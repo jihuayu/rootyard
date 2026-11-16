@@ -16,7 +16,8 @@ use super::retirement_reconcile::{
     GroupObservationStatus, GroupRetirementObservation, RetirementBlockReason, evaluate_shared_hold_retirement,
     observe_group_retirement_from_sm,
 };
-use crate::ref_store::contract::{GitObjectFormat, MetadataPinPurpose, RequestDigest};
+use crate::ref_store::GitObjectFormat;
+use crate::ref_store::contract::{MetadataPinPurpose, RequestDigest};
 use crate::ref_store::core::state_machine::{
     AdvanceCancelCutoffCommand, AppliedLogId, ApplyResponse, CancelCommand, InitializeGateCommand, RefCasCommand,
     RefCasStateMachine, ReleaseRootCommand, RepositoryLane, RetireHoldBatchCommand, ScopeLifecycle,
@@ -154,11 +155,12 @@ fn setup_group(seed: u128, group_id: i64, sha256: &str, backend: &str) -> (RefCa
         pack_mode: SmPackMode::MetadataOnly,
         authz_floor: 1,
     };
-    let ApplyResponse::GateInitialized { gate_digest, .. } =
+    let ApplyResponse::GateInitialized { version, .. } =
         sm.apply(log(1), RefCasCommand::InitializeGate(init_cmd)).unwrap()
     else {
         panic!("expected GateInitialized");
     };
+    let gate_digest = version.digest().as_hex();
     let binding = BridgeBinding {
         tenant_id,
         repository_id,

@@ -4,7 +4,7 @@
 
 use anyhow::{Result, ensure};
 use deadpool_postgres::{Manager, Pool};
-use rootyard::blob_store::{BlobProfile, BlobStore};
+use rootyard::blob_store::{config::BlobProfile, opendal::BlobStore};
 use rootyard::db;
 use rootyard::ref_store::artifact_hold::bridge_contract::{
     BridgeBinding, GroupHoldBinding, SharedHoldReference, SharedHoldRetirementStatus,
@@ -22,9 +22,9 @@ use rootyard::ref_store::artifact_hold::retirement_reconcile::{
 use rootyard::ref_store::artifact_hold::{AcquireArtifactHoldsRequest, ArtifactHoldPurpose, ArtifactSpec, HoldScope};
 use rootyard::ref_store::core::command::CommitRefsRequest;
 use rootyard::ref_store::core::state_machine::{
-    AppliedLogId, ApplyResponse, CancelCommand, CommitRefsCommand, InitializeGateCommand, RefCasCommand,
-    RefCasStateMachine, ReleaseRootCommand, RepositoryLane, RetireHoldBatchCommand, ScopeLifecycle,
-    SetRepositoryLaneCommand, SmPackMode, WireCommitRefsRequest, WireGateInit,
+    AppliedLogId, CancelCommand, CommitRefsCommand, InitializeGateCommand, RefCasCommand, RefCasStateMachine,
+    ReleaseRootCommand, RepositoryLane, RetireHoldBatchCommand, ScopeLifecycle, SetRepositoryLaneCommand, SmPackMode,
+    WireCommitRefsRequest, WireGateInit,
 };
 use rootyard::ref_store::projector::{
     ProjectionError, ProjectionRealm, RefCasEventEnvelope, RefCasEventPage, TruncationCutoff,
@@ -385,7 +385,7 @@ async fn pg_bridge_cancel_before_register_and_anti_aba_fencing() -> Result<()> {
         IssuerLane::new("push")?,
         2,
         Uuid::new_v4(),
-        RequestDigest::of("op2", b"2"),
+        RequestDigest::of("op2", &[b"2"]),
     )?;
     let binding2 = BridgeBinding::from_scope_and_operation(&scope, &op2, authority_id, 1, 10, blob.backend_identity())?;
     ensure!(matches!(
@@ -455,7 +455,7 @@ async fn pg_multi_group_shared_hold_retirement_and_cursor_reconciler() -> Result
             let commit_req = CommitRefsRequest::new(
                 r,
                 t,
-                binding.issuer_id,
+                Uuid::new_v4(),
                 IssuerLane::new("push")?,
                 2,
                 commit_op,
