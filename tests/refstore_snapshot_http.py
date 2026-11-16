@@ -463,8 +463,11 @@ class SnapshotHttpHarness(checkpoint.CheckpointHarness):
         write_only = self._issue_scoped(write_repo, "write-only", ["contents_write"])
         status, write_created, _ = self._create(write_repo, "write-only-create", 300, token=write_only)
         assert status == 201, (status, write_created)
+        baseline = self._ledger(repo)
+        write_baseline = self._ledger(write_repo)
         status, _, _ = self._read(write_repo, write_created["snapshot_id"], token=write_only)
         assert status == 403
+        assert self._ledger(write_repo) == write_baseline, "write-only denial changed durable state"
 
         # Non-member and then initial fixture-only write collaborator role.
         status, _, _ = self._read(repo, snapshot, token=self.bob)
