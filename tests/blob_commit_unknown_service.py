@@ -48,6 +48,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -129,11 +130,138 @@ def gate_identity(gate):
 
 
 class CheckpointHarness(blob.BlobOnlyHarness):
+    _SAFE_EXCEPTION_TYPES = frozenset({
+        "AssertionError",
+        "CalledProcessError",
+        "FileNotFoundError",
+        "OSError",
+        "RuntimeError",
+        "TimeoutError",
+        "TimeoutExpired",
+        "ValueError",
+    })
+    _SAFE_FAILURE_SOURCES = {
+        "blob_commit_unknown_service.py": "tests/blob_commit_unknown_service.py",
+        "blob_only_service.py": "tests/blob_only_service.py",
+        "e2e.py": "tests/e2e.py",
+        "native_evidence.py": "tests/native_evidence.py",
+        "ops_provenance.py": "tests/ops_provenance.py",
+        "owned_fuse_cleanup.py": "tests/owned_fuse_cleanup.py",
+    }
+    _SAFE_FAILURE_FUNCTIONS = frozenset({
+        "main", "case", "run", "sql", "prepare", "cleanup",
+        "receive_pack_commit_unknown_resolves_exact",
+        "exact_receive_post_replays_before_native_without_second_effect",
+        "registered_read_cycles_do_not_exhaust_retained_snapshot_quota",
+        "_release_blocker", "_register_owned_blocker", "_register_owned_blocker_or_reap",
+        "_owned_blocker_rows", "_owned_advisory_lock_count", "_blocker_row_matches",
+        "_reap_blocker_child", "_start_blocker", "_waiting_commit_pid",
+        "_await_waiting_commit", "_await_commit_finished", "_drop_commit_gate",
+        "_create_commit_gate", "_validate_blocker_application_name",
+        "_long_http", "_json_rows", "exact_ledger", "pack_identity", "operation_row",
+        "operation_row_optional", "cancellation_snapshot", "insert_unbound_operation",
+        "add_write_collaborator",
+    })
+    _SAFE_FAILURE_CONTEXT_LIMIT = 5
+    _SAFE_FAILURE_FRAME_LIMIT = 8
+
     def __init__(self, args, profile, blob_profile):
         super().__init__(args, profile, blob_profile)
         # The verifier stage clamps itself to 30s; keep the whole request open
         # well past that so the typed COMMIT-unknown wins over the HTTP timeout.
         self.env["ROOTYARD_GIT_TIMEOUT_SECONDS"] = "60"
+
+    def case(self, name, fn):
+        diagnostic = None
+
+        def capture_failure():
+            nonlocal diagnostic
+            try:
+                return fn()
+            except Exception as error:
+                try:
+                    diagnostic = self._safe_failure_context(error)
+                except Exception:
+                    diagnostic = {"exception_chain": [], "truncated": True}
+                raise
+
+        try:
+            return super().case(name, capture_failure)
+        except Exception:
+            try:
+                if diagnostic is not None and self.results:
+                    failed = self.results[-1]
+                    if failed.get("name") == name and failed.get("status") == "failed":
+                        failed["failure_context"] = diagnostic
+            except Exception:
+                pass
+            raise
+
+    @classmethod
+    def _safe_failure_context(cls, error):
+        chain = []
+        seen = set()
+        queued = {id(error)}
+        pending = [(error, "exception")]
+        while pending and len(chain) < cls._SAFE_FAILURE_CONTEXT_LIMIT:
+            current, relation = pending.pop(0)
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            chain.append({
+                "relation": relation,
+                "type": cls._safe_exception_type(current),
+                "frames": cls._safe_traceback_frames(current),
+            })
+            try:
+                cause = current.__cause__
+            except Exception:
+                cause = None
+            try:
+                context = current.__context__
+            except Exception:
+                context = None
+            for related, related_relation in ((cause, "cause"), (context, "context")):
+                if related is not None and id(related) not in seen and id(related) not in queued:
+                    pending.append((related, related_relation))
+                    queued.add(id(related))
+        return {"exception_chain": chain, "truncated": bool(pending)}
+
+    @classmethod
+    def _safe_exception_type(cls, error):
+        try:
+            name = type(error).__name__
+        except Exception:
+            return "Other"
+        return name if name in cls._SAFE_EXCEPTION_TYPES else "Other"
+
+    @classmethod
+    def _safe_traceback_frames(cls, error):
+        frames = []
+        seen_frames = set()
+        try:
+            tb = error.__traceback__
+        except Exception:
+            tb = None
+        if tb is None:
+            return frames
+        for frame, lineno in traceback.walk_tb(tb):
+            marker = id(frame)
+            if marker in seen_frames:
+                break
+            seen_frames.add(marker)
+            function = frame.f_code.co_name
+            source = cls._SAFE_FAILURE_SOURCES.get(Path(frame.f_code.co_filename).name)
+            if source is None or function not in cls._SAFE_FAILURE_FUNCTIONS:
+                continue
+            frames.append({
+                "file": source,
+                "function": function,
+                "line": lineno if type(lineno) is int else 0,
+            })
+            if len(frames) >= cls._SAFE_FAILURE_FRAME_LIMIT:
+                break
+        return frames
 
     def _long_http(self, path, token, body, operation, timeout=75):
         headers = {

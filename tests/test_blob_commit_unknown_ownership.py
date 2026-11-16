@@ -156,6 +156,16 @@ def stop_child(child):
             stream.close()
 
 
+def raised_generated(source, filename="tests/e2e.py"):
+    namespace = {}
+    exec(compile(source, filename, "exec"), namespace)
+    try:
+        namespace["run"]()
+    except Exception as error:
+        return error
+    raise AssertionError("generated failure source did not raise")
+
+
 class BlockerDatabaseIdentityTest(unittest.TestCase):
     def test_complete_dsns_accept_the_connection_current_database_name(self):
         cases = (
@@ -273,6 +283,100 @@ class BlockerReleaseTest(unittest.TestCase):
                 self.assertEqual(sql.lock_calls, 1)
                 self.assertIn("a.application_name='" + identity["application_name"] + "'",
                               sql.queries[0])
+
+
+class SafeFailureContextTest(unittest.TestCase):
+    def test_projection_keeps_only_whitelisted_metadata(self):
+        error = raised_generated(
+            "def run():\n"
+            "    return sql()\n"
+            "def sql():\n"
+            "    return leaky_frame()\n"
+            "def leaky_frame():\n"
+            "    local_secret = 'local-sentinel'\n"
+            "    raise RuntimeError(local_secret + ' password=message-sentinel')\n"
+        )
+        context = CheckpointHarness._safe_failure_context(error)
+        encoded = json.dumps(context, sort_keys=True)
+        for secret in ("message-sentinel", "local-sentinel", "password", "/Users/", "postgresql://"):
+            self.assertNotIn(secret, encoded)
+        chain = context["exception_chain"]
+        self.assertEqual(len(chain), 1)
+        self.assertEqual(chain[0]["relation"], "exception")
+        self.assertEqual(chain[0]["type"], "RuntimeError")
+        functions = [frame["function"] for frame in chain[0]["frames"]]
+        self.assertIn("run", functions)
+        self.assertIn("sql", functions)
+        self.assertNotIn("leaky_frame", functions)
+        for frame in chain[0]["frames"]:
+            self.assertEqual(frame["file"], "tests/e2e.py")
+            self.assertIsInstance(frame["line"], int)
+            self.assertNotIn("/", frame["file"].replace("tests/", "", 1))
+
+    def test_unknown_exception_type_maps_to_other(self):
+        class SecretError(Exception):
+            pass
+
+        context = CheckpointHarness._safe_failure_context(SecretError("secret-sentinel"))
+        self.assertEqual(context["exception_chain"][0]["type"], "Other")
+        self.assertEqual(context["exception_chain"][0]["frames"], [])
+        self.assertNotIn("secret-sentinel", json.dumps(context, sort_keys=True))
+
+    def test_cause_context_chain_is_bounded_and_cycle_safe(self):
+        first = raised_generated("def run():\n    raise RuntimeError('root-sentinel')\n")
+        entries = [
+            raised_generated("def run():\n    raise RuntimeError('chain-sentinel-%d')\n" % index)
+            for index in range(7)
+        ]
+        first.__cause__ = entries[0]
+        first.__context__ = entries[1]
+        for left, right in zip(entries, entries[1:]):
+            left.__context__ = right
+        entries[0].__cause__ = first
+        entries[-1].__context__ = first
+
+        context = CheckpointHarness._safe_failure_context(first)
+        self.assertLessEqual(len(context["exception_chain"]), 5)
+        self.assertTrue(context["truncated"])
+        relations = {entry["relation"] for entry in context["exception_chain"]}
+        self.assertIn("cause", relations)
+        self.assertIn("context", relations)
+        encoded = json.dumps(context, sort_keys=True)
+        self.assertNotIn("root-sentinel", encoded)
+        self.assertNotIn("chain-sentinel", encoded)
+
+    def test_case_attaches_safe_context_without_replacing_failure(self):
+        namespace = {}
+        exec(compile(
+            "def run():\n    raise RuntimeError('password=case-sentinel')\n",
+            "tests/e2e.py", "exec"), namespace)
+        seen = []
+
+        def failing():
+            try:
+                namespace["run"]()
+            except Exception as error:
+                seen.append(error)
+                raise
+
+        fixture = object.__new__(CheckpointHarness)
+        fixture.results = []
+        fixture.redact = lambda value: str(value)
+        with self.assertRaises(RuntimeError) as caught:
+            fixture.case("receive_pack_commit_unknown_resolves_exact", failing)
+        self.assertIs(caught.exception, seen[0])
+        result = fixture.results[-1]
+        self.assertEqual(result["name"], "receive_pack_commit_unknown_resolves_exact")
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("error", result)
+        self.assertIn("failure_context", result)
+        encoded = json.dumps(result["failure_context"], sort_keys=True)
+        self.assertNotIn("case-sentinel", encoded)
+        functions = [
+            frame["function"]
+            for frame in result["failure_context"]["exception_chain"][0]["frames"]
+        ]
+        self.assertIn("run", functions)
 
 
 if __name__ == "__main__":
