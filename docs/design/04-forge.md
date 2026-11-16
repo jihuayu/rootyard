@@ -2,7 +2,7 @@
 
 > 历史来源快照：本文中的“最新/当前/优先级”仅指归档日期。现行规范见 [状态服务设计](12-state-services.md) 和 [实施计划](implementation-plan.md)，不再要求旧 GitFS 演进或旧版本升级。
 
-> 状态：目标设计；当前仅落地私有 owner Issue/comment 等有限切片。
+> 状态：目标设计；Issue #86（搜索、标签负责人、通知订阅、行级 PR 评审及合规审计）现行实现规范见 [Forge 协作扩展规范](../forge-collaboration.md)。
 > [设计目录](README.md) · [实现状态](implementation-status.md) · [来源与完整归档](source-page.md)
 
 <!-- BEGIN SOURCE BODY -->

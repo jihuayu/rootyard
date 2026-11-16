@@ -2,17 +2,19 @@
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-/// Current archives use format 25 / schema 149 (Ref-CAS event replay cursors,
-/// immutable non-authorizing projections, and reliable projection jobs). Prior
-/// format catalogs remain frozen; formats 23 and 24 are schema 148, formats 21
-/// and 22 are schema 147, and format 20 is schema 144. The new schema catalogs
-/// were generated from real PostgreSQL, never copied from a previous schema.
-pub(super) const FORMAT: u32 = 25;
+/// Current archives use format 27 / schema 150 (Forge collaboration: labels,
+/// assignees, subscriptions, idempotent notifications, inline diff PR review
+/// comments, and comment edit/moderation revisions). Prior format catalogs
+/// remain frozen; formats 25 and 26 are schema 149, formats 23 and 24 are
+/// schema 148, formats 21 and 22 are schema 147, and format 20 is schema 144.
+/// The new schema catalogs were generated from real PostgreSQL, never copied
+/// from a previous schema.
+pub(super) const FORMAT: u32 = 27;
 
 /// Paired PG + OpenDAL Blob closure archive (#120). The schema does not change:
 /// format tags the archive layout, not the frozen PostgreSQL catalog, so every
 /// same-schema archive maps unchanged to the same reviewed catalog/versions.
-pub(super) const FORMAT_PAIRED: u32 = 26;
+pub(super) const FORMAT_PAIRED: u32 = 28;
 
 pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
     let raw = match format {
@@ -116,6 +118,11 @@ pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
             include_str!("../../schema/149_restored_catalog.json"),
             include_str!("../../schema/149_upgraded_catalog.json"),
         ],
+        27 | 28 => [
+            include_str!("../../schema/150_catalog.json"),
+            include_str!("../../schema/150_restored_catalog.json"),
+            include_str!("../../schema/150_upgraded_catalog.json"),
+        ],
         _ => bail!("unsupported backup format"),
     };
     Ok([serde_json::from_str(raw[0])?, serde_json::from_str(raw[1])?, serde_json::from_str(raw[2])?])
@@ -142,7 +149,8 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
         20 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 144).collect()),
         21 | 22 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 147).collect()),
         23 | 24 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 148).collect()),
-        25 | 26 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
+        25 | 26 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 149).collect()),
+        27 | 28 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
         _ => bail!("unsupported backup format"),
     }
 }

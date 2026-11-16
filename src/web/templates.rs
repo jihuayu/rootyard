@@ -49,7 +49,7 @@ pub fn render_page_shell(header: &RepoHeaderCtx, view_name: &str, page_title: &s
     };
 
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\"/>\n<title>{title} — {owner}/{repo}</title>\n<script src=\"/web/app.js\" defer></script>\n<style>body{{font-family:system-ui,sans-serif;margin:1.5rem;line-height:1.5}}nav a{{margin-right:1rem}}.badge{{padding:0.15rem 0.45rem;border-radius:4px;background:#eef}}.blob-truncation-banner{{padding:0.5rem;background:#fff3cd;border:1px solid #ffeeba}}</style>\n</head>\n<body data-view=\"{view_name}\" data-owner=\"{owner}\" data-repo=\"{repo}\" data-role=\"{role}\" data-actor=\"{actor}\" data-storage-backend=\"{backend}\" data-storage-generation=\"{generation}\">\n<header class=\"repo-header\" data-repo-id=\"{}\" data-repo-state=\"{}\">\n<h1><a href=\"{base_url}\">{owner}/{repo}</a> <span class=\"badge\" data-role-badge=\"{role}\">{role}</span></h1>\n<nav class=\"repo-nav\">\n<a href=\"/web/repos\">My repositories</a>\n<a href=\"{base_url}\" data-nav=\"overview\">Overview</a>\n<a href=\"{base_url}/tree\" data-nav=\"tree\">Files</a>\n<a href=\"{base_url}/commits\" data-nav=\"commits\">Commits</a>\n<a href=\"{base_url}/issues\" data-nav=\"issues\">Issues</a>\n<a href=\"{base_url}/pulls\" data-nav=\"pulls\">Pull Requests</a>\n{audit_nav}\n</nav>\n<form method=\"post\" action=\"/web/logout\"><button type=\"submit\">Sign out</button></form>\n</header>\n<main class=\"repo-main\">\n{inner_html}\n</main>\n</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\"/>\n<title>{title} — {owner}/{repo}</title>\n<script src=\"/web/app.js\" defer></script>\n<style>body{{font-family:system-ui,sans-serif;margin:1.5rem;line-height:1.5}}nav a{{margin-right:1rem}}.badge{{padding:0.15rem 0.45rem;border-radius:4px;background:#eef}}.blob-truncation-banner{{padding:0.5rem;background:#fff3cd;border:1px solid #ffeeba}}</style>\n</head>\n<body data-view=\"{view_name}\" data-owner=\"{owner}\" data-repo=\"{repo}\" data-role=\"{role}\" data-actor=\"{actor}\" data-storage-backend=\"{backend}\" data-storage-generation=\"{generation}\">\n<header class=\"repo-header\" data-repo-id=\"{}\" data-repo-state=\"{}\">\n<h1><a href=\"{base_url}\">{owner}/{repo}</a> <span class=\"badge\" data-role-badge=\"{role}\">{role}</span></h1>\n<nav class=\"repo-nav\">\n<a href=\"/web/repos\">My repositories</a>\n<a href=\"/web/search\" data-nav=\"search\">Search</a>\n<a href=\"/web/notifications\" data-nav=\"notifications\">Notifications</a>\n<a href=\"{base_url}\" data-nav=\"overview\">Overview</a>\n<a href=\"{base_url}/tree\" data-nav=\"tree\">Files</a>\n<a href=\"{base_url}/commits\" data-nav=\"commits\">Commits</a>\n<a href=\"{base_url}/issues\" data-nav=\"issues\">Issues</a>\n<a href=\"{base_url}/labels\" data-nav=\"labels\">Labels</a>\n<a href=\"{base_url}/pulls\" data-nav=\"pulls\">Pull Requests</a>\n{audit_nav}\n</nav>\n<form method=\"post\" action=\"/web/logout\"><button type=\"submit\">Sign out</button></form>\n</header>\n<main class=\"repo-main\">\n{inner_html}\n</main>\n</body>\n</html>\n",
         header.repository_id,
         escape_html(&header.repo_state),
     )
@@ -401,12 +401,14 @@ pub fn render_pull_detail_view(header: &RepoHeaderCtx, data: &PullDetailViewData
     let mut reviews_html = String::new();
     for rev in &data.reviews {
         let rev_md = render_safe_markdown(&rev.body);
+        let outdated_tag = if rev.outdated { "<span class=\"badge outdated\">outdated</span>" } else { "" };
         reviews_html.push_str(&format!(
-            "<li class=\"pull-review\" data-review-number=\"{}\" data-review-state=\"{}\" data-review-commit=\"{}\" data-review-author-id=\"{}\"><span class=\"review-state\">{}</span><div class=\"review-body markdown-body\">{rev_md}</div></li>\n",
+            "<li class=\"pull-review\" data-review-number=\"{}\" data-review-state=\"{}\" data-review-commit=\"{}\" data-review-author-id=\"{}\" data-review-outdated=\"{}\"><span class=\"review-state\">{}</span>{outdated_tag}<div class=\"review-body markdown-body\">{rev_md}</div></li>\n",
             rev.number,
             escape_html(&rev.state),
             escape_html(&rev.commit_oid),
             rev.author_id,
+            rev.outdated,
             escape_html(&rev.state),
         ));
     }

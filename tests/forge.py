@@ -13,7 +13,7 @@ import time
 import uuid
 
 from e2e import Harness
-from schema_baseline import SCHEMA_VERSION_CSV
+from schema_baseline import SCHEMA_VERSION_CSV, SCHEMA_VERSIONS
 
 
 class ForgeHarness(Harness):
@@ -39,7 +39,30 @@ class ForgeHarness(Harness):
         self.cli("migrate")
         self.cli("migrate")
         # Remove only this test's empty Forge slice to reconstruct a real upgrade.
-        self.sql("DROP TABLE forge_creation_requests,forge_issue_comments,forge_issues,forge_issue_counters; DELETE FROM schema_migrations WHERE version IN (6,7); CREATE TABLE forge_issue_comments(dummy integer)")
+        drops = (
+            "DROP TABLE forge_creation_requests,forge_issue_comments,"
+            "forge_issues,forge_issue_counters"
+        )
+        replay = "DELETE FROM schema_migrations WHERE version IN (6,7)"
+        if 150 in SCHEMA_VERSIONS:
+            # Dropping forge_issues/forge_issue_comments discards migration 150
+            # dependencies and alters; drop its tables and remaining forge_pulls
+            # constraints so replaying 150 restores the full schema.
+            drops = (
+                "DROP TABLE forge_notifications,forge_subscriptions,"
+                "forge_comment_revisions,forge_pull_review_comments,"
+                "forge_pull_assignees,forge_issue_assignees,forge_pull_labels,"
+                "forge_issue_labels,forge_labels,forge_creation_requests,"
+                "forge_issue_comments,forge_issues,forge_issue_counters; "
+                "ALTER TABLE forge_pulls "
+                "DROP CONSTRAINT IF EXISTS forge_pulls_label_version_check, "
+                "DROP CONSTRAINT IF EXISTS forge_pulls_assignee_version_check, "
+                "DROP CONSTRAINT IF EXISTS forge_pulls_next_review_comment_number_check"
+            )
+            replay = "DELETE FROM schema_migrations WHERE version IN (6,7,150)"
+        self.sql(
+            drops + "; " + replay + "; CREATE TABLE forge_issue_comments(dummy integer)"
+        )
         failed = self.run([self.args.binary, "migrate"], check=False)
         assert failed.returncode != 0
         assert self.sql("SELECT count(*) FROM schema_migrations WHERE version=6") == "0"

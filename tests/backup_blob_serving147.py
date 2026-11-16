@@ -621,7 +621,7 @@ class Drill(BlobOnlyHarness):
                     process.wait(timeout=10)
         assert self.advisory_holds(self.source_db) == 0, "backup did not release its exclusive barrier"
         manifest = json.loads(self.backup.joinpath("manifest.json").read_text())
-        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 26
+        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 28
         assert manifest["schema_versions"] == SCHEMA_VERSIONS and max(SCHEMA_VERSIONS) == CURRENT_SCHEMA_VERSION
         assert len(manifest["repositories"]) == 2
         assert manifest["blob_closure"]["artifacts"] == self.closure_rows["count"]

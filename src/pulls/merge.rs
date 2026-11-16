@@ -478,6 +478,7 @@ async fn merge_pull_inner(
     let merged_pull = PullRequest::row(&updated_row);
     let response_val = serde_json::to_value(&merged_pull).map_err(Error::internal)?;
     record_creation(&tx, tenant_id, repo_id, key.as_deref(), &response_val).await?;
+    crate::forge::notifications::emit_repo_notifications(&tx, crate::forge::notifications::NotifySpec { tenant_id, repository_id: repo_id, actor_id: actor.id, target_type: "pull", target_number: number, thread_type: "pull", thread_number: number, event_kind: "pull_merged", delivery_key: &format!("pull:{repo_id}:{number}:merged"), title: &format!("PR #{number} merged: {}", merged_pull.title), body_excerpt: "", extra_recipients: &[] }).await?;
     // Final freshness check before the merge commit. The window remains held
     // through response construction below, so a policy transition cannot
     // interleave after this decision and before the committed response value.
