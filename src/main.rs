@@ -430,15 +430,15 @@ async fn run() -> Result<()> {
             if join_task_until(shutdown_deadline, publish_task).await.is_err() {
                 failures.push("dispatch publisher did not stop cleanly");
             }
-            if let Some(task) = delivery_task {
-                if join_task_until(shutdown_deadline, task).await.is_err() {
-                    failures.push("dispatch delivery worker did not stop cleanly");
-                }
+            if let Some(task) = delivery_task
+                && join_task_until(shutdown_deadline, task).await.is_err()
+            {
+                failures.push("dispatch delivery worker did not stop cleanly");
             }
-            if let Some(task) = webhook_task {
-                if join_task_until(shutdown_deadline, task).await.is_err() {
-                    failures.push("webhook worker did not stop cleanly");
-                }
+            if let Some(task) = webhook_task
+                && join_task_until(shutdown_deadline, task).await.is_err()
+            {
+                failures.push("webhook worker did not stop cleanly");
             }
             if let Some(metrics_worker) = metrics_worker {
                 metrics_worker.abort();
