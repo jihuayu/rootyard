@@ -11,6 +11,7 @@ use rootyard::ref_store::core::state_machine::{
     WireDecisionKind, WireDecisionScopeDep, WireDecisionVerdict,
 };
 use rootyard::ref_store::projector::{AuthoritySourceKind, RevocationDrainStatus, await_drain_before_revocation_ack};
+use rootyard::ref_store::raft_backend::RootRefCasApplied;
 
 #[allow(clippy::too_many_arguments)]
 fn install_scoped_command(
@@ -123,7 +124,16 @@ async fn privileged_scope_drain_query_is_quorum_bound_and_multirepo_complete() -
         logical_tick: 1,
     });
     let close_outcome = backend_a.propose(close).await?;
-    assert!(proposal_outcome(&close_outcome).is_applied());
+    let close_summary = match proposal_outcome(&close_outcome) {
+        RootRefCasOutcome::Applied(RootRefCasApplied::AuthScopeClosedV2 { drain_summary, .. }) => {
+            assert_eq!(drain_summary.open_decision_count, 2);
+            assert_eq!(drain_summary.pending_operation_count, 2);
+            assert!(drain_summary.validate().is_ok());
+            drain_summary.clone()
+        }
+        other => panic!("close did not emit a compact acknowledgment: {other:?}"),
+    };
+    assert_eq!(close_summary.open_decision_count, 2);
     let close_index = close_outcome.log_id.index;
 
     let leader_node = cluster.node(leader_id).node.clone();

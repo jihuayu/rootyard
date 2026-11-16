@@ -11,8 +11,8 @@ use rootyard_refcas_log::state_machine::{ApplicationError, ApplicationLogId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ref_store::core::state_machine::RefCasStateMachine;
-use crate::ref_store::raft_backend::outcome::{RootRefCasOutcome, RootRefCasRefusalKind};
+use crate::ref_store::core::state_machine::{RefCasStateMachine, validate_scope_kind};
+use crate::ref_store::raft_backend::outcome::{RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusalKind};
 use crate::ref_store::raft_backend::proposal::{
     MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, MAX_ROOT_STATE_BYTES, PROPOSAL_WINDOW, ProposalAttempt,
     ProposalAttemptKind,
@@ -193,6 +193,20 @@ fn validate_v3(
         }
         if attempt.serialized_len()? > MAX_PROPOSAL_RECEIPT_BYTES {
             return Err(ApplicationError::new("attempt receipt exceeds its byte budget"));
+        }
+        if let RootRefCasOutcome::Applied(RootRefCasApplied::AuthScopeClosedV2 {
+            scope_kind,
+            scope_id,
+            drain_summary,
+            ..
+        }) = &attempt.outcome
+        {
+            if scope_id.is_nil() {
+                return Err(ApplicationError::new("compact scope close acknowledgment has a nil scope id"));
+            }
+            validate_scope_kind(scope_kind)
+                .map_err(|error| ApplicationError::new(format!("compact scope close acknowledgment: {error}")))?;
+            drain_summary.validate()?;
         }
         match attempt.kind {
             ProposalAttemptKind::Legacy => {

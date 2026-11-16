@@ -612,6 +612,8 @@ mod tests {
     use std::collections::BTreeMap;
     use uuid::Uuid;
 
+    mod scope_close_tests;
+
     fn proposal_id(repo: Uuid, tenant: Uuid, history: Uuid, issued_at_index: u64) -> ProposalId {
         ProposalId::new(
             repo,
@@ -930,14 +932,18 @@ mod tests {
         let closed = app.query_attempt(close_log).expect("close attempt");
         assert!(matches!(
             &closed.outcome,
-            RootRefCasOutcome::Applied(RootRefCasApplied::AuthScopeClosed {
+            RootRefCasOutcome::Applied(RootRefCasApplied::AuthScopeClosedV2 {
                 scope_kind,
                 scope_id: actual,
                 lifecycle: ScopeLifecycle::Closing,
                 authz_floor: 2,
                 replayed: false,
-                ..
-            }) if scope_kind.as_str() == "token" && *actual == scope_id
+                drain_summary,
+            }) if scope_kind.as_str() == "token"
+                && *actual == scope_id
+                && drain_summary.open_decision_count == 1
+                && drain_summary.pending_operation_count == 1
+                && drain_summary.validate().is_ok()
         ));
         assert_eq!(app.logical_clock_floor(), 11);
         let prior_gate = app.machine().read_gate_version(repo).unwrap();

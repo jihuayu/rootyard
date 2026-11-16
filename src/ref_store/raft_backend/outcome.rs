@@ -14,6 +14,7 @@ use crate::ref_store::contract::{OperationState, RefStoreError};
 use crate::ref_store::core::state_machine::{ApplyResponse, ScopeLifecycle, StateMachineError};
 use crate::ref_store::core::terminal::CommitTerminal;
 use crate::ref_store::core::types::GitObjectFormat;
+use crate::ref_store::raft_backend::scope_close::ScopeCloseDrainSummary;
 
 /// One result of applying a Root business command at an exact Raft coordinate.
 #[allow(clippy::large_enum_variant)]
@@ -76,6 +77,8 @@ pub enum RootRefCasApplied {
         decision_id: Uuid,
         replayed: bool,
     },
+    /// Legacy full-vector close receipt. Retained for decoding old `/3` attempts and exact replay;
+    /// new applications never emit this variant.
     AuthScopeClosed {
         scope_kind: String,
         scope_id: Uuid,
@@ -84,6 +87,16 @@ pub enum RootRefCasApplied {
         replayed: bool,
         open_decision_ids: Vec<Uuid>,
         pending_operation_ids: Vec<Uuid>,
+    },
+    /// Compact at-close acknowledgment emitted for new applications. It commits to the exact
+    /// returned vectors but cannot reconstruct them; current drain comes from the committed query.
+    AuthScopeClosedV2 {
+        scope_kind: String,
+        scope_id: Uuid,
+        lifecycle: ScopeLifecycle,
+        authz_floor: i64,
+        replayed: bool,
+        drain_summary: ScopeCloseDrainSummary,
     },
     SnapshotPinCreated {
         snapshot_id: Uuid,
@@ -177,14 +190,20 @@ impl RootRefCasApplied {
                 replayed,
                 open_decision_ids,
                 pending_operation_ids,
-            } => Self::AuthScopeClosed {
+            } => Self::AuthScopeClosedV2 {
+                drain_summary: ScopeCloseDrainSummary::from_vectors(
+                    &scope_kind,
+                    scope_id,
+                    lifecycle,
+                    authz_floor,
+                    &open_decision_ids,
+                    &pending_operation_ids,
+                ),
                 scope_kind,
                 scope_id,
                 lifecycle,
                 authz_floor,
                 replayed,
-                open_decision_ids,
-                pending_operation_ids,
             },
             ApplyResponse::SnapshotPinCreated {
                 snapshot_id,
