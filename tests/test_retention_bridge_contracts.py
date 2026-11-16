@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_HOLD_DIR = ROOT / "src" / "ref_store" / "core" / "artifact_hold"
 BRIDGE_MODULES = (
     "bridge_contract.rs",
+    "group_keyring.rs",
     "reconcile_proof.rs",
     "retention_bridge.rs",
     "retirement_reconcile.rs",
@@ -40,7 +41,13 @@ class TestRetentionBridgeContracts(unittest.TestCase):
         struct_re = re.compile(
             r"(#\[derive\([^\]]*Deserialize[^\]]*\)\]\s*)(#\[serde\([^\]]*\)\]\s*)?pub struct\s+([A-Za-z0-9_]+)"
         )
-        for name in ("bridge_contract.rs", "reconcile_proof.rs", "retention_bridge.rs", "retirement_reconcile.rs"):
+        for name in (
+            "bridge_contract.rs",
+            "group_keyring.rs",
+            "reconcile_proof.rs",
+            "retention_bridge.rs",
+            "retirement_reconcile.rs",
+        ):
             text = (ARTIFACT_HOLD_DIR / name).read_text(encoding="utf-8")
             for match in struct_re.finditer(text):
                 serde_attr = match.group(2) or ""
@@ -52,7 +59,12 @@ class TestRetentionBridgeContracts(unittest.TestCase):
                 )
                 self.assertNotIn(
                     struct_name,
-                    ("VerifiedGlobalHoldReservation", "VerifiedGroupRetirement", "VerifiedGroupObservation"),
+                    (
+                        "VerifiedGlobalHoldReservation",
+                        "VerifiedGroupRetirement",
+                        "VerifiedGroupObservation",
+                        "GroupConsensusVerifier",
+                    ),
                     f"verified capability {struct_name} must never derive Deserialize",
                 )
 
@@ -67,11 +79,22 @@ class TestRetentionBridgeContracts(unittest.TestCase):
             for forbidden in ("tokio_postgres", "deadpool_postgres", "BlobStore", "opendal"):
                 self.assertNotIn(forbidden, sm_text, f"{rs_file.name} must keep zero PG/Blob I/O")
 
-        for name in ("reconcile_proof.rs", "retention_bridge.rs", "retirement_reconcile.rs"):
+        for name in ("group_keyring.rs", "reconcile_proof.rs", "retention_bridge.rs", "retirement_reconcile.rs"):
             text = (ARTIFACT_HOLD_DIR / name).read_text(encoding="utf-8").upper()
             for table in ("ARTIFACT_HOLDS", "ARTIFACT_HOLD_REQUESTS", "ARTIFACT_HOLD_CONSUME_RECEIPTS"):
                 self.assertNotIn(f"UPDATE {table}", text)
                 self.assertNotIn(f"DELETE FROM {table}", text)
+
+        proof_text = (ARTIFACT_HOLD_DIR / "reconcile_proof.rs").read_text(encoding="utf-8")
+        for forbidden_pub in (
+            "pub fn observe_group_retirement_from_",
+            "pub fn verify_group_observation_with_snapshot",
+        ):
+            self.assertNotIn(forbidden_pub, proof_text)
+
+        reconcile_text = (ARTIFACT_HOLD_DIR / "retirement_reconcile.rs").read_text(encoding="utf-8")
+        self.assertNotIn("pub fn evaluate_shared_hold_retirement", reconcile_text)
+        self.assertIn("MissingPgEvidence", reconcile_text)
 
     def test_workflow_and_documentation_contracts(self) -> None:
         raw = WORKFLOW.read_bytes()

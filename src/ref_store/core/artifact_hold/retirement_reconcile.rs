@@ -3,9 +3,9 @@
 
 use super::reconcile_proof::VerifiedGroupState;
 pub use super::reconcile_proof::{
-    GroupHoldBinding, RetentionBridgeError, RetirementBlockReason, SharedHoldReference, VerifiedGroupObservation,
-    VerifiedGroupRetirement, observe_group_retirement_from_sm, observe_group_retirement_from_snapshot,
-    observe_group_retirement_from_snapshot_bytes, verify_group_observation_with_snapshot,
+    AttestedGroupSnapshotDto, GROUP_KEYRING_ENV, GroupConsensusVerifier, GroupHoldBinding, GroupVoterSignatureDto,
+    QuorumCommitClaims, RetentionBridgeError, RetirementBlockReason, SharedHoldReference, VerifiedGroupObservation,
+    VerifiedGroupRetirement, quorum_commit_transcript_bytes,
 };
 pub use super::retention_bridge::apply_retire_hold_batch_idempotent;
 use crate::ref_store::contract::RequestDigest;
@@ -278,9 +278,10 @@ fn check_group_pg_holds(
     }
 }
 
-/// Fail-closed multi-group evaluator consuming ONLY consensus-verified `VerifiedGroupObservation`s,
-/// Migration-149 PG projection cursors, and PG cross-repo `artifact_holds`.
-pub fn evaluate_shared_hold_retirement(
+/// Internal multi-group evaluator; restricted to `artifact_hold` so public reclaim authorization
+/// MUST execute live PostgreSQL cursor & `artifact_holds` queries (`reconcile_shared_hold_retirement_with_pg`).
+/// Passing `pg_holds = None` ALWAYS fails closed with `RetirementBlockReason::MissingPgEvidence`.
+pub(super) fn evaluate_shared_hold_retirement(
     shared: &SharedHoldReference,
     observations: &[VerifiedGroupObservation],
     cursors: &[ProjectionCursor],
@@ -298,6 +299,9 @@ pub fn evaluate_shared_hold_retirement(
         cursors.iter().map(|c| ((c.realm.group_id, c.realm.history_incarnation), c)).collect();
     let hold_map: BTreeMap<Uuid, &PgHoldRowSummary> =
         pg_holds.map(|v| v.found_holds.iter().map(|r| (r.hold_id, r)).collect()).unwrap_or_default();
+    if pg_holds.is_none() {
+        reasons.push(RetirementBlockReason::MissingPgEvidence);
+    }
 
     let mut reconciled_groups = 0usize;
     for g in &shared.groups {
@@ -313,7 +317,7 @@ pub fn evaluate_shared_hold_retirement(
         if pg_holds.is_some() {
             check_group_pg_holds(g, shared, &hold_map, &mut reasons);
         }
-        if valid_proof.is_some() && reasons.len() == before {
+        if pg_holds.is_some() && valid_proof.is_some() && reasons.len() == before {
             reconciled_groups += 1;
         }
     }

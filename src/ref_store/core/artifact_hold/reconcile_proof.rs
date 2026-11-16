@@ -1,13 +1,18 @@
 //! Consensus-verified per-group retirement proofs for shared physical holds (#151).
 //!
-//! Untrusted transport DTOs (`GroupRetirementReceiptDto`, `GroupRetirementObservationDto`)
-//! carry `#[serde(deny_unknown_fields)]` and are strictly separated from opaque
-//! `VerifiedGroupRetirement` / `VerifiedGroupObservation` values, which cannot be
-//! deserialized or minted outside this module without verifying a `RefCasSnapshot`
-//! (`verify_integrity()`) or authoritative `RefCasStateMachine`.
+//! Untrusted transport DTOs (`GroupRetirementReceiptDto`, `GroupRetirementObservationDto`,
+//! `AttestedGroupSnapshotDto`) carry `#[serde(deny_unknown_fields)]` and are strictly
+//! separated from opaque `VerifiedGroupRetirement` / `VerifiedGroupObservation` values.
+//! `Retired` observations can ONLY be minted by [`GroupConsensusVerifier`] after verifying
+//! a majority-quorum HMAC-SHA256 commit attestation from the trusted group keyring and
+//! validating the integrity-sealed `RefCasSnapshot` at that exact committed coordinate.
 
 pub use super::bridge_contract::RetentionBridgeError;
 use super::contract::MAX_BATCH_ARTIFACTS;
+pub use super::group_keyring::{
+    AttestedGroupSnapshotDto, GROUP_KEYRING_ENV, GroupConsensusVerifier, GroupVoterSignatureDto, QuorumCommitClaims,
+    quorum_commit_transcript_bytes,
+};
 pub use super::retirement_reconcile::{
     GroupObservationStatus, GroupRetirementObservationDto, GroupRetirementReceiptDto,
 };
@@ -110,6 +115,7 @@ pub enum RetirementBlockReason {
     MissingPgHoldRow { repository_id: Uuid, hold_id: Uuid },
     PgHoldIdentityMismatch { repository_id: Uuid, hold_id: Uuid },
     UnreconciledCrossRepoHold { repository_id: Uuid, hold_id: Uuid },
+    MissingPgEvidence,
 }
 
 /// Opaque consensus-verified retirement proof (zero `Deserialize`, private inner state).
@@ -148,7 +154,7 @@ pub(super) enum VerifiedGroupState {
 }
 
 /// Opaque per-group observation consumed by the shared-hold retirement reconciler.
-/// Cannot be deserialized from JSON; `Retired` variants require snapshot integrity proof.
+/// Cannot be deserialized from JSON; `Retired` variants require quorum attestation verification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedGroupObservation {
     group_id: i64,
@@ -159,21 +165,6 @@ pub struct VerifiedGroupObservation {
 }
 
 impl VerifiedGroupObservation {
-    pub fn unreachable(group_id: i64, repository_id: Uuid, detail: Option<String>) -> Self {
-        Self { group_id, repository_id, state: VerifiedGroupState::Unreachable, observed_log_index: None, detail }
-    }
-
-    pub fn unknown_outcome(group_id: i64, repository_id: Uuid, detail: Option<String>) -> Self {
-        let msg = detail.clone().unwrap_or_else(|| "unknown group outcome".into());
-        Self {
-            group_id,
-            repository_id,
-            state: VerifiedGroupState::UnknownOutcome { detail: msg },
-            observed_log_index: None,
-            detail,
-        }
-    }
-
     pub fn group_id(&self) -> i64 {
         self.group_id
     }
@@ -215,96 +206,93 @@ impl VerifiedGroupObservation {
     }
 }
 
-/// Inspect one group's deterministic `RefCasStateMachine` and mint a sealed observation.
-pub fn observe_group_retirement_from_sm(
-    sm: &RefCasStateMachine,
-    binding: &GroupHoldBinding,
-    expected_artifact_digest: &str,
-    expected_backend_identity: &str,
-    min_expected_log_index: Option<u64>,
-) -> Result<VerifiedGroupObservation, RetentionBridgeError> {
-    let snap = sm.snapshot()?;
-    observe_group_retirement_from_snapshot(
-        &snap,
-        binding,
-        expected_artifact_digest,
-        expected_backend_identity,
-        min_expected_log_index,
-    )
-}
-
-/// Decode and SHA-256 verify serialized `RefCasSnapshot` bytes, then mint a sealed observation.
-pub fn observe_group_retirement_from_snapshot_bytes(
-    snapshot_bytes: &[u8],
-    binding: &GroupHoldBinding,
-    expected_artifact_digest: &str,
-    expected_backend_identity: &str,
-    min_expected_log_index: Option<u64>,
-) -> Result<VerifiedGroupObservation, RetentionBridgeError> {
-    let sm = RefCasStateMachine::restore_bytes(snapshot_bytes)?;
-    observe_group_retirement_from_sm(
-        &sm,
-        binding,
-        expected_artifact_digest,
-        expected_backend_identity,
-        min_expected_log_index,
-    )
-}
-
-/// Verify an untrusted transport DTO against a cryptographic `RefCasSnapshot`; rejects any forgery.
-pub fn verify_group_observation_with_snapshot(
-    untrusted: &GroupRetirementObservationDto,
-    snap: &RefCasSnapshot,
-    binding: &GroupHoldBinding,
-    expected_artifact_digest: &str,
-    expected_backend_identity: &str,
-    min_expected_log_index: Option<u64>,
-) -> Result<VerifiedGroupObservation, RetentionBridgeError> {
-    let verified = observe_group_retirement_from_snapshot(
-        snap,
-        binding,
-        expected_artifact_digest,
-        expected_backend_identity,
-        min_expected_log_index,
-    )?;
-    if untrusted.group_id != verified.group_id || untrusted.repository_id != verified.repository_id {
-        return Err(RetentionBridgeError::UntrustedObservationProof);
+impl GroupConsensusVerifier {
+    /// Fail-closed observation when a consensus group cannot be reached during reconciliation.
+    pub fn observe_unreachable(
+        &self,
+        binding: &GroupHoldBinding,
+        detail: Option<String>,
+    ) -> Result<VerifiedGroupObservation, RetentionBridgeError> {
+        binding.validate()?;
+        Ok(VerifiedGroupObservation {
+            group_id: binding.group_id,
+            repository_id: binding.repository_id,
+            state: VerifiedGroupState::Unreachable,
+            observed_log_index: None,
+            detail,
+        })
     }
-    if untrusted.status != verified.status() {
-        return Err(RetentionBridgeError::UntrustedObservationProof);
+
+    /// Fail-closed observation when a consensus poll ended with an inconclusive / unknown outcome.
+    pub fn observe_unknown_outcome(
+        &self,
+        binding: &GroupHoldBinding,
+        detail: Option<String>,
+    ) -> Result<VerifiedGroupObservation, RetentionBridgeError> {
+        binding.validate()?;
+        let msg = detail.clone().unwrap_or_else(|| "unknown group outcome".into());
+        Ok(VerifiedGroupObservation {
+            group_id: binding.group_id,
+            repository_id: binding.repository_id,
+            state: VerifiedGroupState::UnknownOutcome { detail: msg },
+            observed_log_index: None,
+            detail,
+        })
     }
-    if untrusted.status == GroupObservationStatus::Retired {
-        let Some(dto_receipt) = &untrusted.receipt else {
-            return Err(RetentionBridgeError::UntrustedObservationProof);
-        };
-        let Some(proof) = verified.retired_proof() else {
-            return Err(RetentionBridgeError::UntrustedObservationProof);
-        };
-        if dto_receipt != proof.receipt() {
+
+    /// Authenticate a quorum-signed `RefCasSnapshot` envelope against this keyring's
+    /// trusted group keys before inspecting state and minting `VerifiedGroupObservation`.
+    pub fn verify_attested_observation(
+        &self,
+        attested: &AttestedGroupSnapshotDto,
+        binding: &GroupHoldBinding,
+        expected_artifact_digest: &str,
+        expected_backend_identity: &str,
+        min_expected_log_index: Option<u64>,
+    ) -> Result<VerifiedGroupObservation, RetentionBridgeError> {
+        binding.validate()?;
+        RequestDigest::from_str(expected_artifact_digest)?;
+        RequestDigest::from_str(expected_backend_identity)?;
+        if matches!(min_expected_log_index, Some(0)) {
+            return Err(RetentionBridgeError::InvalidBinding("min_expected_log_index must be >= 1".into()));
+        }
+        self.verify_quorum_attestation(attested)?;
+        if (attested.group_id, attested.history_incarnation, attested.group_epoch)
+            != (binding.group_id, binding.history_incarnation, binding.expected_group_epoch)
+        {
             return Err(RetentionBridgeError::UntrustedObservationProof);
         }
+        let snap: RefCasSnapshot = serde_json::from_slice(&attested.snapshot_bytes)
+            .map_err(|_| RetentionBridgeError::UntrustedObservationProof)?;
+        snap.verify_integrity()?;
+        RefCasStateMachine::restore(snap.clone())?;
+        let Some(applied) = snap.body.last_applied else {
+            return Err(RetentionBridgeError::UntrustedObservationProof);
+        };
+        if applied.term != attested.raft_term || applied.index != attested.committed_log_index {
+            return Err(RetentionBridgeError::UntrustedObservationProof);
+        }
+        evaluate_attested_snapshot(
+            &snap,
+            attested,
+            binding,
+            expected_artifact_digest,
+            expected_backend_identity,
+            min_expected_log_index,
+        )
     }
-    Ok(verified)
 }
 
-/// Verify one cryptographic `RefCasSnapshot` and derive the conservative non-underreportable
-/// barrier `last_applied.index` before minting a `VerifiedGroupObservation`.
-pub fn observe_group_retirement_from_snapshot(
+fn evaluate_attested_snapshot(
     snap: &RefCasSnapshot,
+    attested: &AttestedGroupSnapshotDto,
     binding: &GroupHoldBinding,
     expected_artifact_digest: &str,
     expected_backend_identity: &str,
     min_expected_log_index: Option<u64>,
 ) -> Result<VerifiedGroupObservation, RetentionBridgeError> {
-    binding.validate()?;
-    RequestDigest::from_str(expected_artifact_digest)?;
-    RequestDigest::from_str(expected_backend_identity)?;
-    if matches!(min_expected_log_index, Some(0)) {
-        return Err(RetentionBridgeError::InvalidBinding("min_expected_log_index must be >= 1".into()));
-    }
-    snap.verify_integrity()?;
     let (gid, rid) = (binding.group_id, binding.repository_id);
-    let applied_idx = snap.body.last_applied.map_or(0, |id| id.index);
+    let applied_idx = attested.committed_log_index;
     let mk_obs = |state, detail: Option<String>| {
         Ok(VerifiedGroupObservation {
             group_id: gid,
@@ -314,29 +302,16 @@ pub fn observe_group_retirement_from_snapshot(
             detail,
         })
     };
-    if applied_idx == 0 {
-        return mk_obs(
-            VerifiedGroupState::UnknownOutcome { detail: "no applied log".into() },
-            Some("no applied log".into()),
-        );
-    }
     let Some(gate) = snap.body.gates.iter().find(|g| g.repository_id == rid) else {
         return mk_obs(
             VerifiedGroupState::UnknownOutcome { detail: "missing gate".into() },
             Some("missing gate".into()),
         );
     };
-    if (gate.tenant_id, gate.history_incarnation, gate.group_epoch)
-        != (binding.tenant_id, binding.history_incarnation, binding.expected_group_epoch)
+    if (gate.tenant_id, gate.history_incarnation, gate.group_epoch, gate.authority_epoch)
+        != (binding.tenant_id, binding.history_incarnation, binding.expected_group_epoch, attested.authority_epoch)
     {
-        return mk_obs(
-            VerifiedGroupState::StaleSnapshot {
-                observed_log_index: applied_idx,
-                required_log_index: applied_idx,
-                detail: "realm mismatch".into(),
-            },
-            Some("realm mismatch".into()),
-        );
+        return Err(RetentionBridgeError::UntrustedObservationProof);
     }
     if let Some(min_idx) = min_expected_log_index
         && applied_idx < min_idx
@@ -401,7 +376,7 @@ pub fn observe_group_retirement_from_snapshot(
             );
         }
     }
-    // Conservative barrier: use snapshot.last_applied.index so a low caller floor can never lower cursor fencing.
+    // Conservative barrier: locked to quorum-committed `last_applied.index` so low caller hints cannot bypass fencing.
     let mut receipt = GroupRetirementReceiptDto {
         group_id: gid,
         history_incarnation: binding.history_incarnation,

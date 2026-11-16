@@ -4,14 +4,15 @@
 
 use anyhow::{Result, ensure};
 use deadpool_postgres::{Manager, Pool};
+use ring::hmac;
 use rootyard::blob_store::{config::BlobProfile, opendal::BlobStore};
 use rootyard::db;
 use rootyard::ref_store::artifact_hold::bridge_contract::{
     BridgeBinding, GlobalHoldReservationDto, GroupHoldBinding, SharedHoldReference, SharedHoldRetirementStatus,
 };
 use rootyard::ref_store::artifact_hold::reconcile_proof::{
-    GroupObservationStatus, RetirementBlockReason, observe_group_retirement_from_sm,
-    verify_group_observation_with_snapshot,
+    AttestedGroupSnapshotDto, GroupConsensusVerifier, GroupObservationStatus, GroupVoterSignatureDto,
+    QuorumCommitClaims, RetirementBlockReason, quorum_commit_transcript_bytes,
 };
 use rootyard::ref_store::artifact_hold::retention_bridge::{
     BridgeRootRegistrationPlan, RetentionBridgeError, apply_release_root_idempotent, apply_reserved_hold_to_sm,
@@ -23,9 +24,9 @@ use rootyard::ref_store::artifact_hold::retirement_reconcile::reconcile_shared_h
 use rootyard::ref_store::artifact_hold::{AcquireArtifactHoldsRequest, ArtifactHoldPurpose, ArtifactSpec, HoldScope};
 use rootyard::ref_store::core::command::CommitRefsRequest;
 use rootyard::ref_store::core::state_machine::{
-    AppliedLogId, CancelCommand, CommitRefsCommand, InitializeGateCommand, RefCasCommand, RefCasStateMachine,
-    ReleaseRootCommand, RepositoryLane, RetireHoldBatchCommand, ScopeLifecycle, SetRepositoryLaneCommand, SmPackMode,
-    WireCommitRefsRequest, WireGateInit,
+    AppliedLogId, CancelCommand, CommitRefsCommand, InitializeGateCommand, RefCasCommand, RefCasSnapshot,
+    RefCasStateMachine, ReleaseRootCommand, RepositoryLane, RetireHoldBatchCommand, ScopeLifecycle,
+    SetRepositoryLaneCommand, SmPackMode, WireCommitRefsRequest, WireGateInit,
 };
 use rootyard::ref_store::projector::{
     ProjectionError, ProjectionRealm, RefCasEventEnvelope, RefCasEventPage, TruncationCutoff,
@@ -35,7 +36,10 @@ use rootyard::ref_store::{
     CommitMode, CoreGateInit, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MetadataPinPurpose, OperationIdentity,
     PgRefStore, PgRefStoreCore, RefName, RefPrecondition, RefTarget, RefUpdate, RequestDigest,
 };
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::Instant as TokioInstant;
@@ -600,24 +604,130 @@ async fn pg_multi_group_shared_hold_retirement_and_cursor_reconciler() -> Result
         retire_request_id: ret3,
     };
 
-    // Even with a low caller hint `Some(1)`, barrier locks to `snap.last_applied.index == 8`.
-    let obs1 = observe_group_retirement_from_sm(&sm1, &gb1, &shared_sha, &backend_hex, Some(1))?;
-    let obs2 = observe_group_retirement_from_sm(&sm2, &gb2, &shared_sha, &backend_hex, Some(1))?;
-    let obs3 = observe_group_retirement_from_sm(&sm3, &gb3, &shared_sha, &backend_hex, Some(1))?;
+    // Build strict 0700/0600 keyring directory and sign 2-of-3 quorum commits per group.
+    let keyring_dir = tempfile::tempdir()?;
+    #[cfg(unix)]
+    std::fs::set_permissions(keyring_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    let mk_voters = |tag: u8| -> Vec<(u64, u8, [u8; 32])> {
+        (1..=3)
+            .map(|vid| {
+                let mut raw = [tag; 32];
+                raw[0] = vid as u8;
+                raw[31] = tag.wrapping_add(0x41);
+                (vid, 1, raw)
+            })
+            .collect()
+    };
+    let (vk1, vk2, vk3) = (mk_voters(0x11), mk_voters(0x22), mk_voters(0x33));
+    let mut group_entries = Vec::new();
+    for (gid, hist, prefix, vs) in [(10, h1, "g10", &vk1), (20, h2, "g20", &vk2), (30, h3, "g30", &vk3)] {
+        let mut voters_json = Vec::new();
+        for &(vid, kid, raw) in vs {
+            let kfile = format!("{prefix}-v{vid}.key");
+            let kp = keyring_dir.path().join(&kfile);
+            std::fs::write(&kp, raw)?;
+            #[cfg(unix)]
+            std::fs::set_permissions(&kp, std::fs::Permissions::from_mode(0o600))?;
+            voters_json.push(serde_json::json!({"voter_id": vid, "key_id": kid, "key_file": kfile}));
+        }
+        group_entries.push(serde_json::json!({
+            "group_id": gid,
+            "history_incarnation": hist,
+            "quorum_threshold": 2,
+            "voters": voters_json,
+        }));
+    }
+    let mp = keyring_dir.path().join("keyring.json");
+    std::fs::write(&mp, serde_json::to_vec(&serde_json::json!({"schema": 1, "groups": group_entries}))?)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&mp, std::fs::Permissions::from_mode(0o600))?;
+    let verifier = GroupConsensusVerifier::from_keyring_dir(keyring_dir.path())?;
+    ensure!(verifier.group_count() == 3);
+
+    let attest = |sm: &RefCasStateMachine,
+                  gid: i64,
+                  hist: Uuid,
+                  voters: &[(u64, u8, [u8; 32])]|
+     -> Result<AttestedGroupSnapshotDto> {
+        let snapshot_bytes = sm.snapshot_bytes()?;
+        let sha_bytes: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
+        let snap: RefCasSnapshot = serde_json::from_slice(&snapshot_bytes)?;
+        let applied = snap.body.last_applied.unwrap();
+        let gate = snap.body.gates.first().unwrap();
+        let voter_signatures = voters
+            .iter()
+            .map(|&(voter_id, key_id, raw)| {
+                let claims = QuorumCommitClaims {
+                    group_id: gid,
+                    history_incarnation: hist,
+                    group_epoch: gate.group_epoch,
+                    authority_epoch: gate.authority_epoch,
+                    raft_term: applied.term,
+                    committed_log_index: applied.index,
+                    voter_id,
+                    key_id,
+                    snapshot_sha256: &sha_bytes,
+                };
+                let key = hmac::Key::new(hmac::HMAC_SHA256, &raw);
+                let tag = hmac::sign(&key, &quorum_commit_transcript_bytes(&claims));
+                GroupVoterSignatureDto { voter_id, key_id, mac_hex: hex::encode(tag.as_ref()) }
+            })
+            .collect();
+        Ok(AttestedGroupSnapshotDto {
+            group_id: gid,
+            history_incarnation: hist,
+            group_epoch: gate.group_epoch,
+            authority_epoch: gate.authority_epoch,
+            raft_term: applied.term,
+            committed_log_index: applied.index,
+            snapshot_sha256: hex::encode(sha_bytes),
+            snapshot_bytes,
+            voter_signatures,
+        })
+    };
+
+    // Unauthenticated (cross-group key swap, minority quorum, low-index claim) MUST fail closed!
+    let att1 = attest(&sm1, 10, h1, &vk1[..2])?;
+    let swapped = attest(&sm1, 10, h1, &vk2[..2])?;
+    ensure!(
+        verifier.verify_attested_observation(&swapped, &gb1, &shared_sha, &backend_hex, Some(1)).unwrap_err()
+            == RetentionBridgeError::UntrustedObservationProof
+    );
+    let mut minority = att1.clone();
+    minority.voter_signatures.truncate(1);
+    ensure!(
+        verifier.verify_attested_observation(&minority, &gb1, &shared_sha, &backend_hex, Some(1)).unwrap_err()
+            == RetentionBridgeError::UntrustedObservationProof
+    );
+    let mut forged_coord = att1.clone();
+    forged_coord.committed_log_index = 1;
+    ensure!(
+        verifier.verify_attested_observation(&forged_coord, &gb1, &shared_sha, &backend_hex, Some(1)).unwrap_err()
+            == RetentionBridgeError::UntrustedObservationProof
+    );
+
+    // Even with a low caller hint `Some(1)`, barrier locks to committed `snap.last_applied.index == 8`.
+    let obs1 = verifier.verify_attested_observation(&att1, &gb1, &shared_sha, &backend_hex, Some(1))?;
+    let obs2 = verifier.verify_attested_observation(
+        &attest(&sm2, 20, h2, &vk2[..2])?,
+        &gb2,
+        &shared_sha,
+        &backend_hex,
+        Some(1),
+    )?;
+    let obs3 = verifier.verify_attested_observation(
+        &attest(&sm3, 30, h3, &vk3[..2])?,
+        &gb3,
+        &shared_sha,
+        &backend_hex,
+        Some(1),
+    )?;
     ensure!(
         obs1.status() == GroupObservationStatus::Retired
             && obs2.status() == GroupObservationStatus::Retired
             && obs3.status() == GroupObservationStatus::Retired
     );
     ensure!(obs1.retired_proof().unwrap().barrier_log_index() == 8);
-
-    // Tampered DTO claiming lower barrier fails snapshot verification.
-    let mut forged_dto = obs1.to_dto();
-    forged_dto.receipt.as_mut().unwrap().retirement_log_index = 1;
-    let forge_err =
-        verify_group_observation_with_snapshot(&forged_dto, &sm1.snapshot()?, &gb1, &shared_sha, &backend_hex, Some(1))
-            .unwrap_err();
-    ensure!(forge_err == RetentionBridgeError::UntrustedObservationProof);
 
     let shared_two = SharedHoldReference {
         shared_hold_key: Uuid::new_v4(),

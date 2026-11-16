@@ -52,6 +52,7 @@
 //!   cancellation and gate separately.
 pub mod bridge_contract;
 pub mod contract;
+pub mod group_keyring;
 pub mod receipt;
 pub mod reconcile_proof;
 pub mod request;

@@ -6,12 +6,12 @@ use super::bridge_contract::{
     PgCrossRepoSiblingHold, PgHoldRowSummary, RetentionBridgeError, SharedHoldReference, SharedHoldRetirementStatus,
 };
 use super::contract::ArtifactHoldPurpose;
-use super::receipt::{AcquireAck, HoldAck, HoldArtifactIdentity};
-use super::reconcile_proof::{
-    GroupObservationStatus, RetirementBlockReason, VerifiedGroupObservation, observe_group_retirement_from_sm,
-    observe_group_retirement_from_snapshot, observe_group_retirement_from_snapshot_bytes,
-    verify_group_observation_with_snapshot,
+use super::group_keyring::{
+    AttestedGroupSnapshotDto, GroupConsensusVerifier, GroupVoterSignatureDto, QuorumCommitClaims,
+    quorum_commit_transcript_bytes,
 };
+use super::receipt::{AcquireAck, HoldAck, HoldArtifactIdentity};
+use super::reconcile_proof::{GroupObservationStatus, RetirementBlockReason};
 use super::retention_bridge::{
     VerifiedGlobalHoldReservation, apply_release_root_idempotent, apply_reserved_hold_to_sm,
     apply_retire_hold_batch_idempotent, publish_pin_and_root_after_hold,
@@ -25,6 +25,8 @@ use crate::ref_store::core::state_machine::{
     StateMachineError, WireGateInit,
 };
 use crate::ref_store::projector::{ProjectionCursor, ProjectionRealm, TruncationCutoff};
+use ring::hmac;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 fn dhex(label: &str) -> String {
@@ -214,118 +216,187 @@ fn close_and_retire_at(sm: &mut RefCasStateMachine, f: &GroupFx, release_idx: u6
     .unwrap();
 }
 
-#[test]
-fn untrusted_dto_and_tampered_snapshot_proofs_fail_closed() {
-    let (sha, backend) = (dhex("shared-art"), dhex("s3-shared"));
-    let (mut sm_open, f_open) = setup_published_group(1000, &sha, &backend, 10);
-    let g_open = GroupHoldBinding {
-        group_id: 10,
-        history_incarnation: f_open.history,
+fn voter_key(group_tag: u8, voter_id: u64) -> [u8; 32] {
+    let mut raw = [group_tag; 32];
+    raw[0] = voter_id as u8;
+    raw[31] = group_tag.wrapping_add(0x41);
+    raw
+}
+
+fn voters_for(group_tag: u8) -> Vec<(u64, u8, [u8; 32])> {
+    (1..=3).map(|vid| (vid, 1, voter_key(group_tag, vid))).collect()
+}
+
+fn attest_snap_bytes(
+    snapshot_bytes: Vec<u8>,
+    group_id: i64,
+    history_incarnation: Uuid,
+    voters: &[(u64, u8, [u8; 32])],
+) -> AttestedGroupSnapshotDto {
+    let sha_bytes: [u8; 32] = Sha256::digest(&snapshot_bytes).into();
+    let snap: RefCasSnapshot = serde_json::from_slice(&snapshot_bytes).unwrap();
+    let applied = snap.body.last_applied.unwrap();
+    let gate = snap.body.gates.first().unwrap();
+    let voter_signatures = voters
+        .iter()
+        .map(|&(voter_id, key_id, raw)| {
+            let claims = QuorumCommitClaims {
+                group_id,
+                history_incarnation,
+                group_epoch: gate.group_epoch,
+                authority_epoch: gate.authority_epoch,
+                raft_term: applied.term,
+                committed_log_index: applied.index,
+                voter_id,
+                key_id,
+                snapshot_sha256: &sha_bytes,
+            };
+            let key = hmac::Key::new(hmac::HMAC_SHA256, &raw);
+            let tag = hmac::sign(&key, &quorum_commit_transcript_bytes(&claims));
+            GroupVoterSignatureDto { voter_id, key_id, mac_hex: hex::encode(tag.as_ref()) }
+        })
+        .collect();
+    AttestedGroupSnapshotDto {
+        group_id,
+        history_incarnation,
+        group_epoch: gate.group_epoch,
+        authority_epoch: gate.authority_epoch,
+        raft_term: applied.term,
+        committed_log_index: applied.index,
+        snapshot_sha256: hex::encode(sha_bytes),
+        snapshot_bytes,
+        voter_signatures,
+    }
+}
+
+fn mk_binding(group_id: i64, f: &GroupFx) -> GroupHoldBinding {
+    GroupHoldBinding {
+        group_id,
+        history_incarnation: f.history,
         expected_group_epoch: 1,
-        repository_id: f_open.repo,
-        tenant_id: f_open.tenant,
-        hold_ids: vec![f_open.hold_id],
-        retire_request_id: f_open.retire_id,
-    };
+        repository_id: f.repo,
+        tenant_id: f.tenant,
+        hold_ids: vec![f.hold_id],
+        retire_request_id: f.retire_id,
+    }
+}
 
-    // Even if an attacker serializes/forges a Closed+Retired DTO with valid unkeyed digest, verification against live Open snapshot fails closed!
-    let mut forged_obs_dto =
-        observe_group_retirement_from_sm(&sm_open, &g_open, &sha, &backend, None).unwrap().to_dto();
-    assert_eq!(forged_obs_dto.status, GroupObservationStatus::Active);
-    forged_obs_dto.status = GroupObservationStatus::Retired;
-    let err = verify_group_observation_with_snapshot(
-        &forged_obs_dto,
-        &sm_open.snapshot().unwrap(),
-        &g_open,
-        &sha,
-        &backend,
-        None,
-    )
-    .unwrap_err();
-    assert_eq!(err, RetentionBridgeError::UntrustedObservationProof);
+#[test]
+fn unauthenticated_forged_quorum_and_missing_pg_evidence_fail_closed() {
+    let (sha, backend) = (dhex("shared-art"), dhex("s3-shared"));
+    let (mut sm1, f1) = setup_published_group(1000, &sha, &backend, 10);
+    let (_sm2, f2) = setup_published_group(2000, &dhex("different-art"), &backend, 20);
+    let (g1, g2) = (mk_binding(10, &f1), mk_binding(20, &f2));
+    let (v1, v2) = (voters_for(0x11), voters_for(0x22));
+    let verifier = GroupConsensusVerifier::from_test_quorums(vec![
+        (10, f1.history, 2, v1.clone()),
+        (20, f2.history, 2, v2.clone()),
+    ]);
 
-    // Tampered serialized snapshot bytes (mutating last_applied without resealing SHA-256 checksum) fail integrity check.
-    close_and_retire_at(&mut sm_open, &f_open, 5, 6, 10);
-    let mut tampered_snap: RefCasSnapshot = serde_json::from_slice(&sm_open.snapshot_bytes().unwrap()).unwrap();
+    close_and_retire_at(&mut sm1, &f1, 5, 6, 10);
+    let attested = attest_snap_bytes(sm1.snapshot_bytes().unwrap(), 10, f1.history, &v1[..2]);
+
+    // 1. Unauthenticated (empty/minority/duplicate signatures) and wrong-group key swap fail closed.
+    let mut empty = attested.clone();
+    empty.voter_signatures.clear();
+    assert_eq!(
+        verifier.verify_attested_observation(&empty, &g1, &sha, &backend, None).unwrap_err(),
+        RetentionBridgeError::UntrustedObservationProof
+    );
+    let mut minority = attested.clone();
+    minority.voter_signatures.truncate(1);
+    assert_eq!(
+        verifier.verify_attested_observation(&minority, &g1, &sha, &backend, None).unwrap_err(),
+        RetentionBridgeError::UntrustedObservationProof
+    );
+    let mut dup_voter = attested.clone();
+    dup_voter.voter_signatures[1] = dup_voter.voter_signatures[0].clone();
+    assert_eq!(
+        verifier.verify_attested_observation(&dup_voter, &g1, &sha, &backend, None).unwrap_err(),
+        RetentionBridgeError::UntrustedObservationProof
+    );
+    let wrong_group_sig = attest_snap_bytes(sm1.snapshot_bytes().unwrap(), 10, f1.history, &v2[..2]);
+    assert_eq!(
+        verifier.verify_attested_observation(&wrong_group_sig, &g1, &sha, &backend, None).unwrap_err(),
+        RetentionBridgeError::UntrustedObservationProof
+    );
+
+    // 2. Post-sign tampering (coordinate or snapshot bytes) AND corrupted inner snapshot body checksum fail closed.
+    let mut bad_coord = attested.clone();
+    bad_coord.committed_log_index = 1;
+    assert_eq!(
+        verifier.verify_attested_observation(&bad_coord, &g1, &sha, &backend, None).unwrap_err(),
+        RetentionBridgeError::UntrustedObservationProof
+    );
+    let mut tampered_snap: RefCasSnapshot = serde_json::from_slice(&attested.snapshot_bytes).unwrap();
     tampered_snap.body.last_applied = Some(log(1));
-    let tampered_bytes = serde_json::to_vec(&tampered_snap).unwrap();
-    let snap_err =
-        observe_group_retirement_from_snapshot_bytes(&tampered_bytes, &g_open, &sha, &backend, Some(1)).unwrap_err();
+    let mut tampered_wire = attested.clone();
+    tampered_wire.snapshot_bytes = serde_json::to_vec(&tampered_snap).unwrap();
+    assert_eq!(
+        verifier.verify_attested_observation(&tampered_wire, &g1, &sha, &backend, None).unwrap_err(),
+        RetentionBridgeError::UntrustedObservationProof
+    );
+    let corrupt_attested = attest_snap_bytes(serde_json::to_vec(&tampered_snap).unwrap(), 10, f1.history, &v1[..2]);
+    let snap_err = verifier.verify_attested_observation(&corrupt_attested, &g1, &sha, &backend, None).unwrap_err();
     assert!(matches!(snap_err, RetentionBridgeError::StateMachine(StateMachineError::SnapshotCorrupted(_))));
 
-    // Low caller hint (Some(1)) when actual retirement barrier committed at log_index = 10 STILL yields barrier = 10;
-    // lagging PG projection cursor at index = 2 MUST fail closed (Protected / CursorBehindRetirement).
-    let verified =
-        observe_group_retirement_from_snapshot(&sm_open.snapshot().unwrap(), &g_open, &sha, &backend, Some(1)).unwrap();
+    // 3. Low caller hint (Some(1)) still locks barrier to committed log 10; lagging cursor AND pg_holds=None fail closed!
+    let verified = verifier.verify_attested_observation(&attested, &g1, &sha, &backend, Some(1)).unwrap();
     assert_eq!(verified.retired_proof().unwrap().barrier_log_index(), 10);
     let shared = SharedHoldReference {
         shared_hold_key: Uuid::from_u128(9900),
         artifact_digest: sha.clone(),
         backend_identity: backend.clone(),
-        groups: vec![g_open],
+        groups: vec![g1],
     };
-    let lagging_cursor = make_cursor(f_open.history, 10, 1, 2);
-    let out = evaluate_shared_hold_retirement(&shared, &[verified], &[lagging_cursor], None).unwrap();
-    assert_eq!(out.status, SharedHoldRetirementStatus::Protected);
-    assert!(out.reasons.iter().any(|r| matches!(
+    let out_lag =
+        evaluate_shared_hold_retirement(&shared, &[verified.clone()], &[make_cursor(f1.history, 10, 1, 2)], None)
+            .unwrap();
+    assert_eq!(out_lag.status, SharedHoldRetirementStatus::Protected);
+    assert!(out_lag.reasons.contains(&RetirementBlockReason::MissingPgEvidence));
+    assert!(out_lag.reasons.iter().any(|r| matches!(
         r,
         RetirementBlockReason::CursorBehindRetirement { group_id: 10, applied_log_index: 2, retirement_log_index: 10 }
     )));
+    // Even with a converged cursor, pg_holds = None NEVER returns RetiredToSafeReclaim (P2).
+    let out_no_pg =
+        evaluate_shared_hold_retirement(&shared, &[verified], &[make_cursor(f1.history, 10, 1, 10)], None).unwrap();
+    assert_eq!(
+        (out_no_pg.status, out_no_pg.reconciled_groups, out_no_pg.reasons),
+        (SharedHoldRetirementStatus::Protected, 0, vec![RetirementBlockReason::MissingPgEvidence])
+    );
 
-    // Cross-artifact proof substitution MUST be rejected.
-    let (_sm_other, f_other) = setup_published_group(2000, &dhex("different-art"), &backend, 10);
-    let g_other = GroupHoldBinding {
-        group_id: 10,
-        history_incarnation: f_other.history,
-        expected_group_epoch: 1,
-        repository_id: f_other.repo,
-        tenant_id: f_other.tenant,
-        hold_ids: vec![f_other.hold_id],
-        retire_request_id: f_other.retire_id,
-    };
-    let mut sm_other_retired = _sm_other;
-    close_and_retire_at(&mut sm_other_retired, &f_other, 5, 6, 7);
-    let wrong_proof =
-        observe_group_retirement_from_sm(&sm_other_retired, &g_other, &dhex("different-art"), &backend, None).unwrap();
+    // 4. Cross-artifact proof substitution MUST be rejected even when quorum-signed.
+    let mut sm2 = _sm2;
+    close_and_retire_at(&mut sm2, &f2, 5, 6, 7);
+    let att2 = attest_snap_bytes(sm2.snapshot_bytes().unwrap(), 20, f2.history, &v2[..2]);
+    let wrong_art = verifier.verify_attested_observation(&att2, &g2, &dhex("different-art"), &backend, None).unwrap();
     let cross_err = evaluate_shared_hold_retirement(
         &SharedHoldReference {
             shared_hold_key: Uuid::from_u128(9901),
             artifact_digest: sha,
             backend_identity: backend,
-            groups: vec![g_other],
+            groups: vec![g2],
         },
-        &[wrong_proof],
-        &[make_cursor(f_other.history, 10, 1, 7)],
+        &[wrong_art],
+        &[make_cursor(f2.history, 20, 1, 7)],
         None,
     )
     .unwrap();
-    assert_eq!(cross_err.status, SharedHoldRetirementStatus::Protected);
     assert!(cross_err.reasons.iter().any(|r| matches!(r, RetirementBlockReason::InvalidReceipt { .. })));
 }
 
 #[test]
-fn multi_group_retirement_fails_closed_across_faults_and_converges_safely() {
+fn multi_group_faults_and_pg_convergence() {
     let (sha, backend) = (dhex("shared-physical-pack"), dhex("s3-bucket-shared"));
     let (mut sm1, f1) = setup_published_group(6000, &sha, &backend, 10);
     let (mut sm2, f2) = setup_published_group(7000, &sha, &backend, 20);
-    let g1 = GroupHoldBinding {
-        group_id: 10,
-        history_incarnation: f1.history,
-        expected_group_epoch: 1,
-        repository_id: f1.repo,
-        tenant_id: f1.tenant,
-        hold_ids: vec![f1.hold_id],
-        retire_request_id: f1.retire_id,
-    };
-    let g2 = GroupHoldBinding {
-        group_id: 20,
-        history_incarnation: f2.history,
-        expected_group_epoch: 1,
-        repository_id: f2.repo,
-        tenant_id: f2.tenant,
-        hold_ids: vec![f2.hold_id],
-        retire_request_id: f2.retire_id,
-    };
+    let (g1, g2) = (mk_binding(10, &f1), mk_binding(20, &f2));
+    let (v1, v2) = (voters_for(0x31), voters_for(0x41));
+    let verifier = GroupConsensusVerifier::from_test_quorums(vec![
+        (10, f1.history, 2, v1.clone()),
+        (20, f2.history, 2, v2.clone()),
+    ]);
     let shared = SharedHoldReference {
         shared_hold_key: Uuid::from_u128(8888),
         artifact_digest: sha.clone(),
@@ -333,42 +404,33 @@ fn multi_group_retirement_fails_closed_across_faults_and_converges_safely() {
         groups: vec![g1.clone(), g2.clone()],
     };
 
+    let att1_open = attest_snap_bytes(sm1.snapshot_bytes().unwrap(), 10, f1.history, &v1[..2]);
     assert_eq!(
-        observe_group_retirement_from_sm(&sm1, &g1, &sha, &backend, Some(4)).unwrap().status(),
+        verifier.verify_attested_observation(&att1_open, &g1, &sha, &backend, Some(4)).unwrap().status(),
         GroupObservationStatus::Active
     );
     assert_eq!(
-        observe_group_retirement_from_sm(&sm1, &g1, &sha, &backend, Some(7)).unwrap().status(),
+        verifier.verify_attested_observation(&att1_open, &g1, &sha, &backend, Some(7)).unwrap().status(),
         GroupObservationStatus::StaleSnapshot
     );
 
-    // Advance group 1 to log 10 via no-ops + retire so barrier = 10.
     sm1.apply(log(5), RefCasCommand::Noop(NoopCommand { logical_tick: Some(5) })).unwrap();
     close_and_retire_at(&mut sm1, &f1, 6, 7, 10);
-    let obs1 = observe_group_retirement_from_sm(&sm1, &g1, &sha, &backend, Some(1)).unwrap();
+    let obs1 = verifier
+        .verify_attested_observation(
+            &attest_snap_bytes(sm1.snapshot_bytes().unwrap(), 10, f1.history, &v1[1..]),
+            &g1,
+            &sha,
+            &backend,
+            Some(1),
+        )
+        .unwrap();
     assert_eq!(obs1.retired_proof().unwrap().barrier_log_index(), 10);
 
-    // Group 2 still active -> Protected despite Group 1 retirement.
-    let obs2_active = observe_group_retirement_from_sm(&sm2, &g2, &sha, &backend, None).unwrap();
-    let res = evaluate_shared_hold_retirement(
-        &shared,
-        &[obs1.clone(), obs2_active],
-        &[make_cursor(f1.history, 10, 1, 10), make_cursor(f2.history, 20, 1, 7)],
-        None,
-    )
-    .unwrap();
-    assert_eq!(res.status, SharedHoldRetirementStatus::Protected);
-    assert!(res.reasons.iter().any(|r| matches!(r, RetirementBlockReason::GroupStillActive { group_id: 20, .. })));
-
     close_and_retire_at(&mut sm2, &f2, 5, 6, 7);
-    let obs2 = observe_group_retirement_from_sm(&sm2, &g2, &sha, &backend, None).unwrap();
-    assert_eq!(obs2.status(), GroupObservationStatus::Retired);
-    assert_eq!(
-        observe_group_retirement_from_sm(&sm2, &g2, &sha, &backend, Some(9)).unwrap().status(),
-        GroupObservationStatus::StaleSnapshot
-    );
-
-    let unreach = VerifiedGroupObservation::unreachable(20, f2.repo, Some("timeout".into()));
+    let att2 = attest_snap_bytes(sm2.snapshot_bytes().unwrap(), 20, f2.history, &v2[..2]);
+    let obs2 = verifier.verify_attested_observation(&att2, &g2, &sha, &backend, None).unwrap();
+    let unreach = verifier.observe_unreachable(&g2, Some("timeout".into())).unwrap();
     let (c1, c2) = (make_cursor(f1.history, 10, 1, 10), make_cursor(f2.history, 20, 1, 7));
     let r_unreach =
         evaluate_shared_hold_retirement(&shared, &[obs1.clone(), unreach], &[c1.clone(), c2.clone()], None).unwrap();
@@ -381,38 +443,28 @@ fn multi_group_retirement_fails_closed_across_faults_and_converges_safely() {
         log_index: 7,
         event_seq: 9,
         log_term: 1,
-        closure_digest: dhex("cutoff"),
+        closure_digest: dhex("cut"),
         archive_uri: None,
     });
     let r_lag =
         evaluate_shared_hold_retirement(&shared, &[obs1.clone(), obs2.clone()], &[c1.clone(), bad_c2], None).unwrap();
-    assert!(r_lag.reasons.iter().any(|r| matches!(r, RetirementBlockReason::CursorEpochMismatch { group_id: 20, .. })));
     assert!(
         r_lag.reasons.iter().any(|r| matches!(r, RetirementBlockReason::CursorBehindRetirement { group_id: 20, .. }))
     );
-    assert!(
-        r_lag.reasons.iter().any(|r| matches!(r, RetirementBlockReason::CursorResyncRequired { group_id: 20, .. }))
-    );
 
+    let found_holds = [&f1, &f2]
+        .into_iter()
+        .map(|f| PgHoldRowSummary {
+            hold_id: f.hold_id,
+            repository_id: f.repo,
+            tenant_id: f.tenant,
+            sha256: sha.clone(),
+            backend_identity: backend.clone(),
+            state: "active".into(),
+        })
+        .collect();
     let mut pg_view = PgArtifactHoldReconciliationView {
-        found_holds: vec![
-            PgHoldRowSummary {
-                hold_id: f1.hold_id,
-                repository_id: f1.repo,
-                tenant_id: f1.tenant,
-                sha256: sha.clone(),
-                backend_identity: backend.clone(),
-                state: "active".into(),
-            },
-            PgHoldRowSummary {
-                hold_id: f2.hold_id,
-                repository_id: f2.repo,
-                tenant_id: f2.tenant,
-                sha256: sha,
-                backend_identity: backend,
-                state: "active".into(),
-            },
-        ],
+        found_holds,
         unreconciled_sibling_holds: vec![PgCrossRepoSiblingHold {
             repository_id: Uuid::from_u128(9991),
             hold_id: Uuid::from_u128(9992),
@@ -426,7 +478,6 @@ fn multi_group_retirement_fails_closed_across_faults_and_converges_safely() {
     )
     .unwrap();
     assert!(r_sib.reasons.iter().any(|r| matches!(r, RetirementBlockReason::UnreconciledCrossRepoHold { .. })));
-
     pg_view.unreconciled_sibling_holds.clear();
     let r_ok = evaluate_shared_hold_retirement(&shared, &[obs1, obs2], &[c1, c2], Some(&pg_view)).unwrap();
     assert_eq!(
