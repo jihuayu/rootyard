@@ -11,16 +11,14 @@ from __future__ import annotations
 
 from pathlib import Path
 import stat
-import time
 
 from pando_vault_rotation_fixture import FixtureError
+from pando_vault_rotation_mirror import read_complete_mirror
 from pando_vault_rotation_support import (
     CASES,
     QualificationError,
     cache_absent,
     local_authority_absent,
-    mirror_path,
-    read_mirror,
     require,
     sha256_bytes,
     sha256_file,
@@ -94,32 +92,14 @@ def _alternate_hex(value):
     return "0" * 64 if value != "0" * 64 else "1" * 64
 
 
-def _require_healthy_mirror(ctx, pack, original):
-    """Require the ordinary mirror to be a regular file matching DB authority."""
-    stage = "db_envelope_tamper"
-    path = mirror_path(ctx.root.path, ctx.repo, pack)
-    try:
-        info = path.lstat()
-    except OSError:
-        raise QualificationError("healthy_mirror_missing", stage) from None
-    require(stat.S_ISREG(info.st_mode), "healthy_mirror_not_regular", stage)
-    value = read_mirror(ctx.root.path, ctx.repo, pack)
-    require(isinstance(value, dict), "healthy_mirror_unreadable", stage)
-    require(value.get("repo") == ctx.repo and value.get("pack_id") == pack,
-            "healthy_mirror_identity_mismatch", stage)
-    require(value.get("envelope_mac") == original.get("envelope_mac")
-            and value.get("ciphertext_sha256") == original.get("ciphertext_sha256"),
-            "healthy_mirror_db_mismatch", stage)
-    return path
-
-
-def probe_db_envelope_field_tamper(ctx, pack, field, stage):
+def probe_db_envelope_field_tamper(ctx, pack, field, stage, canonical=None):
     """Tamper one DB envelope field, prove both cold consumers fail, restore.
 
-    The healthy ordinary mirror must already match the original DB envelope.
-    ``envelope_mac`` and ``ciphertext_sha256`` are changed in separate probes so
-    a MAC-only failure cannot be explained by a digest mismatch.  The exact DB
-    row is restored in ``finally`` even when a probe raises.
+    The complete healthy mirror must match the original DB/manifest record
+    before mutation.  ``envelope_mac`` and ``ciphertext_sha256`` are changed in
+    separate probes so a MAC-only failure cannot be explained by a digest
+    mismatch.  The exact DB row is restored in ``finally`` even when a probe
+    raises.
     """
     require(field in ("envelope_mac", "ciphertext_sha256"),
             "db_tamper_field_invalid", stage)
@@ -130,8 +110,8 @@ def probe_db_envelope_field_tamper(ctx, pack, field, stage):
         require(isinstance(value, str) and len(value) == 64
                 and all(char in "0123456789abcdef" for char in value),
                 "db_envelope_original_invalid", stage)
-    mirror = _require_healthy_mirror(ctx, pack, envelope)
-    before_mirror = mirror.read_bytes()
+    _path, before_mirror, _record = read_complete_mirror(
+        ctx, pack, canonical, db=envelope, stage=stage)
     before_cipher = ctx.cipher(pack)
     alternate = _alternate_hex(envelope[field])
     require(alternate != envelope[field], "db_tamper_value_unchanged", stage)
@@ -149,15 +129,17 @@ def probe_db_envelope_field_tamper(ctx, pack, field, stage):
         else:
             require(tampered.get("envelope_mac") == original_mac,
                     "db_digest_tamper_changed_mac", stage)
-        _require_healthy_mirror(ctx, pack, envelope)
+        read_complete_mirror(ctx, pack, canonical, db=envelope, stage=stage)
         _negative_verify(ctx, ctx.environment, stage + "_verify")
         _negative_get(ctx, pack, ctx.environment, stage + "_get")
         after_cipher = ctx.cipher(pack)
         require(sha256_bytes(after_cipher) == sha256_bytes(before_cipher)
                 and len(after_cipher) == len(before_cipher),
                 "db_tamper_changed_ciphertext", stage)
-        require(_require_healthy_mirror(ctx, pack, envelope).read_bytes()
-                == before_mirror, "db_tamper_changed_healthy_mirror", stage)
+        _after_path, after_mirror, _after_record = read_complete_mirror(
+            ctx, pack, canonical, db=envelope, stage=stage)
+        require(after_mirror == before_mirror,
+                "db_tamper_changed_healthy_mirror", stage)
         require(cache_absent(ctx.root.path, ctx.repo, [pack]),
                 stage + "_created_plaintext_cache", stage)
         require(local_authority_absent(ctx.root.path, ctx.repo),
@@ -175,6 +157,9 @@ def probe_db_envelope_field_tamper(ctx, pack, field, stage):
 def case_wrong_key_ciphertext_envelope_and_provider_revocation(ctx):
     before_cas = _cas_snapshot(ctx)
     before_db = _db_snapshot(ctx)
+    pack = ctx.pack_ids[0]
+    canonical_mirror_path, _canonical_mirror_bytes, canonical_mirror = (
+        read_complete_mirror(ctx, pack, stage="mirror_baseline"))
     latest = ctx.fixture.key_metadata()["latest_version"]
     require(latest == 3, "negative_baseline_latest_invalid", "fail_closed")
     wrong_metadata = ctx.fixture.create_wrong_key()
@@ -198,7 +183,6 @@ def case_wrong_key_ciphertext_envelope_and_provider_revocation(ctx):
     ctx.cold_get(ctx.pack_ids[0])
     wrong_key_denied = True
 
-    pack = ctx.pack_ids[0]
     manifest = ctx.manifest(pack)
     cipher_path = (ctx.root.path / manifest["pack_key"]).resolve()
     original = cipher_path.read_bytes()
@@ -228,35 +212,37 @@ def case_wrong_key_ciphertext_envelope_and_provider_revocation(ctx):
     ctx.cold_verify()
 
     mac_only_denied = probe_db_envelope_field_tamper(
-        ctx, pack, "envelope_mac", "db_envelope_mac_tamper")
+        ctx, pack, "envelope_mac", "db_envelope_mac_tamper", canonical_mirror)
     ctx.evict([pack])
     ctx.cold_get(pack)
     ctx.cold_verify()
     digest_only_denied = probe_db_envelope_field_tamper(
-        ctx, pack, "ciphertext_sha256", "db_envelope_digest_tamper")
+        ctx, pack, "ciphertext_sha256", "db_envelope_digest_tamper",
+        canonical_mirror)
     require(mac_only_denied and digest_only_denied,
             "db_envelope_tamper_not_denied", "db_envelope_tamper")
     ctx.evict([pack])
     ctx.cold_get(pack)
     ctx.cold_verify()
 
-    mirror = ctx.root.path / "object_store" / "envelopes" / ctx.repo / (pack + ".json")
+    mirror = canonical_mirror_path
     mirror.chmod(0o600)
     mirror.write_bytes(b'{"schema":"broken","envelope_mac":"' + b"0" * 64 + b'"}\n')
     ctx.evict([pack])
     ctx.cold_get(pack)
-    import json
-    repaired = json.loads(mirror.read_text())
-    require(repaired.get("envelope_mac") == ctx.envelope(pack)["envelope_mac"],
-            "mirror_tamper_not_repaired_from_db", "mirror_repair")
+    _repair_path, _repaired_bytes, repaired = read_complete_mirror(
+        ctx, pack, canonical_mirror, stage="mirror_repair")
+    require(repaired == canonical_mirror,
+            "mirror_tamper_not_full_repaired_from_db", "mirror_repair")
     mirror_tamper_repaired = True
     mirror.unlink()
     ctx.evict([pack])
     ctx.cold_get(pack)
     require(mirror.is_file(), "missing_mirror_not_recreated", "mirror_repair")
-    require(json.loads(mirror.read_text()).get("envelope_mac")
-            == ctx.envelope(pack)["envelope_mac"],
-            "missing_mirror_not_repaired_from_db", "mirror_repair")
+    _repair_path, _repaired_bytes, repaired = read_complete_mirror(
+        ctx, pack, canonical_mirror, stage="mirror_repair")
+    require(repaired == canonical_mirror,
+            "missing_mirror_not_full_repaired_from_db", "mirror_repair")
     mirror_missing_repaired = True
     ctx.cold_verify()
 
