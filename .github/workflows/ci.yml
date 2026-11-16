@@ -342,7 +342,9 @@ jobs:
         run: |
           set -euo pipefail
           set +x
+          set -a
           . "${{ steps.workspace_garage.outputs.env_file }}"
+          set +a
           set +e
           ROOTYARD_TEST_FUSE_BACKEND=fuse-helper             python3 tests/workspace_fuse_service_acceptance.py               --report test-results/workspace-fuse-service.json
           fuse_rc=$?
