@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RemoteEntry {
+pub(crate) struct RemoteEntry {
     pub path_base64: String,
     pub kind: String,
     pub mode: u32,
@@ -44,7 +44,7 @@ pub(super) struct RemoteEntry {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RemoteManifest {
+pub(crate) struct RemoteManifest {
     pub schema: u32,
     pub checkpoint_id: Uuid,
     pub repository_id: Uuid,

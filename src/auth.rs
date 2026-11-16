@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 #[path = "auth/browser_parent.rs"]
 mod browser_parent;
+#[path = "auth/lifecycle.rs"]
+pub(crate) mod lifecycle;
 
 tokio::task_local! { static WEB_AUTH_SCOPE: bool; }
 pub async fn web_scope<F: std::future::Future>(future: F) -> F::Output {
@@ -91,53 +93,22 @@ pub async fn authorize_repo_with_role(
     min_role: Role,
     action: crate::token_scopes::RepoAction,
 ) -> Result<RepoAccess, Error> {
-    if !db::valid_name(owner) || !db::valid_name(name) {
-        return Err(Error::not_found());
-    }
-    // Keep lock order token/user -> repository -> creation key -> counter/issue/comment.
-    // Revoke and read_only updates must wait for these transaction-scoped locks.
-    tx.query_opt(
-        "SELECT t.id FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND u.username=$3 FOR SHARE OF t,u",
-        &[&actor.token_id, &actor.id, &actor.username],
-    )
-    .await
-    .map_err(Error::internal)?
-    .ok_or_else(Error::unauthorized)?;
-    // read_only follows the resolved action, never the route's minimum role:
-    // an admin may legitimately perform a read with a read-only token.
-    verify_token(tx, actor, action.is_mutating()).await?;
-
-    let row = tx
-        .query_opt(
-            "SELECT r.id, r.owner_id, r.state FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id WHERE ns.slug = $1 AND r.name = $2 FOR SHARE OF r",
-            &[&owner, &name],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    let repo_id: Uuid = row.get("id");
-    let owner_id: Uuid = row.get("owner_id");
-    let state: String = row.get("state");
-
-    let Some((effective_role, _, _)) =
-        crate::members::rbac::resolve_effective_role(&**tx, repo_id, owner_id, actor.id).await?
-    else {
-        return Err(Error::not_found());
-    };
-
-    if effective_role < min_role {
-        return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
-    }
-    if state != "ready" {
-        return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
-    }
-    // Scopes only narrow the RBAC result above and are read in the same
-    // transaction, so a token narrowing cannot race this authorisation.
-    authorize_repo_scope(tx, actor, repo_id, action).await?;
-    Ok(RepoAccess { repo_id, owner_id, role: effective_role })
+    authorize_repo_lifecycle(tx, actor, owner, name, min_role, action, false).await
 }
 
-async fn authorize_repo_scope(
+pub async fn authorize_repo_lifecycle(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    owner: &str,
+    name: &str,
+    min_role: Role,
+    action: crate::token_scopes::RepoAction,
+    allow_deleted: bool,
+) -> Result<RepoAccess, Error> {
+    lifecycle::authorize_repo_lifecycle_inner(tx, actor, owner, name, min_role, action, allow_deleted).await
+}
+
+pub(super) async fn authorize_repo_scope(
     tx: &Transaction<'_>,
     actor: &Identity,
     repo_id: Uuid,
@@ -191,6 +162,7 @@ pub async fn authorize_repo_action_by_id(
     action: crate::token_scopes::RepoAction,
 ) -> Result<(), Error> {
     verify_token(tx, actor, action.is_mutating()).await?;
+    lifecycle::check_repo_availability_by_id(&**tx, repo_id, action.is_mutating()).await?;
     authorize_repo_scope(tx, actor, repo_id, action).await
 }
 
@@ -278,13 +250,23 @@ async fn verify_active_inner(
     let tx = client.transaction().await.map_err(Error::internal)?;
     verify_token(&tx, actor, action.is_mutating()).await?;
     let row = tx
-        .query_opt("SELECT owner_id, state, storage_generation FROM repositories WHERE id=$1", &[&repo_id])
+        .query_opt(
+            "SELECT owner_id, state, storage_generation, deleted_at IS NOT NULL AS deleted, \
+                    archived_at IS NOT NULL AS archived, transition_state FROM repositories WHERE id=$1",
+            &[&repo_id],
+        )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     let owner_id: Uuid = row.get("owner_id");
     let state: String = row.get("state");
     let storage_generation: i64 = row.get("storage_generation");
+    let deleted: bool = row.get("deleted");
+    let archived: bool = row.get("archived");
+    let transition_state: String = row.get("transition_state");
+    if deleted {
+        return Err(Error::not_found());
+    }
     if state != "ready" {
         return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
     }
@@ -298,6 +280,7 @@ async fn verify_active_inner(
     if eff < min_role {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
+    lifecycle::enforce_availability(&**tx, repo_id, deleted, archived, &transition_state, action.is_mutating()).await?;
     authorize_repo_scope(&tx, actor, repo_id, action).await?;
     Ok(())
 }
@@ -339,11 +322,18 @@ pub async fn verify_repo_write_access_with_parent<C: GenericClient + Sync>(
         return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
     }
     let repo = client
-        .query_opt("SELECT owner_id,state FROM repositories WHERE id=$1", &[&repo_id])
+        .query_opt(
+            "SELECT owner_id, state, deleted_at IS NOT NULL, archived_at IS NOT NULL, transition_state \
+             FROM repositories WHERE id=$1",
+            &[&repo_id],
+        )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     let owner_id: Uuid = repo.get(0);
+    if repo.get::<_, bool>(2) {
+        return Err(Error::not_found());
+    }
     if repo.get::<_, String>(1) != "ready" {
         return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
     }
@@ -355,6 +345,8 @@ pub async fn verify_repo_write_access_with_parent<C: GenericClient + Sync>(
     if effective < Role::Write {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
+    lifecycle::enforce_availability(client, repo_id, false, repo.get(3), repo.get::<_, &str>(4), action.is_mutating())
+        .await?;
     crate::token_scopes::authorize_repository_late_with_parent(
         client,
         token_id,
@@ -406,10 +398,17 @@ pub async fn authorize_publication_window(
     // Step 3: current repository generation/state and effective write role,
     // read under the same transaction that now owns the token lock.
     let repo = tx
-        .query_opt("SELECT owner_id,state,storage_generation FROM repositories WHERE id=$1", &[&repository_id])
+        .query_opt(
+            "SELECT owner_id, state, storage_generation, deleted_at IS NOT NULL, archived_at IS NOT NULL, transition_state \
+             FROM repositories WHERE id=$1",
+            &[&repository_id],
+        )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
+    if repo.get::<_, bool>(3) {
+        return Err(Error::not_found());
+    }
     if repo.get::<_, i64>(2) != storage_generation {
         return Err(Error(StatusCode::CONFLICT, "repository generation changed before ref publication"));
     }
@@ -425,6 +424,7 @@ pub async fn authorize_publication_window(
     if effective < Role::Write {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
+    lifecycle::enforce_availability(&**tx, repository_id, false, repo.get(4), repo.get::<_, &str>(5), true).await?;
     // Step 4: the fixed action is ContentsWrite; the token can only narrow.
     crate::token_scopes::authorize_repository_late_with_parent(
         &**tx,

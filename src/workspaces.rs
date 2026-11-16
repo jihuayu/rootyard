@@ -25,7 +25,7 @@ mod models;
 #[path = "workspaces/mounts.rs"]
 pub mod mounts;
 #[path = "workspaces/remote.rs"]
-mod remote;
+pub(crate) mod remote;
 #[path = "workspaces/remote_gc.rs"]
 mod remote_gc;
 #[path = "workspaces/scan.rs"]

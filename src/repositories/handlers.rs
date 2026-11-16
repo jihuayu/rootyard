@@ -65,6 +65,24 @@ pub(super) async fn create_repo(
     auth::reject_restricted_create(&tx, &identity).await?;
     let owner = input.owner.as_deref().unwrap_or(&identity.username);
     let owner_id = organizations::authorize_namespace_create(&tx, &identity, owner).await?;
+    let slot_conflict = tx
+        .query_opt(
+            "SELECT 'deleted' FROM repositories WHERE owner_id=$1 AND name=$2 AND deleted_at IS NOT NULL \
+             UNION ALL \
+             SELECT 'alias' FROM repository_aliases WHERE alias_owner_id=$1 AND alias_name=$2 \
+             LIMIT 1",
+            &[&owner_id, &input.name],
+        )
+        .await
+        .map_err(Error::internal)?;
+    if let Some(row) = slot_conflict {
+        let msg = if row.get::<_, &str>(0) == "deleted" {
+            "repository name belongs to a soft-deleted repository pending purge"
+        } else {
+            "repository name is reserved by an active redirect alias"
+        };
+        return Err(Error(StatusCode::CONFLICT, msg));
+    }
     let format = input.object_format.unwrap_or(browse::object_format::ObjectFormat::Sha1);
     let id = Uuid::new_v4();
     let created=tx.execute("INSERT INTO repositories (id,owner_id,name,object_format) VALUES ($1,$2,$3,$4) ON CONFLICT (owner_id,name) DO NOTHING",&[&id,&owner_id,&input.name,&format.as_str()]).await.map_err(Error::internal)?==1;
@@ -140,7 +158,7 @@ pub(super) async fn list_repos(
     // never widen the actor's permission filters.
     let sql = format!(
         concat!(
-            "{} WHERE (r.owner_id=$1",
+            "{} WHERE r.deleted_at IS NULL AND (r.owner_id=$1",
             " OR EXISTS (SELECT 1 FROM repository_collaborators c WHERE c.repository_id=r.id AND c.user_id=$1)",
             " OR EXISTS (SELECT 1 FROM repository_teams t JOIN repository_team_members m ON m.team_id=t.id WHERE t.repository_id=r.id AND m.user_id=$1)",
             " OR EXISTS (SELECT 1 FROM organization_memberships m WHERE m.organization_id=r.owner_id AND m.user_id=$1)",
@@ -160,7 +178,7 @@ pub(super) async fn list_repos(
     let rows = if restricted {
         let sql = format!(
             concat!(
-                "{} WHERE (r.owner_id=$6",
+                "{} WHERE r.deleted_at IS NULL AND (r.owner_id=$6",
                 " OR EXISTS (SELECT 1 FROM repository_collaborators c WHERE c.repository_id=r.id AND c.user_id=$6)",
                 " OR EXISTS (SELECT 1 FROM repository_teams t JOIN repository_team_members m ON m.team_id=t.id WHERE t.repository_id=r.id AND m.user_id=$6)",
                 " OR EXISTS (SELECT 1 FROM organization_memberships m WHERE m.organization_id=r.owner_id AND m.user_id=$6)",
@@ -230,7 +248,10 @@ pub(super) async fn get_repo(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id: Uuid = if owner == identity.username {
         let repo_id: Uuid = tx
-            .query_opt("SELECT id FROM repositories WHERE owner_id=$1 AND name=$2", &[&identity.id, &name])
+            .query_opt(
+                "SELECT id FROM repositories WHERE owner_id=$1 AND name=$2 AND deleted_at IS NULL",
+                &[&identity.id, &name],
+            )
             .await
             .map_err(Error::internal)?
             .ok_or_else(Error::not_found)?
@@ -298,5 +319,6 @@ pub async fn recover(state: &AppState) -> anyhow::Result<usize> {
             Err(_) => eprintln!("rootyard: repository {id} provisioning requires retry"),
         }
     }
+    recovered += super::transfer_db::recover_transfers(state).await?;
     Ok(recovered)
 }

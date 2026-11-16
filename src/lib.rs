@@ -102,6 +102,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(sandbox::routes())
         .merge(namespace_service::routes())
         .fallback(|State(state): State<Arc<AppState>>, request| async move { git_http::handle(state, request).await })
+        .layer(axum::middleware::from_fn_with_state(state.clone(), repositories::alias_middleware::middleware))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(axum::middleware::from_fn(observability::middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_admission::login_middleware))
