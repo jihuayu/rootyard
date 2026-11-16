@@ -2,7 +2,7 @@
 //! ignored real PG/S3/trusted-Git tests; no HTTP route, keyring or runtime PASS is
 //! claimed. Sources and roots are established through the real provision,
 //! A3/A4/native publication, A5 serving snapshot and core roots paths.
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use axum::http::StatusCode;
 use std::sync::Arc;
 use std::time::Duration;
