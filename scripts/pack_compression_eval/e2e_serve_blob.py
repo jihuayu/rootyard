@@ -24,6 +24,14 @@ from .corpus import (
     run_git,
     write_askpass_script,
 )
+from .failure_diagnostics import (
+    LiveEvalFailure,
+    bindings_from_receipt,
+    build_failure_record,
+    completed_counts,
+    enrich_failure_record,
+    sanitize_s3_snapshot,
+)
 from .live_server import (
     append_search_path,
     cli_exec,
@@ -69,6 +77,35 @@ def run_live_serve_blob_eval(
     # Every child launch uses the canonical reader's resolved, verified path.
     # The benchmark owns this path; this does not make later launches atomic.
     binary = receipt_info["path"]
+    progress: dict[str, Any] = {
+        "last_completed_phase": "live_setup",
+        "completed": completed_counts(),
+    }
+
+    def push_context(
+        phase: str,
+        *,
+        archetype: str = "unknown",
+        object_format: str = "unknown",
+        config: str = "baseline",
+        repo_ordinal: int | None = None,
+        wave_ordinal: int | None = None,
+        target_ordinal: int | None = None,
+        branch_ordinal: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "phase": phase,
+            "archetype": archetype,
+            "object_format": object_format,
+            "config": config,
+            "repo_ordinal": repo_ordinal,
+            "wave_ordinal": wave_ordinal,
+            "target_ordinal": target_ordinal,
+            "branch_ordinal": branch_ordinal,
+            "completed": dict(progress["completed"]),
+            "last_completed_phase": progress["last_completed_phase"],
+        }
+
     parsed_s3 = urllib.parse.urlsplit(live.s3_endpoint)
     if parsed_s3.scheme != "http" or not parsed_s3.hostname:
         raise RuntimeError("S3 endpoint must be plain HTTP loopback or host:port for wire metering")
@@ -134,14 +171,34 @@ def run_live_serve_blob_eval(
                 seed_oid = apply_commit_spec(git_bin, wdir, cs, git_rw_env, step)
                 step += 1
             head_oid = seed_oid
-            multi_push_latencies.append(push_with_pack_config(git_bin, wdir, remote_url, None, "HEAD:refs/heads/main", git_rw_env))
-            for wave in waves:
+            multi_push_latencies.append(
+                push_with_pack_config(
+                    git_bin, wdir, remote_url, None, "HEAD:refs/heads/main", git_rw_env,
+                    context=push_context(
+                        "baseline_seed_push", archetype=arch, object_format=obj_fmt, repo_ordinal=idx
+                    ),
+                )
+            )
+            progress["completed"]["baseline_seed_pushes_completed"] += 1
+            progress["last_completed_phase"] = "baseline_seed_push"
+            for wave_ordinal, wave in enumerate(waves, start=1):
                 for cs in wave:
                     head_oid = apply_commit_spec(git_bin, wdir, cs, git_rw_env, step)
                     step += 1
                 multi_push_latencies.append(
-                    push_with_pack_config(git_bin, wdir, remote_url, None, "HEAD:refs/heads/main", git_rw_env)
+                    push_with_pack_config(
+                        git_bin, wdir, remote_url, None, "HEAD:refs/heads/main", git_rw_env,
+                        context=push_context(
+                            "baseline_wave_push",
+                            archetype=arch,
+                            object_format=obj_fmt,
+                            repo_ordinal=idx,
+                            wave_ordinal=wave_ordinal,
+                        ),
+                    )
                 )
+                progress["completed"]["baseline_wave_pushes_completed"] += 1
+                progress["last_completed_phase"] = "baseline_wave_push"
             acked.append((repo_info["clone_path"], "refs/heads/main", head_oid, arch, ro["username"], ro["token"]))
             bare_mirror = work_root / f"ref-bare-{idx}.git"
             run_git(git_bin, ["clone", "--bare", "--quiet", str(wdir), str(bare_mirror)], None, git_rw_env)
@@ -162,6 +219,7 @@ def run_live_serve_blob_eval(
                     "uncompacted_pg": pg_bytes,
                 }
             )
+            progress["completed"]["baseline_repos_completed"] += 1
         baseline_push_s3 = proxy.snapshot()
 
         # Restart serve-blob with empty scratch for genuine cold clone & cold browse measurements.
@@ -179,12 +237,14 @@ def run_live_serve_blob_eval(
             git_ro_env = build_git_http_env(run_env, askpass, entry["ro"]["username"], ro_tok)
             remote_url = base_url + entry["repo"]["clone_path"]
             cold_clone_ms.append(clone_and_fsck(git_bin, remote_url, work_root / f"cold-clone-{idx}", git_ro_env))
-            cold_browse_ms.extend(
-                exercise_browse(
-                    base_url, entry["repo"]["owner"], entry["repo"]["name"], ro_tok,
-                    entry["seed_oid"], entry["head_oid"], entry["browse_path"],
-                )
+            progress["completed"]["cold_clone_samples_completed"] += 1
+            browse_samples = exercise_browse(
+                base_url, entry["repo"]["owner"], entry["repo"]["name"], ro_tok,
+                entry["seed_oid"], entry["head_oid"], entry["browse_path"],
             )
+            cold_browse_ms.extend(browse_samples)
+            progress["completed"]["browse_requests_completed"] += len(browse_samples)
+            progress["last_completed_phase"] = "baseline_reads"
         cold_read_s3 = proxy.snapshot()
 
         proxy.reset_counters()
@@ -196,12 +256,14 @@ def run_live_serve_blob_eval(
             remote_url = base_url + entry["repo"]["clone_path"]
             for rep in range(2):
                 warm_clone_ms.append(clone_and_fsck(git_bin, remote_url, work_root / f"warm-clone-{idx}-{rep}", git_ro_env))
-                warm_browse_ms.extend(
-                    exercise_browse(
-                        base_url, entry["repo"]["owner"], entry["repo"]["name"], ro_tok,
-                        entry["seed_oid"], entry["head_oid"], entry["browse_path"],
-                    )
+                progress["completed"]["warm_clone_samples_completed"] += 1
+                browse_samples = exercise_browse(
+                    base_url, entry["repo"]["owner"], entry["repo"]["name"], ro_tok,
+                    entry["seed_oid"], entry["head_oid"], entry["browse_path"],
                 )
+                warm_browse_ms.extend(browse_samples)
+                progress["completed"]["browse_requests_completed"] += len(browse_samples)
+                progress["last_completed_phase"] = "baseline_reads"
         warm_read_s3 = proxy.snapshot()
 
         # Phase 2: Candidate compacted single-pack serving comparison on live serve-blob + PG17 + Garage S3.
@@ -228,7 +290,21 @@ def run_live_serve_blob_eval(
                     object_format=target["object_format"],
                 )
                 c_remote = base_url + crepo["clone_path"]
-                push_ms.append(push_with_pack_config(git_bin, target["work_dir"], c_remote, spec, "HEAD:refs/heads/main", cmp_rw_env))
+                push_ms.append(
+                    push_with_pack_config(
+                        git_bin, target["work_dir"], c_remote, spec, "HEAD:refs/heads/main", cmp_rw_env,
+                        context=push_context(
+                            "candidate_push",
+                            archetype=target["archetype"],
+                            object_format=target["object_format"],
+                            config=spec.name,
+                            repo_ordinal=t_idx,
+                            target_ordinal=t_idx,
+                        ),
+                    )
+                )
+                progress["completed"]["candidate_pushes_completed"] += 1
+                progress["last_completed_phase"] = "candidate_push"
                 c_pg = query_repo_pg_pack_bytes(pg_url, run_env, crepo["id"])
                 serving_sum += c_pg["artifact_bytes"]
                 coexist_sum += target["uncompacted_pg"]["artifact_bytes"] + c_pg["artifact_bytes"]
@@ -248,11 +324,18 @@ def run_live_serve_blob_eval(
                 crepo = cmp_repos[t_idx]
                 c_remote = base_url + crepo["clone_path"]
                 c_cold_ms.append(clone_and_fsck(git_bin, c_remote, work_root / f"cmp-cold-{spec.name}-{t_idx}", cmp_ro_env))
-                c_browse_ms.extend(
-                    exercise_browse(base_url, crepo["owner"], crepo["name"], cmp_ro["token"], target["seed_oid"], target["head_oid"], target["browse_path"])
+                progress["completed"]["cold_clone_samples_completed"] += 1
+                browse_samples = exercise_browse(
+                    base_url, crepo["owner"], crepo["name"], cmp_ro["token"], target["seed_oid"], target["head_oid"], target["browse_path"]
                 )
+                c_browse_ms.extend(browse_samples)
+                progress["completed"]["browse_requests_completed"] += len(browse_samples)
                 c_warm_ms.append(clone_and_fsck(git_bin, c_remote, work_root / f"cmp-warm-{spec.name}-{t_idx}", cmp_ro_env))
+                progress["completed"]["warm_clone_samples_completed"] += 1
+                progress["last_completed_phase"] = "candidate_reads"
             read_s3 = proxy.snapshot()
+            progress["completed"]["candidate_reads_completed"] += 1
+            progress["completed"]["candidate_configs_completed"] += 1
             candidate_serving.append(
                 {
                     "config_name": spec.name,
@@ -290,14 +373,31 @@ def run_live_serve_blob_eval(
             cdir, oid_b = conc_clones[bi]
             branch_ref = f"refs/heads/conc_{bi}"
             barrier.wait(timeout=30)
-            ms = push_with_pack_config(git_bin, cdir, base_url + conc_target["repo"]["clone_path"], None, f"HEAD:{branch_ref}", conc_rw_env)
+            ms = push_with_pack_config(
+                git_bin, cdir, base_url + conc_target["repo"]["clone_path"], None, f"HEAD:{branch_ref}", conc_rw_env,
+                context=push_context(
+                    "concurrent_push",
+                    archetype=conc_target["archetype"],
+                    object_format=conc_target["object_format"],
+                    config="baseline",
+                    repo_ordinal=0,
+                    branch_ordinal=bi,
+                ),
+            )
             with conc_lock:
                 conc_results.append((ms, oid_b))
+                progress["completed"]["concurrent_pushes_completed"] += 1
+                progress["last_completed_phase"] = "concurrent_push"
                 acked.append((conc_target["repo"]["clone_path"], branch_ref, oid_b, "concurrent", conc_ro_user, conc_ro_tok))
 
         def _conc_browse_and_pg() -> None:
             barrier.wait(timeout=30)
-            exercise_browse(base_url, conc_target["repo"]["owner"], conc_target["repo"]["name"], conc_ro_tok, conc_target["seed_oid"], conc_target["head_oid"], conc_target["browse_path"])
+            browse_samples = exercise_browse(
+                base_url, conc_target["repo"]["owner"], conc_target["repo"]["name"], conc_ro_tok,
+                conc_target["seed_oid"], conc_target["head_oid"], conc_target["browse_path"],
+            )
+            with conc_lock:
+                progress["completed"]["browse_requests_completed"] += len(browse_samples)
             query_pg_refstore_stats(pg_url, run_env)
 
         with ThreadPoolExecutor(max_workers=conc_branches + 1) as pool:
@@ -317,6 +417,8 @@ def run_live_serve_blob_eval(
             if ls_proc.returncode != 0 or exp_oid not in ls_proc.stdout.decode("utf-8"):
                 raise RuntimeError(f"ACK verification mismatch for {ref_name} expected {exp_oid}")
             verified_acked += 1
+            progress["completed"]["acked_refs_verified"] += 1
+            progress["last_completed_phase"] = "ack_verification"
 
         pg_final = query_pg_refstore_stats(pg_url, run_env)
         sampler.stop()
@@ -355,6 +457,27 @@ def run_live_serve_blob_eval(
             "resource_peaks": {**sampler.summary(), "work_root_disk_bytes": sum_dir_bytes([work_root])},
             "physical_savings_claimed": False,
         }
+    except LiveEvalFailure as exc:
+        raise LiveEvalFailure(
+            enrich_failure_record(
+                exc.record,
+                s3=sanitize_s3_snapshot(proxy.snapshot()),
+                completed=progress["completed"],
+                last_completed_phase=progress["last_completed_phase"],
+                bindings=bindings_from_receipt(receipt_info),
+            )
+        ) from None
+    except Exception:
+        raise LiveEvalFailure(
+            build_failure_record(
+                phase="unknown",
+                failure_class="unclassified",
+                completed=progress["completed"],
+                last_completed_phase=progress["last_completed_phase"],
+                s3=sanitize_s3_snapshot(proxy.snapshot()),
+                bindings=bindings_from_receipt(receipt_info),
+            )
+        ) from None
     finally:
         if proc is not None:
             stop_serve_blob(proc, log_f)

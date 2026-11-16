@@ -14,6 +14,7 @@ from typing import Any
 import urllib.parse
 
 from .corpus import run_git, url_quote_repo
+from .failure_diagnostics import LiveEvalFailure, git_failure_record
 from .pack_matrix import PackConfigSpec, kill_process_group
 from .telemetry import http_json_timed, verify_binary_receipt
 
@@ -244,14 +245,23 @@ def push_with_pack_config(
     spec: PackConfigSpec | None,
     ref_target: str,
     env: dict[str, str],
+    *,
+    context: dict[str, Any] | None = None,
 ) -> float:
     args: list[str] = ["-c", "credential.helper="]
     if spec is not None:
         args.extend(spec.git_config_args())
     args.extend(["push", "--quiet", "--porcelain", remote_url, ref_target])
-    proc, ms = run_git(git_bin, args, work_dir, env)
+    try:
+        proc, ms = run_git(git_bin, args, work_dir, env)
+    except subprocess.TimeoutExpired:
+        raise LiveEvalFailure(git_failure_record(context, failure_class="git_timeout")) from None
+    except OSError:
+        raise LiveEvalFailure(git_failure_record(context, failure_class="git_spawn")) from None
     if proc.returncode != 0:
-        raise RuntimeError(f"HTTP git push failed: {proc.stderr.decode(errors='replace')[:300]}")
+        raise LiveEvalFailure(
+            git_failure_record(context, returncode=proc.returncode, elapsed_ms=ms, stderr=proc.stderr)
+        ) from None
     return ms
 
 

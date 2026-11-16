@@ -27,12 +27,17 @@ from pack_compression_eval.corpus import (  # noqa: E402
 )
 from pack_compression_eval.correctness import run_correctness_suite  # noqa: E402
 from pack_compression_eval.e2e_serve_blob import run_live_serve_blob_eval  # noqa: E402
+from pack_compression_eval.failure_diagnostics import (  # noqa: E402
+    FailureArtifactError,
+    failure_path_for,
+    failure_record_from_exception,
+    write_failure_json,
+)
 from pack_compression_eval.live_server import resolve_live_env  # noqa: E402
 from pack_compression_eval.pack_matrix import CANDIDATE_CONFIGS, evaluate_repo_pack_matrix  # noqa: E402
 from pack_compression_eval.report import (  # noqa: E402
     _derive_candidate_summary,
     build_recommendations,
-    redact_text,
     render_summary_markdown,
     validate_report,
 )
@@ -65,13 +70,14 @@ def _git_source_meta() -> dict[str, Any]:
 
 def run_evaluation(config: EvalConfig) -> dict[str, Any]:
     """Execute controlled pack matrix, SHA-1/SHA-256 verification, and optional full E2E."""
-    git_bin = resolve_trusted_git(config.git)
-    git_ver = subprocess.check_output([str(git_bin), "--version"], text=True, timeout=10).strip()
-    work_root = Path(tempfile.mkdtemp(prefix="rootyard-pack-eval-"))
-    os.chmod(work_root, 0o700)
     secrets: list[str] = []
-
+    work_root: Path | None = None
     try:
+        git_bin = resolve_trusted_git(config.git)
+        git_ver = subprocess.check_output([str(git_bin), "--version"], text=True, timeout=10).strip()
+        work_root = Path(tempfile.mkdtemp(prefix="rootyard-pack-eval-"))
+        os.chmod(work_root, 0o700)
+
         if config.mode == "full":
             if not config.binary:
                 raise RuntimeError("--binary is required in --mode full")
@@ -144,9 +150,17 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any]:
             config.summary_md.write_text(render_summary_markdown(report), encoding="utf-8", newline="\n")
         return report
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(redact_text(exc, secrets)) from exc
+        source_meta = _git_source_meta()
+        record = failure_record_from_exception(
+            exc, mode=config.mode, scale=config.scale, seed=config.seed, source_meta=source_meta
+        )
+        try:
+            write_failure_json(failure_path_for(config.report_path), record)
+        except Exception:  # noqa: BLE001 - preserve the original failure exit
+            pass
+        raise FailureArtifactError(record) from None
     finally:
-        if not config.keep:
+        if work_root is not None and not config.keep:
             shutil.rmtree(work_root, ignore_errors=True)
 
 
@@ -179,8 +193,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         run_evaluation(cfg)
-    except Exception as exc:  # noqa: BLE001
-        print(f"pando-pack-compression-eval failed: {exc}", file=sys.stderr)
+    except FailureArtifactError as exc:
+        print(f"pando-pack-compression-eval failed: {exc.summary}", file=sys.stderr)
+        return 1
+    except Exception:  # noqa: BLE001 - final boundary never prints raw exception text
+        print("pando-pack-compression-eval failed: phase=unknown failure_class=unclassified", file=sys.stderr)
         return 1
     return 0
 
