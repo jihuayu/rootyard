@@ -41,7 +41,15 @@ pub(crate) fn validate_application_open(
     let meta_coord = meta_last_applied.map(ApplicationLogId::from_log_id);
     match read_app_row(conn)? {
         None => {
-            let Some(reducer) = app else { return Ok(None) };
+            let Some(reducer) = app else {
+                if count_application_entries(conn)? != 0 {
+                    return Err(E::Refused(
+                        "KV mode contains application entries without an application state row; refusing downgrade"
+                            .into(),
+                    ));
+                }
+                return Ok(None);
+            };
             if meta_last_applied.is_some() || !read_kv_map(conn)?.is_empty() || count_rows(conn, "sm_entries")? != 0 {
                 return Err(E::Refused(
                     "cannot initialize application state over non-empty legacy KV state; no empty fallback".into(),
@@ -200,6 +208,10 @@ fn row_checksum(
         state_sha256_hex.as_bytes(),
         bytes,
     ])
+}
+
+fn count_application_entries(conn: &Connection) -> Res<i64> {
+    Ok(conn.query_row("SELECT count(*) FROM sm_entries WHERE kind='application'", [], |r| r.get(0))?)
 }
 
 fn count_rows(conn: &Connection, table: &str) -> Res<i64> {

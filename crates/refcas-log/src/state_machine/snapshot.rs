@@ -97,6 +97,7 @@ pub(crate) fn verify_on_open(
                     snap_path.display()
                 )));
             }
+            let mut snapshot_app_digest: Option<String> = None;
             match decode_snapshot(&raw)? {
                 DecodedSnapshot::Legacy(envelope) => {
                     if app.is_some() {
@@ -123,6 +124,11 @@ pub(crate) fn verify_on_open(
                     }
                     let mut staged = app.clone_box();
                     restore_application_body(&envelope.app, staged.as_mut(), snap_meta.last_log_id)?;
+                    snapshot_app_digest = Some(
+                        staged
+                            .state_digest_hex()
+                            .map_err(|e| E::Refused(format!("active snapshot reducer digest refused: {e}")))?,
+                    );
                 }
             }
             let (last_applied, _) = read_applied_state(conn)?;
@@ -131,6 +137,18 @@ pub(crate) fn verify_on_open(
                     "sqlite last_applied {last_applied:?} precedes active snapshot {:?}",
                     snap_meta.last_log_id
                 )));
+            }
+            if let (Some(snapshot_digest), Some(app)) = (snapshot_app_digest, app)
+                && snap_meta.last_log_id == last_applied
+            {
+                let live_digest =
+                    app.state_digest_hex().map_err(|e| E::Refused(format!("live application digest refused: {e}")))?;
+                if snapshot_digest != live_digest {
+                    return Err(E::Refused(
+                        "active application snapshot digest differs from live state at the same applied coordinate"
+                            .into(),
+                    ));
+                }
             }
             Ok(())
         }
