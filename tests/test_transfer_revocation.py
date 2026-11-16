@@ -311,6 +311,58 @@ class TestTransferRevocationContract(unittest.TestCase):
         self.assertEqual(entries[0].tx_queue, 4096)
         self.assertEqual(entries[0].inode, 424242)
 
+    def test_bounded_observer_wait_terminates_at_fixed_deadline(self):
+        class FakeClock:
+            def __init__(self):
+                self.now_ns = 0
+                self.sleeps = []
+
+            def __call__(self):
+                return self.now_ns
+
+            def sleep(self, seconds):
+                self.sleeps.append(seconds)
+                self.now_ns += int(seconds * 1_000_000_000)
+
+        class NeverQuiescent:
+            all_quiescent = False
+
+        clock = FakeClock()
+        result = revocation_observer.wait_for_quiescence_until(
+            NeverQuiescent(), 1_000_000_000, clock=clock,
+            interval_ns=100_000_000, sleep=clock.sleep,
+        )
+        self.assertFalse(result)
+        self.assertEqual(clock.now_ns, 1_000_000_000)
+        self.assertLessEqual(len(clock.sleeps), 10)
+
+    def test_observer_finished_without_quiescence_is_not_success(self):
+        class FinishedButLive:
+            all_quiescent = False
+            finished = True
+
+        class FrozenClock:
+            def __call__(self):
+                return 2_000_000_000
+
+        self.assertFalse(revocation_observer.wait_for_quiescence_until(
+            FinishedButLive(), 1_000_000_000, clock=FrozenClock(),
+            interval_ns=10_000_000, sleep=lambda _seconds: None,
+        ))
+
+    def test_observer_quiescence_returns_without_opening_a_second_window(self):
+        class ImmediatelyQuiescent:
+            all_quiescent = True
+
+        class FrozenClock:
+            def __call__(self):
+                return 50_000_000
+
+        self.assertTrue(revocation_observer.wait_for_quiescence_until(
+            ImmediatelyQuiescent(), 50_000_000, clock=FrozenClock(),
+            interval_ns=10_000_000, sleep=lambda _seconds: None,
+        ))
+
     def test_natural_expiry_requalification_uses_reconciled_earliest_deadline(self):
         clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
         base = {

@@ -1245,10 +1245,10 @@ class JobCheckoutHarness(SourcePinHarness):
                     deadline_ns = trigger.deadline_ns(1200)
                     prep_status, _prep_body, _ = pending.result(timeout=8)
                     pending_ns = time.monotonic_ns()
-                    while time.monotonic_ns() < max(time.monotonic_ns(), deadline_ns + 100_000_000):
-                        if observer.all_quiescent:
-                            break
-                        time.sleep(0.01)
+                    observer_deadline_ns = deadline_ns + 100_000_000
+                    revocation_observer.wait_for_quiescence_until(
+                        observer, observer_deadline_ns
+                    )
                     observer.stop()
                 assert prep_status in (401, 403, 500, 502, 503), f"unexpected prepare status {prep_status}"
                 group_ok = observer.proven(trigger.t_before_ns, deadline_ns)

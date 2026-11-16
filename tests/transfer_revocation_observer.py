@@ -329,3 +329,15 @@ class ProcGroupObserver:
             "max_poll_gap_ms": round(self.max_poll_gap_ns / 1_000_000, 3),
             "unobservable": self.unavailable_reason,
         }
+
+def wait_for_quiescence_until(observer, deadline_ns, *, clock=time.monotonic_ns,
+                              interval_ns=10_000_000, sleep=time.sleep):
+    """Wait to one fixed absolute deadline; never extend on a later time read."""
+    while True:
+        now_ns = clock()
+        if observer.all_quiescent:
+            return True
+        if now_ns >= deadline_ns:
+            return False
+        remaining_ns = deadline_ns - now_ns
+        sleep(min(interval_ns, remaining_ns) / 1_000_000_000)

@@ -10,6 +10,7 @@ import struct
 import threading
 from urllib.parse import urlsplit
 
+import transfer_revocation_observer as revocation_observer
 from transfer_revocation_observer import (
     ProcGroupObserver,
     discover_groups,
@@ -339,9 +340,10 @@ def run_timed_transfer(
                 raise AssertionError("body reader ended without an observation")
 
         if observer is not None:
-            wait_until = max(time.monotonic_ns(), deadline_ns + 100 * NS_PER_MS)
-            while time.monotonic_ns() < wait_until and not observer.all_quiescent:
-                time.sleep(0.01)
+            observer_deadline_ns = deadline_ns + 100 * NS_PER_MS
+            revocation_observer.wait_for_quiescence_until(
+                observer, observer_deadline_ns
+            )
             observer.stop()
         group_ok = observer.proven(lower_ns, deadline_ns) if observer is not None else True
         group_sanity_ok = True
