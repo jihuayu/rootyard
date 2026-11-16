@@ -3,8 +3,9 @@ use super::provider::PandoKeyProvider;
 use super::wrapped_dek::{PandoProviderKind, PandoWrappedDek, parse_vault_ciphertext_version};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use bytes::Bytes;
 use futures_util::{StreamExt, future::BoxFuture};
-use reqwest::{Client, Method, Url};
+use reqwest::{Body, Client, Method, Url};
 use rootyard::blob_store::key_provider::{KeyId, KeyProviderCapabilities, KeyProviderError, WrapContext};
 use serde::{Deserialize, Serialize};
 use std::{fmt, time::Duration};
@@ -41,15 +42,27 @@ impl fmt::Debug for VaultTransitConfig {
 impl VaultTransitConfig {
     pub(super) fn from_env() -> Result<Self> {
         let base = std::env::var("PANDO_KMS_VAULT_URL").context("PANDO_KMS_VAULT_URL missing")?;
-        let token = std::env::var("PANDO_KMS_VAULT_TOKEN").context("PANDO_KMS_VAULT_TOKEN missing")?;
+        let token = Zeroizing::new(
+            std::env::var("PANDO_KMS_VAULT_TOKEN").context("PANDO_KMS_VAULT_TOKEN missing")?,
+        );
         let mount = std::env::var("PANDO_KMS_VAULT_MOUNT").context("PANDO_KMS_VAULT_MOUNT missing")?;
         let key_name = std::env::var("PANDO_KMS_VAULT_KEY").context("PANDO_KMS_VAULT_KEY missing")?;
-        Self::from_values(&base, token, &mount, &key_name, None)
+        Self::from_owned_values(&base, token, &mount, &key_name, None)
     }
 
     pub(super) fn from_values(
         base: &str,
         token: String,
+        mount: &str,
+        key_name: &str,
+        operation_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        Self::from_owned_values(base, Zeroizing::new(token), mount, key_name, operation_timeout)
+    }
+
+    fn from_owned_values(
+        base: &str,
+        token: Zeroizing<String>,
         mount: &str,
         key_name: &str,
         operation_timeout: Option<Duration>,
@@ -84,7 +97,7 @@ impl VaultTransitConfig {
         );
         Ok(Self {
             base,
-            token: Zeroizing::new(token),
+            token,
             mount: mount.to_owned(),
             key_name: key_name.to_owned(),
             key_id,
@@ -144,7 +157,7 @@ impl VaultTransitProvider {
             key_version: target_version,
         })?);
         let bytes =
-            self.call(Method::POST, &format!("encrypt/{}", self.config.key_name), Some(&body), deadline).await?;
+            self.call(Method::POST, &format!("encrypt/{}", self.config.key_name), Some(body), deadline).await?;
         let mut response: TransitResponse = serde_json::from_slice(&bytes)?;
         let ciphertext =
             response.data.ciphertext.take().context("Vault Transit encrypt response missing ciphertext")?;
@@ -160,7 +173,7 @@ impl VaultTransitProvider {
         let context = self.context_b64(context)?;
         let body = Zeroizing::new(serde_json::to_vec(&DecryptRequest { ciphertext, context: &context })?);
         let bytes =
-            self.call(Method::POST, &format!("decrypt/{}", self.config.key_name), Some(&body), deadline).await?;
+            self.call(Method::POST, &format!("decrypt/{}", self.config.key_name), Some(body), deadline).await?;
         let mut response: TransitResponse = serde_json::from_slice(&bytes)?;
         let plaintext =
             Zeroizing::new(response.data.plaintext.take().context("Vault Transit decrypt response missing plaintext")?);
@@ -191,7 +204,7 @@ impl VaultTransitProvider {
             context: &context,
             key_version: target_version,
         })?);
-        let bytes = self.call(Method::POST, &format!("rewrap/{}", self.config.key_name), Some(&body), deadline).await?;
+        let bytes = self.call(Method::POST, &format!("rewrap/{}", self.config.key_name), Some(body), deadline).await?;
         let mut response: TransitResponse = serde_json::from_slice(&bytes)?;
         let ciphertext = response.data.ciphertext.take().context("Vault Transit rewrap response missing ciphertext")?;
         ensure_ciphertext(&ciphertext, target_version)?;
@@ -235,14 +248,16 @@ impl VaultTransitProvider {
         &self,
         method: Method,
         path: &str,
-        body: Option<&[u8]>,
+        body: Option<Zeroizing<Vec<u8>>>,
         deadline: Instant,
     ) -> Result<Zeroizing<Vec<u8>>> {
         let mut url = self.config.base.clone();
         url.set_path(&format!("/v1/{}/{}", self.config.mount, path));
         let mut request = self.client.request(method, url).header("X-Vault-Token", self.config.token.as_str());
         if let Some(body) = body {
-            request = request.header("Content-Type", "application/json").body(body.to_vec());
+            request = request
+                .header("Content-Type", "application/json")
+                .body(Body::from(Bytes::from_owner(body)));
         }
         let response =
             timeout_at(deadline, request.send()).await.context("Vault Transit request deadline exceeded")??;
