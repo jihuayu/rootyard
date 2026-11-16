@@ -483,6 +483,26 @@ pub(super) async fn ensure_local_pack_cached(config: &Config, repo: Uuid, pack: 
 }
 
 async fn verify_repo_files_with_base(store_root_dir: &Path, base_root: &Path, bucket: &str, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
+    verify_repo_files_with_base_inner(store_root_dir, base_root, bucket, repo, None).await
+}
+
+async fn verify_repo_files_with_client(
+    store_root_dir: &Path,
+    base_root: &Path,
+    bucket: &str,
+    repo: Uuid,
+    client: &Client,
+) -> Result<ObjectStoreVerifyReport> {
+    verify_repo_files_with_base_inner(store_root_dir, base_root, bucket, repo, Some(client)).await
+}
+
+async fn verify_repo_files_with_base_inner(
+    store_root_dir: &Path,
+    base_root: &Path,
+    bucket: &str,
+    repo: Uuid,
+    client: Option<&Client>,
+) -> Result<ObjectStoreVerifyReport> {
     let mut orphan_staging_cleaned = 0usize;
     let mp_dir = store_root_dir.join("multipart");
     if mp_dir.is_dir() {
@@ -499,7 +519,7 @@ async fn verify_repo_files_with_base(store_root_dir: &Path, base_root: &Path, bu
             if path.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
             checked += 1;
             let m: CasPackManifest = serde_json::from_slice(&std::fs::read(&path)?)?;
-            decrypt_verified_store_pack(store_root_dir, base_root, &m, None).await?;
+            decrypt_verified_store_pack(store_root_dir, base_root, &m, client).await?;
             verified += 1;
             p_bytes_sum += m.pack_bytes;
             i_bytes_sum += m.idx_bytes;
@@ -560,8 +580,8 @@ pub(super) async fn get_pack(config: &Config, repo: Uuid, pack_id: Uuid) -> Resu
 
 pub(super) async fn verify_repo_store(config: &Config, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
     if remote_enabled() { return super::remote::verify(config, repo).await; }
-    let report = verify_repo_files_with_base(&store_root(config), &config.root, &default_bucket(), repo).await?;
     let c = config.db().await?;
+    let report = verify_repo_files_with_client(&store_root(config), &config.root, &default_bucket(), repo, &c).await?;
     for r in c.query("SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.object_store_manifests WHERE repo=$1", &[&repo]).await? {
         let pid: Uuid = r.get(0);
         let m: CasPackManifest = serde_json::from_slice(&std::fs::read(store_root(config).join(manifest_key(repo, pid)))?)?;
