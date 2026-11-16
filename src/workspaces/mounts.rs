@@ -51,11 +51,16 @@ pub(super) fn registry() -> &'static Arc<Mutex<MountRegistry>> {
 /// One owner lock for the current helper, retired unproved generations and the
 /// shutdown-closing state. A generation moves current -> retired and shutdown
 /// snapshots both under this same lock, so there is no take-then-push gap.
-#[derive(Default)]
 pub(super) struct HelperOwner<C> {
     current: Option<C>,
     retired: Vec<C>,
     closing: bool,
+}
+
+impl<C> Default for HelperOwner<C> {
+    fn default() -> Self {
+        Self { current: None, retired: Vec::new(), closing: false }
+    }
 }
 
 impl<C: Clone> HelperOwner<C> {
