@@ -8,11 +8,13 @@ use std::{
 
 mod authority;
 mod publication;
-pub(crate) use publication::{PreparedPackPublication, prepare_pack_files_sealed};
+pub(crate) use publication::{PreparedPackPublication, PublicationReceipt, prepare_pack_files_sealed};
 #[cfg(test)]
 mod publication_tests;
 #[cfg(test)]
 mod pg_tests;
+#[cfg(test)]
+mod pg_receipt_tests;
 
 pub const DEFAULT_BUCKET: &str = "pando-default";
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
@@ -486,7 +488,7 @@ pub async fn put_pack_files(
     .await?;
     // This raw path has no DB authority, so its verified envelope file is the
     // only metadata authority. The staged prepare itself never writes a mirror.
-    prepared.write_mirror()?;
+    prepared.write_file_only_mirror()?;
     Ok((prepared.report().clone(), prepared.manifest().clone()))
 }
 
@@ -636,12 +638,13 @@ async fn put_pack_db_inner(config: &Config, repo: Uuid, pack_id: Uuid, opts: &Ob
     )
     .await?;
     let t = session.client_mut().transaction().await?;
-    let env = prepared.publish_in(&t).await?;
+    let receipt = prepared.publish_in(&t).await?;
     t.commit().await?;
-    // The DB pair is authoritative. Mirror refresh is post-commit and cannot
-    // change the retry or publication result.
-    prepared.refresh_mirrors();
-    Ok((prepared.report().clone(), env))
+    // The receipt is the DB winner. Mirror only after the known commit and
+    // derive the returned report/envelope from the receipt, never the losing
+    // prepared value.
+    receipt.refresh_mirrors();
+    Ok((receipt.report(), receipt.envelope().clone()))
 }
 
 pub(super) async fn put_pack(config: &Config, repo: Uuid, pack_id: Uuid, opts: &ObjectStorePutOptions) -> Result<ObjectStorePutReport> {

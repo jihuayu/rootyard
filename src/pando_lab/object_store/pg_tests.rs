@@ -254,18 +254,19 @@ async fn pg_publish_transaction_rollback_leaves_no_authority_pair_or_mirror() {
     assert!(!lifecycle::envelope_file_path(&config.root, repo, pack_id).exists());
 
     let tx = session.client_mut().transaction().await.unwrap();
-    prepared.publish_in(&tx).await.unwrap();
+    let rolled_back = prepared.publish_in(&tx).await.unwrap();
     tx.rollback().await.unwrap();
+    assert_eq!(rolled_back.envelope().pack_id, pack_id);
     assert_eq!(pair_count(&admin, repo).await, (0, 0));
     assert!(!lifecycle::envelope_file_path(&config.root, repo, pack_id).exists());
 
     let tx = session.client_mut().transaction().await.unwrap();
-    let envelope = prepared.publish_in(&tx).await.unwrap();
+    let receipt = prepared.publish_in(&tx).await.unwrap();
     tx.commit().await.unwrap();
-    prepared.refresh_mirrors();
+    receipt.refresh_mirrors();
     assert_eq!(pair_count(&admin, repo).await, (1, 1));
     assert!(lifecycle::envelope_file_path(&config.root, repo, pack_id).is_file());
-    assert_eq!(envelope.pack_id, pack_id);
+    assert_eq!(receipt.envelope().pack_id, pack_id);
 
     cleanup(&admin, repo).await;
     let _ = std::fs::remove_dir_all(&root);
@@ -347,10 +348,11 @@ async fn pg_shared_gate_pins_selected_target_and_blocks_exclusive_rotation() {
     assert_eq!(prepared.envelope().key_version, active.expected_version());
 
     let tx = session.client_mut().transaction().await.unwrap();
-    let envelope = prepared.publish_in(&tx).await.unwrap();
+    let receipt = prepared.publish_in(&tx).await.unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(envelope.key_id, active.to_key_id);
-    assert_eq!(envelope.key_version, active.expected_version());
+    receipt.refresh_mirrors();
+    assert_eq!(receipt.envelope().key_id, active.to_key_id);
+    assert_eq!(receipt.envelope().key_version, active.expected_version());
     assert_eq!(pair_count(&admin, repo).await, (1, 1));
 
     cleanup(&admin, repo).await;

@@ -66,7 +66,7 @@ async fn preparation_stages_immutable_cas_without_envelope_mirror_and_retry_reus
 
     // The raw file-only API has no DB pair, so its own post-prepare mirror is
     // the durable envelope. A retry must recover these exact bytes.
-    prepared.write_mirror().unwrap();
+    prepared.write_file_only_mirror().unwrap();
     let retry = prepare_pack_files_sealed(&tmp, &objects_root, repo, pack_id, &opts, "hot", None, None).await.unwrap();
     assert_eq!(retry.envelope().envelope_id, prepared.envelope().envelope_id);
     assert_eq!(retry.report().pack_sha256, prepared.report().pack_sha256);

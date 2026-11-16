@@ -8,12 +8,14 @@
 
 use super::super::{LIMIT, Pack, delta, lifecycle};
 use super::authority::{
-    insert_envelope_if_absent_in_tx, load_existing_pair, report_from_manifest, validate_envelope_record,
-    validate_manifest_record, verify_existing_cas_artifacts, verify_existing_cas_bytes, verify_fresh_target,
+    insert_envelope_if_absent_in_tx, load_existing_pair, report_from_manifest, require_winner_manifest,
+    validate_envelope_record, validate_manifest_record, verify_existing_cas_artifacts, verify_existing_cas_bytes,
+    verify_fresh_target,
 };
 use super::{
     BACKEND_KIND, CasPackManifest, MANIFEST_SCHEMA, ObjectStorePutOptions, ObjectStorePutReport, idx_key,
     infer_base_root, manifest_key, pack_key, stage_and_reassemble_multipart, write_immutable_cas_file,
+    write_immutable_cas_file_with_before_link,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::path::{Path, PathBuf};
@@ -29,8 +31,38 @@ pub(crate) struct PreparedPackPublication {
     manifest: CasPackManifest,
     envelope: lifecycle::KmsEnvelopeRecord,
     local_policy: Option<lifecycle::provider::KmsKeyPolicy>,
+    store_root_dir: PathBuf,
     base_root: PathBuf,
     expected_checkpoint: Option<lifecycle::rotation::KmsRotationCheckpoint>,
+}
+
+/// The authoritative DB winner returned by `publish_in`. It is provisional
+/// until the caller transaction successfully commits; callers must not mirror
+/// or report it as published on rollback or an uncertain commit.
+pub(crate) struct PublicationReceipt {
+    manifest: CasPackManifest,
+    envelope: lifecycle::KmsEnvelopeRecord,
+    store_root_dir: PathBuf,
+    base_root: PathBuf,
+}
+
+impl PublicationReceipt {
+    pub(crate) fn manifest(&self) -> &CasPackManifest {
+        &self.manifest
+    }
+
+    pub(crate) fn envelope(&self) -> &lifecycle::KmsEnvelopeRecord {
+        &self.envelope
+    }
+
+    pub(crate) fn report(&self) -> ObjectStorePutReport {
+        report_from_manifest(&self.store_root_dir, &self.manifest)
+    }
+
+    /// Best-effort postcommit mirror repair from the winning DB envelope.
+    pub(crate) fn refresh_mirrors(&self) {
+        let _ = lifecycle::write_envelope_file(&self.base_root, &self.envelope);
+    }
 }
 
 impl PreparedPackPublication {
@@ -49,14 +81,15 @@ impl PreparedPackPublication {
     /// Commit the manifest, Local policy and authenticated envelope together.
     /// An existing complete pair is recovered without overwriting randomized
     /// ciphertext; a partial pair or a changed rotation target fails closed.
-    pub(crate) async fn publish_in(&self, t: &Transaction<'_>) -> Result<lifecycle::KmsEnvelopeRecord> {
+    pub(crate) async fn publish_in(&self, t: &Transaction<'_>) -> Result<PublicationReceipt> {
         let c = t.client();
         let pack_sha256 = &self.manifest.pack_sha256;
         let idx_sha256 = &self.manifest.idx_sha256;
-        if let Some((_, envelope)) =
+        if let Some((winner_manifest, winner_envelope)) =
             load_existing_pair(c, self.repo, self.pack_id, &self.manifest.bucket, pack_sha256, idx_sha256).await?
         {
-            return Ok(envelope);
+            require_winner_manifest(&winner_manifest, &self.manifest, self.pack_id)?;
+            return Ok(self.receipt_for(winner_manifest, winner_envelope));
         }
 
         // A first publication re-reads the authoritative checkpoint in this
@@ -92,11 +125,12 @@ impl PreparedPackPublication {
         // A concurrent complete pair won the insert. Its durable pair is
         // authority, so recover it and never overwrite a newer key policy.
         if inserted_manifest == 0 {
-            let recovered =
+            let (winner_manifest, winner_envelope) =
                 load_existing_pair(c, self.repo, self.pack_id, &self.manifest.bucket, pack_sha256, idx_sha256)
                     .await?
                     .context("Pando manifest appeared without an envelope inside the publication transaction")?;
-            return Ok(recovered.1);
+            require_winner_manifest(&winner_manifest, &self.manifest, self.pack_id)?;
+            return Ok(self.receipt_for(winner_manifest, winner_envelope));
         }
         let inserted_envelope = insert_envelope_if_absent_in_tx(t, &self.envelope).await?;
         if inserted_envelope != 1 {
@@ -108,24 +142,28 @@ impl PreparedPackPublication {
             lifecycle::rotation::sync_kms_policy_in_tx(t, self.repo, policy).await?;
         }
 
-        let recovered = load_existing_pair(c, self.repo, self.pack_id, &self.manifest.bucket, pack_sha256, idx_sha256)
-            .await?
-            .context("Pando publication rows vanished inside their transaction")?;
-        ensure!(
-            recovered.0.pack_sha256 == self.manifest.pack_sha256 && recovered.0.idx_sha256 == self.manifest.idx_sha256,
-            "Pando publication transaction lost its immutable pack identity"
-        );
-        Ok(recovered.1)
+        let (winner_manifest, winner_envelope) =
+            load_existing_pair(c, self.repo, self.pack_id, &self.manifest.bucket, pack_sha256, idx_sha256)
+                .await?
+                .context("Pando publication rows vanished inside their transaction")?;
+        require_winner_manifest(&winner_manifest, &self.manifest, self.pack_id)?;
+        Ok(self.receipt_for(winner_manifest, winner_envelope))
     }
 
-    pub(super) fn write_mirror(&self) -> Result<()> {
+    fn receipt_for(&self, manifest: CasPackManifest, envelope: lifecycle::KmsEnvelopeRecord) -> PublicationReceipt {
+        PublicationReceipt {
+            manifest,
+            envelope,
+            store_root_dir: self.store_root_dir.clone(),
+            base_root: self.base_root.clone(),
+        }
+    }
+
+    /// File-only helper used by the raw, no-DB-authority API. DB publication
+    /// receipts must use `PublicationReceipt::refresh_mirrors` instead.
+    pub(super) fn write_file_only_mirror(&self) -> Result<()> {
         lifecycle::write_envelope_file(&self.base_root, &self.envelope)?;
         Ok(())
-    }
-
-    /// Best-effort mirror repair after the authoritative transaction commits.
-    pub(crate) fn refresh_mirrors(&self) {
-        let _ = self.write_mirror();
     }
 }
 
@@ -142,6 +180,61 @@ pub(crate) async fn prepare_pack_files_sealed(
     storage_tier: &str,
     checkpoint: Option<&lifecycle::rotation::KmsRotationCheckpoint>,
     client: Option<&Client>,
+) -> Result<PreparedPackPublication> {
+    prepare_pack_files_sealed_inner(
+        store_root_dir,
+        local_objects_root,
+        repo,
+        pack_id,
+        opts,
+        storage_tier,
+        checkpoint,
+        client,
+        || {},
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_pack_files_sealed_with_install_barrier(
+    store_root_dir: &Path,
+    local_objects_root: &Path,
+    repo: Uuid,
+    pack_id: Uuid,
+    opts: &ObjectStorePutOptions,
+    storage_tier: &str,
+    checkpoint: Option<&lifecycle::rotation::KmsRotationCheckpoint>,
+    client: Option<&Client>,
+    barrier: &std::sync::Barrier,
+) -> Result<PreparedPackPublication> {
+    prepare_pack_files_sealed_inner(
+        store_root_dir,
+        local_objects_root,
+        repo,
+        pack_id,
+        opts,
+        storage_tier,
+        checkpoint,
+        client,
+        || {
+            barrier.wait();
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_pack_files_sealed_inner(
+    store_root_dir: &Path,
+    local_objects_root: &Path,
+    repo: Uuid,
+    pack_id: Uuid,
+    opts: &ObjectStorePutOptions,
+    storage_tier: &str,
+    checkpoint: Option<&lifecycle::rotation::KmsRotationCheckpoint>,
+    client: Option<&Client>,
+    before_pack_install: impl FnOnce() + Send,
 ) -> Result<PreparedPackPublication> {
     // This primitive stages local CAS only. Composed S3 producers must use an
     // explicit remote prepare path; never let them silently fall back here.
@@ -181,6 +274,7 @@ pub(crate) async fn prepare_pack_files_sealed(
                 manifest,
                 envelope,
                 local_policy: None,
+                store_root_dir: store_root_dir.to_path_buf(),
                 base_root,
                 expected_checkpoint: checkpoint.cloned(),
             });
@@ -227,6 +321,7 @@ pub(crate) async fn prepare_pack_files_sealed(
             manifest,
             envelope,
             local_policy: None,
+            store_root_dir: store_root_dir.to_path_buf(),
             base_root,
             expected_checkpoint: checkpoint.cloned(),
         });
@@ -276,7 +371,7 @@ pub(crate) async fn prepare_pack_files_sealed(
         &mut chunks_uploaded,
     )?;
 
-    write_immutable_cas_file(&b_pack, &ver_cipher, &sealed.ciphertext_sha256)?;
+    write_immutable_cas_file_with_before_link(&b_pack, &ver_cipher, &sealed.ciphertext_sha256, before_pack_install)?;
     write_immutable_cas_file(&b_idx, &ver_idx, &idx_sha256)?;
     let mut manifest = CasPackManifest {
         schema: MANIFEST_SCHEMA.to_owned(),
@@ -331,6 +426,7 @@ pub(crate) async fn prepare_pack_files_sealed(
         manifest,
         envelope,
         local_policy,
+        store_root_dir: store_root_dir.to_path_buf(),
         base_root,
         expected_checkpoint: checkpoint.cloned(),
     })

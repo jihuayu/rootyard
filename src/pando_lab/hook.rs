@@ -227,6 +227,7 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
     } else {
         None
     };
+    let mut receipt: Option<object_store::PublicationReceipt> = None;
     c.execute(
         "UPDATE pando_lab.operations SET state='OBJECTS_DURABLE' WHERE id=$1",
         &[&op],
@@ -315,7 +316,7 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
         }
     }
     if let Some(prepared) = &prepared {
-        prepared.publish_in(&t).await?;
+        receipt = Some(prepared.publish_in(&t).await?);
     }
     for cmd in commands {
         if cmd.new == ZERO {
@@ -351,8 +352,10 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
         std::process::exit(73);
     }
     t.commit().await?;
-    if let Some(prepared) = &prepared {
-        prepared.refresh_mirrors();
+    // The receipt is provisional until this commit succeeds. Mirror only the
+    // DB-winning envelope, never the losing prepared value.
+    if let Some(receipt) = &receipt {
+        receipt.refresh_mirrors();
     }
     if ctl.fault == "after-commit" {
         std::process::exit(74);

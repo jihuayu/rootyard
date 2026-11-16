@@ -120,6 +120,21 @@ pub(super) fn verify_fresh_target(
     }
 }
 
+/// Bind a DB winner to the physically verified prepared artifact set. A
+/// different randomized ciphertext (for example from another root) fails the
+/// whole caller transaction instead of being silently adopted.
+pub(super) fn require_winner_manifest(
+    winner: &CasPackManifest,
+    prepared: &CasPackManifest,
+    pack_id: Uuid,
+) -> Result<()> {
+    ensure!(
+        winner == prepared,
+        "Pando publication conflict for pack {pack_id}: the DB winner's immutable manifest differs from the physically verified prepared manifest"
+    );
+    Ok(())
+}
+
 /// Validate the immutable local manifest record and every key it binds.
 pub(crate) fn validate_manifest_record(
     manifest: &CasPackManifest,
