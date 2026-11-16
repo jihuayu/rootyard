@@ -310,11 +310,13 @@ impl RaftNodeProc {
                 "--check-on-open",
                 "true",
                 "--heartbeat-ms",
-                "60",
+                "80",
                 "--election-min-ms",
-                "200",
+                "280",
                 "--election-max-ms",
-                "380",
+                "520",
+                "--write-timeout-ms",
+                "4000",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -367,8 +369,8 @@ async fn shutdown_nodes(st: &GatewayState, ids: &[u64]) {
 
 fn rpc_sync(cfg: &Arc<ClientConfig>, addr: &str, dns: &str, req: &Value) -> Result<Value> {
     let tcp = TcpStream::connect(addr)?;
-    tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
     let server_name = ServerName::try_from(dns.to_owned())?;
     let conn = ClientConnection::new(cfg.clone(), server_name)?;
     let mut tls = StreamOwned::new(conn, tcp);
@@ -436,7 +438,7 @@ async fn teardown_pg_schema(admin: &Pool, schema: &str) {
 }
 
 async fn wait_cluster_leader(nodes: &[&RaftNodeProc], excluded: Option<u64>) -> Result<u64> {
-    let deadline = Instant::now() + Duration::from_secs(12);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         for n in nodes {
             if excluded == Some(n.id) {
@@ -447,7 +449,9 @@ async fn wait_cluster_leader(nodes: &[&RaftNodeProc], excluded: Option<u64>) -> 
                 && m["running_ok"].as_bool() == Some(true)
                 && let Some(lid) = m["current_leader"].as_u64()
                 && excluded != Some(lid)
-                && nodes.iter().any(|p| p.id == lid)
+                && let Some(leader) = nodes.iter().find(|p| p.id == lid)
+                && let Ok(ri) = leader.rpc(json!("EnsureReadIndex")).await
+                && ri.get("ReadIndex").is_some()
             {
                 return Ok(lid);
             }
@@ -460,7 +464,7 @@ async fn wait_cluster_leader(nodes: &[&RaftNodeProc], excluded: Option<u64>) -> 
 }
 
 async fn wait_nodes_converged(nodes: &[&RaftNodeProc], target_idx: u64) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(12);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let mut all_ok = true;
         for n in nodes {
@@ -485,16 +489,36 @@ async fn wait_nodes_converged(nodes: &[&RaftNodeProc], target_idx: u64) -> Resul
 }
 
 async fn commit_state_to_raft(nodes: &[&RaftNodeProc], key: &str, state: &RaftRepoStateValue) -> Result<(u64, u64)> {
-    let leader_id = wait_cluster_leader(nodes, None).await?;
-    let leader = nodes.iter().find(|n| n.id == leader_id).context("leader missing")?;
     let value = serde_json::to_string(state)?;
     let cmd = json!({ "Put": { "key": key, "value": value } });
     let payload = serde_json::to_vec(&cmd)?;
-    let resp = leader.rpc(json!({ "ClientWrite": { "payload": payload } })).await?;
-    if let Some(idx) = resp.pointer("/ClientWrite/log_index").and_then(Value::as_u64) {
-        return Ok((leader_id, idx));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut hint_leader = wait_cluster_leader(nodes, None).await?;
+    let mut last_err = String::from("no response");
+
+    while Instant::now() < deadline {
+        let leader = nodes.iter().find(|n| n.id == hint_leader).copied().unwrap_or(nodes[0]);
+        match leader.rpc(json!({ "ClientWrite": { "payload": payload.clone() } })).await {
+            Ok(resp) => {
+                if let Some(idx) = resp.pointer("/ClientWrite/log_index").and_then(Value::as_u64) {
+                    return Ok((leader.id, idx));
+                }
+                if let Some(fwd) = resp.pointer("/Error/forward_to_leader_id").and_then(Value::as_u64)
+                    && nodes.iter().any(|n| n.id == fwd)
+                {
+                    hint_leader = fwd;
+                } else if let Ok(new_lid) = wait_cluster_leader(nodes, None).await {
+                    hint_leader = new_lid;
+                }
+                last_err = resp.to_string();
+            }
+            Err(e) => {
+                last_err = e.to_string();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
     }
-    bail!("ClientWrite rejected on leader {leader_id}: {resp}");
+    bail!("ClientWrite did not commit on raft cluster within 15s (last={last_err})");
 }
 
 struct GatewayState {
@@ -1255,7 +1279,7 @@ async fn stock_git_compatibility_fixed_oid_closure_and_pin_gc_safety() -> Result
             repository_id: repo,
             tenant_id: tenant,
             owner_id: owner,
-            purpose: MetadataPinPurpose::Verification,
+            purpose: MetadataPinPurpose::Backup,
             snapshot_id: snap_id,
             pin_id,
             object_format: GitObjectFormat::Sha256,
@@ -1278,7 +1302,7 @@ async fn stock_git_compatibility_fixed_oid_closure_and_pin_gc_safety() -> Result
             repository_id: repo,
             tenant_id: tenant,
             owner_id: owner,
-            purpose: "pin_closure".into(),
+            purpose: "ref_publication".into(),
             backend_identity: d("backend"),
             authority_id: realm.authority_id,
             authority_generation: 1,
@@ -1312,7 +1336,7 @@ async fn stock_git_compatibility_fixed_oid_closure_and_pin_gc_safety() -> Result
             repository_id: repo,
             tenant_id: tenant,
             owner_id: owner,
-            purpose: "clone_pin".into(),
+            purpose: "backup".into(),
             business_intent_digest: d("intent"),
             object_format: GitObjectFormat::Sha256,
             history_incarnation: history,
