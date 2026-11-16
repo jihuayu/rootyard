@@ -514,9 +514,25 @@ fn combine_shutdown_results(helper: Result<(), Error>, legacy: Result<(), Error>
     }
 }
 
+/// Minimal failsafe deadline contract for a successful legacy observation.
+///
+/// Success is accepted only when the observation itself happens strictly before
+/// the caller's same absolute deadline. A worker that completed earlier but is
+/// first observed at or after that deadline is reported as incomplete/timeout;
+/// no completion time is invented retroactively and no fresh clock is started.
+/// An empty/no-work legacy ticket follows the same rule: if clean completion is
+/// only observable after the deadline, it is not accepted.
+fn legacy_success_within_deadline(
+    observation: &LegacyShutdownObservation,
+    observed_at: Instant,
+    deadline: Instant,
+) -> bool {
+    observed_at < deadline && observation.success()
+}
+
 /// Bounded observer for the retained legacy owner. A timeout or dropped future
 /// never cancels the worker or releases its handles; a later shutdown/observer
-/// reaps the same ticket.
+/// reaps the same ticket. The deadline is checked before success is accepted.
 async fn wait_legacy_until(
     ticket: Arc<LegacyShutdownTicket<InProcessSlot>>,
     deadline: tokio::time::Instant,
@@ -524,18 +540,18 @@ async fn wait_legacy_until(
     let finite_deadline = deadline.into_std();
     loop {
         let observation: LegacyShutdownObservation = ticket.observe();
-        if observation.success() {
+        let now = Instant::now();
+        if legacy_success_within_deadline(&observation, now, finite_deadline) {
             return Ok(());
         }
-        if observation.is_terminal() {
-            return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "workspace FUSE legacy mount teardown failed"));
-        }
-        let now = Instant::now();
         if now >= finite_deadline {
             return Err(Error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "workspace FUSE legacy mount teardown exceeded the shared normal-shutdown deadline",
             ));
+        }
+        if observation.is_terminal() {
+            return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "workspace FUSE legacy mount teardown failed"));
         }
         tokio::time::sleep((finite_deadline - now).min(Duration::from_millis(10))).await;
     }
@@ -700,5 +716,46 @@ mod tests {
     fn current_generation_is_merged_with_retained_entries_only_once() {
         let collected = collect_unique(Some(11u64), vec![12, 11, 13, 12], |left, right| left == right);
         assert_eq!(collected, vec![11, 12, 13]);
+    }
+
+    fn clean_legacy_observation() -> LegacyShutdownObservation {
+        LegacyShutdownObservation {
+            pending: 0,
+            owned: 0,
+            failures: Vec::new(),
+            worker_spawn_error: None,
+            worker_finished: true,
+            worker_reaped: true,
+            reaped_result: Some(Ok(())),
+        }
+    }
+
+    #[test]
+    fn legacy_success_observed_at_or_after_the_absolute_deadline_is_not_clean() {
+        let deadline = Instant::now();
+        let clean = clean_legacy_observation();
+        assert!(legacy_success_within_deadline(&clean, deadline - Duration::from_millis(1), deadline));
+        assert!(
+            !legacy_success_within_deadline(&clean, deadline, deadline),
+            "an observation at the absolute deadline is not a success"
+        );
+        assert!(
+            !legacy_success_within_deadline(&clean, deadline + Duration::from_millis(1), deadline),
+            "a worker completed after D must not be accepted by a late observer"
+        );
+
+        let mut incomplete = clean_legacy_observation();
+        incomplete.pending = 1;
+        assert!(!legacy_success_within_deadline(&incomplete, deadline - Duration::from_millis(1), deadline));
+    }
+
+    #[test]
+    fn empty_legacy_ticket_uses_the_same_pre_deadline_success_contract() {
+        // The no-work case is represented by a clean zero-owner observation;
+        // it still cannot be accepted at/after D.
+        let deadline = Instant::now();
+        let clean = clean_legacy_observation();
+        assert!(!legacy_success_within_deadline(&clean, deadline, deadline));
+        assert!(legacy_success_within_deadline(&clean, deadline - Duration::from_millis(1), deadline));
     }
 }
