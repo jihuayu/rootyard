@@ -20,12 +20,8 @@ jobs:
     # reaps orphaned Git grandchildren. Do not introduce a global child
     # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
     runs-on: ubuntu-22.04
-    # Job cap with bounded headroom for the three populated RefStore/artifact-hold
-    # backup drills below (their step caps grow from 5 to 10 minutes each, adding
-    # 3 x 5 = 15 worst-case minutes) and the two sequential Issue 85 acceptance
-    # steps below (each capped at 10 minutes, adding 2 x 10 = 20 worst-case
-    # minutes). Keep this bounded; raising it further must not be used to hide a
-    # regression inside one individual step.
+    # Existing verify budget is 75 minutes. Two lifecycle acceptance steps add
+    # ten minutes each, so reserve 95 minutes in total.
     timeout-minutes: 95
     services:
       postgres:
