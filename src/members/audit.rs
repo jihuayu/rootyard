@@ -38,6 +38,20 @@ pub async fn insert_audit_event(
     target_name: &str,
     details: Value,
 ) -> Result<AuditEntry, Error> {
+    insert_audit_event_by_actor(tx, tenant_id, repository_id, actor.id, &actor.username, action, target_type, target_name, details).await
+}
+
+pub async fn insert_audit_event_by_actor(
+    tx: &Transaction<'_>,
+    tenant_id: Uuid,
+    repository_id: Uuid,
+    actor_id: Uuid,
+    actor_username: &str,
+    action: &str,
+    target_type: &str,
+    target_name: &str,
+    details: Value,
+) -> Result<AuditEntry, Error> {
     if !valid_audit_token(action)
         || !valid_audit_token(target_type)
         || target_name.len() > 256
@@ -56,8 +70,8 @@ pub async fn insert_audit_event(
             &[
                 &tenant_id,
                 &repository_id,
-                &actor.id,
-                &actor.username,
+                &actor_id,
+                &actor_username,
                 &action,
                 &target_type,
                 &target_name,
@@ -67,6 +81,36 @@ pub async fn insert_audit_event(
         .await
         .map_err(Error::internal)?;
     Ok(AuditEntry::row(&row))
+}
+
+pub async fn record_audit_event_for_actor(
+    tx: &Transaction<'_>,
+    tenant_id: Uuid,
+    repository_id: Uuid,
+    actor_id: Uuid,
+    actor_username: &str,
+    action: &str,
+    target_type: &str,
+    target_name: &str,
+    details: Value,
+) -> Result<Option<AuditEntry>, Error> {
+    if !audit_table_installed(tx).await? {
+        return Ok(None);
+    }
+    Ok(Some(
+        insert_audit_event_by_actor(
+            tx,
+            tenant_id,
+            repository_id,
+            actor_id,
+            actor_username,
+            action,
+            target_type,
+            target_name,
+            details,
+        )
+        .await?,
+    ))
 }
 
 pub async fn record_audit_event(
@@ -79,21 +123,7 @@ pub async fn record_audit_event(
     target_name: &str,
     details: Value,
 ) -> Result<Option<AuditEntry>, Error> {
-    if !audit_table_installed(tx).await? {
-        return Ok(None);
-    }
-    let entry = insert_audit_event(
-        tx,
-        tenant_id,
-        repository_id,
-        actor,
-        action,
-        target_type,
-        target_name,
-        details,
-    )
-    .await?;
-    Ok(Some(entry))
+    record_audit_event_for_actor(tx, tenant_id, repository_id, actor.id, &actor.username, action, target_type, target_name, details).await
 }
 
 pub async fn list_audit_events(

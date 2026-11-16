@@ -53,18 +53,24 @@ async fn backend_current(state: &AppState, repo: &Repository) -> Result<(), Erro
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client
         .query_opt(
-            "SELECT storage_generation,storage_backend,state,transition_state FROM repositories WHERE id=$1",
+            "SELECT storage_generation,storage_backend,state,transition_state,deleted_at IS NOT NULL FROM repositories WHERE id=$1",
             &[&repo.id],
         )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
+    if row.get::<_, bool>(4) {
+        return Err(Error::not_found());
+    }
     if row.get::<_, i64>(0) != repo.storage_generation
         || row.get::<_, &str>(1) != repo.storage_backend
         || row.get::<_, &str>(2) != "ready"
         || row.get::<_, &str>(3) != "stable"
     {
         return Err(Error(StatusCode::CONFLICT, "repository backend changed; retry"));
+    }
+    if crate::auth::lifecycle::has_active_transfer(&client, repo.id).await? {
+        return Err(Error(StatusCode::CONFLICT, "repository ownership transfer in progress"));
     }
     Ok(())
 }

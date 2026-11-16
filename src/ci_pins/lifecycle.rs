@@ -199,13 +199,14 @@ pub(super) async fn release_pin_inner(
     .ok_or_else(Error::unauthorized)?;
     let locked = tx
         .query_opt(
-            "SELECT state,storage_generation FROM repositories \
+            "SELECT state,storage_generation,deleted_at IS NOT NULL,archived_at IS NOT NULL,transition_state FROM repositories \
              WHERE id=$1 AND owner_id=$2 AND name=$3 FOR SHARE",
             &[&repo.id, &actor.id, &name],
         )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
+    crate::auth::lifecycle::enforce_availability(&**tx, repo.id, locked.get(2), locked.get(3), locked.get::<_, &str>(4), true).await?;
     let token = tx
         .query_opt(
             "SELECT read_only FROM tokens \
