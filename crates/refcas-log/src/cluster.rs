@@ -125,6 +125,11 @@ impl PeerDirectory {
         self.inner.read().expect("peer directory poisoned").addrs.get(&id).cloned()
     }
 
+    /// Returns a point-in-time copy of all registered peer addresses.
+    pub fn snapshot_addrs(&self) -> BTreeMap<u64, String> {
+        self.inner.read().expect("peer directory poisoned").addrs.clone()
+    }
+
     /// Updates the set of peer node ids blocked by simulated network partition.
     pub fn set_blocked(&self, blocked: BTreeSet<u64>) {
         self.inner.write().expect("peer directory poisoned").blocked = blocked;
@@ -320,15 +325,18 @@ where
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed mTLS connection before response"))
 }
 
-/// Writes a length-prefixed JSON frame (`<= 16 MiB`) asynchronously and flushes the stream.
-pub async fn write_frame_async<S, T>(stream: &mut S, value: &T) -> io::Result<()>
+/// Writes a length-prefixed JSON frame (`<= max_bytes`) asynchronously and flushes the stream.
+pub async fn write_frame_bounded_async<S, T>(stream: &mut S, value: &T, max_bytes: usize) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
     T: Serialize,
 {
     let payload = serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    if payload.len() > MAX_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame exceeds max length"));
+    if payload.len() > max_bytes || payload.len() > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("frame length {} exceeds cap {max_bytes}", payload.len()),
+        ));
     }
     let len = (payload.len() as u32).to_be_bytes();
     stream.write_all(&len).await?;
@@ -337,12 +345,13 @@ where
     Ok(())
 }
 
-/// Reads a length-prefixed JSON frame asynchronously; returns `Ok(None)` only on clean zero-byte EOF.
-pub async fn read_frame_async<S, T>(stream: &mut S) -> io::Result<Option<T>>
+/// Reads a length-prefixed JSON frame (`<= max_bytes`); returns `Ok(None)` only on clean zero-byte EOF.
+pub async fn read_frame_bounded_async<S, T>(stream: &mut S, max_bytes: usize) -> io::Result<Option<T>>
 where
     S: AsyncRead + Unpin,
     T: for<'de> Deserialize<'de>,
 {
+    let cap = max_bytes.min(MAX_FRAME_BYTES);
     let mut len_buf = [0u8; 4];
     let first = stream.read(&mut len_buf[..1]).await?;
     if first == 0 {
@@ -350,13 +359,31 @@ where
     }
     stream.read_exact(&mut len_buf[1..]).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_FRAME_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid RPC frame length {len}")));
+    if len == 0 || len > cap {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid RPC frame length {len} (cap {cap})")));
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     let value = serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(value))
+}
+
+/// Writes a length-prefixed JSON frame (`<= 16 MiB`) asynchronously and flushes the stream.
+pub async fn write_frame_async<S, T>(stream: &mut S, value: &T) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    write_frame_bounded_async(stream, value, MAX_FRAME_BYTES).await
+}
+
+/// Reads a length-prefixed JSON frame asynchronously; returns `Ok(None)` only on clean zero-byte EOF.
+pub async fn read_frame_async<S, T>(stream: &mut S) -> io::Result<Option<T>>
+where
+    S: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    read_frame_bounded_async(stream, MAX_FRAME_BYTES).await
 }
 
 /// Expects `RpcResponse::Ok`, turning any error variant into `E::Refused`.

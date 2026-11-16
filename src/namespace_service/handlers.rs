@@ -1,10 +1,12 @@
-use crate::{AppState, Error, auth, db, members::models::Role, storage::read_leases};
+use crate::{AppState, Error, auth, db, members::models::Role, storage::read_leases, token_scopes::RepoAction};
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -54,18 +56,13 @@ pub async fn create(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    auth::verify_token(&tx, &actor, false).await?;
     let mut owner_id = None;
     let mut repo_ids = Vec::new();
     for m in &input.mounts {
-        let access = auth::authorize_repo_with_role(
-            &tx,
-            &actor,
-            &m.owner,
-            &m.repository,
-            Role::Read,
-            crate::token_scopes::RepoAction::ContentsRead,
-        )
-        .await?;
+        let access =
+            auth::authorize_repo_with_role(&tx, &actor, &m.owner, &m.repository, Role::Read, RepoAction::ContentsRead)
+                .await?;
         if owner_id.is_some_and(|id| id != access.owner_id) {
             return Err(Error::bad_request());
         }
@@ -77,15 +74,9 @@ pub async fn create(
             .await
             .map_err(|_| Error::timeout())?;
         source_lease.ensure_active()?;
-        let refreshed = auth::authorize_repo_with_role(
-            &tx,
-            &actor,
-            &m.owner,
-            &m.repository,
-            Role::Read,
-            crate::token_scopes::RepoAction::ContentsRead,
-        )
-        .await?;
+        let refreshed =
+            auth::authorize_repo_with_role(&tx, &actor, &m.owner, &m.repository, Role::Read, RepoAction::ContentsRead)
+                .await?;
         if refreshed.repo_id != access.repo_id {
             return Err(Error::not_found());
         }
@@ -106,50 +97,70 @@ pub async fn create(
         &[&id, &owner_id, &input.name, &actor.id],
     )
     .await
-    .map_err(Error::internal)?;
+    .map_err(|err| {
+        if err.as_db_error().is_some_and(|db_err| db_err.code().code() == "23505") {
+            Error(StatusCode::CONFLICT, "namespace revision already exists")
+        } else {
+            Error::internal(err)
+        }
+    })?;
     for (m, repo) in input.mounts.iter().zip(repo_ids) {
         tx.execute("INSERT INTO workspace_namespace_mounts(namespace_id,mount_path,repository_id,owner_slug,repository_name,base_oid) VALUES($1,$2,$3,$4,$5,$6)", &[&id,&m.path,&repo,&m.owner,&m.repository,&m.base_oid]).await.map_err(Error::internal)?;
     }
-    tx.commit().await.map_err(Error::internal)?;
+    auth::finish_tx(tx, &actor, false).await?;
     Ok((StatusCode::CREATED, Json(Namespace { id, name: input.name, revision: 1, owner_id, mounts: input.mounts })))
 }
 
-pub async fn load(state: &AppState, headers: &HeaderMap, id: Uuid) -> Result<Namespace, Error> {
-    let actor = auth::authenticate(&state.pool, headers).await?;
+pub(super) async fn load_for_actor_with_overrides(
+    state: &AppState,
+    actor: &db::Identity,
+    id: Uuid,
+    overrides: &HashMap<String, (Role, RepoAction)>,
+) -> Result<Namespace, Error> {
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let write_any = overrides.values().any(|(_, action)| action.is_mutating());
+    auth::verify_token(&tx, actor, write_any).await?;
     let row = tx
         .query_opt("SELECT owner_id,name,revision,creator_id FROM workspace_namespaces WHERE id=$1", &[&id])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
-    let rows=tx.query("SELECT mount_path,repository_id,owner_slug,repository_name,base_oid FROM workspace_namespace_mounts WHERE namespace_id=$1 ORDER BY mount_path", &[&id]).await.map_err(Error::internal)?;
+    let rows = tx
+        .query(
+            "SELECT mount_path,repository_id,owner_slug,repository_name,base_oid FROM workspace_namespace_mounts WHERE namespace_id=$1 ORDER BY mount_path",
+            &[&id],
+        )
+        .await
+        .map_err(Error::internal)?;
     let mut mounts = Vec::new();
     for r in rows {
         let m = Mount { path: r.get(0), owner: r.get(2), repository: r.get(3), base_oid: r.get(4) };
-        let access = auth::authorize_repo_with_role(
-            &tx,
-            &actor,
-            &m.owner,
-            &m.repository,
-            Role::Read,
-            crate::token_scopes::RepoAction::ContentsRead,
-        )
-        .await?;
+        let (min_role, action) = overrides.get(&m.path).copied().unwrap_or((Role::Read, RepoAction::ContentsRead));
+        let access = auth::authorize_repo_with_role(&tx, actor, &m.owner, &m.repository, min_role, action).await?;
         if access.repo_id != r.get::<_, Uuid>(1) {
             return Err(Error::not_found());
         }
         mounts.push(m);
     }
     let result = Namespace { id, owner_id: row.get(0), name: row.get(1), revision: row.get(2), mounts };
-    tx.commit().await.map_err(Error::internal)?;
+    auth::finish_tx(tx, actor, write_any).await?;
     Ok(result)
+}
+
+pub(super) async fn load_for_actor(state: &AppState, actor: &db::Identity, id: Uuid) -> Result<Namespace, Error> {
+    load_for_actor_with_overrides(state, actor, id, &HashMap::new()).await
+}
+
+pub async fn load(state: &AppState, headers: &HeaderMap, id: Uuid) -> Result<Namespace, Error> {
+    let actor = auth::authenticate(&state.pool, headers).await?;
+    load_for_actor(state, &actor, id).await
 }
 
 pub async fn get(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> Result<Json<Namespace>, Error> {
-    Ok(Json(load(&state, &headers, id).await?))
+) -> Result<impl IntoResponse, Error> {
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(load(&state, &headers, id).await?)))
 }
