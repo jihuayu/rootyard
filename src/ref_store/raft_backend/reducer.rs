@@ -37,11 +37,27 @@ pub struct RootRefCasStateMachine {
     machine: RefCasStateMachine,
     attempts: BTreeMap<ApplicationLogId, ProposalAttempt>,
     legacy: Option<LegacyAdapterState>,
+    #[cfg(test)]
+    forced_capacity_once: bool,
 }
 
 impl RootRefCasStateMachine {
     pub fn new() -> Self {
-        Self { machine: RefCasStateMachine::new(), attempts: BTreeMap::new(), legacy: None }
+        Self {
+            machine: RefCasStateMachine::new(),
+            attempts: BTreeMap::new(),
+            legacy: None,
+            #[cfg(test)]
+            forced_capacity_once: false,
+        }
+    }
+
+    /// Test-only admission hook. It is consumed only by the real business fallback path after a
+    /// real core apply, so a source test can prove rollback without manufacturing an unapplied
+    /// oversized outcome.
+    #[cfg(test)]
+    fn force_capacity_once(&mut self) {
+        self.forced_capacity_once = true;
     }
 
     /// Applied consensus coordinate of the underlying Root state machine.
@@ -221,12 +237,16 @@ impl RootRefCasStateMachine {
         attempt: ProposalAttempt,
         fallback: ProposalAttempt,
     ) -> Result<(), ApplicationError> {
+        #[cfg(test)]
+        let force_capacity = std::mem::take(&mut self.forced_capacity_once);
+        #[cfg(not(test))]
+        let force_capacity = false;
         let prior_attempts = self.attempts.clone();
         if self.attempts.insert(log_id, attempt.clone()).is_some() {
             return Err(ApplicationError::new("duplicate proposal attempt coordinate"));
         }
         self.prune_attempts(log_id.index);
-        if self.attempts.contains_key(&log_id) && self.attempt_fits(&attempt)? {
+        if !force_capacity && self.attempts.contains_key(&log_id) && self.attempt_fits(&attempt)? {
             return Ok(());
         }
         self.attempts = prior_attempts;
@@ -578,11 +598,9 @@ mod tests {
         InitializeGateCommand, NoopCommand, RefCasCommand, RepositoryLane, SmPackMode, WireGateInit, encode_command,
     };
     use crate::ref_store::core::types::GitObjectFormat;
-    use crate::ref_store::raft_backend::outcome::{
-        RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusal, RootRefCasRefusalKind,
-    };
+    use crate::ref_store::raft_backend::outcome::{RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusalKind};
     use crate::ref_store::raft_backend::proposal::{
-        PROPOSAL_WINDOW, ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup,
+        PROPOSAL_WINDOW, ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup, ProposalOutcome,
     };
     use crate::ref_store::{CoreGateInit, RefName};
     use rootyard_refcas_log::state_machine::{ApplicationLogId, ApplicationStateMachine};
@@ -670,11 +688,11 @@ mod tests {
         let repo = Uuid::from_u128(10);
         let tenant = Uuid::from_u128(20);
         let history = Uuid::from_u128(30);
-        let payload = ProposalEnvelope::encode(
+        // A real side-effecting command that would create the gate if it were executed.
+        let payload = envelope(
             &proposal_id(repo, tenant, history, 0),
-            &encode_command(&RefCasCommand::Noop(NoopCommand { logical_tick: None })).unwrap(),
-        )
-        .unwrap();
+            &init_command(repo, tenant, history, 1, 1, GitObjectFormat::Sha256),
+        );
         let expired_log = ApplicationLogId::new(1, PROPOSAL_WINDOW + 3);
         app.apply(expired_log, &payload).unwrap();
         let attempt = app.query_attempt(expired_log).expect("expired attempt retained");
@@ -684,11 +702,21 @@ mod tests {
             &attempt.outcome,
             RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::ProposalExpired
         ));
+        let retained_outcome =
+            ProposalOutcome::from_attempt(proposal_id(repo, tenant, history, 0), expired_log, attempt);
+        assert_eq!(retained_outcome.original_log_id, None);
+        assert!(retained_outcome.outcome.is_none());
+        assert!(app.machine().read_gate_version(repo).unwrap().is_none());
+        assert!(app.read_refs(repo).is_empty());
+        assert_eq!(app.logical_clock_floor(), 0);
         assert!(matches!(app.query_proposal(&proposal_id(repo, tenant, history, 0)), ProposalLookup::Expired { .. }));
 
         let later_log = ApplicationLogId::new(1, PROPOSAL_WINDOW + 4);
         app.apply(later_log, &payload).unwrap();
         assert_eq!(app.query_attempt(later_log).expect("later expired attempt").kind, ProposalAttemptKind::Expired);
+        assert!(app.machine().read_gate_version(repo).unwrap().is_none());
+        assert!(app.read_refs(repo).is_empty());
+        assert_eq!(app.logical_clock_floor(), 0);
 
         // Retain the late Expired attempt through its own observed window, then deterministically
         // prune it; the stable ID still reports Expired and never executes again.
@@ -697,6 +725,12 @@ mod tests {
         }
         assert!(app.query_attempt(expired_log).is_none());
         assert!(app.query_attempt(later_log).is_none());
+        assert!(app.machine().read_gate_version(repo).unwrap().is_none());
+        assert!(app.read_refs(repo).is_empty());
+        assert_eq!(app.logical_clock_floor(), 0);
+        let pruned_outcome = ProposalOutcome::expired(proposal_id(repo, tenant, history, 0), later_log);
+        assert_eq!(pruned_outcome.original_log_id, None);
+        assert!(pruned_outcome.outcome.is_none());
         assert!(matches!(app.query_proposal(&proposal_id(repo, tenant, history, 0)), ProposalLookup::Expired { .. }));
     }
 
@@ -874,51 +908,55 @@ mod tests {
     }
 
     #[test]
-    fn valid_candidate_over_budget_rolls_back_to_capacity_and_following_write_succeeds() {
+    fn capacity_fallback_rolls_back_real_gate_mutation_and_following_write_succeeds() {
         let mut app = RootRefCasStateMachine::new();
         let repo = Uuid::from_u128(10);
         let tenant = Uuid::from_u128(20);
         let history = Uuid::from_u128(30);
-        let log = ApplicationLogId::new(1, 1);
-        let prior = app.machine().clone();
-        let id = proposal_id(repo, tenant, history, 0);
-        let huge = ProposalAttempt {
-            proposal_id: Some(id.clone()),
-            command_digest_hex: "00".repeat(32),
-            original_log_id: log,
-            observed_log_id: log,
-            kind: ProposalAttemptKind::First,
-            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal {
-                kind: RootRefCasRefusalKind::InvalidInput,
-                detail: "x".repeat(MAX_PROPOSAL_RECEIPT_BYTES + 1024),
-            }),
-        };
-        let fallback = ProposalAttempt {
-            proposal_id: Some(id),
-            command_digest_hex: "00".repeat(32),
-            original_log_id: log,
-            observed_log_id: log,
-            kind: ProposalAttemptKind::First,
-            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(RootRefCasRefusalKind::StateCapacity)),
-        };
-        app.commit_business_attempt(log, prior, huge, fallback).expect("capacity fallback is admissible");
-        assert_eq!(app.last_applied_coordinate(), Some(log));
-        assert_eq!(app.logical_clock_floor(), 0);
-        assert_eq!(app.retained_attempt_count(), 1);
-        let capacity = app.query_attempt(log).expect("capacity attempt");
+        let init_log = ApplicationLogId::new(1, 1);
+        let init_id = scoped_id(repo, tenant, history, 1, 1, GitObjectFormat::Sha256, 0, 5);
+        let init = init_command(repo, tenant, history, 1, 1, GitObjectFormat::Sha256);
+        app.apply(init_log, &envelope(&init_id, &init)).expect("initial gate");
+        let prior_gate = app.machine().read_gate_version(repo).unwrap();
+        let prior_refs = app.read_refs(repo);
+        let prior_clock = app.logical_clock_floor();
+
+        // Stage a real core SetRepositoryLane mutation at the actual candidate coordinate, then
+        // force only the receipt-admission branch to choose its bounded StateCapacity fallback.
+        app.force_capacity_once();
+        let mutation_log = ApplicationLogId::new(1, 2);
+        let mutation_id = scoped_id(repo, tenant, history, 1, 2, GitObjectFormat::Sha256, 1, 10);
+        let mutation =
+            RefCasCommand::SetRepositoryLane(crate::ref_store::core::state_machine::SetRepositoryLaneCommand {
+                repository_id: repo,
+                tenant_id: tenant,
+                lane: RepositoryLane::ServingRefStore,
+                lifecycle: crate::ref_store::core::state_machine::ScopeLifecycle::Closing,
+                authz_floor: 1,
+                history_incarnation: history,
+                authority_epoch: 2,
+                group_epoch: 1,
+                pack_mode: SmPackMode::MetadataOnly,
+            });
+        app.apply(mutation_log, &envelope(&mutation_id, &mutation)).expect("real mutation falls back to capacity");
+
+        assert_eq!(app.last_applied_coordinate(), Some(mutation_log));
+        assert_eq!(app.logical_clock_floor(), prior_clock);
+        assert_eq!(app.read_refs(repo), prior_refs);
+        assert_eq!(app.machine().read_gate_version(repo).unwrap(), prior_gate);
+        let capacity = app.query_attempt(mutation_log).expect("capacity attempt");
         assert_eq!(capacity.kind, ProposalAttemptKind::First);
         assert!(matches!(
             &capacity.outcome,
             RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::StateCapacity
         ));
 
-        let next_log = ApplicationLogId::new(1, 2);
-        let next_id = scoped_id(repo, tenant, history, 1, 1, GitObjectFormat::Sha256, 1, 9);
-        let next = init_command(repo, tenant, history, 1, 1, GitObjectFormat::Sha256);
+        let next_log = ApplicationLogId::new(1, 3);
+        let next_id = scoped_id(repo, tenant, history, 1, 1, GitObjectFormat::Sha256, 2, 11);
+        let next = RefCasCommand::Noop(NoopCommand { logical_tick: Some(8) });
         app.apply(next_log, &envelope(&next_id, &next)).expect("healthy write after capacity refusal");
         assert!(app.query_attempt(next_log).expect("next attempt").outcome.is_applied());
-        assert!(app.machine().read_gate_version(repo).unwrap().is_some());
-        assert_eq!(app.logical_clock_floor(), 0);
+        assert_eq!(app.logical_clock_floor(), 8);
     }
 
     #[test]
