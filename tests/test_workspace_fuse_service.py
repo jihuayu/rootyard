@@ -42,6 +42,31 @@ if SELECTED not in BACKENDS:
 MOUNT_MODE = BACKENDS[SELECTED]
 
 
+def confirmed_pidfd(pid, identity):
+    """Open a pidfd and recheck the captured identity after the open."""
+    if identity is None:
+        raise AssertionError("helper identity is unavailable before pidfd open")
+    fd = support.open_pidfd(pid)
+    current = support.process_identity(pid)
+    try:
+        if (current is None
+                or current["starttime"] != identity["starttime"]
+                or current["pgid"] != pid):
+            raise AssertionError("helper identity changed while opening pidfd")
+    except BaseException:
+        support.close_fd(fd)
+        raise
+    return fd
+
+
+def signal_pidfd(fd, sig):
+    """Signal only the held pidfd; never fall back to a numeric PID/group."""
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if sender is None:
+        raise AssertionError("pidfd_send_signal is unavailable")
+    sender(fd, sig)
+
+
 class WorkspaceFuseServiceTest(unittest.TestCase):
     # backend selects which mount implementation this API scenario proves:
     # "fuse" is the legacy in-process mount (no AutoUnmount contract), and
@@ -160,6 +185,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
             new_holder = None
             new_helper_pid = None
             new_helper_identity = None
+            new_helper_pidfd = None
             new_holder_identity = None
             new_mount_id = None
             original_failure = None
@@ -235,7 +261,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     self.assertEqual(helper_identity["pgid"], helper_pid,
                                      "FUSE helper is not in its own owned process group")
                     self.assertGreater(helper_identity["starttime"], api_identity["starttime"])
-                    helper_pidfd = support.open_pidfd(helper_pid)
+                    helper_pidfd = confirmed_pidfd(helper_pid, helper_identity)
 
                 holder = support.spawn_api_namespace_holder(api_pid)
                 holder_identity = support.process_identity(holder.pid)
@@ -353,6 +379,8 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                                      "fresh FUSE helper is not in its own process group")
                     self.assertGreater(new_helper_identity["starttime"],
                                        new_api_identity["starttime"])
+                    new_helper_pidfd = confirmed_pidfd(
+                        new_helper_pid, new_helper_identity)
 
                 # Attest the fresh mount in the fresh API's own namespace, then
                 # use a fresh holder to keep that namespace observable across
@@ -483,20 +511,25 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                         "owned API residue",
                         AssertionError("API process remains after stop")))
 
-                for pid, identity, label in (
-                        (helper_pid, helper_identity, "crashed-API"),
-                        (new_helper_pid, new_helper_identity, "fresh")):
+                for pid, identity, pidfd, label in (
+                        (helper_pid, helper_identity, helper_pidfd, "crashed-API"),
+                        (new_helper_pid, new_helper_identity, new_helper_pidfd, "fresh")):
                     if pid is None:
+                        continue
+                    if identity is None or pidfd is None:
+                        cleanup_failures.append((
+                            f"{label} helper identity/pidfd unavailable",
+                            AssertionError(
+                                f"helper {pid} has no confirmed pidfd; no numeric fallback")))
                         continue
                     current = support.process_identity(pid)
                     if current is None:
                         continue
-                    if identity is None:
-                        cleanup_failures.append((
-                            f"{label} helper identity unavailable",
-                            AssertionError(f"helper {pid} ownership is unresolved")))
-                        continue
                     if current["starttime"] != identity["starttime"]:
+                        cleanup_failures.append((
+                            f"{label} helper identity changed",
+                            AssertionError(
+                                f"helper {pid} no longer matches the captured identity; no signal")))
                         continue
                     try:
                         own_group = os.getpgid(pid) == pid
@@ -505,16 +538,45 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     if not own_group:
                         cleanup_failures.append((
                             f"{label} helper process group",
-                            AssertionError(f"helper {pid} process group is unresolved")))
+                            AssertionError(
+                                f"helper {pid} process group is unresolved; no signal")))
+                        continue
+                    if support.wait_pid_gone(pid, support.EXIT_DEADLINE):
+                        continue
+                    current = support.process_identity(pid)
+                    if current is None:
+                        cleanup_failures.append((
+                            f"{label} helper identity unavailable after wait",
+                            AssertionError(
+                                f"helper {pid} identity disappeared after wait; no signal")))
+                        continue
+                    if current["starttime"] != identity["starttime"]:
+                        cleanup_failures.append((
+                            f"{label} helper identity changed after wait",
+                            AssertionError(
+                                f"helper {pid} no longer matches after wait; no signal")))
+                        continue
+                    try:
+                        own_group = os.getpgid(pid) == pid
+                    except OSError:
+                        own_group = False
+                    if not own_group:
+                        cleanup_failures.append((
+                            f"{label} helper process group after wait",
+                            AssertionError(
+                                f"helper {pid} process group changed after wait; no signal")))
+                        continue
+                    try:
+                        signal_pidfd(pidfd, signal.SIGKILL)
+                    except BaseException as error:
+                        cleanup_failures.append(
+                            (f"{label} helper pidfd signal", error))
                         continue
                     if not support.wait_pid_gone(pid, support.EXIT_DEADLINE):
-                        if current["state"] != "Z":
-                            attempt(f"kill {label} helper",
-                                    lambda pid=pid: os.killpg(pid, signal.SIGKILL))
-                        if not support.wait_pid_gone(pid, support.EXIT_DEADLINE):
-                            cleanup_failures.append((
-                                f"{label} helper residue",
-                                AssertionError(f"helper {pid} remained")))
+                        cleanup_failures.append((
+                            f"{label} helper residue",
+                            AssertionError(
+                                f"helper {pid} remained after pidfd signal")))
 
                 if not old_mount_cleared:
                     if not workspace_created:
@@ -550,6 +612,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
 
                 for label, fd in (("close API pidfd", api_pidfd),
                                   ("close helper pidfd", helper_pidfd),
+                                  ("close fresh helper pidfd", new_helper_pidfd),
                                   ("close writer pidfd", writer_pidfd)):
                     if fd is not None:
                         attempt(label, lambda fd=fd: os.close(fd))
