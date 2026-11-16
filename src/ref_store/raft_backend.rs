@@ -30,8 +30,8 @@ pub use backend::{BackendOptions, RootRaftRefCasBackend};
 pub use error::RaftBackendError;
 pub use node::{RootRaftNode, RootRaftNodeConfig};
 pub use outcome::{
-    GateVersionSnapshot, OperationStateSnapshot, ProposeOutcome, RootRefCasApplied, RootRefCasOutcome,
-    RootRefCasRefusal, RootRefCasRefusalKind,
+    GateVersionSnapshot, OperationStateSnapshot, RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusal,
+    RootRefCasRefusalKind,
 };
 pub use proposal::{
     MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, MAX_ROOT_STATE_BYTES, PROPOSAL_FORMAT, PROPOSAL_WINDOW,
