@@ -604,7 +604,7 @@ class RepositoryLifecycleHarness(BrowserHarness):
         )
         assert arch2["archived"] and arch2["version"] == 4, arch2
 
-        del_body = {"confirmation": "alice/scope-old", "expected_version": 4, "purge_delay_seconds": 600}
+        del_body = {"expected_version": 4, "grace_period_seconds": 600}
         deleted = self.doc(
             "/api/repos/alice/scope-old",
             200,
@@ -632,14 +632,24 @@ class RepositoryLifecycleHarness(BrowserHarness):
             body={"expected_version": 5},
             extra_headers={"Idempotency-Key": "rem-restore-1"},
         )
-        assert not restored["deleted"], restored
+        assert not restored["deleted"] and restored["archived"], restored
+
+        unarch2 = self.doc(
+            "/api/repos/alice/scope-old/unarchive",
+            200,
+            token=self.alice,
+            method="POST",
+            body={"expected_version": restored["version"]},
+            extra_headers={"Idempotency-Key": "rem-unarch-2"},
+        )
+        assert not unarch2["archived"], unarch2
 
         renamed = self.doc(
             "/api/repos/alice/scope-old/rename",
             200,
             token=self.alice,
             method="POST",
-            body={"new_name": "scope-canon", "expected_version": restored["version"]},
+            body={"new_name": "scope-canon", "expected_version": unarch2["version"]},
             extra_headers={"Idempotency-Key": "rem-rename-1"},
         )
         assert renamed["name"] == "scope-canon", renamed
