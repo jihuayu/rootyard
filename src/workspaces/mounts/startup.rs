@@ -219,13 +219,14 @@ async fn reconcile_owned(state: Arc<AppState>, stop: CancellationToken) -> Resul
         _ = stop.cancelled() => return Err(ProduceError::Stopped),
         result = state.pool.get() => result.map_err(|error| ProduceError::Failed(Error::internal(error)))?,
     };
+    let startup_query_params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&state.storage.volume_id];
     let rows = tokio::select! {
         biased;
         _ = stop.cancelled() => return Err(ProduceError::Stopped),
         result = client.query(
             "SELECT id,lease_epoch,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces \
              WHERE host_id=$1 AND state='ready' ORDER BY id",
-            &[&state.storage.volume_id],
+            &startup_query_params,
         ) => result.map_err(|error| ProduceError::Failed(Error::internal(error)))?,
     };
     drop(client);
