@@ -1,0 +1,99 @@
+name: Rubicon Blob Read Acceleration
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/rubicon-read-accel.yml'
+      - 'src/blob_store.rs'
+      - 'src/blob_store/read_accel.rs'
+      - 'src/blob_store/read_accel/**'
+      - 'tests/blob_read_accel.rs'
+      - 'tests/test_blob_read_accel_contracts.py'
+      - 'scripts/eval_blob_read_accel.py'
+      - 'docs/rubicon-read-accel.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rubicon-read-accel-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  read-accel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && rustfmt -V && cargo clippy -V
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/rubicon-read-accel/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+      - name: Format, design-doc and offline contract checks
+        run: |
+          git --version
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_blob_read_accel_contracts.py
+      - name: Run Clippy, library unit tests, and stock-Git OpenDAL integration tests
+        run: |
+          cargo clippy --locked --no-default-features --lib --test blob_read_accel -- -D warnings
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib blob_store::read_accel
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test blob_read_accel
+      - name: Run reproducible read-accel benchmark evaluator
+        run: |
+          mkdir -p test-results/rubicon-read-accel
+          python3 scripts/eval_blob_read_accel.py \
+            --profiles small,medium,history \
+            --formats sha1,sha256 \
+            --json-out test-results/rubicon-read-accel/benchmark.json
+      - name: Upload read-accel CI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubicon-read-accel-evidence
+          path: test-results/rubicon-read-accel/
+          if-no-files-found: warn
