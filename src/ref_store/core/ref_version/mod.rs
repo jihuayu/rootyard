@@ -33,7 +33,7 @@ pub use digest::{derive_candidate_version_id, operation_digest};
 pub use limits::{
     MAX_CLOSURE_ARTIFACTS, MAX_CLOSURE_PACKS, MAX_CLOSURE_VERIFIED_BYTES, MAX_COMMIT_SET_REFS, MAX_OBJECT_DEP_DEPTH,
     MAX_OBJECT_DEPS_PER_VERSION, MAX_OBJECT_DEPS_TOTAL, MAX_OPERATION_PACKS, MAX_OPERATION_PLANNED_BYTES,
-    MAX_OPERATION_REFS, MAX_REASON_BYTES, MAX_VERSION_REFS,
+    MAX_OPERATION_REFS, MAX_REASON_BYTES, MAX_VERSION_REFS, MAX_VERSION_TERMINAL_BYTES,
 };
 pub use pack_set::{PackSetDigest, PackSetEntry, VerifiedClosurePack, compute_pack_set_digest};
 pub use read_mode::{
