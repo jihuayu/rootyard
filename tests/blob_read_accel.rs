@@ -341,7 +341,7 @@ struct TestCtx {
 
 fn test_ctx() -> Result<TestCtx> {
     let _dir = TempDir::new()?;
-    let vr = DisposableViewRoot::open(_dir.path(), 8, 64 << 20, Duration::from_secs(120))?;
+    let vr = DisposableViewRoot::open(&_dir.path().join("views"), 8, 64 << 20, Duration::from_secs(120))?;
     Ok(TestCtx { store: LoopbackS3::shared().open_store()?, vr, _dir, dl: Instant::now() + Duration::from_secs(60) })
 }
 
