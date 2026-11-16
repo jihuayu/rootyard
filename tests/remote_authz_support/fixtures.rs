@@ -56,8 +56,8 @@ pub fn init_gate_cmd(repo: Uuid, realm: &GrantExpectedRealm, authz_floor: i64) -
             group_epoch: realm.group_epoch,
             head_ref: "refs/heads/main".to_owned(),
         },
-        lane: RepositoryLane::PgRefstore,
-        pack_mode: SmPackMode::Refcas,
+        lane: RepositoryLane::ServingRefStore,
+        pack_mode: SmPackMode::MetadataOnly,
         authz_floor,
     })
 }

@@ -205,7 +205,7 @@ impl TestPgEnv {
         client.batch_execute(&format!("SET TIME ZONE '{tz}'")).await?;
         client
             .execute(
-                "UPDATE ref_store_decision_scopes SET updated_at = updated_at + ($1 * interval '1 hour')",
+                "UPDATE ref_store_decision_scopes SET updated_at = updated_at + make_interval(hours => $1)",
                 &[&hours_offset],
             )
             .await?;

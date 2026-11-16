@@ -42,7 +42,7 @@ pub async fn run_open_to_closing_grant_rotation_crash_restart() -> Result<()> {
     let dec1 = Uuid::new_v4();
     assert_eq!(
         mint_signed_decision_grant_from_pg(
-            &*pg.pool.get().await?,
+            &**pg.pool.get().await?,
             &keyring,
             &PgGrantMintRequest {
                 decision_id: dec1,
@@ -88,9 +88,9 @@ pub async fn run_open_to_closing_grant_rotation_crash_restart() -> Result<()> {
         required_holds: vec![],
         not_after_tick: 1000,
     };
-    let grant1 = mint_signed_decision_grant_from_pg(&*pg.pool.get().await?, &keyring, &mint_req).await?;
+    let grant1 = mint_signed_decision_grant_from_pg(&**pg.pool.get().await?, &keyring, &mint_req).await?;
     keyring.rotate_key(2, Zeroizing::new([0x88u8; 32]), true)?;
-    let grant2 = mint_signed_decision_grant_from_pg(&*pg.pool.get().await?, &keyring, &mint_req).await?;
+    let grant2 = mint_signed_decision_grant_from_pg(&**pg.pool.get().await?, &keyring, &mint_req).await?;
     assert!(verify_signed_decision_grant(&keyring, &grant1, &realm, &svc.san_identity, 10).is_err());
 
     let install1 = verify_signed_decision_grant(&keyring, &grant2, &realm, &svc.san_identity, 10)?;
@@ -99,7 +99,7 @@ pub async fn run_open_to_closing_grant_rotation_crash_restart() -> Result<()> {
 
     let change_id = Uuid::new_v4();
     pg.transition_scope_closing("token", scope_id, 5, change_id).await?;
-    let closing = load_closing_scopes_from_pg(&*pg.pool.get().await?).await?;
+    let closing = load_closing_scopes_from_pg(&**pg.pool.get().await?).await?;
     let close_cmds = plan_close_scope_commands(&closing, Some(pg.repo_id), Some(pg.tenant_id), 5, 20)?;
     assert_eq!(close_cmds.len(), 1);
     let (_, _, close_apply) = raft.commit_sm_cmd(&RefCasCommand::CloseAuthScope(close_cmds[0].clone())).await?;
@@ -144,7 +144,7 @@ pub async fn run_open_to_closing_grant_rotation_crash_restart() -> Result<()> {
         Err(StateMachineError::ScopeClosingOrClosed { .. })
     ));
     assert!(matches!(
-        mint_signed_decision_grant_from_pg(&*pg.pool.get().await?, &keyring, &mint_req).await,
+        mint_signed_decision_grant_from_pg(&**pg.pool.get().await?, &keyring, &mint_req).await,
         Err(RemoteAuthzGrantError::ScopeClosingOrMissingInPg { .. })
     ));
 
@@ -198,7 +198,7 @@ pub async fn run_cancel_commit_partition_drain_barrier() -> Result<()> {
         })
         .await?;
         let grant = mint_signed_decision_grant_from_pg(
-            &*pg.pool.get().await?,
+            &**pg.pool.get().await?,
             &keyring,
             &PgGrantMintRequest {
                 decision_id: dec_id,
@@ -227,7 +227,7 @@ pub async fn run_cancel_commit_partition_drain_barrier() -> Result<()> {
     pg.skew_clock_and_timezone("America/Los_Angeles", -26).await?;
 
     let close_cmds = plan_close_scope_commands(
-        &load_closing_scopes_from_pg(&*pg.pool.get().await?).await?,
+        &load_closing_scopes_from_pg(&**pg.pool.get().await?).await?,
         Some(pg.repo_id),
         Some(pg.tenant_id),
         6,
@@ -257,7 +257,7 @@ pub async fn run_cancel_commit_partition_drain_barrier() -> Result<()> {
     assert!(!unknown_status.can_ack_revocation());
 
     raft.heal_all().await?;
-    let cancel_rows = load_decision_cancellations_from_pg(&*pg.pool.get().await?, pg.repo_id).await?;
+    let cancel_rows = load_decision_cancellations_from_pg(&**pg.pool.get().await?, pg.repo_id).await?;
     let cancel_cmd = build_cancel_command_from_pg(&cancel_rows[0], "lane-b", 1, 35)?;
     raft.commit_sm_cmd(&RefCasCommand::Cancel(cancel_cmd)).await?;
     let new_lid = raft.wait_leader(None).await?;

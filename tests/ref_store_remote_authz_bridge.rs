@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::Result;
 use rootyard::ref_store::contract::{OperationState, RefStoreError};
 use rootyard::ref_store::core::state_machine::{
-    ApplyResponse, CancelCommand, CloseAuthScopeCommand, CommitRefsCommand, RefCasCommand, RefCasLogEntry,
+    ApplyResponse, CancelCommand, CloseAuthScopeCommand, CommitRefsCommand, NoopCommand, RefCasCommand, RefCasLogEntry,
     RefCasStateMachine, ScopeLifecycle, StateMachineError, WireCommitRefsRequest, WireOperationIdentity,
     encode_command,
 };
@@ -205,7 +205,7 @@ fn same_log_cancel_commit_ordering_and_snapshot_recovery_preserve_floor() {
     recovered
         .recover_entries(vec![RefCasLogEntry {
             log_id: log_id(6),
-            payload: encode_command(&RefCasCommand::Noop(Default::default())).unwrap(),
+            payload: encode_command(&RefCasCommand::Noop(NoopCommand { logical_tick: None })).unwrap(),
         }])
         .unwrap();
     assert_eq!(recovered.read_scope_floor("branch_rules", scope_id).unwrap().authz_floor, 12);
