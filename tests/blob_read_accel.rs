@@ -498,12 +498,21 @@ async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Res
                 (Fallback(SidecarArtifactCorrupt { kind: k, .. }), false) => *k == kind,
                 _ => false,
             },
-            "unexpected fallback status: {}",
+            "{}: unexpected fallback status: {}",
+            open_phase,
             finite_status_label(view.status())
         );
         if require_midx_quarantine {
-            ensure!(view.metrics().quarantined_sidecar_paths.iter().any(|p| p == "objects/pack/multi-pack-index"));
-            ensure!(!view.repo_path().context(quarantine_phase)?.join("objects/pack/multi-pack-index").exists());
+            ensure!(
+                view.metrics().quarantined_sidecar_paths.iter().any(|p| p == "objects/pack/multi-pack-index"),
+                "{}: midx quarantine marker missing",
+                quarantine_phase
+            );
+            ensure!(
+                !view.repo_path().context(quarantine_phase)?.join("objects/pack/multi-pack-index").exists(),
+                "{}: midx quarantine path still present",
+                quarantine_phase
+            );
         }
         assert_git_parity(
             baseline.repo_path().context(parity_phase)?,
