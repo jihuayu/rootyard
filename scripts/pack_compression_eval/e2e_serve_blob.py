@@ -6,13 +6,14 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
+import sys
 import threading
 from typing import Any
 import urllib.parse
 import uuid
 
+from .cleanup_diagnostics import remove_tree_checked, run_cleanup_steps
 from .corpus import (
     DATASET_ARCHETYPES,
     CommitSpec,
@@ -30,6 +31,8 @@ from .failure_diagnostics import (
     build_failure_record,
     completed_counts,
     enrich_failure_record,
+    finalize_cleanup,
+    push_context,
     sanitize_s3_snapshot,
 )
 from .live_server import (
@@ -81,30 +84,6 @@ def run_live_serve_blob_eval(
         "last_completed_phase": "live_setup",
         "completed": completed_counts(),
     }
-
-    def push_context(
-        phase: str,
-        *,
-        archetype: str = "unknown",
-        object_format: str = "unknown",
-        config: str = "baseline",
-        repo_ordinal: int | None = None,
-        wave_ordinal: int | None = None,
-        target_ordinal: int | None = None,
-        branch_ordinal: int | None = None,
-    ) -> dict[str, Any]:
-        return {
-            "phase": phase,
-            "archetype": archetype,
-            "object_format": object_format,
-            "config": config,
-            "repo_ordinal": repo_ordinal,
-            "wave_ordinal": wave_ordinal,
-            "target_ordinal": target_ordinal,
-            "branch_ordinal": branch_ordinal,
-            "completed": dict(progress["completed"]),
-            "last_completed_phase": progress["last_completed_phase"],
-        }
 
     parsed_s3 = urllib.parse.urlsplit(live.s3_endpoint)
     if parsed_s3.scheme != "http" or not parsed_s3.hostname:
@@ -175,7 +154,7 @@ def run_live_serve_blob_eval(
                 push_with_pack_config(
                     git_bin, wdir, remote_url, None, "HEAD:refs/heads/main", git_rw_env,
                     context=push_context(
-                        "baseline_seed_push", archetype=arch, object_format=obj_fmt, repo_ordinal=idx
+                        progress, "baseline_seed_push", archetype=arch, object_format=obj_fmt, repo_ordinal=idx
                     ),
                 )
             )
@@ -189,7 +168,7 @@ def run_live_serve_blob_eval(
                     push_with_pack_config(
                         git_bin, wdir, remote_url, None, "HEAD:refs/heads/main", git_rw_env,
                         context=push_context(
-                            "baseline_wave_push",
+                            progress, "baseline_wave_push",
                             archetype=arch,
                             object_format=obj_fmt,
                             repo_ordinal=idx,
@@ -294,7 +273,7 @@ def run_live_serve_blob_eval(
                     push_with_pack_config(
                         git_bin, target["work_dir"], c_remote, spec, "HEAD:refs/heads/main", cmp_rw_env,
                         context=push_context(
-                            "candidate_push",
+                            progress, "candidate_push",
                             archetype=target["archetype"],
                             object_format=target["object_format"],
                             config=spec.name,
@@ -376,7 +355,7 @@ def run_live_serve_blob_eval(
             ms = push_with_pack_config(
                 git_bin, cdir, base_url + conc_target["repo"]["clone_path"], None, f"HEAD:{branch_ref}", conc_rw_env,
                 context=push_context(
-                    "concurrent_push",
+                    progress, "concurrent_push",
                     archetype=conc_target["archetype"],
                     object_format=conc_target["object_format"],
                     config="baseline",
@@ -421,7 +400,7 @@ def run_live_serve_blob_eval(
             progress["last_completed_phase"] = "ack_verification"
 
         pg_final = query_pg_refstore_stats(pg_url, run_env)
-        sampler.stop()
+        sampler.sample_once()
         return {
             "executed": True,
             "binary": receipt_info,
@@ -479,17 +458,31 @@ def run_live_serve_blob_eval(
             )
         ) from None
     finally:
-        if proc is not None:
-            stop_serve_blob(proc, log_f)
-        proxy.stop()
-        sampler.stop()
-        if schema_created:
-            subprocess.run(
-                ["psql", "--dbname", live.pg_base, "-X", "-c", f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'],
-                env=run_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=15,
-            )
-        if not keep:
-            shutil.rmtree(scratch_dir, ignore_errors=True)
+        active = sys.exc_info()[1]
+        try:
+            s3_at_cleanup = sanitize_s3_snapshot(proxy.snapshot())
+        except Exception:  # noqa: BLE001 - never let snapshot failure replace the primary outcome
+            s3_at_cleanup = None
+        cleanup = run_cleanup_steps(
+            stop_server=(lambda: stop_serve_blob(proc, log_f)) if proc is not None else None,
+            stop_proxy=proxy.stop,
+            stop_sampler=sampler.stop,
+            drop_schema=(
+                lambda: subprocess.run(
+                    ["psql", "--dbname", live.pg_base, "-X", "-c", f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'],
+                    env=run_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=15,
+                )
+            ) if schema_created else None,
+            remove_scratch=(lambda: remove_tree_checked(scratch_dir)) if not keep else None,
+        )
+        finalize_cleanup(
+            active,
+            cleanup,
+            s3=s3_at_cleanup,
+            completed=progress["completed"],
+            last_completed_phase=progress["last_completed_phase"],
+            bindings=bindings_from_receipt(receipt_info),
+        )

@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from .cleanup_diagnostics import sanitize_cleanup
 from .corpus import DATASET_ARCHETYPES, OBJECT_FORMATS
 from .pack_matrix import CANDIDATE_CONFIGS
 
@@ -31,6 +32,7 @@ PHASES = (
     "concurrent_push",
     "live_setup",
     "ack_verification",
+    "cleanup",
     "unknown",
 )
 PROGRESS_PHASES = PHASES + ("none", "baseline_reads", "candidate_reads")
@@ -38,6 +40,7 @@ FAILURE_CLASSES = (
     "git_push",
     "git_timeout",
     "git_spawn",
+    "cleanup_failure",
     "unclassified",
 )
 HTTP_SUBPHASES = ("unknown",)
@@ -95,6 +98,7 @@ _RECORD_FIELDS = (
     "completed",
     "s3",
     "bindings",
+    "cleanup",
 )
 _HTTP_PATTERNS = (
     re.compile(rb"\bHTTP\s+(\d{3})\b"),
@@ -293,6 +297,7 @@ def build_failure_record(
     completed: Any = None,
     s3: Any = None,
     bindings: Any = None,
+    cleanup: Any = None,
 ) -> dict[str, Any]:
     """Build one fixed-schema failure record from source-known fields only."""
     return {
@@ -321,6 +326,7 @@ def build_failure_record(
         "completed": completed_counts(completed),
         "s3": sanitize_s3_snapshot(s3),
         "bindings": sanitize_bindings(bindings),
+        "cleanup": sanitize_cleanup(cleanup),
     }
 
 
@@ -329,6 +335,13 @@ def enrich_failure_record(record: Any, **overrides: Any) -> dict[str, Any]:
     source = dict(record) if isinstance(record, Mapping) else {}
     source.update(overrides)
     return build_failure_record(**{key: source.get(key) for key in _RECORD_FIELDS})
+
+
+def push_context(progress: Any, phase: Any, **values: Any) -> dict[str, Any]:
+    """Build caller-owned finite push context from the live progress map."""
+    source = progress if isinstance(progress, Mapping) else {}
+    completed = source.get("completed") if isinstance(source.get("completed"), Mapping) else {}
+    return {"phase": phase, **values, "completed": dict(completed), "last_completed_phase": source.get("last_completed_phase")}
 
 
 def failure_record_from_exception(
@@ -406,6 +419,34 @@ class LiveEvalFailure(FailureArtifactError):
     """A live-evaluation failure carrying only finite diagnostic fields."""
 
 
+def attach_cleanup(exc: FailureArtifactError, cleanup: Any) -> None:
+    """Attach finite cleanup outcomes without changing the primary failure."""
+    if isinstance(exc, FailureArtifactError):
+        exc.record = enrich_failure_record(exc.record, cleanup=cleanup)
+        exc.summary = safe_summary(exc.record)
+
+
+def finalize_cleanup(
+    active: BaseException | None,
+    cleanup: Any,
+    *,
+    s3: Any,
+    completed: Any,
+    last_completed_phase: Any,
+    bindings: Any,
+) -> None:
+    """Preserve a live failure, or fail a successful run whose cleanup failed."""
+    if isinstance(active, FailureArtifactError):
+        attach_cleanup(active, cleanup)
+    elif active is None and sanitize_cleanup(cleanup)["failures"]:
+        raise LiveEvalFailure(
+            build_failure_record(
+                phase="cleanup", failure_class="cleanup_failure", s3=s3, completed=completed,
+                last_completed_phase=last_completed_phase, bindings=bindings, cleanup=cleanup,
+            )
+        ) from None
+
+
 def failure_path_for(report_path: Path | str) -> Path:
     """Return the failure artifact sibling of the configured success report."""
     return Path(report_path).with_suffix(".failure.json")
@@ -434,6 +475,7 @@ __all__ = [
     "FAILURE_SCHEMA",
     "FailureArtifactError",
     "LiveEvalFailure",
+    "attach_cleanup",
     "bindings_from_receipt",
     "build_failure_record",
     "child_outcome",
@@ -441,8 +483,10 @@ __all__ = [
     "enrich_failure_record",
     "failure_path_for",
     "failure_record_from_exception",
+    "finalize_cleanup",
     "finite_http_status",
     "git_failure_record",
+    "push_context",
     "safe_summary",
     "sanitize_bindings",
     "sanitize_s3_snapshot",

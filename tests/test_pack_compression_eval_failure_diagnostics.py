@@ -122,6 +122,8 @@ class FiniteFailureDiagnosticsTest(unittest.TestCase):
         self.assertEqual(record["completed"]["acked_refs_verified"], 2)
         self.assertEqual(record["s3"]["status_counts"], {"200": 2, "unknown": 10})
         self.assertEqual(record["s3"]["other_requests"], 4)
+        self.assertEqual(record["cleanup"]["failures"], [])
+        self.assertFalse(record["cleanup"]["attempted"])
         self.assertIsNone(record["bindings"]["binary_sha256"])
         self.assertIsNone(record["bindings"]["binary_size_bytes"])
         self.assertIsNone(record["bindings"]["workspace_commit"])
