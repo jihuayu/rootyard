@@ -1,8 +1,10 @@
 //! Import a projected Git bundle and map its tree back into a pinned source subdir.
-use super::{changesets, views};
+use super::{changesets, handlers, views};
 #[path = "reverse_git.rs"]
 mod reverse_git;
-use crate::{AppState, Error, auth, browse::transactions, members::models::Role, storage::read_leases};
+use crate::{
+    AppState, Error, auth, browse::transactions, members::models::Role, storage::read_leases, token_scopes::RepoAction,
+};
 use axum::{
     Json,
     extract::{Path, State},
@@ -12,7 +14,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use reverse_git::{git, git_input, git_oid, verify_candidate_budget};
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
     io::Write,
     os::fd::AsRawFd,
@@ -176,7 +178,8 @@ pub async fn create(
     Path(id): Path<Uuid>,
     Json(input): Json<ReverseInput>,
 ) -> Result<(StatusCode, Json<changesets::ChangeSet>), Error> {
-    let view = views::load(&state, &headers, id).await?;
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let view = views::load_row(&state, id).await?;
     if !crate::browse::models::valid_public_ref(&input.bundle_ref)
         || !input.bundle_ref.starts_with("refs/heads/")
         || !crate::browse::models::valid_public_ref(&input.source_ref)
@@ -191,32 +194,34 @@ pub async fn create(
     if bundle.is_empty() || bundle.len() > 16 * 1024 * 1024 {
         return Err(Error::bad_request());
     }
-    let actor = auth::authenticate(&state.pool, &headers).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let ns = super::handlers::load(&state, &headers, view.namespace_id).await?;
+    let mut overrides = HashMap::new();
+    overrides.insert(view.mount_path.clone(), (Role::Write, RepoAction::ContentsWrite));
+    let ns = handlers::load_for_actor_with_overrides(&state, &actor, view.namespace_id, &overrides).await?;
     let mount = ns.mounts.iter().find(|m| m.path == view.mount_path).ok_or_else(Error::not_found)?;
     if mount.base_oid != view.source_oid {
         return Err(Error::not_found());
     }
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(
         &tx,
         &actor,
         &mount.owner,
         &mount.repository,
         Role::Write,
-        crate::token_scopes::RepoAction::ContentsWrite,
+        RepoAction::ContentsWrite,
     )
     .await?;
     if access.repo_id != view.repository_id {
         return Err(Error::not_found());
     }
     let generation: i64 = tx
-        .query_one("SELECT storage_generation FROM repositories WHERE id=$1 AND state='ready'", &[&access.repo_id])
+        .query_opt("SELECT storage_generation FROM repositories WHERE id=$1 AND state='ready'", &[&access.repo_id])
         .await
         .map_err(Error::internal)?
+        .ok_or_else(|| Error(StatusCode::CONFLICT, "repository is not ready"))?
         .get(0);
-    tx.commit().await.map_err(Error::internal)?;
+    auth::finish_tx(tx, &actor, true).await?;
     drop(client);
     let source_lease =
         read_leases::shared(&state.pool, access.repo_id, tokio::time::Instant::now() + state.config.git_timeout)
