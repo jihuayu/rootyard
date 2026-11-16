@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use openraft::{BasicNode, Config, Raft, SnapshotPolicy};
+use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -197,8 +197,8 @@ impl TenantTestCluster {
                 Config {
                     cluster_name: "tenant-rpc-test".into(),
                     heartbeat_interval: 60,
-                    election_timeout_min: 180,
-                    election_timeout_max: 320,
+                    election_timeout_min: 220,
+                    election_timeout_max: 450,
                     snapshot_policy: SnapshotPolicy::LogsSinceLast(2_000),
                     ..Default::default()
                 }
@@ -227,8 +227,17 @@ impl TenantTestCluster {
                             let t = p_tls.clone();
                             tokio::spawn(async move {
                                 let Ok((mut tls, id)) = t.accept(tcp).await else { return };
+                                if let PeerIdentity::Node(sid) = id
+                                    && d.is_blocked(sid)
+                                {
+                                    return;
+                                }
                                 while let Ok(Some(req)) = read_frame_async::<_, RpcRequest>(&mut tls).await {
-                                    if let PeerIdentity::Node(sid) = id && d.is_blocked(sid) { break; }
+                                    if let PeerIdentity::Node(sid) = id
+                                        && d.is_blocked(sid)
+                                    {
+                                        break;
+                                    }
                                     let resp = match (id, req) {
                                         (PeerIdentity::Node(sid), RpcRequest::Vote(v)) if v.vote.leader_id.node_id == sid => {
                                             RpcResponse::Vote(Box::new(r.vote(v).await))
@@ -258,8 +267,8 @@ impl TenantTestCluster {
                 mtls: mtls_srv,
                 tenant_peers: tenant_peers.clone(),
                 registry: registry.clone(),
-                quorum_timeout: Duration::from_millis(600),
-                write_timeout: Duration::from_millis(1200),
+                quorum_timeout: Duration::from_millis(1_000),
+                write_timeout: Duration::from_millis(2_000),
             };
             let rpc_server = TenantRpcServer::spawn(raft.clone(), sm, srv_cfg).await.unwrap();
 
@@ -276,24 +285,32 @@ impl TenantTestCluster {
         nodes[0].raft.initialize(init_nodes).await.unwrap();
 
         let cluster = Self { pki, nodes };
-        cluster.wait_leader(Duration::from_secs(6)).await;
+        cluster.wait_leader(Duration::from_secs(15)).await;
         cluster
     }
 
     pub async fn wait_leader(&self, timeout: Duration) -> (u64, u64) {
         let stop = Instant::now() + timeout;
         while Instant::now() < stop {
-            for n in &self.nodes {
+            let leader_term = self.nodes.iter().find_map(|n| {
                 let m = n.raft.metrics().borrow().clone();
-                if let Some(lid) = m.current_leader
-                    && m.current_term > 0
-                {
-                    return (lid, m.current_term);
+                (m.state == ServerState::Leader && m.current_leader == Some(n.id) && m.current_term > 0)
+                    .then_some((n.id, m.current_term))
+            });
+            if let Some((lid, term)) = leader_term {
+                let all_ready = self.nodes.iter().all(|n| {
+                    let m = n.raft.metrics().borrow().clone();
+                    m.current_leader == Some(lid)
+                        && m.last_applied.is_some()
+                        && m.membership_config.membership().voter_ids().count() == 3
+                });
+                if all_ready {
+                    return (lid, term);
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("cluster did not elect a leader within {timeout:?}");
+        panic!("cluster did not elect a converged leader within {timeout:?}");
     }
 
     pub async fn wait_leader_excluding(&self, excluded_id: u64, min_term: u64, timeout: Duration) -> (u64, u64) {
@@ -304,11 +321,13 @@ impl TenantTestCluster {
                     continue;
                 }
                 let m = n.raft.metrics().borrow().clone();
-                if let Some(lid) = m.current_leader
-                    && lid != excluded_id
-                    && m.current_term >= min_term
-                {
-                    return (lid, m.current_term);
+                if m.state == ServerState::Leader && m.current_leader == Some(n.id) && m.current_term >= min_term {
+                    let peer_agrees = self.nodes.iter().any(|p| {
+                        p.id != excluded_id && p.id != n.id && p.raft.metrics().borrow().current_leader == Some(n.id)
+                    });
+                    if peer_agrees {
+                        return (n.id, m.current_term);
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

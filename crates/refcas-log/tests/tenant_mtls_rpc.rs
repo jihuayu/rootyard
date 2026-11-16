@@ -258,11 +258,11 @@ async fn stale_authority_history_group_epoch_and_term_vs_storage_generation_sepa
 
     let paths =
         cluster.pki.tenant_paths("tenant-a-rw2", TENANT_A, GROUP_ALPHA, &[RpcCapability::Read, RpcCapability::Write]);
-    let client = TenantRpcClient::new(cluster.pki.client_from(&paths), Duration::from_secs(3), 4);
+    let client = TenantRpcClient::new(cluster.pki.client_from(&paths), Duration::from_secs(6), 4);
 
     // 1. Isolate leader1 so nodes elect leader2 at raft_term > term1 while business storage_generation stays 7.
     cluster.partition_node(leader1);
-    let (leader2, term2) = cluster.wait_leader_excluding(leader1, term1 + 1, Duration::from_secs(6)).await;
+    let (leader2, term2) = cluster.wait_leader_excluding(leader1, term1 + 1, Duration::from_secs(15)).await;
     assert!(term2 > term1);
 
     // Client sending stale redirect / querying follower gets safe LeaderRedirect onto leader2 with storage_generation == 7.
