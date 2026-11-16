@@ -7,6 +7,7 @@ No Git, HTTP, S3, PostgreSQL, proxy, process, server or network is created.
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 import subprocess
@@ -351,6 +352,20 @@ class ServerOwnerTest(unittest.TestCase):
                 live_server.restart_serve_blob(owner, start)
         start.assert_not_called()
         self.assertTrue(owner.has_owner)
+
+    def test_both_restart_callsites_use_owner_receipt_helper(self) -> None:
+        tree = ast.parse(Path(e2e.__file__).read_text(encoding="utf-8"))
+        names: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name):
+                    names.append(func.id)
+                elif isinstance(func, ast.Attribute):
+                    names.append(func.attr)
+        self.assertEqual(names.count("restart_serve_blob"), 2)
+        self.assertEqual(names.count("stop_serve_blob"), 0)
+        self.assertEqual(names.count("start_serve_blob"), 1)
 
     def test_confirmed_reap_clears_old_owner_before_fresh_start(self) -> None:
         owner = live_server.ServeBlobOwner()
