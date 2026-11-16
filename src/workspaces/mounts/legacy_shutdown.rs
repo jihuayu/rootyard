@@ -256,8 +256,7 @@ impl<O> LegacyShutdownTicket<O> {
             if !finished {
                 return None;
             }
-            let Some(handle) = worker.handle.take() else { return None };
-            handle
+            worker.handle.take()?
         };
         // The worker mutex is intentionally released before joining. Status
         // observation must never wait on a native teardown.
