@@ -12,8 +12,10 @@
 //! Redis/PG/local-unverified fallback. Full authenticated network proof, production HTTP auth,
 //! and the PostgreSQL projection consumer remain later qualification tasks.
 
+mod adapter_state;
 mod backend;
 mod error;
+mod outcome;
 mod realm;
 mod reducer;
 mod scope;
@@ -21,6 +23,10 @@ mod view;
 
 pub use backend::{BackendOptions, RootRaftRefCasBackend};
 pub use error::RaftBackendError;
+pub use outcome::{
+    GateVersionSnapshot, OperationStateSnapshot, OutcomeKey, OutcomeQuery, ProposeOutcome, RootRefCasApplied,
+    RootRefCasOutcome, RootRefCasRefusal, RootRefCasRefusalKind, StoredOutcome, command_digest_hex,
+};
 pub use realm::RealmBinding;
 pub use reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine, validate_ref_cas_command};
 pub use view::CommittedRefCasView;

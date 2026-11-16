@@ -20,6 +20,10 @@ pub enum RaftBackendError {
     QuorumUnavailable(&'static str),
     /// The local application apply barrier did not reach the quorum ReadIndex coordinate.
     ApplyBarrierTimeout { applied: Option<ApplicationLogId>, required: Option<ApplicationLogId> },
+    /// The committed entry applied without a durable typed outcome at its exact coordinate.
+    OutcomeMissing(ApplicationLogId),
+    /// The stored outcome belongs to a different canonical command payload.
+    OutcomeDigestMismatch(ApplicationLogId),
     /// The persistent state machine was not opened with the root Ref-CAS reducer.
     NotApplicationMode,
     /// The opened application reducer is not the root Ref-CAS adapter.
@@ -48,6 +52,12 @@ impl fmt::Display for RaftBackendError {
             }
             Self::ApplyBarrierTimeout { applied, required } => {
                 write!(f, "local application apply barrier {applied:?} did not reach required coordinate {required:?}")
+            }
+            Self::OutcomeMissing(log_id) => {
+                write!(f, "committed entry {log_id:?} has no durable typed business outcome")
+            }
+            Self::OutcomeDigestMismatch(log_id) => {
+                write!(f, "committed entry {log_id:?} typed outcome digest does not match the command payload")
             }
             Self::NotApplicationMode => {
                 f.write_str("persistent state machine is not opened with the root Ref-CAS reducer")

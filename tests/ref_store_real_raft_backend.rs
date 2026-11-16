@@ -18,11 +18,12 @@ use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{BasicNode, CommittedLeaderId, Config, Entry, EntryPayload, LogId, Raft, ServerState, SnapshotPolicy};
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use rootyard::ref_store::core::state_machine::{
-    CommitRefsCommand, InitializeGateCommand, RefCasCommand, RepositoryLane, SmPackMode, WireCommitRefsRequest,
-    WireGateInit,
+    CommitRefsCommand, InitializeGateCommand, NoopCommand, RefCasCommand, RepositoryLane, ScopeLifecycle,
+    SetRepositoryLaneCommand, SmPackMode, WireCommitRefsRequest, WireGateInit, encode_command,
 };
 use rootyard::ref_store::raft_backend::{
-    BackendOptions, ROOT_REF_CAS_VERSION, RaftBackendError, RealmBinding, RootRaftRefCasBackend, RootRefCasStateMachine,
+    BackendOptions, OutcomeQuery, ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RaftBackendError, RealmBinding,
+    RootRaftRefCasBackend, RootRefCasOutcome, RootRefCasRefusalKind, RootRefCasStateMachine,
 };
 use rootyard::ref_store::{
     CommitMode, CommitRefsRequest, CoreGateInit, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, OperationLookup,
@@ -31,6 +32,7 @@ use rootyard::ref_store::{
 use rootyard_refcas_log::cluster::{
     MtlsNetworkFactory, PeerDirectory, RpcRequest, RpcResponse, read_frame_async, write_frame_async,
 };
+use rootyard_refcas_log::fault::{FaultController, FaultMode, FaultPoint, FaultSpec};
 use rootyard_refcas_log::mtls::{MtlsClient, MtlsPaths, MtlsServer, PeerIdentity, node_dns_name};
 use rootyard_refcas_log::state_machine::{
     ApplicationCommand, ApplicationError, ApplicationLogId, ApplicationStateMachine, PersistentStateMachine, SmCommand,
@@ -390,6 +392,23 @@ fn reducer_snapshot(
     snapshot.reducer.as_any().downcast_ref::<RootRefCasStateMachine>().expect("root reducer")
 }
 
+async fn wait_applied_through(cluster: &TestCluster, index: u64, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let ready = cluster
+            .nodes
+            .iter()
+            .all(|node| node.raft.metrics().borrow().last_applied.is_some_and(|id| id.index >= index));
+        if ready {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("cluster did not apply coordinate {index} on every replica within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct ForeignState {
     last_applied: Option<ApplicationLogId>,
@@ -488,10 +507,13 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     };
     let backend = backend_on(&cluster, leader_id, repo, tenant, realm.clone(), options).await?;
 
-    backend.propose(init_command(repo, tenant, history)).await?;
+    let init_outcome = backend.propose(init_command(repo, tenant, history)).await?;
+    assert!(init_outcome.outcome.is_applied());
     let operation_id = Uuid::new_v4();
     let commit = commit_command(repo, tenant, issuer, history, 1, operation_id, 1, "refs/heads/main", None, oid(1));
-    let commit_coordinate = backend.propose(commit.clone()).await?;
+    let commit_outcome = backend.propose(commit.clone()).await?;
+    let commit_coordinate = commit_outcome.log_id;
+    assert!(commit_outcome.outcome.is_applied());
 
     let view = backend.read_committed_view().await?;
     assert!(view.last_applied().is_some_and(|id| id.index >= commit_coordinate.index));
@@ -511,6 +533,54 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     ));
     assert!(matches!(view.query_operation(operation_id)?, OperationLookup::Known(_)));
     assert!(view.state_digest_hex()?.len() == 64);
+
+    // A valid gate transition to Closing is applied. A subsequent same-scope CommitRefs is a
+    // deterministic business refusal: it must advance the replicated applied coordinate and
+    // return a durable typed outcome, not become a fatal OpenRaft apply/storage error.
+    let closing = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+        repository_id: repo,
+        tenant_id: tenant,
+        lane: RepositoryLane::ServingRefStore,
+        lifecycle: ScopeLifecycle::Closing,
+        authz_floor: 1,
+        history_incarnation: history,
+        authority_epoch: 1,
+        group_epoch: 1,
+        pack_mode: SmPackMode::MetadataOnly,
+    });
+    let close_outcome = backend.propose(closing).await?;
+    assert!(close_outcome.outcome.is_applied());
+    let closing_view = backend.read_committed_view().await?;
+    assert_eq!(closing_view.read_scope_lifecycle().map(|(lifecycle, _)| lifecycle), Some(ScopeLifecycle::Closing));
+
+    let refused_operation = Uuid::new_v4();
+    let refused_commit =
+        commit_command(repo, tenant, issuer, history, 2, refused_operation, 2, "refs/heads/refused", None, oid(2));
+    let refusal = backend.propose(refused_commit).await?;
+    let refusal_kind = match &refusal.outcome {
+        RootRefCasOutcome::Refused(refusal) => refusal.kind,
+        RootRefCasOutcome::Applied(_) => panic!("gate-closed commit unexpectedly applied"),
+    };
+    assert_eq!(refusal_kind, RootRefCasRefusalKind::ScopeClosingOrClosed);
+    wait_applied_through(&cluster, refusal.log_id.index, Duration::from_secs(10)).await?;
+    let refused_view = backend.read_committed_view().await?;
+    assert!(refused_view.last_applied().is_some_and(|id| id.index >= refusal.log_id.index));
+    assert!(refused_view.read_ref("refs/heads/refused").is_none());
+    let stored_refusal = refused_view
+        .query_outcome(&OutcomeQuery::Operation(refused_operation))
+        .expect("durable typed refusal by operation id");
+    assert_eq!(stored_refusal.log_id, refusal.log_id);
+    assert!(matches!(
+        stored_refusal.outcome,
+        RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::ScopeClosingOrClosed
+    ));
+
+    // The healthy quorum still works after the refusal: a valid Noop applies, the applied index
+    // advances, and a new ReadIndex-backed view is minted.
+    let healthy = backend.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })).await?;
+    assert!(healthy.outcome.is_applied());
+    let healthy_view = backend.read_committed_view().await?;
+    assert!(healthy_view.last_applied().is_some_and(|id| id.index >= healthy.log_id.index));
 
     // A real KV fallback is unavailable in application mode.
     assert!(cluster.node(leader_id).sm.kv_get("refs/heads/main").await.is_err());
@@ -561,7 +631,38 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
             .await
             .is_err()
     );
+    let unknown_wire =
+        ApplicationCommand::new(ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, b"{bad".to_vec())?.encode()?;
+    assert!(
+        malformed
+            .apply(vec![Entry { log_id: lid(1, 90, 3), payload: EntryPayload::Normal(unknown_wire) }])
+            .await
+            .is_err()
+    );
     assert!(malformed.application_summary().await?.expect("application row").last_applied.is_none());
+
+    // Storage/commit faults remain fatal and never advance the applied coordinate or manufacture a
+    // typed business outcome.
+    let fault = Arc::new(FaultController::default());
+    let faulty_dir = tempfile::tempdir()?;
+    let mut faulty = PersistentStateMachine::open_application_with_faults(
+        faulty_dir.path(),
+        94,
+        true,
+        Box::new(RootRefCasStateMachine::new()),
+        fault.clone(),
+    )
+    .await?;
+    fault.arm(FaultSpec { point: FaultPoint::SmApplySync, mode: FaultMode::Once });
+    let noop_payload = encode_command(&RefCasCommand::Noop(NoopCommand { logical_tick: None }))?;
+    let noop_envelope = ApplicationCommand::new(ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, noop_payload)?.encode()?;
+    assert!(
+        faulty
+            .apply(vec![Entry { log_id: lid(1, 94, 1), payload: EntryPayload::Normal(noop_envelope) }])
+            .await
+            .is_err()
+    );
+    assert!(faulty.application_summary().await?.expect("application row").last_applied.is_none());
 
     // A snapshot from a different application domain is refused on install, not restored as
     // empty/local state.
@@ -604,6 +705,13 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     assert_eq!(restored_reducer.read_refs(repo).get("refs/heads/main"), Some(&expected_oid));
     assert_eq!(restored_reducer.read_head_ref(repo).as_deref(), Some("refs/heads/main"));
     assert!(restored_reducer.last_applied_coordinate().is_some_and(|id| id.index >= commit_coordinate.index));
+    let restored_refusal = restored_reducer
+        .query_outcome(&OutcomeQuery::LogId(refusal.log_id))
+        .expect("refusal survives snapshot install");
+    assert!(matches!(
+        &restored_refusal.outcome,
+        RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::ScopeClosingOrClosed
+    ));
     drop(restored);
 
     let reopened = PersistentStateMachine::open_application(
@@ -616,6 +724,9 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let reopened_snapshot = reopened.application_snapshot().await?.expect("application state");
     let reopened_reducer = reducer_snapshot(&reopened_snapshot);
     assert_eq!(reopened_reducer.read_refs(repo).get("refs/heads/main"), Some(&expected_oid));
+    let reopened_refusal =
+        reopened_reducer.query_outcome(&OutcomeQuery::LogId(refusal.log_id)).expect("refusal survives SQLite reopen");
+    assert!(reopened_refusal.outcome.is_refused());
 
     // Real no-quorum boundary: isolate the leader, use a short-bounded backend, and require an
     // explicit quorum/redirect refusal. No PG/Redis/local view is returned.

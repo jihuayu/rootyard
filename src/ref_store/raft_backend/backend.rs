@@ -6,13 +6,14 @@ use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::{LogId, Raft};
 use rootyard_refcas_log::LogTypeConfig;
 use rootyard_refcas_log::state_machine::{
-    ApplicationCommand, ApplicationLogId, ApplicationStateMachine, PersistentStateMachine,
+    ApplicationCommand, ApplicationLogId, ApplicationRuntimeSnapshot, ApplicationStateMachine, PersistentStateMachine,
 };
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::ref_store::core::state_machine::{RefCasCommand, encode_command};
 use crate::ref_store::raft_backend::error::RaftBackendError;
+use crate::ref_store::raft_backend::outcome::{OutcomeQuery, ProposeOutcome, StoredOutcome, command_digest_hex};
 use crate::ref_store::raft_backend::realm::RealmBinding;
 use crate::ref_store::raft_backend::reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine};
 use crate::ref_store::raft_backend::scope::validate_command_scope;
@@ -117,26 +118,53 @@ impl RootRaftRefCasBackend {
     /// There is no direct local state-machine write or PostgreSQL fallback.
     ///
     /// This validates canonical codec bounds and the trusted repository/tenant/realm scope only.
-    /// Production business prevalidation (live authorization, expected revision/policy, pack
-    /// closure) must happen before this call; a deterministic RSM refusal is an openraft apply
-    /// error. That prevalidation/HTTP boundary is a later qualification task, not claimed here.
-    pub async fn propose(&self, command: RefCasCommand) -> Result<ApplicationLogId, RaftBackendError> {
+    /// Expected business refusals are returned as a replicated typed `ProposeOutcome`, not as a
+    /// storage/apply error. Production business prevalidation (live authorization, expected
+    /// revision/policy, pack closure) remains a later qualification task; the adapter's typed
+    /// refusal path makes the ordering race a durable decision rather than an OpenRaft failure.
+    pub async fn propose(&self, command: RefCasCommand) -> Result<ProposeOutcome, RaftBackendError> {
         validate_command_scope(&command, self.repository_id, self.tenant_id, &self.realm)?;
         let payload =
             encode_command(&command).map_err(|_| RaftBackendError::Encode("root Ref-CAS command codec refused"))?;
+        let digest_hex = command_digest_hex(&payload);
         let envelope = ApplicationCommand::new(ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, payload)
             .map_err(|_| RaftBackendError::Encode("application envelope bounds refused"))?
             .encode()
             .map_err(|_| RaftBackendError::Encode("application envelope codec refused"))?;
 
         match tokio::time::timeout(self.options.quorum_timeout, self.raft.client_write(envelope)).await {
-            Ok(Ok(response)) => Ok(ApplicationLogId::from_log_id(response.log_id)),
+            Ok(Ok(response)) => {
+                let log_id = ApplicationLogId::from_log_id(response.log_id);
+                let snapshot = self.await_applied_snapshot(Some(log_id)).await?;
+                let reducer = snapshot
+                    .reducer
+                    .as_any()
+                    .downcast_ref::<RootRefCasStateMachine>()
+                    .ok_or(RaftBackendError::WrongReducer)?;
+                if reducer.last_applied() != Some(log_id) {
+                    return Err(RaftBackendError::Storage("root reducer coordinate mismatch after write"));
+                }
+                let stored = reducer
+                    .query_outcome(&OutcomeQuery::LogId(log_id))
+                    .cloned()
+                    .ok_or(RaftBackendError::OutcomeMissing(log_id))?;
+                if stored.command_digest_hex != digest_hex {
+                    return Err(RaftBackendError::OutcomeDigestMismatch(log_id));
+                }
+                Ok(ProposeOutcome { log_id, outcome: stored.outcome })
+            }
             Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd)))) => {
                 Err(RaftBackendError::FollowerRedirect(fwd.leader_id))
             }
             Ok(Err(_)) => Err(RaftBackendError::QuorumUnavailable("client write")),
             Err(_) => Err(RaftBackendError::QuorumUnavailable("client write timeout")),
         }
+    }
+
+    /// Linearizable idempotent outcome lookup for an unknown/lost propose acknowledgement.
+    pub async fn query_outcome(&self, query: OutcomeQuery) -> Result<Option<StoredOutcome>, RaftBackendError> {
+        let view = self.read_committed_view().await?;
+        Ok(view.query_outcome(&query))
     }
 
     /// Mints an authoritative view only after a real quorum ReadIndex and local apply barrier.
@@ -172,6 +200,20 @@ impl RootRaftRefCasBackend {
         read_log_id: Option<LogId<u64>>,
     ) -> Result<CommittedRefCasView, RaftBackendError> {
         let required = read_log_id.map(ApplicationLogId::from_log_id);
+        let snapshot = self.await_applied_snapshot(required).await?;
+        let applied = snapshot.applied.map(ApplicationLogId::from_log_id);
+        let reducer =
+            snapshot.reducer.as_any().downcast_ref::<RootRefCasStateMachine>().ok_or(RaftBackendError::WrongReducer)?;
+        if reducer.last_applied() != applied {
+            return Err(RaftBackendError::Storage("root reducer coordinate mismatch"));
+        }
+        Ok(CommittedRefCasView::mint(reducer.clone(), applied, self.repository_id, self.tenant_id, self.realm.clone()))
+    }
+
+    async fn await_applied_snapshot(
+        &self,
+        required: Option<ApplicationLogId>,
+    ) -> Result<ApplicationRuntimeSnapshot, RaftBackendError> {
         let deadline = Instant::now() + self.options.apply_timeout;
         loop {
             let snapshot = self
@@ -185,21 +227,7 @@ impl RootRaftRefCasBackend {
             }
             let applied = snapshot.applied.map(ApplicationLogId::from_log_id);
             if required.is_none_or(|required| applied.is_some_and(|applied| applied.index >= required.index)) {
-                let reducer = snapshot
-                    .reducer
-                    .as_any()
-                    .downcast_ref::<RootRefCasStateMachine>()
-                    .ok_or(RaftBackendError::WrongReducer)?;
-                if reducer.last_applied() != applied {
-                    return Err(RaftBackendError::Storage("root reducer coordinate mismatch"));
-                }
-                return Ok(CommittedRefCasView::mint(
-                    reducer.machine().clone(),
-                    applied,
-                    self.repository_id,
-                    self.tenant_id,
-                    self.realm.clone(),
-                ));
+                return Ok(snapshot);
             }
             if Instant::now() >= deadline {
                 return Err(RaftBackendError::ApplyBarrierTimeout { applied, required });
