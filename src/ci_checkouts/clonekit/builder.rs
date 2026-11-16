@@ -220,6 +220,44 @@ fn copy_private_file(src: &Path, dest: &Path) -> Result<(), CloneKitError> {
         .map_err(|err| CloneKitError::GitFailed(format!("sync prepared clonekit artifact: {err}")))
 }
 
+fn sync_dir(path: &Path) -> Result<(), CloneKitError> {
+    File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|err| CloneKitError::GitFailed(format!("sync clonekit directory: {err}")))
+}
+
+fn verify_prepared_artifact(path: &Path, expected: &str, expected_len: u64) -> Result<(), CloneKitError> {
+    let (sha256, length) = compute_file_sha256(path)?;
+    if sha256 != expected || length != expected_len {
+        return Err(CloneKitError::CorruptArtifact("prepared pack/idx failed digest verification".into()));
+    }
+    Ok(())
+}
+
+fn verify_idx_in_ephemeral_repo(
+    git_binary: &Path,
+    work_parent: &Path,
+    object_format: CloneKitObjectFormat,
+    idx_path: &Path,
+    cancel: Option<&CancellationToken>,
+) -> Result<(), CloneKitError> {
+    let idx_str = idx_path.to_str().ok_or(CloneKitError::InvalidInput("non-utf8 idx path"))?;
+    let verify_repo = work_parent.join(format!(".verify-repo-{}", Uuid::new_v4().simple()));
+    let res = (|| {
+        ensure_private_dir(&verify_repo)?;
+        run_git_command(
+            git_binary,
+            Some(&verify_repo),
+            &["init", "--bare", "--quiet", object_format.git_init_flag()],
+            cancel,
+        )?;
+        run_git_command(git_binary, Some(&verify_repo), &["verify-pack", "-s", idx_str], cancel)?;
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&verify_repo);
+    res
+}
+
 fn manifest_from_request(
     req: &BuildCloneKitRequest,
     status: CloneKitStatus,

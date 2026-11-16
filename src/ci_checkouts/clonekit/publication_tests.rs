@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use super::{CloneKitPublicationStore, PreparedGeneration, publish_clonekit_versioned};
+use super::{CloneKitPublicationStore, PreparedGeneration, publish_clonekit_versioned, test_seam};
 use crate::ci_checkouts::clonekit::{
     BuiltCloneKitArtifacts, RetentionPinGuard, RetentionPinLedger,
     manifest::{
@@ -100,6 +100,8 @@ fn attempt_names(store: &CloneKitPublicationStore, repository_id: Uuid) -> Vec<S
 
 #[test]
 fn empty_publication_uses_whole_generation_layout() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
@@ -115,6 +117,8 @@ fn empty_publication_uses_whole_generation_layout() {
 
 #[test]
 fn corrupt_candidate_preserves_existing_generation_and_current() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
@@ -136,6 +140,8 @@ fn corrupt_candidate_preserves_existing_generation_and_current() {
 
 #[test]
 fn failed_attempt_cleanup_removes_only_its_own_directory() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
@@ -171,6 +177,8 @@ fn prepare_empty(
 
 #[test]
 fn locked_recheck_rejects_candidate_prepared_before_newer_publication() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
@@ -187,6 +195,7 @@ fn locked_recheck_rejects_candidate_prepared_before_newer_publication() {
     let error = store.commit_prepared(older, None).unwrap_err();
     assert!(matches!(error, CloneKitError::StaleGeneration { expected_min: 3, actual: 1 }));
     assert_eq!(store.load_latest(repository_id).expect("latest").expect("present").kit_generation, 2);
+    drop(_guard);
 
     let duplicate = publish_clonekit_versioned(
         &store,
@@ -201,6 +210,8 @@ fn locked_recheck_rejects_candidate_prepared_before_newer_publication() {
 
 #[test]
 fn busy_publication_lock_is_explicit_and_released_after_guard_drop() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
@@ -228,6 +239,8 @@ fn busy_publication_lock_is_explicit_and_released_after_guard_drop() {
 
 #[test]
 fn publication_lock_is_released_after_panic_unwind() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
@@ -241,6 +254,8 @@ fn publication_lock_is_released_after_panic_unwind() {
 
 #[test]
 fn generation_u64_max_is_reported_as_exhausted_not_overflowed() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
@@ -261,6 +276,8 @@ fn generation_u64_max_is_reported_as_exhausted_not_overflowed() {
 
 #[test]
 fn exact_unpublished_generation_recovers_and_conflicting_generation_rejects() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
@@ -300,6 +317,8 @@ fn exact_unpublished_generation_recovers_and_conflicting_generation_rejects() {
 
 #[test]
 fn recovery_validates_active_manifest_pack_and_idx_without_git() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
@@ -332,6 +351,8 @@ fn recovery_validates_active_manifest_pack_and_idx_without_git() {
 
 #[test]
 fn gc_requires_publication_lock_strictly_older_current_and_held_pin_check() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let ledger = RetentionPinLedger::new();
@@ -372,4 +393,20 @@ fn gc_requires_publication_lock_strictly_older_current_and_held_pin_check() {
     fs::write(candidate.join("keep"), b"candidate").expect("candidate marker");
     assert!(!store.try_gc_generation(absent, 1, &ledger).expect("absent current refused"));
     assert!(candidate.join("keep").is_file());
+}
+
+#[test]
+fn staged_git_verification_failure_cleans_attempt_before_shared_write() {
+    let _serial = test_seam::serial();
+    test_seam::reset();
+    let td = TempDir::new().expect("tempdir");
+    let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
+    let repository_id = Uuid::new_v4();
+    let candidate = active_artifacts(&td, repository_id, 2, b"pack-bytes", b"idx-bytes", b"pack-bytes", b"idx-bytes");
+    let missing_git = Path::new("/nonexistent/rootyard-test-git");
+    let error = publish_clonekit_versioned(&store, &candidate, missing_git, None, None).unwrap_err();
+    assert!(matches!(error, CloneKitError::GitFailed(_)));
+    assert!(!store.version_dir(repository_id, 2).exists());
+    assert!(attempt_names(&store, repository_id).is_empty());
+    assert!(store.load_latest(repository_id).expect("latest").is_none());
 }

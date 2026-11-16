@@ -13,12 +13,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    BuildFailurePoint, BuiltCloneKitArtifacts, RetentionPinLedger, copy_private_file, read_regular_file,
-    write_private_file,
+    BuildFailurePoint, BuiltCloneKitArtifacts, RetentionPinLedger, copy_private_file, read_regular_file, sync_dir,
+    verify_idx_in_ephemeral_repo, verify_prepared_artifact, write_private_file,
 };
 use crate::ci_checkouts::clonekit::manifest::{
-    CloneKitError, CloneKitManifest, CloneKitObjectFormat, CloneKitStatus, MAX_MANIFEST_JSON_BYTES,
-    compute_file_sha256, ensure_not_cancelled, ensure_private_dir, run_git_command,
+    CloneKitError, CloneKitManifest, CloneKitStatus, MAX_MANIFEST_JSON_BYTES, ensure_not_cancelled,
+    ensure_private_dir,
 };
 
 const REPOSITORY_PREFIX: &str = "repo-";
@@ -29,6 +29,12 @@ const IDX_FILE: &str = "clonekit.idx";
 const MANIFEST_FILE: &str = "manifest.json";
 const CURRENT_FILE: &str = "current.json";
 const PUBLICATION_LOCK_FILE: &str = ".publication.lock";
+const CP_BEFORE_LOCK: &str = "before-lock";
+const CP_AFTER_LOCK: &str = "after-lock";
+const CP_BEFORE_INSTALL: &str = "before-install";
+const CP_AFTER_INSTALL: &str = "after-install";
+const CP_BEFORE_POINTER: &str = "before-pointer";
+const CP_AFTER_POINTER: &str = "after-pointer";
 
 /// Atomic versioned disk catalog storing published CloneKit generations and active pointer.
 #[derive(Clone, Debug)]
@@ -218,6 +224,7 @@ impl CloneKitPublicationStore {
         let vdir = self.version_dir(repo_id, prepared.manifest.kit_generation);
         match fs::symlink_metadata(&vdir) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                checkpoint(CP_BEFORE_INSTALL)?;
                 ensure_not_cancelled(cancel)?;
                 fs::rename(&prepared.attempt_dir, &vdir)
                     .map_err(|err| CloneKitError::GitFailed(format!("install prepared generation: {err}")))?;
@@ -252,13 +259,19 @@ impl CloneKitPublicationStore {
                 return Err(stale_generation(current.kit_generation, prepared.manifest.kit_generation));
             }
         }
+        checkpoint(CP_AFTER_LOCK)?;
         ensure_not_cancelled(cancel)?;
         self.install_or_recover(&mut prepared, cancel)?;
+        checkpoint(CP_AFTER_INSTALL)?;
         let repo_dir = self.ensure_repo_dir(repo_id)?;
         let mut staged = StagedCurrent::create(&repo_dir)?;
         staged.write_and_sync(&prepared.encoded)?;
+        checkpoint(CP_BEFORE_POINTER)?;
         ensure_not_cancelled(cancel)?;
         staged.publish(&repo_dir.join(CURRENT_FILE))?;
+        if checkpoint(CP_AFTER_POINTER).is_err() {
+            return Err(uncertain_publication_error(self, repo_id, &prepared.manifest));
+        }
         if sync_dir(&repo_dir).is_err() {
             return Err(uncertain_publication_error(self, repo_id, &prepared.manifest));
         }
@@ -266,46 +279,9 @@ impl CloneKitPublicationStore {
     }
 }
 
+#[derive(Debug)]
 struct PublicationGuard {
     _file: File,
-}
-
-fn sync_dir(path: &Path) -> Result<(), CloneKitError> {
-    File::open(path)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|err| CloneKitError::GitFailed(format!("sync clonekit directory: {err}")))
-}
-
-fn verify_prepared_artifact(path: &Path, expected: &str, expected_len: u64) -> Result<(), CloneKitError> {
-    let (sha256, length) = compute_file_sha256(path)?;
-    if sha256 != expected || length != expected_len {
-        return Err(CloneKitError::CorruptArtifact("prepared pack/idx failed digest verification".into()));
-    }
-    Ok(())
-}
-
-fn verify_idx_in_ephemeral_repo(
-    git_binary: &Path,
-    work_parent: &Path,
-    object_format: CloneKitObjectFormat,
-    idx_path: &Path,
-    cancel: Option<&CancellationToken>,
-) -> Result<(), CloneKitError> {
-    let idx_str = idx_path.to_str().ok_or(CloneKitError::InvalidInput("non-utf8 idx path"))?;
-    let verify_repo = work_parent.join(format!(".verify-repo-{}", Uuid::new_v4().simple()));
-    let res = (|| {
-        ensure_private_dir(&verify_repo)?;
-        run_git_command(
-            git_binary,
-            Some(&verify_repo),
-            &["init", "--bare", "--quiet", object_format.git_init_flag()],
-            cancel,
-        )?;
-        run_git_command(git_binary, Some(&verify_repo), &["verify-pack", "-s", idx_str], cancel)?;
-        Ok(())
-    })();
-    let _ = fs::remove_dir_all(&verify_repo);
-    res
 }
 
 struct OwnedAttempt {
@@ -320,6 +296,7 @@ impl OwnedAttempt {
             .mode(0o700)
             .create(&path)
             .map_err(|err| CloneKitError::GitFailed(format!("create publication attempt: {err}")))?;
+        ensure_private_dir(&path)?;
         Ok(Self { path, armed: true })
     }
 
@@ -481,10 +458,30 @@ pub fn publish_clonekit_versioned(
     }
     let prepared = PreparedGeneration::prepare(store, built, git_binary, cancel)?;
     ensure_not_cancelled(cancel)?;
+    checkpoint(CP_BEFORE_LOCK)?;
     let _guard = store.acquire_publication_lock(built.manifest.repository_id)?;
     store.commit_prepared(prepared, cancel)
 }
 
 #[cfg(test)]
+#[path = "publication_test_seam.rs"]
+mod test_seam;
+
+#[cfg(test)]
+fn checkpoint(name: &'static str) -> Result<(), CloneKitError> {
+    test_seam::checkpoint(name)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn checkpoint(_name: &'static str) -> Result<(), CloneKitError> {
+    Ok(())
+}
+
+#[cfg(test)]
 #[path = "publication_tests.rs"]
 mod publication_tests;
+
+#[cfg(test)]
+#[path = "publication_race_tests.rs"]
+mod publication_race_tests;
