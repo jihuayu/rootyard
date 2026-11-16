@@ -19,8 +19,7 @@ use uuid::Uuid;
 use super::session_fence::{AuthoritySourceKind, assert_authoritative_source};
 use crate::ref_store::contract::{IssuerLane, OperationState, RequestDigest};
 use crate::ref_store::core::state_machine::{
-    CancelCommand, CloseAuthScopeCommand, ScopeDrainSnapshot, ScopeLifecycle, WireOperationIdentity,
-    validate_scope_kind,
+    CancelCommand, CloseAuthScopeCommand, ScopeDrainSnapshot, ScopeLifecycle, validate_scope_kind,
 };
 use std::str::FromStr;
 

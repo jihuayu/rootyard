@@ -38,7 +38,7 @@ fn signed_grant_rejects_tamper_cross_domain_replay_retired_key_and_late_closing(
     let tok2 = Uuid::new_v4();
     let op1 = Uuid::new_v4();
     let dec1 = Uuid::new_v4();
-    let req1 = build_commit_request(&realm, actor, "main", 1, op1, 1, "refs/heads/main", 0x1a);
+    let req1 = build_commit_request(&realm, actor, "main", 1, op1, "refs/heads/main", 0x1a);
     let grant_v1 = keyring.sign(build_grant_payload(&realm, dec1, &req1, "token", tok1, 4, 500)).expect("sign v1");
 
     keyring.rotate_key(2, Zeroizing::new([0x55u8; 32]), true).expect("rotate key 1 -> 2");
@@ -112,7 +112,7 @@ fn signed_grant_rejects_tamper_cross_domain_replay_retired_key_and_late_closing(
 
     let op_late = Uuid::new_v4();
     let dec_late = Uuid::new_v4();
-    let req_late = build_commit_request(&realm, actor, "main", 2, op_late, 1, "refs/heads/other", 0x1b);
+    let req_late = build_commit_request(&realm, actor, "main", 2, op_late, "refs/heads/other", 0x1b);
     let late_grant =
         keyring.sign(build_grant_payload(&realm, dec_late, &req_late, "token", tok1, 9, 500)).expect("sign late");
     let late_cmd = verify_signed_decision_grant(&keyring, &late_grant, &realm, "raft-bridge-svc-a", 22).unwrap();
@@ -123,7 +123,7 @@ fn signed_grant_rejects_tamper_cross_domain_replay_retired_key_and_late_closing(
 
     let op_tok2 = Uuid::new_v4();
     let dec_tok2 = Uuid::new_v4();
-    let req_tok2 = build_commit_request(&realm, actor, "main", 3, op_tok2, 1, "refs/heads/independent", 0x2c);
+    let req_tok2 = build_commit_request(&realm, actor, "main", 3, op_tok2, "refs/heads/independent", 0x2c);
     let grant_tok2 =
         keyring.sign(build_grant_payload(&realm, dec_tok2, &req_tok2, "token", tok2, 8, 500)).expect("sign tok2");
     let cmd_tok2 = verify_signed_decision_grant(&keyring, &grant_tok2, &realm, "raft-bridge-svc-a", 23).unwrap();
@@ -154,7 +154,7 @@ fn same_log_cancel_commit_ordering_and_snapshot_recovery_preserve_floor() {
 
     let op_cancel_first = Uuid::new_v4();
     let dec_cancel_first = Uuid::new_v4();
-    let req_a = build_commit_request(&realm, actor, "lane-a", 1, op_cancel_first, 1, "refs/heads/a", 0x3a);
+    let req_a = build_commit_request(&realm, actor, "lane-a", 1, op_cancel_first, "refs/heads/a", 0x3a);
     let grant_a =
         keyring.sign(build_grant_payload(&realm, dec_cancel_first, &req_a, "branch_rules", scope_id, 3, 500)).unwrap();
     let install_a = RefCasCommand::InstallScopedDecision(
@@ -237,7 +237,7 @@ async fn drain_barrier_refuses_unknown_quorum_loss_and_pg_fallback() {
     let scope_id = Uuid::new_v4();
     let op_id = Uuid::new_v4();
     let dec_id = Uuid::new_v4();
-    let req = build_commit_request(&realm, actor, "main", 1, op_id, 1, "refs/heads/main", 0x55);
+    let req = build_commit_request(&realm, actor, "main", 1, op_id, "refs/heads/main", 0x55);
     let grant = keyring.sign(build_grant_payload(&realm, dec_id, &req, "pull", scope_id, 3, 500)).unwrap();
     let install_cmd = verify_signed_decision_grant(&keyring, &grant, &realm, "raft-bridge-svc-a", 5).unwrap();
 

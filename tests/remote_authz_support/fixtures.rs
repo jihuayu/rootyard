@@ -68,7 +68,6 @@ pub fn build_commit_request(
     lane: &str,
     sequence: i64,
     operation_id: Uuid,
-    expected_revision: i64,
     ref_name: &str,
     new_oid_byte: u8,
 ) -> CommitRefsRequest {
@@ -88,7 +87,7 @@ pub fn build_commit_request(
         realm.history_incarnation,
         realm.authority_epoch,
         realm.group_epoch,
-        expected_revision,
+        1,
         HeadUpdate::Keep,
         CommitMode::Atomic,
         vec![update],

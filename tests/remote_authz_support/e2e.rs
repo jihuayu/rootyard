@@ -57,7 +57,7 @@ pub async fn run_open_to_closing_grant_rotation_crash_restart() -> Result<()> {
         Err(RemoteAuthzGrantError::DecisionNotCommittedInPg(dec1))
     );
 
-    let req1 = build_commit_request(&realm, actor, "main", 1, op1, 1, "refs/heads/main", 0x7a);
+    let req1 = build_commit_request(&realm, actor, "main", 1, op1, "refs/heads/main", 0x7a);
     pg.seed_decision(&SeedPgDecision {
         decision_id: dec1,
         actor_id: actor,
@@ -134,7 +134,7 @@ pub async fn run_open_to_closing_grant_rotation_crash_restart() -> Result<()> {
     ));
     let op_late = Uuid::new_v4();
     let dec_late = Uuid::new_v4();
-    let req_late = build_commit_request(&realm, actor, "main", 2, op_late, 1, "refs/heads/late", 0x7b);
+    let req_late = build_commit_request(&realm, actor, "main", 2, op_late, "refs/heads/late", 0x7b);
     let mut late_payload = build_grant_payload(&realm, dec_late, &req_late, "token", scope_id, 9, 1000);
     late_payload.service_mtls_identity = svc.san_identity.clone();
     let late_grant = keyring.sign(late_payload)?;
@@ -168,10 +168,10 @@ pub async fn run_cancel_commit_partition_drain_barrier() -> Result<()> {
 
     let op_commit = Uuid::new_v4();
     let dec_commit = Uuid::new_v4();
-    let req_commit = build_commit_request(&realm, actor, "main", 1, op_commit, 1, "refs/heads/done", 0x91);
+    let req_commit = build_commit_request(&realm, actor, "main", 1, op_commit, "refs/heads/done", 0x91);
     let op_cancel = Uuid::new_v4();
     let dec_cancel = Uuid::new_v4();
-    let req_cancel = build_commit_request(&realm, actor, "lane-b", 1, op_cancel, 1, "refs/heads/wip", 0x92);
+    let req_cancel = build_commit_request(&realm, actor, "lane-b", 1, op_cancel, "refs/heads/wip", 0x92);
     for (dec_id, op_id, lane, req, ref_name, oid_b) in [
         (dec_commit, op_commit, "main", &req_commit, "refs/heads/done", 0x91u8),
         (dec_cancel, op_cancel, "lane-b", &req_cancel, "refs/heads/wip", 0x92u8),
