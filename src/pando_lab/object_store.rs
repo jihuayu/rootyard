@@ -6,6 +6,14 @@ use std::{
     os::unix::fs::PermissionsExt,
 };
 
+mod authority;
+mod publication;
+pub(crate) use publication::{PreparedPackPublication, prepare_pack_files_sealed};
+#[cfg(test)]
+mod publication_tests;
+#[cfg(test)]
+mod pg_tests;
+
 pub const DEFAULT_BUCKET: &str = "pando-default";
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 pub const MANIFEST_SCHEMA: &str = "rootyard.pando.cas-pack-manifest.v1";
@@ -164,7 +172,7 @@ pub fn manifest_key(repo: Uuid, pack_id: Uuid) -> String {
     format!("manifests/{repo}/{pack_id}.json")
 }
 
-fn stage_and_reassemble_multipart(
+pub(super) fn stage_and_reassemble_multipart(
     root: &Path,
     upload_id: Uuid,
     payload: &[u8],
@@ -215,7 +223,7 @@ fn stage_and_reassemble_multipart(
     res
 }
 
-fn write_immutable_cas_file(target: &Path, data: &[u8], expected_sha256: &str) -> Result<()> {
+pub(super) fn write_immutable_cas_file(target: &Path, data: &[u8], expected_sha256: &str) -> Result<()> {
     ensure!(delta::sha256_hex(data) == expected_sha256, "CAS payload digest mismatch");
     let parent = target.parent().context("missing CAS parent")?;
     std::fs::create_dir_all(parent)?;
@@ -250,7 +258,7 @@ fn write_atomic_local_cache_file(target: &Path, data: &[u8], expected_sha256: &s
     Ok(())
 }
 
-fn infer_base_root<'a>(store_root_dir: &'a Path, objects_root: Option<&'a Path>) -> &'a Path {
+pub(super) fn infer_base_root<'a>(store_root_dir: &'a Path, objects_root: Option<&'a Path>) -> &'a Path {
     if store_root_dir.file_name().and_then(|s| s.to_str()) == Some("object_store")
         && let Some(parent) = store_root_dir.parent()
     {
@@ -294,41 +302,6 @@ async fn decrypt_verified_store_pack(
     Ok((p_bytes, i_bytes))
 }
 
-pub(crate) struct PreparedPackPublication {
-    repo: Uuid,
-    pack_id: Uuid,
-    manifest: CasPackManifest,
-    envelope: lifecycle::KmsEnvelopeRecord,
-    local_policy: Option<lifecycle::provider::KmsKeyPolicy>,
-    base_root: PathBuf,
-}
-
-impl PreparedPackPublication {
-    pub(crate) async fn publish_in(&self, t: &Transaction<'_>) -> Result<()> {
-        t.execute(
-            "INSERT INTO pando_lab.object_store_manifests(repo,pack_id,bucket,pack_key,idx_key,manifest_key,pack_sha256,idx_sha256,pack_bytes,idx_bytes,object_count,chunk_size,chunk_count,manifest_json) \
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
-            &[
-                &self.repo, &self.pack_id, &self.manifest.bucket, &self.manifest.pack_key,
-                &self.manifest.idx_key, &self.manifest.manifest_key, &self.manifest.pack_sha256,
-                &self.manifest.idx_sha256, &(self.manifest.pack_bytes as i64),
-                &(self.manifest.idx_bytes as i64), &(self.manifest.object_count as i64),
-                &(self.manifest.chunk_size as i64), &(self.manifest.pack_chunks.len() as i64),
-                &serde_json::to_value(&self.manifest)?,
-            ],
-        ).await?;
-        lifecycle::rotation::insert_envelope_in_tx(t, &self.envelope).await?;
-        if let Some(policy) = &self.local_policy {
-            lifecycle::rotation::sync_kms_policy_in_tx(t, self.repo, policy).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn refresh_mirrors(&self) {
-        let _ = lifecycle::write_envelope_file(&self.base_root, &self.envelope);
-    }
-}
-
 fn ensure_encrypted_hook_backend_supported(remote: bool) -> Result<()> {
     ensure!(
         !remote,
@@ -362,7 +335,7 @@ pub(crate) async fn prepare_known_pack_publication(
         expected_pack_bytes: Some(pack_bytes.len() as u64),
         ..Default::default()
     };
-    let (_, manifest, envelope, local_policy) = put_pack_files_sealed(
+    let prepared = prepare_pack_files_sealed(
         &store_root(config),
         &local_root,
         repo,
@@ -373,12 +346,18 @@ pub(crate) async fn prepare_known_pack_publication(
         Some(client),
     )
     .await?;
+    let manifest = prepared.manifest();
+    let envelope = prepared.envelope();
     ensure!(
         manifest.repo == repo
             && manifest.pack_id == pack.id
             && manifest.pack_sha256 == pack.pack_sha256
             && manifest.idx_sha256 == pack.idx_sha256,
         "prepared object-store manifest identity mismatch"
+    );
+    ensure!(
+        envelope.encryption_mode == lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE,
+        "prepared envelope is not authenticated"
     );
     if let Some(cp) = checkpoint {
         ensure!(
@@ -388,113 +367,7 @@ pub(crate) async fn prepare_known_pack_publication(
             "prepared envelope does not match the authoritative rotation target"
         );
     }
-    Ok(PreparedPackPublication {
-        repo,
-        pack_id: pack.id,
-        manifest,
-        envelope,
-        local_policy,
-        base_root: config.root.clone(),
-    })
-}
-
-pub(crate) async fn put_pack_files_sealed(
-    store_root_dir: &Path,
-    local_objects_root: &Path,
-    repo: Uuid,
-    pack_id: Uuid,
-    opts: &ObjectStorePutOptions,
-    storage_tier: &str,
-    checkpoint: Option<&lifecycle::rotation::KmsRotationCheckpoint>,
-    client: Option<&Client>,
-) -> Result<(
-    ObjectStorePutReport,
-    CasPackManifest,
-    lifecycle::KmsEnvelopeRecord,
-    Option<lifecycle::provider::KmsKeyPolicy>,
-)> {
-    ensure!(valid_bucket_name(&opts.bucket), "invalid bucket '{}'", opts.bucket);
-    let suite = opts.cipher_suite.as_deref().unwrap_or(lifecycle::DEFAULT_CIPHER_SUITE);
-    let local_dir = local_objects_root.join(repo.to_string());
-    let pack_bytes = std::fs::read(local_dir.join(format!("{pack_id}.pack")))?;
-    let idx_bytes = std::fs::read(local_dir.join(format!("{pack_id}.idx")))?;
-    ensure!(pack_bytes.len() <= LIMIT && idx_bytes.len() <= LIMIT, "pack/idx exceeds limit");
-    let pack_report = delta::verify_pack(&pack_bytes, &delta::Limits::default())?;
-    let pack_sha256 = pack_report.pack_sha256.clone();
-    let idx_sha256 = delta::sha256_hex(&idx_bytes);
-    if let Some(ref exp_sha) = opts.expected_pack_sha256 { ensure!(exp_sha == &pack_sha256, "expected pack SHA-256 mismatch"); }
-    if let Some(exp_len) = opts.expected_pack_bytes { ensure!(exp_len == pack_bytes.len() as u64, "expected pack byte length mismatch"); }
-
-    let base_root = infer_base_root(store_root_dir, Some(local_objects_root));
-    let provider = lifecycle::provider_selection::for_write(base_root, repo, checkpoint)?;
-    let sealed = lifecycle::crypto::seal_pack_bytes(
-        provider.provider(),
-        repo,
-        pack_id,
-        &idx_sha256,
-        suite,
-        provider.key_version_hint(),
-        &pack_bytes,
-    )
-    .await?;
-
-    let upload_id = Uuid::new_v4();
-    let mut chunks_uploaded = 0usize;
-    let (pack_chunks, ver_cipher) = stage_and_reassemble_multipart(store_root_dir, upload_id, &sealed.ciphertext, &sealed.ciphertext_sha256, sealed.ciphertext_bytes, opts, &mut chunks_uploaded)?;
-    let idx_opts = ObjectStorePutOptions { corrupt_chunk_part: None, expected_pack_sha256: None, expected_pack_bytes: None, ..opts.clone() };
-    let (idx_chunks, ver_idx) = stage_and_reassemble_multipart(store_root_dir, Uuid::new_v4(), &idx_bytes, &idx_sha256, idx_bytes.len() as u64, &idx_opts, &mut chunks_uploaded)?;
-
-    let (p_key, i_key, m_key) = (pack_key(&opts.bucket, repo, pack_id), idx_key(&opts.bucket, repo, pack_id), manifest_key(repo, pack_id));
-    let (b_pack, b_idx, m_path) = (store_root_dir.join(&p_key), store_root_dir.join(&i_key), store_root_dir.join(&m_key));
-
-    let (manifest, env) = if m_path.is_file() && b_pack.is_file() {
-        let existing_m: CasPackManifest = serde_json::from_slice(&std::fs::read(&m_path)?)?;
-        ensure!(existing_m.pack_sha256 == pack_sha256 && existing_m.idx_sha256 == idx_sha256, "immutable object store key collision on {}", b_pack.display());
-        decrypt_verified_store_pack(store_root_dir, base_root, &existing_m, client).await?;
-        let existing_env = if let Some(client) = client {
-            let pack = Pack { id: pack_id, pack_sha256: existing_m.pack_sha256.clone(), idx_sha256: existing_m.idx_sha256.clone() };
-            lifecycle::rotation::load_authoritative_envelope(client, base_root, repo, &pack).await?
-        } else {
-            lifecycle::read_and_verify_envelope_file(base_root, repo, pack_id)?
-        };
-        (existing_m, existing_env)
-    } else {
-        write_immutable_cas_file(&b_pack, &ver_cipher, &sealed.ciphertext_sha256)?;
-        write_immutable_cas_file(&b_idx, &ver_idx, &idx_sha256)?;
-        let mut manifest = CasPackManifest {
-            schema: MANIFEST_SCHEMA.to_owned(), bucket: opts.bucket.clone(), backend: BACKEND_KIND.to_owned(),
-            repo, pack_id, pack_key: p_key.clone(), idx_key: i_key.clone(), manifest_key: m_key.clone(),
-            pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone(), pack_bytes: pack_bytes.len() as u64,
-            idx_bytes: ver_idx.len() as u64, object_count: pack_report.object_count, chunk_size: opts.chunk_size,
-            pack_chunks, idx_chunks, manifest_sha256: String::new(),
-            encryption_mode: Some(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE.to_owned()),
-            ciphertext_sha256: Some(sealed.ciphertext_sha256.clone()), ciphertext_bytes: Some(sealed.ciphertext_bytes),
-            cipher_suite: Some(sealed.cipher_suite.clone()),
-        };
-        manifest.manifest_sha256 = delta::sha256_hex(&serde_json::to_vec(&manifest)?);
-        let m_bytes = serde_json::to_vec_pretty(&manifest)?;
-        write_immutable_cas_file(&m_path, &m_bytes, &delta::sha256_hex(&m_bytes))?;
-        let env = lifecycle::build_authenticated_envelope_record(
-            repo,
-            &Pack { id: pack_id, pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone() },
-            &sealed,
-            storage_tier,
-        )?;
-        lifecycle::write_envelope_file(base_root, &env)?;
-        (manifest, env)
-    };
-
-    let report = ObjectStorePutReport {
-        repo, pack_id, bucket: opts.bucket.clone(), backend: BACKEND_KIND.to_owned(), upload_id,
-        pack_key: p_key, idx_key: i_key, manifest_key: m_key,
-        bucket_pack_path: b_pack.to_string_lossy().into_owned(), bucket_idx_path: b_idx.to_string_lossy().into_owned(),
-        manifest_path: m_path.to_string_lossy().into_owned(), pack_sha256, idx_sha256,
-        pack_bytes: manifest.pack_bytes, idx_bytes: manifest.idx_bytes, object_count: manifest.object_count,
-        chunk_size: opts.chunk_size, chunk_count: manifest.pack_chunks.len(),
-        total_chunks_uploaded: manifest.pack_chunks.len() + manifest.idx_chunks.len(),
-        immutable_mode: "0444".to_owned(), status: "published".to_owned(),
-    };
-    Ok((report, manifest, env, provider.into_local_policy()))
+    Ok(prepared)
 }
 
 pub async fn put_pack_files(
@@ -509,8 +382,21 @@ pub async fn put_pack_files(
             == lifecycle::provider_selection::PandoProviderSelection::Local,
         "raw Local object-store helper cannot publish unterminated Vault writes"
     );
-    let (rep, manifest, _, _) = put_pack_files_sealed(store_root_dir, local_objects_root, repo, pack_id, opts, "hot", None, None).await?;
-    Ok((rep, manifest))
+    let prepared = prepare_pack_files_sealed(
+        store_root_dir,
+        local_objects_root,
+        repo,
+        pack_id,
+        opts,
+        "hot",
+        None,
+        None,
+    )
+    .await?;
+    // This raw path has no DB authority, so its verified envelope file is the
+    // only metadata authority. The staged prepare itself never writes a mirror.
+    prepared.write_mirror()?;
+    Ok((prepared.report().clone(), prepared.manifest().clone()))
 }
 
 pub async fn get_pack_files(
@@ -637,9 +523,17 @@ pub async fn verify_repo_files(store_root_dir: &Path, bucket: &str, repo: Uuid) 
 }
 
 async fn put_pack_db_inner(config: &Config, repo: Uuid, pack_id: Uuid, opts: &ObjectStorePutOptions, storage_tier: &str) -> Result<(ObjectStorePutReport, lifecycle::KmsEnvelopeRecord)> {
-    let session = lifecycle::publication::writer_session(config, repo).await?;
+    // Composed remote publication is not this primitive. Keep the boundary
+    // explicit instead of silently committing local CAS under an S3 endpoint.
+    ensure!(
+        !remote_enabled(),
+        "direct local CAS publication is unsupported with ROOTYARD_OBJECT_STORE_ENDPOINT; standalone remote put must use the remote publication path"
+    );
+    let mut session = lifecycle::publication::writer_session(config, repo).await?;
     let checkpoint = lifecycle::publication::active_rotation(session.client(), repo).await?;
-    let (report, manifest, env, policy) = put_pack_files_sealed(
+    // Provider selection, sealing and immutable CAS writes happen while this
+    // dedicated session owns the shared publication gate, but outside SQL.
+    let prepared = prepare_pack_files_sealed(
         &store_root(config),
         &config.root.join("objects"),
         repo,
@@ -650,18 +544,13 @@ async fn put_pack_db_inner(config: &Config, repo: Uuid, pack_id: Uuid, opts: &Ob
         Some(session.client()),
     )
     .await?;
-    let c = session.client();
-    c.execute(
-        "INSERT INTO pando_lab.object_store_manifests(repo,pack_id,bucket,pack_key,idx_key,manifest_key,pack_sha256,idx_sha256,pack_bytes,idx_bytes,object_count,chunk_size,chunk_count,manifest_json) \
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
-         ON CONFLICT(repo,pack_id) DO UPDATE SET bucket=EXCLUDED.bucket,manifest_json=EXCLUDED.manifest_json",
-        &[&repo, &pack_id, &report.bucket, &report.pack_key, &report.idx_key, &report.manifest_key, &report.pack_sha256, &report.idx_sha256, &(report.pack_bytes as i64), &(report.idx_bytes as i64), &(report.object_count as i64), &(report.chunk_size as i64), &(report.chunk_count as i64), &serde_json::to_value(&manifest)?],
-    ).await?;
-    if let Some(policy) = policy {
-        lifecycle::rotation::sync_kms_policy_to_db(&c, repo, &policy).await?;
-    }
-    lifecycle::rotation::upsert_envelope_in_db(&c, &env).await?;
-    Ok((report, env))
+    let t = session.client_mut().transaction().await?;
+    let env = prepared.publish_in(&t).await?;
+    t.commit().await?;
+    // The DB pair is authoritative. Mirror refresh is post-commit and cannot
+    // change the retry or publication result.
+    prepared.refresh_mirrors();
+    Ok((prepared.report().clone(), env))
 }
 
 pub(super) async fn put_pack(config: &Config, repo: Uuid, pack_id: Uuid, opts: &ObjectStorePutOptions) -> Result<ObjectStorePutReport> {
