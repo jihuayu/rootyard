@@ -17,13 +17,11 @@ turns a failed case into a pass.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
 from pathlib import Path
 import signal
-import socket
 import subprocess
 import time
 import uuid
@@ -56,43 +54,6 @@ def mount_namespace_inode(pid: int) -> int:
         raise LegacyAcceptanceError("mount namespace identity is unavailable") from None
 
 
-def create_workspace(harness, agent_id: str, idempotency_key: str) -> dict:
-    status, body, _ = harness.http(
-        "/api/workspaces",
-        token=harness.alice,
-        method="POST",
-        body={
-            "owner": "alice",
-            "repository": "demo",
-            "agent_id": agent_id,
-            "base_oid": harness.second,
-        },
-        extra_headers={"Idempotency-Key": idempotency_key},
-    )
-    if status != 201:
-        raise LegacyAcceptanceError(f"workspace creation returned {status}, not 201")
-    try:
-        value = json.loads(body)
-    except ValueError:
-        raise LegacyAcceptanceError("workspace creation returned invalid JSON") from None
-    if not isinstance(value, dict) or not isinstance(value.get("id"), str):
-        raise LegacyAcceptanceError("workspace creation returned no stable id")
-    return value
-
-
-def workspace_state(harness, workspace_id: str) -> dict:
-    return json.loads(harness.expect(f"/api/workspaces/{workspace_id}", 200, token=harness.alice))
-
-
-def workspace_paths(harness, workspace_id: str) -> dict:
-    root = harness.root / "data/workspace-service"
-    return {
-        "lower": root / "workspaces" / workspace_id,
-        "upper": root / "uppers" / workspace_id,
-        "mountpoint": root / "mounts" / workspace_id,
-    }
-
-
 def start_service(harness, log_path=None):
     """Start one owned service process; never use a readiness timeout here."""
     log = open(log_path or (harness.root / "server.log"), "ab")
@@ -122,13 +83,26 @@ def wait_ready(harness, deadline: float) -> None:
     raise LegacyAcceptanceError("owned service did not become ready within the startup bound")
 
 
-def _wait_exit(proc, deadline: float):
-    while time.monotonic() < deadline:
+def _wait_exit(proc, deadline: float, *, clock=time.monotonic, sleep=time.sleep):
+    """Poll first, then wait only to the same absolute deadline.
+
+    An already-exited owned child is reaped even when the deadline has just
+    expired; expiry never starts a fresh positive wait budget.
+    """
+    code = proc.poll()
+    if code is not None:
+        return code
+    while True:
+        now = clock()
+        if now >= deadline:
+            code = proc.poll()
+            if code is not None:
+                return code
+            raise LegacyAcceptanceError("owned process did not exit within the shared deadline")
         code = proc.poll()
         if code is not None:
             return code
-        time.sleep(0.01)
-    raise LegacyAcceptanceError("owned service did not exit within the shared deadline")
+        sleep(min(0.01, max(0.0, deadline - now)))
 
 
 def stop_service_gracefully(harness, timeout: float = ORACLE_SECONDS):
@@ -234,16 +208,92 @@ def owned_leftovers(holder_pid: int, mountpoints) -> int:
     )
 
 
-def contain_proven_owned_mounts(holder_pid: int, records, deadline: float) -> int:
+def _containment_result(owner, before, any_failure: bool) -> dict:
+    after = owner.snapshot()
+    started = after["started"] - before["started"]
+    contained = after["contained"] - before["contained"]
+    deadline_exhausted = after["deadline_exhausted"] - before["deadline_exhausted"]
+    errors = after["errors"] - before["errors"]
+    pending = after["pending"]
+    if pending > 0:
+        outcome = "pending"
+    elif deadline_exhausted > 0:
+        outcome = "deadline_exhausted"
+    elif any_failure or errors > 0:
+        outcome = "failed"
+    elif started > 0:
+        outcome = "contained"
+    else:
+        outcome = "clean"
+    result = {
+        "outcome": outcome,
+        "started": started,
+        "contained": contained,
+        "kill_requested": after["kill_requested"] - before["kill_requested"],
+        "reaped": after["reaped"] - before["reaped"],
+        "pending": pending,
+        "deadline_exhausted": deadline_exhausted,
+        "errors": errors,
+        "error_classes": after["error_classes"],
+        "pending_children": after["pending_children"],
+    }
+    result["failed"] = bool(
+        outcome != "clean"
+        or started > 0
+        or pending > 0
+        or deadline_exhausted > 0
+        or errors > 0
+    )
+    return result
+
+
+def contain_proven_owned_mounts(
+    holder_pid: int,
+    records,
+    deadline: float,
+    owner,
+    *,
+    clock=time.monotonic,
+    spawn=None,
+    read_mountinfo=None,
+    wait_mount_gone=None,
+    read_identity=None,
+):
     """Failure containment for exact recorded owned identities only.
 
     ``records`` contains ``(mountpoint, mount_id)`` observed before the failure.
-    A record whose exact ID no longer occupies that path is skipped. No lazy
-    unmount, path guess or foreign mount is touched.
+    ``owner`` is the runner-level strong owner that receives the exact Popen
+    immediately after it returns. D is checked at entry, per record, and again
+    immediately before spawn. Once D is observed expired, no new child is
+    admitted; an already-created child is polled/killed/polled and retained as
+    pending until a real reap is observed. No lazy unmount, path guess, process
+    group signal, or foreign mount is touched.
     """
-    contained = 0
+    if spawn is None:
+        spawn = support.spawn_api_namespace
+    if read_mountinfo is None:
+        read_mountinfo = support.read_process_mountinfo
+    if wait_mount_gone is None:
+        wait_mount_gone = wait_exact_mount_gone
+    if read_identity is None:
+        read_identity = support.process_identity
+    before = owner.snapshot()
+    any_failure = False
+    if deadline is None or clock() >= deadline:
+        owner.note_deadline_exhausted()
+        return _containment_result(owner, before, True)
+
     for mountpoint, mount_id in records:
-        rows = support.read_process_mountinfo(holder_pid)
+        if clock() >= deadline:
+            owner.note_deadline_exhausted()
+            any_failure = True
+            break
+        try:
+            rows = read_mountinfo(holder_pid)
+        except Exception as error:
+            owner.note_error(error)
+            any_failure = True
+            break
         exact = [
             row for row in rows
             if row["mountpoint"] == str(mountpoint)
@@ -253,15 +303,72 @@ def contain_proven_owned_mounts(holder_pid: int, records, deadline: float) -> in
         ]
         if not exact:
             continue
-        child = support.spawn_api_namespace(
-            holder_pid, ["umount", "--no-canonicalize", str(mountpoint)]
-        )
-        code = _wait_exit(child, deadline)
+        if clock() >= deadline:
+            owner.note_deadline_exhausted()
+            any_failure = True
+            break
+        try:
+            child = spawn(
+                holder_pid, ["umount", "--no-canonicalize", str(mountpoint)]
+            )
+        except Exception as error:
+            owner.note_error(error)
+            any_failure = True
+            break
+        try:
+            record = owner.register(child, int(mount_id))
+        except BaseException:
+            # Registration should not fail for a real Popen/mount ID, but never
+            # abandon the just-returned exact child if it does.
+            try:
+                child.kill()
+            except Exception:
+                pass
+            try:
+                child.poll()
+            except Exception:
+                pass
+            raise
+        try:
+            identity = read_identity(record.pid)
+        except Exception:
+            identity = None
+        if isinstance(identity, dict):
+            try:
+                starttime = int(identity.get("starttime"))
+            except (TypeError, ValueError):
+                starttime = None
+            if starttime is not None and starttime >= 1:
+                record.starttime = starttime
+
+        if clock() >= deadline:
+            owner.note_deadline_exhausted()
+            owner.reap_owned_child(record, deadline, clock=clock)
+            any_failure = True
+            break
+        try:
+            code = owner.reap_owned_child(record, deadline, clock=clock)
+        except Exception as error:
+            owner.note_error(error)
+            any_failure = True
+            break
+        if code is None:
+            any_failure = True
+            break
         if code != 0:
-            raise LegacyAcceptanceError("exact owned failure containment did not confirm unmount")
-        wait_exact_mount_gone(holder_pid, mountpoint, int(mount_id), deadline)
-        contained += 1
-    return contained
+            owner.note_error(error_class="nonzero_exit")
+            any_failure = True
+            break
+        try:
+            wait_mount_gone(holder_pid, mountpoint, int(mount_id), deadline)
+        except Exception as error:
+            if clock() >= deadline:
+                owner.note_deadline_exhausted()
+            owner.note_error(error)
+            any_failure = True
+            break
+        owner.note_contained()
+    return _containment_result(owner, before, any_failure)
 
 
 def close_holder(holder) -> None:
@@ -280,12 +387,27 @@ def _safe_field(value, kind):
     return False
 
 
-def read_join_evidence(log_path: Path, expected_namespace: int, expected_workspace_hash: str):
+def read_join_evidence(
+    log_path: Path,
+    expected_namespace: int,
+    expected_workspace_hashes,
+    forbidden_workspace_hashes=(),
+):
     """Parse exactly one fixed-schema evidence line from our own service log.
 
-    Only matching lines are parsed; unrelated service diagnostics are ignored
-    and never returned. The caller receives safe counts/hashes only.
+    The evidence must name exactly the expected workspace identities, with no
+    duplicates or omissions, and the joined-mount count must equal that exact
+    set size. Forbidden identities (for example the deliberately corrupted
+    later fixture) must be absent. Only matching lines are parsed; unrelated
+    service diagnostics are ignored and never returned. The caller receives
+    safe counts/hashes only.
     """
+    expected = tuple(str(value) for value in expected_workspace_hashes)
+    if not expected:
+        raise LegacyAcceptanceError("legacy join evidence has no expected workspace")
+    if len(set(expected)) != len(expected):
+        raise LegacyAcceptanceError("expected legacy workspace identities are not unique")
+    forbidden = {str(value) for value in forbidden_workspace_hashes}
     path = Path(log_path)
     try:
         raw = path.read_bytes()
@@ -333,66 +455,28 @@ def read_join_evidence(log_path: Path, expected_namespace: int, expected_workspa
         raise LegacyAcceptanceError("legacy join evidence workspace list is not bounded")
     if any(not isinstance(value, str) or len(value) != 64 for value in workspaces):
         raise LegacyAcceptanceError("legacy join evidence workspace identity is not a SHA-256")
+    if len(set(workspaces)) != len(workspaces):
+        raise LegacyAcceptanceError("legacy join evidence workspace identities are not unique")
     if payload["pending_admissions"] != 0:
         raise LegacyAcceptanceError("legacy join evidence retained a pending admission")
     if payload["retained_owners"] != 0:
         raise LegacyAcceptanceError("legacy join evidence retained an owned mount")
     if payload["cleanup_failures"] != 0:
         raise LegacyAcceptanceError("legacy join evidence reported a cleanup failure")
-    if expected_workspace_hash not in workspaces:
-        raise LegacyAcceptanceError("legacy join evidence did not name the HTTP-created workspace")
+    if forbidden.intersection(workspaces):
+        raise LegacyAcceptanceError("legacy join evidence named a forbidden workspace")
+    if joined != len(expected):
+        raise LegacyAcceptanceError("legacy join evidence mount count does not match the exact workspace set")
+    if set(workspaces) != set(expected):
+        raise LegacyAcceptanceError("legacy join evidence workspace set is not the exact expected set")
     return {
         "schema": EVIDENCE_SCHEMA,
         "mount_namespace": namespace,
         "joined_mounts": joined,
         "joined_workspaces": len(workspaces),
         "workspace_hashes": list(workspaces),
+        "expected_workspace_hashes": list(expected),
         "pending_admissions": 0,
         "retained_owners": 0,
         "cleanup_failures": 0,
     }
-
-
-def read_workspace_file(harness, workspace_id: str, path: str) -> bytes:
-    value = json.loads(
-        harness.expect(f"/api/workspaces/{workspace_id}/files?path={path}", 200, token=harness.alice)
-    )
-    try:
-        return base64.b64decode(value["content_base64"], validate=True)
-    except (KeyError, ValueError):
-        raise LegacyAcceptanceError("workspace file response did not carry valid base64") from None
-
-
-def write_workspace_file(harness, workspace_id: str, path: str, data: bytes, idempotency_key: str) -> None:
-    state = workspace_state(harness, workspace_id)
-    body = {
-        "content_base64": base64.b64encode(data).decode(),
-        "expected_entry_version": 0,
-        "expected_workspace_revision": state["revision"],
-        "lease_epoch": state["lease_epoch"],
-    }
-    status, _, _ = harness.http(
-        f"/api/workspaces/{workspace_id}/files?path={path}",
-        token=harness.alice,
-        method="PUT",
-        body=body,
-        extra_headers={"Idempotency-Key": idempotency_key},
-    )
-    if status != 200:
-        raise LegacyAcceptanceError(f"workspace write returned {status}, not 200")
-
-
-def bind_owned_conflict(port: int) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", int(port)))
-    sock.listen(1)
-    return sock
-
-
-def close_conflict(sock) -> None:
-    if sock is not None:
-        try:
-            sock.close()
-        finally:
-            pass
