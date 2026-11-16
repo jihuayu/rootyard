@@ -12,7 +12,8 @@
 use super::protocol::{
     ABORT_DEADLINE, AbortFreeze, AbortMount, Body, ErrorReply, FREEZE_DEADLINE, FenceIfUnchanged, Frame, FreezeBegin,
     FreezeFinish, HEARTBEAT_INTERVAL, Handoff, Heartbeat, Hello, MAX_INFLIGHT, MOUNT_DEADLINE, MountRequest, Observe,
-    PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, PrewarmReply, REQUEST_DEADLINE, StateReply, read_frame, write_frame,
+    PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, PrewarmReply, REQUEST_DEADLINE, StateReply, encode_frame, read_frame,
+    write_frame,
 };
 use crate::workspace_lab::fuse_mount::FreezeDecision;
 use std::{
@@ -20,13 +21,13 @@ use std::{
     io,
     net::Shutdown,
     os::{
-        fd::OwnedFd,
+        fd::{AsRawFd, OwnedFd, RawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     path::Path,
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, TrySendError},
     },
@@ -44,6 +45,17 @@ use child_lifecycle::{ChildSlot, ExitObservation, ExitView};
 const ABORT_QUEUE: usize = 64;
 /// How often the reaper checks the dead flag without relying on the channel.
 const REAPER_TICK: Duration = Duration::from_millis(50);
+/// Bounded poll granularity for control-mutex admission. The absolute call or
+/// teardown deadline is re-read on every iteration.
+const CONTROL_POLL: Duration = Duration::from_millis(10);
+/// Bounded poll granularity for socket writability. The absolute call or
+/// teardown deadline is re-read on every iteration.
+const WRITE_POLL: Duration = Duration::from_millis(10);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const CONTROL_SEND_FLAGS: i32 = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const CONTROL_SEND_FLAGS: i32 = libc::MSG_DONTWAIT;
 
 /// Failure while talking to the helper. The code is an errno value when one is
 /// meaningful, so callers can distinguish `EBUSY`/`ESTALE`/timeouts.
@@ -127,6 +139,110 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn control_deadline_error() -> HelperError {
+    HelperError::new(libc::ETIMEDOUT, "workspace FUSE helper control deadline expired")
+}
+
+/// Admit one control writer without blocking past the caller's absolute
+/// deadline. The deadline closure re-reads the current teardown cap on every
+/// iteration, so a deadline published while this writer waits for the mutex
+/// immediately tightens the wait.
+fn lock_until<'a, T, F>(mutex: &'a Mutex<T>, mut deadline: F) -> Result<MutexGuard<'a, T>, HelperError>
+where
+    F: FnMut() -> Instant,
+{
+    loop {
+        let limit = deadline();
+        let now = Instant::now();
+        if now >= limit {
+            return Err(control_deadline_error());
+        }
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                thread::sleep(limit.saturating_duration_since(now).min(CONTROL_POLL));
+            }
+        }
+    }
+}
+
+/// Wait until the exact control socket is writable or `wait` expires. The
+/// duration is deliberately short; the writer re-reads its absolute deadline
+/// after every poll instead of treating this as a fresh write grace.
+fn poll_writable(fd: RawFd, wait: Duration) -> Result<(), HelperError> {
+    let timeout = wait.min(WRITE_POLL).as_millis() as i32;
+    let mut pollfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    loop {
+        // SAFETY: one valid pollfd is supplied and the timeout is bounded.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+        if ready >= 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINTR) {
+            // Return to the writer so it re-reads the absolute deadline
+            // instead of restarting this poll window.
+            return Ok(());
+        }
+        return Err(HelperError::new(
+            error.raw_os_error().unwrap_or(libc::EIO),
+            format!("workspace FUSE helper control poll failed: {error}"),
+        ));
+    }
+}
+
+/// Write one already-serialized control frame without blocking past the
+/// absolute deadline. The deadline closure re-reads the current teardown cap
+/// on every send/poll iteration. A partial frame is never followed by another
+/// frame: the caller fail-closes the generation on any error.
+fn write_bytes_until<F>(stream: &mut UnixStream, mut bytes: &[u8], mut deadline: F) -> Result<(), HelperError>
+where
+    F: FnMut() -> Instant,
+{
+    let fd = stream.as_raw_fd();
+    while !bytes.is_empty() {
+        let limit = deadline();
+        let now = Instant::now();
+        if now >= limit {
+            return Err(control_deadline_error());
+        }
+        // SAFETY: the socket fd is owned by `stream`; the pointer covers the
+        // remaining bytes and `MSG_DONTWAIT` keeps every call nonblocking.
+        let sent = unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), CONTROL_SEND_FLAGS) };
+        if sent > 0 {
+            bytes = &bytes[sent as usize..];
+            continue;
+        }
+        if sent == 0 {
+            return Err(HelperError::new(libc::EPIPE, "workspace FUSE helper control write closed"));
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK) => {
+                let remaining = limit.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(control_deadline_error());
+                }
+                poll_writable(fd, remaining)?;
+            }
+            _ => {
+                return Err(HelperError::new(
+                    error.raw_os_error().unwrap_or(libc::EIO),
+                    format!("workspace FUSE helper control write failed: {error}"),
+                ));
+            }
+        }
+    }
+    stream.flush().map_err(|error| {
+        HelperError::new(
+            error.raw_os_error().unwrap_or(libc::EIO),
+            format!("workspace FUSE helper control flush failed: {error}"),
+        )
+    })
+}
+
 impl Inner {
     fn mark_dead(&self) {
         self.fail_generation(libc::ECONNRESET, "workspace FUSE helper is not available");
@@ -175,6 +291,15 @@ impl Inner {
 
     fn teardown_deadline(&self) -> Option<Instant> {
         *lock(&self.teardown_deadline)
+    }
+
+    /// Tighten one call deadline with any already-published teardown cap.
+    fn effective_deadline(&self, deadline: Instant) -> Instant {
+        self.teardown_deadline().map_or(deadline, |limit| deadline.min(limit))
+    }
+
+    fn lock_control_until(&self, deadline: Instant) -> Result<MutexGuard<'_, UnixStream>, HelperError> {
+        lock_until(&self.control, || self.effective_deadline(deadline))
     }
 
     fn deliver(&self, frame: Frame) {
@@ -258,6 +383,10 @@ impl Inner {
         if self.dead.load(Ordering::Acquire) {
             return (0, Err(self.failure()));
         }
+        let deadline = self.effective_deadline(deadline);
+        if Instant::now() >= deadline {
+            return (0, Err(control_deadline_error()));
+        }
         let request_id = self.next_request();
         let (sender, receiver) = mpsc::channel();
         {
@@ -277,19 +406,42 @@ impl Inner {
                 return (request_id, Err(HelperError::protocol(error.to_string())));
             }
         };
-        let written = {
-            // Only the write of this frame is under the mutex; the reply is
-            // awaited with the lock released so one slow operation cannot
-            // serialize every other mount's control traffic.
-            let mut control = lock(&self.control);
-            write_frame(&mut *control, &frame)
+        let bytes = match encode_frame(&frame) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                lock(&self.pending).remove(&request_id);
+                return (request_id, Err(HelperError::protocol(error.to_string())));
+            }
         };
-        if let Err(error) = written {
+        let mut control = match self.lock_control_until(deadline) {
+            Ok(control) => control,
+            Err(error) => {
+                lock(&self.pending).remove(&request_id);
+                return (request_id, Err(error));
+            }
+        };
+        if self.dead.load(Ordering::Acquire) {
             lock(&self.pending).remove(&request_id);
-            self.fail_generation(libc::ECONNRESET, format!("helper control write failed: {error}"));
             return (request_id, Err(self.failure()));
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        // A teardown deadline may have been published while this caller waited
+        // for the control mutex. Re-read it immediately before touching the
+        // stream so the write itself consumes the tightened absolute budget.
+        let deadline = self.effective_deadline(deadline);
+        if Instant::now() >= deadline {
+            lock(&self.pending).remove(&request_id);
+            return (request_id, Err(control_deadline_error()));
+        }
+        // Only the write of this frame is under the mutex; the reply is
+        // awaited with the lock released so one slow operation cannot
+        // serialize every other mount's control traffic. A partial write is
+        // fail-closed here and never reused as another frame.
+        if let Err(error) = write_bytes_until(&mut control, &bytes, || self.effective_deadline(deadline)) {
+            lock(&self.pending).remove(&request_id);
+            self.fail_generation(error.code, error.message.clone());
+            return (request_id, Err(error));
+        }
+        let remaining = self.effective_deadline(deadline).saturating_duration_since(Instant::now());
         match receiver.recv_timeout(remaining) {
             Ok(result) => (request_id, result),
             Err(RecvTimeoutError::Timeout) => {
@@ -941,5 +1093,71 @@ impl Drop for RemoteFreezeToken {
             epoch: self.epoch,
             op_id: self.op_id,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill_socket_until_blocked(stream: &mut UnixStream) {
+        let fd = stream.as_raw_fd();
+        let chunk = [0u8; 4096];
+        loop {
+            // SAFETY: the test owns both ends of the socket pair and keeps the
+            // peer alive for the whole test.
+            let sent = unsafe { libc::send(fd, chunk.as_ptr().cast(), chunk.len(), libc::MSG_DONTWAIT) };
+            if sent > 0 {
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK)),
+                "unexpected socket fill error: {error}"
+            );
+            return;
+        }
+    }
+
+    #[test]
+    fn control_mutex_admission_is_bounded_by_the_absolute_deadline() {
+        let mutex = Mutex::new(0u8);
+        let _held = mutex.lock().expect("hold test mutex");
+        let started = Instant::now();
+        let error = match lock_until(&mutex, || started + Duration::from_millis(50)) {
+            Ok(_) => panic!("a held control mutex must not admit another writer after the deadline"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, libc::ETIMEDOUT);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stalled_control_write_observes_a_teardown_deadline_published_during_the_write() {
+        let (mut writer, _reader) = UnixStream::pair().expect("socket pair");
+        fill_socket_until_blocked(&mut writer);
+
+        let published = Arc::new(Mutex::new(None));
+        let publisher = published.clone();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            *publisher.lock().expect("publish teardown deadline") = Some(Instant::now() + Duration::from_millis(30));
+        });
+
+        let call_deadline = Instant::now() + Duration::from_secs(5);
+        let started = Instant::now();
+        let bytes = [0u8; 4096];
+        let error = match write_bytes_until(&mut writer, &bytes, || match *published.lock().expect("read deadline") {
+            Some(teardown) => call_deadline.min(teardown),
+            None => call_deadline,
+        }) {
+            Ok(()) => panic!("a full send buffer with no reader must not report a clean write"),
+            Err(error) => error,
+        };
+        release.join().expect("publisher thread");
+
+        assert_eq!(error.code, libc::ETIMEDOUT);
+        assert!(started.elapsed() >= Duration::from_millis(15), "teardown publication was not exercised");
+        assert!(started.elapsed() < Duration::from_secs(2), "write ignored the published teardown cap");
     }
 }
