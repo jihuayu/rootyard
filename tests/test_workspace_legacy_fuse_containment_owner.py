@@ -8,6 +8,7 @@ namespace, read real /proc, use FUSE, service, PG, network or Docker.
 from __future__ import annotations
 
 import subprocess
+import threading
 import unittest
 from unittest import mock
 
@@ -41,6 +42,8 @@ class FakeChild:
         wait_error=None,
         kill_error=None,
         poll_error=None,
+        late_sequence=None,
+        late_release=None,
     ):
         self.pid = pid
         self.returncode = returncode
@@ -49,6 +52,8 @@ class FakeChild:
         self.wait_error = wait_error
         self.kill_error = kill_error
         self.poll_error = poll_error
+        self.late_sequence = list(late_sequence or [])
+        self.late_release = late_release
         self.waits = []
         self.kills = 0
 
@@ -59,14 +64,27 @@ class FakeChild:
 
     def wait(self, timeout=None):
         self.waits.append(timeout)
+        if timeout is None:
+            if self.late_release is not None:
+                if self.late_release.is_set():
+                    self.returncode = 0
+                    return 0
+                return None
+            if self.late_sequence:
+                item = self.late_sequence.pop(0)
+                if isinstance(item, BaseException):
+                    raise item
+                if item is None:
+                    return None
+                self.returncode = item
+                return item
+            if self.exit_on_late_wait:
+                self.returncode = 0
+                return 0
+            return self.returncode
         if self.wait_error is not None:
             raise self.wait_error
         if self.returncode is not None:
-            return self.returncode
-        if timeout is None and self.exit_on_late_wait:
-            self.returncode = 0
-            return 0
-        if timeout is None:
             return self.returncode
         raise subprocess.TimeoutExpired("owned-child", timeout)
 
@@ -242,6 +260,80 @@ class ContainmentOwnerTest(unittest.TestCase):
         self.assertEqual(snapshot["late_cleanup"]["state"], "reaped_late")
         self.assertEqual(snapshot["late_cleanup"]["reaped_late"], 1)
         self.assertEqual(child.waits[-1], None)
+
+    def test_late_drain_retries_wait_exception_until_real_exit(self):
+        owner = ownership.ContainmentOwner()
+        child = FakeChild(late_sequence=[RuntimeError("transient"), 0])
+        owner.register(child, MOUNT_ID)
+        self.assertEqual(
+            owner.late_physical_drain(sleep=lambda _seconds: None, poll_interval=0), 1
+        )
+        snapshot = owner.snapshot()
+        self.assertEqual(snapshot["pending"], 0)
+        self.assertEqual(snapshot["late_cleanup"]["state"], "reaped_late")
+        self.assertEqual(snapshot["late_cleanup"]["reaped_late"], 1)
+        self.assertEqual(snapshot["late_cleanup"]["wait_error_count"], 1)
+        self.assertIn("RuntimeError", snapshot["late_cleanup"]["wait_error_classes"])
+        self.assertEqual(snapshot["records"][0]["returncode"], 0)
+
+    def test_late_drain_retries_none_until_real_exit(self):
+        owner = ownership.ContainmentOwner()
+        child = FakeChild(late_sequence=[None, None, 0])
+        owner.register(child, MOUNT_ID)
+        self.assertEqual(
+            owner.late_physical_drain(sleep=lambda _seconds: None, poll_interval=0), 1
+        )
+        snapshot = owner.snapshot()
+        self.assertEqual(snapshot["pending"], 0)
+        self.assertEqual(snapshot["late_cleanup"]["wait_error_count"], 2)
+        self.assertIn("wait_none", snapshot["late_cleanup"]["wait_error_classes"])
+        self.assertEqual(snapshot["records"][0]["returncode"], 0)
+
+    def test_late_drain_diagnostics_are_bounded(self):
+        owner = ownership.ContainmentOwner()
+        child = FakeChild(late_sequence=[RuntimeError("spam")] * 8 + [0])
+        owner.register(child, MOUNT_ID)
+        self.assertEqual(
+            owner.late_physical_drain(sleep=lambda _seconds: None, poll_interval=0), 1
+        )
+        snapshot = owner.snapshot()
+        self.assertEqual(snapshot["pending"], 0)
+        self.assertEqual(snapshot["errors"], 0)
+        self.assertEqual(snapshot["late_cleanup"]["wait_error_count"], ownership.LATE_DIAG_LIMIT)
+        self.assertTrue(snapshot["late_cleanup"]["wait_diagnostics_capped"])
+        self.assertEqual(snapshot["late_cleanup"]["wait_error_classes"], ["RuntimeError"])
+
+    def test_late_drain_does_not_return_before_release(self):
+        release = threading.Event()
+        child = FakeChild(late_release=release)
+        owner = ownership.ContainmentOwner()
+        owner.register(child, MOUNT_ID)
+        started = threading.Event()
+        wake = threading.Event()
+
+        def sleeper(_seconds):
+            started.set()
+            wake.wait(2)
+
+        thread = threading.Thread(
+            target=owner.late_physical_drain,
+            kwargs={"sleep": sleeper, "poll_interval": 0},
+        )
+        thread.start()
+        try:
+            self.assertTrue(started.wait(2))
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(owner.snapshot()["pending"], 1)
+            self.assertEqual(owner.snapshot()["late_cleanup"]["state"], "draining")
+        finally:
+            release.set()
+            wake.set()
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        snapshot = owner.snapshot()
+        self.assertEqual(snapshot["pending"], 0)
+        self.assertEqual(snapshot["late_cleanup"]["state"], "reaped_late")
+        self.assertEqual(snapshot["late_cleanup"]["reaped_late"], 1)
 
     def test_multiple_records_admit_no_second_child_after_deadline(self):
         clock = FakeClock(4.0)

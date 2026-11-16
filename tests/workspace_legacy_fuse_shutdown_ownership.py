@@ -26,6 +26,8 @@ SAFE_CONTAINMENT_ERRORS = frozenset((
     "TimeoutExpired", "ProcessLookupError", "OSError", "LegacyAcceptanceError",
     "HarnessError", "RuntimeError", "ValueError", "TypeError", "AttributeError",
 ))
+LATE_POLL_SECONDS = 0.01
+LATE_DIAG_LIMIT = 3
 
 
 def safe_error_name(error) -> str:
@@ -192,6 +194,8 @@ class ContainmentOwner:
         self._error_classes: set[str] = set()
         self._late_state = "not_needed"
         self._late_reaped = 0
+        self._late_wait_errors = 0
+        self._late_wait_error_classes: set[str] = set()
         self._retained: list[object] = []
 
     def reset(self) -> None:
@@ -204,6 +208,8 @@ class ContainmentOwner:
         self._error_classes.clear()
         self._late_state = "not_needed"
         self._late_reaped = 0
+        self._late_wait_errors = 0
+        self._late_wait_error_classes.clear()
         self._retained.clear()
 
     def register(self, proc, mount_id, starttime=None) -> ContainmentRecord:
@@ -240,6 +246,21 @@ class ContainmentOwner:
         except Exception as error:
             record.reap_error = safe_error_name(error)
             self.note_error(error)
+            return None
+
+    def _note_late_wait_issue(self, record, error_class: str) -> None:
+        """Record bounded late-drain diagnostics, never an unbounded list."""
+        if error_class not in self._late_wait_error_classes:
+            self._late_wait_error_classes.add(error_class)
+        if self._late_wait_errors < LATE_DIAG_LIMIT:
+            self._late_wait_errors += 1
+        record.reap_error = error_class
+
+    def _poll_late(self, record):
+        try:
+            return record.proc.poll()
+        except Exception as error:
+            self._note_late_wait_issue(record, safe_error_name(error))
             return None
 
     def mark_reaped(self, record, code) -> None:
@@ -290,29 +311,43 @@ class ContainmentOwner:
         record.state = "pending"
         return None
 
-    def late_physical_drain(self) -> int:
-        """Explicit failed-run drain: block on the exact owned children only.
+    def late_physical_drain(self, *, sleep=time.sleep, poll_interval=LATE_POLL_SECONDS) -> int:
+        """Explicit failed-run drain that never returns while a child is pending.
 
-        This is not an acceptance grace and cannot revive the oracle. The
-        failed pending report is written before this call; if the outer job
-        kills this runner, the persisted report remains pending.
+        This is not an acceptance grace and cannot revive the oracle. A wait
+        exception or a ``None`` result is retried on the same exact owned
+        ``Popen`` at a quiet poll cadence. There is no timeout and no success
+        state until ``poll`` or ``wait`` yields a real return code. If the
+        child is permanently unobservable, this call keeps the runner, owner,
+        holders and failed pending report alive until an external resolution
+        or the outer job terminates the process.
         """
-        pending = self.pending_records()
-        if not pending:
+        if not self.pending_records():
             self._late_state = "reaped_late" if self._late_reaped > 0 else "not_needed"
             return 0
         self._late_state = "draining"
-        for record in pending:
-            try:
-                code = record.proc.wait()
-            except Exception as error:
-                record.reap_error = safe_error_name(error)
-                self.note_error(error)
-                continue
-            if code is not None:
-                self.mark_reaped(record, code)
-                self._late_reaped += 1
-        self._late_state = "reaped_late" if not self.pending_records() else "pending"
+        while self.pending_records():
+            for record in list(self.pending_records()):
+                code = self._poll_late(record)
+                if code is not None:
+                    self.mark_reaped(record, code)
+                    self._late_reaped += 1
+                    continue
+                try:
+                    code = record.proc.wait()
+                except Exception as error:
+                    self._note_late_wait_issue(record, safe_error_name(error))
+                    code = self._poll_late(record)
+                else:
+                    if code is None:
+                        self._note_late_wait_issue(record, "wait_none")
+                        code = self._poll_late(record)
+                if code is not None:
+                    self.mark_reaped(record, code)
+                    self._late_reaped += 1
+            if self.pending_records():
+                sleep(poll_interval)
+        self._late_state = "reaped_late"
         return self._late_reaped
 
     def snapshot(self) -> dict:
@@ -336,6 +371,9 @@ class ContainmentOwner:
                 "state": late_state,
                 "reaped_late": self._late_reaped,
                 "pending": len(pending),
+                "wait_error_count": self._late_wait_errors,
+                "wait_error_classes": sorted(self._late_wait_error_classes),
+                "wait_diagnostics_capped": self._late_wait_errors >= LATE_DIAG_LIMIT,
             },
             "retained_fixtures": len(self._retained),
         }
