@@ -151,6 +151,7 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         stock_git_accepts_view(&view, &verified.fixture, deadline())
             .await
             .context("coordinator.legacy.git_verify_after_source_release")?;
+        drop(view);
 
         let release = ServingRootRelease {
             owner: repository.owner.clone(),
@@ -197,6 +198,7 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
             .await
             .context("coordinator.legacy.expiring_materialize")?;
         ensure!(expiring_view.refs() == expiring.read.refs(), "expired source root view changed refs");
+        drop(expiring_view);
         let expiring_replay = facade
             .create(&db.pool, &actor, expiring_input, deadline())
             .await
