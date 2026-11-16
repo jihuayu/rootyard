@@ -350,16 +350,22 @@ def run_qualification(args, environ=None):
     before = None
     try:
         inputs = validate_inputs(args, environ)
-        before = binding_snapshot(inputs)
     except QualificationError as error:
         fatal_code, fatal_stage = error.code, error.stage
     except Exception:
         fatal_code, fatal_stage = "unexpected_error", "input"
-    if inputs is None:
+    if inputs is not None:
+        try:
+            before = binding_snapshot(inputs)
+        except QualificationError as error:
+            fatal_code, fatal_stage = _final_binding_code(error), "binding"
+        except Exception:
+            fatal_code, fatal_stage = "binding_unavailable", "binding"
+    if inputs is None or before is None:
         cleanup = _failed_cleanup("qualification_not_started", "cleanup")
         rows = fill_cases([], fatal_code or "input_validation_failed",
                           fatal_stage or "input", cleanup)
-        report = _safe_build(None, rows, cleanup, False,
+        report = _safe_build(inputs, rows, cleanup, False,
                              fatal_code or "input_validation_failed",
                              fatal_stage or "input")
         if args.report:

@@ -177,6 +177,85 @@ class FinalBindingFailureReportTest(unittest.TestCase):
         self.assertNotIn(SENTINEL, json.dumps(report))
 
 
+class InitialBindingFailureTest(unittest.TestCase):
+    def _assert_no_start(self, report, context_calls):
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["error_code"], "binding_unavailable")
+        self.assertEqual(report["stage"], "binding")
+        self.assertEqual(report["case_count"], 5)
+        self.assertEqual(len(report["cases"]), 5)
+        self.assertTrue(all(case["status"] == "failed"
+                            for case in report["cases"]))
+        self.assertFalse(report["cleanup"]["cleanup_ok"])
+        self.assertEqual(context_calls, [])
+        self.assertNotIn(SENTINEL, json.dumps(report))
+
+    def test_initial_binding_oserror_never_constructs_context_or_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "report.json"
+            args = main.parse_args(["--report", str(report_path)])
+            context_calls = []
+
+            def context_must_not_start(*args, **kwargs):
+                context_calls.append((args, kwargs))
+                raise AssertionError("Context must not be constructed")
+
+            with mock.patch.object(main, "validate_inputs",
+                                   return_value=inputs(report_path)), \
+                 mock.patch.object(main, "binding_snapshot",
+                                   side_effect=OSError(SENTINEL)), \
+                 mock.patch.object(main, "Context",
+                                   side_effect=context_must_not_start), \
+                 mock.patch.object(
+                     main.negative, "case_owned_resource_cleanup",
+                     side_effect=AssertionError(
+                         "cleanup must not run for unstarted resources")):
+                report = main.run_qualification(args, environ={})
+            self._assert_no_start(report, context_calls)
+            self.assertTrue(report_path.is_file())
+            self.assertNotIn(SENTINEL, report_path.read_text())
+
+    def test_initial_binding_qualification_error_returns_fixed_before_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "report.json"
+            args = main.parse_args(["--report", str(report_path)])
+            context_calls = []
+            with mock.patch.object(main, "validate_inputs",
+                                   return_value=inputs(report_path)), \
+                 mock.patch.object(
+                     main, "binding_snapshot",
+                     side_effect=support.QualificationError(
+                         "source_binding_changed", "binding")), \
+                 mock.patch.object(
+                     main, "Context",
+                     side_effect=lambda *a, **k: context_calls.append(1)):
+                report = main.run_qualification(args, environ={})
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["error_code"], "binding_changed")
+            self.assertEqual(report["stage"], "binding")
+            self.assertEqual(report["case_count"], 5)
+            self.assertEqual(context_calls, [])
+            self.assertFalse(report["cleanup"]["cleanup_ok"])
+
+    def test_initial_binding_oserror_main_returns_nonzero_and_writes_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            report_path = Path(temporary) / "report.json"
+            with mock.patch.object(main, "validate_inputs",
+                                   return_value=inputs(report_path)), \
+                 mock.patch.object(main, "binding_snapshot",
+                                   side_effect=OSError(SENTINEL)), \
+                 mock.patch.object(
+                     main, "Context",
+                     side_effect=AssertionError("must not construct Context")):
+                code = main.main(["--report", str(report_path)])
+            self.assertEqual(code, 1)
+            payload = json.loads(report_path.read_text())
+            self.assertFalse(payload["passed"])
+            self.assertEqual(payload["case_count"], 5)
+            self.assertNotIn(SENTINEL, report_path.read_text())
+
+
 class ReportWriteFailureTest(unittest.TestCase):
     def test_report_write_oserror_is_reported_without_raw_text(self):
         with tempfile.TemporaryDirectory() as temporary:
