@@ -34,24 +34,14 @@ impl PandoProviderKind {
 /// fixed-size wrapped-key representation; no external provider is wired yet.
 pub enum PandoWrappedDek {
     Local(WrappedKey),
-    Versioned {
-        provider_kind: PandoProviderKind,
-        key_id: String,
-        key_version: i32,
-        payload: Vec<u8>,
-    },
+    Versioned { provider_kind: PandoProviderKind, key_id: String, key_version: i32, payload: Vec<u8> },
 }
 
 impl fmt::Debug for PandoWrappedDek {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Local(wrapped) => f.debug_tuple("Local").field(wrapped).finish(),
-            Self::Versioned {
-                provider_kind,
-                key_id,
-                key_version,
-                payload,
-            } => f
+            Self::Versioned { provider_kind, key_id, key_version, payload } => f
                 .debug_struct("Versioned")
                 .field("provider_kind", provider_kind)
                 .field("key_id", &"<redacted>")
@@ -79,25 +69,16 @@ impl PandoWrappedDek {
 
     pub(super) fn from_json(bytes: &[u8]) -> Result<Self, KeyProviderError> {
         if bytes.is_empty() || bytes.len() > PANDO_WRAPPED_DEK_JSON_MAX {
-            return Err(KeyProviderError::InvalidWrappedKey(
-                "wrapped DEK JSON is empty or exceeds the size limit",
-            ));
+            return Err(KeyProviderError::InvalidWrappedKey("wrapped DEK JSON is empty or exceeds the size limit"));
         }
         let value: Value = serde_json::from_slice(bytes)
             .map_err(|_| KeyProviderError::InvalidWrappedKey("wrapped DEK is not valid JSON"))?;
-        let is_versioned = value
-            .as_object()
-            .is_some_and(|object| object.contains_key("pando_wrapped_dek"));
+        let is_versioned = value.as_object().is_some_and(|object| object.contains_key("pando_wrapped_dek"));
         if is_versioned {
-            let wire: VersionedEnvelopeWire = serde_json::from_value(value)
+            let wire: VersionedEnvelopeWire = serde_json::from_slice(bytes)
                 .map_err(|_| KeyProviderError::InvalidWrappedKey("invalid versioned wrapped DEK schema"))?;
             let (provider_kind, key_id, key_version, payload) = wire.pando_wrapped_dek.validate()?;
-            return Ok(Self::Versioned {
-                provider_kind,
-                key_id,
-                key_version,
-                payload,
-            });
+            return Ok(Self::Versioned { provider_kind, key_id, key_version, payload });
         }
         WrappedKey::from_json(bytes)
             .map(Self::Local)
@@ -107,12 +88,7 @@ impl PandoWrappedDek {
     pub(super) fn to_json(&self) -> Result<String, KeyProviderError> {
         match self {
             Self::Local(wrapped) => wrapped.to_json(),
-            Self::Versioned {
-                provider_kind,
-                key_id,
-                key_version,
-                payload,
-            } => {
+            Self::Versioned { provider_kind, key_id, key_version, payload } => {
                 validate_versioned_parts(*provider_kind, key_id, *key_version, payload)?;
                 serde_json::to_string(&VersionedEnvelopeWire {
                     pando_wrapped_dek: VersionedBodyWire {
@@ -148,9 +124,7 @@ struct VersionedBodyWire {
 impl VersionedBodyWire {
     fn validate(self) -> Result<(PandoProviderKind, String, i32, Vec<u8>), KeyProviderError> {
         if self.version != PANDO_WRAPPED_DEK_VERSION {
-            return Err(KeyProviderError::InvalidWrappedKey(
-                "unsupported Pando wrapped DEK version",
-            ));
+            return Err(KeyProviderError::InvalidWrappedKey("unsupported Pando wrapped DEK version"));
         }
         let provider_kind = PandoProviderKind::parse(&self.provider_kind)
             .ok_or(KeyProviderError::InvalidWrappedKey("unknown wrapped DEK provider kind"))?;
@@ -164,16 +138,12 @@ impl VersionedBodyWire {
             || self.payload_hex.len() > PANDO_OPAQUE_PAYLOAD_MAX * 2
             || !self.payload_hex.bytes().all(|b| b.is_ascii_hexdigit())
         {
-            return Err(KeyProviderError::InvalidWrappedKey(
-                "invalid opaque wrapped DEK payload",
-            ));
+            return Err(KeyProviderError::InvalidWrappedKey("invalid opaque wrapped DEK payload"));
         }
         let payload = hex::decode(&self.payload_hex)
             .map_err(|_| KeyProviderError::InvalidWrappedKey("invalid opaque wrapped DEK payload"))?;
         if payload.is_empty() || payload.len() > PANDO_OPAQUE_PAYLOAD_MAX {
-            return Err(KeyProviderError::InvalidWrappedKey(
-                "invalid opaque wrapped DEK payload length",
-            ));
+            return Err(KeyProviderError::InvalidWrappedKey("invalid opaque wrapped DEK payload length"));
         }
         Ok((provider_kind, self.key_id, self.key_version, payload))
     }
@@ -192,21 +162,17 @@ fn validate_versioned_parts(
         || payload.is_empty()
         || payload.len() > PANDO_OPAQUE_PAYLOAD_MAX
     {
-        return Err(KeyProviderError::InvalidWrappedKey(
-            "invalid versioned wrapped DEK fields",
-        ));
+        return Err(KeyProviderError::InvalidWrappedKey("invalid versioned wrapped DEK fields"));
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::crypto::{
-        compute_authenticated_envelope_mac, pack_wrap_context, sha256_hex, EnvelopeMacInputs,
-    };
-    use super::super::provider::{PandoKmsProvider, PandoKeyProvider};
+    use super::super::crypto::{EnvelopeMacInputs, compute_authenticated_envelope_mac, pack_wrap_context, sha256_hex};
     use super::super::data_key::PandoDataKey;
+    use super::super::provider::{PandoKeyProvider, PandoKmsProvider};
+    use super::*;
 
     const LEGACY_LOCAL: &str = r#"{"version":1,"key_id":"kms-local-default-v1","nonce":"000102030405060708090a0b","wrapped_dek":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f","aad_digest":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}"#;
     const LEGACY_MAC: &str = "0a74c11486db282523915a5a6b52a414d469fed640811f90eb585fdbfd8b6aa2";
@@ -245,12 +211,7 @@ mod tests {
     fn versioned_schema_is_strict_and_provider_specific() {
         let decoded = PandoWrappedDek::from_json(VERSIONED.as_bytes()).unwrap();
         match &decoded {
-            PandoWrappedDek::Versioned {
-                provider_kind,
-                key_id,
-                key_version,
-                payload,
-            } => {
+            PandoWrappedDek::Versioned { provider_kind, key_id, key_version, payload } => {
                 assert_eq!(*provider_kind, PandoProviderKind::VaultTransit);
                 assert_eq!(key_id.as_str(), "pando-vault-key");
                 assert_eq!(*key_version, 3);
@@ -268,6 +229,14 @@ mod tests {
             r#"{"pando_wrapped_dek":{"version":1,"provider_kind":"vault-transit","key_id":"pando-vault-key","key_version":3,"payload_hex":"zz"}}"#,
             r#"{"pando_wrapped_dek":{"version":1,"provider_kind":"vault-transit","key_id":"pando-vault-key","key_version":3,"payload_hex":"aabbcc"},"extra":true}"#,
             r#"{"pando_wrapped_dek":{"version":1,"provider_kind":"vault-transit","key_id":"pando-vault-key","key_version":3,"payload_hex":"aabbcc","extra":true}}"#,
+            r#"{"pando_wrapped_dek":null}"#,
+            r#"{"pando_wrapped_dek":"not-an-object"}"#,
+            r#"{"pando_wrapped_dek":{"version":1,"provider_kind":"vault-transit","key_id":"pando-vault-key","key_version":3,"payload_hex":"aabbcc"},"pando_wrapped_dek":{"version":1,"provider_kind":"vault-transit","key_id":"pando-vault-key","key_version":3,"payload_hex":"aabbcc"}}"#,
+            r#"{"pando_wrapped_dek":{"version":1,"version":1,"provider_kind":"vault-transit","key_id":"pando-vault-key","key_version":3,"payload_hex":"aabbcc"}}"#,
+            r#"{"pando_wrapped_dek":{"version":1,"provider_kind":"vault-transit","provider_kind":"vault-transit","key_id":"pando-vault-key","key_version":3,"payload_hex":"aabbcc"}}"#,
+            r#"{"pando_wrapped_dek":{"version":1,"provider_kind":"vault-transit","key_id":"pando-vault-key","key_id":"pando-vault-key","key_version":3,"payload_hex":"aabbcc"}}"#,
+            r#"{"pando_wrapped_dek":{"version":1,"provider_kind":"vault-transit","key_id":"pando-vault-key","key_version":3,"key_version":3,"payload_hex":"aabbcc"}}"#,
+            r#"{"pando_wrapped_dek":{"version":1,"provider_kind":"vault-transit","key_id":"pando-vault-key","key_version":3,"payload_hex":"aabbcc","payload_hex":"aabbcc"}}"#,
         ] {
             assert!(PandoWrappedDek::from_json(bad.as_bytes()).is_err(), "accepted {bad}");
         }
@@ -288,22 +257,16 @@ mod tests {
     async fn local_adapter_roundtrips_legacy_and_rejects_versioned_payload_before_local_fallback() {
         let tmp = std::env::temp_dir().join(format!("pando-wrapped-dek-{}", uuid::Uuid::new_v4()));
         let provider = PandoKmsProvider::open_or_init(&tmp, "kms-local-default-v1").unwrap();
-        let context = pack_wrap_context(
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            &"44".repeat(32),
-        ).unwrap();
+        let context =
+            pack_wrap_context(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), &"44".repeat(32))
+                .unwrap();
         let data_key = PandoDataKey::generate().unwrap();
         let wrapped = provider.wrap_data_key(&data_key, &context).await.unwrap();
         let encoded = wrapped.to_json().unwrap();
         let decoded = PandoWrappedDek::from_json(encoded.as_bytes()).unwrap();
         assert_eq!(decoded.to_json().unwrap(), encoded);
         let opened = provider.unwrap_data_key(&decoded, &context).await.unwrap();
-        assert_eq!(
-            sha256_hex(opened.expose_secret()),
-            sha256_hex(data_key.expose_secret())
-        );
+        assert_eq!(sha256_hex(opened.expose_secret()), sha256_hex(data_key.expose_secret()));
 
         let versioned = PandoWrappedDek::from_json(VERSIONED.as_bytes()).unwrap();
         assert!(provider.unwrap_data_key(&versioned, &context).await.is_err());
