@@ -9,11 +9,11 @@ use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result, ensure};
 use rootyard::blob_store::disposable_view::DisposableViewError;
-use rootyard::blob_store::{BlobError, BlobLocator};
 use rootyard::blob_store::read_accel::{
     ReadAccelArtifactKind, ReadAccelFallbackReason, ReadAccelManifest, ReadAccelMaterializeMetrics,
     ReadAccelObjectFormat, ReadAccelSidecarStatus, verify_and_recover_view_sidecars,
 };
+use rootyard::blob_store::{BlobError, BlobLocator};
 
 use super::{LoopbackS3, SampleRepoPacks, assert_git_parity, test_ctx};
 
@@ -340,22 +340,29 @@ finite_enum!(StageClass {
 });
 impl FormatState {
     fn from_format(format: ReadAccelObjectFormat) -> Self {
-        match format { ReadAccelObjectFormat::Sha1 => Self::Sha1, ReadAccelObjectFormat::Sha256 => Self::Sha256 }
+        match format {
+            ReadAccelObjectFormat::Sha1 => Self::Sha1,
+            ReadAccelObjectFormat::Sha256 => Self::Sha256,
+        }
     }
 }
 impl BlobClass {
     fn from_error(err: &BlobError) -> Self {
         match err {
-            BlobError::Config(_) => Self::Config, BlobError::UnsupportedService(_) => Self::UnsupportedService,
-            BlobError::NotFound => Self::NotFound, BlobError::AlreadyExists => Self::AlreadyExists,
+            BlobError::Config(_) => Self::Config,
+            BlobError::UnsupportedService(_) => Self::UnsupportedService,
+            BlobError::NotFound => Self::NotFound,
+            BlobError::AlreadyExists => Self::AlreadyExists,
             BlobError::LengthMismatch { .. } => Self::LengthMismatch,
             BlobError::DigestMismatch { .. } => Self::DigestMismatch,
             BlobError::RangeExceedsLimit { .. } => Self::RangeExceedsLimit,
             BlobError::RangeUnsupported { .. } => Self::RangeUnsupported,
             BlobError::DeadlineExceeded => Self::DeadlineExceeded,
             BlobError::StagingBudgetExceeded { .. } => Self::StagingBudgetExceeded,
-            BlobError::CapacityConflict => Self::CapacityConflict, BlobError::DeleteDisabled => Self::DeleteDisabled,
-            BlobError::ForeignBackend => Self::ForeignBackend, BlobError::Provider(_) => Self::Provider,
+            BlobError::CapacityConflict => Self::CapacityConflict,
+            BlobError::DeleteDisabled => Self::DeleteDisabled,
+            BlobError::ForeignBackend => Self::ForeignBackend,
+            BlobError::Provider(_) => Self::Provider,
             BlobError::Remote(_) => Self::Remote,
         }
     }
@@ -367,24 +374,34 @@ impl ViewClass {
             DisposableViewError::InvalidArgument(_) => Self::InvalidArgument,
             DisposableViewError::UnsafePath(_) => Self::UnsafePath,
             DisposableViewError::CapacityExceeded(_) => Self::CapacityExceeded,
-            DisposableViewError::Expired => Self::Expired, DisposableViewError::Io(_) => Self::Io,
+            DisposableViewError::Expired => Self::Expired,
+            DisposableViewError::Io(_) => Self::Io,
         }
     }
 }
 impl GitCommandClass {
     fn from_command(command: &'static str) -> Self {
         match command {
-            "init" => Self::Init, "verify-pack" => Self::VerifyPack, "update-ref" => Self::UpdateRef,
-            "multi-pack-index" => Self::MultiPackIndex, "commit-graph" => Self::CommitGraph,
-            "rev-list" => Self::RevList, "git" => Self::Git, _ => Self::Unknown,
+            "init" => Self::Init,
+            "verify-pack" => Self::VerifyPack,
+            "update-ref" => Self::UpdateRef,
+            "multi-pack-index" => Self::MultiPackIndex,
+            "commit-graph" => Self::CommitGraph,
+            "rev-list" => Self::RevList,
+            "git" => Self::Git,
+            _ => Self::Unknown,
         }
     }
     fn from_args(args: &[&str]) -> Self {
         match args.first().copied() {
-            Some("init") => Self::Init, Some("multi-pack-index") => Self::MultiPackIndex,
-            Some("commit-graph") => Self::CommitGraph, Some("rev-list") => Self::RevList,
-            Some("merge-base") => Self::MergeBase, Some("cat-file") => Self::CatFile,
-            Some("verify-pack") => Self::VerifyPack, Some("update-ref") => Self::UpdateRef,
+            Some("init") => Self::Init,
+            Some("multi-pack-index") => Self::MultiPackIndex,
+            Some("commit-graph") => Self::CommitGraph,
+            Some("rev-list") => Self::RevList,
+            Some("merge-base") => Self::MergeBase,
+            Some("cat-file") => Self::CatFile,
+            Some("verify-pack") => Self::VerifyPack,
+            Some("update-ref") => Self::UpdateRef,
             _ => Self::Unknown,
         }
     }
@@ -400,14 +417,16 @@ impl IoKindClass {
             std::io::ErrorKind::ConnectionReset => Self::ConnectionReset,
             std::io::ErrorKind::InvalidData => Self::InvalidData,
             std::io::ErrorKind::InvalidInput => Self::InvalidInput,
-            std::io::ErrorKind::UnexpectedEof => Self::UnexpectedEof, _ => Self::Other,
+            std::io::ErrorKind::UnexpectedEof => Self::UnexpectedEof,
+            _ => Self::Other,
         }
     }
 }
 impl StatusClass {
     fn from_status(status: &ReadAccelSidecarStatus) -> Self {
         match finite_status_label(status) {
-            "disabled" => Self::Disabled, "applied" => Self::Applied,
+            "disabled" => Self::Disabled,
+            "applied" => Self::Applied,
             "fallback/no-manifest" => Self::FallbackNoManifest,
             "fallback/manifest-fetch-failed" => Self::FallbackManifestFetchFailed,
             "fallback/manifest-invalid" => Self::FallbackManifestInvalid,
@@ -425,17 +444,22 @@ impl StatusClass {
 impl KindClass {
     fn from_label(label: &'static str) -> Self {
         match label {
-            "none" => Self::None, "midx" => Self::Midx, "bitmap" => Self::Bitmap,
-            "commit-graph" => Self::CommitGraph, _ => Self::NotCaptured,
+            "none" => Self::None,
+            "midx" => Self::Midx,
+            "bitmap" => Self::Bitmap,
+            "commit-graph" => Self::CommitGraph,
+            _ => Self::NotCaptured,
         }
     }
 }
 impl StageClass {
     fn from_label(label: &'static str) -> Self {
         match label {
-            "download" => Self::Download, "downloaded-local-integrity" => Self::DownloadedLocalIntegrity,
+            "download" => Self::Download,
+            "downloaded-local-integrity" => Self::DownloadedLocalIntegrity,
             "bitmap-post-placement-header" => Self::BitmapPostPlacementHeader,
-            "inconsistent-metrics" => Self::InconsistentMetrics, _ => Self::NotCaptured,
+            "inconsistent-metrics" => Self::InconsistentMetrics,
+            _ => Self::NotCaptured,
         }
     }
 }

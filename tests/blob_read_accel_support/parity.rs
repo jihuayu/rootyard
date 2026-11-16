@@ -125,8 +125,14 @@ impl fmt::Display for SafeDiagError {
             write!(
                 f,
                 " view_status={} view_kind={} view_stage={} view_detail={} sidecars_applied={} sidecar_get_attempts={} sidecar_get_bytes={} quarantined={}",
-                view.status.label(), view.kind.label(), view.stage.label(), view.detail.label(),
-                view.sidecars_applied, view.sidecar_get_attempts, view.sidecar_get_bytes, view.quarantined
+                view.status.label(),
+                view.kind.label(),
+                view.stage.label(),
+                view.detail.label(),
+                view.sidecars_applied,
+                view.sidecar_get_attempts,
+                view.sidecar_get_bytes,
+                view.quarantined
             )?;
             if let Some(artifacts) = view.artifacts {
                 write!(f, " manifest_artifacts={artifacts}")?;
@@ -191,10 +197,12 @@ pub(super) async fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Re
         };
         diag.set_phase(Phase::EnabledStatus);
         diag.projection = Some(project_view_full(
-            enabled_view.status(), enabled_view.metrics(), &bundle.manifest, &bundle.manifest_locator,
+            enabled_view.status(),
+            enabled_view.metrics(),
+            &bundle.manifest,
+            &bundle.manifest_locator,
         ));
-        if !(*enabled_view.status() == ReadAccelSidecarStatus::Applied
-            && enabled_view.metrics().sidecars_applied == 3)
+        if !(*enabled_view.status() == ReadAccelSidecarStatus::Applied && enabled_view.metrics().sidecars_applied == 3)
         {
             return Err(fail_assert(&mut diag, Phase::EnabledStatus).into());
         }
@@ -274,12 +282,8 @@ fn assert_git_parity_diagnosed(
     let base_commit = sample.base_commit.as_str();
     for (anc, tip, want) in [(base_commit, main_tip, 0), (feature_tip, main_tip, 1)] {
         diag.set_phase(Phase::ParityAncestry);
-        let expected = git_cmd_diag(
-            diag,
-            expected_repo,
-            &["merge-base", "--is-ancestor", anc, tip],
-            GitCommandClass::MergeBase,
-        )?;
+        let expected =
+            git_cmd_diag(diag, expected_repo, &["merge-base", "--is-ancestor", anc, tip], GitCommandClass::MergeBase)?;
         if expected.status.code() != Some(want) {
             diag.error = ErrorClass::Assertion;
             diag.git_command = GitCommandClass::MergeBase;
@@ -287,12 +291,8 @@ fn assert_git_parity_diagnosed(
             diag.signal = status_signal(&expected.status);
             return Err(SafeDiagError { diag: *diag });
         }
-        let candidate = git_cmd_diag(
-            diag,
-            candidate_repo,
-            &["merge-base", "--is-ancestor", anc, tip],
-            GitCommandClass::MergeBase,
-        )?;
+        let candidate =
+            git_cmd_diag(diag, candidate_repo, &["merge-base", "--is-ancestor", anc, tip], GitCommandClass::MergeBase)?;
         if candidate.status.code() != Some(want) {
             diag.error = ErrorClass::Assertion;
             diag.git_command = GitCommandClass::MergeBase;
@@ -385,9 +385,9 @@ fn project_view_full(
     let stage = match status {
         ReadAccelSidecarStatus::Applied => StageClass::Applied,
         ReadAccelSidecarStatus::Disabled => StageClass::Disabled,
-        ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(_) => StageClass::from_label(
-            cached_fallback_stage_label(status, metrics, manifest, manifest_locator, true),
-        ),
+        ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(_) => {
+            StageClass::from_label(cached_fallback_stage_label(status, metrics, manifest, manifest_locator, true))
+        }
     };
     ViewProjection {
         status: StatusClass::from_status(status),
