@@ -1,0 +1,124 @@
+name: Ref-CAS remote authz bridge and drain barrier (#152)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/refcas-remote-authz.yml'
+      - 'src/ref_store/projector.rs'
+      - 'src/ref_store/projector/**'
+      - 'src/ref_store/core/state_machine.rs'
+      - 'src/ref_store/core/state_machine/**'
+      - 'crates/refcas-log/**'
+      - 'tests/ref_store_remote_authz_bridge.rs'
+      - 'tests/remote_authz_support/**'
+      - 'tests/test_remote_authz_bridge_contracts.py'
+      - 'docs/refcas-remote-authz-bridge.md'
+      - 'migrations/144_*'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refcas-remote-authz-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  refcas-remote-authz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: rootyard_authz152
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_authz152"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_authz152
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install native prerequisites (OpenSSL, Git, build tools)
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates openssl libssl-dev pkg-config git build-essential \
+            libfuse3-dev fuse3 cmake clang
+          git --version
+          openssl version
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/refcas-remote-authz/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: refcas-remote-authz
+          workspaces: ". -> target"
+      - name: Verify formatting, design docs, and contracts
+        run: |
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest tests.test_remote_authz_bridge_contracts tests.test_ci_workflow_triggers tests.test_ci_cargo_fork_workflows
+      - name: Clippy and compile checks with warnings denied
+        run: |
+          cargo clippy --locked --lib --test ref_store_raft_sm --test ref_store_remote_authz_bridge -- -D warnings
+          cargo check --locked --all-targets
+      - name: Build multi-process refcas-log raft-node binary
+        run: |
+          cargo build --locked --manifest-path crates/refcas-log/Cargo.toml --bin raft-node
+          echo "ROOTYARD_REFCAS_NODE_BIN=$GITHUB_WORKSPACE/crates/refcas-log/target/debug/raft-node" >> "$GITHUB_ENV"
+      - name: Run deterministic state machine, grant, and drain unit/integration tests
+        run: |
+          cargo test --locked --test ref_store_raft_sm
+          cargo test --locked --lib ref_store::projector
+          cargo test --locked --test ref_store_remote_authz_bridge
+      - name: Exercise multi-node mTLS Raft + PG17 E2E remote authz bridge qualification
+        run: |
+          cargo test --locked --test ref_store_remote_authz_bridge -- --ignored --test-threads=1
+      - name: Upload workflow receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refcas-remote-authz-receipts
+          path: test-results/refcas-remote-authz/cargo-fork.json
+          if-no-files-found: warn

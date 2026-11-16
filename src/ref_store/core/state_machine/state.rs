@@ -4,6 +4,7 @@
 //! `BTreeMap`-ordered fields so identical Raft log execution across replicas
 //! yields identical canonical SHA-256 `state_digest()` and `RefCasSnapshot` checksums.
 
+use super::apply_scopes::{DecisionScopeIndexRecord, ScopeFloorRecord, ScopeKey};
 use super::commands::{
     AppliedLogId, RepositoryLane, ScopeLifecycle, SmDecisionState, SmHoldState, SmPackMode, SmPinState, SmRootState,
     WireDecisionKind, WireDecisionVerdict, WireHoldArtifactSpec,
@@ -15,7 +16,7 @@ use crate::ref_store::core::contract::{CoreGate, CoreGateVersion};
 use crate::ref_store::core::types::{GitObjectFormat, RefName};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 pub const SNAPSHOT_FORMAT_VERSION: &str = "rootyard-refcas-sm-snapshot/1";
@@ -386,6 +387,9 @@ pub(super) struct SmState {
     pub cancellations: BTreeMap<RepoEntityKey, CancelTombstone>,
     pub decisions: BTreeMap<Uuid, DecisionRecord>,
     pub decisions_by_op: BTreeMap<RepoEntityKey, Uuid>,
+    pub scope_floors: BTreeMap<ScopeKey, ScopeFloorRecord>,
+    pub decision_scope_deps: BTreeMap<Uuid, DecisionScopeIndexRecord>,
+    pub scope_decision_index: BTreeMap<ScopeKey, BTreeSet<Uuid>>,
     pub snapshots: BTreeMap<Uuid, SnapshotRecord>,
     pub pins: BTreeMap<Uuid, PinRecord>,
     pub pin_receipts: BTreeMap<Uuid, PinReceiptRecord>,
