@@ -108,6 +108,7 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         self.conflict = None
         self.log_path = self.h.root / "server.log"
         self.oracle_log_path = self.log_path
+        self._cleanup_deadline = None
 
     def tearDown(self):
         harness = self.h
@@ -116,10 +117,14 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
                 legacy_support.force_stop_owned_service(harness)
             legacy_fixtures.close_conflict(self.conflict)
             self.conflict = None
+            # Reuse the absolute deadline armed at the case trigger. Failure
+            # containment never receives a fresh oracle window after D, and no
+            # containment wait runs before a trigger has armed that deadline.
+            deadline = self._cleanup_deadline
             for holder in self.holders:
-                if self.owned_records:
+                if self.owned_records and deadline is not None:
                     contained = legacy_support.contain_proven_owned_mounts(
-                        holder.pid, self.owned_records, time.monotonic() + legacy_support.ORACLE_SECONDS
+                        holder.pid, self.owned_records, deadline
                     )
                     detail = CASE_DETAILS.setdefault(self.id(), {})
                     detail["containment_used"] = int(detail.get("containment_used", 0)) + contained
@@ -185,11 +190,17 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         proc = legacy_support.start_service(self.h, self.oracle_log_path)
         return proc.pid
 
+    def _arm_cleanup_deadline(self):
+        """Arm the one absolute case deadline at the actual trigger."""
+        self._cleanup_deadline = time.monotonic() + legacy_support.ORACLE_SECONDS
+        return self._cleanup_deadline
+
     def _record_detail(self, namespace, evidence, exit_code):
         CASE_DETAILS[self.id()] = {
             "mount_namespace": namespace,
             "joined_mounts": evidence["joined_mounts"],
             "joined_workspaces": evidence["joined_workspaces"],
+            "exit_code": int(exit_code),
             "primary_nonzero": exit_code != 0,
             "owned_mounts_remaining": None,
             "containment_used": 0,
@@ -241,7 +252,7 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         self.assertEqual(int(visible["mount_id"]), mount_id, "holder does not see the exact service mount")
         namespace = legacy_support.mount_namespace_inode(api_pid)
 
-        deadline = time.monotonic() + legacy_support.ORACLE_SECONDS
+        deadline = self._arm_cleanup_deadline()
         self._signal_owned(signal.SIGTERM)
         code = support.wait_process_exit(
             self.h.proc, timeout=max(0.0, deadline - time.monotonic())
@@ -300,6 +311,8 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         git_dir.rename(corrupt_name)
         (broken_lower / ".git").write_text("corrupted legacy lower state\n", encoding="utf-8")
 
+        # This 180 s preparation-stop bound is setup containment, explicitly
+        # outside the single 5 s case oracle armed below at the failure trigger.
         code = legacy_support.stop_service_gracefully(
             self.h, timeout=legacy_support.PREP_SHUTDOWN_SECONDS
         )
@@ -322,12 +335,12 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             raise legacy_support.LegacyAcceptanceError("earlier healthy workspaces were not both observed mounted")
 
         namespace = legacy_support.mount_namespace_inode(api_pid)
-        deadline = time.monotonic() + legacy_support.ORACLE_SECONDS
+        deadline = self._arm_cleanup_deadline()
         code = support.wait_process_exit(
             self.h.proc, timeout=max(0.0, deadline - time.monotonic())
         )
         self._finish_service_exit()
-        self.assertNotEqual(code, 0, "partial reconcile failure exited zero")
+        self.assertGreater(code, 0, "partial reconcile failure did not return a positive application exit status")
 
         for workspace, paths in healthy:
             legacy_support.wait_exact_mount_gone(
@@ -362,6 +375,8 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             timeout=legacy_support.STARTUP_OBSERVATION_SECONDS,
         )
         self._remember_record(paths["mountpoint"], int(mount["mount_id"]))
+        # This 180 s preparation-stop bound is setup containment, explicitly
+        # outside the single 5 s case oracle armed below at the bind failure.
         code = legacy_support.stop_service_gracefully(
             self.h, timeout=legacy_support.PREP_SHUTDOWN_SECONDS
         )
@@ -379,14 +394,14 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         mount_id = int(visible["mount_id"])
         self._remember_record(paths["mountpoint"], mount_id)
         namespace = legacy_support.mount_namespace_inode(api_pid)
-        deadline = time.monotonic() + legacy_support.ORACLE_SECONDS
+        deadline = self._arm_cleanup_deadline()
         code = support.wait_process_exit(
             self.h.proc, timeout=max(0.0, deadline - time.monotonic())
         )
         self._finish_service_exit()
         legacy_fixtures.close_conflict(self.conflict)
         self.conflict = None
-        self.assertNotEqual(code, 0, "post-reconcile bind failure exited zero")
+        self.assertGreater(code, 0, "post-reconcile bind failure did not return a positive application exit status")
 
         legacy_support.wait_exact_mount_gone(holder.pid, paths["mountpoint"], mount_id, deadline)
         self.assertEqual(
