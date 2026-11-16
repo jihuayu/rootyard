@@ -333,6 +333,8 @@ pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOption
         bail!("concurrent repository state change during repack");
     }
     ensure!(!cur_p && cur_b == "pando", "repack requires active pando repository authority");
+    #[cfg(test)]
+    super::store::snapshot_pg_support::barrier_tx("repack-after-lock", &t).await?;
 
     let live_snaps = t
         .query("SELECT packs FROM pando_lab.snapshots WHERE repo=$1 AND expires_at>clock_timestamp()", &[&repo])

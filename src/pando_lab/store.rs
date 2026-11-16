@@ -10,6 +10,13 @@ use std::{
 mod snapshot_retention;
 pub(super) use snapshot_retention::snapshot_and_retain;
 
+#[cfg(test)]
+pub(super) mod snapshot_pg_support;
+#[cfg(test)]
+mod snapshot_pg_tests;
+#[cfg(test)]
+mod snapshot_race_pg_tests;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcReport {
     pub orphan_packs_deleted: usize,
