@@ -1748,6 +1748,7 @@ fn uuid_from_digest(digest: RequestDigest) -> Uuid {
 }
 
 fn map_root_error(error: RootError) -> Error {
+    crate::observability::root_prepare::observe_root_to_service(&error);
     match error {
         RootError::Store(error) => match error {
             RefStoreError::MetadataPinExpired { .. } | RefStoreError::MetadataPinReleased { .. } => {

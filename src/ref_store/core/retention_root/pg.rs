@@ -14,6 +14,7 @@ use super::selector::{native_refs, resolve_oids};
 use super::sql_read;
 use super::{RootPurpose, RootRef, RootSelectorKind};
 use crate::blob_store::opendal::BlobStore;
+use crate::observability::root_prepare::{native_diagnostic, observe_native_to_root};
 use crate::ref_store::contract::RefStoreError;
 use crate::ref_store::core::pack_commit::{NativeReadEngine, NativeReadRequest, PackCommitError};
 use crate::ref_store::core::pack_snapshot::{PackReadSnapshot, PackSnapshotRef, PgPackSnapshot};
@@ -270,7 +271,10 @@ async fn capture_t1(
 
 /// Map the private native refusal without promoting Git text, argv, a path, a locator or provider text.
 fn map_native_error(error: PackCommitError) -> RootError {
-    RootError::from(error)
+    let diagnostic = native_diagnostic(&error);
+    let mapped = RootError::from(error);
+    observe_native_to_root(diagnostic, &mapped);
+    mapped
 }
 
 /// Re-proven metadata of one retained capture, as the core itself stores it.

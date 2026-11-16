@@ -5,6 +5,7 @@
 //! headers, query strings, user content and source strings are never formatted.
 use crate::storage::remote_objects::RemoteStoreError;
 
+pub(crate) mod root_prepare;
 pub(crate) mod worker;
 use axum::{
     extract::{MatchedPath, Request},
