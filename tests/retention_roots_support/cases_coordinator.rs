@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use rootyard::ref_store::{
     PinReleaseReason, RequestDigest,
-    core::retention_root::{PgRetentionRoots, RootPurpose, RootSelector},
+    core::retention_root::{PgRetentionRoots, RootPurpose, RootReadView, RootSelector},
     serving::{
         PgServingRetentionRoots, PgServingSnapshotMetadata, ServingRootCreate, ServingRootIntent, ServingRootRead,
         ServingRootRelease, ServingRootReleaseTarget, ServingSnapshotCreate, ServingSnapshotRead,
@@ -25,7 +25,7 @@ use crate::retention_roots_support::db::{
     serving_collaborator, set_collaborator_role, wait_pin_expired,
 };
 use crate::retention_roots_support::git::{
-    GateRelease, GitGate, assert_pack_identity, git_binary, stock_git_accepts_view,
+    GateRelease, GitGate, GitRepo, assert_pack_identity, git_binary, stock_git_accepts_view,
 };
 use crate::retention_roots_support::pack::{self, create_serving_snapshot};
 use crate::retention_roots_support::roots;
@@ -59,6 +59,37 @@ fn create_input(owner: &str, name: &str, snapshot_id: Uuid, key: &str) -> Servin
 
 fn read_input(owner: &str, name: &str, root_id: Uuid) -> ServingRootRead {
     ServingRootRead { owner: owner.to_owned(), name: name.to_owned(), root_id }
+}
+
+async fn assert_root_view_matches_source(
+    view: &RootReadView,
+    source: &pack::SourceSnapshot,
+    owner: Uuid,
+    tenant: Uuid,
+    fixture: &GitRepo,
+) -> Result<()> {
+    ensure!(
+        view.scope().owner_id() == owner
+            && view.scope().tenant_id() == tenant
+            && !view.packs().is_empty()
+            && view.packs().len() == source.read.packs().len(),
+        "root view owner/tenant/pack shape differs"
+    );
+    for expected in source.read.packs() {
+        let actual = view
+            .packs()
+            .iter()
+            .find(|pack| pack.pack_id() == expected.pack_id())
+            .ok_or_else(|| anyhow!("root view omitted a retained pack"))?;
+        assert_pack_identity(expected, actual)?;
+    }
+    stock_git_accepts_view(view, fixture, deadline()).await?;
+    let head = view.head_oid_hex().ok_or_else(|| anyhow!("root HEAD is unborn"))?;
+    ensure!(
+        fixture.cat_file(head).await?.contains("fixture main"),
+        "root did not materialize real Git bytes"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -145,8 +176,9 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
             "expired-source exact replay differs"
         );
 
-        // Additive actor-owned root lifecycle. The producer is a distinct real
-        // Admin collaborator; the format22 fixture role remains unchanged.
+        // Additive actor-owned root lifecycle. Both roots are created through
+        // the actor facade while the source A5 pin is live; default existing-root
+        // APIs intentionally remain owner-independent for a current Admin.
         let producer =
             serving_collaborator(&db.pool, verified.repo, verified.tenant, "admin", "owned-root-").await?;
         ensure!(
@@ -200,35 +232,39 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
             pin_id: owned_source_outcome.receipt.pin_id(),
             read: owned_source_read,
         };
-        let mut owned_input =
-            create_input(&repository.owner, &repository.name, owned_source.snapshot_id, "coord-owned-root");
-        owned_input.intent.purpose = RootPurpose::Backup;
-        let owned_root = facade.create_actor_owned(&db.pool, &producer, owned_input.clone(), deadline()).await?;
+
+        let mut default_input =
+            create_input(&repository.owner, &repository.name, owned_source.snapshot_id, "coord-owned-default");
+        default_input.intent.purpose = RootPurpose::Backup;
+        let default_root =
+            facade.create_actor_owned(&db.pool, &producer, default_input.clone(), deadline()).await?;
         ensure!(
-            !owned_root.replayed()
-                && owned_root.state() == "active"
-                && owned_root.owner_id() == producer.id
-                && owned_root.tenant_id() == verified.tenant,
+            !default_root.replayed()
+                && default_root.state() == "active"
+                && default_root.owner_id() == producer.id
+                && default_root.tenant_id() == verified.tenant,
+            "default-compatibility actor root create receipt differs"
+        );
+        let default_root_id = default_root.root_id();
+        let default_read_input = read_input(&repository.owner, &repository.name, default_root_id);
+
+        let mut actor_input =
+            create_input(&repository.owner, &repository.name, owned_source.snapshot_id, "coord-owned-actor");
+        actor_input.intent.purpose = RootPurpose::Backup;
+        let actor_root = facade.create_actor_owned(&db.pool, &producer, actor_input.clone(), deadline()).await?;
+        ensure!(
+            !actor_root.replayed()
+                && actor_root.state() == "active"
+                && actor_root.owner_id() == producer.id
+                && actor_root.tenant_id() == verified.tenant,
             "actor-owned root create receipt differs"
         );
-        let owned_root_id = owned_root.root_id();
-        let owned_created_counts = root_counts(&db.pool, verified.repo).await?;
-        let owned_created_usage = repo_usage(&db.pool, verified.repo).await?;
-        let owned_read_input = read_input(&repository.owner, &repository.name, owned_root_id);
-        let owned_record = facade
-            .metadata_actor_owned(&db.pool, &producer, owned_read_input.clone(), deadline())
-            .await?
-            .ok_or_else(|| anyhow!("actor-owned root metadata missing"))?;
-        ensure!(
-            owned_record.owner_id() == producer.id
-                && owned_record.tenant_id() == verified.tenant
-                && owned_record.purpose() == RootPurpose::Backup
-                && owned_record.is_active()
-                && owned_record.pack_count() > 0,
-            "actor-owned root metadata owner/purpose/shape differs"
-        );
+        let actor_root_id = actor_root.root_id();
+        let actor_read_input = read_input(&repository.owner, &repository.name, actor_root_id);
+        let created_counts = root_counts(&db.pool, verified.repo).await?;
+        let created_usage = repo_usage(&db.pool, verified.repo).await?;
 
-        // Release the actor-owned source pin; root metadata stays retained.
+        // Release the actor-owned source pin; both root receipts remain retained.
         PgServingSnapshotMetadata
             .release_actor_owned(
                 &db.pool,
@@ -246,120 +282,195 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
             )
             .await?;
 
-        // Exact root create replay is independent of the released source pin.
-        let owned_replay = facade.create_actor_owned(&db.pool, &producer, owned_input.clone(), deadline()).await?;
+        // Exact create replay is source-pin independent for both actor roots.
+        let default_replay =
+            facade.create_actor_owned(&db.pool, &producer, default_input.clone(), deadline()).await?;
         ensure!(
-            owned_replay.replayed() && owned_replay.root_id() == owned_root_id,
-            "actor-owned root replay after source release differs"
+            default_replay.replayed() && default_replay.root_id() == default_root_id,
+            "default-compatibility root create replay differs"
+        );
+        let actor_replay = facade.create_actor_owned(&db.pool, &producer, actor_input.clone(), deadline()).await?;
+        ensure!(
+            actor_replay.replayed() && actor_replay.root_id() == actor_root_id,
+            "actor-owned root create replay differs"
         );
         ensure!(
-            root_counts(&db.pool, verified.repo).await? == owned_created_counts
-                && repo_usage(&db.pool, verified.repo).await? == owned_created_usage,
+            root_counts(&db.pool, verified.repo).await? == created_counts
+                && repo_usage(&db.pool, verified.repo).await? == created_usage,
             "actor-owned create replay charged root quota or usage"
         );
 
-        // The root materializes from its own retained rows even after the source
-        // pin is released; actual native Git bytes and pack identity must match.
-        let owned_view =
-            facade.materialize_actor_owned(&db.pool, &producer, owned_read_input.clone(), deadline()).await?;
+        // Actor-owned metadata/materialize remain actor-bound.
+        let actor_record = facade
+            .metadata_actor_owned(&db.pool, &producer, actor_read_input.clone(), deadline())
+            .await?
+            .ok_or_else(|| anyhow!("actor-owned root metadata missing"))?;
         ensure!(
-            owned_view.root_id() == owned_root_id
-                && owned_view.scope().owner_id() == producer.id
-                && owned_view.scope().tenant_id() == verified.tenant
-                && !owned_view.packs().is_empty()
-                && owned_view.packs().len() == owned_source.read.packs().len(),
-            "actor-owned root view owner/pack shape differs"
+            actor_record.owner_id() == producer.id
+                && actor_record.tenant_id() == verified.tenant
+                && actor_record.purpose() == RootPurpose::Backup
+                && actor_record.is_active()
+                && actor_record.pack_count() > 0,
+            "actor-owned root metadata owner/purpose/shape differs"
         );
-        for expected in owned_source.read.packs() {
-            let actual = owned_view
-                .packs()
-                .iter()
-                .find(|pack| pack.pack_id() == expected.pack_id())
-                .ok_or_else(|| anyhow!("actor-owned root view omitted a retained pack"))?;
-            assert_pack_identity(expected, actual)?;
-        }
-        stock_git_accepts_view(&owned_view, &verified.fixture, deadline()).await?;
-        let owned_head = owned_view.head_oid_hex().ok_or_else(|| anyhow!("actor-owned root HEAD is unborn"))?;
-        ensure!(
-            verified.fixture.cat_file(owned_head).await?.contains("fixture main"),
-            "actor-owned root did not materialize real Git bytes"
-        );
+        let actor_view =
+            facade.materialize_actor_owned(&db.pool, &producer, actor_read_input.clone(), deadline()).await?;
+        assert_root_view_matches_source(
+            &actor_view,
+            &owned_source,
+            producer.id,
+            verified.tenant,
+            &verified.fixture,
+        )
+        .await?;
 
-        // Wrong-owner and default tenant-mode reads/materialization cannot adopt
-        // the actor-owned root, and charge no ledger rows.
-        let owned_counts = root_counts(&db.pool, verified.repo).await?;
-        let owned_usage = repo_usage(&db.pool, verified.repo).await?;
-        match facade.metadata_actor_owned(&db.pool, &actor, owned_read_input.clone(), deadline()).await {
+        // Default metadata/materialize preserve historical owner-independent
+        // existing-root access while retaining the stored producer owner.
+        let default_record = facade
+            .metadata(&db.pool, &actor, default_read_input.clone(), deadline())
+            .await?
+            .ok_or_else(|| anyhow!("default compatibility root metadata missing"))?;
+        ensure!(
+            default_record.owner_id() == producer.id
+                && default_record.tenant_id() == verified.tenant
+                && default_record.purpose() == RootPurpose::Backup
+                && default_record.is_active()
+                && default_record.pack_count() > 0,
+            "default metadata did not preserve the stored producer owner"
+        );
+        let default_view =
+            facade.materialize(&db.pool, &actor, default_read_input.clone(), deadline()).await?;
+        assert_root_view_matches_source(
+            &default_view,
+            &owned_source,
+            producer.id,
+            verified.tenant,
+            &verified.fixture,
+        )
+        .await?;
+
+        // Explicit actor-owned access still rejects a different authorized Admin.
+        match facade.metadata_actor_owned(&db.pool, &actor, actor_read_input.clone(), deadline()).await {
             Err(error) if error.0 == StatusCode::NOT_FOUND => {}
             Err(error) => return Err(anyhow!("non-owner actor-owned root metadata returned {} {}", error.0, error.1)),
             Ok(_) => return Err(anyhow!("non-owner actor-owned root metadata unexpectedly returned")),
         }
-        match facade.metadata(&db.pool, &actor, owned_read_input.clone(), deadline()).await {
-            Err(error) if error.0 == StatusCode::NOT_FOUND => {}
-            Err(error) => return Err(anyhow!("tenant root metadata adopted actor root: {} {}", error.0, error.1)),
-            Ok(_) => return Err(anyhow!("tenant root metadata unexpectedly adopted actor root")),
-        }
-        match facade.materialize_actor_owned(&db.pool, &actor, owned_read_input.clone(), deadline()).await {
+        match facade.materialize_actor_owned(&db.pool, &actor, actor_read_input.clone(), deadline()).await {
             Err(error) if error.0 == StatusCode::NOT_FOUND => {}
             Err(error) => return Err(anyhow!("non-owner actor-owned root materialize returned {} {}", error.0, error.1)),
             Ok(_) => return Err(anyhow!("non-owner actor-owned root materialize unexpectedly returned")),
         }
-        match facade.materialize(&db.pool, &actor, owned_read_input.clone(), deadline()).await {
-            Err(error) if error.0 == StatusCode::NOT_FOUND => {}
-            Err(error) => return Err(anyhow!("tenant root materialize adopted actor root: {} {}", error.0, error.1)),
-            Ok(_) => return Err(anyhow!("tenant root materialize unexpectedly adopted actor root")),
-        }
-        ensure!(root_counts(&db.pool, verified.repo).await? == owned_counts, "root owner refusals charged quota");
-        ensure!(repo_usage(&db.pool, verified.repo).await? == owned_usage, "root owner refusals charged usage");
-
-        let owned_release = ServingRootRelease {
+        let default_release = ServingRootRelease {
             owner: repository.owner.clone(),
             name: repository.name.clone(),
-            target: ServingRootReleaseTarget::Existing { root_id: owned_root_id },
-            idempotency_key: "coord-owned-root-release".into(),
+            target: ServingRootReleaseTarget::Existing { root_id: default_root_id },
+            idempotency_key: "coord-owned-default-release".into(),
+            reason: "fixture default release of producer-owned root".into(),
+        };
+        let actor_release = ServingRootRelease {
+            owner: repository.owner.clone(),
+            name: repository.name.clone(),
+            target: ServingRootReleaseTarget::Existing { root_id: actor_root_id },
+            idempotency_key: "coord-owned-actor-release".into(),
             reason: "fixture actor-owned root release".into(),
         };
-        let owned_released =
-            facade.release_actor_owned(&db.pool, &producer, owned_release.clone(), deadline()).await?;
+        match facade.release_actor_owned(&db.pool, &actor, actor_release.clone(), deadline()).await {
+            Err(error) if error.0 == StatusCode::NOT_FOUND => {}
+            Err(error) => return Err(anyhow!("non-owner actor-owned root release returned {} {}", error.0, error.1)),
+            Ok(_) => return Err(anyhow!("non-owner actor-owned root release unexpectedly returned")),
+        }
         ensure!(
-            owned_released.state() == "released" && owned_released.root_id() == owned_root_id,
-            "actor-owned root release state differs"
+            root_counts(&db.pool, verified.repo).await? == created_counts
+                && repo_usage(&db.pool, verified.repo).await? == created_usage,
+            "actor-owned refusals charged root quota or usage"
         );
-        let owned_released_counts = root_counts(&db.pool, verified.repo).await?;
-        let owned_released_usage = repo_usage(&db.pool, verified.repo).await?;
-        let owned_release_replay =
-            facade.release_actor_owned(&db.pool, &producer, owned_release, deadline()).await?;
+
+        // Default release Existing must work for a current Admin even though the
+        // durable owner is the producer; exact replay returns the same terminal.
+        let default_released = facade.release(&db.pool, &actor, default_release.clone(), deadline()).await?;
         ensure!(
-            owned_release_replay.replayed() && owned_release_replay.root_id() == owned_root_id,
-            "actor-owned release replay differs"
+            default_released.state() == "released"
+                && default_released.root_id() == default_root_id
+                && default_released.owner_id() == producer.id,
+            "default release of producer-owned root state/owner differs"
         );
-        let owned_create_after_release =
-            facade.create_actor_owned(&db.pool, &producer, owned_input, deadline()).await?;
+        let default_released_counts = root_counts(&db.pool, verified.repo).await?;
+        let default_released_usage = repo_usage(&db.pool, verified.repo).await?;
+        let default_release_replay = facade.release(&db.pool, &actor, default_release, deadline()).await?;
         ensure!(
-            owned_create_after_release.replayed() && owned_create_after_release.root_id() == owned_root_id,
+            default_release_replay.replayed()
+                && default_release_replay.root_id() == default_root_id
+                && default_release_replay.request_digest() == default_released.request_digest()
+                && default_release_replay.created_at_unix_micros()
+                    == default_released.created_at_unix_micros(),
+            "default release replay did not return the same terminal"
+        );
+        ensure!(
+            root_counts(&db.pool, verified.repo).await? == default_released_counts
+                && repo_usage(&db.pool, verified.repo).await? == default_released_usage,
+            "default release replay charged root quota or usage"
+        );
+        let default_released_record = facade
+            .metadata(&db.pool, &actor, default_read_input.clone(), deadline())
+            .await?
+            .ok_or_else(|| anyhow!("default released root metadata missing"))?;
+        ensure!(
+            default_released_record.owner_id() == producer.id
+                && default_released_record.state() == "released",
+            "default released metadata did not retain producer owner/state"
+        );
+
+        // Explicit actor-owned release works on its actor's root.
+        let actor_released =
+            facade.release_actor_owned(&db.pool, &producer, actor_release.clone(), deadline()).await?;
+        ensure!(
+            actor_released.state() == "released"
+                && actor_released.root_id() == actor_root_id
+                && actor_released.owner_id() == producer.id,
+            "actor-owned root release state/owner differs"
+        );
+        let actor_released_counts = root_counts(&db.pool, verified.repo).await?;
+        let actor_released_usage = repo_usage(&db.pool, verified.repo).await?;
+        let actor_release_replay =
+            facade.release_actor_owned(&db.pool, &producer, actor_release, deadline()).await?;
+        ensure!(
+            actor_release_replay.replayed()
+                && actor_release_replay.root_id() == actor_root_id
+                && actor_release_replay.request_digest() == actor_released.request_digest()
+                && actor_release_replay.created_at_unix_micros()
+                    == actor_released.created_at_unix_micros(),
+            "actor-owned release replay did not return the same terminal"
+        );
+        let actor_create_after_release =
+            facade.create_actor_owned(&db.pool, &producer, actor_input, deadline()).await?;
+        ensure!(
+            actor_create_after_release.replayed() && actor_create_after_release.root_id() == actor_root_id,
             "actor-owned create replay after root release differs"
         );
         ensure!(
-            root_counts(&db.pool, verified.repo).await? == owned_released_counts
-                && repo_usage(&db.pool, verified.repo).await? == owned_released_usage,
+            root_counts(&db.pool, verified.repo).await? == actor_released_counts
+                && repo_usage(&db.pool, verified.repo).await? == actor_released_usage,
             "actor-owned release/create replay charged root quota or usage"
         );
-        let owned_released_record = facade
-            .metadata_actor_owned(&db.pool, &producer, owned_read_input.clone(), deadline())
+        let actor_released_record = facade
+            .metadata_actor_owned(&db.pool, &producer, actor_read_input.clone(), deadline())
             .await?
             .ok_or_else(|| anyhow!("actor-owned released root metadata missing"))?;
-        ensure!(owned_released_record.state() == "released", "actor-owned released state differs");
+        ensure!(
+            actor_released_record.owner_id() == producer.id && actor_released_record.state() == "released",
+            "actor-owned released state/owner differs"
+        );
 
         // Admin role loss is a real RBAC refusal; no ownership fallback.
         let revoked_counts = root_counts(&db.pool, verified.repo).await?;
         let revoked_usage = repo_usage(&db.pool, verified.repo).await?;
         set_collaborator_role(&db.pool, verified.repo, producer.id, "write").await?;
-        match facade.metadata_actor_owned(&db.pool, &producer, owned_read_input.clone(), deadline()).await {
+        match facade.metadata_actor_owned(&db.pool, &producer, actor_read_input.clone(), deadline()).await {
             Err(error) if error.0 == StatusCode::FORBIDDEN => {}
             Err(error) => return Err(anyhow!("role-revoked root metadata returned {} {}", error.0, error.1)),
             Ok(_) => return Err(anyhow!("role-revoked root metadata unexpectedly returned")),
         }
-        match facade.materialize_actor_owned(&db.pool, &producer, owned_read_input, deadline()).await {
+        match facade.materialize_actor_owned(&db.pool, &producer, actor_read_input, deadline()).await {
             Err(error) if error.0 == StatusCode::FORBIDDEN => {}
             Err(error) => return Err(anyhow!("role-revoked root materialize returned {} {}", error.0, error.1)),
             Ok(_) => return Err(anyhow!("role-revoked root materialize unexpectedly returned")),
