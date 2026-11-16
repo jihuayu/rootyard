@@ -614,4 +614,30 @@ a configurable end-to-end revocation bound via
   scope during both `git clone --mirror` and origin LFS fetches and aborts
   without publishing partial snapshots or permitting origin fallback bypass.
 
+## Live multi-mirror and multi-controller HA qualification
+
+Multi-daemon deployments couple live `rootyard serve` controllers,
+`rootyard worker`, and multiple `rootyard serve-mirror` daemons over shared
+PostgreSQL 17 state:
+
+- **Typed mirror identity & continuous keepalive**: `mirror-auto-fetch` parses
+  `ROOTYARD_CI_MIRROR_ID` / explicit `mirror_id` as a `UUID` before upserting
+  `ci_mirror_nodes` (`publish_ready_oid`), starts a periodic background keepalive
+  (`8`s interval, inside `MIRROR_HEARTBEAT_TTL_SECS = 30`) so healthy mirrors
+  stay `alive=true` across long jobs, and `GET /api/repos/{owner}/{name}/ci-mirrors`
+  decodes the PostgreSQL `UUID` column directly without conversion panics.
+- **Parallel prewarm fanout**: `trigger_coalesced_prewarm` dispatches bounded
+  coalesced `mirror-auto-fetch` requests across up to 8 healthy unready
+  allowlisted origins in parallel (`JoinSet`), keeping `ROOTYARD_CI_MIRROR_SOURCE_TOKEN`
+  isolated from primary-issued prewarm calls.
+- **Qualification harness & workflow**: `tests/ci_mirror_ha_qualification.py`
+  exercises live multi-controller/multi-mirror checkout (Scenario A), dual
+  `SIGKILL` of mirror #1 and controller #1 with `worker`/`reconcile`/failover
+  and `409` stale attempt fencing (Scenario B), and all-mirrors-down
+  simultaneous origin-fallback bursts covering all 5 `X-Rootyard-CI-State`
+  outcomes and leak checks (Scenario C) on single-host loopback PG 17 (not a
+  multi-host WAN/power-loss test). Enforced statically by
+  `tests/test_ci_mirror_ha_contracts.py` and in CI by
+  `.github/workflows/ci-mirror-ha.yml`.
+
 

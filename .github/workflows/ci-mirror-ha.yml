@@ -1,0 +1,156 @@
+name: CI Mirror & Multi-Controller HA Qualification (#34)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/ci-mirror-ha.yml'
+      - 'src/mirror.rs'
+      - 'src/mirror/**'
+      - 'src/webhooks.rs'
+      - 'src/webhooks/**'
+      - 'src/ci_checkouts.rs'
+      - 'src/ci_checkouts/**'
+      - 'src/ci_pins.rs'
+      - 'src/ci_pins/**'
+      - 'src/git_http.rs'
+      - 'src/git_http/**'
+      - 'tests/ci_mirror_ha_qualification.py'
+      - 'tests/test_ci_mirror_ha_contracts.py'
+      - 'tests/ci_runs_regressions.py'
+      - 'tests/ci_mirror.py'
+      - 'tests/webhooks.py'
+      - 'tests/pulls.py'
+      - 'tests/forge.py'
+      - 'tests/e2e.py'
+      - 'docs/ci-mirror.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'scripts/install_ci_cargo_fork.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-mirror-ha-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-mirror-ha:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_PASSWORD: rootyard-ci-only
+          POSTGRES_DB: rootyard_ci_mirror_ha
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_ci_mirror_ha"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard:rootyard-ci-only@127.0.0.1:55432/rootyard_ci_mirror_ha
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install native CI toolchain (postgresql-client-17, Git 2.43, LFS)
+        timeout-minutes: 20
+        run: |
+          scripts/install_ci_native_tools.sh install \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/ci-mirror-ha/native-tools.json
+      - name: Verify native CI tool profile
+        timeout-minutes: 5
+        run: |
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
+          scripts/install_ci_native_tools.sh preflight \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/ci-mirror-ha/native-tools.json
+      - name: Install the pinned Rust 1.99.1 toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/ci-mirror-ha/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-mirror-ha
+          workspaces: ". -> target"
+      - name: Verify formatting, design docs, and HA contracts
+        run: |
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest tests.test_ci_mirror_ha_contracts tests.test_webhooks tests.test_ci_mirror tests.test_ci_cargo_fork_workflows
+      - name: Clippy and mirror/webhooks unit tests
+        run: |
+          cargo clippy --locked --lib --bin rootyard -- -D warnings
+          cargo test --locked --lib mirror::
+          cargo test --locked --lib webhooks::
+      - name: Build sealed native rootyard binary
+        timeout-minutes: 15
+        run: |
+          mkdir -p test-results/ci-mirror-ha
+          python3 scripts/build_native.py \
+            --strip-debuginfo \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            --output test-results/ci-mirror-ha/rootyard
+          echo "ROOTYARD_BIN=$GITHUB_WORKSPACE/test-results/ci-mirror-ha/rootyard" >> "$GITHUB_ENV"
+      - name: Run live multi-mirror and multi-controller HA qualification
+        timeout-minutes: 15
+        run: |
+          python3 tests/ci_mirror_ha_qualification.py \
+            --binary "$ROOTYARD_BIN" \
+            --report test-results/ci-mirror-ha/ha-qualification.json
+      - name: Run CI run scheduling and multi-mirror regressions
+        timeout-minutes: 10
+        run: |
+          python3 tests/ci_runs_regressions.py \
+            --binary "$ROOTYARD_BIN" \
+            --report test-results/ci-mirror-ha/ci-runs-regressions.json
+      - name: Run exact-commit CI mirror E2E suite
+        timeout-minutes: 10
+        run: |
+          python3 tests/ci_mirror.py \
+            --binary "$ROOTYARD_BIN" \
+            --report test-results/ci-mirror-ha/ci-mirror.json
+      - name: Upload CI Mirror HA receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-mirror-ha-receipts
+          path: test-results/ci-mirror-ha/*.json
+          if-no-files-found: warn
