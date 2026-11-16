@@ -611,6 +611,11 @@ async fn rotate_vault_kms_key_with_options(
     let mut envelopes = Vec::with_capacity(packs.len());
     let mut rewrapped_this_run = 0usize;
     for pack in &packs {
+        let observed = vault.latest_version().await?;
+        ensure!(
+            observed == cp.expected_version(),
+            "unexpected concurrent Vault Transit key version during rotation; refusing to continue"
+        );
         let on_disk = envelope_file_path(&config.root, repo, pack.id);
         let existing = if on_disk.is_file() {
             Some(read_and_verify_envelope_file(&config.root, repo, pack.id)?)
@@ -690,6 +695,10 @@ async fn rotate_vault_kms_key_with_options(
         persist_checkpoint(&c, &kms_dir, &cp).await?;
         envelopes.push(updated);
     }
+    ensure!(
+        vault.latest_version().await? == cp.expected_version(),
+        "unexpected concurrent Vault Transit key version before completion; refusing to complete"
+    );
     cp.state = "COMPLETED".to_owned();
     cp.reconcile_stage = KmsReconcileStage::TargetObserved;
     cp.failed_pack_id = None;
