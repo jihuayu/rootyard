@@ -7,7 +7,9 @@ import hashlib
 import http.client
 import json
 from pathlib import Path
+import socket
 import sys
+import time
 import traceback
 import urllib.error
 import urllib.request
@@ -430,6 +432,92 @@ class NamespaceOnlineHarness(Harness):
         assert reader_done["state"] == "complete"
         return {"partial_reader_visible": True, "failpoint_exit_79": True, "recover_complete": True}
 
+    def stalled_upload_body_releases_slot_and_temp_files(self):
+        vid = self.view["id"]
+        tmp_dir = self.root / "data" / "workspace-service" / "views" / "tmp"
+        saved = {key: self.env.get(key) for key in ("ROOTYARD_GIT_TIMEOUT_SECONDS", "ROOTYARD_MAX_CONCURRENT_GIT")}
+        self.stop()
+        self.env.update(ROOTYARD_GIT_TIMEOUT_SECONDS="3", ROOTYARD_MAX_CONCURRENT_GIT="1")
+        self.start()
+        try:
+            partial_body = self.pkt_line(f"want {self.view['projected_oid']}\n".encode())
+            wire_req = (
+                f"POST /git/views/{vid}.git/git-upload-pack HTTP/1.1\r\n"
+                f"Host: localhost\r\n"
+                f"Authorization: Bearer {self.alice['token']}\r\n"
+                f"Content-Type: application/x-git-upload-pack-request\r\n"
+                f"Content-Length: 4096\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode() + partial_body
+
+            # 1. Stalled request holds the sole git_slots permit while spooling, then times out boundedly (504).
+            with socket.create_connection(("127.0.0.1", self.port), timeout=10) as stalled:
+                started = time.monotonic()
+                stalled.sendall(wire_req)
+                saw_503 = False
+                while time.monotonic() - started < 2.0:
+                    st, _, _ = self.http(f"/git/views/{vid}.git/info/refs?service=git-upload-pack", token=self.alice)
+                    if st == 503:
+                        saw_503 = True
+                        break
+                    time.sleep(0.05)
+                assert saw_503, "stalled upload body did not occupy git_slots before timeout"
+
+                stalled.settimeout(10)
+                raw = bytearray()
+                while True:
+                    chunk = stalled.recv(4096)
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                elapsed = time.monotonic() - started
+                assert b" 504 " in raw, raw[:300]
+                assert elapsed < 9.0, f"stalled upload took {elapsed:.2f}s"
+
+            leftover = [p.name for p in tmp_dir.glob("*")] if tmp_dir.exists() else []
+            assert not leftover, f"temp upload files survived timeout: {leftover}"
+            assert self.http(f"/git/views/{vid}.git/info/refs?service=git-upload-pack", token=self.alice)[0] == 200
+
+            # 2. Client disconnect mid-upload releases temp file and permit promptly, allowing subsequent clone.
+            sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+            try:
+                started = time.monotonic()
+                sock.sendall(wire_req)
+                saw_503_cancel = False
+                while time.monotonic() - started < 2.0:
+                    st, _, _ = self.http(f"/git/views/{vid}.git/info/refs?service=git-upload-pack", token=self.alice)
+                    if st == 503:
+                        saw_503_cancel = True
+                        break
+                    time.sleep(0.05)
+                assert saw_503_cancel, "cancelled upload request did not enter slot phase"
+            finally:
+                sock.close()
+
+            deadline = time.monotonic() + 3.0
+            recovered_200 = False
+            while time.monotonic() < deadline:
+                if self.http(f"/git/views/{vid}.git/info/refs?service=git-upload-pack", token=self.alice)[0] == 200:
+                    recovered_200 = True
+                    break
+                time.sleep(0.05)
+            assert recovered_200, "git_slots stayed blocked after stalled upload closed"
+            leftover = [p.name for p in tmp_dir.glob("*")] if tmp_dir.exists() else []
+            assert not leftover, f"temp upload files survived disconnect: {leftover}"
+
+            verify_clone = self.root / "view-clone-after-stall"
+            self.git("clone", f"{self.base}/git/views/{vid}.git", str(verify_clone), token=self.alice)
+            assert (verify_clone / "lib.rs").read_text() == "pub fn v() -> i32 { 7 }\n"
+        finally:
+            self.stop()
+            for key, value in saved.items():
+                if value is None:
+                    self.env.pop(key, None)
+                else:
+                    self.env[key] = value
+            self.start()
+        return {"stalled_timeout_504": True, "disconnect_cleanup": True, "recovery_clone_ok": True}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -452,6 +540,7 @@ def main():
             "fine_grained_token_scopes_and_repo_availability",
             "reverse_proposal_and_concurrent_source_conflicts",
             "crash_recovery_partial_visibility_and_complete_integration",
+            "stalled_upload_body_releases_slot_and_temp_files",
         ):
             harness.case(name, getattr(harness, name))
         passed = True

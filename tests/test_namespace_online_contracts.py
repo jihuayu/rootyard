@@ -74,6 +74,8 @@ class NamespaceOnlineContractsTest(unittest.TestCase):
         self.assertIn("RepoAction::ContentsRead", views_txt)
         self.assertIn("RepoAction::ContentsRead", git_http_txt)
         self.assertIn("verify_active", git_http_txt)
+        self.assertIn("run_bounded(", git_http_txt)
+        self.assertIn("spool_body_to_temp(", git_http_txt)
         self.assertIn("service=git-receive-pack", git_http_txt)
         self.assertIn("StatusCode::FORBIDDEN", git_http_txt)
         self.assertIn("RepoAction::ContentsWrite", changesets_txt)
@@ -112,6 +114,7 @@ class NamespaceOnlineContractsTest(unittest.TestCase):
         e2e_txt = (ROOT / "tests/namespace_online_workflows.py").read_text(encoding="utf-8")
         self.assertIn("ROOTYARD_CHANGESET_KILL_AFTER_STEP", e2e_txt)
         self.assertIn("/git/views/", e2e_txt)
+        self.assertIn("stalled_upload_body_releases_slot_and_temp_files", e2e_txt)
 
 
 if __name__ == "__main__":

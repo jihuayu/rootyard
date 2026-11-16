@@ -122,58 +122,78 @@ fn create_temp_request_file(root: &FsPath, id: Uuid) -> Result<(std::fs::File, T
     Ok((file, TempFileGuard(Some(path))))
 }
 
-async fn spool_upload_body(
-    state: &AppState,
+fn remaining_timeout(deadline: tokio::time::Instant) -> Result<std::time::Duration, Error> {
+    deadline.checked_duration_since(tokio::time::Instant::now()).filter(|d| !d.is_zero()).ok_or_else(Error::timeout)
+}
+
+async fn run_bounded<T, Fut>(deadline: tokio::time::Instant, fut: Fut) -> Result<T, Error>
+where
+    Fut: std::future::Future<Output = Result<T, Error>>,
+{
+    tokio::time::timeout_at(deadline, fut).await.map_err(|_| Error::timeout())?
+}
+
+async fn spool_body_to_temp(
+    root: &FsPath,
     id: Uuid,
     body: Body,
     gzipped: bool,
     max_bytes: u64,
+    deadline: tokio::time::Instant,
 ) -> Result<(std::fs::File, TempFileGuard), Error> {
-    let (std_file, guard) = create_temp_request_file(&views::projection_root(state), id)?;
-    let mut file = tokio::fs::File::from_std(std_file);
-    let mut wire_bytes = 0u64;
-    let stream = body.into_data_stream().map(move |chunk| {
-        let chunk = chunk.map_err(io::Error::other)?;
-        wire_bytes = wire_bytes.saturating_add(chunk.len() as u64);
-        if wire_bytes > max_bytes {
-            return Err(io::Error::new(io::ErrorKind::FileTooLarge, "request wire size limit exceeded"));
-        }
-        Ok(chunk)
-    });
-    let reader = StreamReader::new(stream);
-    let mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = if gzipped {
-        let mut decoder = GzipDecoder::new(BufReader::new(reader));
-        decoder.multiple_members(true);
-        Box::pin(decoder)
-    } else {
-        Box::pin(reader)
-    };
-    let mut decoded = 0u64;
-    let mut buf = [0u8; 32 * 1024];
-    loop {
-        let n = reader.read(&mut buf).await.map_err(|err| {
-            if err.kind() == io::ErrorKind::FileTooLarge {
-                Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded")
-            } else {
-                Error::bad_request()
+    let (std_file, guard) = create_temp_request_file(root, id)?;
+    let read_result = tokio::time::timeout_at(deadline, async {
+        let mut file = tokio::fs::File::from_std(std_file);
+        let mut wire_bytes = 0u64;
+        let stream = body.into_data_stream().map(move |chunk| {
+            let chunk = chunk.map_err(io::Error::other)?;
+            wire_bytes = wire_bytes.saturating_add(chunk.len() as u64);
+            if wire_bytes > max_bytes {
+                return Err(io::Error::new(io::ErrorKind::FileTooLarge, "request wire size limit exceeded"));
             }
-        })?;
-        if n == 0 {
-            break;
+            Ok(chunk)
+        });
+        let reader = StreamReader::new(stream);
+        let mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = if gzipped {
+            let mut decoder = GzipDecoder::new(BufReader::new(reader));
+            decoder.multiple_members(true);
+            Box::pin(decoder)
+        } else {
+            Box::pin(reader)
+        };
+        let mut decoded = 0u64;
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            let n = reader.read(&mut buf).await.map_err(|err| {
+                if err.kind() == io::ErrorKind::FileTooLarge {
+                    Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded")
+                } else {
+                    Error::bad_request()
+                }
+            })?;
+            if n == 0 {
+                break;
+            }
+            decoded = decoded.saturating_add(n as u64);
+            if decoded > max_bytes {
+                return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
+            }
+            file.write_all(&buf[..n]).await.map_err(Error::internal)?;
         }
-        decoded = decoded.saturating_add(n as u64);
-        if decoded > max_bytes {
-            return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
+        if decoded == 0 {
+            return Err(Error::bad_request());
         }
-        file.write_all(&buf[..n]).await.map_err(Error::internal)?;
+        file.flush().await.map_err(Error::internal)?;
+        let mut std_file = file.into_std().await;
+        std_file.seek(SeekFrom::Start(0)).map_err(Error::internal)?;
+        Ok(std_file)
+    })
+    .await;
+    match read_result {
+        Ok(Ok(std_file)) => Ok((std_file, guard)),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(Error::timeout()),
     }
-    if decoded == 0 {
-        return Err(Error::bad_request());
-    }
-    file.flush().await.map_err(Error::internal)?;
-    let mut std_file = file.into_std().await;
-    std_file.seek(SeekFrom::Start(0)).map_err(Error::internal)?;
-    Ok((std_file, guard))
 }
 
 pub async fn info_refs(
@@ -201,24 +221,34 @@ pub async fn info_refs(
         .try_acquire_owned()
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let deadline = tokio::time::Instant::now() + state.config.git_timeout;
-    let source_lease = read_leases::shared(&state.pool, view.repository_id, deadline).await?;
-    let _local = tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(view.repository_id))
-        .await
-        .map_err(|_| Error::timeout())?;
-    source_lease.ensure_active()?;
-    let _ = authorize_view_git_read(&state, &actor, id).await?;
-    let mut cmd = state.storage.git(&state.config);
-    cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
-    if let Some(proto) = protocol.as_deref() {
-        cmd.env("GIT_PROTOCOL", proto);
-    }
-    cmd.args(["upload-pack", "--stateless-rpc", "--advertise-refs"]).arg(&git_dir);
-    let advertised = source_lease
-        .guard(crate::git_http::collect_git_output(cmd, ADVERTISE_LIMIT, state.config.git_timeout))
-        .await?
-        .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "projected Git view unavailable"))?;
-    source_lease.ensure_active()?;
-    let _ = authorize_view_git_read(&state, &actor, id).await?;
+    let advertised = run_bounded(deadline, async {
+        let source_lease = read_leases::shared(&state.pool, view.repository_id, deadline).await?;
+        let _local = tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(view.repository_id))
+            .await
+            .map_err(|_| Error::timeout())?;
+        source_lease.ensure_active()?;
+        let _ = authorize_view_git_read(&state, &actor, id).await?;
+        let mut cmd = state.storage.git(&state.config);
+        cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
+        if let Some(proto) = protocol.as_deref() {
+            cmd.env("GIT_PROTOCOL", proto);
+        }
+        cmd.args(["upload-pack", "--stateless-rpc", "--advertise-refs"]).arg(&git_dir);
+        let advertised = source_lease
+            .guard(crate::git_http::collect_git_output(cmd, ADVERTISE_LIMIT, remaining_timeout(deadline)?))
+            .await?
+            .map_err(|_| {
+                if tokio::time::Instant::now() >= deadline {
+                    Error::timeout()
+                } else {
+                    Error(StatusCode::SERVICE_UNAVAILABLE, "projected Git view unavailable")
+                }
+            })?;
+        source_lease.ensure_active()?;
+        let _ = authorize_view_git_read(&state, &actor, id).await?;
+        Ok(advertised)
+    })
+    .await?;
     let mut body = service_prefix("git-upload-pack");
     body.extend_from_slice(&advertised);
     Ok((
@@ -248,30 +278,47 @@ pub async fn upload_pack(
         .clone()
         .try_acquire_owned()
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
-    let (req_file, _tmp_guard) = spool_upload_body(&state, id, body, gzipped, max_req).await?;
     let deadline = tokio::time::Instant::now() + state.config.git_timeout;
-    let source_lease = read_leases::shared(&state.pool, view.repository_id, deadline).await?;
-    let _local = tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(view.repository_id))
-        .await
-        .map_err(|_| Error::timeout())?;
-    source_lease.ensure_active()?;
-    let _ = authorize_view_git_read(&state, &actor, id).await?;
-    let mut cmd = state.storage.git(&state.config);
-    cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
-    if let Some(proto) = protocol.as_deref() {
-        cmd.env("GIT_PROTOCOL", proto);
-    }
-    cmd.args(["upload-pack", "--stateless-rpc"]).arg(&git_dir);
-    let max_out = usize::try_from(state.config.max_output_bytes).unwrap_or(UPLOAD_RESULT_CAP).min(UPLOAD_RESULT_CAP);
-    let pack = source_lease
-        .guard(crate::git_http::collect_git_output_input(cmd, max_out, state.config.git_timeout, Stdio::from(req_file)))
-        .await?
-        .map_err(|_| Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request"))?;
-    if pack.get(4..).is_some_and(|rest| rest.starts_with(b"ERR ")) {
-        return Err(Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request"));
-    }
-    source_lease.ensure_active()?;
-    let _ = authorize_view_git_read(&state, &actor, id).await?;
+    let projection_root = views::projection_root(&state);
+    let pack = run_bounded(deadline, async {
+        let (req_file, _tmp_guard) = spool_body_to_temp(&projection_root, id, body, gzipped, max_req, deadline).await?;
+        let source_lease = read_leases::shared(&state.pool, view.repository_id, deadline).await?;
+        let _local = tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(view.repository_id))
+            .await
+            .map_err(|_| Error::timeout())?;
+        source_lease.ensure_active()?;
+        let _ = authorize_view_git_read(&state, &actor, id).await?;
+        let mut cmd = state.storage.git(&state.config);
+        cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
+        if let Some(proto) = protocol.as_deref() {
+            cmd.env("GIT_PROTOCOL", proto);
+        }
+        cmd.args(["upload-pack", "--stateless-rpc"]).arg(&git_dir);
+        let max_out =
+            usize::try_from(state.config.max_output_bytes).unwrap_or(UPLOAD_RESULT_CAP).min(UPLOAD_RESULT_CAP);
+        let pack = source_lease
+            .guard(crate::git_http::collect_git_output_input(
+                cmd,
+                max_out,
+                remaining_timeout(deadline)?,
+                Stdio::from(req_file),
+            ))
+            .await?
+            .map_err(|_| {
+                if tokio::time::Instant::now() >= deadline {
+                    Error::timeout()
+                } else {
+                    Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request")
+                }
+            })?;
+        if pack.get(4..).is_some_and(|rest| rest.starts_with(b"ERR ")) {
+            return Err(Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request"));
+        }
+        source_lease.ensure_active()?;
+        let _ = authorize_view_git_read(&state, &actor, id).await?;
+        Ok(pack)
+    })
+    .await?;
     Ok((
         StatusCode::OK,
         [
@@ -327,5 +374,40 @@ mod tests {
         headers.insert(header::CONTENT_TYPE, "application/x-git-upload-pack-request".parse().unwrap());
         headers.insert(header::CONTENT_LENGTH, "4096".parse().unwrap());
         assert_eq!(validate_upload_headers(&headers, 1024).unwrap_err().0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn stalled_and_cancelled_upload_bodies_timeout_and_remove_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4();
+        let stalled = Body::from_stream(futures_util::stream::pending::<Result<bytes::Bytes, io::Error>>());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(80);
+        let err = spool_body_to_temp(tmp.path(), id, stalled, false, 1024, deadline).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(fs::read_dir(tmp.path().join("tmp")).unwrap().count(), 0);
+        assert_eq!(remaining_timeout(deadline).unwrap_err().0, StatusCode::GATEWAY_TIMEOUT);
+
+        let partial = futures_util::stream::iter([Ok::<_, io::Error>(bytes::Bytes::from_static(b"0009want "))])
+            .chain(futures_util::stream::pending());
+        let cancelled = Body::from_stream(partial);
+        let long_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        tokio::select! {
+            _ = spool_body_to_temp(tmp.path(), id, cancelled, false, 1024, long_deadline) => {
+                panic!("stalled partial body unexpectedly finished");
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(40)) => {}
+        }
+        assert_eq!(fs::read_dir(tmp.path().join("tmp")).unwrap().count(), 0);
+
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let slot_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+        let slot_res: Result<(), Error> = run_bounded(slot_deadline, async move {
+            let _held = permit;
+            std::future::pending::<Result<(), Error>>().await
+        })
+        .await;
+        assert_eq!(slot_res.unwrap_err().0, StatusCode::GATEWAY_TIMEOUT);
+        assert!(slots.clone().try_acquire_owned().is_ok());
     }
 }
