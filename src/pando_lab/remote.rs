@@ -84,11 +84,18 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
         ensure!(expected == pack_bytes, "expected pack byte length mismatch");
     }
     let suite = opts.cipher_suite.as_deref().unwrap_or(lifecycle::DEFAULT_CIPHER_SUITE);
-    let kms_dir = lifecycle::provider::resolve_kms_dir(&config.root, repo);
-    let provider = lifecycle::provider::PandoKmsProvider::open_or_init(&kms_dir, lifecycle::DEFAULT_KMS_KEY_ID)?;
-    let active_key = provider.active_entry()?;
+    let provider = lifecycle::provider_selection::for_write(&config.root, repo)?;
     let plain_bytes = fs::read(&pack).await?;
-    let sealed = lifecycle::crypto::seal_pack_bytes(&provider, repo, pack_id, &idx_sha256, suite, active_key.key_version, &plain_bytes).await?;
+    let sealed = lifecycle::crypto::seal_pack_bytes(
+        provider.provider(),
+        repo,
+        pack_id,
+        &idx_sha256,
+        suite,
+        provider.key_version_hint(),
+        &plain_bytes,
+    )
+    .await?;
     let env = lifecycle::build_authenticated_envelope_record(
         repo,
         &Pack { id: pack_id, pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone() },

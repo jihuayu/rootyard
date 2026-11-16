@@ -80,8 +80,47 @@ impl PandoWrappedDek {
     pub fn provider_kind(&self) -> &'static str {
         match self {
             Self::Local(_) => super::provider::PROVIDER_KIND_LOCAL,
-            Self::Versioned { provider_kind, .. } => provider_kind.as_str(),
+            Self::Versioned { provider_kind, .. } => (*provider_kind).as_str(),
         }
+    }
+
+    pub fn key_version(&self) -> Option<i32> {
+        match self {
+            Self::Local(_) => None,
+            Self::Versioned { key_version, .. } => Some(*key_version),
+        }
+    }
+
+    pub(super) fn validate_binding(
+        &self,
+        outer_provider_kind: &str,
+        outer_key_id: &str,
+        outer_key_version: i32,
+    ) -> Result<(), KeyProviderError> {
+        match self {
+            Self::Local(wrapped) => {
+                if outer_provider_kind != super::provider::PROVIDER_KIND_LOCAL
+                    || outer_key_id != wrapped.key_id().as_str()
+                {
+                    return Err(KeyProviderError::InvalidWrappedKey(
+                        "local wrapped DEK does not match outer envelope identity",
+                    ));
+                }
+            }
+            Self::Versioned { provider_kind, key_id, key_version, payload } => {
+                if *provider_kind != PandoProviderKind::VaultTransit
+                    || outer_provider_kind != (*provider_kind).as_str()
+                    || outer_key_id != key_id.as_str()
+                    || outer_key_version != *key_version
+                    || parse_vault_ciphertext_version(payload) != Some(*key_version)
+                {
+                    return Err(KeyProviderError::InvalidWrappedKey(
+                        "versioned wrapped DEK does not match outer envelope identity",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn from_json(bytes: &[u8]) -> Result<Self, KeyProviderError> {
@@ -222,6 +261,168 @@ mod tests {
         assert!(matches!(decoded, PandoWrappedDek::Local(_)));
         assert_eq!(decoded.to_json().unwrap(), LEGACY_LOCAL);
         assert_eq!(sample_mac(LEGACY_LOCAL), LEGACY_MAC);
+    }
+
+    #[test]
+    fn provider_binding_checks_outer_identity_and_vault_ciphertext_version() {
+        let versioned = PandoWrappedDek::Versioned {
+            provider_kind: PandoProviderKind::VaultTransit,
+            key_id: "pando-vault-key".to_owned(),
+            key_version: 3,
+            payload: b"vault:v3:abcdef".to_vec(),
+        };
+        assert!(versioned.validate_binding("vault-transit", "pando-vault-key", 3).is_ok());
+        assert!(versioned.validate_binding("local-file-key-provider", "pando-vault-key", 3).is_err());
+        assert!(versioned.validate_binding("vault-transit", "other-key", 3).is_err());
+        assert!(versioned.validate_binding("vault-transit", "pando-vault-key", 2).is_err());
+        let wrong_ciphertext_version = PandoWrappedDek::Versioned {
+            provider_kind: PandoProviderKind::VaultTransit,
+            key_id: "pando-vault-key".to_owned(),
+            key_version: 3,
+            payload: b"vault:v2:abcdef".to_vec(),
+        };
+        assert!(wrong_ciphertext_version.validate_binding("vault-transit", "pando-vault-key", 3).is_err());
+
+        let local = PandoWrappedDek::from_json(LEGACY_LOCAL.as_bytes()).unwrap();
+        assert!(local.validate_binding("local-file-key-provider", "kms-local-default-v1", 1).is_ok());
+        assert!(local.validate_binding("vault-transit", "kms-local-default-v1", 1).is_err());
+        assert!(local.validate_binding("local-file-key-provider", "other-key", 1).is_err());
+    }
+
+    #[test]
+    fn authenticated_envelope_write_binds_provider_identity() {
+        use super::super::Pack;
+        use super::super::crypto::{AUTHENTICATED_ENVELOPE_MODE, SealedPackArtifact};
+        use super::super::envelopes::build_authenticated_envelope_record;
+
+        let repo = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let pack = Pack {
+            id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
+            pack_sha256: "11".repeat(32),
+            idx_sha256: "22".repeat(32),
+        };
+        let wrapped = PandoWrappedDek::Versioned {
+            provider_kind: PandoProviderKind::VaultTransit,
+            key_id: "pando-vault-key".to_owned(),
+            key_version: 3,
+            payload: b"vault:v3:abcdef".to_vec(),
+        }
+        .to_json()
+        .unwrap();
+        let sealed = SealedPackArtifact {
+            ciphertext: Vec::new(),
+            ciphertext_sha256: "33".repeat(32),
+            ciphertext_bytes: 0,
+            plaintext_sha256: pack.pack_sha256.clone(),
+            plaintext_bytes: 0,
+            envelope_id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap(),
+            nonce_prefix_hex: "01020304".to_owned(),
+            wrapped_key_json: wrapped,
+            key_id: "pando-vault-key".to_owned(),
+            key_version: 3,
+            provider_kind: "vault-transit".to_owned(),
+            cipher_suite: "AES-256-GCM-HMAC-SHA256".to_owned(),
+            encryption_mode: AUTHENTICATED_ENVELOPE_MODE.to_owned(),
+        };
+        let env = build_authenticated_envelope_record(repo, &pack, &sealed, "hot").unwrap();
+        assert_eq!(env.provider_kind, "vault-transit");
+        assert_eq!(env.key_version, 3);
+
+        let mut mismatched = sealed.clone();
+        mismatched.key_version = 2;
+        assert!(build_authenticated_envelope_record(repo, &pack, &mismatched, "hot").is_err());
+        let mut mismatched_kind = sealed.clone();
+        mismatched_kind.provider_kind = "local-file-key-provider".to_owned();
+        assert!(build_authenticated_envelope_record(repo, &pack, &mismatched_kind, "hot").is_err());
+    }
+
+    #[test]
+    fn authenticated_envelope_verification_binds_outer_provider_identity() {
+        use super::super::envelopes::verify_envelope_record;
+        use super::super::{ENVELOPE_SCHEMA, KmsEnvelopeRecord};
+
+        let wrapped = PandoWrappedDek::Versioned {
+            provider_kind: PandoProviderKind::VaultTransit,
+            key_id: "pando-vault-key".to_owned(),
+            key_version: 3,
+            payload: b"vault:v3:abcdef".to_vec(),
+        }
+        .to_json()
+        .unwrap();
+        let mut env = KmsEnvelopeRecord {
+            schema: ENVELOPE_SCHEMA.to_owned(),
+            repo: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            pack_id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
+            key_id: "pando-vault-key".to_owned(),
+            key_version: 3,
+            cipher_suite: "AES-256-GCM-HMAC-SHA256".to_owned(),
+            pack_sha256: "11".repeat(32),
+            idx_sha256: "22".repeat(32),
+            plaintext_sha256: "11".repeat(32),
+            envelope_mac: String::new(),
+            storage_tier: "hot".to_owned(),
+            encryption_mode: "authenticated-envelope-v1".to_owned(),
+            envelope_id: Some(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap()),
+            nonce_prefix: Some("01020304".to_owned()),
+            wrapped_key_json: Some(wrapped.clone()),
+            ciphertext_sha256: Some("33".repeat(32)),
+            ciphertext_bytes: Some(123),
+            provider_kind: "vault-transit".to_owned(),
+        };
+        env.envelope_mac = compute_authenticated_envelope_mac(&EnvelopeMacInputs {
+            encryption_mode: &env.encryption_mode,
+            repo: env.repo,
+            pack_id: env.pack_id,
+            key_id: &env.key_id,
+            key_version: env.key_version,
+            cipher_suite: &env.cipher_suite,
+            pack_sha256: &env.pack_sha256,
+            idx_sha256: &env.idx_sha256,
+            ciphertext_sha256: env.ciphertext_sha256.as_deref().unwrap(),
+            ciphertext_bytes: env.ciphertext_bytes.unwrap(),
+            envelope_id: env.envelope_id.unwrap(),
+            nonce_prefix: env.nonce_prefix.as_deref().unwrap(),
+            wrapped_key_json: &wrapped,
+        });
+        verify_envelope_record(&env).unwrap();
+
+        let mut wrong_version = env.clone();
+        wrong_version.key_version = 2;
+        wrong_version.envelope_mac = compute_authenticated_envelope_mac(&EnvelopeMacInputs {
+            encryption_mode: &wrong_version.encryption_mode,
+            repo: wrong_version.repo,
+            pack_id: wrong_version.pack_id,
+            key_id: &wrong_version.key_id,
+            key_version: wrong_version.key_version,
+            cipher_suite: &wrong_version.cipher_suite,
+            pack_sha256: &wrong_version.pack_sha256,
+            idx_sha256: &wrong_version.idx_sha256,
+            ciphertext_sha256: wrong_version.ciphertext_sha256.as_deref().unwrap(),
+            ciphertext_bytes: wrong_version.ciphertext_bytes.unwrap(),
+            envelope_id: wrong_version.envelope_id.unwrap(),
+            nonce_prefix: wrong_version.nonce_prefix.as_deref().unwrap(),
+            wrapped_key_json: &wrapped,
+        });
+        assert!(verify_envelope_record(&wrong_version).is_err());
+
+        let mut wrong_kind = env.clone();
+        wrong_kind.provider_kind = "local-file-key-provider".to_owned();
+        wrong_kind.envelope_mac = compute_authenticated_envelope_mac(&EnvelopeMacInputs {
+            encryption_mode: &wrong_kind.encryption_mode,
+            repo: wrong_kind.repo,
+            pack_id: wrong_kind.pack_id,
+            key_id: &wrong_kind.key_id,
+            key_version: wrong_kind.key_version,
+            cipher_suite: &wrong_kind.cipher_suite,
+            pack_sha256: &wrong_kind.pack_sha256,
+            idx_sha256: &wrong_kind.idx_sha256,
+            ciphertext_sha256: wrong_kind.ciphertext_sha256.as_deref().unwrap(),
+            ciphertext_bytes: wrong_kind.ciphertext_bytes.unwrap(),
+            envelope_id: wrong_kind.envelope_id.unwrap(),
+            nonce_prefix: wrong_kind.nonce_prefix.as_deref().unwrap(),
+            wrapped_key_json: &wrapped,
+        });
+        assert!(verify_envelope_record(&wrong_kind).is_err());
     }
 
     #[test]

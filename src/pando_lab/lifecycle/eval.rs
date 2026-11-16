@@ -6,7 +6,7 @@ use super::{
     valid_kms_key_id, verify_envelope_record, write_envelope_file,
 };
 use super::super::{Config, Pack, object_store, repack};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::path::Path;
 use tokio_postgres::Client;
 use uuid::Uuid;
@@ -70,6 +70,11 @@ pub(super) async fn evaluate_lifecycle_inner(
     repo: Uuid,
     opts: &LifecycleEvaluateOptions,
 ) -> Result<LifecycleEvaluationReport> {
+    if super::provider_selection::selected_kind()?
+        == super::provider_selection::PandoProviderSelection::VaultTransit
+    {
+        bail!("Pando lifecycle evaluation is local-only in this checkpoint; refusing local KMS mutation");
+    }
     if let Some(m) = opts.max_active_packs {
         ensure!((1..=1000).contains(&m), "max_active_packs must be within 1..=1000");
     }

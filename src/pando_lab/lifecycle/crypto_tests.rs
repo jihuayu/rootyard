@@ -1,4 +1,6 @@
-use super::super::provider::PandoKmsProvider;
+use super::super::data_key::PandoDataKey;
+use super::super::provider::{PandoKeyProvider, PandoKmsProvider};
+use super::super::wrapped_dek::PandoWrappedDek;
 use super::*;
 use rootyard::blob_store::key_provider::{KeyId, KeyProviderCapabilities, KeyProviderError};
 
@@ -37,12 +39,76 @@ impl KeyProvider for PlaintextFallbackProvider {
     }
 }
 
+#[derive(Debug)]
+struct VersionedProvider {
+    key_id: KeyId,
+}
+
+impl PandoKeyProvider for VersionedProvider {
+    fn current_key_id(&self) -> &KeyId {
+        &self.key_id
+    }
+
+    fn capabilities(&self) -> KeyProviderCapabilities {
+        KeyProviderCapabilities {
+            local_envelope: false,
+            rewrap: true,
+            retained_key_versions: true,
+            provider_managed: true,
+            plaintext_fallback: false,
+        }
+    }
+
+    fn wrap_data_key<'a>(
+        &'a self,
+        _data_key: &'a PandoDataKey,
+        _context: &'a WrapContext,
+    ) -> futures_util::future::BoxFuture<'a, std::result::Result<PandoWrappedDek, KeyProviderError>> {
+        Box::pin(async move {
+            Ok(PandoWrappedDek::Versioned {
+                provider_kind: super::super::wrapped_dek::PandoProviderKind::VaultTransit,
+                key_id: "pando-vault-key".to_owned(),
+                key_version: 7,
+                payload: b"vault:v7:abcdef".to_vec(),
+            })
+        })
+    }
+
+    fn unwrap_data_key<'a>(
+        &'a self,
+        _wrapped: &'a PandoWrappedDek,
+        _context: &'a WrapContext,
+    ) -> futures_util::future::BoxFuture<'a, std::result::Result<PandoDataKey, KeyProviderError>> {
+        Box::pin(async { Err(KeyProviderError::KeyRing("test provider cannot unwrap")) })
+    }
+
+    fn rewrap_data_key<'a>(
+        &'a self,
+        _wrapped: &'a PandoWrappedDek,
+        _context: &'a WrapContext,
+    ) -> futures_util::future::BoxFuture<'a, std::result::Result<PandoWrappedDek, KeyProviderError>> {
+        Box::pin(async { Err(KeyProviderError::KeyRing("test provider cannot rewrap")) })
+    }
+}
+
 fn sample_pack_payload() -> (Uuid, Uuid, Vec<u8>, String) {
     let mut plain = b"PACK\x00\x00\x00\x02\x00\x00\x00\x01".to_vec();
     plain.extend_from_slice(b"ROOTYARD_SECRET_BLOB_CONTENT_ISSUE_21:");
     plain.resize(SEALED_CHUNK_BYTES + 1234, 0x5Au8);
     let idx_sha = sha256_hex(b"sample-pack-index");
     (Uuid::new_v4(), Uuid::new_v4(), plain, idx_sha)
+}
+
+#[tokio::test]
+async fn versioned_provider_key_version_overrides_the_caller_hint() {
+    let provider = VersionedProvider { key_id: KeyId::parse("pando-vault-key").unwrap() };
+    let (repo, pack_id, plain, idx_sha) = sample_pack_payload();
+    let sealed = seal_pack_bytes(&provider, repo, pack_id, &idx_sha, "AES-256-GCM-HMAC-SHA256", 1, &plain)
+        .await
+        .unwrap();
+    assert_eq!(sealed.provider_kind, "vault-transit");
+    assert_eq!(sealed.key_id, "pando-vault-key");
+    assert_eq!(sealed.key_version, 7);
 }
 
 #[tokio::test]

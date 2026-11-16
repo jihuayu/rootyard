@@ -296,7 +296,12 @@ pub(crate) async fn put_pack_files_sealed(
     pack_id: Uuid,
     opts: &ObjectStorePutOptions,
     storage_tier: &str,
-) -> Result<(ObjectStorePutReport, CasPackManifest, lifecycle::KmsEnvelopeRecord, lifecycle::provider::KmsKeyPolicy)> {
+) -> Result<(
+    ObjectStorePutReport,
+    CasPackManifest,
+    lifecycle::KmsEnvelopeRecord,
+    Option<lifecycle::provider::KmsKeyPolicy>,
+)> {
     ensure!(valid_bucket_name(&opts.bucket), "invalid bucket '{}'", opts.bucket);
     let suite = opts.cipher_suite.as_deref().unwrap_or(lifecycle::DEFAULT_CIPHER_SUITE);
     let local_dir = local_objects_root.join(repo.to_string());
@@ -310,10 +315,17 @@ pub(crate) async fn put_pack_files_sealed(
     if let Some(exp_len) = opts.expected_pack_bytes { ensure!(exp_len == pack_bytes.len() as u64, "expected pack byte length mismatch"); }
 
     let base_root = infer_base_root(store_root_dir, Some(local_objects_root));
-    let kms_dir = lifecycle::provider::resolve_kms_dir(base_root, repo);
-    let provider = lifecycle::provider::PandoKmsProvider::open_or_init(&kms_dir, lifecycle::DEFAULT_KMS_KEY_ID)?;
-    let active_key = provider.active_entry()?;
-    let sealed = lifecycle::crypto::seal_pack_bytes(&provider, repo, pack_id, &idx_sha256, suite, active_key.key_version, &pack_bytes).await?;
+    let provider = lifecycle::provider_selection::for_write(base_root, repo)?;
+    let sealed = lifecycle::crypto::seal_pack_bytes(
+        provider.provider(),
+        repo,
+        pack_id,
+        &idx_sha256,
+        suite,
+        provider.key_version_hint(),
+        &pack_bytes,
+    )
+    .await?;
 
     let upload_id = Uuid::new_v4();
     let mut chunks_uploaded = 0usize;
@@ -366,7 +378,7 @@ pub(crate) async fn put_pack_files_sealed(
         total_chunks_uploaded: manifest.pack_chunks.len() + manifest.idx_chunks.len(),
         immutable_mode: "0444".to_owned(), status: "published".to_owned(),
     };
-    Ok((report, manifest, env, provider.policy().clone()))
+    Ok((report, manifest, env, provider.into_local_policy()))
 }
 
 pub async fn put_pack_files(
@@ -465,7 +477,9 @@ async fn put_pack_db_inner(config: &Config, repo: Uuid, pack_id: Uuid, opts: &Ob
          ON CONFLICT(repo,pack_id) DO UPDATE SET bucket=EXCLUDED.bucket,manifest_json=EXCLUDED.manifest_json",
         &[&repo, &pack_id, &report.bucket, &report.pack_key, &report.idx_key, &report.manifest_key, &report.pack_sha256, &report.idx_sha256, &(report.pack_bytes as i64), &(report.idx_bytes as i64), &(report.object_count as i64), &(report.chunk_size as i64), &(report.chunk_count as i64), &serde_json::to_value(&manifest)?],
     ).await?;
-    lifecycle::rotation::sync_kms_policy_to_db(&c, repo, &policy).await?;
+    if let Some(policy) = policy {
+        lifecycle::rotation::sync_kms_policy_to_db(&c, repo, &policy).await?;
+    }
     lifecycle::rotation::upsert_envelope_in_db(&c, &env).await?;
     Ok((report, env))
 }

@@ -1,10 +1,10 @@
 use super::{
-    ENVELOPE_SCHEMA, KmsEnvelopeRecord, crypto, provider, valid_cipher_suite,
+    ENVELOPE_SCHEMA, KmsEnvelopeRecord, crypto, valid_cipher_suite,
     valid_encryption_mode, valid_kms_key_id, valid_sha256_hex, valid_storage_tier,
 };
+use super::wrapped_dek::PandoWrappedDek;
 use super::super::{Pack, delta};
 use anyhow::{Context, Result, ensure};
-use rootyard::blob_store::key_provider::WrappedKey;
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -86,6 +86,10 @@ pub fn build_authenticated_envelope_record(
             && sealed.plaintext_sha256 == pack.pack_sha256,
         "invalid authenticated envelope parameters"
     );
+    PandoWrappedDek::from_json(sealed.wrapped_key_json.as_bytes())
+        .map_err(|err| anyhow::anyhow!("invalid wrapped DEK in envelope: {err}"))?
+        .validate_binding(&sealed.provider_kind, &sealed.key_id, sealed.key_version)
+        .map_err(|err| anyhow::anyhow!("wrapped DEK does not match envelope identity: {err}"))?;
     let mac = crypto::compute_authenticated_envelope_mac(&crypto::EnvelopeMacInputs {
         encryption_mode: crypto::AUTHENTICATED_ENVELOPE_MODE,
         repo,
@@ -119,7 +123,7 @@ pub fn build_authenticated_envelope_record(
         wrapped_key_json: Some(sealed.wrapped_key_json.clone()),
         ciphertext_sha256: Some(sealed.ciphertext_sha256.clone()),
         ciphertext_bytes: Some(sealed.ciphertext_bytes),
-        provider_kind: provider::PROVIDER_KIND_LOCAL.to_owned(),
+        provider_kind: sealed.provider_kind.clone(),
     })
 }
 
@@ -135,10 +139,6 @@ pub fn verify_envelope_record(env: &KmsEnvelopeRecord) -> Result<()> {
         "invalid KMS envelope fields"
     );
     if crypto::is_authenticated_mode(&env.encryption_mode) {
-        ensure!(
-            env.provider_kind == provider::PROVIDER_KIND_LOCAL,
-            "unsupported KMS envelope provider_kind"
-        );
         let envelope_id = env.envelope_id.context("missing envelope_id in envelope")?;
         let nonce = env.nonce_prefix.as_deref().context("missing nonce_prefix")?;
         let wrapped = env
@@ -151,8 +151,10 @@ pub fn verify_envelope_record(env: &KmsEnvelopeRecord) -> Result<()> {
             .context("missing ciphertext_sha256")?;
         let cipher_len = env.ciphertext_bytes.context("missing ciphertext_bytes")?;
         ensure!(valid_sha256_hex(cipher_sha), "invalid ciphertext_sha256");
-        WrappedKey::from_json(wrapped.as_bytes())
-            .map_err(|err| anyhow::anyhow!("invalid wrapped DEK in envelope: {err}"))?;
+        PandoWrappedDek::from_json(wrapped.as_bytes())
+            .map_err(|err| anyhow::anyhow!("invalid wrapped DEK in envelope: {err}"))?
+            .validate_binding(&env.provider_kind, &env.key_id, env.key_version)
+            .map_err(|err| anyhow::anyhow!("wrapped DEK does not match envelope identity: {err}"))?;
         let expected = crypto::compute_authenticated_envelope_mac(&crypto::EnvelopeMacInputs {
             encryption_mode: &env.encryption_mode,
             repo: env.repo,

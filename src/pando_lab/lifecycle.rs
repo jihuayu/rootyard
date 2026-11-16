@@ -9,6 +9,7 @@ mod db;
 pub mod envelopes;
 mod eval;
 pub mod provider;
+pub(crate) mod provider_selection;
 pub mod rotation;
 mod vault_provider;
 mod wrapped_dek;

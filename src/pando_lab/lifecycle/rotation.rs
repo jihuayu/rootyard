@@ -51,13 +51,13 @@ pub async fn verify_and_decrypt_pack_bytes(
     env: &KmsEnvelopeRecord,
     cipher_bytes: &[u8],
 ) -> Result<Vec<u8>> {
-    let kms_dir = super::provider::resolve_kms_dir(base_root, repo);
-    let provider = super::provider::PandoKmsProvider::open_existing(&kms_dir)?;
-    verify_with_provider(&provider, repo, pack, env, cipher_bytes).await
+    let provider = super::provider_selection::for_envelope(base_root, repo, &env.provider_kind)?;
+    provider.ensure_key_readable(&env.key_id, env.key_version)?;
+    verify_with_provider(provider.as_key_provider(), repo, pack, env, cipher_bytes).await
 }
 
 async fn verify_with_provider(
-    provider: &super::provider::PandoKmsProvider,
+    provider: &dyn super::provider::PandoKeyProvider,
     repo: Uuid,
     pack: &Pack,
     env: &KmsEnvelopeRecord,
@@ -69,7 +69,6 @@ async fn verify_with_provider(
         pack.id,
         env.encryption_mode
     );
-    provider.ensure_key_readable(&env.key_id, env.key_version)?;
     let exp_cipher_sha = env
         .ciphertext_sha256
         .as_deref()
@@ -119,6 +118,7 @@ pub(super) async fn verify_pack_ciphertext_open(
     let manifest: object_store::CasPackManifest =
         serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
     let cipher_bytes = std::fs::read(s_root.join(&manifest.pack_key))?;
+    provider.ensure_key_readable(&env.key_id, env.key_version)?;
     let _plain = verify_with_provider(provider, repo, pack, env, &cipher_bytes).await?;
     Ok(())
 }
@@ -287,10 +287,29 @@ pub async fn rotate_kms_key_with_options(
     repo: Uuid,
     opts: &KmsRotateOptions,
 ) -> Result<KmsRotationReport> {
+    if super::provider_selection::selected_kind()?
+        == super::provider_selection::PandoProviderSelection::VaultTransit
+    {
+        bail!("Pando Vault Transit rotation is not implemented yet; refusing local-file mutation");
+    }
     let c = config.db().await?;
     let kms_dir = super::provider::resolve_kms_dir(&config.root, repo);
     let s_root = object_store::store_root(config);
     let packs = load_repo_packs(&c, repo).await?;
+    for pack in &packs {
+        let on_disk = envelope_file_path(&config.root, repo, pack.id);
+        let existing = if on_disk.is_file() {
+            Some(read_and_verify_envelope_file(&config.root, repo, pack.id)?)
+        } else {
+            load_envelope_from_db(&c, repo, pack).await?
+        };
+        if let Some(env) = existing {
+            ensure!(
+                env.provider_kind == super::provider::PROVIDER_KIND_LOCAL,
+                "Pando KMS rotation across nonlocal provider kinds is not implemented yet; refusing local-file mutation"
+            );
+        }
+    }
     let (mut cp, _policy) = resolve_rotation_checkpoint(&c, &kms_dir, repo, opts, &packs).await?;
     let provider = super::provider::PandoKmsProvider::open_existing(&kms_dir)?;
 

@@ -82,6 +82,7 @@ pub struct SealedPackArtifact {
     pub wrapped_key_json: String,
     pub key_id: String,
     pub key_version: i32,
+    pub provider_kind: String,
     pub cipher_suite: String,
     pub encryption_mode: String,
 }
@@ -288,6 +289,8 @@ pub async fn seal_pack_bytes<P: PandoKeyProvider + ?Sized>(
     let wrapped_key_json = wrapped
         .to_json()
         .map_err(|err| anyhow::anyhow!("wrapped DEK serialization failed: {err}"))?;
+    let resolved_key_version = wrapped.key_version().unwrap_or(key_version);
+    ensure!(resolved_key_version >= 1, "invalid wrapped DEK key version");
 
     Ok(SealedPackArtifact {
         ciphertext_sha256: sha256_hex(&ciphertext),
@@ -299,7 +302,8 @@ pub async fn seal_pack_bytes<P: PandoKeyProvider + ?Sized>(
         nonce_prefix_hex: hex::encode(nonce_prefix),
         wrapped_key_json,
         key_id: wrapped.key_id().to_owned(),
-        key_version,
+        key_version: resolved_key_version,
+        provider_kind: wrapped.provider_kind().to_owned(),
         cipher_suite: cipher.suite_name().to_owned(),
         encryption_mode: AUTHENTICATED_ENVELOPE_MODE.to_owned(),
     })

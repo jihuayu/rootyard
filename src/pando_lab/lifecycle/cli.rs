@@ -1,5 +1,5 @@
 use super::{
-    DEFAULT_KMS_KEY_ID, db, envelope_file_path, load_repo_packs, provider,
+    DEFAULT_KMS_KEY_ID, db, envelope_file_path, load_repo_packs, provider, provider_selection,
     read_and_verify_envelope_file,
     rotation::{
         KmsRotateOptions, KmsRotationCheckpoint, rotate_kms_key_with_options,
@@ -36,6 +36,9 @@ pub struct KmsStatusReport {
 }
 
 pub async fn verify_repo_encryption(config: &Config, repo: Uuid) -> Result<KmsVerifyReport> {
+    if provider_selection::selected_kind()? == provider_selection::PandoProviderSelection::VaultTransit {
+        bail!("Pando kms-verify is local-only in this checkpoint; use the object-store read path for Vault packs");
+    }
     let c = config.db().await?;
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
     let prov = provider::PandoKmsProvider::open_existing(&kms_dir)?;
@@ -71,6 +74,9 @@ pub async fn verify_repo_encryption(config: &Config, repo: Uuid) -> Result<KmsVe
 }
 
 pub async fn kms_status(config: &Config, repo: Uuid) -> Result<KmsStatusReport> {
+    if provider_selection::selected_kind()? == provider_selection::PandoProviderSelection::VaultTransit {
+        bail!("Pando local KMS status is unavailable while vault-transit is selected");
+    }
     let c = config.db().await?;
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
     let policy = if kms_dir.join(provider::POLICY_FILE_NAME).is_file() {
@@ -102,6 +108,18 @@ pub async fn run_kms_cli(config: &Config, args: &[String]) -> Result<()> {
         .with_context(|| format!("missing <repo> for {cmd}"))?
         .parse()?;
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
+    if provider_selection::selected_kind()? == provider_selection::PandoProviderSelection::VaultTransit
+        && matches!(
+            cmd,
+            "kms-rotate"
+                | "kms-revoke-key"
+                | "kms-revoke-provider"
+                | "kms-grant-provider"
+                | "kms-policy"
+        )
+    {
+        bail!("Pando local KMS mutation is unsupported while vault-transit is selected; refusing local-file mutation");
+    }
     match cmd {
         "kms-rotate" => {
             let mut opts = KmsRotateOptions::default();

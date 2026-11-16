@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 pub const POLICY_FILE_NAME: &str = "kms_policy.json";
 pub const KEYRING_FILE_NAME: &str = "keyring.json";
 pub const PROVIDER_KIND_LOCAL: &str = "local-file-key-provider";
+pub const PROVIDER_KIND_VAULT: &str = "vault-transit";
 
 /// Pando-only provider boundary. Unlike the shared Blob `KeyProvider`, this
 /// boundary is async so a network-backed provider (for example Vault Transit)
