@@ -22,6 +22,7 @@ mod realm;
 mod reducer;
 mod scope;
 mod scope_close;
+mod scope_close_requirement;
 mod scope_drain;
 mod view;
 
@@ -40,5 +41,6 @@ pub use proposal::{
 pub use realm::{NodeTrust, RealmBinding};
 pub use reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine, validate_ref_cas_command};
 pub use scope_close::{MAX_SCOPE_CLOSE_ACK_BYTES, SCOPE_CLOSE_DRAIN_FORMAT, ScopeCloseDrainSummary};
+pub use scope_close_requirement::ScopeCloseRequirement;
 pub use scope_drain::CommittedScopeDrain;
 pub use view::CommittedRefCasView;

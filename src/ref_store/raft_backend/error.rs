@@ -20,6 +20,10 @@ pub enum RaftBackendError {
     InvalidProposal(&'static str),
     /// A proposal identity does not match the backend/view repository/tenant/realm scope.
     ProposalScopeMismatch(&'static str),
+    /// A retained decision cannot be minted into a successful close requirement.
+    ScopeCloseNotRecoverable(&'static str),
+    /// A drain query/conversion was attempted for a different close trust/domain/coordinate.
+    ScopeDrainBindingMismatch(&'static str),
     /// The applied Root gate does not match the trusted realm on the named axis.
     StaleGate(&'static str),
     /// This node is not the leader; no local or projection read was substituted.
@@ -62,6 +66,12 @@ impl fmt::Display for RaftBackendError {
             Self::StaleRealm => f.write_str("presented realm/epoch/storage generation is stale"),
             Self::InvalidProposal(reason) => write!(f, "invalid proposal identity: {reason}"),
             Self::ProposalScopeMismatch(axis) => write!(f, "proposal identity does not match {axis}"),
+            Self::ScopeCloseNotRecoverable(reason) => {
+                write!(f, "scope close requirement cannot be recovered: {reason}")
+            }
+            Self::ScopeDrainBindingMismatch(axis) => {
+                write!(f, "scope drain observation does not match the required close binding on {axis}")
+            }
             Self::RecoveryNotObserved(id) => {
                 write!(f, "proposal {id:?} has no observed exact receipt within its valid window")
             }

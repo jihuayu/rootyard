@@ -10,7 +10,7 @@ use rootyard_refcas_log::state_machine::{
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::ref_store::core::state_machine::{RefCasCommand, encode_command, validate_scope_kind};
+use crate::ref_store::core::state_machine::{RefCasCommand, encode_command};
 use crate::ref_store::raft_backend::error::RaftBackendError;
 use crate::ref_store::raft_backend::node::RootRaftNode;
 use crate::ref_store::raft_backend::proposal::{
@@ -19,6 +19,9 @@ use crate::ref_store::raft_backend::proposal::{
 use crate::ref_store::raft_backend::realm::RealmBinding;
 use crate::ref_store::raft_backend::reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine};
 use crate::ref_store::raft_backend::scope::{requires_live_gate_precheck, validate_command_scope};
+use crate::ref_store::raft_backend::scope_close_requirement::{
+    ScopeCloseRequirement, scope_close_requirement_from_lookup,
+};
 use crate::ref_store::raft_backend::scope_drain::CommittedScopeDrain;
 use crate::ref_store::raft_backend::view::CommittedRefCasView;
 
@@ -255,6 +258,20 @@ impl RootRaftRefCasBackend {
         Ok(reducer.query_proposal(&proposal_id))
     }
 
+    /// Recovers a successful close requirement from an actual retained close receipt.
+    ///
+    /// This reuses the scope-checked quorum receipt read and deliberately does not require the old
+    /// live gate to still match. Only a retained `Found` applied `AuthScopeClosedV2` or legacy
+    /// `AuthScopeClosed` with Closing/Closed lifecycle and positive floor can mint the capability.
+    /// Refused, non-close, Expired, NotObserved and Invalid results never mint one.
+    pub async fn recover_scope_close_requirement(
+        &self,
+        proposal_id: ProposalId,
+    ) -> Result<ScopeCloseRequirement, RaftBackendError> {
+        let lookup = self.query_proposal(proposal_id.clone()).await?;
+        scope_close_requirement_from_lookup(lookup, self.node.trust().clone(), proposal_id)
+    }
+
     fn validate_proposal_scope(&self, proposal_id: &ProposalId) -> Result<(), RaftBackendError> {
         proposal_id.validate_shape().map_err(|_| RaftBackendError::InvalidProposal("malformed proposal identity"))?;
         if !proposal_id.matches_scope(
@@ -416,17 +433,11 @@ pub(crate) async fn await_applied_snapshot(
 /// it is intentionally not exposed on a repository-scoped `CommittedRefCasView`.
 pub(crate) async fn read_scope_drain(
     node: &RootRaftNode,
-    scope_kind: &str,
-    scope_id: Uuid,
-    required_close_log_id: u64,
+    requirement: &ScopeCloseRequirement,
     options: BackendOptions,
 ) -> Result<CommittedScopeDrain, RaftBackendError> {
     options.validate()?;
-    validate_scope_kind(scope_kind)
-        .map_err(|error| RaftBackendError::Command(format!("invalid scope drain scope: {error}")))?;
-    if scope_id.is_nil() {
-        return Err(RaftBackendError::Command("scope drain scope_id must be non-nil".into()));
-    }
+    requirement.validate_node_binding(node.trust())?;
     let read_log_id = ensure_linearizable_read(
         node,
         options.quorum_timeout,
@@ -435,9 +446,10 @@ pub(crate) async fn read_scope_drain(
     )
     .await?;
     let read_index = read_log_id.map(|log_id| log_id.index);
-    let required_index = read_index.map_or(required_close_log_id, |read| read.max(required_close_log_id));
-    let required = (required_index > 0).then(|| ApplicationLogId::new(0, required_index));
-    let snapshot = await_applied_snapshot(node, required, options.apply_timeout, options.poll_interval).await?;
+    let close_index = requirement.close_log_id().index;
+    let barrier_index = read_index.map_or(close_index, |read| read.max(close_index));
+    let barrier = (barrier_index > 0).then(|| ApplicationLogId::new(0, barrier_index));
+    let snapshot = await_applied_snapshot(node, barrier, options.apply_timeout, options.poll_interval).await?;
     let applied = snapshot.applied.map(ApplicationLogId::from_log_id);
     let reducer =
         snapshot.reducer.as_any().downcast_ref::<RootRefCasStateMachine>().ok_or(RaftBackendError::WrongReducer)?;
@@ -446,12 +458,12 @@ pub(crate) async fn read_scope_drain(
     }
     let drain = reducer
         .machine()
-        .inspect_scope_drain(scope_kind, scope_id)
+        .inspect_scope_drain(requirement.scope_kind(), requirement.scope_id())
         .map_err(|error| RaftBackendError::Command(format!("scope drain inspection refused: {error}")))?;
     Ok(CommittedScopeDrain::new(
         drain,
         read_index,
         applied.map(|coordinate| coordinate.index).unwrap_or(0),
-        node.trust().clone(),
+        requirement.clone(),
     ))
 }
