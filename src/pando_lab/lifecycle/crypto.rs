@@ -1,12 +1,12 @@
+use super::data_key::PandoDataKey;
+use super::provider::PandoKeyProvider;
+use super::wrapped_dek::PandoWrappedDek;
 use anyhow::{Context, Result, ensure};
 use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
 };
 use rootyard::blob_store::key_provider::{DATA_KEY_BYTES, WrapContext};
-use super::data_key::PandoDataKey;
-use super::provider::PandoKeyProvider;
-use super::wrapped_dek::PandoWrappedDek;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -52,11 +52,7 @@ impl PackCipher {
         if matches!(self, Self::Aes256Gcm) { 1 } else { 2 }
     }
     pub fn algorithm(self) -> &'static aead::Algorithm {
-        if matches!(self, Self::Aes256Gcm) {
-            &aead::AES_256_GCM
-        } else {
-            &aead::CHACHA20_POLY1305
-        }
+        if matches!(self, Self::Aes256Gcm) { &aead::AES_256_GCM } else { &aead::CHACHA20_POLY1305 }
     }
 }
 
@@ -131,22 +127,14 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 pub fn is_valid_sha256_hex(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn is_authenticated_mode(mode: &str) -> bool {
     mode == AUTHENTICATED_ENVELOPE_MODE
 }
 
-pub fn pack_wrap_context(
-    repo: Uuid,
-    pack_id: Uuid,
-    envelope_id: Uuid,
-    plaintext_sha256: &str,
-) -> Result<WrapContext> {
+pub fn pack_wrap_context(repo: Uuid, pack_id: Uuid, envelope_id: Uuid, plaintext_sha256: &str) -> Result<WrapContext> {
     WrapContext::new(repo, pack_id, 1, envelope_id, "pando-pack", plaintext_sha256)
         .map_err(|err| anyhow::anyhow!("invalid KMS wrap context: {err}"))
 }
@@ -187,14 +175,8 @@ fn less_safe_key(cipher: PackCipher, dek: &[u8; DATA_KEY_BYTES]) -> Result<LessS
 
 fn ensure_provider_allows_encryption<P: PandoKeyProvider + ?Sized>(provider: &P) -> Result<()> {
     let caps = provider.capabilities();
-    ensure!(
-        !caps.plaintext_fallback,
-        "key provider refuses fail-closed invariant by allowing plaintext_fallback"
-    );
-    ensure!(
-        caps.local_envelope || caps.provider_managed,
-        "key provider does not support envelope encryption"
-    );
+    ensure!(!caps.plaintext_fallback, "key provider refuses fail-closed invariant by allowing plaintext_fallback");
+    ensure!(caps.local_envelope || caps.provider_managed, "key provider does not support envelope encryption");
     Ok(())
 }
 
@@ -212,10 +194,7 @@ pub async fn seal_pack_bytes<P: PandoKeyProvider + ?Sized>(
         !repo.is_nil() && !pack_id.is_nil() && key_version >= 1,
         "invalid pack scope or key version for encryption"
     );
-    ensure!(
-        is_valid_sha256_hex(idx_sha256),
-        "invalid idx_sha256 digest for pack encryption"
-    );
+    ensure!(is_valid_sha256_hex(idx_sha256), "invalid idx_sha256 digest for pack encryption");
 
     let cipher = PackCipher::from_suite(cipher_suite)?;
     let plaintext_sha256 = sha256_hex(plaintext);
@@ -223,15 +202,10 @@ pub async fn seal_pack_bytes<P: PandoKeyProvider + ?Sized>(
     let rng = SystemRandom::new();
     let dek = PandoDataKey::generate()?;
     let mut nonce_prefix = [0u8; NONCE_PREFIX_BYTES];
-    rng.fill(&mut nonce_prefix)
-        .map_err(|_| anyhow::anyhow!("system random generator failed while creating nonce"))?;
+    rng.fill(&mut nonce_prefix).map_err(|_| anyhow::anyhow!("system random generator failed while creating nonce"))?;
     let envelope_id = Uuid::new_v4();
 
-    let chunk_count = if plaintext.is_empty() {
-        1u64
-    } else {
-        plaintext.len().div_ceil(SEALED_CHUNK_BYTES) as u64
-    };
+    let chunk_count = if plaintext.is_empty() { 1u64 } else { plaintext.len().div_ceil(SEALED_CHUNK_BYTES) as u64 };
     let expected_total = SEALED_HEADER_LEN
         .checked_add(plaintext.len())
         .and_then(|n| n.checked_add((chunk_count as usize) * AEAD_TAG_BYTES))
@@ -268,27 +242,19 @@ pub async fn seal_pack_bytes<P: PandoKeyProvider + ?Sized>(
         let aad = build_chunk_aad(&aad_params, chunk_index, chunk_index + 1 == chunk_count);
         let mut block = Vec::with_capacity((end - start) + AEAD_TAG_BYTES);
         block.extend_from_slice(&plaintext[start..end]);
-        key.seal_in_place_append_tag(
-            chunk_nonce(&nonce_prefix, chunk_index),
-            Aad::from(&aad),
-            &mut block,
-        )
-        .map_err(|_| anyhow::anyhow!("AEAD chunk sealing failed"))?;
+        key.seal_in_place_append_tag(chunk_nonce(&nonce_prefix, chunk_index), Aad::from(&aad), &mut block)
+            .map_err(|_| anyhow::anyhow!("AEAD chunk sealing failed"))?;
         ciphertext.extend_from_slice(&block);
     }
-    ensure!(
-        ciphertext.len() == expected_total && !ciphertext.starts_with(b"PACK"),
-        "sealed pack invariant violation"
-    );
+    ensure!(ciphertext.len() == expected_total && !ciphertext.starts_with(b"PACK"), "sealed pack invariant violation");
 
     let wrap_ctx = pack_wrap_context(repo, pack_id, envelope_id, &plaintext_sha256)?;
     let wrapped = provider
         .wrap_data_key(&dek, &wrap_ctx)
         .await
         .map_err(|err| anyhow::anyhow!("KMS key wrapping failed: {err}"))?;
-    let wrapped_key_json = wrapped
-        .to_json()
-        .map_err(|err| anyhow::anyhow!("wrapped DEK serialization failed: {err}"))?;
+    let wrapped_key_json =
+        wrapped.to_json().map_err(|err| anyhow::anyhow!("wrapped DEK serialization failed: {err}"))?;
     let resolved_key_version = wrapped.key_version().unwrap_or(key_version);
     ensure!(resolved_key_version >= 1, "invalid wrapped DEK key version");
 
@@ -344,8 +310,7 @@ pub async fn open_sealed_pack_bytes<P: PandoKeyProvider + ?Sized>(
 ) -> Result<Vec<u8>> {
     ensure_provider_allows_encryption(provider)?;
     ensure!(
-        is_valid_sha256_hex(req.expected_plaintext_sha256)
-            && is_valid_sha256_hex(req.expected_idx_sha256),
+        is_valid_sha256_hex(req.expected_plaintext_sha256) && is_valid_sha256_hex(req.expected_idx_sha256),
         "invalid expected digest for pack decryption"
     );
     let header = inspect_sealed_header(ciphertext)?;
@@ -364,20 +329,12 @@ pub async fn open_sealed_pack_bytes<P: PandoKeyProvider + ?Sized>(
         );
     }
     if let Some(exp_prefix) = req.expected_nonce_prefix {
-        ensure!(
-            hex::encode(header.nonce_prefix) == exp_prefix,
-            "sealed pack nonce_prefix mismatch"
-        );
+        ensure!(hex::encode(header.nonce_prefix) == exp_prefix, "sealed pack nonce_prefix mismatch");
     }
 
     let wrapped = PandoWrappedDek::from_json(req.wrapped_key_json.as_bytes())
         .map_err(|err| anyhow::anyhow!("invalid wrapped DEK metadata: {err}"))?;
-    let wrap_ctx = pack_wrap_context(
-        req.repo,
-        req.pack_id,
-        header.envelope_id,
-        req.expected_plaintext_sha256,
-    )?;
+    let wrap_ctx = pack_wrap_context(req.repo, req.pack_id, header.envelope_id, req.expected_plaintext_sha256)?;
     let data_key: PandoDataKey = provider
         .unwrap_data_key(&wrapped, &wrap_ctx)
         .await
@@ -399,39 +356,21 @@ pub async fn open_sealed_pack_bytes<P: PandoKeyProvider + ?Sized>(
     for chunk_index in 0..header.chunk_count {
         let is_final = chunk_index + 1 == header.chunk_count;
         let remaining_plain = header.plaintext_len - (plaintext.len() as u64);
-        let plain_chunk_len = if header.plaintext_len == 0 {
-            0usize
-        } else {
-            remaining_plain.min(header.chunk_size as u64) as usize
-        };
+        let plain_chunk_len =
+            if header.plaintext_len == 0 { 0usize } else { remaining_plain.min(header.chunk_size as u64) as usize };
         let cipher_slice_len = plain_chunk_len + AEAD_TAG_BYTES;
-        let slice = ciphertext
-            .get(offset..offset + cipher_slice_len)
-            .context("sealed pack truncated mid-chunk")?;
+        let slice = ciphertext.get(offset..offset + cipher_slice_len).context("sealed pack truncated mid-chunk")?;
         let mut scratch = slice.to_vec();
         let aad = build_chunk_aad(&aad_params, chunk_index, is_final);
         let decrypted = key
-            .open_in_place(
-                chunk_nonce(&header.nonce_prefix, chunk_index),
-                Aad::from(&aad),
-                &mut scratch,
-            )
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "AEAD chunk {chunk_index} authentication failed for pack {}",
-                    req.pack_id
-                )
-            })?;
+            .open_in_place(chunk_nonce(&header.nonce_prefix, chunk_index), Aad::from(&aad), &mut scratch)
+            .map_err(|_| anyhow::anyhow!("AEAD chunk {chunk_index} authentication failed for pack {}", req.pack_id))?;
         plaintext.extend_from_slice(decrypted);
         offset += cipher_slice_len;
     }
+    ensure!(offset == ciphertext.len(), "unexpected trailing bytes after sealed pack chunks");
     ensure!(
-        offset == ciphertext.len(),
-        "unexpected trailing bytes after sealed pack chunks"
-    );
-    ensure!(
-        plaintext.len() as u64 == header.plaintext_len
-            && sha256_hex(&plaintext) == req.expected_plaintext_sha256,
+        plaintext.len() as u64 == header.plaintext_len && sha256_hex(&plaintext) == req.expected_plaintext_sha256,
         "decrypted pack plaintext digest mismatch"
     );
     Ok(plaintext)
@@ -453,9 +392,7 @@ pub async fn rewrap_pack_dek<P: PandoKeyProvider + ?Sized>(
         .rewrap_data_key(&wrapped, &ctx)
         .await
         .map_err(|err| anyhow::anyhow!("KMS DEK rewrap failed closed: {err}"))?;
-    let json = rewrapped
-        .to_json()
-        .map_err(|err| anyhow::anyhow!("rewrapped DEK serialization failed: {err}"))?;
+    let json = rewrapped.to_json().map_err(|err| anyhow::anyhow!("rewrapped DEK serialization failed: {err}"))?;
     Ok((rewrapped.key_id().to_owned(), json))
 }
 

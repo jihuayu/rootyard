@@ -91,7 +91,7 @@ fn key_metadata_requires_derived_aes256_and_positive_latest_version() {
         br#"{"data":{"type":"rsa-2048","derived":true,"latest_version":3}}"#.as_slice(),
         br#"{"data":{"type":"aes256-gcm96","derived":true}}"#.as_slice(),
         br#"{"data":{"type":"aes256-gcm96","derived":true,"latest_version":0}}"#.as_slice(),
-    br#"{"data":{"type":"aes256-gcm96","derived":true,"latest_version":3,"min_encryption_version":4}}"#.as_slice(),
+        br#"{"data":{"type":"aes256-gcm96","derived":true,"latest_version":3,"min_encryption_version":4}}"#.as_slice(),
     ] {
         assert!(parse_key_metadata(invalid).is_err());
     }

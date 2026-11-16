@@ -4,8 +4,8 @@ use super::wrapped_dek::PandoWrappedDek;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::future::BoxFuture;
 use rootyard::blob_store::key_provider::{
-    DATA_KEY_BYTES, DataKey, KeyId, KeyProvider, KeyProviderCapabilities, KeyProviderError,
-    LocalFileKeyProvider, WrapContext, WrappedKey,
+    DATA_KEY_BYTES, DataKey, KeyId, KeyProvider, KeyProviderCapabilities, KeyProviderError, LocalFileKeyProvider,
+    WrapContext, WrappedKey,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,8 +18,7 @@ use zeroize::Zeroizing;
 mod keyring_io;
 
 use keyring_io::{
-    ensure_private_dir, generate_random_kek, key_file_path, save_policy_and_keyring,
-    write_private_atomic,
+    ensure_private_dir, generate_random_kek, key_file_path, save_policy_and_keyring, write_private_atomic,
 };
 
 pub const POLICY_FILE_NAME: &str = "kms_policy.json";
@@ -155,8 +154,7 @@ pub fn resolve_kms_dir(root: &Path, repo: Uuid) -> PathBuf {
         && !raw.is_empty()
     {
         let configured = PathBuf::from(raw);
-        if configured.join(KEYRING_FILE_NAME).is_file() || configured.join(POLICY_FILE_NAME).is_file()
-        {
+        if configured.join(KEYRING_FILE_NAME).is_file() || configured.join(POLICY_FILE_NAME).is_file() {
             return configured;
         }
         return configured.join(repo.to_string());
@@ -175,12 +173,7 @@ fn create_key_entry(canonical: &Path, key_id: &str, key_version: i32) -> Result<
     let kek = generate_random_kek()?;
     let sha256 = sha256_hex(&kek[..]);
     write_private_atomic(&key_file_path(canonical, key_id), &kek[..])?;
-    Ok(ManagedKeyEntry {
-        key_id: key_id.to_owned(),
-        key_version,
-        sha256,
-        status: ManagedKeyStatus::Active,
-    })
+    Ok(ManagedKeyEntry { key_id: key_id.to_owned(), key_version, sha256, status: ManagedKeyStatus::Active })
 }
 
 fn init_default_policy(dir: &Path, default_key_id: &str) -> Result<KmsKeyPolicy> {
@@ -211,8 +204,7 @@ pub fn load_policy(dir: &Path) -> Result<KmsKeyPolicy> {
 
 fn policy_from_external_keyring(dir: &Path) -> Result<KmsKeyPolicy> {
     let canonical = std::fs::canonicalize(dir)?;
-    let raw: KeyringManifestWire =
-        serde_json::from_slice(&std::fs::read(canonical.join(KEYRING_FILE_NAME))?)?;
+    let raw: KeyringManifestWire = serde_json::from_slice(&std::fs::read(canonical.join(KEYRING_FILE_NAME))?)?;
     ensure!(raw.schema == 1, "unsupported external keyring schema");
     let mut active_ver = 1i32;
     let keys = raw
@@ -277,10 +269,8 @@ impl PandoKmsProvider {
         };
         let active_key_id = KeyId::parse(&policy.active_key_id)
             .map_err(|err| anyhow::anyhow!("invalid active KMS key_id in policy: {err}"))?;
-        let active_usable = policy
-            .keys
-            .iter()
-            .any(|e| e.key_id == policy.active_key_id && e.status == ManagedKeyStatus::Active);
+        let active_usable =
+            policy.keys.iter().any(|e| e.key_id == policy.active_key_id && e.status == ManagedKeyStatus::Active);
         let inner = if !policy.provider_revoked && active_usable && canonical.join(KEYRING_FILE_NAME).is_file() {
             Some(
                 LocalFileKeyProvider::load(&canonical)
@@ -335,8 +325,7 @@ impl PandoKmsProvider {
     }
 
     pub fn ensure_key_readable(&self, key_id: &str, key_version: i32) -> Result<()> {
-        self.check_readable_policy(key_id, Some(key_version))
-            .map_err(|err| anyhow::anyhow!("{err}"))
+        self.check_readable_policy(key_id, Some(key_version)).map_err(|err| anyhow::anyhow!("{err}"))
     }
 }
 
@@ -427,10 +416,7 @@ pub fn prepare_rotation_target_key(
     Ok((policy, new_ver))
 }
 
-fn mutate_policy(
-    kms_dir: &Path,
-    f: impl FnOnce(&Path, &mut KmsKeyPolicy) -> Result<()>,
-) -> Result<KmsKeyPolicy> {
+fn mutate_policy(kms_dir: &Path, f: impl FnOnce(&Path, &mut KmsKeyPolicy) -> Result<()>) -> Result<KmsKeyPolicy> {
     let canonical = ensure_private_dir(kms_dir)?;
     let mut policy = load_policy(&canonical)?;
     f(&canonical, &mut policy)?;

@@ -58,12 +58,9 @@ fn set_fault(point: &str) {
 /// is rejected below. `PANDO_OBJECT_STORE_BUCKET` changes only a key prefix
 /// under the owned temporary root, not the fixture root itself.
 fn preflight_fixture_isolation() {
-    for name in [
-        "PANDO_OBJECT_STORE_ROOT",
-        "PANDO_KMS_KEYRING_DIR",
-        "PANDO_KMS_PROVIDER",
-        "ROOTYARD_OBJECT_STORE_ENDPOINT",
-    ] {
+    for name in
+        ["PANDO_OBJECT_STORE_ROOT", "PANDO_KMS_KEYRING_DIR", "PANDO_KMS_PROVIDER", "ROOTYARD_OBJECT_STORE_ENDPOINT"]
+    {
         assert!(
             std::env::var_os(name).is_none(),
             "repack PG fixture isolation preflight failed: external {name} is set; remove it so the owned temporary fixture cannot escape"
@@ -74,15 +71,11 @@ fn preflight_fixture_isolation() {
 fn config_for(label: &str) -> (Config, PathBuf) {
     let database = match std::env::var("ROOTYARD_TEST_DATABASE_URL") {
         Ok(database) if !database.trim().is_empty() => database,
-        _ => panic!(
-            "ROOTYARD_TEST_DATABASE_URL must be set and non-empty for ignored repack PostgreSQL cases"
-        ),
+        _ => panic!("ROOTYARD_TEST_DATABASE_URL must be set and non-empty for ignored repack PostgreSQL cases"),
     };
     let root = std::env::temp_dir().join(format!("pando-repack-pg-{label}-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(root.join("objects"))
-        .expect("create owned repack PG fixture objects directory");
-    std::fs::create_dir_all(root.join("sessions"))
-        .expect("create owned repack PG fixture sessions directory");
+    std::fs::create_dir_all(root.join("objects")).expect("create owned repack PG fixture objects directory");
+    std::fs::create_dir_all(root.join("sessions")).expect("create owned repack PG fixture sessions directory");
     (Config { database, root: root.clone(), git: PathBuf::from("/usr/bin/git") }, root)
 }
 

@@ -48,10 +48,8 @@ impl PgSession {
     }
 
     pub(crate) async fn unlock_publication_exclusive(&self, repo: Uuid) -> Result<()> {
-        let row = self
-            .client()
-            .query_one("SELECT pg_advisory_unlock($1)", &[&lock_key(repo, PUBLICATION_DOMAIN)])
-            .await?;
+        let row =
+            self.client().query_one("SELECT pg_advisory_unlock($1)", &[&lock_key(repo, PUBLICATION_DOMAIN)]).await?;
         let released: bool = row.get(0);
         if !released {
             bail!("Pando publication advisory lock was not held by this session");
@@ -60,10 +58,7 @@ impl PgSession {
     }
 
     async fn acquire(&self, repo: Uuid, domain: u64, label: &str) -> Result<()> {
-        let row = self
-            .client()
-            .query_one("SELECT pg_try_advisory_lock($1)", &[&lock_key(repo, domain)])
-            .await?;
+        let row = self.client().query_one("SELECT pg_try_advisory_lock($1)", &[&lock_key(repo, domain)]).await?;
         let acquired: bool = row.get(0);
         if !acquired {
             bail!("Pando {label} lock is busy for repository {repo}");
@@ -72,10 +67,7 @@ impl PgSession {
     }
 
     async fn acquire_shared(&self, repo: Uuid, domain: u64, label: &str) -> Result<()> {
-        let row = self
-            .client()
-            .query_one("SELECT pg_try_advisory_lock_shared($1)", &[&lock_key(repo, domain)])
-            .await?;
+        let row = self.client().query_one("SELECT pg_try_advisory_lock_shared($1)", &[&lock_key(repo, domain)]).await?;
         let acquired: bool = row.get(0);
         if !acquired {
             bail!("Pando {label} lock is busy for repository {repo}");

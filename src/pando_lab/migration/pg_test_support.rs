@@ -196,10 +196,7 @@ pub(super) async fn assert_repo_row(
 
 pub(super) async fn assert_migration_row(client: &Client, repo: Uuid, state: &str) {
     let row = client
-        .query_one(
-            "SELECT state,copied_packs,copied_objects FROM pando_lab.migrations WHERE repo=$1",
-            &[&repo],
-        )
+        .query_one("SELECT state,copied_packs,copied_objects FROM pando_lab.migrations WHERE repo=$1", &[&repo])
         .await
         .unwrap();
     assert_eq!(row.get::<_, String>(0), state);

@@ -1,17 +1,18 @@
 use super::super::super::{Config, Pack, object_store};
 use super::super::{
-    DEFAULT_CIPHER_SUITE, db::{persist_checkpoint, upsert_envelope_in_db},
-    envelopes::write_envelope_file, load_repo_packs, provider,
+    DEFAULT_CIPHER_SUITE,
+    db::{persist_checkpoint, upsert_envelope_in_db},
+    envelopes::write_envelope_file,
+    load_repo_packs, provider,
     provider_selection::{self, PandoProviderSelection},
     vault_provider::VaultTransitProvider,
 };
 use super::crypto_ops::{
-    migrate_local_envelope_to_vault, read_pack_cipher, rewrap_vault_envelope,
-    verify_rewrapped_pack,
+    migrate_local_envelope_to_vault, read_pack_cipher, rewrap_vault_envelope, verify_rewrapped_pack,
 };
 use super::{
-    KmsReconcileStage, KmsRotateOptions, KmsRotationCheckpoint, KmsRotationReport,
-    load_authoritative_envelope, load_authoritative_envelope_optional,
+    KmsReconcileStage, KmsRotateOptions, KmsRotationCheckpoint, KmsRotationReport, load_authoritative_envelope,
+    load_authoritative_envelope_optional,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::path::Path;
@@ -90,7 +91,13 @@ async fn resolve_vault_rotation_checkpoint(
         let mut added_pack = false;
         for pack in packs {
             if let Some(env) = load_authoritative_envelope_optional(c, &config.root, repo, pack).await? {
-                ensure_no_version_downgrade(&env.provider_kind, &env.key_id, env.key_version, &cp.to_key_id, cp.expected_version())?;
+                ensure_no_version_downgrade(
+                    &env.provider_kind,
+                    &env.key_id,
+                    env.key_version,
+                    &cp.to_key_id,
+                    cp.expected_version(),
+                )?;
             }
             if !cp.target_pack_ids.contains(&pack.id) {
                 cp.target_pack_ids.push(pack.id);
@@ -106,9 +113,8 @@ async fn resolve_vault_rotation_checkpoint(
     if let Some(ref target) = opts.target_key_id {
         ensure!(target.trim() == vault.key_name(), "Vault rotation target must be the configured key name");
     }
-    let target_version = opts
-        .target_version
-        .context("Vault rotation requires --target-version for an existing Transit key version")?;
+    let target_version =
+        opts.target_version.context("Vault rotation requires --target-version for an existing Transit key version")?;
     ensure!(target_version >= 1, "Vault target version must be >= 1");
     let (latest, min_encryption) = vault.latest_and_min_encryption().await?;
     ensure_target_available(target_version, latest, min_encryption)?;
@@ -174,13 +180,9 @@ pub(super) async fn rotate_vault_kms_key_with_options(
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
     let s_root = object_store::store_root(config);
     let packs = load_repo_packs(&c, repo).await?;
-    let mut cp =
-        resolve_vault_rotation_checkpoint(&c, &kms_dir, config, repo, opts, &packs, &vault).await?;
+    let mut cp = resolve_vault_rotation_checkpoint(&c, &kms_dir, config, repo, opts, &packs, &vault).await?;
     session.unlock_publication_exclusive(repo).await?;
-    ensure!(
-        cp.expected_version() == cp.to_key_version,
-        "Vault rotation checkpoint version mismatch"
-    );
+    ensure!(cp.expected_version() == cp.to_key_version, "Vault rotation checkpoint version mismatch");
     let mut envelopes = Vec::with_capacity(packs.len());
     let mut rewrapped_this_run = 0usize;
     for pack in &packs {
@@ -188,7 +190,13 @@ pub(super) async fn rotate_vault_kms_key_with_options(
         ensure_target_available(cp.expected_version(), latest, min_encryption)?;
         let existing = load_authoritative_envelope_optional(c, &config.root, repo, pack).await?;
         if let Some(ref env) = existing {
-            ensure_no_version_downgrade(&env.provider_kind, &env.key_id, env.key_version, &cp.to_key_id, cp.expected_version())?;
+            ensure_no_version_downgrade(
+                &env.provider_kind,
+                &env.key_id,
+                env.key_version,
+                &cp.to_key_id,
+                cp.expected_version(),
+            )?;
         }
         if let Some(ref env) = existing
             && env.provider_kind == provider::PROVIDER_KIND_VAULT
@@ -216,26 +224,11 @@ pub(super) async fn rotate_vault_kms_key_with_options(
         }
         let updated = match existing {
             Some(ref env) if env.provider_kind == provider::PROVIDER_KIND_LOCAL => {
-                migrate_local_envelope_to_vault(
-                    &vault,
-                    &config.root,
-                    &s_root,
-                    repo,
-                    pack,
-                    env,
-                    cp.expected_version(),
-                ).await?
+                migrate_local_envelope_to_vault(&vault, &config.root, &s_root, repo, pack, env, cp.expected_version())
+                    .await?
             }
             Some(ref env) if env.provider_kind == provider::PROVIDER_KIND_VAULT => {
-                rewrap_vault_envelope(
-                    &vault,
-                    &config.root,
-                    &s_root,
-                    repo,
-                    pack,
-                    env,
-                    cp.expected_version(),
-                ).await?
+                rewrap_vault_envelope(&vault, &config.root, &s_root, repo, pack, env, cp.expected_version()).await?
             }
             None => {
                 let tier = "hot";
