@@ -199,6 +199,20 @@ pub(super) fn actor_appname(nonce: &str, repo: Uuid, role: &str) -> String {
     appname
 }
 
+fn exact_actor_wait(
+    expected_appname: &str,
+    repo: Uuid,
+    expected_phase: &str,
+    candidate_appname: &str,
+    wait_event: Option<&str>,
+    query: &str,
+) -> bool {
+    candidate_appname == expected_appname
+        && expected_appname.contains(&repo.to_string())
+        && wait_event == Some("Lock")
+        && query.contains(expected_phase)
+}
+
 /// Observe only the exact controlled actor application_name backend. The repo
 /// UUID and nonce are embedded in the application_name, so the admin session
 /// and unrelated parallel waiters cannot satisfy the proof.
@@ -227,17 +241,25 @@ pub(super) async fn wait_for_actor_lock_wait(
             .unwrap();
         if let Some(row) = row {
             let pid: i32 = row.get(0);
-            let exact: bool = admin
+            let row = admin
                 .query_one(
-                    "SELECT wait_event_type='Lock' AND state='active' AND query ILIKE $2 \
-                     FROM pg_stat_activity WHERE pid=$1 AND application_name=$3 \
-                     AND datname=current_database()",
-                    &[&pid, &phase, &appname],
+                    "SELECT application_name,wait_event_type,query FROM pg_stat_activity \
+                     WHERE pid=$1 AND datname=current_database()",
+                    &[&pid],
                 )
                 .await
-                .unwrap()
-                .get(0);
-            if exact {
+                .unwrap();
+            let candidate: String = row.get(0);
+            let wait_event: Option<String> = row.get(1);
+            let query: String = row.get(2);
+            if exact_actor_wait(
+                appname,
+                repo,
+                expected_phase,
+                &candidate,
+                wait_event.as_deref(),
+                &query,
+            ) {
                 return;
             }
         }
@@ -293,6 +315,55 @@ mod tests {
         let mut other_case = spec.clone();
         other_case.nonce = case_nonce();
         assert_ne!(spec.marker("release"), other_case.marker("release"));
+    }
+
+    #[test]
+    fn negative_unrelated_waiter_is_rejected() {
+        let repo = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let nonce = case_nonce();
+        let appname = actor_appname(&nonce, repo, "snap");
+        let query = "SELECT generation FROM pando_lab.repositories WHERE id=$1 FOR SHARE";
+        assert!(exact_actor_wait(
+            &appname,
+            repo,
+            "FOR SHARE",
+            &appname,
+            Some("Lock"),
+            query
+        ));
+        assert!(!exact_actor_wait(
+            &appname,
+            repo,
+            "FOR SHARE",
+            "rs-unrelated",
+            Some("Lock"),
+            query
+        ));
+        assert!(!exact_actor_wait(
+            &appname,
+            repo,
+            "FOR SHARE",
+            &appname,
+            Some("ClientRead"),
+            query
+        ));
+        assert!(!exact_actor_wait(
+            &appname,
+            repo,
+            "FOR UPDATE",
+            &appname,
+            Some("Lock"),
+            query
+        ));
+        assert!(!exact_actor_wait(
+            &appname,
+            other,
+            "FOR SHARE",
+            &appname,
+            Some("Lock"),
+            query
+        ));
     }
 
     #[test]
