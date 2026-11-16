@@ -887,18 +887,31 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
         bob_sub_pre = json.loads(
             self.expect("/api/repos/alice/demo/subscription", 200, token=self.bob)
         )
-        carol_issue_sub_pre = json.loads(
-            self.expect("/api/repos/alice/demo/issues/1/subscription", 200, token=self.carol)
+        # Carol is deliberately revoked and must remain the denial actor. Seed
+        # and verify an ignored issue subscription on Bob, who retains access.
+        bob_issue_sub_seed = json.loads(
+            self.expect(
+                "/api/repos/alice/demo/issues/1/subscription",
+                200,
+                token=self.bob,
+                method="PUT",
+                body={"state": "ignored"},
+            )
+        )
+        assert bob_issue_sub_seed["state"] == "ignored"
+        assert bob_issue_sub_seed["version"] >= 1
+        bob_issue_sub_pre = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/subscription", 200, token=self.bob)
         )
         alice_pr_sub_pre = json.loads(
             self.expect("/api/repos/alice/demo/pulls/1/subscription", 200, token=self.alice)
         )
         bob_sub_pre_identity = subscription_identity(bob_sub_pre)
-        carol_issue_sub_pre_identity = subscription_identity(carol_issue_sub_pre)
+        bob_issue_sub_pre_identity = subscription_identity(bob_issue_sub_pre)
         alice_pr_sub_pre_identity = subscription_identity(alice_pr_sub_pre)
         assert bob_sub_pre_identity[0] is True and bob_sub_pre_identity[1][0] == "subscribed"
-        assert carol_issue_sub_pre_identity[0] is False
-        assert carol_issue_sub_pre_identity[1][0] == "ignored"
+        assert bob_issue_sub_pre_identity[0] is False
+        assert bob_issue_sub_pre_identity[1][0] == "ignored"
         assert alice_pr_sub_pre_identity[0] is True
         assert alice_pr_sub_pre_identity[1][0] == "subscribed"
 
@@ -1056,14 +1069,14 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
         bob_sub_post = json.loads(
             self.expect("/api/repos/alice/demo/subscription", 200, token=self.bob)
         )
-        carol_issue_sub_post = json.loads(
-            self.expect("/api/repos/alice/demo/issues/1/subscription", 200, token=self.carol)
+        bob_issue_sub_post = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/subscription", 200, token=self.bob)
         )
         alice_pr_sub_post = json.loads(
             self.expect("/api/repos/alice/demo/pulls/1/subscription", 200, token=self.alice)
         )
         assert subscription_identity(bob_sub_post) == bob_sub_pre_identity
-        assert subscription_identity(carol_issue_sub_post) == carol_issue_sub_pre_identity
+        assert subscription_identity(bob_issue_sub_post) == bob_issue_sub_pre_identity
         assert subscription_identity(alice_pr_sub_post) == alice_pr_sub_pre_identity
         self.expect(
             "/api/repos/alice/demo/subscription",
@@ -1072,7 +1085,7 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
             method="PUT",
             body={
                 "state": "ignored",
-                "expected_version": max(0, bob_sub_pre_identity[1][1] - 1),
+                "expected_version": bob_sub_pre_identity[1][1] + 1,
             },
         )
         assert subscription_identity(
@@ -1160,6 +1173,10 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
                 assert b'data-outdated-reviews="1"' in page
                 assert b'data-rc-outdated="true"' in page
                 assert b"[deleted]" in page
+            if path.endswith("/labels"):
+                for label_name in ("defect", "triage", "post-restore"):
+                    marker = ('data-label-name="' + label_name + '"').encode()
+                    assert marker in page, f"post-restore label row missing: {label_name}"
 
         bob_cookies, _, _ = self.sign_in(username="bob", token=browser_token["secret"])
         bob_headers = {"Cookie": self.cookie_header(bob_cookies)}
