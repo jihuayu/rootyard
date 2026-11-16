@@ -308,6 +308,7 @@ impl PgServingRetentionRoots {
             {
                 Ok(receipt) => receipt,
                 Err(error) => {
+                    *stage = RootCreateFailureStage::FinalAuthorityCheck;
                     let authority = final_authority_root(
                         &tx,
                         actor,
@@ -320,11 +321,11 @@ impl PgServingRetentionRoots {
                     )
                     .await;
                     return match authority {
-                        Ok(_) => Err(map_root_error(error)),
-                        Err(auth_error) => {
-                            *stage = RootCreateFailureStage::FinalAuthorityCheck;
-                            Err(auth_error)
+                        Ok(_) => {
+                            *stage = RootCreateFailureStage::RegisterInTransaction;
+                            Err(map_root_error(error))
                         }
+                        Err(auth_error) => Err(auth_error),
                     };
                 }
             };
