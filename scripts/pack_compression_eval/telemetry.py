@@ -259,12 +259,17 @@ def verify_binary_receipt(
     resolved = binary.resolve()
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise RuntimeError(f"rootyard binary unavailable or not executable: {resolved}")
-    sha256 = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with resolved.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+        sha256 = digest.hexdigest()
+        size_bytes = os.fstat(source.fileno()).st_size
     receipt_path = resolved.with_name(resolved.name + ".build.json")
     info: dict[str, Any] = {
         "path": str(resolved),
         "sha256": sha256,
-        "size_bytes": resolved.stat().st_size,
+        "size_bytes": size_bytes,
         "receipt_verified": False,
     }
     if not receipt_path.is_file():
@@ -304,10 +309,21 @@ def verify_binary_receipt(
             receipt_path=receipt_path,
             receipt_sha256=receipt_sha256,
             binary_path=resolved,
+            expected_binary_sha256=sha256,
             expected_commit=git_state["commit"],
         )
     except build_receipt_mod.ReceiptError as error:
         raise RuntimeError(f"binary build receipt rejected: {error}") from error
+
+    if validated.binary_path is None:
+        raise RuntimeError("canonical build receipt validator did not return a binary path")
+    validated_path = Path(validated.binary_path).resolve()
+    if validated_path != resolved:
+        raise RuntimeError(
+            f"canonical build receipt validator returned {validated_path}, not the verified path {resolved}"
+        )
+    if validated.binary_sha256 != sha256:
+        raise RuntimeError("canonical build receipt validator returned a different binary digest")
 
     recorded_head = data.get("git_head")
     if recorded_head is not None and recorded_head != git_state["head"]:
@@ -329,6 +345,9 @@ def verify_binary_receipt(
     payload = validated.payload
     info.update(
         {
+            "path": str(validated_path),
+            "sha256": validated.binary_sha256,
+            "size_bytes": size_bytes,
             "receipt_verified": True,
             "receipt_schema": (
                 payload.get("receipt_schema")

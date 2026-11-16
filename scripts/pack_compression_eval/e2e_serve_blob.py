@@ -66,6 +66,9 @@ def run_live_serve_blob_eval(
     os.chmod(work_root, 0o700)
     live = resolve_live_env(os.environ)
     receipt_info = verify_binary_receipt(Path(binary), require_receipt=require_receipt)
+    # Every child launch uses the canonical reader's resolved, verified path.
+    # The benchmark owns this path; this does not make later launches atomic.
+    binary = receipt_info["path"]
     parsed_s3 = urllib.parse.urlsplit(live.s3_endpoint)
     if parsed_s3.scheme != "http" or not parsed_s3.hostname:
         raise RuntimeError("S3 endpoint must be plain HTTP loopback or host:port for wire metering")

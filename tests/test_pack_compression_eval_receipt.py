@@ -170,6 +170,19 @@ class ValidReceiptTest(BinaryReceiptVerificationFixture):
         self.assertEqual(info["source_inputs_sha256"], self.payload["source_inputs_sha256"])
         self.assertEqual(info["receipt_schema"], receipts.RECEIPT_SCHEMA_V2)
 
+    def test_symlink_input_returns_resolved_verified_path(self) -> None:
+        links = self.tempdir / "links"
+        links.mkdir()
+        link = links / "rootyard-link"
+        link.symlink_to(self.binary)
+
+        info = telemetry.verify_binary_receipt(link, True, source_root=self.repo)
+
+        self.assertTrue(info["receipt_verified"])
+        self.assertEqual(info["path"], str(self.binary.resolve()))
+        self.assertEqual(info["sha256"], receipts.sha256_file(self.binary))
+        self.assertEqual(info["size_bytes"], self.binary.stat().st_size)
+
     def test_receipt_is_optional_only_when_absent_and_not_required(self) -> None:
         self.receipt_path.unlink()
 
@@ -183,6 +196,32 @@ class ValidReceiptTest(BinaryReceiptVerificationFixture):
 
 
 class FailClosedReceiptTest(BinaryReceiptVerificationFixture):
+    def test_first_digest_is_passed_to_canonical_validator(self) -> None:
+        real_validator = receipts.validate_receipt
+        seen: dict = {}
+
+        def capture(receipt, **kwargs):
+            seen.update(kwargs)
+            return real_validator(receipt, **kwargs)
+
+        with mock.patch.object(telemetry.build_receipt_mod, "validate_receipt", capture):
+            info = self.verify()
+
+        self.assertTrue(info["receipt_verified"])
+        self.assertEqual(seen["expected_binary_sha256"], info["sha256"])
+        self.assertEqual(seen["binary_path"], self.binary.resolve())
+
+    def test_mutation_between_first_digest_and_validator_is_rejected(self) -> None:
+        real_validator = receipts.validate_receipt
+
+        def mutate_then_validate(receipt, **kwargs):
+            self.binary.write_bytes(b"replacement-binary-after-first-digest")
+            self.binary.chmod(0o755)
+            return real_validator(receipt, **kwargs)
+
+        with mock.patch.object(telemetry.build_receipt_mod, "validate_receipt", mutate_then_validate):
+            self.assert_rejected("binary digest")
+
     def test_missing_canonical_validator_is_rejected(self) -> None:
         with mock.patch.object(telemetry, "build_receipt_mod", None):
             self.assert_rejected("canonical build-receipt validator is unavailable")
@@ -206,7 +245,7 @@ class FailClosedReceiptTest(BinaryReceiptVerificationFixture):
     def test_tampered_binary_is_rejected(self) -> None:
         self.binary.write_bytes(self.binary.read_bytes() + b"-tampered")
         self.binary.chmod(0o755)
-        self.assert_rejected("binary digest")
+        self.assert_rejected("binary_sha256")
 
     def test_dirty_source_tree_is_rejected(self) -> None:
         (self.repo / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
