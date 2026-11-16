@@ -88,15 +88,15 @@ impl KmsRotationCheckpoint {
     }
 }
 
-pub(crate) async fn load_authoritative_envelope(
+pub(crate) async fn load_authoritative_envelope_optional(
     c: &Client,
     base_root: &Path,
     repo: Uuid,
     pack: &Pack,
-) -> Result<KmsEnvelopeRecord> {
-    let env = load_envelope_from_db(c, repo, pack)
-        .await?
-        .context("missing committed DB KMS envelope for pack")?;
+) -> Result<Option<KmsEnvelopeRecord>> {
+    let Some(env) = load_envelope_from_db(c, repo, pack).await? else {
+        return Ok(None);
+    };
     super::envelopes::verify_envelope_record(&env)?;
     ensure!(
         env.repo == repo && env.pack_id == pack.id
@@ -105,7 +105,18 @@ pub(crate) async fn load_authoritative_envelope(
         "committed DB KMS envelope identity mismatch"
     );
     let _ = write_envelope_file(base_root, &env);
-    Ok(env)
+    Ok(Some(env))
+}
+
+pub(crate) async fn load_authoritative_envelope(
+    c: &Client,
+    base_root: &Path,
+    repo: Uuid,
+    pack: &Pack,
+) -> Result<KmsEnvelopeRecord> {
+    load_authoritative_envelope_optional(c, base_root, repo, pack)
+        .await?
+        .context("missing committed DB KMS envelope for pack")
 }
 
 pub async fn verify_and_decrypt_pack_bytes(
@@ -451,6 +462,22 @@ fn ensure_existing_target_contract(cp: &KmsRotationCheckpoint) -> Result<()> {
     Ok(())
 }
 
+fn ensure_no_version_downgrade(
+    provider_kind: &str,
+    key_id: &str,
+    key_version: i32,
+    target_key_id: &str,
+    target_version: i32,
+) -> Result<()> {
+    if provider_kind == provider::PROVIDER_KIND_VAULT && key_id == target_key_id {
+        ensure!(
+            key_version <= target_version,
+            "refusing same-key Vault downgrade from version {key_version} to {target_version}"
+        );
+    }
+    Ok(())
+}
+
 fn ensure_target_available(target_version: i32, latest: i32, min_encryption: i32) -> Result<()> {
     ensure!(
         target_version >= 1 && target_version <= latest && target_version >= min_encryption,
@@ -496,6 +523,9 @@ async fn resolve_vault_rotation_checkpoint(
         ensure_target_available(cp.expected_version(), latest, min_encryption)?;
         let mut added_pack = false;
         for pack in packs {
+            if let Some(env) = load_authoritative_envelope_optional(c, &config.root, repo, pack).await? {
+                ensure_no_version_downgrade(&env.provider_kind, &env.key_id, env.key_version, &cp.to_key_id, cp.expected_version())?;
+            }
             if !cp.target_pack_ids.contains(&pack.id) {
                 cp.target_pack_ids.push(pack.id);
                 added_pack = true;
@@ -518,8 +548,15 @@ async fn resolve_vault_rotation_checkpoint(
     ensure_target_available(target_version, latest, min_encryption)?;
     let mut from_provider_kind = provider::PROVIDER_KIND_VAULT.to_owned();
     for pack in packs {
-        let env = Some(load_authoritative_envelope(c, &config.root, repo, pack).await?);
+        let env = load_authoritative_envelope_optional(c, &config.root, repo, pack).await?;
         if let Some(env) = env {
+            ensure_no_version_downgrade(
+                &env.provider_kind,
+                &env.key_id,
+                env.key_version,
+                vault.key_name(),
+                target_version,
+            )?;
             ensure!(
                 env.provider_kind == provider::PROVIDER_KIND_LOCAL
                     || env.provider_kind == provider::PROVIDER_KIND_VAULT,
@@ -583,7 +620,10 @@ async fn rotate_vault_kms_key_with_options(
     for pack in &packs {
         let (latest, min_encryption) = vault.latest_and_min_encryption().await?;
         ensure_target_available(cp.expected_version(), latest, min_encryption)?;
-        let existing = Some(load_authoritative_envelope(c, &config.root, repo, pack).await?);
+        let existing = load_authoritative_envelope_optional(c, &config.root, repo, pack).await?;
+        if let Some(ref env) = existing {
+            ensure_no_version_downgrade(&env.provider_kind, &env.key_id, env.key_version, &cp.to_key_id, cp.expected_version())?;
+        }
         if let Some(ref env) = existing
             && env.provider_kind == provider::PROVIDER_KIND_VAULT
             && env.key_id == cp.to_key_id
@@ -784,7 +824,7 @@ pub async fn rotate_kms_key_with_options(
     let s_root = object_store::store_root(config);
     let packs = load_repo_packs(&c, repo).await?;
     for pack in &packs {
-        let existing = Some(load_authoritative_envelope(c, &config.root, repo, pack).await?);
+        let existing = load_authoritative_envelope_optional(c, &config.root, repo, pack).await?;
         if let Some(env) = existing {
             ensure!(
                 env.provider_kind == super::provider::PROVIDER_KIND_LOCAL,
@@ -799,7 +839,10 @@ pub async fn rotate_kms_key_with_options(
     let mut envelopes = Vec::with_capacity(packs.len());
     let mut rewrapped_this_run = 0usize;
     for pack in &packs {
-        let existing_env = Some(load_authoritative_envelope(&c, &config.root, repo, pack).await?);
+        let existing_env = load_authoritative_envelope_optional(&c, &config.root, repo, pack).await?;
+        if let Some(ref env) = existing_env {
+            ensure_no_version_downgrade(&env.provider_kind, &env.key_id, env.key_version, &cp.to_key_id, cp.to_key_version)?;
+        }
         if let Some(ref env) = existing_env
             && env.key_id == cp.to_key_id
             && env.key_version == cp.to_key_version
@@ -957,6 +1000,9 @@ mod tests {
         assert!(ensure_target_available(4, 6, 4).is_ok());
         assert!(ensure_target_available(4, 3, 0).is_err());
         assert!(ensure_target_available(4, 6, 5).is_err());
+        assert!(ensure_no_version_downgrade(super::super::provider::PROVIDER_KIND_VAULT, "k", 6, "k", 4).is_err());
+        assert!(ensure_no_version_downgrade(super::super::provider::PROVIDER_KIND_VAULT, "k", 4, "k", 4).is_ok());
+        assert!(ensure_no_version_downgrade(super::super::provider::PROVIDER_KIND_LOCAL, "l", 6, "k", 4).is_ok());
         let mut legacy = cp;
         legacy.target_contract.clear();
         assert!(ensure_existing_target_contract(&legacy).is_err());
