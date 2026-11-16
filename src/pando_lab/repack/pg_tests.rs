@@ -3,6 +3,8 @@
 //! Every case is `#[ignore]`d and was not executed in this checkpoint. They use
 //! an owned repository row and disposable root with the normal
 //! `experimental/pando/schema.sql` installed in `ROOTYARD_TEST_DATABASE_URL`.
+//! Explicit `--ignored` invocation fails closed when that dedicated selector is
+//! missing or empty; there is no silent success path.
 
 use super::super::{Config, Pack, lifecycle, store};
 use super::{RepackOptions, repack_repo};
@@ -69,15 +71,19 @@ fn preflight_fixture_isolation() {
     }
 }
 
-fn config_for(label: &str) -> Option<(Config, PathBuf)> {
-    let database = std::env::var("ROOTYARD_TEST_DATABASE_URL").ok()?;
-    if database.trim().is_empty() {
-        return None;
-    }
+fn config_for(label: &str) -> (Config, PathBuf) {
+    let database = match std::env::var("ROOTYARD_TEST_DATABASE_URL") {
+        Ok(database) if !database.trim().is_empty() => database,
+        _ => panic!(
+            "ROOTYARD_TEST_DATABASE_URL must be set and non-empty for ignored repack PostgreSQL cases"
+        ),
+    };
     let root = std::env::temp_dir().join(format!("pando-repack-pg-{label}-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(root.join("objects")).ok()?;
-    std::fs::create_dir_all(root.join("sessions")).ok()?;
-    Some((Config { database, root: root.clone(), git: PathBuf::from("/usr/bin/git") }, root))
+    std::fs::create_dir_all(root.join("objects"))
+        .expect("create owned repack PG fixture objects directory");
+    std::fs::create_dir_all(root.join("sessions"))
+        .expect("create owned repack PG fixture sessions directory");
+    (Config { database, root: root.clone(), git: PathBuf::from("/usr/bin/git") }, root)
 }
 
 async fn connect(config: &Config) -> Client {
@@ -251,9 +257,7 @@ async fn pg_repack_default_local_publishes_one_authority_and_retains_pinned_data
     let _lock = test_lock();
     let _hooks = HookGuard::new();
     preflight_fixture_isolation();
-    let Some((config, root)) = config_for("default-local") else {
-        return;
-    };
+    let (config, root) = config_for("default-local");
     let admin = connect(&config).await;
     let repo = Uuid::new_v4();
     insert_repo(&admin, repo).await;
@@ -313,9 +317,7 @@ async fn pg_repack_generation_race_fails_cleanly_without_authority() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
     preflight_fixture_isolation();
-    let Some((config, root)) = config_for("generation-race") else {
-        return;
-    };
+    let (config, root) = config_for("generation-race");
     let admin = connect(&config).await;
     let repo = Uuid::new_v4();
     insert_repo(&admin, repo).await;
@@ -352,9 +354,7 @@ async fn pg_repack_forced_final_failure_rolls_back_authority_and_mirror() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
     preflight_fixture_isolation();
-    let Some((config, root)) = config_for("forced-rollback") else {
-        return;
-    };
+    let (config, root) = config_for("forced-rollback");
     let admin = connect(&config).await;
     let repo = Uuid::new_v4();
     insert_repo(&admin, repo).await;
@@ -390,9 +390,7 @@ async fn pg_repack_rotation_barrier_keeps_exact_target_and_shared_gate() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
     preflight_fixture_isolation();
-    let Some((config, root)) = config_for("rotation-barrier") else {
-        return;
-    };
+    let (config, root) = config_for("rotation-barrier");
     let admin = connect(&config).await;
     let repo = Uuid::new_v4();
     insert_repo(&admin, repo).await;
@@ -456,9 +454,7 @@ async fn pg_repack_no_sync_local_legacy_and_active_target_narrow_reject() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
     preflight_fixture_isolation();
-    let Some((config, root)) = config_for("no-sync") else {
-        return;
-    };
+    let (config, root) = config_for("no-sync");
     let admin = connect(&config).await;
     let repo = Uuid::new_v4();
     insert_repo(&admin, repo).await;
