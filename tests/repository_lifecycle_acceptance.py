@@ -13,6 +13,11 @@ the canonical build receipt is validated against the exact current source root
 with ``verify_source_files=True``, and every new acceptance input is hashed
 against its committed HEAD blob.  The runner never invokes Cargo, rustc, a
 builder, Docker or a network peer.
+
+CLI failures emit only a fixed case/phase/error-class line.  Raw tracebacks,
+exception text, SQL, DSNs and tokens are never written to stderr or the report.
+A debugging ``--keep`` is explicitly reported as retained/non-clean and can
+never satisfy the overall pass gate.
 """
 from __future__ import annotations
 
@@ -23,7 +28,6 @@ from pathlib import Path
 import shutil
 import sys
 import time
-import traceback
 
 TESTS_DIR = Path(__file__).resolve().parent
 ROOT = TESTS_DIR.parent
@@ -45,11 +49,14 @@ from repository_lifecycle_acceptance_support import (  # noqa: E402
     REPORT_SCHEMA,
     bind_build_receipt,
     classify_error,
+    cleanup_qualification,
     evaluate_binding,
     expected_receipt_sha256,
     expected_source_commit,
+    failed_case_results,
     helper_input_manifest,
     safe_detail,
+    safe_failure_line,
     select_receipt,
     sha256_file,
     source_identity,
@@ -87,7 +94,10 @@ def _run_case(harness, name, function):
     except Exception as error:
         status = "failed"
         error_class = classify_error(error)
-        print(harness.redact(traceback.format_exc()), file=sys.stderr)
+        print(
+            safe_failure_line("case " + name, harness.current_phase, error_class),
+            file=sys.stderr,
+        )
         detail = {}
     return {
         "name": name,
@@ -96,21 +106,8 @@ def _run_case(harness, name, function):
         "error_class": error_class,
         "seconds": round(time.monotonic() - started, 4),
         "detail": safe_detail(detail),
+        "executed": True,
     }
-
-
-def _failed_inventory(phase, error_class):
-    return [
-        {
-            "name": name,
-            "status": "failed",
-            "phase": phase,
-            "error_class": error_class,
-            "seconds": 0.0,
-            "detail": {},
-        }
-        for name, _ in CASES
-    ]
 
 
 def _empty_helper_inputs():
@@ -137,39 +134,37 @@ def _empty_source():
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", default="target/debug/rootyard")
-    parser.add_argument("--report", type=Path)
-    parser.add_argument("--keep", action="store_true")
-    parser.add_argument("--build-receipt", type=Path)
-    parser.add_argument("--expected-source-commit")
-    parser.add_argument("--expected-receipt-sha256")
-    args = parser.parse_args()
-    args.binary = str(Path(args.binary).resolve())
-    if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
-        parser.error(
-            "ROOTYARD_TEST_DATABASE_URL is required; use a dedicated test database"
-        )
-    for executable in ("git", "psql", args.binary):
-        if not shutil.which(executable):
-            parser.error("Required executable not found: " + executable)
-
+def _run(args):
     source = _empty_source()
     try:
         source.update(source_identity(ROOT))
     except Exception as error:
         source["error_class"] = classify_error(error)
-        print(traceback.format_exc(), file=sys.stderr)
+        print(
+            safe_failure_line("preflight", "source_identity", source["error_class"]),
+            file=sys.stderr,
+        )
 
     expected_commit, expected_commit_error = expected_source_commit(
         args.expected_source_commit, os.environ
     )
+    if expected_commit_error:
+        print(
+            safe_failure_line(
+                "preflight", "expected_source_commit", expected_commit_error
+            ),
+            file=sys.stderr,
+        )
     receipt_anchor, receipt_anchor_error = expected_receipt_sha256(
         args.expected_receipt_sha256, os.environ
     )
     if receipt_anchor_error not in (None, "receipt_anchor_missing"):
-        print("expected receipt digest: " + receipt_anchor_error, file=sys.stderr)
+        print(
+            safe_failure_line(
+                "preflight", "expected_receipt_sha256", receipt_anchor_error
+            ),
+            file=sys.stderr,
+        )
 
     receipt_path, receipt_origin = select_receipt(
         args.binary, args.build_receipt, os.environ
@@ -179,7 +174,12 @@ def main():
         helper_inputs = helper_input_manifest(ROOT)
     except Exception as error:
         helper_inputs["error_class"] = classify_error(error)
-        print(traceback.format_exc(), file=sys.stderr)
+        print(
+            safe_failure_line(
+                "preflight", "helper_input_manifest", helper_inputs["error_class"]
+            ),
+            file=sys.stderr,
+        )
 
     if source.get("commit"):
         build_receipt = bind_build_receipt(
@@ -197,14 +197,33 @@ def main():
             "bound": False,
             "error_class": "source_unavailable",
         }
+    if receipt_anchor_error == "receipt_anchor_invalid":
+        # A user-supplied but malformed trusted anchor is a hard failure, not
+        # an absent optional anchor.
+        build_receipt["bound"] = False
+        build_receipt["error_class"] = "receipt_anchor_invalid"
+        build_receipt["receipt_anchor_present"] = False
+        build_receipt["receipt_anchor_matches"] = False
     binary_sha256 = sha256_file(args.binary)
     binding = evaluate_binding(
         source, expected_commit, build_receipt, binary_sha256, helper_inputs
     )
+    if not binding["bound"]:
+        print(
+            safe_failure_line("preflight", "source_binding", "source_binding_failed"),
+            file=sys.stderr,
+        )
 
     harness = AcceptanceHarness(args)
     setup = {"status": "not_run", "error_class": None}
-    cleanup = {"status": "not_run", "error_class": None}
+    cleanup = {
+        "status": "not_run",
+        "error_class": None,
+        "reason": None,
+        "retained": False,
+        "schema_dropped": False,
+        "qualified": False,
+    }
     case_results = []
     try:
         try:
@@ -212,23 +231,42 @@ def main():
             setup = {"status": "passed", "error_class": None}
         except Exception as error:
             setup = {"status": "failed", "error_class": classify_error(error)}
-            print(harness.redact(traceback.format_exc()), file=sys.stderr)
-            case_results = _failed_inventory("setup", "setup")
+            print(
+                safe_failure_line("setup", "setup", setup["error_class"]),
+                file=sys.stderr,
+            )
+            case_results = failed_case_results(PLAN_CASE_NAMES, "setup", "setup")
         else:
             for name, function in CASES:
                 case_results.append(_run_case(harness, name, function))
     finally:
+        cleanup_error = None
         try:
             harness.cleanup()
-            cleanup = {"status": "passed", "error_class": None}
         except Exception as error:
-            cleanup = {"status": "failed", "error_class": classify_error(error)}
-            print(harness.redact(traceback.format_exc()), file=sys.stderr)
+            cleanup_error = classify_error(error)
+        cleanup = cleanup_qualification(
+            args.keep,
+            harness.root.exists(),
+            not harness.schema_created,
+            cleanup_error,
+        )
+        if cleanup["status"] == "retained":
+            print("cleanup retained reason=keep_requested", file=sys.stderr)
+        elif cleanup["status"] != "passed":
+            print(
+                safe_failure_line(
+                    "cleanup",
+                    cleanup["reason"] or "cleanup",
+                    cleanup["error_class"] or "cleanup_failed",
+                ),
+                file=sys.stderr,
+            )
 
     inventory = summarize(
         case_results,
         PLAN_CASE_NAMES,
-        cleanup_ok=cleanup["status"] == "passed",
+        cleanup_ok=cleanup["qualified"],
         binding_ok=binding["bound"],
     )
     passed_count = sum(row["status"] == "passed" for row in case_results)
@@ -239,7 +277,8 @@ def main():
         "skipped": 0,
         "case_inventory": {
             "expected": list(PLAN_CASE_NAMES),
-            "executed": [row["name"] for row in case_results],
+            "reported": inventory["reported"],
+            "executed": inventory["executed"],
             "exact": inventory["exact"],
             "missing": inventory["missing"],
             "unexpected": inventory["unexpected"],
@@ -247,7 +286,8 @@ def main():
         },
         "counts": {
             "expected": len(PLAN_CASE_NAMES),
-            "executed": len(case_results),
+            "reported": len(case_results),
+            "executed": len(inventory["executed"]),
             "passed": passed_count,
             "failed": failed_count,
             "skipped": 0,
@@ -263,6 +303,7 @@ def main():
             "receipt_origin": receipt_origin,
             "receipt_anchor": receipt_anchor,
             "receipt_anchor_present": receipt_anchor is not None,
+            "receipt_anchor_error": receipt_anchor_error,
             "checks": binding["checks"],
         },
         "helper_inputs": helper_inputs,
@@ -274,6 +315,49 @@ def main():
         args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["passed"] else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", default="target/debug/rootyard")
+    parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="retain scratch files; cleanup is reported retained and cannot pass",
+    )
+    parser.add_argument("--build-receipt", type=Path)
+    parser.add_argument(
+        "--expected-source-commit",
+        help="trusted current source commit; defaults to ROOTYARD_EXPECTED_SOURCE_COMMIT/GITHUB_SHA",
+    )
+    parser.add_argument(
+        "--expected-receipt-sha256",
+        help="optional trusted canonical receipt digest anchor",
+    )
+    args = parser.parse_args()
+    args.binary = str(Path(args.binary).resolve())
+    if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
+        parser.error(
+            "ROOTYARD_TEST_DATABASE_URL is required; use a dedicated test database"
+        )
+    for executable in ("git", "psql", args.binary):
+        if not shutil.which(executable):
+            parser.error("Required executable not found: " + executable)
+    try:
+        return _run(args)
+    except SystemExit:
+        print(
+            safe_failure_line("preflight", "unexpected", "system_exit"),
+            file=sys.stderr,
+        )
+        return 1
+    except BaseException as error:
+        print(
+            safe_failure_line("preflight", "unexpected", classify_error(error)),
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":

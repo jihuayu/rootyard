@@ -1,13 +1,7 @@
-"""Safe, pure support for the Issue #85 literal acceptance runner.
+"""Pure support for the Issue #85 literal acceptance runner.
 
-This module deliberately contains no service, database, Git clone/push, LFS
-network, Docker, compiler or Cargo execution.  It classifies failures,
-allowlists report detail, reads the immutable source identity, captures the
-new acceptance-input manifest, and validates the canonical build receipt
-through the existing ``scripts/native_build_receipt.py`` reader with source
-files re-verified against the exact current source root.
-
-The four-case inventory is exactly the reviewed plan IDs.
+Binds clean exact source, new inputs, binary and canonical receipt; no native
+service, database, Git-network, Docker, compiler or Cargo execution occurs.
 """
 from __future__ import annotations
 
@@ -29,10 +23,7 @@ PLAN_CASE_NAMES = (
     "ci_pin_blocks_purge",
     "rename_alias_accepts_real_git_and_lfs_writes",
 )
-
-# All new acceptance inputs are bound by the helper manifest.  The fixed list
-# is intentionally explicit: an untracked or modified helper cannot silently
-# become part of the acceptance oracle.
+# Fixed new-input manifest; an untracked/modified helper cannot be silent.
 ACCEPTANCE_INPUT_PATHS = (
     "tests/repository_lifecycle_acceptance.py",
     "tests/repository_lifecycle_acceptance_support.py",
@@ -65,7 +56,6 @@ CASE_DETAIL_KEYS = frozenset(
         "canonical_bytes",
     }
 )
-
 
 def fresh_key(prefix: str) -> str:
     """Return a bounded idempotency key containing only the accepted alphabet."""
@@ -111,6 +101,11 @@ def classify_error(error) -> str:
     return "other"
 
 
+def safe_failure_line(kind: str, phase: str, error_class: str) -> str:
+    """Return the only failure text this evidence runner may print."""
+    return f"{kind} failed phase={phase} error_class={error_class}"
+
+
 def _git(root, *args: str) -> str:
     return subprocess.check_output(
         ["git", "-C", str(root), *args],
@@ -134,19 +129,14 @@ def is_sha256(value) -> bool:
 
 
 def expected_source_commit(explicit=None, environ=None):
-    """Return the externally supplied expected commit and a fixed error class.
-
-    The checkout HEAD is never silently substituted for the trusted run
-    context; the caller must supply this anchor through the CLI, the CI
-    environment or ``GITHUB_SHA``.
-    """
+    """Return the trusted expected commit; HEAD is never silently substituted."""
     environ = os.environ if environ is None else environ
     value = explicit or environ.get("ROOTYARD_EXPECTED_SOURCE_COMMIT") or environ.get("GITHUB_SHA")
     if not value:
         return None, "expected_source_commit_missing"
     normalized = str(value).strip().lower()
     if not is_full_commit(normalized):
-        return normalized, "expected_source_commit_invalid"
+        return None, "expected_source_commit_invalid"
     return normalized, None
 
 
@@ -158,29 +148,26 @@ def expected_receipt_sha256(explicit=None, environ=None):
         return None, "receipt_anchor_missing"
     normalized = str(value).strip().lower()
     if not is_sha256(normalized):
-        return normalized, "receipt_anchor_invalid"
+        return None, "receipt_anchor_invalid"
     return normalized, None
 
 
-def source_identity(root, receipts=None):
-    """Return commit/tree/parents plus full tracked and untracked Git state.
-
-    ``git_state`` is the existing receipt-reader helper: it reports tracked
-    changes and non-ignored untracked files while keeping ignored build/cache
-    outputs out of the dirty state.  Only counts and booleans are projected;
-    untracked paths are never emitted.
-    """
-    module = receipts or _receipt_module(root)
-    state = module.git_state(root)
+def source_identity(root):
+    """Return commit/tree/parents and full tracked plus non-ignored untracked state."""
+    commit = _git(root, "rev-parse", "--verify", "HEAD^{commit}")
+    tree = _git(root, "rev-parse", "HEAD^{tree}")
     parents = _git(root, "show", "-s", "--format=%P", "HEAD").split()
+    tracked = _git(root, "status", "--porcelain", "--untracked-files=no")
+    full = _git(root, "status", "--porcelain", "--untracked-files=all")
+    untracked = [line[3:] for line in full.splitlines() if line.startswith("?? ")]
     return {
-        "commit": state["commit"],
-        "tree": state["tree"],
+        "commit": commit,
+        "tree": tree,
         "parents": parents,
-        "working_tree_dirty": state["dirty"],
-        "tracked_dirty": state["tracked_dirty"],
-        "untracked_count": state["untracked_count"],
-        "clean": state["clean"],
+        "working_tree_dirty": bool(full.strip()),
+        "tracked_dirty": bool(tracked.strip()),
+        "untracked_count": len(untracked),
+        "clean": not full.strip(),
     }
 
 
@@ -237,12 +224,7 @@ def _git_blob(root, relative):
 
 
 def helper_input_manifest(root, committed_reader=None):
-    """Hash every new acceptance input and compare it with the HEAD blob.
-
-    The reader is injectable only so pure tests can supply file data without a
-    repository.  Production always uses ``git cat-file HEAD:<path>``; a
-    missing, untracked or modified helper makes ``bound`` false.
-    """
+    """Hash each new input and require exact equality with its HEAD blob."""
     root = Path(root)
     reader = committed_reader or (lambda relative: _git_blob(root, relative))
     files = []
@@ -300,15 +282,11 @@ def bind_build_receipt(
     helper_files=None,
     expected_receipt_sha256=None,
 ):
-    """Validate the canonical receipt against the exact current source root.
+    """Validate the receipt against the exact current source root.
 
-    The receipt bytes are read once, hashed, and parsed from that same buffer;
-    the caller-supplied digest is passed as ``receipt_sha256`` so the reader
-    cannot silently re-read a racing file.  A post-validation byte comparison
-    additionally rejects a file mutated during validation.  Validation uses
-    ``source_root=<current source>`` and ``verify_source_files=True``; there is
-    no weak ``verify_source_files=False`` fallback.  No Cargo/rustc/builder is
-    invoked.
+    Bytes are read/hashed/parsed once and the same digest is passed to the
+    reader; a post-validation byte check rejects a racing rewrite.  Validation
+    uses ``verify_source_files=True`` with no weak fallback.
     """
     result = {
         "present": False,
@@ -390,10 +368,16 @@ def bind_build_receipt(
     }
     working_tree = payload.get("working_tree")
     if isinstance(working_tree, dict):
-        if isinstance(working_tree.get("tree"), str):
-            result["recorded_tree"] = working_tree["tree"]
-        if "clean" in working_tree:
-            result["recorded_tree_clean"] = bool(working_tree["clean"])
+        tree_value = working_tree.get("tree")
+        if isinstance(tree_value, str) and is_full_commit(tree_value):
+            result["recorded_tree"] = tree_value.lower()
+        elif tree_value is not None:
+            result["recorded_tree_invalid"] = True
+        clean_value = working_tree.get("clean")
+        if isinstance(clean_value, bool):
+            result["recorded_tree_clean"] = clean_value
+        elif clean_value is not None:
+            result["recorded_tree_invalid"] = True
     if validated.config_digest is not None:
         result["config_digest"] = validated.config_digest
     return result
@@ -404,13 +388,10 @@ def evaluate_binding(source, expected_commit, receipt, binary_sha256, helper_inp
     recorded_tree = receipt.get("recorded_tree")
     recorded_tree_clean = receipt.get("recorded_tree_clean")
     checks = {
-        "source_commit_present": isinstance(source.get("commit"), str)
-        and bool(source.get("commit")),
-        "source_tree_present": isinstance(source.get("tree"), str)
-        and bool(source.get("tree")),
+        "source_commit_present": bool(source.get("commit")),
+        "source_tree_present": bool(source.get("tree")),
         "source_clean": source.get("clean") is True,
-        "expected_commit_present": isinstance(expected_commit, str)
-        and bool(expected_commit),
+        "expected_commit_present": bool(expected_commit),
         "expected_matches_head": bool(expected_commit)
         and expected_commit == source.get("commit"),
         "receipt_present": receipt.get("present") is True,
@@ -420,6 +401,7 @@ def evaluate_binding(source, expected_commit, receipt, binary_sha256, helper_inp
         "receipt_binary_matches": receipt.get("binary_sha256") == binary_sha256,
         "receipt_tree_matches": (not recorded_tree) or recorded_tree == source.get("tree"),
         "receipt_working_tree_clean": recorded_tree_clean is not False,
+        "receipt_tree_valid": receipt.get("recorded_tree_invalid") is not True,
         "receipt_anchor": receipt.get("receipt_anchor_matches") is not False,
         "helper_inputs_bound": helper_inputs.get("bound") is True,
         "helper_inputs_count": helper_inputs.get("count")
@@ -432,28 +414,87 @@ def evaluate_binding(source, expected_commit, receipt, binary_sha256, helper_inp
     }
 
 
+def cleanup_qualification(
+    keep_requested, scratch_exists, schema_dropped, error_class=None
+):
+    """Describe cleanup truth; a requested ``--keep`` is never clean/pass."""
+    if error_class is not None:
+        status = "failed"
+        reason = "cleanup_exception"
+        retained = bool(scratch_exists)
+    elif keep_requested:
+        if scratch_exists:
+            status = "retained"
+            reason = "keep_requested"
+            retained = True
+        else:
+            status = "failed"
+            reason = "keep_data_missing"
+            retained = False
+    elif scratch_exists:
+        status = "failed"
+        reason = "scratch_retained"
+        retained = True
+    else:
+        status = "passed"
+        reason = None
+        retained = False
+    return {
+        "status": status,
+        "error_class": error_class,
+        "reason": reason,
+        "retained": retained,
+        "schema_dropped": bool(schema_dropped),
+        "qualified": status == "passed",
+    }
+
+
+def failed_case_results(expected_names, phase, error_class):
+    """Report every expected name as failed but explicitly not executed."""
+    return [
+        {
+            "name": name,
+            "status": "failed",
+            "phase": phase,
+            "error_class": error_class,
+            "seconds": 0.0,
+            "detail": {},
+            "executed": False,
+        }
+        for name in expected_names
+    ]
+
+
 def summarize(case_results, expected_names, cleanup_ok, binding_ok):
     """Return the exact-inventory/no-skip decision for the report."""
-    names = [row.get("name") for row in case_results]
-    missing = [name for name in expected_names if name not in names]
-    unexpected = [name for name in names if name not in expected_names]
-    duplicate = len(names) != len(set(names))
+    reported = [row.get("name") for row in case_results]
+    executed = [
+        row.get("name") for row in case_results if row.get("executed") is True
+    ]
+    missing = [name for name in expected_names if name not in reported]
+    unexpected = [name for name in reported if name not in expected_names]
+    duplicate = len(reported) != len(set(reported))
     exact = (
         not missing
         and not unexpected
         and not duplicate
-        and len(names) == len(expected_names)
+        and len(reported) == len(expected_names)
     )
-    all_passed = bool(case_results) and all(
+    all_reported_passed = bool(case_results) and all(
         row.get("status") == "passed" for row in case_results
     )
+    all_expected_executed = all(name in executed for name in expected_names)
+    all_passed = all_reported_passed and all_expected_executed
     return {
         "passed": bool(exact and all_passed and cleanup_ok and binding_ok),
         "exact": exact,
+        "reported": reported,
+        "executed": executed,
         "missing": missing,
         "unexpected": unexpected,
         "duplicate": duplicate,
         "all_passed": all_passed,
+        "all_expected_executed": all_expected_executed,
         "cleanup_ok": bool(cleanup_ok),
         "binding_ok": bool(binding_ok),
     }

@@ -102,6 +102,7 @@ class AcceptanceContractTest(unittest.TestCase):
                 "error_class": "assertion",
                 "seconds": 0.1,
                 "detail": {},
+                "executed": True,
             },
             {
                 "name": "serving_read_header_blocks_purge",
@@ -110,6 +111,7 @@ class AcceptanceContractTest(unittest.TestCase):
                 "error_class": None,
                 "seconds": 0.2,
                 "detail": {},
+                "executed": True,
             },
             {
                 "name": "ci_pin_blocks_purge",
@@ -118,6 +120,7 @@ class AcceptanceContractTest(unittest.TestCase):
                 "error_class": None,
                 "seconds": 0.3,
                 "detail": {},
+                "executed": True,
             },
             {
                 "name": "rename_alias_accepts_real_git_and_lfs_writes",
@@ -126,6 +129,7 @@ class AcceptanceContractTest(unittest.TestCase):
                 "error_class": None,
                 "seconds": 0.4,
                 "detail": {},
+                "executed": True,
             },
         ]
         summary = support.summarize(
@@ -148,6 +152,7 @@ class AcceptanceContractTest(unittest.TestCase):
                 "error_class": None,
                 "seconds": 0.1,
                 "detail": {},
+                "executed": True,
             },
             {
                 "name": "unexpected_case",
@@ -156,6 +161,7 @@ class AcceptanceContractTest(unittest.TestCase):
                 "error_class": None,
                 "seconds": 0.1,
                 "detail": {},
+                "executed": True,
             },
         ]
         summary = support.summarize(
@@ -168,6 +174,102 @@ class AcceptanceContractTest(unittest.TestCase):
         self.assertFalse(summary["exact"])
         self.assertEqual(len(summary["missing"]), 3)
         self.assertEqual(summary["unexpected"], ["unexpected_case"])
+
+    def test_setup_failure_is_not_faked_as_executed(self):
+        rows = support.failed_case_results(
+            support.PLAN_CASE_NAMES, "setup", "setup"
+        )
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row["status"] == "failed" for row in rows))
+        self.assertTrue(all(row["phase"] == "setup" for row in rows))
+        self.assertTrue(all(row["executed"] is False for row in rows))
+        summary = support.summarize(
+            rows,
+            support.PLAN_CASE_NAMES,
+            cleanup_ok=True,
+            binding_ok=True,
+        )
+        self.assertTrue(summary["exact"])
+        self.assertEqual(summary["reported"], list(support.PLAN_CASE_NAMES))
+        self.assertEqual(summary["executed"], [])
+        self.assertFalse(summary["all_expected_executed"])
+        self.assertFalse(summary["passed"])
+
+    def test_all_four_cases_must_actually_execute(self):
+        rows = [
+            {
+                "name": name,
+                "status": "passed",
+                "phase": "control_purge",
+                "error_class": None,
+                "seconds": 0.1,
+                "detail": {},
+                "executed": True,
+            }
+            for name in support.PLAN_CASE_NAMES
+        ]
+        summary = support.summarize(
+            rows,
+            support.PLAN_CASE_NAMES,
+            cleanup_ok=True,
+            binding_ok=True,
+        )
+        self.assertTrue(summary["passed"])
+        rows[-1]["executed"] = False
+        summary = support.summarize(
+            rows,
+            support.PLAN_CASE_NAMES,
+            cleanup_ok=True,
+            binding_ok=True,
+        )
+        self.assertFalse(summary["passed"])
+        self.assertFalse(summary["all_expected_executed"])
+
+    def test_cleanup_keep_is_never_clean_or_pass(self):
+        cleanup = support.cleanup_qualification(True, True, True)
+        self.assertEqual(cleanup["status"], "retained")
+        self.assertTrue(cleanup["retained"])
+        self.assertFalse(cleanup["qualified"])
+        rows = [
+            {
+                "name": name,
+                "status": "passed",
+                "phase": "control_purge",
+                "error_class": None,
+                "seconds": 0.1,
+                "detail": {},
+                "executed": True,
+            }
+            for name in support.PLAN_CASE_NAMES
+        ]
+        summary = support.summarize(
+            rows,
+            support.PLAN_CASE_NAMES,
+            cleanup_ok=cleanup["qualified"],
+            binding_ok=True,
+        )
+        self.assertFalse(summary["passed"])
+
+    def test_cleanup_success_and_unexpected_scratch(self):
+        clean = support.cleanup_qualification(False, False, True)
+        self.assertEqual(clean["status"], "passed")
+        self.assertTrue(clean["qualified"])
+        retained = support.cleanup_qualification(False, True, True)
+        self.assertEqual(retained["status"], "failed")
+        self.assertFalse(retained["qualified"])
+        failed = support.cleanup_qualification(False, True, False, "io")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["error_class"], "io")
+        self.assertFalse(failed["qualified"])
+
+    def test_safe_failure_line_is_fixed_and_message_free(self):
+        line = support.safe_failure_line("case backup_root_blocks_purge", "blocked_purge", "assertion")
+        self.assertEqual(
+            line,
+            "case backup_root_blocks_purge failed phase=blocked_purge error_class=assertion",
+        )
+        self.assertNotIn("Traceback", line)
+        self.assertNotIn("secret", line)
 
     def test_error_classes_are_fixed_and_message_free(self):
         self.assertEqual(support.classify_error(AssertionError("secret")), "assertion")
@@ -226,7 +328,7 @@ class AcceptanceContractTest(unittest.TestCase):
                 None,
                 {"ROOTYARD_EXPECTED_SOURCE_COMMIT": "short", "GITHUB_SHA": "b" * 40},
             ),
-            ("short", "expected_source_commit_invalid"),
+            (None, "expected_source_commit_invalid"),
         )
 
     def test_expected_receipt_digest_anchor(self):
@@ -240,7 +342,7 @@ class AcceptanceContractTest(unittest.TestCase):
         )
         self.assertEqual(
             support.expected_receipt_sha256("bad", {}),
-            ("bad", "receipt_anchor_invalid"),
+            (None, "receipt_anchor_invalid"),
         )
 
     def test_clean_exact_source_binding_passes(self):
@@ -302,6 +404,14 @@ class AcceptanceContractTest(unittest.TestCase):
         )
         self.assertFalse(result["bound"])
         self.assertFalse(result["checks"]["helper_inputs_bound"])
+
+        invalid_tree = _receipt()
+        invalid_tree["recorded_tree_invalid"] = True
+        result = support.evaluate_binding(
+            _source(), "a" * 40, invalid_tree, "c" * 64, _helpers()
+        )
+        self.assertFalse(result["bound"])
+        self.assertFalse(result["checks"]["receipt_tree_valid"])
 
     def test_helper_input_manifest_detects_missing_or_changed_committed_blob(self):
         with tempfile.TemporaryDirectory() as temporary:
