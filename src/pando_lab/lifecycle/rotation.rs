@@ -1,12 +1,10 @@
 use super::super::{Config, Pack, object_store};
 use super::{
-    DEFAULT_CIPHER_SUITE, DEFAULT_KMS_KEY_ID, ENVELOPE_SCHEMA, KmsEnvelopeRecord,
-    KmsRotationReport,
-    crypto, data_key, envelopes, publication,
+    DEFAULT_CIPHER_SUITE, DEFAULT_KMS_KEY_ID, ENVELOPE_SCHEMA, KmsEnvelopeRecord, KmsRotationReport, crypto, data_key,
     db::{self, load_envelope_from_db, persist_checkpoint},
-    load_repo_packs, provider,
+    envelopes, load_repo_packs, provider,
     provider_selection::{self, PandoProviderSelection},
-    valid_kms_key_id,
+    publication, valid_kms_key_id,
     vault_provider::VaultTransitProvider,
     wrapped_dek::PandoWrappedDek,
     write_envelope_file,
@@ -25,9 +23,7 @@ mod vault_rotation;
 
 use crypto_ops::rewrap_existing_envelope;
 #[cfg(test)]
-use vault_rotation::{
-    ensure_existing_target_contract, ensure_target_available, ensure_vault_retention_option,
-};
+use vault_rotation::{ensure_existing_target_contract, ensure_target_available, ensure_vault_retention_option};
 use vault_rotation::{ensure_no_version_downgrade, rotate_vault_kms_key_with_options};
 
 pub use crypto_ops::verify_and_decrypt_pack_bytes;
@@ -102,10 +98,7 @@ impl KmsRotationCheckpoint {
     }
 }
 
-pub(crate) async fn insert_envelope_in_tx(
-    t: &tokio_postgres::Transaction<'_>,
-    env: &KmsEnvelopeRecord,
-) -> Result<()> {
+pub(crate) async fn insert_envelope_in_tx(t: &tokio_postgres::Transaction<'_>, env: &KmsEnvelopeRecord) -> Result<()> {
     super::db::insert_envelope_in_tx(t, env).await
 }
 
@@ -128,7 +121,8 @@ pub(crate) async fn load_authoritative_envelope_optional(
     };
     super::envelopes::verify_envelope_record(&env)?;
     ensure!(
-        env.repo == repo && env.pack_id == pack.id
+        env.repo == repo
+            && env.pack_id == pack.id
             && env.pack_sha256 == pack.pack_sha256
             && env.idx_sha256 == pack.idx_sha256,
         "committed DB KMS envelope identity mismatch"
@@ -174,25 +168,14 @@ async fn resolve_rotation_checkpoint(
                 cp.target_pack_ids.push(pack.id);
             }
         }
-        let (policy, _) = super::provider::prepare_rotation_target_key(
-            kms_dir,
-            &cp.to_key_id,
-            DEFAULT_KMS_KEY_ID,
-        )?;
+        let (policy, _) = super::provider::prepare_rotation_target_key(kms_dir, &cp.to_key_id, DEFAULT_KMS_KEY_ID)?;
         sync_kms_policy_to_db(c, repo, &policy).await?;
         persist_checkpoint(c, kms_dir, &cp).await?;
         return Ok((cp, policy));
     }
 
-    ensure!(
-        !opts.resume,
-        "no IN_PROGRESS KMS rotation checkpoint found to resume for repository {repo}"
-    );
-    let target = opts
-        .target_key_id
-        .as_deref()
-        .context("kms-rotate requires <new_key_id> or --resume")?
-        .trim();
+    ensure!(!opts.resume, "no IN_PROGRESS KMS rotation checkpoint found to resume for repository {repo}");
+    let target = opts.target_key_id.as_deref().context("kms-rotate requires <new_key_id> or --resume")?.trim();
     ensure!(valid_kms_key_id(target), "invalid kms_key_id '{target}'");
 
     super::provider::PandoKmsProvider::open_or_init(kms_dir, DEFAULT_KMS_KEY_ID)?;
@@ -201,10 +184,8 @@ async fn resolve_rotation_checkpoint(
         target != prev_policy.active_key_id,
         "KMS key '{target}' is already active; provide a distinct target key id"
     );
-    let (from_key_id, from_key_version) =
-        (prev_policy.active_key_id, prev_policy.active_key_version);
-    let (policy, new_ver) =
-        super::provider::prepare_rotation_target_key(kms_dir, target, DEFAULT_KMS_KEY_ID)?;
+    let (from_key_id, from_key_version) = (prev_policy.active_key_id, prev_policy.active_key_version);
+    let (policy, new_ver) = super::provider::prepare_rotation_target_key(kms_dir, target, DEFAULT_KMS_KEY_ID)?;
     sync_kms_policy_to_db(c, repo, &policy).await?;
 
     let mut cp = KmsRotationCheckpoint {
@@ -274,7 +255,13 @@ pub async fn rotate_kms_key_with_options(
     for pack in &packs {
         let existing_env = load_authoritative_envelope_optional(&c, &config.root, repo, pack).await?;
         if let Some(ref env) = existing_env {
-            ensure_no_version_downgrade(&env.provider_kind, &env.key_id, env.key_version, &cp.to_key_id, cp.to_key_version)?;
+            ensure_no_version_downgrade(
+                &env.provider_kind,
+                &env.key_id,
+                env.key_version,
+                &cp.to_key_id,
+                cp.to_key_version,
+            )?;
         }
         if let Some(ref env) = existing_env
             && env.key_id == cp.to_key_id
@@ -302,27 +289,13 @@ pub async fn rotate_kms_key_with_options(
 
         let updated = match existing_env {
             Some(ref old_env) if super::crypto::is_authenticated_mode(&old_env.encryption_mode) => {
-                rewrap_existing_envelope(
-                    &provider,
-                    &s_root,
-                    repo,
-                    pack,
-                    old_env,
-                    &cp.to_key_id,
-                    cp.to_key_version,
-                ).await?
+                rewrap_existing_envelope(&provider, &s_root, repo, pack, old_env, &cp.to_key_id, cp.to_key_version)
+                    .await?
             }
             _ => {
-                let tier = existing_env
-                    .as_ref()
-                    .map(|e| e.storage_tier.as_str())
-                    .unwrap_or("hot");
-                let suite = existing_env
-                    .as_ref()
-                    .map(|e| e.cipher_suite.as_str())
-                    .unwrap_or(DEFAULT_CIPHER_SUITE);
-                object_store::put_pack_and_seal_with_suite(config, repo, pack.id, suite, tier)
-                    .await?
+                let tier = existing_env.as_ref().map(|e| e.storage_tier.as_str()).unwrap_or("hot");
+                let suite = existing_env.as_ref().map(|e| e.cipher_suite.as_str()).unwrap_or(DEFAULT_CIPHER_SUITE);
+                object_store::put_pack_and_seal_with_suite(config, repo, pack.id, suite, tier).await?
             }
         };
         upsert_envelope_in_db(&c, &updated).await?;
@@ -388,7 +361,6 @@ pub async fn rotate_kms_key_with_options(
         envelopes,
     })
 }
-
 
 #[cfg(test)]
 mod tests;

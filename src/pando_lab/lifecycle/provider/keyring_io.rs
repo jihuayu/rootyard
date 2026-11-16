@@ -1,7 +1,4 @@
-use super::{
-    KEYRING_FILE_NAME, KeyringKeyWire, KeyringManifestWire, KmsKeyPolicy, ManagedKeyStatus,
-    POLICY_FILE_NAME,
-};
+use super::{KEYRING_FILE_NAME, KeyringKeyWire, KeyringManifestWire, KmsKeyPolicy, ManagedKeyStatus, POLICY_FILE_NAME};
 use anyhow::{Context, Result};
 use ring::rand::{SecureRandom, SystemRandom};
 use rootyard::blob_store::key_provider::DATA_KEY_BYTES;
@@ -23,11 +20,7 @@ pub(super) fn ensure_private_dir(dir: &Path) -> Result<PathBuf> {
 pub(super) fn write_private_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
     let parent = target.parent().context("missing parent for private KMS file")?;
     let tmp = parent.join(format!(".kms-tmp-{}", Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -69,16 +62,9 @@ fn sync_keyring_manifest(dir: &Path, policy: &KmsKeyPolicy) -> Result<()> {
             ManagedKeyStatus::Retained => policy.retain_previous_generations,
             ManagedKeyStatus::Revoked => false,
         })
-        .map(|entry| KeyringKeyWire {
-            key_id: entry.key_id.clone(),
-            sha256: entry.sha256.clone(),
-        })
+        .map(|entry| KeyringKeyWire { key_id: entry.key_id.clone(), sha256: entry.sha256.clone() })
         .collect();
-    let manifest = KeyringManifestWire {
-        schema: 1,
-        current: policy.active_key_id.clone(),
-        keys,
-    };
+    let manifest = KeyringManifestWire { schema: 1, current: policy.active_key_id.clone(), keys };
     write_private_atomic(&keyring_path, &serde_json::to_vec_pretty(&manifest)?)?;
     Ok(())
 }
@@ -86,9 +72,6 @@ fn sync_keyring_manifest(dir: &Path, policy: &KmsKeyPolicy) -> Result<()> {
 pub(super) fn save_policy_and_keyring(dir: &Path, policy: &KmsKeyPolicy) -> Result<()> {
     let canonical = ensure_private_dir(dir)?;
     sync_keyring_manifest(&canonical, policy)?;
-    write_private_atomic(
-        &canonical.join(POLICY_FILE_NAME),
-        &serde_json::to_vec_pretty(policy)?,
-    )?;
+    write_private_atomic(&canonical.join(POLICY_FILE_NAME), &serde_json::to_vec_pretty(policy)?)?;
     Ok(())
 }

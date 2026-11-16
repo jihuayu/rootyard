@@ -1,11 +1,10 @@
-use super::{
-    DEFAULT_CIPHER_SUITE, KmsEnvelopeRecord, LifecycleEvaluateOptions, LifecycleEvaluationReport,
-    LifecyclePolicy, LifecycleStatusReport, build_envelope_record, compute_fragmentation_metrics,
-    crypto, db, envelope_file_path, evict_cold_pack_local, provider,
-    rotate_kms_key, valid_cipher_suite, valid_encryption_mode,
-    valid_kms_key_id, verify_envelope_record, write_envelope_file,
-};
 use super::super::{Config, Pack, object_store, repack};
+use super::{
+    DEFAULT_CIPHER_SUITE, KmsEnvelopeRecord, LifecycleEvaluateOptions, LifecycleEvaluationReport, LifecyclePolicy,
+    LifecycleStatusReport, build_envelope_record, compute_fragmentation_metrics, crypto, db, envelope_file_path,
+    evict_cold_pack_local, provider, rotate_kms_key, valid_cipher_suite, valid_encryption_mode, valid_kms_key_id,
+    verify_envelope_record, write_envelope_file,
+};
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
 use tokio_postgres::Client;
@@ -18,11 +17,7 @@ pub(crate) async fn load_repo_packs(c: &Client, repo: Uuid) -> Result<Vec<Pack>>
     )
     .await?
     .into_iter()
-    .map(|r| Pack {
-        id: r.get(0),
-        pack_sha256: r.get(1),
-        idx_sha256: r.get(2),
-    })
+    .map(|r| Pack { id: r.get(0), pack_sha256: r.get(1), idx_sha256: r.get(2) })
     .collect())
 }
 
@@ -84,20 +79,11 @@ fn fenced(detail: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(LifecycleEvaluationFenced { detail: detail.into() })
 }
 
-async fn load_db_envelope_authority(
-    c: &Client,
-    repo: Uuid,
-    pack: &Pack,
-) -> Result<Option<KmsEnvelopeRecord>> {
+async fn load_db_envelope_authority(c: &Client, repo: Uuid, pack: &Pack) -> Result<Option<KmsEnvelopeRecord>> {
     let env = db::load_envelope_from_db(c, repo, pack).await?;
     if let Some(env) = &env {
-        ensure!(
-            env.repo == repo && env.pack_id == pack.id,
-            "DB KMS envelope identity mismatch for pack {}",
-            pack.id
-        );
-        verify_envelope_record(env)
-            .with_context(|| format!("invalid DB KMS envelope for pack {}", pack.id))?;
+        ensure!(env.repo == repo && env.pack_id == pack.id, "DB KMS envelope identity mismatch for pack {}", pack.id);
+        verify_envelope_record(env).with_context(|| format!("invalid DB KMS envelope for pack {}", pack.id))?;
     }
     Ok(env)
 }
@@ -107,12 +93,8 @@ pub(super) async fn evaluate_lifecycle_inner(
     repo: Uuid,
     opts: &LifecycleEvaluateOptions,
 ) -> Result<LifecycleEvaluationReport> {
-    if super::provider_selection::selected_kind()?
-        == super::provider_selection::PandoProviderSelection::VaultTransit
-    {
-        return Err(fenced(
-            "Pando lifecycle evaluation is local-only in this checkpoint; refusing local KMS mutation",
-        ));
+    if super::provider_selection::selected_kind()? == super::provider_selection::PandoProviderSelection::VaultTransit {
+        return Err(fenced("Pando lifecycle evaluation is local-only in this checkpoint; refusing local KMS mutation"));
     }
     if let Some(m) = opts.max_active_packs {
         ensure!((1..=1000).contains(&m), "max_active_packs must be within 1..=1000");
@@ -125,10 +107,7 @@ pub(super) async fn evaluate_lifecycle_inner(
     }
     let suite = opts.cipher_suite.as_deref().unwrap_or(DEFAULT_CIPHER_SUITE);
     ensure!(valid_cipher_suite(suite), "invalid cipher_suite");
-    let mode = opts
-        .encryption_mode
-        .as_deref()
-        .unwrap_or(crypto::AUTHENTICATED_ENVELOPE_MODE);
+    let mode = opts.encryption_mode.as_deref().unwrap_or(crypto::AUTHENTICATED_ENVELOPE_MODE);
     ensure!(valid_encryption_mode(mode), "invalid encryption_mode '{mode}'");
 
     // Hold one owned publication session for every lifecycle read and
@@ -156,21 +135,15 @@ pub(super) async fn evaluate_lifecycle_inner(
             )));
         }
         let meta = c
-            .query_one(
-                "SELECT storage_backend,write_paused FROM pando_lab.repositories WHERE id=$1",
-                &[&repo],
-            )
+            .query_one("SELECT storage_backend,write_paused FROM pando_lab.repositories WHERE id=$1", &[&repo])
             .await?;
         ensure!(
             !meta.get::<_, bool>(1) && meta.get::<_, String>(0) == "pando",
             "lifecycle evaluation requires active pando repository"
         );
 
-        c.execute(
-            "INSERT INTO pando_lab.lifecycle_policies(repo) VALUES($1) ON CONFLICT(repo) DO NOTHING",
-            &[&repo],
-        )
-        .await?;
+        c.execute("INSERT INTO pando_lab.lifecycle_policies(repo) VALUES($1) ON CONFLICT(repo) DO NOTHING", &[&repo])
+            .await?;
         let cur = c
             .query_one(
                 "SELECT max_active_packs,cold_transition_age_secs,auto_repack_enabled,kms_key_id,kms_key_version FROM pando_lab.lifecycle_policies WHERE repo=$1",
@@ -202,29 +175,22 @@ pub(super) async fn evaluate_lifecycle_inner(
 
         let s_root = object_store::store_root(config);
         let packs_before = load_repo_packs(c, repo).await?;
-        let fragmentation_before =
-            compute_fragmentation_metrics(&config.root, &s_root, repo, &packs_before).await?;
-        let (compaction_triggered, repack_report) = if policy.auto_repack_enabled
-            && (packs_before.len() as i32) > policy.max_active_packs
-        {
-            let rep = repack::repack_repo(
-                config,
-                repo,
-                &repack::RepackOptions {
-                    prune_superseded: true,
-                    pin_oids: Vec::new(),
-                    sync_object_store: true,
-                },
-            )
-            .await?;
-            (true, Some(rep))
-        } else {
-            (false, None)
-        };
+        let fragmentation_before = compute_fragmentation_metrics(&config.root, &s_root, repo, &packs_before).await?;
+        let (compaction_triggered, repack_report) =
+            if policy.auto_repack_enabled && (packs_before.len() as i32) > policy.max_active_packs {
+                let rep = repack::repack_repo(
+                    config,
+                    repo,
+                    &repack::RepackOptions { prune_superseded: true, pin_oids: Vec::new(), sync_object_store: true },
+                )
+                .await?;
+                (true, Some(rep))
+            } else {
+                (false, None)
+            };
 
         let packs_after = load_repo_packs(c, repo).await?;
-        let fragmentation_after =
-            compute_fragmentation_metrics(&config.root, &s_root, repo, &packs_after).await?;
+        let fragmentation_after = compute_fragmentation_metrics(&config.root, &s_root, repo, &packs_after).await?;
         let active_ids: Vec<Uuid> = packs_after.iter().map(|p| p.id).collect();
         c.execute(
             "DELETE FROM pando_lab.kms_envelopes WHERE repo=$1 AND NOT (pack_id = ANY($2))",
@@ -232,11 +198,7 @@ pub(super) async fn evaluate_lifecycle_inner(
         )
         .await?;
 
-        let tier = if opts.cold_evict_local || policy.cold_transition_age_secs == 0 {
-            "cold_archive"
-        } else {
-            "hot"
-        };
+        let tier = if opts.cold_evict_local || policy.cold_transition_age_secs == 0 { "cold_archive" } else { "hot" };
         let (mut envelopes, mut cold_count, mut evicted_count) = (Vec::new(), 0usize, 0usize);
         for pack in &packs_after {
             let env = if crypto::is_authenticated_mode(mode) {
@@ -244,26 +206,23 @@ pub(super) async fn evaluate_lifecycle_inner(
                 // legacy row may read the file, and it is published to the DB
                 // before the mirror is refreshed.
                 if let Some(mut cur_env) = load_db_envelope_authority(c, repo, pack).await? {
-                    if cur_env.storage_tier != tier
-                        && crypto::is_authenticated_mode(&cur_env.encryption_mode)
-                    {
+                    if cur_env.storage_tier != tier && crypto::is_authenticated_mode(&cur_env.encryption_mode) {
                         cur_env.storage_tier = tier.to_owned();
-                        cur_env.envelope_mac =
-                            crypto::compute_authenticated_envelope_mac(&crypto::EnvelopeMacInputs {
-                                encryption_mode: &cur_env.encryption_mode,
-                                repo,
-                                pack_id: pack.id,
-                                key_id: &cur_env.key_id,
-                                key_version: cur_env.key_version,
-                                cipher_suite: &cur_env.cipher_suite,
-                                pack_sha256: &cur_env.pack_sha256,
-                                idx_sha256: &cur_env.idx_sha256,
-                                ciphertext_sha256: cur_env.ciphertext_sha256.as_deref().unwrap_or(""),
-                                ciphertext_bytes: cur_env.ciphertext_bytes.unwrap_or(0),
-                                envelope_id: cur_env.envelope_id.context("missing envelope_id")?,
-                                nonce_prefix: cur_env.nonce_prefix.as_deref().unwrap_or(""),
-                                wrapped_key_json: cur_env.wrapped_key_json.as_deref().unwrap_or(""),
-                            });
+                        cur_env.envelope_mac = crypto::compute_authenticated_envelope_mac(&crypto::EnvelopeMacInputs {
+                            encryption_mode: &cur_env.encryption_mode,
+                            repo,
+                            pack_id: pack.id,
+                            key_id: &cur_env.key_id,
+                            key_version: cur_env.key_version,
+                            cipher_suite: &cur_env.cipher_suite,
+                            pack_sha256: &cur_env.pack_sha256,
+                            idx_sha256: &cur_env.idx_sha256,
+                            ciphertext_sha256: cur_env.ciphertext_sha256.as_deref().unwrap_or(""),
+                            ciphertext_bytes: cur_env.ciphertext_bytes.unwrap_or(0),
+                            envelope_id: cur_env.envelope_id.context("missing envelope_id")?,
+                            nonce_prefix: cur_env.nonce_prefix.as_deref().unwrap_or(""),
+                            wrapped_key_json: cur_env.wrapped_key_json.as_deref().unwrap_or(""),
+                        });
                         db::upsert_envelope_in_db(c, &cur_env).await?;
                     }
                     let _ = write_envelope_file(&config.root, &cur_env);
@@ -288,8 +247,7 @@ pub(super) async fn evaluate_lifecycle_inner(
                 }
             } else {
                 ensure_no_authenticated_envelope(c, &config.root, &s_root, repo, pack).await?;
-                let syn =
-                    build_envelope_record(repo, pack, &policy.kms_key_id, policy.kms_key_version, suite, tier)?;
+                let syn = build_envelope_record(repo, pack, &policy.kms_key_id, policy.kms_key_version, suite, tier)?;
                 db::upsert_envelope_in_db(c, &syn).await?;
                 let _ = write_envelope_file(&config.root, &syn);
                 syn
@@ -320,9 +278,7 @@ pub(super) async fn evaluate_lifecycle_inner(
         .kms_key_id
         .as_deref()
         .map(str::trim)
-        .filter(|requested| {
-            *requested != policy.kms_key_id.as_str() && crypto::is_authenticated_mode(mode)
-        })
+        .filter(|requested| *requested != policy.kms_key_id.as_str() && crypto::is_authenticated_mode(mode))
         .map(str::to_owned);
     if let Some(requested_key) = rotate_target {
         let rot = rotate_kms_key(config, repo, &requested_key).await?;
@@ -349,11 +305,8 @@ pub(super) async fn evaluate_lifecycle_inner(
 
 pub(super) async fn status_inner(config: &Config, repo: Uuid) -> Result<LifecycleStatusReport> {
     let c = config.db().await?;
-    c.execute(
-        "INSERT INTO pando_lab.lifecycle_policies(repo) VALUES($1) ON CONFLICT(repo) DO NOTHING",
-        &[&repo],
-    )
-    .await?;
+    c.execute("INSERT INTO pando_lab.lifecycle_policies(repo) VALUES($1) ON CONFLICT(repo) DO NOTHING", &[&repo])
+        .await?;
     let p = c
         .query_one(
             "SELECT max_active_packs,cold_transition_age_secs,auto_repack_enabled,kms_key_id,kms_key_version FROM pando_lab.lifecycle_policies WHERE repo=$1",

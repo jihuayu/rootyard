@@ -17,34 +17,24 @@ use uuid::Uuid;
 fn database_with_repeatable_read_default(database: &str) -> String {
     if database.contains("://") {
         let separator = if database.contains('?') { '&' } else { '?' };
-        format!(
-            "{database}{separator}options=-c%20default_transaction_isolation%3Drepeatable%5C%20read"
-        )
+        format!("{database}{separator}options=-c%20default_transaction_isolation%3Drepeatable%5C%20read")
     } else {
         format!("{database} options='-c default_transaction_isolation=repeatable\\\\ read'")
     }
 }
 
 fn external_override_present() -> bool {
-    [
-        "PANDO_OBJECT_STORE_ROOT",
-        "PANDO_KMS_KEYRING_DIR",
-        "PANDO_KMS_PROVIDER",
-        "ROOTYARD_OBJECT_STORE_ENDPOINT",
-    ]
-    .into_iter()
-    .any(|key| std::env::var_os(key).is_some())
+    ["PANDO_OBJECT_STORE_ROOT", "PANDO_KMS_KEYRING_DIR", "PANDO_KMS_PROVIDER", "ROOTYARD_OBJECT_STORE_ENDPOINT"]
+        .into_iter()
+        .any(|key| std::env::var_os(key).is_some())
 }
 
 pub(super) fn config_for(label: &str) -> (Config, PathBuf) {
     if external_override_present() {
-        panic!(
-            "snapshot retention PG fixture refuses external object-store/KMS/endpoint overrides"
-        );
+        panic!("snapshot retention PG fixture refuses external object-store/KMS/endpoint overrides");
     }
-    let database = std::env::var("ROOTYARD_TEST_DATABASE_URL").unwrap_or_else(|_| {
-        panic!("snapshot retention PG cases require a nonempty ROOTYARD_TEST_DATABASE_URL")
-    });
+    let database = std::env::var("ROOTYARD_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| panic!("snapshot retention PG cases require a nonempty ROOTYARD_TEST_DATABASE_URL"));
     let database = database.trim().to_owned();
     if database.is_empty() {
         panic!("snapshot retention PG cases require a nonempty ROOTYARD_TEST_DATABASE_URL");
@@ -56,14 +46,7 @@ pub(super) fn config_for(label: &str) -> (Config, PathBuf) {
     let root = std::env::temp_dir().join(format!("pando-snapshot-pg-{label}-{}", Uuid::new_v4()));
     std::fs::create_dir_all(root.join("objects")).expect("snapshot retention fixture root");
     std::fs::create_dir_all(root.join("sessions")).expect("snapshot retention fixture sessions");
-    (
-        Config {
-            database,
-            root: root.clone(),
-            git: PathBuf::from("/usr/bin/git"),
-        },
-        root,
-    )
+    (Config { database, root: root.clone(), git: PathBuf::from("/usr/bin/git") }, root)
 }
 
 pub(super) fn actor_config(config: &Config, appname: &str) -> Config {
@@ -89,10 +72,7 @@ pub(super) async fn connect_named(config: &Config, appname: &str) -> Client {
         .await
         .expect("fixture session default isolation");
     client
-        .execute(
-            "SELECT set_config('application_name',$1,false)",
-            &[&appname],
-        )
+        .execute("SELECT set_config('application_name',$1,false)", &[&appname])
         .await
         .expect("fixture session application_name");
     client
@@ -122,65 +102,28 @@ pub(super) async fn cleanup(client: &Client, repo: Uuid) {
 
 pub(super) async fn insert_repo(client: &Client, repo: Uuid) {
     client
-        .execute(
-            "INSERT INTO pando_lab.repositories(id,storage_backend) VALUES($1,'pando')",
-            &[&repo],
-        )
+        .execute("INSERT INTO pando_lab.repositories(id,storage_backend) VALUES($1,'pando')", &[&repo])
         .await
         .unwrap();
 }
 
 async fn init_work(config: &Config, work: &Path) {
     std::fs::create_dir_all(work).unwrap();
-    config
-        .git(work, &["init", "--initial-branch=main", "."], b"")
-        .await
-        .unwrap();
-    config
-        .git(work, &["config", "user.name", "T"], b"")
-        .await
-        .unwrap();
-    config
-        .git(work, &["config", "user.email", "t@e.c"], b"")
-        .await
-        .unwrap();
+    config.git(work, &["init", "--initial-branch=main", "."], b"").await.unwrap();
+    config.git(work, &["config", "user.name", "T"], b"").await.unwrap();
+    config.git(work, &["config", "user.email", "t@e.c"], b"").await.unwrap();
 }
 
-async fn commit_file(
-    config: &Config,
-    work: &Path,
-    name: &str,
-    text: &str,
-    message: &str,
-) -> String {
+async fn commit_file(config: &Config, work: &Path, name: &str, text: &str, message: &str) -> String {
     std::fs::write(work.join(name), text).unwrap();
     config.git(work, &["add", name], b"").await.unwrap();
-    config
-        .git(work, &["commit", "-m", message], b"")
-        .await
-        .unwrap();
-    String::from_utf8(
-        config
-            .git(work, &["rev-parse", "HEAD"], b"")
-            .await
-            .unwrap(),
-    )
-    .unwrap()
-    .trim()
-    .to_owned()
+    config.git(work, &["commit", "-m", message], b"").await.unwrap();
+    String::from_utf8(config.git(work, &["rev-parse", "HEAD"], b"").await.unwrap()).unwrap().trim().to_owned()
 }
 
-async fn publish(
-    config: &Config,
-    admin: &Client,
-    repo: Uuid,
-    work: &Path,
-    roots: &[String],
-) -> Pack {
-    let (pack, oids) = super::publish_pack(config, repo, Uuid::new_v4(), work, roots)
-        .await
-        .unwrap()
-        .expect("incremental pack");
+async fn publish(config: &Config, admin: &Client, repo: Uuid, work: &Path, roots: &[String]) -> Pack {
+    let (pack, oids) =
+        super::publish_pack(config, repo, Uuid::new_v4(), work, roots).await.unwrap().expect("incremental pack");
     admin
         .execute(
             "INSERT INTO pando_lab.manifests(repo,pack_id,pack_sha256,idx_sha256) VALUES($1,$2,$3,$4)",
@@ -190,10 +133,7 @@ async fn publish(
         .unwrap();
     for oid in &oids {
         admin
-            .execute(
-                "INSERT INTO pando_lab.objects(repo,oid,pack_id) VALUES($1,$2,$3)",
-                &[&repo, oid, &pack.id],
-            )
+            .execute("INSERT INTO pando_lab.objects(repo,oid,pack_id) VALUES($1,$2,$3)", &[&repo, oid, &pack.id])
             .await
             .unwrap();
     }
@@ -211,11 +151,7 @@ async fn set_ref(admin: &Client, repo: Uuid, name: &str, oid: &str) {
         .unwrap();
 }
 
-pub(super) async fn seed_single_pack(
-    config: &Config,
-    admin: &Client,
-    repo: Uuid,
-) -> (Pack, String) {
+pub(super) async fn seed_single_pack(config: &Config, admin: &Client, repo: Uuid) -> (Pack, String) {
     let work = config.root.join("work");
     init_work(config, &work).await;
     let commit = commit_file(config, &work, "a.txt", "one\n", "c1").await;
@@ -224,20 +160,13 @@ pub(super) async fn seed_single_pack(
     (pack, commit)
 }
 
-pub(super) async fn seed_two_packs(
-    config: &Config,
-    admin: &Client,
-    repo: Uuid,
-) -> (Pack, Pack) {
+pub(super) async fn seed_two_packs(config: &Config, admin: &Client, repo: Uuid) -> (Pack, Pack) {
     let work = config.root.join("work");
     init_work(config, &work).await;
     let first = commit_file(config, &work, "a.txt", "one\n", "c1").await;
     let live = publish(config, admin, repo, &work, &[first.clone()]).await;
     set_ref(admin, repo, "refs/heads/main", &first).await;
-    config
-        .git(&work, &["checkout", "-b", "expired", &first], b"")
-        .await
-        .unwrap();
+    config.git(&work, &["checkout", "-b", "expired", &first], b"").await.unwrap();
     let second = commit_file(config, &work, "b.txt", "two\n", "c2").await;
     let expired = publish(config, admin, repo, &work, &[second]).await;
     (live, expired)
@@ -292,12 +221,7 @@ pub(super) async fn insert_snapshot(
     id
 }
 
-pub(super) async fn retained_snapshot(
-    admin: &Client,
-    token: Uuid,
-    repo: Uuid,
-    principal: &str,
-) -> Snapshot {
+pub(super) async fn retained_snapshot(admin: &Client, token: Uuid, repo: Uuid, principal: &str) -> Snapshot {
     let row = admin
         .query_one(
             "SELECT generation,storage_generation,refs,packs FROM pando_lab.snapshots \
@@ -329,23 +253,10 @@ pub(super) async fn assert_token_ttl(admin: &Client, token: Uuid) {
     assert!(live_default, "the schema's five-minute token lifetime must remain");
 }
 
-pub(super) async fn materialize_and_read(
-    config: &Config,
-    snapshot: &Snapshot,
-    base: &Path,
-    path: &str,
-) -> String {
-    let repo = super::materialize(config, snapshot, base, &Control::default())
-        .await
-        .unwrap();
+pub(super) async fn materialize_and_read(config: &Config, snapshot: &Snapshot, base: &Path, path: &str) -> String {
+    let repo = super::materialize(config, snapshot, base, &Control::default()).await.unwrap();
     let refspec = format!("refs/heads/main:{path}");
-    String::from_utf8(
-        config
-            .git(&repo, &["show", &refspec], b"")
-            .await
-            .unwrap(),
-    )
-    .unwrap()
+    String::from_utf8(config.git(&repo, &["show", &refspec], b"").await.unwrap()).unwrap()
 }
 
 pub(super) async fn metadata_count(admin: &Client, repo: Uuid, pack: Uuid) -> i64 {
@@ -360,9 +271,5 @@ pub(super) async fn metadata_count(admin: &Client, repo: Uuid, pack: Uuid) -> i6
 }
 
 pub(super) fn options() -> repack::RepackOptions {
-    repack::RepackOptions {
-        prune_superseded: true,
-        pin_oids: Vec::new(),
-        sync_object_store: false,
-    }
+    repack::RepackOptions { prune_superseded: true, pin_oids: Vec::new(), sync_object_store: false }
 }

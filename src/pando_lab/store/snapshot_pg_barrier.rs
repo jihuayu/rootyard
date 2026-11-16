@@ -29,10 +29,7 @@ struct BarrierSpec {
 
 impl BarrierSpec {
     fn marker(&self, suffix: &str) -> PathBuf {
-        self.dir.join(format!(
-            "{}.{}.{}.{}",
-            self.point, self.nonce, self.repo, suffix
-        ))
+        self.dir.join(format!("{}.{}.{}.{}", self.point, self.nonce, self.repo, suffix))
     }
 
     fn matches(&self, point: &str, repo: Uuid, appname: &str) -> bool {
@@ -51,20 +48,9 @@ pub(super) struct BarrierCase {
 }
 
 impl BarrierCase {
-    pub(super) fn arm(
-        dir: PathBuf,
-        repo: Uuid,
-        point: &str,
-        appname: &str,
-        nonce: &str,
-    ) -> Self {
-        let spec = BarrierSpec {
-            dir,
-            repo,
-            point: point.to_owned(),
-            appname: appname.to_owned(),
-            nonce: nonce.to_owned(),
-        };
+    pub(super) fn arm(dir: PathBuf, repo: Uuid, point: &str, appname: &str, nonce: &str) -> Self {
+        let spec =
+            BarrierSpec { dir, repo, point: point.to_owned(), appname: appname.to_owned(), nonce: nonce.to_owned() };
         *BARRIER.lock().expect("snapshot retention barrier lock") = Some(spec.clone());
         Self { spec }
     }
@@ -77,21 +63,13 @@ impl BarrierCase {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!(
-            "snapshot retention barrier point '{}' was not reached by the owned actor",
-            self.spec.point
-        );
+        panic!("snapshot retention barrier point '{}' was not reached by the owned actor", self.spec.point);
     }
 
     pub(super) fn assert_read_committed(&self) {
         let isolation = std::fs::read_to_string(self.spec.marker("isolation"))
             .expect("the production barrier must record actual transaction isolation");
-        assert_eq!(
-            isolation.trim(),
-            "read committed",
-            "actual transaction isolation at {}",
-            self.spec.point
-        );
+        assert_eq!(isolation.trim(), "read committed", "actual transaction isolation at {}", self.spec.point);
     }
 
     pub(super) fn release(&self) {
@@ -103,10 +81,9 @@ impl Drop for BarrierCase {
     fn drop(&mut self) {
         {
             let mut slot = BARRIER.lock().expect("snapshot retention barrier lock");
-            let same = slot
-                .as_ref()
-                .is_some_and(|spec| spec.matches(&self.spec.point, self.spec.repo, &self.spec.appname)
-                    && spec.nonce == self.spec.nonce);
+            let same = slot.as_ref().is_some_and(|spec| {
+                spec.matches(&self.spec.point, self.spec.repo, &self.spec.appname) && spec.nonce == self.spec.nonce
+            });
             if same {
                 *slot = None;
             }
@@ -116,10 +93,7 @@ impl Drop for BarrierCase {
 }
 
 pub(crate) fn arm_fault(point: &str, repo: Uuid) {
-    *FAULT.lock().expect("snapshot retention fault lock") = Some(FaultSpec {
-        point: point.to_owned(),
-        repo,
-    });
+    *FAULT.lock().expect("snapshot retention fault lock") = Some(FaultSpec { point: point.to_owned(), repo });
 }
 
 pub(crate) fn clear_fault() {
@@ -128,10 +102,7 @@ pub(crate) fn clear_fault() {
 
 pub(crate) fn fault(point: &str, repo: Uuid) -> Result<()> {
     let fault = { FAULT.lock().expect("snapshot retention fault lock").clone() };
-    if fault
-        .as_ref()
-        .is_some_and(|fault| fault.point == point && fault.repo == repo)
-    {
+    if fault.as_ref().is_some_and(|fault| fault.point == point && fault.repo == repo) {
         bail!("snapshot retention test fault before commit");
     }
     Ok(())
@@ -140,11 +111,7 @@ pub(crate) fn fault(point: &str, repo: Uuid) -> Result<()> {
 /// Test seam that records actual transaction isolation after matching the
 /// exact repository, phase and owned application_name. Unmatched calls return
 /// before any filesystem access.
-pub(crate) async fn barrier_tx(
-    point: &str,
-    repo: Uuid,
-    transaction: &tokio_postgres::Transaction<'_>,
-) -> Result<()> {
+pub(crate) async fn barrier_tx(point: &str, repo: Uuid, transaction: &tokio_postgres::Transaction<'_>) -> Result<()> {
     let spec = { BARRIER.lock().expect("snapshot retention barrier lock").clone() };
     let Some(spec) = spec else {
         return Ok(());
@@ -152,18 +119,12 @@ pub(crate) async fn barrier_tx(
     if spec.point != point || spec.repo != repo {
         return Ok(());
     }
-    let appname: String = transaction
-        .query_one("SELECT current_setting('application_name')", &[])
-        .await?
-        .get(0);
+    let appname: String = transaction.query_one("SELECT current_setting('application_name')", &[]).await?.get(0);
     if !spec.matches(point, repo, &appname) {
         return Ok(());
     }
     std::fs::create_dir_all(&spec.dir)?;
-    let isolation: String = transaction
-        .query_one("SHOW transaction_isolation", &[])
-        .await?
-        .get(0);
+    let isolation: String = transaction.query_one("SHOW transaction_isolation", &[]).await?.get(0);
     std::fs::write(spec.marker("isolation"), isolation)?;
     std::fs::write(spec.marker("ready"), b"")?;
     wait_release(&spec).await
@@ -173,10 +134,7 @@ async fn wait_release(spec: &BarrierSpec) -> Result<()> {
     let release = spec.marker("release");
     let started = Instant::now();
     while !release.exists() {
-        ensure!(
-            started.elapsed().as_secs() < 30,
-            "snapshot retention test barrier timeout"
-        );
+        ensure!(started.elapsed().as_secs() < 30, "snapshot retention test barrier timeout");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     Ok(())
@@ -187,15 +145,9 @@ pub(super) fn case_nonce() -> String {
 }
 
 pub(super) fn actor_appname(nonce: &str, repo: Uuid, role: &str) -> String {
-    assert!(
-        !nonce.is_empty() && nonce.len() <= 16,
-        "test application_name nonce must be bounded"
-    );
+    assert!(!nonce.is_empty() && nonce.len() <= 16, "test application_name nonce must be bounded");
     let appname = format!("rs-{nonce}-{repo}-{role}");
-    assert!(
-        appname.len() <= 63,
-        "test application_name exceeds the PostgreSQL limit"
-    );
+    assert!(appname.len() <= 63, "test application_name exceeds the PostgreSQL limit");
     appname
 }
 
@@ -223,10 +175,7 @@ pub(super) async fn wait_for_actor_lock_wait(
     expected_phase: &str,
     attempts: usize,
 ) {
-    assert!(
-        appname.contains(&repo.to_string()),
-        "actor application_name must bind the repository"
-    );
+    assert!(appname.contains(&repo.to_string()), "actor application_name must bind the repository");
     let phase = format!("%{expected_phase}%");
     for _ in 0..attempts {
         let row = admin
@@ -252,14 +201,7 @@ pub(super) async fn wait_for_actor_lock_wait(
             let candidate: String = row.get(0);
             let wait_event: Option<String> = row.get(1);
             let query: String = row.get(2);
-            if exact_actor_wait(
-                appname,
-                repo,
-                expected_phase,
-                &candidate,
-                wait_event.as_deref(),
-                &query,
-            ) {
+            if exact_actor_wait(appname, repo, expected_phase, &candidate, wait_event.as_deref(), &query) {
                 return;
             }
         }
@@ -269,9 +211,7 @@ pub(super) async fn wait_for_actor_lock_wait(
 }
 
 pub(super) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub(super) struct HookGuard;
@@ -324,46 +264,11 @@ mod tests {
         let nonce = case_nonce();
         let appname = actor_appname(&nonce, repo, "snap");
         let query = "SELECT generation FROM pando_lab.repositories WHERE id=$1 FOR SHARE";
-        assert!(exact_actor_wait(
-            &appname,
-            repo,
-            "FOR SHARE",
-            &appname,
-            Some("Lock"),
-            query
-        ));
-        assert!(!exact_actor_wait(
-            &appname,
-            repo,
-            "FOR SHARE",
-            "rs-unrelated",
-            Some("Lock"),
-            query
-        ));
-        assert!(!exact_actor_wait(
-            &appname,
-            repo,
-            "FOR SHARE",
-            &appname,
-            Some("ClientRead"),
-            query
-        ));
-        assert!(!exact_actor_wait(
-            &appname,
-            repo,
-            "FOR UPDATE",
-            &appname,
-            Some("Lock"),
-            query
-        ));
-        assert!(!exact_actor_wait(
-            &appname,
-            other,
-            "FOR SHARE",
-            &appname,
-            Some("Lock"),
-            query
-        ));
+        assert!(exact_actor_wait(&appname, repo, "FOR SHARE", &appname, Some("Lock"), query));
+        assert!(!exact_actor_wait(&appname, repo, "FOR SHARE", "rs-unrelated", Some("Lock"), query));
+        assert!(!exact_actor_wait(&appname, repo, "FOR SHARE", &appname, Some("ClientRead"), query));
+        assert!(!exact_actor_wait(&appname, repo, "FOR UPDATE", &appname, Some("Lock"), query));
+        assert!(!exact_actor_wait(&appname, other, "FOR SHARE", &appname, Some("Lock"), query));
     }
 
     #[test]

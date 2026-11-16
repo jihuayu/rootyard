@@ -103,9 +103,8 @@ fn sample_pack_payload() -> (Uuid, Uuid, Vec<u8>, String) {
 async fn versioned_provider_key_version_overrides_the_caller_hint() {
     let provider = VersionedProvider { key_id: KeyId::parse("pando-vault-key").unwrap() };
     let (repo, pack_id, plain, idx_sha) = sample_pack_payload();
-    let sealed = seal_pack_bytes(&provider, repo, pack_id, &idx_sha, "AES-256-GCM-HMAC-SHA256", 1, &plain)
-        .await
-        .unwrap();
+    let sealed =
+        seal_pack_bytes(&provider, repo, pack_id, &idx_sha, "AES-256-GCM-HMAC-SHA256", 1, &plain).await.unwrap();
     assert_eq!(sealed.provider_kind, "vault-transit");
     assert_eq!(sealed.key_id, "pando-vault-key");
     assert_eq!(sealed.key_version, 7);
@@ -139,22 +138,15 @@ async fn sealed_packs_encrypt_with_random_dek_nonce_and_roundtrip_both_ciphers()
                 wrapped_key_json: &s1.wrapped_key_json,
             },
             &s1.ciphertext,
-        ).await
+        )
+        .await
         .unwrap();
         assert_eq!(opened, plain);
         assert_eq!(sha256_hex(&opened), sha256_hex(&plain));
     }
 
-    let empty_sealed = seal_pack_bytes(
-        &prov,
-        repo,
-        pack_id,
-        &idx_sha,
-        "CHACHA20-POLY1305-SHA256",
-        1,
-        b"",
-    ).await
-    .unwrap();
+    let empty_sealed =
+        seal_pack_bytes(&prov, repo, pack_id, &idx_sha, "CHACHA20-POLY1305-SHA256", 1, b"").await.unwrap();
     let empty_open = open_sealed_pack_bytes(
         &prov,
         &OpenSealedRequest {
@@ -168,7 +160,8 @@ async fn sealed_packs_encrypt_with_random_dek_nonce_and_roundtrip_both_ciphers()
             wrapped_key_json: &empty_sealed.wrapped_key_json,
         },
         &empty_sealed.ciphertext,
-    ).await
+    )
+    .await
     .unwrap();
     assert!(empty_open.is_empty());
     let _ = std::fs::remove_dir_all(&tmp);
@@ -178,8 +171,7 @@ async fn sealed_packs_encrypt_with_random_dek_nonce_and_roundtrip_both_ciphers()
 async fn tampered_ciphertext_wrong_key_wrong_context_and_fallback_provider_fail_closed() {
     let tmp = std::env::temp_dir().join(format!("pando-crypto-fail-{}", Uuid::new_v4()));
     let prov = PandoKmsProvider::open_or_init(&tmp.join("kms-a"), "kms-local-default-v1").unwrap();
-    let wrong_prov =
-        PandoKmsProvider::open_or_init(&tmp.join("kms-b"), "kms-local-default-v1").unwrap();
+    let wrong_prov = PandoKmsProvider::open_or_init(&tmp.join("kms-b"), "kms-local-default-v1").unwrap();
     let (repo, pack_id, plain, idx_sha) = sample_pack_payload();
     let suite = "AES-256-GCM-HMAC-SHA256";
     let sealed = seal_pack_bytes(&prov, repo, pack_id, &idx_sha, suite, 1, &plain).await.unwrap();

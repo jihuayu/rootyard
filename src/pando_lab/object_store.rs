@@ -10,11 +10,11 @@ mod authority;
 mod publication;
 pub(crate) use publication::{PreparedPackPublication, PublicationReceipt, prepare_pack_files_sealed};
 #[cfg(test)]
-mod publication_tests;
+mod pg_receipt_tests;
 #[cfg(test)]
 mod pg_tests;
 #[cfg(test)]
-mod pg_receipt_tests;
+mod publication_tests;
 
 pub const DEFAULT_BUCKET: &str = "pando-default";
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
@@ -151,16 +151,29 @@ pub struct ObjectStoreStatusReport {
 }
 
 pub fn default_bucket() -> String {
-    std::env::var("PANDO_OBJECT_STORE_BUCKET").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| DEFAULT_BUCKET.to_owned())
+    std::env::var("PANDO_OBJECT_STORE_BUCKET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_BUCKET.to_owned())
 }
-pub(crate) fn remote_enabled() -> bool { std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_some() }
+pub(crate) fn remote_enabled() -> bool {
+    std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_some()
+}
 
 pub(super) fn store_root(config: &Config) -> PathBuf {
-    std::env::var("PANDO_OBJECT_STORE_ROOT").ok().filter(|s| !s.trim().is_empty()).map(PathBuf::from).unwrap_or_else(|| config.root.clone())
+    std::env::var("PANDO_OBJECT_STORE_ROOT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.root.clone())
 }
 
 pub fn valid_bucket_name(bucket: &str) -> bool {
-    !bucket.is_empty() && bucket.len() <= 128 && !bucket.starts_with('.') && !bucket.ends_with('.') && !bucket.contains("..")
+    !bucket.is_empty()
+        && bucket.len() <= 128
+        && !bucket.starts_with('.')
+        && !bucket.ends_with('.')
+        && !bucket.contains("..")
         && bucket.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
 }
 
@@ -188,7 +201,8 @@ pub(super) fn stage_and_reassemble_multipart(
     std::fs::create_dir_all(&staging_dir)?;
     let res = (|| -> Result<(Vec<ChunkPartReceipt>, Vec<u8>)> {
         let mut receipts = Vec::new();
-        let slices: Vec<&[u8]> = if payload.is_empty() { vec![&[][..]] } else { payload.chunks(opts.chunk_size).collect() };
+        let slices: Vec<&[u8]> =
+            if payload.is_empty() { vec![&[][..]] } else { payload.chunks(opts.chunk_size).collect() };
         let mut offset = 0usize;
         for (idx, chunk) in slices.iter().enumerate() {
             let part_number = idx + 1;
@@ -203,22 +217,36 @@ pub(super) fn stage_and_reassemble_multipart(
             *chunks_uploaded += 1;
             if opts.corrupt_chunk_part == Some(part_number) {
                 let mut tampered = std::fs::read(&part_path)?;
-                if tampered.is_empty() { tampered.push(0xff); } else { tampered[0] ^= 0xff; }
+                if tampered.is_empty() {
+                    tampered.push(0xff);
+                } else {
+                    tampered[0] ^= 0xff;
+                }
                 std::fs::write(&part_path, &tampered)?;
             }
             let staged = std::fs::read(&part_path)?;
             let actual_sha = delta::sha256_hex(&staged);
-            ensure!(staged.len() == chunk.len() && actual_sha == expected_part_sha, "multipart chunk {part_number} digest or size mismatch");
+            ensure!(
+                staged.len() == chunk.len() && actual_sha == expected_part_sha,
+                "multipart chunk {part_number} digest or size mismatch"
+            );
             receipts.push(ChunkPartReceipt { part_number, offset, size_bytes: chunk.len(), sha256: actual_sha });
             offset += chunk.len();
         }
         let mut reassembled = Vec::with_capacity(payload.len());
         for r in &receipts {
             let part_bytes = std::fs::read(staging_dir.join(format!("part-{}", r.part_number)))?;
-            ensure!(part_bytes.len() == r.size_bytes && delta::sha256_hex(&part_bytes) == r.sha256, "reassembly mismatch at part {}", r.part_number);
+            ensure!(
+                part_bytes.len() == r.size_bytes && delta::sha256_hex(&part_bytes) == r.sha256,
+                "reassembly mismatch at part {}",
+                r.part_number
+            );
             reassembled.extend_from_slice(&part_bytes);
         }
-        ensure!(reassembled.len() as u64 == expected_bytes && delta::sha256_hex(&reassembled) == expected_sha256, "complete object digest/size mismatch");
+        ensure!(
+            reassembled.len() as u64 == expected_bytes && delta::sha256_hex(&reassembled) == expected_sha256,
+            "complete object digest/size mismatch"
+        );
         Ok((receipts, reassembled))
     })();
     let _ = std::fs::remove_dir_all(&staging_dir);
@@ -374,22 +402,43 @@ async fn decrypt_verified_store_pack(
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut check = manifest.clone();
     check.manifest_sha256 = String::new();
-    ensure!(delta::sha256_hex(&serde_json::to_vec(&check)?) == manifest.manifest_sha256, "CAS manifest verification failed");
-    ensure!(manifest.encryption_mode.as_deref() == Some(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE), "object store pack {} lacks authenticated encryption mode", manifest.pack_id);
+    ensure!(
+        delta::sha256_hex(&serde_json::to_vec(&check)?) == manifest.manifest_sha256,
+        "CAS manifest verification failed"
+    );
+    ensure!(
+        manifest.encryption_mode.as_deref() == Some(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE),
+        "object store pack {} lacks authenticated encryption mode",
+        manifest.pack_id
+    );
     let cipher_sha = manifest.ciphertext_sha256.as_deref().context("missing ciphertext_sha256 in CAS manifest")?;
     let cipher_len = manifest.ciphertext_bytes.context("missing ciphertext_bytes in CAS manifest")?;
     let c_bytes = std::fs::read(store_root_dir.join(&manifest.pack_key))?;
     let i_bytes = std::fs::read(store_root_dir.join(&manifest.idx_key))?;
-    ensure!(c_bytes.len() as u64 == cipher_len && delta::sha256_hex(&c_bytes) == cipher_sha, "object store ciphertext mismatch");
-    ensure!(i_bytes.len() as u64 == manifest.idx_bytes && delta::sha256_hex(&i_bytes) == manifest.idx_sha256, "object store idx mismatch");
-    let pack = Pack { id: manifest.pack_id, pack_sha256: manifest.pack_sha256.clone(), idx_sha256: manifest.idx_sha256.clone() };
+    ensure!(
+        c_bytes.len() as u64 == cipher_len && delta::sha256_hex(&c_bytes) == cipher_sha,
+        "object store ciphertext mismatch"
+    );
+    ensure!(
+        i_bytes.len() as u64 == manifest.idx_bytes && delta::sha256_hex(&i_bytes) == manifest.idx_sha256,
+        "object store idx mismatch"
+    );
+    let pack = Pack {
+        id: manifest.pack_id,
+        pack_sha256: manifest.pack_sha256.clone(),
+        idx_sha256: manifest.idx_sha256.clone(),
+    };
     let env = if let Some(client) = client {
         lifecycle::rotation::load_authoritative_envelope(client, base_root, manifest.repo, &pack).await?
     } else {
         lifecycle::read_and_verify_envelope_file(base_root, manifest.repo, manifest.pack_id)?
     };
-    let p_bytes = lifecycle::rotation::verify_and_decrypt_pack_bytes(base_root, manifest.repo, &pack, &env, &c_bytes).await?;
-    ensure!(p_bytes.len() as u64 == manifest.pack_bytes && delta::sha256_hex(&p_bytes) == manifest.pack_sha256, "decrypted pack digest or length mismatch");
+    let p_bytes =
+        lifecycle::rotation::verify_and_decrypt_pack_bytes(base_root, manifest.repo, &pack, &env, &c_bytes).await?;
+    ensure!(
+        p_bytes.len() as u64 == manifest.pack_bytes && delta::sha256_hex(&p_bytes) == manifest.pack_sha256,
+        "decrypted pack digest or length mismatch"
+    );
     let rep = delta::verify_pack(&p_bytes, &delta::Limits::default())?;
     ensure!(rep.object_count == manifest.object_count, "object store pack object_count mismatch");
     Ok((p_bytes, i_bytes))
@@ -419,8 +468,7 @@ pub(crate) async fn prepare_known_pack_publication(
     let pack_bytes = std::fs::read(local_root.join(repo.to_string()).join(format!("{}.pack", pack.id)))?;
     let idx_bytes = std::fs::read(local_root.join(repo.to_string()).join(format!("{}.idx", pack.id)))?;
     ensure!(
-        delta::sha256_hex(&pack_bytes) == pack.pack_sha256
-            && delta::sha256_hex(&idx_bytes) == pack.idx_sha256,
+        delta::sha256_hex(&pack_bytes) == pack.pack_sha256 && delta::sha256_hex(&idx_bytes) == pack.idx_sha256,
         "prepared pack or index digest does not match the known pack identity"
     );
     let opts = ObjectStorePutOptions {
@@ -471,21 +519,11 @@ pub async fn put_pack_files(
     opts: &ObjectStorePutOptions,
 ) -> Result<(ObjectStorePutReport, CasPackManifest)> {
     ensure!(
-        lifecycle::provider_selection::selected_kind()?
-            == lifecycle::provider_selection::PandoProviderSelection::Local,
+        lifecycle::provider_selection::selected_kind()? == lifecycle::provider_selection::PandoProviderSelection::Local,
         "raw Local object-store helper cannot publish unterminated Vault writes"
     );
-    let prepared = prepare_pack_files_sealed(
-        store_root_dir,
-        local_objects_root,
-        repo,
-        pack_id,
-        opts,
-        "hot",
-        None,
-        None,
-    )
-    .await?;
+    let prepared =
+        prepare_pack_files_sealed(store_root_dir, local_objects_root, repo, pack_id, opts, "hot", None, None).await?;
     // This raw path has no DB authority, so its verified envelope file is the
     // only metadata authority. The staged prepare itself never writes a mirror.
     prepared.write_file_only_mirror()?;
@@ -501,7 +539,17 @@ pub async fn get_pack_files(
     expected_pack_sha256: Option<&str>,
     expected_idx_sha256: Option<&str>,
 ) -> Result<ObjectStoreGetReport> {
-    get_pack_files_inner(store_root_dir, local_objects_root, bucket, repo, pack_id, expected_pack_sha256, expected_idx_sha256, None).await
+    get_pack_files_inner(
+        store_root_dir,
+        local_objects_root,
+        bucket,
+        repo,
+        pack_id,
+        expected_pack_sha256,
+        expected_idx_sha256,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn get_pack_files_with_client(
@@ -514,7 +562,17 @@ pub(crate) async fn get_pack_files_with_client(
     expected_idx_sha256: Option<&str>,
     client: &Client,
 ) -> Result<ObjectStoreGetReport> {
-    get_pack_files_inner(store_root_dir, local_objects_root, bucket, repo, pack_id, expected_pack_sha256, expected_idx_sha256, Some(client)).await
+    get_pack_files_inner(
+        store_root_dir,
+        local_objects_root,
+        bucket,
+        repo,
+        pack_id,
+        expected_pack_sha256,
+        expected_idx_sha256,
+        Some(client),
+    )
+    .await
 }
 
 async fn get_pack_files_inner(
@@ -534,10 +592,18 @@ async fn get_pack_files_inner(
         let (p_sha, i_sha) = (delta::sha256_hex(&p_b), delta::sha256_hex(&i_b));
         if expected_pack_sha256.is_none_or(|e| e == p_sha) && expected_idx_sha256.is_none_or(|e| e == i_sha) {
             return Ok(ObjectStoreGetReport {
-                repo, pack_id, bucket: bucket.to_owned(), pack_sha256: p_sha, idx_sha256: i_sha,
-                pack_bytes: p_b.len() as u64, idx_bytes: i_b.len() as u64, cache_hit: true,
-                rehydrated_from_object_store: false, local_pack_path: local_pack.to_string_lossy().into_owned(),
-                local_idx_path: local_idx.to_string_lossy().into_owned(), verified: true,
+                repo,
+                pack_id,
+                bucket: bucket.to_owned(),
+                pack_sha256: p_sha,
+                idx_sha256: i_sha,
+                pack_bytes: p_b.len() as u64,
+                idx_bytes: i_b.len() as u64,
+                cache_hit: true,
+                rehydrated_from_object_store: false,
+                local_pack_path: local_pack.to_string_lossy().into_owned(),
+                local_idx_path: local_idx.to_string_lossy().into_owned(),
+                verified: true,
             });
         }
     }
@@ -545,27 +611,56 @@ async fn get_pack_files_inner(
     ensure!(m_path.is_file(), "local pack cache miss for {pack_id} and pack is not present in object store");
     let manifest: CasPackManifest = serde_json::from_slice(&std::fs::read(&m_path)?)?;
     ensure!(manifest.repo == repo && manifest.pack_id == pack_id, "CAS manifest identity mismatch");
-    if let Some(ep) = expected_pack_sha256 { ensure!(manifest.pack_sha256 == ep, "manifest pack_sha256 mismatch"); }
-    if let Some(ei) = expected_idx_sha256 { ensure!(manifest.idx_sha256 == ei, "manifest idx_sha256 mismatch"); }
+    if let Some(ep) = expected_pack_sha256 {
+        ensure!(manifest.pack_sha256 == ep, "manifest pack_sha256 mismatch");
+    }
+    if let Some(ei) = expected_idx_sha256 {
+        ensure!(manifest.idx_sha256 == ei, "manifest idx_sha256 mismatch");
+    }
     let base_root = infer_base_root(store_root_dir, Some(local_objects_root));
     let (p_bytes, i_bytes) = decrypt_verified_store_pack(store_root_dir, base_root, &manifest, client).await?;
     write_atomic_local_cache_file(&local_pack, &p_bytes, &manifest.pack_sha256)?;
     write_atomic_local_cache_file(&local_idx, &i_bytes, &manifest.idx_sha256)?;
     Ok(ObjectStoreGetReport {
-        repo, pack_id, bucket: manifest.bucket, pack_sha256: manifest.pack_sha256, idx_sha256: manifest.idx_sha256,
-        pack_bytes: manifest.pack_bytes, idx_bytes: manifest.idx_bytes, cache_hit: false,
-        rehydrated_from_object_store: true, local_pack_path: local_pack.to_string_lossy().into_owned(),
-        local_idx_path: local_idx.to_string_lossy().into_owned(), verified: true,
+        repo,
+        pack_id,
+        bucket: manifest.bucket,
+        pack_sha256: manifest.pack_sha256,
+        idx_sha256: manifest.idx_sha256,
+        pack_bytes: manifest.pack_bytes,
+        idx_bytes: manifest.idx_bytes,
+        cache_hit: false,
+        rehydrated_from_object_store: true,
+        local_pack_path: local_pack.to_string_lossy().into_owned(),
+        local_idx_path: local_idx.to_string_lossy().into_owned(),
+        verified: true,
     })
 }
 
 pub(super) async fn ensure_local_pack_cached(config: &Config, repo: Uuid, pack: &Pack) -> Result<ObjectStoreGetReport> {
-    if remote_enabled() { return super::remote::get(config, repo, pack.id).await; }
+    if remote_enabled() {
+        return super::remote::get(config, repo, pack.id).await;
+    }
     let c = config.db().await?;
-    get_pack_files_with_client(&store_root(config), &config.root.join("objects"), &default_bucket(), repo, pack.id, Some(&pack.pack_sha256), Some(&pack.idx_sha256), &c).await
+    get_pack_files_with_client(
+        &store_root(config),
+        &config.root.join("objects"),
+        &default_bucket(),
+        repo,
+        pack.id,
+        Some(&pack.pack_sha256),
+        Some(&pack.idx_sha256),
+        &c,
+    )
+    .await
 }
 
-async fn verify_repo_files_with_base(store_root_dir: &Path, base_root: &Path, bucket: &str, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
+async fn verify_repo_files_with_base(
+    store_root_dir: &Path,
+    base_root: &Path,
+    bucket: &str,
+    repo: Uuid,
+) -> Result<ObjectStoreVerifyReport> {
     verify_repo_files_with_base_inner(store_root_dir, base_root, bucket, repo, None).await
 }
 
@@ -591,7 +686,10 @@ async fn verify_repo_files_with_base_inner(
     if mp_dir.is_dir() {
         for e in std::fs::read_dir(&mp_dir)? {
             let p = e?.path();
-            if p.is_dir() { std::fs::remove_dir_all(&p)?; orphan_staging_cleaned += 1; }
+            if p.is_dir() {
+                std::fs::remove_dir_all(&p)?;
+                orphan_staging_cleaned += 1;
+            }
         }
     }
     let m_dir = store_root_dir.join("manifests").join(repo.to_string());
@@ -599,7 +697,9 @@ async fn verify_repo_files_with_base_inner(
     if m_dir.is_dir() {
         for e in std::fs::read_dir(&m_dir)? {
             let path = e?.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
             checked += 1;
             let m: CasPackManifest = serde_json::from_slice(&std::fs::read(&path)?)?;
             decrypt_verified_store_pack(store_root_dir, base_root, &m, client).await?;
@@ -608,14 +708,29 @@ async fn verify_repo_files_with_base_inner(
             i_bytes_sum += m.idx_bytes;
         }
     }
-    Ok(ObjectStoreVerifyReport { repo, bucket: bucket.to_owned(), manifests_checked: checked, packs_verified: verified, total_pack_bytes: p_bytes_sum, total_idx_bytes: i_bytes_sum, orphan_staging_cleaned, verified: true })
+    Ok(ObjectStoreVerifyReport {
+        repo,
+        bucket: bucket.to_owned(),
+        manifests_checked: checked,
+        packs_verified: verified,
+        total_pack_bytes: p_bytes_sum,
+        total_idx_bytes: i_bytes_sum,
+        orphan_staging_cleaned,
+        verified: true,
+    })
 }
 
 pub async fn verify_repo_files(store_root_dir: &Path, bucket: &str, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
     verify_repo_files_with_base(store_root_dir, infer_base_root(store_root_dir, None), bucket, repo).await
 }
 
-async fn put_pack_db_inner(config: &Config, repo: Uuid, pack_id: Uuid, opts: &ObjectStorePutOptions, storage_tier: &str) -> Result<(ObjectStorePutReport, lifecycle::KmsEnvelopeRecord)> {
+async fn put_pack_db_inner(
+    config: &Config,
+    repo: Uuid,
+    pack_id: Uuid,
+    opts: &ObjectStorePutOptions,
+    storage_tier: &str,
+) -> Result<(ObjectStorePutReport, lifecycle::KmsEnvelopeRecord)> {
     // Composed remote publication is not this primitive. Keep the boundary
     // explicit instead of silently committing local CAS under an S3 endpoint.
     ensure!(
@@ -647,39 +762,86 @@ async fn put_pack_db_inner(config: &Config, repo: Uuid, pack_id: Uuid, opts: &Ob
     Ok((receipt.report(), receipt.envelope().clone()))
 }
 
-pub(super) async fn put_pack(config: &Config, repo: Uuid, pack_id: Uuid, opts: &ObjectStorePutOptions) -> Result<ObjectStorePutReport> {
-    if remote_enabled() { return super::remote::put(config, repo, pack_id, opts).await; }
+pub(super) async fn put_pack(
+    config: &Config,
+    repo: Uuid,
+    pack_id: Uuid,
+    opts: &ObjectStorePutOptions,
+) -> Result<ObjectStorePutReport> {
+    if remote_enabled() {
+        return super::remote::put(config, repo, pack_id, opts).await;
+    }
     Ok(put_pack_db_inner(config, repo, pack_id, opts, "hot").await?.0)
 }
 
-pub(crate) async fn put_pack_and_seal_with_suite(config: &Config, repo: Uuid, pack_id: Uuid, cipher_suite: &str, storage_tier: &str) -> Result<lifecycle::KmsEnvelopeRecord> {
+pub(crate) async fn put_pack_and_seal_with_suite(
+    config: &Config,
+    repo: Uuid,
+    pack_id: Uuid,
+    cipher_suite: &str,
+    storage_tier: &str,
+) -> Result<lifecycle::KmsEnvelopeRecord> {
     let opts = ObjectStorePutOptions { cipher_suite: Some(cipher_suite.to_owned()), ..Default::default() };
     Ok(put_pack_db_inner(config, repo, pack_id, &opts, storage_tier).await?.1)
 }
 
 pub(super) async fn get_pack(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<ObjectStoreGetReport> {
-    if remote_enabled() { return super::remote::get(config, repo, pack_id).await; }
+    if remote_enabled() {
+        return super::remote::get(config, repo, pack_id).await;
+    }
     let c = config.db().await?;
-    let row = c.query_opt("SELECT pack_sha256,idx_sha256 FROM pando_lab.manifests WHERE repo=$1 AND pack_id=$2", &[&repo, &pack_id]).await?;
-    let (ep, ei) = match row { Some(r) => (Some(r.get::<_, String>(0)), Some(r.get::<_, String>(1))), None => (None, None) };
-    get_pack_files_with_client(&store_root(config), &config.root.join("objects"), &default_bucket(), repo, pack_id, ep.as_deref(), ei.as_deref(), &c).await
+    let row = c
+        .query_opt(
+            "SELECT pack_sha256,idx_sha256 FROM pando_lab.manifests WHERE repo=$1 AND pack_id=$2",
+            &[&repo, &pack_id],
+        )
+        .await?;
+    let (ep, ei) = match row {
+        Some(r) => (Some(r.get::<_, String>(0)), Some(r.get::<_, String>(1))),
+        None => (None, None),
+    };
+    get_pack_files_with_client(
+        &store_root(config),
+        &config.root.join("objects"),
+        &default_bucket(),
+        repo,
+        pack_id,
+        ep.as_deref(),
+        ei.as_deref(),
+        &c,
+    )
+    .await
 }
 
 pub(super) async fn verify_repo_store(config: &Config, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
-    if remote_enabled() { return super::remote::verify(config, repo).await; }
+    if remote_enabled() {
+        return super::remote::verify(config, repo).await;
+    }
     let c = config.db().await?;
     let report = verify_repo_files_with_client(&store_root(config), &config.root, &default_bucket(), repo, &c).await?;
-    for r in c.query("SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.object_store_manifests WHERE repo=$1", &[&repo]).await? {
+    for r in c
+        .query("SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.object_store_manifests WHERE repo=$1", &[&repo])
+        .await?
+    {
         let pid: Uuid = r.get(0);
-        let m: CasPackManifest = serde_json::from_slice(&std::fs::read(store_root(config).join(manifest_key(repo, pid)))?)?;
-        ensure!(m.pack_sha256 == r.get::<_, String>(1) && m.idx_sha256 == r.get::<_, String>(2), "DB object_store_manifests mismatch for {pid}");
+        let m: CasPackManifest =
+            serde_json::from_slice(&std::fs::read(store_root(config).join(manifest_key(repo, pid)))?)?;
+        ensure!(
+            m.pack_sha256 == r.get::<_, String>(1) && m.idx_sha256 == r.get::<_, String>(2),
+            "DB object_store_manifests mismatch for {pid}"
+        );
     }
     Ok(report)
 }
 
 pub(super) async fn status(config: &Config, repo: Uuid) -> Result<ObjectStoreStatusReport> {
     let c = config.db().await?;
-    let committed = c.query("SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.manifests WHERE repo=$1 ORDER BY pack_id", &[&repo]).await?;
+    let committed = c
+        .query(
+            "SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.manifests WHERE repo=$1 ORDER BY pack_id",
+            &[&repo],
+        )
+        .await?;
     let os_rows = c.query("SELECT pack_id,bucket,pack_key,idx_key,manifest_key,pack_bytes,idx_bytes,object_count,chunk_count FROM pando_lab.object_store_manifests WHERE repo=$1 ORDER BY pack_id", &[&repo]).await?;
     let mut os_map = BTreeMap::new();
     for r in &os_rows {
@@ -691,14 +853,28 @@ pub(super) async fn status(config: &Config, repo: Uuid) -> Result<ObjectStoreSta
         let pid: Uuid = r.get(0);
         let pfx = config.root.join("objects").join(repo.to_string()).join(pid.to_string());
         let cached = pfx.with_extension("pack").is_file() && pfx.with_extension("idx").is_file();
-        if cached { local_cached += 1; }
+        if cached {
+            local_cached += 1;
+        }
         let in_os = os_map.contains_key(&pid);
-        if !in_os { all_rep = false; }
+        if !in_os {
+            all_rep = false;
+        }
         packs.push(serde_json::json!({"pack_id": pid, "pack_sha256": r.get::<_, String>(1), "idx_sha256": r.get::<_, String>(2), "local_cached": cached, "in_object_store": in_os, "object_store": os_map.get(&pid)}));
     }
     let mp_dir = store_root(config).join("multipart");
     let active_mp = if mp_dir.is_dir() { std::fs::read_dir(&mp_dir)?.count() } else { 0 };
-    Ok(ObjectStoreStatusReport { repo, bucket: default_bucket(), backend: BACKEND_KIND.to_owned(), committed_manifests: committed.len(), object_store_manifests: os_rows.len(), local_cached_packs: local_cached, fully_replicated: all_rep, active_multipart_uploads: active_mp, packs })
+    Ok(ObjectStoreStatusReport {
+        repo,
+        bucket: default_bucket(),
+        backend: BACKEND_KIND.to_owned(),
+        committed_manifests: committed.len(),
+        object_store_manifests: os_rows.len(),
+        local_cached_packs: local_cached,
+        fully_replicated: all_rep,
+        active_multipart_uploads: active_mp,
+        packs,
+    })
 }
 
 #[cfg(test)]
@@ -731,15 +907,25 @@ mod tests {
         std::fs::write(dir.join(format!("{pack_id}.pack")), &pack).unwrap();
         std::fs::write(dir.join(format!("{pack_id}.idx")), b"idx-bytes").unwrap();
 
-        let fail_opts = ObjectStorePutOptions { bucket: "b1".into(), chunk_size: 8, fail_after_chunks: Some(1), ..Default::default() };
+        let fail_opts = ObjectStorePutOptions {
+            bucket: "b1".into(),
+            chunk_size: 8,
+            fail_after_chunks: Some(1),
+            ..Default::default()
+        };
         assert!(put_pack_files(&tmp, &objects_root, repo, pack_id, &fail_opts).await.is_err());
         let ok_opts = ObjectStorePutOptions { bucket: "b1".into(), chunk_size: 8, ..Default::default() };
         let (rep, m) = put_pack_files(&tmp, &objects_root, repo, pack_id, &ok_opts).await.unwrap();
         assert_eq!(rep.status, "published");
         assert!(!std::fs::read(&rep.bucket_pack_path).unwrap().windows(19).any(|w| w == b"test-secret-payload"));
         std::fs::remove_file(dir.join(format!("{pack_id}.pack"))).unwrap();
-        let get_rep = get_pack_files(&tmp, &objects_root, "b1", repo, pack_id, Some(&m.pack_sha256), Some(&m.idx_sha256)).await.unwrap();
-        assert!(get_rep.rehydrated_from_object_store && std::fs::read(dir.join(format!("{pack_id}.pack"))).unwrap() == pack);
+        let get_rep =
+            get_pack_files(&tmp, &objects_root, "b1", repo, pack_id, Some(&m.pack_sha256), Some(&m.idx_sha256))
+                .await
+                .unwrap();
+        assert!(
+            get_rep.rehydrated_from_object_store && std::fs::read(dir.join(format!("{pack_id}.pack"))).unwrap() == pack
+        );
         assert!(verify_repo_files(&tmp, "b1", repo).await.unwrap().verified);
         let _ = std::fs::remove_dir_all(&tmp);
     }

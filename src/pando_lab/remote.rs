@@ -1,15 +1,23 @@
 //! Real network CAS for Pando pack and index artifacts. PostgreSQL publication
 //! follows verified remote objects; local pack files are only a read cache.
 use super::*;
+use object_store::{
+    CasPackManifest, ChunkPartReceipt, ObjectStoreGetReport, ObjectStorePutOptions, ObjectStorePutReport,
+    ObjectStoreVerifyReport,
+};
 use rootyard::storage::remote_objects::{ObjectKey, RemoteObjectStore};
-use object_store::{CasPackManifest, ChunkPartReceipt, ObjectStoreGetReport,
-    ObjectStorePutOptions, ObjectStorePutReport, ObjectStoreVerifyReport};
 use sha2::{Digest, Sha256};
 use std::process::Stdio;
-use tokio::{fs::{self, File}, io::{AsyncReadExt, AsyncWriteExt}, time::{Duration, Instant}};
+use tokio::{
+    fs::{self, File},
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::{Duration, Instant},
+};
 use tokio_postgres::Client;
 
-fn deadline() -> Instant { Instant::now() + Duration::from_secs(300) }
+fn deadline() -> Instant {
+    Instant::now() + Duration::from_secs(300)
+}
 fn remote_store(config: &Config) -> Result<RemoteObjectStore> {
     RemoteObjectStore::from_env(config.root.join("remote-cas"))
 }
@@ -29,11 +37,7 @@ fn remote_manifest_key(repo: Uuid, manifest: &CasPackManifest) -> Result<ObjectK
 /// Validate the immutable manifest bytes and the artifact keys they bind.
 /// This is the collision oracle used both to publish and to recover an
 /// already-committed publication.
-fn validate_manifest_record(
-    manifest: &CasPackManifest,
-    repo: Uuid,
-    pack_id: Uuid,
-) -> Result<(String, u64)> {
+fn validate_manifest_record(manifest: &CasPackManifest, repo: Uuid, pack_id: Uuid) -> Result<(String, u64)> {
     let mut unsigned = manifest.clone();
     unsigned.manifest_sha256.clear();
     ensure!(
@@ -41,22 +45,15 @@ fn validate_manifest_record(
             && manifest.repo == repo
             && manifest.pack_id == pack_id
             && manifest.backend == object_store::BACKEND_KIND
-            && manifest.manifest_sha256
-                == hex::encode(Sha256::digest(serde_json::to_vec(&unsigned)?)),
+            && manifest.manifest_sha256 == hex::encode(Sha256::digest(serde_json::to_vec(&unsigned)?)),
         "Pando remote manifest identity or digest mismatch"
     );
     ensure!(
         manifest.encryption_mode.as_deref() == Some(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE),
         "remote Pando manifest lacks authenticated encryption mode"
     );
-    let cipher_sha = manifest
-        .ciphertext_sha256
-        .as_deref()
-        .context("missing remote ciphertext_sha256")?
-        .to_owned();
-    let cipher_bytes = manifest
-        .ciphertext_bytes
-        .context("missing remote ciphertext_bytes")?;
+    let cipher_sha = manifest.ciphertext_sha256.as_deref().context("missing remote ciphertext_sha256")?.to_owned();
+    let cipher_bytes = manifest.ciphertext_bytes.context("missing remote ciphertext_bytes")?;
     ensure!(
         manifest.pack_key == key(repo, "pando-pack", &cipher_sha)?.path()
             && manifest.idx_key == key(repo, "pando-index", &manifest.idx_sha256)?.path()
@@ -74,15 +71,10 @@ fn validate_db_envelope(
     idx_sha256: &str,
     manifest: &CasPackManifest,
 ) -> Result<()> {
-    ensure!(
-        env.repo == repo && env.pack_id == pack_id,
-        "DB KMS envelope repo/pack_id mismatch"
-    );
+    ensure!(env.repo == repo && env.pack_id == pack_id, "DB KMS envelope repo/pack_id mismatch");
     lifecycle::verify_envelope_record(env)?;
     ensure!(
-        env.pack_sha256 == pack_sha256
-            && env.idx_sha256 == idx_sha256
-            && env.plaintext_sha256 == pack_sha256,
+        env.pack_sha256 == pack_sha256 && env.idx_sha256 == idx_sha256 && env.plaintext_sha256 == pack_sha256,
         "DB KMS envelope does not bind the immutable pack/idx digests"
     );
     ensure!(
@@ -95,10 +87,7 @@ fn validate_db_envelope(
         "DB KMS envelope ciphertext identity diverges from the manifest"
     );
     if let Some(suite) = manifest.cipher_suite.as_deref() {
-        ensure!(
-            env.cipher_suite == suite,
-            "DB KMS envelope cipher suite diverges from the manifest"
-        );
+        ensure!(env.cipher_suite == suite, "DB KMS envelope cipher suite diverges from the manifest");
     }
     Ok(())
 }
@@ -110,11 +99,7 @@ struct DbManifestRow {
     idx_sha256: String,
 }
 
-async fn load_manifest_row(
-    client: &Client,
-    repo: Uuid,
-    pack_id: Uuid,
-) -> Result<Option<DbManifestRow>> {
+async fn load_manifest_row(client: &Client, repo: Uuid, pack_id: Uuid) -> Result<Option<DbManifestRow>> {
     let row = client
         .query_opt(
             "SELECT manifest_json,manifest_key,pack_sha256,idx_sha256 FROM pando_lab.object_store_manifests WHERE repo=$1 AND pack_id=$2",
@@ -130,11 +115,7 @@ async fn load_manifest_row(
     }))
 }
 
-fn recovered_report(
-    repo: Uuid,
-    pack_id: Uuid,
-    manifest: &CasPackManifest,
-) -> Result<ObjectStorePutReport> {
+fn recovered_report(repo: Uuid, pack_id: Uuid, manifest: &CasPackManifest) -> Result<ObjectStorePutReport> {
     let manifest_object_key = remote_manifest_key(repo, manifest)?;
     Ok(ObjectStorePutReport {
         repo,
@@ -162,10 +143,7 @@ fn recovered_report(
     })
 }
 
-async fn insert_envelope_if_absent(
-    client: &Client,
-    env: &lifecycle::KmsEnvelopeRecord,
-) -> Result<()> {
+async fn insert_envelope_if_absent(client: &Client, env: &lifecycle::KmsEnvelopeRecord) -> Result<()> {
     client
         .execute(
             "INSERT INTO pando_lab.kms_envelopes(repo,pack_id,key_id,key_version,cipher_suite,plaintext_sha256,envelope_mac,storage_tier,\
@@ -206,11 +184,7 @@ async fn check_existing_publication(
     idx_sha256: &str,
     bucket: &str,
 ) -> Result<Option<ObjectStorePutReport>> {
-    let pack = Pack {
-        id: pack_id,
-        pack_sha256: pack_sha256.to_owned(),
-        idx_sha256: idx_sha256.to_owned(),
-    };
+    let pack = Pack { id: pack_id, pack_sha256: pack_sha256.to_owned(), idx_sha256: idx_sha256.to_owned() };
     let manifest_row = load_manifest_row(client, repo, pack_id).await?;
     let envelope = lifecycle::load_envelope_from_db(client, repo, &pack).await?;
     match (manifest_row, envelope) {
@@ -218,31 +192,19 @@ async fn check_existing_publication(
         (Some(row), Some(envelope)) => {
             validate_manifest_record(&row.manifest, repo, pack_id)?;
             ensure!(
-                row.pack_sha256 == row.manifest.pack_sha256
-                    && row.idx_sha256 == row.manifest.idx_sha256,
+                row.pack_sha256 == row.manifest.pack_sha256 && row.idx_sha256 == row.manifest.idx_sha256,
                 "DB Pando manifest columns diverge from the immutable manifest"
             );
+            ensure!(row.manifest.bucket == bucket, "Pando manifest bucket differs from the requested bucket");
             ensure!(
-                row.manifest.bucket == bucket,
-                "Pando manifest bucket differs from the requested bucket"
-            );
-            ensure!(
-                row.manifest.pack_sha256 == pack_sha256
-                    && row.manifest.idx_sha256 == idx_sha256,
+                row.manifest.pack_sha256 == pack_sha256 && row.manifest.idx_sha256 == idx_sha256,
                 "immutable Pando pack digest collision"
             );
             ensure!(
                 row.manifest_key == remote_manifest_key(repo, &row.manifest)?.path(),
                 "Pando remote manifest key mismatch"
             );
-            validate_db_envelope(
-                &envelope,
-                repo,
-                pack_id,
-                pack_sha256,
-                idx_sha256,
-                &row.manifest,
-            )?;
+            validate_db_envelope(&envelope, repo, pack_id, pack_sha256, idx_sha256, &row.manifest)?;
             let _ = lifecycle::write_envelope_file(&config.root, &envelope);
             Ok(Some(recovered_report(repo, pack_id, &row.manifest)?))
         }
@@ -268,15 +230,8 @@ async fn publish_on_writer_session(
     pack_sha256: &str,
     idx_sha256: &str,
 ) -> Result<ObjectStorePutReport> {
-    let pack = Pack {
-        id: pack_id,
-        pack_sha256: pack_sha256.to_owned(),
-        idx_sha256: idx_sha256.to_owned(),
-    };
-    client
-        .batch_execute("BEGIN")
-        .await
-        .context("failed to open the Pando publication transaction")?;
+    let pack = Pack { id: pack_id, pack_sha256: pack_sha256.to_owned(), idx_sha256: idx_sha256.to_owned() };
+    client.batch_execute("BEGIN").await.context("failed to open the Pando publication transaction")?;
     let result = async {
         let existing_manifest = load_manifest_row(client, repo, pack_id).await?;
         let existing_envelope = lifecycle::load_envelope_from_db(client, repo, &pack).await?;
@@ -363,10 +318,7 @@ async fn publish_on_writer_session(
 
     match result {
         Ok((report, stored_envelope)) => {
-            client
-                .batch_execute("COMMIT")
-                .await
-                .context("Pando publication commit failed")?;
+            client.batch_execute("COMMIT").await.context("Pando publication commit failed")?;
             // The DB pair is authoritative; a mirror failure cannot make the
             // retry generate replacement ciphertext.
             let _ = lifecycle::write_envelope_file(&config.root, &stored_envelope);
@@ -380,8 +332,7 @@ async fn publish_on_writer_session(
 }
 
 async fn scan(path: &Path, chunk_size: usize) -> Result<(String, u64, Vec<ChunkPartReceipt>)> {
-    ensure!((4096..=8 * 1024 * 1024).contains(&chunk_size),
-        "remote pack chunk size must be 4 KiB through 8 MiB");
+    ensure!((4096..=8 * 1024 * 1024).contains(&chunk_size), "remote pack chunk size must be 4 KiB through 8 MiB");
     let mut source = File::open(path).await?;
     let mut whole = Sha256::new();
     let mut chunks = Vec::new();
@@ -391,17 +342,27 @@ async fn scan(path: &Path, chunk_size: usize) -> Result<(String, u64, Vec<ChunkP
         let mut used = 0;
         while used < buf.len() {
             let n = source.read(&mut buf[used..]).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             used += n;
         }
-        if used == 0 { break; }
+        if used == 0 {
+            break;
+        }
         ensure!(chunks.len() < 10_000, "remote pack has too many chunks");
         whole.update(&buf[..used]);
         let at = usize::try_from(offset).context("pack offset exceeds address space")?;
-        chunks.push(ChunkPartReceipt { part_number: chunks.len() + 1,
-            offset: at, size_bytes: used, sha256: hex::encode(Sha256::digest(&buf[..used])) });
+        chunks.push(ChunkPartReceipt {
+            part_number: chunks.len() + 1,
+            offset: at,
+            size_bytes: used,
+            sha256: hex::encode(Sha256::digest(&buf[..used])),
+        });
         offset = offset.checked_add(used as u64).context("pack length overflow")?;
-        if used < buf.len() { break; }
+        if used < buf.len() {
+            break;
+        }
     }
     ensure!(offset == source.metadata().await?.len(), "pack changed while scanning");
     Ok((hex::encode(whole.finalize()), offset, chunks))
@@ -411,27 +372,46 @@ async fn pack_object_count(config: &Config, pack: &Path) -> Result<usize> {
     let mut file = File::open(pack).await?;
     let mut header = [0u8; 12];
     file.read_exact(&mut header).await?;
-    ensure!(&header[..4] == b"PACK" && u32::from_be_bytes(header[4..8].try_into()?) == 2,
-        "unsupported Git pack header");
+    ensure!(
+        &header[..4] == b"PACK" && u32::from_be_bytes(header[4..8].try_into()?) == 2,
+        "unsupported Git pack header"
+    );
     let count = u32::from_be_bytes(header[8..12].try_into()?) as usize;
     ensure!(count <= delta::MAX_OBJECTS, "Git pack object count exceeds limit");
-    let status = tokio::time::timeout(Duration::from_secs(120),
+    let status = tokio::time::timeout(
+        Duration::from_secs(120),
         tokio::process::Command::new(&config.git)
-            .env_clear().env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args(["index-pack", "--verify"]).arg(pack)
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .kill_on_drop(true).status()).await??;
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["index-pack", "--verify"])
+            .arg(pack)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await??;
     ensure!(status.success(), "Git pack/index verification failed");
     Ok(count)
 }
 
-pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
-    opts: &ObjectStorePutOptions) -> Result<ObjectStorePutReport> {
-    ensure!(opts.fail_after_chunks.is_none() && opts.corrupt_chunk_part.is_none(),
-        "local multipart fault flags do not apply to network S3");
-    ensure!(opts.bucket == std::env::var("ROOTYARD_OBJECT_STORE_BUCKET")?,
-        "Pando bucket differs from configured object-store bucket");
+pub(super) async fn put(
+    config: &Config,
+    repo: Uuid,
+    pack_id: Uuid,
+    opts: &ObjectStorePutOptions,
+) -> Result<ObjectStorePutReport> {
+    ensure!(
+        opts.fail_after_chunks.is_none() && opts.corrupt_chunk_part.is_none(),
+        "local multipart fault flags do not apply to network S3"
+    );
+    ensure!(
+        opts.bucket == std::env::var("ROOTYARD_OBJECT_STORE_BUCKET")?,
+        "Pando bucket differs from configured object-store bucket"
+    );
     let (pack, idx) = local_paths(config, repo, pack_id);
     let object_count = pack_object_count(config, &pack).await?;
     let (pack_sha256, pack_bytes, _plain_chunks) = scan(&pack, opts.chunk_size).await?;
@@ -448,16 +428,9 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
     // A retry of an already-committed publication is recovered before provider
     // selection or any network upload, so randomized ciphertext is never
     // regenerated for an immutable pack.
-    if let Some(report) = check_existing_publication(
-        session.client(),
-        config,
-        repo,
-        pack_id,
-        &pack_sha256,
-        &idx_sha256,
-        &opts.bucket,
-    )
-    .await?
+    if let Some(report) =
+        check_existing_publication(session.client(), config, repo, pack_id, &pack_sha256, &idx_sha256, &opts.bucket)
+            .await?
     {
         return Ok(report);
     }
@@ -489,18 +462,29 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
         let (_cs, _cl, enc_chunks) = scan(&enc_temp, opts.chunk_size).await?;
         store.put_file(&pack_key, &enc_temp, sealed.ciphertext_bytes, deadline()).await?;
         Ok::<Vec<ChunkPartReceipt>, anyhow::Error>(enc_chunks)
-    }.await;
+    }
+    .await;
     let _ = fs::remove_file(&enc_temp).await;
     let pack_chunks = enc_res?;
     store.put_file(&idx_key, &idx, idx_bytes, deadline()).await?;
     let mut manifest = CasPackManifest {
-        schema: object_store::MANIFEST_SCHEMA.into(), bucket: opts.bucket.clone(),
-        backend: object_store::BACKEND_KIND.into(), repo, pack_id,
-        pack_key: pack_key.path(), idx_key: idx_key.path(),
+        schema: object_store::MANIFEST_SCHEMA.into(),
+        bucket: opts.bucket.clone(),
+        backend: object_store::BACKEND_KIND.into(),
+        repo,
+        pack_id,
+        pack_key: pack_key.path(),
+        idx_key: idx_key.path(),
         manifest_key: object_store::manifest_key(repo, pack_id),
-        pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone(),
-        pack_bytes, idx_bytes, object_count, chunk_size: opts.chunk_size,
-        pack_chunks, idx_chunks, manifest_sha256: String::new(),
+        pack_sha256: pack_sha256.clone(),
+        idx_sha256: idx_sha256.clone(),
+        pack_bytes,
+        idx_bytes,
+        object_count,
+        chunk_size: opts.chunk_size,
+        pack_chunks,
+        idx_chunks,
+        manifest_sha256: String::new(),
         encryption_mode: Some(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE.into()),
         ciphertext_sha256: Some(sealed.ciphertext_sha256.clone()),
         ciphertext_bytes: Some(sealed.ciphertext_bytes),
@@ -530,15 +514,20 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
             &idx_sha256,
         )
         .await
-    }.await;
+    }
+    .await;
     let _ = fs::remove_file(&temp).await;
     publication
 }
 
 pub(super) async fn get(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<ObjectStoreGetReport> {
     let client = config.db().await?;
-    let row = client.query_one("SELECT manifest_json,manifest_key FROM pando_lab.object_store_manifests WHERE repo=$1 AND pack_id=$2",
-        &[&repo,&pack_id]).await?;
+    let row = client
+        .query_one(
+            "SELECT manifest_json,manifest_key FROM pando_lab.object_store_manifests WHERE repo=$1 AND pack_id=$2",
+            &[&repo, &pack_id],
+        )
+        .await?;
     let manifest: CasPackManifest = serde_json::from_value(row.get(0))?;
     let (cipher_sha, cipher_bytes) = validate_manifest_record(&manifest, repo, pack_id)?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -549,61 +538,89 @@ pub(super) async fn get(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<Ob
     let temp = config.root.join(format!(".pando-verify-{}", Uuid::new_v4()));
     let verified = async {
         store.get_to_file(&manifest_key, &temp, manifest_bytes.len() as u64, deadline()).await?;
-        ensure!(fs::read(&temp).await? == manifest_bytes,
-            "remote Pando manifest differs from database");
+        ensure!(fs::read(&temp).await? == manifest_bytes, "remote Pando manifest differs from database");
         Ok::<(), anyhow::Error>(())
-    }.await;
+    }
+    .await;
     let _ = fs::remove_file(&temp).await;
     verified?;
     let (pack, idx) = local_paths(config, repo, pack_id);
     let pack_key = key(repo, "pando-pack", &cipher_sha)?;
     let idx_key = key(repo, "pando-index", &manifest.idx_sha256)?;
-    ensure!(manifest.pack_key == pack_key.path() && manifest.idx_key == idx_key.path(),
-        "Pando remote artifact key mismatch");
-    let pack_obj = Pack { id: pack_id, pack_sha256: manifest.pack_sha256.clone(), idx_sha256: manifest.idx_sha256.clone() };
+    ensure!(
+        manifest.pack_key == pack_key.path() && manifest.idx_key == idx_key.path(),
+        "Pando remote artifact key mismatch"
+    );
+    let pack_obj =
+        Pack { id: pack_id, pack_sha256: manifest.pack_sha256.clone(), idx_sha256: manifest.idx_sha256.clone() };
     // The committed DB envelope is the read authority. A missing or stale file
     // mirror must never select an older wrapper or fail this read.
-    let env = lifecycle::load_envelope_from_db(&client, repo, &pack_obj).await?
+    let env = lifecycle::load_envelope_from_db(&client, repo, &pack_obj)
+        .await?
         .context("missing DB KMS envelope for a published Pando pack")?;
     validate_db_envelope(&env, repo, pack_id, &manifest.pack_sha256, &manifest.idx_sha256, &manifest)?;
     // Repair the private file mirror best-effort after the DB authority and
     // record identity have been verified.
     let _ = lifecycle::write_envelope_file(&config.root, &env);
-    let cache_hit = pack.is_file() && idx.is_file() &&
-        scan(&pack, manifest.chunk_size).await.ok().is_some_and(|x| x.0 == manifest.pack_sha256 && x.1 == manifest.pack_bytes) &&
-        scan(&idx, manifest.chunk_size).await.ok().is_some_and(|x| x.0 == manifest.idx_sha256 && x.1 == manifest.idx_bytes);
+    let cache_hit = pack.is_file()
+        && idx.is_file()
+        && scan(&pack, manifest.chunk_size)
+            .await
+            .ok()
+            .is_some_and(|x| x.0 == manifest.pack_sha256 && x.1 == manifest.pack_bytes)
+        && scan(&idx, manifest.chunk_size)
+            .await
+            .ok()
+            .is_some_and(|x| x.0 == manifest.idx_sha256 && x.1 == manifest.idx_bytes);
     if !cache_hit {
         let cipher_tmp = config.root.join(format!(".pando-dec-{}", Uuid::new_v4()));
         let dec_res = async {
             store.get_to_file(&pack_key, &cipher_tmp, cipher_bytes, deadline()).await?;
             let c_bytes = fs::read(&cipher_tmp).await?;
             lifecycle::rotation::verify_and_decrypt_pack_bytes(&config.root, repo, &pack_obj, &env, &c_bytes).await
-        }.await;
+        }
+        .await;
         let _ = fs::remove_file(&cipher_tmp).await;
         let plain = dec_res?;
-        if let Some(parent) = pack.parent() { fs::create_dir_all(parent).await?; }
+        if let Some(parent) = pack.parent() {
+            fs::create_dir_all(parent).await?;
+        }
         fs::write(&pack, &plain).await?;
         store.get_to_file(&idx_key, &idx, manifest.idx_bytes, deadline()).await?;
     }
-    ensure!(pack_object_count(config, &pack).await? == manifest.object_count,
-        "remote Pando pack object count mismatch");
-    Ok(ObjectStoreGetReport { repo, pack_id, bucket: manifest.bucket,
-        pack_sha256: manifest.pack_sha256, idx_sha256: manifest.idx_sha256,
-        pack_bytes: manifest.pack_bytes, idx_bytes: manifest.idx_bytes,
-        cache_hit, rehydrated_from_object_store: !cache_hit,
+    ensure!(
+        pack_object_count(config, &pack).await? == manifest.object_count,
+        "remote Pando pack object count mismatch"
+    );
+    Ok(ObjectStoreGetReport {
+        repo,
+        pack_id,
+        bucket: manifest.bucket,
+        pack_sha256: manifest.pack_sha256,
+        idx_sha256: manifest.idx_sha256,
+        pack_bytes: manifest.pack_bytes,
+        idx_bytes: manifest.idx_bytes,
+        cache_hit,
+        rehydrated_from_object_store: !cache_hit,
         local_pack_path: pack.to_string_lossy().into_owned(),
-        local_idx_path: idx.to_string_lossy().into_owned(), verified: true })
+        local_idx_path: idx.to_string_lossy().into_owned(),
+        verified: true,
+    })
 }
 
 pub(super) async fn verify(config: &Config, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
     let client = config.db().await?;
-    let rows = client.query("SELECT pack_id FROM pando_lab.object_store_manifests WHERE repo=$1",
-        &[&repo]).await?;
-    let mut result = ObjectStoreVerifyReport { repo,
+    let rows = client.query("SELECT pack_id FROM pando_lab.object_store_manifests WHERE repo=$1", &[&repo]).await?;
+    let mut result = ObjectStoreVerifyReport {
+        repo,
         bucket: std::env::var("ROOTYARD_OBJECT_STORE_BUCKET")?,
-        manifests_checked: 0, packs_verified: 0,
-        total_pack_bytes: 0, total_idx_bytes: 0,
-        orphan_staging_cleaned: 0, verified: true };
+        manifests_checked: 0,
+        packs_verified: 0,
+        total_pack_bytes: 0,
+        total_idx_bytes: 0,
+        orphan_staging_cleaned: 0,
+        verified: true,
+    };
     for row in rows {
         let report = get(config, repo, row.get(0)).await?;
         result.manifests_checked += 1;
@@ -647,8 +664,7 @@ mod tests {
         };
         let mut unsigned = manifest.clone();
         unsigned.manifest_sha256.clear();
-        manifest.manifest_sha256 =
-            hex::encode(Sha256::digest(serde_json::to_vec(&unsigned).unwrap()));
+        manifest.manifest_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&unsigned).unwrap()));
         manifest
     }
 
@@ -657,8 +673,7 @@ mod tests {
         let repo = Uuid::new_v4();
         let pack_id = Uuid::new_v4();
         let manifest = manifest_fixture(repo, pack_id);
-        let (cipher_sha256, ciphertext_bytes) =
-            validate_manifest_record(&manifest, repo, pack_id).unwrap();
+        let (cipher_sha256, ciphertext_bytes) = validate_manifest_record(&manifest, repo, pack_id).unwrap();
         assert_eq!(cipher_sha256, "33".repeat(32));
         assert_eq!(ciphertext_bytes, 234);
 

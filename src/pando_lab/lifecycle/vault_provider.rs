@@ -1,6 +1,6 @@
 use super::data_key::PandoDataKey;
-use super::valid_kms_key_id;
 use super::provider::PandoKeyProvider;
+use super::valid_kms_key_id;
 use super::wrapped_dek::{PandoProviderKind, PandoWrappedDek, parse_vault_ciphertext_version};
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -42,9 +42,7 @@ impl fmt::Debug for VaultTransitConfig {
 impl VaultTransitConfig {
     pub(super) fn from_env() -> Result<Self> {
         let base = std::env::var("PANDO_KMS_VAULT_URL").context("PANDO_KMS_VAULT_URL missing")?;
-        let token = Zeroizing::new(
-            std::env::var("PANDO_KMS_VAULT_TOKEN").context("PANDO_KMS_VAULT_TOKEN missing")?,
-        );
+        let token = Zeroizing::new(std::env::var("PANDO_KMS_VAULT_TOKEN").context("PANDO_KMS_VAULT_TOKEN missing")?);
         let mount = std::env::var("PANDO_KMS_VAULT_MOUNT").context("PANDO_KMS_VAULT_MOUNT missing")?;
         let key_name = std::env::var("PANDO_KMS_VAULT_KEY").context("PANDO_KMS_VAULT_KEY missing")?;
         Self::from_owned_values(&base, token, &mount, &key_name, None)
@@ -88,24 +86,14 @@ impl VaultTransitConfig {
             "invalid Pando Vault token"
         );
         ensure!(valid_component(mount, MAX_MOUNT_BYTES), "invalid Pando Vault mount");
-        ensure!(
-            key_name == key_name.trim() && valid_kms_key_id(key_name),
-            "invalid Pando Vault key name"
-        );
+        ensure!(key_name == key_name.trim() && valid_kms_key_id(key_name), "invalid Pando Vault key name");
         let key_id = KeyId::parse(key_name).map_err(|_| anyhow::anyhow!("invalid Pando Vault key id"))?;
         let operation_timeout = operation_timeout.unwrap_or(DEFAULT_OPERATION_TIMEOUT);
         ensure!(
             !operation_timeout.is_zero() && operation_timeout <= Duration::from_secs(60),
             "invalid Pando Vault operation timeout"
         );
-        Ok(Self {
-            base,
-            token,
-            mount: mount.to_owned(),
-            key_name: key_name.to_owned(),
-            key_id,
-            operation_timeout,
-        })
+        Ok(Self { base, token, mount: mount.to_owned(), key_name: key_name.to_owned(), key_id, operation_timeout })
     }
 }
 
@@ -168,9 +156,7 @@ impl VaultTransitProvider {
         let (latest_version, min_encryption) = self.read_key_metadata(deadline).await?;
         let target_version = requested_version.unwrap_or(latest_version);
         ensure!(
-            target_version >= 1
-                && target_version <= latest_version
-                && target_version >= min_encryption,
+            target_version >= 1 && target_version <= latest_version && target_version >= min_encryption,
             "requested Vault Transit key version is unavailable"
         );
         self.encrypt_at_version(data_key, context, target_version, deadline).await
@@ -185,9 +171,7 @@ impl VaultTransitProvider {
         let deadline = self.operation_deadline();
         let (latest_version, min_encryption) = self.read_key_metadata(deadline).await?;
         ensure!(
-            target_version >= 1
-                && target_version <= latest_version
-                && target_version >= min_encryption,
+            target_version >= 1 && target_version <= latest_version && target_version >= min_encryption,
             "pinned Vault Transit target version is unavailable or below min_encryption_version"
         );
         self.encrypt_at_version(data_key, context, target_version, deadline).await
@@ -207,8 +191,7 @@ impl VaultTransitProvider {
             context: &context,
             key_version: target_version,
         })?);
-        let bytes =
-            self.call(Method::POST, &format!("encrypt/{}", self.config.key_name), Some(body), deadline).await?;
+        let bytes = self.call(Method::POST, &format!("encrypt/{}", self.config.key_name), Some(body), deadline).await?;
         let mut response: TransitResponse = serde_json::from_slice(&bytes)?;
         let ciphertext =
             response.data.ciphertext.take().context("Vault Transit encrypt response missing ciphertext")?;
@@ -223,8 +206,7 @@ impl VaultTransitProvider {
         ensure!(key_id == self.config.key_name.as_str(), "Vault Transit wrapped DEK key id mismatch");
         let context = self.context_b64(context)?;
         let body = Zeroizing::new(serde_json::to_vec(&DecryptRequest { ciphertext, context: &context })?);
-        let bytes =
-            self.call(Method::POST, &format!("decrypt/{}", self.config.key_name), Some(body), deadline).await?;
+        let bytes = self.call(Method::POST, &format!("decrypt/{}", self.config.key_name), Some(body), deadline).await?;
         let mut response: TransitResponse = serde_json::from_slice(&bytes)?;
         let plaintext =
             Zeroizing::new(response.data.plaintext.take().context("Vault Transit decrypt response missing plaintext")?);
@@ -245,9 +227,7 @@ impl VaultTransitProvider {
         let (latest_version, min_encryption) = self.read_key_metadata(deadline).await?;
         let target_version = requested_version.unwrap_or(latest_version);
         ensure!(
-            target_version >= 1
-                && target_version <= latest_version
-                && target_version >= min_encryption,
+            target_version >= 1 && target_version <= latest_version && target_version >= min_encryption,
             "requested Vault Transit key version is unavailable or below min_encryption_version"
         );
         let (_, _, ciphertext) = self.versioned_parts(wrapped, latest_version)?;
@@ -308,9 +288,7 @@ impl VaultTransitProvider {
         url.set_path(&format!("/v1/{}/{}", self.config.mount, path));
         let mut request = self.client.request(method, url).header("X-Vault-Token", self.config.token.as_str());
         if let Some(body) = body {
-            request = request
-                .header("Content-Type", "application/json")
-                .body(Body::from(Bytes::from_owner(body)));
+            request = request.header("Content-Type", "application/json").body(Body::from(Bytes::from_owner(body)));
         }
         let response =
             timeout_at(deadline, request.send()).await.context("Vault Transit request deadline exceeded")??;
@@ -405,10 +383,7 @@ fn parse_key_metadata(bytes: &[u8]) -> Result<(i32, i32)> {
     ensure!(envelope.data.derived == Some(true), "Vault key is not configured for derived contexts");
     let latest = envelope.data.latest_version.context("Vault key metadata missing latest_version")?;
     let min_encryption = envelope.data.min_encryption_version.unwrap_or(0);
-    ensure!(
-        latest >= 1 && min_encryption >= 0 && min_encryption <= latest,
-        "Vault key version metadata is invalid"
-    );
+    ensure!(latest >= 1 && min_encryption >= 0 && min_encryption <= latest, "Vault key version metadata is invalid");
     Ok((latest, min_encryption))
 }
 

@@ -8,32 +8,17 @@ use tokio_postgres::{Client, IsolationLevel};
 /// holding it through the `INSERT`/`COMMIT` makes pack selection and retention
 /// admission one ordering decision without putting provider, Git or filesystem
 /// work inside SQL.
-pub(super) async fn snapshot_and_retain(
-    client: &mut Client,
-    repo: Uuid,
-    principal: &str,
-) -> Result<Uuid> {
-    let t = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .read_only(false)
-        .start()
-        .await?;
+pub(super) async fn snapshot_and_retain(client: &mut Client, repo: Uuid, principal: &str) -> Result<Uuid> {
+    let t = client.build_transaction().isolation_level(IsolationLevel::ReadCommitted).read_only(false).start().await?;
 
     // This must remain the first authoritative statement. No refs or packs are
     // read before the repository ordering fence is held.
     let row = t
-        .query_one(
-            "SELECT generation,storage_generation FROM pando_lab.repositories WHERE id=$1 FOR SHARE",
-            &[&repo],
-        )
+        .query_one("SELECT generation,storage_generation FROM pando_lab.repositories WHERE id=$1 FOR SHARE", &[&repo])
         .await?;
 
     let refs = t
-        .query(
-            "SELECT name,oid FROM pando_lab.refs WHERE repo=$1 ORDER BY name",
-            &[&repo],
-        )
+        .query("SELECT name,oid FROM pando_lab.refs WHERE repo=$1 ORDER BY name", &[&repo])
         .await?
         .into_iter()
         .map(|r| (r.get(0), r.get(1)))
@@ -45,19 +30,9 @@ pub(super) async fn snapshot_and_retain(
         )
         .await?
         .into_iter()
-        .map(|r| Pack {
-            id: r.get(0),
-            pack_sha256: r.get(1),
-            idx_sha256: r.get(2),
-        })
+        .map(|r| Pack { id: r.get(0), pack_sha256: r.get(1), idx_sha256: r.get(2) })
         .collect();
-    let snapshot = Snapshot {
-        repo,
-        generation: row.get(0),
-        storage_generation: row.get(1),
-        refs,
-        packs,
-    };
+    let snapshot = Snapshot { repo, generation: row.get(0), storage_generation: row.get(1), refs, packs };
     #[cfg(test)]
     super::snapshot_pg_barrier::barrier_tx("snapshot-after-select", repo, &t).await?;
 
