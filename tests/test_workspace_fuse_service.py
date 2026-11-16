@@ -145,10 +145,18 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
             h = Harness(argparse.Namespace(binary=str(wrapper), keep=False))
             gate = None
             holder = None
+            holder_identity = None
             writer = None
             helper_pid = None
             helper_identity = None
             api_pidfd = helper_pidfd = writer_pidfd = None
+            mountpoint = None
+            mount_id = None
+            workspace_attempted = False
+            workspace_created = False
+            old_mount_cleared = False
+            remount_started = False
+            new_mount_cleared = True
             new_holder = None
             new_helper_pid = None
             new_helper_identity = None
@@ -161,12 +169,14 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 h.setup()
                 h.api()
                 h.roundtrip()
+                workspace_attempted = True
                 ws = json.loads(h.expect(
                     "/api/workspaces", 201, token=h.alice, method="POST",
                     body={"owner": "alice", "repository": "demo",
                           "agent_id": "pending-sigkill", "base_oid": h.second},
                     extra_headers={"Idempotency-Key": "pending-sigkill-create"}))
                 wid = ws["id"]
+                workspace_created = True
                 current = json.loads(h.expect(f"/api/workspaces/{wid}", 200, token=h.alice))
                 checkpoint = json.loads(h.expect(
                     f"/api/workspaces/{wid}/checkpoints", 201, token=h.alice, method="POST",
@@ -279,12 +289,22 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 if helper_pid is not None:
                     self.assertTrue(support.wait_pid_gone(helper_pid, support.EXIT_DEADLINE),
                                     "production FUSE helper did not exit after API SIGKILL")
+                holder_now = support.process_identity(holder.pid)
+                self.assertIsNotNone(holder_now, "crashed-API holder exited before proof")
+                self.assertEqual(holder_now["starttime"], holder_identity["starttime"],
+                                 "crashed-API holder identity changed before proof")
                 self.assertTrue(
                     support.wait_for_mount_id_gone(
                         holder.pid, mountpoint, mount_id, support.EXIT_DEADLINE),
                     f"BLOCKED: {self.backend} did not remove exact owned mount ID "
                     f"{mount_id} before cleanup; in-process fuse has no AutoUnmount "
                     "ownership boundary")
+                old_remaining = [
+                    row for row in support.read_process_mountinfo(holder.pid)
+                    if row["mountpoint"] == str(mountpoint)
+                ]
+                self.assertEqual(old_remaining, [],
+                                 "crashed workspace mount was replaced after SIGKILL")
                 self.assertEqual(int(h.sql(
                     "SELECT count(*) FROM workspace_events "
                     f"WHERE workspace_id='{wid}' AND kind='external_capture'")),
@@ -302,7 +322,10 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 # the crashed API's evidence.
                 support.terminate_process(holder)
                 holder = None
+                old_mount_cleared = True
                 h.stop(hard=True)
+                remount_started = True
+                new_mount_cleared = False
                 h.start()
                 new_api_pid = h.proc.pid
                 remount = support.wait_for_fuse_mount(new_api_pid, mountpoint)
@@ -348,6 +371,8 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 # bound.  Do not take Harness.stop's SIGKILL/fallback branch:
                 # normal shutdown must exit 0 and release the helper/mount before
                 # the fixture root is deleted.
+                self.assertEqual(os.getpgid(new_api_pid), new_api_pid,
+                                 "fresh API is not the owned process-group leader")
                 os.killpg(new_api_pid, signal.SIGTERM)
                 new_api_exit = support.wait_process_exit(h.proc, timeout=5)
                 self.assertEqual(new_api_exit, 0,
@@ -365,8 +390,6 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 remaining = [
                     row for row in support.read_process_mountinfo(new_holder.pid)
                     if row["mountpoint"] == str(mountpoint)
-                    and row["source"] == "rootyard-workspace"
-                    and (row["fstype"] == "fuse" or row["fstype"].startswith("fuse."))
                 ]
                 self.assertEqual(remaining, [],
                                  "fresh workspace mount remained after normal shutdown")
@@ -376,6 +399,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                                  "fresh holder identity changed before cleanup")
                 support.terminate_process(new_holder)
                 new_holder = None
+                new_mount_cleared = True
                 new_mount_id = None
             except BaseException as error:
                 original_failure = error
@@ -389,109 +413,140 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     except BaseException as error:
                         cleanup_failures.append((label, error))
 
+                def clear_holder(holder, identity, mountpoint, mount_id, label):
+                    """Prove the exact mount gone, then terminate its holder.
+
+                    The holder stays alive on every failure path so its mount
+                    namespace remains available as evidence; holder termination
+                    is never used as mount-removal proof.
+                    """
+                    if (holder is None or identity is None
+                            or mountpoint is None or mount_id is None):
+                        raise AssertionError(f"{label}: holder/mount identity unavailable")
+                    current = support.process_identity(holder.pid)
+                    if (current is None
+                            or current["starttime"] != identity["starttime"]):
+                        raise AssertionError(f"{label}: holder identity changed")
+                    if not support.wait_for_mount_id_gone(
+                            holder.pid, mountpoint, mount_id, support.EXIT_DEADLINE):
+                        raise AssertionError(f"{label}: mount ID {mount_id} remained")
+                    remaining = [
+                        row for row in support.read_process_mountinfo(holder.pid)
+                        if row["mountpoint"] == str(mountpoint)
+                    ]
+                    if remaining:
+                        raise AssertionError(f"{label}: mountpoint has a replacement mount")
+                    support.terminate_process(holder)
+                    current = support.process_identity(holder.pid)
+                    if (current is not None and current["state"] != "Z"
+                            and current["starttime"] == identity["starttime"]):
+                        raise AssertionError(f"{label}: holder survived termination")
+
                 if gate is not None:
                     attempt("release capture gate",
                             lambda: gate.with_suffix(".release").touch())
                 attempt("stop pending writer",
                         lambda: support.terminate_process(writer))
-                attempt("stop crashed-API namespace holder",
-                        lambda: support.terminate_process(holder))
-                if helper_pid is not None:
-                    current = support.process_identity(helper_pid)
-                    if (helper_identity is not None and current is not None
-                            and current["state"] != "Z"
-                            and current["starttime"] == helper_identity["starttime"]):
-                        attempt("kill crashed-API helper",
-                                lambda: os.killpg(helper_pid, signal.SIGKILL))
-                        if not support.wait_pid_gone(helper_pid, support.EXIT_DEADLINE):
-                            cleanup_failures.append((
-                                "crashed-API helper residue",
-                                AssertionError(
-                                    f"crashed-API helper {helper_pid} remained")))
 
-                # A failure can leave the fresh API alive.  Reclaim only the
-                # verified owned API process group, then still wait for the fresh
-                # helper and mount before fixture-root deletion.
                 if h.proc is not None and h.proc.poll() is None:
+                    group_owned = False
                     try:
-                        os.killpg(h.proc.pid, signal.SIGTERM)
-                        support.wait_process_exit(h.proc, timeout=5)
+                        group_owned = os.getpgid(h.proc.pid) == h.proc.pid
                     except BaseException as error:
-                        cleanup_failures.append(("fresh API graceful stop", error))
-                        try:
-                            os.killpg(h.proc.pid, signal.SIGKILL)
-                        except OSError:
-                            pass
-                        try:
-                            support.wait_process_exit(
-                                h.proc, timeout=support.EXIT_DEADLINE)
-                        except BaseException as kill_error:
-                            cleanup_failures.append(("fresh API hard stop", kill_error))
-
-                if new_helper_pid is not None:
-                    current = support.process_identity(new_helper_pid)
-                    if (new_helper_identity is not None and current is not None
-                            and current["starttime"] == new_helper_identity["starttime"]):
-                        if not support.wait_pid_gone(
-                                new_helper_pid, support.EXIT_DEADLINE):
-                            cleanup_failures.append((
-                                "fresh helper residue",
-                                AssertionError(
-                                    f"fresh helper {new_helper_pid} remained")))
-                            if current["state"] != "Z":
-                                attempt("kill fresh helper",
-                                        lambda: os.killpg(
-                                            new_helper_pid, signal.SIGKILL))
-                                if not support.wait_pid_gone(
-                                        new_helper_pid, support.EXIT_DEADLINE):
-                                    cleanup_failures.append((
-                                        "fresh helper unreaped",
-                                        AssertionError(
-                                            f"fresh helper {new_helper_pid} survived")))
-
-                if new_mount_id is not None:
-                    if new_holder is None:
+                        cleanup_failures.append(("owned API process group", error))
+                    if not group_owned:
                         cleanup_failures.append((
-                            "fresh mount unattested",
-                            AssertionError(
-                                f"fresh mount ID {new_mount_id} has no holder")))
+                            "owned API process group",
+                            AssertionError("API Popen is not its process-group leader")))
                     else:
-                        holder_now = support.process_identity(new_holder.pid)
-                        if (new_holder_identity is None or holder_now is None
-                                or holder_now["starttime"]
-                                != new_holder_identity["starttime"]):
-                            cleanup_failures.append((
-                                "fresh mount unattested",
-                                AssertionError(
-                                    f"fresh holder identity changed for mount ID "
-                                    f"{new_mount_id}")))
-                        else:
-                            try:
-                                gone = support.wait_for_mount_id_gone(
-                                    new_holder.pid, mountpoint, new_mount_id,
-                                    support.EXIT_DEADLINE)
-                            except BaseException as error:
-                                gone = False
-                                cleanup_failures.append(("fresh mount wait", error))
-                            if not gone:
+                        try:
+                            os.killpg(h.proc.pid, signal.SIGTERM)
+                            code = support.wait_process_exit(h.proc, timeout=5)
+                            if code != 0:
                                 cleanup_failures.append((
-                                    "fresh mount residue",
-                                    AssertionError(
-                                        f"fresh mount ID {new_mount_id} remained "
-                                        "before root deletion")))
+                                    "owned API graceful exit",
+                                    AssertionError(f"API exit {code}, expected 0")))
+                        except BaseException as error:
+                            cleanup_failures.append(("owned API stop", error))
+                            try:
+                                os.killpg(h.proc.pid, signal.SIGKILL)
+                            except OSError:
+                                pass
+                            try:
+                                support.wait_process_exit(
+                                    h.proc, timeout=support.EXIT_DEADLINE)
+                            except BaseException as kill_error:
+                                cleanup_failures.append(
+                                    ("owned API hard stop", kill_error))
+                if h.proc is not None and h.proc.poll() is None:
+                    cleanup_failures.append((
+                        "owned API residue",
+                        AssertionError("API process remains after stop")))
 
-                if new_holder is not None:
-                    holder_now = support.process_identity(new_holder.pid)
-                    if (new_holder_identity is not None and holder_now is not None
-                            and holder_now["starttime"]
-                            != new_holder_identity["starttime"]):
+                for pid, identity, label in (
+                        (helper_pid, helper_identity, "crashed-API"),
+                        (new_helper_pid, new_helper_identity, "fresh")):
+                    if pid is None:
+                        continue
+                    current = support.process_identity(pid)
+                    if current is None:
+                        continue
+                    if identity is None:
                         cleanup_failures.append((
-                            "fresh holder identity changed",
-                            AssertionError(
-                                f"holder PID {new_holder.pid} now names another process")))
+                            f"{label} helper identity unavailable",
+                            AssertionError(f"helper {pid} ownership is unresolved")))
+                        continue
+                    if current["starttime"] != identity["starttime"]:
+                        continue
+                    try:
+                        own_group = os.getpgid(pid) == pid
+                    except OSError:
+                        own_group = False
+                    if not own_group:
+                        cleanup_failures.append((
+                            f"{label} helper process group",
+                            AssertionError(f"helper {pid} process group is unresolved")))
+                        continue
+                    if not support.wait_pid_gone(pid, support.EXIT_DEADLINE):
+                        if current["state"] != "Z":
+                            attempt(f"kill {label} helper",
+                                    lambda pid=pid: os.killpg(pid, signal.SIGKILL))
+                        if not support.wait_pid_gone(pid, support.EXIT_DEADLINE):
+                            cleanup_failures.append((
+                                f"{label} helper residue",
+                                AssertionError(f"helper {pid} remained")))
+
+                if not old_mount_cleared:
+                    if not workspace_created:
+                        if workspace_attempted:
+                            cleanup_failures.append((
+                                "crashed-API workspace outcome unknown",
+                                AssertionError(
+                                    "workspace creation outcome is unresolved; root retained")))
+                        else:
+                            old_mount_cleared = True
                     else:
-                        attempt("stop fresh namespace holder",
-                                lambda: support.terminate_process(new_holder))
+                        try:
+                            clear_holder(holder, holder_identity, mountpoint,
+                                         mount_id, "crashed-API")
+                        except BaseException as error:
+                            cleanup_failures.append(("crashed-API mount/holder", error))
+                        else:
+                            holder = None
+                            old_mount_cleared = True
+
+                if not new_mount_cleared:
+                    if not remount_started:
+                        new_mount_cleared = True
+                    else:
+                        try:
+                            clear_holder(new_holder, new_holder_identity, mountpoint,
+                                         new_mount_id, "fresh")
+                        except BaseException as error:
+                            cleanup_failures.append(("fresh mount/holder", error))
+                        else:
+                            new_holder = None
+                            new_mount_cleared = True
 
                 for label, fd in (("close API pidfd", api_pidfd),
                                   ("close helper pidfd", helper_pidfd),
@@ -499,9 +554,27 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     if fd is not None:
                         attempt(label, lambda fd=fd: os.close(fd))
 
-                # Both final steps are attempted even if earlier cleanup failed.
-                attempt("harness stop", lambda: h.stop())
-                attempt("harness cleanup", lambda: h.cleanup())
+                cleanup_allowed = (
+                    old_mount_cleared and new_mount_cleared and not cleanup_failures)
+                if cleanup_allowed and h.proc is not None and h.proc.poll() is None:
+                    cleanup_failures.append((
+                        "harness stop ownership unresolved",
+                        AssertionError("API process is still live")))
+                    cleanup_allowed = False
+                if cleanup_allowed:
+                    attempt("harness stop", lambda: h.stop())
+                    attempt("harness cleanup", lambda: h.cleanup())
+                else:
+                    if h.proc is None or h.proc.poll() is not None:
+                        # h.stop is safe here: Popen has no live child to signal.
+                        attempt("harness stop", lambda: h.stop())
+                    elif h.log is not None:
+                        attempt("close harness log", lambda: h.log.close())
+                        h.log = None
+                    cleanup_failures.append((
+                        "fixture root retained",
+                        AssertionError(
+                            "mount/process cleanup unproven; root/schema retained")))
 
                 if cleanup_failures:
                     detail = "; ".join(
