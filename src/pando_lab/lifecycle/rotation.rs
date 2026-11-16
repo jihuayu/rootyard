@@ -88,6 +88,21 @@ impl KmsRotationCheckpoint {
     }
 }
 
+pub(crate) async fn insert_envelope_in_tx(
+    t: &tokio_postgres::Transaction<'_>,
+    env: &KmsEnvelopeRecord,
+) -> Result<()> {
+    super::db::insert_envelope_in_tx(t, env).await
+}
+
+pub(crate) async fn sync_kms_policy_in_tx(
+    t: &tokio_postgres::Transaction<'_>,
+    repo: Uuid,
+    policy: &super::provider::KmsKeyPolicy,
+) -> Result<()> {
+    super::db::sync_kms_policy_in_tx(t, repo, policy).await
+}
+
 pub(crate) async fn load_authoritative_envelope_optional(
     c: &Client,
     base_root: &Path,

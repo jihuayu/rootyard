@@ -29,6 +29,12 @@ impl PgSession {
         self.client.as_ref().expect("owned PostgreSQL session client")
     }
 
+    /// Scoped mutable borrow of the lock-owning session. Callers must not move,
+    /// clone or replace the client; a transaction borrows this exact owner.
+    pub(crate) fn client_mut(&mut self) -> &mut Client {
+        self.client.as_mut().expect("owned PostgreSQL session client")
+    }
+
     pub(crate) async fn acquire_runner(&self, repo: Uuid) -> Result<()> {
         self.acquire(repo, RUNNER_DOMAIN, "runner").await
     }

@@ -252,6 +252,53 @@ pub async fn upsert_envelope_in_db(c: &Client, env: &KmsEnvelopeRecord) -> Resul
     Ok(())
 }
 
+pub(crate) async fn insert_envelope_in_tx(
+    t: &tokio_postgres::Transaction<'_>,
+    env: &KmsEnvelopeRecord,
+) -> Result<()> {
+    t.execute(
+        "INSERT INTO pando_lab.kms_envelopes(repo,pack_id,key_id,key_version,cipher_suite,plaintext_sha256,envelope_mac,storage_tier,\
+         encryption_mode,envelope_id,nonce_prefix,wrapped_key_json,ciphertext_sha256,ciphertext_bytes,provider_kind) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+        &[
+            &env.repo, &env.pack_id, &env.key_id, &env.key_version, &env.cipher_suite,
+            &env.plaintext_sha256, &env.envelope_mac, &env.storage_tier, &env.encryption_mode,
+            &env.envelope_id, &env.nonce_prefix, &env.wrapped_key_json, &env.ciphertext_sha256,
+            &(env.ciphertext_bytes.map(|v| v as i64)), &env.provider_kind,
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn sync_kms_policy_in_tx(
+    t: &tokio_postgres::Transaction<'_>,
+    repo: Uuid,
+    policy: &KmsKeyPolicy,
+) -> Result<()> {
+    t.execute(
+        "INSERT INTO pando_lab.lifecycle_policies(repo) VALUES($1) ON CONFLICT(repo) DO NOTHING",
+        &[&repo],
+    ).await?;
+    t.execute(
+        "UPDATE pando_lab.lifecycle_policies SET kms_key_id=$2,kms_key_version=$3,updated_at=now() WHERE repo=$1",
+        &[&repo, &policy.active_key_id, &policy.active_key_version],
+    ).await?;
+    t.execute(
+        "INSERT INTO pando_lab.kms_key_policies(repo,active_key_id,active_key_version,retain_previous_generations,min_readable_key_version,provider_revoked,encryption_mode) \
+         VALUES($1,$2,$3,$4,$5,$6,$7) \
+         ON CONFLICT(repo) DO UPDATE SET active_key_id=EXCLUDED.active_key_id,active_key_version=EXCLUDED.active_key_version,\
+         retain_previous_generations=EXCLUDED.retain_previous_generations,min_readable_key_version=EXCLUDED.min_readable_key_version,\
+         provider_revoked=EXCLUDED.provider_revoked,encryption_mode=EXCLUDED.encryption_mode,updated_at=now()",
+        &[
+            &repo, &policy.active_key_id, &policy.active_key_version, &policy.retain_previous_generations,
+            &policy.min_readable_key_version, &policy.provider_revoked,
+            &super::crypto::AUTHENTICATED_ENVELOPE_MODE,
+        ],
+    ).await?;
+    Ok(())
+}
+
 pub async fn load_envelope_from_db(
     c: &Client,
     repo: Uuid,

@@ -139,6 +139,13 @@ pub(super) async fn run(config: &Config) -> Result<()> {
     flush(&mut out)
 }
 
+fn needs_prepared_encryption(
+    has_checkpoint: bool,
+    selected: lifecycle::provider_selection::PandoProviderSelection,
+) -> bool {
+    has_checkpoint || selected == lifecycle::provider_selection::PandoProviderSelection::VaultTransit
+}
+
 async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<()> {
     let repo: Uuid = std::env::var("PANDO_REPO")?.parse()?;
     let principal = std::env::var("PANDO_PRINCIPAL")?;
@@ -146,7 +153,9 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
     let ctl = control(config)?;
     let git_dir = std::env::current_dir()?;
     let value = serde_json::to_value(commands)?;
-    let mut c = config.db().await?;
+    let mut session = lifecycle::publication::writer_session(config, repo).await?;
+    let checkpoint = lifecycle::publication::active_rotation(session.client(), repo).await?;
+    let c = session.client();
     // Do not overwrite the complete pre-receive command group with Git's filtered
     // proc-receive subset. Matching JSON arrays checks old/new/name and ordering.
     let n=c.execute("UPDATE pando_lab.operations SET state='PREPARING' WHERE id=$1 AND repo=$2 AND principal=$3 AND state='PREPARED' AND commands=$4",&[&op,&repo,&principal,&value]).await?;
@@ -197,6 +206,27 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
         std::process::exit(71);
     }
     let pack = store::publish_pack(config, repo, op, &git_dir, &roots).await?;
+    let prepared = if let Some((pack, _)) = &pack {
+        let selected = lifecycle::provider_selection::selected_kind()?;
+        let needs_encrypted = needs_prepared_encryption(checkpoint.is_some(), selected);
+        if needs_encrypted {
+            Some(
+                object_store::prepare_known_pack_publication(
+                    config,
+                    session.client(),
+                    repo,
+                    pack,
+                    checkpoint.as_ref(),
+                    "hot",
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     c.execute(
         "UPDATE pando_lab.operations SET state='OBJECTS_DURABLE' WHERE id=$1",
         &[&op],
@@ -215,7 +245,7 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
-    let t = c.transaction().await?;
+    let t = session.client_mut().transaction().await?;
     let row = t
         .query_one(
             "SELECT generation,storage_generation,write_paused,storage_backend FROM pando_lab.repositories WHERE id=$1 FOR UPDATE",
@@ -284,6 +314,9 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
             .await?;
         }
     }
+    if let Some(prepared) = &prepared {
+        prepared.publish_in(&t).await?;
+    }
     for cmd in commands {
         if cmd.new == ZERO {
             t.execute(
@@ -318,8 +351,24 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
         std::process::exit(73);
     }
     t.commit().await?;
+    if let Some(prepared) = &prepared {
+        prepared.refresh_mirrors();
+    }
     if ctl.fault == "after-commit" {
         std::process::exit(74);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_encryption_activation_matrix_is_explicit() {
+        assert!(!needs_prepared_encryption(false, lifecycle::provider_selection::PandoProviderSelection::Local));
+        assert!(needs_prepared_encryption(false, lifecycle::provider_selection::PandoProviderSelection::VaultTransit));
+        assert!(needs_prepared_encryption(true, lifecycle::provider_selection::PandoProviderSelection::Local));
+        assert!(needs_prepared_encryption(true, lifecycle::provider_selection::PandoProviderSelection::VaultTransit));
+    }
 }

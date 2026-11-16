@@ -294,6 +294,98 @@ async fn decrypt_verified_store_pack(
     Ok((p_bytes, i_bytes))
 }
 
+pub(crate) struct PreparedPackPublication {
+    repo: Uuid,
+    pack_id: Uuid,
+    manifest: CasPackManifest,
+    envelope: lifecycle::KmsEnvelopeRecord,
+    local_policy: Option<lifecycle::provider::KmsKeyPolicy>,
+    base_root: PathBuf,
+}
+
+impl PreparedPackPublication {
+    pub(crate) async fn publish_in(&self, t: &Transaction<'_>) -> Result<()> {
+        t.execute(
+            "INSERT INTO pando_lab.object_store_manifests(repo,pack_id,bucket,pack_key,idx_key,manifest_key,pack_sha256,idx_sha256,pack_bytes,idx_bytes,object_count,chunk_size,chunk_count,manifest_json) \
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+            &[
+                &self.repo, &self.pack_id, &self.manifest.bucket, &self.manifest.pack_key,
+                &self.manifest.idx_key, &self.manifest.manifest_key, &self.manifest.pack_sha256,
+                &self.manifest.idx_sha256, &(self.manifest.pack_bytes as i64),
+                &(self.manifest.idx_bytes as i64), &(self.manifest.object_count as i64),
+                &(self.manifest.chunk_size as i64), &(self.manifest.pack_chunks.len() as i64),
+                &serde_json::to_value(&self.manifest)?,
+            ],
+        ).await?;
+        lifecycle::rotation::insert_envelope_in_tx(t, &self.envelope).await?;
+        if let Some(policy) = &self.local_policy {
+            lifecycle::rotation::sync_kms_policy_in_tx(t, self.repo, policy).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_mirrors(&self) {
+        let _ = lifecycle::write_envelope_file(&self.base_root, &self.envelope);
+    }
+}
+
+pub(crate) async fn prepare_known_pack_publication(
+    config: &Config,
+    client: &Client,
+    repo: Uuid,
+    pack: &Pack,
+    checkpoint: Option<&lifecycle::rotation::KmsRotationCheckpoint>,
+    storage_tier: &str,
+) -> Result<PreparedPackPublication> {
+    let local_root = config.root.join("objects");
+    let pack_bytes = std::fs::read(local_root.join(repo.to_string()).join(format!("{}.pack", pack.id)))?;
+    let idx_bytes = std::fs::read(local_root.join(repo.to_string()).join(format!("{}.idx", pack.id)))?;
+    ensure!(
+        delta::sha256_hex(&pack_bytes) == pack.pack_sha256
+            && delta::sha256_hex(&idx_bytes) == pack.idx_sha256,
+        "prepared pack or index digest does not match the known pack identity"
+    );
+    let opts = ObjectStorePutOptions {
+        expected_pack_sha256: Some(pack.pack_sha256.clone()),
+        expected_pack_bytes: Some(pack_bytes.len() as u64),
+        ..Default::default()
+    };
+    let (_, manifest, envelope, local_policy) = put_pack_files_sealed(
+        &store_root(config),
+        &local_root,
+        repo,
+        pack.id,
+        &opts,
+        storage_tier,
+        checkpoint,
+        Some(client),
+    )
+    .await?;
+    ensure!(
+        manifest.repo == repo
+            && manifest.pack_id == pack.id
+            && manifest.pack_sha256 == pack.pack_sha256
+            && manifest.idx_sha256 == pack.idx_sha256,
+        "prepared object-store manifest identity mismatch"
+    );
+    if let Some(cp) = checkpoint {
+        ensure!(
+            envelope.provider_kind == cp.to_provider_kind
+                && envelope.key_id == cp.to_key_id
+                && envelope.key_version == cp.expected_version(),
+            "prepared envelope does not match the authoritative rotation target"
+        );
+    }
+    Ok(PreparedPackPublication {
+        repo,
+        pack_id: pack.id,
+        manifest,
+        envelope,
+        local_policy,
+        base_root: config.root.clone(),
+    })
+}
+
 pub(crate) async fn put_pack_files_sealed(
     store_root_dir: &Path,
     local_objects_root: &Path,
