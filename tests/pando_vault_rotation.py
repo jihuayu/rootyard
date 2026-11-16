@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""Authored (not executed here) real Vault/PG rotation qualification harness.
+
+Run this only in an environment that intentionally owns Docker, PostgreSQL 17,
+Vault and the lab binary.  It accepts an existing ``rootyard-pando-lab`` binary
+and its native-build receipt, proves the source/receipt/binary identity, then
+runs exactly five mandatory cases.  Missing tools, fixtures, unsupported
+operations or unverifiable identities fail; there is no skip path.
+
+The report is a fixed allowlist of case names, statuses, counts, hashes and
+booleans.  It never contains tokens, DSNs, provider bodies, SQL rows, wrapped
+DEKs, pack/plaintext bytes, marker text, environment dumps, raw child output,
+container logs or traceback text.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import tempfile
+
+TESTS = Path(__file__).resolve().parent
+ROOT = TESTS.parent
+SCRIPTS = ROOT / "scripts"
+for entry in (str(TESTS), str(SCRIPTS)):
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+import native_build_receipt as receipts  # noqa: E402
+from pando_vault_rotation_fixture import FixtureError  # noqa: E402
+import pando_vault_rotation_cases as cases  # noqa: E402
+import pando_vault_rotation_negative as negative  # noqa: E402
+from pando_vault_rotation_context import Context  # noqa: E402
+from pando_vault_rotation_support import (  # noqa: E402
+    ALLOWED_LIMITATIONS,
+    CASES,
+    COMMIT_RE,
+    QualificationError,
+    Runner,
+    atomic_write_json,
+    inside,
+    require,
+    sanitize_report,
+    sha256_bytes,
+    sha256_file,
+)
+
+REPORT_SCHEMA = "rootyard/issue21-derived-vault-rotation/v1"
+
+
+def required_cases():
+    return CASES
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--binary", default=None,
+                        help="rootyard-pando-lab binary (default ROOTYARD_PANDO_LAB_BIN)")
+    parser.add_argument("--receipt", default=None,
+                        help="native-build receipt (default ROOTYARD_PANDO_BUILD_RECEIPT)")
+    parser.add_argument("--source-root", default=str(ROOT))
+    parser.add_argument("--expected-commit", default=None)
+    parser.add_argument("--expected-binary-sha256", default=None)
+    parser.add_argument("--report", default=None)
+    return parser.parse_args(argv)
+
+
+def _harness_files():
+    paths = sorted(TESTS.glob("pando_vault_rotation*.py"))
+    paths += sorted(TESTS.glob("test_pando_vault_rotation*.py"))
+    return [path for path in paths if path.is_file()]
+
+
+def _harness_sha256():
+    rows = [path.name + "\0" + sha256_file(path) for path in _harness_files()]
+    require(bool(rows), "harness_files_missing", "binding")
+    return sha256_bytes("\n".join(rows).encode())
+
+
+def _source_state(root):
+    try:
+        return receipts.require_clean_git_state(root)
+    except receipts.ReceiptError:
+        raise QualificationError("source_not_clean", "binding") from None
+    except (OSError, ValueError):
+        raise QualificationError("source_unreadable", "binding") from None
+
+
+def _pando_artifact(receipt, binary_sha256):
+    rows = [
+        row for row in receipt.artifacts
+        if isinstance(row, dict) and row.get("kind") == "bin"
+        and row.get("target") == "rootyard-pando-lab"
+    ]
+    require(bool(rows), "receipt_pando_artifact_missing", "binding")
+    row = rows[0]
+    if "executable_sha256" in row:
+        require(row["executable_sha256"] == binary_sha256,
+                "receipt_pando_artifact_mismatch", "binding")
+    return True
+
+
+def validate_inputs(args, environ):
+    binary = args.binary or environ.get("ROOTYARD_PANDO_LAB_BIN")
+    receipt = args.receipt or environ.get("ROOTYARD_PANDO_BUILD_RECEIPT")
+    expected_commit = args.expected_commit or environ.get("ROOTYARD_EXPECTED_COMMIT")
+    expected_sha = args.expected_binary_sha256 or environ.get(
+        "ROOTYARD_PANDO_LAB_SHA256")
+    report = args.report
+    require(bool(binary), "missing_binary", "input")
+    require(bool(receipt), "missing_receipt", "input")
+    require(bool(expected_commit), "missing_expected_commit", "input")
+    require(bool(report), "missing_report", "input")
+    require(COMMIT_RE.fullmatch(expected_commit) is not None,
+            "expected_commit_invalid", "input")
+    if expected_sha is not None:
+        require(re.fullmatch(r"[0-9a-f]{64}", expected_sha) is not None,
+                "expected_binary_sha256_invalid", "input")
+    binary = Path(binary).resolve()
+    receipt = Path(receipt).resolve()
+    source_root = Path(args.source_root).resolve()
+    report = Path(report).resolve()
+    require(binary.is_file() and os.access(binary, os.X_OK),
+            "binary_missing_or_not_executable", "input")
+    require(receipt.is_file(), "receipt_missing", "input")
+    require(source_root.is_dir(), "source_root_missing", "input")
+    require(not any(part.startswith("rootyard-pando-vault-rotation-")
+                    for part in report.parts),
+            "report_path_inside_owned_root", "input")
+    for tool in ("docker", "psql", "git"):
+        require(shutil.which(tool) is not None, tool + "_missing", "input")
+    bootstrap = environ.get("ROOTYARD_TEST_DATABASE_URL")
+    require(bool(bootstrap), "missing_pg_bootstrap", "input")
+    state = _source_state(source_root)
+    require(state["commit"] == expected_commit, "expected_commit_mismatch", "binding")
+    binary_sha256 = sha256_file(binary)
+    try:
+        validated = receipts.load_receipt(
+            receipt,
+            source_root=source_root,
+            binary_path=binary,
+            expected_commit=expected_commit,
+            expected_binary_sha256=expected_sha,
+            forbid_implicit_build=True,
+        )
+    except receipts.ReceiptError:
+        raise QualificationError("receipt_rejected", "binding") from None
+    require(validated.binary_sha256 == binary_sha256,
+            "receipt_binary_digest_mismatch", "binding")
+    require(validated.workspace_commit == expected_commit,
+            "receipt_commit_mismatch", "binding")
+    require(_pando_artifact(validated, binary_sha256),
+            "receipt_pando_artifact_missing", "binding")
+    return {
+        "binary": binary,
+        "receipt": receipt,
+        "source_root": source_root,
+        "expected_commit": expected_commit,
+        "expected_binary_sha256": expected_sha,
+        "report": report,
+        "bootstrap_dsn": bootstrap,
+        "source_commit": state["commit"],
+        "source_tree": state["tree"],
+        "source_clean": bool(state["clean"]),
+        "binary_sha256": binary_sha256,
+        "receipt_sha256": validated.receipt_sha256,
+        "harness_sha256": _harness_sha256(),
+    }
+
+
+def binding_snapshot(inputs):
+    try:
+        state = receipts.git_state(inputs["source_root"])
+    except (OSError, ValueError, Exception):
+        raise QualificationError("binding_unreadable", "binding") from None
+    require(state["commit"] == inputs["source_commit"]
+            and state["tree"] == inputs["source_tree"],
+            "source_binding_changed", "binding")
+    require(bool(state["clean"]), "source_became_dirty", "binding")
+    require(sha256_file(inputs["binary"]) == inputs["binary_sha256"],
+            "binary_binding_changed", "binding")
+    require(sha256_file(inputs["receipt"]) == inputs["receipt_sha256"],
+            "receipt_binding_changed", "binding")
+    require(_harness_sha256() == inputs["harness_sha256"],
+            "harness_binding_changed", "binding")
+    return {
+        "source_commit": state["commit"],
+        "source_tree": state["tree"],
+        "source_clean": bool(state["clean"]),
+        "binary_sha256": inputs["binary_sha256"],
+        "receipt_sha256": inputs["receipt_sha256"],
+        "harness_sha256": inputs["harness_sha256"],
+    }
+
+
+def _failed_case(case_id, code, stage):
+    return {
+        "id": case_id,
+        "status": "failed",
+        "code": code or "mandatory_case_failed",
+        "stage": stage or "case",
+        "facts": {},
+    }
+
+
+def _failed_cleanup(code, stage):
+    return {
+        "id": CASES[4],
+        "status": "failed",
+        "code": code or "owned_resource_cleanup_unresolved",
+        "stage": stage or "cleanup",
+        "facts": {
+            "cleanup_ok": False,
+            "vault_stopped": False,
+            "postgres_dropped": False,
+            "root_removed": False,
+            "no_global_cleanup": True,
+        },
+    }
+
+
+def fill_cases(results, code, stage, cleanup):
+    mapping = {row["id"]: row for row in results if row.get("id") in CASES}
+    for case_id in CASES:
+        if case_id == CASES[4]:
+            mapping[case_id] = cleanup
+        elif case_id not in mapping:
+            mapping[case_id] = _failed_case(case_id, code, stage)
+    return [mapping[case_id] for case_id in CASES]
+
+
+def build_report(inputs, rows, cleanup, passed, error_code=None, stage=None):
+    binding = {}
+    if inputs is not None:
+        binding = {
+            "source_commit": inputs.get("source_commit"),
+            "source_tree": inputs.get("source_tree"),
+            "source_clean": inputs.get("source_clean"),
+            "binary_sha256": inputs.get("binary_sha256"),
+            "receipt_sha256": inputs.get("receipt_sha256"),
+            "harness_sha256": inputs.get("harness_sha256"),
+        }
+    payload = {
+        "schema": REPORT_SCHEMA,
+        "passed": bool(passed),
+        "status": "passed" if passed else "failed",
+        "case_count": len(rows),
+        "cases": rows,
+        "binding": binding,
+        "cleanup": cleanup.get("facts", {}),
+        "limitations": list(ALLOWED_LIMITATIONS),
+    }
+    if error_code is not None:
+        payload["error_code"] = error_code
+    if stage is not None:
+        payload["stage"] = stage
+    return sanitize_report(payload)
+
+
+def _report_path_allowed(path):
+    return not any(part.startswith("rootyard-pando-vault-rotation-")
+                   for part in Path(path).parts)
+
+
+def _write_report(path, payload):
+    if not _report_path_allowed(path):
+        return False
+    atomic_write_json(Path(path), payload)
+    return True
+
+
+def _minimal_failed_report():
+    return {
+        "schema": REPORT_SCHEMA,
+        "passed": False,
+        "status": "failed",
+        "case_count": len(CASES),
+        "cases": [
+            {"id": case_id, "status": "failed",
+             "code": "report_projection_rejected", "stage": "report", "facts": {}}
+            for case_id in CASES
+        ],
+        "binding": {},
+        "cleanup": {"cleanup_ok": False},
+        "limitations": list(ALLOWED_LIMITATIONS),
+        "error_code": "report_projection_rejected",
+        "stage": "report",
+    }
+
+
+def _safe_build(inputs, rows, cleanup, passed, error_code=None, stage=None):
+    try:
+        return build_report(inputs, rows, cleanup, passed, error_code, stage)
+    except QualificationError:
+        fallback_cleanup = _failed_cleanup(
+            "report_projection_rejected", "report")
+        fallback_rows = fill_cases(
+            [], "report_projection_rejected", "report", fallback_cleanup)
+        try:
+            return build_report(
+                inputs, fallback_rows, fallback_cleanup, False,
+                "report_projection_rejected", "report")
+        except QualificationError:
+            return _minimal_failed_report()
+
+
+def run_qualification(args, environ=None):
+    environ = dict(os.environ if environ is None else environ)
+    inputs = None
+    context = None
+    rows = []
+    cleanup = None
+    fatal_code = None
+    fatal_stage = None
+    before = None
+    try:
+        inputs = validate_inputs(args, environ)
+        before = binding_snapshot(inputs)
+    except QualificationError as error:
+        fatal_code, fatal_stage = error.code, error.stage
+    except Exception:
+        fatal_code, fatal_stage = "unexpected_error", "input"
+    if inputs is None:
+        cleanup = _failed_cleanup("qualification_not_started", "cleanup")
+        rows = fill_cases([], fatal_code or "input_validation_failed",
+                          fatal_stage or "input", cleanup)
+        report = _safe_build(None, rows, cleanup, False,
+                             fatal_code or "input_validation_failed",
+                             fatal_stage or "input")
+        if args.report:
+            try:
+                if not _write_report(args.report, report):
+                    report["passed"] = False
+                    report["status"] = "failed"
+                    report["error_code"] = "report_path_rejected"
+            except OSError:
+                report["passed"] = False
+                report["status"] = "failed"
+                report["error_code"] = "report_write_failed"
+        return report
+    try:
+        context = Context(inputs, environ, Runner())
+        try:
+            context.start_base()
+            rows.append(cases.case_fixture_and_app_capability_boundary(context))
+            context.prepare_initial_packs()
+            rows.append(cases.case_authentic_envelope_digest_and_cold_read(context))
+            rows.append(cases.case_admin_rotated_target_interrupted_resume_and_new_write(context))
+            rows.append(negative.case_wrong_key_ciphertext_envelope_and_provider_revocation(context))
+        except QualificationError as error:
+            fatal_code, fatal_stage = error.code, error.stage
+        except FixtureError as error:
+            fatal_code, fatal_stage = error.code, error.stage
+        except Exception:
+            fatal_code, fatal_stage = "unexpected_error", "case"
+    finally:
+        if context is not None:
+            try:
+                cleanup = negative.case_owned_resource_cleanup(context)
+            except Exception:
+                cleanup = _failed_cleanup("cleanup_unexpected_error", "cleanup")
+        else:
+            cleanup = _failed_cleanup("qualification_not_started", "cleanup")
+        if not isinstance(cleanup, dict):
+            cleanup = _failed_cleanup("cleanup_unexpected_error", "cleanup")
+        if cleanup.get("status") != "passed" and fatal_code is None:
+            fatal_code = cleanup.get("code") or "owned_resource_cleanup_unresolved"
+            fatal_stage = "cleanup"
+        rows = fill_cases(rows, fatal_code or "mandatory_case_failed",
+                          fatal_stage or "case", cleanup)
+    binding_ok = True
+    if before is not None:
+        try:
+            after = binding_snapshot(inputs)
+        except QualificationError as error:
+            binding_ok = False
+            fatal_code, fatal_stage = error.code, error.stage
+        else:
+            if after != before:
+                binding_ok = False
+                fatal_code, fatal_stage = "binding_changed", "binding"
+    all_green = bool(rows) and all(
+        isinstance(row, dict) and row.get("status") == "passed" for row in rows)
+    passed = bool(binding_ok and fatal_code is None and all_green
+                  and cleanup is not None and cleanup.get("status") == "passed")
+    report = _safe_build(inputs, rows, cleanup, passed, fatal_code, fatal_stage)
+    try:
+        if not _write_report(inputs["report"], report):
+            report["passed"] = False
+            report["status"] = "failed"
+            report["error_code"] = "report_path_rejected"
+    except OSError:
+        report["passed"] = False
+        report["status"] = "failed"
+        report["error_code"] = "report_write_failed"
+    return report
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    report = run_qualification(args)
+    return 0 if report.get("passed") is True else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
