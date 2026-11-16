@@ -5,167 +5,12 @@
 //! with the installed `pando_lab` schema. The schema name is fixed by the
 //! product SQL, so every case owns a unique repository UUID, temp root and
 //! all repo-scoped cleanup rather than replacing the fixture with a mock.
+//! Fixture preflight and complete-row assertions live in `pg_test_support`.
 
-use super::super::{Config, Pack, delta, lifecycle};
+use super::super::lifecycle;
+use super::pg_test_support::*;
 use super::producer;
-use std::path::{Path, PathBuf};
-use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
-
-fn config_for(label: &str) -> (Config, PathBuf) {
-    let database = std::env::var("ROOTYARD_TEST_DATABASE_URL")
-        .expect("ROOTYARD_TEST_DATABASE_URL must be set when running the ignored migration PG cases");
-    assert!(!database.trim().is_empty(), "ROOTYARD_TEST_DATABASE_URL must not be empty");
-    // Preflight every production override that could escape the temporary
-    // fixture root or select a non-Local provider. Presence only: never read or
-    // print the external values, and never mutate process-global environment
-    // from parallel Rust tests. This runs before any temp directory or DB row.
-    for name in
-        ["PANDO_OBJECT_STORE_ROOT", "PANDO_KMS_KEYRING_DIR", "PANDO_KMS_PROVIDER", "ROOTYARD_OBJECT_STORE_ENDPOINT"]
-    {
-        assert!(std::env::var_os(name).is_none(), "migration PG cases require an owned fixture; unset {name}");
-    }
-    let root = std::env::temp_dir().join(format!("pando-migration-pg-{label}-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(root.join("objects")).unwrap();
-    std::fs::create_dir_all(root.join("sessions")).unwrap();
-    let config = Config { database, root: root.clone(), git: PathBuf::from("/usr/bin/git") };
-    (config, root)
-}
-
-async fn connect(config: &Config) -> Client {
-    let (client, connection) = tokio_postgres::connect(&config.database, NoTls).await.unwrap();
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    client
-}
-
-async fn cleanup(client: &Client, repo: Uuid) {
-    for sql in [
-        "DELETE FROM pando_lab.migrations WHERE repo=$1",
-        "DELETE FROM pando_lab.refs WHERE repo=$1",
-        "DELETE FROM pando_lab.objects WHERE repo=$1",
-        "DELETE FROM pando_lab.manifests WHERE repo=$1",
-        "DELETE FROM pando_lab.object_store_manifests WHERE repo=$1",
-        "DELETE FROM pando_lab.kms_envelopes WHERE repo=$1",
-        "DELETE FROM pando_lab.kms_key_policies WHERE repo=$1",
-        "DELETE FROM pando_lab.lifecycle_policies WHERE repo=$1",
-        "DELETE FROM pando_lab.kms_keys WHERE repo=$1",
-        "DELETE FROM pando_lab.kms_rotations WHERE repo=$1",
-        "DELETE FROM pando_lab.acl WHERE repo=$1",
-        "DELETE FROM pando_lab.repositories WHERE id=$1",
-    ] {
-        let _ = client.execute(sql, &[&repo]).await;
-    }
-}
-
-async fn table_count(client: &Client, table: &str, repo: Uuid) -> i64 {
-    client.query_one(&format!("SELECT count(*) FROM pando_lab.{table} WHERE repo=$1"), &[&repo]).await.unwrap().get(0)
-}
-
-async fn pair_count(client: &Client, repo: Uuid) -> (i64, i64) {
-    let manifests = table_count(client, "object_store_manifests", repo).await;
-    let envelopes = table_count(client, "kms_envelopes", repo).await;
-    (manifests, envelopes)
-}
-
-async fn init_bare(config: &Config, path: &Path) {
-    std::fs::create_dir_all(path).unwrap();
-    config.git(path, &["init", "--bare", "--initial-branch=main", "."], b"").await.unwrap();
-}
-
-async fn commit_file(config: &Config, gitfs: &Path, file: &str, content: &str, parents: &[&str]) -> String {
-    let blob =
-        String::from_utf8(config.git(gitfs, &["hash-object", "-w", "--stdin"], content.as_bytes()).await.unwrap())
-            .unwrap()
-            .trim()
-            .to_owned();
-    let tree_input = format!("100644 blob {blob}\t{file}\n");
-    let tree = String::from_utf8(config.git(gitfs, &["mktree"], tree_input.as_bytes()).await.unwrap())
-        .unwrap()
-        .trim()
-        .to_owned();
-    let mut args = vec![
-        "-c",
-        "user.name=Migration Fixture",
-        "-c",
-        "user.email=migration@example.invalid",
-        "commit-tree",
-        tree.as_str(),
-        "-m",
-        "fixture commit",
-    ];
-    for parent in parents {
-        args.push("-p");
-        args.push(*parent);
-    }
-    String::from_utf8(config.git(gitfs, &args, b"").await.unwrap()).unwrap().trim().to_owned()
-}
-
-fn local_checkpoint(repo: Uuid, state: &str, write_epoch: u64) -> lifecycle::rotation::KmsRotationCheckpoint {
-    lifecycle::rotation::KmsRotationCheckpoint {
-        rotation_id: Uuid::new_v4(),
-        repo,
-        from_key_id: lifecycle::DEFAULT_KMS_KEY_ID.to_owned(),
-        from_key_version: lifecycle::DEFAULT_KMS_KEY_VERSION,
-        to_key_id: lifecycle::DEFAULT_KMS_KEY_ID.to_owned(),
-        to_key_version: lifecycle::DEFAULT_KMS_KEY_VERSION,
-        state: state.to_owned(),
-        revoke_previous: false,
-        target_pack_ids: Vec::new(),
-        completed_pack_ids: Vec::new(),
-        failed_pack_id: None,
-        from_provider_kind: lifecycle::provider::PROVIDER_KIND_LOCAL.to_owned(),
-        to_provider_kind: lifecycle::provider::PROVIDER_KIND_LOCAL.to_owned(),
-        expected_to_version: lifecycle::DEFAULT_KMS_KEY_VERSION,
-        external_rotate_issued: false,
-        reconcile_stage: lifecycle::rotation::KmsReconcileStage::NotIssued,
-        target_contract: lifecycle::rotation::EXISTING_TARGET_CONTRACT.to_owned(),
-        write_epoch,
-    }
-}
-
-async fn insert_local_checkpoint(client: &Client, repo: Uuid, state: &str, write_epoch: u64) {
-    let checkpoint = local_checkpoint(repo, state, write_epoch);
-    let value = serde_json::to_value(&checkpoint).unwrap();
-    client
-        .execute(
-            "INSERT INTO pando_lab.kms_rotations(id,repo,from_key_id,from_key_version,to_key_id,to_key_version,state,revoke_previous,total_packs,processed_packs,failed_pack_id,checkpoint_json) \
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
-            &[
-                &checkpoint.rotation_id,
-                &repo,
-                &checkpoint.from_key_id,
-                &checkpoint.from_key_version,
-                &checkpoint.to_key_id,
-                &checkpoint.to_key_version,
-                &checkpoint.state,
-                &checkpoint.revoke_previous,
-                &(checkpoint.target_pack_ids.len() as i32),
-                &(checkpoint.completed_pack_ids.len() as i32),
-                &checkpoint.failed_pack_id,
-                &value,
-            ],
-        )
-        .await
-        .unwrap();
-}
-
-fn write_fixture_pack(root: &Path, repo: Uuid, payload: &[u8]) -> Pack {
-    let pack_id = Uuid::new_v4();
-    let dir = root.join("objects").join(repo.to_string());
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut pack = Vec::from(&b"PACK\x00\x00\x00\x02\x00\x00\x00\x01"[..]);
-    pack.push(0x80 | 0x30 | ((payload.len() & 0x0f) as u8));
-    pack.push((payload.len() >> 4) as u8);
-    pack.extend_from_slice(&delta::compress_zlib_stored(payload));
-    let trailer = delta::sha1_digest(&pack);
-    pack.extend_from_slice(&trailer);
-    let idx = format!("idx-{}", payload.len()).into_bytes();
-    std::fs::write(dir.join(format!("{pack_id}.pack")), &pack).unwrap();
-    std::fs::write(dir.join(format!("{pack_id}.idx")), &idx).unwrap();
-    Pack { id: pack_id, pack_sha256: delta::sha256_hex(&pack), idx_sha256: delta::sha256_hex(&idx) }
-}
 
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the installed pando_lab schema"]
@@ -180,12 +25,21 @@ async fn pg_copy_authenticated_publication_commits_pair_rows_and_mirror_together
     config.git(&gitfs, &["update-ref", "refs/heads/main", first.as_str()], b"").await.unwrap();
     insert_local_checkpoint(&admin, repo, "IN_PROGRESS", 1).await;
 
+    let gitfs_path = std::fs::canonicalize(&gitfs).unwrap().to_string_lossy().into_owned();
     let report = super::step_copy(&config, repo, &gitfs).await.unwrap();
     assert_eq!(report.state, "COPYING");
     assert_eq!(report.storage_backend, "gitfs");
     assert_eq!(report.migration_state, "copying");
     assert!(!report.write_paused);
+    assert_eq!(report.generation, 1);
+    assert_eq!(report.old_storage_generation, 1);
+    assert_eq!(report.new_storage_generation, 1);
+    assert_eq!(report.copied_packs, 1);
+    assert!(report.copied_objects > 0);
     assert!(report.incremental_objects_synced > 0);
+    assert_repo_row(&admin, repo, 1, 1, "gitfs", "copying", false, Some(&gitfs_path)).await;
+    assert_migration_row(&admin, repo, "COPYING").await;
+    assert_key_policy(&admin, repo).await;
 
     assert_eq!(pair_count(&admin, repo).await, (1, 1));
     assert_eq!(table_count(&admin, "manifests", repo).await, 1);
@@ -230,18 +84,23 @@ async fn pg_drain_authenticated_incremental_publication_is_atomic_and_targeted()
     let second = commit_file(&config, &gitfs, "app.txt", "two\n", &[first.as_str()]).await;
     config.git(&gitfs, &["update-ref", "refs/heads/main", second.as_str()], b"").await.unwrap();
 
+    let gitfs_path = std::fs::canonicalize(&gitfs).unwrap().to_string_lossy().into_owned();
     let report = super::step_drain(&config, repo, &gitfs).await.unwrap();
     assert_eq!(report.state, "DRAINED");
     assert_eq!(report.migration_state, "draining");
     assert!(report.write_paused);
+    assert_eq!(report.generation, 2);
+    assert_eq!(report.old_storage_generation, 1);
+    assert_eq!(report.new_storage_generation, 1);
+    assert_eq!(report.copied_packs, 2);
+    assert!(report.copied_objects > 0);
     assert!(report.incremental_objects_synced > 0);
     assert!(report.diff_report.as_ref().unwrap().matched);
     assert!(report.diff_report.as_ref().unwrap().bit_for_bit_match);
+    assert_repo_row(&admin, repo, 2, 1, "gitfs", "draining", true, Some(&gitfs_path)).await;
+    assert_migration_row(&admin, repo, "DRAINED").await;
+    assert_key_policy(&admin, repo).await;
     assert_eq!(pair_count(&admin, repo).await, (2, 2));
-    assert_eq!(table_count(&admin, "migrations", repo).await, 1);
-    let migration_state: String =
-        admin.query_one("SELECT state FROM pando_lab.migrations WHERE repo=$1", &[&repo]).await.unwrap().get(0);
-    assert_eq!(migration_state, "DRAINED");
     let ref_oid: String =
         admin.query_one("SELECT oid FROM pando_lab.refs WHERE repo=$1", &[&repo]).await.unwrap().get(0);
     assert_eq!(ref_oid, second);
@@ -272,6 +131,7 @@ async fn pg_publication_rollback_leaves_no_authority_rows_or_mirror() {
     let repo = Uuid::new_v4();
     admin.execute("INSERT INTO pando_lab.repositories(id, storage_generation) VALUES($1, 1)", &[&repo]).await.unwrap();
     insert_local_checkpoint(&admin, repo, "IN_PROGRESS", 1).await;
+    assert_repo_row(&admin, repo, 0, 1, "pando", "idle", false, None).await;
     let pack = write_fixture_pack(&config.root, repo, b"rollback-pack");
 
     let mut session = producer::ProducerSession::begin(&config, repo).await.unwrap();
@@ -295,10 +155,9 @@ async fn pg_publication_rollback_leaves_no_authority_rows_or_mirror() {
     assert!(!lifecycle::envelope_file_path(&config.root, repo, pack.id).exists());
     t.rollback().await.unwrap();
 
+    assert_repo_row(&admin, repo, 0, 1, "pando", "idle", false, None).await;
     assert_eq!(pair_count(&admin, repo).await, (0, 0));
-    assert_eq!(table_count(&admin, "manifests", repo).await, 0);
-    assert_eq!(table_count(&admin, "objects", repo).await, 0);
-    assert_eq!(table_count(&admin, "refs", repo).await, 0);
+    assert_no_authority(&admin, repo).await;
     assert!(!lifecycle::envelope_file_path(&config.root, repo, pack.id).exists());
 
     cleanup(&admin, repo).await;
@@ -335,6 +194,8 @@ async fn pg_exact_preparation_retry_returns_same_physical_winner() {
     t.commit().await.unwrap();
     winner.refresh_mirrors();
 
+    assert_repo_row(&admin, repo, 0, 1, "pando", "idle", false, None).await;
+    assert_key_policy(&admin, repo).await;
     assert_eq!(pair_count(&admin, repo).await, (1, 1));
     assert_eq!(winner.envelope().envelope_id, first_envelope);
     assert_eq!(std::fs::read(winner.report().bucket_pack_path.as_str()).unwrap(), first_ciphertext);
@@ -440,17 +301,18 @@ async fn pg_local_default_and_legacy_completed_epoch_zero_keep_raw_behavior() {
         let commit = commit_file(&config, &gitfs, "local.txt", label, &[]).await;
         config.git(&gitfs, &["update-ref", "refs/heads/main", commit.as_str()], b"").await.unwrap();
 
+        let gitfs_path = std::fs::canonicalize(&gitfs).unwrap().to_string_lossy().into_owned();
         let report = super::step_copy(&config, repo, &gitfs).await.unwrap();
         assert_eq!(report.state, "COPYING");
         assert_eq!(report.migration_state, "copying");
+        assert_eq!(report.generation, 1);
+        assert_repo_row(&admin, repo, 1, 1, "gitfs", "copying", false, Some(&gitfs_path)).await;
+        assert_migration_row(&admin, repo, "COPYING").await;
         assert_eq!(pair_count(&admin, repo).await, (0, 0));
+        assert_eq!(table_count(&admin, "kms_key_policies", repo).await, 0);
         assert_eq!(table_count(&admin, "manifests", repo).await, 1);
         assert_eq!(table_count(&admin, "refs", repo).await, 1);
         assert_eq!(table_count(&admin, "migrations", repo).await, 1);
-        assert_eq!(
-            admin.query("SELECT pack_id FROM pando_lab.kms_envelopes WHERE repo=$1", &[&repo]).await.unwrap().len(),
-            0
-        );
 
         cleanup(&admin, repo).await;
     }

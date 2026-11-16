@@ -9,6 +9,8 @@ use std::{
 
 mod parity;
 #[cfg(test)]
+mod pg_test_support;
+#[cfg(test)]
 mod pg_tests;
 mod producer;
 
