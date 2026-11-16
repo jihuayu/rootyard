@@ -74,6 +74,8 @@ pub struct KmsRotationCheckpoint {
     pub reconcile_stage: KmsReconcileStage,
     #[serde(default)]
     pub target_contract: String,
+    #[serde(default)]
+    pub write_epoch: u64,
 }
 
 impl KmsRotationCheckpoint {
@@ -513,7 +515,7 @@ async fn resolve_vault_rotation_checkpoint(
             }
         }
     }
-    let cp = KmsRotationCheckpoint {
+    let mut cp = KmsRotationCheckpoint {
         rotation_id: Uuid::new_v4(),
         repo,
         from_key_id: vault.key_name().to_owned(),
@@ -531,7 +533,9 @@ async fn resolve_vault_rotation_checkpoint(
         external_rotate_issued: false,
         reconcile_stage: KmsReconcileStage::TargetObserved,
         target_contract: EXISTING_TARGET_CONTRACT.to_owned(),
+        write_epoch: 0,
     };
+    cp.write_epoch = super::db::next_write_epoch(c, repo).await?;
     persist_checkpoint(c, kms_dir, &cp).await?;
     Ok(cp)
 }
@@ -718,7 +722,7 @@ async fn resolve_rotation_checkpoint(
         super::provider::prepare_rotation_target_key(kms_dir, target, DEFAULT_KMS_KEY_ID)?;
     sync_kms_policy_to_db(c, repo, &policy).await?;
 
-    let cp = KmsRotationCheckpoint {
+    let mut cp = KmsRotationCheckpoint {
         rotation_id: Uuid::new_v4(),
         repo,
         from_key_id,
@@ -736,7 +740,9 @@ async fn resolve_rotation_checkpoint(
         external_rotate_issued: false,
         reconcile_stage: KmsReconcileStage::NotIssued,
         target_contract: String::new(),
+        write_epoch: 0,
     };
+    cp.write_epoch = super::db::next_write_epoch(c, repo).await?;
     persist_checkpoint(c, kms_dir, &cp).await?;
     Ok((cp, policy))
 }
@@ -912,6 +918,7 @@ mod tests {
             external_rotate_issued: issued,
             reconcile_stage: stage,
             target_contract: "existing-vault-version/v1".to_owned(),
+            write_epoch: 1,
         }
     }
 

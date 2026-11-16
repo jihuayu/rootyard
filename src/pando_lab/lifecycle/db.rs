@@ -37,22 +37,92 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn load_db_checkpoint(c: &Client, repo: Uuid) -> Result<Option<KmsRotationCheckpoint>> {
-    let rows = c
-        .query(
-            "SELECT checkpoint_json FROM pando_lab.kms_rotations WHERE repo=$1 AND state='IN_PROGRESS' ORDER BY updated_at DESC",
+pub(super) async fn next_write_epoch(c: &Client, repo: Uuid) -> Result<u64> {
+    let row = c
+        .query_one(
+            "SELECT COALESCE(MAX((checkpoint_json->>'write_epoch')::bigint),0) FROM pando_lab.kms_rotations WHERE repo=$1",
             &[&repo],
         )
         .await?;
-    ensure!(rows.len() <= 1, "multiple in-progress Pando rotation checkpoints");
-    let Some(row) = rows.into_iter().next() else { return Ok(None) };
-    let value: serde_json::Value = row.get(0);
-    let cp: KmsRotationCheckpoint = serde_json::from_value(value)?;
+    let current: i64 = row.get(0);
+    ensure!(current >= 0, "invalid Pando rotation write epoch");
+    u64::try_from(current)
+        .ok()
+        .and_then(|v| v.checked_add(1))
+        .context("Pando rotation write epoch exhausted")
+}
+
+fn validate_current_checkpoint(cp: &KmsRotationCheckpoint, repo: Uuid) -> Result<()> {
     ensure!(
-        cp.repo == repo && cp.state == "IN_PROGRESS",
-        "in-progress rotation checkpoint identity mismatch"
+        cp.repo == repo
+            && !cp.rotation_id.is_nil()
+            && (cp.state == "IN_PROGRESS" || cp.state == "COMPLETED")
+            && super::valid_kms_key_id(&cp.from_key_id)
+            && super::valid_kms_key_id(&cp.to_key_id)
+            && cp.from_key_version >= 1
+            && cp.to_key_version >= 1,
+        "invalid Pando rotation checkpoint identity"
     );
-    Ok(Some(cp))
+    ensure!(
+        cp.from_provider_kind == super::provider::PROVIDER_KIND_LOCAL
+            || cp.from_provider_kind == super::provider::PROVIDER_KIND_VAULT,
+        "invalid Pando rotation source provider"
+    );
+    ensure!(
+        cp.to_provider_kind == super::provider::PROVIDER_KIND_LOCAL
+            || cp.to_provider_kind == super::provider::PROVIDER_KIND_VAULT,
+        "invalid Pando rotation target provider"
+    );
+    ensure!(
+        cp.expected_version() == cp.to_key_version,
+        "Pando rotation checkpoint target version mismatch"
+    );
+    if cp.to_provider_kind == super::provider::PROVIDER_KIND_VAULT {
+        ensure!(
+            cp.target_contract == super::rotation::EXISTING_TARGET_CONTRACT
+                && cp.write_epoch >= 1,
+            "invalid legacy Vault rotation checkpoint contract"
+        );
+    }
+    Ok(())
+}
+
+fn select_current_checkpoint(
+    rows: Vec<(String, serde_json::Value)>,
+    repo: Uuid,
+) -> Result<Option<KmsRotationCheckpoint>> {
+    let mut parsed = Vec::new();
+    for (state, value) in rows {
+        let cp: KmsRotationCheckpoint = serde_json::from_value(value)?;
+        ensure!(cp.state == state, "rotation row/checkpoint state mismatch");
+        validate_current_checkpoint(&cp, repo)?;
+        parsed.push(cp);
+    }
+    let active: Vec<_> = parsed.iter().filter(|cp| cp.state == "IN_PROGRESS").collect();
+    ensure!(active.len() <= 1, "multiple in-progress Pando rotation checkpoints");
+    if let Some(cp) = active.into_iter().next() {
+        return Ok(Some(cp.clone()));
+    }
+    let completed: Vec<_> = parsed.iter().filter(|cp| cp.state == "COMPLETED").collect();
+    let Some(max_epoch) = completed.iter().map(|cp| cp.write_epoch).max() else {
+        return Ok(None);
+    };
+    let latest: Vec<_> = completed.iter().filter(|cp| cp.write_epoch == max_epoch).collect();
+    ensure!(latest.len() == 1, "ambiguous completed Pando rotation write epoch");
+    Ok(Some(latest[0].clone()))
+}
+
+pub(super) async fn load_db_checkpoint(c: &Client, repo: Uuid) -> Result<Option<KmsRotationCheckpoint>> {
+    let rows = c
+        .query(
+            "SELECT state, checkpoint_json FROM pando_lab.kms_rotations WHERE repo=$1",
+            &[&repo],
+        )
+        .await?;
+    select_current_checkpoint(
+        rows.into_iter().map(|row| (row.get(0), row.get(1))).collect(),
+        repo,
+    )
 }
 
 pub(super) fn load_file_checkpoint(kms_dir: &Path) -> Result<Option<KmsRotationCheckpoint>> {
@@ -207,4 +277,79 @@ pub async fn load_envelope_from_db(
         ciphertext_bytes: r.get::<_, Option<i64>>(11).map(|v| v as u64),
         provider_kind: r.get(12),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checkpoint(state: &str, epoch: u64, target: i32, contract: &str) -> KmsRotationCheckpoint {
+        KmsRotationCheckpoint {
+            rotation_id: Uuid::new_v4(),
+            repo: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            from_key_id: "pendo-vault-key".to_owned(),
+            from_key_version: 3,
+            to_key_id: "pendo-vault-key".to_owned(),
+            to_key_version: target,
+            state: state.to_owned(),
+            revoke_previous: false,
+            target_pack_ids: Vec::new(),
+            completed_pack_ids: Vec::new(),
+            failed_pack_id: None,
+            from_provider_kind: super::super::provider::PROVIDER_KIND_VAULT.to_owned(),
+            to_provider_kind: super::super::provider::PROVIDER_KIND_VAULT.to_owned(),
+            expected_to_version: target,
+            external_rotate_issued: false,
+            reconcile_stage: super::super::rotation::KmsReconcileStage::TargetObserved,
+            target_contract: contract.to_owned(),
+            write_epoch: epoch,
+        }
+    }
+
+    #[test]
+    fn completed_epoch_is_current_and_ambiguous_epochs_fail_closed() {
+        let repo = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let contract = super::super::rotation::EXISTING_TARGET_CONTRACT;
+        let old = checkpoint("COMPLETED", 1, 4, contract);
+        let new = checkpoint("COMPLETED", 2, 5, contract);
+        let selected = select_current_checkpoint(
+            vec![
+                ("COMPLETED".to_owned(), serde_json::to_value(&old).unwrap()),
+                ("COMPLETED".to_owned(), serde_json::to_value(&new).unwrap()),
+            ],
+            repo,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.write_epoch, 2);
+        assert_eq!(selected.expected_version(), 5);
+
+        let duplicate = checkpoint("COMPLETED", 2, 6, contract);
+        assert!(select_current_checkpoint(
+            vec![
+                ("COMPLETED".to_owned(), serde_json::to_value(&new).unwrap()),
+                ("COMPLETED".to_owned(), serde_json::to_value(&duplicate).unwrap()),
+            ],
+            repo,
+        )
+        .is_err());
+
+        let invalid = checkpoint("COMPLETED", 2, 5, "");
+        assert!(select_current_checkpoint(
+            vec![("COMPLETED".to_owned(), serde_json::to_value(&invalid).unwrap())],
+            repo,
+        )
+        .is_err());
+
+        let first = checkpoint("IN_PROGRESS", 3, 6, contract);
+        let second = checkpoint("IN_PROGRESS", 4, 7, contract);
+        assert!(select_current_checkpoint(
+            vec![
+                ("IN_PROGRESS".to_owned(), serde_json::to_value(&first).unwrap()),
+                ("IN_PROGRESS".to_owned(), serde_json::to_value(&second).unwrap()),
+            ],
+            repo,
+        )
+        .is_err());
+    }
 }
