@@ -810,6 +810,8 @@ class JobCheckoutHarness(SourcePinHarness):
             require_group=True,
             active_barrier_check=(lambda: not self._barrier_available()) if check_barrier else None,
             start_barrier=start_barrier,
+            source_bounded_producer=True,
+            source_producer_kind="git_stdout_pipe",
         )
         result["configured_bound_proven"] = bool(result["configured_bound_proven"])
         result["received"] = result["client_stop"]["received_bytes"]
@@ -838,6 +840,8 @@ class JobCheckoutHarness(SourcePinHarness):
             require_backpressure=require_backpressure,
             require_group=False,
             start_barrier=start_barrier,
+            source_bounded_producer=True,
+            source_producer_kind="lfs_8_slot_channel",
         )
         result["configured_bound_proven"] = bool(result["configured_bound_proven"])
         result["received"] = result["client_stop"]["received_bytes"]

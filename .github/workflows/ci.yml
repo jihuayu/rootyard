@@ -493,6 +493,7 @@ jobs:
             --harness tests/ci_job_checkouts.py \
             --harness tests/transfer_revocation_timing.py \
             --harness tests/transfer_revocation_observer.py \
+            --harness tests/transfer_revocation_backpressure.py \
             --harness tests/transfer_revocation_transport.py \
             --harness tests/ci_source_pins.py \
             --harness tests/ci_mirror.py \

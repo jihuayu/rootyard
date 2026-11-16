@@ -632,15 +632,27 @@ bound, an inconsistent clock mapping is rejected, and no `expiry + 0.35 s`
 fresh-clock shortcut is used.
 
 The real transfer is opened with a fixture-owned small `SO_RCVBUF` set before
-connect; the effective `getsockopt` value is recorded. A 16/24/32 MiB
-incompressible payload and bounded producer channels make the consumer pause
-meaningful, and the harness proves a live fixture 4-tuple with a persistent
-server send queue/socket inode owned by the fixture service. The healthy read
-pause is before the mutation. After the trigger the consumer stays paused for a
-shorter interval (the CI starting point is 800 ms at `B=1200`, inside `D`),
-then drains promptly with the remaining absolute deadline and `read1`-style
-incremental reads. A timeout, local close, or harness cancellation is never a
-pass.
+connect; the effective `getsockopt` value is recorded but is not treated as a
+payload-capacity proof. A 16/24/32 MiB incompressible payload and bounded
+producer channels make the consumer pause meaningful. The harness proves a
+live fixture 4-tuple and a service-owned socket inode, then requires a
+**continuous sender-stall window**: the server TX queue and client RX queue are
+positive on every qualifying sample, the paused receiver queue is stably
+non-draining, sampling gaps are bounded, and any missing, unobservable, reset,
+or nonqualifying sample invalidates the window. Time spent before the first
+qualifying sample does not count. The minimum qualified interval is 500 ms, not
+merely the last few samples. The large unfinished payload plus bounded producer
+source is the precondition that prevents a producer that already finished all
+bytes into the socket buffer from being mistaken for sustained backpressure.
+No zero-window kernel witness is claimed; if this sustained sender-stall
+evidence cannot be observed, the result remains unproven.
+
+The healthy read pause is before the mutation and the final qualifying sample
+is taken immediately before the mutation trigger (or shortly before the mapped
+natural expiry). After the trigger the consumer stays paused for a shorter
+interval (the CI starting point is 800 ms at `B=1200`, inside `D`), then drains
+promptly with the remaining absolute deadline and `read1`-style incremental
+reads. A timeout, local close, or harness cancellation is never a pass.
 
 Only confirmed transport truncation (incomplete framing, short
 `Content-Length` EOF, or reset) can be a client observation. A later observation

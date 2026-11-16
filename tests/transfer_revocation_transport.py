@@ -11,6 +11,7 @@ import threading
 from urllib.parse import urlsplit
 
 import transfer_revocation_observer as revocation_observer
+from transfer_revocation_backpressure import SustainedStallWindow
 from transfer_revocation_observer import (
     ProcGroupObserver,
     discover_groups,
@@ -86,10 +87,11 @@ def server_fd_owns_inode(service_pid, inode, proc_root=Path("/proc")):
 
 
 class BackpressureProbe:
-    """Observe the fixture 4-tuple and persistent server-side send backlog."""
+    """Observe a sustained, owned server-sender stall while the reader pauses."""
 
     def __init__(self, *, service_pid, server_port, client_socket, requested_rcvbuf,
-                 effective_rcvbuf, proc_root=Path("/proc"), net_path=Path("/proc/net/tcp")):
+                 effective_rcvbuf, min_duration_s=0.5, max_gap_s=0.1,
+                 proc_root=Path("/proc"), net_path=Path("/proc/net/tcp")):
         self.service_pid = service_pid
         self.server_port = int(server_port)
         self.client_port = int(client_socket.getsockname()[1])
@@ -97,8 +99,12 @@ class BackpressureProbe:
         self.effective_rcvbuf = int(effective_rcvbuf)
         self.proc_root = Path(proc_root)
         self.net_path = Path(net_path)
-        self.window = []
+        self.window = SustainedStallWindow(
+            min_duration_ns=int(min_duration_s * 1_000_000_000),
+            max_gap_ns=int(max_gap_s * 1_000_000_000),
+        )
         self.persistent = False
+        self.last_sample = None
 
     def sample(self):
         try:
@@ -124,50 +130,62 @@ class BackpressureProbe:
             "effective_so_rcvbuf": self.effective_rcvbuf,
         }
 
-    def wait_persistent(self, *, samples=3, timeout_s=2.0, min_duration_s=0.15):
+    def _observe(self):
+        observed_ns = time.monotonic_ns()
+        sample = self.sample()
+        sample["observed_ns"] = observed_ns
+        self.last_sample = sample
+        qualified = self.window.observe(sample, observed_ns)
+        return qualified, observed_ns
+
+    def wait_persistent(self, *, timeout_s=2.0):
         deadline = time.monotonic_ns() + int(timeout_s * 1_000_000_000)
-        started = time.monotonic_ns()
-        history = []
         while True:
-            sample = self.sample()
-            history.append(sample)
-            if len(history) >= samples:
-                window = history[-samples:]
-                inode = window[0].get("server_socket_inode")
-                self.persistent = bool(
-                    inode
-                    and all(item.get("server_fd_owned") for item in window)
-                    and all(item.get("server_socket_inode") == inode for item in window)
-                    and all(max(item.get("server_tx_queue") or 0,
-                                item.get("client_rx_queue") or 0) > 0
-                            for item in window)
-                )
-                if (self.persistent
-                        and time.monotonic_ns() - started >= min_duration_s * 1_000_000_000):
-                    self.window = window
-                    return self
-            if time.monotonic_ns() >= deadline:
-                self.window = history[-samples:]
+            qualified, now_ns = self._observe()
+            if qualified:
+                self.persistent = True
+                return self
+            if now_ns >= deadline:
+                self.persistent = False
                 return self
             time.sleep(0.02)
 
+    def hold_until(self, target_ns):
+        while True:
+            now_ns = time.monotonic_ns()
+            if now_ns >= target_ns:
+                return self
+            self._observe()
+            time.sleep(min(0.02, max(0.0, (target_ns - time.monotonic_ns()) / 1_000_000_000)))
+        return self
+
+    def finalize(self):
+        self._observe()
+        self.persistent = bool(self.window.qualified)
+        return self.persistent
+
+    def pre_trigger_valid(self, lower_bound_ns):
+        if not self.persistent or self.last_sample is None:
+            return False
+        observed_ns = self.last_sample["observed_ns"]
+        gap_ns = abs(lower_bound_ns - observed_ns)
+        return gap_ns <= self.window.max_gap_ns
+
     def report(self):
-        window = self.window or []
-        return {
+        report = self.window.report()
+        report.update({
             "persistent": self.persistent,
-            "sample_count": len(window),
             "requested_so_rcvbuf": self.requested_rcvbuf,
             "effective_so_rcvbuf": self.effective_rcvbuf,
             "fixture_four_tuple": {
                 "server_port": self.server_port,
                 "client_port": self.client_port,
             },
-            "server_socket_inode": window[0].get("server_socket_inode") if window else None,
-            "server_fd_owned": all(item.get("server_fd_owned") for item in window) if window else False,
-            "server_tx_queue_min": min((item.get("server_tx_queue") or 0) for item in window) if window else None,
-            "server_tx_queue_max": max((item.get("server_tx_queue") or 0) for item in window) if window else None,
-            "client_rx_queue_max": max((item.get("client_rx_queue") or 0) for item in window) if window else None,
-        }
+            "server_fd_owned": bool(
+                self.last_sample and self.last_sample.get("server_fd_owned")
+            ),
+        })
+        return report
 
 
 class SmallBufferHTTPConnection(http.client.HTTPConnection):
@@ -231,6 +249,8 @@ def run_timed_transfer(
     require_group=True,
     active_barrier_check=None,
     start_barrier=None,
+    source_bounded_producer=True,
+    source_producer_kind="bounded_pipe_or_channel",
 ):
     """Open one real transfer, trigger it, and report conservative evidence."""
     if trigger is None and natural_expiry is None:
@@ -270,16 +290,6 @@ def run_timed_transfer(
                 requested_rcvbuf=connection.requested_so_rcvbuf,
                 effective_rcvbuf=connection.effective_so_rcvbuf,
             )
-            probe.wait_persistent()
-            pre_trigger_sample = probe.sample()
-            probe.persistent = bool(
-                probe.persistent
-                and pre_trigger_sample.get("server_fd_owned")
-                and max(pre_trigger_sample.get("server_tx_queue") or 0,
-                        pre_trigger_sample.get("client_rx_queue") or 0) > 0
-            )
-        else:
-            pre_trigger_sample = None
         if start_barrier is not None:
             start_barrier.wait(timeout=15)
 
@@ -307,10 +317,14 @@ def run_timed_transfer(
         reader = threading.Thread(target=body_reader, name="revocation-body-reader", daemon=True)
         reader.start()
 
+        if probe is not None:
+            probe.wait_persistent()
         if observer is not None:
             observer.sample_once()
         interval = None
         if trigger is not None:
+            if probe is not None:
+                probe.finalize()
             interval, _ = TriggerInterval.measure(trigger_kind, trigger)
             lower_ns = interval.t_before_ns
             deadline_ns = interval.deadline_ns(bound_ms)
@@ -319,9 +333,13 @@ def run_timed_transfer(
             lower_ns = natural_expiry.earliest_ns
             deadline_ns = lower_ns + bound_ns
             trigger_report = natural_expiry.report()
+            if probe is not None:
+                probe.hold_until(lower_ns - 20 * NS_PER_MS)
+                probe.finalize()
         resume_ns = lower_ns + post_pause_ns
         trigger_state["value"] = (lower_ns, resume_ns, deadline_ns)
         trigger_ready.set()
+        pre_trigger_sample = probe.last_sample if probe is not None else None
 
         if probe is not None:
             sample_at = max(lower_ns, resume_ns - 20 * NS_PER_MS)
@@ -353,13 +371,30 @@ def run_timed_transfer(
             except AssertionError:
                 group_sanity_ok = False
 
-        pre_trigger_ok = lower_ns > first_ns
+        if probe is not None:
+            pre_trigger_ok = probe.pre_trigger_valid(lower_ns)
+        else:
+            pre_trigger_ok = lower_ns > first_ns
+        large_unfinished = (expected_size - len(first)) >= 8 * 1024 * 1024
+        source_bounded = bool(source_bounded_producer)
+        source_ok = large_unfinished and source_bounded
         client_ok = stop.confirmed and stop.observed_ns <= deadline_ns
         trigger_ok = interval is None or interval.t_after_ns <= deadline_ns
-        backpressure_ok = (not require_backpressure) or bool(probe and probe.persistent)
+        backpressure_ok = (not require_backpressure) or bool(
+            probe and probe.persistent and probe.window.qualified
+        )
         post_pause_ok = post_pause_ns <= bound_ns
-        proof = bool(client_ok and group_ok and trigger_ok and backpressure_ok
-                     and post_pause_ok and pre_trigger_ok and group_sanity_ok)
+        proof_components = {
+            "client_stop_within_deadline": client_ok,
+            "git_group_within_deadline": group_ok,
+            "group_post_sanity": group_sanity_ok,
+            "trigger_within_deadline": trigger_ok,
+            "backpressure_qualified": backpressure_ok,
+            "source_preconditions": source_ok if require_backpressure else True,
+            "target_pause_within_bound": post_pause_ok,
+            "pre_trigger_window": pre_trigger_ok,
+        }
+        proof = all(proof_components.values())
         result = {
             "configured_bound_ms": int(bound_ms),
             "trigger": trigger_report,
@@ -367,9 +402,7 @@ def run_timed_transfer(
             "deadline_ns": deadline_ns,
             "trigger_within_deadline": trigger_ok,
             "pre_trigger_pause_ms": _ms(lower_ns - first_ns),
-            "pre_trigger_backpressure_established": bool(
-                pre_trigger_ok and (not require_backpressure or bool(probe and probe.persistent))
-            ),
+            "pre_trigger_backpressure_established": bool(pre_trigger_ok and backpressure_ok),
             "post_trigger_pause_ms": _ms(post_pause_ns),
             "reader_resume_after_lower_ms": _ms(resume_ns - lower_ns),
             "post_pause_within_deadline": post_pause_ok,
@@ -381,6 +414,12 @@ def run_timed_transfer(
             },
             "pre_trigger_backpressure_sample": pre_trigger_sample,
             "post_trigger_backpressure_sample": post_sample,
+            "source_preconditions": {
+                "large_unfinished_payload": large_unfinished,
+                "source_bounded_producer_channels": source_bounded,
+                "source_producer_kind": source_producer_kind,
+                "zero_window_witness_available": False,
+            },
             "post_trigger_backpressure_sample_after_lower_ms": (
                 _ms(post_sample_ns - lower_ns) if post_sample_ns is not None else None
             ),
@@ -393,6 +432,7 @@ def run_timed_transfer(
             },
             "git_group_within_deadline": group_ok,
             "post_transfer_group_stopped": group_sanity_ok,
+            "proof_components": proof_components,
             "configured_bound_proven": proof,
         }
         return result

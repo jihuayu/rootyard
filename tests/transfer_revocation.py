@@ -74,6 +74,8 @@ class RevocationHarness(MirrorHarness):
             require_backpressure=True,
             require_group=True,
             active_barrier_check=lambda: not self.barrier_available(),
+            source_bounded_producer=True,
+            source_producer_kind="git_stdout_pipe",
         )
         result["configured_bound_proven"] = bool(result["configured_bound_proven"])
         result["received_before_abort"] = result["client_stop"]["received_bytes"]

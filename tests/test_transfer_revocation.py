@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(ROOT / "tests"))
 
+import transfer_revocation_backpressure as revocation_backpressure  # noqa: E402
 import transfer_revocation_observer as revocation_observer  # noqa: E402
 import transfer_revocation_timing as revocation_timing  # noqa: E402
 import transfer_revocation_transport as revocation_transport  # noqa: E402
@@ -363,6 +364,78 @@ class TestTransferRevocationContract(unittest.TestCase):
             interval_ns=10_000_000, sleep=lambda _seconds: None,
         ))
 
+    @staticmethod
+    def _stall_sample(now_ns, *, tx=4096, rx=4096, inode=17, owned=True,
+                      net=True):
+        return {
+            "observed_ns": now_ns,
+            "net_table_available": net,
+            "server_tx_queue": tx,
+            "client_rx_queue": rx,
+            "server_socket_inode": inode,
+            "server_fd_owned": owned,
+        }
+
+    def test_backpressure_rejects_receiver_rx_without_sender_tx(self):
+        window = revocation_backpressure.SustainedStallWindow(200_000_000)
+        self.assertFalse(window.observe(self._stall_sample(0, tx=0, rx=8192), 0))
+        self.assertEqual(window.last_reset_reason, "server_tx_not_positive")
+        self.assertFalse(window.qualified)
+
+    def test_backpressure_transient_positive_does_not_qualify(self):
+        window = revocation_backpressure.SustainedStallWindow(
+            200_000_000, max_gap_ns=100_000_000
+        )
+        self.assertFalse(window.observe(self._stall_sample(0), 0))
+        self.assertFalse(window.observe(self._stall_sample(20_000_000), 20_000_000))
+        self.assertFalse(window.observe(self._stall_sample(40_000_000, tx=0), 40_000_000))
+        self.assertFalse(window.observe(self._stall_sample(60_000_000), 60_000_000))
+        self.assertFalse(window.observe(self._stall_sample(80_000_000), 80_000_000))
+        self.assertFalse(window.qualified)
+        self.assertGreaterEqual(window.reset_count, 1)
+
+    def test_backpressure_invalid_gap_resets_qualified_window(self):
+        window = revocation_backpressure.SustainedStallWindow(
+            200_000_000, max_gap_ns=100_000_000
+        )
+        self.assertFalse(window.observe(self._stall_sample(0), 0))
+        self.assertFalse(window.observe(self._stall_sample(20_000_000), 20_000_000))
+        self.assertFalse(window.observe(self._stall_sample(200_000_000), 200_000_000))
+        self.assertEqual(window.last_reset_reason, "sample_gap")
+        self.assertFalse(window.observe(self._stall_sample(220_000_000), 220_000_000))
+        self.assertFalse(window.qualified)
+
+    def test_backpressure_time_before_first_qualified_sample_does_not_count(self):
+        window = revocation_backpressure.SustainedStallWindow(250_000_000)
+        for now in (0, 50_000_000, 100_000_000, 150_000_000, 200_000_000):
+            self.assertFalse(window.observe(self._stall_sample(now, tx=0), now))
+        for now in (300_000_000, 350_000_000, 400_000_000, 450_000_000):
+            self.assertFalse(window.observe(self._stall_sample(now), now))
+        self.assertFalse(window.qualified,
+                         "wait spent before the first valid stall must not count")
+
+    def test_backpressure_continuous_qualified_window_is_accepted(self):
+        window = revocation_backpressure.SustainedStallWindow(
+            250_000_000, max_gap_ns=100_000_000
+        )
+        for now in range(0, 301_000_000, 20_000_000):
+            window.observe(self._stall_sample(now), now)
+        self.assertTrue(window.qualified)
+        report = window.report()
+        self.assertTrue(report["server_tx_positive_every_sample"])
+        self.assertTrue(report["client_rx_positive_every_sample"])
+        self.assertTrue(report["receiver_nondraining"])
+        self.assertGreaterEqual(report["observed_window_ms"], 250.0)
+
+    def test_backpressure_receiver_drain_and_inode_change_reset(self):
+        window = revocation_backpressure.SustainedStallWindow(200_000_000)
+        window.observe(self._stall_sample(0, rx=8192), 0)
+        window.observe(self._stall_sample(20_000_000, rx=4096), 20_000_000)
+        self.assertEqual(window.last_reset_reason, "receiver_drained")
+        window.observe(self._stall_sample(40_000_000, rx=8192, inode=17), 40_000_000)
+        window.observe(self._stall_sample(60_000_000, rx=8192, inode=18), 60_000_000)
+        self.assertEqual(window.last_reset_reason, "inode_changed")
+
     def test_natural_expiry_requalification_uses_reconciled_earliest_deadline(self):
         clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
         base = {
@@ -426,6 +499,7 @@ class TestTransferRevocationContract(unittest.TestCase):
     def test_harness_helpers_declare_bound_evidence(self):
         for rel in ("tests/transfer_revocation_timing.py",
                     "tests/transfer_revocation_observer.py",
+                    "tests/transfer_revocation_backpressure.py",
                     "tests/transfer_revocation_transport.py"):
             path = ROOT / rel
             self.assertLessEqual(len(path.read_text(encoding="utf-8").splitlines()), 500, rel)
@@ -442,16 +516,25 @@ class TestTransferRevocationContract(unittest.TestCase):
         transport = (ROOT / "tests/transfer_revocation_transport.py").read_text(encoding="utf-8")
         for expected in ("SO_RCVBUF", "getsockopt", "fixture_four_tuple",
                          "server_fd_owned", "deadline_ns = lower_ns + bound_ns",
-                         "post_pause_ns <= bound_ns", "post_transfer_group_stopped"):
+                         "post_pause_ns <= bound_ns", "post_transfer_group_stopped",
+                         "SustainedStallWindow", "source_bounded_producer"):
             self.assertTrue(expected in transport, f"transport missing {expected}")
+        backpressure = (ROOT / "tests" / "transfer_revocation_backpressure.py").read_text(encoding="utf-8")
+        for expected in ("server_tx_positive_every_sample",
+                         "client_rx_positive_every_sample",
+                         "receiver_nondraining", "sample_gap"):
+            self.assertTrue(expected in backpressure, f"backpressure helper missing {expected}")
         docs = (ROOT / "docs" / "ci-mirror.md").read_text(encoding="utf-8")
         for expected in ("S_upper - E_lower <= B", "small `SO_RCVBUF`",
+                         "continuous sender-stall window", "500 ms",
+                         "No zero-window kernel witness is claimed",
                          "A timeout, local close, or harness cancellation is never a",
                          "no additive CI"):
             self.assertTrue(expected in docs, f"docs missing {expected}")
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         for helper in ("tests/transfer_revocation_timing.py",
                        "tests/transfer_revocation_observer.py",
+                       "tests/transfer_revocation_backpressure.py",
                        "tests/transfer_revocation_transport.py"):
             self.assertTrue(f"--harness {helper}" in workflow, f"workflow missing {helper}")
 
