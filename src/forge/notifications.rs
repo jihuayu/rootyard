@@ -224,7 +224,7 @@ pub(crate) fn visibility_and_scope_clause(restricted: bool) -> String {
     } else {
         ""
     };
-    format!("{vis}{scope}")
+    format!("{vis} AND $2::uuid IS NOT NULL{scope}")
 }
 
 pub(crate) async fn load_notifications_page(
