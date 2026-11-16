@@ -12,8 +12,10 @@
 //! A private injected-future seam lets source tests exercise this production
 //! funnel (primary-error preservation, tracked task join/abort, early serve
 //! Ok/Err) without a public fault endpoint or environment backdoor.
-use anyhow::{anyhow, bail};
-use rootyard::workspaces::mounts::{LegacyShutdownEvidence, shutdown_helper_until_with_evidence};
+use anyhow::anyhow;
+use rootyard::workspaces::mounts::{
+    LegacyShutdownEvidence, StartupJoinError, StartupOutcome, StartupReconcile, shutdown_helper_until_with_evidence,
+};
 use sha2::{Digest, Sha256};
 use std::{
     future::Future,
@@ -28,56 +30,49 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "service_shutdown/completion.rs"]
+mod completion;
+#[path = "service_shutdown/signals.rs"]
+mod signals;
+
+pub(crate) use self::completion::{PendingStartup, startup_join_error_text};
+pub(crate) use self::completion::{ServiceCompletion, is_startup_stopped, startup_join_failure, startup_stopped};
+pub(crate) use self::signals::StopSignals;
+
+/// Biased startup wait used by the service. A ready stop signal is always
+/// polled before the setup future is first polled, including when both become
+/// ready together.
+pub(crate) enum StartupTrigger {
+    Stop(anyhow::Result<()>),
+    Setup(anyhow::Result<()>),
+}
+
+pub(crate) async fn select_startup<S, F>(stop: S, setup: F) -> StartupTrigger
+where
+    S: Future<Output = anyhow::Result<()>>,
+    F: Future<Output = anyhow::Result<()>>,
+{
+    tokio::select! {
+        biased;
+        result = stop => StartupTrigger::Stop(result),
+        result = setup => StartupTrigger::Setup(result),
+    }
+}
+
+enum StartupJoinResult {
+    None,
+    Clean,
+    Stopped,
+    Failed(anyhow::Error),
+    JoinFailed(StartupJoinError),
+    Pending,
+}
+
 /// Fixed, bounded evidence line emitted only after the retained legacy ticket
 /// has actually joined its exact owned mounts.
 const LEGACY_EVIDENCE_PREFIX: &str = "rootyard: legacy-shutdown-evidence ";
 const LEGACY_EVIDENCE_SCHEMA: &str = "rootyard/issues91-95/legacy-shutdown-evidence/v1";
 const LEGACY_EVIDENCE_MAX_WORKSPACES: usize = 64;
-
-/// Result of one service run. The primary error and cleanup failures stay
-/// separate: cleanup can never overwrite or relabel the original failure.
-pub(crate) struct ServiceCompletion {
-    primary: Option<anyhow::Error>,
-    cleanup_failures: Vec<String>,
-    deadline: std::time::Instant,
-}
-
-impl ServiceCompletion {
-    fn new(primary: Option<anyhow::Error>, cleanup_failures: Vec<String>, deadline: Instant) -> Self {
-        Self { primary, cleanup_failures, deadline: deadline.into_std() }
-    }
-
-    /// Only an unsuccessful/pending cleanup may consume the remaining product
-    /// deadline through `Runtime::shutdown_timeout`. A clean terminal outcome
-    /// keeps the ordinary runtime drop and makes no native-cleanup claim from
-    /// process death.
-    pub(crate) fn pending_runtime(&self) -> bool {
-        !self.cleanup_failures.is_empty()
-    }
-
-    pub(crate) fn remaining(&self) -> Duration {
-        self.deadline.saturating_duration_since(std::time::Instant::now())
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn is_clean(&self) -> bool {
-        self.primary.is_none() && self.cleanup_failures.is_empty()
-    }
-
-    /// Preserve the original failure as the error and append cleanup failures
-    /// as a separate, explicit incomplete classification.
-    pub(crate) fn into_result(self) -> anyhow::Result<()> {
-        match (self.primary, self.cleanup_failures.is_empty()) {
-            (Some(primary), true) => Err(primary),
-            (Some(primary), false) => {
-                let cleanup = format!("service cleanup incomplete: {}", self.cleanup_failures.join("; "));
-                Err(primary.context(cleanup))
-            }
-            (None, true) => Ok(()),
-            (None, false) => bail!("normal shutdown incomplete: {}", self.cleanup_failures.join("; ")),
-        }
-    }
-}
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
@@ -167,6 +162,7 @@ pub(crate) struct ServiceOwner {
     worker: Option<JoinHandle<()>>,
     maintenance_task: Option<JoinHandle<anyhow::Result<()>>>,
     session_gc_task: Option<JoinHandle<()>>,
+    startup: Option<StartupReconcile>,
 }
 
 impl ServiceOwner {
@@ -191,6 +187,7 @@ impl ServiceOwner {
             worker: None,
             maintenance_task: None,
             session_gc_task: None,
+            startup: None,
         }
     }
 
@@ -254,26 +251,72 @@ impl ServiceOwner {
         self.session_gc_task = Some(task);
     }
 
+    pub(crate) fn attach_startup(&mut self, startup: StartupReconcile) {
+        self.startup = Some(startup);
+    }
+
+    /// Await the owned startup producer while leaving its handle here if this
+    /// future is dropped by the outer startup select. Service startup calls
+    /// this before any listener bind or later task attachment.
+    pub(crate) async fn wait_startup(&mut self) -> Result<StartupOutcome, StartupJoinError> {
+        let result = {
+            let Some(startup) = self.startup.as_mut() else {
+                return Err(StartupJoinError::AlreadyJoined);
+            };
+            startup.wait().await
+        };
+        self.startup = None;
+        result
+    }
+
+    /// Fix and publish the one deadline, stop new startup row admission, close
+    /// Git admission and stop HTTP acceptance. Idempotent: a later cleanup call
+    /// reuses the same D and cannot extend it.
+    pub(crate) fn begin_stop(&mut self) -> Instant {
+        let deadline = self.absolute_deadline();
+        if let Some(startup) = self.startup.as_ref() {
+            startup.stop();
+        }
+        rootyard::workspaces::close_git_admission();
+        self.http_stop.cancel();
+        deadline
+    }
+
     /// Wait for the normal signal or for the serving future to complete on its
     /// own. On an early completion the `JoinHandle` is consumed exactly once
     /// and converted to the primary error; it is never polled again by cleanup.
+    /// A signal/stream error is a finite primary error. Both branches call
+    /// `begin_stop` before returning.
     pub(crate) async fn wait_for_stop_or_serve<F>(&mut self, stop: F) -> Option<anyhow::Error>
     where
-        F: Future<Output = ()>,
+        F: Future<Output = anyhow::Result<()>>,
     {
-        let Some(server) = self.server.as_mut() else {
-            return Some(anyhow!("HTTP server task was not armed before the service wait"));
-        };
-        let early = tokio::select! {
-            _ = stop => None,
-            joined = server => Some(serve_primary(joined)),
-        };
-        if early.is_some() {
-            // The handle completed exactly once. Drop the consumed handle; a
-            // later cleanup must not poll it again.
-            self.server = None;
+        enum StopOrServe {
+            Stop(anyhow::Result<()>),
+            Serve(Result<io::Result<()>, JoinError>),
         }
-        early
+        let event = {
+            let Some(server) = self.server.as_mut() else {
+                self.begin_stop();
+                return Some(anyhow!("HTTP server task was not armed before the service wait"));
+            };
+            tokio::select! {
+                biased;
+                result = stop => StopOrServe::Stop(result),
+                joined = server => StopOrServe::Serve(joined),
+            }
+        };
+        self.begin_stop();
+        match event {
+            StopOrServe::Stop(Ok(())) => None,
+            StopOrServe::Stop(Err(error)) => Some(error),
+            StopOrServe::Serve(joined) => {
+                // The handle completed exactly once. Drop the consumed handle;
+                // a later cleanup must not poll it again.
+                self.server = None;
+                Some(serve_primary(joined))
+            }
+        }
     }
 
     /// Run the single cleanup funnel. Ordering is the existing product order:
@@ -281,30 +324,55 @@ impl ServiceOwner {
     /// request/Git/background joins, then the final plumbing drain.
     pub(crate) async fn cleanup(
         &mut self,
-        primary: Option<anyhow::Error>,
+        mut primary: Option<anyhow::Error>,
         driver: &dyn CleanupDriver,
     ) -> ServiceCompletion {
-        let deadline = self.absolute_deadline();
+        let deadline = self.begin_stop();
         if self.cleanup_started {
-            return ServiceCompletion::new(primary, vec!["service cleanup was invoked twice".to_owned()], deadline);
+            return ServiceCompletion::new(
+                primary,
+                vec!["service cleanup was invoked twice".to_owned()],
+                deadline,
+                self.startup.take().map(PendingStartup::Owned),
+            );
         }
         self.cleanup_started = true;
 
-        self.http_stop.cancel();
-        // Already accepted Git jobs keep their permits and JoinSet ownership;
-        // only new acquisition is refused from here on.
-        rootyard::workspaces::close_git_admission();
-
         let mut failures = Vec::new();
         let capture_grace = rootyard::workspaces::capture_shutdown_grace().min(remaining_until(deadline));
-        let (capture_result, evidence) = driver
-            .stop_capture_and_mounts(self.capture_task.take(), self.capture_stop.clone(), capture_grace, deadline)
-            .await;
+        let capture_task = self.capture_task.take();
+        let capture_stop = self.capture_stop.clone();
+        let teardown = driver.stop_capture_and_mounts(capture_task, capture_stop, capture_grace, deadline);
+        // Start mount closing/teardown and the retained startup producer join
+        // under the same D. The driver future is polled first by `join!`, so a
+        // blocked startup ensure is never awaited before teardown can release
+        // the mount it is holding.
+        let startup_join = self.join_startup_until(deadline);
+        let (teardown_result, startup_result) = join_teardown_and_startup(teardown, startup_join).await;
+        let (capture_result, evidence) = teardown_result;
         if let Err(error) = capture_result {
             failures.push(format!("workspace capture/helper shutdown did not complete cleanly: {error}"));
         }
         if let Some(evidence) = evidence {
             self.emit_legacy_evidence(&evidence);
+        }
+        match startup_result {
+            StartupJoinResult::None | StartupJoinResult::Clean | StartupJoinResult::Stopped => {}
+            StartupJoinResult::Failed(error) => {
+                if primary.is_none() {
+                    primary = Some(error);
+                } else {
+                    failures.push(format!("startup reconcile failed after another primary error: {error:#}"));
+                }
+            }
+            StartupJoinResult::JoinFailed(error) => {
+                failures.push(format!("startup reconcile join failed: {}", startup_join_error_text(error)));
+            }
+            StartupJoinResult::Pending => {
+                // `ServiceCompletion` retains the owner and its `into_result`
+                // adds the incomplete classification after bounded runtime
+                // termination.
+            }
         }
 
         // The helper has fenced and unmounted before this join. The retained
@@ -385,7 +453,36 @@ impl ServiceOwner {
             failures.push("native Git process cleanup did not prove quiescence".to_owned());
         }
 
-        ServiceCompletion::new(primary, failures, deadline)
+        let pending_startup = self.startup.take().map(PendingStartup::Owned);
+        ServiceCompletion::new(primary, failures, deadline, pending_startup)
+    }
+
+    async fn join_startup_until(&mut self, deadline: Instant) -> StartupJoinResult {
+        let result = {
+            let Some(startup) = self.startup.as_mut() else {
+                return StartupJoinResult::None;
+            };
+            startup.join_until(deadline).await
+        };
+        match result {
+            Ok(StartupOutcome::Completed(Ok(()))) => {
+                self.startup = None;
+                StartupJoinResult::Clean
+            }
+            Ok(StartupOutcome::Stopped) => {
+                self.startup = None;
+                StartupJoinResult::Stopped
+            }
+            Ok(StartupOutcome::Completed(Err(error))) => {
+                self.startup = None;
+                StartupJoinResult::Failed(anyhow::Error::new(error))
+            }
+            Err(StartupJoinError::Deadline) => StartupJoinResult::Pending,
+            Err(error) => {
+                self.startup = None;
+                StartupJoinResult::JoinFailed(error)
+            }
+        }
     }
 
     /// One absolute deadline, computed at the first stop/error and reused for
@@ -439,6 +536,17 @@ fn serve_primary(joined: Result<io::Result<()>, JoinError>) -> anyhow::Error {
     }
 }
 
+async fn join_teardown_and_startup<T, F, S>(teardown: F, startup: S) -> (T, StartupJoinResult)
+where
+    F: Future<Output = T>,
+    S: Future<Output = StartupJoinResult>,
+{
+    // Teardown is the first argument, so the driver future starts before the
+    // startup join is polled. A blocked ensure can therefore be released by the
+    // mount-closing path instead of being awaited first.
+    tokio::join!(teardown, startup)
+}
+
 fn remaining_until(deadline: Instant) -> Duration {
     let now = Instant::now();
     if deadline <= now { Duration::ZERO } else { deadline - now }
@@ -468,276 +576,5 @@ async fn join_aborted_until<T>(deadline: Instant, mut task: JoinHandle<T>) -> Re
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[derive(Default)]
-    struct RecordingDriver {
-        events: Mutex<Vec<String>>,
-        capture_error: Option<String>,
-        git_ok: bool,
-        process_failed: bool,
-    }
-
-    impl RecordingDriver {
-        fn clean() -> Self {
-            Self { git_ok: true, ..Self::default() }
-        }
-
-        fn record(&self, event: &str) {
-            self.events.lock().unwrap().push(event.to_owned());
-        }
-    }
-
-    impl CleanupDriver for RecordingDriver {
-        fn stop_capture_and_mounts<'a>(
-            &'a self,
-            capture: Option<JoinHandle<()>>,
-            _stop: CancellationToken,
-            _capture_grace: Duration,
-            _deadline: Instant,
-        ) -> BoxFuture<'a, (Result<(), String>, Option<LegacyShutdownEvidence>)> {
-            self.record(if capture.is_some() { "capture:present" } else { "capture:absent" });
-            let result = match &self.capture_error {
-                Some(error) => Err(error.clone()),
-                None => Ok(()),
-            };
-            Box::pin(async move {
-                if let Some(task) = capture {
-                    task.abort();
-                    let _ = task.await;
-                }
-                (result, None)
-            })
-        }
-
-        fn drain_git<'a>(&'a self, _deadline: Instant) -> BoxFuture<'a, bool> {
-            self.record("git");
-            let ok = self.git_ok;
-            Box::pin(async move { ok })
-        }
-
-        fn process_cleanup_failed(&self) -> bool {
-            self.record("process");
-            self.process_failed
-        }
-    }
-
-    struct DropFlag(Arc<AtomicBool>);
-
-    impl Drop for DropFlag {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-
-    #[tokio::test]
-    async fn early_serve_error_is_primary_and_enters_the_same_cleanup() {
-        let mut owner = ServiceOwner::arm(Duration::from_secs(2));
-        owner.attach_server(tokio::spawn(async { Err(io::Error::other("injected early serve failure")) }));
-        let primary = owner
-            .wait_for_stop_or_serve(std::future::pending())
-            .await
-            .expect("an early serve completion must become the primary error");
-        assert!(primary.to_string().contains("injected early serve failure"));
-
-        let driver = RecordingDriver::clean();
-        let completion = owner.cleanup(Some(primary), &driver).await;
-        assert!(!completion.is_clean(), "a primary error can never be clean");
-        assert!(!completion.pending_runtime(), "cleanup itself was complete");
-        let events = driver.events.lock().unwrap().clone();
-        assert_eq!(events, vec!["capture:absent".to_owned(), "git".to_owned(), "git".to_owned(), "process".to_owned()]);
-        let error = completion.into_result().expect_err("primary error must survive cleanup");
-        assert!(error.to_string().contains("injected early serve failure"));
-    }
-
-    #[tokio::test]
-    async fn early_serve_ok_before_signal_is_still_a_primary_error() {
-        let mut owner = ServiceOwner::arm(Duration::from_secs(2));
-        owner.attach_server(tokio::spawn(async { Ok(()) }));
-        let primary = owner
-            .wait_for_stop_or_serve(std::future::pending())
-            .await
-            .expect("an early clean serve return is not a normal signal");
-        assert!(primary.to_string().contains("before the normal shutdown signal"));
-
-        let driver = RecordingDriver::clean();
-        let completion = owner.cleanup(Some(primary), &driver).await;
-        assert!(!completion.is_clean());
-        assert!(!completion.pending_runtime());
-        assert!(owner.server.is_none(), "the completed serve JoinHandle must not be polled twice");
-    }
-
-    #[tokio::test]
-    async fn cleanup_failure_stays_separate_and_requests_bounded_runtime_termination() {
-        let mut owner = ServiceOwner::arm(Duration::from_secs(2));
-        let driver = RecordingDriver {
-            capture_error: Some("fixture capture failure".to_owned()),
-            git_ok: false,
-            process_failed: true,
-            ..RecordingDriver::default()
-        };
-        let completion = owner.cleanup(None, &driver).await;
-        assert!(!completion.is_clean());
-        assert!(completion.pending_runtime(), "incomplete cleanup must use the bounded runtime path");
-        assert_eq!(completion.cleanup_failures.len(), 4);
-        let error = completion.into_result().expect_err("incomplete cleanup is not exit zero");
-        let text = error.to_string();
-        assert!(text.contains("normal shutdown incomplete"), "{text}");
-        assert!(text.contains("fixture capture failure"), "{text}");
-        assert!(text.contains("Git jobs/process cleanup"), "{text}");
-        assert!(text.contains("process cleanup did not prove quiescence"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn primary_and_cleanup_failures_are_preserved_separately() {
-        let mut owner = ServiceOwner::arm(Duration::from_secs(2));
-        let driver = RecordingDriver { git_ok: false, ..RecordingDriver::default() };
-        let primary = anyhow!("injected startup failure");
-        let completion = owner.cleanup(Some(primary), &driver).await;
-        let error = completion.into_result().expect_err("the primary failure must be returned");
-        let chain = format!("{error:#}");
-        assert!(chain.contains("service cleanup incomplete"));
-        assert!(chain.contains("Git jobs/process cleanup"));
-        assert!(chain.contains("injected startup failure"));
-    }
-
-    #[tokio::test]
-    async fn tracked_tasks_are_joined_or_aborted_before_cleanup_returns() {
-        let mut owner = ServiceOwner::arm(Duration::from_secs(2));
-        let dispatch = owner.dispatch_stop().clone();
-        let maintenance = owner.maintenance_stop().clone();
-        let session_gc = owner.session_gc_stop().clone();
-        let capture = owner.capture_stop().clone();
-        let http = owner.http_stop().clone();
-        let ready = Arc::new(tokio::sync::Barrier::new(11));
-
-        let controller_dropped = Arc::new(AtomicBool::new(false));
-        let metrics_dropped = Arc::new(AtomicBool::new(false));
-        let worker_dropped = Arc::new(AtomicBool::new(false));
-        let publish_done = Arc::new(AtomicBool::new(false));
-        let delivery_done = Arc::new(AtomicBool::new(false));
-        let webhook_done = Arc::new(AtomicBool::new(false));
-        let maintenance_done = Arc::new(AtomicBool::new(false));
-        let session_done = Arc::new(AtomicBool::new(false));
-        let capture_dropped = Arc::new(AtomicBool::new(false));
-        let server_done = Arc::new(AtomicBool::new(false));
-
-        let flag = controller_dropped.clone();
-        let gate = ready.clone();
-        owner.attach_controller(tokio::spawn(async move {
-            gate.wait().await;
-            let _drop = DropFlag(flag);
-            std::future::pending::<()>().await;
-        }));
-        let flag = metrics_dropped.clone();
-        let gate = ready.clone();
-        owner.attach_metrics(tokio::spawn(async move {
-            gate.wait().await;
-            let _drop = DropFlag(flag);
-            std::future::pending::<()>().await;
-        }));
-        let flag = worker_dropped.clone();
-        let gate = ready.clone();
-        owner.attach_worker(tokio::spawn(async move {
-            gate.wait().await;
-            let _drop = DropFlag(flag);
-            std::future::pending::<()>().await;
-        }));
-        let flag = publish_done.clone();
-        let gate = ready.clone();
-        owner.attach_publish(tokio::spawn(async move {
-            gate.wait().await;
-            dispatch.cancelled().await;
-            flag.store(true, Ordering::Release);
-        }));
-        let flag = delivery_done.clone();
-        let dispatch_delivery = owner.dispatch_stop().clone();
-        let gate = ready.clone();
-        owner.attach_delivery(tokio::spawn(async move {
-            gate.wait().await;
-            dispatch_delivery.cancelled().await;
-            flag.store(true, Ordering::Release);
-        }));
-        let flag = webhook_done.clone();
-        let dispatch_webhook = owner.dispatch_stop().clone();
-        let gate = ready.clone();
-        owner.attach_webhook(tokio::spawn(async move {
-            gate.wait().await;
-            dispatch_webhook.cancelled().await;
-            flag.store(true, Ordering::Release);
-        }));
-        let flag = maintenance_done.clone();
-        let gate = ready.clone();
-        owner.attach_maintenance(tokio::spawn(async move {
-            gate.wait().await;
-            maintenance.cancelled().await;
-            flag.store(true, Ordering::Release);
-            Ok(())
-        }));
-        let flag = session_done.clone();
-        let gate = ready.clone();
-        owner.attach_session_gc(tokio::spawn(async move {
-            gate.wait().await;
-            session_gc.cancelled().await;
-            flag.store(true, Ordering::Release);
-        }));
-        let flag = capture_dropped.clone();
-        let gate = ready.clone();
-        owner.attach_capture(tokio::spawn(async move {
-            gate.wait().await;
-            let _drop = DropFlag(flag);
-            capture.cancelled().await;
-        }));
-        let flag = server_done.clone();
-        let gate = ready.clone();
-        owner.attach_server(tokio::spawn(async move {
-            gate.wait().await;
-            http.cancelled().await;
-            flag.store(true, Ordering::Release);
-            Ok(())
-        }));
-
-        // Every task has reached its owned wait before cleanup takes ownership.
-        ready.wait().await;
-
-        let driver = RecordingDriver::clean();
-        let completion = owner.cleanup(None, &driver).await;
-        assert!(completion.is_clean(), "{:?}", completion.cleanup_failures);
-        assert!(controller_dropped.load(Ordering::Acquire));
-        assert!(metrics_dropped.load(Ordering::Acquire));
-        assert!(worker_dropped.load(Ordering::Acquire));
-        assert!(publish_done.load(Ordering::Acquire));
-        assert!(delivery_done.load(Ordering::Acquire));
-        assert!(webhook_done.load(Ordering::Acquire));
-        assert!(maintenance_done.load(Ordering::Acquire));
-        assert!(session_done.load(Ordering::Acquire));
-        assert!(capture_dropped.load(Ordering::Acquire));
-        assert!(server_done.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn deadline_is_published_once_and_not_extended() {
-        let mut owner = ServiceOwner::arm(Duration::from_millis(50));
-        let first = owner.absolute_deadline();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let second = owner.absolute_deadline();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn empty_join_evidence_is_not_emitted_and_nonempty_evidence_is_bounded() {
-        let mut owner = ServiceOwner::arm(Duration::from_secs(1));
-        let empty = LegacyShutdownEvidence { mount_namespace: 7, joined_mounts: 0, workspaces: Vec::new() };
-        owner.emit_legacy_evidence(&empty);
-        assert!(!owner.evidence_emitted, "an empty ticket is never one mount of proof");
-
-        let joined =
-            LegacyShutdownEvidence { mount_namespace: 7, joined_mounts: 1, workspaces: vec![uuid::Uuid::nil()] };
-        owner.emit_legacy_evidence(&joined);
-        assert!(owner.evidence_emitted);
-        owner.emit_legacy_evidence(&joined);
-        assert!(owner.evidence_emitted, "one cleanup emits one bounded line");
-    }
-}
+#[path = "service_shutdown/tests.rs"]
+mod tests;

@@ -51,13 +51,16 @@ fn main() -> Result<()> {
         Ok(RunOutcome::Service(completion)) => {
             let pending = completion.pending_runtime();
             let remaining = completion.remaining();
-            let result = completion.into_result();
             if pending {
+                // Keep the completion (and any retained startup owner) alive
+                // through bounded runtime termination. The timeout is failure
+                // containment; it never proves cleanup.
                 runtime.shutdown_timeout(remaining);
+                completion.into_result()
             } else {
                 drop(runtime);
+                completion.into_result()
             }
-            result
         }
         Err(error) => {
             drop(runtime);
@@ -303,10 +306,29 @@ async fn run() -> Result<RunOutcome> {
             // scope, so a later failure never bypasses cleanup.
             let git_shutdown_grace = std::time::Duration::from_secs(30).saturating_add(state.config.git_timeout);
             let mut lifecycle = service_shutdown::ServiceOwner::arm(git_shutdown_grace);
-            let setup: Result<()> = async {
-                rootyard::workspaces::mounts::reconcile_startup(&state)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("workspace FUSE mount recovery failed"))?;
+            // Register both Unix stop streams synchronously before the first
+            // legacy mount can be admitted. The owner is already armed, so a
+            // registration failure still enters the same cleanup funnel.
+            let mut signals = match service_shutdown::StopSignals::install() {
+                Ok(signals) => signals,
+                Err(error) => {
+                    let completion = lifecycle.cleanup(Some(error), &service_shutdown::NativeCleanupDriver).await;
+                    return Ok(RunOutcome::Service(completion));
+                }
+            };
+            let startup = rootyard::workspaces::mounts::StartupReconcile::start(state.clone());
+            lifecycle.attach_startup(startup);
+            let setup = async {
+                match lifecycle.wait_startup().await {
+                    Ok(rootyard::workspaces::mounts::StartupOutcome::Completed(Ok(()))) => {}
+                    Ok(rootyard::workspaces::mounts::StartupOutcome::Completed(Err(error))) => {
+                        return Err(anyhow::Error::new(error));
+                    }
+                    Ok(rootyard::workspaces::mounts::StartupOutcome::Stopped) => {
+                        return Err(service_shutdown::startup_stopped());
+                    }
+                    Err(error) => return Err(service_shutdown::startup_join_failure(error)),
+                }
                 rootyard::pando_gateway::pitr_fence::startup_check(&state.pool, &state.storage.root).await?;
                 let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
                 // Lease renewal is independent of the single-host fencing
@@ -420,11 +442,29 @@ async fn run() -> Result<RunOutcome> {
                 });
                 lifecycle.attach_server(server);
                 Ok(())
-            }
-            .await;
-            let primary = match setup {
-                Ok(()) => lifecycle.wait_for_stop_or_serve(shutdown()).await,
-                Err(error) => Some(error),
+            };
+            let mut setup = Box::pin(setup);
+            let trigger = service_shutdown::select_startup(signals.next(), &mut setup).await;
+            // Drop only the setup wrapper. The owned startup producer remains
+            // in the lifecycle owner and is joined concurrently with mount
+            // teardown under the same deadline.
+            drop(setup);
+            let primary = match trigger {
+                service_shutdown::StartupTrigger::Stop(Ok(())) => {
+                    lifecycle.begin_stop();
+                    None
+                }
+                service_shutdown::StartupTrigger::Stop(Err(error)) => {
+                    lifecycle.begin_stop();
+                    Some(error)
+                }
+                service_shutdown::StartupTrigger::Setup(Err(error)) => {
+                    lifecycle.begin_stop();
+                    if service_shutdown::is_startup_stopped(&error) { None } else { Some(error) }
+                }
+                service_shutdown::StartupTrigger::Setup(Ok(())) => {
+                    lifecycle.wait_for_stop_or_serve(signals.next()).await
+                }
             };
             let completion = lifecycle.cleanup(primary, &service_shutdown::NativeCleanupDriver).await;
             return Ok(RunOutcome::Service(completion));
