@@ -35,6 +35,7 @@ class NetTcpEntry:
     state: str
     tx_queue: int
     rx_queue: int
+    timer_active: int
     inode: int
 
 
@@ -53,6 +54,7 @@ def parse_proc_net_tcp(text):
             local_hex, local_port_hex = fields[1].split(":")
             remote_hex, remote_port_hex = fields[2].split(":")
             tx_raw, rx_raw = fields[4].split(":")
+            timer_active = int(fields[5].split(":", 1)[0], 16)
             entries.append(NetTcpEntry(
                 local_host=_ipv4_from_hex(local_hex),
                 local_port=int(local_port_hex, 16),
@@ -61,6 +63,7 @@ def parse_proc_net_tcp(text):
                 state=fields[3],
                 tx_queue=int(tx_raw, 16),
                 rx_queue=int(rx_raw, 16),
+                timer_active=timer_active,
                 inode=int(fields[9]),
             ))
         except (ValueError, IndexError, struct.error):

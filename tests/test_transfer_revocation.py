@@ -303,7 +303,7 @@ class TestTransferRevocationContract(unittest.TestCase):
     def test_backpressure_net_parser_reads_only_fixture_queue_fields(self):
         text = (
             "  sl  local_address rem_address   st tx_queue:rx_queue tr:tm->when retrnsmt   uid  timeout inode\n"
-            "   0: 0100007F:1F90 0100007F:D431 01 00001000:00000000 00:00000000 00000000  1000        0 424242 1\n"
+            "   0: 0100007F:1F90 0100007F:D431 01 00001000:00000000 04:00000000 00000000  1000        0 424242 1\n"
         )
         entries = revocation_transport.parse_proc_net_tcp(text)
         self.assertEqual(len(entries), 1)
@@ -311,6 +311,7 @@ class TestTransferRevocationContract(unittest.TestCase):
         self.assertEqual(entries[0].local_port, 8080)
         self.assertEqual(entries[0].remote_port, 54321)
         self.assertEqual(entries[0].tx_queue, 4096)
+        self.assertEqual(entries[0].timer_active, 4)
         self.assertEqual(entries[0].inode, 424242)
 
     def test_bounded_observer_wait_terminates_at_fixed_deadline(self):
@@ -367,14 +368,18 @@ class TestTransferRevocationContract(unittest.TestCase):
 
     @staticmethod
     def _stall_sample(now_ns, *, tx=4096, rx=4096, inode=17, owned=True,
-                      net=True):
+                      net=True, probe0=True, source=True):
         return {
             "observed_ns": now_ns,
             "net_table_available": net,
+            "same_netns": net,
+            "probe0_pending": probe0,
+            "source_qualified": source,
             "server_tx_queue": tx,
             "client_rx_queue": rx,
             "server_socket_inode": inode,
             "server_fd_owned": owned,
+            "client_inode_owned": owned,
         }
 
     def test_backpressure_rejects_receiver_rx_without_sender_tx(self):
@@ -425,16 +430,28 @@ class TestTransferRevocationContract(unittest.TestCase):
         report = window.report()
         self.assertTrue(report["server_tx_positive_every_sample"])
         self.assertTrue(report["client_rx_positive_every_sample"])
-        self.assertTrue(report["receiver_nondraining"])
+        self.assertTrue(report["receiver_queue_unchanged"])
+        self.assertTrue(report["probe0_every_sample"])
+        self.assertTrue(report["source_qualified_every_sample"])
         self.assertGreaterEqual(report["observed_window_ms"], 250.0)
 
-    def test_backpressure_receiver_drain_and_inode_change_reset(self):
+    def test_backpressure_receiver_growth_and_drain_both_reset(self):
         window = revocation_backpressure.SustainedStallWindow(200_000_000)
         window.observe(self._stall_sample(0, rx=8192), 0)
-        window.observe(self._stall_sample(20_000_000, rx=4096), 20_000_000)
-        self.assertEqual(window.last_reset_reason, "receiver_drained")
-        window.observe(self._stall_sample(40_000_000, rx=8192, inode=17), 40_000_000)
-        window.observe(self._stall_sample(60_000_000, rx=8192, inode=18), 60_000_000)
+        window.observe(self._stall_sample(20_000_000, rx=16384), 20_000_000)
+        self.assertEqual(window.last_reset_reason, "receiver_queue_changed")
+        window.observe(self._stall_sample(40_000_000, rx=8192), 40_000_000)
+        window.observe(self._stall_sample(60_000_000, rx=4096), 60_000_000)
+        self.assertEqual(window.last_reset_reason, "receiver_queue_changed")
+
+    def test_backpressure_probe0_and_source_failures_reset(self):
+        window = revocation_backpressure.SustainedStallWindow(200_000_000)
+        window.observe(self._stall_sample(0, probe0=False), 0)
+        self.assertEqual(window.last_reset_reason, "probe0_not_pending")
+        window.observe(self._stall_sample(20_000_000, source=False), 20_000_000)
+        self.assertEqual(window.last_reset_reason, "source_unqualified")
+        window.observe(self._stall_sample(40_000_000), 40_000_000)
+        window.observe(self._stall_sample(60_000_000, inode=18), 60_000_000)
         self.assertEqual(window.last_reset_reason, "inode_changed")
 
     def _natural_result_fixture(self, *, client_observed_ns):
@@ -572,6 +589,8 @@ class TestTransferRevocationContract(unittest.TestCase):
         for rel in ("tests/transfer_revocation_timing.py",
                     "tests/transfer_revocation_observer.py",
                     "tests/transfer_revocation_backpressure.py",
+                    "tests/transfer_revocation_source.py",
+                    "tests/transfer_revocation_git_source.py",
                     "tests/transfer_revocation_transport.py"):
             path = ROOT / rel
             self.assertLessEqual(len(path.read_text(encoding="utf-8").splitlines()), 500, rel)
@@ -595,7 +614,8 @@ class TestTransferRevocationContract(unittest.TestCase):
         backpressure = (ROOT / "tests" / "transfer_revocation_backpressure.py").read_text(encoding="utf-8")
         for expected in ("server_tx_positive_every_sample",
                          "client_rx_positive_every_sample",
-                         "receiver_nondraining", "sample_gap"):
+                         "receiver_queue_unchanged", "probe0_every_sample",
+                         "source_qualified_every_sample", "sample_gap"):
             self.assertTrue(expected in backpressure, f"backpressure helper missing {expected}")
         docs = (ROOT / "docs" / "ci-mirror.md").read_text(encoding="utf-8")
         for expected in ("S_upper - E_lower <= B", "small `SO_RCVBUF`",

@@ -18,7 +18,7 @@ class SustainedStallWindow:
     max_gap_ns: int = 100_000_000
     started_ns: int = 0
     last_sample_ns: int = 0
-    last_rx_queue: int = 0
+    first_rx_queue: int = 0
     inode: int = 0
     samples: list = field(default_factory=list)
     qualified: bool = False
@@ -30,7 +30,7 @@ class SustainedStallWindow:
             self.reset_count += 1
         self.started_ns = 0
         self.last_sample_ns = 0
-        self.last_rx_queue = 0
+        self.first_rx_queue = 0
         self.inode = 0
         self.samples = []
         self.qualified = False
@@ -39,7 +39,13 @@ class SustainedStallWindow:
     def _reason_if_invalid(self, sample, now_ns):
         if not sample.get("net_table_available"):
             return "net_table_missing"
-        if not sample.get("server_fd_owned"):
+        if not sample.get("same_netns"):
+            return "netns_mismatch"
+        if not sample.get("probe0_pending"):
+            return "probe0_not_pending"
+        if not sample.get("source_qualified"):
+            return "source_unqualified"
+        if not sample.get("server_fd_owned") or not sample.get("client_inode_owned"):
             return "service_inode_not_owned"
         inode = sample.get("server_socket_inode")
         tx_queue = sample.get("server_tx_queue")
@@ -57,8 +63,8 @@ class SustainedStallWindow:
                 return "sample_gap"
             if inode != self.inode:
                 return "inode_changed"
-            if rx_queue < self.last_rx_queue:
-                return "receiver_drained"
+            if rx_queue != self.first_rx_queue:
+                return "receiver_queue_changed"
         return None
 
     def observe(self, sample, now_ns):
@@ -69,8 +75,8 @@ class SustainedStallWindow:
         if not self.samples:
             self.started_ns = now_ns
             self.inode = sample["server_socket_inode"]
+            self.first_rx_queue = sample["client_rx_queue"]
         self.last_sample_ns = now_ns
-        self.last_rx_queue = sample["client_rx_queue"]
         self.samples.append(sample)
         if now_ns - self.started_ns >= self.min_duration_ns:
             self.qualified = True
@@ -108,9 +114,14 @@ class SustainedStallWindow:
             "client_rx_positive_every_sample": bool(rx_values) and all(
                 value > 0 for value in rx_values
             ),
-            "receiver_nondraining": bool(rx_values) and all(
-                rx_values[index] >= rx_values[index - 1]
-                for index in range(1, len(rx_values))
+            "probe0_every_sample": bool(self.samples) and all(
+                item.get("probe0_pending") for item in self.samples
+            ),
+            "source_qualified_every_sample": bool(self.samples) and all(
+                item.get("source_qualified") for item in self.samples
+            ),
+            "receiver_queue_unchanged": bool(rx_values) and all(
+                value == rx_values[0] for value in rx_values
             ),
             "server_tx_queue_min": min(tx_values) if tx_values else None,
             "server_tx_queue_max": max(tx_values) if tx_values else None,
