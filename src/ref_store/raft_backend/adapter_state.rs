@@ -15,7 +15,7 @@ use crate::ref_store::core::state_machine::RefCasStateMachine;
 use crate::ref_store::raft_backend::outcome::{RootRefCasOutcome, RootRefCasRefusalKind};
 use crate::ref_store::raft_backend::proposal::{
     MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, MAX_ROOT_STATE_BYTES, PROPOSAL_WINDOW, ProposalAttempt,
-    ProposalAttemptKind, ProposalId,
+    ProposalAttemptKind,
 };
 
 pub(crate) const ADAPTER_STATE_FORMAT_V3: &str = "rootyard-refcas-adapter/3";
@@ -290,5 +290,37 @@ mod tests {
     fn unknown_v3_like_format_fails_closed() {
         let payload = br#"{"format":"rootyard-refcas-adapter/9","root_snapshot":"{}","attempts":[]}"#;
         assert!(restore_adapter_state(payload).is_err());
+    }
+
+    #[test]
+    fn legacy_v2_restore_preserves_bytes_and_old_digest() {
+        let machine = RefCasStateMachine::new();
+        let root = String::from_utf8(machine.snapshot_bytes().unwrap()).unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "format": ADAPTER_STATE_FORMAT_V2,
+            "root_snapshot": root,
+            "outcomes": [],
+        }))
+        .unwrap();
+        let restored = restore_adapter_state(&payload).unwrap();
+        let legacy = restored.legacy.expect("legacy marker");
+        assert_eq!(legacy.bytes, payload);
+        assert_eq!(legacy.digest_hex, machine.state_digest().unwrap());
+    }
+
+    #[test]
+    fn legacy_v2_with_outcomes_preserves_v2_domain_digest() {
+        let machine = RefCasStateMachine::new();
+        let root = String::from_utf8(machine.snapshot_bytes().unwrap()).unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "format": ADAPTER_STATE_FORMAT_V2,
+            "root_snapshot": root,
+            "outcomes": [{"legacy": true}],
+        }))
+        .unwrap();
+        let restored = restore_adapter_state(&payload).unwrap();
+        let legacy = restored.legacy.expect("legacy marker");
+        assert_eq!(legacy.bytes, payload);
+        assert_eq!(legacy.digest_hex, legacy_v2_digest(&payload).unwrap());
     }
 }

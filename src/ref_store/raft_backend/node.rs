@@ -1,12 +1,13 @@
 //! Owned real Raft node factory: the Raft handle and its application state machine are created
 //! together from one store directory, so a caller cannot attach an unrelated same-node-id SM.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{BasicNode, Config, Raft, RaftMetrics, Snapshot};
-use rootyard_refcas_log::cluster::MtlsNetworkFactory;
+use rootyard_refcas_log::cluster::{MtlsNetworkFactory, RpcRequest, RpcResponse};
 use rootyard_refcas_log::state_machine::PersistentStateMachine;
 use rootyard_refcas_log::{LogTypeConfig, PersistentLog};
 
@@ -75,9 +76,37 @@ impl RootRaftNode {
         &self.trust
     }
 
-    /// Clone of the real Raft handle for network/control wiring. It does not expose the SM.
-    pub fn raft(&self) -> Raft<LogTypeConfig> {
+    /// Raw Raft handle is crate-private. External callers get only the narrow control/peer-RPC
+    /// methods below, and never the application state machine.
+    pub(crate) fn raft(&self) -> Raft<LogTypeConfig> {
         self.raft.clone()
+    }
+
+    /// Privileged host control: initialize the real cluster membership.
+    pub async fn initialize_cluster(&self, members: BTreeMap<u64, BasicNode>) -> Result<(), RaftBackendError> {
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(|_| RaftBackendError::NodeControl("initialize cluster membership"))?;
+        Ok(())
+    }
+
+    /// Narrow peer RPC surface: only vote, append-entries, and install-snapshot. Business writes,
+    /// reads, control mutations, and fault injection are not exposed through this method.
+    pub async fn handle_peer_rpc(&self, request: RpcRequest) -> RpcResponse {
+        match request {
+            RpcRequest::Vote(vote) => RpcResponse::Vote(Box::new(self.raft.vote(vote).await)),
+            RpcRequest::AppendEntries(append) => {
+                RpcResponse::AppendEntries(Box::new(self.raft.append_entries(append).await))
+            }
+            RpcRequest::InstallSnapshot(snapshot) => {
+                RpcResponse::InstallSnapshot(Box::new(self.raft.install_snapshot(snapshot).await))
+            }
+            _ => RpcResponse::Error {
+                message: "owned node permits only peer vote/append/install RPC".into(),
+                forward_to_leader_id: None,
+            },
+        }
     }
 
     pub fn metrics(&self) -> RaftMetrics<u64, BasicNode> {

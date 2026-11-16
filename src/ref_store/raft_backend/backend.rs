@@ -13,8 +13,9 @@ use uuid::Uuid;
 use crate::ref_store::core::state_machine::{RefCasCommand, encode_command};
 use crate::ref_store::raft_backend::error::RaftBackendError;
 use crate::ref_store::raft_backend::node::RootRaftNode;
-use crate::ref_store::raft_backend::outcome::ProposeOutcome;
-use crate::ref_store::raft_backend::proposal::command_digest_hex;
+use crate::ref_store::raft_backend::proposal::{
+    ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup, ProposalOutcome, command_digest_hex,
+};
 use crate::ref_store::raft_backend::realm::RealmBinding;
 use crate::ref_store::raft_backend::reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine};
 use crate::ref_store::raft_backend::scope::{requires_live_gate_precheck, validate_command_scope};
@@ -142,29 +143,63 @@ impl RootRaftRefCasBackend {
         &self.realm
     }
 
-    /// Proposes one Root Ref-CAS business command through the real Raft WAL/quorum path.
+    /// Prepares a caller-stable proposal identity at the current applied coordinate.
     ///
-    /// A follower returns `FollowerRedirect`; a timeout/minority returns `QuorumUnavailable`.
-    /// There is no direct local state-machine write or PostgreSQL fallback.
+    /// This performs the actual quorum ReadIndex plus local applied barrier but deliberately does
+    /// not validate or mint a ref view, so it also works before `InitializeGate` exists.
+    pub async fn prepare_proposal_id(&self) -> Result<ProposalId, RaftBackendError> {
+        let raft = self.node.raft();
+        let read_log_id = match tokio::time::timeout(self.options.quorum_timeout, raft.ensure_linearizable()).await {
+            Ok(Ok(read_log_id)) => read_log_id,
+            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
+                return Err(RaftBackendError::FollowerRedirect(fwd.leader_id));
+            }
+            Ok(Err(_)) => return Err(RaftBackendError::QuorumUnavailable("prepare read index")),
+            Err(_) => return Err(RaftBackendError::QuorumUnavailable("prepare read index timeout")),
+        };
+        let snapshot = self.await_applied_snapshot(read_log_id.map(ApplicationLogId::from_log_id)).await?;
+        let issued_at_index =
+            snapshot.applied.map(ApplicationLogId::from_log_id).map(|coordinate| coordinate.index).unwrap_or(0);
+        ProposalId::new(
+            self.repository_id,
+            self.tenant_id,
+            self.realm.history_id(),
+            self.realm.group_id().to_owned(),
+            self.realm.group_epoch(),
+            self.realm.authority_id(),
+            self.realm.authority_epoch(),
+            self.realm.storage_generation(),
+            self.realm.object_format(),
+            issued_at_index,
+            Uuid::new_v4(),
+        )
+        .map_err(|_| RaftBackendError::InvalidProposal("proposal identity construction failed"))
+    }
+
+    /// Proposes one command under a caller-stable proposal identity.
     ///
-    /// This validates canonical codec bounds and the trusted repository/tenant/realm scope only.
-    /// Expected business refusals are returned as a replicated typed `ProposeOutcome`, not as a
-    /// storage/apply error. Production business prevalidation (live authorization, expected
-    /// revision/policy, pack closure) remains a later qualification task; the adapter's typed
-    /// refusal path makes the ordering race a durable decision rather than an OpenRaft failure.
-    pub async fn propose(&self, command: RefCasCommand) -> Result<ProposeOutcome, RaftBackendError> {
+    /// The identity is the invocation identity. Same ID and canonical digest never execute the
+    /// business command again; a different digest is a typed conflict. The fixed expiry is not
+    /// refreshed by retries.
+    pub async fn propose_with_id(
+        &self,
+        proposal_id: ProposalId,
+        command: RefCasCommand,
+    ) -> Result<ProposalOutcome, RaftBackendError> {
+        self.validate_proposal_scope(&proposal_id)?;
+        if !proposal_id.matches_command(&command) {
+            return Err(RaftBackendError::ProposalScopeMismatch("command does not match proposal identity"));
+        }
         validate_command_scope(&command, self.repository_id, self.tenant_id, &self.realm)?;
         if requires_live_gate_precheck(&command) {
-            // A real quorum ReadIndex view also validates the live gate against the trusted
-            // realm before this command is accepted for append. The controlled gate transition
-            // (SetRepositoryLane) and gate-independent InitializeGate/Noop are exempt so a new
-            // realm can actually become live.
             self.read_committed_view().await?;
         }
-        let payload =
+        let command_payload =
             encode_command(&command).map_err(|_| RaftBackendError::Encode("root Ref-CAS command codec refused"))?;
-        let digest_hex = command_digest_hex(&payload);
-        let envelope = ApplicationCommand::new(ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, payload)
+        let digest_hex = command_digest_hex(&command_payload);
+        let proposal_payload = ProposalEnvelope::encode(&proposal_id, &command_payload)
+            .map_err(|_| RaftBackendError::Encode("proposal envelope bounds refused"))?;
+        let envelope = ApplicationCommand::new(ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, proposal_payload)
             .map_err(|_| RaftBackendError::Encode("application envelope bounds refused"))?
             .encode()
             .map_err(|_| RaftBackendError::Encode("application envelope codec refused"))?;
@@ -179,11 +214,38 @@ impl RootRaftRefCasBackend {
                     .as_any()
                     .downcast_ref::<RootRefCasStateMachine>()
                     .ok_or(RaftBackendError::WrongReducer)?;
-                let attempt = reducer.query_attempt(log_id).ok_or(RaftBackendError::OutcomeMissing(log_id))?;
-                if attempt.command_digest_hex != digest_hex {
-                    return Err(RaftBackendError::OutcomeDigestMismatch(log_id));
+                if let Some(attempt) = reducer.query_attempt(log_id) {
+                    if attempt.command_digest_hex != digest_hex {
+                        return Err(RaftBackendError::OutcomeDigestMismatch(log_id));
+                    }
+                    let outcome =
+                        if attempt.kind == ProposalAttemptKind::Expired { None } else { Some(attempt.outcome.clone()) };
+                    return Ok(ProposalOutcome {
+                        proposal_id,
+                        log_id,
+                        original_log_id: Some(attempt.original_log_id),
+                        decision: attempt.kind,
+                        outcome,
+                    });
                 }
-                Ok(ProposeOutcome { log_id, outcome: attempt.outcome.clone() })
+                match reducer.query_proposal(&proposal_id) {
+                    ProposalLookup::Found { original_log_id, outcome, .. } => Ok(ProposalOutcome {
+                        proposal_id,
+                        log_id,
+                        original_log_id: Some(original_log_id),
+                        decision: ProposalAttemptKind::First,
+                        outcome: Some(outcome),
+                    }),
+                    ProposalLookup::Expired { .. } => Ok(ProposalOutcome {
+                        proposal_id,
+                        log_id,
+                        original_log_id: None,
+                        decision: ProposalAttemptKind::Expired,
+                        outcome: None,
+                    }),
+                    ProposalLookup::NotObserved { .. } => Err(RaftBackendError::RecoveryNotObserved(proposal_id)),
+                    ProposalLookup::Invalid { reason, .. } => Err(RaftBackendError::InvalidProposal(reason)),
+                }
             }
             Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd)))) => {
                 Err(RaftBackendError::FollowerRedirect(fwd.leader_id))
@@ -191,6 +253,58 @@ impl RootRaftRefCasBackend {
             Ok(Err(_)) => Err(RaftBackendError::QuorumUnavailable("client write")),
             Err(_) => Err(RaftBackendError::QuorumUnavailable("client write timeout")),
         }
+    }
+
+    /// Proposes one command with a fresh caller-stable identity.
+    pub async fn propose(&self, command: RefCasCommand) -> Result<ProposalOutcome, RaftBackendError> {
+        let proposal_id = self.prepare_proposal_id().await?;
+        self.propose_with_id(proposal_id, command).await
+    }
+
+    /// Linearized receipt-only lookup. This checks proposal scope but deliberately does not
+    /// revalidate the current live gate, so a lost ACK for a gate-transition command can be
+    /// resolved by the old-realm backend that owns the identity.
+    pub async fn query_proposal(&self, proposal_id: ProposalId) -> Result<ProposalLookup, RaftBackendError> {
+        self.validate_proposal_scope(&proposal_id)?;
+        let reducer = self.read_receipt_reducer().await?;
+        Ok(reducer.query_proposal(&proposal_id))
+    }
+
+    fn validate_proposal_scope(&self, proposal_id: &ProposalId) -> Result<(), RaftBackendError> {
+        proposal_id.validate_shape().map_err(|_| RaftBackendError::InvalidProposal("malformed proposal identity"))?;
+        if !proposal_id.matches_scope(
+            self.repository_id,
+            self.tenant_id,
+            self.realm.history_id(),
+            self.realm.group_id(),
+            self.realm.group_epoch(),
+            self.realm.authority_id(),
+            self.realm.authority_epoch(),
+            self.realm.storage_generation(),
+            self.realm.object_format(),
+        ) {
+            return Err(RaftBackendError::ProposalScopeMismatch("proposal scope"));
+        }
+        Ok(())
+    }
+
+    async fn read_receipt_reducer(&self) -> Result<RootRefCasStateMachine, RaftBackendError> {
+        let raft = self.node.raft();
+        let read_log_id = match tokio::time::timeout(self.options.quorum_timeout, raft.ensure_linearizable()).await {
+            Ok(Ok(read_log_id)) => read_log_id,
+            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
+                return Err(RaftBackendError::FollowerRedirect(fwd.leader_id));
+            }
+            Ok(Err(_)) => return Err(RaftBackendError::QuorumUnavailable("receipt read index")),
+            Err(_) => return Err(RaftBackendError::QuorumUnavailable("receipt read index timeout")),
+        };
+        let snapshot = self.await_applied_snapshot(read_log_id.map(ApplicationLogId::from_log_id)).await?;
+        snapshot
+            .reducer
+            .as_any()
+            .downcast_ref::<RootRefCasStateMachine>()
+            .cloned()
+            .ok_or(RaftBackendError::WrongReducer)
     }
 
     /// Mints an authoritative view only after a real quorum ReadIndex and local apply barrier.

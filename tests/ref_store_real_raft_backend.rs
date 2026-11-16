@@ -15,22 +15,21 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use openraft::entry::RaftEntry as _;
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
-use openraft::{BasicNode, CommittedLeaderId, Config, Entry, EntryPayload, LogId, Raft, ServerState, SnapshotPolicy};
+use openraft::{BasicNode, CommittedLeaderId, Config, Entry, EntryPayload, LogId, ServerState, SnapshotPolicy};
 use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use rootyard::ref_store::core::state_machine::{
     CommitRefsCommand, CreateSnapshotPinCommand, InitializeGateCommand, NoopCommand, RefCasCommand, RepositoryLane,
     ScopeLifecycle, SetRepositoryLaneCommand, SmPackMode, WireCommitRefsRequest, WireGateInit, encode_command,
 };
 use rootyard::ref_store::raft_backend::{
-    BackendOptions, NodeTrust, OutcomeQuery, ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RaftBackendError, RealmBinding,
-    RootRaftNode, RootRaftNodeConfig, RootRaftRefCasBackend, RootRefCasOutcome, RootRefCasRefusalKind,
-    RootRefCasStateMachine,
+    BackendOptions, NodeTrust, ProposalAttemptKind, ProposalLookup, ProposalOutcome, ROOT_REF_CAS_DOMAIN,
+    ROOT_REF_CAS_VERSION, RaftBackendError, RealmBinding, RootRaftNode, RootRaftNodeConfig, RootRaftRefCasBackend,
+    RootRefCasOutcome, RootRefCasRefusalKind, RootRefCasStateMachine,
 };
 use rootyard::ref_store::{
     CommitMode, CommitRefsRequest, CoreGateInit, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MetadataPinPurpose,
     OperationLookup, RefName, RefPrecondition, RefTarget, RefUpdate, VersionCheck,
 };
-use rootyard_refcas_log::LogTypeConfig;
 use rootyard_refcas_log::cluster::{
     MtlsNetworkFactory, PeerDirectory, RpcRequest, RpcResponse, read_frame_async, write_frame_async,
 };
@@ -252,7 +251,7 @@ impl TestCluster {
             let raft_addr = listener.local_addr()?.to_string();
             raft_map.insert(id, raft_addr.clone());
             let (stop, stop_rx) = watch::channel(false);
-            spawn_rpc_listener(mtls_server, listener, node.raft(), peer_dir.clone(), stop_rx);
+            spawn_rpc_listener(mtls_server, listener, node.clone(), peer_dir.clone(), stop_rx);
 
             nodes.push(TestNode { id, dir, node, peer_dir, stop });
         }
@@ -262,7 +261,7 @@ impl TestCluster {
         }
         let initial: BTreeMap<u64, BasicNode> =
             raft_map.iter().map(|(id, addr)| (*id, BasicNode { addr: addr.clone() })).collect();
-        nodes[0].node.raft().initialize(initial).await.map_err(|e| anyhow::anyhow!("initialize raft cluster: {e}"))?;
+        nodes[0].node.initialize_cluster(initial).await.map_err(|e| anyhow::anyhow!("initialize raft cluster: {e}"))?;
         let cluster = Self { _pki: pki, nodes };
         cluster.wait_leader(Duration::from_secs(20)).await?;
         Ok(cluster)
@@ -335,7 +334,7 @@ impl TestCluster {
 fn spawn_rpc_listener(
     server: MtlsServer,
     listener: TcpListener,
-    raft: Raft<LogTypeConfig>,
+    node: RootRaftNode,
     peers: PeerDirectory,
     stop: watch::Receiver<bool>,
 ) {
@@ -351,7 +350,7 @@ fn spawn_rpc_listener(
                 accepted = listener.accept() => {
                     let Ok((tcp, _)) = accepted else { break };
                     let server = server.clone();
-                    let raft = raft.clone();
+                    let node = node.clone();
                     let peers = peers.clone();
                     let mut conn_stop = stop.clone();
                     tokio::spawn(async move {
@@ -381,13 +380,13 @@ fn spawn_rpc_listener(
                             }
                             let response = match request {
                                 RpcRequest::Vote(vote) if vote.vote.leader_id.node_id == sender => {
-                                    RpcResponse::Vote(Box::new(raft.vote(vote).await))
+                                    node.handle_peer_rpc(RpcRequest::Vote(vote)).await
                                 }
                                 RpcRequest::AppendEntries(append) if append.vote.leader_id.node_id == sender => {
-                                    RpcResponse::AppendEntries(Box::new(raft.append_entries(append).await))
+                                    node.handle_peer_rpc(RpcRequest::AppendEntries(append)).await
                                 }
                                 RpcRequest::InstallSnapshot(snapshot) if snapshot.vote.leader_id.node_id == sender => {
-                                    RpcResponse::InstallSnapshot(Box::new(raft.install_snapshot(snapshot).await))
+                                    node.handle_peer_rpc(RpcRequest::InstallSnapshot(snapshot)).await
                                 }
                                 _ => RpcResponse::Error {
                                     message: "unauthorized peer rpc".into(),
@@ -415,6 +414,10 @@ async fn backend_on(
 ) -> Result<RootRaftRefCasBackend> {
     let node = cluster.node(node_id);
     Ok(RootRaftRefCasBackend::open(node.node.clone(), repo, tenant, realm, options).await?)
+}
+
+fn proposal_outcome(result: &ProposalOutcome) -> &RootRefCasOutcome {
+    result.outcome.as_ref().expect("proposal outcome present")
 }
 
 fn reducer_snapshot(
@@ -538,12 +541,12 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let backend = backend_on(&cluster, leader_id, repo, tenant, realm.clone(), options).await?;
 
     let init_outcome = backend.propose(init_command(repo, tenant, history)).await?;
-    assert!(init_outcome.outcome.is_applied());
+    assert!(proposal_outcome(&init_outcome).is_applied());
     let operation_id = Uuid::new_v4();
     let commit = commit_command(repo, tenant, issuer, history, 1, operation_id, 1, "refs/heads/main", None, oid(1));
     let commit_outcome = backend.propose(commit.clone()).await?;
     let commit_coordinate = commit_outcome.log_id;
-    assert!(commit_outcome.outcome.is_applied());
+    assert!(proposal_outcome(&commit_outcome).is_applied());
 
     let view = backend.read_committed_view().await?;
     assert!(view.last_applied().is_some_and(|id| id.index >= commit_coordinate.index));
@@ -582,7 +585,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
             0,
         ))
         .await?;
-    let invalid_input_kind = match &invalid_input.outcome {
+    let invalid_input_kind = match proposal_outcome(&invalid_input) {
         RootRefCasOutcome::Refused(refusal) => refusal.kind,
         RootRefCasOutcome::Applied(_) => panic!("zero-lease pin unexpectedly applied"),
     };
@@ -605,7 +608,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
             1,
         ))
         .await?;
-    let invalid_identity_kind = match &invalid_identity.outcome {
+    let invalid_identity_kind = match proposal_outcome(&invalid_identity) {
         RootRefCasOutcome::Refused(refusal) => refusal.kind,
         RootRefCasOutcome::Applied(_) => panic!("nil-request-id pin unexpectedly applied"),
     };
@@ -618,11 +621,26 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
 
     // The same quorum still accepts a valid command and serves a fresh ReadIndex view.
     let healthy_after_semantic = backend.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })).await?;
-    assert!(healthy_after_semantic.outcome.is_applied());
+    assert!(proposal_outcome(&healthy_after_semantic).is_applied());
     let healthy_after_semantic_view = backend.read_committed_view().await?;
     assert!(
         healthy_after_semantic_view.last_applied().is_some_and(|id| id.index >= healthy_after_semantic.log_id.index)
     );
+
+    // Concurrent proposals can advance the applied snapshot beyond another write's exact index.
+    // Propose must recover its own receipt with a >= apply barrier, not return a Storage error.
+    let concurrent_a = backend.clone();
+    let concurrent_b = backend.clone();
+    let (concurrent_a, concurrent_b) = tokio::join!(
+        concurrent_a.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })),
+        concurrent_b.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })),
+    );
+    let concurrent_a = concurrent_a?;
+    let concurrent_b = concurrent_b?;
+    assert!(proposal_outcome(&concurrent_a).is_applied());
+    assert!(proposal_outcome(&concurrent_b).is_applied());
+    assert_ne!(concurrent_a.log_id, concurrent_b.log_id);
+    assert_ne!(concurrent_a.proposal_id, concurrent_b.proposal_id);
 
     // A valid gate transition to Closing is applied. A subsequent same-scope CommitRefs is a
     // deterministic business refusal: it must advance the replicated applied coordinate and
@@ -639,15 +657,15 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
         pack_mode: SmPackMode::MetadataOnly,
     });
     let close_outcome = backend.propose(closing).await?;
-    assert!(close_outcome.outcome.is_applied());
+    assert!(proposal_outcome(&close_outcome).is_applied());
     let closing_view = backend.read_committed_view().await?;
     assert_eq!(closing_view.read_scope_lifecycle().map(|(lifecycle, _)| lifecycle), Some(ScopeLifecycle::Closing));
 
     let refused_operation = Uuid::new_v4();
     let refused_commit =
         commit_command(repo, tenant, issuer, history, 2, refused_operation, 2, "refs/heads/refused", None, oid(2));
-    let refusal = backend.propose(refused_commit).await?;
-    let refusal_kind = match &refusal.outcome {
+    let refusal = backend.propose(refused_commit.clone()).await?;
+    let refusal_kind = match proposal_outcome(&refusal) {
         RootRefCasOutcome::Refused(refusal) => refusal.kind,
         RootRefCasOutcome::Applied(_) => panic!("gate-closed commit unexpectedly applied"),
     };
@@ -656,19 +674,34 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let refused_view = backend.read_committed_view().await?;
     assert!(refused_view.last_applied().is_some_and(|id| id.index >= refusal.log_id.index));
     assert!(refused_view.read_ref("refs/heads/refused").is_none());
-    let stored_refusal = refused_view
-        .query_outcome(&OutcomeQuery::Operation(refused_operation))
-        .expect("durable typed refusal by operation id");
-    assert_eq!(stored_refusal.log_id, refusal.log_id);
+    let stored_refusal = backend.query_proposal(refusal.proposal_id.clone()).await?;
+    let stored_outcome = match stored_refusal {
+        ProposalLookup::Found { original_log_id, observed_log_id, outcome, .. } => {
+            assert_eq!(original_log_id, refusal.log_id);
+            assert_eq!(observed_log_id, refusal.log_id);
+            outcome
+        }
+        other => panic!("durable typed refusal lookup mismatch: {other:?}"),
+    };
     assert!(matches!(
-        stored_refusal.outcome,
+        stored_outcome,
+        RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::ScopeClosingOrClosed
+    ));
+
+    // Same caller-stable ID and canonical digest advances the coordinate on retry but never
+    // re-executes the business command; the first typed refusal remains the result.
+    let refusal_retry = backend.propose_with_id(refusal.proposal_id.clone(), refused_commit).await?;
+    assert_eq!(refusal_retry.decision, ProposalAttemptKind::Replayed);
+    assert_eq!(refusal_retry.original_log_id, Some(refusal.log_id));
+    assert!(matches!(
+        proposal_outcome(&refusal_retry),
         RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::ScopeClosingOrClosed
     ));
 
     // The healthy quorum still works after the refusal: a valid Noop applies, the applied index
     // advances, and a new ReadIndex-backed view is minted.
     let healthy = backend.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })).await?;
-    assert!(healthy.outcome.is_applied());
+    assert!(proposal_outcome(&healthy).is_applied());
     let healthy_view = backend.read_committed_view().await?;
     assert!(healthy_view.last_applied().is_some_and(|id| id.index >= healthy.log_id.index));
 
@@ -712,13 +745,57 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let repo_b = Uuid::new_v4();
     let backend_b = backend_on(&cluster, leader_id, repo_b, tenant, realm.clone(), options).await?;
     assert!(matches!(backend_b.read_committed_view().await, Err(RaftBackendError::StaleGate("gate_missing"))));
-    let init_b = backend_b.propose(init_command(repo_b, tenant, history)).await?;
-    assert!(init_b.outcome.is_applied());
+
+    // A proposal identity can be prepared before the gate exists. Retrying the same ID and digest
+    // after a lost ACK replays the original typed outcome without re-executing InitializeGate.
+    let init_b_id = backend_b.prepare_proposal_id().await?;
+    let init_b = backend_b.propose_with_id(init_b_id.clone(), init_command(repo_b, tenant, history)).await?;
+    assert_eq!(init_b.decision, ProposalAttemptKind::First);
+    assert_eq!(init_b.original_log_id, Some(init_b.log_id));
+    assert!(proposal_outcome(&init_b).is_applied());
+    let init_b_replay = backend_b.propose_with_id(init_b_id.clone(), init_command(repo_b, tenant, history)).await?;
+    assert_eq!(init_b_replay.decision, ProposalAttemptKind::Replayed);
+    assert_eq!(init_b_replay.original_log_id, Some(init_b.log_id));
+    assert_eq!(proposal_outcome(&init_b_replay), proposal_outcome(&init_b));
+    let init_b_lookup = backend_b.query_proposal(init_b_id.clone()).await?;
+    assert!(matches!(
+        init_b_lookup,
+        ProposalLookup::Found { original_log_id, outcome, .. }
+            if original_log_id == init_b.log_id && &outcome == proposal_outcome(&init_b)
+    ));
+    assert!(matches!(backend.query_proposal(init_b_id.clone()).await, Err(RaftBackendError::ProposalScopeMismatch(_))));
+
+    // Same identity with a different canonical command is a durable typed conflict and never
+    // replaces the first decision.
+    let conflicting_lane = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+        repository_id: repo_b,
+        tenant_id: tenant,
+        lane: RepositoryLane::ServingRefStore,
+        lifecycle: ScopeLifecycle::Open,
+        authz_floor: 1,
+        history_incarnation: history,
+        authority_epoch: 1,
+        group_epoch: 1,
+        pack_mode: SmPackMode::MetadataOnly,
+    });
+    let conflict = backend_b.propose_with_id(init_b_id.clone(), conflicting_lane).await?;
+    assert_eq!(conflict.decision, ProposalAttemptKind::Conflict);
+    assert!(matches!(
+        proposal_outcome(&conflict),
+        RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::ProposalConflict
+    ));
+    assert!(matches!(
+        backend_b.query_proposal(init_b_id.clone()).await?,
+        ProposalLookup::Found { original_log_id, outcome, .. }
+            if original_log_id == init_b.log_id && &outcome == proposal_outcome(&init_b)
+    ));
+
     let operation_b = Uuid::new_v4();
     let commit_b =
         commit_command(repo_b, tenant, issuer, history, 1, operation_b, 1, "refs/heads/b-only", None, oid(3));
     let expected_b_oid = oid(3).as_hex();
-    assert!(backend_b.propose(commit_b).await?.outcome.is_applied());
+    let commit_b_outcome = backend_b.propose(commit_b).await?;
+    assert!(proposal_outcome(&commit_b_outcome).is_applied());
     let view_b = backend_b.read_committed_view().await?;
     assert_eq!(view_b.read_ref("refs/heads/b-only").as_deref(), Some(expected_b_oid.as_str()));
     assert!(view_b.read_ref("refs/heads/main").is_none());
@@ -843,11 +920,16 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     assert_eq!(restored_reducer.read_refs(repo).get("refs/heads/main"), Some(&expected_oid));
     assert_eq!(restored_reducer.read_head_ref(repo).as_deref(), Some("refs/heads/main"));
     assert!(restored_reducer.last_applied_coordinate().is_some_and(|id| id.index >= commit_coordinate.index));
-    let restored_refusal = restored_reducer
-        .query_outcome(&OutcomeQuery::LogId(refusal.log_id))
-        .expect("refusal survives snapshot install");
+    let restored_refusal = restored_reducer.query_proposal(&refusal.proposal_id);
+    let restored_outcome = match restored_refusal {
+        ProposalLookup::Found { original_log_id, outcome, .. } => {
+            assert_eq!(original_log_id, refusal.log_id);
+            outcome
+        }
+        other => panic!("refusal did not survive snapshot install: {other:?}"),
+    };
     assert!(matches!(
-        &restored_refusal.outcome,
+        &restored_outcome,
         RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::ScopeClosingOrClosed
     ));
     drop(restored);
@@ -862,9 +944,12 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let reopened_snapshot = reopened.application_snapshot().await?.expect("application state");
     let reopened_reducer = reducer_snapshot(&reopened_snapshot);
     assert_eq!(reopened_reducer.read_refs(repo).get("refs/heads/main"), Some(&expected_oid));
-    let reopened_refusal =
-        reopened_reducer.query_outcome(&OutcomeQuery::LogId(refusal.log_id)).expect("refusal survives SQLite reopen");
-    assert!(reopened_refusal.outcome.is_refused());
+    let reopened_refusal = reopened_reducer.query_proposal(&refusal.proposal_id);
+    assert!(matches!(
+        reopened_refusal,
+        ProposalLookup::Found { original_log_id, outcome: RootRefCasOutcome::Refused(_), .. }
+            if original_log_id == refusal.log_id
+    ));
 
     // Real no-quorum boundary: isolate the leader, use a short-bounded backend, and require an
     // explicit quorum/redirect refusal. No PG/Redis/local view is returned.
@@ -893,6 +978,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let history_2 = Uuid::new_v4();
     let realm_h2a2 = RealmBinding::new(tenant, TEST_GROUP, authority, history_2, 1, 2, GitObjectFormat::Sha256, 1)?;
     let backend_h2a2 = backend_on(&cluster, healed_leader, repo, tenant, realm_h2a2.clone(), options).await?;
+    let change_history_id = backend_h2a2.prepare_proposal_id().await?;
     let change_history = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
         repository_id: repo,
         tenant_id: tenant,
@@ -904,9 +990,34 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
         group_epoch: 1,
         pack_mode: SmPackMode::MetadataOnly,
     });
-    assert!(backend_h2a2.propose(change_history).await?.outcome.is_applied());
-    assert!(backend_h2a2.read_committed_view().await.is_ok());
+    let change_history_outcome =
+        backend_h2a2.propose_with_id(change_history_id.clone(), change_history.clone()).await?;
+    assert_eq!(change_history_outcome.decision, ProposalAttemptKind::First);
+    assert!(proposal_outcome(&change_history_outcome).is_applied());
+    let revision_after_first = backend_h2a2
+        .read_committed_view()
+        .await?
+        .read_gate_version()?
+        .expect("live gate after history transition")
+        .revision();
+    let change_history_replay = backend_h2a2.propose_with_id(change_history_id.clone(), change_history).await?;
+    assert_eq!(change_history_replay.decision, ProposalAttemptKind::Replayed);
+    assert_eq!(change_history_replay.original_log_id, Some(change_history_outcome.log_id));
+    assert_eq!(proposal_outcome(&change_history_replay), proposal_outcome(&change_history_outcome));
+    let revision_after_replay =
+        backend_h2a2.read_committed_view().await?.read_gate_version()?.expect("live gate after replay").revision();
+    assert_eq!(revision_after_first, revision_after_replay);
+    assert!(matches!(
+        backend_h2a2.query_proposal(change_history_id.clone()).await?,
+        ProposalLookup::Found { original_log_id, outcome, .. }
+            if original_log_id == change_history_outcome.log_id
+                && &outcome == proposal_outcome(&change_history_outcome)
+    ));
     let stale_h1 = backend_on(&cluster, healed_leader, repo, tenant, realm.clone(), options).await?;
+    assert!(matches!(
+        stale_h1.query_proposal(change_history_id).await,
+        Err(RaftBackendError::ProposalScopeMismatch(_))
+    ));
     assert!(matches!(stale_h1.read_committed_view().await, Err(RaftBackendError::StaleGate("history_incarnation"))));
 
     let realm_h2a3 = RealmBinding::new(tenant, TEST_GROUP, authority, history_2, 1, 3, GitObjectFormat::Sha256, 1)?;
@@ -922,7 +1033,8 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
         group_epoch: 1,
         pack_mode: SmPackMode::MetadataOnly,
     });
-    assert!(backend_h2a3.propose(change_authority).await?.outcome.is_applied());
+    let change_authority_outcome = backend_h2a3.propose(change_authority).await?;
+    assert!(proposal_outcome(&change_authority_outcome).is_applied());
     assert!(matches!(backend_h2a2.read_committed_view().await, Err(RaftBackendError::StaleGate("authority_epoch"))));
 
     // Restart actual cluster SQLite state: shut down all nodes, reopen the leader's application

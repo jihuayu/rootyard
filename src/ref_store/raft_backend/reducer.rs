@@ -139,9 +139,7 @@ impl RootRefCasStateMachine {
         if root_only_state_v3(&root).is_err() {
             return Ok(false);
         }
-        Ok(export_adapter_state_v3(root, &self.attempts)
-            .map(|bytes| bytes.len() <= MAX_ADAPTER_STATE_BYTES)
-            .unwrap_or(false))
+        Ok(export_adapter_state_v3(root, &self.attempts).is_ok_and(|bytes| bytes.len() <= MAX_ADAPTER_STATE_BYTES))
     }
 
     fn insert_with_fallback(
@@ -489,4 +487,114 @@ impl ApplicationStateMachine for RootRefCasStateMachine {
 pub fn validate_ref_cas_command(command: &RefCasCommand) -> Result<(), ApplicationError> {
     let payload = encode_command(command).map_err(map_state_error)?;
     decode_command(&payload).map_err(map_state_error).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ref_store::core::state_machine::{
+        InitializeGateCommand, NoopCommand, RefCasCommand, RepositoryLane, SmPackMode, WireGateInit, encode_command,
+    };
+    use crate::ref_store::core::types::GitObjectFormat;
+    use crate::ref_store::raft_backend::outcome::{RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusalKind};
+    use crate::ref_store::raft_backend::proposal::{
+        PROPOSAL_WINDOW, ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup,
+    };
+    use crate::ref_store::{CoreGateInit, RefName};
+    use rootyard_refcas_log::state_machine::{ApplicationLogId, ApplicationStateMachine};
+    use uuid::Uuid;
+
+    fn proposal_id(repo: Uuid, tenant: Uuid, history: Uuid, issued_at_index: u64) -> ProposalId {
+        ProposalId::new(
+            repo,
+            tenant,
+            history,
+            "group-a",
+            1,
+            Uuid::from_u128(4),
+            1,
+            1,
+            GitObjectFormat::Sha256,
+            issued_at_index,
+            Uuid::from_u128(5),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn expired_proposal_does_not_execute_or_relabel_itself() {
+        let mut app = RootRefCasStateMachine::new();
+        for index in 1..=PROPOSAL_WINDOW + 2 {
+            app.advance_applied(ApplicationLogId::new(1, index)).unwrap();
+        }
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let payload = ProposalEnvelope::encode(
+            &proposal_id(repo, tenant, history, 0),
+            &encode_command(&RefCasCommand::Noop(NoopCommand { logical_tick: None })).unwrap(),
+        )
+        .unwrap();
+        let expired_log = ApplicationLogId::new(1, PROPOSAL_WINDOW + 3);
+        app.apply(expired_log, &payload).unwrap();
+        let attempt = app.query_attempt(expired_log).expect("expired attempt retained");
+        assert_eq!(attempt.kind, ProposalAttemptKind::Expired);
+        assert!(matches!(
+            &attempt.outcome,
+            RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::ProposalExpired
+        ));
+        assert!(matches!(app.query_proposal(&proposal_id(repo, tenant, history, 0)), ProposalLookup::Expired { .. }));
+
+        let later_log = ApplicationLogId::new(1, PROPOSAL_WINDOW + 4);
+        app.apply(later_log, &payload).unwrap();
+        assert_eq!(app.query_attempt(later_log).expect("later expired attempt").kind, ProposalAttemptKind::Expired);
+    }
+
+    #[test]
+    fn same_identity_and_digest_replays_without_reexecuting_business() {
+        let mut app = RootRefCasStateMachine::new();
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let gate = CoreGateInit::new(
+            repo,
+            tenant,
+            GitObjectFormat::Sha256,
+            history,
+            1,
+            1,
+            RefName::branch("refs/heads/main").unwrap(),
+        )
+        .unwrap();
+        let command = RefCasCommand::InitializeGate(InitializeGateCommand {
+            gate: WireGateInit::from(&gate),
+            lane: RepositoryLane::ServingRefStore,
+            pack_mode: SmPackMode::MetadataOnly,
+            authz_floor: 1,
+        });
+        let payload =
+            ProposalEnvelope::encode(&proposal_id(repo, tenant, history, 0), &encode_command(&command).unwrap())
+                .unwrap();
+        let first_log = ApplicationLogId::new(1, 1);
+        app.apply(first_log, &payload).unwrap();
+        let first = app.query_attempt(first_log).expect("first attempt").outcome.clone();
+        assert!(matches!(first, RootRefCasOutcome::Applied(RootRefCasApplied::GateInitialized { created: true, .. })));
+
+        let replay_log = ApplicationLogId::new(1, 2);
+        app.apply(replay_log, &payload).unwrap();
+        let replay = app.query_attempt(replay_log).expect("replay attempt");
+        assert_eq!(replay.kind, ProposalAttemptKind::Replayed);
+        assert_eq!(replay.original_log_id, first_log);
+        assert_eq!(replay.outcome, first);
+        assert_eq!(
+            app.query_proposal(&proposal_id(repo, tenant, history, 0)),
+            ProposalLookup::Found {
+                proposal_id: proposal_id(repo, tenant, history, 0),
+                command_digest_hex: replay.command_digest_hex.clone(),
+                original_log_id: first_log,
+                observed_log_id: first_log,
+                outcome: first,
+            }
+        );
+    }
 }

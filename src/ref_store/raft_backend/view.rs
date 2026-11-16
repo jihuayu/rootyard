@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::ref_store::contract::OperationLookup;
 use crate::ref_store::core::state_machine::ScopeLifecycle;
 use crate::ref_store::raft_backend::error::RaftBackendError;
+use crate::ref_store::raft_backend::proposal::{ProposalId, ProposalLookup};
 use crate::ref_store::raft_backend::realm::RealmBinding;
 use crate::ref_store::raft_backend::reducer::RootRefCasStateMachine;
 use crate::ref_store::{CoreGateVersion, VersionCheck};
@@ -102,10 +103,29 @@ impl CommittedRefCasView {
     }
 
     /// Deterministic state digest of the cloned view.
-    /// Full adapter digest, covering Root state and the typed outcome ledger when present.
+    /// Full adapter digest, covering Root state and the bounded receipt window when present.
     pub fn state_digest_hex(&self) -> Result<String, RaftBackendError> {
         self.reducer
             .adapter_state_digest_hex()
             .map_err(|e| RaftBackendError::Command(format!("state digest refused: {e}")))
+    }
+
+    /// Exact proposal receipt lookup bound to this committed view's repository/tenant/realm.
+    pub fn query_proposal(&self, proposal_id: &ProposalId) -> Result<ProposalLookup, RaftBackendError> {
+        proposal_id.validate_shape().map_err(|_| RaftBackendError::InvalidProposal("malformed proposal identity"))?;
+        if !proposal_id.matches_scope(
+            self.repository_id,
+            self.tenant_id,
+            self.realm.history_id(),
+            self.realm.group_id(),
+            self.realm.group_epoch(),
+            self.realm.authority_id(),
+            self.realm.authority_epoch(),
+            self.realm.storage_generation(),
+            self.realm.object_format(),
+        ) {
+            return Err(RaftBackendError::ProposalScopeMismatch("view proposal scope"));
+        }
+        Ok(self.reducer.query_proposal(proposal_id))
     }
 }

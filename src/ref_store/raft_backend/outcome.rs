@@ -16,6 +16,7 @@ use crate::ref_store::core::terminal::CommitTerminal;
 use crate::ref_store::core::types::GitObjectFormat;
 
 /// One result of applying a Root business command at an exact Raft coordinate.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RootRefCasOutcome {
     Applied(RootRefCasApplied),
@@ -34,6 +35,7 @@ impl RootRefCasOutcome {
 
 /// Successful typed application response. This is an explicit, bounded mirror of the core
 /// `ApplyResponse`; it carries the actual business fields without requiring a core serde change.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RootRefCasApplied {
     Noop,
@@ -427,11 +429,4 @@ impl RootRefCasRefusalKind {
             Self::MetadataGateVersionMismatch => "metadata gate version moved before capture",
         }
     }
-}
-
-/// One actual propose result: the committed coordinate plus the replicated typed outcome.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProposeOutcome {
-    pub log_id: ApplicationLogId,
-    pub outcome: RootRefCasOutcome,
 }

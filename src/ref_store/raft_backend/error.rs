@@ -4,6 +4,8 @@ use std::fmt;
 
 use rootyard_refcas_log::state_machine::ApplicationLogId;
 
+use crate::ref_store::raft_backend::proposal::ProposalId;
+
 /// Authoritative backend refusal. Every variant is a hard failure; there is no PG/Redis/local
 /// fallback path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +16,10 @@ pub enum RaftBackendError {
     ScopeMismatch(&'static str),
     /// The presented realm/epoch/generation does not equal the trusted configured realm.
     StaleRealm,
+    /// A proposal identity is malformed or outside the fixed protocol.
+    InvalidProposal(&'static str),
+    /// A proposal identity does not match the backend/view repository/tenant/realm scope.
+    ProposalScopeMismatch(&'static str),
     /// The applied Root gate does not match the trusted realm on the named axis.
     StaleGate(&'static str),
     /// This node is not the leader; no local or projection read was substituted.
@@ -26,6 +32,10 @@ pub enum RaftBackendError {
     OutcomeMissing(ApplicationLogId),
     /// The stored outcome belongs to a different canonical command payload.
     OutcomeDigestMismatch(ApplicationLogId),
+    /// A committed retry's exact receipt is no longer observed within its valid window.
+    RecoveryNotObserved(ProposalId),
+    /// Owned-node control/peer RPC failure.
+    NodeControl(&'static str),
     /// The persistent state machine was not opened with the root Ref-CAS reducer.
     NotApplicationMode,
     /// The opened application reducer is not the root Ref-CAS adapter.
@@ -50,6 +60,12 @@ impl fmt::Display for RaftBackendError {
                 write!(f, "command {coordinate} is outside the trusted repository/tenant/realm binding")
             }
             Self::StaleRealm => f.write_str("presented realm/epoch/storage generation is stale"),
+            Self::InvalidProposal(reason) => write!(f, "invalid proposal identity: {reason}"),
+            Self::ProposalScopeMismatch(axis) => write!(f, "proposal identity does not match {axis}"),
+            Self::RecoveryNotObserved(id) => {
+                write!(f, "proposal {id:?} has no observed exact receipt within its valid window")
+            }
+            Self::NodeControl(operation) => write!(f, "owned Raft node control failed during {operation}"),
             Self::StaleGate(axis) => write!(f, "live Root gate does not match the trusted realm on {axis}"),
             Self::FollowerRedirect(leader) => {
                 write!(f, "leader redirect required (leader {leader:?}); follower cannot serve this view")

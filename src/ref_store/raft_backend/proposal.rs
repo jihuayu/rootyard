@@ -294,6 +294,7 @@ impl ProposalAttempt {
 }
 
 /// Exact lookup result for a caller-stable proposal identity.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalLookup {
     Found {
