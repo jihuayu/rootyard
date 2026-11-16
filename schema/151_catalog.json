@@ -13521,12 +13521,23 @@
     },
     {
       "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "name": "delete_uncertain",
+      "not_null": true,
+      "position": 6,
+      "table": "remote_object_delete_claims",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
       "default": null,
       "generated": "",
       "identity": "",
       "name": "lease_until",
       "not_null": true,
-      "position": 6,
+      "position": 7,
       "table": "remote_object_delete_claims",
       "type": "timestamp with time zone"
     },
@@ -13537,7 +13548,7 @@
       "identity": "",
       "name": "claimed_at",
       "not_null": true,
-      "position": 7,
+      "position": 8,
       "table": "remote_object_delete_claims",
       "type": "timestamp with time zone"
     },
@@ -32047,7 +32058,7 @@
       "valid": true
     },
     {
-      "definition": "CREATE INDEX remote_object_delete_claims_active_lease_idx ON public.remote_object_delete_claims USING btree (deleting, lease_until) WHERE deleting",
+      "definition": "CREATE INDEX remote_object_delete_claims_active_lease_idx ON public.remote_object_delete_claims USING btree (deleting, delete_uncertain, lease_until) WHERE (deleting OR delete_uncertain)",
       "live": true,
       "name": "remote_object_delete_claims_active_lease_idx",
       "ready": true,

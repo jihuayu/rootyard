@@ -13,6 +13,7 @@ This document specifies Rootyard's repository lifecycle contracts (#85): archive
 3. **Idempotency (`Idempotency-Key`)**:
    - Lifecycle actions hash the canonical JSON payload (`request_sha256`).
    - Repeating the same `Idempotency-Key` with an identical payload replays the stored outcome cleanly; reusing a key with a different payload fails closed with `409 Conflict`.
+   - Once soft-deleted (`deleted_at IS NOT NULL`), repeating `DELETE` with its stored `Idempotency-Key` replays its stored delete outcome, while `restore`, `purge`, and `GET /lifecycle` remain accessible; non-`delete` lifecycle endpoints (`archive`, `unarchive`, `rename`, `transfer`) return `404 Not Found` (preventing pre-delete key replay) until `POST /restore` completes.
 4. **In-flight Git / LFS / CI / Maintenance Fencing**:
    - Mutations acquire exclusive repository coordination and reject with `409 Conflict` when a physical GC lease (`gc_owner IS NOT NULL AND gc_lease_until > now()`), storage backend transition (`transition_state <> 'stable'`), or active ownership transfer is in progress.
    - `pg_refstore` repositories preserve database-enforced immutable identity and append-only storage proofs: `archive`/`unarchive` and `delete`/`restore` are supported, while `rename`, `transfer`, and final `purge` fail closed with `409 Conflict`.

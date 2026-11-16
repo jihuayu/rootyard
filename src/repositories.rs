@@ -1,6 +1,7 @@
 //! Repository discovery, creation, lifecycle, alias, purge, and transfer domain.
 pub mod alias;
 pub mod alias_middleware;
+mod alias_policy;
 pub mod deletion_handlers;
 mod handlers;
 pub mod lifecycle;

@@ -3,7 +3,7 @@ use super::purge_safety::RemoteDeletePlan;
 use crate::{
     AppState, Error,
     storage::{
-        remote_key_claims::{DeleteClaim, finish_claim, verify_claim_lease},
+        remote_key_claims::{DeleteClaim, execute_locked_claimed_delete},
         remote_objects::{ObjectKey, RemoteObjectStore},
     },
     workspaces::remote::RemoteManifest,
@@ -185,13 +185,9 @@ pub async fn execute_claimed_remote_deletes(
             let Some(claim) = claim_map.get(&("lfs", oid)).copied() else {
                 bail!("missing delete claim for LFS object {oid}");
             };
-            if !verify_claim_lease(pool, claim).await.map_err(|e| anyhow::anyhow!(e.1))? {
-                bail!("LFS delete claim lease expired or superseded for {oid}");
-            }
             let key = ObjectKey::new(tenant_id, "lfs", oid)?;
             ensure!(key.path() == *key_path, "LFS delete key path mismatch: {key_path}");
-            store.delete(&key, deadline).await?;
-            finish_claim(pool, claim).await.map_err(|e| anyhow::anyhow!(e.1))?;
+            execute_locked_claimed_delete(pool, store, claim, deadline).await?;
             deleted_lfs += 1;
         }
     }
@@ -206,13 +202,9 @@ pub async fn execute_claimed_remote_deletes(
             let Some(claim) = claim_map.get(&("workspace", digest)).copied() else {
                 bail!("missing delete claim for workspace object {digest}");
             };
-            if !verify_claim_lease(pool, claim).await.map_err(|e| anyhow::anyhow!(e.1))? {
-                bail!("workspace delete claim lease expired or superseded for {digest}");
-            }
             let key = ObjectKey::new(tenant_id, "workspace", digest)?;
             ensure!(key.path() == *key_path, "workspace delete key path mismatch: {key_path}");
-            store.delete(&key, deadline).await?;
-            finish_claim(pool, claim).await.map_err(|e| anyhow::anyhow!(e.1))?;
+            execute_locked_claimed_delete(pool, store, claim, deadline).await?;
             deleted_workspace += 1;
         }
     }

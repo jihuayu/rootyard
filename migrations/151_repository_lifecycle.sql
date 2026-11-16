@@ -239,14 +239,15 @@ CREATE TABLE IF NOT EXISTS remote_object_delete_claims (
     digest TEXT NOT NULL CHECK (digest ~ '^[0-9a-f]{64}$'),
     claim_generation BIGINT NOT NULL DEFAULT 1 CHECK (claim_generation > 0),
     deleting BOOLEAN NOT NULL DEFAULT true,
+    delete_uncertain BOOLEAN NOT NULL DEFAULT false,
     lease_until TIMESTAMPTZ NOT NULL,
     claimed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (tenant_id, namespace, digest)
 );
 
 CREATE INDEX IF NOT EXISTS remote_object_delete_claims_active_lease_idx
-    ON remote_object_delete_claims (deleting, lease_until)
-    WHERE deleting;
+    ON remote_object_delete_claims (deleting, delete_uncertain, lease_until)
+    WHERE deleting OR delete_uncertain;
 
 -- Fix pando_retention_roots_tenant_id_fkey so organization namespaces are valid tenants.
 ALTER TABLE pando_retention_roots DROP CONSTRAINT IF EXISTS pando_retention_roots_tenant_id_fkey;

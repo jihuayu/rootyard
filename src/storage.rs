@@ -27,6 +27,8 @@ pub mod remote_authority;
 pub mod remote_errors;
 pub mod remote_io;
 pub mod remote_key_claims;
+#[cfg(test)]
+mod remote_key_claims_tests;
 pub mod remote_local;
 // The module order below is part of the `RemoteObjectStore::OpenDal` type: all
 // three `impl RemoteObjectStore` blocks belong to the same provider, never to

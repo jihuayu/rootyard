@@ -849,6 +849,337 @@ class RepositoryLifecycleHarness(BrowserHarness):
         assert xfer_view["state"] == "completed", xfer_view
         return {"lost_ack_repo": lost_repo["id"], "drain_transfer_id": xfer_view["transfer_id"]}
 
+    def remediation_alias_parity_and_uncertain_claim_fail_closed(self):
+        # 1. Seed a real PR on an aliased repository so alias prechecks match canonical handlers end-to-end.
+        repo = self.create_repository({"owner": "alice", "name": "parity-old"}, token=self.alice)
+        work = self.root / "parity-work"
+        self.push_file("alice", "parity-old", work, "README.md", "base\n", "main", "base commit", self.alice)
+        self.git("checkout", "-b", "feature", cwd=work)
+        (work / "feat.txt").write_text("feature\n")
+        self.git("add", "feat.txt", cwd=work)
+        self.git("commit", "-m", "feature commit", cwd=work)
+        self.git("push", "-u", "origin", "feature", cwd=work, token=self.alice)
+        head_oid = self.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
+        pr = self.doc(
+            "/api/repos/alice/parity-old/pulls",
+            201,
+            token=self.alice,
+            method="POST",
+            body={
+                "title": "Parity review test",
+                "body": "alias precheck parity",
+                "head_ref": "refs/heads/feature",
+                "base_ref": "refs/heads/main",
+            },
+        )
+        pr_num = pr["number"]
+
+        self.expect(
+            "/api/repos/alice/parity-old/collaborators/bob",
+            201,
+            token=self.alice,
+            method="PUT",
+            body={"role": "triage"},
+        )
+        self.expect(
+            "/api/repos/alice/parity-old/collaborators/charlie",
+            201,
+            token=self.alice,
+            method="PUT",
+            body={"role": "write"},
+        )
+        self.doc(
+            "/api/repos/alice/parity-old/rename",
+            200,
+            token=self.alice,
+            method="POST",
+            body={"new_name": "parity-canon", "expected_version": 1},
+            extra_headers={"Idempotency-Key": "parity-rename-1"},
+        )
+
+        bob_triage_pulls_w = self.issue_scoped_token(
+            self.bob, "par-bob-pw", [{"repository_id": repo["id"], "actions": ["pulls_write"]}]
+        )
+        bob_triage_repo_r = self.issue_scoped_token(
+            self.bob, "par-bob-rr", [{"repository_id": repo["id"], "actions": ["repo_read"]}]
+        )
+        charlie_write_pulls_w = self.issue_scoped_token(
+            self.charlie, "par-ch-pw", [{"repository_id": repo["id"], "actions": ["pulls_write"]}]
+        )
+        alice_repo_r = self.issue_scoped_token(
+            self.alice, "par-al-rr", [{"repository_id": repo["id"], "actions": ["repo_read"]}]
+        )
+        alice_contents_r = self.issue_scoped_token(
+            self.alice, "par-al-cr", [{"repository_id": repo["id"], "actions": ["contents_read"]}]
+        )
+        alice_pulls_r = self.issue_scoped_token(
+            self.alice, "par-al-pr", [{"repository_id": repo["id"], "actions": ["pulls_read"]}]
+        )
+        alice_admin_only = self.issue_scoped_token(
+            self.alice, "par-al-admin", [{"repository_id": repo["id"], "actions": ["repo_admin"]}]
+        )
+
+        # Reviews: triage+pulls_write allowed only for state=commented across API, /web, and /ui;
+        # approved/changes_requested require Role::Write+pulls_write; oversized (>64KiB) -> 413 after auth.
+        comment_body = {"state": "commented", "commit_oid": head_oid, "body": "lgtm comment"}
+        approve_body = {"state": "approved", "commit_oid": head_oid, "body": "approved"}
+        changes_body = {"state": "changes_requested", "commit_oid": head_oid, "body": "fix please"}
+
+        st_api_triage_c, _, hdr_api_c = self.raw_http(
+            f"/api/repos/alice/parity-old/pulls/{pr_num}/reviews",
+            token=bob_triage_pulls_w,
+            method="POST",
+            body=comment_body,
+        )
+        assert st_api_triage_c == 308 and hdr_api_c.get("location") == (
+            f"/api/repos/alice/parity-canon/pulls/{pr_num}/reviews"
+        ), (st_api_triage_c, hdr_api_c)
+        self.doc(hdr_api_c["location"], 201, token=bob_triage_pulls_w, method="POST", body=comment_body)
+
+        for denied_body in (approve_body, changes_body):
+            st_deny, _, _ = self.raw_http(
+                f"/api/repos/alice/parity-old/pulls/{pr_num}/reviews",
+                token=bob_triage_pulls_w,
+                method="POST",
+                body=denied_body,
+            )
+            assert st_deny == 403, (denied_body["state"], st_deny)
+
+        st_no_scope, _, _ = self.raw_http(
+            f"/api/repos/alice/parity-old/pulls/{pr_num}/reviews",
+            token=bob_triage_repo_r,
+            method="POST",
+            body=comment_body,
+        )
+        assert st_no_scope == 403, st_no_scope
+
+        st_api_write_a, _, hdr_api_a = self.raw_http(
+            f"/api/repos/alice/parity-old/pulls/{pr_num}/reviews",
+            token=charlie_write_pulls_w,
+            method="POST",
+            body=approve_body,
+        )
+        assert st_api_write_a == 308 and hdr_api_a.get("location") == (
+            f"/api/repos/alice/parity-canon/pulls/{pr_num}/reviews"
+        ), (st_api_write_a, hdr_api_a)
+
+        oversized_review = json.dumps(
+            {"state": "commented", "commit_oid": head_oid, "body": "x" * (65 * 1024)}
+        ).encode()
+        st_unauth_big, _, _ = self.raw_http(
+            f"/api/repos/alice/parity-old/pulls/{pr_num}/reviews",
+            token={**self.alice, "token": "ryt_invalid_token_before_body_read"},
+            method="POST",
+            body=oversized_review,
+            content_type="application/json",
+        )
+        assert st_unauth_big in (401, 403), st_unauth_big
+
+        st_auth_big, _, _ = self.raw_http(
+            f"/api/repos/alice/parity-old/pulls/{pr_num}/reviews",
+            token=charlie_write_pulls_w,
+            method="POST",
+            body=oversized_review,
+            content_type="application/json",
+        )
+        assert st_auth_big == 413, st_auth_big
+
+        st_bad_state, _, _ = self.raw_http(
+            f"/api/repos/alice/parity-old/pulls/{pr_num}/reviews",
+            token=charlie_write_pulls_w,
+            method="POST",
+            body={"state": "invalid_state", "commit_oid": head_oid, "body": "x"},
+        )
+        assert st_bad_state == 400, st_bad_state
+
+        bob_cookies, _, _ = self.sign_in(username="bob", token=bob_triage_pulls_w["token"])
+        bob_web_hdrs = {"Origin": self.base, "x-csrf-token": bob_cookies["rootyard_csrf"]}
+        charlie_cookies, _, _ = self.sign_in(username="charlie", token=charlie_write_pulls_w["token"])
+        charlie_web_hdrs = {"Origin": self.base, "x-csrf-token": charlie_cookies["rootyard_csrf"]}
+
+        for web_prefix in ("/web", "/ui"):
+            st_wc, _, hdr_wc = self.raw_http(
+                f"{web_prefix}/repos/alice/parity-old/pulls/{pr_num}/reviews",
+                cookies=bob_cookies,
+                method="POST",
+                body=comment_body,
+                extra_headers=bob_web_hdrs,
+            )
+            assert st_wc == 308 and hdr_wc.get("location") == (
+                f"{web_prefix}/repos/alice/parity-canon/pulls/{pr_num}/reviews"
+            ), (web_prefix, st_wc, hdr_wc)
+            st_wa_deny, _, _ = self.raw_http(
+                f"{web_prefix}/repos/alice/parity-old/pulls/{pr_num}/reviews",
+                cookies=bob_cookies,
+                method="POST",
+                body=approve_body,
+                extra_headers=bob_web_hdrs,
+            )
+            assert st_wa_deny == 403, (web_prefix, st_wa_deny)
+            st_wc_allow, _, hdr_wc_a = self.raw_http(
+                f"{web_prefix}/repos/alice/parity-old/pulls/{pr_num}/reviews",
+                cookies=charlie_cookies,
+                method="POST",
+                body=approve_body,
+                extra_headers=charlie_web_hdrs,
+            )
+            assert st_wc_allow == 308 and hdr_wc_a.get("location") == (
+                f"{web_prefix}/repos/alice/parity-canon/pulls/{pr_num}/reviews"
+            ), (web_prefix, st_wc_allow, hdr_wc_a)
+
+        st_web_big, _, _ = self.raw_http(
+            f"/web/repos/alice/parity-old/pulls/{pr_num}/reviews",
+            cookies=charlie_cookies,
+            method="POST",
+            body=oversized_review,
+            content_type="application/json",
+            extra_headers=charlie_web_hdrs,
+        )
+        assert st_web_big == 413, st_web_big
+
+        # LFS upload-waiters requires (Role::Admin, RepoAction::RepoRead).
+        st_wait_ok, _, hdr_wait = self.raw_http(
+            "/api/repos/alice/parity-old/lfs/upload-waiters", token=alice_repo_r
+        )
+        assert st_wait_ok == 308 and hdr_wait.get("location") == "/api/repos/alice/parity-canon/lfs/upload-waiters", (
+            st_wait_ok,
+            hdr_wait,
+        )
+        self.doc(hdr_wait["location"], 200, token=alice_repo_r)
+        for bad_wait_tok in (alice_contents_r, charlie_write_pulls_w):
+            st_w_deny, _, _ = self.raw_http("/api/repos/alice/parity-old/lfs/upload-waiters", token=bad_wait_tok)
+            assert st_w_deny == 403, st_w_deny
+
+        # Branch rules: GET -> (Read, PullsRead); mutating POST/PUT/DELETE -> (Maintain, PullsWrite).
+        st_br_get, _, hdr_br = self.raw_http("/api/repos/alice/parity-old/branch-rules", token=alice_pulls_r)
+        assert st_br_get == 308 and hdr_br.get("location") == "/api/repos/alice/parity-canon/branch-rules", (
+            st_br_get,
+            hdr_br,
+        )
+        self.doc(hdr_br["location"], 200, token=alice_pulls_r)
+        st_br_deny_r, _, _ = self.raw_http("/api/repos/alice/parity-old/branch-rules", token=alice_repo_r)
+        assert st_br_deny_r == 403, st_br_deny_r
+
+        rule_body = {"branch_ref": "refs/heads/main", "required_approvals": 1, "required_checks": []}
+        st_br_write_deny, _, _ = self.raw_http(
+            "/api/repos/alice/parity-old/branch-rules",
+            token=charlie_write_pulls_w,
+            method="POST",
+            body=rule_body,
+        )
+        assert st_br_write_deny == 403, st_br_write_deny
+
+        st_br_admin_only, _, _ = self.raw_http(
+            "/api/repos/alice/parity-old/branch-rules",
+            token=alice_admin_only,
+            method="POST",
+            body=rule_body,
+        )
+        assert st_br_admin_only == 403, st_br_admin_only
+
+        self.expect(
+            "/api/repos/alice/parity-canon/collaborators/charlie",
+            200,
+            token=self.alice,
+            method="PUT",
+            body={"role": "maintain"},
+        )
+        st_br_maint_post, _, hdr_br_post = self.raw_http(
+            "/api/repos/alice/parity-old/branch-rules",
+            token=charlie_write_pulls_w,
+            method="POST",
+            body=rule_body,
+        )
+        assert st_br_maint_post == 308 and hdr_br_post.get("location") == "/api/repos/alice/parity-canon/branch-rules", (
+            st_br_maint_post,
+            hdr_br_post,
+        )
+        self.doc(hdr_br_post["location"], (200, 201), token=charlie_write_pulls_w, method="POST", body=rule_body)
+        for m_rule in ("PUT", "DELETE"):
+            st_m, _, hdr_m = self.raw_http(
+                "/api/repos/alice/parity-old/branch-rules/main",
+                token=charlie_write_pulls_w,
+                method=m_rule,
+                body=rule_body if m_rule == "PUT" else None,
+            )
+            assert st_m == 308 and hdr_m.get("location") == "/api/repos/alice/parity-canon/branch-rules/main", (
+                m_rule,
+                st_m,
+                hdr_m,
+            )
+
+        # 2. Uncertain delete claim fails closed (503) even after lease expiry until startup recovery clears it.
+        uncertain_oid = hashlib.sha256(b"uncertain-delete-fail-closed-oid").hexdigest()
+        self.sql(
+            "INSERT INTO remote_object_delete_claims "
+            "(tenant_id, namespace, digest, claim_generation, deleting, delete_uncertain, lease_until) "
+            f"VALUES ({quote(self.alice['user_id'])}, 'lfs', {quote(uncertain_oid)}, 1, true, true, "
+            "clock_timestamp() - interval '10 seconds') "
+            "ON CONFLICT (tenant_id, namespace, digest) DO UPDATE SET "
+            "deleting = true, delete_uncertain = true, lease_until = clock_timestamp() - interval '10 seconds'"
+        )
+        st_u_batch, raw_u_batch, _ = self.http(
+            "/git/alice/parity-canon.git/info/lfs/objects/batch",
+            token=self.alice,
+            method="POST",
+            content_type=LFS_MIME,
+            extra_headers={"Accept": LFS_MIME},
+            body=json.dumps({
+                "operation": "upload",
+                "transfers": ["basic"],
+                "objects": [{"oid": uncertain_oid, "size": 32}],
+                "hash_algo": "sha256",
+            }).encode(),
+        )
+        assert st_u_batch == 503, (st_u_batch, raw_u_batch)
+        st_u_put, raw_u_put, _ = self.http(
+            f"/git/alice/parity-canon.git/info/lfs/objects/{uncertain_oid}",
+            token=self.alice,
+            method="PUT",
+            body=b"uncertain-delete-fail-closed-oid",
+            content_type="application/octet-stream",
+        )
+        assert st_u_put == 503, (st_u_put, raw_u_put)
+        assert (
+            self.sql(
+                "SELECT deleting::text || ':' || delete_uncertain::text FROM remote_object_delete_claims "
+                f"WHERE tenant_id = {quote(self.alice['user_id'])} AND namespace = 'lfs' "
+                f"AND digest = {quote(uncertain_oid)}"
+            )
+            == "true:true"
+        )
+        self.sql(
+            "DELETE FROM remote_object_delete_claims "
+            f"WHERE tenant_id = {quote(self.alice['user_id'])} AND namespace = 'lfs' AND digest = {quote(uncertain_oid)}"
+        )
+
+        # Workspace remote store is always initialized by repositories::recover; prove restart clears absent uncertain claim.
+        ws_uncertain = hashlib.sha256(b"uncertain-ws-recovery-digest").hexdigest()
+        self.stop(hard=True)
+        self.sql(
+            "INSERT INTO remote_object_delete_claims "
+            "(tenant_id, namespace, digest, claim_generation, deleting, delete_uncertain, lease_until) "
+            f"VALUES ({quote(self.alice['user_id'])}, 'workspace', {quote(ws_uncertain)}, 1, true, true, "
+            "clock_timestamp() + interval '60 seconds') "
+            "ON CONFLICT (tenant_id, namespace, digest) DO UPDATE SET "
+            "claim_generation = 1, deleting = true, delete_uncertain = true"
+        )
+        self.start()
+        rec_deadline = time.monotonic() + 15
+        ws_state = None
+        while time.monotonic() < rec_deadline:
+            ws_state = self.sql(
+                "SELECT deleting::text || ':' || delete_uncertain::text || ':' || claim_generation::text "
+                "FROM remote_object_delete_claims "
+                f"WHERE tenant_id = {quote(self.alice['user_id'])} AND namespace = 'workspace' "
+                f"AND digest = {quote(ws_uncertain)}"
+            )
+            if ws_state == "false:false:2":
+                break
+            time.sleep(0.25)
+        assert ws_state == "false:false:2", ws_state
+        return {"parity_repo": repo["id"], "ws_recovered_claim": ws_uncertain}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -872,6 +1203,10 @@ def main():
             ("ownership_transfer_and_crash_recovery", h.ownership_transfer_and_crash_recovery),
             ("remediation_lifecycle_and_alias_scope_boundaries", h.remediation_lifecycle_and_alias_scope_boundaries),
             ("remediation_fault_injection_and_concurrency", h.remediation_fault_injection_and_concurrency),
+            (
+                "remediation_alias_parity_and_uncertain_claim_fail_closed",
+                h.remediation_alias_parity_and_uncertain_claim_fail_closed,
+            ),
         ]:
             h.case(name, fn)
         passed = True
