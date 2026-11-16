@@ -33,6 +33,7 @@ SOURCE_FAILURE_POSITION_EOF = 21
 SOURCE_FAILURE_NO_CANDIDATE = 22
 SOURCE_FAILURE_WRITER_RUNNING = 23
 SOURCE_FAILURE_NO_BLOCKED_WRITER = 24
+SOURCE_FAILURE_PRE_ANCHOR = 25
 
 
 class SourceParseError(ValueError):
@@ -186,6 +187,8 @@ class LfsSourceWitness:
         self.position = 0
         self.size = 0
         self.qualified = False
+        self.prechecked = False
+        self.precheck_failed = False
         self.failure_code = SOURCE_FAILURE_NONE
         self.fatal_failure_code = SOURCE_FAILURE_NONE
 
@@ -222,9 +225,15 @@ class LfsSourceWitness:
     def _bind_candidate(self):
         if self.bound or self.fatal_failure_code:
             return
+        if not self.prechecked or self.identity is None:
+            self._fatal(SOURCE_FAILURE_PRE_ANCHOR)
+            return
         try:
-            self.identity = read_service_identity(self.service_pid, proc_root=self.proc_root)
+            current = read_service_identity(self.service_pid, proc_root=self.proc_root)
         except SourceParseError:
+            self._fatal(SOURCE_FAILURE_IDENTITY)
+            return
+        if current.pid != self.identity.pid or current.starttime != self.identity.starttime:
             self._fatal(SOURCE_FAILURE_IDENTITY)
             return
         try:
@@ -279,6 +288,9 @@ class LfsSourceWitness:
         if candidates[0][1].pos <= 0:
             self._transient(SOURCE_FAILURE_NO_CANDIDATE)
             return
+        if not verify_service_identity(self.identity, proc_root=self.proc_root):
+            self._fatal(SOURCE_FAILURE_IDENTITY)
+            return
         self.fd, info, descriptor_stat = candidates[0]
         self.st_dev = descriptor_stat.st_dev
         self.st_ino = descriptor_stat.st_ino
@@ -291,14 +303,40 @@ class LfsSourceWitness:
         self.qualified = True
 
     def prepare_no_match(self):
+        if self.fatal_failure_code or self.precheck_failed:
+            return False
+        if self.identity is None:
+            try:
+                self.identity = read_service_identity(
+                    self.service_pid, proc_root=self.proc_root
+                )
+            except SourceParseError:
+                self._fatal(SOURCE_FAILURE_IDENTITY)
+                return False
+        else:
+            try:
+                current = read_service_identity(
+                    self.service_pid, proc_root=self.proc_root
+                )
+            except SourceParseError:
+                self._fatal(SOURCE_FAILURE_IDENTITY)
+                return False
+            if current.pid != self.identity.pid or current.starttime != self.identity.starttime:
+                self._fatal(SOURCE_FAILURE_IDENTITY)
+                return False
+        if self.bound:
+            self.precheck_failed = True
+            return False
         try:
-            self.identity = read_service_identity(self.service_pid, proc_root=self.proc_root)
             object_stat = os.stat(self.object_path)
         except FileNotFoundError:
+            self.prechecked = True
             return True
-        except (OSError, SourceParseError):
+        except OSError:
+            self.precheck_failed = True
             return False
         if not stat_module.S_ISREG(object_stat.st_mode):
+            self.precheck_failed = True
             return False
         try:
             for fd in _fd_numbers(self.proc_root, self.service_pid):
@@ -310,9 +348,15 @@ class LfsSourceWitness:
                     continue
                 if (descriptor_stat.st_dev == object_stat.st_dev
                         and descriptor_stat.st_ino == object_stat.st_ino):
+                    self.precheck_failed = True
                     return False
         except (OSError, SourceParseError):
+            self.precheck_failed = True
             return False
+        if not verify_service_identity(self.identity, proc_root=self.proc_root):
+            self._fatal(SOURCE_FAILURE_IDENTITY)
+            return False
+        self.prechecked = True
         return True
 
     def bind(self):

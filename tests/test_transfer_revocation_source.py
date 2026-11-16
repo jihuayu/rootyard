@@ -96,9 +96,18 @@ class TestLfsSourceWitness(unittest.TestCase):
         self.witness = source.LfsSourceWitness(
             self.pid, self.object_path, 100, proc_root=self.proc
         )
+        self.assertTrue(self.witness.prepare_no_match())
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def _remove_fds(self):
+        fd_dir = self.proc / str(self.pid) / "fd"
+        fdinfo_dir = self.proc / str(self.pid) / "fdinfo"
+        for directory in (fd_dir, fdinfo_dir):
+            if directory.exists():
+                for entry in directory.iterdir():
+                    entry.unlink()
 
     def _add_fd(self, fd=9, pos=40, inode=None, flags=0, mnt_id=77):
         fd_dir = self.proc / str(self.pid) / "fd"
@@ -124,27 +133,68 @@ class TestLfsSourceWitness(unittest.TestCase):
         self.assertNotIn("oid", json.dumps(report))
 
     def test_eof_wrong_inode_multiple_fds_and_missing_fdinfo_fail(self):
+        self._remove_fds()
         eof = source.LfsSourceWitness(self.pid, self.object_path, 100, proc_root=self.proc)
+        self.assertTrue(eof.prepare_no_match())
         self._add_fd(pos=100)
         self.assertFalse(eof.bind())
         self.assertEqual(eof.fatal_failure_code, source.SOURCE_FAILURE_POSITION_EOF)
 
+        self._remove_fds()
         wrong = source.LfsSourceWitness(self.pid, self.object_path, 100, proc_root=self.proc)
+        self.assertTrue(wrong.prepare_no_match())
         self._add_fd(pos=40, inode=self.ino + 1)
         self.assertFalse(wrong.bind())
         self.assertEqual(wrong.fatal_failure_code, source.SOURCE_FAILURE_NOT_READABLE)
 
+        self._remove_fds()
         multiple = source.LfsSourceWitness(self.pid, self.object_path, 100, proc_root=self.proc)
+        self.assertTrue(multiple.prepare_no_match())
         self._add_fd(fd=9, pos=40)
         self._add_fd(fd=10, pos=40)
         self.assertFalse(multiple.bind())
         self.assertEqual(multiple.fatal_failure_code, source.SOURCE_FAILURE_MULTIPLE_MATCH)
 
+        self._remove_fds()
         missing = source.LfsSourceWitness(self.pid, self.object_path, 100, proc_root=self.proc)
+        self.assertTrue(missing.prepare_no_match())
         self._add_fd(fd=9, pos=40)
         (self.proc / str(self.pid) / "fdinfo" / "9").unlink()
         self.assertFalse(missing.bind())
         self.assertEqual(missing.fatal_failure_code, source.SOURCE_FAILURE_FDINFO)
+
+    def test_pre_request_owner_change_before_fd_is_fatal_and_sticky(self):
+        self.assertFalse(self.witness.bind())
+        self.assertEqual(self.witness.fatal_failure_code, source.SOURCE_FAILURE_NONE)
+        _write(self.proc / str(self.pid) / "stat",
+               _stat_text(self.pid, "rootyard", starttime=51))
+        self.assertFalse(self.witness.bind())
+        self.assertEqual(self.witness.fatal_failure_code, source.SOURCE_FAILURE_IDENTITY)
+        self._add_fd(pos=40)
+        self.assertFalse(self.witness.sample()["qualified"])
+        self.assertFalse(self.witness.bind())
+        self.assertFalse(self.witness.prepare_no_match())
+        self.assertEqual(self.witness.fatal_failure_code, source.SOURCE_FAILURE_IDENTITY)
+
+    def test_repeated_prepare_cannot_reanchor_changed_owner(self):
+        witness = source.LfsSourceWitness(self.pid, self.object_path, 100,
+                                          proc_root=self.proc)
+        self.assertTrue(witness.prepare_no_match())
+        _write(self.proc / str(self.pid) / "stat",
+               _stat_text(self.pid, "rootyard", starttime=51))
+        self.assertFalse(witness.prepare_no_match())
+        self.assertEqual(witness.fatal_failure_code, source.SOURCE_FAILURE_IDENTITY)
+        self._add_fd(pos=40)
+        self.assertFalse(witness.bind())
+
+    def test_unprepared_caller_cannot_bind_post_request_identity(self):
+        self._remove_fds()
+        witness = source.LfsSourceWitness(self.pid, self.object_path, 100,
+                                          proc_root=self.proc)
+        self._add_fd(pos=40)
+        self.assertFalse(witness.bind())
+        self.assertEqual(witness.fatal_failure_code, source.SOURCE_FAILURE_PRE_ANCHOR)
+        self.assertFalse(witness.sample()["qualified"])
 
     def test_no_fd_progress_then_stable_position_qualifies_after_progress(self):
         self.assertTrue(self.witness.prepare_no_match())
@@ -187,7 +237,9 @@ class TestLfsSourceWitness(unittest.TestCase):
         self.assertFalse(self.witness.sample()["qualified"],
                          "a fatal backwards position must not be recovered by retry")
 
+        self._remove_fds()
         eof = source.LfsSourceWitness(self.pid, self.object_path, 100, proc_root=self.proc)
+        self.assertTrue(eof.prepare_no_match())
         self._add_fd(pos=40)
         self.assertTrue(eof.bind())
         _fdinfo(self.proc / str(self.pid) / "fdinfo" / "9",
@@ -214,8 +266,10 @@ class TestLfsSourceWitness(unittest.TestCase):
         self.assertFalse(self.witness.sample()["qualified"],
                          "an already-bound FD replacement must not be adopted back")
 
+        self._remove_fds()
         identity = source.LfsSourceWitness(self.pid, self.object_path, 100,
                                            proc_root=self.proc)
+        self.assertTrue(identity.prepare_no_match())
         self._add_fd(pos=40)
         self.assertTrue(identity.bind())
         _write(self.proc / str(self.pid) / "stat",
