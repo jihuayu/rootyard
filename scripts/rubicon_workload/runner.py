@@ -701,7 +701,6 @@ def _phase_cold_warm_and_ci(
 
 
 def _phase_fault_and_audit(
-    n_procs: int,
     pre: dict[str, Any],
     base_env: dict[str, str],
     cli_env: dict[str, str],
@@ -711,11 +710,9 @@ def _phase_fault_and_audit(
     repos: dict[str, dict[str, Any]],
     records: list[dict[str, Any]],
     acked: list[dict[str, Any]],
-    secrets: list[str],
+    rev_tok: dict[str, str],
 ) -> tuple[dict[str, int], dict[str, int]]:
     fault_entry = repos["fault_repo"]
-    rev_tok = json.loads(_cli(pre["binary"], cli_env, "create-token", f"rubicon_t{n_procs}_u2"))
-    secrets.append(rev_tok["token"])
     if http_json(bases[0], "/api/repos", token=rev_tok)[0] != 200:
         raise RuntimeError("pre-revocation API probe did not return 200")
     _cli(pre["binary"], cli_env, "revoke-token", rev_tok["token_id"])
@@ -785,6 +782,11 @@ def _run_tier(
     secrets: list[str],
 ) -> dict[str, Any]:
     users = [_create_user_and_tokens(pre["binary"], cli_env, f"rubicon_t{n_procs}_u{i}", secrets) for i in range(3)]
+    # Pre-mint the sacrificial token before starting serve-blob because CLI
+    # `create-token` invokes `db::migrate` (exclusive advisory lock) which
+    # contends on ServingBarrier's shared lock while serve-blob is active.
+    rev_tok = json.loads(_cli(pre["binary"], cli_env, "create-token", f"rubicon_t{n_procs}_u2"))
+    secrets.append(rev_tok["token"])
     tier_scratch = tier_dir / "scratches"
     tier_scratch.mkdir(parents=True, mode=0o700)
     fleet = _start_fleet(n_procs, pre["binary"], base_env, pre["git"], pg_url, s3_endpoint, tier_scratch)
@@ -806,7 +808,7 @@ def _run_tier(
             n_procs, pre, base_env, pg_url, s3_endpoint, s3_proxy, tier_scratch, tier_dir, askpass, repos, records, fleet, sampler
         )
         bases = [item[1] for item in fleet]
-        fault_counts, audit = _phase_fault_and_audit(n_procs, pre, base_env, cli_env, bases, tier_dir, askpass, repos, records, acked, secrets)
+        fault_counts, audit = _phase_fault_and_audit(pre, base_env, cli_env, bases, tier_dir, askpass, repos, records, acked, rev_tok)
         pg_final = query_pg_snapshot_json(pg_url, base_env)
         sampler.stop()
     finally:

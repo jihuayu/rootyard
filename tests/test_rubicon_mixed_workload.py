@@ -519,6 +519,55 @@ class RubiconProvisioningAndAuthorityTests(unittest.TestCase):
         self.assertEqual(seen_cli_modes, [("migrate", "auto")])
         self.assertEqual(tier_modes, ["external"])
 
+    def test_fault_phase_only_invokes_revoke_token_while_fleet_is_running(self) -> None:
+        import inspect
+        import pathlib
+        import tempfile
+        from unittest import mock
+        from scripts.rubicon_workload.runner import _phase_fault_and_audit, _run_tier
+
+        run_tier_src = inspect.getsource(_run_tier)
+        self.assertLess(run_tier_src.index('"create-token"'), run_tier_src.index("_start_fleet"))
+
+        seen_cli: list[tuple[str, ...]] = []
+
+        def fake_cli(_binary: str, _env: dict[str, str], *args: str) -> str:
+            seen_cli.append(args)
+            return ""
+
+        with tempfile.TemporaryDirectory() as td:
+            wdir = pathlib.Path(td) / "work"
+            wdir.mkdir()
+            repos = {
+                "fault_repo": {
+                    "info": {"clone_path": "/git/u2/fault.git", "owner": "u2", "name": "fault"},
+                    "work": wdir,
+                    "rw": {"username": "u2", "token": "ryt_" + "c" * 64},
+                    "ro": {"username": "u2", "token": "ryt_" + "d" * 64},
+                }
+            }
+            records: list[dict[str, object]] = []
+            with mock.patch("scripts.rubicon_workload.runner._cli", side_effect=fake_cli), \
+                 mock.patch("scripts.rubicon_workload.runner.http_json", side_effect=[(200, b"{}", {}, 1.0), (401, b"{}", {}, 1.0)]), \
+                 mock.patch("scripts.rubicon_workload.runner.materialize_commit_spec", return_value="a" * 40), \
+                 mock.patch("scripts.rubicon_workload.runner.run_git", return_value=(mock.Mock(returncode=1, stdout=b"", stderr=b"denied"), 1.0)), \
+                 mock.patch("scripts.rubicon_workload.runner.git_remote_refs", return_value=({}, 1.0)):
+                fault_counts, audit = _phase_fault_and_audit(
+                    {"binary": "/bin/true", "git": "/usr/bin/git"},
+                    {},
+                    {},
+                    ["http://127.0.0.1:9999"],
+                    pathlib.Path(td),
+                    pathlib.Path(td) / "askpass.sh",
+                    repos,
+                    records,
+                    [],
+                    {"username": "u2", "token_id": "tok-123", "token": "ryt_" + "e" * 64},
+                )
+        self.assertEqual(seen_cli, [("revoke-token", "tok-123")])
+        self.assertEqual(fault_counts["committed_success"], 0)
+        self.assertEqual(audit["acked_targets_total"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
