@@ -3944,9 +3944,17 @@ async fn serving_check_version_absolute_deadline_bounds_two_sequential_auth_lock
             // ~8.2s. The fixed facade must return around 5s (plus its 1s cleanup
             // budget) while B remains held; the old unwrapped lookup would still
             // be blocked here.
-            let joined = tokio::time::timeout_at(absolute + Duration::from_secs(2), task.as_mut().expect("task"))
-                .await
-                .map_err(|_| anyhow!("CheckVersion did not return within the bounded deadline grace"))??;
+            let completed =
+                tokio::time::timeout_at(absolute + Duration::from_secs(2), task.as_mut().expect("task"))
+                    .await
+                    .map_err(|_| anyhow!("CheckVersion did not return within the bounded deadline grace"))?;
+            // The join handle has completed once this timeout is ready. Remove it
+            // before propagating the inner result/JoinError so cleanup cannot
+            // abort and await the same completed handle again. On outer timeout
+            // the handling branch returns early above and leaves the original
+            // handle in `task` for the bounded abort/join below.
+            drop(task.take());
+            let joined = completed?;
             let error = joined.expect_err("CheckVersion returned an observation after the absolute deadline");
             ensure!(
                 error.0 == axum::http::StatusCode::GATEWAY_TIMEOUT
