@@ -59,7 +59,7 @@ pub(super) async fn snapshot_and_retain(
         packs,
     };
     #[cfg(test)]
-    super::snapshot_pg_support::barrier_tx("snapshot-after-select", &t).await?;
+    super::snapshot_pg_barrier::barrier_tx("snapshot-after-select", repo, &t).await?;
 
     let token = Uuid::new_v4();
     t.execute(
@@ -76,7 +76,7 @@ pub(super) async fn snapshot_and_retain(
     )
     .await?;
     #[cfg(test)]
-    super::snapshot_pg_support::fault("snapshot-before-commit")?;
+    super::snapshot_pg_barrier::fault("snapshot-before-commit", repo)?;
 
     t.commit().await?;
     Ok(token)

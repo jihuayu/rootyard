@@ -2,6 +2,7 @@
 //!
 //! These cases are `#[ignore]`d and were not executed in this checkpoint.
 
+use super::snapshot_pg_barrier::*;
 use super::snapshot_pg_support::*;
 use super::super::{repack, store};
 use uuid::Uuid;
@@ -14,12 +15,14 @@ async fn pg_snapshot_fault_rolls_back_without_token_and_releases_lock() {
     let Some((config, root)) = config_for("snapshot-rollback") else {
         return;
     };
-    let admin = connect(&config).await;
     let repo = Uuid::new_v4();
+    let nonce = case_nonce();
+    let admin_name = actor_appname(&nonce, repo, "admin");
+    let admin = connect_named(&config, &admin_name).await;
     insert_repo(&admin, repo).await;
     seed_single_pack(&config, &admin, repo).await;
 
-    set_fault(Some("snapshot-before-commit"));
+    arm_fault("snapshot-before-commit", repo);
     let mut client = config.db().await.unwrap();
     let error = store::snapshot_and_retain(&mut client, repo, "reader")
         .await
@@ -36,7 +39,8 @@ async fn pg_snapshot_fault_rolls_back_without_token_and_releases_lock() {
         .get(0);
     assert_eq!(rows, 0, "a failed helper must not expose a token row");
 
-    let probe = connect(&config).await;
+    let probe_name = actor_appname(&nonce, repo, "probe");
+    let probe = connect_named(&config, &probe_name).await;
     let row = probe
         .query_one(
             "SELECT generation FROM pando_lab.repositories WHERE id=$1 FOR UPDATE NOWAIT",
@@ -58,8 +62,9 @@ async fn pg_snapshot_retention_uses_live_expiry_not_expired_rows() {
     let Some((config, root)) = config_for("snapshot-expiry") else {
         return;
     };
-    let admin = connect(&config).await;
     let repo = Uuid::new_v4();
+    let nonce = case_nonce();
+    let admin = connect_named(&config, &actor_appname(&nonce, repo, "admin")).await;
     insert_repo(&admin, repo).await;
     let (live, expired) = seed_two_packs(&config, &admin, repo).await;
     insert_snapshot(&admin, repo, "live", &[live.clone()], "1 minute").await;
@@ -88,8 +93,9 @@ async fn pg_ordinary_snapshot_still_does_not_retain() {
     let Some((config, root)) = config_for("ordinary-snapshot") else {
         return;
     };
-    let admin = connect(&config).await;
     let repo = Uuid::new_v4();
+    let nonce = case_nonce();
+    let admin = connect_named(&config, &actor_appname(&nonce, repo, "admin")).await;
     insert_repo(&admin, repo).await;
     let (pack, _) = seed_single_pack(&config, &admin, repo).await;
 

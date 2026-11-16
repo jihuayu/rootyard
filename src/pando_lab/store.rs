@@ -18,6 +18,8 @@ pub(super) async fn snapshot_and_retain(
 }
 
 #[cfg(test)]
+pub(super) mod snapshot_pg_barrier;
+#[cfg(test)]
 pub(super) mod snapshot_pg_support;
 #[cfg(test)]
 mod snapshot_pg_tests;

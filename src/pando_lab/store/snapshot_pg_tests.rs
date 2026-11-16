@@ -2,6 +2,7 @@
 //!
 //! These cases are `#[ignore]`d and were not executed in this checkpoint.
 
+use super::snapshot_pg_barrier::*;
 use super::snapshot_pg_support::*;
 use super::super::{repack, store};
 use uuid::Uuid;
@@ -14,26 +15,31 @@ async fn pg_snapshot_wins_retains_old_pack_before_insert() {
     let Some((config, root)) = config_for("snapshot-wins") else {
         return;
     };
-    let admin = connect(&config).await;
     let repo = Uuid::new_v4();
+    let nonce = case_nonce();
+    let admin_name = actor_appname(&nonce, repo, "admin");
+    let snapshot_name = actor_appname(&nonce, repo, "snap");
+    let repack_name = actor_appname(&nonce, repo, "repack");
+    let admin = connect_named(&config, &admin_name).await;
     insert_repo(&admin, repo).await;
     let (old, _) = seed_single_pack(&config, &admin, repo).await;
     insert_old_metadata(&admin, repo, &old).await;
     let obj_dir = config.root.join("objects").join(repo.to_string());
 
-    let barrier = root.join("barrier");
-    set_barrier(Some(barrier.clone()));
-    let snapshot_config = config.clone();
+    let case = BarrierCase::arm(
+        root.join("barrier"),
+        repo,
+        "snapshot-after-select",
+        &snapshot_name,
+        &nonce,
+    );
+    let snapshot_config = actor_config(&config, &snapshot_name);
     let snapshot = tokio::spawn(async move {
         let mut client = snapshot_config.db().await.unwrap();
         store::snapshot_and_retain(&mut client, repo, "reader").await
     });
-    wait_ready(&barrier, "snapshot-after-select").await;
-    assert_read_committed(&barrier, "snapshot-after-select");
-    // The snapshot waiter already owns this barrier directory. Clear the
-    // process-wide arm so the repack seam stays inert for this half of the
-    // race; clearing does not wake or cancel the snapshot waiter.
-    set_barrier(None);
+    case.wait_ready().await;
+    case.assert_read_committed();
     let before: i64 = admin
         .query_one("SELECT count(*) FROM pando_lab.snapshots WHERE repo=$1", &[&repo])
         .await
@@ -41,19 +47,12 @@ async fn pg_snapshot_wins_retains_old_pack_before_insert() {
         .get(0);
     assert_eq!(before, 0, "no token row may exist before the helper commits");
 
-    let repack_config = config.clone();
+    let repack_config = actor_config(&config, &repack_name);
     let opts = options();
     let repack = tokio::spawn(async move { repack::repack_repo(&repack_config, repo, &opts).await });
-    wait_for_lock_wait(
-        &admin,
-        "FOR UPDATE",
-        "pando_lab.repositories",
-        "repack final lock",
-        3000,
-    )
-    .await;
+    wait_for_actor_lock_wait(&admin, &repack_name, repo, "FOR UPDATE", 3000).await;
 
-    std::fs::write(barrier.join("snapshot-after-select.release"), b"").unwrap();
+    case.release();
     let token = snapshot.await.unwrap().unwrap();
     let report = repack.await.unwrap().unwrap();
 
@@ -95,36 +94,35 @@ async fn pg_repack_wins_snapshot_selects_replacement_after_commit() {
     let Some((config, root)) = config_for("repack-wins") else {
         return;
     };
-    let admin = connect(&config).await;
     let repo = Uuid::new_v4();
+    let nonce = case_nonce();
+    let admin_name = actor_appname(&nonce, repo, "admin");
+    let snapshot_name = actor_appname(&nonce, repo, "snap");
+    let repack_name = actor_appname(&nonce, repo, "repack");
+    let admin = connect_named(&config, &admin_name).await;
     insert_repo(&admin, repo).await;
     let (old, _) = seed_single_pack(&config, &admin, repo).await;
     let obj_dir = config.root.join("objects").join(repo.to_string());
 
-    let barrier = root.join("barrier");
-    set_barrier(Some(barrier.clone()));
-    let repack_config = config.clone();
+    let case = BarrierCase::arm(
+        root.join("barrier"),
+        repo,
+        "repack-after-lock",
+        &repack_name,
+        &nonce,
+    );
+    let repack_config = actor_config(&config, &repack_name);
     let opts = options();
     let repack = tokio::spawn(async move { repack::repack_repo(&repack_config, repo, &opts).await });
-    wait_ready(&barrier, "repack-after-lock").await;
-    assert_read_committed(&barrier, "repack-after-lock");
-    // The repack waiter already owns this barrier directory. Clear the
-    // process-wide arm so the snapshot seam stays inert while repack finishes.
-    set_barrier(None);
+    case.wait_ready().await;
+    case.assert_read_committed();
 
-    let snapshot_config = config.clone();
+    let snapshot_config = actor_config(&config, &snapshot_name);
     let snapshot = tokio::spawn(async move {
         let mut client = snapshot_config.db().await.unwrap();
         store::snapshot_and_retain(&mut client, repo, "reader").await
     });
-    wait_for_lock_wait(
-        &admin,
-        "FOR SHARE",
-        "pando_lab.repositories",
-        "retained snapshot lock",
-        900,
-    )
-    .await;
+    wait_for_actor_lock_wait(&admin, &snapshot_name, repo, "FOR SHARE", 900).await;
     let before: i64 = admin
         .query_one("SELECT count(*) FROM pando_lab.snapshots WHERE repo=$1", &[&repo])
         .await
@@ -132,7 +130,7 @@ async fn pg_repack_wins_snapshot_selects_replacement_after_commit() {
         .get(0);
     assert_eq!(before, 0, "the snapshot must not select or insert before repack commits");
 
-    std::fs::write(barrier.join("repack-after-lock.release"), b"").unwrap();
+    case.release();
     let report = repack.await.unwrap().unwrap();
     let token = snapshot.await.unwrap().unwrap();
 

@@ -7,118 +7,12 @@
 //! transaction is still read committed.
 
 use super::super::{Config, Control, Pack, Snapshot, repack};
-use anyhow::{Result, bail, ensure};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Mutex,
-    time::Duration,
 };
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
-
-static TEST_LOCK: Mutex<()> = Mutex::new(());
-static BARRIER: Mutex<Option<PathBuf>> = Mutex::new(None);
-static FAULT: Mutex<Option<String>> = Mutex::new(None);
-
-pub(crate) fn set_barrier(dir: Option<PathBuf>) {
-    *BARRIER.lock().expect("snapshot retention barrier lock") = dir;
-}
-
-pub(crate) fn set_fault(point: Option<&str>) {
-    *FAULT.lock().expect("snapshot retention fault lock") = point.map(str::to_owned);
-}
-
-async fn wait_release(dir: &Path, point: &str) -> Result<()> {
-    let started = std::time::Instant::now();
-    while !dir.join(format!("{point}.release")).exists() {
-        ensure!(
-            started.elapsed().as_secs() < 30,
-            "snapshot retention test barrier timeout"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Ok(())
-}
-
-/// Test seam that records the actual transaction isolation at a production
-/// lock/selection boundary rather than asserting a test-only imitation.
-pub(crate) async fn barrier_tx(
-    point: &str,
-    transaction: &tokio_postgres::Transaction<'_>,
-) -> Result<()> {
-    let dir = { BARRIER.lock().expect("snapshot retention barrier lock").clone() };
-    let Some(dir) = dir else {
-        return Ok(());
-    };
-    std::fs::create_dir_all(&dir)?;
-    let isolation: String = transaction
-        .query_one("SHOW transaction_isolation", &[])
-        .await?
-        .get(0);
-    std::fs::write(dir.join(format!("{point}.isolation")), isolation)?;
-    std::fs::write(dir.join(format!("{point}.ready")), b"")?;
-    wait_release(&dir, point).await
-}
-
-pub(crate) fn fault(point: &str) -> Result<()> {
-    let fault = { FAULT.lock().expect("snapshot retention fault lock").clone() };
-    if fault.as_deref() == Some(point) {
-        bail!("snapshot retention test fault before commit");
-    }
-    Ok(())
-}
-
-pub(crate) async fn wait_ready(dir: &Path, point: &str) {
-    let marker = dir.join(format!("{point}.ready"));
-    for _ in 0..3000 {
-        if marker.exists() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("snapshot retention test barrier point '{point}' was not reached");
-}
-
-pub(crate) fn assert_read_committed(dir: &Path, point: &str) {
-    let isolation = std::fs::read_to_string(dir.join(format!("{point}.isolation")))
-        .expect("the production barrier must record actual transaction isolation");
-    assert_eq!(
-        isolation.trim(),
-        "read committed",
-        "actual transaction isolation at {point}"
-    );
-}
-
-/// Poll PostgreSQL lock state to a finite deadline. This observes the real
-/// waiter instead of guessing with a fixed sleep.
-pub(crate) async fn wait_for_lock_wait(
-    admin: &Client,
-    first: &str,
-    second: &str,
-    label: &str,
-    attempts: usize,
-) {
-    let first = format!("%{first}%");
-    let second = format!("%{second}%");
-    for _ in 0..attempts {
-        let count: i64 = admin
-            .query_one(
-                "SELECT count(*) FROM pg_stat_activity \
-                 WHERE datname=current_database() AND state='active' \
-                 AND wait_event_type='Lock' AND query ILIKE $1 AND query ILIKE $2",
-                &[&first, &second],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        if count > 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("did not observe PostgreSQL lock wait for {label}");
-}
 
 fn database_with_repeatable_read_default(database: &str) -> String {
     if database.contains("://") {
@@ -166,7 +60,18 @@ pub(super) fn config_for(label: &str) -> Option<(Config, PathBuf)> {
     ))
 }
 
-pub(super) async fn connect(config: &Config) -> Client {
+pub(super) fn actor_config(config: &Config, appname: &str) -> Config {
+    let mut actor = config.clone();
+    actor.database = if actor.database.contains("://") {
+        let separator = if actor.database.contains('?') { '&' } else { '?' };
+        format!("{}{separator}application_name={appname}", actor.database)
+    } else {
+        format!("{} application_name='{appname}'", actor.database)
+    };
+    actor
+}
+
+pub(super) async fn connect_named(config: &Config, appname: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(&config.database, NoTls)
         .await
         .expect("ROOTYARD_TEST_DATABASE_URL must accept PostgreSQL connections");
@@ -177,6 +82,13 @@ pub(super) async fn connect(config: &Config) -> Client {
         .batch_execute("SET default_transaction_isolation='repeatable read'")
         .await
         .expect("fixture session default isolation");
+    client
+        .execute(
+            "SELECT set_config('application_name',$1,false)",
+            &[&appname],
+        )
+        .await
+        .expect("fixture session application_name");
     client
 }
 
@@ -439,29 +351,6 @@ pub(super) async fn metadata_count(admin: &Client, repo: Uuid, pack: Uuid) -> i6
         .await
         .unwrap()
         .get(0)
-}
-
-pub(super) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-pub(super) struct HookGuard;
-
-impl HookGuard {
-    pub(super) fn new() -> Self {
-        set_barrier(None);
-        set_fault(None);
-        Self
-    }
-}
-
-impl Drop for HookGuard {
-    fn drop(&mut self) {
-        set_barrier(None);
-        set_fault(None);
-    }
 }
 
 pub(super) fn options() -> repack::RepackOptions {
