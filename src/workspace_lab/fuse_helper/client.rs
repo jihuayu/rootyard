@@ -173,23 +173,21 @@ where
 fn poll_writable(fd: RawFd, wait: Duration) -> Result<(), HelperError> {
     let timeout = wait.min(WRITE_POLL).as_millis() as i32;
     let mut pollfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-    loop {
-        // SAFETY: one valid pollfd is supplied and the timeout is bounded.
-        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout) };
-        if ready >= 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EINTR) {
-            // Return to the writer so it re-reads the absolute deadline
-            // instead of restarting this poll window.
-            return Ok(());
-        }
-        return Err(HelperError::new(
-            error.raw_os_error().unwrap_or(libc::EIO),
-            format!("workspace FUSE helper control poll failed: {error}"),
-        ));
+    // SAFETY: one valid pollfd is supplied and the timeout is bounded.
+    let ready = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+    if ready >= 0 {
+        return Ok(());
     }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EINTR) {
+        // Return to the writer so it re-reads the absolute deadline instead of
+        // restarting this poll window.
+        return Ok(());
+    }
+    Err(HelperError::new(
+        error.raw_os_error().unwrap_or(libc::EIO),
+        format!("workspace FUSE helper control poll failed: {error}"),
+    ))
 }
 
 /// One complete-frame nonblocking send attempt. A short or failed attempt runs
