@@ -355,7 +355,7 @@ impl RaftNodeProc {
     }
 }
 
-async fn shutdown_nodes(st: &HarnessState, ids: &[u64]) {
+async fn shutdown_nodes(st: &GatewayState, ids: &[u64]) {
     let procs: Vec<_> = {
         let mut guard = st.nodes.write().unwrap();
         ids.iter().filter_map(|sid| guard.remove(sid)).collect()
