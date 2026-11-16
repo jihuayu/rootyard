@@ -329,6 +329,14 @@ impl PreparedPackPublication {
     }
 }
 
+fn ensure_encrypted_hook_backend_supported(remote: bool) -> Result<()> {
+    ensure!(
+        !remote,
+        "encrypted Git-hook publication is unsupported with ROOTYARD_OBJECT_STORE_ENDPOINT; local CAS cannot be committed as a remote-backed object-store publication"
+    );
+    Ok(())
+}
+
 pub(crate) async fn prepare_known_pack_publication(
     config: &Config,
     client: &Client,
@@ -337,6 +345,10 @@ pub(crate) async fn prepare_known_pack_publication(
     checkpoint: Option<&lifecycle::rotation::KmsRotationCheckpoint>,
     storage_tier: &str,
 ) -> Result<PreparedPackPublication> {
+    // The encrypted prepared hook currently produces local CAS only. Use the
+    // exact same backend switch as ordinary put/get/verify before provider
+    // selection, local sealing, or authoritative SQL publication.
+    ensure_encrypted_hook_backend_supported(remote_enabled())?;
     let local_root = config.root.join("objects");
     let pack_bytes = std::fs::read(local_root.join(repo.to_string()).join(format!("{}.pack", pack.id)))?;
     let idx_bytes = std::fs::read(local_root.join(repo.to_string()).join(format!("{}.idx", pack.id)))?;
@@ -709,6 +721,16 @@ pub(super) async fn status(config: &Config, repo: Uuid) -> Result<ObjectStoreSta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypted_hook_factory_is_local_cas_only_and_fails_before_remote_side_effects() {
+        // Both real Local-CAS encrypted modes (pinned Local and Vault without a
+        // checkpoint / with a compatible checkpoint) share this local factory.
+        assert!(ensure_encrypted_hook_backend_supported(false).is_ok());
+        // Remote endpoint mode must not silently commit local CAS metadata.
+        assert!(ensure_encrypted_hook_backend_supported(true).is_err());
+    }
+
     #[tokio::test]
     async fn multipart_cas_upload_fault_injection_and_cache_rehydration() {
         let tmp = std::env::temp_dir().join(format!("pando-os-test-{}", Uuid::new_v4()));
