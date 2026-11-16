@@ -392,7 +392,7 @@ fn serving_metadata_scope(scope: &RootsScope) -> Result<MetadataSnapshotScope, R
     MetadataSnapshotScope::new(
         scope.repository_id(),
         scope.tenant_id(),
-        scope.tenant_id(),
+        scope.owner_id(),
         MetadataPinPurpose::Verification,
         scope.object_format(),
         scope.history_incarnation(),

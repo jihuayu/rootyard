@@ -47,6 +47,26 @@ const ROOT_REASON_MAX: usize = 256;
 /// through the metadata-scope adapter; this value never reaches a mutation.
 const PLACEHOLDER_BUSINESS_INTENT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
+/// Private ownership mode for the shared serving-root lifecycle.
+///
+/// `Tenant` preserves the ordinary HTTP behavior and stable ids. `Actor` is the
+/// additive producer-owned mode; its durable owner is the authenticated actor,
+/// never an arbitrary request owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootOwnership {
+    Tenant,
+    Actor,
+}
+
+impl RootOwnership {
+    fn owner_id(self, actor: &Identity, tenant_id: Uuid) -> Uuid {
+        match self {
+            Self::Tenant => tenant_id,
+            Self::Actor => actor.id,
+        }
+    }
+}
+
 /// One bounded original create intent. The same value is accepted by
 /// release-before-register so the server can derive the exact root id and
 /// expected register digest without any client-supplied digest.
@@ -107,6 +127,7 @@ pub(crate) struct ServingRetainedRootReadContext {
     root: RootRef,
     repository_id: Uuid,
     tenant_id: Uuid,
+    owner_id: Uuid,
     name: String,
     cluster_incarnation: Uuid,
     deadline: Instant,
@@ -128,6 +149,12 @@ impl ServingRetainedRootReadContext {
 
 /// Authorized retention-root service facade over the actual opened
 /// `PgRetentionRoots` engine/store. Construction grants no authority.
+///
+/// The historical methods preserve tenant-owned HTTP behavior. Additive
+/// `*_actor_owned` methods derive the durable root owner from the authenticated
+/// actor only; no request owner-id field exists. Both modes retain the existing
+/// Admin/ContentsRead+Write, ready binding/backend, gate/realm, cluster anchor,
+/// quota, receipt, exact replay, deadline and T1/T2 checks.
 pub struct PgServingRetentionRoots {
     roots: PgRetentionRoots,
 }
@@ -152,29 +179,61 @@ impl PgServingRetentionRoots {
         input: ServingRootCreate,
         deadline: Instant,
     ) -> Result<RootReceipt, Error> {
+        self.create_with_ownership(pool, actor, input, deadline, RootOwnership::Tenant).await
+    }
+
+    /// Create one retained root owned by the authenticated actor.
+    ///
+    /// The source snapshot must itself be actor-owned; repository/tenant,
+    /// purpose, selector, stable ids, Admin/ContentsWrite, ready binding,
+    /// backend, realm, quota, receipt, replay and late-auth checks remain the
+    /// existing production checks. No owner-id input is accepted.
+    pub async fn create_actor_owned(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingRootCreate,
+        deadline: Instant,
+    ) -> Result<RootReceipt, Error> {
+        self.create_with_ownership(pool, actor, input, deadline, RootOwnership::Actor).await
+    }
+
+    async fn create_with_ownership(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingRootCreate,
+        deadline: Instant,
+        ownership: RootOwnership,
+    ) -> Result<RootReceipt, Error> {
         validate_owner_name(&input.owner, &input.name)?;
         validate_intent(&input.intent)?;
         let deadline = root_deadline(deadline)?;
         let repo = self.preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsWrite, deadline).await?;
+        let expected_owner = ownership.owner_id(actor, repo.tenant_id);
         let gate = repo.gate()?;
         let derived = derive_intent(gate, &input.intent)?;
-        let scope = root_scope(&repo, input.intent.purpose, &derived.business_intent)?;
+        let scope = root_scope(&repo, input.intent.purpose, &derived.business_intent, expected_owner)?;
 
         // Exact create replay lives entirely on retained root/receipt rows and
         // runs before source pin/snapshot lookup or native work.
-        if let Some(receipt) = self.replay_create(pool, actor, &repo, &scope, &input.intent, &derived, deadline).await?
+        if let Some(receipt) = self
+            .replay_create(pool, actor, &repo, &scope, &input.intent, &derived, expected_owner, deadline)
+            .await?
         {
             return Ok(receipt);
         }
 
-        let source = self.source_snapshot(pool, actor, &repo, &scope, &input.intent, deadline).await?;
+        let source = self
+            .source_snapshot(pool, actor, &repo, &scope, &input.intent, expected_owner, deadline)
+            .await?;
         let format = source.scope().object_format();
         if format != gate.object_format()
             || source.scope().history_incarnation() != gate.history_incarnation()
             || source.scope().authority_epoch() != gate.authority_epoch()
             || source.scope().group_epoch() != gate.group_epoch()
             || source.scope().tenant_id() != repo.tenant_id
-            || source.scope().owner_id() != repo.tenant_id
+            || source.scope().owner_id() != expected_owner
         {
             return Err(Error(StatusCode::CONFLICT, "source snapshot realm changed; retry the same request"));
         }
@@ -293,18 +352,43 @@ impl PgServingRetentionRoots {
         input: ServingRootRelease,
         deadline: Instant,
     ) -> Result<RootReceipt, Error> {
+        self.release_with_ownership(pool, actor, input, deadline, RootOwnership::Tenant).await
+    }
+
+    /// Release a retained root only when the persisted root owner is the
+    /// authenticated actor. Exact existing/absent replay remains independent of
+    /// the released source pin; tenant roots are not adoptable here.
+    pub async fn release_actor_owned(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingRootRelease,
+        deadline: Instant,
+    ) -> Result<RootReceipt, Error> {
+        self.release_with_ownership(pool, actor, input, deadline, RootOwnership::Actor).await
+    }
+
+    async fn release_with_ownership(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingRootRelease,
+        deadline: Instant,
+        ownership: RootOwnership,
+    ) -> Result<RootReceipt, Error> {
         validate_owner_name(&input.owner, &input.name)?;
         validate_key(&input.idempotency_key)?;
         validate_reason(&input.reason)?;
         let deadline = root_deadline(deadline)?;
         let repo = self.preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsWrite, deadline).await?;
+        let expected_owner = ownership.owner_id(actor, repo.tenant_id);
 
         match input.target.clone() {
             ServingRootReleaseTarget::Existing { root_id } => {
                 if root_id.is_nil() {
                     return Err(Error(::axum::http::StatusCode::BAD_REQUEST, "invalid root id"));
                 }
-                self.release_existing(pool, actor, &repo, root_id, &input, deadline).await
+                self.release_existing(pool, actor, &repo, root_id, &input, expected_owner, deadline).await
             }
             ServingRootReleaseTarget::Absent { root_id, create } => {
                 validate_intent(&create)?;
@@ -312,19 +396,36 @@ impl PgServingRetentionRoots {
                 if derived.root_id != root_id {
                     return Err(Error::not_found());
                 }
-                let scope = root_scope(&repo, create.purpose, &derived.business_intent)?;
-                self.release_absent(pool, actor, &repo, root_id, &create, &derived, &scope, &input, deadline, false)
-                    .await
+                let scope = root_scope(&repo, create.purpose, &derived.business_intent, expected_owner)?;
+                self.release_absent(
+                    pool,
+                    actor,
+                    &repo,
+                    root_id,
+                    &create,
+                    &derived,
+                    &scope,
+                    &input,
+                    expected_owner,
+                    deadline,
+                    false,
+                )
+                .await
             }
             ServingRootReleaseTarget::ByIntent { create } => {
                 validate_intent(&create)?;
                 let derived = derive_intent(repo.gate()?, &create)?;
-                let scope = root_scope(&repo, create.purpose, &derived.business_intent)?;
+                let scope = root_scope(&repo, create.purpose, &derived.business_intent, expected_owner)?;
                 // Reuse the create exact-intent probe. A changed source/selector/
                 // purpose under this create key conflicts here after the probe's
                 // final ContentsWrite check and never touches an existing root.
-                if self.replay_create(pool, actor, &repo, &scope, &create, &derived, deadline).await?.is_some() {
-                    self.release_existing(pool, actor, &repo, derived.root_id, &input, deadline).await
+                if self
+                    .replay_create(pool, actor, &repo, &scope, &create, &derived, expected_owner, deadline)
+                    .await?
+                    .is_some()
+                {
+                    self.release_existing(pool, actor, &repo, derived.root_id, &input, expected_owner, deadline)
+                        .await
                 } else {
                     self.release_absent(
                         pool,
@@ -335,6 +436,7 @@ impl PgServingRetentionRoots {
                         &derived,
                         &scope,
                         &input,
+                        expected_owner,
                         deadline,
                         true,
                     )
@@ -353,10 +455,34 @@ impl PgServingRetentionRoots {
         input: ServingRootRead,
         deadline: Instant,
     ) -> Result<Option<RootRecord>, Error> {
+        self.metadata_with_ownership(pool, actor, input, deadline, RootOwnership::Tenant).await
+    }
+
+    /// Read retained-root metadata only when the persisted owner is the
+    /// authenticated actor. The source pin/snapshot are not read for metadata.
+    pub async fn metadata_actor_owned(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingRootRead,
+        deadline: Instant,
+    ) -> Result<Option<RootRecord>, Error> {
+        self.metadata_with_ownership(pool, actor, input, deadline, RootOwnership::Actor).await
+    }
+
+    async fn metadata_with_ownership(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingRootRead,
+        deadline: Instant,
+        ownership: RootOwnership,
+    ) -> Result<Option<RootRecord>, Error> {
         validate_owner_name(&input.owner, &input.name)?;
         validate_root_id(input.root_id)?;
         let deadline = root_deadline(deadline)?;
         let repo = self.preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsRead, deadline).await?;
+        let expected_owner = ownership.owner_id(actor, repo.tenant_id);
         let root = RootRef::new(repo.repository_id, input.root_id, 1).map_err(map_root_error)?;
         let mut client = super::acquire(pool, deadline).await?;
         let tx = super::begin_owned(&mut client, deadline).await?;
@@ -375,7 +501,12 @@ impl PgServingRetentionRoots {
                         actor,
                         &repo,
                         RepoAction::ContentsRead,
-                        &root_scope_from_gate(&repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT)?,
+                        &root_scope_from_gate(
+                            &repo,
+                            RootPurpose::Ci,
+                            PLACEHOLDER_BUSINESS_INTENT,
+                            expected_owner,
+                        )?,
                         self.backend(),
                         None,
                         deadline,
@@ -389,7 +520,12 @@ impl PgServingRetentionRoots {
             };
             let expected_scope = match &record {
                 Some(record) => root_scope_from_record(record)?,
-                None => root_scope_from_gate(&repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT)?,
+                None => root_scope_from_gate(
+                    &repo,
+                    RootPurpose::Ci,
+                    PLACEHOLDER_BUSINESS_INTENT,
+                    expected_owner,
+                )?,
             };
             final_authority_root(
                 &tx,
@@ -402,6 +538,11 @@ impl PgServingRetentionRoots {
                 deadline,
             )
             .await?;
+            if let Some(record) = &record
+                && record.owner_id() != expected_owner
+            {
+                return Err(Error::not_found());
+            }
             Ok::<Option<RootRecord>, Error>(record)
         })
         .await;
@@ -432,6 +573,22 @@ impl PgServingRetentionRoots {
         Ok(self.materialize_with_context(pool, actor, input, deadline).await?.into_view())
     }
 
+    /// Materialize a retained root only when its persisted owner is the
+    /// authenticated actor. The persisted owner is checked before any native
+    /// work and again at T2; the original owner is retained in the context.
+    pub async fn materialize_actor_owned(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingRootRead,
+        deadline: Instant,
+    ) -> Result<RootReadView, Error> {
+        Ok(self
+            .materialize_with_context_for(pool, actor, input, deadline, RootOwnership::Actor)
+            .await?
+            .into_view())
+    }
+
     pub(crate) async fn materialize_with_context(
         &self,
         pool: &Pool,
@@ -439,29 +596,57 @@ impl PgServingRetentionRoots {
         input: ServingRootRead,
         deadline: Instant,
     ) -> Result<ServingRetainedRootReadContext, Error> {
+        self.materialize_with_context_for(pool, actor, input, deadline, RootOwnership::Tenant).await
+    }
+
+    async fn materialize_with_context_for(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingRootRead,
+        deadline: Instant,
+        ownership: RootOwnership,
+    ) -> Result<ServingRetainedRootReadContext, Error> {
         validate_owner_name(&input.owner, &input.name)?;
         validate_root_id(input.root_id)?;
         let deadline = root_deadline(deadline)?;
         let repo = self.preflight(pool, actor, &input.owner, &input.name, RepoAction::ContentsRead, deadline).await?;
+        let expected_owner = ownership.owner_id(actor, repo.tenant_id);
+
+        // Pre-native persisted-owner check. Metadata performs the same Admin
+        // and late ContentsRead authorization but never touches Blob/native
+        // bytes; a wrong-owner or default-mode root is refused here.
+        let metadata = self
+            .metadata_with_ownership(pool, actor, input.clone(), deadline, ownership)
+            .await?;
+        if metadata.is_none() {
+            return Err(Error::not_found());
+        }
+
         let root = RootRef::new(repo.repository_id, input.root_id, 1).map_err(map_root_error)?;
         let view = match self.roots.materialize_serving(pool, root, deadline).await {
             Ok(view) => view,
             Err(error) => {
-                return match self.authorize_current(pool, actor, &repo, deadline).await {
+                return match self.authorize_current(pool, actor, &repo, expected_owner, deadline).await {
                     Ok(()) => Err(map_root_error(error)),
                     Err(auth_error) => Err(auth_error),
                 };
             }
         };
+        if view.scope().owner_id() != expected_owner {
+            return Err(Error::not_found());
+        }
         let cluster = view
             .serving_cluster_incarnation()
             .ok_or_else(|| Error::internal("serving root view has no cluster anchor"))?;
-        self.finish_view(pool, actor, &repo, root, &view, cluster, deadline).await?;
+        self.finish_view(pool, actor, &repo, root, &view, cluster, expected_owner, deadline)
+            .await?;
         Ok(ServingRetainedRootReadContext {
             view,
             root,
             repository_id: repo.repository_id,
             tenant_id: repo.tenant_id,
+            owner_id: expected_owner,
             name: repo.name.clone(),
             cluster_incarnation: cluster,
             deadline,
@@ -493,8 +678,19 @@ impl PgServingRetentionRoots {
         let expected_binding = RequestDigest::from_str(&view.binding_digest_hex())
             .map_err(|_| Error::internal("retained root binding digest is invalid"))?;
         let expected_cluster = context.cluster_incarnation;
-        self.finish_view_state(pool, actor, &repo, root, &view, &scope, expected_binding, expected_cluster, deadline)
-            .await?;
+        self.finish_view_state(
+            pool,
+            actor,
+            &repo,
+            root,
+            &view,
+            &scope,
+            expected_binding,
+            expected_cluster,
+            context.owner_id,
+            deadline,
+        )
+        .await?;
         Ok(view)
     }
 
@@ -505,6 +701,7 @@ impl PgServingRetentionRoots {
         repo: &AuthorizedRootRepo,
         root_id: Uuid,
         input: &ServingRootRelease,
+        expected_owner: Uuid,
         deadline: Instant,
     ) -> Result<RootReceipt, Error> {
         let root = RootRef::new(repo.repository_id, root_id, 1).map_err(map_root_error)?;
@@ -519,7 +716,12 @@ impl PgServingRetentionRoots {
             let record = match PgRetentionRoots::root_record_in_tx(&tx, root).await {
                 Ok(Some(record)) => record,
                 Ok(None) => {
-                    let scope = root_scope_from_gate(repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT)?;
+                    let scope = root_scope_from_gate(
+                        repo,
+                        RootPurpose::Ci,
+                        PLACEHOLDER_BUSINESS_INTENT,
+                        expected_owner,
+                    )?;
                     match final_authority_root(
                         &tx,
                         actor,
@@ -537,7 +739,12 @@ impl PgServingRetentionRoots {
                     }
                 }
                 Err(error) => {
-                    let scope = root_scope_from_gate(repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT)?;
+                    let scope = root_scope_from_gate(
+                        repo,
+                        RootPurpose::Ci,
+                        PLACEHOLDER_BUSINESS_INTENT,
+                        expected_owner,
+                    )?;
                     return match final_authority_root(
                         &tx,
                         actor,
@@ -556,6 +763,20 @@ impl PgServingRetentionRoots {
                 }
             };
             let scope = root_scope_from_record(&record)?;
+            if record.owner_id() != expected_owner {
+                final_authority_root(
+                    &tx,
+                    actor,
+                    repo,
+                    RepoAction::ContentsWrite,
+                    &scope,
+                    self.backend(),
+                    None,
+                    deadline,
+                )
+                .await?;
+                return Err(Error::not_found());
+            }
             let release_digest =
                 derive_release_digest(repo.repository_id, root_id, &input.idempotency_key, &input.reason);
             let release_request_id = derive_release_request_id(repo.repository_id, root_id, &input.idempotency_key);
@@ -623,6 +844,7 @@ impl PgServingRetentionRoots {
         derived: &DerivedIntent,
         scope: &RootsScope,
         input: &ServingRootRelease,
+        expected_owner: Uuid,
         deadline: Instant,
         recheck_existing_on_metadata_miss: bool,
     ) -> Result<RootReceipt, Error> {
@@ -650,7 +872,10 @@ impl PgServingRetentionRoots {
         // Load the original authorized A5 metadata data-only. This proves the
         // stored snapshot/ref/pack rows and current serving realm/backend, but it
         // does not require the source pin to be live.
-        let source = match self.stored_source_snapshot(pool, actor, repo, scope, create, deadline).await {
+        let source = match self
+            .stored_source_snapshot(pool, actor, repo, scope, create, expected_owner, deadline)
+            .await
+        {
             Ok(source) => source,
             Err(error) => {
                 // A concurrent exact create may have committed after the ByIntent
@@ -661,9 +886,14 @@ impl PgServingRetentionRoots {
                 // deadline.
                 if recheck_existing_on_metadata_miss
                     && error.0 == StatusCode::NOT_FOUND
-                    && self.replay_create(pool, actor, repo, scope, create, derived, deadline).await?.is_some()
+                    && self
+                        .replay_create(pool, actor, repo, scope, create, derived, expected_owner, deadline)
+                        .await?
+                        .is_some()
                 {
-                    return self.release_existing(pool, actor, repo, derived.root_id, input, deadline).await;
+                    return self
+                        .release_existing(pool, actor, repo, derived.root_id, input, expected_owner, deadline)
+                        .await;
                 }
                 return Err(error);
             }
@@ -764,6 +994,7 @@ impl PgServingRetentionRoots {
         scope: &RootsScope,
         input: &ServingRootIntent,
         derived: &DerivedIntent,
+        expected_owner: Uuid,
         deadline: Instant,
     ) -> Result<Option<RootReceipt>, Error> {
         let root = RootRef::new(repo.repository_id, derived.root_id, 1).map_err(map_root_error)?;
@@ -799,7 +1030,7 @@ impl PgServingRetentionRoots {
             let Some((record, receipt)) = replay else {
                 return Ok::<Option<RootReceipt>, Error>(None);
             };
-            let exact = record_matches_intent(&record, repo, input, derived);
+            let exact = record_matches_intent(&record, repo, input, derived, expected_owner);
             final_authority_root(&tx, actor, repo, RepoAction::ContentsWrite, scope, self.backend(), None, deadline)
                 .await?;
             if !exact {
@@ -896,6 +1127,7 @@ impl PgServingRetentionRoots {
         repo: &AuthorizedRootRepo,
         scope: &RootsScope,
         intent: &ServingRootIntent,
+        expected_owner: Uuid,
         deadline: Instant,
     ) -> Result<PackReadSnapshot, Error> {
         let mut client = super::acquire(pool, deadline).await?;
@@ -917,7 +1149,23 @@ impl PgServingRetentionRoots {
                 )
                 .await
             {
-                Ok(source) => Ok::<PackReadSnapshot, Error>(source),
+                Ok(source) => {
+                    if source.scope().owner_id() != expected_owner {
+                        final_authority_root(
+                            &tx,
+                            actor,
+                            repo,
+                            RepoAction::ContentsWrite,
+                            scope,
+                            self.backend(),
+                            None,
+                            deadline,
+                        )
+                        .await?;
+                        return Err(Error::not_found());
+                    }
+                    Ok::<PackReadSnapshot, Error>(source)
+                }
                 Err(error) => match final_authority_root(
                     &tx,
                     actor,
@@ -956,6 +1204,7 @@ impl PgServingRetentionRoots {
         repo: &AuthorizedRootRepo,
         scope: &RootsScope,
         intent: &ServingRootIntent,
+        expected_owner: Uuid,
         deadline: Instant,
     ) -> Result<PackReadSnapshot, Error> {
         let mut client = super::acquire(pool, deadline).await?;
@@ -977,7 +1226,23 @@ impl PgServingRetentionRoots {
                 )
                 .await
             {
-                Ok(source) => Ok::<PackReadSnapshot, Error>(source),
+                Ok(source) => {
+                    if source.scope().owner_id() != expected_owner {
+                        final_authority_root(
+                            &tx,
+                            actor,
+                            repo,
+                            RepoAction::ContentsWrite,
+                            scope,
+                            self.backend(),
+                            None,
+                            deadline,
+                        )
+                        .await?;
+                        return Err(Error::not_found());
+                    }
+                    Ok::<PackReadSnapshot, Error>(source)
+                }
                 Err(error) => match final_authority_root(
                     &tx,
                     actor,
@@ -1017,12 +1282,25 @@ impl PgServingRetentionRoots {
         root: RootRef,
         view: &RootReadView,
         cluster: Uuid,
+        expected_owner: Uuid,
         deadline: Instant,
     ) -> Result<(), Error> {
         let scope = *view.scope();
         let binding = RequestDigest::from_str(&view.binding_digest_hex())
             .map_err(|_| Error::internal("retained root binding digest is invalid"))?;
-        self.finish_view_state(pool, actor, repo, root, view, &scope, binding, cluster, deadline).await
+        self.finish_view_state(
+            pool,
+            actor,
+            repo,
+            root,
+            view,
+            &scope,
+            binding,
+            cluster,
+            expected_owner,
+            deadline,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1036,6 +1314,7 @@ impl PgServingRetentionRoots {
         scope: &RootsScope,
         expected_binding: RequestDigest,
         expected_cluster: Uuid,
+        expected_owner: Uuid,
         deadline: Instant,
     ) -> Result<(), Error> {
         let _ = view;
@@ -1083,6 +1362,9 @@ impl PgServingRetentionRoots {
                 deadline,
             )
             .await?;
+            if scope.owner_id() != expected_owner {
+                return Err(Error::not_found());
+            }
             Ok::<(), Error>(())
         })
         .await;
@@ -1104,6 +1386,7 @@ impl PgServingRetentionRoots {
         pool: &Pool,
         actor: &Identity,
         repo: &AuthorizedRootRepo,
+        expected_owner: Uuid,
         deadline: Instant,
     ) -> Result<(), Error> {
         let mut client = super::acquire(pool, deadline).await?;
@@ -1113,7 +1396,7 @@ impl PgServingRetentionRoots {
             drop(client);
             return Err(error);
         }
-        let scope = root_scope_from_gate(repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT)?;
+        let scope = root_scope_from_gate(repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT, expected_owner)?;
         let outcome = timeout_at(deadline, async {
             final_authority_root(&tx, actor, repo, RepoAction::ContentsRead, &scope, self.backend(), None, deadline)
                 .await
@@ -1290,12 +1573,13 @@ fn root_scope(
     repo: &AuthorizedRootRepo,
     purpose: RootPurpose,
     business_intent: &RequestDigest,
+    owner_id: Uuid,
 ) -> Result<RootsScope, Error> {
     let gate = repo.gate()?;
     RootsScope::new(
         repo.repository_id,
         repo.tenant_id,
-        repo.tenant_id,
+        owner_id,
         purpose,
         &business_intent.as_hex(),
         gate.object_format(),
@@ -1310,12 +1594,13 @@ fn root_scope_from_gate(
     repo: &AuthorizedRootRepo,
     purpose: RootPurpose,
     business_intent_hex: &str,
+    owner_id: Uuid,
 ) -> Result<RootsScope, Error> {
     let gate = repo.gate()?;
     RootsScope::new(
         repo.repository_id,
         repo.tenant_id,
-        repo.tenant_id,
+        owner_id,
         purpose,
         business_intent_hex,
         gate.object_format(),
@@ -1345,7 +1630,7 @@ fn root_metadata_scope(scope: &RootsScope) -> Result<MetadataSnapshotScope, Erro
     MetadataSnapshotScope::new(
         scope.repository_id(),
         scope.tenant_id(),
-        scope.tenant_id(),
+        scope.owner_id(),
         MetadataPinPurpose::Verification,
         scope.object_format(),
         scope.history_incarnation(),
@@ -1360,11 +1645,12 @@ fn record_matches_intent(
     repo: &AuthorizedRootRepo,
     intent: &ServingRootIntent,
     derived: &DerivedIntent,
+    expected_owner: Uuid,
 ) -> bool {
     let Ok(gate) = repo.gate() else { return false };
     record.repository_id() == repo.repository_id
         && record.tenant_id() == repo.tenant_id
-        && record.owner_id() == repo.tenant_id
+        && record.owner_id() == expected_owner
         && record.root_id() == derived.root_id
         && record.source_snapshot_id() == intent.source_snapshot_id
         && record.purpose() == intent.purpose
