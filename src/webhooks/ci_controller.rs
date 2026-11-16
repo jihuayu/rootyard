@@ -286,8 +286,8 @@ pub(crate) fn trigger_coalesced_prewarm(
         let Ok(client) = pool.get().await else {
             return;
         };
-        let Ok(row) = client
-            .query_opt(
+        let Ok(rows) = client
+            .query(
                 "SELECT m.url, u.slug, r.name, r.storage_generation \
                  FROM ci_mirror_nodes m \
                  JOIN repositories r ON r.id=m.repository_id \
@@ -299,7 +299,7 @@ pub(crate) fn trigger_coalesced_prewarm(
                    AND m.url = ANY($6::text[]) \
                  ORDER BY (m.capacity - (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
                      AND c.source_url=m.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp()))) DESC, \
-                   m.heartbeat_unix DESC LIMIT 1",
+                   m.heartbeat_unix DESC LIMIT 8",
                 &[&repo_id, &audience, &MIRROR_HEARTBEAT_TTL_SECS, &head_oid, &excluded, &allowed_origins],
             )
             .await
@@ -307,24 +307,18 @@ pub(crate) fn trigger_coalesced_prewarm(
             return;
         };
         drop(client);
-        let Some(row) = row else {
-            return;
-        };
-        let (raw_url, owner, name, generation): (String, String, String, i64) =
-            (row.get(0), row.get(1), row.get(2), row.get(3));
-        let Ok(base) = validate_mirror_url(&raw_url) else {
-            return;
-        };
-        if !allowed_origins.contains(&base) {
-            return;
+        let mut tasks = tokio::task::JoinSet::new();
+        for row in rows {
+            let Ok(base) = validate_mirror_url(row.get::<_, &str>(0)) else { continue };
+            if !allowed_origins.contains(&base) { continue; }
+            let endpoint = format!("{base}/api/repos/{}/{}/mirror-auto-fetch", row.get::<_, &str>(1), row.get::<_, &str>(2));
+            let (tok, oid, generation) = (token.clone(), head_oid.clone(), row.get::<_, i64>(3));
+            tasks.spawn(async move {
+                let _ = PREWARM_CLIENT.post(&endpoint).bearer_auth(tok)
+                    .json(&json!({ "target_oid": oid, "storage_generation": generation })).send().await;
+            });
         }
-        let endpoint = format!("{base}/api/repos/{owner}/{name}/mirror-auto-fetch");
-        let _ = PREWARM_CLIENT
-            .post(&endpoint)
-            .bearer_auth(token)
-            .json(&json!({ "target_oid": head_oid, "storage_generation": generation }))
-            .send()
-            .await;
+        while tasks.join_next().await.is_some() {}
     });
     (false, 0)
 }

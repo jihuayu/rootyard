@@ -55,7 +55,7 @@ pub(crate) async fn list_repo_mirrors(
         .map(|row| {
             let audience: Uuid = row.get("audience");
             MirrorNodeStatus {
-                mirror_id: row.get("mirror_id"),
+                mirror_id: row.get::<_, Uuid>("mirror_id").to_string(),
                 url: row.get("url"),
                 audience,
                 storage_generation: row.get("storage_generation"),
