@@ -307,6 +307,7 @@ def _run(args):
             "checks": binding["checks"],
         },
         "helper_inputs": helper_inputs,
+        "binary_sha256": binary_sha256,
         "binary": {"sha256": binary_sha256},
         "build_receipt": build_receipt,
     }
