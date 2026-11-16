@@ -8,9 +8,10 @@ use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result, ensure};
+use rootyard::blob_store::BlobLocator;
 use rootyard::blob_store::read_accel::{
-    ReadAccelArtifactKind, ReadAccelFallbackReason, ReadAccelObjectFormat, ReadAccelSidecarStatus,
-    verify_and_recover_view_sidecars,
+    ReadAccelArtifactKind, ReadAccelFallbackReason, ReadAccelManifest, ReadAccelMaterializeMetrics,
+    ReadAccelObjectFormat, ReadAccelSidecarStatus, verify_and_recover_view_sidecars,
 };
 
 use super::{LoopbackS3, SampleRepoPacks, assert_git_parity, test_ctx};
@@ -46,8 +47,17 @@ pub(super) async fn fault_injection_drift_missing_corrupt_and_local_cache_recove
     let cached_view = sample.open(&ctx, 1, Some(&bundle), true).await.context("phase: cached open")?;
     ensure!(
         *cached_view.status() == ReadAccelSidecarStatus::Applied,
-        "phase: cached open expected applied, got {}",
-        finite_status_label(cached_view.status())
+        "phase: cached open expected applied, got {} kind={} stage={} detail_class={}",
+        finite_status_label(cached_view.status()),
+        cached_fallback_kind_label(cached_view.status()),
+        cached_fallback_stage_label(
+            cached_view.status(),
+            cached_view.metrics(),
+            &bundle.manifest,
+            &bundle.manifest_locator,
+            true,
+        ),
+        cached_fallback_detail_class(cached_view.status())
     );
     let bm_path = cached_view
         .repo_path()
@@ -159,4 +169,128 @@ fn finite_status_label(status: &ReadAccelSidecarStatus) -> &'static str {
             ReadAccelFallbackReason::GitSidecarVerificationFailed { .. } => "fallback/git-sidecar-verification-failed",
         },
     }
+}
+
+fn cached_corrupt_kind(status: &ReadAccelSidecarStatus) -> Option<ReadAccelArtifactKind> {
+    if let ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(ReadAccelFallbackReason::SidecarArtifactCorrupt {
+        kind,
+        ..
+    }) = status
+    {
+        Some(*kind)
+    } else {
+        None
+    }
+}
+
+fn cached_artifact_kind_label(kind: ReadAccelArtifactKind) -> &'static str {
+    match kind {
+        ReadAccelArtifactKind::Midx => "midx",
+        ReadAccelArtifactKind::Bitmap => "bitmap",
+        ReadAccelArtifactKind::CommitGraph => "commit-graph",
+    }
+}
+
+fn cached_fallback_kind_label(status: &ReadAccelSidecarStatus) -> &'static str {
+    if let ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(reason) = status {
+        match reason {
+            ReadAccelFallbackReason::SidecarArtifactCorrupt { kind, .. } => return cached_artifact_kind_label(*kind),
+            ReadAccelFallbackReason::SidecarArtifactMissing(kind) => return cached_artifact_kind_label(*kind),
+            _ => {}
+        }
+    }
+    "none"
+}
+
+fn cached_fallback_detail_class(status: &ReadAccelSidecarStatus) -> &'static str {
+    if let ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(ReadAccelFallbackReason::SidecarArtifactCorrupt {
+        detail,
+        ..
+    }) = status
+    {
+        match detail.as_str() {
+            "blob operation deadline exceeded" => "blob-deadline",
+            "read-acceleration operation deadline exceeded" => "read-accel-deadline",
+            "blob digest mismatch" => "blob-digest",
+            "read-acceleration sidecar integrity failed: local sidecar SHA-256 or length mismatch" => {
+                "local-digest-or-length"
+            }
+            "invalid bitmap header magic or length" => "bitmap-header",
+            "blob provider error: blob readback task failed" => "readback-task",
+            "blob provider error: blob destination directory failed" => "destination-directory",
+            "blob provider error: blob staging file creation failed" => "staging-create",
+            "blob provider error: blob staging write failed" => "staging-write",
+            "blob provider error: blob staging fsync failed" => "staging-fsync",
+            "blob provider error: blob destination rename failed" => "destination-rename",
+            "blob provider error: blob destination fsync failed" => "destination-fsync",
+            "blob resource limits conflict with the initialized process-wide context" => "resource-context-conflict",
+            "blob locator already exists" => "blob-already-exists",
+            _ => "unknown",
+        }
+    } else {
+        "none"
+    }
+}
+
+fn cached_fallback_stage_label(
+    status: &ReadAccelSidecarStatus,
+    metrics: &ReadAccelMaterializeMetrics,
+    manifest: &ReadAccelManifest,
+    manifest_locator: &BlobLocator,
+    enabled_default_config: bool,
+) -> &'static str {
+    let Some(kind) = cached_corrupt_kind(status) else {
+        return "inconsistent-metrics";
+    };
+    if !enabled_default_config || manifest.artifacts.len() != 3 {
+        return "inconsistent-metrics";
+    }
+    let mut counts = [0usize; 3];
+    for artifact in &manifest.artifacts {
+        let index = match artifact.kind {
+            ReadAccelArtifactKind::Midx => 0,
+            ReadAccelArtifactKind::Bitmap => 1,
+            ReadAccelArtifactKind::CommitGraph => 2,
+        };
+        counts[index] += 1;
+    }
+    if counts != [1, 1, 1] {
+        return "inconsistent-metrics";
+    }
+    let (Some(midx), Some(bitmap), Some(commit_graph)) = (
+        manifest.artifact(ReadAccelArtifactKind::Midx),
+        manifest.artifact(ReadAccelArtifactKind::Bitmap),
+        manifest.artifact(ReadAccelArtifactKind::CommitGraph),
+    ) else {
+        return "inconsistent-metrics";
+    };
+    let artifacts = [midx, bitmap, commit_graph];
+    let mut prefix = [0u64; 3];
+    let mut complete = [0u64; 3];
+    let mut offset = manifest_locator.length();
+    for (index, artifact) in artifacts.iter().enumerate() {
+        prefix[index] = offset;
+        let Some(next) = offset.checked_add(artifact.locator.length) else {
+            return "inconsistent-metrics";
+        };
+        offset = next;
+        complete[index] = offset;
+    }
+    let attempts = metrics.sidecar_get_attempts;
+    let bytes = metrics.sidecar_get_bytes;
+    let index = match kind {
+        ReadAccelArtifactKind::Midx => 0,
+        ReadAccelArtifactKind::Bitmap => 1,
+        ReadAccelArtifactKind::CommitGraph => 2,
+    };
+    if kind == ReadAccelArtifactKind::Bitmap && attempts == 4 && bytes == complete[2] {
+        return "bitmap-post-placement-header";
+    }
+    if attempts == index as u64 + 2 && bytes == prefix[index] {
+        return "download";
+    }
+    if attempts == index as u64 + 2 && bytes == complete[index] {
+        return "downloaded-local-integrity";
+    }
+    "inconsistent-metrics"
 }
