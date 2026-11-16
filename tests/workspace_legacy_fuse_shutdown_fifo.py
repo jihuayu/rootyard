@@ -40,12 +40,26 @@ SERVICE_CLEANUP_INCOMPLETE_MARKERS = (
     "service cleanup incomplete:",
     "normal shutdown incomplete:",
 )
+EXPECTED_PRIMARY_HTTP_STATUS = 400
+EXPECTED_PRIMARY_DISPLAY = "HTTP 400: invalid request"
+_PRIMARY_RESULT_PREFIX = "Error: "
+_EXPECTED_PRIMARY_RESULT = _PRIMARY_RESULT_PREFIX + EXPECTED_PRIMARY_DISPLAY
 _BLOCKED_STATES = frozenset(("S", "D"))
 _OPEN_RETRY_ERRNOS = frozenset((errno.ENXIO, errno.EAGAIN, errno.EINTR))
 _WRITE_CLOSED_ERRNOS = frozenset((errno.EPIPE,))
 _POLL_SECONDS = 0.02
 _STACK_LIMIT = 4096
 _MAX_LOG_BYTES = 4 * 1024 * 1024
+
+
+def _read_bounded_oracle_log(log_path) -> bytes:
+    try:
+        raw = Path(log_path).read_bytes()
+    except OSError:
+        raise LegacyAcceptanceError("service oracle log is unavailable") from None
+    if len(raw) > _MAX_LOG_BYTES:
+        raise LegacyAcceptanceError("service oracle log exceeded the bounded fixture limit")
+    return raw
 
 
 def startup_owner_join_evidence(log_path) -> dict:
@@ -56,12 +70,7 @@ def startup_owner_join_evidence(log_path) -> dict:
     caller separately checks the positive primary exit and the legacy mount
     evidence; this function never stores or returns raw log text.
     """
-    try:
-        raw = Path(log_path).read_bytes()
-    except OSError:
-        raise LegacyAcceptanceError("service startup evidence log is unavailable") from None
-    if len(raw) > _MAX_LOG_BYTES:
-        raise LegacyAcceptanceError("service startup evidence log exceeded the bounded fixture limit")
+    raw = _read_bounded_oracle_log(log_path)
     text = raw.decode("utf-8", "replace")
     for marker in STARTUP_JOIN_FAILURE_MARKERS:
         if marker in text:
@@ -74,6 +83,37 @@ def startup_owner_join_evidence(log_path) -> dict:
                 "service completion reported incomplete cleanup for the blocked startup"
             )
     return {"startup_owner_joined": True, "log_bytes": len(raw)}
+
+
+def primary_result_classifier(log_path) -> dict:
+    """Bind the final application result to the source-known lazy FIFO 400.
+
+    ``Error`` Display is ``HTTP {status}: {static text}`` and Rust's final
+    ``Termination`` report prints ``Error: <Display>`` for the primary error.
+    The unique fresh oracle log must end with the exact static classification
+    emitted when ``lazy::read_manifest`` rejects a non-regular FIFO. Only a
+    boolean and the fixed status code are returned; no log or error text is
+    retained.
+    """
+    text = _read_bounded_oracle_log(log_path).decode("utf-8", "replace")
+    final_result = None
+    for line in text.splitlines():
+        if line.startswith(_PRIMARY_RESULT_PREFIX):
+            final_result = line.rstrip()
+    if final_result is None:
+        raise LegacyAcceptanceError("service emitted no final application error result")
+    if final_result != _EXPECTED_PRIMARY_RESULT:
+        raise LegacyAcceptanceError(
+            "service final application error did not match the expected lazy manifest rejection"
+        )
+    return {"expected_primary": True, "primary_http_status": EXPECTED_PRIMARY_HTTP_STATUS}
+
+
+def assert_expected_primary_result(exit_code, log_path) -> dict:
+    """Require a positive application exit and the exact expected primary."""
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code <= 0:
+        raise LegacyAcceptanceError("service did not exit with a positive application status")
+    return primary_result_classifier(log_path)
 
 
 def assert_startup_not_ready(harness, seconds: float = 0.25) -> dict:

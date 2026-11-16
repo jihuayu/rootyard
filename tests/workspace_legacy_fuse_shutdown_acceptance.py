@@ -590,6 +590,12 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             "SIGTERM during blocked startup did not return a positive application error",
         )
         self.assertNotEqual(code, -signal.SIGTERM, "the service died by SIGTERM instead of an application error")
+        # The unique fresh oracle log, never the preparation instance log, must
+        # carry the exact source-known primary written by the final result path.
+        self.assertNotEqual(
+            self.oracle_log_path, self.log_path, "primary classifier used the preparation log"
+        )
+        primary = legacy_fifo.assert_expected_primary_result(code, self.oracle_log_path)
         self.assertEqual(
             released["bytes_written"],
             len(legacy_fifo.INVALID_MANIFEST),
@@ -636,6 +642,8 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             "fifo_writer_closed": True,
             "fifo_release_seconds": round(release_seconds, 3),
             "startup_owner_joined": bool(startup_join["startup_owner_joined"]),
+            "primary_expected": bool(primary["expected_primary"]),
+            "primary_http_status": int(primary["primary_http_status"]),
             "blocked_workspace_hash": blocked_hash,
         })
 

@@ -442,6 +442,42 @@ class ServiceIdentityTest(unittest.TestCase):
                 ownership.recheck_service_identity(proc, captured)
 
 
+def _oracle_log(test, body):
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    path = Path(directory.name) / "oracle.log"
+    path.write_bytes(body)
+    return path
+
+
+class PrimaryOracleTest(unittest.TestCase):
+    def test_correct_primary_with_positive_exit_is_accepted(self):
+        evidence = fifo.assert_expected_primary_result(
+            1, _oracle_log(self, b"rootyard: evidence\nError: HTTP 400: invalid request\n")
+        )
+        self.assertEqual(evidence, {"expected_primary": True, "primary_http_status": 400})
+
+    def test_positive_exit_with_wrong_or_missing_primary_is_rejected(self):
+        bodies = (
+            b"Error: HTTP 503: service temporarily unavailable\n",
+            b"rootyard: evidence\n",
+            b"rootyard: rejected HTTP 400: invalid request\n",
+            b"Error: HTTP 400: invalid request\n"
+            b"Error: HTTP 503: service temporarily unavailable\n",
+        )
+        for index, body in enumerate(bodies):
+            with self.subTest(index=index):
+                with self.assertRaises(support.LegacyAcceptanceError):
+                    fifo.assert_expected_primary_result(1, _oracle_log(self, body))
+
+    def test_nonpositive_exit_is_rejected_even_with_expected_primary(self):
+        log = _oracle_log(self, b"Error: HTTP 400: invalid request\n")
+        for code in (0, -15, True, None):
+            with self.subTest(code=code):
+                with self.assertRaises(support.LegacyAcceptanceError):
+                    fifo.assert_expected_primary_result(code, log)
+
+
 class ReadinessTest(unittest.TestCase):
     def test_connection_refused_and_200_are_distinguished(self):
         refused = FakeHarness(raise_error=True)
