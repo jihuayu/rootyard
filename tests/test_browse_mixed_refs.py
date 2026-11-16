@@ -30,6 +30,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 import urllib.parse
 from types import SimpleNamespace
 
@@ -756,6 +757,168 @@ class MixedRefWiringTest(unittest.TestCase):
         # The credential copy is per command: the server env is never rewritten
         # (a mutation here used to make the live server look bound to the client).
         self.assertEqual(harness.env, original_env, "git_as must not mutate the server env")
+
+
+class _BaselineClock:
+    """Deterministic monotonic clock advanced only by the helper's poll sleep."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class RefusalBaselineSynchronizationTest(unittest.TestCase):
+    """The policy refusal baseline is fresh, bounded and fail-closed before push."""
+
+    @staticmethod
+    def snapshot(*, highwater=5, refs=None, api_refs=None, journal=None,
+                 state="ready/-", outbox=0):
+        refs = list(refs if refs is not None else [("refs/heads/main", "a" * 40)])
+        return {
+            "operation_highwater": highwater,
+            "refs": refs,
+            "api_refs": list(api_refs if api_refs is not None else refs),
+            "journal": list(journal if journal is not None else []),
+            "state": state,
+            "outbox": outbox,
+            "outcomes": {},
+            "admissions": {},
+        }
+
+    @staticmethod
+    def clock_patch(clock):
+        return mock.patch.object(
+            mixed_ref_support,
+            "time",
+            SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+        )
+
+    def test_delayed_clean_journal_returns_fresh_baseline_before_push(self):
+        refs = [("refs/heads/main", "a" * 40)]
+        feature_oid = "b" * 40
+        after_control_refs = refs + [("refs/heads/mixed-topic", feature_oid)]
+        dirty = self.snapshot(journal=["00000000000000000001-deadbeef"])
+        first_clean = self.snapshot(refs=refs, api_refs=refs, outbox=0)
+        second_clean = self.snapshot(refs=refs, api_refs=refs, outbox=1)
+        after_control = self.snapshot(refs=after_control_refs, api_refs=after_control_refs, outbox=2)
+        states = iter([dirty, first_clean, second_clean, after_control])
+
+        harness = object.__new__(mixed_ref_cases.MixedRefPolicyCases)
+        harness.third = refs[0][1]
+        harness.feature_oid = feature_oid
+        harness.alice = {"username": "alice", "token": "secret"}
+        ref_state_calls = []
+
+        def ref_state():
+            ref_state_calls.append(True)
+            return next(states)
+
+        events = []
+        push_states = []
+        audit_befores = []
+
+        def open_pull(head):
+            events.append(("open_pull", head))
+
+        def push_as_owner(*_refspecs):
+            push_states.append(len(ref_state_calls))
+            events.append(("push", len(ref_state_calls)))
+            return SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
+
+        def assert_push_refusals(_completed, *_refs):
+            return {}
+
+        def assert_one_aborted_refusal(before, label, refs):
+            audit_befores.append((before, label, tuple(refs)))
+            return {}
+
+        def git_as(_token, *args, cwd=None, check=False):
+            events.append(("git_as", args))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        def ref_oids(*names):
+            return {name: harness.feature_oid for name in names}
+
+        harness.ref_state = ref_state
+        harness.advertised_oid = lambda _ref: harness.third
+        harness.commit_over = lambda _base, _text: "c" * 40
+        harness.policy_rule = lambda *_args, **_kwargs: {}
+        harness.assert_rule_state = lambda _expected: None
+        harness.open_pull_for_main = open_pull
+        harness.push_as_owner = push_as_owner
+        harness.assert_push_refusals = assert_push_refusals
+        harness.assert_one_aborted_refusal = assert_one_aborted_refusal
+        harness.git_as = git_as
+        harness.ref_oids = ref_oids
+        harness.remote_oid = lambda _ref: harness.third
+
+        with self.clock_patch(_BaselineClock()):
+            result = harness.policy_group(
+                "refs/heads/main", "refs/heads/mixed-topic", {})
+
+        self.assertEqual(events[0][0], "open_pull")
+        self.assertEqual(push_states, [3])
+        self.assertEqual(len(ref_state_calls), 4)
+        self.assertIs(audit_befores[0][0], second_clean)
+        self.assertIs(audit_befores[1][0], after_control)
+        self.assertEqual(audit_befores[0][1], "policy refusal")
+        self.assertEqual(result["refusal"], {})
+        self.assertIs(mixed_ref_support.audit_git_refusal_interval,
+                      refusal_audit_sql.audit_git_refusal_interval)
+
+    def test_persistent_journal_times_out_before_operation(self):
+        entry = "00000000000000000001-deadbeef"
+        harness = object.__new__(mixed_ref_support.MixedRefSupport)
+        harness.ref_state = lambda: self.snapshot(journal=[entry])
+        forbidden = mock.Mock()
+        with mock.patch.object(mixed_ref_support, "REFUSAL_BASELINE_TIMEOUT_SECONDS", 0.1),              self.clock_patch(_BaselineClock()):
+            with self.assertRaises(AssertionError) as caught:
+                forbidden(harness.await_stable_refusal_baseline())
+        self.assertEqual(forbidden.call_count, 0)
+        message = str(caught.exception)
+        self.assertIn("phase=journal", message)
+        self.assertIn("attempts=3", message)
+        self.assertIn("state=ready", message)
+        self.assertIn("journal_count=1", message)
+        self.assertIn("journal_kind=operation", message)
+        self.assertNotIn(entry, message)
+
+    def test_fenced_state_fails_before_operation(self):
+        harness = object.__new__(mixed_ref_support.MixedRefSupport)
+        harness.ref_state = lambda: self.snapshot(state="recovering/push_outcome_unknown")
+        forbidden = mock.Mock()
+        with self.clock_patch(_BaselineClock()):
+            with self.assertRaises(AssertionError) as caught:
+                forbidden(harness.await_stable_refusal_baseline())
+        self.assertEqual(forbidden.call_count, 0)
+        message = str(caught.exception)
+        self.assertIn("phase=state", message)
+        self.assertIn("attempts=1", message)
+        self.assertIn("state=recovering", message)
+        self.assertIn("journal_count=0", message)
+        self.assertNotIn("push_outcome_unknown", message)
+
+    def test_unstable_causal_keys_fail_before_operation(self):
+        first = self.snapshot(highwater=5)
+        second = self.snapshot(highwater=6)
+        states = iter([first, second] * 3)
+        harness = object.__new__(mixed_ref_support.MixedRefSupport)
+        harness.ref_state = lambda: next(states)
+        forbidden = mock.Mock()
+        with mock.patch.object(mixed_ref_support, "REFUSAL_BASELINE_TIMEOUT_SECONDS", 0.1),              self.clock_patch(_BaselineClock()):
+            with self.assertRaises(AssertionError) as caught:
+                forbidden(harness.await_stable_refusal_baseline())
+        self.assertEqual(forbidden.call_count, 0)
+        message = str(caught.exception)
+        self.assertIn("phase=unstable", message)
+        self.assertIn("attempts=3", message)
+        self.assertIn("state=ready", message)
+        self.assertIn("journal_count=0", message)
 
 
 class _FakeProcess:
