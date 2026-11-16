@@ -16,8 +16,8 @@ use crate::ref_store::raft_backend::outcome::{
     RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusal, RootRefCasRefusalKind,
 };
 use crate::ref_store::raft_backend::proposal::{
-    MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, MAX_ROOT_STATE_BYTES, PROPOSAL_WINDOW, ProposalAttempt,
-    ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup, command_digest_hex,
+    MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, PROPOSAL_WINDOW, ProposalAttempt, ProposalAttemptKind,
+    ProposalEnvelope, ProposalId, ProposalLookup, command_digest_hex,
 };
 use crate::ref_store::raft_backend::scope::{fence_legacy_set_lane, fence_proposal_against_gate};
 
@@ -605,7 +605,8 @@ mod tests {
         RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusal, RootRefCasRefusalKind,
     };
     use crate::ref_store::raft_backend::proposal::{
-        PROPOSAL_WINDOW, ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup, ProposalOutcome,
+        MAX_ROOT_STATE_BYTES, PROPOSAL_WINDOW, ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup,
+        ProposalOutcome,
     };
     use crate::ref_store::{CoreGateInit, RefName};
     use rootyard_refcas_log::state_machine::{ApplicationLogId, ApplicationStateMachine};
@@ -1087,7 +1088,7 @@ mod tests {
         // stop: 4 MiB Root contribution + 32 * 80 KiB receipts remains below 7 MiB.
         assert!(MAX_ROOT_STATE_BYTES + PROPOSAL_WINDOW as usize * MAX_PROPOSAL_RECEIPT_BYTES < MAX_ADAPTER_STATE_BYTES);
 
-        let mut app = RootRefCasStateMachine::new();
+        let app = RootRefCasStateMachine::new();
         let repo = Uuid::from_u128(10);
         let tenant = Uuid::from_u128(20);
         let history = Uuid::from_u128(30);

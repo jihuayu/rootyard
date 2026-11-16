@@ -136,6 +136,9 @@ pub(crate) fn restore_adapter_state(bytes: &[u8]) -> Result<RestoredAdapterState
         if probe.format == ADAPTER_STATE_FORMAT_V2 {
             let state: AdapterStateV2 = serde_json::from_slice(bytes)
                 .map_err(|e| ApplicationError::new(format!("decode legacy /2 adapter state: {e}")))?;
+            if state.format != ADAPTER_STATE_FORMAT_V2 {
+                return Err(ApplicationError::new("legacy /2 adapter format disagrees with its discriminator"));
+            }
             let machine = RefCasStateMachine::restore_bytes(state.root_snapshot.as_bytes())
                 .map_err(|e| ApplicationError::new(format!("restore legacy /2 root snapshot: {e}")))?;
             root_only_state_v3(state.root_snapshot.as_bytes())?;
@@ -302,7 +305,6 @@ mod close_restore_validation;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rootyard_refcas_log::state_machine::ApplicationStateMachine;
 
     #[test]
     fn v3_roundtrip_preserves_root_and_empty_window() {
