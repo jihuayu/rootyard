@@ -1,9 +1,8 @@
 //! Ephemeral isolated PostgreSQL 17 schema helpers for #152 remote authz bridge tests.
 
 use anyhow::{Context, Result};
-use deadpool_postgres::{Manager, Pool};
+use deadpool_postgres::{GenericClient, Manager, Pool};
 use rootyard::db;
-use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
 pub struct TestPgEnv {
@@ -114,7 +113,7 @@ impl TestPgEnv {
 
     pub async fn seed_decision(&self, d: &SeedPgDecision<'_>) -> Result<()> {
         let client = self.pool.get().await?;
-        self.seed_decision_on(&**client, d).await
+        self.seed_decision_on(&*client, d).await
     }
 
     pub async fn seed_decision_on<C: GenericClient + Sync>(&self, client: &C, d: &SeedPgDecision<'_>) -> Result<()> {

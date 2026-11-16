@@ -7,10 +7,11 @@ use zeroize::Zeroizing;
 
 use rootyard::ref_store::contract::IssuerLane;
 use rootyard::ref_store::core::command::CommitRefsRequest;
-use rootyard::ref_store::core::contract::{CommitMode, CoreGate};
+use rootyard::ref_store::core::contract::CommitMode;
 use rootyard::ref_store::core::state_machine::{
-    AcquireHoldBatchCommand, AppliedLogId, InitializeGateCommand, RefCasCommand, RepositoryLane, SmPackMode,
-    WireDecisionKind, WireDecisionScopeDep, WireDecisionVerdict, WireGateInit, WireHoldArtifactSpec,
+    AcquireHoldBatchCommand, AppliedLogId, ApplyResponse, InitializeGateCommand, RefCasCommand, RefCasStateMachine,
+    RepositoryLane, SmPackMode, WireDecisionKind, WireDecisionScopeDep, WireDecisionVerdict, WireGateInit,
+    WireHoldArtifactSpec,
 };
 use rootyard::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefUpdate};
 use rootyard::ref_store::projector::{
@@ -46,19 +47,11 @@ pub fn make_test_keyring(current_key_id: u8) -> DecisionGrantKeyring {
 }
 
 pub fn gate_base_digest_hex(repo: Uuid, realm: &GrantExpectedRealm) -> String {
-    CoreGate::new(
-        repo,
-        realm.tenant_id,
-        GitObjectFormat::Sha256,
-        realm.history_incarnation,
-        realm.authority_epoch,
-        realm.group_epoch,
-        RefName::branch("refs/heads/main").expect("valid branch"),
-        1,
-    )
-    .expect("build canonical gate")
-    .digest()
-    .as_hex()
+    let mut sm = RefCasStateMachine::new();
+    match sm.apply(log_id(1), init_gate_cmd(repo, realm, 1)).expect("init gate for digest") {
+        ApplyResponse::GateInitialized { version, .. } => version.digest().as_hex(),
+        other => panic!("unexpected init gate response: {other:?}"),
+    }
 }
 
 pub fn init_gate_cmd(repo: Uuid, realm: &GrantExpectedRealm, authz_floor: i64) -> RefCasCommand {
