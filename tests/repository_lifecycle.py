@@ -907,9 +907,21 @@ class RepositoryLifecycleHarness(BrowserHarness):
             extra_headers={"Idempotency-Key": "parity-rename-1"},
         )
 
-        bob_triage_pulls_w = self.issue_scoped_token(
-            self.bob, "par-bob-pw", [{"repository_id": repo["id"], "actions": ["pulls_write"]}]
+        # Triage cannot mint a scoped `pulls_write` grant (`repository_min_role(PullsWrite) == Write`),
+        # so triage alias review checks use bob's unscoped PAT while `bob_triage_repo_r` verifies missing scope 403.
+        st_bad_grant, _, _ = self.http(
+            "/api/tokens",
+            token=self.bob,
+            method="POST",
+            body={
+                "display_name": "par-bob-pw-denied",
+                "expires_in_days": 7,
+                "read_only": False,
+                "repository_grants": [{"repository_id": repo["id"], "actions": ["pulls_write"]}],
+                "namespace_grants": [],
+            },
         )
+        assert st_bad_grant == 403, st_bad_grant
         bob_triage_repo_r = self.issue_scoped_token(
             self.bob, "par-bob-rr", [{"repository_id": repo["id"], "actions": ["repo_read"]}]
         )
@@ -929,7 +941,7 @@ class RepositoryLifecycleHarness(BrowserHarness):
             self.alice, "par-al-admin", [{"repository_id": repo["id"], "actions": ["repo_admin"]}]
         )
 
-        # Reviews: triage+pulls_write allowed only for state=commented across API, /web, and /ui;
+        # Reviews: triage allowed only for state=commented across API, /web, and /ui;
         # approved/changes_requested require Role::Write+pulls_write; oversized (>64KiB) -> 413 after auth.
         comment_body = {"state": "commented", "commit_oid": head_oid, "body": "lgtm comment"}
         approve_body = {"state": "approved", "commit_oid": head_oid, "body": "approved"}
@@ -937,19 +949,19 @@ class RepositoryLifecycleHarness(BrowserHarness):
 
         st_api_triage_c, _, hdr_api_c = self.raw_http(
             f"/api/repos/alice/parity-old/pulls/{pr_num}/reviews",
-            token=bob_triage_pulls_w,
+            token=self.bob,
             method="POST",
             body=comment_body,
         )
         assert st_api_triage_c == 308 and hdr_api_c.get("location") == (
             f"/api/repos/alice/parity-canon/pulls/{pr_num}/reviews"
         ), (st_api_triage_c, hdr_api_c)
-        self.doc(hdr_api_c["location"], 201, token=bob_triage_pulls_w, method="POST", body=comment_body)
+        self.doc(hdr_api_c["location"], 201, token=self.bob, method="POST", body=comment_body)
 
         for denied_body in (approve_body, changes_body):
             st_deny, _, _ = self.raw_http(
                 f"/api/repos/alice/parity-old/pulls/{pr_num}/reviews",
-                token=bob_triage_pulls_w,
+                token=self.bob,
                 method="POST",
                 body=denied_body,
             )
@@ -1002,7 +1014,7 @@ class RepositoryLifecycleHarness(BrowserHarness):
         )
         assert st_bad_state == 400, st_bad_state
 
-        bob_cookies, _, _ = self.sign_in(username="bob", token=bob_triage_pulls_w["token"])
+        bob_cookies, _, _ = self.sign_in(username="bob", token=self.bob["token"])
         bob_web_hdrs = {"Origin": self.base, "x-csrf-token": bob_cookies["rootyard_csrf"]}
         charlie_cookies, _, _ = self.sign_in(username="charlie", token=charlie_write_pulls_w["token"])
         charlie_web_hdrs = {"Origin": self.base, "x-csrf-token": charlie_cookies["rootyard_csrf"]}
