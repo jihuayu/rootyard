@@ -713,18 +713,38 @@ async fn rotate_vault_kms_key_with_options(
         envelopes.push(updated);
     }
     session.acquire_publication_exclusive(repo).await?;
-    for pack in &packs {
-        let env = load_authoritative_envelope(c, &config.root, repo, pack).await?;
-        ensure!(
-            env.provider_kind == provider::PROVIDER_KIND_VAULT
-                && env.key_id == cp.to_key_id
-                && env.key_version == cp.expected_version(),
-            "final Vault envelope target mismatch for pack {}",
-            pack.id
-        );
-        let cipher = read_pack_cipher(&s_root, repo, pack)?;
-        verify_rewrapped_pack(&config.root, repo, pack, &env, &cipher).await?;
+    let fresh_packs = load_repo_packs(c, repo).await?;
+    cp.target_pack_ids = fresh_packs.iter().map(|pack| pack.id).collect();
+    cp.completed_pack_ids.clear();
+    let mut verified_envelopes = Vec::with_capacity(fresh_packs.len());
+    for pack in &fresh_packs {
+        let result = async {
+            let env = load_authoritative_envelope(c, &config.root, repo, pack).await?;
+            ensure!(
+                env.provider_kind == provider::PROVIDER_KIND_VAULT
+                    && env.key_id == cp.to_key_id
+                    && env.key_version == cp.expected_version(),
+                "final Vault envelope target mismatch for pack {}",
+                pack.id
+            );
+            let cipher = read_pack_cipher(&s_root, repo, pack)?;
+            verify_rewrapped_pack(&config.root, repo, pack, &env, &cipher).await?;
+            Ok::<_, anyhow::Error>(env)
+        }
+        .await;
+        match result {
+            Ok(env) => {
+                cp.completed_pack_ids.push(pack.id);
+                verified_envelopes.push(env);
+            }
+            Err(error) => {
+                cp.failed_pack_id = Some(pack.id);
+                persist_checkpoint(c, kms_dir, &cp).await?;
+                return Err(error.context(format!("final Vault rotation rescan remains resumable at pack {}", pack.id)));
+            }
+        }
     }
+    envelopes = verified_envelopes;
     let (latest, min_encryption) = vault.latest_and_min_encryption().await?;
     ensure_target_available(cp.expected_version(), latest, min_encryption)?;
     cp.state = "COMPLETED".to_owned();
@@ -737,7 +757,7 @@ async fn rotate_vault_kms_key_with_options(
         previous_key_version: cp.from_key_version,
         new_key_id: cp.to_key_id,
         new_key_version: cp.to_key_version,
-        envelopes_rewrapped: envelopes.len(),
+        envelopes_rewrapped: rewrapped_this_run,
         envelopes_verified: envelopes.len(),
         envelopes,
     })
@@ -932,17 +952,38 @@ pub async fn rotate_kms_key_with_options(
     }
 
     session.acquire_publication_exclusive(repo).await?;
-    for pack in &packs {
-        let env = load_authoritative_envelope(&c, &config.root, repo, pack).await?;
-        ensure!(
-            env.provider_kind == super::provider::PROVIDER_KIND_LOCAL
-                && env.key_id == cp.to_key_id
-                && env.key_version == cp.to_key_version,
-            "final Local envelope target mismatch for pack {}",
-            pack.id
-        );
-        verify_pack_ciphertext_open(&provider, &s_root, repo, pack, &env).await?;
+    let base_client = session.client();
+    let fresh_packs = load_repo_packs(base_client, repo).await?;
+    cp.target_pack_ids = fresh_packs.iter().map(|pack| pack.id).collect();
+    cp.completed_pack_ids.clear();
+    let mut verified_envelopes = Vec::with_capacity(fresh_packs.len());
+    for pack in &fresh_packs {
+        let result = async {
+            let env = load_authoritative_envelope(base_client, &config.root, repo, pack).await?;
+            ensure!(
+                env.provider_kind == super::provider::PROVIDER_KIND_LOCAL
+                    && env.key_id == cp.to_key_id
+                    && env.key_version == cp.to_key_version,
+                "final Local envelope target mismatch for pack {}",
+                pack.id
+            );
+            verify_pack_ciphertext_open(&provider, &s_root, repo, pack, &env).await?;
+            Ok::<_, anyhow::Error>(env)
+        }
+        .await;
+        match result {
+            Ok(env) => {
+                cp.completed_pack_ids.push(pack.id);
+                verified_envelopes.push(env);
+            }
+            Err(error) => {
+                cp.failed_pack_id = Some(pack.id);
+                persist_checkpoint(base_client, kms_dir, &cp).await?;
+                return Err(error.context(format!("final Local rotation rescan remains resumable at pack {}", pack.id)));
+            }
+        }
     }
+    envelopes = verified_envelopes;
     cp.state = "COMPLETED".to_owned();
     cp.failed_pack_id = None;
     persist_checkpoint(&c, &kms_dir, &cp).await?;
@@ -957,7 +998,7 @@ pub async fn rotate_kms_key_with_options(
         previous_key_version: cp.from_key_version,
         new_key_id: cp.to_key_id,
         new_key_version: cp.to_key_version,
-        envelopes_rewrapped: envelopes.len(),
+        envelopes_rewrapped: rewrapped_this_run,
         envelopes_verified: envelopes.len(),
         envelopes,
     })
