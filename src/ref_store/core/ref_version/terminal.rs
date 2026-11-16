@@ -4,7 +4,7 @@ use super::contract::{OperationDigest, RefVersionCodecError, RefVersionRealm};
 use super::digest::{
     CanonicalWriter, ensure_present_oid, format_tag, hash_sha256, push_oid, require_non_nil, validate_realm,
 };
-use super::limits::{MAX_COMMIT_SET_REFS, count_u32, positive_u64};
+use super::limits::{MAX_COMMIT_SET_REFS, MAX_VERSION_TERMINAL_BYTES, count_u32, positive_u64};
 use super::reasons::CausalRejectCode;
 use crate::ref_store::core::types::{GitOid, RefName};
 use std::collections::{BTreeMap, BTreeSet};
@@ -191,6 +191,13 @@ pub fn encode_terminal(input: &VersionTerminalInput) -> Result<EncodedTerminal, 
         }
     }
     let bytes = writer.into_bytes();
+    if bytes.len() > MAX_VERSION_TERMINAL_BYTES {
+        return Err(RefVersionCodecError::Capacity {
+            field: "terminal_bytes",
+            limit: MAX_VERSION_TERMINAL_BYTES,
+            actual: bytes.len(),
+        });
+    }
     let digest = TerminalDigest(hash_sha256(&bytes));
     Ok(EncodedTerminal { bytes, digest })
 }

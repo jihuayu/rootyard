@@ -221,6 +221,21 @@ Every committed version batch has one `CommitSet`. Canonical encoding: `L(x)=u64
 `T = L("ry-version-terminal-v1") || u8(commit_set_tag) [|| L(CommitSetId)] || L(tenant) || L(repo) || L(history) || u8(authority) || u64(authority_epoch) || u64(group_id) || u64(group_epoch) || u8(object_format) || u64(authority_seq) || L(operation_id) || L(operation_digest) || u8(terminal_kind) || result-list`.
 `result-entry = L(ref_name)||u8(outcome)||u8(old_tag)||[L(old_oid)]||u8(new_tag)||[L(new_oid)]||L(reason)`; `TerminalDigest = SHA-256(T)`. `T` is the exact ACK/replay body; a JSON wrapper may store it as base64 but must not re-encode it. `T` contains CommitSetId when `commit_set_tag=1`; it never contains TerminalDigest. A commit-set row may store TerminalDigest as an integrity column, but CommitSetId does not hash it. Order: versions/head -> CS/CommitSetId -> T/TerminalDigest -> rows+terminal -> ACK. The graph is acyclic.
 
+The raw canonical terminal bytes `T` are capped at **65,536 bytes**
+(`MAX_VERSION_TERMINAL_BYTES`). The pure encoder assembles the canonical
+preimage, rejects `T` over that size **before SHA-256**, and returns the
+existing typed `RefVersionCodecError::Capacity { field: "terminal_bytes",
+limit: 65_536, actual }`; no `TerminalDigest` or `EncodedTerminal` exists for
+an oversized input. This is an aggregate terminal-byte bound in addition to,
+not a replacement for, the 128-result count bound.
+
+Base64 of a 65,536-byte `T` is 87,384 bytes before any JSON wrapper overhead, so
+the exact-limit terminal cannot fit the existing legacy 64 KiB
+`TerminalResult::json` envelope. Future C2 must use a byte-preserving,
+separately bounded v2 terminal store (or explicitly justified wrapper
+headroom). The legacy v1 request identity, JSON ceiling and replay rendering
+remain unchanged.
+
 #### 2.5.1 Result semantics and terminal invariants
 
 `result-list` is `u32_be(count)` followed by every original request ref exactly
@@ -510,6 +525,13 @@ persisted terminal. A lost ACK therefore cannot become a second commit.
 The required order is:
 
 1. **Prepare.** Authorize the real actor, create/replay the exact pending operation, capture the current `RefHead`/gate revision and expected base, and freeze the old-OID/lease expectation. No ref/version is written. A changed gate/base makes the operation stale; do not mint a silent second operation.
+
+   Before that mutation-capable prepare creates any operation/pending row,
+   A3 hold, Blob upload, decision install or version/head write, future C2 must
+   compute a conservative worst-case raw `T` size from the frozen request and
+   reject an oversized request through the typed request-refusal path. The
+   later exact `encode_terminal` byte guard is the final codec check, not a
+   substitute for this pre-mutation ordering.
 2. **Durable bytes + holds.** A3 acquire/consume durable Blob holds before upload; upload each pack/idx to a unique attempt locator; fully read back length, SHA-256 and the actually opened backend. A4 registration binds the exact pair, both holds, planned content and parent digest. A missing/failed registration leaves retained holds and no publishable version; provider success is not a byte proof.
 3. **Proof + decisions.** Capture the authoritative base and candidate dependency versions/packs; pin/hold old packs through proof and commit. Verify full native connectivity, exact ref/HEAD result, exact accepted set, dependency realms and all bounds. The verifier selects exact OBJECT dependencies; the plan/proof binds them. A PG single-use decision or [PROPOSED/RAFT] signed grant binds operation, realm, base, selection, proof and deps. No ref mutation precedes this step.
 4. **Authoritative atomic commit.** PG: one short transaction takes the 138 operation/lane prefix, repository/usage/gate locks, rechecks base/dependencies, writes ref heads/current refs + version rows + commit set + edges + membership + terminal + event, and consumes the decision. Raft: one deterministic applied command validates local head/realm/grant/dependency indexes and writes the same logical records; no PG query, Blob read or native child in apply.

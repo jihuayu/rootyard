@@ -2,7 +2,8 @@
 //! `docs/ref-version-pack-contract.md`.
 use super::commit_set::{CommitSetHead, CommitSetInput, CommitSetVersionEntry, encode_commit_set};
 use super::contract::{
-    AuthorityKind, OperationDigest, OperationDigestInput, RefVersionIntent, RefVersionKind, RefVersionRealm, VersionId,
+    AuthorityKind, OperationDigest, OperationDigestInput, RefVersionCodecError, RefVersionIntent, RefVersionKind,
+    RefVersionRealm, VersionId,
 };
 use super::digest::{derive_candidate_version_id, operation_digest};
 use super::pack_set::{PackSetEntry, compute_pack_set_digest};
@@ -11,6 +12,7 @@ use super::record::{VersionRecord, VersionRecordInput};
 use super::terminal::{
     VersionResultEntry, VersionResultOutcome, VersionTerminalInput, VersionTerminalKind, encode_terminal,
 };
+use super::MAX_VERSION_TERMINAL_BYTES;
 use crate::ref_store::contract::{IssuerLane, RequestDigest};
 use crate::ref_store::core::pack_commit::PackCommitRejectCode;
 use crate::ref_store::core::publication_decision::codes::DecisionRejectCode;
@@ -33,6 +35,50 @@ fn synthetic_realm() -> RefVersionRealm {
 
 fn sha1(byte: u8) -> GitOid {
     GitOid::Sha1([byte; 20])
+}
+
+/// Real 128-ref rejected terminal input at the raw T byte boundary.
+fn terminal_budget_input(long_name_extra: usize) -> VersionTerminalInput {
+    let segment = "a".repeat(250);
+    let tail = "b".repeat(10);
+    let mut names = Vec::with_capacity(128);
+    for index in 0..52 {
+        let mut name = format!("refs/x{index:03}");
+        for _ in 0..4 {
+            name.push('/');
+            name.push_str(&segment);
+        }
+        name.push('/');
+        name.push_str(&tail);
+        assert_eq!(name.len(), 1024);
+        names.push(name);
+    }
+    names.push(format!("refs/x052/{}{}", "c".repeat(133), "d".repeat(long_name_extra)));
+    for index in 53..128 {
+        names.push(format!("refs/x{index:03}"));
+    }
+    assert_eq!(names.len(), 128);
+    assert_eq!(names.iter().map(String::len).sum::<usize>(), 54_066 + long_name_extra);
+    let results = names
+        .into_iter()
+        .map(|name| {
+            VersionResultEntry::new(
+                RefName::new(name).unwrap(),
+                VersionResultOutcome::NotApplied(CausalRejectCode::PolicyDenied),
+                Some(sha1(0x44)),
+                Some(sha1(0x33)),
+            )
+        })
+        .collect();
+    VersionTerminalInput {
+        realm: synthetic_realm(),
+        authority_seq: 42,
+        operation_id: Uuid::from_bytes(4_u128.to_be_bytes()),
+        operation_digest: OperationDigest::from_test_bytes([0x11; 32]),
+        terminal_kind: VersionTerminalKind::Rejected,
+        commit_set_id: None,
+        results,
+    }
 }
 
 #[test]
@@ -324,4 +370,22 @@ fn reason_vocabulary_and_refinements_are_closed() {
     assert!(CausalRejectCode::parse("has:colon").is_err());
     let _ = CausalRejectCode::from_commit_reject_code(CommitRejectCode::OldOidMismatch);
     assert_eq!(CausalRejectCode::from_pack_commit_reject_code(PackCommitRejectCode::LedgerIntegrity), None);
+}
+
+#[test]
+fn terminal_bytes_boundary_is_exact_and_typed() {
+    assert_eq!(MAX_VERSION_TERMINAL_BYTES, 65_536);
+    let exact = encode_terminal(&terminal_budget_input(0)).unwrap();
+    assert_eq!(exact.bytes().len(), 65_536);
+    assert_eq!(exact.digest().as_hex(), "c04a91f6fc0b74f88c46bf70aa381e080f6f68b99be3603ec6b695c806cc9932");
+
+    let over = encode_terminal(&terminal_budget_input(1)).unwrap_err();
+    match over {
+        RefVersionCodecError::Capacity { field, limit, actual } => {
+            assert_eq!(field, "terminal_bytes");
+            assert_eq!(limit, MAX_VERSION_TERMINAL_BYTES);
+            assert_eq!(actual, 65_537);
+        }
+        other => panic!("expected terminal_bytes Capacity, got {other:?}"),
+    }
 }
