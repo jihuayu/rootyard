@@ -191,3 +191,94 @@ class PostgresOwnershipStateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RootCreationOwnershipTest(unittest.TestCase):
+    def test_chmod_failure_registers_exact_root_and_cleanup_removes_it(self):
+        with tempfile.TemporaryDirectory() as base:
+            root = resources.OwnedRoot(nonce="b" * 12, base=base)
+            with mock.patch.object(Path, "chmod", side_effect=OSError("denied")):
+                with self.assertRaises(FixtureError) as caught:
+                    root.create()
+            self.assertEqual(caught.exception.code, "root_post_create_failed")
+            self.assertTrue(root.created)
+            self.assertTrue(root.ownership_verified)
+            self.assertIsNotNone(root.creation_proof)
+            self.assertTrue(root.path.exists())
+            self.assertTrue(root.remove())
+            self.assertFalse(root.path.exists())
+            self.assertTrue(root.safe_record()["removed"])
+
+    def test_stat_failure_retains_path_and_cleanup_does_not_pretend_absent(self):
+        with tempfile.TemporaryDirectory() as base:
+            root = resources.OwnedRoot(nonce="c" * 12, base=base)
+            with mock.patch.object(Path, "stat", side_effect=OSError("denied")):
+                with self.assertRaises(FixtureError) as caught:
+                    root.create()
+            self.assertEqual(caught.exception.code, "root_ownership_unverified")
+            self.assertTrue(root.created)
+            self.assertFalse(root.ownership_verified)
+            self.assertTrue(root.path.exists())
+            self.assertFalse(root.safe_record()["removed"])
+            self.assertTrue(root.remove())
+            self.assertFalse(root.path.exists())
+
+    def test_permission_verification_failure_keeps_registered_root(self):
+        with tempfile.TemporaryDirectory() as base:
+            root = resources.OwnedRoot(nonce="d" * 12, base=base)
+            with mock.patch.object(resources.stat, "S_IMODE", return_value=0o755):
+                with self.assertRaises(FixtureError) as caught:
+                    root.create()
+            self.assertEqual(caught.exception.code, "root_permissions_invalid")
+            self.assertTrue(root.created)
+            self.assertFalse(root.private_permissions)
+            self.assertTrue(root.path.exists())
+            self.assertTrue(root.remove())
+            self.assertFalse(root.path.exists())
+
+    def test_mkdtemp_without_ack_never_pretends_owned(self):
+        with tempfile.TemporaryDirectory() as base:
+            root = resources.OwnedRoot(nonce="e" * 12, base=base)
+            with mock.patch.object(
+                    resources.tempfile, "mkdtemp",
+                    side_effect=OSError("unavailable")):
+                with self.assertRaises(FixtureError) as caught:
+                    root.create()
+            self.assertEqual(caught.exception.code, "root_create_failed")
+            self.assertFalse(root.created)
+            self.assertIsNone(root.path)
+            self.assertTrue(root.remove())
+            self.assertTrue(root.removed)
+
+    def test_inode_replacement_is_refused_not_deleted(self):
+        with tempfile.TemporaryDirectory() as base:
+            root = resources.OwnedRoot(nonce="f" * 12, base=base)
+            path = root.create()
+            backup = Path(base) / "owned-backup"
+            path.rename(backup)
+            replacement = Path(path)
+            replacement.mkdir()
+            with self.assertRaises(FixtureError) as caught:
+                root.remove()
+            self.assertEqual(caught.exception.code, "root_identity_mismatch")
+            self.assertTrue(replacement.exists())
+            shutil.rmtree(replacement)
+            backup.rename(path)
+            self.assertTrue(root.remove())
+            self.assertFalse(path.exists())
+
+    def test_private_mode_owner_and_creation_proof_are_recorded(self):
+        with tempfile.TemporaryDirectory() as base:
+            root = resources.OwnedRoot(nonce="a" * 12, base=base)
+            path = root.create()
+            self.assertEqual(stat_mode(path), 0o700)
+            self.assertEqual(root.creation_proof["st_uid"], os.getuid())
+            self.assertIn("st_dev", root.creation_proof)
+            self.assertIn("st_ino", root.creation_proof)
+            self.assertTrue(root.safe_record()["creation_proof_recorded"])
+            self.assertTrue(root.safe_record()["private_permissions"])
+            self.assertTrue(root.remove())
+
+
+def stat_mode(path):
+    return Path(path).stat().st_mode & 0o777

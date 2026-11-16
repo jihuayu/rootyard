@@ -318,6 +318,7 @@ ALLOWED_KEYS = {
     "root_absent", "cleanup_ok", "server_stopped", "pg_major", "loopback",
     "owned", "prechecked_absent", "created", "dropped", "removed",
     "create_acknowledged", "creation_outcome", "identity_oid",
+    "ownership_verified", "creation_proof_recorded", "private_permissions",
     "identity_verified",
     "absolute_private_root", "raw_logs_persisted", "no_global_cleanup",
     "credential_released",

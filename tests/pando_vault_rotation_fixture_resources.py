@@ -16,9 +16,11 @@ temporary-file, PostgreSQL or Docker cleanup path.
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import re
 import secrets
 import shutil
+import stat
 import tempfile
 import urllib.parse
 
@@ -254,25 +256,76 @@ class OwnedRoot:
         self.base = Path(base or tempfile.gettempdir()).resolve()
         self.prefix = ROOT_PREFIX + self.nonce + "-"
         self.path = None
+        self.creation_proof = None
         self.created = False
+        self.ownership_verified = False
+        self.private_permissions = False
         self.removed = False
 
     def create(self):
         _require(not self.created, "root_already_created")
-        path = Path(tempfile.mkdtemp(prefix=self.prefix, dir=str(self.base)))
-        path.chmod(0o700)
-        self.path = path.resolve()
+        try:
+            path = Path(tempfile.mkdtemp(prefix=self.prefix, dir=str(self.base)))
+        except OSError:
+            raise FixtureError("root_create_failed") from None
+        # Register the exact mkdtemp result before chmod/stat verification can
+        # fail.  A post-create failure must remain visible to cleanup.
+        self.path = path
         self.created = True
-        return self.path
+        self.creation_proof = {
+            "base": str(self.base),
+            "name": path.name,
+            "prefix": self.prefix,
+            "nonce": self.nonce,
+        }
+        try:
+            current = path.stat()
+            self.creation_proof.update({
+                "st_dev": current.st_dev,
+                "st_ino": current.st_ino,
+                "st_uid": current.st_uid,
+            })
+            _require(current.st_uid == os.getuid(), "root_ownership_unverified")
+            self.ownership_verified = True
+        except OSError:
+            raise FixtureError("root_ownership_unverified") from None
+        try:
+            path.chmod(0o700)
+            mode = stat.S_IMODE(path.stat().st_mode)
+            _require(mode == 0o700, "root_permissions_invalid")
+            self.private_permissions = True
+            return path.resolve()
+        except FixtureError:
+            raise
+        except OSError:
+            raise FixtureError("root_post_create_failed") from None
 
     def remove(self):
         if not self.created:
             self.removed = True
             return True
         _require(self.path is not None, "root_path_missing")
-        resolved = self.path.resolve()
+        _require(self.creation_proof is not None, "root_creation_proof_missing")
+        try:
+            resolved = self.path.resolve()
+        except OSError:
+            raise FixtureError("root_path_unresolved") from None
         _require(resolved.parent == self.base, "root_path_parent_mismatch")
-        _require(resolved.name.startswith(self.prefix), "root_path_prefix_mismatch")
+        _require(resolved.name == self.creation_proof["name"]
+                 and resolved.name.startswith(self.prefix),
+                 "root_path_prefix_mismatch")
+        if not resolved.exists():
+            self.removed = True
+            return True
+        proof_dev = self.creation_proof.get("st_dev")
+        proof_ino = self.creation_proof.get("st_ino")
+        if proof_dev is not None and proof_ino is not None:
+            try:
+                current = resolved.stat()
+            except OSError:
+                raise FixtureError("root_identity_unreadable") from None
+            _require(current.st_dev == proof_dev and current.st_ino == proof_ino,
+                     "root_identity_mismatch")
         shutil.rmtree(resolved)
         _require(not resolved.exists(), "root_remove_unverified")
         self.removed = True
@@ -283,6 +336,9 @@ class OwnedRoot:
             "owned": self.created,
             "absolute_private_root": bool(
                 self.created and self.path is not None and self.path.is_absolute()),
+            "ownership_verified": self.ownership_verified,
+            "creation_proof_recorded": self.creation_proof is not None,
+            "private_permissions": self.private_permissions,
             "created": self.created,
             "removed": self.removed,
         }
