@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, StatusCode};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -114,12 +114,9 @@ impl RaftSessionRealm {
         if self.group_id < 0 || self.group_epoch < 1 || self.authority_epoch < 1 {
             return Err(SessionFenceError::InvalidInput("group/authority epochs must be >= 1 and group_id >= 0"));
         }
-        if self.history_incarnation.is_nil()
-            || self.authority_id.is_nil()
-            || self.cluster_incarnation.is_nil()
-            || self.tenant_id.is_nil()
-            || self.repository_id.is_nil()
-        {
+        let ids =
+            [self.history_incarnation, self.authority_id, self.cluster_incarnation, self.tenant_id, self.repository_id];
+        if ids.iter().any(Uuid::is_nil) {
             return Err(SessionFenceError::InvalidInput("realm UUID fields must be non-nil"));
         }
         Ok(())
@@ -418,11 +415,10 @@ pub fn evaluate_raft_read(
         }
         None => None,
     };
-    let next_log_index = presented_bound
-        .as_ref()
-        .map_or(proof.last_applied_log_index, |b| proof.last_applied_log_index.max(b.raft_log_index));
-    let next_version =
-        presented_bound.as_ref().map_or(proof.repo_ref_version, |b| proof.repo_ref_version.max(b.repo_ref_version));
+    let (next_log_index, next_version) = match &presented_bound {
+        Some(b) => (proof.last_applied_log_index.max(b.raft_log_index), proof.repo_ref_version.max(b.repo_ref_version)),
+        None => (proof.last_applied_log_index, proof.repo_ref_version),
+    };
     let session_token = codec.mint_token(&proof.realm, next_log_index, next_version, now_unix)?;
     Ok(AdmittedRaftRead {
         realm: proof.realm.clone(),
@@ -452,10 +448,18 @@ where
     let deadline = Instant::now() + wait_budget;
     let mut target_leader: Option<u64> = None;
     let mut redirects = 0usize;
-
     loop {
-        match probe(target_leader).await? {
+        if !wait_budget.is_zero() && Instant::now() >= deadline {
+            return Err(SessionFenceError::QuorumUnavailable("raft ReadIndex wait budget exceeded".into()));
+        }
+        let outcome = timeout_at(deadline, probe(target_leader))
+            .await
+            .map_err(|_| SessionFenceError::QuorumUnavailable("raft ReadIndex wait budget exceeded".into()))??;
+        match outcome {
             RaftProbeOutcome::Ready(proof) => {
+                if !wait_budget.is_zero() && Instant::now() > deadline {
+                    return Err(SessionFenceError::QuorumUnavailable("raft ReadIndex wait budget exceeded".into()));
+                }
                 match evaluate_raft_read(access, codec, &proof, presented_token, current_unix_seconds()) {
                     Ok(admitted) => return Ok(admitted),
                     Err(err @ SessionFenceError::BehindLowerBound { .. }) => {
@@ -468,9 +472,8 @@ where
             }
             RaftProbeOutcome::ForwardToLeader(leader_id) => {
                 if redirects >= max_redirects || Instant::now() >= deadline {
-                    return Err(SessionFenceError::QuorumUnavailable(format!(
-                        "leader redirect budget exhausted targeting node {leader_id}"
-                    )));
+                    let msg = format!("leader redirect budget exhausted targeting node {leader_id}");
+                    return Err(SessionFenceError::QuorumUnavailable(msg));
                 }
                 target_leader = Some(leader_id);
                 redirects += 1;

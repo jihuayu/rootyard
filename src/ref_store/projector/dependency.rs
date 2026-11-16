@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
@@ -267,10 +267,31 @@ pub async fn await_projected_event(
     target.validate()?;
     let deadline = Instant::now() + wait_timeout;
     let poll = poll_interval.max(Duration::from_millis(5));
+    let timeout_err = |reason: String| ProjectionDependencyError::Timeout {
+        group_id: target.realm.group_id,
+        history_incarnation: target.realm.history_incarnation,
+        min_log_index: target.min_log_index,
+        min_event_seq: target.min_event_seq,
+        last_reason: reason,
+    };
     loop {
-        let client = pool.get().await.map_err(|e| ProjectionDependencyError::Database(e.to_string()))?;
-        match verify_projection_dependency(&**client, target).await {
-            Ok(verified) => return Ok(verified),
+        if !wait_timeout.is_zero() && Instant::now() >= deadline {
+            return Err(timeout_err("projection dependency wait budget exceeded".into()));
+        }
+        let client = timeout_at(deadline, pool.get())
+            .await
+            .map_err(|_| timeout_err("pg pool checkout exceeded wait budget".into()))?
+            .map_err(|e| ProjectionDependencyError::Database(e.to_string()))?;
+        let outcome = timeout_at(deadline, verify_projection_dependency(&**client, target))
+            .await
+            .map_err(|_| timeout_err("pg dependency query exceeded wait budget".into()))?;
+        match outcome {
+            Ok(verified) => {
+                if !wait_timeout.is_zero() && Instant::now() > deadline {
+                    return Err(timeout_err("projection dependency check exceeded wait budget".into()));
+                }
+                return Ok(verified);
+            }
             Err(
                 err @ (ProjectionDependencyError::SequenceGapOrResync { .. }
                 | ProjectionDependencyError::AuthorityViolation(_)
@@ -280,13 +301,7 @@ pub async fn await_projected_event(
                 drop(client);
                 let now = Instant::now();
                 if now >= deadline {
-                    return Err(ProjectionDependencyError::Timeout {
-                        group_id: target.realm.group_id,
-                        history_incarnation: target.realm.history_incarnation,
-                        min_log_index: target.min_log_index,
-                        min_event_seq: target.min_event_seq,
-                        last_reason: transient.to_string(),
-                    });
+                    return Err(timeout_err(transient.to_string()));
                 }
                 tokio::time::sleep(poll.min(deadline.saturating_duration_since(now))).await;
             }

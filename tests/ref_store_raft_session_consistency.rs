@@ -538,10 +538,12 @@ async fn probe_raft_node(
     st: &GatewayState,
     preferred_node_id: u64,
     override_leader: Option<u64>,
+    probe_budget: Duration,
 ) -> Result<RaftProbeOutcome, SessionFenceError> {
     if st.force_pg_fallback.load(Ordering::SeqCst) {
         assert_authoritative_source(AuthoritySourceKind::PgRefsProjection)?;
     }
+    let deadline = tokio::time::Instant::now() + probe_budget;
     let node_id = override_leader.unwrap_or(preferred_node_id);
     let node = {
         let guard = st.nodes.read().map_err(|_| SessionFenceError::Internal("lock poisoned"))?;
@@ -549,11 +551,10 @@ async fn probe_raft_node(
     }
     .ok_or_else(|| SessionFenceError::QuorumUnavailable(format!("node {node_id} unavailable")))?;
 
-    let kv_resp =
-        tokio::time::timeout(Duration::from_millis(900), node.rpc(json!({ "KvGet": { "key": st.repo_key } })))
-            .await
-            .map_err(|_| SessionFenceError::QuorumUnavailable(format!("rpc timeout to node {node_id}")))?
-            .map_err(|e| SessionFenceError::QuorumUnavailable(format!("rpc error to node {node_id}: {e}")))?;
+    let kv_resp = tokio::time::timeout_at(deadline, node.rpc(json!({ "KvGet": { "key": st.repo_key } })))
+        .await
+        .map_err(|_| SessionFenceError::QuorumUnavailable(format!("rpc timeout to node {node_id}")))?
+        .map_err(|e| SessionFenceError::QuorumUnavailable(format!("rpc error to node {node_id}: {e}")))?;
 
     if let Some(err) = kv_resp.get("Error") {
         if let Some(fwd) = err["forward_to_leader_id"].as_u64() {
@@ -571,9 +572,9 @@ async fn probe_raft_node(
     let parsed: RaftRepoStateValue =
         serde_json::from_str(raw_val).map_err(|_| SessionFenceError::Internal("decode state value"))?;
 
-    let metrics = node
-        .rpc(json!("Metrics"))
+    let metrics = tokio::time::timeout_at(deadline, node.rpc(json!("Metrics")))
         .await
+        .map_err(|_| SessionFenceError::QuorumUnavailable(format!("metrics timeout on node {node_id}")))?
         .map_err(|e| SessionFenceError::QuorumUnavailable(format!("metrics error: {e}")))?;
     let last_applied = metrics.pointer("/Metrics/last_applied/index").and_then(Value::as_u64).unwrap_or(0);
     let state_digest_hex =
@@ -621,7 +622,7 @@ async fn http_read_refs(
         3,
         |leader| {
             let st_ref = st.clone();
-            async move { probe_raft_node(&st_ref, node_id, leader).await }
+            async move { probe_raft_node(&st_ref, node_id, leader, budget).await }
         },
     )
     .await;
@@ -654,16 +655,17 @@ async fn http_git_info_refs(
         authenticated: st.authenticated.load(Ordering::SeqCst),
         has_read_permission: st.has_read_permission.load(Ordering::SeqCst),
     };
+    let budget = Duration::from_millis(*st.wait_budget_ms.read().unwrap());
     let admitted = match await_raft_read_or_redirect(
         access,
         &st.codec,
         presented.as_deref(),
-        Duration::from_millis(500),
+        budget,
         Duration::from_millis(25),
         3,
         |leader| {
             let st_ref = st.clone();
-            async move { probe_raft_node(&st_ref, node_id, leader).await }
+            async move { probe_raft_node(&st_ref, node_id, leader, budget).await }
         },
     )
     .await
@@ -709,16 +711,17 @@ async fn http_git_upload_pack(
         authenticated: st.authenticated.load(Ordering::SeqCst),
         has_read_permission: st.has_read_permission.load(Ordering::SeqCst),
     };
+    let budget = Duration::from_millis(*st.wait_budget_ms.read().unwrap());
     let admitted = match await_raft_read_or_redirect(
         access,
         &st.codec,
         presented.as_deref(),
-        Duration::from_millis(500),
+        budget,
         Duration::from_millis(25),
         3,
         |leader| {
             let st_ref = st.clone();
-            async move { probe_raft_node(&st_ref, node_id, leader).await }
+            async move { probe_raft_node(&st_ref, node_id, leader, budget).await }
         },
     )
     .await
@@ -896,16 +899,26 @@ async fn real_raft_cluster_http_read_your_writes_monotonic_failover_lag_and_quor
     assert_eq!(r_pg_fb.status(), 503);
     st.force_pg_fallback.store(false, Ordering::SeqCst);
 
-    // 4. Lagged replica behind client's bound fails closed with 503 (never silent stale read).
-    *st.wait_budget_ms.write().unwrap() = 80;
+    // 4. Zero-budget and lagged replica behind client's bound fail closed with 503 (never silent stale read).
+    *st.wait_budget_ms.write().unwrap() = 0;
     let ahead_tok =
         st.codec.mint_token(&realm, idx1 + 50, 99, rootyard::ref_store::projector::current_unix_seconds())?;
+    let r_zero_behind = http
+        .get(format!("{base_url}/api/raft/nodes/{leader_id}/refs"))
+        .header(RAFT_SESSION_HEADER, &ahead_tok)
+        .send()
+        .await?;
+    assert_eq!(r_zero_behind.status(), 503);
+
+    *st.wait_budget_ms.write().unwrap() = 80;
+    let t_behind = Instant::now();
     let r_behind = http
         .get(format!("{base_url}/api/raft/nodes/{leader_id}/refs"))
         .header(RAFT_SESSION_HEADER, &ahead_tok)
         .send()
         .await?;
     assert_eq!(r_behind.status(), 503);
+    assert!(t_behind.elapsed() < Duration::from_millis(500));
     *st.wait_budget_ms.write().unwrap() = 400;
 
     // 5. Partition old leader into minority; surviving 2 voters elect new leader and commit rev=2.
@@ -1153,15 +1166,51 @@ async fn real_pg17_projection_dependency_atomicity_duplicates_gap_abort_and_time
         required_repository_id: Some(repo),
         min_repo_revision: Some(4),
     };
+    let mut schema_cfg: tokio_postgres::Config = test_database_url().parse()?;
+    schema_cfg
+        .options(format!("-c search_path={schema} -c timezone=UTC -c statement_timeout=15000 -c lock_timeout=10000"));
+    let pool_one = Pool::builder(Manager::new(schema_cfg, tokio_postgres::NoTls))
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .max_size(1)
+        .build()?;
+
+    let t_zero_pg = Instant::now();
+    let zero_timeout =
+        await_projected_event(&pool, &target3, Duration::ZERO, Duration::from_millis(20)).await.unwrap_err();
+    assert!(matches!(zero_timeout, ProjectionDependencyError::Timeout { .. }));
+    assert!(t_zero_pg.elapsed() < Duration::from_millis(100));
+
+    // Exhaust pool checkout -> await_projected_event (25ms budget) fails closed within budget.
+    let held = pool_one.get().await?;
+    let t_pool = Instant::now();
+    let pool_timeout = await_projected_event(&pool_one, &target3, Duration::from_millis(25), Duration::from_millis(5))
+        .await
+        .unwrap_err();
+    assert!(matches!(pool_timeout, ProjectionDependencyError::Timeout { .. }));
+    assert!(t_pool.elapsed() < Duration::from_millis(150));
+    drop(held);
+
     let timeout_err =
         await_projected_event(&pool, &target3, Duration::from_millis(80), Duration::from_millis(20)).await.unwrap_err();
     assert!(matches!(timeout_err, ProjectionDependencyError::Timeout { .. }));
 
-    // 5. Complete contiguous replay seq=2, seq=3 -> dependency succeeds & non-authorizing verified.
+    // 5. Complete contiguous replay seq=2, seq=3, verify delayed query fails closed on lock, then succeeds unlocked.
     let (applied_rest, no_gap) =
         apply_projection_stream_stop_on_gap(&pool, &[src.events[1].clone(), src.events[2].clone()], None).await?;
     assert_eq!(applied_rest.len(), 2);
     assert!(no_gap.is_none());
+
+    let mut lock_conn = pool.get().await?;
+    let lock_tx = lock_conn.transaction().await?;
+    lock_tx.batch_execute("LOCK TABLE ref_cas_projection_cursors IN ACCESS EXCLUSIVE MODE").await?;
+    let t_query = Instant::now();
+    let query_timeout =
+        await_projected_event(&pool, &target3, Duration::from_millis(25), Duration::from_millis(5)).await.unwrap_err();
+    assert!(matches!(query_timeout, ProjectionDependencyError::Timeout { .. }));
+    assert!(t_query.elapsed() < Duration::from_millis(150));
+    lock_tx.rollback().await?;
+    drop(lock_conn);
+
     let wait_ok = await_projected_event(&pool, &target3, Duration::from_millis(200), Duration::from_millis(20)).await?;
     assert_eq!(wait_ok.cursor.applied_event_seq, 3);
     assert_eq!(wait_ok.verified_op_event_id.as_deref(), Some(op3_event_id.as_str()));

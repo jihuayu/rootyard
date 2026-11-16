@@ -11,7 +11,7 @@ use super::types::ProjectionRealm;
 use crate::ref_store::GitObjectFormat;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -276,4 +276,79 @@ fn headers_and_serde_deny_unknown_fields_enforced() {
         min_repo_revision: None,
     };
     assert!(matches!(bad_dep.validate(), Err(ProjectionDependencyError::InvalidInput(_))));
+}
+
+#[tokio::test]
+async fn zero_budget_and_slow_probe_fail_closed_within_caller_deadline() {
+    let codec = codec_fixture();
+    let realm = realm_fixture(19);
+    let access = CallerAccessState { authenticated: true, has_read_permission: true };
+    let bound = codec.mint_token(&realm, 10, 3, current_unix_seconds()).unwrap();
+
+    // Instantaneous Ready on zero budget succeeds without sleeping or redirecting.
+    let ok_zero = await_raft_read_or_redirect(
+        access,
+        &codec,
+        Some(&bound),
+        Duration::ZERO,
+        Duration::from_millis(20),
+        2,
+        |_| async { Ok(RaftProbeOutcome::Ready(proof_fixture(realm.clone(), 10, 3))) },
+    )
+    .await
+    .expect("instant ready passes zero wait budget");
+    assert_eq!(ok_zero.committed_log_index, 10);
+
+    // Delayed probe on zero budget fails closed immediately without waiting 80ms.
+    let t_zero = Instant::now();
+    let delayed_zero =
+        await_raft_read_or_redirect(access, &codec, None, Duration::ZERO, Duration::from_millis(20), 2, |_| async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok(RaftProbeOutcome::Ready(proof_fixture(realm.clone(), 11, 3)))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(delayed_zero.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(t_zero.elapsed() < Duration::from_millis(50));
+
+    // BehindLowerBound or ForwardToLeader on zero budget fails closed on poll 1 without sleeping.
+    let behind_zero = await_raft_read_or_redirect(
+        access,
+        &codec,
+        Some(&bound),
+        Duration::ZERO,
+        Duration::from_millis(30),
+        2,
+        |_| async { Ok(RaftProbeOutcome::Ready(proof_fixture(realm.clone(), 9, 2))) },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(behind_zero.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let fwd_zero =
+        await_raft_read_or_redirect(access, &codec, None, Duration::ZERO, Duration::from_millis(30), 2, |_| async {
+            Ok(RaftProbeOutcome::ForwardToLeader(2))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(fwd_zero.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Positive wait_budget cancels a slow underlying probe whose Ready arrives past deadline.
+    let t_pos = Instant::now();
+    let slow_probe = await_raft_read_or_redirect(
+        access,
+        &codec,
+        None,
+        Duration::from_millis(25),
+        Duration::from_millis(5),
+        2,
+        |_| async {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            Ok(RaftProbeOutcome::Ready(proof_fixture(realm.clone(), 12, 4)))
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(slow_probe.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(t_pos.elapsed() < Duration::from_millis(100));
 }

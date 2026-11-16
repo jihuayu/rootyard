@@ -54,6 +54,7 @@ class RaftSessionConsistencyContractTest(unittest.TestCase):
         self.assertIn("assert_authoritative_source", fence_txt)
         self.assertIn("RealmMismatch", fence_txt)
         self.assertIn("rrs1.", fence_txt)
+        self.assertIn("timeout_at", fence_txt)
 
     def test_dependency_module_enforces_contiguous_cursor_and_no_gap_skip(self) -> None:
         dep_txt = (PROJECTOR_DIR / "dependency.rs").read_text(encoding="utf-8")
@@ -63,6 +64,9 @@ class RaftSessionConsistencyContractTest(unittest.TestCase):
         self.assertIn("can_authorize_write", dep_code)
         self.assertIn("apply_projection_stream_stop_on_gap", dep_code)
         self.assertIn("await_projected_event", dep_code)
+        self.assertIn("timeout_at", dep_code)
+        self.assertIn("pool.get()", dep_code)
+        self.assertIn("verify_projection_dependency", dep_code)
         self.assertNotIn("MAX(id)", dep_code)
         self.assertNotIn("MAX(event_seq)", dep_code)
 
