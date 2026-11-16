@@ -304,6 +304,8 @@ jobs:
         run: python3 tests/pulls.py --binary "$ROOTYARD_BIN" --report test-results/pulls.json
       - name: Exercise populated Pull Request paired backup and fresh restore
         run: python3 tests/backup_pulls.py --binary "$ROOTYARD_BIN" --report test-results/backup-pulls.json
+      - name: Exercise Forge collaboration (search, labels, assignees, subscriptions, notifications, inline PR review, backup/restore)
+        run: python3 tests/forge_collaboration.py --binary "$ROOTYARD_BIN" --report test-results/forge-collaboration.json
       - name: Exercise repository read-only Browse API and atomic multi-ref CAS transactions
         run: python3 tests/browse.py --mixed-refs --git "$(command -v git)" --binary "$ROOTYARD_BIN" --report test-results/browse.json
       - name: Exercise repository pagination against real PostgreSQL
@@ -443,6 +445,7 @@ jobs:
             --report organizations_web=test-results/organizations-web.json \
             --report backup_capabilities=test-results/backup-capabilities.json \
             --report organizations_lifecycle=test-results/organizations-lifecycle.json \
+            --report forge_collaboration=test-results/forge-collaboration.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
             --report web_repository_pagination=test-results/web-repository-pagination.json \
             --report worker_diagnostics=test-results/worker-diagnostics.json \
@@ -509,6 +512,7 @@ jobs:
             --harness tests/organizations_web.py \
             --harness tests/backup_capabilities.py \
             --harness tests/organizations_lifecycle.py \
+            --harness tests/forge_collaboration.py \
             --harness tests/backup.py \
             --harness tests/web_detail_pagination.py \
             --harness tests/web_repository_pagination.py \
@@ -580,6 +584,13 @@ jobs:
             --require-case pat_scope_auth=restricted.browser_child_inheritance \
             --require-case token_management=sessions.restricted_browser_child_inheritance \
             --require-case token_management=sessions.legacy_upgrade_and_parent_rotation_live \
+            --require-case forge_collaboration=setup_fixtures \
+            --require-case forge_collaboration=subscriptions_and_notifications \
+            --require-case forge_collaboration=labels_and_assignees \
+            --require-case forge_collaboration=inline_review_and_moderation \
+            --require-case forge_collaboration=search_and_rbac \
+            --require-case forge_collaboration=web_ui_and_csrf \
+            --require-case forge_collaboration=backup_and_restore \
             --fixture-rust-from-receipt \
             --fixture git="$(git --version)" \
             --fixture git_lfs="$(git lfs version)" \

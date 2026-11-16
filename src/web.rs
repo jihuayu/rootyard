@@ -9,6 +9,9 @@
 //! repository pages for both the `/web` and legacy `/ui` prefixes, and
 //! [`org_admin`] owns organization administration. [`routes`] merges them and
 //! applies one session/Origin/CSRF middleware layer over the final router.
+pub mod collaboration;
+pub mod collaboration_actions;
+pub mod collaboration_views;
 pub mod detail_pagination;
 pub mod handlers;
 pub mod models;
@@ -41,5 +44,6 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(navigation::routes())
         .merge(repository_pages::router())
         .merge(org_admin::routes())
+        .merge(collaboration::routes())
         .layer(axum::middleware::from_fn_with_state(state, session::middleware))
 }

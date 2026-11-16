@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 pub const ZERO_OID_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-pub const PULL_FIELDS: &str = "repository_id,number,author_id,title,body,state,head_ref,base_ref,head_oid,base_oid,merge_commit_oid,merged_storage_generation,version,created_at::text,updated_at::text";
+pub const PULL_FIELDS: &str = "repository_id,number,author_id,title,body,state,head_ref,base_ref,head_oid,base_oid,merge_commit_oid,merged_storage_generation,version,label_version,assignee_version,created_at::text,updated_at::text";
 pub const REVIEW_FIELDS: &str =
     "repository_id,pull_number,number,author_id,state,commit_oid,pull_version,body,created_at::text";
 pub const CHECK_FIELDS: &str =
@@ -36,6 +36,8 @@ pub struct PullRequest {
     pub merge_commit_oid: Option<String>,
     pub merged_storage_generation: Option<i64>,
     pub version: i64,
+    pub label_version: i64,
+    pub assignee_version: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -55,6 +57,8 @@ impl PullRequest {
             merge_commit_oid: row.get("merge_commit_oid"),
             merged_storage_generation: row.get("merged_storage_generation"),
             version: row.get("version"),
+            label_version: row.get("label_version"),
+            assignee_version: row.get("assignee_version"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         }
@@ -70,19 +74,26 @@ pub struct PullReview {
     pub state: String,
     pub commit_oid: String,
     pub pull_version: i64,
+    pub outdated: bool,
     pub body: String,
     pub created_at: String,
 }
 impl PullReview {
     pub fn row(row: &Row) -> Self {
+        Self::row_for_pull(row, row.get::<_, &str>("commit_oid"))
+    }
+    pub fn row_for_pull(row: &Row, current_head_oid: &str) -> Self {
+        let commit_oid: String = row.get("commit_oid");
+        let outdated = commit_oid != current_head_oid;
         Self {
             repository_id: row.get("repository_id"),
             pull_number: row.get("pull_number"),
             number: row.get("number"),
             author_id: row.get("author_id"),
             state: row.get("state"),
-            commit_oid: row.get("commit_oid"),
+            commit_oid,
             pull_version: row.get("pull_version"),
+            outdated,
             body: row.get("body"),
             created_at: row.get("created_at"),
         }
@@ -409,6 +420,32 @@ pub async fn creation_replay(
         )
         .await
         .map_err(Error::internal)?;
+    if row.get::<_, Value>("request") != *request {
+        return Err(Error(StatusCode::CONFLICT, "idempotency key conflict"));
+    }
+    row.get::<_, Option<Value>>("response").map(Some).ok_or_else(|| Error::internal("incomplete creation record"))
+}
+
+/// Read a completed creation receipt without reserving the key. Missing rows
+/// are not reserved; a different request conflicts and a committed incomplete
+/// receipt fails closed.
+pub async fn completed_creation_replay(
+    tx: &Transaction<'_>,
+    actor: Uuid,
+    repo: Uuid,
+    key: &str,
+    request: &Value,
+) -> Result<Option<Value>, Error> {
+    let Some(row) = tx
+        .query_opt(
+            "SELECT request,response FROM forge_creation_requests WHERE tenant_id=$1 AND repository_id=$2 AND idempotency_key=$3",
+            &[&actor, &repo, &key],
+        )
+        .await
+        .map_err(Error::internal)?
+    else {
+        return Ok(None);
+    };
     if row.get::<_, Value>("request") != *request {
         return Err(Error(StatusCode::CONFLICT, "idempotency key conflict"));
     }

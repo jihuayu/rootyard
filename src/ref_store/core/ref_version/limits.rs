@@ -33,6 +33,8 @@ pub const MAX_CLOSURE_VERIFIED_BYTES: u64 = VERIFIER_MAX_TOTAL_BYTES;
 pub const MAX_VERSION_REFS: usize = MAX_SNAPSHOT_REFS;
 /// Canonical ASCII reason code ceiling (§2.5.2).
 pub const MAX_REASON_BYTES: usize = 64;
+/// Maximum raw canonical terminal bytes `T` accepted by the v2 ref-version codec.
+pub const MAX_VERSION_TERMINAL_BYTES: usize = 64 * 1024;
 /// Exactly one `.pack` and one `.idx` per planned/registered pack.
 pub(super) const ARTIFACTS_PER_PACK: u32 = 2;
 

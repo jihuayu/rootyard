@@ -225,6 +225,7 @@ class WebTrack1ContractTest(unittest.TestCase):
                     ("src/web/navigation.rs", t5._extract_route_registrations(ROOT / "src/web/navigation.rs")),
                     ("src/web/repository_pages.rs", t5._expand_page_table("src/web/repository_pages.rs", ("/web", "/ui"))),
                     ("src/web/org_admin.rs", t5._expand_page_table("src/web/org_admin.rs", ())),
+                    ("src/web/collaboration.rs", t5._expand_web_collaboration_routes()),
                 )
             else:
                 files = ((rel, t5._extract_route_registrations(ROOT / rel)),)
