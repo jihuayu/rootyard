@@ -2,6 +2,7 @@
 """Contract and structural tests for Issue #37 bounded active transfer revocation."""
 import ast
 import http.client
+import json
 import os
 from pathlib import Path
 import socket
@@ -436,25 +437,96 @@ class TestTransferRevocationContract(unittest.TestCase):
         window.observe(self._stall_sample(60_000_000, rx=8192, inode=18), 60_000_000)
         self.assertEqual(window.last_reset_reason, "inode_changed")
 
-    def test_natural_expiry_requalification_uses_reconciled_earliest_deadline(self):
-        clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
-        base = {
-            "lower_bound_ns": 2_000_000_000,
-            "client_stop": {"confirmed_transport_stop": True, "observed_ns": 2_200_100_000},
-            "client_stop_after_lower_ms": 200.1,
-            "git_group": {"stop_upper_after_lower_ms": 180.0},
+    def _natural_result_fixture(self, *, client_observed_ns):
+        all_true = {
+            "client_stop_within_deadline": True,
             "git_group_within_deadline": True,
+            "group_post_sanity": True,
+            "trigger_within_deadline": True,
+            "backpressure_qualified": True,
+            "source_preconditions": True,
+            "target_pause_within_bound": True,
+            "actual_reader_resume_within_deadline": True,
+            "pre_trigger_window": True,
+        }
+        return {
+            "initial_lower_bound_ns": 1_100_000_000,
+            "lower_bound_ns": 1_100_000_000,
+            "deadline_ns": 2_300_000_000,
+            "first_byte_ns": 500_000_000,
+            "client_stop": {
+                "confirmed_transport_stop": True,
+                "observed_ns": client_observed_ns,
+                "kind": "reset",
+                "received_bytes": 4096,
+            },
+            "client_stop_after_lower_ms": 100.0,
+            "actual_reader_resume_ns": 1_850_000_000,
+            "post_trigger_pause_target_ms": 800.0,
+            "post_trigger_backpressure_sample_ns": 1_840_000_000,
+            "pre_trigger_backpressure_sample": {"observed_ns": 980_000_000},
+            "backpressure": {"persistent": True},
+            "source_preconditions": {
+                "large_unfinished_payload": True,
+                "source_bounded_producer_channels": True,
+            },
+            "post_transfer_group_stopped": True,
+            "post_pause_within_deadline": True,
+            "pre_trigger_backpressure_established": True,
+            "git_group": {
+                "stop_upper_ns": 1_900_000_000,
+                "groups": [{
+                    "last_live_ns": 1_700_000_000,
+                    "quiescent_ns": 1_900_000_000,
+                }],
+            },
+            "git_group_within_deadline": True,
+            "proof_components": all_true,
             "configured_bound_proven": True,
         }
-        result = revocation_timing.apply_natural_expiry_clock(dict(base), clock, 1200)
+
+    def test_natural_expiry_requalification_uses_reconciled_earliest_deadline(self):
+        clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
+        result = revocation_timing.apply_natural_expiry_clock(
+            self._natural_result_fixture(client_observed_ns=2_200_100_000), clock, 1200
+        )
         self.assertEqual(result["deadline_ns"], 2_200_000_000)
         self.assertFalse(result["client_stop_within_deadline"])
         self.assertFalse(result["configured_bound_proven"],
                          "a stop after E_lower+B must not be requalified as a pass")
-        later = dict(base, client_stop={"confirmed_transport_stop": True,
-                                        "observed_ns": 2_199_000_000})
-        later = revocation_timing.apply_natural_expiry_clock(later, clock, 1200)
+        later = revocation_timing.apply_natural_expiry_clock(
+            self._natural_result_fixture(client_observed_ns=2_199_000_000), clock, 1200
+        )
         self.assertTrue(later["configured_bound_proven"])
+
+    def test_natural_finalization_rewrites_all_relative_fields_from_final_lower(self):
+        clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
+        result = revocation_timing.apply_natural_expiry_clock(
+            self._natural_result_fixture(client_observed_ns=2_000_000_000), clock, 1200
+        )
+        self.assertEqual(result["lower_bound_ns"], 1_000_000_000)
+        self.assertEqual(result["initial_lower_bound_ns"], 1_100_000_000)
+        self.assertEqual(result["client_stop_after_lower_ms"], 1000.0)
+        self.assertEqual(result["actual_reader_resume_after_lower_ms"], 850.0)
+        self.assertEqual(result["actual_post_trigger_pause_ms"], 850.0)
+        self.assertEqual(result["post_trigger_pause_ms"], 850.0)
+        self.assertEqual(result["reader_resume_delta_from_target_ms"], 50.0)
+        self.assertEqual(result["post_trigger_backpressure_sample_after_lower_ms"], 840.0)
+        self.assertEqual(result["pre_trigger_backpressure_sample_after_lower_ms"], -20.0)
+        self.assertEqual(result["git_group"]["stop_upper_after_lower_ms"], 900.0)
+        self.assertEqual(result["git_group"]["groups"][0]["quiescent_after_lower_ms"], 900.0)
+        self.assertEqual(result["clock_uncertainty_ms"], 0.1)
+        self.assertTrue(result["configured_bound_proven"])
+        self.assertNotIn("ryj_", json.dumps(result))
+        self.assertNotIn("Authorization", json.dumps(result))
+
+    def test_actual_reader_resume_after_final_deadline_is_not_a_pass(self):
+        clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
+        fixture = self._natural_result_fixture(client_observed_ns=2_100_000_000)
+        fixture["actual_reader_resume_ns"] = 2_250_000_000
+        result = revocation_timing.apply_natural_expiry_clock(fixture, clock, 1200)
+        self.assertFalse(result["actual_reader_resume_within_deadline"])
+        self.assertFalse(result["configured_bound_proven"])
 
     def test_read_timeout_is_never_a_confirmed_transport_stop(self):
         class FakeSocket:
@@ -517,7 +589,8 @@ class TestTransferRevocationContract(unittest.TestCase):
         for expected in ("SO_RCVBUF", "getsockopt", "fixture_four_tuple",
                          "server_fd_owned", "deadline_ns = lower_ns + bound_ns",
                          "post_pause_ns <= bound_ns", "post_transfer_group_stopped",
-                         "SustainedStallWindow", "source_bounded_producer"):
+                         "SustainedStallWindow", "source_bounded_producer",
+                         "actual_reader_resume_ns", "proof_components"):
             self.assertTrue(expected in transport, f"transport missing {expected}")
         backpressure = (ROOT / "tests" / "transfer_revocation_backpressure.py").read_text(encoding="utf-8")
         for expected in ("server_tx_positive_every_sample",
@@ -528,6 +601,7 @@ class TestTransferRevocationContract(unittest.TestCase):
         for expected in ("S_upper - E_lower <= B", "small `SO_RCVBUF`",
                          "continuous sender-stall window", "500 ms",
                          "No zero-window kernel witness is claimed",
+                         "actual monotonic resume", "final validated natural-expiry",
                          "A timeout, local close, or harness cancellation is never a",
                          "no additive CI"):
             self.assertTrue(expected in docs, f"docs missing {expected}")

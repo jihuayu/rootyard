@@ -304,12 +304,16 @@ def run_timed_transfer(
             if state is None:
                 return
             lower_ns, resume_ns, deadline_ns = state
+            now_ns = time.monotonic_ns()
+            if resume_ns > now_ns:
+                time.sleep((resume_ns - now_ns) / 1_000_000_000)
+            trigger_state["reader_resume_ns"] = time.monotonic_ns()
             trigger_state["stop"] = read_until_transport_stop(
                 response=response,
                 sock=connection.sock,
                 expected_size=expected_size,
                 initial_received=len(first),
-                resume_ns=resume_ns,
+                resume_ns=0,
                 deadline_ns=deadline_ns,
                 framing=framing,
             )
@@ -356,6 +360,7 @@ def run_timed_transfer(
             stop = trigger_state.get("stop")
             if stop is None:
                 raise AssertionError("body reader ended without an observation")
+        reader_resume_ns = trigger_state.get("reader_resume_ns")
 
         if observer is not None:
             observer_deadline_ns = deadline_ns + 100 * NS_PER_MS
@@ -384,6 +389,9 @@ def run_timed_transfer(
             probe and probe.persistent and probe.window.qualified
         )
         post_pause_ok = post_pause_ns <= bound_ns
+        actual_resume_ok = bool(
+            reader_resume_ns is not None and reader_resume_ns < deadline_ns
+        )
         proof_components = {
             "client_stop_within_deadline": client_ok,
             "git_group_within_deadline": group_ok,
@@ -392,6 +400,7 @@ def run_timed_transfer(
             "backpressure_qualified": backpressure_ok,
             "source_preconditions": source_ok if require_backpressure else True,
             "target_pause_within_bound": post_pause_ok,
+            "actual_reader_resume_within_deadline": actual_resume_ok,
             "pre_trigger_window": pre_trigger_ok,
         }
         proof = all(proof_components.values())
@@ -403,9 +412,21 @@ def run_timed_transfer(
             "trigger_within_deadline": trigger_ok,
             "pre_trigger_pause_ms": _ms(lower_ns - first_ns),
             "pre_trigger_backpressure_established": bool(pre_trigger_ok and backpressure_ok),
-            "post_trigger_pause_ms": _ms(post_pause_ns),
-            "reader_resume_after_lower_ms": _ms(resume_ns - lower_ns),
+            "post_trigger_pause_target_ms": _ms(post_pause_ns),
+            "post_trigger_pause_ms": (
+                _ms(reader_resume_ns - lower_ns) if reader_resume_ns is not None else None
+            ),
+            "planned_reader_resume_after_lower_ms": _ms(resume_ns - lower_ns),
+            "reader_resume_after_lower_ms": (
+                _ms(reader_resume_ns - lower_ns) if reader_resume_ns is not None else None
+            ),
+            "actual_reader_resume_ns": reader_resume_ns,
+            "reader_resume_delta_from_target_ms": (
+                _ms(reader_resume_ns - resume_ns) if reader_resume_ns is not None else None
+            ),
+            "actual_reader_resume_within_deadline": actual_resume_ok,
             "post_pause_within_deadline": post_pause_ok,
+            "first_byte_ns": first_ns,
             "initial_bytes_received": len(first),
             "transfer_incomplete_at_trigger": len(first) < expected_size,
             "backpressure": probe.report() if probe is not None else {
@@ -420,6 +441,7 @@ def run_timed_transfer(
                 "source_producer_kind": source_producer_kind,
                 "zero_window_witness_available": False,
             },
+            "post_trigger_backpressure_sample_ns": post_sample_ns,
             "post_trigger_backpressure_sample_after_lower_ms": (
                 _ms(post_sample_ns - lower_ns) if post_sample_ns is not None else None
             ),

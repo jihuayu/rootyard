@@ -666,12 +666,18 @@ tolerance. Leak/reap, GC-lock, and staging checks remain separate sanity checks
 and do not reset the bound clock.
 
 Each subcase reports the configured bound, trigger kind and interval (or expiry
-clock bracket), backpressure witness and effective receive buffer, actual pre-
-and post-trigger pauses, client stop kind/time, Git group quiescence and polling
-gaps, and `configured_bound_proven`. Existing top-level case IDs and the original
-17-case inventory are preserved; added report fields are timing evidence, not a
-new runtime qualification. These are harness measurements, not a new server
-telemetry endpoint, and a timed-out or unobservable run remains unproven.
+clock bracket), backpressure witness and effective receive buffer, target and
+actual pre/post-trigger pauses, client stop kind/time, Git group quiescence and
+polling gaps, and `configured_bound_proven`. The harness timestamps the body
+reader's actual monotonic resume, not just the planned hold, and derives every
+relative elapsed field from the final validated natural-expiry `E_lower` (the
+initial single-sample bracket is retained only for audit). The same final
+`E_lower` drives the pass booleans and report values; an invalid or inconsistent
+clock mapping fails rather than passing. Existing top-level case IDs and the
+original 17-case inventory are preserved; added report fields are timing
+evidence, not a new runtime qualification. These are harness measurements, not
+a new server telemetry endpoint, and a timed-out or unobservable run remains
+unproven.
 
 ## Live multi-mirror and multi-controller HA qualification
 

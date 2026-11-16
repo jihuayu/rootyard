@@ -186,29 +186,116 @@ def read_until_transport_stop(*, response, sock, expected_size, initial_received
 
 
 def apply_natural_expiry_clock(result, clock, bound_ms):
-    """Re-evaluate a natural-expiry result against the reconciled earliest bound."""
-    deadline_ns = clock.earliest_ns + int(bound_ms) * NS_PER_MS
-    client = result["client_stop"]
-    client_ok = bool(client["confirmed_transport_stop"] and client["observed_ns"] <= deadline_ns)
-    group = result.get("git_group", {})
-    group_stop_ns = group.get("stop_upper_ns")
-    if group_stop_ns is None:
-        group_stop_ms = group.get("stop_upper_after_lower_ms")
-        if group_stop_ms is None:
-            group_ok = result.get("git_group_within_deadline", True)
-        else:
-            group_stop_ns = result["lower_bound_ns"] + int(round(group_stop_ms * NS_PER_MS))
-            group_ok = group_stop_ns <= deadline_ns
-    else:
-        group_ok = group_stop_ns <= deadline_ns
-    result["expiry_clock"] = clock.report()
+    """Re-evaluate and rewrite relative evidence against the final E_lower."""
+    final_lower_ns = clock.earliest_ns
+    deadline_ns = final_lower_ns + int(bound_ms) * NS_PER_MS
+    result.setdefault("initial_lower_bound_ns", result.get("lower_bound_ns"))
+    result.setdefault("initial_trigger", result.get("trigger"))
+    clock_report = clock.report()
+    result["expiry_clock"] = clock_report
+    result["trigger"] = clock_report
+    result["lower_bound_ns"] = final_lower_ns
     result["deadline_ns"] = deadline_ns
-    result["client_stop_within_deadline"] = client_ok
-    result["git_group_within_deadline"] = group_ok
-    result["configured_bound_proven"] = bool(
-        result["configured_bound_proven"]
-        and client_ok
-        and group_ok
-        and result["client_stop_after_lower_ms"] >= 0
+    result["clock_uncertainty_ms"] = clock_report["width_ms"]
+
+    first_byte_ns = result.get("first_byte_ns")
+    if isinstance(first_byte_ns, int):
+        result["pre_trigger_pause_ms"] = round(
+            (final_lower_ns - first_byte_ns) / NS_PER_MS, 3
+        )
+
+    client = result["client_stop"]
+    client_ok = bool(
+        client["confirmed_transport_stop"] and client["observed_ns"] <= deadline_ns
     )
+    result["client_stop_after_lower_ms"] = round(
+        (client["observed_ns"] - final_lower_ns) / NS_PER_MS, 3
+    )
+    result["client_stop_within_deadline"] = client_ok
+
+    actual_resume_ns = result.get("actual_reader_resume_ns")
+    actual_resume_ok = bool(
+        isinstance(actual_resume_ns, int) and actual_resume_ns < deadline_ns
+    )
+    result["actual_reader_resume_after_lower_ms"] = (
+        round((actual_resume_ns - final_lower_ns) / NS_PER_MS, 3)
+        if isinstance(actual_resume_ns, int) else None
+    )
+    result["actual_post_trigger_pause_ms"] = (
+        round((actual_resume_ns - final_lower_ns) / NS_PER_MS, 3)
+        if isinstance(actual_resume_ns, int) else None
+    )
+    target_pause_ms = result.get("post_trigger_pause_target_ms")
+    result["post_trigger_pause_ms"] = result["actual_post_trigger_pause_ms"]
+    result["planned_reader_resume_after_lower_ms"] = target_pause_ms
+    result["reader_resume_delta_from_target_ms"] = (
+        round(result["actual_reader_resume_after_lower_ms"] - target_pause_ms, 3)
+        if target_pause_ms is not None and result["actual_reader_resume_after_lower_ms"] is not None
+        else None
+    )
+    result["actual_reader_resume_within_deadline"] = actual_resume_ok
+
+    post_sample_ns = result.get("post_trigger_backpressure_sample_ns")
+    result["post_trigger_backpressure_sample_after_lower_ms"] = (
+        round((post_sample_ns - final_lower_ns) / NS_PER_MS, 3)
+        if isinstance(post_sample_ns, int) else None
+    )
+    pre_sample = result.get("pre_trigger_backpressure_sample") or {}
+    pre_sample_ns = pre_sample.get("observed_ns")
+    result["pre_trigger_backpressure_sample_after_lower_ms"] = (
+        round((pre_sample_ns - final_lower_ns) / NS_PER_MS, 3)
+        if isinstance(pre_sample_ns, int) else None
+    )
+    max_gap_ns = int(
+        (result.get("backpressure", {}).get("max_gap_ms") or 100.0) * NS_PER_MS
+    )
+
+    group = result.get("git_group") or {}
+    group_stop_ns = group.get("stop_upper_ns")
+    if isinstance(group_stop_ns, int):
+        group_ok = group_stop_ns <= deadline_ns
+    else:
+        group_ok = bool(result.get("git_group_within_deadline", True))
+    for observation in group.get("groups", []):
+        if isinstance(observation.get("last_live_ns"), int):
+            observation["last_live_after_lower_ms"] = round(
+                (observation["last_live_ns"] - final_lower_ns) / NS_PER_MS, 3
+            )
+        if isinstance(observation.get("quiescent_ns"), int):
+            observation["quiescent_after_lower_ms"] = round(
+                (observation["quiescent_ns"] - final_lower_ns) / NS_PER_MS, 3
+            )
+    if isinstance(group.get("stop_upper_ns"), int):
+        group["stop_upper_after_lower_ms"] = round(
+            (group["stop_upper_ns"] - final_lower_ns) / NS_PER_MS, 3
+        )
+
+    components = dict(result.get("proof_components") or {})
+    components.setdefault("trigger_within_deadline", result.get("trigger_within_deadline", True))
+    components.setdefault("backpressure_qualified", bool(
+        result.get("backpressure", {}).get("persistent", True)
+    ))
+    source = result.get("source_preconditions") or {}
+    components.setdefault("source_preconditions", bool(
+        source.get("large_unfinished_payload", True)
+        and source.get("source_bounded_producer_channels", True)
+    ))
+    components.setdefault("group_post_sanity", result.get("post_transfer_group_stopped", True))
+    components.setdefault("target_pause_within_bound", result.get("post_pause_within_deadline", True))
+    components.setdefault("pre_trigger_window", result.get("pre_trigger_backpressure_established", True))
+    components["client_stop_within_deadline"] = client_ok
+    components["git_group_within_deadline"] = group_ok
+    components["actual_reader_resume_within_deadline"] = actual_resume_ok
+    if isinstance(first_byte_ns, int):
+        components["pre_trigger_window"] = bool(
+            components["pre_trigger_window"] and final_lower_ns > first_byte_ns
+        )
+    components["pre_trigger_window"] = bool(
+        components["pre_trigger_window"]
+        and isinstance(pre_sample_ns, int)
+        and abs(pre_sample_ns - final_lower_ns) <= max_gap_ns
+    )
+    result["proof_components"] = components
+    result["git_group_within_deadline"] = group_ok
+    result["configured_bound_proven"] = all(components.values())
     return result

@@ -309,6 +309,9 @@ class ProcGroupObserver:
                 "pgid": track.identity.pgid,
                 "leader_starttime": track.identity.leader_starttime,
                 "members_observed_max": track.max_members,
+                "first_live_ns": track.first_live_ns or None,
+                "last_live_ns": track.last_live_ns or None,
+                "quiescent_ns": track.quiescent_ns or None,
                 "last_live_after_lower_ms": (
                     round((track.last_live_ns - lower_bound_ns) / 1_000_000, 3)
                     if track.last_live_ns else None
