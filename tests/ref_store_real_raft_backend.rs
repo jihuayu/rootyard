@@ -22,9 +22,9 @@ use rootyard::ref_store::core::state_machine::{
     ScopeLifecycle, SetRepositoryLaneCommand, SmPackMode, WireCommitRefsRequest, WireGateInit, encode_command,
 };
 use rootyard::ref_store::raft_backend::{
-    BackendOptions, NodeTrust, ProposalAttemptKind, ProposalLookup, ProposalOutcome, ROOT_REF_CAS_DOMAIN,
-    ROOT_REF_CAS_VERSION, RaftBackendError, RealmBinding, RootRaftNode, RootRaftNodeConfig, RootRaftRefCasBackend,
-    RootRefCasOutcome, RootRefCasRefusalKind, RootRefCasStateMachine,
+    BackendOptions, NodeTrust, ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup, ProposalOutcome,
+    ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RaftBackendError, RealmBinding, RootRaftNode, RootRaftNodeConfig,
+    RootRaftRefCasBackend, RootRefCasOutcome, RootRefCasRefusalKind, RootRefCasStateMachine,
 };
 use rootyard::ref_store::{
     CommitMode, CommitRefsRequest, CoreGateInit, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MetadataPinPurpose,
@@ -1199,6 +1199,67 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     assert_eq!(restarted_reducer.read_refs(repo).get("refs/heads/main"), Some(&expected_oid));
     assert_eq!(restarted_reducer.read_head_ref(repo).as_deref(), Some("refs/heads/main"));
     assert!(restarted_reducer.last_applied_coordinate().is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pruned_receipts_export_restore_and_sqlite_reopen() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let repo = Uuid::new_v4();
+    let tenant = Uuid::new_v4();
+    let history = Uuid::new_v4();
+    let authority = Uuid::new_v4();
+    let node_id = 211;
+    let gate =
+        CoreGateInit::new(repo, tenant, GitObjectFormat::Sha256, history, 1, 1, RefName::branch("refs/heads/main")?)?;
+    let init = RefCasCommand::InitializeGate(InitializeGateCommand {
+        gate: WireGateInit::from(&gate),
+        lane: RepositoryLane::ServingRefStore,
+        pack_mode: SmPackMode::MetadataOnly,
+        authz_floor: 1,
+    });
+    let id = ProposalId::new(
+        repo,
+        tenant,
+        history,
+        TEST_GROUP,
+        1,
+        authority,
+        1,
+        1,
+        GitObjectFormat::Sha256,
+        0,
+        Uuid::new_v4(),
+    )?;
+    let proposal = ProposalEnvelope::encode(&id, &encode_command(&init)?)?;
+    let app_command = ApplicationCommand::new(ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, proposal)?.encode()?;
+
+    let mut sm =
+        PersistentStateMachine::open_application(dir.path(), node_id, true, Box::new(RootRefCasStateMachine::new()))
+            .await?;
+    sm.apply(vec![Entry { log_id: lid(1, node_id, 1), payload: EntryPayload::Normal(app_command.clone()) }]).await?;
+    for index in 2..=30 {
+        sm.apply(vec![Entry::new_blank(lid(1, node_id, index))]).await?;
+    }
+    sm.apply(vec![Entry { log_id: lid(1, node_id, 31), payload: EntryPayload::Normal(app_command) }]).await?;
+    for index in 32..=33 {
+        sm.apply(vec![Entry::new_blank(lid(1, node_id, index))]).await?;
+    }
+    let snapshot = sm.application_snapshot().await?.expect("application state at index 33");
+    let reducer = reducer_snapshot(&snapshot);
+    assert_eq!(reducer.retained_attempt_count(), 0);
+    let exported = reducer.export_state()?;
+    let digest = reducer.state_digest_hex()?;
+    drop(sm);
+
+    let reopened =
+        PersistentStateMachine::open_application(dir.path(), node_id, true, Box::new(RootRefCasStateMachine::new()))
+            .await?;
+    let snapshot = reopened.application_snapshot().await?.expect("reopened application state");
+    let reducer = reducer_snapshot(&snapshot);
+    assert_eq!(reducer.retained_attempt_count(), 0);
+    assert_eq!(reducer.state_digest_hex()?, digest);
+    assert_eq!(reducer.export_state()?, exported);
     Ok(())
 }
 

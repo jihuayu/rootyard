@@ -327,6 +327,15 @@ mod tests {
             fence_proposal_against_gate(Some(&live), &sha1, &lane_command(repo, tenant, Uuid::from_u128(31), 3, 2)),
             Some(RootRefCasRefusalKind::GateTransitionRefused)
         );
+        // Repository/tenant must match the actual live gate exactly.
+        assert_eq!(
+            fence_proposal_against_gate(Some(&live), &base, &lane_command(repo, Uuid::from_u128(21), history, 3, 2)),
+            Some(RootRefCasRefusalKind::GateTransitionRefused)
+        );
+        assert_eq!(
+            fence_proposal_against_gate(Some(&live), &base, &lane_command(Uuid::from_u128(11), tenant, history, 3, 2)),
+            Some(RootRefCasRefusalKind::GateTransitionRefused)
+        );
         // Missing live gate is a normal typed refusal.
         assert_eq!(
             fence_proposal_against_gate(None, &base, &lane_command(repo, tenant, history, 3, 2)),

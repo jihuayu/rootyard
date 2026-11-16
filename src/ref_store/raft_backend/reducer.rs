@@ -132,8 +132,48 @@ impl RootRefCasStateMachine {
     }
 
     fn prune_attempts(&mut self, current_index: u64) {
+        // Collect expired stable IDs before the observed-coordinate prune can remove the First
+        // record that proves the ID's dependency set.
+        let expired_ids: Vec<ProposalId> = self
+            .attempts
+            .values()
+            .filter_map(|attempt| attempt.proposal_id.as_ref())
+            .filter(|id| id.expires_at_index().is_some_and(|expires| current_index > expires))
+            .cloned()
+            .collect();
+
         let cutoff = current_index.saturating_sub(PROPOSAL_WINDOW);
         self.attempts.retain(|log_id, _| log_id.index > cutoff);
+
+        // Do not export a Replayed/Conflict/dependent-Capacity receipt after its referenced First
+        // decision has left the observed window. Self-contained First/Legacy/Expired and
+        // first-coordinate Capacity records remain bounded by the same window.
+        let firsts: Vec<ApplicationLogId> = self
+            .attempts
+            .values()
+            .filter(|attempt| attempt.kind == ProposalAttemptKind::First)
+            .map(|attempt| attempt.observed_log_id)
+            .collect();
+        self.attempts.retain(|_, attempt| match attempt.kind {
+            ProposalAttemptKind::First | ProposalAttemptKind::Legacy | ProposalAttemptKind::Expired => true,
+            ProposalAttemptKind::Replayed | ProposalAttemptKind::Conflict => firsts.contains(&attempt.original_log_id),
+            ProposalAttemptKind::Capacity => {
+                attempt.original_log_id == attempt.observed_log_id || firsts.contains(&attempt.original_log_id)
+            }
+        });
+
+        // Once a stable ID has expired, its First/Replay/Conflict dependency set is no longer
+        // promised. Keep only a self-contained Expired decision (if present); Legacy has no
+        // stable-ID dependency claim.
+        self.attempts.retain(|_, attempt| {
+            let Some(id) = attempt.proposal_id.as_ref() else {
+                return true;
+            };
+            if !expired_ids.iter().any(|expired| expired == id) {
+                return true;
+            }
+            attempt.kind == ProposalAttemptKind::Expired
+        });
     }
 
     fn attempt_fits(&self, attempt: &ProposalAttempt) -> Result<bool, ApplicationError> {
@@ -158,7 +198,7 @@ impl RootRefCasStateMachine {
             return Err(ApplicationError::new("duplicate proposal attempt coordinate"));
         }
         self.prune_attempts(observed.index);
-        if self.attempt_fits(&attempt)? {
+        if self.attempts.contains_key(&observed) && self.attempt_fits(&attempt)? {
             return Ok(());
         }
         self.attempts = prior_attempts;
@@ -167,10 +207,10 @@ impl RootRefCasStateMachine {
             return Err(ApplicationError::new("duplicate capacity refusal attempt coordinate"));
         }
         self.prune_attempts(observed.index);
-        if self.attempt_fits(&fallback)? {
+        if self.attempts.contains_key(&observed) && self.attempt_fits(&fallback)? {
             Ok(())
         } else {
-            Err(ApplicationError::new("bounded adapter state cannot admit a capacity refusal"))
+            Err(ApplicationError::new("bounded adapter state cannot retain a capacity refusal"))
         }
     }
 
@@ -186,7 +226,7 @@ impl RootRefCasStateMachine {
             return Err(ApplicationError::new("duplicate proposal attempt coordinate"));
         }
         self.prune_attempts(log_id.index);
-        if self.attempt_fits(&attempt)? {
+        if self.attempts.contains_key(&log_id) && self.attempt_fits(&attempt)? {
             return Ok(());
         }
         self.attempts = prior_attempts;
@@ -196,10 +236,10 @@ impl RootRefCasStateMachine {
             return Err(ApplicationError::new("duplicate capacity refusal attempt coordinate"));
         }
         self.prune_attempts(log_id.index);
-        if self.attempt_fits(&fallback)? {
+        if self.attempts.contains_key(&log_id) && self.attempt_fits(&fallback)? {
             Ok(())
         } else {
-            Err(ApplicationError::new("bounded adapter state cannot admit a capacity refusal"))
+            Err(ApplicationError::new("bounded adapter state cannot retain a capacity refusal"))
         }
     }
 
@@ -538,7 +578,9 @@ mod tests {
         InitializeGateCommand, NoopCommand, RefCasCommand, RepositoryLane, SmPackMode, WireGateInit, encode_command,
     };
     use crate::ref_store::core::types::GitObjectFormat;
-    use crate::ref_store::raft_backend::outcome::{RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusalKind};
+    use crate::ref_store::raft_backend::outcome::{
+        RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusal, RootRefCasRefusalKind,
+    };
     use crate::ref_store::raft_backend::proposal::{
         PROPOSAL_WINDOW, ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup,
     };
@@ -798,6 +840,84 @@ mod tests {
         let gate = app.machine().read_gate_version(repo).unwrap().expect("live gate");
         assert_eq!(gate.history_incarnation(), live_history);
         assert_eq!(gate.authority_epoch(), 2);
+        assert_eq!(app.logical_clock_floor(), 0);
+    }
+
+    #[test]
+    fn export_restore_after_first_at_one_replay_at_31_has_no_dangling_receipt() {
+        let mut app = RootRefCasStateMachine::new();
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let id = proposal_id(repo, tenant, history, 0);
+        let payload = envelope(&id, &init_command(repo, tenant, history, 1, 1, GitObjectFormat::Sha256));
+        app.apply(ApplicationLogId::new(1, 1), &payload).unwrap();
+        for index in 2..=30 {
+            app.advance_applied(ApplicationLogId::new(1, index)).unwrap();
+        }
+        let replay_log = ApplicationLogId::new(1, 31);
+        app.apply(replay_log, &payload).unwrap();
+        assert_eq!(app.query_attempt(replay_log).expect("replay before expiry").kind, ProposalAttemptKind::Replayed);
+        for index in 32..=33 {
+            app.advance_applied(ApplicationLogId::new(1, index)).unwrap();
+        }
+        assert_eq!(app.retained_attempt_count(), 0);
+        let exported = app.export_state().unwrap();
+        let digest = app.state_digest_hex().unwrap();
+
+        let mut restored = RootRefCasStateMachine::new();
+        restored.restore_state(&exported).unwrap();
+        assert_eq!(restored.state_digest_hex().unwrap(), digest);
+        assert_eq!(restored.export_state().unwrap(), exported);
+        assert_eq!(restored.retained_attempt_count(), 0);
+        assert!(matches!(restored.query_proposal(&id), ProposalLookup::Expired { .. }));
+    }
+
+    #[test]
+    fn valid_candidate_over_budget_rolls_back_to_capacity_and_following_write_succeeds() {
+        let mut app = RootRefCasStateMachine::new();
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let log = ApplicationLogId::new(1, 1);
+        let prior = app.machine().clone();
+        let id = proposal_id(repo, tenant, history, 0);
+        let huge = ProposalAttempt {
+            proposal_id: Some(id.clone()),
+            command_digest_hex: "00".repeat(32),
+            original_log_id: log,
+            observed_log_id: log,
+            kind: ProposalAttemptKind::First,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal {
+                kind: RootRefCasRefusalKind::InvalidInput,
+                detail: "x".repeat(MAX_PROPOSAL_RECEIPT_BYTES + 1024),
+            }),
+        };
+        let fallback = ProposalAttempt {
+            proposal_id: Some(id),
+            command_digest_hex: "00".repeat(32),
+            original_log_id: log,
+            observed_log_id: log,
+            kind: ProposalAttemptKind::First,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(RootRefCasRefusalKind::StateCapacity)),
+        };
+        app.commit_business_attempt(log, prior, huge, fallback).expect("capacity fallback is admissible");
+        assert_eq!(app.last_applied_coordinate(), Some(log));
+        assert_eq!(app.logical_clock_floor(), 0);
+        assert_eq!(app.retained_attempt_count(), 1);
+        let capacity = app.query_attempt(log).expect("capacity attempt");
+        assert_eq!(capacity.kind, ProposalAttemptKind::First);
+        assert!(matches!(
+            &capacity.outcome,
+            RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::StateCapacity
+        ));
+
+        let next_log = ApplicationLogId::new(1, 2);
+        let next_id = scoped_id(repo, tenant, history, 1, 1, GitObjectFormat::Sha256, 1, 9);
+        let next = init_command(repo, tenant, history, 1, 1, GitObjectFormat::Sha256);
+        app.apply(next_log, &envelope(&next_id, &next)).expect("healthy write after capacity refusal");
+        assert!(app.query_attempt(next_log).expect("next attempt").outcome.is_applied());
+        assert!(app.machine().read_gate_version(repo).unwrap().is_some());
         assert_eq!(app.logical_clock_floor(), 0);
     }
 }
