@@ -364,6 +364,7 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         assert_root_view_matches_source(&actor_view, &owned_source, producer.id, verified.tenant, &verified.fixture)
             .await
             .context("coordinator.actor.actor_view_verify")?;
+        drop(actor_view);
 
         // Default metadata/materialize preserve historical owner-independent
         // existing-root access while retaining the stored producer owner.
@@ -387,6 +388,7 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         assert_root_view_matches_source(&default_view, &owned_source, producer.id, verified.tenant, &verified.fixture)
             .await
             .context("coordinator.actor.default_view_verify")?;
+        drop(default_view);
 
         // Explicit actor-owned access still rejects a different authorized Admin.
         match facade.metadata_actor_owned(&db.pool, &actor, actor_read_input.clone(), deadline()).await {
