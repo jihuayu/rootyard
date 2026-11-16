@@ -14,6 +14,8 @@ pub enum RaftBackendError {
     ScopeMismatch(&'static str),
     /// The presented realm/epoch/generation does not equal the trusted configured realm.
     StaleRealm,
+    /// The applied Root gate does not match the trusted realm on the named axis.
+    StaleGate(&'static str),
     /// This node is not the leader; no local or projection read was substituted.
     FollowerRedirect(Option<u64>),
     /// No actual quorum proof was obtained within the bounded deadline.
@@ -48,6 +50,7 @@ impl fmt::Display for RaftBackendError {
                 write!(f, "command {coordinate} is outside the trusted repository/tenant/realm binding")
             }
             Self::StaleRealm => f.write_str("presented realm/epoch/storage generation is stale"),
+            Self::StaleGate(axis) => write!(f, "live Root gate does not match the trusted realm on {axis}"),
             Self::FollowerRedirect(leader) => {
                 write!(f, "leader redirect required (leader {leader:?}); follower cannot serve this view")
             }

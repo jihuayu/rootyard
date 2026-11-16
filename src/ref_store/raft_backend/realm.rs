@@ -2,6 +2,7 @@
 
 use uuid::Uuid;
 
+use crate::ref_store::core::types::GitObjectFormat;
 use crate::ref_store::raft_backend::error::RaftBackendError;
 
 const MAX_GROUP_BYTES: usize = 64;
@@ -57,6 +58,8 @@ pub struct RealmBinding {
     authority_id: Uuid,
     history_id: Uuid,
     group_epoch: u64,
+    authority_epoch: i64,
+    object_format: GitObjectFormat,
     storage_generation: u64,
 }
 
@@ -68,6 +71,8 @@ impl RealmBinding {
         authority_id: Uuid,
         history_id: Uuid,
         group_epoch: u64,
+        authority_epoch: i64,
+        object_format: GitObjectFormat,
         storage_generation: u64,
     ) -> Result<Self, RaftBackendError> {
         if tenant_id.is_nil() || authority_id.is_nil() || history_id.is_nil() {
@@ -78,10 +83,22 @@ impl RealmBinding {
         if group_epoch == 0 || group_epoch > i64::MAX as u64 {
             return Err(RaftBackendError::InvalidConfig("group_epoch must be in 1..=i64::MAX"));
         }
+        if authority_epoch <= 0 {
+            return Err(RaftBackendError::InvalidConfig("authority_epoch must be positive"));
+        }
         if storage_generation == 0 {
             return Err(RaftBackendError::InvalidConfig("storage_generation must be positive"));
         }
-        Ok(Self { tenant_id, group_id, authority_id, history_id, group_epoch, storage_generation })
+        Ok(Self {
+            tenant_id,
+            group_id,
+            authority_id,
+            history_id,
+            group_epoch,
+            authority_epoch,
+            object_format,
+            storage_generation,
+        })
     }
 
     pub fn tenant_id(&self) -> Uuid {
@@ -102,6 +119,14 @@ impl RealmBinding {
 
     pub fn group_epoch(&self) -> u64 {
         self.group_epoch
+    }
+
+    pub fn authority_epoch(&self) -> i64 {
+        self.authority_epoch
+    }
+
+    pub fn object_format(&self) -> GitObjectFormat {
+        self.object_format
     }
 
     pub fn storage_generation(&self) -> u64 {

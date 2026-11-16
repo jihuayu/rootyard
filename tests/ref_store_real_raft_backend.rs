@@ -496,7 +496,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let history = Uuid::new_v4();
     let authority = Uuid::new_v4();
     let trust = NodeTrust::new(TEST_GROUP, authority, 1)?;
-    let realm = RealmBinding::new(tenant, TEST_GROUP, authority, history, 1, 1)?;
+    let realm = RealmBinding::new(tenant, TEST_GROUP, authority, history, 1, 1, GitObjectFormat::Sha256, 1)?;
     let cluster = TestCluster::start_three(trust.clone()).await?;
     let (leader_id, _leader_term) = cluster.wait_leader(Duration::from_secs(20)).await?;
     let options = BackendOptions {
@@ -613,16 +613,44 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     assert!(matches!(follower.propose(commit.clone()).await, Err(RaftBackendError::FollowerRedirect(_))));
 
     // Stale realm/epoch refuses before any quorum or local read.
-    let stale_realm = RealmBinding::new(tenant, TEST_GROUP, authority, history, 2, 1)?;
+    let stale_realm = RealmBinding::new(tenant, TEST_GROUP, authority, history, 2, 1, GitObjectFormat::Sha256, 1)?;
     assert!(matches!(backend.read_committed_view_for(&stale_realm).await, Err(RaftBackendError::StaleRealm)));
 
-    // Coordinate isolation: another repository cannot see or write repo A's state.
+    // Coordinate isolation: initialize and commit repository B, then prove repository A's
+    // committed view does not see B and a B-scoped backend cannot write A.
     let repo_b = Uuid::new_v4();
     let backend_b = backend_on(&cluster, leader_id, repo_b, tenant, realm.clone(), options).await?;
+    assert!(matches!(backend_b.read_committed_view().await, Err(RaftBackendError::StaleGate("gate_missing"))));
+    let init_b = backend_b.propose(init_command(repo_b, tenant, history)).await?;
+    assert!(init_b.outcome.is_applied());
+    let operation_b = Uuid::new_v4();
+    let commit_b =
+        commit_command(repo_b, tenant, issuer, history, 1, operation_b, 1, "refs/heads/b-only", None, oid(3));
+    let expected_b_oid = oid(3).as_hex();
+    assert!(backend_b.propose(commit_b).await?.outcome.is_applied());
     let view_b = backend_b.read_committed_view().await?;
-    assert!(view_b.read_refs().is_empty());
+    assert_eq!(view_b.read_ref("refs/heads/b-only").as_deref(), Some(expected_b_oid.as_str()));
     assert!(view_b.read_ref("refs/heads/main").is_none());
+    let view_a = backend.read_committed_view().await?;
+    assert_eq!(view_a.read_ref("refs/heads/main").as_deref(), Some(expected_oid.as_str()));
+    assert!(view_a.read_ref("refs/heads/b-only").is_none());
     assert!(matches!(backend_b.propose(commit.clone()).await, Err(RaftBackendError::ScopeMismatch("repository_id"))));
+
+    // Live realm/gate axes that are not covered by the old static binding: object format,
+    // tenant, and a missing repository gate all fail before a view can be minted. These reads
+    // still perform a real ReadIndex first and fail on the applied gate afterwards.
+    let sha1_realm = RealmBinding::new(tenant, TEST_GROUP, authority, history, 1, 1, GitObjectFormat::Sha1, 1)?;
+    let sha1_backend = backend_on(&cluster, leader_id, repo, tenant, sha1_realm, options).await?;
+    assert!(matches!(sha1_backend.read_committed_view().await, Err(RaftBackendError::StaleGate("object_format"))));
+
+    let tenant_b = Uuid::new_v4();
+    let tenant_b_realm = RealmBinding::new(tenant_b, TEST_GROUP, authority, history, 1, 1, GitObjectFormat::Sha256, 1)?;
+    let tenant_b_backend = backend_on(&cluster, leader_id, repo, tenant_b, tenant_b_realm, options).await?;
+    assert!(matches!(tenant_b_backend.read_committed_view().await, Err(RaftBackendError::StaleGate("tenant_id"))));
+
+    let repo_c = Uuid::new_v4();
+    let repo_c_backend = backend_on(&cluster, leader_id, repo_c, tenant, realm.clone(), options).await?;
+    assert!(matches!(repo_c_backend.read_committed_view().await, Err(RaftBackendError::StaleGate("gate_missing"))));
 
     // A real malformed/foreign-domain command is refused by the same reducer callback without
     // advancing its applied coordinate.
@@ -766,6 +794,45 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     );
     cluster.heal_partitions();
     let (healed_leader, _) = cluster.wait_leader(Duration::from_secs(20)).await?;
+
+    // The live gate, not only the cached realm, must match before a view is minted. A controlled
+    // SetRepositoryLane transition is allowed to install a new history/authority realm; old
+    // backends then fail on the actual applied gate. The transition command is exempt from the
+    // pre-append live-gate read because it is the operation that changes those axes.
+    let history_2 = Uuid::new_v4();
+    let realm_h2a2 = RealmBinding::new(tenant, TEST_GROUP, authority, history_2, 1, 2, GitObjectFormat::Sha256, 1)?;
+    let backend_h2a2 = backend_on(&cluster, healed_leader, repo, tenant, realm_h2a2.clone(), options).await?;
+    let change_history = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+        repository_id: repo,
+        tenant_id: tenant,
+        lane: RepositoryLane::ServingRefStore,
+        lifecycle: ScopeLifecycle::Closing,
+        authz_floor: 1,
+        history_incarnation: history_2,
+        authority_epoch: 2,
+        group_epoch: 1,
+        pack_mode: SmPackMode::MetadataOnly,
+    });
+    assert!(backend_h2a2.propose(change_history).await?.outcome.is_applied());
+    assert!(backend_h2a2.read_committed_view().await.is_ok());
+    let stale_h1 = backend_on(&cluster, healed_leader, repo, tenant, realm.clone(), options).await?;
+    assert!(matches!(stale_h1.read_committed_view().await, Err(RaftBackendError::StaleGate("history_incarnation"))));
+
+    let realm_h2a3 = RealmBinding::new(tenant, TEST_GROUP, authority, history_2, 1, 3, GitObjectFormat::Sha256, 1)?;
+    let backend_h2a3 = backend_on(&cluster, healed_leader, repo, tenant, realm_h2a3, options).await?;
+    let change_authority = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+        repository_id: repo,
+        tenant_id: tenant,
+        lane: RepositoryLane::ServingRefStore,
+        lifecycle: ScopeLifecycle::Closing,
+        authz_floor: 1,
+        history_incarnation: history_2,
+        authority_epoch: 3,
+        group_epoch: 1,
+        pack_mode: SmPackMode::MetadataOnly,
+    });
+    assert!(backend_h2a3.propose(change_authority).await?.outcome.is_applied());
+    assert!(matches!(backend_h2a2.read_committed_view().await, Err(RaftBackendError::StaleGate("authority_epoch"))));
 
     // Restart actual cluster SQLite state: shut down all nodes, reopen the leader's application
     // state machine from its own directory, and verify the committed Root refs/coordinate.

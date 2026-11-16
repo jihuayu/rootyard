@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use openraft::storage::RaftSnapshotBuilder;
+use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{BasicNode, Config, Raft, RaftMetrics, Snapshot};
 use rootyard_refcas_log::cluster::MtlsNetworkFactory;
 use rootyard_refcas_log::state_machine::PersistentStateMachine;

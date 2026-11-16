@@ -3,6 +3,7 @@
 use uuid::Uuid;
 
 use crate::ref_store::core::state_machine::RefCasCommand;
+use crate::ref_store::core::types::GitObjectFormat;
 use crate::ref_store::raft_backend::error::RaftBackendError;
 use crate::ref_store::raft_backend::realm::RealmBinding;
 
@@ -11,6 +12,32 @@ struct CommandScope {
     tenant_id: Option<Uuid>,
     group_epoch: Option<i64>,
     authority_id: Option<Uuid>,
+    history_incarnation: Option<Uuid>,
+    authority_epoch: Option<i64>,
+    object_format: Option<GitObjectFormat>,
+}
+
+fn base(
+    repository_id: Uuid,
+    tenant_id: Option<Uuid>,
+    group_epoch: Option<i64>,
+    authority_id: Option<Uuid>,
+) -> CommandScope {
+    CommandScope {
+        repository_id,
+        tenant_id,
+        group_epoch,
+        authority_id,
+        history_incarnation: None,
+        authority_epoch: None,
+        object_format: None,
+    }
+}
+
+/// Commands that are the controlled gate transition (or gate-independent) cannot be blocked by
+/// the old live gate. Every other command must pass a live-gate ReadIndex precheck.
+pub(crate) fn requires_live_gate_precheck(command: &RefCasCommand) -> bool {
+    !matches!(command, RefCasCommand::InitializeGate(_) | RefCasCommand::Noop(_) | RefCasCommand::SetRepositoryLane(_))
 }
 
 /// Rejects a command whose business coordinates are outside the backend's trusted binding.
@@ -24,92 +51,46 @@ pub(crate) fn validate_command_scope(
     let scope = match command {
         RefCasCommand::Noop(_) => return Ok(()),
         RefCasCommand::InitializeGate(cmd) => CommandScope {
-            repository_id: cmd.gate.repository_id,
-            tenant_id: Some(cmd.gate.tenant_id),
-            group_epoch: Some(cmd.gate.group_epoch),
-            authority_id: None,
+            history_incarnation: Some(cmd.gate.history_incarnation),
+            authority_epoch: Some(cmd.gate.authority_epoch),
+            object_format: Some(cmd.gate.object_format),
+            ..base(cmd.gate.repository_id, Some(cmd.gate.tenant_id), Some(cmd.gate.group_epoch), None)
         },
         RefCasCommand::SetRepositoryLane(cmd) => CommandScope {
-            repository_id: cmd.repository_id,
-            tenant_id: Some(cmd.tenant_id),
-            group_epoch: Some(cmd.group_epoch),
-            authority_id: None,
+            history_incarnation: Some(cmd.history_incarnation),
+            authority_epoch: Some(cmd.authority_epoch),
+            ..base(cmd.repository_id, Some(cmd.tenant_id), Some(cmd.group_epoch), None)
         },
-        RefCasCommand::BeginOperation(cmd) => CommandScope {
-            repository_id: cmd.identity.repository_id,
-            tenant_id: None,
-            group_epoch: None,
-            authority_id: None,
-        },
+        RefCasCommand::BeginOperation(cmd) => base(cmd.identity.repository_id, None, None, None),
         RefCasCommand::CommitRefs(cmd) => CommandScope {
-            repository_id: cmd.request.repository_id,
-            tenant_id: Some(cmd.request.tenant_id),
-            group_epoch: Some(cmd.request.group_epoch),
-            authority_id: None,
+            history_incarnation: Some(cmd.request.history_incarnation),
+            authority_epoch: Some(cmd.request.authority_epoch),
+            object_format: Some(cmd.request.object_format),
+            ..base(cmd.request.repository_id, Some(cmd.request.tenant_id), Some(cmd.request.group_epoch), None)
         },
-        RefCasCommand::Cancel(cmd) => CommandScope {
-            repository_id: cmd.identity.repository_id,
-            tenant_id: None,
-            group_epoch: None,
-            authority_id: None,
-        },
-        RefCasCommand::AdvanceCancelCutoff(cmd) => {
-            CommandScope { repository_id: cmd.repository_id, tenant_id: None, group_epoch: None, authority_id: None }
-        }
-        RefCasCommand::InstallDecision(cmd) => CommandScope {
-            repository_id: cmd.repository_id,
-            tenant_id: Some(cmd.tenant_id),
-            group_epoch: None,
-            authority_id: None,
-        },
+        RefCasCommand::Cancel(cmd) => base(cmd.identity.repository_id, None, None, None),
+        RefCasCommand::AdvanceCancelCutoff(cmd) => base(cmd.repository_id, None, None, None),
+        RefCasCommand::InstallDecision(cmd) => base(cmd.repository_id, Some(cmd.tenant_id), None, None),
         RefCasCommand::CreateSnapshotPin(cmd) => CommandScope {
-            repository_id: cmd.repository_id,
-            tenant_id: Some(cmd.tenant_id),
-            group_epoch: Some(cmd.group_epoch),
-            authority_id: None,
+            history_incarnation: Some(cmd.history_incarnation),
+            authority_epoch: Some(cmd.authority_epoch),
+            object_format: Some(cmd.object_format),
+            ..base(cmd.repository_id, Some(cmd.tenant_id), Some(cmd.group_epoch), None)
         },
-        RefCasCommand::RenewPin(cmd) => CommandScope {
-            repository_id: cmd.repository_id,
-            tenant_id: Some(cmd.tenant_id),
-            group_epoch: None,
-            authority_id: None,
-        },
-        RefCasCommand::ReleasePin(cmd) => CommandScope {
-            repository_id: cmd.repository_id,
-            tenant_id: Some(cmd.tenant_id),
-            group_epoch: None,
-            authority_id: None,
-        },
+        RefCasCommand::RenewPin(cmd) => base(cmd.repository_id, Some(cmd.tenant_id), None, None),
+        RefCasCommand::ReleasePin(cmd) => base(cmd.repository_id, Some(cmd.tenant_id), None, None),
         RefCasCommand::RegisterRoot(cmd) => CommandScope {
-            repository_id: cmd.repository_id,
-            tenant_id: Some(cmd.tenant_id),
-            group_epoch: Some(cmd.group_epoch),
-            authority_id: None,
+            history_incarnation: Some(cmd.history_incarnation),
+            authority_epoch: Some(cmd.authority_epoch),
+            object_format: Some(cmd.object_format),
+            ..base(cmd.repository_id, Some(cmd.tenant_id), Some(cmd.group_epoch), None)
         },
-        RefCasCommand::ReleaseRoot(cmd) => CommandScope {
-            repository_id: cmd.repository_id,
-            tenant_id: Some(cmd.tenant_id),
-            group_epoch: None,
-            authority_id: None,
-        },
-        RefCasCommand::AcquireHoldBatch(cmd) => CommandScope {
-            repository_id: cmd.repository_id,
-            tenant_id: Some(cmd.tenant_id),
-            group_epoch: None,
-            authority_id: Some(cmd.authority_id),
-        },
-        RefCasCommand::MarkHoldConsumed(cmd) => CommandScope {
-            repository_id: cmd.repository_id,
-            tenant_id: Some(cmd.tenant_id),
-            group_epoch: None,
-            authority_id: None,
-        },
-        RefCasCommand::RetireHoldBatch(cmd) => CommandScope {
-            repository_id: cmd.repository_id,
-            tenant_id: Some(cmd.tenant_id),
-            group_epoch: None,
-            authority_id: None,
-        },
+        RefCasCommand::ReleaseRoot(cmd) => base(cmd.repository_id, Some(cmd.tenant_id), None, None),
+        RefCasCommand::AcquireHoldBatch(cmd) => {
+            base(cmd.repository_id, Some(cmd.tenant_id), None, Some(cmd.authority_id))
+        }
+        RefCasCommand::MarkHoldConsumed(cmd) => base(cmd.repository_id, Some(cmd.tenant_id), None, None),
+        RefCasCommand::RetireHoldBatch(cmd) => base(cmd.repository_id, Some(cmd.tenant_id), None, None),
     };
 
     if scope.repository_id != repository_id {
@@ -129,6 +110,15 @@ pub(crate) fn validate_command_scope(
         && authority_id != realm.authority_id()
     {
         return Err(RaftBackendError::ScopeMismatch("authority_id"));
+    }
+    if scope.history_incarnation.is_some_and(|value| value != realm.history_id()) {
+        return Err(RaftBackendError::ScopeMismatch("history_incarnation"));
+    }
+    if scope.authority_epoch.is_some_and(|value| value != realm.authority_epoch()) {
+        return Err(RaftBackendError::ScopeMismatch("authority_epoch"));
+    }
+    if scope.object_format.is_some_and(|value| value != realm.object_format()) {
+        return Err(RaftBackendError::ScopeMismatch("object_format"));
     }
     Ok(())
 }

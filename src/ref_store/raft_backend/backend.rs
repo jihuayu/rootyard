@@ -16,7 +16,7 @@ use crate::ref_store::raft_backend::error::RaftBackendError;
 use crate::ref_store::raft_backend::outcome::{OutcomeQuery, ProposeOutcome, StoredOutcome, command_digest_hex};
 use crate::ref_store::raft_backend::realm::RealmBinding;
 use crate::ref_store::raft_backend::reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine};
-use crate::ref_store::raft_backend::scope::validate_command_scope;
+use crate::ref_store::raft_backend::scope::{requires_live_gate_precheck, validate_command_scope};
 use crate::ref_store::raft_backend::view::CommittedRefCasView;
 
 const MAX_DEADLINE: Duration = Duration::from_secs(60);
@@ -153,6 +153,13 @@ impl RootRaftRefCasBackend {
     /// refusal path makes the ordering race a durable decision rather than an OpenRaft failure.
     pub async fn propose(&self, command: RefCasCommand) -> Result<ProposeOutcome, RaftBackendError> {
         validate_command_scope(&command, self.repository_id, self.tenant_id, &self.realm)?;
+        if requires_live_gate_precheck(&command) {
+            // A real quorum ReadIndex view also validates the live gate against the trusted
+            // realm before this command is accepted for append. The controlled gate transition
+            // (SetRepositoryLane) and gate-independent InitializeGate/Noop are exempt so a new
+            // realm can actually become live.
+            self.read_committed_view().await?;
+        }
         let payload =
             encode_command(&command).map_err(|_| RaftBackendError::Encode("root Ref-CAS command codec refused"))?;
         let digest_hex = command_digest_hex(&payload);
@@ -161,7 +168,8 @@ impl RootRaftRefCasBackend {
             .encode()
             .map_err(|_| RaftBackendError::Encode("application envelope codec refused"))?;
 
-        match tokio::time::timeout(self.options.quorum_timeout, self.node.raft().client_write(envelope)).await {
+        let raft = self.node.raft();
+        match tokio::time::timeout(self.options.quorum_timeout, raft.client_write(envelope)).await {
             Ok(Ok(response)) => {
                 let log_id = ApplicationLogId::from_log_id(response.log_id);
                 let snapshot = self.await_applied_snapshot(Some(log_id)).await?;
@@ -211,15 +219,15 @@ impl RootRaftRefCasBackend {
         if presented != &self.realm {
             return Err(RaftBackendError::StaleRealm);
         }
-        let read_log_id =
-            match tokio::time::timeout(self.options.quorum_timeout, self.node.raft().ensure_linearizable()).await {
-                Ok(Ok(read_log_id)) => read_log_id,
-                Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
-                    return Err(RaftBackendError::FollowerRedirect(fwd.leader_id));
-                }
-                Ok(Err(_)) => return Err(RaftBackendError::QuorumUnavailable("read index")),
-                Err(_) => return Err(RaftBackendError::QuorumUnavailable("read index timeout")),
-            };
+        let raft = self.node.raft();
+        let read_log_id = match tokio::time::timeout(self.options.quorum_timeout, raft.ensure_linearizable()).await {
+            Ok(Ok(read_log_id)) => read_log_id,
+            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
+                return Err(RaftBackendError::FollowerRedirect(fwd.leader_id));
+            }
+            Ok(Err(_)) => return Err(RaftBackendError::QuorumUnavailable("read index")),
+            Err(_) => return Err(RaftBackendError::QuorumUnavailable("read index timeout")),
+        };
 
         self.await_applied_and_mint(read_log_id).await
     }
@@ -236,7 +244,37 @@ impl RootRaftRefCasBackend {
         if reducer.last_applied() != applied {
             return Err(RaftBackendError::Storage("root reducer coordinate mismatch"));
         }
+        self.validate_live_gate(reducer)?;
         Ok(CommittedRefCasView::mint(reducer.clone(), applied, self.repository_id, self.tenant_id, self.realm.clone()))
+    }
+
+    fn validate_live_gate(&self, reducer: &RootRefCasStateMachine) -> Result<(), RaftBackendError> {
+        let gate = reducer
+            .machine()
+            .read_gate_version(self.repository_id)
+            .map_err(|_| RaftBackendError::Storage("live gate query"))?
+            .ok_or(RaftBackendError::StaleGate("gate_missing"))?;
+        if gate.repository_id() != self.repository_id {
+            return Err(RaftBackendError::StaleGate("repository_id"));
+        }
+        if gate.tenant_id() != self.tenant_id {
+            return Err(RaftBackendError::StaleGate("tenant_id"));
+        }
+        if gate.history_incarnation() != self.realm.history_id() {
+            return Err(RaftBackendError::StaleGate("history_incarnation"));
+        }
+        let expected_group_epoch = i64::try_from(self.realm.group_epoch())
+            .map_err(|_| RaftBackendError::InvalidConfig("group_epoch does not fit gate i64"))?;
+        if gate.group_epoch() != expected_group_epoch {
+            return Err(RaftBackendError::StaleGate("group_epoch"));
+        }
+        if gate.authority_epoch() != self.realm.authority_epoch() {
+            return Err(RaftBackendError::StaleGate("authority_epoch"));
+        }
+        if gate.object_format() != self.realm.object_format() {
+            return Err(RaftBackendError::StaleGate("object_format"));
+        }
+        Ok(())
     }
 
     async fn await_applied_snapshot(

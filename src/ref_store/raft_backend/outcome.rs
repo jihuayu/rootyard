@@ -10,11 +10,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::ref_store::CoreGateVersion;
 use crate::ref_store::contract::{OperationState, RefStoreError};
-use crate::ref_store::core::state_machine::{ApplyResponse, RefCasCommand, StateMachineError};
+use crate::ref_store::core::state_machine::{ApplyResponse, RefCasCommand, ScopeLifecycle, StateMachineError};
 use crate::ref_store::core::terminal::CommitTerminal;
 use crate::ref_store::core::types::GitObjectFormat;
-use crate::ref_store::{CoreGateVersion, ScopeLifecycle};
 
 /// One result of applying a Root business command at an exact Raft coordinate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
