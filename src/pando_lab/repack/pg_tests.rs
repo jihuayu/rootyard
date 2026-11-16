@@ -42,6 +42,33 @@ fn set_fault(point: &str) {
     super::test_support::set_fault(Some(point));
 }
 
+/// Fail closed before any fixture side effect. This inspects only presence,
+/// never values, and never mutates process-global environment.
+///
+/// Direct fixture-escaping overrides in the real source are:
+/// - `object_store::store_root` -> `PANDO_OBJECT_STORE_ROOT`
+/// - `lifecycle::provider::resolve_kms_dir` -> `PANDO_KMS_KEYRING_DIR`
+/// - `provider_selection` -> `PANDO_KMS_PROVIDER`
+/// - `object_store::remote_enabled` -> `ROOTYARD_OBJECT_STORE_ENDPOINT`
+///
+/// Vault URL/token/mount/key variables are unreachable while
+/// `PANDO_KMS_PROVIDER` is absent or Local, and any presence of that selector
+/// is rejected below. `PANDO_OBJECT_STORE_BUCKET` changes only a key prefix
+/// under the owned temporary root, not the fixture root itself.
+fn preflight_fixture_isolation() {
+    for name in [
+        "PANDO_OBJECT_STORE_ROOT",
+        "PANDO_KMS_KEYRING_DIR",
+        "PANDO_KMS_PROVIDER",
+        "ROOTYARD_OBJECT_STORE_ENDPOINT",
+    ] {
+        assert!(
+            std::env::var_os(name).is_none(),
+            "repack PG fixture isolation preflight failed: external {name} is set; remove it so the owned temporary fixture cannot escape"
+        );
+    }
+}
+
 fn config_for(label: &str) -> Option<(Config, PathBuf)> {
     let database = std::env::var("ROOTYARD_TEST_DATABASE_URL").ok()?;
     if database.trim().is_empty() {
@@ -223,6 +250,7 @@ fn default_options(sync_object_store: bool) -> RepackOptions {
 async fn pg_repack_default_local_publishes_one_authority_and_retains_pinned_data() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
+    preflight_fixture_isolation();
     let Some((config, root)) = config_for("default-local") else {
         return;
     };
@@ -284,6 +312,7 @@ async fn pg_repack_default_local_publishes_one_authority_and_retains_pinned_data
 async fn pg_repack_generation_race_fails_cleanly_without_authority() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
+    preflight_fixture_isolation();
     let Some((config, root)) = config_for("generation-race") else {
         return;
     };
@@ -322,6 +351,7 @@ async fn pg_repack_generation_race_fails_cleanly_without_authority() {
 async fn pg_repack_forced_final_failure_rolls_back_authority_and_mirror() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
+    preflight_fixture_isolation();
     let Some((config, root)) = config_for("forced-rollback") else {
         return;
     };
@@ -359,6 +389,7 @@ async fn pg_repack_forced_final_failure_rolls_back_authority_and_mirror() {
 async fn pg_repack_rotation_barrier_keeps_exact_target_and_shared_gate() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
+    preflight_fixture_isolation();
     let Some((config, root)) = config_for("rotation-barrier") else {
         return;
     };
@@ -424,6 +455,7 @@ async fn pg_repack_rotation_barrier_keeps_exact_target_and_shared_gate() {
 async fn pg_repack_no_sync_local_legacy_and_active_target_narrow_reject() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
+    preflight_fixture_isolation();
     let Some((config, root)) = config_for("no-sync") else {
         return;
     };
