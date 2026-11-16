@@ -241,12 +241,27 @@ def _safe_field(value, kind):
     return False
 
 
-def read_join_evidence(log_path: Path, expected_namespace: int, expected_workspace_hash: str):
+def read_join_evidence(
+    log_path: Path,
+    expected_namespace: int,
+    expected_workspace_hashes,
+    forbidden_workspace_hashes=(),
+):
     """Parse exactly one fixed-schema evidence line from our own service log.
 
-    Only matching lines are parsed; unrelated service diagnostics are ignored
-    and never returned. The caller receives safe counts/hashes only.
+    The evidence must name exactly the expected workspace identities, with no
+    duplicates or omissions, and the joined-mount count must equal that exact
+    set size. Forbidden identities (for example the deliberately corrupted
+    later fixture) must be absent. Only matching lines are parsed; unrelated
+    service diagnostics are ignored and never returned. The caller receives
+    safe counts/hashes only.
     """
+    expected = tuple(str(value) for value in expected_workspace_hashes)
+    if not expected:
+        raise LegacyAcceptanceError("legacy join evidence has no expected workspace")
+    if len(set(expected)) != len(expected):
+        raise LegacyAcceptanceError("expected legacy workspace identities are not unique")
+    forbidden = {str(value) for value in forbidden_workspace_hashes}
     path = Path(log_path)
     try:
         raw = path.read_bytes()
@@ -294,20 +309,27 @@ def read_join_evidence(log_path: Path, expected_namespace: int, expected_workspa
         raise LegacyAcceptanceError("legacy join evidence workspace list is not bounded")
     if any(not isinstance(value, str) or len(value) != 64 for value in workspaces):
         raise LegacyAcceptanceError("legacy join evidence workspace identity is not a SHA-256")
+    if len(set(workspaces)) != len(workspaces):
+        raise LegacyAcceptanceError("legacy join evidence workspace identities are not unique")
     if payload["pending_admissions"] != 0:
         raise LegacyAcceptanceError("legacy join evidence retained a pending admission")
     if payload["retained_owners"] != 0:
         raise LegacyAcceptanceError("legacy join evidence retained an owned mount")
     if payload["cleanup_failures"] != 0:
         raise LegacyAcceptanceError("legacy join evidence reported a cleanup failure")
-    if expected_workspace_hash not in workspaces:
-        raise LegacyAcceptanceError("legacy join evidence did not name the HTTP-created workspace")
+    if forbidden.intersection(workspaces):
+        raise LegacyAcceptanceError("legacy join evidence named a forbidden workspace")
+    if joined != len(expected):
+        raise LegacyAcceptanceError("legacy join evidence mount count does not match the exact workspace set")
+    if set(workspaces) != set(expected):
+        raise LegacyAcceptanceError("legacy join evidence workspace set is not the exact expected set")
     return {
         "schema": EVIDENCE_SCHEMA,
         "mount_namespace": namespace,
         "joined_mounts": joined,
         "joined_workspaces": len(workspaces),
         "workspace_hashes": list(workspaces),
+        "expected_workspace_hashes": list(expected),
         "pending_admissions": 0,
         "retained_owners": 0,
         "cleanup_failures": 0,

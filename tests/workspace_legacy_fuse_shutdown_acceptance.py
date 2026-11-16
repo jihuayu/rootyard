@@ -36,6 +36,7 @@ for path in (TESTS, ROOT):
 
 from tests import fuse_helper_native_support as support  # noqa: E402
 from tests import workspace_legacy_fuse_shutdown_fixtures as legacy_fixtures  # noqa: E402
+from tests import workspace_legacy_fuse_shutdown_ownership as legacy_ownership  # noqa: E402
 from tests import workspace_legacy_fuse_shutdown_support as legacy_support  # noqa: E402
 from tests.e2e import Harness  # noqa: E402
 from tests.runtime_binary import select_runtime_binary  # noqa: E402
@@ -53,6 +54,7 @@ SOURCE_PATHS = (
     "tests/workspace_legacy_fuse_shutdown_acceptance.py",
     "tests/workspace_legacy_fuse_shutdown_support.py",
     "tests/workspace_legacy_fuse_shutdown_fixtures.py",
+    "tests/workspace_legacy_fuse_shutdown_ownership.py",
     "tests/workspace_legacy_fuse_shutdown_report.py",
 )
 CASE_DETAILS: dict[str, dict] = {}
@@ -103,6 +105,7 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
                 pass
             raise
         self.holders = []
+        self.holder_proofs = []
         self.created_mountpoints = []
         self.owned_records = []
         self.conflict = None
@@ -117,6 +120,10 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
                 legacy_support.force_stop_owned_service(harness)
             legacy_fixtures.close_conflict(self.conflict)
             self.conflict = None
+            # Recheck the same owned holder PID/starttime after the service has
+            # exited and before the finally block releases the holder.
+            for holder, proof in self.holder_proofs:
+                legacy_ownership.recheck_holder_identity(holder, proof)
             # Reuse the absolute deadline armed at the case trigger. Failure
             # containment never receives a fresh oracle window after D, and no
             # containment wait runs before a trigger has armed that deadline.
@@ -142,6 +149,7 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
                 for holder in self.holders:
                     legacy_support.close_holder(holder)
                 self.holders = []
+                self.holder_proofs = []
                 if harness.proc is not None:
                     try:
                         support.terminate_process(harness.proc)
@@ -166,16 +174,18 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         proc = self.h.proc
         if proc is None:
             raise legacy_support.LegacyAcceptanceError("owned service is already gone")
-        if os.getpgid(proc.pid) != proc.pid:
-            raise legacy_support.LegacyAcceptanceError("owned service is not its process-group leader")
+        legacy_ownership.owned_service_group(proc)
         os.killpg(proc.pid, sig)
 
-    def _attach_holder(self, api_pid):
+    def _attach_holder(self, service_proc):
+        api_pid = int(service_proc.pid)
         holder = legacy_support.attach_namespace_holder(
             api_pid, time.monotonic() + legacy_support.ORACLE_SECONDS
         )
         self.holders.append(holder)
-        return holder
+        proof = legacy_ownership.capture_holder_identity(holder, service_proc)
+        self.holder_proofs.append((holder, proof))
+        return holder, proof
 
     def _remember_record(self, mountpoint, mount_id):
         if int(mount_id) <= 0:
@@ -187,24 +197,29 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
 
     def _start_oracle_service(self):
         self.oracle_log_path = self.h.root / f"legacy-shutdown-oracle-{uuid.uuid4().hex}.log"
-        proc = legacy_support.start_service(self.h, self.oracle_log_path)
-        return proc.pid
+        return legacy_support.start_service(self.h, self.oracle_log_path)
 
     def _arm_cleanup_deadline(self):
         """Arm the one absolute case deadline at the actual trigger."""
         self._cleanup_deadline = time.monotonic() + legacy_support.ORACLE_SECONDS
         return self._cleanup_deadline
 
-    def _record_detail(self, namespace, evidence, exit_code):
-        CASE_DETAILS[self.id()] = {
-            "mount_namespace": namespace,
-            "joined_mounts": evidence["joined_mounts"],
-            "joined_workspaces": evidence["joined_workspaces"],
+    def _record_detail(self, evidence, exit_code, holder_proof):
+        detail = {
+            "mount_namespace": int(holder_proof["service_namespace"]),
+            "joined_mounts": int(evidence["joined_mounts"]),
+            "joined_workspaces": int(evidence["joined_workspaces"]),
+            "workspace_hashes": list(evidence["workspace_hashes"]),
             "exit_code": int(exit_code),
             "primary_nonzero": exit_code != 0,
+            "holder_identity_rechecked": True,
             "owned_mounts_remaining": None,
             "containment_used": 0,
         }
+        legacy_ownership.record_ownership_detail(
+            detail, holder_proof, legacy_ownership.observed_mount_ids(self.owned_records)
+        )
+        CASE_DETAILS[self.id()] = detail
 
     def _create_workspace(self, agent_id, key):
         workspace = legacy_fixtures.create_workspace(self.h, agent_id, key)
@@ -235,22 +250,20 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             "real FUSE write did not read back the exact bytes",
         )
 
-        api_pid = self.h.proc.pid
-        self.assertEqual(os.getpgid(api_pid), api_pid, "owned service is not its process-group leader")
+        legacy_ownership.owned_service_group(self.h.proc)
+        api_pid = int(self.h.proc.pid)
         mount = support.wait_for_fuse_mount(
             api_pid, paths["mountpoint"], timeout=legacy_support.STARTUP_OBSERVATION_SECONDS
         )
         mount_id = int(mount["mount_id"])
         self._remember_record(paths["mountpoint"], mount_id)
 
-        holder = self._attach_holder(api_pid)
-        holder_identity = support.process_identity(holder.pid)
-        self.assertIsNotNone(holder_identity, "namespace holder identity is unavailable")
+        holder, holder_proof = self._attach_holder(self.h.proc)
         visible = legacy_support.wait_owned_mount(
             holder.pid, paths["mountpoint"], time.monotonic() + legacy_support.ORACLE_SECONDS
         )
         self.assertEqual(int(visible["mount_id"]), mount_id, "holder does not see the exact service mount")
-        namespace = legacy_support.mount_namespace_inode(api_pid)
+        namespace = int(holder_proof["service_namespace"])
 
         deadline = self._arm_cleanup_deadline()
         self._signal_owned(signal.SIGTERM)
@@ -268,17 +281,14 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             0,
             "an owned legacy mount remained after SIGTERM",
         )
-        current = support.process_identity(holder.pid)
-        self.assertIsNotNone(current, "namespace holder exited before the post-exit observation")
-        self.assertEqual(
-            current["starttime"], holder_identity["starttime"],
-            "the independent namespace holder identity changed",
-        )
+        legacy_ownership.recheck_holder_identity(holder, holder_proof)
         evidence = legacy_support.read_join_evidence(
-            self.oracle_log_path, namespace, legacy_support.workspace_hash(workspace_id)
+            self.oracle_log_path,
+            namespace,
+            [legacy_support.workspace_hash(workspace_id)],
         )
-        self.assertGreaterEqual(evidence["joined_mounts"], 1)
-        self._record_detail(namespace, evidence, code)
+        self.assertEqual(evidence["joined_mounts"], 1)
+        self._record_detail(evidence, code, holder_proof)
 
     def test_partial_reconcile_failure_cleans_earlier_owned_mount(self):
         created = [
@@ -301,6 +311,9 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         ordered = sorted(prepared, key=lambda item: uuid.UUID(item[0]["id"]).bytes)
         broken_workspace, broken_paths = ordered[-1]
         healthy = ordered[:-1]
+        self.assertEqual(len(created), 3, "the isolated partial case did not create exactly three workspaces")
+        self.assertEqual(len(prepared), 3, "not every isolated partial workspace was prepared mounted")
+        self.assertEqual(len(healthy), 2, "the partial case did not retain exactly two healthy workspaces")
         broken_lower = broken_paths["lower"]
         git_dir = broken_lower / ".git"
         if not git_dir.is_dir():
@@ -319,8 +332,8 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         self.assertEqual(code, 0, "preparation service did not stop cleanly before the failure run")
         self.owned_records.clear()
 
-        api_pid = self._start_oracle_service()
-        holder = self._attach_holder(api_pid)
+        service_proc = self._start_oracle_service()
+        holder, holder_proof = self._attach_holder(service_proc)
         observed = {}
         for workspace, paths in healthy:
             mount = legacy_support.wait_owned_mount(
@@ -331,10 +344,18 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             mount_id = int(mount["mount_id"])
             self._remember_record(paths["mountpoint"], mount_id)
             observed[workspace["id"]] = mount_id
-        if len(observed) < 2:
-            raise legacy_support.LegacyAcceptanceError("earlier healthy workspaces were not both observed mounted")
+        self.assertEqual(
+            len(observed),
+            2,
+            "earlier healthy workspaces were not both observed mounted",
+        )
+        self.assertEqual(
+            set(observed),
+            {workspace["id"] for workspace, _paths in healthy},
+            "the observed mounts are not the exact two healthy workspaces",
+        )
 
-        namespace = legacy_support.mount_namespace_inode(api_pid)
+        namespace = int(holder_proof["service_namespace"])
         deadline = self._arm_cleanup_deadline()
         code = support.wait_process_exit(
             self.h.proc, timeout=max(0.0, deadline - time.monotonic())
@@ -353,18 +374,40 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             0,
             "an earlier owned mount remained after the reconcile failure",
         )
+        self.assertEqual(
+            legacy_support.owned_leftovers(holder.pid, [broken_paths["mountpoint"]]),
+            0,
+            "the corrupted later workspace was mounted despite its reconcile failure",
+        )
+        legacy_ownership.recheck_holder_identity(holder, holder_proof)
+        healthy_hashes = [
+            legacy_support.workspace_hash(workspace["id"])
+            for workspace, _paths in healthy
+        ]
+        broken_hash = legacy_support.workspace_hash(broken_workspace["id"])
+        self.assertEqual(
+            len(set(healthy_hashes)),
+            2,
+            "the two healthy workspace hashes are not unique",
+        )
         evidence = legacy_support.read_join_evidence(
             self.oracle_log_path,
             namespace,
-            legacy_support.workspace_hash(healthy[0][0]["id"]),
+            healthy_hashes,
+            forbidden_workspace_hashes=(broken_hash,),
         )
-        self.assertGreaterEqual(evidence["joined_mounts"], 2)
+        self.assertEqual(evidence["joined_mounts"], 2)
+        self.assertEqual(
+            set(evidence["workspace_hashes"]),
+            set(healthy_hashes),
+            "the evidence did not name exactly both healthy workspaces",
+        )
         self.assertNotIn(
-            legacy_support.workspace_hash(broken_workspace["id"]),
+            broken_hash,
             evidence["workspace_hashes"],
             "the corrupted later workspace was reported as a joined mount",
         )
-        self._record_detail(namespace, evidence, code)
+        self._record_detail(evidence, code, holder_proof)
 
     def test_post_reconcile_api_bind_failure_cleans_owned_mount(self):
         workspace, paths = self._create_workspace("legacy-bind", "legacy-bind-create")
@@ -384,8 +427,8 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         self.owned_records.clear()
 
         self.conflict = legacy_fixtures.bind_owned_conflict(self.h.port)
-        api_pid = self._start_oracle_service()
-        holder = self._attach_holder(api_pid)
+        service_proc = self._start_oracle_service()
+        holder, holder_proof = self._attach_holder(service_proc)
         visible = legacy_support.wait_owned_mount(
             holder.pid,
             paths["mountpoint"],
@@ -393,7 +436,7 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         )
         mount_id = int(visible["mount_id"])
         self._remember_record(paths["mountpoint"], mount_id)
-        namespace = legacy_support.mount_namespace_inode(api_pid)
+        namespace = int(holder_proof["service_namespace"])
         deadline = self._arm_cleanup_deadline()
         code = support.wait_process_exit(
             self.h.proc, timeout=max(0.0, deadline - time.monotonic())
@@ -409,11 +452,14 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             0,
             "a previously mounted workspace remained after the bind failure",
         )
+        legacy_ownership.recheck_holder_identity(holder, holder_proof)
         evidence = legacy_support.read_join_evidence(
-            self.oracle_log_path, namespace, legacy_support.workspace_hash(workspace_id)
+            self.oracle_log_path,
+            namespace,
+            [legacy_support.workspace_hash(workspace_id)],
         )
-        self.assertGreaterEqual(evidence["joined_mounts"], 1)
-        self._record_detail(namespace, evidence, code)
+        self.assertEqual(evidence["joined_mounts"], 1)
+        self._record_detail(evidence, code, holder_proof)
 
 
 if __name__ == "__main__":
