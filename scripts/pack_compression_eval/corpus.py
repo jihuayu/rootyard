@@ -418,13 +418,16 @@ def seed_multi_push_bare_repo(
     }
 
 
-def build_git_http_env(base_env: dict[str, str], askpass_path: Path, token_secret: str) -> dict[str, str]:
+def build_git_http_env(
+    base_env: dict[str, str], askpass_path: Path, username: str, token_secret: str
+) -> dict[str, str]:
     """Construct Smart HTTP non-interactive git environment using askpass secret."""
     env = isolated_git_env(base_env)
     env.update(
         {
             "GIT_ASKPASS": str(askpass_path),
-            "ROOTYARD_ASKPASS_USER": "x-access-token",
+            "GIT_ASKPASS_REQUIRE": "force",
+            "ROOTYARD_ASKPASS_USER": username,
             "ROOTYARD_ASKPASS_SECRET": token_secret,
             "GCM_INTERACTIVE": "never",
         }

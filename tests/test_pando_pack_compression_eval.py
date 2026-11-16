@@ -22,9 +22,11 @@ if str(SCRIPTS) not in sys.path:
 from pack_compression_eval.corpus import (  # noqa: E402
     DATASET_ARCHETYPES,
     build_archetype_commits,
+    build_git_http_env,
     isolated_git_env,
     resolve_trusted_git,
     seed_multi_push_bare_repo,
+    write_askpass_script,
 )
 from pack_compression_eval.correctness import run_correctness_suite  # noqa: E402
 from pack_compression_eval.live_server import resolve_live_env  # noqa: E402
@@ -144,6 +146,14 @@ class PackCompressionEvalTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             resolve_live_env({})
+
+        with tempfile.TemporaryDirectory(prefix="pack-eval-askpass-") as tmp:
+            askpass = write_askpass_script(Path(tmp) / "askpass.sh")
+            self.assertTrue(askpass.is_file())
+            http_env = build_git_http_env(os.environ, askpass, "alice_eval", "ryt_secret_123")
+            self.assertEqual(http_env["ROOTYARD_ASKPASS_USER"], "alice_eval")
+            self.assertEqual(http_env["ROOTYARD_ASKPASS_SECRET"], "ryt_secret_123")
+            self.assertEqual(http_env["GIT_ASKPASS_REQUIRE"], "force")
 
         fake_cand = {
             "config": CANDIDATE_CONFIGS[0].to_dict(),

@@ -245,7 +245,7 @@ def push_with_pack_config(
     ref_target: str,
     env: dict[str, str],
 ) -> float:
-    args: list[str] = []
+    args: list[str] = ["-c", "credential.helper="]
     if spec is not None:
         args.extend(spec.git_config_args())
     args.extend(["push", "--quiet", "--porcelain", remote_url, ref_target])
@@ -258,7 +258,7 @@ def push_with_pack_config(
 def clone_and_fsck(git_bin: str, remote_url: str, dest: Path, env: dict[str, str]) -> float:
     if dest.exists():
         shutil.rmtree(dest)
-    proc, ms = run_git(git_bin, ["clone", "--quiet", remote_url, str(dest)], None, env)
+    proc, ms = run_git(git_bin, ["-c", "credential.helper=", "clone", "--quiet", remote_url, str(dest)], None, env)
     if proc.returncode != 0:
         raise RuntimeError(f"HTTP git clone failed: {proc.stderr.decode(errors='replace')[:300]}")
     fsck, _ = run_git(git_bin, ["-C", str(dest), "fsck", "--full", "--strict"], None, env)

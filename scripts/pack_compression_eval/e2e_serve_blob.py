@@ -115,11 +115,11 @@ def run_live_serve_blob_eval(
         repos: list[dict[str, Any]] = []
         multi_push_latencies: list[float] = []
         proxy.reset_counters()
-        acked: list[tuple[str, str, str, str, str]] = []
+        acked: list[tuple[str, str, str, str, str, str]] = []
 
         for idx, (arch, obj_fmt) in enumerate(archetype_specs):
             rw, ro = p1_tenants[idx]
-            git_rw_env = build_git_http_env(run_env, askpass, rw["token"])
+            git_rw_env = build_git_http_env(run_env, askpass, rw["username"], rw["token"])
             repo_info = create_repo(base_url, rw["token"], f"eval-{arch}-{obj_fmt}-{idx}", object_format=obj_fmt)
             wdir = work_root / f"client-{arch}-{obj_fmt}-{idx}"
             init_work_repo(git_bin, wdir, git_rw_env, object_format=obj_fmt)
@@ -139,7 +139,7 @@ def run_live_serve_blob_eval(
                 multi_push_latencies.append(
                     push_with_pack_config(git_bin, wdir, remote_url, None, "HEAD:refs/heads/main", git_rw_env)
                 )
-            acked.append((repo_info["clone_path"], "refs/heads/main", head_oid, arch, ro["token"]))
+            acked.append((repo_info["clone_path"], "refs/heads/main", head_oid, arch, ro["username"], ro["token"]))
             bare_mirror = work_root / f"ref-bare-{idx}.git"
             run_git(git_bin, ["clone", "--bare", "--quiet", str(wdir), str(bare_mirror)], None, git_rw_env)
             logical = measure_bare_repo_stats(git_bin, bare_mirror, git_rw_env)
@@ -173,7 +173,7 @@ def run_live_serve_blob_eval(
         cold_browse_ms: list[float] = []
         for idx, entry in enumerate(repos):
             ro_tok = entry["ro"]["token"]
-            git_ro_env = build_git_http_env(run_env, askpass, ro_tok)
+            git_ro_env = build_git_http_env(run_env, askpass, entry["ro"]["username"], ro_tok)
             remote_url = base_url + entry["repo"]["clone_path"]
             cold_clone_ms.append(clone_and_fsck(git_bin, remote_url, work_root / f"cold-clone-{idx}", git_ro_env))
             cold_browse_ms.extend(
@@ -189,7 +189,7 @@ def run_live_serve_blob_eval(
         warm_browse_ms: list[float] = []
         for idx, entry in enumerate(repos):
             ro_tok = entry["ro"]["token"]
-            git_ro_env = build_git_http_env(run_env, askpass, ro_tok)
+            git_ro_env = build_git_http_env(run_env, askpass, entry["ro"]["username"], ro_tok)
             remote_url = base_url + entry["repo"]["clone_path"]
             for rep in range(2):
                 warm_clone_ms.append(clone_and_fsck(git_bin, remote_url, work_root / f"warm-clone-{idx}-{rep}", git_ro_env))
@@ -209,8 +209,8 @@ def run_live_serve_blob_eval(
         candidate_serving: list[dict[str, Any]] = []
         for s_idx, spec in enumerate(compare_specs):
             cmp_rw, cmp_ro = cmp_tenants[s_idx]
-            cmp_rw_env = build_git_http_env(run_env, askpass, cmp_rw["token"])
-            cmp_ro_env = build_git_http_env(run_env, askpass, cmp_ro["token"])
+            cmp_rw_env = build_git_http_env(run_env, askpass, cmp_rw["username"], cmp_rw["token"])
+            cmp_ro_env = build_git_http_env(run_env, askpass, cmp_ro["username"], cmp_ro["token"])
             push_ms: list[float] = []
             c_cold_ms: list[float] = []
             c_warm_ms: list[float] = []
@@ -229,7 +229,9 @@ def run_live_serve_blob_eval(
                 c_pg = query_repo_pg_pack_bytes(pg_url, run_env, crepo["id"])
                 serving_sum += c_pg["artifact_bytes"]
                 coexist_sum += target["uncompacted_pg"]["artifact_bytes"] + c_pg["artifact_bytes"]
-                acked.append((crepo["clone_path"], "refs/heads/main", target["head_oid"], f"{target['archetype']}:{spec.name}", cmp_ro["token"]))
+                acked.append(
+                    (crepo["clone_path"], "refs/heads/main", target["head_oid"], f"{target['archetype']}:{spec.name}", cmp_ro["username"], cmp_ro["token"])
+                )
                 cmp_repos.append(crepo)
             put_s3 = proxy.snapshot()
 
@@ -265,7 +267,8 @@ def run_live_serve_blob_eval(
 
         # Phase 3: Concurrent pushes across distinct branches + Browse + PG inspection.
         conc_target = repos[0]
-        conc_rw_env = build_git_http_env(run_env, askpass, conc_target["rw"]["token"])
+        conc_rw_env = build_git_http_env(run_env, askpass, conc_target["rw"]["username"], conc_target["rw"]["token"])
+        conc_ro_user = conc_target["ro"]["username"]
         conc_ro_tok = conc_target["ro"]["token"]
         conc_branches = 3
         barrier = threading.Barrier(conc_branches + 1)
@@ -287,7 +290,7 @@ def run_live_serve_blob_eval(
             ms = push_with_pack_config(git_bin, cdir, base_url + conc_target["repo"]["clone_path"], None, f"HEAD:{branch_ref}", conc_rw_env)
             with conc_lock:
                 conc_results.append((ms, oid_b))
-                acked.append((conc_target["repo"]["clone_path"], branch_ref, oid_b, "concurrent", conc_ro_tok))
+                acked.append((conc_target["repo"]["clone_path"], branch_ref, oid_b, "concurrent", conc_ro_user, conc_ro_tok))
 
         def _conc_browse_and_pg() -> None:
             barrier.wait(timeout=30)
@@ -301,8 +304,13 @@ def run_live_serve_blob_eval(
                 fut.result()
 
         verified_acked = 0
-        for clone_path, ref_name, exp_oid, _, ro_tok in acked:
-            ls_proc, _ = run_git(git_bin, ["ls-remote", base_url + clone_path, ref_name], None, build_git_http_env(run_env, askpass, ro_tok))
+        for clone_path, ref_name, exp_oid, _, ro_user, ro_tok in acked:
+            ls_proc, _ = run_git(
+                git_bin,
+                ["-c", "credential.helper=", "ls-remote", base_url + clone_path, ref_name],
+                None,
+                build_git_http_env(run_env, askpass, ro_user, ro_tok),
+            )
             if ls_proc.returncode != 0 or exp_oid not in ls_proc.stdout.decode("utf-8"):
                 raise RuntimeError(f"ACK verification mismatch for {ref_name} expected {exp_oid}")
             verified_acked += 1
