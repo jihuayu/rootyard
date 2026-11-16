@@ -2,7 +2,7 @@
 //! ignored real PG/S3/trusted-Git tests; no HTTP route, keyring or runtime PASS is
 //! claimed. Sources and roots are established through the real provision,
 //! A3/A4/native publication, A5 serving snapshot and core roots paths.
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use axum::http::StatusCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,23 +92,28 @@ async fn assert_root_view_matches_source(
 #[tokio::test]
 #[ignore = "requires real PG/S3/Git and the integrated roots/serving modules"]
 async fn exact_create_replays_after_source_release_expiry_and_root_release() -> Result<()> {
-    let db = Db::setup().await?;
+    let db = Db::setup().await.context("coordinator.fixture.db_setup")?;
     let store = open_store()?;
     let git = git_binary()?;
     let outcome = async {
-        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "coord-exact-replay").await?;
-        let source = create_serving_snapshot(&db, &store, &actor, &repository, 300).await?;
+        let (verified, actor, repository) =
+            verify_new_serving(&db, &store, &git, "coord-exact-replay").await.context("coordinator.legacy.setup")?;
+        let source = create_serving_snapshot(&db, &store, &actor, &repository, 300)
+            .await
+            .context("coordinator.legacy.source_create")?;
         let facade = PgServingRetentionRoots::new(adapter(&store, &git)?);
         let input = create_input(&repository.owner, &repository.name, source.snapshot_id(), "coord-replay");
-        let first = facade.create(&db.pool, &actor, input.clone(), deadline()).await?;
+        let first =
+            facade.create(&db.pool, &actor, input.clone(), deadline()).await.context("coordinator.legacy.create")?;
         ensure!(!first.replayed(), "fresh create replayed");
         let root_id = first.root_id();
-        let counts = root_counts(&db.pool, verified.repo).await?;
-        let usage = repo_usage(&db.pool, verified.repo).await?;
+        let counts = root_counts(&db.pool, verified.repo).await.context("coordinator.legacy.quota_after_create")?;
+        let usage = repo_usage(&db.pool, verified.repo).await.context("coordinator.legacy.usage_after_create")?;
 
         let record = facade
             .metadata(&db.pool, &actor, read_input(&repository.owner, &repository.name, root_id), deadline())
-            .await?
+            .await
+            .context("coordinator.legacy.metadata_active")?
             .ok_or_else(|| anyhow::anyhow!("fresh root metadata missing"))?;
         ensure!(record.is_active(), "fresh root is not active");
 
@@ -121,17 +126,31 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
             &source,
             deadline(),
         )
-        .await?;
-        let replay = facade.create(&db.pool, &actor, input.clone(), deadline()).await?;
+        .await
+        .context("coordinator.legacy.source_release")?;
+        let replay = facade
+            .create(&db.pool, &actor, input.clone(), deadline())
+            .await
+            .context("coordinator.legacy.create_replay_after_source_release")?;
         ensure!(replay.replayed() && replay.root_id() == root_id, "released-source exact replay differs");
-        ensure!(root_counts(&db.pool, verified.repo).await? == counts, "replay charged root quota");
-        ensure!(repo_usage(&db.pool, verified.repo).await? == usage, "replay charged usage counters");
+        ensure!(
+            root_counts(&db.pool, verified.repo).await.context("coordinator.legacy.quota_after_create_replay")?
+                == counts,
+            "replay charged root quota"
+        );
+        ensure!(
+            repo_usage(&db.pool, verified.repo).await.context("coordinator.legacy.usage_after_create_replay")? == usage,
+            "replay charged usage counters"
+        );
 
         let view = facade
             .materialize(&db.pool, &actor, read_input(&repository.owner, &repository.name, root_id), deadline())
-            .await?;
+            .await
+            .context("coordinator.legacy.materialize_after_source_release")?;
         ensure!(view.refs() == record.refs(), "serving root view refs differ after source release");
-        stock_git_accepts_view(&view, &verified.fixture, deadline()).await?;
+        stock_git_accepts_view(&view, &verified.fixture, deadline())
+            .await
+            .context("coordinator.legacy.git_verify_after_source_release")?;
 
         let release = ServingRootRelease {
             owner: repository.owner.clone(),
@@ -140,24 +159,34 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
             idempotency_key: "coord-replay-release".to_owned(),
             reason: "fixture release".to_owned(),
         };
-        let released = facade.release(&db.pool, &actor, release, deadline()).await?;
+        let released =
+            facade.release(&db.pool, &actor, release, deadline()).await.context("coordinator.legacy.release_active")?;
         ensure!(released.state() == "released", "root release state differs");
-        let replay_after_release = facade.create(&db.pool, &actor, input.clone(), deadline()).await?;
+        let replay_after_release = facade
+            .create(&db.pool, &actor, input.clone(), deadline())
+            .await
+            .context("coordinator.legacy.create_replay_after_root_release")?;
         ensure!(
             replay_after_release.replayed() && replay_after_release.root_id() == root_id,
             "released-root exact replay differs"
         );
         let released_record = facade
             .metadata(&db.pool, &actor, read_input(&repository.owner, &repository.name, root_id), deadline())
-            .await?
+            .await
+            .context("coordinator.legacy.metadata_released")?
             .ok_or_else(|| anyhow::anyhow!("released root metadata missing"))?;
         ensure!(released_record.state() == "released", "metadata did not retain released root state");
 
         // Actual source-pin expiry has the same no-source replay property.
-        let expiring = create_serving_snapshot(&db, &store, &actor, &repository, 8).await?;
+        let expiring = create_serving_snapshot(&db, &store, &actor, &repository, 8)
+            .await
+            .context("coordinator.legacy.expiring_source_create")?;
         let expiring_input = create_input(&repository.owner, &repository.name, expiring.snapshot_id, "coord-expiry");
-        let expiring_receipt = facade.create(&db.pool, &actor, expiring_input.clone(), deadline()).await?;
-        wait_pin_expired(&db.pool, expiring.pin_id).await?;
+        let expiring_receipt = facade
+            .create(&db.pool, &actor, expiring_input.clone(), deadline())
+            .await
+            .context("coordinator.legacy.expiring_create")?;
+        wait_pin_expired(&db.pool, expiring.pin_id).await.context("coordinator.legacy.wait_expiry")?;
         let expiring_view = facade
             .materialize(
                 &db.pool,
@@ -165,9 +194,13 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
                 read_input(&repository.owner, &repository.name, expiring_receipt.root_id()),
                 deadline(),
             )
-            .await?;
+            .await
+            .context("coordinator.legacy.expiring_materialize")?;
         ensure!(expiring_view.refs() == expiring.read.refs(), "expired source root view changed refs");
-        let expiring_replay = facade.create(&db.pool, &actor, expiring_input, deadline()).await?;
+        let expiring_replay = facade
+            .create(&db.pool, &actor, expiring_input, deadline())
+            .await
+            .context("coordinator.legacy.expiring_create_replay")?;
         ensure!(
             expiring_replay.replayed() && expiring_replay.root_id() == expiring_receipt.root_id(),
             "expired-source exact replay differs"
@@ -176,7 +209,9 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         // Additive actor-owned root lifecycle. Both roots are created through
         // the actor facade while the source A5 pin is live; default existing-root
         // APIs intentionally remain owner-independent for a current Admin.
-        let producer = serving_collaborator(&db.pool, verified.repo, verified.tenant, "admin", "owned-root-").await?;
+        let producer = serving_collaborator(&db.pool, verified.repo, verified.tenant, "admin", "owned-root-")
+            .await
+            .context("coordinator.actor.producer_grant")?;
         ensure!(
             producer.id != actor.id && producer.id != verified.tenant,
             "actor-owned root producer is not a distinct principal"
@@ -189,7 +224,8 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         };
         let owned_source_outcome = PgServingSnapshotMetadata
             .create_actor_owned(&db.pool, &producer, owned_source_create.clone(), store.backend_identity(), deadline())
-            .await?;
+            .await
+            .context("coordinator.actor.source_create")?;
         ensure!(!owned_source_outcome.replayed, "actor-owned source create replayed");
         ensure!(
             owned_source_outcome.receipt.scope().owner_id() == producer.id
@@ -208,7 +244,8 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
                 store.backend_identity(),
                 deadline(),
             )
-            .await?;
+            .await
+            .context("coordinator.actor.source_read")?;
         ensure!(
             owned_source_read.scope().owner_id() == producer.id
                 && owned_source_read.scope().tenant_id() == verified.tenant
@@ -226,7 +263,10 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         let mut default_input =
             create_input(&repository.owner, &repository.name, owned_source.snapshot_id, "coord-owned-default");
         default_input.intent.purpose = RootPurpose::Backup;
-        let default_root = facade.create_actor_owned(&db.pool, &producer, default_input.clone(), deadline()).await?;
+        let default_root = facade
+            .create_actor_owned(&db.pool, &producer, default_input.clone(), deadline())
+            .await
+            .context("coordinator.actor.default_root_create")?;
         ensure!(
             !default_root.replayed()
                 && default_root.state() == "active"
@@ -240,7 +280,10 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         let mut actor_input =
             create_input(&repository.owner, &repository.name, owned_source.snapshot_id, "coord-owned-actor");
         actor_input.intent.purpose = RootPurpose::Backup;
-        let actor_root = facade.create_actor_owned(&db.pool, &producer, actor_input.clone(), deadline()).await?;
+        let actor_root = facade
+            .create_actor_owned(&db.pool, &producer, actor_input.clone(), deadline())
+            .await
+            .context("coordinator.actor.actor_root_create")?;
         ensure!(
             !actor_root.replayed()
                 && actor_root.state() == "active"
@@ -250,8 +293,9 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         );
         let actor_root_id = actor_root.root_id();
         let actor_read_input = read_input(&repository.owner, &repository.name, actor_root_id);
-        let created_counts = root_counts(&db.pool, verified.repo).await?;
-        let created_usage = repo_usage(&db.pool, verified.repo).await?;
+        let created_counts =
+            root_counts(&db.pool, verified.repo).await.context("coordinator.actor.quota_after_roots")?;
+        let created_usage = repo_usage(&db.pool, verified.repo).await.context("coordinator.actor.usage_after_roots")?;
 
         // Release the actor-owned source pin; both root receipts remain retained.
         PgServingSnapshotMetadata
@@ -269,29 +313,39 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
                 store.backend_identity(),
                 deadline(),
             )
-            .await?;
+            .await
+            .context("coordinator.actor.source_release")?;
 
         // Exact create replay is source-pin independent for both actor roots.
-        let default_replay = facade.create_actor_owned(&db.pool, &producer, default_input.clone(), deadline()).await?;
+        let default_replay = facade
+            .create_actor_owned(&db.pool, &producer, default_input.clone(), deadline())
+            .await
+            .context("coordinator.actor.default_create_replay_after_source_release")?;
         ensure!(
             default_replay.replayed() && default_replay.root_id() == default_root_id,
             "default-compatibility root create replay differs"
         );
-        let actor_replay = facade.create_actor_owned(&db.pool, &producer, actor_input.clone(), deadline()).await?;
+        let actor_replay = facade
+            .create_actor_owned(&db.pool, &producer, actor_input.clone(), deadline())
+            .await
+            .context("coordinator.actor.actor_create_replay_after_source_release")?;
         ensure!(
             actor_replay.replayed() && actor_replay.root_id() == actor_root_id,
             "actor-owned root create replay differs"
         );
         ensure!(
-            root_counts(&db.pool, verified.repo).await? == created_counts
-                && repo_usage(&db.pool, verified.repo).await? == created_usage,
+            root_counts(&db.pool, verified.repo).await.context("coordinator.actor.quota_after_create_replay")?
+                == created_counts
+                && repo_usage(&db.pool, verified.repo).await.context("coordinator.actor.usage_after_create_replay")?
+                    == created_usage,
             "actor-owned create replay charged root quota or usage"
         );
 
         // Actor-owned metadata/materialize remain actor-bound.
         let actor_record = facade
             .metadata_actor_owned(&db.pool, &producer, actor_read_input.clone(), deadline())
-            .await?
+            .await
+            .context("coordinator.actor.actor_metadata_active")?
             .ok_or_else(|| anyhow!("actor-owned root metadata missing"))?;
         ensure!(
             actor_record.owner_id() == producer.id
@@ -301,16 +355,20 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
                 && actor_record.pack_count() > 0,
             "actor-owned root metadata owner/purpose/shape differs"
         );
-        let actor_view =
-            facade.materialize_actor_owned(&db.pool, &producer, actor_read_input.clone(), deadline()).await?;
+        let actor_view = facade
+            .materialize_actor_owned(&db.pool, &producer, actor_read_input.clone(), deadline())
+            .await
+            .context("coordinator.actor.actor_materialize_after_source_release")?;
         assert_root_view_matches_source(&actor_view, &owned_source, producer.id, verified.tenant, &verified.fixture)
-            .await?;
+            .await
+            .context("coordinator.actor.actor_view_verify")?;
 
         // Default metadata/materialize preserve historical owner-independent
         // existing-root access while retaining the stored producer owner.
         let default_record = facade
             .metadata(&db.pool, &actor, default_read_input.clone(), deadline())
-            .await?
+            .await
+            .context("coordinator.actor.default_metadata_active")?
             .ok_or_else(|| anyhow!("default compatibility root metadata missing"))?;
         ensure!(
             default_record.owner_id() == producer.id
@@ -320,20 +378,28 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
                 && default_record.pack_count() > 0,
             "default metadata did not preserve the stored producer owner"
         );
-        let default_view = facade.materialize(&db.pool, &actor, default_read_input.clone(), deadline()).await?;
+        let default_view = facade
+            .materialize(&db.pool, &actor, default_read_input.clone(), deadline())
+            .await
+            .context("coordinator.actor.default_materialize_after_source_release")?;
         assert_root_view_matches_source(&default_view, &owned_source, producer.id, verified.tenant, &verified.fixture)
-            .await?;
+            .await
+            .context("coordinator.actor.default_view_verify")?;
 
         // Explicit actor-owned access still rejects a different authorized Admin.
         match facade.metadata_actor_owned(&db.pool, &actor, actor_read_input.clone(), deadline()).await {
             Err(error) if error.0 == StatusCode::NOT_FOUND => {}
-            Err(error) => return Err(anyhow!("non-owner actor-owned root metadata returned {} {}", error.0, error.1)),
+            Err(error) => {
+                return Err(anyhow!("non-owner actor-owned root metadata returned {} {}", error.0, error.1)
+                    .context("coordinator.actor.nonowner_metadata_unexpected_status"));
+            }
             Ok(_) => return Err(anyhow!("non-owner actor-owned root metadata unexpectedly returned")),
         }
         match facade.materialize_actor_owned(&db.pool, &actor, actor_read_input.clone(), deadline()).await {
             Err(error) if error.0 == StatusCode::NOT_FOUND => {}
             Err(error) => {
-                return Err(anyhow!("non-owner actor-owned root materialize returned {} {}", error.0, error.1));
+                return Err(anyhow!("non-owner actor-owned root materialize returned {} {}", error.0, error.1)
+                    .context("coordinator.actor.nonowner_materialize_unexpected_status"));
             }
             Ok(_) => return Err(anyhow!("non-owner actor-owned root materialize unexpectedly returned")),
         }
@@ -353,27 +419,42 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         };
         match facade.release_actor_owned(&db.pool, &actor, actor_release.clone(), deadline()).await {
             Err(error) if error.0 == StatusCode::NOT_FOUND => {}
-            Err(error) => return Err(anyhow!("non-owner actor-owned root release returned {} {}", error.0, error.1)),
+            Err(error) => {
+                return Err(anyhow!("non-owner actor-owned root release returned {} {}", error.0, error.1)
+                    .context("coordinator.actor.nonowner_release_unexpected_status"));
+            }
             Ok(_) => return Err(anyhow!("non-owner actor-owned root release unexpectedly returned")),
         }
         ensure!(
-            root_counts(&db.pool, verified.repo).await? == created_counts
-                && repo_usage(&db.pool, verified.repo).await? == created_usage,
+            root_counts(&db.pool, verified.repo).await.context("coordinator.actor.quota_after_negative_checks")?
+                == created_counts
+                && repo_usage(&db.pool, verified.repo)
+                    .await
+                    .context("coordinator.actor.usage_after_negative_checks")?
+                    == created_usage,
             "actor-owned refusals charged root quota or usage"
         );
 
         // Default release Existing must work for a current Admin even though the
         // durable owner is the producer; exact replay returns the same terminal.
-        let default_released = facade.release(&db.pool, &actor, default_release.clone(), deadline()).await?;
+        let default_released = facade
+            .release(&db.pool, &actor, default_release.clone(), deadline())
+            .await
+            .context("coordinator.actor.default_root_release")?;
         ensure!(
             default_released.state() == "released"
                 && default_released.root_id() == default_root_id
                 && default_released.owner_id() == producer.id,
             "default release of producer-owned root state/owner differs"
         );
-        let default_released_counts = root_counts(&db.pool, verified.repo).await?;
-        let default_released_usage = repo_usage(&db.pool, verified.repo).await?;
-        let default_release_replay = facade.release(&db.pool, &actor, default_release, deadline()).await?;
+        let default_released_counts =
+            root_counts(&db.pool, verified.repo).await.context("coordinator.actor.quota_after_default_release")?;
+        let default_released_usage =
+            repo_usage(&db.pool, verified.repo).await.context("coordinator.actor.usage_after_default_release")?;
+        let default_release_replay = facade
+            .release(&db.pool, &actor, default_release, deadline())
+            .await
+            .context("coordinator.actor.default_release_replay")?;
         ensure!(
             default_release_replay.replayed()
                 && default_release_replay.root_id() == default_root_id
@@ -382,13 +463,20 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
             "default release replay did not return the same terminal"
         );
         ensure!(
-            root_counts(&db.pool, verified.repo).await? == default_released_counts
-                && repo_usage(&db.pool, verified.repo).await? == default_released_usage,
+            root_counts(&db.pool, verified.repo)
+                .await
+                .context("coordinator.actor.quota_after_default_release_replay")?
+                == default_released_counts
+                && repo_usage(&db.pool, verified.repo)
+                    .await
+                    .context("coordinator.actor.usage_after_default_release_replay")?
+                    == default_released_usage,
             "default release replay charged root quota or usage"
         );
         let default_released_record = facade
             .metadata(&db.pool, &actor, default_read_input.clone(), deadline())
-            .await?
+            .await
+            .context("coordinator.actor.default_metadata_released")?
             .ok_or_else(|| anyhow!("default released root metadata missing"))?;
         ensure!(
             default_released_record.owner_id() == producer.id && default_released_record.state() == "released",
@@ -396,16 +484,24 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         );
 
         // Explicit actor-owned release works on its actor's root.
-        let actor_released = facade.release_actor_owned(&db.pool, &producer, actor_release.clone(), deadline()).await?;
+        let actor_released = facade
+            .release_actor_owned(&db.pool, &producer, actor_release.clone(), deadline())
+            .await
+            .context("coordinator.actor.actor_root_release")?;
         ensure!(
             actor_released.state() == "released"
                 && actor_released.root_id() == actor_root_id
                 && actor_released.owner_id() == producer.id,
             "actor-owned root release state/owner differs"
         );
-        let actor_released_counts = root_counts(&db.pool, verified.repo).await?;
-        let actor_released_usage = repo_usage(&db.pool, verified.repo).await?;
-        let actor_release_replay = facade.release_actor_owned(&db.pool, &producer, actor_release, deadline()).await?;
+        let actor_released_counts =
+            root_counts(&db.pool, verified.repo).await.context("coordinator.actor.quota_after_actor_release")?;
+        let actor_released_usage =
+            repo_usage(&db.pool, verified.repo).await.context("coordinator.actor.usage_after_actor_release")?;
+        let actor_release_replay = facade
+            .release_actor_owned(&db.pool, &producer, actor_release, deadline())
+            .await
+            .context("coordinator.actor.actor_release_replay")?;
         ensure!(
             actor_release_replay.replayed()
                 && actor_release_replay.root_id() == actor_root_id
@@ -413,20 +509,27 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
                 && actor_release_replay.created_at_unix_micros() == actor_released.created_at_unix_micros(),
             "actor-owned release replay did not return the same terminal"
         );
-        let actor_create_after_release =
-            facade.create_actor_owned(&db.pool, &producer, actor_input, deadline()).await?;
+        let actor_create_after_release = facade
+            .create_actor_owned(&db.pool, &producer, actor_input, deadline())
+            .await
+            .context("coordinator.actor.actor_create_replay_after_root_release")?;
         ensure!(
             actor_create_after_release.replayed() && actor_create_after_release.root_id() == actor_root_id,
             "actor-owned create replay after root release differs"
         );
         ensure!(
-            root_counts(&db.pool, verified.repo).await? == actor_released_counts
-                && repo_usage(&db.pool, verified.repo).await? == actor_released_usage,
+            root_counts(&db.pool, verified.repo).await.context("coordinator.actor.quota_after_actor_release_replay")?
+                == actor_released_counts
+                && repo_usage(&db.pool, verified.repo)
+                    .await
+                    .context("coordinator.actor.usage_after_actor_release_replay")?
+                    == actor_released_usage,
             "actor-owned release/create replay charged root quota or usage"
         );
         let actor_released_record = facade
             .metadata_actor_owned(&db.pool, &producer, actor_read_input.clone(), deadline())
-            .await?
+            .await
+            .context("coordinator.actor.actor_metadata_released")?
             .ok_or_else(|| anyhow!("actor-owned released root metadata missing"))?;
         ensure!(
             actor_released_record.owner_id() == producer.id && actor_released_record.state() == "released",
@@ -434,25 +537,37 @@ async fn exact_create_replays_after_source_release_expiry_and_root_release() -> 
         );
 
         // Admin role loss is a real RBAC refusal; no ownership fallback.
-        let revoked_counts = root_counts(&db.pool, verified.repo).await?;
-        let revoked_usage = repo_usage(&db.pool, verified.repo).await?;
-        set_collaborator_role(&db.pool, verified.repo, producer.id, "write").await?;
+        let revoked_counts =
+            root_counts(&db.pool, verified.repo).await.context("coordinator.actor.quota_before_role_revoke")?;
+        let revoked_usage =
+            repo_usage(&db.pool, verified.repo).await.context("coordinator.actor.usage_before_role_revoke")?;
+        set_collaborator_role(&db.pool, verified.repo, producer.id, "write")
+            .await
+            .context("coordinator.actor.role_revoke")?;
         match facade.metadata_actor_owned(&db.pool, &producer, actor_read_input.clone(), deadline()).await {
             Err(error) if error.0 == StatusCode::FORBIDDEN => {}
-            Err(error) => return Err(anyhow!("role-revoked root metadata returned {} {}", error.0, error.1)),
+            Err(error) => {
+                return Err(anyhow!("role-revoked root metadata returned {} {}", error.0, error.1)
+                    .context("coordinator.actor.role_revoked_metadata_unexpected_status"));
+            }
             Ok(_) => return Err(anyhow!("role-revoked root metadata unexpectedly returned")),
         }
         match facade.materialize_actor_owned(&db.pool, &producer, actor_read_input, deadline()).await {
             Err(error) if error.0 == StatusCode::FORBIDDEN => {}
-            Err(error) => return Err(anyhow!("role-revoked root materialize returned {} {}", error.0, error.1)),
+            Err(error) => {
+                return Err(anyhow!("role-revoked root materialize returned {} {}", error.0, error.1)
+                    .context("coordinator.actor.role_revoked_materialize_unexpected_status"));
+            }
             Ok(_) => return Err(anyhow!("role-revoked root materialize unexpectedly returned")),
         }
         ensure!(
-            root_counts(&db.pool, verified.repo).await? == revoked_counts,
+            root_counts(&db.pool, verified.repo).await.context("coordinator.actor.quota_after_role_revoke")?
+                == revoked_counts,
             "role-revoked root metadata charged quota"
         );
         ensure!(
-            repo_usage(&db.pool, verified.repo).await? == revoked_usage,
+            repo_usage(&db.pool, verified.repo).await.context("coordinator.actor.usage_after_role_revoke")?
+                == revoked_usage,
             "role-revoked root materialize charged usage"
         );
 
