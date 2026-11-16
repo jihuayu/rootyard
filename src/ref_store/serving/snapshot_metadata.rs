@@ -52,6 +52,30 @@ const RELEASE_REQUEST_DOMAIN: &str = "serving-durable-snapshot-release-request-v
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const SERVING_PURPOSE: MetadataPinPurpose = MetadataPinPurpose::Verification;
 
+/// Private ownership mode for the shared serving lifecycle implementation.
+///
+/// `Tenant` is the historical/ordinary HTTP behavior: durable owner equals the
+/// repository tenant. `Actor` is the additive producer-owned behavior: durable
+/// owner equals the authenticated actor, never an arbitrary owner id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotOwnership {
+    Tenant,
+    Actor,
+}
+
+impl SnapshotOwnership {
+    fn owner_id(self, actor: &Identity, tenant_id: Uuid) -> Uuid {
+        match self {
+            Self::Tenant => tenant_id,
+            Self::Actor => actor.id,
+        }
+    }
+
+    fn is_actor(self) -> bool {
+        matches!(self, Self::Actor)
+    }
+}
+
 /// Bounded create input. `owner`/`name` are route selectors, not authority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServingSnapshotCreate {
@@ -118,6 +142,14 @@ impl RetainedServingReadContext {
 
 /// Stateless coordinator. It owns the short bounded transaction and the final
 /// late token check; the core adapters own the existing SQL/ledger details.
+///
+/// The historical `create`/`read`/`renew`/`release`/`materialize` methods keep
+/// the tenant-owned HTTP behavior. The additive `*_actor_owned` methods derive
+/// the durable owner from the authenticated actor only; no method accepts an
+/// arbitrary owner-id input. Both modes retain the existing Admin/scope/backend/
+/// realm/late-auth/receipt/quota/history/deadline behavior. The stable-id and
+/// idempotency namespace is shared: the same key with the other ownership mode
+/// is a typed conflict, never a replay of the wrong owner.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PgServingSnapshotMetadata;
 
@@ -126,6 +158,9 @@ impl PgServingSnapshotMetadata {
     /// create/replay/quota/history path. A fresh capture uses the current gate;
     /// an exact retry reconstructs the original gate expectation from the
     /// stored receipt/header before its digest is checked.
+    ///
+    /// This historical/default entry point keeps the durable snapshot owner
+    /// equal to the repository tenant. Ordinary HTTP calls retain this path.
     pub async fn create(
         &self,
         pool: &Pool,
@@ -134,11 +169,44 @@ impl PgServingSnapshotMetadata {
         backend: &BlobBackendIdentity,
         deadline: Instant,
     ) -> Result<PackSnapshotOutcome, Error> {
+        self.create_with_ownership(pool, actor, input, backend, deadline, SnapshotOwnership::Tenant).await
+    }
+
+    /// Capture one durable serving snapshot owned by the authenticated actor.
+    ///
+    /// The input still carries only repository owner/name selectors and has no
+    /// owner-id field. The durable owner is always `actor.id`; the repository
+    /// tenant, gate realm, backend, Admin role, ContentsWrite scope, quota,
+    /// history, receipt and late-auth checks remain the existing production
+    /// checks. The stable-id/idempotency namespace is shared with the tenant
+    /// mode, so reusing a tenant-owned key is a typed conflict, never a replay of
+    /// the wrong owner; an exact actor-owned retry still replays.
+    pub async fn create_actor_owned(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotCreate,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+    ) -> Result<PackSnapshotOutcome, Error> {
+        self.create_with_ownership(pool, actor, input, backend, deadline, SnapshotOwnership::Actor).await
+    }
+
+    async fn create_with_ownership(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotCreate,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+        ownership: SnapshotOwnership,
+    ) -> Result<PackSnapshotOutcome, Error> {
         validate_key(&input.idempotency_key)?;
         validate_lease(input.lease_seconds)?;
         let preflight = preflight(pool, actor, &input.owner, &input.name, true, backend, deadline).await?;
         let repository_id = preflight.repository.id;
-        let scope = scope_from_gate(&preflight.gate)?;
+        let tenant_id = preflight.gate.tenant_id();
+        let scope = scope_from_gate_for_owner(&preflight.gate, ownership.owner_id(actor, tenant_id))?;
         let request_id = derived_uuid(CREATE_REQUEST_DOMAIN, repository_id, actor.id, "create", &input.idempotency_key);
         let snapshot_id =
             derived_uuid(CREATE_SNAPSHOT_DOMAIN, repository_id, actor.id, "create", &input.idempotency_key);
@@ -224,6 +292,9 @@ impl PgServingSnapshotMetadata {
     /// selector. The pin/generation come from stored rows; a historical gate
     /// revision is allowed after refs advance as long as the current realm and
     /// serving binding still match.
+    ///
+    /// This historical/default entry point keeps the durable owner equal to the
+    /// repository tenant. Ordinary HTTP calls retain this path.
     pub async fn read(
         &self,
         pool: &Pool,
@@ -231,6 +302,37 @@ impl PgServingSnapshotMetadata {
         input: ServingSnapshotRead,
         backend: &BlobBackendIdentity,
         deadline: Instant,
+    ) -> Result<PackReadSnapshot, Error> {
+        self.read_with_ownership(pool, actor, input, backend, deadline, SnapshotOwnership::Tenant).await
+    }
+
+    /// Read one durable serving snapshot only when its persisted owner is the
+    /// authenticated actor.
+    ///
+    /// The input remains the repository-scoped selector. Current Admin plus
+    /// late ContentsRead and the ready backend/realm checks are unchanged. A
+    /// tenant-owned or another actor's snapshot is not reshaped into this
+    /// caller: it is refused after authorization with the common not-found
+    /// surface.
+    pub async fn read_actor_owned(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRead,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+    ) -> Result<PackReadSnapshot, Error> {
+        self.read_with_ownership(pool, actor, input, backend, deadline, SnapshotOwnership::Actor).await
+    }
+
+    async fn read_with_ownership(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRead,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+        ownership: SnapshotOwnership,
     ) -> Result<PackReadSnapshot, Error> {
         validate_snapshot(input.snapshot_id)?;
         let preflight = preflight(pool, actor, &input.owner, &input.name, false, backend, deadline).await?;
@@ -276,6 +378,8 @@ impl PgServingSnapshotMetadata {
                     .await);
                 }
             };
+            let expected_scope: Option<&MetadataSnapshotScope> =
+                if ownership.is_actor() { Some(value.scope()) } else { None };
             final_authority(
                 &tx,
                 actor,
@@ -284,11 +388,14 @@ impl PgServingSnapshotMetadata {
                 &preflight.repository.name,
                 RepoAction::ContentsRead,
                 backend,
-                None,
+                expected_scope,
                 false,
                 deadline,
             )
             .await?;
+            if value.scope().owner_id() != ownership.owner_id(actor, tenant_id) {
+                return Err(Error::not_found());
+            }
             Ok::<PackReadSnapshot, Error>(value)
         }
         .await;
@@ -316,10 +423,31 @@ impl PgServingSnapshotMetadata {
         Ok(self.materialize_with_context(pool, actor, input, materializer, deadline).await?.into_view())
     }
 
+    /// Materialize one durable serving snapshot only when its persisted owner
+    /// is the authenticated actor.
+    ///
+    /// The same T1/T2 authorization, ready backend/realm, cluster anchor, pin
+    /// liveness and native/Blob work are used. A tenant-owned or another
+    /// actor's snapshot is refused before native work; it is never reshaped into
+    /// this caller.
+    pub async fn materialize_actor_owned(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRead,
+        materializer: &PgPackSnapshotMaterializer,
+        deadline: Instant,
+    ) -> Result<MaterializedPackRead, Error> {
+        Ok(self
+            .materialize_with_context_for(pool, actor, input, materializer, deadline, SnapshotOwnership::Actor)
+            .await?
+            .into_view())
+    }
+
     /// Internal same-flow form that retains the exact T1 capture, cluster anchor
     /// and effective absolute deadline until the caller's post-encoding final
     /// fence. The public [`Self::materialize`] API unwraps the view exactly as
-    /// before.
+    /// before. Ordinary HTTP callers retain this tenant-owned path.
     pub(crate) async fn materialize_with_context(
         &self,
         pool: &Pool,
@@ -327,6 +455,19 @@ impl PgServingSnapshotMetadata {
         input: ServingSnapshotRead,
         materializer: &PgPackSnapshotMaterializer,
         deadline: Instant,
+    ) -> Result<RetainedServingReadContext, Error> {
+        self.materialize_with_context_for(pool, actor, input, materializer, deadline, SnapshotOwnership::Tenant)
+            .await
+    }
+
+    async fn materialize_with_context_for(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRead,
+        materializer: &PgPackSnapshotMaterializer,
+        deadline: Instant,
+        ownership: SnapshotOwnership,
     ) -> Result<RetainedServingReadContext, Error> {
         validate_snapshot(input.snapshot_id)?;
         let deadline = materializer.retained_deadline(deadline).map_err(map_metadata_error)?;
@@ -342,8 +483,18 @@ impl PgServingSnapshotMetadata {
         let tenant_id = initial.gate.tenant_id();
         let name = initial.repository.name.clone();
 
-        let (snapshot, cluster_incarnation) =
-            retained_t1(pool, actor, repository_id, tenant_id, &name, input.snapshot_id, backend, deadline).await?;
+        let (snapshot, cluster_incarnation) = retained_t1(
+            pool,
+            actor,
+            repository_id,
+            tenant_id,
+            &name,
+            input.snapshot_id,
+            backend,
+            deadline,
+            ownership,
+        )
+        .await?;
         let reference = PackSnapshotRef::new(
             repository_id,
             tenant_id,
@@ -353,8 +504,16 @@ impl PgServingSnapshotMetadata {
         )
         .map_err(map_metadata_error)?;
         let prepared =
-            match timeout_at(deadline, materializer.prepare_retained_serving(snapshot, cluster_incarnation, deadline))
-                .await
+            match timeout_at(
+                deadline,
+                materializer.prepare_retained_serving(
+                    snapshot,
+                    ownership.owner_id(actor, tenant_id),
+                    cluster_incarnation,
+                    deadline,
+                ),
+            )
+            .await
             {
                 Ok(result) => result.map_err(map_metadata_error)?,
                 Err(_) => return Err(deadline_error()),
@@ -370,6 +529,7 @@ impl PgServingSnapshotMetadata {
             materializer,
             backend,
             deadline,
+            ownership,
         )
         .await?;
         Ok(RetainedServingReadContext { view, cluster_incarnation, deadline })
@@ -432,6 +592,9 @@ impl PgServingSnapshotMetadata {
     /// Renew the stored pin at its exact generation. The stored scope and pin
     /// id are reconstructed from immutable rows; changed generation/lease under
     /// the same key conflicts in the existing request digest.
+    ///
+    /// This historical/default entry point keeps the durable owner equal to the
+    /// repository tenant. Ordinary HTTP calls retain this path.
     pub async fn renew(
         &self,
         pool: &Pool,
@@ -440,6 +603,36 @@ impl PgServingSnapshotMetadata {
         backend: &BlobBackendIdentity,
         deadline: Instant,
     ) -> Result<MetadataPinOutcome, Error> {
+        self.renew_with_ownership(pool, actor, input, backend, deadline, SnapshotOwnership::Tenant).await
+    }
+
+    /// Renew a serving pin only when the persisted snapshot owner is the
+    /// authenticated actor.
+    ///
+    /// Current Admin plus late ContentsWrite, exact generation, backend/realm
+    /// and receipt/idempotency semantics are unchanged. A tenant-owned or
+    /// another actor's snapshot is refused through the authorized not-found
+    /// surface and is never adopted.
+    pub async fn renew_actor_owned(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRenew,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+    ) -> Result<MetadataPinOutcome, Error> {
+        self.renew_with_ownership(pool, actor, input, backend, deadline, SnapshotOwnership::Actor).await
+    }
+
+    async fn renew_with_ownership(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRenew,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+        ownership: SnapshotOwnership,
+    ) -> Result<MetadataPinOutcome, Error> {
         validate_key(&input.idempotency_key)?;
         validate_snapshot(input.snapshot_id)?;
         validate_generation(input.expected_generation)?;
@@ -447,7 +640,7 @@ impl PgServingSnapshotMetadata {
         let preflight = preflight(pool, actor, &input.owner, &input.name, true, backend, deadline).await?;
         let repository_id = preflight.repository.id;
         let tenant_id = preflight.gate.tenant_id();
-        let current_scope = scope_from_gate(&preflight.gate)?;
+        let current_scope = scope_from_gate_for_owner(&preflight.gate, ownership.owner_id(actor, tenant_id))?;
         let request_id = derived_uuid(RENEW_REQUEST_DOMAIN, repository_id, actor.id, "renew", &input.idempotency_key);
 
         let mut client = acquire(pool, deadline).await?;
@@ -460,6 +653,9 @@ impl PgServingSnapshotMetadata {
             else {
                 return Err(RefStoreError::MetadataSnapshotNotFound { snapshot_id: input.snapshot_id });
             };
+            if identity.scope.owner_id() != ownership.owner_id(actor, tenant_id) {
+                return Err(RefStoreError::MetadataSnapshotNotFound { snapshot_id: input.snapshot_id });
+            }
             let request = RenewMetadataPinRequest::new(
                 identity.scope,
                 request_id,
@@ -530,6 +726,9 @@ impl PgServingSnapshotMetadata {
     /// Release the stored pin at its exact generation. The immutable receipt is
     /// returned only after acknowledged commit; an exact retry never extends or
     /// revives the lease.
+    ///
+    /// This historical/default entry point keeps the durable owner equal to the
+    /// repository tenant. Ordinary HTTP calls retain this path.
     pub async fn release(
         &self,
         pool: &Pool,
@@ -538,13 +737,43 @@ impl PgServingSnapshotMetadata {
         backend: &BlobBackendIdentity,
         deadline: Instant,
     ) -> Result<MetadataPinOutcome, Error> {
+        self.release_with_ownership(pool, actor, input, backend, deadline, SnapshotOwnership::Tenant).await
+    }
+
+    /// Release a serving pin only when the persisted snapshot owner is the
+    /// authenticated actor.
+    ///
+    /// Current Admin plus late ContentsWrite, exact generation, backend/realm
+    /// and immutable receipt/idempotency semantics are unchanged. A tenant-owned
+    /// or another actor's snapshot is refused through the authorized not-found
+    /// surface and is never adopted.
+    pub async fn release_actor_owned(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRelease,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+    ) -> Result<MetadataPinOutcome, Error> {
+        self.release_with_ownership(pool, actor, input, backend, deadline, SnapshotOwnership::Actor).await
+    }
+
+    async fn release_with_ownership(
+        &self,
+        pool: &Pool,
+        actor: &Identity,
+        input: ServingSnapshotRelease,
+        backend: &BlobBackendIdentity,
+        deadline: Instant,
+        ownership: SnapshotOwnership,
+    ) -> Result<MetadataPinOutcome, Error> {
         validate_key(&input.idempotency_key)?;
         validate_snapshot(input.snapshot_id)?;
         validate_generation(input.expected_generation)?;
         let preflight = preflight(pool, actor, &input.owner, &input.name, true, backend, deadline).await?;
         let repository_id = preflight.repository.id;
         let tenant_id = preflight.gate.tenant_id();
-        let current_scope = scope_from_gate(&preflight.gate)?;
+        let current_scope = scope_from_gate_for_owner(&preflight.gate, ownership.owner_id(actor, tenant_id))?;
         let request_id =
             derived_uuid(RELEASE_REQUEST_DOMAIN, repository_id, actor.id, "release", &input.idempotency_key);
 
@@ -558,6 +787,9 @@ impl PgServingSnapshotMetadata {
             else {
                 return Err(RefStoreError::MetadataSnapshotNotFound { snapshot_id: input.snapshot_id });
             };
+            if identity.scope.owner_id() != ownership.owner_id(actor, tenant_id) {
+                return Err(RefStoreError::MetadataSnapshotNotFound { snapshot_id: input.snapshot_id });
+            }
             let request = ReleaseMetadataPinRequest::new(
                 identity.scope,
                 request_id,
@@ -651,6 +883,7 @@ async fn retained_t1(
     snapshot_id: Uuid,
     backend: &BlobBackendIdentity,
     deadline: Instant,
+    ownership: SnapshotOwnership,
 ) -> Result<(PackReadSnapshot, Uuid), Error> {
     let mut client = acquire(pool, deadline).await?;
     let tx = begin_owned(&mut client, deadline).await?;
@@ -691,6 +924,9 @@ async fn retained_t1(
             deadline,
         )
         .await?;
+        if snapshot.scope().owner_id() != ownership.owner_id(actor, tenant_id) {
+            return Err(Error::not_found());
+        }
         Ok::<_, Error>((snapshot, cluster_incarnation))
     })
     .await;
@@ -722,6 +958,7 @@ async fn retained_t2(
     materializer: &PgPackSnapshotMaterializer,
     backend: &BlobBackendIdentity,
     deadline: Instant,
+    ownership: SnapshotOwnership,
 ) -> Result<MaterializedPackRead, Error> {
     let mut client = acquire(pool, deadline).await?;
     let tx = begin_owned(&mut client, deadline).await?;
@@ -771,6 +1008,9 @@ async fn retained_t2(
             deadline,
         )
         .await?;
+        if fresh.scope().owner_id() != ownership.owner_id(actor, tenant_id) {
+            return Err(Error::not_found());
+        }
         if cluster_incarnation != prepared.cluster_incarnation() {
             return Err(map_metadata_error(RefStoreError::MetadataScopeMismatch("cluster authority incarnation")));
         }
@@ -1060,11 +1300,11 @@ async fn authorize_failure(
     }
 }
 
-fn scope_from_gate(gate: &CoreGate) -> Result<MetadataSnapshotScope, Error> {
+fn scope_from_gate_for_owner(gate: &CoreGate, owner_id: Uuid) -> Result<MetadataSnapshotScope, Error> {
     MetadataSnapshotScope::new(
         gate.repository_id(),
         gate.tenant_id(),
-        gate.tenant_id(),
+        owner_id,
         SERVING_PURPOSE,
         gate.object_format(),
         gate.history_incarnation(),

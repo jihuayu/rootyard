@@ -3027,6 +3027,391 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             "changed lease under the same key was accepted"
         );
         ensure!(snapshot_counts(&db.pool, repo).await? == counts, "conflicting create wrote metadata");
+
+        // Additive actor-owned lifecycle. The producer is a distinct real
+        // Admin collaborator; the existing tenant-owned HTTP/Write-role cases
+        // above remain unchanged.
+        let admin_producer = db.collaborator(repo, tenant, "admin").await?;
+        ensure!(
+            admin_producer.id != tenant && admin_producer.id != actor.id,
+            "actor-owned producer is not a distinct repository principal"
+        );
+        let owned_owner = actor.username.clone();
+        let owned_name = "serving-metadata".to_string();
+
+        // The stable-id/idempotency namespace is shared across ownership modes.
+        // Reusing the tenant-owned key through the actor-owned method must be a
+        // typed conflict, never a wrong-owner replay and never a new snapshot.
+        let cross_mode = ServingSnapshotCreate {
+            owner: owned_owner.clone(),
+            name: owned_name.clone(),
+            idempotency_key: "owned-cross-mode".into(),
+            lease_seconds: 300,
+        };
+        let cross_tenant = PgServingSnapshotMetadata
+            .create(&db.pool, &admin_producer, cross_mode.clone(), &backend, deadline())
+            .await?;
+        ensure!(!cross_tenant.replayed, "tenant-owned cross-mode setup replayed");
+        ensure!(
+            cross_tenant.receipt.scope().owner_id() == tenant,
+            "tenant-owned cross-mode setup persisted the wrong owner"
+        );
+        let cross_counts = snapshot_counts(&db.pool, repo).await?;
+        match PgServingSnapshotMetadata
+            .create_actor_owned(&db.pool, &admin_producer, cross_mode, &backend, deadline())
+            .await
+        {
+            Err(error) if error.0 == axum::http::StatusCode::CONFLICT => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "cross-mode actor-owned create returned {} {}",
+                    error.0,
+                    error.1
+                ));
+            }
+            Ok(outcome) => {
+                return Err(anyhow!(
+                    "cross-mode actor-owned create was accepted (replayed={})",
+                    outcome.replayed
+                ));
+            }
+        }
+        ensure!(
+            snapshot_counts(&db.pool, repo).await? == cross_counts,
+            "cross-mode actor-owned conflict wrote metadata"
+        );
+
+        let owned_create = ServingSnapshotCreate {
+            owner: owned_owner.clone(),
+            name: owned_name.clone(),
+            idempotency_key: "owned-create".into(),
+            lease_seconds: 300,
+        };
+        let owned_a = PgServingSnapshotMetadata
+            .create_actor_owned(&db.pool, &admin_producer, owned_create.clone(), &backend, deadline())
+            .await?;
+        ensure!(!owned_a.replayed, "actor-owned create replayed");
+        ensure!(
+            owned_a.receipt.scope().owner_id() == admin_producer.id
+                && owned_a.receipt.scope().tenant_id() == tenant,
+            "actor-owned create persisted the wrong owner/tenant"
+        );
+        let owned_a_snapshot = owned_a.receipt.snapshot_id();
+        let owned_a_gate = owned_a.receipt.gate_revision();
+        let owned_a_read = PgServingSnapshotMetadata
+            .read_actor_owned(
+                &db.pool,
+                &admin_producer,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_a_snapshot,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        ensure!(
+            owned_a_read.scope().owner_id() == admin_producer.id
+                && owned_a_read.scope().tenant_id() == tenant
+                && owned_a_read.snapshot_id() == owned_a_snapshot
+                && owned_a_read.gate_revision() == owned_a_gate,
+            "actor-owned read did not return the immutable producer-owned capture"
+        );
+
+        let owned_a_renew = ServingSnapshotRenew {
+            owner: owned_owner.clone(),
+            name: owned_name.clone(),
+            snapshot_id: owned_a_snapshot,
+            idempotency_key: "renew-owned".into(),
+            expected_generation: 1,
+            lease_seconds: 120,
+        };
+        let owned_a_renewed = PgServingSnapshotMetadata
+            .renew_actor_owned(&db.pool, &admin_producer, owned_a_renew.clone(), &backend, deadline())
+            .await?;
+        ensure!(!owned_a_renewed.replayed, "actor-owned renew replayed");
+        ensure!(owned_a_renewed.receipt.pin_generation() == 2, "actor-owned renew generation differs");
+        let owned_a_renew_replay = PgServingSnapshotMetadata
+            .renew_actor_owned(&db.pool, &admin_producer, owned_a_renew, &backend, deadline())
+            .await?;
+        ensure!(owned_a_renew_replay.replayed, "actor-owned exact renew did not replay");
+
+        let owned_a_release = ServingSnapshotRelease {
+            owner: owned_owner.clone(),
+            name: owned_name.clone(),
+            snapshot_id: owned_a_snapshot,
+            idempotency_key: "release-owned".into(),
+            expected_generation: 2,
+            reason: PinReleaseReason::ClientDone,
+        };
+        let owned_a_released = PgServingSnapshotMetadata
+            .release_actor_owned(&db.pool, &admin_producer, owned_a_release.clone(), &backend, deadline())
+            .await?;
+        ensure!(!owned_a_released.replayed, "actor-owned release replayed");
+        let owned_a_release_replay = PgServingSnapshotMetadata
+            .release_actor_owned(&db.pool, &admin_producer, owned_a_release, &backend, deadline())
+            .await?;
+        ensure!(owned_a_release_replay.replayed, "actor-owned exact release did not replay");
+        ensure!(
+            PgServingSnapshotMetadata
+                .read_actor_owned(
+                    &db.pool,
+                    &admin_producer,
+                    ServingSnapshotRead {
+                        owner: owned_owner.clone(),
+                        name: owned_name.clone(),
+                        snapshot_id: owned_a_snapshot,
+                    },
+                    &backend,
+                    deadline(),
+                )
+                .await
+                .is_err(),
+            "released actor-owned snapshot remained readable"
+        );
+
+        // A second owned snapshot is created before the next gate advance, then
+        // replayed/read after it: the capture id, gate and refs stay immutable.
+        let owned_b_create = ServingSnapshotCreate {
+            owner: owned_owner.clone(),
+            name: owned_name.clone(),
+            idempotency_key: "owned-immutable".into(),
+            lease_seconds: 300,
+        };
+        let owned_b = PgServingSnapshotMetadata
+            .create_actor_owned(&db.pool, &admin_producer, owned_b_create.clone(), &backend, deadline())
+            .await?;
+        ensure!(!owned_b.replayed, "fresh actor-owned immutable create replayed");
+        ensure!(
+            owned_b.receipt.scope().owner_id() == admin_producer.id
+                && owned_b.receipt.scope().tenant_id() == tenant,
+            "actor-owned immutable create persisted the wrong owner/tenant"
+        );
+        let owned_b_snapshot = owned_b.receipt.snapshot_id();
+        let owned_b_pin = owned_b.receipt.pin_id();
+        let owned_b_gate = owned_b.receipt.gate_revision();
+        let owned_b_counts = snapshot_counts(&db.pool, repo).await?;
+        serving_advance(&db, &store, &git, &mut verified, &actor, 3, b"serving metadata owned advance\n").await?;
+        let owned_b_replay = PgServingSnapshotMetadata
+            .create_actor_owned(&db.pool, &admin_producer, owned_b_create, &backend, deadline())
+            .await?;
+        ensure!(owned_b_replay.replayed, "actor-owned create did not replay after gate advance");
+        ensure!(
+            owned_b_replay.receipt.snapshot_id() == owned_b_snapshot
+                && owned_b_replay.receipt.pin_id() == owned_b_pin
+                && owned_b_replay.receipt.gate_revision() == owned_b_gate,
+            "actor-owned replay moved snapshot/pin/gate"
+        );
+        ensure!(
+            snapshot_counts(&db.pool, repo).await? == owned_b_counts,
+            "actor-owned replay wrote metadata or counters"
+        );
+        let owned_b_read = PgServingSnapshotMetadata
+            .read_actor_owned(
+                &db.pool,
+                &admin_producer,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &backend,
+                deadline(),
+            )
+            .await?;
+        ensure!(
+            owned_b_read.scope().owner_id() == admin_producer.id
+                && owned_b_read.scope().tenant_id() == tenant
+                && owned_b_read.snapshot_id() == owned_b_snapshot
+                && owned_b_read.gate_revision() == owned_b_gate,
+            "actor-owned historical read moved the immutable capture"
+        );
+        ensure!(!owned_b_read.packs().is_empty(), "actor-owned capture has no registered pack");
+        let owned_b_head = owned_b_read
+            .head_oid_hex()
+            .ok_or_else(|| anyhow!("actor-owned captured head is missing"))?
+            .to_owned();
+        let materializer = PgPackSnapshotMaterializer::new(store.clone(), git.clone())?;
+        let owned_view = PgServingSnapshotMetadata
+            .materialize_actor_owned(
+                &db.pool,
+                &admin_producer,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &materializer,
+                deadline(),
+            )
+            .await?;
+        ensure!(
+            owned_view.scope().owner_id() == admin_producer.id
+                && owned_view.scope().tenant_id() == tenant
+                && owned_view.gate_revision() == owned_b_gate
+                && owned_view.complete_git_read_snapshot()
+                && owned_view.pack_count() > 0
+                && owned_view.packs().len() == owned_b_read.packs().len(),
+            "actor-owned materialized view owner/shape differs"
+        );
+        for (expected, actual) in owned_b_read.packs().iter().zip(owned_view.packs()) {
+            assert_pack_identity(expected, actual)?;
+        }
+        ensure!(
+            read_materialized_file(&owned_view, &git, &owned_b_head, "file.txt").await?
+                == b"serving snapshot fixture\n",
+            "actor-owned materialized Git content differs"
+        );
+
+        // The tenant Admin is authorized but is not the owned snapshot's actor;
+        // the durable owner check must refuse without reshaping the capture.
+        let owned_ledger = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        match PgServingSnapshotMetadata
+            .read_actor_owned(
+                &db.pool,
+                &actor,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &backend,
+                deadline(),
+            )
+            .await
+        {
+            Err(error) if error.0 == axum::http::StatusCode::NOT_FOUND => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "non-owner actor-owned read returned {} {}",
+                    error.0,
+                    error.1
+                ));
+            }
+            Ok(_) => return Err(anyhow!("non-owner actor-owned read unexpectedly returned a view")),
+        }
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
+            "non-owner actor-owned refusal changed the ledger"
+        );
+
+        // The historical tenant-owned read path must not adopt an actor-owned
+        // capture either; ownership mode is bound in both directions.
+        ensure!(
+            PgServingSnapshotMetadata
+                .read(
+                    &db.pool,
+                    &actor,
+                    ServingSnapshotRead {
+                        owner: owned_owner.clone(),
+                        name: owned_name.clone(),
+                        snapshot_id: owned_b_snapshot,
+                    },
+                    &backend,
+                    deadline(),
+                )
+                .await
+                .is_err(),
+            "tenant-owned read accepted an actor-owned snapshot"
+        );
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
+            "tenant-owned actor-owned refusal changed the ledger"
+        );
+
+        match PgServingSnapshotMetadata
+            .materialize_actor_owned(
+                &db.pool,
+                &actor,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &materializer,
+                deadline(),
+            )
+            .await
+        {
+            Err(error) if error.0 == axum::http::StatusCode::NOT_FOUND => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "non-owner actor-owned materialization returned {} {}",
+                    error.0,
+                    error.1
+                ));
+            }
+            Ok(_) => return Err(anyhow!("non-owner actor-owned materialization unexpectedly returned a view")),
+        }
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
+            "non-owner actor-owned materialization changed the ledger"
+        );
+        ensure!(
+            PgServingSnapshotMetadata
+                .materialize(
+                    &db.pool,
+                    &actor,
+                    ServingSnapshotRead {
+                        owner: owned_owner.clone(),
+                        name: owned_name.clone(),
+                        snapshot_id: owned_b_snapshot,
+                    },
+                    &materializer,
+                    deadline(),
+                )
+                .await
+                .is_err(),
+            "tenant default materializer accepted an actor-owned snapshot"
+        );
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
+            "tenant default actor-owned materialization changed the ledger"
+        );
+
+        // Admin role loss is a real RBAC refusal, not an ownership fallback.
+        db.set_collaborator_role(repo, admin_producer.id, "write").await?;
+        expect_forbidden(
+            "role-revoked actor-owned read",
+            PgServingSnapshotMetadata
+                .read_actor_owned(
+                    &db.pool,
+                    &admin_producer,
+                    ServingSnapshotRead {
+                        owner: owned_owner.clone(),
+                        name: owned_name.clone(),
+                        snapshot_id: owned_b_snapshot,
+                    },
+                    &backend,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
+            "role-revoked actor-owned refusal changed the ledger"
+        );
+        expect_forbidden(
+            "role-revoked actor-owned materialization",
+            PgServingSnapshotMetadata
+                .materialize_actor_owned(
+                    &db.pool,
+                    &admin_producer,
+                    ServingSnapshotRead {
+                        owner: owned_owner,
+                        name: owned_name,
+                        snapshot_id: owned_b_snapshot,
+                    },
+                    &materializer,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
+            "role-revoked actor-owned materialization changed the ledger"
+        );
         Ok::<(), anyhow::Error>(())
     }
     .await;

@@ -109,7 +109,7 @@ class RootBrowseHttpHarness(RootsHttpHarness):
         expired_root = self._selector_root(repo, "roots-http-browse-expiring-root",
                                            expired_source["snapshot_id"], {"kind": "snapshot"})
         self._await_pin_expiry(repo, expired_source["pin_id"], "roots-http-browse-expiring-source")
-        status, _ = self._release(repo, snapshot_id, "roots-http-browse-source-release", 1)
+        status, _, _ = self._release(repo, snapshot_id, "roots-http-browse-source-release", 1)
         assert status == 200, ("source pin release", status)
 
         baseline_ledger = self._ledger(repo)

@@ -241,12 +241,17 @@ impl PgPackSnapshotMaterializer {
     }
 
     /// Actual retained-serving Blob/native closure for an already-authorized T1
-    /// capture. No PostgreSQL transaction is held here. The caller must still
-    /// run the post-I/O authorization/cluster/pin fence in T2 and call
-    /// [`RetainedServingPreparation::finish`] only after it succeeds.
+    /// capture. `expected_owner` is the scope owner the authorized coordinator
+    /// selected: the repository tenant for the historical/default entrypoint or
+    /// the authenticated actor for the additive actor-owned entrypoint. It is
+    /// never a public caller-supplied owner. No PostgreSQL transaction is held
+    /// here. The caller must still run the post-I/O authorization/cluster/pin
+    /// fence in T2 and call [`RetainedServingPreparation::finish`] only after it
+    /// succeeds.
     pub(crate) async fn prepare_retained_serving(
         &self,
         snapshot: PackReadSnapshot,
+        expected_owner: Uuid,
         cluster_incarnation: Uuid,
         deadline: Instant,
     ) -> Result<RetainedServingPreparation, RefStoreError> {
@@ -255,7 +260,7 @@ impl PgPackSnapshotMaterializer {
         }
         if snapshot.source_kind() != ReadSnapshotSourceKind::RetainedDurable
             || snapshot.scope().purpose() != MetadataPinPurpose::Verification
-            || snapshot.owner_id() != snapshot.tenant_id()
+            || snapshot.owner_id() != expected_owner
             || snapshot.pack_mode() != pack_contract::PACK_MODE_VERIFIED
             || !snapshot.complete_registered_pack_membership()
             || snapshot.pack_count() <= 0

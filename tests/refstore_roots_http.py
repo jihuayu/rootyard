@@ -133,7 +133,7 @@ class RootsHttpHarness(snapshot.SnapshotHttpHarness):
 
         # Existing-root release remains source-independent after the source pin is
         # actually released through the snapshot API.
-        status, _ = self._release(repo, snapshot_one, "roots-http-source-release", 1)
+        status, _, _ = self._release(repo, snapshot_one, "roots-http-source-release", 1)
         assert status == 200, ("source pin release", status)
         status, released = self._delete_root(repo, root_id, self._release_body("roots-http-release"))
         assert status == 200, (status, released)
@@ -159,7 +159,7 @@ class RootsHttpHarness(snapshot.SnapshotHttpHarness):
         assert intent_receipt["action"] == "release", intent_receipt
         status, _ = self._read_root(repo, intent_root)
         assert status == 404, ("release-before-register metadata", status)
-        status, _ = self._release(repo, snapshot_two, "roots-http-source-two-release", 1)
+        status, _, _ = self._release(repo, snapshot_two, "roots-http-source-two-release", 1)
         assert status == 200, ("source two release", status)
         status, intent_replay = self._release_intent(repo, intent_body)
         assert status == 200 and intent_replay["replayed"] is True, (status, intent_replay)
