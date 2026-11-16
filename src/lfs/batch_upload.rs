@@ -210,7 +210,7 @@ pub(super) async fn batch_upload(
             .iter()
             .filter_map(|(spec, slot)| matches!(slot, UploadSlot::NeedsPending { .. }).then(|| spec.oid.clone()))
             .collect();
-        let mut acquired_tx = None;
+        let mut pass_done = None;
         for attempt in 0..MAX_CLAIM_RETRIES {
             for oid in &pending_oids {
                 wait_or_clear_delete_claim(
@@ -256,79 +256,87 @@ pub(super) async fn batch_upload(
                 sleep(Duration::from_millis(25)).await;
                 continue;
             }
-            acquired_tx = Some((client, tx));
-            break;
-        }
-        let (client, tx) = acquired_tx.ok_or(Error(StatusCode::CONFLICT, "remote object delete claim in progress"))?;
 
-        let mut pass_results = Vec::with_capacity(slots.len());
-        let mut pass_repairs = BTreeSet::new();
-        let mut saw_newly_ready = false;
+            let mut pass_results = Vec::with_capacity(slots.len());
+            let mut pass_repairs = BTreeSet::new();
+            let mut saw_newly_ready = false;
 
-        for (spec, slot) in &mut slots {
-            match *slot {
-                UploadSlot::Invalid => {
-                    pass_results.push(obj_error(spec.oid.clone(), spec.size, 422, "Invalid LFS object oid or size"));
-                }
-                UploadSlot::TooLarge => {
-                    pass_results.push(obj_error(
-                        spec.oid.clone(),
-                        spec.size,
-                        413,
-                        "LFS object exceeds maximum request size",
-                    ));
-                }
-                UploadSlot::SizeMismatch => {
-                    pass_results.push(obj_error(
-                        spec.oid.clone(),
-                        spec.size,
-                        422,
-                        "Object size mismatch with existing record",
-                    ));
-                }
-                UploadSlot::VerifiedReady => {
-                    pass_repairs.insert((spec.oid.clone(), spec.size as u64));
-                    pass_results.push(dedup_ready_result(spec.oid.clone(), spec.size));
-                }
-                UploadSlot::ReadyCandidate { .. } => unreachable!(),
-                UploadSlot::NeedsPending { prev_ready_at } => {
-                    match try_reserve_pending_row(&tx, tenant_id, repo_id, spec, prev_ready_at, saw_newly_ready).await? {
-                        ReserveOutcome::Reserved => {
-                            pass_results.push(upload_actions_result(ctx, spec.oid.clone(), spec.size));
+            for (spec, slot) in &mut slots {
+                match *slot {
+                    UploadSlot::Invalid => {
+                        pass_results.push(obj_error(spec.oid.clone(), spec.size, 422, "Invalid LFS object oid or size"));
+                    }
+                    UploadSlot::TooLarge => {
+                        pass_results.push(obj_error(
+                            spec.oid.clone(),
+                            spec.size,
+                            413,
+                            "LFS object exceeds maximum request size",
+                        ));
+                    }
+                    UploadSlot::SizeMismatch => {
+                        pass_results.push(obj_error(
+                            spec.oid.clone(),
+                            spec.size,
+                            422,
+                            "Object size mismatch with existing record",
+                        ));
+                    }
+                    UploadSlot::VerifiedReady => {
+                        pass_repairs.insert((spec.oid.clone(), spec.size as u64));
+                        pass_results.push(dedup_ready_result(spec.oid.clone(), spec.size));
+                    }
+                    UploadSlot::ReadyCandidate { .. } => unreachable!(),
+                    UploadSlot::NeedsPending { prev_ready_at } => {
+                        match try_reserve_pending_row(&tx, tenant_id, repo_id, spec, prev_ready_at, saw_newly_ready)
+                            .await?
+                        {
+                            ReserveOutcome::Reserved => {
+                                pass_results.push(upload_actions_result(ctx, spec.oid.clone(), spec.size));
+                            }
+                            ReserveOutcome::SizeMismatch => {
+                                *slot = UploadSlot::SizeMismatch;
+                                pass_results.push(obj_error(
+                                    spec.oid.clone(),
+                                    spec.size,
+                                    422,
+                                    "Object size mismatch with existing record",
+                                ));
+                            }
+                            ReserveOutcome::NewlyReady { updated_at } => {
+                                *slot = UploadSlot::ReadyCandidate { updated_at };
+                                saw_newly_ready = true;
+                            }
+                            ReserveOutcome::DeferredPending => {}
                         }
-                        ReserveOutcome::SizeMismatch => {
-                            *slot = UploadSlot::SizeMismatch;
-                            pass_results.push(obj_error(
-                                spec.oid.clone(),
-                                spec.size,
-                                422,
-                                "Object size mismatch with existing record",
-                            ));
-                        }
-                        ReserveOutcome::NewlyReady { updated_at } => {
-                            *slot = UploadSlot::ReadyCandidate { updated_at };
-                            saw_newly_ready = true;
-                        }
-                        ReserveOutcome::DeferredPending => {}
                     }
                 }
             }
-        }
 
-        if saw_newly_ready {
-            tx.rollback().await.map_err(Error::internal)?;
-            drop(client);
-            if pass + 1 == MAX_BATCH_UPLOAD_PASSES {
-                return Err(Error(StatusCode::CONFLICT, "LFS object state changed concurrently"));
+            if saw_newly_ready {
+                tx.rollback().await.map_err(Error::internal)?;
+                drop(client);
+                pass_done = Some(false);
+                break;
             }
-            continue;
+
+            auth::finish_tx(tx, ctx.actor, true).await?;
+            drop(client);
+            repairs = pass_repairs;
+            final_results = Some(pass_results);
+            pass_done = Some(true);
+            break;
         }
 
-        auth::finish_tx(tx, ctx.actor, true).await?;
-        drop(client);
-        repairs = pass_repairs;
-        final_results = Some(pass_results);
-        break;
+        match pass_done {
+            Some(true) => break,
+            Some(false) => {
+                if pass + 1 == MAX_BATCH_UPLOAD_PASSES {
+                    return Err(Error(StatusCode::CONFLICT, "LFS object state changed concurrently"));
+                }
+            }
+            None => return Err(Error(StatusCode::CONFLICT, "remote object delete claim in progress")),
+        }
     }
 
     let results = final_results.ok_or(Error(StatusCode::CONFLICT, "LFS object state changed concurrently"))?;
