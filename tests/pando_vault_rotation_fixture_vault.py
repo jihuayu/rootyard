@@ -462,5 +462,3 @@ class VaultFixture:
         self.remove_state()
         self.release_credentials()
         return result
-
-
