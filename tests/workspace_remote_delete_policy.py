@@ -470,7 +470,11 @@ class PolicyHarness(Harness):
             assert writer_identity["starttime"] > 0
             writer_pidfd = support.open_pidfd(writer.pid)
 
-            readiness_deadline = time.monotonic() + EARLY_WRITER_READY_SECONDS
+            capture_deadline = time.monotonic() + 30.0
+            readiness_deadline = min(
+                capture_deadline,
+                time.monotonic() + EARLY_WRITER_READY_SECONDS,
+            )
             while True:
                 status = support.writer_status(writer_status) or {}
                 phase = status.get("phase")
@@ -498,8 +502,13 @@ class PolicyHarness(Harness):
                         f"phase={phase} errno={errno_value} attempts={attempts} writes={writes}")
                 time.sleep(0.05)
 
+            remaining = capture_deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    "capture gate shared deadline exhausted before wait: "
+                    f"phase={phase} errno={errno_value} attempts={attempts} writes={writes}")
             hit = gate.with_suffix(".hit")
-            wait_capture_gate(hit, timeout=30)
+            wait_capture_gate(hit, timeout=remaining)
             assert not gate.with_suffix(".timeout").exists(), (
                 "capture read gate expired before observation")
             evidence = support.wait_for_kernel_wait(
