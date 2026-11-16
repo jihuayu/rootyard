@@ -329,25 +329,31 @@ class PinAndPolicyTest(unittest.TestCase):
 
 
 class PostgresAndRootTest(unittest.TestCase):
-    def psql_runner(self, version="170004", exists_sequence=(False, True, False)):
-        state = {"exists": list(exists_sequence), "calls": []}
+    def psql_runner(self, version="170004"):
+        state = {"exists": False, "db_name": None, "calls": [], "oid": "16384"}
 
-        def handle(argv, kwargs):
-            sql = (kwargs.get("input") or b"").decode()
-            state["calls"].append((argv, kwargs, sql))
-            if "SHOW server_version_num" in sql:
-                return Result(0, (version + "\n").encode())
-            if "FROM pg_database" in sql:
-                value = state["exists"].pop(0)
-                return Result(0, (("1" if value else "") + "\n").encode())
-            return Result(0, b"")
+        class Runner:
+            def run(self, argv, **kwargs):
+                sql = (kwargs.get("input") or b"").decode()
+                state["calls"].append(([str(item) for item in argv], kwargs, sql))
+                if "SHOW server_version_num" in sql:
+                    return Result(0, (version + "\n").encode())
+                if "oid::text" in sql and "FROM pg_database" in sql:
+                    if not state["exists"] or not state["db_name"]:
+                        return Result(0, b"")
+                    return Result(
+                        0, ("%s|10|%s|10\n" % (state["oid"], state["db_name"])).encode())
+                if "FROM pg_database" in sql:
+                    return Result(0, (("1" if state["exists"] else "") + "\n").encode())
+                if sql.startswith('CREATE DATABASE'):
+                    state["exists"] = True
+                    return Result(0, b"")
+                if sql.startswith('DROP DATABASE'):
+                    state["exists"] = False
+                    return Result(0, b"")
+                return Result(0, b"")
 
-        runner = FakeRunner([], on_call=handle)
-        runner.run = lambda argv, **kwargs: (
-            state["calls"].append((list(argv), kwargs, (kwargs.get("input") or b"").decode()))
-            or handle(list(argv), kwargs)
-        )
-        return runner, state
+        return Runner(), state
 
     def test_dsn_validation_requires_literal_loopback_and_allowlisted_query(self):
         parsed = resources.parse_bootstrap_dsn(
@@ -371,6 +377,7 @@ class PostgresAndRootTest(unittest.TestCase):
         value = resources.OwnedPostgres(
             "postgresql://user:password@127.0.0.1:55432/admin",
             nonce="a" * 12, runner=runner)
+        state["db_name"] = value.database
         value.create()
         self.assertEqual(value.database, "pando_rotation_" + "a" * 12)
         self.assertTrue(value.created)

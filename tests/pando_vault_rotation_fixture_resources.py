@@ -85,6 +85,10 @@ class OwnedPostgres:
         self.environment = self._environment(self.parts["database"])
         self.major = None
         self.prechecked_absent = False
+        self.create_acknowledged = False
+        self.owned = False
+        self.identity = None
+        self.creation_outcome = "not_attempted"
         self.created = False
         self.dropped = False
 
@@ -150,27 +154,90 @@ class OwnedPostgres:
             "SELECT 1 FROM pg_database WHERE datname='%s';\n" % self.database)
         return raw.splitlines()[-1:] == ["1"]
 
+    def _database_identity(self):
+        """Read the exact name/OID/owner identity of the nonce database."""
+        raw = self._psql(
+            "SELECT oid::text, datdba::text, datname, "
+            "(SELECT oid::text FROM pg_roles WHERE rolname=current_user) "
+            "FROM pg_database WHERE datname='%s';\n" % self.database)
+        rows = [line for line in raw.splitlines() if line.strip()]
+        _require(len(rows) == 1, "pg_database_identity_unreadable")
+        parts = rows[0].split("|")
+        _require(len(parts) == 4, "pg_database_identity_unreadable")
+        oid, datdba, database, current_oid = parts
+        _require(database == self.database, "pg_database_identity_mismatch")
+        _require(oid.isdigit() and int(oid) > 0, "pg_database_oid_invalid")
+        _require(datdba.isdigit() and current_oid.isdigit()
+                 and datdba == current_oid, "pg_database_owner_mismatch")
+        return {"oid": oid, "datdba": datdba, "database": database}
+
+    def _capture_identity(self):
+        self.identity = self._database_identity()
+        return self.identity
+
+    def _post_create_setup(self):
+        """Fresh identity proof after CREATE; failure keeps ownership."""
+        current = self._database_identity()
+        _require(self.identity is not None, "pg_identity_missing")
+        _require(current["oid"] == self.identity["oid"]
+                 and current["datdba"] == self.identity["datdba"]
+                 and current["database"] == self.identity["database"],
+                 "pg_database_identity_changed")
+
     def create(self):
         if self.major is None:
             self.validate()
+        _require(not self.owned and not self.created, "pg_already_created")
         _require(not self._exists(), "pg_database_already_exists")
         self.prechecked_absent = True
-        self._psql('CREATE DATABASE "%s";\n' % self.database)
+        try:
+            self._psql('CREATE DATABASE "%s";\n' % self.database)
+        except FixtureError as error:
+            # A nonzero CREATE is a rejection.  A timed-out/lost process is
+            # unknown: it never authorizes cleanup to drop anything by name.
+            self.creation_outcome = (
+                "unknown" if error.code in ("process_failed", "pg_command_timeout")
+                else "rejected")
+            raise
+        # The successful CREATE acknowledgement is the ownership boundary.
+        self.create_acknowledged = True
+        self.owned = True
+        self.creation_outcome = "created_ack"
+        self._capture_identity()
+        self._post_create_setup()
         self.created = True
-        _require(self._exists(), "pg_database_create_unverified")
         return self.child_dsn()
 
     def drop(self):
-        _require(self.prechecked_absent, "pg_drop_not_owned")
-        self._psql('DROP DATABASE IF EXISTS "%s" WITH (FORCE);\n' % self.database, timeout=60)
+        if not self.create_acknowledged:
+            if self.creation_outcome == "unknown":
+                raise FixtureError("pg_create_outcome_unknown")
+            raise FixtureError("pg_drop_not_owned")
+        _require(self.owned, "pg_drop_not_owned")
+        _require(self.identity is not None, "pg_cleanup_identity_unresolved")
+        if not self._exists():
+            # The exact database is already absent; no DROP is issued.
+            self.dropped = True
+            return True
+        current = self._database_identity()
+        _require(current["oid"] == self.identity["oid"]
+                 and current["datdba"] == self.identity["datdba"]
+                 and current["database"] == self.identity["database"],
+                 "pg_drop_identity_mismatch")
+        self._psql('DROP DATABASE IF EXISTS "%s" WITH (FORCE);\n' % self.database,
+                   timeout=60)
         _require(not self._exists(), "pg_database_drop_unverified")
         self.dropped = True
         return True
 
     def safe_record(self):
         return {
-            "owned": self.prechecked_absent,
+            "owned": self.owned,
             "prechecked_absent": self.prechecked_absent,
+            "create_acknowledged": self.create_acknowledged,
+            "creation_outcome": self.creation_outcome,
+            "identity_oid": self.identity["oid"] if self.identity else None,
+            "identity_verified": self.identity is not None,
             "created": self.created,
             "dropped": self.dropped,
             "pg_major": self.major,
