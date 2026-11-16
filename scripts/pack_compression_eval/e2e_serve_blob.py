@@ -88,20 +88,29 @@ def run_live_serve_blob_eval(
     parsed_s3 = urllib.parse.urlsplit(live.s3_endpoint)
     if parsed_s3.scheme != "http" or not parsed_s3.hostname:
         raise RuntimeError("S3 endpoint must be plain HTTP loopback or host:port for wire metering")
-    proxy = S3MeterProxy(parsed_s3.hostname, parsed_s3.port or 80)
-    proxy.start()
-
     schema = f"ry_pack_eval_{uuid.uuid4().hex[:12]}"
     pg_url = append_search_path(live.pg_base, schema)
     run_env = os.environ.copy()
-    schema_created = False
+    scratch_dir = work_root / "server-scratch"
+    proxy: S3MeterProxy | None = None
+    sampler: ResourceSampler | None = None
     proc: subprocess.Popen[bytes] | None = None
     log_f: Any = None
-    scratch_dir = work_root / "server-scratch"
-    sampler = ResourceSampler([scratch_dir, work_root / "pack-stage"], interval_seconds=0.1)
-    sampler.start()
+    schema_created = False
+
+    def s3_snapshot() -> dict[str, Any]:
+        if proxy is None:
+            return sanitize_s3_snapshot(None)
+        try:
+            return sanitize_s3_snapshot(proxy.snapshot())
+        except Exception:  # noqa: BLE001 - diagnostics must not replace the primary outcome
+            return sanitize_s3_snapshot(None)
 
     try:
+        proxy = S3MeterProxy(parsed_s3.hostname, parsed_s3.port or 80)
+        proxy.start()
+        sampler = ResourceSampler([scratch_dir, work_root / "pack-stage"], interval_seconds=0.1)
+        sampler.start()
         subprocess.check_call(
             ["psql", "--dbname", live.pg_base, "-X", "-v", "ON_ERROR_STOP=1", "-c", f'CREATE SCHEMA "{schema}"'],
             env=run_env,
@@ -440,7 +449,7 @@ def run_live_serve_blob_eval(
         raise LiveEvalFailure(
             enrich_failure_record(
                 exc.record,
-                s3=sanitize_s3_snapshot(proxy.snapshot()),
+                s3=s3_snapshot(),
                 completed=progress["completed"],
                 last_completed_phase=progress["last_completed_phase"],
                 bindings=bindings_from_receipt(receipt_info),
@@ -453,20 +462,17 @@ def run_live_serve_blob_eval(
                 failure_class="unclassified",
                 completed=progress["completed"],
                 last_completed_phase=progress["last_completed_phase"],
-                s3=sanitize_s3_snapshot(proxy.snapshot()),
+                s3=s3_snapshot(),
                 bindings=bindings_from_receipt(receipt_info),
             )
         ) from None
     finally:
         active = sys.exc_info()[1]
-        try:
-            s3_at_cleanup = sanitize_s3_snapshot(proxy.snapshot())
-        except Exception:  # noqa: BLE001 - never let snapshot failure replace the primary outcome
-            s3_at_cleanup = None
+        s3_at_cleanup = s3_snapshot()
         cleanup = run_cleanup_steps(
             stop_server=(lambda: stop_serve_blob(proc, log_f)) if proc is not None else None,
-            stop_proxy=proxy.stop,
-            stop_sampler=sampler.stop,
+            stop_proxy=proxy.stop if proxy is not None else None,
+            stop_sampler=sampler.stop if sampler is not None else None,
             drop_schema=(
                 lambda: subprocess.run(
                     ["psql", "--dbname", live.pg_base, "-X", "-c", f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'],
@@ -476,7 +482,7 @@ def run_live_serve_blob_eval(
                     timeout=15,
                 )
             ) if schema_created else None,
-            remove_scratch=(lambda: remove_tree_checked(scratch_dir)) if not keep else None,
+            remove_scratch=(lambda: remove_tree_checked(scratch_dir)) if not keep and scratch_dir.exists() else None,
         )
         finalize_cleanup(
             active,

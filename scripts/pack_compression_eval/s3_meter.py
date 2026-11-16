@@ -131,12 +131,19 @@ class S3MeterProxy:
         self.upstream_host = upstream_host
         self.upstream_port = upstream_port
         self._listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listen.bind(("127.0.0.1", 0))
-        self._listen.listen(128)
-        self._listen.settimeout(0.25)
-        self.port: int = self._listen.getsockname()[1]
-        self.endpoint = f"http://127.0.0.1:{self.port}"
+        try:
+            self._listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._listen.bind(("127.0.0.1", 0))
+            self._listen.listen(128)
+            self._listen.settimeout(0.25)
+            self.port: int = self._listen.getsockname()[1]
+            self.endpoint = f"http://127.0.0.1:{self.port}"
+        except BaseException:
+            try:
+                self._listen.close()
+            except OSError:
+                pass
+            raise
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._req_counts: dict[str, int] = {}
