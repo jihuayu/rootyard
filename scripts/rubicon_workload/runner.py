@@ -267,6 +267,16 @@ def _read_log_tail(log_path: Path, max_lines: int = 30) -> str:
     return redact_text("\n".join(lines), [])
 
 
+def _attach_fleet_cleanup_note(exc: BaseException, issues: list[str]) -> None:
+    """Attach safe per-worker cleanup facts without replacing the original failure."""
+    if not issues:
+        return
+    try:
+        exc.add_note("fleet cleanup incomplete: " + "; ".join(issues))
+    except (AttributeError, TypeError):
+        pass
+
+
 def _start_fleet(
     count: int,
     binary: str,
@@ -333,61 +343,88 @@ def _start_fleet(
                     break
                 if pending:
                     time.sleep(0.1)
-        except BaseException:
+        except BaseException as startup_error:
             # Attempt to reap every worker already started and close the log
             # opened for the failed spawn before propagating the original failure.
             cleanup_fleet = list(fleet)
             if pending_proc is not None and not any(item[0] is pending_proc for item in fleet):
                 cleanup_fleet.append((pending_proc, "", scratch_root, pending_log))
-            try:
-                _stop_fleet(cleanup_fleet)
-            except BaseException:
-                pass
-            finally:
-                if pending_log is not None:
-                    try:
-                        pending_log.close()
-                    except OSError:
-                        pass
+            cleanup_issues = _stop_fleet_issues(cleanup_fleet)
+            if pending_log is not None:
+                try:
+                    pending_log.close()
+                except OSError:
+                    cleanup_issues.append("pending_log: close_error")
+            _attach_fleet_cleanup_note(startup_error, cleanup_issues)
             raise
 
         if exited is not None:
             idx, rc = exited
-            _stop_fleet(fleet)
+            cleanup_issues = _stop_fleet_issues(fleet)
             tail = _read_log_tail(log_paths[idx])
             if attempt == 0 and "could not bind Blob service listener" in tail:
                 continue
-            raise RuntimeError(f"serve-blob[{idx}] exited during startup with {rc}\n{tail}")
+            error = RuntimeError(f"serve-blob[{idx}] exited during startup with {rc}\n{tail}")
+            _attach_fleet_cleanup_note(error, cleanup_issues)
+            raise error
         if pending:
-            _stop_fleet(fleet)
+            cleanup_issues = _stop_fleet_issues(fleet)
             tails = "\n".join(f"[{i}] {_read_log_tail(log_paths[i])}" for i in sorted(pending))
-            raise RuntimeError(f"serve-blob readiness timed out for workers {sorted(pending)}\n{tails}")
+            error = RuntimeError(f"serve-blob readiness timed out for workers {sorted(pending)}\n{tails}")
+            _attach_fleet_cleanup_note(error, cleanup_issues)
+            raise error
         return fleet
     raise RuntimeError("serve-blob startup exhausted retries")
 
 
-def _stop_fleet(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> None:
-    for proc, _, _, _ in fleet:
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-    for proc, _, _, log_f in fleet:
+def _stop_fleet_issues(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> list[str]:
+    """Return safe cleanup facts even if the cleanup pass is interrupted."""
+    try:
+        return _stop_fleet(fleet)
+    except BaseException:
+        return ["fleet: cleanup_interrupted"]
+
+
+def _stop_fleet(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> list[str]:
+    """Attempt to stop owned workers and return safe per-worker issue facts."""
+    issues: list[str] = []
+    for idx, (proc, _, _, _) in enumerate(fleet):
+        try:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    issues.append(f"worker[{idx}]: sigterm_error")
+        except Exception:
+            issues.append(f"worker[{idx}]: poll_error")
+    for idx, (proc, _, _, log_f) in enumerate(fleet):
         try:
             if proc.poll() is None:
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait(timeout=5)
-        except OSError:
-            pass
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except Exception:
+                        issues.append(f"worker[{idx}]: sigkill_error")
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        issues.append(f"worker[{idx}]: post_sigkill_wait_timeout")
+                    except Exception:
+                        issues.append(f"worker[{idx}]: post_sigkill_wait_error")
+        except Exception:
+            issues.append(f"worker[{idx}]: wait_error")
         finally:
             try:
                 log_f.close()
-            except OSError:
-                pass
+            except Exception:
+                issues.append(f"worker[{idx}]: log_close_error")
+    return issues
 
 
 def _verify_public_cluster_authority(pg_base: str, env: dict[str, str]) -> None:
