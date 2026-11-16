@@ -335,11 +335,16 @@ async fn pending_startup_completion_is_incomplete_and_retains_owner_marker() {
 #[tokio::test]
 async fn teardown_is_polled_before_the_startup_join_and_releases_it() {
     let (release_tx, release_rx) = oneshot::channel();
+    let teardown_polled = Arc::new(AtomicBool::new(false));
+    let teardown_seen = teardown_polled.clone();
     let teardown = async move {
+        teardown_seen.store(true, Ordering::SeqCst);
         release_tx.send(()).expect("startup release receiver");
         "teardown"
     };
+    let startup_seen = teardown_polled.clone();
     let startup = async move {
+        assert!(startup_seen.load(Ordering::SeqCst), "startup join was polled before mount teardown");
         let _ = release_rx.await;
         StartupJoinResult::Clean
     };

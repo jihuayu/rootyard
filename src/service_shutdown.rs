@@ -344,9 +344,9 @@ impl ServiceOwner {
         let capture_stop = self.capture_stop.clone();
         let teardown = driver.stop_capture_and_mounts(capture_task, capture_stop, capture_grace, deadline);
         // Start mount closing/teardown and the retained startup producer join
-        // under the same D. The driver future is polled first by `join!`, so a
-        // blocked startup ensure is never awaited before teardown can release
-        // the mount it is holding.
+        // under the same D. The biased `join!` polls the driver future first,
+        // so a blocked startup ensure is never awaited before teardown can
+        // release the mount it is holding.
         let startup_join = self.join_startup_until(deadline);
         let (teardown_result, startup_result) = join_teardown_and_startup(teardown, startup_join).await;
         let (capture_result, evidence) = teardown_result;
@@ -541,10 +541,10 @@ where
     F: Future<Output = T>,
     S: Future<Output = StartupJoinResult>,
 {
-    // Teardown is the first argument, so the driver future starts before the
-    // startup join is polled. A blocked ensure can therefore be released by the
-    // mount-closing path instead of being awaited first.
-    tokio::join!(teardown, startup)
+    // Biased join: the mount-closing future is polled first. Both futures stay
+    // concurrent under the same D, so teardown can release a blocked startup
+    // ensure and startup is never awaited serially before teardown.
+    tokio::join!(biased; teardown, startup)
 }
 
 fn remaining_until(deadline: Instant) -> Duration {
