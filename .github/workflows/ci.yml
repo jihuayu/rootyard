@@ -21,10 +21,13 @@ jobs:
     # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
     runs-on: ubuntu-22.04
     # Job cap with bounded headroom for the three populated RefStore/artifact-hold
-    # backup drills below: their step caps grow from 5 to 10 minutes each, so the
-    # worst case added here is 3 x 5 = 15 minutes. Keep this bounded; raising it
-    # further must not be used to hide a regression inside one individual step.
-    timeout-minutes: 75
+    # backup drills below (their step caps grow from 5 to 10 minutes each, so the
+    # worst case added by them is 3 x 5 = 15 minutes) plus the 10-minute legacy
+    # four-case service-shutdown step. The previous 75-minute cap already
+    # included the backup-drill increase; this CI-only wiring adds exactly 10
+    # minutes, so the explicit cap is 85. Keep this bounded; raising it further
+    # must not be used to hide a regression inside one individual step.
+    timeout-minutes: 85
     services:
       postgres:
         image: postgres:17
@@ -359,6 +362,22 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/native_report_manifest.py --mode job             --manifest-out test-results/native-workspace-fuse-gate.json             --expect-commit "$GITHUB_SHA"             --build-receipt "$ROOTYARD_BUILD_RECEIPT"             --binary "$ROOTYARD_BIN"             --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST"             --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256"             --report workspace_fuse_service=test-results/workspace-fuse-service.json             --report workspace_remote_delete=test-results/workspace-remote-delete-policy.json             --require-case workspace_fuse_service=tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_live_editor_capture_checkpoint_and_remount             --require-case workspace_fuse_service=tests.test_workspace_handoff.WorkspaceHandoffTest.test_expired_host_reattach_from_remote_checkpoint             --require-case workspace_fuse_service=tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_normal_sigterm_helper_unmount_precedes_parked_git_join             --require-case workspace_remote_delete=invalid_optin_rejected_at_startup             --require-case workspace_remote_delete=default_retains_failed_remote_cleanup             --require-case workspace_remote_delete=exit77_with_pending_fuse_request             --harness tests/test_workspace_fuse_service.py             --harness tests/test_workspace_handoff.py             --harness tests/workspace_fuse_service_acceptance.py             --harness tests/workspace_remote_delete_policy.py             --harness tests/runtime_binary.py             --harness tests/source_bound_binary.py             --harness tests/native_evidence.py             --harness tests/e2e.py             --harness tests/fuse_helper_native_support.py             --harness tests/workspace_normal_shutdown_support.py             --harness tests/workspace_capture_acceptance.py             --harness tests/lfs_hydration_concurrency.py             --harness tests/fixtures/capture_read_gate.c             --harness scripts/native_report_manifest.py             --harness .github/workflows/ci.yml             --fixture-rust-from-receipt             --fixture workspace_mount_mode=fuse-helper             --fixture postgres=postgres:17             --fixture garage=garage:2.1.0             --fixture fuse_device="$(stat -Lc '%F mode=%a' /dev/fuse)"
+      - name: Exercise four legacy in-process FUSE service-shutdown cases
+        id: workspace_legacy_service
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ROOTYARD_BIN:-}"
+          test -x "$ROOTYARD_BIN"
+          test -n "${ROOTYARD_BUILD_RECEIPT:-}"
+          test -f "$ROOTYARD_BUILD_RECEIPT"
+          test -n "${ROOTYARD_TEST_DATABASE_URL:-}"
+          test -c /dev/fuse
+          command -v unshare >/dev/null
+          command -v nsenter >/dev/null
+          python3 tests/workspace_legacy_fuse_shutdown_report.py \
+            --report test-results/workspace-legacy-service.json
       - name: Stop only the job-owned workspace FUSE/remote Garage fixture
         if: always()
         shell: bash
@@ -376,6 +395,7 @@ jobs:
           path: |
             test-results/workspace-fuse-service.json
             test-results/workspace-remote-delete-policy.json
+            test-results/workspace-legacy-service.json
             test-results/native-workspace-fuse-gate.json
             ${{ env.ROOTYARD_BUILD_RECEIPT }}
             ${{ env.ROOTYARD_BATCH_MANIFEST }}
@@ -485,6 +505,7 @@ jobs:
             --manifest-out test-results/native-pr-gate.json \
             --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
             --binary "$ROOTYARD_BIN" \
+            --expect-commit "$GITHUB_SHA" \
             --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST" \
             --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
             --report web_sessions=test-results/web-sessions.json \
@@ -497,6 +518,7 @@ jobs:
             --report webhook_pr_sync=test-results/webhook-pr-sync.json \
             --report audit_sequence_backup=test-results/audit-sequence-backup.json \
             --report workspace_capture=test-results/workspace-capture.json \
+            --report workspace_legacy_service=test-results/workspace-legacy-service.json \
             --report repository_pagination=test-results/repository-pagination.json \
             --report organization_pagination=test-results/organization-pagination.json \
             --report organizations=test-results/organizations.json \
@@ -563,6 +585,17 @@ jobs:
             --harness tests/ci_webhook_regressions.py \
             --harness tests/backup_audit_sequence_legacy.py \
             --harness tests/workspace_capture_acceptance.py \
+            --harness tests/workspace_legacy_fuse_shutdown_acceptance.py \
+            --harness tests/workspace_legacy_fuse_shutdown_support.py \
+            --harness tests/workspace_legacy_fuse_shutdown_fixtures.py \
+            --harness tests/workspace_legacy_fuse_shutdown_ownership.py \
+            --harness tests/workspace_legacy_fuse_shutdown_fifo.py \
+            --harness tests/workspace_legacy_fuse_shutdown_report.py \
+            --harness tests/fuse_helper_native_support.py \
+            --harness tests/runtime_binary.py \
+            --harness tests/test_workspace_legacy_fuse_shutdown_primary.py \
+            --harness tests/test_workspace_legacy_fuse_shutdown_fifo.py \
+            --harness tests/test_workspace_legacy_fuse_containment_owner.py \
             --harness tests/fixtures/capture_read_gate.c \
             --harness tests/repository_pagination.py \
             --harness tests/organization_pagination.py \
@@ -608,6 +641,10 @@ jobs:
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision \
             --require-case workspace_capture=__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_normal_legacy_sigterm_join_evidence_and_exact_unmount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_partial_reconcile_failure_cleans_earlier_owned_mount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_post_reconcile_api_bind_failure_cleans_owned_mount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_sigterm_during_blocked_startup_joins_mounted_owner \
             --require-case lfs_read_amplification=read_amplification_and_offline_remote \
             --require-case lfs_split_tx_races=split_tx_races_reauth_and_repair_dedup \
             --require-case lfs_lock_policy=setup_repo \
