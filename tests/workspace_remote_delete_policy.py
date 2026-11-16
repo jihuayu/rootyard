@@ -416,9 +416,17 @@ class PolicyHarness(Harness):
         writer = None
         helper_pid = None
         helper_identity = None
+        holder_identity = None
         api_pidfd = helper_pidfd = writer_pidfd = None
         mount_id = None
         mountpoint = None
+        old_holder_mount_ns = None
+        old_holder_user_ns = None
+        new_api_pid = None
+        new_api_identity = None
+        new_helper_pid = None
+        new_helper_identity = None
+        new_mount_id = None
         try:
             gate = install_capture_read_gate(self, gate_target)
             self.env[KILL_ENV] = "1"
@@ -436,8 +444,11 @@ class PolicyHarness(Harness):
             assert api_identity is not None, "production API identity is unavailable"
             assert api_identity["starttime"] > 0
             api_pidfd = support.open_pidfd(api_pid)
+            api_mount_ns = os.stat(f"/proc/{api_pid}/ns/mnt").st_ino
             api_user_ns = os.stat(f"/proc/{api_pid}/ns/user").st_ino
             self_user_ns = os.stat("/proc/self/ns/user").st_ino
+            assert api_mount_ns > 0 and api_user_ns > 0, (
+                "remote publisher API namespace inode is not positive")
             assert api_user_ns != self_user_ns, (
                 "remote publisher API did not enter an isolated user namespace")
 
@@ -459,6 +470,32 @@ class PolicyHarness(Harness):
             visible = support.wait_for_fuse_mount(holder.pid, mountpoint, timeout=5)
             assert int(visible["mount_id"]) == mount_id, (
                 "holder namespace does not see the exact API mount")
+            old_holder_mount_ns = os.stat(f"/proc/{holder.pid}/ns/mnt").st_ino
+            old_holder_user_ns = os.stat(f"/proc/{holder.pid}/ns/user").st_ino
+            assert old_holder_mount_ns > 0, (
+                "API namespace holder mount namespace inode is not positive")
+            assert old_holder_user_ns > 0, (
+                "API namespace holder user namespace inode is not positive")
+            assert old_holder_mount_ns == api_mount_ns, (
+                "API namespace holder did not join the old API mount namespace")
+            assert old_holder_user_ns == api_user_ns, (
+                "API namespace holder did not join the old API user namespace")
+
+            def verify_holder_pinned(stage):
+                current = support.process_identity(holder.pid)
+                assert current is not None and current["state"] != "Z", (
+                    f"API namespace holder died {stage}")
+                assert current["pid"] == holder_identity["pid"], (
+                    f"API namespace holder PID changed {stage}")
+                assert current["starttime"] == holder_identity["starttime"], (
+                    f"API namespace holder starttime changed {stage}")
+                assert os.stat(f"/proc/{holder.pid}/ns/mnt").st_ino == old_holder_mount_ns, (
+                    f"API namespace holder mount namespace inode changed {stage}")
+                assert os.stat(f"/proc/{holder.pid}/ns/user").st_ino == old_holder_user_ns, (
+                    f"API namespace holder user namespace inode changed {stage}")
+                return current
+
+            verify_holder_pinned("during the initial exact-mount observation")
 
             writer_script = Path(self.root) / "pending-fuse-writer.py"
             writer_script.write_text(support.PENDING_WRITER_SCRIPT, encoding="utf-8")
@@ -578,14 +615,103 @@ class PolicyHarness(Harness):
             assert int(self.sql(f"SELECT revision FROM workspaces WHERE id='{wid}'")) \
                 == base_revision, "workspace revision advanced after exit 77"
 
-            support.terminate_process(holder)
-            holder = None
+            verify_holder_pinned("immediately before the remount restart")
+            old_helper_exit_before_restart = support.wait_pid_gone(
+                helper_pid, support.EXIT_DEADLINE)
+            assert old_helper_exit_before_restart, (
+                "production FUSE helper survived immediately before the remount restart")
+            old_mount_id_absent_before_restart = support.wait_for_mount_id_gone(
+                holder.pid, mountpoint, mount_id, support.EXIT_DEADLINE)
+            assert old_mount_id_absent_before_restart, (
+                f"exact owned mount ID {mount_id} reappeared in the pinned old holder "
+                "namespace before the remount restart")
+
+            # Keep the owned old namespace holder alive across the restart.
+            # Mount IDs are scoped to a mount namespace and may be recycled
+            # after umount, so the pinned namespace is the stable identity.
             self.stop()
             self.env.pop(KILL_ENV, None)
             self.start()
-            remount = support.wait_for_fuse_mount(self.proc.pid, mountpoint)
-            assert int(remount["mount_id"]) != mount_id, (
-                "restarted API reused the crashed mount ID")
+            new_api_pid = self.proc.pid
+            new_api_identity = support.process_identity(new_api_pid)
+            assert new_api_identity is not None, "restarted API identity is unavailable"
+            assert new_api_identity["state"] != "Z", "restarted API exited during remount"
+            new_api_identity_fresh = (
+                new_api_identity["starttime"] > api_identity["starttime"])
+            assert new_api_identity_fresh, (
+                "restarted API process identity is not fresher than the crashed API")
+            # A new numeric mount ID is not required: proc_pid_mountinfo(5)
+            # permits reuse after umount.  The fresh namespace/process identity
+            # below is the cross-incarnation proof.
+            remount = support.wait_for_fuse_mount(new_api_pid, mountpoint)
+            new_mount_id = int(remount["mount_id"])
+            assert new_mount_id > 0, "restarted API did not expose a positive mount ID"
+
+            holder_after_restart = verify_holder_pinned("across the remount restart")
+            old_holder_identity_stable = (
+                holder_after_restart["pid"] == holder_identity["pid"]
+                and holder_after_restart["starttime"] == holder_identity["starttime"])
+            old_mount_namespace_stable = (
+                os.stat(f"/proc/{holder.pid}/ns/mnt").st_ino == old_holder_mount_ns)
+            old_user_namespace_stable = (
+                os.stat(f"/proc/{holder.pid}/ns/user").st_ino == old_holder_user_ns)
+            assert old_holder_identity_stable, (
+                "pinned old holder process identity changed across the remount restart")
+            assert old_mount_namespace_stable, (
+                "pinned old holder mount namespace inode changed across the remount restart")
+            assert old_user_namespace_stable, (
+                "pinned old holder user namespace inode changed across the remount restart")
+
+            old_helper_still_gone = support.wait_pid_gone(
+                helper_pid, support.EXIT_DEADLINE)
+            assert old_helper_still_gone, (
+                "crashed FUSE helper reappeared or survived after the new remount")
+            old_mount_id_absent_after_remount = support.wait_for_mount_id_gone(
+                holder.pid, mountpoint, mount_id, support.EXIT_DEADLINE)
+            assert old_mount_id_absent_after_remount, (
+                f"crashed exact mount ID {mount_id} remained in the pinned old holder "
+                "namespace after the new remount")
+
+            new_api_mount_ns = os.stat(f"/proc/{new_api_pid}/ns/mnt").st_ino
+            new_api_user_ns = os.stat(f"/proc/{new_api_pid}/ns/user").st_ino
+            assert new_api_mount_ns > 0 and new_api_user_ns > 0, (
+                "restarted API namespace inode is not positive")
+            remount_namespace_distinct = (
+                new_api_mount_ns != old_holder_mount_ns
+                and new_api_user_ns != old_holder_user_ns)
+            assert remount_namespace_distinct, (
+                "restarted API reused the crashed mount/user namespace")
+            assert new_api_mount_ns != old_holder_mount_ns, (
+                "restarted API mount namespace inode equals the pinned old holder")
+            assert new_api_user_ns != old_holder_user_ns, (
+                "restarted API user namespace inode equals the pinned old holder")
+
+            new_helper_pid = support.find_api_helper_pid(new_api_pid)
+            new_helper_identity = support.process_identity(new_helper_pid)
+            assert new_helper_identity is not None, (
+                "restarted FUSE helper identity is unavailable")
+            assert new_helper_identity["state"] != "Z", (
+                "restarted FUSE helper exited immediately")
+            assert new_helper_identity["pgid"] == new_helper_pid, (
+                "restarted FUSE helper is not in its own owned process group")
+            new_helper_identity_fresh = (
+                new_helper_identity["starttime"] > new_api_identity["starttime"]
+                and new_helper_identity["starttime"] > helper_identity["starttime"])
+            assert new_helper_identity_fresh, (
+                "restarted FUSE helper is not a fresh process incarnation")
+
+            holder_final = verify_holder_pinned("after all remount identity checks")
+            old_holder_alive_across_remount = (
+                holder_final is not None and holder_final["state"] != "Z")
+            old_holder_identity_stable = (
+                holder_final["pid"] == holder_identity["pid"]
+                and holder_final["starttime"] == holder_identity["starttime"])
+
+            # The pinned old namespace has now proved the old mount is gone and
+            # the new API lives in a distinct namespace.  The holder may be
+            # reaped explicitly; the finally block still bounds it on failures.
+            support.terminate_process(holder)
+            holder = None
 
             deletes_before = proxy.method_counts.get("DELETE", 0)
             abandoned = json.loads(self.expect(f"/api/checkpoints/{failed_id}/abandon", 200,
@@ -620,6 +746,29 @@ class PolicyHarness(Harness):
                 "writer_pid": writer_identity["pid"],
                 "writer_starttime": writer_identity["starttime"],
                 "owned_mount_id": mount_id,
+                "remount_mount_id": new_mount_id,
+                "mount_id_recycled": new_mount_id == mount_id,
+                "old_holder_mount_ns_ino": old_holder_mount_ns,
+                "new_api_mount_ns_ino": new_api_mount_ns,
+                "old_holder_user_ns_ino": old_holder_user_ns,
+                "new_api_user_ns_ino": new_api_user_ns,
+                "new_api_pid": new_api_pid,
+                "new_api_starttime": new_api_identity["starttime"],
+                "new_helper_pid": new_helper_pid,
+                "new_helper_starttime": new_helper_identity["starttime"],
+                "new_api_identity_fresh": new_api_identity_fresh,
+                "new_helper_identity_fresh": new_helper_identity_fresh,
+                "remount_namespace_distinct": remount_namespace_distinct,
+                "old_holder_alive_across_remount": old_holder_alive_across_remount,
+                "old_holder_identity_stable": old_holder_identity_stable,
+                "old_mount_namespace_stable": old_mount_namespace_stable,
+                "old_user_namespace_stable": old_user_namespace_stable,
+                "old_helper_exit_before_restart": old_helper_exit_before_restart,
+                "old_mount_id_absent_before_restart":
+                    old_mount_id_absent_before_restart,
+                "old_helper_exit_after_remount": old_helper_still_gone,
+                "old_mount_id_absent_after_remount":
+                    old_mount_id_absent_after_remount,
                 "failed_publication_exit": 77,
                 "pending_writer_exit": writer_exit,
                 "failed_publish_put_delta": put_delta,
@@ -658,16 +807,18 @@ class PolicyHarness(Harness):
                     support.terminate_process(process)
                 except Exception:
                     pass
-            if helper_pid is not None:
-                current = support.process_identity(helper_pid)
-                if (helper_identity is not None and current is not None
-                        and current["state"] != "Z"
-                        and current["starttime"] == helper_identity["starttime"]):
+            for pid, identity in ((helper_pid, helper_identity),
+                                  (new_helper_pid, new_helper_identity)):
+                if pid is None or identity is None:
+                    continue
+                current = support.process_identity(pid)
+                if (current is not None and current["state"] != "Z"
+                        and current["starttime"] == identity["starttime"]):
                     try:
-                        os.killpg(helper_pid, signal.SIGKILL)
+                        os.killpg(pid, signal.SIGKILL)
                     except OSError:
                         pass
-                    support.wait_pid_gone(helper_pid, support.EXIT_DEADLINE)
+                    support.wait_pid_gone(pid, support.EXIT_DEADLINE)
             support.close_fd(api_pidfd)
             support.close_fd(helper_pidfd)
             support.close_fd(writer_pidfd)
