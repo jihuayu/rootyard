@@ -5,6 +5,8 @@ mod changesets;
 mod handlers;
 #[path = "namespace_service/reverse.rs"]
 mod reverse;
+#[path = "namespace_service/view_git_http.rs"]
+mod view_git_http;
 #[path = "namespace_service/views.rs"]
 mod views;
 
@@ -61,10 +63,17 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/namespaces/{id}/views", post(views::create))
         .route("/api/views/{id}", get(views::get))
         .route("/api/views/{id}/bundle", get(views::bundle))
+        .route("/api/views/{id}/history", get(views::history))
         .route("/api/namespaces/{id}/changesets", post(changesets::create))
         .route("/api/changesets/{id}", get(changesets::get))
         .route("/api/changesets/{id}/review", post(changesets::review))
         .route("/api/changesets/{id}/integrate", post(changesets::integrate))
         .route("/api/changesets/{id}/recover", post(changesets::recover))
         .route("/api/views/{id}/changesets", post(reverse::create).layer(DefaultBodyLimit::max(reverse::BODY_LIMIT)))
+        .route("/git/views/{view_git}/info/refs", get(view_git_http::info_refs))
+        .route(
+            "/git/views/{view_git}/git-upload-pack",
+            post(view_git_http::upload_pack).layer(DefaultBodyLimit::max(view_git_http::UPLOAD_BODY_LIMIT)),
+        )
+        .route("/git/views/{view_git}/git-receive-pack", post(view_git_http::reject_receive_pack))
 }
