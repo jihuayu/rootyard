@@ -1,4 +1,5 @@
 use super::data_key::PandoDataKey;
+use super::valid_kms_key_id;
 use super::provider::PandoKeyProvider;
 use super::wrapped_dek::{PandoProviderKind, PandoWrappedDek, parse_vault_ciphertext_version};
 use anyhow::{Context, Result, bail, ensure};
@@ -14,7 +15,6 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_CIPHERTEXT_BYTES: usize = 4096;
-const MAX_KEY_NAME_BYTES: usize = 64;
 const MAX_MOUNT_BYTES: usize = 64;
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -88,7 +88,10 @@ impl VaultTransitConfig {
             "invalid Pando Vault token"
         );
         ensure!(valid_component(mount, MAX_MOUNT_BYTES), "invalid Pando Vault mount");
-        ensure!(valid_component(key_name, MAX_KEY_NAME_BYTES), "invalid Pando Vault key name");
+        ensure!(
+            key_name == key_name.trim() && valid_kms_key_id(key_name),
+            "invalid Pando Vault key name"
+        );
         let key_id = KeyId::parse(key_name).map_err(|_| anyhow::anyhow!("invalid Pando Vault key id"))?;
         let operation_timeout = operation_timeout.unwrap_or(DEFAULT_OPERATION_TIMEOUT);
         ensure!(
@@ -468,6 +471,29 @@ mod tests {
                 .is_err()
             );
         }
+        for key_name in ["a", "ab", " pando-vault-key", "pando-vault-key "] {
+            assert!(
+                VaultTransitConfig::from_values(
+                    "https://vault.example.com",
+                    "token-value".to_owned(),
+                    "transit",
+                    key_name,
+                    timeout,
+                )
+                .is_err(),
+                "accepted key name {key_name:?}"
+            );
+        }
+        assert!(
+            VaultTransitConfig::from_values(
+                "https://vault.example.com",
+                "token-value".to_owned(),
+                "transit",
+                "abc",
+                timeout,
+            )
+            .is_ok()
+        );
         let config = VaultTransitConfig::from_values(
             "https://vault.example.com",
             "super-secret-token".to_owned(),
