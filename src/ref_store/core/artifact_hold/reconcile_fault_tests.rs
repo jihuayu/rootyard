@@ -68,8 +68,6 @@ struct GroupFx {
     history: Uuid,
     hold_id: Uuid,
     retire_id: Uuid,
-    binding: BridgeBinding,
-    reservation: VerifiedGlobalHoldReservation,
     plan: BridgeRootRegistrationPlan,
 }
 
@@ -182,8 +180,6 @@ fn setup_published_group(seed: u128, sha: &str, backend: &str, group_id: i64) ->
         history: history_incarnation,
         hold_id,
         retire_id,
-        binding,
-        reservation,
         plan,
     };
     (sm, fx)
