@@ -193,7 +193,7 @@ pub async fn create(
         if kind.trim() != "tree" {
             return Err(Error::bad_request());
         }
-        git(&temp, &["filter-branch", &format!("--subdirectory-filter={}", input.subdir), "--", "HEAD"])?;
+        git(&temp, &["filter-branch", "--subdirectory-filter", &input.subdir, "--", "HEAD"])?;
         git(&temp, &["rev-parse", "HEAD"])?.trim().to_owned()
     };
     git(&temp, &["update-ref", "refs/heads/projected", &projected])?;

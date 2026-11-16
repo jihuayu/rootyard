@@ -113,9 +113,13 @@ jobs:
           echo "ROOTYARD_BIN=$candidate_dir/rootyard" >> "$GITHUB_ENV"
       - name: Run existing Namespace service regression suite
         timeout-minutes: 10
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/tests
         run: python3 -m unittest -v tests.test_namespace_service
       - name: Run online Namespace, Smart HTTP View, RBAC, conflict, and crash recovery workflows
         timeout-minutes: 15
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/tests
         run: |
           python3 tests/namespace_online_workflows.py \
             --binary "$ROOTYARD_BIN" \
