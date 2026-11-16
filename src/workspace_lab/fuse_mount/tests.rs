@@ -198,3 +198,26 @@ fn direct_upper_whiteout_rollback_keeps_overlay_reads_and_subsequent_unlinks_con
     let saved: Vec<String> = serde_json::from_slice(&fs::read(&whiteout_path).unwrap()).unwrap();
     assert_eq!(saved, vec!["a.txt", "b.txt"]);
 }
+
+#[test]
+fn legacy_spawn_api_is_owner_bearing_while_old_public_spawn_is_unchanged() {
+    // Compile-time contract only. The legacy registry uses the owner-bearing
+    // result so a post-spawn identity failure can transfer the live session;
+    // the existing public `spawn` API keeps its `io::Result` signature and
+    // retains (never drops) an unproved owner while mapping the error.
+    fn old_public(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
+        spawn(overlay, mountpoint)
+    }
+    fn owner_bearing(overlay: Overlay, mountpoint: &Path) -> Result<MountHandle, LegacySpawnFailure> {
+        spawn_legacy(overlay, mountpoint)
+    }
+    let _: fn(Overlay, &Path) -> io::Result<MountHandle> = old_public;
+    let _: fn(Overlay, &Path) -> Result<MountHandle, LegacySpawnFailure> = owner_bearing;
+}
+
+#[test]
+fn unproved_identity_is_a_static_failure_category_without_a_path() {
+    let text = MountTeardownError::IdentityUnproved.to_string();
+    assert_eq!(text, "FUSE mount identity was not captured; exact unmount is unproved");
+    assert!(!text.contains('/'), "the ownership failure category must not expose a mount path");
+}

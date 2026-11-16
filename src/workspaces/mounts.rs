@@ -21,7 +21,7 @@ use crate::{
     members::models::Role,
     workspace_lab::{
         fuse_helper::{HelperClient, HelperError},
-        fuse_mount::{LazySource, MountHandle, MutationGate, Overlay},
+        fuse_mount::{LazySource, LegacySpawnFailure, MountHandle, MutationGate, Overlay},
     },
 };
 use axum::{
@@ -234,6 +234,12 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
             Err(LegacyReserveError::Occupied) => {
                 return Err(Error(StatusCode::CONFLICT, "workspace FUSE mount changed during admission; retry"));
             }
+            Err(LegacyReserveError::Unproved) => {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "workspace FUSE mount has unproved ownership; retry after shutdown",
+                ));
+            }
         }
     };
 
@@ -249,7 +255,17 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
     let lazy = lazy::Reader::open(state, id)?;
     let source: Option<Arc<dyn LazySource>> = lazy.clone().map(|reader| reader as Arc<dyn LazySource>);
     let overlay = Overlay::new_with_gate_and_lazy(lower, upper, gate.clone(), source).map_err(Error::internal)?;
-    let session = crate::workspace_lab::fuse_mount::spawn(overlay, &mountpoint).map_err(Error::internal)?;
+    let session = match crate::workspace_lab::fuse_mount::spawn_legacy(overlay, &mountpoint) {
+        Ok(session) => session,
+        Err(LegacySpawnFailure::BeforeSession(error)) => return Err(Error::internal(error)),
+        Err(LegacySpawnFailure::AfterSession { error, owner }) => {
+            // The session already exists even though its exact identity could
+            // not be captured. Transfer the owner and Reader before the
+            // pending guard can resolve this admission without an owner.
+            admission.retain_unproved(InProcessSlot { _session: owner, gate, lazy });
+            return Err(Error::internal(error));
+        }
+    };
     match admission.promote(InProcessSlot { _session: session, gate, lazy }) {
         Ok(LegacyPromotion::Mounted) => Ok(()),
         Ok(LegacyPromotion::Transferred) => {

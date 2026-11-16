@@ -79,6 +79,11 @@ pub(crate) struct Registry<C, I> {
     /// A token-conflict owner that cannot be published or transferred. Keeping
     /// it here (rather than dropping it) makes it shutdown-visible.
     legacy_orphans: Vec<(Uuid, I)>,
+    /// Post-spawn owners whose exact mount identity was not captured. They are
+    /// never published as mounted; close seeds them into the retained ticket,
+    /// where teardown is a permanent typed failure until real ownership is
+    /// resolved.
+    legacy_unproved: Vec<(Uuid, I)>,
 }
 
 impl<C, I> Default for Registry<C, I> {
@@ -89,6 +94,7 @@ impl<C, I> Default for Registry<C, I> {
             legacy_pending: HashMap::new(),
             legacy_ticket: None,
             legacy_orphans: Vec::new(),
+            legacy_unproved: Vec::new(),
         }
     }
 }
@@ -111,6 +117,7 @@ pub(super) enum LegacyReserveError {
     Closing,
     Pending,
     Occupied,
+    Unproved,
 }
 
 /// Result of publishing an owner after its IO/spawn work completed.
@@ -189,6 +196,9 @@ impl<C, I> Registry<C, I> {
         if self.entries.contains_key(&id) {
             return Err(LegacyReserveError::Occupied);
         }
+        if self.legacy_unproved.iter().any(|(existing, _)| *existing == id) {
+            return Err(LegacyReserveError::Unproved);
+        }
         let reservation = LegacyReservation::new();
         self.legacy_pending.insert(id, reservation);
         Ok(LegacyReservationGuard { registry: shared.clone(), id, reservation, armed: true })
@@ -218,6 +228,7 @@ impl<C, I> Registry<C, I> {
             }
         }
         in_process.append(&mut self.legacy_orphans);
+        in_process.append(&mut self.legacy_unproved);
 
         if self.legacy_closing {
             if let Some(ticket) = self.legacy_ticket.as_ref() {
@@ -389,6 +400,30 @@ impl<C, I> LegacyReservationGuard<C, I> {
         }
     }
 
+    /// Transfer an owner whose mount was created but whose exact identity was
+    /// not captured. It is never published as mounted and never resolves the
+    /// pending condition without an owner.
+    pub(super) fn retain_unproved(&mut self, owner: I) {
+        let mut registry = lock(&self.registry);
+        if registry.legacy_pending.get(&self.id) != Some(&self.reservation) {
+            // A stale token must not remove a newer reservation, but the owner
+            // still has to stay shutdown-visible.
+            registry.retain_legacy_owner(self.id, owner);
+            return;
+        }
+        registry.legacy_pending.remove(&self.id);
+        self.armed = false;
+        if registry.legacy_closing {
+            if let Some(ticket) = registry.legacy_ticket.clone() {
+                ticket.resolve_with_owner(self.id, owner);
+            } else {
+                registry.legacy_orphans.push((self.id, owner));
+            }
+        } else {
+            registry.legacy_unproved.push((self.id, owner));
+        }
+    }
+
     #[cfg(test)]
     fn reservation(&self) -> LegacyReservation {
         self.reservation
@@ -427,7 +462,10 @@ mod tests {
     use super::super::legacy_shutdown::LegacyOwner;
     use super::*;
     use std::{
-        sync::{Arc, Barrier},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -555,6 +593,30 @@ mod tests {
         Arc::new(Mutex::new(LegacyTestRegistry::new()))
     }
 
+    struct UnprovedTestOwner {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl LegacyOwner for UnprovedTestOwner {
+        fn fence_for_shutdown(&self) {}
+
+        fn teardown_owned(&mut self) -> Result<(), String> {
+            Err("mount identity unproved".into())
+        }
+    }
+
+    impl Drop for UnprovedTestOwner {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    type UnprovedTestRegistry = Registry<TestClient, UnprovedTestOwner>;
+
+    fn unproved_registry() -> Arc<Mutex<UnprovedTestRegistry>> {
+        Arc::new(Mutex::new(UnprovedTestRegistry::new()))
+    }
+
     #[test]
     fn close_refuses_a_legacy_reservation_under_the_same_registry_authority() {
         let registry = legacy_registry();
@@ -659,5 +721,76 @@ mod tests {
         assert_ne!(old_reservation, later.reservation());
         drop(old);
         assert!(registry.lock().unwrap().legacy_pending(id), "the stale guard must leave the later token intact");
+    }
+
+    #[test]
+    fn unproved_post_spawn_owner_is_retained_without_publishing_or_remount() {
+        let registry = unproved_registry();
+        let id = Uuid::new_v4();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut guard = {
+            let mut lock = registry.lock().unwrap();
+            lock.reserve_legacy(id, &registry).unwrap()
+        };
+        guard.retain_unproved(UnprovedTestOwner { drops: drops.clone() });
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "the owner must not be dropped");
+
+        {
+            let mut lock = registry.lock().unwrap();
+            assert!(!lock.legacy_pending(id), "an owner-bearing failure must remove the pending token");
+            assert!(lock.get(&id).is_none(), "an unproved owner must never be published as mounted");
+            assert_eq!(lock.legacy_unproved.len(), 1);
+            assert!(matches!(lock.reserve_legacy(id, &registry), Err(LegacyReserveError::Unproved)));
+        }
+    }
+
+    #[test]
+    fn post_spawn_unproved_owner_after_close_resolves_pending_but_is_never_clean() {
+        let registry = unproved_registry();
+        let id = Uuid::new_v4();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut guard = {
+            let mut lock = registry.lock().unwrap();
+            lock.reserve_legacy(id, &registry).unwrap()
+        };
+        let ticket = {
+            let mut lock = registry.lock().unwrap();
+            lock.begin_shutdown().legacy.expect("pending admission must create a retained ticket")
+        };
+        ticket.spawn_worker().unwrap();
+        assert_eq!(ticket.observe().pending, 1);
+
+        // This is the source stand-in for ensure() observing an owner-bearing
+        // post-spawn failure. The owner and Reader transfer before guard Drop.
+        guard.retain_unproved(UnprovedTestOwner { drops: drops.clone() });
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "retained unproved owner must not be dropped");
+        assert_eq!(ticket.observe().pending, 0, "owner transfer must resolve the pending count");
+
+        let observation = ticket.wait_until(Instant::now() + Duration::from_secs(2));
+        assert!(!observation.success(), "an unproved owner must never produce clean success");
+        assert_eq!(observation.owned, 1, "the unproved owner stays ticket-owned");
+        assert!(observation.failures.iter().any(|failure| failure.contains("mount identity unproved")));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn close_seeds_an_earlier_unproved_owner_into_the_ticket() {
+        let registry = unproved_registry();
+        let id = Uuid::new_v4();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut guard = {
+            let mut lock = registry.lock().unwrap();
+            lock.reserve_legacy(id, &registry).unwrap()
+        };
+        guard.retain_unproved(UnprovedTestOwner { drops: drops.clone() });
+        let ticket = {
+            let mut lock = registry.lock().unwrap();
+            lock.begin_shutdown().legacy.expect("an unproved owner must create a retained ticket")
+        };
+        ticket.spawn_worker().unwrap();
+        let observation = ticket.wait_until(Instant::now() + Duration::from_secs(2));
+        assert!(!observation.success());
+        assert_eq!(observation.owned, 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
 }

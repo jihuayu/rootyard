@@ -24,7 +24,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -104,10 +104,67 @@ pub struct MountHandle {
     dispatcher: Arc<fuse_dispatch::Dispatcher>,
     /// Canonical mount point the kernel published for this handle.
     mountpoint: PathBuf,
-    /// Kernel mount ID captured for this handle when it mounted.
-    mount_id: MountId,
+    /// Kernel mount ID captured for this handle when it mounted. `None` is an
+    /// unproved post-spawn owner: the live session must be retained, never
+    /// dropped through the path/lazy destructor fallback, and can never report
+    /// clean teardown until a real exact identity is resolved.
+    mount_id: Option<MountId>,
     /// Terminal session-join state. `None` means it has not been attempted.
     session_join: Option<Result<(), SessionJoinFailureKind>>,
+}
+
+/// Last-resort retention for an unproved owner that reached an API boundary
+/// which can only return `io::Error`. The owner is never dropped here, because
+/// `fuser`'s mount destructor may choose a path-only or lazy fallback.
+static RETAINED_UNPROVED: OnceLock<Mutex<Vec<MountHandle>>> = OnceLock::new();
+
+fn retain_unproved_owner(owner: MountHandle) {
+    RETAINED_UNPROVED
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(owner);
+}
+
+/// A post-spawn failure can already own a live `fuser` session even though the
+/// exact mount identity was not captured. Legacy callers must transfer that
+/// owner, not treat the admission as a pre-spawn no-owner failure.
+pub(crate) enum LegacySpawnFailure {
+    /// No `BackgroundSession` was created; the pending admission may resolve
+    /// without an owner.
+    BeforeSession(io::Error),
+    /// `spawn_mount2` succeeded, but exact identity could not be proven. The
+    /// owner is retained with `mount_id = None` and is a permanent teardown
+    /// failure until real ownership is resolved.
+    AfterSession { error: io::Error, owner: MountHandle },
+}
+
+impl LegacySpawnFailure {
+    /// Preserve the old `io::Result` API without dropping a post-spawn owner.
+    fn into_error(self) -> io::Error {
+        match self {
+            Self::BeforeSession(error) => error,
+            Self::AfterSession { error, owner } => {
+                retain_unproved_owner(owner);
+                error
+            }
+        }
+    }
+}
+
+impl Drop for MountHandle {
+    fn drop(&mut self) {
+        if self.mount_id.is_none()
+            && let Some(session) = self.session.take()
+        {
+            // There is no exact authority to unmount. Dropping the background
+            // session would let fuser's `Mount` destructor attempt a path-only
+            // or lazy unmount, which this code cannot prove belongs to us.
+            // Retain it instead; the registry/ticket paths do this explicitly,
+            // and this is the last-resort boundary retention.
+            std::mem::forget(session);
+        }
+    }
 }
 
 /// Why the owner-preserving legacy teardown did not reach confirmed
@@ -122,6 +179,7 @@ pub(crate) enum MountTeardownError {
     SessionJoin(io::Error),
     SessionJoinAlreadyFailed,
     SessionStateInvalid,
+    IdentityUnproved,
 }
 
 impl fmt::Display for MountTeardownError {
@@ -135,6 +193,9 @@ impl fmt::Display for MountTeardownError {
                 formatter.write_str("FUSE session join previously failed after exact unmount")
             }
             Self::SessionStateInvalid => formatter.write_str("FUSE session ownership state is inconsistent"),
+            Self::IdentityUnproved => {
+                formatter.write_str("FUSE mount identity was not captured; exact unmount is unproved")
+            }
         }
     }
 }
@@ -204,6 +265,13 @@ impl MountHandle {
     /// is terminal failure after the exact unmount and is cached so a retry
     /// cannot relabel it as success.
     pub(crate) fn teardown_owned(&mut self) -> Result<(), MountTeardownError> {
+        let Some(mount_id) = self.mount_id else {
+            // Stop new work, but no path-only or lazy unmount is permitted for
+            // an unproved owner. The live session stays in `self.session`.
+            self.request_stop();
+            self.dispatcher.join_actor().map_err(|_| MountTeardownError::ActorJoinPanicked)?;
+            return Err(MountTeardownError::IdentityUnproved);
+        };
         if let Some(outcome) = self.session_join {
             return match outcome {
                 Ok(()) => Ok(()),
@@ -215,7 +283,7 @@ impl MountHandle {
         self.dispatcher.join_actor().map_err(|_| MountTeardownError::ActorJoinPanicked)?;
         // The session is still owned here. A refusal or identity mismatch must
         // propagate without dropping the live `fuser` mount.
-        unmount_owned(&self.mountpoint, self.mount_id).map_err(MountTeardownError::Unmount)?;
+        unmount_owned(&self.mountpoint, mount_id).map_err(MountTeardownError::Unmount)?;
         let Some(session) = self.session.take() else {
             return Err(MountTeardownError::SessionStateInvalid);
         };
@@ -497,46 +565,56 @@ pub(crate) fn mount_options(auto_unmount: bool) -> Vec<MountOption> {
     options
 }
 
-fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Result<MountHandle> {
+fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> Result<MountHandle, LegacySpawnFailure> {
     // Canonicalize before mounting: `/proc/self/mountinfo` publishes the
     // canonical path, and the teardown identity check compares it exactly.
-    let mountpoint = mountpoint.canonicalize()?;
-    let fs = MountFs::new(overlay)?;
+    let mountpoint = mountpoint.canonicalize().map_err(LegacySpawnFailure::BeforeSession)?;
+    let fs = MountFs::new(overlay).map_err(LegacySpawnFailure::BeforeSession)?;
     let dispatcher = fs.dispatcher().clone();
-    let session = fuser::spawn_mount2(fs, &mountpoint, &mount_options(auto_unmount))?;
+    let session = fuser::spawn_mount2(fs, &mountpoint, &mount_options(auto_unmount))
+        .map_err(LegacySpawnFailure::BeforeSession)?;
     // Capture the kernel mount identity before anyone else can observe the
-    // mount point. An unverifiable mount is not published: a later path-based
-    // unmount could otherwise hit a different mount stacked at the same path.
+    // mount point. A missing or unreadable identity is not a pre-spawn failure:
+    // the session already exists, so the owner must be returned intact.
     let mount_id = match ownership::mount_id_at_path(&mountpoint) {
-        Ok(Some(mount_id)) => mount_id,
+        Ok(Some(mount_id)) => Some(mount_id),
         Ok(None) => {
-            // The helper mount already succeeded, so dropping the background
-            // session would leave an untracked FUSE thread and a mount nobody
-            // can prove ownership of. `AutoUnmount` removes the mount when the
-            // last helper descriptor dies, so exit immediately and lock-free:
-            // no IO, no unmount guess, no destructor that joins the session.
+            // The helper mount already succeeded. `AutoUnmount` removes the
+            // mount when the last helper descriptor dies, so the helper exits
+            // immediately and lock-free: no IO, no unmount guess, no
+            // destructor that joins the session.
             if auto_unmount {
                 // SAFETY: `_exit` is async-signal-safe and does not touch
                 // Rust state or any lock; process death closes the owned FUSE
                 // descriptor and lets `AutoUnmount` clean the mountpoint.
                 unsafe { libc::_exit(1) }
             }
-            drop(session);
-            return Err(io::Error::other("owned FUSE mount is missing from /proc/self/mountinfo"));
+            let error = io::Error::other("owned FUSE mount is missing from /proc/self/mountinfo");
+            let owner =
+                MountHandle { session: Some(session), dispatcher, mountpoint, mount_id: None, session_join: None };
+            return Err(LegacySpawnFailure::AfterSession { error, owner });
         }
         Err(error) => {
             // Same fail-closed rule when the mount table cannot be read at
-            // all. The legacy (non-`AutoUnmount`) caller keeps its previous
-            // error propagation because it has no helper death cleanup.
+            // all. The legacy path returns the already-created owner, not just
+            // an IO error.
             if auto_unmount {
                 // SAFETY: as above; this path must not run any Rust teardown.
                 unsafe { libc::_exit(1) }
             }
-            drop(session);
-            return Err(error);
+            let owner =
+                MountHandle { session: Some(session), dispatcher, mountpoint, mount_id: None, session_join: None };
+            return Err(LegacySpawnFailure::AfterSession { error, owner });
         }
     };
     Ok(MountHandle { session: Some(session), dispatcher, mountpoint, mount_id, session_join: None })
+}
+
+/// Owner-bearing variant used by the in-process legacy registry. A
+/// post-spawn identity failure returns the live owner so the caller can
+/// transfer it before the pending admission guard is dropped.
+pub(crate) fn spawn_legacy(overlay: Overlay, mountpoint: &Path) -> Result<MountHandle, LegacySpawnFailure> {
+    spawn_with(overlay, mountpoint, false)
 }
 
 /// Spawn the bounded per-mount dispatcher and mount `overlay` in the background.
@@ -547,7 +625,7 @@ fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Re
 /// This is the historical option list (no `AutoUnmount`): used by the in-process
 /// service mount, whose unmount is driven by the owning API process.
 pub fn spawn(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
-    spawn_with(overlay, mountpoint, false)
+    spawn_with(overlay, mountpoint, false).map_err(LegacySpawnFailure::into_error)
 }
 
 /// Spawn a mount owned by one independent FUSE helper process with
@@ -579,7 +657,7 @@ pub fn spawn(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
 /// never edits a global `fuse.conf` or any LSM policy, and makes no implicit
 /// rootless guarantee.
 pub fn spawn_helper(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
-    spawn_with(overlay, mountpoint, true)
+    spawn_with(overlay, mountpoint, true).map_err(LegacySpawnFailure::into_error)
 }
 
 pub fn mount(lower: PathBuf, upper: PathBuf, mountpoint: PathBuf) -> io::Result<()> {
