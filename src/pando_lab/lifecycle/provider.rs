@@ -1,4 +1,6 @@
 use super::crypto::sha256_hex;
+use super::data_key::PandoDataKey;
+use super::wrapped_dek::PandoWrappedDek;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::future::BoxFuture;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -31,19 +33,19 @@ pub trait PandoKeyProvider: fmt::Debug + Send + Sync {
     fn capabilities(&self) -> KeyProviderCapabilities;
     fn wrap_data_key<'a>(
         &'a self,
-        data_key: &'a [u8; DATA_KEY_BYTES],
+        data_key: &'a PandoDataKey,
         context: &'a WrapContext,
-    ) -> BoxFuture<'a, std::result::Result<WrappedKey, KeyProviderError>>;
+    ) -> BoxFuture<'a, std::result::Result<PandoWrappedDek, KeyProviderError>>;
     fn unwrap_data_key<'a>(
         &'a self,
-        wrapped: &'a WrappedKey,
+        wrapped: &'a PandoWrappedDek,
         context: &'a WrapContext,
-    ) -> BoxFuture<'a, std::result::Result<DataKey, KeyProviderError>>;
+    ) -> BoxFuture<'a, std::result::Result<PandoDataKey, KeyProviderError>>;
     fn rewrap_data_key<'a>(
         &'a self,
-        wrapped: &'a WrappedKey,
+        wrapped: &'a PandoWrappedDek,
         context: &'a WrapContext,
-    ) -> BoxFuture<'a, std::result::Result<WrappedKey, KeyProviderError>>;
+    ) -> BoxFuture<'a, std::result::Result<PandoWrappedDek, KeyProviderError>>;
 }
 
 impl<T: KeyProvider + ?Sized> PandoKeyProvider for T {
@@ -57,26 +59,45 @@ impl<T: KeyProvider + ?Sized> PandoKeyProvider for T {
 
     fn wrap_data_key<'a>(
         &'a self,
-        data_key: &'a [u8; DATA_KEY_BYTES],
+        data_key: &'a PandoDataKey,
         context: &'a WrapContext,
-    ) -> BoxFuture<'a, std::result::Result<WrappedKey, KeyProviderError>> {
-        Box::pin(async move { KeyProvider::wrap_data_key(self, data_key, context) })
+    ) -> BoxFuture<'a, std::result::Result<PandoWrappedDek, KeyProviderError>> {
+        Box::pin(async move {
+            let wrapped = KeyProvider::wrap_data_key(self, data_key.expose_secret(), context)?;
+            Ok(PandoWrappedDek::Local(wrapped))
+        })
     }
 
     fn unwrap_data_key<'a>(
         &'a self,
-        wrapped: &'a WrappedKey,
+        wrapped: &'a PandoWrappedDek,
         context: &'a WrapContext,
-    ) -> BoxFuture<'a, std::result::Result<DataKey, KeyProviderError>> {
-        Box::pin(async move { KeyProvider::unwrap_data_key(self, wrapped, context) })
+    ) -> BoxFuture<'a, std::result::Result<PandoDataKey, KeyProviderError>> {
+        Box::pin(async move {
+            let PandoWrappedDek::Local(wrapped) = wrapped else {
+                return Err(KeyProviderError::InvalidWrappedKey(
+                    "external wrapped DEK cannot be unwrapped by the local provider",
+                ));
+            };
+            let data_key = KeyProvider::unwrap_data_key(self, wrapped, context)?;
+            Ok(PandoDataKey::from_bytes(*data_key.expose_secret()))
+        })
     }
 
     fn rewrap_data_key<'a>(
         &'a self,
-        wrapped: &'a WrappedKey,
+        wrapped: &'a PandoWrappedDek,
         context: &'a WrapContext,
-    ) -> BoxFuture<'a, std::result::Result<WrappedKey, KeyProviderError>> {
-        Box::pin(async move { KeyProvider::rewrap_data_key(self, wrapped, context) })
+    ) -> BoxFuture<'a, std::result::Result<PandoWrappedDek, KeyProviderError>> {
+        Box::pin(async move {
+            let PandoWrappedDek::Local(wrapped) = wrapped else {
+                return Err(KeyProviderError::InvalidWrappedKey(
+                    "external wrapped DEK cannot be rewrapped by the local provider",
+                ));
+            };
+            let rewrapped = KeyProvider::rewrap_data_key(self, wrapped, context)?;
+            Ok(PandoWrappedDek::Local(rewrapped))
+        })
     }
 }
 

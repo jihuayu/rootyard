@@ -3,13 +3,12 @@ use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     rand::{SecureRandom, SystemRandom},
 };
-use rootyard::blob_store::key_provider::{
-    DATA_KEY_BYTES, DataKey, WrapContext, WrappedKey,
-};
+use rootyard::blob_store::key_provider::{DATA_KEY_BYTES, WrapContext};
+use super::data_key::PandoDataKey;
 use super::provider::PandoKeyProvider;
+use super::wrapped_dek::PandoWrappedDek;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 pub const AUTHENTICATED_ENVELOPE_MODE: &str = "authenticated-envelope-v1";
 pub const SYNTHETIC_METADATA_MODE: &str = "synthetic-metadata-lab-only";
@@ -221,9 +220,7 @@ pub async fn seal_pack_bytes<P: PandoKeyProvider + ?Sized>(
     let plaintext_sha256 = sha256_hex(plaintext);
     let plaintext_len = plaintext.len() as u64;
     let rng = SystemRandom::new();
-    let mut dek = Zeroizing::new([0u8; DATA_KEY_BYTES]);
-    rng.fill(&mut dek[..])
-        .map_err(|_| anyhow::anyhow!("system random generator failed while creating DEK"))?;
+    let dek = PandoDataKey::generate()?;
     let mut nonce_prefix = [0u8; NONCE_PREFIX_BYTES];
     rng.fill(&mut nonce_prefix)
         .map_err(|_| anyhow::anyhow!("system random generator failed while creating nonce"))?;
@@ -261,7 +258,7 @@ pub async fn seal_pack_bytes<P: PandoKeyProvider + ?Sized>(
         plaintext_len,
         chunk_size: SEALED_CHUNK_BYTES as u32,
     };
-    let key = less_safe_key(cipher, &dek)?;
+    let key = less_safe_key(cipher, dek.expose_secret())?;
     let total_chunks = if plaintext.is_empty() { 1 } else { chunk_count as usize };
     for idx in 0..total_chunks {
         let start = idx * SEALED_CHUNK_BYTES;
@@ -301,7 +298,7 @@ pub async fn seal_pack_bytes<P: PandoKeyProvider + ?Sized>(
         envelope_id,
         nonce_prefix_hex: hex::encode(nonce_prefix),
         wrapped_key_json,
-        key_id: wrapped.key_id().as_str().to_owned(),
+        key_id: wrapped.key_id().to_owned(),
         key_version,
         cipher_suite: cipher.suite_name().to_owned(),
         encryption_mode: AUTHENTICATED_ENVELOPE_MODE.to_owned(),
@@ -369,7 +366,7 @@ pub async fn open_sealed_pack_bytes<P: PandoKeyProvider + ?Sized>(
         );
     }
 
-    let wrapped = WrappedKey::from_json(req.wrapped_key_json.as_bytes())
+    let wrapped = PandoWrappedDek::from_json(req.wrapped_key_json.as_bytes())
         .map_err(|err| anyhow::anyhow!("invalid wrapped DEK metadata: {err}"))?;
     let wrap_ctx = pack_wrap_context(
         req.repo,
@@ -377,7 +374,7 @@ pub async fn open_sealed_pack_bytes<P: PandoKeyProvider + ?Sized>(
         header.envelope_id,
         req.expected_plaintext_sha256,
     )?;
-    let data_key: DataKey = provider
+    let data_key: PandoDataKey = provider
         .unwrap_data_key(&wrapped, &wrap_ctx)
         .await
         .map_err(|err| anyhow::anyhow!("KMS key unwrap failed closed: {err}"))?;
@@ -445,7 +442,7 @@ pub async fn rewrap_pack_dek<P: PandoKeyProvider + ?Sized>(
     wrapped_key_json: &str,
 ) -> Result<(String, String)> {
     ensure_provider_allows_encryption(provider)?;
-    let wrapped = WrappedKey::from_json(wrapped_key_json.as_bytes())
+    let wrapped = PandoWrappedDek::from_json(wrapped_key_json.as_bytes())
         .map_err(|err| anyhow::anyhow!("invalid wrapped DEK during rewrap: {err}"))?;
     let ctx = pack_wrap_context(repo, pack_id, envelope_id, plaintext_sha256)?;
     let rewrapped = provider
@@ -455,7 +452,7 @@ pub async fn rewrap_pack_dek<P: PandoKeyProvider + ?Sized>(
     let json = rewrapped
         .to_json()
         .map_err(|err| anyhow::anyhow!("rewrapped DEK serialization failed: {err}"))?;
-    Ok((rewrapped.key_id().as_str().to_owned(), json))
+    Ok((rewrapped.key_id().to_owned(), json))
 }
 
 pub fn compute_authenticated_envelope_mac(inputs: &EnvelopeMacInputs<'_>) -> String {

@@ -4,11 +4,13 @@ use std::{collections::BTreeSet, fs::File};
 
 mod cli;
 pub mod crypto;
+mod data_key;
 mod db;
 pub mod envelopes;
 mod eval;
 pub mod provider;
 pub mod rotation;
+mod wrapped_dek;
 
 pub use envelopes::{
     build_authenticated_envelope_record, build_envelope_record, envelope_file_path,
