@@ -69,6 +69,60 @@ class ExitedProcess:
         return 1
 
 
+class ReapedProcess:
+    """Already-exited local child stand-in for the release path."""
+
+    def __init__(self, identity):
+        self._rootyard_blocker_identity = identity
+        self.stdout = None
+        self.stderr = None
+        self.communicated = False
+
+    def poll(self):
+        return -15
+
+    def communicate(self, timeout=None):
+        self.communicated = True
+        return b"", b""
+
+
+class ReleaseFakeSQL:
+    """Synthetic answers for the release path; no PG connection is opened."""
+
+    def __init__(self, before_rows, after_rows=None, lock_count="0", termination="1"):
+        self.before_rows = before_rows
+        self.after_rows = [] if after_rows is None else after_rows
+        self.lock_count = lock_count
+        self.termination = termination
+        self.owned_calls = 0
+        self.lock_calls = 0
+        self.terminations = []
+        self.queries = []
+
+    def __call__(self, query, isolated=True):
+        self.queries.append(query)
+        if "pg_terminate_backend" in query:
+            self.terminations.append(query)
+            return self.termination
+        if "FROM pg_locks" in query:
+            self.lock_calls += 1
+            return self.lock_count
+        if "jsonb_agg" in query:
+            self.owned_calls += 1
+            return json.dumps(self.before_rows if self.owned_calls == 1 else self.after_rows)
+        raise AssertionError("offline release test issued an unexpected SQL query")
+
+
+def release_identity(application_name=APPLICATION_NAME, database="owned_db",
+                     pid=PID, backend_start=BACKEND_START):
+    return {
+        "application_name": application_name,
+        "database": database,
+        "pid": pid,
+        "backend_start": backend_start,
+    }
+
+
 def row(database, pid=PID, backend_start=BACKEND_START):
     return {"pid": pid, "database": database, "backend_start": backend_start}
 
@@ -156,6 +210,69 @@ class BlockerDatabaseIdentityTest(unittest.TestCase):
         fixture = harness(DSN_ESCAPED, [row("owned_db")], "owned_db")
         with self.assertRaisesRegex(AssertionError, "child exited before ownership registration"):
             fixture._register_owned_blocker(ExitedProcess(), APPLICATION_NAME)
+
+
+class BlockerReleaseTest(unittest.TestCase):
+    def test_exact_owned_backend_is_terminated_only_after_identity_accept(self):
+        identity = release_identity()
+        sql = ReleaseFakeSQL([row(identity["database"])], after_rows=[], lock_count="0")
+        fixture = object.__new__(CheckpointHarness)
+        fixture.sql = sql
+        process = ReapedProcess(identity)
+
+        self.assertIsNone(fixture._release_blocker(process))
+        self.assertTrue(process.communicated)
+        self.assertEqual(len(sql.terminations), 1)
+        query = sql.terminations[0]
+        self.assertEqual(sql.queries.index(query), 1)
+        self.assertTrue(query.startswith("WITH owned AS MATERIALIZED ("))
+        for predicate in (
+                "a.application_name='" + identity["application_name"] + "'",
+                "a.datname=current_database()",
+                "a.pid=" + str(identity["pid"]),
+                "a.backend_start::text='" + identity["backend_start"] + "'",
+                "a.pid<>pg_backend_pid()",
+        ):
+            self.assertIn(predicate, query)
+        self.assertIn("SELECT count(*) FROM owned WHERE pg_terminate_backend(owned.pid)", query)
+        self.assertEqual(sql.owned_calls, 2)
+        self.assertEqual(sql.lock_calls, 1)
+        self.assertFalse(any("pg_terminate_backend" in item for item in sql.queries[2:]))
+
+    def test_foreign_identity_fields_refuse_without_termination(self):
+        cases = (
+            ("database", release_identity(database="foreign_db"), [row("owned_db")]),
+            ("backend_start", release_identity(), [row("owned_db", backend_start="other")]),
+            ("pid", release_identity(), [row("owned_db", pid=PID + 1)]),
+        )
+        for field, identity, rows in cases:
+            with self.subTest(field=field):
+                sql = ReleaseFakeSQL(rows)
+                fixture = object.__new__(CheckpointHarness)
+                fixture.sql = sql
+                with self.assertRaisesRegex(AssertionError, "refusing foreign termination"):
+                    fixture._release_blocker(ReapedProcess(identity))
+                self.assertEqual(sql.terminations, [])
+                self.assertEqual(sql.owned_calls, 1)
+                self.assertEqual(sql.lock_calls, 0)
+
+    def test_foreign_application_name_and_absent_backend_probe_lock_without_termination(self):
+        cases = (
+            ("foreign_application_name",
+             release_identity(application_name="rootyard-commit-gate-foreign"), []),
+            ("absent_backend", release_identity(), []),
+        )
+        for label, identity, rows in cases:
+            with self.subTest(case=label):
+                sql = ReleaseFakeSQL(rows, lock_count="0")
+                fixture = object.__new__(CheckpointHarness)
+                fixture.sql = sql
+                self.assertIsNone(fixture._release_blocker(ReapedProcess(identity)))
+                self.assertEqual(sql.terminations, [])
+                self.assertEqual(sql.owned_calls, 1)
+                self.assertEqual(sql.lock_calls, 1)
+                self.assertIn("a.application_name='" + identity["application_name"] + "'",
+                              sql.queries[0])
 
 
 if __name__ == "__main__":
