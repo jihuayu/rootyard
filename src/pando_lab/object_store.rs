@@ -269,6 +269,7 @@ async fn decrypt_verified_store_pack(
     store_root_dir: &Path,
     base_root: &Path,
     manifest: &CasPackManifest,
+    client: Option<&Client>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut check = manifest.clone();
     check.manifest_sha256 = String::new();
@@ -280,8 +281,12 @@ async fn decrypt_verified_store_pack(
     let i_bytes = std::fs::read(store_root_dir.join(&manifest.idx_key))?;
     ensure!(c_bytes.len() as u64 == cipher_len && delta::sha256_hex(&c_bytes) == cipher_sha, "object store ciphertext mismatch");
     ensure!(i_bytes.len() as u64 == manifest.idx_bytes && delta::sha256_hex(&i_bytes) == manifest.idx_sha256, "object store idx mismatch");
-    let env = lifecycle::read_and_verify_envelope_file(base_root, manifest.repo, manifest.pack_id)?;
     let pack = Pack { id: manifest.pack_id, pack_sha256: manifest.pack_sha256.clone(), idx_sha256: manifest.idx_sha256.clone() };
+    let env = if let Some(client) = client {
+        lifecycle::rotation::load_authoritative_envelope(client, base_root, manifest.repo, &pack).await?
+    } else {
+        lifecycle::read_and_verify_envelope_file(base_root, manifest.repo, manifest.pack_id)?
+    };
     let p_bytes = lifecycle::rotation::verify_and_decrypt_pack_bytes(base_root, manifest.repo, &pack, &env, &c_bytes).await?;
     ensure!(p_bytes.len() as u64 == manifest.pack_bytes && delta::sha256_hex(&p_bytes) == manifest.pack_sha256, "decrypted pack digest or length mismatch");
     let rep = delta::verify_pack(&p_bytes, &delta::Limits::default())?;
@@ -297,6 +302,7 @@ pub(crate) async fn put_pack_files_sealed(
     opts: &ObjectStorePutOptions,
     storage_tier: &str,
     checkpoint: Option<&lifecycle::rotation::KmsRotationCheckpoint>,
+    client: Option<&Client>,
 ) -> Result<(
     ObjectStorePutReport,
     CasPackManifest,
@@ -340,8 +346,13 @@ pub(crate) async fn put_pack_files_sealed(
     let (manifest, env) = if m_path.is_file() && b_pack.is_file() {
         let existing_m: CasPackManifest = serde_json::from_slice(&std::fs::read(&m_path)?)?;
         ensure!(existing_m.pack_sha256 == pack_sha256 && existing_m.idx_sha256 == idx_sha256, "immutable object store key collision on {}", b_pack.display());
-        decrypt_verified_store_pack(store_root_dir, base_root, &existing_m).await?;
-        let existing_env = lifecycle::read_and_verify_envelope_file(base_root, repo, pack_id)?;
+        decrypt_verified_store_pack(store_root_dir, base_root, &existing_m, client).await?;
+        let existing_env = if let Some(client) = client {
+            let pack = Pack { id: pack_id, pack_sha256: existing_m.pack_sha256.clone(), idx_sha256: existing_m.idx_sha256.clone() };
+            lifecycle::rotation::load_authoritative_envelope(client, base_root, repo, &pack).await?
+        } else {
+            lifecycle::read_and_verify_envelope_file(base_root, repo, pack_id)?
+        };
         (existing_m, existing_env)
     } else {
         write_immutable_cas_file(&b_pack, &ver_cipher, &sealed.ciphertext_sha256)?;
@@ -394,7 +405,7 @@ pub async fn put_pack_files(
             == lifecycle::provider_selection::PandoProviderSelection::Local,
         "raw Local object-store helper cannot publish unterminated Vault writes"
     );
-    let (rep, manifest, _, _) = put_pack_files_sealed(store_root_dir, local_objects_root, repo, pack_id, opts, "hot", None).await?;
+    let (rep, manifest, _, _) = put_pack_files_sealed(store_root_dir, local_objects_root, repo, pack_id, opts, "hot", None, None).await?;
     Ok((rep, manifest))
 }
 
@@ -406,6 +417,32 @@ pub async fn get_pack_files(
     pack_id: Uuid,
     expected_pack_sha256: Option<&str>,
     expected_idx_sha256: Option<&str>,
+) -> Result<ObjectStoreGetReport> {
+    get_pack_files_inner(store_root_dir, local_objects_root, bucket, repo, pack_id, expected_pack_sha256, expected_idx_sha256, None).await
+}
+
+pub(crate) async fn get_pack_files_with_client(
+    store_root_dir: &Path,
+    local_objects_root: &Path,
+    bucket: &str,
+    repo: Uuid,
+    pack_id: Uuid,
+    expected_pack_sha256: Option<&str>,
+    expected_idx_sha256: Option<&str>,
+    client: &Client,
+) -> Result<ObjectStoreGetReport> {
+    get_pack_files_inner(store_root_dir, local_objects_root, bucket, repo, pack_id, expected_pack_sha256, expected_idx_sha256, Some(client)).await
+}
+
+async fn get_pack_files_inner(
+    store_root_dir: &Path,
+    local_objects_root: &Path,
+    bucket: &str,
+    repo: Uuid,
+    pack_id: Uuid,
+    expected_pack_sha256: Option<&str>,
+    expected_idx_sha256: Option<&str>,
+    client: Option<&Client>,
 ) -> Result<ObjectStoreGetReport> {
     let local_dir = local_objects_root.join(repo.to_string());
     let (local_pack, local_idx) = (local_dir.join(format!("{pack_id}.pack")), local_dir.join(format!("{pack_id}.idx")));
@@ -428,7 +465,7 @@ pub async fn get_pack_files(
     if let Some(ep) = expected_pack_sha256 { ensure!(manifest.pack_sha256 == ep, "manifest pack_sha256 mismatch"); }
     if let Some(ei) = expected_idx_sha256 { ensure!(manifest.idx_sha256 == ei, "manifest idx_sha256 mismatch"); }
     let base_root = infer_base_root(store_root_dir, Some(local_objects_root));
-    let (p_bytes, i_bytes) = decrypt_verified_store_pack(store_root_dir, base_root, &manifest).await?;
+    let (p_bytes, i_bytes) = decrypt_verified_store_pack(store_root_dir, base_root, &manifest, client).await?;
     write_atomic_local_cache_file(&local_pack, &p_bytes, &manifest.pack_sha256)?;
     write_atomic_local_cache_file(&local_idx, &i_bytes, &manifest.idx_sha256)?;
     Ok(ObjectStoreGetReport {
@@ -441,7 +478,8 @@ pub async fn get_pack_files(
 
 pub(super) async fn ensure_local_pack_cached(config: &Config, repo: Uuid, pack: &Pack) -> Result<ObjectStoreGetReport> {
     if remote_enabled() { return super::remote::get(config, repo, pack.id).await; }
-    get_pack_files(&store_root(config), &config.root.join("objects"), &default_bucket(), repo, pack.id, Some(&pack.pack_sha256), Some(&pack.idx_sha256)).await
+    let c = config.db().await?;
+    get_pack_files_with_client(&store_root(config), &config.root.join("objects"), &default_bucket(), repo, pack.id, Some(&pack.pack_sha256), Some(&pack.idx_sha256), &c).await
 }
 
 async fn verify_repo_files_with_base(store_root_dir: &Path, base_root: &Path, bucket: &str, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
@@ -461,7 +499,7 @@ async fn verify_repo_files_with_base(store_root_dir: &Path, base_root: &Path, bu
             if path.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
             checked += 1;
             let m: CasPackManifest = serde_json::from_slice(&std::fs::read(&path)?)?;
-            decrypt_verified_store_pack(store_root_dir, base_root, &m).await?;
+            decrypt_verified_store_pack(store_root_dir, base_root, &m, None).await?;
             verified += 1;
             p_bytes_sum += m.pack_bytes;
             i_bytes_sum += m.idx_bytes;
@@ -485,6 +523,7 @@ async fn put_pack_db_inner(config: &Config, repo: Uuid, pack_id: Uuid, opts: &Ob
         opts,
         storage_tier,
         checkpoint.as_ref(),
+        Some(session.client()),
     )
     .await?;
     let c = session.client();
@@ -516,7 +555,7 @@ pub(super) async fn get_pack(config: &Config, repo: Uuid, pack_id: Uuid) -> Resu
     let c = config.db().await?;
     let row = c.query_opt("SELECT pack_sha256,idx_sha256 FROM pando_lab.manifests WHERE repo=$1 AND pack_id=$2", &[&repo, &pack_id]).await?;
     let (ep, ei) = match row { Some(r) => (Some(r.get::<_, String>(0)), Some(r.get::<_, String>(1))), None => (None, None) };
-    get_pack_files(&store_root(config), &config.root.join("objects"), &default_bucket(), repo, pack_id, ep.as_deref(), ei.as_deref()).await
+    get_pack_files_with_client(&store_root(config), &config.root.join("objects"), &default_bucket(), repo, pack_id, ep.as_deref(), ei.as_deref(), &c).await
 }
 
 pub(super) async fn verify_repo_store(config: &Config, repo: Uuid) -> Result<ObjectStoreVerifyReport> {

@@ -697,6 +697,19 @@ async fn rotate_vault_kms_key_with_options(
         persist_checkpoint(&c, &kms_dir, &cp).await?;
         envelopes.push(updated);
     }
+    session.acquire_publication_exclusive(repo).await?;
+    for pack in &packs {
+        let env = load_authoritative_envelope(c, &config.root, repo, pack).await?;
+        ensure!(
+            env.provider_kind == provider::PROVIDER_KIND_VAULT
+                && env.key_id == cp.to_key_id
+                && env.key_version == cp.expected_version(),
+            "final Vault envelope target mismatch for pack {}",
+            pack.id
+        );
+        let cipher = read_pack_cipher(&s_root, repo, pack)?;
+        verify_rewrapped_pack(&config.root, repo, pack, &env, &cipher).await?;
+    }
     let (latest, min_encryption) = vault.latest_and_min_encryption().await?;
     ensure_target_available(cp.expected_version(), latest, min_encryption)?;
     cp.state = "COMPLETED".to_owned();
@@ -903,6 +916,18 @@ pub async fn rotate_kms_key_with_options(
         envelopes.push(updated);
     }
 
+    session.acquire_publication_exclusive(repo).await?;
+    for pack in &packs {
+        let env = load_authoritative_envelope(&c, &config.root, repo, pack).await?;
+        ensure!(
+            env.provider_kind == super::provider::PROVIDER_KIND_LOCAL
+                && env.key_id == cp.to_key_id
+                && env.key_version == cp.to_key_version,
+            "final Local envelope target mismatch for pack {}",
+            pack.id
+        );
+        verify_pack_ciphertext_open(&provider, &s_root, repo, pack, &env).await?;
+    }
     cp.state = "COMPLETED".to_owned();
     cp.failed_pack_id = None;
     persist_checkpoint(&c, &kms_dir, &cp).await?;
