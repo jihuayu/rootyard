@@ -23,8 +23,8 @@ use rootyard::blob_store::{
     disposable_view::DisposableViewRoot,
     opendal::BlobStore,
     read_accel::{
-        AuthoritativePackSource, AuthoritativeRef, BuildReadAccelRequest, BuiltReadAccelBundle, ENABLE_BY_DEFAULT,
-        ManifestFetchRef, MaterializeViewRequest, MaterializedAccelView, PackRetentionRegistry, ReadAccelConfig,
+        AuthoritativePackSource, AuthoritativeRef, BuildReadAccelRequest, BuiltReadAccelBundle, ManifestFetchRef,
+        MaterializeViewRequest, MaterializedAccelView, PackRetentionRegistry, ReadAccelConfig,
         ReadAccelObjectFormat, ReadAccelSidecarStatus, build_and_upload_sidecars, materialize_git_view_with_read_accel,
     },
 };
@@ -368,31 +368,7 @@ fn assert_git_parity(expected_repo: &Path, candidate_repo: &Path, sample: &Sampl
 
 #[tokio::test]
 async fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Result<()> {
-    ensure!(!ENABLE_BY_DEFAULT && !ReadAccelConfig::default().enabled);
-    let ctx = test_ctx()?;
-    for format in [ReadAccelObjectFormat::Sha1, ReadAccelObjectFormat::Sha256] {
-        let sample = SampleRepoPacks::seed(format, false)?;
-        let disabled_view = sample.open(&ctx, 1, None, false).await?;
-        ensure!(
-            *disabled_view.status() == ReadAccelSidecarStatus::Disabled
-                && disabled_view.metrics().sidecar_get_attempts == 0
-        );
-        let bundle = sample.build(&ctx, 1, 1, &sample.packs, None).await?;
-        ensure!(bundle.manifest.artifacts.len() == 3);
-        let enabled_view = sample.open(&ctx, 1, Some(&bundle), true).await?;
-        ensure!(
-            *enabled_view.status() == ReadAccelSidecarStatus::Applied && enabled_view.metrics().sidecars_applied == 3
-        );
-        let enabled_path = enabled_view.repo_path()?;
-        git_ok(enabled_path, &["multi-pack-index", "verify"])?;
-        git_ok(enabled_path, &["commit-graph", "verify"])?;
-        ensure!(
-            git_ok(enabled_path, &["rev-list", "--count", "--use-bitmap-index", "--all"])?
-                == git_ok(disabled_view.repo_path()?, &["rev-list", "--count", "--all"])?
-        );
-        assert_git_parity(disabled_view.repo_path()?, enabled_path, &sample)?;
-    }
-    Ok(())
+    blob_read_accel_support::sha1_and_sha256_parity_and_default_disabled_behavior().await
 }
 
 #[tokio::test]
