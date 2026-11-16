@@ -37,11 +37,25 @@ def _valid_sample_report() -> dict:
         "committed_ops_per_sec": 3.2941,
         "outcomes": {"total_ops": 35, "committed_success": 28, "typed_refusal": 6, "unknown_outcome": 1},
         "independent_ref_overlap": {
+            "scope": "cross_repo_distinct_repositories",
             "total_ops": 6,
             "max_concurrent_overlap": 4,
             "overlapped_pairs": 7,
             "wall_span_ms": 420.0,
             "sum_op_durations_ms": 1320.0,
+        },
+        "same_repo_mixed_concurrency": {
+            "scope": "same_repository_distinct_refs",
+            "repo": "tiny-delta-t1",
+            "total_ops": 3,
+            "max_concurrent_overlap": 2,
+            "overlapped_pairs": 1,
+            "wall_span_ms": 210.0,
+            "sum_op_durations_ms": 420.0,
+            "committed_success": 3,
+            "contention_retries": 0,
+            "read_browse_ops": 4,
+            "maintenance_pg_select_ops": 3,
         },
         "cas_race": {"participants": 4, "winner_count": 1, "loser_refused": 3, "false_ok": 0, "remote_ref_matches_winner": True},
         "atomic_vs_subset": {"atomic_rejected_unchanged": True, "subset_partial_exact": True, "atomic_positive_committed": True},
@@ -82,8 +96,18 @@ def _valid_sample_report() -> dict:
         "measurement_kind": "native_execution",
         "simulated": False,
         "seed": 16420261116,
-        "source": {"commit": "a" * 40, "dirty": False},
-        "binary": {"path": "/tmp/rootyard", "sha256": "b" * 64, "size_bytes": 123456, "receipt_verified": True},
+        "source": {"commit": "a" * 40, "dirty": False, "receipt_workspace_commit": "a" * 40, "source_inputs_sha256": "c" * 64},
+        "binary": {
+            "path": "/tmp/rootyard",
+            "sha256": "b" * 64,
+            "size_bytes": 123456,
+            "receipt_verified": True,
+            "receipt_schema": "v2",
+            "receipt_sha256": "d" * 64,
+            "workspace_commit": "a" * 40,
+            "config_digest": "e" * 64,
+            "source_inputs_sha256": "c" * 64,
+        },
         "tools": {"git": "git version 2.56.1", "postgres": "PostgreSQL 17.0"},
         "hardware": {"logical_cpus": 4, "machine": "x86_64"},
         "topology": "1..2 serve-blob processes sharing one PG schema + one S3 provider",
@@ -257,12 +281,22 @@ class RubiconReportValidationTests(unittest.TestCase):
         wf = (ROOT / ".github" / "workflows" / "rubicon-mixed-workload.yml").read_bytes()
         self.assertNotIn(b"\r", wf, "workflow must use pure LF line endings")
         wf_text = wf.decode("utf-8")
-        for token in ("rubicon_mixed_workload.py", "owned_garage_fixture.sh", "persist-credentials: false", "test_rubicon_mixed_workload"):
+        for token in (
+            "rubicon_mixed_workload.py",
+            "owned_garage_fixture.sh",
+            "persist-credentials: false",
+            "test_rubicon_mixed_workload",
+            "src/blob_store/**",
+            "src/storage/**",
+            "migrations/**",
+        ):
             self.assertIn(token, wf_text)
         doc_text = (ROOT / "docs" / "rubicon-mixed-workload.md").read_text(encoding="utf-8")
         self.assertIn("#164", doc_text)
         self.assertIn("physical_savings_claimed", doc_text)
         self.assertIn("public.cluster_authority", doc_text)
+        self.assertIn("same_repo_mixed_concurrency", doc_text)
+        self.assertIn("verify_source_files=True", doc_text)
 
 
 class RubiconProvisioningAndAuthorityTests(unittest.TestCase):
@@ -567,6 +601,102 @@ class RubiconProvisioningAndAuthorityTests(unittest.TestCase):
         self.assertEqual(seen_cli, [("revoke-token", "tok-123")])
         self.assertEqual(fault_counts["committed_success"], 0)
         self.assertEqual(audit["acked_targets_total"], 0)
+
+    def test_upsert_acked_inserts_after_initial_miss_and_updates_without_duplicates(self) -> None:
+        from scripts.rubicon_workload.runner import _upsert_acked
+
+        acked: list[dict[str, object]] = []
+        entry = {"info": {"owner": "u0", "name": "repo0", "clone_path": "/git/u0/repo0.git"}, "rw": {"username": "u0", "token": "tok"}}
+        # Initial wave missed refs/heads/indep_0; timed wave retry succeeded -> must insert!
+        _upsert_acked(acked, "text_history", entry, "refs/heads/indep_0", "1" * 40)
+        self.assertEqual(len(acked), 1)
+        self.assertEqual(acked[0]["expected_oid"], "1" * 40)
+
+        # Subsequent wave updates existing entry without adding a duplicate.
+        _upsert_acked(acked, "text_history", entry, "refs/heads/indep_0", "2" * 40)
+        self.assertEqual(len(acked), 1)
+        self.assertEqual(acked[0]["expected_oid"], "2" * 40)
+
+    def test_load_receipt_binds_source_commit_and_verifies_source_files(self) -> None:
+        import pathlib
+        import sys
+        import tempfile
+        from unittest import mock
+        from scripts.rubicon_workload.runner import _load_receipt_or_fail
+
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            (root / "scripts").mkdir()
+            bin_path = root / "rootyard"
+            bin_path.write_bytes(b"ELF")
+            receipt_path = root / "rootyard.build.json"
+            receipt_path.write_text("{}", encoding="utf-8")
+
+            fake_validated = mock.Mock(
+                schema="v2",
+                workspace_commit="a" * 40,
+                receipt_sha256="b" * 64,
+                config_digest="c" * 64,
+                source_inputs_sha256="d" * 64,
+            )
+            fake_mod = mock.Mock()
+            fake_mod.load_receipt.return_value = fake_validated
+            with mock.patch.dict(sys.modules, {"native_build_receipt": fake_mod}):
+                info = _load_receipt_or_fail(bin_path, root, True, "a" * 40)
+            fake_mod.load_receipt.assert_called_once_with(
+                receipt_path,
+                source_root=root,
+                binary_path=bin_path,
+                expected_commit="a" * 40,
+                verify_source_files=True,
+            )
+            self.assertEqual(info["workspace_commit"], "a" * 40)
+            self.assertEqual(info["config_digest"], "c" * 64)
+            self.assertEqual(info["source_inputs_sha256"], "d" * 64)
+
+            fake_mod.load_receipt.side_effect = ValueError("build receipt: workspace_commit mismatch")
+            with mock.patch.dict(sys.modules, {"native_build_receipt": fake_mod}):
+                with self.assertRaisesRegex(ValueError, "workspace_commit"):
+                    _load_receipt_or_fail(bin_path, root, True, "e" * 40)
+
+    def test_validate_report_enforces_receipt_commit_and_config_digest(self) -> None:
+        bad_commit = _valid_sample_report()
+        bad_commit["binary"]["workspace_commit"] = "9" * 40
+        with self.assertRaisesRegex(ValueError, "workspace_commit"):
+            validate_report(bad_commit)
+
+        missing_cfg = _valid_sample_report()
+        missing_cfg["binary"]["config_digest"] = ""
+        with self.assertRaisesRegex(ValueError, "config_digest"):
+            validate_report(missing_cfg)
+
+    def test_format_topology_handles_loopback_vs_external_https(self) -> None:
+        from scripts.rubicon_workload.runner import _format_topology
+
+        metered = _format_topology([1, 2], "http", True, True)
+        self.assertIn("loopback HTTP S3 provider (metered via loopback proxy)", metered)
+        ext = _format_topology([1, 2, 4], "https", False, False)
+        self.assertIn("external HTTPS S3 provider (unmetered)", ext)
+        self.assertNotIn("loopback HTTP", ext)
+
+    def test_read_proc_metrics_counts_scratch_and_worktrees_without_double_counting(self) -> None:
+        import pathlib
+        import tempfile
+        from scripts.rubicon_workload.workloads import read_proc_metrics
+
+        with tempfile.TemporaryDirectory() as td:
+            tier_dir = pathlib.Path(td)
+            scratch0 = tier_dir / "scratches" / "scratch-0"
+            work0 = tier_dir / "work-text"
+            scratch0.mkdir(parents=True)
+            work0.mkdir(parents=True)
+            (scratch0 / "pack.bin").write_bytes(b"x" * 100)
+            (work0 / "blob.bin").write_bytes(b"y" * 250)
+
+            metrics = read_proc_metrics([], [scratch0], worktree_dirs=[tier_dir])
+            self.assertEqual(metrics["server_scratch_bytes"], 100)
+            self.assertEqual(metrics["client_worktree_bytes"], 250)
+            self.assertEqual(metrics["temp_disk_bytes"], 350)
 
 
 if __name__ == "__main__":

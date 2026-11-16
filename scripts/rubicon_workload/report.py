@@ -132,6 +132,17 @@ def validate_tier(tier: dict[str, Any]) -> None:
         "independent_ref_overlap failed to demonstrate simultaneous overlap >= 2",
     )
 
+    same_repo = tier.get("same_repo_mixed_concurrency")
+    _require(isinstance(same_repo, dict), "tier.same_repo_mixed_concurrency missing")
+    _require(
+        _check_nonneg_int(same_repo.get("max_concurrent_overlap"), "same_repo.max_concurrent_overlap") >= 2,
+        "same_repo_mixed_concurrency failed to demonstrate simultaneous overlap >= 2",
+    )
+    _require(
+        _check_nonneg_int(same_repo.get("committed_success"), "same_repo.committed_success") >= 1,
+        "same_repo_mixed_concurrency committed no branch",
+    )
+
     cas = tier.get("cas_race")
     _require(isinstance(cas, dict), "tier.cas_race missing")
     participants = _check_nonneg_int(cas.get("participants"), "cas_race.participants")
@@ -215,6 +226,28 @@ def validate_report(report: dict[str, Any], secrets: tuple[str, ...] | list[str]
     _require(isinstance(source, dict) and bool(source.get("commit")), "source commit missing")
     binary = report.get("binary")
     _require(isinstance(binary, dict) and len(str(binary.get("sha256", ""))) == 64, "binary.sha256 missing")
+    if binary.get("receipt_verified"):
+        _require(
+            binary.get("workspace_commit") == source.get("commit"),
+            "receipt workspace_commit differs from report source.commit",
+        )
+        _require(
+            source.get("receipt_workspace_commit") == source.get("commit"),
+            "source.receipt_workspace_commit differs from source.commit",
+        )
+        _require(
+            len(str(binary.get("source_inputs_sha256", ""))) == 64,
+            "binary.source_inputs_sha256 missing for verified receipt",
+        )
+        _require(
+            len(str(binary.get("receipt_sha256", ""))) == 64,
+            "binary.receipt_sha256 missing for verified receipt",
+        )
+        if binary.get("receipt_schema") == "v2":
+            _require(
+                len(str(binary.get("config_digest", ""))) == 64,
+                "binary.config_digest missing for v2 receipt",
+            )
     tools = report.get("tools")
     _require(isinstance(tools, dict) and bool(tools.get("git")) and bool(tools.get("postgres")), "tools metadata missing")
     _require(isinstance(report.get("seed"), int), "seed must be int")
@@ -239,16 +272,23 @@ def validate_report(report: dict[str, Any], secrets: tuple[str, ...] | list[str]
 
 def render_summary_markdown(report: dict[str, Any]) -> str:
     """Render a concise human-readable markdown summary from a validated report."""
+    binary = report["binary"]
+    receipt_details = ""
+    if binary.get("receipt_verified"):
+        receipt_details = (
+            f" | receipt commit `{binary.get('workspace_commit')}`, "
+            f"config_digest `{binary.get('config_digest')}`"
+        )
     lines = [
         "# Rubicon Mixed Workload & Compute Scaling Baseline (Issue #164)",
         "",
         f"- **Source Commit**: `{report['source']['commit']}` (dirty: `{report['source'].get('dirty')}`)",
-        f"- **Binary SHA-256**: `{report['binary']['sha256']}` (receipt verified: `{report['binary'].get('receipt_verified')}`)",
+        f"- **Binary SHA-256**: `{binary['sha256']}` (receipt verified: `{binary.get('receipt_verified')}`{receipt_details})",
         f"- **Git / PostgreSQL**: `{report['tools'].get('git')}` / `{report['tools'].get('postgres')}`",
         f"- **Seed / Topology**: `{report['seed']}` — {report['topology']}",
         "",
-        "| Compute Processes | Wall (s) | Committed / Total Ops | Throughput (ops/s) | Independent Overlap | Cold Clone P50 (ms) | Warm Clone P50 (ms) | Peak RSS (KiB) | Serving / Coexisting Pack Bytes | S3 GET / PUT (wire) |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Compute Processes | Wall (s) | Committed / Total Ops | Throughput (ops/s) | Cross-Repo / Same-Repo Overlap | Cold Clone P50 (ms) | Warm Clone P50 (ms) | Peak RSS (KiB) | Peak Temp Disk (B) | Serving / Coexisting Pack Bytes | S3 GET / PUT (wire) |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for tier in report["tiers"]:
         out = tier["outcomes"]
@@ -260,15 +300,20 @@ def render_summary_markdown(report: dict[str, Any]) -> str:
             if s3.get("observed")
             else "unmetered (external)"
         )
-        rss_val = tier.get("resource_peaks", {}).get("max_total_rss_kib")
+        peaks = tier.get("resource_peaks", {})
+        rss_val = peaks.get("max_total_rss_kib")
         rss_str = str(rss_val) if rss_val is not None else "n/a"
+        disk_val = peaks.get("max_temp_disk_bytes")
+        disk_str = str(disk_val) if disk_val is not None else "n/a"
+        cross_ov = tier["independent_ref_overlap"]["max_concurrent_overlap"]
+        same_ov = tier["same_repo_mixed_concurrency"]["max_concurrent_overlap"]
         lines.append(
             f"| {tier['compute_processes']} | {tier['wall_seconds']:.2f} | "
             f"{out['committed_success']} / {out['total_ops']} | "
             f"{tier['committed_ops_per_sec']:.3f} | "
-            f"{tier['independent_ref_overlap']['max_concurrent_overlap']} | "
+            f"{cross_ov} / {same_ov} | "
             f"{cw['cold_clone']['p50_ms']} | {cw['warm_clone']['p50_ms']} | "
-            f"{rss_str} | {st['serving_pack_bytes']} / {st['coexisting_pack_bytes']} | {s3_str} |"
+            f"{rss_str} | {disk_str} | {st['serving_pack_bytes']} / {st['coexisting_pack_bytes']} | {s3_str} |"
         )
     lines.append("")
     lines.append("## Scaling & Bottleneck Observations")

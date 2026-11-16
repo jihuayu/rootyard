@@ -25,8 +25,11 @@ on:
       - 'scripts/install_ci_cargo_fork.sh'
       - 'scripts/owned_garage_fixture.sh'
       - 'src/blob_git_gateway/**'
+      - 'src/blob_store/**'
+      - 'src/storage/**'
       - 'src/ref_store/**'
       - 'src/standalone/**'
+      - 'migrations/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -173,8 +176,13 @@ jobs:
           report = json.loads(pathlib.Path("test-results/rubicon-mixed-workload/report.json").read_text(encoding="utf-8"))
           assert report["measurement_kind"] == "native_execution"
           assert report["simulated"] is False
+          assert report["binary"]["receipt_verified"] is True
+          assert report["binary"]["workspace_commit"] == report["source"]["commit"]
+          assert len(str(report["binary"].get("config_digest", ""))) == 64
           assert len(report["tiers"]) >= 2, len(report["tiers"])
           for tier in report["tiers"]:
+              assert tier["same_repo_mixed_concurrency"]["max_concurrent_overlap"] >= 2
+              assert tier["same_repo_mixed_concurrency"]["committed_success"] >= 1
               assert tier["audit"]["acked_targets_total"] == tier["audit"]["verified_exact"]
               assert tier["audit"]["fsck_failed"] == 0 and tier["audit"]["ref_mismatch"] == 0
               assert tier["cas_race"]["winner_count"] == 1 and tier["cas_race"]["false_ok"] == 0

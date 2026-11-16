@@ -125,7 +125,18 @@ def _validate_blob_profile(env: dict[str, str]) -> tuple[str, int, bool]:
     return str(parsed.hostname), int(port), parsed.scheme == "http" and is_loopback
 
 
-def _load_receipt_or_fail(binary_path: Path, repo_root: Path, require_receipt: bool) -> dict[str, Any]:
+def _git_source_state(repo_root: Path) -> tuple[str, bool]:
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True, timeout=15).strip()
+    dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=repo_root, text=True, timeout=15).strip())
+    return commit, dirty
+
+
+def _load_receipt_or_fail(
+    binary_path: Path,
+    repo_root: Path,
+    require_receipt: bool,
+    expected_commit: str,
+) -> dict[str, Any]:
     receipt_path = binary_path.with_name(binary_path.name + ".build.json")
     if not receipt_path.exists():
         _need(not require_receipt, f"missing adjacent build receipt {receipt_path}")
@@ -136,13 +147,20 @@ def _load_receipt_or_fail(binary_path: Path, repo_root: Path, require_receipt: b
         sys.path.insert(0, scripts_dir)
     import native_build_receipt  # noqa: E402
 
-    validated = native_build_receipt.load_receipt(receipt_path, binary_path=binary_path, verify_source_files=False)
+    validated = native_build_receipt.load_receipt(
+        receipt_path,
+        source_root=repo_root,
+        binary_path=binary_path,
+        expected_commit=expected_commit,
+        verify_source_files=True,
+    )
     return {
         "receipt_verified": True,
-        "schema": validated.schema,
+        "receipt_schema": validated.schema,
         "workspace_commit": validated.workspace_commit,
         "receipt_sha256": validated.receipt_sha256,
         "config_digest": validated.config_digest,
+        "source_inputs_sha256": validated.source_inputs_sha256,
     }
 
 
@@ -153,7 +171,8 @@ def _preflight(config: WorkloadConfig, env: dict[str, str], repo_root: Path) -> 
     _need(bin_path.is_absolute() and bin_path.is_file() and os.access(bin_path, os.X_OK),
           f"--binary must be an absolute executable path: {config.binary}")
     resolved_bin = bin_path.resolve(strict=True)
-    receipt_info = _load_receipt_or_fail(resolved_bin, repo_root, config.require_build_receipt)
+    source_commit, source_dirty = _git_source_state(repo_root)
+    receipt_info = _load_receipt_or_fail(resolved_bin, repo_root, config.require_build_receipt, source_commit)
 
     git_raw = config.git or env.get("ROOTYARD_GIT") or env.get("ROOTYARD_TEST_GIT")
     _need(bool(git_raw), "--git or ROOTYARD_GIT/ROOTYARD_TEST_GIT is required")
@@ -166,6 +185,9 @@ def _preflight(config: WorkloadConfig, env: dict[str, str], repo_root: Path) -> 
     pg_base = env.get("ROOTYARD_TEST_DATABASE_URL", "")
     _need(pg_base.startswith(("postgres://", "postgresql://")), "ROOTYARD_TEST_DATABASE_URL is required")
     s3_host, s3_port, s3_loopback_http = _validate_blob_profile(env)
+    s3_parsed = urllib.parse.urlsplit(env["ROOTYARD_BLOB_ENDPOINT"])
+    s3_scheme = s3_parsed.scheme or "http"
+    s3_is_loopback = s3_parsed.hostname in ("127.0.0.1", "::1", "localhost")
     logical_cpus = os.cpu_count() or 1
     tiers, tier_notes = _resolve_tiers(config.tiers, logical_cpus)
     return {
@@ -173,6 +195,8 @@ def _preflight(config: WorkloadConfig, env: dict[str, str], repo_root: Path) -> 
         "binary_sha256": _sha256_file(resolved_bin),
         "binary_size_bytes": resolved_bin.stat().st_size,
         **receipt_info,
+        "source_commit": source_commit,
+        "source_dirty": source_dirty,
         "git": str(resolved_git),
         "git_version": subprocess.check_output([str(resolved_git), "--version"], text=True, timeout=10).strip(),
         "psql_version": subprocess.check_output(["psql", "--version"], text=True, timeout=10).strip(),
@@ -180,6 +204,8 @@ def _preflight(config: WorkloadConfig, env: dict[str, str], repo_root: Path) -> 
         "s3_host": s3_host,
         "s3_port": s3_port,
         "s3_loopback_http": s3_loopback_http,
+        "s3_scheme": s3_scheme,
+        "s3_is_loopback": s3_is_loopback,
         "logical_cpus": logical_cpus,
         "tiers": tiers,
         "tier_notes": tier_notes,
@@ -342,6 +368,29 @@ def _record_op(records: list[dict[str, Any]], op_class: str, ds_class: str, outc
     records.append({"op_class": op_class, "dataset_class": ds_class, "outcome": outcome, "wall_ms": round(wall_ms, 3), "phase": phase})
 
 
+def _upsert_acked(
+    acked: list[dict[str, Any]],
+    repo_key: str,
+    entry: dict[str, Any],
+    ref_name: str,
+    expected_oid: str,
+) -> None:
+    """Record or update an ACKed (repo, ref) -> oid target for 100% end-of-tier audit."""
+    for item in acked:
+        if item["repo_key"] == repo_key and item["ref_name"] == ref_name:
+            item["expected_oid"] = expected_oid
+            return
+    acked.append(
+        {
+            "repo_key": repo_key,
+            "repo": entry["info"],
+            "ref_name": ref_name,
+            "expected_oid": expected_oid,
+            "token": entry["rw"],
+        }
+    )
+
+
 def _phase_seed(
     n_procs: int,
     config: WorkloadConfig,
@@ -463,7 +512,7 @@ def _phase_concurrent_overlap(
             intervals.append((s_ns, e_ns))
             _record_op(records, "concurrent_push", entry["ds_class"], outcome, ms, "measured")
             if outcome == "committed_success":
-                acked.append({"repo_key": rkey, "repo": entry["info"], "ref_name": ref_name, "expected_oid": new_oid, "token": entry["rw"]})
+                _upsert_acked(acked, rkey, entry, ref_name, new_oid)
 
     def _browse_worker() -> None:
         try:
@@ -534,11 +583,146 @@ def _phase_concurrent_overlap(
             outcome, _ = classify_git_push(proc, ref_name)
             _record_op(records, "mixed_push", entry["ds_class"], outcome, ms, "measured")
             if outcome == "committed_success":
-                for item in acked:
-                    if item["repo_key"] == rk and item["ref_name"] == ref_name:
-                        item["expected_oid"] = new_oid
+                _upsert_acked(acked, rk, entry, ref_name, new_oid)
         wave_idx += 1
-    return compute_overlap_metrics(intervals)
+    return {"scope": "cross_repo_distinct_repositories", **compute_overlap_metrics(intervals)}
+
+
+def _phase_same_repo_mixed(
+    n_procs: int,
+    seed: int,
+    pre: dict[str, Any],
+    base_env: dict[str, str],
+    pg_url: str,
+    bases: list[str],
+    tier_dir: Path,
+    askpass: Path,
+    repos: dict[str, dict[str, Any]],
+    records: list[dict[str, Any]],
+    acked: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Exercise concurrent independent-ref pushes, read/Browse, and PG SELECTs on ONE repository."""
+    entry = repos["small_deltas"]
+    branches = 3
+    prepared: list[tuple[Path, str, str, dict[str, str]]] = []
+    for idx in range(branches):
+        wdir = tier_dir / f"same-{idx}"
+        env = build_git_env(base_env, askpass, entry["rw"])
+        remote = bases[idx % n_procs] + entry["info"]["clone_path"]
+        clone_proc, _ = run_git(pre["git"], ["clone", remote, str(wdir)], None, env)
+        if clone_proc.returncode != 0:
+            err = clone_proc.stderr.decode("utf-8", errors="replace").strip()[:300]
+            raise RuntimeError(f"same-repo clone failed idx={idx} (rc={clone_proc.returncode}): {err}")
+        for k, v in (("user.name", f"SameRepo{idx}"), ("user.email", f"same{idx}@example.invalid")):
+            run_git(pre["git"], ["config", k, v], wdir, env)
+        new_oid = materialize_commit_spec(
+            wdir,
+            CommitSpec(f"same-repo branch {idx}", {f"same_branch_{idx}.txt": f"branch={idx} seed={seed}\n".encode()}),
+            pre["git"],
+            env,
+        )
+        prepared.append((wdir, f"refs/heads/same_branch_{idx}", new_oid, env))
+
+    barrier = threading.Barrier(branches + 2)
+    intervals: list[tuple[int, int]] = []
+    lock = threading.Lock()
+    stop_readers = threading.Event()
+    counters = {"committed_success": 0, "contention_retries": 0, "read_browse_ops": 0, "maintenance_pg_select_ops": 0}
+
+    def _push_worker(idx: int) -> None:
+        wdir, ref_name, new_oid, env = prepared[idx]
+        try:
+            barrier.wait(timeout=30)
+            s_ns = time.monotonic_ns()
+            proc, ms = run_git(pre["git"], ["push", "--porcelain", "origin", f"HEAD:{ref_name}"], wdir, env)
+            e_ns = time.monotonic_ns()
+        except BaseException:
+            barrier.abort()
+            raise
+        outcome, _ = classify_git_push(proc, ref_name)
+        retries = 0
+        with lock:
+            intervals.append((s_ns, e_ns))
+            _record_op(records, "same_repo_push", entry["ds_class"], outcome, ms, "measured")
+        for attempt in range(3):
+            if outcome == "committed_success":
+                break
+            retries += 1
+            time.sleep(0.05 * (attempt + 1))
+            proc, r_ms = run_git(pre["git"], ["push", "--porcelain", "origin", f"HEAD:{ref_name}"], wdir, env)
+            outcome, _ = classify_git_push(proc, ref_name)
+            with lock:
+                _record_op(records, "same_repo_push_retry", entry["ds_class"], outcome, r_ms, "measured")
+        with lock:
+            counters["contention_retries"] += retries
+            if outcome == "committed_success":
+                counters["committed_success"] += 1
+                _upsert_acked(acked, "small_deltas", entry, ref_name, new_oid)
+
+    def _read_browse_worker() -> None:
+        try:
+            barrier.wait(timeout=30)
+        except BaseException:
+            barrier.abort()
+            raise
+        owner, name = urllib.parse.quote(entry["info"]["owner"], safe=""), urllib.parse.quote(entry["info"]["name"], safe="")
+        for cycle in range(8):
+            if stop_readers.is_set():
+                break
+            if cycle % 2 == 0:
+                _, ls_ms = git_remote_refs(pre["git"], bases[cycle % n_procs] + entry["info"]["clone_path"], base_env, askpass, entry["ro"])
+                with lock:
+                    counters["read_browse_ops"] += 1
+                    _record_op(records, "same_repo_read", entry["ds_class"], "committed_success", ls_ms, "measured")
+            else:
+                ep = ("refs", "commits", "tree")[cycle % 3]
+                st, _, _, b_ms = http_json(bases[cycle % n_procs], f"/api/repos/{owner}/{name}/{ep}", token=entry["ro"])
+                with lock:
+                    counters["read_browse_ops"] += 1
+                    _record_op(records, "same_repo_browse", entry["ds_class"], classify_http_status(st), b_ms, "measured")
+
+    def _maint_select_worker() -> None:
+        try:
+            barrier.wait(timeout=30)
+        except BaseException:
+            barrier.abort()
+            raise
+        for _ in range(6):
+            if stop_readers.is_set():
+                break
+            t0 = time.monotonic()
+            try:
+                query_pg_snapshot_json(pg_url, base_env)
+                out = "committed_success"
+            except Exception:  # noqa: BLE001
+                out = "unknown_outcome"
+            with lock:
+                counters["maintenance_pg_select_ops"] += 1
+                _record_op(records, "maintenance_query", entry["ds_class"], out, (time.monotonic() - t0) * 1000.0, "measured")
+            time.sleep(0.05)
+
+    with ThreadPoolExecutor(max_workers=branches + 2) as pool:
+        futs = [pool.submit(_push_worker, i) for i in range(branches)]
+        rf, mf = pool.submit(_read_browse_worker), pool.submit(_maint_select_worker)
+        try:
+            _collect_barrier_futures(futs)
+        except BaseException as exc:
+            stop_readers.set()
+            try:
+                _collect_barrier_futures([rf, mf])
+            except BaseException as worker_exc:
+                if isinstance(exc, threading.BrokenBarrierError) and not isinstance(worker_exc, threading.BrokenBarrierError):
+                    raise worker_exc from None
+            raise
+        stop_readers.set()
+        _collect_barrier_futures([rf, mf])
+
+    return {
+        "scope": "same_repository_distinct_refs",
+        "repo": entry["info"]["name"],
+        **compute_overlap_metrics(intervals),
+        **counters,
+    }
 
 
 def _phase_cas_race(
@@ -590,9 +774,7 @@ def _phase_cas_race(
     live_refs, _ = git_remote_refs(pre["git"], bases[0] + cas_entry["info"]["clone_path"], base_env, askpass, cas_entry["ro"])
     matches = bool(winner_oid and live_refs.get("refs/heads/main") == winner_oid)
     if matches:
-        for item in acked:
-            if item["repo_key"] == "cas_race" and item["ref_name"] == "refs/heads/main":
-                item["expected_oid"] = winner_oid
+        _upsert_acked(acked, "cas_race", cas_entry, "refs/heads/main", winner_oid)
     return {"participants": participants, "winner_count": len(winners), "loser_refused": len(losers), "false_ok": max(0, len(winners) - 1), "remote_ref_matches_winner": matches}
 
 
@@ -628,14 +810,10 @@ def _phase_atomic_subset(
     refs_ok, _ = git_remote_refs(pre["git"], at_remote, base_env, askpass, at["ro"])
     atom_ok = p_ok.returncode == 0 and refs_ok.get("refs/heads/atom-a") == adv_oid and refs_ok.get("refs/heads/atom-b") == sib_oid
     _record_op(records, "atomic_push", "small_deltas", "committed_success" if atom_ok else "unknown_outcome", ms_ok, "measured")
-    for item in acked:
-        if item["repo_key"] == "atomic_subset" and item["ref_name"] == "refs/heads/main":
-            item["expected_oid"] = adv_oid
-    acked.extend([
-        {"repo_key": "atomic_subset", "repo": at["info"], "ref_name": "refs/heads/protected", "expected_oid": adv_oid, "token": at["rw"]},
-        {"repo_key": "atomic_subset", "repo": at["info"], "ref_name": "refs/heads/atom-a", "expected_oid": adv_oid, "token": at["rw"]},
-        {"repo_key": "atomic_subset", "repo": at["info"], "ref_name": "refs/heads/atom-b", "expected_oid": sib_oid, "token": at["rw"]},
-    ])
+    _upsert_acked(acked, "atomic_subset", at, "refs/heads/main", adv_oid)
+    _upsert_acked(acked, "atomic_subset", at, "refs/heads/protected", adv_oid)
+    _upsert_acked(acked, "atomic_subset", at, "refs/heads/atom-a", adv_oid)
+    _upsert_acked(acked, "atomic_subset", at, "refs/heads/atom-b", sib_oid)
     return {"atomic_rejected_unchanged": atomic_rej, "subset_partial_exact": sub_exact, "atomic_positive_committed": atom_ok}
 
 
@@ -670,7 +848,7 @@ def _phase_cold_warm_and_ci(
     _stop_fleet(fleet)
     fleet = _start_fleet(n_procs, pre["binary"], base_env, pre["git"], pg_url, s3_endpoint, tier_scratch)
     bases = [item[1] for item in fleet]
-    sampler.set_targets([item[0].pid for item in fleet], [item[2] for item in fleet], new_epoch=True)
+    sampler.set_targets([item[0].pid for item in fleet], [item[2] for item in fleet], new_epoch=True, worktree_dirs=[tier_dir])
 
     def _run_pass(label: str) -> tuple[list[float], list[float], dict[str, Any]]:
         s3_b = s3_proxy.snapshot() if s3_proxy else None
@@ -791,7 +969,7 @@ def _run_tier(
     tier_scratch.mkdir(parents=True, mode=0o700)
     fleet = _start_fleet(n_procs, pre["binary"], base_env, pre["git"], pg_url, s3_endpoint, tier_scratch)
     sampler = ResourceSampler(pg_url=pg_url, base_env=base_env, interval_seconds=0.4)
-    sampler.set_targets([item[0].pid for item in fleet], [item[2] for item in fleet])
+    sampler.set_targets([item[0].pid for item in fleet], [item[2] for item in fleet], worktree_dirs=[tier_dir])
     sampler.start()
 
     tier_start = time.monotonic()
@@ -802,6 +980,7 @@ def _run_tier(
         bases = [item[1] for item in fleet]
         repos = _phase_seed(n_procs, config, pre, base_env, users, bases, tier_dir, askpass, records, acked)
         overlap = _phase_concurrent_overlap(n_procs, config, pre, base_env, pg_url, bases, tier_dir, askpass, repos, records, acked)
+        same_repo = _phase_same_repo_mixed(n_procs, config.seed, pre, base_env, pg_url, bases, tier_dir, askpass, repos, records, acked)
         cas = _phase_cas_race(n_procs, config.seed, pre, base_env, bases, tier_dir, askpass, repos, records, acked)
         atomic = _phase_atomic_subset(pre, base_env, bases, askpass, repos, records, acked)
         fleet, ci_info, cold_warm = _phase_cold_warm_and_ci(
@@ -831,6 +1010,7 @@ def _run_tier(
         "committed_ops_per_sec": round(outcomes["committed_success"] / max(0.001, tier_wall), 4),
         "outcomes": outcomes,
         "independent_ref_overlap": overlap,
+        "same_repo_mixed_concurrency": same_repo,
         "cas_race": cas,
         "atomic_vs_subset": atomic,
         "ci_read_amplification": ci_info,
@@ -853,6 +1033,8 @@ def _run_tier(
             "max_total_rss_kib": sampler.max_rss_kib,
             "max_total_hwm_kib": sampler.max_hwm_kib,
             "max_temp_disk_bytes": sampler.max_temp_disk_bytes,
+            "max_server_scratch_bytes": sampler.max_server_scratch_bytes,
+            "max_client_worktree_bytes": sampler.max_client_worktree_bytes,
             "max_pg_active": sampler.max_pg_active,
             "max_pg_lock_waiters": sampler.max_pg_lock_waiters,
             "sampler_errors": sampler.errors,
@@ -888,6 +1070,17 @@ def _analyze_scaling(tiers: list[dict[str, Any]], tier_notes: list[str]) -> dict
         )
     notes.append("Single-host shared PostgreSQL and single Garage S3 container mean compute tiers contend on host CPUs and shared DB/S3.")
     return {"ratios": ratios, "bottlenecks": notes}
+
+
+def _format_topology(tiers: list[int], s3_scheme: str, s3_is_loopback: bool, s3_metered: bool) -> str:
+    scheme_upper = (s3_scheme or "http").upper()
+    if s3_metered:
+        s3_desc = "one loopback HTTP S3 provider (metered via loopback proxy)"
+    elif s3_is_loopback:
+        s3_desc = f"one loopback {scheme_upper} S3 provider (unmetered)"
+    else:
+        s3_desc = f"one external {scheme_upper} S3 provider (unmetered)"
+    return f"1..{max(tiers)} serve-blob processes on one host sharing one PostgreSQL schema + {s3_desc}"
 
 
 def run_rubicon_workload(config: WorkloadConfig, env: dict[str, str] | None = None) -> dict[str, Any]:
@@ -929,24 +1122,49 @@ def run_rubicon_workload(config: WorkloadConfig, env: dict[str, str] | None = No
 
         askpass = write_askpass_script(work_root / "askpass.sh")
         tiers_out = [_run_tier(n, config, pre, run_env, cli_env, pg_url, s3_endpoint, s3_proxy, work_root / f"tier-{n}", askpass, secrets) for n in pre["tiers"]]
-        source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo_root, text=True, timeout=15).strip()
-        source_dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=repo_root, text=True, timeout=15).strip())
+        source_sha, source_dirty = _git_source_state(repo_root)
+        source_obj: dict[str, Any] = {"commit": source_sha, "dirty": source_dirty}
+        binary_obj: dict[str, Any] = {
+            "path": pre["binary"],
+            "sha256": pre["binary_sha256"],
+            "size_bytes": pre["binary_size_bytes"],
+            "receipt_verified": pre["receipt_verified"],
+        }
+        if pre.get("receipt_verified"):
+            source_obj["receipt_workspace_commit"] = pre["workspace_commit"]
+            source_obj["source_inputs_sha256"] = pre["source_inputs_sha256"]
+            binary_obj.update(
+                {
+                    "receipt_schema": pre["receipt_schema"],
+                    "receipt_sha256": pre["receipt_sha256"],
+                    "workspace_commit": pre["workspace_commit"],
+                    "config_digest": pre["config_digest"],
+                    "source_inputs_sha256": pre["source_inputs_sha256"],
+                }
+            )
         report: dict[str, Any] = {
             "schema_version": "rootyard/rubicon-mixed-workload/v1",
             "issue": "#164",
             "measurement_kind": "native_execution",
             "simulated": False,
             "seed": config.seed,
-            "source": {"commit": source_sha, "dirty": source_dirty},
-            "binary": {"path": pre["binary"], "sha256": pre["binary_sha256"], "size_bytes": pre["binary_size_bytes"], "receipt_verified": pre["receipt_verified"]},
+            "source": source_obj,
+            "binary": binary_obj,
             "tools": {"git": pre["git_version"], "postgres": f"PostgreSQL {pg_ver}", "psql": pre["psql_version"]},
             "hardware": {"logical_cpus": pre["logical_cpus"], "machine": platform.machine(), "kernel": platform.release()},
-            "topology": f"1..{max(pre['tiers'])} serve-blob processes sharing one PostgreSQL schema + one S3 provider over loopback HTTP",
+            "topology": _format_topology(pre["tiers"], pre["s3_scheme"], pre["s3_is_loopback"], s3_proxy is not None),
+            "workload_scope": {
+                "cross_repo_overlap": "6 barrier-synchronized independent-ref pushes across 6 distinct repositories",
+                "same_repo_overlap": "3 barrier-synchronized independent-ref pushes on one shared repository alongside read/Browse and PG SELECT queries",
+                "maintenance": "read_only_pg_pack_snapshot_inspection_select (no background compaction/repack or physical Blob GC in serve-blob)",
+                "temp_disk_scope": "tier_dir recursive bytes (server ROOTYARD_SCRATCH_DIR + client git clones/worktrees)",
+            },
             "tiers": tiers_out,
             "scaling_comparison": _analyze_scaling(tiers_out, pre["tier_notes"]),
             "limitations": [
-                "Single Linux host sharing one PostgreSQL instance and one S3-compatible provider container; not multi-host HA failover (see #157).",
+                "Single Linux host sharing one PostgreSQL instance and one S3-compatible provider; not multi-host HA failover (see #157).",
                 "GitHub Rubicon's 7200 pushes/s external figure is not a Rootyard SLA target; self-measured baselines reflect this host and workload.",
+                "Maintenance traffic runs read-only PostgreSQL pack/snapshot/operations inspection SELECT queries only; serve-blob runs no background compaction/repack.",
                 "Cold reads follow service restart with empty ROOTYARD_SCRATCH_DIR only; provider/OS cache state is not reset or observed.",
                 "Physical Blob deletion/GC is disabled; coexisting_pack_bytes reflects retained registered artifacts with zero physical storage savings claimed.",
             ],

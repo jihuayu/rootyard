@@ -315,8 +315,43 @@ class S3MeterProxy:
         }
 
 
-def read_proc_metrics(pids: list[int], scratch_dirs: list[Path]) -> dict[str, Any]:
-    """Read Linux /proc metrics for active serve-blob PIDs plus scratch directory size."""
+def _sum_dir_bytes(dirs: list[Path], exclude_roots: set[Path] | None = None) -> int:
+    """Recursively sum regular non-symlink file sizes without double-counting excluded subtrees."""
+    total = 0
+    seen_roots: set[Path] = set()
+    excluded = exclude_roots or set()
+    for dpath in dirs:
+        if not dpath.exists():
+            continue
+        try:
+            resolved_dir = dpath.resolve()
+        except OSError:
+            continue
+        if resolved_dir in seen_roots or resolved_dir in excluded:
+            continue
+        seen_roots.add(resolved_dir)
+        try:
+            for root, dirnames, filenames in os.walk(resolved_dir, followlinks=False):
+                root_path = Path(root)
+                dirnames[:] = [dn for dn in dirnames if (root_path / dn).resolve() not in excluded]
+                for fname in filenames:
+                    fpath = root_path / fname
+                    try:
+                        if not fpath.is_symlink():
+                            total += fpath.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return total
+
+
+def read_proc_metrics(
+    pids: list[int],
+    scratch_dirs: list[Path],
+    worktree_dirs: list[Path] | None = None,
+) -> dict[str, Any]:
+    """Read Linux /proc metrics for active serve-blob PIDs plus server scratch and client worktree disk."""
     total_rss_kib = 0
     total_hwm_kib = 0
     total_cpu_ticks = 0
@@ -350,16 +385,10 @@ def read_proc_metrics(pids: list[int], scratch_dirs: list[Path]) -> dict[str, An
         except (OSError, ValueError, IndexError):
             continue
 
-    scratch_bytes = 0
-    for sdir in scratch_dirs:
-        if not sdir.exists():
-            continue
-        try:
-            for entry in sdir.rglob("*"):
-                if entry.is_file() and not entry.is_symlink():
-                    scratch_bytes += entry.stat().st_size
-        except OSError:
-            pass
+    server_scratch_bytes = _sum_dir_bytes(scratch_dirs)
+    scratch_resolved = {d.resolve() for d in scratch_dirs if d.exists()}
+    client_worktree_bytes = _sum_dir_bytes(worktree_dirs or [], exclude_roots=scratch_resolved)
+    temp_disk_bytes = server_scratch_bytes + client_worktree_bytes
 
     clk_tck = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
     return {
@@ -369,7 +398,9 @@ def read_proc_metrics(pids: list[int], scratch_dirs: list[Path]) -> dict[str, An
         "cpu_seconds": round(total_cpu_ticks / float(clk_tck), 4),
         "io_read_bytes": total_read_bytes,
         "io_write_bytes": total_write_bytes,
-        "temp_disk_bytes": scratch_bytes,
+        "temp_disk_bytes": temp_disk_bytes,
+        "server_scratch_bytes": server_scratch_bytes,
+        "client_worktree_bytes": client_worktree_bytes,
     }
 
 
@@ -413,6 +444,7 @@ class ResourceSampler:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _pids: list[int] = field(default_factory=list)
     _scratch_dirs: list[Path] = field(default_factory=list)
+    _worktree_dirs: list[Path] = field(default_factory=list)
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
     _started_mono: float = 0.0
@@ -420,6 +452,8 @@ class ResourceSampler:
     max_rss_kib: int = 0
     max_hwm_kib: int = 0
     max_temp_disk_bytes: int = 0
+    max_server_scratch_bytes: int = 0
+    max_client_worktree_bytes: int = 0
     max_pg_active: int = 0
     max_pg_lock_waiters: int = 0
     last_cpu_seconds_by_epoch: dict[int, float] = field(default_factory=dict)
@@ -427,13 +461,21 @@ class ResourceSampler:
     _epoch: int = 0
     errors: list[str] = field(default_factory=list)
 
-    def set_targets(self, pids: list[int], scratch_dirs: list[Path], new_epoch: bool = False) -> None:
+    def set_targets(
+        self,
+        pids: list[int],
+        scratch_dirs: list[Path],
+        new_epoch: bool = False,
+        worktree_dirs: list[Path] | None = None,
+    ) -> None:
         with self._lock:
             if new_epoch and self._epoch in self.last_cpu_seconds_by_epoch:
                 self.completed_cpu_seconds += self.last_cpu_seconds_by_epoch[self._epoch]
                 self._epoch += 1
             self._pids = list(pids)
             self._scratch_dirs = list(scratch_dirs)
+            if worktree_dirs is not None:
+                self._worktree_dirs = list(worktree_dirs)
 
     def start(self) -> None:
         self._started_mono = time.monotonic()
@@ -450,11 +492,12 @@ class ResourceSampler:
         with self._lock:
             pids = list(self._pids)
             dirs = list(self._scratch_dirs)
+            worktree_dirs = list(self._worktree_dirs)
             epoch = self._epoch
         if not pids:
             return
         try:
-            proc_snap = read_proc_metrics(pids, dirs)
+            proc_snap = read_proc_metrics(pids, dirs, worktree_dirs=worktree_dirs)
             pg_snap = query_pg_snapshot_json(self.pg_url, self.base_env)
         except Exception as exc:  # noqa: BLE001
             with self._lock:
@@ -465,6 +508,8 @@ class ResourceSampler:
             self.max_rss_kib = max(self.max_rss_kib, proc_snap["rss_kib"])
             self.max_hwm_kib = max(self.max_hwm_kib, proc_snap["hwm_kib"])
             self.max_temp_disk_bytes = max(self.max_temp_disk_bytes, proc_snap["temp_disk_bytes"])
+            self.max_server_scratch_bytes = max(self.max_server_scratch_bytes, proc_snap["server_scratch_bytes"])
+            self.max_client_worktree_bytes = max(self.max_client_worktree_bytes, proc_snap["client_worktree_bytes"])
             self.max_pg_active = max(self.max_pg_active, pg_snap["pg_active"])
             self.max_pg_lock_waiters = max(self.max_pg_lock_waiters, pg_snap["pg_lock_waiters"])
             if proc_snap["alive_pids"] > 0:
@@ -477,6 +522,8 @@ class ResourceSampler:
                     **pg_snap,
                     "rss_kib": proc_snap["rss_kib"],
                     "temp_disk_bytes": proc_snap["temp_disk_bytes"],
+                    "server_scratch_bytes": proc_snap["server_scratch_bytes"],
+                    "client_worktree_bytes": proc_snap["client_worktree_bytes"],
                 }
             )
 
