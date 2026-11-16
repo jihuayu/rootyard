@@ -6,12 +6,15 @@
 //! proven pre-COMMIT rollback as the only case that may thaw the old epoch.
 #[path = "mounts/freeze.rs"]
 mod freeze;
+#[path = "mounts/legacy_shutdown.rs"]
+mod legacy_shutdown;
 #[path = "mounts/registry.rs"]
 mod registry;
 
 pub(super) use self::freeze::with_frozen_fenced;
 pub use self::freeze::{refresh_leases, update_lease, with_frozen, with_frozen_async};
-use self::registry::{Admission, MountEntry, Registry};
+use self::legacy_shutdown::{LegacyOwner, LegacyShutdownObservation, LegacyShutdownTicket};
+use self::registry::{Admission, HelperSlot, LegacyPromotion, LegacyReserveError, MountEntry, Registry};
 use super::lazy;
 use crate::{
     AppState, Error,
@@ -40,6 +43,16 @@ pub(super) struct InProcessSlot {
     _session: MountHandle,
     pub(super) gate: Arc<MutationGate>,
     lazy: Option<Arc<lazy::Reader>>,
+}
+
+impl LegacyOwner for InProcessSlot {
+    fn fence_for_shutdown(&self) {
+        self._session.request_stop();
+    }
+
+    fn teardown_owned(&mut self) -> Result<(), String> {
+        self._session.teardown_owned().map_err(|error| error.to_string())
+    }
 }
 
 pub(super) type MountRegistry = Registry<Arc<HelperClient>, InProcessSlot>;
@@ -135,6 +148,9 @@ pub fn mounted(id: Uuid) -> bool {
         return true;
     }
     let registry = registry().lock().unwrap();
+    if registry.legacy_closing() {
+        return false;
+    }
     match registry.get(&id) {
         Some(MountEntry::InProcess(_)) => true,
         Some(MountEntry::Helper(slot)) => !slot.is_pending() && slot.client.alive(),
@@ -184,17 +200,43 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
     if helper_mode() {
         return ensure_helper(state, id, db_epoch, until);
     }
-    let mut registry = registry().lock().unwrap();
-    match registry.get(&id) {
-        Some(MountEntry::InProcess(slot)) => {
-            slot.gate.handoff(db_epoch, until).map_err(Error::internal)?;
-            return Ok(());
+    // The registry lock only covers the admission decision and token
+    // reservation. Filesystem checks, lazy Reader creation and the FUSE spawn
+    // happen after it is released, so a synchronous snapshot cannot block on
+    // unrelated ensure IO.
+    let mut admission = {
+        let shared = registry();
+        let mut registry = shared.lock().unwrap();
+        if registry.legacy_closing() {
+            return Err(Error(StatusCode::CONFLICT, "workspace FUSE mount is shutting down"));
         }
-        Some(MountEntry::Helper(_)) => {
-            return Err(Error(StatusCode::CONFLICT, "workspace mount is registered with another backend"));
+        match registry.get(&id) {
+            Some(MountEntry::InProcess(slot)) => {
+                slot.gate.handoff(db_epoch, until).map_err(Error::internal)?;
+                return Ok(());
+            }
+            Some(MountEntry::Helper(_)) => {
+                return Err(Error(StatusCode::CONFLICT, "workspace mount is registered with another backend"));
+            }
+            None => {}
         }
-        None => {}
-    }
+        match registry.reserve_legacy(id, shared) {
+            Ok(admission) => admission,
+            Err(LegacyReserveError::Closing) => {
+                return Err(Error(StatusCode::CONFLICT, "workspace FUSE mount is shutting down"));
+            }
+            Err(LegacyReserveError::Pending) => {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "workspace FUSE mount is still being confirmed; retry on the same epoch",
+                ));
+            }
+            Err(LegacyReserveError::Occupied) => {
+                return Err(Error(StatusCode::CONFLICT, "workspace FUSE mount changed during admission; retry"));
+            }
+        }
+    };
+
     let lower = lower_path(state, id);
     if !lower.join(".git").is_dir() {
         return Err(Error::internal("workspace lower Git state missing"));
@@ -208,8 +250,19 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
     let source: Option<Arc<dyn LazySource>> = lazy.clone().map(|reader| reader as Arc<dyn LazySource>);
     let overlay = Overlay::new_with_gate_and_lazy(lower, upper, gate.clone(), source).map_err(Error::internal)?;
     let session = crate::workspace_lab::fuse_mount::spawn(overlay, &mountpoint).map_err(Error::internal)?;
-    registry.insert_in_process(id, InProcessSlot { _session: session, gate, lazy });
-    Ok(())
+    match admission.promote(InProcessSlot { _session: session, gate, lazy }) {
+        Ok(LegacyPromotion::Mounted) => Ok(()),
+        Ok(LegacyPromotion::Transferred) => {
+            Err(Error(StatusCode::CONFLICT, "workspace FUSE mount completed after shutdown began; ownership retained"))
+        }
+        Err(owner) => {
+            // A stale token must never remove a newer reservation. Keep the
+            // newly created owner shutdown-visible instead of dropping its live
+            // session and lazy reader.
+            registry().lock().unwrap().retain_legacy_owner(id, owner);
+            Err(Error(StatusCode::CONFLICT, "workspace FUSE mount reservation changed; retry"))
+        }
+    }
 }
 
 /// Off-thread wrapper around [`ensure`] on the isolated control bulkhead.
@@ -399,31 +452,77 @@ where
     items
 }
 
-/// Atomically close helper registration/creation and snapshot the current
-/// slot, every retired generation and every helper client still retained by the
-/// mount registry. Registration is admitted under the owner lock, so no new
-/// helper entry can appear after this snapshot. Reaped retired generations are
-/// safe to prune; unproved ones stay in the snapshot for deadline publication
-/// and an explicit failure result.
-fn take_shutdown_snapshot() -> (Vec<Arc<HelperClient>>, MountRegistry) {
+struct ShutdownSnapshot {
+    clients: Vec<Arc<HelperClient>>,
+    helpers: Vec<(Uuid, HelperSlot<Arc<HelperClient>>)>,
+    legacy: Option<Arc<LegacyShutdownTicket<InProcessSlot>>>,
+}
+
+/// Atomically close helper registration/creation and legacy admission, snapshot
+/// the current/retired helper slots and every helper client still retained by
+/// the mount registry, and extract legacy owners into one retained ticket.
+/// Registration is admitted under the owner lock, so no new helper entry can
+/// appear after this snapshot. The legacy ticket is stored by the registry
+/// before its ordinary OS worker is spawned. This function intentionally does
+/// not `mem::take` the registry: the closing flags and retained ticket stay
+/// reachable for repeated observers.
+fn take_shutdown_snapshot() -> ShutdownSnapshot {
     let owner_clients = {
         let mut owner = helper_slot().lock().unwrap();
         owner.prune_reaped();
         owner.take_for_shutdown()
     };
-    let entries = {
+    let (helpers, legacy) = {
         let mut registry = registry().lock().unwrap();
-        std::mem::take(&mut *registry)
+        let shutdown = registry.begin_shutdown();
+        (shutdown.helpers, shutdown.legacy)
     };
+    if let Some(ticket) = legacy.as_ref() {
+        // The ticket is already stored under the registry authority. A spawn
+        // failure is recorded in the same ticket and retains every owner; the
+        // bounded observer reports it instead of relabeling it clean.
+        let _ = ticket.spawn_worker();
+    }
     let clients = collect_unique(
         None,
-        owner_clients.into_iter().chain(entries.iter().filter_map(|(_, mount)| match mount {
-            MountEntry::Helper(slot) => Some(slot.client.clone()),
-            MountEntry::InProcess(_) => None,
-        })),
+        owner_clients.into_iter().chain(helpers.iter().map(|(_, mount)| mount.client.clone())),
         |left, right| left.generation() == right.generation(),
     );
-    (clients, entries)
+    ShutdownSnapshot { clients, helpers, legacy }
+}
+
+fn combine_shutdown_results(helper: Result<(), Error>, legacy: Result<(), Error>) -> Result<(), Error> {
+    match (helper, legacy) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+/// Bounded observer for the retained legacy owner. A timeout or dropped future
+/// never cancels the worker or releases its handles; a later shutdown/observer
+/// reaps the same ticket.
+async fn wait_legacy_until(
+    ticket: Arc<LegacyShutdownTicket<InProcessSlot>>,
+    deadline: tokio::time::Instant,
+) -> Result<(), Error> {
+    let finite_deadline = deadline.into_std();
+    loop {
+        let observation: LegacyShutdownObservation = ticket.observe();
+        if observation.success() {
+            return Ok(());
+        }
+        if observation.is_terminal() {
+            return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "workspace FUSE legacy mount teardown failed"));
+        }
+        let now = Instant::now();
+        if now >= finite_deadline {
+            return Err(Error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "workspace FUSE legacy mount teardown exceeded the shared normal-shutdown deadline",
+            ));
+        }
+        tokio::time::sleep((finite_deadline - now).min(Duration::from_millis(10))).await;
+    }
 }
 
 fn helper_teardown_error(failures: Vec<String>) -> Error {
@@ -437,8 +536,8 @@ fn helper_teardown_error(failures: Vec<String>) -> Error {
 /// by the caller's remaining shared normal-shutdown deadline, never by a fresh
 /// helper grace.
 pub async fn shutdown_helper_until(deadline: tokio::time::Instant) -> Result<(), Error> {
-    let (clients, entries) = take_shutdown_snapshot();
-    if clients.is_empty() && entries.iter().next().is_none() {
+    let ShutdownSnapshot { clients, helpers, legacy } = take_shutdown_snapshot();
+    if clients.is_empty() && helpers.is_empty() && legacy.is_none() {
         return Ok(());
     }
     let teardown_deadline = deadline.into_std().min(Instant::now() + HELPER_SHUTDOWN_GRACE);
@@ -446,41 +545,61 @@ pub async fn shutdown_helper_until(deadline: tokio::time::Instant) -> Result<(),
     for client in &clients {
         effective = effective.min(client.publish_teardown_deadline(teardown_deadline));
     }
-    let cleanup: HelperShutdown = Box::new(move || {
-        let mut failures = Vec::new();
-        for client in &clients {
-            if let Err(error) = client.shutdown_until(effective) {
-                failures.push(format!("helper generation {}: {error}", client.generation()));
+    let helper_result = if clients.is_empty() && helpers.is_empty() {
+        Ok(())
+    } else {
+        let cleanup: HelperShutdown = Box::new(move || {
+            let mut failures = Vec::new();
+            for client in &clients {
+                if let Err(error) = client.shutdown_until(effective) {
+                    failures.push(format!("helper generation {}: {error}", client.generation()));
+                }
             }
-        }
-        // Keep the registry entries alive until every retained generation has
-        // had its exact-owner teardown attempt. A failed generation leaves the
-        // helper stage an error; it is never converted to clean quiescence.
-        drop(entries);
-        if failures.is_empty() { Ok(()) } else { Err(helper_teardown_error(failures)) }
-    });
-    run_helper_cleanup(cleanup, tokio::time::Instant::from_std(effective)).await
+            // Keep the registry entries alive until every retained generation
+            // has had its exact-owner teardown attempt. A failed generation
+            // leaves the helper stage an error; it is never converted to clean
+            // quiescence.
+            drop(helpers);
+            if failures.is_empty() { Ok(()) } else { Err(helper_teardown_error(failures)) }
+        });
+        run_helper_cleanup(cleanup, tokio::time::Instant::from_std(effective)).await
+    };
+    let legacy_result = match legacy {
+        Some(ticket) => wait_legacy_until(ticket, deadline).await,
+        None => Ok(()),
+    };
+    combine_shutdown_results(helper_result, legacy_result)
 }
 
 /// Compatibility path used when no normal-shutdown deadline was published.
 /// It still tears down every retained generation and keeps the previous
 /// per-client helper allowance and control-bulkhead dispatch.
 async fn shutdown_helper_without_deadline() -> Result<(), Error> {
-    let (clients, entries) = take_shutdown_snapshot();
-    if clients.is_empty() && entries.iter().next().is_none() {
+    let ShutdownSnapshot { clients, helpers, legacy } = take_shutdown_snapshot();
+    if clients.is_empty() && helpers.is_empty() && legacy.is_none() {
         return Ok(());
     }
-    super::blocking::run_control(move || {
-        let mut failures = Vec::new();
-        for client in &clients {
-            if let Err(error) = client.shutdown(HELPER_SHUTDOWN_GRACE) {
-                failures.push(format!("helper generation {}: {error}", client.generation()));
+    let legacy_deadline = tokio::time::Instant::now() + HELPER_SHUTDOWN_GRACE;
+    let helper_result = if clients.is_empty() && helpers.is_empty() {
+        Ok(())
+    } else {
+        super::blocking::run_control(move || {
+            let mut failures = Vec::new();
+            for client in &clients {
+                if let Err(error) = client.shutdown(HELPER_SHUTDOWN_GRACE) {
+                    failures.push(format!("helper generation {}: {error}", client.generation()));
+                }
             }
-        }
-        drop(entries);
-        if failures.is_empty() { Ok(()) } else { Err(helper_teardown_error(failures)) }
-    })
-    .await
+            drop(helpers);
+            if failures.is_empty() { Ok(()) } else { Err(helper_teardown_error(failures)) }
+        })
+        .await
+    };
+    let legacy_result = match legacy {
+        Some(ticket) => wait_legacy_until(ticket, legacy_deadline).await,
+        None => Ok(()),
+    };
+    combine_shutdown_results(helper_result, legacy_result)
 }
 
 /// Run mandatory helper teardown on the existing control bulkhead, but never
