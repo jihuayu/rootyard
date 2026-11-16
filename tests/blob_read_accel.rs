@@ -403,7 +403,7 @@ async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Res
     };
     use ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly as Fallback;
     let s3 = LoopbackS3::shared();
-    let ctx = test_ctx()?;
+    let ctx = test_ctx().context("phase: test context")?;
     let sample = SampleRepoPacks::seed(ReadAccelObjectFormat::Sha1, true).context("phase: seed sample")?;
     let baseline = sample.open(&ctx, 1, None, false).await.context("phase: baseline open")?;
     let bundle = sample.build(&ctx, 1, 1, &sample.packs, None).await.context("phase: baseline build")?;
@@ -460,48 +460,57 @@ async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Res
     rebuilt.reap();
 
     // 3. Bit-flipped MIDX, truncated CommitGraph, and deleted Bitmap Blob all quarantine & fall back cleanly.
-    let bundle2 = sample.build(&ctx, 1, 2, &sample.packs, None).await.context("phase: remote-fault build")?;
+    let bundle2 =
+        sample.build(&ctx, 1, 2, &sample.packs, None).await.context("phase: remote-fault build commit-graph+bitmap")?;
     for (kind, target_bundle, op, want_missing, require_midx_quarantine) in [
         (ReadAccelArtifactKind::Midx, &bundle, None, false, false),
         (ReadAccelArtifactKind::CommitGraph, &bundle2, Some(12), false, true),
         (ReadAccelArtifactKind::Bitmap, &bundle2, Some(0), true, true),
     ] {
+        let (mutate_phase, open_phase, quarantine_phase, parity_phase) = match kind {
+            ReadAccelArtifactKind::Midx => (
+                "phase: remote-fault midx mutate",
+                "phase: remote-fault midx open",
+                "phase: remote-fault midx quarantine",
+                "phase: remote-fault midx parity",
+            ),
+            ReadAccelArtifactKind::CommitGraph => (
+                "phase: remote-fault commit-graph mutate",
+                "phase: remote-fault commit-graph open",
+                "phase: remote-fault commit-graph quarantine",
+                "phase: remote-fault commit-graph parity",
+            ),
+            ReadAccelArtifactKind::Bitmap => (
+                "phase: remote-fault bitmap mutate",
+                "phase: remote-fault bitmap open",
+                "phase: remote-fault bitmap quarantine",
+                "phase: remote-fault bitmap parity",
+            ),
+        };
         s3.mutate_object(
-            &target_bundle
-                .manifest
-                .artifact(kind)
-                .unwrap()
-                .locator
-                .to_locator()
-                .context("phase: remote-fault mutate")?,
+            &target_bundle.manifest.artifact(kind).unwrap().locator.to_locator().context(mutate_phase)?,
             op,
         );
-        let view = sample.open(&ctx, 1, Some(target_bundle), true).await.context("phase: remote-fault open")?;
+        let view = sample.open(&ctx, 1, Some(target_bundle), true).await.context(open_phase)?;
         ensure!(
             match (view.status(), want_missing) {
                 (Fallback(SidecarArtifactMissing(k)), true) => *k == kind,
                 (Fallback(SidecarArtifactCorrupt { kind: k, .. }), false) => *k == kind,
                 _ => false,
             },
-            "unexpected fallback status: {:?}",
-            view.status()
+            "unexpected fallback status: {}",
+            finite_status_label(view.status())
         );
         if require_midx_quarantine {
             ensure!(view.metrics().quarantined_sidecar_paths.iter().any(|p| p == "objects/pack/multi-pack-index"));
-            ensure!(
-                !view
-                    .repo_path()
-                    .context("phase: remote-fault quarantine")?
-                    .join("objects/pack/multi-pack-index")
-                    .exists()
-            );
+            ensure!(!view.repo_path().context(quarantine_phase)?.join("objects/pack/multi-pack-index").exists());
         }
         assert_git_parity(
-            baseline.repo_path().context("phase: remote-fault parity")?,
-            view.repo_path().context("phase: remote-fault parity")?,
+            baseline.repo_path().context(parity_phase)?,
+            view.repo_path().context(parity_phase)?,
             &sample,
         )
-        .context("phase: remote-fault parity")?;
+        .context(parity_phase)?;
     }
     Ok(())
 }
