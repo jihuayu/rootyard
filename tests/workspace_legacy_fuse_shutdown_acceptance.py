@@ -58,6 +58,7 @@ SOURCE_PATHS = (
     "tests/workspace_legacy_fuse_shutdown_report.py",
 )
 CASE_DETAILS: dict[str, dict] = {}
+CONTAINMENT_OWNER = legacy_ownership.ContainmentOwner()
 
 
 class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
@@ -112,6 +113,7 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         self.log_path = self.h.root / "server.log"
         self.oracle_log_path = self.log_path
         self._cleanup_deadline = None
+        self.containment_owner = CONTAINMENT_OWNER
 
     def tearDown(self):
         harness = self.h
@@ -128,13 +130,26 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             # containment never receives a fresh oracle window after D, and no
             # containment wait runs before a trigger has armed that deadline.
             deadline = self._cleanup_deadline
+            containment_failed = False
             for holder in self.holders:
-                if self.owned_records and deadline is not None:
-                    contained = legacy_support.contain_proven_owned_mounts(
-                        holder.pid, self.owned_records, deadline
+                leftovers = legacy_support.owned_leftovers(holder.pid, self.created_mountpoints)
+                if leftovers and self.owned_records and deadline is not None:
+                    result = legacy_support.contain_proven_owned_mounts(
+                        holder.pid,
+                        self.owned_records,
+                        deadline,
+                        self.containment_owner,
                     )
                     detail = CASE_DETAILS.setdefault(self.id(), {})
-                    detail["containment_used"] = int(detail.get("containment_used", 0)) + contained
+                    detail["containment_used"] = int(detail.get("containment_used", 0)) + int(
+                        result["contained"]
+                    )
+                    legacy_ownership.attach_containment_detail(
+                        detail, result, self.containment_owner
+                    )
+                    if result["failed"]:
+                        containment_failed = True
+                        break
                 leftovers = legacy_support.owned_leftovers(holder.pid, self.created_mountpoints)
                 if leftovers:
                     detail = CASE_DETAILS.setdefault(self.id(), {})
@@ -144,12 +159,24 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
                     )
                 detail = CASE_DETAILS.setdefault(self.id(), {})
                 detail["owned_mounts_remaining"] = 0
+            if containment_failed:
+                raise legacy_support.LegacyAcceptanceError(
+                    "failure containment was required or incomplete within the original deadline"
+                )
         finally:
+            pending = int(self.containment_owner.snapshot()["pending"]) > 0
             try:
-                for holder in self.holders:
-                    legacy_support.close_holder(holder)
-                self.holders = []
-                self.holder_proofs = []
+                if pending:
+                    legacy_ownership.retain_unresolved_fixtures(
+                        self.containment_owner, self.holders, harness
+                    )
+                    detail = CASE_DETAILS.setdefault(self.id(), {})
+                    detail["fixture_cleanup_deferred"] = True
+                else:
+                    for holder in self.holders:
+                        legacy_support.close_holder(holder)
+                    self.holders = []
+                    self.holder_proofs = []
                 if harness.proc is not None:
                     try:
                         support.terminate_process(harness.proc)
@@ -159,7 +186,8 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
                     harness.log.close()
                     harness.log = None
             finally:
-                harness.cleanup()
+                if not pending:
+                    harness.cleanup()
 
     def _close_service_log(self):
         if self.h.log is not None:

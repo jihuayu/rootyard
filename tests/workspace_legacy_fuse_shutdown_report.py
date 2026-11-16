@@ -128,11 +128,21 @@ def _case_inventory(result, scheduled):
 def _report_payload(binary_sha256=None, receipt_sha256=None, source_inputs_sha256=None,
                     source_head=None, expected_commit=None, source_tree=None,
                     checkout_head=None, input_digest=None, failure_type=None,
-                    scheduled=(), result=None, imported=True):
+                    scheduled=(), result=None, imported=True, containment_owner=None):
     cases, counts, tests_run = _case_inventory(result, scheduled)
     details = [acceptance.CASE_DETAILS.get(name) or {} for name in acceptance.REQUIRED_CASES]
-    owned_remaining = sum(int(detail.get("owned_mounts_remaining") or 0) for detail in details)
+    remaining_values = [detail.get("owned_mounts_remaining") for detail in details]
+    remaining_known = all(
+        isinstance(value, int) and not isinstance(value, bool) for value in remaining_values
+    )
+    owned_remaining = (
+        sum(value for value in remaining_values if isinstance(value, int))
+        if remaining_known else None
+    )
     containment = sum(int(detail.get("containment_used") or 0) for detail in details)
+    deferred = sum(1 for detail in details if detail.get("fixture_cleanup_deferred"))
+    owner = containment_owner if containment_owner is not None else acceptance.CONTAINMENT_OWNER
+    containment_state = owner.snapshot()
     passed = bool(
         imported
         and result is not None
@@ -145,7 +155,12 @@ def _report_payload(binary_sha256=None, receipt_sha256=None, source_inputs_sha25
         and counts["expected_failure"] == 0
         and counts["unexpected_success"] == 0
         and counts["not_run"] == 0
+        and remaining_known
         and owned_remaining == 0
+        and int(containment_state["started"]) == 0
+        and int(containment_state["pending"]) == 0
+        and int(containment_state["deadline_exhausted"]) == 0
+        and int(containment_state["errors"]) == 0
     )
     return {
         "schema": acceptance.REPORT_SCHEMA,
@@ -164,13 +179,20 @@ def _report_payload(binary_sha256=None, receipt_sha256=None, source_inputs_sha25
         "tests_run": tests_run,
         "cases": cases,
         "counts": counts,
+        "containment": containment_state,
         "cleanup": {
             "required": len(acceptance.REQUIRED_CASES),
             "scheduled": len(scheduled),
             "tests_run": tests_run,
             "zero_skips": counts["skipped"] == 0,
             "owned_mounts_remaining": owned_remaining,
+            "owned_mounts_remaining_known": remaining_known,
             "containment_used": containment,
+            "containment_started": int(containment_state["started"]),
+            "containment_pending": int(containment_state["pending"]),
+            "containment_deadline_exhausted": int(containment_state["deadline_exhausted"]),
+            "containment_errors": int(containment_state["errors"]),
+            "fixture_cleanup_deferred": deferred,
         },
         "summary": {
             "required": len(acceptance.REQUIRED_CASES),
@@ -182,10 +204,17 @@ def _report_payload(binary_sha256=None, receipt_sha256=None, source_inputs_sha25
     }
 
 
+def _write_report(path: Path, report) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=acceptance.__doc__)
     parser.add_argument("--report", type=Path, required=True, help="safe JSON acceptance report path")
     args = parser.parse_args(argv)
+    acceptance.CONTAINMENT_OWNER.reset()
+    acceptance.CASE_DETAILS.clear()
 
     binary_sha256 = receipt_sha256 = source_inputs_sha256 = None
     source_head = None
@@ -222,7 +251,7 @@ def main(argv=None):
         if not scheduled:
             scheduled = acceptance.REQUIRED_CASES
 
-    report = _report_payload(
+    payload_kwargs = dict(
         binary_sha256=binary_sha256,
         receipt_sha256=receipt_sha256,
         source_inputs_sha256=source_inputs_sha256,
@@ -236,8 +265,14 @@ def main(argv=None):
         result=result,
         imported=imported,
     )
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    report = _report_payload(**payload_kwargs)
+    _write_report(args.report, report)
+    if int(report["containment"]["pending"]) > 0:
+        # The failed pending report is durable before the explicit late drain.
+        # The drain has no positive acceptance grace and cannot revive a pass.
+        acceptance.CONTAINMENT_OWNER.late_physical_drain()
+        report = _report_payload(**payload_kwargs)
+        _write_report(args.report, report)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["passed"] else 1
 

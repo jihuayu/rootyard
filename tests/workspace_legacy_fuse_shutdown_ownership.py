@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
-"""Owned holder and exact mount ownership proof for legacy shutdown cases.
+"""Owned holder and containment-child ownership for legacy shutdown cases.
 
 This private module is owned by ``tests/workspace_legacy_fuse_shutdown_acceptance.py``.
 It pins the independent namespace holder to the exact ``Popen`` process the case
 started, proves that holder's mount namespace equals the service's mount
-namespace, rechecks the same PID/starttime after the service exits, and records
-only safe numeric identities plus exact observed mount IDs. It never selects a
-process by name, path, or environment and never signals a foreign process.
+namespace, rechecks the same PID/starttime after the service exits, and retains
+failure-containment children as exact owned ``Popen`` objects until their real
+reap is observed. It never selects a process by name, path, or environment and
+never signals a foreign process or an inherited process group.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
+import subprocess
+import time
 
 from tests import fuse_helper_native_support as support
 from tests.workspace_legacy_fuse_shutdown_support import (
     LegacyAcceptanceError,
     mount_namespace_inode,
 )
+
+SAFE_CONTAINMENT_ERRORS = frozenset((
+    "TimeoutExpired", "ProcessLookupError", "OSError", "LegacyAcceptanceError",
+    "HarnessError", "RuntimeError", "ValueError", "TypeError", "AttributeError",
+))
+
+
+def safe_error_name(error) -> str:
+    """Return a finite class name, never raw exception text."""
+    name = type(error).__name__
+    return name if name in SAFE_CONTAINMENT_ERRORS else "unknown"
 
 
 def _positive_int(value, label: str) -> int:
@@ -129,3 +144,222 @@ def record_ownership_detail(detail, captured, mount_ids) -> None:
             _positive_int(value, "observed owned mount id") for value in mount_ids
         ),
     })
+
+
+@dataclass
+class ContainmentRecord:
+    """One exact direct child held by the failed-run containment owner."""
+
+    proc: object
+    pid: int
+    mount_id: int
+    starttime: int | None = None
+    state: str = "started"
+    returncode: int | None = None
+    kill_requested: bool = False
+    deadline_crossed: bool = False
+    signal_error: str | None = None
+    reap_error: str | None = None
+
+    def safe(self) -> dict:
+        return {
+            "pid": self.pid,
+            "starttime": self.starttime,
+            "mount_id": self.mount_id,
+            "state": self.state,
+            "returncode": self.returncode,
+            "kill_requested": bool(self.kill_requested),
+            "deadline_crossed": bool(self.deadline_crossed),
+            "signal_error": self.signal_error,
+            "reap_error": self.reap_error,
+        }
+
+
+class ContainmentOwner:
+    """Strong owner for containment Popen children and retained fixtures.
+
+    The record holds the live ``Popen`` object, not a reconstructed PID. A
+    record leaves the pending state only after ``poll``/``wait`` returns a real
+    code. ``late_physical_drain`` is reserved for the already-failed report
+    runner and deliberately has no positive acceptance grace.
+    """
+
+    def __init__(self):
+        self._records: list[ContainmentRecord] = []
+        self._contained = 0
+        self._deadline_exhausted = 0
+        self._errors = 0
+        self._error_classes: set[str] = set()
+        self._late_state = "not_needed"
+        self._late_reaped = 0
+        self._retained: list[object] = []
+
+    def reset(self) -> None:
+        if self.pending_records():
+            raise LegacyAcceptanceError("cannot reset containment owner with pending children")
+        self._records.clear()
+        self._contained = 0
+        self._deadline_exhausted = 0
+        self._errors = 0
+        self._error_classes.clear()
+        self._late_state = "not_needed"
+        self._late_reaped = 0
+        self._retained.clear()
+
+    def register(self, proc, mount_id, starttime=None) -> ContainmentRecord:
+        """Register the exact child immediately after Popen returns."""
+        pid = _positive_int(proc.pid, "containment child pid")
+        record = ContainmentRecord(
+            proc=proc,
+            pid=pid,
+            mount_id=_positive_int(mount_id, "containment mount id"),
+            starttime=starttime,
+        )
+        self._records.append(record)
+        return record
+
+    def note_contained(self) -> None:
+        self._contained += 1
+
+    def note_deadline_exhausted(self) -> None:
+        self._deadline_exhausted += 1
+
+    def note_error(self, error=None, error_class=None) -> None:
+        self._errors += 1
+        if error_class is not None:
+            self._error_classes.add(str(error_class))
+        elif error is not None:
+            self._error_classes.add(safe_error_name(error))
+
+    def pending_records(self):
+        return [record for record in self._records if record.state != "reaped"]
+
+    def _poll(self, record):
+        try:
+            return record.proc.poll()
+        except Exception as error:
+            record.reap_error = safe_error_name(error)
+            self.note_error(error)
+            return None
+
+    def mark_reaped(self, record, code) -> None:
+        record.state = "reaped"
+        record.returncode = int(code)
+
+    def reap_owned_child(self, record, deadline, *, clock=time.monotonic):
+        """Reap the exact child, polling even after D, then kill/poll if needed."""
+        code = self._poll(record)
+        if code is not None:
+            self.mark_reaped(record, code)
+            return record.returncode
+
+        now = clock()
+        if now < deadline:
+            remaining = max(0.0, deadline - now)
+            try:
+                code = record.proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                record.deadline_crossed = True
+                self.note_deadline_exhausted()
+            except Exception as error:
+                record.reap_error = safe_error_name(error)
+                self.note_error(error)
+            else:
+                if code is not None:
+                    self.mark_reaped(record, code)
+                    return record.returncode
+        else:
+            record.deadline_crossed = True
+            self.note_deadline_exhausted()
+
+        code = self._poll(record)
+        if code is not None:
+            self.mark_reaped(record, code)
+            return record.returncode
+        record.kill_requested = True
+        record.state = "kill_requested"
+        try:
+            record.proc.kill()
+        except Exception as error:
+            record.signal_error = safe_error_name(error)
+            self.note_error(error)
+        code = self._poll(record)
+        if code is not None:
+            self.mark_reaped(record, code)
+            return record.returncode
+        record.state = "pending"
+        return None
+
+    def late_physical_drain(self) -> int:
+        """Explicit failed-run drain: block on the exact owned children only.
+
+        This is not an acceptance grace and cannot revive the oracle. The
+        failed pending report is written before this call; if the outer job
+        kills this runner, the persisted report remains pending.
+        """
+        pending = self.pending_records()
+        if not pending:
+            self._late_state = "reaped_late" if self._late_reaped > 0 else "not_needed"
+            return 0
+        self._late_state = "draining"
+        for record in pending:
+            try:
+                code = record.proc.wait()
+            except Exception as error:
+                record.reap_error = safe_error_name(error)
+                self.note_error(error)
+                continue
+            if code is not None:
+                self.mark_reaped(record, code)
+                self._late_reaped += 1
+        self._late_state = "reaped_late" if not self.pending_records() else "pending"
+        return self._late_reaped
+
+    def snapshot(self) -> dict:
+        records = [record.safe() for record in self._records]
+        pending = [row for row in records if row["state"] != "reaped"]
+        late_state = self._late_state
+        if late_state == "not_needed" and pending:
+            late_state = "pending"
+        return {
+            "started": len(records),
+            "contained": self._contained,
+            "kill_requested": sum(1 for row in records if row["kill_requested"]),
+            "reaped": sum(1 for row in records if row["state"] == "reaped"),
+            "pending": len(pending),
+            "deadline_exhausted": self._deadline_exhausted,
+            "errors": self._errors,
+            "error_classes": sorted(self._error_classes),
+            "records": records,
+            "pending_children": pending,
+            "late_cleanup": {
+                "state": late_state,
+                "reaped_late": self._late_reaped,
+                "pending": len(pending),
+            },
+            "retained_fixtures": len(self._retained),
+        }
+
+    def retain_fixture(self, fixture) -> None:
+        """Keep an unresolved fixture/namespace object strongly reachable."""
+        self._retained.append(fixture)
+
+
+def attach_containment_detail(detail, result, owner) -> None:
+    """Attach safe per-case containment accounting and defer marker."""
+    snapshot = owner.snapshot()
+    detail["containment"] = dict(result)
+    detail["containment_outcome"] = str(result.get("outcome", "unknown"))
+    detail["containment_pending"] = int(result.get("pending", 0))
+    detail["containment_deadline_exhausted"] = int(result.get("deadline_exhausted", 0))
+    detail["containment_errors"] = int(result.get("errors", 0))
+    if snapshot["pending"] > 0:
+        detail["fixture_cleanup_deferred"] = True
+
+
+def retain_unresolved_fixtures(owner, holders, harness) -> None:
+    """Retain exact holders/harness when a pending child blocks safe cleanup."""
+    for holder in holders:
+        owner.retain_fixture(holder)
+    if harness is not None:
+        owner.retain_fixture(harness)

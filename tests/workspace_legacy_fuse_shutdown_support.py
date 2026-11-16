@@ -83,13 +83,26 @@ def wait_ready(harness, deadline: float) -> None:
     raise LegacyAcceptanceError("owned service did not become ready within the startup bound")
 
 
-def _wait_exit(proc, deadline: float):
-    while time.monotonic() < deadline:
+def _wait_exit(proc, deadline: float, *, clock=time.monotonic, sleep=time.sleep):
+    """Poll first, then wait only to the same absolute deadline.
+
+    An already-exited owned child is reaped even when the deadline has just
+    expired; expiry never starts a fresh positive wait budget.
+    """
+    code = proc.poll()
+    if code is not None:
+        return code
+    while True:
+        now = clock()
+        if now >= deadline:
+            code = proc.poll()
+            if code is not None:
+                return code
+            raise LegacyAcceptanceError("owned process did not exit within the shared deadline")
         code = proc.poll()
         if code is not None:
             return code
-        time.sleep(0.01)
-    raise LegacyAcceptanceError("owned service did not exit within the shared deadline")
+        sleep(min(0.01, max(0.0, deadline - now)))
 
 
 def stop_service_gracefully(harness, timeout: float = ORACLE_SECONDS):
@@ -195,16 +208,92 @@ def owned_leftovers(holder_pid: int, mountpoints) -> int:
     )
 
 
-def contain_proven_owned_mounts(holder_pid: int, records, deadline: float) -> int:
+def _containment_result(owner, before, any_failure: bool) -> dict:
+    after = owner.snapshot()
+    started = after["started"] - before["started"]
+    contained = after["contained"] - before["contained"]
+    deadline_exhausted = after["deadline_exhausted"] - before["deadline_exhausted"]
+    errors = after["errors"] - before["errors"]
+    pending = after["pending"]
+    if pending > 0:
+        outcome = "pending"
+    elif deadline_exhausted > 0:
+        outcome = "deadline_exhausted"
+    elif any_failure or errors > 0:
+        outcome = "failed"
+    elif started > 0:
+        outcome = "contained"
+    else:
+        outcome = "clean"
+    result = {
+        "outcome": outcome,
+        "started": started,
+        "contained": contained,
+        "kill_requested": after["kill_requested"] - before["kill_requested"],
+        "reaped": after["reaped"] - before["reaped"],
+        "pending": pending,
+        "deadline_exhausted": deadline_exhausted,
+        "errors": errors,
+        "error_classes": after["error_classes"],
+        "pending_children": after["pending_children"],
+    }
+    result["failed"] = bool(
+        outcome != "clean"
+        or started > 0
+        or pending > 0
+        or deadline_exhausted > 0
+        or errors > 0
+    )
+    return result
+
+
+def contain_proven_owned_mounts(
+    holder_pid: int,
+    records,
+    deadline: float,
+    owner,
+    *,
+    clock=time.monotonic,
+    spawn=None,
+    read_mountinfo=None,
+    wait_mount_gone=None,
+    read_identity=None,
+):
     """Failure containment for exact recorded owned identities only.
 
     ``records`` contains ``(mountpoint, mount_id)`` observed before the failure.
-    A record whose exact ID no longer occupies that path is skipped. No lazy
-    unmount, path guess or foreign mount is touched.
+    ``owner`` is the runner-level strong owner that receives the exact Popen
+    immediately after it returns. D is checked at entry, per record, and again
+    immediately before spawn. Once D is observed expired, no new child is
+    admitted; an already-created child is polled/killed/polled and retained as
+    pending until a real reap is observed. No lazy unmount, path guess, process
+    group signal, or foreign mount is touched.
     """
-    contained = 0
+    if spawn is None:
+        spawn = support.spawn_api_namespace
+    if read_mountinfo is None:
+        read_mountinfo = support.read_process_mountinfo
+    if wait_mount_gone is None:
+        wait_mount_gone = wait_exact_mount_gone
+    if read_identity is None:
+        read_identity = support.process_identity
+    before = owner.snapshot()
+    any_failure = False
+    if deadline is None or clock() >= deadline:
+        owner.note_deadline_exhausted()
+        return _containment_result(owner, before, True)
+
     for mountpoint, mount_id in records:
-        rows = support.read_process_mountinfo(holder_pid)
+        if clock() >= deadline:
+            owner.note_deadline_exhausted()
+            any_failure = True
+            break
+        try:
+            rows = read_mountinfo(holder_pid)
+        except Exception as error:
+            owner.note_error(error)
+            any_failure = True
+            break
         exact = [
             row for row in rows
             if row["mountpoint"] == str(mountpoint)
@@ -214,15 +303,72 @@ def contain_proven_owned_mounts(holder_pid: int, records, deadline: float) -> in
         ]
         if not exact:
             continue
-        child = support.spawn_api_namespace(
-            holder_pid, ["umount", "--no-canonicalize", str(mountpoint)]
-        )
-        code = _wait_exit(child, deadline)
+        if clock() >= deadline:
+            owner.note_deadline_exhausted()
+            any_failure = True
+            break
+        try:
+            child = spawn(
+                holder_pid, ["umount", "--no-canonicalize", str(mountpoint)]
+            )
+        except Exception as error:
+            owner.note_error(error)
+            any_failure = True
+            break
+        try:
+            record = owner.register(child, int(mount_id))
+        except BaseException:
+            # Registration should not fail for a real Popen/mount ID, but never
+            # abandon the just-returned exact child if it does.
+            try:
+                child.kill()
+            except Exception:
+                pass
+            try:
+                child.poll()
+            except Exception:
+                pass
+            raise
+        try:
+            identity = read_identity(record.pid)
+        except Exception:
+            identity = None
+        if isinstance(identity, dict):
+            try:
+                starttime = int(identity.get("starttime"))
+            except (TypeError, ValueError):
+                starttime = None
+            if starttime is not None and starttime >= 1:
+                record.starttime = starttime
+
+        if clock() >= deadline:
+            owner.note_deadline_exhausted()
+            owner.reap_owned_child(record, deadline, clock=clock)
+            any_failure = True
+            break
+        try:
+            code = owner.reap_owned_child(record, deadline, clock=clock)
+        except Exception as error:
+            owner.note_error(error)
+            any_failure = True
+            break
+        if code is None:
+            any_failure = True
+            break
         if code != 0:
-            raise LegacyAcceptanceError("exact owned failure containment did not confirm unmount")
-        wait_exact_mount_gone(holder_pid, mountpoint, int(mount_id), deadline)
-        contained += 1
-    return contained
+            owner.note_error(error_class="nonzero_exit")
+            any_failure = True
+            break
+        try:
+            wait_mount_gone(holder_pid, mountpoint, int(mount_id), deadline)
+        except Exception as error:
+            if clock() >= deadline:
+                owner.note_deadline_exhausted()
+            owner.note_error(error)
+            any_failure = True
+            break
+        owner.note_contained()
+    return _containment_result(owner, before, any_failure)
 
 
 def close_holder(holder) -> None:
