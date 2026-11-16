@@ -19,6 +19,7 @@ pub use envelopes::{
     build_authenticated_envelope_record, build_envelope_record, envelope_file_path,
     read_and_verify_envelope_file, verify_envelope_record, write_envelope_file,
 };
+pub(crate) use db::load_envelope_from_db;
 pub(crate) use eval::load_repo_packs;
 
 pub const DEFAULT_MAX_ACTIVE_PACKS: i32 = 4;
