@@ -14,6 +14,7 @@ pub mod core;
 pub mod metadata;
 pub mod pg;
 pub mod projector;
+pub mod raft_backend;
 pub mod serving;
 pub(crate) mod tx;
 

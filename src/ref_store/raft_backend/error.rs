@@ -1,0 +1,69 @@
+//! Fail-closed backend errors without payload, token, key, or SQL text leakage.
+
+use std::fmt;
+
+use rootyard_refcas_log::state_machine::ApplicationLogId;
+
+/// Authoritative backend refusal. Every variant is a hard failure; there is no PG/Redis/local
+/// fallback path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RaftBackendError {
+    /// Trusted configuration is incomplete or invalid.
+    InvalidConfig(&'static str),
+    /// Command repository/tenant/group/authority coordinate differs from the trusted binding.
+    ScopeMismatch(&'static str),
+    /// The presented realm/epoch/generation does not equal the trusted configured realm.
+    StaleRealm,
+    /// This node is not the leader; no local or projection read was substituted.
+    FollowerRedirect(Option<u64>),
+    /// No actual quorum proof was obtained within the bounded deadline.
+    QuorumUnavailable(&'static str),
+    /// The local application apply barrier did not reach the quorum ReadIndex coordinate.
+    ApplyBarrierTimeout { applied: Option<ApplicationLogId>, required: Option<ApplicationLogId> },
+    /// The persistent state machine was not opened with the root Ref-CAS reducer.
+    NotApplicationMode,
+    /// The opened application reducer is not the root Ref-CAS adapter.
+    WrongReducer,
+    /// Persistence/read failed; the message is intentionally fixed/bounded.
+    Storage(&'static str),
+    /// Command encoding or envelope bounds refused the write before Raft append.
+    Encode(&'static str),
+    /// Deterministic state-machine refusal. It carries no caller payload or credentials.
+    Command(String),
+}
+
+impl fmt::Display for RaftBackendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(reason) => write!(f, "invalid raft backend configuration: {reason}"),
+            Self::ScopeMismatch(coordinate) => {
+                write!(f, "command {coordinate} is outside the trusted repository/tenant/realm binding")
+            }
+            Self::StaleRealm => f.write_str("presented realm/epoch/storage generation is stale"),
+            Self::FollowerRedirect(leader) => {
+                write!(f, "leader redirect required (leader {leader:?}); follower cannot serve this view")
+            }
+            Self::QuorumUnavailable(operation) => {
+                write!(f, "raft quorum unavailable during {operation}; no fallback read was attempted")
+            }
+            Self::ApplyBarrierTimeout { applied, required } => {
+                write!(f, "local application apply barrier {applied:?} did not reach required coordinate {required:?}")
+            }
+            Self::NotApplicationMode => {
+                f.write_str("persistent state machine is not opened with the root Ref-CAS reducer")
+            }
+            Self::WrongReducer => f.write_str("application reducer is not the root Ref-CAS adapter"),
+            Self::Storage(operation) => write!(f, "state-machine storage failure during {operation}"),
+            Self::Encode(reason) => write!(f, "raft command refused before append: {reason}"),
+            Self::Command(message) => write!(f, "state-machine refused command: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for RaftBackendError {}
+
+impl From<rootyard_refcas_log::E> for RaftBackendError {
+    fn from(_: rootyard_refcas_log::E) -> Self {
+        Self::Storage("application state-machine access")
+    }
+}
