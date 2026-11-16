@@ -265,7 +265,7 @@ impl GroupConsensusVerifier {
         let snap: RefCasSnapshot = serde_json::from_slice(&attested.snapshot_bytes)
             .map_err(|_| RetentionBridgeError::UntrustedObservationProof)?;
         snap.verify_integrity()?;
-        RefCasStateMachine::restore(snap.clone())?;
+        RefCasStateMachine::restore(&snap)?;
         let Some(applied) = snap.body.last_applied else {
             return Err(RetentionBridgeError::UntrustedObservationProof);
         };
