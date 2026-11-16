@@ -23,6 +23,8 @@ pub mod mirror_lfs;
 pub mod authority;
 #[path = "ci_checkouts/integration.rs"]
 pub mod integration;
+#[path = "ci_checkouts/clonekit.rs"]
+pub mod clonekit;
 #[path = "ci_checkouts/origin.rs"]
 mod origin;
 pub(crate) use origin::origin_job_path;
