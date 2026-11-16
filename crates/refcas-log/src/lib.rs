@@ -55,6 +55,8 @@ pub mod fault;
 pub mod fixture;
 pub mod mtls;
 pub mod state_machine;
+pub mod streaming;
+pub mod tenant_rpc;
 
 // `Cursor` is required by the macro's default `SnapshotData`. Intentionally not documented.
 openraft::declare_raft_types!(

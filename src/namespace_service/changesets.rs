@@ -5,16 +5,19 @@ use crate::{
         ref_transaction::{RefTransactionRequest, RefUpdateInput},
         transactions,
     },
+    db::Identity,
     members::models::Role,
     storage::read_leases,
+    token_scopes::RepoAction,
 };
 use axum::{
     Json,
     extract::{Extension, Path, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -58,7 +61,7 @@ fn conflict() -> Error {
     Error(StatusCode::CONFLICT, "ChangeSet state or ref conflict")
 }
 
-async fn load(state: &AppState, headers: &HeaderMap, id: Uuid) -> Result<ChangeSet, Error> {
+async fn load_raw(state: &AppState, id: Uuid) -> Result<ChangeSet, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client
         .query_opt("SELECT namespace_id,state,creator_id,reviewer_id FROM workspace_changesets WHERE id=$1", &[&id])
@@ -66,8 +69,13 @@ async fn load(state: &AppState, headers: &HeaderMap, id: Uuid) -> Result<ChangeS
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     let namespace_id: Uuid = row.get(0);
-    handlers::load(state, headers, namespace_id).await?;
-    let rows=client.query("SELECT ordinal,repository_id,mount_path,owner_slug,repository_name,ref_name,old_oid,new_oid,storage_generation,applied FROM workspace_changeset_steps WHERE changeset_id=$1 ORDER BY ordinal", &[&id]).await.map_err(Error::internal)?;
+    let rows = client
+        .query(
+            "SELECT ordinal,repository_id,mount_path,owner_slug,repository_name,ref_name,old_oid,new_oid,storage_generation,applied FROM workspace_changeset_steps WHERE changeset_id=$1 ORDER BY ordinal",
+            &[&id],
+        )
+        .await
+        .map_err(Error::internal)?;
     let steps = rows
         .into_iter()
         .map(|r| Step {
@@ -85,12 +93,49 @@ async fn load(state: &AppState, headers: &HeaderMap, id: Uuid) -> Result<ChangeS
         .collect();
     Ok(ChangeSet { id, namespace_id, state: row.get(1), creator_id: row.get(2), reviewer_id: row.get(3), steps })
 }
+
+async fn authorize_write_steps(
+    state: &AppState,
+    actor: &Identity,
+    cs: &ChangeSet,
+    min_role: Role,
+) -> Result<(), Error> {
+    let mut overrides = HashMap::new();
+    for step in &cs.steps {
+        overrides.insert(step.mount_path.clone(), (min_role, RepoAction::ContentsWrite));
+    }
+    let _ = handlers::load_for_actor_with_overrides(state, actor, cs.namespace_id, &overrides).await?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    for step in &cs.steps {
+        let access = auth::authorize_repo_with_role(
+            &tx,
+            actor,
+            &step.owner,
+            &step.repository,
+            min_role,
+            RepoAction::ContentsWrite,
+        )
+        .await?;
+        if access.repo_id != step.repository_id {
+            return Err(Error::not_found());
+        }
+    }
+    auth::finish_tx(tx, actor, true).await
+}
+
+async fn load(state: &AppState, headers: &HeaderMap, id: Uuid) -> Result<ChangeSet, Error> {
+    let actor = auth::authenticate(&state.pool, headers).await?;
+    let cs = load_raw(state, id).await?;
+    handlers::load_for_actor(state, &actor, cs.namespace_id).await?;
+    Ok(cs)
+}
 pub async fn get(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
-) -> Result<Json<ChangeSet>, Error> {
-    Ok(Json(load(&state, &headers, id).await?))
+) -> Result<impl IntoResponse, Error> {
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(load(&state, &headers, id).await?)))
 }
 
 pub async fn create(
@@ -99,13 +144,18 @@ pub async fn create(
     Path(namespace_id): Path<Uuid>,
     Json(input): Json<Propose>,
 ) -> Result<(StatusCode, Json<ChangeSet>), Error> {
-    let ns = handlers::load(&state, &headers, namespace_id).await?;
     if input.steps.is_empty() || input.steps.len() > 32 {
         return Err(Error::bad_request());
     }
     let actor = auth::authenticate(&state.pool, &headers).await?;
+    let mut overrides = HashMap::new();
+    for step in &input.steps {
+        overrides.insert(step.mount_path.clone(), (Role::Write, RepoAction::ContentsWrite));
+    }
+    let ns = handlers::load_for_actor_with_overrides(&state, &actor, namespace_id, &overrides).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    auth::verify_token(&tx, &actor, true).await?;
     let id = Uuid::new_v4();
     let mut steps = Vec::new();
     let mut targets = HashSet::new();
@@ -117,7 +167,7 @@ pub async fn create(
             &mount.owner,
             &mount.repository,
             Role::Write,
-            crate::token_scopes::RepoAction::ContentsWrite,
+            RepoAction::ContentsWrite,
         )
         .await?;
         if !targets.insert((access.repo_id, step.ref_name.as_str())) {
@@ -144,7 +194,7 @@ pub async fn create(
             &mount.owner,
             &mount.repository,
             Role::Write,
-            crate::token_scopes::RepoAction::ContentsWrite,
+            RepoAction::ContentsWrite,
         )
         .await?;
         if refreshed.repo_id != access.repo_id {
@@ -169,8 +219,8 @@ pub async fn create(
     for (ordinal, mount, repo, step) in steps {
         tx.execute("INSERT INTO workspace_changeset_steps(changeset_id,ordinal,repository_id,mount_path,owner_slug,repository_name,ref_name,old_oid,new_oid,storage_generation) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", &[&id,&ordinal,&repo,&step.mount_path,&mount.owner,&mount.repository,&step.ref_name,&step.old_oid,&step.new_oid,&step.storage_generation]).await.map_err(Error::internal)?;
     }
-    tx.commit().await.map_err(Error::internal)?;
-    Ok((StatusCode::CREATED, Json(load(&state, &headers, id).await?)))
+    auth::finish_tx(tx, &actor, true).await?;
+    Ok((StatusCode::CREATED, Json(load_raw(&state, id).await?)))
 }
 
 pub async fn review(
@@ -179,7 +229,8 @@ pub async fn review(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ChangeSet>, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
-    let cs = load(&state, &headers, id).await?;
+    let cs = load_raw(&state, id).await?;
+    authorize_write_steps(&state, &actor, &cs, Role::Maintain).await?;
     if cs.creator_id == actor.id {
         return Err(Error(StatusCode::FORBIDDEN, "independent reviewer required"));
     }
@@ -192,19 +243,25 @@ pub async fn review(
             &step.owner,
             &step.repository,
             Role::Maintain,
-            crate::token_scopes::RepoAction::ContentsWrite,
+            RepoAction::ContentsWrite,
         )
         .await?;
         if access.repo_id != step.repository_id {
             return Err(Error::not_found());
         }
     }
-    let changed=tx.execute("UPDATE workspace_changesets SET state='reviewed',reviewer_id=$2,updated_at=clock_timestamp() WHERE id=$1 AND state='proposed'", &[&id,&actor.id]).await.map_err(Error::internal)?;
+    let changed = tx
+        .execute(
+            "UPDATE workspace_changesets SET state='reviewed',reviewer_id=$2,updated_at=clock_timestamp() WHERE id=$1 AND state='proposed'",
+            &[&id, &actor.id],
+        )
+        .await
+        .map_err(Error::internal)?;
     if changed != 1 {
         return Err(conflict());
     }
-    tx.commit().await.map_err(Error::internal)?;
-    Ok(Json(load(&state, &headers, id).await?))
+    auth::finish_tx(tx, &actor, true).await?;
+    Ok(Json(load_raw(&state, id).await?))
 }
 
 pub async fn integrate(
@@ -232,7 +289,8 @@ async fn run(state: Arc<AppState>, headers: HeaderMap, id: Uuid, recovery: bool)
     gate.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 616))", &[&id])
         .await
         .map_err(Error::internal)?;
-    let cs = load(&state, &headers, id).await?;
+    let cs = load_raw(&state, id).await?;
+    authorize_write_steps(&state, &actor, &cs, Role::Write).await?;
     if cs.state == "complete" {
         return Ok(cs);
     }
@@ -251,7 +309,7 @@ async fn run(state: Arc<AppState>, headers: HeaderMap, id: Uuid, recovery: bool)
             &step.owner,
             &step.repository,
             Role::Write,
-            crate::token_scopes::RepoAction::ContentsWrite,
+            RepoAction::ContentsWrite,
         )
         .await?;
         if access.repo_id != step.repository_id {
@@ -268,7 +326,7 @@ async fn run(state: Arc<AppState>, headers: HeaderMap, id: Uuid, recovery: bool)
     if changed != 1 {
         return Err(conflict());
     }
-    tx.commit().await.map_err(Error::internal)?;
+    auth::finish_tx(tx, &actor, true).await?;
     for step in &cs.steps {
         if step.applied {
             continue;
@@ -278,9 +336,13 @@ async fn run(state: Arc<AppState>, headers: HeaderMap, id: Uuid, recovery: bool)
             .get()
             .await
             .map_err(Error::internal)?
-            .query_one("SELECT storage_generation FROM repositories WHERE id=$1", &[&step.repository_id])
+            .query_opt(
+                "SELECT storage_generation FROM repositories WHERE id=$1 AND state='ready'",
+                &[&step.repository_id],
+            )
             .await
             .map_err(Error::internal)?
+            .ok_or_else(conflict)?
             .get(0);
         if generation != step.storage_generation {
             let client = state.pool.get().await.map_err(Error::internal)?;
@@ -304,14 +366,7 @@ async fn run(state: Arc<AppState>, headers: HeaderMap, id: Uuid, recovery: bool)
                 .await
                 .map_err(|_| Error::timeout())?;
         source_lease.ensure_active()?;
-        auth::verify_active(
-            &state.pool,
-            &actor,
-            step.repository_id,
-            crate::token_scopes::RepoAction::ContentsWrite,
-            Role::Write,
-        )
-        .await?;
+        auth::verify_active(&state.pool, &actor, step.repository_id, RepoAction::ContentsWrite, Role::Write).await?;
         let repo = state.storage.verify_path(step.repository_id).map_err(Error::internal)?;
         let mut git = state.storage.git(&state.config);
         git.arg("--git-dir").arg(&repo).args(["rev-parse", "--verify", &step.ref_name]);
@@ -357,12 +412,18 @@ async fn run(state: Arc<AppState>, headers: HeaderMap, id: Uuid, recovery: bool)
                 Json(request),
             )
             .await;
-            if response.is_err() || !response.as_ref().is_ok_and(|r| r.status().is_success()) {
+            let failed_conflict = match &response {
+                Ok(r) if r.status().is_success() => None,
+                Ok(r) => Some(r.status() == StatusCode::CONFLICT),
+                Err(err) => Some(err.0 == StatusCode::CONFLICT),
+            };
+            if let Some(is_conflict) = failed_conflict {
+                let next_state = if is_conflict { "conflict" } else { "partial" };
                 let client = state.pool.get().await.map_err(Error::internal)?;
                 client
                     .execute(
-                        "UPDATE workspace_changesets SET state='partial',updated_at=clock_timestamp() WHERE id=$1",
-                        &[&id],
+                        "UPDATE workspace_changesets SET state=$2,updated_at=clock_timestamp() WHERE id=$1",
+                        &[&id, &next_state],
                     )
                     .await
                     .map_err(Error::internal)?;
@@ -391,5 +452,5 @@ async fn run(state: Arc<AppState>, headers: HeaderMap, id: Uuid, recovery: bool)
     let client = state.pool.get().await.map_err(Error::internal)?;
     client.execute("UPDATE workspace_changesets SET state='complete',updated_at=clock_timestamp() WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM workspace_changeset_steps WHERE changeset_id=$1 AND NOT applied)", &[&id]).await.map_err(Error::internal)?;
     gate.commit().await.map_err(Error::internal)?;
-    load(&state, &headers, id).await
+    load_raw(&state, id).await
 }
