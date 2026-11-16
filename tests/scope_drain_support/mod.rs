@@ -15,6 +15,8 @@ use rootyard::ref_store::projector::{
 };
 use rootyard::ref_store::raft_backend::RootRefCasApplied;
 
+pub(crate) mod failure_phase;
+
 #[allow(clippy::too_many_arguments)]
 fn install_scoped_command(
     repo: Uuid,

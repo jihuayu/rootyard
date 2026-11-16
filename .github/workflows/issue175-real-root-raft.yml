@@ -130,6 +130,7 @@ jobs:
             --harness tests/test_run_root_raft_backend_tests.py \
             --harness tests/ref_store_real_raft_backend.rs \
             --harness tests/scope_drain_support/mod.rs \
+            --harness tests/scope_drain_support/failure_phase.rs \
             --harness src/ref_store/raft_backend.rs \
             --harness src/ref_store/raft_backend/node.rs \
             --harness src/ref_store/raft_backend/reducer.rs \

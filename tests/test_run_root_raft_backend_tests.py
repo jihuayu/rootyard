@@ -13,6 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+from unittest import mock
 import sys
 import tempfile
 import unittest
@@ -77,6 +78,13 @@ test {CASE_PRUNED} ... FAILED
 
 test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 """
+NONZERO_FAILED_OUTPUT = f"""running 3 tests
+test {CASE_REAL} ... FAILED
+test {CASE_PRUNED} ... ok
+test {CASE_DRAIN} ... ok
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+"""
 ZERO_OUTPUT = """running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -101,6 +109,16 @@ REPORT_KEYS = {
     "counts",
     "finite_phase",
     "error_class",
+}
+DIAGNOSTIC_KEYS = {
+    "exit_code",
+    "signal",
+    "evidence_complete",
+    "failure_phase",
+    "failure_class",
+    "unknown_case",
+    "diagnostics_valid",
+    "evidence_unchanged",
 }
 
 
@@ -399,34 +417,45 @@ class RootRaftRunnerTest(unittest.TestCase):
             calls.append((command, kwargs))
             return subprocess.CompletedProcess(command, 0, GOOD_OUTPUT, SECRET)
 
-        self.assertEqual(runner.execute_case(self.binary, 900.0, run=fake_run), GOOD_OUTPUT)
+        result = runner.execute_case(self.binary, 900.0, run=fake_run)
+        self.assertEqual(result.stdout, GOOD_OUTPUT)
+        self.assertEqual(result.stderr, SECRET)
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNone(result.signal)
+        self.assertEqual(result.termination, "exited")
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], [str(self.binary), "--test-threads=1"])
         self.assertEqual(calls[0][1]["timeout"], 900.0)
         self.assertIs(calls[0][1]["text"], True)
         self.assertNotIn("--", calls[0][0])
 
-    def test_execute_refuses_nonzero_signal_timeout_and_spawn_failure(self) -> None:
+    def test_execute_retains_nonzero_signal_and_timeout_results(self) -> None:
         def result(code):
             def run(command, **_kwargs):
                 return subprocess.CompletedProcess(command, code, "", SECRET)
             return run
 
-        for code, expected in ((101, "nonzero_exit"), (-9, "signal_killed")):
-            with self.subTest(code=code):
-                self.assert_code(
-                    expected, runner.execute_case, self.binary, 900.0, run=result(code)
-                )
+        nonzero = runner.execute_case(self.binary, 900.0, run=result(101))
+        self.assertEqual(nonzero.returncode, 101)
+        self.assertIsNone(nonzero.signal)
+        self.assertEqual(nonzero.termination, "exited")
+
+        killed = runner.execute_case(self.binary, 900.0, run=result(-9))
+        self.assertIsNone(killed.returncode)
+        self.assertEqual(killed.signal, 9)
+        self.assertEqual(killed.termination, "signal")
 
         def timed_out(command, **kwargs):
             raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=SECRET)
 
+        timed = runner.execute_case(self.binary, 900.0, run=timed_out)
+        self.assertIsNone(timed.returncode)
+        self.assertIsNone(timed.signal)
+        self.assertEqual(timed.termination, "timeout")
+
         def spawn_failed(_command, **_kwargs):
             raise OSError("spawn refused")
 
-        self.assert_code(
-            "timeout", runner.execute_case, self.binary, 900.0, run=timed_out
-        )
         self.assert_code(
             "spawn_failed",
             runner.execute_case,
@@ -434,6 +463,271 @@ class RootRaftRunnerTest(unittest.TestCase):
             900.0,
             run=spawn_failed,
         )
+
+    def test_failure_evidence_retains_complete_failed_suite(self) -> None:
+        evidence = runner.collect_failure_evidence(NONZERO_FAILED_OUTPUT)
+        self.assertTrue(evidence.complete)
+        self.assertEqual(
+            evidence.cases,
+            [
+                {"name": CASE_REAL, "status": "failed"},
+                {"name": CASE_PRUNED, "status": "passed"},
+                {"name": CASE_DRAIN, "status": "passed"},
+            ],
+        )
+        self.assertEqual(
+            evidence.counts,
+            {"passed": 2, "failed": 1, "ignored": 0, "measured": 0, "filtered": 0},
+        )
+        self.assertIsNone(evidence.failure_phase)
+        self.assertIsNone(evidence.failure_class)
+        self.assertTrue(evidence.diagnostics_valid)
+        self.assertNotIn(SECRET, json.dumps(evidence.cases))
+
+    def test_failure_evidence_is_partial_without_summary(self) -> None:
+        partial = (
+            f"running 3 tests\n"
+            f"test {CASE_REAL} ... ok\n"
+            f"test {CASE_PRUNED} ... ok\n"
+        )
+        evidence = runner.collect_failure_evidence(partial)
+        self.assertFalse(evidence.complete)
+        self.assertEqual(
+            [case["name"] for case in evidence.cases], [CASE_REAL, CASE_PRUNED]
+        )
+        self.assertEqual(
+            evidence.counts,
+            {"passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered": 0},
+        )
+        empty = runner.collect_failure_evidence("")
+        self.assertFalse(empty.complete)
+        self.assertEqual(empty.cases, [])
+        self.assertEqual(
+            empty.counts,
+            {"passed": 0, "failed": 0, "ignored": 0, "measured": 0, "filtered": 0},
+        )
+        oversized = runner.collect_failure_evidence(
+            f"running 3 tests\n"
+            f"test {CASE_REAL} ... ok\n"
+            f"test {CASE_PRUNED} ... ok\n"
+            f"test {CASE_DRAIN} ... ok\n"
+            f"test result: FAILED. 999 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        )
+        self.assertFalse(oversized.complete)
+        self.assertEqual(oversized.counts["passed"], 3)
+
+    def test_failure_evidence_rejects_unknown_duplicate_and_bad_frames(self) -> None:
+        duplicate = (
+            f"running 3 tests\n"
+            f"test {CASE_REAL} ... ok\n"
+            f"test {CASE_REAL} ... FAILED\n"
+            f"test secret_case ... ok\n"
+            f"test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        )
+        evidence = runner.collect_failure_evidence(duplicate + SECRET)
+        self.assertFalse(evidence.complete)
+        self.assertTrue(evidence.unknown_case)
+        self.assertNotIn("secret_case", json.dumps(evidence.cases))
+        self.assertNotIn(SECRET, json.dumps(evidence.cases))
+
+        frame = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
+            "phase=commit class=proposal_scope\n"
+        )
+        framed = runner.collect_failure_evidence(frame)
+        self.assertEqual(framed.failure_phase, "commit")
+        self.assertEqual(framed.failure_class, "proposal_scope")
+        self.assertTrue(framed.diagnostics_valid)
+
+        bad = runner.collect_failure_evidence(
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
+            "phase=commit class=not_a_class\n" + SECRET
+        )
+        self.assertIsNone(bad.failure_phase)
+        self.assertFalse(bad.diagnostics_valid)
+        self.assertNotIn(SECRET, json.dumps(bad.cases))
+
+        conflicting = runner.collect_failure_evidence(
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n"
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=refusal class=storage\n"
+        )
+        self.assertIsNone(conflicting.failure_phase)
+        self.assertFalse(conflicting.diagnostics_valid)
+
+    def test_main_retains_partial_evidence_on_nonzero_without_passing(self) -> None:
+        path = self.root / "out" / "nonzero-report.json"
+        output = (
+            NONZERO_FAILED_OUTPUT
+            + f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
+            "phase=commit class=proposal_scope\n"
+        )
+
+        def fake_execute(*_args, **_kwargs):
+            return runner.ExecutionResult(output, SECRET, 101, None, "exited")
+
+        with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+             mock.patch.object(runner, "_safe_head", return_value=self.head), \
+             mock.patch.object(
+                 runner,
+                 "load_and_validate",
+                 return_value=(None, "c" * 64, "b" * 64),
+             ), \
+             mock.patch.object(runner, "execute_case", side_effect=fake_execute), \
+             mock.patch.object(runner, "_verify_evidence_unchanged", return_value=None):
+            code = runner.main(
+                [
+                    "--test-binary",
+                    str(self.binary),
+                    "--build-receipt",
+                    str(self.receipt),
+                    "--report",
+                    str(path),
+                    "--expected-commit",
+                    self.head,
+                ]
+            )
+        self.assertEqual(code, 1)
+        report = json.loads(path.read_text(encoding="utf-8"))
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["error_class"], "nonzero_exit")
+        self.assertEqual(report["finite_phase"], "execute")
+        self.assertEqual(len(report["cases"]), 3)
+        self.assertEqual(report["diagnostics"], {
+            "exit_code": 101,
+            "signal": None,
+            "evidence_complete": True,
+            "failure_phase": "commit",
+            "failure_class": "proposal_scope",
+            "unknown_case": False,
+            "diagnostics_valid": True,
+            "evidence_unchanged": True,
+        })
+        serialized = json.dumps(report)
+        self.assertNotIn(SECRET, serialized)
+        self.assertNotIn(str(self.root), serialized)
+
+    def test_main_nonzero_with_passing_suite_still_fails(self) -> None:
+        path = self.root / "out" / "nonzero-passing-report.json"
+
+        def fake_execute(*_args, **_kwargs):
+            return runner.ExecutionResult(GOOD_OUTPUT, "", 101, None, "exited")
+
+        with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+             mock.patch.object(runner, "_safe_head", return_value=self.head), \
+             mock.patch.object(
+                 runner,
+                 "load_and_validate",
+                 return_value=(None, "c" * 64, "b" * 64),
+             ), \
+             mock.patch.object(runner, "execute_case", side_effect=fake_execute), \
+             mock.patch.object(runner, "_verify_evidence_unchanged", return_value=None):
+            code = runner.main(
+                [
+                    "--test-binary",
+                    str(self.binary),
+                    "--build-receipt",
+                    str(self.receipt),
+                    "--report",
+                    str(path),
+                    "--expected-commit",
+                    self.head,
+                ]
+            )
+        self.assertEqual(code, 1)
+        report = json.loads(path.read_text(encoding="utf-8"))
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["error_class"], "nonzero_exit")
+        self.assertEqual([case["status"] for case in report["cases"]], ["passed"] * 3)
+        self.assertEqual(report["counts"]["passed"], 3)
+        self.assertTrue(report["diagnostics"]["evidence_complete"])
+
+    def test_main_preserves_original_failure_when_postrun_evidence_is_unavailable(self) -> None:
+        path = self.root / "out" / "evidence-changed-report.json"
+
+        def fake_execute(*_args, **_kwargs):
+            return runner.ExecutionResult(NONZERO_FAILED_OUTPUT, "", 101, None, "exited")
+
+        def changed(*_args, **_kwargs):
+            raise runner.RunnerError("execute", "evidence_changed")
+
+        with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+             mock.patch.object(runner, "_safe_head", return_value=self.head), \
+             mock.patch.object(
+                 runner,
+                 "load_and_validate",
+                 return_value=(None, "c" * 64, "b" * 64),
+             ), \
+             mock.patch.object(runner, "execute_case", side_effect=fake_execute), \
+             mock.patch.object(runner, "_verify_evidence_unchanged", side_effect=changed):
+            code = runner.main(
+                [
+                    "--test-binary",
+                    str(self.binary),
+                    "--build-receipt",
+                    str(self.receipt),
+                    "--report",
+                    str(path),
+                    "--expected-commit",
+                    self.head,
+                ]
+            )
+        self.assertEqual(code, 1)
+        report = json.loads(path.read_text(encoding="utf-8"))
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["error_class"], "nonzero_exit")
+        self.assertEqual(len(report["cases"]), 3)
+        self.assertFalse(report["diagnostics"]["evidence_unchanged"])
+
+    def test_main_timeout_and_signal_keep_partial_evidence(self) -> None:
+        partial = (
+            f"running 3 tests\n"
+            f"test {CASE_REAL} ... ok\n"
+            f"test {CASE_PRUNED} ... ok\n"
+        )
+        for termination, signal, expected_class in (
+            ("timeout", None, "timeout"),
+            ("signal", 9, "signal_killed"),
+        ):
+            with self.subTest(termination=termination):
+                path = self.root / "out" / f"{termination}-report.json"
+
+                def fake_execute(*_args, **_kwargs):
+                    return runner.ExecutionResult(partial, SECRET, None, signal, termination)
+
+                with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+                     mock.patch.object(runner, "_safe_head", return_value=self.head), \
+                     mock.patch.object(
+                         runner,
+                         "load_and_validate",
+                         return_value=(None, "c" * 64, "b" * 64),
+                     ), \
+                     mock.patch.object(runner, "execute_case", side_effect=fake_execute), \
+                     mock.patch.object(runner, "_verify_evidence_unchanged", return_value=None):
+                    code = runner.main(
+                        [
+                            "--test-binary",
+                            str(self.binary),
+                            "--build-receipt",
+                            str(self.receipt),
+                            "--report",
+                            str(path),
+                            "--expected-commit",
+                            self.head,
+                        ]
+                    )
+                self.assertEqual(code, 1)
+                report = json.loads(path.read_text(encoding="utf-8"))
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["error_class"], expected_class)
+                self.assertEqual(len(report["cases"]), 2)
+                self.assertEqual(report["counts"]["passed"], 2)
+                self.assertEqual(report["diagnostics"]["exit_code"], None)
+                self.assertEqual(report["diagnostics"]["signal"], signal)
+                self.assertFalse(report["diagnostics"]["evidence_complete"])
+                self.assertIsNone(report["diagnostics"]["failure_phase"])
+                self.assertIsNone(report["diagnostics"]["failure_class"])
+                self.assertTrue(report["diagnostics"]["diagnostics_valid"])
+                self.assertNotIn(SECRET, json.dumps(report))
 
     def test_report_allowlist_and_privacy(self) -> None:
         cases = [
@@ -469,6 +763,29 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertEqual(set(failure), REPORT_KEYS)
         self.assertEqual(failure["error_class"], "missing_case")
         self.assertEqual(failure["finite_phase"], "parse")
+        diagnostics = {
+            "exit_code": 101,
+            "signal": None,
+            "evidence_complete": True,
+            "failure_phase": "commit",
+            "failure_class": "proposal_scope",
+            "unknown_case": False,
+            "diagnostics_valid": True,
+            "evidence_unchanged": True,
+        }
+        failed_with_diagnostics = runner.build_report(
+            False,
+            self.head,
+            "b" * 64,
+            "c" * 64,
+            [],
+            runner._zero_counts(),
+            "execute",
+            "nonzero_exit",
+            diagnostics,
+        )
+        self.assertEqual(set(failed_with_diagnostics), REPORT_KEYS | {"diagnostics"})
+        self.assertEqual(set(failed_with_diagnostics["diagnostics"]), DIAGNOSTIC_KEYS)
 
     def test_write_report_is_atomic_json(self) -> None:
         path = self.root / "out" / "root-raft-report.json"

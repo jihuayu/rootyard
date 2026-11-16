@@ -46,6 +46,8 @@ use uuid::Uuid;
 
 mod scope_drain_support;
 
+use scope_drain_support::failure_phase::{Class, Phase, PhaseGuard};
+
 const TEST_GROUP: &str = "group-175";
 const CLUSTER_NAME: &str = "issue175-real-raft-backend";
 
@@ -526,6 +528,21 @@ async fn build_snapshot(sm: &PersistentStateMachine) -> Result<(openraft::Snapsh
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> Result<()> {
+    let mut phase = PhaseGuard::new(Phase::Bootstrap);
+    let outcome = real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(&mut phase).await;
+    match outcome {
+        Ok(()) => {
+            phase.complete();
+            Ok(())
+        }
+        Err(error) => {
+            phase.fail(Class::from_error(&error));
+            Err(anyhow::anyhow!("root raft case failed"))
+        }
+    }
+}
+
+async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(phase: &mut PhaseGuard) -> Result<()> {
     let repo = Uuid::new_v4();
     let tenant = Uuid::new_v4();
     let issuer = Uuid::new_v4();
@@ -533,6 +550,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let authority = Uuid::new_v4();
     let trust = NodeTrust::new(TEST_GROUP, authority, 1)?;
     let realm = RealmBinding::new(tenant, TEST_GROUP, authority, history, 1, 1, GitObjectFormat::Sha256, 1)?;
+    phase.set(Phase::Bootstrap);
     let cluster = TestCluster::start_three(trust.clone()).await?;
     let (leader_id, _leader_term) = cluster.wait_leader(Duration::from_secs(20)).await?;
     let options = BackendOptions {
@@ -542,8 +560,10 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     };
     let backend = backend_on(&cluster, leader_id, repo, tenant, realm.clone(), options).await?;
 
+    phase.set(Phase::Provision);
     let init_outcome = backend.propose(init_command(repo, tenant, history)).await?;
     assert!(proposal_outcome(&init_outcome).is_applied());
+    phase.set(Phase::Commit);
     let operation_id = Uuid::new_v4();
     let commit = commit_command(repo, tenant, issuer, history, 1, operation_id, 1, "refs/heads/main", None, oid(1));
     let commit_outcome = backend.propose(commit.clone()).await?;
@@ -569,6 +589,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     assert!(matches!(view.query_operation(operation_id)?, OperationLookup::Known(_)));
     assert!(view.state_digest_hex()?.len() == 64);
 
+    phase.set(Phase::Refusal);
     // Decoded normal commands with semantic-invalid fields are durable typed refusals, not fatal
     // storage/apply errors. Zero lease ticks is valid JSON but core-semantic-invalid; a nil
     // request id is a core InvalidIdentity. Both must advance the applied coordinate without
@@ -629,6 +650,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
         healthy_after_semantic_view.last_applied().is_some_and(|id| id.index >= healthy_after_semantic.log_id.index)
     );
 
+    phase.set(Phase::Concurrent);
     // Concurrent proposals can advance the applied snapshot beyond another write's exact index.
     // Propose must recover its own receipt with a >= apply barrier, not return a Storage error.
     let concurrent_a = backend.clone();
@@ -644,6 +666,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     assert_ne!(concurrent_a.log_id, concurrent_b.log_id);
     assert_ne!(concurrent_a.proposal_id, concurrent_b.proposal_id);
 
+    phase.set(Phase::Transition);
     // A valid gate transition to Closing is applied. A subsequent same-scope CommitRefs is a
     // deterministic business refusal: it must advance the replicated applied coordinate and
     // return a durable typed outcome, not become a fatal OpenRaft apply/storage error.
@@ -729,6 +752,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     assert!(kv_probe.kv_get("refs/heads/main").await.is_err());
     assert!(kv_probe.kv_snapshot().await.is_err());
 
+    phase.set(Phase::Follower);
     // Follower boundary: both write and committed read fail closed with an explicit redirect.
     let follower_id = cluster.first_follower_id(leader_id);
     let follower = backend_on(&cluster, follower_id, repo, tenant, realm.clone(), options).await?;
@@ -742,6 +766,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let stale_realm = RealmBinding::new(tenant, TEST_GROUP, authority, history, 2, 1, GitObjectFormat::Sha256, 1)?;
     assert!(matches!(backend.read_committed_view_for(&stale_realm).await, Err(RaftBackendError::StaleRealm)));
 
+    phase.set(Phase::Isolation);
     // Coordinate isolation: initialize and commit repository B, then prove repository A's
     // committed view does not see B and a B-scoped backend cannot write A.
     let repo_b = Uuid::new_v4();
@@ -809,6 +834,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
         Err(RaftBackendError::ProposalScopeMismatch("command does not match proposal identity"))
     ));
 
+    phase.set(Phase::LiveAxes);
     // Live realm/gate axes that are not covered by the old static binding: object format,
     // tenant, and a missing repository gate all fail before a view can be minted. These reads
     // still perform a real ReadIndex first and fail on the applied gate afterwards.
@@ -825,6 +851,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let repo_c_backend = backend_on(&cluster, leader_id, repo_c, tenant, realm.clone(), options).await?;
     assert!(matches!(repo_c_backend.read_committed_view().await, Err(RaftBackendError::StaleGate("gate_missing"))));
 
+    phase.set(Phase::Snapshot);
     // A real malformed/foreign-domain command is refused by the same reducer callback without
     // advancing its applied coordinate.
     let malformed_dir = tempfile::tempdir()?;
@@ -903,6 +930,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     assert!(format!("{install_err:#}").contains("application snapshot identity mismatch"));
     assert!(install_target.application_summary().await?.expect("application row").last_applied.is_none());
 
+    phase.set(Phase::Install);
     // Build a real application-mode snapshot from the committed Root state, install it into a
     // fresh SQLite state machine, and reopen that state machine to prove actual Root state restore.
     let leader_snapshot = cluster.node(leader_id).node.build_snapshot().await?;
@@ -939,6 +967,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     ));
     drop(restored);
 
+    phase.set(Phase::Reopen);
     let reopened = PersistentStateMachine::open_application(
         restored_dir.path(),
         93,
@@ -956,6 +985,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
             if original_log_id == refusal.log_id
     ));
 
+    phase.set(Phase::Partition);
     // Real no-quorum boundary: isolate the leader, use a short-bounded backend, and require an
     // explicit quorum/redirect refusal. No PG/Redis/local view is returned.
     let no_quorum_options = BackendOptions {
@@ -976,6 +1006,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     cluster.heal_partitions();
     let (healed_leader, _) = cluster.wait_leader(Duration::from_secs(20)).await?;
 
+    phase.set(Phase::Heal);
     // The live gate, not only the cached realm, must match before a view is minted. A controlled
     // SetRepositoryLane transition is allowed to install a new history/authority realm; old
     // backends then fail on the actual applied gate. The transition command is exempt from the
@@ -1193,6 +1224,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     assert_eq!(final_gate.group_epoch(), 1);
     assert_eq!(floor_before_fences, backend_h5a6.read_committed_view().await?.logical_clock_floor());
 
+    phase.set(Phase::FinalReopen);
     // Restart actual cluster SQLite state: shut down all nodes, reopen the leader's application
     // state machine from its own directory, and verify the committed Root refs/coordinate.
     let dirs = cluster.shutdown().await;

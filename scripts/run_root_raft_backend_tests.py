@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -64,6 +65,30 @@ _SUMMARY = re.compile(
 )
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _COUNT_KEYS = ("passed", "failed", "ignored", "measured", "filtered")
+_FAILURE_FRAME = re.compile(
+    r"^ROOTYARD_FAILURE_FRAME v1 case=([A-Za-z0-9_:]+) phase=([a-z0-9_]+) class=([a-z0-9_]+)$"
+)
+_FAILURE_PHASES = frozenset(
+    (
+        "bootstrap", "provision", "commit", "refusal", "concurrent", "transition",
+        "follower", "isolation", "live_axes", "snapshot", "install", "reopen",
+        "partition", "heal", "final_reopen",
+    )
+)
+_FAILURE_CLASSES = frozenset(
+    (
+        "assertion_panic", "proposal_scope", "command_scope", "stale_gate",
+        "follower_redirect", "quorum_unavailable", "apply_barrier", "storage",
+        "encode", "wrong_reducer", "recovery_not_observed", "backend_other",
+        "unclassified",
+    )
+)
+_FAILURE_CASES = {REQUIRED_CASES[0]: _FAILURE_PHASES}
+_FAILURE_STATUS = {"ok": "passed", "FAILED": "failed", "ignored": "ignored"}
+_DIAGNOSTIC_KEYS = (
+    "exit_code", "signal", "evidence_complete", "failure_phase", "failure_class",
+    "unknown_case", "diagnostics_valid", "evidence_unchanged",
+)
 
 
 class RunnerError(RuntimeError):
@@ -80,6 +105,26 @@ class RunnerError(RuntimeError):
 def _need(condition, phase: str, code: str) -> None:
     if not condition:
         raise RunnerError(phase, code)
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    stdout: str
+    stderr: str
+    returncode: int | None
+    signal: int | None
+    termination: str
+
+
+@dataclass(frozen=True)
+class FailureEvidence:
+    cases: list[dict[str, str]]
+    counts: dict[str, int]
+    complete: bool
+    failure_phase: str | None
+    failure_class: str | None
+    unknown_case: bool
+    diagnostics_valid: bool
 
 
 def _safe_digest(path) -> str | None:
@@ -338,8 +383,16 @@ def parse_test_output(text) -> tuple[list[dict[str, str]], dict[str, int]]:
     return cases, counts
 
 
-def execute_case(binary: Path, timeout: float, *, run=subprocess.run) -> str:
-    """Execute the supplied binary exactly once; return RAM-only stdout."""
+def _text_output(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value if isinstance(value, str) else ""
+
+
+def execute_case(binary: Path, timeout: float, *, run=subprocess.run) -> ExecutionResult:
+    """Execute the supplied binary exactly once and retain RAM-only status/output."""
     command = [str(binary), *TEST_ARGS]
     try:
         result = run(
@@ -351,8 +404,14 @@ def execute_case(binary: Path, timeout: float, *, run=subprocess.run) -> str:
             timeout=timeout,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        raise RunnerError("execute", "timeout") from None
+    except subprocess.TimeoutExpired as error:
+        return ExecutionResult(
+            _text_output(getattr(error, "stdout", getattr(error, "output", ""))),
+            _text_output(getattr(error, "stderr", "")),
+            None,
+            None,
+            "timeout",
+        )
     except OSError:
         raise RunnerError("execute", "spawn_failed") from None
     returncode = getattr(result, "returncode", None)
@@ -361,13 +420,122 @@ def execute_case(binary: Path, timeout: float, *, run=subprocess.run) -> str:
         "execute",
         "spawn_failed",
     )
+    stdout = _text_output(getattr(result, "stdout", ""))
+    stderr = _text_output(getattr(result, "stderr", ""))
     if returncode < 0:
-        raise RunnerError("execute", "signal_killed")
-    if returncode != 0:
-        raise RunnerError("execute", "nonzero_exit")
-    stdout = getattr(result, "stdout", "")
-    _need(isinstance(stdout, str), "execute", "spawn_failed")
-    return stdout
+        return ExecutionResult(stdout, stderr, None, -returncode, "signal")
+    return ExecutionResult(stdout, stderr, returncode, None, "exited")
+
+
+def collect_failure_evidence(text) -> FailureEvidence:
+    """Collect only fixed known case rows, an anchored summary and fixed frames."""
+    if not isinstance(text, str):
+        text = ""
+    running = []
+    summaries = []
+    case_lines = []
+    frame_set = set()
+    unknown_case = False
+    diagnostics_invalid = False
+    for raw_line in text.splitlines():
+        line = _ANSI.sub("", raw_line).strip()
+        match = _RUNNING.fullmatch(line)
+        if match:
+            running.append(int(match.group(1)))
+            continue
+        match = _SUMMARY.fullmatch(line)
+        if match:
+            summaries.append(match.groups())
+            continue
+        match = _CASE.fullmatch(line)
+        if match:
+            name, outcome = match.group(1), match.group(2)
+            if name not in REQUIRED_CASES:
+                unknown_case = True
+            else:
+                case_lines.append((name, outcome))
+            continue
+        match = _FAILURE_FRAME.fullmatch(line)
+        if match:
+            name, phase, class_code = match.groups()
+            allowed_phases = _FAILURE_CASES.get(name)
+            if allowed_phases is None:
+                unknown_case = True
+            elif phase not in allowed_phases or class_code not in _FAILURE_CLASSES:
+                diagnostics_invalid = True
+            else:
+                frame_set.add((name, phase, class_code))
+
+    by_name: dict[str, str] = {}
+    duplicate_case = False
+    for name, outcome in case_lines:
+        if name in by_name:
+            duplicate_case = True
+        else:
+            by_name[name] = outcome
+
+    observed = {key: 0 for key in _COUNT_KEYS}
+    for outcome in by_name.values():
+        if outcome == "ok":
+            observed["passed"] += 1
+        elif outcome == "FAILED":
+            observed["failed"] += 1
+        elif outcome == "ignored":
+            observed["ignored"] += 1
+
+    summary = summaries[0] if len(summaries) == 1 else None
+    if summary is None:
+        counts = observed
+        summary_counts = None
+    else:
+        _status, passed, failed, ignored, measured, filtered = summary
+        summary_counts = {
+            "passed": int(passed),
+            "failed": int(failed),
+            "ignored": int(ignored),
+            "measured": int(measured),
+            "filtered": int(filtered),
+        }
+        if any(value > EXPECTED_CASE_COUNT for value in summary_counts.values()):
+            summary_counts = None
+            counts = observed
+        else:
+            counts = summary_counts
+
+    running_count = running[0] if len(running) == 1 else None
+    complete = (
+        summary_counts is not None
+        and running_count is not None
+        and not duplicate_case
+        and not unknown_case
+        and len(case_lines) == EXPECTED_CASE_COUNT
+        and len(by_name) == EXPECTED_CASE_COUNT
+        and running_count == sum(summary_counts.values())
+        and running_count == len(case_lines)
+        and summary_counts["measured"] == 0
+        and summary_counts["filtered"] == 0
+    )
+    cases = [
+        {"name": name, "status": _FAILURE_STATUS[by_name[name]]}
+        for name in REQUIRED_CASES
+        if name in by_name
+    ]
+
+    phase = None
+    class_code = None
+    if len(frame_set) > 1:
+        diagnostics_invalid = True
+    elif len(frame_set) == 1 and not diagnostics_invalid:
+        _name, phase, class_code = next(iter(frame_set))
+    return FailureEvidence(
+        cases=cases,
+        counts=counts,
+        complete=complete,
+        failure_phase=phase,
+        failure_class=class_code,
+        unknown_case=unknown_case,
+        diagnostics_valid=not diagnostics_invalid,
+    )
 
 
 def _verify_evidence_unchanged(
@@ -392,9 +560,9 @@ def _zero_counts() -> dict[str, int]:
 
 
 def build_report(passed: bool, source_head, binary_sha, receipt_sha, cases, counts,
-                 finite_phase: str, error_class) -> dict:
+                 finite_phase: str, error_class, diagnostics=None) -> dict:
     """Build the exact credential-free report allowlist."""
-    return {
+    report = {
         "passed": bool(passed),
         "source_head": source_head,
         "binary_sha256": binary_sha,
@@ -406,6 +574,9 @@ def build_report(passed: bool, source_head, binary_sha, receipt_sha, cases, coun
         "finite_phase": finite_phase,
         "error_class": error_class,
     }
+    if diagnostics is not None:
+        report["diagnostics"] = {key: diagnostics[key] for key in _DIAGNOSTIC_KEYS}
+    return report
 
 
 def write_report(path: Path, payload) -> None:
@@ -421,6 +592,19 @@ def write_report(path: Path, payload) -> None:
         with contextlib.suppress(OSError):
             temporary.unlink()
         raise
+
+
+def _failure_diagnostics(execution, evidence, evidence_unchanged) -> dict:
+    return {
+        "exit_code": None if execution is None else execution.returncode,
+        "signal": None if execution is None else execution.signal,
+        "evidence_complete": evidence.complete,
+        "failure_phase": evidence.failure_phase,
+        "failure_class": evidence.failure_class,
+        "unknown_case": evidence.unknown_case,
+        "diagnostics_valid": evidence.diagnostics_valid,
+        "evidence_unchanged": evidence_unchanged,
+    }
 
 
 def main(argv=None) -> int:
@@ -446,6 +630,9 @@ def main(argv=None) -> int:
     cases = []
     counts = _zero_counts()
     status = 1
+    execution = None
+    evidence = None
+    evidence_unchanged = None
     try:
         expected_commit = resolve_expected_commit(args.expected_commit)
         timeout = _require_timeout(args.timeout_seconds)
@@ -455,15 +642,45 @@ def main(argv=None) -> int:
             binary, receipt_path, expected_commit
         )
         phase = "execute"
-        output = execute_case(binary, timeout)
-        phase = "parse"
-        cases, counts = parse_test_output(output)
-        phase = "execute"
-        _verify_evidence_unchanged(
-            binary, receipt_path, expected_commit, head, binary_sha, receipt_sha
-        )
-        phase = "complete"
-        status = 0
+        execution = execute_case(binary, timeout)
+        combined = execution.stdout + "\n" + execution.stderr
+        if execution.termination == "timeout":
+            error_class = "timeout"
+        elif execution.termination == "signal":
+            error_class = "signal_killed"
+        elif execution.returncode != 0:
+            error_class = "nonzero_exit"
+        else:
+            phase = "parse"
+            try:
+                cases, counts = parse_test_output(execution.stdout)
+            except RunnerError as error:
+                phase = error.phase
+                error_class = error.code
+            else:
+                phase = "execute"
+                status = 0
+        if status != 0:
+            evidence = collect_failure_evidence(combined)
+            cases = evidence.cases
+            counts = evidence.counts
+        if execution is not None:
+            try:
+                _verify_evidence_unchanged(
+                    binary, receipt_path, expected_commit, head, binary_sha, receipt_sha
+                )
+                evidence_unchanged = True
+            except RunnerError:
+                evidence_unchanged = False
+                if status == 0:
+                    status = 1
+                    phase = "execute"
+                    error_class = "evidence_changed"
+                    evidence = collect_failure_evidence(combined)
+                    cases = evidence.cases
+                    counts = evidence.counts
+        if status == 0:
+            phase = "complete"
     except RunnerError as error:
         phase = error.phase
         error_class = error.code
@@ -472,15 +689,22 @@ def main(argv=None) -> int:
             phase = "report"
         error_class = "internal_error"
 
+    if status != 0:
+        if evidence is None:
+            evidence = collect_failure_evidence("")
+        diagnostics = _failure_diagnostics(execution, evidence, evidence_unchanged)
+    else:
+        diagnostics = None
     report = build_report(
         passed=status == 0,
         source_head=head,
         binary_sha=binary_sha,
         receipt_sha=receipt_sha,
-        cases=cases if status == 0 else [],
-        counts=counts if status == 0 else _zero_counts(),
+        cases=cases,
+        counts=counts,
         finite_phase=phase,
         error_class=error_class,
+        diagnostics=diagnostics,
     )
     try:
         write_report(args.report, report)
