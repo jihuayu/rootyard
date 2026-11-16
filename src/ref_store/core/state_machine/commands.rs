@@ -351,6 +351,58 @@ pub struct NoopCommand {
     pub logical_tick: Option<u64>,
 }
 
+/// Persisted PostgreSQL `ref_store_decision_dependencies` binding carried on a scoped grant.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireDecisionScopeDep {
+    pub scope_kind: String,
+    pub scope_id: Uuid,
+    pub observed_version: i64,
+    pub observed_digest: String,
+}
+
+/// Project PG `OPEN -> CLOSING` (or `Closed`) scope revocation monotonically onto Raft (`#152`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseAuthScopeCommand {
+    pub scope_kind: String,
+    pub scope_id: Uuid,
+    pub repository_id: Option<Uuid>,
+    pub tenant_id: Option<Uuid>,
+    pub lifecycle: ScopeLifecycle,
+    pub authz_floor: i64,
+    pub change_id: Uuid,
+    pub logical_tick: u64,
+}
+
+/// Signed remote authorization grant commitments bound through install & commit (`#152`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireDecisionGrantCommitment {
+    pub base_gate_digest: String,
+    pub packs_digest: String,
+    pub hold_receipts_digest: String,
+    pub captured_oid_digest: String,
+    pub required_holds: Vec<Uuid>,
+}
+
+/// Install a decision together with its indexed `(scope_kind, scope_id)` dependencies (`#152`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallScopedDecisionCommand {
+    pub decision: InstallDecisionCommand,
+    pub scope_dependencies: Vec<WireDecisionScopeDep>,
+    pub grant_commitment: WireDecisionGrantCommitment,
+}
+
+/// Commit refs under an installed scoped decision while enforcing signed grant commitments (`#152`).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitScopedRefsCommand {
+    pub commit: CommitRefsCommand,
+    pub expected_commitment: WireDecisionGrantCommitment,
+}
+
 /// Deterministic command union accepted by [`super::RefCasStateMachine`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RefCasCommand {
@@ -359,9 +411,12 @@ pub enum RefCasCommand {
     SetRepositoryLane(SetRepositoryLaneCommand),
     BeginOperation(BeginOperationCommand),
     CommitRefs(CommitRefsCommand),
+    CommitScopedRefs(CommitScopedRefsCommand),
     Cancel(CancelCommand),
     AdvanceCancelCutoff(AdvanceCancelCutoffCommand),
     InstallDecision(InstallDecisionCommand),
+    InstallScopedDecision(InstallScopedDecisionCommand),
+    CloseAuthScope(CloseAuthScopeCommand),
     CreateSnapshotPin(CreateSnapshotPinCommand),
     RenewPin(RenewPinCommand),
     ReleasePin(ReleasePinCommand),
