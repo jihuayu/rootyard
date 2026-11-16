@@ -241,8 +241,21 @@ def http_json_timed(
         return None, b"", {}, (time.monotonic() - t0) * 1000.0
 
 
-def verify_binary_receipt(binary: Path, require_receipt: bool) -> dict[str, Any]:
-    """Verify binary existence, SHA-256, and sibling .build.json receipt when required."""
+def verify_binary_receipt(
+    binary: Path,
+    require_receipt: bool,
+    *,
+    source_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Verify a binary and its sibling ``.build.json`` with the canonical reader.
+
+    A receipt is trusted only after ``native_build_receipt.validate_receipt``
+    checks its shape, exact receipt bytes, binary digest, source inventory and
+    current source commit.  The source tree must be clean and the receipt's
+    recorded Git binding must still describe it.  Any missing validator,
+    malformed receipt or mismatch fails closed instead of yielding an
+    unverified ``receipt_verified`` claim.
+    """
     resolved = binary.resolve()
     if not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise RuntimeError(f"rootyard binary unavailable or not executable: {resolved}")
@@ -258,17 +271,75 @@ def verify_binary_receipt(binary: Path, require_receipt: bool) -> dict[str, Any]
         if require_receipt:
             raise RuntimeError(f"missing binary build receipt: {receipt_path}")
         return info
-    data = json.loads(receipt_path.read_text(encoding="utf-8"))
-    if build_receipt_mod is not None and hasattr(build_receipt_mod, "verify_receipt"):
-        build_receipt_mod.verify_receipt(data, resolved)
+
+    validator = getattr(build_receipt_mod, "validate_receipt", None) if build_receipt_mod is not None else None
+    if not callable(validator):
+        raise RuntimeError(
+            "canonical build-receipt validator is unavailable; "
+            f"refusing to mark {receipt_path} as verified"
+        )
+
+    root = SCRIPTS_DIR.parent if source_root is None else Path(source_root)
+    root = root.resolve()
+    try:
+        git_state = build_receipt_mod.require_clean_git_state(root)
+    except build_receipt_mod.ReceiptError as error:
+        raise RuntimeError(f"binary build receipt source binding rejected: {error}") from error
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"cannot establish clean source state for {root}: {error}") from error
+
+    raw = receipt_path.read_bytes()
+    receipt_sha256 = hashlib.sha256(raw).hexdigest()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"malformed binary build receipt {receipt_path}: {error}") from error
+    if not isinstance(data, dict):
+        raise RuntimeError(f"malformed binary build receipt {receipt_path}: expected a JSON object")
+
+    try:
+        validated = validator(
+            data,
+            source_root=root,
+            receipt_path=receipt_path,
+            receipt_sha256=receipt_sha256,
+            binary_path=resolved,
+            expected_commit=git_state["commit"],
+        )
+    except build_receipt_mod.ReceiptError as error:
+        raise RuntimeError(f"binary build receipt rejected: {error}") from error
+
+    recorded_head = data.get("git_head")
+    if recorded_head is not None and recorded_head != git_state["head"]:
+        raise RuntimeError(
+            f"binary build receipt git_head {recorded_head!r} does not match current HEAD {git_state['head']!r}"
+        )
+    recorded_tree = data.get("working_tree")
+    if recorded_tree is not None:
+        if not isinstance(recorded_tree, dict):
+            raise RuntimeError("binary build receipt working_tree must be an object")
+        if recorded_tree.get("tree") is not None and recorded_tree["tree"] != git_state["tree"]:
+            raise RuntimeError(
+                f"binary build receipt working_tree.tree {recorded_tree['tree']!r} "
+                f"does not match current tree {git_state['tree']!r}"
+            )
+        if recorded_tree.get("status"):
+            raise RuntimeError("binary build receipt describes a dirty working tree")
+
+    payload = validated.payload
     info.update(
         {
             "receipt_verified": True,
-            "receipt_schema": data.get("schema_version") or data.get("schema"),
-            "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
-            "workspace_commit": data.get("workspace_commit"),
-            "config_digest": data.get("config_digest"),
-            "source_inputs_sha256": data.get("source_inputs_sha256"),
+            "receipt_schema": (
+                payload.get("receipt_schema")
+                or payload.get("schema_version")
+                or payload.get("schema")
+                or validated.schema
+            ),
+            "receipt_sha256": receipt_sha256,
+            "workspace_commit": payload.get("workspace_commit"),
+            "config_digest": payload.get("config_digest"),
+            "source_inputs_sha256": payload.get("source_inputs_sha256"),
         }
     )
     return info
