@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Standalone literal acceptance runner for Issue #85 / PR #259.
 
-Checkpoint 2 executes exactly the four plan case IDs against the real supplied
+The runner executes exactly the four plan case IDs against the real supplied
 service binary, a real isolated PostgreSQL schema, real stock Git objects and
 real LFS bytes: three DB-backed purge holds plus rename-alias real Git/LFS
 writes.  The existing author suite, production Rust and CI workflow are
 untouched.
 
-The runner never invokes Cargo, rustc, a builder, Docker or a network peer.  It
-uses the exact ``--binary`` supplied by the caller and binds its report to the
-immutable source commit/tree and the canonical adjacent/explicit build receipt
-though ``scripts/native_build_receipt.validate_receipt``.
+Provenance is fail-closed.  The complete tracked and non-ignored untracked
+worktree must be clean, the trusted expected source commit must equal HEAD,
+the canonical build receipt is validated against the exact current source root
+with ``verify_source_files=True``, and every new acceptance input is hashed
+against its committed HEAD blob.  The runner never invokes Cargo, rustc, a
+builder, Docker or a network peer.
 """
 from __future__ import annotations
 
@@ -38,10 +40,15 @@ from repository_lifecycle_acceptance_holds import (  # noqa: E402
     serving_read_header_blocks_purge,
 )
 from repository_lifecycle_acceptance_support import (  # noqa: E402
+    ACCEPTANCE_INPUT_PATHS,
     PLAN_CASE_NAMES,
     REPORT_SCHEMA,
     bind_build_receipt,
     classify_error,
+    evaluate_binding,
+    expected_receipt_sha256,
+    expected_source_commit,
+    helper_input_manifest,
     safe_detail,
     select_receipt,
     sha256_file,
@@ -106,13 +113,38 @@ def _failed_inventory(phase, error_class):
     ]
 
 
+def _empty_helper_inputs():
+    return {
+        "bound": False,
+        "manifest_sha256": None,
+        "count": 0,
+        "expected_count": len(ACCEPTANCE_INPUT_PATHS),
+        "files": [],
+        "error_class": "helper_inputs_unavailable",
+    }
+
+
+def _empty_source():
+    return {
+        "commit": None,
+        "tree": None,
+        "parents": [],
+        "working_tree_dirty": None,
+        "tracked_dirty": None,
+        "untracked_count": None,
+        "clean": False,
+        "error_class": None,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rootyard")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--build-receipt", type=Path)
-    parser.add_argument("--source-commit")
+    parser.add_argument("--expected-source-commit")
+    parser.add_argument("--expected-receipt-sha256")
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
@@ -123,37 +155,51 @@ def main():
         if not shutil.which(executable):
             parser.error("Required executable not found: " + executable)
 
-    source = {
-        "commit": None,
-        "tree": None,
-        "parents": [],
-        "working_tree_dirty": None,
-        "error_class": None,
-    }
+    source = _empty_source()
     try:
         source.update(source_identity(ROOT))
     except Exception as error:
         source["error_class"] = classify_error(error)
         print(traceback.format_exc(), file=sys.stderr)
 
-    expected_commit = (
-        args.source_commit
-        or os.environ.get("ROOTYARD_EXPECTED_SOURCE_COMMIT")
-        or os.environ.get("GITHUB_SHA")
-        or source.get("commit")
+    expected_commit, expected_commit_error = expected_source_commit(
+        args.expected_source_commit, os.environ
     )
+    receipt_anchor, receipt_anchor_error = expected_receipt_sha256(
+        args.expected_receipt_sha256, os.environ
+    )
+    if receipt_anchor_error not in (None, "receipt_anchor_missing"):
+        print("expected receipt digest: " + receipt_anchor_error, file=sys.stderr)
+
     receipt_path, receipt_origin = select_receipt(
         args.binary, args.build_receipt, os.environ
     )
-    build_receipt = bind_build_receipt(
-        args.binary, receipt_path, expected_commit, ROOT
-    )
+    helper_inputs = _empty_helper_inputs()
+    try:
+        helper_inputs = helper_input_manifest(ROOT)
+    except Exception as error:
+        helper_inputs["error_class"] = classify_error(error)
+        print(traceback.format_exc(), file=sys.stderr)
+
+    if source.get("commit"):
+        build_receipt = bind_build_receipt(
+            args.binary,
+            receipt_path,
+            source["commit"],
+            ROOT,
+            module_root=ROOT,
+            helper_files=helper_inputs.get("files") or [],
+            expected_receipt_sha256=receipt_anchor,
+        )
+    else:
+        build_receipt = {
+            "present": False,
+            "bound": False,
+            "error_class": "source_unavailable",
+        }
     binary_sha256 = sha256_file(args.binary)
-    binding_ok = bool(
-        source.get("commit")
-        and build_receipt.get("bound")
-        and build_receipt.get("workspace_commit") == source.get("commit")
-        and build_receipt.get("binary_sha256") == binary_sha256
+    binding = evaluate_binding(
+        source, expected_commit, build_receipt, binary_sha256, helper_inputs
     )
 
     harness = AcceptanceHarness(args)
@@ -183,7 +229,7 @@ def main():
         case_results,
         PLAN_CASE_NAMES,
         cleanup_ok=cleanup["status"] == "passed",
-        binding_ok=binding_ok,
+        binding_ok=binding["bound"],
     )
     passed_count = sum(row["status"] == "passed" for row in case_results)
     failed_count = sum(row["status"] == "failed" for row in case_results)
@@ -211,10 +257,15 @@ def main():
         "cleanup": cleanup,
         "source": source,
         "source_binding": {
-            "bound": binding_ok,
+            "bound": binding["bound"],
             "expected_commit": expected_commit,
+            "expected_commit_error": expected_commit_error,
             "receipt_origin": receipt_origin,
+            "receipt_anchor": receipt_anchor,
+            "receipt_anchor_present": receipt_anchor is not None,
+            "checks": binding["checks"],
         },
+        "helper_inputs": helper_inputs,
         "binary": {"sha256": binary_sha256},
         "build_receipt": build_receipt,
     }
