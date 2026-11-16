@@ -83,7 +83,7 @@ impl<C: Clone> HelperOwner<C> {
         if let Some(current) = self.current.take() {
             clients.push(current);
         }
-        clients.extend(self.retired.drain(..));
+        clients.append(&mut self.retired);
         clients
     }
 }
