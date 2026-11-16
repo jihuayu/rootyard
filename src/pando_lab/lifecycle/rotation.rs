@@ -3,10 +3,10 @@ use super::{
     DEFAULT_CIPHER_SUITE, DEFAULT_KMS_KEY_ID, ENVELOPE_SCHEMA, KmsEnvelopeRecord,
     KmsRotationReport,
     db::{load_envelope_from_db, persist_checkpoint},
-    envelope_file_path, load_repo_packs, provider,
+    load_repo_packs, provider,
     provider::PandoKeyProvider,
     provider_selection::{self, PandoProviderSelection},
-    read_and_verify_envelope_file, valid_kms_key_id,
+    valid_kms_key_id,
     vault_provider::VaultTransitProvider,
     wrapped_dek::PandoWrappedDek,
     write_envelope_file,
@@ -86,6 +86,26 @@ impl KmsRotationCheckpoint {
     pub(crate) fn is_vault_target(&self) -> bool {
         self.to_provider_kind == super::provider::PROVIDER_KIND_VAULT
     }
+}
+
+pub(crate) async fn load_authoritative_envelope(
+    c: &Client,
+    base_root: &Path,
+    repo: Uuid,
+    pack: &Pack,
+) -> Result<KmsEnvelopeRecord> {
+    let env = load_envelope_from_db(c, repo, pack)
+        .await?
+        .context("missing committed DB KMS envelope for pack")?;
+    super::envelopes::verify_envelope_record(&env)?;
+    ensure!(
+        env.repo == repo && env.pack_id == pack.id
+            && env.pack_sha256 == pack.pack_sha256
+            && env.idx_sha256 == pack.idx_sha256,
+        "committed DB KMS envelope identity mismatch"
+    );
+    let _ = write_envelope_file(base_root, &env);
+    Ok(env)
 }
 
 pub async fn verify_and_decrypt_pack_bytes(
@@ -498,12 +518,7 @@ async fn resolve_vault_rotation_checkpoint(
     ensure_target_available(target_version, latest, min_encryption)?;
     let mut from_provider_kind = provider::PROVIDER_KIND_VAULT.to_owned();
     for pack in packs {
-        let on_disk = envelope_file_path(&config.root, repo, pack.id);
-        let env = if on_disk.is_file() {
-            Some(read_and_verify_envelope_file(&config.root, repo, pack.id)?)
-        } else {
-            load_envelope_from_db(c, repo, pack).await?
-        };
+        let env = Some(load_authoritative_envelope(c, &config.root, repo, pack).await?);
         if let Some(env) = env {
             ensure!(
                 env.provider_kind == provider::PROVIDER_KIND_LOCAL
@@ -566,12 +581,7 @@ async fn rotate_vault_kms_key_with_options(
     for pack in &packs {
         let (latest, min_encryption) = vault.latest_and_min_encryption().await?;
         ensure_target_available(cp.expected_version(), latest, min_encryption)?;
-        let on_disk = envelope_file_path(&config.root, repo, pack.id);
-        let existing = if on_disk.is_file() {
-            Some(read_and_verify_envelope_file(&config.root, repo, pack.id)?)
-        } else {
-            load_envelope_from_db(&c, repo, pack).await?
-        };
+        let existing = Some(load_authoritative_envelope(c, &config.root, repo, pack).await?);
         if let Some(ref env) = existing
             && env.provider_kind == provider::PROVIDER_KIND_VAULT
             && env.key_id == cp.to_key_id
@@ -772,12 +782,7 @@ pub async fn rotate_kms_key_with_options(
     let s_root = object_store::store_root(config);
     let packs = load_repo_packs(&c, repo).await?;
     for pack in &packs {
-        let on_disk = envelope_file_path(&config.root, repo, pack.id);
-        let existing = if on_disk.is_file() {
-            Some(read_and_verify_envelope_file(&config.root, repo, pack.id)?)
-        } else {
-            load_envelope_from_db(&c, repo, pack).await?
-        };
+        let existing = Some(load_authoritative_envelope(c, &config.root, repo, pack).await?);
         if let Some(env) = existing {
             ensure!(
                 env.provider_kind == super::provider::PROVIDER_KIND_LOCAL,
@@ -791,12 +796,7 @@ pub async fn rotate_kms_key_with_options(
     let mut envelopes = Vec::with_capacity(packs.len());
     let mut rewrapped_this_run = 0usize;
     for pack in &packs {
-        let on_disk = envelope_file_path(&config.root, repo, pack.id);
-        let existing_env = if on_disk.is_file() {
-            Some(read_and_verify_envelope_file(&config.root, repo, pack.id)?)
-        } else {
-            load_envelope_from_db(&c, repo, pack).await?
-        };
+        let existing_env = Some(load_authoritative_envelope(&c, &config.root, repo, pack).await?);
         if let Some(ref env) = existing_env
             && env.key_id == cp.to_key_id
             && env.key_version == cp.to_key_version

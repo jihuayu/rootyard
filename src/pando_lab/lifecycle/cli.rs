@@ -1,6 +1,5 @@
 use super::{
-    DEFAULT_KMS_KEY_ID, db, envelope_file_path, load_repo_packs, provider, provider_selection,
-    read_and_verify_envelope_file,
+    DEFAULT_KMS_KEY_ID, db, load_repo_packs, provider, provider_selection,
     rotation::{
         KmsRotateOptions, KmsRotationCheckpoint, rotate_kms_key_with_options,
     },
@@ -79,16 +78,7 @@ pub async fn verify_repo_encryption(config: &Config, repo: Uuid) -> Result<KmsVe
             )
         };
     for pack in &packs {
-        let disk_path = envelope_file_path(&config.root, repo, pack.id);
-        ensure!(disk_path.is_file(), "missing KMS envelope file for pack {}", pack.id);
-        let env = read_and_verify_envelope_file(&config.root, repo, pack.id)?;
-        if let Some(db_env) = db::load_envelope_from_db(&c, repo, pack).await? {
-            ensure!(
-                db_env.envelope_mac == env.envelope_mac && db_env.key_id == env.key_id && db_env.provider_kind == env.provider_kind,
-                "DB KMS envelope diverges from verified on-disk envelope for pack {}",
-                pack.id
-            );
-        }
+        let env = super::rotation::load_authoritative_envelope(&c, &config.root, repo, pack).await?;
         let manifest_path = s_root.join(object_store::manifest_key(repo, pack.id));
         ensure!(manifest_path.is_file(), "missing object-store manifest for pack {}", pack.id);
         let manifest: object_store::CasPackManifest =
