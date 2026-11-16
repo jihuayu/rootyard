@@ -117,6 +117,9 @@ struct Inner {
     dead: AtomicBool,
     stop: AtomicBool,
     death: Mutex<Option<HelperError>>,
+    /// One absolute teardown deadline, once shutdown starts. Every later
+    /// shutdown/reap phase may only tighten or reuse it.
+    teardown_deadline: Mutex<Option<Instant>>,
     child: Mutex<ChildSlot>,
 }
 
@@ -155,6 +158,23 @@ impl Inner {
 
     fn failure(&self) -> HelperError {
         lock(&self.death).clone().unwrap_or_else(HelperError::disconnected)
+    }
+
+    /// Publish the one absolute teardown deadline. Repeated calls only tighten
+    /// it, so the RPC wait, child-exit wait, reaper and last-resort drop never
+    /// reset a fresh grace after the shared shutdown budget is exhausted.
+    fn begin_teardown_deadline(&self, deadline: Instant) -> Instant {
+        let mut current = lock(&self.teardown_deadline);
+        let effective = match *current {
+            Some(existing) => existing.min(deadline),
+            None => deadline,
+        };
+        *current = Some(effective);
+        effective
+    }
+
+    fn teardown_deadline(&self) -> Option<Instant> {
+        *lock(&self.teardown_deadline)
     }
 
     fn deliver(&self, frame: Frame) {
@@ -221,7 +241,19 @@ impl Inner {
         workspace: Option<Uuid>,
         db_epoch: i64,
         body: Body,
-        deadline: Duration,
+        grace: Duration,
+    ) -> (u64, Result<Body, HelperError>) {
+        self.call_full_until(workspace, db_epoch, body, Instant::now() + grace)
+    }
+
+    /// Send one request and wait for the matching reply without extending the
+    /// caller's absolute deadline.
+    fn call_full_until(
+        &self,
+        workspace: Option<Uuid>,
+        db_epoch: i64,
+        body: Body,
+        deadline: Instant,
     ) -> (u64, Result<Body, HelperError>) {
         if self.dead.load(Ordering::Acquire) {
             return (0, Err(self.failure()));
@@ -257,7 +289,8 @@ impl Inner {
             self.fail_generation(libc::ECONNRESET, format!("helper control write failed: {error}"));
             return (request_id, Err(self.failure()));
         }
-        match receiver.recv_timeout(deadline) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
             Ok(result) => (request_id, result),
             Err(RecvTimeoutError::Timeout) => {
                 lock(&self.pending).remove(&request_id);
@@ -277,8 +310,17 @@ impl Inner {
         self.call_full(workspace, db_epoch, body, deadline).1
     }
 
-    fn wait_exit(&self, grace: Duration) -> Result<(), HelperError> {
-        let deadline = Instant::now() + grace;
+    fn call_until(
+        &self,
+        workspace: Option<Uuid>,
+        db_epoch: i64,
+        body: Body,
+        deadline: Instant,
+    ) -> Result<Body, HelperError> {
+        self.call_full_until(workspace, db_epoch, body, deadline).1
+    }
+
+    fn wait_exit_until(&self, deadline: Instant) -> Result<(), HelperError> {
         loop {
             // One short observation under the lock; sleep never happens here.
             let observation = {
@@ -300,14 +342,15 @@ impl Inner {
                         "workspace FUSE helper child handle disappeared before an exit was observed",
                     ));
                 }
-                ExitObservation::Running | ExitObservation::Reaping if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(10));
-                }
                 ExitObservation::Running | ExitObservation::Reaping => {
-                    return Err(HelperError::new(
-                        libc::ETIMEDOUT,
-                        "workspace FUSE helper did not exit within the shutdown grace",
-                    ));
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(HelperError::new(
+                            libc::ETIMEDOUT,
+                            "workspace FUSE helper did not exit within the shutdown deadline",
+                        ));
+                    }
+                    thread::sleep(deadline.saturating_duration_since(now).min(Duration::from_millis(10)));
                 }
             }
         }
@@ -315,7 +358,11 @@ impl Inner {
 
     /// The one fixed reaper keeps polling until `Child::try_wait` reports a
     /// real exit. A SIGKILLed process stuck in D-state is not dropped
-    /// unreaped; this dedicated thread may outlive a bounded caller.
+    /// unreaped. When shutdown published an absolute deadline, the reaper
+    /// stops waiting at that same deadline and records a failure instead of
+    /// starting a fresh grace. Without a shutdown deadline (for example a
+    /// crash-triggered generation death), this dedicated thread may outlive a
+    /// bounded caller as before.
     fn reap_child_until_exit(&self) {
         let child = {
             let mut slot = lock(&self.child);
@@ -329,7 +376,21 @@ impl Inner {
                     lock(&self.child).record_exit(Ok(ExitView::from(status)));
                     return;
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    let now = Instant::now();
+                    let Some(limit) = self.teardown_deadline() else {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    if now >= limit {
+                        lock(&self.child).record_exit(Err(
+                            "workspace FUSE helper was killed but did not reap within the shutdown deadline".into(),
+                        ));
+                        std::mem::forget(child);
+                        return;
+                    }
+                    thread::sleep(limit.saturating_duration_since(now).min(Duration::from_millis(10)));
+                }
                 Err(error) => {
                     lock(&self.child).record_exit(Err(error.to_string()));
                     return;
@@ -340,7 +401,9 @@ impl Inner {
 
     /// Last-resort teardown when the last `Arc` is gone and no reaper can own
     /// the handle. Bounded; if the child still has not exited, forget the
-    /// handle instead of dropping an unreaped `Child`.
+    /// handle instead of dropping an unreaped `Child`. A published shutdown
+    /// deadline is a hard cap, so Drop never starts a fresh grace after the
+    /// shared budget is exhausted.
     fn reap_for_drop(&self, grace: Duration) {
         let child = {
             let mut slot = lock(&self.child);
@@ -348,17 +411,24 @@ impl Inner {
         };
         let Some(mut child) = child else { return };
         let _ = child.kill();
-        let deadline = Instant::now() + grace;
+        let proposed = Instant::now() + grace;
+        let deadline = self.teardown_deadline().map_or(proposed, |limit| limit.min(proposed));
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     lock(&self.child).record_exit(Ok(ExitView::from(status)));
                     return;
                 }
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 Ok(None) => {
-                    std::mem::forget(child);
-                    return;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        lock(&self.child).record_exit(Err(
+                            "workspace FUSE helper was killed but did not reap within the shutdown deadline".into(),
+                        ));
+                        std::mem::forget(child);
+                        return;
+                    }
+                    thread::sleep(deadline.saturating_duration_since(now).min(Duration::from_millis(10)));
                 }
                 Err(error) => {
                     lock(&self.child).record_exit(Err(error.to_string()));
@@ -458,6 +528,7 @@ impl HelperClient {
             dead: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             death: Mutex::new(None),
+            teardown_deadline: Mutex::new(None),
             child: Mutex::new(ChildSlot::running(child)),
         });
 
@@ -485,6 +556,14 @@ impl HelperClient {
     /// False after control EOF, a failed write or a completed shutdown.
     pub fn alive(&self) -> bool {
         !self.inner.dead.load(Ordering::Acquire)
+    }
+
+    /// Publish the one absolute helper teardown deadline before scheduling the
+    /// blocking shutdown. This also caps a last-`Arc` drop/reaper that runs
+    /// before the blocking closure is dispatched, so it cannot start a fresh
+    /// grace after the shared shutdown budget is exhausted.
+    pub fn publish_teardown_deadline(&self, deadline: Instant) -> Instant {
+        self.inner.begin_teardown_deadline(deadline)
     }
 
     /// Send one request and wait for the matching reply with a deadline.
@@ -608,11 +687,23 @@ impl HelperClient {
     /// Ask the child to fence, unmount and exit, then reap it within `grace`.
     ///
     /// A helper that does not exit is killed and reported as an error: shutdown
-    /// either observes a real exit or fails, it never claims success.
+    /// either observes a real exit or fails, it never claims success. The
+    /// grace is converted once to an absolute deadline shared by the RPC and
+    /// the exit wait; the old caller-visible method is preserved.
     pub fn shutdown(&self, grace: Duration) -> Result<(), HelperError> {
-        let request = self.call(None, 0, Body::Shutdown, grace.min(REQUEST_DEADLINE));
+        self.shutdown_until(Instant::now() + grace)
+    }
+
+    /// Deadline-aware shutdown used by the normal signal path. The RPC wait,
+    /// child-exit wait, reaper and last-resort drop all consume the same
+    /// absolute deadline and may only tighten it. No fresh grace is started
+    /// after the caller's remaining normal-shutdown budget is exhausted.
+    pub fn shutdown_until(&self, deadline: Instant) -> Result<(), HelperError> {
+        let deadline = self.inner.begin_teardown_deadline(deadline);
+        let request_deadline = deadline.min(Instant::now() + REQUEST_DEADLINE);
+        let request = self.inner.call_until(None, 0, Body::Shutdown, request_deadline);
         self.inner.stop.store(true, Ordering::Release);
-        match self.inner.wait_exit(grace) {
+        match self.inner.wait_exit_until(deadline) {
             Ok(()) => {
                 self.inner.mark_dead();
                 match request {

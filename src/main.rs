@@ -381,7 +381,7 @@ async fn run() -> Result<()> {
                 workspace_capture_task,
                 capture_grace,
                 async {
-                    rootyard::workspaces::mounts::shutdown_helper()
+                    rootyard::workspaces::mounts::shutdown_helper_until(shutdown_deadline)
                         .await
                         .map_err(|_| anyhow::anyhow!("workspace FUSE helper shutdown failed"))
                 },

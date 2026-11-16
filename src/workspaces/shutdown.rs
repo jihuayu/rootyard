@@ -26,18 +26,20 @@ const CAPTURE_SCAN_MARGIN: Duration = Duration::from_secs(5);
 /// half the total, so a small test/config grace still leaves a strict split.
 const ABORT_CONFIRMATION_LIMIT: Duration = Duration::from_secs(1);
 
-/// One bounded capture drain budget. The helper has its own pre-existing
-/// fence/unmount/join and child-process grace; this value never makes that path
-/// unbounded.
+/// One bounded capture drain budget. The helper future supplied by the caller
+/// owns the same absolute normal-shutdown deadline for its fence/unmount/exit
+/// and child-reap phases; this value never starts a second helper grace.
 pub fn capture_shutdown_grace() -> Duration {
     scan::timeout().saturating_add(CAPTURE_SCAN_MARGIN)
 }
 
 /// Cancel the capture producer, await its release and drain accepted scans with
 /// every wait bounded by one absolute deadline, then unconditionally attempt
-/// helper teardown with its existing bounded fence/unmount/join and
-/// child-process grace. Helper teardown deliberately precedes the caller's
-/// retained HTTP/Git joins so a FUSE-parked Git child can be released.
+/// helper teardown. The helper future is deadline-aware: its RPC, exit and
+/// child-reap waits consume the caller's published normal-shutdown deadline
+/// rather than starting a fresh helper grace. Helper teardown deliberately
+/// precedes the caller's retained HTTP/Git joins so a FUSE-parked Git child can
+/// be released.
 ///
 /// The total grace is not extended: a reserved confirmation slice is taken from
 /// inside it. If capture does not release before the earlier cooperative

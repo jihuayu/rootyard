@@ -32,7 +32,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -53,6 +53,12 @@ pub(super) static HELPER: OnceLock<Mutex<Option<Arc<HelperClient>>>> = OnceLock:
 fn helper_slot() -> &'static Mutex<Option<Arc<HelperClient>>> {
     HELPER.get_or_init(|| Mutex::new(None))
 }
+
+/// Existing helper fence/unmount/exit allowance. The one absolute
+/// normal-shutdown deadline can only tighten this value.
+const HELPER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+type HelperShutdown = Box<dyn FnOnce() -> Result<(), Error> + Send>;
 
 fn mode() -> String {
     std::env::var("ROOTYARD_WORKSPACE_MOUNT_MODE").unwrap_or_else(|_| "direct".into())
@@ -299,23 +305,91 @@ pub async fn reconcile_startup(state: &Arc<AppState>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Compatibility entry point. If the normal signal path published one
+/// absolute shutdown deadline, use it; otherwise keep the previous allowance.
 pub async fn shutdown_helper() -> Result<(), Error> {
+    match super::process_cleanup_deadline() {
+        Some(deadline) => shutdown_helper_until(deadline).await,
+        None => shutdown_helper_without_deadline().await,
+    }
+}
+
+/// Deadline-aware helper teardown for the normal signal path. The existing
+/// fence/exact-unmount/exit allowance is capped by the caller's remaining
+/// shared normal-shutdown deadline instead of starting a fresh helper grace.
+pub async fn shutdown_helper_until(deadline: tokio::time::Instant) -> Result<(), Error> {
     let client = helper_slot().lock().unwrap().take();
     let entries = {
         let mut registry = registry().lock().unwrap();
         std::mem::take(&mut *registry)
     };
     let Some(client) = client else {
-        super::blocking::run_control(move || {
+        return super::blocking::run_control(move || {
             drop(entries);
             Ok(())
         })
-        .await?;
-        return Ok(());
+        .await;
+    };
+    let teardown_deadline =
+        client.publish_teardown_deadline(deadline.into_std().min(Instant::now() + HELPER_SHUTDOWN_GRACE));
+    let cleanup: HelperShutdown = Box::new(move || {
+        drop(entries);
+        client.shutdown_until(teardown_deadline).map_err(Error::internal)
+    });
+    run_helper_cleanup(cleanup, tokio::time::Instant::from_std(teardown_deadline)).await
+}
+
+/// Compatibility path used when no normal-shutdown deadline was published.
+/// It keeps the previous helper allowance and control-bulkhead dispatch.
+async fn shutdown_helper_without_deadline() -> Result<(), Error> {
+    let client = helper_slot().lock().unwrap().take();
+    let entries = {
+        let mut registry = registry().lock().unwrap();
+        std::mem::take(&mut *registry)
+    };
+    let Some(client) = client else {
+        return super::blocking::run_control(move || {
+            drop(entries);
+            Ok(())
+        })
+        .await;
     };
     super::blocking::run_control(move || {
         drop(entries);
-        client.shutdown(Duration::from_secs(10)).map_err(Error::internal)
+        client.shutdown(HELPER_SHUTDOWN_GRACE).map_err(Error::internal)
     })
     .await
+}
+
+/// Run mandatory helper teardown on the existing control bulkhead, but never
+/// wait past the helper's shared absolute deadline. If the wait expires before
+/// the bulkhead dispatched the closure, launch the same owned closure on a
+/// blocking task so the verified fence/exact-unmount attempt is not skipped at
+/// budget zero. Either way the closure owns the helper client and registry
+/// entries and uses the deadline-aware shutdown internally; a missed wait is
+/// reported as a failure, never as a clean unmount.
+async fn run_helper_cleanup(cleanup: HelperShutdown, deadline: tokio::time::Instant) -> Result<(), Error> {
+    let cleanup = Arc::new(Mutex::new(Some(cleanup)));
+    let dispatched = cleanup.clone();
+    let task = super::blocking::run_control(move || {
+        let cleanup = dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| Error::internal("workspace FUSE helper cleanup was dispatched twice"))?;
+        cleanup()
+    });
+    match tokio::time::timeout_at(deadline, task).await {
+        Ok(result) => result,
+        Err(_) => {
+            let pending = cleanup.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            if let Some(cleanup) = pending {
+                let _ = tokio::task::spawn_blocking(cleanup);
+            }
+            Err(Error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "workspace FUSE helper shutdown exceeded the shared normal-shutdown deadline",
+            ))
+        }
+    }
 }
