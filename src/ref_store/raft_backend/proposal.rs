@@ -253,9 +253,15 @@ impl ProposalEnvelope {
             if probe.format == PROPOSAL_FORMAT {
                 let envelope: Self = serde_json::from_slice(payload)
                     .map_err(|e| ApplicationError::new(format!("decode proposal envelope: {e}")))?;
-                if envelope.proposal_id.group_id.len() > 64 {
-                    return Err(ApplicationError::new("proposal group_id exceeds the fixed protocol bound"));
-                }
+                // Full identity shape belongs to the fixed proposal wire boundary. This rejects
+                // nil ids, bad/empty/oversized group ids, zero epochs, and checked expiry
+                // overflow before the reducer can advance an applied coordinate or stage a
+                // receipt. Well-formed IDs that are merely expired relative to the current
+                // committed index still decode; the reducer classifies those as normal Expired.
+                envelope
+                    .proposal_id
+                    .validate_shape()
+                    .map_err(|e| ApplicationError::new(format!("invalid proposal identity: {e}")))?;
                 let command = envelope.command.into_bytes();
                 let actual = command_digest_hex(&command);
                 if actual != envelope.command_digest_hex {
@@ -486,5 +492,36 @@ mod tests {
         let ordinary = ProposalOutcome::from_attempt(id(0), log_id, &ordinary);
         assert_eq!(ordinary.original_log_id, Some(log_id));
         assert!(ordinary.outcome.is_some());
+    }
+
+    #[test]
+    fn decode_rejects_invalid_identity_shape() {
+        let envelope = ProposalEnvelope::encode(&id(0), b"{}").unwrap();
+        let base: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        let mutations = [
+            ("repository_id", serde_json::json!(Uuid::nil())),
+            ("group_id", serde_json::json!("")),
+            ("group_id", serde_json::json!("bad!")),
+            ("group_epoch", serde_json::json!(0)),
+            ("authority_epoch", serde_json::json!(0)),
+            ("storage_generation", serde_json::json!(0)),
+            ("nonce", serde_json::json!(Uuid::nil())),
+            ("issued_at_index", serde_json::json!(u64::MAX - PROPOSAL_WINDOW + 1)),
+        ];
+        for (field, value) in mutations {
+            let mut broken = base.clone();
+            broken["proposal_id"][field] = value;
+            let bytes = serde_json::to_vec(&broken).unwrap();
+            assert!(ProposalEnvelope::decode(&bytes).is_err(), "accepted invalid {field}");
+        }
+    }
+
+    #[test]
+    fn decode_accepts_well_formed_expired_identity() {
+        let expired_later = id(0);
+        assert!(!expired_later.is_valid_at(33));
+        let envelope = ProposalEnvelope::encode(&expired_later, b"{}").unwrap();
+        let (decoded, _) = ProposalEnvelope::decode(&envelope).unwrap().unwrap();
+        assert_eq!(decoded, expired_later);
     }
 }

@@ -920,4 +920,44 @@ mod tests {
         assert!(app.machine().read_gate_version(repo).unwrap().is_some());
         assert_eq!(app.logical_clock_floor(), 0);
     }
+
+    #[test]
+    fn malformed_outer_ids_are_fatal_before_any_staging() {
+        let mut app = RootRefCasStateMachine::new();
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let base = ProposalEnvelope::encode(
+            &proposal_id(repo, tenant, history, 0),
+            &encode_command(&RefCasCommand::Noop(NoopCommand { logical_tick: None })).unwrap(),
+        )
+        .unwrap();
+        let base: serde_json::Value = serde_json::from_slice(&base).unwrap();
+        let before_bytes = app.export_state().unwrap();
+        let before_digest = app.state_digest_hex().unwrap();
+
+        let mutations = [
+            ("repository_id", serde_json::json!(Uuid::nil())),
+            ("group_id", serde_json::json!("")),
+            ("group_id", serde_json::json!("bad!")),
+            ("group_epoch", serde_json::json!(0)),
+            ("authority_epoch", serde_json::json!(0)),
+            ("storage_generation", serde_json::json!(0)),
+            ("nonce", serde_json::json!(Uuid::nil())),
+            ("issued_at_index", serde_json::json!(u64::MAX - PROPOSAL_WINDOW + 1)),
+        ];
+        for (field, value) in mutations {
+            let mut broken = base.clone();
+            broken["proposal_id"][field] = value;
+            let bytes = serde_json::to_vec(&broken).unwrap();
+            for index in [1_u64, 35_u64] {
+                let error = app.apply(ApplicationLogId::new(1, index), &bytes).unwrap_err();
+                assert!(error.to_string().contains("invalid proposal identity"));
+                assert_eq!(app.last_applied_coordinate(), None);
+                assert_eq!(app.retained_attempt_count(), 0);
+                assert_eq!(app.export_state().unwrap(), before_bytes);
+                assert_eq!(app.state_digest_hex().unwrap(), before_digest);
+            }
+        }
+    }
 }
