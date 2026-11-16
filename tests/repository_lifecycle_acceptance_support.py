@@ -5,8 +5,8 @@ Cargo execution.  It only classifies failures, allowlists report detail,
 reads the immutable source identity, and validates the adjacent canonical
 build receipt through the existing ``scripts/native_build_receipt.py`` reader.
 
-Checkpoint 1 inventory is exactly the three DB-backed hold cases from the
-reviewed plan.  Checkpoint 2 expands it to the four plan case IDs.
+Checkpoint 2 inventory is exactly the four plan case IDs: the three DB-backed
+hold cases plus the real rename-alias Git/LFS write case.
 """
 from __future__ import annotations
 
@@ -20,11 +20,12 @@ import uuid
 
 REPORT_SCHEMA = "issue85-repository-lifecycle-acceptance-v1"
 
-# Checkpoint 1: exactly the three hold cases, in plan order.
+# Checkpoint 2 inventory: exactly the four plan case IDs, in plan order.
 PLAN_CASE_NAMES = (
     "backup_root_blocks_purge",
     "serving_read_header_blocks_purge",
     "ci_pin_blocks_purge",
+    "rename_alias_accepts_real_git_and_lfs_writes",
 )
 
 # Report details are fixed constants/counts only.  Raw response bodies, SQL,

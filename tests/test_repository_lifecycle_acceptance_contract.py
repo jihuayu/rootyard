@@ -22,6 +22,7 @@ class AcceptanceContractTest(unittest.TestCase):
                 "backup_root_blocks_purge",
                 "serving_read_header_blocks_purge",
                 "ci_pin_blocks_purge",
+                "rename_alias_accepts_real_git_and_lfs_writes",
             ),
         )
 
@@ -47,6 +48,21 @@ class AcceptanceContractTest(unittest.TestCase):
             },
         )
 
+    def test_alias_detail_constants_are_accepted(self):
+        detail = support.safe_detail(
+            {
+                "fixture": "rename_alias_real_git_lfs",
+                "alias_git_write": "passed",
+                "alias_lfs_write": "passed",
+                "canonical_head": "new_oid_verified",
+                "canonical_bytes": "hash_verified",
+                "restricted_read": "redirected",
+                "restricted_write": "denied",
+                "denied_mutation": "unchanged",
+            }
+        )
+        self.assertEqual(len(detail), 8)
+
     def test_failure_is_a_failure_not_a_skip(self):
         results = [
             {
@@ -71,6 +87,14 @@ class AcceptanceContractTest(unittest.TestCase):
                 "phase": "control_purge",
                 "error_class": None,
                 "seconds": 0.3,
+                "detail": {},
+            },
+            {
+                "name": "rename_alias_accepts_real_git_and_lfs_writes",
+                "status": "passed",
+                "phase": "assert_denial_unchanged",
+                "error_class": None,
+                "seconds": 0.4,
                 "detail": {},
             },
         ]
@@ -112,7 +136,7 @@ class AcceptanceContractTest(unittest.TestCase):
         )
         self.assertFalse(summary["passed"])
         self.assertFalse(summary["exact"])
-        self.assertEqual(len(summary["missing"]), 2)
+        self.assertEqual(len(summary["missing"]), 3)
         self.assertEqual(summary["unexpected"], ["unexpected_case"])
 
     def test_error_classes_are_fixed_and_message_free(self):

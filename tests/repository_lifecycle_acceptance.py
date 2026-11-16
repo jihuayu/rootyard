@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Standalone literal acceptance runner for Issue #85 / PR #259.
 
-Checkpoint 1 executes exactly three new DB-backed purge-hold cases against
-the real supplied service binary, a real isolated PostgreSQL schema, real
-stock Git objects and real LFS bytes.  The existing author suite, production
-Rust and CI workflow are untouched.
+Checkpoint 2 executes exactly the four plan case IDs against the real supplied
+service binary, a real isolated PostgreSQL schema, real stock Git objects and
+real LFS bytes: three DB-backed purge holds plus rename-alias real Git/LFS
+writes.  The existing author suite, production Rust and CI workflow are
+untouched.
 
 The runner never invokes Cargo, rustc, a builder, Docker or a network peer.  It
 uses the exact ``--binary`` supplied by the caller and binds its report to the
@@ -28,6 +29,9 @@ if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
 from repository_lifecycle import RepositoryLifecycleHarness  # noqa: E402
+from repository_lifecycle_acceptance_alias import (  # noqa: E402
+    rename_alias_accepts_real_git_and_lfs_writes,
+)
 from repository_lifecycle_acceptance_holds import (  # noqa: E402
     backup_root_blocks_purge,
     ci_pin_blocks_purge,
@@ -59,6 +63,10 @@ CASES = (
     ("backup_root_blocks_purge", backup_root_blocks_purge),
     ("serving_read_header_blocks_purge", serving_read_header_blocks_purge),
     ("ci_pin_blocks_purge", ci_pin_blocks_purge),
+    (
+        "rename_alias_accepts_real_git_and_lfs_writes",
+        rename_alias_accepts_real_git_and_lfs_writes,
+    ),
 )
 
 
