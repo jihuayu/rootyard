@@ -135,6 +135,10 @@ pub fn verify_envelope_record(env: &KmsEnvelopeRecord) -> Result<()> {
         "invalid KMS envelope fields"
     );
     if crypto::is_authenticated_mode(&env.encryption_mode) {
+        ensure!(
+            env.provider_kind == provider::PROVIDER_KIND_LOCAL,
+            "unsupported KMS envelope provider_kind"
+        );
         let envelope_id = env.envelope_id.context("missing envelope_id in envelope")?;
         let nonce = env.nonce_prefix.as_deref().context("missing nonce_prefix")?;
         let wrapped = env
