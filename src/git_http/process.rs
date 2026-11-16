@@ -6,13 +6,56 @@ pub(super) struct Process {
     pub(super) input: Option<JoinHandle<io::Result<()>>>,
     pub(super) stderr: JoinHandle<()>,
     pub(super) pid: i32,
+    cleanup_deadline: Option<Instant>,
 }
 impl Process {
+    /// Construct without starting a cleanup budget. The budget starts only when
+    /// finish, stop or Drop first has to clean this owned process, so normal Git
+    /// command execution is never shortened by process creation.
+    pub(super) fn new(
+        child: Child,
+        input: Option<JoinHandle<io::Result<()>>>,
+        stderr: JoinHandle<()>,
+        pid: i32,
+    ) -> Self {
+        Self { child, input, stderr, pid, cleanup_deadline: None }
+    }
+
+    /// Start on first cleanup, then only reuse/tighten the same absolute budget.
+    /// The optional shared normal-shutdown cap can only move it earlier.
+    fn begin_cleanup_deadline(&mut self, grace: std::time::Duration) -> Instant {
+        let now = Instant::now();
+        let proposed = now + grace;
+        let deadline = self.cleanup_deadline.get_or_insert(proposed);
+        if proposed < *deadline {
+            *deadline = proposed;
+        }
+        if let Some(cap) = crate::workspaces::process_cleanup_deadline()
+            && cap < *deadline
+        {
+            *deadline = cap;
+        }
+        *deadline
+    }
+
+    fn kill_owned_group(&self) {
+        unsafe {
+            libc::kill(-self.pid, libc::SIGKILL);
+        }
+    }
     pub(super) async fn finish(&mut self) -> io::Result<std::process::ExitStatus> {
         // Observe leader exit without reaping it: the unreaped PID reserves the
         // process-group ID while we clean any surviving descendants. Tokio's
         // Child::wait would reap too early for a safe group signal afterwards.
-        let deadline = Instant::now() + super::revocation::bound().stop_grace;
+        let deadline = self.begin_cleanup_deadline(super::revocation::bound().stop_grace);
+        if Instant::now() >= deadline {
+            crate::workspaces::mark_process_cleanup_failure();
+            self.kill_owned_group();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Git process cleanup budget exhausted before leader observation",
+            ));
+        }
         loop {
             let exited = {
                 let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
@@ -35,6 +78,7 @@ impl Process {
             }
             if Instant::now() >= deadline {
                 crate::workspaces::mark_process_cleanup_failure();
+                self.kill_owned_group();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "Git process group leader exit did not become observable",
@@ -74,9 +118,15 @@ impl Process {
         if self.pid <= 0 {
             return;
         }
+        let final_deadline = self.begin_cleanup_deadline(grace);
         let started = Instant::now();
-        let term_deadline = started + grace / 2;
-        let final_deadline = started + grace;
+        if started >= final_deadline {
+            crate::workspaces::mark_process_cleanup_failure();
+            self.kill_owned_group();
+            eprintln!("rootyard: process cleanup budget exhausted before stop; retained process-group ownership");
+            return;
+        }
+        let term_deadline = started + (final_deadline - started) / 2;
         let quiescent = terminate_group_until(
             self.pid,
             term_deadline,
@@ -275,36 +325,40 @@ async fn wait_pid_group_quiescent(pid: i32, warn: &str) {
 impl Drop for Process {
     fn drop(&mut self) {
         // The process group covers http-backend, receive/upload-pack and their workers.
-        // Drop cannot await. Use the existing revocation stop grace as a synchronous
-        // final bound; never wait forever on a FUSE-parked descendant. If quiescence
-        // is not proved, leave the PID reservation and report failure rather than
-        // claiming the group was reaped.
+        // Drop cannot await. First cleanup starts the one per-Process budget; a prior
+        // finish/stop attempt reuses or tightens it. On expiry there is no fresh grace:
+        // only an owned nonblocking SIGKILL and a failure fact are recorded.
         if self.pid > 0 {
-            unsafe {
-                libc::kill(-self.pid, libc::SIGKILL);
-            }
-            let deadline = std::time::Instant::now() + super::revocation::bound().stop_grace;
-            loop {
-                if matches!(group_quiescent(self.pid), Ok(true)) {
-                    match self.child.try_wait() {
-                        Ok(Some(_)) => self.pid = 0,
-                        _ => {
-                            crate::workspaces::mark_process_cleanup_failure();
-                            eprintln!(
-                                "rootyard: cancelled Git process group quiescent but leader reaping not proven; shutdown fails closed"
-                            );
+            let deadline = self.begin_cleanup_deadline(super::revocation::bound().stop_grace);
+            self.kill_owned_group();
+            if Instant::now() >= deadline {
+                crate::workspaces::mark_process_cleanup_failure();
+                eprintln!(
+                    "rootyard: cancelled Git process cleanup budget exhausted; no fresh wait, no quiescence or reap claim"
+                );
+            } else {
+                loop {
+                    if matches!(group_quiescent(self.pid), Ok(true)) {
+                        match self.child.try_wait() {
+                            Ok(Some(_)) => self.pid = 0,
+                            _ => {
+                                crate::workspaces::mark_process_cleanup_failure();
+                                eprintln!(
+                                    "rootyard: cancelled Git process group quiescent but leader reaping not proven; shutdown fails closed"
+                                );
+                            }
                         }
+                        break;
                     }
-                    break;
+                    if Instant::now() >= deadline {
+                        crate::workspaces::mark_process_cleanup_failure();
+                        eprintln!(
+                            "rootyard: cancelled Git process group cleanup did not prove quiescence; shutdown fails closed rather than claiming reaping"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                if std::time::Instant::now() >= deadline {
-                    crate::workspaces::mark_process_cleanup_failure();
-                    eprintln!(
-                        "rootyard: cancelled Git process group cleanup did not prove quiescence; shutdown fails closed rather than claiming reaping"
-                    );
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         if let Some(input) = &self.input {
@@ -392,7 +446,7 @@ where
         let mut bytes = [0u8; 4096];
         while matches!(stderr.read(&mut bytes).await,Ok(n) if n>0) {}
     });
-    let mut process = Process { child, input: None, stderr: drain, pid };
+    let mut process = Process::new(child, None, drain, pid);
     let outcome = tokio::time::timeout(timeout, async {
         let mut reader = stdout.take(limits.max_bytes as u64 + 1);
         let mut chunk = [0u8; STREAM_CHUNK_BYTES];
@@ -517,7 +571,7 @@ pub(crate) async fn collect_git_output_input(
         let mut bytes = [0u8; 4096];
         while matches!(stderr.read(&mut bytes).await,Ok(n) if n>0) {}
     });
-    let mut process = Process { child, input: None, stderr: drain, pid };
+    let mut process = Process::new(child, None, drain, pid);
     let mut output = Vec::new();
     let result = tokio::time::timeout(timeout, async {
         (&mut stdout).take(limit as u64 + 1).read_to_end(&mut output).await?;
@@ -565,7 +619,7 @@ mod process_tests {
         }
         let child = cmd.spawn().unwrap();
         let pid = child.id().unwrap() as i32;
-        let process = Process { child, input: None, stderr: tokio::spawn(async {}), pid };
+        let process = Process::new(child, None, tokio::spawn(async {}), pid);
         let started = Instant::now();
         let child_pid = loop {
             if let Ok(text) = std::fs::read_to_string(&pid_file)

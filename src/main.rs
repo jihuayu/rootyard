@@ -368,6 +368,7 @@ async fn run() -> Result<()> {
                 }
             }
             let shutdown_deadline = tokio::time::Instant::now() + git_shutdown_grace;
+            rootyard::workspaces::set_process_cleanup_deadline(shutdown_deadline);
             http_stop.cancel();
             // The existing Git capacity/job ownership is the mutation admission
             // mechanism. Already accepted jobs keep their permits and JoinSet

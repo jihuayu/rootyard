@@ -43,11 +43,31 @@ mod snapshot_tests;
 pub use shutdown::{capture_shutdown_grace, stop_capture_before_helper};
 
 static PROCESS_CLEANUP_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PROCESS_CLEANUP_DEADLINE: std::sync::OnceLock<std::sync::Mutex<Option<tokio::time::Instant>>> =
+    std::sync::OnceLock::new();
 
 /// Record that some native Git process group could not be proved quiescent.
 /// This is a process-wide shutdown fact: a later clean join cannot erase it.
 pub(crate) fn mark_process_cleanup_failure() {
     PROCESS_CLEANUP_FAILED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Publish the one absolute normal-shutdown deadline so every Process cleanup
+/// can cap its already-started per-child budget. Repeated publication only
+/// tightens; it never extends an existing cap.
+pub fn set_process_cleanup_deadline(deadline: tokio::time::Instant) {
+    let cell = PROCESS_CLEANUP_DEADLINE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut current = cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *current = Some(match *current {
+        Some(existing) if existing <= deadline => existing,
+        _ => deadline,
+    });
+}
+
+/// The shared normal-shutdown cap, if the signal path has published it.
+pub(crate) fn process_cleanup_deadline() -> Option<tokio::time::Instant> {
+    let cell = PROCESS_CLEANUP_DEADLINE.get_or_init(|| std::sync::Mutex::new(None));
+    *cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Whether any native Git process-group cleanup failed to prove quiescence.

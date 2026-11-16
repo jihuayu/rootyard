@@ -194,7 +194,7 @@ where
         let mut bytes = [0u8; 4096];
         while matches!(stderr.read(&mut bytes).await, Ok(n) if n > 0) {}
     });
-    let mut process = Process { child, input: None, stderr: drain, pid };
+    let mut process = Process::new(child, None, drain, pid);
     let deadline = Instant::now() + timeout;
     let mut tick = tokio::time::interval_at(Instant::now() + bound.check_interval, bound.check_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
