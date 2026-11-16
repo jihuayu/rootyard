@@ -222,8 +222,7 @@ pub async fn producer_snapshot(
         .map_err(|error| stage.tag(error))?;
     ensure!(!created.replayed, "fresh actor-owned pack snapshot replayed");
     ensure!(
-        created.receipt.scope().tenant_id() == verified.tenant
-            && created.receipt.scope().owner_id() == producer.id,
+        created.receipt.scope().tenant_id() == verified.tenant && created.receipt.scope().owner_id() == producer.id,
         "actor-owned A5 receipt scope owner/tenant differs"
     );
     let snapshot_id = created.receipt.snapshot_id();
@@ -233,11 +232,7 @@ pub async fn producer_snapshot(
         .read_actor_owned(
             &db.pool,
             producer,
-            ServingSnapshotRead {
-                owner: owner.to_owned(),
-                name: name.to_owned(),
-                snapshot_id,
-            },
+            ServingSnapshotRead { owner: owner.to_owned(), name: name.to_owned(), snapshot_id },
             store.backend_identity(),
             deadline(),
         )

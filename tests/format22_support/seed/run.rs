@@ -90,32 +90,23 @@ pub async fn run(options: &Options) -> Result<Value> {
             .map_err(|error| anyhow!("retention roots adapter rejected the Blob/Git configuration: {error:?}"))?,
     );
     let mut root_rows = Vec::new();
-    for (state, create_key, release_key) in [
-        ("active", "format22-active", None),
-        ("released", "format22-released", Some("format22-released-root")),
-    ] {
+    for (state, create_key, release_key) in
+        [("active", "format22-active", None), ("released", "format22-released", Some("format22-released-root"))]
+    {
         let create = roots::create_input(&owner.username, "bound", snapshot.snapshot_id, create_key);
         let receipt = adapter
             .create_actor_owned(&db.pool, &producer_identity, create, deadline())
             .await
             .map_err(|error| anyhow!("{state} actor-owned root create refused: {error:?}"))?;
-        ensure!(
-            receipt.state() == "active" && !receipt.replayed(),
-            "the {state} root is not a fresh active capture"
-        );
+        ensure!(receipt.state() == "active" && !receipt.replayed(), "the {state} root is not a fresh active capture");
         ensure!(
             receipt.owner_id() == producer && receipt.tenant_id() == tenant,
             "the {state} root receipt owner/tenant differs"
         );
         let root_id = receipt.root_id();
         if let Some(release_key) = release_key {
-            let release = roots::release_input(
-                &owner.username,
-                "bound",
-                root_id,
-                release_key,
-                "operator released retained root",
-            );
+            let release =
+                roots::release_input(&owner.username, "bound", root_id, release_key, "operator released retained root");
             let released = adapter
                 .release_actor_owned(&db.pool, &producer_identity, release, deadline())
                 .await
@@ -158,19 +149,11 @@ pub async fn run(options: &Options) -> Result<Value> {
     // survives (migration 143 keeps `snapshot_packs` with the snapshot), so both
     // roots and that retained snapshot still declare every registration; the
     // transient serving read below adds the third declaring set.
-    repo::release_snapshot_pin(
-        &db,
-        &store,
-        &producer_identity,
-        &owner.username,
-        "bound",
-        &snapshot,
-        &verified.gate,
-    )
-    .await
-    .map_err(|error| {
-        anyhow!("stage=release_snapshot_pin expected_revision={}: {error:#}", verified.gate.revision())
-    })?;
+    repo::release_snapshot_pin(&db, &store, &producer_identity, &owner.username, "bound", &snapshot, &verified.gate)
+        .await
+        .map_err(|error| {
+            anyhow!("stage=release_snapshot_pin expected_revision={}: {error:#}", verified.gate.revision())
+        })?;
 
     // 3b. One nonempty transient serving read by the third real user, over the
     //     same verified gate, captured only by the production

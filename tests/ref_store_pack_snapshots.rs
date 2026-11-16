@@ -3063,17 +3063,10 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
         {
             Err(error) if error.0 == axum::http::StatusCode::CONFLICT => {}
             Err(error) => {
-                return Err(anyhow!(
-                    "cross-mode actor-owned create returned {} {}",
-                    error.0,
-                    error.1
-                ));
+                return Err(anyhow!("cross-mode actor-owned create returned {} {}", error.0, error.1));
             }
             Ok(outcome) => {
-                return Err(anyhow!(
-                    "cross-mode actor-owned create was accepted (replayed={})",
-                    outcome.replayed
-                ));
+                return Err(anyhow!("cross-mode actor-owned create was accepted (replayed={})", outcome.replayed));
             }
         }
         ensure!(
@@ -3092,8 +3085,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             .await?;
         ensure!(!owned_a.replayed, "actor-owned create replayed");
         ensure!(
-            owned_a.receipt.scope().owner_id() == admin_producer.id
-                && owned_a.receipt.scope().tenant_id() == tenant,
+            owned_a.receipt.scope().owner_id() == admin_producer.id && owned_a.receipt.scope().tenant_id() == tenant,
             "actor-owned create persisted the wrong owner/tenant"
         );
         let owned_a_snapshot = owned_a.receipt.snapshot_id();
@@ -3184,8 +3176,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             .await?;
         ensure!(!owned_b.replayed, "fresh actor-owned immutable create replayed");
         ensure!(
-            owned_b.receipt.scope().owner_id() == admin_producer.id
-                && owned_b.receipt.scope().tenant_id() == tenant,
+            owned_b.receipt.scope().owner_id() == admin_producer.id && owned_b.receipt.scope().tenant_id() == tenant,
             "actor-owned immutable create persisted the wrong owner/tenant"
         );
         let owned_b_snapshot = owned_b.receipt.snapshot_id();
@@ -3228,10 +3219,8 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             "actor-owned historical read moved the immutable capture"
         );
         ensure!(!owned_b_read.packs().is_empty(), "actor-owned capture has no registered pack");
-        let owned_b_head = owned_b_read
-            .head_oid_hex()
-            .ok_or_else(|| anyhow!("actor-owned captured head is missing"))?
-            .to_owned();
+        let owned_b_head =
+            owned_b_read.head_oid_hex().ok_or_else(|| anyhow!("actor-owned captured head is missing"))?.to_owned();
         let materializer = PgPackSnapshotMaterializer::new(store.clone(), git.clone())?;
         let owned_view = PgServingSnapshotMetadata
             .materialize_actor_owned(
@@ -3283,11 +3272,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
         {
             Err(error) if error.0 == axum::http::StatusCode::NOT_FOUND => {}
             Err(error) => {
-                return Err(anyhow!(
-                    "non-owner actor-owned read returned {} {}",
-                    error.0,
-                    error.1
-                ));
+                return Err(anyhow!("non-owner actor-owned read returned {} {}", error.0, error.1));
             }
             Ok(_) => return Err(anyhow!("non-owner actor-owned read unexpectedly returned a view")),
         }
@@ -3336,11 +3321,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
         {
             Err(error) if error.0 == axum::http::StatusCode::NOT_FOUND => {}
             Err(error) => {
-                return Err(anyhow!(
-                    "non-owner actor-owned materialization returned {} {}",
-                    error.0,
-                    error.1
-                ));
+                return Err(anyhow!("non-owner actor-owned materialization returned {} {}", error.0, error.1));
             }
             Ok(_) => return Err(anyhow!("non-owner actor-owned materialization unexpectedly returned a view")),
         }
@@ -3398,11 +3379,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
                 .materialize_actor_owned(
                     &db.pool,
                     &admin_producer,
-                    ServingSnapshotRead {
-                        owner: owned_owner,
-                        name: owned_name,
-                        snapshot_id: owned_b_snapshot,
-                    },
+                    ServingSnapshotRead { owner: owned_owner, name: owned_name, snapshot_id: owned_b_snapshot },
                     &materializer,
                     deadline(),
                 )
@@ -4329,10 +4306,9 @@ async fn serving_check_version_absolute_deadline_bounds_two_sequential_auth_lock
             // ~8.2s. The fixed facade must return around 5s (plus its 1s cleanup
             // budget) while B remains held; the old unwrapped lookup would still
             // be blocked here.
-            let completed =
-                tokio::time::timeout_at(absolute + Duration::from_secs(2), task.as_mut().expect("task"))
-                    .await
-                    .map_err(|_| anyhow!("CheckVersion did not return within the bounded deadline grace"))?;
+            let completed = tokio::time::timeout_at(absolute + Duration::from_secs(2), task.as_mut().expect("task"))
+                .await
+                .map_err(|_| anyhow!("CheckVersion did not return within the bounded deadline grace"))?;
             // The join handle has completed once this timeout is ready. Remove it
             // before propagating the inner result/JoinError so cleanup cannot
             // abort and await the same completed handle again. On outer timeout

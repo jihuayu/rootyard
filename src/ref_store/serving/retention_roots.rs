@@ -224,16 +224,13 @@ impl PgServingRetentionRoots {
 
         // Exact create replay lives entirely on retained root/receipt rows and
         // runs before source pin/snapshot lookup or native work.
-        if let Some(receipt) = self
-            .replay_create(pool, actor, &repo, &scope, &input.intent, &derived, intent_owner, deadline)
-            .await?
+        if let Some(receipt) =
+            self.replay_create(pool, actor, &repo, &scope, &input.intent, &derived, intent_owner, deadline).await?
         {
             return Ok(receipt);
         }
 
-        let source = self
-            .source_snapshot(pool, actor, &repo, &scope, &input.intent, intent_owner, deadline)
-            .await?;
+        let source = self.source_snapshot(pool, actor, &repo, &scope, &input.intent, intent_owner, deadline).await?;
         let format = source.scope().object_format();
         if format != gate.object_format()
             || source.scope().history_incarnation() != gate.history_incarnation()
@@ -405,17 +402,7 @@ impl PgServingRetentionRoots {
                 }
                 let scope = root_scope(&repo, create.purpose, &derived.business_intent, intent_owner)?;
                 self.release_absent(
-                    pool,
-                    actor,
-                    &repo,
-                    root_id,
-                    &create,
-                    &derived,
-                    &scope,
-                    &input,
-                    ownership,
-                    deadline,
-                    false,
+                    pool, actor, &repo, root_id, &create, &derived, &scope, &input, ownership, deadline, false,
                 )
                 .await
             }
@@ -431,8 +418,7 @@ impl PgServingRetentionRoots {
                     .await?
                     .is_some()
                 {
-                    self.release_existing(pool, actor, &repo, derived.root_id, &input, ownership, deadline)
-                        .await
+                    self.release_existing(pool, actor, &repo, derived.root_id, &input, ownership, deadline).await
                 } else {
                     self.release_absent(
                         pool,
@@ -508,12 +494,7 @@ impl PgServingRetentionRoots {
                         actor,
                         &repo,
                         RepoAction::ContentsRead,
-                        &root_scope_from_gate(
-                            &repo,
-                            RootPurpose::Ci,
-                            PLACEHOLDER_BUSINESS_INTENT,
-                            intent_owner,
-                        )?,
+                        &root_scope_from_gate(&repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT, intent_owner)?,
                         self.backend(),
                         None,
                         deadline,
@@ -527,12 +508,7 @@ impl PgServingRetentionRoots {
             };
             let expected_scope = match &record {
                 Some(record) => root_scope_from_record(record)?,
-                None => root_scope_from_gate(
-                    &repo,
-                    RootPurpose::Ci,
-                    PLACEHOLDER_BUSINESS_INTENT,
-                    intent_owner,
-                )?,
+                None => root_scope_from_gate(&repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT, intent_owner)?,
             };
             final_authority_root(
                 &tx,
@@ -591,10 +567,7 @@ impl PgServingRetentionRoots {
         input: ServingRootRead,
         deadline: Instant,
     ) -> Result<RootReadView, Error> {
-        Ok(self
-            .materialize_with_context_for(pool, actor, input, deadline, RootOwnership::Actor)
-            .await?
-            .into_view())
+        Ok(self.materialize_with_context_for(pool, actor, input, deadline, RootOwnership::Actor).await?.into_view())
     }
 
     pub(crate) async fn materialize_with_context(
@@ -625,9 +598,7 @@ impl PgServingRetentionRoots {
         // and realm checks; actor-owned mode additionally requires the persisted
         // owner to be this actor. Default mode preserves historical
         // owner-independent existing-root access.
-        let metadata = self
-            .metadata_with_ownership(pool, actor, input.clone(), deadline, ownership)
-            .await?;
+        let metadata = self.metadata_with_ownership(pool, actor, input.clone(), deadline, ownership).await?;
         if metadata.is_none() {
             return Err(Error::not_found());
         }
@@ -649,8 +620,7 @@ impl PgServingRetentionRoots {
         let cluster = view
             .serving_cluster_incarnation()
             .ok_or_else(|| Error::internal("serving root view has no cluster anchor"))?;
-        self.finish_view(pool, actor, &repo, root, &view, cluster, owner_id, deadline)
-            .await?;
+        self.finish_view(pool, actor, &repo, root, &view, cluster, owner_id, deadline).await?;
         Ok(ServingRetainedRootReadContext {
             view,
             root,
@@ -727,12 +697,7 @@ impl PgServingRetentionRoots {
             let record = match PgRetentionRoots::root_record_in_tx(&tx, root).await {
                 Ok(Some(record)) => record,
                 Ok(None) => {
-                    let scope = root_scope_from_gate(
-                        repo,
-                        RootPurpose::Ci,
-                        PLACEHOLDER_BUSINESS_INTENT,
-                        intent_owner,
-                    )?;
+                    let scope = root_scope_from_gate(repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT, intent_owner)?;
                     match final_authority_root(
                         &tx,
                         actor,
@@ -750,12 +715,7 @@ impl PgServingRetentionRoots {
                     }
                 }
                 Err(error) => {
-                    let scope = root_scope_from_gate(
-                        repo,
-                        RootPurpose::Ci,
-                        PLACEHOLDER_BUSINESS_INTENT,
-                        intent_owner,
-                    )?;
+                    let scope = root_scope_from_gate(repo, RootPurpose::Ci, PLACEHOLDER_BUSINESS_INTENT, intent_owner)?;
                     return match final_authority_root(
                         &tx,
                         actor,
@@ -884,10 +844,7 @@ impl PgServingRetentionRoots {
         // Load the original authorized A5 metadata data-only. This proves the
         // stored snapshot/ref/pack rows and current serving realm/backend, but it
         // does not require the source pin to be live.
-        let source = match self
-            .stored_source_snapshot(pool, actor, repo, scope, create, intent_owner, deadline)
-            .await
-        {
+        let source = match self.stored_source_snapshot(pool, actor, repo, scope, create, intent_owner, deadline).await {
             Ok(source) => source,
             Err(error) => {
                 // A concurrent exact create may have committed after the ByIntent
@@ -903,9 +860,7 @@ impl PgServingRetentionRoots {
                         .await?
                         .is_some()
                 {
-                    return self
-                        .release_existing(pool, actor, repo, derived.root_id, input, ownership, deadline)
-                        .await;
+                    return self.release_existing(pool, actor, repo, derived.root_id, input, ownership, deadline).await;
                 }
                 return Err(error);
             }
@@ -1300,19 +1255,7 @@ impl PgServingRetentionRoots {
         let scope = *view.scope();
         let binding = RequestDigest::from_str(&view.binding_digest_hex())
             .map_err(|_| Error::internal("retained root binding digest is invalid"))?;
-        self.finish_view_state(
-            pool,
-            actor,
-            repo,
-            root,
-            view,
-            &scope,
-            binding,
-            cluster,
-            expected_owner,
-            deadline,
-        )
-        .await
+        self.finish_view_state(pool, actor, repo, root, view, &scope, binding, cluster, expected_owner, deadline).await
     }
 
     #[allow(clippy::too_many_arguments)]

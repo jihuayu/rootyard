@@ -456,8 +456,7 @@ impl PgServingSnapshotMetadata {
         materializer: &PgPackSnapshotMaterializer,
         deadline: Instant,
     ) -> Result<RetainedServingReadContext, Error> {
-        self.materialize_with_context_for(pool, actor, input, materializer, deadline, SnapshotOwnership::Tenant)
-            .await
+        self.materialize_with_context_for(pool, actor, input, materializer, deadline, SnapshotOwnership::Tenant).await
     }
 
     async fn materialize_with_context_for(
@@ -483,18 +482,9 @@ impl PgServingSnapshotMetadata {
         let tenant_id = initial.gate.tenant_id();
         let name = initial.repository.name.clone();
 
-        let (snapshot, cluster_incarnation) = retained_t1(
-            pool,
-            actor,
-            repository_id,
-            tenant_id,
-            &name,
-            input.snapshot_id,
-            backend,
-            deadline,
-            ownership,
-        )
-        .await?;
+        let (snapshot, cluster_incarnation) =
+            retained_t1(pool, actor, repository_id, tenant_id, &name, input.snapshot_id, backend, deadline, ownership)
+                .await?;
         let reference = PackSnapshotRef::new(
             repository_id,
             tenant_id,
@@ -503,21 +493,20 @@ impl PgServingSnapshotMetadata {
             snapshot.pin_generation(),
         )
         .map_err(map_metadata_error)?;
-        let prepared =
-            match timeout_at(
+        let prepared = match timeout_at(
+            deadline,
+            materializer.prepare_retained_serving(
+                snapshot,
+                ownership.owner_id(actor, tenant_id),
+                cluster_incarnation,
                 deadline,
-                materializer.prepare_retained_serving(
-                    snapshot,
-                    ownership.owner_id(actor, tenant_id),
-                    cluster_incarnation,
-                    deadline,
-                ),
-            )
-            .await
-            {
-                Ok(result) => result.map_err(map_metadata_error)?,
-                Err(_) => return Err(deadline_error()),
-            };
+            ),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(map_metadata_error)?,
+            Err(_) => return Err(deadline_error()),
+        };
         let view = retained_t2(
             pool,
             actor,
