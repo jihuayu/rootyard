@@ -280,52 +280,76 @@ def _start_fleet(
         ports = _allocate_distinct_ports(count)
         fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]] = []
         log_paths: list[Path] = []
-        for idx in range(count):
-            bind = f"127.0.0.1:{ports[idx]}"
-            sdir = scratch_root / f"scratch-{idx}"
-            if sdir.exists():
-                shutil.rmtree(sdir)
-            sdir.mkdir(parents=True, mode=0o700)
-            os.chmod(sdir, 0o700)
-            env = base_env.copy()
-            env.pop("ROOTYARD_DATA_DIR", None)
-            env.update(
-                {
-                    "DATABASE_URL": pg_url,
-                    "ROOTYARD_SCHEMA_MODE": "external",
-                    "ROOTYARD_BIND": bind,
-                    "ROOTYARD_GIT": git_bin,
-                    "ROOTYARD_SCRATCH_DIR": str(sdir),
-                    "ROOTYARD_BLOB_ENDPOINT": s3_endpoint,
-                    "ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE": "1000",
-                }
-            )
-            # Ensure single-process tier handles 6-way concurrent push + 4-way CI fetch
-            # without tripping default 256 MiB / 128 MiB = 2 inflight transfer slots.
-            env.setdefault("ROOTYARD_MAX_CONCURRENT_GIT", "16")
-            env.setdefault("ROOTYARD_MAX_REQUEST_BYTES", str(16 * 1024 * 1024))
-            env.setdefault("ROOTYARD_MAX_INFLIGHT_BYTES", str(256 * 1024 * 1024))
-            log_path = scratch_root / f"serve-blob-{idx}.log"
-            log_paths.append(log_path)
-            log_f = open(log_path, "ab")
-            proc = subprocess.Popen([binary, "serve-blob"], env=env, stdout=log_f, stderr=log_f, start_new_session=True)
-            fleet.append((proc, f"http://{bind}", sdir, log_f))
+        pending_proc: subprocess.Popen[bytes] | None = None
+        pending_log: Any = None
+        try:
+            for idx in range(count):
+                bind = f"127.0.0.1:{ports[idx]}"
+                sdir = scratch_root / f"scratch-{idx}"
+                if sdir.exists():
+                    shutil.rmtree(sdir)
+                sdir.mkdir(parents=True, mode=0o700)
+                os.chmod(sdir, 0o700)
+                env = base_env.copy()
+                env.pop("ROOTYARD_DATA_DIR", None)
+                env.update(
+                    {
+                        "DATABASE_URL": pg_url,
+                        "ROOTYARD_SCHEMA_MODE": "external",
+                        "ROOTYARD_BIND": bind,
+                        "ROOTYARD_GIT": git_bin,
+                        "ROOTYARD_SCRATCH_DIR": str(sdir),
+                        "ROOTYARD_BLOB_ENDPOINT": s3_endpoint,
+                        "ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE": "1000",
+                    }
+                )
+                # Ensure single-process tier handles 6-way concurrent push + 4-way CI fetch
+                # without tripping default 256 MiB / 128 MiB = 2 inflight transfer slots.
+                env.setdefault("ROOTYARD_MAX_CONCURRENT_GIT", "16")
+                env.setdefault("ROOTYARD_MAX_REQUEST_BYTES", str(16 * 1024 * 1024))
+                env.setdefault("ROOTYARD_MAX_INFLIGHT_BYTES", str(256 * 1024 * 1024))
+                log_path = scratch_root / f"serve-blob-{idx}.log"
+                log_paths.append(log_path)
+                log_f = open(log_path, "ab")
+                pending_log = log_f
+                proc = subprocess.Popen([binary, "serve-blob"], env=env, stdout=log_f, stderr=log_f, start_new_session=True)
+                pending_proc = proc
+                fleet.append((proc, f"http://{bind}", sdir, log_f))
+                pending_proc = None
+                pending_log = None
 
-        deadline = time.monotonic() + 30.0
-        pending = set(range(count))
-        exited: tuple[int, int | None] | None = None
-        while pending and time.monotonic() < deadline:
-            for idx in list(pending):
-                proc, base_url, _, _ = fleet[idx]
-                if proc.poll() is not None:
-                    exited = (idx, proc.returncode)
+            deadline = time.monotonic() + 30.0
+            pending = set(range(count))
+            exited: tuple[int, int | None] | None = None
+            while pending and time.monotonic() < deadline:
+                for idx in list(pending):
+                    proc, base_url, _, _ = fleet[idx]
+                    if proc.poll() is not None:
+                        exited = (idx, proc.returncode)
+                        break
+                    if http_json(base_url, "/health/ready", timeout=3)[0] == 200:
+                        pending.remove(idx)
+                if exited is not None:
                     break
-                if http_json(base_url, "/health/ready", timeout=3)[0] == 200:
-                    pending.remove(idx)
-            if exited is not None:
-                break
-            if pending:
-                time.sleep(0.1)
+                if pending:
+                    time.sleep(0.1)
+        except BaseException:
+            # Attempt to reap every worker already started and close the log
+            # opened for the failed spawn before propagating the original failure.
+            cleanup_fleet = list(fleet)
+            if pending_proc is not None and not any(item[0] is pending_proc for item in fleet):
+                cleanup_fleet.append((pending_proc, "", scratch_root, pending_log))
+            try:
+                _stop_fleet(cleanup_fleet)
+            except BaseException:
+                pass
+            finally:
+                if pending_log is not None:
+                    try:
+                        pending_log.close()
+                    except OSError:
+                        pass
+            raise
 
         if exited is not None:
             idx, rc = exited
