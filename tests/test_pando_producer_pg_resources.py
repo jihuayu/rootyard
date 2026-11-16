@@ -61,6 +61,8 @@ class PgFake:
                 return Result(0, b"")
             if self.create_mode == "unknown":
                 raise FixtureError("process_failed")
+            self.exists = True
+            self.identity = {"oid": "999", "datdba": "10", "database": self.database}
             return Result(1, b"")
         if sql.startswith("DROP DATABASE"):
             self.drop_sqls.append(sql)
@@ -176,6 +178,19 @@ class OwnedFixtureTest(unittest.TestCase):
         cleanup = fixture.cleanup(1e18)
         self.assertFalse(cleanup["cleanup_ok"])
         self.assertEqual(cleanup["error_code"], "postgres_create_outcome_unknown")
+        self.assertEqual(factory.fake.drop_sqls, [])
+        self.assertTrue(cleanup["root_removed"])
+
+    def test_rejected_create_race_never_claims_absent_or_drops(self):
+        factory = PgFactory("reject")
+        fixture = self.fixture(factory)
+        with self.assertRaises(process.RunnerError) as caught:
+            fixture.start(deadline=1e18)
+        self.assertEqual(caught.exception.code, "postgres_create_failed")
+        cleanup = fixture.cleanup(1e18)
+        self.assertFalse(cleanup["cleanup_ok"])
+        self.assertFalse(cleanup["database_absent"])
+        self.assertEqual(cleanup["error_code"], "cleanup_unresolved")
         self.assertEqual(factory.fake.drop_sqls, [])
         self.assertTrue(cleanup["root_removed"])
 

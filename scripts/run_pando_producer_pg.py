@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Source-bound producer PostgreSQL runner (preparation checkpoint).
+"""Source-bound executor for all 17 ignored producer PostgreSQL cases.
 
-This checkpoint resolves one existing bin-unit-test executable from the Cargo
-JSON cache, proves the clean expected source/tree and Pando schema identity,
+The runner resolves exactly one existing bin-unit-test executable from captured
+Cargo JSON, proves the clean expected source/tree and Pando schema identity,
 starts one owned loopback PostgreSQL 17 database and private temporary root,
-applies the real schema to that owned database, and tears both down with the
-approved ownership helpers.  The next checkpoint adds the 17 exact case
-executions and the report.
+applies the real schema to that owned database, runs the exact case list
+serially, rechecks source/binary identity, tears down only the owned resources
+and writes a fixed-allowlist report.  The exported Pando product receipt is
+validated as same-source evidence only and is never used as the test receipt.
 """
 from __future__ import annotations
 
@@ -25,11 +26,11 @@ for entry in (str(SCRIPTS), str(ROOT / "tests")):
     if entry not in sys.path:
         sys.path.insert(0, entry)
 
-from pando_producer_pg import artifacts, resources, source  # noqa: E402
+from pando_producer_pg import artifacts, cases, report, resources, source  # noqa: E402
 from pando_producer_pg.errors import RunnerError, require  # noqa: E402
 from pando_producer_pg.process import ProcessRunner  # noqa: E402
 
-REPORT_SCHEMA = "rootyard/issue21-pando-producer-pg/v1"
+REPORT_SCHEMA = report.REPORT_SCHEMA
 DEFAULT_REPORT = "test-results/pando-producer-pg.json"
 DEFAULT_TOTAL_SECONDS = 570.0
 DEFAULT_CLEANUP_RESERVE_SECONDS = 90.0
@@ -119,73 +120,199 @@ def parse_args(argv=None, environ=None):
         selection_timeout_seconds=_positive(args.selection_timeout_seconds),
         setup_timeout_seconds=_positive(args.setup_timeout_seconds),
         case_timeout_seconds=_positive(args.case_timeout_seconds),
-        prepare_only=True,
+        prepare_only=bool(args.prepare_only),
     )
 
 
-def _remaining(clock, deadline):
-    return deadline - clock()
-
-
-def _safe_summary(selection, cleanup):
+def _selection_binding(selection):
     return {
-        "schema": REPORT_SCHEMA,
-        "prepared": True,
-        "test_binary_sha256": selection.get("executable_sha256"),
-        "actual_fresh": {
-            "selected_test_binary": bool(selection.get("fresh")),
-            "cargo_selection_reused_cache": bool(selection.get("fresh")),
-        },
-        "cleanup": cleanup,
+        "command": list(selection.get("command") or artifacts.CARGO_COMMAND),
+        "features": list(selection.get("features") or artifacts.FEATURES),
+        "target": selection.get("target"),
+        "kind": list(selection.get("kind") or []),
+        "profile_test": bool((selection.get("profile") or {}).get("test")),
+        "fresh": bool(selection.get("fresh")),
     }
 
 
-def main(argv=None):
-    clock = time.monotonic
+def _first_failure(records):
+    for row in records:
+        if row.get("status") == "failed":
+            return RunnerError("execute", row.get("code") or "case_failed")
+    for row in records:
+        if row.get("status") != "passed":
+            return RunnerError("execute", row.get("code") or "not_run")
+    return None
+
+
+def _prepare_summary(payload):
+    return {
+        "schema": payload.get("schema"),
+        "prepared": bool(payload.get("passed")),
+        "test_binary_sha256": payload.get("test_binary_sha256"),
+        "actual_fresh": payload.get("actual_fresh", {}),
+        "cleanup": payload.get("cleanup", {}),
+    }
+
+
+def run(
+    config,
+    *,
+    runner=None,
+    clock=time.monotonic,
+    capture_source=None,
+    select_binary=None,
+    fixture_factory=None,
+    execute_cases_fn=None,
+    write_report_fn=None,
+    validate_product=None,
+    environ=None,
+):
+    runner = runner or ProcessRunner(clock=clock)
+    capture_source = capture_source or source.capture
+    select_binary = select_binary or artifacts.select_test_binary
+    fixture_factory = fixture_factory or resources.OwnedFixture
+    execute_cases_fn = execute_cases_fn or cases.execute_cases
+    write_report_fn = write_report_fn or report.write_report
+    validate_product = validate_product or source.validate_product_receipt
+    environ = dict(os.environ if environ is None else environ)
+    resources.require_escape_absent(environ)
+    require(
+        config.prepare_only or config.product_receipt is not None,
+        "source",
+        "product_receipt_missing",
+    )
+    bootstrap = environ.get("ROOTYARD_TEST_DATABASE_URL")
+    require(bool(bootstrap), "input", "missing_bootstrap")
+    started = clock()
+    overall = started + config.total_seconds
+    work = overall - config.cleanup_reserve_seconds
+    records = cases.not_run_records()
+    binding = None
+    selection = None
+    product = {
+        "provided": False,
+        "same_source": False,
+        "used_as_test_binary_receipt": False,
+        "attached_to_native_gate": False,
+    }
+    cleanup = resources.empty_cleanup()
+    fixture = None
+    error = None
     try:
-        config = parse_args(argv)
-        environ = dict(os.environ)
-        bootstrap = environ.get("ROOTYARD_TEST_DATABASE_URL")
-        require(bool(bootstrap), "input", "missing_bootstrap")
-        overall = clock() + config.total_seconds
-        work = overall - config.cleanup_reserve_seconds
-        binding = source.capture(
-            config.source_root, config.expected_commit, environ=environ
+        binding = capture_source(
+            config.source_root,
+            config.expected_commit,
+            expected_tree=config.expected_tree,
+            environ=environ,
         )
-        source.validate_product_receipt(
+        product = validate_product(
             config.product_receipt,
             config.source_root,
             config.expected_commit,
             binding["source_inputs_sha256"],
         )
-        remaining = min(
-            config.selection_timeout_seconds, _remaining(clock, work)
-        )
+        remaining = min(config.selection_timeout_seconds, work - clock())
         require(remaining > 0, "selection", "setup_deadline_exceeded")
-        selection = artifacts.select_test_binary(
-            config.source_root, ProcessRunner(clock=clock), remaining
-        )
-        fixture = resources.OwnedFixture(
+        selection = select_binary(config.source_root, runner, remaining)
+        binding["cargo_selection"] = _selection_binding(selection)
+        binding["source_rechecked"] = False
+        binding["source_unchanged"] = False
+        binding["test_binary_unchanged"] = False
+        fixture = fixture_factory(
             config.source_root,
             bootstrap,
             environ,
-            ProcessRunner(clock=clock),
+            runner,
             schema_sha256=binding["schema_sha256"],
             clock=clock,
         )
-        cleanup = resources.empty_cleanup()
-        try:
-            setup_deadline = min(
-                work, clock() + config.setup_timeout_seconds
+        setup_deadline = min(work, clock() + config.setup_timeout_seconds)
+        fixture.start(deadline=setup_deadline)
+        if not config.prepare_only:
+            records = execute_cases_fn(
+                selection["executable_path"],
+                fixture.child_environment,
+                runner,
+                work_deadline=work,
+                case_timeout=config.case_timeout_seconds,
+                clock=clock,
             )
-            fixture.start(deadline=setup_deadline)
-        finally:
+            try:
+                after = capture_source(
+                    config.source_root,
+                    config.expected_commit,
+                    expected_tree=config.expected_tree,
+                    environ=environ,
+                )
+            except RunnerError:
+                raise RunnerError("binding", "source_recheck_failed") from None
+            binding["source_rechecked"] = True
+            binding["source_unchanged"] = source.same(binding, after)
+            if not binding["source_unchanged"]:
+                raise RunnerError("binding", "source_drift")
+            artifacts.verify_selected_binary(selection)
+            binding["test_binary_unchanged"] = True
+            error = _first_failure(records)
+    except RunnerError as caught:
+        error = caught
+    finally:
+        if fixture is not None:
             cleanup = fixture.cleanup(overall)
-        if not cleanup["cleanup_ok"]:
-            code = cleanup.get("error_code", "cleanup_unresolved")
-            raise RunnerError("cleanup", code)
-        print(json.dumps(_safe_summary(selection, cleanup), sort_keys=True))
-        return 0
+        else:
+            cleanup = resources.empty_cleanup()
+    if error is None and not cleanup.get("cleanup_ok"):
+        error = RunnerError(
+            "cleanup", cleanup.get("error_code", "cleanup_unresolved")
+        )
+    if error is None and not cleanup.get("cleanup_within_deadline", False):
+        error = RunnerError("cleanup", "cleanup_deadline_exceeded")
+    if not config.prepare_only:
+        failure = _first_failure(records)
+        if failure is not None and error is None:
+            error = failure
+    passed = error is None and bool(cleanup.get("cleanup_ok"))
+    if not config.prepare_only:
+        passed = passed and all(row.get("status") == "passed" for row in records)
+    actual_fresh = {
+        "selected_test_binary": bool(
+            isinstance(selection, dict) and selection.get("fresh")
+        ),
+        "cargo_selection_reused_cache": bool(
+            isinstance(selection, dict) and selection.get("fresh")
+        ),
+    }
+    payload = report.build_report(
+        passed=passed,
+        records=records,
+        binding=binding,
+        selection=selection,
+        product_receipt=product,
+        cleanup=cleanup,
+        actual_fresh=actual_fresh,
+        error_code=error.code if error is not None else None,
+        stage=error.stage if error is not None else None,
+    )
+    if not config.prepare_only:
+        write_report_fn(
+            config.report,
+            payload,
+            forbidden_root=(
+                fixture.root.path
+                if fixture is not None and fixture.root is not None
+                else None
+            ),
+        )
+    return payload
+
+
+def main(argv=None):
+    try:
+        config = parse_args(argv)
+        payload = run(config)
+        if config.prepare_only:
+            print(json.dumps(_prepare_summary(payload), sort_keys=True))
+        return 0 if payload.get("passed") else 1
     except RunnerError as error:
         print(
             "pando producer pg runner failed: %s/%s" % (error.stage, error.code),

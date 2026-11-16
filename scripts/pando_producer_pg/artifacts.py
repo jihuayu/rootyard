@@ -145,6 +145,7 @@ def select_test_binary(source_root, runner, timeout):
             raise RunnerError("selection", "artifact_source_outside") from None
         require(resolved.is_file(), "selection", "artifact_source_missing")
         source = relative
+    require(source == EXPECTED_SOURCE, "selection", "artifact_source_missing")
     return {
         "target": TARGET,
         "kind": list(kinds),

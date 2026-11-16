@@ -162,6 +162,14 @@ class ArtifactSelectionTest(unittest.TestCase):
             "build_failed",
         )
 
+    def test_wrong_target_source_is_not_accepted(self):
+        other = self.root / "src/bin/other.rs"
+        other.write_text("fn main() {}\n")
+        event = self.event()
+        event["target"]["src_path"] = str(other)
+        self.assert_code([event, {"reason": "build-finished", "success": True}],
+                         "artifact_source_missing")
+
     def test_missing_executable_fails(self):
         event = self.event()
         event["executable"] = None

@@ -156,7 +156,12 @@ def capture(source_root, expected_commit, *, expected_tree=None, environ=None):
         bound_digest = summary["digest"]
     except (KeyError, TypeError):
         raise RunnerError("source", "source_capture_failed") from None
-    rows = _hash_rows(root)
+    try:
+        rows = _hash_rows(root)
+    except RunnerError:
+        raise
+    except (OSError, ValueError, TypeError):
+        raise RunnerError("source", "source_capture_failed") from None
     schema = next(
         (row["sha256"] for row in rows if row["path"] == SCHEMA_REL), None
     )

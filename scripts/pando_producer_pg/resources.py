@@ -253,9 +253,21 @@ class OwnedFixture:
                 failure = "postgres_create_outcome_unknown"
                 facts["postgres_dropped"] = False
                 facts["database_absent"] = False
-            else:
+            elif outcome == "not_attempted" and (
+                self.postgres.major is None or self.postgres.prechecked_absent
+            ):
+                # No CREATE was issued by this process, so no owned database
+                # exists.  A failed preflight that found a foreign database is
+                # handled by the final branch and never treated as ours.
                 facts["postgres_dropped"] = True
                 facts["database_absent"] = True
+            else:
+                # CREATE was attempted without an ownership acknowledgment
+                # (rejected/raced), or the absence preflight found a foreign
+                # database.  Absence is unresolved and no DROP is authorized.
+                failure = "postgres_create_outcome_unknown" if outcome == "unknown" else "cleanup_unresolved"
+                facts["postgres_dropped"] = False
+                facts["database_absent"] = False
         if self.root is not None:
             facts["root_owned"] = bool(self.root.created)
             facts["root_created"] = bool(self.root.created)
@@ -278,6 +290,5 @@ class OwnedFixture:
             and facts["root_absent"]
             and failure is None
         )
-        if self.clock() > deadline and not facts["cleanup_ok"]:
-            facts["cleanup_within_deadline"] = False
+        facts["cleanup_within_deadline"] = self.clock() <= deadline
         return facts
