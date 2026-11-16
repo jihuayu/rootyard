@@ -64,6 +64,7 @@ UNSAFE_ENV = "ROOTYARD_WORKSPACE_UNSAFE_REMOTE_DELETE"
 KILL_ENV = "ROOTYARD_WORKSPACE_REMOTE_KILL_AFTER_OBJECTS"
 ORPHAN_NAME = "!orphan.bin"
 PENDING_FUSE_MODE = "fuse-helper"
+EARLY_WRITER_READY_SECONDS = 5.0
 REQUIRED_CASES = (
     "invalid_optin_rejected_at_startup",
     "default_retains_failed_remote_cleanup",
@@ -349,6 +350,10 @@ class PolicyHarness(Harness):
         proxy = CountingProxy(parsed.hostname, backend_port)
         proxy.start()
         harness = PolicyHarness(self.args)
+        # The remote writer is observed through the API process's own user
+        # namespace.  Keep the binary real and isolate only this case's API
+        # process (and its restart) in a private user+mount namespace.
+        harness.server_prefix = ["unshare", "-Urm", "--propagation", "private"]
         harness.env["ROOTYARD_OBJECT_STORE_ENDPOINT"] = f"http://127.0.0.1:{proxy.port}"
         harness.env.pop(UNSAFE_ENV, None)
         harness.env["ROOTYARD_WORKSPACE_MOUNT_MODE"] = PENDING_FUSE_MODE
@@ -431,6 +436,10 @@ class PolicyHarness(Harness):
             assert api_identity is not None, "production API identity is unavailable"
             assert api_identity["starttime"] > 0
             api_pidfd = support.open_pidfd(api_pid)
+            api_user_ns = os.stat(f"/proc/{api_pid}/ns/user").st_ino
+            self_user_ns = os.stat("/proc/self/ns/user").st_ino
+            assert api_user_ns != self_user_ns, (
+                "remote publisher API did not enter an isolated user namespace")
 
             mountpoint = Path(self.root) / "data/workspace-service/mounts" / wid
             mount = support.wait_for_fuse_mount(api_pid, mountpoint)
@@ -460,6 +469,34 @@ class PolicyHarness(Harness):
             assert writer_identity is not None, "pending writer identity is unavailable"
             assert writer_identity["starttime"] > 0
             writer_pidfd = support.open_pidfd(writer.pid)
+
+            readiness_deadline = time.monotonic() + EARLY_WRITER_READY_SECONDS
+            while True:
+                status = support.writer_status(writer_status) or {}
+                phase = status.get("phase")
+                if phase not in ("ready", "writing", "error", "setup_error"):
+                    phase = "unknown"
+                errno_value = status.get("errno")
+                if not isinstance(errno_value, int) or isinstance(errno_value, bool) or not 0 <= errno_value <= 4095:
+                    errno_value = None
+                attempts = status.get("attempts")
+                if not isinstance(attempts, int) or isinstance(attempts, bool) or not 0 <= attempts <= 1000000000:
+                    attempts = None
+                writes = status.get("writes")
+                if not isinstance(writes, int) or isinstance(writes, bool) or not 0 <= writes <= 1000000000:
+                    writes = None
+                writer_exited = writer.poll() is not None
+                if writer_exited or phase in ("setup_error", "error"):
+                    raise AssertionError(
+                        "pending writer could not reach capture-gate readiness: "
+                        f"phase={phase} errno={errno_value} attempts={attempts} writes={writes}")
+                if phase == "writing" and gate_target.exists():
+                    break
+                if time.monotonic() >= readiness_deadline:
+                    raise AssertionError(
+                        "pending writer did not reach writing+target readiness: "
+                        f"phase={phase} errno={errno_value} attempts={attempts} writes={writes}")
+                time.sleep(0.05)
 
             hit = gate.with_suffix(".hit")
             wait_capture_gate(hit, timeout=30)
