@@ -3,7 +3,6 @@
 from pathlib import Path
 import re
 import unittest
-import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,9 +98,12 @@ class NamespaceOnlineContractsTest(unittest.TestCase):
         self.assertTrue(wf_path.is_file())
         wf_raw = wf_path.read_bytes()
         self.assertNotIn(b"\r\n", wf_raw, "Workflow file must use LF line endings")
-        wf = yaml.safe_load(wf_raw.decode("utf-8"))
-        self.assertIn("jobs", wf)
+        self.assertNotIn(b"\t", wf_raw, "Workflow YAML must not contain literal tabs")
         job_text = wf_raw.decode("utf-8")
+        lines = job_text.splitlines()
+        self.assertTrue(any(line == "jobs:" for line in lines), "Workflow missing top-level jobs:")
+        self.assertTrue(any(line == "  namespace-online:" for line in lines), "Workflow missing namespace-online job")
+        self.assertIn("runs-on: ubuntu-22.04", job_text)
         self.assertIn("rootyard-view-lab", job_text)
         self.assertIn("tests.test_namespace_service", job_text)
         self.assertIn("tests/namespace_online_workflows.py", job_text)

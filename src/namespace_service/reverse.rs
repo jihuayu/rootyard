@@ -219,7 +219,7 @@ pub async fn create(
         .query_opt("SELECT storage_generation FROM repositories WHERE id=$1 AND state='ready'", &[&access.repo_id])
         .await
         .map_err(Error::internal)?
-        .ok_or_else(|| Error(StatusCode::CONFLICT, "repository is not ready"))?
+        .ok_or(Error(StatusCode::CONFLICT, "repository is not ready"))?
         .get(0);
     auth::finish_tx(tx, &actor, true).await?;
     drop(client);
