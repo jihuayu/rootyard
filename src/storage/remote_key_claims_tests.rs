@@ -159,7 +159,9 @@ fn valid_claim_target_and_default_lease_invariants() {
     assert!(valid_claim_target("pando", &ok).is_err());
     assert!(valid_claim_target("lfs", "short").is_err());
     assert!(valid_claim_target("lfs", &"A".repeat(64)).is_err());
-    assert!(DEFAULT_DELETE_CLAIM_LEASE_SECS >= 60);
+    const {
+        assert!(DEFAULT_DELETE_CLAIM_LEASE_SECS >= 60);
+    }
 }
 
 #[tokio::test]
