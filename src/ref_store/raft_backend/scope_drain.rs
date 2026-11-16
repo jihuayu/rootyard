@@ -179,7 +179,7 @@ mod tests {
         let early = CommittedScopeDrain::new(drain, Some(8), 6, required.clone());
         assert!(matches!(
             early.into_linearizable_scope_probe(&required),
-            Err(RaftBackendError::ScopeDrainBindingMismatch("close requirement"))
+            Err(RaftBackendError::ScopeDrainBindingMismatch("applied coordinate"))
         ));
     }
 }
