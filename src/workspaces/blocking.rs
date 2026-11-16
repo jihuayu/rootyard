@@ -87,6 +87,10 @@ fn put_slots() -> &'static Arc<Semaphore> {
 /// Reserve one disconnect-safe `files::put` job admission slot before spawning
 /// into the owned workspace job registry.
 pub(super) fn try_put_slot() -> Result<OwnedSemaphorePermit, Error> {
+    // PUT and Git share the one shutdown admission state. Check before taking
+    // the PUT capacity permit; a job that already owns its permit remains owned
+    // and is drained by the existing JoinSet path.
+    super::git::ensure_admission_open()?;
     put_slots()
         .clone()
         .try_acquire_owned()
