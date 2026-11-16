@@ -746,6 +746,10 @@ pub async fn rotate_kms_key_with_options(
     repo: Uuid,
     opts: &KmsRotateOptions,
 ) -> Result<KmsRotationReport> {
+    ensure!(
+        !object_store::remote_enabled(),
+        "S3 remote rotation is not implemented; refusing unsupported remote-rotation mode"
+    );
     let session = super::publication::runner_session(config, repo).await?;
     session.acquire_publication_exclusive(repo).await?;
     let c = session.client();

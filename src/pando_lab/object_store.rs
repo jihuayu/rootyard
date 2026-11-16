@@ -143,7 +143,7 @@ pub struct ObjectStoreStatusReport {
 pub fn default_bucket() -> String {
     std::env::var("PANDO_OBJECT_STORE_BUCKET").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| DEFAULT_BUCKET.to_owned())
 }
-fn remote_enabled() -> bool { std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_some() }
+pub(crate) fn remote_enabled() -> bool { std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_some() }
 
 pub(super) fn store_root(config: &Config) -> PathBuf {
     std::env::var("PANDO_OBJECT_STORE_ROOT").ok().filter(|s| !s.trim().is_empty()).map(PathBuf::from).unwrap_or_else(|| config.root.clone())
