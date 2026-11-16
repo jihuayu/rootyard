@@ -103,7 +103,15 @@ fn select_current_checkpoint(
     if let Some(cp) = active.into_iter().next() {
         return Ok(Some(cp.clone()));
     }
-    let completed: Vec<_> = parsed.iter().filter(|cp| cp.state == "COMPLETED").collect();
+    // Legacy Local completion rows predate write_epoch and all decode at epoch 0.
+    // They never declared a DB write pin; ignore them for positive-epoch selection
+    // and fall back to the existing Local policy file authority when no positive
+    // epoch exists. A single IN_PROGRESS legacy Local checkpoint above is still
+    // resumable; multiple IN_PROGRESS rows remain ambiguous and fail closed.
+    let completed: Vec<_> = parsed
+        .iter()
+        .filter(|cp| cp.state == "COMPLETED" && cp.write_epoch > 0)
+        .collect();
     let Some(max_epoch) = completed.iter().map(|cp| cp.write_epoch).max() else {
         return Ok(None);
     };
@@ -304,6 +312,78 @@ mod tests {
             target_contract: contract.to_owned(),
             write_epoch: epoch,
         }
+    }
+
+    fn local_checkpoint(state: &str, epoch: u64, target: i32) -> KmsRotationCheckpoint {
+        KmsRotationCheckpoint {
+            rotation_id: Uuid::new_v4(),
+            repo: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            from_key_id: "kms-local-a".to_owned(),
+            from_key_version: 1,
+            to_key_id: "kms-local-b".to_owned(),
+            to_key_version: target,
+            state: state.to_owned(),
+            revoke_previous: false,
+            target_pack_ids: Vec::new(),
+            completed_pack_ids: Vec::new(),
+            failed_pack_id: None,
+            from_provider_kind: super::super::provider::PROVIDER_KIND_LOCAL.to_owned(),
+            to_provider_kind: super::super::provider::PROVIDER_KIND_LOCAL.to_owned(),
+            expected_to_version: target,
+            external_rotate_issued: false,
+            reconcile_stage: super::super::rotation::KmsReconcileStage::NotIssued,
+            target_contract: String::new(),
+            write_epoch: epoch,
+        }
+    }
+
+    #[test]
+    fn legacy_local_completed_epoch_zero_has_no_db_write_pin() {
+        let repo = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let zero = local_checkpoint("COMPLETED", 0, 2);
+        assert!(select_current_checkpoint(
+            vec![("COMPLETED".to_owned(), serde_json::to_value(&zero).unwrap())],
+            repo,
+        )
+        .unwrap()
+        .is_none());
+        let second = local_checkpoint("COMPLETED", 0, 3);
+        assert!(select_current_checkpoint(
+            vec![
+                ("COMPLETED".to_owned(), serde_json::to_value(&zero).unwrap()),
+                ("COMPLETED".to_owned(), serde_json::to_value(&second).unwrap()),
+            ],
+            repo,
+        )
+        .unwrap()
+        .is_none());
+        let active = local_checkpoint("IN_PROGRESS", 0, 4);
+        assert!(select_current_checkpoint(
+            vec![("IN_PROGRESS".to_owned(), serde_json::to_value(&active).unwrap())],
+            repo,
+        )
+        .unwrap()
+        .is_some());
+
+        let positive = local_checkpoint("COMPLETED", 1, 5);
+        let selected = select_current_checkpoint(
+            vec![
+                ("COMPLETED".to_owned(), serde_json::to_value(&zero).unwrap()),
+                ("COMPLETED".to_owned(), serde_json::to_value(&positive).unwrap()),
+            ],
+            repo,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.write_epoch, 1);
+        assert_eq!(selected.expected_version(), 5);
+
+        let vault_zero = checkpoint("COMPLETED", 0, 3, super::super::rotation::EXISTING_TARGET_CONTRACT);
+        assert!(select_current_checkpoint(
+            vec![("COMPLETED".to_owned(), serde_json::to_value(&vault_zero).unwrap())],
+            repo,
+        )
+        .is_err());
     }
 
     #[test]
