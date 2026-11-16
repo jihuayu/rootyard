@@ -223,7 +223,8 @@ async fn slow_delete_exceeding_lease_and_failed_delete_fail_closed_until_recover
         return;
     };
     let mock = Arc::new(MockDeleteS3::new());
-    let (store, server) = start_mock_s3(mock.clone()).await;
+    let (raw_store, server) = start_mock_s3(mock.clone()).await;
+    let store = Arc::new(raw_store);
     let dir = std::env::temp_dir().join(format!("ry-claim-s3-{}", Uuid::new_v4()));
     tokio::fs::create_dir_all(&dir).await.unwrap();
     let c = pool.get().await.unwrap();
@@ -249,14 +250,16 @@ async fn slow_delete_exceeding_lease_and_failed_delete_fail_closed_until_recover
     mock.gate_first_delete.store(true, Ordering::SeqCst);
     let entered = mock.first_delete_entered.notified();
     let pool_a = pool.clone();
-    let store_a = store.clone();
+    let store_a = Arc::clone(&store);
     let claim_a = claim.clone();
     let deleter = tokio::spawn(async move {
-        execute_locked_claimed_delete(&pool_a, &store_a, &claim_a, Instant::now() + Duration::from_secs(15)).await
+        execute_locked_claimed_delete(&pool_a, store_a.as_ref(), &claim_a, Instant::now() + Duration::from_secs(15))
+            .await
     });
     entered.await;
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    let publish_err = wait_or_clear_delete_claim(&pool, Some(&store), tenant, "lfs", &oid, deadline).await.unwrap_err();
+    let publish_err =
+        wait_or_clear_delete_claim(&pool, Some(store.as_ref()), tenant, "lfs", &oid, deadline).await.unwrap_err();
     assert_eq!(publish_err.0, StatusCode::SERVICE_UNAVAILABLE);
 
     let mut lock_probe = pool.get().await.unwrap();
@@ -268,7 +271,7 @@ async fn slow_delete_exceeding_lease_and_failed_delete_fail_closed_until_recover
     mock.release_first_delete.notify_one();
     deleter.await.unwrap().unwrap();
     assert!(store.head(&key, deadline).await.unwrap().is_none());
-    wait_or_clear_delete_claim(&pool, Some(&store), tenant, "lfs", &oid, deadline).await.unwrap();
+    wait_or_clear_delete_claim(&pool, Some(store.as_ref()), tenant, "lfs", &oid, deadline).await.unwrap();
 
     // 2. Failed DELETE leaves delete_uncertain=true -> 503 even after lease expiry until recovery confirms head().is_none().
     store.put_file(&key, &file_path, payload.len() as u64, deadline).await.unwrap();
@@ -278,7 +281,7 @@ async fn slow_delete_exceeding_lease_and_failed_delete_fail_closed_until_recover
     tx2.commit().await.unwrap();
 
     mock.fail_deletes_500.store(true, Ordering::SeqCst);
-    assert!(execute_locked_claimed_delete(&pool, &store, &claim2, deadline).await.is_err());
+    assert!(execute_locked_claimed_delete(&pool, store.as_ref(), &claim2, deadline).await.is_err());
 
     c.execute(
         "UPDATE remote_object_delete_claims SET lease_until = clock_timestamp() - interval '10 seconds' \
@@ -288,7 +291,7 @@ async fn slow_delete_exceeding_lease_and_failed_delete_fail_closed_until_recover
     .await
     .unwrap();
     let uncertain_err =
-        wait_or_clear_delete_claim(&pool, Some(&store), tenant, "lfs", &oid, deadline).await.unwrap_err();
+        wait_or_clear_delete_claim(&pool, Some(store.as_ref()), tenant, "lfs", &oid, deadline).await.unwrap_err();
     assert_eq!(uncertain_err.0, StatusCode::SERVICE_UNAVAILABLE);
 
     let mut c_chk = pool.get().await.unwrap();
@@ -296,15 +299,15 @@ async fn slow_delete_exceeding_lease_and_failed_delete_fail_closed_until_recover
     assert!(has_active_delete_claim(&tx_chk, tenant, "lfs", &oid).await.unwrap());
     tx_chk.commit().await.unwrap();
 
-    assert!(sweep_expired_claims_with_stores(&pool, Some(&store), None, deadline).await.is_err());
+    assert!(sweep_expired_claims_with_stores(&pool, Some(store.as_ref()), None, deadline).await.is_err());
     mock.fail_deletes_500.store(false, Ordering::SeqCst);
     mock.keep_object_on_delete.store(true, Ordering::SeqCst);
-    assert!(sweep_expired_claims_with_stores(&pool, Some(&store), None, deadline).await.is_err());
+    assert!(sweep_expired_claims_with_stores(&pool, Some(store.as_ref()), None, deadline).await.is_err());
 
     mock.keep_object_on_delete.store(false, Ordering::SeqCst);
-    let recovered = sweep_expired_claims_with_stores(&pool, Some(&store), None, deadline).await.unwrap();
+    let recovered = sweep_expired_claims_with_stores(&pool, Some(store.as_ref()), None, deadline).await.unwrap();
     assert_eq!(recovered, 1);
-    wait_or_clear_delete_claim(&pool, Some(&store), tenant, "lfs", &oid, deadline).await.unwrap();
+    wait_or_clear_delete_claim(&pool, Some(store.as_ref()), tenant, "lfs", &oid, deadline).await.unwrap();
     store.put_file(&key, &file_path, payload.len() as u64, deadline).await.unwrap();
     assert!(store.head(&key, deadline).await.unwrap().is_some());
 
