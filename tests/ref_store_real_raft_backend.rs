@@ -804,7 +804,10 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let view_a = backend.read_committed_view().await?;
     assert_eq!(view_a.read_ref("refs/heads/main").as_deref(), Some(expected_oid.as_str()));
     assert!(view_a.read_ref("refs/heads/b-only").is_none());
-    assert!(matches!(backend_b.propose(commit.clone()).await, Err(RaftBackendError::ScopeMismatch("repository_id"))));
+    assert!(matches!(
+        backend_b.propose(commit.clone()).await,
+        Err(RaftBackendError::ProposalScopeMismatch("command does not match proposal identity"))
+    ));
 
     // Live realm/gate axes that are not covered by the old static binding: object format,
     // tenant, and a missing repository gate all fail before a view can be minted. These reads
