@@ -20,13 +20,16 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import stat
 import tempfile
+import threading
 import time
 import unittest
 
 from tests import fuse_helper_native_support as support
+from tests import workspace_normal_shutdown_support as normal_shutdown
 from tests.e2e import Harness
 from tests.runtime_binary import select_runtime_binary
 from tests.workspace_capture_acceptance import install_capture_read_gate, wait_capture_gate
@@ -65,6 +68,16 @@ def signal_pidfd(fd, sig):
     if sender is None:
         raise AssertionError("pidfd_send_signal is unavailable")
     sender(fd, sig)
+
+
+# The normal-shutdown case keeps the pre-existing five-second service exit
+# bound used by the original SIGKILL case.  A helper-backend proof is required
+# by the C3 matrix, but legacy in-process discovery must not present this as a
+# helper run, so the method is gated by the import-time selector.
+NORMAL_SIGTERM_BUDGET = 5.0
+HELPER_NORMAL_SIGTERM = unittest.skipUnless(
+    MOUNT_MODE == HELPER_BACKEND,
+    "helper-backend normal SIGTERM proof requires ROOTYARD_TEST_FUSE_BACKEND=fuse-helper")
 
 
 class WorkspaceFuseServiceTest(unittest.TestCase):
@@ -645,6 +658,542 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                         f"{label}: {type(error).__name__}"
                         for label, error in cleanup_failures)
                     note = "remount teardown failed: " + detail
+                    if original_failure is not None:
+                        original_failure.add_note(note)
+                    else:
+                        raise AssertionError(note)
+
+    @HELPER_NORMAL_SIGTERM
+    def test_normal_sigterm_helper_unmount_precedes_parked_git_join(self):
+        """Normal SIGTERM releases a parked real FUSE writer before Git join.
+
+        The production capture freeze is held through its ordinary raw-snapshot
+        read (a test-owned FIFO at the writer workspace's upper ``.git/index``),
+        not the 15s LD_PRELOAD capture gate.  A real HTTP workspace Git mutation
+        runs real Git through a small test-only ``ROOTYARD_GIT`` wrapper that
+        holds the completed child at an owned marker.  The Git mutation uses a
+        second mounted workspace owned by the same API/helper: the production
+        per-workspace mutation/scan gate serializes a capture freeze and a
+        same-workspace Git body, so the held Git job runs on its own mount while
+        the writer remains in the real kernel wait at the first mount.  Helper
+        teardown owns every mount, so the held wrapper still proves that helper
+        teardown precedes the Git join.  A raw partial-body PUT is already
+        accepted but cannot reach PUT admission until shutdown closes it.
+        """
+        binary, _ = select_runtime_binary()
+        self.assertTrue(binary.is_file())
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git, "real Git is unavailable")
+        with tempfile.TemporaryDirectory(prefix="rootyard-userns-wrapper-") as wrapper_dir:
+            wrapper = Path(wrapper_dir) / "rootyard-userns"
+            wrapper.write_text(
+                f"#!/bin/sh\nexec unshare -Urm {shlex.quote(str(binary))} \"$@\"\n")
+            wrapper.chmod(0o700)
+            h = Harness(argparse.Namespace(binary=str(wrapper), keep=False))
+            marker = h.root / "normal-sigterm-git"
+            h.env["ROOTYARD_WORKSPACE_MOUNT_MODE"] = HELPER_BACKEND
+            h.env["ROOTYARD_SANDBOX_MODE"] = "dev"
+            for name in ("LD_PRELOAD", "ROOTYARD_TEST_CAPTURE_GATE",
+                         "ROOTYARD_TEST_CAPTURE_TARGET"):
+                h.env.pop(name, None)
+            git_wrapper = normal_shutdown.install_git_wrapper(h.root, real_git, marker)
+            h.env["ROOTYARD_GIT"] = str(git_wrapper)
+
+            fifo = None
+            writer = None
+            writer_pidfd = None
+            holders = []
+            holder_identities = []
+            put = None
+            git_thread = None
+            git_wrapper_pid = None
+            git_wrapper_starttime = None
+            helper_pid = None
+            helper_identity = None
+            helper_pidfd = None
+            api_pidfd = None
+            original_failure = None
+            mount_cleanup_proven = True
+            try:
+                h.setup()
+                api_pid = h.proc.pid
+                self.assertEqual(os.getpgid(api_pid), api_pid,
+                                 "production API is not the owned process-group leader")
+                api_identity = support.process_identity(api_pid)
+                self.assertIsNotNone(api_identity, "production API identity is unavailable")
+                self.assertGreater(api_identity["starttime"], 0)
+                api_pidfd = support.open_pidfd(api_pid)
+                h.api()
+                h.roundtrip()
+
+                def create_workspace(agent_id, key):
+                    return json.loads(h.expect(
+                        "/api/workspaces", 201, token=h.alice, method="POST",
+                        body={"owner": "alice", "repository": "demo",
+                              "agent_id": agent_id, "base_oid": h.second},
+                        extra_headers={"Idempotency-Key": key}))
+
+                def workspace_state(wid):
+                    return json.loads(h.expect(
+                        f"/api/workspaces/{wid}", 200, token=h.alice))
+
+                def checkpoint(wid, key):
+                    current = workspace_state(wid)
+                    saved = json.loads(h.expect(
+                        f"/api/workspaces/{wid}/checkpoints", 201,
+                        token=h.alice, method="POST",
+                        body={"expected_workspace_revision": current["revision"],
+                              "lease_epoch": current["lease_epoch"]},
+                        extra_headers={"Idempotency-Key": key}))
+                    self.assertEqual(saved["state"], "local_complete")
+                    return saved
+
+                def mount_info(wid):
+                    mountpoint = h.root / "data/workspace-service/mounts" / wid
+                    row = support.wait_for_fuse_mount(api_pid, mountpoint)
+                    mount_id = int(row["mount_id"])
+                    self.assertGreater(mount_id, 0)
+                    return mountpoint, mount_id
+
+                def keep_namespace(mountpoint, mount_id):
+                    holder = support.spawn_api_namespace_holder(api_pid)
+                    holders.append(holder)
+                    identity = support.process_identity(holder.pid)
+                    self.assertIsNotNone(identity, "API namespace holder identity is unavailable")
+                    visible = support.wait_for_fuse_mount(holder.pid, mountpoint, timeout=5)
+                    self.assertEqual(int(visible["mount_id"]), mount_id,
+                                     "holder namespace does not see the exact API mount")
+                    holder_identities.append(identity)
+                    return holder
+
+                writer_ws = create_workspace("normal-sigterm-writer",
+                                             "normal-sigterm-writer-create")
+                mount_cleanup_proven = False
+                writer_id = writer_ws["id"]
+                writer_mount, writer_mount_id = mount_info(writer_id)
+                writer_upper = h.root / "data/workspace-service/uppers" / writer_id
+                writer_checkpoint = checkpoint(writer_id,
+                                               "normal-sigterm-writer-checkpoint")
+                writer_checkpoint_id = writer_checkpoint["checkpoint_id"]
+                writer_checkpoint_dir = (
+                    h.root / "data/workspace-service/checkpoints" / writer_checkpoint_id)
+                writer_checkpoint_bytes = (writer_checkpoint_dir / "hello.txt").read_bytes()
+                self.assertEqual(writer_checkpoint_bytes, b"second\n")
+                writer_holder = keep_namespace(writer_mount, writer_mount_id)
+
+                git_ws = create_workspace("normal-sigterm-git",
+                                          "normal-sigterm-git-create")
+                git_id = git_ws["id"]
+                git_mount, git_mount_id = mount_info(git_id)
+                git_upper = h.root / "data/workspace-service/uppers" / git_id
+                git_lower = h.root / "data/workspace-service/workspaces" / git_id
+                git_checkpoint = checkpoint(git_id, "normal-sigterm-git-checkpoint")
+                git_checkpoint_id = git_checkpoint["checkpoint_id"]
+                git_checkpoint_dir = (
+                    h.root / "data/workspace-service/checkpoints" / git_checkpoint_id)
+                git_checkpoint_bytes = (git_checkpoint_dir / "hello.txt").read_bytes()
+                self.assertEqual(git_checkpoint_bytes, b"second\n")
+                git_state = workspace_state(git_id)
+                parked_body = {"content_base64": base64.b64encode(b"parked\n").decode(),
+                               "expected_entry_version": 0,
+                               "expected_workspace_revision": git_state["revision"],
+                               "lease_epoch": git_state["lease_epoch"]}
+                h.expect(f"/api/workspaces/{git_id}/files?path=parked.bin", 200,
+                         token=h.alice, method="PUT", body=parked_body,
+                         extra_headers={"Idempotency-Key": "normal-sigterm-parked"})
+                git_state = workspace_state(git_id)
+                self.assertEqual((git_mount / "parked.bin").read_bytes(), b"parked\n")
+                git_holder = keep_namespace(git_mount, git_mount_id)
+
+                put_ws = create_workspace("normal-sigterm-put",
+                                          "normal-sigterm-put-create")
+                put_id = put_ws["id"]
+                put_mount, put_mount_id = mount_info(put_id)
+                put_upper = h.root / "data/workspace-service/uppers" / put_id
+                put_lower = h.root / "data/workspace-service/workspaces" / put_id
+                put_checkpoint = checkpoint(put_id, "normal-sigterm-put-checkpoint")
+                put_checkpoint_id = put_checkpoint["checkpoint_id"]
+                put_checkpoint_dir = (
+                    h.root / "data/workspace-service/checkpoints" / put_checkpoint_id)
+                put_checkpoint_bytes = (put_checkpoint_dir / "hello.txt").read_bytes()
+                self.assertEqual(put_checkpoint_bytes, b"second\n")
+                put_state = workspace_state(put_id)
+                put_revision_before = put_state["revision"]
+                put_generation_before = put_state["git_generation"]
+                put_target = put_mount / "normal-sigterm-put.txt"
+                self.assertFalse(put_target.exists())
+
+                writer_checkpoints_before = int(h.sql(
+                    "SELECT count(*) FROM workspace_checkpoints "
+                    f"WHERE workspace_id='{writer_id}'"))
+                git_checkpoints_before = int(h.sql(
+                    "SELECT count(*) FROM workspace_checkpoints "
+                    f"WHERE workspace_id='{git_id}'"))
+                put_checkpoints_before = int(h.sql(
+                    "SELECT count(*) FROM workspace_checkpoints "
+                    f"WHERE workspace_id='{put_id}'"))
+                put_events_before = int(h.sql(
+                    "SELECT count(*) FROM workspace_events "
+                    f"WHERE workspace_id='{put_id}' AND kind='file_put'"))
+                put_operations_before = int(h.sql(
+                    "SELECT count(*) FROM workspace_operations "
+                    f"WHERE workspace_id='{put_id}' AND kind='file_put'"))
+
+                helper_pid = support.find_api_helper_pid(api_pid)
+                helper_identity = support.process_identity(helper_pid)
+                self.assertIsNotNone(helper_identity, "FUSE helper identity is unavailable")
+                self.assertEqual(helper_identity["pgid"], helper_pid,
+                                 "FUSE helper is not in its own owned process group")
+                self.assertGreater(helper_identity["starttime"], api_identity["starttime"])
+                helper_pidfd = confirmed_pidfd(helper_pid, helper_identity)
+
+                writer_script = h.root / "normal-sigterm-writer.py"
+                writer_script.write_text(support.PENDING_WRITER_SCRIPT, encoding="utf-8")
+                writer_status = h.root / "normal-sigterm-writer.json"
+                writer = support.spawn_api_namespace_writer(
+                    api_pid, writer_script, writer_mount, writer_status)
+                writer_identity = support.process_identity(writer.pid)
+                self.assertIsNotNone(writer_identity, "pending writer identity is unavailable")
+                self.assertGreater(writer_identity["starttime"], 0)
+                writer_pidfd = support.open_pidfd(writer.pid)
+                normal_shutdown.wait_for_writer_writing(writer, writer_status, timeout=10)
+
+                # The production capture scanner enters with_frozen before its
+                # raw snapshot.  A real FIFO at upper .git/index makes that
+                # ordinary read wait, so the actual helper gate stays Frozen
+                # and the next real FUSE write is parked in the kernel.
+                fifo = normal_shutdown.RawFifoGate(writer_upper / ".git/index")
+                fifo.install()
+                kernel_wait = support.wait_for_kernel_wait(
+                    writer.pid, writer_mount, writer_status, timeout=15)
+                self.assertEqual(kernel_wait["attempts"], kernel_wait["writes"] + 1)
+                self.assertTrue(kernel_wait["kernel_wchan"] or kernel_wait["inflight_fd"],
+                                "writer did not expose a real kernel FUSE wait")
+
+                normal_shutdown.clear_git_markers(marker)
+                Path(str(marker) + ".trigger").touch()
+                git_state = workspace_state(git_id)
+                git_revision_before = git_state["revision"]
+                git_generation_before = git_state["git_generation"]
+                git_events_before = int(h.sql(
+                    "SELECT count(*) FROM workspace_events "
+                    f"WHERE workspace_id='{git_id}' AND kind='git'"))
+                git_operations_before = int(h.sql(
+                    "SELECT count(*) FROM workspace_operations "
+                    f"WHERE workspace_id='{git_id}' AND kind='git'"))
+                git_request = {"action": "add", "paths": ["parked.bin"],
+                               "expected_git_generation": git_generation_before,
+                               "expected_workspace_revision": git_revision_before,
+                               "lease_epoch": git_state["lease_epoch"]}
+                git_result = {}
+
+                def run_git_request():
+                    try:
+                        status, raw, _ = h.http(
+                            f"/api/workspaces/{git_id}/git", token=h.alice,
+                            method="POST", body=git_request,
+                            extra_headers={"Idempotency-Key": "normal-sigterm-git-add"})
+                        git_result["status"] = status
+                        git_result["raw"] = raw
+                    except BaseException as error:
+                        git_result["error_type"] = type(error).__name__
+
+                git_thread = threading.Thread(
+                    target=run_git_request, name="normal-sigterm-git", daemon=False)
+                git_thread.start()
+                git_hold = normal_shutdown.wait_for_git_hold(marker, timeout=10)
+                self.assertEqual(git_hold["exit"], 0,
+                                 "real Git add did not exit successfully")
+                git_wrapper_pid = git_hold["pid"]
+                git_wrapper_starttime = git_hold["starttime"]
+                self.assertGreater(git_wrapper_starttime, 0)
+                self.assertFalse(Path(str(marker) + ".release").exists(),
+                                 "Git wrapper was released before SIGTERM")
+                self.assertTrue(normal_shutdown.git_hold_active(marker))
+
+                put_body = json.dumps({
+                    "content_base64": base64.b64encode(b"put-after-shutdown\n").decode(),
+                    "expected_entry_version": 0,
+                    "expected_workspace_revision": put_revision_before,
+                    "lease_epoch": put_state["lease_epoch"],
+                }, separators=(",", ":")).encode()
+                put = normal_shutdown.PartialPut(
+                    "127.0.0.1", h.port,
+                    f"/api/workspaces/{put_id}/files?path=normal-sigterm-put.txt",
+                    h.alice["token"], put_body)
+                put.start()
+                put.wait_accepted(api_pid, timeout=5)
+                self.assertFalse(put_target.exists())
+
+                self.assertEqual(os.getpgid(api_pid), api_pid,
+                                 "production API is not the owned process-group leader")
+                deadline = time.monotonic() + NORMAL_SIGTERM_BUDGET
+
+                def remaining():
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise AssertionError(
+                            "normal SIGTERM five-second service budget exhausted")
+                    return left
+
+                os.killpg(api_pid, signal.SIGTERM)
+                # Capture drain precedes helper teardown.  Release only the
+                # real raw-snapshot FIFO so the producer can observe stop; the
+                # exact mount/helper proof below remains separate.
+                fifo.release()
+
+                self.assertTrue(support.wait_for_mount_id_gone(
+                    writer_holder.pid, writer_mount, writer_mount_id, remaining()),
+                    "exact writer mount remained after normal SIGTERM")
+                self.assertTrue(support.wait_for_mount_id_gone(
+                    git_holder.pid, git_mount, git_mount_id, remaining()),
+                    "exact Git workspace mount remained after normal SIGTERM")
+                self.assertTrue(support.wait_for_mount_id_gone(
+                    api_pid, put_mount, put_mount_id, remaining()),
+                    "exact PUT workspace mount remained after normal SIGTERM")
+                for holder, identity, mountpoint, label in (
+                        (writer_holder, holder_identities[0], writer_mount, "writer"),
+                        (git_holder, holder_identities[1], git_mount, "git")):
+                    current = support.process_identity(holder.pid)
+                    self.assertIsNotNone(current, f"{label} holder exited before proof")
+                    self.assertEqual(current["starttime"], identity["starttime"],
+                                     f"{label} holder identity changed before proof")
+                    remaining_rows = [
+                        row for row in support.read_process_mountinfo(holder.pid)
+                        if row["mountpoint"] == str(mountpoint)
+                    ]
+                    self.assertEqual(remaining_rows, [],
+                                     f"{label} mount was replaced after normal SIGTERM")
+                mount_cleanup_proven = True
+
+                self.assertTrue(support.wait_pid_gone(helper_pid, remaining()),
+                                "production FUSE helper did not exit on normal SIGTERM")
+                self.assertIsNone(h.proc.poll(),
+                                  "API exited before the held Git wrapper was released")
+                self.assertTrue(normal_shutdown.git_hold_active(marker),
+                                "Git wrapper was not still held when helper/mount proof completed")
+
+                writer_exit = support.wait_process_exit(writer, timeout=remaining())
+                self.assertEqual(writer_exit, 23,
+                                 f"pending writer exit {writer_exit}, expected errno failure")
+                writer_final = support.writer_status(writer_status)
+                self.assertIsNotNone(writer_final, "pending writer wrote no safe error status")
+                self.assertEqual(writer_final["phase"], "error")
+                self.assertIn(writer_final["errno"],
+                              (errno.EIO, errno.ENOTCONN, errno.EROFS,
+                               errno.ECONNABORTED, errno.ENOENT),
+                              f"pending writer error {writer_final['errno']} is not an I/O/fence error")
+                self.assertGreaterEqual(writer_final["writes"], kernel_wait["writes"])
+                self.assertGreaterEqual(writer_final["attempts"], kernel_wait["attempts"])
+
+                put_outcome = put.finish(remaining())
+                put = None
+                if put_outcome["status"] is None:
+                    self.assertTrue(put_outcome["closed"],
+                                    "partial PUT ended without a status or close")
+                else:
+                    self.assertEqual(put_outcome["status"], 503,
+                                     "post-close PUT admission did not reject with 503")
+                self.assertFalse(put_target.exists())
+                self.assertFalse((put_upper / "normal-sigterm-put.txt").exists())
+                self.assertFalse((put_lower / "normal-sigterm-put.txt").exists())
+
+                normal_shutdown.release_git_hold(marker)
+                git_thread.join(timeout=remaining())
+                self.assertFalse(git_thread.is_alive(),
+                                 "Git HTTP request did not resolve after wrapper release")
+                api_exit = support.wait_process_exit(h.proc, timeout=remaining())
+                self.assertEqual(api_exit, 0,
+                                 f"normal service shutdown exit {api_exit}, expected 0")
+
+                reap_deadline = time.monotonic() + min(remaining(), 1.0)
+                while (time.monotonic() < reap_deadline
+                       and support.process_identity(helper_pid) is not None):
+                    time.sleep(0.02)
+                self.assertIsNone(support.process_identity(helper_pid),
+                                  "helper PID was not fully reaped after API exit")
+
+                self.assertEqual(int(h.sql(
+                    f"SELECT revision FROM workspaces WHERE id='{put_id}'")),
+                    put_revision_before)
+                self.assertEqual(int(h.sql(
+                    f"SELECT git_generation FROM workspaces WHERE id='{put_id}'")),
+                    put_generation_before)
+                self.assertEqual(int(h.sql(
+                    "SELECT count(*) FROM workspace_events "
+                    f"WHERE workspace_id='{put_id}' AND kind='file_put'")),
+                    put_events_before)
+                self.assertEqual(int(h.sql(
+                    "SELECT count(*) FROM workspace_operations "
+                    f"WHERE workspace_id='{put_id}' AND kind='file_put'")),
+                    put_operations_before)
+
+                git_status = git_result.get("status")
+                if git_status == 200:
+                    committed = json.loads(git_result["raw"])
+                    self.assertEqual(committed["action"], "add")
+                    self.assertEqual(committed["workspace_revision"],
+                                     git_revision_before + 1)
+                    self.assertEqual(committed["git_generation"],
+                                     git_generation_before + 1)
+                    self.assertEqual(int(h.sql(
+                        f"SELECT revision FROM workspaces WHERE id='{git_id}'")),
+                        git_revision_before + 1)
+                    self.assertEqual(int(h.sql(
+                        f"SELECT git_generation FROM workspaces WHERE id='{git_id}'")),
+                        git_generation_before + 1)
+                    self.assertEqual(h.sql(
+                        "SELECT state FROM workspace_operations "
+                        f"WHERE workspace_id='{git_id}' "
+                        "AND idempotency_key='normal-sigterm-git-add'"),
+                        "committed")
+                    stored = json.loads(h.sql(
+                        "SELECT result::text FROM workspace_operations "
+                        f"WHERE workspace_id='{git_id}' "
+                        "AND idempotency_key='normal-sigterm-git-add'"))
+                    self.assertEqual(stored["workspace_revision"],
+                                     committed["workspace_revision"])
+                    self.assertEqual(stored["git_generation"],
+                                     committed["git_generation"])
+                    self.assertEqual(int(h.sql(
+                        "SELECT count(*) FROM workspace_events "
+                        f"WHERE workspace_id='{git_id}' AND kind='git'")),
+                        git_events_before + 1)
+                    self.assertEqual(int(h.sql(
+                        "SELECT count(*) FROM workspace_operations "
+                        f"WHERE workspace_id='{git_id}' AND kind='git'")),
+                        git_operations_before + 1)
+                    index_path = git_upper / ".git/index"
+                    self.assertTrue(index_path.is_file(),
+                                    "real Git did not persist an upper index")
+                    self.assertGreater(index_path.stat().st_size, 0)
+                    index_env = h.env.copy()
+                    index_env["GIT_INDEX_FILE"] = str(index_path)
+                    index_view = h.run(
+                        ["git", "--git-dir", str(git_lower / ".git"),
+                         "ls-files", "--stage", "--", "parked.bin"],
+                        check=False, env=index_env)
+                    self.assertEqual(index_view.returncode, 0)
+                    self.assertTrue(b"parked.bin" in index_view.stdout,
+                                    "real Git index does not contain parked.bin")
+                else:
+                    self.assertIn(git_status, (409, 500, 503, None),
+                                  "Git mutation returned an undeclared outcome")
+                    if git_status is None:
+                        self.assertIn("error_type", git_result)
+                    self.assertEqual(int(h.sql(
+                        f"SELECT revision FROM workspaces WHERE id='{git_id}'")),
+                        git_revision_before)
+                    self.assertEqual(int(h.sql(
+                        f"SELECT git_generation FROM workspaces WHERE id='{git_id}'")),
+                        git_generation_before)
+                    self.assertEqual(int(h.sql(
+                        "SELECT count(*) FROM workspace_events "
+                        f"WHERE workspace_id='{git_id}' AND kind='git'")),
+                        git_events_before)
+                    self.assertEqual(int(h.sql(
+                        "SELECT count(*) FROM workspace_operations "
+                        f"WHERE workspace_id='{git_id}' AND kind='git'")),
+                        git_operations_before)
+
+                self.assertEqual(int(h.sql(
+                    "SELECT count(*) FROM workspace_checkpoints "
+                    f"WHERE workspace_id='{writer_id}'")),
+                    writer_checkpoints_before)
+                self.assertEqual(int(h.sql(
+                    "SELECT count(*) FROM workspace_checkpoints "
+                    f"WHERE workspace_id='{git_id}'")),
+                    git_checkpoints_before)
+                self.assertEqual(int(h.sql(
+                    "SELECT count(*) FROM workspace_checkpoints "
+                    f"WHERE workspace_id='{put_id}'")),
+                    put_checkpoints_before)
+                for checkpoint_id, checkpoint_dir, expected in (
+                        (writer_checkpoint_id, writer_checkpoint_dir,
+                         writer_checkpoint_bytes),
+                        (git_checkpoint_id, git_checkpoint_dir,
+                         git_checkpoint_bytes),
+                        (put_checkpoint_id, put_checkpoint_dir,
+                         put_checkpoint_bytes)):
+                    self.assertEqual(h.sql(
+                        "SELECT state FROM workspace_checkpoints "
+                        f"WHERE id='{checkpoint_id}'"), "local_complete")
+                    self.assertEqual(
+                        (checkpoint_dir / "hello.txt").read_bytes(), expected)
+            except BaseException as error:
+                original_failure = error
+                raise
+            finally:
+                cleanup_failures = []
+
+                def attempt(label, function):
+                    try:
+                        function()
+                    except BaseException as error:
+                        cleanup_failures.append((label, error))
+
+                if fifo is not None:
+                    attempt("release capture FIFO", fifo.release)
+                attempt("release Git wrapper",
+                        lambda: normal_shutdown.release_git_hold(marker))
+                if put is not None:
+                    attempt("close partial PUT", put.close)
+                attempt("stop pending writer",
+                        lambda: support.terminate_process(writer))
+                for holder in holders:
+                    attempt("stop namespace holder",
+                            lambda holder=holder: support.terminate_process(holder))
+                if h.proc is not None and h.proc.poll() is None:
+                    try:
+                        os.killpg(h.proc.pid, signal.SIGTERM)
+                        support.wait_process_exit(
+                            h.proc, timeout=NORMAL_SIGTERM_BUDGET)
+                    except BaseException:
+                        try:
+                            os.killpg(h.proc.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        try:
+                            support.wait_process_exit(
+                                h.proc, timeout=support.EXIT_DEADLINE)
+                        except BaseException as error:
+                            cleanup_failures.append(("owned API", error))
+                if git_thread is not None and git_thread.is_alive():
+                    git_thread.join(timeout=10)
+                    if git_thread.is_alive():
+                        cleanup_failures.append((
+                            "Git HTTP thread",
+                            AssertionError("owned request thread remained")))
+                if git_wrapper_pid is not None:
+                    current = support.process_identity(git_wrapper_pid)
+                    if current is not None:
+                        if current["starttime"] != git_wrapper_starttime:
+                            cleanup_failures.append((
+                                "Git wrapper identity",
+                                AssertionError("wrapper PID no longer matches")))
+                        elif not support.wait_pid_gone(
+                                git_wrapper_pid, support.EXIT_DEADLINE):
+                            cleanup_failures.append((
+                                "Git wrapper",
+                                AssertionError("owned wrapper remained after release")))
+                for label, fd in (("close API pidfd", api_pidfd),
+                                  ("close helper pidfd", helper_pidfd),
+                                  ("close writer pidfd", writer_pidfd)):
+                    if fd is not None:
+                        attempt(label, lambda fd=fd: os.close(fd))
+                if fifo is not None:
+                    attempt("remove capture FIFO", fifo.remove)
+                if not mount_cleanup_proven:
+                    h.args.keep = True
+                    cleanup_failures.append((
+                        "mount cleanup unproven",
+                        AssertionError("fixture root retained for exact mount evidence")))
+                attempt("harness cleanup", h.cleanup)
+                if cleanup_failures:
+                    detail = "; ".join(
+                        f"{label}: {type(error).__name__}"
+                        for label, error in cleanup_failures)
+                    note = "normal SIGTERM teardown failed: " + detail
                     if original_failure is not None:
                         original_failure.add_note(note)
                     else:
