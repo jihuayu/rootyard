@@ -97,20 +97,28 @@ def run_live_serve_blob_eval(
         cli_exec(binary, pg_env, "migrate")
 
         askpass = write_askpass_script(work_root / "askpass.sh")
+        archetype_specs: list[tuple[str, str]] = [(arch, "sha1") for arch in DATASET_ARCHETYPES] + [("text_history", "sha256")]
+        compare_names = ("rootyard_default", "zlib_store_c0", "wide_window_c6_w50_t2", "deep_archive_c9_w50_d100")
+        compare_specs = [s for s in CANDIDATE_CONFIGS if s.name in compare_names]
+
+        # Pre-create all tenant user/token pairs BEFORE starting serve-blob so `create-user`
+        # (`db::migrate`) never contends against serve-blob's PostgreSQL lifecycle barrier.
+        p1_tenants = [_create_tenant_pair(binary, pg_env, f"p1_{idx}", live.secrets) for idx in range(len(archetype_specs))]
+        cmp_tenants = [_create_tenant_pair(binary, pg_env, f"cmp_{s_idx}", live.secrets) for s_idx in range(len(compare_specs))]
+
         proc, base_url, log_f = start_serve_blob(
             binary, git_bin, live, pg_url, proxy.endpoint, scratch_dir, work_root / "serve-blob-1.log"
         )
         sampler.set_pids([proc.pid])
 
         # Phase 1: Incremental multi-wave pushes (isolated tenant per archetype to respect schema 142 quotas).
-        archetype_specs: list[tuple[str, str]] = [(arch, "sha1") for arch in DATASET_ARCHETYPES] + [("text_history", "sha256")]
         repos: list[dict[str, Any]] = []
         multi_push_latencies: list[float] = []
         proxy.reset_counters()
         acked: list[tuple[str, str, str, str, str]] = []
 
         for idx, (arch, obj_fmt) in enumerate(archetype_specs):
-            rw, ro = _create_tenant_pair(binary, pg_env, f"p1_{idx}", live.secrets)
+            rw, ro = p1_tenants[idx]
             git_rw_env = build_git_http_env(run_env, askpass, rw["token"])
             repo_info = create_repo(base_url, rw["token"], f"eval-{arch}-{obj_fmt}-{idx}", object_format=obj_fmt)
             wdir = work_root / f"client-{arch}-{obj_fmt}-{idx}"
@@ -194,15 +202,13 @@ def run_live_serve_blob_eval(
         warm_read_s3 = proxy.snapshot()
 
         # Phase 2: Candidate compacted single-pack serving comparison on live serve-blob + PG17 + Garage S3.
-        compare_names = ("rootyard_default", "zlib_store_c0", "wide_window_c6_w50_t2", "deep_archive_c9_w50_d100")
-        compare_specs = [s for s in CANDIDATE_CONFIGS if s.name in compare_names]
         target_arches = ("text_history", "similar_files", "compressed_media", "large_binary", "small_deltas")
         eval_targets = [r for r in repos if r["archetype"] in target_arches and r["object_format"] == "sha1"]
         if scale == "quick":
             eval_targets = eval_targets[:3]
         candidate_serving: list[dict[str, Any]] = []
         for s_idx, spec in enumerate(compare_specs):
-            cmp_rw, cmp_ro = _create_tenant_pair(binary, pg_env, f"cmp_{s_idx}", live.secrets)
+            cmp_rw, cmp_ro = cmp_tenants[s_idx]
             cmp_rw_env = build_git_http_env(run_env, askpass, cmp_rw["token"])
             cmp_ro_env = build_git_http_env(run_env, askpass, cmp_ro["token"])
             push_ms: list[float] = []

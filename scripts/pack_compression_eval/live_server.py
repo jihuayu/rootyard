@@ -191,18 +191,25 @@ def start_serve_blob(
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             log_f.close()
-            raise RuntimeError(f"serve-blob exited early rc={proc.returncode}")
+            tail = log_path.read_bytes()[-2048:].decode("utf-8", errors="replace") if log_path.is_file() else ""
+            raise RuntimeError(f"serve-blob exited early rc={proc.returncode}: {tail[-400:]}")
         st, body, _, _ = http_json_timed(base_url, "/health/ready", timeout=2)
         if st == 200 and body == b"ready":
             return proc, base_url, log_f
         time.sleep(0.1)
     kill_process_group(proc)
     log_f.close()
-    raise RuntimeError("serve-blob failed readiness probe within 30s")
+    tail = log_path.read_bytes()[-2048:].decode("utf-8", errors="replace") if log_path.is_file() else ""
+    raise RuntimeError(f"serve-blob failed readiness probe within 30s: {tail[-400:]}")
 
 
 def stop_serve_blob(proc: subprocess.Popen[bytes], log_f: Any) -> None:
-    kill_process_group(proc)
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            kill_process_group(proc)
     try:
         log_f.close()
     except OSError:
