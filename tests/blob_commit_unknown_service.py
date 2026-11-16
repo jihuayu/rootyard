@@ -430,12 +430,13 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         pid = identity["pid"]
         backend_start = identity["backend_start"]
         terminated = self.sql(
-            "SELECT count(*) FROM ("
+            "WITH owned AS MATERIALIZED ("
             "SELECT a.pid FROM pg_stat_activity a "
             "WHERE a.application_name='" + application_name + "' "
             "AND a.datname=current_database() AND a.pid=" + str(pid)
             + " AND a.backend_start::text='" + backend_start + "'"
-            ") exact WHERE pg_terminate_backend(exact.pid)")
+            + " AND a.pid<>pg_backend_pid()) "
+            "SELECT count(*) FROM owned WHERE pg_terminate_backend(owned.pid)")
         if terminated != "1":
             rows = self._owned_blocker_rows(application_name)
             if not rows and self._owned_advisory_lock_count(application_name) == 0:
