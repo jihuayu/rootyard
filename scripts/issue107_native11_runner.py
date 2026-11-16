@@ -30,12 +30,48 @@ DEFAULT_OVERALL_SECONDS = 3600.0
 DEFAULT_CASE_SECONDS = 600.0
 KILL_WAIT_SECONDS = 5.0
 REPORT_KIND = "rootyard/refstore-native11-acceptance"
+FAILURE_KIND = "rootyard/refstore-native11-target-failure"
+
+# The failure projection is deliberately smaller than the already bounded
+# 2 MiB process capture.  It only keeps fields whose complete vocabulary is
+# owned by this harness or by the frozen inventory.
+MAX_DIAGNOSTIC_LINE_CHARS = 4096
+MAX_DIAGNOSTIC_CASE_ENTRIES = 256
+MAX_SOURCE_LOCATIONS = 8
+MAX_SOURCE_LINE = 10_000_000
+
+# Exact repo-relative Rust source allowlist.  A path is retained only when it
+# is byte-equal to one of the fixed integration-test sources in the inventory.
+SOURCE_ALLOWLIST = tuple(sorted({
+    cfg["source"] for cfg in inventory.TARGETS.values()
+}))
+
+# Finite, platform-independent signal vocabulary used only to label a negative
+# child return code.  Unknown numbers stay numeric without a symbolic label.
+_SIGNAL_NAMES = {
+    1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 4: "SIGILL", 5: "SIGTRAP",
+    6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE", 9: "SIGKILL", 10: "SIGUSR1",
+    11: "SIGSEGV", 12: "SIGUSR2", 13: "SIGPIPE", 14: "SIGALRM",
+    15: "SIGTERM", 16: "SIGSTKFLT", 17: "SIGCHLD", 18: "SIGCONT",
+    19: "SIGSTOP", 20: "SIGTSTP", 21: "SIGTTIN", 22: "SIGTTOU",
+    23: "SIGURG", 24: "SIGXCPU", 25: "SIGXFSZ", 26: "SIGVTALRM",
+    27: "SIGPROF", 28: "SIGWINCH", 29: "SIGIO", 30: "SIGPWR", 31: "SIGSYS",
+}
+
+_CASE_LINE = re.compile(r"test (.+) \.\.\. (ok|FAILED|failed|ignored|bench)")
+_SUMMARY_LINE = re.compile(
+    r"test result: (ok|FAILED)\.\s+(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored;"
+    r"(?:\s+(\d+) measured;)?(?:\s+(\d+) filtered out;)?")
 
 
 class RunnerError(ValueError):
-    def __init__(self, code):
+    def __init__(self, code, diagnostic=None):
         super().__init__(code)
         self.code = code
+        # Safe, already-projected data only.  Raw child output, messages,
+        # panic text, SQL and credentials are never attached to the exception.
+        self.diagnostic = diagnostic
+        self.failed_target = diagnostic
 
 
 def _fail(code):
@@ -310,7 +346,174 @@ def _kill_group(proc):
         pass
 
 
-def run_bounded(command, timeout, env=None):
+def _returncode_detail(returncode):
+    """Return (numeric, signal, finite signal name) without child text."""
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        return None, None, None
+    if returncode >= 0:
+        return returncode, None, None
+    number = -returncode
+    return returncode, number, _SIGNAL_NAMES.get(number)
+
+
+def _bounded_int(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if not -2_147_483_648 <= value <= 2_147_483_647:
+        return None
+    return value
+
+
+def project_target_failure(target, output, returncode, *, timed_out=False, scope="case"):
+    """Project captured child output into a fixed, privacy-preserving shape.
+
+    This is a pure RAM-only parser: it performs no IO, starts no process and
+    never retries or extends a deadline.  Only case names that are byte-equal
+    to the frozen inventory, finite numeric counts, fixed error/signal labels,
+    and repo-relative paths from ``SOURCE_ALLOWLIST`` are retained.  Everything
+    else is dropped or counted as unknown, never as success.
+    """
+    _require(target in inventory.TARGETS, "unknown_target")
+    cfg = inventory.TARGETS[target]
+    expected = tuple(cfg["cases"])
+    expected_set = set(expected)
+
+    case_rows = {}
+    duplicate_names = set()
+    source_locations = []
+    source_seen = set()
+    unlisted_count = 0
+    duplicate_count = 0
+    malformed_count = 0
+    summary_count = 0
+    reported_summary = None
+
+    numeric, signal_number, signal_name = _returncode_detail(returncode)
+    text = output.decode("utf-8", "replace")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if len(line) > MAX_DIAGNOSTIC_LINE_CHARS:
+            line = line[:MAX_DIAGNOSTIC_LINE_CHARS]
+
+        if len(source_locations) < MAX_SOURCE_LOCATIONS:
+            for path in SOURCE_ALLOWLIST:
+                if path not in line:
+                    continue
+                match = re.search(
+                    re.escape(path) + r":([1-9][0-9]{0,7})(?::[0-9]{1,7})?", line)
+                if match is None:
+                    continue
+                line_number = int(match.group(1))
+                key = (path, line_number)
+                if line_number > MAX_SOURCE_LINE or key in source_seen:
+                    continue
+                source_seen.add(key)
+                source_locations.append({"file": path, "line": line_number})
+                if len(source_locations) >= MAX_SOURCE_LOCATIONS:
+                    break
+
+        if line.startswith("test result:"):
+            match = _SUMMARY_LINE.match(line)
+            if match is None:
+                malformed_count += 1
+                continue
+            summary_count += 1
+            reported_summary = {
+                "status": match.group(1),
+                "passed": int(match.group(2)),
+                "failed": int(match.group(3)),
+                "ignored": int(match.group(4)),
+                "measured": (int(match.group(5)) if match.group(5) is not None else None),
+                "filtered_out": (int(match.group(6)) if match.group(6) is not None else None),
+            }
+            continue
+
+        if line.startswith("test "):
+            match = _CASE_LINE.fullmatch(line)
+            if match is None:
+                malformed_count += 1
+                continue
+            name, token = match.group(1), match.group(2)
+            if name not in expected_set:
+                unlisted_count += 1
+                continue
+            if name in duplicate_names:
+                duplicate_count += 1
+                continue
+            if name in case_rows:
+                # A repeated inventory name is never trusted as a pass: drop
+                # the earlier observation and keep the name out of the cases.
+                case_rows.pop(name, None)
+                duplicate_names.add(name)
+                duplicate_count += 1
+                continue
+            case_rows[name] = {
+                "ok": "passed",
+                "FAILED": "failed",
+                "failed": "failed",
+                "ignored": "ignored",
+                "bench": "unknown",
+            }[token]
+
+    ordered = [
+        {"name": name, "status": case_rows[name]}
+        for name in expected if name in case_rows
+    ]
+    truncated_entries = len(ordered) > MAX_DIAGNOSTIC_CASE_ENTRIES
+    if truncated_entries:
+        ordered = ordered[:MAX_DIAGNOSTIC_CASE_ENTRIES]
+    observed = len(case_rows)
+    case_counts = {"passed": 0, "failed": 0, "ignored": 0, "unknown": 0}
+    for row in ordered:
+        case_counts[row["status"]] += 1
+    missing = max(0, len(expected) - observed)
+
+    return {
+        "kind": FAILURE_KIND,
+        "target": target,
+        "scope": scope if scope in ("list", "case") else "unknown",
+        "error_class": "native_timeout" if timed_out else "native_process_failed",
+        "returncode": _bounded_int(numeric),
+        "timed_out": bool(timed_out),
+        "exit": {
+            "returncode": _bounded_int(numeric),
+            "signal": _bounded_int(signal_number),
+            "signal_name": signal_name,
+            "known": numeric is not None,
+        },
+        "cases": ordered,
+        "case_counts": case_counts,
+        "inventory": {
+            "expected": len(expected),
+            "observed": observed,
+            "missing": missing,
+            "unlisted": unlisted_count,
+            "duplicate": duplicate_count,
+            "malformed": malformed_count,
+            "reported_summary_lines": summary_count,
+            "case_entries_truncated": truncated_entries,
+        },
+        "unknown": {
+            "missing_inventory_cases": missing,
+            "unlisted_output_cases": unlisted_count,
+            "duplicate_inventory_cases": duplicate_count,
+            "malformed_output_lines": malformed_count,
+        },
+        "libtest_summary": reported_summary,
+        "source_locations": source_locations,
+        "parse_caps": {
+            "output_bytes": MAX_CAPTURE_BYTES,
+            "line_chars": MAX_DIAGNOSTIC_LINE_CHARS,
+            "case_entries": MAX_DIAGNOSTIC_CASE_ENTRIES,
+            "source_locations": MAX_SOURCE_LOCATIONS,
+            "source_line": MAX_SOURCE_LINE,
+        },
+    }
+
+
+def run_bounded(command, timeout, env=None, failure_projector=None):
     """Run one child in its own process group and capture bounded RAM only."""
     process = subprocess.Popen(
         command,
@@ -360,9 +563,17 @@ def run_bounded(command, timeout, env=None):
     reader.join(timeout=KILL_WAIT_SECONDS)
     _require(not reader.is_alive(), "cleanup_unresolved")
     _require(not truncated[0], "native_output_too_large")
-    if timed_out:
-        _fail("native_timeout")
-    _require(process.returncode == 0, "native_process_failed")
+    if timed_out or process.returncode != 0:
+        code = "native_timeout" if timed_out else "native_process_failed"
+        diagnostic = None
+        if failure_projector is not None:
+            try:
+                diagnostic = failure_projector(
+                    bytes(captured), process.returncode, timed_out)
+            except Exception:
+                # Projection must never replace or swallow the outer failure.
+                diagnostic = None
+        raise RunnerError(code, diagnostic)
     return bytes(captured)
 
 
@@ -386,10 +597,16 @@ def parse_case_result(output, name):
     _require(passed == 1 and failed == 0 and ignored == 0, "test_partial_or_skipped")
 
 
-def _list_target(binary, cfg, remaining):
+def _list_target(binary, cfg, remaining, target=None):
+    projector = None
+    if target is not None:
+        def projector(output, returncode, timed_out):
+            return project_target_failure(
+                target, output, returncode, timed_out=timed_out, scope="list")
     output = run_bounded(
         [str(binary), "--list", "--ignored", "--format", "terse"],
-        timeout=min(60.0, remaining), env=os.environ.copy())
+        timeout=min(60.0, remaining), env=os.environ.copy(),
+        failure_projector=projector)
     actual = parse_listing(output)
     expected = list(cfg["cases"])
     _require(len(actual) == len(expected) and len(set(actual)) == len(actual)
@@ -397,10 +614,16 @@ def _list_target(binary, cfg, remaining):
     return actual
 
 
-def _run_one(binary, name, remaining, case_seconds=DEFAULT_CASE_SECONDS):
+def _run_one(binary, name, remaining, case_seconds=DEFAULT_CASE_SECONDS, target=None):
+    projector = None
+    if target is not None:
+        def projector(output, returncode, timed_out):
+            return project_target_failure(
+                target, output, returncode, timed_out=timed_out, scope="case")
     output = run_bounded(
         [str(binary), name, "--exact", "--ignored", "--test-threads=1", "--format", "pretty"],
-        timeout=min(case_seconds, remaining), env=os.environ.copy())
+        timeout=min(case_seconds, remaining), env=os.environ.copy(),
+        failure_projector=projector)
     parse_case_result(output, name)
 
 
@@ -418,6 +641,182 @@ def validate_batch_command_consistency(identities):
                  and set(selectors) == expected, "batch_command_target_set_mismatch")
     _require(len({tuple(row["command_test_targets"]) for row in rows}) == 1,
              "batch_command_inconsistent")
+
+
+def _nonnegative_int(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _safe_source_locations(values):
+    locations = []
+    seen = set()
+    for value in values or []:
+        if not isinstance(value, dict):
+            continue
+        path = value.get("file")
+        line = value.get("line")
+        if path not in SOURCE_ALLOWLIST:
+            continue
+        if isinstance(line, bool) or not isinstance(line, int):
+            continue
+        if not 1 <= line <= MAX_SOURCE_LINE:
+            continue
+        key = (path, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        locations.append({"file": path, "line": line})
+        if len(locations) >= MAX_SOURCE_LOCATIONS:
+            break
+    return locations
+
+
+def _safe_failure_diagnostic(diagnostic, target, observed_cases=None):
+    """Rebuild the failure diagnostic from fixed fields before persistence."""
+    expected = tuple(inventory.TARGETS[target]["cases"])
+    allowed_names = set(expected)
+    status_by_name = {}
+    # The child that just failed is authoritative for its own case line, so it
+    # is merged first.  Cases already completed in this target are then kept
+    # honestly instead of being lost with the not-yet-appended report row.
+    for row in diagnostic.get("cases") or []:
+        if not isinstance(row, dict):
+            continue
+        name, status = row.get("name"), row.get("status")
+        if name not in allowed_names or name in status_by_name:
+            continue
+        if status not in ("passed", "failed", "ignored", "unknown"):
+            continue
+        status_by_name[name] = status
+    for row in observed_cases or []:
+        if not isinstance(row, dict):
+            continue
+        name, status = row.get("name"), row.get("status")
+        if name not in allowed_names or name in status_by_name:
+            continue
+        if status not in ("passed", "failed", "ignored", "unknown"):
+            continue
+        status_by_name[name] = status
+    cases = [
+        {"name": name, "status": status_by_name[name]}
+        for name in expected if name in status_by_name
+    ]
+    cases = cases[:MAX_DIAGNOSTIC_CASE_ENTRIES]
+    case_counts = {"passed": 0, "failed": 0, "ignored": 0, "unknown": 0}
+    for row in cases:
+        case_counts[row["status"]] += 1
+
+    raw_inventory = diagnostic.get("inventory")
+    raw_inventory = raw_inventory if isinstance(raw_inventory, dict) else {}
+    missing = max(0, len(expected) - len(cases))
+    unlisted = _nonnegative_int(raw_inventory.get("unlisted"))
+    duplicate = _nonnegative_int(raw_inventory.get("duplicate"))
+    malformed = _nonnegative_int(raw_inventory.get("malformed"))
+
+    raw_exit = diagnostic.get("exit")
+    raw_exit = raw_exit if isinstance(raw_exit, dict) else {}
+    numeric = _bounded_int(raw_exit.get("returncode"))
+    signal_number = _bounded_int(raw_exit.get("signal"))
+    signal_name = _SIGNAL_NAMES.get(signal_number) if signal_number is not None else None
+
+    raw_summary = diagnostic.get("libtest_summary")
+    summary = None
+    if isinstance(raw_summary, dict):
+        status = raw_summary.get("status")
+        if status in ("ok", "FAILED"):
+            summary = {
+                "status": status,
+                "passed": _nonnegative_int(raw_summary.get("passed")),
+                "failed": _nonnegative_int(raw_summary.get("failed")),
+                "ignored": _nonnegative_int(raw_summary.get("ignored")),
+                "measured": _bounded_int(raw_summary.get("measured")),
+                "filtered_out": _bounded_int(raw_summary.get("filtered_out")),
+            }
+
+    timed_out = diagnostic.get("timed_out") is True
+    error_class = diagnostic.get("error_class")
+    if error_class not in ("native_process_failed", "native_timeout"):
+        error_class = "native_timeout" if timed_out else "native_process_failed"
+    return {
+        "kind": FAILURE_KIND,
+        "target": target,
+        "scope": (diagnostic.get("scope")
+                  if diagnostic.get("scope") in ("list", "case") else "unknown"),
+        "error_class": error_class,
+        "returncode": numeric,
+        "timed_out": timed_out,
+        "exit": {
+            "returncode": numeric,
+            "signal": signal_number,
+            "signal_name": signal_name,
+            "known": numeric is not None,
+        },
+        "cases": cases,
+        "case_counts": case_counts,
+        "inventory": {
+            "expected": len(expected),
+            "observed": len(cases),
+            "missing": missing,
+            "unlisted": unlisted,
+            "duplicate": duplicate,
+            "malformed": malformed,
+            "reported_summary_lines": _nonnegative_int(
+                raw_inventory.get("reported_summary_lines")),
+            "case_entries_truncated": len(status_by_name) > MAX_DIAGNOSTIC_CASE_ENTRIES,
+        },
+        "unknown": {
+            "missing_inventory_cases": missing,
+            "unlisted_output_cases": unlisted,
+            "duplicate_inventory_cases": duplicate,
+            "malformed_output_lines": malformed,
+        },
+        "libtest_summary": summary,
+        "source_locations": _safe_source_locations(diagnostic.get("source_locations")),
+        "parse_caps": {
+            "output_bytes": MAX_CAPTURE_BYTES,
+            "line_chars": MAX_DIAGNOSTIC_LINE_CHARS,
+            "case_entries": MAX_DIAGNOSTIC_CASE_ENTRIES,
+            "source_locations": MAX_SOURCE_LOCATIONS,
+            "source_line": MAX_SOURCE_LINE,
+        },
+    }
+
+
+def _attach_failed_target(report, diagnostic, identities, observed_cases=None):
+    target = diagnostic.get("target")
+    if target not in inventory.TARGETS:
+        return
+    safe_diagnostic = _safe_failure_diagnostic(diagnostic, target, observed_cases)
+    row = {
+        "target": target,
+        "passed": False,
+        "status": "failed",
+        "cases": safe_diagnostic["cases"],
+        "case_count": len(safe_diagnostic["cases"]),
+        "error_class": safe_diagnostic["error_class"],
+        "exit": safe_diagnostic["exit"],
+        "source_locations": safe_diagnostic["source_locations"],
+        "diagnostic": safe_diagnostic,
+    }
+    identity = (identities or {}).get(target) or {}
+    for key in ("binary_sha256", "receipt_sha256", "source_inputs_sha256",
+                "config_digest", "kind", "profile", "test_count"):
+        if key in identity:
+            row[key] = identity[key]
+    rows = report.setdefault("targets", [])
+    for index, existing in enumerate(rows):
+        if existing.get("target") == target:
+            rows[index] = row
+            break
+    else:
+        rows.append(row)
+    report["failed_target"] = safe_diagnostic
+    report["case_count"] = sum(
+        1 for item in rows for case in item.get("cases", [])
+        if isinstance(case, dict) and case.get("status") == "passed")
+    report["observed_case_count"] = sum(len(item.get("cases", [])) for item in rows)
 
 
 def run_acceptance(source_head, source_root, targets, receipts_by_name,
@@ -446,8 +845,9 @@ def run_acceptance(source_head, source_root, targets, receipts_by_name,
         "error_codes": [],
     }
     deadline = time.monotonic() + max(0.1, float(overall_seconds))
+    identities = {}
+    completed_cases = []
     try:
-        identities = {}
         for target in inventory.TARGET_ORDER:
             _required_environment(target)
             binary = targets[target]
@@ -464,20 +864,20 @@ def run_acceptance(source_head, source_root, targets, receipts_by_name,
             _require(remaining > 0, "overall_timeout")
             binary = targets[target]
             cfg = inventory.TARGETS[target]
-            _list_target(binary, cfg, remaining)
-            cases = []
+            completed_cases = []
+            _list_target(binary, cfg, remaining, target)
             for name in cfg["cases"]:
                 remaining = deadline - time.monotonic()
                 _require(remaining > 0, "overall_timeout")
-                _run_one(binary, name, remaining, case_seconds)
-                cases.append({"name": name, "status": "passed"})
+                _run_one(binary, name, remaining, case_seconds, target)
+                completed_cases.append({"name": name, "status": "passed"})
             report["targets"].append({
                 **identities[target],
                 "passed": True,
-                "cases": cases,
-                "case_count": len(cases),
+                "cases": completed_cases,
+                "case_count": len(completed_cases),
             })
-            report["case_count"] += len(cases)
+            report["case_count"] += len(completed_cases)
         _require(report["case_count"] == report["expected_count"],
                  "total_case_count_mismatch")
         after = input_hashes(source_root)
@@ -487,6 +887,14 @@ def run_acceptance(source_head, source_root, targets, receipts_by_name,
     except RunnerError as error:
         report["error_codes"] = [error.code]
         report["cleanup_unresolved"] = error.code == "cleanup_unresolved"
+        diagnostic = getattr(error, "diagnostic", None)
+        if isinstance(diagnostic, dict):
+            try:
+                _attach_failed_target(
+                    report, diagnostic, identities, completed_cases)
+            except Exception:
+                # Never let a projection defect replace the outer failure.
+                pass
     except Exception:
         report["error_codes"] = ["runner_failure"]
     try:
