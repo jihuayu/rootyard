@@ -1000,7 +1000,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
         .read_gate_version()?
         .expect("live gate after history transition")
         .revision();
-    let change_history_replay = backend_h2a2.propose_with_id(change_history_id.clone(), change_history).await?;
+    let change_history_replay = backend_h2a2.propose_with_id(change_history_id.clone(), change_history.clone()).await?;
     assert_eq!(change_history_replay.decision, ProposalAttemptKind::Replayed);
     assert_eq!(change_history_replay.original_log_id, Some(change_history_outcome.log_id));
     assert_eq!(proposal_outcome(&change_history_replay), proposal_outcome(&change_history_outcome));
@@ -1015,7 +1015,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     ));
     let stale_h1 = backend_on(&cluster, healed_leader, repo, tenant, realm.clone(), options).await?;
     assert!(matches!(
-        stale_h1.query_proposal(change_history_id).await,
+        stale_h1.query_proposal(change_history_id.clone()).await,
         Err(RaftBackendError::ProposalScopeMismatch(_))
     ));
     assert!(matches!(stale_h1.read_committed_view().await, Err(RaftBackendError::StaleGate("history_incarnation"))));
@@ -1036,6 +1036,157 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let change_authority_outcome = backend_h2a3.propose(change_authority).await?;
     assert!(proposal_outcome(&change_authority_outcome).is_applied());
     assert!(matches!(backend_h2a2.read_committed_view().await, Err(RaftBackendError::StaleGate("authority_epoch"))));
+
+    // A retained First receipt takes precedence over the live fence. Replaying the original H2/A2
+    // SetLane after H2/A3 must return the exact original outcome and must not relabel the gate.
+    let view_after_h2a3 = backend_h2a3.read_committed_view().await?;
+    let revision_before_old_replay = view_after_h2a3.read_gate_version()?.expect("gate H2/A3").revision();
+    let floor_before_fences = view_after_h2a3.logical_clock_floor();
+    let old_replay_after_h3 = backend_h2a2.propose_with_id(change_history_id.clone(), change_history.clone()).await?;
+    assert_eq!(old_replay_after_h3.decision, ProposalAttemptKind::Replayed);
+    assert_eq!(old_replay_after_h3.original_log_id, Some(change_history_outcome.log_id));
+    assert_eq!(proposal_outcome(&old_replay_after_h3), proposal_outcome(&change_history_outcome));
+    let revision_after_old_replay =
+        backend_h2a3.read_committed_view().await?.read_gate_version()?.expect("gate H2/A3").revision();
+    assert_eq!(revision_before_old_replay, revision_after_old_replay);
+
+    // A fresh old-realm writer cannot revive H1/A1 or regress H2/A2 after H2/A3. These are typed
+    // first decisions at apply, not preflight-only checks, and they do not mutate the gate/clock.
+    let stale_id = stale_h1.prepare_proposal_id().await?;
+    let stale_lane = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+        repository_id: repo,
+        tenant_id: tenant,
+        lane: RepositoryLane::ServingRefStore,
+        lifecycle: ScopeLifecycle::Closing,
+        authz_floor: 1,
+        history_incarnation: history,
+        authority_epoch: 1,
+        group_epoch: 1,
+        pack_mode: SmPackMode::MetadataOnly,
+    });
+    let stale_result = stale_h1.propose_with_id(stale_id, stale_lane).await?;
+    assert_eq!(stale_result.decision, ProposalAttemptKind::First);
+    assert!(matches!(
+        proposal_outcome(&stale_result),
+        RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::GateTransitionRefused
+    ));
+
+    let regress_id = backend_h2a2.prepare_proposal_id().await?;
+    let regress_lane = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+        repository_id: repo,
+        tenant_id: tenant,
+        lane: RepositoryLane::ServingRefStore,
+        lifecycle: ScopeLifecycle::Closing,
+        authz_floor: 1,
+        history_incarnation: history_2,
+        authority_epoch: 2,
+        group_epoch: 1,
+        pack_mode: SmPackMode::MetadataOnly,
+    });
+    let regress_result = backend_h2a2.propose_with_id(regress_id, regress_lane).await?;
+    assert_eq!(regress_result.decision, ProposalAttemptKind::First);
+    assert!(matches!(
+        proposal_outcome(&regress_result),
+        RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::GateTransitionRefused
+    ));
+
+    // The target may be a new history with a strict epoch increase, but SetLane cannot migrate
+    // object format. A Sha1 target against the live Sha256 gate is refused.
+    let history_3 = Uuid::new_v4();
+    let realm_h3a4_sha1 = RealmBinding::new(tenant, TEST_GROUP, authority, history_3, 1, 4, GitObjectFormat::Sha1, 1)?;
+    let backend_h3a4_sha1 = backend_on(&cluster, healed_leader, repo, tenant, realm_h3a4_sha1, options).await?;
+    let format_id = backend_h3a4_sha1.prepare_proposal_id().await?;
+    let format_lane = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+        repository_id: repo,
+        tenant_id: tenant,
+        lane: RepositoryLane::ServingRefStore,
+        lifecycle: ScopeLifecycle::Closing,
+        authz_floor: 1,
+        history_incarnation: history_3,
+        authority_epoch: 4,
+        group_epoch: 1,
+        pack_mode: SmPackMode::MetadataOnly,
+    });
+    let format_result = backend_h3a4_sha1.propose_with_id(format_id, format_lane).await?;
+    assert_eq!(format_result.decision, ProposalAttemptKind::First);
+    assert!(matches!(
+        proposal_outcome(&format_result),
+        RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::GateTransitionRefused
+    ));
+
+    // A different history with equal epochs has no UUID ordering and is refused.
+    let realm_h3a3 = RealmBinding::new(tenant, TEST_GROUP, authority, history_3, 1, 3, GitObjectFormat::Sha256, 1)?;
+    let backend_h3a3 = backend_on(&cluster, healed_leader, repo, tenant, realm_h3a3, options).await?;
+    let foreign_id = backend_h3a3.prepare_proposal_id().await?;
+    let foreign_lane = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+        repository_id: repo,
+        tenant_id: tenant,
+        lane: RepositoryLane::ServingRefStore,
+        lifecycle: ScopeLifecycle::Closing,
+        authz_floor: 1,
+        history_incarnation: history_3,
+        authority_epoch: 3,
+        group_epoch: 1,
+        pack_mode: SmPackMode::MetadataOnly,
+    });
+    let foreign_result = backend_h3a3.propose_with_id(foreign_id, foreign_lane).await?;
+    assert_eq!(foreign_result.decision, ProposalAttemptKind::First);
+    assert!(matches!(
+        proposal_outcome(&foreign_result),
+        RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::GateTransitionRefused
+    ));
+    let floor_after_fences = backend_h2a3.read_committed_view().await?.logical_clock_floor();
+    assert_eq!(floor_before_fences, floor_after_fences);
+
+    // Concurrent monotonic target preflights cannot overwrite the higher winner backwards. The
+    // higher H2/A6 target must win regardless of apply order; the lower H2/A5 may apply first or
+    // lose to the monotonic fence.
+    let realm_h4a5 = RealmBinding::new(tenant, TEST_GROUP, authority, history_2, 1, 5, GitObjectFormat::Sha256, 1)?;
+    let backend_h4a5 = backend_on(&cluster, healed_leader, repo, tenant, realm_h4a5, options).await?;
+    let realm_h5a6 = RealmBinding::new(tenant, TEST_GROUP, authority, history_2, 1, 6, GitObjectFormat::Sha256, 1)?;
+    let backend_h5a6 = backend_on(&cluster, healed_leader, repo, tenant, realm_h5a6, options).await?;
+    let h4_id = backend_h4a5.prepare_proposal_id().await?;
+    let h5_id = backend_h5a6.prepare_proposal_id().await?;
+    let h4_lane = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+        repository_id: repo,
+        tenant_id: tenant,
+        lane: RepositoryLane::ServingRefStore,
+        lifecycle: ScopeLifecycle::Closing,
+        authz_floor: 1,
+        history_incarnation: history_2,
+        authority_epoch: 5,
+        group_epoch: 1,
+        pack_mode: SmPackMode::MetadataOnly,
+    });
+    let h5_lane = RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+        repository_id: repo,
+        tenant_id: tenant,
+        lane: RepositoryLane::ServingRefStore,
+        lifecycle: ScopeLifecycle::Closing,
+        authz_floor: 1,
+        history_incarnation: history_2,
+        authority_epoch: 6,
+        group_epoch: 1,
+        pack_mode: SmPackMode::MetadataOnly,
+    });
+    let (h4_result, h5_result) =
+        tokio::join!(backend_h4a5.propose_with_id(h4_id, h4_lane), backend_h5a6.propose_with_id(h5_id, h5_lane),);
+    let h4_result = h4_result?;
+    let h5_result = h5_result?;
+    assert!(proposal_outcome(&h5_result).is_applied());
+    assert!(
+        proposal_outcome(&h4_result).is_applied()
+            || matches!(
+                proposal_outcome(&h4_result),
+                RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::GateTransitionRefused
+            )
+    );
+    let final_gate =
+        backend_h5a6.read_committed_view().await?.read_gate_version()?.expect("live gate after concurrent transitions");
+    assert_eq!(final_gate.history_incarnation(), history_2);
+    assert_eq!(final_gate.authority_epoch(), 6);
+    assert_eq!(final_gate.group_epoch(), 1);
+    assert_eq!(floor_before_fences, backend_h5a6.read_committed_view().await?.logical_clock_floor());
 
     // Restart actual cluster SQLite state: shut down all nodes, reopen the leader's application
     // state machine from its own directory, and verify the committed Root refs/coordinate.

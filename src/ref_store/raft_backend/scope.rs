@@ -2,9 +2,12 @@
 
 use uuid::Uuid;
 
-use crate::ref_store::core::state_machine::RefCasCommand;
+use crate::ref_store::CoreGateVersion;
+use crate::ref_store::core::state_machine::{RefCasCommand, SetRepositoryLaneCommand};
 use crate::ref_store::core::types::GitObjectFormat;
 use crate::ref_store::raft_backend::error::RaftBackendError;
+use crate::ref_store::raft_backend::outcome::RootRefCasRefusalKind;
+use crate::ref_store::raft_backend::proposal::ProposalId;
 use crate::ref_store::raft_backend::realm::RealmBinding;
 
 struct CommandScope {
@@ -121,4 +124,275 @@ pub(crate) fn validate_command_scope(
         return Err(RaftBackendError::ScopeMismatch("object_format"));
     }
     Ok(())
+}
+
+/// Atomic apply-time fence. Called after First-receipt replay/conflict and after command/identity
+/// matching, immediately before first business execution. A `Some` result is a bounded typed
+/// refusal; the caller advances only the no-tick coordinate.
+pub(crate) fn fence_proposal_against_gate(
+    live: Option<&CoreGateVersion>,
+    proposal: &ProposalId,
+    command: &RefCasCommand,
+) -> Option<RootRefCasRefusalKind> {
+    match command {
+        RefCasCommand::InitializeGate(_) => None,
+        RefCasCommand::Noop(command) if command.logical_tick.is_none() => None,
+        RefCasCommand::SetRepositoryLane(command) => fence_set_lane(
+            live,
+            command.repository_id,
+            command.tenant_id,
+            command.history_incarnation,
+            command.group_epoch,
+            command.authority_epoch,
+            Some(proposal.object_format),
+        ),
+        _ => {
+            let Some(live) = live else {
+                return Some(RootRefCasRefusalKind::RepositoryNotFound);
+            };
+            if proposal_matches_live_gate(live, proposal) {
+                None
+            } else {
+                Some(RootRefCasRefusalKind::GateScopeRefused)
+            }
+        }
+    }
+}
+
+/// Raw legacy commands carry no stable full proposal identity. Apply the minimum SetRepositoryLane
+/// monotonic history/epoch fence only; do not claim a full scope check that the wire cannot prove.
+pub(crate) fn fence_legacy_set_lane(
+    live: Option<&CoreGateVersion>,
+    command: &SetRepositoryLaneCommand,
+) -> Option<RootRefCasRefusalKind> {
+    fence_set_lane(
+        live,
+        command.repository_id,
+        command.tenant_id,
+        command.history_incarnation,
+        command.group_epoch,
+        command.authority_epoch,
+        None,
+    )
+}
+
+fn fence_set_lane(
+    live: Option<&CoreGateVersion>,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    history: Uuid,
+    group_epoch: i64,
+    authority_epoch: i64,
+    object_format: Option<GitObjectFormat>,
+) -> Option<RootRefCasRefusalKind> {
+    let Some(live) = live else {
+        return Some(RootRefCasRefusalKind::RepositoryNotFound);
+    };
+    if live.repository_id() != repository_id || live.tenant_id() != tenant_id {
+        return Some(RootRefCasRefusalKind::GateTransitionRefused);
+    }
+    if group_epoch < live.group_epoch() || authority_epoch < live.authority_epoch() {
+        return Some(RootRefCasRefusalKind::GateTransitionRefused);
+    }
+    if history != live.history_incarnation()
+        && group_epoch == live.group_epoch()
+        && authority_epoch == live.authority_epoch()
+    {
+        return Some(RootRefCasRefusalKind::GateTransitionRefused);
+    }
+    if object_format.is_some_and(|format| format != live.object_format()) {
+        return Some(RootRefCasRefusalKind::GateTransitionRefused);
+    }
+    None
+}
+
+fn proposal_matches_live_gate(live: &CoreGateVersion, proposal: &ProposalId) -> bool {
+    live.repository_id() == proposal.repository_id
+        && live.tenant_id() == proposal.tenant_id
+        && live.history_incarnation() == proposal.history_id
+        && i64::try_from(proposal.group_epoch).is_ok_and(|epoch| epoch == live.group_epoch())
+        && live.authority_epoch() == proposal.authority_epoch
+        && live.object_format() == proposal.object_format
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ref_store::core::contract::CoreGate;
+    use crate::ref_store::core::state_machine::{
+        InitializeGateCommand, NoopCommand, RepositoryLane, ScopeLifecycle, SetRepositoryLaneCommand, SmPackMode,
+        WireGateInit,
+    };
+    use crate::ref_store::{CoreGateInit, RefName};
+
+    fn live_gate(
+        repo: Uuid,
+        tenant: Uuid,
+        history: Uuid,
+        group_epoch: i64,
+        authority_epoch: i64,
+        format: GitObjectFormat,
+    ) -> CoreGateVersion {
+        CoreGate::new(
+            repo,
+            tenant,
+            format,
+            history,
+            authority_epoch,
+            group_epoch,
+            RefName::branch("refs/heads/main").unwrap(),
+            1,
+        )
+        .unwrap()
+        .version()
+    }
+
+    fn proposal(
+        repo: Uuid,
+        tenant: Uuid,
+        history: Uuid,
+        group_epoch: u64,
+        authority_epoch: i64,
+        format: GitObjectFormat,
+    ) -> ProposalId {
+        ProposalId::new(
+            repo,
+            tenant,
+            history,
+            "group-a",
+            group_epoch,
+            Uuid::from_u128(4),
+            authority_epoch,
+            1,
+            format,
+            0,
+            Uuid::from_u128(5),
+        )
+        .unwrap()
+    }
+
+    fn lane_command(repo: Uuid, tenant: Uuid, history: Uuid, group_epoch: i64, authority_epoch: i64) -> RefCasCommand {
+        RefCasCommand::SetRepositoryLane(SetRepositoryLaneCommand {
+            repository_id: repo,
+            tenant_id: tenant,
+            lane: RepositoryLane::ServingRefStore,
+            lifecycle: ScopeLifecycle::Closing,
+            authz_floor: 1,
+            history_incarnation: history,
+            authority_epoch,
+            group_epoch,
+            pack_mode: SmPackMode::MetadataOnly,
+        })
+    }
+
+    #[test]
+    fn set_lane_fence_is_componentwise_monotonic() {
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let live = live_gate(repo, tenant, history, 2, 2, GitObjectFormat::Sha256);
+        let base = proposal(repo, tenant, history, 2, 2, GitObjectFormat::Sha256);
+
+        // Group or authority regression, even if the other axis rises.
+        assert_eq!(
+            fence_proposal_against_gate(Some(&live), &base, &lane_command(repo, tenant, Uuid::from_u128(31), 1, 2)),
+            Some(RootRefCasRefusalKind::GateTransitionRefused)
+        );
+        assert_eq!(
+            fence_proposal_against_gate(Some(&live), &base, &lane_command(repo, tenant, Uuid::from_u128(31), 2, 1)),
+            Some(RootRefCasRefusalKind::GateTransitionRefused)
+        );
+        // A new history with no strict epoch increase has no UUID ordering and is refused.
+        assert_eq!(
+            fence_proposal_against_gate(Some(&live), &base, &lane_command(repo, tenant, Uuid::from_u128(31), 2, 2)),
+            Some(RootRefCasRefusalKind::GateTransitionRefused)
+        );
+        // Same history/equal epochs and ordinary lane changes are allowed.
+        assert_eq!(fence_proposal_against_gate(Some(&live), &base, &lane_command(repo, tenant, history, 2, 2)), None);
+        // A new history is allowed only with a strict epoch increase.
+        assert_eq!(
+            fence_proposal_against_gate(Some(&live), &base, &lane_command(repo, tenant, Uuid::from_u128(31), 3, 2)),
+            None
+        );
+        assert_eq!(
+            fence_proposal_against_gate(Some(&live), &base, &lane_command(repo, tenant, Uuid::from_u128(31), 2, 3)),
+            None
+        );
+        // Same history with one epoch increase is allowed.
+        assert_eq!(fence_proposal_against_gate(Some(&live), &base, &lane_command(repo, tenant, history, 3, 2)), None);
+        assert_eq!(fence_proposal_against_gate(Some(&live), &base, &lane_command(repo, tenant, history, 2, 3)), None);
+        // SetLane cannot change object format.
+        let sha1 = proposal(repo, tenant, Uuid::from_u128(31), 3, 2, GitObjectFormat::Sha1);
+        assert_eq!(
+            fence_proposal_against_gate(Some(&live), &sha1, &lane_command(repo, tenant, Uuid::from_u128(31), 3, 2)),
+            Some(RootRefCasRefusalKind::GateTransitionRefused)
+        );
+        // Missing live gate is a normal typed refusal.
+        assert_eq!(
+            fence_proposal_against_gate(None, &base, &lane_command(repo, tenant, history, 3, 2)),
+            Some(RootRefCasRefusalKind::RepositoryNotFound)
+        );
+    }
+
+    #[test]
+    fn legacy_set_lane_fence_has_no_identity_or_format_claim() {
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let live = live_gate(repo, tenant, history, 2, 2, GitObjectFormat::Sha256);
+        let RefCasCommand::SetRepositoryLane(command) = lane_command(repo, tenant, history, 2, 2) else {
+            unreachable!()
+        };
+        assert_eq!(fence_legacy_set_lane(Some(&live), &command), None);
+        let RefCasCommand::SetRepositoryLane(old) = lane_command(repo, tenant, history, 1, 1) else { unreachable!() };
+        assert_eq!(fence_legacy_set_lane(Some(&live), &old), Some(RootRefCasRefusalKind::GateTransitionRefused));
+        let RefCasCommand::SetRepositoryLane(foreign) = lane_command(repo, tenant, Uuid::from_u128(31), 2, 2) else {
+            unreachable!()
+        };
+        assert_eq!(fence_legacy_set_lane(Some(&live), &foreign), Some(RootRefCasRefusalKind::GateTransitionRefused));
+        let RefCasCommand::SetRepositoryLane(newer) = lane_command(repo, tenant, Uuid::from_u128(31), 3, 2) else {
+            unreachable!()
+        };
+        assert_eq!(fence_legacy_set_lane(Some(&live), &newer), None);
+    }
+
+    #[test]
+    fn ordinary_apply_fence_includes_ticking_noop_but_not_coordinate_noop() {
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let live = live_gate(repo, tenant, history, 1, 2, GitObjectFormat::Sha256);
+        let stale = proposal(repo, tenant, Uuid::from_u128(31), 1, 2, GitObjectFormat::Sha256);
+        let ticking = RefCasCommand::Noop(NoopCommand { logical_tick: Some(7) });
+        assert_eq!(
+            fence_proposal_against_gate(Some(&live), &stale, &ticking),
+            Some(RootRefCasRefusalKind::GateScopeRefused)
+        );
+        let matching = proposal(repo, tenant, history, 1, 2, GitObjectFormat::Sha256);
+        assert_eq!(fence_proposal_against_gate(Some(&live), &matching, &ticking), None);
+        let coordinate = RefCasCommand::Noop(NoopCommand { logical_tick: None });
+        assert_eq!(fence_proposal_against_gate(Some(&live), &stale, &coordinate), None);
+        assert_eq!(
+            fence_proposal_against_gate(None, &matching, &ticking),
+            Some(RootRefCasRefusalKind::RepositoryNotFound)
+        );
+
+        let gate = CoreGateInit::new(
+            repo,
+            tenant,
+            GitObjectFormat::Sha256,
+            history,
+            2,
+            1,
+            RefName::branch("refs/heads/main").unwrap(),
+        )
+        .unwrap();
+        let initialize = RefCasCommand::InitializeGate(InitializeGateCommand {
+            gate: WireGateInit::from(&gate),
+            lane: RepositoryLane::ServingRefStore,
+            pack_mode: SmPackMode::MetadataOnly,
+            authz_floor: 1,
+        });
+        assert_eq!(fence_proposal_against_gate(Some(&live), &stale, &initialize), None);
+    }
 }

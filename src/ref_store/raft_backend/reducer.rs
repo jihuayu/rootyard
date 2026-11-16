@@ -19,6 +19,7 @@ use crate::ref_store::raft_backend::proposal::{
     MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, PROPOSAL_WINDOW, ProposalAttempt, ProposalAttemptKind,
     ProposalEnvelope, ProposalId, ProposalLookup, command_digest_hex,
 };
+use crate::ref_store::raft_backend::scope::{fence_legacy_set_lane, fence_proposal_against_gate};
 
 /// Stable application domain for Root Ref-CAS business commands.
 pub const ROOT_REF_CAS_DOMAIN: &str = "rootyard.ref_store.ref_cas";
@@ -27,6 +28,10 @@ pub const ROOT_REF_CAS_VERSION: u16 = 1;
 
 /// Adapter that actually applies committed `RefCasCommand` values to the Root deterministic
 /// state machine. It never runs Git/Blob/PG/Redis IO and never reads a wall clock.
+///
+/// This is a fresh homogeneous `/3` adapter protocol. A writer/version that does not enforce the
+/// same apply-time gate fence is not transparently compatible; mixed-version deployments must not
+/// be treated as having these fencing guarantees.
 #[derive(Clone, Debug, Default)]
 pub struct RootRefCasStateMachine {
     machine: RefCasStateMachine,
@@ -359,6 +364,11 @@ impl RootRefCasStateMachine {
             );
         }
 
+        let live_gate = self.machine.read_gate_version(proposal_id.repository_id).map_err(map_state_error)?;
+        if let Some(refusal) = fence_proposal_against_gate(live_gate.as_ref(), &proposal_id, &command) {
+            return self.commit_protocol_refusal(log_id, proposal_id, digest_hex, refusal, ProposalAttemptKind::First);
+        }
+
         let prior_machine = self.machine.clone();
         let outcome = self.apply_core(log_id, command, prior_machine.clone())?;
         let attempt = ProposalAttempt {
@@ -380,12 +390,44 @@ impl RootRefCasStateMachine {
         self.commit_business_attempt(log_id, prior_machine, attempt, fallback)
     }
 
+    fn commit_legacy_refusal(
+        &mut self,
+        log_id: ApplicationLogId,
+        digest_hex: String,
+        refusal: RootRefCasRefusalKind,
+    ) -> Result<(), ApplicationError> {
+        let attempt = ProposalAttempt {
+            proposal_id: None,
+            command_digest_hex: digest_hex.clone(),
+            original_log_id: log_id,
+            observed_log_id: log_id,
+            kind: ProposalAttemptKind::Legacy,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(refusal)),
+        };
+        let fallback = ProposalAttempt {
+            proposal_id: None,
+            command_digest_hex: digest_hex,
+            original_log_id: log_id,
+            observed_log_id: log_id,
+            kind: ProposalAttemptKind::Legacy,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(RootRefCasRefusalKind::StateCapacity)),
+        };
+        self.apply_noop(log_id)?;
+        self.insert_with_fallback(attempt, fallback)
+    }
+
     fn apply_legacy(
         &mut self,
         log_id: ApplicationLogId,
         command: RefCasCommand,
         digest_hex: String,
     ) -> Result<(), ApplicationError> {
+        if let RefCasCommand::SetRepositoryLane(command) = &command {
+            let live = self.machine.read_gate_version(command.repository_id).map_err(map_state_error)?;
+            if let Some(refusal) = fence_legacy_set_lane(live.as_ref(), command) {
+                return self.commit_legacy_refusal(log_id, digest_hex, refusal);
+            }
+        }
         let prior_machine = self.machine.clone();
         let outcome = self.apply_core(log_id, command, prior_machine.clone())?;
         let attempt = ProposalAttempt {
@@ -521,6 +563,62 @@ mod tests {
         .unwrap()
     }
 
+    fn scoped_id(
+        repo: Uuid,
+        tenant: Uuid,
+        history: Uuid,
+        group_epoch: u64,
+        authority_epoch: i64,
+        object_format: GitObjectFormat,
+        issued_at_index: u64,
+        nonce: u128,
+    ) -> ProposalId {
+        ProposalId::new(
+            repo,
+            tenant,
+            history,
+            "group-a",
+            group_epoch,
+            Uuid::from_u128(4),
+            authority_epoch,
+            1,
+            object_format,
+            issued_at_index,
+            Uuid::from_u128(nonce),
+        )
+        .unwrap()
+    }
+
+    fn init_command(
+        repo: Uuid,
+        tenant: Uuid,
+        history: Uuid,
+        group_epoch: i64,
+        authority_epoch: i64,
+        object_format: GitObjectFormat,
+    ) -> RefCasCommand {
+        let gate = CoreGateInit::new(
+            repo,
+            tenant,
+            object_format,
+            history,
+            authority_epoch,
+            group_epoch,
+            RefName::branch("refs/heads/main").unwrap(),
+        )
+        .unwrap();
+        RefCasCommand::InitializeGate(InitializeGateCommand {
+            gate: WireGateInit::from(&gate),
+            lane: RepositoryLane::ServingRefStore,
+            pack_mode: SmPackMode::MetadataOnly,
+            authz_floor: 1,
+        })
+    }
+
+    fn envelope(id: &ProposalId, command: &RefCasCommand) -> Vec<u8> {
+        ProposalEnvelope::encode(id, &encode_command(command).unwrap()).unwrap()
+    }
+
     #[test]
     fn expired_proposal_does_not_execute_or_relabel_itself() {
         let mut app = RootRefCasStateMachine::new();
@@ -578,7 +676,7 @@ mod tests {
         let first_log = ApplicationLogId::new(1, 1);
         app.apply(first_log, &payload).unwrap();
         let first = app.query_attempt(first_log).expect("first attempt").outcome.clone();
-        assert!(matches!(first, RootRefCasOutcome::Applied(RootRefCasApplied::GateInitialized { created: true, .. })));
+        assert!(matches!(&first, RootRefCasOutcome::Applied(RootRefCasApplied::GateInitialized { created: true, .. })));
 
         let replay_log = ApplicationLogId::new(1, 2);
         app.apply(replay_log, &payload).unwrap();
@@ -596,5 +694,76 @@ mod tests {
                 outcome: first,
             }
         );
+    }
+
+    #[test]
+    fn stale_ordinary_proposal_and_ticking_noop_are_fenced_at_apply() {
+        let mut app = RootRefCasStateMachine::new();
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let live_history = Uuid::from_u128(30);
+        let live_id = scoped_id(repo, tenant, live_history, 1, 2, GitObjectFormat::Sha256, 0, 5);
+        let live_init = init_command(repo, tenant, live_history, 1, 2, GitObjectFormat::Sha256);
+        app.apply(ApplicationLogId::new(1, 1), &envelope(&live_id, &live_init)).unwrap();
+        assert_eq!(app.logical_clock_floor(), 0);
+
+        let stale_id = scoped_id(repo, tenant, Uuid::from_u128(31), 1, 1, GitObjectFormat::Sha256, 1, 6);
+        let tick = RefCasCommand::Noop(NoopCommand { logical_tick: Some(7) });
+        app.apply(ApplicationLogId::new(1, 2), &envelope(&stale_id, &tick)).unwrap();
+        let refused = app.query_attempt(ApplicationLogId::new(1, 2)).expect("fenced attempt");
+        assert_eq!(refused.kind, ProposalAttemptKind::First);
+        assert!(matches!(
+            &refused.outcome,
+            RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::GateScopeRefused
+        ));
+        assert_eq!(app.logical_clock_floor(), 0);
+        let gate = app.machine().read_gate_version(repo).unwrap().expect("live gate");
+        assert_eq!(gate.history_incarnation(), live_history);
+        assert_eq!(gate.authority_epoch(), 2);
+
+        // Noop(None) is the explicit coordinate-only exception; it does not mutate the clock and
+        // deliberately does not require a full live scope match.
+        let coordinate_id = scoped_id(repo, tenant, Uuid::from_u128(31), 1, 1, GitObjectFormat::Sha256, 2, 7);
+        let coordinate = RefCasCommand::Noop(NoopCommand { logical_tick: None });
+        app.apply(ApplicationLogId::new(1, 3), &envelope(&coordinate_id, &coordinate)).unwrap();
+        let applied = app.query_attempt(ApplicationLogId::new(1, 3)).expect("coordinate attempt");
+        assert_eq!(applied.kind, ProposalAttemptKind::First);
+        assert!(applied.outcome.is_applied());
+        assert_eq!(app.logical_clock_floor(), 0);
+    }
+
+    #[test]
+    fn legacy_set_lane_is_fenced_before_business_mutation() {
+        let mut app = RootRefCasStateMachine::new();
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let live_history = Uuid::from_u128(30);
+        let live_id = scoped_id(repo, tenant, live_history, 1, 2, GitObjectFormat::Sha256, 0, 5);
+        let live_init = init_command(repo, tenant, live_history, 1, 2, GitObjectFormat::Sha256);
+        app.apply(ApplicationLogId::new(1, 1), &envelope(&live_id, &live_init)).unwrap();
+
+        let old_lane =
+            RefCasCommand::SetRepositoryLane(crate::ref_store::core::state_machine::SetRepositoryLaneCommand {
+                repository_id: repo,
+                tenant_id: tenant,
+                lane: RepositoryLane::ServingRefStore,
+                lifecycle: crate::ref_store::core::state_machine::ScopeLifecycle::Closing,
+                authz_floor: 1,
+                history_incarnation: Uuid::from_u128(31),
+                authority_epoch: 1,
+                group_epoch: 1,
+                pack_mode: SmPackMode::MetadataOnly,
+            });
+        app.apply(ApplicationLogId::new(1, 2), &encode_command(&old_lane).unwrap()).unwrap();
+        let refused = app.query_attempt(ApplicationLogId::new(1, 2)).expect("legacy fenced attempt");
+        assert_eq!(refused.kind, ProposalAttemptKind::Legacy);
+        assert!(matches!(
+            &refused.outcome,
+            RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::GateTransitionRefused
+        ));
+        let gate = app.machine().read_gate_version(repo).unwrap().expect("live gate");
+        assert_eq!(gate.history_incarnation(), live_history);
+        assert_eq!(gate.authority_epoch(), 2);
+        assert_eq!(app.logical_clock_floor(), 0);
     }
 }
