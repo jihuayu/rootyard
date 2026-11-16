@@ -196,16 +196,20 @@ fn poll_writable(fd: RawFd, wait: Duration) -> Result<(), HelperError> {
 /// It never retries EINTR/short writes or restarts a grace.
 fn send_complete_or_terminal<F, M>(bytes: &[u8], send: F, terminal: M) -> bool
 where
-    F: FnOnce(*const u8, usize) -> isize,
+    F: FnOnce(*const u8, usize) -> io::Result<usize>,
     M: FnOnce(i32),
 {
-    let sent = send(bytes.as_ptr(), bytes.len());
-    if sent as usize == bytes.len() {
-        return true;
+    match send(bytes.as_ptr(), bytes.len()) {
+        Ok(sent) if sent == bytes.len() => true,
+        Ok(_) => {
+            terminal(libc::EIO);
+            false
+        }
+        Err(error) => {
+            terminal(error.raw_os_error().unwrap_or(libc::EIO));
+            false
+        }
     }
-    let code = if sent < 0 { io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO) } else { libc::EIO };
-    terminal(code);
-    false
 }
 
 /// Write one already-serialized control frame without blocking past the
@@ -353,7 +357,13 @@ impl Inner {
         // canonical frame bytes and `MSG_DONTWAIT` never blocks.
         if !send_complete_or_terminal(
             &bytes,
-            |pointer, length| unsafe { libc::send(fd, pointer.cast(), length, CONTROL_SEND_FLAGS) },
+            |pointer, length| {
+                // Capture the syscall errno immediately on failure, before any
+                // intervening call can overwrite it; positive results are the
+                // completed byte count.
+                let sent = unsafe { libc::send(fd, pointer.cast(), length, CONTROL_SEND_FLAGS) };
+                if sent < 0 { Err(io::Error::last_os_error()) } else { Ok(sent as usize) }
+            },
             |code| {
                 self.fail_generation(code, "workspace FUSE helper shutdown frame was not sent completely");
             },
@@ -1241,7 +1251,7 @@ mod tests {
             &[1u8, 2, 3],
             |_, _| {
                 attempts += 1;
-                -1
+                Err(io::Error::from_raw_os_error(libc::EINTR))
             },
             |code| {
                 terminal_calls += 1;
@@ -1254,6 +1264,26 @@ mod tests {
         assert_eq!(terminal_calls, 1);
         drop(guard);
         assert!(!guard_alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn short_positive_zero_budget_send_terminalizes_with_eio() {
+        let mut attempts = 0;
+        let mut terminal_calls = 0;
+        let complete = send_complete_or_terminal(
+            &[1u8, 2, 3],
+            |_, _| {
+                attempts += 1;
+                Ok(2)
+            },
+            |code| {
+                terminal_calls += 1;
+                assert_eq!(code, libc::EIO);
+            },
+        );
+        assert!(!complete);
+        assert_eq!(attempts, 1, "a short positive send must not be retried");
+        assert_eq!(terminal_calls, 1);
     }
 
     #[test]
