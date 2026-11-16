@@ -144,6 +144,20 @@ jobs:
           export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
           export ROOTYARD_BLOB_ROOT="rubicon-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           export ROOTYARD_GIT="$(command -v git)"
+          mkdir -p test-results/rubicon-mixed-workload
+          # Runner creates an isolated search_path schema per run, so migrate the
+          # job-owned database once upfront to populate public.cluster_authority.
+          if ! env DATABASE_URL="$ROOTYARD_TEST_DATABASE_URL" "$RUNNER_TEMP/rubicon-bin/rootyard" migrate \
+              > "$RUNNER_TEMP/rubicon-public-migrate.log" 2>&1; then
+            echo "rubicon-mixed-workload: production CLI migrate failed on the job-owned database" >&2
+            exit 1
+          fi
+          authority="$(psql "$ROOTYARD_TEST_DATABASE_URL" -X -t -A -v ON_ERROR_STOP=1 -c \
+            "SELECT to_regclass('public.cluster_authority') IS NOT NULL")"
+          if [ "$authority" != "t" ]; then
+            echo "rubicon-mixed-workload: public.cluster_authority is absent from the job-owned database" >&2
+            exit 1
+          fi
           tiers="${{ inputs.tiers || 'auto' }}"
           duration="${{ inputs.duration_seconds || '12' }}"
           python3 scripts/rubicon_mixed_workload.py \

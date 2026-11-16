@@ -262,6 +262,126 @@ class RubiconReportValidationTests(unittest.TestCase):
         doc_text = (ROOT / "docs" / "rubicon-mixed-workload.md").read_text(encoding="utf-8")
         self.assertIn("#164", doc_text)
         self.assertIn("physical_savings_claimed", doc_text)
+        self.assertIn("public.cluster_authority", doc_text)
+
+
+class RubiconProvisioningAndAuthorityTests(unittest.TestCase):
+    def test_create_repo_and_wait_retries_409_and_provisioning_then_succeeds(self) -> None:
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from scripts.rubicon_workload.runner import _create_repo_and_wait
+
+        state = {"gets": 0}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                _ = self.rfile.read(length)
+                body = json.dumps({"owner": "alice", "name": "r1", "state": "provisioning"}).encode("utf-8")
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                state["gets"] += 1
+                if state["gets"] == 1:
+                    code, payload = 409, {"error": "repository is not ready"}
+                elif state["gets"] == 2:
+                    code, payload = 200, {"owner": "alice", "name": "r1", "state": "provisioning"}
+                else:
+                    code, payload = 200, {"owner": "alice", "name": "r1", "state": "ready"}
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            data = _create_repo_and_wait(f"http://127.0.0.1:{port}", "r1", {"token": "ryt_" + "a" * 64})
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(data["state"], "ready")
+        self.assertEqual(state["gets"], 3)
+
+    def test_create_repo_and_wait_fails_fast_on_500_and_redacts_token(self) -> None:
+        import json
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from scripts.rubicon_workload.runner import _create_repo_and_wait
+
+        secret_tok = "ryt_" + "b" * 64
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                _ = self.rfile.read(length)
+                body = json.dumps({"owner": "alice", "name": "r2", "state": "ready"}).encode("utf-8")
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                body = json.dumps({"error": f"relation public.cluster_authority missing {secret_tok}"}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        t0 = time.monotonic()
+        try:
+            port = server.server_address[1]
+            with self.assertRaises(RuntimeError) as ctx:
+                _create_repo_and_wait(f"http://127.0.0.1:{port}", "r2", {"token": secret_tok})
+        finally:
+            server.shutdown()
+            server.server_close()
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 3.0)
+        msg = str(ctx.exception)
+        self.assertIn("status=500", msg)
+        self.assertIn("cluster_authority", msg)
+        self.assertNotIn(secret_tok, msg)
+
+    def test_verify_public_cluster_authority_checks_pg_result_without_leaking_dsn(self) -> None:
+        import subprocess
+        from unittest import mock
+        from scripts.rubicon_workload.runner import _verify_public_cluster_authority
+
+        with mock.patch("subprocess.check_output", return_value="t\n"):
+            _verify_public_cluster_authority("postgresql://u:pw@127.0.0.1/db", {})
+
+        with mock.patch("subprocess.check_output", return_value="f\n"):
+            with self.assertRaisesRegex(RuntimeError, "public.cluster_authority"):
+                _verify_public_cluster_authority("postgresql://u:pw@127.0.0.1/db", {})
+
+        err = subprocess.CalledProcessError(2, ["psql", "--dbname", "postgresql://u:supersecretpw@127.0.0.1/db"])
+        with mock.patch("subprocess.check_output", side_effect=err):
+            with self.assertRaises(RuntimeError) as ctx:
+                _verify_public_cluster_authority("postgresql://u:supersecretpw@127.0.0.1/db", {})
+        self.assertIn("exit=2", str(ctx.exception))
+        self.assertNotIn("supersecretpw", str(ctx.exception))
 
 
 if __name__ == "__main__":

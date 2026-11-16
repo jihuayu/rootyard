@@ -286,23 +286,50 @@ def _stop_fleet(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> 
                 pass
 
 
+def _verify_public_cluster_authority(pg_base: str, env: dict[str, str]) -> None:
+    """Fail fast unless base DB public schema holds migration-085 cluster_authority."""
+    try:
+        authority = subprocess.check_output(
+            [
+                "psql", "--dbname", pg_base, "-X", "-t", "-A", "-v", "ON_ERROR_STOP=1",
+                "-c", "SELECT to_regclass('public.cluster_authority') IS NOT NULL",
+            ],
+            env=env, text=True, stderr=subprocess.PIPE, timeout=15,
+        ).strip()
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"failed checking public.cluster_authority on base database (exit={exc.returncode})") from None
+    if authority != "t":
+        raise RuntimeError(
+            "public.cluster_authority is absent from base database; "
+            "run 'rootyard migrate' on the base DATABASE_URL before running rubicon_mixed_workload"
+        )
+
+
 def _create_repo_and_wait(base_url: str, name: str, token: dict[str, str]) -> dict[str, Any]:
     code, raw, _, _ = http_json(base_url, "/api/repos", token=token, method="POST", body={"name": name, "object_format": "sha1"})
+    secret_list = [token.get("token", "")] if token.get("token") else []
     if code not in (201, 202):
-        raise RuntimeError(f"POST /api/repos failed: status={code}")
+        err_body = redact_text(raw.decode("utf-8", "replace")[:240], secret_list)
+        raise RuntimeError(f"POST /api/repos failed: status={code} body={err_body}")
     created = json.loads(raw)
     path = f"/api/repos/{urllib.parse.quote(created['owner'], safe='')}/{urllib.parse.quote(created['name'], safe='')}"
     deadline = time.monotonic() + 30.0
+    last_code = 0
+    last_body = ""
     while time.monotonic() < deadline:
         g_code, g_raw, _, _ = http_json(base_url, path, token=token)
+        last_code = g_code
+        last_body = redact_text(g_raw.decode("utf-8", "replace")[:240], secret_list)
         if g_code == 200:
             data = json.loads(g_raw)
             if data.get("state") == "ready":
                 return data
             if data.get("state") != "provisioning":
                 raise RuntimeError(f"unexpected repo provisioning state: {data.get('state')}")
+        elif g_code in (400, 401, 403, 404, 500):
+            raise RuntimeError(f"GET {path} failed for repo {name}: status={g_code} body={last_body}")
         time.sleep(0.1)
-    raise RuntimeError(f"repo {name} did not become ready in 30s")
+    raise RuntimeError(f"repo {name} did not become ready in 30s (last_status={last_code}, last_body={last_body})")
 
 
 def _record_op(records: list[dict[str, Any]], op_class: str, ds_class: str, outcome: str, wall_ms: float, phase: str) -> None:
@@ -814,6 +841,7 @@ def run_rubicon_workload(config: WorkloadConfig, env: dict[str, str] | None = No
     s3_endpoint = run_env["ROOTYARD_BLOB_ENDPOINT"]
 
     try:
+        _verify_public_cluster_authority(pre["pg_base"], run_env)
         subprocess.run(
             ["psql", "--dbname", pre["pg_base"], "-X", "-v", "ON_ERROR_STOP=1", "-c", f'CREATE SCHEMA "{schema}"'],
             env=run_env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,

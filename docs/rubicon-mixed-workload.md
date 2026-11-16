@@ -44,7 +44,9 @@ Each compute tier (`1`, `2`, and `4` when `logical_cpus >= 4`) executes:
 # Offline unit contract tests (run automatically by scripts/run_python_ci_tests.py)
 python3 -m unittest -v tests.test_rubicon_mixed_workload
 
-# Live CI benchmark profile (requires PG17, Garage/S3 ROOTYARD_BLOB_*, git, psql, built binary + .build.json)
+# Live CI benchmark profile (requires PG17 with public.cluster_authority migrated once on the base DB,
+# Garage/S3 ROOTYARD_BLOB_*, git, psql, built binary + .build.json)
+env DATABASE_URL="$ROOTYARD_TEST_DATABASE_URL" "$ROOTYARD_BIN" migrate
 python3 scripts/rubicon_mixed_workload.py \
   --binary "$ROOTYARD_BIN" \
   --git "$(command -v git)" \
