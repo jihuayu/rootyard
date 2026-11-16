@@ -5,6 +5,7 @@ use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::core::retention_root::{PgRetentionRoots, RootPurpose};
 use rootyard::ref_store::serving::PgServingRetentionRoots;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use super::super::db::{Db, deadline};
 use super::super::{http, marker, pack, repo, roots};
