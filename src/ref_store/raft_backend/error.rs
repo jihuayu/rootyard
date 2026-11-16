@@ -28,6 +28,10 @@ pub enum RaftBackendError {
     NotApplicationMode,
     /// The opened application reducer is not the root Ref-CAS adapter.
     WrongReducer,
+    /// The owned factory could not create its real Raft node/storage pair.
+    NodeStart(&'static str),
+    /// The owned factory could not shut down its real Raft node.
+    NodeShutdown(&'static str),
     /// Persistence/read failed; the message is intentionally fixed/bounded.
     Storage(&'static str),
     /// Command encoding or envelope bounds refused the write before Raft append.
@@ -63,6 +67,8 @@ impl fmt::Display for RaftBackendError {
                 f.write_str("persistent state machine is not opened with the root Ref-CAS reducer")
             }
             Self::WrongReducer => f.write_str("application reducer is not the root Ref-CAS adapter"),
+            Self::NodeStart(operation) => write!(f, "owned Raft node start failed during {operation}"),
+            Self::NodeShutdown(operation) => write!(f, "owned Raft node shutdown failed during {operation}"),
             Self::Storage(operation) => write!(f, "state-machine storage failure during {operation}"),
             Self::Encode(reason) => write!(f, "raft command refused before append: {reason}"),
             Self::Command(message) => write!(f, "state-machine refused command: {message}"),

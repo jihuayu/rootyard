@@ -6,6 +6,46 @@ use crate::ref_store::raft_backend::error::RaftBackendError;
 
 const MAX_GROUP_BYTES: usize = 64;
 
+/// Trusted node/factory identity. `group_id`, `authority_id`, and `storage_generation` are not
+/// fields of the Root gate; they are owned by the node factory/storage configuration and are
+/// checked against the backend realm. They are never claimed to be derived from Raft membership.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeTrust {
+    group_id: String,
+    authority_id: Uuid,
+    storage_generation: u64,
+}
+
+impl NodeTrust {
+    pub fn new(
+        group_id: impl Into<String>,
+        authority_id: Uuid,
+        storage_generation: u64,
+    ) -> Result<Self, RaftBackendError> {
+        let group_id = group_id.into();
+        validate_group_id(&group_id)?;
+        if authority_id.is_nil() {
+            return Err(RaftBackendError::InvalidConfig("node trust authority_id must be non-nil"));
+        }
+        if storage_generation == 0 {
+            return Err(RaftBackendError::InvalidConfig("node trust storage_generation must be positive"));
+        }
+        Ok(Self { group_id, authority_id, storage_generation })
+    }
+
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    pub fn authority_id(&self) -> Uuid {
+        self.authority_id
+    }
+
+    pub fn storage_generation(&self) -> u64 {
+        self.storage_generation
+    }
+}
+
 /// Immutable trusted realm/authority/storage-generation context owned by a backend.
 ///
 /// Every field is private. There is no `Deserialize`, default, or arbitrary-bytes constructor, so

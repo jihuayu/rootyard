@@ -57,8 +57,7 @@ impl BackendOptions {
 /// Backend bound to exactly one repository, tenant, and trusted realm on one real openraft node.
 #[derive(Clone)]
 pub struct RootRaftRefCasBackend {
-    raft: Raft<LogTypeConfig>,
-    sm: PersistentStateMachine,
+    node: RootRaftNode,
     repository_id: Uuid,
     tenant_id: Uuid,
     realm: RealmBinding,
@@ -66,13 +65,35 @@ pub struct RootRaftRefCasBackend {
 }
 
 impl RootRaftRefCasBackend {
-    /// Binds a real Raft handle and application-mode persistent state machine to trusted scope.
+    /// Binds one **owned** Raft/application-SM pair to trusted repository/tenant/realm scope.
     ///
-    /// The constructor refuses a KV-mode state machine, a different reducer, mismatched realm
-    /// tenant, nil ids, or unbounded deadlines. It performs no network read and mints no view.
+    /// There is deliberately no raw `(Raft, PersistentStateMachine)` constructor. The node
+    /// factory opens both stores in one directory and constructs Raft with that exact SM, so a
+    /// same-node-id but unrelated local SM cannot be attached accidentally.
+    ///
+    /// The realm's `group_id`, `authority_id`, and `storage_generation` are checked against the
+    /// owned node/factory trust identity. They are explicitly factory/storage configuration, not
+    /// inferred from Raft membership.
+    ///
+    /// ```compile_fail
+    /// # use rootyard::ref_store::raft_backend::RootRaftRefCasBackend;
+    /// # async fn old_raw_pair(
+    /// #     raft: openraft::Raft<rootyard_refcas_log::LogTypeConfig>,
+    /// #     sm: rootyard_refcas_log::state_machine::PersistentStateMachine,
+    /// # ) {
+    /// let _ = RootRaftRefCasBackend::open(
+    ///     raft,
+    ///     sm,
+    ///     uuid::Uuid::nil(),
+    ///     uuid::Uuid::nil(),
+    ///     todo!(),
+    ///     todo!(),
+    /// )
+    /// .await;
+    /// # }
+    /// ```
     pub async fn open(
-        raft: Raft<LogTypeConfig>,
-        sm: PersistentStateMachine,
+        node: RootRaftNode,
         repository_id: Uuid,
         tenant_id: Uuid,
         realm: RealmBinding,
@@ -84,12 +105,20 @@ impl RootRaftRefCasBackend {
         if realm.tenant_id() != tenant_id {
             return Err(RaftBackendError::InvalidConfig("realm tenant differs from backend tenant"));
         }
-        let options = options.validate()?;
-        let node_summary = sm.summary().await.map_err(|_| RaftBackendError::Storage("state-machine summary"))?;
-        if node_summary.node_id != raft.metrics().borrow().id {
-            return Err(RaftBackendError::InvalidConfig("raft node id differs from persistent state-machine node id"));
+        if realm.group_id() != node.trust().group_id() {
+            return Err(RaftBackendError::InvalidConfig("realm group_id differs from owned node trust"));
         }
-        let summary = sm
+        if realm.authority_id() != node.trust().authority_id() {
+            return Err(RaftBackendError::InvalidConfig("realm authority_id differs from owned node trust"));
+        }
+        if realm.storage_generation() != node.trust().storage_generation() {
+            return Err(RaftBackendError::InvalidConfig(
+                "realm storage_generation differs from owned node storage generation",
+            ));
+        }
+        let options = options.validate()?;
+        let summary = node
+            .sm()
             .application_summary()
             .await
             .map_err(|_| RaftBackendError::Storage("application summary"))?
@@ -97,7 +126,7 @@ impl RootRaftRefCasBackend {
         if summary.domain != ROOT_REF_CAS_DOMAIN || summary.version != ROOT_REF_CAS_VERSION {
             return Err(RaftBackendError::WrongReducer);
         }
-        Ok(Self { raft, sm, repository_id, tenant_id, realm, options })
+        Ok(Self { node, repository_id, tenant_id, realm, options })
     }
 
     pub fn repository_id(&self) -> Uuid {
@@ -132,7 +161,7 @@ impl RootRaftRefCasBackend {
             .encode()
             .map_err(|_| RaftBackendError::Encode("application envelope codec refused"))?;
 
-        match tokio::time::timeout(self.options.quorum_timeout, self.raft.client_write(envelope)).await {
+        match tokio::time::timeout(self.options.quorum_timeout, self.node.raft().client_write(envelope)).await {
             Ok(Ok(response)) => {
                 let log_id = ApplicationLogId::from_log_id(response.log_id);
                 let snapshot = self.await_applied_snapshot(Some(log_id)).await?;
@@ -182,15 +211,15 @@ impl RootRaftRefCasBackend {
         if presented != &self.realm {
             return Err(RaftBackendError::StaleRealm);
         }
-        let read_log_id = match tokio::time::timeout(self.options.quorum_timeout, self.raft.ensure_linearizable()).await
-        {
-            Ok(Ok(read_log_id)) => read_log_id,
-            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
-                return Err(RaftBackendError::FollowerRedirect(fwd.leader_id));
-            }
-            Ok(Err(_)) => return Err(RaftBackendError::QuorumUnavailable("read index")),
-            Err(_) => return Err(RaftBackendError::QuorumUnavailable("read index timeout")),
-        };
+        let read_log_id =
+            match tokio::time::timeout(self.options.quorum_timeout, self.node.raft().ensure_linearizable()).await {
+                Ok(Ok(read_log_id)) => read_log_id,
+                Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
+                    return Err(RaftBackendError::FollowerRedirect(fwd.leader_id));
+                }
+                Ok(Err(_)) => return Err(RaftBackendError::QuorumUnavailable("read index")),
+                Err(_) => return Err(RaftBackendError::QuorumUnavailable("read index timeout")),
+            };
 
         self.await_applied_and_mint(read_log_id).await
     }
@@ -217,7 +246,8 @@ impl RootRaftRefCasBackend {
         let deadline = Instant::now() + self.options.apply_timeout;
         loop {
             let snapshot = self
-                .sm
+                .node
+                .sm()
                 .application_snapshot()
                 .await
                 .map_err(|_| RaftBackendError::Storage("application snapshot"))?

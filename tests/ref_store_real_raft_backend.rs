@@ -22,13 +22,15 @@ use rootyard::ref_store::core::state_machine::{
     SetRepositoryLaneCommand, SmPackMode, WireCommitRefsRequest, WireGateInit, encode_command,
 };
 use rootyard::ref_store::raft_backend::{
-    BackendOptions, OutcomeQuery, ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RaftBackendError, RealmBinding,
-    RootRaftRefCasBackend, RootRefCasOutcome, RootRefCasRefusalKind, RootRefCasStateMachine,
+    BackendOptions, NodeTrust, OutcomeQuery, ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RaftBackendError, RealmBinding,
+    RootRaftNode, RootRaftNodeConfig, RootRaftRefCasBackend, RootRefCasOutcome, RootRefCasRefusalKind,
+    RootRefCasStateMachine,
 };
 use rootyard::ref_store::{
     CommitMode, CommitRefsRequest, CoreGateInit, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, OperationLookup,
     RefName, RefPrecondition, RefTarget, RefUpdate, VersionCheck,
 };
+use rootyard_refcas_log::LogTypeConfig;
 use rootyard_refcas_log::cluster::{
     MtlsNetworkFactory, PeerDirectory, RpcRequest, RpcResponse, read_frame_async, write_frame_async,
 };
@@ -37,7 +39,6 @@ use rootyard_refcas_log::mtls::{MtlsClient, MtlsPaths, MtlsServer, PeerIdentity,
 use rootyard_refcas_log::state_machine::{
     ApplicationCommand, ApplicationError, ApplicationLogId, ApplicationStateMachine, PersistentStateMachine, SmCommand,
 };
-use rootyard_refcas_log::{LogTypeConfig, PersistentLog};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -169,8 +170,7 @@ fn clone_key(key: &KeyPair) -> Result<KeyPair> {
 struct TestNode {
     id: u64,
     dir: tempfile::TempDir,
-    raft: Raft<LogTypeConfig>,
-    sm: PersistentStateMachine,
+    node: RootRaftNode,
     peer_dir: PeerDirectory,
     stop: watch::Sender<bool>,
 }
@@ -182,7 +182,7 @@ struct TestCluster {
 }
 
 impl TestCluster {
-    async fn start_three() -> Result<Self> {
+    async fn start_three(trust: NodeTrust) -> Result<Self> {
         let pki = TestPki::new()?;
         let mut nodes = Vec::new();
         let mut raft_map = BTreeMap::new();
@@ -194,11 +194,6 @@ impl TestCluster {
             let mtls_client = MtlsClient::from_paths(&paths)?;
             let peer_dir = PeerDirectory::new();
 
-            let log = PersistentLog::open(dir.path(), id, true).await.context("open persistent log")?;
-            let sm =
-                PersistentStateMachine::open_application(dir.path(), id, true, Box::new(RootRefCasStateMachine::new()))
-                    .await
-                    .context("open application state machine")?;
             let config = Arc::new(
                 Config {
                     cluster_name: CLUSTER_NAME.into(),
@@ -212,17 +207,23 @@ impl TestCluster {
                 .map_err(|e| anyhow::anyhow!("raft config: {e}"))?,
             );
             let network = MtlsNetworkFactory::new(peer_dir.clone(), mtls_client);
-            let raft = Raft::new(id, config, network, log, sm.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("create raft node {id}: {e}"))?;
+            let node = RootRaftNode::start(RootRaftNodeConfig {
+                node_id: id,
+                store_dir: dir.path().to_path_buf(),
+                raft_config: config,
+                network,
+                check_on_open: true,
+                trust: trust.clone(),
+            })
+            .await?;
 
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let raft_addr = listener.local_addr()?.to_string();
             raft_map.insert(id, raft_addr.clone());
             let (stop, stop_rx) = watch::channel(false);
-            spawn_rpc_listener(mtls_server, listener, raft.clone(), peer_dir.clone(), stop_rx);
+            spawn_rpc_listener(mtls_server, listener, node.raft(), peer_dir.clone(), stop_rx);
 
-            nodes.push(TestNode { id, dir, raft, sm, peer_dir, stop });
+            nodes.push(TestNode { id, dir, node, peer_dir, stop });
         }
 
         for node in &nodes {
@@ -230,7 +231,7 @@ impl TestCluster {
         }
         let initial: BTreeMap<u64, BasicNode> =
             raft_map.iter().map(|(id, addr)| (*id, BasicNode { addr: addr.clone() })).collect();
-        nodes[0].raft.initialize(initial).await.map_err(|e| anyhow::anyhow!("initialize raft cluster: {e}"))?;
+        nodes[0].node.raft().initialize(initial).await.map_err(|e| anyhow::anyhow!("initialize raft cluster: {e}"))?;
         let cluster = Self { _pki: pki, nodes };
         cluster.wait_leader(Duration::from_secs(20)).await?;
         Ok(cluster)
@@ -240,12 +241,12 @@ impl TestCluster {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             for node in &self.nodes {
-                let metrics = node.raft.metrics().borrow().clone();
+                let metrics = node.node.metrics();
                 if metrics.state != ServerState::Leader || metrics.current_leader != Some(node.id) {
                     continue;
                 }
                 let all_ready = self.nodes.iter().all(|peer| {
-                    let peer_metrics = peer.raft.metrics().borrow().clone();
+                    let peer_metrics = peer.node.metrics();
                     peer_metrics.current_leader == Some(node.id)
                         && peer_metrics.last_applied.is_some()
                         && peer_metrics.membership_config.membership().voter_ids().count() == 3
@@ -290,11 +291,10 @@ impl TestCluster {
     async fn shutdown(self) -> Vec<(u64, tempfile::TempDir)> {
         let mut dirs = Vec::new();
         for node in self.nodes {
-            let TestNode { id, dir, raft, sm, stop, .. } = node;
+            let TestNode { id, dir, node, stop, .. } = node;
             let _ = stop.send(true);
-            let _ = raft.shutdown().await;
-            drop(raft);
-            drop(sm);
+            let _ = node.shutdown().await;
+            drop(node);
             dirs.push((id, dir));
         }
         dirs
@@ -383,7 +383,7 @@ async fn backend_on(
     options: BackendOptions,
 ) -> Result<RootRaftRefCasBackend> {
     let node = cluster.node(node_id);
-    Ok(RootRaftRefCasBackend::open(node.raft.clone(), node.sm.clone(), repo, tenant, realm, options).await?)
+    Ok(RootRaftRefCasBackend::open(node.node.clone(), repo, tenant, realm, options).await?)
 }
 
 fn reducer_snapshot(
@@ -395,10 +395,8 @@ fn reducer_snapshot(
 async fn wait_applied_through(cluster: &TestCluster, index: u64, timeout: Duration) -> Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let ready = cluster
-            .nodes
-            .iter()
-            .all(|node| node.raft.metrics().borrow().last_applied.is_some_and(|id| id.index >= index));
+        let ready =
+            cluster.nodes.iter().all(|node| node.node.metrics().last_applied.is_some_and(|id| id.index >= index));
         if ready {
             return Ok(());
         }
@@ -492,14 +490,15 @@ async fn build_snapshot(sm: &PersistentStateMachine) -> Result<(openraft::Snapsh
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> Result<()> {
-    let cluster = TestCluster::start_three().await?;
-    let (leader_id, _leader_term) = cluster.wait_leader(Duration::from_secs(20)).await?;
     let repo = Uuid::new_v4();
     let tenant = Uuid::new_v4();
     let issuer = Uuid::new_v4();
     let history = Uuid::new_v4();
     let authority = Uuid::new_v4();
+    let trust = NodeTrust::new(TEST_GROUP, authority, 1)?;
     let realm = RealmBinding::new(tenant, TEST_GROUP, authority, history, 1, 1)?;
+    let cluster = TestCluster::start_three(trust.clone()).await?;
+    let (leader_id, _leader_term) = cluster.wait_leader(Duration::from_secs(20)).await?;
     let options = BackendOptions {
         quorum_timeout: Duration::from_secs(3),
         apply_timeout: Duration::from_secs(5),
@@ -582,9 +581,27 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     let healthy_view = backend.read_committed_view().await?;
     assert!(healthy_view.last_applied().is_some_and(|id| id.index >= healthy.log_id.index));
 
-    // A real KV fallback is unavailable in application mode.
-    assert!(cluster.node(leader_id).sm.kv_get("refs/heads/main").await.is_err());
-    assert!(cluster.node(leader_id).sm.kv_snapshot().await.is_err());
+    // A same-node-id standalone SM cannot be attached: the public constructor takes the owned
+    // factory node, not a caller-selected SM. Application-mode KV reads remain unavailable too.
+    let same_id_dir = tempfile::tempdir()?;
+    let same_id_sm = PersistentStateMachine::open_application(
+        same_id_dir.path(),
+        leader_id,
+        true,
+        Box::new(RootRefCasStateMachine::new()),
+    )
+    .await?;
+    assert_eq!(same_id_sm.summary().await?.node_id, leader_id);
+    let kv_probe_dir = tempfile::tempdir()?;
+    let kv_probe = PersistentStateMachine::open_application(
+        kv_probe_dir.path(),
+        95,
+        true,
+        Box::new(RootRefCasStateMachine::new()),
+    )
+    .await?;
+    assert!(kv_probe.kv_get("refs/heads/main").await.is_err());
+    assert!(kv_probe.kv_snapshot().await.is_err());
 
     // Follower boundary: both write and committed read fail closed with an explicit redirect.
     let follower_id = cluster.first_follower_id(leader_id);
@@ -687,7 +704,9 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
 
     // Build a real application-mode snapshot from the committed Root state, install it into a
     // fresh SQLite state machine, and reopen that state machine to prove actual Root state restore.
-    let (snapshot_meta, snapshot_bytes) = build_snapshot(&cluster.node(leader_id).sm).await?;
+    let leader_snapshot = cluster.node(leader_id).node.build_snapshot().await?;
+    let snapshot_meta = leader_snapshot.meta;
+    let snapshot_bytes = leader_snapshot.snapshot.into_inner();
     let restored_dir = tempfile::tempdir()?;
     let mut restored = PersistentStateMachine::open_application(
         restored_dir.path(),
