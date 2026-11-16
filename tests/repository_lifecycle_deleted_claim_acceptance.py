@@ -629,12 +629,20 @@ class DeletedClaimAcceptanceHarness(RepositoryLifecycleHarness):
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(self._claim_raw, race["id"], "race-runner")
-                self._wait_claim_blocked(future)
-                self.delete_repository()
-                assert self.checkout_rows() == before, "soft delete changed checkout rows"
-                self._release_policy_lock()
+                # Release the owned barrier inside the executor scope, before
+                # ThreadPoolExecutor.__exit__ waits for the claim future. A
+                # failure in delete/snapshot must not strand the blocked claim
+                # behind a barrier whose outer finally cannot run until shutdown.
+                try:
+                    self._wait_claim_blocked(future)
+                    self.delete_repository()
+                    assert self.checkout_rows() == before, "soft delete changed checkout rows"
+                finally:
+                    self._release_policy_lock()
                 status, raw, headers = future.result(timeout=20)
         finally:
+            # Idempotent outer failsafe; the inner finally above is the release
+            # that must precede executor shutdown/future waiting.
             self._release_policy_lock()
 
         self._remember_claim_token(raw)
