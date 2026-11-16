@@ -25,6 +25,14 @@ SOURCE_FAILURE_PIPE = 13
 SOURCE_FAILURE_SYSCALL = 14
 SOURCE_FAILURE_WCHAN = 15
 SOURCE_FAILURE_NOT_SLEEPING = 16
+SOURCE_FAILURE_FD_MISSING = 17
+SOURCE_FAILURE_FD_REPLACED = 18
+SOURCE_FAILURE_POSITION_RESET = 19
+SOURCE_FAILURE_POSITION_PROGRESS = 20
+SOURCE_FAILURE_POSITION_EOF = 21
+SOURCE_FAILURE_NO_CANDIDATE = 22
+SOURCE_FAILURE_WRITER_RUNNING = 23
+SOURCE_FAILURE_NO_BLOCKED_WRITER = 24
 
 
 class SourceParseError(ValueError):
@@ -158,7 +166,7 @@ def _fd_numbers(proc_root, pid):
 
 
 class LfsSourceWitness:
-    """Bind the unique readable descriptor for one fixture LFS object."""
+    """Separate immutable LFS source identity from transient qualification."""
 
     witness_kind_code = 1
 
@@ -169,34 +177,118 @@ class LfsSourceWitness:
         self.expected_size = int(expected_size)
         self.proc_root = Path(proc_root)
         self.identity = None
+        self.bound = False
         self.fd = 0
         self.st_dev = 0
         self.st_ino = 0
         self.mnt_id = 0
+        self.flags = 0
         self.position = 0
         self.size = 0
         self.qualified = False
         self.failure_code = SOURCE_FAILURE_NONE
+        self.fatal_failure_code = SOURCE_FAILURE_NONE
 
-    def _base_report(self, qualified, failure_code):
+    def _base_report(self, *, qualified=False, failure_code=SOURCE_FAILURE_NONE):
         return {
             "witness_version": 1,
             "witness_kind_code": self.witness_kind_code,
             "witness_available": bool(self.identity is not None),
+            "witness_bound": bool(self.bound),
             "qualified": bool(qualified),
             "failure_code": int(failure_code),
-            "source_identity_unique": bool(qualified),
+            "fatal_failure_code": int(self.fatal_failure_code),
+            "source_identity_unique": bool(self.bound and not self.fatal_failure_code),
             "source_position_unchanged": bool(qualified),
             "source_unfinished": bool(qualified),
-            "source_position": int(self.position),
-            "source_size": int(self.size),
-            "source_remaining": max(0, int(self.size) - int(self.position)),
+            "source_position": int(self.position if self.bound else 0),
+            "source_size": int(self.size if self.bound else 0),
+            "source_remaining": (
+                max(0, int(self.size) - int(self.position)) if self.bound else 0
+            ),
         }
 
-    def _fail(self, code):
+    def _transient(self, code):
         self.qualified = False
         self.failure_code = code
-        return self._base_report(False, code)
+        return self._base_report(qualified=False, failure_code=code)
+
+    def _fatal(self, code):
+        self.qualified = False
+        self.fatal_failure_code = code
+        self.failure_code = code
+        return self._base_report(qualified=False, failure_code=code)
+
+    def _bind_candidate(self):
+        if self.bound or self.fatal_failure_code:
+            return
+        try:
+            self.identity = read_service_identity(self.service_pid, proc_root=self.proc_root)
+        except SourceParseError:
+            self._fatal(SOURCE_FAILURE_IDENTITY)
+            return
+        try:
+            object_stat = os.stat(self.object_path)
+        except FileNotFoundError:
+            self._transient(SOURCE_FAILURE_NO_MATCH)
+            return
+        except OSError:
+            self._fatal(SOURCE_FAILURE_OBJECT)
+            return
+        if (not stat_module.S_ISREG(object_stat.st_mode)
+                or object_stat.st_size != self.expected_size):
+            self._fatal(SOURCE_FAILURE_OBJECT)
+            return
+        try:
+            fd_numbers = _fd_numbers(self.proc_root, self.service_pid)
+        except (OSError, SourceParseError):
+            self._fatal(SOURCE_FAILURE_UNOBSERVABLE)
+            return
+        candidates = []
+        for fd in fd_numbers:
+            fd_path = self.proc_root / str(self.service_pid) / "fd" / str(fd)
+            try:
+                descriptor_stat = os.stat(fd_path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                self._fatal(SOURCE_FAILURE_UNOBSERVABLE)
+                return
+            if (descriptor_stat.st_dev != object_stat.st_dev
+                    or descriptor_stat.st_ino != object_stat.st_ino
+                    or descriptor_stat.st_size != self.expected_size):
+                continue
+            try:
+                info = read_fdinfo(self.proc_root, self.service_pid, fd)
+            except SourceParseError:
+                self._fatal(SOURCE_FAILURE_FDINFO)
+                return
+            if (info.flags & os.O_ACCMODE) != os.O_RDONLY or info.ino != object_stat.st_ino:
+                self._fatal(SOURCE_FAILURE_NOT_READABLE)
+                return
+            if info.pos >= self.expected_size:
+                self._fatal(SOURCE_FAILURE_POSITION_EOF)
+                return
+            candidates.append((fd, info, descriptor_stat))
+        if not candidates:
+            self._transient(SOURCE_FAILURE_NO_CANDIDATE)
+            return
+        if len(candidates) > 1:
+            self._fatal(SOURCE_FAILURE_MULTIPLE_MATCH)
+            return
+        if candidates[0][1].pos <= 0:
+            self._transient(SOURCE_FAILURE_NO_CANDIDATE)
+            return
+        self.fd, info, descriptor_stat = candidates[0]
+        self.st_dev = descriptor_stat.st_dev
+        self.st_ino = descriptor_stat.st_ino
+        self.mnt_id = info.mnt_id
+        self.flags = info.flags
+        self.position = info.pos
+        self.size = object_stat.st_size
+        self.bound = True
+        self.failure_code = SOURCE_FAILURE_NONE
+        self.qualified = True
 
     def prepare_no_match(self):
         try:
@@ -224,85 +316,55 @@ class LfsSourceWitness:
         return True
 
     def bind(self):
-        try:
-            self.identity = read_service_identity(self.service_pid, proc_root=self.proc_root)
-            object_stat = os.stat(self.object_path)
-        except (OSError, SourceParseError):
-            return self._fail(SOURCE_FAILURE_OBJECT)["qualified"]
-        if (not stat_module.S_ISREG(object_stat.st_mode)
-                or object_stat.st_size != self.expected_size):
-            return self._fail(SOURCE_FAILURE_OBJECT)["qualified"]
-        candidates = []
-        try:
-            for fd in _fd_numbers(self.proc_root, self.service_pid):
-                fd_path = self.proc_root / str(self.service_pid) / "fd" / str(fd)
-                try:
-                    descriptor_stat = os.stat(fd_path)
-                except FileNotFoundError:
-                    continue
-                if (descriptor_stat.st_dev != object_stat.st_dev
-                        or descriptor_stat.st_ino != object_stat.st_ino
-                        or descriptor_stat.st_size != self.expected_size):
-                    continue
-                try:
-                    info = read_fdinfo(self.proc_root, self.service_pid, fd)
-                except SourceParseError:
-                    return self._fail(SOURCE_FAILURE_FDINFO)["qualified"]
-                if (info.flags & os.O_ACCMODE) != os.O_RDONLY:
-                    return self._fail(SOURCE_FAILURE_NOT_READABLE)["qualified"]
-                if info.ino != object_stat.st_ino:
-                    return self._fail(SOURCE_FAILURE_NOT_READABLE)["qualified"]
-                if not (0 < info.pos < self.expected_size):
-                    return self._fail(SOURCE_FAILURE_POSITION_EDGE)["qualified"]
-                candidates.append((fd, info, descriptor_stat))
-        except (OSError, SourceParseError):
-            return self._fail(SOURCE_FAILURE_UNOBSERVABLE)["qualified"]
-        if not candidates:
-            return self._fail(SOURCE_FAILURE_NO_MATCH)["qualified"]
-        if len(candidates) > 1:
-            return self._fail(SOURCE_FAILURE_MULTIPLE_MATCH)["qualified"]
-        self.fd, info, descriptor_stat = candidates[0]
-        self.st_dev = descriptor_stat.st_dev
-        self.st_ino = descriptor_stat.st_ino
-        self.mnt_id = info.mnt_id
-        self.position = info.pos
-        self.size = object_stat.st_size
-        self.qualified = True
-        self.failure_code = SOURCE_FAILURE_NONE
-        return True
+        if self.fatal_failure_code:
+            return False
+        if not self.bound:
+            self._bind_candidate()
+        if not self.bound:
+            return False
+        return bool(self.qualified)
 
     def sample(self):
-        if not self.qualified or self.identity is None:
-            return self._fail(self.failure_code or SOURCE_FAILURE_NO_MATCH)
+        if self.fatal_failure_code:
+            return self._fatal(self.fatal_failure_code)
+        if not self.bound:
+            self._bind_candidate()
+            if not self.bound:
+                return self._base_report(qualified=False, failure_code=self.failure_code)
+            return self._base_report(qualified=True)
         if not verify_service_identity(self.identity, proc_root=self.proc_root):
-            return self._fail(SOURCE_FAILURE_IDENTITY)
+            return self._fatal(SOURCE_FAILURE_IDENTITY)
         try:
             object_stat = os.stat(self.object_path)
             descriptor_stat = os.stat(
                 self.proc_root / str(self.service_pid) / "fd" / str(self.fd)
             )
             info = read_fdinfo(self.proc_root, self.service_pid, self.fd)
+        except FileNotFoundError:
+            return self._fatal(SOURCE_FAILURE_FD_MISSING)
         except (OSError, SourceParseError):
-            return self._fail(SOURCE_FAILURE_UNOBSERVABLE)
+            return self._fatal(SOURCE_FAILURE_UNOBSERVABLE)
         if (not stat_module.S_ISREG(object_stat.st_mode)
                 or object_stat.st_dev != self.st_dev
                 or object_stat.st_ino != self.st_ino
                 or object_stat.st_size != self.size):
-            return self._fail(SOURCE_FAILURE_OBJECT_CHANGED)
+            return self._fatal(SOURCE_FAILURE_OBJECT_CHANGED)
         if (descriptor_stat.st_dev != self.st_dev
                 or descriptor_stat.st_ino != self.st_ino
                 or descriptor_stat.st_size != self.size):
-            return self._fail(SOURCE_FAILURE_OBJECT_CHANGED)
+            return self._fatal(SOURCE_FAILURE_FD_REPLACED)
         if (info.flags & os.O_ACCMODE) != os.O_RDONLY or info.ino != self.st_ino:
-            return self._fail(SOURCE_FAILURE_NOT_READABLE)
+            return self._fatal(SOURCE_FAILURE_NOT_READABLE)
         if info.mnt_id != self.mnt_id:
-            return self._fail(SOURCE_FAILURE_OBJECT_CHANGED)
-        if not (0 < info.pos < self.size):
-            return self._fail(SOURCE_FAILURE_POSITION_EDGE)
-        if info.pos != self.position:
+            return self._fatal(SOURCE_FAILURE_OBJECT_CHANGED)
+        if info.pos >= self.size:
+            return self._fatal(SOURCE_FAILURE_POSITION_EOF)
+        if info.pos <= 0 or info.pos < self.position:
+            return self._fatal(SOURCE_FAILURE_POSITION_RESET)
+        if info.pos > self.position:
             self.position = info.pos
-            return self._fail(SOURCE_FAILURE_POSITION_MOVED)
-        return self._base_report(True, SOURCE_FAILURE_NONE)
+            return self._transient(SOURCE_FAILURE_POSITION_PROGRESS)
+        return self._base_report(qualified=True, failure_code=SOURCE_FAILURE_NONE)
 
     def report(self):
         return self.sample()

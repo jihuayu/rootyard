@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(ROOT / "tests"))
 
+import transfer_revocation_backpressure as revocation_backpressure  # noqa: E402
 import transfer_revocation_git_source as git_source  # noqa: E402
 import transfer_revocation_observer as observer  # noqa: E402
 import transfer_revocation_source as source  # noqa: E402
@@ -30,6 +31,23 @@ def _write(path, text):
 
 def _fdinfo(path, *, pos, flags, ino, mnt_id=77):
     _write(path, f"pos:\t{pos}\nflags:\t{flags:o}\nino:\t{ino}\nmnt_id:\t{mnt_id}\n")
+
+
+def _window_sample(now_ns, qualified, *, inode=17):
+    return {
+        "observed_ns": now_ns,
+        "sample_start_ns": now_ns,
+        "sample_duration_ns": 0,
+        "net_table_available": True,
+        "same_netns": True,
+        "probe0_pending": True,
+        "source_qualified": qualified,
+        "server_tx_queue": 4096,
+        "client_rx_queue": 4096,
+        "server_socket_inode": inode,
+        "server_fd_owned": True,
+        "client_inode_owned": True,
+    }
 
 
 class TestSourceParsers(unittest.TestCase):
@@ -106,33 +124,108 @@ class TestLfsSourceWitness(unittest.TestCase):
         self.assertNotIn("oid", json.dumps(report))
 
     def test_eof_wrong_inode_multiple_fds_and_missing_fdinfo_fail(self):
+        eof = source.LfsSourceWitness(self.pid, self.object_path, 100, proc_root=self.proc)
         self._add_fd(pos=100)
-        self.assertFalse(self.witness.bind())
+        self.assertFalse(eof.bind())
+        self.assertEqual(eof.fatal_failure_code, source.SOURCE_FAILURE_POSITION_EOF)
+
+        wrong = source.LfsSourceWitness(self.pid, self.object_path, 100, proc_root=self.proc)
         self._add_fd(pos=40, inode=self.ino + 1)
-        self.assertFalse(self.witness.bind())
+        self.assertFalse(wrong.bind())
+        self.assertEqual(wrong.fatal_failure_code, source.SOURCE_FAILURE_NOT_READABLE)
+
+        multiple = source.LfsSourceWitness(self.pid, self.object_path, 100, proc_root=self.proc)
         self._add_fd(fd=9, pos=40)
         self._add_fd(fd=10, pos=40)
-        self.assertFalse(self.witness.bind())
-        (self.proc / str(self.pid) / "fdinfo" / "9").unlink()
-        self.assertFalse(self.witness.bind())
+        self.assertFalse(multiple.bind())
+        self.assertEqual(multiple.fatal_failure_code, source.SOURCE_FAILURE_MULTIPLE_MATCH)
 
-    def test_progress_file_replacement_and_pid_reuse_fail(self):
-        self._add_fd()
+        missing = source.LfsSourceWitness(self.pid, self.object_path, 100, proc_root=self.proc)
+        self._add_fd(fd=9, pos=40)
+        (self.proc / str(self.pid) / "fdinfo" / "9").unlink()
+        self.assertFalse(missing.bind())
+        self.assertEqual(missing.fatal_failure_code, source.SOURCE_FAILURE_FDINFO)
+
+    def test_no_fd_progress_then_stable_position_qualifies_after_progress(self):
+        self.assertTrue(self.witness.prepare_no_match())
+        self.assertFalse(self.witness.bind())
+        self.assertEqual(self.witness.fatal_failure_code, source.SOURCE_FAILURE_NONE)
+        self._add_fd(pos=40)
+        self.assertTrue(self.witness.bind())
+        _fdinfo(self.proc / str(self.pid) / "fdinfo" / "9",
+                pos=41, flags=0, ino=self.ino)
+        progress = self.witness.sample()
+        self.assertFalse(progress["qualified"])
+        self.assertEqual(progress["fatal_failure_code"], source.SOURCE_FAILURE_NONE)
+        self.assertEqual(progress["failure_code"], source.SOURCE_FAILURE_POSITION_PROGRESS)
+        self.assertTrue(self.witness.sample()["qualified"])
+
+        # The last progress sample starts a fresh continuous source window.
+        window = revocation_backpressure.SustainedStallWindow(
+            500_000_000, max_gap_ns=100_000_000
+        )
+        for now in range(0, 561_000_000, 20_000_000):
+            qualified = now >= 60_000_000
+            window.observe(_window_sample(now, qualified), now)
+            if now < 560_000_000:
+                self.assertFalse(window.qualified)
+        self.assertTrue(window.qualified)
+
+    def test_backwards_and_eof_positions_cannot_recover(self):
+        self._add_fd(pos=40)
         self.assertTrue(self.witness.bind())
         _fdinfo(self.proc / str(self.pid) / "fdinfo" / "9",
                 pos=41, flags=0, ino=self.ino)
         self.assertFalse(self.witness.sample()["qualified"])
         _fdinfo(self.proc / str(self.pid) / "fdinfo" / "9",
                 pos=40, flags=0, ino=self.ino)
-        self.object_path.unlink()
-        self.object_path.write_bytes(b"y" * 100)
         self.assertFalse(self.witness.sample()["qualified"])
-        replacement = source.LfsSourceWitness(
-            self.pid, self.object_path, 100, proc_root=self.proc
-        )
+        self.assertEqual(self.witness.fatal_failure_code,
+                         source.SOURCE_FAILURE_POSITION_RESET)
+        _fdinfo(self.proc / str(self.pid) / "fdinfo" / "9",
+                pos=41, flags=0, ino=self.ino)
+        self.assertFalse(self.witness.sample()["qualified"],
+                         "a fatal backwards position must not be recovered by retry")
+
+        eof = source.LfsSourceWitness(self.pid, self.object_path, 100, proc_root=self.proc)
+        self._add_fd(pos=40)
+        self.assertTrue(eof.bind())
+        _fdinfo(self.proc / str(self.pid) / "fdinfo" / "9",
+                pos=100, flags=0, ino=self.ino)
+        self.assertFalse(eof.sample()["qualified"])
+        self.assertEqual(eof.fatal_failure_code, source.SOURCE_FAILURE_POSITION_EOF)
+        _fdinfo(self.proc / str(self.pid) / "fdinfo" / "9",
+                pos=40, flags=0, ino=self.ino)
+        self.assertFalse(eof.sample()["qualified"],
+                         "EOF then rewind must not requalify")
+
+    def test_fd_replacement_and_pid_reuse_cannot_recover(self):
+        self._add_fd(pos=40)
+        self.assertTrue(self.witness.bind())
+        replacement = self.root / "data" / "lfs" / "repo" / "replacement"
+        replacement.write_bytes(b"z" * 100)
+        link = self.proc / str(self.pid) / "fd" / "9"
+        link.unlink()
+        link.symlink_to(replacement)
+        self.assertFalse(self.witness.sample()["qualified"])
+        self.assertNotEqual(self.witness.fatal_failure_code, source.SOURCE_FAILURE_NONE)
+        link.unlink()
+        link.symlink_to(self.object_path)
+        self.assertFalse(self.witness.sample()["qualified"],
+                         "an already-bound FD replacement must not be adopted back")
+
+        identity = source.LfsSourceWitness(self.pid, self.object_path, 100,
+                                           proc_root=self.proc)
+        self._add_fd(pos=40)
+        self.assertTrue(identity.bind())
         _write(self.proc / str(self.pid) / "stat",
                _stat_text(self.pid, "rootyard", starttime=51))
-        self.assertFalse(replacement.bind())
+        self.assertFalse(identity.sample()["qualified"])
+        self.assertEqual(identity.fatal_failure_code, source.SOURCE_FAILURE_IDENTITY)
+        _write(self.proc / str(self.pid) / "stat",
+               _stat_text(self.pid, "rootyard", starttime=50))
+        self.assertFalse(identity.sample()["qualified"],
+                         "owner PID starttime reuse must not recover")
 
     def test_permission_denial_and_missing_identity_fail_closed(self):
         self._add_fd()
@@ -211,6 +304,61 @@ class TestGitSourceWitness(unittest.TestCase):
         self.assertTrue(report["qualified"])
         self.assertEqual(report["source_syscall_kind_code"], 2)
 
+    def test_no_candidate_then_blocked_writer_recovers_and_window_qualifies(self):
+        self._task_files(syscall="running")
+        self.assertFalse(self.witness.bind())
+        self.assertEqual(self.witness.fatal_failure_code, source.SOURCE_FAILURE_NONE)
+        self._task_files(syscall="1 0x1 0x2 0x10 0x0 0x0 0x0")
+        self.assertTrue(self.witness.sample()["qualified"])
+        window = revocation_backpressure.SustainedStallWindow(
+            500_000_000, max_gap_ns=100_000_000
+        )
+        for now in range(0, 561_000_000, 20_000_000):
+            qualified = now >= 60_000_000
+            window.observe(_window_sample(now, qualified, inode=700), now)
+            if now < 560_000_000:
+                self.assertFalse(window.qualified)
+        self.assertTrue(window.qualified)
+
+    def test_running_writer_then_blocked_same_identity_recovers(self):
+        self._task_files(syscall="running")
+        self.assertFalse(self.witness.bind())
+        self.assertFalse(self.witness.sample()["qualified"])
+        self.assertEqual(self.witness.fatal_failure_code, source.SOURCE_FAILURE_NONE)
+        self._task_files(syscall="1 0x1 0x2 0x10 0x0 0x0 0x0")
+        self.assertTrue(self.witness.sample()["qualified"])
+
+    def test_task_identity_and_pipe_change_cannot_recover(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(starttime=62)
+        self.assertFalse(self.witness.sample()["qualified"])
+        self.assertEqual(self.witness.fatal_failure_code, source.SOURCE_FAILURE_TASK)
+        self._task_files(starttime=61)
+        self.assertFalse(self.witness.sample()["qualified"],
+                         "task starttime reuse must not be cleared by retry")
+
+        pipe = git_source.GitSourceWitness(
+            100, [self.identity], proc_root=self.proc, uid=None, arch="x86_64"
+        )
+        self.assertTrue(pipe.bind())
+        self._task_files(pipe_inode=701)
+        self.assertFalse(pipe.sample()["qualified"])
+        self.assertEqual(pipe.fatal_failure_code, source.SOURCE_FAILURE_PIPE)
+        self._task_files(pipe_inode=700)
+        self.assertFalse(pipe.sample()["qualified"],
+                         "paired pipe replacement must not be adopted back")
+
+    def test_two_blocked_writers_are_ambiguous_and_cannot_recover(self):
+        _write(self.proc / "200" / "task" / "202" / "stat",
+               _stat_text(202, "git", ppid=200, pgid=200, starttime=63))
+        _write(self.proc / "200" / "task" / "202" / "syscall",
+               "1 0x1 0x2 0x10 0x0 0x0 0x0")
+        _write(self.proc / "200" / "task" / "202" / "wchan", "pipe_write\n")
+        self.assertFalse(self.witness.bind())
+        self.assertEqual(self.witness.fatal_failure_code, source.SOURCE_FAILURE_TASK)
+        (self.proc / "200" / "task" / "202" / "syscall").unlink()
+        self.assertFalse(self.witness.sample()["qualified"])
+
     def test_running_unknown_syscall_and_wait4_fail(self):
         for syscall in ("running", "999 0x1 0x2 0x3", "61 0x1 0x2 0x3"):
             self._task_files(syscall=syscall)
@@ -242,6 +390,8 @@ class TestGitSourceWitness(unittest.TestCase):
         syscall_path.chmod(0)
         try:
             self.assertFalse(self.witness.bind())
+            self.assertEqual(self.witness.fatal_failure_code,
+                             source.SOURCE_FAILURE_UNOBSERVABLE)
         finally:
             syscall_path.chmod(0o600)
 
