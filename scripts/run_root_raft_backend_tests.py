@@ -484,27 +484,39 @@ def collect_failure_evidence(text) -> FailureEvidence:
             observed["ignored"] += 1
 
     summary = summaries[0] if len(summaries) == 1 else None
-    if summary is None:
-        counts = observed
-        summary_counts = None
-    else:
-        _status, passed, failed, ignored, measured, filtered = summary
-        summary_counts = {
+    summary_status = None
+    summary_counts = None
+    if summary is not None:
+        status, passed, failed, ignored, measured, filtered = summary
+        candidate = {
             "passed": int(passed),
             "failed": int(failed),
             "ignored": int(ignored),
             "measured": int(measured),
             "filtered": int(filtered),
         }
-        if any(value > EXPECTED_CASE_COUNT for value in summary_counts.values()):
-            summary_counts = None
-            counts = observed
-        else:
-            counts = summary_counts
+        if not any(value > EXPECTED_CASE_COUNT for value in candidate.values()):
+            summary_status = status
+            summary_counts = candidate
 
+    summary_consistent = (
+        summary_counts is not None
+        and summary_status is not None
+        and summary_counts["passed"] == observed["passed"]
+        and summary_counts["failed"] == observed["failed"]
+        and summary_counts["ignored"] == observed["ignored"]
+        and summary_counts["measured"] == observed["measured"]
+        and summary_counts["filtered"] == observed["filtered"]
+        and ((summary_status == "FAILED") == (observed["failed"] > 0))
+    )
+    counts = (
+        summary_counts
+        if summary_consistent and not duplicate_case and not unknown_case
+        else observed
+    )
     running_count = running[0] if len(running) == 1 else None
     complete = (
-        summary_counts is not None
+        summary_consistent
         and running_count is not None
         and not duplicate_case
         and not unknown_case

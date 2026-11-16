@@ -484,6 +484,47 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertTrue(evidence.diagnostics_valid)
         self.assertNotIn(SECRET, json.dumps(evidence.cases))
 
+    def test_failure_evidence_requires_summary_status_and_counts_to_match_rows(self) -> None:
+        all_ok_failed_summary = (
+            f"running 3 tests\n"
+            f"test {CASE_REAL} ... ok\n"
+            f"test {CASE_PRUNED} ... ok\n"
+            f"test {CASE_DRAIN} ... ok\n"
+            f"test result: FAILED. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        )
+        evidence = runner.collect_failure_evidence(all_ok_failed_summary)
+        self.assertFalse(evidence.complete)
+        self.assertEqual(
+            evidence.counts,
+            {"passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered": 0},
+        )
+        self.assertEqual([case["status"] for case in evidence.cases], ["passed"] * 3)
+
+        failed_row_ok_summary = (
+            f"running 3 tests\n"
+            f"test {CASE_REAL} ... FAILED\n"
+            f"test {CASE_PRUNED} ... ok\n"
+            f"test {CASE_DRAIN} ... ok\n"
+            f"test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        )
+        evidence = runner.collect_failure_evidence(failed_row_ok_summary)
+        self.assertFalse(evidence.complete)
+        self.assertEqual(
+            evidence.counts,
+            {"passed": 2, "failed": 1, "ignored": 0, "measured": 0, "filtered": 0},
+        )
+        self.assertEqual(evidence.cases[0], {"name": CASE_REAL, "status": "failed"})
+
+        consistent = runner.collect_failure_evidence(
+            f"running 3 tests\n"
+            f"test {CASE_REAL} ... FAILED\n"
+            f"test {CASE_PRUNED} ... ok\n"
+            f"test {CASE_DRAIN} ... ok\n"
+            f"test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        )
+        self.assertTrue(consistent.complete)
+        self.assertEqual(consistent.counts["failed"], 1)
+
     def test_failure_evidence_is_partial_without_summary(self) -> None:
         partial = (
             f"running 3 tests\n"
