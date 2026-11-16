@@ -118,7 +118,7 @@ impl CleanupDriver for NativeCleanupDriver {
                         rootyard::workspaces::stop_capture_before_helper(stop, task, capture_grace, async move {
                             let (helper_result, evidence) = shutdown_helper_until_with_evidence(deadline).await;
                             *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = evidence;
-                            helper_result.map_err(|error| format!("{error}"))
+                            helper_result.map_err(|error| anyhow!("{error}"))
                         })
                         .await
                         .map_err(|error| format!("{error:#}"));
