@@ -9,9 +9,10 @@ use crate::{
             WebAssigneesForm, WebCommentEditForm, WebCommentModerateForm, WebLabelsForm,
             WebNewLabelForm, WebNewReviewCommentForm, WebNotificationQuery, WebSearchQuery,
             WebSubscriptionForm, WebUpdateLabelForm, WebVersionForm, inject_before_main_end,
-            pct_encode, render_notifications_view, render_pull_collab_html, render_search_view,
+            pct_encode, render_issue_collab_html, render_notifications_view, render_pull_collab_html,
+            render_search_view,
         },
-        models::RepoHeaderCtx,
+        models::{CommentViewItem, RepoHeaderCtx, WebComment},
     },
 };
 use serde::de::DeserializeOwned;
@@ -213,4 +214,32 @@ fn notifications_and_pull_collab_render_outdated_and_role_gated_forms() {
 
     let wrapped = inject_before_main_end("<main><p>x</p></main>".to_owned(), "<div>y</div>");
     assert_eq!(wrapped, "<main><p>x</p><div>y</div></main>");
+
+    let comment = CommentViewItem {
+        comment: WebComment {
+            repository_id: Uuid::nil(),
+            issue_number: 9,
+            number: 42,
+            author_id: Uuid::nil(),
+            body: "page-comment-0042 <script>xss()</script>".to_owned(),
+            version: 3,
+            created_at: "2026-11-15T00:00:00Z".to_owned(),
+            updated_at: "2026-11-15T00:00:00Z".to_owned(),
+        },
+        author_username: "alice".to_owned(),
+    };
+    let issue_html = render_issue_collab_html(
+        &sample_header(Role::Maintain),
+        9,
+        (1, 1),
+        &[],
+        &[],
+        None,
+        &[comment],
+    );
+    assert!(issue_html.contains(r#"data-comment-action-number="42""#));
+    assert!(!issue_html.contains(r#"data-comment-number="42""#));
+    assert!(!issue_html.contains("page-comment-0042"));
+    assert!(issue_html.contains(r#"data-web-action="comment-edit""#));
+    assert!(issue_html.contains(r#"data-web-action="comment-mod""#));
 }

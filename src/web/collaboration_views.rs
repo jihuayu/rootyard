@@ -374,8 +374,8 @@ pub fn render_issue_collab_html(
         let c = &item.comment;
         if header.effective_role >= Role::Triage {
             mod_forms.push_str(&format!(
-                "<div class=\"comment-actions\" data-comment-number=\"{}\"><form data-web-action=\"comment-edit\" action=\"{base}/comments/{}/edit\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"/><input name=\"body\" value=\"{}\" required/><button>Edit #{}</button><p class=\"form-result\" role=\"status\"></p></form><form data-web-action=\"comment-delete\" action=\"{base}/comments/{}/delete\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"/><button>Delete #{}</button><p class=\"form-result\" role=\"status\"></p></form>",
-                c.number, c.number, c.version, escape_html(&c.body), c.number, c.number, c.version, c.number,
+                "<div class=\"comment-actions\" data-comment-action-number=\"{}\"><form data-web-action=\"comment-edit\" action=\"{base}/comments/{}/edit\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"/><input name=\"body\" placeholder=\"Updated body\" required/><button>Edit #{}</button><p class=\"form-result\" role=\"status\"></p></form><form data-web-action=\"comment-delete\" action=\"{base}/comments/{}/delete\"><input type=\"hidden\" name=\"expected_version\" value=\"{}\"/><button>Delete #{}</button><p class=\"form-result\" role=\"status\"></p></form>",
+                c.number, c.number, c.version, c.number, c.number, c.version, c.number,
             ));
             if header.effective_role >= Role::Maintain {
                 mod_forms.push_str(&format!(
