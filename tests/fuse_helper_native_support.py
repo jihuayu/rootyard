@@ -919,7 +919,7 @@ def wait_for_mount_id_gone(holder_pid, mountpoint, mount_id, timeout=EXIT_DEADLI
             raise HarnessError(f"holder mountinfo became unreadable: {error}") from None
         if not any(row["mount_id"] == int(mount_id)
                    and row["mountpoint"] == expected
-                   and row["source"] == "rootyard-workspace"
+                   and row["source"] == "rootyard-vfs"
                    for row in rows):
             return True
         time.sleep(0.05)
@@ -1003,7 +1003,7 @@ def wait_for_fuse_mount(api_pid, mountpoint, timeout=MOUNT_DEADLINE):
             rows = []
         matches = [row for row in rows
                    if row["mountpoint"] == expected
-                   and row["source"] == "rootyard-workspace"
+                   and row["source"] == "rootyard-vfs"
                    and (row["fstype"] == "fuse" or row["fstype"].startswith("fuse."))]
         if len(matches) == 1:
             return matches[0]
