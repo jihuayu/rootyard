@@ -2,15 +2,16 @@
 use crate::{
     AppState, Error,
     auth::{self, finish_tx as finish, idempotency_key},
+    forge::notifications::{NotifySpec, emit_repo_notifications},
     git_http,
     members::{audit, models::Role, rbac},
     pulls::{
         models::{
             NewPull, NewReview, PULL_FIELDS, Page, PullDiffResponse, PullPage, PullPatch,
             PullRequest, PullReview, PullStateFilter, REVIEW_FIELDS, body_valid, creation_replay,
-            git_cmd, json, merge_base, normalize_branch_ref, positive, pull_exists,
-            record_creation, repo_tenant_id, repository_object_format, resolve_ref_oid, title_valid,
-            valid_oid, valid_oid_for_format, valid_review_state,
+            git_cmd, json, merge_base, normalize_branch_ref, positive, record_creation,
+            repo_tenant_id, repository_object_format, resolve_ref_oid, title_valid, valid_oid,
+            valid_oid_for_format, valid_review_state,
         },
         rules,
     },
@@ -160,6 +161,7 @@ pub async fn create_pull(
     record_creation(&tx, tenant_id, repo, key, &pull).await?;
     let det = sjson!({ "head_ref": head_ref, "base_ref": base_ref, "head_oid": live_head_oid });
     audit::record_audit_event(&tx, tenant_id, repo, &actor, "pull.created", "pull", &number.to_string(), det).await?;
+    emit_repo_notifications(&tx, NotifySpec { tenant_id, repository_id: repo, actor_id: actor.id, target_type: "pull", target_number: number, thread_type: "pull", thread_number: number, event_kind: "pull_opened", delivery_key: &format!("pull:{repo}:{number}:opened"), title: &format!("PR #{number}: {}", input.title), body_excerpt: &input.body, extra_recipients: &[] }).await?;
     let sync_wh = has_active_webhooks(&tx, repo).await?;
     finish(tx, &actor, true).await?;
     drop(client);
@@ -306,6 +308,9 @@ pub async fn update_pull(
     let pull = PullRequest::row(&row);
     let det = sjson!({ "state": pull.state, "version": pull.version });
     audit::record_audit_event(&tx, tenant_id, repo, &actor, "pull.updated", "pull", &number.to_string(), det).await?;
+    if pull.state == "open" && input.head_oid.is_some() {
+        emit_repo_notifications(&tx, NotifySpec { tenant_id, repository_id: repo, actor_id: actor.id, target_type: "pull", target_number: number, thread_type: "pull", thread_number: number, event_kind: "pull_synchronized", delivery_key: &format!("pull:{repo}:{number}:sync:v{}:{}", pull.version, pull.head_oid), title: &format!("PR #{number} updated: {}", pull.title), body_excerpt: "", extra_recipients: &[] }).await?;
+    }
     let sync_action = if pull.state == "open" {
         if input.head_oid.is_some() {
             Some("synchronize")
@@ -442,6 +447,7 @@ pub async fn create_review(
     record_creation(&tx, tenant_id, repo, key, &review).await?;
     let det = sjson!({ "pull_number": number, "state": input.state, "commit_oid": input.commit_oid });
     audit::record_audit_event(&tx, tenant_id, repo, &actor, "pull_review.submitted", "pull_review", &format!("{number}:{review_number}"), det).await?;
+    emit_repo_notifications(&tx, NotifySpec { tenant_id, repository_id: repo, actor_id: actor.id, target_type: "pull_review", target_number: review_number, thread_type: "pull", thread_number: number, event_kind: "pull_review_submitted", delivery_key: &format!("pull:{repo}:{number}:review:{review_number}"), title: &format!("Review ({}) on PR #{number}", input.state), body_excerpt: &input.body, extra_recipients: &[] }).await?;
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::CREATED, review))
 }
@@ -459,11 +465,11 @@ pub async fn list_reviews(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::PullsRead).await?.repo_id;
     let tenant_id = repo_tenant_id(&tx, repo).await?;
-    pull_exists(&tx, tenant_id, repo, number).await?;
+    let head_oid: String = tx.query_opt("SELECT head_oid FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number=$3", &[&tenant_id, &repo, &number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?.get(0);
     let q = format!("SELECT {REVIEW_FIELDS} FROM forge_pull_reviews WHERE tenant_id=$1 AND repository_id=$2 AND pull_number=$3 AND number>$4 ORDER BY number LIMIT $5");
     let rows = tx.query(&q, &[&tenant_id, &repo, &number, &after, &(limit + 1)]).await.map_err(Error::internal)?;
     let more = rows.len() > limit as usize;
-    let items: Vec<_> = rows.iter().take(limit as usize).map(PullReview::row).collect();
+    let items: Vec<_> = rows.iter().take(limit as usize).map(|r| PullReview::row_for_pull(r, &head_oid)).collect();
     let next_after = if more { items.last().map(|r| r.number) } else { None };
     finish(tx, &actor, false).await?;
     Ok(json(StatusCode::OK, sjson!({ "items": items, "next_after": next_after })))
