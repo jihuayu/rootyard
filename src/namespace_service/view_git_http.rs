@@ -26,6 +26,7 @@ pub const UPLOAD_BODY_LIMIT: usize = 10 * 1024 * 1024;
 const ADVERTISE_LIMIT: usize = 4 * 1024 * 1024;
 const UPLOAD_RESULT_CAP: usize = 64 * 1024 * 1024;
 
+#[derive(Debug)]
 struct TempFileGuard(Option<PathBuf>);
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
