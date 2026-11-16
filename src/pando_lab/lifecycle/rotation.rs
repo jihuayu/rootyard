@@ -2,7 +2,7 @@ use super::super::{Config, Pack, object_store};
 use super::{
     DEFAULT_CIPHER_SUITE, DEFAULT_KMS_KEY_ID, ENVELOPE_SCHEMA, KmsEnvelopeRecord,
     KmsRotationReport,
-    db::{load_envelope_from_db, load_file_checkpoint, persist_checkpoint},
+    db::{load_envelope_from_db, persist_checkpoint},
     envelope_file_path, load_repo_packs, provider,
     provider::PandoKeyProvider,
     provider_selection::{self, PandoProviderSelection},
@@ -500,7 +500,7 @@ async fn resolve_vault_rotation_checkpoint(
     vault: &VaultTransitProvider,
 ) -> Result<KmsRotationCheckpoint> {
     ensure_vault_retention_option(opts)?;
-    let existing = load_file_checkpoint(kms_dir)?;
+    let existing = super::db::load_db_checkpoint(c, repo).await?;
     if let Some(mut cp) = existing
         && cp.state == "IN_PROGRESS"
     {
@@ -591,6 +591,7 @@ async fn rotate_vault_kms_key_with_options(
     config: &Config,
     repo: Uuid,
     opts: &KmsRotateOptions,
+    c: &Client,
 ) -> Result<KmsRotationReport> {
     ensure!(
         provider_selection::selected_kind()? == PandoProviderSelection::VaultTransit,
@@ -598,7 +599,6 @@ async fn rotate_vault_kms_key_with_options(
     );
     ensure_vault_retention_option(opts)?;
     let vault = VaultTransitProvider::from_env()?;
-    let c = config.db().await?;
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
     let s_root = object_store::store_root(config);
     let packs = load_repo_packs(&c, repo).await?;
@@ -722,7 +722,7 @@ async fn resolve_rotation_checkpoint(
     opts: &KmsRotateOptions,
     packs: &[Pack],
 ) -> Result<(KmsRotationCheckpoint, super::provider::KmsKeyPolicy)> {
-    let existing = load_file_checkpoint(kms_dir)?;
+    let existing = super::db::load_db_checkpoint(c, repo).await?;
     if let Some(mut cp) = existing
         && cp.state == "IN_PROGRESS"
     {
@@ -801,17 +801,19 @@ pub async fn rotate_kms_key_with_options(
     repo: Uuid,
     opts: &KmsRotateOptions,
 ) -> Result<KmsRotationReport> {
+    let session = super::publication::runner_session(config, repo).await?;
+    session.acquire_publication_exclusive(repo).await?;
+    let c = session.client();
     if provider_selection::selected_kind()? == PandoProviderSelection::VaultTransit {
-        return rotate_vault_kms_key_with_options(config, repo, opts).await;
+        return rotate_vault_kms_key_with_options(config, repo, opts, c).await;
     }
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
-    if let Some(cp) = load_file_checkpoint(&kms_dir)?
+    if let Some(cp) = super::db::load_db_checkpoint(c, repo).await?
         && cp.state == "IN_PROGRESS"
         && cp.to_provider_kind != provider::PROVIDER_KIND_LOCAL
     {
         bail!("active Vault rotation requires PANDO_KMS_PROVIDER=vault-transit; refusing local-file mutation");
     }
-    let c = config.db().await?;
     let s_root = object_store::store_root(config);
     let packs = load_repo_packs(&c, repo).await?;
     for pack in &packs {

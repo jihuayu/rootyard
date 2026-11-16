@@ -1,5 +1,6 @@
 use super::{
     provider::{KmsKeyPolicy, PROVIDER_KIND_LOCAL, PROVIDER_KIND_VAULT, PandoKeyProvider, PandoKmsProvider},
+    rotation::KmsRotationCheckpoint,
     vault_provider::VaultTransitProvider,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -82,12 +83,15 @@ fn selection_from_value(value: Option<&str>) -> Result<PandoProviderSelection> {
     }
 }
 
-pub(crate) fn for_write(base_root: &Path, repo: Uuid) -> Result<PandoWriteProvider> {
+pub(crate) fn for_write(
+    base_root: &Path,
+    repo: Uuid,
+    active_rotation: Option<&KmsRotationCheckpoint>,
+) -> Result<PandoWriteProvider> {
     let kms_dir = super::provider::resolve_kms_dir(base_root, repo);
-    let active_rotation = super::db::load_file_checkpoint(&kms_dir)?.filter(|cp| cp.state == "IN_PROGRESS");
     match selected_kind()? {
         PandoProviderSelection::Local => {
-            if let Some(cp) = active_rotation.as_ref() {
+            if let Some(cp) = active_rotation {
                 ensure!(
                     cp.to_provider_kind == PROVIDER_KIND_LOCAL,
                     "active rotation requires the Vault Transit provider for new writes"
@@ -100,7 +104,7 @@ pub(crate) fn for_write(base_root: &Path, repo: Uuid) -> Result<PandoWriteProvid
         }
         PandoProviderSelection::VaultTransit => {
             let mut provider = VaultTransitProvider::from_env().context("Pando Vault Transit provider unavailable")?;
-            if let Some(cp) = active_rotation.as_ref() {
+            if let Some(cp) = active_rotation {
                 ensure!(
                     cp.to_provider_kind == PROVIDER_KIND_VAULT,
                     "active Local rotation cannot use the Vault Transit write provider"

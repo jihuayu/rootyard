@@ -84,7 +84,9 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
         ensure!(expected == pack_bytes, "expected pack byte length mismatch");
     }
     let suite = opts.cipher_suite.as_deref().unwrap_or(lifecycle::DEFAULT_CIPHER_SUITE);
-    let provider = lifecycle::provider_selection::for_write(&config.root, repo)?;
+    let session = lifecycle::publication::writer_session(config, repo).await?;
+    let checkpoint = lifecycle::publication::active_rotation(session.client(), repo).await?;
+    let provider = lifecycle::provider_selection::for_write(&config.root, repo, checkpoint.as_ref())?;
     let plain_bytes = fs::read(&pack).await?;
     let sealed = lifecycle::crypto::seal_pack_bytes(
         provider.provider(),

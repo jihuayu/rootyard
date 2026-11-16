@@ -296,6 +296,7 @@ pub(crate) async fn put_pack_files_sealed(
     pack_id: Uuid,
     opts: &ObjectStorePutOptions,
     storage_tier: &str,
+    checkpoint: Option<&lifecycle::rotation::KmsRotationCheckpoint>,
 ) -> Result<(
     ObjectStorePutReport,
     CasPackManifest,
@@ -315,7 +316,7 @@ pub(crate) async fn put_pack_files_sealed(
     if let Some(exp_len) = opts.expected_pack_bytes { ensure!(exp_len == pack_bytes.len() as u64, "expected pack byte length mismatch"); }
 
     let base_root = infer_base_root(store_root_dir, Some(local_objects_root));
-    let provider = lifecycle::provider_selection::for_write(base_root, repo)?;
+    let provider = lifecycle::provider_selection::for_write(base_root, repo, checkpoint)?;
     let sealed = lifecycle::crypto::seal_pack_bytes(
         provider.provider(),
         repo,
@@ -388,7 +389,12 @@ pub async fn put_pack_files(
     pack_id: Uuid,
     opts: &ObjectStorePutOptions,
 ) -> Result<(ObjectStorePutReport, CasPackManifest)> {
-    let (rep, manifest, _, _) = put_pack_files_sealed(store_root_dir, local_objects_root, repo, pack_id, opts, "hot").await?;
+    ensure!(
+        lifecycle::provider_selection::selected_kind()?
+            == lifecycle::provider_selection::PandoProviderSelection::Local,
+        "raw Local object-store helper cannot publish unterminated Vault writes"
+    );
+    let (rep, manifest, _, _) = put_pack_files_sealed(store_root_dir, local_objects_root, repo, pack_id, opts, "hot", None).await?;
     Ok((rep, manifest))
 }
 
@@ -469,8 +475,19 @@ pub async fn verify_repo_files(store_root_dir: &Path, bucket: &str, repo: Uuid) 
 }
 
 async fn put_pack_db_inner(config: &Config, repo: Uuid, pack_id: Uuid, opts: &ObjectStorePutOptions, storage_tier: &str) -> Result<(ObjectStorePutReport, lifecycle::KmsEnvelopeRecord)> {
-    let (report, manifest, env, policy) = put_pack_files_sealed(&store_root(config), &config.root.join("objects"), repo, pack_id, opts, storage_tier).await?;
-    let c = config.db().await?;
+    let session = lifecycle::publication::writer_session(config, repo).await?;
+    let checkpoint = lifecycle::publication::active_rotation(session.client(), repo).await?;
+    let (report, manifest, env, policy) = put_pack_files_sealed(
+        &store_root(config),
+        &config.root.join("objects"),
+        repo,
+        pack_id,
+        opts,
+        storage_tier,
+        checkpoint.as_ref(),
+    )
+    .await?;
+    let c = session.client();
     c.execute(
         "INSERT INTO pando_lab.object_store_manifests(repo,pack_id,bucket,pack_key,idx_key,manifest_key,pack_sha256,idx_sha256,pack_bytes,idx_bytes,object_count,chunk_size,chunk_count,manifest_json) \
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \

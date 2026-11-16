@@ -37,6 +37,24 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+pub(super) async fn load_db_checkpoint(c: &Client, repo: Uuid) -> Result<Option<KmsRotationCheckpoint>> {
+    let rows = c
+        .query(
+            "SELECT checkpoint_json FROM pando_lab.kms_rotations WHERE repo=$1 AND state='IN_PROGRESS' ORDER BY updated_at DESC",
+            &[&repo],
+        )
+        .await?;
+    ensure!(rows.len() <= 1, "multiple in-progress Pando rotation checkpoints");
+    let Some(row) = rows.into_iter().next() else { return Ok(None) };
+    let value: serde_json::Value = row.get(0);
+    let cp: KmsRotationCheckpoint = serde_json::from_value(value)?;
+    ensure!(
+        cp.repo == repo && cp.state == "IN_PROGRESS",
+        "in-progress rotation checkpoint identity mismatch"
+    );
+    Ok(Some(cp))
+}
+
 pub(super) fn load_file_checkpoint(kms_dir: &Path) -> Result<Option<KmsRotationCheckpoint>> {
     let path = checkpoint_path(kms_dir);
     if !path.is_file() {
@@ -96,7 +114,6 @@ pub(super) async fn persist_checkpoint(
     kms_dir: &Path,
     cp: &KmsRotationCheckpoint,
 ) -> Result<()> {
-    write_private_json(&checkpoint_path(kms_dir), cp)?;
     let cp_val = serde_json::to_value(cp)?;
     c.execute(
         "INSERT INTO pando_lab.kms_rotations(id,repo,from_key_id,from_key_version,to_key_id,to_key_version,state,revoke_previous,total_packs,processed_packs,failed_pack_id,checkpoint_json) \
@@ -120,6 +137,7 @@ pub(super) async fn persist_checkpoint(
         ],
     )
     .await?;
+    let _ = write_private_json(&checkpoint_path(kms_dir), cp);
     Ok(())
 }
 

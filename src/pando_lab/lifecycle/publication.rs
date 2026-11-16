@@ -94,6 +94,13 @@ pub(crate) fn lock_key(repo: Uuid, domain: u64) -> i64 {
     (((raw >> 64) as u64) ^ (raw as u64) ^ domain) as i64
 }
 
+pub(crate) async fn active_rotation(
+    client: &Client,
+    repo: Uuid,
+) -> Result<Option<super::rotation::KmsRotationCheckpoint>> {
+    super::db::load_db_checkpoint(client, repo).await
+}
+
 pub(crate) async fn writer_session(config: &Config, repo: Uuid) -> Result<PgSession> {
     let session = PgSession::connect(config).await?;
     session.acquire_publication_shared(repo).await?;
