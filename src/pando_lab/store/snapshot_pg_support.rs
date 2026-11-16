@@ -124,10 +124,10 @@ fn database_with_repeatable_read_default(database: &str) -> String {
     if database.contains("://") {
         let separator = if database.contains('?') { '&' } else { '?' };
         format!(
-            "{database}{separator}options=-c%20default_transaction_isolation%3Drepeatable%20read"
+            "{database}{separator}options=-c%20default_transaction_isolation%3Drepeatable%5C%20read"
         )
     } else {
-        format!("{database} options='-c default_transaction_isolation=repeatable read'")
+        format!("{database} options='-c default_transaction_isolation=repeatable\\\\ read'")
     }
 }
 
