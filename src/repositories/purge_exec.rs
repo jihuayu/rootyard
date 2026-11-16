@@ -267,7 +267,7 @@ async fn lock_unreferenced_pando_artifact(
     }
     let Some(row) = tx
         .query_opt(
-            "SELECT state, object_generation, (lease_until IS NULL OR lease_until <= clock_timestamp()) \
+            "SELECT state, object_generation, (lease_until IS NOT NULL AND lease_until <= clock_timestamp()) \
              FROM pando_remote_artifacts \
              WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 FOR UPDATE",
             &[&authority_id, &target.tenant_id, &target.namespace, &target.sha256],
@@ -349,7 +349,7 @@ pub(super) async fn delete_pando_artifact_states(
                  WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
                    AND object_generation = $5 \
                    AND (state IN ('active', 'retired') OR ($7 AND (state = 'reserved' \
-                        OR (state = 'deleting' AND (lease_until IS NULL OR lease_until <= clock_timestamp())))))",
+                        OR (state = 'deleting' AND lease_until IS NOT NULL AND lease_until <= clock_timestamp()))))",
                 &[&authority_id, &target.tenant_id, &target.namespace, &target.sha256, &locked_gen, &claim_owner, &allow_reserved],
             )
             .await?;
@@ -365,7 +365,7 @@ pub(super) async fn delete_pando_artifact_states(
             let _ = client
                 .execute(
                     "UPDATE pando_remote_artifacts \
-                     SET lease_until = NULL, last_error = $7, updated_at = clock_timestamp() \
+                     SET last_error = $7, updated_at = clock_timestamp() \
                      WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
                        AND object_generation = $5 AND state = 'deleting' AND claimed_by = $6",
                     &[
