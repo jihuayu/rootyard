@@ -186,12 +186,12 @@ trait StartedWork: Send {
     fn join(self: Box<Self>) -> JoinFuture;
 }
 
-struct NativeStarted(OwnedControl<Result<(), Error>>);
+struct NativeStarted(OwnedControl<()>);
 
 impl StartedWork for NativeStarted {
     fn join(self: Box<Self>) -> JoinFuture {
         let NativeStarted(control) = *self;
-        Box::pin(async move { control.join().await.and_then(|result| result) })
+        Box::pin(async move { control.join().await })
     }
 }
 
