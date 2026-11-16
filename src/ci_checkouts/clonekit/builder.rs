@@ -17,8 +17,13 @@ use uuid::Uuid;
 use super::manifest::{
     CLONEKIT_IDX_NAMESPACE, CLONEKIT_MANIFEST_SCHEMA, CLONEKIT_PACK_NAMESPACE, CloneKitArtifactDigest,
     CloneKitError, CloneKitManifest, CloneKitObjectFormat, CloneKitStatus, StoredBlobLocator, compute_file_sha256,
-    default_git_timeout, ensure_not_cancelled, ensure_private_dir, git_cmd, run_git_command, write_atomic_private_file,
+    default_git_timeout, ensure_not_cancelled, ensure_private_dir, git_cmd, run_git_command,
 };
+
+#[path = "publication.rs"]
+mod publication;
+
+pub use publication::{CloneKitPublicationStore, publish_clonekit_versioned};
 use crate::{
     blob_store::{
         BlobReceipt,
@@ -140,87 +145,6 @@ impl Drop for RetentionPinGuard<'_> {
     fn drop(&mut self) {
         self.ledger.release_pin(self.repository_id, self.kit_generation, self.pin_id);
     }
-}
-
-/// Atomic versioned disk catalog storing published CloneKit generations and active pointer.
-#[derive(Clone, Debug)]
-pub struct CloneKitPublicationStore {
-    root_dir: PathBuf,
-}
-
-impl CloneKitPublicationStore {
-    /// Open or initialize a `0o700` publication catalog root directory.
-    pub fn open(root_dir: &Path) -> Result<Self, CloneKitError> {
-        ensure_private_dir(root_dir)?;
-        Ok(Self { root_dir: root_dir.to_path_buf() })
-    }
-
-    fn current_pointer_path(&self, repo_id: Uuid) -> PathBuf {
-        self.root_dir.join(format!("repo-{}", repo_id.simple())).join("current.json")
-    }
-
-    /// Directory containing generation `kit_generation` bytes for `repo_id`.
-    pub fn version_dir(&self, repo_id: Uuid, kit_generation: u64) -> PathBuf {
-        self.root_dir.join(format!("repo-{}", repo_id.simple())).join(format!("gen-{kit_generation:08}"))
-    }
-
-    /// Load the latest verified published manifest for `repo_id`, if any.
-    pub fn load_latest(&self, repo_id: Uuid) -> Result<Option<CloneKitManifest>, CloneKitError> {
-        let bytes = match fs::read(self.current_pointer_path(repo_id)) {
-            Ok(b) => b,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(CloneKitError::CorruptArtifact(format!("read latest manifest: {err}"))),
-        };
-        Ok(Some(CloneKitManifest::from_verified_json(&bytes)?))
-    }
-
-    /// Return `(pack_path, idx_path)` for a published generation.
-    pub fn artifact_paths(&self, repo_id: Uuid, kit_generation: u64) -> (PathBuf, PathBuf) {
-        let vdir = self.version_dir(repo_id, kit_generation);
-        (vdir.join("clonekit.pack"), vdir.join("clonekit.idx"))
-    }
-
-    /// Garbage-collect one superseded generation ONLY if unpinned and strictly older than current.
-    pub fn try_gc_generation(
-        &self,
-        repo_id: Uuid,
-        kit_generation: u64,
-        ledger: &RetentionPinLedger,
-    ) -> Result<bool, CloneKitError> {
-        if let Some(pin) = ledger.active_pin_for(repo_id, kit_generation) {
-            return Err(CloneKitError::PinProtectionActive(pin));
-        }
-        if let Some(latest) = self.load_latest(repo_id)?
-            && latest.kit_generation == kit_generation
-        {
-            return Err(CloneKitError::PinProtectionActive(latest.retention_pin_id.unwrap_or(repo_id)));
-        }
-        let dir = self.version_dir(repo_id, kit_generation);
-        if !dir.exists() {
-            return Ok(false);
-        }
-        fs::remove_dir_all(&dir).map_err(|e| CloneKitError::GitFailed(format!("remove old kit: {e}")))?;
-        Ok(true)
-    }
-}
-
-fn verify_idx_in_ephemeral_repo(
-    git_binary: &Path,
-    work_parent: &Path,
-    object_format: CloneKitObjectFormat,
-    idx_path: &Path,
-    cancel: Option<&CancellationToken>,
-) -> Result<(), CloneKitError> {
-    let idx_str = idx_path.to_str().ok_or(CloneKitError::InvalidInput("non-utf8 idx path"))?;
-    let verify_repo = work_parent.join(format!(".verify-repo-{}", Uuid::new_v4().simple()));
-    let res = (|| {
-        ensure_private_dir(&verify_repo)?;
-        run_git_command(git_binary, Some(&verify_repo), &["init", "--bare", "--quiet", object_format.git_init_flag()], cancel)?;
-        run_git_command(git_binary, Some(&verify_repo), &["verify-pack", "-s", idx_str], cancel)?;
-        Ok(())
-    })();
-    let _ = fs::remove_dir_all(&verify_repo);
-    res
 }
 
 fn manifest_from_request(
@@ -434,54 +358,4 @@ pub async fn publish_clonekit_to_blob_store(
     Ok(vec![r_pack, r_idx])
 }
 
-/// Atomically publish built artifacts as the latest kit only after full destination verification.
-pub fn publish_clonekit_versioned(
-    store: &CloneKitPublicationStore,
-    built: &BuiltCloneKitArtifacts,
-    git_binary: &Path,
-    inject_failure: Option<BuildFailurePoint>,
-    cancel: Option<&CancellationToken>,
-) -> Result<CloneKitManifest, CloneKitError> {
-    ensure_not_cancelled(cancel)?;
-    built.manifest.verify_integrity()?;
-    if let Some(existing) = store.load_latest(built.manifest.repository_id)?
-        && built.manifest.kit_generation <= existing.kit_generation
-    {
-        return Err(CloneKitError::StaleGeneration {
-            expected_min: existing.kit_generation + 1,
-            actual: built.manifest.kit_generation,
-        });
-    }
-    if inject_failure == Some(BuildFailurePoint::AfterUploadBeforePublish) {
-        return Err(CloneKitError::GitFailed("injected failure before atomic catalog publish".into()));
-    }
 
-    let vdir = store.version_dir(built.manifest.repository_id, built.manifest.kit_generation);
-    ensure_private_dir(&vdir)?;
-    if built.manifest.status == CloneKitStatus::Active {
-        let (Some(pack_src), Some(idx_src)) = (&built.staged_pack_path, &built.staged_idx_path) else {
-            return Err(CloneKitError::InvalidInput("active kit publish missing staged files"));
-        };
-        let (dest_pack, dest_idx) = store.artifact_paths(built.manifest.repository_id, built.manifest.kit_generation);
-        write_atomic_private_file(&dest_pack, &fs::read(pack_src).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?)?;
-        write_atomic_private_file(&dest_idx, &fs::read(idx_src).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?)?;
-
-        let ((p_sha, p_len), (i_sha, i_len)) = (compute_file_sha256(&dest_pack)?, compute_file_sha256(&dest_idx)?);
-        let exp_p = built.manifest.pack.as_ref().ok_or(CloneKitError::MissingKit)?;
-        let exp_i = built.manifest.idx.as_ref().ok_or(CloneKitError::MissingKit)?;
-        if p_sha != exp_p.sha256 || p_len != exp_p.length || i_sha != exp_i.sha256 || i_len != exp_i.length {
-            let _ = fs::remove_dir_all(&vdir);
-            return Err(CloneKitError::CorruptArtifact("staged pack/idx failed destination verify".into()));
-        }
-        if let Err(err) = verify_idx_in_ephemeral_repo(git_binary, &vdir, built.manifest.object_format, &dest_idx, cancel)
-        {
-            let _ = fs::remove_dir_all(&vdir);
-            return Err(err);
-        }
-    }
-
-    let encoded = serde_json::to_vec_pretty(&built.manifest).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
-    write_atomic_private_file(&vdir.join("manifest.json"), &encoded)?;
-    write_atomic_private_file(&store.current_pointer_path(built.manifest.repository_id), &encoded)?;
-    Ok(built.manifest.clone())
-}
