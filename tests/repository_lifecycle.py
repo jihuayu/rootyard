@@ -1118,7 +1118,7 @@ class RepositoryLifecycleHarness(BrowserHarness):
                 hdr_m,
             )
 
-        # 2. Uncertain delete claim fails closed (503) even after lease expiry until startup recovery clears it.
+        # 2. Uncertain delete claim remains permanently fenced fail-closed (503) across lease expiry and restart recovery.
         uncertain_oid = hashlib.sha256(b"uncertain-delete-fail-closed-oid").hexdigest()
         self.sql(
             "INSERT INTO remote_object_delete_claims "

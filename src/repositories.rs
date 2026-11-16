@@ -15,6 +15,9 @@ pub mod transfer_db;
 pub mod transfer_exec;
 mod transfer_lease;
 pub mod transfer_model;
+mod transfer_pando;
+#[cfg(test)]
+mod transfer_pando_tests;
 pub mod transfer_phases;
 pub mod transfer_remote;
 #[cfg(test)]

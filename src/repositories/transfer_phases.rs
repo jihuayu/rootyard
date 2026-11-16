@@ -87,12 +87,20 @@ pub(super) async fn phase_drain(state: &AppState, rec: &TransferRecord, deadline
 }
 
 pub(super) async fn phase_rekey_db(state: &AppState, rec: &TransferRecord, deadline: Instant) -> anyhow::Result<()> {
-    let (lease_owner, lease_epoch) = expected_lease(rec)?;
-    renew_transfer_lease(&state.pool, rec.id, lease_owner, lease_epoch).await?;
     let _maint = state.storage.maintenance_exclusive(rec.repository_id).await;
-    let _read = read_leases::exclusive(&state.pool, rec.repository_id, deadline).await?;
+    phase_rekey_db_with_pool(&state.pool, rec, deadline).await
+}
 
-    let mut client = state.pool.get().await?;
+pub(super) async fn phase_rekey_db_with_pool(
+    pool: &deadpool_postgres::Pool,
+    rec: &TransferRecord,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    let (lease_owner, lease_epoch) = expected_lease(rec)?;
+    renew_transfer_lease(pool, rec.id, lease_owner, lease_epoch).await?;
+    let _read = read_leases::exclusive(pool, rec.repository_id, deadline).await?;
+
+    let mut client = pool.get().await?;
     let tx = client.transaction().await?;
     let locked = load_record_with_lock(&tx, rec.id, true).await?;
     anyhow::ensure!(
@@ -123,6 +131,15 @@ pub(super) async fn phase_rekey_db(state: &AppState, rec: &TransferRecord, deadl
         !r.get::<_, bool>(2) && !r.get::<_, bool>(3) && r.get::<_, &str>(4) == "stable",
         "repository state incompatible with rekey"
     );
+
+    let has_linked_pando = super::transfer_pando::verify_pando_rekey_ready_tx(
+        &tx,
+        rec.repository_id,
+        rec.from_owner_id,
+        rec.to_owner_id,
+        &locked.copied_objects,
+    )
+    .await?;
 
     tx.execute("DELETE FROM repository_team_members WHERE repository_id = $1", &[&rec.repository_id]).await?;
     tx.execute("DELETE FROM repository_teams WHERE repository_id = $1", &[&rec.repository_id]).await?;
@@ -160,6 +177,9 @@ pub(super) async fn phase_rekey_db(state: &AppState, rec: &TransferRecord, deadl
         &[&rec.repository_id, &rec.to_owner_id],
     )
     .await?;
+    if has_linked_pando {
+        super::transfer_pando::clear_transfer_pando_fences_tx(&tx, rec.repository_id, rec.to_owner_id).await?;
+    }
 
     for item in &locked.copied_objects {
         if item.kind == "workspace_manifest"

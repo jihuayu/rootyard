@@ -3,7 +3,8 @@ use super::{
     purge_exec::{delete_pando_artifact_fenced, retire_pando_artifact_fenced},
     remote_copy::{copy_and_rekey_workspace_checkpoint, copy_object_if_present},
     transfer_exec::plan_rollback_cleanup_keys,
-    transfer_model::{CopiedRemoteObject, plan_lfs_copy, plan_pando_copy, plan_workspace_blob_copy},
+    transfer_model::{CopiedRemoteObject, plan_lfs_copy, plan_workspace_blob_copy},
+    transfer_pando::{PandoTransferCopy, clear_transfer_pando_fences_tx, copy_pando_objects_with_store},
 };
 use crate::{
     AppState,
@@ -112,8 +113,17 @@ pub async fn copy_repository_remote_objects(
         .await?;
     copy_workspace_objects(state, &client, repo_id, from_owner, to_owner, &stage_dir, &mut copied, &mut seen, deadline)
         .await?;
-    copy_pando_objects(state, &client, repo_id, from_owner, to_owner, &stage_dir, &mut copied, &mut seen, deadline)
-        .await?;
+    drop(client);
+    let pando_store = RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
+    let pando_req = PandoTransferCopy {
+        transfer_lease: Some((transfer_id, lease_owner, lease_epoch)),
+        repo_id,
+        from_owner,
+        to_owner,
+        stage_dir: &stage_dir,
+        deadline,
+    };
+    copy_pando_objects_with_store(&state.pool, &pando_store, &pando_req, &mut copied, &mut seen).await?;
 
     persist_copied_objects(state, transfer_id, lease_owner, lease_epoch, &copied).await?;
     Ok(copied)
@@ -214,95 +224,6 @@ async fn copy_workspace_objects(
     Ok(())
 }
 
-async fn copy_pando_objects(
-    state: &AppState,
-    client: &tokio_postgres::Client,
-    repo_id: Uuid,
-    from_owner: Uuid,
-    to_owner: Uuid,
-    stage_dir: &Path,
-    copied: &mut Vec<CopiedRemoteObject>,
-    seen: &mut BTreeSet<(String, String, String)>,
-    deadline: Instant,
-) -> Result<()> {
-    let linked = client
-        .query(
-            "SELECT DISTINCT a.authority_id, a.namespace, a.sha256, a.object_generation, a.remote_path, a.size \
-             FROM pando_manifest_artifacts m \
-             JOIN pando_remote_artifacts a ON a.authority_id = m.authority_id AND a.tenant_id = m.tenant_id \
-              AND a.namespace = m.namespace AND a.sha256 = m.sha256 \
-             WHERE m.repository_id = $1 AND m.tenant_id = $2",
-            &[&repo_id, &from_owner],
-        )
-        .await?;
-    let unlinked_manifests = client
-        .query(
-            "SELECT m.manifest FROM pando_pack_manifests m \
-             WHERE m.repository_id = $1 AND m.tenant_id = $2 \
-               AND NOT EXISTS (SELECT 1 FROM pando_manifest_artifacts a WHERE a.manifest_id = m.id)",
-            &[&repo_id, &from_owner],
-        )
-        .await?;
-    if linked.is_empty() && unlinked_manifests.is_empty() {
-        return Ok(());
-    }
-
-    let store = RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
-    let scoped_prefix = format!("tenants/{from_owner}/authorities/");
-    for row in linked {
-        let auth_id: Uuid = row.get(0);
-        let ns: String = row.get(1);
-        let sha: String = row.get(2);
-        let obj_gen: i64 = row.get(3);
-        let remote_path: String = row.get(4);
-        let size: i64 = row.get(5);
-        let src = if remote_path.starts_with(&scoped_prefix) {
-            ObjectKey::scoped(from_owner, auth_id, obj_gen, &ns, &sha)?
-        } else {
-            ObjectKey::new(from_owner, &ns, &sha)?
-        };
-        let dst = ObjectKey::scoped(to_owner, auth_id, obj_gen, &ns, &sha)?;
-        let expected = u64::try_from(size).ok().filter(|&s| s > 0);
-        if let Some(rec) = copy_object_if_present(&store, stage_dir, &ns, &src, &dst, expected, deadline).await? {
-            push_unique(copied, seen, rec);
-        }
-        let dst_path = dst.path();
-        client
-            .execute(
-                "INSERT INTO pando_remote_artifacts \
-                 (authority_id, tenant_id, namespace, sha256, object_generation, remote_path, size, state) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'active') \
-                 ON CONFLICT (authority_id, tenant_id, namespace, sha256) DO UPDATE \
-                 SET remote_path = EXCLUDED.remote_path, object_generation = EXCLUDED.object_generation, \
-                     size = EXCLUDED.size, state = 'active', retired_at = NULL, delete_after = NULL, deleted_at = NULL",
-                &[&auth_id, &to_owner, &ns, &sha, &obj_gen, &dst_path, &size],
-            )
-            .await
-            .context("register destination Pando artifact row prior to rekey")?;
-    }
-
-    for row in unlinked_manifests {
-        let manifest: Value = row.get(0);
-        for (field, ns) in [
-            ("pack_cipher", crate::pando_gateway::retention::NAMESPACE_CIPHER),
-            ("pack_envelope", crate::pando_gateway::retention::NAMESPACE_ENVELOPE),
-            ("index_cipher", crate::pando_gateway::retention::NAMESPACE_CIPHER),
-            ("index_envelope", crate::pando_gateway::retention::NAMESPACE_ENVELOPE),
-        ] {
-            if let Some(sha) = manifest.get(field).and_then(|v| v.get("sha256")).and_then(Value::as_str) {
-                let expected = manifest.get(field).and_then(|v| v.get("size")).and_then(Value::as_u64);
-                let (src, dst) =
-                    plan_pando_copy(from_owner, to_owner, None, ns, sha).map_err(|e| anyhow::anyhow!(e))?;
-                if let Some(rec) = copy_object_if_present(&store, stage_dir, ns, &src, &dst, expected, deadline).await?
-                {
-                    push_unique(copied, seen, rec);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 async fn rollback_cleanup_claim_key(
     pool: &Pool,
     store: &RemoteObjectStore,
@@ -346,43 +267,46 @@ pub(super) async fn cleanup_rollback_objects_with_stores(
     if copied.is_empty() {
         return Ok(());
     }
-    let client = pool.get().await?;
     let mut preserved = BTreeSet::new();
-    for row in client
-        .query("SELECT oid FROM lfs_objects WHERE tenant_id = $1 AND repository_id <> $2", &[&to_owner, &repo_id])
-        .await?
     {
-        if let Ok(key) = ObjectKey::new(to_owner, "lfs", row.get::<_, &str>(0)) {
-            preserved.insert(key.path());
+        let client = pool.get().await?;
+        for row in client
+            .query("SELECT oid FROM lfs_objects WHERE tenant_id = $1 AND repository_id <> $2", &[&to_owner, &repo_id])
+            .await?
+        {
+            if let Ok(key) = ObjectKey::new(to_owner, "lfs", row.get::<_, &str>(0)) {
+                preserved.insert(key.path());
+            }
         }
-    }
-    for row in client
-        .query(
-            "SELECT DISTINCT c.manifest_digest FROM workspace_checkpoints c \
-             JOIN repositories r ON r.id = c.repository_id \
-             WHERE r.owner_id = $1 AND c.repository_id <> $2 AND c.manifest_digest IS NOT NULL",
-            &[&to_owner, &repo_id],
-        )
-        .await?
-    {
-        if let Ok(key) = ObjectKey::new(to_owner, "workspace", row.get::<_, &str>(0)) {
-            preserved.insert(key.path());
+        for row in client
+            .query(
+                "SELECT DISTINCT c.manifest_digest FROM workspace_checkpoints c \
+                 JOIN repositories r ON r.id = c.repository_id \
+                 WHERE r.owner_id = $1 AND c.repository_id <> $2 AND c.manifest_digest IS NOT NULL",
+                &[&to_owner, &repo_id],
+            )
+            .await?
+        {
+            if let Ok(key) = ObjectKey::new(to_owner, "workspace", row.get::<_, &str>(0)) {
+                preserved.insert(key.path());
+            }
         }
-    }
-    for row in client
-        .query(
-            "SELECT DISTINCT a.remote_path FROM pando_manifest_artifacts m \
-             JOIN pando_remote_artifacts a ON a.authority_id = m.authority_id AND a.tenant_id = m.tenant_id \
-              AND a.namespace = m.namespace AND a.sha256 = m.sha256 \
-             WHERE m.tenant_id = $1 AND m.repository_id <> $2",
-            &[&to_owner, &repo_id],
-        )
-        .await?
-    {
-        preserved.insert(row.get(0));
+        for row in client
+            .query(
+                "SELECT DISTINCT a.remote_path FROM pando_manifest_artifacts m \
+                 JOIN pando_remote_artifacts a ON a.authority_id = m.authority_id AND a.tenant_id = m.tenant_id \
+                  AND a.namespace = m.namespace AND a.sha256 = m.sha256 \
+                 WHERE m.tenant_id = $1 AND m.repository_id <> $2",
+                &[&to_owner, &repo_id],
+            )
+            .await?
+        {
+            preserved.insert(row.get(0));
+        }
     }
 
     let targets = plan_rollback_cleanup_keys(to_owner, copied, &preserved);
+    let mut cleared_pando_fences = false;
     for (kind, key) in targets {
         match kind.as_str() {
             "lfs" => {
@@ -396,44 +320,42 @@ pub(super) async fn cleanup_rollback_objects_with_stores(
                     .await?;
             }
             "pando-cipher" | "pando-envelope" => {
-                verify_rollback_lease(pool, transfer_id, lease_owner, lease_epoch).await?;
-                if let Some((authority_id, obj_gen)) = key.authority {
-                    if let Some(store) = pando_remote_allowed {
-                        delete_pando_artifact_fenced(
-                            pool,
-                            store,
-                            authority_id,
-                            key.tenant_id,
-                            &key.namespace,
-                            &key.sha256,
-                            Some(obj_gen),
-                            deadline,
-                        )
-                        .await?;
-                    } else {
-                        retire_pando_artifact_fenced(
-                            pool,
-                            authority_id,
-                            key.tenant_id,
-                            &key.namespace,
-                            &key.sha256,
-                            Some(obj_gen),
-                        )
-                        .await?;
-                    }
-                } else if let Some(store) = pando_remote_allowed {
-                    let referenced: bool = client
-                        .query_one(
-                            "SELECT EXISTS(SELECT 1 FROM pando_pack_manifests m WHERE m.tenant_id = $1 AND m.repository_id <> $2 \
-                               AND ($3 IN (m.manifest->'pack_cipher'->>'sha256', m.manifest->'pack_envelope'->>'sha256', \
-                                           m.manifest->'index_cipher'->>'sha256', m.manifest->'index_envelope'->>'sha256')))",
-                            &[&to_owner, &repo_id, &key.sha256],
-                        )
-                        .await?
-                        .get(0);
-                    if !referenced {
-                        store.delete(&key, deadline).await?;
-                    }
+                // Un-fenced legacy tenant-only Pando keys (`authority = None`) are never deleted.
+                let Some((authority_id, obj_gen)) = key.authority else {
+                    continue;
+                };
+                if !cleared_pando_fences {
+                    let mut c = pool.get().await?;
+                    let tx = c.transaction().await?;
+                    verify_rollback_lease_with(&*tx, transfer_id, lease_owner, lease_epoch).await?;
+                    clear_transfer_pando_fences_tx(&tx, repo_id, to_owner).await?;
+                    tx.commit().await?;
+                    cleared_pando_fences = true;
+                } else {
+                    verify_rollback_lease(pool, transfer_id, lease_owner, lease_epoch).await?;
+                }
+                if let Some(store) = pando_remote_allowed {
+                    delete_pando_artifact_fenced(
+                        pool,
+                        store,
+                        authority_id,
+                        key.tenant_id,
+                        &key.namespace,
+                        &key.sha256,
+                        Some(obj_gen),
+                        deadline,
+                    )
+                    .await?;
+                } else {
+                    retire_pando_artifact_fenced(
+                        pool,
+                        authority_id,
+                        key.tenant_id,
+                        &key.namespace,
+                        &key.sha256,
+                        Some(obj_gen),
+                    )
+                    .await?;
                 }
             }
             _ => {}

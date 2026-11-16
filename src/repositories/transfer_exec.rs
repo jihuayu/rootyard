@@ -110,7 +110,7 @@ fn plan_side_cleanup_keys(
     out
 }
 
-fn parse_tenant_key(tenant: Uuid, raw_path: &str) -> Option<ObjectKey> {
+pub(super) fn parse_tenant_key(tenant: Uuid, raw_path: &str) -> Option<ObjectKey> {
     let prefix = format!("tenants/{tenant}/");
     let rest = raw_path.strip_prefix(&prefix)?;
     if let Some(after_auth) = rest.strip_prefix("authorities/") {

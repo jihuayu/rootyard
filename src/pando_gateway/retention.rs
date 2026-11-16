@@ -67,7 +67,7 @@ pub async fn reserve_pair<C: GenericClient + Sync>(
     Ok((cipher, envelope))
 }
 
-async fn reserve<C: GenericClient + Sync>(
+pub(crate) async fn reserve<C: GenericClient + Sync>(
     client: &C,
     tenant_id: Uuid,
     publication: Option<Uuid>,
@@ -159,7 +159,7 @@ async fn reserve<C: GenericClient + Sync>(
 
 /// Durable pending-publication root: the closure is protected from reservation
 /// commit until the serving CAS deletes this fence or the bounded lease expires.
-async fn fence_publication<C: GenericClient + Sync>(
+pub(crate) async fn fence_publication<C: GenericClient + Sync>(
     client: &C,
     manifest_id: Uuid,
     authority_id: Uuid,
@@ -187,16 +187,16 @@ pub async fn activate<C: GenericClient + Sync>(
     slot: &Slot,
 ) -> Result<bool> {
     if let Slot::Reuse(key) = slot {
-        let Some((authority_id, _generation)) = key.authority else {
+        let Some((authority_id, generation)) = key.authority else {
             anyhow::bail!("reused artifact lost its authority scope");
         };
-        // Only a still-active row may be acknowledged. A concurrent mark that
-        // retired this address forces a fresh generation and re-upload instead
-        // of publishing a path a deleter may already own.
+        // Only a still-active row at the same generation may be acknowledged.
+        // A concurrent mark that retired/deleted this address forces a fresh
+        // generation and re-upload instead of publishing a path a deleter may own.
         let active = client
             .query_opt(
-                "SELECT 1 FROM pando_remote_artifacts WHERE authority_id=$1 AND tenant_id=$2                  AND namespace=$3 AND sha256=$4 AND state='active' FOR SHARE",
-                &[&authority_id, &tenant_id, &namespace, &sha256],
+                "SELECT 1 FROM pando_remote_artifacts WHERE authority_id=$1 AND tenant_id=$2                  AND namespace=$3 AND sha256=$4 AND object_generation=$5 AND state='active' FOR SHARE",
+                &[&authority_id, &tenant_id, &namespace, &sha256, &generation],
             )
             .await?;
         return Ok(active.is_some());

@@ -58,24 +58,32 @@ This document specifies Rootyard's repository lifecycle contracts (#85): archive
     - Never deletes remote `tenants/{tenant}/lfs/{oid}` or `tenants/{tenant}/workspace/{digest}` keys referenced by any other live repository in `tenant`, and never deletes objects belonging to another tenant.
     - Only authority-scoped Pando keys (`tenants/{tenant}/authorities/...`) unreferenced by other manifests/retention roots are retired through the PITR-fenced delete gate; legacy tenant-only keys are never deleted.
 
+### Uncertain Delete Claims and Manual Operator Disposition
+
+- Before purging or rolling back an unshared `lfs` / `workspace` key in `remote_object_delete_claims`, Rootyard locks the `(tenant_id, namespace, digest)` key and persists `deleting = true, delete_uncertain = true` prior to issuing remote `store.delete`.
+- Background/startup sweep (`sweep_expired_claims_with_stores`) clears **only** pre-delete expired claims where remote deletion never started (`delete_uncertain = false`).
+- Any claim with `delete_uncertain = true` (including HTTP `DELETE` errors, client timeouts/cancellations, or process crashes mid-delete) stays **permanently fenced fail-closed (`503 Service Unavailable`)** across lease expiry and process restarts, because remote HTTP `DELETE` cancellation cannot prove the object store aborted an in-flight delete.
+- **Operator disposition**: Permanent uncertain-key quarantine requires manual intervention — do not treat it as automatic recovery. Before manually clearing an uncertain claim row or restoring ingest under that key, verify directly against the object-store backend that no delayed `DELETE` remains in flight (or keep the content-addressed key quarantined and re-ingest via an unblocked key/tenant boundary). Keep this permanent manual quarantine distinct from ownership-transfer crash recovery (`repositories::recover`), which automatically resumes or rolls back uncommitted `repository_transfers` phase records.
+
 ## Recoverable Ownership Transfer (`personal <-> organization`)
 
 `POST /api/repos/{owner}/{name}/transfer` executes a crash-recoverable multi-phase state machine persisted in `repository_transfers`:
 
 1. `preparing`: Validates RBAC, target namespace authority, target `(to_owner_id, target_name)` conflict/alias freedom, CAS `expected_version`, and acquires single-flight transfer row.
 2. `draining`: Revokes/cancels active `ci_checkout_jobs`, deletes `ci_integration_checkout_jobs` / `ci_checkout_delegations` / `ci_integration_source_grants`, deactivates `ci_service_principals`, drains `storage_write_admissions` / maintenance jobs, and acquires exclusive read lease.
-3. `copying_remote`: Copies live remote objects (`tenants/{from}/lfs/{oid}`, re-tenanted `RemoteManifest` + entry blobs in `tenants/{to}/workspace/...`, and Pando packs/envelopes under fresh destination keys in `tenants/{to}/authorities/...`) and verifies read-back BEFORE touching `repositories.owner_id`. Source objects are preserved until safely outside source failure windows.
+3. `copying_remote`: Copies live remote objects (`tenants/{from}/lfs/{oid}`, re-tenanted `RemoteManifest` + entry blobs in `tenants/{to}/workspace/...`, and authority-scoped Pando packs/envelopes reserved/activated through `pando_storage_authorities` + `pando_publication_fences` without resurrecting `deleting` generations) and verifies read-back BEFORE touching `repositories.owner_id`. Unlinked legacy tenant-only Pando keys remain excluded from deletion. Source objects are preserved until safely outside source failure windows.
 4. `rekeying_db`: Single ACID PostgreSQL transaction:
+   - locks `pando_storage_authorities` and destination `pando_remote_artifacts` to confirm every linked destination Pando artifact remains `state = 'active'` at its verified generation before cascading repository ownership,
    - removes legacy team bindings (`repository_team_members`, `repository_teams`), self-collaborator (`user_id = to_owner_id`), revoked collaborator/token scopes (`revoke_collaborators` defaults `true`),
    - records `(from_owner_id, old_name)` in `repository_aliases`,
    - updates `repositories` (`owner_id = to_owner_id`, `name = target_name`, `version = version + 1`),
-   - cascades/rekeys all tenant-scoped tables (`forge_*`, `lfs_*`, `pando_*`, `storage_maintenance_*`, `repository_shard_routes`, `shard_failover_operations`, `workspaces` slugs, `workspace_remote_staging_objects`, `workspace_changeset_steps`),
+   - cascades/rekeys all tenant-scoped tables (`forge_*`, `lfs_*`, `pando_*`, `storage_maintenance_*`, `repository_shard_routes`, `shard_failover_operations`, `workspaces` slugs, `workspace_remote_staging_objects`, `workspace_changeset_steps`) and clears the transfer's temporary destination `pando_publication_fences`,
    - writes audit entries to `repository_audit_log` and `organization_audit_log`,
    - transitions transfer to `revoking_legacy`.
 5. `revoking_legacy` -> `completed`: Updates/rekeys surviving disk CI metadata if retained, verifies single authoritative owner and legacy revocation invariants, marks transfer `completed`.
 
 ### Crash and Restart Recovery (`repositories::recover`)
 
-- If the server crashes in `preparing`, `draining`, or `copying_remote` (before `rekeying_db` commits), PostgreSQL still records solely `from_owner_id` as the repository owner. On restart, `repositories::recover` deterministically drives or rolls back the transfer (`rolling_back -> rolled_back` cleans destination-only `copied_objects` without ever deleting source keys).
+- If the server crashes in `preparing`, `draining`, or `copying_remote` (before `rekeying_db` commits), PostgreSQL still records solely `from_owner_id` as the repository owner. On restart, `repositories::recover` deterministically drives or rolls back the transfer (`rolling_back -> rolled_back` cleans destination-only `copied_objects` via `remote_object_delete_claims` for LFS/workspace and fenced generation checks for authority-scoped Pando objects while preserving un-fenced legacy tenant-only Pando objects and never deleting source keys; failed/uncertain rollback deletes stay quarantined and fail closed).
 - If the server crashes in `revoking_legacy` (after `rekeying_db` commits), PostgreSQL already records solely `to_owner_id` as owner; `repositories::recover` completes remaining legacy revocations and marks `completed`.
 - At no point can two owners be simultaneously active for the same repository.

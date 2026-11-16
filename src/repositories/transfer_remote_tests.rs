@@ -33,16 +33,16 @@ use std::{
 use tokio::{net::TcpListener, sync::Notify, time::Instant};
 use uuid::Uuid;
 
-struct MockRemoteS3 {
+pub(super) struct MockRemoteS3 {
     objects: Mutex<HashMap<String, Vec<u8>>>,
-    gate_first_delete: AtomicBool,
-    fail_deletes_500: AtomicBool,
-    first_delete_entered: Notify,
-    release_first_delete: Notify,
+    pub(super) gate_first_delete: AtomicBool,
+    pub(super) fail_deletes_500: AtomicBool,
+    pub(super) first_delete_entered: Notify,
+    pub(super) release_first_delete: Notify,
 }
 
 impl MockRemoteS3 {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             objects: Mutex::new(HashMap::new()),
             gate_first_delete: AtomicBool::new(false),
@@ -106,7 +106,7 @@ async fn handle_s3(
     }
 }
 
-async fn start_s3(state: Arc<MockRemoteS3>) -> (Arc<RemoteObjectStore>, tokio::task::JoinHandle<()>) {
+pub(super) async fn start_s3(state: Arc<MockRemoteS3>) -> (Arc<RemoteObjectStore>, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = Router::new().fallback(handle_s3).with_state(state);

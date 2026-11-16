@@ -390,7 +390,7 @@ pub async fn wait_or_clear_delete_claim(
         if delete_uncertain {
             return Err(Error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "remote object delete outcome is uncertain; key reuse fenced pending recovery",
+                "remote object delete outcome is uncertain; key reuse permanently fenced pending operator disposition",
             ));
         }
         if lease_active {
@@ -405,7 +405,7 @@ pub async fn wait_or_clear_delete_claim(
             Ok(ClearClaimOutcome::Uncertain) => {
                 return Err(Error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "remote object delete outcome is uncertain; key reuse fenced pending recovery",
+                    "remote object delete outcome is uncertain; key reuse permanently fenced pending operator disposition",
                 ));
             }
             Ok(ClearClaimOutcome::StillLeased) => {}

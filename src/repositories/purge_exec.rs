@@ -315,6 +315,7 @@ pub(super) async fn delete_pando_artifact_fenced(
     expected_generation: Option<i64>,
     deadline: Instant,
 ) -> Result<bool> {
+    let claim_owner = Uuid::new_v4();
     let obj_gen = {
         let mut client = pool.get().await?;
         let tx = client.transaction().await?;
@@ -334,10 +335,12 @@ pub(super) async fn delete_pando_artifact_fenced(
         };
         let marked = tx
             .execute(
-                "UPDATE pando_remote_artifacts SET state = 'deleting', updated_at = clock_timestamp() \
+                "UPDATE pando_remote_artifacts \
+                 SET state = 'deleting', claimed_by = $6, claim_generation = claim_generation + 1, \
+                     lease_until = clock_timestamp() + interval '120 seconds', updated_at = clock_timestamp() \
                  WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
                    AND object_generation = $5 AND state IN ('active', 'retired')",
-                &[&authority_id, &tenant_id, &namespace, &sha256, &locked_gen],
+                &[&authority_id, &tenant_id, &namespace, &sha256, &locked_gen, &claim_owner],
             )
             .await?;
         ensure!(marked == 1, "Pando remote artifact state/generation changed before delete fence");
@@ -351,10 +354,11 @@ pub(super) async fn delete_pando_artifact_fenced(
     let _ = client
         .execute(
             "UPDATE pando_remote_artifacts \
-             SET state = 'deleted', deleted_at = clock_timestamp(), updated_at = clock_timestamp() \
+             SET state = 'deleted', deleted_at = clock_timestamp(), claimed_by = NULL, lease_until = NULL, \
+                 last_error = NULL, updated_at = clock_timestamp() \
              WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
-               AND object_generation = $5 AND state = 'deleting'",
-            &[&authority_id, &tenant_id, &namespace, &sha256, &obj_gen],
+               AND object_generation = $5 AND state = 'deleting' AND claimed_by = $6",
+            &[&authority_id, &tenant_id, &namespace, &sha256, &obj_gen, &claim_owner],
         )
         .await?;
     Ok(true)
