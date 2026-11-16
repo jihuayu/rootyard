@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the two original workspace FUSE helper-authority cases in one process.
+"""Run the three workspace FUSE helper-authority cases in one process.
 
 The runner selects the canonical source-bound CI binary first, then imports the
 original test classes with ROOTYARD_TEST_FUSE_BACKEND=fuse-helper already set.
@@ -33,15 +33,18 @@ REPORT_SCHEMA = "rootyard/issues91-95/workspace-fuse-service-acceptance/v1"
 REQUIRED_CASES = (
     "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_live_editor_capture_checkpoint_and_remount",
     "tests.test_workspace_handoff.WorkspaceHandoffTest.test_expired_host_reattach_from_remote_checkpoint",
+    "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_normal_sigterm_helper_unmount_precedes_parked_git_join",
 )
 SOURCE_PATHS = (
     "tests/test_workspace_fuse_service.py",
     "tests/test_workspace_handoff.py",
+    "tests/workspace_normal_shutdown_support.py",
 )
 SAFE_FAILURE_TYPES = frozenset((
     "RuntimeError", "OSError", "ImportError", "ModuleNotFoundError",
     "SourceBindingError", "RuntimeBinarySelectionError", "AssertionError",
     "ValueError", "TypeError", "KeyError", "AttributeError", "FileNotFoundError",
+    "NormalShutdownError",
 ))
 
 
