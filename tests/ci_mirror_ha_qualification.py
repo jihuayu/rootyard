@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -792,15 +793,8 @@ class HaQualificationHarness:
         runs3 = self.wait_for_runs(self.repo1["id"], pr3["number"], feat_d_oid, ("ci/test", "ci/lint"))
         prefix1 = f"/api/repos/alice/forge/integrations/{self.hook1_id}/runs/"
 
-        # Exercise `waiting` classification when mirror-2 is temporarily marked unready and `prefer_mirror=True`.
-        self.document(
-            self.c2_base, f"/api/repos/alice/forge/ci-mirrors/{self.m2_id}/heartbeat", 200,
-            token=self.alice, method="POST",
-            body={
-                "audience": self.audience, "url": self.m2_base, "storage_generation": 1,
-                "ready_oids": [], "capacity": 4, "active": True,
-            },
-        )
+        # Exercise `waiting` classification either on immediate prewarm miss (202 waiting)
+        # or via requeue_only failover (200 waiting) once prewarm settles.
         waiting_doc, waiting_hdrs = self.document(
             self.c2_base, prefix1 + runs3["ci/test"] + "/claim", (200, 202),
             bearer=self.hook_secret, method="POST",
@@ -820,7 +814,7 @@ class HaQualificationHarness:
             time.sleep(0.2)
         assert by_id[self.m2_id]["target_ready"] is True and by_id[self.m3_id]["target_ready"] is False, by_id
         st_m3, raw_m3, _ = self.http(self.m3_base, "/metrics")
-        assert st_m3 == 200 and b"rootyard_mirror_sync_total 0\n" in raw_m3
+        assert st_m3 == 200 and b"rootyard_mirror_sync_total 0\n" in raw_m3, (st_m3, raw_m3.decode(errors="replace"))
 
         if waiting_doc.get("source"):
             # Requeue so all queued slots start fresh below, capturing explicit `waiting`.
@@ -830,7 +824,7 @@ class HaQualificationHarness:
                 body={"attempt": waiting_doc["attempt"], "lease_generation": waiting_doc["lease_generation"],
                       "runner_id": "runner-c-wait", "requeue_only": True},
             )
-            assert rq_hdrs.get("x-rootyard-ci-state") == "waiting"
+            assert rq_hdrs.get("x-rootyard-ci-state") == "waiting", (rq, rq_hdrs)
             observed_states.add("waiting")
 
         # Hard-kill ALL remaining serve-mirror daemons (`mirror-2`, `mirror-3`) and verify origin budgets.
@@ -866,7 +860,7 @@ class HaQualificationHarness:
             self.c2_base, prefix1 + str(uuid.uuid4()), 404,
             bearer=self.hook_secret, method="GET",
         )
-        assert unk_hdrs.get("x-rootyard-ci-state") == "missing"
+        assert unk_hdrs.get("x-rootyard-ci-state") == "missing", (unk_doc, unk_hdrs)
 
         # Set up burst across 2 repos (forge + forge2), each with >= 3 queued runs so
         # per_repo_limit=2 and global_limit=4 are deterministically exercised under simultaneous bursts.
@@ -941,8 +935,8 @@ class HaQualificationHarness:
         ready1 = [r for r in res1 if r[0] == 200]
         over1 = [r for r in res1 if r[0] == 429]
         assert len(ready1) == 2 and len(over1) == 1, res1
-        assert all(d["source"] == "origin" and h.get("x-rootyard-ci-state") == "ready" for _, d, h in ready1)
-        assert over1[0][2].get("x-rootyard-ci-state") == "overloaded" and over1[0][1]["classification"] == "overloaded"
+        assert all(d["source"] == "origin" and h.get("x-rootyard-ci-state") == "ready" for _, d, h in ready1), ready1
+        assert over1[0][2].get("x-rootyard-ci-state") == "overloaded" and over1[0][1]["classification"] == "overloaded", over1
         observed_states.update({"ready", "overloaded"})
 
         # Burst repo 2 -> 2 more ready (origin), hitting global_limit=4, 3rd returns 429 overloaded.
@@ -959,8 +953,8 @@ class HaQualificationHarness:
         ready2 = [r for r in res2 if r[0] == 200]
         over2 = [r for r in res2 if r[0] == 429]
         assert len(ready2) == 2 and len(over2) == 1, res2
-        assert all(d["source"] == "origin" and h.get("x-rootyard-ci-state") == "ready" for _, d, h in ready2)
-        assert over2[0][2].get("x-rootyard-ci-state") == "overloaded"
+        assert all(d["source"] == "origin" and h.get("x-rootyard-ci-state") == "ready" for _, d, h in ready2), ready2
+        assert over2[0][2].get("x-rootyard-ci-state") == "overloaded", over2
 
         # Test bounded wait wakeup when an origin slot is released: wait_for_ready_ms=5000 blocks until
         # one of forge2's leased origin runs reports completion, then clones strictly from origin.
@@ -1051,7 +1045,9 @@ class HaQualificationHarness:
             self.results.append({"name": name, "status": "passed", "seconds": round(time.monotonic() - t0, 4), "detail": detail})
             print(f"{name}: passed", flush=True)
         except Exception as err:
-            self.results.append({"name": name, "status": "failed", "seconds": round(time.monotonic() - t0, 4), "error": self.redact(err)})
+            tb = self.redact(traceback.format_exc())
+            msg = self.redact(f"{type(err).__name__}: {err}")
+            self.results.append({"name": name, "status": "failed", "seconds": round(time.monotonic() - t0, 4), "error": msg, "traceback": tb})
             raise
 
     def cleanup(self) -> None:
@@ -1096,8 +1092,8 @@ def main(argv: list[str] | None = None) -> int:
         harness.case("scenario_b_sigkill_dual_crash_and_failover", harness.scenario_b_sigkill_dual_crash_and_failover)
         harness.case("scenario_c_coalesced_prewarm_and_origin_burst", harness.scenario_c_coalesced_prewarm_and_origin_burst)
         success = True
-    except Exception as err:
-        print(harness.redact(err), file=sys.stderr)
+    except Exception:
+        print(harness.redact(traceback.format_exc()), file=sys.stderr)
     finally:
         try:
             harness.cleanup()
