@@ -201,6 +201,23 @@ pub(super) fn verify_decision_for_commit(
             floor: gate.authz_floor,
         });
     }
+    super::apply_scopes::verify_decision_scopes_open(state, decision_id, decision.authz_epoch)?;
+    if let Some(scoped) = state.decision_scope_deps.get(&decision_id) {
+        if scoped.grant_commitment.base_gate_digest != gate.version()?.digest().as_hex() {
+            return Err(StateMachineError::DecisionDigestMismatch {
+                decision_id,
+                reason: "signed grant base_gate_digest disagrees with repository gate",
+            });
+        }
+        let expected_holds: BTreeSet<Uuid> = scoped.grant_commitment.required_holds.iter().copied().collect();
+        let supplied_holds: BTreeSet<Uuid> = required_holds.iter().copied().collect();
+        if supplied_holds.len() != required_holds.len() || supplied_holds != expected_holds {
+            return Err(StateMachineError::DecisionDigestMismatch {
+                decision_id,
+                reason: "commit required_holds disagree with installed signed decision grant",
+            });
+        }
+    }
     if current_tick > decision.not_after_tick {
         return Err(StateMachineError::DecisionExpired {
             decision_id,
