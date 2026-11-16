@@ -161,6 +161,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
         is killed without Harness.stop's fallback; helper exit, the exact owned
         mount ID disappearing and caller failure are asserted before cleanup.
         """
+        backend = HELPER_BACKEND
         binary, _ = select_runtime_binary()
         self.assertTrue(binary.is_file())
         with tempfile.TemporaryDirectory(prefix="rootyard-userns-wrapper-") as wrapper_dir:
@@ -190,7 +191,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
             new_mount_id = None
             original_failure = None
             try:
-                h.env["ROOTYARD_WORKSPACE_MOUNT_MODE"] = MOUNT_MODE
+                h.env["ROOTYARD_WORKSPACE_MOUNT_MODE"] = backend
                 h.env["ROOTYARD_SANDBOX_MODE"] = "dev"
                 h.setup()
                 h.api()
@@ -254,7 +255,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 mount = support.wait_for_fuse_mount(api_pid, mountpoint)
                 mount_id = int(mount["mount_id"])
                 self.assertGreater(mount_id, 0)
-                if self.backend == HELPER_BACKEND:
+                if backend == HELPER_BACKEND:
                     helper_pid = support.find_api_helper_pid(api_pid)
                     helper_identity = support.process_identity(helper_pid)
                     self.assertIsNotNone(helper_identity, "FUSE helper identity is unavailable")
@@ -322,7 +323,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 self.assertTrue(
                     support.wait_for_mount_id_gone(
                         holder.pid, mountpoint, mount_id, support.EXIT_DEADLINE),
-                    f"BLOCKED: {self.backend} did not remove exact owned mount ID "
+                    f"BLOCKED: {backend} did not remove exact owned mount ID "
                     f"{mount_id} before cleanup; in-process fuse has no AutoUnmount "
                     "ownership boundary")
                 old_remaining = [
@@ -370,7 +371,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 self.assertIsNotNone(new_api_identity, "fresh API identity is unavailable")
                 self.assertGreater(new_api_identity["starttime"],
                                    api_identity["starttime"])
-                if self.backend == HELPER_BACKEND:
+                if backend == HELPER_BACKEND:
                     new_helper_pid = support.find_api_helper_pid(new_api_pid)
                     new_helper_identity = support.process_identity(new_helper_pid)
                     self.assertIsNotNone(new_helper_identity,
