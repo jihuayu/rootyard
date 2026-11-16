@@ -31,6 +31,8 @@ pub struct KmsRotateOptions {
     pub revoke_previous: bool,
     #[serde(default)]
     pub target_key_id: Option<String>,
+    #[serde(default)]
+    pub target_version: Option<i32>,
 }
 
 fn default_checkpoint_provider_kind() -> String {
@@ -70,6 +72,8 @@ pub struct KmsRotationCheckpoint {
     pub external_rotate_issued: bool,
     #[serde(default)]
     pub reconcile_stage: KmsReconcileStage,
+    #[serde(default)]
+    pub target_contract: String,
 }
 
 impl KmsRotationCheckpoint {
@@ -80,44 +84,6 @@ impl KmsRotationCheckpoint {
     pub(crate) fn is_vault_target(&self) -> bool {
         self.to_provider_kind == super::provider::PROVIDER_KIND_VAULT
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VaultRotationDecision {
-    IssueRotate,
-    ReconcileTarget,
-    AlreadyObserved,
-}
-
-pub(crate) fn vault_rotation_decision(
-    cp: &KmsRotationCheckpoint,
-    latest_version: i32,
-) -> Result<VaultRotationDecision> {
-    ensure!(cp.state == "IN_PROGRESS", "rotation checkpoint is not IN_PROGRESS");
-    ensure!(cp.is_vault_target(), "rotation checkpoint target is not vault-transit");
-    let expected = cp.expected_version();
-    ensure!(
-        cp.from_key_version >= 1 && expected > cp.from_key_version && latest_version >= 1,
-        "invalid Vault rotation version state"
-    );
-    if latest_version == cp.from_key_version {
-        ensure!(
-            !cp.external_rotate_issued && cp.reconcile_stage == KmsReconcileStage::NotIssued,
-            "Vault rotate outcome is unknown after an issued rotate; refusing a duplicate rotate"
-        );
-        return Ok(VaultRotationDecision::IssueRotate);
-    }
-    if latest_version == expected {
-        ensure!(
-            cp.external_rotate_issued,
-            "Vault target version was observed without a persisted rotate intent"
-        );
-        if cp.reconcile_stage == KmsReconcileStage::TargetObserved {
-            return Ok(VaultRotationDecision::AlreadyObserved);
-        }
-        return Ok(VaultRotationDecision::ReconcileTarget);
-    }
-    bail!("unexpected concurrent Vault Transit key version {latest_version}")
 }
 
 pub async fn verify_and_decrypt_pack_bytes(
@@ -453,40 +419,29 @@ async fn migrate_local_envelope_to_vault(
     Ok(updated)
 }
 
+pub(crate) const EXISTING_TARGET_CONTRACT: &str = "existing-vault-version/v1";
+
+fn ensure_existing_target_contract(cp: &KmsRotationCheckpoint) -> Result<()> {
+    ensure!(
+        cp.target_contract == EXISTING_TARGET_CONTRACT,
+        "unsupported legacy automatic-rotate Vault checkpoint; refusing to adopt it"
+    );
+    Ok(())
+}
+
+fn ensure_target_available(target_version: i32, latest: i32, min_encryption: i32) -> Result<()> {
+    ensure!(
+        target_version >= 1 && target_version <= latest && target_version >= min_encryption,
+        "Vault target version is unavailable or below min_encryption_version"
+    );
+    Ok(())
+}
+
 fn ensure_vault_retention_option(opts: &KmsRotateOptions) -> Result<()> {
     ensure!(
         !opts.revoke_previous,
         "Vault retained-version retirement is not implemented; refusing explicit retirement"
     );
-    Ok(())
-}
-
-async fn issue_vault_rotate(
-    c: &Client,
-    kms_dir: &Path,
-    vault: &VaultTransitProvider,
-    cp: &mut KmsRotationCheckpoint,
-) -> Result<()> {
-    let latest = vault.latest_version().await?;
-    ensure!(
-        latest == cp.from_key_version,
-        "unexpected concurrent Vault Transit key version before rotate"
-    );
-    ensure!(
-        !cp.external_rotate_issued && cp.reconcile_stage == KmsReconcileStage::NotIssued,
-        "Vault rotate intent has already been issued"
-    );
-    cp.external_rotate_issued = true;
-    cp.reconcile_stage = KmsReconcileStage::RotateIssued;
-    persist_checkpoint(c, kms_dir, cp).await?;
-    vault.rotate_key().await?;
-    let observed = vault.latest_version().await?;
-    ensure!(
-        observed == cp.expected_version(),
-        "Vault rotate outcome is unknown or unexpectedly reconciled"
-    );
-    cp.reconcile_stage = KmsReconcileStage::TargetObserved;
-    persist_checkpoint(c, kms_dir, cp).await?;
     Ok(())
 }
 
@@ -504,12 +459,19 @@ async fn resolve_vault_rotation_checkpoint(
     if let Some(mut cp) = existing
         && cp.state == "IN_PROGRESS"
     {
+        ensure!(
+            cp.target_contract == EXISTING_TARGET_CONTRACT,
+            "unsupported legacy automatic-rotate Vault checkpoint; refusing to adopt it"
+        );
         ensure!(cp.is_vault_target(), "active checkpoint target is not vault-transit");
         ensure!(!cp.revoke_previous, "Vault checkpoint retirement is unsupported");
         ensure!(cp.to_key_id == vault.key_name(), "active checkpoint target is a different Vault key");
-        if let Some(ref target) = opts.target_key_id {
-            ensure!(target.trim() == cp.to_key_id, "active Vault rotation targets a different key name");
+        if let Some(version) = opts.target_version {
+            ensure!(version == cp.expected_version(), "active Vault target version changed");
         }
+        ensure_existing_target_contract(&cp)?;
+        let (latest, min_encryption) = vault.latest_and_min_encryption().await?;
+        ensure_target_available(cp.expected_version(), latest, min_encryption)?;
         let mut added_pack = false;
         for pack in packs {
             if !cp.target_pack_ids.contains(&pack.id) {
@@ -520,23 +482,18 @@ async fn resolve_vault_rotation_checkpoint(
         if added_pack {
             persist_checkpoint(c, kms_dir, &cp).await?;
         }
-        let latest = vault.latest_version().await?;
-        match vault_rotation_decision(&cp, latest)? {
-            VaultRotationDecision::IssueRotate => issue_vault_rotate(c, kms_dir, vault, &mut cp).await?,
-            VaultRotationDecision::ReconcileTarget => {
-                cp.reconcile_stage = KmsReconcileStage::TargetObserved;
-                persist_checkpoint(c, kms_dir, &cp).await?;
-            }
-            VaultRotationDecision::AlreadyObserved => {}
-        }
         return Ok(cp);
     }
     ensure!(!opts.resume, "no IN_PROGRESS Vault rotation checkpoint found to resume for repository {repo}");
     if let Some(ref target) = opts.target_key_id {
         ensure!(target.trim() == vault.key_name(), "Vault rotation target must be the configured key name");
     }
-    let latest = vault.latest_version().await?;
-    let expected = latest.checked_add(1).context("Vault Transit key version exhausted")?;
+    let target_version = opts
+        .target_version
+        .context("Vault rotation requires --target-version for an existing Transit key version")?;
+    ensure!(target_version >= 1, "Vault target version must be >= 1");
+    let (latest, min_encryption) = vault.latest_and_min_encryption().await?;
+    ensure_target_available(target_version, latest, min_encryption)?;
     let mut from_provider_kind = provider::PROVIDER_KIND_VAULT.to_owned();
     for pack in packs {
         let on_disk = envelope_file_path(&config.root, repo, pack.id);
@@ -556,13 +513,13 @@ async fn resolve_vault_rotation_checkpoint(
             }
         }
     }
-    let mut cp = KmsRotationCheckpoint {
+    let cp = KmsRotationCheckpoint {
         rotation_id: Uuid::new_v4(),
         repo,
         from_key_id: vault.key_name().to_owned(),
         from_key_version: latest,
         to_key_id: vault.key_name().to_owned(),
-        to_key_version: expected,
+        to_key_version: target_version,
         state: "IN_PROGRESS".to_owned(),
         revoke_previous: false,
         target_pack_ids: packs.iter().map(|p| p.id).collect(),
@@ -570,20 +527,12 @@ async fn resolve_vault_rotation_checkpoint(
         failed_pack_id: None,
         from_provider_kind,
         to_provider_kind: provider::PROVIDER_KIND_VAULT.to_owned(),
-        expected_to_version: expected,
+        expected_to_version: target_version,
         external_rotate_issued: false,
-        reconcile_stage: KmsReconcileStage::NotIssued,
+        reconcile_stage: KmsReconcileStage::TargetObserved,
+        target_contract: EXISTING_TARGET_CONTRACT.to_owned(),
     };
     persist_checkpoint(c, kms_dir, &cp).await?;
-    let latest_now = vault.latest_version().await?;
-    match vault_rotation_decision(&cp, latest_now)? {
-        VaultRotationDecision::IssueRotate => issue_vault_rotate(c, kms_dir, vault, &mut cp).await?,
-        VaultRotationDecision::ReconcileTarget => {
-            cp.reconcile_stage = KmsReconcileStage::TargetObserved;
-            persist_checkpoint(c, kms_dir, &cp).await?;
-        }
-        VaultRotationDecision::AlreadyObserved => {}
-    }
     Ok(cp)
 }
 
@@ -611,11 +560,8 @@ async fn rotate_vault_kms_key_with_options(
     let mut envelopes = Vec::with_capacity(packs.len());
     let mut rewrapped_this_run = 0usize;
     for pack in &packs {
-        let observed = vault.latest_version().await?;
-        ensure!(
-            observed == cp.expected_version(),
-            "unexpected concurrent Vault Transit key version during rotation; refusing to continue"
-        );
+        let (latest, min_encryption) = vault.latest_and_min_encryption().await?;
+        ensure_target_available(cp.expected_version(), latest, min_encryption)?;
         let on_disk = envelope_file_path(&config.root, repo, pack.id);
         let existing = if on_disk.is_file() {
             Some(read_and_verify_envelope_file(&config.root, repo, pack.id)?)
@@ -695,10 +641,8 @@ async fn rotate_vault_kms_key_with_options(
         persist_checkpoint(&c, &kms_dir, &cp).await?;
         envelopes.push(updated);
     }
-    ensure!(
-        vault.latest_version().await? == cp.expected_version(),
-        "unexpected concurrent Vault Transit key version before completion; refusing to complete"
-    );
+    let (latest, min_encryption) = vault.latest_and_min_encryption().await?;
+    ensure_target_available(cp.expected_version(), latest, min_encryption)?;
     cp.state = "COMPLETED".to_owned();
     cp.reconcile_stage = KmsReconcileStage::TargetObserved;
     cp.failed_pack_id = None;
@@ -791,6 +735,7 @@ async fn resolve_rotation_checkpoint(
         expected_to_version: new_ver,
         external_rotate_issued: false,
         reconcile_stage: KmsReconcileStage::NotIssued,
+        target_contract: String::new(),
     };
     persist_checkpoint(c, kms_dir, &cp).await?;
     Ok((cp, policy))
@@ -962,6 +907,7 @@ mod tests {
             expected_to_version: 4,
             external_rotate_issued: issued,
             reconcile_stage: stage,
+            target_contract: "existing-vault-version/v1".to_owned(),
         }
     }
 
@@ -989,32 +935,25 @@ mod tests {
     }
 
     #[test]
+    fn existing_target_contract_versions_and_legacy_checkpoints_are_checked() {
+        let cp = vault_checkpoint(false, KmsReconcileStage::TargetObserved);
+        assert!(ensure_existing_target_contract(&cp).is_ok());
+        assert!(ensure_target_available(4, 4, 0).is_ok());
+        assert!(ensure_target_available(4, 6, 0).is_ok());
+        assert!(ensure_target_available(4, 6, 4).is_ok());
+        assert!(ensure_target_available(4, 3, 0).is_err());
+        assert!(ensure_target_available(4, 6, 5).is_err());
+        let mut legacy = cp;
+        legacy.target_contract.clear();
+        assert!(ensure_existing_target_contract(&legacy).is_err());
+    }
+
+    #[test]
     fn vault_retention_changes_are_refused() {
         let mut opts = KmsRotateOptions::default();
         assert!(ensure_vault_retention_option(&opts).is_ok());
         opts.revoke_previous = true;
         assert!(ensure_vault_retention_option(&opts).is_err());
-        let mut mismatched = vault_checkpoint(false, KmsReconcileStage::NotIssued);
-        mismatched.to_provider_kind = super::super::provider::PROVIDER_KIND_LOCAL.to_owned();
-        assert!(vault_rotation_decision(&mismatched, 3).is_err());
     }
 
-    #[test]
-    fn vault_rotation_decision_is_idempotent_and_fails_closed() {
-        let issue = vault_checkpoint(false, KmsReconcileStage::NotIssued);
-        assert_eq!(vault_rotation_decision(&issue, 3).unwrap(), VaultRotationDecision::IssueRotate);
-        assert!(vault_rotation_decision(&issue, 4).is_err());
-        assert!(vault_rotation_decision(&issue, 5).is_err());
-
-        let issued = vault_checkpoint(true, KmsReconcileStage::RotateIssued);
-        assert_eq!(vault_rotation_decision(&issued, 4).unwrap(), VaultRotationDecision::ReconcileTarget);
-        assert!(vault_rotation_decision(&issued, 3).is_err());
-        assert_eq!(
-            vault_rotation_decision(&vault_checkpoint(true, KmsReconcileStage::TargetObserved), 4)
-                .unwrap(),
-            VaultRotationDecision::AlreadyObserved
-        );
-        assert!(vault_rotation_decision(&vault_checkpoint(true, KmsReconcileStage::RotateIssued), 9).is_err());
-        assert!(vault_rotation_decision(&legacy_checkpoint(), 2).is_err());
-    }
 }

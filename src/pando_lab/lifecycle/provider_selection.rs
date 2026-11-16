@@ -1,6 +1,6 @@
 use super::{
     provider::{KmsKeyPolicy, PROVIDER_KIND_LOCAL, PROVIDER_KIND_VAULT, PandoKeyProvider, PandoKmsProvider},
-    rotation::KmsRotationCheckpoint,
+    rotation::{EXISTING_TARGET_CONTRACT, KmsRotationCheckpoint},
     vault_provider::VaultTransitProvider,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -111,8 +111,8 @@ pub(crate) fn for_write(
                 );
                 ensure!(cp.to_key_id == provider.key_name(), "active rotation targets a different Vault key");
                 ensure!(
-                    cp.external_rotate_issued,
-                    "active Vault rotation target has not been issued; refusing new writes"
+                    cp.target_contract == EXISTING_TARGET_CONTRACT,
+                    "active Vault rotation uses an unsupported legacy checkpoint contract"
                 );
                 provider = provider.with_pinned_write_version(cp.expected_version())?;
             }

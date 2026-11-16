@@ -151,20 +151,11 @@ impl VaultTransitProvider {
     }
 
     pub(super) async fn latest_version(&self) -> Result<i32> {
-        self.read_key_metadata(self.operation_deadline()).await
+        Ok(self.read_key_metadata(self.operation_deadline()).await?.0)
     }
 
-    pub(super) async fn rotate_key(&self) -> Result<()> {
-        let deadline = self.operation_deadline();
-        let _ = self
-            .call(
-                Method::POST,
-                &format!("keys/{}/rotate", self.config.key_name),
-                None,
-                deadline,
-            )
-            .await?;
-        Ok(())
+    pub(super) async fn latest_and_min_encryption(&self) -> Result<(i32, i32)> {
+        self.read_key_metadata(self.operation_deadline()).await
     }
 
     pub(super) async fn wrap_at_version(
@@ -174,10 +165,12 @@ impl VaultTransitProvider {
         requested_version: Option<i32>,
     ) -> Result<PandoWrappedDek> {
         let deadline = self.operation_deadline();
-        let latest_version = self.read_key_metadata(deadline).await?;
+        let (latest_version, min_encryption) = self.read_key_metadata(deadline).await?;
         let target_version = requested_version.unwrap_or(latest_version);
         ensure!(
-            target_version >= 1 && target_version <= latest_version,
+            target_version >= 1
+                && target_version <= latest_version
+                && target_version >= min_encryption,
             "requested Vault Transit key version is unavailable"
         );
         self.encrypt_at_version(data_key, context, target_version, deadline).await
@@ -190,10 +183,12 @@ impl VaultTransitProvider {
         target_version: i32,
     ) -> Result<PandoWrappedDek> {
         let deadline = self.operation_deadline();
-        let latest_version = self.read_key_metadata(deadline).await?;
+        let (latest_version, min_encryption) = self.read_key_metadata(deadline).await?;
         ensure!(
-            latest_version == target_version,
-            "pinned Vault Transit target version is not the observed latest version"
+            target_version >= 1
+                && target_version <= latest_version
+                && target_version >= min_encryption,
+            "pinned Vault Transit target version is unavailable or below min_encryption_version"
         );
         self.encrypt_at_version(data_key, context, target_version, deadline).await
     }
@@ -247,11 +242,13 @@ impl VaultTransitProvider {
         requested_version: Option<i32>,
     ) -> Result<PandoWrappedDek> {
         let deadline = self.operation_deadline();
-        let latest_version = self.read_key_metadata(deadline).await?;
+        let (latest_version, min_encryption) = self.read_key_metadata(deadline).await?;
         let target_version = requested_version.unwrap_or(latest_version);
         ensure!(
-            target_version >= 1 && target_version <= latest_version,
-            "requested Vault Transit key version is unavailable"
+            target_version >= 1
+                && target_version <= latest_version
+                && target_version >= min_encryption,
+            "requested Vault Transit key version is unavailable or below min_encryption_version"
         );
         let (_, _, ciphertext) = self.versioned_parts(wrapped, latest_version)?;
         let context = self.context_b64(context)?;
@@ -399,15 +396,20 @@ struct KeyMetadata {
     key_type: Option<String>,
     derived: Option<bool>,
     latest_version: Option<i32>,
+    min_encryption_version: Option<i32>,
 }
 
-fn parse_key_metadata(bytes: &[u8]) -> Result<i32> {
+fn parse_key_metadata(bytes: &[u8]) -> Result<(i32, i32)> {
     let envelope: MetadataEnvelope = serde_json::from_slice(bytes).context("invalid Vault key metadata")?;
     ensure!(envelope.data.key_type.as_deref() == Some("aes256-gcm96"), "Vault key is not aes256-gcm96");
     ensure!(envelope.data.derived == Some(true), "Vault key is not configured for derived contexts");
     let latest = envelope.data.latest_version.context("Vault key metadata missing latest_version")?;
-    ensure!(latest >= 1, "Vault key latest_version is invalid");
-    Ok(latest)
+    let min_encryption = envelope.data.min_encryption_version.unwrap_or(0);
+    ensure!(
+        latest >= 1 && min_encryption >= 0 && min_encryption <= latest,
+        "Vault key version metadata is invalid"
+    );
+    Ok((latest, min_encryption))
 }
 
 #[derive(Deserialize)]
@@ -564,12 +566,13 @@ mod tests {
     #[test]
     fn key_metadata_requires_derived_aes256_and_positive_latest_version() {
         let valid = br#"{"data":{"type":"aes256-gcm96","derived":true,"latest_version":3}}"#;
-        assert_eq!(parse_key_metadata(valid).unwrap(), 3);
+        assert_eq!(parse_key_metadata(valid).unwrap(), (3, 0));
         for invalid in [
             br#"{"data":{"type":"aes256-gcm96","derived":false,"latest_version":3}}"#.as_slice(),
             br#"{"data":{"type":"rsa-2048","derived":true,"latest_version":3}}"#.as_slice(),
             br#"{"data":{"type":"aes256-gcm96","derived":true}}"#.as_slice(),
             br#"{"data":{"type":"aes256-gcm96","derived":true,"latest_version":0}}"#.as_slice(),
+        br#"{"data":{"type":"aes256-gcm96","derived":true,"latest_version":3,"min_encryption_version":4}}"#.as_slice(),
         ] {
             assert!(parse_key_metadata(invalid).is_err());
         }

@@ -202,6 +202,14 @@ pub async fn run_kms_cli(config: &Config, args: &[String]) -> Result<()> {
                         );
                         i += 2;
                     }
+                    "--target-version" => {
+                        opts.target_version = Some(
+                            args.get(i + 1)
+                                .context("missing value for --target-version")?
+                                .parse()?,
+                        );
+                        i += 2;
+                    }
                     flag if flag.starts_with("--") => bail!("unknown kms-rotate flag '{flag}'"),
                     val if opts.target_key_id.is_none() => {
                         opts.target_key_id = Some(val.to_owned());
