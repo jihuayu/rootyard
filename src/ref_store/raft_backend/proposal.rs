@@ -140,7 +140,10 @@ impl ProposalId {
     }
 
     fn matches_commit_request(&self, request: &WireCommitRefsRequest) -> bool {
-        self.repository_id == request.repository_id
+        // The embedded operation identity duplicates the repository axis; a proposal may not
+        // accept a command whose duplicate disagrees with the outer request.
+        request.identity.repository_id == request.repository_id
+            && self.repository_id == request.repository_id
             && self.tenant_id == request.tenant_id
             && self.history_id == request.history_incarnation
             && self.group_epoch == u64::try_from(request.group_epoch).unwrap_or(0)
