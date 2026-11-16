@@ -303,7 +303,7 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
         _ => return Ok(reply(StatusCode::NOT_FOUND, "unknown route")),
     };
     let write = service == "git-receive-pack";
-    let db = config.db().await?;
+    let mut db = config.db().await?;
     if !permitted(&db, repo, principal, write).await? {
         return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
     }
@@ -342,13 +342,11 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
             packs: serde_json::from_value(row.get(3))?,
         }
     } else {
-        let snapshot = store::snapshot(config, repo).await?;
         if !write {
             if parts.method != "GET" {
                 return Ok(reply(StatusCode::CONFLICT, "read snapshot required"));
             }
-            let token = Uuid::new_v4();
-            db.execute("INSERT INTO pando_lab.snapshots(id,repo,principal,generation,storage_generation,refs,packs) VALUES($1,$2,$3,$4,$5,$6,$7)",&[&token,&repo,&principal,&snapshot.generation,&snapshot.storage_generation,&serde_json::to_value(&snapshot.refs)?,&serde_json::to_value(&snapshot.packs)?]).await?;
+            let token = store::snapshot_and_retain(&mut db, repo, principal).await?;
             return Ok(Response::builder()
                 .status(StatusCode::FOUND)
                 .header(
@@ -358,7 +356,7 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
                 .header(header::CACHE_CONTROL, "no-store")
                 .body(Body::empty())?);
         }
-        snapshot
+        store::snapshot(config, repo).await?
     };
     if parts.headers.contains_key(header::CONTENT_ENCODING) {
         return Ok(reply(

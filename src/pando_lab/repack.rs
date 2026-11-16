@@ -314,7 +314,16 @@ pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOption
     #[cfg(test)]
     test_support::barrier("after-prepare").await?;
 
-    let t = session.client_mut().transaction().await?;
+    // The repository lock can wait behind a retained-snapshot commit. Explicit
+    // read committed makes the post-wait live-snapshot scan fresh even when the
+    // server or session default is repeatable read.
+    let t = session
+        .client_mut()
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .read_only(false)
+        .start()
+        .await?;
     let lk = t.query_one("SELECT generation,storage_generation,storage_backend,write_paused FROM pando_lab.repositories WHERE id=$1 FOR UPDATE", &[&repo]).await?;
     let (cur_gen, cur_sgen, cur_b, cur_p): (i64, i64, String, bool) = (lk.get(0), lk.get(1), lk.get(2), lk.get(3));
     if cur_gen != pre_gen || cur_sgen != pre_sgen || cur_b != backend || cur_p != paused {
