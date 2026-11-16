@@ -16,6 +16,7 @@ from pando_vault_rotation_support import (
     require,
     sha256_bytes,
     sha256_file,
+    valid_uuid,
 )
 
 EXISTING_TARGET_CONTRACT = "existing-vault-version/v1"
@@ -175,6 +176,53 @@ def _require_cipher_unchanged(ctx, baseline):
     return True
 
 
+def validate_interrupt_checkpoint(checkpoint, expected_targets, report=None):
+    """Validate the actual IN_PROGRESS checkpoint against the pre-run pack set.
+
+    The real Vault selector snapshots every current manifest pack into
+    ``target_pack_ids``.  With ``--fail-after-packs 1`` exactly one existing
+    target is completed and the next remaining target is recorded as failed.
+    Foreign/duplicate IDs and report counts that do not match the checkpoint are
+    rejected rather than accepting a merely nonempty state.
+    """
+    stage = "rotation"
+    require(isinstance(checkpoint, dict), "rotation_checkpoint_missing", stage)
+    targets = checkpoint.get("target_pack_ids")
+    completed = checkpoint.get("completed_pack_ids")
+    failed = checkpoint.get("failed_pack_id")
+    require(isinstance(targets, list) and bool(targets)
+            and all(valid_uuid(item) for item in targets),
+            "rotation_target_ids_invalid", stage)
+    require(len(targets) == len(set(targets)), "rotation_target_duplicate", stage)
+    require(set(targets) == set(expected_targets),
+            "rotation_target_set_mismatch", stage)
+    require(isinstance(completed, list)
+            and all(valid_uuid(item) for item in completed),
+            "rotation_completed_ids_invalid", stage)
+    require(len(completed) == len(set(completed)),
+            "rotation_completed_duplicate", stage)
+    require(len(completed) == 1, "rotation_completed_count_invalid", stage)
+    require(set(completed) <= set(targets), "rotation_completed_foreign", stage)
+    require(isinstance(failed, str) and valid_uuid(failed),
+            "rotation_failed_id_invalid", stage)
+    require(failed in set(targets), "rotation_failed_foreign", stage)
+    require(failed not in set(completed), "rotation_failed_completed", stage)
+    remaining = set(targets) - set(completed)
+    require(failed in remaining, "rotation_failed_not_remaining", stage)
+    if report is not None:
+        require(isinstance(report, dict), "rotation_report_missing", stage)
+        require(report.get("rotation_total_packs") == len(targets),
+                "rotation_total_count_inconsistent", stage)
+        require(report.get("rotation_completed_packs") == len(completed),
+                "rotation_completed_count_inconsistent", stage)
+    return {
+        "targets": list(targets),
+        "completed": list(completed),
+        "failed": failed,
+        "remaining": sorted(remaining),
+    }
+
+
 def case_admin_rotated_target_interrupted_resume_and_new_write(ctx):
     baseline = dict(ctx.baseline)
     metadata = ctx.fixture.admin_rotate()
@@ -186,6 +234,10 @@ def case_admin_rotated_target_interrupted_resume_and_new_write(ctx):
     app_after = ctx.fixture.probe_scoped_key(ctx.fixture.key_name)
     require(app_after["rotate_denied"] and app_after["latest_unchanged"],
             "app_rotate_not_denied_after_admin_rotate", "rotation")
+    expected_targets = list(ctx.refresh_packs())
+    require(len(expected_targets) >= 2, "initial_pack_count_insufficient", "rotation")
+    require(len(expected_targets) == len(set(expected_targets)),
+            "initial_pack_duplicate", "rotation")
     interrupt = ctx.run_status(
         ["kms-rotate", ctx.repo, "--target-version", "2", "--fail-after-packs", "1"],
         stage="rotation_interrupt")
@@ -193,13 +245,8 @@ def case_admin_rotated_target_interrupted_resume_and_new_write(ctx):
     mid = ctx.status()
     rotation = mid.get("active_rotation")
     require(isinstance(rotation, dict), "rotation_checkpoint_missing", "rotation")
-    completed = rotation.get("completed_pack_ids") or []
-    targets = rotation.get("target_pack_ids") or []
-    failed = rotation.get("failed_pack_id")
     require(rotation.get("state") == "IN_PROGRESS", "rotation_not_in_progress",
             "rotation")
-    require(len(completed) == 1 and failed is not None and failed not in completed,
-            "rotation_interrupt_state_invalid", "rotation")
     require(rotation.get("to_key_version") == 2
             and rotation.get("expected_to_version") == 2,
             "rotation_target_version_invalid", "rotation")
@@ -212,10 +259,12 @@ def case_admin_rotated_target_interrupted_resume_and_new_write(ctx):
     require(mid.get("policy") is None, "vault_status_exposed_local_policy", "rotation")
     require(mid.get("provider_latest_version") == 2,
             "midpoint_latest_version_invalid", "rotation")
+    oracle = validate_interrupt_checkpoint(rotation, expected_targets, mid)
+    completed = oracle["completed"]
+    targets = oracle["targets"]
+    failed = oracle["failed"]
     completed_pack = completed[0]
-    v1_packs = [pack for pack in targets if pack not in completed]
-    require(bool(v1_packs), "rotation_left_no_v1_pack", "rotation")
-    v1_pack = v1_packs[0]
+    v1_pack = failed
     require(ctx.envelope(completed_pack)["key_version"] == 2,
             "completed_pack_not_rewrapped", "rotation")
     require(ctx.envelope(v1_pack)["key_version"] == 1,
@@ -246,10 +295,14 @@ def case_admin_rotated_target_interrupted_resume_and_new_write(ctx):
     baseline[new_pack] = _cipher_fact(ctx, new_pack)
     ctx.cold_get(new_pack)
     ctx.cold_verify()
+    expected_remaining = set(targets) - set(completed)
     current = ctx.refresh_packs()
     remaining_v1 = [pack for pack in current
                     if ctx.envelope(pack)["key_version"] == 1]
-    require(len(remaining_v1) == 1, "resume_remaining_v1_count_invalid", "resume")
+    require(set(remaining_v1) == expected_remaining,
+            "resume_remaining_v1_set_invalid", "resume")
+    require(failed in set(remaining_v1),
+            "resume_failed_pack_not_remaining_v1", "resume")
     resume = ctx.cli(["kms-rotate", ctx.repo, "--resume"], stage="rotation_resume")
     require(resume.get("new_key_version") == 2, "resume_target_version_invalid",
             "resume")
@@ -308,9 +361,9 @@ def case_admin_rotated_target_interrupted_resume_and_new_write(ctx):
             "rotation_failed": True,
             "rotation_contract": EXISTING_TARGET_CONTRACT,
             "rotation_write_epoch_positive": True,
-            "completed_pack_count": 1,
-            "v1_pack_count": 1,
-            "v2_pack_count": 1,
+            "completed_pack_count": len(completed),
+            "v1_pack_count": len(remaining_v1),
+            "v2_pack_count": len(completed),
             "midpoint_old_v1_cold_read": True,
             "midpoint_rewrapped_v2_cold_read": True,
             "new_write_v2": True,
