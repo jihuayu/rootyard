@@ -11,7 +11,7 @@ use rootyard_refcas_log::state_machine::{ApplicationError, ApplicationLogId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ref_store::core::state_machine::{RefCasStateMachine, validate_scope_kind};
+use crate::ref_store::core::state_machine::{RefCasStateMachine, ScopeLifecycle, validate_scope_kind};
 use crate::ref_store::raft_backend::outcome::{RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusalKind};
 use crate::ref_store::raft_backend::proposal::{
     MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, MAX_ROOT_STATE_BYTES, PROPOSAL_WINDOW, ProposalAttempt,
@@ -197,6 +197,8 @@ fn validate_v3(
         if let RootRefCasOutcome::Applied(RootRefCasApplied::AuthScopeClosedV2 {
             scope_kind,
             scope_id,
+            lifecycle,
+            authz_floor,
             drain_summary,
             ..
         }) = &attempt.outcome
@@ -207,6 +209,16 @@ fn validate_v3(
             validate_scope_kind(scope_kind)
                 .map_err(|error| ApplicationError::new(format!("compact scope close acknowledgment: {error}")))?;
             drain_summary.validate()?;
+            // The core close producer refuses these values before any successful response can be
+            // recorded. A structurally valid restored compact receipt must not bypass that
+            // successful-close invariant. The legacy full-vector variant above keeps its historical
+            // decoding semantics.
+            if *lifecycle == ScopeLifecycle::Open {
+                return Err(ApplicationError::new("compact scope close acknowledgment has an open lifecycle"));
+            }
+            if *authz_floor <= 0 {
+                return Err(ApplicationError::new("compact scope close acknowledgment has a non-positive authz floor"));
+            }
         }
         match attempt.kind {
             ProposalAttemptKind::Legacy => {
@@ -283,6 +295,9 @@ fn legacy_v2_digest(state_bytes: &[u8]) -> Result<String, ApplicationError> {
 fn is_lower_hex_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
+
+#[cfg(test)]
+mod close_restore_validation;
 
 #[cfg(test)]
 mod tests {
