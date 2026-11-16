@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .corpus import DATASET_CLASSES
+
+_TOKEN_RE = re.compile(r"ryt_[0-9A-Za-z_-]{16,}")
+_BEARER_RE = re.compile(r"(?i)(Bearer\s+)[0-9A-Za-z._~+/=-]{8,}")
+_PG_URL_RE = re.compile(r"postgres(?:ql)?://[^\s\"'<>]+")
 
 OUTCOME_CLASSES: tuple[str, ...] = ("committed_success", "typed_refusal", "unknown_outcome")
 
@@ -92,6 +97,9 @@ def redact_text(value: Any, secrets: tuple[str, ...] | list[str]) -> str:
     for secret in secrets:
         if secret:
             text = text.replace(secret, "[REDACTED]")
+    text = _TOKEN_RE.sub("[REDACTED]", text)
+    text = _BEARER_RE.sub(r"\1[REDACTED]", text)
+    text = _PG_URL_RE.sub("postgresql://[REDACTED]", text)
     return text
 
 

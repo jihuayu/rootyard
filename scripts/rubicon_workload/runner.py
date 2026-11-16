@@ -84,10 +84,32 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+def _allocate_distinct_ports(count: int) -> list[int]:
+    """Reserve distinct loopback TCP ports outside Linux's ephemeral range to avoid client port races."""
+    ports: list[int] = []
+    seen: set[int] = set()
+    base = 20000 + (os.getpid() % 5000)
+    for offset in range(9000):
+        if len(ports) >= count:
+            return ports
+        candidate = 20000 + ((base - 20000 + offset) % 9000)
+        if candidate in seen:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
+            ports.append(candidate)
+            seen.add(candidate)
+    while len(ports) < count:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            p = int(s.getsockname()[1])
+        if p not in seen:
+            ports.append(p)
+            seen.add(p)
+    return ports
 
 
 def _with_search_path(base_db: str, schema: str) -> str:
@@ -237,6 +259,14 @@ def _create_user_and_tokens(binary: str, cli_env: dict[str, str], username: str,
     return rw, ro
 
 
+def _read_log_tail(log_path: Path, max_lines: int = 30) -> str:
+    if not log_path.is_file():
+        return ""
+    raw = log_path.read_bytes()[-16384:].decode("utf-8", errors="replace")
+    lines = raw.splitlines()[-max_lines:]
+    return redact_text("\n".join(lines), [])
+
+
 def _start_fleet(
     count: int,
     binary: str,
@@ -246,52 +276,70 @@ def _start_fleet(
     s3_endpoint: str,
     scratch_root: Path,
 ) -> list[tuple[subprocess.Popen[bytes], str, Path, Any]]:
-    fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]] = []
-    for idx in range(count):
-        bind = f"127.0.0.1:{_free_port()}"
-        sdir = scratch_root / f"scratch-{idx}"
-        if sdir.exists():
-            shutil.rmtree(sdir)
-        sdir.mkdir(parents=True, mode=0o700)
-        os.chmod(sdir, 0o700)
-        env = base_env.copy()
-        env.pop("ROOTYARD_DATA_DIR", None)
-        env.update(
-            {
-                "DATABASE_URL": pg_url,
-                "ROOTYARD_SCHEMA_MODE": "external",
-                "ROOTYARD_BIND": bind,
-                "ROOTYARD_GIT": git_bin,
-                "ROOTYARD_SCRATCH_DIR": str(sdir),
-                "ROOTYARD_BLOB_ENDPOINT": s3_endpoint,
-                "ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE": "1000",
-            }
-        )
-        # Ensure single-process tier handles 6-way concurrent push + 4-way CI fetch
-        # without tripping default 256 MiB / 128 MiB = 2 inflight transfer slots.
-        env.setdefault("ROOTYARD_MAX_CONCURRENT_GIT", "16")
-        env.setdefault("ROOTYARD_MAX_REQUEST_BYTES", str(16 * 1024 * 1024))
-        env.setdefault("ROOTYARD_MAX_INFLIGHT_BYTES", str(256 * 1024 * 1024))
-        log_f = open(scratch_root / f"serve-blob-{idx}.log", "ab")
-        proc = subprocess.Popen([binary, "serve-blob"], env=env, stdout=log_f, stderr=log_f, start_new_session=True)
-        fleet.append((proc, f"http://{bind}", sdir, log_f))
+    for attempt in range(2):
+        ports = _allocate_distinct_ports(count)
+        fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]] = []
+        log_paths: list[Path] = []
+        for idx in range(count):
+            bind = f"127.0.0.1:{ports[idx]}"
+            sdir = scratch_root / f"scratch-{idx}"
+            if sdir.exists():
+                shutil.rmtree(sdir)
+            sdir.mkdir(parents=True, mode=0o700)
+            os.chmod(sdir, 0o700)
+            env = base_env.copy()
+            env.pop("ROOTYARD_DATA_DIR", None)
+            env.update(
+                {
+                    "DATABASE_URL": pg_url,
+                    "ROOTYARD_SCHEMA_MODE": "external",
+                    "ROOTYARD_BIND": bind,
+                    "ROOTYARD_GIT": git_bin,
+                    "ROOTYARD_SCRATCH_DIR": str(sdir),
+                    "ROOTYARD_BLOB_ENDPOINT": s3_endpoint,
+                    "ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE": "1000",
+                }
+            )
+            # Ensure single-process tier handles 6-way concurrent push + 4-way CI fetch
+            # without tripping default 256 MiB / 128 MiB = 2 inflight transfer slots.
+            env.setdefault("ROOTYARD_MAX_CONCURRENT_GIT", "16")
+            env.setdefault("ROOTYARD_MAX_REQUEST_BYTES", str(16 * 1024 * 1024))
+            env.setdefault("ROOTYARD_MAX_INFLIGHT_BYTES", str(256 * 1024 * 1024))
+            log_path = scratch_root / f"serve-blob-{idx}.log"
+            log_paths.append(log_path)
+            log_f = open(log_path, "ab")
+            proc = subprocess.Popen([binary, "serve-blob"], env=env, stdout=log_f, stderr=log_f, start_new_session=True)
+            fleet.append((proc, f"http://{bind}", sdir, log_f))
 
-    deadline = time.monotonic() + 30.0
-    pending = set(range(count))
-    while pending and time.monotonic() < deadline:
-        for idx in list(pending):
-            proc, base_url, _, _ = fleet[idx]
-            if proc.poll() is not None:
-                _stop_fleet(fleet)
-                raise RuntimeError(f"serve-blob[{idx}] exited during startup with {proc.returncode}")
-            if http_json(base_url, "/health/ready", timeout=3)[0] == 200:
-                pending.remove(idx)
+        deadline = time.monotonic() + 30.0
+        pending = set(range(count))
+        exited: tuple[int, int | None] | None = None
+        while pending and time.monotonic() < deadline:
+            for idx in list(pending):
+                proc, base_url, _, _ = fleet[idx]
+                if proc.poll() is not None:
+                    exited = (idx, proc.returncode)
+                    break
+                if http_json(base_url, "/health/ready", timeout=3)[0] == 200:
+                    pending.remove(idx)
+            if exited is not None:
+                break
+            if pending:
+                time.sleep(0.1)
+
+        if exited is not None:
+            idx, rc = exited
+            _stop_fleet(fleet)
+            tail = _read_log_tail(log_paths[idx])
+            if attempt == 0 and "could not bind Blob service listener" in tail:
+                continue
+            raise RuntimeError(f"serve-blob[{idx}] exited during startup with {rc}\n{tail}")
         if pending:
-            time.sleep(0.1)
-    if pending:
-        _stop_fleet(fleet)
-        raise RuntimeError(f"serve-blob readiness timed out for workers {sorted(pending)}")
-    return fleet
+            _stop_fleet(fleet)
+            tails = "\n".join(f"[{i}] {_read_log_tail(log_paths[i])}" for i in sorted(pending))
+            raise RuntimeError(f"serve-blob readiness timed out for workers {sorted(pending)}\n{tails}")
+        return fleet
+    raise RuntimeError("serve-blob startup exhausted retries")
 
 
 def _stop_fleet(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> None:
@@ -1183,9 +1231,9 @@ def run_rubicon_workload(config: WorkloadConfig, env: dict[str, str] | None = No
                 diag_path = Path(config.report).parent / "failure-diagnostics.log"
                 diag_path.parent.mkdir(parents=True, exist_ok=True)
                 lines = [f"error: {type(exc).__name__}: {msg}", tb]
-                for log_p in sorted(work_root.glob("tier-*/serve-blob-*.log")):
+                for log_p in sorted(work_root.rglob("serve-blob-*.log")):
                     raw_log = log_p.read_bytes()[-8192:].decode("utf-8", errors="replace")
-                    lines.append(f"--- {log_p.parent.name}/{log_p.name} ---")
+                    lines.append(f"--- {log_p.relative_to(work_root)} ---")
                     lines.append(redact_text(raw_log, secrets))
                 diag_path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
             except Exception:

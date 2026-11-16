@@ -698,6 +698,46 @@ class RubiconProvisioningAndAuthorityTests(unittest.TestCase):
             self.assertEqual(metrics["client_worktree_bytes"], 250)
             self.assertEqual(metrics["temp_disk_bytes"], 350)
 
+    def test_allocate_distinct_ports_and_start_fleet_log_diagnostics(self) -> None:
+        import pathlib
+        import tempfile
+        from unittest import mock
+        from scripts.rubicon_workload.runner import _allocate_distinct_ports, _start_fleet
+
+        ports = _allocate_distinct_ports(4)
+        self.assertEqual(len(ports), 4)
+        self.assertEqual(len(set(ports)), 4)
+
+        secret_tok = "ryt_" + "f" * 64
+        with tempfile.TemporaryDirectory() as td:
+            scratch = pathlib.Path(td)
+            attempt_calls = {"n": 0}
+
+            def fake_popen(_cmd: list[str], **_kwargs: object) -> mock.Mock:
+                attempt_calls["n"] += 1
+                stdout = _kwargs["stdout"]
+                if attempt_calls["n"] == 1:
+                    stdout.write(b"could not bind Blob service listener\n")
+                else:
+                    stdout.write(f"fatal startup failure {secret_tok}\n".encode("utf-8"))
+                stdout.flush()
+                proc = mock.Mock(pid=12345 + attempt_calls["n"], returncode=1)
+                proc.poll.return_value = 1
+                return proc
+
+            def fake_stop(fleet: list[tuple[object, str, pathlib.Path, object]]) -> None:
+                for _, _, _, fh in fleet:
+                    fh.close()
+
+            with mock.patch("subprocess.Popen", side_effect=fake_popen), \
+                 mock.patch("scripts.rubicon_workload.runner._stop_fleet", side_effect=fake_stop):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _start_fleet(1, "/bin/rootyard", {}, "/usr/bin/git", "postgresql://u@127.0.0.1/db", "http://127.0.0.1:9000", scratch)
+            msg = str(ctx.exception)
+            self.assertIn("fatal startup failure", msg)
+            self.assertNotIn(secret_tok, msg)
+            self.assertEqual(attempt_calls["n"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
