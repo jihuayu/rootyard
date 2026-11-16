@@ -279,6 +279,18 @@ async fn handle_repair_s3(
                 .body(Body::empty())
                 .unwrap()
         }
+        Method::GET => match state.objects.lock().unwrap().get(&key).cloned() {
+            Some(bytes) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                .body(Body::from(bytes))
+                .unwrap(),
+            None => Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(header::CONTENT_LENGTH, "0")
+                .body(Body::empty())
+                .unwrap(),
+        },
         _ => Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .header(header::CONTENT_LENGTH, "0")

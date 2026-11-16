@@ -82,6 +82,14 @@ async fn handle_s3(
                 .unwrap(),
             None => empty_resp(StatusCode::NOT_FOUND),
         },
+        Method::GET => match state.objects.lock().unwrap().get(&key).cloned() {
+            Some(bytes) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, bytes.len().to_string())
+                .body(Body::from(bytes))
+                .unwrap(),
+            None => empty_resp(StatusCode::NOT_FOUND),
+        },
         Method::DELETE => {
             if state.gate_first_delete.swap(false, Ordering::SeqCst) {
                 let release = state.release_first_delete.notified();
@@ -294,7 +302,9 @@ async fn rollback_cleanup_preserves_concurrent_publish_and_fences_uncertain_dele
     let dir = std::env::temp_dir().join(format!("ry-rollback-clean-{}", Uuid::new_v4()));
     tokio::fs::create_dir_all(&dir).await.unwrap();
     let payload_path = dir.join("obj.bin");
+    let fail_payload_path = dir.join("obj-fail.bin");
     tokio::fs::write(&payload_path, b"rollback-bytes").await.unwrap();
+    tokio::fs::write(&fail_payload_path, b"fail-delete-bytes").await.unwrap();
     let sha = hex::encode(Sha256::digest(b"rollback-bytes"));
     let oid_fail = hex::encode(Sha256::digest(b"fail-delete-bytes"));
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -389,13 +399,13 @@ async fn rollback_cleanup_preserves_concurrent_publish_and_fences_uncertain_dele
 
     // Scenario B: Failed rollback DELETE leaves delete_uncertain=true + propagates Err -> destination publish 503.
     let lfs_fail = ObjectKey::new(to_owner, "lfs", &oid_fail).unwrap();
-    store.put_file(&lfs_fail, &payload_path, 14, deadline).await.unwrap();
+    store.put_file(&lfs_fail, &fail_payload_path, b"fail-delete-bytes".len() as u64, deadline).await.unwrap();
     mock.fail_deletes_500.store(true, Ordering::SeqCst);
     let copied_fail = vec![CopiedRemoteObject {
         kind: "lfs".into(),
         from_key: ObjectKey::new(from_owner, "lfs", &oid_fail).unwrap().path(),
         to_key: lfs_fail.path(),
-        size: 14,
+        size: b"fail-delete-bytes".len() as u64,
         sha256: Some(oid_fail.clone()),
     }];
     assert!(

@@ -242,9 +242,12 @@ async fn blocked_first_delete_timeout_and_500_fail_closed_across_recovery() {
 
     let payload = b"blocked-delete-interleaving-payload";
     let oid = hex::encode(Sha256::digest(payload));
-    let oid_err = hex::encode(Sha256::digest(b"http-500-delete-payload"));
+    let payload_err = b"http-500-delete-payload";
+    let oid_err = hex::encode(Sha256::digest(payload_err));
     let file_path = dir.join("obj.bin");
+    let file_path_err = dir.join("obj-err.bin");
     tokio::fs::write(&file_path, payload).await.unwrap();
+    tokio::fs::write(&file_path_err, payload_err).await.unwrap();
     let key = ObjectKey::new(tenant, "lfs", &oid).unwrap();
     let key_err = ObjectKey::new(tenant, "lfs", &oid_err).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -296,7 +299,7 @@ async fn blocked_first_delete_timeout_and_500_fail_closed_across_recovery() {
     );
 
     // 2. HTTP 500 on DELETE also leaves delete_uncertain=true permanently fenced across recovery & expiry.
-    store.put_file(&key_err, &file_path, payload.len() as u64, deadline).await.unwrap();
+    store.put_file(&key_err, &file_path_err, payload_err.len() as u64, deadline).await.unwrap();
     let mut c_mut2 = pool.get().await.unwrap();
     let tx2 = c_mut2.transaction().await.unwrap();
     let claim2 = upsert_delete_claim(&tx2, tenant, "lfs", &oid_err, 60).await.unwrap();
