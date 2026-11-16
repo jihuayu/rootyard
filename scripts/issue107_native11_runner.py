@@ -399,7 +399,7 @@ def _list_target(binary, cfg, remaining):
 
 def _run_one(binary, name, remaining, case_seconds=DEFAULT_CASE_SECONDS):
     output = run_bounded(
-        [str(binary), name, "--exact", "--ignored", "--test-threads=1", "--format", "terse"],
+        [str(binary), name, "--exact", "--ignored", "--test-threads=1", "--format", "pretty"],
         timeout=min(case_seconds, remaining), env=os.environ.copy())
     parse_case_result(output, name)
 
