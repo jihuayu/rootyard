@@ -337,7 +337,8 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         database = row.get("database")
         backend_start = row.get("backend_start")
         assert type(pid) is int and pid > 0, "fixture blocker backend pid is invalid"
-        assert database == self.db, "fixture blocker backend database is not owned"
+        assert database == self.sql("SELECT current_database()"), \
+            "fixture blocker backend database is not owned"
         assert isinstance(backend_start, str) and backend_start, \
             "fixture blocker backend_start is missing"
         assert "'" not in backend_start, "fixture blocker backend_start is not SQL-safe"
