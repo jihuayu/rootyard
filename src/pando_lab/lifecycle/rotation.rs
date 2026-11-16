@@ -560,6 +560,7 @@ async fn rotate_vault_kms_key_with_options(
     repo: Uuid,
     opts: &KmsRotateOptions,
     c: &Client,
+    session: &super::publication::PgSession,
 ) -> Result<KmsRotationReport> {
     ensure!(
         provider_selection::selected_kind()? == PandoProviderSelection::VaultTransit,
@@ -572,6 +573,7 @@ async fn rotate_vault_kms_key_with_options(
     let packs = load_repo_packs(&c, repo).await?;
     let mut cp =
         resolve_vault_rotation_checkpoint(&c, &kms_dir, config, repo, opts, &packs, &vault).await?;
+    session.unlock_publication_exclusive(repo).await?;
     ensure!(
         cp.expected_version() == cp.to_key_version,
         "Vault rotation checkpoint version mismatch"
@@ -770,7 +772,7 @@ pub async fn rotate_kms_key_with_options(
     session.acquire_publication_exclusive(repo).await?;
     let c = session.client();
     if provider_selection::selected_kind()? == PandoProviderSelection::VaultTransit {
-        return rotate_vault_kms_key_with_options(config, repo, opts, c).await;
+        return rotate_vault_kms_key_with_options(config, repo, opts, c, &session).await;
     }
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
     if let Some(cp) = super::db::load_db_checkpoint(c, repo).await?
@@ -791,6 +793,7 @@ pub async fn rotate_kms_key_with_options(
         }
     }
     let (mut cp, _policy) = resolve_rotation_checkpoint(&c, &kms_dir, repo, opts, &packs).await?;
+    session.unlock_publication_exclusive(repo).await?;
     let provider = super::provider::PandoKmsProvider::open_existing(&kms_dir)?;
 
     let mut envelopes = Vec::with_capacity(packs.len());
