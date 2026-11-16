@@ -2,8 +2,6 @@
 
 use std::{
     collections::BTreeMap,
-    fs::Permissions,
-    os::unix::fs::PermissionsExt,
     path::Path,
     process::Command,
     sync::{Arc, Mutex, OnceLock},
@@ -26,14 +24,15 @@ use rootyard::blob_store::{
     opendal::BlobStore,
     read_accel::{
         AuthoritativePackSource, AuthoritativeRef, BuildReadAccelRequest, BuiltReadAccelBundle, ENABLE_BY_DEFAULT,
-        ManifestFetchRef, MaterializeViewRequest, MaterializedAccelView, PackRetentionRegistry, ReadAccelArtifactKind,
-        ReadAccelConfig, ReadAccelFallbackReason, ReadAccelObjectFormat, ReadAccelSidecarStatus,
-        build_and_upload_sidecars, materialize_git_view_with_read_accel, verify_and_recover_view_sidecars,
+        ManifestFetchRef, MaterializeViewRequest, MaterializedAccelView, PackRetentionRegistry, ReadAccelConfig,
+        ReadAccelObjectFormat, ReadAccelSidecarStatus, build_and_upload_sidecars, materialize_git_view_with_read_accel,
     },
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
+
+mod blob_read_accel_support;
 
 #[derive(Default)]
 struct S3State {
@@ -398,70 +397,7 @@ async fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Result<()> {
 
 #[tokio::test]
 async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Result<()> {
-    use ReadAccelFallbackReason::{
-        MembershipGenerationDrift, PackSetDigestDrift, SidecarArtifactCorrupt, SidecarArtifactMissing,
-    };
-    use ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly as Fallback;
-    let s3 = LoopbackS3::shared();
-    let ctx = test_ctx()?;
-    let sample = SampleRepoPacks::seed(ReadAccelObjectFormat::Sha1, true)?;
-    let baseline = sample.open(&ctx, 1, None, false).await?;
-    let bundle = sample.build(&ctx, 1, 1, &sample.packs, None).await?;
-
-    // 1. Membership drift & pack-set drift fail closed before sidecar GETs.
-    let drift_view = sample.open(&ctx, 2, Some(&bundle), true).await?;
-    ensure!(matches!(drift_view.status(), Fallback(MembershipGenerationDrift { expected: 2, manifest: 1 })));
-    ensure!(drift_view.metrics().sidecar_get_attempts == 1);
-    assert_git_parity(baseline.repo_path()?, drift_view.repo_path()?, &sample)?;
-    let subset_view = sample.open_with_packs(&ctx, 1, &sample.packs[..1], &[], (Some(&bundle), true), None).await?;
-    ensure!(matches!(subset_view.status(), Fallback(PackSetDigestDrift)));
-
-    // 2. Local cache tamper scrubs sidecars cleanly; cleared-cache rebuild restores Applied view.
-    let cached_view = sample.open(&ctx, 1, Some(&bundle), true).await?;
-    let bm_path =
-        cached_view.repo_path()?.join(&bundle.manifest.artifact(ReadAccelArtifactKind::Bitmap).unwrap().relative_path);
-    std::fs::set_permissions(&bm_path, Permissions::from_mode(0o644))?;
-    let mut raw = std::fs::read(&bm_path)?;
-    raw[8] ^= 0xff;
-    std::fs::write(&bm_path, raw)?;
-    let (status, removed) =
-        verify_and_recover_view_sidecars(cached_view.repo_path()?, Some(&bundle.manifest), ctx.dl).await?;
-    ensure!(
-        matches!(status, Fallback(SidecarArtifactCorrupt { kind: ReadAccelArtifactKind::Bitmap, .. }))
-            && removed.len() == 3
-            && !cached_view.repo_path()?.join("objects/pack/multi-pack-index").exists()
-    );
-    assert_git_parity(baseline.repo_path()?, cached_view.repo_path()?, &sample)?;
-    cached_view.reap();
-    let rebuilt = sample.open(&ctx, 1, Some(&bundle), true).await?;
-    ensure!(*rebuilt.status() == ReadAccelSidecarStatus::Applied);
-    rebuilt.reap();
-
-    // 3. Bit-flipped MIDX, truncated CommitGraph, and deleted Bitmap Blob all quarantine & fall back cleanly.
-    let bundle2 = sample.build(&ctx, 1, 2, &sample.packs, None).await?;
-    for (kind, target_bundle, op, want_missing, require_midx_quarantine) in [
-        (ReadAccelArtifactKind::Midx, &bundle, None, false, false),
-        (ReadAccelArtifactKind::CommitGraph, &bundle2, Some(12), false, true),
-        (ReadAccelArtifactKind::Bitmap, &bundle2, Some(0), true, true),
-    ] {
-        s3.mutate_object(&target_bundle.manifest.artifact(kind).unwrap().locator.to_locator()?, op);
-        let view = sample.open(&ctx, 1, Some(target_bundle), true).await?;
-        ensure!(
-            match (view.status(), want_missing) {
-                (Fallback(SidecarArtifactMissing(k)), true) => *k == kind,
-                (Fallback(SidecarArtifactCorrupt { kind: k, .. }), false) => *k == kind,
-                _ => false,
-            },
-            "unexpected fallback status: {:?}",
-            view.status()
-        );
-        if require_midx_quarantine {
-            ensure!(view.metrics().quarantined_sidecar_paths.iter().any(|p| p == "objects/pack/multi-pack-index"));
-            ensure!(!view.repo_path()?.join("objects/pack/multi-pack-index").exists());
-        }
-        assert_git_parity(baseline.repo_path()?, view.repo_path()?, &sample)?;
-    }
-    Ok(())
+    blob_read_accel_support::fault_injection_drift_missing_corrupt_and_local_cache_recovery().await
 }
 
 #[tokio::test]
