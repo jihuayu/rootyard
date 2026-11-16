@@ -4433,6 +4433,10 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
             read_materialized_file(&old_after, &git, &first_oid, "file.txt").await? == b"serving snapshot fixture\n",
             "old materialized file bytes changed after advance"
         );
+        // `old` still owns one of the two process-wide view permits. Release this
+        // completed view now so the new materialization below can take that slot;
+        // `old_after` keeps the other permit, so its captured view stays valid.
+        drop(old);
 
         let new_created = PgServingSnapshotMetadata
             .create(
