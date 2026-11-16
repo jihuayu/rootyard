@@ -4,7 +4,10 @@
 //! `(scope_kind, scope_id)` across Raft log entries and canonical snapshots with zero wall clocks.
 
 use super::apply_decisions::install_decision;
-use super::commands::{CloseAuthScopeCommand, InstallScopedDecisionCommand, ScopeLifecycle, SmDecisionState};
+use super::commands::{
+    AppliedLogId, CloseAuthScopeCommand, CommitScopedRefsCommand, InstallScopedDecisionCommand, ScopeLifecycle,
+    SmDecisionState, WireDecisionGrantCommitment,
+};
 use super::response::{ApplyResponse, StateMachineError};
 use super::state::SmState;
 use crate::ref_store::contract::{OperationState, RefStoreError, RequestDigest};
@@ -61,6 +64,7 @@ pub struct ScopeFloorRecord {
 pub struct DecisionScopeIndexRecord {
     pub decision_id: Uuid,
     pub dependencies: Vec<super::commands::WireDecisionScopeDep>,
+    pub grant_commitment: WireDecisionGrantCommitment,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -175,6 +179,26 @@ pub(super) fn close_auth_scope(
     })
 }
 
+pub(super) fn validate_grant_commitment(commitment: &WireDecisionGrantCommitment) -> Result<(), StateMachineError> {
+    for hex in [
+        &commitment.base_gate_digest,
+        &commitment.packs_digest,
+        &commitment.hold_receipts_digest,
+        &commitment.captured_oid_digest,
+    ] {
+        RequestDigest::from_str(hex)?;
+    }
+    let mut seen_holds = BTreeSet::new();
+    for &hold_id in &commitment.required_holds {
+        if hold_id.is_nil() || !seen_holds.insert(hold_id) {
+            return Err(StateMachineError::InvalidInput(
+                "decision grant required_holds must be non-nil and unique".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn install_scoped_decision(
     state: &mut SmState,
     cmd: InstallScopedDecisionCommand,
@@ -184,6 +208,7 @@ pub(super) fn install_scoped_decision(
             "install_scoped_decision requires at least one indexed scope dependency".into(),
         ));
     }
+    validate_grant_commitment(&cmd.grant_commitment)?;
     let mut seen_scopes = BTreeSet::new();
     for dep in &cmd.scope_dependencies {
         validate_scope_kind(&dep.scope_kind)?;
@@ -200,6 +225,16 @@ pub(super) fn install_scoped_decision(
     let op_key = super::state::RepoEntityKey::new(cmd.decision.repository_id, cmd.decision.operation_id);
     let already_installed = state.decisions_by_op.contains_key(&op_key);
     if !already_installed {
+        let gate = state
+            .gates
+            .get(&cmd.decision.repository_id)
+            .ok_or(StateMachineError::Store(RefStoreError::RepositoryNotFound))?;
+        if cmd.grant_commitment.base_gate_digest != gate.version()?.digest().as_hex() {
+            return Err(StateMachineError::DecisionDigestMismatch {
+                decision_id: cmd.decision.decision_id,
+                reason: "signed grant base_gate_digest disagrees with repository gate",
+            });
+        }
         for dep in &cmd.scope_dependencies {
             let skey = ScopeKey::new(&dep.scope_kind, dep.scope_id);
             if let Some(floor) = state.scope_floors.get(&skey) {
@@ -222,7 +257,8 @@ pub(super) fn install_scoped_decision(
     let decision_id = cmd.decision.decision_id;
     let resp = install_decision(state, cmd.decision)?;
     if let Some(existing_rec) = state.decision_scope_deps.get(&decision_id) {
-        if existing_rec.dependencies != cmd.scope_dependencies {
+        if existing_rec.dependencies != cmd.scope_dependencies || existing_rec.grant_commitment != cmd.grant_commitment
+        {
             return Err(StateMachineError::DecisionConflict { decision_id, state: SmDecisionState::Open });
         }
     } else {
@@ -230,11 +266,37 @@ pub(super) fn install_scoped_decision(
             let skey = ScopeKey::new(&dep.scope_kind, dep.scope_id);
             state.scope_decision_index.entry(skey).or_default().insert(decision_id);
         }
-        state
-            .decision_scope_deps
-            .insert(decision_id, DecisionScopeIndexRecord { decision_id, dependencies: cmd.scope_dependencies });
+        state.decision_scope_deps.insert(
+            decision_id,
+            DecisionScopeIndexRecord {
+                decision_id,
+                dependencies: cmd.scope_dependencies,
+                grant_commitment: cmd.grant_commitment,
+            },
+        );
     }
     Ok(resp)
+}
+
+pub(super) fn commit_scoped_refs(
+    state: &mut SmState,
+    log_id: AppliedLogId,
+    cmd: CommitScopedRefsCommand,
+) -> Result<ApplyResponse, StateMachineError> {
+    validate_grant_commitment(&cmd.expected_commitment)?;
+    let decision_id = cmd
+        .commit
+        .decision_id
+        .ok_or_else(|| StateMachineError::InvalidInput("commit_scoped_refs requires decision_id".into()))?;
+    let scoped =
+        state.decision_scope_deps.get(&decision_id).ok_or(StateMachineError::DecisionNotFound { decision_id })?;
+    if scoped.grant_commitment != cmd.expected_commitment {
+        return Err(StateMachineError::DecisionDigestMismatch {
+            decision_id,
+            reason: "commit grant commitments disagree with installed signed decision grant",
+        });
+    }
+    super::apply_commit::commit_refs(state, log_id, cmd.commit)
 }
 
 pub(super) fn verify_decision_scopes_open(

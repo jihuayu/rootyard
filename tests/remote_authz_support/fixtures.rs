@@ -7,10 +7,10 @@ use zeroize::Zeroizing;
 
 use rootyard::ref_store::contract::IssuerLane;
 use rootyard::ref_store::core::command::CommitRefsRequest;
-use rootyard::ref_store::core::contract::CommitMode;
+use rootyard::ref_store::core::contract::{CommitMode, CoreGate};
 use rootyard::ref_store::core::state_machine::{
-    AppliedLogId, InitializeGateCommand, RefCasCommand, RepositoryLane, SmPackMode, WireDecisionKind,
-    WireDecisionScopeDep, WireDecisionVerdict, WireGateInit,
+    AcquireHoldBatchCommand, AppliedLogId, InitializeGateCommand, RefCasCommand, RepositoryLane, SmPackMode,
+    WireDecisionKind, WireDecisionScopeDep, WireDecisionVerdict, WireGateInit, WireHoldArtifactSpec,
 };
 use rootyard::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefUpdate};
 use rootyard::ref_store::projector::{
@@ -45,6 +45,22 @@ pub fn make_test_keyring(current_key_id: u8) -> DecisionGrantKeyring {
     .expect("build test decision grant keyring")
 }
 
+pub fn gate_base_digest_hex(repo: Uuid, realm: &GrantExpectedRealm) -> String {
+    CoreGate::new(
+        repo,
+        realm.tenant_id,
+        GitObjectFormat::Sha256,
+        realm.history_incarnation,
+        realm.authority_epoch,
+        realm.group_epoch,
+        RefName::branch("refs/heads/main").expect("valid branch"),
+        1,
+    )
+    .expect("build canonical gate")
+    .digest()
+    .as_hex()
+}
+
 pub fn init_gate_cmd(repo: Uuid, realm: &GrantExpectedRealm, authz_floor: i64) -> RefCasCommand {
     RefCasCommand::InitializeGate(InitializeGateCommand {
         gate: WireGateInit {
@@ -59,6 +75,39 @@ pub fn init_gate_cmd(repo: Uuid, realm: &GrantExpectedRealm, authz_floor: i64) -
         lane: RepositoryLane::ServingRefStore,
         pack_mode: SmPackMode::MetadataOnly,
         authz_floor,
+    })
+}
+
+pub fn acquire_holds_cmd(
+    realm: &GrantExpectedRealm,
+    owner_id: Uuid,
+    operation_id: Uuid,
+    hold_ids: &[Uuid],
+) -> RefCasCommand {
+    let artifacts = hold_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &hold_id)| WireHoldArtifactSpec {
+            hold_id,
+            slot: i as i16,
+            artifact_digest: hex_digest(0xc0 + (i as u8)),
+            declared_bytes: 512,
+            logical_bytes: 512,
+        })
+        .collect();
+    RefCasCommand::AcquireHoldBatch(AcquireHoldBatchCommand {
+        request_id: Uuid::new_v4(),
+        consume_request_id: Uuid::new_v4(),
+        operation_id,
+        repository_id: realm.repository_id,
+        tenant_id: realm.tenant_id,
+        owner_id,
+        purpose: "ref_publication".to_owned(),
+        backend_identity: hex_digest(0xde),
+        authority_id: Uuid::new_v4(),
+        authority_generation: 1,
+        expected_gate_digest: gate_base_digest_hex(realm.repository_id, realm),
+        artifacts,
     })
 }
 
@@ -138,7 +187,7 @@ pub fn build_grant_payload(
         packs_digest: hex_digest(0x66),
         hold_receipts_digest: hex_digest(0x77),
         captured_oid_digest: hex_digest(0x88),
-        base_gate_digest: hex_digest(0x99),
+        base_gate_digest: gate_base_digest_hex(realm.repository_id, realm),
         required_holds: vec![],
         verdicts,
         scope_dependencies: vec![WireDecisionScopeDep {

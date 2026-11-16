@@ -26,11 +26,12 @@ pub use apply_scopes::{
 };
 pub use commands::{
     AcquireHoldBatchCommand, AdvanceCancelCutoffCommand, AppliedLogId, BeginOperationCommand, CancelCommand,
-    CloseAuthScopeCommand, CommitRefsCommand, CreateSnapshotPinCommand, InitializeGateCommand, InstallDecisionCommand,
-    InstallScopedDecisionCommand, MarkHoldConsumedCommand, NoopCommand, RefCasCommand, RegisterRootCommand,
-    ReleasePinCommand, ReleaseRootCommand, RenewPinCommand, RepositoryLane, RetireHoldBatchCommand, ScopeLifecycle,
-    SetRepositoryLaneCommand, SmDecisionState, SmHoldState, SmPackMode, SmPinState, SmRootState, WireDecisionKind,
-    WireDecisionScopeDep, WireDecisionVerdict, WireHoldArtifactSpec,
+    CloseAuthScopeCommand, CommitRefsCommand, CommitScopedRefsCommand, CreateSnapshotPinCommand, InitializeGateCommand,
+    InstallDecisionCommand, InstallScopedDecisionCommand, MarkHoldConsumedCommand, NoopCommand, RefCasCommand,
+    RegisterRootCommand, ReleasePinCommand, ReleaseRootCommand, RenewPinCommand, RepositoryLane,
+    RetireHoldBatchCommand, ScopeLifecycle, SetRepositoryLaneCommand, SmDecisionState, SmHoldState, SmPackMode,
+    SmPinState, SmRootState, WireDecisionGrantCommitment, WireDecisionKind, WireDecisionScopeDep, WireDecisionVerdict,
+    WireHoldArtifactSpec,
 };
 pub use machine::{RefCasLogEntry, RefCasStateMachine, decode_command, encode_command};
 pub use response::{ApplyResponse, SmOperationRecord, SmVersionCheck, StateMachineError};

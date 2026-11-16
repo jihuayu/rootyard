@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use deadpool_postgres::{Manager, Pool};
 use rootyard::db;
+use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
 pub struct TestPgEnv {
@@ -24,6 +25,7 @@ pub struct SeedPgDecision<'a> {
     pub authority_epoch: i64,
     pub group_epoch: i64,
     pub base_revision: i64,
+    pub base_gate_digest: &'a str,
     pub command_digest: &'a str,
     pub ref_name: &'a str,
     pub new_oid_hex: &'a str,
@@ -112,6 +114,10 @@ impl TestPgEnv {
 
     pub async fn seed_decision(&self, d: &SeedPgDecision<'_>) -> Result<()> {
         let client = self.pool.get().await?;
+        self.seed_decision_on(&**client, d).await
+    }
+
+    pub async fn seed_decision_on<C: GenericClient + Sync>(&self, client: &C, d: &SeedPgDecision<'_>) -> Result<()> {
         let d_zero = super::fixtures::hex_digest(0xaa);
         let tok_id = Uuid::new_v4();
         let receipt_opt: Option<Uuid> = (d.state == "CONSUMED").then(Uuid::new_v4);
@@ -130,7 +136,7 @@ impl TestPgEnv {
                     $1, $2, $3, $3, $4, $5, $6,
                     $7, $8, $9, $10, 'atomic', 'push', 'sha256',
                     $11, $12, $13, $14,
-                    $6, $15, $6, $6,
+                    $18, $15, $6, $6,
                     $6, $6, $6, $6,
                     $6, $6, $6, $6,
                     2000000000, 1000000000, $16, $17,
@@ -155,6 +161,7 @@ impl TestPgEnv {
                     &d.command_digest,
                     &d.state,
                     &receipt_opt,
+                    &d.base_gate_digest,
                 ],
             )
             .await?;

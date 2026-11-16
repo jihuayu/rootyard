@@ -84,8 +84,13 @@ class RemoteAuthzBridgeContractTest(unittest.TestCase):
         self.assertIn("RetiredSigningKey", grant_txt)
         self.assertIn("ServiceIdentityMismatch", grant_txt)
         self.assertIn("Zeroizing", grant_txt)
+        self.assertIn("WireDecisionGrantCommitment", grant_txt)
+        self.assertIn("build_scoped_commit_from_grant", grant_txt)
 
         pg_txt = (PROJECTOR_DIR / "remote_authz_pg.rs").read_text(encoding="utf-8")
+        self.assertIn("deadpool_postgres::Pool", pg_txt)
+        self.assertIn("IsolationLevel::ReadCommitted", pg_txt)
+        self.assertNotIn("GenericClient", pg_txt)
         self.assertIn("ref_store_publication_decisions", pg_txt)
         self.assertIn("ref_store_decision_cancellations", pg_txt)
         self.assertIn("ref_store_decision_dependencies", pg_txt)
@@ -96,6 +101,8 @@ class RemoteAuthzBridgeContractTest(unittest.TestCase):
         self.assertIn("UnknownQuorumLoss", bridge_txt)
         self.assertIn("DrainedAndConfirmed", bridge_txt)
         self.assertIn("evaluate_revocation_drain_barrier", bridge_txt)
+        self.assertIn("floor.key.scope_kind != scope_kind", bridge_txt)
+        self.assertNotIn("GenericClient", bridge_txt)
 
     def test_workflow_and_docs_match_issue152_contract(self) -> None:
         wf_bytes = WORKFLOW.read_bytes()
@@ -106,10 +113,12 @@ class RemoteAuthzBridgeContractTest(unittest.TestCase):
             "scripts/install_ci_cargo_fork.sh verify",
             "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b",
             "crates/refcas-log/Cargo.toml",
+            "ref_store_raft_sm",
             "ref_store_remote_authz_bridge",
             "--ignored --test-threads=1",
         ):
             self.assertIn(token, wf_txt)
+        self.assertNotIn("--lib ref_store::core::state_machine", wf_txt)
 
         doc_bytes = DOC.read_bytes()
         self.assertNotIn(b"\r\n", doc_bytes, "Doc must use pure LF")

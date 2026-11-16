@@ -18,9 +18,11 @@ use zeroize::Zeroizing;
 
 use crate::ref_store::contract::RequestDigest;
 use crate::ref_store::core::state_machine::{
-    InstallDecisionCommand, InstallScopedDecisionCommand, WireDecisionKind, WireDecisionScopeDep, WireDecisionVerdict,
+    CommitRefsCommand, CommitScopedRefsCommand, InstallDecisionCommand, InstallScopedDecisionCommand,
+    WireCommitRefsRequest, WireDecisionGrantCommitment, WireDecisionKind, WireDecisionScopeDep, WireDecisionVerdict,
     validate_scope_kind,
 };
+use crate::ref_store::core::terminal::CommitRejectCode;
 
 pub(crate) const GRANT_FORMAT_VERSION: u8 = 1;
 const MAC_LEN: usize = 32;
@@ -316,7 +318,40 @@ pub fn verify_signed_decision_grant(
             logical_tick: current_logical_tick,
         },
         scope_dependencies: p.scope_dependencies.clone(),
+        grant_commitment: grant_commitment_for(grant),
     })
+}
+
+/// Extracts signed commitment fields (`base_gate_digest`, `packs`, `hold_receipts`, `captured_oid`, `required_holds`).
+pub fn grant_commitment_for(grant: &SignedDecisionGrant) -> WireDecisionGrantCommitment {
+    let p = &grant.payload;
+    WireDecisionGrantCommitment {
+        base_gate_digest: p.base_gate_digest.clone(),
+        packs_digest: p.packs_digest.clone(),
+        hold_receipts_digest: p.hold_receipts_digest.clone(),
+        captured_oid_digest: p.captured_oid_digest.clone(),
+        required_holds: p.required_holds.clone(),
+    }
+}
+
+/// Builds a [`CommitScopedRefsCommand`] bound strictly to the signed grant's `decision_id`, `required_holds`, and commitments.
+pub fn build_scoped_commit_from_grant(
+    grant: &SignedDecisionGrant,
+    request: WireCommitRefsRequest,
+    policy_rejects: BTreeMap<String, CommitRejectCode>,
+    logical_tick: u64,
+) -> CommitScopedRefsCommand {
+    let expected_commitment = grant_commitment_for(grant);
+    CommitScopedRefsCommand {
+        commit: CommitRefsCommand {
+            request,
+            decision_id: Some(grant.payload.decision_id),
+            required_holds: expected_commitment.required_holds.clone(),
+            policy_rejects,
+            logical_tick,
+        },
+        expected_commitment,
+    }
 }
 
 fn validate_payload_syntax(p: &SignedDecisionGrantPayload) -> Result<(), RemoteAuthzGrantError> {
@@ -332,6 +367,12 @@ fn validate_payload_syntax(p: &SignedDecisionGrantPayload) -> Result<(), RemoteA
     }
     if p.verdicts.is_empty() || p.scope_dependencies.is_empty() {
         return Err(RemoteAuthzGrantError::InvalidInput("grant requires verdicts and scope_dependencies".into()));
+    }
+    let mut seen_holds = BTreeSet::new();
+    for &hold_id in &p.required_holds {
+        if hold_id.is_nil() || !seen_holds.insert(hold_id) {
+            return Err(RemoteAuthzGrantError::InvalidInput("grant required_holds must be non-nil and unique".into()));
+        }
     }
     for hex in [
         &p.command_digest,

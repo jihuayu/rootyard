@@ -17,13 +17,15 @@ use rootyard::ref_store::core::state_machine::{
 };
 use rootyard::ref_store::projector::{
     AuthoritySourceKind, LinearizableScopeProbe, RemoteAuthzBridgeError, RemoteAuthzGrantError, RevocationDrainStatus,
-    await_drain_before_revocation_ack, evaluate_revocation_drain_barrier, verify_signed_decision_grant,
+    await_drain_before_revocation_ack, build_scoped_commit_from_grant, evaluate_revocation_drain_barrier,
+    verify_signed_decision_grant,
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use remote_authz_support::fixtures::{
-    build_commit_request, build_grant_payload, init_gate_cmd, log_id, make_test_keyring, make_test_realm,
+    acquire_holds_cmd, build_commit_request, build_grant_payload, hex_digest, init_gate_cmd, log_id, make_test_keyring,
+    make_test_realm,
 };
 
 #[test]
@@ -329,6 +331,80 @@ async fn drain_barrier_refuses_unknown_quorum_loss_and_pg_fallback() {
         RevocationDrainStatus::DrainedAndConfirmed { confirmed_operations, .. }
         if confirmed_operations.len() == 1 && confirmed_operations[0].state == OperationState::Cancelled
     ));
+
+    // Scope-A closed/empty probe passed when evaluating Scope-B target MUST fail closed cleanly.
+    let scope_b = Uuid::new_v4();
+    let cross_probe = LinearizableScopeProbe {
+        source: AuthoritySourceKind::RaftReadIndexQuorum,
+        read_log_index: Some(4),
+        applied_log_index: 4,
+        drain: drained_snapshot,
+    };
+    assert!(matches!(
+        evaluate_revocation_drain_barrier(&cross_probe, "pull", scope_b, 5, 3),
+        Err(RemoteAuthzBridgeError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn signed_commitment_and_non_empty_holds_match_and_mismatch() {
+    let repo = Uuid::new_v4();
+    let tenant = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let realm = make_test_realm(repo, tenant);
+    let keyring = make_test_keyring(2);
+    let scope_id = Uuid::new_v4();
+    let op_id = Uuid::new_v4();
+    let dec_id = Uuid::new_v4();
+    let hold1 = Uuid::new_v4();
+    let hold2 = Uuid::new_v4();
+    let wrong_hold = Uuid::new_v4();
+
+    let mut sm = RefCasStateMachine::new();
+    sm.apply(log_id(1), init_gate_cmd(repo, &realm, 1)).unwrap();
+    sm.apply(log_id(2), acquire_holds_cmd(&realm, actor, op_id, &[hold1, hold2])).unwrap();
+
+    let req = build_commit_request(&realm, actor, "main", 1, op_id, "refs/heads/main", 0x61);
+    let mut payload = build_grant_payload(&realm, dec_id, &req, "token", scope_id, 3, 500);
+    payload.required_holds = vec![hold1, hold2];
+    let grant = keyring.sign(payload).unwrap();
+    let install_cmd = verify_signed_decision_grant(&keyring, &grant, &realm, "raft-bridge-svc-a", 5).unwrap();
+    assert_eq!(install_cmd.grant_commitment.required_holds, vec![hold1, hold2]);
+
+    sm.apply(log_id(3), RefCasCommand::InstallScopedDecision(install_cmd)).unwrap();
+    let mut restored = RefCasStateMachine::restore(&sm.snapshot().unwrap()).unwrap();
+
+    let wire_req = WireCommitRefsRequest::from(&req);
+    for bad_holds in [vec![], vec![hold1], vec![hold1, wrong_hold], vec![hold1, hold2, wrong_hold]] {
+        let bad = RefCasCommand::CommitRefs(CommitRefsCommand {
+            request: wire_req.clone(),
+            decision_id: Some(dec_id),
+            required_holds: bad_holds,
+            policy_rejects: BTreeMap::new(),
+            logical_tick: 6,
+        });
+        assert!(matches!(restored.apply(log_id(4), bad), Err(StateMachineError::DecisionDigestMismatch { .. })));
+    }
+
+    let good_scoped = build_scoped_commit_from_grant(&grant, wire_req.clone(), BTreeMap::new(), 6);
+    for mutate in 0..4u8 {
+        let mut tampered = good_scoped.clone();
+        match mutate {
+            0 => tampered.expected_commitment.packs_digest = hex_digest(0xfe),
+            1 => tampered.expected_commitment.hold_receipts_digest = hex_digest(0xfd),
+            2 => tampered.expected_commitment.captured_oid_digest = hex_digest(0xfc),
+            _ => tampered.expected_commitment.base_gate_digest = hex_digest(0xfb),
+        }
+        assert!(matches!(
+            restored.apply(log_id(5), RefCasCommand::CommitScopedRefs(tampered)),
+            Err(StateMachineError::DecisionDigestMismatch { .. })
+        ));
+    }
+
+    let ok_res = restored.apply(log_id(5), RefCasCommand::CommitScopedRefs(good_scoped.clone())).unwrap();
+    assert!(matches!(ok_res, ApplyResponse::RefsCommitted(r) if !r.replayed));
+    let replay_res = restored.apply(log_id(6), RefCasCommand::CommitScopedRefs(good_scoped)).unwrap();
+    assert!(matches!(replay_res, ApplyResponse::RefsCommitted(r) if r.replayed));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

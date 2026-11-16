@@ -43,7 +43,7 @@ pub use remote_authz_bridge::{
 };
 pub use remote_authz_grant::{
     DecisionGrantKeyring, GrantExpectedRealm, RemoteAuthzGrantError, ServiceMtlsIdentity, SignedDecisionGrant,
-    SignedDecisionGrantPayload, verify_signed_decision_grant,
+    SignedDecisionGrantPayload, build_scoped_commit_from_grant, grant_commitment_for, verify_signed_decision_grant,
 };
 pub use remote_authz_pg::{PgGrantMintRequest, mint_signed_decision_grant_from_pg};
 pub use replay::{

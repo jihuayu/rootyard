@@ -1,9 +1,13 @@
-//! PostgreSQL commitment verifier & signed decision grant minter (`#152`).
+//! PostgreSQL committed-read decision verifier & signed decision grant minter (`#152`).
 //!
 //! Separated from HMAC verification so grant cryptographic validation stays offline
-//! and every PG read confirms committed `OPEN` rows before minting a grant.
+//! and every PG read executes inside an independent pooled `READ COMMITTED` read-only
+//! snapshot, making it impossible to mint grants from an uncommitted caller `Transaction`.
 
-use tokio_postgres::GenericClient;
+use std::collections::BTreeSet;
+
+use deadpool_postgres::Pool;
+use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use crate::ref_store::core::state_machine::{WireDecisionKind, WireDecisionScopeDep, WireDecisionVerdict};
@@ -24,10 +28,11 @@ pub struct PgGrantMintRequest {
     pub not_after_tick: u64,
 }
 
-/// Reads a committed `OPEN` PG publication decision and mints a signed grant only when
-/// every indexed dependency scope in `ref_store_decision_scopes` is confirmed `OPEN`.
-pub async fn mint_signed_decision_grant_from_pg<C: GenericClient + Sync>(
-    client: &C,
+/// Reads a committed `OPEN` PG publication decision from an independent `READ COMMITTED`
+/// read-only pooled connection and mints a signed grant only when every indexed dependency
+/// scope in `ref_store_decision_scopes` is confirmed `OPEN`.
+pub async fn mint_signed_decision_grant_from_pg(
+    pool: &Pool,
     signer: &DecisionGrantKeyring,
     req: &PgGrantMintRequest,
 ) -> Result<SignedDecisionGrant, RemoteAuthzGrantError> {
@@ -36,8 +41,23 @@ pub async fn mint_signed_decision_grant_from_pg<C: GenericClient + Sync>(
     if req.authz_epoch <= 0 || req.not_after_tick == 0 {
         return Err(RemoteAuthzGrantError::InvalidInput("authz_epoch and not_after_tick must be > 0".into()));
     }
+    let mut seen_holds = BTreeSet::new();
+    for &hold_id in &req.required_holds {
+        if hold_id.is_nil() || !seen_holds.insert(hold_id) {
+            return Err(RemoteAuthzGrantError::InvalidInput("mint required_holds must be non-nil and unique".into()));
+        }
+    }
 
-    let row = client
+    let mut client = pool.get().await.map_err(|e| RemoteAuthzGrantError::PgDatabase(e.to_string()))?;
+    let tx = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .read_only(true)
+        .start()
+        .await
+        .map_err(|e| RemoteAuthzGrantError::PgDatabase(e.to_string()))?;
+
+    let row = tx
         .query_opt(
             "SELECT repository_id, tenant_id, actor_id, operation_id, mode, state,
                     history_incarnation, authority_epoch, group_epoch, base_revision,
@@ -75,7 +95,7 @@ pub async fn mint_signed_decision_grant_from_pg<C: GenericClient + Sync>(
         return Err(RemoteAuthzGrantError::RealmMismatch("PG decision realm differs from mint request"));
     }
 
-    let cancelled = client
+    let cancelled = tx
         .query_opt(
             "SELECT 1 FROM ref_store_decision_cancellations WHERE repository_id = $1 AND operation_id = $2",
             &[&repository_id, &operation_id],
@@ -86,7 +106,7 @@ pub async fn mint_signed_decision_grant_from_pg<C: GenericClient + Sync>(
         return Err(RemoteAuthzGrantError::DecisionCancelledInPg(operation_id));
     }
 
-    let ref_rows = client
+    let ref_rows = tx
         .query(
             "SELECT ref_name, verdict, reject_code FROM ref_store_decision_refs
              WHERE decision_id = $1 ORDER BY ref_ordinal ASC",
@@ -108,7 +128,7 @@ pub async fn mint_signed_decision_grant_from_pg<C: GenericClient + Sync>(
         verdicts.push(WireDecisionVerdict { ref_name: r.get(0), accepted: verdict_str == "accept", reject_code });
     }
 
-    let dep_rows = client
+    let dep_rows = tx
         .query(
             "SELECT scope_kind, scope_id, observed_version, observed_digest
              FROM ref_store_decision_dependencies
@@ -121,7 +141,7 @@ pub async fn mint_signed_decision_grant_from_pg<C: GenericClient + Sync>(
     for d in dep_rows {
         let scope_kind: String = d.get(0);
         let scope_id: Uuid = d.get(1);
-        let scope_row = client
+        let scope_row = tx
             .query_opt(
                 "SELECT state FROM ref_store_decision_scopes WHERE scope_kind = $1 AND scope_id = $2",
                 &[&scope_kind, &scope_id],
@@ -143,6 +163,7 @@ pub async fn mint_signed_decision_grant_from_pg<C: GenericClient + Sync>(
             observed_digest: d.get(3),
         });
     }
+    let _ = tx.rollback().await;
 
     let kind = match mode.as_str() {
         "atomic" => WireDecisionKind::Atomic,

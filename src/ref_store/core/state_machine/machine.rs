@@ -9,7 +9,8 @@ use super::apply_refs::{
 };
 use super::apply_roots::{register_root, release_root};
 use super::apply_scopes::{
-    ScopeDrainSnapshot, ScopeFloorRecord, ScopeKey, close_auth_scope, inspect_scope_drain, install_scoped_decision,
+    ScopeDrainSnapshot, ScopeFloorRecord, ScopeKey, close_auth_scope, commit_scoped_refs, inspect_scope_drain,
+    install_scoped_decision,
 };
 use super::commands::{AppliedLogId, RefCasCommand, ScopeLifecycle};
 use super::response::{ApplyResponse, StateMachineError};
@@ -257,6 +258,7 @@ fn apply_inner(
         RefCasCommand::SetRepositoryLane(cmd) => set_repository_lane(state, cmd),
         RefCasCommand::BeginOperation(cmd) => begin_operation(state, cmd),
         RefCasCommand::CommitRefs(cmd) => commit_refs(state, log_id, cmd),
+        RefCasCommand::CommitScopedRefs(cmd) => commit_scoped_refs(state, log_id, cmd),
         RefCasCommand::Cancel(cmd) => cancel_operation(state, cmd),
         RefCasCommand::AdvanceCancelCutoff(cmd) => advance_cancel_cutoff(state, cmd),
         RefCasCommand::InstallDecision(cmd) => install_decision(state, cmd),

@@ -11,9 +11,10 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 
+use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Instant, timeout_at};
-use tokio_postgres::GenericClient;
+use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use super::session_fence::{AuthoritySourceKind, assert_authoritative_source};
@@ -106,10 +107,16 @@ impl std::fmt::Display for RemoteAuthzBridgeError {
 impl std::error::Error for RemoteAuthzBridgeError {}
 
 /// Queries committed PostgreSQL `ref_store_decision_scopes` rows in `CLOSING` state ordered deterministically.
-pub async fn load_closing_scopes_from_pg<C: GenericClient + Sync>(
-    client: &C,
-) -> Result<Vec<PgClosingScopeRow>, RemoteAuthzBridgeError> {
-    let rows = client
+pub async fn load_closing_scopes_from_pg(pool: &Pool) -> Result<Vec<PgClosingScopeRow>, RemoteAuthzBridgeError> {
+    let mut client = pool.get().await.map_err(|e| RemoteAuthzBridgeError::PgDatabase(e.to_string()))?;
+    let tx = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .read_only(true)
+        .start()
+        .await
+        .map_err(|e| RemoteAuthzBridgeError::PgDatabase(e.to_string()))?;
+    let rows = tx
         .query(
             "SELECT scope_kind, scope_id, version, change_id
              FROM ref_store_decision_scopes
@@ -119,6 +126,7 @@ pub async fn load_closing_scopes_from_pg<C: GenericClient + Sync>(
         )
         .await
         .map_err(|e| RemoteAuthzBridgeError::PgDatabase(e.to_string()))?;
+    let _ = tx.rollback().await;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -162,12 +170,20 @@ pub fn plan_close_scope_commands(
     Ok(cmds)
 }
 
-/// Queries PG decision cancellations so pending/open operations can be deterministically cancelled via Raft log.
-pub async fn load_decision_cancellations_from_pg<C: GenericClient + Sync>(
-    client: &C,
+/// Queries committed PG decision cancellations so pending/open operations can be cancelled via Raft log.
+pub async fn load_decision_cancellations_from_pg(
+    pool: &Pool,
     repository_id: Uuid,
 ) -> Result<Vec<PgDecisionCancellationRow>, RemoteAuthzBridgeError> {
-    let rows = client
+    let mut client = pool.get().await.map_err(|e| RemoteAuthzBridgeError::PgDatabase(e.to_string()))?;
+    let tx = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::ReadCommitted)
+        .read_only(true)
+        .start()
+        .await
+        .map_err(|e| RemoteAuthzBridgeError::PgDatabase(e.to_string()))?;
+    let rows = tx
         .query(
             "SELECT repository_id, operation_id, decision_id, request_digest, actor_id, reason
              FROM ref_store_decision_cancellations
@@ -177,6 +193,7 @@ pub async fn load_decision_cancellations_from_pg<C: GenericClient + Sync>(
         )
         .await
         .map_err(|e| RemoteAuthzBridgeError::PgDatabase(e.to_string()))?;
+    let _ = tx.rollback().await;
 
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
@@ -249,6 +266,12 @@ pub fn evaluate_revocation_drain_barrier(
             reason: format!("scope ({scope_kind}, {scope_id}) closure not yet applied"),
         });
     };
+    if floor.key.scope_kind != scope_kind || floor.key.scope_id != scope_id {
+        return Err(RemoteAuthzBridgeError::InvalidInput(format!(
+            "drain probe scope ({}, {}) does not match target scope ({scope_kind}, {scope_id})",
+            floor.key.scope_kind, floor.key.scope_id
+        )));
+    }
     if floor.lifecycle == ScopeLifecycle::Open || floor.authz_floor < required_authz_floor {
         return Ok(RevocationDrainStatus::DrainInProgress {
             pending_operation_ids: probe.drain.pending_operation_ids.clone(),
