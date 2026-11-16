@@ -103,8 +103,7 @@ async fn prepare_transfer(
     }
 
     let (target_name, revoke_collaborators) = validate_transfer_input(&from_owner_slug, &from_name, input)?;
-    let expected_version =
-        input.expected_version.ok_or_else(|| Error(StatusCode::CONFLICT, "expected_version required"))?;
+    let expected_version = input.expected_version.ok_or(Error(StatusCode::CONFLICT, "expected_version required"))?;
     check_cas_version(actual_version, expected_version)?;
     if deleted {
         return Err(Error::not_found());

@@ -152,7 +152,7 @@ pub fn plan_workspace_blob_copy(
 
 /// Update a serialized `RemoteManifest`'s `tenant_id` to `to_tenant` and return
 /// `(new_manifest_bytes, new_manifest_sha256, destination_key)`.
-pub fn rekey_workspace_manifest(
+pub(crate) fn rekey_workspace_manifest(
     mut manifest: RemoteManifest,
     to_tenant: Uuid,
 ) -> Result<(Vec<u8>, String, ObjectKey), Error> {
