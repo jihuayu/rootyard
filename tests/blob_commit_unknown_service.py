@@ -261,9 +261,11 @@ class CheckpointHarness(blob.BlobOnlyHarness):
         # repositories (id, owner_id), so the actual tenant is the owner id read
         # from this run's repository row, never a global/user-supplied value.
         inserted = self.sql(
+            "WITH inserted AS ("
             "INSERT INTO repository_collaborators(repository_id,tenant_id,user_id,role) "
             "VALUES('" + rid + "','" + owner_id + "','" + bob_id + "','write') "
-            "RETURNING role || '|' || tenant_id::text || '|' || user_id::text")
+            "RETURNING role || '|' || tenant_id::text || '|' || user_id::text AS row_text"
+            ") SELECT row_text FROM inserted")
         assert inserted == "write|" + owner_id + "|" + bob_id, (
             "phase=" + label + " collaborator fixture: unexpected inserted role row", inserted)
         count = self.sql(
