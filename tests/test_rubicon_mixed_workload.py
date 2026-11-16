@@ -463,6 +463,62 @@ class RubiconProvisioningAndAuthorityTests(unittest.TestCase):
         self.assertIn("ROOTYARD_MAX_REQUEST_BYTES", src)
         self.assertIn("ROOTYARD_MAX_INFLIGHT_BYTES", src)
 
+    def test_run_rubicon_workload_switches_cli_to_external_schema_mode_after_migrate(self) -> None:
+        import os
+        import pathlib
+        import tempfile
+        from unittest import mock
+        from scripts.rubicon_workload.runner import WorkloadConfig, run_rubicon_workload
+
+        seen_cli_modes: list[tuple[str, str | None]] = []
+        tier_modes: list[str | None] = []
+
+        def fake_cli(_binary: str, env: dict[str, str], *args: str) -> str:
+            seen_cli_modes.append((args[0], env.get("ROOTYARD_SCHEMA_MODE")))
+            return "{}"
+
+        def fake_tier(_n: int, _cfg: object, _pre: object, _benv: object, cli_env: dict[str, str], *_rest: object) -> dict[str, object]:
+            tier_modes.append(cli_env.get("ROOTYARD_SCHEMA_MODE"))
+            raise RuntimeError("stop-after-check")
+
+        with tempfile.TemporaryDirectory() as td:
+            rep = pathlib.Path(td) / "report.json"
+            fake_pre = {
+                "binary": "/bin/true",
+                "binary_sha256": "0" * 64,
+                "binary_size_bytes": 1,
+                "receipt_verified": False,
+                "git": "/usr/bin/git",
+                "git_version": "git version 2.43.0",
+                "psql_version": "psql 17",
+                "pg_base": "postgresql://u:pw@127.0.0.1/db",
+                "s3_loopback_http": False,
+                "s3_host": "127.0.0.1",
+                "s3_port": 9000,
+                "logical_cpus": 2,
+                "tiers": [1],
+                "tier_notes": [],
+            }
+            fake_env = {
+                "ROOTYARD_TEST_DATABASE_URL": "postgresql://u:pw@127.0.0.1/db",
+                "ROOTYARD_BLOB_SECRET_ACCESS_KEY": "s3secretval",
+                "ROOTYARD_BLOB_ACCESS_KEY_ID": "s3keyid",
+                "ROOTYARD_BLOB_ENDPOINT": "http://127.0.0.1:9000",
+                "ROOTYARD_SCHEMA_MODE": "external",
+            }
+            cfg = WorkloadConfig(binary="/bin/true", report=str(rep), git="/usr/bin/git", require_build_receipt=False)
+            with mock.patch("scripts.rubicon_workload.runner._preflight", return_value=fake_pre), \
+                 mock.patch.dict(os.environ, fake_env, clear=False), \
+                 mock.patch("scripts.rubicon_workload.runner._verify_public_cluster_authority"), \
+                 mock.patch("subprocess.run"), \
+                 mock.patch("subprocess.check_output", return_value="17.0"), \
+                 mock.patch("scripts.rubicon_workload.runner._cli", side_effect=fake_cli), \
+                 mock.patch("scripts.rubicon_workload.runner._run_tier", side_effect=fake_tier):
+                with self.assertRaisesRegex(RuntimeError, "stop-after-check"):
+                    run_rubicon_workload(cfg)
+        self.assertEqual(seen_cli_modes, [("migrate", "auto")])
+        self.assertEqual(tier_modes, ["external"])
+
 
 if __name__ == "__main__":
     unittest.main()

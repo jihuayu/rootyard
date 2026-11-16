@@ -912,7 +912,12 @@ def run_rubicon_workload(config: WorkloadConfig, env: dict[str, str] | None = No
         cli_env = run_env.copy()
         cli_env["DATABASE_URL"] = pg_url
         cli_env["ROOTYARD_DATA_DIR"] = str(work_root / "cli-data")
+        cli_env["ROOTYARD_SCHEMA_MODE"] = "auto"
         _cli(pre["binary"], cli_env, "migrate")
+        # Switch CLI calls to read-only schema verification once migrated so
+        # create-user/create-token/revoke-token never block on exclusive
+        # migration locks against live serve-blob shared ServingBarrier locks.
+        cli_env["ROOTYARD_SCHEMA_MODE"] = "external"
         pg_ver = subprocess.check_output(["psql", "--dbname", pg_url, "-X", "-t", "-A", "-c", "SHOW server_version"], env=run_env, text=True, timeout=15).strip()
 
         if config.s3_meter != "off" and pre["s3_loopback_http"]:
