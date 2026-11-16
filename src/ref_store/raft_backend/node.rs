@@ -5,15 +5,19 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{BasicNode, Config, Raft, RaftMetrics, Snapshot};
 use rootyard_refcas_log::cluster::{MtlsNetworkFactory, RpcRequest, RpcResponse};
 use rootyard_refcas_log::state_machine::PersistentStateMachine;
 use rootyard_refcas_log::{LogTypeConfig, PersistentLog};
 
+use crate::ref_store::raft_backend::backend::{BackendOptions, read_scope_drain as read_scope_drain_from_node};
 use crate::ref_store::raft_backend::error::RaftBackendError;
 use crate::ref_store::raft_backend::realm::NodeTrust;
 use crate::ref_store::raft_backend::reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine};
+use crate::ref_store::raft_backend::scope_drain::CommittedScopeDrain;
 
 /// Inputs for one owned, real mTLS Raft node. No state-machine handle is accepted; the factory
 /// opens the log and application state machine from `store_dir` itself.
@@ -74,6 +78,23 @@ impl RootRaftNode {
 
     pub fn trust(&self) -> &NodeTrust {
         &self.trust
+    }
+
+    /// Privileged group-level control read: current committed scope drain at or after
+    /// `required_close_log_id`.
+    ///
+    /// This performs an actual openraft `ReadIndex` and an atomic applied barrier before reading
+    /// the owned reducer's complete `(scope_kind, scope_id)` drain. It is deliberately exposed only
+    /// on the trusted node/control surface, not on a repository-scoped committed view. The result
+    /// is a current-state observation, not a reconstruction of an earlier close receipt's lists.
+    pub async fn read_scope_drain(
+        &self,
+        scope_kind: &str,
+        scope_id: Uuid,
+        required_close_log_id: u64,
+        options: BackendOptions,
+    ) -> Result<CommittedScopeDrain, RaftBackendError> {
+        read_scope_drain_from_node(self, scope_kind, scope_id, required_close_log_id, options).await
     }
 
     /// Raw Raft handle is crate-private. External callers get only the narrow control/peer-RPC

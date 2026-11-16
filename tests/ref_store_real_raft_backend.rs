@@ -44,6 +44,8 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+mod scope_drain_support;
+
 const TEST_GROUP: &str = "group-175";
 const CLUSTER_NAME: &str = "issue175-real-raft-backend";
 

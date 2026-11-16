@@ -21,6 +21,7 @@ mod proposal;
 mod realm;
 mod reducer;
 mod scope;
+mod scope_drain;
 mod view;
 
 pub use backend::{BackendOptions, RootRaftRefCasBackend};
@@ -37,4 +38,5 @@ pub use proposal::{
 };
 pub use realm::{NodeTrust, RealmBinding};
 pub use reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine, validate_ref_cas_command};
+pub use scope_drain::CommittedScopeDrain;
 pub use view::CommittedRefCasView;

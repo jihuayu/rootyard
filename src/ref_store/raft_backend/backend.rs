@@ -10,7 +10,7 @@ use rootyard_refcas_log::state_machine::{
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::ref_store::core::state_machine::{RefCasCommand, encode_command};
+use crate::ref_store::core::state_machine::{RefCasCommand, encode_command, validate_scope_kind};
 use crate::ref_store::raft_backend::error::RaftBackendError;
 use crate::ref_store::raft_backend::node::RootRaftNode;
 use crate::ref_store::raft_backend::proposal::{
@@ -19,6 +19,7 @@ use crate::ref_store::raft_backend::proposal::{
 use crate::ref_store::raft_backend::realm::RealmBinding;
 use crate::ref_store::raft_backend::reducer::{ROOT_REF_CAS_DOMAIN, ROOT_REF_CAS_VERSION, RootRefCasStateMachine};
 use crate::ref_store::raft_backend::scope::{requires_live_gate_precheck, validate_command_scope};
+use crate::ref_store::raft_backend::scope_drain::CommittedScopeDrain;
 use crate::ref_store::raft_backend::view::CommittedRefCasView;
 
 const MAX_DEADLINE: Duration = Duration::from_secs(60);
@@ -42,7 +43,7 @@ impl Default for BackendOptions {
 }
 
 impl BackendOptions {
-    fn validate(self) -> Result<Self, RaftBackendError> {
+    pub(crate) fn validate(self) -> Result<Self, RaftBackendError> {
         if self.quorum_timeout.is_zero() || self.quorum_timeout > MAX_DEADLINE {
             return Err(RaftBackendError::InvalidConfig("quorum_timeout must be in (0, 60s]"));
         }
@@ -148,15 +149,13 @@ impl RootRaftRefCasBackend {
     /// This performs the actual quorum ReadIndex plus local applied barrier but deliberately does
     /// not validate or mint a ref view, so it also works before `InitializeGate` exists.
     pub async fn prepare_proposal_id(&self) -> Result<ProposalId, RaftBackendError> {
-        let raft = self.node.raft();
-        let read_log_id = match tokio::time::timeout(self.options.quorum_timeout, raft.ensure_linearizable()).await {
-            Ok(Ok(read_log_id)) => read_log_id,
-            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
-                return Err(RaftBackendError::FollowerRedirect(fwd.leader_id));
-            }
-            Ok(Err(_)) => return Err(RaftBackendError::QuorumUnavailable("prepare read index")),
-            Err(_) => return Err(RaftBackendError::QuorumUnavailable("prepare read index timeout")),
-        };
+        let read_log_id = ensure_linearizable_read(
+            &self.node,
+            self.options.quorum_timeout,
+            "prepare read index",
+            "prepare read index timeout",
+        )
+        .await?;
         let snapshot = self.await_applied_snapshot(read_log_id.map(ApplicationLogId::from_log_id)).await?;
         let issued_at_index =
             snapshot.applied.map(ApplicationLogId::from_log_id).map(|coordinate| coordinate.index).unwrap_or(0);
@@ -275,15 +274,13 @@ impl RootRaftRefCasBackend {
     }
 
     async fn read_receipt_reducer(&self) -> Result<RootRefCasStateMachine, RaftBackendError> {
-        let raft = self.node.raft();
-        let read_log_id = match tokio::time::timeout(self.options.quorum_timeout, raft.ensure_linearizable()).await {
-            Ok(Ok(read_log_id)) => read_log_id,
-            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
-                return Err(RaftBackendError::FollowerRedirect(fwd.leader_id));
-            }
-            Ok(Err(_)) => return Err(RaftBackendError::QuorumUnavailable("receipt read index")),
-            Err(_) => return Err(RaftBackendError::QuorumUnavailable("receipt read index timeout")),
-        };
+        let read_log_id = ensure_linearizable_read(
+            &self.node,
+            self.options.quorum_timeout,
+            "receipt read index",
+            "receipt read index timeout",
+        )
+        .await?;
         let snapshot = self.await_applied_snapshot(read_log_id.map(ApplicationLogId::from_log_id)).await?;
         snapshot
             .reducer
@@ -308,15 +305,9 @@ impl RootRaftRefCasBackend {
         if presented != &self.realm {
             return Err(RaftBackendError::StaleRealm);
         }
-        let raft = self.node.raft();
-        let read_log_id = match tokio::time::timeout(self.options.quorum_timeout, raft.ensure_linearizable()).await {
-            Ok(Ok(read_log_id)) => read_log_id,
-            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
-                return Err(RaftBackendError::FollowerRedirect(fwd.leader_id));
-            }
-            Ok(Err(_)) => return Err(RaftBackendError::QuorumUnavailable("read index")),
-            Err(_) => return Err(RaftBackendError::QuorumUnavailable("read index timeout")),
-        };
+        let read_log_id =
+            ensure_linearizable_read(&self.node, self.options.quorum_timeout, "read index", "read index timeout")
+                .await?;
 
         self.await_applied_and_mint(read_log_id).await
     }
@@ -370,26 +361,97 @@ impl RootRaftRefCasBackend {
         &self,
         required: Option<ApplicationLogId>,
     ) -> Result<ApplicationRuntimeSnapshot, RaftBackendError> {
-        let deadline = Instant::now() + self.options.apply_timeout;
-        loop {
-            let snapshot = self
-                .node
-                .sm()
-                .application_snapshot()
-                .await
-                .map_err(|_| RaftBackendError::Storage("application snapshot"))?
-                .ok_or(RaftBackendError::NotApplicationMode)?;
-            if snapshot.summary.domain != ROOT_REF_CAS_DOMAIN || snapshot.summary.version != ROOT_REF_CAS_VERSION {
-                return Err(RaftBackendError::WrongReducer);
-            }
-            let applied = snapshot.applied.map(ApplicationLogId::from_log_id);
-            if required.is_none_or(|required| applied.is_some_and(|applied| applied.index >= required.index)) {
-                return Ok(snapshot);
-            }
-            if Instant::now() >= deadline {
-                return Err(RaftBackendError::ApplyBarrierTimeout { applied, required });
-            }
-            tokio::time::sleep(self.options.poll_interval).await;
-        }
+        await_applied_snapshot(&self.node, required, self.options.apply_timeout, self.options.poll_interval).await
     }
+}
+
+/// Shared actual ReadIndex with explicit follower/no-quorum/timeout mapping.
+pub(crate) async fn ensure_linearizable_read(
+    node: &RootRaftNode,
+    timeout: Duration,
+    operation: &'static str,
+    timeout_operation: &'static str,
+) -> Result<Option<LogId<u64>>, RaftBackendError> {
+    let raft = node.raft();
+    match tokio::time::timeout(timeout, raft.ensure_linearizable()).await {
+        Ok(Ok(read_log_id)) => Ok(read_log_id),
+        Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
+            Err(RaftBackendError::FollowerRedirect(fwd.leader_id))
+        }
+        Ok(Err(_)) => Err(RaftBackendError::QuorumUnavailable(operation)),
+        Err(_) => Err(RaftBackendError::QuorumUnavailable(timeout_operation)),
+    }
+}
+
+/// Shared applied barrier over the same application snapshot validation used by view/receipt reads.
+pub(crate) async fn await_applied_snapshot(
+    node: &RootRaftNode,
+    required: Option<ApplicationLogId>,
+    apply_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<ApplicationRuntimeSnapshot, RaftBackendError> {
+    let deadline = Instant::now() + apply_timeout;
+    loop {
+        let snapshot = node
+            .sm()
+            .application_snapshot()
+            .await
+            .map_err(|_| RaftBackendError::Storage("application snapshot"))?
+            .ok_or(RaftBackendError::NotApplicationMode)?;
+        if snapshot.summary.domain != ROOT_REF_CAS_DOMAIN || snapshot.summary.version != ROOT_REF_CAS_VERSION {
+            return Err(RaftBackendError::WrongReducer);
+        }
+        let applied = snapshot.applied.map(ApplicationLogId::from_log_id);
+        if required.is_none_or(|required| applied.is_some_and(|applied| applied.index >= required.index)) {
+            return Ok(snapshot);
+        }
+        if Instant::now() >= deadline {
+            return Err(RaftBackendError::ApplyBarrierTimeout { applied, required });
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Privileged group-level current drain read. This is the only public path to a full core drain;
+/// it is intentionally not exposed on a repository-scoped `CommittedRefCasView`.
+pub(crate) async fn read_scope_drain(
+    node: &RootRaftNode,
+    scope_kind: &str,
+    scope_id: Uuid,
+    required_close_log_id: u64,
+    options: BackendOptions,
+) -> Result<CommittedScopeDrain, RaftBackendError> {
+    options.validate()?;
+    validate_scope_kind(scope_kind)
+        .map_err(|error| RaftBackendError::Command(format!("invalid scope drain scope: {error}")))?;
+    if scope_id.is_nil() {
+        return Err(RaftBackendError::Command("scope drain scope_id must be non-nil".into()));
+    }
+    let read_log_id = ensure_linearizable_read(
+        node,
+        options.quorum_timeout,
+        "scope drain read index",
+        "scope drain read index timeout",
+    )
+    .await?;
+    let read_index = read_log_id.map(|log_id| log_id.index);
+    let required_index = read_index.map_or(required_close_log_id, |read| read.max(required_close_log_id));
+    let required = (required_index > 0).then(|| ApplicationLogId::new(0, required_index));
+    let snapshot = await_applied_snapshot(node, required, options.apply_timeout, options.poll_interval).await?;
+    let applied = snapshot.applied.map(ApplicationLogId::from_log_id);
+    let reducer =
+        snapshot.reducer.as_any().downcast_ref::<RootRefCasStateMachine>().ok_or(RaftBackendError::WrongReducer)?;
+    if reducer.last_applied() != applied {
+        return Err(RaftBackendError::Storage("root reducer coordinate mismatch"));
+    }
+    let drain = reducer
+        .machine()
+        .inspect_scope_drain(scope_kind, scope_id)
+        .map_err(|error| RaftBackendError::Command(format!("scope drain inspection refused: {error}")))?;
+    Ok(CommittedScopeDrain::new(
+        drain,
+        read_index,
+        applied.map(|coordinate| coordinate.index).unwrap_or(0),
+        node.trust().clone(),
+    ))
 }
