@@ -40,8 +40,16 @@ pub async fn delete_repo(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access =
-        auth::authorize_repo_lifecycle(&tx, &actor, &owner, &name, Role::Admin, RepoAction::RepoAdmin, false).await?;
+    let access = auth::authorize_repo_lifecycle(
+        &tx,
+        &actor,
+        &owner,
+        &name,
+        Role::Admin,
+        RepoAction::RepoAdmin,
+        idem_key.is_some(),
+    )
+    .await?;
 
     let locked = match lock_repo_for_lifecycle(
         &tx,
@@ -209,8 +217,7 @@ pub async fn delete_alias(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access =
-        auth::authorize_repo_lifecycle(&tx, &actor, &owner, &name, Role::Admin, RepoAction::RepoAdmin, false).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, RepoAction::RepoAdmin).await?;
     let archived: bool = tx
         .query_one("SELECT archived_at IS NOT NULL FROM repositories WHERE id = $1 FOR UPDATE", &[&access.repo_id])
         .await

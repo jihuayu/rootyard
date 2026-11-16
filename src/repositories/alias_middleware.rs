@@ -203,9 +203,17 @@ async fn authorize_target_access(
     }
 
     let (min_role, action) = surface_role_and_action(method, parsed, query);
+    let tail = parsed.tail();
+    let is_lifecycle_endpoint = parsed.kind == RepoRouteKind::Api
+        && ((*method == Method::DELETE && tail.is_empty())
+            || matches!(tail, "/archive" | "/unarchive" | "/rename" | "/restore" | "/purge" | "/transfer"));
     let mut client = pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, actor, &target.owner, &target.name, min_role, action).await?;
+    let access = if is_lifecycle_endpoint {
+        auth::authorize_repo_lifecycle(&tx, actor, &target.owner, &target.name, min_role, action, false).await?
+    } else {
+        auth::authorize_repo_with_role(&tx, actor, &target.owner, &target.name, min_role, action).await?
+    };
     if access.repo_id != target.repository_id {
         return Err(Error::not_found());
     }

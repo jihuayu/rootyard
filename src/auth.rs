@@ -90,7 +90,7 @@ pub async fn authorize_repo_with_role(
     min_role: Role,
     action: crate::token_scopes::RepoAction,
 ) -> Result<RepoAccess, Error> {
-    authorize_repo_lifecycle(tx, actor, owner, name, min_role, action, false).await
+    lifecycle::authorize_repo_lifecycle_inner(tx, actor, owner, name, min_role, action, false, true).await
 }
 
 pub async fn authorize_repo_lifecycle(
@@ -102,7 +102,7 @@ pub async fn authorize_repo_lifecycle(
     action: crate::token_scopes::RepoAction,
     allow_deleted: bool,
 ) -> Result<RepoAccess, Error> {
-    lifecycle::authorize_repo_lifecycle_inner(tx, actor, owner, name, min_role, action, allow_deleted).await
+    lifecycle::authorize_repo_lifecycle_inner(tx, actor, owner, name, min_role, action, allow_deleted, false).await
 }
 
 pub(super) async fn authorize_repo_scope(

@@ -15,6 +15,7 @@ pub(super) async fn authorize_repo_lifecycle_inner(
     min_role: Role,
     action: RepoAction,
     allow_deleted: bool,
+    enforce_lifecycle_fence: bool,
 ) -> Result<RepoAccess, Error> {
     if !db::valid_name(owner) || !db::valid_name(name) {
         return Err(Error::not_found());
@@ -51,13 +52,16 @@ pub(super) async fn authorize_repo_lifecycle_inner(
     else {
         return Err(Error::not_found());
     };
+    if deleted && effective_role < min_role {
+        return Err(Error::not_found());
+    }
     if effective_role < min_role {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
     if state != "ready" {
         return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
     }
-    if !allow_deleted {
+    if enforce_lifecycle_fence {
         enforce_availability(&**tx, repo_id, deleted, archived, &transition_state, action.is_mutating()).await?;
     }
     authorize_repo_scope(tx, actor, repo_id, action).await?;
