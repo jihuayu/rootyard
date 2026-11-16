@@ -287,7 +287,106 @@ class CheckpointHarness(blob.BlobOnlyHarness):
             "DROP TRIGGER IF EXISTS rootyard_commit_unknown_gate ON ref_store_core_events; "
             "DROP FUNCTION IF EXISTS rootyard_commit_unknown_gate();")
 
+    @staticmethod
+    def _validate_blocker_application_name(application_name):
+        assert isinstance(application_name, str), "fixture blocker application_name must be text"
+        try:
+            raw = application_name.encode("ascii")
+        except UnicodeEncodeError as error:
+            raise AssertionError("fixture blocker application_name must be ASCII") from error
+        assert 0 < len(raw) <= 63, "fixture blocker application_name exceeds 63 bytes"
+        assert application_name.startswith(
+            ("rootyard-commit-gate-", "rootyard-cancel-scope-")), \
+            "fixture blocker application_name has an unexpected prefix"
+        assert all(ch.isalnum() or ch in "-._" for ch in application_name), \
+            "fixture blocker application_name has unsafe characters"
+
+    def _owned_blocker_rows(self, application_name):
+        self._validate_blocker_application_name(application_name)
+        raw = self.sql(
+            "SELECT coalesce(jsonb_agg(jsonb_build_object("
+            "'pid',a.pid,'database',a.datname,'backend_start',a.backend_start::text) "
+            "ORDER BY a.backend_start), '[]'::jsonb)::text "
+            "FROM pg_stat_activity a "
+            "WHERE a.application_name='" + application_name + "' "
+            "AND a.datname=current_database()")
+        return json.loads(raw)
+
+    def _owned_advisory_lock_count(self, application_name):
+        self._validate_blocker_application_name(application_name)
+        return int(self.sql(
+            "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid "
+            "WHERE a.application_name='" + application_name + "' "
+            "AND a.datname=current_database() AND l.locktype='advisory'"))
+
+    @staticmethod
+    def _blocker_row_matches(row, identity):
+        return (
+            isinstance(row, dict)
+            and row.get("pid") == identity.get("pid")
+            and row.get("database") == identity.get("database")
+            and row.get("backend_start") == identity.get("backend_start")
+        )
+
+    def _register_owned_blocker(self, process, application_name):
+        self._validate_blocker_application_name(application_name)
+        rows = self._owned_blocker_rows(application_name)
+        assert len(rows) == 1, "fixture blocker ownership is not a single backend"
+        row = rows[0]
+        pid = row.get("pid")
+        database = row.get("database")
+        backend_start = row.get("backend_start")
+        assert type(pid) is int and pid > 0, "fixture blocker backend pid is invalid"
+        assert database == self.db, "fixture blocker backend database is not owned"
+        assert isinstance(backend_start, str) and backend_start, \
+            "fixture blocker backend_start is missing"
+        assert "'" not in backend_start, "fixture blocker backend_start is not SQL-safe"
+        assert process.poll() is None, "fixture blocker child exited before ownership registration"
+        identity = {
+            "application_name": application_name,
+            "database": database,
+            "pid": pid,
+            "backend_start": backend_start,
+        }
+        process._rootyard_blocker_identity = identity
+        return identity
+
+    def _register_owned_blocker_or_reap(self, process, application_name):
+        try:
+            return self._register_owned_blocker(process, application_name)
+        except Exception:
+            self._reap_blocker_child(process)
+            raise
+
+    def _reap_blocker_child(self, process):
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        except ValueError:
+            pass
+        finally:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+
     def _start_blocker(self, key, application_name):
+        self._validate_blocker_application_name(application_name)
         env = self.env.copy()
         env["PGDATABASE"] = self.db
         env["PGAPPNAME"] = application_name
@@ -304,22 +403,55 @@ class CheckpointHarness(blob.BlobOnlyHarness):
                                      + self.redact(error[:500].decode(errors="replace")))
             held = int(self.sql(
                 "SELECT count(*) FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid "
-                "WHERE a.application_name='" + application_name + "' AND l.locktype='advisory' AND l.granted"))
+                "WHERE a.application_name='" + application_name + "' "
+                "AND a.datname=current_database() AND l.locktype='advisory' AND l.granted"))
             if held == 1:
+                self._register_owned_blocker_or_reap(process, application_name)
                 return process
             time.sleep(0.05)
-        process.terminate()
-        process.wait(timeout=5)
+        self._reap_blocker_child(process)
         raise AssertionError("fixture advisory lock was not acquired")
 
     def _release_blocker(self, process):
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+        self._reap_blocker_child(process)
+        identity = getattr(process, "_rootyard_blocker_identity", None)
+        assert isinstance(identity, dict), "fixture blocker ownership identity is missing"
+        application_name = identity.get("application_name")
+        self._validate_blocker_application_name(application_name)
+        rows = self._owned_blocker_rows(application_name)
+        if not rows:
+            assert self._owned_advisory_lock_count(application_name) == 0, \
+                "fixture blocker advisory lock remained without an owned backend"
+            return
+        assert len(rows) == 1, "fixture blocker ownership is no longer a single backend"
+        assert self._blocker_row_matches(rows[0], identity), \
+            "fixture blocker ownership changed; refusing foreign termination"
+        pid = identity["pid"]
+        backend_start = identity["backend_start"]
+        terminated = self.sql(
+            "SELECT count(*) FROM ("
+            "SELECT a.pid FROM pg_stat_activity a "
+            "WHERE a.application_name='" + application_name + "' "
+            "AND a.datname=current_database() AND a.pid=" + str(pid)
+            + " AND a.backend_start::text='" + backend_start + "'"
+            ") exact WHERE pg_terminate_backend(exact.pid)")
+        if terminated != "1":
+            rows = self._owned_blocker_rows(application_name)
+            if not rows and self._owned_advisory_lock_count(application_name) == 0:
+                return
+            raise AssertionError("fixture could not terminate exact owned blocker backend")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            rows = self._owned_blocker_rows(application_name)
+            if not rows:
+                assert self._owned_advisory_lock_count(application_name) == 0, \
+                    "fixture blocker advisory lock remained after owned backend exit"
+                return
+            assert len(rows) == 1, "fixture blocker ownership changed while awaiting release"
+            assert self._blocker_row_matches(rows[0], identity), \
+                "fixture blocker ownership changed while awaiting release"
+            time.sleep(0.05)
+        raise AssertionError("fixture blocker backend did not disappear after exact terminate")
 
     @staticmethod
     def _advisory_key_parts(key):
