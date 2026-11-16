@@ -743,6 +743,211 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
         return {"web_and_ui_parity": True, "security_headers": True, "csrf_mutations": True}
 
     def exercise_backup_restore(self):
+        def search_identity(payload):
+            return tuple(sorted(
+                (item["kind"], item["repository_id"], int(item["number"]))
+                for item in payload["items"]
+            ))
+
+        def label_state(payload):
+            return (
+                int(payload["label_version"]),
+                tuple(sorted((item["name"], int(item["version"])) for item in payload["items"])),
+            )
+
+        def assignee_state(payload):
+            return (
+                int(payload["assignee_version"]),
+                tuple(sorted(item["username"] for item in payload["items"])),
+            )
+
+        def subscription_identity(payload):
+            sub = payload.get("subscription")
+            if sub is None:
+                return (payload.get("subscribed") is True, None)
+            return (
+                payload.get("subscribed") is True,
+                (sub.get("state"), int(sub.get("version"))),
+            )
+
+        def notification_identity(payload):
+            return tuple(sorted(
+                (item["id"], item["event_kind"], int(item["target_number"]))
+                for item in payload["items"]
+            ))
+
+        def outdated_identity(payload):
+            return tuple(sorted(
+                (int(item["number"]), item["commit_oid"], item["base_oid"])
+                for item in payload["items"]
+                if item.get("body") == "Inline v1 comment" and item.get("outdated") is True
+            ))
+
+        def review_identity(payload):
+            return tuple(sorted(
+                (int(item["number"]), str(item.get("commit_oid") or ""), bool(item.get("outdated")))
+                for item in payload["items"]
+            ))
+
+        # Real API-seeded restricted credentials. These are restored rows, not
+        # direct SQL users/authority, and their secrets remain in RAM only.
+        issues_token = json.loads(
+            self.expect(
+                "/api/tokens",
+                201,
+                token=self.bob,
+                method="POST",
+                body={
+                    "display_name": "restore-issues-only",
+                    "expires_in_days": 1,
+                    "read_only": True,
+                    "repository_grants": [{
+                        "repository_id": self.demo["id"],
+                        "actions": ["issues_read"],
+                    }],
+                    "namespace_grants": [],
+                },
+            )
+        )
+        self.secrets.append(issues_token["secret"])
+        issues_auth = {"username": "bob", "token": issues_token["secret"]}
+
+        browser_token = json.loads(
+            self.expect(
+                "/api/tokens",
+                201,
+                token=self.bob,
+                method="POST",
+                body={
+                    "display_name": "restore-browser-scope",
+                    "expires_in_days": 1,
+                    "read_only": True,
+                    "repository_grants": [{
+                        "repository_id": self.demo["id"],
+                        "actions": ["repo_read", "issues_read", "pulls_read"],
+                    }],
+                    "namespace_grants": [],
+                },
+            )
+        )
+        self.secrets.append(browser_token["secret"])
+
+        bob_search_pre = json.loads(
+            self.expect("/api/search?q=needle&scope=all&limit=100", 200, token=self.bob)
+        )
+        carol_search_pre = json.loads(
+            self.expect("/api/search?q=needle&scope=all", 200, token=self.carol)
+        )
+        issues_search_pre = json.loads(
+            self.expect("/api/search?q=needle&scope=all", 200, token=issues_auth)
+        )
+        assert bob_search_pre["items"], "pre-backup search was empty"
+        assert any(item["repository_id"] == self.demo["id"] for item in bob_search_pre["items"])
+        assert any(item["repository_id"] == self.team_repo["id"] for item in bob_search_pre["items"])
+        assert carol_search_pre["items"] == [], "revoked collaborator still had search hits before backup"
+        assert issues_search_pre["items"], "restricted issues-only token had no issue/comment hits"
+        assert all(
+            item["kind"] in ("issue", "issue_comment")
+            and item["repository_id"] == self.demo["id"]
+            for item in issues_search_pre["items"]
+        )
+        bob_search_pre_identity = search_identity(bob_search_pre)
+        issues_search_pre_identity = search_identity(issues_search_pre)
+
+        issue_labels_pre = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/labels", 200, token=self.alice)
+        )
+        pr_labels_pre = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/labels", 200, token=self.alice)
+        )
+        issue_assignees_pre = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/assignees", 200, token=self.alice)
+        )
+        pr_assignees_pre = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/assignees", 200, token=self.alice)
+        )
+        repo_labels_pre = json.loads(
+            self.expect("/api/repos/alice/demo/labels?limit=100", 200, token=self.alice)
+        )
+        issue_labels_pre_state = label_state(issue_labels_pre)
+        pr_labels_pre_state = label_state(pr_labels_pre)
+        issue_assignees_pre_state = assignee_state(issue_assignees_pre)
+        pr_assignees_pre_state = assignee_state(pr_assignees_pre)
+        assert issue_labels_pre_state[0] >= 2
+        assert issue_labels_pre_state[1] == (("defect", 2),), issue_labels_pre_state
+        assert pr_labels_pre_state[0] >= 2
+        assert pr_labels_pre_state[1] == (("triage", 1),), pr_labels_pre_state
+        assert issue_assignees_pre_state[0] >= 2
+        assert issue_assignees_pre_state[1] == ("bob",), issue_assignees_pre_state
+        assert pr_assignees_pre_state[0] >= 2
+        assert pr_assignees_pre_state[1] == ("bob",), pr_assignees_pre_state
+        pre_repo_label_names = {item["name"] for item in repo_labels_pre["items"]}
+        assert {"defect", "triage"} <= pre_repo_label_names
+
+        bob_sub_pre = json.loads(
+            self.expect("/api/repos/alice/demo/subscription", 200, token=self.bob)
+        )
+        carol_issue_sub_pre = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/subscription", 200, token=self.carol)
+        )
+        alice_pr_sub_pre = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/subscription", 200, token=self.alice)
+        )
+        bob_sub_pre_identity = subscription_identity(bob_sub_pre)
+        carol_issue_sub_pre_identity = subscription_identity(carol_issue_sub_pre)
+        alice_pr_sub_pre_identity = subscription_identity(alice_pr_sub_pre)
+        assert bob_sub_pre_identity[0] is True and bob_sub_pre_identity[1][0] == "subscribed"
+        assert carol_issue_sub_pre_identity[0] is False
+        assert carol_issue_sub_pre_identity[1][0] == "ignored"
+        assert alice_pr_sub_pre_identity[0] is True
+        assert alice_pr_sub_pre_identity[1][0] == "subscribed"
+
+        bob_notifications_pre = json.loads(
+            self.expect("/api/notifications?limit=100", 200, token=self.bob)
+        )
+        carol_notifications_pre = json.loads(
+            self.expect("/api/notifications?limit=100", 200, token=self.carol)
+        )
+        assert bob_notifications_pre["channel"] == "in_app"
+        assert bob_notifications_pre["retention_days"] == 90
+        assert bob_notifications_pre["items"], "pre-backup notification inbox was empty"
+        assert carol_notifications_pre["items"] == [], "revoked collaborator had notifications before backup"
+        bob_notification_pre_identity = notification_identity(bob_notifications_pre)
+        unread_notification = next(
+            (item for item in bob_notifications_pre["items"] if item.get("unread") is True),
+            None,
+        )
+        assert unread_notification is not None, "pre-backup notification inbox had no unread item"
+        unread_notification_id = unread_notification["id"]
+        dedupe_notification_id = bob_notifications_pre["items"][0]["id"]
+        assert bob_notifications_pre["items"][0]["delivery_key"]
+
+        review_comments_pre = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/review-comments?limit=100", 200, token=self.alice)
+        )
+        reviews_pre = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/reviews", 200, token=self.alice)
+        )
+        issue_comment_pre = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/comments/1", 200, token=self.bob)
+        )
+        revisions_pre = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/comments/1/revisions", 200, token=self.bob)
+        )
+        outdated_pre_identity = outdated_identity(review_comments_pre)
+        reviews_pre_identity = review_identity(reviews_pre)
+        revision_actions_pre = tuple(item["action"] for item in revisions_pre["items"])
+        assert outdated_pre_identity, "pre-backup inline review was not outdated"
+        assert reviews_pre_identity and any(item[2] is True for item in reviews_pre_identity)
+        assert any(
+            item.get("body") == "[deleted]" and item.get("moderation_state") == "deleted"
+            for item in review_comments_pre["items"]
+        ), "pre-backup soft-deleted review comment missing"
+        assert issue_comment_pre["body"] == "Edited comment searchneedle"
+        assert issue_comment_pre["moderation_state"] == "visible"
+        assert issue_comment_pre["version"] >= 4
+        assert revision_actions_pre == ("edited", "hidden", "unhidden")
+
         self.stop()
         self.backup_command()
         self.restore_command()
@@ -763,7 +968,8 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
         self.env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))
         self.db = self.target_db
         self.start()
-        # Post-restore reads and writes continue cleanly
+
+        # Preserved legacy post-restore checks.
         rcs = json.loads(
             self.expect("/api/repos/alice/demo/pulls/1/review-comments?outdated=true", 200, token=self.alice)
         )
@@ -778,9 +984,234 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
             )
         )
         assert post_lbl["name"] == "post-restore"
-        self.stop()
-        return {"all_9_tables_restored": True, "post_restore_writes": True}
 
+        bob_search_post = json.loads(
+            self.expect("/api/search?q=needle&scope=all&limit=100", 200, token=self.bob)
+        )
+        carol_search_post = json.loads(
+            self.expect("/api/search?q=needle&scope=all", 200, token=self.carol)
+        )
+        issues_search_post = json.loads(
+            self.expect("/api/search?q=needle&scope=all", 200, token=issues_auth)
+        )
+        assert bob_search_post["items"]
+        assert search_identity(bob_search_post) == bob_search_pre_identity
+        assert carol_search_post["items"] == []
+        assert issues_search_post["items"]
+        assert search_identity(issues_search_post) == issues_search_pre_identity
+        assert all(
+            item["kind"] in ("issue", "issue_comment")
+            and item["repository_id"] == self.demo["id"]
+            for item in issues_search_post["items"]
+        )
+
+        issue_labels_post = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/labels", 200, token=self.alice)
+        )
+        pr_labels_post = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/labels", 200, token=self.alice)
+        )
+        issue_assignees_post = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/assignees", 200, token=self.alice)
+        )
+        pr_assignees_post = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/assignees", 200, token=self.alice)
+        )
+        repo_labels_post = json.loads(
+            self.expect("/api/repos/alice/demo/labels?limit=100", 200, token=self.alice)
+        )
+        assert label_state(issue_labels_post) == issue_labels_pre_state
+        assert label_state(pr_labels_post) == pr_labels_pre_state
+        assert assignee_state(issue_assignees_post) == issue_assignees_pre_state
+        assert assignee_state(pr_assignees_post) == pr_assignees_pre_state
+        post_repo_label_names = {item["name"] for item in repo_labels_post["items"]}
+        assert {"defect", "triage", "post-restore"} <= post_repo_label_names
+        self.expect(
+            "/api/repos/alice/demo/issues/1/labels",
+            409,
+            token=self.alice,
+            method="POST",
+            body={
+                "expected_version": max(0, issue_labels_pre_state[0] - 1),
+                "labels": ["triage"],
+            },
+        )
+        self.expect(
+            "/api/repos/alice/demo/issues/1/assignees",
+            409,
+            token=self.alice,
+            method="POST",
+            body={
+                "expected_version": max(0, issue_assignees_pre_state[0] - 1),
+                "assignees": ["carol"],
+            },
+        )
+        assert label_state(
+            json.loads(self.expect("/api/repos/alice/demo/issues/1/labels", 200, token=self.alice))
+        ) == issue_labels_pre_state
+        assert assignee_state(
+            json.loads(self.expect("/api/repos/alice/demo/issues/1/assignees", 200, token=self.alice))
+        ) == issue_assignees_pre_state
+
+        bob_sub_post = json.loads(
+            self.expect("/api/repos/alice/demo/subscription", 200, token=self.bob)
+        )
+        carol_issue_sub_post = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/subscription", 200, token=self.carol)
+        )
+        alice_pr_sub_post = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/subscription", 200, token=self.alice)
+        )
+        assert subscription_identity(bob_sub_post) == bob_sub_pre_identity
+        assert subscription_identity(carol_issue_sub_post) == carol_issue_sub_pre_identity
+        assert subscription_identity(alice_pr_sub_post) == alice_pr_sub_pre_identity
+        self.expect(
+            "/api/repos/alice/demo/subscription",
+            409,
+            token=self.bob,
+            method="PUT",
+            body={
+                "state": "ignored",
+                "expected_version": max(0, bob_sub_pre_identity[1][1] - 1),
+            },
+        )
+        assert subscription_identity(
+            json.loads(self.expect("/api/repos/alice/demo/subscription", 200, token=self.bob))
+        ) == bob_sub_pre_identity
+
+        bob_notifications_post = json.loads(
+            self.expect("/api/notifications?limit=100", 200, token=self.bob)
+        )
+        carol_notifications_post = json.loads(
+            self.expect("/api/notifications?limit=100", 200, token=self.carol)
+        )
+        assert bob_notifications_post["channel"] == "in_app"
+        assert bob_notifications_post["retention_days"] == 90
+        assert notification_identity(bob_notifications_post) == bob_notification_pre_identity
+        assert carol_notifications_post["items"] == []
+        ack1 = json.loads(
+            self.expect(f"/api/notifications/{unread_notification_id}/read", 200, token=self.bob, method="POST")
+        )
+        ack2 = json.loads(
+            self.expect(f"/api/notifications/{unread_notification_id}/read", 200, token=self.bob, method="POST")
+        )
+        assert ack1["already_read"] is False and ack2["already_read"] is True
+        notification_count_before = int(self.query(
+            self.target_db,
+            f"SELECT count(*) FROM forge_notifications WHERE recipient_id='{self.bob['user_id']}'",
+        ))
+        inserted_dup = self.query(
+            self.target_db,
+            "INSERT INTO forge_notifications(tenant_id,repository_id,recipient_id,channel,target_type,target_number,event_kind,delivery_key,title,body_excerpt) "
+            "SELECT tenant_id,repository_id,recipient_id,channel,target_type,target_number,event_kind,delivery_key,title,body_excerpt "
+            f"FROM forge_notifications WHERE id='{dedupe_notification_id}' ON CONFLICT (recipient_id, delivery_key) DO NOTHING",
+        )
+        notification_count_after = int(self.query(
+            self.target_db,
+            f"SELECT count(*) FROM forge_notifications WHERE recipient_id='{self.bob['user_id']}'",
+        ))
+        assert inserted_dup == "" or "INSERT 0 0" in inserted_dup
+        assert notification_count_before == notification_count_after
+
+        review_comments_post = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/review-comments?limit=100", 200, token=self.alice)
+        )
+        reviews_post = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/reviews", 200, token=self.alice)
+        )
+        issue_comment_post = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/comments/1", 200, token=self.bob)
+        )
+        revisions_post = json.loads(
+            self.expect("/api/repos/alice/demo/issues/1/comments/1/revisions", 200, token=self.bob)
+        )
+        assert outdated_identity(review_comments_post) == outdated_pre_identity
+        assert review_identity(reviews_post) == reviews_pre_identity
+        assert any(
+            item.get("body") == "[deleted]" and item.get("moderation_state") == "deleted"
+            for item in review_comments_post["items"]
+        )
+        assert issue_comment_post["body"] == issue_comment_pre["body"]
+        assert issue_comment_post["moderation_state"] == issue_comment_pre["moderation_state"]
+        assert issue_comment_post["version"] == issue_comment_pre["version"]
+        assert tuple(item["action"] for item in revisions_post["items"]) == revision_actions_pre
+
+        alice_cookies, _, _ = self.sign_in(username="alice", token=self.alice["token"])
+        alice_headers = {"Cookie": self.cookie_header(alice_cookies)}
+        for path in (
+            "/web/search?q=needle",
+            "/ui/search?q=needle",
+            "/web/notifications",
+            "/ui/notifications",
+            "/web/repos/alice/demo/labels",
+            "/ui/repos/alice/demo/labels",
+            "/web/repos/alice/demo/pulls/1",
+        ):
+            status, page, headers = self.request(path, headers=alice_headers)
+            assert status == 200, f"post-restore GET {path} -> {status}"
+            header_map = {key.lower(): value for key, value in headers}
+            assert "content-security-policy" in header_map
+            assert header_map["x-frame-options"] == "DENY"
+            assert header_map["x-content-type-options"] == "nosniff"
+            if path.endswith("search?q=needle"):
+                assert b'data-hit-count="0"' not in page
+                assert b'data-hit-kind="issue"' in page
+            if path.endswith("/pulls/1"):
+                assert b'data-outdated-reviews="1"' in page
+                assert b'data-rc-outdated="true"' in page
+                assert b"[deleted]" in page
+
+        bob_cookies, _, _ = self.sign_in(username="bob", token=browser_token["secret"])
+        bob_headers = {"Cookie": self.cookie_header(bob_cookies)}
+        status, page, _ = self.request("/web/search?q=needle&scope=all", headers=bob_headers)
+        assert status == 200
+        assert b'data-hit-count="0"' not in page
+        assert b'data-hit-kind="issue"' in page and b'data-hit-kind="pull"' in page
+        assert b'data-hit-owner="alice"' in page and b'data-hit-owner="collab-org"' not in page
+        status, page, _ = self.request("/web/notifications", headers=bob_headers)
+        assert status == 200
+        assert b'data-notification-count="0"' not in page
+        assert b"/issues/" in page or b"/pulls/" in page
+        assert self.request("/web/repos/alice/demo/search?q=needle", headers=bob_headers)[0] == 200
+        assert self.request("/web/repos/collab-org/team-repo/search?q=needle", headers=bob_headers)[0] == 403
+
+        pr_sub_current = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/subscription", 200, token=self.alice)
+        )
+        current_sub = pr_sub_current.get("subscription")
+        expected_version = "" if current_sub is None else str(current_sub["version"])
+        post_headers = {
+            "Cookie": self.cookie_header(alice_cookies),
+            "Origin": self.base,
+            "Content-Type": "application/json",
+            "X-CSRF-Token": alice_cookies["rootyard_csrf"],
+        }
+        status, _, _ = self.request(
+            "/web/repos/alice/demo/pulls/1/subscription",
+            method="POST",
+            body=json.dumps({"action": "subscribe", "expected_version": expected_version}),
+            headers=post_headers,
+        )
+        assert status == 200
+        pr_sub_after = json.loads(
+            self.expect("/api/repos/alice/demo/pulls/1/subscription", 200, token=self.alice)
+        )
+        assert pr_sub_after["subscribed"] is True and pr_sub_after["subscription"]["state"] == "subscribed"
+
+        self.stop()
+        return {
+            "all_9_tables_restored": True,
+            "post_restore_writes": True,
+            "restored_search_hits": len(bob_search_post["items"]),
+            "restored_notification_count": len(bob_notifications_post["items"]),
+            "search_restored": True,
+            "auth_filter_restored": True,
+            "labels_assignees_restored": True,
+            "subscriptions_restored": True,
+            "notifications_restored": True,
+            "inline_moderation_restored": True,
+            "web_ui_restored": True,
+        }
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
