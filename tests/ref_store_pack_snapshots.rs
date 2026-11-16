@@ -8,8 +8,11 @@
 #![allow(clippy::too_many_arguments)]
 // This target uses only `backend_identity` from the shared serving harness;
 // sibling test targets use the remaining helpers, so keep them reusable here.
+#[path = "ref_store_pack_snapshots_support/metadata_replay_trace.rs"]
+mod metadata_replay_trace;
 #[allow(dead_code)]
 mod serving_support;
+use metadata_replay_trace as trace;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::http::{HeaderMap, HeaderValue, header};
@@ -58,6 +61,39 @@ use uuid::Uuid;
 const OP_SECONDS: u64 = 30;
 const GIT_SECONDS: u64 = 60;
 const HOLD_NAMESPACE: &str = "core-pack";
+
+macro_rules! trace_try {
+    ($phase:expr, $site:expr, $expr:expr) => {{
+        metadata_replay_trace::enter($phase, $site);
+        match $expr {
+            Ok(value) => {
+                metadata_replay_trace::completed($phase, $site);
+                value
+            }
+            Err(error) => {
+                metadata_replay_trace::failed_operation($phase, $site);
+                return Err(error.into());
+            }
+        }
+    }};
+}
+
+macro_rules! trace_assert {
+    ($phase:expr, $site:expr, $cond:expr, $($arg:tt)*) => {{
+        let checked = $cond;
+        metadata_replay_trace::predicate($phase, $site, checked);
+        ensure!(checked, $($arg)*);
+    }};
+}
+
+macro_rules! trace_result_status {
+    ($phase:expr, $site:expr, $result:expr) => {
+        match &$result {
+            Ok(_) => metadata_replay_trace::completed($phase, $site),
+            Err(error) => metadata_replay_trace::completed_status($phase, $site, error.0.as_u16()),
+        }
+    };
+}
 
 fn deadline() -> TokioInstant {
     TokioInstant::now() + Duration::from_secs(OP_SECONDS)
@@ -2960,83 +2996,193 @@ async fn deadline_on_inflight_commit_returns_no_value_for_create_and_renew() -> 
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL, real S3 and native Git"]
 async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_it() -> Result<()> {
-    let db = Db::setup().await?;
+    let db = trace_try!(trace::Phase::Setup, trace::S1_DB_SETUP, Db::setup().await);
     let outcome = async {
         // The first advance publishes exactly these bytes in a one-file tree;
         // the historical read below must observe that same captured content.
         const FIRST_ADVANCE_CONTENT: &[u8] = b"serving metadata advance\n";
-        let store = open_store()?;
-        let git = git_binary()?;
-        let (tenant, repo, actor, backend) = db.serving_business("serving-metadata", &store).await?;
-        let mut verified = serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await?;
+        let store = trace_try!(trace::Phase::Setup, trace::S1_OPEN_STORE, open_store());
+        let git = trace_try!(trace::Phase::Setup, trace::S1_GIT_BINARY, git_binary());
+        let (tenant, repo, actor, backend) = trace_try!(
+            trace::Phase::Setup,
+            trace::S1_SERVING_BUSINESS,
+            db.serving_business("serving-metadata", &store).await
+        );
+        let mut verified = trace_try!(
+            trace::Phase::Setup,
+            trace::S1_SERVING_VERIFIED,
+            serving_verified(&db, &store, &git, tenant, repo, &actor, GitObjectFormat::Sha1).await
+        );
         let create = ServingSnapshotCreate {
             owner: actor.username.clone(),
             name: "serving-metadata".into(),
             idempotency_key: "create-one".into(),
             lease_seconds: 300,
         };
-        let first = PgServingSnapshotMetadata.create(&db.pool, &actor, create.clone(), &backend, deadline()).await?;
-        ensure!(!first.replayed, "fresh serving create replayed");
+        let first = trace_try!(
+            trace::Phase::TenantCreate,
+            trace::S2_CREATE,
+            PgServingSnapshotMetadata.create(&db.pool, &actor, create.clone(), &backend, deadline()).await
+        );
+        trace_assert!(
+            trace::Phase::TenantCreate,
+            trace::S2_NOT_REPLAYED_ASSERT,
+            !first.replayed,
+            "fresh serving create replayed"
+        );
         let snapshot_id = first.receipt.snapshot_id();
         let pin_id = first.receipt.pin_id();
         let first_gate = first.receipt.gate_revision();
-        ensure!(first.receipt.scope().tenant_id() == tenant, "serving create tenant differs");
+        trace_assert!(
+            trace::Phase::TenantCreate,
+            trace::S2_TENANT_ASSERT,
+            first.receipt.scope().tenant_id() == tenant,
+            "serving create tenant differs"
+        );
+        trace::enter(trace::Phase::TenantCreate, trace::S2_COUNTS_READ);
         let counts = snapshot_counts(&db.pool, repo).await?;
+        trace::completed_counts(trace::Phase::TenantCreate, trace::S2_COUNTS_READ, counts);
 
         // The original A5a entry point is deliberately unserved and must reject
         // a ready pg_refstore repository without writing anything.
-        let old_scope = MetadataSnapshotScope::new(
-            repo,
-            tenant,
-            tenant,
-            MetadataPinPurpose::Verification,
-            GitObjectFormat::Sha1,
-            verified.gate.history_incarnation(),
-            verified.gate.authority_epoch(),
-            verified.gate.group_epoch(),
-        )?;
-        let old_request = CreatePackSnapshotRequest::new(
-            old_scope,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            300,
-            PackSnapshotExpectation::new(verified.gate.revision(), *verified.gate.digest())?,
-        )?;
-        let mut client = db.pool.get().await?;
+        let old_scope = trace_try!(
+            trace::Phase::OldA5a,
+            trace::S3_SCOPE_CONSTRUCT,
+            MetadataSnapshotScope::new(
+                repo,
+                tenant,
+                tenant,
+                MetadataPinPurpose::Verification,
+                GitObjectFormat::Sha1,
+                verified.gate.history_incarnation(),
+                verified.gate.authority_epoch(),
+                verified.gate.group_epoch(),
+            )
+        );
+        let old_expectation = trace_try!(
+            trace::Phase::OldA5a,
+            trace::S3_EXPECTATION_CONSTRUCT,
+            PackSnapshotExpectation::new(verified.gate.revision(), *verified.gate.digest())
+        );
+        let old_request = trace_try!(
+            trace::Phase::OldA5a,
+            trace::S3_REQUEST_CONSTRUCT,
+            CreatePackSnapshotRequest::new(
+                old_scope,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                300,
+                old_expectation,
+            )
+        );
+        let mut client = trace_try!(trace::Phase::OldA5a, trace::S3_POOL_ACQUIRE, db.pool.get().await);
+        trace::enter(trace::Phase::OldA5a, trace::S3_CREATE_RESULT);
         let old = PgPackSnapshot.create(&mut client, &old_request, deadline()).await;
-        ensure!(old.is_err(), "old unserved A5a create accepted a serving repository");
+        trace::completed(trace::Phase::OldA5a, trace::S3_CREATE_RESULT);
+        trace_assert!(
+            trace::Phase::OldA5a,
+            trace::S3_REFUSED_ASSERT,
+            old.is_err(),
+            "old unserved A5a create accepted a serving repository"
+        );
         drop(client);
-        ensure!(snapshot_counts(&db.pool, repo).await? == counts, "old A5a create wrote metadata");
+        trace::enter(trace::Phase::OldA5a, trace::S3_COUNTS_READ);
+        let old_counts = snapshot_counts(&db.pool, repo).await?;
+        trace::completed_counts(trace::Phase::OldA5a, trace::S3_COUNTS_READ, old_counts);
+        trace_assert!(
+            trace::Phase::OldA5a,
+            trace::S3_UNCHANGED_ASSERT,
+            old_counts == counts,
+            "old A5a create wrote metadata"
+        );
 
         // Advance refs and the gate through the real decision-gated publication
         // path; the same create key must still replay the original capture.
+        trace::enter(trace::Phase::FirstAdvance, trace::S4_SERVING_ADVANCE);
         serving_advance(&db, &store, &git, &mut verified, &actor, 2, FIRST_ADVANCE_CONTENT).await?;
+        trace::completed(trace::Phase::FirstAdvance, trace::S4_SERVING_ADVANCE);
         let first_advance_head = verified.commit_oid.clone();
-        ensure!(
-            gate_version(&db.pool, repo, tenant).await?.revision() > first_gate,
+        trace::enter(trace::Phase::FirstAdvance, trace::S4_GATE_READ);
+        let first_advance_gate = gate_version(&db.pool, repo, tenant).await?;
+        trace::completed(trace::Phase::FirstAdvance, trace::S4_GATE_READ);
+        trace_assert!(
+            trace::Phase::FirstAdvance,
+            trace::S4_REVISION_ADVANCED_ASSERT,
+            first_advance_gate.revision() > first_gate,
             "decision-gated advance did not move the gate"
         );
-        let replay = PgServingSnapshotMetadata.create(&db.pool, &actor, create.clone(), &backend, deadline()).await?;
-        ensure!(replay.replayed, "same-key create did not replay after refs advanced");
-        ensure!(replay.receipt.snapshot_id() == snapshot_id, "replay snapshot id moved");
-        ensure!(replay.receipt.pin_id() == pin_id, "replay pin id moved");
-        ensure!(replay.receipt.gate_revision() == first_gate, "replay captured a newer gate");
-        ensure!(snapshot_counts(&db.pool, repo).await? == counts, "create replay wrote metadata or counters");
+        let replay = trace_try!(
+            trace::Phase::TenantReplay,
+            trace::S5_CREATE,
+            PgServingSnapshotMetadata.create(&db.pool, &actor, create.clone(), &backend, deadline()).await
+        );
+        trace_assert!(
+            trace::Phase::TenantReplay,
+            trace::S5_REPLAYED_ASSERT,
+            replay.replayed,
+            "same-key create did not replay after refs advanced"
+        );
+        trace_assert!(
+            trace::Phase::TenantReplay,
+            trace::S5_SNAPSHOT_ID_ASSERT,
+            replay.receipt.snapshot_id() == snapshot_id,
+            "replay snapshot id moved"
+        );
+        trace_assert!(
+            trace::Phase::TenantReplay,
+            trace::S5_PIN_ID_ASSERT,
+            replay.receipt.pin_id() == pin_id,
+            "replay pin id moved"
+        );
+        trace_assert!(
+            trace::Phase::TenantReplay,
+            trace::S5_GATE_ASSERT,
+            replay.receipt.gate_revision() == first_gate,
+            "replay captured a newer gate"
+        );
+        trace::enter(trace::Phase::TenantReplay, trace::S5_COUNTS_READ);
+        let replay_counts = snapshot_counts(&db.pool, repo).await?;
+        trace::completed_counts(trace::Phase::TenantReplay, trace::S5_COUNTS_READ, replay_counts);
+        trace_assert!(
+            trace::Phase::TenantReplay,
+            trace::S5_UNCHANGED_ASSERT,
+            replay_counts == counts,
+            "create replay wrote metadata or counters"
+        );
 
         // Changed lease under the same key is a conflict, never a new id.
         let changed = ServingSnapshotCreate { lease_seconds: 301, ..create };
-        ensure!(
-            PgServingSnapshotMetadata.create(&db.pool, &actor, changed, &backend, deadline()).await.is_err(),
+        trace::enter(trace::Phase::ChangedLease, trace::S6_CREATE_RESULT);
+        let changed_result = PgServingSnapshotMetadata.create(&db.pool, &actor, changed, &backend, deadline()).await;
+        trace_result_status!(trace::Phase::ChangedLease, trace::S6_CREATE_RESULT, changed_result);
+        trace_assert!(
+            trace::Phase::ChangedLease,
+            trace::S6_REFUSED_ASSERT,
+            changed_result.is_err(),
             "changed lease under the same key was accepted"
         );
-        ensure!(snapshot_counts(&db.pool, repo).await? == counts, "conflicting create wrote metadata");
+        trace::enter(trace::Phase::ChangedLease, trace::S6_COUNTS_READ);
+        let changed_counts = snapshot_counts(&db.pool, repo).await?;
+        trace::completed_counts(trace::Phase::ChangedLease, trace::S6_COUNTS_READ, changed_counts);
+        trace_assert!(
+            trace::Phase::ChangedLease,
+            trace::S6_UNCHANGED_ASSERT,
+            changed_counts == counts,
+            "conflicting create wrote metadata"
+        );
 
         // Additive actor-owned lifecycle. The producer is a distinct real
         // Admin collaborator; the existing tenant-owned HTTP/Write-role cases
         // above remain unchanged.
-        let admin_producer = db.collaborator(repo, tenant, "admin").await?;
-        ensure!(
+        let admin_producer = trace_try!(
+            trace::Phase::Collaborator,
+            trace::S7_CREATE_AUTHENTICATE_COLLABORATOR,
+            db.collaborator(repo, tenant, "admin").await
+        );
+        trace_assert!(
+            trace::Phase::Collaborator,
+            trace::S7_DISTINCT_PRINCIPAL_ASSERT,
             admin_producer.id != tenant && admin_producer.id != actor.id,
             "actor-owned producer is not a distinct repository principal"
         );
@@ -3052,29 +3198,61 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             idempotency_key: "owned-cross-mode".into(),
             lease_seconds: 300,
         };
-        let cross_tenant = PgServingSnapshotMetadata
-            .create(&db.pool, &admin_producer, cross_mode.clone(), &backend, deadline())
-            .await?;
-        ensure!(!cross_tenant.replayed, "tenant-owned cross-mode setup replayed");
-        ensure!(
+        let cross_tenant = trace_try!(
+            trace::Phase::CrossModeTenant,
+            trace::S8_CREATE,
+            PgServingSnapshotMetadata.create(&db.pool, &admin_producer, cross_mode.clone(), &backend, deadline()).await
+        );
+        trace_assert!(
+            trace::Phase::CrossModeTenant,
+            trace::S8_NOT_REPLAYED_ASSERT,
+            !cross_tenant.replayed,
+            "tenant-owned cross-mode setup replayed"
+        );
+        trace_assert!(
+            trace::Phase::CrossModeTenant,
+            trace::S8_OWNER_ASSERT,
             cross_tenant.receipt.scope().owner_id() == tenant,
             "tenant-owned cross-mode setup persisted the wrong owner"
         );
+        trace::enter(trace::Phase::CrossModeTenant, trace::S8_COUNTS_READ);
         let cross_counts = snapshot_counts(&db.pool, repo).await?;
-        match PgServingSnapshotMetadata
+        trace::completed_counts(trace::Phase::CrossModeTenant, trace::S8_COUNTS_READ, cross_counts);
+        trace::enter(trace::Phase::CrossModeActor, trace::S9_CREATE_RESULT);
+        let cross_actor = PgServingSnapshotMetadata
             .create_actor_owned(&db.pool, &admin_producer, cross_mode, &backend, deadline())
-            .await
-        {
-            Err(error) if error.0 == axum::http::StatusCode::CONFLICT => {}
+            .await;
+        trace_result_status!(trace::Phase::CrossModeActor, trace::S9_CREATE_RESULT, cross_actor);
+        match cross_actor {
+            Err(error) if error.0 == axum::http::StatusCode::CONFLICT => {
+                trace::predicate_status(
+                    trace::Phase::CrossModeActor,
+                    trace::S9_EXACT_CONFLICT_MATCH,
+                    true,
+                    error.0.as_u16(),
+                );
+            }
             Err(error) => {
+                trace::predicate_status(
+                    trace::Phase::CrossModeActor,
+                    trace::S9_EXACT_CONFLICT_MATCH,
+                    false,
+                    error.0.as_u16(),
+                );
                 return Err(anyhow!("cross-mode actor-owned create returned {} {}", error.0, error.1));
             }
             Ok(outcome) => {
+                trace::predicate(trace::Phase::CrossModeActor, trace::S9_EXACT_CONFLICT_MATCH, false);
                 return Err(anyhow!("cross-mode actor-owned create was accepted (replayed={})", outcome.replayed));
             }
         }
-        ensure!(
-            snapshot_counts(&db.pool, repo).await? == cross_counts,
+        trace::enter(trace::Phase::CrossModeActor, trace::S9_COUNTS_READ);
+        let cross_counts_after = snapshot_counts(&db.pool, repo).await?;
+        trace::completed_counts(trace::Phase::CrossModeActor, trace::S9_COUNTS_READ, cross_counts_after);
+        trace_assert!(
+            trace::Phase::CrossModeActor,
+            trace::S9_UNCHANGED_ASSERT,
+            cross_counts_after == cross_counts,
             "cross-mode actor-owned conflict wrote metadata"
         );
 
@@ -3084,30 +3262,47 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             idempotency_key: "owned-create".into(),
             lease_seconds: 300,
         };
-        let owned_a = PgServingSnapshotMetadata
-            .create_actor_owned(&db.pool, &admin_producer, owned_create.clone(), &backend, deadline())
-            .await?;
-        ensure!(!owned_a.replayed, "actor-owned create replayed");
-        ensure!(
+        let owned_a = trace_try!(
+            trace::Phase::OwnedACreateRead,
+            trace::S10_CREATE,
+            PgServingSnapshotMetadata
+                .create_actor_owned(&db.pool, &admin_producer, owned_create.clone(), &backend, deadline())
+                .await
+        );
+        trace_assert!(
+            trace::Phase::OwnedACreateRead,
+            trace::S10_NOT_REPLAYED_ASSERT,
+            !owned_a.replayed,
+            "actor-owned create replayed"
+        );
+        trace_assert!(
+            trace::Phase::OwnedACreateRead,
+            trace::S10_OWNER_TENANT_ASSERT,
             owned_a.receipt.scope().owner_id() == admin_producer.id && owned_a.receipt.scope().tenant_id() == tenant,
             "actor-owned create persisted the wrong owner/tenant"
         );
         let owned_a_snapshot = owned_a.receipt.snapshot_id();
         let owned_a_gate = owned_a.receipt.gate_revision();
-        let owned_a_read = PgServingSnapshotMetadata
-            .read_actor_owned(
-                &db.pool,
-                &admin_producer,
-                ServingSnapshotRead {
-                    owner: owned_owner.clone(),
-                    name: owned_name.clone(),
-                    snapshot_id: owned_a_snapshot,
-                },
-                &backend,
-                deadline(),
-            )
-            .await?;
-        ensure!(
+        let owned_a_read = trace_try!(
+            trace::Phase::OwnedACreateRead,
+            trace::S10_READ,
+            PgServingSnapshotMetadata
+                .read_actor_owned(
+                    &db.pool,
+                    &admin_producer,
+                    ServingSnapshotRead {
+                        owner: owned_owner.clone(),
+                        name: owned_name.clone(),
+                        snapshot_id: owned_a_snapshot,
+                    },
+                    &backend,
+                    deadline(),
+                )
+                .await
+        );
+        trace_assert!(
+            trace::Phase::OwnedACreateRead,
+            trace::S10_IMMUTABLE_CAPTURE_ASSERT,
             owned_a_read.scope().owner_id() == admin_producer.id
                 && owned_a_read.scope().tenant_id() == tenant
                 && owned_a_read.snapshot_id() == owned_a_snapshot
@@ -3123,15 +3318,38 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             expected_generation: 1,
             lease_seconds: 120,
         };
-        let owned_a_renewed = PgServingSnapshotMetadata
-            .renew_actor_owned(&db.pool, &admin_producer, owned_a_renew.clone(), &backend, deadline())
-            .await?;
-        ensure!(!owned_a_renewed.replayed, "actor-owned renew replayed");
-        ensure!(owned_a_renewed.receipt.pin_generation() == 2, "actor-owned renew generation differs");
-        let owned_a_renew_replay = PgServingSnapshotMetadata
-            .renew_actor_owned(&db.pool, &admin_producer, owned_a_renew, &backend, deadline())
-            .await?;
-        ensure!(owned_a_renew_replay.replayed, "actor-owned exact renew did not replay");
+        let owned_a_renewed = trace_try!(
+            trace::Phase::OwnedARenew,
+            trace::S11_RENEW,
+            PgServingSnapshotMetadata
+                .renew_actor_owned(&db.pool, &admin_producer, owned_a_renew.clone(), &backend, deadline())
+                .await
+        );
+        trace_assert!(
+            trace::Phase::OwnedARenew,
+            trace::S11_NOT_REPLAYED_ASSERT,
+            !owned_a_renewed.replayed,
+            "actor-owned renew replayed"
+        );
+        trace_assert!(
+            trace::Phase::OwnedARenew,
+            trace::S11_GENERATION_TWO_ASSERT,
+            owned_a_renewed.receipt.pin_generation() == 2,
+            "actor-owned renew generation differs"
+        );
+        let owned_a_renew_replay = trace_try!(
+            trace::Phase::OwnedARenew,
+            trace::S11_RENEW_REPLAY,
+            PgServingSnapshotMetadata
+                .renew_actor_owned(&db.pool, &admin_producer, owned_a_renew, &backend, deadline())
+                .await
+        );
+        trace_assert!(
+            trace::Phase::OwnedARenew,
+            trace::S11_REPLAYED_ASSERT,
+            owned_a_renew_replay.replayed,
+            "actor-owned exact renew did not replay"
+        );
 
         let owned_a_release = ServingSnapshotRelease {
             owner: owned_owner.clone(),
@@ -3141,29 +3359,51 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             expected_generation: 2,
             reason: PinReleaseReason::ClientDone,
         };
-        let owned_a_released = PgServingSnapshotMetadata
-            .release_actor_owned(&db.pool, &admin_producer, owned_a_release.clone(), &backend, deadline())
-            .await?;
-        ensure!(!owned_a_released.replayed, "actor-owned release replayed");
-        let owned_a_release_replay = PgServingSnapshotMetadata
-            .release_actor_owned(&db.pool, &admin_producer, owned_a_release, &backend, deadline())
-            .await?;
-        ensure!(owned_a_release_replay.replayed, "actor-owned exact release did not replay");
-        ensure!(
+        let owned_a_released = trace_try!(
+            trace::Phase::OwnedARelease,
+            trace::S12_RELEASE,
             PgServingSnapshotMetadata
-                .read_actor_owned(
-                    &db.pool,
-                    &admin_producer,
-                    ServingSnapshotRead {
-                        owner: owned_owner.clone(),
-                        name: owned_name.clone(),
-                        snapshot_id: owned_a_snapshot,
-                    },
-                    &backend,
-                    deadline(),
-                )
+                .release_actor_owned(&db.pool, &admin_producer, owned_a_release.clone(), &backend, deadline())
                 .await
-                .is_err(),
+        );
+        trace_assert!(
+            trace::Phase::OwnedARelease,
+            trace::S12_NOT_REPLAYED_ASSERT,
+            !owned_a_released.replayed,
+            "actor-owned release replayed"
+        );
+        let owned_a_release_replay = trace_try!(
+            trace::Phase::OwnedARelease,
+            trace::S12_RELEASE_REPLAY,
+            PgServingSnapshotMetadata
+                .release_actor_owned(&db.pool, &admin_producer, owned_a_release, &backend, deadline())
+                .await
+        );
+        trace_assert!(
+            trace::Phase::OwnedARelease,
+            trace::S12_REPLAYED_ASSERT,
+            owned_a_release_replay.replayed,
+            "actor-owned exact release did not replay"
+        );
+        trace::enter(trace::Phase::OwnedARelease, trace::S12_RELEASED_READ_RESULT);
+        let released_read = PgServingSnapshotMetadata
+            .read_actor_owned(
+                &db.pool,
+                &admin_producer,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_a_snapshot,
+                },
+                &backend,
+                deadline(),
+            )
+            .await;
+        trace_result_status!(trace::Phase::OwnedARelease, trace::S12_RELEASED_READ_RESULT, released_read);
+        trace_assert!(
+            trace::Phase::OwnedARelease,
+            trace::S12_REFUSED_ASSERT,
+            released_read.is_err(),
             "released actor-owned snapshot remained readable"
         );
 
@@ -3175,195 +3415,68 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             idempotency_key: "owned-immutable".into(),
             lease_seconds: 300,
         };
-        let owned_b = PgServingSnapshotMetadata
-            .create_actor_owned(&db.pool, &admin_producer, owned_b_create.clone(), &backend, deadline())
-            .await?;
-        ensure!(!owned_b.replayed, "fresh actor-owned immutable create replayed");
-        ensure!(
+        let owned_b = trace_try!(
+            trace::Phase::OwnedBCreate,
+            trace::S13_CREATE,
+            PgServingSnapshotMetadata
+                .create_actor_owned(&db.pool, &admin_producer, owned_b_create.clone(), &backend, deadline())
+                .await
+        );
+        trace_assert!(
+            trace::Phase::OwnedBCreate,
+            trace::S13_NOT_REPLAYED_ASSERT,
+            !owned_b.replayed,
+            "fresh actor-owned immutable create replayed"
+        );
+        trace_assert!(
+            trace::Phase::OwnedBCreate,
+            trace::S13_OWNER_TENANT_ASSERT,
             owned_b.receipt.scope().owner_id() == admin_producer.id && owned_b.receipt.scope().tenant_id() == tenant,
             "actor-owned immutable create persisted the wrong owner/tenant"
         );
         let owned_b_snapshot = owned_b.receipt.snapshot_id();
         let owned_b_pin = owned_b.receipt.pin_id();
         let owned_b_gate = owned_b.receipt.gate_revision();
+        trace::enter(trace::Phase::OwnedBCreate, trace::S13_COUNTS_READ);
         let owned_b_counts = snapshot_counts(&db.pool, repo).await?;
+        trace::completed_counts(trace::Phase::OwnedBCreate, trace::S13_COUNTS_READ, owned_b_counts);
+        trace::enter(trace::Phase::SecondAdvanceReplay, trace::S14_SERVING_ADVANCE);
         serving_advance(&db, &store, &git, &mut verified, &actor, 3, b"serving metadata owned advance\n").await?;
+        trace::completed(trace::Phase::SecondAdvanceReplay, trace::S14_SERVING_ADVANCE);
         let second_advance_head = verified.commit_oid.clone();
-        let owned_b_replay = PgServingSnapshotMetadata
-            .create_actor_owned(&db.pool, &admin_producer, owned_b_create, &backend, deadline())
-            .await?;
-        ensure!(owned_b_replay.replayed, "actor-owned create did not replay after gate advance");
-        ensure!(
+        let owned_b_replay = trace_try!(
+            trace::Phase::SecondAdvanceReplay,
+            trace::S14_CREATE_REPLAY,
+            PgServingSnapshotMetadata
+                .create_actor_owned(&db.pool, &admin_producer, owned_b_create, &backend, deadline())
+                .await
+        );
+        trace_assert!(
+            trace::Phase::SecondAdvanceReplay,
+            trace::S14_REPLAYED_ASSERT,
+            owned_b_replay.replayed,
+            "actor-owned create did not replay after gate advance"
+        );
+        trace_assert!(
+            trace::Phase::SecondAdvanceReplay,
+            trace::S14_SNAPSHOT_PIN_GATE_ASSERT,
             owned_b_replay.receipt.snapshot_id() == owned_b_snapshot
                 && owned_b_replay.receipt.pin_id() == owned_b_pin
                 && owned_b_replay.receipt.gate_revision() == owned_b_gate,
             "actor-owned replay moved snapshot/pin/gate"
         );
-        ensure!(
-            snapshot_counts(&db.pool, repo).await? == owned_b_counts,
+        trace::enter(trace::Phase::SecondAdvanceReplay, trace::S14_COUNTS_READ);
+        let owned_b_counts_after = snapshot_counts(&db.pool, repo).await?;
+        trace::completed_counts(trace::Phase::SecondAdvanceReplay, trace::S14_COUNTS_READ, owned_b_counts_after);
+        trace_assert!(
+            trace::Phase::SecondAdvanceReplay,
+            trace::S14_UNCHANGED_ASSERT,
+            owned_b_counts_after == owned_b_counts,
             "actor-owned replay wrote metadata or counters"
         );
-        let owned_b_read = PgServingSnapshotMetadata
-            .read_actor_owned(
-                &db.pool,
-                &admin_producer,
-                ServingSnapshotRead {
-                    owner: owned_owner.clone(),
-                    name: owned_name.clone(),
-                    snapshot_id: owned_b_snapshot,
-                },
-                &backend,
-                deadline(),
-            )
-            .await?;
-        ensure!(
-            owned_b_read.scope().owner_id() == admin_producer.id
-                && owned_b_read.scope().tenant_id() == tenant
-                && owned_b_read.snapshot_id() == owned_b_snapshot
-                && owned_b_read.gate_revision() == owned_b_gate,
-            "actor-owned historical read moved the immutable capture"
-        );
-        ensure!(!owned_b_read.packs().is_empty(), "actor-owned capture has no registered pack");
-        let owned_b_head =
-            owned_b_read.head_oid_hex().ok_or_else(|| anyhow!("actor-owned captured head is missing"))?.to_owned();
-        ensure!(
-            owned_b_head == first_advance_head,
-            "actor-owned historical head is not the captured first advance commit"
-        );
-        ensure!(owned_b_head != second_advance_head, "actor-owned historical head followed the later advance");
-        let materializer = PgPackSnapshotMaterializer::new(store.clone(), git.clone())?;
-        let owned_view = PgServingSnapshotMetadata
-            .materialize_actor_owned(
-                &db.pool,
-                &admin_producer,
-                ServingSnapshotRead {
-                    owner: owned_owner.clone(),
-                    name: owned_name.clone(),
-                    snapshot_id: owned_b_snapshot,
-                },
-                &materializer,
-                deadline(),
-            )
-            .await?;
-        ensure!(
-            owned_view.scope().owner_id() == admin_producer.id
-                && owned_view.scope().tenant_id() == tenant
-                && owned_view.gate_revision() == owned_b_gate
-                && owned_view.complete_git_read_snapshot()
-                && owned_view.pack_count() > 0
-                && owned_view.packs().len() == owned_b_read.packs().len(),
-            "actor-owned materialized view owner/shape differs"
-        );
-        for (expected, actual) in owned_b_read.packs().iter().zip(owned_view.packs()) {
-            assert_pack_identity(expected, actual)?;
-        }
-        ensure!(
-            read_materialized_file(&owned_view, &git, &owned_b_head, "advance.txt").await? == FIRST_ADVANCE_CONTENT,
-            "actor-owned materialized Git content is not the captured first advance"
-        );
-
-        // The tenant Admin is authorized but is not the owned snapshot's actor;
-        // the durable owner check must refuse without reshaping the capture.
-        let owned_ledger = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
-        match PgServingSnapshotMetadata
-            .read_actor_owned(
-                &db.pool,
-                &actor,
-                ServingSnapshotRead {
-                    owner: owned_owner.clone(),
-                    name: owned_name.clone(),
-                    snapshot_id: owned_b_snapshot,
-                },
-                &backend,
-                deadline(),
-            )
-            .await
-        {
-            Err(error) if error.0 == axum::http::StatusCode::NOT_FOUND => {}
-            Err(error) => {
-                return Err(anyhow!("non-owner actor-owned read returned {} {}", error.0, error.1));
-            }
-            Ok(_) => return Err(anyhow!("non-owner actor-owned read unexpectedly returned a view")),
-        }
-        ensure!(
-            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
-            "non-owner actor-owned refusal changed the ledger"
-        );
-
-        // The historical tenant-owned read path must not adopt an actor-owned
-        // capture either; ownership mode is bound in both directions.
-        ensure!(
-            PgServingSnapshotMetadata
-                .read(
-                    &db.pool,
-                    &actor,
-                    ServingSnapshotRead {
-                        owner: owned_owner.clone(),
-                        name: owned_name.clone(),
-                        snapshot_id: owned_b_snapshot,
-                    },
-                    &backend,
-                    deadline(),
-                )
-                .await
-                .is_err(),
-            "tenant-owned read accepted an actor-owned snapshot"
-        );
-        ensure!(
-            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
-            "tenant-owned actor-owned refusal changed the ledger"
-        );
-
-        match PgServingSnapshotMetadata
-            .materialize_actor_owned(
-                &db.pool,
-                &actor,
-                ServingSnapshotRead {
-                    owner: owned_owner.clone(),
-                    name: owned_name.clone(),
-                    snapshot_id: owned_b_snapshot,
-                },
-                &materializer,
-                deadline(),
-            )
-            .await
-        {
-            Err(error) if error.0 == axum::http::StatusCode::NOT_FOUND => {}
-            Err(error) => {
-                return Err(anyhow!("non-owner actor-owned materialization returned {} {}", error.0, error.1));
-            }
-            Ok(_) => return Err(anyhow!("non-owner actor-owned materialization unexpectedly returned a view")),
-        }
-        ensure!(
-            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
-            "non-owner actor-owned materialization changed the ledger"
-        );
-        ensure!(
-            PgServingSnapshotMetadata
-                .materialize(
-                    &db.pool,
-                    &actor,
-                    ServingSnapshotRead {
-                        owner: owned_owner.clone(),
-                        name: owned_name.clone(),
-                        snapshot_id: owned_b_snapshot,
-                    },
-                    &materializer,
-                    deadline(),
-                )
-                .await
-                .is_err(),
-            "tenant default materializer accepted an actor-owned snapshot"
-        );
-        ensure!(
-            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
-            "tenant default actor-owned materialization changed the ledger"
-        );
-
-        // Admin role loss is a real RBAC refusal, not an ownership fallback.
-        db.set_collaborator_role(repo, admin_producer.id, "write").await?;
-        expect_forbidden(
-            "role-revoked actor-owned read",
+        let owned_b_read = trace_try!(
+            trace::Phase::OwnedBRead,
+            trace::S15_READ,
             PgServingSnapshotMetadata
                 .read_actor_owned(
                     &db.pool,
@@ -3376,32 +3489,344 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
                     &backend,
                     deadline(),
                 )
-                .await,
-        )?;
-        ensure!(
-            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
-            "role-revoked actor-owned refusal changed the ledger"
+                .await
         );
-        expect_forbidden(
-            "role-revoked actor-owned materialization",
+        trace_assert!(
+            trace::Phase::OwnedBRead,
+            trace::S15_IMMUTABLE_CAPTURE_ASSERT,
+            owned_b_read.scope().owner_id() == admin_producer.id
+                && owned_b_read.scope().tenant_id() == tenant
+                && owned_b_read.snapshot_id() == owned_b_snapshot
+                && owned_b_read.gate_revision() == owned_b_gate,
+            "actor-owned historical read moved the immutable capture"
+        );
+        trace_assert!(
+            trace::Phase::OwnedBRead,
+            trace::S15_NONEMPTY_PACKS_ASSERT,
+            !owned_b_read.packs().is_empty(),
+            "actor-owned capture has no registered pack"
+        );
+        let owned_b_head = trace_try!(
+            trace::Phase::OwnedBRead,
+            trace::S15_HEAD_OPTION,
+            owned_b_read
+                .head_oid_hex()
+                .ok_or_else(|| anyhow!("actor-owned captured head is missing"))
+                .map(|head| head.to_owned())
+        );
+        trace_assert!(
+            trace::Phase::OwnedBRead,
+            trace::S15_FIRST_ADVANCE_HEAD_ASSERT,
+            owned_b_head == first_advance_head,
+            "actor-owned historical head is not the captured first advance commit"
+        );
+        trace_assert!(
+            trace::Phase::OwnedBRead,
+            trace::S15_DIFFERENT_SECOND_HEAD_ASSERT,
+            owned_b_head != second_advance_head,
+            "actor-owned historical head followed the later advance"
+        );
+        let materializer = trace_try!(
+            trace::Phase::OwnedBMaterialize,
+            trace::S16_MATERIALIZER_CONSTRUCT,
+            PgPackSnapshotMaterializer::new(store.clone(), git.clone())
+        );
+        let owned_view = trace_try!(
+            trace::Phase::OwnedBMaterialize,
+            trace::S16_MATERIALIZE,
             PgServingSnapshotMetadata
                 .materialize_actor_owned(
                     &db.pool,
                     &admin_producer,
-                    ServingSnapshotRead { owner: owned_owner, name: owned_name, snapshot_id: owned_b_snapshot },
+                    ServingSnapshotRead {
+                        owner: owned_owner.clone(),
+                        name: owned_name.clone(),
+                        snapshot_id: owned_b_snapshot,
+                    },
                     &materializer,
                     deadline(),
                 )
-                .await,
-        )?;
-        ensure!(
-            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
+                .await
+        );
+        let view_owner_ok = owned_view.scope().owner_id() == admin_producer.id;
+        let view_tenant_ok = owned_view.scope().tenant_id() == tenant;
+        let view_gate_ok = owned_view.gate_revision() == owned_b_gate;
+        let view_complete_ok = owned_view.complete_git_read_snapshot();
+        let view_pack_count_ok = owned_view.pack_count() > 0;
+        let view_pack_len_ok = owned_view.packs().len() == owned_b_read.packs().len();
+        let view_shape_ok = view_owner_ok
+            && view_tenant_ok
+            && view_gate_ok
+            && view_complete_ok
+            && view_pack_count_ok
+            && view_pack_len_ok;
+        trace::predicate_checks(
+            trace::Phase::OwnedBMaterialize,
+            trace::S16_VIEW_SHAPE_ASSERT,
+            view_shape_ok,
+            &[view_owner_ok, view_tenant_ok, view_gate_ok, view_complete_ok, view_pack_count_ok, view_pack_len_ok],
+        );
+        ensure!(view_shape_ok, "actor-owned materialized view owner/shape differs");
+        for (index, (expected, actual)) in owned_b_read.packs().iter().zip(owned_view.packs()).enumerate() {
+            trace::enter_loop(trace::Phase::OwnedBMaterialize, trace::S16_EACH_PACK_IDENTITY_ASSERT, index);
+            assert_pack_identity(expected, actual)?;
+            trace::completed_loop(trace::Phase::OwnedBMaterialize, trace::S16_EACH_PACK_IDENTITY_ASSERT, index);
+        }
+        let historical = trace_try!(
+            trace::Phase::HistoricalContent,
+            trace::S17_READ_MATERIALIZED_FILE,
+            read_materialized_file(&owned_view, &git, &owned_b_head, "advance.txt").await
+        );
+        trace_assert!(
+            trace::Phase::HistoricalContent,
+            trace::S17_EXACT_FIRST_ADVANCE_CONTENT_ASSERT,
+            historical.as_slice() == FIRST_ADVANCE_CONTENT,
+            "actor-owned materialized Git content is not the captured first advance"
+        );
+
+        // The tenant Admin is authorized but is not the owned snapshot's actor;
+        // the durable owner check must refuse without reshaping the capture.
+        trace::enter(trace::Phase::NonownerRead, trace::S18_LEDGER_BASELINE);
+        let owned_ledger = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        trace::completed_counts(trace::Phase::NonownerRead, trace::S18_LEDGER_BASELINE, owned_ledger.counts);
+        trace::enter(trace::Phase::NonownerRead, trace::S18_READ_RESULT);
+        let nonowner_read = PgServingSnapshotMetadata
+            .read_actor_owned(
+                &db.pool,
+                &actor,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &backend,
+                deadline(),
+            )
+            .await;
+        trace_result_status!(trace::Phase::NonownerRead, trace::S18_READ_RESULT, nonowner_read);
+        match nonowner_read {
+            Err(error) if error.0 == axum::http::StatusCode::NOT_FOUND => {
+                trace::predicate_status(
+                    trace::Phase::NonownerRead,
+                    trace::S18_EXACT_NOT_FOUND_MATCH,
+                    true,
+                    error.0.as_u16(),
+                );
+            }
+            Err(error) => {
+                trace::predicate_status(
+                    trace::Phase::NonownerRead,
+                    trace::S18_EXACT_NOT_FOUND_MATCH,
+                    false,
+                    error.0.as_u16(),
+                );
+                return Err(anyhow!("non-owner actor-owned read returned {} {}", error.0, error.1));
+            }
+            Ok(_) => {
+                trace::predicate(trace::Phase::NonownerRead, trace::S18_EXACT_NOT_FOUND_MATCH, false);
+                return Err(anyhow!("non-owner actor-owned read unexpectedly returned a view"));
+            }
+        }
+        trace::enter(trace::Phase::NonownerRead, trace::S18_LEDGER_READ);
+        let nonowner_ledger = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        trace::completed_counts(trace::Phase::NonownerRead, trace::S18_LEDGER_READ, nonowner_ledger.counts);
+        trace_assert!(
+            trace::Phase::NonownerRead,
+            trace::S18_UNCHANGED_ASSERT,
+            nonowner_ledger == owned_ledger,
+            "non-owner actor-owned refusal changed the ledger"
+        );
+
+        // The historical tenant-owned read path must not adopt an actor-owned
+        // capture either; ownership mode is bound in both directions.
+        trace::enter(trace::Phase::TenantReadRefusal, trace::S19_READ_RESULT);
+        let tenant_read = PgServingSnapshotMetadata
+            .read(
+                &db.pool,
+                &actor,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &backend,
+                deadline(),
+            )
+            .await;
+        trace_result_status!(trace::Phase::TenantReadRefusal, trace::S19_READ_RESULT, tenant_read);
+        trace_assert!(
+            trace::Phase::TenantReadRefusal,
+            trace::S19_REFUSED_ASSERT,
+            tenant_read.is_err(),
+            "tenant-owned read accepted an actor-owned snapshot"
+        );
+        trace::enter(trace::Phase::TenantReadRefusal, trace::S19_LEDGER_READ);
+        let tenant_read_ledger = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        trace::completed_counts(trace::Phase::TenantReadRefusal, trace::S19_LEDGER_READ, tenant_read_ledger.counts);
+        trace_assert!(
+            trace::Phase::TenantReadRefusal,
+            trace::S19_UNCHANGED_ASSERT,
+            tenant_read_ledger == owned_ledger,
+            "tenant-owned actor-owned refusal changed the ledger"
+        );
+
+        trace::enter(trace::Phase::NonownerMaterialize, trace::S20_MATERIALIZE_RESULT);
+        let nonowner_materialize = PgServingSnapshotMetadata
+            .materialize_actor_owned(
+                &db.pool,
+                &actor,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &materializer,
+                deadline(),
+            )
+            .await;
+        trace_result_status!(trace::Phase::NonownerMaterialize, trace::S20_MATERIALIZE_RESULT, nonowner_materialize);
+        match nonowner_materialize {
+            Err(error) if error.0 == axum::http::StatusCode::NOT_FOUND => {
+                trace::predicate_status(
+                    trace::Phase::NonownerMaterialize,
+                    trace::S20_EXACT_NOT_FOUND_MATCH,
+                    true,
+                    error.0.as_u16(),
+                );
+            }
+            Err(error) => {
+                trace::predicate_status(
+                    trace::Phase::NonownerMaterialize,
+                    trace::S20_EXACT_NOT_FOUND_MATCH,
+                    false,
+                    error.0.as_u16(),
+                );
+                return Err(anyhow!("non-owner actor-owned materialization returned {} {}", error.0, error.1));
+            }
+            Ok(_) => {
+                trace::predicate(trace::Phase::NonownerMaterialize, trace::S20_EXACT_NOT_FOUND_MATCH, false);
+                return Err(anyhow!("non-owner actor-owned materialization unexpectedly returned a view"));
+            }
+        }
+        trace::enter(trace::Phase::NonownerMaterialize, trace::S20_LEDGER_READ);
+        let nonowner_materialize_ledger = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        trace::completed_counts(
+            trace::Phase::NonownerMaterialize,
+            trace::S20_LEDGER_READ,
+            nonowner_materialize_ledger.counts,
+        );
+        trace_assert!(
+            trace::Phase::NonownerMaterialize,
+            trace::S20_UNCHANGED_ASSERT,
+            nonowner_materialize_ledger == owned_ledger,
+            "non-owner actor-owned materialization changed the ledger"
+        );
+        trace::enter(trace::Phase::TenantMaterializeRefusal, trace::S21_MATERIALIZE_RESULT);
+        let tenant_materialize = PgServingSnapshotMetadata
+            .materialize(
+                &db.pool,
+                &actor,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &materializer,
+                deadline(),
+            )
+            .await;
+        trace_result_status!(trace::Phase::TenantMaterializeRefusal, trace::S21_MATERIALIZE_RESULT, tenant_materialize);
+        trace_assert!(
+            trace::Phase::TenantMaterializeRefusal,
+            trace::S21_REFUSED_ASSERT,
+            tenant_materialize.is_err(),
+            "tenant default materializer accepted an actor-owned snapshot"
+        );
+        trace::enter(trace::Phase::TenantMaterializeRefusal, trace::S21_LEDGER_READ);
+        let tenant_materialize_ledger = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        trace::completed_counts(
+            trace::Phase::TenantMaterializeRefusal,
+            trace::S21_LEDGER_READ,
+            tenant_materialize_ledger.counts,
+        );
+        trace_assert!(
+            trace::Phase::TenantMaterializeRefusal,
+            trace::S21_UNCHANGED_ASSERT,
+            tenant_materialize_ledger == owned_ledger,
+            "tenant default actor-owned materialization changed the ledger"
+        );
+
+        // Admin role loss is a real RBAC refusal, not an ownership fallback.
+        trace_try!(
+            trace::Phase::RoleRevokeRead,
+            trace::S22_SET_ROLE,
+            db.set_collaborator_role(repo, admin_producer.id, "write").await
+        );
+        trace::enter(trace::Phase::RoleRevokeRead, trace::S22_READ_RESULT);
+        let role_read = PgServingSnapshotMetadata
+            .read_actor_owned(
+                &db.pool,
+                &admin_producer,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &backend,
+                deadline(),
+            )
+            .await;
+        trace_result_status!(trace::Phase::RoleRevokeRead, trace::S22_READ_RESULT, role_read);
+        trace::enter(trace::Phase::RoleRevokeRead, trace::S22_EXACT_COMMON_FORBIDDEN_ASSERT);
+        expect_forbidden("role-revoked actor-owned read", role_read)?;
+        trace::completed(trace::Phase::RoleRevokeRead, trace::S22_EXACT_COMMON_FORBIDDEN_ASSERT);
+        trace::enter(trace::Phase::RoleRevokeRead, trace::S22_LEDGER_READ);
+        let role_read_ledger = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        trace::completed_counts(trace::Phase::RoleRevokeRead, trace::S22_LEDGER_READ, role_read_ledger.counts);
+        trace_assert!(
+            trace::Phase::RoleRevokeRead,
+            trace::S22_UNCHANGED_ASSERT,
+            role_read_ledger == owned_ledger,
+            "role-revoked actor-owned refusal changed the ledger"
+        );
+        trace::enter(trace::Phase::RoleRevokeMaterialize, trace::S23_MATERIALIZE_RESULT);
+        let role_materialize = PgServingSnapshotMetadata
+            .materialize_actor_owned(
+                &db.pool,
+                &admin_producer,
+                ServingSnapshotRead { owner: owned_owner, name: owned_name, snapshot_id: owned_b_snapshot },
+                &materializer,
+                deadline(),
+            )
+            .await;
+        trace_result_status!(trace::Phase::RoleRevokeMaterialize, trace::S23_MATERIALIZE_RESULT, role_materialize);
+        trace::enter(trace::Phase::RoleRevokeMaterialize, trace::S23_EXACT_COMMON_FORBIDDEN_ASSERT);
+        expect_forbidden("role-revoked actor-owned materialization", role_materialize)?;
+        trace::completed(trace::Phase::RoleRevokeMaterialize, trace::S23_EXACT_COMMON_FORBIDDEN_ASSERT);
+        trace::enter(trace::Phase::RoleRevokeMaterialize, trace::S23_LEDGER_READ);
+        let role_materialize_ledger = metadata_ledger_snapshot(&db.pool, repo, tenant).await?;
+        trace::completed_counts(
+            trace::Phase::RoleRevokeMaterialize,
+            trace::S23_LEDGER_READ,
+            role_materialize_ledger.counts,
+        );
+        trace_assert!(
+            trace::Phase::RoleRevokeMaterialize,
+            trace::S23_UNCHANGED_ASSERT,
+            role_materialize_ledger == owned_ledger,
             "role-revoked actor-owned materialization changed the ledger"
         );
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    db.finish(outcome).await
+    trace::enter(trace::Phase::Finish, trace::S24_FINISH_AND_TEARDOWN);
+    let finished = db.finish(outcome).await;
+    if finished.is_ok() {
+        trace::completed(trace::Phase::Finish, trace::S24_FINISH_AND_TEARDOWN);
+    } else {
+        trace::failed_operation(trace::Phase::Finish, trace::S24_FINISH_AND_TEARDOWN);
+    }
+    finished
 }
 
 #[tokio::test]
