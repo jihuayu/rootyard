@@ -2,129 +2,34 @@
 //! for crash-recoverable repository ownership transfer.
 use super::{
     purge_exec::remove_local_repo_dir,
-    transfer_model::{CopiedRemoteObject, TransferPhase, TransferStatusView},
+    transfer_lease::{RollbackDecision, TransferRecord, expected_lease, load_record_with_lock, renew_transfer_lease},
+    transfer_model::{CopiedRemoteObject, TransferPhase},
     transfer_remote::cleanup_rollback_remote_objects,
 };
 use crate::{AppState, Error, storage::read_leases};
-use deadpool_postgres::Transaction;
 use serde_json::json;
 use std::{path::PathBuf, time::Duration};
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
-#[derive(Clone)]
-pub(super) struct TransferRecord {
-    pub(super) id: Uuid,
-    pub(super) repository_id: Uuid,
-    pub(super) from_owner_id: Uuid,
-    pub(super) to_owner_id: Uuid,
-    pub(super) from_owner: String,
-    pub(super) to_owner: String,
-    pub(super) from_name: String,
-    pub(super) to_name: String,
-    pub(super) initiated_by: Uuid,
-    pub(super) revoke_collaborators: bool,
-    pub(super) keep_alias: bool,
-    pub(super) expected_version: i64,
-    pub(super) phase: TransferPhase,
-    pub(super) copied_objects: Vec<CopiedRemoteObject>,
-    pub(super) last_error: Option<String>,
-}
-
-pub(super) fn parse_phase(s: &str) -> TransferPhase {
-    match s {
-        "preparing" => TransferPhase::Preparing,
-        "draining" => TransferPhase::Draining,
-        "copying_remote" => TransferPhase::CopyingRemote,
-        "rekeying_db" => TransferPhase::RekeyingDb,
-        "revoking_legacy" => TransferPhase::RevokingLegacy,
-        "completed" => TransferPhase::Completed,
-        "rolling_back" => TransferPhase::RollingBack,
-        "rolled_back" => TransferPhase::RolledBack,
-        _ => TransferPhase::Failed,
-    }
-}
-
-pub(super) fn record_to_view(r: &TransferRecord, version: i64) -> TransferStatusView {
-    TransferStatusView {
-        transfer_id: r.id,
-        repository_id: r.repository_id,
-        from_owner_id: r.from_owner_id,
-        to_owner_id: r.to_owner_id,
-        from_owner: r.from_owner.clone(),
-        to_owner: r.to_owner.clone(),
-        old_name: r.from_name.clone(),
-        new_name: r.to_name.clone(),
-        state: r.phase,
-        revoke_collaborators: r.revoke_collaborators,
-        copied_object_count: r.copied_objects.len(),
-        version,
-        last_error: r.last_error.clone(),
-    }
-}
-
-pub(super) async fn load_record(tx: &Transaction<'_>, transfer_id: Uuid) -> Result<TransferRecord, Error> {
-    let row = tx
-        .query_opt(
-            "SELECT t.id, t.repository_id, t.from_owner_id, t.to_owner_id, \
-                    fn.slug, tn.slug, t.from_name, t.to_name, t.initiated_by, \
-                    t.revoke_collaborators, t.keep_alias, t.expected_version, \
-                    t.state, t.copied_objects, t.last_error \
-             FROM repository_transfers t \
-             JOIN namespaces fn ON fn.id = t.from_owner_id \
-             JOIN namespaces tn ON tn.id = t.to_owner_id \
-             WHERE t.id = $1",
-            &[&transfer_id],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    let copied: Vec<CopiedRemoteObject> = serde_json::from_value(row.get(13)).unwrap_or_default();
-    Ok(TransferRecord {
-        id: row.get(0),
-        repository_id: row.get(1),
-        from_owner_id: row.get(2),
-        to_owner_id: row.get(3),
-        from_owner: row.get(4),
-        to_owner: row.get(5),
-        from_name: row.get(6),
-        to_name: row.get(7),
-        initiated_by: row.get(8),
-        revoke_collaborators: row.get(9),
-        keep_alias: row.get(10),
-        expected_version: row.get(11),
-        phase: parse_phase(row.get(12)),
-        copied_objects: copied,
-        last_error: row.get(14),
-    })
-}
-
-pub async fn load_transfer_status(tx: &Transaction<'_>, repo_id: Uuid) -> Result<Option<TransferStatusView>, Error> {
-    let Some(row) = tx
-        .query_opt(
-            "SELECT t.id, r.version FROM repository_transfers t \
-             JOIN repositories r ON r.id = t.repository_id \
-             WHERE t.repository_id = $1 ORDER BY t.created_at DESC LIMIT 1",
-            &[&repo_id],
-        )
-        .await
-        .map_err(Error::internal)?
-    else {
-        return Ok(None);
-    };
-    let transfer_id: Uuid = row.get(0);
-    let version: i64 = row.get(1);
-    let rec = load_record(tx, transfer_id).await?;
-    Ok(Some(record_to_view(&rec, version)))
-}
-
 pub(super) async fn phase_drain(state: &AppState, rec: &TransferRecord, deadline: Instant) -> anyhow::Result<()> {
+    let (lease_owner, lease_epoch) = expected_lease(rec)?;
+    renew_transfer_lease(&state.pool, rec.id, lease_owner, lease_epoch).await?;
     let _maint = state.storage.maintenance_exclusive(rec.repository_id).await;
     let _read = read_leases::exclusive(&state.pool, rec.repository_id, deadline).await?;
 
     {
         let mut client = state.pool.get().await?;
         let tx = client.transaction().await?;
+        let renewed = tx
+            .execute(
+                "UPDATE repository_transfers \
+                 SET lease_until = clock_timestamp() + interval '60 seconds', updated_at = clock_timestamp() \
+                 WHERE id = $1 AND state = 'draining' AND lease_owner = $2 AND lease_epoch = $3",
+                &[&rec.id, &lease_owner, &lease_epoch],
+            )
+            .await?;
+        anyhow::ensure!(renewed == 1, "transfer lease lost during drain");
         tx.execute(
             "UPDATE ci_checkout_jobs SET revoked = true WHERE repository_id = $1 AND NOT revoked",
             &[&rec.repository_id],
@@ -141,11 +46,15 @@ pub(super) async fn phase_drain(state: &AppState, rec: &TransferRecord, deadline
         tx.commit().await?;
     }
 
-    for _ in 0..10 {
+    let mut ticks = 0u64;
+    loop {
+        if ticks > 0 && ticks.is_multiple_of(20) {
+            renew_transfer_lease(&state.pool, rec.id, lease_owner, lease_epoch).await?;
+        }
         let client = state.pool.get().await?;
         let active_ops: i64 = client
             .query_one(
-                "SELECT (SELECT count(*) FROM storage_write_admissions WHERE repository_id = $1 AND state = 'active') \
+                "SELECT (SELECT count(*) FROM storage_write_admissions WHERE repository_id = $1 AND state = 'active' AND lease_until > clock_timestamp()) \
                       + (SELECT count(*) FROM storage_maintenance_jobs WHERE repository_id = $1 AND state IN ('queued','running')) \
                       + (SELECT count(*) FROM artifact_holds WHERE repository_id = $1 AND state = 'active') \
                       + (SELECT count(*) FROM ci_runs WHERE repository_id = $1 AND state IN ('queued','leased')) \
@@ -156,32 +65,45 @@ pub(super) async fn phase_drain(state: &AppState, rec: &TransferRecord, deadline
             .await?
             .get(0);
         if active_ops == 0 {
-            client
+            let changed = client
                 .execute(
-                    "UPDATE repository_transfers SET state = 'copying_remote', updated_at = clock_timestamp() \
-                     WHERE id = $1 AND state = 'draining'",
-                    &[&rec.id],
+                    "UPDATE repository_transfers \
+                     SET state = 'copying_remote', lease_until = clock_timestamp() + interval '60 seconds', \
+                         updated_at = clock_timestamp() \
+                     WHERE id = $1 AND state = 'draining' AND lease_owner = $2 AND lease_epoch = $3",
+                    &[&rec.id, &lease_owner, &lease_epoch],
                 )
                 .await?;
+            anyhow::ensure!(changed == 1, "transfer lease lost transitioning draining -> copying_remote");
             return Ok(());
         }
-        anyhow::ensure!(Instant::now() < deadline, "timed out draining active repository operations");
-        sleep(Duration::from_millis(150)).await;
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "active repository operations did not drain before transfer deadline"
+        );
+        ticks += 1;
+        sleep(Duration::from_millis(100)).await;
     }
-    anyhow::bail!("active repository operations did not drain before transfer deadline")
 }
 
 pub(super) async fn phase_rekey_db(state: &AppState, rec: &TransferRecord, deadline: Instant) -> anyhow::Result<()> {
+    let (lease_owner, lease_epoch) = expected_lease(rec)?;
+    renew_transfer_lease(&state.pool, rec.id, lease_owner, lease_epoch).await?;
     let _maint = state.storage.maintenance_exclusive(rec.repository_id).await;
     let _read = read_leases::exclusive(&state.pool, rec.repository_id, deadline).await?;
 
     let mut client = state.pool.get().await?;
     let tx = client.transaction().await?;
-    let locked = load_record(&tx, rec.id).await?;
+    let locked = load_record_with_lock(&tx, rec.id, true).await?;
+    anyhow::ensure!(
+        locked.lease_owner.as_deref() == Some(lease_owner) && locked.lease_epoch == lease_epoch,
+        "transfer lease lost before rekeying_db"
+    );
     if locked.phase == TransferPhase::RevokingLegacy || locked.phase == TransferPhase::Completed {
         tx.commit().await?;
         return Ok(());
     }
+    anyhow::ensure!(locked.phase == TransferPhase::RekeyingDb, "unexpected transfer phase in rekeying_db");
 
     let r = tx
         .query_one(
@@ -277,7 +199,7 @@ pub(super) async fn phase_rekey_db(state: &AppState, rec: &TransferRecord, deadl
         let alias_id = Uuid::new_v4();
         tx.execute(
             "INSERT INTO repository_aliases (id, alias_owner_id, alias_name, repository_id, created_by, reason) \
-             VALUES ($1, $2, $3, $4, $5, 'transfer') ON CONFLICT (alias_owner_id, alias_name) DO NOTHING",
+             VALUES ($1, $2, $3, $4, $5, 'transfer')",
             &[&alias_id, &rec.from_owner_id, &rec.from_name, &rec.repository_id, &rec.initiated_by],
         )
         .await?;
@@ -312,18 +234,34 @@ pub(super) async fn phase_rekey_db(state: &AppState, rec: &TransferRecord, deadl
         }
     }
 
-    tx.execute(
-        "UPDATE repository_transfers SET state = 'revoking_legacy', updated_at = clock_timestamp() WHERE id = $1",
-        &[&rec.id],
-    )
-    .await?;
+    let changed = tx
+        .execute(
+            "UPDATE repository_transfers \
+             SET state = 'revoking_legacy', lease_until = clock_timestamp() + interval '60 seconds', \
+                 updated_at = clock_timestamp() \
+             WHERE id = $1 AND state = 'rekeying_db' AND lease_owner = $2 AND lease_epoch = $3",
+            &[&rec.id, &lease_owner, &lease_epoch],
+        )
+        .await?;
+    anyhow::ensure!(changed == 1, "transfer lease lost transitioning rekeying_db -> revoking_legacy");
     tx.commit().await?;
     Ok(())
 }
 
 pub(super) async fn phase_revoke_legacy(state: &AppState, rec: &TransferRecord) -> anyhow::Result<()> {
+    let (lease_owner, lease_epoch) = expected_lease(rec)?;
     let mut client = state.pool.get().await?;
     let tx = client.transaction().await?;
+    let locked = load_record_with_lock(&tx, rec.id, true).await?;
+    anyhow::ensure!(
+        locked.lease_owner.as_deref() == Some(lease_owner) && locked.lease_epoch == lease_epoch,
+        "transfer lease lost before revoking_legacy"
+    );
+    if locked.phase == TransferPhase::Completed {
+        tx.commit().await?;
+        return Ok(());
+    }
+    anyhow::ensure!(locked.phase == TransferPhase::RevokingLegacy, "unexpected transfer phase in revoking_legacy");
     tx.execute("DELETE FROM repository_team_members WHERE repository_id = $1", &[&rec.repository_id]).await?;
     tx.execute("DELETE FROM repository_teams WHERE repository_id = $1", &[&rec.repository_id]).await?;
     tx.execute(
@@ -343,11 +281,15 @@ pub(super) async fn phase_revoke_legacy(state: &AppState, rec: &TransferRecord) 
     let owner_id: Uuid =
         tx.query_one("SELECT owner_id FROM repositories WHERE id = $1", &[&rec.repository_id]).await?.get(0);
     anyhow::ensure!(owner_id == rec.to_owner_id, "single-owner invariant violated in revoking_legacy");
-    tx.execute(
-        "UPDATE repository_transfers SET state = 'completed', completed_at = clock_timestamp(), updated_at = clock_timestamp() WHERE id = $1",
-        &[&rec.id],
-    )
-    .await?;
+    let changed = tx
+        .execute(
+            "UPDATE repository_transfers \
+             SET state = 'completed', completed_at = clock_timestamp(), updated_at = clock_timestamp() \
+             WHERE id = $1 AND state = 'revoking_legacy' AND lease_owner = $2 AND lease_epoch = $3",
+            &[&rec.id, &lease_owner, &lease_epoch],
+        )
+        .await?;
+    anyhow::ensure!(changed == 1, "transfer lease lost transitioning revoking_legacy -> completed");
     tx.commit().await?;
 
     let ci_dir: PathBuf = state.storage.root.join("ci-pins").join(rec.repository_id.to_string());
@@ -362,24 +304,85 @@ pub(super) async fn phase_rollback(
     rec: &TransferRecord,
     reason: &str,
     deadline: Instant,
-) -> anyhow::Result<()> {
-    {
-        let client = state.pool.get().await?;
-        client
+) -> anyhow::Result<RollbackDecision> {
+    let (lease_owner, lease_epoch) = expected_lease(rec)?;
+    let copied_to_clean: Vec<CopiedRemoteObject> = {
+        let mut client = state.pool.get().await?;
+        let tx = client.transaction().await?;
+        let row = tx
+            .query_opt(
+                "SELECT t.state, t.lease_owner, t.lease_epoch, t.copied_objects, r.owner_id \
+                 FROM repository_transfers t JOIN repositories r ON r.id = t.repository_id \
+                 WHERE t.id = $1 FOR UPDATE OF t, r",
+                &[&rec.id],
+            )
+            .await?
+            .ok_or_else(Error::not_found)?;
+        let db_state: String = row.get(0);
+        let db_owner: Option<String> = row.get(1);
+        let db_epoch: i64 = row.get(2);
+        let db_copied: Vec<CopiedRemoteObject> = serde_json::from_value(row.get(3)).unwrap_or_default();
+        let repo_owner_id: Uuid = row.get(4);
+        anyhow::ensure!(
+            db_owner.as_deref() == Some(lease_owner) && db_epoch == lease_epoch,
+            "transfer lease lost before rollback"
+        );
+        if matches!(db_state.as_str(), "revoking_legacy" | "completed") || repo_owner_id == rec.to_owner_id {
+            if db_state == "rekeying_db" {
+                let changed = tx
+                    .execute(
+                        "UPDATE repository_transfers \
+                         SET state = 'revoking_legacy', lease_until = clock_timestamp() + interval '60 seconds', \
+                             updated_at = clock_timestamp() \
+                         WHERE id = $1 AND lease_owner = $2 AND lease_epoch = $3",
+                        &[&rec.id, &lease_owner, &lease_epoch],
+                    )
+                    .await?;
+                anyhow::ensure!(changed == 1, "transfer lease lost advancing committed rekey");
+            }
+            tx.commit().await?;
+            return Ok(RollbackDecision::DriveForward);
+        }
+        if db_state == "rolled_back" {
+            tx.commit().await?;
+            return Ok(RollbackDecision::AlreadyRolledBack);
+        }
+        anyhow::ensure!(db_state != "failed", "transfer already in failed state");
+        let changed = tx
             .execute(
-                "UPDATE repository_transfers SET state = 'rolling_back', last_error = $2, updated_at = clock_timestamp() \
-                 WHERE id = $1 AND state NOT IN ('revoking_legacy','completed','rolled_back')",
-                &[&rec.id, &reason],
+                "UPDATE repository_transfers \
+                 SET state = 'rolling_back', last_error = $2, \
+                     lease_until = clock_timestamp() + interval '60 seconds', \
+                     updated_at = clock_timestamp() \
+                 WHERE id = $1 AND lease_owner = $3 AND lease_epoch = $4 \
+                   AND state NOT IN ('revoking_legacy','completed','rolled_back','failed')",
+                &[&rec.id, &reason, &lease_owner, &lease_epoch],
             )
             .await?;
-    }
-    cleanup_rollback_remote_objects(state, rec.repository_id, rec.to_owner_id, &rec.copied_objects, deadline).await?;
+        anyhow::ensure!(changed == 1, "transfer lease lost entering rolling_back");
+        tx.commit().await?;
+        db_copied
+    };
+    cleanup_rollback_remote_objects(
+        state,
+        rec.id,
+        lease_owner,
+        lease_epoch,
+        rec.repository_id,
+        rec.to_owner_id,
+        &copied_to_clean,
+        deadline,
+    )
+    .await?;
     let client = state.pool.get().await?;
-    client
+    let changed = client
         .execute(
-            "UPDATE repository_transfers SET state = 'rolled_back', completed_at = clock_timestamp(), updated_at = clock_timestamp() WHERE id = $1",
-            &[&rec.id],
+            "UPDATE repository_transfers \
+             SET state = 'rolled_back', completed_at = clock_timestamp(), updated_at = clock_timestamp() \
+             WHERE id = $1 AND state = 'rolling_back' AND lease_owner = $2 AND lease_epoch = $3",
+            &[&rec.id, &lease_owner, &lease_epoch],
         )
         .await?;
-    Ok(())
+    anyhow::ensure!(changed == 1, "transfer lease lost finalizing rolled_back");
+    Ok(RollbackDecision::RolledBack)
 }

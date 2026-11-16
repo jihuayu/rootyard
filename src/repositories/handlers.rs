@@ -85,7 +85,13 @@ pub(super) async fn create_repo(
     }
     let format = input.object_format.unwrap_or(browse::object_format::ObjectFormat::Sha1);
     let id = Uuid::new_v4();
-    let created=tx.execute("INSERT INTO repositories (id,owner_id,name,object_format) VALUES ($1,$2,$3,$4) ON CONFLICT (owner_id,name) DO NOTHING",&[&id,&owner_id,&input.name,&format.as_str()]).await.map_err(Error::internal)?==1;
+    let created=tx.execute("INSERT INTO repositories (id,owner_id,name,object_format) VALUES ($1,$2,$3,$4) ON CONFLICT (owner_id,name) DO NOTHING",&[&id,&owner_id,&input.name,&format.as_str()]).await.map_err(|err| {
+        if err.as_db_error().is_some_and(|db| *db.code() == tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+            Error(StatusCode::CONFLICT, "repository name is reserved by an active redirect alias")
+        } else {
+            Error::internal(err)
+        }
+    })?==1;
     let row = tx
         .query_one(&format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT), &[&owner_id, &input.name])
         .await
@@ -320,5 +326,7 @@ pub async fn recover(state: &AppState) -> anyhow::Result<usize> {
         }
     }
     recovered += super::transfer_db::recover_transfers(state).await?;
+    let claim_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    recovered += crate::storage::remote_key_claims::sweep_expired_claims(state, claim_deadline).await?;
     Ok(recovered)
 }

@@ -4,6 +4,7 @@ aliases (authz-before-redirect), soft-delete/restore/fail-closed purge, and
 crash-recoverable ownership transfer against the real binary and PostgreSQL."""
 import argparse
 import base64
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -534,6 +535,320 @@ class RepositoryLifecycleHarness(BrowserHarness):
         assert st_rec == 308 and hdr_rec.get("location") == "/api/repos/alice/recover-me", (st_rec, hdr_rec)
         return {"transferred_repo": gamma["id"], "recovered_transfer_id": xfer_id}
 
+    def issue_scoped_token(self, owner_token, name, grants, read_only=False):
+        st, raw, _ = self.http(
+            "/api/tokens",
+            token=owner_token,
+            method="POST",
+            body={
+                "display_name": name,
+                "expires_in_days": 7,
+                "read_only": read_only,
+                "repository_grants": grants,
+                "namespace_grants": [],
+            },
+        )
+        assert st == 201, (st, raw)
+        data = json.loads(raw)
+        self.secrets.append(data["secret"])
+        return {**owner_token, "token": data["secret"], "id": data["id"]}
+
+    def remediation_lifecycle_and_alias_scope_boundaries(self):
+        # 1. Archived repos may be unarchived and soft-deleted; idempotency replays after state/version transitions.
+        repo = self.create_repository({"owner": "alice", "name": "scope-old"}, token=self.alice)
+        arch = self.doc(
+            "/api/repos/alice/scope-old/archive",
+            200,
+            token=self.alice,
+            method="POST",
+            body={"expected_version": 1},
+            extra_headers={"Idempotency-Key": "rem-arch-1"},
+        )
+        assert arch["archived"] and arch["version"] == 2, arch
+        arch_replay = self.doc(
+            "/api/repos/alice/scope-old/archive",
+            200,
+            token=self.alice,
+            method="POST",
+            body={"expected_version": 1},
+            extra_headers={"Idempotency-Key": "rem-arch-1"},
+        )
+        assert arch_replay == arch, (arch_replay, arch)
+
+        unarch = self.doc(
+            "/api/repos/alice/scope-old/unarchive",
+            200,
+            token=self.alice,
+            method="POST",
+            body={"expected_version": 2},
+            extra_headers={"Idempotency-Key": "rem-unarch-1"},
+        )
+        assert not unarch["archived"] and unarch["version"] == 3, unarch
+        unarch_replay = self.doc(
+            "/api/repos/alice/scope-old/unarchive",
+            200,
+            token=self.alice,
+            method="POST",
+            body={"expected_version": 2},
+            extra_headers={"Idempotency-Key": "rem-unarch-1"},
+        )
+        assert unarch_replay == unarch, (unarch_replay, unarch)
+
+        arch2 = self.doc(
+            "/api/repos/alice/scope-old/archive",
+            200,
+            token=self.alice,
+            method="POST",
+            body={"expected_version": 3},
+            extra_headers={"Idempotency-Key": "rem-arch-2"},
+        )
+        assert arch2["archived"] and arch2["version"] == 4, arch2
+
+        del_body = {"confirmation": "alice/scope-old", "expected_version": 4, "purge_delay_seconds": 600}
+        deleted = self.doc(
+            "/api/repos/alice/scope-old",
+            200,
+            token=self.alice,
+            method="DELETE",
+            body=del_body,
+            extra_headers={"Idempotency-Key": "rem-del-arch-1"},
+        )
+        assert deleted["deleted"] and deleted["version"] == 5, deleted
+        del_replay = self.doc(
+            "/api/repos/alice/scope-old",
+            200,
+            token=self.alice,
+            method="DELETE",
+            body=del_body,
+            extra_headers={"Idempotency-Key": "rem-del-arch-1"},
+        )
+        assert del_replay == deleted, (del_replay, deleted)
+
+        restored = self.doc(
+            "/api/repos/alice/scope-old/restore",
+            200,
+            token=self.alice,
+            method="POST",
+            body={"expected_version": 5},
+            extra_headers={"Idempotency-Key": "rem-restore-1"},
+        )
+        assert not restored["deleted"], restored
+
+        renamed = self.doc(
+            "/api/repos/alice/scope-old/rename",
+            200,
+            token=self.alice,
+            method="POST",
+            body={"new_name": "scope-canon", "expected_version": restored["version"]},
+            extra_headers={"Idempotency-Key": "rem-rename-1"},
+        )
+        assert renamed["name"] == "scope-canon", renamed
+
+        # 2. Fine-grained Web and LFS alias scope checks before 308 redirect.
+        repo_read_tok = self.issue_scoped_token(
+            self.alice, "rem-repo-read", [{"repository_id": repo["id"], "actions": ["repo_read"]}]
+        )
+        repo_read_cookies, _, _ = self.sign_in(username="alice", token=repo_read_tok["token"])
+        st_w_ok, _, hdr_w_ok = self.raw_http("/web/repos/alice/scope-old", cookies=repo_read_cookies)
+        assert st_w_ok == 308 and hdr_w_ok.get("location") == "/web/repos/alice/scope-canon", (st_w_ok, hdr_w_ok)
+        for blocked_web in ("/tree", "/issues", "/pulls", "/audit", "/commits/" + ("0" * 40) + "/checks"):
+            st_wb, _, _ = self.raw_http("/web/repos/alice/scope-old" + blocked_web, cookies=repo_read_cookies)
+            assert st_wb == 403, (blocked_web, st_wb)
+
+        dummy_oid = "a" * 64
+        st_lfs_get, _, _ = self.raw_http(f"/git/alice/scope-old.git/info/lfs/objects/{dummy_oid}", token=repo_read_tok)
+        assert st_lfs_get == 403, st_lfs_get
+
+        contents_read_tok = self.issue_scoped_token(
+            self.alice, "rem-contents-read", [{"repository_id": repo["id"], "actions": ["contents_read"]}]
+        )
+        cr_cookies, _, _ = self.sign_in(username="alice", token=contents_read_tok["token"])
+        st_tree, _, hdr_tree = self.raw_http("/web/repos/alice/scope-old/tree", cookies=cr_cookies)
+        assert st_tree == 308 and hdr_tree.get("location") == "/web/repos/alice/scope-canon/tree", (st_tree, hdr_tree)
+
+        st_dl, _, hdr_dl = self.raw_http(
+            "/git/alice/scope-old.git/info/lfs/objects/batch",
+            token=contents_read_tok,
+            method="POST",
+            body=json.dumps({"operation": "download", "objects": [{"oid": dummy_oid, "size": 4}]}).encode(),
+            content_type="application/vnd.git-lfs+json",
+            extra_headers={"Accept": "application/vnd.git-lfs+json"},
+        )
+        assert st_dl == 308 and hdr_dl.get("location") == "/git/alice/scope-canon.git/info/lfs/objects/batch", (
+            st_dl,
+            hdr_dl,
+        )
+
+        for method, tail, body_obj in [
+            ("POST", "/info/lfs/objects/batch", {"operation": "upload", "objects": [{"oid": dummy_oid, "size": 4}]}),
+            ("POST", "/info/lfs/verify", {"oid": dummy_oid, "size": 4}),
+            ("POST", "/info/lfs/locks/verify", {}),
+        ]:
+            st_blk, _, _ = self.raw_http(
+                "/git/alice/scope-old.git" + tail,
+                token=contents_read_tok,
+                method=method,
+                body=json.dumps(body_obj).encode(),
+                content_type="application/vnd.git-lfs+json",
+                extra_headers={"Accept": "application/vnd.git-lfs+json"},
+            )
+            assert st_blk == 403, (tail, st_blk)
+
+        ro_tok = self.issue_scoped_token(
+            self.alice,
+            "rem-ro-flag",
+            [{"repository_id": repo["id"], "actions": ["contents_read", "contents_write"]}],
+            read_only=True,
+        )
+        st_ro_up, _, _ = self.raw_http(
+            "/git/alice/scope-old.git/info/lfs/objects/batch",
+            token=ro_tok,
+            method="POST",
+            body=json.dumps({"operation": "upload", "objects": [{"oid": dummy_oid, "size": 4}]}).encode(),
+            content_type="application/vnd.git-lfs+json",
+            extra_headers={"Accept": "application/vnd.git-lfs+json"},
+        )
+        assert st_ro_up == 403, st_ro_up
+        return {"scoped_repo": repo["id"]}
+
+    def remediation_fault_injection_and_concurrency(self):
+        # 1. Concurrent create_repo vs rename unified reservation constraint (23505 -> 409, zero 500).
+        for idx in range(3):
+            src_name = f"race-src-{idx}"
+            slot_name = f"race-slot-{idx}"
+            self.create_repository({"owner": "alice", "name": src_name}, token=self.alice)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                f_create = pool.submit(
+                    self.http, "/api/repos", token=self.alice, method="POST", body={"owner": "alice", "name": slot_name}
+                )
+                f_rename = pool.submit(
+                    self.http,
+                    f"/api/repos/alice/{src_name}/rename",
+                    token=self.alice,
+                    method="POST",
+                    body={"new_name": slot_name, "expected_version": 1},
+                    extra_headers={"Idempotency-Key": f"rem-race-ren-{idx}"},
+                )
+                c_st, c_raw, _ = f_create.result(timeout=15)
+                r_st, r_raw, _ = f_rename.result(timeout=15)
+            assert c_st in (200, 201, 409) and r_st in (200, 409), (c_st, c_raw, r_st, r_raw)
+            kinds = self.sql(
+                "SELECT count(*) FROM repository_name_reservations "
+                f"WHERE namespace_id = {quote(self.alice['user_id'])} AND name = {quote(slot_name)}"
+            )
+            assert kinds == "1", (slot_name, kinds)
+
+        # 2. Active foreign transfer lease non-stealing & lost-COMMIT rekeying_db forward recovery.
+        org_id = self.sql("SELECT id FROM namespaces WHERE slug = 'dest-org'")
+        assert org_id, "expected dest-org namespace from ownership transfer case"
+        lease_repo = self.create_repository({"owner": "alice", "name": "lease-stay"}, token=self.alice)
+        stay_xfer = str(uuid.uuid4())
+        self.stop()
+        self.sql(
+            "INSERT INTO repository_transfers "
+            "(id, repository_id, from_owner_id, to_owner_id, from_name, to_name, initiated_by, state, "
+            " expected_version, revoke_collaborators, keep_alias, copied_objects, lease_owner, lease_until, lease_epoch) "
+            f"VALUES ({quote(stay_xfer)}, {quote(lease_repo['id'])}, {quote(self.alice['user_id'])}, {quote(org_id)}, "
+            "'lease-stay', 'lease-stay', "
+            f"{quote(self.alice['user_id'])}, 'copying_remote', 1, true, true, '[]'::jsonb, "
+            "'foreign-live-worker', clock_timestamp() + interval '45 seconds', 7)"
+        )
+        self.start()
+        time.sleep(0.5)
+        stay_row = self.sql(
+            f"SELECT state || ':' || lease_owner || ':' || lease_epoch::text FROM repository_transfers WHERE id = {quote(stay_xfer)}"
+        )
+        assert stay_row == "copying_remote:foreign-live-worker:7", stay_row
+        self.sql(f"DELETE FROM repository_transfers WHERE id = {quote(stay_xfer)}")
+
+        lost_repo = self.create_repository({"owner": "alice", "name": "lost-ack"}, token=self.alice)
+        lost_xfer = str(uuid.uuid4())
+        self.stop()
+        self.sql(
+            f"UPDATE repositories SET owner_id = {quote(org_id)}, version = version + 1 WHERE id = {quote(lost_repo['id'])}"
+        )
+        self.sql(
+            "INSERT INTO repository_transfers "
+            "(id, repository_id, from_owner_id, to_owner_id, from_name, to_name, initiated_by, state, "
+            " expected_version, revoke_collaborators, keep_alias, copied_objects, lease_owner, lease_until, lease_epoch) "
+            f"VALUES ({quote(lost_xfer)}, {quote(lost_repo['id'])}, {quote(self.alice['user_id'])}, {quote(org_id)}, "
+            "'lost-ack', 'lost-ack', "
+            f"{quote(self.alice['user_id'])}, 'rekeying_db', 1, true, true, '[]'::jsonb, "
+            "'crashed-worker', clock_timestamp() - interval '5 minutes', 2)"
+        )
+        self.start()
+        deadline = time.monotonic() + 20
+        lost_state = None
+        while time.monotonic() < deadline:
+            st, body, _ = self.http("/api/repos/dest-org/lost-ack/transfer", token=self.alice)
+            if st == 200:
+                view = json.loads(body)
+                lost_state = view["state"]
+                if lost_state == "completed":
+                    break
+            time.sleep(0.25)
+        assert lost_state == "completed", lost_state
+        assert self.sql(f"SELECT owner_id FROM repositories WHERE id = {quote(lost_repo['id'])}") == org_id
+
+        # 3. Remote delete claim barrier forces waiting/flushing stale claims before LFS upload reservation.
+        claim_repo = self.create_repository({"owner": "alice", "name": "claim-race"}, token=self.alice)
+        claim_bytes = b"fresh-upload-never-trust-stale-claim"
+        claim_oid = hashlib.sha256(claim_bytes).hexdigest()
+        self.sql(
+            "INSERT INTO remote_object_delete_claims "
+            "(tenant_id, namespace, digest, claim_generation, deleting, lease_until) "
+            f"VALUES ({quote(self.alice['user_id'])}, 'lfs', {quote(claim_oid)}, 1, true, "
+            "clock_timestamp() + interval '1 second') "
+            "ON CONFLICT (tenant_id, namespace, digest) DO UPDATE SET "
+            "claim_generation = remote_object_delete_claims.claim_generation + 1, "
+            "deleting = true, lease_until = clock_timestamp() + interval '1 second'"
+        )
+        st_b, raw_b, _ = self.http(
+            "/git/alice/claim-race.git/info/lfs/objects/batch",
+            token=self.alice,
+            method="POST",
+            body={
+                "operation": "upload",
+                "transfers": ["basic"],
+                "objects": [{"oid": claim_oid, "size": len(claim_bytes)}],
+                "hash_algo": "sha256",
+            },
+            content_type="application/vnd.git-lfs+json",
+            extra_headers={"Accept": "application/vnd.git-lfs+json"},
+        )
+        assert st_b == 200, (st_b, raw_b)
+        obj_resp = json.loads(raw_b)["objects"][0]
+        assert "upload" in obj_resp.get("actions", {}), obj_resp
+        claim_after = self.sql(
+            "SELECT deleting::text || ':' || claim_generation::text FROM remote_object_delete_claims "
+            f"WHERE tenant_id = {quote(self.alice['user_id'])} AND namespace = 'lfs' AND digest = {quote(claim_oid)}"
+        )
+        assert claim_after == "false:2", claim_after
+
+        # 4. Transfer drain waits beyond 1.5s for valid write admission while ignoring expired admissions.
+        drain_repo = self.create_repository({"owner": "alice", "name": "drain-guard"}, token=self.alice)
+        exp_id = str(uuid.uuid4())
+        live_id = str(uuid.uuid4())
+        owner_uuid = str(uuid.uuid4())
+        self.sql(
+            "INSERT INTO storage_write_admissions "
+            "(id, repository_id, gc_epoch, owner, kind, state, lease_until) VALUES "
+            f"({quote(exp_id)}, {quote(drain_repo['id'])}, 0, {quote(owner_uuid)}, 'workspace_publish', 'active', "
+            "clock_timestamp() - interval '5 seconds'), "
+            f"({quote(live_id)}, {quote(drain_repo['id'])}, 0, {quote(owner_uuid)}, 'workspace_publish', 'active', "
+            "clock_timestamp() + interval '2200 milliseconds')"
+        )
+        xfer_view = self.doc(
+            "/api/repos/alice/drain-guard/transfer",
+            200,
+            token=self.alice,
+            method="POST",
+            body={"new_owner": "dest-org", "expected_version": 1},
+            extra_headers={"Idempotency-Key": "rem-drain-wait"},
+        )
+        assert xfer_view["state"] == "completed", xfer_view
+        return {"lost_ack_repo": lost_repo["id"], "drain_transfer_id": xfer_view["transfer_id"]}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -555,6 +870,8 @@ def main():
             ("rename_aliases_and_authz_before_redirect", h.rename_aliases_and_authz_before_redirect),
             ("soft_delete_restore_and_purge_holds", h.soft_delete_restore_and_purge_holds),
             ("ownership_transfer_and_crash_recovery", h.ownership_transfer_and_crash_recovery),
+            ("remediation_lifecycle_and_alias_scope_boundaries", h.remediation_lifecycle_and_alias_scope_boundaries),
+            ("remediation_fault_injection_and_concurrency", h.remediation_fault_injection_and_concurrency),
         ]:
             h.case(name, fn)
         passed = True

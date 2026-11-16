@@ -12,6 +12,7 @@ pub mod purge_safety;
 pub mod remote_copy;
 pub mod transfer_db;
 pub mod transfer_exec;
+mod transfer_lease;
 pub mod transfer_model;
 pub mod transfer_phases;
 pub mod transfer_remote;

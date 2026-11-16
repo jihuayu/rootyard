@@ -10,21 +10,47 @@ use crate::{
     storage::remote_objects::{ObjectKey, RemoteObjectStore},
     storage_lifecycle::pando_delete_gate,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
+use deadpool_postgres::Pool;
 use serde_json::Value;
 use std::{collections::BTreeSet, path::Path};
 use tokio::{fs, time::Instant};
 use uuid::Uuid;
 
-async fn persist_copied_objects(state: &AppState, transfer_id: Uuid, copied: &[CopiedRemoteObject]) -> Result<()> {
+async fn verify_rollback_lease(pool: &Pool, transfer_id: Uuid, lease_owner: &str, lease_epoch: i64) -> Result<()> {
+    let client = pool.get().await?;
+    let active: bool = client
+        .query_one(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM repository_transfers \
+                 WHERE id = $1 AND state = 'rolling_back' AND lease_owner = $2 AND lease_epoch = $3 \
+                   AND lease_until > clock_timestamp() \
+             )",
+            &[&transfer_id, &lease_owner, &lease_epoch],
+        )
+        .await?
+        .get(0);
+    ensure!(active, "transfer rollback lease lost before remote delete");
+    Ok(())
+}
+
+async fn persist_copied_objects(
+    state: &AppState,
+    transfer_id: Uuid,
+    lease_owner: &str,
+    lease_epoch: i64,
+    copied: &[CopiedRemoteObject],
+) -> Result<()> {
     let client = state.pool.get().await?;
     let val = serde_json::to_value(copied)?;
-    client
+    let changed = client
         .execute(
-            "UPDATE repository_transfers SET copied_objects = $2, updated_at = clock_timestamp() WHERE id = $1",
-            &[&transfer_id, &val],
+            "UPDATE repository_transfers SET copied_objects = $2, updated_at = clock_timestamp() \
+             WHERE id = $1 AND state = 'copying_remote' AND lease_owner = $3 AND lease_epoch = $4",
+            &[&transfer_id, &val, &lease_owner, &lease_epoch],
         )
         .await?;
+    ensure!(changed == 1, "transfer lease lost while persisting copied remote objects");
     Ok(())
 }
 
@@ -42,16 +68,23 @@ fn push_unique(
 pub async fn copy_repository_remote_objects(
     state: &AppState,
     transfer_id: Uuid,
+    lease_owner: &str,
+    lease_epoch: i64,
     repo_id: Uuid,
     from_owner: Uuid,
     to_owner: Uuid,
     deadline: Instant,
 ) -> Result<Vec<CopiedRemoteObject>> {
     let client = state.pool.get().await?;
-    let existing_val: Value = client
-        .query_one("SELECT copied_objects FROM repository_transfers WHERE id = $1", &[&transfer_id])
-        .await?
-        .get(0);
+    let row = client
+        .query_one(
+            "SELECT copied_objects FROM repository_transfers \
+             WHERE id = $1 AND state = 'copying_remote' AND lease_owner = $2 AND lease_epoch = $3",
+            &[&transfer_id, &lease_owner, &lease_epoch],
+        )
+        .await
+        .context("transfer lease lost before remote object copy")?;
+    let existing_val: Value = row.get(0);
     let mut copied: Vec<CopiedRemoteObject> = serde_json::from_value(existing_val).unwrap_or_default();
     let mut seen: BTreeSet<(String, String, String)> =
         copied.iter().map(|c| (c.kind.clone(), c.from_key.clone(), c.to_key.clone())).collect();
@@ -66,7 +99,7 @@ pub async fn copy_repository_remote_objects(
     copy_pando_objects(state, &client, repo_id, from_owner, to_owner, &stage_dir, &mut copied, &mut seen, deadline)
         .await?;
 
-    persist_copied_objects(state, transfer_id, &copied).await?;
+    persist_copied_objects(state, transfer_id, lease_owner, lease_epoch, &copied).await?;
     Ok(copied)
 }
 
@@ -256,6 +289,9 @@ async fn copy_pando_objects(
 
 pub async fn cleanup_rollback_remote_objects(
     state: &AppState,
+    transfer_id: Uuid,
+    lease_owner: &str,
+    lease_epoch: i64,
     repo_id: Uuid,
     to_owner: Uuid,
     copied: &[CopiedRemoteObject],
@@ -321,15 +357,18 @@ pub async fn cleanup_rollback_remote_objects(
         match kind.as_str() {
             "lfs" => {
                 if let Some(store) = lfs_store.as_ref() {
+                    verify_rollback_lease(&state.pool, transfer_id, lease_owner, lease_epoch).await?;
                     let _ = store.delete(&key, deadline).await;
                 }
             }
             "workspace" | "workspace_manifest" => {
+                verify_rollback_lease(&state.pool, transfer_id, lease_owner, lease_epoch).await?;
                 let _ = ws_store.delete(&key, deadline).await;
             }
             "pando-cipher" | "pando-envelope" => {
                 let path = key.path();
                 if let Some(store) = pando_remote_allowed.as_ref() {
+                    verify_rollback_lease(&state.pool, transfer_id, lease_owner, lease_epoch).await?;
                     if store.delete(&key, deadline).await.is_ok() {
                         let _ = client
                             .execute(

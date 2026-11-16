@@ -1,11 +1,223 @@
 //! Safe final purge execution for unshared remote objects and local git dirs (#85).
 use super::purge_safety::RemoteDeletePlan;
-use crate::storage::remote_objects::{ObjectKey, RemoteObjectStore};
-use anyhow::{Result, ensure};
+use crate::{
+    AppState, Error,
+    storage::{
+        remote_key_claims::{DeleteClaim, finish_claim, verify_claim_lease},
+        remote_objects::{ObjectKey, RemoteObjectStore},
+    },
+    workspaces::remote::RemoteManifest,
+};
+use anyhow::{Result, bail, ensure};
+use deadpool_postgres::{Pool, Transaction};
 use std::collections::BTreeSet;
 use std::path::Path;
 use tokio::{fs, time::Instant};
 use uuid::Uuid;
+
+#[derive(Clone)]
+pub(super) struct PandoArtifactCandidate {
+    pub(super) authority_id: Uuid,
+    pub(super) tenant_id: Uuid,
+    pub(super) namespace: String,
+    pub(super) sha256: String,
+    pub(super) object_generation: i64,
+    pub(super) remote_path: String,
+    pub(super) authority_scoped_unshared: bool,
+}
+
+async fn collect_strings(
+    tx: &Transaction<'_>,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Vec<String>, Error> {
+    Ok(tx.query(sql, params).await.map_err(Error::internal)?.into_iter().map(|r| r.get(0)).collect())
+}
+
+async fn workspace_manifest_blob_digests(
+    store: &RemoteObjectStore,
+    tenant_id: Uuid,
+    manifest_digest: &str,
+    stage_dir: &Path,
+    deadline: Instant,
+) -> Vec<String> {
+    let Ok(key) = ObjectKey::new(tenant_id, "workspace", manifest_digest) else {
+        return Vec::new();
+    };
+    let Ok(Some(head)) = store.head(&key, deadline).await else {
+        return Vec::new();
+    };
+    let tmp = stage_dir.join(format!("ws-manifest-{}.json", Uuid::new_v4()));
+    if store.get_to_file(&key, &tmp, head.size, deadline).await.is_err() {
+        let _ = fs::remove_file(&tmp).await;
+        return Vec::new();
+    }
+    let parsed = fs::read(&tmp).await.ok().and_then(|bytes| serde_json::from_slice::<RemoteManifest>(&bytes).ok());
+    let _ = fs::remove_file(&tmp).await;
+    parsed
+        .map(|m| m.entries.into_iter().filter(|e| e.kind == "file" && !e.sha256.is_empty()).map(|e| e.sha256).collect())
+        .unwrap_or_default()
+}
+
+pub(super) async fn gather_remote_inventory(
+    state: &AppState,
+    tx: &Transaction<'_>,
+    repo_id: Uuid,
+    owner_id: Uuid,
+    ws_store: Option<&RemoteObjectStore>,
+    deadline: Instant,
+) -> Result<(Vec<String>, BTreeSet<String>, Vec<String>, BTreeSet<String>, Vec<PandoArtifactCandidate>), Error> {
+    let repo_lfs_oids = collect_strings(
+        tx,
+        "SELECT oid FROM lfs_objects WHERE repository_id = $1 AND tenant_id = $2",
+        &[&repo_id, &owner_id],
+    )
+    .await?;
+    let shared_lfs_oids: BTreeSet<String> = collect_strings(
+        tx,
+        "SELECT DISTINCT oid FROM lfs_objects WHERE tenant_id = $1 AND repository_id <> $2",
+        &[&owner_id, &repo_id],
+    )
+    .await?
+    .into_iter()
+    .collect();
+    let repo_manifests = collect_strings(
+        tx,
+        "SELECT DISTINCT manifest_digest FROM workspace_checkpoints WHERE repository_id = $1 AND manifest_digest IS NOT NULL",
+        &[&repo_id],
+    )
+    .await?;
+    let repo_staged = collect_strings(
+        tx,
+        "SELECT DISTINCT s.digest FROM workspace_remote_staging_objects s JOIN workspace_checkpoints c ON c.id = s.checkpoint_id WHERE c.repository_id = $1 AND s.tenant_id = $2",
+        &[&repo_id, &owner_id],
+    )
+    .await?;
+    let other_manifests = collect_strings(
+        tx,
+        "SELECT DISTINCT c.manifest_digest FROM workspace_checkpoints c JOIN repositories r ON r.id = c.repository_id WHERE r.owner_id = $1 AND c.repository_id <> $2 AND c.manifest_digest IS NOT NULL",
+        &[&owner_id, &repo_id],
+    )
+    .await?;
+    let other_staged = collect_strings(
+        tx,
+        "SELECT DISTINCT s.digest FROM workspace_remote_staging_objects s JOIN workspace_checkpoints c ON c.id = s.checkpoint_id WHERE s.tenant_id = $1 AND c.repository_id <> $2",
+        &[&owner_id, &repo_id],
+    )
+    .await?;
+
+    let mut repo_ws_digests = repo_manifests.clone();
+    repo_ws_digests.extend(repo_staged);
+    let mut shared_ws_digests: BTreeSet<String> = other_manifests.iter().cloned().collect();
+    shared_ws_digests.extend(other_staged);
+
+    if let Some(store) = ws_store {
+        let stage_dir = state.storage.root.join("tmp");
+        let _ = fs::create_dir_all(&stage_dir).await;
+        for m in &repo_manifests {
+            repo_ws_digests.extend(workspace_manifest_blob_digests(store, owner_id, m, &stage_dir, deadline).await);
+        }
+        for m in &other_manifests {
+            shared_ws_digests.extend(workspace_manifest_blob_digests(store, owner_id, m, &stage_dir, deadline).await);
+        }
+    }
+
+    let pando_rows = tx
+        .query(
+            "SELECT DISTINCT a.authority_id, a.tenant_id, a.namespace, a.sha256, a.object_generation, a.remote_path, \
+                    EXISTS (SELECT 1 FROM pando_manifest_artifacts other \
+                            WHERE other.authority_id = a.authority_id AND other.tenant_id = a.tenant_id \
+                              AND other.namespace = a.namespace AND other.sha256 = a.sha256 \
+                              AND other.repository_id <> $1) \
+             FROM pando_manifest_artifacts m \
+             JOIN pando_remote_artifacts a ON a.authority_id = m.authority_id AND a.tenant_id = m.tenant_id \
+              AND a.namespace = m.namespace AND a.sha256 = m.sha256 \
+             WHERE m.repository_id = $1",
+            &[&repo_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+
+    let scoped_prefix = format!("tenants/{owner_id}/authorities/");
+    let pando_candidates = pando_rows
+        .into_iter()
+        .map(|row| {
+            let tenant_id: Uuid = row.get(1);
+            let remote_path: String = row.get(5);
+            let shared_elsewhere: bool = row.get(6);
+            PandoArtifactCandidate {
+                authority_id: row.get(0),
+                tenant_id,
+                namespace: row.get(2),
+                sha256: row.get(3),
+                object_generation: row.get(4),
+                authority_scoped_unshared: !shared_elsewhere
+                    && tenant_id == owner_id
+                    && remote_path.starts_with(&scoped_prefix),
+                remote_path,
+            }
+        })
+        .collect();
+
+    Ok((repo_lfs_oids, shared_lfs_oids, repo_ws_digests, shared_ws_digests, pando_candidates))
+}
+
+/// Delete claimed unshared LFS and workspace remote object keys while proving
+/// each key's lease generation is still valid before `store.delete`, then clear `deleting`.
+pub async fn execute_claimed_remote_deletes(
+    pool: &Pool,
+    tenant_id: Uuid,
+    lfs_store: Option<&RemoteObjectStore>,
+    workspace_store: Option<&RemoteObjectStore>,
+    plan: &RemoteDeletePlan,
+    preserved_shared_lfs_oids: &BTreeSet<String>,
+    preserved_shared_workspace_digests: &BTreeSet<String>,
+    claims: &[DeleteClaim],
+    deadline: Instant,
+) -> Result<(usize, usize)> {
+    let claim_map: std::collections::BTreeMap<(&str, &str), &DeleteClaim> =
+        claims.iter().map(|c| ((c.namespace.as_str(), c.digest.as_str()), c)).collect();
+    let mut deleted_lfs = 0usize;
+    if let Some(store) = lfs_store {
+        for key_path in &plan.deletable_lfs_keys {
+            let oid = key_path.rsplit('/').next().unwrap_or_default();
+            ensure!(!preserved_shared_lfs_oids.contains(oid), "refusing to delete shared LFS object {oid}");
+            let Some(claim) = claim_map.get(&("lfs", oid)).copied() else {
+                bail!("missing delete claim for LFS object {oid}");
+            };
+            if !verify_claim_lease(pool, claim).await.map_err(|e| anyhow::anyhow!(e.1))? {
+                bail!("LFS delete claim lease expired or superseded for {oid}");
+            }
+            let key = ObjectKey::new(tenant_id, "lfs", oid)?;
+            ensure!(key.path() == *key_path, "LFS delete key path mismatch: {key_path}");
+            store.delete(&key, deadline).await?;
+            finish_claim(pool, claim).await.map_err(|e| anyhow::anyhow!(e.1))?;
+            deleted_lfs += 1;
+        }
+    }
+    let mut deleted_workspace = 0usize;
+    if let Some(store) = workspace_store {
+        for key_path in &plan.deletable_workspace_keys {
+            let digest = key_path.rsplit('/').next().unwrap_or_default();
+            ensure!(
+                !preserved_shared_workspace_digests.contains(digest),
+                "refusing to delete shared workspace object {digest}"
+            );
+            let Some(claim) = claim_map.get(&("workspace", digest)).copied() else {
+                bail!("missing delete claim for workspace object {digest}");
+            };
+            if !verify_claim_lease(pool, claim).await.map_err(|e| anyhow::anyhow!(e.1))? {
+                bail!("workspace delete claim lease expired or superseded for {digest}");
+            }
+            let key = ObjectKey::new(tenant_id, "workspace", digest)?;
+            ensure!(key.path() == *key_path, "workspace delete key path mismatch: {key_path}");
+            store.delete(&key, deadline).await?;
+            finish_claim(pool, claim).await.map_err(|e| anyhow::anyhow!(e.1))?;
+            deleted_workspace += 1;
+        }
+    }
+    Ok((deleted_lfs, deleted_workspace))
+}
 
 /// Delete only the strictly unshared LFS and workspace remote object keys
 /// returned by [`super::purge_safety::plan_safe_remote_cleanup`]. Never deletes

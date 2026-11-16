@@ -360,6 +360,13 @@ pub async fn rename(
         return Err(Error(StatusCode::CONFLICT, "target repository name or alias is already taken"));
     }
 
+    let map_name_conflict = |err: tokio_postgres::Error| {
+        if err.as_db_error().is_some_and(|db| *db.code() == tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+            Error(StatusCode::CONFLICT, "target repository name or alias is already taken")
+        } else {
+            Error::internal(err)
+        }
+    };
     tx.execute(
         "DELETE FROM repository_aliases WHERE alias_owner_id = $1 AND alias_name = $2 AND repository_id = $3",
         &[&locked.owner_id, &input.new_name, &locked.id],
@@ -371,7 +378,7 @@ pub async fn rename(
         &[&locked.id, &input.new_name],
     )
     .await
-    .map_err(Error::internal)?;
+    .map_err(map_name_conflict)?;
     tx.execute("UPDATE workspaces SET repository_name = $2 WHERE repository_id = $1", &[&locked.id, &input.new_name])
         .await
         .map_err(Error::internal)?;
@@ -391,11 +398,11 @@ pub async fn rename(
     let alias_id = Uuid::new_v4();
     tx.execute(
         "INSERT INTO repository_aliases (id, alias_owner_id, alias_name, repository_id, created_by, reason) \
-         VALUES ($1, $2, $3, $4, $5, 'rename') ON CONFLICT (alias_owner_id, alias_name) DO NOTHING",
+         VALUES ($1, $2, $3, $4, $5, 'rename')",
         &[&alias_id, &locked.owner_id, &locked.name, &locked.id, &actor.id],
     )
     .await
-    .map_err(Error::internal)?;
+    .map_err(map_name_conflict)?;
 
     crate::members::audit::record_audit_event(
         &tx,

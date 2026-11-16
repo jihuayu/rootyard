@@ -3,8 +3,9 @@ use super::{
     lifecycle::{check_cas_version, request_sha256},
     lifecycle_ops::{decide_idempotent_cas, json_no_store, require_idempotency_key_valid},
     transfer_exec::{NamespaceKind, check_target_namespace_authority, http_status_for_transfer_phase},
+    transfer_lease::{load_record, record_to_view, renew_transfer_lease},
     transfer_model::{TransferInput, TransferPhase, TransferStatusView, validate_transfer_input},
-    transfer_phases::{load_record, phase_drain, phase_rekey_db, phase_revoke_legacy, phase_rollback, record_to_view},
+    transfer_phases::{phase_drain, phase_rekey_db, phase_revoke_legacy, phase_rollback},
     transfer_remote::copy_repository_remote_objects,
 };
 use crate::{AppState, Error, auth, db::Identity, members::models::Role, token_scopes::RepoAction};
@@ -20,7 +21,7 @@ use std::{
 use tokio::time::Instant;
 use uuid::Uuid;
 
-pub use super::transfer_phases::load_transfer_status;
+pub use super::transfer_lease::load_transfer_status;
 
 static PROCESS_LEASE_ID: OnceLock<String> = OnceLock::new();
 
@@ -45,7 +46,7 @@ async fn prepare_transfer(
     idem_key: Option<&str>,
     req_hash: &str,
     input: &TransferInput,
-) -> Result<Result<Uuid, (StatusCode, Value)>, Error> {
+) -> Result<Result<(Uuid, String, i64), (StatusCode, Value)>, Error> {
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
 
@@ -156,12 +157,14 @@ async fn prepare_transfer(
     }
 
     let transfer_id = Uuid::new_v4();
-    let lease_owner = process_lease_id();
+    let lease_owner = process_lease_id().to_owned();
+    let lease_epoch: i64 = 1;
     tx.execute(
         "INSERT INTO repository_transfers \
          (id, repository_id, from_owner_id, to_owner_id, from_name, to_name, initiated_by, \
-          revoke_collaborators, keep_alias, expected_version, state, lease_owner, lease_until) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, 'draining', $10, clock_timestamp() + interval '60 seconds')",
+          revoke_collaborators, keep_alias, expected_version, state, lease_owner, lease_until, lease_epoch) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, 'draining', $10, \
+                 clock_timestamp() + interval '60 seconds', $11)",
         &[
             &transfer_id,
             &repo_id,
@@ -173,10 +176,17 @@ async fn prepare_transfer(
             &revoke_collaborators,
             &expected_version,
             &lease_owner,
+            &lease_epoch,
         ],
     )
     .await
-    .map_err(Error::internal)?;
+    .map_err(|err| {
+        if err.as_db_error().is_some_and(|db| *db.code() == tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+            Error(StatusCode::CONFLICT, "target repository path, alias, or active transfer already exists")
+        } else {
+            Error::internal(err)
+        }
+    })?;
 
     crate::members::audit::record_audit_event(
         &tx,
@@ -191,36 +201,74 @@ async fn prepare_transfer(
     .await?;
 
     auth::finish_tx(tx, actor, true).await?;
-    Ok(Ok(transfer_id))
+    Ok(Ok((transfer_id, lease_owner, lease_epoch)))
 }
 
-async fn drive_transfer(state: &AppState, transfer_id: Uuid) -> anyhow::Result<TransferStatusView> {
+async fn drive_transfer(
+    state: &AppState,
+    transfer_id: Uuid,
+    initial_lease: Option<(String, i64)>,
+) -> anyhow::Result<TransferStatusView> {
     let deadline = Instant::now() + Duration::from_secs(60);
-    let lease_owner = process_lease_id();
+    let (lease_owner, lease_epoch) = if let Some(lease) = initial_lease {
+        lease
+    } else {
+        let candidate = process_lease_id().to_owned();
+        let mut client = state.pool.get().await?;
+        let tx = client.transaction().await?;
+        let claimed = tx
+            .query_opt(
+                "UPDATE repository_transfers \
+                 SET lease_owner = $2, lease_epoch = lease_epoch + 1, \
+                     lease_until = clock_timestamp() + interval '60 seconds', updated_at = clock_timestamp() \
+                 WHERE id = $1 AND state NOT IN ('completed', 'rolled_back', 'failed') \
+                   AND (lease_owner IS NULL OR lease_until IS NULL OR lease_until <= clock_timestamp()) \
+                 RETURNING lease_epoch",
+                &[&transfer_id, &candidate],
+            )
+            .await?;
+        if let Some(row) = claimed {
+            let epoch: i64 = row.get(0);
+            tx.commit().await?;
+            (candidate, epoch)
+        } else {
+            let r = load_record(&tx, transfer_id).await?;
+            tx.commit().await?;
+            let version = current_repo_version(&state.pool, r.repository_id).await?;
+            return Ok(record_to_view(&r, version));
+        }
+    };
+
     loop {
         let rec = {
             let mut client = state.pool.get().await?;
             let tx = client.transaction().await?;
-            let _ = tx
-                .execute(
-                    "UPDATE repository_transfers SET lease_owner = $2, lease_until = clock_timestamp() + interval '60 seconds' WHERE id = $1",
-                    &[&transfer_id, &lease_owner],
-                )
-                .await?;
             let r = load_record(&tx, transfer_id).await?;
             tx.commit().await?;
             r
         };
+        if rec.phase.is_terminal() {
+            let version = current_repo_version(&state.pool, rec.repository_id).await?;
+            return Ok(record_to_view(&rec, version));
+        }
+        anyhow::ensure!(
+            rec.lease_owner.as_deref() == Some(lease_owner.as_str()) && rec.lease_epoch == lease_epoch,
+            "transfer lease lost"
+        );
+        renew_transfer_lease(&state.pool, transfer_id, &lease_owner, lease_epoch).await?;
+
         match rec.phase {
             TransferPhase::Preparing | TransferPhase::Draining => {
                 if let Err(err) = phase_drain(state, &rec, deadline).await {
-                    phase_rollback(state, &rec, &format!("{err:#}"), deadline).await?;
+                    let _ = phase_rollback(state, &rec, &format!("{err:#}"), deadline).await?;
                 }
             }
             TransferPhase::CopyingRemote => {
                 match copy_repository_remote_objects(
                     state,
                     rec.id,
+                    &lease_owner,
+                    lease_epoch,
                     rec.repository_id,
                     rec.from_owner_id,
                     rec.to_owner_id,
@@ -230,9 +278,20 @@ async fn drive_transfer(state: &AppState, transfer_id: Uuid) -> anyhow::Result<T
                 {
                     Ok(_) => {
                         let client = state.pool.get().await?;
-                        client
-                            .execute("UPDATE repository_transfers SET state = 'rekeying_db', updated_at = clock_timestamp() WHERE id = $1", &[&rec.id])
+                        let changed = client
+                            .execute(
+                                "UPDATE repository_transfers \
+                                 SET state = 'rekeying_db', lease_until = clock_timestamp() + interval '60 seconds', \
+                                     updated_at = clock_timestamp() \
+                                 WHERE id = $1 AND state = 'copying_remote' \
+                                   AND lease_owner = $2 AND lease_epoch = $3",
+                                &[&rec.id, &lease_owner, &lease_epoch],
+                            )
                             .await?;
+                        anyhow::ensure!(
+                            changed == 1,
+                            "transfer lease lost transitioning copying_remote -> rekeying_db"
+                        );
                     }
                     Err(err) => {
                         let fresh = {
@@ -242,7 +301,7 @@ async fn drive_transfer(state: &AppState, transfer_id: Uuid) -> anyhow::Result<T
                             tx.commit().await?;
                             r
                         };
-                        phase_rollback(state, &fresh, &format!("{err:#}"), deadline).await?;
+                        let _ = phase_rollback(state, &fresh, &format!("{err:#}"), deadline).await?;
                     }
                 }
             }
@@ -255,19 +314,27 @@ async fn drive_transfer(state: &AppState, transfer_id: Uuid) -> anyhow::Result<T
                     .await?
                     .get(0);
                 if current_owner == rec.to_owner_id {
-                    state
+                    let changed = state
                         .pool
                         .get()
                         .await?
-                        .execute("UPDATE repository_transfers SET state = 'revoking_legacy', updated_at = clock_timestamp() WHERE id = $1", &[&rec.id])
+                        .execute(
+                            "UPDATE repository_transfers \
+                             SET state = 'revoking_legacy', lease_until = clock_timestamp() + interval '60 seconds', \
+                                 updated_at = clock_timestamp() \
+                             WHERE id = $1 AND state = 'rekeying_db' AND lease_owner = $2 AND lease_epoch = $3",
+                            &[&rec.id, &lease_owner, &lease_epoch],
+                        )
                         .await?;
+                    anyhow::ensure!(changed == 1, "transfer lease lost advancing committed rekeying_db");
                 } else if let Err(err) = phase_rekey_db(state, &rec, deadline).await {
-                    phase_rollback(state, &rec, &format!("{err:#}"), deadline).await?;
+                    let _ = phase_rollback(state, &rec, &format!("{err:#}"), deadline).await?;
                 }
             }
             TransferPhase::RevokingLegacy => phase_revoke_legacy(state, &rec).await?,
             TransferPhase::RollingBack => {
-                phase_rollback(state, &rec, rec.last_error.as_deref().unwrap_or("recovery rollback"), deadline).await?;
+                let _ = phase_rollback(state, &rec, rec.last_error.as_deref().unwrap_or("recovery rollback"), deadline)
+                    .await?;
             }
             TransferPhase::Completed | TransferPhase::RolledBack | TransferPhase::Failed => {
                 let version = current_repo_version(&state.pool, rec.repository_id).await?;
@@ -288,13 +355,13 @@ pub async fn start_or_drive_transfer(
     let idem_key = require_idempotency_key_valid(&headers)?;
     let req_hash = request_sha256(&input)?;
 
-    let transfer_id = match prepare_transfer(state, &actor, owner, name, idem_key.as_deref(), &req_hash, &input).await?
-    {
-        Ok(id) => id,
-        Err((status, body)) => return json_no_store(status, &body),
-    };
+    let (transfer_id, lease_owner, lease_epoch) =
+        match prepare_transfer(state, &actor, owner, name, idem_key.as_deref(), &req_hash, &input).await? {
+            Ok(claimed) => claimed,
+            Err((status, body)) => return json_no_store(status, &body),
+        };
 
-    let view = drive_transfer(state, transfer_id).await.map_err(Error::internal)?;
+    let view = drive_transfer(state, transfer_id, Some((lease_owner, lease_epoch))).await.map_err(Error::internal)?;
     let status = http_status_for_transfer_phase(view.state);
     if status.is_success()
         && let Some(key) = idem_key
@@ -314,24 +381,27 @@ pub async fn start_or_drive_transfer(
 }
 
 pub async fn recover_transfers(state: &AppState) -> anyhow::Result<usize> {
-    let lease_owner = process_lease_id();
+    let lease_owner = process_lease_id().to_owned();
     let client = state.pool.get().await?;
     let rows = client
         .query(
-            "UPDATE repository_transfers SET lease_owner = $1, lease_until = clock_timestamp() + interval '60 seconds' \
+            "UPDATE repository_transfers \
+             SET lease_owner = $1, lease_epoch = lease_epoch + 1, \
+                 lease_until = clock_timestamp() + interval '60 seconds', updated_at = clock_timestamp() \
              WHERE id IN ( \
                  SELECT id FROM repository_transfers \
                  WHERE state NOT IN ('completed', 'rolled_back', 'failed') \
-                   AND (lease_owner IS DISTINCT FROM $1 OR lease_until IS NULL OR lease_until < clock_timestamp()) \
+                   AND (lease_owner IS NULL OR lease_until IS NULL OR lease_until <= clock_timestamp()) \
                  ORDER BY created_at ASC LIMIT 32 FOR UPDATE SKIP LOCKED \
-             ) RETURNING id",
+             ) RETURNING id, lease_epoch",
             &[&lease_owner],
         )
         .await?;
     let mut processed = 0usize;
     for row in rows {
         let id: Uuid = row.get(0);
-        drive_transfer(state, id).await?;
+        let epoch: i64 = row.get(1);
+        drive_transfer(state, id, Some((lease_owner.clone(), epoch))).await?;
         processed += 1;
     }
     Ok(processed)

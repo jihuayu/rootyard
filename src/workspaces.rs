@@ -28,6 +28,8 @@ pub mod mounts;
 pub(crate) mod remote;
 #[path = "workspaces/remote_gc.rs"]
 mod remote_gc;
+#[path = "workspaces/remote_publish_guard.rs"]
+mod remote_publish_guard;
 #[path = "workspaces/scan.rs"]
 mod scan;
 #[path = "workspaces/service.rs"]

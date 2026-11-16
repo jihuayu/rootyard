@@ -1,7 +1,7 @@
 //! Authenticated, tenant-scoped remote checkpoint closure and recovery.
-use super::service;
+use super::{remote_publish_guard, service};
 use crate::{
-    AppState, Error,
+    AppState, Error, auth,
     members::models::Role,
     storage::remote_objects::{ObjectKey, RemoteObjectStore},
     workspace_lab::core,
@@ -157,31 +157,17 @@ pub(super) async fn load_manifest(
     Ok(manifest)
 }
 
-async fn stage_key(state: &AppState, cp: Uuid, tenant: Uuid, digest: &str, size: u64, kind: &str) -> Result<(), Error> {
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    super::remote_gc::lock_key(&tx, tenant, digest).await?;
-    tx.execute(
-        "INSERT INTO workspace_remote_staging_objects(checkpoint_id,tenant_id,digest,size,kind) VALUES($1,$2,$3,$4,$5) \
-         ON CONFLICT(checkpoint_id,digest) DO NOTHING",
-        &[&cp, &tenant, &digest, &(size as i64), &kind],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.commit().await.map_err(Error::internal)?;
-    Ok(())
-}
-
 pub async fn publish(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(cp): Path<Uuid>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
     let row = {
         let client = state.pool.get().await.map_err(Error::internal)?;
         client
             .query_opt(
-                "SELECT c.workspace_id,c.repository_id,c.state,c.lease_epoch,c.captured_revision,c.manifest_digest,c.manifest_size,r.owner_id \
+                "SELECT c.workspace_id,c.repository_id,c.state,c.lease_epoch,c.captured_revision,c.manifest_digest,c.manifest_size,r.owner_id,r.storage_generation \
                  FROM workspace_checkpoints c JOIN repositories r ON r.id=c.repository_id WHERE c.id=$1",
                 &[&cp],
             )
@@ -197,6 +183,7 @@ pub async fn publish(
     let digest: Option<String> = row.get(5);
     let size: Option<i64> = row.get(6);
     let tenant: Uuid = row.get(7);
+    let storage_generation: i64 = row.get(8);
     let ws =
         service::authorized(&state, &headers, ws_id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite)
             .await?;
@@ -229,6 +216,9 @@ pub async fn publish(
         return Err(service::conflict());
     }
 
+    let admission =
+        crate::storage::admission::acquire(&state.pool, repo_id, storage_generation, "workspace_publish", deadline())
+            .await?;
     let store = remote_store(&state)?;
     let root = service::checkpoint_repo(&state, cp);
     let root_inv = root.clone();
@@ -253,7 +243,22 @@ pub async fn publish(
     let mut uploaded = 0usize;
     for (entry, file, target) in scanned_items {
         if entry.kind != "symlink" {
-            stage_key(&state, cp, tenant, &entry.sha256, entry.size, "file").await?;
+            remote_publish_guard::stage_key_guarded(
+                &state,
+                &store,
+                remote_publish_guard::StageKeyTarget {
+                    checkpoint_id: cp,
+                    repository_id: repo_id,
+                    tenant_id: tenant,
+                    digest: &entry.sha256,
+                    size: entry.size,
+                    kind: "file",
+                },
+                &admission,
+                deadline(),
+            )
+            .await?;
+            admission.ensure_active()?;
             store
                 .put_file(&key(tenant, &entry.sha256)?, &file, entry.size, deadline())
                 .await
@@ -286,7 +291,21 @@ pub async fn publish(
     bounded_manifest(&raw)?;
     let raw_len = raw.len();
     let digest = hex::encode(Sha256::digest(&raw));
-    stage_key(&state, cp, tenant, &digest, raw_len as u64, "manifest").await?;
+    remote_publish_guard::stage_key_guarded(
+        &state,
+        &store,
+        remote_publish_guard::StageKeyTarget {
+            checkpoint_id: cp,
+            repository_id: repo_id,
+            tenant_id: tenant,
+            digest: &digest,
+            size: raw_len as u64,
+            kind: "manifest",
+        },
+        &admission,
+        deadline(),
+    )
+    .await?;
     let stage = state.storage.root.join("workspace-service/staging");
     let file = super::blocking::run(move || {
         fs::create_dir_all(&stage).map_err(Error::internal)?;
@@ -299,33 +318,23 @@ pub async fn publish(
     })
     .await?;
     let temp_guard = super::cleanup::FileCleanupGuard::new(file.clone());
+    admission.ensure_active()?;
     let upload = store.put_file(&key(tenant, &digest)?, &file, raw_len as u64, deadline()).await;
     temp_guard.cleanup().await;
     upload.map_err(Error::internal)?;
 
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let changed = tx
-        .execute(
-            "UPDATE workspace_checkpoints c SET state='committed',manifest_digest=$2,manifest_size=$3,committed_at=clock_timestamp() \
-             FROM workspaces w WHERE c.id=$1 AND c.workspace_id=w.id AND c.state='local_complete' \
-             AND c.lease_epoch=w.lease_epoch AND w.host_id=$4 AND w.lease_until>clock_timestamp()",
-            &[&cp, &digest, &(raw_len as i64), &state.storage.volume_id],
-        )
-        .await
-        .map_err(Error::internal)?;
-    if changed != 1 {
-        let row = tx
-            .query_opt("SELECT state,manifest_digest,manifest_size FROM workspace_checkpoints WHERE id=$1", &[&cp])
-            .await
-            .map_err(Error::internal)?
-            .ok_or_else(Error::not_found)?;
-        if row.get::<_, String>(0) != "committed" || row.get::<_, Option<String>>(1).as_deref() != Some(&digest) {
-            return Err(service::conflict());
-        }
-    }
-    tx.commit().await.map_err(Error::internal)?;
-    drop(client);
+    remote_publish_guard::commit_checkpoint_guarded(
+        &state,
+        cp,
+        repo_id,
+        tenant,
+        &actor,
+        &digest,
+        raw_len as i64,
+        &admission,
+    )
+    .await?;
+    admission.finish().await;
     if std::env::var("ROOTYARD_WORKSPACE_REMOTE_KILL_AFTER_COMMIT").as_deref() == Ok("1") {
         std::process::exit(78);
     }

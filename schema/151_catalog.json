@@ -13469,6 +13469,83 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 1,
+      "table": "remote_object_delete_claims",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "namespace",
+      "not_null": true,
+      "position": 2,
+      "table": "remote_object_delete_claims",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "digest",
+      "not_null": true,
+      "position": 3,
+      "table": "remote_object_delete_claims",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "1",
+      "generated": "",
+      "identity": "",
+      "name": "claim_generation",
+      "not_null": true,
+      "position": 4,
+      "table": "remote_object_delete_claims",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "true",
+      "generated": "",
+      "identity": "",
+      "name": "deleting",
+      "not_null": true,
+      "position": 5,
+      "table": "remote_object_delete_claims",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "lease_until",
+      "not_null": true,
+      "position": 6,
+      "table": "remote_object_delete_claims",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "claimed_at",
+      "not_null": true,
+      "position": 7,
+      "table": "remote_object_delete_claims",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "id",
       "not_null": true,
       "position": 1,
@@ -14184,6 +14261,50 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "namespace_id",
+      "not_null": true,
+      "position": 1,
+      "table": "repository_name_reservations",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "name",
+      "not_null": true,
+      "position": 2,
+      "table": "repository_name_reservations",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 3,
+      "table": "repository_name_reservations",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "kind",
+      "not_null": true,
+      "position": 4,
+      "table": "repository_name_reservations",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "repository_id",
       "not_null": true,
       "position": 1,
@@ -14830,12 +14951,23 @@
     },
     {
       "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "lease_epoch",
+      "not_null": true,
+      "position": 16,
+      "table": "repository_transfers",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
       "default": "clock_timestamp()",
       "generated": "",
       "identity": "",
       "name": "created_at",
       "not_null": true,
-      "position": 16,
+      "position": 17,
       "table": "repository_transfers",
       "type": "timestamp with time zone"
     },
@@ -14846,7 +14978,7 @@
       "identity": "",
       "name": "updated_at",
       "not_null": true,
-      "position": 17,
+      "position": 18,
       "table": "repository_transfers",
       "type": "timestamp with time zone"
     },
@@ -14857,7 +14989,7 @@
       "identity": "",
       "name": "completed_at",
       "not_null": false,
-      "position": 18,
+      "position": 19,
       "table": "repository_transfers",
       "type": "timestamp with time zone"
     },
@@ -26238,6 +26370,51 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK ((claim_generation > 0))",
+      "name": "remote_object_delete_claims_claim_generation_check",
+      "table": "remote_object_delete_claims",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((digest ~ '^[0-9a-f]{64}$'::text))",
+      "name": "remote_object_delete_claims_digest_check",
+      "table": "remote_object_delete_claims",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((namespace = ANY (ARRAY['lfs'::text, 'workspace'::text])))",
+      "name": "remote_object_delete_claims_namespace_check",
+      "table": "remote_object_delete_claims",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (tenant_id, namespace, digest)",
+      "name": "remote_object_delete_claims_pkey",
+      "table": "remote_object_delete_claims",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (tenant_id) REFERENCES public.namespaces(id) ON DELETE CASCADE",
+      "name": "remote_object_delete_claims_tenant_id_fkey",
+      "table": "remote_object_delete_claims",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "FOREIGN KEY (archived_by) REFERENCES public.users(id) ON DELETE SET NULL",
       "name": "repositories_archived_by_fkey",
       "table": "repositories",
@@ -26679,6 +26856,42 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK ((kind = ANY (ARRAY['repository'::text, 'alias'::text])))",
+      "name": "repository_name_reservations_kind_check",
+      "table": "repository_name_reservations",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (namespace_id) REFERENCES public.namespaces(id) ON DELETE CASCADE",
+      "name": "repository_name_reservations_namespace_id_fkey",
+      "table": "repository_name_reservations",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (namespace_id, name)",
+      "name": "repository_name_reservations_pkey",
+      "table": "repository_name_reservations",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.repositories(id) ON DELETE CASCADE",
+      "name": "repository_name_reservations_repository_id_fkey",
+      "table": "repository_name_reservations",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "CHECK ((((source_kind = 'push_receipt'::text) AND (event_id IS NOT NULL) AND (resolution_id IS NULL)) OR ((source_kind = 'recovery_snapshot'::text) AND (event_id IS NULL) AND (resolution_id IS NOT NULL))))",
       "name": "projection_source",
       "table": "repository_ref_projection",
@@ -27034,6 +27247,15 @@
       "name": "repository_transfers_initiated_by_fkey",
       "table": "repository_transfers",
       "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((lease_epoch >= 0))",
+      "name": "repository_transfers_lease_epoch_check",
+      "table": "repository_transfers",
+      "type": "c",
       "validated": true
     },
     {
@@ -28615,7 +28837,7 @@
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\nBEGIN\n    IF TG_TABLE_NAME = 'repository_aliases' THEN\n        IF EXISTS (\n            SELECT 1 FROM repositories r\n            WHERE r.owner_id = NEW.alias_owner_id AND r.name = NEW.alias_name\n        ) THEN\n            RAISE EXCEPTION 'alias path collides with active or deleted repository' USING ERRCODE = '23505';\n        END IF;\n        RETURN NEW;\n    END IF;\n\n    IF TG_TABLE_NAME = 'repositories' THEN\n        IF EXISTS (\n            SELECT 1 FROM repository_aliases a\n            WHERE a.alias_owner_id = NEW.owner_id\n              AND a.alias_name = NEW.name\n              AND a.repository_id <> NEW.id\n        ) THEN\n            RAISE EXCEPTION 'repository path is reserved by an existing alias' USING ERRCODE = '23505';\n        END IF;\n        DELETE FROM repository_aliases\n        WHERE alias_owner_id = NEW.owner_id\n          AND alias_name = NEW.name\n          AND repository_id = NEW.id;\n        RETURN NEW;\n    END IF;\n\n    RETURN NEW;\nEND\n",
+      "source": "\nBEGIN\n    IF TG_TABLE_NAME = 'repository_aliases' THEN\n        IF EXISTS (\n            SELECT 1 FROM repositories r\n            WHERE r.owner_id = NEW.alias_owner_id AND r.name = NEW.alias_name\n        ) THEN\n            RAISE EXCEPTION 'alias path collides with active or deleted repository' USING ERRCODE = '23505';\n        END IF;\n        RETURN NEW;\n    END IF;\n\n    IF TG_TABLE_NAME = 'repositories' THEN\n        IF EXISTS (\n            SELECT 1 FROM repository_aliases a\n            WHERE a.alias_owner_id = NEW.owner_id\n              AND a.alias_name = NEW.name\n              AND a.repository_id <> NEW.id\n        ) THEN\n            RAISE EXCEPTION 'repository path is reserved by an existing alias' USING ERRCODE = '23505';\n        END IF;\n        DELETE FROM repository_aliases\n        WHERE alias_owner_id = NEW.owner_id\n          AND alias_name = NEW.name\n          AND repository_id = NEW.id;\n        DELETE FROM repository_name_reservations\n        WHERE namespace_id = NEW.owner_id\n          AND name = NEW.name\n          AND repository_id = NEW.id\n          AND kind = 'alias';\n        RETURN NEW;\n    END IF;\n\n    RETURN NEW;\nEND\n",
       "strict": false,
       "volatility": "v"
     },
@@ -29589,6 +29811,40 @@
       "rows": 0,
       "security_definer": true,
       "source": "\nDECLARE generation bigint;\nBEGIN\n    IF NOT has_table_privilege(session_user, format('%I.event_deliveries', app_schema), 'UPDATE') THEN\n        RAISE EXCEPTION 'repository delivery lock requires event delivery role'\n            USING ERRCODE = '42501';\n    END IF;\n    EXECUTE format('SELECT storage_generation FROM %I.repositories WHERE id=$1 FOR SHARE', app_schema)\n        INTO STRICT generation USING repo_uuid;\n    RETURN generation;\nEND;\n",
+      "strict": false,
+      "volatility": "v"
+    },
+    {
+      "arguments": "",
+      "binary": null,
+      "config": null,
+      "cost": 100,
+      "kind": "f",
+      "language": "plpgsql",
+      "leakproof": false,
+      "name": "sync_repository_name_reservation_alias",
+      "parallel": "u",
+      "result": "trigger",
+      "rows": 0,
+      "security_definer": false,
+      "source": "\nBEGIN\n    IF TG_OP = 'DELETE' THEN\n        DELETE FROM repository_name_reservations\n        WHERE namespace_id = OLD.alias_owner_id\n          AND name = OLD.alias_name\n          AND repository_id = OLD.repository_id\n          AND kind = 'alias';\n        RETURN OLD;\n    END IF;\n    IF TG_OP = 'UPDATE' THEN\n        IF OLD.alias_owner_id = NEW.alias_owner_id\n           AND OLD.alias_name = NEW.alias_name\n           AND OLD.repository_id = NEW.repository_id\n        THEN\n            RETURN NEW;\n        END IF;\n        DELETE FROM repository_name_reservations\n        WHERE namespace_id = OLD.alias_owner_id\n          AND name = OLD.alias_name\n          AND repository_id = OLD.repository_id\n          AND kind = 'alias';\n    END IF;\n    INSERT INTO repository_name_reservations (namespace_id, name, repository_id, kind)\n    VALUES (NEW.alias_owner_id, NEW.alias_name, NEW.repository_id, 'alias');\n    RETURN NEW;\nEND\n",
+      "strict": false,
+      "volatility": "v"
+    },
+    {
+      "arguments": "",
+      "binary": null,
+      "config": null,
+      "cost": 100,
+      "kind": "f",
+      "language": "plpgsql",
+      "leakproof": false,
+      "name": "sync_repository_name_reservation_repo",
+      "parallel": "u",
+      "result": "trigger",
+      "rows": 0,
+      "security_definer": false,
+      "source": "\nBEGIN\n    IF TG_OP = 'UPDATE' THEN\n        IF OLD.owner_id = NEW.owner_id AND OLD.name = NEW.name THEN\n            RETURN NEW;\n        END IF;\n        DELETE FROM repository_name_reservations\n        WHERE namespace_id = OLD.owner_id\n          AND name = OLD.name\n          AND repository_id = OLD.id\n          AND kind = 'repository';\n    END IF;\n    INSERT INTO repository_name_reservations (namespace_id, name, repository_id, kind)\n    VALUES (NEW.owner_id, NEW.name, NEW.id, 'repository');\n    RETURN NEW;\nEND\n",
       "strict": false,
       "volatility": "v"
     }
@@ -31791,6 +32047,24 @@
       "valid": true
     },
     {
+      "definition": "CREATE INDEX remote_object_delete_claims_active_lease_idx ON public.remote_object_delete_claims USING btree (deleting, lease_until) WHERE deleting",
+      "live": true,
+      "name": "remote_object_delete_claims_active_lease_idx",
+      "ready": true,
+      "table": "remote_object_delete_claims",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX remote_object_delete_claims_pkey ON public.remote_object_delete_claims USING btree (tenant_id, namespace, digest)",
+      "live": true,
+      "name": "remote_object_delete_claims_pkey",
+      "ready": true,
+      "table": "remote_object_delete_claims",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE INDEX repositories_active_owner_name_idx ON public.repositories USING btree (owner_id, name) WHERE (deleted_at IS NULL)",
       "live": true,
       "name": "repositories_active_owner_name_idx",
@@ -31958,6 +32232,24 @@
       "name": "repository_lifecycle_idempotency_pkey",
       "ready": true,
       "table": "repository_lifecycle_idempotency",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX repository_name_reservations_pkey ON public.repository_name_reservations USING btree (namespace_id, name)",
+      "live": true,
+      "name": "repository_name_reservations_pkey",
+      "ready": true,
+      "table": "repository_name_reservations",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX repository_name_reservations_repo_idx ON public.repository_name_reservations USING btree (repository_id)",
+      "live": true,
+      "name": "repository_name_reservations_repo_idx",
+      "ready": true,
+      "table": "repository_name_reservations",
       "tablespace": null,
       "valid": true
     },
@@ -33788,6 +34080,16 @@
     {
       "force_row_security": false,
       "kind": "r",
+      "name": "remote_object_delete_claims",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
       "name": "repositories",
       "options": null,
       "persistence": "p",
@@ -33839,6 +34141,16 @@
       "force_row_security": false,
       "kind": "r",
       "name": "repository_lifecycle_idempotency",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "repository_name_reservations",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",
@@ -36331,6 +36643,22 @@
       "constraint": false,
       "deferrable": false,
       "deferred": false,
+      "definition": "CREATE TRIGGER repositories_name_reservation_sync AFTER INSERT OR UPDATE OF owner_id, name ON public.repositories FOR EACH ROW EXECUTE FUNCTION public.sync_repository_name_reservation_repo()",
+      "enabled": "O",
+      "function": "sync_repository_name_reservation_repo",
+      "function_schema": "public",
+      "name": "repositories_name_reservation_sync",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "repositories",
+      "type": 21
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
       "definition": "CREATE TRIGGER repositories_pg_refstore_guard BEFORE INSERT OR DELETE OR UPDATE ON public.repositories FOR EACH ROW EXECUTE FUNCTION public.rootyard_pg_refstore_repository_guard()",
       "enabled": "O",
       "function": "rootyard_pg_refstore_repository_guard",
@@ -36372,6 +36700,22 @@
       "old_transition": null,
       "table": "repository_aliases",
       "type": 23
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER repository_aliases_name_reservation_sync AFTER INSERT OR DELETE OR UPDATE ON public.repository_aliases FOR EACH ROW EXECUTE FUNCTION public.sync_repository_name_reservation_alias()",
+      "enabled": "O",
+      "function": "sync_repository_name_reservation_alias",
+      "function_schema": "public",
+      "name": "repository_aliases_name_reservation_sync",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "repository_aliases",
+      "type": 29
     },
     {
       "argument_count": 0,

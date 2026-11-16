@@ -75,9 +75,86 @@ BEGIN
         WHERE alias_owner_id = NEW.owner_id
           AND alias_name = NEW.name
           AND repository_id = NEW.id;
+        DELETE FROM repository_name_reservations
+        WHERE namespace_id = NEW.owner_id
+          AND name = NEW.name
+          AND repository_id = NEW.id
+          AND kind = 'alias';
         RETURN NEW;
     END IF;
 
+    RETURN NEW;
+END
+$$;
+
+CREATE TABLE IF NOT EXISTS repository_name_reservations (
+    namespace_id UUID NOT NULL REFERENCES namespaces(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('repository', 'alias')),
+    PRIMARY KEY (namespace_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS repository_name_reservations_repo_idx
+    ON repository_name_reservations (repository_id);
+
+INSERT INTO repository_name_reservations (namespace_id, name, repository_id, kind)
+SELECT owner_id, name, id, 'repository' FROM repositories
+ON CONFLICT (namespace_id, name) DO NOTHING;
+
+INSERT INTO repository_name_reservations (namespace_id, name, repository_id, kind)
+SELECT alias_owner_id, alias_name, repository_id, 'alias' FROM repository_aliases
+ON CONFLICT (namespace_id, name) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION sync_repository_name_reservation_repo()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.owner_id = NEW.owner_id AND OLD.name = NEW.name THEN
+            RETURN NEW;
+        END IF;
+        DELETE FROM repository_name_reservations
+        WHERE namespace_id = OLD.owner_id
+          AND name = OLD.name
+          AND repository_id = OLD.id
+          AND kind = 'repository';
+    END IF;
+    INSERT INTO repository_name_reservations (namespace_id, name, repository_id, kind)
+    VALUES (NEW.owner_id, NEW.name, NEW.id, 'repository');
+    RETURN NEW;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION sync_repository_name_reservation_alias()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        DELETE FROM repository_name_reservations
+        WHERE namespace_id = OLD.alias_owner_id
+          AND name = OLD.alias_name
+          AND repository_id = OLD.repository_id
+          AND kind = 'alias';
+        RETURN OLD;
+    END IF;
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.alias_owner_id = NEW.alias_owner_id
+           AND OLD.alias_name = NEW.alias_name
+           AND OLD.repository_id = NEW.repository_id
+        THEN
+            RETURN NEW;
+        END IF;
+        DELETE FROM repository_name_reservations
+        WHERE namespace_id = OLD.alias_owner_id
+          AND name = OLD.alias_name
+          AND repository_id = OLD.repository_id
+          AND kind = 'alias';
+    END IF;
+    INSERT INTO repository_name_reservations (namespace_id, name, repository_id, kind)
+    VALUES (NEW.alias_owner_id, NEW.alias_name, NEW.repository_id, 'alias');
     RETURN NEW;
 END
 $$;
@@ -91,6 +168,16 @@ DROP TRIGGER IF EXISTS repositories_alias_disjoint_guard ON repositories;
 CREATE TRIGGER repositories_alias_disjoint_guard
     BEFORE INSERT OR UPDATE OF owner_id, name ON repositories
     FOR EACH ROW EXECUTE FUNCTION enforce_repository_alias_disjoint();
+
+DROP TRIGGER IF EXISTS repositories_name_reservation_sync ON repositories;
+CREATE TRIGGER repositories_name_reservation_sync
+    AFTER INSERT OR UPDATE OF owner_id, name ON repositories
+    FOR EACH ROW EXECUTE FUNCTION sync_repository_name_reservation_repo();
+
+DROP TRIGGER IF EXISTS repository_aliases_name_reservation_sync ON repository_aliases;
+CREATE TRIGGER repository_aliases_name_reservation_sync
+    AFTER INSERT OR UPDATE OR DELETE ON repository_aliases
+    FOR EACH ROW EXECUTE FUNCTION sync_repository_name_reservation_alias();
 
 CREATE TABLE IF NOT EXISTS repository_lifecycle_idempotency (
     repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
@@ -130,6 +217,7 @@ CREATE TABLE IF NOT EXISTS repository_transfers (
     last_error TEXT NULL,
     lease_owner TEXT NULL,
     lease_until TIMESTAMPTZ NULL,
+    lease_epoch BIGINT NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     completed_at TIMESTAMPTZ NULL,
@@ -144,6 +232,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS repository_transfers_one_active_idx
 CREATE INDEX IF NOT EXISTS repository_transfers_recovery_idx
     ON repository_transfers (state, updated_at)
     WHERE state NOT IN ('completed', 'rolled_back', 'failed');
+
+CREATE TABLE IF NOT EXISTS remote_object_delete_claims (
+    tenant_id UUID NOT NULL REFERENCES namespaces(id) ON DELETE CASCADE,
+    namespace TEXT NOT NULL CHECK (namespace IN ('lfs', 'workspace')),
+    digest TEXT NOT NULL CHECK (digest ~ '^[0-9a-f]{64}$'),
+    claim_generation BIGINT NOT NULL DEFAULT 1 CHECK (claim_generation > 0),
+    deleting BOOLEAN NOT NULL DEFAULT true,
+    lease_until TIMESTAMPTZ NOT NULL,
+    claimed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (tenant_id, namespace, digest)
+);
+
+CREATE INDEX IF NOT EXISTS remote_object_delete_claims_active_lease_idx
+    ON remote_object_delete_claims (deleting, lease_until)
+    WHERE deleting;
 
 -- Fix pando_retention_roots_tenant_id_fkey so organization namespaces are valid tenants.
 ALTER TABLE pando_retention_roots DROP CONSTRAINT IF EXISTS pando_retention_roots_tenant_id_fkey;

@@ -8,15 +8,21 @@ use super::{
     },
     storage,
 };
-use crate::{Error, auth, token_scopes::RepoAction};
+use crate::{
+    Error, auth,
+    storage::remote_key_claims::{has_active_delete_claim, lock_object_key, wait_or_clear_delete_claim},
+    token_scopes::RepoAction,
+};
 use axum::http::StatusCode;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 const MAX_BATCH_UPLOAD_PASSES: usize = 3;
+const MAX_CLAIM_RETRIES: usize = 8;
 
 enum UploadSlot {
     Invalid,
@@ -119,6 +125,7 @@ pub(super) async fn batch_upload(
     let mut repairs: BTreeSet<(String, u64)> = BTreeSet::new();
     let mut final_results: Option<Vec<BatchObjectResult>> = None;
 
+    let remote_store = super::hydration::remote_store(&ctx.state.storage.root).map_err(Error::internal)?;
     for pass in 0..MAX_BATCH_UPLOAD_PASSES {
         // Phase 2: run `ensure_readable` ONLY for `ReadyCandidate` rows with zero DB connections held.
         let mut pass_verified: BTreeMap<(String, u64), bool> = BTreeMap::new();
@@ -129,6 +136,15 @@ pub(super) async fn batch_upload(
                 let on_disk = if let Some(&cached) = pass_verified.get(&key) {
                     cached
                 } else {
+                    wait_or_clear_delete_claim(
+                        &ctx.state.pool,
+                        remote_store.as_ref(),
+                        tenant_id,
+                        "lfs",
+                        &spec.oid,
+                        ctx.deadline,
+                    )
+                    .await?;
                     let ok = storage::ensure_readable(
                         &ctx.state.storage.root,
                         repo_id,
@@ -190,20 +206,60 @@ pub(super) async fn batch_upload(
             break;
         }
 
-        let mut client = ctx.state.pool.get().await.map_err(Error::internal)?;
-        let tx = client.transaction().await.map_err(Error::internal)?;
-        let reauth = auth::authorize_repo_with_role(
-            &tx,
-            ctx.actor,
-            ctx.owner,
-            ctx.name,
-            auth::Role::Write,
-            RepoAction::ContentsWrite,
-        )
-        .await?;
-        if reauth.repo_id != repo_id || reauth.owner_id != tenant_id {
-            return Err(Error(StatusCode::CONFLICT, "repository identity changed"));
+        let pending_oids: BTreeSet<String> = slots
+            .iter()
+            .filter_map(|(spec, slot)| matches!(slot, UploadSlot::NeedsPending { .. }).then(|| spec.oid.clone()))
+            .collect();
+        let mut acquired_tx = None;
+        for attempt in 0..MAX_CLAIM_RETRIES {
+            for oid in &pending_oids {
+                wait_or_clear_delete_claim(
+                    &ctx.state.pool,
+                    remote_store.as_ref(),
+                    tenant_id,
+                    "lfs",
+                    oid,
+                    ctx.deadline,
+                )
+                .await?;
+            }
+            let mut client = ctx.state.pool.get().await.map_err(Error::internal)?;
+            let tx = client.transaction().await.map_err(Error::internal)?;
+            let reauth = auth::authorize_repo_with_role(
+                &tx,
+                ctx.actor,
+                ctx.owner,
+                ctx.name,
+                auth::Role::Write,
+                RepoAction::ContentsWrite,
+            )
+            .await?;
+            if reauth.repo_id != repo_id || reauth.owner_id != tenant_id {
+                return Err(Error(StatusCode::CONFLICT, "repository identity changed"));
+            }
+            for oid in &pending_oids {
+                lock_object_key(&tx, tenant_id, "lfs", oid).await?;
+            }
+            let mut blocked = false;
+            for oid in &pending_oids {
+                if has_active_delete_claim(&tx, tenant_id, "lfs", oid).await? {
+                    blocked = true;
+                    break;
+                }
+            }
+            if blocked {
+                tx.rollback().await.map_err(Error::internal)?;
+                drop(client);
+                if attempt + 1 >= MAX_CLAIM_RETRIES || Instant::now() >= ctx.deadline {
+                    return Err(Error(StatusCode::CONFLICT, "remote object delete claim in progress"));
+                }
+                sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            acquired_tx = Some((client, tx));
+            break;
         }
+        let (client, tx) = acquired_tx.ok_or(Error(StatusCode::CONFLICT, "remote object delete claim in progress"))?;
 
         let mut pass_results = Vec::with_capacity(slots.len());
         let mut pass_repairs = BTreeSet::new();
