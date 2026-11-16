@@ -223,25 +223,30 @@ class ProcGroupObserver:
         self._thread.start()
         return self
 
-    def _run(self, max_duration_s):
-        deadline = self.clock() + int(max_duration_s * 1_000_000_000)
-        while not self._stop.is_set() and self.clock() < deadline:
-            now_ns = self.clock()
+    def sample_once(self):
+        """Synchronously confirm the group is live immediately before trigger."""
+        table = read_proc_table(self.proc_root, uid=self.uid)
+        now_ns = self.clock()
+        with self._lock:
             if self._last_poll_ns:
-                gap = now_ns - self._last_poll_ns
-                self.max_poll_gap_ns = max(self.max_poll_gap_ns, gap)
+                self.max_poll_gap_ns = max(self.max_poll_gap_ns,
+                                           now_ns - self._last_poll_ns)
             self._last_poll_ns = now_ns
-            try:
-                table = read_proc_table(self.proc_root, uid=self.uid)
-            except ObserverUnavailable:
-                with self._lock:
-                    self.unavailable_reason = "proc unobservable"
-                return
             for pgid, track in tuple(self._tracks.items()):
                 if leader_reused(track.identity, table):
                     track.reuse_detected = True
                 members = [process for process in group_members(table, pgid) if process.live]
                 track.observe(members, now_ns)
+
+    def _run(self, max_duration_s):
+        deadline = self.clock() + int(max_duration_s * 1_000_000_000)
+        while not self._stop.is_set() and self.clock() < deadline:
+            try:
+                self.sample_once()
+            except ObserverUnavailable:
+                with self._lock:
+                    self.unavailable_reason = "proc unobservable"
+                return
             time.sleep(self.interval_ns / 1_000_000_000)
 
     @property

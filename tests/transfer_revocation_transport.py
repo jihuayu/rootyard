@@ -306,6 +306,8 @@ def run_timed_transfer(
         reader = threading.Thread(target=body_reader, name="revocation-body-reader", daemon=True)
         reader.start()
 
+        if observer is not None:
+            observer.sample_once()
         interval = None
         if trigger is not None:
             interval, _ = TriggerInterval.measure(trigger_kind, trigger)
@@ -356,7 +358,6 @@ def run_timed_transfer(
         post_pause_ok = post_pause_ns <= bound_ns
         proof = bool(client_ok and group_ok and trigger_ok and backpressure_ok
                      and post_pause_ok and pre_trigger_ok and group_sanity_ok)
-        end_ns = max(stop.observed_ns, natural_expiry.latest_ns if natural_expiry else stop.observed_ns)
         result = {
             "configured_bound_ms": int(bound_ms),
             "trigger": trigger_report,
@@ -364,7 +365,9 @@ def run_timed_transfer(
             "deadline_ns": deadline_ns,
             "trigger_within_deadline": trigger_ok,
             "pre_trigger_pause_ms": _ms(lower_ns - first_ns),
-            "pre_trigger_backpressure_established": pre_trigger_ok,
+            "pre_trigger_backpressure_established": bool(
+                pre_trigger_ok and (not require_backpressure or bool(probe and probe.persistent))
+            ),
             "post_trigger_pause_ms": _ms(post_pause_ns),
             "reader_resume_after_lower_ms": _ms(resume_ns - lower_ns),
             "post_pause_within_deadline": post_pause_ok,
@@ -389,7 +392,6 @@ def run_timed_transfer(
             "git_group_within_deadline": group_ok,
             "post_transfer_group_stopped": group_sanity_ok,
             "configured_bound_proven": proof,
-            "observed_end_ns": end_ns,
         }
         return result
     finally:

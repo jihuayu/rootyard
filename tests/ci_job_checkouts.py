@@ -1254,6 +1254,11 @@ class JobCheckoutHarness(SourcePinHarness):
                 group_ok = observer.proven(trigger.t_before_ns, deadline_ns)
                 abort_ok = pending_ns <= deadline_ns
                 abort_elapsed = (pending_ns - trigger.t_before_ns) / 1_000_000_000
+                group_sanity_ok = True
+                try:
+                    observer.wait_no_live(timeout_s=2.5)
+                except AssertionError:
+                    group_sanity_ok = False
                 abort_report = {
                     "configured_bound_ms": 1200,
                     "trigger": trigger.report(),
@@ -1262,7 +1267,8 @@ class JobCheckoutHarness(SourcePinHarness):
                     "response_within_deadline": abort_ok,
                     "git_group": observer.report(trigger.t_before_ns),
                     "git_group_within_deadline": group_ok,
-                    "configured_bound_proven": bool(abort_ok and group_ok),
+                    "post_transfer_group_stopped": group_sanity_ok,
+                    "configured_bound_proven": bool(abort_ok and group_ok and group_sanity_ok),
                 }
                 assert abort_report["configured_bound_proven"], "mirror prepare abort bound not proven"
                 self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
