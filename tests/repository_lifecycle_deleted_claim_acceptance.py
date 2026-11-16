@@ -295,18 +295,6 @@ class DeletedClaimAcceptanceHarness(RepositoryLifecycleHarness):
             method="PUT",
             body={"context": self.CONTEXT},
         )
-        self.doc(
-            f"/api/repos/alice/{name}/branch-rules",
-            201,
-            token=self.alice,
-            method="POST",
-            body={
-                "branch_ref": "refs/heads/main",
-                "required_approvals": 0,
-                "required_checks": [self.CONTEXT],
-            },
-        )
-
         work = self.root / "deleted-claim-work"
         self.git("clone", self.base + f"/git/alice/{name}.git", str(work), token=self.alice)
         self.git("config", "user.name", self.alice["username"], cwd=work)
@@ -321,6 +309,18 @@ class DeletedClaimAcceptanceHarness(RepositoryLifecycleHarness):
         self.git("commit", "-m", "seed deleted-claim fixture", cwd=work)
         base_oid = self.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
         self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice)
+
+        self.doc(
+            f"/api/repos/alice/{name}/branch-rules",
+            201,
+            token=self.alice,
+            method="POST",
+            body={
+                "branch_ref": "refs/heads/main",
+                "required_approvals": 0,
+                "required_checks": [self.CONTEXT],
+            },
+        )
 
         branches = (
             ("feature-control", "control.txt", "control"),
