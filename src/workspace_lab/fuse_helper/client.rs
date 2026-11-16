@@ -238,7 +238,7 @@ where
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::EINTR) => {}
-            Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK) => {
+            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
                 let remaining = limit.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(control_deadline_error());
@@ -1205,7 +1205,7 @@ mod tests {
             }
             let error = io::Error::last_os_error();
             assert!(
-                matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK)),
+                matches!(error.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK),
                 "unexpected socket fill error: {error}"
             );
             return;
