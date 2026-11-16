@@ -1,6 +1,7 @@
 use super::super::super::{Pack, object_store};
 use super::super::{
     ENVELOPE_SCHEMA, KmsEnvelopeRecord, provider,
+    provider::PandoKeyProvider,
     vault_provider::VaultTransitProvider,
     wrapped_dek::PandoWrappedDek,
 };

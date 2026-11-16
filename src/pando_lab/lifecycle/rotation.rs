@@ -5,7 +5,6 @@ use super::{
     crypto, data_key, envelopes, publication,
     db::{self, load_envelope_from_db, persist_checkpoint},
     load_repo_packs, provider,
-    provider::PandoKeyProvider,
     provider_selection::{self, PandoProviderSelection},
     valid_kms_key_id,
     vault_provider::VaultTransitProvider,
