@@ -136,7 +136,7 @@ pub(super) async fn evaluate_lifecycle_inner(
     let s_root = object_store::store_root(config);
     let packs_before = load_repo_packs(&c, repo).await?;
     let fragmentation_before =
-        compute_fragmentation_metrics(&config.root, &s_root, repo, &packs_before)?;
+        compute_fragmentation_metrics(&config.root, &s_root, repo, &packs_before).await?;
     let (compaction_triggered, repack_report) = if policy.auto_repack_enabled
         && (packs_before.len() as i32) > policy.max_active_packs
     {
@@ -157,7 +157,7 @@ pub(super) async fn evaluate_lifecycle_inner(
 
     let packs_after = load_repo_packs(&c, repo).await?;
     let fragmentation_after =
-        compute_fragmentation_metrics(&config.root, &s_root, repo, &packs_after)?;
+        compute_fragmentation_metrics(&config.root, &s_root, repo, &packs_after).await?;
     let active_ids: Vec<Uuid> = packs_after.iter().map(|p| p.id).collect();
     c.execute(
         "DELETE FROM pando_lab.kms_envelopes WHERE repo=$1 AND NOT (pack_id = ANY($2))",
@@ -269,7 +269,7 @@ pub(super) async fn status_inner(config: &Config, repo: Uuid) -> Result<Lifecycl
     };
     let packs = load_repo_packs(&c, repo).await?;
     let fragmentation =
-        compute_fragmentation_metrics(&config.root, &object_store::store_root(config), repo, &packs)?;
+        compute_fragmentation_metrics(&config.root, &object_store::store_root(config), repo, &packs).await?;
     let (mut envelopes, mut hot_packs, mut cold_packs, mut all_verified, mut all_auth) =
         (Vec::new(), 0usize, 0usize, true, !packs.is_empty());
     for pack in &packs {

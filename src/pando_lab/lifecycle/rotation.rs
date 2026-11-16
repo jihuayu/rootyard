@@ -44,7 +44,7 @@ pub struct KmsRotationCheckpoint {
     pub failed_pack_id: Option<Uuid>,
 }
 
-pub fn verify_and_decrypt_pack_bytes(
+pub async fn verify_and_decrypt_pack_bytes(
     base_root: &Path,
     repo: Uuid,
     pack: &Pack,
@@ -53,10 +53,10 @@ pub fn verify_and_decrypt_pack_bytes(
 ) -> Result<Vec<u8>> {
     let kms_dir = super::provider::resolve_kms_dir(base_root, repo);
     let provider = super::provider::PandoKmsProvider::open_existing(&kms_dir)?;
-    verify_with_provider(&provider, repo, pack, env, cipher_bytes)
+    verify_with_provider(&provider, repo, pack, env, cipher_bytes).await
 }
 
-fn verify_with_provider(
+async fn verify_with_provider(
     provider: &super::provider::PandoKmsProvider,
     repo: Uuid,
     pack: &Pack,
@@ -100,10 +100,10 @@ fn verify_with_provider(
             wrapped_key_json: wrapped,
         },
         cipher_bytes,
-    )
+    ).await
 }
 
-pub(super) fn verify_pack_ciphertext_open(
+pub(super) async fn verify_pack_ciphertext_open(
     provider: &super::provider::PandoKmsProvider,
     s_root: &Path,
     repo: Uuid,
@@ -119,11 +119,11 @@ pub(super) fn verify_pack_ciphertext_open(
     let manifest: object_store::CasPackManifest =
         serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
     let cipher_bytes = std::fs::read(s_root.join(&manifest.pack_key))?;
-    let _plain = verify_with_provider(provider, repo, pack, env, &cipher_bytes)?;
+    let _plain = verify_with_provider(provider, repo, pack, env, &cipher_bytes).await?;
     Ok(())
 }
 
-fn rewrap_existing_envelope(
+async fn rewrap_existing_envelope(
     provider: &super::provider::PandoKmsProvider,
     s_root: &Path,
     repo: Uuid,
@@ -132,7 +132,7 @@ fn rewrap_existing_envelope(
     to_key_id: &str,
     to_key_version: i32,
 ) -> Result<KmsEnvelopeRecord> {
-    verify_pack_ciphertext_open(provider, s_root, repo, pack, old_env)?;
+    verify_pack_ciphertext_open(provider, s_root, repo, pack, old_env).await?;
     let envelope_id = old_env
         .envelope_id
         .context("missing envelope_id during DEK rewrap")?;
@@ -159,7 +159,7 @@ fn rewrap_existing_envelope(
         envelope_id,
         &pack.pack_sha256,
         wrapped_json,
-    )?;
+    ).await?;
     ensure!(
         rewrapped_key_id == to_key_id,
         "rewrapped key_id '{}' != target '{to_key_id}'",
@@ -202,7 +202,7 @@ fn rewrap_existing_envelope(
         ciphertext_bytes: Some(ciphertext_bytes),
         provider_kind: super::provider::PROVIDER_KIND_LOCAL.to_owned(),
     };
-    verify_pack_ciphertext_open(provider, s_root, repo, pack, &updated)?;
+    verify_pack_ciphertext_open(provider, s_root, repo, pack, &updated).await?;
     Ok(updated)
 }
 
@@ -308,7 +308,7 @@ pub async fn rotate_kms_key_with_options(
             && env.key_version == cp.to_key_version
             && super::crypto::is_authenticated_mode(&env.encryption_mode)
         {
-            verify_pack_ciphertext_open(&provider, &s_root, repo, pack, env)?;
+            verify_pack_ciphertext_open(&provider, &s_root, repo, pack, env).await?;
             if !cp.completed_pack_ids.contains(&pack.id) {
                 cp.completed_pack_ids.push(pack.id);
                 persist_checkpoint(&c, &kms_dir, &cp).await?;
@@ -337,7 +337,7 @@ pub async fn rotate_kms_key_with_options(
                     old_env,
                     &cp.to_key_id,
                     cp.to_key_version,
-                )?
+                ).await?
             }
             _ => {
                 let tier = existing_env

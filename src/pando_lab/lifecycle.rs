@@ -189,7 +189,7 @@ pub fn valid_encryption_mode(mode: &str) -> bool {
     )
 }
 
-pub fn compute_fragmentation_metrics(
+pub async fn compute_fragmentation_metrics(
     root: &Path,
     store_root_dir: &Path,
     repo: Uuid,
@@ -208,7 +208,7 @@ pub fn compute_fragmentation_metrics(
             pack.id,
             Some(&pack.pack_sha256),
             Some(&pack.idx_sha256),
-        )?;
+        ).await?;
         let pfx = objects_root.join(repo.to_string()).join(pack.id.to_string());
         let (pb, ib) = (
             std::fs::read(pfx.with_extension("pack"))?,
@@ -270,7 +270,7 @@ pub fn evict_cold_pack_local(root: &Path, store_root_dir: &Path, repo: Uuid, pac
     }
 }
 
-pub fn hydrate_cold_pack_verified(
+pub async fn hydrate_cold_pack_verified(
     root: &Path,
     store_root_dir: &Path,
     bucket: &str,
@@ -303,7 +303,7 @@ pub fn hydrate_cold_pack_verified(
         pack.id,
         Some(&pack.pack_sha256),
         Some(&pack.idx_sha256),
-    )
+    ).await
 }
 
 pub(super) async fn evaluate_lifecycle(
@@ -337,8 +337,8 @@ pub(super) async fn status(config: &Config, repo: Uuid) -> Result<LifecycleStatu
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn authenticated_pack_encryption_rotation_revocation_and_tamper_rejection() {
+    #[tokio::test]
+    async fn authenticated_pack_encryption_rotation_revocation_and_tamper_rejection() {
         let tmp = std::env::temp_dir().join(format!("pando-lifecycle-test-{}", Uuid::new_v4()));
         let objects_root = tmp.join("objects");
         let (repo, pack_id) = (Uuid::new_v4(), Uuid::new_v4());
@@ -356,7 +356,7 @@ mod tests {
         std::fs::write(dir.join(format!("{pack_id}.idx")), &idx_bytes).unwrap();
 
         let pack = Pack { id: pack_id, pack_sha256: delta::sha256_hex(&pack_bytes), idx_sha256: delta::sha256_hex(&idx_bytes) };
-        let (put_rep, _) = object_store::put_pack_files(&tmp, &objects_root, repo, pack_id, &Default::default()).unwrap();
+        let (put_rep, _) = object_store::put_pack_files(&tmp, &objects_root, repo, pack_id, &Default::default()).await.unwrap();
         let cipher_on_disk = std::fs::read(&put_rep.bucket_pack_path).unwrap();
         assert!(!cipher_on_disk.starts_with(b"PACK"));
         assert!(!cipher_on_disk.windows(pack_bytes.len()).any(|w| w == pack_bytes.as_slice()));
@@ -389,7 +389,7 @@ mod tests {
         });
         write_envelope_file(&tmp, &env).unwrap();
         assert!(evict_cold_pack_local(&tmp, &tmp, repo, &pack).unwrap());
-        let hydrated = hydrate_cold_pack_verified(&tmp, &tmp, "pando-default", repo, &pack).unwrap();
+        let hydrated = hydrate_cold_pack_verified(&tmp, &tmp, "pando-default", repo, &pack).await.unwrap();
         assert!(hydrated.rehydrated_from_object_store && std::fs::read(dir.join(format!("{pack_id}.pack"))).unwrap() == pack_bytes);
         let _ = std::fs::remove_dir_all(&tmp);
     }

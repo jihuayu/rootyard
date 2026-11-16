@@ -88,7 +88,7 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
     let provider = lifecycle::provider::PandoKmsProvider::open_or_init(&kms_dir, lifecycle::DEFAULT_KMS_KEY_ID)?;
     let active_key = provider.active_entry()?;
     let plain_bytes = fs::read(&pack).await?;
-    let sealed = lifecycle::crypto::seal_pack_bytes(&provider, repo, pack_id, &idx_sha256, suite, active_key.key_version, &plain_bytes)?;
+    let sealed = lifecycle::crypto::seal_pack_bytes(&provider, repo, pack_id, &idx_sha256, suite, active_key.key_version, &plain_bytes).await?;
     let env = lifecycle::build_authenticated_envelope_record(
         repo,
         &Pack { id: pack_id, pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone() },
@@ -208,7 +208,7 @@ pub(super) async fn get(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<Ob
         let dec_res = async {
             store.get_to_file(&pack_key, &cipher_tmp, cipher_bytes, deadline()).await?;
             let c_bytes = fs::read(&cipher_tmp).await?;
-            lifecycle::rotation::verify_and_decrypt_pack_bytes(&config.root, repo, &pack_obj, &env, &c_bytes)
+            lifecycle::rotation::verify_and_decrypt_pack_bytes(&config.root, repo, &pack_obj, &env, &c_bytes).await
         }.await;
         let _ = fs::remove_file(&cipher_tmp).await;
         let plain = dec_res?;

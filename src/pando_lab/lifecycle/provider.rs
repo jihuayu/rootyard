@@ -1,5 +1,6 @@
 use super::crypto::sha256_hex;
 use anyhow::{Context, Result, bail, ensure};
+use futures_util::future::BoxFuture;
 use ring::rand::{SecureRandom, SystemRandom};
 use rootyard::blob_store::key_provider::{
     DATA_KEY_BYTES, DataKey, KeyId, KeyProvider, KeyProviderCapabilities, KeyProviderError,
@@ -19,6 +20,65 @@ use zeroize::Zeroizing;
 pub const POLICY_FILE_NAME: &str = "kms_policy.json";
 pub const KEYRING_FILE_NAME: &str = "keyring.json";
 pub const PROVIDER_KIND_LOCAL: &str = "local-file-key-provider";
+
+/// Pando-only provider boundary. Unlike the shared Blob `KeyProvider`, this
+/// boundary is async so a network-backed provider (for example Vault Transit)
+/// can be added in a later checkpoint without blocking an async runtime. The
+/// local concrete provider remains available through the synchronous shared
+/// `KeyProvider` trait as a compatibility path.
+pub trait PandoKeyProvider: fmt::Debug + Send + Sync {
+    fn current_key_id(&self) -> &KeyId;
+    fn capabilities(&self) -> KeyProviderCapabilities;
+    fn wrap_data_key<'a>(
+        &'a self,
+        data_key: &'a [u8; DATA_KEY_BYTES],
+        context: &'a WrapContext,
+    ) -> BoxFuture<'a, std::result::Result<WrappedKey, KeyProviderError>>;
+    fn unwrap_data_key<'a>(
+        &'a self,
+        wrapped: &'a WrappedKey,
+        context: &'a WrapContext,
+    ) -> BoxFuture<'a, std::result::Result<DataKey, KeyProviderError>>;
+    fn rewrap_data_key<'a>(
+        &'a self,
+        wrapped: &'a WrappedKey,
+        context: &'a WrapContext,
+    ) -> BoxFuture<'a, std::result::Result<WrappedKey, KeyProviderError>>;
+}
+
+impl<T: KeyProvider + ?Sized> PandoKeyProvider for T {
+    fn current_key_id(&self) -> &KeyId {
+        KeyProvider::current_key_id(self)
+    }
+
+    fn capabilities(&self) -> KeyProviderCapabilities {
+        KeyProvider::capabilities(self)
+    }
+
+    fn wrap_data_key<'a>(
+        &'a self,
+        data_key: &'a [u8; DATA_KEY_BYTES],
+        context: &'a WrapContext,
+    ) -> BoxFuture<'a, std::result::Result<WrappedKey, KeyProviderError>> {
+        Box::pin(async move { KeyProvider::wrap_data_key(self, data_key, context) })
+    }
+
+    fn unwrap_data_key<'a>(
+        &'a self,
+        wrapped: &'a WrappedKey,
+        context: &'a WrapContext,
+    ) -> BoxFuture<'a, std::result::Result<DataKey, KeyProviderError>> {
+        Box::pin(async move { KeyProvider::unwrap_data_key(self, wrapped, context) })
+    }
+
+    fn rewrap_data_key<'a>(
+        &'a self,
+        wrapped: &'a WrappedKey,
+        context: &'a WrapContext,
+    ) -> BoxFuture<'a, std::result::Result<WrappedKey, KeyProviderError>> {
+        Box::pin(async move { KeyProvider::rewrap_data_key(self, wrapped, context) })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

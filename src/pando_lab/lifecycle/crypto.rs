@@ -4,8 +4,9 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use rootyard::blob_store::key_provider::{
-    DATA_KEY_BYTES, DataKey, KeyProvider, WrapContext, WrappedKey,
+    DATA_KEY_BYTES, DataKey, WrapContext, WrappedKey,
 };
+use super::provider::PandoKeyProvider;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -184,7 +185,7 @@ fn less_safe_key(cipher: PackCipher, dek: &[u8; DATA_KEY_BYTES]) -> Result<LessS
     Ok(LessSafeKey::new(unbound))
 }
 
-fn ensure_provider_allows_encryption(provider: &dyn KeyProvider) -> Result<()> {
+fn ensure_provider_allows_encryption<P: PandoKeyProvider + ?Sized>(provider: &P) -> Result<()> {
     let caps = provider.capabilities();
     ensure!(
         !caps.plaintext_fallback,
@@ -197,8 +198,8 @@ fn ensure_provider_allows_encryption(provider: &dyn KeyProvider) -> Result<()> {
     Ok(())
 }
 
-pub fn seal_pack_bytes(
-    provider: &dyn KeyProvider,
+pub async fn seal_pack_bytes<P: PandoKeyProvider + ?Sized>(
+    provider: &P,
     repo: Uuid,
     pack_id: Uuid,
     idx_sha256: &str,
@@ -285,6 +286,7 @@ pub fn seal_pack_bytes(
     let wrap_ctx = pack_wrap_context(repo, pack_id, envelope_id, &plaintext_sha256)?;
     let wrapped = provider
         .wrap_data_key(&dek, &wrap_ctx)
+        .await
         .map_err(|err| anyhow::anyhow!("KMS key wrapping failed: {err}"))?;
     let wrapped_key_json = wrapped
         .to_json()
@@ -334,8 +336,8 @@ pub fn inspect_sealed_header(ciphertext: &[u8]) -> Result<SealedHeader> {
     Ok(SealedHeader { cipher, chunk_size, envelope_id, nonce_prefix, plaintext_len, chunk_count })
 }
 
-pub fn open_sealed_pack_bytes(
-    provider: &dyn KeyProvider,
+pub async fn open_sealed_pack_bytes<P: PandoKeyProvider + ?Sized>(
+    provider: &P,
     req: &OpenSealedRequest<'_>,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
@@ -377,6 +379,7 @@ pub fn open_sealed_pack_bytes(
     )?;
     let data_key: DataKey = provider
         .unwrap_data_key(&wrapped, &wrap_ctx)
+        .await
         .map_err(|err| anyhow::anyhow!("KMS key unwrap failed closed: {err}"))?;
     let key = less_safe_key(header.cipher, data_key.expose_secret())?;
 
@@ -433,8 +436,8 @@ pub fn open_sealed_pack_bytes(
     Ok(plaintext)
 }
 
-pub fn rewrap_pack_dek(
-    provider: &dyn KeyProvider,
+pub async fn rewrap_pack_dek<P: PandoKeyProvider + ?Sized>(
+    provider: &P,
     repo: Uuid,
     pack_id: Uuid,
     envelope_id: Uuid,
@@ -447,6 +450,7 @@ pub fn rewrap_pack_dek(
     let ctx = pack_wrap_context(repo, pack_id, envelope_id, plaintext_sha256)?;
     let rewrapped = provider
         .rewrap_data_key(&wrapped, &ctx)
+        .await
         .map_err(|err| anyhow::anyhow!("KMS DEK rewrap failed closed: {err}"))?;
     let json = rewrapped
         .to_json()

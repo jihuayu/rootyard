@@ -4,8 +4,8 @@ use super::super::crypto::{
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
-#[test]
-fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
+#[tokio::test]
+async fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
     let tmp = std::env::temp_dir().join(format!("pando-kms-prov-{}", Uuid::new_v4()));
     let kms_dir = tmp.join("kms-repo");
     let prov_v1 = PandoKmsProvider::open_or_init(&kms_dir, "kms-local-default-v1").unwrap();
@@ -31,7 +31,7 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
         "AES-256-GCM-HMAC-SHA256",
         1,
         &plain1,
-    )
+    ).await
     .unwrap();
 
     let (_pol2, ver2) =
@@ -46,7 +46,7 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
         "CHACHA20-POLY1305-SHA256",
         ver2,
         &plain2,
-    )
+    ).await
     .unwrap();
 
     let opened1_via_retained = open_sealed_pack_bytes(
@@ -62,7 +62,7 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
             wrapped_key_json: &sealed1.wrapped_key_json,
         },
         &sealed1.ciphertext,
-    )
+    ).await
     .unwrap();
     assert_eq!(opened1_via_retained, plain1);
 
@@ -73,7 +73,7 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
         sealed1.envelope_id,
         &sealed1.plaintext_sha256,
         &sealed1.wrapped_key_json,
-    )
+    ).await
     .unwrap();
     assert_eq!(rewrapped_key_id, "kms-rot-v2");
 
@@ -93,7 +93,7 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
             wrapped_key_json: &sealed1.wrapped_key_json,
         },
         &sealed1.ciphertext,
-    )
+    ).await
     .is_err());
     let opened1_rewrapped = open_sealed_pack_bytes(
         &prov_no_retain,
@@ -108,7 +108,7 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
             wrapped_key_json: &rewrapped_json,
         },
         &sealed1.ciphertext,
-    )
+    ).await
     .unwrap();
     assert_eq!(opened1_rewrapped, plain1);
 
@@ -129,7 +129,7 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
             wrapped_key_json: &sealed1.wrapped_key_json,
         },
         &sealed1.ciphertext,
-    )
+    ).await
     .is_err());
     assert!(prepare_rotation_target_key(&kms_dir, "kms-local-default-v1", "kms-local-default-v1").is_err());
     assert!(prepare_rotation_target_key(&kms_dir, "kms-rot-v2", "kms-local-default-v1").is_ok());
@@ -151,7 +151,7 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
         "CHACHA20-POLY1305-SHA256",
         2,
         &plain2,
-    )
+    ).await
     .is_err());
     assert!(open_sealed_pack_bytes(
         &prov_revoked,
@@ -166,7 +166,7 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
             wrapped_key_json: &sealed2.wrapped_key_json,
         },
         &sealed2.ciphertext,
-    )
+    ).await
     .is_err());
 
     set_provider_revoked_in_dir(&kms_dir, false).unwrap();
@@ -184,7 +184,7 @@ fn kms_rotation_retention_policy_revocation_and_rewrap_lifecycle() {
             wrapped_key_json: &sealed2.wrapped_key_json,
         },
         &sealed2.ciphertext,
-    )
+    ).await
     .unwrap();
     assert_eq!(opened2, plain2);
 

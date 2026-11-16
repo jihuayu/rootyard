@@ -53,7 +53,7 @@ pub async fn verify_repo_encryption(config: &Config, repo: Uuid) -> Result<KmsVe
                 pack.id
             );
         }
-        verify_pack_ciphertext_open(&prov, &s_root, repo, pack, &env)?;
+        verify_pack_ciphertext_open(&prov, &s_root, repo, pack, &env).await?;
     }
     let p = prov.policy();
     Ok(KmsVerifyReport {
