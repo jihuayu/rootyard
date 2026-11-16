@@ -19,6 +19,7 @@ if str(ROOT / "tests") not in sys.path:
 
 import transfer_revocation_backpressure as revocation_backpressure  # noqa: E402
 import transfer_revocation_observer as revocation_observer  # noqa: E402
+import transfer_revocation_probe as revocation_probe  # noqa: E402
 import transfer_revocation_timing as revocation_timing  # noqa: E402
 import transfer_revocation_transport as revocation_transport  # noqa: E402
 
@@ -371,6 +372,8 @@ class TestTransferRevocationContract(unittest.TestCase):
                       net=True, probe0=True, source=True):
         return {
             "observed_ns": now_ns,
+            "sample_start_ns": now_ns,
+            "sample_duration_ns": 0,
             "net_table_available": net,
             "same_netns": net,
             "probe0_pending": probe0,
@@ -454,6 +457,35 @@ class TestTransferRevocationContract(unittest.TestCase):
         window.observe(self._stall_sample(60_000_000, inode=18), 60_000_000)
         self.assertEqual(window.last_reset_reason, "inode_changed")
 
+    def test_backpressure_sample_duration_and_missing_timing_fail_closed(self):
+        window = revocation_backpressure.SustainedStallWindow(100_000_000)
+        slow = self._stall_sample(0)
+        slow["sample_duration_ns"] = 150_000_000
+        self.assertFalse(window.observe(slow, 0))
+        self.assertEqual(window.last_reset_reason, "sample_duration")
+        missing = self._stall_sample(20_000_000)
+        missing.pop("sample_start_ns")
+        self.assertFalse(window.observe(missing, 20_000_000))
+        self.assertEqual(window.last_reset_reason, "sample_timing_missing")
+
+    def test_post_qualified_invalid_sample_clears_qualification(self):
+        window = revocation_backpressure.SustainedStallWindow(
+            100_000_000, max_gap_ns=50_000_000
+        )
+        for now in (0, 20_000_000, 40_000_000, 60_000_000, 80_000_000, 100_000_000):
+            window.observe(self._stall_sample(now), now)
+        self.assertTrue(window.qualified)
+        window.observe(self._stall_sample(120_000_000, source=False), 120_000_000)
+        self.assertFalse(window.qualified)
+        self.assertEqual(window.last_reset_reason, "source_unqualified")
+        for now in (140_000_000, 160_000_000, 180_000_000, 200_000_000):
+            window.observe(self._stall_sample(now), now)
+        self.assertFalse(window.qualified)
+        for now in (220_000_000, 240_000_000, 260_000_000, 280_000_000, 300_000_000,
+                    320_000_000):
+            window.observe(self._stall_sample(now), now)
+        self.assertTrue(window.qualified)
+
     def _natural_result_fixture(self, *, client_observed_ns):
         all_true = {
             "client_stop_within_deadline": True,
@@ -461,7 +493,7 @@ class TestTransferRevocationContract(unittest.TestCase):
             "group_post_sanity": True,
             "trigger_within_deadline": True,
             "backpressure_qualified": True,
-            "source_preconditions": True,
+            "source_witness": True,
             "target_pause_within_bound": True,
             "actual_reader_resume_within_deadline": True,
             "pre_trigger_window": True,
@@ -482,11 +514,10 @@ class TestTransferRevocationContract(unittest.TestCase):
             "post_trigger_pause_target_ms": 800.0,
             "post_trigger_backpressure_sample_ns": 1_840_000_000,
             "pre_trigger_backpressure_sample": {"observed_ns": 980_000_000},
-            "backpressure": {"persistent": True},
-            "source_preconditions": {
-                "large_unfinished_payload": True,
-                "source_bounded_producer_channels": True,
-            },
+            "backpressure": {"persistent": True, "max_gap_ms": 100.0},
+            "source_witness": {"qualified": True},
+            "group_required": True,
+            "transfer_kind": "git",
             "post_transfer_group_stopped": True,
             "post_pause_within_deadline": True,
             "pre_trigger_backpressure_established": True,
@@ -501,6 +532,46 @@ class TestTransferRevocationContract(unittest.TestCase):
             "proof_components": all_true,
             "configured_bound_proven": True,
         }
+
+    def test_tcp_pair_requires_unique_established_reversed_four_tuples(self):
+        rows = (
+            "   0: 0100007F:1F90 0100007F:D431 01 00001000:00000000 04:00000000 "
+            "00000000  1000        0 424242 1\n"
+            "   1: 0100007F:D431 0100007F:1F90 01 00000000:00002000 00:00000000 "
+            "00000000  1000        0 424243 1\n"
+        )
+        entries = revocation_probe.parse_proc_net_tcp(rows)
+        pair = revocation_probe.find_tcp_pair(
+            entries, client_host="127.0.0.1", client_port=54321,
+            server_host="127.0.0.1", server_port=8080,
+        )
+        self.assertIsNotNone(pair)
+        self.assertEqual(pair[0].timer_active, 4)
+        duplicate = entries + entries
+        self.assertIsNone(revocation_probe.find_tcp_pair(
+            duplicate, client_host="127.0.0.1", client_port=54321,
+            server_host="127.0.0.1", server_port=8080,
+        ))
+        listening = revocation_probe.parse_proc_net_tcp(
+            rows.replace(" 01 ", " 0A ")
+        )
+        self.assertIsNone(revocation_probe.find_tcp_pair(
+            listening, client_host="127.0.0.1", client_port=54321,
+            server_host="127.0.0.1", server_port=8080,
+        ))
+
+    def test_pre_trigger_window_rejects_post_trigger_and_stale_samples(self):
+        probe = object.__new__(revocation_probe.BackpressureProbe)
+        probe.persistent = True
+        probe.window = type("Window", (), {"max_gap_ns": 100_000_000})()
+        probe.last_sample = {"observed_ns": 101_000_000}
+        self.assertFalse(probe.pre_trigger_valid(100_000_000),
+                         "a post-trigger sample must not qualify")
+        probe.last_sample = {"observed_ns": 0}
+        self.assertFalse(probe.pre_trigger_valid(200_000_000),
+                         "a stale sample beyond the maximum gap must not qualify")
+        probe.last_sample = {"observed_ns": 150_000_000}
+        self.assertTrue(probe.pre_trigger_valid(200_000_000))
 
     def test_natural_expiry_requalification_uses_reconciled_earliest_deadline(self):
         clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
@@ -544,6 +615,34 @@ class TestTransferRevocationContract(unittest.TestCase):
         result = revocation_timing.apply_natural_expiry_clock(fixture, clock, 1200)
         self.assertFalse(result["actual_reader_resume_within_deadline"])
         self.assertFalse(result["configured_bound_proven"])
+
+    def test_missing_source_component_cannot_default_to_true(self):
+        clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
+        fixture = self._natural_result_fixture(client_observed_ns=2_000_000_000)
+        del fixture["proof_components"]["source_witness"]
+        result = revocation_timing.apply_natural_expiry_clock(fixture, clock, 1200)
+        self.assertFalse(result["proof_components"]["source_witness"])
+        self.assertFalse(result["configured_bound_proven"])
+
+    def test_lfs_finalization_explicitly_omits_not_required_group_check(self):
+        clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
+        fixture = self._natural_result_fixture(client_observed_ns=2_000_000_000)
+        fixture["group_required"] = False
+        fixture["git_group"] = {}
+        fixture["git_group_within_deadline"] = None
+        fixture["proof_components"].pop("git_group_within_deadline", None)
+        result = revocation_timing.apply_natural_expiry_clock(fixture, clock, 1200)
+        self.assertNotIn("git_group_within_deadline", result["proof_components"])
+        self.assertIsNone(result["git_group_within_deadline"])
+        self.assertTrue(result["configured_bound_proven"])
+
+    def test_post_trigger_or_stale_final_sample_invalidates_final_expiry(self):
+        clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
+        for observed_ns in (1_000_000_001, 0):
+            fixture = self._natural_result_fixture(client_observed_ns=2_000_000_000)
+            fixture["pre_trigger_backpressure_sample"] = {"observed_ns": observed_ns}
+            result = revocation_timing.apply_natural_expiry_clock(fixture, clock, 1200)
+            self.assertFalse(result["configured_bound_proven"])
 
     def test_read_timeout_is_never_a_confirmed_transport_stop(self):
         class FakeSocket:
@@ -591,6 +690,7 @@ class TestTransferRevocationContract(unittest.TestCase):
                     "tests/transfer_revocation_backpressure.py",
                     "tests/transfer_revocation_source.py",
                     "tests/transfer_revocation_git_source.py",
+                    "tests/transfer_revocation_probe.py",
                     "tests/transfer_revocation_transport.py"):
             path = ROOT / rel
             self.assertLessEqual(len(path.read_text(encoding="utf-8").splitlines()), 500, rel)
@@ -605,22 +705,27 @@ class TestTransferRevocationContract(unittest.TestCase):
                          "require_backpressure=True"):
             self.assertTrue(expected in ci_source, f"ci_job_checkouts.py missing {expected}")
         transport = (ROOT / "tests/transfer_revocation_transport.py").read_text(encoding="utf-8")
-        for expected in ("SO_RCVBUF", "getsockopt", "fixture_four_tuple",
-                         "server_fd_owned", "deadline_ns = lower_ns + bound_ns",
+        for expected in ("SO_RCVBUF", "getsockopt", "deadline_ns = lower_ns + bound_ns",
                          "post_pause_ns <= bound_ns", "post_transfer_group_stopped",
-                         "SustainedStallWindow", "source_bounded_producer",
+                         "source_witness", "source_witness_factory",
                          "actual_reader_resume_ns", "proof_components"):
             self.assertTrue(expected in transport, f"transport missing {expected}")
+        probe = (ROOT / "tests/transfer_revocation_probe.py").read_text(encoding="utf-8")
+        for expected in ("fixture_four_tuple", "server_fd_owned", "client_inode_owned",
+                         "probe0_pending", "find_tcp_pair", "source_qualified"):
+            self.assertTrue(expected in probe, f"probe missing {expected}")
         backpressure = (ROOT / "tests" / "transfer_revocation_backpressure.py").read_text(encoding="utf-8")
         for expected in ("server_tx_positive_every_sample",
                          "client_rx_positive_every_sample",
                          "receiver_queue_unchanged", "probe0_every_sample",
-                         "source_qualified_every_sample", "sample_gap"):
+                         "source_qualified_every_sample", "sample_gap",
+                         "max_sample_duration"):
             self.assertTrue(expected in backpressure, f"backpressure helper missing {expected}")
         docs = (ROOT / "docs" / "ci-mirror.md").read_text(encoding="utf-8")
         for expected in ("S_upper - E_lower <= B", "small `SO_RCVBUF`",
-                         "continuous sender-stall window", "500 ms",
-                         "No zero-window kernel witness is claimed",
+                         "probe0_pending", "not a literal `snd_wnd==0`",
+                         "exactly unchanged RX plateau", "500 ms",
+                         "pipe_write", "st_dev", "fails/unproven",
                          "actual monotonic resume", "final validated natural-expiry",
                          "A timeout, local close, or harness cancellation is never a",
                          "no additive CI"):
@@ -629,6 +734,9 @@ class TestTransferRevocationContract(unittest.TestCase):
         for helper in ("tests/transfer_revocation_timing.py",
                        "tests/transfer_revocation_observer.py",
                        "tests/transfer_revocation_backpressure.py",
+                       "tests/transfer_revocation_source.py",
+                       "tests/transfer_revocation_git_source.py",
+                       "tests/transfer_revocation_probe.py",
                        "tests/transfer_revocation_transport.py"):
             self.assertTrue(f"--harness {helper}" in workflow, f"workflow missing {helper}")
 

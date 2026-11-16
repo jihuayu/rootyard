@@ -199,7 +199,17 @@ class TestGitSourceWitness(unittest.TestCase):
         self.assertTrue(report["source_pipe_paired"])
         self.assertTrue(report["source_writer_blocked"])
         self.assertEqual(report["source_syscall_kind_code"], 1)
-        self.assertNotIn(str(self.proc), json.dumps(report))
+        serialized = json.dumps(report)
+        self.assertNotIn(str(self.proc), serialized)
+        self.assertNotIn("0x", serialized)
+        self.assertNotIn("pipe_write", serialized)
+
+    def test_writev_on_owned_stdout_pipe_qualifies(self):
+        self._task_files(syscall="20 0x1 0x2 0x3 0x0 0x0 0x0")
+        self.assertTrue(self.witness.bind())
+        report = self.witness.sample()
+        self.assertTrue(report["qualified"])
+        self.assertEqual(report["source_syscall_kind_code"], 2)
 
     def test_running_unknown_syscall_and_wait4_fail(self):
         for syscall in ("running", "999 0x1 0x2 0x3", "61 0x1 0x2 0x3"):

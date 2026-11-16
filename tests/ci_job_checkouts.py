@@ -23,7 +23,9 @@ import urllib.parse
 import uuid
 
 from ci_source_pins import SourcePinHarness
+import transfer_revocation_git_source as revocation_git_source
 import transfer_revocation_observer as revocation_observer
+import transfer_revocation_source as revocation_source
 import transfer_revocation_timing as revocation_timing
 import transfer_revocation_transport as revocation_transport
 
@@ -810,17 +812,24 @@ class JobCheckoutHarness(SourcePinHarness):
             require_group=True,
             active_barrier_check=(lambda: not self._barrier_available()) if check_barrier else None,
             start_barrier=start_barrier,
-            source_bounded_producer=True,
-            source_producer_kind="git_stdout_pipe",
+            source_witness_factory=lambda observer: revocation_git_source.GitSourceWitness(
+                service_pid, observer.identities, arch=os.uname().machine
+            ),
+            transfer_kind="git",
         )
         result["configured_bound_proven"] = bool(result["configured_bound_proven"])
         result["received"] = result["client_stop"]["received_bytes"]
         return result
 
-    def _lfs_transfer(self, base, path, token, expected_size, *, trigger=None,
-                      trigger_kind="committed_mutation", natural_expiry=None,
+    def _lfs_transfer(self, base, path, token, expected_size, *, data_root, repo_id, oid,
+                      trigger=None, trigger_kind="committed_mutation", natural_expiry=None,
                       service_pid=None, start_barrier=None, pause_after_first=0.8,
                       rcvbuf=16 * 1024, require_backpressure=True):
+        witness = revocation_source.LfsSourceWitness(
+            service_pid,
+            Path(data_root) / "lfs" / str(repo_id) / oid,
+            expected_size,
+        )
         result = revocation_transport.run_timed_transfer(
             base=base,
             path=path,
@@ -840,8 +849,9 @@ class JobCheckoutHarness(SourcePinHarness):
             require_backpressure=require_backpressure,
             require_group=False,
             start_barrier=start_barrier,
-            source_bounded_producer=True,
-            source_producer_kind="lfs_8_slot_channel",
+            source_witness=witness,
+            source_precheck=witness.prepare_no_match,
+            transfer_kind="lfs",
         )
         result["configured_bound_proven"] = bool(result["configured_bound_proven"])
         result["received"] = result["client_stop"]["received_bytes"]
@@ -858,10 +868,11 @@ class JobCheckoutHarness(SourcePinHarness):
         )
 
     def _stream_lfs_until_revoked(self, base, path, token, expected_size, revoke, *,
-                                  pause_after_first=0.8, start_barrier=None, service_pid=None):
+                                  data_root, repo_id, oid, pause_after_first=0.8,
+                                  start_barrier=None, service_pid=None):
         return self._lfs_transfer(
-            base, path, token, expected_size, trigger=revoke,
-            service_pid=service_pid or self.proc.pid,
+            base, path, token, expected_size, data_root=data_root, repo_id=repo_id, oid=oid,
+            trigger=revoke, service_pid=service_pid or self.proc.pid,
             start_barrier=start_barrier, pause_after_first=pause_after_first,
         )
 
@@ -874,9 +885,11 @@ class JobCheckoutHarness(SourcePinHarness):
         )
 
     def _stream_lfs_until_expiry(self, base, path, token, expected_size, expiry_clock, *,
-                                 pause_after_first=0.8, service_pid=None, start_barrier=None):
+                                 data_root, repo_id, oid, pause_after_first=0.8,
+                                 service_pid=None, start_barrier=None):
         return self._lfs_transfer(
-            base, path, token, expected_size, natural_expiry=expiry_clock,
+            base, path, token, expected_size, data_root=data_root, repo_id=repo_id, oid=oid,
+            natural_expiry=expiry_clock,
             service_pid=service_pid or self.proc.pid,
             start_barrier=start_barrier, pause_after_first=pause_after_first,
         )
@@ -992,6 +1005,9 @@ class JobCheckoutHarness(SourcePinHarness):
                         method="DELETE",
                         token=self.alice,
                     ),
+                    data_root=self.root / "data",
+                    repo_id=self.repo["id"],
+                    oid=lfs_oid,
                     pause_after_first=0.8,
                     service_pid=self.proc.pid,
                 )
@@ -1069,6 +1085,9 @@ class JobCheckoutHarness(SourcePinHarness):
                     tok_b,
                     len(lfs_bytes),
                     expiry_before_clock,
+                    data_root=self.root / "mirror-data",
+                    repo_id=self.repo["id"],
+                    oid=lfs_oid,
                     pause_after_first=0.8,
                     start_barrier=both_streaming,
                     service_pid=self.mirror_proc.pid,

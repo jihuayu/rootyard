@@ -633,19 +633,46 @@ fresh-clock shortcut is used.
 
 The real transfer is opened with a fixture-owned small `SO_RCVBUF` set before
 connect; the effective `getsockopt` value is recorded but is not treated as a
-payload-capacity proof. A 16/24/32 MiB incompressible payload and bounded
-producer channels make the consumer pause meaningful. The harness proves a
-live fixture 4-tuple and a service-owned socket inode, then requires a
-**continuous sender-stall window**: the server TX queue and client RX queue are
-positive on every qualifying sample, the paused receiver queue is stably
-non-draining, sampling gaps are bounded, and any missing, unobservable, reset,
-or nonqualifying sample invalidates the window. Time spent before the first
-qualifying sample does not count. The minimum qualified interval is 500 ms, not
-merely the last few samples. The large unfinished payload plus bounded producer
-source is the precondition that prevents a producer that already finished all
-bytes into the socket buffer from being mistaken for sustained backpressure.
-No zero-window kernel witness is claimed; if this sustained sender-stall
-evidence cannot be observed, the result remains unproven.
+payload-capacity proof. A 16/24/32 MiB incompressible payload keeps the fixture
+large, but payload size and any caller-supplied Boolean are never source
+evidence.
+
+For each transport sample the harness matches the complete reversed IPv4
+four-tuples, requires exactly one `ESTABLISHED` row in each direction, verifies
+the service-owned server socket inode and the actual client socket inode, and
+requires the service and fixture to share a network namespace. It parses the
+hexadecimal `/proc/<pid>/net/tcp` timer field and treats `tr==4` as
+`probe0_pending` only. This is not a literal `snd_wnd==0` measurement: Linux
+also uses probe0 / sender SWS avoidance with a small nonzero window and can clear
+the pending timer during the probe transition, so a missing/non-4 sample resets
+the window. Every qualifying sample requires `probe0_pending`, positive server
+TX, and positive client RX with an exactly unchanged RX plateau. The minimum
+continuous qualified interval is 500 ms, with bounded sampling gaps; missing,
+ambiguous, unobservable, reset, or changed samples clear qualification. Time
+spent before the first valid sample does not count. No exact zero-window claim
+is made.
+
+An independent unfinished-source witness is required in the same samples:
+
+- **LFS:** the serving process must hold exactly one readable descriptor for the
+  actual fixture object, matched by `st_dev`, `st_ino`, and `st_size`, with
+  fdinfo position strictly inside the file and unchanged throughout the window.
+  The fixture object may appear during cold setup; after the first body bytes it
+  must remain the same file and descriptor. Copies of expected body bytes,
+  client read counts, payload size, and hardcoded booleans are not source
+  evidence.
+- **Git:** an owned process-group task must be sleeping in an actual
+  `write`/`writev` on fd 1 to a write-only pipe whose read end is owned by the
+  serving process, with the exact supported `pipe_write` wait channel. The
+  implementation enumerates `/proc/<tgid>/task/<tid>`, binds TID/start-time/PGID
+  identity, and supports only pinned Linux x86_64 syscall 1 (write) and 20
+  (writev). It does not guess architecture syscall numbers or TCP_INFO layout.
+  A live process or process group alone is insufficient.
+
+Missing, ambiguous, permission-denied, unsupported-ABI, identity-reuse, source
+progress, or unobservable evidence fails/unproven; it is not reported as a
+product defect or skipped. These are sampled observations, not an atomic
+snapshot or a claim that every instant between samples was stalled.
 
 The healthy read pause is before the mutation and the final qualifying sample
 is taken immediately before the mutation trigger (or shortly before the mapped

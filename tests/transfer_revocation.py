@@ -10,6 +10,7 @@ import time
 import uuid
 
 from ci_mirror import MirrorHarness
+import transfer_revocation_git_source as revocation_git_source
 import transfer_revocation_observer as revocation_observer
 import transfer_revocation_timing as revocation_timing
 import transfer_revocation_transport as revocation_transport
@@ -74,8 +75,11 @@ class RevocationHarness(MirrorHarness):
             require_backpressure=True,
             require_group=True,
             active_barrier_check=lambda: not self.barrier_available(),
-            source_bounded_producer=True,
-            source_producer_kind="git_stdout_pipe",
+            source_witness_factory=lambda observer: revocation_git_source.GitSourceWitness(
+                service_pid or self.proc.pid, observer.identities,
+                arch=os.uname().machine,
+            ),
+            transfer_kind="git",
         )
         result["configured_bound_proven"] = bool(result["configured_bound_proven"])
         result["received_before_abort"] = result["client_stop"]["received_bytes"]

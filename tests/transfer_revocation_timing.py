@@ -251,11 +251,12 @@ def apply_natural_expiry_clock(result, clock, bound_ms):
     )
 
     group = result.get("git_group") or {}
+    group_required = bool(result.get("group_required", True))
     group_stop_ns = group.get("stop_upper_ns")
-    if isinstance(group_stop_ns, int):
-        group_ok = group_stop_ns <= deadline_ns
+    if group_required:
+        group_ok = bool(isinstance(group_stop_ns, int) and group_stop_ns <= deadline_ns)
     else:
-        group_ok = bool(result.get("git_group_within_deadline", True))
+        group_ok = None
     for observation in group.get("groups", []):
         if isinstance(observation.get("last_live_ns"), int):
             observation["last_live_after_lower_ms"] = round(
@@ -270,32 +271,39 @@ def apply_natural_expiry_clock(result, clock, bound_ms):
             (group["stop_upper_ns"] - final_lower_ns) / NS_PER_MS, 3
         )
 
-    components = dict(result.get("proof_components") or {})
-    components.setdefault("trigger_within_deadline", result.get("trigger_within_deadline", True))
-    components.setdefault("backpressure_qualified", bool(
-        result.get("backpressure", {}).get("persistent", True)
-    ))
-    source = result.get("source_preconditions") or {}
-    components.setdefault("source_preconditions", bool(
-        source.get("large_unfinished_payload", True)
-        and source.get("source_bounded_producer_channels", True)
-    ))
-    components.setdefault("group_post_sanity", result.get("post_transfer_group_stopped", True))
-    components.setdefault("target_pause_within_bound", result.get("post_pause_within_deadline", True))
-    components.setdefault("pre_trigger_window", result.get("pre_trigger_backpressure_established", True))
-    components["client_stop_within_deadline"] = client_ok
-    components["git_group_within_deadline"] = group_ok
-    components["actual_reader_resume_within_deadline"] = actual_resume_ok
-    if isinstance(first_byte_ns, int):
-        components["pre_trigger_window"] = bool(
-            components["pre_trigger_window"] and final_lower_ns > first_byte_ns
-        )
-    components["pre_trigger_window"] = bool(
-        components["pre_trigger_window"]
+    max_gap_ms = (result.get("backpressure") or {}).get("max_gap_ms")
+    pre_order_ok = bool(
+        isinstance(first_byte_ns, int)
         and isinstance(pre_sample_ns, int)
-        and abs(pre_sample_ns - final_lower_ns) <= max_gap_ns
+        and isinstance(max_gap_ms, (int, float))
+        and final_lower_ns > first_byte_ns
+        and pre_sample_ns <= final_lower_ns
+        and final_lower_ns - pre_sample_ns <= int(max_gap_ms * NS_PER_MS)
     )
+
+    components = dict(result.get("proof_components") or {})
+    required_components = (
+        "trigger_within_deadline",
+        "backpressure_qualified",
+        "source_witness",
+        "group_post_sanity",
+        "target_pause_within_bound",
+        "pre_trigger_window",
+    )
+    for key in required_components:
+        if type(components.get(key)) is not bool:
+            components[key] = False
+    components["client_stop_within_deadline"] = client_ok
+    components["actual_reader_resume_within_deadline"] = actual_resume_ok
+    components["pre_trigger_window"] = bool(
+        components["pre_trigger_window"] and pre_order_ok
+    )
+    if group_required:
+        components["git_group_within_deadline"] = group_ok
+    else:
+        components.pop("git_group_within_deadline", None)
     result["proof_components"] = components
+    result["group_required"] = group_required
     result["git_group_within_deadline"] = group_ok
     result["configured_bound_proven"] = all(components.values())
     return result

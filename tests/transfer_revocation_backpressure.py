@@ -8,16 +8,19 @@ class SustainedStallWindow:
     """Accept only a continuous, owned sender-stall interval.
 
     A qualifying sample has an observable fixture inode owned by the service,
-    positive server TX queue, positive client RX queue, and a receiver queue
-    that never decreases while the body reader is paused. The window starts at
-    the first qualifying sample and resets on any missing, unobservable, or
-    nonqualifying sample, or on an invalid sampling gap.
+    positive server TX queue, positive client RX queue, and an exactly
+    unchanged receiver queue while the body reader is paused. The window starts
+    at the first qualifying sample and resets on any missing, unobservable, or
+    nonqualifying sample, an invalid sampling gap, an excessive sample duration,
+    or source progress.
     """
 
     min_duration_ns: int
     max_gap_ns: int = 100_000_000
+    max_sample_duration_ns: int = 100_000_000
     started_ns: int = 0
     last_sample_ns: int = 0
+    last_sample_start_ns: int = 0
     first_rx_queue: int = 0
     inode: int = 0
     samples: list = field(default_factory=list)
@@ -30,6 +33,7 @@ class SustainedStallWindow:
             self.reset_count += 1
         self.started_ns = 0
         self.last_sample_ns = 0
+        self.last_sample_start_ns = 0
         self.first_rx_queue = 0
         self.inode = 0
         self.samples = []
@@ -56,10 +60,16 @@ class SustainedStallWindow:
             return "server_tx_not_positive"
         if not isinstance(rx_queue, int) or rx_queue <= 0:
             return "client_rx_not_positive"
+        sample_start_ns = sample.get("sample_start_ns")
+        sample_duration_ns = sample.get("sample_duration_ns")
+        if not isinstance(sample_start_ns, int) or not isinstance(sample_duration_ns, int):
+            return "sample_timing_missing"
+        if sample_duration_ns > self.max_sample_duration_ns:
+            return "sample_duration"
         if self.samples:
             if now_ns < self.last_sample_ns:
                 return "nonmonotonic_sample"
-            if now_ns - self.last_sample_ns > self.max_gap_ns:
+            if sample_start_ns - self.last_sample_ns > self.max_gap_ns:
                 return "sample_gap"
             if inode != self.inode:
                 return "inode_changed"
@@ -77,8 +87,9 @@ class SustainedStallWindow:
             self.inode = sample["server_socket_inode"]
             self.first_rx_queue = sample["client_rx_queue"]
         self.last_sample_ns = now_ns
+        self.last_sample_start_ns = sample["sample_start_ns"]
         self.samples.append(sample)
-        if now_ns - self.started_ns >= self.min_duration_ns:
+        if sample["sample_start_ns"] - self.started_ns >= self.min_duration_ns:
             self.qualified = True
         return self.qualified
 
@@ -91,22 +102,33 @@ class SustainedStallWindow:
         tx_values = [item["server_tx_queue"] for item in self.samples]
         rx_values = [item["client_rx_queue"] for item in self.samples]
         gaps = [
-            self.samples[index]["observed_ns"] - self.samples[index - 1]["observed_ns"]
+            self.samples[index]["sample_start_ns"] - self.samples[index - 1]["observed_ns"]
             for index in range(1, len(self.samples))
         ]
+        sample_durations = [item["sample_duration_ns"] for item in self.samples]
         return {
             "qualified": self.qualified,
             "min_duration_ms": round(self.min_duration_ns / 1_000_000, 3),
             "max_gap_ms": round(self.max_gap_ns / 1_000_000, 3),
+            "max_sample_duration_ms": round(self.max_sample_duration_ns / 1_000_000, 3),
             "sample_count": len(self.samples),
             "first_valid_stall_ns": self.started_ns if has_window else None,
-            "last_sample_ns": self.last_sample_ns or None,
+            "first_sample_end_ns": self.started_ns if has_window else None,
+            "last_sample_start_ns": self.last_sample_start_ns if has_window else None,
+            "last_sample_ns": self.last_sample_ns if has_window else None,
+            "qualified_span_ms": (
+                round((self.last_sample_start_ns - self.started_ns) / 1_000_000, 3)
+                if has_window else 0.0
+            ),
             "observed_window_ms": (
                 round((self.last_sample_ns - self.started_ns) / 1_000_000, 3)
                 if has_window else 0.0
             ),
             "max_observed_gap_ms": (
                 round(max(gaps) / 1_000_000, 3) if gaps else 0.0
+            ),
+            "max_observed_sample_duration_ms": (
+                round(max(sample_durations) / 1_000_000, 3) if sample_durations else 0.0
             ),
             "server_tx_positive_every_sample": bool(tx_values) and all(
                 value > 0 for value in tx_values

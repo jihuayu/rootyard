@@ -124,7 +124,10 @@ class GitSourceWitness:
         leader = table.get(group.leader_pid)
         if leader is None or leader.starttime != group.leader_starttime:
             return self._fail(SOURCE_FAILURE_IDENTITY)["qualified"]
-        read_pipes = self._read_pipes()
+        try:
+            read_pipes = self._read_pipes()
+        except (OSError, SourceParseError):
+            return self._fail(SOURCE_FAILURE_UNOBSERVABLE)["qualified"]
         candidates = []
         for tgid, tid in self._tasks_for_group(table, group):
             task_stat_path = self.proc_root / str(tgid) / "task" / str(tid) / "stat"
