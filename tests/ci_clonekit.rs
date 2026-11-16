@@ -364,6 +364,7 @@ async fn clonekit_fail_closed_auth_revocation_cancel_gc_pin_and_dependencies() -
     let lfs_ptr =
         format!("version https://git-lfs.github.com/spec/v1\noid sha256:{lfs_oid}\nsize {}\n", lfs_bytes.len());
     add_commit(&repo, "media.bin", lfs_ptr.as_bytes(), "c1")?;
+    add_commit(&repo, "nested/media.bin", lfs_ptr.as_bytes(), "c1b")?;
     let sub_oid = add_commit(&init_repo(td.path(), "sub", Sha1)?, "s.txt", b"s", "s1")?;
     run_git(Some(&repo), &["update-index", "--add", "--cacheinfo", &format!("160000,{sub_oid},deps/sub")])?;
     run_git(Some(&repo), &["commit", "--quiet", "-m", "c2"])?;
@@ -371,13 +372,15 @@ async fn clonekit_fail_closed_auth_revocation_cancel_gc_pin_and_dependencies() -
 
     let ids = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let deps = CloneKitDependencyGrants {
-        lfs_objects: vec![RequiredLfsObject {
-            repository_id: ids.1,
-            path: "media.bin".into(),
-            oid: lfs_oid,
-            size: lfs_bytes.len() as u64,
-            grant_id: Uuid::new_v4(),
-        }],
+        lfs_objects: ["media.bin", "nested/media.bin"]
+            .map(|path| RequiredLfsObject {
+                repository_id: ids.1,
+                path: path.into(),
+                oid: lfs_oid.clone(),
+                size: lfs_bytes.len() as u64,
+                grant_id: Uuid::new_v4(),
+            })
+            .to_vec(),
         submodules: vec![RequiredSubmodule {
             path: "deps/sub".into(),
             repository_id: Uuid::new_v4(),
@@ -387,20 +390,21 @@ async fn clonekit_fail_closed_auth_revocation_cancel_gc_pin_and_dependencies() -
             grant_id: Uuid::new_v4(),
         }],
     };
-    let (grant, mut ctx) = make_grant(ids, Sha1, &target, Some(deps), 1_750_000_000)?;
+    let (grant, mut ctx) = make_grant(ids, Sha1, &target, Some(deps.clone()), 1_750_000_000)?;
     let oracle = Arc::new(InMemoryAuthorityOracle::new());
     let auth: Arc<dyn CloneKitAuthorityOracle> = oracle.clone();
     let remote = repo.to_str().expect("utf8");
     let co = Co { lfs: Some(&lfs_dir), ..Co::new(&vr) };
 
-    let (ng, nc) = make_grant(ids, Sha1, &target, None, 1_750_000_000)?;
+    let lfs_missing = CloneKitDependencyGrants { submodules: deps.submodules.clone(), ..Default::default() };
+    let (ng, nc) = make_grant(ids, Sha1, &target, Some(lfs_missing), 1_750_000_000)?;
     ensure!(matches!(
         co.run(&ng, &nc, &auth, pol(false, true), remote, None).await,
         Err(CloneKitError::DependencyCheckFailed(_))
     ));
     let ok = co.run(&grant, &ctx, &auth, pol(false, true), remote, None).await?;
     ensure!(
-        ok.telemetry.dependency_receipt.verified_lfs_count == 1
+        ok.telemetry.dependency_receipt.verified_lfs_count == 2
             && ok.telemetry.dependency_receipt.verified_submodule_count == 1
     );
 
