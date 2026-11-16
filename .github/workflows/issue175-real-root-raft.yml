@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/issue175-real-root-raft.yml'
       - 'tests/ref_store_real_raft_backend.rs'
+      - 'tests/scope_drain_support/**'
       - 'tests/test_run_root_raft_backend_tests.py'
       - 'scripts/run_root_raft_backend_tests.py'
       - 'src/ref_store/raft_backend.rs'
@@ -122,10 +123,12 @@ jobs:
             --report root_raft=test-results/issue175-real-root-raft/root-raft-report.json \
             --require-case root_raft=real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart \
             --require-case root_raft=pruned_receipts_export_restore_and_sqlite_reopen \
+            --require-case root_raft=scope_drain_support::privileged_scope_drain_query_is_quorum_bound_and_multirepo_complete \
             --harness .github/workflows/issue175-real-root-raft.yml \
             --harness scripts/run_root_raft_backend_tests.py \
             --harness tests/test_run_root_raft_backend_tests.py \
             --harness tests/ref_store_real_raft_backend.rs \
+            --harness tests/scope_drain_support/mod.rs \
             --harness src/ref_store/raft_backend.rs \
             --harness src/ref_store/raft_backend/node.rs \
             --harness src/ref_store/raft_backend/reducer.rs \

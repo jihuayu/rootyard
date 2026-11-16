@@ -6,7 +6,7 @@ ref_store_real_raft_backend``.  This runner never invokes Cargo, rustc or a
 builder: it validates the adjacent v2 build receipt against the current
 checkout (including every bound source input), executes the supplied executable
 exactly once with ``--test-threads=1`` under a finite 900-second process cap,
-and writes a credential-free report.  Only the two reviewed libtest case names,
+and writes a credential-free report.  Only the reviewed libtest case names,
 their statuses and one anchored summary are parsed; raw output, panic text,
 environment values, certificate material, command argv and paths stay in memory
 and are never printed, persisted or uploaded.
@@ -32,6 +32,7 @@ TEST_SOURCE = "tests/ref_store_real_raft_backend.rs"
 REQUIRED_CASES = (
     "real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart",
     "pruned_receipts_export_restore_and_sqlite_reopen",
+    "scope_drain_support::privileged_scope_drain_query_is_quorum_bound_and_multirepo_complete",
 )
 EXPECTED_CASE_COUNT = len(REQUIRED_CASES)
 TEST_ARGS = ("--test-threads=1",)
@@ -487,7 +488,7 @@ def main(argv=None) -> int:
         print("root raft backend: report write failed", file=sys.stderr, flush=True)
         return 1
     if status == 0:
-        print("root raft backend: passed (2 cases)", flush=True)
+        print(f"root raft backend: passed ({EXPECTED_CASE_COUNT} cases)", flush=True)
     else:
         print(f"root raft backend: failed ({phase}/{error_class})", flush=True)
     return status

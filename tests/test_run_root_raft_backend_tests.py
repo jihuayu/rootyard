@@ -24,22 +24,27 @@ import run_root_raft_backend_tests as runner  # noqa: E402
 
 CASE_REAL = "real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart"
 CASE_PRUNED = "pruned_receipts_export_restore_and_sqlite_reopen"
+CASE_DRAIN = (
+    "scope_drain_support::privileged_scope_drain_query_is_quorum_bound_and_multirepo_complete"
+)
 SECRET = "fixture-secret-8f3c"
 NOISE = (
     f"thread 'main' panicked at /tmp/private/{SECRET}/state.sqlite: boom\n"
     f"ROOTYARD_FIXTURE_SECRET={SECRET}\n"
 )
-GOOD_OUTPUT = NOISE + f"""running 2 tests
+GOOD_OUTPUT = NOISE + f"""running 3 tests
 test {CASE_REAL} ... ok
 test {CASE_PRUNED} ... ok
+test {CASE_DRAIN} ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 """
-REORDERED_OUTPUT = f"""running 2 tests
+REORDERED_OUTPUT = f"""running 3 tests
 test {CASE_PRUNED} ... ok
+test {CASE_DRAIN} ... ok
 test {CASE_REAL} ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 """
 MISSING_OUTPUT = f"""running 1 test
 test {CASE_REAL} ... ok
@@ -52,12 +57,13 @@ test {CASE_REAL} ... ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 """
-EXTRA_OUTPUT = f"""running 3 tests
+EXTRA_OUTPUT = f"""running 4 tests
 test {CASE_REAL} ... ok
 test {CASE_PRUNED} ... ok
+test {CASE_DRAIN} ... ok
 test secret_case ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 """
 IGNORED_OUTPUT = f"""running 2 tests
 test {CASE_REAL} ... ok
@@ -75,14 +81,15 @@ ZERO_OUTPUT = """running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 """
-COUNT_MISMATCH_OUTPUT = f"""running 3 tests
+COUNT_MISMATCH_OUTPUT = f"""running 4 tests
 test {CASE_REAL} ... ok
 test {CASE_PRUNED} ... ok
+test {CASE_DRAIN} ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 """
 SUMMARY = (
-    "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; "
+    "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; "
     "0 filtered out; finished in 0.01s"
 )
 REPORT_KEYS = {
@@ -331,18 +338,15 @@ class RootRaftRunnerTest(unittest.TestCase):
                 self.assert_code("timeout_invalid", runner._require_timeout, value)
 
     # -- parser ------------------------------------------------------------
-    def test_parser_accepts_exact_two_case_fixture(self) -> None:
+    def test_parser_accepts_exact_three_case_fixture(self) -> None:
         cases, counts = runner.parse_test_output(GOOD_OUTPUT)
         self.assertEqual(
-            cases,
-            [
-                {"name": CASE_REAL, "status": "passed"},
-                {"name": CASE_PRUNED, "status": "passed"},
-            ],
+            cases, [{"name": name, "status": "passed"} for name in runner.REQUIRED_CASES]
         )
+        self.assertEqual(runner.REQUIRED_CASES, (CASE_REAL, CASE_PRUNED, CASE_DRAIN))
         self.assertEqual(
             counts,
-            {"passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered": 0},
+            {"passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered": 0},
         )
         self.assertNotIn(SECRET, json.dumps(cases))
 
@@ -436,7 +440,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             {"name": name, "status": "passed"} for name in runner.REQUIRED_CASES
         ]
         counts = {
-            "passed": 2,
+            "passed": 3,
             "failed": 0,
             "ignored": 0,
             "measured": 0,
