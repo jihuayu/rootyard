@@ -6,7 +6,15 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{
+    Arc, LazyLock, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use uuid::Uuid;
+
+const HEARTBEAT_KEEPALIVE_SECS: u64 = 8;
+static HEARTBEAT_STARTED: AtomicBool = AtomicBool::new(false);
+static HEARTBEAT_MIRROR_IDS: LazyLock<Mutex<Vec<Uuid>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,8 +98,72 @@ impl<T: axum::response::IntoResponse> IntoClassifiedFallback for T {
     }
 }
 
+pub(crate) fn parse_mirror_uuid_opt(raw: Option<&str>) -> Option<Uuid> {
+    raw.map(str::trim)
+        .filter(|id| !id.is_empty() && id.len() <= 128)
+        .and_then(|id| Uuid::parse_str(id).ok())
+}
+
+fn ensure_heartbeat_keepalive(state: &Arc<AppState>, mirror_uuid: Uuid) {
+    if state.mirror_primary.is_none() {
+        return;
+    }
+    if let Ok(mut ids) = HEARTBEAT_MIRROR_IDS.lock()
+        && !ids.contains(&mirror_uuid)
+    {
+        if ids.len() >= 16 {
+            ids.remove(0);
+        }
+        ids.push(mirror_uuid);
+    }
+    if HEARTBEAT_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        HEARTBEAT_STARTED.store(false, Ordering::Release);
+        return;
+    };
+    let weak = Arc::downgrade(state);
+    handle.spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_KEEPALIVE_SECS));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let Some(app) = weak.upgrade() else {
+                break;
+            };
+            let ids = HEARTBEAT_MIRROR_IDS
+                .lock()
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            if ids.is_empty() {
+                continue;
+            }
+            if let Ok(client) = app.pool.get().await
+                && client
+                    .query_one("SELECT to_regclass('ci_mirror_nodes') IS NOT NULL", &[])
+                    .await
+                    .is_ok_and(|r| r.get::<_, bool>(0))
+            {
+                let _ = client
+                    .execute(
+                        "UPDATE ci_mirror_nodes SET heartbeat_unix=extract(epoch FROM clock_timestamp())::bigint \
+                         WHERE mirror_id = ANY($1) AND active=true",
+                        &[&ids],
+                    )
+                    .await;
+            }
+        }
+        HEARTBEAT_STARTED.store(false, Ordering::Release);
+    });
+}
+
 pub(crate) async fn publish_ready_oid(
-    state: &AppState,
+    state: &Arc<AppState>,
     repo: &db::Repository,
     target_oid: &str,
     explicit_mirror_id: Option<&str>,
@@ -104,16 +176,11 @@ pub(crate) async fn publish_ready_oid(
         repo.storage_generation,
         &[target_oid.to_owned()],
     );
-    let Some(mirror_id) = explicit_mirror_id
-        .map(str::to_owned)
-        .or_else(|| std::env::var("ROOTYARD_CI_MIRROR_ID").ok())
-    else {
+    let env_id = std::env::var("ROOTYARD_CI_MIRROR_ID").ok();
+    let Some(mirror_uuid) = parse_mirror_uuid_opt(explicit_mirror_id.or(env_id.as_deref())) else {
         return;
     };
-    let mirror_id = mirror_id.trim().to_owned();
-    if mirror_id.is_empty() || mirror_id.len() > 128 {
-        return;
-    }
+    ensure_heartbeat_keepalive(state, mirror_uuid);
     let Ok(audience) = crate::ci_checkouts::audience() else {
         return;
     };
@@ -149,7 +216,7 @@ pub(crate) async fn publish_ready_oid(
                      THEN COALESCE((SELECT jsonb_agg(DISTINCT x) FROM jsonb_array_elements_text(ci_mirror_nodes.ready_oids || excluded.ready_oids) AS x),'[]'::jsonb) \
                      ELSE excluded.ready_oids END, \
                    capacity=excluded.capacity,active=true,heartbeat_unix=excluded.heartbeat_unix",
-                &[&repo.id, &mirror_id, &audience, &url, &repo.storage_generation, &ready, &capacity],
+                &[&repo.id, &mirror_uuid, &audience, &url, &repo.storage_generation, &ready, &capacity],
             )
             .await;
     } else {
@@ -159,7 +226,7 @@ pub(crate) async fn publish_ready_oid(
                    ready_oids=COALESCE((SELECT jsonb_agg(DISTINCT x) FROM jsonb_array_elements_text(ready_oids || jsonb_build_array($4::text)) AS x),'[]'::jsonb), \
                    heartbeat_unix=extract(epoch FROM clock_timestamp())::bigint \
                  WHERE repository_id=$1 AND mirror_id=$2 AND storage_generation=$3 AND active=true",
-                &[&repo.id, &mirror_id, &repo.storage_generation, &target_oid],
+                &[&repo.id, &mirror_uuid, &repo.storage_generation, &target_oid],
             )
             .await;
     }
@@ -250,5 +317,14 @@ mod tests {
         assert!(validate_mirror_id_opt(Some("mirror-us-east-1")).is_ok());
         assert!(validate_mirror_id_opt(Some("")).is_err());
         assert!(validate_mirror_id_opt(Some("mirror/bad")).is_err());
+    }
+
+    #[test]
+    fn mirror_uuid_parser_accepts_uuid_and_rejects_non_uuid_labels() {
+        let id = Uuid::new_v4();
+        assert_eq!(parse_mirror_uuid_opt(Some(&format!("  {id}  "))), Some(id));
+        assert_eq!(parse_mirror_uuid_opt(Some("mirror-us-east-1")), None);
+        assert_eq!(parse_mirror_uuid_opt(Some("")), None);
+        assert_eq!(parse_mirror_uuid_opt(None), None);
     }
 }
