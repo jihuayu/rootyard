@@ -16,8 +16,8 @@ use crate::ref_store::raft_backend::outcome::{
     RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusal, RootRefCasRefusalKind,
 };
 use crate::ref_store::raft_backend::proposal::{
-    MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, PROPOSAL_WINDOW, ProposalAttempt, ProposalAttemptKind,
-    ProposalEnvelope, ProposalId, ProposalLookup, command_digest_hex,
+    MAX_ADAPTER_STATE_BYTES, MAX_PROPOSAL_RECEIPT_BYTES, MAX_ROOT_STATE_BYTES, PROPOSAL_WINDOW, ProposalAttempt,
+    ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup, command_digest_hex,
 };
 use crate::ref_store::raft_backend::scope::{fence_legacy_set_lane, fence_proposal_against_gate};
 
@@ -600,12 +600,16 @@ mod tests {
         WireDecisionKind, WireDecisionScopeDep, WireDecisionVerdict, WireGateInit, encode_command,
     };
     use crate::ref_store::core::types::GitObjectFormat;
-    use crate::ref_store::raft_backend::outcome::{RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusalKind};
+    use crate::ref_store::raft_backend::adapter_state::{export_adapter_state_v3, root_only_state_v3};
+    use crate::ref_store::raft_backend::outcome::{
+        RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusal, RootRefCasRefusalKind,
+    };
     use crate::ref_store::raft_backend::proposal::{
         PROPOSAL_WINDOW, ProposalAttemptKind, ProposalEnvelope, ProposalId, ProposalLookup, ProposalOutcome,
     };
     use crate::ref_store::{CoreGateInit, RefName};
     use rootyard_refcas_log::state_machine::{ApplicationLogId, ApplicationStateMachine};
+    use std::collections::BTreeMap;
     use uuid::Uuid;
 
     fn proposal_id(repo: Uuid, tenant: Uuid, history: Uuid, issued_at_index: u64) -> ProposalId {
@@ -1069,6 +1073,73 @@ mod tests {
         app.apply(next_log, &envelope(&next_id, &next)).expect("healthy write after capacity refusal");
         assert!(app.query_attempt(next_log).expect("next attempt").outcome.is_applied());
         assert_eq!(app.logical_clock_floor(), 8);
+    }
+
+    #[test]
+    fn actual_serialized_receipt_and_adapter_budgets_trigger_at_their_limits() {
+        // The production constants retain the fixed 32-entry window and the generic 8 MiB hard
+        // stop: 4 MiB Root contribution + 32 * 80 KiB receipts remains below 7 MiB.
+        assert!(MAX_ROOT_STATE_BYTES + PROPOSAL_WINDOW as usize * MAX_PROPOSAL_RECEIPT_BYTES < MAX_ADAPTER_STATE_BYTES);
+
+        let mut app = RootRefCasStateMachine::new();
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let log_id = ApplicationLogId::new(1, 1);
+        let id = proposal_id(repo, tenant, history, 0);
+        let base_detail = "typed-capacity-detail";
+        let base = ProposalAttempt {
+            proposal_id: Some(id),
+            command_digest_hex: "00".repeat(32),
+            original_log_id: log_id,
+            observed_log_id: log_id,
+            kind: ProposalAttemptKind::First,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal {
+                kind: RootRefCasRefusalKind::StateCapacity,
+                detail: base_detail.to_owned(),
+            }),
+        };
+        let base_len = base.serialized_len().unwrap();
+        assert!(base_len < MAX_PROPOSAL_RECEIPT_BYTES);
+        assert!(app.attempt_fits(&base).unwrap(), "small receipt must fit the real predicate");
+
+        // The synthetic fixed detail is the only oversized field: this exercises the actual
+        // serialized receipt predicate, not a production command string or a fabricated fallback.
+        let at_limit_detail_len = base_detail.len() + (MAX_PROPOSAL_RECEIPT_BYTES - base_len);
+        let mut at_limit = base.clone();
+        at_limit.outcome = RootRefCasOutcome::Refused(RootRefCasRefusal {
+            kind: RootRefCasRefusalKind::StateCapacity,
+            detail: "a".repeat(at_limit_detail_len),
+        });
+        assert_eq!(at_limit.serialized_len().unwrap(), MAX_PROPOSAL_RECEIPT_BYTES);
+        assert!(app.attempt_fits(&at_limit).unwrap(), "exact 80 KiB receipt boundary must fit");
+
+        let mut over_limit = base;
+        over_limit.outcome = RootRefCasOutcome::Refused(RootRefCasRefusal {
+            kind: RootRefCasRefusalKind::StateCapacity,
+            detail: "b".repeat(at_limit_detail_len + 1),
+        });
+        assert_eq!(over_limit.serialized_len().unwrap(), MAX_PROPOSAL_RECEIPT_BYTES + 1);
+        assert!(!app.attempt_fits(&over_limit).unwrap(), "one byte over the receipt budget must be rejected");
+
+        // Fill the fixed window with boundary-sized receipts and a synthetic Root string whose
+        // JSON escaping alone pushes the full adapter wrapper over its independent hard ceiling.
+        // This direct export is the production wrapper budget path used by attempt_fits; the
+        // escaped Root string is a size-predicate fixture, not a production snapshot.
+        let mut attempts = BTreeMap::new();
+        for index in 1..=PROPOSAL_WINDOW {
+            let coordinate = ApplicationLogId::new(1, index);
+            let mut attempt = at_limit.clone();
+            attempt.original_log_id = coordinate;
+            attempt.observed_log_id = coordinate;
+            attempts.insert(coordinate, attempt);
+        }
+        let escaped_root = vec![b'"'; MAX_ROOT_STATE_BYTES / 2 + 1024 * 1024];
+        assert!(root_only_state_v3(&escaped_root).is_err(), "escaped Root contribution must exceed its budget");
+        assert!(
+            export_adapter_state_v3(escaped_root, &attempts).is_err(),
+            "escaped full adapter wrapper must hit the independent hard ceiling"
+        );
     }
 
     #[test]
