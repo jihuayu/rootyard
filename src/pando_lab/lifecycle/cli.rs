@@ -120,7 +120,7 @@ pub async fn verify_repo_encryption(config: &Config, repo: Uuid) -> Result<KmsVe
 pub async fn kms_status(config: &Config, repo: Uuid) -> Result<KmsStatusReport> {
     let c = config.db().await?;
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
-    let active_rotation = db::load_file_checkpoint(&kms_dir)?;
+    let active_rotation = db::load_db_checkpoint(&c, repo).await?;
     let rotation_total_packs = active_rotation.as_ref().map_or(0, |cp| cp.target_pack_ids.len());
     let rotation_completed_packs = active_rotation.as_ref().map_or(0, |cp| cp.completed_pack_ids.len());
     let row = c
