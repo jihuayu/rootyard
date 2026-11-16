@@ -17,6 +17,8 @@ mod transfer_lease;
 pub mod transfer_model;
 pub mod transfer_phases;
 pub mod transfer_remote;
+#[cfg(test)]
+mod transfer_remote_tests;
 use crate::AppState;
 use axum::{
     Router,

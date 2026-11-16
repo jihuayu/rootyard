@@ -284,9 +284,9 @@ async fn upload_inner(
         )
         .await?;
         storage::schedule_remote_repair(
+            state.pool.clone(),
             state.storage.root.clone(),
             repo_id,
-            tenant_id,
             oid.clone(),
             expected_size,
             state.config.git_timeout,

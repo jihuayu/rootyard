@@ -1158,37 +1158,59 @@ class RepositoryLifecycleHarness(BrowserHarness):
             )
             == "true:true"
         )
-        self.sql(
-            "DELETE FROM remote_object_delete_claims "
-            f"WHERE tenant_id = {quote(self.alice['user_id'])} AND namespace = 'lfs' AND digest = {quote(uncertain_oid)}"
-        )
 
-        # Workspace remote store is always initialized by repositories::recover; prove restart clears absent uncertain claim.
-        ws_uncertain = hashlib.sha256(b"uncertain-ws-recovery-digest").hexdigest()
+        # Restart recovery sweeps ONLY unstarted expired claims (`delete_uncertain = false`);
+        # uncertain claims across LFS and workspace MUST stay permanently fail-closed (`true:true:1` & 503).
+        ws_uncertain = hashlib.sha256(b"uncertain-ws-fail-closed-digest").hexdigest()
+        ws_clean_stale = hashlib.sha256(b"clean-unstarted-ws-stale-digest").hexdigest()
         self.stop(hard=True)
         self.sql(
             "INSERT INTO remote_object_delete_claims "
-            "(tenant_id, namespace, digest, claim_generation, deleting, delete_uncertain, lease_until) "
-            f"VALUES ({quote(self.alice['user_id'])}, 'workspace', {quote(ws_uncertain)}, 1, true, true, "
-            "clock_timestamp() + interval '60 seconds') "
+            "(tenant_id, namespace, digest, claim_generation, deleting, delete_uncertain, lease_until) VALUES "
+            f"({quote(self.alice['user_id'])}, 'workspace', {quote(ws_uncertain)}, 1, true, true, "
+            "clock_timestamp() - interval '10 seconds'), "
+            f"({quote(self.alice['user_id'])}, 'workspace', {quote(ws_clean_stale)}, 1, true, false, "
+            "clock_timestamp() - interval '10 seconds') "
             "ON CONFLICT (tenant_id, namespace, digest) DO UPDATE SET "
-            "claim_generation = 1, deleting = true, delete_uncertain = true"
+            "claim_generation = 1, deleting = true, delete_uncertain = EXCLUDED.delete_uncertain, "
+            "lease_until = EXCLUDED.lease_until"
         )
         self.start()
         rec_deadline = time.monotonic() + 15
-        ws_state = None
+        clean_state = None
         while time.monotonic() < rec_deadline:
-            ws_state = self.sql(
+            clean_state = self.sql(
                 "SELECT deleting::text || ':' || delete_uncertain::text || ':' || claim_generation::text "
                 "FROM remote_object_delete_claims "
                 f"WHERE tenant_id = {quote(self.alice['user_id'])} AND namespace = 'workspace' "
-                f"AND digest = {quote(ws_uncertain)}"
+                f"AND digest = {quote(ws_clean_stale)}"
             )
-            if ws_state == "false:false:2":
+            if clean_state == "false:false:2":
                 break
             time.sleep(0.25)
-        assert ws_state == "false:false:2", ws_state
-        return {"parity_repo": repo["id"], "ws_recovered_claim": ws_uncertain}
+        assert clean_state == "false:false:2", clean_state
+
+        for ns, dig in (("lfs", uncertain_oid), ("workspace", ws_uncertain)):
+            st_row = self.sql(
+                "SELECT deleting::text || ':' || delete_uncertain::text || ':' || claim_generation::text "
+                "FROM remote_object_delete_claims "
+                f"WHERE tenant_id = {quote(self.alice['user_id'])} AND namespace = {quote(ns)} AND digest = {quote(dig)}"
+            )
+            assert st_row == "true:true:1", (ns, dig, st_row)
+
+        st_u_after, _, _ = self.http(
+            f"/git/alice/parity-canon.git/info/lfs/objects/{uncertain_oid}",
+            token=self.alice,
+            method="PUT",
+            body=b"uncertain-delete-fail-closed-oid",
+            content_type="application/octet-stream",
+        )
+        assert st_u_after == 503, st_u_after
+        self.sql(
+            "DELETE FROM remote_object_delete_claims "
+            f"WHERE tenant_id = {quote(self.alice['user_id'])} AND digest IN ({quote(uncertain_oid)}, {quote(ws_uncertain)})"
+        )
+        return {"parity_repo": repo["id"], "ws_uncertain_kept_closed": ws_uncertain}
 
 
 def main():

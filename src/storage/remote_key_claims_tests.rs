@@ -32,9 +32,9 @@ struct MockDeleteS3 {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     gate_first_delete: AtomicBool,
     fail_deletes_500: AtomicBool,
-    keep_object_on_delete: AtomicBool,
     first_delete_entered: Notify,
     release_first_delete: Notify,
+    first_delete_finished: Notify,
 }
 
 impl MockDeleteS3 {
@@ -43,9 +43,9 @@ impl MockDeleteS3 {
             objects: Mutex::new(HashMap::new()),
             gate_first_delete: AtomicBool::new(false),
             fail_deletes_500: AtomicBool::new(false),
-            keep_object_on_delete: AtomicBool::new(false),
             first_delete_entered: Notify::new(),
             release_first_delete: Notify::new(),
+            first_delete_finished: Notify::new(),
         }
     }
 }
@@ -95,16 +95,21 @@ async fn handle_mock_s3(
         }
         Method::DELETE => {
             if state.gate_first_delete.swap(false, Ordering::SeqCst) {
-                let release = state.release_first_delete.notified();
-                state.first_delete_entered.notify_one();
-                release.await;
+                let st = Arc::clone(&state);
+                let del_key = key.clone();
+                tokio::spawn(async move {
+                    let release = st.release_first_delete.notified();
+                    st.first_delete_entered.notify_one();
+                    release.await;
+                    st.objects.lock().unwrap().remove(&del_key);
+                    st.first_delete_finished.notify_one();
+                });
+                return std::future::pending::<Response>().await;
             }
             if state.fail_deletes_500.load(Ordering::SeqCst) {
                 return empty_resp(StatusCode::INTERNAL_SERVER_ERROR);
             }
-            if !state.keep_object_on_delete.load(Ordering::SeqCst) {
-                state.objects.lock().unwrap().remove(&key);
-            }
+            state.objects.lock().unwrap().remove(&key);
             empty_resp(StatusCode::NO_CONTENT)
         }
         _ => empty_resp(StatusCode::METHOD_NOT_ALLOWED),
@@ -220,7 +225,7 @@ async fn expired_claim_flushes_unshared_stale_bytes_and_preserves_live_refs() {
 }
 
 #[tokio::test]
-async fn slow_delete_exceeding_lease_and_failed_delete_fail_closed_until_recovery() {
+async fn blocked_first_delete_timeout_and_500_fail_closed_across_recovery() {
     let Some(pool) = setup_claims_pool().await else {
         return;
     };
@@ -235,18 +240,20 @@ async fn slow_delete_exceeding_lease_and_failed_delete_fail_closed_until_recover
     c.execute("INSERT INTO namespaces(id) VALUES($1)", &[&tenant]).await.unwrap();
     c.execute("INSERT INTO repositories(id, owner_id) VALUES($1, $2)", &[&repo, &tenant]).await.unwrap();
 
-    let payload = b"reclaimed-or-raced-payload";
+    let payload = b"blocked-delete-interleaving-payload";
     let oid = hex::encode(Sha256::digest(payload));
+    let oid_err = hex::encode(Sha256::digest(b"http-500-delete-payload"));
     let file_path = dir.join("obj.bin");
     tokio::fs::write(&file_path, payload).await.unwrap();
     let key = ObjectKey::new(tenant, "lfs", &oid).unwrap();
+    let key_err = ObjectKey::new(tenant, "lfs", &oid_err).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     store.put_file(&key, &file_path, payload.len() as u64, deadline).await.unwrap();
 
-    // 1. Slow DELETE exceeding a 1s claim lease remains serialized & fenced.
+    // 1. Block 1st DELETE inside mock S3 -> client timeout/cancel -> run recovery -> attempt publish (MUST fail closed 503) -> finally release 1st DELETE.
     let mut c_mut = pool.get().await.unwrap();
     let tx = c_mut.transaction().await.unwrap();
-    let claim = upsert_delete_claim(&tx, tenant, "lfs", &oid, 1).await.unwrap();
+    let claim = upsert_delete_claim(&tx, tenant, "lfs", &oid, 60).await.unwrap();
     tx.commit().await.unwrap();
 
     mock.gate_first_delete.store(true, Ordering::SeqCst);
@@ -254,36 +261,14 @@ async fn slow_delete_exceeding_lease_and_failed_delete_fail_closed_until_recover
     let pool_a = pool.clone();
     let store_a = Arc::clone(&store);
     let claim_a = claim.clone();
-    let deleter = tokio::spawn(async move {
-        execute_locked_claimed_delete(&pool_a, store_a.as_ref(), &claim_a, Instant::now() + Duration::from_secs(15))
+    let mut deleter = tokio::spawn(async move {
+        execute_locked_claimed_delete(&pool_a, store_a.as_ref(), &claim_a, Instant::now() + Duration::from_secs(30))
             .await
     });
     entered.await;
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    let publish_err =
-        wait_or_clear_delete_claim(&pool, Some(store.as_ref()), tenant, "lfs", &oid, deadline).await.unwrap_err();
-    assert_eq!(publish_err.0, StatusCode::SERVICE_UNAVAILABLE);
-
-    let mut lock_probe = pool.get().await.unwrap();
-    let probe_tx = lock_probe.transaction().await.unwrap();
-    probe_tx.batch_execute("SET LOCAL lock_timeout = '50ms'").await.unwrap();
-    assert!(lock_object_key(&probe_tx, tenant, "lfs", &oid).await.is_err());
-    drop(probe_tx);
-
-    mock.release_first_delete.notify_one();
-    deleter.await.unwrap().unwrap();
-    assert!(store.head(&key, deadline).await.unwrap().is_none());
-    wait_or_clear_delete_claim(&pool, Some(store.as_ref()), tenant, "lfs", &oid, deadline).await.unwrap();
-
-    // 2. Failed DELETE leaves delete_uncertain=true -> 503 even after lease expiry until recovery confirms head().is_none().
-    store.put_file(&key, &file_path, payload.len() as u64, deadline).await.unwrap();
-    let mut c_mut2 = pool.get().await.unwrap();
-    let tx2 = c_mut2.transaction().await.unwrap();
-    let claim2 = upsert_delete_claim(&tx2, tenant, "lfs", &oid, 60).await.unwrap();
-    tx2.commit().await.unwrap();
-
-    mock.fail_deletes_500.store(true, Ordering::SeqCst);
-    assert!(execute_locked_claimed_delete(&pool, store.as_ref(), &claim2, deadline).await.is_err());
+    assert!(tokio::time::timeout(Duration::from_millis(80), &mut deleter).await.is_err());
+    deleter.abort();
+    let _ = deleter.await;
 
     c.execute(
         "UPDATE remote_object_delete_claims SET lease_until = clock_timestamp() - interval '10 seconds' \
@@ -292,26 +277,44 @@ async fn slow_delete_exceeding_lease_and_failed_delete_fail_closed_until_recover
     )
     .await
     .unwrap();
-    let uncertain_err =
+    assert_eq!(sweep_expired_claims_with_stores(&pool, Some(store.as_ref()), None, deadline).await.unwrap(), 0);
+    let pub_err =
         wait_or_clear_delete_claim(&pool, Some(store.as_ref()), tenant, "lfs", &oid, deadline).await.unwrap_err();
-    assert_eq!(uncertain_err.0, StatusCode::SERVICE_UNAVAILABLE);
-
+    assert_eq!(pub_err.0, StatusCode::SERVICE_UNAVAILABLE);
     let mut c_chk = pool.get().await.unwrap();
     let tx_chk = c_chk.transaction().await.unwrap();
     assert!(has_active_delete_claim(&tx_chk, tenant, "lfs", &oid).await.unwrap());
     tx_chk.commit().await.unwrap();
 
-    assert!(sweep_expired_claims_with_stores(&pool, Some(store.as_ref()), None, deadline).await.is_err());
-    mock.fail_deletes_500.store(false, Ordering::SeqCst);
-    mock.keep_object_on_delete.store(true, Ordering::SeqCst);
-    assert!(sweep_expired_claims_with_stores(&pool, Some(store.as_ref()), None, deadline).await.is_err());
+    let finished = mock.first_delete_finished.notified();
+    mock.release_first_delete.notify_one();
+    finished.await;
+    assert!(store.head(&key, deadline).await.unwrap().is_none());
+    assert_eq!(
+        wait_or_clear_delete_claim(&pool, Some(store.as_ref()), tenant, "lfs", &oid, deadline).await.unwrap_err().0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 
-    mock.keep_object_on_delete.store(false, Ordering::SeqCst);
-    let recovered = sweep_expired_claims_with_stores(&pool, Some(store.as_ref()), None, deadline).await.unwrap();
-    assert_eq!(recovered, 1);
-    wait_or_clear_delete_claim(&pool, Some(store.as_ref()), tenant, "lfs", &oid, deadline).await.unwrap();
-    store.put_file(&key, &file_path, payload.len() as u64, deadline).await.unwrap();
-    assert!(store.head(&key, deadline).await.unwrap().is_some());
+    // 2. HTTP 500 on DELETE also leaves delete_uncertain=true permanently fenced across recovery & expiry.
+    store.put_file(&key_err, &file_path, payload.len() as u64, deadline).await.unwrap();
+    let mut c_mut2 = pool.get().await.unwrap();
+    let tx2 = c_mut2.transaction().await.unwrap();
+    let claim2 = upsert_delete_claim(&tx2, tenant, "lfs", &oid_err, 60).await.unwrap();
+    tx2.commit().await.unwrap();
+    mock.fail_deletes_500.store(true, Ordering::SeqCst);
+    assert!(execute_locked_claimed_delete(&pool, store.as_ref(), &claim2, deadline).await.is_err());
+    c.execute(
+        "UPDATE remote_object_delete_claims SET lease_until = clock_timestamp() - interval '10 seconds' \
+         WHERE tenant_id=$1 AND namespace='lfs' AND digest=$2",
+        &[&tenant, &oid_err],
+    )
+    .await
+    .unwrap();
+    assert_eq!(sweep_expired_claims_with_stores(&pool, Some(store.as_ref()), None, deadline).await.unwrap(), 0);
+    assert_eq!(
+        wait_or_clear_delete_claim(&pool, Some(store.as_ref()), tenant, "lfs", &oid_err, deadline).await.unwrap_err().0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 
     server.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;

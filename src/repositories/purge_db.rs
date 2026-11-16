@@ -3,7 +3,9 @@
 use super::{
     lifecycle::{PurgeRepoInput, validate_purge_confirmation},
     lifecycle_ops::{PurgeBlockedResponse, PurgeRepoResponse, json_no_store},
-    purge_exec::{execute_claimed_remote_deletes, gather_remote_inventory, remove_local_repo_dir},
+    purge_exec::{
+        delete_pando_artifact_fenced, execute_claimed_remote_deletes, gather_remote_inventory, remove_local_repo_dir,
+    },
     purge_safety::{PurgeHoldKind, PurgePreconditions, evaluate_purge_holds, plan_safe_remote_cleanup},
 };
 use crate::{
@@ -327,22 +329,18 @@ pub async fn execute_purge(
 
     if let Some(store) = pando_store.as_ref() {
         for cand in pando_candidates.iter().filter(|c| c.authority_scoped_unshared) {
-            let key = ObjectKey::scoped(
-                cand.tenant_id,
+            delete_pando_artifact_fenced(
+                &state.pool,
+                store,
                 cand.authority_id,
-                cand.object_generation,
+                cand.tenant_id,
                 &cand.namespace,
                 &cand.sha256,
+                Some(cand.object_generation),
+                deadline,
             )
+            .await
             .map_err(Error::internal)?;
-            store.delete(&key, deadline).await.map_err(Error::internal)?;
-            let _ = client
-                .execute(
-                    "UPDATE pando_remote_artifacts SET state = 'deleted', deleted_at = clock_timestamp() \
-                     WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4",
-                    &[&cand.authority_id, &cand.tenant_id, &cand.namespace, &cand.sha256],
-                )
-                .await;
         }
     }
 

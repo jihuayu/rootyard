@@ -1,5 +1,6 @@
 //! Tenant-scoped remote object copy and rollback cleanup for ownership transfer.
 use super::{
+    purge_exec::{delete_pando_artifact_fenced, retire_pando_artifact_fenced},
     remote_copy::{copy_and_rekey_workspace_checkpoint, copy_object_if_present},
     transfer_exec::plan_rollback_cleanup_keys,
     transfer_model::{CopiedRemoteObject, plan_lfs_copy, plan_pando_copy, plan_workspace_blob_copy},
@@ -7,7 +8,12 @@ use super::{
 use crate::{
     AppState,
     pando_gateway::pitr_fence,
-    storage::remote_objects::{ObjectKey, RemoteObjectStore},
+    storage::{
+        remote_key_claims::{
+            DEFAULT_DELETE_CLAIM_LEASE_SECS, claim_if_unreferenced, execute_locked_claimed_delete, lock_object_key,
+        },
+        remote_objects::{ObjectKey, RemoteObjectStore},
+    },
     storage_lifecycle::pando_delete_gate,
 };
 use anyhow::{Context, Result, ensure};
@@ -15,10 +21,15 @@ use deadpool_postgres::Pool;
 use serde_json::Value;
 use std::{collections::BTreeSet, path::Path};
 use tokio::{fs, time::Instant};
+use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
-async fn verify_rollback_lease(pool: &Pool, transfer_id: Uuid, lease_owner: &str, lease_epoch: i64) -> Result<()> {
-    let client = pool.get().await?;
+async fn verify_rollback_lease_with<C: GenericClient + Sync>(
+    client: &C,
+    transfer_id: Uuid,
+    lease_owner: &str,
+    lease_epoch: i64,
+) -> Result<()> {
     let active: bool = client
         .query_one(
             "SELECT EXISTS( \
@@ -32,6 +43,11 @@ async fn verify_rollback_lease(pool: &Pool, transfer_id: Uuid, lease_owner: &str
         .get(0);
     ensure!(active, "transfer rollback lease lost before remote delete");
     Ok(())
+}
+
+async fn verify_rollback_lease(pool: &Pool, transfer_id: Uuid, lease_owner: &str, lease_epoch: i64) -> Result<()> {
+    let client = pool.get().await?;
+    verify_rollback_lease_with(&*client, transfer_id, lease_owner, lease_epoch).await
 }
 
 async fn persist_copied_objects(
@@ -287,20 +303,50 @@ async fn copy_pando_objects(
     Ok(())
 }
 
-pub async fn cleanup_rollback_remote_objects(
-    state: &AppState,
+async fn rollback_cleanup_claim_key(
+    pool: &Pool,
+    store: &RemoteObjectStore,
+    transfer_id: Uuid,
+    lease_owner: &str,
+    lease_epoch: i64,
+    key: &ObjectKey,
+    deadline: Instant,
+) -> Result<()> {
+    let claim = {
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        verify_rollback_lease_with(&tx, transfer_id, lease_owner, lease_epoch).await?;
+        lock_object_key(&tx, key.tenant_id, &key.namespace, &key.sha256).await.map_err(|e| anyhow::anyhow!(e.1))?;
+        let claim =
+            claim_if_unreferenced(&tx, key.tenant_id, &key.namespace, &key.sha256, DEFAULT_DELETE_CLAIM_LEASE_SECS)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.1))?;
+        tx.commit().await?;
+        claim
+    };
+    if let Some(claim) = claim {
+        execute_locked_claimed_delete(pool, store, &claim, deadline).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn cleanup_rollback_objects_with_stores(
+    pool: &Pool,
     transfer_id: Uuid,
     lease_owner: &str,
     lease_epoch: i64,
     repo_id: Uuid,
     to_owner: Uuid,
     copied: &[CopiedRemoteObject],
+    lfs_store: Option<&RemoteObjectStore>,
+    ws_store: &RemoteObjectStore,
+    pando_remote_allowed: Option<&RemoteObjectStore>,
     deadline: Instant,
 ) -> Result<()> {
     if copied.is_empty() {
         return Ok(());
     }
-    let client = state.pool.get().await?;
+    let client = pool.get().await?;
     let mut preserved = BTreeSet::new();
     for row in client
         .query("SELECT oid FROM lfs_objects WHERE tenant_id = $1 AND repository_id <> $2", &[&to_owner, &repo_id])
@@ -337,6 +383,78 @@ pub async fn cleanup_rollback_remote_objects(
     }
 
     let targets = plan_rollback_cleanup_keys(to_owner, copied, &preserved);
+    for (kind, key) in targets {
+        match kind.as_str() {
+            "lfs" => {
+                if let Some(store) = lfs_store {
+                    rollback_cleanup_claim_key(pool, store, transfer_id, lease_owner, lease_epoch, &key, deadline)
+                        .await?;
+                }
+            }
+            "workspace" | "workspace_manifest" => {
+                rollback_cleanup_claim_key(pool, ws_store, transfer_id, lease_owner, lease_epoch, &key, deadline)
+                    .await?;
+            }
+            "pando-cipher" | "pando-envelope" => {
+                verify_rollback_lease(pool, transfer_id, lease_owner, lease_epoch).await?;
+                if let Some((authority_id, obj_gen)) = key.authority {
+                    if let Some(store) = pando_remote_allowed {
+                        delete_pando_artifact_fenced(
+                            pool,
+                            store,
+                            authority_id,
+                            key.tenant_id,
+                            &key.namespace,
+                            &key.sha256,
+                            Some(obj_gen),
+                            deadline,
+                        )
+                        .await?;
+                    } else {
+                        retire_pando_artifact_fenced(
+                            pool,
+                            authority_id,
+                            key.tenant_id,
+                            &key.namespace,
+                            &key.sha256,
+                            Some(obj_gen),
+                        )
+                        .await?;
+                    }
+                } else if let Some(store) = pando_remote_allowed {
+                    let referenced: bool = client
+                        .query_one(
+                            "SELECT EXISTS(SELECT 1 FROM pando_pack_manifests m WHERE m.tenant_id = $1 AND m.repository_id <> $2 \
+                               AND ($3 IN (m.manifest->'pack_cipher'->>'sha256', m.manifest->'pack_envelope'->>'sha256', \
+                                           m.manifest->'index_cipher'->>'sha256', m.manifest->'index_envelope'->>'sha256')))",
+                            &[&to_owner, &repo_id, &key.sha256],
+                        )
+                        .await?
+                        .get(0);
+                    if !referenced {
+                        store.delete(&key, deadline).await?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+pub async fn cleanup_rollback_remote_objects(
+    state: &AppState,
+    transfer_id: Uuid,
+    lease_owner: &str,
+    lease_epoch: i64,
+    repo_id: Uuid,
+    to_owner: Uuid,
+    copied: &[CopiedRemoteObject],
+    deadline: Instant,
+) -> Result<()> {
+    if copied.is_empty() {
+        return Ok(());
+    }
     let lfs_store = if std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_some() {
         Some(RemoteObjectStore::from_env(state.storage.root.join("remote-objects"))?)
     } else {
@@ -352,54 +470,18 @@ pub async fn cleanup_rollback_remote_objects(
     } else {
         None
     };
-
-    for (kind, key) in targets {
-        match kind.as_str() {
-            "lfs" => {
-                if let Some(store) = lfs_store.as_ref() {
-                    verify_rollback_lease(&state.pool, transfer_id, lease_owner, lease_epoch).await?;
-                    let _ = store.delete(&key, deadline).await;
-                }
-            }
-            "workspace" | "workspace_manifest" => {
-                verify_rollback_lease(&state.pool, transfer_id, lease_owner, lease_epoch).await?;
-                let _ = ws_store.delete(&key, deadline).await;
-            }
-            "pando-cipher" | "pando-envelope" => {
-                let path = key.path();
-                if let Some(store) = pando_remote_allowed.as_ref() {
-                    verify_rollback_lease(&state.pool, transfer_id, lease_owner, lease_epoch).await?;
-                    if store.delete(&key, deadline).await.is_ok() {
-                        let _ = client
-                            .execute(
-                                "UPDATE pando_remote_artifacts SET state = 'deleted', deleted_at = clock_timestamp() \
-                                 WHERE tenant_id = $1 AND remote_path = $2 \
-                                   AND NOT EXISTS (SELECT 1 FROM pando_manifest_artifacts m \
-                                                   WHERE m.authority_id = pando_remote_artifacts.authority_id \
-                                                     AND m.tenant_id = pando_remote_artifacts.tenant_id \
-                                                     AND m.namespace = pando_remote_artifacts.namespace \
-                                                     AND m.sha256 = pando_remote_artifacts.sha256)",
-                                &[&to_owner, &path],
-                            )
-                            .await;
-                    }
-                } else {
-                    let _ = client
-                        .execute(
-                            "UPDATE pando_remote_artifacts SET state = 'retired', retired_at = COALESCE(retired_at, clock_timestamp()) \
-                             WHERE tenant_id = $1 AND remote_path = $2 AND state = 'active' \
-                               AND NOT EXISTS (SELECT 1 FROM pando_manifest_artifacts m \
-                                               WHERE m.authority_id = pando_remote_artifacts.authority_id \
-                                                 AND m.tenant_id = pando_remote_artifacts.tenant_id \
-                                                 AND m.namespace = pando_remote_artifacts.namespace \
-                                                 AND m.sha256 = pando_remote_artifacts.sha256)",
-                            &[&to_owner, &path],
-                        )
-                        .await;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
+    cleanup_rollback_objects_with_stores(
+        &state.pool,
+        transfer_id,
+        lease_owner,
+        lease_epoch,
+        repo_id,
+        to_owner,
+        copied,
+        lfs_store.as_ref(),
+        &ws_store,
+        pando_remote_allowed.as_ref(),
+        deadline,
+    )
+    .await
 }

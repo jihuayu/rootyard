@@ -344,9 +344,9 @@ pub(super) async fn batch_upload(
     for (oid, size) in repairs {
         // Explicit write-path repair hook: never touched by reads, deduplicated per (oid, size).
         storage::schedule_remote_repair(
+            ctx.state.pool.clone(),
             ctx.state.storage.root.clone(),
             repo_id,
-            tenant_id,
             oid,
             size,
             ctx.state.config.git_timeout,

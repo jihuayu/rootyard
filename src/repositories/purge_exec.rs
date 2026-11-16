@@ -251,6 +251,155 @@ pub async fn execute_safe_remote_deletes(
     Ok((deleted_lfs, deleted_workspace))
 }
 
+async fn lock_unreferenced_pando_artifact(
+    tx: &Transaction<'_>,
+    authority_id: Uuid,
+    tenant_id: Uuid,
+    namespace: &str,
+    sha256: &str,
+    expected_generation: Option<i64>,
+    allowed_states: &[&str],
+) -> Result<Option<i64>> {
+    let locked_auth: Uuid = tx
+        .query_one("SELECT authority_id FROM pando_storage_authorities WHERE singleton FOR UPDATE", &[])
+        .await?
+        .get(0);
+    if locked_auth != authority_id {
+        return Ok(None);
+    }
+    let Some(row) = tx
+        .query_opt(
+            "SELECT state, object_generation FROM pando_remote_artifacts \
+             WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 FOR UPDATE",
+            &[&authority_id, &tenant_id, &namespace, &sha256],
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let state: String = row.get(0);
+    let obj_gen: i64 = row.get(1);
+    if expected_generation.is_some_and(|exp| exp != obj_gen) || !allowed_states.contains(&state.as_str()) {
+        return Ok(None);
+    }
+    let referenced: bool = tx
+        .query_one(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM pando_manifest_artifacts \
+                 WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
+             ) OR EXISTS( \
+                 SELECT 1 FROM pando_publication_fences \
+                 WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
+                   AND lease_until > clock_timestamp() \
+             )",
+            &[&authority_id, &tenant_id, &namespace, &sha256],
+        )
+        .await?
+        .get(0);
+    if referenced {
+        return Ok(None);
+    }
+    Ok(Some(obj_gen))
+}
+
+/// Delete an authority-scoped Pando artifact only after serializing with the
+/// authority/artifact publisher fence, rechecking live links and fences, and
+/// committing `state = 'deleting'` before remote `store.delete`.
+pub(super) async fn delete_pando_artifact_fenced(
+    pool: &Pool,
+    store: &RemoteObjectStore,
+    authority_id: Uuid,
+    tenant_id: Uuid,
+    namespace: &str,
+    sha256: &str,
+    expected_generation: Option<i64>,
+    deadline: Instant,
+) -> Result<bool> {
+    let obj_gen = {
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        let Some(locked_gen) = lock_unreferenced_pando_artifact(
+            &tx,
+            authority_id,
+            tenant_id,
+            namespace,
+            sha256,
+            expected_generation,
+            &["active", "retired"],
+        )
+        .await?
+        else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let marked = tx
+            .execute(
+                "UPDATE pando_remote_artifacts SET state = 'deleting', updated_at = clock_timestamp() \
+                 WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
+                   AND object_generation = $5 AND state IN ('active', 'retired')",
+                &[&authority_id, &tenant_id, &namespace, &sha256, &locked_gen],
+            )
+            .await?;
+        ensure!(marked == 1, "Pando remote artifact state/generation changed before delete fence");
+        tx.commit().await?;
+        locked_gen
+    };
+
+    let key = ObjectKey::scoped(tenant_id, authority_id, obj_gen, namespace, sha256)?;
+    store.delete(&key, deadline).await?;
+    let client = pool.get().await?;
+    let _ = client
+        .execute(
+            "UPDATE pando_remote_artifacts \
+             SET state = 'deleted', deleted_at = clock_timestamp(), updated_at = clock_timestamp() \
+             WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
+               AND object_generation = $5 AND state = 'deleting'",
+            &[&authority_id, &tenant_id, &namespace, &sha256, &obj_gen],
+        )
+        .await?;
+    Ok(true)
+}
+
+/// Retire an unreferenced authority-scoped Pando artifact under the publisher lock
+/// when remote deletion is disabled or PITR-fenced.
+pub(super) async fn retire_pando_artifact_fenced(
+    pool: &Pool,
+    authority_id: Uuid,
+    tenant_id: Uuid,
+    namespace: &str,
+    sha256: &str,
+    expected_generation: Option<i64>,
+) -> Result<bool> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    let Some(locked_gen) = lock_unreferenced_pando_artifact(
+        &tx,
+        authority_id,
+        tenant_id,
+        namespace,
+        sha256,
+        expected_generation,
+        &["active"],
+    )
+    .await?
+    else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+    let updated = tx
+        .execute(
+            "UPDATE pando_remote_artifacts \
+             SET state = 'retired', retired_at = COALESCE(retired_at, clock_timestamp()), updated_at = clock_timestamp() \
+             WHERE authority_id = $1 AND tenant_id = $2 AND namespace = $3 AND sha256 = $4 \
+               AND object_generation = $5 AND state = 'active'",
+            &[&authority_id, &tenant_id, &namespace, &sha256, &locked_gen],
+        )
+        .await?;
+    ensure!(updated == 1, "Pando remote artifact generation changed during fenced retire");
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Remove the local bare repository directory only when contained strictly inside
 /// `storage_root` (no symlink traversal outside storage root).
 pub async fn remove_local_repo_dir(storage_root: &Path, repo_path: &Path) -> Result<()> {
