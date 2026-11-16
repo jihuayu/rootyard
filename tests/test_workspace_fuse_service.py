@@ -343,10 +343,12 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     h.sql(f"SELECT state FROM workspace_checkpoints WHERE id='{checkpoint_id}'"),
                     "local_complete", "an in-flight checkpoint was falsely confirmed")
 
-                # A fresh API must mount the same workspace again, with a new
-                # kernel mount ID, and read the retained lower bytes.  Capture
-                # this fresh API/helper identity and mount ID rather than reusing
-                # the crashed API's evidence.
+                # A fresh API must mount the same workspace again and read the
+                # retained lower bytes.  Mount IDs are scoped to each API's
+                # unshared mount namespace, so the fresh numeric ID is not a
+                # cross-namespace comparison with the crashed API's ID; retain
+                # it for exact fresh-holder and cleanup checks.  Capture this
+                # fresh API/helper identity rather than reusing old evidence.
                 support.terminate_process(holder)
                 holder = None
                 old_mount_cleared = True
@@ -357,8 +359,6 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 new_api_pid = h.proc.pid
                 remount = support.wait_for_fuse_mount(new_api_pid, mountpoint)
                 new_mount_id = int(remount["mount_id"])
-                self.assertNotEqual(new_mount_id, mount_id,
-                                    "fresh API reused the crashed mount ID")
                 after = json.loads(h.expect(
                     f"/api/workspaces/{wid}/files?path=hello.txt", 200, token=h.alice))
                 self.assertEqual(base64.b64decode(after["content_base64"]), b"second\n")
