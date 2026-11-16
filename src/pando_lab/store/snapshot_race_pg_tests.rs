@@ -12,9 +12,7 @@ use uuid::Uuid;
 async fn pg_snapshot_fault_rolls_back_without_token_and_releases_lock() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
-    let Some((config, root)) = config_for("snapshot-rollback") else {
-        return;
-    };
+    let (config, root) = config_for("snapshot-rollback");
     let repo = Uuid::new_v4();
     let nonce = case_nonce();
     let admin_name = actor_appname(&nonce, repo, "admin");
@@ -59,9 +57,7 @@ async fn pg_snapshot_fault_rolls_back_without_token_and_releases_lock() {
 async fn pg_snapshot_retention_uses_live_expiry_not_expired_rows() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
-    let Some((config, root)) = config_for("snapshot-expiry") else {
-        return;
-    };
+    let (config, root) = config_for("snapshot-expiry");
     let repo = Uuid::new_v4();
     let nonce = case_nonce();
     let admin = connect_named(&config, &actor_appname(&nonce, repo, "admin")).await;
@@ -90,9 +86,7 @@ async fn pg_snapshot_retention_uses_live_expiry_not_expired_rows() {
 async fn pg_ordinary_snapshot_still_does_not_retain() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
-    let Some((config, root)) = config_for("ordinary-snapshot") else {
-        return;
-    };
+    let (config, root) = config_for("ordinary-snapshot");
     let repo = Uuid::new_v4();
     let nonce = case_nonce();
     let admin = connect_named(&config, &actor_appname(&nonce, repo, "admin")).await;

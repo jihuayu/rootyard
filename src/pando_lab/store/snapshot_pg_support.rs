@@ -36,28 +36,34 @@ fn external_override_present() -> bool {
     .any(|key| std::env::var_os(key).is_some())
 }
 
-pub(super) fn config_for(label: &str) -> Option<(Config, PathBuf)> {
+pub(super) fn config_for(label: &str) -> (Config, PathBuf) {
     if external_override_present() {
         panic!(
             "snapshot retention PG fixture refuses external object-store/KMS/endpoint overrides"
         );
     }
-    let database = std::env::var("ROOTYARD_TEST_DATABASE_URL").ok()?;
-    if database.trim().is_empty() {
-        return None;
+    let database = std::env::var("ROOTYARD_TEST_DATABASE_URL").unwrap_or_else(|_| {
+        panic!("snapshot retention PG cases require a nonempty ROOTYARD_TEST_DATABASE_URL")
+    });
+    let database = database.trim().to_owned();
+    if database.is_empty() {
+        panic!("snapshot retention PG cases require a nonempty ROOTYARD_TEST_DATABASE_URL");
+    }
+    if database.parse::<tokio_postgres::Config>().is_err() {
+        panic!("snapshot retention PG cases require a valid ROOTYARD_TEST_DATABASE_URL");
     }
     let database = database_with_repeatable_read_default(&database);
     let root = std::env::temp_dir().join(format!("pando-snapshot-pg-{label}-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(root.join("objects")).ok()?;
-    std::fs::create_dir_all(root.join("sessions")).ok()?;
-    Some((
+    std::fs::create_dir_all(root.join("objects")).expect("snapshot retention fixture root");
+    std::fs::create_dir_all(root.join("sessions")).expect("snapshot retention fixture sessions");
+    (
         Config {
             database,
             root: root.clone(),
             git: PathBuf::from("/usr/bin/git"),
         },
         root,
-    ))
+    )
 }
 
 pub(super) fn actor_config(config: &Config, appname: &str) -> Config {

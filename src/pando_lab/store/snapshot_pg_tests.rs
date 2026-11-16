@@ -12,9 +12,7 @@ use uuid::Uuid;
 async fn pg_snapshot_wins_retains_old_pack_before_insert() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
-    let Some((config, root)) = config_for("snapshot-wins") else {
-        return;
-    };
+    let (config, root) = config_for("snapshot-wins");
     let repo = Uuid::new_v4();
     let nonce = case_nonce();
     let admin_name = actor_appname(&nonce, repo, "admin");
@@ -91,9 +89,7 @@ async fn pg_snapshot_wins_retains_old_pack_before_insert() {
 async fn pg_repack_wins_snapshot_selects_replacement_after_commit() {
     let _lock = test_lock();
     let _hooks = HookGuard::new();
-    let Some((config, root)) = config_for("repack-wins") else {
-        return;
-    };
+    let (config, root) = config_for("repack-wins");
     let repo = Uuid::new_v4();
     let nonce = case_nonce();
     let admin_name = actor_appname(&nonce, repo, "admin");
