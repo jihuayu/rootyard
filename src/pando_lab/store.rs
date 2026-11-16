@@ -7,6 +7,25 @@ use std::{
     io::Write,
 };
 
+mod snapshot_retention;
+
+pub(super) async fn snapshot_and_retain(
+    client: &mut Client,
+    repo: Uuid,
+    principal: &str,
+) -> Result<Uuid> {
+    snapshot_retention::snapshot_and_retain(client, repo, principal).await
+}
+
+#[cfg(test)]
+pub(super) mod snapshot_pg_barrier;
+#[cfg(test)]
+pub(super) mod snapshot_pg_support;
+#[cfg(test)]
+mod snapshot_pg_tests;
+#[cfg(test)]
+mod snapshot_race_pg_tests;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcReport {
     pub orphan_packs_deleted: usize,
@@ -303,7 +322,15 @@ pub(super) async fn publish_pack(
 /// fences non-terminal operations, and purges expired read snapshots.
 pub(super) async fn gc(config: &Config, repo_filter: Option<Uuid>) -> Result<GcReport> {
     let mut c = config.db().await?;
-    let t = c.transaction().await?;
+    // The repository row locks can wait behind a retained-snapshot commit.
+    // Read committed keeps the post-wait live-snapshot scan fresh instead of
+    // reusing a repeatable-read image taken before the wait.
+    let t = c
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .read_only(false)
+        .start()
+        .await?;
 
     let repos: Vec<Uuid> = if let Some(repo) = repo_filter {
         t.query(
