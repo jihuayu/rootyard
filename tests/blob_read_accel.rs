@@ -111,9 +111,7 @@ impl LoopbackS3 {
         let mut objs = self.state.objects.lock().unwrap();
         let key = Self::key(locator);
         match truncate_to {
-            Some(0) => {
-                objs.remove(&key);
-            }
+            Some(0) => drop(objs.remove(&key)),
             Some(len) => {
                 if let Some(bytes) = objs.get_mut(&key) {
                     bytes.truncate(len);
@@ -187,8 +185,9 @@ fn git_ok(repo: &Path, args: &[&str]) -> Result<String> {
 fn commit_files(root: &Path, prefix: &str, count: usize) -> Result<()> {
     for i in 0..count {
         std::fs::write(root.join(format!("{prefix}-{i}.txt")), format!("{prefix}-{i}\n"))?;
-        git_ok(root, &["add", "."])?;
-        git_ok(root, &["commit", "-m", &format!("{prefix} {i}")])?;
+        for args in [&["add", "."][..], &["commit", "-m", &format!("{prefix} {i}")]] {
+            git_ok(root, args)?;
+        }
     }
     Ok(())
 }
@@ -223,10 +222,12 @@ impl SampleRepoPacks {
             git_ok(root, &["repack", "--no-write-bitmap-index"])?;
         }
         let feature_tip = git_ok(root, &["rev-parse", "refs/heads/feature"])?;
+        let tenant_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
         let mut sample = Self {
             work_dir,
-            tenant_id: Uuid::new_v4(),
-            repo_id: Uuid::new_v4(),
+            tenant_id,
+            repo_id,
             history_id: Uuid::new_v4(),
             format,
             packs: Vec::new(),
@@ -274,10 +275,11 @@ impl SampleRepoPacks {
         ctx: &TestCtx,
         gen_num: u64,
         packs: &[AuthoritativePackSource],
-        bundle: Option<&BuiltReadAccelBundle>,
-        enabled: bool,
+        refs: &[AuthoritativeRef],
+        bundle_on: (Option<&BuiltReadAccelBundle>, bool),
         registry: Option<PackRetentionRegistry>,
     ) -> Result<MaterializedAccelView> {
+        let (bundle, enabled) = bundle_on;
         let manifest_ref = bundle
             .map(|b| ManifestFetchRef { locator: b.manifest_locator.clone(), envelope: b.manifest_envelope.clone() });
         let config = if enabled { ReadAccelConfig::enabled_default() } else { ReadAccelConfig::default() };
@@ -288,7 +290,7 @@ impl SampleRepoPacks {
             object_format: self.format,
             expected_membership_generation: gen_num,
             authoritative_packs: packs.to_vec(),
-            refs: self.refs.clone(),
+            refs: refs.to_vec(),
             manifest_ref,
             config,
             retention_registry: registry,
@@ -328,7 +330,7 @@ impl SampleRepoPacks {
         b: Option<&BuiltReadAccelBundle>,
         on: bool,
     ) -> Result<MaterializedAccelView> {
-        self.open_with_packs(ctx, gen_n, &self.packs, b, on, None).await
+        self.open_with_packs(ctx, gen_n, &self.packs, &self.refs, (b, on), None).await
     }
 }
 
@@ -396,6 +398,10 @@ async fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Result<()> {
 
 #[tokio::test]
 async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Result<()> {
+    use ReadAccelFallbackReason::{
+        MembershipGenerationDrift, PackSetDigestDrift, SidecarArtifactCorrupt, SidecarArtifactMissing,
+    };
+    use ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly as Fallback;
     let s3 = LoopbackS3::shared();
     let ctx = test_ctx()?;
     let sample = SampleRepoPacks::seed(ReadAccelObjectFormat::Sha1, true)?;
@@ -404,20 +410,11 @@ async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Res
 
     // 1. Membership drift & pack-set drift fail closed before sidecar GETs.
     let drift_view = sample.open(&ctx, 2, Some(&bundle), true).await?;
-    ensure!(matches!(
-        drift_view.status(),
-        ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(ReadAccelFallbackReason::MembershipGenerationDrift {
-            expected: 2,
-            manifest: 1
-        })
-    ));
+    ensure!(matches!(drift_view.status(), Fallback(MembershipGenerationDrift { expected: 2, manifest: 1 })));
     ensure!(drift_view.metrics().sidecar_get_attempts == 1);
     assert_git_parity(baseline.repo_path()?, drift_view.repo_path()?, &sample)?;
-    let subset_view = sample.open_with_packs(&ctx, 1, &sample.packs[..1], Some(&bundle), true, None).await?;
-    ensure!(matches!(
-        subset_view.status(),
-        ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(ReadAccelFallbackReason::PackSetDigestDrift)
-    ));
+    let subset_view = sample.open_with_packs(&ctx, 1, &sample.packs[..1], &[], (Some(&bundle), true), None).await?;
+    ensure!(matches!(subset_view.status(), Fallback(PackSetDigestDrift)));
 
     // 2. Local cache tamper scrubs sidecars cleanly; cleared-cache rebuild restores Applied view.
     let cached_view = sample.open(&ctx, 1, Some(&bundle), true).await?;
@@ -430,13 +427,8 @@ async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Res
     let (status, removed) =
         verify_and_recover_view_sidecars(cached_view.repo_path()?, Some(&bundle.manifest), ctx.dl).await?;
     ensure!(
-        matches!(
-            status,
-            ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(ReadAccelFallbackReason::SidecarArtifactCorrupt {
-                kind: ReadAccelArtifactKind::Bitmap,
-                ..
-            })
-        ) && removed.len() == 3
+        matches!(status, Fallback(SidecarArtifactCorrupt { kind: ReadAccelArtifactKind::Bitmap, .. }))
+            && removed.len() == 3
             && !cached_view.repo_path()?.join("objects/pack/multi-pack-index").exists()
     );
     assert_git_parity(baseline.repo_path()?, cached_view.repo_path()?, &sample)?;
@@ -454,15 +446,15 @@ async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Res
     ] {
         s3.mutate_object(&target_bundle.manifest.artifact(kind).unwrap().locator.to_locator()?, op);
         let view = sample.open(&ctx, 1, Some(target_bundle), true).await?;
-        let ok = match view.status() {
-            ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(r) => match (r, want_missing) {
-                (ReadAccelFallbackReason::SidecarArtifactMissing(k), true) => *k == kind,
-                (ReadAccelFallbackReason::SidecarArtifactCorrupt { kind: k, .. }, false) => *k == kind,
+        ensure!(
+            match (view.status(), want_missing) {
+                (Fallback(SidecarArtifactMissing(k)), true) => *k == kind,
+                (Fallback(SidecarArtifactCorrupt { kind: k, .. }), false) => *k == kind,
                 _ => false,
             },
-            _ => false,
-        };
-        ensure!(ok, "unexpected fallback status: {:?}", view.status());
+            "unexpected fallback status: {:?}",
+            view.status()
+        );
         if require_midx_quarantine {
             ensure!(view.metrics().quarantined_sidecar_paths.iter().any(|p| p == "objects/pack/multi-pack-index"));
             ensure!(!view.repo_path()?.join("objects/pack/multi-pack-index").exists());
@@ -479,7 +471,9 @@ async fn retention_pin_protects_packs_until_release_and_compaction_rebuild() -> 
     ensure!(sample.packs.len() >= 2);
     let registry = PackRetentionRegistry::new();
     let gen1 = sample.build(&ctx, 1, 1, &sample.packs, Some(registry.clone())).await?;
-    let active_view = sample.open_with_packs(&ctx, 1, &sample.packs, Some(&gen1), true, Some(registry.clone())).await?;
+    let active_view = sample
+        .open_with_packs(&ctx, 1, &sample.packs, &sample.refs, (Some(&gen1), true), Some(registry.clone()))
+        .await?;
     ensure!(
         registry.is_pack_pinned(&sample.packs[0].pack_locator) && registry.is_pack_pinned(&sample.packs[0].idx_locator)
     );
@@ -491,7 +485,7 @@ async fn retention_pin_protects_packs_until_release_and_compaction_rebuild() -> 
     let compacted_packs = sample.collect_and_upload_packs()?;
     ensure!(compacted_packs.len() == 1);
     let gen2 = sample.build(&ctx, 2, 2, &compacted_packs, Some(registry)).await?;
-    let gen2_view = sample.open_with_packs(&ctx, 2, &compacted_packs, Some(&gen2), true, None).await?;
+    let gen2_view = sample.open_with_packs(&ctx, 2, &compacted_packs, &sample.refs, (Some(&gen2), true), None).await?;
     ensure!(*gen2_view.status() == ReadAccelSidecarStatus::Applied);
     git_ok(gen2_view.repo_path()?, &["multi-pack-index", "verify"])?;
     assert_git_parity(baseline.repo_path()?, gen2_view.repo_path()?, &sample)?;
