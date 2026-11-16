@@ -70,7 +70,7 @@ async fn stop_before_query_submits_no_work() {
 async fn stop_during_permit_wait_submits_no_work() {
     let stop = CancellationToken::new();
     let (polled_tx, polled_rx) = oneshot::channel();
-    let (permit_tx, permit_rx) = oneshot::channel();
+    let (permit_tx, permit_rx) = oneshot::channel::<()>();
     let submitted = Arc::new(AtomicBool::new(false));
     let seen = submitted.clone();
     let start_stop = stop.clone();
