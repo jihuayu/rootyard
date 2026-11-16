@@ -99,7 +99,9 @@ def primary_result_classifier(log_path) -> dict:
     final_result = None
     for line in text.splitlines():
         if line.startswith(_PRIMARY_RESULT_PREFIX):
-            final_result = line.rstrip()
+            # splitlines removes line terminators only; every other character,
+            # including trailing spaces and tabs, remains significant.
+            final_result = line
     if final_result is None:
         raise LegacyAcceptanceError("service emitted no final application error result")
     if final_result != _EXPECTED_PRIMARY_RESULT:
