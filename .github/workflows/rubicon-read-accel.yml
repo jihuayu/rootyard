@@ -9,6 +9,7 @@ on:
       - 'src/blob_store/read_accel.rs'
       - 'src/blob_store/read_accel/**'
       - 'tests/blob_read_accel.rs'
+      - 'tests/blob_read_accel_support/**'
       - 'tests/test_blob_read_accel_contracts.py'
       - 'scripts/eval_blob_read_accel.py'
       - 'docs/rubicon-read-accel.md'
