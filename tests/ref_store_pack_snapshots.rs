@@ -3227,6 +3227,42 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
                 && owned_b_read.gate_revision() == owned_b_gate,
             "actor-owned historical read moved the immutable capture"
         );
+        ensure!(!owned_b_read.packs().is_empty(), "actor-owned capture has no registered pack");
+        let owned_b_head = owned_b_read
+            .head_oid_hex()
+            .ok_or_else(|| anyhow!("actor-owned captured head is missing"))?
+            .to_owned();
+        let materializer = PgPackSnapshotMaterializer::new(store.clone(), git.clone())?;
+        let owned_view = PgServingSnapshotMetadata
+            .materialize_actor_owned(
+                &db.pool,
+                &admin_producer,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &materializer,
+                deadline(),
+            )
+            .await?;
+        ensure!(
+            owned_view.scope().owner_id() == admin_producer.id
+                && owned_view.scope().tenant_id() == tenant
+                && owned_view.gate_revision() == owned_b_gate
+                && owned_view.complete_git_read_snapshot()
+                && owned_view.pack_count() > 0
+                && owned_view.packs().len() == owned_b_read.packs().len(),
+            "actor-owned materialized view owner/shape differs"
+        );
+        for (expected, actual) in owned_b_read.packs().iter().zip(owned_view.packs()) {
+            assert_pack_identity(expected, actual)?;
+        }
+        ensure!(
+            read_materialized_file(&owned_view, &git, &owned_b_head, "file.txt").await?
+                == b"serving snapshot fixture\n",
+            "actor-owned materialized Git content differs"
+        );
 
         // The tenant Admin is authorized but is not the owned snapshot's actor;
         // the durable owner check must refuse without reshaping the capture.
@@ -3284,6 +3320,56 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
             "tenant-owned actor-owned refusal changed the ledger"
         );
 
+        match PgServingSnapshotMetadata
+            .materialize_actor_owned(
+                &db.pool,
+                &actor,
+                ServingSnapshotRead {
+                    owner: owned_owner.clone(),
+                    name: owned_name.clone(),
+                    snapshot_id: owned_b_snapshot,
+                },
+                &materializer,
+                deadline(),
+            )
+            .await
+        {
+            Err(error) if error.0 == axum::http::StatusCode::NOT_FOUND => {}
+            Err(error) => {
+                return Err(anyhow!(
+                    "non-owner actor-owned materialization returned {} {}",
+                    error.0,
+                    error.1
+                ));
+            }
+            Ok(_) => return Err(anyhow!("non-owner actor-owned materialization unexpectedly returned a view")),
+        }
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
+            "non-owner actor-owned materialization changed the ledger"
+        );
+        ensure!(
+            PgServingSnapshotMetadata
+                .materialize(
+                    &db.pool,
+                    &actor,
+                    ServingSnapshotRead {
+                        owner: owned_owner.clone(),
+                        name: owned_name.clone(),
+                        snapshot_id: owned_b_snapshot,
+                    },
+                    &materializer,
+                    deadline(),
+                )
+                .await
+                .is_err(),
+            "tenant default materializer accepted an actor-owned snapshot"
+        );
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
+            "tenant default actor-owned materialization changed the ledger"
+        );
+
         // Admin role loss is a real RBAC refusal, not an ownership fallback.
         db.set_collaborator_role(repo, admin_producer.id, "write").await?;
         expect_forbidden(
@@ -3293,8 +3379,8 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
                     &db.pool,
                     &admin_producer,
                     ServingSnapshotRead {
-                        owner: owned_owner,
-                        name: owned_name,
+                        owner: owned_owner.clone(),
+                        name: owned_name.clone(),
                         snapshot_id: owned_b_snapshot,
                     },
                     &backend,
@@ -3305,6 +3391,26 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
         ensure!(
             metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
             "role-revoked actor-owned refusal changed the ledger"
+        );
+        expect_forbidden(
+            "role-revoked actor-owned materialization",
+            PgServingSnapshotMetadata
+                .materialize_actor_owned(
+                    &db.pool,
+                    &admin_producer,
+                    ServingSnapshotRead {
+                        owner: owned_owner,
+                        name: owned_name,
+                        snapshot_id: owned_b_snapshot,
+                    },
+                    &materializer,
+                    deadline(),
+                )
+                .await,
+        )?;
+        ensure!(
+            metadata_ledger_snapshot(&db.pool, repo, tenant).await? == owned_ledger,
+            "role-revoked actor-owned materialization changed the ledger"
         );
         Ok::<(), anyhow::Error>(())
     }

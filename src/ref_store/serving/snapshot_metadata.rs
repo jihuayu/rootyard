@@ -504,8 +504,16 @@ impl PgServingSnapshotMetadata {
         )
         .map_err(map_metadata_error)?;
         let prepared =
-            match timeout_at(deadline, materializer.prepare_retained_serving(snapshot, cluster_incarnation, deadline))
-                .await
+            match timeout_at(
+                deadline,
+                materializer.prepare_retained_serving(
+                    snapshot,
+                    ownership.owner_id(actor, tenant_id),
+                    cluster_incarnation,
+                    deadline,
+                ),
+            )
+            .await
             {
                 Ok(result) => result.map_err(map_metadata_error)?,
                 Err(_) => return Err(deadline_error()),
