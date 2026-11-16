@@ -21,10 +21,12 @@ jobs:
     # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
     runs-on: ubuntu-22.04
     # Job cap with bounded headroom for the three populated RefStore/artifact-hold
-    # backup drills below: their step caps grow from 5 to 10 minutes each, so the
-    # worst case added here is 3 x 5 = 15 minutes. Keep this bounded; raising it
-    # further must not be used to hide a regression inside one individual step.
-    timeout-minutes: 75
+    # backup drills below (their step caps grow from 5 to 10 minutes each, adding
+    # 3 x 5 = 15 worst-case minutes) and the two sequential Issue 85 acceptance
+    # steps below (each capped at 10 minutes, adding 2 x 10 = 20 worst-case
+    # minutes). Keep this bounded; raising it further must not be used to hide a
+    # regression inside one individual step.
+    timeout-minutes: 95
     services:
       postgres:
         image: postgres:17
@@ -309,6 +311,12 @@ jobs:
       - name: Exercise repository archive, rename aliases, soft-delete purge, and ownership transfer (#85)
         timeout-minutes: 10
         run: python3 tests/repository_lifecycle.py --binary "$ROOTYARD_BIN" --report test-results/repository-lifecycle.json
+      - name: Exercise deleted webhook-claim fence (#85)
+        timeout-minutes: 10
+        run: ROOTYARD_EXPECTED_SOURCE_COMMIT="$GITHUB_SHA" python3 tests/repository_lifecycle_deleted_claim_acceptance.py --binary "$ROOTYARD_BIN" --report test-results/repository-lifecycle-deleted-claim.json
+      - name: Exercise literal Issue 85 purge-hold and alias acceptance
+        timeout-minutes: 10
+        run: python3 tests/repository_lifecycle_acceptance.py --binary "$ROOTYARD_BIN" --build-receipt "$ROOTYARD_BUILD_RECEIPT" --expected-source-commit "$GITHUB_SHA" --report test-results/repository-lifecycle-issue85-literal.json
       - name: Exercise repository read-only Browse API and atomic multi-ref CAS transactions
         run: python3 tests/browse.py --mixed-refs --git "$(command -v git)" --binary "$ROOTYARD_BIN" --report test-results/browse.json
       - name: Exercise repository pagination against real PostgreSQL
@@ -450,6 +458,8 @@ jobs:
             --report organizations_lifecycle=test-results/organizations-lifecycle.json \
             --report forge_collaboration=test-results/forge-collaboration.json \
             --report repository_lifecycle=test-results/repository-lifecycle.json \
+            --report repository_lifecycle_deleted_claim=test-results/repository-lifecycle-deleted-claim.json \
+            --report issue85_literal_lifecycle=test-results/repository-lifecycle-issue85-literal.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
             --report web_repository_pagination=test-results/web-repository-pagination.json \
             --report worker_diagnostics=test-results/worker-diagnostics.json \
@@ -518,6 +528,13 @@ jobs:
             --harness tests/organizations_lifecycle.py \
             --harness tests/forge_collaboration.py \
             --harness tests/repository_lifecycle.py \
+            --harness tests/repository_lifecycle_deleted_claim_acceptance.py \
+            --harness tests/repository_lifecycle_acceptance.py \
+            --harness tests/repository_lifecycle_acceptance_support.py \
+            --harness tests/repository_lifecycle_acceptance_holds.py \
+            --harness tests/repository_lifecycle_acceptance_alias.py \
+            --harness tests/test_repository_lifecycle_acceptance_contract.py \
+            --harness tests/test_repository_lifecycle_acceptance_provenance.py \
             --harness tests/backup.py \
             --harness tests/web_detail_pagination.py \
             --harness tests/web_repository_pagination.py \
@@ -600,6 +617,15 @@ jobs:
             --require-case repository_lifecycle=rename_aliases_and_authz_before_redirect \
             --require-case repository_lifecycle=soft_delete_restore_and_purge_holds \
             --require-case repository_lifecycle=ownership_transfer_and_crash_recovery \
+            --require-case repository_lifecycle_deleted_claim=source_claim_fence_contract \
+            --require-case repository_lifecycle_deleted_claim=live_control_secret_claim_and_expired_reclaim \
+            --require-case repository_lifecycle_deleted_claim=live_main_run_expired_lease_fixture \
+            --require-case repository_lifecycle_deleted_claim=deleted_claim_after_early_lookup_rejected_by_final_row_lock \
+            --require-case repository_lifecycle_deleted_claim=deleted_expired_lease_reclaim_denied_without_new_grant \
+            --require-case issue85_literal_lifecycle=backup_root_blocks_purge \
+            --require-case issue85_literal_lifecycle=serving_read_header_blocks_purge \
+            --require-case issue85_literal_lifecycle=ci_pin_blocks_purge \
+            --require-case issue85_literal_lifecycle=rename_alias_accepts_real_git_and_lfs_writes \
             --fixture-rust-from-receipt \
             --fixture git="$(git --version)" \
             --fixture git_lfs="$(git lfs version)" \
