@@ -595,7 +595,9 @@ pub fn validate_ref_cas_command(command: &RefCasCommand) -> Result<(), Applicati
 mod tests {
     use super::*;
     use crate::ref_store::core::state_machine::{
-        InitializeGateCommand, NoopCommand, RefCasCommand, RepositoryLane, SmPackMode, WireGateInit, encode_command,
+        CloseAuthScopeCommand, InitializeGateCommand, InstallDecisionCommand, InstallScopedDecisionCommand,
+        NoopCommand, RefCasCommand, RepositoryLane, ScopeLifecycle, SmPackMode, WireDecisionGrantCommitment,
+        WireDecisionKind, WireDecisionScopeDep, WireDecisionVerdict, WireGateInit, encode_command,
     };
     use crate::ref_store::core::types::GitObjectFormat;
     use crate::ref_store::raft_backend::outcome::{RootRefCasApplied, RootRefCasOutcome, RootRefCasRefusalKind};
@@ -840,6 +842,116 @@ mod tests {
         assert_eq!(applied.kind, ProposalAttemptKind::First);
         assert!(applied.outcome.is_applied());
         assert_eq!(app.logical_clock_floor(), 0);
+    }
+
+    #[test]
+    fn scoped_install_and_close_execute_only_inside_the_live_gate_scope() {
+        let mut app = RootRefCasStateMachine::new();
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let init_log = ApplicationLogId::new(1, 1);
+        let init_id = scoped_id(repo, tenant, history, 1, 1, GitObjectFormat::Sha256, 0, 5);
+        let init = init_command(repo, tenant, history, 1, 1, GitObjectFormat::Sha256);
+        app.apply(init_log, &envelope(&init_id, &init)).expect("initial gate");
+        let gate = app.machine().read_gate_version(repo).unwrap().expect("live gate");
+
+        let decision_id = Uuid::from_u128(70);
+        let scope_id = Uuid::from_u128(71);
+        let commitment = WireDecisionGrantCommitment {
+            base_gate_digest: gate.digest().as_hex(),
+            packs_digest: "11".repeat(32),
+            hold_receipts_digest: "22".repeat(32),
+            captured_oid_digest: "33".repeat(32),
+            required_holds: Vec::new(),
+        };
+        let install = InstallScopedDecisionCommand {
+            decision: InstallDecisionCommand {
+                decision_id,
+                repository_id: repo,
+                tenant_id: tenant,
+                actor_id: Uuid::from_u128(72),
+                operation_id: Uuid::from_u128(73),
+                kind: WireDecisionKind::Atomic,
+                base_revision: gate.revision(),
+                command_digest: "44".repeat(32),
+                selection_digest: "55".repeat(32),
+                policy_digest: "66".repeat(32),
+                facts_digest: "77".repeat(32),
+                authz_digest: "88".repeat(32),
+                dependencies_digest: "99".repeat(32),
+                verdicts: vec![WireDecisionVerdict {
+                    ref_name: "refs/heads/main".to_owned(),
+                    accepted: true,
+                    reject_code: None,
+                }],
+                authz_epoch: 2,
+                not_after_tick: 100,
+                logical_tick: 10,
+            },
+            scope_dependencies: vec![WireDecisionScopeDep {
+                scope_kind: "token".to_owned(),
+                scope_id,
+                observed_version: 1,
+                observed_digest: "aa".repeat(32),
+            }],
+            grant_commitment: commitment,
+        };
+        let install_log = ApplicationLogId::new(1, 2);
+        let install_id = scoped_id(repo, tenant, history, 1, 2, GitObjectFormat::Sha256, 1, 20);
+        app.apply(install_log, &envelope(&install_id, &RefCasCommand::InstallScopedDecision(install.clone())))
+            .expect("scoped decision install");
+        let installed = app.query_attempt(install_log).expect("install attempt");
+        assert!(matches!(
+            &installed.outcome,
+            RootRefCasOutcome::Applied(RootRefCasApplied::DecisionInstalled { decision_id: actual, replayed: false })
+                if *actual == decision_id
+        ));
+        assert_eq!(app.logical_clock_floor(), 10);
+
+        let close = CloseAuthScopeCommand {
+            scope_kind: "token".to_owned(),
+            scope_id,
+            repository_id: Some(repo),
+            tenant_id: Some(tenant),
+            lifecycle: ScopeLifecycle::Closing,
+            authz_floor: 2,
+            change_id: Uuid::from_u128(74),
+            logical_tick: 11,
+        };
+        let close_log = ApplicationLogId::new(1, 3);
+        let close_id = scoped_id(repo, tenant, history, 1, 2, GitObjectFormat::Sha256, 2, 21);
+        app.apply(close_log, &envelope(&close_id, &RefCasCommand::CloseAuthScope(close)))
+            .expect("close scoped decision");
+        let closed = app.query_attempt(close_log).expect("close attempt");
+        assert!(matches!(
+            &closed.outcome,
+            RootRefCasOutcome::Applied(RootRefCasApplied::AuthScopeClosed {
+                scope_kind,
+                scope_id: actual,
+                lifecycle: ScopeLifecycle::Closing,
+                authz_floor: 2,
+                replayed: false,
+                ..
+            }) if scope_kind.as_str() == "token" && *actual == scope_id
+        ));
+        assert_eq!(app.logical_clock_floor(), 11);
+        let prior_gate = app.machine().read_gate_version(repo).unwrap();
+
+        let mut foreign = install;
+        foreign.decision.tenant_id = Uuid::from_u128(21);
+        let foreign_log = ApplicationLogId::new(1, 4);
+        let foreign_id = scoped_id(repo, tenant, history, 1, 2, GitObjectFormat::Sha256, 3, 22);
+        app.apply(foreign_log, &envelope(&foreign_id, &RefCasCommand::InstallScopedDecision(foreign)))
+            .expect("foreign nested scope is a typed refusal");
+        let refused = app.query_attempt(foreign_log).expect("foreign attempt");
+        assert_eq!(refused.kind, ProposalAttemptKind::First);
+        assert!(matches!(
+            &refused.outcome,
+            RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::ProposalScopeMismatch
+        ));
+        assert_eq!(app.machine().read_gate_version(repo).unwrap(), prior_gate);
+        assert_eq!(app.logical_clock_floor(), 11);
     }
 
     #[test]

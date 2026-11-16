@@ -3,7 +3,7 @@
 use uuid::Uuid;
 
 use crate::ref_store::CoreGateVersion;
-use crate::ref_store::core::state_machine::{RefCasCommand, SetRepositoryLaneCommand};
+use crate::ref_store::core::state_machine::{RefCasCommand, SetRepositoryLaneCommand, WireCommitRefsRequest};
 use crate::ref_store::core::types::GitObjectFormat;
 use crate::ref_store::raft_backend::error::RaftBackendError;
 use crate::ref_store::raft_backend::outcome::RootRefCasRefusalKind;
@@ -11,7 +11,7 @@ use crate::ref_store::raft_backend::proposal::ProposalId;
 use crate::ref_store::raft_backend::realm::RealmBinding;
 
 struct CommandScope {
-    repository_id: Uuid,
+    repository_id: Option<Uuid>,
     tenant_id: Option<Uuid>,
     group_epoch: Option<i64>,
     authority_id: Option<Uuid>,
@@ -27,13 +27,22 @@ fn base(
     authority_id: Option<Uuid>,
 ) -> CommandScope {
     CommandScope {
-        repository_id,
+        repository_id: Some(repository_id),
         tenant_id,
         group_epoch,
         authority_id,
         history_incarnation: None,
         authority_epoch: None,
         object_format: None,
+    }
+}
+
+fn commit_request_scope(request: &WireCommitRefsRequest) -> CommandScope {
+    CommandScope {
+        history_incarnation: Some(request.history_incarnation),
+        authority_epoch: Some(request.authority_epoch),
+        object_format: Some(request.object_format),
+        ..base(request.repository_id, Some(request.tenant_id), Some(request.group_epoch), None)
     }
 }
 
@@ -65,15 +74,25 @@ pub(crate) fn validate_command_scope(
             ..base(cmd.repository_id, Some(cmd.tenant_id), Some(cmd.group_epoch), None)
         },
         RefCasCommand::BeginOperation(cmd) => base(cmd.identity.repository_id, None, None, None),
-        RefCasCommand::CommitRefs(cmd) => CommandScope {
-            history_incarnation: Some(cmd.request.history_incarnation),
-            authority_epoch: Some(cmd.request.authority_epoch),
-            object_format: Some(cmd.request.object_format),
-            ..base(cmd.request.repository_id, Some(cmd.request.tenant_id), Some(cmd.request.group_epoch), None)
-        },
+        RefCasCommand::CommitRefs(cmd) => commit_request_scope(&cmd.request),
+        RefCasCommand::CommitScopedRefs(cmd) => commit_request_scope(&cmd.commit.request),
         RefCasCommand::Cancel(cmd) => base(cmd.identity.repository_id, None, None, None),
         RefCasCommand::AdvanceCancelCutoff(cmd) => base(cmd.repository_id, None, None, None),
         RefCasCommand::InstallDecision(cmd) => base(cmd.repository_id, Some(cmd.tenant_id), None, None),
+        RefCasCommand::InstallScopedDecision(cmd) => {
+            base(cmd.decision.repository_id, Some(cmd.decision.tenant_id), None, None)
+        }
+        RefCasCommand::CloseAuthScope(cmd) => CommandScope {
+            // A closing-auth-scope row may name a global scope; only the optional axes actually
+            // present are constrained. The proposal identity is still live-gate fenced.
+            repository_id: cmd.repository_id,
+            tenant_id: cmd.tenant_id,
+            group_epoch: None,
+            authority_id: None,
+            history_incarnation: None,
+            authority_epoch: None,
+            object_format: None,
+        },
         RefCasCommand::CreateSnapshotPin(cmd) => CommandScope {
             history_incarnation: Some(cmd.history_incarnation),
             authority_epoch: Some(cmd.authority_epoch),
@@ -96,7 +115,7 @@ pub(crate) fn validate_command_scope(
         RefCasCommand::RetireHoldBatch(cmd) => base(cmd.repository_id, Some(cmd.tenant_id), None, None),
     };
 
-    if scope.repository_id != repository_id {
+    if scope.repository_id.is_some_and(|value| value != repository_id) {
         return Err(RaftBackendError::ScopeMismatch("repository_id"));
     }
     if scope.tenant_id.is_some_and(|value| value != tenant_id) {
@@ -218,12 +237,17 @@ fn proposal_matches_live_gate(live: &CoreGateVersion, proposal: &ProposalId) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ref_store::CommitMode;
     use crate::ref_store::core::contract::CoreGate;
     use crate::ref_store::core::state_machine::{
-        InitializeGateCommand, NoopCommand, RepositoryLane, ScopeLifecycle, SetRepositoryLaneCommand, SmPackMode,
-        WireGateInit,
+        CloseAuthScopeCommand, CommitRefsCommand, CommitScopedRefsCommand, InitializeGateCommand,
+        InstallDecisionCommand, InstallScopedDecisionCommand, NoopCommand, RepositoryLane, ScopeLifecycle,
+        SetRepositoryLaneCommand, SmPackMode, WireCommitRefsRequest, WireDecisionGrantCommitment, WireDecisionKind,
+        WireDecisionScopeDep, WireDecisionVerdict, WireGateInit, WireHeadUpdate, WireHeadUpdateKind,
+        WireOperationIdentity,
     };
     use crate::ref_store::{CoreGateInit, RefName};
+    use std::collections::BTreeMap;
 
     fn live_gate(
         repo: Uuid,
@@ -403,5 +427,205 @@ mod tests {
             authz_floor: 1,
         });
         assert_eq!(fence_proposal_against_gate(Some(&live), &stale, &initialize), None);
+    }
+
+    fn grant_commitment() -> WireDecisionGrantCommitment {
+        WireDecisionGrantCommitment {
+            base_gate_digest: "07".repeat(32),
+            packs_digest: "08".repeat(32),
+            hold_receipts_digest: "09".repeat(32),
+            captured_oid_digest: "0a".repeat(32),
+            required_holds: Vec::new(),
+        }
+    }
+
+    fn install_scoped_command(repo: Uuid, tenant: Uuid) -> InstallScopedDecisionCommand {
+        InstallScopedDecisionCommand {
+            decision: InstallDecisionCommand {
+                decision_id: Uuid::from_u128(40),
+                repository_id: repo,
+                tenant_id: tenant,
+                actor_id: Uuid::from_u128(41),
+                operation_id: Uuid::from_u128(42),
+                kind: WireDecisionKind::Atomic,
+                base_revision: 1,
+                command_digest: "00".repeat(32),
+                selection_digest: "01".repeat(32),
+                policy_digest: "02".repeat(32),
+                facts_digest: "03".repeat(32),
+                authz_digest: "04".repeat(32),
+                dependencies_digest: "05".repeat(32),
+                verdicts: vec![WireDecisionVerdict {
+                    ref_name: "refs/heads/main".to_owned(),
+                    accepted: true,
+                    reject_code: None,
+                }],
+                authz_epoch: 1,
+                not_after_tick: 100,
+                logical_tick: 1,
+            },
+            scope_dependencies: vec![WireDecisionScopeDep {
+                scope_kind: "token".to_owned(),
+                scope_id: Uuid::from_u128(43),
+                observed_version: 1,
+                observed_digest: "06".repeat(32),
+            }],
+            grant_commitment: grant_commitment(),
+        }
+    }
+
+    fn commit_scoped_command(repo: Uuid, tenant: Uuid, history: Uuid) -> CommitScopedRefsCommand {
+        CommitScopedRefsCommand {
+            commit: CommitRefsCommand {
+                request: WireCommitRefsRequest {
+                    identity: WireOperationIdentity {
+                        repository_id: repo,
+                        issuer_id: Uuid::from_u128(44),
+                        lane: "main".to_owned(),
+                        sequence: 1,
+                        operation_id: Uuid::from_u128(45),
+                        digest: "0b".repeat(32),
+                    },
+                    repository_id: repo,
+                    tenant_id: tenant,
+                    object_format: GitObjectFormat::Sha256,
+                    history_incarnation: history,
+                    authority_epoch: 2,
+                    group_epoch: 1,
+                    expected_revision: 1,
+                    head: WireHeadUpdate { kind: WireHeadUpdateKind::Keep, target_ref: None },
+                    mode: CommitMode::Atomic,
+                    refs: Vec::new(),
+                },
+                decision_id: Some(Uuid::from_u128(46)),
+                required_holds: Vec::new(),
+                policy_rejects: BTreeMap::new(),
+                logical_tick: 1,
+            },
+            expected_commitment: grant_commitment(),
+        }
+    }
+
+    fn close_scope_command(repo: Uuid, tenant: Uuid) -> CloseAuthScopeCommand {
+        CloseAuthScopeCommand {
+            scope_kind: "token".to_owned(),
+            scope_id: Uuid::from_u128(47),
+            repository_id: Some(repo),
+            tenant_id: Some(tenant),
+            lifecycle: ScopeLifecycle::Closing,
+            authz_floor: 1,
+            change_id: Uuid::from_u128(48),
+            logical_tick: 1,
+        }
+    }
+
+    #[test]
+    fn current_scoped_commands_bind_present_axes_and_delegate_embedded_requests() {
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let realm = RealmBinding::new(tenant, "group-a", Uuid::from_u128(4), history, 1, 2, GitObjectFormat::Sha256, 1)
+            .unwrap();
+        let proposal = proposal(repo, tenant, history, 1, 2, GitObjectFormat::Sha256);
+
+        let install = RefCasCommand::InstallScopedDecision(install_scoped_command(repo, tenant));
+        assert!(proposal.matches_command(&install));
+        assert!(validate_command_scope(&install, repo, tenant, &realm).is_ok());
+        assert!(requires_live_gate_precheck(&install));
+
+        let mut foreign_repo = install_scoped_command(repo, tenant);
+        foreign_repo.decision.repository_id = Uuid::from_u128(11);
+        let foreign_repo = RefCasCommand::InstallScopedDecision(foreign_repo);
+        assert!(!proposal.matches_command(&foreign_repo));
+        assert_eq!(
+            validate_command_scope(&foreign_repo, repo, tenant, &realm),
+            Err(RaftBackendError::ScopeMismatch("repository_id"))
+        );
+
+        let mut foreign_tenant = install_scoped_command(repo, tenant);
+        foreign_tenant.decision.tenant_id = Uuid::from_u128(21);
+        let foreign_tenant = RefCasCommand::InstallScopedDecision(foreign_tenant);
+        assert!(!proposal.matches_command(&foreign_tenant));
+        assert_eq!(
+            validate_command_scope(&foreign_tenant, repo, tenant, &realm),
+            Err(RaftBackendError::ScopeMismatch("tenant_id"))
+        );
+
+        let commit = RefCasCommand::CommitScopedRefs(commit_scoped_command(repo, tenant, history));
+        assert!(proposal.matches_command(&commit));
+        assert!(validate_command_scope(&commit, repo, tenant, &realm).is_ok());
+        assert!(requires_live_gate_precheck(&commit));
+
+        for axis in ["repository_id", "tenant_id", "history_incarnation", "authority_epoch", "group_epoch"] {
+            let mut changed = commit_scoped_command(repo, tenant, history);
+            match axis {
+                "repository_id" => changed.commit.request.repository_id = Uuid::from_u128(11),
+                "tenant_id" => changed.commit.request.tenant_id = Uuid::from_u128(21),
+                "history_incarnation" => changed.commit.request.history_incarnation = Uuid::from_u128(31),
+                "authority_epoch" => changed.commit.request.authority_epoch = 3,
+                "group_epoch" => changed.commit.request.group_epoch = 2,
+                _ => unreachable!(),
+            }
+            let changed = RefCasCommand::CommitScopedRefs(changed);
+            assert!(!proposal.matches_command(&changed), "nested {axis} was not bound");
+            assert!(validate_command_scope(&changed, repo, tenant, &realm).is_err(), "nested {axis} passed scope");
+        }
+
+        let mut changed_format = commit_scoped_command(repo, tenant, history);
+        changed_format.commit.request.object_format = GitObjectFormat::Sha1;
+        let changed_format = RefCasCommand::CommitScopedRefs(changed_format);
+        assert!(!proposal.matches_command(&changed_format));
+        assert_eq!(
+            validate_command_scope(&changed_format, repo, tenant, &realm),
+            Err(RaftBackendError::ScopeMismatch("object_format"))
+        );
+
+        let close = RefCasCommand::CloseAuthScope(close_scope_command(repo, tenant));
+        assert!(proposal.matches_command(&close));
+        assert!(validate_command_scope(&close, repo, tenant, &realm).is_ok());
+        assert!(requires_live_gate_precheck(&close));
+
+        let mut unscoped = close_scope_command(repo, tenant);
+        unscoped.repository_id = None;
+        unscoped.tenant_id = None;
+        assert!(proposal.matches_command(&RefCasCommand::CloseAuthScope(unscoped.clone())));
+        assert!(validate_command_scope(&RefCasCommand::CloseAuthScope(unscoped), repo, tenant, &realm).is_ok());
+
+        let mut foreign_repo_scope = close_scope_command(repo, tenant);
+        foreign_repo_scope.repository_id = Some(Uuid::from_u128(11));
+        let foreign_repo_scope = RefCasCommand::CloseAuthScope(foreign_repo_scope);
+        assert!(!proposal.matches_command(&foreign_repo_scope));
+        assert_eq!(
+            validate_command_scope(&foreign_repo_scope, repo, tenant, &realm),
+            Err(RaftBackendError::ScopeMismatch("repository_id"))
+        );
+
+        let mut foreign_tenant_scope = close_scope_command(repo, tenant);
+        foreign_tenant_scope.tenant_id = Some(Uuid::from_u128(21));
+        let foreign_tenant_scope = RefCasCommand::CloseAuthScope(foreign_tenant_scope);
+        assert!(!proposal.matches_command(&foreign_tenant_scope));
+        assert_eq!(
+            validate_command_scope(&foreign_tenant_scope, repo, tenant, &realm),
+            Err(RaftBackendError::ScopeMismatch("tenant_id"))
+        );
+    }
+
+    #[test]
+    fn new_ordinary_commands_are_still_fenced_against_the_live_gate() {
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let live = live_gate(repo, tenant, Uuid::from_u128(30), 1, 2, GitObjectFormat::Sha256);
+        let stale = proposal(repo, tenant, Uuid::from_u128(31), 1, 2, GitObjectFormat::Sha256);
+
+        for command in [
+            RefCasCommand::InstallScopedDecision(install_scoped_command(repo, tenant)),
+            RefCasCommand::CommitScopedRefs(commit_scoped_command(repo, tenant, Uuid::from_u128(31))),
+            RefCasCommand::CloseAuthScope(close_scope_command(repo, tenant)),
+        ] {
+            assert_eq!(
+                fence_proposal_against_gate(Some(&live), &stale, &command),
+                Some(RootRefCasRefusalKind::GateScopeRefused)
+            );
+        }
     }
 }

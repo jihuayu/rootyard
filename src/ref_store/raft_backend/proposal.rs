@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::ref_store::core::state_machine::RefCasCommand;
+use crate::ref_store::core::state_machine::{RefCasCommand, WireCommitRefsRequest};
 use crate::ref_store::core::types::GitObjectFormat;
 use crate::ref_store::raft_backend::outcome::RootRefCasOutcome;
 
@@ -139,6 +139,15 @@ impl ProposalId {
             && self.object_format == object_format
     }
 
+    fn matches_commit_request(&self, request: &WireCommitRefsRequest) -> bool {
+        self.repository_id == request.repository_id
+            && self.tenant_id == request.tenant_id
+            && self.history_id == request.history_incarnation
+            && self.group_epoch == u64::try_from(request.group_epoch).unwrap_or(0)
+            && self.authority_epoch == request.authority_epoch
+            && self.object_format == request.object_format
+    }
+
     /// Compares the command axes that are actually represented on the decoded command. Group id,
     /// authority id, and storage generation are not fields of every command and remain bound by
     /// the trusted backend/receipt scope checks instead of being invented here.
@@ -161,18 +170,21 @@ impl ProposalId {
                     && self.authority_epoch == cmd.authority_epoch
             }
             RefCasCommand::BeginOperation(cmd) => self.repository_id == cmd.identity.repository_id,
-            RefCasCommand::CommitRefs(cmd) => {
-                self.repository_id == cmd.request.repository_id
-                    && self.tenant_id == cmd.request.tenant_id
-                    && self.history_id == cmd.request.history_incarnation
-                    && self.group_epoch == u64::try_from(cmd.request.group_epoch).unwrap_or(0)
-                    && self.authority_epoch == cmd.request.authority_epoch
-                    && self.object_format == cmd.request.object_format
-            }
+            RefCasCommand::CommitRefs(cmd) => self.matches_commit_request(&cmd.request),
+            RefCasCommand::CommitScopedRefs(cmd) => self.matches_commit_request(&cmd.commit.request),
             RefCasCommand::Cancel(cmd) => self.repository_id == cmd.identity.repository_id,
             RefCasCommand::AdvanceCancelCutoff(cmd) => self.repository_id == cmd.repository_id,
             RefCasCommand::InstallDecision(cmd) => {
                 self.repository_id == cmd.repository_id && self.tenant_id == cmd.tenant_id
+            }
+            RefCasCommand::InstallScopedDecision(cmd) => {
+                self.repository_id == cmd.decision.repository_id && self.tenant_id == cmd.decision.tenant_id
+            }
+            RefCasCommand::CloseAuthScope(cmd) => {
+                // Optional axes only constrain when the core row names them; scope dependencies
+                // and signed grant commitments remain enforced by the core apply path.
+                cmd.repository_id.is_none_or(|repository_id| self.repository_id == repository_id)
+                    && cmd.tenant_id.is_none_or(|tenant_id| self.tenant_id == tenant_id)
             }
             RefCasCommand::CreateSnapshotPin(cmd) => {
                 self.repository_id == cmd.repository_id

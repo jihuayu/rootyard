@@ -76,6 +76,15 @@ pub enum RootRefCasApplied {
         decision_id: Uuid,
         replayed: bool,
     },
+    AuthScopeClosed {
+        scope_kind: String,
+        scope_id: Uuid,
+        lifecycle: ScopeLifecycle,
+        authz_floor: i64,
+        replayed: bool,
+        open_decision_ids: Vec<Uuid>,
+        pending_operation_ids: Vec<Uuid>,
+    },
     SnapshotPinCreated {
         snapshot_id: Uuid,
         pin_id: Uuid,
@@ -160,6 +169,23 @@ impl RootRefCasApplied {
             ApplyResponse::DecisionInstalled { decision_id, replayed } => {
                 Self::DecisionInstalled { decision_id, replayed }
             }
+            ApplyResponse::AuthScopeClosed {
+                scope_kind,
+                scope_id,
+                lifecycle,
+                authz_floor,
+                replayed,
+                open_decision_ids,
+                pending_operation_ids,
+            } => Self::AuthScopeClosed {
+                scope_kind,
+                scope_id,
+                lifecycle,
+                authz_floor,
+                replayed,
+                open_decision_ids,
+                pending_operation_ids,
+            },
             ApplyResponse::SnapshotPinCreated {
                 snapshot_id,
                 pin_id,
