@@ -19,6 +19,7 @@ pub mod envelope;
 pub mod key_provider;
 pub mod opendal;
 pub mod protected;
+pub mod read_accel;
 pub mod readback;
 pub mod transfer;
 mod types;

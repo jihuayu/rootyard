@@ -79,7 +79,7 @@ pub async fn inspect(
         Err(err) => return Ok(error_with_classification(err)),
     };
     let client = state.pool.get().await.map_err(Error::internal)?;
-    let row = client
+    let Some(row) = client
         .query_opt(
             "SELECT c.context,c.head_oid,c.base_oid,c.job_id,c.storage_generation,c.state,c.attempt, \
                c.lease_generation,c.lease_expires_unix,c.runner_id,c.source_url, \
@@ -97,7 +97,9 @@ pub async fn inspect(
         )
         .await
         .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
+    else {
+        return Ok(error_with_classification(Error::not_found()));
+    };
     let head_oid: String = row.get("head_oid");
     let generation: i64 = row.get("storage_generation");
     let trusted_bound: bool = row.get("trusted_bound");
