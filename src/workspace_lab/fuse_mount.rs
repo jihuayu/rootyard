@@ -136,7 +136,7 @@ pub(crate) enum LegacySpawnFailure {
     /// `spawn_mount2` succeeded, but exact identity could not be proven. The
     /// owner is retained with `mount_id = None` and is a permanent teardown
     /// failure until real ownership is resolved.
-    AfterSession { error: io::Error, owner: MountHandle },
+    AfterSession { error: io::Error, owner: Box<MountHandle> },
 }
 
 impl LegacySpawnFailure {
@@ -145,7 +145,7 @@ impl LegacySpawnFailure {
         match self {
             Self::BeforeSession(error) => error,
             Self::AfterSession { error, owner } => {
-                retain_unproved_owner(owner);
+                retain_unproved_owner(*owner);
                 error
             }
         }
@@ -598,7 +598,7 @@ fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> Result
             let error = io::Error::other("owned FUSE mount is missing from /proc/self/mountinfo");
             let owner =
                 MountHandle { session: Some(session), dispatcher, mountpoint, mount_id: None, session_join: None };
-            return Err(LegacySpawnFailure::AfterSession { error, owner });
+            return Err(LegacySpawnFailure::AfterSession { error, owner: Box::new(owner) });
         }
         Err(error) => {
             // Same fail-closed rule when the mount table cannot be read at
@@ -610,7 +610,7 @@ fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> Result
             }
             let owner =
                 MountHandle { session: Some(session), dispatcher, mountpoint, mount_id: None, session_join: None };
-            return Err(LegacySpawnFailure::AfterSession { error, owner });
+            return Err(LegacySpawnFailure::AfterSession { error, owner: Box::new(owner) });
         }
     };
     Ok(MountHandle { session: Some(session), dispatcher, mountpoint, mount_id, session_join: None })

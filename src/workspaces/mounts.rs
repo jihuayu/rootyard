@@ -266,7 +266,7 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
             // The session already exists even though its exact identity could
             // not be captured. Transfer the owner and Reader before the
             // pending guard can resolve this admission without an owner.
-            admission.retain_unproved(InProcessSlot { _session: owner, gate, lazy });
+            admission.retain_unproved(InProcessSlot { _session: *owner, gate, lazy });
             return Err(Error::internal(error));
         }
     };
