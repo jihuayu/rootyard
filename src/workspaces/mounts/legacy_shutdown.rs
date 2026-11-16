@@ -37,6 +37,10 @@ struct State<O> {
     queued: Vec<Owned<O>>,
     retained: Vec<Owned<O>>,
     in_flight: usize,
+    /// Exact owners whose actor join, exact unmount and session join all
+    /// completed. Kept only for bounded source-completion evidence; an empty
+    /// list is not evidence that any mount existed.
+    joined: Vec<Uuid>,
     failures: Vec<String>,
     completion: Option<Result<(), String>>,
     finished: bool,
@@ -57,6 +61,7 @@ struct WorkerState {
 pub(super) struct LegacyShutdownObservation {
     pub(super) pending: usize,
     pub(super) owned: usize,
+    pub(super) joined: usize,
     pub(super) failures: Vec<String>,
     pub(super) worker_spawn_error: Option<String>,
     pub(super) worker_finished: bool,
@@ -97,6 +102,7 @@ impl<O> LegacyShutdownTicket<O> {
                 queued: Vec::new(),
                 retained: Vec::new(),
                 in_flight: 0,
+                joined: Vec::new(),
                 failures: Vec::new(),
                 completion: None,
                 finished: false,
@@ -197,12 +203,21 @@ impl<O> LegacyShutdownTicket<O> {
         LegacyShutdownObservation {
             pending: state.pending,
             owned: state.queued.len() + state.retained.len() + state.in_flight,
+            joined: state.joined.len(),
             failures: state.failures.clone(),
             worker_spawn_error: spawn_error,
             worker_finished: state.finished,
             worker_reaped: reaped,
             reaped_result: reap_result,
         }
+    }
+
+    /// Exact completion identities for source evidence. The caller must first
+    /// observe a clean ticket; an empty vector is returned as `None` so an
+    /// empty/no-work ticket can never be reported as a joined mount.
+    pub(super) fn completion_evidence(&self) -> Option<(usize, Vec<Uuid>)> {
+        let state = self.lock_state();
+        if state.joined.is_empty() { None } else { Some((state.joined.len(), state.joined.clone())) }
     }
 
     /// Bounded wait for one caller. Expiry returns the current incomplete
@@ -352,7 +367,10 @@ impl<O: LegacyOwner> LegacyShutdownTicket<O> {
                 let mut state = self.lock_state();
                 state.in_flight = state.in_flight.saturating_sub(1);
                 match failure {
-                    None => drop(item),
+                    None => {
+                        state.joined.push(item.id);
+                        drop(item);
+                    }
                     Some(error) => {
                         state.failures.push(format!("workspace {}: {error}", item.id));
                         // Failed owners stay owned by the ticket. They are not
@@ -549,6 +567,45 @@ mod tests {
         assert_eq!(observation.owned, 1, "a failed slot must remain ticket-owned");
         assert_eq!(observation.failures.len(), 1);
         assert!(observation.failures[0].contains("exact unmount refused"));
+    }
+
+    #[test]
+    fn empty_ticket_has_no_completion_evidence() {
+        let ticket = Arc::new(LegacyShutdownTicket::new());
+        ticket.spawn_worker().unwrap();
+        assert!(ticket.wait_until(Instant::now() + Duration::from_secs(2)).success());
+        assert!(ticket.completion_evidence().is_none(), "an empty/no-work ticket is not proof of one mount");
+    }
+
+    #[test]
+    fn joined_owner_is_recorded_only_after_successful_teardown() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let owner = RecordingOwner::immediate(41, events);
+        let id = Uuid::new_v4();
+        let ticket = Arc::new(LegacyShutdownTicket::new());
+        ticket.seed_owners(vec![(id, owner)]);
+        ticket.spawn_worker().unwrap();
+        assert!(ticket.wait_until(Instant::now() + Duration::from_secs(2)).success());
+        assert_eq!(ticket.completion_evidence(), Some((1, vec![id])));
+    }
+
+    #[test]
+    fn failed_owner_is_not_recorded_as_joined() {
+        struct FailingOwner;
+        impl LegacyOwner for FailingOwner {
+            fn fence_for_shutdown(&self) {}
+            fn teardown_owned(&mut self) -> Result<(), String> {
+                Err("exact unmount refused".into())
+            }
+        }
+
+        let ticket = Arc::new(LegacyShutdownTicket::new());
+        ticket.seed_owners(vec![(Uuid::new_v4(), FailingOwner)]);
+        ticket.spawn_worker().unwrap();
+        let observation = ticket.wait_until(Instant::now() + Duration::from_secs(2));
+        assert!(!observation.success());
+        assert_eq!(observation.joined, 0);
+        assert!(ticket.completion_evidence().is_none());
     }
 
     #[test]

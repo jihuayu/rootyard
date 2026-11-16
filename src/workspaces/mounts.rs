@@ -561,16 +561,51 @@ fn helper_teardown_error(failures: Vec<String>) -> Error {
     Error::internal(format!("workspace FUSE helper teardown incomplete: {}", failures.join("; ")))
 }
 
+/// Bounded source-completion evidence for actual legacy owners whose actor
+/// join, exact unmount and session join all completed inside one cleanup.
+///
+/// It is returned only after the retained ticket reports a reaped clean worker.
+/// An empty/no-work ticket yields `None`, so evidence can never be interpreted
+/// as proof that at least one mount existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyShutdownEvidence {
+    /// Numeric identity of the mount namespace in which the joins happened.
+    pub mount_namespace: u64,
+    /// Number of exact owned mounts joined in this cleanup.
+    pub joined_mounts: usize,
+    /// Exact workspace UUIDs, in teardown completion order. The service layer
+    /// hashes these before emitting any bounded evidence line.
+    pub workspaces: Vec<Uuid>,
+}
+
+fn mount_namespace_inode() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self/ns/mnt").map(|metadata| metadata.ino()).unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
 /// Deadline-aware helper teardown for the normal signal path. Every owned
 /// helper generation — current, retired and registry-retained, even with an
 /// empty registry — receives the same absolute deadline before any blocking
 /// teardown begins. The existing fence/exact-unmount/exit allowance is capped
 /// by the caller's remaining shared normal-shutdown deadline, never by a fresh
 /// helper grace.
-pub async fn shutdown_helper_until(deadline: tokio::time::Instant) -> Result<(), Error> {
+///
+/// The returned bounded legacy evidence is present only when the legacy result
+/// itself succeeded; a helper-only failure does not erase an already-proven
+/// legacy join.
+pub async fn shutdown_helper_until_with_evidence(
+    deadline: tokio::time::Instant,
+) -> (Result<(), Error>, Option<LegacyShutdownEvidence>) {
     let ShutdownSnapshot { clients, helpers, legacy } = take_shutdown_snapshot();
     if clients.is_empty() && helpers.is_empty() && legacy.is_none() {
-        return Ok(());
+        return (Ok(()), None);
     }
     let teardown_deadline = deadline.into_std().min(Instant::now() + HELPER_SHUTDOWN_GRACE);
     let mut effective = teardown_deadline;
@@ -596,11 +631,29 @@ pub async fn shutdown_helper_until(deadline: tokio::time::Instant) -> Result<(),
         });
         run_helper_cleanup(cleanup, tokio::time::Instant::from_std(effective)).await
     };
-    let legacy_result = match legacy {
-        Some(ticket) => wait_legacy_until(ticket, deadline).await,
-        None => Ok(()),
+    let (legacy_result, legacy_evidence) = match legacy {
+        Some(ticket) => {
+            let observer = ticket.clone();
+            let result = wait_legacy_until(ticket, deadline).await;
+            let evidence = if result.is_ok() {
+                observer.completion_evidence().map(|(joined_mounts, workspaces)| LegacyShutdownEvidence {
+                    mount_namespace: mount_namespace_inode(),
+                    joined_mounts,
+                    workspaces,
+                })
+            } else {
+                None
+            };
+            (result, evidence)
+        }
+        None => (Ok(()), None),
     };
-    combine_shutdown_results(helper_result, legacy_result)
+    (combine_shutdown_results(helper_result, legacy_result), legacy_evidence)
+}
+
+/// Compatibility entry point preserving the original result-only API.
+pub async fn shutdown_helper_until(deadline: tokio::time::Instant) -> Result<(), Error> {
+    shutdown_helper_until_with_evidence(deadline).await.0
 }
 
 /// Compatibility path used when no normal-shutdown deadline was published.
@@ -722,6 +775,7 @@ mod tests {
         LegacyShutdownObservation {
             pending: 0,
             owned: 0,
+            joined: 1,
             failures: Vec::new(),
             worker_spawn_error: None,
             worker_finished: true,

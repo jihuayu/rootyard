@@ -2,6 +2,16 @@ use anyhow::{Context, Result, bail};
 use rootyard::{AppState, config::Config, db, storage::Storage};
 use std::sync::Arc;
 
+mod service_shutdown;
+
+/// Ordinary CLI success or the service branch's bounded cleanup outcome. Only
+/// the service branch may request a bounded runtime shutdown on an
+/// unsuccessful/pending teardown; ordinary CLI behavior keeps the normal drop.
+enum RunOutcome {
+    Ordinary,
+    Service(service_shutdown::ServiceCompletion),
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() == 2 && args[1] == "--rootyard-hook-self-check" {
@@ -27,18 +37,45 @@ fn main() -> Result<()> {
         "pre-receive" => return rootyard::journal::run_pre_receive(),
         _ => {}
     }
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
+    // The top-level runtime is explicit so an unsuccessful service cleanup can
+    // consume only the remaining product deadline through `shutdown_timeout`.
+    // That bounded wait is terminal failure containment, never proof of native
+    // cleanup, and it is not used on an ordinary/clean path.
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let outcome = runtime.block_on(run());
+    match outcome {
+        Ok(RunOutcome::Ordinary) => {
+            drop(runtime);
+            Ok(())
+        }
+        Ok(RunOutcome::Service(completion)) => {
+            let pending = completion.pending_runtime();
+            let remaining = completion.remaining();
+            let result = completion.into_result();
+            if pending {
+                runtime.shutdown_timeout(remaining);
+            } else {
+                drop(runtime);
+            }
+            result
+        }
+        Err(error) => {
+            drop(runtime);
+            Err(error)
+        }
+    }
 }
-async fn run() -> Result<()> {
+async fn run() -> Result<RunOutcome> {
     if !cfg!(target_os = "linux") {
         bail!("Rootyard phase one currently supports Linux only");
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.len() == 1 && args[0] == "serve-blob" {
-        return rootyard::standalone::run_from_env().await;
+        return rootyard::standalone::run_from_env().await.map(|()| RunOutcome::Ordinary);
     }
     if args.first().is_some_and(|s| s == "backup-verify") && args.len() == 2 {
         return rootyard::backup::check(std::path::Path::new(&args[1]))
+            .map(|()| RunOutcome::Ordinary)
             .map_err(|_| anyhow::anyhow!("backup verification failed; incomplete, unsafe or mismatched files"));
     }
     // Control-plane workers need only PostgreSQL, never Git or a data volume.
@@ -78,7 +115,7 @@ async fn run() -> Result<()> {
                 result=&mut task=>{ result?; bail!("delivery worker stopped unexpectedly"); },
             }
         }
-        return Ok(());
+        return Ok(RunOutcome::Ordinary);
     }
     let config = Config::from_env()?;
     let pool = db::pool(&config.database_url)?;
@@ -261,212 +298,142 @@ async fn run() -> Result<()> {
             rootyard::sandbox::reconcile_startup(&state)
                 .await
                 .map_err(|_| anyhow::anyhow!("sandbox startup recovery failed"))?;
-            rootyard::workspaces::mounts::reconcile_startup(&state)
-                .await
-                .map_err(|_| anyhow::anyhow!("workspace FUSE mount recovery failed"))?;
-            rootyard::pando_gateway::pitr_fence::startup_check(&state.pool, &state.storage.root).await?;
-            let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
-            // Lease renewal is independent of the single-host fencing driver;
-            // takeover scanning still requires a verifiable physical fence.
-            let controller_task = if configured_node.is_some() || local_fence {
-                Some(tokio::spawn(rootyard::sharding::controller::run(state.clone())))
-            } else {
-                None
-            };
-            eprintln!("rootyard listening on {} (GitFS single-node)", listener.local_addr()?);
-            let metrics_worker = if let Some(address) = state.config.metrics_bind {
-                let listener = tokio::net::TcpListener::bind(rootyard::metrics::validate_bind(address)?).await?;
-                let router = rootyard::metrics::router(
-                    state.pool.clone(),
-                    state.git_slots.clone(),
-                    state.config.max_concurrent_git,
-                    state.transfer_metrics.clone(),
-                    rootyard::metrics_workers::Config {
-                        volume_id: state.storage.volume_id,
-                        scan_period_seconds: maintenance_policy.scan_period_seconds,
-                    },
-                );
-                Some(tokio::spawn(async move {
-                    if axum::serve(listener, router).await.is_err() {
-                        eprintln!("rootyard: metrics listener stopped");
-                    }
-                }))
-            } else {
-                None
-            };
-            let dispatch_stop = tokio_util::sync::CancellationToken::new();
-            let publish_task = tokio::spawn(rootyard::dispatch::publisher(
-                dispatch_settings.transport.clone(),
-                state.dispatch.remote.clone(),
-                dispatch_stop.clone(),
-            ));
-            let delivery_task = if state.config.outbox_worker {
-                Some(tokio::spawn(rootyard::dispatch::worker(
-                    state.pool.clone(),
-                    dispatch_settings,
-                    state.dispatch.local.clone(),
+            // Arm the one service-lifecycle owner before reconcile. Every
+            // fallible post-mount step below runs inside this result-producing
+            // scope, so a later failure never bypasses cleanup.
+            let git_shutdown_grace = std::time::Duration::from_secs(30).saturating_add(state.config.git_timeout);
+            let mut lifecycle = service_shutdown::ServiceOwner::arm(git_shutdown_grace);
+            let setup: Result<()> = async {
+                rootyard::workspaces::mounts::reconcile_startup(&state)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("workspace FUSE mount recovery failed"))?;
+                rootyard::pando_gateway::pitr_fence::startup_check(&state.pool, &state.storage.root).await?;
+                let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
+                // Lease renewal is independent of the single-host fencing
+                // driver; takeover scanning still requires a verifiable
+                // physical fence.
+                let controller_task = if configured_node.is_some() || local_fence {
+                    Some(tokio::spawn(rootyard::sharding::controller::run(state.clone())))
+                } else {
+                    None
+                };
+                if let Some(task) = controller_task {
+                    lifecycle.attach_controller(task);
+                }
+                eprintln!("rootyard listening on {} (GitFS single-node)", listener.local_addr()?);
+                let metrics_worker = if let Some(address) = state.config.metrics_bind {
+                    let listener = tokio::net::TcpListener::bind(rootyard::metrics::validate_bind(address)?).await?;
+                    let router = rootyard::metrics::router(
+                        state.pool.clone(),
+                        state.git_slots.clone(),
+                        state.config.max_concurrent_git,
+                        state.transfer_metrics.clone(),
+                        rootyard::metrics_workers::Config {
+                            volume_id: state.storage.volume_id,
+                            scan_period_seconds: maintenance_policy.scan_period_seconds,
+                        },
+                    );
+                    Some(tokio::spawn(async move {
+                        if axum::serve(listener, router).await.is_err() {
+                            eprintln!("rootyard: metrics listener stopped");
+                        }
+                    }))
+                } else {
+                    None
+                };
+                if let Some(task) = metrics_worker {
+                    lifecycle.attach_metrics(task);
+                }
+                let dispatch_stop = lifecycle.dispatch_stop().clone();
+                let publish_task = tokio::spawn(rootyard::dispatch::publisher(
+                    dispatch_settings.transport.clone(),
+                    state.dispatch.remote.clone(),
                     dispatch_stop.clone(),
-                )))
-            } else {
-                None
+                ));
+                lifecycle.attach_publish(publish_task);
+                let delivery_task = if state.config.outbox_worker {
+                    Some(tokio::spawn(rootyard::dispatch::worker(
+                        state.pool.clone(),
+                        dispatch_settings,
+                        state.dispatch.local.clone(),
+                        dispatch_stop.clone(),
+                    )))
+                } else {
+                    None
+                };
+                if let Some(task) = delivery_task {
+                    lifecycle.attach_delivery(task);
+                }
+                let webhook_task = if state.config.outbox_worker {
+                    Some(tokio::spawn(rootyard::webhooks::background::worker(state.clone(), dispatch_stop.clone())))
+                } else {
+                    None
+                };
+                if let Some(task) = webhook_task {
+                    lifecycle.attach_webhook(task);
+                }
+                let worker_state = state.clone();
+                let workspace_capture_stop = lifecycle.capture_stop().clone();
+                let workspace_capture_task =
+                    tokio::spawn(rootyard::workspaces::capture::run(state.clone(), workspace_capture_stop));
+                lifecycle.attach_capture(workspace_capture_task);
+                let worker = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                    loop {
+                        interval.tick().await;
+                        if rootyard::sharding::transitions::reconcile_pending(&worker_state).await.is_err() {
+                            eprintln!(
+                                "rootyard: shard marker reconciliation unavailable; affected writes remain fenced"
+                            );
+                        }
+                        if rootyard::reliability::recover_pending(&worker_state).await.is_err() {
+                            eprintln!("rootyard: journal retry unavailable");
+                        }
+                        if rootyard::recover(&worker_state).await.is_err() {
+                            eprintln!("rootyard: provisioning retry unavailable");
+                        }
+                    }
+                });
+                lifecycle.attach_worker(worker);
+                let maintenance_stop = lifecycle.maintenance_stop().clone();
+                let maintenance_task = maintenance_policy
+                    .enabled
+                    .then(|| tokio::spawn(rootyard::storage_lifecycle::run(state.clone(), maintenance_stop)));
+                if let Some(task) = maintenance_task {
+                    lifecycle.attach_maintenance(task);
+                }
+                let session_gc_stop = lifecycle.session_gc_stop().clone();
+                let session_gc_task = tokio::spawn(rootyard::web::session_gc::run(state.pool.clone(), session_gc_stop));
+                lifecycle.attach_session_gc(session_gc_task);
+                // A disconnected client must not cancel a started workspace Git
+                // mutation. Keep the serving future owned, but do not await its
+                // in-flight requests before the helper has had a chance to
+                // unmount and release a FUSE-parked Git child.
+                let http_stop_for_server = lifecycle.http_stop().clone();
+                let server = tokio::spawn(async move {
+                    axum::serve(
+                        listener,
+                        rootyard::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async move { http_stop_for_server.cancelled().await })
+                    .await
+                });
+                lifecycle.attach_server(server);
+                Ok(())
+            }
+            .await;
+            let primary = match setup {
+                Ok(()) => lifecycle.wait_for_stop_or_serve(shutdown()).await,
+                Err(error) => Some(error),
             };
-            let webhook_task = if state.config.outbox_worker {
-                Some(tokio::spawn(rootyard::webhooks::background::worker(state.clone(), dispatch_stop.clone())))
-            } else {
-                None
-            };
-            let worker_state = state.clone();
-            let workspace_capture_stop = tokio_util::sync::CancellationToken::new();
-            let workspace_capture_task =
-                tokio::spawn(rootyard::workspaces::capture::run(state.clone(), workspace_capture_stop.clone()));
-            let worker = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-                loop {
-                    interval.tick().await;
-                    if rootyard::sharding::transitions::reconcile_pending(&worker_state).await.is_err() {
-                        eprintln!("rootyard: shard marker reconciliation unavailable; affected writes remain fenced");
-                    }
-                    if rootyard::reliability::recover_pending(&worker_state).await.is_err() {
-                        eprintln!("rootyard: journal retry unavailable");
-                    }
-                    if rootyard::recover(&worker_state).await.is_err() {
-                        eprintln!("rootyard: provisioning retry unavailable");
-                    }
-                }
-            });
-            let maintenance_stop = tokio_util::sync::CancellationToken::new();
-            let maintenance_task = maintenance_policy
-                .enabled
-                .then(|| tokio::spawn(rootyard::storage_lifecycle::run(state.clone(), maintenance_stop.clone())));
-            let session_gc_stop = tokio_util::sync::CancellationToken::new();
-            let session_gc_task =
-                tokio::spawn(rootyard::web::session_gc::run(state.pool.clone(), session_gc_stop.clone()));
-            // A disconnected client must not cancel a started workspace Git
-            // mutation. Keep the serving future owned, but do not await its
-            // in-flight requests before the helper has had a chance to unmount
-            // and release a FUSE-parked Git child. `router` consumes the state
-            // Arc, so the one shutdown deadline is computed before serving.
-            let git_shutdown_grace = state.config.git_timeout + std::time::Duration::from_secs(30);
-            let http_stop = tokio_util::sync::CancellationToken::new();
-            let http_stop_for_server = http_stop.clone();
-            let mut server = tokio::spawn(async move {
-                axum::serve(
-                    listener,
-                    rootyard::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                )
-                .with_graceful_shutdown(async move { http_stop_for_server.cancelled().await })
-                .await
-            });
-            tokio::select! {
-                _ = shutdown() => {}
-                joined = &mut server => {
-                    return match joined {
-                        Ok(Ok(())) => bail!("HTTP server stopped before the normal shutdown signal"),
-                        Ok(Err(error)) => Err(error.into()),
-                        Err(error) => Err(error.into()),
-                    };
-                }
-            }
-            let shutdown_deadline = tokio::time::Instant::now() + git_shutdown_grace;
-            rootyard::workspaces::set_process_cleanup_deadline(shutdown_deadline);
-            http_stop.cancel();
-            // The existing Git capacity/job ownership is the mutation admission
-            // mechanism. Already accepted jobs keep their permits and JoinSet
-            // ownership; only new acquisition is refused from here on.
-            rootyard::workspaces::close_git_admission();
-            let mut failures: Vec<&'static str> = Vec::new();
-            let capture_grace = rootyard::workspaces::capture_shutdown_grace().min(remaining_until(shutdown_deadline));
-            if rootyard::workspaces::stop_capture_before_helper(
-                workspace_capture_stop,
-                workspace_capture_task,
-                capture_grace,
-                async {
-                    rootyard::workspaces::mounts::shutdown_helper_until(shutdown_deadline)
-                        .await
-                        .map_err(|_| anyhow::anyhow!("workspace FUSE helper shutdown failed"))
-                },
-            )
-            .await
-            .is_err()
-            {
-                failures.push("workspace capture/helper shutdown did not complete cleanly");
-            }
-            // The helper has fenced and unmounted before this join. The retained
-            // Git set consumes only the remaining shared deadline; it is never
-            // dropped/cancelled on expiry.
-            if !rootyard::workspaces::drain_git_jobs_until(shutdown_deadline).await {
-                failures.push("owned workspace Git jobs/process cleanup did not complete cleanly");
-            }
-            match tokio::time::timeout_at(shutdown_deadline, &mut server).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(_))) | Ok(Err(_)) => failures.push("HTTP server did not stop cleanly"),
-                Err(_) => {
-                    server.abort();
-                    failures.push("HTTP server did not join within the shutdown deadline");
-                }
-            }
-            worker.abort();
-            if join_aborted_until(shutdown_deadline, worker).await.is_err() {
-                failures.push("background worker did not stop cleanly");
-            }
-            maintenance_stop.cancel();
-            session_gc_stop.cancel();
-            if join_task_until(shutdown_deadline, session_gc_task).await.is_err() {
-                failures.push("session GC task did not join cleanly");
-            }
-            if let Some(task) = controller_task {
-                task.abort();
-                if join_aborted_until(shutdown_deadline, task).await.is_err() {
-                    failures.push("sharding controller did not stop cleanly");
-                }
-            }
-            if let Some(task) = maintenance_task {
-                match join_task_until(shutdown_deadline, task).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) | Err(_) => failures.push("workspace maintenance task did not stop cleanly"),
-                }
-            }
-            dispatch_stop.cancel();
-            if join_task_until(shutdown_deadline, publish_task).await.is_err() {
-                failures.push("dispatch publisher did not stop cleanly");
-            }
-            if let Some(task) = delivery_task
-                && join_task_until(shutdown_deadline, task).await.is_err()
-            {
-                failures.push("dispatch delivery worker did not stop cleanly");
-            }
-            if let Some(task) = webhook_task
-                && join_task_until(shutdown_deadline, task).await.is_err()
-            {
-                failures.push("webhook worker did not stop cleanly");
-            }
-            if let Some(metrics_worker) = metrics_worker {
-                metrics_worker.abort();
-                if join_aborted_until(shutdown_deadline, metrics_worker).await.is_err() {
-                    failures.push("metrics worker did not stop cleanly");
-                }
-            }
-            // A request that passed the old capacity admission immediately before
-            // the close can spawn its owned job after the first drain snapshot.
-            // The serving future and every background producer are joined now, so
-            // this second same-deadline drain catches that late ownership without
-            // resetting or extending the budget.
-            if !rootyard::workspaces::drain_git_jobs_until(shutdown_deadline).await {
-                failures.push("late owned workspace Git jobs/process cleanup did not complete cleanly");
-            }
-            if rootyard::workspaces::process_cleanup_failed() {
-                failures.push("native Git process cleanup did not prove quiescence");
-            }
-            if failures.is_empty() {
-                return Ok(());
-            }
-            bail!("normal shutdown incomplete: {}", failures.join("; "))
+            let completion = lifecycle.cleanup(primary, &service_shutdown::NativeCleanupDriver).await;
+            return Ok(RunOutcome::Service(completion));
         }
         _ => bail!(
             "usage: rootyard [serve | serve-blob | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | pando-authority status|verify|isolate --confirm-shared-bucket|pin-recovery-point|release-recovery-point | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132 | --allow-legacy-schema133 | --allow-legacy-schema134 | --allow-legacy-schema135 | --allow-legacy-schema136 | --allow-legacy-schema137 | --allow-legacy-schema138 | --allow-legacy-schema139 | --allow-legacy-schema140 | --allow-legacy-schema141 | --allow-legacy-schema142 | --allow-legacy-schema143]]"
         ),
     }
-    Ok(())
+    Ok(RunOutcome::Ordinary)
 }
 
 /// The one generic backup refusal every other failure keeps byte-for-byte.
@@ -501,38 +468,4 @@ async fn shutdown() {
     let mut term =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("install SIGTERM handler");
     tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
-}
-
-fn remaining_until(deadline: tokio::time::Instant) -> std::time::Duration {
-    let now = tokio::time::Instant::now();
-    if deadline <= now { std::time::Duration::ZERO } else { deadline - now }
-}
-
-async fn join_task_until<T>(
-    deadline: tokio::time::Instant,
-    mut task: tokio::task::JoinHandle<T>,
-) -> Result<T, &'static str> {
-    match tokio::time::timeout_at(deadline, &mut task).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(_)) => Err("shutdown task ended abnormally"),
-        Err(_) => {
-            task.abort();
-            Err("shutdown task did not join within the deadline")
-        }
-    }
-}
-
-async fn join_aborted_until<T>(
-    deadline: tokio::time::Instant,
-    mut task: tokio::task::JoinHandle<T>,
-) -> Result<(), &'static str> {
-    match tokio::time::timeout_at(deadline, &mut task).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) if error.is_cancelled() => Ok(()),
-        Ok(Err(_)) => Err("aborted shutdown task failed"),
-        Err(_) => {
-            task.abort();
-            Err("aborted shutdown task did not join within the deadline")
-        }
-    }
 }
