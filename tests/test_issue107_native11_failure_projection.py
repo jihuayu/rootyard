@@ -70,7 +70,11 @@ def summary(status="ok", passed=1, failed=0, ignored=0):
 
 
 def project(output, returncode=101, **changes):
-    options = {"timed_out": False, "scope": "case"}
+    options = {
+        "timed_out": False,
+        "phase": "run",
+        "selected_case": inventory.TARGETS[TARGET]["cases"][0],
+    }
     options.update(changes)
     return runner.project_target_failure(TARGET, output, returncode, **options)
 
@@ -86,7 +90,13 @@ class ProjectionParserTests(unittest.TestCase):
         ]).encode()
         diag = project(output)
         self.assertEqual(diag["kind"], runner.FAILURE_KIND)
+        self.assertEqual(diag["prefix"], runner.FAILURE_PREFIX)
+        self.assertEqual(diag["source_prefix"], runner.SOURCE_PREFIX)
         self.assertEqual(diag["target"], TARGET)
+        self.assertEqual(diag["phase"], "run")
+        self.assertEqual(diag["selected_case"], cases[0])
+        self.assertTrue(diag["selected_case_known"])
+        self.assertEqual(diag["source_allowlist"], list(runner.SOURCE_ALLOWLIST))
         self.assertEqual(diag["error_class"], "native_process_failed")
         self.assertEqual(diag["exit"]["returncode"], 101)
         self.assertEqual([row["name"] for row in diag["cases"]],
@@ -102,6 +112,23 @@ class ProjectionParserTests(unittest.TestCase):
         self.assertEqual(diag["libtest_summary"],
                          {"status": "FAILED", "passed": 1, "failed": 1,
                           "ignored": 1, "measured": 0, "filtered_out": 0})
+
+    def test_explicit_list_phase_has_null_source_inventory_case(self):
+        diag = project(b"", phase="list", selected_case=None)
+        self.assertEqual(diag["phase"], "list")
+        self.assertEqual(diag["scope"], "list")
+        self.assertIsNone(diag["selected_case"])
+        self.assertFalse(diag["selected_case_known"])
+        self.assertEqual(diag["cases"], [])
+        self.assertEqual(diag["inventory"]["missing"],
+                         len(inventory.TARGETS[TARGET]["cases"]))
+
+    def test_unknown_selected_case_is_dropped_not_serialized(self):
+        diag = project(b"", selected_case=SECRET)
+        self.assertEqual(diag["phase"], "run")
+        self.assertIsNone(diag["selected_case"])
+        self.assertFalse(diag["selected_case_known"])
+        self.assertNotIn(SECRET, json.dumps(diag, sort_keys=True))
 
     def test_missing_case_or_summary_is_never_success(self):
         diag = project(b"test result: ok. 1 passed; 0 failed; 0 ignored;\n")
@@ -237,7 +264,8 @@ class BoundedFailureProjectionTests(unittest.TestCase):
         ]).encode()
         process = FakeProcess(payload, returncode=101)
         projector = lambda output, code, timed_out: runner.project_target_failure(
-            TARGET, output, code, timed_out=timed_out, scope="case")
+            TARGET, output, code, timed_out=timed_out, phase="run",
+            selected_case=cases[0])
         with mock.patch.object(runner.subprocess, "Popen", return_value=process):
             with self.assertRaises(runner.RunnerError) as raised:
                 runner.run_bounded(["fake"], timeout=1, failure_projector=projector)
@@ -251,7 +279,7 @@ class BoundedFailureProjectionTests(unittest.TestCase):
     def test_timeout_keeps_native_timeout_code_and_diagnostic(self):
         process = FakeProcess(b"test secret ... failed\n", returncode=-9, timeout=True)
         projector = lambda output, code, timed_out: runner.project_target_failure(
-            TARGET, output, code, timed_out=timed_out, scope="list")
+            TARGET, output, code, timed_out=timed_out, phase="list")
         with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
              mock.patch.object(runner.os, "getpgid", return_value=4242), \
              mock.patch.object(runner.os, "killpg"):
@@ -274,6 +302,98 @@ class BoundedFailureProjectionTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "native_process_failed")
         self.assertIsNone(raised.exception.diagnostic)
         self.assertNotIn(SECRET, str(raised.exception))
+
+
+class ExplicitPhaseContextTests(unittest.TestCase):
+    def test_list_and_run_failure_share_code_but_distinguish_phase(self):
+        cases = inventory.TARGETS[TARGET]["cases"]
+        cfg = inventory.TARGETS[TARGET]
+
+        with mock.patch.object(
+                runner.subprocess, "Popen",
+                return_value=FakeProcess(b"", returncode=101)):
+            with self.assertRaises(runner.RunnerError) as listed:
+                runner._list_target("fake", cfg, 5.0, TARGET)
+        self.assertEqual(listed.exception.code, "native_process_failed")
+        list_diag = listed.exception.diagnostic
+        self.assertEqual(list_diag["phase"], "list")
+        self.assertEqual(list_diag["scope"], "list")
+        self.assertIsNone(list_diag["selected_case"])
+        self.assertFalse(list_diag["selected_case_known"])
+        self.assertEqual(list_diag["error_class"], "native_process_failed")
+        self.assertEqual(list_diag["returncode"], 101)
+        self.assertEqual(list_diag["cases"], [])
+        self.assertEqual(list_diag["source_allowlist"],
+                         list(runner.SOURCE_ALLOWLIST))
+
+        with mock.patch.object(
+                runner.subprocess, "Popen",
+                return_value=FakeProcess(b"", returncode=101)):
+            with self.assertRaises(runner.RunnerError) as ran:
+                runner._run_one("fake", cases[0], 5.0, target=TARGET)
+        self.assertEqual(ran.exception.code, "native_process_failed")
+        run_diag = ran.exception.diagnostic
+        self.assertEqual(run_diag["phase"], "run")
+        self.assertEqual(run_diag["scope"], "case")
+        self.assertEqual(run_diag["selected_case"], cases[0])
+        self.assertTrue(run_diag["selected_case_known"])
+        self.assertEqual(run_diag["error_class"], "native_process_failed")
+        self.assertEqual(run_diag["returncode"], 101)
+        self.assertEqual(run_diag["cases"], [])
+
+    def test_unknown_selected_case_context_is_dropped(self):
+        context = {"target": TARGET, "phase": "run", "selected_case": SECRET}
+        with mock.patch.object(
+                runner.subprocess, "Popen",
+                return_value=FakeProcess(b"", returncode=101)):
+            with self.assertRaises(runner.RunnerError) as raised:
+                runner.run_bounded(["fake"], timeout=1,
+                                   failure_context=context)
+        diag = raised.exception.diagnostic
+        self.assertEqual(diag["phase"], "run")
+        self.assertIsNone(diag["selected_case"])
+        self.assertFalse(diag["selected_case_known"])
+        self.assertNotIn(SECRET, json.dumps(diag, sort_keys=True))
+
+    def test_context_survives_parser_failure_and_empty_output(self):
+        cases = inventory.TARGETS[TARGET]["cases"]
+        context = {"target": TARGET, "phase": "run",
+                   "selected_case": cases[0]}
+        with mock.patch.object(
+                runner.subprocess, "Popen",
+                return_value=FakeProcess(b"", returncode=101)), \
+             mock.patch.object(runner, "project_target_failure",
+                               side_effect=RuntimeError(SECRET)):
+            with self.assertRaises(runner.RunnerError) as raised:
+                runner.run_bounded(["fake"], timeout=1,
+                                   failure_context=context)
+        self.assertEqual(raised.exception.code, "native_process_failed")
+        diag = raised.exception.diagnostic
+        self.assertEqual(diag["prefix"], runner.FAILURE_PREFIX)
+        self.assertEqual(diag["phase"], "run")
+        self.assertEqual(diag["selected_case"], cases[0])
+        self.assertTrue(diag["selected_case_known"])
+        self.assertEqual(diag["error_class"], "native_process_failed")
+        self.assertEqual(diag["returncode"], 101)
+        self.assertEqual(diag["exit"]["returncode"], 101)
+        self.assertIsNone(diag["exit"]["signal"])
+        self.assertEqual(diag["cases"], [])
+        self.assertEqual(diag["source_allowlist"],
+                         list(runner.SOURCE_ALLOWLIST))
+        self.assertEqual(diag["parse_caps"]["output_bytes"],
+                         runner.MAX_CAPTURE_BYTES)
+        self.assertNotIn(SECRET, json.dumps(diag, sort_keys=True))
+
+    def test_invalid_phase_never_replaces_outer_failure(self):
+        context = {"target": TARGET, "phase": "from-argv", "selected_case": None}
+        with mock.patch.object(
+                runner.subprocess, "Popen",
+                return_value=FakeProcess(b"", returncode=101)):
+            with self.assertRaises(runner.RunnerError) as raised:
+                runner.run_bounded(["fake"], timeout=1,
+                                   failure_context=context)
+        self.assertEqual(raised.exception.code, "native_process_failed")
+        self.assertIsNone(raised.exception.diagnostic)
 
 
 def success_report():
@@ -320,6 +440,7 @@ class AcceptanceFailureReportTests(unittest.TestCase):
             self.targets[target] = str(binary)
             self.receipts[target] = str(receipt)
         self.fail_case_index = 0
+        self.fail_listing = False
         self.identities = {
             target: {
                 "target": target,
@@ -342,6 +463,8 @@ class AcceptanceFailureReportTests(unittest.TestCase):
     def _popen(self, command):
         target = Path(command[0]).name
         if "--list" in command:
+            if target == FAIL_TARGET and self.fail_listing:
+                return FakeProcess(b"", returncode=101)
             payload = "\n".join(
                 name + ": test" for name in inventory.TARGETS[target]["cases"]
             ).encode()
@@ -390,6 +513,15 @@ class AcceptanceFailureReportTests(unittest.TestCase):
         self.assertEqual(failed["diagnostic"]["exit"]["returncode"], 101)
         self.assertEqual(failed["diagnostic"]["error_class"],
                          "native_process_failed")
+        self.assertEqual(failed["phase"], "run")
+        self.assertEqual(failed["selected_case"],
+                         inventory.TARGETS[FAIL_TARGET]["cases"][0])
+        self.assertTrue(failed["selected_case_known"])
+        self.assertEqual(failed["diagnostic"]["phase"], "run")
+        self.assertEqual(failed["diagnostic"]["selected_case"],
+                         inventory.TARGETS[FAIL_TARGET]["cases"][0])
+        self.assertEqual(failed["diagnostic"]["source_allowlist"],
+                         list(runner.SOURCE_ALLOWLIST))
         self.assertEqual(failed["diagnostic"]["case_counts"]["failed"], 1)
         self.assertEqual(failed["diagnostic"]["source_locations"],
                          [{"file": "tests/ref_store_pack_snapshots.rs", "line": 42}])
@@ -404,6 +536,25 @@ class AcceptanceFailureReportTests(unittest.TestCase):
             self.assertNotIn(forbidden, serialized)
         self.assertNotIn(str(self.root), serialized)
 
+    def test_list_failure_report_records_list_phase_and_null_case(self):
+        self.fail_listing = True
+        report, report_path = self._run("list-failure.json")
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["error_codes"], ["native_process_failed"])
+        self.assertEqual(report["case_count"], 66)
+        failed = report["targets"][-1]
+        self.assertEqual(failed["target"], FAIL_TARGET)
+        self.assertEqual(failed["phase"], "list")
+        self.assertIsNone(failed["selected_case"])
+        self.assertFalse(failed["selected_case_known"])
+        self.assertEqual(failed["diagnostic"]["phase"], "list")
+        self.assertIsNone(failed["diagnostic"]["selected_case"])
+        self.assertEqual(failed["diagnostic"]["error_class"],
+                         "native_process_failed")
+        self.assertEqual(failed["diagnostic"]["returncode"], 101)
+        self.assertEqual(failed["cases"], [])
+        self.assertNotIn(SECRET, report_path.read_text())
+
     def test_completed_cases_in_failing_target_are_recorded_honestly(self):
         self.fail_case_index = 2
         report, report_path = self._run("partial-failure.json")
@@ -413,6 +564,9 @@ class AcceptanceFailureReportTests(unittest.TestCase):
         self.assertEqual(report["observed_case_count"], 69)
         failed = report["targets"][-1]
         self.assertEqual(failed["target"], FAIL_TARGET)
+        self.assertEqual(failed["phase"], "run")
+        self.assertEqual(failed["selected_case"],
+                         inventory.TARGETS[FAIL_TARGET]["cases"][2])
         self.assertEqual(failed["case_count"], 3)
         self.assertEqual([row["status"] for row in failed["cases"]],
                          ["passed", "passed", "failed"])

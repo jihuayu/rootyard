@@ -31,6 +31,9 @@ DEFAULT_CASE_SECONDS = 600.0
 KILL_WAIT_SECONDS = 5.0
 REPORT_KIND = "rootyard/refstore-native11-acceptance"
 FAILURE_KIND = "rootyard/refstore-native11-target-failure"
+FAILURE_PREFIX = "native11"
+FAILURE_PHASES = ("list", "run")
+SOURCE_PREFIX = "tests/"
 
 # The failure projection is deliberately smaller than the already bounded
 # 2 MiB process capture.  It only keeps fields whose complete vocabulary is
@@ -364,16 +367,96 @@ def _bounded_int(value):
     return value
 
 
-def project_target_failure(target, output, returncode, *, timed_out=False, scope="case"):
+def _normalize_failure_context(target, phase, selected_case):
+    """Validate caller-owned phase context without reading argv or output."""
+    _require(target in inventory.TARGETS, "unknown_target")
+    _require(phase in FAILURE_PHASES, "invalid_failure_phase")
+    cases = inventory.TARGETS[target]["cases"]
+    if phase == "list":
+        return {"target": target, "phase": phase, "selected_case": None,
+                "selected_case_known": False}
+    known = selected_case in set(cases)
+    return {
+        "target": target,
+        "phase": phase,
+        "selected_case": selected_case if known else None,
+        "selected_case_known": known,
+    }
+
+
+def _parse_caps():
+    return {
+        "output_bytes": MAX_CAPTURE_BYTES,
+        "line_chars": MAX_DIAGNOSTIC_LINE_CHARS,
+        "case_entries": MAX_DIAGNOSTIC_CASE_ENTRIES,
+        "source_locations": MAX_SOURCE_LOCATIONS,
+        "source_line": MAX_SOURCE_LINE,
+    }
+
+
+def _failure_base(context, returncode, timed_out):
+    """Fixed context/exit/unknown shell, valid even when nothing is parsed."""
+    target = context["target"]
+    phase = context["phase"]
+    expected = tuple(inventory.TARGETS[target]["cases"])
+    numeric, signal_number, signal_name = _returncode_detail(returncode)
+    return {
+        "kind": FAILURE_KIND,
+        "prefix": FAILURE_PREFIX,
+        "source_prefix": SOURCE_PREFIX,
+        "target": target,
+        "phase": phase,
+        "scope": "list" if phase == "list" else "case",
+        "selected_case": context["selected_case"],
+        "selected_case_known": context["selected_case_known"],
+        "error_class": "native_timeout" if timed_out else "native_process_failed",
+        "returncode": _bounded_int(numeric),
+        "timed_out": bool(timed_out),
+        "exit": {
+            "returncode": _bounded_int(numeric),
+            "signal": _bounded_int(signal_number),
+            "signal_name": signal_name,
+            "known": numeric is not None,
+        },
+        "cases": [],
+        "case_counts": {"passed": 0, "failed": 0, "ignored": 0, "unknown": 0},
+        "inventory": {
+            "expected": len(expected),
+            "observed": 0,
+            "missing": len(expected),
+            "unlisted": 0,
+            "duplicate": 0,
+            "malformed": 0,
+            "reported_summary_lines": 0,
+            "case_entries_truncated": False,
+        },
+        "unknown": {
+            "missing_inventory_cases": len(expected),
+            "unlisted_output_cases": 0,
+            "duplicate_inventory_cases": 0,
+            "malformed_output_lines": 0,
+        },
+        "libtest_summary": None,
+        "source_locations": [],
+        "source_allowlist": list(SOURCE_ALLOWLIST),
+        "parse_caps": _parse_caps(),
+    }
+
+
+def project_target_failure(target, output, returncode, *, timed_out=False,
+                           phase="run", selected_case=None):
     """Project captured child output into a fixed, privacy-preserving shape.
 
     This is a pure RAM-only parser: it performs no IO, starts no process and
-    never retries or extends a deadline.  Only case names that are byte-equal
-    to the frozen inventory, finite numeric counts, fixed error/signal labels,
-    and repo-relative paths from ``SOURCE_ALLOWLIST`` are retained.  Everything
-    else is dropped or counted as unknown, never as success.
+    never retries or extends a deadline.  Phase and selected case are supplied
+    by the caller and are never inferred from argv or child output.  Only case
+    names that are byte-equal to the frozen inventory, finite numeric counts,
+    fixed error/signal labels, and repo-relative paths from
+    ``SOURCE_ALLOWLIST`` are retained.  Everything else is dropped or counted
+    as unknown, never as success.
     """
-    _require(target in inventory.TARGETS, "unknown_target")
+    context = _normalize_failure_context(target, phase, selected_case)
+    diagnostic = _failure_base(context, returncode, timed_out)
     cfg = inventory.TARGETS[target]
     expected = tuple(cfg["cases"])
     expected_set = set(expected)
@@ -388,7 +471,6 @@ def project_target_failure(target, output, returncode, *, timed_out=False, scope
     summary_count = 0
     reported_summary = None
 
-    numeric, signal_number, signal_name = _returncode_detail(returncode)
     text = output.decode("utf-8", "replace")
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -470,50 +552,31 @@ def project_target_failure(target, output, returncode, *, timed_out=False, scope
         case_counts[row["status"]] += 1
     missing = max(0, len(expected) - observed)
 
-    return {
-        "kind": FAILURE_KIND,
-        "target": target,
-        "scope": scope if scope in ("list", "case") else "unknown",
-        "error_class": "native_timeout" if timed_out else "native_process_failed",
-        "returncode": _bounded_int(numeric),
-        "timed_out": bool(timed_out),
-        "exit": {
-            "returncode": _bounded_int(numeric),
-            "signal": _bounded_int(signal_number),
-            "signal_name": signal_name,
-            "known": numeric is not None,
-        },
-        "cases": ordered,
-        "case_counts": case_counts,
-        "inventory": {
-            "expected": len(expected),
-            "observed": observed,
-            "missing": missing,
-            "unlisted": unlisted_count,
-            "duplicate": duplicate_count,
-            "malformed": malformed_count,
-            "reported_summary_lines": summary_count,
-            "case_entries_truncated": truncated_entries,
-        },
-        "unknown": {
-            "missing_inventory_cases": missing,
-            "unlisted_output_cases": unlisted_count,
-            "duplicate_inventory_cases": duplicate_count,
-            "malformed_output_lines": malformed_count,
-        },
-        "libtest_summary": reported_summary,
-        "source_locations": source_locations,
-        "parse_caps": {
-            "output_bytes": MAX_CAPTURE_BYTES,
-            "line_chars": MAX_DIAGNOSTIC_LINE_CHARS,
-            "case_entries": MAX_DIAGNOSTIC_CASE_ENTRIES,
-            "source_locations": MAX_SOURCE_LOCATIONS,
-            "source_line": MAX_SOURCE_LINE,
-        },
-    }
+    diagnostic["cases"] = ordered
+    diagnostic["case_counts"] = case_counts
+    diagnostic["inventory"].update({
+        "expected": len(expected),
+        "observed": observed,
+        "missing": missing,
+        "unlisted": unlisted_count,
+        "duplicate": duplicate_count,
+        "malformed": malformed_count,
+        "reported_summary_lines": summary_count,
+        "case_entries_truncated": truncated_entries,
+    })
+    diagnostic["unknown"].update({
+        "missing_inventory_cases": missing,
+        "unlisted_output_cases": unlisted_count,
+        "duplicate_inventory_cases": duplicate_count,
+        "malformed_output_lines": malformed_count,
+    })
+    diagnostic["libtest_summary"] = reported_summary
+    diagnostic["source_locations"] = source_locations
+    return diagnostic
 
 
-def run_bounded(command, timeout, env=None, failure_projector=None):
+def run_bounded(command, timeout, env=None, failure_projector=None,
+                failure_context=None):
     """Run one child in its own process group and capture bounded RAM only."""
     process = subprocess.Popen(
         command,
@@ -566,7 +629,26 @@ def run_bounded(command, timeout, env=None, failure_projector=None):
     if timed_out or process.returncode != 0:
         code = "native_timeout" if timed_out else "native_process_failed"
         diagnostic = None
-        if failure_projector is not None:
+        context = None
+        if failure_context is not None:
+            try:
+                context = _normalize_failure_context(
+                    failure_context.get("target"),
+                    failure_context.get("phase"),
+                    failure_context.get("selected_case"))
+            except Exception:
+                context = None
+        if context is not None:
+            try:
+                diagnostic = project_target_failure(
+                    context["target"], bytes(captured), process.returncode,
+                    timed_out=timed_out, phase=context["phase"],
+                    selected_case=context["selected_case"])
+            except Exception:
+                # Context survives even if the parser itself fails.
+                diagnostic = _failure_base(
+                    context, process.returncode, timed_out)
+        elif failure_projector is not None:
             try:
                 diagnostic = failure_projector(
                     bytes(captured), process.returncode, timed_out)
@@ -598,15 +680,17 @@ def parse_case_result(output, name):
 
 
 def _list_target(binary, cfg, remaining, target=None):
-    projector = None
+    failure_context = None
     if target is not None:
-        def projector(output, returncode, timed_out):
-            return project_target_failure(
-                target, output, returncode, timed_out=timed_out, scope="list")
+        failure_context = {
+            "target": target,
+            "phase": "list",
+            "selected_case": None,
+        }
     output = run_bounded(
         [str(binary), "--list", "--ignored", "--format", "terse"],
         timeout=min(60.0, remaining), env=os.environ.copy(),
-        failure_projector=projector)
+        failure_context=failure_context)
     actual = parse_listing(output)
     expected = list(cfg["cases"])
     _require(len(actual) == len(expected) and len(set(actual)) == len(actual)
@@ -615,15 +699,17 @@ def _list_target(binary, cfg, remaining, target=None):
 
 
 def _run_one(binary, name, remaining, case_seconds=DEFAULT_CASE_SECONDS, target=None):
-    projector = None
+    failure_context = None
     if target is not None:
-        def projector(output, returncode, timed_out):
-            return project_target_failure(
-                target, output, returncode, timed_out=timed_out, scope="case")
+        failure_context = {
+            "target": target,
+            "phase": "run",
+            "selected_case": name,
+        }
     output = run_bounded(
         [str(binary), name, "--exact", "--ignored", "--test-threads=1", "--format", "pretty"],
         timeout=min(case_seconds, remaining), env=os.environ.copy(),
-        failure_projector=projector)
+        failure_context=failure_context)
     parse_case_result(output, name)
 
 
@@ -739,11 +825,27 @@ def _safe_failure_diagnostic(diagnostic, target, observed_cases=None):
     error_class = diagnostic.get("error_class")
     if error_class not in ("native_process_failed", "native_timeout"):
         error_class = "native_timeout" if timed_out else "native_process_failed"
+    raw_phase = diagnostic.get("phase")
+    phase = raw_phase if raw_phase in FAILURE_PHASES else "unknown"
+    if phase == "list":
+        selected_case = None
+        selected_case_known = False
+    elif phase == "run":
+        raw_selected = diagnostic.get("selected_case")
+        selected_case_known = raw_selected in set(expected)
+        selected_case = raw_selected if selected_case_known else None
+    else:
+        selected_case = None
+        selected_case_known = False
     return {
         "kind": FAILURE_KIND,
+        "prefix": FAILURE_PREFIX,
+        "source_prefix": SOURCE_PREFIX,
         "target": target,
-        "scope": (diagnostic.get("scope")
-                  if diagnostic.get("scope") in ("list", "case") else "unknown"),
+        "phase": phase,
+        "scope": "list" if phase == "list" else ("case" if phase == "run" else "unknown"),
+        "selected_case": selected_case,
+        "selected_case_known": selected_case_known,
         "error_class": error_class,
         "returncode": numeric,
         "timed_out": timed_out,
@@ -774,13 +876,8 @@ def _safe_failure_diagnostic(diagnostic, target, observed_cases=None):
         },
         "libtest_summary": summary,
         "source_locations": _safe_source_locations(diagnostic.get("source_locations")),
-        "parse_caps": {
-            "output_bytes": MAX_CAPTURE_BYTES,
-            "line_chars": MAX_DIAGNOSTIC_LINE_CHARS,
-            "case_entries": MAX_DIAGNOSTIC_CASE_ENTRIES,
-            "source_locations": MAX_SOURCE_LOCATIONS,
-            "source_line": MAX_SOURCE_LINE,
-        },
+        "source_allowlist": list(SOURCE_ALLOWLIST),
+        "parse_caps": _parse_caps(),
     }
 
 
@@ -790,7 +887,11 @@ def _attach_failed_target(report, diagnostic, identities, observed_cases=None):
         return
     safe_diagnostic = _safe_failure_diagnostic(diagnostic, target, observed_cases)
     row = {
+        "prefix": safe_diagnostic["prefix"],
         "target": target,
+        "phase": safe_diagnostic["phase"],
+        "selected_case": safe_diagnostic["selected_case"],
+        "selected_case_known": safe_diagnostic["selected_case_known"],
         "passed": False,
         "status": "failed",
         "cases": safe_diagnostic["cases"],
