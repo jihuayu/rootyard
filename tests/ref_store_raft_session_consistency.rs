@@ -346,12 +346,22 @@ impl RaftNodeProc {
     async fn shutdown(&self) {
         let _ = tokio::time::timeout(Duration::from_millis(800), self.rpc(json!("Shutdown"))).await;
         let child_opt = self.child.lock().expect("child mutex").take();
-        if let Some(mut c) = child_opt {
-            if reap_bounded(&mut c, Duration::from_secs(4)).is_none() {
-                let _ = c.kill();
-                let _ = reap_bounded(&mut c, Duration::from_secs(2));
-            }
+        if let Some(mut c) = child_opt
+            && reap_bounded(&mut c, Duration::from_secs(4)).is_none()
+        {
+            let _ = c.kill();
+            let _ = reap_bounded(&mut c, Duration::from_secs(2));
         }
+    }
+}
+
+async fn shutdown_nodes(st: &HarnessState, ids: &[u64]) {
+    let procs: Vec<_> = {
+        let mut guard = st.nodes.write().unwrap();
+        ids.iter().filter_map(|sid| guard.remove(sid)).collect()
+    };
+    for p in procs {
+        p.shutdown().await;
     }
 }
 
@@ -375,7 +385,7 @@ fn rpc_sync(cfg: &Arc<ClientConfig>, addr: &str, dns: &str, req: &Value) -> Resu
     }
     let mut body = vec![0u8; len];
     tls.read_exact(&mut body)?;
-    let _ = tls.conn.send_close_notify();
+    tls.conn.send_close_notify();
     let _ = tls.flush();
     Ok(serde_json::from_slice(&body)?)
 }
@@ -915,11 +925,7 @@ async fn real_raft_cluster_http_read_your_writes_monotonic_failover_lag_and_quor
     // 6. Total quorum loss: remove 2 voters -> surviving node MUST fail closed 503.
     let survivor_id = majority[0].id;
     let to_stop: Vec<u64> = [1u64, 2, 3].into_iter().filter(|&id| id != survivor_id).collect();
-    for sid in to_stop {
-        if let Some(proc_arc) = st.nodes.write().unwrap().remove(&sid) {
-            proc_arc.shutdown().await;
-        }
-    }
+    shutdown_nodes(&st, &to_stop).await;
     let r_quorum_lost = http
         .get(format!("{base_url}/api/raft/nodes/{survivor_id}/refs"))
         .header(RAFT_SESSION_HEADER, &tok1)
@@ -927,9 +933,7 @@ async fn real_raft_cluster_http_read_your_writes_monotonic_failover_lag_and_quor
         .await?;
     assert_eq!(r_quorum_lost.status(), 503);
 
-    if let Some(last) = st.nodes.write().unwrap().remove(&survivor_id) {
-        last.shutdown().await;
-    }
+    shutdown_nodes(&st, &[survivor_id]).await;
     teardown_pg_schema(&admin, &schema).await;
     Ok(())
 }
@@ -1012,11 +1016,7 @@ async fn real_http_rejects_rotated_history_authority_restore_forged_token_and_re
     let r_unauth = http.get(format!("{base_url}/api/raft/nodes/{leader_id}/refs")).send().await?;
     assert_eq!(r_unauth.status(), 401);
 
-    for sid in [1u64, 2, 3] {
-        if let Some(p) = st.nodes.write().unwrap().remove(&sid) {
-            p.shutdown().await;
-        }
-    }
+    shutdown_nodes(&st, &[1, 2, 3]).await;
     Ok(())
 }
 
@@ -1061,7 +1061,7 @@ async fn real_pg17_projection_dependency_atomicity_duplicates_gap_abort_and_time
             HeadUpdate::Keep,
             CommitMode::Atomic,
             vec![RefUpdate::new(
-                RefName::branch(&format!("refs/heads/b{seq}"))?,
+                RefName::branch(format!("refs/heads/b{seq}"))?,
                 RefPrecondition::Absent,
                 RefTarget::Oid(GitOid::Sha256([seq as u8; 32])),
             )],
@@ -1338,10 +1338,6 @@ async fn stock_git_compatibility_fixed_oid_closure_and_pin_gc_safety() -> Result
     )?;
     assert_eq!(sm.read_hold(hold_id).unwrap().state, SmHoldState::Retired);
 
-    for sid in [1u64, 2, 3] {
-        if let Some(p) = st.nodes.write().unwrap().remove(&sid) {
-            p.shutdown().await;
-        }
-    }
+    shutdown_nodes(&st, &[1, 2, 3]).await;
     Ok(())
 }
