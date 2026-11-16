@@ -755,6 +755,13 @@ impl HelperClient {
         !self.inner.dead.load(Ordering::Acquire)
     }
 
+    /// True only after the exact helper child was actually reaped. A dead
+    /// control generation with a still-running or unreaped child is not
+    /// quiescent and remains shutdown-visible.
+    pub fn child_reaped(&self) -> bool {
+        lock(&self.inner.child).reaped()
+    }
+
     /// Publish the one absolute helper teardown deadline before scheduling the
     /// blocking shutdown. This also caps a last-`Arc` drop/reaper that runs
     /// before the blocking closure is dispatched, so it cannot start a fresh

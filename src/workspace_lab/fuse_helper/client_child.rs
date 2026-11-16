@@ -58,6 +58,13 @@ impl ChildSlot {
         self.reaping = false;
     }
 
+    /// True only after `Child::try_wait`/`wait` actually reaped the child.
+    /// A recorded wait error, a taken handle still being reaped, or a missing
+    /// handle is never quiescence.
+    pub(super) fn reaped(&self) -> bool {
+        matches!(&self.status, Some(Ok(_)))
+    }
+
     /// One short observation. Never sleeps and never treats a missing handle as
     /// an exit; `wait_exit` owns the bounded sleep loop.
     pub(super) fn observe(&mut self) -> ExitObservation {
@@ -113,6 +120,18 @@ mod tests {
         slot.record_exit(Ok(success.clone()));
         assert!(slot.take_for_reap().is_none(), "an observed exit must not be reaped twice");
         assert_eq!(slot.observe(), ExitObservation::Exited(Ok(success)));
+    }
+
+    #[test]
+    fn only_an_observed_exit_is_reaped() {
+        let mut waiting = ChildSlot::default();
+        assert!(!waiting.reaped(), "a missing handle is not reap proof");
+        waiting.record_exit(Err("wait failed".into()));
+        assert!(!waiting.reaped(), "a wait error is not reap proof");
+
+        let mut reaped = ChildSlot::default();
+        reaped.record_exit(Ok(ExitView { success: false, description: "exit status: 9".into() }));
+        assert!(reaped.reaped(), "an observed nonzero exit was still reaped");
     }
 
     #[test]
