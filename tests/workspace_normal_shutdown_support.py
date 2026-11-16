@@ -5,8 +5,9 @@ Everything here is owned by the one test that imports it:
 
 * the ``ROOTYARD_GIT`` wrapper executes the host's real Git and records only a
   fixed exit code and byte counts/digests, never Git output, paths or bodies;
-* the raw FIFO is a real filesystem object used to hold the production capture
-  freeze through its ordinary snapshot read; it is not a FUSE/helper fake;
+* the capture target is a real regular ``.git/index`` exposed through a
+  test-owned symlink proxy for the existing exact-path read barrier; it is not
+  a FUSE/helper fake or a special file;
 * the raw HTTP PUT client sends request headers plus only part of a valid JSON
   body, so the handler cannot reach its PUT-capacity admission before the test
   observes shutdown.
@@ -196,46 +197,33 @@ def clear_git_markers(marker: Path) -> None:
             path.unlink()
 
 
-class RawFifoGate:
-    """A real FIFO that holds the production raw-snapshot read.
+def enable_capture_proxy(proxy: Path, target_file: Path, source_file: Path) -> None:
+    """Make the exact production raw read match the installed capture gate.
 
-    The capture scanner enters ``with_frozen`` before ``Raw::load``; creating
-    the FIFO at the upper ``.git/index`` path makes that ordinary snapshot read
-    wait for a writer.  While the actual helper gate is frozen, the pending
-    FUSE writer is parked by the real frozen dispatch queue.  Releasing the
-    FIFO only lets the capture producer leave the freeze; it is never used as
-    mount-removal or helper-exit evidence.
+    The interposer resolves its configured target at read time.  Until this
+    function runs the proxy is absent, so setup/checkpoint reads cannot match.
+    The proxy is a test-owned symlink to a real regular upper ``.git/index``
+    copied from the workspace lower index; ``core::inventory`` therefore
+    accepts it as a file before the real ``read`` is intercepted.  No FIFO or
+    other special file is used.
     """
-
-    def __init__(self, path: Path):
-        self.path = Path(path)
-        self.fd: int | None = None
-
-    def install(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists() or self.path.is_symlink():
-            self.path.unlink()
-        os.mkfifo(self.path, 0o600)
-        if not stat.S_ISFIFO(self.path.lstat().st_mode):
-            raise NormalShutdownError("owned capture gate is not a FIFO")
-
-    def release(self) -> None:
-        if self.fd is None:
-            self.fd = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)
-
-    def close(self) -> None:
-        if self.fd is not None:
-            try:
-                os.close(self.fd)
-            finally:
-                self.fd = None
-
-    def remove(self) -> None:
-        self.close()
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
+    target_file = Path(target_file)
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    if target_file.exists() or target_file.is_symlink():
+        mode = target_file.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            raise NormalShutdownError("capture target is a directory")
+        target_file.unlink()
+    data = Path(source_file).read_bytes()
+    target_file.write_bytes(data)
+    target_file.chmod(0o600)
+    if not stat.S_ISREG(target_file.lstat().st_mode):
+        raise NormalShutdownError("capture target is not a regular file")
+    proxy = Path(proxy)
+    proxy.parent.mkdir(parents=True, exist_ok=True)
+    if proxy.exists() or proxy.is_symlink():
+        proxy.unlink()
+    os.symlink(target_file.resolve(), proxy)
 
 
 def wait_for_writer_writing(process, status_path: Path, timeout: float = 10.0) -> dict:

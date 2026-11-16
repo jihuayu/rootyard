@@ -668,8 +668,14 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
         """Normal SIGTERM releases a parked real FUSE writer before Git join.
 
         The production capture freeze is held through its ordinary raw-snapshot
-        read (a test-owned FIFO at the writer workspace's upper ``.git/index``),
-        not the 15s LD_PRELOAD capture gate.  A real HTTP workspace Git mutation
+        read by the repository's existing exact-path capture-read interposer.
+        The interposer is installed before the API starts with an absent proxy
+        target; all heavy setup completes first, then a test-owned symlink proxy
+        points at a real regular upper ``.git/index``.  The next production Raw
+        read hits the barrier and holds the real ``with_frozen`` closure.  The
+        barrier is released immediately at SIGTERM; its fixed 15-second marker
+        is only an emergency failure guard, never a wait or shutdown extension.
+        A real HTTP workspace Git mutation
         runs real Git through a small test-only ``ROOTYARD_GIT`` wrapper that
         holds the completed child at an owned marker.  The Git mutation uses a
         second mounted workspace owned by the same API/helper: the production
@@ -691,15 +697,13 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
             wrapper.chmod(0o700)
             h = Harness(argparse.Namespace(binary=str(wrapper), keep=False))
             marker = h.root / "normal-sigterm-git"
+            proxy_target = h.root / "normal-sigterm-capture-target"
             h.env["ROOTYARD_WORKSPACE_MOUNT_MODE"] = HELPER_BACKEND
             h.env["ROOTYARD_SANDBOX_MODE"] = "dev"
-            for name in ("LD_PRELOAD", "ROOTYARD_TEST_CAPTURE_GATE",
-                         "ROOTYARD_TEST_CAPTURE_TARGET"):
-                h.env.pop(name, None)
             git_wrapper = normal_shutdown.install_git_wrapper(h.root, real_git, marker)
             h.env["ROOTYARD_GIT"] = str(git_wrapper)
 
-            fifo = None
+            gate_prefix = None
             writer = None
             writer_pidfd = None
             holders = []
@@ -715,6 +719,10 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
             original_failure = None
             mount_cleanup_proven = True
             try:
+                # The existing exact-path capture interposer is installed into
+                # this harness's own service child before the API starts.  Its
+                # target proxy is absent, so setup reads cannot match yet.
+                gate_prefix = install_capture_read_gate(h, proxy_target)
                 h.setup()
                 api_pid = h.proc.pid
                 self.assertEqual(os.getpgid(api_pid), api_pid,
@@ -772,6 +780,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 writer_id = writer_ws["id"]
                 writer_mount, writer_mount_id = mount_info(writer_id)
                 writer_upper = h.root / "data/workspace-service/uppers" / writer_id
+                writer_lower = h.root / "data/workspace-service/workspaces" / writer_id
                 writer_checkpoint = checkpoint(writer_id,
                                                "normal-sigterm-writer-checkpoint")
                 writer_checkpoint_id = writer_checkpoint["checkpoint_id"]
@@ -858,18 +867,6 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 writer_pidfd = support.open_pidfd(writer.pid)
                 normal_shutdown.wait_for_writer_writing(writer, writer_status, timeout=10)
 
-                # The production capture scanner enters with_frozen before its
-                # raw snapshot.  A real FIFO at upper .git/index makes that
-                # ordinary read wait, so the actual helper gate stays Frozen
-                # and the next real FUSE write is parked in the kernel.
-                fifo = normal_shutdown.RawFifoGate(writer_upper / ".git/index")
-                fifo.install()
-                kernel_wait = support.wait_for_kernel_wait(
-                    writer.pid, writer_mount, writer_status, timeout=15)
-                self.assertEqual(kernel_wait["attempts"], kernel_wait["writes"] + 1)
-                self.assertTrue(kernel_wait["kernel_wchan"] or kernel_wait["inflight_fd"],
-                                "writer did not expose a real kernel FUSE wait")
-
                 normal_shutdown.clear_git_markers(marker)
                 Path(str(marker) + ".trigger").touch()
                 git_state = workspace_state(git_id)
@@ -925,6 +922,26 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 put.wait_accepted(api_pid, timeout=5)
                 self.assertFalse(put_target.exists())
 
+                # All heavy setup is complete while the exact-path proxy is
+                # absent.  The upper .git/index is a real regular file copied
+                # from the workspace lower index; the proxy is only a test-owned
+                # symlink to it.  The next production Raw read matches the
+                # existing capture interposer and holds the real with_frozen
+                # closure before the writer's next FUSE write is parked.
+                normal_shutdown.enable_capture_proxy(
+                    proxy_target, writer_upper / ".git/index",
+                    writer_lower / ".git/index")
+                wait_capture_gate(gate_prefix.with_suffix(".hit"), timeout=10)
+                self.assertFalse(gate_prefix.with_suffix(".timeout").exists(),
+                                 "capture read gate emergency timeout fired before hit")
+                kernel_wait = support.wait_for_kernel_wait(
+                    writer.pid, writer_mount, writer_status, timeout=15)
+                self.assertEqual(kernel_wait["attempts"], kernel_wait["writes"] + 1)
+                self.assertTrue(kernel_wait["kernel_wchan"] or kernel_wait["inflight_fd"],
+                                "writer did not expose a real kernel FUSE wait")
+                self.assertFalse(gate_prefix.with_suffix(".timeout").exists(),
+                                 "capture read gate emergency timeout fired while frozen")
+
                 self.assertEqual(os.getpgid(api_pid), api_pid,
                                  "production API is not the owned process-group leader")
                 deadline = time.monotonic() + NORMAL_SIGTERM_BUDGET
@@ -937,10 +954,11 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     return left
 
                 os.killpg(api_pid, signal.SIGTERM)
-                # Capture drain precedes helper teardown.  Release only the
-                # real raw-snapshot FIFO so the producer can observe stop; the
-                # exact mount/helper proof below remains separate.
-                fifo.release()
+                # The release is immediate: it is not a 15-second wait.  The
+                # .timeout marker remains an emergency failure guard.
+                gate_prefix.with_suffix(".release").touch()
+                self.assertFalse(gate_prefix.with_suffix(".timeout").exists(),
+                                 "capture read gate emergency timeout fired at SIGTERM")
 
                 self.assertTrue(support.wait_for_mount_id_gone(
                     writer_holder.pid, writer_mount, writer_mount_id, remaining()),
@@ -1012,6 +1030,8 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertIsNone(support.process_identity(helper_pid),
                                   "helper PID was not fully reaped after API exit")
+                self.assertFalse(gate_prefix.with_suffix(".timeout").exists(),
+                                 "capture read gate emergency timeout fired during shutdown")
 
                 self.assertEqual(int(h.sql(
                     f"SELECT revision FROM workspaces WHERE id='{put_id}'")),
@@ -1132,8 +1152,9 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     except BaseException as error:
                         cleanup_failures.append((label, error))
 
-                if fifo is not None:
-                    attempt("release capture FIFO", fifo.release)
+                if gate_prefix is not None:
+                    attempt("release capture gate",
+                            lambda: gate_prefix.with_suffix(".release").touch())
                 attempt("release Git wrapper",
                         lambda: normal_shutdown.release_git_hold(marker))
                 if put is not None:
@@ -1181,8 +1202,6 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                                   ("close writer pidfd", writer_pidfd)):
                     if fd is not None:
                         attempt(label, lambda fd=fd: os.close(fd))
-                if fifo is not None:
-                    attempt("remove capture FIFO", fifo.remove)
                 if not mount_cleanup_proven:
                     h.args.keep = True
                     cleanup_failures.append((
