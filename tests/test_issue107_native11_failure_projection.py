@@ -620,5 +620,158 @@ class AcceptanceFailureReportTests(unittest.TestCase):
                          {"targets": 11, "cases": 167})
 
 
+class MetadataReplayTraceTests(unittest.TestCase):
+    target = runner.METADATA_REPLAY_TARGET
+    case = runner.METADATA_REPLAY_CASE
+
+    def _frame(self, phase, site, event, ok="", status="", counts="", checks="", iteration="", error_kind=""):
+        return "|".join([
+            runner.METADATA_REPLAY_PREFIX,
+            str(phase), str(site), str(event), ok, status, counts, checks,
+            iteration, error_kind,
+        ])
+
+    def _project(self, lines, **changes):
+        options = {"phase": "run", "selected_case": self.case}
+        options.update(changes)
+        payload = ("\n".join(lines) + ("\n" if lines else "")).encode()
+        return runner.project_target_failure(self.target, payload, 101, **options)
+
+    def test_valid_frame_survives_projection_safe_rebuild_and_attach(self):
+        lines = [
+            self._frame(17, 1, 0),
+            self._frame(17, 1, 1, ok="1"),
+            self._frame(17, 2, 0),
+            self._frame(17, 2, 2, ok="0", status="404"),
+            self._frame(18, 1, 0),
+            self._frame(18, 1, 1, ok="1", counts="1,2,3,4,5"),
+            self._frame(24, 1, 0),
+            self._frame(24, 1, 1, ok="1"),
+        ]
+        diag = self._project(lines)
+        trace = diag["case_trace"]
+        self.assertTrue(trace["known"])
+        self.assertFalse(trace["incomplete"])
+        self.assertFalse(trace["invalid"])
+        self.assertEqual(trace["frames"], 8)
+        self.assertEqual(trace["first_failure"]["phase"], 17)
+        self.assertEqual(trace["first_failure"]["site"], 2)
+        self.assertEqual(trace["first_failure"]["status"], 404)
+        self.assertEqual(trace["primary"]["site_name"], "exact_first_advance_content_assert")
+        self.assertEqual(trace["status"], 404)
+        self.assertIsNone(trace["last_incomplete"])
+        self.assertTrue(trace["cleanup_completed"])
+        self.assertEqual(trace["last_completed"]["phase"], 24)
+        self.assertEqual(trace["last_completed"]["ok"], True)
+
+        safe = runner._safe_failure_diagnostic(diag, self.target)
+        self.assertEqual(safe["case_trace"]["primary"], trace["primary"])
+        self.assertEqual(safe["case_trace"]["cleanup_completed"], True)
+        report = {"targets": []}
+        runner._attach_failed_target(report, diag, {}, [])
+        attached = report["targets"][0]["case_trace"]
+        self.assertEqual(attached["primary"], trace["primary"])
+        self.assertEqual(attached["first_failure"]["status"], 404)
+        serialized = json.dumps(report)
+        for forbidden in (SECRET, SQL, DSN):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_failed_operation_event_and_marker_alone_cannot_pass(self):
+        lines = [
+            self._frame(18, 2, 0),
+            self._frame(18, 2, 1, ok="0", status="500"),
+            summary("ok", 1, 0, 0),
+        ]
+        diag = self._project(lines)
+        trace = diag["case_trace"]
+        self.assertTrue(trace["known"])
+        self.assertEqual(trace["first_failure"]["event"], 1)
+        self.assertFalse(trace["first_failure"]["ok"])
+        self.assertEqual(trace["first_failure"]["status"], 500)
+        self.assertEqual(trace["primary"]["site"], 2)
+        self.assertEqual(diag["case_counts"]["passed"], 0)
+        self.assertEqual(diag["cases"], [])
+
+    def test_checks_and_counts_are_fixed_bounded_fields(self):
+        lines = [
+            self._frame(16, 3, 0),
+            self._frame(16, 3, 1, ok="1", checks="1,0,1"),
+        ]
+        diag = self._project(lines)
+        trace = diag["case_trace"]
+        self.assertEqual(trace["last_completed"]["checks"], [True, False, True])
+        self.assertEqual(trace["checks"], [True, False, True])
+        counts_lines = [
+            self._frame(18, 1, 0),
+            self._frame(18, 1, 1, ok="1", counts="0,1,2,3,4"),
+        ]
+        counts_trace = self._project(counts_lines)["case_trace"]
+        self.assertEqual(counts_trace["counts"], [0, 1, 2, 3, 4])
+
+    def test_invalid_frames_are_unknown_and_never_retain_text(self):
+        malformed = [
+            self._frame(17, 1, 0) + "|extra",
+            self._frame(17, 1, 1, ok="1", status=SECRET),
+            self._frame(17, 1, 1, ok="2"),
+            self._frame(17, 1, 1, ok="1", checks="2"),
+            self._frame(17, 99, 0),
+            self._frame(17, 1, 3),
+            self._frame(17, 1, 0) + "\n" + self._frame(17, 2, 0),
+        ]
+        for bad in malformed:
+            diag = self._project([bad])
+            trace = diag["case_trace"]
+            self.assertFalse(trace["known"])
+            self.assertTrue(trace["incomplete"])
+            self.assertTrue(trace["invalid"])
+            self.assertIsNone(trace["last_event"])
+            serialized = json.dumps(diag)
+            for forbidden in (SECRET, SQL, DSN):
+                self.assertNotIn(forbidden, serialized)
+
+    def test_truncated_frame_is_incomplete_not_a_completion(self):
+        diag = runner.project_target_failure(
+            self.target,
+            self._frame(17, 1, 0).encode(),
+            101,
+            phase="run",
+            selected_case=self.case,
+        )
+        trace = diag["case_trace"]
+        self.assertFalse(trace["known"])
+        self.assertTrue(trace["incomplete"])
+        self.assertFalse(trace["invalid"])
+        self.assertIsNone(trace["last_event"])
+        self.assertIsNone(trace["primary"])
+        safe = runner._safe_failure_diagnostic(diag, self.target)["case_trace"]
+        self.assertFalse(safe["known"])
+        self.assertTrue(safe["incomplete"])
+        self.assertFalse(safe["invalid"])
+        self.assertIsNone(safe["primary"])
+
+    def test_cleanup_failure_does_not_replace_earlier_incomplete_primary(self):
+        lines = [
+            self._frame(17, 1, 0),
+            self._frame(24, 1, 0),
+            self._frame(24, 1, 1, ok="0"),
+        ]
+        trace = self._project(lines)["case_trace"]
+        self.assertEqual(trace["primary"]["phase"], 17)
+        self.assertEqual(trace["primary"]["site"], 1)
+        self.assertEqual(trace["last_incomplete"]["phase"], 17)
+        self.assertEqual(trace["first_failure"]["phase"], 24)
+        self.assertFalse(trace["cleanup_completed"])
+
+    def test_frame_parser_is_gated_to_exact_target_phase_and_case(self):
+        lines = [self._frame(17, 1, 0), self._frame(17, 1, 1, ok="1")]
+        self.assertIsNone(self._project(lines, phase="list", selected_case=None)["case_trace"])
+        self.assertIsNone(self._project(lines, selected_case=inventory.TARGETS[self.target]["cases"][1])["case_trace"])
+        other = inventory.TARGETS[TARGET]["cases"][0]
+        diag = runner.project_target_failure(
+            TARGET, ("\n".join(lines) + "\n").encode(), 101,
+            phase="run", selected_case=other)
+        self.assertIsNone(diag["case_trace"])
+
+
 if __name__ == "__main__":
     unittest.main()

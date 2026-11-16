@@ -49,6 +49,158 @@ SOURCE_ALLOWLIST = tuple(sorted({
     cfg["source"] for cfg in inventory.TARGETS.values()
 }))
 
+# Bounded, test-only metadata-replay checkpoint frames. The protocol is gated
+# on the caller-selected exact target/case below; frame text never supplies or
+# changes the case identity and never becomes a libtest pass.
+METADATA_REPLAY_PREFIX = "ROOTYARD_I107_METADATA_REPLAY_V1"
+METADATA_REPLAY_TARGET = "ref_store_pack_snapshots"
+METADATA_REPLAY_CASE = "serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_it"
+METADATA_REPLAY_PROTOCOL = "metadata_replay_v1"
+METADATA_REPLAY_MAX_LINE = 512
+METADATA_REPLAY_MAX_FRAMES = 512
+METADATA_REPLAY_MAX_COUNTS = 1_000_000_000
+METADATA_REPLAY_MAX_ITERATION = 100_000
+METADATA_REPLAY_MAX_CHECKS = 8
+METADATA_REPLAY_MAX_ERROR_KIND = 8
+MAX_METADATA_REPLAY_PHASE = 24
+
+METADATA_REPLAY_PHASES = {
+    1: 'setup',
+    2: 'tenant_create',
+    3: 'old_a5a',
+    4: 'first_advance',
+    5: 'tenant_replay',
+    6: 'changed_lease',
+    7: 'collaborator',
+    8: 'cross_mode_tenant',
+    9: 'cross_mode_actor',
+    10: 'owned_a_create_read',
+    11: 'owned_a_renew',
+    12: 'owned_a_release',
+    13: 'owned_b_create',
+    14: 'second_advance_replay',
+    15: 'owned_b_read',
+    16: 'owned_b_materialize',
+    17: 'historical_content',
+    18: 'nonowner_read',
+    19: 'tenant_read_refusal',
+    20: 'nonowner_materialize',
+    21: 'tenant_materialize_refusal',
+    22: 'role_revoke_read',
+    23: 'role_revoke_materialize',
+    24: 'finish',
+}
+
+# (phase, site) -> fixed phase/site labels from the source-only triage map.
+METADATA_REPLAY_SITES = {
+    (1, 1): ('setup', 'db_setup'),
+    (1, 2): ('setup', 'open_store'),
+    (1, 3): ('setup', 'git_binary'),
+    (1, 4): ('setup', 'serving_business'),
+    (1, 5): ('setup', 'serving_verified'),
+    (2, 1): ('tenant_create', 'create'),
+    (2, 2): ('tenant_create', 'not_replayed_assert'),
+    (2, 3): ('tenant_create', 'tenant_assert'),
+    (2, 4): ('tenant_create', 'counts_read'),
+    (3, 1): ('old_a5a', 'scope_construct'),
+    (3, 2): ('old_a5a', 'expectation_construct'),
+    (3, 3): ('old_a5a', 'request_construct'),
+    (3, 4): ('old_a5a', 'pool_acquire'),
+    (3, 5): ('old_a5a', 'create_result'),
+    (3, 6): ('old_a5a', 'refused_assert'),
+    (3, 7): ('old_a5a', 'counts_read'),
+    (3, 8): ('old_a5a', 'unchanged_assert'),
+    (4, 1): ('first_advance', 'serving_advance'),
+    (4, 2): ('first_advance', 'gate_read'),
+    (4, 3): ('first_advance', 'revision_advanced_assert'),
+    (5, 1): ('tenant_replay', 'create'),
+    (5, 2): ('tenant_replay', 'replayed_assert'),
+    (5, 3): ('tenant_replay', 'snapshot_id_assert'),
+    (5, 4): ('tenant_replay', 'pin_id_assert'),
+    (5, 5): ('tenant_replay', 'gate_assert'),
+    (5, 6): ('tenant_replay', 'counts_read'),
+    (5, 7): ('tenant_replay', 'unchanged_assert'),
+    (6, 1): ('changed_lease', 'create_result'),
+    (6, 2): ('changed_lease', 'refused_assert'),
+    (6, 3): ('changed_lease', 'counts_read'),
+    (6, 4): ('changed_lease', 'unchanged_assert'),
+    (7, 1): ('collaborator', 'create_authenticate_collaborator'),
+    (7, 2): ('collaborator', 'distinct_principal_assert'),
+    (8, 1): ('cross_mode_tenant', 'create'),
+    (8, 2): ('cross_mode_tenant', 'not_replayed_assert'),
+    (8, 3): ('cross_mode_tenant', 'owner_assert'),
+    (8, 4): ('cross_mode_tenant', 'counts_read'),
+    (9, 1): ('cross_mode_actor', 'create_result'),
+    (9, 2): ('cross_mode_actor', 'exact_conflict_match'),
+    (9, 3): ('cross_mode_actor', 'counts_read'),
+    (9, 4): ('cross_mode_actor', 'unchanged_assert'),
+    (10, 1): ('owned_a_create_read', 'create'),
+    (10, 2): ('owned_a_create_read', 'not_replayed_assert'),
+    (10, 3): ('owned_a_create_read', 'owner_tenant_assert'),
+    (10, 4): ('owned_a_create_read', 'read'),
+    (10, 5): ('owned_a_create_read', 'immutable_capture_assert'),
+    (11, 1): ('owned_a_renew', 'renew'),
+    (11, 2): ('owned_a_renew', 'not_replayed_assert'),
+    (11, 3): ('owned_a_renew', 'generation_two_assert'),
+    (11, 4): ('owned_a_renew', 'renew_replay'),
+    (11, 5): ('owned_a_renew', 'replayed_assert'),
+    (12, 1): ('owned_a_release', 'release'),
+    (12, 2): ('owned_a_release', 'not_replayed_assert'),
+    (12, 3): ('owned_a_release', 'release_replay'),
+    (12, 4): ('owned_a_release', 'replayed_assert'),
+    (12, 5): ('owned_a_release', 'released_read_result'),
+    (12, 6): ('owned_a_release', 'refused_assert'),
+    (13, 1): ('owned_b_create', 'create'),
+    (13, 2): ('owned_b_create', 'not_replayed_assert'),
+    (13, 3): ('owned_b_create', 'owner_tenant_assert'),
+    (13, 4): ('owned_b_create', 'counts_read'),
+    (14, 1): ('second_advance_replay', 'serving_advance'),
+    (14, 2): ('second_advance_replay', 'create_replay'),
+    (14, 3): ('second_advance_replay', 'replayed_assert'),
+    (14, 4): ('second_advance_replay', 'snapshot_pin_gate_assert'),
+    (14, 5): ('second_advance_replay', 'counts_read'),
+    (14, 6): ('second_advance_replay', 'unchanged_assert'),
+    (15, 1): ('owned_b_read', 'read'),
+    (15, 2): ('owned_b_read', 'immutable_capture_assert'),
+    (15, 3): ('owned_b_read', 'nonempty_packs_assert'),
+    (15, 4): ('owned_b_read', 'head_option'),
+    (15, 5): ('owned_b_read', 'first_advance_head_assert'),
+    (15, 6): ('owned_b_read', 'different_second_head_assert'),
+    (16, 1): ('owned_b_materialize', 'materializer_construct'),
+    (16, 2): ('owned_b_materialize', 'materialize'),
+    (16, 3): ('owned_b_materialize', 'view_shape_assert'),
+    (16, 4): ('owned_b_materialize', 'each_pack_identity_assert'),
+    (17, 1): ('historical_content', 'read_materialized_file'),
+    (17, 2): ('historical_content', 'exact_first_advance_content_assert'),
+    (18, 1): ('nonowner_read', 'ledger_baseline'),
+    (18, 2): ('nonowner_read', 'read_result'),
+    (18, 3): ('nonowner_read', 'exact_not_found_match'),
+    (18, 4): ('nonowner_read', 'ledger_read'),
+    (18, 5): ('nonowner_read', 'unchanged_assert'),
+    (19, 1): ('tenant_read_refusal', 'read_result'),
+    (19, 2): ('tenant_read_refusal', 'refused_assert'),
+    (19, 3): ('tenant_read_refusal', 'ledger_read'),
+    (19, 4): ('tenant_read_refusal', 'unchanged_assert'),
+    (20, 1): ('nonowner_materialize', 'materialize_result'),
+    (20, 2): ('nonowner_materialize', 'exact_not_found_match'),
+    (20, 3): ('nonowner_materialize', 'ledger_read'),
+    (20, 4): ('nonowner_materialize', 'unchanged_assert'),
+    (21, 1): ('tenant_materialize_refusal', 'materialize_result'),
+    (21, 2): ('tenant_materialize_refusal', 'refused_assert'),
+    (21, 3): ('tenant_materialize_refusal', 'ledger_read'),
+    (21, 4): ('tenant_materialize_refusal', 'unchanged_assert'),
+    (22, 1): ('role_revoke_read', 'set_role'),
+    (22, 2): ('role_revoke_read', 'read_result'),
+    (22, 3): ('role_revoke_read', 'exact_common_forbidden_assert'),
+    (22, 4): ('role_revoke_read', 'ledger_read'),
+    (22, 5): ('role_revoke_read', 'unchanged_assert'),
+    (23, 1): ('role_revoke_materialize', 'materialize_result'),
+    (23, 2): ('role_revoke_materialize', 'exact_common_forbidden_assert'),
+    (23, 3): ('role_revoke_materialize', 'ledger_read'),
+    (23, 4): ('role_revoke_materialize', 'unchanged_assert'),
+    (24, 1): ('finish', 'finish_and_teardown'),
+}
+
 # Finite, platform-independent signal vocabulary used only to label a negative
 # child return code.  Unknown numbers stay numeric without a symbolic label.
 _SIGNAL_NAMES = {
@@ -384,6 +536,346 @@ def _normalize_failure_context(target, phase, selected_case):
     }
 
 
+def _metadata_replay_unknown(invalid=False):
+    """Fixed checkpoint shape used when no trusted frame is available."""
+    return {
+        "protocol": METADATA_REPLAY_PROTOCOL,
+        "known": False,
+        "incomplete": True,
+        "invalid": bool(invalid),
+        "frames": 0,
+        "last_enter": None,
+        "last_completed": None,
+        "first_failure": None,
+        "last_incomplete": None,
+        "last_event": None,
+        "primary": None,
+        "cleanup_completed": False,
+        "status": None,
+        "counts": None,
+        "checks": None,
+        "iteration": None,
+        "error_kind": None,
+    }
+
+
+def _metadata_replay_location(phase, site):
+    names = METADATA_REPLAY_SITES.get((phase, site))
+    if names is None:
+        return None
+    return {
+        "phase": phase,
+        "site": site,
+        "phase_name": names[0],
+        "site_name": names[1],
+    }
+
+
+def _metadata_replay_uint(value, minimum, maximum):
+    if not isinstance(value, str) or re.fullmatch(r"0|[1-9][0-9]*", value) is None:
+        raise ValueError
+    number = int(value)
+    if not minimum <= number <= maximum:
+        raise ValueError
+    return number
+
+
+def _metadata_replay_optional_uint(value, minimum, maximum):
+    if value == "":
+        return None
+    return _metadata_replay_uint(value, minimum, maximum)
+
+
+def _metadata_replay_optional_bool(value):
+    if value == "":
+        return None
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    raise ValueError
+
+
+def _metadata_replay_counts(value):
+    if value == "":
+        return None
+    parts = value.split(",")
+    if len(parts) != 5:
+        raise ValueError
+    return [_metadata_replay_uint(part, 0, METADATA_REPLAY_MAX_COUNTS) for part in parts]
+
+
+def _metadata_replay_checks(value):
+    if value == "":
+        return None
+    parts = value.split(",")
+    if not 1 <= len(parts) <= METADATA_REPLAY_MAX_CHECKS:
+        raise ValueError
+    checks = []
+    for part in parts:
+        if part not in ("0", "1"):
+            raise ValueError
+        checks.append(part == "1")
+    return checks
+
+
+def _parse_metadata_replay_trace(text):
+    """Parse complete fixed frames only; raw rejected text is never retained."""
+    trace = _metadata_replay_unknown()
+    if not text:
+        return trace
+    lines = text.splitlines()
+    trailing_newline = text.endswith("\n")
+    open_frame = None
+    last_phase = 0
+    last_site = 0
+    frame_count = 0
+    truncated = False
+    for index, line in enumerate(lines):
+        if not line.startswith(METADATA_REPLAY_PREFIX):
+            continue
+        frame_count += 1
+        trace["frames"] = frame_count
+        if frame_count > METADATA_REPLAY_MAX_FRAMES:
+            return _metadata_replay_unknown(invalid=True)
+        if len(line) > METADATA_REPLAY_MAX_LINE:
+            return _metadata_replay_unknown(invalid=True)
+        if index == len(lines) - 1 and not trailing_newline:
+            truncated = True
+            break
+        try:
+            parts = line.split("|")
+            if len(parts) != 10 or parts[0] != METADATA_REPLAY_PREFIX:
+                raise ValueError
+            phase = _metadata_replay_uint(parts[1], 1, MAX_METADATA_REPLAY_PHASE)
+            site = _metadata_replay_uint(parts[2], 1, 255)
+            if (phase, site) not in METADATA_REPLAY_SITES:
+                raise ValueError
+            event = _metadata_replay_uint(parts[3], 0, 2)
+            ok = _metadata_replay_optional_bool(parts[4])
+            status = _metadata_replay_optional_uint(parts[5], 100, 599)
+            counts = _metadata_replay_counts(parts[6])
+            checks = _metadata_replay_checks(parts[7])
+            iteration = _metadata_replay_optional_uint(parts[8], 0, METADATA_REPLAY_MAX_ITERATION)
+            error_kind = _metadata_replay_optional_uint(parts[9], 1, METADATA_REPLAY_MAX_ERROR_KIND)
+            if event == 0 and ok is not None:
+                raise ValueError
+            if event == 1 and ok is None:
+                raise ValueError
+            if event == 2 and ok is not False:
+                raise ValueError
+            if phase < last_phase:
+                raise ValueError
+            if phase == last_phase and site < last_site:
+                raise ValueError
+            if open_frame is not None:
+                if event == 0:
+                    if phase != MAX_METADATA_REPLAY_PHASE or open_frame["phase"] == MAX_METADATA_REPLAY_PHASE:
+                        raise ValueError
+                    trace["last_incomplete"] = open_frame
+                    open_frame = None
+                else:
+                    if open_frame["phase"] != phase or open_frame["site"] != site:
+                        raise ValueError
+                    open_frame = None
+            elif event != 0:
+                raise ValueError
+            frame = _metadata_replay_location(phase, site)
+            if frame is None:
+                raise ValueError
+            frame.update({
+                "event": event,
+                "ok": ok,
+                "status": status,
+                "counts": counts,
+                "checks": checks,
+                "iteration": iteration,
+                "error_kind": error_kind,
+            })
+        except ValueError:
+            return _metadata_replay_unknown(invalid=True)
+        trace["last_event"] = frame
+        if event == 0:
+            open_frame = frame
+            trace["last_enter"] = frame
+        elif event == 1:
+            trace["last_completed"] = frame
+            if ok is False and trace["first_failure"] is None:
+                trace["first_failure"] = frame
+        else:
+            if trace["first_failure"] is None:
+                trace["first_failure"] = frame
+        last_phase = phase
+        last_site = site
+    trace["frames"] = frame_count
+    if frame_count == 0:
+        return trace
+    trace["known"] = trace["last_event"] is not None
+    trace["incomplete"] = truncated or open_frame is not None
+    if open_frame is not None and not (
+        open_frame["phase"] == MAX_METADATA_REPLAY_PHASE and trace["last_incomplete"] is not None
+    ):
+        trace["last_incomplete"] = open_frame
+    primary = trace["first_failure"]
+    if primary is not None and primary["phase"] == MAX_METADATA_REPLAY_PHASE and trace["last_incomplete"] is not None:
+        primary = trace["last_incomplete"]
+    if primary is None:
+        primary = trace["last_incomplete"] or trace["last_event"]
+    trace["primary"] = primary
+    if primary is not None:
+        for key in ("status", "counts", "checks", "iteration", "error_kind"):
+            trace[key] = primary.get(key)
+    trace["cleanup_completed"] = (
+        trace["last_completed"] is not None
+        and trace["last_completed"]["phase"] == MAX_METADATA_REPLAY_PHASE
+        and trace["last_completed"]["ok"] is True
+    )
+    return trace
+
+
+def _safe_metadata_replay_optional_int(value, minimum, maximum):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError
+    if not minimum <= value <= maximum:
+        raise ValueError
+    return value
+
+
+def _safe_metadata_replay_counts(value):
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 5:
+        raise ValueError
+    counts = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= METADATA_REPLAY_MAX_COUNTS:
+            raise ValueError
+        counts.append(item)
+    return counts
+
+
+def _safe_metadata_replay_checks(value):
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= METADATA_REPLAY_MAX_CHECKS:
+        raise ValueError
+    if not all(isinstance(item, bool) for item in value):
+        raise ValueError
+    return list(value)
+
+
+def _safe_metadata_replay_frame(value):
+    if not isinstance(value, dict):
+        raise ValueError
+    phase = value.get("phase")
+    site = value.get("site")
+    if isinstance(phase, bool) or not isinstance(phase, int) or not 1 <= phase <= MAX_METADATA_REPLAY_PHASE:
+        raise ValueError
+    if isinstance(site, bool) or not isinstance(site, int) or (phase, site) not in METADATA_REPLAY_SITES:
+        raise ValueError
+    event = value.get("event")
+    if isinstance(event, bool) or not isinstance(event, int) or event not in (0, 1, 2):
+        raise ValueError
+    ok = value.get("ok")
+    if ok is not None and not isinstance(ok, bool):
+        raise ValueError
+    if event == 0 and ok is not None:
+        raise ValueError
+    if event == 1 and ok is None:
+        raise ValueError
+    if event == 2 and ok is not False:
+        raise ValueError
+    frame = _metadata_replay_location(phase, site)
+    if frame is None:
+        raise ValueError
+    frame.update({
+        "event": event,
+        "ok": ok,
+        "status": _safe_metadata_replay_optional_int(value.get("status"), 100, 599),
+        "counts": _safe_metadata_replay_counts(value.get("counts")),
+        "checks": _safe_metadata_replay_checks(value.get("checks")),
+        "iteration": _safe_metadata_replay_optional_int(value.get("iteration"), 0, METADATA_REPLAY_MAX_ITERATION),
+        "error_kind": _safe_metadata_replay_optional_int(
+            value.get("error_kind"), 1, METADATA_REPLAY_MAX_ERROR_KIND
+        ),
+    })
+    return frame
+
+
+def _safe_metadata_replay_frame_field(raw, key):
+    value = raw.get(key)
+    if value is None:
+        return None
+    return _safe_metadata_replay_frame(value)
+
+
+def _safe_metadata_replay_trace(raw):
+    """Rebuild the checkpoint from fixed fields before persistence."""
+    if not isinstance(raw, dict) or raw.get("protocol") != METADATA_REPLAY_PROTOCOL:
+        return None
+    try:
+        frames = _safe_metadata_replay_optional_int(raw.get("frames"), 0, METADATA_REPLAY_MAX_FRAMES)
+        if frames is None:
+            raise ValueError
+        known = raw.get("known")
+        incomplete = raw.get("incomplete")
+        invalid = raw.get("invalid")
+        if not isinstance(known, bool) or not isinstance(incomplete, bool) or not isinstance(invalid, bool):
+            raise ValueError
+        last_enter = _safe_metadata_replay_frame_field(raw, "last_enter")
+        last_completed = _safe_metadata_replay_frame_field(raw, "last_completed")
+        first_failure = _safe_metadata_replay_frame_field(raw, "first_failure")
+        last_incomplete = _safe_metadata_replay_frame_field(raw, "last_incomplete")
+        last_event = _safe_metadata_replay_frame_field(raw, "last_event")
+        if last_enter is not None and last_enter["event"] != 0:
+            raise ValueError
+        if last_completed is not None and last_completed["event"] != 1:
+            raise ValueError
+        if last_incomplete is not None and last_incomplete["event"] != 0:
+            raise ValueError
+        if first_failure is not None and not (
+            first_failure["event"] == 2
+            or (first_failure["event"] == 1 and first_failure["ok"] is False)
+        ):
+            raise ValueError
+        if known and last_event is None:
+            raise ValueError
+        if invalid or frames == 0:
+            known = False
+            incomplete = True
+        cleanup_completed = (
+            last_completed is not None
+            and last_completed["phase"] == MAX_METADATA_REPLAY_PHASE
+            and last_completed["ok"] is True
+        )
+        result = _metadata_replay_unknown(invalid=invalid)
+        result.update({
+            "known": known,
+            "incomplete": incomplete,
+            "frames": frames,
+            "last_enter": last_enter,
+            "last_completed": last_completed,
+            "first_failure": first_failure,
+            "last_incomplete": last_incomplete,
+            "last_event": last_event,
+            "cleanup_completed": cleanup_completed,
+        })
+        primary = first_failure
+        if primary is not None and primary["phase"] == MAX_METADATA_REPLAY_PHASE and last_incomplete is not None:
+            primary = last_incomplete
+        if primary is None:
+            primary = last_incomplete or last_event
+        result["primary"] = primary
+        if primary is not None:
+            for key in ("status", "counts", "checks", "iteration", "error_kind"):
+                result[key] = primary.get(key)
+        return result
+    except (TypeError, ValueError):
+        return _metadata_replay_unknown(invalid=True)
+
+
 def _parse_caps():
     return {
         "output_bytes": MAX_CAPTURE_BYTES,
@@ -440,6 +932,7 @@ def _failure_base(context, returncode, timed_out):
         "source_locations": [],
         "source_allowlist": list(SOURCE_ALLOWLIST),
         "parse_caps": _parse_caps(),
+        "case_trace": None,
     }
 
 
@@ -472,6 +965,14 @@ def project_target_failure(target, output, returncode, *, timed_out=False,
     reported_summary = None
 
     text = output.decode("utf-8", "replace")
+    metadata_replay_enabled = (
+        context["target"] == METADATA_REPLAY_TARGET
+        and context["phase"] == "run"
+        and context["selected_case"] == METADATA_REPLAY_CASE
+        and context["selected_case_known"]
+    )
+    if metadata_replay_enabled:
+        diagnostic["case_trace"] = _parse_metadata_replay_trace(text)
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -878,6 +1379,7 @@ def _safe_failure_diagnostic(diagnostic, target, observed_cases=None):
         "source_locations": _safe_source_locations(diagnostic.get("source_locations")),
         "source_allowlist": list(SOURCE_ALLOWLIST),
         "parse_caps": _parse_caps(),
+        "case_trace": _safe_metadata_replay_trace(diagnostic.get("case_trace")),
     }
 
 
@@ -899,6 +1401,7 @@ def _attach_failed_target(report, diagnostic, identities, observed_cases=None):
         "error_class": safe_diagnostic["error_class"],
         "exit": safe_diagnostic["exit"],
         "source_locations": safe_diagnostic["source_locations"],
+        "case_trace": safe_diagnostic.get("case_trace"),
         "diagnostic": safe_diagnostic,
     }
     identity = (identities or {}).get(target) or {}
