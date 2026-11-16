@@ -29,19 +29,57 @@ pub enum StartupJoinError {
     AlreadyJoined,
 }
 
+type StartupProducer = Pin<Box<dyn Future<Output = StartupOutcome> + Send>>;
+
 /// Library-owned startup producer handle. It is stored by the service before
-/// the setup future is first polled; dropping that future cannot drop this
-/// handle or abort the producer.
+/// the setup future is first polled, but it is initially inert: the producer
+/// future is not spawned until the first owned wait is polled. A ready stop
+/// therefore creates no producer at all, while a setup win starts it exactly
+/// once. Dropping a waiter cannot drop the stored future or an already-started
+/// JoinHandle.
 pub struct StartupReconcile {
     stop: CancellationToken,
+    producer: Option<StartupProducer>,
     task: Option<JoinHandle<StartupOutcome>>,
+    started: bool,
+}
+
+enum StartGate {
+    Started,
+    Stopped,
+    AlreadyJoined,
 }
 
 impl StartupReconcile {
-    pub fn start(state: Arc<AppState>) -> Self {
+    /// Prepare the inert producer future. Nothing is polled or spawned here.
+    pub fn prepare(state: Arc<AppState>) -> Self {
         let stop = CancellationToken::new();
-        let task = tokio::spawn(produce(state, stop.clone()));
-        Self { stop, task: Some(task) }
+        let producer: StartupProducer = Box::pin(produce(state, stop.clone()));
+        Self { stop, producer: Some(producer), task: None, started: false }
+    }
+
+    /// Gate the first owner poll on the cooperative stop and spawn at most one
+    /// producer. A stop observed before this point drops the unstarted future
+    /// without a query, permit, or ensure.
+    fn start_once(&mut self) -> StartGate {
+        if self.task.is_some() {
+            return StartGate::Started;
+        }
+        if self.started {
+            return StartGate::AlreadyJoined;
+        }
+        if self.stop.is_cancelled() {
+            self.producer = None;
+            self.started = true;
+            return StartGate::Stopped;
+        }
+        let Some(producer) = self.producer.take() else {
+            self.started = true;
+            return StartGate::AlreadyJoined;
+        };
+        self.task = Some(tokio::spawn(producer));
+        self.started = true;
+        StartGate::Started
     }
 
     /// Cooperative stop. It never aborts an already-submitted ensure closure.
@@ -50,13 +88,18 @@ impl StartupReconcile {
     }
 
     pub fn is_pending(&self) -> bool {
-        self.task.is_some()
+        self.task.is_some() || (self.producer.is_some() && !self.started)
     }
 
     /// Await producer completion without consuming the handle on future drop.
     /// If the surrounding setup future is dropped, the handle remains here and
     /// cleanup can join the same producer under its own deadline.
     pub async fn wait(&mut self) -> Result<StartupOutcome, StartupJoinError> {
+        match self.start_once() {
+            StartGate::Stopped => return Ok(StartupOutcome::Stopped),
+            StartGate::AlreadyJoined => return Err(StartupJoinError::AlreadyJoined),
+            StartGate::Started => {}
+        }
         let result = {
             let Some(task) = self.task.as_mut() else {
                 return Err(StartupJoinError::AlreadyJoined);
@@ -74,6 +117,11 @@ impl StartupReconcile {
     /// Bounded observation. On `Deadline`, the real producer handle remains in
     /// this owner and a later observation joins the same work.
     pub async fn join_until(&mut self, deadline: tokio::time::Instant) -> Result<StartupOutcome, StartupJoinError> {
+        match self.start_once() {
+            StartGate::Stopped => return Ok(StartupOutcome::Stopped),
+            StartGate::AlreadyJoined => return Err(StartupJoinError::AlreadyJoined),
+            StartGate::Started => {}
+        }
         let result = {
             let Some(task) = self.task.as_mut() else {
                 return Err(StartupJoinError::AlreadyJoined);
@@ -90,7 +138,12 @@ impl StartupReconcile {
     }
 
     /// Consume and join the producer. Used by the compatibility entrypoint.
-    pub async fn join(self) -> Result<StartupOutcome, StartupJoinError> {
+    pub async fn join(mut self) -> Result<StartupOutcome, StartupJoinError> {
+        match self.start_once() {
+            StartGate::Stopped => return Ok(StartupOutcome::Stopped),
+            StartGate::AlreadyJoined => return Err(StartupJoinError::AlreadyJoined),
+            StartGate::Started => {}
+        }
         let Some(task) = self.task else {
             return Err(StartupJoinError::AlreadyJoined);
         };
@@ -102,8 +155,13 @@ impl StartupReconcile {
     }
 
     #[cfg(test)]
-    pub(super) fn from_task(stop: CancellationToken, task: JoinHandle<StartupOutcome>) -> Self {
-        Self { stop, task: Some(task) }
+    fn from_task(stop: CancellationToken, task: JoinHandle<StartupOutcome>) -> Self {
+        Self { stop, producer: None, task: Some(task), started: true }
+    }
+
+    #[cfg(test)]
+    fn from_future(stop: CancellationToken, producer: StartupProducer) -> Self {
+        Self { stop, producer: Some(producer), task: None, started: false }
     }
 }
 

@@ -197,3 +197,93 @@ async fn producer_panic_is_a_typed_join_failure() {
     assert!(matches!(result, Err(StartupJoinError::Panicked)));
     assert!(!startup.is_pending());
 }
+
+#[tokio::test]
+async fn ready_stop_before_first_poll_does_not_spawn_the_producer() {
+    let stop = CancellationToken::new();
+    let started = Arc::new(AtomicBool::new(false));
+    let seen = started.clone();
+    let producer: StartupProducer = Box::pin(async move {
+        seen.store(true, Ordering::SeqCst);
+        StartupOutcome::Completed(Ok(()))
+    });
+    let mut startup = StartupReconcile::from_future(stop.clone(), producer);
+    stop.cancel();
+    let outcome = startup.wait().await.unwrap();
+    assert!(matches!(outcome, StartupOutcome::Stopped));
+    assert!(!started.load(Ordering::SeqCst), "a ready stop must not poll/query/ensure");
+    assert!(!startup.is_pending());
+}
+
+#[tokio::test]
+async fn setup_win_starts_the_actual_producer_exactly_once() {
+    let stop = CancellationToken::new();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let seen = starts.clone();
+    let producer: StartupProducer = Box::pin(async move {
+        seen.fetch_add(1, Ordering::SeqCst);
+        StartupOutcome::Completed(Ok(()))
+    });
+    let mut startup = StartupReconcile::from_future(stop, producer);
+    let outcome = startup.wait().await.unwrap();
+    assert!(matches!(outcome, StartupOutcome::Completed(Ok(()))));
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert!(matches!(startup.wait().await, Err(StartupJoinError::AlreadyJoined)));
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "a repeated wait must not start a second producer");
+    assert!(!startup.is_pending());
+}
+
+#[tokio::test]
+async fn join_until_deadline_retains_the_started_owner() {
+    let stop = CancellationToken::new();
+    let (release_tx, release_rx) = oneshot::channel();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let seen = starts.clone();
+    let producer: StartupProducer = Box::pin(async move {
+        seen.fetch_add(1, Ordering::SeqCst);
+        let _ = release_rx.await;
+        StartupOutcome::Completed(Ok(()))
+    });
+    let mut startup = StartupReconcile::from_future(stop, producer);
+    let first = startup.join_until(tokio::time::Instant::now() + Duration::from_millis(20)).await;
+    assert!(matches!(first, Err(StartupJoinError::Deadline)));
+    assert!(startup.is_pending(), "the started owner must survive deadline expiry");
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "the first owned poll starts the producer");
+    release_tx.send(()).unwrap();
+    let second = startup.join_until(tokio::time::Instant::now() + Duration::from_secs(1)).await.unwrap();
+    assert!(matches!(second, StartupOutcome::Completed(Ok(()))));
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "the deadline retry must join the same producer");
+    assert!(!startup.is_pending());
+}
+
+#[tokio::test]
+async fn cancelled_wait_after_spawn_retains_the_actual_join() {
+    let stop = CancellationToken::new();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let seen = starts.clone();
+    let producer: StartupProducer = Box::pin(async move {
+        seen.fetch_add(1, Ordering::SeqCst);
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+        StartupOutcome::Completed(Ok(()))
+    });
+    let mut startup = StartupReconcile::from_future(stop, producer);
+    {
+        let wait = startup.wait();
+        tokio::pin!(wait);
+        tokio::select! {
+            biased;
+            _ = started_rx => {}
+            result = &mut wait => panic!("wait returned before the producer started: {result:?}"),
+        }
+    }
+    assert!(startup.is_pending(), "a cancelled waiter must retain the spawned task");
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    release_tx.send(()).unwrap();
+    let outcome = startup.join_until(tokio::time::Instant::now() + Duration::from_secs(1)).await.unwrap();
+    assert!(matches!(outcome, StartupOutcome::Completed(Ok(()))));
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "cleanup must join the same actual producer");
+    assert!(!startup.is_pending());
+}

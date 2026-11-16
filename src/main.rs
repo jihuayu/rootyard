@@ -316,7 +316,7 @@ async fn run() -> Result<RunOutcome> {
                     return Ok(RunOutcome::Service(completion));
                 }
             };
-            let startup = rootyard::workspaces::mounts::StartupReconcile::start(state.clone());
+            let startup = rootyard::workspaces::mounts::StartupReconcile::prepare(state.clone());
             lifecycle.attach_startup(startup);
             let setup = async {
                 match lifecycle.wait_startup().await {

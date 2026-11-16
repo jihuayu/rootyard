@@ -423,7 +423,7 @@ pub async fn ensure_from_database(state: &Arc<AppState>, id: Uuid) -> Result<(),
 /// inline. Service startup retains [`StartupReconcile`] itself so a signal can
 /// stop admission without dropping the producer.
 pub async fn reconcile_startup(state: &Arc<AppState>) -> Result<(), Error> {
-    match StartupReconcile::start(state.clone()).join().await {
+    match StartupReconcile::prepare(state.clone()).join().await {
         Ok(StartupOutcome::Completed(result)) => result,
         Ok(StartupOutcome::Stopped) => Err(Error::internal("workspace startup reconcile stopped")),
         Err(StartupJoinError::Panicked) => Err(Error::internal("workspace startup reconcile worker panicked")),
