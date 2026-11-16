@@ -7,6 +7,7 @@ import hashlib
 import http.client
 import json
 from pathlib import Path
+import select
 import socket
 import sys
 import time
@@ -450,36 +451,40 @@ class NamespaceOnlineHarness(Harness):
                 f"Connection: close\r\n\r\n"
             ).encode() + partial_body
 
-            def wait_for_slot_busy(conn, phase):
-                started_at = time.monotonic()
-                seen_probes = []
-                while time.monotonic() - started_at < 2.0:
-                    st, body, _ = self.http(f"/git/views/{vid}.git/info/refs?service=git-upload-pack", token=self.alice)
-                    if len(seen_probes) < 5:
-                        seen_probes.append((st, body[:120].decode(errors="replace")))
-                    if st == 503:
-                        return started_at
-                    time.sleep(0.05)
-                conn.settimeout(0.2)
-                try:
-                    early = conn.recv(4096).decode(errors="replace")
-                except OSError as exc:
-                    early = repr(exc)
-                srv_log = (self.root / "server.log").read_text(errors="replace")[-1500:] if (self.root / "server.log").exists() else ""
-                tmp_items = [p.name for p in tmp_dir.glob("*")] if tmp_dir.exists() else []
+            def open_stalled_conn(phase):
+                last_early = ""
+                for _ in range(10):
+                    conn = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+                    started_at = time.monotonic()
+                    conn.sendall(wire_req)
+                    wait_end = started_at + 2.0
+                    while time.monotonic() < wait_end:
+                        if tmp_dir.exists() and any(tmp_dir.glob(f"upload-{vid}-*.bin")):
+                            st, body, _ = self.http(
+                                f"/git/views/{vid}.git/info/refs?service=git-upload-pack", token=self.alice
+                            )
+                            assert st == 503, (phase, st, body[:120])
+                            return conn, started_at
+                        readable, _, _ = select.select([conn], [], [], 0.02)
+                        if readable:
+                            last_early = conn.recv(4096).decode(errors="replace")
+                            conn.close()
+                            if "503 Service Unavailable" in last_early:
+                                time.sleep(0.1)
+                                break
+                            raise AssertionError(
+                                self.redact(f"{phase}: stalled request failed early: {last_early!r}")
+                            )
+                    else:
+                        conn.close()
+                        raise AssertionError(f"{phase}: upload temp file never appeared within 2s")
                 raise AssertionError(
-                    self.redact(
-                        f"{phase}: stalled upload did not occupy git_slots before timeout: "
-                        f"probes={seen_probes!r} early={early!r} tmp={tmp_items!r} log={srv_log!r}"
-                    )
+                    self.redact(f"{phase}: background task kept git_slots busy across retries: {last_early!r}")
                 )
 
             # 1. Stalled request holds the sole git_slots permit while spooling, then times out boundedly (504).
-            with socket.create_connection(("127.0.0.1", self.port), timeout=10) as stalled:
-                started = time.monotonic()
-                stalled.sendall(wire_req)
-                wait_for_slot_busy(stalled, "timeout_stall")
-
+            stalled, started = open_stalled_conn("timeout_stall")
+            try:
                 stalled.settimeout(10)
                 raw = bytearray()
                 while True:
@@ -490,18 +495,16 @@ class NamespaceOnlineHarness(Harness):
                 elapsed = time.monotonic() - started
                 assert b" 504 " in raw, raw[:300]
                 assert elapsed < 9.0, f"stalled upload took {elapsed:.2f}s"
+            finally:
+                stalled.close()
 
             leftover = [p.name for p in tmp_dir.glob("*")] if tmp_dir.exists() else []
             assert not leftover, f"temp upload files survived timeout: {leftover}"
             assert self.http(f"/git/views/{vid}.git/info/refs?service=git-upload-pack", token=self.alice)[0] == 200
 
             # 2. Client disconnect mid-upload releases temp file and permit promptly, allowing subsequent clone.
-            sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
-            try:
-                sock.sendall(wire_req)
-                wait_for_slot_busy(sock, "disconnect_cancel")
-            finally:
-                sock.close()
+            sock, _ = open_stalled_conn("disconnect_cancel")
+            sock.close()
 
             deadline = time.monotonic() + 3.0
             recovered_200 = False
