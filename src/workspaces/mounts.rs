@@ -10,6 +10,10 @@ mod freeze;
 mod legacy_shutdown;
 #[path = "mounts/registry.rs"]
 mod registry;
+#[path = "mounts/startup.rs"]
+mod startup;
+
+pub use self::startup::{StartupJoinError, StartupOutcome, StartupReconcile};
 
 pub(super) use self::freeze::with_frozen_fenced;
 pub use self::freeze::{refresh_leases, update_lease, with_frozen, with_frozen_async};
@@ -415,28 +419,20 @@ pub async fn ensure_from_database(state: &Arc<AppState>, id: Uuid) -> Result<(),
     ensure_async(state, id, row.get(0), row.get(1)).await
 }
 
+/// Compatibility entrypoint that starts and joins the owned startup producer
+/// inline. Service startup retains [`StartupReconcile`] itself so a signal can
+/// stop admission without dropping the producer.
 pub async fn reconcile_startup(state: &Arc<AppState>) -> Result<(), Error> {
-    let mode = mode();
-    if mode == "direct" {
-        return Ok(());
+    match StartupReconcile::start(state.clone()).join().await {
+        Ok(StartupOutcome::Completed(result)) => result,
+        Ok(StartupOutcome::Stopped) => Err(Error::internal("workspace startup reconcile stopped")),
+        Err(StartupJoinError::Panicked) => Err(Error::internal("workspace startup reconcile worker panicked")),
+        Err(StartupJoinError::Cancelled) => Err(Error::internal("workspace startup reconcile worker cancelled")),
+        Err(StartupJoinError::Deadline) => {
+            Err(Error::internal("workspace startup reconcile deadline is not used by the compatibility entrypoint"))
+        }
+        Err(StartupJoinError::AlreadyJoined) => Err(Error::internal("workspace startup reconcile was already joined")),
     }
-    if mode != "fuse" && mode != "fuse-helper" {
-        return Err(Error::internal("invalid workspace mount mode"));
-    }
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let rows = client
-        .query(
-            "SELECT id,lease_epoch,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces \
-             WHERE host_id=$1 AND state='ready' ORDER BY id",
-            &[&state.storage.volume_id],
-        )
-        .await
-        .map_err(Error::internal)?;
-    drop(client);
-    for row in rows {
-        ensure_async(state, row.get(0), row.get(1), row.get(2)).await?;
-    }
-    Ok(())
 }
 
 /// Compatibility entry point. If the normal signal path published one

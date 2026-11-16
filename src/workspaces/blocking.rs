@@ -97,14 +97,59 @@ pub(super) fn try_put_slot() -> Result<OwnedSemaphorePermit, Error> {
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "workspace write capacity exhausted; retry later"))
 }
 
-/// Acquire a control-bulkhead permit with bounded admission wait so FUSE freeze
-/// callers can decouple admission from unbounded Phase 3 commit lifetimes.
-pub(super) async fn acquire_control_permit() -> Result<OwnedSemaphorePermit, Error> {
+async fn acquire_control_owned() -> Result<OwnedSemaphorePermit, Error> {
     match tokio::time::timeout(Duration::from_secs(10), control_slots().clone().acquire_owned()).await {
         Ok(Ok(permit)) => Ok(permit),
         Ok(Err(_)) => Err(Error::internal("workspace control bulkhead closed")),
         Err(_) => Err(Error(StatusCode::SERVICE_UNAVAILABLE, "workspace control capacity exhausted; retry later")),
     }
+}
+
+/// Acquire a control-bulkhead permit with bounded admission wait so FUSE freeze
+/// callers can decouple admission from unbounded Phase 3 commit lifetimes.
+pub(super) async fn acquire_control_permit() -> Result<OwnedSemaphorePermit, Error> {
+    acquire_control_owned().await
+}
+
+/// One already-submitted control-bulkhead closure. The permit travels inside
+/// the OS closure and the real `spawn_blocking` handle stays owned here until
+/// the caller awaits [`OwnedControl::join`]. Unlike [`run_control`], no work
+/// timeout discards this handle; the only timed wait is the pre-submission
+/// permit acquisition.
+pub(in crate::workspaces) struct OwnedControl<T> {
+    task: tokio::task::JoinHandle<Result<T, Error>>,
+}
+
+impl<T> OwnedControl<T> {
+    pub(in crate::workspaces) async fn join(self) -> Result<T, Error> {
+        match self.task.await {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => Err(Error::internal("workspace control worker panicked")),
+            Err(_) => Err(Error::internal("workspace control worker cancelled")),
+        }
+    }
+}
+
+/// Submit one control closure and return its owned completion handle.
+///
+/// This is the startup-specific owned variant: permit acquisition is still
+/// bounded, but once the closure is submitted the caller must await the actual
+/// OS completion. Dropping it before this returns cannot submit a closure.
+pub(in crate::workspaces) async fn start_control_owned<T, F>(work: F) -> Result<OwnedControl<T>, Error>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+{
+    let permit = acquire_control_owned().await?;
+    let operation = worker::blocking_scope();
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match catch_unwind(AssertUnwindSafe(|| worker::blocking(operation, work))) {
+            Ok(result) => result,
+            Err(_) => Err(Error::internal("workspace control worker panicked")),
+        }
+    });
+    Ok(OwnedControl { task })
 }
 
 /// Signals to a `spawn_blocking` worker that the async caller timed out or was
