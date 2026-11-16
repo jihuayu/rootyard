@@ -31,6 +31,11 @@ LIMITATIONS = [
 
 
 class RootsHttpHarness(snapshot.SnapshotHttpHarness):
+    _RECEIPT_EXPECTATIONS = {
+        "register": (1, "active"),
+        "release": (2, "released"),
+    }
+
     def _roots_path(self, repo, suffix=""):
         return self._repo_path(repo, "/roots" + suffix)
 
@@ -65,28 +70,44 @@ class RootsHttpHarness(snapshot.SnapshotHttpHarness):
     def _release_body(key, reason="fixture release"):
         return {"idempotency_key": key, "reason": reason}
 
-    def _assert_receipt(self, data):
+    def _assert_receipt(self, data, expected_action="register"):
+        # The sibling browse fixture only creates roots and keeps calling the
+        # finite register default. Every roots-module lifecycle call is explicit.
+        assert expected_action in self._RECEIPT_EXPECTATIONS, \
+            "receipt expected action is not in the finite source allowlist"
+        expected_generation, expected_state = self._RECEIPT_EXPECTATIONS[expected_action]
         assert set(data) == {"action", "root_id", "generation", "replayed",
-                             "created_at_unix_micros", "receipt_only", "receipt_state"}, data
-        assert data["receipt_only"] is True
-        assert data["generation"] == 1
-        assert data["receipt_state"] in ("active", "released")
+                             "created_at_unix_micros", "receipt_only", "receipt_state"}, \
+            "receipt shape differs"
+        assert data["receipt_only"] is True, "receipt_only is not true"
+        assert data["action"] == expected_action, \
+            "receipt action differs from the finite expected action"
+        assert data["generation"] == expected_generation, \
+            "receipt generation differs from the expected lifecycle generation"
+        assert data["receipt_state"] == expected_state, \
+            "receipt state differs from the expected lifecycle state"
         self._forbidden_markers(data)
 
     def _assert_metadata(self, data):
         assert set(data) == {"root_id", "current_state", "generation", "purpose", "selector_kind",
                              "object_format", "head_ref", "head_oid", "ref_count", "pack_count",
-                             "oid_count"}, data
-        assert data["current_state"] in ("active", "released")
-        assert data["generation"] == 1
+                             "oid_count"}, "metadata shape differs"
+        assert data["current_state"] in ("active", "released"), \
+            "metadata state is not a finite lifecycle state"
+        # Metadata generation is the retained capture generation, not the
+        # receipt lifecycle generation; it must remain 1 after release.
+        assert data["generation"] == 1, "metadata retained capture generation is not 1"
         self._forbidden_markers(data)
 
     def _assert_unauthorized(self, method, path, body=None):
-        status, raw, headers = self.http(path, token=None, method=method, body=body)
-        assert status == 401, (status, raw[:300])
-        assert blob.header_value(headers, "www-authenticate") == 'Bearer realm="Rootyard"', headers
-        assert blob.header_value(headers, "cache-control") == "no-store", headers
-        assert blob.header_value(headers, "x-rootyard-session") is None, headers
+        status, _raw, headers = self.http(path, token=None, method=method, body=body)
+        assert status == 401, "unauthorized status differs"
+        assert blob.header_value(headers, "www-authenticate") == 'Bearer realm="Rootyard"', \
+            "unauthorized www-authenticate differs"
+        assert blob.header_value(headers, "cache-control") == "no-store", \
+            "unauthorized cache-control differs"
+        assert blob.header_value(headers, "x-rootyard-session") is None, \
+            "unauthorized session header is present"
 
     def roots_http_metadata_create_release_and_intent(self):
         repo, _remote, _work, old_oid = self.seed("roots-http-metadata")
@@ -94,55 +115,63 @@ class RootsHttpHarness(snapshot.SnapshotHttpHarness):
         create = self._intent("roots-http-create", snapshot_one)
 
         status, receipt = self._create_root(repo, create)
-        assert status == 201, (status, receipt)
-        self._assert_receipt(receipt)
+        assert status == 201, "root create status differs"
+        self._assert_receipt(receipt, "register")
         root_id = receipt["root_id"]
-        assert receipt["action"] == "register"
+        assert receipt["action"] == "register", "root create action differs"
         status, retry = self._create_root(repo, create)
-        assert status == 200 and retry["replayed"] is True, (status, retry)
-        assert retry["root_id"] == root_id
+        assert status == 200 and retry["replayed"] is True, \
+            "root create replay status/replayed differs"
+        self._assert_receipt(retry, "register")
+        assert retry["root_id"] == root_id, "root create replay root_id differs"
 
         status, metadata = self._read_root(repo, root_id)
-        assert status == 200, (status, metadata)
+        assert status == 200, "root metadata status differs"
         self._assert_metadata(metadata)
-        assert metadata["current_state"] == "active" and metadata["purpose"] == "ci", metadata
-        assert metadata["selector_kind"] == "snapshot", metadata
+        assert metadata["current_state"] == "active" and metadata["purpose"] == "ci", \
+            "root metadata active purpose differs"
+        assert metadata["selector_kind"] == "snapshot", "root metadata selector kind differs"
 
         # Changed purpose/source/selector under the same create key all conflict
         # without touching the active root or charging another root.
         changed = dict(create, purpose="workspace")
         status, _ = self._create_root(repo, changed)
-        assert status == 409, ("changed purpose", status)
+        assert status == 409, "changed purpose status differs"
         changed = dict(create, selector={"kind": "oids", "oids": [old_oid]})
         status, _ = self._create_root(repo, changed)
-        assert status == 409, ("changed selector", status)
+        assert status == 409, "changed selector status differs"
         snapshot_other = self._create(repo, "roots-http-source-other", 300)[1]["snapshot_id"]
         changed = dict(create, source_snapshot_id=snapshot_other)
         status, _ = self._create_root(repo, changed)
-        assert status == 409, ("changed source", status)
+        assert status == 409, "changed source status differs"
         status, still_active = self._read_root(repo, root_id)
-        assert status == 200 and still_active["current_state"] == "active", (status, still_active)
+        assert status == 200 and still_active["current_state"] == "active", \
+            "active root changed after create refusal"
 
         # Read-only owner metadata is allowed; metadata-only rejection remains 403
         # for mutations.
-        status, read_metadata = self._read_root(repo, root_id, token=self.reader)
-        assert status == 200, (status, read_metadata)
+        status, _read_metadata = self._read_root(repo, root_id, token=self.reader)
+        assert status == 200, "read-only root metadata status differs"
         status, _ = self._create_root(repo, self._intent("roots-http-reader-write", snapshot_other),
                                       token=self.reader)
-        assert status == 403, ("read-only create", status)
+        assert status == 403, "read-only create status differs"
 
         # Existing-root release remains source-independent after the source pin is
         # actually released through the snapshot API.
         status, _, _ = self._release(repo, snapshot_one, "roots-http-source-release", 1)
-        assert status == 200, ("source pin release", status)
+        assert status == 200, "source pin release status differs"
         status, released = self._delete_root(repo, root_id, self._release_body("roots-http-release"))
-        assert status == 200, (status, released)
-        self._assert_receipt(released)
-        assert released["action"] == "release" and released["receipt_state"] == "released", released
+        assert status == 200, "root release status differs"
+        self._assert_receipt(released, "release")
+        assert released["action"] == "release" and released["receipt_state"] == "released", \
+            "root release action/state differs"
         status, reused = self._delete_root(repo, root_id, self._release_body("roots-http-release"))
-        assert status == 200 and reused["replayed"] is True, (status, reused)
+        assert status == 200 and reused["replayed"] is True, \
+            "root release replay status/replayed differs"
+        self._assert_receipt(reused, "release")
         status, released_metadata = self._read_root(repo, root_id)
-        assert status == 200 and released_metadata["current_state"] == "released", (status, released_metadata)
+        assert status == 200 and released_metadata["current_state"] == "released", \
+            "released root metadata status/state differs"
 
         # Release-before-register: no client root id; exact replay is independent
         # of the source metadata after the source pin is released.
@@ -153,44 +182,46 @@ class RootsHttpHarness(snapshot.SnapshotHttpHarness):
             "reason": "release before register",
         }
         status, intent_receipt = self._release_intent(repo, intent_body)
-        assert status == 200, (status, intent_receipt)
-        self._assert_receipt(intent_receipt)
+        assert status == 200, "release-intent create status differs"
+        self._assert_receipt(intent_receipt, "release")
         intent_root = intent_receipt["root_id"]
-        assert intent_receipt["action"] == "release", intent_receipt
+        assert intent_receipt["action"] == "release", "release-intent create action differs"
         status, _ = self._read_root(repo, intent_root)
-        assert status == 404, ("release-before-register metadata", status)
+        assert status == 404, "release-before-register metadata status differs"
         status, _, _ = self._release(repo, snapshot_two, "roots-http-source-two-release", 1)
-        assert status == 200, ("source two release", status)
+        assert status == 200, "source two release status differs"
         status, intent_replay = self._release_intent(repo, intent_body)
-        assert status == 200 and intent_replay["replayed"] is True, (status, intent_replay)
-        assert intent_replay["root_id"] == intent_root
+        assert status == 200 and intent_replay["replayed"] is True, \
+            "release-intent replay status/replayed differs"
+        self._assert_receipt(intent_replay, "release")
+        assert intent_replay["root_id"] == intent_root, "release-intent replay root_id differs"
 
         changed_intent = json.loads(json.dumps(intent_body))
         changed_intent["create"]["purpose"] = "workspace"
         status, _ = self._release_intent(repo, changed_intent)
-        assert status == 409, ("changed release intent", status)
+        assert status == 409, "changed release intent status differs"
 
         baseline = self._ledger(repo)
         root_baseline = self._root_rows(repo)
 
         # Authentication/validation and transport contracts.
         status, _ = self._create_root(repo, self._intent("roots-http-bob", snapshot_other), token=self.bob)
-        assert status == 404, ("non-member create", status)
+        assert status == 404, "non-member create status differs"
         other_repo, _other_remote, _other_work, _other_oid = self.seed("roots-http-foreign")
         status, _ = self._read_root(other_repo, root_id)
-        assert status == 404, ("foreign root", status)
+        assert status == 404, "foreign root status differs"
         status, _ = self._read_root(repo, "00000000-0000-0000-0000-000000000000")
-        assert status == 400, ("nil root id", status)
+        assert status == 400, "nil root id status differs"
         forged = dict(self._intent("roots-http-forged", snapshot_other), register_digest="00" * 32)
         status, _ = self._create_root(repo, forged)
-        assert status == 400, ("forged authority field", status)
+        assert status == 400, "forged authority field status differs"
         bad_purpose = dict(self._intent("roots-http-purpose", snapshot_other), purpose="not-a-purpose")
         status, _ = self._create_root(repo, bad_purpose)
-        assert status == 400, ("invalid purpose", status)
+        assert status == 400, "invalid purpose status differs"
         too_many = dict(self._intent("roots-http-oids", snapshot_other),
                         selector={"kind": "oids", "oids": [old_oid] * 257})
         status, _ = self._create_root(repo, too_many)
-        assert status == 400, ("oversized selector", status)
+        assert status == 400, "oversized selector status differs"
         self._assert_unauthorized("POST", self._roots_path(repo),
                                   self._intent("roots-http-unauth", snapshot_other))
         self._assert_unauthorized("GET", self._roots_path(repo, "/" + str(root_id)))
