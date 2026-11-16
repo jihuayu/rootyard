@@ -139,6 +139,27 @@ impl VaultTransitProvider {
         Self::from_config(VaultTransitConfig::from_env()?)
     }
 
+    pub(super) fn key_name(&self) -> &str {
+        &self.config.key_name
+    }
+
+    pub(super) async fn latest_version(&self) -> Result<i32> {
+        self.read_key_metadata(self.operation_deadline()).await
+    }
+
+    pub(super) async fn rotate_key(&self) -> Result<()> {
+        let deadline = self.operation_deadline();
+        let _ = self
+            .call(
+                Method::POST,
+                &format!("keys/{}/rotate", self.config.key_name),
+                None,
+                deadline,
+            )
+            .await?;
+        Ok(())
+    }
+
     pub(super) async fn wrap_at_version(
         &self,
         data_key: &PandoDataKey,
