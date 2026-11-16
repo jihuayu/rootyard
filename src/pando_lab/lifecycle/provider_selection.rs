@@ -2,7 +2,7 @@ use super::{
     provider::{KmsKeyPolicy, PROVIDER_KIND_LOCAL, PROVIDER_KIND_VAULT, PandoKeyProvider, PandoKmsProvider},
     vault_provider::VaultTransitProvider,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -83,16 +83,35 @@ fn selection_from_value(value: Option<&str>) -> Result<PandoProviderSelection> {
 }
 
 pub(crate) fn for_write(base_root: &Path, repo: Uuid) -> Result<PandoWriteProvider> {
+    let kms_dir = super::provider::resolve_kms_dir(base_root, repo);
+    let active_rotation = super::db::load_file_checkpoint(&kms_dir)?.filter(|cp| cp.state == "IN_PROGRESS");
     match selected_kind()? {
         PandoProviderSelection::Local => {
-            let kms_dir = super::provider::resolve_kms_dir(base_root, repo);
+            if let Some(cp) = active_rotation.as_ref() {
+                ensure!(
+                    cp.to_provider_kind == PROVIDER_KIND_LOCAL,
+                    "active rotation requires the Vault Transit provider for new writes"
+                );
+            }
             let provider = PandoKmsProvider::open_or_init(&kms_dir, super::DEFAULT_KMS_KEY_ID)?;
             let key_version = provider.active_entry()?.key_version;
             let policy = Some(provider.policy().clone());
             Ok(PandoWriteProvider { provider: Box::new(provider), key_version_hint: key_version, local_policy: policy })
         }
         PandoProviderSelection::VaultTransit => {
-            let provider = VaultTransitProvider::from_env().context("Pando Vault Transit provider unavailable")?;
+            let mut provider = VaultTransitProvider::from_env().context("Pando Vault Transit provider unavailable")?;
+            if let Some(cp) = active_rotation.as_ref() {
+                ensure!(
+                    cp.to_provider_kind == PROVIDER_KIND_VAULT,
+                    "active Local rotation cannot use the Vault Transit write provider"
+                );
+                ensure!(cp.to_key_id == provider.key_name(), "active rotation targets a different Vault key");
+                ensure!(
+                    cp.external_rotate_issued,
+                    "active Vault rotation target has not been issued; refusing new writes"
+                );
+                provider = provider.with_pinned_write_version(cp.expected_version())?;
+            }
             Ok(PandoWriteProvider { provider: Box::new(provider), key_version_hint: 1, local_policy: None })
         }
     }

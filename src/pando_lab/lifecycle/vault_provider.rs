@@ -112,6 +112,7 @@ impl VaultTransitConfig {
 pub struct VaultTransitProvider {
     config: VaultTransitConfig,
     client: Client,
+    pinned_write_version: Option<i32>,
 }
 
 impl fmt::Debug for VaultTransitProvider {
@@ -132,7 +133,13 @@ impl VaultTransitProvider {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("failed constructing Pando Vault client")?;
-        Ok(Self { config, client })
+        Ok(Self { config, client, pinned_write_version: None })
+    }
+
+    pub(super) fn with_pinned_write_version(mut self, version: i32) -> Result<Self> {
+        ensure!(version >= 1, "invalid pinned Vault Transit write version");
+        self.pinned_write_version = Some(version);
+        Ok(self)
     }
 
     pub(super) fn from_env() -> Result<Self> {
@@ -173,6 +180,31 @@ impl VaultTransitProvider {
             target_version >= 1 && target_version <= latest_version,
             "requested Vault Transit key version is unavailable"
         );
+        self.encrypt_at_version(data_key, context, target_version, deadline).await
+    }
+
+    async fn wrap_exact_version(
+        &self,
+        data_key: &PandoDataKey,
+        context: &WrapContext,
+        target_version: i32,
+    ) -> Result<PandoWrappedDek> {
+        let deadline = self.operation_deadline();
+        let latest_version = self.read_key_metadata(deadline).await?;
+        ensure!(
+            latest_version == target_version,
+            "pinned Vault Transit target version is not the observed latest version"
+        );
+        self.encrypt_at_version(data_key, context, target_version, deadline).await
+    }
+
+    async fn encrypt_at_version(
+        &self,
+        data_key: &PandoDataKey,
+        context: &WrapContext,
+        target_version: i32,
+        deadline: Instant,
+    ) -> Result<PandoWrappedDek> {
         let context = self.context_b64(context)?;
         let plaintext = Zeroizing::new(STANDARD.encode(data_key.expose_secret()));
         let body = Zeroizing::new(serde_json::to_vec(&EncryptRequest {
@@ -322,9 +354,12 @@ impl PandoKeyProvider for VaultTransitProvider {
         context: &'a WrapContext,
     ) -> BoxFuture<'a, std::result::Result<PandoWrappedDek, KeyProviderError>> {
         Box::pin(async move {
-            self.wrap_at_version(data_key, context, None)
-                .await
-                .map_err(|_| KeyProviderError::KeyRing("Vault Transit operation failed closed"))
+            let result = if let Some(version) = self.pinned_write_version {
+                self.wrap_exact_version(data_key, context, version).await
+            } else {
+                self.wrap_at_version(data_key, context, None).await
+            };
+            result.map_err(|_| KeyProviderError::KeyRing("Vault Transit operation failed closed"))
         })
     }
 

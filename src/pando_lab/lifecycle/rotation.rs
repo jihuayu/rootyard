@@ -3,7 +3,12 @@ use super::{
     DEFAULT_CIPHER_SUITE, DEFAULT_KMS_KEY_ID, ENVELOPE_SCHEMA, KmsEnvelopeRecord,
     KmsRotationReport,
     db::{load_envelope_from_db, load_file_checkpoint, persist_checkpoint},
-    envelope_file_path, load_repo_packs, read_and_verify_envelope_file, valid_kms_key_id,
+    envelope_file_path, load_repo_packs, provider,
+    provider::PandoKeyProvider,
+    provider_selection::{self, PandoProviderSelection},
+    read_and_verify_envelope_file, valid_kms_key_id,
+    vault_provider::VaultTransitProvider,
+    wrapped_dek::PandoWrappedDek,
     write_envelope_file,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -277,6 +282,430 @@ async fn rewrap_existing_envelope(
     Ok(updated)
 }
 
+fn same_dek(left: &super::data_key::PandoDataKey, right: &super::data_key::PandoDataKey) -> bool {
+    ring::constant_time::verify_slices_are_equal(left.expose_secret(), right.expose_secret()).is_ok()
+}
+
+fn read_pack_cipher(s_root: &Path, repo: Uuid, pack: &Pack) -> Result<Vec<u8>> {
+    let manifest_path = s_root.join(object_store::manifest_key(repo, pack.id));
+    ensure!(manifest_path.is_file(), "missing object-store manifest for encrypted pack {}", pack.id);
+    let manifest: object_store::CasPackManifest =
+        serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    ensure!(
+        manifest.repo == repo && manifest.pack_id == pack.id,
+        "object-store manifest identity mismatch for pack {}",
+        pack.id
+    );
+    let cipher = std::fs::read(s_root.join(&manifest.pack_key))?;
+    let cipher_sha = manifest.ciphertext_sha256.as_deref().context("manifest missing ciphertext_sha256")?;
+    ensure!(
+        cipher.len() as u64 == manifest.ciphertext_bytes.context("manifest missing ciphertext_bytes")?
+            && super::crypto::sha256_hex(&cipher) == cipher_sha,
+        "object-store ciphertext digest or length mismatch for pack {}",
+        pack.id
+    );
+    Ok(cipher)
+}
+
+fn envelope_with_wrapped_key(
+    old_env: &KmsEnvelopeRecord,
+    new_wrapped_json: String,
+    new_provider_kind: &str,
+    new_key_id: &str,
+    new_key_version: i32,
+) -> Result<KmsEnvelopeRecord> {
+    let envelope_id = old_env.envelope_id.context("missing envelope_id during Vault rewrap")?;
+    let nonce_prefix = old_env.nonce_prefix.as_deref().context("missing nonce_prefix during Vault rewrap")?;
+    let ciphertext_sha256 = old_env
+        .ciphertext_sha256
+        .as_deref()
+        .context("missing ciphertext_sha256 during Vault rewrap")?;
+    let ciphertext_bytes = old_env.ciphertext_bytes.context("missing ciphertext_bytes during Vault rewrap")?;
+    PandoWrappedDek::from_json(new_wrapped_json.as_bytes())?
+        .validate_binding(new_provider_kind, new_key_id, new_key_version)?;
+    let mac = super::crypto::compute_authenticated_envelope_mac(&super::crypto::EnvelopeMacInputs {
+        encryption_mode: super::crypto::AUTHENTICATED_ENVELOPE_MODE,
+        repo: old_env.repo,
+        pack_id: old_env.pack_id,
+        key_id: new_key_id,
+        key_version: new_key_version,
+        cipher_suite: &old_env.cipher_suite,
+        pack_sha256: &old_env.pack_sha256,
+        idx_sha256: &old_env.idx_sha256,
+        ciphertext_sha256,
+        ciphertext_bytes,
+        envelope_id,
+        nonce_prefix,
+        wrapped_key_json: &new_wrapped_json,
+    });
+    let updated = KmsEnvelopeRecord {
+        schema: ENVELOPE_SCHEMA.to_owned(),
+        repo: old_env.repo,
+        pack_id: old_env.pack_id,
+        key_id: new_key_id.to_owned(),
+        key_version: new_key_version,
+        cipher_suite: old_env.cipher_suite.clone(),
+        pack_sha256: old_env.pack_sha256.clone(),
+        idx_sha256: old_env.idx_sha256.clone(),
+        plaintext_sha256: old_env.pack_sha256.clone(),
+        envelope_mac: mac,
+        storage_tier: old_env.storage_tier.clone(),
+        encryption_mode: super::crypto::AUTHENTICATED_ENVELOPE_MODE.to_owned(),
+        envelope_id: Some(envelope_id),
+        nonce_prefix: Some(nonce_prefix.to_owned()),
+        wrapped_key_json: Some(new_wrapped_json),
+        ciphertext_sha256: Some(ciphertext_sha256.to_owned()),
+        ciphertext_bytes: Some(ciphertext_bytes),
+        provider_kind: new_provider_kind.to_owned(),
+    };
+    super::envelopes::verify_envelope_record(&updated)?;
+    Ok(updated)
+}
+
+async fn verify_rewrapped_pack(
+    base_root: &Path,
+    repo: Uuid,
+    pack: &Pack,
+    env: &KmsEnvelopeRecord,
+    cipher: &[u8],
+) -> Result<()> {
+    super::envelopes::verify_envelope_record(env)?;
+    let plain = verify_and_decrypt_pack_bytes(base_root, repo, pack, env, cipher).await?;
+    ensure!(
+        super::crypto::sha256_hex(&plain) == pack.pack_sha256,
+        "rewrapped pack plaintext digest mismatch"
+    );
+    Ok(())
+}
+
+async fn rewrap_vault_envelope(
+    vault: &VaultTransitProvider,
+    base_root: &Path,
+    s_root: &Path,
+    repo: Uuid,
+    pack: &Pack,
+    old_env: &KmsEnvelopeRecord,
+    target_version: i32,
+) -> Result<KmsEnvelopeRecord> {
+    ensure!(
+        old_env.provider_kind == provider::PROVIDER_KIND_VAULT,
+        "Vault rewrap source is not a Vault envelope"
+    );
+    let cipher = read_pack_cipher(s_root, repo, pack)?;
+    verify_rewrapped_pack(base_root, repo, pack, old_env, &cipher).await?;
+    let old_wrapped = old_env.wrapped_key_json.as_deref().context("missing old wrapped_key_json")?;
+    let old_dto = PandoWrappedDek::from_json(old_wrapped.as_bytes())?;
+    let envelope_id = old_env.envelope_id.context("missing envelope_id during Vault rewrap")?;
+    let context = super::crypto::pack_wrap_context(repo, pack.id, envelope_id, &pack.pack_sha256)?;
+    let new_dto = vault.rewrap_at_version(&old_dto, &context, Some(target_version)).await?;
+    let old_key = vault.unwrap(&old_dto, &context).await?;
+    let new_key = vault.unwrap(&new_dto, &context).await?;
+    ensure!(same_dek(&old_key, &new_key), "Vault rewrap changed the data key");
+    let new_json = new_dto.to_json()?;
+    let new_key_id = new_dto.key_id().to_owned();
+    let updated = envelope_with_wrapped_key(
+        old_env,
+        new_json,
+        provider::PROVIDER_KIND_VAULT,
+        &new_key_id,
+        target_version,
+    )?;
+    verify_rewrapped_pack(base_root, repo, pack, &updated, &cipher).await?;
+    Ok(updated)
+}
+
+async fn migrate_local_envelope_to_vault(
+    vault: &VaultTransitProvider,
+    base_root: &Path,
+    s_root: &Path,
+    repo: Uuid,
+    pack: &Pack,
+    old_env: &KmsEnvelopeRecord,
+    target_version: i32,
+) -> Result<KmsEnvelopeRecord> {
+    ensure!(
+        old_env.provider_kind == provider::PROVIDER_KIND_LOCAL,
+        "Vault migration source is not a Local envelope"
+    );
+    let cipher = read_pack_cipher(s_root, repo, pack)?;
+    verify_rewrapped_pack(base_root, repo, pack, old_env, &cipher).await?;
+    let local_dir = provider::resolve_kms_dir(base_root, repo);
+    let local = provider::PandoKmsProvider::open_existing(&local_dir)?;
+    let old_dto = PandoWrappedDek::from_json(
+        old_env.wrapped_key_json.as_deref().context("missing local wrapped_key_json")?.as_bytes(),
+    )?;
+    let envelope_id = old_env.envelope_id.context("missing envelope_id during migration")?;
+    let context = super::crypto::pack_wrap_context(repo, pack.id, envelope_id, &pack.pack_sha256)?;
+    let data_key = local.unwrap_data_key(&old_dto, &context).await?;
+    let new_dto = vault.wrap_at_version(&data_key, &context, Some(target_version)).await?;
+    let migrated_key = vault.unwrap(&new_dto, &context).await?;
+    ensure!(same_dek(&data_key, &migrated_key), "Local-to-Vault migration changed the data key");
+    let new_json = new_dto.to_json()?;
+    let new_key_id = new_dto.key_id().to_owned();
+    let updated = envelope_with_wrapped_key(
+        old_env,
+        new_json,
+        provider::PROVIDER_KIND_VAULT,
+        &new_key_id,
+        target_version,
+    )?;
+    verify_rewrapped_pack(base_root, repo, pack, &updated, &cipher).await?;
+    Ok(updated)
+}
+
+fn ensure_vault_retention_option(opts: &KmsRotateOptions) -> Result<()> {
+    ensure!(
+        !opts.revoke_previous,
+        "Vault retained-version retirement is not implemented; refusing explicit retirement"
+    );
+    Ok(())
+}
+
+async fn issue_vault_rotate(
+    c: &Client,
+    kms_dir: &Path,
+    vault: &VaultTransitProvider,
+    cp: &mut KmsRotationCheckpoint,
+) -> Result<()> {
+    let latest = vault.latest_version().await?;
+    ensure!(
+        latest == cp.from_key_version,
+        "unexpected concurrent Vault Transit key version before rotate"
+    );
+    ensure!(
+        !cp.external_rotate_issued && cp.reconcile_stage == KmsReconcileStage::NotIssued,
+        "Vault rotate intent has already been issued"
+    );
+    cp.external_rotate_issued = true;
+    cp.reconcile_stage = KmsReconcileStage::RotateIssued;
+    persist_checkpoint(c, kms_dir, cp).await?;
+    vault.rotate_key().await?;
+    let observed = vault.latest_version().await?;
+    ensure!(
+        observed == cp.expected_version(),
+        "Vault rotate outcome is unknown or unexpectedly reconciled"
+    );
+    cp.reconcile_stage = KmsReconcileStage::TargetObserved;
+    persist_checkpoint(c, kms_dir, cp).await?;
+    Ok(())
+}
+
+async fn resolve_vault_rotation_checkpoint(
+    c: &Client,
+    kms_dir: &Path,
+    config: &Config,
+    repo: Uuid,
+    opts: &KmsRotateOptions,
+    packs: &[Pack],
+    vault: &VaultTransitProvider,
+) -> Result<KmsRotationCheckpoint> {
+    ensure_vault_retention_option(opts)?;
+    let existing = load_file_checkpoint(kms_dir)?;
+    if let Some(mut cp) = existing
+        && cp.state == "IN_PROGRESS"
+    {
+        ensure!(cp.is_vault_target(), "active checkpoint target is not vault-transit");
+        ensure!(!cp.revoke_previous, "Vault checkpoint retirement is unsupported");
+        ensure!(cp.to_key_id == vault.key_name(), "active checkpoint target is a different Vault key");
+        if let Some(ref target) = opts.target_key_id {
+            ensure!(target.trim() == cp.to_key_id, "active Vault rotation targets a different key name");
+        }
+        let mut added_pack = false;
+        for pack in packs {
+            if !cp.target_pack_ids.contains(&pack.id) {
+                cp.target_pack_ids.push(pack.id);
+                added_pack = true;
+            }
+        }
+        if added_pack {
+            persist_checkpoint(c, kms_dir, &cp).await?;
+        }
+        let latest = vault.latest_version().await?;
+        match vault_rotation_decision(&cp, latest)? {
+            VaultRotationDecision::IssueRotate => issue_vault_rotate(c, kms_dir, vault, &mut cp).await?,
+            VaultRotationDecision::ReconcileTarget => {
+                cp.reconcile_stage = KmsReconcileStage::TargetObserved;
+                persist_checkpoint(c, kms_dir, &cp).await?;
+            }
+            VaultRotationDecision::AlreadyObserved => {}
+        }
+        return Ok(cp);
+    }
+    ensure!(!opts.resume, "no IN_PROGRESS Vault rotation checkpoint found to resume for repository {repo}");
+    if let Some(ref target) = opts.target_key_id {
+        ensure!(target.trim() == vault.key_name(), "Vault rotation target must be the configured key name");
+    }
+    let latest = vault.latest_version().await?;
+    let expected = latest.checked_add(1).context("Vault Transit key version exhausted")?;
+    let mut from_provider_kind = provider::PROVIDER_KIND_VAULT.to_owned();
+    for pack in packs {
+        let on_disk = envelope_file_path(&config.root, repo, pack.id);
+        let env = if on_disk.is_file() {
+            Some(read_and_verify_envelope_file(&config.root, repo, pack.id)?)
+        } else {
+            load_envelope_from_db(c, repo, pack).await?
+        };
+        if let Some(env) = env {
+            ensure!(
+                env.provider_kind == provider::PROVIDER_KIND_LOCAL
+                    || env.provider_kind == provider::PROVIDER_KIND_VAULT,
+                "unsupported source provider kind during Vault rotation"
+            );
+            if env.provider_kind == provider::PROVIDER_KIND_LOCAL {
+                from_provider_kind = provider::PROVIDER_KIND_LOCAL.to_owned();
+            }
+        }
+    }
+    let mut cp = KmsRotationCheckpoint {
+        rotation_id: Uuid::new_v4(),
+        repo,
+        from_key_id: vault.key_name().to_owned(),
+        from_key_version: latest,
+        to_key_id: vault.key_name().to_owned(),
+        to_key_version: expected,
+        state: "IN_PROGRESS".to_owned(),
+        revoke_previous: false,
+        target_pack_ids: packs.iter().map(|p| p.id).collect(),
+        completed_pack_ids: Vec::new(),
+        failed_pack_id: None,
+        from_provider_kind,
+        to_provider_kind: provider::PROVIDER_KIND_VAULT.to_owned(),
+        expected_to_version: expected,
+        external_rotate_issued: false,
+        reconcile_stage: KmsReconcileStage::NotIssued,
+    };
+    persist_checkpoint(c, kms_dir, &cp).await?;
+    let latest_now = vault.latest_version().await?;
+    match vault_rotation_decision(&cp, latest_now)? {
+        VaultRotationDecision::IssueRotate => issue_vault_rotate(c, kms_dir, vault, &mut cp).await?,
+        VaultRotationDecision::ReconcileTarget => {
+            cp.reconcile_stage = KmsReconcileStage::TargetObserved;
+            persist_checkpoint(c, kms_dir, &cp).await?;
+        }
+        VaultRotationDecision::AlreadyObserved => {}
+    }
+    Ok(cp)
+}
+
+async fn rotate_vault_kms_key_with_options(
+    config: &Config,
+    repo: Uuid,
+    opts: &KmsRotateOptions,
+) -> Result<KmsRotationReport> {
+    ensure!(
+        provider_selection::selected_kind()? == PandoProviderSelection::VaultTransit,
+        "Vault rotation requires PANDO_KMS_PROVIDER=vault-transit"
+    );
+    ensure_vault_retention_option(opts)?;
+    let vault = VaultTransitProvider::from_env()?;
+    let c = config.db().await?;
+    let kms_dir = provider::resolve_kms_dir(&config.root, repo);
+    let s_root = object_store::store_root(config);
+    let packs = load_repo_packs(&c, repo).await?;
+    let mut cp =
+        resolve_vault_rotation_checkpoint(&c, &kms_dir, config, repo, opts, &packs, &vault).await?;
+    ensure!(
+        cp.expected_version() == cp.to_key_version,
+        "Vault rotation checkpoint version mismatch"
+    );
+    let mut envelopes = Vec::with_capacity(packs.len());
+    let mut rewrapped_this_run = 0usize;
+    for pack in &packs {
+        let on_disk = envelope_file_path(&config.root, repo, pack.id);
+        let existing = if on_disk.is_file() {
+            Some(read_and_verify_envelope_file(&config.root, repo, pack.id)?)
+        } else {
+            load_envelope_from_db(&c, repo, pack).await?
+        };
+        if let Some(ref env) = existing
+            && env.provider_kind == provider::PROVIDER_KIND_VAULT
+            && env.key_id == cp.to_key_id
+            && env.key_version == cp.expected_version()
+        {
+            let cipher = read_pack_cipher(&s_root, repo, pack)?;
+            verify_rewrapped_pack(&config.root, repo, pack, env, &cipher).await?;
+            if !cp.completed_pack_ids.contains(&pack.id) {
+                cp.completed_pack_ids.push(pack.id);
+                persist_checkpoint(&c, &kms_dir, &cp).await?;
+            }
+            envelopes.push(env.clone());
+            continue;
+        }
+        if let Some(limit) = opts.fail_after_packs
+            && rewrapped_this_run >= limit
+        {
+            cp.failed_pack_id = Some(pack.id);
+            persist_checkpoint(&c, &kms_dir, &cp).await?;
+            bail!(
+                "fault injection: Vault kms-rotate interrupted after {rewrapped_this_run} pack(s) before {} (state=IN_PROGRESS, resumable)",
+                pack.id
+            );
+        }
+        let updated = match existing {
+            Some(ref env) if env.provider_kind == provider::PROVIDER_KIND_LOCAL => {
+                migrate_local_envelope_to_vault(
+                    &vault,
+                    &config.root,
+                    &s_root,
+                    repo,
+                    pack,
+                    env,
+                    cp.expected_version(),
+                ).await?
+            }
+            Some(ref env) if env.provider_kind == provider::PROVIDER_KIND_VAULT => {
+                rewrap_vault_envelope(
+                    &vault,
+                    &config.root,
+                    &s_root,
+                    repo,
+                    pack,
+                    env,
+                    cp.expected_version(),
+                ).await?
+            }
+            None => {
+                let tier = "hot";
+                let suite = DEFAULT_CIPHER_SUITE;
+                let updated = object_store::put_pack_and_seal_with_suite(config, repo, pack.id, suite, tier).await?;
+                ensure!(
+                    updated.provider_kind == provider::PROVIDER_KIND_VAULT
+                        && updated.key_id == cp.to_key_id
+                        && updated.key_version == cp.expected_version(),
+                    "new pack write did not use the active Vault rotation target"
+                );
+                let cipher = read_pack_cipher(&s_root, repo, pack)?;
+                verify_rewrapped_pack(&config.root, repo, pack, &updated, &cipher).await?;
+                updated
+            }
+            Some(_) => bail!("unsupported source provider kind during Vault rotation"),
+        };
+        upsert_envelope_in_db(&c, &updated).await?;
+        write_envelope_file(&config.root, &updated)?;
+        rewrapped_this_run += 1;
+        cp.failed_pack_id = None;
+        if !cp.completed_pack_ids.contains(&pack.id) {
+            cp.completed_pack_ids.push(pack.id);
+        }
+        persist_checkpoint(&c, &kms_dir, &cp).await?;
+        envelopes.push(updated);
+    }
+    cp.state = "COMPLETED".to_owned();
+    cp.reconcile_stage = KmsReconcileStage::TargetObserved;
+    cp.failed_pack_id = None;
+    persist_checkpoint(&c, &kms_dir, &cp).await?;
+    Ok(KmsRotationReport {
+        repo,
+        previous_key_id: cp.from_key_id,
+        previous_key_version: cp.from_key_version,
+        new_key_id: cp.to_key_id,
+        new_key_version: cp.to_key_version,
+        envelopes_rewrapped: envelopes.len(),
+        envelopes_verified: envelopes.len(),
+        envelopes,
+    })
+}
+
 async fn resolve_rotation_checkpoint(
     c: &Client,
     kms_dir: &Path,
@@ -363,13 +792,17 @@ pub async fn rotate_kms_key_with_options(
     repo: Uuid,
     opts: &KmsRotateOptions,
 ) -> Result<KmsRotationReport> {
-    if super::provider_selection::selected_kind()?
-        == super::provider_selection::PandoProviderSelection::VaultTransit
+    if provider_selection::selected_kind()? == PandoProviderSelection::VaultTransit {
+        return rotate_vault_kms_key_with_options(config, repo, opts).await;
+    }
+    let kms_dir = provider::resolve_kms_dir(&config.root, repo);
+    if let Some(cp) = load_file_checkpoint(&kms_dir)?
+        && cp.state == "IN_PROGRESS"
+        && cp.to_provider_kind != provider::PROVIDER_KIND_LOCAL
     {
-        bail!("Pando Vault Transit rotation is not implemented yet; refusing local-file mutation");
+        bail!("active Vault rotation requires PANDO_KMS_PROVIDER=vault-transit; refusing local-file mutation");
     }
     let c = config.db().await?;
-    let kms_dir = super::provider::resolve_kms_dir(&config.root, repo);
     let s_root = object_store::store_root(config);
     let packs = load_repo_packs(&c, repo).await?;
     for pack in &packs {
@@ -530,6 +963,29 @@ mod tests {
         assert!(!cp.external_rotate_issued);
         assert_eq!(cp.reconcile_stage, KmsReconcileStage::NotIssued);
         assert!(!cp.is_vault_target());
+    }
+
+    #[test]
+    fn vault_checkpoint_roundtrips_through_json() {
+        let cp = vault_checkpoint(true, KmsReconcileStage::RotateIssued);
+        let encoded = serde_json::to_vec(&cp).unwrap();
+        let decoded: KmsRotationCheckpoint = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.from_provider_kind, super::super::provider::PROVIDER_KIND_VAULT);
+        assert_eq!(decoded.to_provider_kind, super::super::provider::PROVIDER_KIND_VAULT);
+        assert_eq!(decoded.expected_to_version, 4);
+        assert!(decoded.external_rotate_issued);
+        assert_eq!(decoded.reconcile_stage, KmsReconcileStage::RotateIssued);
+    }
+
+    #[test]
+    fn vault_retention_changes_are_refused() {
+        let mut opts = KmsRotateOptions::default();
+        assert!(ensure_vault_retention_option(&opts).is_ok());
+        opts.revoke_previous = true;
+        assert!(ensure_vault_retention_option(&opts).is_err());
+        let mut mismatched = vault_checkpoint(false, KmsReconcileStage::NotIssued);
+        mismatched.to_provider_kind = super::super::provider::PROVIDER_KIND_LOCAL.to_owned();
+        assert!(vault_rotation_decision(&mismatched, 3).is_err());
     }
 
     #[test]

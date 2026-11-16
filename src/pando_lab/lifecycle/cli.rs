@@ -3,10 +3,10 @@ use super::{
     read_and_verify_envelope_file,
     rotation::{
         KmsRotateOptions, KmsRotationCheckpoint, rotate_kms_key_with_options,
-        verify_pack_ciphertext_open,
     },
 };
 use super::super::{Config, object_store};
+use super::vault_provider::VaultTransitProvider;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -24,41 +24,83 @@ pub struct KmsVerifyReport {
     pub active_key_version: i32,
     pub provider_revoked: bool,
     pub keys: Vec<provider::ManagedKeyEntry>,
+    #[serde(default)]
+    pub provider_kind: String,
+    #[serde(default)]
+    pub provider_latest_version: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KmsStatusReport {
     pub repo: Uuid,
-    pub policy: provider::KmsKeyPolicy,
+    pub policy: Option<provider::KmsKeyPolicy>,
     pub active_rotation: Option<KmsRotationCheckpoint>,
     pub envelope_count: usize,
+    #[serde(default)]
+    pub provider_kind: String,
+    #[serde(default)]
+    pub provider_latest_version: Option<i32>,
+    #[serde(default)]
+    pub rotation_total_packs: usize,
+    #[serde(default)]
+    pub rotation_completed_packs: usize,
 }
 
 pub async fn verify_repo_encryption(config: &Config, repo: Uuid) -> Result<KmsVerifyReport> {
-    if provider_selection::selected_kind()? == provider_selection::PandoProviderSelection::VaultTransit {
-        bail!("Pando kms-verify is local-only in this checkpoint; use the object-store read path for Vault packs");
-    }
     let c = config.db().await?;
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
-    let prov = provider::PandoKmsProvider::open_existing(&kms_dir)?;
-    let _active = prov.active_entry()?;
     let packs = load_repo_packs(&c, repo).await?;
     let s_root = object_store::store_root(config);
+    let selected = provider_selection::selected_kind()?;
+    let (provider_kind, provider_latest_version, active_key_id, active_key_version, provider_revoked, keys) =
+        if selected == provider_selection::PandoProviderSelection::VaultTransit {
+            let vault = VaultTransitProvider::from_env()?;
+            let latest = vault.latest_version().await?;
+            (
+                provider::PROVIDER_KIND_VAULT.to_owned(),
+                Some(latest),
+                vault.key_name().to_owned(),
+                latest,
+                false,
+                Vec::<provider::ManagedKeyEntry>::new(),
+            )
+        } else {
+            let prov = provider::PandoKmsProvider::open_existing(&kms_dir)?;
+            let _active = prov.active_entry()?;
+            let p = prov.policy();
+            (
+                provider::PROVIDER_KIND_LOCAL.to_owned(),
+                None,
+                p.active_key_id.clone(),
+                p.active_key_version,
+                p.provider_revoked,
+                p.keys.clone(),
+            )
+        };
     for pack in &packs {
         let disk_path = envelope_file_path(&config.root, repo, pack.id);
         ensure!(disk_path.is_file(), "missing KMS envelope file for pack {}", pack.id);
         let env = read_and_verify_envelope_file(&config.root, repo, pack.id)?;
         if let Some(db_env) = db::load_envelope_from_db(&c, repo, pack).await? {
             ensure!(
-                db_env.envelope_mac == env.envelope_mac && db_env.key_id == env.key_id,
+                db_env.envelope_mac == env.envelope_mac && db_env.key_id == env.key_id && db_env.provider_kind == env.provider_kind,
                 "DB KMS envelope diverges from verified on-disk envelope for pack {}",
                 pack.id
             );
         }
-        verify_pack_ciphertext_open(&prov, &s_root, repo, pack, &env).await?;
+        let manifest_path = s_root.join(object_store::manifest_key(repo, pack.id));
+        ensure!(manifest_path.is_file(), "missing object-store manifest for pack {}", pack.id);
+        let manifest: object_store::CasPackManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        ensure!(
+            manifest.repo == repo && manifest.pack_id == pack.id,
+            "object-store manifest identity mismatch for pack {}",
+            pack.id
+        );
+        let cipher = std::fs::read(s_root.join(&manifest.pack_key))?;
+        super::rotation::verify_and_decrypt_pack_bytes(&config.root, repo, pack, &env, &cipher).await?;
     }
-    let p = prov.policy();
     Ok(KmsVerifyReport {
         repo,
         verified: true,
@@ -66,19 +108,41 @@ pub async fn verify_repo_encryption(config: &Config, repo: Uuid) -> Result<KmsVe
         authenticated_encryption: true,
         packs_checked: packs.len(),
         packs_verified: packs.len(),
-        active_key_id: p.active_key_id.clone(),
-        active_key_version: p.active_key_version,
-        provider_revoked: p.provider_revoked,
-        keys: p.keys.clone(),
+        active_key_id,
+        active_key_version,
+        provider_revoked,
+        keys,
+        provider_kind,
+        provider_latest_version,
     })
 }
 
 pub async fn kms_status(config: &Config, repo: Uuid) -> Result<KmsStatusReport> {
-    if provider_selection::selected_kind()? == provider_selection::PandoProviderSelection::VaultTransit {
-        bail!("Pando local KMS status is unavailable while vault-transit is selected");
-    }
     let c = config.db().await?;
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
+    let active_rotation = db::load_file_checkpoint(&kms_dir)?;
+    let rotation_total_packs = active_rotation.as_ref().map_or(0, |cp| cp.target_pack_ids.len());
+    let rotation_completed_packs = active_rotation.as_ref().map_or(0, |cp| cp.completed_pack_ids.len());
+    let row = c
+        .query_one(
+            "SELECT count(*) FROM pando_lab.kms_envelopes WHERE repo=$1",
+            &[&repo],
+        )
+        .await?;
+    let envelope_count = row.get::<_, i64>(0) as usize;
+    if provider_selection::selected_kind()? == provider_selection::PandoProviderSelection::VaultTransit {
+        let vault = VaultTransitProvider::from_env()?;
+        return Ok(KmsStatusReport {
+            repo,
+            policy: None,
+            active_rotation,
+            envelope_count,
+            provider_kind: provider::PROVIDER_KIND_VAULT.to_owned(),
+            provider_latest_version: Some(vault.latest_version().await?),
+            rotation_total_packs,
+            rotation_completed_packs,
+        });
+    }
     let policy = if kms_dir.join(provider::POLICY_FILE_NAME).is_file() {
         provider::load_policy(&kms_dir)?
     } else {
@@ -86,18 +150,15 @@ pub async fn kms_status(config: &Config, repo: Uuid) -> Result<KmsStatusReport> 
             .policy()
             .clone()
     };
-    let active_rotation = db::load_file_checkpoint(&kms_dir)?;
-    let row = c
-        .query_one(
-            "SELECT count(*) FROM pando_lab.kms_envelopes WHERE repo=$1",
-            &[&repo],
-        )
-        .await?;
     Ok(KmsStatusReport {
         repo,
-        policy,
+        policy: Some(policy),
         active_rotation,
-        envelope_count: row.get::<_, i64>(0) as usize,
+        envelope_count,
+        provider_kind: provider::PROVIDER_KIND_LOCAL.to_owned(),
+        provider_latest_version: None,
+        rotation_total_packs,
+        rotation_completed_packs,
     })
 }
 
@@ -111,8 +172,7 @@ pub async fn run_kms_cli(config: &Config, args: &[String]) -> Result<()> {
     if provider_selection::selected_kind()? == provider_selection::PandoProviderSelection::VaultTransit
         && matches!(
             cmd,
-            "kms-rotate"
-                | "kms-revoke-key"
+            "kms-revoke-key"
                 | "kms-revoke-provider"
                 | "kms-grant-provider"
                 | "kms-policy"
