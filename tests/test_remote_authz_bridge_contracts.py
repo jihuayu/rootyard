@@ -13,7 +13,7 @@ SM_ENTRY = ROOT / "src/ref_store/core/state_machine.rs"
 SM_DIR = ROOT / "src/ref_store/core/state_machine"
 NEW_PROJECTOR_SUBS = ("remote_authz_bridge.rs", "remote_authz_grant.rs", "remote_authz_pg.rs")
 TOUCHED_SM_SUBS = ("apply_scopes.rs", "commands.rs", "state.rs", "snapshot.rs", "response.rs", "machine.rs", "apply_decisions.rs")
-TEST_SUPPORT_ENTRY = ROOT / "tests/remote_authz_support.rs"
+TEST_SUPPORT_ENTRY = ROOT / "tests/remote_authz_support/mod.rs"
 TEST_SUPPORT_SUBS = ("cluster.rs", "e2e.rs", "fixtures.rs", "pg.rs")
 TEST_RS = ROOT / "tests/ref_store_remote_authz_bridge.rs"
 WORKFLOW = ROOT / ".github/workflows/refcas-remote-authz.yml"
@@ -24,7 +24,6 @@ class RemoteAuthzBridgeContractTest(unittest.TestCase):
     def test_module_boundaries_and_line_limits(self) -> None:
         self.assertFalse((PROJECTOR_DIR / "mod.rs").exists(), "Forbidden projector/mod.rs")
         self.assertFalse((SM_DIR / "mod.rs").exists(), "Forbidden state_machine/mod.rs")
-        self.assertFalse((ROOT / "tests/remote_authz_support/mod.rs").exists(), "Forbidden remote_authz_support/mod.rs")
 
         for entry in (PROJECTOR_ENTRY, SM_ENTRY, TEST_SUPPORT_ENTRY):
             self.assertTrue(entry.is_file(), f"Missing {entry}")

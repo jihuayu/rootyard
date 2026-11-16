@@ -11,7 +11,6 @@ on:
       - 'src/ref_store/core/state_machine/**'
       - 'crates/refcas-log/**'
       - 'tests/ref_store_remote_authz_bridge.rs'
-      - 'tests/remote_authz_support.rs'
       - 'tests/remote_authz_support/**'
       - 'tests/test_remote_authz_bridge_contracts.py'
       - 'docs/refcas-remote-authz-bridge.md'

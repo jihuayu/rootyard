@@ -35,7 +35,7 @@ pub async fn run_open_to_closing_grant_rotation_crash_restart() -> Result<()> {
     let scope_id = Uuid::new_v4();
     let svc = make_service_identity(actor, "raft-bridge-e2e");
 
-    raft.commit_sm_cmd(&init_gate_cmd(pg.repo_id, &realm, 1)).await?;
+    raft.commit_sm_cmd(&init_gate_cmd(pg.repo_id, &realm, 1)).await?.2.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     pg.seed_scope("token", scope_id, 1, "OPEN", None).await?;
 
     let op1 = Uuid::new_v4();
@@ -164,7 +164,7 @@ pub async fn run_cancel_commit_partition_drain_barrier() -> Result<()> {
 
     pg.skew_clock_and_timezone("Pacific/Auckland", 18).await?;
     pg.seed_scope("branch_rules", scope_id, 1, "OPEN", None).await?;
-    raft.commit_sm_cmd(&init_gate_cmd(pg.repo_id, &realm, 1)).await?;
+    raft.commit_sm_cmd(&init_gate_cmd(pg.repo_id, &realm, 1)).await?.2.map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     let op_commit = Uuid::new_v4();
     let dec_commit = Uuid::new_v4();
@@ -211,7 +211,10 @@ pub async fn run_cancel_commit_partition_drain_barrier() -> Result<()> {
         )
         .await?;
         let cmd = verify_signed_decision_grant(&keyring, &grant, &realm, &svc.san_identity, 10)?;
-        raft.commit_sm_cmd(&RefCasCommand::InstallScopedDecision(cmd)).await?;
+        raft.commit_sm_cmd(&RefCasCommand::InstallScopedDecision(cmd))
+            .await?
+            .2
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     }
     raft.commit_sm_cmd(&RefCasCommand::CommitRefs(CommitRefsCommand {
         request: WireCommitRefsRequest::from(&req_commit),
@@ -220,7 +223,9 @@ pub async fn run_cancel_commit_partition_drain_barrier() -> Result<()> {
         policy_rejects: BTreeMap::new(),
         logical_tick: 11,
     }))
-    .await?;
+    .await?
+    .2
+    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     pg.transition_scope_closing("branch_rules", scope_id, 6, Uuid::new_v4()).await?;
     pg.insert_cancellation(op_cancel, Some(dec_cancel), &req_cancel.digest().as_hex(), actor, "revoked").await?;
@@ -259,7 +264,7 @@ pub async fn run_cancel_commit_partition_drain_barrier() -> Result<()> {
     raft.heal_all().await?;
     let cancel_rows = load_decision_cancellations_from_pg(&**pg.pool.get().await?, pg.repo_id).await?;
     let cancel_cmd = build_cancel_command_from_pg(&cancel_rows[0], "lane-b", 1, 35)?;
-    raft.commit_sm_cmd(&RefCasCommand::Cancel(cancel_cmd)).await?;
+    raft.commit_sm_cmd(&RefCasCommand::Cancel(cancel_cmd)).await?.2.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let new_lid = raft.wait_leader(None).await?;
     let digest_before = raft.replay_linearizable_on(new_lid).await?.0.state_digest()?;
     let done = await_drain_before_revocation_ack(
