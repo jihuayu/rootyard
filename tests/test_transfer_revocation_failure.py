@@ -3,12 +3,14 @@
 import json
 from pathlib import Path
 import sys
+import types
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(ROOT / "tests"))
 
+import ci_job_checkouts as checkouts  # noqa: E402
 import transfer_revocation_failure as failure  # noqa: E402
 import transfer_revocation_timing as timing  # noqa: E402
 import transfer_revocation_transport as transport  # noqa: E402
@@ -207,6 +209,111 @@ class ReaderEvidenceTests(unittest.TestCase):
         self.assertEqual(stop.kind, timing.StopKind.TIMEOUT)
         self.assertEqual(evidence.snapshot()["terminal_state"], "unproven")
         self.assertFalse(evidence.snapshot()["transport_stop"]["confirmed_transport_stop"])
+
+
+class _CaseHarness(checkouts.JobCheckoutHarness):
+    def __init__(self):
+        self.results = []
+        self.secrets = []
+        self.base_db = "db"
+        self.db = "db"
+
+
+class CaseSerializationTests(unittest.TestCase):
+    def test_failed_case_row_gets_fixed_code_and_nested_safe_proof(self):
+        harness = _CaseHarness()
+
+        def fails(evidence):
+            evidence.start()
+            evidence.enter_phase("transport_request")
+            evidence.fail_exception(RuntimeError("secret /tmp/path oid=abc"))
+            raise RuntimeError("secret /tmp/path oid=abc")
+
+        with self.assertRaises(failure.SafeFailure):
+            harness.run_case_with_partial(
+                "bounded_active_transfer_revocation", fails,
+                failure.BOUNDED_SUBCASES,
+            )
+        row = harness.results[0]
+        self.assertEqual(row["name"], "bounded_active_transfer_revocation")
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("seconds", row)
+        self.assertEqual(row["error"], "runtime_error")
+        self.assertNotIn("secret", row["error"])
+        proof = row["partial_proof"]
+        self.assertEqual(proof["terminal_state"], "failed")
+        self.assertEqual(proof["subcases"]["pat_revoked"]["subcase_state"], "not_run")
+        self.assertNotIn("secret", json.dumps(proof))
+
+    def test_successful_case_schema_stays_compatible(self):
+        harness = _CaseHarness()
+
+        def passes(evidence):
+            evidence.start()
+            evidence.set_final_proof(True)
+            return {"all_proven": True}
+
+        harness.run_case_with_partial(
+            "mirror_cannot_bypass_revocation_via_origin", passes,
+            failure.MIRROR_SUBCASES,
+        )
+        row = harness.results[0]
+        self.assertEqual(row["status"], "passed")
+        self.assertEqual(row["detail"], {"all_proven": True})
+        self.assertNotIn("partial_proof", row)
+
+    def test_failed_subcase_is_finished_with_fixed_code(self):
+        harness = _CaseHarness()
+        evidence = failure.FailureEvidence(
+            case="bounded_active_transfer_revocation",
+            subcases=failure.BOUNDED_SUBCASES,
+        )
+        evidence.start()
+
+        def fails(*args, **kwargs):
+            raise RuntimeError("secret /tmp/path")
+
+        with self.assertRaises(RuntimeError):
+            harness._run_subcase(evidence, "pat_revoked", fails)
+        snapshot = evidence.snapshot()["subcases"]["pat_revoked"]
+        self.assertEqual(snapshot["subcase_state"], "finished")
+        self.assertEqual(snapshot["primary_failure_phase"], "transport_request")
+        self.assertEqual(snapshot["exception_class"], "runtime_error")
+        self.assertNotIn("secret", json.dumps(snapshot))
+
+    def test_expiry_subcase_keeps_initial_and_final_clock_distinct(self):
+        harness = _CaseHarness()
+        evidence = failure.FailureEvidence(
+            case="bounded_active_transfer_revocation",
+            subcases=failure.BOUNDED_SUBCASES,
+        )
+        evidence.start()
+        child = evidence.start_subcase("pat_expired")
+        child.set_clock("initial", {
+            "kind": "db_clock_expiry_bracket", "earliest_ns": 10,
+            "latest_ns": 20, "width_ms": 0.001, "samples": 1,
+        })
+        clock = types.SimpleNamespace(report=lambda: {
+            "kind": "db_clock_expiry_bracket", "earliest_ns": 30,
+            "latest_ns": 40, "width_ms": 0.002, "samples": 2,
+        })
+        harness._finish_expiry_subcase(
+            evidence, "pat_expired", {"configured_bound_proven": True}, clock,
+        )
+        snapshot = evidence.snapshot()["subcases"]["pat_expired"]
+        self.assertEqual(snapshot["initial_clock"]["earliest_ns"], 10)
+        self.assertEqual(snapshot["final_clock"]["earliest_ns"], 30)
+        self.assertTrue(snapshot["final_proof"])
+        self.assertEqual(snapshot["subcase_state"], "finished")
+
+    def test_only_two_b1200_callables_use_partial_wrapper(self):
+        source = (ROOT / "tests" / "ci_job_checkouts.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count("harness.run_case_with_partial("), 2)
+        self.assertIn("harness.case(name, getattr(harness, name))", source)
+        self.assertIn("def bounded_active_transfer_revocation(self, evidence=None)",
+                      source)
+        self.assertIn("def mirror_cannot_bypass_revocation_via_origin(self, evidence=None)",
+                      source)
 
 
 class TransportEntryTests(unittest.TestCase):

@@ -23,6 +23,7 @@ import urllib.parse
 import uuid
 
 from ci_source_pins import SourcePinHarness
+import transfer_revocation_failure as revocation_failure
 import transfer_revocation_git_source as revocation_git_source
 import transfer_revocation_observer as revocation_observer
 import transfer_revocation_source as revocation_source
@@ -783,7 +784,8 @@ class JobCheckoutHarness(SourcePinHarness):
     def _git_transfer(self, base, path, token, oid, payload_bytes, *, trigger=None,
                       trigger_kind="committed_mutation", natural_expiry=None,
                       service_pid=None, check_barrier=True, start_barrier=None,
-                      pause_after_first=0.8, rcvbuf=16 * 1024, require_backpressure=True):
+                      pause_after_first=0.8, rcvbuf=16 * 1024, require_backpressure=True,
+                      evidence=None):
         def pkt(value):
             return f"{len(value) + 4:04x}".encode() + value
 
@@ -816,6 +818,7 @@ class JobCheckoutHarness(SourcePinHarness):
                 service_pid, observer.identities, arch=os.uname().machine
             ),
             transfer_kind="git",
+            evidence=evidence,
         )
         result["configured_bound_proven"] = bool(result["configured_bound_proven"])
         result["received"] = result["client_stop"]["received_bytes"]
@@ -824,7 +827,7 @@ class JobCheckoutHarness(SourcePinHarness):
     def _lfs_transfer(self, base, path, token, expected_size, *, data_root, repo_id, oid,
                       trigger=None, trigger_kind="committed_mutation", natural_expiry=None,
                       service_pid=None, start_barrier=None, pause_after_first=0.8,
-                      rcvbuf=16 * 1024, require_backpressure=True):
+                      rcvbuf=16 * 1024, require_backpressure=True, evidence=None):
         witness = revocation_source.LfsSourceWitness(
             service_pid,
             Path(data_root) / "lfs" / str(repo_id) / oid,
@@ -852,6 +855,7 @@ class JobCheckoutHarness(SourcePinHarness):
             source_witness=witness,
             source_precheck=witness.prepare_no_match,
             transfer_kind="lfs",
+            evidence=evidence,
         )
         result["configured_bound_proven"] = bool(result["configured_bound_proven"])
         result["received"] = result["client_stop"]["received_bytes"]
@@ -859,40 +863,82 @@ class JobCheckoutHarness(SourcePinHarness):
 
     def _stream_git_until_revoked(self, base, path, token, oid, payload_bytes, revoke, *,
                                   check_barrier=True, pause_after_first=0.8, start_barrier=None,
-                                  service_pid=None):
+                                  service_pid=None, evidence=None):
         return self._git_transfer(
             base, path, token, oid, payload_bytes, trigger=revoke,
             service_pid=service_pid or self.proc.pid,
             check_barrier=check_barrier, start_barrier=start_barrier,
-            pause_after_first=pause_after_first,
+            pause_after_first=pause_after_first, evidence=evidence,
         )
 
     def _stream_lfs_until_revoked(self, base, path, token, expected_size, revoke, *,
                                   data_root, repo_id, oid, pause_after_first=0.8,
-                                  start_barrier=None, service_pid=None):
+                                  start_barrier=None, service_pid=None, evidence=None):
         return self._lfs_transfer(
             base, path, token, expected_size, data_root=data_root, repo_id=repo_id, oid=oid,
             trigger=revoke, service_pid=service_pid or self.proc.pid,
             start_barrier=start_barrier, pause_after_first=pause_after_first,
+            evidence=evidence,
         )
 
     def _stream_git_until_expiry(self, base, path, token, oid, payload_bytes, expiry_clock, *,
-                                 pause_after_first=0.8, service_pid=None):
+                                 pause_after_first=0.8, service_pid=None, evidence=None):
         return self._git_transfer(
             base, path, token, oid, payload_bytes, natural_expiry=expiry_clock,
             service_pid=service_pid or self.proc.pid,
-            pause_after_first=pause_after_first,
+            pause_after_first=pause_after_first, evidence=evidence,
         )
 
     def _stream_lfs_until_expiry(self, base, path, token, expected_size, expiry_clock, *,
                                  data_root, repo_id, oid, pause_after_first=0.8,
-                                 service_pid=None, start_barrier=None):
+                                 service_pid=None, start_barrier=None, evidence=None):
         return self._lfs_transfer(
             base, path, token, expected_size, data_root=data_root, repo_id=repo_id, oid=oid,
             natural_expiry=expiry_clock,
             service_pid=service_pid or self.proc.pid,
             start_barrier=start_barrier, pause_after_first=pause_after_first,
+            evidence=evidence,
         )
+
+    def _run_subcase(self, evidence, name, fn, *args, **kwargs):
+        child = evidence.start_subcase(name)
+        try:
+            result = fn(*args, evidence=child, **kwargs)
+        except Exception as error:
+            child.fail_exception(error)
+            evidence.finish_subcase(name, child)
+            raise
+        evidence.finish_subcase(name, child)
+        return result
+
+    def _finish_expiry_subcase(self, evidence, name, result, clock):
+        child = evidence.get_subcase(name)
+        if child is not None:
+            child.set_clock("final", clock.report())
+            child.set_final_proof(bool(result.get("configured_bound_proven")))
+            evidence.finish_subcase(name, child)
+
+    def _case_callable(self, evidence, fn):
+        try:
+            return fn(evidence=evidence)
+        except revocation_failure.SafeFailure as error:
+            error.partial = evidence.snapshot()
+            raise
+        except Exception as error:
+            evidence.fail_exception(error)
+            raise evidence.safe_failure() from None
+
+    def run_case_with_partial(self, name, fn, subcases):
+        evidence = revocation_failure.FailureEvidence(case=name, subcases=subcases)
+        row_index = len(self.results)
+        try:
+            super().case(name, lambda: self._case_callable(evidence, fn))
+        except Exception:
+            if row_index < len(self.results):
+                row = self.results[row_index]
+                if row.get("name") == name and row.get("status") == "failed":
+                    row["partial_proof"] = evidence.snapshot()
+            raise
 
     def _require_configured_bound_proof(self, results):
         proofs = {
@@ -908,7 +954,13 @@ class JobCheckoutHarness(SourcePinHarness):
             "all_proven": True,
         }
 
-    def bounded_active_transfer_revocation(self):
+    def bounded_active_transfer_revocation(self, evidence=None):
+        evidence = evidence or revocation_failure.FailureEvidence(
+            case="bounded_active_transfer_revocation",
+            subcases=revocation_failure.BOUNDED_SUBCASES,
+        )
+        evidence.start()
+        evidence.enter_phase("fixture_upload")
         lfs_bytes = os.urandom(16 * 1024 * 1024)
         lfs_oid = hashlib.sha256(lfs_bytes).hexdigest()
         self.expect(
@@ -925,6 +977,8 @@ class JobCheckoutHarness(SourcePinHarness):
             )
             == "ready"
         )
+        evidence.finish_phase("fixture_upload")
+        evidence.enter_phase("fixture_commit_push")
         pack_size = 24 * 1024 * 1024
         self.git("checkout", "-b", "revocation-large-fixture", cwd=self.work)
         try:
@@ -939,12 +993,16 @@ class JobCheckoutHarness(SourcePinHarness):
         finally:
             self.git("checkout", "main", cwd=self.work)
 
+        evidence.finish_phase("fixture_commit_push")
         results = {}
+        evidence.enter_phase("scoped_restart_sync")
         with self._scoped_revocation_env(bound_ms="1200"):
             self.sync()
+            evidence.finish_phase("scoped_restart_sync")
             # 1. Human PAT revocation mid-stream + PG barrier & child cleanup
             pat_revoked = self.account("create-token", "alice")
-            results["pat_revoked"] = self._stream_git_until_revoked(
+            results["pat_revoked"] = self._run_subcase(
+                evidence, "pat_revoked", self._stream_git_until_revoked,
                 self.base,
                 "/git/alice/demo.git",
                 pat_revoked,
@@ -967,7 +1025,8 @@ class JobCheckoutHarness(SourcePinHarness):
             exp_epoch = self._set_token_natural_expiry(pat_expired["token_id"], seconds=10)
             expiry_before = self._db_clock_sample()
             expiry_before_clock = revocation_timing.reconcile_expiry([expiry_before], exp_epoch)
-            results["pat_expired"] = self._stream_git_until_expiry(
+            results["pat_expired"] = self._run_subcase(
+                evidence, "pat_expired", self._stream_git_until_expiry,
                 self.base,
                 "/git/alice/demo.git",
                 pat_expired,
@@ -976,12 +1035,20 @@ class JobCheckoutHarness(SourcePinHarness):
                 expiry_before_clock,
                 service_pid=self.proc.pid,
             )
+            evidence.enter_phase("final_clock_sample")
             expiry_after = self._db_clock_sample()
-            results["pat_expired"] = revocation_timing.apply_natural_expiry_clock(
-                results["pat_expired"],
-                revocation_timing.reconcile_expiry([expiry_before, expiry_after], exp_epoch),
-                1200,
+            evidence.finish_phase("final_clock_sample")
+            evidence.enter_phase("final_clock_reconcile")
+            pat_expired_clock = revocation_timing.reconcile_expiry(
+                [expiry_before, expiry_after], exp_epoch
             )
+            results["pat_expired"] = revocation_timing.apply_natural_expiry_clock(
+                results["pat_expired"], pat_expired_clock, 1200,
+            )
+            self._finish_expiry_subcase(
+                evidence, "pat_expired", results["pat_expired"], pat_expired_clock,
+            )
+            evidence.finish_phase("final_clock_reconcile")
             self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", 401, token=pat_expired)
             self._wait_no_owned_children([self.proc.pid])
 
@@ -994,7 +1061,9 @@ class JobCheckoutHarness(SourcePinHarness):
                 body={"role": "read", "username": "bob"},
             )
             try:
-                results["member_removed_slow_lfs"] = self._stream_lfs_until_revoked(
+                results["member_removed_slow_lfs"] = self._run_subcase(
+                    evidence, "member_removed_slow_lfs",
+                    self._stream_lfs_until_revoked,
                     self.base,
                     f"/git/alice/demo.git/info/lfs/objects/{lfs_oid}",
                     self.bob,
@@ -1020,7 +1089,8 @@ class JobCheckoutHarness(SourcePinHarness):
             # 4. Repository storage_generation increment mid-stream
             repo_id = self.repo["id"]
             try:
-                results["generation_changed"] = self._stream_git_until_revoked(
+                results["generation_changed"] = self._run_subcase(
+                    evidence, "generation_changed", self._stream_git_until_revoked,
                     self.base,
                     "/git/alice/demo.git",
                     self.reader,
@@ -1066,6 +1136,9 @@ class JobCheckoutHarness(SourcePinHarness):
             ci_lfs_path = f"/ci/{rev_oid}/git/alice/demo.git/info/lfs/objects/{lfs_oid}"
             both_streaming = threading.Barrier(2)
 
+            child_a = evidence.start_subcase("concurrent_job_cancel")
+            child_b = evidence.start_subcase("concurrent_job_expired_lfs")
+            error_a = error_b = None
             with ThreadPoolExecutor(max_workers=2) as pool:
                 fut_a = pool.submit(
                     self._stream_git_until_revoked,
@@ -1077,6 +1150,7 @@ class JobCheckoutHarness(SourcePinHarness):
                     lambda: self.transition(body_a_job, "cancel"),
                     start_barrier=both_streaming,
                     service_pid=self.mirror_proc.pid,
+                    evidence=child_a,
                 )
                 fut_b = pool.submit(
                     self._stream_lfs_until_expiry,
@@ -1091,15 +1165,40 @@ class JobCheckoutHarness(SourcePinHarness):
                     pause_after_first=0.8,
                     start_barrier=both_streaming,
                     service_pid=self.mirror_proc.pid,
+                    evidence=child_b,
                 )
-                results["concurrent_job_cancel"] = fut_a.result(timeout=20)
-                results["concurrent_job_expired_lfs"] = fut_b.result(timeout=25)
+                try:
+                    results["concurrent_job_cancel"] = fut_a.result(timeout=20)
+                except Exception as error:
+                    error_a = error
+                try:
+                    results["concurrent_job_expired_lfs"] = fut_b.result(timeout=25)
+                except Exception as error:
+                    error_b = error
+            for name, child, error in (
+                ("concurrent_job_cancel", child_a, error_a),
+                ("concurrent_job_expired_lfs", child_b, error_b),
+            ):
+                if error is not None:
+                    child.fail_exception(error)
+                evidence.finish_subcase(name, child)
+            if error_a is not None or error_b is not None:
+                raise (error_a or error_b)
+            evidence.enter_phase("final_clock_sample")
             expiry_after = self._db_clock_sample()
-            results["concurrent_job_expired_lfs"] = revocation_timing.apply_natural_expiry_clock(
-                results["concurrent_job_expired_lfs"],
-                revocation_timing.reconcile_expiry([expiry_before, expiry_after], exp_b),
-                1200,
+            evidence.finish_phase("final_clock_sample")
+            evidence.enter_phase("final_clock_reconcile")
+            concurrent_clock = revocation_timing.reconcile_expiry(
+                [expiry_before, expiry_after], exp_b
             )
+            results["concurrent_job_expired_lfs"] = revocation_timing.apply_natural_expiry_clock(
+                results["concurrent_job_expired_lfs"], concurrent_clock, 1200,
+            )
+            self._finish_expiry_subcase(
+                evidence, "concurrent_job_expired_lfs",
+                results["concurrent_job_expired_lfs"], concurrent_clock,
+            )
+            evidence.finish_phase("final_clock_reconcile")
             self.mirror_expect(self.advertise(rev_oid), (401, 403), token=tok_a)
             self.mirror_expect(ci_lfs_path, (401, 403), token=tok_b)
             for _ in range(30):
@@ -1112,7 +1211,9 @@ class JobCheckoutHarness(SourcePinHarness):
 
             # 6. Database / authority outage fails closed within bound without child leak
             try:
-                results["db_outage_fail_closed"] = self._stream_git_until_revoked(
+                results["db_outage_fail_closed"] = self._run_subcase(
+                    evidence, "db_outage_fail_closed",
+                    self._stream_git_until_revoked,
                     self.base,
                     "/git/alice/demo.git",
                     self.reader,
@@ -1134,11 +1235,24 @@ class JobCheckoutHarness(SourcePinHarness):
                 if self.sql("SELECT to_regclass('checkout_revocation_outage_tokens') IS NOT NULL") == "t":
                     self.sql("ALTER TABLE checkout_revocation_outage_tokens RENAME TO tokens")
             self._wait_no_owned_children([self.proc.pid])
+            evidence.enter_phase("post_revocation_denial")
             self.expect("/git/alice/demo.git/info/refs?service=git-upload-pack", 200, token=self.reader)
+            evidence.finish_phase("post_revocation_denial")
+            evidence.enter_phase("final_bound_assert")
             results["bound_proof_summary"] = self._require_configured_bound_proof(results)
+            evidence.finish_phase("final_bound_assert")
+            evidence.set_final_proof(True)
+            evidence.enter_phase("scoped_service_restore")
+        evidence.finish_phase("scoped_service_restore")
         return results
 
-    def mirror_cannot_bypass_revocation_via_origin(self):
+    def mirror_cannot_bypass_revocation_via_origin(self, evidence=None):
+        evidence = evidence or revocation_failure.FailureEvidence(
+            case="mirror_cannot_bypass_revocation_via_origin",
+            subcases=revocation_failure.MIRROR_SUBCASES,
+        )
+        evidence.start()
+        evidence.enter_phase("fixture_commit_push")
         branch = "mirror-bypass-revocation-fixture"
         self.git("checkout", "-b", branch, cwd=self.work)
         try:
@@ -1149,6 +1263,7 @@ class JobCheckoutHarness(SourcePinHarness):
             self.git("push", "origin", "HEAD:refs/heads/" + branch, cwd=self.work, token=self.alice)
         finally:
             self.git("checkout", "main", cwd=self.work)
+        evidence.finish_phase("fixture_commit_push")
 
         hook_secret = "revocation-bypass-hook-secret-123456"
         self.secrets.append(hook_secret)
@@ -1236,98 +1351,141 @@ class JobCheckoutHarness(SourcePinHarness):
         }
         extra_mirror = {"ROOTYARD_CI_MIRROR_SOURCE_TOKEN": self.alice["token"]}
         prepare_path = f"/api/repos/alice/demo/ci-checkouts/{job_id}/prepare-dependencies"
+        evidence.enter_phase("scoped_restart_sync")
+        child = evidence.start_subcase("mirror_source_token_abort")
         try:
-            with self._scoped_revocation_env(bound_ms="1200", extra_env=extra_env, extra_mirror_env=extra_mirror):
-                baseline = {
-                    identity.pgid for identity in revocation_observer.discover_groups(
-                        revocation_observer.read_proc_table(uid=os.geteuid()),
-                        [self.mirror_proc.pid],
+            try:
+                with self._scoped_revocation_env(bound_ms="1200", extra_env=extra_env, extra_mirror_env=extra_mirror):
+                    evidence.finish_phase("scoped_restart_sync")
+                    baseline = {
+                        identity.pgid for identity in revocation_observer.discover_groups(
+                            revocation_observer.read_proc_table(uid=os.geteuid()),
+                            [self.mirror_proc.pid],
+                        )
+                    }
+                    observer = None
+                    evidence.enter_phase("group_observer_arm")
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        pending = pool.submit(self.mirror_http, prepare_path, int_token, "POST", b"")
+                        arrival_deadline = time.monotonic() + 10
+                        while not entered.exists():
+                            assert not pending.done(), "prepare-dependencies ended early"
+                            assert time.monotonic() < arrival_deadline, "mirror did not reach paused origin fetch"
+                            time.sleep(0.02)
+                        observer = revocation_observer.ProcGroupObserver(
+                            [self.mirror_proc.pid]
+                        ).arm(exclude_pgids=baseline)
+                        observer.start(max_duration_s=5.0)
+                        evidence.finish_phase("group_observer_arm")
+                        evidence.enter_phase("trigger_commit")
+                        trigger, _ = revocation_timing.TriggerInterval.measure(
+                            "webhook_delete",
+                            lambda: self.expect(
+                                f"/api/repos/alice/demo/webhooks/{hook_id}",
+                                200,
+                                token=self.alice,
+                                method="DELETE",
+                            ),
+                        )
+                        evidence.set_timestamp("trigger_before_ns", trigger.t_before_ns)
+                        evidence.set_timestamp("trigger_after_ns", trigger.t_after_ns)
+                        evidence.finish_phase("trigger_commit")
+                        deadline_ns = trigger.deadline_ns(1200)
+                        evidence.enter_phase("transport_stop_observe")
+                        prep_status, _prep_body, _ = pending.result(timeout=8)
+                        pending_ns = time.monotonic_ns()
+                        evidence.finish_phase("transport_stop_observe")
+                        evidence.enter_phase("group_quiescence")
+                        observer_deadline_ns = deadline_ns + 100_000_000
+                        revocation_observer.wait_for_quiescence_until(
+                            observer, observer_deadline_ns
+                        )
+                        observer.stop()
+                        evidence.finish_phase("group_quiescence")
+                    assert prep_status in (401, 403, 500, 502, 503), f"unexpected prepare status {prep_status}"
+                    group_ok = observer.proven(trigger.t_before_ns, deadline_ns)
+                    abort_ok = pending_ns <= deadline_ns
+                    abort_elapsed = (pending_ns - trigger.t_before_ns) / 1_000_000_000
+                    group_sanity_ok = True
+                    evidence.enter_phase("group_cleanup_sanity")
+                    try:
+                        observer.wait_no_live(timeout_s=2.5)
+                    except AssertionError:
+                        group_sanity_ok = False
+                    evidence.finish_phase("group_cleanup_sanity")
+                    abort_report = {
+                        "configured_bound_ms": 1200,
+                        "trigger": trigger.report(),
+                        "prepare_status_actual": prep_status,
+                        "response_after_trigger_ms": round((pending_ns - trigger.t_before_ns) / 1_000_000, 3),
+                        "response_within_deadline": abort_ok,
+                        "git_group": observer.report(trigger.t_before_ns),
+                        "git_group_within_deadline": group_ok,
+                        "post_transfer_group_stopped": group_sanity_ok,
+                        "configured_bound_proven": bool(abort_ok and group_ok and group_sanity_ok),
+                    }
+                    child.set_http_status(prep_status)
+                    child.set_timestamp("stop_ns", pending_ns)
+                    child.set_metric(
+                        "client_stop_after_lower_ms",
+                        round((pending_ns - trigger.t_before_ns) / 1_000_000, 3),
                     )
-                }
-                observer = None
-                with ThreadPoolExecutor(max_workers=1) as pool:
-                    pending = pool.submit(self.mirror_http, prepare_path, int_token, "POST", b"")
-                    arrival_deadline = time.monotonic() + 10
-                    while not entered.exists():
-                        assert not pending.done(), "prepare-dependencies ended early"
-                        assert time.monotonic() < arrival_deadline, "mirror did not reach paused origin fetch"
-                        time.sleep(0.02)
-                    observer = revocation_observer.ProcGroupObserver(
-                        [self.mirror_proc.pid]
-                    ).arm(exclude_pgids=baseline)
-                    observer.start(max_duration_s=5.0)
-                    trigger, _ = revocation_timing.TriggerInterval.measure(
-                        "webhook_delete",
-                        lambda: self.expect(
-                            f"/api/repos/alice/demo/webhooks/{hook_id}",
-                            200,
-                            token=self.alice,
-                            method="DELETE",
-                        ),
+                    child.set_group(observer.report(trigger.t_before_ns))
+                    child.set_proof_components({
+                        "client_stop_within_deadline": abort_ok,
+                        "git_group_within_deadline": group_ok,
+                        "group_post_sanity": group_sanity_ok,
+                    })
+                    evidence.enter_phase("final_bound_assert")
+                    assert abort_report["configured_bound_proven"], "mirror prepare abort bound not proven"
+                    evidence.finish_phase("final_bound_assert")
+                    child.set_transport_proof(True)
+                    child.set_final_proof(True)
+                    evidence.finish_subcase("mirror_source_token_abort", child)
+                    evidence.enter_phase("post_revocation_denial")
+                    self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
+
+                    # Release primary stub and verify revoked job NEVER falls back to ROOTYARD_CI_MIRROR_SOURCE_TOKEN.
+                    pause_enabled.unlink(missing_ok=True)
+                    release.touch()
+                    self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
+
+                    repo_mirror_dir = self.root / "mirror-data" / "repos" / self.repo["id"]
+                    assert not (repo_mirror_dir / "job-views" / f"1-{bypass_oid}.git").exists()
+                    assert not list(repo_mirror_dir.glob(".ci-*")), "stale temporary staging artifacts leaked"
+
+                    entered.unlink(missing_ok=True)
+                    release.unlink(missing_ok=True)
+                    pause_enabled.touch()
+                    retry_status, _, _ = self.mirror_http(prepare_path, int_token, method="POST", body=b"")
+                    assert retry_status in (401, 403), retry_status
+                    assert not entered.exists(), "revoked integration triggered origin fetch with mirror source token"
+                    # A normal PAT (even one matching ROOTYARD_CI_MIRROR_SOURCE_TOKEN) cannot use
+                    # integration-scoped CI checkout endpoints, and the unsynced commit remains
+                    # absent on the mirror (`409`) without triggering an origin fetch.
+                    self.mirror_expect(prepare_path, (401, 403), token=self.alice, method="POST", body=b"")
+                    self.mirror_expect(
+                        self.path(bypass_oid) + "/info/lfs/objects/batch",
+                        (401, 403),
+                        token=self.alice,
+                        method="POST",
+                        body={"operation": "download", "objects": [{"oid": "0" * 64, "size": 1}]},
                     )
-                    deadline_ns = trigger.deadline_ns(1200)
-                    prep_status, _prep_body, _ = pending.result(timeout=8)
-                    pending_ns = time.monotonic_ns()
-                    observer_deadline_ns = deadline_ns + 100_000_000
-                    revocation_observer.wait_for_quiescence_until(
-                        observer, observer_deadline_ns
-                    )
-                    observer.stop()
-                assert prep_status in (401, 403, 500, 502, 503), f"unexpected prepare status {prep_status}"
-                group_ok = observer.proven(trigger.t_before_ns, deadline_ns)
-                abort_ok = pending_ns <= deadline_ns
-                abort_elapsed = (pending_ns - trigger.t_before_ns) / 1_000_000_000
-                group_sanity_ok = True
-                try:
-                    observer.wait_no_live(timeout_s=2.5)
-                except AssertionError:
-                    group_sanity_ok = False
-                abort_report = {
-                    "configured_bound_ms": 1200,
-                    "trigger": trigger.report(),
-                    "prepare_status_actual": prep_status,
-                    "response_after_trigger_ms": round((pending_ns - trigger.t_before_ns) / 1_000_000, 3),
-                    "response_within_deadline": abort_ok,
-                    "git_group": observer.report(trigger.t_before_ns),
-                    "git_group_within_deadline": group_ok,
-                    "post_transfer_group_stopped": group_sanity_ok,
-                    "configured_bound_proven": bool(abort_ok and group_ok and group_sanity_ok),
-                }
-                assert abort_report["configured_bound_proven"], "mirror prepare abort bound not proven"
-                self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
-
-                # Release primary stub and verify revoked job NEVER falls back to ROOTYARD_CI_MIRROR_SOURCE_TOKEN.
-                pause_enabled.unlink(missing_ok=True)
-                release.touch()
-                self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
-
-                repo_mirror_dir = self.root / "mirror-data" / "repos" / self.repo["id"]
-                assert not (repo_mirror_dir / "job-views" / f"1-{bypass_oid}.git").exists()
-                assert not list(repo_mirror_dir.glob(".ci-*")), "stale temporary staging artifacts leaked"
-
-                entered.unlink(missing_ok=True)
-                release.unlink(missing_ok=True)
-                pause_enabled.touch()
-                retry_status, _, _ = self.mirror_http(prepare_path, int_token, method="POST", body=b"")
-                assert retry_status in (401, 403), retry_status
-                assert not entered.exists(), "revoked integration triggered origin fetch with mirror source token"
-                # A normal PAT (even one matching ROOTYARD_CI_MIRROR_SOURCE_TOKEN) cannot use
-                # integration-scoped CI checkout endpoints, and the unsynced commit remains
-                # absent on the mirror (`409`) without triggering an origin fetch.
-                self.mirror_expect(prepare_path, (401, 403), token=self.alice, method="POST", body=b"")
-                self.mirror_expect(
-                    self.path(bypass_oid) + "/info/lfs/objects/batch",
-                    (401, 403),
-                    token=self.alice,
-                    method="POST",
-                    body={"operation": "download", "objects": [{"oid": "0" * 64, "size": 1}]},
-                )
-                assert not entered.exists(), "source-token probe triggered origin fetch"
-                self.mirror_expect(self.advertise(bypass_oid), 409, token=self.alice)
-                self.mirror_expect(self.advertise(bypass_oid), (401, 403), token=int_token)
+                    assert not entered.exists(), "source-token probe triggered origin fetch"
+                    self.mirror_expect(self.advertise(bypass_oid), 409, token=self.alice)
+                    self.mirror_expect(self.advertise(bypass_oid), (401, 403), token=int_token)
+                    evidence.finish_phase("post_revocation_denial")
+                    evidence.enter_phase("scoped_service_restore")
+            except Exception as error:
+                if child.subcase_state == "started":
+                    child.fail_exception(error)
+                    evidence.finish_subcase("mirror_source_token_abort", child)
+                raise
         finally:
             pause_enabled.unlink(missing_ok=True)
             release.touch()
+        evidence.finish_phase("scoped_service_restore")
+        evidence.set_final_proof(True)
         return {
             "mirror_source_token_abort": abort_report,
             "mirror_source_token_aborted_within_bound": abort_report["configured_bound_proven"],
@@ -1359,7 +1517,18 @@ def main():
                      "deleted_source_ref_and_primary_offline",
                      "bounded_active_transfer_revocation",
                      "mirror_cannot_bypass_revocation_via_origin"):
-            harness.case(name, getattr(harness, name))
+            if name == "bounded_active_transfer_revocation":
+                harness.run_case_with_partial(
+                    name, harness.bounded_active_transfer_revocation,
+                    revocation_failure.BOUNDED_SUBCASES,
+                )
+            elif name == "mirror_cannot_bypass_revocation_via_origin":
+                harness.run_case_with_partial(
+                    name, harness.mirror_cannot_bypass_revocation_via_origin,
+                    revocation_failure.MIRROR_SUBCASES,
+                )
+            else:
+                harness.case(name, getattr(harness, name))
         success = True
     except Exception as error:
         print(harness.redact(error), file=sys.stderr)

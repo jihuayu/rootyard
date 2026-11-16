@@ -51,14 +51,12 @@ def _owned_group_ids(service_pids, uid=None):
     table = read_proc_table(uid=uid)
     return {identity.pgid for identity in discover_groups(table, service_pids)}
 
-
 def _sleep_until(target_ns):
     while True:
         remaining = target_ns - time.monotonic_ns()
         if remaining <= 0:
             return
         time.sleep(min(remaining / 1_000_000_000, 0.05))
-
 
 def _ms(ns):
     return round(ns / NS_PER_MS, 3)
@@ -72,6 +70,7 @@ def _reader_stop_or_fail(evidence, trigger_state, *, timed_out, received, now_ns
         evidence.mark_unproven()
         stop = StopObservation(StopKind.TIMEOUT, now_ns, received)
         evidence.set_stop(stop.report())
+        evidence.finish_phase("transport_stop_observe")
         return stop
     if not trigger_state.get("reader_finished"):
         evidence.fail("transport_stop_observe", "reader_missing_completion")
@@ -89,6 +88,7 @@ def _reader_stop_or_fail(evidence, trigger_state, *, timed_out, received, now_ns
         evidence.fail("transport_stop_observe", "reader_missing_completion")
         raise evidence.safe_failure("reader_missing_completion")
     evidence.set_stop(stop.report())
+    evidence.finish_phase("transport_stop_observe")
     return stop
 
 

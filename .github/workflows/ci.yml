@@ -498,6 +498,8 @@ jobs:
             --harness tests/transfer_revocation_git_source.py \
             --harness tests/transfer_revocation_probe.py \
             --harness tests/transfer_revocation_transport.py \
+            --harness tests/transfer_revocation_failure.py \
+            --harness tests/test_transfer_revocation_failure.py \
             --harness tests/ci_source_pins.py \
             --harness tests/ci_mirror.py \
             --harness tests/metrics.py \

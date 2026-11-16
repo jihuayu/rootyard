@@ -448,7 +448,7 @@ class FailureEvidence:
         self._subcases[name] = child
         return child
 
-    def subcase(self, name):
+    def get_subcase(self, name):
         return self._subcases.get(name)
 
     def finish_subcase(self, name, child=None):
