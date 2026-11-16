@@ -2,7 +2,7 @@ use super::{
     DEFAULT_CIPHER_SUITE, KmsEnvelopeRecord, LifecycleEvaluateOptions, LifecycleEvaluationReport,
     LifecyclePolicy, LifecycleStatusReport, build_envelope_record, compute_fragmentation_metrics,
     crypto, db, envelope_file_path, evict_cold_pack_local, provider,
-    read_and_verify_envelope_file, rotate_kms_key, valid_cipher_suite, valid_encryption_mode,
+    rotate_kms_key, valid_cipher_suite, valid_encryption_mode,
     valid_kms_key_id, verify_envelope_record, write_envelope_file,
 };
 use super::super::{Config, Pack, object_store, repack};
@@ -269,15 +269,22 @@ pub(super) async fn evaluate_lifecycle_inner(
                     let _ = write_envelope_file(&config.root, &cur_env);
                     cur_env
                 } else {
+                    // Config-backed DB authority has no implicit legacy-file
+                    // adoption. A store manifest or envelope file without a
+                    // committed DB row is a partial prior publication and must
+                    // fail closed rather than overwrite DB authority.
+                    let store_manifest = s_root.join(object_store::manifest_key(repo, pack.id));
                     let disk = envelope_file_path(&config.root, repo, pack.id);
-                    if s_root.join(object_store::manifest_key(repo, pack.id)).is_file() && disk.is_file() {
-                        let cur_env = read_and_verify_envelope_file(&config.root, repo, pack.id)?;
-                        db::upsert_envelope_in_db(c, &cur_env).await?;
-                        let _ = write_envelope_file(&config.root, &cur_env);
-                        cur_env
-                    } else {
-                        object_store::put_pack_and_seal_with_suite(config, repo, pack.id, suite, tier).await?
+                    if store_manifest.is_file() || disk.is_file() {
+                        return Err(fenced(format!(
+                            "DB-authoritative lifecycle evaluation refuses pack {}: a store manifest or KMS envelope file exists without a committed DB envelope; refusing implicit legacy-file adoption",
+                            pack.id
+                        )));
                     }
+                    // A brand-new unpublished pack may create a fresh
+                    // authority through the ordinary checkpoint-aware gated
+                    // publisher; it never adopts an existing file envelope.
+                    object_store::put_pack_and_seal_with_suite(config, repo, pack.id, suite, tier).await?
                 }
             } else {
                 ensure_no_authenticated_envelope(c, &config.root, &s_root, repo, pack).await?;
