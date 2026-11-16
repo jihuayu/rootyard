@@ -89,6 +89,29 @@ async fn pair_count(client: &Client, repo: Uuid) -> (i64, i64) {
     (manifests, envelopes)
 }
 
+async fn pack_pair_count(client: &Client, repo: Uuid, pack_id: Uuid) -> (i64, i64) {
+    let manifests: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pando_lab.object_store_manifests WHERE repo=$1 AND pack_id=$2",
+            &[&repo, &pack_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let envelopes: i64 = client
+        .query_one("SELECT count(*) FROM pando_lab.kms_envelopes WHERE repo=$1 AND pack_id=$2", &[&repo, &pack_id])
+        .await
+        .unwrap()
+        .get(0);
+    (manifests, envelopes)
+}
+
+fn replace_physical_file(path: &Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_first_pair_exact_retry_conflicts_and_partial_pairs_fail_closed() {
@@ -329,6 +352,84 @@ async fn pg_shared_gate_pins_selected_target_and_blocks_exclusive_rotation() {
     assert_eq!(envelope.key_id, active.to_key_id);
     assert_eq!(envelope.key_version, active.expected_version());
     assert_eq!(pair_count(&admin, repo).await, (1, 1));
+
+    cleanup(&admin, repo).await;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
+async fn pg_db_retry_rejects_missing_or_corrupt_physical_artifacts() {
+    let Some((config, root)) = config_for("physical-retry") else {
+        return;
+    };
+    let admin = connect(&config).await;
+    let repo = Uuid::new_v4();
+    admin.execute("INSERT INTO pando_lab.repositories(id) VALUES($1)", &[&repo]).await.unwrap();
+    let opts = options();
+
+    for (label, mutation) in [
+        ("missing-manifest", "missing"),
+        ("corrupt-manifest", "corrupt-manifest"),
+        ("corrupt-cipher", "corrupt-cipher"),
+        ("corrupt-idx", "corrupt-idx"),
+        ("different-manifest", "different-manifest"),
+    ] {
+        let pack_id = Uuid::new_v4();
+        write_fixture(&config.root.join("objects"), repo, pack_id, label.as_bytes());
+        let (report, _) = super::put_pack_db_inner(&config, repo, pack_id, &opts, "hot").await.unwrap();
+        assert_eq!(pack_pair_count(&admin, repo, pack_id).await, (1, 1), "{label}");
+        let mirror_path = lifecycle::envelope_file_path(&config.root, repo, pack_id);
+        let mirror_before = std::fs::read(&mirror_path).unwrap();
+        let cipher_path = PathBuf::from(&report.bucket_pack_path);
+        let idx_path = PathBuf::from(&report.bucket_idx_path);
+        let manifest_path = PathBuf::from(&report.manifest_path);
+
+        match mutation {
+            "missing" => std::fs::remove_file(&manifest_path).unwrap(),
+            "corrupt-manifest" => replace_physical_file(&manifest_path, b"{"),
+            "corrupt-cipher" => {
+                let mut cipher = std::fs::read(&cipher_path).unwrap();
+                cipher[0] ^= 0xff;
+                replace_physical_file(&cipher_path, &cipher);
+            }
+            "corrupt-idx" => {
+                let mut idx = std::fs::read(&idx_path).unwrap();
+                idx[0] ^= 0xff;
+                replace_physical_file(&idx_path, &idx);
+            }
+            "different-manifest" => {
+                let mut different: super::CasPackManifest =
+                    serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+                different.chunk_size += 1;
+                different.manifest_sha256 = delta::sha256_hex(&serde_json::to_vec(&different).unwrap());
+                replace_physical_file(&manifest_path, &serde_json::to_vec_pretty(&different).unwrap());
+            }
+            other => panic!("unknown physical mutation {other}"),
+        }
+
+        let cipher_after_mutation = std::fs::read(&cipher_path).ok();
+        let idx_after_mutation = std::fs::read(&idx_path).ok();
+        let manifest_after_mutation = std::fs::read(&manifest_path).ok();
+        let retry = super::put_pack_db_inner(&config, repo, pack_id, &opts, "hot").await;
+        assert!(retry.is_err(), "{label} retry must fail closed");
+        assert_eq!(pack_pair_count(&admin, repo, pack_id).await, (1, 1), "{label}");
+        assert_eq!(std::fs::read(&mirror_path).unwrap(), mirror_before, "{label}");
+        assert_eq!(std::fs::read(&cipher_path).ok(), cipher_after_mutation, "{label}");
+        assert_eq!(std::fs::read(&idx_path).ok(), idx_after_mutation, "{label}");
+        assert_eq!(std::fs::read(&manifest_path).ok(), manifest_after_mutation, "{label}");
+    }
+
+    // An intact exact retry still succeeds and keeps the exact bytes.
+    let pack_id = Uuid::new_v4();
+    write_fixture(&config.root.join("objects"), repo, pack_id, b"intact-retry");
+    let (report, envelope) = super::put_pack_db_inner(&config, repo, pack_id, &opts, "hot").await.unwrap();
+    let cipher_before = std::fs::read(&report.bucket_pack_path).unwrap();
+    let (retry_report, retry_envelope) = super::put_pack_db_inner(&config, repo, pack_id, &opts, "hot").await.unwrap();
+    assert_eq!(retry_report.pack_sha256, report.pack_sha256);
+    assert_eq!(retry_envelope.envelope_id, envelope.envelope_id);
+    assert_eq!(std::fs::read(&retry_report.bucket_pack_path).unwrap(), cipher_before);
+    assert_eq!(pack_pair_count(&admin, repo, pack_id).await, (1, 1));
 
     cleanup(&admin, repo).await;
     let _ = std::fs::remove_dir_all(&root);

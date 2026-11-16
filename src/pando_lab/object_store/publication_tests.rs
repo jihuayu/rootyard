@@ -57,11 +57,9 @@ async fn preparation_stages_immutable_cas_without_envelope_mirror_and_retry_reus
         .is_ok()
     );
     let cipher_before = std::fs::read(&prepared.report().bucket_pack_path).unwrap();
-    for installed in [
-        &prepared.report().bucket_pack_path,
-        &prepared.report().bucket_idx_path,
-        &prepared.report().manifest_path,
-    ] {
+    for installed in
+        [&prepared.report().bucket_pack_path, &prepared.report().bucket_idx_path, &prepared.report().manifest_path]
+    {
         assert_eq!(mode_of(Path::new(installed)), 0o444);
     }
     assert!(install_temp_files(&tmp).is_empty());
@@ -255,4 +253,62 @@ fn immutable_install_conflicts_nonregular_and_link_failures_never_replace_or_lea
     assert!(!long_name.exists());
     assert!(install_temp_files(&dir).is_empty());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn replace_immutable_file(path: &Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[tokio::test]
+async fn physical_artifact_proof_rejects_missing_corrupt_or_different_manifest_files() {
+    let tmp = temp_root("physical-proof");
+    let objects_root = tmp.join("objects");
+    let (repo, pack_id) = (Uuid::new_v4(), Uuid::new_v4());
+    write_fixture(&objects_root, repo, pack_id, b"physical-proof-secret");
+    let opts = options(8);
+    let prepared =
+        prepare_pack_files_sealed(&tmp, &objects_root, repo, pack_id, &opts, "hot", None, None).await.unwrap();
+    let manifest = prepared.manifest().clone();
+    let manifest_path = PathBuf::from(&prepared.report().manifest_path);
+    let cipher_path = PathBuf::from(&prepared.report().bucket_pack_path);
+    let idx_path = PathBuf::from(&prepared.report().bucket_idx_path);
+    let original_manifest = std::fs::read(&manifest_path).unwrap();
+    let original_cipher = std::fs::read(&cipher_path).unwrap();
+    let original_idx = std::fs::read(&idx_path).unwrap();
+
+    super::authority::verify_existing_cas_artifacts(&tmp, &manifest).unwrap();
+
+    std::fs::remove_file(&manifest_path).unwrap();
+    assert!(super::authority::verify_existing_cas_artifacts(&tmp, &manifest).is_err());
+    replace_immutable_file(&manifest_path, &original_manifest);
+
+    replace_immutable_file(&manifest_path, b"{");
+    assert!(super::authority::verify_existing_cas_artifacts(&tmp, &manifest).is_err());
+    replace_immutable_file(&manifest_path, &original_manifest);
+
+    let mut different = manifest.clone();
+    different.chunk_size += 1;
+    different.manifest_sha256 = delta::sha256_hex(&serde_json::to_vec(&different).unwrap());
+    replace_immutable_file(&manifest_path, &serde_json::to_vec_pretty(&different).unwrap());
+    assert!(super::authority::verify_existing_cas_artifacts(&tmp, &manifest).is_err());
+    replace_immutable_file(&manifest_path, &original_manifest);
+
+    let mut corrupt_cipher = original_cipher.clone();
+    corrupt_cipher[0] ^= 0xff;
+    replace_immutable_file(&cipher_path, &corrupt_cipher);
+    assert!(super::authority::verify_existing_cas_artifacts(&tmp, &manifest).is_err());
+    replace_immutable_file(&cipher_path, &original_cipher);
+
+    let mut corrupt_idx = original_idx.clone();
+    corrupt_idx[0] ^= 0xff;
+    replace_immutable_file(&idx_path, &corrupt_idx);
+    assert!(super::authority::verify_existing_cas_artifacts(&tmp, &manifest).is_err());
+    replace_immutable_file(&idx_path, &original_idx);
+
+    super::authority::verify_existing_cas_artifacts(&tmp, &manifest).unwrap();
+    assert_eq!(std::fs::read(&cipher_path).unwrap(), original_cipher);
+    assert_eq!(std::fs::read(&idx_path).unwrap(), original_idx);
+    let _ = std::fs::remove_dir_all(&tmp);
 }

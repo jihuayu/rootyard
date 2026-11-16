@@ -9,7 +9,7 @@
 use super::super::{LIMIT, Pack, delta, lifecycle};
 use super::authority::{
     insert_envelope_if_absent_in_tx, load_existing_pair, report_from_manifest, validate_envelope_record,
-    validate_manifest_record, verify_existing_cas_bytes, verify_fresh_target,
+    validate_manifest_record, verify_existing_cas_artifacts, verify_existing_cas_bytes, verify_fresh_target,
 };
 use super::{
     BACKEND_KIND, CasPackManifest, MANIFEST_SCHEMA, ObjectStorePutOptions, ObjectStorePutReport, idx_key,
@@ -173,6 +173,7 @@ pub(crate) async fn prepare_pack_files_sealed(
         if let Some((manifest, envelope)) =
             load_existing_pair(c, repo, pack_id, &opts.bucket, &pack_sha256, &idx_sha256).await?
         {
+            verify_existing_cas_artifacts(store_root_dir, &manifest)?;
             return Ok(PreparedPackPublication {
                 repo,
                 pack_id,
@@ -303,6 +304,7 @@ pub(crate) async fn prepare_pack_files_sealed(
     manifest.manifest_sha256 = delta::sha256_hex(&serde_json::to_vec(&manifest)?);
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     write_immutable_cas_file(&m_path, &manifest_bytes, &delta::sha256_hex(&manifest_bytes))?;
+    verify_existing_cas_artifacts(store_root_dir, &manifest)?;
     let envelope = lifecycle::build_authenticated_envelope_record(
         repo,
         &Pack { id: pack_id, pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone() },

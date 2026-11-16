@@ -232,6 +232,35 @@ pub(super) fn report_from_manifest(store_root_dir: &Path, manifest: &CasPackMani
     }
 }
 
+/// Prove that the physical immutable manifest and its ciphertext/index still
+/// exactly match the DB-authoritative manifest. This is a filesystem-only
+/// check: it does not select a provider, unwrap a DEK, or repair anything.
+pub(super) fn verify_existing_cas_artifacts(
+    store_root_dir: &Path,
+    authoritative_manifest: &CasPackManifest,
+) -> Result<()> {
+    let manifest_path = store_root_dir.join(&authoritative_manifest.manifest_key);
+    let physical_bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("missing physical CAS manifest {}", manifest_path.display()))?;
+    let physical: CasPackManifest = serde_json::from_slice(&physical_bytes)
+        .with_context(|| format!("malformed physical CAS manifest {}", manifest_path.display()))?;
+    validate_manifest_record(
+        &physical,
+        authoritative_manifest.repo,
+        authoritative_manifest.pack_id,
+        &authoritative_manifest.bucket,
+        &authoritative_manifest.pack_sha256,
+        &authoritative_manifest.idx_sha256,
+    )?;
+    ensure!(
+        physical == *authoritative_manifest,
+        "physical CAS manifest for pack {} differs from the DB authority",
+        authoritative_manifest.pack_id
+    );
+    let _ = verify_existing_cas_bytes(store_root_dir, authoritative_manifest)?;
+    Ok(())
+}
+
 pub(super) fn verify_existing_cas_bytes(store_root_dir: &Path, manifest: &CasPackManifest) -> Result<Vec<u8>> {
     let ciphertext_sha =
         manifest.ciphertext_sha256.as_deref().context("missing ciphertext_sha256 in immutable CAS manifest")?;
