@@ -1,0 +1,65 @@
+name: Tenant-Scoped mTLS Raft RPC Contracts
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/refcas-tenant-rpc.yml'
+      - 'crates/refcas-log/**'
+      - 'docs/refcas-tenant-rpc.md'
+      - 'tests/test_refcas_tenant_rpc_contracts.py'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+jobs:
+  tenant-mtls-rpc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify pure LF line endings on workflow and contracts
+        run: |
+          python3 -c '
+          for p in [".github/workflows/refcas-tenant-rpc.yml", "crates/refcas-log/README.md", "docs/refcas-tenant-rpc.md"]:
+              raw = open(p, "rb").read()
+              assert b"\r" not in raw, f"CRLF forbidden in {p}"
+          '
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/refcas/tenant-rpc-cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Check formatting
+        run: cargo fmt --manifest-path crates/refcas-log/Cargo.toml --all -- --check
+      - name: Check all targets with warnings denied
+        run: cargo clippy --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets -- -D warnings
+      - name: Run full refcas-log unit, tenant mTLS RPC, ReadIndex, and streaming suites
+        run: cargo test --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
+      - name: Run offline tenant RPC contract checks
+        run: python3 -m unittest tests.test_refcas_tenant_rpc_contracts
