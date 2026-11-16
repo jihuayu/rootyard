@@ -1000,13 +1000,101 @@ class Lab:
             c1_path.chmod(0o444)
 
         env_p1_path = self.store / 'object_store' / 'envelopes' / enc_repo / f'{p1}.json'
-        env_p1_orig = env_p1_path.read_bytes()
-        bad_env = json.loads(env_p1_orig.decode())
-        bad_env['envelope_mac'] = '0' * 64
-        env_p1_path.write_text(json.dumps(bad_env))
-        assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
-        env_p1_path.write_bytes(env_p1_orig)
+        cache_dir = self.store / 'objects' / enc_repo
+
+        def evict_mirror_authority_cache():
+            for suffix in ('.pack', '.idx'):
+                path = cache_dir / f'{p1}{suffix}'
+                if path.exists():
+                    path.unlink()
+            assert not (cache_dir / f'{p1}.pack').exists()
+            assert not (cache_dir / f'{p1}.idx').exists()
+
+        # A healthy committed DB envelope rewrites its mirror, so capture the
+        # canonical mirror before introducing isolated tamper fixtures.
+        evict_mirror_authority_cache()
         assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 2
+        env_p1_orig = env_p1_path.read_bytes()
+        assert c1_path.read_bytes() == c1_bytes
+
+        # DB authority: a valid-length envelope_mac mutation must fail closed
+        # even while the mirror remains healthy. translate() is a reversible
+        # bijection, so the fixture never reads or writes the stored MAC value.
+        db_tampered = False
+        try:
+            changed = self.sql(
+                "UPDATE pando_lab.kms_envelopes "
+                "SET envelope_mac = translate(envelope_mac, '0123456789abcdef', '123456789abcdef0') "
+                f"WHERE repo='{enc_repo}' AND pack_id='{p1}' RETURNING pack_id::text"
+            )
+            db_tampered = True
+            assert changed == p1, changed
+            evict_mirror_authority_cache()
+            assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
+            assert not (cache_dir / f'{p1}.pack').exists()
+            assert not (cache_dir / f'{p1}.idx').exists()
+            assert env_p1_path.read_bytes() == env_p1_orig
+            assert c1_path.read_bytes() == c1_bytes
+            evict_mirror_authority_cache()
+            assert self.run([self.binary, 'object-store-get', enc_repo, p1], check=False).returncode != 0
+            assert not (cache_dir / f'{p1}.pack').exists()
+            assert not (cache_dir / f'{p1}.idx').exists()
+            assert env_p1_path.read_bytes() == env_p1_orig
+            assert c1_path.read_bytes() == c1_bytes
+        finally:
+            if db_tampered:
+                restored = self.sql(
+                    "UPDATE pando_lab.kms_envelopes "
+                    "SET envelope_mac = translate(envelope_mac, '123456789abcdef0', '0123456789abcdef') "
+                    f"WHERE repo='{enc_repo}' AND pack_id='{p1}' RETURNING pack_id::text"
+                )
+                assert restored == p1, restored
+            env_p1_path.write_bytes(env_p1_orig)
+            assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 2
+            assert env_p1_path.read_bytes() == env_p1_orig
+
+        # Mirror-only tamper: DB authority must hydrate successfully and repair
+        # the mirror to the validated committed envelope.
+        try:
+            bad_env = json.loads(env_p1_orig.decode())
+            bad_env['envelope_mac'] = bad_env['envelope_mac'].translate(
+                str.maketrans('0123456789abcdef', '123456789abcdef0')
+            )
+            env_p1_path.write_text(json.dumps(bad_env))
+            evict_mirror_authority_cache()
+            repaired = json.loads(self.cli('object-store-get', enc_repo, p1))
+            assert repaired['verified'] is True, repaired
+            assert repaired['cache_hit'] is False, repaired
+            assert repaired['rehydrated_from_object_store'] is True, repaired
+            assert repaired['pack_sha256'] == p1_sha, repaired
+            assert repaired['idx_sha256'] == m1['idx_sha256'], repaired
+            assert hashlib.sha256((cache_dir / f'{p1}.pack').read_bytes()).hexdigest() == p1_sha
+            assert hashlib.sha256((cache_dir / f'{p1}.idx').read_bytes()).hexdigest() == m1['idx_sha256']
+            assert env_p1_path.read_bytes() == env_p1_orig
+            assert c1_path.read_bytes() == c1_bytes
+        finally:
+            env_p1_path.write_bytes(env_p1_orig)
+            assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 2
+
+        # Missing mirror: the same DB authority must recreate it on cold read.
+        try:
+            if env_p1_path.exists():
+                env_p1_path.unlink()
+            assert not env_p1_path.exists()
+            evict_mirror_authority_cache()
+            repaired = json.loads(self.cli('object-store-get', enc_repo, p1))
+            assert repaired['verified'] is True, repaired
+            assert repaired['cache_hit'] is False, repaired
+            assert repaired['rehydrated_from_object_store'] is True, repaired
+            assert repaired['pack_sha256'] == p1_sha, repaired
+            assert repaired['idx_sha256'] == m1['idx_sha256'], repaired
+            assert hashlib.sha256((cache_dir / f'{p1}.pack').read_bytes()).hexdigest() == p1_sha
+            assert hashlib.sha256((cache_dir / f'{p1}.idx').read_bytes()).hexdigest() == m1['idx_sha256']
+            assert env_p1_path.read_bytes() == env_p1_orig
+            assert c1_path.read_bytes() == c1_bytes
+        finally:
+            env_p1_path.write_bytes(env_p1_orig)
+            assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 2
 
         c1_sha = hashlib.sha256(c1_bytes).hexdigest()
         c2_sha = hashlib.sha256(c2_bytes).hexdigest()
