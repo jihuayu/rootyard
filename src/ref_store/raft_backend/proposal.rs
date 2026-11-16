@@ -99,6 +99,9 @@ impl ProposalId {
         if self.storage_generation == 0 {
             return Err(ApplicationError::new("proposal storage_generation must be positive"));
         }
+        if self.expires_at_index().is_none() {
+            return Err(ApplicationError::new("proposal expiry overflows the u64 index space"));
+        }
         Ok(())
     }
 
@@ -221,6 +224,7 @@ pub struct ProposalEnvelope {
 
 impl ProposalEnvelope {
     pub fn encode(proposal_id: &ProposalId, command_payload: &[u8]) -> Result<Vec<u8>, ApplicationError> {
+        proposal_id.validate_shape()?;
         let command = std::str::from_utf8(command_payload)
             .map_err(|_| ApplicationError::new("canonical command payload is not UTF-8 JSON"))?
             .to_owned();
@@ -237,6 +241,9 @@ impl ProposalEnvelope {
 
     /// Returns `None` only when the payload is not a proposal envelope (legacy raw command).
     pub fn decode(payload: &[u8]) -> Result<Option<(ProposalId, Vec<u8>)>, ApplicationError> {
+        if payload.len() > MAX_PROPOSAL_ENVELOPE_BYTES {
+            return Err(ApplicationError::new("proposal envelope exceeds the fixed protocol byte bound"));
+        }
         #[derive(Deserialize)]
         struct Probe {
             format: String,
@@ -246,6 +253,9 @@ impl ProposalEnvelope {
             if probe.format == PROPOSAL_FORMAT {
                 let envelope: Self = serde_json::from_slice(payload)
                     .map_err(|e| ApplicationError::new(format!("decode proposal envelope: {e}")))?;
+                if envelope.proposal_id.group_id.len() > 64 {
+                    return Err(ApplicationError::new("proposal group_id exceeds the fixed protocol bound"));
+                }
                 let command = envelope.command.into_bytes();
                 let actual = command_digest_hex(&command);
                 if actual != envelope.command_digest_hex {
@@ -279,6 +289,9 @@ pub enum ProposalAttemptKind {
 pub struct ProposalAttempt {
     pub proposal_id: Option<ProposalId>,
     pub command_digest_hex: String,
+    /// First-decision coordinate for replay/conflict. For a self-contained `Expired` decision this
+    /// is an internal observed-coordinate sentinel only; public proposal outcomes must not expose
+    /// it as an original historic coordinate.
     pub original_log_id: ApplicationLogId,
     pub observed_log_id: ApplicationLogId,
     pub kind: ProposalAttemptKind,
@@ -332,6 +345,29 @@ pub struct ProposalOutcome {
     pub outcome: Option<RootRefCasOutcome>,
 }
 
+impl ProposalOutcome {
+    /// Public mapping for an exact retained attempt. An Expired decision exposes the current
+    /// observed retry coordinate as `log_id` but never fabricates an original history coordinate.
+    pub(crate) fn from_attempt(proposal_id: ProposalId, log_id: ApplicationLogId, attempt: &ProposalAttempt) -> Self {
+        if attempt.kind == ProposalAttemptKind::Expired {
+            return Self::expired(proposal_id, log_id);
+        }
+        Self {
+            proposal_id,
+            log_id,
+            original_log_id: Some(attempt.original_log_id),
+            decision: attempt.kind,
+            outcome: Some(attempt.outcome.clone()),
+        }
+    }
+
+    /// Public Expired response: the retry's observed coordinate is exact, but no original
+    /// coordinate or historic business outcome is invented.
+    pub(crate) fn expired(proposal_id: ProposalId, log_id: ApplicationLogId) -> Self {
+        Self { proposal_id, log_id, original_log_id: None, decision: ProposalAttemptKind::Expired, outcome: None }
+    }
+}
+
 /// Canonical command digest bound into the proposal envelope and receipts.
 pub fn command_digest_hex(payload: &[u8]) -> String {
     hex::encode(Sha256::digest(payload))
@@ -341,6 +377,8 @@ pub fn command_digest_hex(payload: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::ref_store::core::state_machine::NoopCommand;
+    use crate::ref_store::raft_backend::outcome::{RootRefCasRefusal, RootRefCasRefusalKind};
+    use rootyard_refcas_log::state_machine::ApplicationLogId;
 
     fn id(issued: u64) -> ProposalId {
         ProposalId::new(
@@ -383,5 +421,70 @@ mod tests {
         let mut tampered = serde_json::from_slice::<serde_json::Value>(&envelope).unwrap();
         tampered["command_digest_hex"] = serde_json::Value::String("00".repeat(32));
         assert!(ProposalEnvelope::decode(&serde_json::to_vec(&tampered).unwrap()).is_err());
+    }
+
+    #[test]
+    fn expiry_overflow_is_rejected_by_shared_validation_before_encode() {
+        let max_valid = id(u64::MAX - PROPOSAL_WINDOW);
+        assert_eq!(max_valid.expires_at_index(), Some(u64::MAX));
+        let overflow_issued = u64::MAX - PROPOSAL_WINDOW + 1;
+        let mut manual = id(0);
+        manual.issued_at_index = overflow_issued;
+        assert!(manual.validate_shape().is_err());
+        assert!(ProposalEnvelope::encode(&manual, b"{}").is_err());
+        assert!(
+            ProposalId::new(
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+                "group-a",
+                1,
+                Uuid::from_u128(4),
+                1,
+                1,
+                GitObjectFormat::Sha256,
+                overflow_issued,
+                Uuid::from_u128(5),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn decode_rejects_structural_oversize_before_semantic_validation() {
+        let envelope = ProposalEnvelope::encode(&id(0), b"{}").unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        value["proposal_id"]["group_id"] = serde_json::Value::String("g".repeat(65));
+        let oversized_group = serde_json::to_vec(&value).unwrap();
+        assert!(ProposalEnvelope::decode(&oversized_group).is_err());
+        assert!(ProposalEnvelope::decode(&vec![0u8; MAX_PROPOSAL_ENVELOPE_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn expired_public_outcome_hides_the_internal_observed_sentinel() {
+        let log_id = ApplicationLogId::new(1, 7);
+        let attempt = ProposalAttempt {
+            proposal_id: Some(id(0)),
+            command_digest_hex: "00".repeat(32),
+            original_log_id: log_id,
+            observed_log_id: log_id,
+            kind: ProposalAttemptKind::Expired,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(RootRefCasRefusalKind::ProposalExpired)),
+        };
+        let outcome = ProposalOutcome::from_attempt(id(0), log_id, &attempt);
+        assert_eq!(outcome.log_id, log_id);
+        assert_eq!(outcome.original_log_id, None);
+        assert_eq!(outcome.decision, ProposalAttemptKind::Expired);
+        assert_eq!(outcome.outcome, None);
+        assert_eq!(ProposalOutcome::expired(id(0), log_id).original_log_id, None);
+
+        let ordinary = ProposalAttempt {
+            kind: ProposalAttemptKind::First,
+            outcome: RootRefCasOutcome::Refused(RootRefCasRefusal::from_kind(RootRefCasRefusalKind::InvalidInput)),
+            ..attempt
+        };
+        let ordinary = ProposalOutcome::from_attempt(id(0), log_id, &ordinary);
+        assert_eq!(ordinary.original_log_id, Some(log_id));
+        assert!(ordinary.outcome.is_some());
     }
 }

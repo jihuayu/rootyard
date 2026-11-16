@@ -637,6 +637,7 @@ mod tests {
         app.apply(expired_log, &payload).unwrap();
         let attempt = app.query_attempt(expired_log).expect("expired attempt retained");
         assert_eq!(attempt.kind, ProposalAttemptKind::Expired);
+        assert_eq!(attempt.original_log_id, expired_log, "internal self-coordinate sentinel");
         assert!(matches!(
             &attempt.outcome,
             RootRefCasOutcome::Refused(refusal) if refusal.kind == RootRefCasRefusalKind::ProposalExpired
@@ -646,6 +647,39 @@ mod tests {
         let later_log = ApplicationLogId::new(1, PROPOSAL_WINDOW + 4);
         app.apply(later_log, &payload).unwrap();
         assert_eq!(app.query_attempt(later_log).expect("later expired attempt").kind, ProposalAttemptKind::Expired);
+
+        // Retain the late Expired attempt through its own observed window, then deterministically
+        // prune it; the stable ID still reports Expired and never executes again.
+        for index in later_log.index + 1..=later_log.index + PROPOSAL_WINDOW + 1 {
+            app.advance_applied(ApplicationLogId::new(1, index)).unwrap();
+        }
+        assert!(app.query_attempt(expired_log).is_none());
+        assert!(app.query_attempt(later_log).is_none());
+        assert!(matches!(app.query_proposal(&proposal_id(repo, tenant, history, 0)), ProposalLookup::Expired { .. }));
+    }
+
+    #[test]
+    fn structural_oversized_proposal_is_fatal_before_staging() {
+        let mut app = RootRefCasStateMachine::new();
+        let repo = Uuid::from_u128(10);
+        let tenant = Uuid::from_u128(20);
+        let history = Uuid::from_u128(30);
+        let payload = ProposalEnvelope::encode(
+            &proposal_id(repo, tenant, history, 0),
+            &encode_command(&RefCasCommand::Noop(NoopCommand { logical_tick: None })).unwrap(),
+        )
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        value["proposal_id"]["group_id"] = serde_json::Value::String("g".repeat(65));
+        let oversized = serde_json::to_vec(&value).unwrap();
+        let error = app.apply(ApplicationLogId::new(1, 1), &oversized).unwrap_err();
+        assert!(error.to_string().contains("group_id"));
+        assert_eq!(app.last_applied_coordinate(), None);
+        assert_eq!(app.retained_attempt_count(), 0);
+
+        let mut overflowing = proposal_id(repo, tenant, history, 0);
+        overflowing.issued_at_index = u64::MAX - PROPOSAL_WINDOW + 1;
+        assert!(matches!(app.query_proposal(&overflowing), ProposalLookup::Invalid { .. }));
     }
 
     #[test]

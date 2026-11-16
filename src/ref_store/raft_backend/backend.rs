@@ -218,15 +218,7 @@ impl RootRaftRefCasBackend {
                     if attempt.command_digest_hex != digest_hex {
                         return Err(RaftBackendError::OutcomeDigestMismatch(log_id));
                     }
-                    let outcome =
-                        if attempt.kind == ProposalAttemptKind::Expired { None } else { Some(attempt.outcome.clone()) };
-                    return Ok(ProposalOutcome {
-                        proposal_id,
-                        log_id,
-                        original_log_id: Some(attempt.original_log_id),
-                        decision: attempt.kind,
-                        outcome,
-                    });
+                    return Ok(ProposalOutcome::from_attempt(proposal_id, log_id, attempt));
                 }
                 match reducer.query_proposal(&proposal_id) {
                     ProposalLookup::Found { original_log_id, outcome, .. } => Ok(ProposalOutcome {
@@ -236,13 +228,7 @@ impl RootRaftRefCasBackend {
                         decision: ProposalAttemptKind::First,
                         outcome: Some(outcome),
                     }),
-                    ProposalLookup::Expired { .. } => Ok(ProposalOutcome {
-                        proposal_id,
-                        log_id,
-                        original_log_id: None,
-                        decision: ProposalAttemptKind::Expired,
-                        outcome: None,
-                    }),
+                    ProposalLookup::Expired { .. } => Ok(ProposalOutcome::expired(proposal_id, log_id)),
                     ProposalLookup::NotObserved { .. } => Err(RaftBackendError::RecoveryNotObserved(proposal_id)),
                     ProposalLookup::Invalid { reason, .. } => Err(RaftBackendError::InvalidProposal(reason)),
                 }
