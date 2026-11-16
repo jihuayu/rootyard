@@ -1,0 +1,268 @@
+"""Offline contract tests for the Rubicon mixed workload & scaling harness (Refs #164)."""
+
+from __future__ import annotations
+
+import copy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from unittest.mock import patch
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from rubicon_workload.corpus import DATASET_CLASSES, generate_repo_corpus, parse_push_porcelain  # noqa: E402
+from rubicon_workload.report import (  # noqa: E402
+    compute_overlap_metrics,
+    find_secret_leaks,
+    percentile_stats,
+    render_summary_markdown,
+    validate_report,
+)
+from rubicon_workload.runner import PreflightError, WorkloadConfig, _preflight  # noqa: E402
+from rubicon_workload.workloads import S3MeterProxy  # noqa: E402
+
+
+def _valid_sample_report() -> dict:
+    tier_base = {
+        "compute_processes": 1,
+        "wall_seconds": 8.5,
+        "committed_ops_per_sec": 3.2941,
+        "outcomes": {"total_ops": 35, "committed_success": 28, "typed_refusal": 6, "unknown_outcome": 1},
+        "independent_ref_overlap": {
+            "total_ops": 6,
+            "max_concurrent_overlap": 4,
+            "overlapped_pairs": 7,
+            "wall_span_ms": 420.0,
+            "sum_op_durations_ms": 1320.0,
+        },
+        "cas_race": {"participants": 4, "winner_count": 1, "loser_refused": 3, "false_ok": 0, "remote_ref_matches_winner": True},
+        "atomic_vs_subset": {"atomic_rejected_unchanged": True, "subset_partial_exact": True, "atomic_positive_committed": True},
+        "ci_read_amplification": {"burst_latencies": percentile_stats([45.0, 52.0, 61.0, 65.0]), "s3_wire": {"observed": True, "get_requests": 12, "get_bytes": 4096}},
+        "cold_vs_warm": {
+            "cold_clone": percentile_stats([120.0, 145.0]),
+            "warm_clone": percentile_stats([72.0, 88.0]),
+            "cold_browse": percentile_stats([18.0, 22.0]),
+            "warm_browse": percentile_stats([11.0, 14.0]),
+        },
+        "fault_revocation_window": {"total_attempts": 3, "committed_success": 0, "typed_refusal": 2, "unknown_outcome": 1},
+        "audit": {"acked_targets_total": 18, "verified_exact": 18, "fsck_failed": 0, "ref_mismatch": 0},
+        "storage_accounting": {
+            "pack_count": 20,
+            "publication_count": 23,
+            "serving_pack_bytes": 950000,
+            "coexisting_pack_bytes": 1100000,
+            "uncommitted_or_stale_registered_bytes": 150000,
+            "gc_executed": False,
+            "gc_reclaimed_physical_bytes": 0,
+            "physical_savings_claimed": False,
+        },
+        "s3_wire": {"observed": True, "get_requests": 30, "get_bytes": 1500000, "put_requests": 46, "put_bytes": 1100000},
+        "resource_peaks": {"cpu_seconds_total": 1.85, "max_total_rss_kib": 48120, "max_total_hwm_kib": 49000, "max_temp_disk_bytes": 655360, "max_pg_active": 3, "max_pg_lock_waiters": 0},
+        "latency_by_op_class": {"concurrent_push": percentile_stats([90.0, 130.0]), "cold_clone": percentile_stats([120.0, 145.0])},
+        "latency_by_dataset_class": {ds: percentile_stats([80.0, 110.0]) for ds in DATASET_CLASSES},
+        "time_series": [
+            {"t_ms": 0, "pack_count": 6, "coexisting_pack_bytes": 250000, "serving_pack_bytes": 250000, "active_serving_reads": 0, "pending_ops": 0},
+            {"t_ms": 400, "pack_count": 20, "coexisting_pack_bytes": 1100000, "serving_pack_bytes": 950000, "active_serving_reads": 2, "pending_ops": 0},
+        ],
+    }
+    tier2 = copy.deepcopy(tier_base)
+    tier2["compute_processes"] = 2
+    tier2["committed_ops_per_sec"] = 4.5
+    return {
+        "schema_version": "rootyard/rubicon-mixed-workload/v1",
+        "issue": "#164",
+        "measurement_kind": "native_execution",
+        "simulated": False,
+        "seed": 16420261116,
+        "source": {"commit": "a" * 40, "dirty": False},
+        "binary": {"path": "/tmp/rootyard", "sha256": "b" * 64, "size_bytes": 123456, "receipt_verified": True},
+        "tools": {"git": "git version 2.56.1", "postgres": "PostgreSQL 17.0"},
+        "hardware": {"logical_cpus": 4, "machine": "x86_64"},
+        "topology": "1..2 serve-blob processes sharing one PG schema + one S3 provider",
+        "tiers": [tier_base, tier2],
+        "scaling_comparison": {"ratios": {"throughput_ratio_2_vs_1": 1.366}, "bottlenecks": ["single host contention"]},
+        "limitations": ["Single host shared PG + S3"],
+    }
+
+
+class RubiconCorpusAndMetricsTests(unittest.TestCase):
+    def test_deterministic_corpus_covers_all_dataset_classes_and_fits_quotas(self) -> None:
+        for ds in DATASET_CLASSES:
+            seed_a, delta_a = generate_repo_corpus(ds, seed=164, repo_index=0, variant_index=1)
+            seed_b, delta_b = generate_repo_corpus(ds, seed=164, repo_index=0, variant_index=1)
+            self.assertEqual(seed_a, seed_b)
+            self.assertEqual(delta_a, delta_b)
+            self.assertGreaterEqual(len(seed_a), 1)
+            self.assertGreaterEqual(len(delta_a), 3)
+            total_raw = sum(c.raw_bytes for c in seed_a + delta_a)
+            self.assertLess(total_raw, 4 * 1024 * 1024, f"{ds} raw payload exceeds 4 MiB Browse bound")
+
+    def test_overlap_and_porcelain_and_percentiles(self) -> None:
+        overlap = compute_overlap_metrics([(100, 500), (150, 450), (600, 900)])
+        self.assertEqual(overlap["max_concurrent_overlap"], 2)
+        self.assertEqual(overlap["overlapped_pairs"], 1)
+
+        parsed = parse_push_porcelain(
+            "*\tHEAD:refs/heads/main\t[new branch]\n"
+            "!\tHEAD:refs/heads/protected\t[rejected] (non-fast-forward)\n"
+        )
+        self.assertEqual([e["flag"] for e in parsed], ["*", "!"])
+        self.assertEqual([e["target"] for e in parsed], ["refs/heads/main", "refs/heads/protected"])
+
+        stats = percentile_stats([10.0, 20.0, 30.0, 40.0, 50.0])
+        self.assertEqual(stats["min_ms"], 10.0)
+        self.assertEqual(stats["p50_ms"], 30.0)
+        self.assertEqual(stats["p95_ms"], 50.0)
+        self.assertEqual(stats["p99_ms"], 50.0)
+        self.assertEqual(stats["max_ms"], 50.0)
+
+
+class RubiconPreflightFailFastTests(unittest.TestCase):
+    def test_cli_fails_fast_without_binary_or_fallback(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT, prefix=".rubicon-cli-test-") as tmp:
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPTS / "rubicon_mixed_workload.py"), "--binary", str(Path(tmp) / "missing-bin"), "--report", str(Path(tmp) / "out.json")],
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse((Path(tmp) / "out.json").exists(), "report must not be created when preflight fails")
+
+    def test_preflight_rejects_missing_dependencies_even_on_mocked_linux(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT, prefix=".rubicon-pre-test-") as tmp:
+            fake_bin = Path(tmp) / "rootyard"
+            fake_bin.write_bytes(b"stub")
+            cfg = WorkloadConfig(binary=str(fake_bin), report=str(Path(tmp) / "r.json"), git=str(fake_bin), require_build_receipt=False)
+            with (
+                patch("rubicon_workload.runner.sys.platform", "linux"),
+                patch("rubicon_workload.runner.Path.is_file", return_value=True),
+                patch("rubicon_workload.runner.os.access", return_value=True),
+                patch("rubicon_workload.runner.shutil.which", return_value="/usr/bin/psql"),
+            ):
+                with self.assertRaisesRegex(PreflightError, "ROOTYARD_TEST_DATABASE_URL"):
+                    _preflight(cfg, {}, ROOT)
+                with self.assertRaisesRegex(PreflightError, "ROOTYARD_BLOB_"):
+                    _preflight(cfg, {"ROOTYARD_TEST_DATABASE_URL": "postgresql://u@127.0.0.1/db"}, ROOT)
+
+
+class RubiconS3ProxyTests(unittest.TestCase):
+    def test_s3_meter_proxy_preserves_host_header_and_counts_wire_traffic(self) -> None:
+        observed_hosts: list[str] = []
+        stored: dict[str, bytes] = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                return
+
+            def do_PUT(self) -> None:
+                observed_hosts.append(self.headers.get("Host", ""))
+                length = int(self.headers.get("Content-Length", "0"))
+                stored[self.path] = self.rfile.read(length)
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                observed_hosts.append(self.headers.get("Host", ""))
+                data = stored.get(self.path, b"")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_HEAD(self) -> None:
+                observed_hosts.append(self.headers.get("Host", ""))
+                data = stored.get(self.path, b"")
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        srv_thread.start()
+        proxy = S3MeterProxy("127.0.0.1", srv.server_address[1])
+        proxy.start()
+        try:
+            payload = b"rubicon-pack-bytes-0123456789" * 100
+            req_put = urllib.request.Request(f"{proxy.endpoint}/bucket/pack.bin", data=payload, method="PUT")
+            with urllib.request.urlopen(req_put, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+            req_head = urllib.request.Request(f"{proxy.endpoint}/bucket/pack.bin", method="HEAD")
+            with urllib.request.urlopen(req_head, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+            req_get = urllib.request.Request(f"{proxy.endpoint}/bucket/pack.bin", method="GET")
+            with urllib.request.urlopen(req_get, timeout=5) as resp:
+                self.assertEqual(resp.read(), payload)
+
+            snap = proxy.snapshot()
+            self.assertEqual(snap["put_requests"], 1)
+            self.assertEqual(snap["put_bytes"], len(payload))
+            self.assertEqual(snap["head_requests"], 1)
+            self.assertEqual(snap["get_requests"], 1)
+            self.assertEqual(snap["get_bytes"], len(payload))
+            self.assertTrue(all(h == f"127.0.0.1:{proxy.port}" for h in observed_hosts), observed_hosts)
+        finally:
+            proxy.stop()
+            srv.shutdown()
+            srv.server_close()
+
+
+class RubiconReportValidationTests(unittest.TestCase):
+    def test_valid_report_and_markdown_rendering(self) -> None:
+        report = _valid_sample_report()
+        validate_report(report, secrets=("supersecret",))
+        md = render_summary_markdown(report)
+        self.assertIn("Rubicon Mixed Workload", md)
+        self.assertIn("`16420261116`", md)
+
+    def test_rejects_false_success_during_fault_window_and_unverified_audit(self) -> None:
+        bad_fault = _valid_sample_report()
+        bad_fault["tiers"][0]["fault_revocation_window"]["committed_success"] = 1
+        with self.assertRaisesRegex(ValueError, "fault_revocation_window"):
+            validate_report(bad_fault)
+
+        bad_audit = _valid_sample_report()
+        bad_audit["tiers"][0]["audit"]["verified_exact"] = 17
+        with self.assertRaisesRegex(ValueError, "100% of ACKed"):
+            validate_report(bad_audit)
+
+    def test_rejects_unbacked_gc_savings_and_secret_leaks(self) -> None:
+        bad_gc = _valid_sample_report()
+        bad_gc["tiers"][0]["storage_accounting"]["physical_savings_claimed"] = True
+        with self.assertRaisesRegex(ValueError, "physical storage savings"):
+            validate_report(bad_gc)
+
+        leaked = _valid_sample_report()
+        leaked["topology"] = "leaked-s3-secret-token"
+        self.assertEqual(find_secret_leaks(leaked, ["leaked-s3-secret-token"]), ["secret[0]"])
+        with self.assertRaisesRegex(ValueError, "leaked sensitive"):
+            validate_report(leaked, secrets=["leaked-s3-secret-token"])
+
+    def test_workflow_and_docs_match_conventions(self) -> None:
+        wf = (ROOT / ".github" / "workflows" / "rubicon-mixed-workload.yml").read_bytes()
+        self.assertNotIn(b"\r", wf, "workflow must use pure LF line endings")
+        wf_text = wf.decode("utf-8")
+        for token in ("rubicon_mixed_workload.py", "owned_garage_fixture.sh", "persist-credentials: false", "test_rubicon_mixed_workload"):
+            self.assertIn(token, wf_text)
+        doc_text = (ROOT / "docs" / "rubicon-mixed-workload.md").read_text(encoding="utf-8")
+        self.assertIn("#164", doc_text)
+        self.assertIn("physical_savings_claimed", doc_text)
+
+
+if __name__ == "__main__":
+    unittest.main()

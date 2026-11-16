@@ -1,0 +1,181 @@
+name: Rubicon mixed workload baseline
+
+on:
+  workflow_dispatch:
+    inputs:
+      tiers:
+        description: Compute process tiers ('auto', '1,2', or '1,2,4')
+        required: false
+        default: 'auto'
+      duration_seconds:
+        description: Timed mixed wave duration budget per tier (seconds)
+        required: false
+        default: '12'
+  pull_request:
+    paths:
+      - '.github/workflows/rubicon-mixed-workload.yml'
+      - 'scripts/rubicon_mixed_workload.py'
+      - 'scripts/rubicon_workload/**'
+      - 'tests/test_rubicon_mixed_workload.py'
+      - 'docs/rubicon-mixed-workload.md'
+      - 'scripts/build_native.py'
+      - 'scripts/native_build_receipt.py'
+      - 'scripts/native_artifact_store.py'
+      - 'scripts/install_ci_native_tools.sh'
+      - 'scripts/install_ci_cargo_fork.sh'
+      - 'scripts/owned_garage_fixture.sh'
+      - 'src/blob_git_gateway/**'
+      - 'src/ref_store/**'
+      - 'src/standalone/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rubicon-mixed-workload-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rubicon-mixed-workload:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: rootyard_rubicon
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_rubicon"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_rubicon
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run offline Rubicon workload unit tests
+        run: python3 -m unittest -v tests.test_rubicon_mixed_workload
+      - name: Install the reviewed native tool profile
+        timeout-minutes: 20
+        run: |
+          scripts/install_ci_native_tools.sh install \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/rubicon-mixed-workload/native-tools.json
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+      - name: Verify the native tool profile
+        timeout-minutes: 5
+        run: |
+          echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
+          scripts/install_ci_native_tools.sh preflight \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/rubicon-mixed-workload/native-tools.json
+      - name: Install pinned Rust 1.99.1
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/rubicon-mixed-workload/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Start the job-owned Garage S3 fixture
+        timeout-minutes: 12
+        run: |
+          scripts/owned_garage_fixture.sh start \
+            --directory "$RUNNER_TEMP/rubicon-garage" \
+            --output-env "$RUNNER_TEMP/rubicon-object-store.env" \
+            --bucket-prefix rootyard-rubicon --region garage
+      - name: Build attested rootyard binary for Rubicon workload
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          artifact_store="$HOME/.cache/rootyard/native-artifacts"
+          bin_dir="$RUNNER_TEMP/rubicon-bin"
+          mkdir -p "$bin_dir" test-results/rubicon-mixed-workload
+          unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          python3 scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo \
+            --artifact-store "$artifact_store" \
+            --output "$bin_dir/rootyard" \
+            > test-results/rubicon-mixed-workload/binary-build.json
+          cp "$bin_dir/rootyard.build.json" test-results/rubicon-mixed-workload/rootyard.build.json
+      - name: Run self-hosted Rubicon mixed workload and compute scaling baseline
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          . "$RUNNER_TEMP/rubicon-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="rubicon-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_GIT="$(command -v git)"
+          tiers="${{ inputs.tiers || 'auto' }}"
+          duration="${{ inputs.duration_seconds || '12' }}"
+          python3 scripts/rubicon_mixed_workload.py \
+            --binary "$RUNNER_TEMP/rubicon-bin/rootyard" \
+            --git "$ROOTYARD_GIT" \
+            --report test-results/rubicon-mixed-workload/report.json \
+            --summary-md test-results/rubicon-mixed-workload/summary.md \
+            --tiers "$tiers" \
+            --duration-seconds "$duration" \
+            --warmup-seconds 2
+          python3 - <<'PY'
+          import json, pathlib
+          report = json.loads(pathlib.Path("test-results/rubicon-mixed-workload/report.json").read_text(encoding="utf-8"))
+          assert report["measurement_kind"] == "native_execution"
+          assert report["simulated"] is False
+          assert len(report["tiers"]) >= 2, len(report["tiers"])
+          for tier in report["tiers"]:
+              assert tier["audit"]["acked_targets_total"] == tier["audit"]["verified_exact"]
+              assert tier["audit"]["fsck_failed"] == 0 and tier["audit"]["ref_mismatch"] == 0
+              assert tier["cas_race"]["winner_count"] == 1 and tier["cas_race"]["false_ok"] == 0
+              assert tier["fault_revocation_window"]["committed_success"] == 0
+              assert tier["storage_accounting"]["physical_savings_claimed"] is False
+          print(pathlib.Path("test-results/rubicon-mixed-workload/summary.md").read_text(encoding="utf-8"))
+          PY
+      - name: Stop the job-owned Garage fixture
+        if: always()
+        run: |
+          scripts/owned_garage_fixture.sh stop --directory "$RUNNER_TEMP/rubicon-garage"
+      - name: Upload Rubicon mixed workload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubicon-mixed-workload-report
+          path: test-results/rubicon-mixed-workload
+          if-no-files-found: warn
