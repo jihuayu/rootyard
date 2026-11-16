@@ -208,7 +208,8 @@ pub(super) async fn batch_upload(
 
         let pending_oids: BTreeSet<String> = slots
             .iter()
-            .filter_map(|(spec, slot)| matches!(slot, UploadSlot::NeedsPending { .. }).then(|| spec.oid.clone()))
+            .filter(|(_, slot)| matches!(slot, UploadSlot::NeedsPending { .. }))
+            .map(|(spec, _)| spec.oid.clone())
             .collect();
         let mut pass_done = None;
         for attempt in 0..MAX_CLAIM_RETRIES {
