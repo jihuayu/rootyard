@@ -4,6 +4,9 @@
 //! `check`/`restore` entrypoints remain defined in `src/backup/restore.rs`.
 use super::*;
 
+/// Immediate previous current paired archive format (frozen schema 150).
+const HISTORICAL_FORMAT_PAIRED_28: u32 = 28;
+
 pub(super) fn verify(source: &Path) -> Result<Manifest> {
     let manifest_meta = fs::symlink_metadata(source.join("manifest.json"))?;
     ensure!(
@@ -89,8 +92,12 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     // The archive version and its members must agree exactly: a paired archive
     // carries locators, a closure summary and a blob/ tree; a format21 archive
     // carries none of them and is never presented as an independent backup.
+    // Format 28 is the immediate previous current paired layout. Its schema
+    // catalog is frozen, but its archive members remain the same paired Blob
+    // closure/locator/RefStore carry that format 30 uses. Keep format 27
+    // metadata-only and preserve the current format 30 paired branch.
     match manifest.format {
-        FORMAT_PAIRED => {
+        FORMAT_PAIRED | HISTORICAL_FORMAT_PAIRED_28 => {
             let closure = manifest.blob_closure.as_ref().context("paired archive carries no Blob closure")?;
             ensure!(has_blob, "paired archive is missing its Blob byte closure");
             ensure!(
@@ -142,4 +149,156 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     allowed.sort();
     ensure!(names == allowed, "unexpected backup files");
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn sha256(data: &[u8]) -> String {
+        hex::encode(Sha256::digest(data))
+    }
+
+    fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<()> {
+        fs::write(path, data)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        Ok(())
+    }
+
+    fn write_archive(root: &Path, format: u32, malformed_closure: bool) -> Result<()> {
+        fs::create_dir_all(root)?;
+        let volume = root.join("volume");
+        fs::create_dir(&volume)?;
+        fs::set_permissions(&volume, fs::Permissions::from_mode(0o700))?;
+        let volume_id = Uuid::from_u128(0x11);
+        write_file(&volume.join(".volume-id"), volume_id.to_string().as_bytes(), 0o600)?;
+
+        let repository_id = Uuid::from_u128(0x21);
+        let pack_id = Uuid::from_u128(0x22);
+        let data = b"canonical packed bytes";
+        let blob = root.join("blob");
+        let repository_blob = blob.join(repository_id.to_string());
+        let pack_blob = repository_blob.join(pack_id.to_string());
+        fs::create_dir_all(&pack_blob)?;
+        for directory in [&blob, &repository_blob, &pack_blob] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let artifact_path = pack_blob.join("pack.pack");
+        write_file(&artifact_path, data, 0o600)?;
+
+        let artifact = ledger::Artifact {
+            repository_id,
+            registration_id: Uuid::from_u128(0x23),
+            pack_id,
+            role: "pack".into(),
+            slot: 0,
+            hold_id: Uuid::from_u128(0x24),
+            acquire_request_id: Uuid::from_u128(0x25),
+            consume_request_id: Uuid::from_u128(0x26),
+            provider: "s3".into(),
+            backend_identity: "a".repeat(64),
+            sha256: sha256(data),
+            length: data.len() as u64,
+            tenant_id: Uuid::from_u128(0x27),
+            authority_id: Uuid::from_u128(0x28),
+            generation: 1,
+            attempt_id: Uuid::from_u128(0x29),
+            namespace: "format28".into(),
+            artifact_set_digest: None,
+            declared_by: Vec::new(),
+        };
+        let mut closure = ledger::closure_of(std::slice::from_ref(&artifact), &artifact.backend_identity, "s3");
+        if malformed_closure {
+            closure.artifacts += 1;
+        }
+
+        let metadata = b"real pg dump bytes";
+        write_file(&root.join("metadata.dump"), metadata, 0o600)?;
+        let mut files = BTreeMap::new();
+        for (name, entry) in inventory(&volume)? {
+            files.insert(format!("volume/{name}"), entry);
+        }
+        for (name, entry) in inventory(&blob)? {
+            files.insert(format!("blob/{name}"), entry);
+        }
+        files.insert(
+            "metadata.dump".into(),
+            Entry {
+                kind: "file".into(),
+                mode: 0o600,
+                bytes: metadata.len() as u64,
+                sha256: Some(sha256(metadata)),
+                target: None,
+            },
+        );
+
+        let manifest = Manifest {
+            format,
+            backup_id: Uuid::from_u128(0x31),
+            volume_id,
+            schema_contract_sha256: schema_contract_digest(format)?,
+            boundary_unix_seconds: 0,
+            rootyard_version: "test".into(),
+            binary_sha256: "b".repeat(64),
+            postgres_version: "17".into(),
+            pg_dump_version: "17".into(),
+            git_version: "2.47.3".into(),
+            schema_versions: schema_versions(format)?,
+            consistency: "complete".into(),
+            journal_record_files: 0,
+            repositories: vec![Repository {
+                id: repository_id,
+                generation: 1,
+                incident_revision: 0,
+                state: "ready".into(),
+                recovery_reason: None,
+                backend: Some("pg_refstore".into()),
+                unknown_operations: 0,
+                refs: None,
+                head: None,
+            }],
+            lfs_objects: Vec::new(),
+            blob_closure: Some(closure),
+            blob_artifacts: vec![artifact],
+            refstore: Some(BTreeMap::new()),
+            files,
+        };
+        let bytes = serde_json::to_vec(&manifest)?;
+        write_file(&root.join("manifest.json"), &bytes, 0o600)?;
+        write_file(&root.join("COMPLETE"), sha256(&bytes).as_bytes(), 0o600)?;
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_paired_28_and_current_paired_30_layouts_verify() -> Result<()> {
+        for format in [28, 30] {
+            let temp = tempfile::tempdir()?;
+            write_archive(temp.path(), format, false)?;
+            let manifest = verify(temp.path())?;
+            assert_eq!(manifest.format, format);
+            assert_eq!(manifest.blob_artifacts.len(), 1);
+            assert!(manifest.blob_closure.is_some());
+            assert!(manifest.refstore.is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_formats_and_malformed_paired_28_stay_rejected() -> Result<()> {
+        for format in [27, 29] {
+            let temp = tempfile::tempdir()?;
+            write_archive(temp.path(), format, false)?;
+            let error = verify(temp.path()).unwrap_err().to_string();
+            assert!(error.contains("must not carry"), "format {format}: {error}");
+        }
+        let temp = tempfile::tempdir()?;
+        write_archive(temp.path(), 28, true)?;
+        let error = verify(temp.path()).unwrap_err().to_string();
+        assert!(error.contains("Blob closure count"), "{error}");
+        Ok(())
+    }
 }
