@@ -506,7 +506,9 @@ async fn run_helper_cleanup(cleanup: HelperShutdown, deadline: tokio::time::Inst
         Err(_) => {
             let pending = cleanup.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
             if let Some(cleanup) = pending {
-                let _ = tokio::task::spawn_blocking(cleanup);
+                // Intentional detachment of the already bounded, owned cleanup
+                // closure; the outer wait has already failed and is not retried.
+                drop(tokio::task::spawn_blocking(cleanup));
             }
             Err(Error(
                 StatusCode::GATEWAY_TIMEOUT,
