@@ -25,6 +25,8 @@ if str(TESTS) not in sys.path:
 
 from pando_vault_rotation_fixture import FixtureError  # noqa: E402
 import pando_vault_rotation_fixture_resources as resources  # noqa: E402
+import pando_vault_rotation_service as service  # noqa: E402
+from pando_vault_rotation_support import Completed, QualificationError  # noqa: E402
 
 
 class Result:
@@ -189,8 +191,6 @@ class PostgresOwnershipStateTest(unittest.TestCase):
         self.assertFalse(fake.exists)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class RootCreationOwnershipTest(unittest.TestCase):
@@ -282,3 +282,105 @@ class RootCreationOwnershipTest(unittest.TestCase):
 
 def stat_mode(path):
     return Path(path).stat().st_mode & 0o777
+
+
+
+class GitClientEnvironmentTest(unittest.TestCase):
+    def test_git_environment_excludes_provider_database_and_admin_secrets(self):
+        environment = {
+            "PATH": "/usr/bin",
+            "LANG": "C",
+            "PANDO_KMS_VAULT_TOKEN": "app-token",
+            "PANDO_KMS_VAULT_URL": "http://127.0.0.1:1",
+            "ROOTYARD_TEST_DATABASE_URL": "postgresql://user:pw@127.0.0.1/db",
+            "PANDO_DATABASE_URL": "postgresql://user:pw@127.0.0.1/pando",
+            "PGPASSWORD": "pg-secret",
+            "DATABASE_URL": "postgresql://user:pw@127.0.0.1/other",
+            "VAULT_ROOT_TOKEN": "admin-root-token",
+            "GIT_DIR": "/outside/.git",
+            "GIT_TRACE": "1",
+            "GIT_CONFIG_COUNT": "1",
+            "HTTP_PROXY": "http://proxy.invalid",
+        }
+        with mock.patch.object(service.shutil, "which",
+                               return_value="/usr/bin/git"):
+            workspace = service.GitWorkspace(environment)
+        filtered = workspace.environment
+        for forbidden in (
+            "PANDO_KMS_VAULT_TOKEN", "PANDO_KMS_VAULT_URL",
+            "ROOTYARD_TEST_DATABASE_URL", "PANDO_DATABASE_URL",
+            "PGPASSWORD", "DATABASE_URL", "VAULT_ROOT_TOKEN",
+            "GIT_DIR", "GIT_TRACE", "GIT_CONFIG_COUNT", "HTTP_PROXY",
+        ):
+            self.assertNotIn(forbidden, filtered)
+        serialized = json.dumps(filtered)
+        for secret in ("app-token", "pg-secret", "admin-root-token",
+                       "postgresql://"):
+            self.assertNotIn(secret, serialized)
+        self.assertEqual(filtered["PATH"], "/usr/bin")
+        self.assertEqual(filtered["LANG"], "C")
+        self.assertEqual(filtered["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(filtered["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(filtered["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(filtered["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(filtered["GIT_ALLOW_PROTOCOL"], "http")
+        self.assertEqual(filtered["GIT_AUTHOR_NAME"], "Synthetic Rotation")
+        self.assertEqual(filtered["GIT_COMMITTER_NAME"], "Synthetic Rotation")
+
+    def test_git_commit_and_push_use_filtered_env_and_safe_argv(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(([str(item) for item in argv], kwargs))
+            if "rev-parse" in argv:
+                return Completed(argv, 0, b"abc123\n", b"")
+            return Completed(argv, 0, b"", b"")
+
+        class FakeRunner:
+            def run(self, argv, **kwargs):
+                return run(argv, **kwargs)
+
+        environment = {
+            "PATH": "/usr/bin", "LANG": "C",
+            "PANDO_KMS_VAULT_TOKEN": "app-token",
+            "ROOTYARD_TEST_DATABASE_URL": "postgresql://user:pw@127.0.0.1/db",
+            "PANDO_DATABASE_URL": "postgresql://user:pw@127.0.0.1/pando",
+            "PGPASSWORD": "pg-secret",
+        }
+        with tempfile.TemporaryDirectory() as temporary, \
+             mock.patch.object(service.shutil, "which",
+                               return_value="/usr/bin/git"):
+            workspace = service.GitWorkspace(environment, runner=FakeRunner())
+            self.assertEqual(
+                workspace.commit(temporary, "content", "synthetic message"),
+                "abc123")
+            workspace.push(temporary, "http://127.0.0.1:1234/repos/r.git")
+        self.assertGreaterEqual(len(calls), 4)
+        for argv, kwargs in calls:
+            env = kwargs["env"]
+            for forbidden in ("PANDO_KMS_VAULT_TOKEN", "PANDO_DATABASE_URL",
+                              "ROOTYARD_TEST_DATABASE_URL", "PGPASSWORD"):
+                self.assertNotIn(forbidden, env)
+            joined = " ".join(argv)
+            for secret in ("app-token", "pg-secret", "postgresql://"):
+                self.assertNotIn(secret, joined)
+            self.assertEqual(env["GIT_AUTHOR_NAME"], "Synthetic Rotation")
+            self.assertEqual(env["GIT_COMMITTER_NAME"], "Synthetic Rotation")
+        commit_calls = [argv for argv, _ in calls
+                        if "commit" in argv and "-m" in argv]
+        self.assertTrue(commit_calls)
+        self.assertIn("-c", commit_calls[0])
+        self.assertIn("user.name=Synthetic Rotation", commit_calls[0])
+        push_calls = [argv for argv, _ in calls if "push" in argv]
+        self.assertTrue(push_calls)
+        self.assertIn("http.extraHeader=X-Pando-Principal: alice", push_calls[0])
+        self.assertNotIn("PANDO_KMS_VAULT_TOKEN", " ".join(push_calls[0]))
+
+    def test_git_environment_requires_path(self):
+        with self.assertRaises(QualificationError) as caught:
+            service.GitWorkspace({})
+        self.assertEqual(caught.exception.code, "git_environment_path_missing")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -194,11 +194,48 @@ class Server:
         return self.base + "/repos/" + repo + ".git"
 
 
+GIT_ENV_KEEP = (
+    "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "TMPDIR", "TMP", "TEMP", "SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR",
+)
+GIT_ENV_SAFE = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_ALLOW_PROTOCOL": "http",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "Synthetic Rotation",
+    "GIT_AUTHOR_EMAIL": "rotation@example.invalid",
+    "GIT_COMMITTER_NAME": "Synthetic Rotation",
+    "GIT_COMMITTER_EMAIL": "rotation@example.invalid",
+    "GIT_AUTHOR_DATE": "2026-11-17T00:00:00Z",
+    "GIT_COMMITTER_DATE": "2026-11-17T00:00:00Z",
+    "NO_PROXY": "127.0.0.1,localhost",
+    "no_proxy": "127.0.0.1,localhost",
+}
+
+
+def git_client_environment(environment):
+    """Return only the narrow stock-Git client environment.
+
+    The Pando CLI/server needs Vault/provider/database credentials; Git does
+    not.  Direct stock-Git commands receive only PATH/locale/temp paths plus
+    explicit author, config-isolation and transport-safety values.  Provider
+    tokens, database DSNs/passwords and admin credentials are never copied.
+    """
+    source = dict(environment)
+    filtered = {name: source[name] for name in GIT_ENV_KEEP if name in source}
+    require("PATH" in filtered, "git_environment_path_missing", "git")
+    filtered.update(GIT_ENV_SAFE)
+    return filtered
+
+
 class GitWorkspace:
     def __init__(self, environment, runner=None):
-        self.environment = dict(environment)
+        self.environment = git_client_environment(environment)
         self.runner = runner or Runner()
-        self.git = shutil.which("git")
+        self.git = shutil.which("git", path=self.environment["PATH"])
         require(self.git is not None and os.path.isabs(self.git), "git_missing", "git")
 
     def _run_in(self, args, cwd, stage="git", timeout=90):
