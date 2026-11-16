@@ -96,6 +96,7 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
         &plain_bytes,
     )
     .await?;
+    let local_policy = provider.into_local_policy();
     let env = lifecycle::build_authenticated_envelope_record(
         repo,
         &Pack { id: pack_id, pack_sha256: pack_sha256.clone(), idx_sha256: idx_sha256.clone() },
@@ -152,7 +153,9 @@ pub(super) async fn put(config: &Config, repo: Uuid, pack_id: Uuid,
         ensure!(row.get::<_, serde_json::Value>(0) == value,
             "immutable Pando manifest collision");
         lifecycle::write_envelope_file(&config.root, &env)?;
-        lifecycle::rotation::sync_kms_policy_to_db(&client, repo, provider.policy()).await?;
+        if let Some(policy) = local_policy.as_ref() {
+            lifecycle::rotation::sync_kms_policy_to_db(&client, repo, policy).await?;
+        }
         lifecycle::rotation::upsert_envelope_in_db(&client, &env).await?;
         Ok::<(), anyhow::Error>(())
     }.await;
