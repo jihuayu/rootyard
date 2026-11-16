@@ -708,6 +708,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
             writer_pidfd = None
             holders = []
             holder_identities = []
+            namespace_mounts = []
             put = None
             git_thread = None
             git_wrapper_pid = None
@@ -772,6 +773,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     self.assertEqual(int(visible["mount_id"]), mount_id,
                                      "holder namespace does not see the exact API mount")
                     holder_identities.append(identity)
+                    namespace_mounts.append((holder, identity, mountpoint, mount_id))
                     return holder
 
                 writer_ws = create_workspace("normal-sigterm-writer",
@@ -786,8 +788,8 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 writer_checkpoint_id = writer_checkpoint["checkpoint_id"]
                 writer_checkpoint_dir = (
                     h.root / "data/workspace-service/checkpoints" / writer_checkpoint_id)
-                writer_checkpoint_bytes = (writer_checkpoint_dir / "hello.txt").read_bytes()
-                self.assertEqual(writer_checkpoint_bytes, b"second\n")
+                writer_checkpoint_digest = normal_shutdown.checkpoint_tree_digest(
+                    writer_checkpoint_dir)
                 writer_holder = keep_namespace(writer_mount, writer_mount_id)
 
                 git_ws = create_workspace("normal-sigterm-git",
@@ -800,8 +802,8 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 git_checkpoint_id = git_checkpoint["checkpoint_id"]
                 git_checkpoint_dir = (
                     h.root / "data/workspace-service/checkpoints" / git_checkpoint_id)
-                git_checkpoint_bytes = (git_checkpoint_dir / "hello.txt").read_bytes()
-                self.assertEqual(git_checkpoint_bytes, b"second\n")
+                git_checkpoint_digest = normal_shutdown.checkpoint_tree_digest(
+                    git_checkpoint_dir)
                 git_state = workspace_state(git_id)
                 parked_body = {"content_base64": base64.b64encode(b"parked\n").decode(),
                                "expected_entry_version": 0,
@@ -824,8 +826,8 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 put_checkpoint_id = put_checkpoint["checkpoint_id"]
                 put_checkpoint_dir = (
                     h.root / "data/workspace-service/checkpoints" / put_checkpoint_id)
-                put_checkpoint_bytes = (put_checkpoint_dir / "hello.txt").read_bytes()
-                self.assertEqual(put_checkpoint_bytes, b"second\n")
+                put_checkpoint_digest = normal_shutdown.checkpoint_tree_digest(
+                    put_checkpoint_dir)
                 put_state = workspace_state(put_id)
                 put_revision_before = put_state["revision"]
                 put_generation_before = put_state["git_generation"]
@@ -988,6 +990,13 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                                 "production FUSE helper did not exit on normal SIGTERM")
                 self.assertIsNone(h.proc.poll(),
                                   "API exited before the held Git wrapper was released")
+                wrapper_now = support.process_identity(git_wrapper_pid)
+                self.assertIsNotNone(wrapper_now,
+                                     "held Git wrapper exited before its release marker")
+                self.assertEqual(wrapper_now["starttime"], git_wrapper_starttime,
+                                 "held Git wrapper starttime changed before release")
+                self.assertNotEqual(wrapper_now["state"], "Z",
+                                    "held Git wrapper was a zombie before release")
                 self.assertTrue(normal_shutdown.git_hold_active(marker),
                                 "Git wrapper was not still held when helper/mount proof completed")
 
@@ -1004,14 +1013,12 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 self.assertGreaterEqual(writer_final["writes"], kernel_wait["writes"])
                 self.assertGreaterEqual(writer_final["attempts"], kernel_wait["attempts"])
 
-                put_outcome = put.finish(remaining())
+                put_outcome = put.finish(remaining)
                 put = None
-                if put_outcome["status"] is None:
-                    self.assertTrue(put_outcome["closed"],
-                                    "partial PUT ended without a status or close")
-                else:
-                    self.assertEqual(put_outcome["status"], 503,
-                                     "post-close PUT admission did not reject with 503")
+                self.assertEqual(put_outcome["status"], 503,
+                                 "post-close PUT did not return the fixed 503")
+                self.assertTrue(put_outcome["admission_closed"],
+                                "post-close PUT did not return the fixed shutdown admission error")
                 self.assertFalse(put_target.exists())
                 self.assertFalse((put_upper / "normal-sigterm-put.txt").exists())
                 self.assertFalse((put_lower / "normal-sigterm-put.txt").exists())
@@ -1128,29 +1135,44 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     "SELECT count(*) FROM workspace_checkpoints "
                     f"WHERE workspace_id='{put_id}'")),
                     put_checkpoints_before)
-                for checkpoint_id, checkpoint_dir, expected in (
+                for checkpoint_id, checkpoint_dir, expected_digest in (
                         (writer_checkpoint_id, writer_checkpoint_dir,
-                         writer_checkpoint_bytes),
+                         writer_checkpoint_digest),
                         (git_checkpoint_id, git_checkpoint_dir,
-                         git_checkpoint_bytes),
+                         git_checkpoint_digest),
                         (put_checkpoint_id, put_checkpoint_dir,
-                         put_checkpoint_bytes)):
+                         put_checkpoint_digest)):
                     self.assertEqual(h.sql(
                         "SELECT state FROM workspace_checkpoints "
                         f"WHERE id='{checkpoint_id}'"), "local_complete")
                     self.assertEqual(
-                        (checkpoint_dir / "hello.txt").read_bytes(), expected)
+                        normal_shutdown.checkpoint_tree_digest(checkpoint_dir),
+                        expected_digest,
+                        "prior checkpoint tree bytes/modes/symlink identities changed")
             except BaseException as error:
                 original_failure = error
                 raise
             finally:
                 cleanup_failures = []
+                retain_fixture = not mount_cleanup_proven
 
                 def attempt(label, function):
                     try:
                         function()
                     except BaseException as error:
                         cleanup_failures.append((label, error))
+
+                def wait_identity_absent(pid, starttime, timeout):
+                    """Bounded /proc wait; never waitpid() a non-child process."""
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        current = support.process_identity(pid)
+                        if current is None:
+                            return True
+                        if current["starttime"] != starttime:
+                            return False
+                        time.sleep(0.02)
+                    return False
 
                 if gate_prefix is not None:
                     attempt("release capture gate",
@@ -1161,9 +1183,9 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     attempt("close partial PUT", put.close)
                 attempt("stop pending writer",
                         lambda: support.terminate_process(writer))
-                for holder in holders:
-                    attempt("stop namespace holder",
-                            lambda holder=holder: support.terminate_process(holder))
+
+                # Keep the namespace observers alive until the exact old mount
+                # proof has been attempted, then stop them with their owner.
                 if h.proc is not None and h.proc.poll() is None:
                     try:
                         os.killpg(h.proc.pid, signal.SIGTERM)
@@ -1179,6 +1201,8 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                                 h.proc, timeout=support.EXIT_DEADLINE)
                         except BaseException as error:
                             cleanup_failures.append(("owned API", error))
+                            retain_fixture = True
+
                 if git_thread is not None and git_thread.is_alive():
                     git_thread.join(timeout=10)
                     if git_thread.is_alive():
@@ -1192,22 +1216,112 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                             cleanup_failures.append((
                                 "Git wrapper identity",
                                 AssertionError("wrapper PID no longer matches")))
+                            retain_fixture = True
                         elif not support.wait_pid_gone(
                                 git_wrapper_pid, support.EXIT_DEADLINE):
                             cleanup_failures.append((
                                 "Git wrapper",
                                 AssertionError("owned wrapper remained after release")))
+                            retain_fixture = True
+
+                for holder, identity, mountpoint, mount_id in namespace_mounts:
+                    current = support.process_identity(holder.pid)
+                    if current is None:
+                        cleanup_failures.append((
+                            "namespace observer",
+                            AssertionError("observer exited before exact mount proof")))
+                        retain_fixture = True
+                        continue
+                    if current["starttime"] != identity["starttime"]:
+                        cleanup_failures.append((
+                            "namespace observer identity",
+                            AssertionError("observer starttime changed")))
+                        retain_fixture = True
+                        continue
+                    try:
+                        gone = support.wait_for_mount_id_gone(
+                            holder.pid, mountpoint, mount_id,
+                            support.EXIT_DEADLINE)
+                    except BaseException as error:
+                        cleanup_failures.append(("exact mount cleanup", error))
+                        gone = False
+                    if not gone:
+                        cleanup_failures.append((
+                            "exact mount cleanup",
+                            AssertionError("owned mount remained after bounded wait")))
+                        retain_fixture = True
+                        continue
+                    remaining = [
+                        row for row in support.read_process_mountinfo(holder.pid)
+                        if row["mountpoint"] == str(mountpoint)
+                    ]
+                    if remaining:
+                        cleanup_failures.append((
+                            "exact mount replacement",
+                            AssertionError("mountpoint gained a replacement mount")))
+                        retain_fixture = True
+
+                for holder in holders:
+                    attempt("stop namespace holder",
+                            lambda holder=holder: support.terminate_process(holder))
+
+                # The helper is not this test's child.  Stop it only through
+                # its confirmed pidfd after the captured identity and owned
+                # process group still match, then wait for /proc disappearance
+                # rather than assuming an unavailable waitpid ownership.
+                if helper_pid is not None and helper_identity is not None:
+                    current = support.process_identity(helper_pid)
+                    if current is None:
+                        pass
+                    elif (current["starttime"] != helper_identity["starttime"]
+                          or current["pgid"] != helper_pid):
+                        cleanup_failures.append((
+                            "owned helper identity",
+                            AssertionError("helper identity changed; no signal")))
+                        retain_fixture = True
+                    elif current["state"] == "Z":
+                        if not wait_identity_absent(
+                                helper_pid, helper_identity["starttime"],
+                                support.EXIT_DEADLINE):
+                            cleanup_failures.append((
+                                "owned helper reap",
+                                AssertionError("helper zombie was not reaped")))
+                            retain_fixture = True
+                    elif helper_pidfd is None:
+                        cleanup_failures.append((
+                            "owned helper pidfd",
+                            AssertionError("helper pidfd unavailable; no PID signal")))
+                        retain_fixture = True
+                    else:
+                        try:
+                            signal_pidfd(helper_pidfd, signal.SIGKILL)
+                        except BaseException as error:
+                            cleanup_failures.append(
+                                ("owned helper pidfd signal", error))
+                            retain_fixture = True
+                        if not wait_identity_absent(
+                                helper_pid, helper_identity["starttime"],
+                                support.EXIT_DEADLINE):
+                            cleanup_failures.append((
+                                "owned helper reap",
+                                AssertionError("helper identity remained after pidfd signal")))
+                            retain_fixture = True
+
                 for label, fd in (("close API pidfd", api_pidfd),
                                   ("close helper pidfd", helper_pidfd),
                                   ("close writer pidfd", writer_pidfd)):
                     if fd is not None:
                         attempt(label, lambda fd=fd: os.close(fd))
-                if not mount_cleanup_proven:
+                if retain_fixture:
                     h.args.keep = True
+                    if h.log is not None:
+                        attempt("close harness log", lambda: h.log.close())
+                        h.log = None
                     cleanup_failures.append((
-                        "mount cleanup unproven",
-                        AssertionError("fixture root retained for exact mount evidence")))
-                attempt("harness cleanup", h.cleanup)
+                        "fixture root/schema retained",
+                        AssertionError("mount/child cleanup unproven")))
+                else:
+                    attempt("harness cleanup", h.cleanup)
                 if cleanup_failures:
                     detail = "; ".join(
                         f"{label}: {type(error).__name__}"

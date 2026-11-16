@@ -18,6 +18,7 @@ created by the test; every other Git call is forwarded unchanged.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -28,6 +29,9 @@ from pathlib import Path
 
 from tests import fuse_helper_native_support as support
 
+
+ADMISSION_CLOSED_ERROR = "workspace admission is closed for shutdown"
+MAX_ERROR_BODY_BYTES = 8192
 
 class NormalShutdownError(RuntimeError):
     """A bounded fixture precondition failed (never a skipped assertion)."""
@@ -244,6 +248,86 @@ def wait_for_writer_writing(process, status_path: Path, timeout: float = 10.0) -
     raise NormalShutdownError("pending writer did not publish its writing phase")
 
 
+def _hash_regular_file(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def checkpoint_tree_digest(root: Path) -> str:
+    """Digest every checkpoint path, type, mode, byte and symlink identity.
+
+    The manifest is built privately and only its SHA-256 is returned, so a
+    mismatch fails with fixed text rather than dumping file contents.  Symlink
+    identities are compared as exact target bytes through their digest/length;
+    file bytes, sizes and modes are all covered.  This is a full tree proof, not
+    a single ``hello.txt`` sample.
+    """
+    root = Path(root)
+    entries = []
+    try:
+        root_metadata = root.lstat()
+    except OSError as error:
+        raise NormalShutdownError("checkpoint root is unreadable") from error
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise NormalShutdownError("checkpoint root is not a directory")
+    entries.append({"path": ".", "kind": "dir",
+                    "mode": stat.S_IMODE(root_metadata.st_mode)})
+
+    def visit(directory: Path, relative: Path) -> None:
+        try:
+            with os.scandir(directory) as iterator:
+                children = sorted(((entry.name, Path(entry.path)) for entry in iterator),
+                                  key=lambda pair: pair[0])
+        except OSError as error:
+            raise NormalShutdownError("checkpoint tree is unreadable") from error
+        for name, full in children:
+            rel = (relative / name).as_posix()
+            try:
+                metadata = full.lstat()
+            except OSError as error:
+                raise NormalShutdownError("checkpoint entry is unreadable") from error
+            mode = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISLNK(metadata.st_mode):
+                target = os.readlink(full)
+                target_bytes = os.fsencode(target)
+                entries.append({
+                    "path": rel,
+                    "kind": "symlink",
+                    "mode": mode,
+                    "target_bytes": len(target_bytes),
+                    "target_sha256": hashlib.sha256(target_bytes).hexdigest(),
+                })
+            elif stat.S_ISDIR(metadata.st_mode):
+                entries.append({"path": rel, "kind": "dir", "mode": mode})
+                visit(full, relative / name)
+            elif stat.S_ISREG(metadata.st_mode):
+                try:
+                    sha256, size = _hash_regular_file(full)
+                except OSError as error:
+                    raise NormalShutdownError("checkpoint file is unreadable") from error
+                entries.append({
+                    "path": rel,
+                    "kind": "file",
+                    "mode": mode,
+                    "size": size,
+                    "sha256": sha256,
+                })
+            else:
+                entries.append({"path": rel, "kind": "special", "mode": mode})
+
+    visit(root, Path())
+    payload = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _socket_table(pid: int):
     for table in ("tcp", "tcp6"):
         try:
@@ -319,35 +403,89 @@ class PartialPut:
             raise NormalShutdownError("partial PUT was not started")
         wait_for_tcp_accepted(api_pid, self.port, self.client_port, timeout)
 
-    def finish(self, timeout: float) -> dict:
-        """Deliver the remainder and return a fixed status/closed outcome."""
+    def finish(self, remaining) -> dict:
+        """Deliver the remainder and require the fixed admission rejection.
+
+        The caller's absolute remaining-budget function is applied immediately
+        before the body send and again before the response read, so neither a
+        blocked send nor a blocked read can start a fresh wait.  Only the
+        route-level 503 with the exact static error string is accepted; a
+        closed connection, a different status, or a different 503 body fails
+        with a fixed safe message and never exposes response bytes.
+        """
         if self.sock is None:
             raise NormalShutdownError("partial PUT was not started")
+        self.sock.settimeout(remaining())
         try:
             self.sock.sendall(self.rest)
+        except socket.timeout:
+            raise NormalShutdownError(
+                "partial PUT send exceeded the shared shutdown deadline") from None
         except ConnectionError:
-            self.close()
-            return {"status": None, "closed": True, "response_bytes": 0}
-        self.sock.settimeout(timeout)
+            raise NormalShutdownError(
+                "partial PUT closed before the fixed admission response") from None
+        self.sock.settimeout(remaining())
         data = bytearray()
         try:
             while b"\r\n\r\n" not in data:
                 chunk = self.sock.recv(4096)
                 if not chunk:
-                    return {"status": None, "closed": True, "response_bytes": len(data)}
+                    raise NormalShutdownError(
+                        "partial PUT closed before the fixed admission response")
                 data.extend(chunk)
                 if len(data) > 65536:
                     raise NormalShutdownError("partial PUT response headers are oversized")
-            head, _body = bytes(data).split(b"\r\n\r\n", 1)
+            head, body = bytes(data).split(b"\r\n\r\n", 1)
+            lines = head.split(b"\r\n")
             try:
-                status = int(head.split(b"\r\n", 1)[0].split()[1])
+                status = int(lines[0].split()[1])
             except (IndexError, ValueError):
                 raise NormalShutdownError("partial PUT returned an invalid status line") from None
-            return {"status": status, "closed": False, "response_bytes": 0}
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-            return {"status": None, "closed": True, "response_bytes": len(data)}
+            if status != 503:
+                return {"status": status, "admission_closed": False}
+            length = None
+            for line in lines[1:]:
+                if b":" not in line:
+                    continue
+                name, value = line.split(b":", 1)
+                if name.strip().lower() == b"content-length":
+                    try:
+                        length = int(value.strip())
+                    except ValueError:
+                        raise NormalShutdownError(
+                            "partial PUT returned an invalid body length") from None
+            if length is not None:
+                if length < 0 or length > MAX_ERROR_BODY_BYTES:
+                    raise NormalShutdownError(
+                        "partial PUT admission body exceeded the safe bound")
+                while len(body) < length:
+                    chunk = self.sock.recv(length - len(body))
+                    if not chunk:
+                        raise NormalShutdownError(
+                            "partial PUT closed before the fixed admission response")
+                    body += chunk
+            else:
+                while True:
+                    chunk = self.sock.recv(4096)
+                    if not chunk:
+                        break
+                    body += chunk
+                    if len(body) > MAX_ERROR_BODY_BYTES:
+                        raise NormalShutdownError(
+                            "partial PUT admission body exceeded the safe bound")
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                raise NormalShutdownError(
+                    "partial PUT 503 body was not the fixed admission response") from None
+            closed = isinstance(payload, dict) and payload.get("error") == ADMISSION_CLOSED_ERROR
+            return {"status": 503, "admission_closed": closed}
         except socket.timeout:
-            raise NormalShutdownError("partial PUT did not resolve within the deadline") from None
+            raise NormalShutdownError(
+                "partial PUT did not resolve within the shared deadline") from None
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            raise NormalShutdownError(
+                "partial PUT closed before the fixed admission response") from None
         finally:
             self.close()
 
