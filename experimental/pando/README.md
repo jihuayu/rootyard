@@ -325,13 +325,19 @@ exactly 3.
 
 ### DB envelope authority, mirror repair and cold-cache checks
 
-A DB-backed publication is authoritative only as the complete pair of
-`pando_lab.object_store_manifests` and `pando_lab.kms_envelopes` rows. The
-per-pack JSON at `$PANDO_ROOT/object_store/envelopes/<repo>/<pack>.json` is a
-post-commit mirror. A fresh DB-backed read loads and verifies the DB envelope
-first, then repairs a damaged or missing mirror best-effort. The verified
-file-only mirror path exists only for raw helpers without a DB client; a
-published pack missing its DB envelope must fail, not fall back to the mirror.
+The complete pair of `pando_lab.object_store_manifests` and
+`pando_lab.kms_envelopes` rows is checked as authority for DB-backed
+publication/recovery and remote S3 reads. The local CAS path is narrower: a
+digest-matching warm pack/index cache returns `verified` before any DB envelope
+lookup. On a cold cache it reads and validates the local CAS manifest plus the
+exact stored ciphertext SHA-256/length, then loads the DB `kms_envelopes` record
+through the repository pack/index digests; it does not query
+`object_store_manifests`. The per-pack JSON at
+`$PANDO_ROOT/object_store/envelopes/<repo>/<pack>.json` is a post-commit mirror,
+not a fallback authority. The missing-DB-envelope/no-mirror-fallback failure
+applies to cold hydration (cache miss), where the DB envelope is loaded and a
+damaged or missing mirror is repaired best-effort; the verified file-only mirror
+path exists only for raw helpers without a DB client.
 
 Every cold negative probe evicts only the exact owned pack/index cache and
 asserts it remains absent after the failure. A cold read validates the immutable
@@ -341,7 +347,10 @@ wrapped-key identity, decrypts, then rechecks plaintext SHA-256/length and pack
 object count before writing the cache. Corrupting only `envelope_mac`, changing
 only the DB ciphertext digest, flipping stored ciphertext, using a usable wrong
 scoped key, or revoking the app token must not create a plaintext cache, replace
-CAS bytes, or mutate committed DB authority.
+CAS bytes, or mutate committed DB authority. Because the fixture evicts before
+every provider probe, its cache/provider failure evidence is cold-hydration
+only; it does not establish warm-cache provider revocation or whole-KMS
+access-control runtime behavior.
 
 ### Separate 17 Local PostgreSQL producer cases
 

@@ -250,17 +250,26 @@ The rotation contract is the explicit existing-target contract
 
 ### DB authority, mirror repair and cold-cache checks
 
-For DB-backed publication and reads, the complete pair in
-`pando_lab.object_store_manifests` plus `pando_lab.kms_envelopes` is
-authoritative. `$PANDO_ROOT/object_store/envelopes/<repo>/<pack>.json` is a
-post-commit mirror, not a fallback authority. A DB-backed cold read loads and
-verifies the authoritative DB envelope, then repairs a missing or damaged
-mirror best-effort. The verified file-only path is reserved for raw helpers that
-have no DB client; a published pack with a missing DB envelope must fail rather
-than silently adopt the mirror.
+The complete pair in `pando_lab.object_store_manifests` plus
+`pando_lab.kms_envelopes` is checked as authority for DB-backed
+publication/recovery and remote S3 reads. The local CAS `object-store-get` path
+is narrower: a digest-matching warm pack/index cache returns `verified` before
+any manifest or DB envelope lookup. On a cold cache it reads and validates the
+local CAS manifest plus the exact stored ciphertext SHA-256/length, then loads
+the DB `kms_envelopes` record through `load_authoritative_envelope` using the
+repository pack/index digests; it does not query
+`pando_lab.object_store_manifests`. `$PANDO_ROOT/object_store/envelopes/<repo>/<pack>.json`
+is a post-commit mirror, not a fallback authority. The fail-closed
+missing-DB-envelope/no-mirror-fallback guarantee applies to cold hydration
+(cache miss); the verified file-only path is reserved for raw helpers without a
+DB client. A cold local read repairs a missing or damaged mirror from the DB
+envelope best-effort after verification.
 
 Before a cold probe the fixture evicts only the exact owned pack/index cache and
-then requires the cache to remain absent after a rejected read. A successful
+then requires the cache to remain absent after a rejected read. Because it
+evicts before every provider probe, the five authored cases' cache/provider
+failure evidence is cold-hydration only; they do not establish warm-cache
+provider revocation or whole-KMS access-control runtime behavior. A successful
 cold read rechecks the immutable manifest digest, the exact stored ciphertext
 SHA-256 and length, the DB envelope's ciphertext identity and MAC/wrapped-key
 binding, decrypts the authenticated pack, and rechecks the plaintext SHA-256,
