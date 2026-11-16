@@ -60,8 +60,8 @@ pub enum ProjectionDependencyError {
     StreamNotInitialized { group_id: i64, history_incarnation: Uuid },
     RealmEpochMismatch { expected_min_epoch: i64, actual_epoch: i64 },
     BehindFrontier { expected_log_index: u64, expected_event_seq: u64, actual_log_index: u64, actual_event_seq: u64 },
-    SequenceGapOrResync { expected_event_seq: u64, cursor: ProjectionCursor },
-    MissingRequiredOperation { op_event_id: String, cursor: ProjectionCursor },
+    SequenceGapOrResync { expected_event_seq: u64, cursor: Box<ProjectionCursor> },
+    MissingRequiredOperation { op_event_id: String, cursor: Box<ProjectionCursor> },
     RevisionBehind { repository_id: Uuid, required_revision: i64, projected_revision: Option<i64> },
     AuthorityViolation(&'static str),
     Timeout { group_id: i64, history_incarnation: Uuid, min_log_index: u64, min_event_seq: u64, last_reason: String },
@@ -138,7 +138,7 @@ pub async fn verify_projection_dependency<C: GenericClient + Sync>(
     if cursor.stream_state != ProjectionStreamState::Active {
         return Err(ProjectionDependencyError::SequenceGapOrResync {
             expected_event_seq: target.min_event_seq,
-            cursor,
+            cursor: Box::new(cursor),
         });
     }
     if cursor.realm.group_epoch < target.realm.group_epoch {
@@ -172,7 +172,7 @@ pub async fn verify_projection_dependency<C: GenericClient + Sync>(
         let Some(row) = row else {
             return Err(ProjectionDependencyError::MissingRequiredOperation {
                 op_event_id: op_event_id.clone(),
-                cursor,
+                cursor: Box::new(cursor),
             });
         };
         let writable: bool = row.get("can_authorize_write");

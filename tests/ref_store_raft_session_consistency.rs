@@ -288,7 +288,7 @@ struct RaftNodeProc {
     addr: String,
     _dir: tempfile::TempDir,
     client_cfg: Arc<ClientConfig>,
-    child: OwnedChild,
+    child: std::sync::Mutex<OwnedChild>,
 }
 
 impl RaftNodeProc {
@@ -333,7 +333,7 @@ impl RaftNodeProc {
             raw.trim().strip_prefix("READY ").with_context(|| format!("expected READY banner, got {raw:?}"))?,
         )?;
         let addr = banner["addr"].as_str().context("missing READY addr")?.to_owned();
-        Ok(Self { id, addr, _dir: dir, client_cfg: pki.client_cfg.clone(), child })
+        Ok(Self { id, addr, _dir: dir, client_cfg: pki.client_cfg.clone(), child: std::sync::Mutex::new(child) })
     }
 
     async fn rpc(&self, req: Value) -> Result<Value> {
@@ -343,10 +343,14 @@ impl RaftNodeProc {
         tokio::task::spawn_blocking(move || rpc_sync(&cfg, &addr, &dns, &req)).await.context("rpc join")?
     }
 
-    async fn shutdown(mut self) {
-        let _ = self.rpc(json!("Shutdown")).await;
-        if let Some(mut c) = self.child.take() {
-            let _ = reap_bounded(&mut c, Duration::from_secs(5));
+    async fn shutdown(&self) {
+        let _ = tokio::time::timeout(Duration::from_millis(800), self.rpc(json!("Shutdown"))).await;
+        let child_opt = self.child.lock().expect("child mutex").take();
+        if let Some(mut c) = child_opt {
+            if reap_bounded(&mut c, Duration::from_secs(4)).is_none() {
+                let _ = c.kill();
+                let _ = reap_bounded(&mut c, Duration::from_secs(2));
+            }
         }
     }
 }
@@ -511,10 +515,11 @@ async fn probe_raft_node(
     }
     .ok_or_else(|| SessionFenceError::QuorumUnavailable(format!("node {node_id} unavailable")))?;
 
-    let kv_resp = node
-        .rpc(json!({ "KvGet": { "key": st.repo_key } }))
-        .await
-        .map_err(|e| SessionFenceError::QuorumUnavailable(format!("rpc error to node {node_id}: {e}")))?;
+    let kv_resp =
+        tokio::time::timeout(Duration::from_millis(900), node.rpc(json!({ "KvGet": { "key": st.repo_key } })))
+            .await
+            .map_err(|_| SessionFenceError::QuorumUnavailable(format!("rpc timeout to node {node_id}")))?
+            .map_err(|e| SessionFenceError::QuorumUnavailable(format!("rpc error to node {node_id}: {e}")))?;
 
     if let Some(err) = kv_resp.get("Error") {
         if let Some(fwd) = err["forward_to_leader_id"].as_u64() {
@@ -589,11 +594,9 @@ async fn http_read_refs(
 
     match res {
         Ok(admitted) => {
-            let mut resp = (StatusCode::OK, axum::Json(admitted.clone())).into_response();
-            resp.headers_mut().insert(
-                HeaderName::from_static(RAFT_SESSION_HEADER),
-                HeaderValue::from_str(&admitted.session_token).expect("valid token header"),
-            );
+            let tok = HeaderValue::from_str(&admitted.session_token).expect("valid token header");
+            let mut resp = (StatusCode::OK, axum::Json(admitted)).into_response();
+            resp.headers_mut().insert(HeaderName::from_static(RAFT_SESSION_HEADER), tok);
             resp
         }
         Err(err) => error_response(err),
@@ -913,9 +916,8 @@ async fn real_raft_cluster_http_read_your_writes_monotonic_failover_lag_and_quor
     let survivor_id = majority[0].id;
     let to_stop: Vec<u64> = [1u64, 2, 3].into_iter().filter(|&id| id != survivor_id).collect();
     for sid in to_stop {
-        let proc_arc = st.nodes.write().unwrap().remove(&sid).unwrap();
-        if let Ok(owned) = Arc::try_unwrap(proc_arc) {
-            owned.shutdown().await;
+        if let Some(proc_arc) = st.nodes.write().unwrap().remove(&sid) {
+            proc_arc.shutdown().await;
         }
     }
     let r_quorum_lost = http
@@ -925,10 +927,8 @@ async fn real_raft_cluster_http_read_your_writes_monotonic_failover_lag_and_quor
         .await?;
     assert_eq!(r_quorum_lost.status(), 503);
 
-    if let Some(last) = st.nodes.write().unwrap().remove(&survivor_id)
-        && let Ok(owned) = Arc::try_unwrap(last)
-    {
-        owned.shutdown().await;
+    if let Some(last) = st.nodes.write().unwrap().remove(&survivor_id) {
+        last.shutdown().await;
     }
     teardown_pg_schema(&admin, &schema).await;
     Ok(())
@@ -1013,10 +1013,8 @@ async fn real_http_rejects_rotated_history_authority_restore_forged_token_and_re
     assert_eq!(r_unauth.status(), 401);
 
     for sid in [1u64, 2, 3] {
-        if let Some(p) = st.nodes.write().unwrap().remove(&sid)
-            && let Ok(owned) = Arc::try_unwrap(p)
-        {
-            owned.shutdown().await;
+        if let Some(p) = st.nodes.write().unwrap().remove(&sid) {
+            p.shutdown().await;
         }
     }
     Ok(())
@@ -1341,10 +1339,8 @@ async fn stock_git_compatibility_fixed_oid_closure_and_pin_gc_safety() -> Result
     assert_eq!(sm.read_hold(hold_id).unwrap().state, SmHoldState::Retired);
 
     for sid in [1u64, 2, 3] {
-        if let Some(p) = st.nodes.write().unwrap().remove(&sid)
-            && let Ok(owned) = Arc::try_unwrap(p)
-        {
-            owned.shutdown().await;
+        if let Some(p) = st.nodes.write().unwrap().remove(&sid) {
+            p.shutdown().await;
         }
     }
     Ok(())
