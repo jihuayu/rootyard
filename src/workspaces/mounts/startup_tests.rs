@@ -2,7 +2,7 @@ use super::*;
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -72,9 +72,12 @@ async fn stop_during_permit_wait_submits_no_work() {
     let (polled_tx, polled_rx) = oneshot::channel();
     let (permit_tx, permit_rx) = oneshot::channel::<()>();
     let submitted = Arc::new(AtomicBool::new(false));
+    let mut start_inputs = Some((polled_tx, permit_rx));
     let seen = submitted.clone();
     let start_stop = stop.clone();
     let producer = tokio::spawn(produce_serial(start_stop, vec![row()], move |_row| -> StartFuture {
+        let (polled_tx, permit_rx) = start_inputs.take().expect("single-row startup fixture invoked twice");
+        let seen = seen.clone();
         Box::pin(async move {
             let _ = polled_tx.send(());
             let _ = permit_rx.await;
@@ -100,8 +103,10 @@ async fn stop_after_submission_waits_for_the_real_join() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let (started_tx, started_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
+    let mut start_inputs = Some((started_tx, release_rx));
     let producer_events = events.clone();
-    let producer = tokio::spawn(produce_serial(producer_stop, vec![row()], move |_row| -> StartFuture {
+    let mut producer = tokio::spawn(produce_serial(producer_stop, vec![row()], move |_row| -> StartFuture {
+        let (started_tx, release_rx) = start_inputs.take().expect("single-row startup fixture invoked twice");
         let events = producer_events.clone();
         Box::pin(async move {
             let _ = started_tx.send(());
@@ -126,8 +131,10 @@ async fn submitted_reserved_post_spawn_and_promote_phases_complete_before_return
     let events = Arc::new(Mutex::new(Vec::new()));
     let (entered_tx, entered_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
+    let mut start_inputs = Some((entered_tx, release_rx));
     let producer_events = events.clone();
-    let producer = tokio::spawn(produce_serial(stop.clone(), vec![row()], move |_row| -> StartFuture {
+    let mut producer = tokio::spawn(produce_serial(stop.clone(), vec![row()], move |_row| -> StartFuture {
+        let (entered_tx, release_rx) = start_inputs.take().expect("single-row startup fixture invoked twice");
         let events = producer_events.clone();
         Box::pin(async move {
             Ok(Box::new(PhasedStarted { events, entered: entered_tx, release: release_rx }) as Box<dyn StartedWork>)

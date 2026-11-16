@@ -168,7 +168,7 @@ fn failed_owner_stays_retained_even_after_teardown_returns() {
 
 #[test]
 fn empty_ticket_has_no_completion_evidence() {
-    let ticket = Arc::new(LegacyShutdownTicket::new());
+    let ticket = Arc::new(LegacyShutdownTicket::<RecordingOwner>::new());
     ticket.spawn_worker().unwrap();
     assert!(ticket.wait_until(Instant::now() + Duration::from_secs(2)).success());
     assert!(ticket.completion_evidence().is_none(), "an empty/no-work ticket is not proof of one mount");
@@ -207,7 +207,7 @@ fn failed_owner_is_not_recorded_as_joined() {
 
 #[test]
 fn resolve_without_owner_resolves_the_pending_condition() {
-    let ticket = Arc::new(LegacyShutdownTicket::new());
+    let ticket = Arc::new(LegacyShutdownTicket::<RecordingOwner>::new());
     ticket.add_pending(1);
     ticket.spawn_worker().unwrap();
     ticket.resolve_without_owner(Uuid::new_v4());
