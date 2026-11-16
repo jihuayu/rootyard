@@ -48,7 +48,7 @@ pub(super) async fn begin(state: &AppState, repo_id: Uuid, direction: super::Dir
     if repo_state != "ready" || !matches!(transition_state.as_str(), "stable" | "failed") {
         return Err(conflict());
     }
-    if crate::auth::lifecycle::has_active_transfer(&**tx, repo_id).await? {
+    if crate::auth::lifecycle::has_active_transfer(&*tx, repo_id).await? {
         return Err(conflict());
     }
     let expected = match direction {

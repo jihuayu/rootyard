@@ -91,7 +91,7 @@ pub(super) async fn pin_inner(
         .map_err(Error::internal)?;
     tx.query_opt("SELECT t.id FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND u.username=$3 FOR SHARE OF t,u", &[&actor.token_id,&actor.id,&owner]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
     let locked = tx.query_opt("SELECT state,storage_generation,deleted_at IS NOT NULL,archived_at IS NOT NULL,transition_state FROM repositories WHERE id=$1 AND owner_id=$2 AND name=$3 FOR SHARE", &[&repo.id,&actor.id,&name]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-    crate::auth::lifecycle::enforce_availability(&**tx, repo.id, locked.get(2), locked.get(3), locked.get::<_, &str>(4), true).await?;
+    crate::auth::lifecycle::enforce_availability(&*tx, repo.id, locked.get(2), locked.get(3), locked.get::<_, &str>(4), true).await?;
     let token = tx.query_opt("SELECT read_only FROM tokens WHERE id=$1 AND user_id=$2 AND digest=$3 AND NOT revoked AND (expires_at IS NULL OR expires_at > clock_timestamp())", &[&actor.token_id,&actor.id,&actor.token_digest]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
     if token.get::<_, bool>(0) {
         return Err(Error(StatusCode::FORBIDDEN, "write permission required"));

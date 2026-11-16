@@ -242,7 +242,8 @@ async fn copy_pando_objects(
         ] {
             if let Some(sha) = manifest.get(field).and_then(|v| v.get("sha256")).and_then(Value::as_str) {
                 let expected = manifest.get(field).and_then(|v| v.get("size")).and_then(Value::as_u64);
-                let (src, dst) = plan_pando_copy(from_owner, to_owner, ns, sha).map_err(|e| anyhow::anyhow!(e))?;
+                let (src, dst) =
+                    plan_pando_copy(from_owner, to_owner, None, ns, sha).map_err(|e| anyhow::anyhow!(e))?;
                 if let Some(rec) = copy_object_if_present(&store, stage_dir, ns, &src, &dst, expected, deadline).await?
                 {
                     push_unique(copied, seen, rec);

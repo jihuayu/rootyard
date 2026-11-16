@@ -1,8 +1,5 @@
 pub use crate::members::models::{RepoAccess, Role};
-use crate::{
-    Error,
-    db::{self, Identity},
-};
+use crate::{Error, db::Identity};
 use axum::http::{HeaderMap, StatusCode, header};
 use base64::Engine;
 use deadpool_postgres::{Pool, Transaction};
@@ -280,7 +277,7 @@ async fn verify_active_inner(
     if eff < min_role {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
-    lifecycle::enforce_availability(&**tx, repo_id, deleted, archived, &transition_state, action.is_mutating()).await?;
+    lifecycle::enforce_availability(&*tx, repo_id, deleted, archived, &transition_state, action.is_mutating()).await?;
     authorize_repo_scope(&tx, actor, repo_id, action).await?;
     Ok(())
 }

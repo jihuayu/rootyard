@@ -69,7 +69,7 @@ async fn backend_current(state: &AppState, repo: &Repository) -> Result<(), Erro
     {
         return Err(Error(StatusCode::CONFLICT, "repository backend changed; retry"));
     }
-    if crate::auth::lifecycle::has_active_transfer(&client, repo.id).await? {
+    if crate::auth::lifecycle::has_active_transfer(&**client, repo.id).await? {
         return Err(Error(StatusCode::CONFLICT, "repository ownership transfer in progress"));
     }
     Ok(())

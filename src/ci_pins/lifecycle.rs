@@ -206,7 +206,7 @@ pub(super) async fn release_pin_inner(
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
-    crate::auth::lifecycle::enforce_availability(&**tx, repo.id, locked.get(2), locked.get(3), locked.get::<_, &str>(4), true).await?;
+    crate::auth::lifecycle::enforce_availability(&*tx, repo.id, locked.get(2), locked.get(3), locked.get::<_, &str>(4), true).await?;
     let token = tx
         .query_opt(
             "SELECT read_only FROM tokens \
