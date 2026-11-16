@@ -36,6 +36,7 @@ from .failure_diagnostics import (
     sanitize_s3_snapshot,
 )
 from .live_server import (
+    ServeBlobOwner,
     append_search_path,
     cli_exec,
     clone_and_fsck,
@@ -44,8 +45,8 @@ from .live_server import (
     push_with_pack_config,
     query_repo_pg_pack_bytes,
     resolve_live_env,
+    restart_serve_blob,
     start_serve_blob,
-    stop_serve_blob,
     verify_binary_receipt,
 )
 from .pack_matrix import CANDIDATE_CONFIGS
@@ -92,10 +93,10 @@ def run_live_serve_blob_eval(
     pg_url = append_search_path(live.pg_base, schema)
     run_env = os.environ.copy()
     scratch_dir = work_root / "server-scratch"
+    server_owner = ServeBlobOwner()
     proxy: S3MeterProxy | None = None
     sampler: ResourceSampler | None = None
     proc: subprocess.Popen[bytes] | None = None
-    log_f: Any = None
     schema_created = False
 
     def s3_snapshot() -> dict[str, Any]:
@@ -105,6 +106,12 @@ def run_live_serve_blob_eval(
             return sanitize_s3_snapshot(proxy.snapshot())
         except Exception:  # noqa: BLE001 - diagnostics must not replace the primary outcome
             return sanitize_s3_snapshot(None)
+
+    def start_owned(log_name: str) -> tuple[subprocess.Popen[bytes], str, Any]:
+        return start_serve_blob(
+            binary, git_bin, live, pg_url, proxy.endpoint, scratch_dir, work_root / log_name,
+            owner=server_owner,
+        )
 
     try:
         proxy = S3MeterProxy(parsed_s3.hostname, parsed_s3.port or 80)
@@ -134,9 +141,7 @@ def run_live_serve_blob_eval(
         p1_tenants = [_create_tenant_pair(binary, pg_env, f"p1_{idx}", live.secrets) for idx in range(len(archetype_specs))]
         cmp_tenants = [_create_tenant_pair(binary, pg_env, f"cmp_{s_idx}", live.secrets) for s_idx in range(len(compare_specs))]
 
-        proc, base_url, log_f = start_serve_blob(
-            binary, git_bin, live, pg_url, proxy.endpoint, scratch_dir, work_root / "serve-blob-1.log"
-        )
+        proc, base_url, _ = start_owned("serve-blob-1.log")
         sampler.set_pids([proc.pid])
 
         # Phase 1: Incremental multi-wave pushes (isolated tenant per archetype to respect schema 142 quotas).
@@ -211,9 +216,8 @@ def run_live_serve_blob_eval(
         baseline_push_s3 = proxy.snapshot()
 
         # Restart serve-blob with empty scratch for genuine cold clone & cold browse measurements.
-        stop_serve_blob(proc, log_f)
-        proc, base_url, log_f = start_serve_blob(
-            binary, git_bin, live, pg_url, proxy.endpoint, scratch_dir, work_root / "serve-blob-2.log"
+        proc, base_url, _ = restart_serve_blob(
+            server_owner, lambda: start_owned("serve-blob-2.log")
         )
         sampler.set_pids([proc.pid], new_epoch=True)
 
@@ -302,9 +306,8 @@ def run_live_serve_blob_eval(
                 cmp_repos.append(crepo)
             put_s3 = proxy.snapshot()
 
-            stop_serve_blob(proc, log_f)
-            proc, base_url, log_f = start_serve_blob(
-                binary, git_bin, live, pg_url, proxy.endpoint, scratch_dir, work_root / f"serve-blob-cmp-{spec.name}.log"
+            proc, base_url, _ = restart_serve_blob(
+                server_owner, lambda: start_owned(f"serve-blob-cmp-{spec.name}.log")
             )
             sampler.set_pids([proc.pid], new_epoch=True)
             proxy.reset_counters()
@@ -470,7 +473,7 @@ def run_live_serve_blob_eval(
         active = sys.exc_info()[1]
         s3_at_cleanup = s3_snapshot()
         cleanup = run_cleanup_steps(
-            stop_server=(lambda: stop_serve_blob(proc, log_f)) if proc is not None else None,
+            stop_server=server_owner.stop if server_owner.has_owner else None,
             stop_proxy=proxy.stop if proxy is not None else None,
             stop_sampler=sampler.stop if sampler is not None else None,
             drop_schema=(

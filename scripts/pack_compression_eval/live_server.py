@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
 import os
@@ -15,12 +16,14 @@ import urllib.parse
 
 from .cleanup_diagnostics import StopPostcondition
 from .corpus import run_git, url_quote_repo
+from .failure_diagnostics import LiveEvalFailure, build_failure_record
 from .failure_diagnostics import LiveEvalFailure, git_failure_record
 from .pack_matrix import PackConfigSpec, kill_process_group
 from .telemetry import http_json_timed, verify_binary_receipt
 
 __all__ = [
     "LiveEnvSpec",
+    "ServeBlobOwner",
     "append_search_path",
     "cli_exec",
     "clone_and_fsck",
@@ -29,6 +32,7 @@ __all__ = [
     "push_with_pack_config",
     "query_repo_pg_pack_bytes",
     "resolve_live_env",
+    "restart_serve_blob",
     "start_serve_blob",
     "stop_serve_blob",
     "verify_binary_receipt",
@@ -145,6 +149,50 @@ def query_repo_pg_pack_bytes(pg_url: str, env: dict[str, str], repo_id: str) -> 
     return json.loads(out)
 
 
+class ServeBlobOwner:
+    """Mutable owner for the log handle and Popen acquired by start_serve_blob."""
+
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen[bytes] | None = None
+        self.log_f: Any = None
+
+    @property
+    def has_owner(self) -> bool:
+        return self.proc is not None or self.log_f is not None
+
+    def register_log(self, log_f: Any) -> None:
+        self.log_f = log_f
+
+    def register_proc(self, proc: subprocess.Popen[bytes]) -> None:
+        self.proc = proc
+
+    def close_log(self) -> None:
+        if self.log_f is not None:
+            try:
+                self.log_f.close()
+            except Exception:  # noqa: BLE001 - preserve the primary startup outcome
+                pass
+            self.log_f = None
+
+    def stop(self) -> StopPostcondition:
+        if self.proc is None:
+            self.close_log()
+            return StopPostcondition("server", True, "not_started")
+        outcome = stop_serve_blob(self.proc, self.log_f)
+        if outcome.stopped:
+            self.proc = None
+            self.log_f = None
+        return outcome
+
+
+def restart_serve_blob(owner: ServeBlobOwner, start: Callable[[], Any]) -> Any:
+    """Start a replacement only after the old owner reports a confirmed reap."""
+    outcome = owner.stop()
+    if not outcome.stopped:
+        raise LiveEvalFailure(build_failure_record(phase="cleanup", failure_class="cleanup_failure"))
+    return start()
+
+
 def start_serve_blob(
     binary: str,
     git_bin: str,
@@ -153,7 +201,12 @@ def start_serve_blob(
     s3_endpoint: str,
     scratch_dir: Path,
     log_path: Path,
+    *,
+    owner: ServeBlobOwner | None = None,
 ) -> tuple[subprocess.Popen[bytes], str, Any]:
+    owned = owner if owner is not None else ServeBlobOwner()
+    if owned.has_owner:
+        raise LiveEvalFailure(build_failure_record(phase="cleanup", failure_class="cleanup_failure"))
     if scratch_dir.exists():
         shutil.rmtree(scratch_dir)
     scratch_dir.mkdir(parents=True, mode=0o700)
@@ -185,24 +238,41 @@ def start_serve_blob(
     if live.s3_session_token:
         proc_env["ROOTYARD_BLOB_SESSION_TOKEN"] = live.s3_session_token
     log_f = open(log_path, "ab")
+    owned.register_log(log_f)
     kw: dict[str, Any] = {"env": proc_env, "stdout": log_f, "stderr": subprocess.STDOUT}
     if hasattr(os, "setsid"):
         kw["start_new_session"] = True
-    proc = subprocess.Popen([binary, "serve-blob"], **kw)
+    try:
+        proc = subprocess.Popen([binary, "serve-blob"], **kw)
+    except Exception:  # noqa: BLE001 - fixed finite startup failure, no raw process text
+        owned.close_log()
+        raise LiveEvalFailure(
+            build_failure_record(phase="live_setup", failure_class="popen_failed")
+        ) from None
+    except BaseException:
+        owned.close_log()
+        raise
+    owned.register_proc(proc)
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            log_f.close()
-            tail = log_path.read_bytes()[-2048:].decode("utf-8", errors="replace") if log_path.is_file() else ""
-            raise RuntimeError(f"serve-blob exited early rc={proc.returncode}: {tail[-400:]}")
+            if owner is None:
+                owned.stop()
+            raise LiveEvalFailure(
+                build_failure_record(phase="live_setup", failure_class="exited_early")
+            )
         st, body, _, _ = http_json_timed(base_url, "/health/ready", timeout=2)
         if st == 200 and body == b"ready":
             return proc, base_url, log_f
         time.sleep(0.1)
-    kill_process_group(proc)
-    log_f.close()
-    tail = log_path.read_bytes()[-2048:].decode("utf-8", errors="replace") if log_path.is_file() else ""
-    raise RuntimeError(f"serve-blob failed readiness probe within 30s: {tail[-400:]}")
+    if owner is None:
+        outcome = owned.stop()
+        if not outcome.stopped:
+            kill_process_group(proc)
+            owned.close_log()
+    raise LiveEvalFailure(
+        build_failure_record(phase="live_setup", failure_class="readiness_timeout")
+    )
 
 
 def stop_serve_blob(proc: subprocess.Popen[bytes], log_f: Any) -> StopPostcondition:
@@ -213,7 +283,7 @@ def stop_serve_blob(proc: subprocess.Popen[bytes], log_f: Any) -> StopPostcondit
         except (OSError, subprocess.TimeoutExpired):
             kill_process_group(proc)
     reaped = proc.poll() is not None
-    if log_f is not None:
+    if reaped and log_f is not None:
         try:
             log_f.close()
         except OSError:

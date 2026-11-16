@@ -129,6 +129,9 @@ def _attempt_step(
             return record, f"{prefix}_unverified"
         if not result.stopped:
             return record, f"{prefix}_incomplete"
+        if name == "server" and result.reason == "not_started":
+            record.update(status="ok", reaped=False)
+            return record, None
     elif name == "psql" and getattr(result, "returncode", 0) != 0:
         return record, "psql_nonzero"
     elif name == "scratch" and result is not True:

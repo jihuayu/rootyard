@@ -40,6 +40,9 @@ FAILURE_CLASSES = (
     "git_push",
     "git_timeout",
     "git_spawn",
+    "popen_failed",
+    "exited_early",
+    "readiness_timeout",
     "cleanup_failure",
     "unclassified",
 )

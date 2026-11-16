@@ -289,9 +289,11 @@ class StopPostconditionTest(unittest.TestCase):
 
     def test_server_wait_timeout_stays_incomplete_when_not_reaped(self) -> None:
         proc = _FakeProc([None, None], wait_error=subprocess.TimeoutExpired("stop", 5))
+        log = _FakeLog()
         with mock.patch.object(live_server, "kill_process_group", return_value=False) as kill:
-            outcome = live_server.stop_serve_blob(proc, _FakeLog())
+            outcome = live_server.stop_serve_blob(proc, log)
         self.assertEqual(outcome, StopPostcondition("server", False, "poll_alive"))
+        self.assertFalse(log.closed)
         kill.assert_called_once_with(proc)
 
     def test_kill_process_group_returns_actual_poll_state(self) -> None:

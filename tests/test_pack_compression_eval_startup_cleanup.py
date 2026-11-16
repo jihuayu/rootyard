@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from pack_compression_eval import e2e_serve_blob as e2e  # noqa: E402
+from pack_compression_eval import live_server  # noqa: E402
 from pack_compression_eval.cleanup_diagnostics import StopPostcondition  # noqa: E402
 from pack_compression_eval.failure_diagnostics import (  # noqa: E402
     LiveEvalFailure,
@@ -183,6 +185,191 @@ class PartialStartupCleanupTest(unittest.TestCase):
         self.assertEqual(original.record["completed"]["baseline_seed_pushes_completed"], 0)
         self.assertEqual(original.record["bindings"]["binary_sha256"], HEX64)
         self.assertEqual(original.record["cleanup"]["failures"], [])
+
+
+class _FakeLog:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _StartProc:
+    pid = 111
+
+    def __init__(self, poll_value: int | None = None) -> None:
+        self.poll_value = poll_value
+        self.terminated = False
+        self.killed = False
+        self.waits: list[float] = []
+
+    def poll(self) -> int | None:
+        return self.poll_value
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout: float) -> int:
+        self.waits.append(timeout)
+        return 0
+
+
+class ServerOwnerTest(unittest.TestCase):
+    def live(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            s3_bucket="bucket",
+            s3_region="region",
+            s3_access_key="access",
+            s3_secret_key="secret",
+            s3_root="root",
+            s3_session_token=None,
+        )
+
+    def start(
+        self,
+        *,
+        proc: _StartProc | None = None,
+        popen_error: BaseException | None = None,
+        ready: bool = False,
+    ):
+        with tempfile.TemporaryDirectory(prefix="pack-eval-owner-") as tmp:
+            root = Path(tmp)
+            owner = live_server.ServeBlobOwner()
+            log = _FakeLog()
+            process = proc or _StartProc()
+            ticks = iter([0.0, 0.0, 31.0])
+            clock = SimpleNamespace(monotonic=lambda: next(ticks, 31.0), sleep=lambda _: None)
+            with (
+                mock.patch.object(live_server, "_pick_free_port", return_value=12345),
+                mock.patch.object(live_server, "open", return_value=log, create=True),
+                mock.patch.object(
+                    live_server,
+                    "http_json_timed",
+                    return_value=(200, b"ready", {}, 1.0) if ready else (503, b"", {}, 1.0),
+                ),
+                mock.patch.object(live_server, "time", clock),
+                mock.patch.object(live_server.subprocess, "Popen", return_value=process, side_effect=popen_error),
+            ):
+                try:
+                    result = live_server.start_serve_blob(
+                        "binary", "git", self.live(), "dsn", "http://s3",
+                        root / "scratch", root / "server.log", owner=owner,
+                    )
+                except BaseException as caught:
+                    return caught, owner, log, process, root
+                return result, owner, log, process, root
+
+    def test_popen_failure_closes_log_and_reports_finite_class(self) -> None:
+        error, owner, log, _process, _root = self.start(popen_error=OSError("raw process text"))
+        self.assertIsInstance(error, LiveEvalFailure)
+        self.assertEqual(error.record["phase"], "live_setup")
+        self.assertEqual(error.record["failure_class"], "popen_failed")
+        self.assertFalse(owner.has_owner)
+        self.assertTrue(log.closed)
+        self.assertNotIn("raw process text", json.dumps(error.record, sort_keys=True))
+
+    def test_readiness_failure_retains_owned_proc_and_open_log(self) -> None:
+        proc = _StartProc()
+        error, owner, log, _process, _root = self.start(proc=proc)
+        self.assertIsInstance(error, LiveEvalFailure)
+        self.assertEqual(error.record["failure_class"], "readiness_timeout")
+        self.assertIs(owner.proc, proc)
+        self.assertIs(owner.log_f, log)
+        self.assertFalse(log.closed)
+
+        outcome = owner.stop()
+        self.assertFalse(outcome.stopped)
+        self.assertEqual(outcome.reason, "poll_alive")
+        self.assertTrue(owner.has_owner)
+        self.assertFalse(log.closed)
+
+    def test_early_exit_retains_owner_until_confirmed_reap(self) -> None:
+        proc = _StartProc(poll_value=1)
+        error, owner, log, _process, _root = self.start(proc=proc)
+        self.assertIsInstance(error, LiveEvalFailure)
+        self.assertEqual(error.record["failure_class"], "exited_early")
+        self.assertIs(owner.proc, proc)
+        self.assertFalse(log.closed)
+
+        outcome = owner.stop()
+        self.assertTrue(outcome.stopped)
+        self.assertEqual(outcome.reason, "reaped")
+        self.assertFalse(owner.has_owner)
+        self.assertTrue(log.closed)
+
+    def test_success_registers_owner_before_return(self) -> None:
+        result, owner, log, proc, _root = self.start(ready=True)
+        returned_proc, base_url, returned_log = result
+        self.assertIs(returned_proc, proc)
+        self.assertEqual(base_url, "http://127.0.0.1:12345")
+        self.assertIs(returned_log, log)
+        self.assertIs(owner.proc, proc)
+        self.assertIs(owner.log_f, log)
+        self.assertFalse(log.closed)
+
+    def test_start_refuses_to_overwrite_existing_owner(self) -> None:
+        owner = live_server.ServeBlobOwner()
+        proc = _StartProc()
+        log = _FakeLog()
+        owner.register_proc(proc)
+        owner.register_log(log)
+        with self.assertRaises(LiveEvalFailure) as caught:
+            live_server.start_serve_blob(
+                "binary", "git", self.live(), "dsn", "http://s3",
+                Path("/tmp/never-created"), Path("/tmp/never-opened.log"), owner=owner,
+            )
+        self.assertEqual(caught.exception.record["phase"], "cleanup")
+        self.assertEqual(caught.exception.record["failure_class"], "cleanup_failure")
+        self.assertIs(owner.proc, proc)
+        self.assertIs(owner.log_f, log)
+        self.assertFalse(log.closed)
+
+    def test_baseline_restart_rejects_unreaped_owner_before_start(self) -> None:
+        owner = live_server.ServeBlobOwner()
+        owner.register_proc(_StartProc())
+        owner.register_log(_FakeLog())
+        start = mock.Mock(side_effect=AssertionError("replacement started"))
+        with mock.patch.object(live_server, "kill_process_group", return_value=False):
+            with self.assertRaises(LiveEvalFailure) as caught:
+                live_server.restart_serve_blob(owner, start)
+        self.assertEqual(caught.exception.record["phase"], "cleanup")
+        self.assertEqual(caught.exception.record["failure_class"], "cleanup_failure")
+        start.assert_not_called()
+        self.assertTrue(owner.has_owner)
+
+    def test_candidate_restart_rejects_unreaped_owner_before_start(self) -> None:
+        owner = live_server.ServeBlobOwner()
+        owner.register_proc(_StartProc())
+        owner.register_log(_FakeLog())
+        start = mock.Mock(side_effect=AssertionError("replacement started"))
+        with mock.patch.object(live_server, "kill_process_group", return_value=False):
+            with self.assertRaises(LiveEvalFailure):
+                live_server.restart_serve_blob(owner, start)
+        start.assert_not_called()
+        self.assertTrue(owner.has_owner)
+
+    def test_confirmed_reap_clears_old_owner_before_fresh_start(self) -> None:
+        owner = live_server.ServeBlobOwner()
+        old_log = _FakeLog()
+        owner.register_proc(_StartProc(poll_value=0))
+        owner.register_log(old_log)
+        fresh_proc = _StartProc()
+        fresh_log = _FakeLog()
+
+        def start() -> str:
+            self.assertFalse(owner.has_owner)
+            owner.register_proc(fresh_proc)
+            owner.register_log(fresh_log)
+            return "fresh-owner"
+
+        self.assertEqual(live_server.restart_serve_blob(owner, start), "fresh-owner")
+        self.assertTrue(old_log.closed)
+        self.assertIs(owner.proc, fresh_proc)
+        self.assertIs(owner.log_f, fresh_log)
 
 
 if __name__ == "__main__":
