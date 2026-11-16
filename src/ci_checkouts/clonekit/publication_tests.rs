@@ -56,7 +56,7 @@ fn manifest(
     .expect("valid test manifest")
 }
 
-fn empty_artifacts(repository_id: Uuid, kit_generation: u64) -> BuiltCloneKitArtifacts {
+pub(super) fn empty_artifacts(repository_id: Uuid, kit_generation: u64) -> BuiltCloneKitArtifacts {
     BuiltCloneKitArtifacts {
         manifest: manifest(repository_id, kit_generation, CloneKitStatus::EmptyRepository, None, None),
         staged_pack_path: None,

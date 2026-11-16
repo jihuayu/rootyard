@@ -485,3 +485,7 @@ mod publication_tests;
 #[cfg(test)]
 #[path = "publication_race_tests.rs"]
 mod publication_race_tests;
+
+#[cfg(test)]
+#[path = "publication_barrier_tests.rs"]
+mod publication_barrier_tests;
