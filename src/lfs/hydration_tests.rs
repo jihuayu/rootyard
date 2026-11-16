@@ -399,21 +399,19 @@ async fn delayed_repair_holds_write_admission_and_rechecks_live_tenant() {
     handle.await.unwrap().unwrap();
     assert!(mock.objects.lock().unwrap().keys().any(|k| k.ends_with(&format!("tenants/{owner_a}/lfs/{oid}"))));
 
-    // After ownership transfer completes to owner_b, repair must target owner_b and refuse active transfers.
+    // After ownership transfer completes to owner_b, repair must target owner_b and skip while transferring.
     let xfer = Uuid::new_v4();
     c.execute("UPDATE repositories SET owner_id=$2 WHERE id=$1", &[&repo_id, &owner_b]).await.unwrap();
     c.execute("UPDATE lfs_objects SET tenant_id=$2 WHERE repository_id=$1", &[&repo_id, &owner_b]).await.unwrap();
     c.execute("INSERT INTO repository_transfers(id, repository_id, state) VALUES($1,$2,'copying_remote')", &[&xfer, &repo_id])
         .await
         .unwrap();
-    assert!(
-        repair_remote_object_with_store(
-            &pool, &root, store_arc.as_ref(), repo_id, &oid, payload.len() as u64,
-            Instant::now() + Duration::from_secs(10),
-        )
-        .await
-        .is_err()
-    );
+    repair_remote_object_with_store(
+        &pool, &root, store_arc.as_ref(), repo_id, &oid, payload.len() as u64,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
     assert!(!mock.objects.lock().unwrap().keys().any(|k| k.ends_with(&format!("tenants/{owner_b}/lfs/{oid}"))));
     c.execute("UPDATE repository_transfers SET state='completed' WHERE id=$1", &[&xfer]).await.unwrap();
     repair_remote_object_with_store(
