@@ -17,6 +17,9 @@ if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 
 from backup import BackupHarness  # noqa: E402
+from organizations_direct_view_acceptance import (  # noqa: E402
+    run_direct_read_view_bundle_revocation,
+)
 from web_sessions import BrowserHarness  # noqa: E402
 
 LFS_MIME = "application/vnd.git-lfs+json"
@@ -390,6 +393,9 @@ class OrganizationLifecycleHarness(BackupHarness, BrowserHarness):
             "team_downgrade_and_member_removal_immediate": True,
         }
 
+    def direct_read_view_bundle_revocation(self):
+        return run_direct_read_view_bundle_revocation(self)
+
     def restart_backup_restore_and_isolation(self):
         # 1. Process restart durability before backup.
         self.stop()
@@ -499,6 +505,7 @@ def main():
         for name, fn in [
             ("namespace_and_org_team_crud", h.prepare_and_org_crud),
             ("consistent_rbac_and_revocation_across_surfaces", h.consistent_rbac_and_revocation),
+            ("direct_read_view_bundle_revocation", h.direct_read_view_bundle_revocation),
             ("restart_backup_restore_and_tenant_isolation", h.restart_backup_restore_and_isolation),
         ]:
             h.case(name, fn)
