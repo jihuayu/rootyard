@@ -392,6 +392,7 @@ def run_benchmark(
     ]
     return {
         "issue": 177,
+        "evaluation_scope": "standalone_stock_git_blob_baseline_not_full_http_pg_server",
         "sla_policy": "observed_baseline_only_no_production_sla",
         "target_calibration_issue": 164,
         "binding": _source_binding(binary, build_receipt),

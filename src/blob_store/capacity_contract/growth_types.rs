@@ -88,12 +88,16 @@ pub struct CompactionOutcome {
 #[serde(deny_unknown_fields)]
 pub struct GrowthEngineSnapshot {
     pub epoch: u64,
+    pub closure_revision: u64,
     pub active_frontier_len: usize,
     pub cumulative_packs_added: u64,
     pub no_new_pack_pushes: u64,
     pub compactions_completed: u64,
     pub active_serving_pack_bytes: u64,
     pub historical_retained_pack_bytes: u64,
+    pub failed_attempt_count: u64,
+    pub failed_attempt_blob_bytes: u64,
+    pub resident_replay_ops: usize,
     pub total_blob_put_bytes: u64,
     pub total_blob_get_bytes: u64,
     pub peak_scratch_bytes: u64,

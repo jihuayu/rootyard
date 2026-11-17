@@ -18,12 +18,28 @@ use super::ledger_types::{
 pub struct RetentionLedger {
     policy: LedgerBudgetPolicy,
     entries: BTreeMap<Uuid, LedgerEntry>,
+    archived_memberships: usize,
+    archived_registrations: usize,
+    archived_receipts: usize,
+    archived_cold_logical_bytes: u64,
     archived_checkpoint_digest: String,
 }
 
 impl RetentionLedger {
     pub fn new(policy: LedgerBudgetPolicy) -> Self {
-        Self { policy, entries: BTreeMap::new(), archived_checkpoint_digest: hex::encode(Sha256::digest(b"empty-v1")) }
+        Self {
+            policy,
+            entries: BTreeMap::new(),
+            archived_memberships: 0,
+            archived_registrations: 0,
+            archived_receipts: 0,
+            archived_cold_logical_bytes: 0,
+            archived_checkpoint_digest: hex::encode(Sha256::digest(b"empty-v1")),
+        }
+    }
+
+    pub fn resident_entries_len(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn policy(&self) -> LedgerBudgetPolicy {
@@ -89,6 +105,13 @@ impl RetentionLedger {
                 resource: "logical_bytes",
                 current: hot_b,
                 limit: self.policy.repo_max_logical_bytes,
+            });
+        }
+        if self.entries.len().saturating_add(1) > self.policy.repo_max_resident_entries {
+            return Err(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "resident_entries",
+                current: self.entries.len() as u64,
+                limit: self.policy.repo_max_resident_entries as u64,
             });
         }
         Ok(())
@@ -218,10 +241,9 @@ impl RetentionLedger {
 
     pub fn archive_released_entries(&mut self) -> usize {
         let mut newly_archived = Vec::new();
-        for entry in self.entries.values_mut() {
+        for entry in self.entries.values() {
             if entry.classification() == RetentionClassification::ReleasedEligibleForArchive {
-                entry.archived = true;
-                newly_archived.push((entry.entry_id, entry.logical_bytes));
+                newly_archived.push((entry.entry_id, entry.kind, entry.logical_bytes));
             }
         }
         if newly_archived.is_empty() {
@@ -229,9 +251,16 @@ impl RetentionLedger {
         }
         let mut hasher = Sha256::new();
         hasher.update(self.archived_checkpoint_digest.as_bytes());
-        for (id, bytes) in &newly_archived {
+        for (id, kind, bytes) in &newly_archived {
             hasher.update(id.as_bytes());
             hasher.update(bytes.to_be_bytes());
+            self.archived_cold_logical_bytes = self.archived_cold_logical_bytes.saturating_add(*bytes);
+            match kind {
+                LedgerEntryKind::Membership => self.archived_memberships += 1,
+                LedgerEntryKind::Registration => self.archived_registrations += 1,
+                LedgerEntryKind::Receipt => self.archived_receipts += 1,
+            }
+            self.entries.remove(id);
         }
         self.archived_checkpoint_digest = hex::encode(hasher.finalize());
         newly_archived.len()
@@ -239,6 +268,10 @@ impl RetentionLedger {
 
     pub fn summary(&self) -> LedgerRetentionSummary {
         let mut out = LedgerRetentionSummary {
+            archived_memberships: self.archived_memberships,
+            archived_registrations: self.archived_registrations,
+            archived_receipts: self.archived_receipts,
+            archived_cold_logical_bytes: self.archived_cold_logical_bytes,
             archived_checkpoint_digest: self.archived_checkpoint_digest.clone(),
             ..Default::default()
         };
@@ -368,5 +401,25 @@ mod tests {
         ledger.release_hold(bid).unwrap();
         assert_eq!(ledger.get(r1).unwrap().classification(), RetentionClassification::ReleasedEligibleForArchive);
         assert_eq!(ledger.archive_released_entries(), 2);
+        assert_eq!(ledger.resident_entries_len(), 0);
+        assert_eq!(ledger.summary().archived_registrations, 2);
+    }
+
+    #[test]
+    fn resident_total_bound_fails_closed_until_released_entries_archived() {
+        let mut policy = LedgerBudgetPolicy::from_contract(&PandoCapacityContract::current_standalone());
+        policy.repo_max_resident_entries = 2;
+        let mut ledger = RetentionLedger::new(policy);
+        let p1 = Uuid::new_v4();
+        ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Membership, Some(p1), None, 512, 1).unwrap();
+        ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Receipt, Some(p1), None, 512, 1).unwrap();
+        assert!(matches!(
+            ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Receipt, None, None, 512, 2),
+            Err(LedgerRetentionError::LedgerBudgetExhausted { resource: "resident_entries", .. })
+        ));
+        ledger.record_compaction_superseded(2, &BTreeSet::from([p1]));
+        assert_eq!(ledger.archive_released_entries(), 2);
+        assert_eq!(ledger.resident_entries_len(), 0);
+        assert!(ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Receipt, None, None, 512, 2).is_ok());
     }
 }

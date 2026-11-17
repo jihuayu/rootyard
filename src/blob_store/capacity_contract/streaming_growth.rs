@@ -5,7 +5,7 @@
 //! cancellation tombstones, pins/roots/backups, and no-delete compaction.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Mutex,
     time::Instant,
 };
@@ -15,9 +15,12 @@ use uuid::Uuid;
 use super::{
     admission::AdmissionController,
     admission_types::{AdmissionClass, AdmissionLimits, AdmissionRejection, AdmissionRequest},
-    git_ops::{ObjectFormat, PackDownloadRef, UploadScope, hash_file_bounded, inspect_pack_file, upload_pack_pair},
+    git_ops::{
+        GitProcessLimits, ObjectFormat, PackDownloadRef, UploadScope, hash_file_bounded, inspect_pack_file,
+        upload_pack_pair,
+    },
     git_views::{CompactViewInput, VerifyViewInput, compact_packs_in_view, verify_frontier_in_view},
-    growth_state::{CommitPushInput, EngineState, apply_cas_mutations, validate_mutations},
+    growth_state::{CommitCompactionInput, CommitPushInput, EngineState, apply_cas_mutations, validate_mutations},
     growth_types::{
         CompactionOutcome, EngineScope, GrowthEngineError, GrowthEngineSnapshot, IncrementalPushRequest, PushOutcome,
         VerifiedPackRecord,
@@ -67,15 +70,21 @@ impl StreamingGrowthEngine {
             auto_compact: scope.auto_compact,
             state: Mutex::new(EngineState {
                 epoch: 0,
+                closure_revision: 0,
                 active_packs: Vec::new(),
                 retained_old_packs: Vec::new(),
+                failed_attempt_packs: Vec::new(),
                 acked_refs: BTreeMap::new(),
                 pinned_commits: BTreeMap::new(),
                 replayed_operations: BTreeMap::new(),
+                replay_order: VecDeque::new(),
                 cancelled_operations: BTreeSet::new(),
+                cancel_order: VecDeque::new(),
                 cumulative_packs_added: 0,
                 no_new_pack_pushes: 0,
                 compactions_completed: 0,
+                failed_attempt_count: 0,
+                failed_attempt_blob_bytes: 0,
                 total_blob_put_bytes: 0,
                 total_blob_get_bytes: 0,
                 peak_scratch_bytes: 0,
@@ -116,12 +125,22 @@ impl StreamingGrowthEngine {
             .collect()
     }
 
+    pub fn failed_attempt_pack_locators(&self) -> Vec<BlobLocator> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .failed_attempt_packs
+            .iter()
+            .map(|p| p.pack_locator.clone())
+            .collect()
+    }
+
     pub fn cancel_operation(&self, operation_id: Uuid) -> Result<(), GrowthEngineError> {
         if operation_id.is_nil() {
             return Err(GrowthEngineError::InvalidInput("operation_id must be non-nil"));
         }
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).cancelled_operations.insert(operation_id);
-        Ok(())
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.record_cancel(operation_id, self.contract.streaming.max_resident_replay_ops)
     }
 
     pub fn attach_hold(&self, hold: ProtectionHold, pinned_oid: Option<String>) -> Result<usize, GrowthEngineError> {
@@ -135,13 +154,16 @@ impl StreamingGrowthEngine {
         let count = guard.ledger.attach_hold_to_active_frontier(hold);
         if let Some(oid) = pinned_oid {
             guard.pinned_commits.insert(hold_id, oid);
+            guard.closure_revision = guard.closure_revision.saturating_add(1);
         }
         Ok(count)
     }
 
     pub fn release_hold(&self, hold_id: Uuid) -> Result<usize, GrowthEngineError> {
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        guard.pinned_commits.remove(&hold_id);
+        if guard.pinned_commits.remove(&hold_id).is_some() {
+            guard.closure_revision = guard.closure_revision.saturating_add(1);
+        }
         Ok(guard.ledger.release_hold(hold_id)?)
     }
 
@@ -189,6 +211,7 @@ impl StreamingGrowthEngine {
 
         let (base_epoch, base_packs, base_refs) = {
             let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            guard.check_resident_pack_bound(self.contract.streaming.max_retained_pack_records, 0)?;
             (guard.epoch, guard.active_packs.clone(), guard.acked_refs.clone())
         };
         let base_pack_ids: BTreeSet<Uuid> = base_packs.iter().map(|p| p.pack_id).collect();
@@ -231,7 +254,22 @@ impl StreamingGrowthEngine {
                 authority_id: self.authority_id,
                 generation: target_epoch as i64,
             };
-            let uploaded = upload_pack_pair(&self.store, scope, pack_path, idx_path, deadline).await?;
+            let uploaded = match upload_pack_pair(&self.store, scope, pack_path, idx_path, deadline).await {
+                Ok(u) => u,
+                Err(err) => {
+                    if !uploaded_records.is_empty() || put_bytes > 0 {
+                        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.record_failed_upload(
+                            uploaded_records,
+                            put_bytes,
+                            0,
+                            0,
+                            self.contract.streaming.max_retained_pack_records,
+                        );
+                    }
+                    return Err(err.into());
+                }
+            };
             put_bytes = put_bytes.saturating_add(uploaded.pack_length).saturating_add(uploaded.idx_length);
             uploaded_records.push(VerifiedPackRecord {
                 pack_id: Uuid::new_v4(),
@@ -249,7 +287,7 @@ impl StreamingGrowthEngine {
 
         let download_refs: Vec<PackDownloadRef> =
             base_packs.iter().chain(uploaded_records.iter()).map(VerifiedPackRecord::as_download_ref).collect();
-        let verified = verify_frontier_in_view(
+        let verified = match verify_frontier_in_view(
             VerifyViewInput {
                 store: &self.store,
                 view_root: &self.view_root,
@@ -258,13 +296,31 @@ impl StreamingGrowthEngine {
                 format: self.object_format,
                 packs: &download_refs,
                 refs: &resulting_refs,
+                pinned_oids: &[],
                 max_objects: self.contract.verifier.max_objects_per_window,
                 max_total_bytes: self.contract.verifier.max_total_bytes_per_window,
+                max_single_object_bytes: self.contract.streaming.max_single_object_bytes,
+                max_view_logical_bytes: self.contract.verifier.view_max_logical_bytes,
+                process_limits: GitProcessLimits::from_verifier(&self.contract.verifier),
                 full_fsck: false,
             },
             deadline,
         )
-        .await?;
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                guard.record_failed_upload(
+                    uploaded_records,
+                    put_bytes,
+                    0,
+                    0,
+                    self.contract.streaming.max_retained_pack_records,
+                );
+                return Err(err.into());
+            }
+        };
         permit.shrink_workspace(total_bytes);
 
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -283,13 +339,17 @@ impl StreamingGrowthEngine {
     }
 
     pub async fn compact_serving_frontier(&self, deadline: Instant) -> Result<CompactionOutcome, GrowthEngineError> {
-        let (base_epoch, target_packs, refs_snap, pins_snap) = {
+        let (base_epoch, base_closure_rev, target_packs, refs_snap, pins_snap) = {
             let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if guard.active_packs.is_empty() {
                 return Err(GrowthEngineError::InvalidInput("cannot compact empty active frontier"));
             }
+            guard.check_resident_pack_bound(
+                self.contract.streaming.max_retained_pack_records,
+                guard.active_packs.len(),
+            )?;
             let pins: Vec<String> = guard.pinned_commits.values().cloned().collect();
-            (guard.epoch, guard.active_packs.clone(), guard.acked_refs.clone(), pins)
+            (guard.epoch, guard.closure_revision, guard.active_packs.clone(), guard.acked_refs.clone(), pins)
         };
         let target_ids: BTreeSet<Uuid> = target_packs.iter().map(|p| p.pack_id).collect();
         let total_bytes: u64 = target_packs.iter().map(VerifiedPackRecord::total_bytes).sum();
@@ -303,7 +363,7 @@ impl StreamingGrowthEngine {
             active_frontier_packs: 0,
             declared_pack_bytes: total_bytes,
             declared_objects: total_objects,
-            max_single_object_bytes: total_bytes.max(1),
+            max_single_object_bytes: self.contract.streaming.max_single_object_bytes,
             estimated_memory_bytes: (self.contract.streaming.io_chunk_bytes as u64).saturating_mul(4),
             estimated_workspace_bytes: total_bytes.saturating_mul(2),
             required_fds: (target_packs.len() as u64).saturating_mul(2).saturating_add(RESERVED_GIT_OPEN_FDS),
@@ -324,28 +384,30 @@ impl StreamingGrowthEngine {
                 pinned_oids: &pins_snap,
                 max_objects: self.contract.verifier.max_objects_per_window,
                 max_total_bytes: self.contract.verifier.max_total_bytes_per_window,
+                max_single_object_bytes: self.contract.streaming.max_single_object_bytes,
+                max_view_logical_bytes: self.contract.verifier.view_max_logical_bytes,
+                process_limits: GitProcessLimits::from_verifier(&self.contract.verifier),
             },
             deadline,
         )
         .await?;
 
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).commit_compaction(
-            &target_ids,
-            summary.uploaded,
-            summary.blob_get_bytes,
-            summary.peak_scratch_bytes,
-            summary.oid_count,
-        )
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).commit_compaction(CommitCompactionInput {
+            target_ids: &target_ids,
+            expected_closure_rev: base_closure_rev,
+            max_retained_pack_records: self.contract.streaming.max_retained_pack_records,
+            uploaded: summary.uploaded,
+            blob_get_bytes: summary.blob_get_bytes,
+            peak_scratch_bytes: summary.peak_scratch_bytes,
+            oid_count: summary.oid_count,
+        })
     }
 
     pub async fn verify_full_serving_closure(&self, deadline: Instant) -> Result<usize, GrowthEngineError> {
-        let (packs, refs_snap) = {
+        let (packs, refs_snap, pins_snap) = {
             let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            let mut refs = guard.acked_refs.clone();
-            for (idx, oid) in guard.pinned_commits.values().enumerate() {
-                refs.insert(format!("refs/pando-pins/pin-{idx:04}"), oid.clone());
-            }
-            (guard.active_packs.clone(), refs)
+            let pins: Vec<String> = guard.pinned_commits.values().cloned().collect();
+            (guard.active_packs.clone(), guard.acked_refs.clone(), pins)
         };
         let dl_refs: Vec<PackDownloadRef> = packs.iter().map(VerifiedPackRecord::as_download_ref).collect();
         let summary = verify_frontier_in_view(
@@ -357,8 +419,12 @@ impl StreamingGrowthEngine {
                 format: self.object_format,
                 packs: &dl_refs,
                 refs: &refs_snap,
+                pinned_oids: &pins_snap,
                 max_objects: self.contract.verifier.max_objects_per_window,
                 max_total_bytes: self.contract.verifier.max_total_bytes_per_window,
+                max_single_object_bytes: self.contract.streaming.max_single_object_bytes,
+                max_view_logical_bytes: self.contract.verifier.view_max_logical_bytes,
+                process_limits: GitProcessLimits::from_verifier(&self.contract.verifier),
                 full_fsck: true,
             },
             deadline,
@@ -367,6 +433,6 @@ impl StreamingGrowthEngine {
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
         guard.total_blob_get_bytes = guard.total_blob_get_bytes.saturating_add(summary.blob_get_bytes);
         guard.peak_scratch_bytes = guard.peak_scratch_bytes.max(summary.peak_scratch_bytes);
-        Ok(refs_snap.len())
+        Ok(refs_snap.len().saturating_add(pins_snap.len()))
     }
 }

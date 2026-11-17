@@ -89,6 +89,7 @@ pub struct LedgerBudgetPolicy {
     pub repo_max_registrations: usize,
     pub repo_max_active_memberships: usize,
     pub repo_max_receipts: usize,
+    pub repo_max_resident_entries: usize,
 }
 
 impl LedgerBudgetPolicy {
@@ -98,6 +99,7 @@ impl LedgerBudgetPolicy {
             repo_max_registrations: contract.metadata_ledger.repo_max_registrations.max(0) as usize,
             repo_max_active_memberships: contract.metadata_ledger.repo_max_active_memberships,
             repo_max_receipts: contract.metadata_ledger.repo_max_receipts.max(0) as usize,
+            repo_max_resident_entries: contract.metadata_ledger.repo_max_resident_entries,
         }
     }
 }

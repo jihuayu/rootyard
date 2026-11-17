@@ -16,11 +16,14 @@ pub mod ledger_types;
 pub mod limits;
 pub mod streaming_growth;
 
+#[cfg(test)]
+mod growth_tests;
+
 pub use admission::{AdmissionController, AdmissionPermit};
 pub use admission_types::{
     AdmissionClass, AdmissionLimits, AdmissionRejection, AdmissionRequest, AdmissionTelemetrySnapshot,
 };
-pub use git_ops::{GitOpsError, ObjectFormat, PackDownloadRef, UploadScope, UploadedPackPair};
+pub use git_ops::{GitOpsError, GitProcessLimits, ObjectFormat, PackDownloadRef, UploadScope, UploadedPackPair};
 pub use git_views::{CompactViewInput, CompactedViewSummary, VerifiedViewSummary, VerifyViewInput};
 pub use growth_types::{
     CompactionOutcome, EngineScope, GrowthEngineError, GrowthEngineSnapshot, IncrementalPushRequest, PushOutcome,

@@ -70,6 +70,9 @@ pub const STREAMING_IO_CHUNK_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_QUEUE_WAITERS: usize = 32;
 pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 * MIB;
 pub const RESERVED_GIT_OPEN_FDS: u64 = 24;
+pub const DEFAULT_MAX_RESIDENT_LEDGER_ENTRIES: usize = 4096;
+pub const DEFAULT_MAX_RETAINED_PACK_RECORDS: usize = 1024;
+pub const DEFAULT_MAX_RESIDENT_REPLAY_OPS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +104,7 @@ pub struct MetadataLedgerContract {
     pub max_ack_body_bytes: usize,
     pub max_capture_refs: usize,
     pub max_plan_refs: usize,
+    pub repo_max_resident_entries: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +153,8 @@ pub struct StreamingGrowthContract {
     pub max_queue_waiters: usize,
     pub max_memory_bytes: u64,
     pub max_single_object_bytes: u64,
+    pub max_retained_pack_records: usize,
+    pub max_resident_replay_ops: usize,
     pub delete_during_compaction_enabled: bool,
 }
 
@@ -207,6 +213,7 @@ impl PandoCapacityContract {
                 max_ack_body_bytes: LEDGER_MAX_ACK_BODY_BYTES,
                 max_capture_refs: LEDGER_MAX_CAPTURE_REFS,
                 max_plan_refs: LEDGER_MAX_PLAN_REFS,
+                repo_max_resident_entries: DEFAULT_MAX_RESIDENT_LEDGER_ENTRIES,
             },
             blob: BlobLayerContract {
                 max_object_bytes: MAX_OBJECT_BYTES,
@@ -246,6 +253,8 @@ impl PandoCapacityContract {
                 max_queue_waiters: DEFAULT_MAX_QUEUE_WAITERS,
                 max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
                 max_single_object_bytes: VERIFIER_WINDOW_MAX_TOTAL_BYTES,
+                max_retained_pack_records: DEFAULT_MAX_RETAINED_PACK_RECORDS,
+                max_resident_replay_ops: DEFAULT_MAX_RESIDENT_REPLAY_OPS,
                 delete_during_compaction_enabled: false,
             },
         }
@@ -298,6 +307,14 @@ impl PandoCapacityContract {
         }
         if self.streaming.max_queue_waiters == 0 || self.streaming.max_single_object_bytes == 0 {
             return Err(CapacityContractError::InvalidBound("queue and object limits must be positive"));
+        }
+        if self.metadata_ledger.repo_max_resident_entries == 0
+            || self.streaming.max_retained_pack_records == 0
+            || self.streaming.max_resident_replay_ops == 0
+        {
+            return Err(CapacityContractError::InvalidBound(
+                "resident ledger, retained pack, and replay caps must be positive",
+            ));
         }
         if self.streaming.delete_during_compaction_enabled {
             return Err(CapacityContractError::CrossLayerViolation(
@@ -352,6 +369,7 @@ mod tests {
         assert!(contract.validate().is_ok());
         assert!(contract.gateway_exceeds_verifier_window());
         assert_eq!(contract.metadata_ledger.repo_max_logical_bytes, 8 * 1024 * 1024);
+        assert_eq!(contract.metadata_ledger.repo_max_active_memberships, 16);
         assert_eq!(contract.verifier.max_pairs_per_window, 16);
         assert_eq!(contract.verifier.max_total_bytes_per_window, 64 * 1024 * 1024);
         assert_eq!(contract.verifier.max_objects_per_window, 16_384);

@@ -15,10 +15,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 use uuid::Uuid;
 
-use super::limits::STREAMING_IO_CHUNK_BYTES;
+use super::limits::{STREAMING_IO_CHUNK_BYTES, VerifierLayerContract};
 use crate::blob_store::{
     BlobError, BlobLocator, BlobReceipt,
     disposable_view::{DisposableViewError, TempViewLease},
@@ -128,6 +131,34 @@ pub(super) enum GitStdin<'a> {
     File(&'a Path),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct GitProcessLimits {
+    pub cpu_seconds: u64,
+    pub address_space_bytes: u64,
+    pub file_size_bytes: u64,
+    pub max_open_files: u64,
+    pub pipe_bytes: usize,
+}
+
+impl GitProcessLimits {
+    pub fn from_verifier(v: &VerifierLayerContract) -> Self {
+        Self {
+            cpu_seconds: v.git_cpu_seconds,
+            address_space_bytes: v.git_address_space_bytes,
+            file_size_bytes: v.git_file_size_bytes,
+            max_open_files: v.git_nofile,
+            pipe_bytes: v.pipe_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GitViewLimits {
+    pub max_objects: u64,
+    pub max_total_bytes: u64,
+    pub process: GitProcessLimits,
+}
+
 pub fn inspect_pack_file(path: &Path) -> Result<(String, u64, u64), GitOpsError> {
     let mut file = fs::File::open(path).map_err(|e| GitOpsError::Io(e.to_string()))?;
     let mut hasher = Sha256::new();
@@ -207,10 +238,49 @@ pub async fn upload_pack_pair(
     Ok(UploadedPackPair { pack_receipt, idx_receipt, pack_sha256, pack_length, idx_sha256, idx_length, object_count })
 }
 
+#[cfg(unix)]
+fn apply_child_rlimits(limits: GitProcessLimits) -> std::io::Result<()> {
+    // SAFETY: calls only async-signal-safe libc setters between fork and exec.
+    if unsafe { libc::setpgid(0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for (resource, raw_limit) in [
+        (libc::RLIMIT_AS, limits.address_space_bytes),
+        (libc::RLIMIT_CPU, limits.cpu_seconds),
+        (libc::RLIMIT_FSIZE, limits.file_size_bytes),
+        (libc::RLIMIT_NOFILE, limits.max_open_files),
+        (libc::RLIMIT_CORE, 0),
+    ] {
+        let mut cur = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: cur points to a valid initialized rlimit struct.
+        if unsafe { libc::getrlimit(resource, &mut cur) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let target = raw_limit.min(cur.rlim_max);
+        let value = libc::rlimit { rlim_cur: target, rlim_max: target };
+        // SAFETY: value is a valid bounded rlimit for a compile-time resource ID.
+        if unsafe { libc::setrlimit(resource, &value) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+async fn read_pipe_bounded<R: AsyncRead + Unpin>(reader: R, limit: usize) -> Result<Vec<u8>, GitOpsError> {
+    let mut buf = Vec::new();
+    let mut limited = reader.take(limit.saturating_add(1) as u64);
+    limited.read_to_end(&mut buf).await.map_err(|e| GitOpsError::Io(e.to_string()))?;
+    if buf.len() > limit {
+        return Err(GitOpsError::LimitExceeded("git child output exceeded pipe_bytes"));
+    }
+    Ok(buf)
+}
+
 pub(super) async fn run_git(
     repo_dir: &Path,
     args: &[&str],
     stdin_mode: GitStdin<'_>,
+    limits: GitProcessLimits,
     deadline: Instant,
 ) -> Result<Vec<u8>, GitOpsError> {
     let timeout = deadline.checked_duration_since(Instant::now()).ok_or(GitOpsError::DeadlineExceeded)?;
@@ -247,6 +317,11 @@ pub(super) async fn run_git(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(stdin_stdio);
+    #[cfg(unix)]
+    {
+        // SAFETY: apply_child_rlimits only runs async-signal-safe libc calls with zero allocation.
+        unsafe { cmd.pre_exec(move || apply_child_rlimits(limits)) };
+    }
     let mut child =
         cmd.spawn().map_err(|e| GitOpsError::GitFailed { command: cmd_name, detail: format!("spawn failed: {e}") })?;
     if let GitStdin::Bytes(bytes) = stdin_mode
@@ -257,16 +332,32 @@ pub(super) async fn run_git(
             .await
             .map_err(|e| GitOpsError::GitFailed { command: cmd_name, detail: format!("stdin write failed: {e}") })?;
     }
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| GitOpsError::DeadlineExceeded)?
-        .map_err(|e| GitOpsError::GitFailed { command: cmd_name, detail: e.to_string() })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let pipe_cap = limits.pipe_bytes.max(1024);
+    let stdout = child.stdout.take().ok_or_else(|| GitOpsError::Io("missing git stdout".into()))?;
+    let stderr = child.stderr.take().ok_or_else(|| GitOpsError::Io("missing git stderr".into()))?;
+    let wait_res = tokio::time::timeout(timeout, async {
+        tokio::try_join!(read_pipe_bounded(stdout, pipe_cap), read_pipe_bounded(stderr, pipe_cap), async {
+            child.wait().await.map_err(|e| GitOpsError::GitFailed { command: cmd_name, detail: e.to_string() })
+        })
+    })
+    .await;
+    let (out_bytes, err_bytes, status) = match wait_res {
+        Ok(Ok(tuple)) => tuple,
+        Ok(Err(err)) => {
+            let _ = child.start_kill();
+            return Err(err);
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            return Err(GitOpsError::DeadlineExceeded);
+        }
+    };
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&err_bytes);
         let detail = stderr.lines().next().unwrap_or("non-zero exit").to_owned();
         return Err(GitOpsError::GitFailed { command: cmd_name, detail });
     }
-    Ok(output.stdout)
+    Ok(out_bytes)
 }
 
 pub(super) fn dir_size_bytes(path: &Path) -> u64 {
@@ -305,15 +396,14 @@ pub(super) async fn populate_bare_view(
     store: &BlobStore,
     format: ObjectFormat,
     packs: &[PackDownloadRef],
-    max_objects: u64,
-    max_total_bytes: u64,
+    limits: GitViewLimits,
     deadline: Instant,
 ) -> Result<(PathBuf, u64, u64, u64), GitOpsError> {
     let repo_dir = lease.repo_path()?.to_path_buf();
     let incoming_dir = lease.dir_path()?.join("incoming");
     create_private_dir(&incoming_dir)?;
     let fmt_arg = format!("--object-format={}", format.as_str());
-    run_git(&repo_dir, &["init", "--bare", "--quiet", &fmt_arg], GitStdin::Null, deadline).await?;
+    run_git(&repo_dir, &["init", "--bare", "--quiet", &fmt_arg], GitStdin::Null, limits.process, deadline).await?;
 
     let mut total_bytes = 0u64;
     let mut total_objects = 0u64;
@@ -323,7 +413,7 @@ pub(super) async fn populate_bare_view(
     for (idx_num, pack_ref) in packs.iter().enumerate() {
         let pair_bytes = pack_ref.pack_length.saturating_add(pack_ref.idx_length);
         total_bytes = total_bytes.saturating_add(pair_bytes);
-        if total_bytes > max_total_bytes {
+        if total_bytes > limits.max_total_bytes {
             return Err(GitOpsError::LimitExceeded("window pack bytes exceed verifier limit"));
         }
         let pack_dst = incoming_dir.join(format!("p-{idx_num:04}.pack"));
@@ -361,17 +451,18 @@ pub(super) async fn populate_bare_view(
             return Err(GitOpsError::InvalidPack("downloaded idx SHA-256 or length mismatch"));
         }
         total_objects = total_objects.saturating_add(objs);
-        if total_objects > max_objects {
+        if total_objects > limits.max_objects {
             return Err(GitOpsError::LimitExceeded("window object count exceeds verifier limit"));
         }
 
         peak_scratch = peak_scratch.max(dir_size_bytes(lease.dir_path()?));
         let idx_arg = idx_dst.to_string_lossy().into_owned();
-        run_git(&repo_dir, &["verify-pack", &idx_arg], GitStdin::Null, deadline).await?;
+        run_git(&repo_dir, &["verify-pack", &idx_arg], GitStdin::Null, limits.process, deadline).await?;
         run_git(
             &repo_dir,
             &["-c", "pack.writeReverseIndex=false", "index-pack", "--stdin"],
             GitStdin::File(&pack_dst),
+            limits.process,
             deadline,
         )
         .await?;
