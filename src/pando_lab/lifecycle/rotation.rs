@@ -233,7 +233,7 @@ pub async fn rotate_kms_key_with_options(
         bail!("active Vault rotation requires PANDO_KMS_PROVIDER=vault-transit; refusing local-file mutation");
     }
     let s_root = object_store::store_root(config);
-    let packs = load_repo_packs(&c, repo).await?;
+    let packs = load_repo_packs(c, repo).await?;
     for pack in &packs {
         let existing = load_authoritative_envelope_optional(c, &config.root, repo, pack).await?;
         if let Some(env) = existing {
@@ -243,14 +243,14 @@ pub async fn rotate_kms_key_with_options(
             );
         }
     }
-    let (mut cp, _policy) = resolve_rotation_checkpoint(&c, &kms_dir, repo, opts, &packs).await?;
+    let (mut cp, _policy) = resolve_rotation_checkpoint(c, &kms_dir, repo, opts, &packs).await?;
     session.unlock_publication_exclusive(repo).await?;
     let provider = super::provider::PandoKmsProvider::open_existing(&kms_dir)?;
 
     let mut envelopes = Vec::with_capacity(packs.len());
     let mut rewrapped_this_run = 0usize;
     for pack in &packs {
-        let existing_env = load_authoritative_envelope_optional(&c, &config.root, repo, pack).await?;
+        let existing_env = load_authoritative_envelope_optional(c, &config.root, repo, pack).await?;
         if let Some(ref env) = existing_env {
             ensure_no_version_downgrade(
                 &env.provider_kind,
@@ -268,7 +268,7 @@ pub async fn rotate_kms_key_with_options(
             verify_pack_ciphertext_open(&provider, &s_root, repo, pack, env).await?;
             if !cp.completed_pack_ids.contains(&pack.id) {
                 cp.completed_pack_ids.push(pack.id);
-                persist_checkpoint(&c, &kms_dir, &cp).await?;
+                persist_checkpoint(c, &kms_dir, &cp).await?;
             }
             envelopes.push(env.clone());
             continue;
@@ -277,7 +277,7 @@ pub async fn rotate_kms_key_with_options(
             && rewrapped_this_run >= limit
         {
             cp.failed_pack_id = Some(pack.id);
-            persist_checkpoint(&c, &kms_dir, &cp).await?;
+            persist_checkpoint(c, &kms_dir, &cp).await?;
             bail!(
                 "fault injection: kms-rotate interrupted after {rewrapped_this_run} pack(s) before {} (state=IN_PROGRESS, resumable)",
                 pack.id
@@ -295,14 +295,14 @@ pub async fn rotate_kms_key_with_options(
                 object_store::put_pack_and_seal_with_suite(config, repo, pack.id, suite, tier).await?
             }
         };
-        upsert_envelope_in_db(&c, &updated).await?;
+        upsert_envelope_in_db(c, &updated).await?;
         write_envelope_file(&config.root, &updated)?;
         rewrapped_this_run += 1;
         cp.failed_pack_id = None;
         if !cp.completed_pack_ids.contains(&pack.id) {
             cp.completed_pack_ids.push(pack.id);
         }
-        persist_checkpoint(&c, &kms_dir, &cp).await?;
+        persist_checkpoint(c, &kms_dir, &cp).await?;
         envelopes.push(updated);
     }
 
@@ -341,10 +341,10 @@ pub async fn rotate_kms_key_with_options(
     envelopes = verified_envelopes;
     cp.state = "COMPLETED".to_owned();
     cp.failed_pack_id = None;
-    persist_checkpoint(&c, &kms_dir, &cp).await?;
+    persist_checkpoint(c, &kms_dir, &cp).await?;
     if cp.revoke_previous {
         let updated_policy = super::provider::revoke_key_in_dir(&kms_dir, &cp.from_key_id)?;
-        sync_kms_policy_to_db(&c, repo, &updated_policy).await?;
+        sync_kms_policy_to_db(c, repo, &updated_policy).await?;
     }
 
     Ok(KmsRotationReport {

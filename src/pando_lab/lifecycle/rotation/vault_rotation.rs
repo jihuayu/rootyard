@@ -179,8 +179,8 @@ pub(super) async fn rotate_vault_kms_key_with_options(
     let vault = VaultTransitProvider::from_env()?;
     let kms_dir = provider::resolve_kms_dir(&config.root, repo);
     let s_root = object_store::store_root(config);
-    let packs = load_repo_packs(&c, repo).await?;
-    let mut cp = resolve_vault_rotation_checkpoint(&c, &kms_dir, config, repo, opts, &packs, &vault).await?;
+    let packs = load_repo_packs(c, repo).await?;
+    let mut cp = resolve_vault_rotation_checkpoint(c, &kms_dir, config, repo, opts, &packs, &vault).await?;
     session.unlock_publication_exclusive(repo).await?;
     ensure!(cp.expected_version() == cp.to_key_version, "Vault rotation checkpoint version mismatch");
     let mut envelopes = Vec::with_capacity(packs.len());
@@ -207,7 +207,7 @@ pub(super) async fn rotate_vault_kms_key_with_options(
             verify_rewrapped_pack(&config.root, repo, pack, env, &cipher).await?;
             if !cp.completed_pack_ids.contains(&pack.id) {
                 cp.completed_pack_ids.push(pack.id);
-                persist_checkpoint(&c, &kms_dir, &cp).await?;
+                persist_checkpoint(c, &kms_dir, &cp).await?;
             }
             envelopes.push(env.clone());
             continue;
@@ -216,7 +216,7 @@ pub(super) async fn rotate_vault_kms_key_with_options(
             && rewrapped_this_run >= limit
         {
             cp.failed_pack_id = Some(pack.id);
-            persist_checkpoint(&c, &kms_dir, &cp).await?;
+            persist_checkpoint(c, &kms_dir, &cp).await?;
             bail!(
                 "fault injection: Vault kms-rotate interrupted after {rewrapped_this_run} pack(s) before {} (state=IN_PROGRESS, resumable)",
                 pack.id
@@ -246,14 +246,14 @@ pub(super) async fn rotate_vault_kms_key_with_options(
             }
             Some(_) => bail!("unsupported source provider kind during Vault rotation"),
         };
-        upsert_envelope_in_db(&c, &updated).await?;
+        upsert_envelope_in_db(c, &updated).await?;
         write_envelope_file(&config.root, &updated)?;
         rewrapped_this_run += 1;
         cp.failed_pack_id = None;
         if !cp.completed_pack_ids.contains(&pack.id) {
             cp.completed_pack_ids.push(pack.id);
         }
-        persist_checkpoint(&c, &kms_dir, &cp).await?;
+        persist_checkpoint(c, &kms_dir, &cp).await?;
         envelopes.push(updated);
     }
     session.acquire_publication_exclusive(repo).await?;
@@ -294,7 +294,7 @@ pub(super) async fn rotate_vault_kms_key_with_options(
     cp.state = "COMPLETED".to_owned();
     cp.reconcile_stage = KmsReconcileStage::TargetObserved;
     cp.failed_pack_id = None;
-    persist_checkpoint(&c, &kms_dir, &cp).await?;
+    persist_checkpoint(c, &kms_dir, &cp).await?;
     Ok(KmsRotationReport {
         repo,
         previous_key_id: cp.from_key_id,
