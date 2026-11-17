@@ -56,6 +56,21 @@ enum Event {
     FailedPredicate = 2,
 }
 
+/// Closed source-owned error classes. Raw error text, paths, object ids and
+/// provider payloads are never formatted into a frame.
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum ErrorKind {
+    Io = 1,
+    RefStoreTimeout = 2,
+    RefStoreUnsupported = 3,
+    StorageDatabase = 4,
+    RefStoreOther = 5,
+    GitProcess = 6,
+    Other = 7,
+    BlobProvider = 8,
+}
+
 // Site identifiers are the per-phase ordinals from the same fixed map.
 
 // Phase 1: setup.
@@ -170,6 +185,13 @@ pub const S16_EACH_PACK_IDENTITY_ASSERT: u8 = 4;
 // Phase 17: historical_content.
 pub const S17_READ_MATERIALIZED_FILE: u8 = 1;
 pub const S17_EXACT_FIRST_ADVANCE_CONTENT_ASSERT: u8 = 2;
+pub const S17_GIT_REPO_NEW: u8 = 3;
+pub const S17_PACK_DIR_CREATE: u8 = 4;
+pub const S17_EXACT_PACK_BYTES: u8 = 5;
+pub const S17_EXACT_IDX_BYTES: u8 = 6;
+pub const S17_WRITE_PACK: u8 = 7;
+pub const S17_WRITE_IDX: u8 = 8;
+pub const S17_CAT_FILE: u8 = 9;
 
 // Phase 18: nonowner_read.
 pub const S18_LEDGER_BASELINE: u8 = 1;
@@ -213,42 +235,60 @@ pub const S23_UNCHANGED_ASSERT: u8 = 4;
 pub const S24_FINISH_AND_TEARDOWN: u8 = 1;
 
 pub fn enter(phase: Phase, site: u8) {
-    emit(phase, site, Event::Enter, None, None, None, None, None);
+    emit(phase, site, Event::Enter, None, None, None, None, None, None);
 }
 
 pub fn enter_loop(phase: Phase, site: u8, iteration: usize) {
-    emit(phase, site, Event::Enter, None, None, None, None, Some(iteration));
+    emit(phase, site, Event::Enter, None, None, None, None, Some(iteration), None);
 }
 
 pub fn completed(phase: Phase, site: u8) {
-    emit(phase, site, Event::Completed, Some(true), None, None, None, None);
+    emit(phase, site, Event::Completed, Some(true), None, None, None, None, None);
 }
 
 /// A fallible propagating call returned an error. This is an operation result,
 /// not a verified failure cause; the original error still propagates unchanged.
 pub fn failed_operation(phase: Phase, site: u8) {
-    emit(phase, site, Event::Completed, Some(false), None, None, None, None);
+    emit(phase, site, Event::Completed, Some(false), None, None, None, None, None);
+}
+
+pub fn failed_error(phase: Phase, site: u8, error_kind: ErrorKind) {
+    emit(phase, site, Event::Completed, Some(false), None, None, None, None, Some(error_kind));
+}
+
+pub fn failed_error_loop(phase: Phase, site: u8, iteration: usize, error_kind: ErrorKind) {
+    emit(phase, site, Event::Completed, Some(false), None, None, None, Some(iteration), Some(error_kind));
 }
 
 pub fn completed_status(phase: Phase, site: u8, status: u16) {
-    emit(phase, site, Event::Completed, Some(true), Some(status), None, None, None);
+    emit(phase, site, Event::Completed, Some(true), Some(status), None, None, None, None);
 }
 
 pub fn completed_counts(phase: Phase, site: u8, counts: (i64, i64, i64, i64, i64)) {
-    emit(phase, site, Event::Completed, Some(true), None, Some(counts), None, None);
+    emit(phase, site, Event::Completed, Some(true), None, Some(counts), None, None, None);
 }
 
 pub fn completed_loop(phase: Phase, site: u8, iteration: usize) {
-    emit(phase, site, Event::Completed, Some(true), None, None, None, Some(iteration));
+    emit(phase, site, Event::Completed, Some(true), None, None, None, Some(iteration), None);
 }
 
 pub fn predicate(phase: Phase, site: u8, ok: bool) {
-    emit(phase, site, Event::Enter, None, None, None, None, None);
-    emit(phase, site, if ok { Event::Completed } else { Event::FailedPredicate }, Some(ok), None, None, None, None);
+    emit(phase, site, Event::Enter, None, None, None, None, None, None);
+    emit(
+        phase,
+        site,
+        if ok { Event::Completed } else { Event::FailedPredicate },
+        Some(ok),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
 }
 
 pub fn predicate_status(phase: Phase, site: u8, ok: bool, status: u16) {
-    emit(phase, site, Event::Enter, None, None, None, None, None);
+    emit(phase, site, Event::Enter, None, None, None, None, None, None);
     emit(
         phase,
         site,
@@ -258,11 +298,12 @@ pub fn predicate_status(phase: Phase, site: u8, ok: bool, status: u16) {
         None,
         None,
         None,
+        None,
     );
 }
 
 pub fn predicate_checks(phase: Phase, site: u8, ok: bool, checks: &[bool]) {
-    emit(phase, site, Event::Enter, None, None, None, None, None);
+    emit(phase, site, Event::Enter, None, None, None, None, None, None);
     emit(
         phase,
         site,
@@ -271,6 +312,7 @@ pub fn predicate_checks(phase: Phase, site: u8, ok: bool, checks: &[bool]) {
         None,
         None,
         Some(checks),
+        None,
         None,
     );
 }
@@ -284,6 +326,7 @@ fn emit(
     counts: Option<(i64, i64, i64, i64, i64)>,
     checks: Option<&[bool]>,
     iteration: Option<usize>,
+    error_kind: Option<ErrorKind>,
 ) {
     let mut line = String::with_capacity(192);
     let _ = write!(&mut line, "{}|{}|{}|{}|", PREFIX, phase as u8, site, event as u8);
@@ -322,8 +365,9 @@ fn emit(
         let _ = write!(&mut line, "{}", iteration.min(MAX_ITERATION));
     }
     line.push('|');
-    // The typed error variant is not exposed at these case boundaries, so the
-    // error-kind field stays null rather than being guessed from text.
+    if let Some(error_kind) = error_kind {
+        let _ = write!(&mut line, "{}", error_kind as u8);
+    }
     line.push('\n');
     if line.len() <= MAX_LINE_BYTES {
         let stderr = std::io::stderr();

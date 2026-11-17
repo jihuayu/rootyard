@@ -95,6 +95,38 @@ macro_rules! trace_result_status {
     };
 }
 
+/// Historical-content diagnostics are emitted only for the original metadata
+/// case. Other callers of `read_materialized_file` pass `false`.
+macro_rules! historical_trace_try {
+    ($enabled:expr, $site:expr, $expr:expr) => {
+        historical_trace_try!($enabled, $site, $expr, trace::ErrorKind::Other)
+    };
+    ($enabled:expr, $site:expr, $expr:expr, $fallback:expr) => {{
+        if $enabled {
+            metadata_replay_trace::enter(metadata_replay_trace::Phase::HistoricalContent, $site);
+        }
+        match $expr {
+            Ok(value) => {
+                if $enabled {
+                    metadata_replay_trace::completed(metadata_replay_trace::Phase::HistoricalContent, $site);
+                }
+                value
+            }
+            Err(error) => {
+                let error: anyhow::Error = error.into();
+                if $enabled {
+                    let kind = match historical_error_kind(&error) {
+                        trace::ErrorKind::Other => $fallback,
+                        kind => kind,
+                    };
+                    metadata_replay_trace::failed_error(metadata_replay_trace::Phase::HistoricalContent, $site, kind);
+                }
+                return Err(error);
+            }
+        }
+    }};
+}
+
 fn deadline() -> TokioInstant {
     TokioInstant::now() + Duration::from_secs(OP_SECONDS)
 }
@@ -557,22 +589,74 @@ impl GitRepo {
         PairFiles::new(pack, self.artifacts_dir()?.join(format!("{name}.idx")))
     }
 }
+/// Closed classification for the historical read trace. Raw error text is
+/// never inspected or formatted.
+fn historical_error_kind(error: &anyhow::Error) -> trace::ErrorKind {
+    if error.downcast_ref::<std::io::Error>().is_some() {
+        trace::ErrorKind::Io
+    } else if let Some(error) = error.downcast_ref::<RefStoreError>() {
+        match error {
+            RefStoreError::Timeout => trace::ErrorKind::RefStoreTimeout,
+            RefStoreError::Unsupported(_) => trace::ErrorKind::RefStoreUnsupported,
+            RefStoreError::Database(_) => trace::ErrorKind::StorageDatabase,
+            _ => trace::ErrorKind::RefStoreOther,
+        }
+    } else {
+        trace::ErrorKind::Other
+    }
+}
+
 /// Reconstruct a disposable Git object view from the exact verified local
 /// pack/index bytes returned by the materializer, then read the historical file
 /// through real Git. This is a fixture check of actual old content, not a
 /// product path: only the materializer's opaque bytes are used.
-async fn read_materialized_file(view: &MaterializedPackRead, git: &Path, oid: &str, path: &str) -> Result<Vec<u8>> {
-    let repo = GitRepo::new(git.to_path_buf(), view.scope().object_format()).await?;
+async fn read_materialized_file(
+    view: &MaterializedPackRead,
+    git: &Path,
+    oid: &str,
+    path: &str,
+    trace_enabled: bool,
+) -> Result<Vec<u8>> {
+    let repo = historical_trace_try!(
+        trace_enabled,
+        trace::S17_GIT_REPO_NEW,
+        GitRepo::new(git.to_path_buf(), view.scope().object_format()).await,
+        trace::ErrorKind::GitProcess
+    );
     let pack_dir = repo.bare.join("objects/pack");
-    std::fs::create_dir_all(&pack_dir)?;
+    historical_trace_try!(
+        trace_enabled,
+        trace::S17_PACK_DIR_CREATE,
+        std::fs::create_dir_all(&pack_dir).map_err(anyhow::Error::from)
+    );
     for pack in view.packs() {
         let pack_id = pack.pack_id();
         let stem = format!("pack-{}", pack_id.simple());
-        std::fs::write(pack_dir.join(format!("{stem}.pack")), view.pack_bytes(pack_id, deadline()).await?)?;
-        std::fs::write(pack_dir.join(format!("{stem}.idx")), view.idx_bytes(pack_id, deadline()).await?)?;
+        let pack_bytes = historical_trace_try!(
+            trace_enabled,
+            trace::S17_EXACT_PACK_BYTES,
+            view.pack_bytes(pack_id, deadline()).await
+        );
+        historical_trace_try!(
+            trace_enabled,
+            trace::S17_WRITE_PACK,
+            std::fs::write(pack_dir.join(format!("{stem}.pack")), pack_bytes).map_err(anyhow::Error::from)
+        );
+        let idx_bytes =
+            historical_trace_try!(trace_enabled, trace::S17_EXACT_IDX_BYTES, view.idx_bytes(pack_id, deadline()).await);
+        historical_trace_try!(
+            trace_enabled,
+            trace::S17_WRITE_IDX,
+            std::fs::write(pack_dir.join(format!("{stem}.idx")), idx_bytes).map_err(anyhow::Error::from)
+        );
     }
     let spec = format!("{oid}:{path}");
-    repo.run(&["cat-file", "-p", spec.as_str()], None).await
+    historical_trace_try!(
+        trace_enabled,
+        trace::S17_CAT_FILE,
+        repo.run(&["cat-file", "-p", spec.as_str()], None).await,
+        trace::ErrorKind::GitProcess
+    )
 }
 
 struct PairFiles {
@@ -3575,7 +3659,7 @@ async fn serving_metadata_create_replays_after_ref_advance_and_old_a5a_rejects_i
         let historical = trace_try!(
             trace::Phase::HistoricalContent,
             trace::S17_READ_MATERIALIZED_FILE,
-            read_materialized_file(&owned_view, &git, &owned_b_head, "advance.txt").await
+            read_materialized_file(&owned_view, &git, &owned_b_head, "advance.txt", true).await
         );
         trace_assert!(
             trace::Phase::HistoricalContent,
@@ -4826,7 +4910,7 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
         ensure!(old.pack_bytes(first_pack.pack_id(), deadline()).await? == first_pack_bytes, "old pack bytes differ");
         ensure!(old.idx_bytes(first_pack.pack_id(), deadline()).await? == first_idx_bytes, "old idx bytes differ");
         ensure!(
-            read_materialized_file(&old, &git, &first_oid, "file.txt").await? == b"serving snapshot fixture\n",
+            read_materialized_file(&old, &git, &first_oid, "file.txt", false).await? == b"serving snapshot fixture\n",
             "old materialized file bytes differ"
         );
         let old_digest = old.read_digest_hex();
@@ -4864,7 +4948,8 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
             "old idx bytes changed after advance"
         );
         ensure!(
-            read_materialized_file(&old_after, &git, &first_oid, "file.txt").await? == b"serving snapshot fixture\n",
+            read_materialized_file(&old_after, &git, &first_oid, "file.txt", false).await?
+                == b"serving snapshot fixture\n",
             "old materialized file bytes changed after advance"
         );
         // `old` still owns one of the two process-wide view permits. Release this
@@ -4921,7 +5006,7 @@ async fn serving_retained_materialization_old_capture_survives_ref_advance() -> 
             "new view did not retain the advance pack pair"
         );
         ensure!(
-            read_materialized_file(&new_view, &git, &new_oid, "advance.txt").await? == b"retained advance\n",
+            read_materialized_file(&new_view, &git, &new_oid, "advance.txt", false).await? == b"retained advance\n",
             "new materialized file bytes differ"
         );
         Ok::<(), anyhow::Error>(())

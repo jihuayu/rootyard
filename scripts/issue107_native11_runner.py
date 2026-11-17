@@ -64,6 +64,21 @@ METADATA_REPLAY_MAX_CHECKS = 8
 METADATA_REPLAY_MAX_ERROR_KIND = 8
 MAX_METADATA_REPLAY_PHASE = 24
 
+# Closed source-owned error classes; no raw text, path, object id or provider
+# payload is accepted or persisted.
+METADATA_REPLAY_ERROR_KINDS = {
+    1: 'io',
+    2: 'ref_store_timeout',
+    3: 'ref_store_unsupported',
+    4: 'storage_database',
+    5: 'ref_store_other',
+    6: 'git_process',
+    7: 'other',
+    8: 'blob_provider',
+}
+# `historical_error_kind` never returns the reserved blob-provider class.
+HISTORICAL_READ_ERROR_KINDS = frozenset(range(1, 8))
+
 METADATA_REPLAY_PHASES = {
     1: 'setup',
     2: 'tenant_create',
@@ -172,6 +187,13 @@ METADATA_REPLAY_SITES = {
     (16, 4): ('owned_b_materialize', 'each_pack_identity_assert'),
     (17, 1): ('historical_content', 'read_materialized_file'),
     (17, 2): ('historical_content', 'exact_first_advance_content_assert'),
+    (17, 3): ('historical_content', 'git_repo_new'),
+    (17, 4): ('historical_content', 'pack_dir_create'),
+    (17, 5): ('historical_content', 'exact_pack_bytes'),
+    (17, 6): ('historical_content', 'exact_idx_bytes'),
+    (17, 7): ('historical_content', 'write_pack'),
+    (17, 8): ('historical_content', 'write_idx'),
+    (17, 9): ('historical_content', 'cat_file'),
     (18, 1): ('nonowner_read', 'ledger_baseline'),
     (18, 2): ('nonowner_read', 'read_result'),
     (18, 3): ('nonowner_read', 'exact_not_found_match'),
@@ -626,6 +648,189 @@ def _metadata_replay_checks(value):
     return checks
 
 
+def _metadata_replay_error_kind(value):
+    if value == "":
+        return None
+    number = _metadata_replay_uint(value, 1, METADATA_REPLAY_MAX_ERROR_KIND)
+    if number not in METADATA_REPLAY_ERROR_KINDS:
+        raise ValueError
+    return number
+
+
+class _HistoricalTraceState:
+    """Closed phase-17 subflow nested under the site-1 wrapper.
+
+    The producer keeps site 1 open while emitting sites 3, 4, then one or more
+    pack groups in actual operation order 5 -> 7 -> 6 -> 8, then site 9, then
+    closes site 1. A failed child is followed directly by the failed parent.
+    Site 2 runs only after a successful parent close.
+    """
+
+    def __init__(self):
+        self.parent = None
+        self.child = None
+        self.assert_frame = None
+        self.stage = "idle"
+        self.packs = 0
+        self.parent_success = False
+        self.assert_failed = False
+
+    def current_open(self):
+        if self.child is not None:
+            return self.child
+        if self.parent is not None:
+            return self.parent
+        if self.stage == "assert_open":
+            return self.assert_frame
+        return None
+
+    @staticmethod
+    def _no_ancillary(frame):
+        return (
+            frame["status"] is None
+            and frame["counts"] is None
+            and frame["checks"] is None
+            and frame["iteration"] is None
+            and frame["error_kind"] is None
+        )
+
+    def _fields_allowed(self, frame):
+        """Match the exact Rust trace_try/historical_trace_try/predicate shape."""
+        site, event, ok = frame["site"], frame["event"], frame["ok"]
+        if site == 1:
+            if event == 0:
+                return ok is None and self._no_ancillary(frame)
+            return event == 1 and isinstance(ok, bool) and self._no_ancillary(frame)
+        if site == 2:
+            if event == 0:
+                return ok is None and self._no_ancillary(frame)
+            if event == 1:
+                return ok is True and self._no_ancillary(frame)
+            if event == 2:
+                return ok is False and self._no_ancillary(frame)
+            return False
+        if not 3 <= site <= 9:
+            return False
+        if event == 0:
+            return ok is None and self._no_ancillary(frame)
+        if event != 1:
+            return False
+        if ok is True:
+            return self._no_ancillary(frame)
+        if ok is not False:
+            return False
+        return (
+            frame["status"] is None
+            and frame["counts"] is None
+            and frame["checks"] is None
+            and frame["iteration"] is None
+            and frame["error_kind"] in HISTORICAL_READ_ERROR_KINDS
+        )
+
+    def _child_enter_allowed(self, site):
+        if site == 3:
+            return self.stage == "git_repo"
+        if site == 4:
+            return self.stage == "pack_dir"
+        if site == 5:
+            return self.stage in ("pack_start", "next_pack")
+        if site == 7:
+            return self.stage == "pack_bytes_complete"
+        if site == 6:
+            return self.stage == "write_pack_complete"
+        if site == 8:
+            return self.stage == "idx_bytes_complete"
+        if site == 9:
+            return self.stage == "next_pack" and self.packs > 0
+        return False
+
+    def _child_complete_stage(self, site):
+        if site == 3:
+            return "pack_dir"
+        if site == 4:
+            return "pack_start"
+        if site == 5:
+            return "pack_bytes_complete"
+        if site == 7:
+            return "write_pack_complete"
+        if site == 6:
+            return "idx_bytes_complete"
+        if site == 8:
+            return "next_pack"
+        return "cat_file_complete"
+
+    def feed(self, frame):
+        phase, site, event, ok = (
+            frame["phase"], frame["site"], frame["event"], frame["ok"])
+        if phase != 17:
+            if self.parent is not None:
+                return False
+            if self.stage in ("expect_assert", "assert_open"):
+                return False
+            if self.stage == "done" and (
+                    not self.parent_success or self.assert_failed):
+                # A failed historical parent or failed site-2 predicate is
+                # followed only by phase-24 cleanup.
+                return phase == MAX_METADATA_REPLAY_PHASE
+            return True
+        if not self._fields_allowed(frame):
+            return False
+        if site == 1:
+            if event == 0:
+                if self.stage != "idle":
+                    return False
+                self.parent = frame
+                self.stage = "git_repo"
+                return True
+            if event != 1 or self.parent is None or self.child is not None:
+                return False
+            if self.stage == "cat_file_complete" and ok is True:
+                self.parent_success = True
+                self.stage = "expect_assert"
+            elif self.stage == "failed" and ok is False:
+                self.parent_success = False
+                self.stage = "done"
+            else:
+                return False
+            self.parent = None
+            return True
+        if site == 2:
+            if self.stage == "expect_assert" and event == 0:
+                self.assert_frame = frame
+                self.stage = "assert_open"
+                return True
+            if self.stage == "assert_open" and event in (1, 2):
+                if event == 1 and ok is not True:
+                    return False
+                if event == 2 and ok is not False:
+                    return False
+                self.assert_failed = event == 2
+                self.assert_frame = None
+                self.stage = "done"
+                return True
+            return False
+        if site not in (3, 4, 5, 6, 7, 8, 9):
+            return False
+        if self.parent is None or self.stage in (
+                "expect_assert", "assert_open", "done"):
+            return False
+        if event == 0:
+            if self.child is not None or not self._child_enter_allowed(site):
+                return False
+            self.child = frame
+            return True
+        if event != 1 or self.child is None or self.child["site"] != site:
+            return False
+        self.child = None
+        if ok is False:
+            self.stage = "failed"
+            return True
+        self.stage = self._child_complete_stage(site)
+        if site == 8:
+            self.packs += 1
+        return True
+
+
 def _parse_metadata_replay_trace(text):
     """Parse complete fixed frames only; raw rejected text is never retained."""
     trace = _metadata_replay_unknown()
@@ -638,6 +843,7 @@ def _parse_metadata_replay_trace(text):
     last_site = 0
     frame_count = 0
     truncated = False
+    historical = _HistoricalTraceState()
     for index, line in enumerate(lines):
         if not line.startswith(METADATA_REPLAY_PREFIX):
             continue
@@ -664,28 +870,12 @@ def _parse_metadata_replay_trace(text):
             counts = _metadata_replay_counts(parts[6])
             checks = _metadata_replay_checks(parts[7])
             iteration = _metadata_replay_optional_uint(parts[8], 0, METADATA_REPLAY_MAX_ITERATION)
-            error_kind = _metadata_replay_optional_uint(parts[9], 1, METADATA_REPLAY_MAX_ERROR_KIND)
+            error_kind = _metadata_replay_error_kind(parts[9])
             if event == 0 and ok is not None:
                 raise ValueError
             if event == 1 and ok is None:
                 raise ValueError
             if event == 2 and ok is not False:
-                raise ValueError
-            if phase < last_phase:
-                raise ValueError
-            if phase == last_phase and site < last_site:
-                raise ValueError
-            if open_frame is not None:
-                if event == 0:
-                    if phase != MAX_METADATA_REPLAY_PHASE or open_frame["phase"] == MAX_METADATA_REPLAY_PHASE:
-                        raise ValueError
-                    trace["last_incomplete"] = open_frame
-                    open_frame = None
-                else:
-                    if open_frame["phase"] != phase or open_frame["site"] != site:
-                        raise ValueError
-                    open_frame = None
-            elif event != 0:
                 raise ValueError
             frame = _metadata_replay_location(phase, site)
             if frame is None:
@@ -699,6 +889,27 @@ def _parse_metadata_replay_trace(text):
                 "iteration": iteration,
                 "error_kind": error_kind,
             })
+            if phase < last_phase:
+                raise ValueError
+            if not historical.feed(frame):
+                raise ValueError
+            if phase == 17:
+                open_frame = historical.current_open()
+            else:
+                if phase == last_phase and site < last_site:
+                    raise ValueError
+                if open_frame is not None:
+                    if event == 0:
+                        if phase != MAX_METADATA_REPLAY_PHASE or open_frame["phase"] == MAX_METADATA_REPLAY_PHASE:
+                            raise ValueError
+                        trace["last_incomplete"] = open_frame
+                        open_frame = None
+                    else:
+                        if open_frame["phase"] != phase or open_frame["site"] != site:
+                            raise ValueError
+                        open_frame = None
+                elif event != 0:
+                    raise ValueError
         except ValueError:
             return _metadata_replay_unknown(invalid=True)
         trace["last_event"] = frame
@@ -717,6 +928,10 @@ def _parse_metadata_replay_trace(text):
     trace["frames"] = frame_count
     if frame_count == 0:
         return trace
+    if historical.stage == "expect_assert":
+        # A successful site-1 parent must be followed by the site-2 exact
+        # content predicate; a bare parent completion is a disallowed skip.
+        return _metadata_replay_unknown(invalid=True)
     trace["known"] = trace["last_event"] is not None
     trace["incomplete"] = truncated or open_frame is not None
     if open_frame is not None and not (
@@ -748,6 +963,14 @@ def _safe_metadata_replay_optional_int(value, minimum, maximum):
     if not minimum <= value <= maximum:
         raise ValueError
     return value
+
+
+def _safe_metadata_replay_error_kind(value):
+    number = _safe_metadata_replay_optional_int(
+        value, 1, METADATA_REPLAY_MAX_ERROR_KIND)
+    if number is not None and number not in METADATA_REPLAY_ERROR_KINDS:
+        raise ValueError
+    return number
 
 
 def _safe_metadata_replay_counts(value):
@@ -806,9 +1029,8 @@ def _safe_metadata_replay_frame(value):
         "counts": _safe_metadata_replay_counts(value.get("counts")),
         "checks": _safe_metadata_replay_checks(value.get("checks")),
         "iteration": _safe_metadata_replay_optional_int(value.get("iteration"), 0, METADATA_REPLAY_MAX_ITERATION),
-        "error_kind": _safe_metadata_replay_optional_int(
-            value.get("error_kind"), 1, METADATA_REPLAY_MAX_ERROR_KIND
-        ),
+        "error_kind": _safe_metadata_replay_error_kind(
+            value.get("error_kind")),
     })
     return frame
 
