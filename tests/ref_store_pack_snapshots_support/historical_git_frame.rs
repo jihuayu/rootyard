@@ -183,14 +183,14 @@ pub fn classify_stderr(stderr: &[u8]) -> u8 {
     {
         return if rest.is_empty() { 0 } else { 3 };
     }
-    if let Some(rest) = line.strip_prefix("fatal: path '") {
-        if let Some(rest) = rest.strip_suffix("'") {
-            let mut parts = rest.split("' does not exist in '");
-            let path = parts.next();
-            let repo = parts.next();
-            if let (Some(path), Some(repo), None) = (path, repo, parts.next()) {
-                return if path.is_empty() || repo.is_empty() { 0 } else { 4 };
-            }
+    if let Some(rest) = line.strip_prefix("fatal: path '")
+        && let Some(rest) = rest.strip_suffix("'")
+    {
+        let mut parts = rest.split("' does not exist in '");
+        let path = parts.next();
+        let repo = parts.next();
+        if let (Some(path), Some(repo), None) = (path, repo, parts.next()) {
+            return if path.is_empty() || repo.is_empty() { 0 } else { 4 };
         }
     }
     0
