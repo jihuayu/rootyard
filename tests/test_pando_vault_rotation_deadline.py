@@ -609,5 +609,25 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         self.assertTrue(process.stdout.closed)
 
 
+class ExpiredInputValidationTest(unittest.TestCase):
+    def test_expired_budget_refuses_before_any_input_probe(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        args = SimpleNamespace(
+            binary="/never-read-binary",
+            receipt="/never-read-receipt",
+            expected_commit=A,
+            expected_binary_sha256=None,
+            report="/never-write-report",
+            source_root="/never-read-source",
+        )
+        clock.advance(80)
+        with self.assertRaises(QualificationError) as caught:
+            main.validate_inputs(args, {}, budget=budget, runner=None)
+        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
+        self.assertEqual(caught.exception.stage, "input")
+
+
 if __name__ == "__main__":
     unittest.main()

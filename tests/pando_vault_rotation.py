@@ -156,6 +156,8 @@ def _pando_artifact(receipt, binary_sha256):
 
 
 def validate_inputs(args, environ, budget=None, runner=None):
+    if budget is not None:
+        budget.require("input")
     binary = args.binary or environ.get("ROOTYARD_PANDO_LAB_BIN")
     receipt = args.receipt or environ.get("ROOTYARD_PANDO_BUILD_RECEIPT")
     expected_commit = args.expected_commit or environ.get("ROOTYARD_EXPECTED_COMMIT")
@@ -186,6 +188,8 @@ def validate_inputs(args, environ, budget=None, runner=None):
         require(shutil.which(tool) is not None, tool + "_missing", "input")
     bootstrap = environ.get("ROOTYARD_TEST_DATABASE_URL")
     require(bool(bootstrap), "missing_pg_bootstrap", "input")
+    if budget is not None:
+        budget.late("input")
     if budget is not None and runner is not None:
         bound = source.validate(
             runner, budget,
