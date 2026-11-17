@@ -945,6 +945,11 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         self.assertGreaterEqual(clock.now, 14.0)
         self.assertLessEqual(clock.now, 15.0)
         self.assertTrue(sleep.calls)
+        kill_index = next(
+            index for index, (_pgid, sig, _at) in enumerate(group.calls)
+            if sig == signal.SIGKILL)
+        self.assertTrue(all(
+            sig == 0 for _pgid, sig, _at in group.calls[kill_index + 1:]))
         self.assertTrue(process.stdout.closed)
 
     def test_stop_late_sigkill_exit_retains_owner(self):

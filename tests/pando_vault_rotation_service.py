@@ -128,7 +128,7 @@ class Server:
 
     MAX_LINE = 4096
     MAX_ANNOUNCEMENT = MAX_LINE
-    GROUP_POLL_SECONDS = 0.05
+    GROUP_POLL_SECONDS = 0.1
 
     def __init__(self, binary, environment, runner=None, budget=None,
                  clock=None, popen=None, killpg=None, select_fn=None,
