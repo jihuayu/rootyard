@@ -16,19 +16,25 @@ import stat
 import sys
 import time
 
-from .errors import RunnerError
+from .errors import CODES, RunnerError
 from .process import ProcessRunner
 
 CHILD_SCRIPT = Path(__file__).with_name("root_remove_child.py")
 REAP_RESERVE_SECONDS = 2.0
 
 
-def _result(removed, code=None, within_deadline=False):
+def _primary(error):
+    value = getattr(error, "primary_code", None)
+    return value if value in CODES else None
+
+
+def _result(removed, code=None, within_deadline=False, primary_code=None):
     return {
         "removed": bool(removed),
         "absent": bool(removed),
         "verified": bool(removed) and code is None,
         "code": code,
+        "primary_code": primary_code,
         "within_deadline": bool(within_deadline),
     }
 
@@ -116,7 +122,12 @@ class BoundedRootRemover:
                 if error.code in ("root_remove_timeout", "process_unreaped")
                 else "root_remove_unverified"
             )
-            return _result(absent, code, self.clock() <= deadline)
+            return _result(
+                absent,
+                code,
+                self.clock() <= deadline,
+                primary_code=_primary(error),
+            )
         absent = not os.path.lexists(resolved)
         if completed.returncode != 0:
             return _result(absent, "root_remove_unverified", self.clock() <= deadline)

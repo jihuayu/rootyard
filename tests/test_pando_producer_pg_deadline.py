@@ -261,6 +261,20 @@ class OwnedFixtureDeadlineTest(unittest.TestCase):
         self.assertTrue(cleanup["postgres"]["dropped"])
         self.assertFalse(fixture.root.removed)
 
+    def test_root_group_unverified_primary_reaches_cleanup(self):
+        clock = FakeClock(0)
+        remover = root_cleanup.BoundedRootRemover(
+            clock=clock,
+            process_runner=GroupUnverifiedRootRunner(),
+        )
+        fixture, factory = self.fixture(clock, root_remover=remover)
+        fixture.start(deadline=1e18)
+        cleanup = fixture.cleanup(deadline=100)
+        self.assertFalse(cleanup["cleanup_ok"])
+        self.assertFalse(cleanup["root_removed"])
+        self.assertEqual(cleanup["error_code"], "root_remove_failed")
+        self.assertEqual(cleanup["primary_code"], "root_remove_timeout")
+
     def test_unknown_runner_timeout_create_never_drops_or_claims_absence(self):
         clock = FakeClock(0)
         fixture, factory = self.fixture(clock, create_mode="runner_timeout")
@@ -357,6 +371,7 @@ class BoundedRootRemovalTest(unittest.TestCase):
         self.assertFalse(result["removed"])
         self.assertFalse(result["verified"])
         self.assertEqual(result["code"], "root_remove_unverified")
+        self.assertEqual(result["primary_code"], "root_remove_timeout")
         self.assertTrue(root.path.exists())
 
     def test_verified_child_absence_is_required_for_success(self):

@@ -18,6 +18,7 @@ for entry in (str(ROOT / "scripts"), str(ROOT / "tests")):
         sys.path.insert(0, entry)
 
 import pando_producer_pg.cases as cases  # noqa: E402
+import pando_producer_pg.report as report  # noqa: E402
 import run_pando_producer_pg as runner  # noqa: E402
 from pando_producer_pg.errors import RunnerError  # noqa: E402
 
@@ -312,6 +313,106 @@ class RunnerBudgetTest(OrchestrationFakes, unittest.TestCase):
             "source_capture_deadline_exceeded",
         )
         self.assertFalse(payload["fresh_verification"])
+        self.assertEqual(
+            payload["primary_code"], "source_capture_deadline_exceeded"
+        )
+
+    def test_initial_group_unverified_primary_reaches_report(self):
+        clock = FakeClock(0)
+
+        def capture(*args, **kwargs):
+            raise RunnerError(
+                "source",
+                "process_group_unverified",
+                primary_code="source_capture_deadline_exceeded",
+            )
+
+        payload, writes, _, _ = self.invoke(
+            clock, capture=capture,
+            execute=lambda *a, **k: passing_records(), cleanup=None,
+        )
+        self.assertFalse(payload["passed"])
+        self.assertEqual(payload["error_code"], "process_group_unverified")
+        self.assertEqual(
+            payload["primary_code"], "source_capture_deadline_exceeded"
+        )
+        self.assertEqual(len(writes), 1)
+
+    def test_case_group_unverified_primary_reaches_report(self):
+        clock = FakeClock(0)
+        rows = cases.not_run_records()
+        rows[0].update(
+            status="failed", executed=True, exit_code=1,
+            code="process_group_unverified", primary_code="case_timeout",
+        )
+        payload, _, _, _ = self.invoke(
+            clock,
+            capture=lambda *a, **k: self.binding(),
+            execute=lambda *a, **k: rows,
+            cleanup=None,
+        )
+        self.assertEqual(payload["error_code"], "process_group_unverified")
+        self.assertEqual(payload["primary_code"], "case_timeout")
+        self.assertEqual(
+            payload["cases"][0]["primary_code"], "case_timeout"
+        )
+
+    def test_cleanup_group_unverified_primary_reaches_report(self):
+        clock = FakeClock(0)
+        payload, _, _, _ = self.invoke(
+            clock,
+            capture=lambda *a, **k: self.binding(),
+            execute=lambda *a, **k: passing_records(),
+            cleanup={
+                "cleanup_ok": False,
+                "cleanup_within_deadline": True,
+                "error_code": "process_group_unverified",
+                "primary_code": "process_timeout",
+            },
+        )
+        self.assertEqual(payload["error_code"], "process_group_unverified")
+        self.assertEqual(payload["primary_code"], "process_timeout")
+        self.assertEqual(
+            payload["cleanup"]["primary_code"], "process_timeout"
+        )
+
+    def test_unregistered_primary_is_rejected(self):
+        with self.assertRaises(ValueError):
+            RunnerError(
+                "execute", "process_group_unverified",
+                primary_code="not_registered",
+            )
+        payload = report.build_report(
+            passed=False,
+            records=cases.not_run_records(),
+            binding={},
+            selection=None,
+            product_receipt=None,
+            cleanup={"cleanup_ok": False},
+            actual_fresh={},
+            error_code="process_group_unverified",
+            stage="execute",
+            primary_code="not_registered",
+        )
+        self.assertFalse(payload["passed"])
+        self.assertEqual(
+            payload["error_code"], "report_projection_rejected"
+        )
+        self.assertNotIn("not_registered", str(payload))
+        rows = cases.not_run_records()
+        rows[0]["primary_code"] = "not_registered"
+        payload = report.build_report(
+            passed=False,
+            records=rows,
+            binding={},
+            selection=None,
+            product_receipt=None,
+            cleanup={"cleanup_ok": False},
+            actual_fresh={},
+        )
+        self.assertEqual(
+            payload["error_code"], "report_projection_rejected"
+        )
 
     def test_binary_recheck_deadline_skips_hash_and_marks_unverified(self):
         clock = FakeClock(0)

@@ -108,6 +108,7 @@ def _record(name, family):
         "ignored": 0,
         "filtered": 0,
         "code": "not_run",
+        "primary_code": None,
     }
 
 
@@ -216,6 +217,7 @@ def execute_cases(
             row["status"] = "failed"
             row["executed"] = error.code not in ("case_spawn_failed", "process_spawn_failed")
             row["code"] = error.code
+            row["primary_code"] = getattr(error, "primary_code", None)
             records.append(row)
             stopped = True
             continue

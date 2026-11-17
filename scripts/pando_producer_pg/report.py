@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 
 from . import cases
-from .errors import RunnerError, require
+from .errors import CODES, RunnerError, require
 
 REPORT_SCHEMA = "rootyard/issue21-pando-producer-pg/v1"
 LIMITATIONS = (
@@ -105,6 +105,10 @@ def _minimal_report():
     }
 
 
+def _fixed_primary(value):
+    return value is None or value in CODES
+
+
 def build_report(
     *,
     passed,
@@ -116,10 +120,23 @@ def build_report(
     actual_fresh,
     error_code=None,
     stage=None,
+    primary_code=None,
     fresh_verification=False,
 ):
     if not isinstance(records, list) or len(records) != len(cases.CASES):
         return _minimal_report()
+    if not _fixed_primary(primary_code):
+        return _minimal_report()
+    for row in records:
+        if not isinstance(row, dict) or not _fixed_primary(
+            row.get("primary_code")
+        ):
+            return _minimal_report()
+    if isinstance(cleanup, dict):
+        if not _fixed_primary(cleanup.get("primary_code")):
+            return _minimal_report()
+        if not _fixed_primary(cleanup.get("secondary_primary_code")):
+            return _minimal_report()
     payload = {
         "schema": REPORT_SCHEMA,
         "passed": bool(passed),
@@ -154,6 +171,8 @@ def build_report(
         payload["error_code"] = error_code
     if stage is not None:
         payload["stage"] = stage
+    if primary_code is not None:
+        payload["primary_code"] = primary_code
     try:
         return _sanitize(payload)
     except RunnerError:

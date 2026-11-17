@@ -187,6 +187,7 @@ class ExecuteCasesTest(unittest.TestCase):
         )
         self.assertEqual(records[0]["status"], "failed")
         self.assertEqual(records[0]["code"], "process_group_unverified")
+        self.assertEqual(records[0]["primary_code"], "case_timeout")
         self.assertTrue(records[0]["executed"])
         self.assertTrue(all(row["status"] == "not_run" for row in records[1:]))
 

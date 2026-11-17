@@ -26,7 +26,7 @@ from pando_vault_rotation_fixture_resources import (  # noqa: E402
     OwnedRoot,
 )
 
-from .errors import RunnerError, require  # noqa: E402
+from .errors import CODES, RunnerError, require  # noqa: E402
 from .root_cleanup import REAP_RESERVE_SECONDS, BoundedRootRemover  # noqa: E402
 
 ESCAPE_VARIABLES = (
@@ -78,9 +78,9 @@ class BoundedOwnedPostgres(OwnedPostgres):
                 if error.code in TIMEOUT_CODES or "timeout" in error.code
                 else "process_failed"
             )
-            raise FixtureError(code) from None
-
-
+            fixture_error = FixtureError(code)
+            fixture_error.primary_code = _primary(error)
+            raise fixture_error from None
 
 def require_escape_absent(environ=None):
     env = os.environ if environ is None else environ
@@ -175,6 +175,10 @@ def _cleanup_code(code):
     return "cleanup_unresolved"
 
 
+def _primary(error):
+    value = getattr(error, "primary_code", None)
+    return value if value in CODES else None
+
 class OwnedFixture:
     """One root and one acknowledged owned database for this nonce."""
 
@@ -235,8 +239,11 @@ class OwnedFixture:
         self._arm_postgres(deadline)
         try:
             self.postgres.validate()
-        except FixtureError:
-            raise RunnerError("setup", "postgres_validate_failed") from None
+        except FixtureError as error:
+            raise RunnerError(
+                "setup", "postgres_validate_failed",
+                primary_code=_primary(error),
+            ) from None
         self._check(deadline)
         self._arm_postgres(deadline)
         try:
@@ -247,7 +254,7 @@ class OwnedFixture:
                 if getattr(error, "code", "") in ("process_failed", "pg_command_timeout")
                 else "postgres_create_failed"
             )
-            raise RunnerError("setup", code) from None
+            raise RunnerError("setup", code, primary_code=_primary(error)) from None
         self._check(deadline)
         self._install_schema(deadline)
         try:
@@ -366,22 +373,22 @@ class OwnedFixture:
             "root": root,
         }
 
-    def _finish_cleanup(self, facts, failure, deadline):
+    def _finish_cleanup(self, facts, failure, deadline, primary_code=None):
         within = self.clock() < deadline
         postgres_verified = bool(facts["database_absent"])
         root_verified = bool(facts["root_removed"] and facts["root_absent"])
         facts["postgres_cleanup_verified"] = postgres_verified
         facts["root_cleanup_verified"] = root_verified
-        facts["cleanup_verified"] = bool(
-            postgres_verified and root_verified and failure is None
-        )
+        facts["cleanup_verified"] = bool(postgres_verified and root_verified and failure is None)
         facts["cleanup_within_deadline"] = within
         facts["cleanup_ok"] = bool(facts["cleanup_verified"] and within)
         if failure is not None:
             facts["error_code"] = failure
+            if primary_code in CODES:
+                facts["primary_code"] = primary_code
         elif not within:
             facts["error_code"] = "cleanup_deadline_exceeded"
-        # The nested records are part of the report evidence.  Refresh them
+        # The nested records are part of the report evidence; refresh them
         # after the final teardown so they cannot remain pre-cleanup snapshots.
         final_postgres, final_root, records_ok = self._final_records()
         if not records_ok:
@@ -399,6 +406,7 @@ class OwnedFixture:
         postgres, root = self._safe_records()
         facts = self._truth_base(postgres, root)
         failure = None
+        primary_code = None
         if self.clock() >= deadline:
             return self._finish_cleanup(
                 facts, "cleanup_deadline_exceeded", deadline
@@ -416,6 +424,7 @@ class OwnedFixture:
                     self.postgres.drop()
                 except FixtureError as error:
                     failure = _cleanup_code(getattr(error, "code", ""))
+                    primary_code = _primary(error)
                 except Exception:
                     failure = "cleanup_unresolved"
                 dropped = bool(getattr(self.postgres, "dropped", False))
@@ -482,5 +491,9 @@ class OwnedFixture:
                 failure = _cleanup_code(
                     removal.get("code") or "root_remove_unverified"
                 )
-        return self._finish_cleanup(facts, failure, deadline)
+                root_primary = removal.get("primary_code")
+                primary_code = root_primary if root_primary in CODES else None
+        return self._finish_cleanup(
+            facts, failure, deadline, primary_code
+        )
 

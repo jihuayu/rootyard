@@ -34,7 +34,7 @@ from pando_producer_pg import (  # noqa: E402
     source,
     source_capture,
 )
-from pando_producer_pg.errors import RunnerError, require  # noqa: E402
+from pando_producer_pg.errors import CODES, RunnerError, require  # noqa: E402
 from pando_producer_pg.process import (  # noqa: E402
     CLEANUP_RESERVE_SECONDS,
     ProcessRunner,
@@ -147,13 +147,25 @@ def _selection_binding(selection):
     }
 
 
+def _registered_primary(value):
+    return value if value in CODES else None
+
+
 def _first_failure(records):
     for row in records:
         if row.get("status") == "failed":
-            return RunnerError("execute", row.get("code") or "case_failed")
+            return RunnerError(
+                "execute",
+                row.get("code") or "case_failed",
+                primary_code=_registered_primary(row.get("primary_code")),
+            )
     for row in records:
         if row.get("status") != "passed":
-            return RunnerError("execute", row.get("code") or "not_run")
+            return RunnerError(
+                "execute",
+                row.get("code") or "not_run",
+                primary_code=_registered_primary(row.get("primary_code")),
+            )
     return None
 
 
@@ -293,9 +305,14 @@ def run(
                 else:
                     code = "source_recheck_failed"
                 binding["verification_code"] = code
-                if getattr(caught, "primary_code", None) is not None:
-                    binding["verification_primary_code"] = caught.primary_code
-                raise RunnerError("binding", code) from None
+                primary_code = _registered_primary(
+                    getattr(caught, "primary_code", None)
+                )
+                if primary_code is not None:
+                    binding["verification_primary_code"] = primary_code
+                raise RunnerError(
+                    "binding", code, primary_code=primary_code
+                ) from None
             binding["source_rechecked"] = True
             binding["source_unchanged"] = source.same(binding, after)
             if not binding["source_unchanged"]:
@@ -336,7 +353,9 @@ def run(
             cleanup = resources.empty_cleanup()
     if error is None and not cleanup.get("cleanup_ok"):
         error = RunnerError(
-            "cleanup", cleanup.get("error_code", "cleanup_unresolved")
+            "cleanup",
+            cleanup.get("error_code", "cleanup_unresolved"),
+            primary_code=_registered_primary(cleanup.get("primary_code")),
         )
     if error is None and not cleanup.get("cleanup_within_deadline", False):
         error = RunnerError("cleanup", "cleanup_deadline_exceeded")
@@ -348,6 +367,13 @@ def run(
         and cleanup.get("error_code") != error.code
     ):
         cleanup["secondary_error_code"] = cleanup["error_code"]
+    cleanup_primary = _registered_primary(cleanup.get("primary_code"))
+    if (
+        error is not None
+        and cleanup_primary is not None
+        and cleanup_primary != error.primary_code
+    ):
+        cleanup["secondary_primary_code"] = cleanup_primary
     if not config.prepare_only:
         failure = _first_failure(records)
         if failure is not None and error is None:
@@ -382,6 +408,9 @@ def run(
         actual_fresh=actual_fresh,
         error_code=error.code if error is not None else None,
         stage=error.stage if error is not None else None,
+        primary_code=(
+            error.primary_code if error is not None else None
+        ),
         fresh_verification=fresh_verification,
     )
     if not config.prepare_only:
