@@ -7,8 +7,6 @@ import re
 import unittest
 from pathlib import Path
 
-import yaml
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -72,11 +70,10 @@ class WorkspaceMerkleSyncContractsTest(unittest.TestCase):
         raw = wf_path.read_text(encoding="utf-8")
         self.assertTrue(raw.startswith("name: "))
         self.assertNotIn("\t", raw)
-        parsed = yaml.safe_load(raw)
-        on_cfg = parsed.get("on") or parsed.get(True)
-        self.assertIn("workflow_dispatch", on_cfg)
-        self.assertIn("pull_request", on_cfg)
-        self.assertTrue(on_cfg["pull_request"]["paths"])
+        self.assertRegex(raw, r"(?m)^on:\s*$")
+        self.assertRegex(raw, r"(?m)^  pull_request:\s*$")
+        self.assertRegex(raw, r"(?m)^    paths:\s*$")
+        self.assertRegex(raw, r"(?m)^  workflow_dispatch:\s*$")
         self.assertIn("1.99.1", raw)
         self.assertIn("64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b", raw)
         self.assertIn("-D warnings", raw)
