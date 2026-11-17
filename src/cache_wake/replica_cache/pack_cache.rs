@@ -31,7 +31,7 @@ struct PackCacheEntry {
 #[derive(Default)]
 struct PackCatalogInner {
     entries: HashMap<String, PackCacheEntry>,
-    retired_entries: HashMap<String, PackCacheEntry>,
+    retired_entries: HashMap<PathBuf, PackCacheEntry>,
     total_bytes: u64,
     lru_counter: u64,
     evicted_count: u64,
@@ -48,6 +48,7 @@ pub struct PackCacheCatalog {
 
 pub struct PackCachePin {
     key_digest: String,
+    dir_path: PathBuf,
     pack_path: PathBuf,
     idx_path: PathBuf,
     inner: Arc<Mutex<PackCatalogInner>>,
@@ -72,13 +73,15 @@ impl Drop for PackCachePin {
         self.released = true;
         let remove_dir = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(entry) = guard.entries.get_mut(&self.key_digest) {
+            if let Some(entry) = guard.entries.get_mut(&self.key_digest)
+                && entry.dir_path == self.dir_path
+            {
                 entry.pin_count = entry.pin_count.saturating_sub(1);
                 None
-            } else if let Some(entry) = guard.retired_entries.get_mut(&self.key_digest) {
+            } else if let Some(entry) = guard.retired_entries.get_mut(&self.dir_path) {
                 entry.pin_count = entry.pin_count.saturating_sub(1);
                 if entry.pin_count == 0 {
-                    guard.retired_entries.remove(&self.key_digest).map(|e| (e.dir_path, e.total_bytes))
+                    guard.retired_entries.remove(&self.dir_path).map(|e| (e.dir_path, e.total_bytes))
                 } else {
                     None
                 }
@@ -143,7 +146,7 @@ impl PackCacheCatalog {
                 }
                 entry.lru_seq = next_seq;
                 entry.pin_count = entry.pin_count.saturating_add(1);
-                (entry.pack_path.clone(), entry.idx_path.clone())
+                (entry.dir_path.clone(), entry.pack_path.clone(), entry.idx_path.clone())
             };
             guard.lru_counter = next_seq;
             paths
@@ -151,12 +154,13 @@ impl PackCacheCatalog {
 
         let pin = PackCachePin {
             key_digest: key.key_digest.clone(),
-            pack_path: paths.0.clone(),
-            idx_path: paths.1.clone(),
+            dir_path: paths.0,
+            pack_path: paths.1.clone(),
+            idx_path: paths.2.clone(),
             inner: Arc::clone(&self.inner),
             released: false,
         };
-        if !verify_cached_pack_files(&paths.0, &paths.1, key, verify_sha256) {
+        if !verify_cached_pack_files(&paths.1, &paths.2, key, verify_sha256) {
             drop(pin);
             self.retire_key(&key.key_digest);
             return Ok((None, true));
@@ -179,7 +183,7 @@ impl PackCacheCatalog {
             return Err(ReplicaCacheError::CacheCapacityExhausted("pack pair exceeds max_pack_bytes"));
         }
 
-        let target_dir = self.root_dir.join(&key.key_digest);
+        let target_dir = self.root_dir.join(format!("{}-{}", key.key_digest, Uuid::new_v4().simple()));
         let pack_name = format!("{}.pack", key.pack_stem);
         let idx_name = format!("{}.idx", key.pack_stem);
         let target_pack = target_dir.join(&pack_name);
@@ -191,12 +195,13 @@ impl PackCacheCatalog {
             let hit = guard.entries.get_mut(&key.key_digest).map(|existing| {
                 existing.lru_seq = next_seq;
                 existing.pin_count = existing.pin_count.saturating_add(1);
-                (existing.pack_path.clone(), existing.idx_path.clone())
+                (existing.dir_path.clone(), existing.pack_path.clone(), existing.idx_path.clone())
             });
-            if let Some((pack_path, idx_path)) = hit {
+            if let Some((dir_path, pack_path, idx_path)) = hit {
                 guard.lru_counter = next_seq;
                 return Ok(PackCachePin {
                     key_digest: key.key_digest,
+                    dir_path,
                     pack_path,
                     idx_path,
                     inner: Arc::clone(&self.inner),
@@ -217,7 +222,6 @@ impl PackCacheCatalog {
         let install_res = (|| -> Result<(), ReplicaCacheError> {
             copy_readonly(staged_pack, &staging_dir.join(&pack_name))?;
             copy_readonly(staged_idx, &staging_dir.join(&idx_name))?;
-            let _ = remove_dir_safely(&target_dir);
             std::fs::rename(&staging_dir, &target_dir)
                 .map_err(|e| ReplicaCacheError::Io(format!("failed committing pack dir: {e}")))?;
             Ok(())
@@ -227,34 +231,64 @@ impl PackCacheCatalog {
             return Err(err);
         }
 
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let to_remove_late = evict_unpinned_packs(&mut guard, &self.limits, entry_bytes)?;
-        guard.lru_counter = guard.lru_counter.saturating_add(1);
-        let lru_seq = guard.lru_counter;
-        guard.total_bytes = guard.total_bytes.saturating_add(entry_bytes);
-        guard.entries.insert(
-            key.key_digest.clone(),
-            PackCacheEntry {
-                key: key.clone(),
-                dir_path: target_dir,
-                pack_path: target_pack.clone(),
-                idx_path: target_idx.clone(),
-                total_bytes: entry_bytes,
-                pin_count: 1,
-                lru_seq,
-            },
-        );
-        drop(guard);
+        let (to_remove_late, pin) = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let next_seq = guard.lru_counter.saturating_add(1);
+            if let Some((dir_path, pack_path, idx_path)) = guard.entries.get_mut(&key.key_digest).map(|existing| {
+                existing.lru_seq = next_seq;
+                existing.pin_count = existing.pin_count.saturating_add(1);
+                (existing.dir_path.clone(), existing.pack_path.clone(), existing.idx_path.clone())
+            }) {
+                guard.lru_counter = next_seq;
+                drop(guard);
+                let _ = remove_dir_safely(&target_dir);
+                return Ok(PackCachePin {
+                    key_digest: key.key_digest,
+                    dir_path,
+                    pack_path,
+                    idx_path,
+                    inner: Arc::clone(&self.inner),
+                    released: false,
+                });
+            }
+            let evicted = match evict_unpinned_packs(&mut guard, &self.limits, entry_bytes) {
+                Ok(v) => v,
+                Err(err) => {
+                    drop(guard);
+                    let _ = remove_dir_safely(&target_dir);
+                    return Err(err);
+                }
+            };
+            guard.lru_counter = next_seq;
+            guard.total_bytes = guard.total_bytes.saturating_add(entry_bytes);
+            guard.entries.insert(
+                key.key_digest.clone(),
+                PackCacheEntry {
+                    key: key.clone(),
+                    dir_path: target_dir.clone(),
+                    pack_path: target_pack.clone(),
+                    idx_path: target_idx.clone(),
+                    total_bytes: entry_bytes,
+                    pin_count: 1,
+                    lru_seq: next_seq,
+                },
+            );
+            (
+                evicted,
+                PackCachePin {
+                    key_digest: key.key_digest,
+                    dir_path: target_dir,
+                    pack_path: target_pack,
+                    idx_path: target_idx,
+                    inner: Arc::clone(&self.inner),
+                    released: false,
+                },
+            )
+        };
         for dir in to_remove_late {
             let _ = remove_dir_safely(&dir);
         }
-        Ok(PackCachePin {
-            key_digest: key.key_digest,
-            pack_path: target_pack,
-            idx_path: target_idx,
-            inner: Arc::clone(&self.inner),
-            released: false,
-        })
+        Ok(pin)
     }
 
     pub fn retire_key(&self, key_digest: &str) {
@@ -265,7 +299,7 @@ impl PackCacheCatalog {
                     guard.total_bytes = guard.total_bytes.saturating_sub(entry.total_bytes);
                     Some(entry.dir_path)
                 } else {
-                    guard.retired_entries.insert(key_digest.to_owned(), entry);
+                    guard.retired_entries.insert(entry.dir_path.clone(), entry);
                     None
                 }
             } else {
@@ -288,7 +322,7 @@ impl PackCacheCatalog {
                         guard.total_bytes = guard.total_bytes.saturating_sub(entry.total_bytes);
                         to_remove.push(entry.dir_path);
                     } else {
-                        guard.retired_entries.insert(key, entry);
+                        guard.retired_entries.insert(entry.dir_path.clone(), entry);
                     }
                 }
             }

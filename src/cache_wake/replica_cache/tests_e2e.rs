@@ -31,7 +31,7 @@ use crate::blob_store::{
     budget::{ResourceContext, ResourceLimits},
     config::BlobProfile,
     opendal::BlobStore,
-    test_support::distinct_backend_identities,
+    test_support::{blob_backend_identity, distinct_backend_identities},
 };
 
 use super::*;
@@ -382,5 +382,99 @@ async fn active_reader_guard_preserves_view_and_pin_under_eviction_and_tamper() 
     assert!(p1.is_dir() && pins.is_pin_active(pin1));
     drop(g1);
     assert!(!p1.exists() && !pins.is_pin_active(pin1));
+    Ok(())
+}
+
+#[test]
+fn pack_cache_concurrent_install_clear_all_and_catalog_eviction_failure_preserve_invariants() -> Result<()> {
+    let pdir = TempDir::new()?;
+    let cache = pack_cache::PackCacheCatalog::open(&pdir.path().join("replica"), ReplicaCacheLimits::default())?;
+    let stage = cache.staging_dir()?;
+    let (pack_bytes, idx_bytes) = (b"pack-payload-0123".to_vec(), b"idx-payload-0123".to_vec());
+    let (sp, si) = (stage.join("p.pack"), stage.join("p.idx"));
+    std::fs::write(&sp, &pack_bytes)?;
+    std::fs::write(&si, &idx_bytes)?;
+    let (tid, rid) = (Uuid::new_v4(), Uuid::new_v4());
+    let p_loc = BlobLocator::new(
+        tid,
+        rid,
+        1,
+        Uuid::new_v4(),
+        "packs",
+        &hex::encode(Sha256::digest(&pack_bytes)),
+        pack_bytes.len() as u64,
+    )?;
+    let i_loc = BlobLocator::new(
+        tid,
+        rid,
+        1,
+        Uuid::new_v4(),
+        "packs",
+        &hex::encode(Sha256::digest(&idx_bytes)),
+        idx_bytes.len() as u64,
+    )?;
+    let bid = blob_backend_identity("pack-test");
+    let spec = PackObjectSpec::provider_managed(format!("pack-{}", "a".repeat(40)), p_loc, i_loc);
+    let key = spec.pack_cache_key(bid.as_hex(), ReplicaObjectFormat::Sha1);
+    let expected_bytes = (pack_bytes.len() + idx_bytes.len()) as u64;
+
+    let mut pins: Vec<pack_cache::PackCachePin> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..4).map(|_| s.spawn(|| cache.install_and_pin(key.clone(), &sp, &si).unwrap())).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!((cache.entry_count(), cache.total_bytes()), (1, expected_bytes));
+    let held_pin = pins.remove(0);
+    drop(pins);
+    cache.clear_all();
+    let new_pin = cache.install_and_pin(key, &sp, &si)?;
+    let old_path = held_pin.pack_path().to_path_buf();
+    assert!(old_path.is_file() && new_pin.pack_path().is_file() && old_path != new_pin.pack_path());
+    drop(held_pin);
+    assert!(!old_path.exists() && new_pin.pack_path().is_file() && cache.total_bytes() == expected_bytes);
+    drop(new_pin);
+    cache.clear_all();
+    assert_eq!(cache.total_bytes(), 0);
+
+    let vdir = TempDir::new()?;
+    let limits = ReplicaCacheLimits { max_view_bytes: 2048, max_active_views: 4, ..ReplicaCacheLimits::default() };
+    let views = catalog::ViewCacheCatalog::open(&vdir.path().join("replica"), limits)?;
+    let refs = [ReplicaRefSpec::new("refs/heads/main", "a".repeat(40))];
+    let vk1 = ReplicaViewKey::build(
+        tid,
+        rid,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        &bid,
+        ReplicaObjectFormat::Sha1,
+        1,
+        1,
+        &[spec.clone()],
+        &refs,
+        "refs/heads/main",
+    )?;
+    let vk2 = ReplicaViewKey::build(
+        tid,
+        rid,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        &bid,
+        ReplicaObjectFormat::Sha1,
+        1,
+        2,
+        &[spec],
+        &refs,
+        "refs/heads/main",
+    )?;
+    let l1 = views.view_root().create_view("v1", tid, rid, 1000, Some(limits.view_ttl))?;
+    let s1 = views.admit_and_checkout(vk1, l1, vec![], 1000, vec![])?;
+    assert_eq!(views.resident_bytes(), 1000);
+    let l2 = views.view_root().create_view("v2", tid, rid, 600, Some(limits.view_ttl))?;
+    assert!(matches!(
+        views.admit_and_checkout(vk2, l2, vec![], 1500, vec![]),
+        Err(ReplicaCacheError::CacheCapacityExhausted(_))
+    ));
+    assert_eq!(views.resident_bytes(), 1000);
+    drop(s1);
+    assert_eq!(views.resident_bytes(), 0);
     Ok(())
 }

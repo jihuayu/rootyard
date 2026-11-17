@@ -429,3 +429,41 @@ async fn scheduler_tolerates_advisory_outage_and_fails_over_on_overload_or_drain
     };
     assert!(matches!(auth_err, ReplicaCacheError::Unauthorized(_)));
 }
+
+#[tokio::test]
+async fn fair_share_expired_deadline_and_cancelled_waiter_leak_zero_slots() {
+    let cfg = TenantFairShareConfig {
+        max_total_inflight: 1,
+        max_per_tenant_inflight: 1,
+        max_waiters_per_tenant: 4,
+        max_total_waiters: 4,
+        admission_timeout: Duration::from_secs(2),
+    };
+    let gate = Arc::new(TenantFairShareGate::new(cfg).unwrap());
+    let tenant = Uuid::new_v4();
+
+    let past = Instant::now() - Duration::from_millis(1);
+    assert!(matches!(gate.acquire(tenant, past).await, Err(ReplicaCacheError::DeadlineExceeded)));
+    assert_eq!((gate.stats().active_inflight, gate.stats().queued_waiters), (0, 0));
+
+    let dl = Instant::now() + Duration::from_secs(5);
+    let (held, _) = gate.acquire(tenant, dl).await.unwrap();
+    let g2 = Arc::clone(&gate);
+    let cancelled = tokio::spawn(async move { g2.acquire(tenant, dl).await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert_eq!(gate.stats().queued_waiters, 1);
+    cancelled.abort();
+    let _ = cancelled.await;
+    drop(held);
+    assert_eq!((gate.stats().active_inflight, gate.stats().queued_waiters), (0, 0));
+
+    let (held2, _) = gate.acquire(tenant, dl).await.unwrap();
+    let g3 = Arc::clone(&gate);
+    let race = tokio::spawn(async move { g3.acquire(tenant, dl).await });
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    drop(held2);
+    race.abort();
+    let _ = race.await;
+    assert_eq!((gate.stats().active_inflight, gate.stats().queued_waiters), (0, 0));
+    let (_ok, _) = gate.acquire(tenant, dl).await.unwrap();
+}

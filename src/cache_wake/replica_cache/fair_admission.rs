@@ -123,7 +123,12 @@ impl TenantFairShareGate {
         deadline: Instant,
     ) -> Result<(FairAdmissionPermit, u64), ReplicaCacheError> {
         let started = Instant::now();
-        let mut rx_opt = {
+        let initial_remaining = deadline
+            .checked_duration_since(started)
+            .filter(|d| !d.is_zero())
+            .ok_or(ReplicaCacheError::DeadlineExceeded)?;
+
+        let mut waiter = {
             let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let t_active = guard.tenant_active.get(&tenant_id).copied().unwrap_or(0);
             if guard.total_active < self.cfg.max_total_inflight
@@ -148,16 +153,13 @@ impl TenantFairShareGate {
             }
             guard.wait_queues.entry(tenant_id).or_default().push_back(QueuedTenantWaiter { tx });
             guard.total_waiters = guard.total_waiters.saturating_add(1);
-            rx
+            FairWaiterGuard { tenant_id, cfg: self.cfg, state: Arc::clone(&self.state), rx, completed: false }
         };
 
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-            .ok_or(ReplicaCacheError::DeadlineExceeded)?;
-        let budget = self.cfg.admission_timeout.min(remaining);
-        match tokio::time::timeout(budget, &mut rx_opt).await {
+        let budget = self.cfg.admission_timeout.min(initial_remaining);
+        match tokio::time::timeout(budget, &mut waiter.rx).await {
             Ok(Ok(())) => {
+                waiter.completed = true;
                 let waited_us = started.elapsed().as_micros() as u64;
                 let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 *guard.per_tenant_wait_us.entry(tenant_id).or_insert(0) += waited_us;
@@ -167,17 +169,8 @@ impl TenantFairShareGate {
                 ))
             }
             _ => {
-                rx_opt.close();
-                if rx_opt.try_recv().is_ok() {
-                    drop(FairAdmissionPermit {
-                        tenant_id,
-                        cfg: self.cfg,
-                        state: Arc::clone(&self.state),
-                        released: false,
-                    });
-                }
+                drop(waiter);
                 let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                prune_closed_waiters(&mut guard, tenant_id);
                 guard.total_rejected = guard.total_rejected.saturating_add(1);
                 *guard.per_tenant_rejected.entry(tenant_id).or_insert(0) += 1;
                 Err(ReplicaCacheError::QueueFull("tenant fair-share admission timed out"))
@@ -195,6 +188,35 @@ impl TenantFairShareGate {
             per_tenant_admitted: guard.per_tenant_admitted.clone(),
             per_tenant_rejected: guard.per_tenant_rejected.clone(),
             per_tenant_wait_us: guard.per_tenant_wait_us.clone(),
+        }
+    }
+}
+
+struct FairWaiterGuard {
+    tenant_id: Uuid,
+    cfg: TenantFairShareConfig,
+    state: Arc<Mutex<FairGateState>>,
+    rx: oneshot::Receiver<()>,
+    completed: bool,
+}
+
+impl Drop for FairWaiterGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        self.rx.close();
+        if self.rx.try_recv().is_ok() {
+            drop(FairAdmissionPermit {
+                tenant_id: self.tenant_id,
+                cfg: self.cfg,
+                state: Arc::clone(&self.state),
+                released: false,
+            });
+        } else {
+            let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            prune_closed_waiters(&mut guard, self.tenant_id);
         }
     }
 }

@@ -4,7 +4,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -32,6 +35,7 @@ pub struct CachedViewSlot {
     lease: Mutex<Option<TempViewLease>>,
     repo_path: PathBuf,
     reserved_bytes: u64,
+    accounted: AtomicBool,
     _pack_pins: Vec<PackCachePin>,
     expected_pack_files: Vec<(String, u64, u64)>,
     state: Mutex<SlotInner>,
@@ -108,8 +112,10 @@ impl ActiveViewSlot for CachedViewSlot {
 impl Drop for CachedViewSlot {
     fn drop(&mut self) {
         let _ = self.lease.lock().unwrap_or_else(|p| p.into_inner()).take();
-        let mut guard = self.catalog.lock().unwrap_or_else(|p| p.into_inner());
-        guard.resident_bytes = guard.resident_bytes.saturating_sub(self.reserved_bytes);
+        if self.accounted.swap(false, Ordering::SeqCst) {
+            let mut guard = self.catalog.lock().unwrap_or_else(|p| p.into_inner());
+            guard.resident_bytes = guard.resident_bytes.saturating_sub(self.reserved_bytes);
+        }
     }
 }
 
@@ -249,6 +255,7 @@ impl ViewCacheCatalog {
             lease: Mutex::new(Some(lease)),
             repo_path,
             reserved_bytes,
+            accounted: AtomicBool::new(false),
             _pack_pins: pack_pins,
             expected_pack_files,
             state: Mutex::new(SlotInner { active_readers: 1, unindexed: false }),
@@ -260,6 +267,7 @@ impl ViewCacheCatalog {
             guard.lru_counter = guard.lru_counter.saturating_add(1);
             let lru_seq = guard.lru_counter;
             guard.resident_bytes = guard.resident_bytes.saturating_add(reserved_bytes);
+            slot.accounted.store(true, Ordering::SeqCst);
             if let Some(old) =
                 guard.entries.insert(view_key.view_key_hex, IndexedViewEntry { slot: Arc::clone(&slot), lru_seq })
             {
