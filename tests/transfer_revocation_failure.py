@@ -5,9 +5,27 @@ Only fixed enums, booleans, and bounded numeric metrics already present in the
 transfer/probe reports are projected. Raw exception text, paths, argv, OIDs,
 bodies, SQL, DSNs, environment values, and provider text are never stored.
 """
-import errno
 import http.client
-import math
+
+from transfer_revocation_failure_projection import (
+    BACKPRESSURE_BOOLS,
+    BACKPRESSURE_INTS,
+    BACKPRESSURE_NUMS,
+    METRIC_BOUNDS,
+    SAFE_ERRNOS,
+    PROOF_COMPONENTS,
+    SOURCE_BOOLS,
+    SOURCE_INTS,
+    TIMESTAMP_FIELDS,
+    bool_or_none as _bool_or_none,
+    bool_value as _bool,
+    int_or_none as _int_or_none,
+    int_value as _int,
+    num_or_none as _num_or_none,
+    num_value as _num,
+    project as _project,
+    safe_errno,
+)
 
 SCHEMA = "rootyard.transfer_partial_evidence.v1"
 
@@ -57,61 +75,6 @@ RESET_REASONS = frozenset({
     "sample_timing_missing", "sample_duration", "nonmonotonic_sample",
     "sample_gap", "inode_changed", "receiver_queue_changed",
 })
-SAFE_ERRNOS = frozenset({
-    code for code in (
-        errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE, errno.ETIMEDOUT,
-        errno.ECONNREFUSED, errno.EIO, errno.ENOENT, errno.EACCES, errno.EMFILE,
-        errno.ENFILE,
-    ) if isinstance(code, int)
-})
-
-PROOF_COMPONENTS = (
-    "client_stop_within_deadline", "group_post_sanity",
-    "trigger_within_deadline", "backpressure_qualified", "source_witness",
-    "target_pause_within_bound", "actual_reader_resume_within_deadline",
-    "pre_trigger_window", "git_group_within_deadline",
-)
-SOURCE_BOOLS = (
-    "witness_available", "witness_bound", "qualified",
-    "source_identity_unique", "source_position_unchanged", "source_unfinished",
-)
-SOURCE_INTS = (
-    "witness_version", "witness_kind_code", "failure_code",
-    "fatal_failure_code", "source_position", "source_size", "source_remaining",
-)
-BACKPRESSURE_BOOLS = (
-    "qualified", "server_tx_positive_every_sample",
-    "client_rx_positive_every_sample", "probe0_every_sample",
-    "source_qualified_every_sample", "receiver_queue_unchanged",
-)
-BACKPRESSURE_NUMS = (
-    "min_duration_ms", "max_gap_ms", "max_sample_duration_ms",
-    "qualified_span_ms", "observed_window_ms", "max_observed_gap_ms",
-    "max_observed_sample_duration_ms",
-)
-BACKPRESSURE_INTS = (
-    "sample_count", "first_valid_stall_ns", "first_sample_end_ns",
-    "last_sample_start_ns", "last_sample_ns", "server_tx_queue_min",
-    "server_tx_queue_max", "client_rx_queue_min", "client_rx_queue_max",
-    "reset_count",
-)
-METRIC_BOUNDS = {
-    "pre_trigger_pause_ms": (-1_000_000_000, 1_000_000_000),
-    "post_trigger_pause_ms": (-1_000_000_000, 1_000_000_000),
-    "reader_resume_after_lower_ms": (-1_000_000_000, 1_000_000_000),
-    "reader_resume_delta_from_target_ms": (-1_000_000_000, 1_000_000_000),
-    "client_stop_after_lower_ms": (-1_000_000_000, 1_000_000_000),
-    "post_trigger_backpressure_sample_after_lower_ms": (-1_000_000_000, 1_000_000_000),
-    "initial_bytes_received": (0, 1 << 63),
-    "post_trigger_pause_target_ms": (0, 1_000_000_000),
-    "configured_bound_ms": (0, 600_000),
-}
-TIMESTAMP_FIELDS = (
-    "first_byte_ns", "trigger_before_ns", "trigger_after_ns",
-    "reader_resume_ns", "stop_ns", "post_trigger_backpressure_sample_ns",
-)
-
-
 class SafeFailure(AssertionError):
     def __init__(self, code="unexpected", partial=None):
         self.code = _enum(code, EXCEPTION_CLASSES, "exception_class", default="unexpected")
@@ -127,34 +90,6 @@ def _enum(value, allowed, name, *, default=None):
             return default
         raise ValueError(f"invalid {name} enum")
     return value
-
-def _bool(value, name):
-    if type(value) is not bool:
-        raise ValueError(f"{name} must be a boolean")
-    return value
-
-def _bool_or_none(value, name):
-    return None if value is None else _bool(value, name)
-
-def _int(value, name, *, low=0, high=(1 << 63)):
-    if type(value) is not int or value < low or value > high:
-        raise ValueError(f"{name} must be a bounded integer")
-    return value
-
-def _int_or_none(value, name, *, low=0, high=(1 << 63)):
-    return None if value is None else _int(value, name, low=low, high=high)
-
-def _num(value, name, *, low=-1_000_000_000, high=1_000_000_000):
-    if type(value) not in (int, float) or not math.isfinite(value):
-        raise ValueError(f"{name} must be a finite number")
-    if value < low or value > high:
-        raise ValueError(f"{name} outside bounded range")
-    return value
-
-
-def _num_or_none(value, name, *, low=-1_000_000_000, high=1_000_000_000):
-    return None if value is None else _num(value, name, low=low, high=high)
-
 
 def _phase(value, default=None):
     return _enum(value, PHASE_SET, "phase", default=default)
@@ -186,29 +121,6 @@ def safe_error_class(error):
     if isinstance(error, RuntimeError):
         return "runtime_error"
     return "unexpected"
-
-
-def safe_errno(error):
-    if not isinstance(error, OSError):
-        return None
-    value = getattr(error, "errno", None)
-    return value if value in SAFE_ERRNOS else None
-
-
-def _project(source, *, bools=(), ints=(), nums=(), base=None):
-    if source is not None and not isinstance(source, dict):
-        raise ValueError("evidence payload must be a mapping")
-    out = dict(base or {})
-    for name in bools:
-        if source is not None and name in source:
-            out[name] = _bool_or_none(source[name], name)
-    for name in ints:
-        if source is not None and name in source:
-            out[name] = _int_or_none(source[name], name)
-    for name in nums:
-        if source is not None and name in source:
-            out[name] = _num_or_none(source[name], name)
-    return out
 
 
 class FailureEvidence:
