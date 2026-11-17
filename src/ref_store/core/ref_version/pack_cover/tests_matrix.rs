@@ -114,7 +114,7 @@ fn planner_verifier_auth_isolation_and_fallback_matrix() {
         operation_id: uid(813),
     })
     .unwrap();
-    index.register_leaf_cover(c1, mem1).unwrap();
+    index.register_leaf_cover(c1.clone(), mem1).unwrap();
     index.register_leaf_cover(c2, mem1).unwrap();
     index.register_leaf_cover(c_sec, mem1).unwrap();
 
@@ -208,7 +208,7 @@ fn planner_verifier_auth_isolation_and_fallback_matrix() {
         FetchPlanOutcome::FallbackToStrongSnapshot { reason: FallbackReason::RetentionLost, .. }
     ));
 
-    let mut non_common_req = inc_req;
+    let mut non_common_req = inc_req.clone();
     non_common_req.isolation = ReadIsolationMode::VersionSet {
         version_ids: vec![v2.version_id()],
         session_lower_bound: None,
@@ -282,7 +282,9 @@ fn planner_verifier_auth_isolation_and_fallback_matrix() {
 
     let mut wrong_realm_heads = heads.clone();
     let other_r = realm(GitObjectFormat::Sha1);
-    let (v_other, _) = mint_version(&other_r, "refs/heads/main", 1, None, oid(GitObjectFormat::Sha1, 1), p1, vec![]);
+    let (p_other, _) = make_pack(&other_r, 11, 50_000, 1000, false, vec![]);
+    let (v_other, _) =
+        mint_version(&other_r, "refs/heads/main", 1, None, oid(GitObjectFormat::Sha1, 1), p_other, vec![]);
     wrong_realm_heads.insert(RefName::new("refs/heads/main").unwrap(), RefHead::from_committed(&v_other).unwrap());
     let wrong_realm_cut = StrongSnapshotCut { heads: wrong_realm_heads, ..cut.clone() };
     let mut wrong_realm_req = inc_req.clone();
@@ -340,7 +342,7 @@ fn planner_rejects_aggregate_scoring_work_budget_exhaustion() {
         let mut raw = [0_u8; 20];
         raw[..8].copy_from_slice(&(idx as u64 + 1).to_be_bytes());
         raw[19] = 2;
-        GitOid::from_bytes(GitObjectFormat::Sha1, &raw).unwrap()
+        GitOid::parse(GitObjectFormat::Sha1, &hex::encode(raw)).unwrap()
     };
     for i in 0..250_usize {
         let parent_oids = if i > 0 { vec![mk_oid(i - 1)] } else { vec![] };
