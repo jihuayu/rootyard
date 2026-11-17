@@ -52,7 +52,19 @@ pub(super) async fn run_compaction_git(
         return Err(CompactionError::DeadlineExceeded);
     }
     let mut cmd = Command::new("git");
-    cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
+    cmd.args([
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "gc.autoDetach=false",
+        "-c",
+        "maintenance.auto=0",
+        "-c",
+        "maintenance.autoDetach=false",
+        "--no-replace-objects",
+    ]);
     if let Some(dir) = repo_dir {
         cmd.arg("-C").arg(dir);
     }

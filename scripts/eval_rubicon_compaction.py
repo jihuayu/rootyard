@@ -48,6 +48,7 @@ def _git_env() -> dict[str, str]:
     env.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": NULL_CONFIG,
             "GIT_CONFIG_GLOBAL": NULL_CONFIG,
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_AUTHOR_NAME": "rubicon-compaction",
@@ -60,7 +61,20 @@ def _git_env() -> dict[str, str]:
 
 
 def _run_git(repo: Path | None, args: list[str], *, input_bytes: bytes | None = None) -> tuple[bytes, float]:
-    cmd = ["git", "-c", "core.hooksPath=/dev/null", "--no-replace-objects"]
+    cmd = [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "gc.autoDetach=false",
+        "-c",
+        "maintenance.auto=0",
+        "-c",
+        "maintenance.autoDetach=false",
+        "--no-replace-objects",
+    ]
     if repo is not None:
         cmd.extend(["-C", str(repo)])
     cmd.extend(args)

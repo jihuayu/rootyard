@@ -32,12 +32,16 @@ pub(super) struct StoredOpEntry {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DurableStoreState {
-    pub(super) repos: BTreeMap<(Uuid, Uuid, Uuid), CompactionAuthoritativeSnapshot>,
+    pub(super) repos: BTreeMap<String, CompactionAuthoritativeSnapshot>,
     pub(super) leases: BTreeMap<String, LeaseSlotState>,
     pub(super) checkpoints: BTreeMap<Uuid, PendingOperationRecord>,
     pub(super) operations: BTreeMap<Uuid, StoredOpEntry>,
     pub(super) cas_conflict_count: u64,
     pub(super) double_retirement_rejections: u64,
+}
+
+pub(super) fn repo_slot_key(tenant_id: Uuid, repo_id: Uuid, history_id: Uuid) -> String {
+    format!("{tenant_id}:{repo_id}:{history_id}")
 }
 
 pub(super) fn lease_slot_key(key: &CompactionLeaseKey) -> String {
@@ -124,7 +128,7 @@ pub(super) fn apply_cas_commit_locked(
     {
         return Err(CompactionError::EquivalenceFailed("publish request lacks valid equivalence proof".into()));
     }
-    let repo_key = (request.tenant_id, request.repo_id, request.history_id);
+    let repo_key = repo_slot_key(request.tenant_id, request.repo_id, request.history_id);
     let Some(repo) = guard.repos.get(&repo_key) else {
         return Err(CompactionError::InvalidInput("missing repository authority".into()));
     };

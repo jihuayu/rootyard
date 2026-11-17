@@ -1,9 +1,10 @@
 //! Real OpenDAL S3 + stock Git (`SHA-1` & `SHA-256`) integration, fault, and concurrency tests (#162).
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -64,29 +65,26 @@ impl LoopbackS3 {
 
     fn open_store(&self) -> Result<BlobStore> {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let ep = format!("ROOTYARD_BLOB_ENDPOINT={}", self.endpoint);
+        let ep = self.endpoint.as_str();
         let spec = "DRIVER=opendal SERVICE=s3 BUCKET=compaction-test-bucket REGION=us-east-1 ROOT=compaction-it ACCESS_KEY_ID=test-ak SECRET_ACCESS_KEY=test-sk ENCRYPTION_MODE=provider-managed RETRY_MAX_TIMES=0 MAX_OBJECT_BYTES=8388608";
-        let mut pairs: Vec<_> = spec
+        let mut pairs: Vec<(String, Option<std::ffi::OsString>)> = spec
             .split(' ')
             .map(|s| s.split_once('=').unwrap())
-            .map(|(k, v)| (format!("ROOTYARD_BLOB_{k}"), Some(v)))
+            .map(|(k, v)| (format!("ROOTYARD_BLOB_{k}"), Some(v.into())))
             .collect();
-        pairs.push(("ROOTYARD_BLOB_ENDPOINT".into(), Some(ep.split_once('=').unwrap().1)));
-        pairs.push(("ROOTYARD_BLOB_KEYRING_DIR".into(), None));
+        pairs.extend([("ROOTYARD_BLOB_ENDPOINT".into(), Some(ep.into())), ("ROOTYARD_BLOB_KEYRING_DIR".into(), None)]);
         let saved: Vec<_> = pairs.iter().map(|(k, _)| (k.clone(), std::env::var_os(k))).collect();
-        // SAFETY: serialized via ENV_LOCK across tests in this integration binary.
-        unsafe {
-            pairs
-                .iter()
-                .for_each(|(k, v)| if let Some(val) = v { std::env::set_var(k, val) } else { std::env::remove_var(k) });
-        }
+        let apply = |items: &[(String, Option<std::ffi::OsString>)]| {
+            // SAFETY: serialized via ENV_LOCK across tests in this integration binary.
+            unsafe {
+                items
+                    .iter()
+                    .for_each(|(k, v)| if let Some(x) = v { std::env::set_var(k, x) } else { std::env::remove_var(k) });
+            }
+        };
+        apply(&pairs);
         let res = BlobStore::open(BlobProfile::from_env()?);
-        // SAFETY: serialized via ENV_LOCK across tests in this integration binary.
-        unsafe {
-            saved.into_iter().for_each(|(k, old)| {
-                if let Some(val) = old { std::env::set_var(k, val) } else { std::env::remove_var(k) }
-            });
-        }
+        apply(&saved);
         Ok(res?)
     }
 
@@ -171,30 +169,61 @@ impl CompactionBlobUploader for TestS3Uploader {
     }
 }
 
-fn git_ok(repo: &Path, args: &[&str]) -> Result<String> {
-    let env = [
-        ("GIT_CONFIG_NOSYSTEM", "1"),
-        ("GIT_CONFIG_GLOBAL", "/dev/null"),
-        ("GIT_AUTHOR_NAME", "r"),
-        ("GIT_AUTHOR_EMAIL", "r@e"),
-        ("GIT_COMMITTER_NAME", "r"),
-        ("GIT_COMMITTER_EMAIL", "r@e"),
-    ];
-    let out = Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "-C"])
+fn git_run(repo: &Path, args: &[&str], stdin_data: Option<&str>) -> Result<String> {
+    let null = if cfg!(unix) { "/dev/null" } else { "NUL" };
+    let cfg = "core.hooksPath=/dev/null gc.auto=0 gc.autoDetach=false maintenance.auto=0 maintenance.autoDetach=false";
+    let env_spec =
+        "GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=r GIT_AUTHOR_EMAIL=r@e GIT_COMMITTER_NAME=r GIT_COMMITTER_EMAIL=r@e";
+    let mut cmd = Command::new("git");
+    cmd.args(cfg.split(' ').flat_map(|c| ["-c", c]))
+        .args(["--no-replace-objects", "-C"])
         .arg(repo)
         .args(args)
-        .envs(env)
-        .output()?;
+        .envs(env_spec.split(' ').map(|s| s.split_once('=').unwrap()))
+        .envs([("GIT_CONFIG_SYSTEM", null), ("GIT_CONFIG_GLOBAL", null)])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() });
+    let mut child = cmd.spawn()?;
+    if let Some(payload) = stdin_data
+        && let Some(mut pipe) = child.stdin.take()
+    {
+        pipe.write_all(payload.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
     ensure!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())
 }
 
-fn commit_pack(work: &Path, msg: &str, repack_args: &[&str]) -> Result<()> {
+fn git_ok(repo: &Path, args: &[&str]) -> Result<String> {
+    git_run(repo, args, None)
+}
+
+fn make_commit_pack(
+    work: &Path,
+    stage: &Path,
+    msg: &str,
+    range: &str,
+    m: (Uuid, Uuid, u64, u16),
+) -> Result<CompactionPackEntry> {
     git_ok(work, &["add", "."])?;
     git_ok(work, &["commit", "-m", msg])?;
-    git_ok(work, repack_args)?;
-    Ok(())
+    let oids: String = git_ok(work, &["rev-list", "--objects", range])?
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .map(|o| format!("{o}\n"))
+        .collect();
+    std::fs::create_dir_all(stage)?;
+    git_run(work, &["pack-objects", "-q", stage.join("pack").to_str().unwrap()], Some(&oids))?;
+    let stem = std::fs::read_dir(stage)?
+        .filter_map(|e| {
+            e.ok()?.file_name().to_str()?.strip_suffix(".pack").filter(|s| s.starts_with("pack-")).map(str::to_owned)
+        })
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing pack"))?;
+    let p = put_s3_blob((m.0, m.1, 1), &stage.join(format!("{stem}.pack")), false)?;
+    let i = put_s3_blob((m.0, m.1, 1), &stage.join(format!("{stem}.idx")), false)?;
+    Ok(CompactionPackEntry::from_locators(Uuid::new_v4(), stem, &p, &i, m.2, m.3)?)
 }
 
 #[derive(Clone)]
@@ -210,61 +239,39 @@ struct MultiPackRepo {
 }
 
 fn seed_repo(dir: &Path, fmt: ReadAccelObjectFormat, num_packs: usize, shards: u16) -> Result<MultiPackRepo> {
-    let work = dir.join("work");
+    let (work, stage) = (dir.join("work"), dir.join("stage"));
     std::fs::create_dir_all(&work)?;
     git_ok(&work, &["init", fmt.git_init_flag(), "--initial-branch=main"])?;
-    std::fs::write(work.join("base.txt"), "shared-delta-base-".repeat(40))?;
-    commit_pack(&work, "root", &["repack", "-ad", "--no-write-bitmap-index"])?;
-    let root_oid = git_ok(&work, &["rev-parse", "HEAD"])?;
-    for idx in 1..num_packs {
+    let (tenant, repo, history) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let (mut packs, mut root_oid) = (Vec::with_capacity(num_packs), String::new());
+    for idx in 0..num_packs {
         std::fs::write(work.join("base.txt"), format!("{}-delta-{idx}", "shared-delta-base-".repeat(40)))?;
         std::fs::write(work.join(format!("f-{idx}.txt")), format!("payload-{idx}\n"))?;
-        commit_pack(&work, &format!("step {idx}"), &["repack", "--no-write-bitmap-index"])?;
+        let range = if idx == 0 { "HEAD" } else { "HEAD~1..HEAD" };
+        packs.push(make_commit_pack(
+            &work,
+            &stage.join(format!("p{idx}")),
+            &format!("s{idx}"),
+            range,
+            (tenant, repo, 1, shards),
+        )?);
+        if idx == 0 {
+            root_oid = git_ok(&work, &["rev-parse", "HEAD"])?;
+        }
     }
-    let tip = git_ok(&work, &["rev-parse", "refs/heads/main"])?;
-    let (tenant, repo, history) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    let packs = upload_packs(&work.join(".git/objects/pack"), tenant, repo, shards)?;
+    ensure!(packs.len() == num_packs, "expected {num_packs} packs");
+    let refs = vec![AuthoritativeRef::new("refs/heads/main", git_ok(&work, &["rev-parse", "refs/heads/main"])?)];
     let oid_count = git_ok(&work, &["cat-file", "--batch-check", "--batch-all-objects"])?.lines().count();
-    Ok(MultiPackRepo {
-        work,
-        tenant,
-        repo,
-        history,
-        packs,
-        refs: vec![AuthoritativeRef::new("refs/heads/main", tip)],
-        roots: vec![root_oid],
-        oid_count,
-    })
+    Ok(MultiPackRepo { work, tenant, repo, history, packs, refs, roots: vec![root_oid], oid_count })
 }
 
 fn push_extra_pack(repo: &mut MultiPackRepo, tag: &str, shards: u16, gen_num: u64) -> Result<CompactionPackEntry> {
-    let existing: HashSet<_> = repo.packs.iter().map(|p| p.pack_stem.clone()).collect();
     std::fs::write(repo.work.join(format!("{tag}.txt")), format!("concurrent-{tag}\n"))?;
-    commit_pack(&repo.work, tag, &["repack", "--no-write-bitmap-index"])?;
+    let stage = repo.work.parent().unwrap().join(format!("extra-{gen_num}-{tag}-{}", repo.packs.len()));
+    let added = make_commit_pack(&repo.work, &stage, tag, "HEAD~1..HEAD", (repo.tenant, repo.repo, gen_num, shards))?;
     repo.refs = vec![AuthoritativeRef::new("refs/heads/main", git_ok(&repo.work, &["rev-parse", "refs/heads/main"])?)];
-    let mut added = upload_packs(&repo.work.join(".git/objects/pack"), repo.tenant, repo.repo, shards)?
-        .into_iter()
-        .find(|p| !existing.contains(&p.pack_stem))
-        .expect("new pack");
-    added.joined_generation = gen_num;
     repo.packs.push(added.clone());
     Ok(added)
-}
-
-fn upload_packs(pack_dir: &Path, tenant: Uuid, repo: Uuid, shards: u16) -> Result<Vec<CompactionPackEntry>> {
-    let mut stems: Vec<_> = std::fs::read_dir(pack_dir)?
-        .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".pack").map(str::to_owned))
-        .collect();
-    stems.sort();
-    stems
-        .into_iter()
-        .map(|stem| {
-            let p = put_s3_blob((tenant, repo, 1), &pack_dir.join(format!("{stem}.pack")), false)?;
-            let i = put_s3_blob((tenant, repo, 1), &pack_dir.join(format!("{stem}.idx")), false)?;
-            CompactionPackEntry::from_locators(Uuid::new_v4(), stem, &p, &i, 1, shards)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
 }
 
 #[derive(Clone)]
@@ -458,15 +465,8 @@ async fn sharding_isolated_serving_quota_and_concurrent_ingest() -> Result<()> {
     h.seed(&store, &repo, "sha1", 2)?;
     for i in 0..4 {
         let extra = push_extra_pack(&mut repo, &format!("stream-{i}"), 2, (i + 2) as u64)?;
-        store.append_concurrent_pack(
-            repo.tenant,
-            repo.repo,
-            repo.history,
-            extra,
-            repo.refs.clone(),
-            2_000 + i as u64 * 100,
-            &h.policy,
-        )?;
+        let ts = 2_000 + i as u64 * 100;
+        store.append_concurrent_pack(repo.tenant, repo.repo, repo.history, extra, repo.refs.clone(), ts, &h.policy)?;
     }
     store.seal_aged_segments(repo.tenant, repo.repo, repo.history, 100_000, &h.policy)?;
 

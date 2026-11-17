@@ -21,7 +21,7 @@ use super::{
     },
     store_cas::{
         DurableStoreState, LeaseSlotState, acquire_lease_locked, apply_cas_commit_locked, lease_slot_key,
-        validate_lease_in_state,
+        repo_slot_key, validate_lease_in_state,
     },
 };
 
@@ -108,7 +108,7 @@ impl DurableCompactionStore {
         };
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = guard.clone();
-        next.repos.insert((tenant_id, repo_id, history_id), snap.clone());
+        next.repos.insert(repo_slot_key(tenant_id, repo_id, history_id), snap.clone());
         self.flush_state(&next)?;
         *guard = next;
         Ok(snap)
@@ -128,7 +128,7 @@ impl DurableCompactionStore {
         let mut next = guard.clone();
         let repo = next
             .repos
-            .get_mut(&(tenant_id, repo_id, history_id))
+            .get_mut(&repo_slot_key(tenant_id, repo_id, history_id))
             .ok_or_else(|| CompactionError::InvalidInput("unknown repo".into()))?;
         pack.validate(repo.shard_count)?;
         if repo.serving_packs.iter().any(|p| p.pack_id == pack.pack_id) {
@@ -157,7 +157,7 @@ impl DurableCompactionStore {
         let mut next = guard.clone();
         let repo = next
             .repos
-            .get_mut(&(tenant_id, repo_id, history_id))
+            .get_mut(&repo_slot_key(tenant_id, repo_id, history_id))
             .ok_or_else(|| CompactionError::InvalidInput("unknown repo".into()))?;
         if !repo.retention_roots.contains(&root_oid) {
             repo.retention_roots.push(root_oid);
@@ -182,7 +182,7 @@ impl DurableCompactionStore {
         let mut next = guard.clone();
         let repo = next
             .repos
-            .get_mut(&(tenant_id, repo_id, history_id))
+            .get_mut(&repo_slot_key(tenant_id, repo_id, history_id))
             .ok_or_else(|| CompactionError::InvalidInput("unknown repo".into()))?;
         let sealed = repo.segments.seal_aged_segments(now_ms, policy)?;
         self.flush_state(&next)?;
@@ -284,7 +284,7 @@ impl CompactionAuthorityStore for DurableCompactionStore {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .repos
-                .get(&(tenant_id, repo_id, history_id))
+                .get(&repo_slot_key(tenant_id, repo_id, history_id))
                 .cloned()
                 .ok_or_else(|| CompactionError::InvalidInput("repository snapshot not found".into()))
         })
