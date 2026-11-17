@@ -26,11 +26,20 @@ pub(super) async fn fault_injection_drift_missing_corrupt_and_local_cache_recove
     let s3 = LoopbackS3::shared();
     let ctx = test_ctx().context("phase: test context")?;
     let sample = SampleRepoPacks::seed(ReadAccelObjectFormat::Sha1, true).context("phase: seed sample")?;
-    let baseline = sample.open(&ctx, 1, None, false).await.context("phase: baseline open")?;
-    let bundle = sample.build(&ctx, 1, 1, &sample.packs, None).await.context("phase: baseline build")?;
+    let baseline = sample
+        .open(&ctx, 1, None, false)
+        .await
+        .map_err(|err| provider_diag::FaultError::from_anyhow("phase: baseline open", &err))?;
+    let bundle = sample
+        .build(&ctx, 1, 1, &sample.packs, None)
+        .await
+        .map_err(|err| provider_diag::FaultError::from_anyhow("phase: baseline build", &err))?;
 
     // 1. Membership drift & pack-set drift fail closed before sidecar GETs.
-    let drift_view = sample.open(&ctx, 2, Some(&bundle), true).await.context("phase: membership drift open")?;
+    let drift_view = sample
+        .open(&ctx, 2, Some(&bundle), true)
+        .await
+        .map_err(|err| provider_diag::FaultError::from_anyhow("phase: membership drift open", &err))?;
     ensure!(matches!(drift_view.status(), Fallback(MembershipGenerationDrift { expected: 2, manifest: 1 })));
     ensure!(drift_view.metrics().sidecar_get_attempts == 1);
     assert_git_parity(
@@ -42,11 +51,14 @@ pub(super) async fn fault_injection_drift_missing_corrupt_and_local_cache_recove
     let subset_view = sample
         .open_with_packs(&ctx, 1, &sample.packs[..1], &[], (Some(&bundle), true), None)
         .await
-        .context("phase: pack subset open")?;
+        .map_err(|err| provider_diag::FaultError::from_anyhow("phase: pack subset open", &err))?;
     ensure!(matches!(subset_view.status(), Fallback(PackSetDigestDrift)));
 
     // 2. Local cache tamper scrubs sidecars cleanly; cleared-cache rebuild restores Applied view.
-    let cached_view = sample.open(&ctx, 1, Some(&bundle), true).await.context("phase: cached open")?;
+    let cached_view = sample
+        .open(&ctx, 1, Some(&bundle), true)
+        .await
+        .map_err(|err| provider_diag::FaultError::from_anyhow("phase: cached open", &err))?;
     ensure!(
         *cached_view.status() == ReadAccelSidecarStatus::Applied,
         "phase: cached open expected applied, got {} kind={} stage={} detail_class={}",
@@ -85,13 +97,18 @@ pub(super) async fn fault_injection_drift_missing_corrupt_and_local_cache_recove
     assert_git_parity(baseline.repo_path().context("phase: cached recovered parity")?, recovered_path, &sample)
         .context("phase: cached recovered parity")?;
     cached_view.reap();
-    let rebuilt = sample.open(&ctx, 1, Some(&bundle), true).await.context("phase: reaped rebuild open")?;
+    let rebuilt = sample
+        .open(&ctx, 1, Some(&bundle), true)
+        .await
+        .map_err(|err| provider_diag::FaultError::from_anyhow("phase: reaped rebuild open", &err))?;
     ensure!(*rebuilt.status() == ReadAccelSidecarStatus::Applied);
     rebuilt.reap();
 
     // 3. Bit-flipped MIDX, truncated CommitGraph, and deleted Bitmap Blob all quarantine & fall back cleanly.
-    let bundle2 =
-        sample.build(&ctx, 1, 2, &sample.packs, None).await.context("phase: remote-fault build commit-graph+bitmap")?;
+    let bundle2 = sample
+        .build(&ctx, 1, 2, &sample.packs, None)
+        .await
+        .map_err(|err| provider_diag::FaultError::from_anyhow("phase: remote-fault build commit-graph+bitmap", &err))?;
     for (kind, target_bundle, op, want_missing, require_midx_quarantine) in [
         (ReadAccelArtifactKind::Midx, &bundle, None, false, false),
         (ReadAccelArtifactKind::CommitGraph, &bundle2, Some(12), false, true),
@@ -121,7 +138,10 @@ pub(super) async fn fault_injection_drift_missing_corrupt_and_local_cache_recove
             &target_bundle.manifest.artifact(kind).unwrap().locator.to_locator().context(mutate_phase)?,
             op,
         );
-        let view = sample.open(&ctx, 1, Some(target_bundle), true).await.context(open_phase)?;
+        let view = sample
+            .open(&ctx, 1, Some(target_bundle), true)
+            .await
+            .map_err(|err| provider_diag::FaultError::from_anyhow(open_phase, &err))?;
         ensure!(
             match (view.status(), want_missing) {
                 (Fallback(SidecarArtifactMissing(k)), true) => *k == kind,
@@ -465,7 +485,9 @@ impl StageClass {
 }
 mod detail_classifier;
 mod parity;
+mod provider_diag;
 mod retention;
+mod retention_view;
 use detail_classifier::{DetailClass, cached_fallback_detail_class};
 
 pub(super) async fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Result<()> {

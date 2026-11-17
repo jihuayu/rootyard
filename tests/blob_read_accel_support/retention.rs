@@ -9,18 +9,13 @@ use std::{fmt, path::Path, process::Output};
 
 use anyhow::Result;
 use rootyard::blob_store::{
-    BlobError, BlobLocator,
+    BlobError,
     disposable_view::DisposableViewError,
-    read_accel::{
-        PackRetentionRegistry, ReadAccelError, ReadAccelManifest, ReadAccelMaterializeMetrics, ReadAccelObjectFormat,
-        ReadAccelSidecarStatus,
-    },
+    read_accel::{PackRetentionRegistry, ReadAccelError, ReadAccelObjectFormat, ReadAccelSidecarStatus},
 };
 
-use super::{
-    BlobClass, DetailClass, ErrorClass, FormatState, IoKindClass, KindClass, StageClass, StatusClass, ViewClass,
-    cached_fallback_detail_class, cached_fallback_kind_label, cached_fallback_stage_label,
-};
+use super::retention_view::{ViewProjection, project_view};
+use super::{BlobClass, DetailClass, ErrorClass, FormatState, IoKindClass, ViewClass};
 use crate::{SampleRepoPacks, git_cmd, test_ctx};
 
 macro_rules! finite_enum {
@@ -71,24 +66,12 @@ macro_rules! try_read_accel {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ViewProjection {
-    status: StatusClass,
-    kind: KindClass,
-    stage: StageClass,
-    detail: DetailClass,
-    sidecars_applied: u64,
-    sidecar_get_attempts: u64,
-    sidecar_get_bytes: u64,
-    quarantined: u64,
-    artifacts: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug)]
 struct Diag {
     format: FormatState,
     phase: Phase,
     error: ErrorClass,
     blob: BlobClass,
+    blob_detail: DetailClass,
     view: ViewClass,
     side: Side,
     git_op: GitOp,
@@ -111,6 +94,7 @@ impl Diag {
             phase: Phase::Context,
             error: ErrorClass::None,
             blob: BlobClass::None,
+            blob_detail: DetailClass::from_label("none"),
             view: ViewClass::None,
             side: Side::None,
             git_op: GitOp::None,
@@ -152,11 +136,12 @@ impl fmt::Display for SafeDiagError {
         let d = &*self.diag;
         write!(
             f,
-            "read-accel retention diagnostic: format={} phase={} error={} blob={} disposable_view={} side={} git_command={} exit_code={:?} signal={:?} io_kind={} raw_os_error={:?}",
+            "read-accel retention diagnostic: format={} phase={} error={} blob={} blob_detail={} disposable_view={} side={} git_command={} exit_code={:?} signal={:?} io_kind={} raw_os_error={:?}",
             d.format.label(),
             d.phase.label(),
             d.error.label(),
             d.blob.label(),
+            d.blob_detail.label(),
             d.view.label(),
             d.side.label(),
             d.git_op.label(),
@@ -391,29 +376,11 @@ fn git_ok_diag(diag: &mut Diag, repo: &Path, args: &[&str], op: GitOp) -> std::r
     }
 }
 
-fn project_view(
-    status: &ReadAccelSidecarStatus,
-    metrics: &ReadAccelMaterializeMetrics,
-    manifest: &ReadAccelManifest,
-    manifest_locator: &BlobLocator,
-) -> ViewProjection {
-    let stage = match status {
-        ReadAccelSidecarStatus::Applied => StageClass::Applied,
-        ReadAccelSidecarStatus::Disabled => StageClass::Disabled,
-        ReadAccelSidecarStatus::FallbackToAuthoritativePackOnly(_) => {
-            StageClass::from_label(cached_fallback_stage_label(status, metrics, manifest, manifest_locator, true))
-        }
-    };
-    ViewProjection {
-        status: StatusClass::from_status(status),
-        kind: KindClass::from_label(cached_fallback_kind_label(status)),
-        stage,
-        detail: DetailClass::from_label(cached_fallback_detail_class(status)),
-        sidecars_applied: metrics.sidecars_applied as u64,
-        sidecar_get_attempts: metrics.sidecar_get_attempts,
-        sidecar_get_bytes: metrics.sidecar_get_bytes,
-        quarantined: metrics.quarantined_sidecar_paths.len() as u64,
-        artifacts: Some(manifest.artifacts.len() as u64),
+fn classify_blob(err: &BlobError, diag: &mut Diag) {
+    diag.error = ErrorClass::Blob;
+    diag.blob = BlobClass::from_error(err);
+    if let BlobError::Provider(detail) = err {
+        diag.blob_detail = super::detail_classifier::provider_detail_class(detail);
     }
 }
 
@@ -421,8 +388,7 @@ fn classify_anyhow(err: &anyhow::Error, diag: &mut Diag) {
     if let Some(err) = err.downcast_ref::<ReadAccelError>() {
         classify_read_accel(err, diag);
     } else if let Some(err) = err.downcast_ref::<BlobError>() {
-        diag.error = ErrorClass::Blob;
-        diag.blob = BlobClass::from_error(err);
+        classify_blob(err, diag);
     } else if let Some(err) = err.downcast_ref::<DisposableViewError>() {
         diag.error = ErrorClass::DisposableView;
         diag.view = ViewClass::from_error(err);
@@ -444,10 +410,7 @@ fn classify_read_accel(err: &ReadAccelError, diag: &mut Diag) {
         ReadAccelError::Manifest(_) => diag.error = ErrorClass::Manifest,
         ReadAccelError::DisabledByDefault => diag.error = ErrorClass::DisabledByDefault,
         ReadAccelError::InvalidInput(_) => diag.error = ErrorClass::InvalidInput,
-        ReadAccelError::Blob(err) => {
-            diag.error = ErrorClass::Blob;
-            diag.blob = BlobClass::from_error(err);
-        }
+        ReadAccelError::Blob(err) => classify_blob(err, diag),
         ReadAccelError::Envelope(_) => diag.error = ErrorClass::Envelope,
         ReadAccelError::Closure(_) => diag.error = ErrorClass::Closure,
         ReadAccelError::DisposableView(err) => {
