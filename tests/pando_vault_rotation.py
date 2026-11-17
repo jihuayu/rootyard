@@ -33,6 +33,7 @@ import native_build_receipt as receipts  # noqa: E402
 from pando_vault_rotation_fixture import FixtureError  # noqa: E402
 import pando_vault_rotation_cases as cases  # noqa: E402
 import pando_vault_rotation_negative as negative  # noqa: E402
+import pando_vault_rotation_source as source  # noqa: E402
 from pando_vault_rotation_context import Context  # noqa: E402
 from pando_vault_rotation_support import (  # noqa: E402
     ALLOWED_LIMITATIONS,
@@ -46,6 +47,7 @@ from pando_vault_rotation_support import (  # noqa: E402
     sanitize_report,
     sha256_bytes,
     sha256_file,
+    sha256_file_bounded,
 )
 
 REPORT_SCHEMA = "rootyard/issue21-derived-vault-rotation/v1"
@@ -74,9 +76,18 @@ def _harness_files():
     return [path for path in paths if path.is_file()]
 
 
-def _harness_sha256():
-    rows = [path.name + "\0" + sha256_file(path) for path in _harness_files()]
+def _harness_sha256(budget=None):
+    rows = []
+    for path in _harness_files():
+        if budget is not None:
+            budget.require("binding")
+            digest = sha256_file_bounded(path, budget, "binding")
+        else:
+            digest = sha256_file(path)
+        rows.append(path.name + "\0" + digest)
     require(bool(rows), "harness_files_missing", "binding")
+    if budget is not None:
+        budget.late("binding")
     return sha256_bytes("\n".join(rows).encode())
 
 
@@ -117,7 +128,7 @@ def _pando_artifact(receipt, binary_sha256):
     return True
 
 
-def validate_inputs(args, environ):
+def validate_inputs(args, environ, budget=None, runner=None):
     binary = args.binary or environ.get("ROOTYARD_PANDO_LAB_BIN")
     receipt = args.receipt or environ.get("ROOTYARD_PANDO_BUILD_RECEIPT")
     expected_commit = args.expected_commit or environ.get("ROOTYARD_EXPECTED_COMMIT")
@@ -148,26 +159,45 @@ def validate_inputs(args, environ):
         require(shutil.which(tool) is not None, tool + "_missing", "input")
     bootstrap = environ.get("ROOTYARD_TEST_DATABASE_URL")
     require(bool(bootstrap), "missing_pg_bootstrap", "input")
-    state = _source_state(source_root)
-    require(state["commit"] == expected_commit, "expected_commit_mismatch", "binding")
-    binary_sha256 = sha256_file(binary)
-    try:
-        validated = receipts.load_receipt(
-            receipt,
+    if budget is not None and runner is not None:
+        bound = source.validate(
+            runner, budget,
             source_root=source_root,
-            binary_path=binary,
             expected_commit=expected_commit,
+            binary=binary,
+            receipt=receipt,
             expected_binary_sha256=expected_sha,
-            forbid_implicit_build=True,
         )
-    except receipts.ReceiptError:
-        raise QualificationError("receipt_rejected", "binding") from None
-    require(validated.binary_sha256 == binary_sha256,
-            "receipt_binary_digest_mismatch", "binding")
-    require(validated.workspace_commit == expected_commit,
-            "receipt_commit_mismatch", "binding")
-    require(_pando_artifact(validated, binary_sha256),
-            "receipt_pando_artifact_missing", "binding")
+        state = {
+            "commit": bound["source_commit"],
+            "tree": bound["source_tree"],
+            "clean": True,
+        }
+        binary_sha256 = bound["binary_sha256"]
+        receipt_sha256 = bound["receipt_sha256"]
+    else:
+        state = _source_state(source_root)
+        require(state["commit"] == expected_commit, "expected_commit_mismatch",
+                "binding")
+        binary_sha256 = sha256_file(binary)
+        try:
+            validated = receipts.load_receipt(
+                receipt,
+                source_root=source_root,
+                binary_path=binary,
+                expected_commit=expected_commit,
+                expected_binary_sha256=expected_sha,
+                forbid_implicit_build=True,
+            )
+        except receipts.ReceiptError:
+            raise QualificationError("receipt_rejected", "binding") from None
+        require(validated.binary_sha256 == binary_sha256,
+                "receipt_binary_digest_mismatch", "binding")
+        require(validated.workspace_commit == expected_commit,
+                "receipt_commit_mismatch", "binding")
+        require(_pando_artifact(validated, binary_sha256),
+                "receipt_pando_artifact_missing", "binding")
+        receipt_sha256 = validated.receipt_sha256
     return {
         "binary": binary,
         "receipt": receipt,
@@ -180,8 +210,8 @@ def validate_inputs(args, environ):
         "source_tree": state["tree"],
         "source_clean": bool(state["clean"]),
         "binary_sha256": binary_sha256,
-        "receipt_sha256": validated.receipt_sha256,
-        "harness_sha256": _harness_sha256(),
+        "receipt_sha256": receipt_sha256,
+        "harness_sha256": _harness_sha256(budget),
     }
 
 
@@ -189,13 +219,33 @@ def _binding_read_error():
     return QualificationError("binding_unavailable", "binding")
 
 
-def binding_snapshot(inputs):
+def binding_snapshot(inputs, budget=None, runner=None):
     """Re-read every bound identity without letting OS errors escape.
 
     A mismatch is a fixed ``*_binding_changed`` code.  Any unreadable source,
     binary, receipt or harness source is ``binding_unavailable``; no fresh hash
-    is fabricated for the report.
+    is fabricated for the report.  When a budget and runner are supplied every
+    Git/receipt read runs in one bounded owned child; the unbudgeted in-process
+    path is retained only for the existing pure unit contract.
     """
+    if budget is not None and runner is not None:
+        bound = source.snapshot(runner, budget, inputs)
+        try:
+            harness_sha256 = _harness_sha256(budget)
+        except QualificationError:
+            raise
+        except (OSError, ValueError, TypeError):
+            raise _binding_read_error() from None
+        require(harness_sha256 == inputs["harness_sha256"],
+                "harness_binding_changed", "binding")
+        return {
+            "source_commit": bound["source_commit"],
+            "source_tree": bound["source_tree"],
+            "source_clean": True,
+            "binary_sha256": inputs["binary_sha256"],
+            "receipt_sha256": inputs["receipt_sha256"],
+            "harness_sha256": inputs["harness_sha256"],
+        }
     try:
         state = receipts.git_state(inputs["source_root"])
     except QualificationError:

@@ -392,6 +392,8 @@ jobs:
             --harness tests/pando_vault_rotation_mirror.py \
             --harness tests/pando_vault_rotation_negative.py \
             --harness tests/pando_vault_rotation_service.py \
+            --harness tests/pando_vault_rotation_source.py \
+            --harness tests/pando_vault_rotation_source_child.py \
             --harness tests/pando_vault_rotation_support.py \
             --harness tests/test_pando_vault_rotation_binding_failure.py \
             --harness tests/test_pando_vault_rotation_budget.py \
@@ -403,6 +405,7 @@ jobs:
             --harness tests/test_pando_vault_rotation_interrupt_oracle.py \
             --harness tests/test_pando_vault_rotation_receipt_v2.py \
             --harness tests/test_pando_vault_rotation_resource_ownership.py \
+            --harness tests/test_pando_vault_rotation_source.py \
             --harness scripts/native_build_receipt.py \
             --harness scripts/native_report_manifest.py \
             --harness scripts/native_artifact_store.py \

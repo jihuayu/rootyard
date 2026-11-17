@@ -282,11 +282,14 @@ def case_wrong_key_ciphertext_envelope_and_provider_revocation(ctx):
 
 
 def case_owned_resource_cleanup(ctx):
+    budget = getattr(ctx, "budget", None)
     server_stopped = True
     if ctx.server is not None:
         try:
             server_stopped = ctx.server.stop()
-        except QualificationError:
+        except (QualificationError, FixtureError, OSError):
+            server_stopped = False
+        if getattr(ctx.server, "process", None) is not None:
             server_stopped = False
     vault_owned = bool(ctx.fixture is not None
                        and (ctx.fixture.container_id is not None
@@ -319,6 +322,8 @@ def case_owned_resource_cleanup(ctx):
     safe_to_remove_root = server_stopped and vault_stopped and postgres_dropped
     if root_owned and safe_to_remove_root:
         try:
+            if budget is not None:
+                budget.require("cleanup")
             root_removed = ctx.root.remove()
             root_absent = not ctx.root.path.exists()
         except (FixtureError, QualificationError, OSError):

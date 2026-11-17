@@ -29,10 +29,11 @@ from pando_vault_rotation_support import (
 
 
 class Context:
-    def __init__(self, inputs, base_environment, runner):
+    def __init__(self, inputs, base_environment, runner, budget=None):
         self.inputs = inputs
         self.base_environment = dict(base_environment)
         self.runner = runner
+        self.budget = budget
         self.binary = str(inputs["binary"])
         self.root = None
         self.fixture = None
@@ -48,22 +49,36 @@ class Context:
         self.baseline = {}
         self.setup_error = None
 
+    def _require(self, stage):
+        if self.budget is not None:
+            self.budget.require(stage)
+
+    def _late(self, stage):
+        if self.budget is not None:
+            self.budget.late(stage)
+
     def start_base(self):
+        self._require("setup")
         self.root = OwnedRoot()
         root_path = self.root.create()
+        self._late("setup")
         self.markers = [
             "ROOTYARD_ISSUE21_%s_ALPHA" % self.root.nonce.upper(),
             "ROOTYARD_ISSUE21_%s_BETA" % self.root.nonce.upper(),
             "ROOTYARD_ISSUE21_%s_GAMMA" % self.root.nonce.upper(),
             "ROOTYARD_ISSUE21_%s_DELTA" % self.root.nonce.upper(),
         ]
-        self.fixture = VaultFixture(root_path / "vault-state.json", runner=self.runner)
+        self.fixture = VaultFixture(
+            root_path / "vault-state.json", runner=self.runner,
+            budget=self.budget)
         self.fixture.start()
+        self._late("setup")
         self.fixture.prepare_admin()
         self.fixture.create_scoped_token()
         self.postgres = OwnedPostgres(
             self.inputs["bootstrap_dsn"], nonce=self.root.nonce, runner=self.runner)
         self.postgres.create()
+        self._late("setup")
         self.psql = Psql(self.postgres, runner=self.runner)
         git = shutil.which("git")
         require(git is not None and Path(git).is_absolute(), "git_missing", "setup")
@@ -73,11 +88,16 @@ class Context:
         self.run_cli(["init"], stage="init")
         self.repo = str(uuid.uuid4())
         self.run_cli(["create-repo", self.repo, "alice"], stage="create_repo")
-        self.server = Server(self.binary, self.environment)
+        self.server = Server(
+            self.binary, self.environment, runner=self.runner,
+            budget=self.budget)
         self.server.start()
-        self.git = GitWorkspace(self.environment, runner=self.runner)
+        self._late("setup")
+        self.git = GitWorkspace(
+            self.environment, runner=self.runner, budget=self.budget)
         self.source = root_path / "source"
         self.git.init(self.source)
+        self._late("setup")
 
     def run_cli(self, args, env=None, stage="cli", timeout=90):
         return self.runner.ok(
@@ -96,8 +116,10 @@ class Context:
 
     def commit_and_push(self, index, message):
         require(0 <= index < len(self.markers), "marker_index_invalid", "git")
+        self._require("git")
         self.git.commit(self.source, self.markers[index], message)
         self.git.push(self.source, self.server.url(self.repo))
+        self._late("git")
         return self.markers[index]
 
     def prepare_initial_packs(self):
@@ -108,27 +130,42 @@ class Context:
         return self.pack_ids
 
     def refresh_packs(self):
+        self._require("packs")
         rows = self.psql.manifests(self.repo)
         self.pack_ids = sorted(row["pack_id"] for row in rows)
         require(bool(self.pack_ids), "no_committed_packs", "packs")
+        self._late("packs")
         return self.pack_ids
 
     def manifest(self, pack):
-        return read_manifest(self.root.path, self.repo, pack)
+        self._require("manifest")
+        value = read_manifest(self.root.path, self.repo, pack)
+        self._late("manifest")
+        return value
 
     def envelope(self, pack):
+        self._require("db_authority")
         value = self.psql.envelope_for(self.repo, pack)
         require(value is not None, "db_envelope_missing", "db_authority")
+        self._late("db_authority")
         return value
 
     def cipher(self, pack):
-        return read_cipher(self.root.path, self.manifest(pack))
+        self._require("cipher")
+        value = read_cipher(self.root.path, self.manifest(pack))
+        self._late("cipher")
+        return value
 
     def evict(self, pack_ids=None):
-        return evict_plaintext_cache(
-            self.root.path, self.repo, pack_ids if pack_ids is not None else self.pack_ids)
+        self._require("cache")
+        value = evict_plaintext_cache(
+            self.root.path, self.repo,
+            pack_ids if pack_ids is not None else self.pack_ids)
+        self._late("cache")
+        return value
 
     def cold_get(self, pack, env=None):
+        self._require("cold_object_store_get")
         self.evict([pack])
         report = self.cli(["object-store-get", self.repo, pack], env=env,
                           stage="cold_object_store_get")
@@ -147,9 +184,11 @@ class Context:
         require(__import__("hashlib").sha256(local_pack.read_bytes()).hexdigest()
                 == manifest["pack_sha256"], "cold_get_plaintext_digest_mismatch",
                 "cold_object_store_get")
+        self._late("cold_object_store_get")
         return report
 
     def cold_verify(self, env=None):
+        self._require("cold_kms_verify")
         self.refresh_packs()
         self.evict()
         report = self.cli(["kms-verify", self.repo], env=env,
@@ -162,17 +201,23 @@ class Context:
         require(report.get("encryption_mode") == "authenticated-envelope-v1"
                 and report.get("authenticated_encryption") is True,
                 "cold_verify_mode_mismatch", "cold_kms_verify")
+        self._late("cold_kms_verify")
         return report
 
     def cold_clone(self, name):
+        self._require("cold_http_clone")
         self.refresh_packs()
         self.evict()
         destination = self.root.path / name
         clone = self.git.clone(self.server.url(self.repo), destination)
+        self._late("cold_http_clone")
         return clone
 
     def status(self, env=None):
-        return self.cli(["kms-status", self.repo], env=env, stage="kms_status")
+        self._require("kms_status")
+        report = self.cli(["kms-status", self.repo], env=env, stage="kms_status")
+        self._late("kms_status")
+        return report
 
     def close_fixture_view(self):
         """Best-effort memory release unrelated to ownership cleanup."""

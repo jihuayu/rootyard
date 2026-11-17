@@ -198,8 +198,8 @@ class OwnedPostgres:
             # A nonzero CREATE is a rejection.  A timed-out/lost process is
             # unknown: it never authorizes cleanup to drop anything by name.
             self.creation_outcome = (
-                "unknown" if error.code in ("process_failed", "pg_command_timeout")
-                else "rejected")
+                "rejected" if getattr(error, "code", None) == "pg_command_failed"
+                else "unknown")
             raise
         # The successful CREATE acknowledgement is the ownership boundary.
         self.create_acknowledged = True

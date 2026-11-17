@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import select
 import shutil
+import signal
 import subprocess
 import time
 import urllib.parse
@@ -122,16 +123,44 @@ class Psql:
 
 
 class Server:
-    def __init__(self, binary, environment, runner=None):
+    """One exact-owned Pando HTTP server under the shared absolute deadline."""
+
+    MAX_LINE = 4096
+
+    def __init__(self, binary, environment, runner=None, budget=None,
+                 clock=None, popen=None, killpg=None):
         self.binary = str(binary)
         self.environment = dict(environment)
+        self.runner = runner
+        self.budget = budget
+        self.clock = clock
         self.process = None
         self.base = None
+        self.owned_group = False
+        self._popen = popen or subprocess.Popen
+        self._killpg = killpg or os.killpg
+
+    def _now(self):
+        return self.clock() if self.clock is not None else time.monotonic()
+
+    def _clamp(self, requested, stage):
+        if self.budget is None:
+            return requested
+        return self.budget.clamp(requested, stage)
+
+    def _late(self, stage):
+        if self.budget is not None:
+            self.budget.late(stage)
+
+    def _late_overall(self, stage):
+        if self.budget is not None:
+            self.budget.late_overall(stage)
 
     def start(self, timeout=45):
         require(self.process is None, "server_already_started", "server")
+        effective = self._clamp(timeout, "server")
         try:
-            self.process = subprocess.Popen(
+            process = self._popen(
                 [self.binary, "serve"],
                 env=self.environment,
                 stdin=subprocess.DEVNULL,
@@ -139,53 +168,129 @@ class Server:
                 stderr=subprocess.DEVNULL,
                 text=True,
                 bufsize=1,
+                start_new_session=True,
             )
         except OSError:
             raise QualificationError("server_start_failed", "server") from None
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.process.poll() is not None:
+        # The parent retains the handle and group ownership immediately after
+        # Popen and before any await/read/start join.
+        self.process = process
+        self.owned_group = True
+        try:
+            self._late("server")
+        except Exception:
+            self.stop()
+            raise
+        stream = getattr(process, "stdout", None)
+        if stream is None:
+            self.stop()
+            raise QualificationError("server_start_failed", "server")
+        deadline = self._now() + effective
+        if self.budget is not None:
+            deadline = min(deadline, self.budget.deadline)
+        while self._now() < deadline:
+            if process.poll() is not None:
+                self.stop()
                 raise QualificationError("server_exited", "server")
-            ready, _, _ = select.select([self.process.stdout], [], [], 0.2)
+            wait = min(0.2, max(0.0, deadline - self._now()))
+            ready, _, _ = select.select([stream], [], [], wait)
             if not ready:
                 continue
-            line = self.process.stdout.readline()
+            line = stream.readline(self.MAX_LINE)
             if not line:
-                if self.process.poll() is not None:
+                if process.poll() is not None:
+                    self.stop()
                     raise QualificationError("server_exited", "server")
                 continue
+            if len(line) >= self.MAX_LINE and not line.endswith("\n"):
+                self.stop()
+                raise QualificationError("server_announcement_invalid", "server")
             if not line.startswith("LISTEN "):
+                try:
+                    self._late("server")
+                except Exception:
+                    self.stop()
+                    raise
                 continue
             value = line.split(" ", 1)[1].strip()
             try:
                 parsed = urllib.parse.urlsplit(value)
                 port = parsed.port
             except ValueError:
+                self.stop()
                 raise QualificationError("server_announcement_invalid", "server") from None
             if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
                     or not port or parsed.path not in ("", "/")):
+                self.stop()
                 raise QualificationError("server_announcement_invalid", "server")
+            try:
+                self._late("server")
+            except Exception:
+                self.stop()
+                raise
             self.base = "http://127.0.0.1:" + str(port)
             return self.base
         self.stop()
         raise QualificationError("server_start_timeout", "server")
 
+    def _signal(self, process, sig):
+        pgid = getattr(process, "pid", None)
+        if (self.owned_group and isinstance(pgid, int)
+                and pgid > 0 and pgid != os.getpid()):
+            try:
+                self._killpg(pgid, sig)
+                return
+            except ProcessLookupError:
+                return
+            except (OSError, ValueError, TypeError):
+                pass
+        try:
+            if sig == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _wait(self, process, deadline):
+        remaining = deadline - self._now()
+        if remaining <= 0:
+            return False
+        try:
+            process.wait(timeout=remaining)
+            return True
+        except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
+            return False
+
+    def _close(self, process):
+        stream = getattr(process, "stdout", None)
+        if stream is not None:
+            try:
+                stream.close()
+            except (OSError, ValueError, AttributeError):
+                pass
+
     def stop(self, timeout=15):
         if self.process is None:
             return True
-        if self.process.poll() is not None:
-            self.process = None
-            return True
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                raise QualificationError("server_stop_timeout", "cleanup") from None
+        # Stop is only reached from an owned failure or cleanup; it uses the
+        # whole absolute deadline, never a fresh per-operation budget.
+        self._late_overall("cleanup")
+        process = self.process
+        deadline = self._now() + timeout
+        if self.budget is not None:
+            deadline = min(deadline, self.budget.overall_deadline)
+        if process.poll() is None:
+            self._signal(process, signal.SIGTERM)
+            if not self._wait(process, deadline):
+                self._signal(process, signal.SIGKILL)
+                if not self._wait(process, deadline):
+                    raise QualificationError("server_stop_timeout", "cleanup")
+        if process.poll() is None:
+            raise QualificationError("server_stop_timeout", "cleanup")
+        self._close(process)
         self.process = None
+        self.owned_group = False
         return True
 
     def url(self, repo):
@@ -232,26 +337,40 @@ def git_client_environment(environment):
 
 
 class GitWorkspace:
-    def __init__(self, environment, runner=None):
+    def __init__(self, environment, runner=None, budget=None):
         self.environment = git_client_environment(environment)
         self.runner = runner or Runner()
+        self.budget = budget
         self.git = shutil.which("git", path=self.environment["PATH"])
         require(self.git is not None and os.path.isabs(self.git), "git_missing", "git")
 
+    def _require(self, stage):
+        if self.budget is not None:
+            self.budget.require(stage)
+
+    def _late(self, stage):
+        if self.budget is not None:
+            self.budget.late(stage)
+
     def _run_in(self, args, cwd, stage="git", timeout=90):
+        self._require(stage)
         result = self.runner.run(
             [self.git, "-c", "protocol.version=2", *args],
             env=self.environment, timeout=timeout, stage=stage, cwd=str(cwd))
         if result.returncode != 0:
             raise QualificationError(stage + "_failed", stage)
+        self._late(stage)
         return result
 
     def init(self, path):
+        self._require("git")
         Path(path).mkdir(parents=True, exist_ok=True)
         self._run_in(["init", "--initial-branch=main", str(path)], Path(path).parent)
 
     def commit(self, path, text, message):
+        self._require("git")
         (Path(path) / "data.txt").write_text(text + "\n")
+        self._late("git")
         self._run_in(["-c", "user.name=Synthetic Rotation",
                       "-c", "user.email=rotation@example.invalid",
                       "add", "."], path)
