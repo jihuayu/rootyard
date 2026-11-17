@@ -122,7 +122,8 @@ impl ms::BlobUploadDriver for OpenDalDriver {
         Box::pin(async move {
             let i = a.store.new_upload(a.tenant_id, a.authority_id, a.generation, a.namespace, a.sha256, a.length)?;
             let data = fs::read(a.source_path)?;
-            ensure!(data.len() as u64 == a.length && hex::encode(Sha256::digest(&data)) == a.sha256);
+            let ok = data.len() as u64 == a.length && hex::encode(Sha256::digest(&data)) == a.sha256;
+            ok.then_some(()).ok_or_else(|| ms::MerkleSyncError::IntegrityMismatch("source mismatch".into()))?;
             self.op.write(&i.locator().path(), data).await.map_err(|e| ms::MerkleSyncError::Io(e.to_string()))?;
             Ok(a.store.verify(i.locator(), a.deadline).await?)
         })
@@ -130,17 +131,16 @@ impl ms::BlobUploadDriver for OpenDalDriver {
 }
 
 fn git_ok(repo: &Path, args: &[&str]) -> Result<String> {
-    let vars = [
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "-C"]).arg(repo).args(args);
+    for kv in [
         "CONFIG_NOSYSTEM=1",
         "CONFIG_GLOBAL=/dev/null",
         "AUTHOR_NAME=r",
         "AUTHOR_EMAIL=r@e",
         "COMMITTER_NAME=r",
         "COMMITTER_EMAIL=r@e",
-    ];
-    let mut cmd = Command::new("git");
-    cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "-C"]).arg(repo).args(args);
-    for kv in vars {
+    ] {
         let (k, v) = kv.split_once('=').unwrap();
         cmd.env(format!("GIT_{k}"), v);
     }
