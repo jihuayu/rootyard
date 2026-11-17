@@ -4,35 +4,35 @@
 //! contended deadline enforcement, and `rr_order` deduplication.
 
 use std::{
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use crate::blob_store::{
-    BlobLocator,
-    budget::ResourceLimits,
-    test_support::{digest, store},
-};
+use crate::blob_store::{BlobLocator, test_support::digest};
 
 use super::*;
 
-struct AllowEmptyAuthorizer {
+struct AllowOnePackAuthorizer {
     pins: DurablePinRegistry,
-    tenant_id: Uuid,
-    repo_id: Uuid,
     history_id: Uuid,
     cluster_incarnation: Uuid,
 }
 
-impl LiveAuthorizer for AllowEmptyAuthorizer {
+impl LiveAuthorizer for AllowOnePackAuthorizer {
     fn authorize_and_check_version<'a>(
         &'a self,
         req: &'a ReplicaReadRequest,
     ) -> lease_pin::AuthTask<'a, Result<AuthoritativeSnapshot, ReplicaCacheError>> {
         Box::pin(async move {
+            let loc = BlobLocator::new(req.tenant_id, req.repo_id, 1, Uuid::new_v4(), "packs", &digest(b"p"), 1)?;
+            let idx = BlobLocator::new(req.tenant_id, req.repo_id, 1, Uuid::new_v4(), "packs", &digest(b"i"), 1)?;
             Ok(AuthoritativeSnapshot {
                 tenant_id: req.tenant_id,
                 repo_id: req.repo_id,
@@ -43,11 +43,66 @@ impl LiveAuthorizer for AllowEmptyAuthorizer {
                 gate_revision: 1,
                 version_check: VersionCheckVerdict::Changed,
                 head_ref: "refs/heads/main".into(),
-                refs: Vec::new(),
-                packs: Vec::new(),
-                durable_pin: self.pins.acquire(self.tenant_id, self.repo_id, 1),
+                refs: vec![ReplicaRefSpec::new("refs/heads/main", "a".repeat(40))],
+                packs: vec![PackObjectSpec::provider_managed(format!("pack-{}", "b".repeat(40)), loc, idx)],
+                durable_pin: self.pins.acquire(req.tenant_id, req.repo_id, 1),
             })
         })
+    }
+}
+
+struct DummyViewSlot {
+    key: ReplicaViewKey,
+    path: PathBuf,
+    released: AtomicBool,
+}
+
+impl ActiveViewSlot for DummyViewSlot {
+    fn view_key(&self) -> &ReplicaViewKey {
+        &self.key
+    }
+    fn repo_path(&self) -> Result<&Path, ReplicaCacheError> {
+        Ok(&self.path)
+    }
+    fn ensure_live(&self) -> Result<(), ReplicaCacheError> {
+        Ok(())
+    }
+    fn release_reader(&self) {
+        self.released.store(true, Ordering::SeqCst);
+    }
+}
+
+struct DummyReplicaBackend {
+    id: String,
+    view_dir: PathBuf,
+}
+
+impl ReplicaBackend for DummyReplicaBackend {
+    fn node_id(&self) -> &str {
+        &self.id
+    }
+    fn serve_replica_view<'a>(
+        &'a self,
+        req: &'a ReplicaReadRequest,
+        authorizer: &'a dyn LiveAuthorizer,
+        _deadline: Instant,
+    ) -> lease_pin::AuthTask<'a, Result<ReplicaViewGuard, ReplicaCacheError>> {
+        Box::pin(async move {
+            let snap = authorizer.authorize_and_check_version(req).await?;
+            let key = ReplicaViewKey::from_snapshot(&snap, &"0".repeat(64))?;
+            let slot = Arc::new(DummyViewSlot { key, path: self.view_dir.clone(), released: AtomicBool::new(false) });
+            Ok(ReplicaViewGuard::new(
+                self.id.clone(),
+                slot,
+                snap.durable_pin,
+                ReplicaServeSource::MaterializedFromBlob,
+                ReplicaRequestMetrics::default(),
+                true,
+            ))
+        })
+    }
+    fn is_accepting_traffic(&self) -> bool {
+        true
     }
 }
 
@@ -131,11 +186,7 @@ fn pack_cache_open_sweeps_orphan_dirs_and_symlinks_on_restart() {
 #[tokio::test]
 async fn scheduler_holds_fair_admission_permit_until_view_guard_drops() {
     let dir = TempDir::new().unwrap();
-    let (blob_store, _) = store(ResourceLimits::new(2, 2, 1 << 20).unwrap());
-    let node = Arc::new(
-        ReplicaCacheNode::open("node-1", &dir.path().join("r1"), blob_store, None, ReplicaCacheLimits::default())
-            .unwrap(),
-    );
+    let backend = Arc::new(DummyReplicaBackend { id: "node-1".into(), view_dir: dir.path().to_path_buf() });
     let fair_cfg = TenantFairShareConfig {
         max_total_inflight: 2,
         max_per_tenant_inflight: 1,
@@ -143,14 +194,12 @@ async fn scheduler_holds_fair_admission_permit_until_view_guard_drops() {
         max_total_waiters: 4,
         admission_timeout: Duration::from_millis(60),
     };
-    let scheduler = ReplicaScheduler::new(vec![node], fair_cfg, None, "test", Duration::from_secs(5)).unwrap();
+    let scheduler = ReplicaScheduler::new(vec![backend], fair_cfg, None, "test", Duration::from_secs(5)).unwrap();
 
     let (t1, t2) = (Uuid::new_v4(), Uuid::new_v4());
     let (r1, r2) = (Uuid::new_v4(), Uuid::new_v4());
-    let auth1 = AllowEmptyAuthorizer {
+    let auth1 = AllowOnePackAuthorizer {
         pins: DurablePinRegistry::new(),
-        tenant_id: t1,
-        repo_id: r1,
         history_id: Uuid::new_v4(),
         cluster_incarnation: Uuid::new_v4(),
     };
@@ -175,10 +224,8 @@ async fn scheduler_holds_fair_admission_permit_until_view_guard_drops() {
     assert!(matches!(err, ReplicaCacheError::QueueFull(_)));
 
     // Different tenant still fits under `max_total_inflight == 2`.
-    let auth2 = AllowEmptyAuthorizer {
+    let auth2 = AllowOnePackAuthorizer {
         pins: DurablePinRegistry::new(),
-        tenant_id: t2,
-        repo_id: r2,
         history_id: Uuid::new_v4(),
         cluster_incarnation: Uuid::new_v4(),
     };
