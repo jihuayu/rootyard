@@ -17,6 +17,7 @@ pub mod memory;
 pub mod origin;
 #[cfg(feature = "state-redis")]
 pub mod redis;
+pub mod replica_cache;
 pub mod serving;
 pub mod types;
 
