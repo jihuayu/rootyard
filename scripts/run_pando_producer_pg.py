@@ -37,6 +37,8 @@ DEFAULT_CLEANUP_RESERVE_SECONDS = 90.0
 DEFAULT_SELECTION_TIMEOUT_SECONDS = 180.0
 DEFAULT_SETUP_TIMEOUT_SECONDS = 120.0
 DEFAULT_CASE_TIMEOUT_SECONDS = 60.0
+MIN_POST_CASE_SECONDS = 5.0
+MIN_BINARY_RECHECK_SECONDS = 2.0
 
 
 class _Parser(argparse.ArgumentParser):
@@ -205,6 +207,8 @@ def run(
             config.expected_commit,
             expected_tree=config.expected_tree,
             environ=environ,
+            deadline=work,
+            clock=clock,
         )
         product = validate_product(
             config.product_receipt,
@@ -214,11 +218,19 @@ def run(
         )
         remaining = min(config.selection_timeout_seconds, work - clock())
         require(remaining > 0, "selection", "setup_deadline_exceeded")
-        selection = select_binary(config.source_root, runner, remaining)
+        selection = select_binary(
+            config.source_root,
+            runner,
+            remaining,
+            deadline=work,
+            clock=clock,
+        )
         binding["cargo_selection"] = _selection_binding(selection)
         binding["source_rechecked"] = False
         binding["source_unchanged"] = False
         binding["test_binary_unchanged"] = False
+        binding["fresh_verification"] = False
+        binding["verification_code"] = None
         fixture = fixture_factory(
             config.source_root,
             bootstrap,
@@ -238,27 +250,67 @@ def run(
                 case_timeout=config.case_timeout_seconds,
                 clock=clock,
             )
+            if work - clock() <= MIN_POST_CASE_SECONDS:
+                binding["verification_code"] = "post_case_deadline_exceeded"
+                raise RunnerError("binding", "post_case_deadline_exceeded")
             try:
                 after = capture_source(
                     config.source_root,
                     config.expected_commit,
                     expected_tree=config.expected_tree,
                     environ=environ,
+                    deadline=work,
+                    clock=clock,
                 )
-            except RunnerError:
-                raise RunnerError("binding", "source_recheck_failed") from None
+            except RunnerError as caught:
+                binding["source_rechecked"] = False
+                binding["source_unchanged"] = False
+                code = (
+                    "source_recheck_deadline_exceeded"
+                    if caught.code in (
+                        "source_capture_deadline_exceeded",
+                        "source_recheck_deadline_exceeded",
+                    )
+                    else "source_recheck_failed"
+                )
+                binding["verification_code"] = code
+                raise RunnerError("binding", code) from None
             binding["source_rechecked"] = True
             binding["source_unchanged"] = source.same(binding, after)
             if not binding["source_unchanged"]:
+                binding["verification_code"] = "source_drift"
                 raise RunnerError("binding", "source_drift")
-            artifacts.verify_selected_binary(selection)
+            if work - clock() <= MIN_BINARY_RECHECK_SECONDS:
+                binding["verification_code"] = "binary_recheck_deadline_exceeded"
+                raise RunnerError("binding", "binary_recheck_deadline_exceeded")
+            try:
+                artifacts.verify_selected_binary(
+                    selection, deadline=work, clock=clock
+                )
+            except RunnerError as caught:
+                binding["test_binary_unchanged"] = False
+                if caught.code in (
+                    "binary_rehash_deadline_exceeded",
+                    "binary_recheck_deadline_exceeded",
+                ):
+                    binding["verification_code"] = "binary_recheck_deadline_exceeded"
+                    raise RunnerError(
+                        "binding", "binary_recheck_deadline_exceeded"
+                    ) from None
+                raise
             binding["test_binary_unchanged"] = True
+            binding["fresh_verification"] = True
             error = _first_failure(records)
     except RunnerError as caught:
         error = caught
     finally:
         if fixture is not None:
-            cleanup = fixture.cleanup(overall)
+            try:
+                cleanup = fixture.cleanup(overall)
+            except RunnerError:
+                cleanup = resources.unresolved_cleanup("cleanup_unresolved")
+            except Exception:
+                cleanup = resources.unresolved_cleanup("cleanup_unresolved")
         else:
             cleanup = resources.empty_cleanup()
     if error is None and not cleanup.get("cleanup_ok"):
@@ -267,13 +319,30 @@ def run(
         )
     if error is None and not cleanup.get("cleanup_within_deadline", False):
         error = RunnerError("cleanup", "cleanup_deadline_exceeded")
+    if error is None and clock() > overall:
+        error = RunnerError("cleanup", "overall_deadline_exceeded")
+    if (
+        error is not None
+        and cleanup.get("error_code")
+        and cleanup.get("error_code") != error.code
+    ):
+        cleanup["secondary_error_code"] = cleanup["error_code"]
     if not config.prepare_only:
         failure = _first_failure(records)
         if failure is not None and error is None:
             error = failure
     passed = error is None and bool(cleanup.get("cleanup_ok"))
+    passed = passed and clock() <= overall
     if not config.prepare_only:
         passed = passed and all(row.get("status") == "passed" for row in records)
+    fresh_verification = bool(
+        not config.prepare_only
+        and isinstance(binding, dict)
+        and binding.get("source_rechecked") is True
+        and binding.get("source_unchanged") is True
+        and binding.get("test_binary_unchanged") is True
+        and binding.get("fresh_verification") is True
+    )
     actual_fresh = {
         "selected_test_binary": bool(
             isinstance(selection, dict) and selection.get("fresh")
@@ -292,6 +361,7 @@ def run(
         actual_fresh=actual_fresh,
         error_code=error.code if error is not None else None,
         stage=error.stage if error is not None else None,
+        fresh_verification=fresh_verification,
     )
     if not config.prepare_only:
         write_report_fn(

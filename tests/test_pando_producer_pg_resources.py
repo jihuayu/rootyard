@@ -25,6 +25,24 @@ import pando_producer_pg.resources as resources  # noqa: E402
 from pando_vault_rotation_fixture import FixtureError  # noqa: E402
 
 
+class FakeRootRemover:
+    """Hermetic stand-in for the bounded child root remover."""
+
+    def __init__(self):
+        self.calls = []
+
+    def remove(self, root, deadline):
+        self.calls.append((root, deadline))
+        root.remove()
+        return {
+            "removed": bool(root.removed),
+            "absent": bool(root.removed),
+            "verified": bool(root.removed),
+            "code": None,
+            "within_deadline": True,
+        }
+
+
 class Result:
     def __init__(self, returncode=0, stdout=b"", stderr=b""):
         self.returncode = returncode
@@ -117,6 +135,7 @@ class OwnedFixtureTest(unittest.TestCase):
             schema_sha256=self.sha,
             postgres_factory=factory or PgFactory(),
             root_factory=lambda: resources.OwnedRoot(base=self.base),
+            root_remover=FakeRootRemover(),
         )
 
     def test_schema_goes_to_owned_database_only(self):

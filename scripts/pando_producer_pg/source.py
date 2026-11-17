@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 ROOT = SCRIPTS.parent
@@ -79,24 +80,36 @@ def _sha256_bytes(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
-def _sha256_file(path):
+def _deadline_hit(deadline, clock):
+    return deadline is not None and clock() >= deadline
+
+
+def _sha256_file(path, deadline=None, clock=time.monotonic):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1 << 20), b""):
+            if _deadline_hit(deadline, clock):
+                raise RunnerError("source", "source_capture_deadline_exceeded")
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def _hash_rows(root):
+def _hash_rows(root, deadline=None, clock=time.monotonic):
     rows = {}
     for relative in EXPLICIT_INPUTS:
+        if _deadline_hit(deadline, clock):
+            raise RunnerError("source", "source_capture_deadline_exceeded")
         path = root / relative
         require(path.is_file(), "source", "source_capture_failed")
-        rows[relative] = _sha256_file(path)
+        rows[relative] = _sha256_file(path, deadline=deadline, clock=clock)
     for pattern in SUPPORT_GLOBS + TEST_GLOBS:
         for path in sorted(root.glob(pattern)):
+            if _deadline_hit(deadline, clock):
+                raise RunnerError("source", "source_capture_deadline_exceeded")
             if path.is_file():
-                rows[path.relative_to(root).as_posix()] = _sha256_file(path)
+                rows[path.relative_to(root).as_posix()] = _sha256_file(
+                    path, deadline=deadline, clock=clock
+                )
     return [
         {"path": relative, "sha256": rows[relative]}
         for relative in sorted(rows)
@@ -116,10 +129,20 @@ def _runner_rows(rows):
     return result
 
 
-def capture(source_root, expected_commit, *, expected_tree=None, environ=None):
+def capture(
+    source_root,
+    expected_commit,
+    *,
+    expected_tree=None,
+    environ=None,
+    deadline=None,
+    clock=time.monotonic,
+):
     """Return the trusted binding snapshot or a fixed failure."""
     root = Path(source_root).resolve()
     require(root.is_dir(), "source", "source_root_missing")
+    if _deadline_hit(deadline, clock):
+        raise RunnerError("source", "source_capture_deadline_exceeded")
     require(
         isinstance(expected_commit, str) and SHA_RE.fullmatch(expected_commit) is not None,
         "input",
@@ -135,6 +158,8 @@ def capture(source_root, expected_commit, *, expected_tree=None, environ=None):
         state = git_state(root)
     except Exception:
         raise RunnerError("source", "git_unavailable") from None
+    if _deadline_hit(deadline, clock):
+        raise RunnerError("source", "source_capture_deadline_exceeded")
     require(isinstance(state, dict), "source", "source_capture_failed")
     require(state.get("commit") == expected_commit, "source", "commit_mismatch")
     if expected_tree is not None:
@@ -146,6 +171,8 @@ def capture(source_root, expected_commit, *, expected_tree=None, environ=None):
         raise RunnerError("source", "source_capture_failed") from None
     except (OSError, ValueError, TypeError):
         raise RunnerError("source", "source_capture_failed") from None
+    if _deadline_hit(deadline, clock):
+        raise RunnerError("source", "source_capture_deadline_exceeded")
     try:
         summary = bound["bound_inputs"]
         source_inputs = bound["source_inputs_sha256"]
@@ -157,11 +184,13 @@ def capture(source_root, expected_commit, *, expected_tree=None, environ=None):
     except (KeyError, TypeError):
         raise RunnerError("source", "source_capture_failed") from None
     try:
-        rows = _hash_rows(root)
+        rows = _hash_rows(root, deadline=deadline, clock=clock)
     except RunnerError:
         raise
     except (OSError, ValueError, TypeError):
         raise RunnerError("source", "source_capture_failed") from None
+    if _deadline_hit(deadline, clock):
+        raise RunnerError("source", "source_capture_deadline_exceeded")
     schema = next(
         (row["sha256"] for row in rows if row["path"] == SCHEMA_REL), None
     )

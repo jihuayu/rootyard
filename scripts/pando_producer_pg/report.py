@@ -91,6 +91,7 @@ def _minimal_report():
         "test_binary_sha256": None,
         "test_binary": {},
         "actual_fresh": {},
+        "fresh_verification": False,
         "product_receipt": {
             "provided": False,
             "same_source": False,
@@ -115,6 +116,7 @@ def build_report(
     actual_fresh,
     error_code=None,
     stage=None,
+    fresh_verification=False,
 ):
     if not isinstance(records, list) or len(records) != len(cases.CASES):
         return _minimal_report()
@@ -134,6 +136,7 @@ def build_report(
         ),
         "test_binary": _test_binary(selection),
         "actual_fresh": actual_fresh if isinstance(actual_fresh, dict) else {},
+        "fresh_verification": bool(fresh_verification),
         "product_receipt": (
             product_receipt
             if isinstance(product_receipt, dict)

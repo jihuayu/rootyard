@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import time
 
 from .errors import RunnerError, require
 
@@ -31,12 +32,18 @@ CARGO_COMMAND = (
 EXPECTED_SOURCE = "src/bin/rootyard-pando-lab.rs"
 
 
-def _sha256_file(path):
+def _sha256_file(
+    path, deadline=None, clock=time.monotonic, stage="binding", deadline_code=None
+):
     import hashlib
 
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1 << 20), b""):
+            if deadline is not None and clock() >= deadline:
+                raise RunnerError(
+                    stage, deadline_code or "binary_rehash_deadline_exceeded"
+                )
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -57,7 +64,7 @@ def _events(raw):
     return events
 
 
-def _snapshot(path, stage, code):
+def _snapshot(path, stage, code, deadline=None, clock=time.monotonic, deadline_code=None):
     candidate = Path(path)
     try:
         if candidate.is_symlink():
@@ -65,7 +72,13 @@ def _snapshot(path, stage, code):
         info = candidate.stat()
         if not stat.S_ISREG(info.st_mode) or not os.access(candidate, os.X_OK):
             raise RunnerError(stage, code)
-        digest = _sha256_file(candidate)
+        digest = _sha256_file(
+            candidate,
+            deadline=deadline,
+            clock=clock,
+            stage=stage,
+            deadline_code=deadline_code,
+        )
     except RunnerError:
         raise
     except (OSError, ValueError):
@@ -80,7 +93,9 @@ def _snapshot(path, stage, code):
     }
 
 
-def select_test_binary(source_root, runner, timeout):
+def select_test_binary(
+    source_root, runner, timeout, *, deadline=None, clock=time.monotonic
+):
     """Run the single bounded Cargo selection and return safe metadata."""
     root = Path(source_root).resolve()
     result = runner.run(
@@ -91,6 +106,8 @@ def select_test_binary(source_root, runner, timeout):
         spawn_code="cargo_failed",
     )
     require(result.returncode == 0, "selection", "cargo_failed")
+    if deadline is not None and clock() >= deadline:
+        raise RunnerError("selection", "selection_deadline_exceeded")
     events = _events(result.stdout)
     finished = [
         event for event in events if event.get("reason") == "build-finished"
@@ -128,7 +145,14 @@ def select_test_binary(source_root, runner, timeout):
     require(path.is_absolute(), "selection", "artifact_executable")
     require(path.parent.name == "deps", "selection", "artifact_executable")
     require(path.name != TARGET, "selection", "artifact_executable")
-    snapshot = _snapshot(path, "selection", "artifact_executable")
+    snapshot = _snapshot(
+        path,
+        "selection",
+        "artifact_executable",
+        deadline=deadline,
+        clock=clock,
+        deadline_code="selection_rehash_deadline_exceeded",
+    )
     source = None
     source_path = target.get("src_path")
     if isinstance(source_path, str) and source_path:
@@ -160,11 +184,20 @@ def select_test_binary(source_root, runner, timeout):
     }
 
 
-def verify_selected_binary(selection, path=None):
+def verify_selected_binary(
+    selection, path=None, *, deadline=None, clock=time.monotonic
+):
     """Re-hash and re-stat the selected executable, retaining the first hash."""
     executable = path or selection.get("executable_path")
     require(bool(executable), "binding", "binary_unreadable")
-    current = _snapshot(executable, "binding", "binary_unreadable")
+    current = _snapshot(
+        executable,
+        "binding",
+        "binary_unreadable",
+        deadline=deadline,
+        clock=clock,
+        deadline_code="binary_rehash_deadline_exceeded",
+    )
     trusted = selection.get("executable")
     require(isinstance(trusted, dict), "binding", "binary_unreadable")
     for key in ("sha256", "size", "st_dev", "st_ino", "mtime_ns"):
