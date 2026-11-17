@@ -166,6 +166,43 @@ class HarnessDeadlineTest(unittest.TestCase):
         self.assertEqual(report["cases"][4]["code"], "cleanup_secondary")
         self.assertTrue(path.is_file())
 
+    def test_case_that_returns_after_the_work_deadline_is_not_green(self):
+        clock = Clock()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        report_path = Path(temporary.name) / "report.json"
+        args = main.parse_args([
+            "--report", str(report_path),
+            "--timeout-seconds", "100",
+            "--cleanup-reserve-seconds", "20",
+        ])
+
+        def late_case(_ctx):
+            clock.advance(80)
+            return {"id": CASES[0], "status": "passed", "facts": {}}
+
+        context = SimpleNamespace(
+            start_base=lambda: None,
+            prepare_initial_packs=lambda: None,
+        )
+        with mock.patch.object(main, "validate_inputs",
+                               return_value=inputs(report_path)), \
+             mock.patch.object(main, "binding_snapshot",
+                               side_effect=[binding(), binding()]), \
+             mock.patch.object(main, "Context", return_value=context), \
+             mock.patch.object(
+                 main.cases, "case_fixture_and_app_capability_boundary",
+                 side_effect=late_case), \
+             mock.patch.object(
+                 main.negative, "case_owned_resource_cleanup",
+                 return_value=passed_cleanup()):
+            report = main.run_qualification(args, environ={}, clock=clock)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["error_code"], "work_deadline_exceeded")
+        self.assertTrue(all(
+            case["status"] == "failed" for case in report["cases"][:4]))
+
+
     def test_work_expiry_still_runs_cleanup_with_the_reserve(self):
         clock = Clock()
         observed = {}
