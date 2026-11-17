@@ -98,8 +98,9 @@ class FakeReader:
         return self.alive
 
 
-def synchronous_start(target, *args):
+def synchronous_start(readers, target, *args):
     reader = FakeReader(target, args)
+    readers.append(reader)
     reader.run()
     return reader
 
@@ -129,8 +130,9 @@ class BoundedStreamTests(unittest.TestCase):
         process = FakeProcess(stdout=b"test a ... ok\n", stderr=b"diagnostic\n")
         started = []
 
-        def start(target, *args):
+        def start(readers, target, *args):
             reader = FakeReader(target, args)
+            readers.append(reader)
             reader.run()
             started.append(reader)
             return reader
@@ -184,14 +186,15 @@ class BoundedStreamTests(unittest.TestCase):
         self.assertTrue(process.stderr.closed)
 
     def test_partial_reader_start_cleans_process_and_started_reader(self):
-        readers = []
+        seen = []
 
-        def start(target, *args):
-            if readers:
+        def start(readers, target, *args):
+            if seen:
                 raise RuntimeError("second reader start failed")
             reader = FakeReader(target, args)
-            reader.run()
             readers.append(reader)
+            seen.append(reader)
+            reader.run()
             return reader
 
         process = FakeProcess(stdout=b"out", stderr=b"err")
@@ -204,9 +207,9 @@ class BoundedStreamTests(unittest.TestCase):
         self.assertTrue(process.killed)
         self.assertTrue(process.stdout.closed)
         self.assertTrue(process.stderr.closed)
-        self.assertEqual(len(readers), 1)
-        self.assertTrue(readers[0].joined)
-        self.assertFalse(readers[0].is_alive())
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].joined)
+        self.assertFalse(seen[0].is_alive())
 
     def test_startup_failure_kills_reaps_joins_before_closing_pipes(self):
         events = []
@@ -239,13 +242,14 @@ class BoundedStreamTests(unittest.TestCase):
 
         process.kill = kill
         process.wait = wait
-        readers = []
+        seen = []
 
-        def start(target, *args):
-            if readers:
+        def start(readers, target, *args):
+            if seen:
                 raise RuntimeError("second reader start failed")
             reader = OrderedReader(target, args)
             readers.append(reader)
+            seen.append(reader)
             return reader
 
         with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
@@ -259,7 +263,7 @@ class BoundedStreamTests(unittest.TestCase):
         self.assertTrue(all(event[1] for event in events if event[0] == "close"))
         self.assertTrue(process.stdout.closed)
         self.assertTrue(process.stderr.closed)
-        self.assertEqual(len(readers), 1)
+        self.assertEqual(len(seen), 1)
 
     def test_incomplete_startup_cleanup_preserves_primary_and_skips_close(self):
         class NeverReapProcess(FakeProcess):
@@ -275,13 +279,14 @@ class BoundedStreamTests(unittest.TestCase):
                 self.joined.append(timeout)
 
         process = NeverReapProcess(stdout=b"out", stderr=b"err")
-        readers = []
+        seen = []
 
-        def start(target, *args):
-            if readers:
+        def start(readers, target, *args):
+            if seen:
                 raise RuntimeError("second reader start failed")
             reader = StuckReader(target, args)
             readers.append(reader)
+            seen.append(reader)
             return reader
 
         with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
@@ -291,7 +296,7 @@ class BoundedStreamTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "second reader start failed"):
                 runner.run_bounded(["fake"], timeout=1)
         self.assertEqual(process.wait_calls, [runner.KILL_WAIT_SECONDS])
-        self.assertTrue(readers[0].joined)
+        self.assertTrue(seen[0].joined)
         self.assertFalse(process.stdout.closed)
         self.assertFalse(process.stderr.closed)
 
@@ -301,11 +306,12 @@ class BoundedStreamTests(unittest.TestCase):
                 self.joined.append(timeout)
 
         process = FakeProcess(stdout=b"", stderr=b"", returncode=0)
-        readers = []
+        seen = []
 
-        def start(target, *args):
+        def start(readers, target, *args):
             reader = StuckReader(target, args)
             readers.append(reader)
+            seen.append(reader)
             return reader
 
         with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
@@ -313,7 +319,7 @@ class BoundedStreamTests(unittest.TestCase):
             with self.assertRaises(runner.RunnerError) as raised:
                 runner.run_bounded(["fake"], timeout=1)
         self.assertEqual(raised.exception.code, "cleanup_unresolved")
-        self.assertEqual(len(readers), 2)
+        self.assertEqual(len(seen), 2)
         self.assertFalse(process.stdout.closed)
         self.assertFalse(process.stderr.closed)
 
@@ -347,6 +353,132 @@ class BoundedStreamTests(unittest.TestCase):
         self.assertEqual(diag["case_trace"]["primary"]["status"], 409)
         self.assertEqual(diag["source_locations"],
                          [{"file": "tests/ref_store_pack_snapshots.rs", "line": 42}])
+
+
+class ReaderOwnershipTests(unittest.TestCase):
+    @staticmethod
+    def _thread_factory(process, events, created, fail_acquire=0,
+                        fail_after=0, fail_before=0):
+        class FakeThread:
+            def __init__(self, target=None, args=(), daemon=None):
+                if fail_acquire and len(created) + 1 == fail_acquire:
+                    raise RuntimeError("reader acquisition failed")
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+                self.started = False
+                self.alive = False
+                self.joined = []
+                self.ident = None
+                created.append(self)
+                self.index = len(created)
+
+            def start(self):
+                self.started = True
+                self.ident = self.index
+                self.alive = True
+                events.append(("start", self.index))
+                if fail_before and self.index == fail_before:
+                    self.started = False
+                    self.alive = False
+                    raise RuntimeError("start before launch failed")
+                if fail_after and self.index == fail_after:
+                    raise RuntimeError("start after launch failed")
+
+            def join(self, timeout=None):
+                if not self.started:
+                    raise RuntimeError("cannot join thread before it is started")
+                self.joined.append(timeout)
+                events.append(("join", self.index))
+                if process.killed:
+                    self.alive = False
+
+            def is_alive(self):
+                return self.alive
+
+        return FakeThread
+
+    def _run_startup_failure(self, process, thread_class):
+        with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
+             mock.patch.object(runner.threading, "Thread", thread_class), \
+             mock.patch.object(runner.os, "getpgid", return_value=4242), \
+             mock.patch.object(runner.os, "killpg"):
+            with self.assertRaises(RuntimeError) as raised:
+                runner.run_bounded(["fake"], timeout=1)
+        return raised.exception
+
+    def test_start_after_launch_keeps_handle_and_joins_before_close(self):
+        events = []
+        created = []
+        process = FakeProcess(stdout=b"out", stderr=b"err")
+        thread_class = self._thread_factory(
+            process, events, created, fail_after=2)
+        error = self._run_startup_failure(process, thread_class)
+        self.assertEqual(str(error), "start after launch failed")
+        self.assertEqual(len(created), 2)
+        self.assertTrue(created[1].started)
+        self.assertTrue(created[0].joined)
+        self.assertTrue(created[1].joined)
+        self.assertTrue(process.killed)
+        self.assertEqual(process.wait_calls, [runner.KILL_WAIT_SECONDS])
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+        names = [event[0] for event in events]
+        self.assertEqual(names, ["start", "start", "join", "join"])
+        for timeout in created[0].joined + created[1].joined:
+            self.assertLessEqual(timeout, runner.KILL_WAIT_SECONDS)
+
+    def test_second_reader_acquisition_failure_joins_first_handle(self):
+        events = []
+        created = []
+        process = FakeProcess(stdout=b"out", stderr=b"err")
+        thread_class = self._thread_factory(
+            process, events, created, fail_acquire=2)
+        error = self._run_startup_failure(process, thread_class)
+        self.assertEqual(str(error), "reader acquisition failed")
+        self.assertEqual(len(created), 1)
+        self.assertTrue(created[0].joined)
+        self.assertTrue(process.killed)
+        self.assertEqual(process.wait_calls, [runner.KILL_WAIT_SECONDS])
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
+    def test_start_before_launch_handle_is_retained_but_not_joined(self):
+        events = []
+        created = []
+        process = FakeProcess(stdout=b"out", stderr=b"err")
+        thread_class = self._thread_factory(
+            process, events, created, fail_before=2)
+        error = self._run_startup_failure(process, thread_class)
+        self.assertEqual(str(error), "start before launch failed")
+        self.assertEqual(len(created), 2)
+        self.assertFalse(created[1].started)
+        self.assertEqual(created[1].joined, [])
+        self.assertTrue(created[0].joined)
+        self.assertTrue(process.killed)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+
+    def test_join_readers_skips_never_started_and_fails_conservatively(self):
+        class NeverStarted:
+            def join(self, timeout=None):
+                raise RuntimeError("cannot join thread before it is started")
+
+            def is_alive(self):
+                return False
+
+        runner._join_readers([NeverStarted()])
+
+        class Unreadable:
+            def join(self, timeout=None):
+                pass
+
+            def is_alive(self):
+                raise RuntimeError("liveness unavailable")
+
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner._join_readers([Unreadable()])
+        self.assertEqual(raised.exception.code, "cleanup_unresolved")
 
 
 class ProjectionStreamTests(unittest.TestCase):

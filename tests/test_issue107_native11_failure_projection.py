@@ -78,8 +78,9 @@ class FakeReader:
         return self.alive
 
 
-def synchronous_start(target, *args):
+def synchronous_start(readers, target, *args):
     reader = FakeReader(target, args)
+    readers.append(reader)
     reader.run()
     return reader
 

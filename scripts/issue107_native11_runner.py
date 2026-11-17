@@ -1131,12 +1131,25 @@ def _close_stream(stream):
         pass
 
 
+def _reader_alive(reader):
+    try:
+        return bool(reader.is_alive())
+    except Exception:
+        # Treat an unreadable liveness state as still owned/blocked.
+        return True
+
+
 def _join_readers(readers):
-    """Join all readers inside the one existing aggregate kill budget."""
+    """Join all owned readers inside the one existing aggregate kill budget."""
     deadline = time.monotonic() + KILL_WAIT_SECONDS
     for reader in readers:
-        reader.join(timeout=max(0.0, deadline - time.monotonic()))
-    _require(not any(reader.is_alive() for reader in readers),
+        try:
+            reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        except RuntimeError:
+            # A handle retained before start() may never have started; such a
+            # Thread has no running reader and join() rejects it.
+            continue
+    _require(not any(_reader_alive(reader) for reader in readers),
              "cleanup_unresolved")
 
 
@@ -1180,9 +1193,10 @@ def _join_then_close(process, readers):
     _close_stream(process.stderr)
 
 
-def _start_reader(target, *args):
-    """Retain the reader object before start so partial startup is cleanable."""
+def _start_reader(readers, target, *args):
+    """Create, retain, then start one reader so partial startup is cleanable."""
     reader = threading.Thread(target=target, args=args, daemon=True)
+    readers.append(reader)
     reader.start()
     return reader
 
@@ -1201,10 +1215,10 @@ def run_bounded(command, timeout, env=None, failure_projector=None,
     capture = _BoundedCapture()
     readers = []
     try:
-        readers.append(_start_reader(
-            capture.drain, process.stdout, capture.stdout))
-        readers.append(_start_reader(
-            capture.drain, process.stderr, capture.stderr))
+        _start_reader(
+            readers, capture.drain, process.stdout, capture.stdout)
+        _start_reader(
+            readers, capture.drain, process.stderr, capture.stderr)
     except BaseException:
         _cleanup_startup(process, readers)
         raise
