@@ -391,6 +391,44 @@ jobs:
           command -v nsenter >/dev/null
           python3 tests/workspace_legacy_fuse_shutdown_report.py \
             --report test-results/workspace-legacy-service.json
+      - name: Bind legacy FUSE evidence independently to the built binary
+        if: ${{ !cancelled() && steps.native_export.outcome == 'success' && steps.workspace_legacy_service.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/native-workspace-legacy-gate.json \
+            --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
+            --binary "$ROOTYARD_BIN" \
+            --expect-commit "$GITHUB_SHA" \
+            --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST" \
+            --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
+            --report workspace_legacy_service=test-results/workspace-legacy-service.json \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_normal_legacy_sigterm_join_evidence_and_exact_unmount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_partial_reconcile_failure_cleans_earlier_owned_mount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_post_reconcile_api_bind_failure_cleans_owned_mount \
+            --require-case workspace_legacy_service=tests.workspace_legacy_fuse_shutdown_acceptance.WorkspaceLegacyFuseShutdownTest.test_sigterm_during_blocked_startup_joins_mounted_owner \
+            --harness tests/workspace_legacy_fuse_shutdown_report.py \
+            --harness tests/workspace_legacy_fuse_shutdown_acceptance.py \
+            --harness tests/workspace_legacy_fuse_shutdown_support.py \
+            --harness tests/workspace_legacy_fuse_shutdown_fixtures.py \
+            --harness tests/workspace_legacy_fuse_shutdown_ownership.py \
+            --harness tests/workspace_legacy_fuse_shutdown_fifo.py \
+            --harness tests/fuse_helper_native_support.py \
+            --harness tests/e2e.py \
+            --harness tests/runtime_binary.py \
+            --harness tests/source_bound_binary.py \
+            --harness tests/native_evidence.py \
+            --harness tests/ops_provenance.py \
+            --harness tests/owned_fuse_cleanup.py \
+            --harness tests/test_workspace_legacy_fuse_shutdown_primary.py \
+            --harness tests/test_workspace_legacy_fuse_shutdown_fifo.py \
+            --harness tests/test_workspace_legacy_fuse_containment_owner.py \
+            --harness scripts/native_report_manifest.py \
+            --harness scripts/native_build_receipt.py \
+            --harness .github/workflows/ci.yml \
+            --fixture-rust-from-receipt \
+            --fixture postgres=postgres:17
       - name: Stop only the job-owned workspace FUSE/remote Garage fixture
         if: always()
         shell: bash
@@ -410,6 +448,7 @@ jobs:
             test-results/workspace-remote-delete-policy.json
             test-results/workspace-legacy-service.json
             test-results/native-workspace-fuse-gate.json
+            test-results/native-workspace-legacy-gate.json
             ${{ env.ROOTYARD_BUILD_RECEIPT }}
             ${{ env.ROOTYARD_BATCH_MANIFEST }}
             test-results/ci-native-tools/provenance.json
