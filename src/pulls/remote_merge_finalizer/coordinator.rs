@@ -128,7 +128,7 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
                     return Ok(map_sm_error_to_outcome(Some(install_idx), err, actual_base_oid));
                 }
             }
-            let op_id = commit.commit.request.operation_id;
+            let op_id = commit.commit.request.identity.operation_id;
             let commit_idx = self.next_log_id();
             let mut sm = self.sm.lock().unwrap_or_else(|e| e.into_inner());
             match sm.apply(commit_idx, RefCasCommand::CommitScopedRefs(commit)) {
