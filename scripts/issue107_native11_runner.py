@@ -869,7 +869,7 @@ def _parse_historical_git_frame(line):
     outcome = _metadata_replay_uint(
         parts[3], 1, max(HISTORICAL_GIT_OUTCOMES))
     exit_code = (None if parts[4] == ""
-                 else _metadata_replay_uint(parts[4], 0, 2_147_483_647))
+                 else _metadata_replay_uint(parts[4], 1, 2_147_483_647))
     signal = (None if parts[5] == ""
               else _metadata_replay_uint(parts[5], 1, 127))
     message_class = _metadata_replay_uint(
@@ -1089,7 +1089,7 @@ def _safe_historical_git(raw):
     message_class = _safe_metadata_replay_optional_int(
         raw.get("message_class"), 0, 4)
     exit_code = _safe_metadata_replay_optional_int(
-        raw.get("exit_code"), 0, 2_147_483_647)
+        raw.get("exit_code"), 1, 2_147_483_647)
     signal = _safe_metadata_replay_optional_int(raw.get("signal"), 1, 127)
     if outcome is None or message_class is None:
         raise ValueError

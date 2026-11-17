@@ -1005,6 +1005,32 @@ class MetadataReplayTraceTests(unittest.TestCase):
                 "message_class": 0,
             })
 
+    def test_historical_git_zero_exit_fails_closed_at_wire_and_rebuild(self):
+        zero = self._git_frame(1, exit_code="0", message="0")
+        with self.assertRaises(ValueError):
+            runner._parse_historical_git_frame(zero)
+        wire = self._project(
+            self._historical_git_failure(child=zero))["case_trace"]
+        self.assertFalse(wire["known"])
+        self.assertTrue(wire["invalid"])
+        self.assertIsNone(wire["historical_git"])
+        self.assertIsNone(wire["primary"])
+
+        valid_diag = self._project(self._historical_git_failure(
+            child=self._git_frame(1, exit_code="1", message="0")))
+        valid_trace = runner._safe_failure_diagnostic(
+            valid_diag, self.target)["case_trace"]
+        self.assertEqual(valid_trace["historical_git"]["exit_code"], 1)
+        raw = dict(valid_trace)
+        raw["historical_git"] = dict(
+            valid_trace["historical_git"], exit_code=0)
+        safe = runner._safe_metadata_replay_trace(raw)
+        self.assertFalse(safe["known"])
+        self.assertTrue(safe["invalid"])
+        self.assertIsNone(safe["historical_git"])
+        self.assertIsNone(safe["primary"])
+        self.assertNotIn(SECRET, json.dumps(safe, sort_keys=True))
+
     def test_historical_git_child_absent_is_unavailable_and_optional(self):
         lines = self._historical_git_failure(child=None)
         diag = self._project(lines)
@@ -1086,6 +1112,7 @@ class MetadataReplayTraceTests(unittest.TestCase):
             "|".join([prefix, "17", "9", "0", "", "", "0"]),
             "|".join([prefix, "17", "9", "7", "1", "", "0"]),
             "|".join([prefix, "17", "9", "1", "", "", "0"]),
+            "|".join([prefix, "17", "9", "1", "0", "", "0"]),
             "|".join([prefix, "17", "9", "2", "", "", "0"]),
             "|".join([prefix, "17", "9", "1", "1", "9", "0"]),
             "|".join([prefix, "17", "9", "3", "1", "", "0"]),
@@ -1141,6 +1168,7 @@ class MetadataReplayTraceTests(unittest.TestCase):
             dict(valid_child, exit_code=True),
             dict(valid_child, exit_code="128"),
             dict(valid_child, exit_code=-1),
+            dict(valid_child, exit_code=0),
             dict(valid_child, exit_code=2_147_483_648),
             dict(valid_child, signal=True),
             dict(valid_child, signal=0),
