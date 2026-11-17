@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
@@ -40,7 +40,7 @@ pub struct CachedViewSlot {
     _pack_pins: Vec<PackCachePin>,
     expected_pack_files: Vec<(String, u64, u64)>,
     state: Mutex<SlotInner>,
-    catalog: Arc<Mutex<ViewCatalogInner>>,
+    catalog: Weak<Mutex<ViewCatalogInner>>,
     _root_lock: Option<Arc<PackRootLockGuard>>,
 }
 
@@ -114,8 +114,10 @@ impl ActiveViewSlot for CachedViewSlot {
 impl Drop for CachedViewSlot {
     fn drop(&mut self) {
         let _ = self.lease.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if self.accounted.swap(false, Ordering::SeqCst) {
-            let mut guard = self.catalog.lock().unwrap_or_else(|p| p.into_inner());
+        if self.accounted.swap(false, Ordering::SeqCst)
+            && let Some(catalog) = self.catalog.upgrade()
+        {
+            let mut guard = catalog.lock().unwrap_or_else(|p| p.into_inner());
             guard.resident_bytes = guard.resident_bytes.saturating_sub(self.reserved_bytes);
         }
     }
@@ -266,7 +268,7 @@ impl ViewCacheCatalog {
             _pack_pins: pack_pins,
             expected_pack_files,
             state: Mutex::new(SlotInner { active_readers: 1, unindexed: false }),
-            catalog: Arc::clone(&self.inner),
+            catalog: Arc::downgrade(&self.inner),
             _root_lock: self.root_lock.clone(),
         });
         let dropped = {
