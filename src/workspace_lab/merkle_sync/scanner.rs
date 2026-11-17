@@ -139,6 +139,19 @@ impl MerkleWorkspaceScanner {
             for p in &dirty_paths {
                 descend_dirs.insert(parent_dir_bytes(p));
             }
+            if let Some(prev) = req.previous {
+                // Any newly introduced directory path adds a child entry to its nearest pre-existing ancestor.
+                let seed: Vec<Vec<u8>> = descend_dirs.iter().cloned().collect();
+                for mut cur in seed {
+                    while !cur.is_empty() {
+                        let parent = parent_dir_bytes(&cur);
+                        if !prev.nodes.contains_key(&encode_rel_bytes(&cur)) {
+                            descend_dirs.insert(parent.clone());
+                        }
+                        cur = parent;
+                    }
+                }
+            }
         }
         let mut ancestor_dirs = BTreeSet::new();
         for d in &descend_dirs {
