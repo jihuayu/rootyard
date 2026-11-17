@@ -329,7 +329,7 @@ impl LiveRaft3 {
             let applied = AppliedLogId { term: 1, index: log_idx };
             last_id = applied;
             if let RefCasCommand::CommitScopedRefs(c) = &cmd {
-                op_logs.insert((c.request.repository_id, c.request.operation_id), applied);
+                op_logs.insert((c.commit.request.repository_id, c.commit.request.operation_id), applied);
             }
             last = Some(sm.apply(applied, cmd));
         }

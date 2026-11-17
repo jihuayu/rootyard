@@ -179,7 +179,6 @@ async fn reconcile_and_replay_survive_subsequent_pr_advancing_base_ref() {
     f2.scope_id = f.scope_id;
     f2.realm = f.realm.clone();
     f2.svc = f.svc.clone();
-    f2.keyring = f.keyring.clone();
     f2.base_oid = f.head_oid.clone();
     f2.head_oid = hex_oid(GitObjectFormat::Sha256, 0x33);
     f2.base_revision = gv2.revision();
