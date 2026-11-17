@@ -16,7 +16,7 @@ use super::planner::{
     DEFAULT_COMPACTED_THRESHOLD, FetchPlanOutcome, FetchPlanRequest, HaveSpec, WantTarget, plan_fetch_covers,
 };
 use super::retention_class::{CoverRetentionHold, PackRetentionState, RetentionClassificationIndex};
-use super::tests::{default_auth, make_pack, mint_version, oid, realm, uid};
+use super::tests::{default_auth, make_pack, mint_version, oid, realm, seal_test_cover, uid};
 use super::verifier::{PlanVerifyError, verify_fetch_plan_closure};
 use crate::ref_store::contract::RequestDigest;
 use crate::ref_store::core::types::{GitObjectFormat, GitOid, RefName};
@@ -45,75 +45,51 @@ fn planner_verifier_auth_isolation_and_fallback_matrix() {
     graph.insert_active(CausalVersionNode { record: v_sec.clone(), own_packs: vec![p_sec_c.clone()] });
 
     let mem1 = compute_cover_membership_digest(&r, 2, &[*p1_c.entry(), *p2_c.entry(), *p_sec_c.entry()]).unwrap();
-    let c1 = CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
-        cover_id: uid(111),
-        realm: r,
-        tier: CoverTier::Delta,
-        pack: p1_c.clone(),
-        artifacts: a1,
-        covered_versions: vec![v1.version_id()],
-        min_authority_seq: 1,
-        max_authority_seq: 1,
-        covered_commits: vec![CoverCommitLink {
-            commit_oid: oid(GitObjectFormat::Sha1, 1),
-            parent_oids: vec![],
-            version_id: v1.version_id(),
-            authority_seq: 1,
-        }],
-        input_cover_ids: vec![],
-        membership_generation: 2,
-        membership_digest: mem1,
-        compaction_epoch: 1,
-        worker_id: uid(701),
-        operation_id: uid(811),
-    })
-    .unwrap();
-    let c2 = CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
-        cover_id: uid(112),
-        realm: r,
-        tier: CoverTier::Delta,
-        pack: p2_c.clone(),
-        artifacts: a2,
-        covered_versions: vec![v2.version_id()],
-        min_authority_seq: 2,
-        max_authority_seq: 2,
-        covered_commits: vec![CoverCommitLink {
-            commit_oid: oid(GitObjectFormat::Sha1, 2),
-            parent_oids: vec![oid(GitObjectFormat::Sha1, 1)],
-            version_id: v2.version_id(),
-            authority_seq: 2,
-        }],
-        input_cover_ids: vec![],
-        membership_generation: 2,
-        membership_digest: mem1,
-        compaction_epoch: 1,
-        worker_id: uid(701),
-        operation_id: uid(812),
-    })
-    .unwrap();
-    let c_sec = CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
-        cover_id: uid(113),
-        realm: r,
-        tier: CoverTier::Delta,
-        pack: p_sec_c.clone(),
-        artifacts: a_sec,
-        covered_versions: vec![v_sec.version_id()],
-        min_authority_seq: 3,
-        max_authority_seq: 3,
-        covered_commits: vec![CoverCommitLink {
-            commit_oid: oid(GitObjectFormat::Sha1, 99),
-            parent_oids: vec![],
-            version_id: v_sec.version_id(),
-            authority_seq: 3,
-        }],
-        input_cover_ids: vec![],
-        membership_generation: 2,
-        membership_digest: mem1,
-        compaction_epoch: 1,
-        worker_id: uid(701),
-        operation_id: uid(813),
-    })
-    .unwrap();
+    let l1 = CoverCommitLink {
+        commit_oid: oid(GitObjectFormat::Sha1, 1),
+        parent_oids: vec![],
+        version_id: v1.version_id(),
+        authority_seq: 1,
+    };
+    let l2 = CoverCommitLink {
+        commit_oid: oid(GitObjectFormat::Sha1, 2),
+        parent_oids: vec![oid(GitObjectFormat::Sha1, 1)],
+        version_id: v2.version_id(),
+        authority_seq: 2,
+    };
+    let l3 = CoverCommitLink {
+        commit_oid: oid(GitObjectFormat::Sha1, 99),
+        parent_oids: vec![],
+        version_id: v_sec.version_id(),
+        authority_seq: 3,
+    };
+    let c1 = seal_test_cover(
+        &r,
+        (111, 2, (1, 1), mem1),
+        CoverTier::Delta,
+        (p1_c.clone(), a1),
+        vec![v1.version_id()],
+        vec![l1],
+        vec![],
+    );
+    let c2 = seal_test_cover(
+        &r,
+        (112, 2, (2, 2), mem1),
+        CoverTier::Delta,
+        (p2_c, a2),
+        vec![v2.version_id()],
+        vec![l2],
+        vec![],
+    );
+    let c_sec = seal_test_cover(
+        &r,
+        (113, 2, (3, 3), mem1),
+        CoverTier::Delta,
+        (p_sec_c, a_sec),
+        vec![v_sec.version_id()],
+        vec![l3],
+        vec![],
+    );
     index.register_leaf_cover(c1.clone(), mem1).unwrap();
     index.register_leaf_cover(c2, mem1).unwrap();
     index.register_leaf_cover(c_sec, mem1).unwrap();
@@ -215,6 +191,79 @@ fn planner_verifier_auth_isolation_and_fallback_matrix() {
         historical_pinned: false,
     };
     assert_eq!(plan_fetch_covers(&non_common_req, &graph, &index, &ret), Err(FetchPlanError::NonCommonTimeDenied));
+
+    // Verifier enforces session_lower_bound (BehindSession), and both planner & verifier bind PinnedVersion.
+    let main_ref = RefName::new("refs/heads/main").unwrap();
+    let vc_req = FetchPlanRequest {
+        consumer: ReadConsumer::SingleRefBrowse,
+        realm: r,
+        auth: restricted_auth.clone(),
+        isolation: ReadIsolationMode::VersionClosure {
+            version_id: v2.version_id(),
+            session_lower_bound: Some(2),
+            historical_pinned: false,
+        },
+        strong_cut: None,
+        wants: vec![WantTarget::PinnedVersion { ref_name: main_ref.clone(), version_id: v2.version_id() }],
+        haves: HaveSpec { have_oids: vec![oid(GitObjectFormat::Sha1, 1)], have_version_ids: vec![] },
+        allow_strong_fallback: false,
+        prefer_compacted_above_delta_count: DEFAULT_COMPACTED_THRESHOLD,
+    };
+    let FetchPlanOutcome::Planned(vc_plan) = plan_fetch_covers(&vc_req, &graph, &index, &ret).unwrap() else {
+        panic!("expected planned VersionClosure outcome");
+    };
+    let mut behind_req = vc_req.clone();
+    behind_req.isolation = ReadIsolationMode::VersionClosure {
+        version_id: v2.version_id(),
+        session_lower_bound: Some(3),
+        historical_pinned: false,
+    };
+    assert_eq!(plan_fetch_covers(&behind_req, &graph, &index, &ret), Err(FetchPlanError::BehindSession));
+    let mut forged_behind_plan = (*vc_plan).clone();
+    forged_behind_plan.isolation = behind_req.isolation.clone();
+    forged_behind_plan.plan_digest = super::planner::compute_fetch_plan_digest(&forged_behind_plan).unwrap();
+    assert_eq!(
+        verify_fetch_plan_closure(
+            &forged_behind_plan,
+            ReadConsumer::SingleRefBrowse,
+            &restricted_auth,
+            None,
+            &graph,
+            &index,
+            &ret,
+        ),
+        Err(PlanVerifyError::Plan(FetchPlanError::BehindSession))
+    );
+
+    let mut pin_strong_req = inc_req.clone();
+    pin_strong_req.auth.allow_historical_pins = false;
+    pin_strong_req.allow_strong_fallback = false;
+    pin_strong_req.wants = vec![WantTarget::PinnedVersion { ref_name: main_ref.clone(), version_id: v1.version_id() }];
+    assert!(matches!(
+        plan_fetch_covers(&pin_strong_req, &graph, &index, &ret),
+        Err(FetchPlanError::InvalidPlanInput(_))
+    ));
+    let mut pin_vc_mismatch = vc_req.clone();
+    pin_vc_mismatch.wants = vec![WantTarget::PinnedVersion { ref_name: main_ref.clone(), version_id: v1.version_id() }];
+    assert!(matches!(
+        plan_fetch_covers(&pin_vc_mismatch, &graph, &index, &ret),
+        Err(FetchPlanError::InvalidPlanInput(_))
+    ));
+    let mut forged_pin_plan = (*vc_plan).clone();
+    forged_pin_plan.wants = vec![WantTarget::PinnedVersion { ref_name: main_ref, version_id: v1.version_id() }];
+    forged_pin_plan.plan_digest = super::planner::compute_fetch_plan_digest(&forged_pin_plan).unwrap();
+    assert!(matches!(
+        verify_fetch_plan_closure(
+            &forged_pin_plan,
+            ReadConsumer::SingleRefBrowse,
+            &restricted_auth,
+            None,
+            &graph,
+            &index,
+            &ret
+        ),
+        Err(PlanVerifyError::Plan(FetchPlanError::InvalidPlanInput(_)))
+    ));
 
     let mut tampered = c1_for_tamper_test(&r, &p1_c, &v1);
     tampered.tamper_record_digest_for_test();

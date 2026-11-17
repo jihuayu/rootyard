@@ -11,7 +11,7 @@ use super::super::record::{VersionRecord, VersionRecordInput};
 use super::auth::{AuthorizationContext, RefVisibilityPolicy};
 use super::model::{
     CompactionPublishOutcome, CoverArtifactPair, CoverCommitLink, CoverHierarchyIndex, CoverHierarchyRecord,
-    CoverHierarchyRecordInput, CoverModelError, CoverTier, compute_cover_membership_digest,
+    CoverHierarchyRecordInput, CoverMembershipDigest, CoverModelError, CoverTier, compute_cover_membership_digest,
 };
 use super::retention_class::{
     CoverRetentionHold, NonAuthoritativeHint, PHYSICAL_GC_OWNER, PackRetentionState, PhysicalBlobStatus,
@@ -169,6 +169,39 @@ pub(super) fn mint_version(
     (rec, pack)
 }
 
+pub(super) fn seal_test_cover(
+    r: &RefVersionRealm,
+    meta: (u128, u64, (i64, i64), CoverMembershipDigest),
+    tier: CoverTier,
+    (pack, artifacts): (VerifiedClosurePack, CoverArtifactPair),
+    covered_versions: Vec<VersionId>,
+    covered_commits: Vec<CoverCommitLink>,
+    input_cover_ids: Vec<Uuid>,
+) -> CoverHierarchyRecord {
+    CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
+        cover_id: uid(meta.0),
+        realm: *r,
+        tier,
+        pack,
+        artifacts,
+        covered_versions,
+        min_authority_seq: meta.2.0,
+        max_authority_seq: meta.2.1,
+        covered_commits,
+        input_cover_ids,
+        membership_generation: meta.1,
+        membership_digest: meta.3,
+        compaction_epoch: 1,
+        worker_id: uid(701),
+        operation_id: uid(meta.0 + 700),
+    })
+    .unwrap()
+}
+
+fn link(commit_oid: GitOid, parent: Option<GitOid>, v: &VersionRecord, authority_seq: i64) -> CoverCommitLink {
+    CoverCommitLink { commit_oid, parent_oids: parent.into_iter().collect(), version_id: v.version_id(), authority_seq }
+}
+
 pub(super) fn default_auth(r: &RefVersionRealm) -> AuthorizationContext {
     AuthorizationContext {
         tenant_id: r.tenant_id(),
@@ -198,99 +231,56 @@ fn cover_record_digest_and_compaction_fencing_work_for_sha1_and_sha256() {
         let (v2, p2_copy) = mint_version(&r, "refs/heads/main", 2, Some(&v1), oid(fmt, 2), p2, vec![v1.version_id()]);
 
         let mem1 = compute_cover_membership_digest(&r, 2, &[*p1_copy.entry()]).unwrap();
-        let c1 = CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
-            cover_id: uid(101),
-            realm: r,
-            tier: CoverTier::Delta,
-            pack: p1_copy.clone(),
-            artifacts: a1,
-            covered_versions: vec![v1.version_id()],
-            min_authority_seq: 1,
-            max_authority_seq: 1,
-            covered_commits: vec![CoverCommitLink {
-                commit_oid: oid(fmt, 1),
-                parent_oids: vec![],
-                version_id: v1.version_id(),
-                authority_seq: 1,
-            }],
-            input_cover_ids: vec![],
-            membership_generation: 2,
-            membership_digest: mem1,
-            compaction_epoch: 1,
-            worker_id: uid(701),
-            operation_id: uid(801),
-        })
-        .unwrap();
+        let l1 = link(oid(fmt, 1), None, &v1, 1);
+        let c1 = seal_test_cover(
+            &r,
+            (101, 2, (1, 1), mem1),
+            CoverTier::Delta,
+            (p1_copy.clone(), a1),
+            vec![v1.version_id()],
+            vec![l1.clone()],
+            vec![],
+        );
         c1.verify_digest().unwrap();
         index.register_leaf_cover(c1.clone(), mem1).unwrap();
 
         let mem2 = compute_cover_membership_digest(&r, 3, &[*p1_copy.entry(), *p2_copy.entry()]).unwrap();
-        let c2 = CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
-            cover_id: uid(102),
-            realm: r,
-            tier: CoverTier::Delta,
-            pack: p2_copy.clone(),
-            artifacts: a2,
-            covered_versions: vec![v2.version_id()],
-            min_authority_seq: 2,
-            max_authority_seq: 2,
-            covered_commits: vec![CoverCommitLink {
-                commit_oid: oid(fmt, 2),
-                parent_oids: vec![oid(fmt, 1)],
-                version_id: v2.version_id(),
-                authority_seq: 2,
-            }],
-            input_cover_ids: vec![],
-            membership_generation: 3,
-            membership_digest: mem2,
-            compaction_epoch: 1,
-            worker_id: uid(701),
-            operation_id: uid(802),
-        })
-        .unwrap();
+        let l2 = link(oid(fmt, 2), Some(oid(fmt, 1)), &v2, 2);
+        let c2 = seal_test_cover(
+            &r,
+            (102, 3, (2, 2), mem2),
+            CoverTier::Delta,
+            (p2_copy.clone(), a2),
+            vec![v2.version_id()],
+            vec![l2.clone()],
+            vec![],
+        );
         index.register_leaf_cover(c2.clone(), mem2).unwrap();
 
         // Compacted cover dropping v2 must fail closed.
         let (p3, a3) = make_pack(&r, 3, 1800, 300, false, vec![]);
         let mem3 = compute_cover_membership_digest(&r, 4, &[*p3.entry()]).unwrap();
-        let bad_drop = CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
-            cover_id: uid(103),
-            realm: r,
-            tier: CoverTier::Compacted,
-            pack: p3.clone(),
-            artifacts: a3.clone(),
-            covered_versions: vec![v1.version_id()],
-            min_authority_seq: 1,
-            max_authority_seq: 2,
-            covered_commits: c1.covered_commits().to_vec(),
-            input_cover_ids: vec![c1.cover_id(), c2.cover_id()],
-            membership_generation: 4,
-            membership_digest: mem3,
-            compaction_epoch: 1,
-            worker_id: uid(702),
-            operation_id: uid(803),
-        })
-        .unwrap();
+        let in_ids = vec![c1.cover_id(), c2.cover_id()];
+        let bad_drop = seal_test_cover(
+            &r,
+            (103, 4, (1, 2), mem3),
+            CoverTier::Compacted,
+            (p3.clone(), a3.clone()),
+            vec![v1.version_id()],
+            vec![l1.clone()],
+            in_ids.clone(),
+        );
         assert_eq!(index.publish_compacted_cover(bad_drop, 1, mem2, mem3), Err(CoverModelError::InputCoverageDrop));
 
-        let full_comp = CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
-            cover_id: uid(104),
-            realm: r,
-            tier: CoverTier::Compacted,
-            pack: p3,
-            artifacts: a3,
-            covered_versions: vec![v1.version_id(), v2.version_id()],
-            min_authority_seq: 1,
-            max_authority_seq: 2,
-            covered_commits: vec![c1.covered_commits()[0].clone(), c2.covered_commits()[0].clone()],
-            input_cover_ids: vec![c1.cover_id(), c2.cover_id()],
-            membership_generation: 4,
-            membership_digest: mem3,
-            compaction_epoch: 1,
-            worker_id: uid(702),
-            operation_id: uid(804),
-        })
-        .unwrap();
+        let full_comp = seal_test_cover(
+            &r,
+            (104, 4, (1, 2), mem3),
+            CoverTier::Compacted,
+            (p3, a3),
+            vec![v1.version_id(), v2.version_id()],
+            vec![l1, l2],
+            in_ids,
+        );
         // Stale membership digest rejected (simulating concurrent push drift).
         assert_eq!(
             index.publish_compacted_cover(full_comp.clone(), 1, mem1, mem3),
@@ -384,4 +374,120 @@ fn three_state_retention_rejects_ttl_cache_and_async_projection_deletes() {
     let c_del = ret.classify_pack(pack_id, cover_id, &[v1.version_id()]);
     assert_eq!(c_del.state, None);
     assert!(!c_del.physically_present && !c_del.plannable_for_fetch && !c_del.gc_eligible);
+}
+
+#[test]
+fn thin_pack_uncached_retired_or_historical_delta_base_falls_back_cleanly() {
+    use super::super::closure::{CausalVersionNode, VersionGraph};
+    use super::super::read_mode::ReadConsumer;
+    use super::super::record::RefHead;
+    use super::auth::{FallbackReason, FetchPlanError, ReadIsolationMode, StrongSnapshotCut};
+    use super::planner::{DEFAULT_COMPACTED_THRESHOLD, FetchPlanOutcome, FetchPlanRequest, HaveSpec, WantTarget};
+
+    let r = realm(GitObjectFormat::Sha1);
+    let mem0 = compute_cover_membership_digest(&r, 1, &[]).unwrap();
+    let mut index = CoverHierarchyIndex::new(r, mem0).unwrap();
+    let mut graph = VersionGraph::new();
+
+    let (p1, a1) = make_pack(&r, 31, 40_000, 1000, false, vec![]);
+    let (v1, p1_c) = mint_version(&r, "refs/heads/main", 1, None, oid(GitObjectFormat::Sha1, 31), p1, vec![]);
+    graph.insert_active(CausalVersionNode { record: v1.clone(), own_packs: vec![p1_c.clone()] });
+
+    let (p2, a2) = make_pack(&r, 32, 2_000, 200, true, vec![uid(1101)]);
+    let (v2, p2_c) =
+        mint_version(&r, "refs/heads/main", 2, Some(&v1), oid(GitObjectFormat::Sha1, 32), p2, vec![v1.version_id()]);
+    graph.insert_active(CausalVersionNode { record: v2.clone(), own_packs: vec![p2_c.clone()] });
+
+    let mem1 = compute_cover_membership_digest(&r, 2, &[*p1_c.entry(), *p2_c.entry()]).unwrap();
+    let l1 = link(oid(GitObjectFormat::Sha1, 31), None, &v1, 1);
+    let l2 = link(oid(GitObjectFormat::Sha1, 32), Some(oid(GitObjectFormat::Sha1, 31)), &v2, 2);
+    let c1 = seal_test_cover(
+        &r,
+        (1101, 2, (1, 1), mem1),
+        CoverTier::Delta,
+        (p1_c, a1),
+        vec![v1.version_id()],
+        vec![l1.clone()],
+        vec![],
+    );
+    let c2 = seal_test_cover(
+        &r,
+        (1102, 2, (2, 2), mem1),
+        CoverTier::Delta,
+        (p2_c.clone(), a2),
+        vec![v2.version_id()],
+        vec![l2],
+        vec![],
+    );
+    index.register_leaf_cover(c1, mem1).unwrap();
+    index.register_leaf_cover(c2, mem1).unwrap();
+
+    let main_ref = RefName::new("refs/heads/main").unwrap();
+    let heads = std::collections::BTreeMap::from([(main_ref.clone(), RefHead::from_committed(&v2).unwrap())]);
+    let mut hist_ret = RetentionClassificationIndex::new();
+    hist_ret.add_hold(CoverRetentionHold::ActiveRefHead {
+        ref_name: main_ref.clone(),
+        version_id: v2.version_id(),
+        cover_ids: vec![uid(1102)],
+    });
+    hist_ret.add_hold(CoverRetentionHold::HistoricalCoverHold {
+        hold_id: uid(1103),
+        cover_ids: vec![uid(1101)],
+        version_ids: vec![],
+        reason: "hist".into(),
+    });
+    let mut req = FetchPlanRequest {
+        consumer: ReadConsumer::SmartHttpFetch,
+        realm: r,
+        auth: default_auth(&r),
+        isolation: ReadIsolationMode::StrongSnapshot,
+        strong_cut: Some(StrongSnapshotCut {
+            authority_seq: 2,
+            snapshot_digest: RequestDigest::of("hist", &[b"cut"]),
+            membership_digest: index.membership_digest(),
+            heads: heads.clone(),
+        }),
+        wants: vec![WantTarget::Ref { ref_name: main_ref.clone() }],
+        haves: HaveSpec::default(),
+        allow_strong_fallback: true,
+        prefer_compacted_above_delta_count: DEFAULT_COMPACTED_THRESHOLD,
+    };
+    let assert_ret_lost = |req: &mut FetchPlanRequest, ret_idx: &RetentionClassificationIndex| {
+        req.allow_strong_fallback = true;
+        assert!(matches!(
+            super::planner::plan_fetch_covers(req, &graph, &index, ret_idx).unwrap(),
+            FetchPlanOutcome::FallbackToStrongSnapshot { reason: FallbackReason::RetentionLost, .. }
+        ));
+        req.allow_strong_fallback = false;
+        assert_eq!(super::planner::plan_fetch_covers(req, &graph, &index, ret_idx), Err(FetchPlanError::RetentionLost));
+    };
+    assert_ret_lost(&mut req, &hist_ret);
+
+    let (p_sup, a_sup) = make_pack(&r, 33, 39_000, 1000, false, vec![]);
+    let mem2 = compute_cover_membership_digest(&r, 3, &[*p_sup.entry(), *p2_c.entry()]).unwrap();
+    let sup = seal_test_cover(
+        &r,
+        (1104, 3, (1, 1), mem2),
+        CoverTier::Compacted,
+        (p_sup, a_sup),
+        vec![v1.version_id()],
+        vec![l1],
+        vec![uid(1101)],
+    );
+    index.publish_compacted_cover(sup, 1, mem1, mem2).unwrap();
+    index.mark_retired_from_active(uid(1101), uid(1104), true).unwrap();
+
+    let mut active_ret = RetentionClassificationIndex::new();
+    active_ret.add_hold(CoverRetentionHold::ActiveRefHead {
+        ref_name: main_ref,
+        version_id: v2.version_id(),
+        cover_ids: vec![uid(1102), uid(1104), uid(1101)],
+    });
+    req.strong_cut = Some(StrongSnapshotCut {
+        authority_seq: 2,
+        snapshot_digest: RequestDigest::of("ret", &[b"cut"]),
+        membership_digest: index.membership_digest(),
+        heads,
+    });
+    assert_ret_lost(&mut req, &active_ret);
 }

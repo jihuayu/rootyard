@@ -88,6 +88,7 @@ struct SafetyFixture {
     store: BlobStore,
     realm: RefVersionRealm,
     mr: RefName,
+    vid: super::super::contract::VersionId,
     c1: GitOid,
     graph: VersionGraph,
     index: CoverHierarchyIndex,
@@ -269,6 +270,7 @@ async fn setup_fixture() -> Result<SafetyFixture> {
         store,
         realm,
         mr,
+        vid,
         c1,
         graph,
         index,
@@ -334,6 +336,81 @@ async fn live_auth_revocation_epoch_visibility_and_actor_mismatch_reject_retaine
         materialize_and_verify_fetch_plan(&f.store, &f.views, &f.proof, &f.plan, &narrowed, &f.index, &[], &refs, dl)
             .await,
         Err(BlobVerifyError::Plan(FetchPlanError::HiddenRefDenied))
+    ));
+
+    // Mutating plan.isolation or delta_base_cover_ids must invalidate plan_digest, binds(), and materialization.
+    let mut mut_iso_strong = f.plan.clone();
+    mut_iso_strong.isolation =
+        ReadIsolationMode::VersionClosure { version_id: f.vid, session_lower_bound: None, historical_pinned: false };
+    ensure!(super::planner::compute_fetch_plan_digest(&mut_iso_strong)? != f.plan.plan_digest);
+    ensure!(!f.proof.binds(&mut_iso_strong));
+    ensure!(matches!(
+        materialize_and_verify_fetch_plan(
+            &f.store,
+            &f.views,
+            &f.proof,
+            &mut_iso_strong,
+            &f.req.auth,
+            &f.index,
+            &[],
+            &refs,
+            dl,
+        )
+        .await,
+        Err(BlobVerifyError::ProofMismatch)
+    ));
+
+    let mut vs_auth = f.req.auth.clone();
+    vs_auth.allow_non_common_time_set = true;
+    vs_auth.allow_historical_pins = true;
+    let mut vs_req = FetchPlanRequest::new(
+        crate::ref_store::core::ref_version::read_mode::ReadConsumer::CrossRefCompare,
+        f.realm,
+        vs_auth.clone(),
+        ReadIsolationMode::VersionSet { version_ids: vec![f.vid], session_lower_bound: None, historical_pinned: true },
+    );
+    vs_req.wants = vec![WantTarget::PinnedVersion { ref_name: f.mr.clone(), version_id: f.vid }];
+    let FetchPlanOutcome::Planned(vs_plan) = plan_fetch_covers(&vs_req, &f.graph, &f.index, &f.ret)? else {
+        anyhow::bail!("expected planned VersionSet outcome");
+    };
+    let vs_proof = verify_fetch_plan_closure(&vs_plan, vs_req.consumer, &vs_auth, None, &f.graph, &f.index, &f.ret)?;
+    let mut forged_vs = *vs_plan;
+    forged_vs.isolation =
+        ReadIsolationMode::VersionClosure { version_id: f.vid, session_lower_bound: None, historical_pinned: false };
+    ensure!(!vs_proof.binds(&forged_vs));
+    ensure!(matches!(
+        materialize_and_verify_fetch_plan(
+            &f.store,
+            &f.views,
+            &vs_proof,
+            &forged_vs,
+            &vs_auth,
+            &f.index,
+            &[],
+            &refs,
+            dl
+        )
+        .await,
+        Err(BlobVerifyError::ProofMismatch)
+    ));
+
+    let mut mut_bases = f.plan.clone();
+    mut_bases.selected_covers[0].delta_base_cover_ids.push(Uuid::new_v4());
+    ensure!(!f.proof.binds(&mut_bases));
+    ensure!(matches!(
+        materialize_and_verify_fetch_plan(
+            &f.store,
+            &f.views,
+            &f.proof,
+            &mut_bases,
+            &f.req.auth,
+            &f.index,
+            &[],
+            &refs,
+            dl,
+        )
+        .await,
+        Err(BlobVerifyError::ProofMismatch)
     ));
 
     ensure!(f.views.active_view_count() == 0 && f.views.total_reserved_bytes() == 0);

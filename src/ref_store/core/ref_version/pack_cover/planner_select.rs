@@ -1,15 +1,16 @@
 //! Greedy weighted set-cover selection, thin-base closure expansion, and strong fallback (Issue #184).
+use super::super::closure::{CausalVersionLookup, VersionLookupEntry};
 use super::super::limits::{MAX_CLOSURE_ARTIFACTS, MAX_CLOSURE_PACKS, MAX_CLOSURE_VERIFIED_BYTES};
 use super::super::read_mode::StrongSnapshotState;
 use super::auth::{
     FallbackReason, FetchPlanError, MAX_PLANNER_SCORING_STEPS, StrongSnapshotFallback, advertise_authorized_refs,
     cover_exposes_unauthorized_commits,
 };
-use super::model::{CoverHierarchyIndex, CoverHierarchyRecord};
+use super::model::{CoverCommitLink, CoverHierarchyIndex, CoverHierarchyRecord, oid_bytes};
 use super::planner::{FetchPlanOutcome, FetchPlanRequest, PlannedCoverEntry};
 use super::retention_class::{CoverHoldKind, RetentionClassificationIndex};
-use crate::ref_store::core::types::GitOid;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use crate::ref_store::core::types::{GitOid, RefTarget};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use uuid::Uuid;
 
 const SMALL_FETCH_PACK_OVERHEAD_BYTES: u64 = 2048;
@@ -188,7 +189,11 @@ fn expand_delta_bases(
             if !client_bases.contains(base_id) {
                 client_bases.push(*base_id);
             }
-        } else if base_cls.physically_present && base_cls.plannable_for_fetch {
+        } else if base_cls.physically_present
+            && base_cls.plannable_for_fetch
+            && (ctx.req.isolation.is_historical_pinned()
+                || (!ctx.cover_index.is_retired_from_active(base_id) && !base_cls.historical_read_only))
+        {
             if !required_bases.contains(base_id) {
                 required_bases.push(*base_id);
             }
@@ -360,4 +365,68 @@ fn enforce_bounds(
         return Err((FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded));
     }
     Ok(())
+}
+
+pub(super) fn resolve_verified_haves(
+    req: &FetchPlanRequest,
+    version_lookup: &dyn CausalVersionLookup,
+    authorized_commits: &HashSet<GitOid>,
+    commit_to_covers: &HashMap<GitOid, Vec<Uuid>>,
+    metadata_reads: &mut u64,
+) -> Result<Vec<GitOid>, FetchPlanError> {
+    let mut verified = HashSet::new();
+    for oid in &req.haves.have_oids {
+        if authorized_commits.contains(oid) {
+            verified.insert(*oid);
+        } else if commit_to_covers.contains_key(oid) {
+            return Err(FetchPlanError::HiddenRefDenied);
+        }
+    }
+    for vid in &req.haves.have_version_ids {
+        *metadata_reads = metadata_reads.saturating_add(1);
+        if let VersionLookupEntry::Active(node) = version_lookup.lookup_version(vid) {
+            if node.record.realm() != &req.realm {
+                return Err(FetchPlanError::RealmMismatch);
+            }
+            if let RefTarget::Oid(oid) = node.record.target() {
+                if authorized_commits.contains(oid) {
+                    verified.insert(*oid);
+                } else if commit_to_covers.contains_key(oid) {
+                    return Err(FetchPlanError::HiddenRefDenied);
+                }
+            }
+        }
+    }
+    let mut out: Vec<GitOid> = verified.into_iter().collect();
+    out.sort_by_key(|oid| oid_bytes(*oid));
+    Ok(out)
+}
+
+pub(super) fn collect_missing_commits(
+    wants: &[GitOid],
+    have_ancestors: &HashSet<GitOid>,
+    commit_links: &HashMap<GitOid, CoverCommitLink>,
+    commit_to_covers: &HashMap<GitOid, Vec<Uuid>>,
+) -> Result<HashSet<GitOid>, FetchPlanError> {
+    let mut needed = HashSet::new();
+    let mut queue = VecDeque::new();
+    for want in wants {
+        if !have_ancestors.contains(want) && needed.insert(*want) {
+            queue.push_back(*want);
+        }
+    }
+    while let Some(oid) = queue.pop_front() {
+        if !commit_to_covers.contains_key(&oid) {
+            return Err(FetchPlanError::MissingBaseCover);
+        }
+        let Some(link) = commit_links.get(&oid) else {
+            return Err(FetchPlanError::MissingBaseCover);
+        };
+        for parent in &link.parent_oids {
+            if !have_ancestors.contains(parent) && needed.insert(*parent) {
+                queue.push_back(*parent);
+            }
+        }
+    }
+    Ok(needed)
 }

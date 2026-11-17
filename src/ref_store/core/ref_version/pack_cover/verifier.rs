@@ -4,7 +4,7 @@
 //! dependency closures, 3-state retention eligibility, Git commit DAG completeness,
 //! thin-pack external delta bases, and closure bounds without trusting planner
 //! heuristics. Produces the unforgeable [`VerifiedFetchPlanProof`].
-use super::super::closure::{CausalVersionLookup, verify_dependency_closure};
+use super::super::closure::CausalVersionLookup;
 use super::super::contract::RefVersionRealm;
 use super::super::digest::CanonicalWriter;
 use super::super::limits::{
@@ -12,14 +12,16 @@ use super::super::limits::{
 };
 use super::super::read_mode::ReadConsumer;
 use super::auth::{
-    AuthorizationContext, FetchPlanError, MAX_PLANNER_INDEXED_COVERS, MAX_PLANNER_INDEXED_LINKS, StrongSnapshotCut,
-    collect_authorized_commit_scope, cover_exposes_unauthorized_commits, map_closure_err, validate_isolation_policy,
-    validate_strong_cut,
+    AuthorizationContext, FetchPlanError, MAX_PLANNER_INDEXED_COVERS, MAX_PLANNER_INDEXED_LINKS, ReadIsolationMode,
+    StrongSnapshotCut, collect_authorized_commit_scope, cover_exposes_unauthorized_commits, push_isolation_canonical,
+    validate_isolation_policy, validate_strong_cut,
 };
 use super::model::{CoverCommitLink, CoverHierarchyIndex, CoverHierarchyRecord};
-use super::planner::{FetchPlan, FetchPlanDigest, WantTarget, collect_ancestors, compute_fetch_plan_digest};
+use super::planner::{
+    FetchPlan, FetchPlanDigest, collect_ancestors, compute_fetch_plan_digest, resolve_and_validate_wants,
+};
 use super::retention_class::{CoverHoldKind, RetentionClassificationIndex};
-use crate::ref_store::core::types::{GitOid, RefTarget};
+use crate::ref_store::core::types::GitOid;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use uuid::Uuid;
@@ -45,6 +47,7 @@ pub struct VerifiedFetchPlanProof {
     auth_epoch: u64,
     authority_seq: i64,
     common_time: bool,
+    isolation: ReadIsolationMode,
     selected_cover_ids: Vec<Uuid>,
     selected_pack_ids: Vec<Uuid>,
     external_client_base_covers: Vec<Uuid>,
@@ -75,6 +78,9 @@ impl VerifiedFetchPlanProof {
     }
     pub const fn common_time(&self) -> bool {
         self.common_time
+    }
+    pub const fn isolation(&self) -> &ReadIsolationMode {
+        &self.isolation
     }
     pub fn selected_cover_ids(&self) -> &[Uuid] {
         &self.selected_cover_ids
@@ -113,6 +119,7 @@ impl VerifiedFetchPlanProof {
         self.realm == plan.realm
             && self.authority_seq == plan.authority_seq
             && self.common_time == plan.common_time
+            && self.isolation == plan.isolation
             && self.selected_cover_ids == cover_ids
             && self.selected_pack_ids == pack_ids
             && self.external_client_base_covers == plan.external_client_base_covers
@@ -189,7 +196,11 @@ pub fn verify_fetch_plan_closure(
         }
     }
 
-    let expected_want_commits = verify_wants_and_cut(plan, strong_cut, auth, version_lookup)?;
+    let (expected_want_commits, expected_seq) =
+        resolve_and_validate_wants(&plan.realm, auth, &plan.isolation, strong_cut, &plan.wants, version_lookup, None)?;
+    if expected_seq != plan.authority_seq {
+        return Err(PlanVerifyError::SelectedPackMetadataMismatch);
+    }
     if expected_want_commits != plan.resolved_want_commits {
         return Err(PlanVerifyError::SelectedPackMetadataMismatch);
     }
@@ -236,62 +247,12 @@ pub fn verify_fetch_plan_closure(
         auth_epoch: auth.auth_epoch,
         authority_seq: plan.authority_seq,
         common_time: plan.common_time,
+        isolation: plan.isolation.clone(),
         selected_cover_ids,
         selected_pack_ids,
         external_client_base_covers: plan.external_client_base_covers.clone(),
         total_verified_bytes: plan.total_selected_bytes,
     })
-}
-
-fn verify_wants_and_cut(
-    plan: &FetchPlan,
-    strong_cut: Option<&StrongSnapshotCut>,
-    auth: &AuthorizationContext,
-    version_lookup: &dyn CausalVersionLookup,
-) -> Result<Vec<GitOid>, PlanVerifyError> {
-    let mut want_commits = Vec::with_capacity(plan.wants.len());
-    for want in &plan.wants {
-        if !auth.can_see_ref(want.ref_name()) {
-            return Err(FetchPlanError::HiddenRefDenied.into());
-        }
-        let (version_id, expected_ref, expected_oid) = match want {
-            WantTarget::Ref { ref_name } => {
-                let cut = strong_cut.ok_or(FetchPlanError::StrongCutRequired)?;
-                let head = cut.heads.get(ref_name).ok_or(FetchPlanError::VersionNotFound)?;
-                if head.realm() != &plan.realm {
-                    return Err(FetchPlanError::RealmMismatch.into());
-                }
-                if head.ref_name() != ref_name {
-                    return Err(FetchPlanError::InvalidPlanInput("snapshot head key mismatch").into());
-                }
-                let oid = head.target().ok_or(FetchPlanError::TargetDeleted)?;
-                (head.version_id(), ref_name, Some(oid))
-            }
-            WantTarget::PinnedVersion { ref_name, version_id } => (*version_id, ref_name, None),
-        };
-        let closure = verify_dependency_closure(version_lookup, &plan.realm, &version_id).map_err(map_closure_err)?;
-        if closure.root().ref_name() != expected_ref {
-            return Err(FetchPlanError::InvalidPlanInput("version ref_name mismatch").into());
-        }
-        if let Some(cut) = strong_cut
-            && closure.root().authority_seq() > cut.authority_seq
-        {
-            return Err(FetchPlanError::InvalidPlanInput("resolved version exceeds snapshot cut authority_seq").into());
-        }
-        if let Some(exp) = expected_oid
-            && closure.root().target() != &RefTarget::Oid(exp)
-        {
-            return Err(FetchPlanError::InvalidPlanInput("snapshot head target mismatch").into());
-        }
-        let oid = match closure.root().target() {
-            RefTarget::Oid(oid) => *oid,
-            RefTarget::Delete => return Err(FetchPlanError::TargetDeleted.into()),
-        };
-        if !want_commits.contains(&oid) {
-            want_commits.push(oid);
-        }
-    }
-    Ok(want_commits)
 }
 
 fn verify_selected_covers<'a>(
@@ -417,6 +378,7 @@ fn compute_proof_digest(plan: &FetchPlan, auth: &AuthorizationContext) -> Result
     w.push_len_prefixed(PLAN_PROOF_DOMAIN).map_err(|_| PlanVerifyError::PlanDigestMismatch)?;
     w.push_len_prefixed(plan.plan_digest.as_bytes()).map_err(|_| PlanVerifyError::PlanDigestMismatch)?;
     w.push_u64(positive_u64(plan.authority_seq, "authority_seq").map_err(|_| PlanVerifyError::PlanDigestMismatch)?);
+    push_isolation_canonical(&mut w, &plan.isolation).map_err(|_| PlanVerifyError::PlanDigestMismatch)?;
     w.push_len_prefixed(auth.actor_id.as_bytes()).map_err(|_| PlanVerifyError::PlanDigestMismatch)?;
     w.push_len_prefixed(auth.token_id.as_bytes()).map_err(|_| PlanVerifyError::PlanDigestMismatch)?;
     w.push_u64(auth.auth_epoch);

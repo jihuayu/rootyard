@@ -26,6 +26,7 @@ OWNED_RUST_FILES = [
     PACK_COVER_DIR / "tests.rs",
     PACK_COVER_DIR / "tests_git_blob.rs",
     PACK_COVER_DIR / "tests_matrix.rs",
+    PACK_COVER_DIR / "tests_safety.rs",
     PACK_COVER_DIR / "verifier.rs",
     ROOT / "tests" / "pando_pack_cover.rs",
 ]

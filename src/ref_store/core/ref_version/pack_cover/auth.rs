@@ -3,7 +3,9 @@
 //! Enforces live per-request authorization (revocation, auth epoch, tenant/repo/history
 //! realm binding), hidden-ref advertisement filtering, anti-oracle `have` checks, and
 //! default `StrongSnapshot` read isolation (`docs/ref-version-pack-contract.md` §4).
-use super::super::contract::{RefVersionRealm, VersionId};
+use super::super::contract::{RefVersionCodecError, RefVersionRealm, VersionId};
+use super::super::digest::CanonicalWriter;
+use super::super::limits::count_u32;
 use super::super::read_mode::{ReadConsumer, ReadModeKind, StrongSnapshotState};
 use super::super::record::RefHead;
 use super::model::{CoverHierarchyIndex, CoverHierarchyRecord, CoverMembershipDigest};
@@ -424,5 +426,45 @@ pub(super) fn map_closure_err(err: super::super::closure::CausalClosureError) ->
         CausalClosureError::DependencyMissing
         | CausalClosureError::DependencyCorrupt
         | CausalClosureError::DependencyCycleIntegrity => FetchPlanError::DependencyClosureFailed,
+    }
+}
+
+/// Canonical encoding of [`ReadIsolationMode`] shared by [`FetchPlan`] and [`VerifiedFetchPlanProof`] digests.
+pub(super) fn push_isolation_canonical(
+    w: &mut CanonicalWriter,
+    isolation: &ReadIsolationMode,
+) -> Result<(), RefVersionCodecError> {
+    match isolation {
+        ReadIsolationMode::StrongSnapshot => {
+            w.push_u8(1);
+            Ok(())
+        }
+        ReadIsolationMode::VersionClosure { version_id, session_lower_bound, historical_pinned } => {
+            w.push_u8(2);
+            w.push_len_prefixed(version_id.as_bytes())?;
+            push_optional_bound(w, *session_lower_bound);
+            w.push_u8(u8::from(*historical_pinned));
+            Ok(())
+        }
+        ReadIsolationMode::VersionSet { version_ids, session_lower_bound, historical_pinned } => {
+            w.push_u8(3);
+            w.push_u32(count_u32(version_ids.len(), "isolation_version_ids")?);
+            for vid in version_ids {
+                w.push_len_prefixed(vid.as_bytes())?;
+            }
+            push_optional_bound(w, *session_lower_bound);
+            w.push_u8(u8::from(*historical_pinned));
+            Ok(())
+        }
+    }
+}
+
+fn push_optional_bound(w: &mut CanonicalWriter, bound: Option<i64>) {
+    match bound {
+        None => w.push_u8(0),
+        Some(value) => {
+            w.push_u8(1);
+            w.push_u64(u64::from_be_bytes(value.to_be_bytes()));
+        }
     }
 }

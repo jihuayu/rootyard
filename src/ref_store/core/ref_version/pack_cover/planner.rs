@@ -12,10 +12,12 @@ use super::super::read_mode::ReadConsumer;
 use super::auth::{
     AuthorizationContext, FallbackReason, FetchPlanError, MAX_PLANNER_INDEXED_COVERS, MAX_PLANNER_INDEXED_LINKS,
     ReadIsolationMode, StrongSnapshotCut, StrongSnapshotFallback, collect_authorized_commit_scope, map_closure_err,
-    validate_isolation_policy, validate_strong_cut,
+    push_isolation_canonical, validate_isolation_policy, validate_strong_cut,
 };
 use super::model::{CoverCommitLink, CoverHierarchyIndex, CoverTier, oid_bytes};
-use super::planner_select::{CoverSelectionCtx, SelectionResult, fallback_or_err, select_covers};
+use super::planner_select::{
+    CoverSelectionCtx, SelectionResult, collect_missing_commits, fallback_or_err, resolve_verified_haves, select_covers,
+};
 use super::retention_class::RetentionClassificationIndex;
 use crate::ref_store::core::types::{GitOid, RefName, RefTarget};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -166,7 +168,15 @@ pub fn plan_fetch_covers(
         }
     }
 
-    let (want_commits, authority_seq) = resolve_wants(req, version_lookup, &mut metadata_reads)?;
+    let (want_commits, authority_seq) = resolve_and_validate_wants(
+        &req.realm,
+        &req.auth,
+        &req.isolation,
+        req.strong_cut.as_ref(),
+        &req.wants,
+        version_lookup,
+        Some(&mut metadata_reads),
+    )?;
     let (commit_links, commit_to_covers, digest_ok) = match index_commits_and_covers(cover_index, &mut metadata_reads) {
         Ok(indexed) => indexed,
         Err(FetchPlanError::ClosureBoundsExceeded) => {
@@ -260,6 +270,7 @@ pub(super) fn compute_fetch_plan_digest(
         crate::ref_store::core::types::GitObjectFormat::Sha256 => 2,
     });
     w.push_u8(u8::from(plan.common_time));
+    push_isolation_canonical(&mut w, &plan.isolation)?;
     w.push_u64(positive_u64(plan.authority_seq, "authority_seq")?);
     w.push_u32(count_u32(plan.wants.len(), "wants")?);
     for want in &plan.wants {
@@ -286,6 +297,10 @@ pub(super) fn compute_fetch_plan_digest(
         w.push_u8(entry.tier.tag());
         w.push_u64(entry.verified_bytes);
         w.push_u8(u8::from(entry.is_thin_pack));
+        w.push_u32(count_u32(entry.delta_base_cover_ids.len(), "delta_base_cover_ids")?);
+        for base_id in &entry.delta_base_cover_ids {
+            w.push_len_prefixed(base_id.as_bytes())?;
+        }
     }
     w.push_u32(count_u32(plan.external_client_base_covers.len(), "external_bases")?);
     for id in &plan.external_client_base_covers {
@@ -295,43 +310,54 @@ pub(super) fn compute_fetch_plan_digest(
     Ok(FetchPlanDigest(w.finish()))
 }
 
-fn resolve_wants(
-    req: &FetchPlanRequest,
+/// Validate every requested want target against visibility, snapshot cut, causal closure,
+/// read-isolation binding, and session monotonicity (`BehindSession`).
+pub(super) fn resolve_and_validate_wants(
+    realm: &RefVersionRealm,
+    auth: &AuthorizationContext,
+    isolation: &ReadIsolationMode,
+    strong_cut: Option<&StrongSnapshotCut>,
+    wants: &[WantTarget],
     version_lookup: &dyn CausalVersionLookup,
-    metadata_reads: &mut u64,
+    mut metadata_reads: Option<&mut u64>,
 ) -> Result<(Vec<GitOid>, i64), FetchPlanError> {
-    let mut want_commits = Vec::with_capacity(req.wants.len());
+    let mut want_commits = Vec::with_capacity(wants.len());
     let mut max_seq = 0_i64;
-    for want in &req.wants {
-        if !req.auth.can_see_ref(want.ref_name()) {
+    for want in wants {
+        if !auth.can_see_ref(want.ref_name()) {
             return Err(FetchPlanError::HiddenRefDenied);
         }
         let (version_id, expected_ref, expected_oid) = match want {
             WantTarget::Ref { ref_name } => {
-                let cut = req.strong_cut.as_ref().ok_or(FetchPlanError::StrongCutRequired)?;
+                let cut = strong_cut.ok_or(FetchPlanError::StrongCutRequired)?;
                 let head = cut.heads.get(ref_name).ok_or(FetchPlanError::VersionNotFound)?;
-                if head.realm() != &req.realm {
+                if head.realm() != realm {
                     return Err(FetchPlanError::RealmMismatch);
                 }
                 if head.ref_name() != ref_name {
                     return Err(FetchPlanError::InvalidPlanInput("snapshot head key does not match RefHead ref_name"));
                 }
+                validate_version_matches_isolation(isolation, head.version_id(), None)?;
                 let oid = head.target().ok_or(FetchPlanError::TargetDeleted)?;
                 (head.version_id(), ref_name, Some(oid))
             }
             WantTarget::PinnedVersion { ref_name, version_id } => {
-                if !req.auth.allow_historical_pins && req.isolation.is_historical_pinned() {
+                if !auth.allow_historical_pins && isolation.is_historical_pinned() {
                     return Err(FetchPlanError::AuthDenied("historical pin reads not permitted"));
                 }
-                (*version_id, ref_name, None)
+                let oid =
+                    validate_version_matches_isolation(isolation, *version_id, Some((strong_cut, realm, ref_name)))?;
+                (*version_id, ref_name, oid)
             }
         };
-        let closure = verify_dependency_closure(version_lookup, &req.realm, &version_id).map_err(map_closure_err)?;
-        *metadata_reads = metadata_reads.saturating_add(1 + closure.dependencies().len() as u64);
+        let closure = verify_dependency_closure(version_lookup, realm, &version_id).map_err(map_closure_err)?;
+        if let Some(reads) = metadata_reads.as_deref_mut() {
+            *reads = reads.saturating_add(1 + closure.dependencies().len() as u64);
+        }
         if closure.root().ref_name() != expected_ref {
             return Err(FetchPlanError::InvalidPlanInput("version ref_name mismatch"));
         }
-        if let Some(cut) = &req.strong_cut
+        if let Some(cut) = strong_cut
             && closure.root().authority_seq() > cut.authority_seq
         {
             return Err(FetchPlanError::InvalidPlanInput("resolved version exceeds snapshot cut authority_seq"));
@@ -342,8 +368,8 @@ fn resolve_wants(
             return Err(FetchPlanError::InvalidPlanInput("snapshot head target mismatches version record"));
         }
         let seq = closure.root().authority_seq();
-        if !req.isolation.is_historical_pinned()
-            && let Some(bound) = req.isolation.session_lower_bound()
+        if !isolation.is_historical_pinned()
+            && let Some(bound) = isolation.session_lower_bound()
             && seq < bound
         {
             return Err(FetchPlanError::BehindSession);
@@ -357,11 +383,50 @@ fn resolve_wants(
             want_commits.push(oid);
         }
     }
-    let effective_seq = match &req.strong_cut {
-        Some(cut) if matches!(req.isolation, ReadIsolationMode::StrongSnapshot) => cut.authority_seq,
+    let effective_seq = match strong_cut {
+        Some(cut) if matches!(isolation, ReadIsolationMode::StrongSnapshot) => cut.authority_seq,
         _ => max_seq,
     };
     Ok((want_commits, effective_seq))
+}
+
+fn validate_version_matches_isolation(
+    isolation: &ReadIsolationMode,
+    version_id: VersionId,
+    strong_pin_ctx: Option<(Option<&StrongSnapshotCut>, &RefVersionRealm, &RefName)>,
+) -> Result<Option<GitOid>, FetchPlanError> {
+    match isolation {
+        ReadIsolationMode::StrongSnapshot => {
+            let Some((strong_cut, realm, ref_name)) = strong_pin_ctx else {
+                return Ok(None);
+            };
+            let cut = strong_cut.ok_or(FetchPlanError::StrongCutRequired)?;
+            let head = cut.heads.get(ref_name).ok_or(FetchPlanError::VersionNotFound)?;
+            if head.realm() != realm {
+                return Err(FetchPlanError::RealmMismatch);
+            }
+            if head.ref_name() != ref_name {
+                return Err(FetchPlanError::InvalidPlanInput("snapshot head key does not match RefHead ref_name"));
+            }
+            if head.version_id() != version_id {
+                return Err(FetchPlanError::InvalidPlanInput("pinned version does not match strong snapshot cut head"));
+            }
+            let oid = head.target().ok_or(FetchPlanError::TargetDeleted)?;
+            Ok(Some(oid))
+        }
+        ReadIsolationMode::VersionClosure { version_id: expected, .. } => {
+            if version_id != *expected {
+                return Err(FetchPlanError::InvalidPlanInput("want version does not match VersionClosure isolation"));
+            }
+            Ok(None)
+        }
+        ReadIsolationMode::VersionSet { version_ids, .. } => {
+            if !version_ids.contains(&version_id) {
+                return Err(FetchPlanError::InvalidPlanInput("want version missing from VersionSet isolation"));
+            }
+            Ok(None)
+        }
+    }
 }
 
 fn index_commits_and_covers(
@@ -391,41 +456,6 @@ fn index_commits_and_covers(
     Ok((links, commit_to_covers, digest_ok))
 }
 
-fn resolve_verified_haves(
-    req: &FetchPlanRequest,
-    version_lookup: &dyn CausalVersionLookup,
-    authorized_commits: &HashSet<GitOid>,
-    commit_to_covers: &HashMap<GitOid, Vec<Uuid>>,
-    metadata_reads: &mut u64,
-) -> Result<Vec<GitOid>, FetchPlanError> {
-    let mut verified = HashSet::new();
-    for oid in &req.haves.have_oids {
-        if authorized_commits.contains(oid) {
-            verified.insert(*oid);
-        } else if commit_to_covers.contains_key(oid) {
-            return Err(FetchPlanError::HiddenRefDenied);
-        }
-    }
-    for vid in &req.haves.have_version_ids {
-        *metadata_reads = metadata_reads.saturating_add(1);
-        if let super::super::closure::VersionLookupEntry::Active(node) = version_lookup.lookup_version(vid) {
-            if node.record.realm() != &req.realm {
-                return Err(FetchPlanError::RealmMismatch);
-            }
-            if let RefTarget::Oid(oid) = node.record.target() {
-                if authorized_commits.contains(oid) {
-                    verified.insert(*oid);
-                } else if commit_to_covers.contains_key(oid) {
-                    return Err(FetchPlanError::HiddenRefDenied);
-                }
-            }
-        }
-    }
-    let mut out: Vec<GitOid> = verified.into_iter().collect();
-    out.sort_by_key(|oid| oid_bytes(*oid));
-    Ok(out)
-}
-
 pub(super) fn collect_ancestors(roots: &[GitOid], commit_links: &HashMap<GitOid, CoverCommitLink>) -> HashSet<GitOid> {
     let mut visited = HashSet::new();
     let mut queue: VecDeque<GitOid> = VecDeque::new();
@@ -444,33 +474,4 @@ pub(super) fn collect_ancestors(roots: &[GitOid], commit_links: &HashMap<GitOid,
         }
     }
     visited
-}
-
-fn collect_missing_commits(
-    wants: &[GitOid],
-    have_ancestors: &HashSet<GitOid>,
-    commit_links: &HashMap<GitOid, CoverCommitLink>,
-    commit_to_covers: &HashMap<GitOid, Vec<Uuid>>,
-) -> Result<HashSet<GitOid>, FetchPlanError> {
-    let mut needed = HashSet::new();
-    let mut queue = VecDeque::new();
-    for want in wants {
-        if !have_ancestors.contains(want) && needed.insert(*want) {
-            queue.push_back(*want);
-        }
-    }
-    while let Some(oid) = queue.pop_front() {
-        if !commit_to_covers.contains_key(&oid) {
-            return Err(FetchPlanError::MissingBaseCover);
-        }
-        let Some(link) = commit_links.get(&oid) else {
-            return Err(FetchPlanError::MissingBaseCover);
-        };
-        for parent in &link.parent_oids {
-            if !have_ancestors.contains(parent) && needed.insert(*parent) {
-                queue.push_back(*parent);
-            }
-        }
-    }
-    Ok(needed)
 }
