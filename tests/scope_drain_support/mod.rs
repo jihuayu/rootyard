@@ -15,7 +15,7 @@ use rootyard::ref_store::projector::{
 };
 use rootyard::ref_store::raft_backend::RootRefCasApplied;
 
-use self::failure_phase::{CASE_SCOPE, Class, PhaseGuard, ScopePhase};
+use self::failure_phase::{CASE_SCOPE, Class, Operation, PhaseGuard, ScopePhase, observe_call};
 
 pub(crate) mod failure_phase;
 
@@ -192,21 +192,25 @@ async fn privileged_scope_drain_query_is_quorum_bound_and_multirepo_complete_bod
     assert_eq!(requirement.storage_generation(), 1);
 
     phase.set(ScopePhase::RecoveryRejections);
-    let non_close_id = backend_a.prepare_proposal_id().await?;
-    let non_close = backend_a
-        .propose_with_id(non_close_id.clone(), RefCasCommand::Noop(NoopCommand { logical_tick: None }))
-        .await?;
+    let non_close_id = observe_call(phase, &cluster, Operation::Prepare, backend_a.prepare_proposal_id()).await?;
+    let non_close = observe_call(
+        phase,
+        &cluster,
+        Operation::ClientWrite,
+        backend_a.propose_with_id(non_close_id.clone(), RefCasCommand::Noop(NoopCommand { logical_tick: None })),
+    )
+    .await?;
     assert!(proposal_outcome(&non_close).is_applied());
     assert!(matches!(
         backend_a.recover_scope_close_requirement(non_close.proposal_id.clone()).await,
         Err(RaftBackendError::ScopeCloseNotRecoverable(_))
     ));
-    let never_observed = backend_a.prepare_proposal_id().await?;
+    let never_observed = observe_call(phase, &cluster, Operation::Prepare, backend_a.prepare_proposal_id()).await?;
     assert!(matches!(
         backend_a.recover_scope_close_requirement(never_observed).await,
         Err(RaftBackendError::RecoveryNotObserved(_))
     ));
-    let mut malformed = backend_a.prepare_proposal_id().await?;
+    let mut malformed = observe_call(phase, &cluster, Operation::Prepare, backend_a.prepare_proposal_id()).await?;
     malformed.group_id = "bad!".into();
     assert!(matches!(
         backend_a.recover_scope_close_requirement(malformed).await,
