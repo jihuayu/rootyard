@@ -651,12 +651,12 @@ async fn read_materialized_file(
         );
     }
     let spec = format!("{oid}:{path}");
-    historical_trace_try!(
+    Ok(historical_trace_try!(
         trace_enabled,
         trace::S17_CAT_FILE,
         repo.run(&["cat-file", "-p", spec.as_str()], None).await,
         trace::ErrorKind::GitProcess
-    )
+    ))
 }
 
 struct PairFiles {
