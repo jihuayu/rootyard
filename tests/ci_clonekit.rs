@@ -456,9 +456,14 @@ async fn pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation(
         let c1 = add_commit(&repo, "big.bin", &payload_bytes(9, 128 * 1024), "c1")?;
         let (ids, token_id) = ((Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()), Uuid::new_v4());
         let client = pool.get().await?;
+        let token_digest_bytes = [7u8; 32];
+        let token_digest: &[u8] = &token_digest_bytes;
+        let repo_name: &str = "ckrepo";
+        let credential_digest_bytes = [9u8; 32];
+        let credential_digest: &[u8] = &credential_digest_bytes;
         client.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&ids.0, &format!("ck_{}", &ids.0.simple().to_string()[..8])]).await?;
-        client.execute("INSERT INTO tokens(id,user_id,digest) VALUES($1,$2,$3)", &[&token_id, &ids.0, &[7u8; 32][..]]).await?;
-        client.execute("INSERT INTO repositories(id,owner_id,name,state,object_format,storage_generation) VALUES($1,$2,$3,'ready','sha1',1)", &[&ids.1, &ids.0, "ckrepo"]).await?;
+        client.execute("INSERT INTO tokens(id,user_id,digest) VALUES($1,$2,$3)", &[&token_id, &ids.0, &token_digest]).await?;
+        client.execute("INSERT INTO repositories(id,owner_id,name,state,object_format,storage_generation) VALUES($1,$2,$3,'ready','sha1',1)", &[&ids.1, &ids.0, &repo_name]).await?;
         drop(client);
 
         let pg_dl = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -478,7 +483,7 @@ async fn pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation(
         let now: i64 = pool.get().await?.query_one("SELECT extract(epoch FROM clock_timestamp())::bigint", &[]).await?.get(0);
         let (signed, ctx) = make_grant(ids, Sha1, &c2, None, now)?;
         let plan = serde_json::json!({"version":1,"job_id":ctx.job_id,"owner_id":ids.0,"repository_id":ids.1,"storage_generation":1,"object_format":"sha1","target_oid":c2,"source_receipt_sha256":"a".repeat(64),"mirror_audience":ctx.audience,"expires_unix":signed.claims.not_after_unix});
-        pool.get().await?.execute("INSERT INTO ci_checkout_jobs(repository_id,job_id,owner_id,plan,issuer_token_id,credential_digest,expires_unix) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&ids.1, &ctx.job_id, &ids.0, &plan, &token_id, &[9u8; 32][..], &signed.claims.not_after_unix]).await?;
+        pool.get().await?.execute("INSERT INTO ci_checkout_jobs(repository_id,job_id,owner_id,plan,issuer_token_id,credential_digest,expires_unix) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&ids.1, &ctx.job_id, &ids.0, &plan, &token_id, &credential_digest, &signed.claims.not_after_unix]).await?;
 
         let pg_auth: Arc<dyn CloneKitAuthorityOracle> = Arc::new(PgCheckoutAuthorityOracle::new(pool.clone()));
         let co = Co { manifest: Some(&built.manifest), blob: Some(&blob), ..Co::new(&vr) };
