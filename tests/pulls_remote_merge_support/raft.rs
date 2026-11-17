@@ -40,7 +40,7 @@ struct MtlsNode {
     addr: String,
     dir: PathBuf,
     cfg: Arc<ClientConfig>,
-    child: Mutex<OwnedChild>,
+    _child: Mutex<OwnedChild>,
 }
 impl MtlsNode {
     fn spawn(
@@ -85,7 +85,7 @@ impl MtlsNode {
         let raw = rx.recv_timeout(Duration::from_secs(15))??;
         let banner: Value = serde_json::from_str(raw.trim().strip_prefix("READY ").context("READY")?)?;
         let addr = banner["addr"].as_str().context("addr")?.into();
-        Ok(Self { id, addr, dir, cfg, child: Mutex::new(OwnedChild(Some(ch))) })
+        Ok(Self { id, addr, dir, cfg, _child: Mutex::new(OwnedChild(Some(ch))) })
     }
 
     async fn rpc(&self, req: Value) -> Result<Value> {
