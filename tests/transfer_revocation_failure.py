@@ -26,6 +26,7 @@ from transfer_revocation_failure_projection import (
     project as _project,
     safe_errno,
 )
+from transfer_revocation_failure_reader import reader_stop_or_fail
 
 SCHEMA = "rootyard.transfer_partial_evidence.v1"
 
@@ -123,6 +124,21 @@ def safe_error_class(error):
     return "unexpected"
 
 
+def _backpressure_value(report):
+    if report is None:
+        return None
+    if not isinstance(report, dict):
+        raise ValueError("backpressure report must be a mapping")
+    value = _project(report, bools=BACKPRESSURE_BOOLS,
+                     ints=BACKPRESSURE_INTS, nums=BACKPRESSURE_NUMS)
+    if "last_reset_reason" in report:
+        value["last_reset_reason"] = _enum(
+            report["last_reset_reason"], RESET_REASONS, "reset_reason")
+    value["source_witness"] = None if report.get("source_witness") is None else _project(
+        report["source_witness"], bools=SOURCE_BOOLS, ints=SOURCE_INTS)
+    return value
+
+
 class FailureEvidence:
     def __init__(self, *, case=None, subcase=None, bound_ms=1200, subcases=()):
         if case is not None:
@@ -152,7 +168,14 @@ class FailureEvidence:
         self._stop = None
         self._source_witness = None
         self._backpressure = None
+        self._pre_source = None
+        self._pre_backpressure = None
         self._group = None
+        self._reader = {
+            "finished": None, "alive_after_main_join": None,
+            "alive_after_cleanup_join": None, "daemon": None,
+            "error_class": None,
+        }
         self._proof_components = {name: None for name in PROOF_COMPONENTS}
         self._subcases = {}
         for name in subcases:
@@ -219,12 +242,41 @@ class FailureEvidence:
 
     def cleanup(self, error=None):
         if error is None:
-            self.cleanup_state = "passed"
-            self.cleanup_exception_class = None
+            if self.cleanup_state != "unresolved":
+                self.cleanup_state = "passed"
+                self.cleanup_exception_class = None
         else:
             self.cleanup_state = "failed"
             self.cleanup_exception_class = safe_error_class(error)
             self.fail("transfer_cleanup", self.cleanup_exception_class, safe_errno(error))
+        return self
+
+    def mark_cleanup_unresolved(self, code="reader_timeout"):
+        self.cleanup_state = "unresolved"
+        self.cleanup_exception_class = _exception_class(code)
+        return self
+
+    def set_reader_state(self, *, finished=None, alive_after_main_join=None,
+                         alive_after_cleanup_join=None, daemon=None,
+                         error_class=None):
+        if finished is not None:
+            self._reader["finished"] = _bool(finished, "reader_finished")
+        if alive_after_main_join is not None:
+            self._reader["alive_after_main_join"] = _bool(
+                alive_after_main_join, "reader_alive_after_main_join")
+        if alive_after_cleanup_join is not None:
+            self._reader["alive_after_cleanup_join"] = _bool(
+                alive_after_cleanup_join, "reader_alive_after_cleanup_join")
+        if daemon is not None:
+            self._reader["daemon"] = _bool(daemon, "reader_daemon")
+        if error_class is not None:
+            self._reader["error_class"] = _exception_class(error_class)
+        return self
+
+    def set_pre_trigger_evidence(self, *, source_witness=None, backpressure=None):
+        self._pre_source = None if source_witness is None else _project(
+            source_witness, bools=SOURCE_BOOLS, ints=SOURCE_INTS)
+        self._pre_backpressure = _backpressure_value(backpressure)
         return self
 
     def set_http_status(self, status):
@@ -274,19 +326,7 @@ class FailureEvidence:
         return self
 
     def set_backpressure(self, report):
-        if report is None:
-            self._backpressure = None
-            return self
-        if not isinstance(report, dict):
-            raise ValueError("backpressure report must be a mapping")
-        value = _project(report, bools=BACKPRESSURE_BOOLS,
-                         ints=BACKPRESSURE_INTS, nums=BACKPRESSURE_NUMS)
-        if "last_reset_reason" in report:
-            value["last_reset_reason"] = _enum(
-                report["last_reset_reason"], RESET_REASONS, "reset_reason")
-        value["source_witness"] = None if report.get("source_witness") is None else _project(
-            report["source_witness"], bools=SOURCE_BOOLS, ints=SOURCE_INTS)
-        self._backpressure = value
+        self._backpressure = _backpressure_value(report)
         return self
 
     def set_group(self, report):
@@ -396,7 +436,12 @@ class FailureEvidence:
             "transport_stop": self._stop,
             "source_witness": self._source_witness,
             "backpressure": self._backpressure,
+            "pre_trigger": {
+                "source_witness": self._pre_source,
+                "backpressure": self._pre_backpressure,
+            },
             "group": self._group,
+            "reader": dict(self._reader),
             "proof_components": dict(self._proof_components),
             "transport_proof": self.transport_proof,
             "final_proof": self.final_proof,

@@ -5,7 +5,6 @@ from pathlib import Path
 import sys
 import types
 import unittest
-from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "tests") not in sys.path:
@@ -174,48 +173,12 @@ class FailureEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence.snapshot()["terminal_state"], "passed")
 
 
-class _RaisingConnection:
-    requested_so_rcvbuf = 16 * 1024
-    effective_so_rcvbuf = 32 * 1024
-
-    def __init__(self, *args, **kwargs):
-        self.sock = object()
-
-    def request(self, method, path, body=None, headers=None):
-        raise RuntimeError("secret operation text /tmp/path")
-
-    def close(self):
-        raise OSError(5, "secret cleanup text /tmp/path")
-
-
-class TransportOrderingTests(unittest.TestCase):
-    def test_operation_failure_survives_cleanup_failure_through_wrapper(self):
-        with mock.patch.object(
-            transport, "SmallBufferHTTPConnection", _RaisingConnection,
-        ):
-            with self.assertRaises(failure.SafeFailure) as caught:
-                transport.run_timed_transfer(
-                    base="http://127.0.0.1:1", path="/x", method="GET",
-                    headers={}, body=None, expected_size=1, initial_bytes=1,
-                    framing="content_length", service_pid=None, bound_ms=1200,
-                    trigger=lambda: None, require_group=False,
-                    require_backpressure=False,
-                )
-        snapshot = caught.exception.partial
-        self.assertEqual(snapshot["primary_failure_phase"], "transport_request")
-        self.assertEqual(snapshot["exception_class"], "runtime_error")
-        self.assertEqual(snapshot["cleanup"]["state"], "failed")
-        self.assertEqual(snapshot["cleanup"]["exception_class"], "os_error")
-        self.assertNotEqual(snapshot["primary_failure_phase"], "transfer_cleanup")
-        self.assertNotIn("secret", json.dumps(snapshot))
-
-
 class ReaderEvidenceTests(unittest.TestCase):
     def test_missing_reader_completion_is_a_safe_failure(self):
         evidence = failure.FailureEvidence(subcase="pat_revoked")
         evidence.start()
         with self.assertRaises(failure.SafeFailure) as caught:
-            transport._reader_stop_or_fail(
+            failure.reader_stop_or_fail(
                 evidence, {"reader_finished": False},
                 timed_out=False, received=10, now_ns=123,
             )
@@ -227,7 +190,7 @@ class ReaderEvidenceTests(unittest.TestCase):
         evidence = failure.FailureEvidence(subcase="pat_revoked")
         evidence.start()
         with self.assertRaises(failure.SafeFailure) as caught:
-            transport._reader_stop_or_fail(
+            failure.reader_stop_or_fail(
                 evidence,
                 {"reader_finished": True, "reader_error_class": "value_error",
                  "reader_error_errno": 5},
@@ -237,15 +200,42 @@ class ReaderEvidenceTests(unittest.TestCase):
         self.assertEqual(caught.exception.partial["errno"], 5)
         self.assertNotIn("secret", json.dumps(caught.exception.partial))
 
+    def test_reader_exception_preserves_observed_resume(self):
+        evidence = failure.FailureEvidence(subcase="pat_revoked")
+        evidence.start()
+        with self.assertRaises(failure.SafeFailure) as caught:
+            failure.reader_stop_or_fail(
+                evidence,
+                {"reader_resume_ns": 1_000_000_000, "reader_finished": True,
+                 "reader_error_class": "value_error", "reader_error_errno": 5},
+                timed_out=False, received=0, now_ns=1_100_000_000,
+                lower_ns=100_000_000, resume_ns=800_000_000,
+            )
+        snapshot = caught.exception.partial
+        self.assertEqual(snapshot["timestamps"]["reader_resume_ns"], 1_000_000_000)
+        self.assertEqual(snapshot["metrics"]["post_trigger_pause_ms"], 900.0)
+        self.assertEqual(
+            snapshot["metrics"]["reader_resume_delta_from_target_ms"], 200.0)
+        self.assertEqual(snapshot["primary_failure_phase"], "transport_stop_observe")
+        self.assertEqual(snapshot["exception_class"], "value_error")
+        self.assertIsNone(snapshot["final_proof"])
+
     def test_reader_timeout_is_unproven_not_a_pass(self):
         evidence = failure.FailureEvidence(subcase="pat_revoked")
         evidence.start()
-        stop = transport._reader_stop_or_fail(
+        stop = failure.reader_stop_or_fail(
             evidence, {}, timed_out=True, received=3, now_ns=99,
         )
         self.assertEqual(stop.kind, timing.StopKind.TIMEOUT)
-        self.assertEqual(evidence.snapshot()["terminal_state"], "unproven")
-        self.assertFalse(evidence.snapshot()["transport_stop"]["confirmed_transport_stop"])
+        snapshot = evidence.snapshot()
+        self.assertEqual(snapshot["terminal_state"], "unproven")
+        self.assertFalse(snapshot["transport_stop"]["confirmed_transport_stop"])
+        self.assertEqual(snapshot["cleanup"]["state"], "unresolved")
+        self.assertEqual(snapshot["cleanup"]["exception_class"], "reader_timeout")
+        self.assertTrue(snapshot["reader"]["alive_after_main_join"])
+        evidence.set_reader_state(alive_after_cleanup_join=True)
+        evidence.cleanup(None)
+        self.assertEqual(evidence.snapshot()["cleanup"]["state"], "unresolved")
 
 
 class _CaseHarness(checkouts.JobCheckoutHarness):

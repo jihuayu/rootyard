@@ -18,8 +18,6 @@ from transfer_revocation_observer import (
 )
 from transfer_revocation_timing import (
     NS_PER_MS,
-    StopKind,
-    StopObservation,
     TriggerInterval,
     read_until_transport_stop,
 )
@@ -58,35 +56,6 @@ def _sleep_until(target_ns):
 
 def _ms(ns):
     return round(ns / NS_PER_MS, 3)
-
-def _reader_stop_or_fail(evidence, trigger_state, *, timed_out, received, now_ns):
-    """Keep reader failure inside the finite evidence vocabulary."""
-    evidence.enter_phase("transport_stop_observe")
-    if timed_out:
-        evidence.note("transport_stop_observe", "reader_timeout")
-        evidence.mark_unproven()
-        stop = StopObservation(StopKind.TIMEOUT, now_ns, received)
-        evidence.set_stop(stop.report())
-        evidence.finish_phase("transport_stop_observe")
-        return stop
-    if not trigger_state.get("reader_finished"):
-        evidence.fail("transport_stop_observe", "reader_missing_completion")
-        raise evidence.safe_failure("reader_missing_completion")
-    error_class = trigger_state.get("reader_error_class")
-    if error_class is not None:
-        evidence.fail(
-            "transport_stop_observe",
-            error_class,
-            trigger_state.get("reader_error_errno"),
-        )
-        raise evidence.safe_failure(error_class)
-    stop = trigger_state.get("stop")
-    if stop is None:
-        evidence.fail("transport_stop_observe", "reader_missing_completion")
-        raise evidence.safe_failure("reader_missing_completion")
-    evidence.set_stop(stop.report())
-    evidence.finish_phase("transport_stop_observe")
-    return stop
 
 def run_timed_transfer(*, evidence=None, subcase=None, **kwargs):
     """Run the real transfer while retaining a finite safe failure snapshot."""
@@ -279,6 +248,10 @@ def _run_timed_transfer_impl(
             evidence.enter_phase("pre_trigger_finalize")
             if probe is not None:
                 probe.finalize()
+                evidence.set_pre_trigger_evidence(
+                    source_witness=((probe.last_sample or {}).get("source_report") or {}),
+                    backpressure=probe.report(),
+                )
             evidence.finish_phase("pre_trigger_finalize")
 
             evidence.enter_phase("trigger_commit")
@@ -298,6 +271,10 @@ def _run_timed_transfer_impl(
             if probe is not None:
                 probe.hold_until(lower_ns - 20 * NS_PER_MS)
                 probe.finalize()
+                evidence.set_pre_trigger_evidence(
+                    source_witness=((probe.last_sample or {}).get("source_report") or {}),
+                    backpressure=probe.report(),
+                )
             evidence.finish_phase("natural_expiry_hold")
 
         resume_ns = lower_ns + post_pause_ns
@@ -326,26 +303,18 @@ def _run_timed_transfer_impl(
         evidence.finish_phase("post_trigger_pressure_sample")
 
         reader.join(timeout=max(1.0, (deadline_ns - time.monotonic_ns()) / 1_000_000_000 + 2.0))
-        stop = _reader_stop_or_fail(
+        stop = revocation_failure.reader_stop_or_fail(
             evidence,
             trigger_state,
             timed_out=reader.is_alive(),
             received=len(first),
             now_ns=time.monotonic_ns(),
+            lower_ns=lower_ns,
+            resume_ns=resume_ns,
         )
         reader_resume_ns = trigger_state.get("reader_resume_ns")
-        evidence.set_timestamp("reader_resume_ns", reader_resume_ns)
         evidence.set_timestamp("stop_ns", stop.observed_ns)
         evidence.set_metric("client_stop_after_lower_ms", _ms(stop.observed_ns - lower_ns))
-        evidence.set_metric("post_trigger_pause_ms", (
-            _ms(reader_resume_ns - lower_ns) if reader_resume_ns is not None else None
-        ))
-        evidence.set_metric("reader_resume_after_lower_ms", (
-            _ms(reader_resume_ns - lower_ns) if reader_resume_ns is not None else None
-        ))
-        evidence.set_metric("reader_resume_delta_from_target_ms", (
-            _ms(reader_resume_ns - resume_ns) if reader_resume_ns is not None else None
-        ))
 
         if observer is not None:
             evidence.enter_phase("group_quiescence")
@@ -491,6 +460,18 @@ def _run_timed_transfer_impl(
                     "transfer_cleanup",
                     revocation_failure.safe_error_class(error),
                 )
+        if reader is not None:
+            main_alive = bool(trigger_state.get("reader_alive_after_main_join"))
+            cleanup_alive = reader.is_alive()
+            evidence.set_reader_state(
+                finished=bool(trigger_state.get("reader_finished")),
+                alive_after_main_join=main_alive,
+                alive_after_cleanup_join=cleanup_alive,
+                daemon=bool(reader.daemon),
+                error_class=trigger_state.get("reader_error_class"),
+            )
+            if main_alive or cleanup_alive:
+                evidence.mark_cleanup_unresolved("reader_timeout")
         evidence.cleanup(cleanup_error)
         evidence.finish_phase("transfer_cleanup")
         if isinstance(primary, revocation_failure.SafeFailure):
