@@ -2,7 +2,7 @@
 
 > 状态：**目标设计（Proposed），未激活**。本文定义全新安装的状态服务边界和接口，不改变当前默认运行时；当前默认仍是原生 GitFS refs/objects 权威，加可选 legacy Pando 过渡。
 >
-> 本分支基于未合并 PR142 final `49f09c2`。按 [roots/decisions 记录](../ref-store-roots-decisions.md) 与 [PR142 证据](../../evidence/state-services/roots-decisions144/README.md)，PR142 只交付**已测试、未服务**的库级 roots/decisions/accepted-subset；没有 HTTP 路由、服务激活、Raft/Redis、GC 消费者、加密或 Blob 字节备份资格。
+> 历史库级基线是未合并 PR142 final `49f09c2`。按 [roots/decisions 记录](../ref-store-roots-decisions.md) 与 [PR142 证据](../../evidence/state-services/roots-decisions144/README.md)，PR142 只交付**已测试、当时未服务**的库级 roots/decisions/accepted-subset；当时没有 HTTP 路由、服务激活、Raft/Redis、GC 消费者、加密或 Blob 字节备份资格。该历史基线不等于当前代码：当前有显式 `rootyard serve-blob`（`src/main.rs` → `src/standalone.rs`），以 PG `PgRefStore` 和远程 OpenDAL Blob 提供 Smart HTTP `git-receive-pack`/PG `CommitRefs`、`GetOperation` 路由及内部 `CheckVersion`/取消边界；它仍是候选入口，默认 `rootyard serve` 仍是 legacy GitFS/Pando。当前模式/拒绝边界见 [state-services/README.md](state-services/README.md)。
 >
 > 软件从未发布。本文只覆盖 fresh install，不设计 legacy schema/backup 升级、GitFS/Pando 导入、旧版本兼容、双写或旧数据回退。规范性摘要见 [ADR](../architecture.md)，图见 [目标架构图](architecture-diagrams.md)，执行拆分见 Root 维护的 [实施计划](implementation-plan.md)。
 >
@@ -57,7 +57,7 @@
 
 ## 4. 接口契约
 
-以下签名是设计契约，不表示全部已有实现。已有库级接口的状态按 [PR142 证据](../../evidence/state-services/roots-decisions144/README.md)、[core CAS](../ref-store-core-cas.md)、[materialized reads](../ref-store-materialized-reads.md) 与 [OpenDAL Blob](../opendal-blob.md) 的记录理解；没有 serving 路由。
+以下签名是设计契约，不表示全部已实现或已服务。历史库级增量的状态按 [PR142 证据](../../evidence/state-services/roots-decisions144/README.md)、[core CAS](../ref-store-core-cas.md)、[operation identity](../ref-store-operation-identity.md)、[materialized reads](../ref-store-materialized-reads.md)、[roots/decisions](../ref-store-roots-decisions.md) 与 [OpenDAL Blob](../opendal-blob.md) 的记录理解。当前显式 `serve-blob` 已把 `POST /git/{owner}/{name}/git-receive-pack` 接到 PG `CommitRefs`，并提供 `GET /api/repos/{owner}/{name}/operations/{operation}`（`GetOperation`）及内部 `CheckVersion`/取消边界；没有独立 REST `CheckVersion` 路由。distributed 契约、服务激活与其余未来签名仍以本节为准。
 
 ### 4.1 Ref 权威
 
@@ -79,14 +79,14 @@ trait RefAuthority {
 
 复制命令只包含 tenant/repo、authority/history/group epoch、原 operation identity/digest、已认证安装的 grant/selection/proof 摘要、精确 CAS/HEAD 更新和有界元数据。Raft 状态机校验自己持久化的单调关闭 floor、grant 及保留状态；请求字段不能替代这些权威记录。事件 cursor 绑定 history/group/log index，leader term 不是业务 authority epoch。
 
-当前 `PgRefStore`/`PgRefStoreCore` 与 PR142 facades 只覆盖未接服务的 PG 参考实现；其 `provisioning/gitfs` bootstrap 限制必须由全新仓库 provisioning 任务替换，不能直接对正常 `ready` 仓库启用测试 gate。当前没有 Raft 依赖，OpenRaft/raft-rs 需要选型验收。
+当前 `PgRefStore`/`PgRefStoreCore` 已服务显式 `serve-blob`，同时保留历史 `provisioning/gitfs` bootstrap 限制：该限制必须由全新仓库 provisioning 任务替换，不能直接对正常 `ready` 仓库启用测试 gate。`serve-blob` 是 PG+Blob 候选服务，不是默认入口；OpenRaft 依赖只存在于隔离实验 crate `crates/refcas-log`，不在根 `Cargo.toml` 依赖或运行时中；[#175](https://github.com/jihuayu/rootyard/issues/175) 的完整服务资格仍未完成，不能视为生产就绪或分布式 Ref-CAS 已激活。
 
 ### 4.2 发布协调器
 
-已有库级接口（未服务）：
+已存在的库级接口；PR142 历史记录为未服务。当前 `serve-blob` 发布路径已调用 prepare/select/verify/commit；`cancel` 仍是内部边界：
 
 ```rust
-// 已存在的 staged API（PR142 记录为未服务）
+// PR142 历史记录为未服务；当前 serve-blob 调用 prepare/select/verify/commit，cancel 为内部边界
 PgAuthorizedCommit::prepare(pool, plan, deadline) -> PrepareOutcome
 PgAuthorizedCommit::select(...) -> AuthorizedSelection
 PgAuthorizedCommit::verify(...) -> VerifiedAuthorizedPublication
@@ -118,7 +118,7 @@ BlobStore::verify(BlobLocator, expected_digest, expected_len, deadline) -> BlobR
 
 以下 `PgRetentionRoots` 是已存在的 PG 实现；分布式必须在 Ref-CAS 提供同等捕获、pin、登记、释放及配额语义，不能只调用 PG 账本。跨仓物理 artifact hold 仍由全局 PG 账本保护。
 
-已有库级接口（未服务）：
+`PgRetentionRoots` 仍是没有独立 serving 路由的库级接口（当前 `serve-blob` 读取走 `PgServingReads`，发布走 `PgAuthorizedCommit`）：
 
 ```rust
 PgRetentionRoots::prepare(pin, selector, deadline) -> RootCandidate
@@ -229,12 +229,14 @@ atomic 全成全败；accepted-subset 按原请求顺序固定每 ref verdict �
 | 阶段 | 内容 | 当前状态 |
 | --- | --- | --- |
 | A. 设计 | 本 ADR、图、第 12 章、fresh-install 边界 | 本 PR 的文档变更；无运行时变更 |
-| B. 库级基础 | PR142 roots/decisions/accepted-subset；PG/S3/Git 库测试 | 已测试但**未服务**；无 HTTP 路由/激活 |
-| C. standalone 激活 | PG `PgRefStore` 作为持久 ref 权威、PG decision、MemoryCache/Wake、内置 worker、OpenDAL Blob | 未实现；需 cutover/activation API、真实 provider 和故障注入 |
-| D. distributed Ref-CAS | Raft 库选型、Ref-CAS、Redis、投影 cursor、独立 worker | 未实现；openraft vs raft-rs 是实测任务 |
+| B. 库级基础 | 历史 PR142 roots/decisions/accepted-subset；PG/S3/Git 库测试 | 历史基线：当时已测试但**未服务**；HTTP/服务由后续显式 `serve-blob` 候选提供，不等于默认激活 |
+| C. standalone 激活 | PG `PgRefStore` 作为持久 ref 权威、PG decision、MemoryCache/Wake、内置 worker、OpenDAL Blob | **部分实现（显式候选）**：`serve-blob` 已提供 PG RefStore + OpenDAL Blob 的 Smart HTTP/browse/format22 路径；默认入口切换、全业务 producer、LFS/PR/Workspace/CI 与最终验收未完成 |
+| D. distributed Ref-CAS | Raft 库选型、Ref-CAS、Redis、投影 cursor、独立 worker | 未实现；`crates/refcas-log` 有 OpenRaft 0.9.26 隔离原型/日志切片，不在根构建；[#175](https://github.com/jihuayu/rootyard/issues/175) 完整服务资格未完成，非生产就绪 |
 | E. 保留/GC | root/hold/backup 屏障、GC planner、物理删除、quarantine | 未实现；当前 Blob delete 禁用 |
 | F. fresh restore | PG+Raft+Blob 协调备份、隔离恢复、投影重建、fsck | 未实现；无 RPO/RTO 声明 |
 | G. 运维/HA | 监控、限流、备份演练、业务 PG HA 选择 | 未实现；Patroni 等不改变 ref 权威 |
+
+原始 #107 仍保持 OPEN；本表只记录能力拆分，不把历史 PR142 库级验收或候选 `serve-blob` 能力合并为最终关闭。固定 Native11/HTTP13 候选结果绑定较早源码，不延伸到当前最终 head。
 
 ## 12. 未决问题
 
