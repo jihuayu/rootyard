@@ -18,6 +18,53 @@ from backup import BackupHarness
 from web_sessions import BrowserHarness
 
 
+def resolve_pull_head_after_push(
+    fetch_pull,
+    patch_pull,
+    *,
+    expected_version,
+    base_oid,
+    old_head_oid,
+    new_head_oid,
+):
+    """Resolve a pull head update after a branch push with bounded ref-sync reads.
+
+    The background ref reconciler can commit before or after the fresh GET and
+    can also win the race with the explicit PATCH. Accept only two exact
+    outcomes: the reconciler already recorded ``new_head_oid`` at exactly
+    ``expected_version + 1``, or the PATCH records it at that version. A 409
+    permits exactly one readback, and only for that same exact snapshot.
+    """
+    def assert_snapshot(pull, *, head, version, context):
+        assert isinstance(pull, dict), f"{context}: expected JSON object, got {pull!r}"
+        assert pull.get("head_oid") == head, f"{context}: expected head {head}, got {pull.get('head_oid')!r}"
+        assert pull.get("base_oid") == base_oid, f"{context}: expected base {base_oid}, got {pull.get('base_oid')!r}"
+        assert pull.get("state") == "open", f"{context}: expected open state, got {pull.get('state')!r}"
+        assert pull.get("version") == version, f"{context}: expected version {version}, got {pull.get('version')!r}"
+
+    status, pull = fetch_pull()
+    assert status == 200, f"GET pull after push: expected 200, got {status}: {pull!r}"
+    if pull.get("head_oid") == new_head_oid:
+        assert_snapshot(
+            pull,
+            head=new_head_oid,
+            version=expected_version + 1,
+            context="GET pull after push (ref sync already recorded)",
+        )
+        return "refsync"
+
+    assert_snapshot(pull, head=old_head_oid, version=expected_version, context="GET pull after push")
+    status, pull = patch_pull(expected_version)
+    if status == 200:
+        assert_snapshot(pull, head=new_head_oid, version=expected_version + 1, context="PATCH pull")
+        return "patched"
+    assert status == 409, f"PATCH pull: expected 200 or 409, got {status}: {pull!r}"
+    status, pull = fetch_pull()
+    assert status == 200, f"GET pull after 409: expected 200, got {status}: {pull!r}"
+    assert_snapshot(pull, head=new_head_oid, version=expected_version + 1, context="GET pull after 409")
+    return "readback"
+
+
 class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
     def prepare_fixtures(self):
         self.cli("migrate")
@@ -391,12 +438,26 @@ class ForgeCollaborationHarness(BackupHarness, BrowserHarness):
         self.git("push", "origin", "HEAD:refs/heads/feat", cwd=work, token=self.alice)
         head_v2 = self.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
 
-        self.expect(
-            "/api/repos/alice/demo/pulls/1",
-            200,
-            token=self.alice,
-            method="PATCH",
-            body={"expected_version": pr["version"], "head_oid": head_v2},
+        def fetch_pull():
+            status, body, _ = self.http("/api/repos/alice/demo/pulls/1", token=self.alice)
+            return status, json.loads(body) if status == 200 else body[:300]
+
+        def patch_pull(expected_version):
+            status, body, _ = self.http(
+                "/api/repos/alice/demo/pulls/1",
+                token=self.alice,
+                method="PATCH",
+                body={"expected_version": expected_version, "head_oid": head_v2},
+            )
+            return status, json.loads(body) if status == 200 else body[:300]
+
+        resolve_pull_head_after_push(
+            fetch_pull,
+            patch_pull,
+            expected_version=pr["version"],
+            base_oid=base_oid,
+            old_head_oid=head_v1,
+            new_head_oid=head_v2,
         )
         revs = json.loads(self.expect("/api/repos/alice/demo/pulls/1/reviews", 200, token=self.alice))
         assert any(r["number"] == rev1["number"] and r["outdated"] is True for r in revs["items"])
