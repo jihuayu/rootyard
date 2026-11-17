@@ -427,7 +427,7 @@ mod tests {
             BackupArtifactEntry {
                 kind: "git_bundle".into(),
                 key_digest: zero_sha,
-                sha256: hex::encode(Sha256::digest(gb_bytes)),
+                sha256: hex::encode(Sha256::digest(&gb_bytes)),
                 length: gb_bytes.len() as u64,
                 payload_base64: STANDARD.encode(gb_bytes),
             },
