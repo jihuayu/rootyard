@@ -103,7 +103,7 @@ fn select_current_checkpoint(
     };
     let latest: Vec<_> = completed.iter().filter(|cp| cp.write_epoch == max_epoch).collect();
     ensure!(latest.len() == 1, "ambiguous completed Pando rotation write epoch");
-    Ok(Some(latest[0].clone()))
+    Ok(Some((**latest[0]).clone()))
 }
 
 pub(super) async fn load_db_checkpoint(c: &Client, repo: Uuid) -> Result<Option<KmsRotationCheckpoint>> {
