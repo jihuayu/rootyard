@@ -332,6 +332,8 @@ fn three_state_retention_rejects_ttl_cache_and_async_projection_deletes() {
     assert!(!c_missing_auth.gc_eligible && !c_missing_auth.plannable_for_fetch);
     ret.set_authority_snapshot(0, false, [cover_id]);
     assert!(!ret.classify_pack(pack_id, cover_id, &[v1.version_id()]).gc_eligible);
+    ret.set_authority_snapshot(1, true, []);
+    assert!(!ret.classify_pack(pack_id, cover_id, &[v1.version_id()]).gc_eligible);
 
     // Complete authoritative snapshot + explicit retirement + no protectors -> gc_eligible, owned by #122/#151/#153.
     ret.set_authority_snapshot(1, true, [cover_id]);

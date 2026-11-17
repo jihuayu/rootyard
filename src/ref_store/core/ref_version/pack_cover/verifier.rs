@@ -30,6 +30,11 @@ const PLAN_PROOF_DOMAIN: &[u8] = b"ry-pack-cover-plan-proof-v1";
 ///
 /// Private fields, neither `Clone` nor `Deserialize`, ensuring no caller or cache
 /// metadata can fabricate verification.
+/// Unforgeable proof of closure for a single verified fetch plan (`no Clone`, `no Deserialize`).
+///
+/// Proves closure strictly against its verification context, NOT live serving authorization.
+/// Never treat a retained proof as current serving authority; `materialize_and_verify_fetch_plan`
+/// re-validates a live [`AuthorizationContext`] via `binds_live_auth` before reading any blob.
 #[derive(Debug, Eq, PartialEq)]
 pub struct VerifiedFetchPlanProof {
     proof_digest: [u8; 32],

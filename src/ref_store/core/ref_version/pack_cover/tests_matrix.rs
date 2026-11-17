@@ -1,6 +1,6 @@
 //! Matrix tests for causal planner selection, authorization boundaries, fallback, and tamper refusal.
 use super::super::closure::{CausalVersionNode, VersionGraph};
-use super::super::contract::RefVersionRealm;
+use super::super::contract::{AuthorityKind, RefVersionRealm};
 use super::super::pack_set::VerifiedClosurePack;
 use super::super::read_mode::ReadConsumer;
 use super::super::record::{RefHead, VersionRecord};
@@ -281,7 +281,7 @@ fn planner_verifier_auth_isolation_and_fallback_matrix() {
     ));
 
     let mut wrong_realm_heads = heads.clone();
-    let other_r = realm(GitObjectFormat::Sha1);
+    let other_r = RefVersionRealm::new(uid(91), uid(92), uid(93), AuthorityKind::Pg, 1, 0, 1, GitObjectFormat::Sha1);
     let (p_other, _) = make_pack(&other_r, 11, 50_000, 1000, false, vec![]);
     let (v_other, _) =
         mint_version(&other_r, "refs/heads/main", 1, None, oid(GitObjectFormat::Sha1, 1), p_other, vec![]);

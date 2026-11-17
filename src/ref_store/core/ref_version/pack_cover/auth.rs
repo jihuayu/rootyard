@@ -187,6 +187,17 @@ pub struct StrongSnapshotCut {
     pub heads: BTreeMap<RefName, RefHead>,
 }
 
+impl StrongSnapshotCut {
+    /// Validate snapshot cut sequence, membership digest, realm consistency, and `key == head.ref_name()`.
+    pub fn validate(
+        &self,
+        realm: &RefVersionRealm,
+        expected_membership: CoverMembershipDigest,
+    ) -> Result<(), FetchPlanError> {
+        validate_strong_cut(self, realm, expected_membership)
+    }
+}
+
 /// Explicitly labeled fallback to full verified strong-snapshot materialization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StrongSnapshotFallback {
