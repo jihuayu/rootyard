@@ -116,6 +116,11 @@ class _NoopThread:
         return False
 
 
+class _AliveThread(_NoopThread):
+    def is_alive(self):
+        return True
+
+
 class TransportOrderingTests(unittest.TestCase):
     def test_operation_failure_survives_cleanup_failure_through_wrapper(self):
         with mock.patch.object(
@@ -164,6 +169,36 @@ class TransportOrderingTests(unittest.TestCase):
         self.assertTrue(
             snapshot["pre_trigger"]["backpressure"]["source_witness"]["qualified"])
         self.assertIsNone(snapshot["final_proof"])
+        self.assertIsNone(snapshot["reader"]["alive_after_main_join"])
+        self.assertFalse(snapshot["reader"]["alive_after_cleanup_join"])
+        self.assertEqual(snapshot["cleanup"]["state"], "passed")
+        self.assertNotIn("secret", json.dumps(snapshot))
+
+    def test_unobserved_main_join_keeps_live_cleanup_unresolved(self):
+        def fail_trigger():
+            raise RuntimeError("secret trigger text /tmp/path")
+
+        with mock.patch.object(
+            transport, "SmallBufferHTTPConnection", _TriggerConnection,
+        ), mock.patch.object(
+            transport, "BackpressureProbe", _TriggerProbe,
+        ), mock.patch.object(
+            transport.threading, "Thread", _AliveThread,
+        ):
+            with self.assertRaises(failure.SafeFailure) as caught:
+                transport.run_timed_transfer(
+                    base="http://127.0.0.1:1", path="/x", method="GET",
+                    headers={}, body=None, expected_size=4, initial_bytes=1,
+                    framing="content_length", service_pid=None, bound_ms=1200,
+                    trigger=fail_trigger, require_group=False,
+                    require_backpressure=True,
+                )
+        snapshot = caught.exception.partial
+        self.assertEqual(snapshot["primary_failure_phase"], "trigger_commit")
+        self.assertIsNone(snapshot["reader"]["alive_after_main_join"])
+        self.assertTrue(snapshot["reader"]["alive_after_cleanup_join"])
+        self.assertEqual(snapshot["cleanup"]["state"], "unresolved")
+        self.assertEqual(snapshot["cleanup"]["exception_class"], "reader_timeout")
         self.assertNotIn("secret", json.dumps(snapshot))
 
 

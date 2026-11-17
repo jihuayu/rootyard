@@ -220,6 +220,22 @@ class ReaderEvidenceTests(unittest.TestCase):
         self.assertEqual(snapshot["exception_class"], "value_error")
         self.assertIsNone(snapshot["final_proof"])
 
+    def test_reader_observed_false_main_join_is_truthful(self):
+        evidence = failure.FailureEvidence(subcase="pat_revoked")
+        evidence.start()
+        stop = failure.reader_stop_or_fail(
+            evidence,
+            {"reader_finished": True,
+             "stop": timing.StopObservation(timing.StopKind.INCOMPLETE_READ, 5, 1)},
+            timed_out=False, received=1, now_ns=6,
+            lower_ns=1, resume_ns=2,
+        )
+        snapshot = evidence.snapshot()
+        self.assertEqual(stop.kind, timing.StopKind.INCOMPLETE_READ)
+        self.assertIs(snapshot["reader"]["alive_after_main_join"], False)
+        evidence.cleanup(None)
+        self.assertEqual(evidence.snapshot()["cleanup"]["state"], "passed")
+
     def test_reader_timeout_is_unproven_not_a_pass(self):
         evidence = failure.FailureEvidence(subcase="pat_revoked")
         evidence.start()

@@ -461,7 +461,8 @@ def _run_timed_transfer_impl(
                     revocation_failure.safe_error_class(error),
                 )
         if reader is not None:
-            main_alive = bool(trigger_state.get("reader_alive_after_main_join"))
+            observed_main_alive = trigger_state.get("reader_alive_after_main_join")
+            main_alive = observed_main_alive if type(observed_main_alive) is bool else None
             cleanup_alive = reader.is_alive()
             evidence.set_reader_state(
                 finished=bool(trigger_state.get("reader_finished")),
@@ -470,7 +471,7 @@ def _run_timed_transfer_impl(
                 daemon=bool(reader.daemon),
                 error_class=trigger_state.get("reader_error_class"),
             )
-            if main_alive or cleanup_alive:
+            if main_alive is True or cleanup_alive:
                 evidence.mark_cleanup_unresolved("reader_timeout")
         evidence.cleanup(cleanup_error)
         evidence.finish_phase("transfer_cleanup")
