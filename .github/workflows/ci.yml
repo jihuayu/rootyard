@@ -381,8 +381,10 @@ jobs:
             --require-case pando_vault=wrong_key_ciphertext_envelope_and_provider_revocation_fail_closed \
             --require-case pando_vault=owned_resource_cleanup \
             --harness tests/pando_vault_rotation.py \
+            --harness tests/pando_vault_rotation_budget.py \
             --harness tests/pando_vault_rotation_cases.py \
             --harness tests/pando_vault_rotation_ci_report.py \
+            --harness tests/pando_vault_rotation_command.py \
             --harness tests/pando_vault_rotation_context.py \
             --harness tests/pando_vault_rotation_fixture.py \
             --harness tests/pando_vault_rotation_fixture_resources.py \
@@ -392,6 +394,7 @@ jobs:
             --harness tests/pando_vault_rotation_service.py \
             --harness tests/pando_vault_rotation_support.py \
             --harness tests/test_pando_vault_rotation_binding_failure.py \
+            --harness tests/test_pando_vault_rotation_budget.py \
             --harness tests/test_pando_vault_rotation_ci_report.py \
             --harness tests/test_pando_vault_rotation_ci_report_duplicates.py \
             --harness tests/test_pando_vault_rotation_db_tamper_oracle.py \
