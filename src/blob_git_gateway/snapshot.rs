@@ -24,6 +24,7 @@ use crate::ref_store::{
         MetadataSnapshotScope, PgPackSnapshotMaterializer,
         pack_commit::{PackCommitBaseline, PgPackCommit},
         pack_snapshot::{MaterializedPackRead, MaterializedServingRead, PgServingReads, ServingReadCapture},
+        retention_root::{RootError, RootReadView, RootSelectorKind},
     },
     serving::ServingRepository,
 };
@@ -86,6 +87,116 @@ impl ComputedView {
     pub(super) fn read(&self) -> Option<&MaterializedServingRead> {
         self.read.as_ref()
     }
+}
+
+/// A computed Git view over an already-authorized opaque retained read. It
+/// carries no serving proof/session authority; the caller must still hold the
+/// retained context through its post-encoding final fence.
+pub(super) struct RetainedComputedView {
+    git: TempGitView,
+    _workspace: super::state::WorkspaceLease,
+}
+
+impl std::ops::Deref for RetainedComputedView {
+    type Target = TempGitView;
+
+    fn deref(&self) -> &Self::Target {
+        &self.git
+    }
+}
+
+impl RetainedComputedView {
+    /// Drop the now-unused Git executable view but keep its workspace charge
+    /// alive for the response body's last user.
+    pub(super) fn into_workspace(self) -> super::state::WorkspaceLease {
+        self._workspace
+    }
+}
+
+/// Synthetic non-branch namespace installed for explicit-OID roots. The
+/// original captured refs and HEAD are deliberately absent on this path.
+pub(super) const RETAINED_ROOT_OID_REF_PREFIX: &str = "refs/roots/oid/";
+/// Unborn private HEAD for every explicit-OID root. It is intentionally not one
+/// of the installed refs, so default HEAD cannot invent a selected object.
+pub(super) const RETAINED_ROOT_UNBORN_HEAD: &str = "refs/heads/rootyard-retained-unborn";
+
+/// Refs installed into the private Git view for one retained root. Snapshot
+/// roots use their stored captured refs exactly; explicit-OID roots install
+/// only the server-derived synthetic refs for the retained selected object ids.
+pub(super) fn retained_root_refs(view: &RootReadView) -> Vec<(String, String)> {
+    match view.selector_kind() {
+        RootSelectorKind::Snapshot => {
+            view.refs().iter().map(|reference| (reference.name().to_owned(), reference.oid_hex().to_owned())).collect()
+        }
+        RootSelectorKind::Oids => view
+            .root_oids()
+            .iter()
+            .map(|oid| {
+                let mut name = String::from(RETAINED_ROOT_OID_REF_PREFIX);
+                name.push_str(oid);
+                (name, oid.clone())
+            })
+            .collect(),
+    }
+}
+
+/// HEAD ref and optional exact HEAD object for one retained root. Explicit-OID
+/// roots always use the private unborn HEAD; snapshot roots preserve HEAD.
+pub(super) fn retained_root_head(view: &RootReadView) -> (&str, Option<&str>) {
+    match view.selector_kind() {
+        RootSelectorKind::Snapshot => (view.head_ref(), view.head_oid_hex()),
+        RootSelectorKind::Oids => (RETAINED_ROOT_UNBORN_HEAD, None),
+    }
+}
+
+/// Compose the private Git view for an authorized retained root from its exact
+/// verified local pack/index bytes. Snapshot roots reproduce their captured refs
+/// and HEAD; explicit-OID roots install only synthetic selected-OID refs and an
+/// unborn HEAD. Ref/HEAD readback is checked before Browse consumes the view.
+pub(super) async fn build_retained_root_view(
+    state: &BlobGitState,
+    view: &RootReadView,
+    deadline: tokio::time::Instant,
+) -> Result<RetainedComputedView, GatewayError> {
+    let pack_bytes = super::resource::registered_packs_workspace_bytes(view.packs());
+    let bytes = pack_bytes
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(state.limits().max_request_bytes.checked_mul(2)?))
+        .ok_or(GatewayError::TooLarge)?;
+    let workspace = state.reserve_workspace(bytes)?;
+    let git = TempGitView::create(state, view.object_format(), deadline).await?;
+    copy_root_packs(&git, view, deadline).await?;
+    let refs = retained_root_refs(view);
+    let (head_ref, head_oid) = retained_root_head(view);
+    write_refs(git.repo(), &refs, head_ref)?;
+    verify_refs_exact(state, &git, &refs, head_ref, head_oid, deadline).await?;
+    Ok(RetainedComputedView { git, _workspace: workspace })
+}
+
+/// Compose the private Git view for an authorized retained read from its exact
+/// verified local pack/index bytes. Ref/HEAD readback is checked before the
+/// view is consumed by Browse.
+pub(super) async fn build_retained_view(
+    state: &BlobGitState,
+    read: &MaterializedPackRead,
+    deadline: tokio::time::Instant,
+) -> Result<RetainedComputedView, GatewayError> {
+    let pack_bytes = super::resource::registered_packs_workspace_bytes(read.packs());
+    let bytes = pack_bytes
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(state.limits().max_request_bytes.checked_mul(2)?))
+        .ok_or(GatewayError::TooLarge)?;
+    let workspace = state.reserve_workspace(bytes)?;
+    let git = TempGitView::create(state, read.scope().object_format(), deadline).await?;
+    copy_materialized_packs(&git, read, read.scope().object_format(), deadline).await?;
+    let refs = read
+        .refs()
+        .iter()
+        .map(|reference| (reference.name().to_owned(), reference.oid_hex().to_owned()))
+        .collect::<Vec<_>>();
+    write_refs(git.repo(), &refs, read.head_ref())?;
+    verify_refs_exact(state, &git, &refs, read.head_ref(), read.head_oid_hex(), deadline).await?;
+    Ok(RetainedComputedView { git, _workspace: workspace })
 }
 
 /// Capture the complete ref/membership view of the current gate.
@@ -262,6 +373,20 @@ async fn build_into(
     if materialized_refs != view.refs {
         return Err(GatewayError::Internal("materialized ref set differs from the sealed snapshot"));
     }
+    copy_materialized_packs(git, read, view.format, deadline).await?;
+    write_refs(git.repo(), &view.refs, &view.head_ref)?;
+    Ok(sealed)
+}
+
+/// Copy the exact verified local pack/index bytes of one materialized read into
+/// the private Git view. The checksum-pair and canonical pack naming checks are
+/// shared by the transient and retained paths.
+async fn copy_materialized_packs(
+    git: &TempGitView,
+    read: &MaterializedPackRead,
+    format: GitObjectFormat,
+    deadline: tokio::time::Instant,
+) -> Result<(), GatewayError> {
     let pack_dir = git.repo().join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir)
         .map_err(|_| GatewayError::Internal("could not create the temporary pack directory"))?;
@@ -269,30 +394,66 @@ async fn build_into(
         let pack_id = pack.pack_id();
         let pack_bytes = read.pack_bytes(pack_id, deadline).await.map_err(materialize_error)?;
         let idx_bytes = read.idx_bytes(pack_id, deadline).await.map_err(materialize_error)?;
-        // The membership UUID is not a Git pack filename. The materializer
-        // already verified these exact bytes and the pack/index checksum pair;
-        // use their object-format-sized pack checksum as Git's canonical stem.
-        let hash_bytes = match view.format {
-            GitObjectFormat::Sha1 => 20,
-            GitObjectFormat::Sha256 => 32,
-        };
-        let trailer = pack_bytes
-            .get(pack_bytes.len().saturating_sub(hash_bytes)..)
-            .filter(|bytes| bytes.len() == hash_bytes)
-            .ok_or(GatewayError::Internal("verified pack has no checksum trailer"))?;
-        let index_pack_checksum =
-            idx_bytes.get(idx_bytes.len().saturating_sub(2 * hash_bytes)..idx_bytes.len().saturating_sub(hash_bytes));
-        if index_pack_checksum != Some(trailer) {
-            return Err(GatewayError::Internal("verified index and pack checksum disagree"));
-        }
-        let stem = format!("pack-{}", hex::encode(trailer));
-        std::fs::write(pack_dir.join(format!("{stem}.pack")), pack_bytes)
-            .map_err(|_| GatewayError::Internal("could not stage a verified pack"))?;
-        std::fs::write(pack_dir.join(format!("{stem}.idx")), idx_bytes)
-            .map_err(|_| GatewayError::Internal("could not stage a verified index"))?;
+        stage_pack_pair(git, format, &pack_bytes, &idx_bytes)?;
     }
-    write_refs(git.repo(), &view.refs, &view.head_ref)?;
-    Ok(sealed)
+    Ok(())
+}
+
+/// Copy the exact verified local pack/index bytes of one retained root.
+async fn copy_root_packs(
+    git: &TempGitView,
+    view: &RootReadView,
+    deadline: tokio::time::Instant,
+) -> Result<(), GatewayError> {
+    let pack_dir = git.repo().join("objects").join("pack");
+    std::fs::create_dir_all(&pack_dir)
+        .map_err(|_| GatewayError::Internal("could not create the temporary pack directory"))?;
+    let format = view.object_format();
+    for pack in view.packs() {
+        let pack_id = pack.pack_id();
+        let pack_bytes = view.pack_bytes(pack_id, deadline).await.map_err(root_pack_error)?;
+        let idx_bytes = view.idx_bytes(pack_id, deadline).await.map_err(root_pack_error)?;
+        stage_pack_pair(git, format, &pack_bytes, &idx_bytes)?;
+    }
+    Ok(())
+}
+
+/// Write one already-verified pack/index pair under Git's canonical checksum
+/// stem. The membership UUID is not a Git filename; the object-format-sized
+/// pack trailer must equal the index's embedded pack checksum.
+fn stage_pack_pair(
+    git: &TempGitView,
+    format: GitObjectFormat,
+    pack_bytes: &[u8],
+    idx_bytes: &[u8],
+) -> Result<(), GatewayError> {
+    let pack_dir = git.repo().join("objects").join("pack");
+    let hash_bytes = match format {
+        GitObjectFormat::Sha1 => 20,
+        GitObjectFormat::Sha256 => 32,
+    };
+    let trailer = pack_bytes
+        .get(pack_bytes.len().saturating_sub(hash_bytes)..)
+        .filter(|bytes| bytes.len() == hash_bytes)
+        .ok_or(GatewayError::Internal("verified pack has no checksum trailer"))?;
+    let index_pack_checksum =
+        idx_bytes.get(idx_bytes.len().saturating_sub(2 * hash_bytes)..idx_bytes.len().saturating_sub(hash_bytes));
+    if index_pack_checksum != Some(trailer) {
+        return Err(GatewayError::Internal("verified index and pack checksum disagree"));
+    }
+    let stem = format!("pack-{}", hex::encode(trailer));
+    std::fs::write(pack_dir.join(format!("{stem}.pack")), pack_bytes)
+        .map_err(|_| GatewayError::Internal("could not stage a verified pack"))?;
+    std::fs::write(pack_dir.join(format!("{stem}.idx")), idx_bytes)
+        .map_err(|_| GatewayError::Internal("could not stage a verified index"))?;
+    Ok(())
+}
+
+fn root_pack_error(error: RootError) -> GatewayError {
+    match error {
+        RootError::Store(RefStoreError::Timeout) => GatewayError::Timeout,
+        _ => GatewayError::Internal("retained root pack could not be read"),
+    }
 }
 
 /// Release the transient read pin of a view that was not materialized (for
@@ -340,6 +501,17 @@ async fn verify_refs(
     view: &RefView,
     deadline: tokio::time::Instant,
 ) -> Result<(), GatewayError> {
+    verify_refs_exact(state, git, &view.refs, &view.head_ref, view.head_oid.as_deref(), deadline).await
+}
+
+async fn verify_refs_exact(
+    state: &BlobGitState,
+    git: &TempGitView,
+    refs: &[(String, String)],
+    head_ref: &str,
+    head_oid: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<(), GatewayError> {
     let mut command = git.command(state.git_binary());
     command.arg("for-each-ref").arg("--format=%(objectname) %(refname)");
     let captured = run_capture(command, None, 4 * 1024 * 1024, deadline).await?;
@@ -356,7 +528,7 @@ async fn verify_refs(
             None => Err(GatewayError::Internal("temporary Git ref line is malformed")),
         })
         .collect::<Result<Vec<_>, GatewayError>>()?;
-    let mut expected = view.refs.clone();
+    let mut expected = refs.to_vec();
     observed.sort();
     expected.sort();
     if observed != expected {
@@ -366,15 +538,21 @@ async fn verify_refs(
     if !expected.iter().all(|(name, _)| names.insert(name.clone())) {
         return Err(GatewayError::Internal("sealed ref set contains a duplicate name"));
     }
-    if let Some(head_oid) = &view.head_oid {
+    if let Some(head_oid) = head_oid {
         let mut command = git.command(state.git_binary());
-        command.arg("rev-parse").arg("--verify").arg(&view.head_ref);
+        command.arg("rev-parse").arg("--verify").arg(head_ref);
         let captured = run_capture(command, None, 1024, deadline).await?;
         let observed = std::str::from_utf8(&captured.stdout)
             .map_err(|_| GatewayError::Internal("temporary HEAD is not UTF-8"))?
             .trim();
         if !captured.success || observed != head_oid {
             return Err(GatewayError::Internal("temporary Git view does not reproduce the sealed HEAD"));
+        }
+    } else {
+        let observed = std::fs::read_to_string(git.repo().join("HEAD"))
+            .map_err(|_| GatewayError::Internal("temporary HEAD could not be read"))?;
+        if observed != format!("ref: {head_ref}\n") {
+            return Err(GatewayError::Internal("temporary Git view does not reproduce the unborn HEAD"));
         }
     }
     Ok(())

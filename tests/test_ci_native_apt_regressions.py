@@ -4,7 +4,8 @@
 Each case sources lib.sh in bash with a fixture PATH that holds only links to
 routine host commands plus Python stand-ins for `apt-get`/`sudo`, which append
 one JSON record per call to $FAKE_LOG. No real apt, sudo, /etc or network is
-ever reachable.
+ever reachable. The PGDG key cases separately use Python stand-ins for
+curl/gpg and a fake sleep, so no real download or keyring write is possible.
 """
 from __future__ import annotations
 
@@ -20,7 +21,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "scripts/ci_native_tools/lib.sh"
-HOST = ("bash", "cat", "env", "mkdir", "find", "sort", "id", "pwd", "dirname")
+HOST = ("bash", "cat", "env", "mkdir", "find", "sort", "id", "pwd", "dirname",
+        "awk", "mktemp", "mv", "rm")
+PGDG_URL = "https://www.postgresql.org/media/keys/ACCC4CF8.asc"
+PGDG_FINGERPRINT = "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8"
 
 SUDO = """#!{python}
 import json, os, sys
@@ -72,6 +76,83 @@ if command == "source":
         stream.write("fixture-acquired\\n")
 """
 
+CURL = """#!{python}
+import json, os, sys
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_LOG"], "a") as stream:
+    stream.write(json.dumps({{"kind": "curl", "args": args}}) + "\\n")
+
+
+def value(flag):
+    try:
+        return args[args.index(flag) + 1]
+    except (ValueError, IndexError):
+        raise SystemExit(64)
+
+
+# The helper must keep the exact reviewed flags and HTTPS endpoint. A missing
+# bound is a hard fixture failure, never a reason to fall through to real curl.
+if "-fsSL" not in args:
+    raise SystemExit(64)
+for forbidden in ("-k", "--insecure"):
+    if forbidden in args:
+        raise SystemExit(65)
+if value("--url") != "https://www.postgresql.org/media/keys/ACCC4CF8.asc":
+    raise SystemExit(64)
+if value("--connect-timeout") != "10":
+    raise SystemExit(64)
+try:
+    max_time = int(value("--max-time"))
+except ValueError:
+    raise SystemExit(64)
+if not 1 <= max_time <= 30:
+    raise SystemExit(64)
+out = value("-o")
+count_path = os.environ["FAKE_CURL_COUNT"]
+try:
+    count = int(open(count_path, encoding="utf-8").read())
+except FileNotFoundError:
+    count = 0
+count += 1
+with open(count_path, "w", encoding="utf-8") as stream:
+    stream.write(str(count))
+mode = os.environ.get("FAKE_CURL_MODE", "success")
+if mode == "permanent" or (mode == "transient" and count == 1):
+    with open(out, "w", encoding="utf-8") as stream:
+        stream.write("partial")
+    raise SystemExit(56)  # receive failure, like the hosted curl 56
+with open(out, "w", encoding="utf-8") as stream:
+    stream.write("fixture PGDG key\\n")
+"""
+
+GPG = """#!{python}
+import json, os, sys
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_LOG"], "a") as stream:
+    stream.write(json.dumps({{"kind": "gpg", "args": args}}) + "\\n")
+if args[:2] == ["--show-keys", "--with-colons"]:
+    print("pub:-:4096:1:0123456789ABCDEF:1:1:::::::scESC:::::::")
+    fingerprint = os.environ.get("FAKE_GPG_FPR", "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8")
+    print("fpr:::::::::" + fingerprint + ":")
+    raise SystemExit(0)
+raise SystemExit(92)  # dearmor/install must not happen in these cases
+"""
+
+SLEEP = """#!{python}
+import json, os, sys
+with open(os.environ["FAKE_LOG"], "a") as stream:
+    stream.write(json.dumps({{"kind": "sleep", "args": sys.argv[1:]}}) + "\\n")
+"""
+
+SUDO_LOG_REJECT = """#!{python}
+import json, os, sys
+with open(os.environ["FAKE_LOG"], "a") as stream:
+    stream.write(json.dumps({{"kind": "sudo", "args": sys.argv[1:]}}) + "\\n")
+raise SystemExit(93)
+"""
+
 
 class NativeAptRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -93,6 +174,18 @@ class NativeAptRegressionTest(unittest.TestCase):
 
     def _sudo(self, template: str = SUDO) -> None:
         self._script(self.bin / "sudo", template)
+
+    def _pgdg_fixtures(self, *, curl_mode: str = "success",
+                       fpr: str = PGDG_FINGERPRINT) -> dict[str, str]:
+        self._script(self.bin / "curl", CURL)
+        self._script(self.bin / "gpg", GPG)
+        self._script(self.bin / "sudo", SUDO_LOG_REJECT)
+        self._script(self.bin / "sleep", SLEEP)
+        return {
+            "FAKE_CURL_MODE": curl_mode,
+            "FAKE_CURL_COUNT": str(self.tmp / "curl-count"),
+            "FAKE_GPG_FPR": fpr,
+        }
 
     def _run(self, body: str, **env_extra: str) -> subprocess.CompletedProcess:
         result = subprocess.run(
@@ -201,6 +294,80 @@ class NativeAptRegressionTest(unittest.TestCase):
                 self.assertFalse(key == "APT::Acquire" or key.startswith("APT::Acquire::"), key)
                 self.assertTrue(key.startswith(("Acquire::http::", "Acquire::https::",
                                                 "Acquire::Retries")), key)
+
+
+    def test_pgdg_key_fetch_retries_transient_receive_error(self) -> None:
+        env = self._pgdg_fixtures(curl_mode="transient")
+        result = self._run(
+            """
+            download_pgdg_signing_key work work/pgdg.asc
+            : > reached
+            """,
+            **env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._calls("curl")
+        self.assertEqual(len(calls), 2, calls)
+        outputs = [argv[argv.index("-o") + 1] for argv in calls]
+        self.assertEqual(len(set(outputs)), 2, outputs)  # fresh file per attempt
+        for argv in calls:
+            self.assertIn("-fsSL", argv)
+            self.assertEqual(argv[argv.index("--url") + 1], PGDG_URL)
+            self.assertEqual(argv[argv.index("--connect-timeout") + 1], "10")
+            self.assertTrue(1 <= int(argv[argv.index("--max-time") + 1]) <= 30)
+        self.assertEqual(self._calls("sleep"), [["2"]])
+        gpg_calls = self._calls("gpg")
+        self.assertEqual(len(gpg_calls), 1, gpg_calls)
+        self.assertEqual(gpg_calls[0][:2], ["--show-keys", "--with-colons"])
+        self.assertEqual(self._calls("sudo"), [])
+        self.assertEqual((self.tmp / "work" / "pgdg.asc").read_text(encoding="utf-8"),
+                         "fixture PGDG key\n")
+        self.assertTrue((self.tmp / "reached").is_file())
+        self.assertEqual(list((self.tmp / "work").glob(".pgdg-key.*")), [])
+
+    def test_pgdg_key_fetch_terminal_failure_skips_gpg_and_sudo(self) -> None:
+        env = self._pgdg_fixtures(curl_mode="permanent")
+        result = self._run(
+            """
+            download_pgdg_signing_key work work/pgdg.asc
+            : > reached
+            """,
+            **env,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("after 3 attempts", result.stderr)
+        self.assertIn("curl exit 56", result.stderr)
+        calls = self._calls("curl")
+        self.assertEqual(len(calls), 3, calls)
+        outputs = [argv[argv.index("-o") + 1] for argv in calls]
+        self.assertEqual(len(set(outputs)), 3, outputs)
+        self.assertEqual(self._calls("sleep"), [["2"], ["2"]])
+        self.assertEqual(self._calls("gpg"), [])
+        self.assertEqual(self._calls("sudo"), [])
+        self.assertFalse((self.tmp / "work" / "pgdg.asc").exists())
+        self.assertFalse((self.tmp / "reached").exists())
+        self.assertEqual(list((self.tmp / "work").glob(".pgdg-key.*")), [])
+
+    def test_pgdg_key_fetch_does_not_retry_bad_fingerprint(self) -> None:
+        env = self._pgdg_fixtures(fpr="0" * 40)
+        result = self._run(
+            """
+            download_pgdg_signing_key work work/pgdg.asc
+            : > reached
+            """,
+            **env,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("fingerprint mismatch", result.stderr)
+        self.assertEqual(len(self._calls("curl")), 1)
+        self.assertEqual(self._calls("sleep"), [])
+        gpg_calls = self._calls("gpg")
+        self.assertEqual(len(gpg_calls), 1, gpg_calls)
+        self.assertEqual(gpg_calls[0][:2], ["--show-keys", "--with-colons"])
+        self.assertEqual(self._calls("sudo"), [])
+        self.assertFalse((self.tmp / "work" / "pgdg.asc").exists())
+        self.assertFalse((self.tmp / "reached").exists())
+        self.assertEqual(list((self.tmp / "work").glob(".pgdg-key.*")), [])
 
 
 if __name__ == "__main__":

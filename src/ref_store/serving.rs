@@ -22,12 +22,25 @@
 //!   row, a forged `storage_backend` string or a stored hex value is never
 //!   authority.
 //!
+//! * [`check_version`] is the narrow internal CheckVersion service boundary.
+//!   One owned read-only transaction runs the authorized serving lookup above
+//!   and then the owning core `check_version_in_tx`, returning the existing
+//!   `Unknown`/`Unchanged`/`Changed` gate observation. It has no REST route,
+//!   grants no write authority and mints no token/HWM/byte-closure proof.
+//!
 //! The durable binding names the exact row (id, owner, name, object format,
 //! history, both epochs, opened Blob digest). Migration-145 triggers and the
 //! shared locked predicate both enforce it; every pool checkout is deadline
 //! bounded (`max_size = 1` is supported) and released before a post-commit read.
 //!
-//! Both entry points are internal trusted-caller APIs: the backend identity is
+//! Durable snapshot and retention-root resources are wired through these
+//! service facades and the separately mounted modules in
+//! `crate::blob_git_gateway` (`snapshot_metadata`, `retention_roots` and their
+//! browse routes). Their actual HTTP13/native167 qualification against a real
+//! PostgreSQL + remote Blob service is still pending; these internal service
+//! facades alone do not close #107 and are not a foundation-only PR.
+//!
+//! These entry points are internal trusted-caller APIs: the backend identity is
 //! passed by the engine from the store it actually opened and is never accepted
 //! from HTTP. [`crate::blob_store::BlobBackendIdentity`] has private
 //! constructors outside the `blob_store` subtree, so an HTTP layer cannot mint
@@ -58,15 +71,33 @@ use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 mod authority;
+mod check_version;
+mod retention_roots;
+mod snapshot_metadata;
 
 pub(crate) use authority::AuthorityKind;
 pub use authority::lookup;
 pub(crate) use authority::lookup_in_tx;
+pub use check_version::check_version;
+pub(crate) use retention_roots::ServingRetainedRootReadContext;
+pub use retention_roots::{
+    PgServingRetentionRoots, ServingRootCreate, ServingRootIntent, ServingRootRead, ServingRootRelease,
+    ServingRootReleaseTarget,
+};
+pub(crate) use snapshot_metadata::RetainedServingReadContext;
+pub use snapshot_metadata::{
+    PgServingSnapshotMetadata, ServingSnapshotCreate, ServingSnapshotRead, ServingSnapshotRelease, ServingSnapshotRenew,
+};
 
 /// Default branch a freshly provisioned core gate starts on.
 const DEFAULT_HEAD_REF: &str = "refs/heads/main";
 /// Both epochs of a brand-new authority intent.
 const INITIAL_EPOCH: i64 = 1;
+/// Exact static response identity for an unknown root COMMIT outcome. The
+/// retention-root diagnostic matches this value only to classify the failure;
+/// it is never formatted into the diagnostic event.
+pub(crate) const COMMIT_UNKNOWN_MESSAGE: &str =
+    "ref-store commit outcome is unknown; retry the same request to resolve it idempotently";
 
 /// Trusted-caller request to create or recover one `pg_refstore` repository.
 #[derive(Clone, Debug)]
@@ -167,10 +198,7 @@ fn deadline_error() -> Error {
 }
 
 fn commit_unknown_error() -> Error {
-    Error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "ref-store commit outcome is unknown; retry the same request to resolve it idempotently",
-    )
+    Error(StatusCode::SERVICE_UNAVAILABLE, COMMIT_UNKNOWN_MESSAGE)
 }
 
 fn map_refstore(error: RefStoreError) -> Error {

@@ -383,6 +383,44 @@ class V2BindingTest(ReceiptFixture):
                     (self.root / relative).write_bytes(original)
         self.validate(payload)
 
+    def test_generated_python_cache_is_not_bound_but_real_support_source_is(self):
+        support = self.write(
+            "tests/blob_gateway_support/root_blob_fault_gate.py",
+            "FAULT_GATE = True\n",
+        )
+        self.bound = self.capture()
+        payload = self.make_v2()
+        receipt_path = self.binary.with_suffix(".build.json")
+        receipt_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+        before = receipts.load_receipt(receipt_path, source_root=self.root)
+        self.assertEqual(before.schema, "v2")
+        before_paths = {entry["path"] for entry in before.payload["bound_input_inventory"]}
+        self.assertIn("tests/blob_gateway_support/root_blob_fault_gate.py", before_paths)
+
+        self.write(
+            "tests/blob_gateway_support/__pycache__/root_blob_fault_gate.cpython-312.pyc",
+            b"generated-bytecode",
+        )
+        self.write(
+            "tests/blob_gateway_support/root_blob_fault_gate.pyo",
+            b"generated-bytecode",
+        )
+
+        after = receipts.load_receipt(receipt_path, source_root=self.root)
+        self.assertEqual(after.schema, "v2")
+        after_paths = {entry["path"] for entry in after.payload["bound_input_inventory"]}
+        self.assertIn("tests/blob_gateway_support/root_blob_fault_gate.py", after_paths)
+        self.assertNotIn(
+            "tests/blob_gateway_support/__pycache__/root_blob_fault_gate.cpython-312.pyc",
+            after_paths,
+        )
+        self.assertNotIn("tests/blob_gateway_support/root_blob_fault_gate.pyo", after_paths)
+
+        support.write_text("FAULT_GATE = False\n", encoding="utf-8")
+        with self.assertRaisesRegex(receipts.ReceiptError, "bound input inventory differs"):
+            receipts.load_receipt(receipt_path, source_root=self.root)
+
     def test_expected_source_config_profile_commit_and_toolchain_anchors(self):
         payload = self.make_v2()
         self.assert_rejected(payload, "expected_source_digest",

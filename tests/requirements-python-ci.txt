@@ -1,0 +1,2 @@
+# Dependencies for the hosted Python CI unit suite (setup-python 3.12).
+PyYAML==6.0.3
