@@ -402,7 +402,7 @@ pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOption
     // Measure superseded local cache without deleting it. Physical removal is
     // a postcommit action so a rolled-back authority transaction cannot destroy
     // pack files still referenced by the previous committed manifest set.
-    let (mut pruned_pack_files, reclaimed_bytes) = (0usize, 0u64);
+    let (mut pruned_pack_files, mut reclaimed_bytes) = (0usize, 0u64);
     if opts.prune_superseded {
         for old_id in &superseded_packs {
             for ext in ["pack", "idx"] {
