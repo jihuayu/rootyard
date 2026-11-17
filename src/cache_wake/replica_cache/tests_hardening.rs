@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -15,7 +15,10 @@ use std::{
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use crate::blob_store::{BlobLocator, test_support::digest};
+use crate::blob_store::{
+    BlobLocator,
+    test_support::{blob_backend_identity, digest},
+};
 
 use super::*;
 
@@ -54,7 +57,7 @@ impl LiveAuthorizer for AllowOnePackAuthorizer {
 struct DummyViewSlot {
     key: ReplicaViewKey,
     path: PathBuf,
-    released: AtomicBool,
+    release_count: Arc<AtomicUsize>,
 }
 
 impl ActiveViewSlot for DummyViewSlot {
@@ -68,13 +71,14 @@ impl ActiveViewSlot for DummyViewSlot {
         Ok(())
     }
     fn release_reader(&self) {
-        self.released.store(true, Ordering::SeqCst);
+        self.release_count.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 struct DummyReplicaBackend {
     id: String,
     view_dir: PathBuf,
+    release_count: Arc<AtomicUsize>,
 }
 
 impl ReplicaBackend for DummyReplicaBackend {
@@ -89,13 +93,29 @@ impl ReplicaBackend for DummyReplicaBackend {
     ) -> lease_pin::AuthTask<'a, Result<ReplicaViewGuard, ReplicaCacheError>> {
         Box::pin(async move {
             let snap = authorizer.authorize_and_check_version(req).await?;
-            let key = ReplicaViewKey::from_snapshot(&snap, &"0".repeat(64))?;
-            let slot = Arc::new(DummyViewSlot { key, path: self.view_dir.clone(), released: AtomicBool::new(false) });
+            let key = ReplicaViewKey::build(
+                snap.tenant_id,
+                snap.repo_id,
+                snap.history_id,
+                snap.cluster_incarnation,
+                &blob_backend_identity("test-hardening"),
+                snap.object_format,
+                snap.authority_epoch,
+                snap.gate_revision,
+                &snap.packs,
+                &snap.refs,
+                &snap.head_ref,
+            )?;
+            let slot = Arc::new(DummyViewSlot {
+                key,
+                path: self.view_dir.clone(),
+                release_count: Arc::clone(&self.release_count),
+            });
             Ok(ReplicaViewGuard::new(
                 self.id.clone(),
                 slot,
                 snap.durable_pin,
-                ReplicaServeSource::MaterializedFromBlob,
+                ReplicaServeSource::ColdBlobMaterialized,
                 ReplicaRequestMetrics::default(),
                 true,
             ))
@@ -186,7 +206,12 @@ fn pack_cache_open_sweeps_orphan_dirs_and_symlinks_on_restart() {
 #[tokio::test]
 async fn scheduler_holds_fair_admission_permit_until_view_guard_drops() {
     let dir = TempDir::new().unwrap();
-    let backend = Arc::new(DummyReplicaBackend { id: "node-1".into(), view_dir: dir.path().to_path_buf() });
+    let release_count = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(DummyReplicaBackend {
+        id: "node-1".into(),
+        view_dir: dir.path().to_path_buf(),
+        release_count: Arc::clone(&release_count),
+    });
     let fair_cfg = TenantFairShareConfig {
         max_total_inflight: 2,
         max_per_tenant_inflight: 1,
@@ -236,6 +261,7 @@ async fn scheduler_holds_fair_admission_permit_until_view_guard_drops() {
     drop(outcome1);
     drop(outcome2);
     assert_eq!(scheduler.fairness_stats().active_inflight, 0);
+    assert_eq!(release_count.load(Ordering::SeqCst), 2);
     let _outcome3 = scheduler.route_and_serve(&req1, &auth1, Instant::now() + Duration::from_secs(5)).await.unwrap();
 }
 
