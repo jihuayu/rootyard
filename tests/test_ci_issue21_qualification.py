@@ -198,11 +198,13 @@ def _unsafe_upload_paths(paths):
 
 
 class WorkflowWiringTest(unittest.TestCase):
-    def test_verify_budget_is_75_plus_pg_10(self):
+    def test_verify_budget_is_75_plus_pg_10_and_vault_20(self):
         lines = _verify_lines()
-        self.assertEqual(_job_scalar(lines, "timeout-minutes"), "85")
+        self.assertEqual(_job_scalar(lines, "timeout-minutes"), "105")
         pg = _step(PG_STEP)
         self.assertEqual(pg["timeout-minutes"], "10")
+        vault = _step("Qualify pinned real Vault rotation and bind the Pando native gate")
+        self.assertEqual(vault["timeout-minutes"], "20")
         self.assertIsNone(_step(PANDO_CLI_STEP)["timeout-minutes"])
         self.assertEqual(_step(PANDO_PITR_STEP)["timeout-minutes"], "10")
 
