@@ -1,25 +1,15 @@
 //! Real OpenDAL S3 + stock Git (SHA-1 & SHA-256) capacity integration tests (#177).
 
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
-use axum::{
-    Router,
-    body::Body,
-    extract::State,
-    http::{Method, Uri},
-    response::Response,
-};
+use axum::http::{Method, Uri};
+use axum::{body::Body, extract::State, response::Response};
 use bytes::Bytes;
-use rootyard::blob_store::{
-    BlobLocator, capacity_contract::*, disposable_view::DisposableViewRoot, opendal::BlobStore,
-};
+use rootyard::blob_store::{BlobLocator, capacity_contract::*, opendal::BlobStore};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::sync::Notify;
@@ -31,7 +21,7 @@ type Cfg = PandoCapacityContract;
 
 #[derive(Default)]
 struct S3State {
-    objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    objects: Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
     gate: Mutex<Option<Gate>>,
     fail_put: Mutex<Option<String>>,
 }
@@ -51,7 +41,7 @@ impl LoopbackS3 {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
                 let l = tokio::net::TcpListener::from_std(lis).unwrap();
                 let _ = tx.send(());
-                let _ = axum::serve(l, Router::new().fallback(handle_s3).with_state(srv)).await;
+                let _ = axum::serve(l, axum::Router::new().fallback(handle_s3).with_state(srv)).await;
             });
         });
         rx.recv().unwrap();
@@ -140,6 +130,7 @@ fn open_eng(s3: &LoopbackS3, dir: &TempDir, c: Cfg, fmt: ObjectFormat, ac: bool)
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
     b.create(&views)?;
+    use rootyard::blob_store::disposable_view::DisposableViewRoot;
     let vr = DisposableViewRoot::open(&views, 4, 256 * 1024 * 1024, Duration::from_secs(120))?;
     let u = Uuid::new_v4;
     let sc = EngineScope { tenant_id: u(), repo_id: u(), authority_id: u(), object_format: fmt, auto_compact: ac };
@@ -231,15 +222,11 @@ fn seed_one(dir: &TempDir, tag: &str, file: &str, b: &[u8]) -> Result<(String, P
 }
 fn err_budget<T: std::fmt::Debug>(r: std::result::Result<T, GrowthEngineError>, want: &str) {
     assert!(
-        matches!(r, Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted { resource, .. })) if resource == want),
-        "{r:?}"
+        matches!(r, Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted { resource, .. })) if resource == want)
     );
 }
 fn err_invalid<T: std::fmt::Debug>(r: std::result::Result<T, GrowthEngineError>) {
     assert!(matches!(r, Err(GrowthEngineError::InvalidInput(_))), "{r:?}");
-}
-fn pin_hold(p: &str) -> ProtectionHold {
-    ProtectionHold::Pin { pin_id: Uuid::new_v4(), purpose: p.into() }
 }
 
 #[tokio::test]
@@ -417,6 +404,7 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     );
     let (p1_sha, p3_sha) = (pack_meta(&p1, &i1)?.0, pack_meta(&p3, &i3)?.0);
 
+    let pin_hold = |p: &str| ProtectionHold::Pin { pin_id: Uuid::new_v4(), purpose: p.into() };
     err_invalid(eng.apply_push(pr("refs/pando-pins/pin-0000", &z, &o1, vec![]), dl).await);
     let op1 = Uuid::new_v4();
     let req1 = push_with(op1, "acked-op", "refs/heads/main", &z, &o1, vec![(p1, i1)]);
@@ -449,13 +437,17 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     spoof.max_single_object_bytes = 64;
     assert!(matches!(eng2.apply_push(spoof, dl).await, Err(GrowthEngineError::GitOps(GitOpsError::LimitExceeded(_)))));
 
+    let err_git = |r| assert!(matches!(r, Err(GrowthEngineError::GitOps(_))));
+    let r2 = |r, o, n, p| {
+        let mut q = pr(r, o, n, p);
+        q.max_single_object_bytes = 512;
+        q
+    };
     let (o_fail, p_fail, i_fail) = seed_one(&dir2, "fail", "f.txt", b"fail")?;
     let (o_win, p_win, i_win) = seed_one(&dir2, "win", "w.txt", b"win")?;
     let p_fail_sha = pack_meta(&p_fail, &i_fail)?.0;
-    let mut rf = pr("refs/heads/main", &z, &o_fail, vec![(p_fail, i_fail)]);
-    let mut rw = pr("refs/heads/main", &z, &o_win, vec![(p_win, i_win)]);
-    (rf.max_single_object_bytes, rw.max_single_object_bytes) = (512, 512);
-    let ef = Arc::clone(&eng2);
+    let (ef, rf) = (Arc::clone(&eng2), r2("refs/heads/main", &z, &o_fail, vec![(p_fail, i_fail)]));
+    let rw = r2("refs/heads/main", &z, &o_win, vec![(p_win, i_win)]);
     let rf_res = s3.race(&p_fail_sha, async move { ef.apply_push(rf, dl).await }, eng2.apply_push(rw, dl)).await?;
     assert!(matches!(rf_res, Err(GrowthEngineError::CasPreconditionFailed { .. })));
     let (s2, l2) = (eng2.snapshot(), eng2.failed_attempt_pack_locators());
@@ -466,7 +458,7 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     let (o_idx, p_idx, i_idx) = seed_one(&dir2, "idx", "idx.txt", b"idx-fail")?;
     let idx_pack_len = fs::metadata(&p_idx)?.len();
     s3.arm_fail_next_put("/pack-idx/");
-    assert!(eng2.apply_push(pr("refs/heads/idx-fail", &z, &o_idx, vec![(p_idx, i_idx)]), dl).await.is_err());
+    err_git(eng2.apply_push(r2("refs/heads/idx-fail", &z, &o_idx, vec![(p_idx, i_idx)]), dl).await);
     let (a, locs) = (eng2.snapshot(), eng2.failed_attempt_pack_locators());
     assert_eq!((a.failed_attempt_count, locs.len()), (3, 3));
     assert_eq!(a.failed_attempt_blob_bytes, s2.failed_attempt_blob_bytes + idx_pack_len);
@@ -490,7 +482,7 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     err_budget(eng3.attach_hold(pin_hold("p2"), Some(o1)), "pins");
     let p2_bytes = fs::metadata(&p2)?.len();
     s3.arm_fail_next_put("/pack-idx/");
-    assert!(eng3.apply_push(pr("refs/heads/main", &z, &o2, vec![(p2.clone(), i2.clone())]), dl).await.is_err());
+    err_git(eng3.apply_push(pr("refs/heads/main", &z, &o2, vec![(p2.clone(), i2.clone())]), dl).await);
     assert_eq!(eng3.snapshot().failed_attempt_blob_bytes, p2_bytes);
     assert!(eng3.failed_attempt_pack_locators().len() == 1 && s3.exists(&eng3.failed_attempt_pack_locators()[0]));
     err_budget(eng3.apply_push(pr("refs/heads/main", &z, &o2, vec![(p2, i2)]), dl).await, "retained_packs");
