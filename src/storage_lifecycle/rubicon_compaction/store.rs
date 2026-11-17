@@ -76,11 +76,28 @@ impl DurableCompactionStore {
         passed_now_ms.max(slot.clock_logical_ms.saturating_add(elapsed_ms))
     }
 
-    fn record_lease_clock(&self, token: &CompactionLeaseToken) {
-        self.lease_clocks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((token.lease_id, token.fence_epoch), Instant::now());
+    fn active_clock_key(state: &DurableStoreState, key: &CompactionLeaseKey) -> Option<(Uuid, u64)> {
+        state.leases.get(&lease_slot_key(key)).and_then(|s| s.active.as_ref()).map(|t| (t.lease_id, t.fence_epoch))
+    }
+
+    fn replace_lease_clock(&self, prev: Option<(Uuid, u64)>, token: &CompactionLeaseToken) {
+        let mut clocks = self.lease_clocks.lock().unwrap_or_else(|e| e.into_inner());
+        let next_key = (token.lease_id, token.fence_epoch);
+        if let Some(prev_key) = prev
+            && prev_key != next_key
+        {
+            clocks.remove(&prev_key);
+        }
+        clocks.insert(next_key, Instant::now());
+    }
+
+    fn remove_lease_clock(&self, key: (Uuid, u64)) {
+        self.lease_clocks.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+    }
+
+    #[cfg(test)]
+    pub(super) fn lease_clock_len(&self) -> usize {
+        self.lease_clocks.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn reload_after_crash(&self) -> Result<Self, CompactionError> {
@@ -234,6 +251,7 @@ impl DurableCompactionStore {
     ) -> Result<CompactionLeaseToken, CompactionError> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = guard.clone();
+        let prev_active = Self::active_clock_key(&next, key);
         let effective_now = self.effective_lease_now(&next, key, now_ms);
         let wall_ms = wall_now_ms();
         let slot = next.leases.entry(lease_slot_key(key)).or_insert(LeaseSlotState {
@@ -257,7 +275,7 @@ impl DurableCompactionStore {
         slot.active = Some(token.clone());
         self.flush_state(&next)?;
         *guard = next;
-        self.record_lease_clock(&token);
+        self.replace_lease_clock(prev_active, &token);
         Ok(token)
     }
 
@@ -285,12 +303,13 @@ impl CompactionAuthorityStore for DurableCompactionStore {
             }
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let mut next = guard.clone();
+            let prev_active = Self::active_clock_key(&next, key);
             let effective_now = self.effective_lease_now(&next, key, now_ms);
             let wall_ms = wall_now_ms();
             let token = acquire_lease_locked(&mut next, key, owner_id, effective_now, wall_ms, ttl_ms)?;
             self.flush_state(&next)?;
             *guard = next;
-            self.record_lease_clock(&token);
+            self.replace_lease_clock(prev_active, &token);
             Ok(token)
         })
     }
@@ -316,6 +335,7 @@ impl CompactionAuthorityStore for DurableCompactionStore {
                 slot.active = None;
                 self.flush_state(&next)?;
                 *guard = next;
+                self.remove_lease_clock((token.lease_id, token.fence_epoch));
             }
             Ok(())
         })
