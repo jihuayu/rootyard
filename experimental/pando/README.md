@@ -219,19 +219,22 @@ server logs and PostgreSQL logs in its printed run directory. Tests check:
   `hooks/pre-receive` fencing, `GET /repos/{id}.git/migration`, and safe
   post-switchover rollback with new commits (`rollback`) back to GitFS.
 
-## Qualification status (#21): authored, runtime NOT RUN
+## Qualification status (#21): source-integrated, CI-required, runtime NOT RUN
 
 **Runtime qualification is NOT RUN on this source.** This documentation change
 did not start Docker, Vault, PostgreSQL, Git/HTTP, the lab server or an exact-head
 product binary. Source review approval, formatting checks and pure oracle tests
-are not real Vault or PostgreSQL passes. The current CI workflow does not invoke
-the Vault harness or the 17-case producer gate described below.
+are not real Vault or PostgreSQL passes. The existing `verify` job now wires the
+Vault harness and the 17-case producer gate as mandatory steps, but only an
+exact-head hosted run can produce runtime evidence.
 
-The required gate intent is an exact clean source commit/tree, the actual
+The required gate is an exact clean source commit/tree, the actual
 `rootyard-pando-lab` product artifact and its native-build receipt, no skip path,
 and a separate source-bound run of the Local-provider PostgreSQL producer cases.
-The report/projection adapter, the 17-case runner and all workflow wiring are
-still pending; no adapter or runner CLI is invented by this document.
+The report/projection adapter, the 17-case runner and the workflow wiring are
+integrated in this source and required by the existing `verify` job. This is
+source and CI wiring evidence only: the real Vault and PostgreSQL cases remain
+NOT RUN pending exact-head results, so no qualification is claimed here.
 
 ### Five real derived-Vault cases
 
@@ -357,7 +360,7 @@ access-control runtime behavior.
 These are separate Local-provider PG contract tests, not additional Vault cases
 and not part of the Vault report. Exactly 17 ignored tests live in the
 existing `rootyard-pando-lab` bin unit-test harness; the normal CLI executable
-and the library-test target cannot select them. The intended mandatory gate runs
+and the library-test target cannot select them. The mandatory gate runs
 each fully qualified name serially in the same PG17 job, in a separately owned
 random database initialized from `experimental/pando/schema.sql`, with
 `PANDO_OBJECT_STORE_ROOT`, `PANDO_KMS_KEYRING_DIR`, `PANDO_KMS_PROVIDER` and
@@ -399,12 +402,13 @@ cargo test --locked --features pando-lab --bin rootyard-pando-lab \
   -- --exact --ignored --test-threads=1
 ```
 
-Repeat for each name. The intended CI gate resolves the same bin-test executable
-once from Cargo JSON and executes all 17 serially, then emits a source-bound
-report. That runner and its report are pending integration; this source has no
-merged producer-runner CLI, and a zero-test or missing-report run is a failure,
-never a pass. The tests cover the DB manifest/envelope pair,
-rollback and exact retry, generation/shared-gate fencing, completed-epoch
+Repeat for each name. The CI gate resolves the same bin-test executable once
+from Cargo JSON and executes all 17 serially, then emits a source-bound report.
+The runner and its report are integrated in this source and wired as a mandatory
+step in the existing `verify` job; a zero-test or missing-report run is a
+failure, never a pass. Actual 17-case PostgreSQL execution is still NOT RUN
+pending exact-head hosted results. The tests cover the DB manifest/envelope
+pair, rollback and exact retry, generation/shared-gate fencing, completed-epoch
 behavior, repack authority/mirror rollback, pinned data, snapshot retention
 races and expiry; they do not establish remote S3, Vault or production behavior.
 
