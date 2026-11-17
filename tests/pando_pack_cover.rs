@@ -338,7 +338,7 @@ impl Env {
         let FetchPlanOutcome::Planned(p) = plan_fetch_covers(req, &self.graph, &self.index, &self.ret)? else {
             anyhow::bail!("plan")
         };
-        Ok(p)
+        Ok(*p)
     }
     async fn mat(
         &self,

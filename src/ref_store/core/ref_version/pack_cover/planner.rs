@@ -133,7 +133,7 @@ pub struct FetchPlan {
 /// Outcome of fetch cover planning: either a verified plan or an explicit strong fallback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FetchPlanOutcome {
-    Planned(FetchPlan),
+    Planned(Box<FetchPlan>),
     FallbackToStrongSnapshot { reason: FallbackReason, snapshot: StrongSnapshotFallback },
 }
 
@@ -216,7 +216,7 @@ pub fn plan_fetch_covers(
     };
     plan.plan_digest =
         compute_fetch_plan_digest(&plan).map_err(|_| FetchPlanError::InvalidPlanInput("plan encoding"))?;
-    Ok(FetchPlanOutcome::Planned(plan))
+    Ok(FetchPlanOutcome::Planned(Box::new(plan)))
 }
 
 /// Deterministic SHA-256 digest over every canonical field of a [`FetchPlan`].

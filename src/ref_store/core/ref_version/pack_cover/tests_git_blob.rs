@@ -32,11 +32,11 @@ type ObjMap = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
 async fn s3_op(State(m): State<ObjMap>, method: Method, uri: Uri) -> Response {
     let k = uri.path().trim_start_matches('/');
     let Some(d) = m.lock().expect("objs").get(k).cloned() else {
-        return (StatusCode::NOT_FOUND, [(header::CONTENT_LENGTH, "0".into())], Body::empty()).into_response();
+        return (StatusCode::NOT_FOUND, [(header::CONTENT_LENGTH, "0".to_owned())], Body::empty()).into_response();
     };
     let len = d.len().to_string();
     let body = if method == Method::HEAD { Body::empty() } else { Body::from(d) };
-    (StatusCode::OK, [(header::CONTENT_LENGTH, len), (header::ETAG, "\"e\"".into())], body).into_response()
+    (StatusCode::OK, [(header::CONTENT_LENGTH, len), (header::ETAG, "\"e\"".to_owned())], body).into_response()
 }
 
 async fn s3_srv() -> Result<(String, ObjMap, tokio::task::JoinHandle<()>)> {
