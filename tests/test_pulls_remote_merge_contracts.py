@@ -98,6 +98,9 @@ class PullsRemoteMergeContractsTest(unittest.TestCase):
             "UPDATE forge_pulls",
             "prepare_merge_candidate",
             "compute_merge_binding_digest",
+            "RefCommitResult::Applied",
+            "pack_sha256",
+            "facts_digest",
         ):
             self.assertIn(token, src_blob, f"Missing required symbol/SQL guard: {token}")
 

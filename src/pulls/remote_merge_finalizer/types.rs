@@ -209,6 +209,9 @@ pub struct PendingMergeRecord {
     pub expected_version: i64,
     pub expected_storage_generation: i64,
     pub strategy: MergeStrategy,
+    pub authz_epoch: i64,
+    pub pack_sha256: String,
+    pub facts_digest: String,
     pub state: PullMergeState,
     pub commit_log_index: Option<u64>,
     pub commit_log_term: Option<u64>,
@@ -319,6 +322,7 @@ pub struct MergeBindingInputs<'a> {
     pub required_checks: &'a [String],
     pub min_check_sequence: i64,
     pub authz_epoch: i64,
+    pub pack_sha256: &'a str,
 }
 
 pub fn compute_merge_binding_digest(inputs: &MergeBindingInputs<'_>) -> String {
@@ -344,12 +348,17 @@ pub fn compute_merge_binding_digest(inputs: &MergeBindingInputs<'_>) -> String {
         inputs.expected_base_oid,
         inputs.candidate_target_oid,
         inputs.strategy.as_str(),
+        inputs.pack_sha256,
         &checks_digest,
     ] {
         h.update((s.len() as u64).to_be_bytes());
         h.update(s.as_bytes());
     }
     hex::encode(h.finalize())
+}
+
+pub(super) fn sha256_hex_valid(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub(super) fn oid_valid_for_format(oid: &str, fmt: GitObjectFormat) -> bool {

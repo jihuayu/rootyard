@@ -231,6 +231,7 @@ impl TestCtx {
             required_checks: &chks,
             min_check_sequence: 1,
             authz_epoch: 3,
+            pack_sha256: psha,
         });
         let grant = self
             .keyring

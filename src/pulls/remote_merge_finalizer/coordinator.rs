@@ -1,6 +1,7 @@
 //! Coordinator orchestration separating pre-CAS validation/pending intent persistence
 //! from authoritative Ref-CAS commit execution and monotonic receipt projection (`Refs #156`).
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -13,7 +14,7 @@ use crate::ref_store::core::state_machine::{
     AppliedLogId, ApplyResponse, CommitScopedRefsCommand, InstallScopedDecisionCommand, RefCasCommand,
     RefCasStateMachine, StateMachineError,
 };
-use crate::ref_store::core::terminal::{CommitRejectCode, CommitTerminal};
+use crate::ref_store::core::terminal::{CommitRejectCode, CommitTerminal, RefCommitResult};
 use crate::ref_store::projector::DecisionGrantKeyring;
 
 use super::projector::{MergeReceiptStore, PullMergeReceiptProjector};
@@ -81,12 +82,17 @@ pub trait MergeAuthorityBackend: Send + Sync {
 pub struct InProcessRefCasBackend {
     sm: Arc<Mutex<RefCasStateMachine>>,
     next_index: Arc<Mutex<u64>>,
+    op_log_ids: Arc<Mutex<BTreeMap<(Uuid, Uuid), AppliedLogId>>>,
 }
 
 impl InProcessRefCasBackend {
     pub fn new(sm: RefCasStateMachine) -> Self {
         let next = sm.last_applied().map_or(1, |id| id.index.saturating_add(1));
-        Self { sm: Arc::new(Mutex::new(sm)), next_index: Arc::new(Mutex::new(next)) }
+        Self {
+            sm: Arc::new(Mutex::new(sm)),
+            next_index: Arc::new(Mutex::new(next)),
+            op_log_ids: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     pub fn snapshot_refs(&self, repository_id: Uuid) -> std::collections::BTreeMap<String, String> {
@@ -122,17 +128,27 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
                     return Ok(map_sm_error_to_outcome(Some(install_idx), err, actual_base_oid));
                 }
             }
+            let op_id = commit.request.operation_id;
             let commit_idx = self.next_log_id();
             let mut sm = self.sm.lock().unwrap_or_else(|e| e.into_inner());
             match sm.apply(commit_idx, RefCasCommand::CommitScopedRefs(commit)) {
                 Ok(ApplyResponse::RefsCommitted(receipt)) => {
-                    let actual_base_oid = sm.read_refs(repository_id).get(base_ref).cloned();
-                    Ok(map_commit_receipt_to_outcome(commit_idx, base_ref, &receipt.terminal, receipt.replayed, actual_base_oid))
+                    let stored_idx = {
+                        let mut map = self.op_log_ids.lock().unwrap_or_else(|e| e.into_inner());
+                        if receipt.replayed {
+                            *map.get(&(repository_id, op_id)).unwrap_or(&commit_idx)
+                        } else {
+                            map.insert((repository_id, op_id), commit_idx);
+                            commit_idx
+                        }
+                    };
+                    let diag_base = sm.read_refs(repository_id).get(base_ref).cloned();
+                    map_commit_receipt_to_outcome(stored_idx, base_ref, &receipt.terminal, receipt.replayed, diag_base)
                 }
                 Ok(other) => Err(RemoteMergeError::Equivocation(format!("unexpected RefCas response: {other:?}"))),
                 Err(err) => {
-                    let actual_base_oid = sm.read_refs(repository_id).get(base_ref).cloned();
-                    Ok(map_sm_error_to_outcome(Some(commit_idx), err, actual_base_oid))
+                    let diag_base = sm.read_refs(repository_id).get(base_ref).cloned();
+                    Ok(map_sm_error_to_outcome(Some(commit_idx), err, diag_base))
                 }
             }
         })
@@ -149,7 +165,13 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
             let lookup = sm
                 .query_operation(repository_id, operation_id)
                 .map_err(|e| RemoteMergeError::RemoteAuthzDenied(e.to_string()))?;
-            let log_id = sm.last_applied().unwrap_or(AppliedLogId { term: 1, index: 1 });
+            let log_id = self
+                .op_log_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(repository_id, operation_id))
+                .copied()
+                .unwrap_or_else(|| sm.last_applied().unwrap_or(AppliedLogId { term: 1, index: 1 }));
             match lookup {
                 OperationLookup::Unknown => {
                     if sm.has_cancel_tombstone(repository_id, operation_id) {
@@ -162,7 +184,7 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
                     Ok(None)
                 }
                 OperationLookup::Known(record) => {
-                    let actual_base = sm.read_refs(repository_id).get(base_ref).cloned();
+                    let diag_base = sm.read_refs(repository_id).get(base_ref).cloned();
                     match record.state() {
                         OperationState::Pending => Ok(Some(AuthorityCommitOutcome::UnknownPending {
                             reason: "operation pending in RefCasStateMachine".into(),
@@ -178,7 +200,7 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
                                 .ok_or_else(|| RemoteMergeError::Equivocation("missing terminal_result".into()))?;
                             let terminal: CommitTerminal = serde_json::from_value(res.value().clone())
                                 .map_err(|e| RemoteMergeError::Equivocation(e.to_string()))?;
-                            Ok(Some(map_commit_receipt_to_outcome(log_id, base_ref, &terminal, true, actual_base)))
+                            Ok(Some(map_commit_receipt_to_outcome(log_id, base_ref, &terminal, true, diag_base)?))
                         }
                     }
                 }
@@ -198,38 +220,52 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
     }
 }
 
+/// Maps an immutable [`CommitTerminal`] receipt into [`AuthorityCommitOutcome`].
+/// For committed terminals, `merged_oid` is always extracted from `terminal.refs`
+/// rather than mutable live ref state so recovery and replay survive later advances.
 pub fn map_commit_receipt_to_outcome(
     log_id: AppliedLogId,
     base_ref: &str,
     terminal: &CommitTerminal,
     replayed: bool,
-    actual_base_oid: Option<String>,
-) -> AuthorityCommitOutcome {
+    diagnostic_live_base_oid: Option<String>,
+) -> Result<AuthorityCommitOutcome, RemoteMergeError> {
     let terminal_digest = canonical_terminal_digest(terminal);
     if terminal.is_committed() {
-        let merged_oid = actual_base_oid.unwrap_or_default();
-        return AuthorityCommitOutcome::Committed {
+        let merged_oid = terminal
+            .refs
+            .iter()
+            .find_map(|r| match r {
+                RefCommitResult::Applied { name, new_oid, .. } if name == base_ref => new_oid.clone(),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                RemoteMergeError::Equivocation(format!(
+                    "committed Ref-CAS terminal missing Applied new_oid for `{base_ref}`"
+                ))
+            })?;
+        return Ok(AuthorityCommitOutcome::Committed {
             log_index: log_id.index,
             log_term: log_id.term,
             gate_revision: terminal.revision,
             merged_oid,
             terminal_digest,
             replayed,
-        };
+        });
     }
     let reject_code = terminal
         .rejection
         .as_ref()
         .map_or(CommitRejectCode::PolicyDenied, |r| r.code);
     let reason = format!("ref-cas rejected `{base_ref}` with {}", reject_code.as_str());
-    AuthorityCommitOutcome::Rejected {
+    Ok(AuthorityCommitOutcome::Rejected {
         log_index: Some(log_id.index),
         log_term: Some(log_id.term),
         reject_code,
-        actual_base_oid,
+        actual_base_oid: diagnostic_live_base_oid,
         terminal_digest: Some(terminal_digest),
         reason,
-    }
+    })
 }
 
 pub fn map_sm_error_to_outcome(
@@ -321,6 +357,9 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> PullRemoteMergeProducer
             expected_version: spec.expected_version,
             expected_storage_generation: spec.expected_storage_generation,
             strategy: spec.strategy,
+            authz_epoch: spec.grant.payload.authz_epoch,
+            pack_sha256: spec.pack_sha256.clone(),
+            facts_digest: validated.binding_digest,
             state: PullMergeState::PendingMerge,
             commit_log_index: None,
             commit_log_term: None,

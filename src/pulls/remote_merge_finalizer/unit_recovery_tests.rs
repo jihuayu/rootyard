@@ -144,3 +144,71 @@ async fn concurrent_same_ref_merges_elect_single_cas_winner() {
     assert_eq!(wins, 1);
     assert_eq!(f.backend.read_ref_oid(f.repo_id, "refs/heads/main").await.unwrap(), Some(target_oid));
 }
+
+#[tokio::test]
+async fn reconcile_and_replay_survive_subsequent_pr_advancing_base_ref() {
+    let f = setup_fixture(GitObjectFormat::Sha256);
+    f.store.seed_pull(ProjectedPullRecord {
+        tenant_id: f.tenant_id,
+        repository_id: f.repo_id,
+        pull_number: 2,
+        state: "open".into(),
+        head_oid: hex_oid(GitObjectFormat::Sha256, 0x33),
+        base_oid: f.head_oid.clone(),
+        merge_commit_oid: None,
+        merged_storage_generation: None,
+        version: 1,
+    });
+    let prod = PullRemoteMergeProducer::new(&f.backend, &f.store, &f.keyring);
+    let finalizer = RecoverablePullMergeFinalizer::new(&f.backend, &f.store);
+
+    // PR #1 commits base -> oid_1 in Ref-CAS, then crashes before PG projection.
+    let (s1, p1) = build_spec_and_pull(&f, 1, 1, 5);
+    assert!(matches!(
+        prod.execute_merge(&s1, &p1, true, MergeFaultInjection::CoordinatorTimeoutAfterCasBeforeProjection).await,
+        Err(RemoteMergeError::UnknownOutcome(_))
+    ));
+    assert_eq!(f.backend.read_ref_oid(f.repo_id, "refs/heads/main").await.unwrap(), Some(f.head_oid.clone()));
+
+    // Before PR #1 reconciles, PR #2 validly advances base from oid_1 -> oid_2.
+    let gv2 = f.backend.state_machine().read_gate_version(f.repo_id).unwrap().unwrap();
+    let mut f2 = setup_fixture(GitObjectFormat::Sha256);
+    f2.tenant_id = f.tenant_id;
+    f2.repo_id = f.repo_id;
+    f2.actor_id = f.actor_id;
+    f2.scope_id = f.scope_id;
+    f2.realm = f.realm.clone();
+    f2.svc = f.svc.clone();
+    f2.keyring = f.keyring.clone();
+    f2.base_oid = f.head_oid.clone();
+    f2.head_oid = hex_oid(GitObjectFormat::Sha256, 0x33);
+    f2.base_revision = gv2.revision();
+    f2.base_gate_digest = gv2.digest().as_hex();
+    let (s2, p2) = build_spec_with_target(&f2, 2, 2, 5, &f2.head_oid);
+    let MergeAttemptOutcome::Committed(rec2) =
+        prod.execute_merge(&s2, &p2, true, MergeFaultInjection::None).await.unwrap()
+    else {
+        panic!("PR #2 should advance main to oid_2");
+    };
+    assert_eq!(rec2.merged_oid, f2.head_oid);
+    assert_eq!(f.backend.read_ref_oid(f.repo_id, "refs/heads/main").await.unwrap(), Some(f2.head_oid.clone()));
+
+    // Recovery of PR #1 must read oid_1 immutably from CommitTerminal (never oid_2).
+    let rep = finalizer.reconcile_pending(f.repo_id, true).await.unwrap();
+    assert_eq!((rep.committed, rep.rejected), (1, 0));
+    let pr1 = f.store.get_pull(f.repo_id, 1).unwrap();
+    assert_eq!((pr1.state.as_str(), pr1.merge_commit_oid.as_deref()), ("merged", Some(f.head_oid.as_str())));
+
+    // Replaying op_1 directly against Ref-CAS must also return oid_1 (`replayed=true`).
+    let v1 = super::validation::verify_pull_remote_authz_grant(&s1, &p1, &f.keyring).unwrap();
+    let replay_out = f
+        .backend
+        .install_and_commit_scoped(f.repo_id, &s1.base_ref, v1.install_cmd, v1.commit_cmd)
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay_out,
+        super::coordinator::AuthorityCommitOutcome::Committed { ref merged_oid, replayed: true, .. }
+            if merged_oid == &f.head_oid
+    ));
+}

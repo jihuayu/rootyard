@@ -221,6 +221,7 @@ pub(super) fn build_spec_with_target(
         )],
     )
     .unwrap();
+    let psha = hex_digest(0x99);
     let binding = compute_merge_binding_digest(&MergeBindingInputs {
         tenant_id: f.tenant_id,
         repository_id: f.repo_id,
@@ -238,6 +239,7 @@ pub(super) fn build_spec_with_target(
         required_checks: &required_checks,
         min_check_sequence: 1,
         authz_epoch,
+        pack_sha256: &psha,
     });
     let grant = f
         .keyring
@@ -343,5 +345,29 @@ async fn fail_closed_checks_head_base_and_revoked_grants_return_named_errors() {
     let mut expired = spec.clone();
     expired.current_logical_tick = 1000;
     assert!(matches!(prod.execute_merge(&expired, &pull, true, MergeFaultInjection::None).await, Err(RemoteMergeError::RevokedAuthorization(_))));
+
+    // Missing/omitted dependency scope in spec.live_scopes must fail closed (never fail open).
+    let mut missing_scope = spec.clone();
+    missing_scope.live_scopes.clear();
+    assert!(matches!(prod.execute_merge(&missing_scope, &pull, true, MergeFaultInjection::None).await, Err(RemoteMergeError::RevokedAuthorization(_))));
+
+    // Later failed/untrusted re-run must override an earlier passing check observation.
+    let mut rerun_fail = pull.clone();
+    rerun_fail.observed_checks.push(CheckRunSnapshot {
+        context: "ci/verify".into(),
+        commit_oid: spec.expected_head_oid.clone(),
+        base_oid: Some(spec.expected_base_oid.clone()),
+        status: "completed".into(),
+        conclusion: Some("failure".into()),
+        sequence: 2,
+        attempt: 1,
+        trusted: true,
+    });
+    assert!(matches!(prod.execute_merge(&spec, &rerun_fail, true, MergeFaultInjection::None).await, Err(RemoteMergeError::StaleRequiredChecks { .. })));
+
+    // Tampered pack_sha256 mismatches signed grant facts_digest.
+    let mut bad_pack = spec.clone();
+    bad_pack.pack_sha256 = hex_digest(0xaa);
+    assert!(matches!(prod.execute_merge(&bad_pack, &pull, true, MergeFaultInjection::None).await, Err(RemoteMergeError::RemoteAuthzDenied(_))));
     assert_eq!(f.backend.read_ref_oid(f.repo_id, "refs/heads/main").await.unwrap(), Some(f.base_oid));
 }

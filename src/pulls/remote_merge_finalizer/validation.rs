@@ -15,7 +15,7 @@ use crate::ref_store::projector::{
 
 use super::types::{
     MergeAttemptSpec, MergeBindingInputs, MergePullSnapshot, MergeStrategy, RemoteMergeError,
-    compute_merge_binding_digest, oid_valid_for_format, unique_sorted_checks,
+    compute_merge_binding_digest, oid_valid_for_format, sha256_hex_valid, unique_sorted_checks,
 };
 
 #[derive(Clone, Debug)]
@@ -72,6 +72,9 @@ pub fn validate_merge_inputs_and_preconditions(
         || !oid_valid_for_format(&spec.candidate_target_oid, spec.object_format)
     {
         return Err(RemoteMergeError::InvalidInput("invalid or zero OID for repository object_format".into()));
+    }
+    if !sha256_hex_valid(&spec.pack_sha256) {
+        return Err(RemoteMergeError::InvalidInput("invalid pack_sha256 hex digest".into()));
     }
     if pull.base_ref != spec.base_ref || !spec.base_ref.starts_with("refs/heads/") {
         return Err(RemoteMergeError::InvalidInput("base_ref mismatch or invalid branch ref".into()));
@@ -141,17 +144,17 @@ fn verify_required_checks(spec: &MergeAttemptSpec, pull: &MergePullSnapshot) -> 
     let required = unique_sorted_checks(&pull.required_checks)?;
     for ctx in &required {
         let mut saw_other_commit = false;
-        let mut exact = None;
+        let mut matching_head = Vec::new();
         for obs in &pull.observed_checks {
             if obs.context == *ctx {
                 if obs.commit_oid == spec.expected_head_oid {
-                    exact = Some(obs);
-                    break;
+                    matching_head.push(obs);
+                } else {
+                    saw_other_commit = true;
                 }
-                saw_other_commit = true;
             }
         }
-        let Some(check) = exact else {
+        let Some(latest_key) = matching_head.iter().map(|obs| (obs.sequence, obs.attempt)).max() else {
             let reason = if saw_other_commit {
                 format!("required check `{ctx}` only ran on stale commit_oid")
             } else {
@@ -162,29 +165,31 @@ fn verify_required_checks(spec: &MergeAttemptSpec, pull: &MergePullSnapshot) -> 
                 reason,
             });
         };
-        if !check.trusted {
-            return Err(RemoteMergeError::StaleRequiredChecks {
-                expected_head_oid: spec.expected_head_oid.clone(),
-                reason: format!("required check `{ctx}` is untrusted"),
-            });
-        }
-        if check.base_oid.as_deref().is_some_and(|b| b != spec.expected_base_oid) {
-            return Err(RemoteMergeError::StaleRequiredChecks {
-                expected_head_oid: spec.expected_head_oid.clone(),
-                reason: format!("required check `{ctx}` targeted stale base OID"),
-            });
-        }
-        if check.sequence < pull.min_check_sequence || check.attempt < 1 {
-            return Err(RemoteMergeError::StaleRequiredChecks {
-                expected_head_oid: spec.expected_head_oid.clone(),
-                reason: format!("required check `{ctx}` sequence {} < {}", check.sequence, pull.min_check_sequence),
-            });
-        }
-        if check.status != "completed" || check.conclusion.as_deref() != Some("success") {
-            return Err(RemoteMergeError::StaleRequiredChecks {
-                expected_head_oid: spec.expected_head_oid.clone(),
-                reason: format!("required check `{ctx}` status={}/conclusion={:?}", check.status, check.conclusion),
-            });
+        for check in matching_head.into_iter().filter(|obs| (obs.sequence, obs.attempt) == latest_key) {
+            if !check.trusted {
+                return Err(RemoteMergeError::StaleRequiredChecks {
+                    expected_head_oid: spec.expected_head_oid.clone(),
+                    reason: format!("required check `{ctx}` is untrusted"),
+                });
+            }
+            if check.base_oid.as_deref().is_some_and(|b| b != spec.expected_base_oid) {
+                return Err(RemoteMergeError::StaleRequiredChecks {
+                    expected_head_oid: spec.expected_head_oid.clone(),
+                    reason: format!("required check `{ctx}` targeted stale base OID"),
+                });
+            }
+            if check.sequence < pull.min_check_sequence || check.attempt < 1 {
+                return Err(RemoteMergeError::StaleRequiredChecks {
+                    expected_head_oid: spec.expected_head_oid.clone(),
+                    reason: format!("required check `{ctx}` sequence {} < {}", check.sequence, pull.min_check_sequence),
+                });
+            }
+            if check.status != "completed" || check.conclusion.as_deref() != Some("success") {
+                return Err(RemoteMergeError::StaleRequiredChecks {
+                    expected_head_oid: spec.expected_head_oid.clone(),
+                    reason: format!("required check `{ctx}` status={}/conclusion={:?}", check.status, check.conclusion),
+                });
+            }
         }
     }
     Ok(())
@@ -272,6 +277,7 @@ pub fn verify_pull_remote_authz_grant(
         required_checks: &pull.required_checks,
         min_check_sequence: pull.min_check_sequence,
         authz_epoch: p.authz_epoch,
+        pack_sha256: &spec.pack_sha256,
     });
     if p.facts_digest != binding_digest {
         return Err(RemoteMergeError::RemoteAuthzDenied(
@@ -285,21 +291,25 @@ pub fn verify_pull_remote_authz_grant(
     }
 
     for dep in &p.scope_dependencies {
-        if let Some(live) =
-            spec.live_scopes.iter().find(|s| s.scope_kind == dep.scope_kind && s.scope_id == dep.scope_id)
-        {
-            if live.lifecycle != ScopeLifecycle::Open {
-                return Err(RemoteMergeError::RevokedAuthorization(format!(
-                    "dependency scope ({}, {}) is {:?}",
-                    live.scope_kind, live.scope_id, live.lifecycle
-                )));
-            }
-            if p.authz_epoch < live.authz_floor {
-                return Err(RemoteMergeError::RevokedAuthorization(format!(
-                    "grant authz_epoch {} < live floor {}",
-                    p.authz_epoch, live.authz_floor
-                )));
-            }
+        if !spec.live_scopes.iter().any(|s| s.scope_kind == dep.scope_kind && s.scope_id == dep.scope_id) {
+            return Err(RemoteMergeError::RevokedAuthorization(format!(
+                "missing live state for dependency scope ({}, {})",
+                dep.scope_kind, dep.scope_id
+            )));
+        }
+    }
+    for live in &spec.live_scopes {
+        if live.lifecycle != ScopeLifecycle::Open {
+            return Err(RemoteMergeError::RevokedAuthorization(format!(
+                "dependency scope ({}, {}) is {:?}",
+                live.scope_kind, live.scope_id, live.lifecycle
+            )));
+        }
+        if p.authz_epoch < live.authz_floor {
+            return Err(RemoteMergeError::RevokedAuthorization(format!(
+                "grant authz_epoch {} < live floor {}",
+                p.authz_epoch, live.authz_floor
+            )));
         }
     }
 

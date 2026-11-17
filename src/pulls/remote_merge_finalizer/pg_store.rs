@@ -16,8 +16,8 @@ use super::types::{
 
 const ATTEMPT_SELECT: &str = "attempt_id, operation_id, decision_id, tenant_id, repository_id, pull_number, \
     base_ref, expected_head_oid, expected_base_oid, candidate_target_oid, expected_version, \
-    expected_storage_generation, strategy, state, commit_log_index, commit_log_term, merged_oid, \
-    terminal_digest, reject_reason";
+    expected_storage_generation, strategy, authz_epoch, pack_sha256, facts_digest, state, \
+    commit_log_index, commit_log_term, merged_oid, terminal_digest, reject_reason";
 
 /// Creates ephemeral/test attempt tracking tables + immutability triggers inside the caller's schema.
 pub async fn init_remote_merge_tables(pool: &Pool) -> Result<(), RemoteMergeError> {
@@ -38,6 +38,9 @@ pub async fn init_remote_merge_tables(pool: &Pool) -> Result<(), RemoteMergeErro
                 expected_version BIGINT NOT NULL CHECK (expected_version > 0),
                 expected_storage_generation BIGINT NOT NULL CHECK (expected_storage_generation > 0),
                 strategy TEXT NOT NULL CHECK (strategy IN ('fast_forward', 'merge_commit')),
+                authz_epoch BIGINT NOT NULL CHECK (authz_epoch >= 0),
+                pack_sha256 TEXT NOT NULL CHECK (pack_sha256 ~ '^[0-9a-f]{64}$'),
+                facts_digest TEXT NOT NULL CHECK (facts_digest ~ '^[0-9a-f]{64}$'),
                 state TEXT NOT NULL CHECK (state IN ('pending_merge', 'committed_merge', 'rejected_merge', 'aborted_before_cas')),
                 commit_log_index BIGINT CHECK (commit_log_index IS NULL OR commit_log_index > 0),
                 commit_log_term BIGINT CHECK (commit_log_term IS NULL OR commit_log_term >= 0),
@@ -61,6 +64,8 @@ pub async fn init_remote_merge_tables(pool: &Pool) -> Result<(), RemoteMergeErro
                     OR NEW.merged_oid IS DISTINCT FROM OLD.merged_oid
                     OR NEW.commit_log_index IS DISTINCT FROM OLD.commit_log_index
                     OR NEW.terminal_digest IS DISTINCT FROM OLD.terminal_digest
+                    OR NEW.pack_sha256 IS DISTINCT FROM OLD.pack_sha256
+                    OR NEW.facts_digest IS DISTINCT FROM OLD.facts_digest
                 ) THEN
                     RAISE EXCEPTION 'committed_merge receipt is immutable and cannot regress or equivocate';
                 END IF;
@@ -97,10 +102,10 @@ impl PgMergeStore {
             "merge_commit" => MergeStrategy::MergeCommit,
             other => return Err(RemoteMergeError::InvalidInput(format!("bad strategy `{other}`"))),
         };
-        let state_raw: String = row.get(13);
+        let state_raw: String = row.get(16);
         let state = PullMergeState::parse(&state_raw)?;
-        let log_idx_opt: Option<i64> = row.get(14);
-        let log_term_opt: Option<i64> = row.get(15);
+        let log_idx_opt: Option<i64> = row.get(17);
+        let log_term_opt: Option<i64> = row.get(18);
         Ok(PendingMergeRecord {
             attempt_id: row.get(0),
             operation_id: row.get(1),
@@ -115,12 +120,15 @@ impl PgMergeStore {
             expected_version: row.get(10),
             expected_storage_generation: row.get(11),
             strategy,
+            authz_epoch: row.get(13),
+            pack_sha256: row.get(14),
+            facts_digest: row.get(15),
             state,
             commit_log_index: log_idx_opt.map(|v| v as u64),
             commit_log_term: log_term_opt.map(|v| v as u64),
-            merged_oid: row.get(16),
-            terminal_digest: row.get(17),
-            reject_reason: row.get(18),
+            merged_oid: row.get(19),
+            terminal_digest: row.get(20),
+            reject_reason: row.get(21),
         })
     }
 }
@@ -178,8 +186,9 @@ impl MergeReceiptStore for PgMergeStore {
                 "INSERT INTO pull_remote_merge_attempts (
                     attempt_id, operation_id, decision_id, tenant_id, repository_id, pull_number,
                     base_ref, expected_head_oid, expected_base_oid, candidate_target_oid,
-                    expected_version, expected_storage_generation, strategy, state
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending_merge')",
+                    expected_version, expected_storage_generation, strategy, authz_epoch, pack_sha256,
+                    facts_digest, state
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending_merge')",
                 &[
                     &record.attempt_id,
                     &record.operation_id,
@@ -194,6 +203,9 @@ impl MergeReceiptStore for PgMergeStore {
                     &record.expected_version,
                     &record.expected_storage_generation,
                     &record.strategy.as_str(),
+                    &record.authz_epoch,
+                    &record.pack_sha256,
+                    &record.facts_digest,
                 ],
             )
             .await

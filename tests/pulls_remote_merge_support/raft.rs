@@ -291,13 +291,19 @@ impl LiveRaft3 {
     ) -> Result<(u64, RefCasStateMachine, Option<Result<ApplyResponse, StateMachineError>>)> {
         let next = self.seq + 1;
         let idx = self.kv_put(&format!("pm/{next:08}"), &serde_json::to_string(cmd)?).await?;
+        let _ = self.kv_put(&format!("pm/{next:08}/idx"), &idx.to_string()).await?;
         let _ = self.kv_put("pm/head", &next.to_string()).await?;
         self.seq = next;
-        let (sm, last) = self.replay_sm().await?;
-        Ok((idx, sm, last))
+        let out = self.replay_sm_full().await?;
+        Ok((idx, out.sm, out.last))
     }
 
     pub async fn replay_sm(&self) -> Result<(RefCasStateMachine, Option<Result<ApplyResponse, StateMachineError>>)> {
+        let out = self.replay_sm_full().await?;
+        Ok((out.sm, out.last))
+    }
+
+    pub async fn replay_sm_full(&self) -> Result<ReplayedSm> {
         let lid = self.wait_leader().await?;
         let node = &self.nodes[&lid];
         let _ = node.rpc(json!("EnsureReadIndex")).await?;
@@ -308,14 +314,26 @@ impl LiveRaft3 {
             .and_then(Value::as_str)
             .unwrap_or("0")
             .parse()?;
-        let (mut sm, mut last) = (RefCasStateMachine::new(), None);
+        let (mut sm, mut last, mut op_logs, mut last_id) =
+            (RefCasStateMachine::new(), None, BTreeMap::new(), AppliedLogId { term: 1, index: 1 });
         for s in 1..=n {
             let r = node.rpc(json!({ "KvGet": { "key": format!("pm/{s:08}") } })).await?;
             let cmd: RefCasCommand =
                 serde_json::from_str(r.pointer("/KvValue/value").and_then(Value::as_str).context("cmd")?)?;
-            last = Some(sm.apply(AppliedLogId { term: 1, index: s }, cmd));
+            let idx_r = node.rpc(json!({ "KvGet": { "key": format!("pm/{s:08}/idx") } })).await?;
+            let log_idx = idx_r
+                .pointer("/KvValue/value")
+                .and_then(Value::as_str)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(s);
+            let applied = AppliedLogId { term: 1, index: log_idx };
+            last_id = applied;
+            if let RefCasCommand::CommitScopedRefs(c) = &cmd {
+                op_logs.insert((c.request.repository_id, c.request.operation_id), applied);
+            }
+            last = Some(sm.apply(applied, cmd));
         }
-        Ok((sm, last))
+        Ok(ReplayedSm { sm, last, op_logs, last_id })
     }
 
     pub async fn restart_leader(&mut self) -> Result<()> {
@@ -336,6 +354,13 @@ impl LiveRaft3 {
         let _ = self.wait_leader().await?;
         Ok(())
     }
+}
+
+pub struct ReplayedSm {
+    pub sm: RefCasStateMachine,
+    pub last: Option<Result<ApplyResponse, StateMachineError>>,
+    pub op_logs: BTreeMap<(Uuid, Uuid), AppliedLogId>,
+    pub last_id: AppliedLogId,
 }
 
 pub struct LiveRaft3Backend(pub Arc<AsyncMutex<LiveRaft3>>);
@@ -366,13 +391,13 @@ impl MergeAuthorityBackend for LiveRaft3Backend {
                 .await
                 .map_err(|e| RemoteMergeError::UnknownOutcome(e.to_string()))?;
             match r2.context("res").map_err(|e| RemoteMergeError::UnknownOutcome(e.to_string()))? {
-                Ok(ApplyResponse::RefsCommitted(rec)) => Ok(map_commit_receipt_to_outcome(
+                Ok(ApplyResponse::RefsCommitted(rec)) => map_commit_receipt_to_outcome(
                     AppliedLogId { term: 1, index: i2 },
                     base_ref,
                     &rec.terminal,
                     rec.replayed,
                     sm2.read_refs(repo).get(base_ref).cloned(),
-                )),
+                ),
                 Ok(o) => Err(RemoteMergeError::Equivocation(format!("unexpected {o:?}"))),
                 Err(e) => Ok(map_sm_error_to_outcome(
                     Some(AppliedLogId { term: 1, index: i2 }),
@@ -390,24 +415,51 @@ impl MergeAuthorityBackend for LiveRaft3Backend {
         base_ref: &'a str,
     ) -> BackendFuture<'a, Option<AuthorityCommitOutcome>> {
         Box::pin(async move {
-            let (sm, _) =
-                self.0.lock().await.replay_sm().await.map_err(|e| RemoteMergeError::UnknownOutcome(e.to_string()))?;
-            match sm.query_operation(repo, op).map_err(|e| RemoteMergeError::RemoteAuthzDenied(e.to_string()))? {
-                OperationLookup::Unknown => Ok(None),
-                OperationLookup::Known(rec)
-                    if matches!(rec.state(), OperationState::Committed | OperationState::Rejected) =>
-                {
-                    let t: CommitTerminal = serde_json::from_value(rec.terminal_result().unwrap().value().clone())
-                        .map_err(|e| RemoteMergeError::Equivocation(e.to_string()))?;
-                    Ok(Some(map_commit_receipt_to_outcome(
-                        AppliedLogId { term: 1, index: 1 },
-                        base_ref,
-                        &t,
-                        true,
-                        sm.read_refs(repo).get(base_ref).cloned(),
-                    )))
+            let out = self
+                .0
+                .lock()
+                .await
+                .replay_sm_full()
+                .await
+                .map_err(|e| RemoteMergeError::UnknownOutcome(e.to_string()))?;
+            let lid = out.op_logs.get(&(repo, op)).copied().unwrap_or(out.last_id);
+            match out.sm.query_operation(repo, op).map_err(|e| RemoteMergeError::RemoteAuthzDenied(e.to_string()))? {
+                OperationLookup::Unknown => {
+                    if out.sm.has_cancel_tombstone(repo, op) {
+                        return Ok(Some(AuthorityCommitOutcome::Cancelled {
+                            log_index: Some(lid.index),
+                            log_term: Some(lid.term),
+                            reason: "operation cancelled by tombstone in RefCasStateMachine".into(),
+                        }));
+                    }
+                    Ok(None)
                 }
-                _ => Ok(Some(AuthorityCommitOutcome::UnknownPending { reason: "pending".into() })),
+                OperationLookup::Known(rec) => match rec.state() {
+                    OperationState::Pending => {
+                        Ok(Some(AuthorityCommitOutcome::UnknownPending { reason: "pending".into() }))
+                    }
+                    OperationState::Cancelled => Ok(Some(AuthorityCommitOutcome::Cancelled {
+                        log_index: Some(lid.index),
+                        log_term: Some(lid.term),
+                        reason: "operation cancelled in RefCasStateMachine".into(),
+                    })),
+                    OperationState::Committed | OperationState::Rejected => {
+                        let t: CommitTerminal = serde_json::from_value(
+                            rec.terminal_result()
+                                .ok_or_else(|| RemoteMergeError::Equivocation("missing terminal_result".into()))?
+                                .value()
+                                .clone(),
+                        )
+                        .map_err(|e| RemoteMergeError::Equivocation(e.to_string()))?;
+                        Ok(Some(map_commit_receipt_to_outcome(
+                            lid,
+                            base_ref,
+                            &t,
+                            true,
+                            out.sm.read_refs(repo).get(base_ref).cloned(),
+                        )?))
+                    }
+                },
             }
         })
     }
