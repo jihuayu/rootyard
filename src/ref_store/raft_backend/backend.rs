@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use openraft::LogId;
-use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, Fatal, RaftError};
 use rootyard_refcas_log::state_machine::{
     ApplicationCommand, ApplicationLogId, ApplicationRuntimeSnapshot, ApplicationStateMachine,
 };
@@ -24,6 +24,10 @@ use crate::ref_store::raft_backend::scope_close_requirement::{
 };
 use crate::ref_store::raft_backend::scope_drain::CommittedScopeDrain;
 use crate::ref_store::raft_backend::view::CommittedRefCasView;
+
+mod cause;
+
+use self::cause::{ReadOperation, Site};
 
 const MAX_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -152,13 +156,8 @@ impl RootRaftRefCasBackend {
     /// This performs the actual quorum ReadIndex plus local applied barrier but deliberately does
     /// not validate or mint a ref view, so it also works before `InitializeGate` exists.
     pub async fn prepare_proposal_id(&self) -> Result<ProposalId, RaftBackendError> {
-        let read_log_id = ensure_linearizable_read(
-            &self.node,
-            self.options.quorum_timeout,
-            "prepare read index",
-            "prepare read index timeout",
-        )
-        .await?;
+        let read_log_id =
+            ensure_linearizable_read(&self.node, self.options.quorum_timeout, ReadOperation::Prepare).await?;
         let snapshot = self.await_applied_snapshot(read_log_id.map(ApplicationLogId::from_log_id)).await?;
         let issued_at_index =
             snapshot.applied.map(ApplicationLogId::from_log_id).map(|coordinate| coordinate.index).unwrap_or(0);
@@ -240,8 +239,19 @@ impl RootRaftRefCasBackend {
             Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(fwd)))) => {
                 Err(RaftBackendError::FollowerRedirect(fwd.leader_id))
             }
-            Ok(Err(_)) => Err(RaftBackendError::QuorumUnavailable("client write")),
-            Err(_) => Err(RaftBackendError::QuorumUnavailable("client write timeout")),
+            Ok(Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(_)))) => {
+                Err(RaftBackendError::QuorumUnavailable(Site::ClientWriteApiOther.code()))
+            }
+            Ok(Err(RaftError::Fatal(Fatal::StorageError(_)))) => {
+                Err(RaftBackendError::QuorumUnavailable(Site::ClientWriteFatalStorage.code()))
+            }
+            Ok(Err(RaftError::Fatal(Fatal::Panicked))) => {
+                Err(RaftBackendError::QuorumUnavailable(Site::ClientWriteFatalPanicked.code()))
+            }
+            Ok(Err(RaftError::Fatal(Fatal::Stopped))) => {
+                Err(RaftBackendError::QuorumUnavailable(Site::ClientWriteFatalStopped.code()))
+            }
+            Err(_) => Err(RaftBackendError::QuorumUnavailable(Site::ClientWriteOuterDeadline.code())),
         }
     }
 
@@ -293,13 +303,8 @@ impl RootRaftRefCasBackend {
     }
 
     async fn read_receipt_reducer(&self) -> Result<RootRefCasStateMachine, RaftBackendError> {
-        let read_log_id = ensure_linearizable_read(
-            &self.node,
-            self.options.quorum_timeout,
-            "receipt read index",
-            "receipt read index timeout",
-        )
-        .await?;
+        let read_log_id =
+            ensure_linearizable_read(&self.node, self.options.quorum_timeout, ReadOperation::Receipt).await?;
         let snapshot = self.await_applied_snapshot(read_log_id.map(ApplicationLogId::from_log_id)).await?;
         snapshot
             .reducer
@@ -325,8 +330,7 @@ impl RootRaftRefCasBackend {
             return Err(RaftBackendError::StaleRealm);
         }
         let read_log_id =
-            ensure_linearizable_read(&self.node, self.options.quorum_timeout, "read index", "read index timeout")
-                .await?;
+            ensure_linearizable_read(&self.node, self.options.quorum_timeout, ReadOperation::ReadView).await?;
 
         self.await_applied_and_mint(read_log_id).await
     }
@@ -385,11 +389,10 @@ impl RootRaftRefCasBackend {
 }
 
 /// Shared actual ReadIndex with explicit follower/no-quorum/timeout mapping.
-pub(crate) async fn ensure_linearizable_read(
+async fn ensure_linearizable_read(
     node: &RootRaftNode,
     timeout: Duration,
-    operation: &'static str,
-    timeout_operation: &'static str,
+    operation: ReadOperation,
 ) -> Result<Option<LogId<u64>>, RaftBackendError> {
     let raft = node.raft();
     match tokio::time::timeout(timeout, raft.ensure_linearizable()).await {
@@ -397,8 +400,19 @@ pub(crate) async fn ensure_linearizable_read(
         Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(fwd)))) => {
             Err(RaftBackendError::FollowerRedirect(fwd.leader_id))
         }
-        Ok(Err(_)) => Err(RaftBackendError::QuorumUnavailable(operation)),
-        Err(_) => Err(RaftBackendError::QuorumUnavailable(timeout_operation)),
+        Ok(Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(_)))) => {
+            Err(RaftBackendError::QuorumUnavailable(operation.quorum_shortfall().code()))
+        }
+        Ok(Err(RaftError::Fatal(Fatal::StorageError(_)))) => {
+            Err(RaftBackendError::QuorumUnavailable(operation.fatal_storage().code()))
+        }
+        Ok(Err(RaftError::Fatal(Fatal::Panicked))) => {
+            Err(RaftBackendError::QuorumUnavailable(operation.fatal_panicked().code()))
+        }
+        Ok(Err(RaftError::Fatal(Fatal::Stopped))) => {
+            Err(RaftBackendError::QuorumUnavailable(operation.fatal_stopped().code()))
+        }
+        Err(_) => Err(RaftBackendError::QuorumUnavailable(operation.outer_deadline().code())),
     }
 }
 
@@ -440,13 +454,7 @@ pub(crate) async fn read_scope_drain(
 ) -> Result<CommittedScopeDrain, RaftBackendError> {
     options.validate()?;
     requirement.validate_node_binding(node.trust())?;
-    let read_log_id = ensure_linearizable_read(
-        node,
-        options.quorum_timeout,
-        "scope drain read index",
-        "scope drain read index timeout",
-    )
-    .await?;
+    let read_log_id = ensure_linearizable_read(node, options.quorum_timeout, ReadOperation::ScopeDrain).await?;
     let read_index = read_log_id.map(|log_id| log_id.index);
     let close_index = requirement.close_log_id().index;
     let barrier_index = read_index.map_or(close_index, |read| read.max(close_index));

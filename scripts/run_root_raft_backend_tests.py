@@ -73,7 +73,9 @@ _FAILURE_FRAME = re.compile(
 )
 _REAL_PHASES = frozenset(
     (
-        "bootstrap", "provision", "commit", "refusal", "concurrent", "closing_write",
+        "bootstrap", "provision", "commit", "semantic_input_write",
+        "semantic_input_view", "semantic_identity_write", "semantic_identity_view",
+        "semantic_healthy_write", "semantic_healthy_view", "concurrent", "closing_write",
         "closing_view", "refused_write", "refused_view", "refusal_lookup",
         "refusal_replay", "healthy_write", "healthy_view", "standalone_probe",
         "follower", "isolation", "live_axes", "snapshot", "install", "reopen",
@@ -100,10 +102,56 @@ _FAILURE_CLASSES = frozenset(
 )
 _FAILURE_CASES = {REQUIRED_CASES[0]: _REAL_PHASES, REQUIRED_CASES[2]: _SCOPE_PHASES}
 _FAILURE_STATUS = {"ok": "passed", "FAILED": "failed", "ignored": "ignored"}
+_DIAGNOSTIC_PREFIX = "ROOTYARD_QUORUM_DIAGNOSTICS v1 "
+_DIAGNOSTIC_SCHEMA = "rootyard.quorum_diagnostics.v1"
+_MAX_DIAGNOSTIC_FRAME_BYTES = 8_192
+_MAX_DIAGNOSTIC_ELAPSED_MS = 900_000
+_MAX_DIAGNOSTIC_TERM = 1_000_000_000
+_MAX_DIAGNOSTIC_LOG_INDEX = 1_000_000_000_000
+_MAX_DIAGNOSTIC_VOTER_COUNT = 3
+_MAX_DIAGNOSTIC_MILLIS = 900_000
+_DIAGNOSTIC_READ_CAUSES = frozenset(
+    (
+        "read_quorum_shortfall", "read_forward", "read_fatal_storage",
+        "read_fatal_panicked", "read_fatal_stopped", "read_outer_deadline",
+        "unclassified",
+    )
+)
+_DIAGNOSTIC_WRITE_CAUSES = frozenset(
+    (
+        "write_forward", "write_fatal_storage", "write_fatal_panicked",
+        "write_fatal_stopped", "write_api_other", "write_outer_deadline",
+        "unclassified",
+    )
+)
+_DIAGNOSTIC_CAUSES_BY_OPERATION = {
+    "prepare": _DIAGNOSTIC_READ_CAUSES,
+    "read_view": _DIAGNOSTIC_READ_CAUSES,
+    "receipt": _DIAGNOSTIC_READ_CAUSES,
+    "scope_drain": _DIAGNOSTIC_READ_CAUSES,
+    "client_write": _DIAGNOSTIC_WRITE_CAUSES,
+}
+_DIAGNOSTIC_RUNNING_STATES = frozenset(("ok", "storage_fatal", "panicked", "stopped"))
+_DIAGNOSTIC_SERVER_STATES = frozenset(("learner", "follower", "candidate", "leader", "shutdown"))
+_DIAGNOSTIC_LEADER_SLOTS = frozenset(("none", "slot1", "slot2", "slot3", "other"))
+_DIAGNOSTIC_TOP_KEYS = frozenset(
+    (
+        "schema", "case", "phase", "operation", "cause", "elapsed_ms",
+        "elapsed_overflow", "snapshots",
+    )
+)
+_DIAGNOSTIC_SNAPSHOT_KEYS = frozenset(("at", "nodes"))
+_DIAGNOSTIC_NODE_KEYS = frozenset(
+    (
+        "slot", "running_state", "server_state", "leader_slot", "term",
+        "last_log_index", "last_applied_index", "voter_count",
+        "millis_since_quorum_ack", "numeric_overflow",
+    )
+)
 _DIAGNOSTIC_KEYS = (
     "exit_code", "signal", "evidence_complete", "suite_counts", "case_failures",
     "failure_phase", "failure_class", "unknown_case", "diagnostics_valid",
-    "evidence_unchanged",
+    "evidence_unchanged", "quorum_diagnostics",
 )
 
 
@@ -144,6 +192,7 @@ class FailureEvidence:
     failure_class: str | None
     unknown_case: bool
     diagnostics_valid: bool
+    quorum_diagnostics: list[dict]
 
 
 def _safe_digest(path) -> str | None:
@@ -488,6 +537,149 @@ def execute_case(binary: Path, timeout: float, *, run=subprocess.Popen) -> Execu
     return ExecutionResult(stdout, stderr, returncode, None, "exited", state["truncated"])
 
 
+def _diagnostic_int(value, minimum=0, maximum=None) -> bool:
+    if type(value) is not int or value < minimum:
+        return False
+    return maximum is None or value <= maximum
+
+
+def _diagnostic_optional_int(value, minimum, maximum) -> bool:
+    return value is None or _diagnostic_int(value, minimum, maximum)
+
+
+def _diagnostic_no_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def _parse_quorum_diagnostic(line) -> tuple[str, dict]:
+    """Validate and safely rebuild one bounded diagnostic JSON frame.
+
+    Any unknown, duplicate or extra field, bad type/range, wrong case/phase or oversized frame
+    raises ``ValueError`` without reflecting the raw value. The returned object is rebuilt from
+    only the validated fields.
+    """
+    if not isinstance(line, str) or len(line.encode("utf-8")) > _MAX_DIAGNOSTIC_FRAME_BYTES:
+        raise ValueError
+    if not line.startswith(_DIAGNOSTIC_PREFIX):
+        raise ValueError
+    try:
+        payload = json.loads(
+            line[len(_DIAGNOSTIC_PREFIX):],
+            object_pairs_hook=_diagnostic_no_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError from None
+    if not isinstance(payload, dict) or set(payload) != _DIAGNOSTIC_TOP_KEYS:
+        raise ValueError
+    if payload.get("schema") != _DIAGNOSTIC_SCHEMA:
+        raise ValueError
+    case = payload.get("case")
+    phase = payload.get("phase")
+    operation = payload.get("operation")
+    cause = payload.get("cause")
+    if not isinstance(case, str) or not case:
+        raise ValueError
+    if not isinstance(phase, str) or phase not in _REAL_PHASES:
+        raise ValueError
+    if not isinstance(operation, str) or operation not in _DIAGNOSTIC_CAUSES_BY_OPERATION:
+        raise ValueError
+    if not isinstance(cause, str) or cause not in _DIAGNOSTIC_CAUSES_BY_OPERATION[operation]:
+        raise ValueError
+    elapsed_ms = payload.get("elapsed_ms")
+    elapsed_overflow = payload.get("elapsed_overflow")
+    if not _diagnostic_int(elapsed_ms, 0, _MAX_DIAGNOSTIC_ELAPSED_MS):
+        raise ValueError
+    if type(elapsed_overflow) is not bool:
+        raise ValueError
+    if elapsed_overflow and elapsed_ms != _MAX_DIAGNOSTIC_ELAPSED_MS:
+        raise ValueError
+    snapshots = payload.get("snapshots")
+    if not isinstance(snapshots, list) or len(snapshots) != 2:
+        raise ValueError
+    rebuilt_snapshots = []
+    for snapshot_index, expected_at in enumerate(("before", "after")):
+        snapshot = snapshots[snapshot_index]
+        if not isinstance(snapshot, dict) or set(snapshot) != _DIAGNOSTIC_SNAPSHOT_KEYS:
+            raise ValueError
+        if snapshot.get("at") != expected_at:
+            raise ValueError
+        nodes = snapshot.get("nodes")
+        if not isinstance(nodes, list) or len(nodes) != 3:
+            raise ValueError
+        rebuilt_nodes = []
+        for expected_slot, node in zip((1, 2, 3), nodes):
+            if not isinstance(node, dict) or set(node) != _DIAGNOSTIC_NODE_KEYS:
+                raise ValueError
+            if type(node.get("slot")) is not int or node.get("slot") != expected_slot:
+                raise ValueError
+            running_state = node.get("running_state")
+            server_state = node.get("server_state")
+            leader_slot = node.get("leader_slot")
+            if not isinstance(running_state, str) or running_state not in _DIAGNOSTIC_RUNNING_STATES:
+                raise ValueError
+            if not isinstance(server_state, str) or server_state not in _DIAGNOSTIC_SERVER_STATES:
+                raise ValueError
+            if not isinstance(leader_slot, str) or leader_slot not in _DIAGNOSTIC_LEADER_SLOTS:
+                raise ValueError
+            term = node.get("term")
+            last_log_index = node.get("last_log_index")
+            last_applied_index = node.get("last_applied_index")
+            voter_count = node.get("voter_count")
+            millis_since_quorum_ack = node.get("millis_since_quorum_ack")
+            numeric_overflow = node.get("numeric_overflow")
+            if not _diagnostic_optional_int(term, 0, _MAX_DIAGNOSTIC_TERM):
+                raise ValueError
+            if not _diagnostic_optional_int(last_log_index, 0, _MAX_DIAGNOSTIC_LOG_INDEX):
+                raise ValueError
+            if not _diagnostic_optional_int(last_applied_index, 0, _MAX_DIAGNOSTIC_LOG_INDEX):
+                raise ValueError
+            if not _diagnostic_optional_int(voter_count, 0, _MAX_DIAGNOSTIC_VOTER_COUNT):
+                raise ValueError
+            if not _diagnostic_optional_int(millis_since_quorum_ack, 0, _MAX_DIAGNOSTIC_MILLIS):
+                raise ValueError
+            if type(numeric_overflow) is not bool:
+                raise ValueError
+            if numeric_overflow and not any(
+                (
+                    term == _MAX_DIAGNOSTIC_TERM,
+                    last_log_index == _MAX_DIAGNOSTIC_LOG_INDEX,
+                    last_applied_index == _MAX_DIAGNOSTIC_LOG_INDEX,
+                    millis_since_quorum_ack == _MAX_DIAGNOSTIC_MILLIS,
+                )
+            ):
+                raise ValueError
+            rebuilt_nodes.append(
+                {
+                    "slot": expected_slot,
+                    "running_state": running_state,
+                    "server_state": server_state,
+                    "leader_slot": leader_slot,
+                    "term": term,
+                    "last_log_index": last_log_index,
+                    "last_applied_index": last_applied_index,
+                    "voter_count": voter_count,
+                    "millis_since_quorum_ack": millis_since_quorum_ack,
+                    "numeric_overflow": numeric_overflow,
+                }
+            )
+        rebuilt_snapshots.append({"at": expected_at, "nodes": rebuilt_nodes})
+    return case, {
+        "schema": _DIAGNOSTIC_SCHEMA,
+        "case": case,
+        "phase": phase,
+        "operation": operation,
+        "cause": cause,
+        "elapsed_ms": elapsed_ms,
+        "elapsed_overflow": elapsed_overflow,
+        "snapshots": rebuilt_snapshots,
+    }
+
+
 def collect_failure_evidence(
     stdout, stderr="", *, capture_truncated=False
 ) -> FailureEvidence:
@@ -500,6 +692,8 @@ def collect_failure_evidence(
     summaries = []
     case_lines = []
     frame_sets: dict[str, set[tuple[str, str]]] = {}
+    quorum_frames: list[tuple[str, dict]] = []
+    quorum_seen: dict[str, int] = {}
     unknown_case = False
     diagnostics_invalid = False
     for raw_line in stdout.splitlines():
@@ -521,6 +715,25 @@ def collect_failure_evidence(
                 case_lines.append((name, outcome))
     for raw_line in stderr.splitlines():
         line = _ANSI.sub("", raw_line).strip()
+        if line.startswith(_DIAGNOSTIC_PREFIX):
+            try:
+                name, safe = _parse_quorum_diagnostic(line)
+            except (TypeError, ValueError):
+                diagnostics_invalid = True
+                continue
+            if name not in REQUIRED_CASES:
+                unknown_case = True
+                diagnostics_invalid = True
+                continue
+            if name != REQUIRED_CASES[0]:
+                diagnostics_invalid = True
+                continue
+            quorum_seen[name] = quorum_seen.get(name, 0) + 1
+            if quorum_seen[name] == 1:
+                quorum_frames.append((name, safe))
+            else:
+                diagnostics_invalid = True
+            continue
         match = _FAILURE_FRAME.fullmatch(line)
         if match:
             name, phase, class_code = match.groups()
@@ -603,6 +816,27 @@ def collect_failure_evidence(
         elif len(frames) == 1:
             phase, class_code = next(iter(frames))
             case_failures.append({"case": case, "phase": phase, "class": class_code})
+    quorum_diagnostics = []
+    for case, safe in quorum_frames:
+        if quorum_seen.get(case, 0) != 1:
+            diagnostics_invalid = True
+            continue
+        if by_name.get(case) != "FAILED":
+            diagnostics_invalid = True
+            continue
+        frames = frame_sets.get(case, set())
+        if len(frames) > 1:
+            diagnostics_invalid = True
+            continue
+        if len(frames) == 1:
+            phase, _class_code = next(iter(frames))
+            if phase != safe["phase"]:
+                diagnostics_invalid = True
+                continue
+        quorum_diagnostics.append(safe)
+    quorum_diagnostics.sort(key=lambda item: REQUIRED_CASES.index(item["case"]))
+    if diagnostics_invalid:
+        quorum_diagnostics = []
     scalar_is_unambiguous = (
         len(case_failures) == 1
         and not diagnostics_invalid
@@ -621,6 +855,7 @@ def collect_failure_evidence(
         failure_class=failure_class,
         unknown_case=unknown_case,
         diagnostics_valid=not diagnostics_invalid,
+        quorum_diagnostics=quorum_diagnostics,
     )
 
 
@@ -695,6 +930,7 @@ def _failure_diagnostics(execution, evidence, evidence_unchanged) -> dict:
         "unknown_case": evidence.unknown_case,
         "diagnostics_valid": evidence.diagnostics_valid,
         "evidence_unchanged": evidence_unchanged,
+        "quorum_diagnostics": evidence.quorum_diagnostics,
     }
 
 
