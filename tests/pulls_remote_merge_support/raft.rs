@@ -137,9 +137,9 @@ impl LiveRaft3 {
         );
         ensure!(bin.is_file(), "missing {}", bin.display());
         let (pki, data) = (TempDir::new()?, TempDir::new()?);
-        let r = pki.path();
+        let r = pki.path().to_path_buf();
         run_ssl(
-            r,
+            &r,
             &[
                 "req",
                 "-x509",
@@ -166,7 +166,7 @@ impl LiveRaft3 {
                 ),
             )?;
             run_ssl(
-                r,
+                &r,
                 &[
                     "req",
                     "-new",
@@ -184,7 +184,7 @@ impl LiveRaft3 {
                 ],
             )?;
             run_ssl(
-                r,
+                &r,
                 &[
                     "x509",
                     "-req",
