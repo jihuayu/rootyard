@@ -118,7 +118,7 @@ async fn handle_s3(State(st): State<Arc<S3State>>, method: Method, uri: Uri, bod
                     entry.1 += d.len() as u64;
                 }
                 let tag = format!("\"{}\"", &hex::encode(Sha256::digest(&d))[..32]);
-                let len = if method == Method::HEAD { "0".into() } else { d.len().to_string() };
+                let len = d.len().to_string();
                 (
                     [(header::ETAG, tag), (header::CONTENT_LENGTH, len)],
                     if method == Method::HEAD { Body::empty() } else { Body::from(d) },

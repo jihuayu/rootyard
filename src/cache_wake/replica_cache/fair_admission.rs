@@ -123,12 +123,12 @@ impl TenantFairShareGate {
         deadline: Instant,
     ) -> Result<(FairAdmissionPermit, u64), ReplicaCacheError> {
         let started = Instant::now();
-        let rx_opt = {
+        let mut rx_opt = {
             let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let t_active = guard.tenant_active.get(&tenant_id).copied().unwrap_or(0);
             if guard.total_active < self.cfg.max_total_inflight
                 && t_active < self.cfg.max_per_tenant_inflight
-                && guard.total_waiters == 0
+                && guard.wait_queues.get(&tenant_id).is_none_or(VecDeque::is_empty)
             {
                 grant_slot(&mut guard, tenant_id);
                 return Ok((
@@ -156,7 +156,7 @@ impl TenantFairShareGate {
             .filter(|d| !d.is_zero())
             .ok_or(ReplicaCacheError::DeadlineExceeded)?;
         let budget = self.cfg.admission_timeout.min(remaining);
-        match tokio::time::timeout(budget, rx_opt).await {
+        match tokio::time::timeout(budget, &mut rx_opt).await {
             Ok(Ok(())) => {
                 let waited_us = started.elapsed().as_micros() as u64;
                 let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -167,6 +167,15 @@ impl TenantFairShareGate {
                 ))
             }
             _ => {
+                rx_opt.close();
+                if rx_opt.try_recv().is_ok() {
+                    drop(FairAdmissionPermit {
+                        tenant_id,
+                        cfg: self.cfg,
+                        state: Arc::clone(&self.state),
+                        released: false,
+                    });
+                }
                 let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 prune_closed_waiters(&mut guard, tenant_id);
                 guard.total_rejected = guard.total_rejected.saturating_add(1);
@@ -210,34 +219,44 @@ fn prune_closed_waiters(guard: &mut FairGateState, tenant_id: Uuid) {
 }
 
 fn dispatch_next_fair_waiters(guard: &mut FairGateState, cfg: &TenantFairShareConfig) {
-    let rounds = guard.rr_order.len();
-    for _ in 0..rounds {
-        if guard.total_active >= cfg.max_total_inflight {
+    while guard.total_active < cfg.max_total_inflight {
+        let rounds = guard.rr_order.len();
+        if rounds == 0 {
             break;
         }
-        let Some(tenant_id) = guard.rr_order.pop_front() else {
-            break;
-        };
-        prune_closed_waiters(guard, tenant_id);
-        let t_active = guard.tenant_active.get(&tenant_id).copied().unwrap_or(0);
-        if t_active >= cfg.max_per_tenant_inflight {
+        let mut made_progress = false;
+        for _ in 0..rounds {
+            if guard.total_active >= cfg.max_total_inflight {
+                break;
+            }
+            let Some(tenant_id) = guard.rr_order.pop_front() else {
+                break;
+            };
+            prune_closed_waiters(guard, tenant_id);
+            let t_active = guard.tenant_active.get(&tenant_id).copied().unwrap_or(0);
+            if t_active >= cfg.max_per_tenant_inflight {
+                if guard.wait_queues.contains_key(&tenant_id) {
+                    guard.rr_order.push_back(tenant_id);
+                }
+                continue;
+            }
+            while let Some(waiter) = guard.wait_queues.get_mut(&tenant_id).and_then(VecDeque::pop_front) {
+                guard.total_waiters = guard.total_waiters.saturating_sub(1);
+                if waiter.tx.send(()).is_ok() {
+                    grant_slot(guard, tenant_id);
+                    made_progress = true;
+                    break;
+                }
+            }
+            if guard.wait_queues.get(&tenant_id).is_some_and(VecDeque::is_empty) {
+                guard.wait_queues.remove(&tenant_id);
+            }
             if guard.wait_queues.contains_key(&tenant_id) {
                 guard.rr_order.push_back(tenant_id);
             }
-            continue;
         }
-        while let Some(waiter) = guard.wait_queues.get_mut(&tenant_id).and_then(VecDeque::pop_front) {
-            guard.total_waiters = guard.total_waiters.saturating_sub(1);
-            if waiter.tx.send(()).is_ok() {
-                grant_slot(guard, tenant_id);
-                break;
-            }
-        }
-        if guard.wait_queues.get(&tenant_id).is_some_and(VecDeque::is_empty) {
-            guard.wait_queues.remove(&tenant_id);
-        }
-        if guard.wait_queues.contains_key(&tenant_id) {
-            guard.rr_order.push_back(tenant_id);
+        if !made_progress {
+            break;
         }
     }
 }
