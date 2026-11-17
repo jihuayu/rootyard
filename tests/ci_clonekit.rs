@@ -61,7 +61,7 @@ fn init_repo(parent: &Path, name: &str, fmt: CloneKitObjectFormat) -> Result<Pat
     let dir = parent.join(name);
     fs::create_dir_all(&dir)?;
     for a in [
-        &["init", "--quiet", fmt.git_init_flag()][..],
+        &["init", "--quiet", "-b", "main", fmt.git_init_flag()][..],
         &["config", "user.name", "ck"],
         &["config", "user.email", "ck@test"],
         &["config", "uploadpack.allowAnySHA1InWant", "true"],
