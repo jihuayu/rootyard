@@ -201,7 +201,7 @@ impl VaultTransitProvider {
 
     pub(super) async fn unwrap(&self, wrapped: &PandoWrappedDek, context: &WrapContext) -> Result<PandoDataKey> {
         let deadline = self.operation_deadline();
-        let latest_version = self.read_key_metadata(deadline).await?;
+        let latest_version = self.read_key_metadata(deadline).await?.0;
         let (key_id, _key_version, ciphertext) = self.versioned_parts(wrapped, latest_version)?;
         ensure!(key_id == self.config.key_name.as_str(), "Vault Transit wrapped DEK key id mismatch");
         let context = self.context_b64(context)?;
@@ -272,7 +272,7 @@ impl VaultTransitProvider {
         Ok((key_id, *key_version, ciphertext))
     }
 
-    async fn read_key_metadata(&self, deadline: Instant) -> Result<i32> {
+    async fn read_key_metadata(&self, deadline: Instant) -> Result<(i32, i32)> {
         let bytes = self.call(Method::GET, &format!("keys/{}", self.config.key_name), None, deadline).await?;
         parse_key_metadata(&bytes)
     }

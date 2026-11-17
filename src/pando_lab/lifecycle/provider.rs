@@ -347,10 +347,11 @@ impl KeyProvider for PandoKmsProvider {
             Some(_) => return Err(KeyProviderError::KeyRing("active KMS key is revoked")),
             None => return Err(KeyProviderError::MissingKey(self.active_key_id.clone())),
         }
-        self.inner
-            .as_ref()
-            .ok_or_else(|| KeyProviderError::MissingKey(self.active_key_id.clone()))?
-            .wrap_data_key(data_key, context)
+        KeyProvider::wrap_data_key(
+            self.inner.as_ref().ok_or_else(|| KeyProviderError::MissingKey(self.active_key_id.clone()))?,
+            data_key,
+            context,
+        )
     }
 
     fn unwrap_data_key(
@@ -359,10 +360,11 @@ impl KeyProvider for PandoKmsProvider {
         context: &WrapContext,
     ) -> std::result::Result<DataKey, KeyProviderError> {
         self.check_readable_policy(wrapped.key_id().as_str(), None)?;
-        self.inner
-            .as_ref()
-            .ok_or_else(|| KeyProviderError::MissingKey(wrapped.key_id().clone()))?
-            .unwrap_data_key(wrapped, context)
+        KeyProvider::unwrap_data_key(
+            self.inner.as_ref().ok_or_else(|| KeyProviderError::MissingKey(wrapped.key_id().clone()))?,
+            wrapped,
+            context,
+        )
     }
 
     fn capabilities(&self) -> KeyProviderCapabilities {

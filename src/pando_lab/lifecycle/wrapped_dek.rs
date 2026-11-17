@@ -41,7 +41,7 @@ impl fmt::Debug for PandoWrappedDek {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Local(wrapped) => f.debug_tuple("Local").field(wrapped).finish(),
-            Self::Versioned { provider_kind, key_id, key_version, payload } => f
+            Self::Versioned { provider_kind, key_id: _, key_version, payload } => f
                 .debug_struct("Versioned")
                 .field("provider_kind", provider_kind)
                 .field("key_id", &"<redacted>")

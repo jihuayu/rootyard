@@ -134,7 +134,7 @@ pub(super) async fn rewrap_existing_envelope(
 }
 
 fn same_dek(left: &super::data_key::PandoDataKey, right: &super::data_key::PandoDataKey) -> bool {
-    ring::constant_time::verify_slices_are_equal(left.expose_secret(), right.expose_secret()).is_ok()
+    rootyard::webhooks::signing::constant_time_eq(left.expose_secret(), right.expose_secret())
 }
 
 pub(super) fn read_pack_cipher(s_root: &Path, repo: Uuid, pack: &Pack) -> Result<Vec<u8>> {
