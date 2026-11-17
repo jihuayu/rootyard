@@ -193,7 +193,7 @@ pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOption
     for pin in &opts.pin_oids {
         ensure!(valid_sha1_oid(pin), "invalid --pin-oid '{pin}'");
     }
-    let mut c = config.db().await?;
+    let c = config.db().await?;
     let meta = c
         .query_one(
             "SELECT generation,storage_generation,storage_backend,write_paused FROM pando_lab.repositories WHERE id=$1",
