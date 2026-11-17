@@ -8,7 +8,7 @@ use std::{
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
     process::Command,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -39,32 +39,29 @@ struct OpenDalDriver {
     op: Operator,
 }
 
-static SHARED_S3: OnceLock<LoopbackS3> = OnceLock::new();
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 impl LoopbackS3 {
-    fn shared() -> &'static Self {
-        SHARED_S3.get_or_init(|| {
-            let objects: ObjMap = Arc::default();
-            let (srv, l) = (Arc::clone(&objects), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
-            l.set_nonblocking(true).unwrap();
-            let (port, (tx, rx)) = (l.local_addr().unwrap().port(), std::sync::mpsc::sync_channel(1));
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-                rt.block_on(async move {
-                    let l = tokio::net::TcpListener::from_std(l).unwrap();
-                    let _ = tx.send(());
-                    let _ = axum::serve(l, Router::new().fallback(handle_s3).with_state(srv)).await;
-                });
+    fn start() -> Self {
+        let objects: ObjMap = Arc::default();
+        let (srv, l) = (Arc::clone(&objects), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        l.set_nonblocking(true).unwrap();
+        let (port, (tx, rx)) = (l.local_addr().unwrap().port(), std::sync::mpsc::sync_channel(1));
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            rt.block_on(async move {
+                let l = tokio::net::TcpListener::from_std(l).unwrap();
+                let _ = tx.send(());
+                let _ = axum::serve(l, Router::new().fallback(handle_s3).with_state(srv)).await;
             });
-            rx.recv().unwrap();
-            Self { endpoint: format!("http://127.0.0.1:{port}"), objects }
-        })
+        });
+        rx.recv().unwrap();
+        Self { endpoint: format!("http://127.0.0.1:{port}"), objects }
     }
 
     fn open_store(&self, root: &str) -> Result<BlobStore> {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let fixed = "DRIVER=opendal SERVICE=s3 BUCKET=merkle-test-bucket REGION=us-east-1 ACCESS_KEY_ID=test-ak SECRET_ACCESS_KEY=test-sk ENCRYPTION_MODE=provider-managed RETRY_MAX_TIMES=0 MAX_OBJECT_BYTES=8388608";
+        let fixed = "DRIVER=opendal SERVICE=s3 BUCKET=merkle-test-bucket REGION=us-east-1 ACCESS_KEY_ID=test-ak SECRET_ACCESS_KEY=test-sk ENCRYPTION_MODE=provider-managed RETRY_MAX_TIMES=3 MAX_OBJECT_BYTES=8388608";
         let mut pairs: Vec<(String, Option<String>)> = fixed
             .split(' ')
             .map(|kv| {
@@ -111,7 +108,10 @@ async fn handle_s3(State(objs): State<ObjMap>, method: Method, uri: Uri, body: B
         format!("\"{}\"", &hex::encode(Sha256::digest(d))[..32])
     });
     let reply = |code: StatusCode, t: Option<String>, len: usize, b: Body| {
-        let mut r = Response::builder().status(code).header(header::CONTENT_LENGTH, len.to_string());
+        let mut r = Response::builder()
+            .status(code)
+            .header(header::CONTENT_LENGTH, len.to_string())
+            .header(header::CONNECTION, "close");
         if let Some(v) = t {
             r = r.header(header::ETAG, v);
         }
@@ -189,6 +189,7 @@ fn seed_git_repo(repo: &Path, fmt: &str, files: &[(&str, &[u8])]) -> Result<()> 
 }
 
 struct SyncEnv {
+    s3: LoopbackS3,
     root_prefix: String,
     store: BlobStore,
     driver: OpenDalDriver,
@@ -202,7 +203,7 @@ struct SyncEnv {
 impl SyncEnv {
     fn new(tag: &str) -> Result<Self> {
         let (s3, root_prefix, fences, dir) = (
-            LoopbackS3::shared(),
+            LoopbackS3::start(),
             format!("{tag}-{}", Uuid::new_v4().simple()),
             ms::HistoryFenceRegistry::new(),
             TempDir::new()?,
@@ -213,6 +214,7 @@ impl SyncEnv {
             ledger: ms::MerkleCheckpointLedger::new(),
             holds: ms::PinHoldRegistry::new(),
             auth: ms::LiveWorkspaceAuthRegistry::new(fences.clone()),
+            s3,
             fences,
             root_prefix,
             dir,
@@ -392,19 +394,18 @@ async fn blob_first_incremental_sync_crash_tamper_and_cross_node_restore_fork() 
     let cp2 = s2.manifest.checkpoint_id;
 
     fs::remove_dir_all(&src_repo)?;
-    let (s3, m_key) =
-        (LoopbackS3::shared(), LoopbackS3::key(&h.root_prefix, &up2.manifest_locator.to_locator()?.path()));
-    let saved_m = s3.objects.lock().unwrap().remove(&m_key).unwrap();
+    let m_key = LoopbackS3::key(&h.root_prefix, &up2.manifest_locator.to_locator()?.path());
+    let saved_m = h.s3.objects.lock().unwrap().remove(&m_key).unwrap();
     let restore_fail = h.dir.path().join("node-b-fail");
     ensure!(h.restore(&ctx1, cp2, &restore_fail, "b").await.is_err() && !restore_fail.exists());
 
-    s3.objects.lock().unwrap().insert(m_key.clone(), {
+    h.s3.objects.lock().unwrap().insert(m_key.clone(), {
         let mut t = saved_m.clone();
         t[0] ^= 0xff;
         t
     });
     ensure!(h.restore(&ctx1, cp2, &restore_fail, "b").await.is_err());
-    s3.objects.lock().unwrap().insert(m_key, saved_m);
+    h.s3.objects.lock().unwrap().insert(m_key, saved_m);
 
     for (agent, sub) in [("node-b", "restored-b"), ("node-c-fork", "forked-c")] {
         let target = h.dir.path().join(sub);
