@@ -203,6 +203,11 @@ pub(super) async fn push(
         Start::Cancelled(reason) => Ok(PushOutcome::Cancelled(reason)),
         Start::Rebaseline => Err(GatewayError::Internal("admission rebase escaped its bounded loop")),
         Start::Fresh { plan, _token: token } => {
+            // Test-only rendezvous after the pending operation is durable and
+            // before prepare/select/verify/commit. Absent from every non-test
+            // build and unreachable from any request or configuration.
+            #[cfg(test)]
+            state.pause_after_admission(operation_id).await;
             let result = async {
                 for (index, pair) in pairs.iter().enumerate() {
                     let planned =

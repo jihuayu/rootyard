@@ -23,6 +23,15 @@
 //! 5. B's refreshed native facts must select `OldOidMismatch`, and only that
 //!    durable terminal may produce the raw `ng refs/heads/main stale info`.
 //!
+//! A second case uses the same rendezvous in a post-admission phase. B is
+//! paused after its pending operation is durable and before prepare, A commits
+//! a different ref, then B is released. The original AC requires both
+//! independent refs to commit with exact `ok` report-statuses. The current
+//! repo-wide gate is expected to reject B as `stale info`; this case records
+//! that known source gap rather than weakening the expectation. It does not
+//! prove slow HTTP body overlap and does not cover AC3 GC, backup, PR merge,
+//! crash or Raft.
+//!
 //! The external `tests/blob_git_gateway.rs` race case and its exact one-ok /
 //! one-ng assertions remain untouched; it stays the unsynchronized stress case.
 //!
@@ -89,6 +98,8 @@ use crate::{
 const SEED_FILE: &str = "seed.txt";
 const SEED_CONTENT: &str = "seed\n";
 const SEED_REF: &str = "refs/heads/main";
+const INDEPENDENT_A: &str = "refs/heads/indep-a";
+const INDEPENDENT_B: &str = "refs/heads/indep-b";
 const MAX_CAPTURED_RESPONSE: usize = 64 * 1024 * 1024;
 const OWNED_BLOB_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB";
 
@@ -197,6 +208,194 @@ async fn pre_admission_revision_mismatch_rebases_to_old_oid_mismatch() -> Result
     require_per_run_blob_prefix()?;
     let outcome = case(&db).await;
     db.finish(outcome).await
+}
+
+#[tokio::test]
+#[ignore = "requires real PostgreSQL, S3-compatible Blob and Git"]
+async fn post_admission_independent_refs_both_commit() -> Result<()> {
+    require_owned_disposable_blob_fixture()?;
+    let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
+    let db = Db::setup().await?;
+    require_per_run_blob_prefix()?;
+    let outcome = independent_refs_case(&db).await;
+    db.finish(outcome).await
+}
+
+async fn independent_refs_case(db: &Db) -> Result<()> {
+    let store = open_store()?;
+    let git: &'static Git = Box::leak(Box::new(Git::new()?));
+    let owner = actor::owner(&db.pool).await?;
+    let name = format!("race-independent-{}", &Uuid::new_v4().simple().to_string()[..12]);
+
+    let first_operation = Uuid::new_v4();
+    let second_operation = Uuid::new_v4();
+    ensure!(first_operation != second_operation, "the independent race pins shared an operation id");
+
+    // The post-admission phase must not consume the existing pre-admission
+    // pause; `new_after_admission` is a distinct selector.
+    let pause = Arc::new(AdmissionPause::new_after_admission(second_operation));
+    let captures = Captures::default();
+    let scratch = tempfile::tempdir().context("temporary gateway scratch root")?;
+    let state = Arc::new(
+        BlobGitState::new(BlobGitConfig {
+            pool: db.pool.clone(),
+            store: store.clone(),
+            git_binary: git.binary().to_path_buf(),
+            scratch_root: scratch.path().to_path_buf(),
+            max_concurrent_requests: 4,
+            max_request_bytes: 16 * 1024 * 1024,
+            max_response_bytes: 64 * 1024 * 1024,
+            max_inflight_bytes: 64 * 1024 * 1024,
+            operation_deadline: Duration::from_secs(120),
+            native_limits: Default::default(),
+        })
+        .map_err(|error| anyhow!("gateway configuration was refused: {error}"))?
+        .with_admission_pause(pause.clone()),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = capture_receive_responses(router(state.clone()), captures.clone());
+    let _server = ServerGuard { task: tokio::spawn(async move { axum::serve(listener, app).await }) };
+
+    let created = create_repository(address, &owner, &name).await?;
+    let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
+    provision_decision_realm(db, &owner, &name, &store).await?;
+
+    // Seed one real main tip, then clone two independent worktrees from it.
+    let work = tempfile::tempdir().context("temporary Git work root")?;
+    let direct_url = clone_url(address, &owner, &name);
+    let seeded = git.clone(work.path(), &direct_url, "seed").await?;
+    ensure!(seeded.success, "real Smart HTTP clone of the empty repository failed");
+    let seed_dir = work.path().join("seed");
+    let seed = git.commit(&seed_dir, SEED_FILE, SEED_CONTENT, "seed commit").await?;
+    let seed_target = format!("HEAD:{SEED_REF}");
+    let pushed = git.run(&seed_dir, &["push", "origin", seed_target.as_str()]).await?;
+    ensure!(pushed.success, "seed push was refused");
+
+    let first_dir = clone_one(git, work.path(), &direct_url, "independent-a").await?;
+    let second_dir = clone_one(git, work.path(), &direct_url, "independent-b").await?;
+    let first_old = git.text(&first_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
+    let second_old = git.text(&second_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
+    ensure!(first_old == seed && second_old == seed, "the two clones did not share the seed tip");
+    let first_new = git.commit(&first_dir, "a.txt", "from a\n", "commit from a").await?;
+    let second_new = git.commit(&second_dir, "b.txt", "from b\n", "commit from b").await?;
+    ensure!(first_new != second_new, "the two independent commits are identical");
+    let revision_before = gate_revision(db, repository_id).await?;
+
+    // B reaches Start::Fresh and pauses with its pending row durable, before
+    // prepare can observe a later gate revision.
+    let mut second_push =
+        spawn_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B);
+    tokio::select! {
+        _ = pause.wait_reached() => {}
+        exited = &mut second_push => {
+            let output = exited.context("the paused independent push task failed")??;
+            return Err(anyhow!(
+                "the independent push exited before its post-admission rendezvous: {}",
+                redacted(&output)
+            ));
+        }
+    }
+    let (second_state, second_terminal) = operation_row(db, repository_id, second_operation)
+        .await?
+        .ok_or_else(|| anyhow!("the paused independent operation has no durable row"))?;
+    ensure!(second_state == "pending", "the paused independent operation is {second_state}, not pending");
+    ensure!(second_terminal.is_none(), "the paused independent operation already has a terminal");
+    ensure!(
+        gate_revision(db, repository_id).await? == revision_before,
+        "the gate moved before the first independent commit"
+    );
+
+    // A commits a different ref while B is paused after admission.
+    let first_output = spawn_push_ref(git, first_dir, direct_url, first_operation, INDEPENDENT_A).await?;
+    let first_output = first_output.context("the first independent push task failed")?;
+    ensure!(first_output.success, "the first independent push failed: {}", redacted(&first_output));
+    let revision_after_first = gate_revision(db, repository_id).await?;
+    ensure!(
+        revision_after_first == revision_before + 1,
+        "the first independent commit did not advance the gate exactly once"
+    );
+
+    pause.release();
+    let second_output = second_push.await.context("the paused independent push task failed")??;
+
+    let first_capture =
+        captures.take(first_operation).ok_or_else(|| anyhow!("the first independent push has no raw reply"))?;
+    let second_capture =
+        captures.take(second_operation).ok_or_else(|| anyhow!("the second independent push has no raw reply"))?;
+    ensure!(captures.is_empty(), "the service answered unexpected extra receive-pack operations");
+    ensure!(
+        first_capture.status == 200,
+        "the service answered the first independent push with {}",
+        first_capture.status
+    );
+    ensure!(
+        second_capture.status == 200,
+        "the service answered the second independent push with {}",
+        second_capture.status
+    );
+    ensure!(!first_capture.truncated, "the first independent raw reply is truncated");
+    ensure!(!second_capture.truncated, "the second independent raw reply is truncated");
+    let (first_unpack, first_verdicts) = report_status(&first_capture.body)?;
+    let (second_unpack, second_verdicts) = report_status(&second_capture.body)?;
+    ensure!(first_unpack == "ok", "the first independent report-status did not unpack: {first_unpack}");
+    ensure!(second_unpack == "ok", "the second independent report-status did not unpack: {second_unpack}");
+    ensure!(
+        first_verdicts == vec![(INDEPENDENT_A.to_owned(), None)],
+        "the first independent report-status is not exactly one ok on {INDEPENDENT_A}: {first_verdicts:?}"
+    );
+    ensure!(
+        second_verdicts == vec![(INDEPENDENT_B.to_owned(), None)],
+        "the second independent report-status is not exactly one ok on {INDEPENDENT_B}: {second_verdicts:?}"
+    );
+    ensure!(first_output.success, "the first independent push was refused: {}", redacted(&first_output));
+    ensure!(second_output.success, "the second independent push was refused: {}", redacted(&second_output));
+
+    let first_oid = durable_ref(db, repository_id, INDEPENDENT_A)
+        .await?
+        .ok_or_else(|| anyhow!("durable {INDEPENDENT_A} is missing"))?;
+    let second_oid = durable_ref(db, repository_id, INDEPENDENT_B)
+        .await?
+        .ok_or_else(|| anyhow!("durable {INDEPENDENT_B} is missing"))?;
+    ensure!(first_oid == first_new, "durable {INDEPENDENT_A} is {first_oid}, not {first_new}");
+    ensure!(second_oid == second_new, "durable {INDEPENDENT_B} is {second_oid}, not {second_new}");
+
+    let (first_state, first_terminal) = operation_row(db, repository_id, first_operation)
+        .await?
+        .ok_or_else(|| anyhow!("the first independent operation has no durable row"))?;
+    let (second_state, second_terminal) = operation_row(db, repository_id, second_operation)
+        .await?
+        .ok_or_else(|| anyhow!("the second independent operation has no durable row"))?;
+    ensure!(first_state == "committed", "the first independent operation is {first_state}, not committed");
+    ensure!(second_state == "committed", "the second independent operation is {second_state}, not committed");
+    ensure!(first_terminal.is_some(), "the first independent operation has no terminal");
+    ensure!(second_terminal.is_some(), "the second independent operation has no terminal");
+
+    let revision_after = gate_revision(db, repository_id).await?;
+    ensure!(
+        revision_after == revision_before + 2,
+        "the gate moved {revision_before}->{revision_after}, not exactly two independent revisions"
+    );
+    let (first_event_revision, first_event_outcome) = core_event(db, repository_id, first_operation)
+        .await?
+        .ok_or_else(|| anyhow!("the first independent operation has no core event"))?;
+    let (second_event_revision, second_event_outcome) = core_event(db, repository_id, second_operation)
+        .await?
+        .ok_or_else(|| anyhow!("the second independent operation has no core event"))?;
+    ensure!(first_event_outcome == "committed", "the first core event is {first_event_outcome}, not committed");
+    ensure!(second_event_outcome == "committed", "the second core event is {second_event_outcome}, not committed");
+    ensure!(
+        first_event_revision == revision_before + 1,
+        "the first core event revision is {first_event_revision}, not {}",
+        revision_before + 1
+    );
+    ensure!(
+        second_event_revision == revision_before + 2,
+        "the second core event revision is {second_event_revision}, not {}",
+        revision_before + 2
+    );
+
+    Ok(())
 }
 
 async fn case(db: &Db) -> Result<()> {
@@ -439,9 +638,19 @@ fn spawn_push(
     url: String,
     operation: Uuid,
 ) -> JoinHandle<Result<git::Output>> {
+    spawn_push_ref(git, directory, url, operation, SEED_REF)
+}
+
+fn spawn_push_ref(
+    git: &'static Git,
+    directory: std::path::PathBuf,
+    url: String,
+    operation: Uuid,
+    ref_name: &'static str,
+) -> JoinHandle<Result<git::Output>> {
     tokio::spawn(async move {
         let header = format!("http.extraHeader=X-Rootyard-Operation: {operation}");
-        let target = format!("HEAD:{SEED_REF}");
+        let target = format!("HEAD:{ref_name}");
         git.run(&directory, &["-c", header.as_str(), "push", url.as_str(), target.as_str()]).await
     })
 }
@@ -469,6 +678,19 @@ async fn durable_main(db: &Db, repository_id: Uuid) -> Result<String> {
         .get(0))
 }
 
+async fn durable_ref(db: &Db, repository_id: Uuid, ref_name: &str) -> Result<Option<String>> {
+    let row = db
+        .pool
+        .get()
+        .await?
+        .query_opt(
+            "SELECT oid FROM ref_store_core_refs WHERE repository_id=$1 AND ref_name=$2",
+            &[&repository_id, &ref_name],
+        )
+        .await?;
+    Ok(row.map(|row| row.get(0)))
+}
+
 async fn operation_row(db: &Db, repository_id: Uuid, operation: Uuid) -> Result<Option<(String, Option<Value>)>> {
     let row = db
         .pool
@@ -476,6 +698,19 @@ async fn operation_row(db: &Db, repository_id: Uuid, operation: Uuid) -> Result<
         .await?
         .query_opt(
             "SELECT state, terminal_result FROM ref_store_operations WHERE repository_id=$1 AND operation_id=$2",
+            &[&repository_id, &operation],
+        )
+        .await?;
+    Ok(row.map(|row| (row.get(0), row.get(1))))
+}
+
+async fn core_event(db: &Db, repository_id: Uuid, operation: Uuid) -> Result<Option<(i64, String)>> {
+    let row = db
+        .pool
+        .get()
+        .await?
+        .query_opt(
+            "SELECT revision, outcome FROM ref_store_core_events WHERE repository_id=$1 AND operation_id=$2",
             &[&repository_id, &operation],
         )
         .await?;
