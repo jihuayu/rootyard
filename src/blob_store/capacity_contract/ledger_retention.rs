@@ -401,7 +401,8 @@ mod tests {
         ledger.release_hold(bid).unwrap();
         assert_eq!(ledger.get(r1).unwrap().classification(), RetentionClassification::ReleasedEligibleForArchive);
         assert_eq!(ledger.archive_released_entries(), 2);
-        assert_eq!(ledger.resident_entries_len(), 0);
+        assert_eq!(ledger.resident_entries_len(), 1);
+        assert_eq!(ledger.summary().protected_registrations, 1);
         assert_eq!(ledger.summary().archived_registrations, 2);
     }
 
