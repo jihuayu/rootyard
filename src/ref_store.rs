@@ -33,9 +33,9 @@ pub use core::{
     MetadataSnapshotCursor, MetadataSnapshotPage, MetadataSnapshotReceipt, MetadataSnapshotRef, MetadataSnapshotScope,
     PackMembershipDescriptor, PgRefStoreCore, PinReleaseReason, REPO_MAX_LOGICAL_BYTES, REPO_MAX_RECEIPTS,
     REPO_MAX_SNAPSHOT_REFS, REPO_MAX_SNAPSHOTS, ReadMetadataSnapshotPageRequest, RefCommitResult, RefName,
-    RefPrecondition, RefPrefix, RefTarget, RefUpdate, ReleaseMetadataPinRequest, RenewMetadataPinRequest,
-    TENANT_MAX_LOGICAL_BYTES, TENANT_MAX_RECEIPTS, TENANT_MAX_SNAPSHOT_REFS, TENANT_MAX_SNAPSHOTS, TerminalKind,
-    VersionCheck,
+    RefPrecondition, RefPrefix, RefTarget, RefUpdate, ReleaseMetadataPinRequest, RenewMetadataPinRequest, RootPurpose,
+    RootSelector, TENANT_MAX_LOGICAL_BYTES, TENANT_MAX_RECEIPTS, TENANT_MAX_SNAPSHOT_REFS, TENANT_MAX_SNAPSHOTS,
+    TerminalKind, VersionCheck,
 };
 pub use metadata::{MetadataMutationAction, MetadataPinPurpose, MetadataQuotaResource, MetadataQuotaScope};
 pub use pg::PgRefStore;

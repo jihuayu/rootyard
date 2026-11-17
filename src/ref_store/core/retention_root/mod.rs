@@ -12,6 +12,7 @@
 //! | release (or fence a not-yet-registered root) one-way | [`PgRetentionRoots::release`] |
 //! | historical metadata / receipt reads (data only) | [`PgRetentionRoots::get`] / [`PgRetentionRoots::query_receipt`] |
 //! | native byte read requiring current authority + active root at T2 | [`PgRetentionRoots::materialize`] |
+//! | serving-lane seal/register/read bound to the actual opened ready backend | [`PgRetentionRoots::prepare_serving`] / [`PgRetentionRoots::register_serving`] / [`PgRetentionRoots::materialize_serving`] |
 //!
 //! ## Guarantees
 //!
@@ -63,13 +64,17 @@ mod usage;
 mod view;
 
 pub use candidate::RootCandidate;
+pub(crate) use candidate::expected_register_digest_from_snapshot;
 pub use error::RootError;
 pub use handle::{RootReadAuthority, RootReadRequest, RootReceiptQuery, RootRef};
 pub use pg::PgRetentionRoots;
+pub(crate) use pg::effective_deadline;
 pub use receipt::{RootAction, RootReceipt};
 pub use record::RootRecord;
+pub(crate) use request::REGISTER_REQUEST_DIGEST_DOMAIN;
 pub use request::{PrepareRootRequest, RegisterRootRequest, ReleaseRootRequest};
 pub use scope::{RootPurpose, RootsScope};
+pub(crate) use selector::canonical_intent_oids;
 pub use selector::{RootSelector, RootSelectorKind};
 pub use usage::{
     MAX_RECEIPT_BODY_BYTES, MAX_ROOT_OIDS, REPO_MAX_LOGICAL_BYTES, REPO_MAX_PACK_BINDINGS, REPO_MAX_RECEIPTS,

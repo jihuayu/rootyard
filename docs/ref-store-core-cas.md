@@ -112,6 +112,9 @@ explicit cutover API in a later increment.
 - `CoreGate`/`CoreGateVersion` with a canonical gate digest.
 - `check_version`: a linearized gate observation returning `Unknown`,
   `Unchanged` or `Changed`. `Unknown` is never treated as unchanged or aborted.
+  The internal `ref_store::serving::check_version` facade reuses this operation
+  inside one authorized read-only serving transaction; it is not a REST route.
+  Durable snapshot and retention-root HTTP resources remain separate later work.
 - `CommitRefsRequest`: exact old/new ref CAS, explicit `Atomic` mode and a typed
   `AcceptedSubset` mode, bounded to 1..=128 refs. The canonical SHA-256 digest
   covers repository, tenant, issuer, lane, sequence, operation id, expected
