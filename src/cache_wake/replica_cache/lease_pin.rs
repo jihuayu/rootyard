@@ -96,6 +96,11 @@ impl DurablePinRegistry {
         let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         guard.active.get(&pin_id).map(|r| r.gate_revision)
     }
+
+    pub fn scope_for_pin(&self, pin_id: Uuid) -> Option<(Uuid, Uuid)> {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.active.get(&pin_id).map(|r| (r.tenant_id, r.repo_id))
+    }
 }
 
 pub struct TrackedDurablePin {

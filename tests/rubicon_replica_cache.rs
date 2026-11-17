@@ -165,19 +165,15 @@ fn seed_repo(fmt: ReplicaObjectFormat) -> Result<(TempDir, [Uuid; 4], PackObject
         .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".pack").map(str::to_owned))
         .next()
         .unwrap();
-    let mut put = |ext: &str| -> Result<BlobLocator> {
+    let put = |ext: &str| -> Result<BlobLocator> {
         let b = std::fs::read(pdir.join(format!("{stem}.{ext}")))?;
         let loc =
             BlobLocator::new(tid, rid, 1, Uuid::new_v4(), "packs", &hex::encode(Sha256::digest(&b)), b.len() as u64)?;
         LoopbackS3::shared().put_raw(&loc, b);
         Ok(loc)
     };
-    Ok((
-        dir,
-        [tid, rid, Uuid::new_v4(), Uuid::new_v4()],
-        PackObjectSpec::provider_managed(stem, put("pack")?, put("idx")?),
-        tip,
-    ))
+    let (p_loc, i_loc) = (put("pack")?, put("idx")?);
+    Ok((dir, [tid, rid, Uuid::new_v4(), Uuid::new_v4()], PackObjectSpec::provider_managed(stem, p_loc, i_loc), tip))
 }
 
 fn mk_snap(

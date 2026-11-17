@@ -173,7 +173,7 @@ impl MemSeededRepo {
         stems.sort();
         let mut out = Vec::with_capacity(stems.len());
         for stem in stems {
-            let mut upload = |ext: &str| -> Result<BlobLocator> {
+            let upload = |ext: &str| -> Result<BlobLocator> {
                 let bytes = std::fs::read(pack_dir.join(format!("{stem}.{ext}")))?;
                 let sha = hex::encode(Sha256::digest(&bytes));
                 let locator = BlobLocator::new(
@@ -188,7 +188,8 @@ impl MemSeededRepo {
                 s3.put_raw(&locator, bytes);
                 Ok(locator)
             };
-            out.push(PackObjectSpec::provider_managed(stem, upload("pack")?, upload("idx")?));
+            let (p_loc, i_loc) = (upload("pack")?, upload("idx")?);
+            out.push(PackObjectSpec::provider_managed(stem, p_loc, i_loc));
         }
         Ok(out)
     }
