@@ -172,7 +172,7 @@ fn staging_budget_class(rest: &str) -> &'static str {
     if requested > limit { "blob-staging-budget" } else { "unknown" }
 }
 
-const EXISTING_DETAIL_LABELS: &[&'static str] = &[
+const EXISTING_DETAIL_LABELS: &[&str] = &[
     "blob-deadline",
     "read-accel-deadline",
     "blob-digest",
@@ -189,7 +189,7 @@ const EXISTING_DETAIL_LABELS: &[&'static str] = &[
     "blob-already-exists",
 ];
 
-const LENGTH_MISMATCH_LABELS: &[&'static str] = &[
+const LENGTH_MISMATCH_LABELS: &[&str] = &[
     "blob-length-mismatch/expected-lt-actual",
     "blob-length-mismatch/expected-eq-actual",
     "blob-length-mismatch/expected-gt-actual",
