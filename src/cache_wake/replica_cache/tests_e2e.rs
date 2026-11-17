@@ -436,7 +436,12 @@ fn pack_cache_concurrent_install_clear_all_and_catalog_eviction_failure_preserve
     assert_eq!(cache.total_bytes(), 0);
 
     let vdir = TempDir::new()?;
-    let limits = ReplicaCacheLimits { max_view_bytes: 2048, max_active_views: 4, ..ReplicaCacheLimits::default() };
+    let limits = ReplicaCacheLimits {
+        max_view_entries: 2,
+        max_view_bytes: 2048,
+        max_active_views: 4,
+        ..ReplicaCacheLimits::default()
+    };
     let views = catalog::ViewCacheCatalog::open(&vdir.path().join("replica"), limits)?;
     let refs = [ReplicaRefSpec::new("refs/heads/main", "a".repeat(40))];
     let vk1 = ReplicaViewKey::build(
