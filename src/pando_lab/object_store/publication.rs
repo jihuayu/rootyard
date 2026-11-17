@@ -262,23 +262,22 @@ async fn prepare_pack_files_sealed_inner(
 
     // Exact retry recovery happens before provider selection, sealing or any
     // randomized DEK/ciphertext regeneration.
-    if let Some(c) = client {
-        if let Some((manifest, envelope)) =
+    if let Some(c) = client
+        && let Some((manifest, envelope)) =
             load_existing_pair(c, repo, pack_id, &opts.bucket, &pack_sha256, &idx_sha256).await?
-        {
-            verify_existing_cas_artifacts(store_root_dir, &manifest)?;
-            return Ok(PreparedPackPublication {
-                repo,
-                pack_id,
-                report: report_from_manifest(store_root_dir, &manifest),
-                manifest,
-                envelope,
-                local_policy: None,
-                store_root_dir: store_root_dir.to_path_buf(),
-                base_root,
-                expected_checkpoint: checkpoint.cloned(),
-            });
-        }
+    {
+        verify_existing_cas_artifacts(store_root_dir, &manifest)?;
+        return Ok(PreparedPackPublication {
+            repo,
+            pack_id,
+            report: report_from_manifest(store_root_dir, &manifest),
+            manifest,
+            envelope,
+            local_policy: None,
+            store_root_dir: store_root_dir.to_path_buf(),
+            base_root,
+            expected_checkpoint: checkpoint.cloned(),
+        });
     }
 
     let (p_key, i_key, m_key) =

@@ -296,7 +296,7 @@ async fn pg_two_shared_writers_barrier_install_one_file_winner_and_retry_verifie
         let opts = opts.clone();
         let barrier = Arc::clone(&barrier);
         handles.push(tokio::spawn(async move {
-            let result = super::prepare_pack_files_sealed_with_install_barrier(
+            let result = super::publication::prepare_pack_files_sealed_with_install_barrier(
                 &super::store_root(&config),
                 &config.root.join("objects"),
                 repo,
