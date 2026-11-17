@@ -178,6 +178,7 @@ def run(
     write_report_fn = write_report_fn or report.write_report
     validate_product = validate_product or source.validate_product_receipt
     environ = dict(os.environ if environ is None else environ)
+    resolved_source = Path(config.source_root).resolve()
     resources.require_escape_absent(environ)
     require(
         config.prepare_only or config.product_receipt is not None,
@@ -203,7 +204,7 @@ def run(
     error = None
     try:
         binding = capture_source(
-            config.source_root,
+            resolved_source,
             config.expected_commit,
             expected_tree=config.expected_tree,
             environ=environ,
@@ -212,14 +213,14 @@ def run(
         )
         product = validate_product(
             config.product_receipt,
-            config.source_root,
+            resolved_source,
             config.expected_commit,
             binding["source_inputs_sha256"],
         )
         remaining = min(config.selection_timeout_seconds, work - clock())
         require(remaining > 0, "selection", "setup_deadline_exceeded")
         selection = select_binary(
-            config.source_root,
+            resolved_source,
             runner,
             remaining,
             deadline=work,
@@ -231,8 +232,9 @@ def run(
         binding["test_binary_unchanged"] = False
         binding["fresh_verification"] = False
         binding["verification_code"] = None
+        binding["source_cwd_bound"] = True
         fixture = fixture_factory(
-            config.source_root,
+            resolved_source,
             bootstrap,
             environ,
             runner,
@@ -249,13 +251,14 @@ def run(
                 work_deadline=work,
                 case_timeout=config.case_timeout_seconds,
                 clock=clock,
+                cwd=str(resolved_source),
             )
             if work - clock() <= MIN_POST_CASE_SECONDS:
                 binding["verification_code"] = "post_case_deadline_exceeded"
                 raise RunnerError("binding", "post_case_deadline_exceeded")
             try:
                 after = capture_source(
-                    config.source_root,
+                    resolved_source,
                     config.expected_commit,
                     expected_tree=config.expected_tree,
                     environ=environ,

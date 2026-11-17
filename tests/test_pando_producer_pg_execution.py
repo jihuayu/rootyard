@@ -145,6 +145,7 @@ class ExecuteCasesTest(unittest.TestCase):
         records = cases.execute_cases(
             BINARY, {"TMPDIR": "/tmp/owned"}, fake,
             work_deadline=1000, case_timeout=30, clock=lambda: 0,
+            cwd="/tmp/source",
         )
         self.assertEqual(len(records), 17)
         self.assertTrue(all(row["status"] == "passed" for row in records))
@@ -155,6 +156,7 @@ class ExecuteCasesTest(unittest.TestCase):
             )
             self.assertNotIn("--", argv)
             self.assertEqual(kwargs["env"], {"TMPDIR": "/tmp/owned"})
+            self.assertEqual(kwargs["cwd"], "/tmp/source")
 
     def test_stops_at_first_failure_and_reports_not_run(self):
         responses = [

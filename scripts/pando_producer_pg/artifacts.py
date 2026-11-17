@@ -100,6 +100,7 @@ def select_test_binary(
     root = Path(source_root).resolve()
     result = runner.run(
         list(CARGO_COMMAND),
+        cwd=str(root),
         timeout=timeout,
         stage="selection",
         timeout_code="cargo_timeout",
@@ -156,6 +157,9 @@ def select_test_binary(
     source = None
     source_path = target.get("src_path")
     if isinstance(source_path, str) and source_path:
+        # Cargo runs with cwd=root, so a relative src_path has exactly that
+        # actual working directory.  It is resolved against the same root and
+        # must remain inside it; no newest-file or foreign-workspace fallback.
         candidate = Path(source_path)
         if not candidate.is_absolute():
             candidate = root / candidate

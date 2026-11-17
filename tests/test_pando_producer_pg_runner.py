@@ -131,6 +131,9 @@ class ArtifactSelectionTest(unittest.TestCase):
         )
         self.assertNotIn("--", runner.calls[0][0])
         self.assertEqual(selection["executable_path"], str(self.exe))
+        self.assertEqual(
+            runner.calls[0][1]["cwd"], str(self.root.resolve())
+        )
 
     def test_profile_test_false_is_not_a_bin_test_artifact(self):
         self.assert_code(

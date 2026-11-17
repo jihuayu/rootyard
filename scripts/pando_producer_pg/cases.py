@@ -171,6 +171,7 @@ def execute_cases(
     case_timeout,
     clock,
     cases=CASES,
+    cwd=None,
 ):
     """Execute the exact cases serially; stop at the first failure."""
     require(
@@ -204,6 +205,7 @@ def execute_cases(
             result = runner.run(
                 [binary, name, "--exact", "--ignored", "--test-threads=1"],
                 env=environment,
+                cwd=cwd,
                 timeout=timeout,
                 stage="execute",
                 timeout_code="case_timeout",
