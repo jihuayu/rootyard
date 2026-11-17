@@ -66,7 +66,7 @@ fn keys_and_route_hints_isolate_tenants_histories_backends_and_reject_unknown_fi
     let k_rev =
         ReplicaViewKey::build(t1, r1, h1, c1, &b1, ReplicaObjectFormat::Sha1, 1, 11, &p1, &refs, "refs/heads/main")
             .unwrap();
-    let refs_moved = vec![ReplicaRefSpec::new("refs/heads/main", &"c".repeat(40))];
+    let refs_moved = vec![ReplicaRefSpec::new("refs/heads/main", "c".repeat(40))];
     let k_ref_only = ReplicaViewKey::build(
         t1,
         r1,
@@ -117,7 +117,7 @@ fn session_lower_bound_enforces_174_monotonicity_and_realm_fence() {
         gate_revision: 42,
         version_check: VersionCheckVerdict::Changed,
         head_ref: "refs/heads/main".into(),
-        refs: vec![ReplicaRefSpec::new("refs/heads/main", &"a".repeat(40))],
+        refs: vec![ReplicaRefSpec::new("refs/heads/main", "a".repeat(40))],
         packs: vec![sample_pack(t, r, &"b".repeat(40), b"p", b"i")],
         durable_pin: pins.acquire(t, r, 42),
     };
@@ -173,7 +173,7 @@ async fn singleflight_bounds_waiters_and_handles_leader_and_waiter_cancellation(
         1,
         5,
         &[sample_pack(t, r, &"1".repeat(40), b"pk", b"ix")],
-        &[ReplicaRefSpec::new("refs/heads/main", &"2".repeat(40))],
+        &[ReplicaRefSpec::new("refs/heads/main", "2".repeat(40))],
         "refs/heads/main",
     )
     .unwrap();
@@ -390,7 +390,7 @@ async fn scheduler_tolerates_advisory_outage_and_fails_over_on_overload_or_drain
             gate_revision: 1,
             version_check: VersionCheckVerdict::Changed,
             head_ref: "refs/heads/main".into(),
-            refs: vec![ReplicaRefSpec::new("refs/heads/main", &"a".repeat(40))],
+            refs: vec![ReplicaRefSpec::new("refs/heads/main", "a".repeat(40))],
             packs: vec![sample_pack(t, r, &"b".repeat(40), b"p", b"i")],
             durable_pin: DurablePinRegistry::new().acquire(t, r, 1),
         }),

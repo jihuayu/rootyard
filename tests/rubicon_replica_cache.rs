@@ -32,9 +32,10 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+type StoredObj = (Option<Uuid>, Vec<u8>);
 #[derive(Default)]
 struct S3State {
-    objects: Mutex<BTreeMap<String, (Option<Uuid>, Vec<u8>)>>,
+    objects: Mutex<BTreeMap<String, StoredObj>>,
     tenant_gets: Mutex<BTreeMap<Uuid, (u64, u64)>>,
 }
 struct LoopbackS3 {
