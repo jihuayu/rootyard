@@ -668,7 +668,6 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
     assert_ne!(concurrent_a.log_id, concurrent_b.log_id);
     assert_ne!(concurrent_a.proposal_id, concurrent_b.proposal_id);
 
-    phase.set(Phase::Transition);
     // A valid gate transition to Closing is applied. A subsequent same-scope CommitRefs is a
     // deterministic business refusal: it must advance the replicated applied coordinate and
     // return a durable typed outcome, not become a fatal OpenRaft apply/storage error.
@@ -683,14 +682,17 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
         group_epoch: 1,
         pack_mode: SmPackMode::MetadataOnly,
     });
+    phase.set(Phase::ClosingWrite);
     let close_outcome = backend.propose(closing).await?;
     assert!(proposal_outcome(&close_outcome).is_applied());
+    phase.set(Phase::ClosingView);
     let closing_view = backend.read_committed_view().await?;
     assert_eq!(closing_view.read_scope_lifecycle().map(|(lifecycle, _)| lifecycle), Some(ScopeLifecycle::Closing));
 
     let refused_operation = Uuid::new_v4();
     let refused_commit =
         commit_command(repo, tenant, issuer, history, 2, refused_operation, 2, "refs/heads/refused", None, oid(2));
+    phase.set(Phase::RefusedWrite);
     let refusal = backend.propose(refused_commit.clone()).await?;
     let refusal_kind = match proposal_outcome(&refusal) {
         RootRefCasOutcome::Refused(refusal) => refusal.kind,
@@ -698,9 +700,11 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
     };
     assert_eq!(refusal_kind, RootRefCasRefusalKind::ScopeClosingOrClosed);
     wait_applied_through(&cluster, refusal.log_id.index, Duration::from_secs(10)).await?;
+    phase.set(Phase::RefusedView);
     let refused_view = backend.read_committed_view().await?;
     assert!(refused_view.last_applied().is_some_and(|id| id.index >= refusal.log_id.index));
     assert!(refused_view.read_ref("refs/heads/refused").is_none());
+    phase.set(Phase::RefusalLookup);
     let stored_refusal = backend.query_proposal(refusal.proposal_id.clone()).await?;
     let stored_outcome = match stored_refusal {
         ProposalLookup::Found { original_log_id, observed_log_id, outcome, .. } => {
@@ -717,6 +721,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
 
     // Same caller-stable ID and canonical digest advances the coordinate on retry but never
     // re-executes the business command; the first typed refusal remains the result.
+    phase.set(Phase::RefusalReplay);
     let refusal_retry = backend.propose_with_id(refusal.proposal_id.clone(), refused_commit).await?;
     assert_eq!(refusal_retry.decision, ProposalAttemptKind::Replayed);
     assert_eq!(refusal_retry.original_log_id, Some(refusal.log_id));
@@ -727,13 +732,16 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
 
     // The healthy quorum still works after the refusal: a valid Noop applies, the applied index
     // advances, and a new ReadIndex-backed view is minted.
+    phase.set(Phase::HealthyWrite);
     let healthy = backend.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })).await?;
     assert!(proposal_outcome(&healthy).is_applied());
+    phase.set(Phase::HealthyView);
     let healthy_view = backend.read_committed_view().await?;
     assert!(healthy_view.last_applied().is_some_and(|id| id.index >= healthy.log_id.index));
 
     // A same-node-id standalone SM cannot be attached: the public constructor takes the owned
     // factory node, not a caller-selected SM. Application-mode KV reads remain unavailable too.
+    phase.set(Phase::StandaloneProbe);
     let same_id_dir = tempfile::tempdir()?;
     let same_id_sm = PersistentStateMachine::open_application(
         same_id_dir.path(),

@@ -743,6 +743,56 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertTrue(unknown.unknown_case)
         self.assertEqual(unknown.case_failures, [])
 
+    def test_fixed_transition_subphases_are_closed_and_case_scoped(self) -> None:
+        self.assertEqual(runner.EXPECTED_CASE_COUNT, 3)
+        self.assertEqual(runner.REQUIRED_CASES, (CASE_REAL, CASE_PRUNED, CASE_DRAIN))
+        phases = (
+            "closing_write",
+            "closing_view",
+            "refused_write",
+            "refused_view",
+            "refusal_lookup",
+            "refusal_replay",
+            "healthy_write",
+            "healthy_view",
+            "standalone_probe",
+        )
+        for phase in phases:
+            with self.subTest(phase=phase):
+                frame = (
+                    f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
+                    f"phase={phase} class=quorum_unavailable\n"
+                )
+                evidence = runner.collect_failure_evidence("", frame)
+                self.assertTrue(evidence.diagnostics_valid)
+                self.assertEqual(
+                    evidence.case_failures,
+                    [{"case": CASE_REAL, "phase": phase, "class": "quorum_unavailable"}],
+                )
+                self.assertEqual(evidence.failure_phase, phase)
+
+        wrong_case = runner.collect_failure_evidence(
+            "",
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_DRAIN} phase=closing_write class=quorum_unavailable\n",
+        )
+        self.assertFalse(wrong_case.diagnostics_valid)
+        self.assertEqual(wrong_case.case_failures, [])
+
+        removed_phase = runner.collect_failure_evidence(
+            "",
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=transition class=quorum_unavailable\n",
+        )
+        self.assertFalse(removed_phase.diagnostics_valid)
+        self.assertEqual(removed_phase.case_failures, [])
+
+        secret_phase = runner.collect_failure_evidence(
+            "",
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=secret_phase class=quorum_unavailable\n"
+            + SECRET,
+        )
+        self.assertFalse(secret_phase.diagnostics_valid)
+        self.assertNotIn(SECRET, json.dumps(secret_phase.case_failures))
+
     def test_main_retains_partial_evidence_on_nonzero_without_passing(self) -> None:
         path = self.root / "out" / "nonzero-report.json"
         output = NONZERO_FAILED_OUTPUT

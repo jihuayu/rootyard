@@ -73,7 +73,9 @@ _FAILURE_FRAME = re.compile(
 )
 _REAL_PHASES = frozenset(
     (
-        "bootstrap", "provision", "commit", "refusal", "concurrent", "transition",
+        "bootstrap", "provision", "commit", "refusal", "concurrent", "closing_write",
+        "closing_view", "refused_write", "refused_view", "refusal_lookup",
+        "refusal_replay", "healthy_write", "healthy_view", "standalone_probe",
         "follower", "isolation", "live_axes", "snapshot", "install", "reopen",
         "partition", "heal", "final_reopen",
     )
