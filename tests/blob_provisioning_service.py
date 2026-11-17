@@ -896,11 +896,13 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
         after_refusal = self.authority(control, control_name)
         assert after_refusal == control_before, "legacy format refusal changed a real ready authority"
         # No half-ready serving state is visible: the old row is not served and
-        # is absent from the ready catalog list.
+        # is absent from the ready catalog list. The shared authorization
+        # boundary refuses an unserved provisioning row with a closed 409 before
+        # any serving lookup can run.
         lookup_status, lookup_raw, _ = self.get_repo_status("alice", legacy_name)
-        assert lookup_status == 404, "legacy fixture was served with status " + str(lookup_status)
+        assert lookup_status == 409, "legacy fixture was served with status " + str(lookup_status)
         lookup = json.loads(lookup_raw)
-        assert lookup == {"error": "not found"}, lookup
+        assert lookup == {"error": "repository is not ready"}, lookup
         listed = self.listed_repos()
         legacy_listed = any(item.get("name") == legacy_name for item in listed)
         assert not legacy_listed, "legacy fixture appeared in the ready catalog list"

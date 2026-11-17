@@ -179,8 +179,8 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertIn("legacy_after == legacy_before", case)
         self.assertIn("after_refusal == control_before", case)
         self.assertIn("self.get_repo_status", case)
-        self.assertIn("assert lookup_status == 404", case)
-        self.assertIn('"not found"', case)
+        self.assertIn("assert lookup_status == 409", case)
+        self.assertIn('"repository is not ready"', case)
         self.assertIn("legacy_listed", case)
         self.assertIn("self.push_and_clone(control, control_name)", case)
         # The refusal is a real API check, not an old binary, migration, import,
@@ -212,6 +212,9 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         scope_source = (ROOT / "src" / "ref_store" / "core" / "serving_scope.rs").read_text(encoding="utf-8")
         self.assertIn('LEGACY_GITFS_BACKEND: &str = "gitfs"', scope_source)
         self.assertIn("LegacyAuthority", scope_source)
+        auth_source = (ROOT / "src" / "auth.rs").read_text(encoding="utf-8")
+        self.assertIn('if state != "ready"', auth_source)
+        self.assertIn('"repository is not ready"', auth_source)
 
     def test_first_checkpoint_stays_first(self) -> None:
         # A reordering that silently turns the independent kill checkpoint into
