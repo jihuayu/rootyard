@@ -86,6 +86,13 @@ test {CASE_DRAIN} ... ok
 
 test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 """
+SCOPE_FAILED_OUTPUT = f"""running 3 tests
+test {CASE_REAL} ... ok
+test {CASE_PRUNED} ... ok
+test {CASE_DRAIN} ... FAILED
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+"""
 ZERO_OUTPUT = """running 0 tests
 
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -986,6 +993,164 @@ class RootRaftRunnerTest(unittest.TestCase):
         )
         self.assertFalse(mismatched.diagnostics_valid)
         self.assertEqual(mismatched.quorum_diagnostics, [])
+
+    def test_quorum_diagnostic_accepts_exact_scope_and_heal_phases(self) -> None:
+        cases = (
+            (CASE_REAL, NONZERO_FAILED_OUTPUT, "heal", "read_view", "read_quorum_shortfall"),
+            (CASE_DRAIN, SCOPE_FAILED_OUTPUT, "heal", "read_view", "read_outer_deadline"),
+            (
+                CASE_DRAIN,
+                SCOPE_FAILED_OUTPUT,
+                "recovery_rejections",
+                "prepare",
+                "read_quorum_shortfall",
+            ),
+        )
+        for case, stdout, phase, operation, cause in cases:
+            with self.subTest(case=case, phase=phase):
+                payload = _diagnostic_payload()
+                payload.update(
+                    case=case,
+                    phase=phase,
+                    operation=operation,
+                    cause=cause,
+                )
+                scalar = (
+                    f"ROOTYARD_FAILURE_FRAME v1 case={case} "
+                    f"phase={phase} class=quorum_unavailable\n"
+                )
+                evidence = runner.collect_failure_evidence(
+                    stdout, scalar + _diagnostic_frame(payload)
+                )
+                self.assertTrue(evidence.diagnostics_valid)
+                self.assertEqual(len(evidence.quorum_diagnostics), 1)
+                self.assertEqual(evidence.quorum_diagnostics[0]["case"], case)
+                self.assertEqual(evidence.quorum_diagnostics[0]["phase"], phase)
+                self.assertEqual(evidence.quorum_diagnostics[0]["operation"], operation)
+                self.assertEqual(evidence.quorum_diagnostics[0]["cause"], cause)
+                self.assertEqual(
+                    [node["slot"] for node in evidence.quorum_diagnostics[0]["snapshots"][0]["nodes"]],
+                    [1, 2, 3],
+                )
+
+    def test_quorum_diagnostic_accepts_bounded_overflow(self) -> None:
+        payload = _diagnostic_payload()
+        payload.update(
+            case=CASE_DRAIN,
+            phase="heal",
+            operation="read_view",
+            cause="read_outer_deadline",
+        )
+        payload["elapsed_ms"] = runner._MAX_DIAGNOSTIC_ELAPSED_MS
+        payload["elapsed_overflow"] = True
+        payload["snapshots"][0]["nodes"][0].update(
+            term=runner._MAX_DIAGNOSTIC_TERM,
+            millis_since_quorum_ack=runner._MAX_DIAGNOSTIC_MILLIS,
+            numeric_overflow=True,
+        )
+        scalar = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_DRAIN} "
+            "phase=heal class=quorum_unavailable\n"
+        )
+        evidence = runner.collect_failure_evidence(
+            SCOPE_FAILED_OUTPUT, scalar + _diagnostic_frame(payload)
+        )
+        self.assertTrue(evidence.diagnostics_valid)
+        self.assertEqual(len(evidence.quorum_diagnostics), 1)
+        safe = evidence.quorum_diagnostics[0]
+        self.assertTrue(safe["elapsed_overflow"])
+        self.assertTrue(safe["snapshots"][0]["nodes"][0]["numeric_overflow"])
+
+    def test_quorum_diagnostic_rejects_cross_case_phases_and_scope_conflicts(self) -> None:
+        scope_payload = _diagnostic_payload()
+        scope_payload.update(case=CASE_DRAIN, phase="recovery_rejections", operation="prepare", cause="read_quorum_shortfall")
+        scope_frame = _diagnostic_frame(scope_payload)
+        scope_scalar = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_DRAIN} "
+            "phase=recovery_rejections class=quorum_unavailable\n"
+        )
+
+        wrong_scope_phase = _diagnostic_payload()
+        wrong_scope_phase.update(
+            case=CASE_DRAIN,
+            phase="closing_write",
+            operation="client_write",
+            cause="write_forward",
+        )
+        evidence = runner.collect_failure_evidence(
+            SCOPE_FAILED_OUTPUT, _diagnostic_frame(wrong_scope_phase)
+        )
+        self.assertFalse(evidence.diagnostics_valid)
+        self.assertEqual(evidence.quorum_diagnostics, [])
+
+        wrong_real_phase = _diagnostic_payload()
+        wrong_real_phase.update(
+            case=CASE_REAL,
+            phase="recovery_rejections",
+            operation="prepare",
+            cause="read_quorum_shortfall",
+        )
+        evidence = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_frame(wrong_real_phase)
+        )
+        self.assertFalse(evidence.diagnostics_valid)
+        self.assertEqual(evidence.quorum_diagnostics, [])
+
+        pruned_payload = _diagnostic_payload()
+        pruned_payload.update(case=CASE_PRUNED)
+        pruned = runner.collect_failure_evidence(
+            FAILED_OUTPUT, _diagnostic_frame(pruned_payload)
+        )
+        self.assertFalse(pruned.diagnostics_valid)
+        self.assertEqual(pruned.quorum_diagnostics, [])
+
+        duplicate = runner.collect_failure_evidence(
+            SCOPE_FAILED_OUTPUT, scope_scalar + scope_frame + scope_frame
+        )
+        self.assertFalse(duplicate.diagnostics_valid)
+        self.assertEqual(duplicate.quorum_diagnostics, [])
+
+        conflict_payload = _diagnostic_payload()
+        conflict_payload.update(
+            case=CASE_DRAIN, phase="heal", operation="read_view", cause="read_outer_deadline"
+        )
+        conflict = runner.collect_failure_evidence(
+            SCOPE_FAILED_OUTPUT,
+            scope_scalar + scope_frame + _diagnostic_frame(conflict_payload),
+        )
+        self.assertFalse(conflict.diagnostics_valid)
+        self.assertEqual(conflict.quorum_diagnostics, [])
+
+        mismatched_terminal = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_DRAIN} "
+            "phase=heal class=quorum_unavailable\n"
+        )
+        mismatched = runner.collect_failure_evidence(
+            SCOPE_FAILED_OUTPUT, mismatched_terminal + scope_frame
+        )
+        self.assertFalse(mismatched.diagnostics_valid)
+        self.assertEqual(mismatched.quorum_diagnostics, [])
+
+    def test_quorum_diagnostic_rejects_nonfinite_and_scope_unknown_fields(self) -> None:
+        for nonfinite in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(nonfinite=nonfinite):
+                payload = _diagnostic_payload()
+                payload["elapsed_ms"] = nonfinite
+                evidence = runner.collect_failure_evidence(
+                    NONZERO_FAILED_OUTPUT, _diagnostic_frame(payload)
+                )
+                self.assertFalse(evidence.diagnostics_valid)
+                self.assertEqual(evidence.quorum_diagnostics, [])
+
+        payload = _diagnostic_payload()
+        payload.update(case=CASE_DRAIN, phase="recovery_rejections")
+        payload["secret"] = SECRET
+        evidence = runner.collect_failure_evidence(
+            SCOPE_FAILED_OUTPUT, _diagnostic_frame(payload)
+        )
+        self.assertFalse(evidence.diagnostics_valid)
+        self.assertEqual(evidence.quorum_diagnostics, [])
+        self.assertNotIn(SECRET, json.dumps(evidence.quorum_diagnostics))
 
     def test_main_retains_partial_evidence_on_nonzero_without_passing(self) -> None:
         path = self.root / "out" / "nonzero-report.json"

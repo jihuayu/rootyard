@@ -131,9 +131,11 @@ jobs:
             --harness tests/ref_store_real_raft_backend.rs \
             --harness tests/scope_drain_support/mod.rs \
             --harness tests/scope_drain_support/failure_phase.rs \
+            --harness tests/scope_drain_support/quorum_diagnostic.rs \
             --harness src/ref_store/raft_backend.rs \
             --harness src/ref_store/raft_backend/node.rs \
             --harness src/ref_store/raft_backend/reducer.rs \
+            --harness src/ref_store/raft_backend/backend/cause.rs \
             --harness src/ref_store/core/state_machine.rs \
             --harness crates/refcas-log/src/lib.rs \
             --harness crates/refcas-log/src/cluster.rs \

@@ -584,7 +584,13 @@ def _parse_quorum_diagnostic(line) -> tuple[str, dict]:
     cause = payload.get("cause")
     if not isinstance(case, str) or not case:
         raise ValueError
-    if not isinstance(phase, str) or phase not in _REAL_PHASES:
+    if not isinstance(phase, str):
+        raise ValueError
+    allowed_phases = _FAILURE_CASES.get(case)
+    if allowed_phases is None:
+        if case in REQUIRED_CASES:
+            raise ValueError
+    elif phase not in allowed_phases:
         raise ValueError
     if not isinstance(operation, str) or operation not in _DIAGNOSTIC_CAUSES_BY_OPERATION:
         raise ValueError
@@ -725,7 +731,7 @@ def collect_failure_evidence(
                 unknown_case = True
                 diagnostics_invalid = True
                 continue
-            if name != REQUIRED_CASES[0]:
+            if name not in _FAILURE_CASES:
                 diagnostics_invalid = True
                 continue
             quorum_seen[name] = quorum_seen.get(name, 0) + 1
