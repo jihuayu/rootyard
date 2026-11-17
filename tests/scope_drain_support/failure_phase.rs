@@ -1,13 +1,20 @@
-//! Fixed failure-phase frames for the first real Root Raft case.
+//! Fixed failure-phase frames for the two long Root Raft cases.
 //!
-//! Frames contain only the fixed case name, a closed phase code and a closed class code. They never
-//! include panic payloads, error text, identities, paths, metrics or other runtime data.
+//! Frames contain only a fixed case identifier, a closed phase code and a closed class code. They
+//! never include panic payloads, error text, identities, paths, metrics or other runtime data.
 
 use std::io::Write;
 
+use rootyard::ref_store::projector::RemoteAuthzBridgeError;
 use rootyard::ref_store::raft_backend::RaftBackendError;
 
-pub(crate) const CASE_ID: &str = "real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart";
+pub(crate) const CASE_REAL: &str = "real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart";
+pub(crate) const CASE_SCOPE: &str =
+    "scope_drain_support::privileged_scope_drain_query_is_quorum_bound_and_multirepo_complete";
+
+pub(crate) trait PhaseLabel: Copy {
+    fn code(self) -> &'static str;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Phase {
@@ -28,7 +35,7 @@ pub(crate) enum Phase {
     FinalReopen,
 }
 
-impl Phase {
+impl PhaseLabel for Phase {
     fn code(self) -> &'static str {
         match self {
             Self::Bootstrap => "bootstrap",
@@ -51,6 +58,59 @@ impl Phase {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScopePhase {
+    Bootstrap,
+    Provision,
+    Install,
+    Close,
+    Recover,
+    RecoveryRejections,
+    InitialDrain,
+    BindingRejections,
+    ForeignBootstrap,
+    ForeignAdvance,
+    ForeignRejection,
+    PendingBridge,
+    Cancel,
+    SettledDrain,
+    SettledEvaluate,
+    SettledBridge,
+    Follower,
+    InvalidOptions,
+    Partition,
+    Heal,
+    Shutdown,
+}
+
+impl PhaseLabel for ScopePhase {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Provision => "provision",
+            Self::Install => "install",
+            Self::Close => "close",
+            Self::Recover => "recover",
+            Self::RecoveryRejections => "recovery_rejections",
+            Self::InitialDrain => "initial_drain",
+            Self::BindingRejections => "binding_rejections",
+            Self::ForeignBootstrap => "foreign_bootstrap",
+            Self::ForeignAdvance => "foreign_advance",
+            Self::ForeignRejection => "foreign_rejection",
+            Self::PendingBridge => "pending_bridge",
+            Self::Cancel => "cancel",
+            Self::SettledDrain => "settled_drain",
+            Self::SettledEvaluate => "settled_evaluate",
+            Self::SettledBridge => "settled_bridge",
+            Self::Follower => "follower",
+            Self::InvalidOptions => "invalid_options",
+            Self::Partition => "partition",
+            Self::Heal => "heal",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Class {
     AssertionPanic,
     ProposalScope,
@@ -63,6 +123,11 @@ pub(crate) enum Class {
     Encode,
     WrongReducer,
     RecoveryNotObserved,
+    ScopeBinding,
+    ScopeCloseRecovery,
+    BridgeDatabase,
+    BridgeInvalidInput,
+    BridgeAuthority,
     BackendOther,
     Unclassified,
 }
@@ -81,42 +146,57 @@ impl Class {
             Self::Encode => "encode",
             Self::WrongReducer => "wrong_reducer",
             Self::RecoveryNotObserved => "recovery_not_observed",
+            Self::ScopeBinding => "scope_binding",
+            Self::ScopeCloseRecovery => "scope_close_recovery",
+            Self::BridgeDatabase => "bridge_database",
+            Self::BridgeInvalidInput => "bridge_invalid_input",
+            Self::BridgeAuthority => "bridge_authority",
             Self::BackendOther => "backend_other",
             Self::Unclassified => "unclassified",
         }
     }
 
     pub(crate) fn from_error(error: &anyhow::Error) -> Self {
-        let Some(error) = error.downcast_ref::<RaftBackendError>() else {
-            return Self::Unclassified;
-        };
-        match error {
-            RaftBackendError::ProposalScopeMismatch(_) => Self::ProposalScope,
-            RaftBackendError::ScopeMismatch(_) => Self::CommandScope,
-            RaftBackendError::StaleGate(_) => Self::StaleGate,
-            RaftBackendError::FollowerRedirect(_) => Self::FollowerRedirect,
-            RaftBackendError::QuorumUnavailable(_) => Self::QuorumUnavailable,
-            RaftBackendError::ApplyBarrierTimeout { .. } => Self::ApplyBarrier,
-            RaftBackendError::Storage(_) => Self::Storage,
-            RaftBackendError::Encode(_) => Self::Encode,
-            RaftBackendError::WrongReducer => Self::WrongReducer,
-            RaftBackendError::RecoveryNotObserved(_) => Self::RecoveryNotObserved,
-            _ => Self::BackendOther,
+        if let Some(error) = error.downcast_ref::<RaftBackendError>() {
+            return match error {
+                RaftBackendError::ProposalScopeMismatch(_) => Self::ProposalScope,
+                RaftBackendError::ScopeMismatch(_) => Self::CommandScope,
+                RaftBackendError::StaleGate(_) => Self::StaleGate,
+                RaftBackendError::FollowerRedirect(_) => Self::FollowerRedirect,
+                RaftBackendError::QuorumUnavailable(_) => Self::QuorumUnavailable,
+                RaftBackendError::ApplyBarrierTimeout { .. } => Self::ApplyBarrier,
+                RaftBackendError::Storage(_) => Self::Storage,
+                RaftBackendError::Encode(_) => Self::Encode,
+                RaftBackendError::WrongReducer => Self::WrongReducer,
+                RaftBackendError::RecoveryNotObserved(_) => Self::RecoveryNotObserved,
+                RaftBackendError::ScopeDrainBindingMismatch(_) => Self::ScopeBinding,
+                RaftBackendError::ScopeCloseNotRecoverable(_) => Self::ScopeCloseRecovery,
+                _ => Self::BackendOther,
+            };
         }
+        if let Some(error) = error.downcast_ref::<RemoteAuthzBridgeError>() {
+            return match error {
+                RemoteAuthzBridgeError::PgDatabase(_) => Self::BridgeDatabase,
+                RemoteAuthzBridgeError::InvalidInput(_) => Self::BridgeInvalidInput,
+                RemoteAuthzBridgeError::AuthorityViolation(_) => Self::BridgeAuthority,
+            };
+        }
+        Self::Unclassified
     }
 }
 
-pub(crate) struct PhaseGuard {
-    phase: Phase,
+pub(crate) struct PhaseGuard<P: PhaseLabel> {
+    case: &'static str,
+    phase: P,
     armed: bool,
 }
 
-impl PhaseGuard {
-    pub(crate) fn new(phase: Phase) -> Self {
-        Self { phase, armed: true }
+impl<P: PhaseLabel> PhaseGuard<P> {
+    pub(crate) fn new(case: &'static str, phase: P) -> Self {
+        Self { case, phase, armed: true }
     }
 
-    pub(crate) fn set(&mut self, phase: Phase) {
+    pub(crate) fn set(&mut self, phase: P) {
         if self.armed {
             self.phase = phase;
         }
@@ -135,14 +215,15 @@ impl PhaseGuard {
         let mut stderr = std::io::stderr().lock();
         let _ = write!(
             stderr,
-            "\nROOTYARD_FAILURE_FRAME v1 case={CASE_ID} phase={} class={}\n",
+            "\nROOTYARD_FAILURE_FRAME v1 case={} phase={} class={}\n",
+            self.case,
             self.phase.code(),
             class.code()
         );
     }
 }
 
-impl Drop for PhaseGuard {
+impl<P: PhaseLabel> Drop for PhaseGuard<P> {
     fn drop(&mut self) {
         if self.armed {
             self.emit(Class::AssertionPanic);

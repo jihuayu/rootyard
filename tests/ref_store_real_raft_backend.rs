@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 mod scope_drain_support;
 
-use scope_drain_support::failure_phase::{Class, Phase, PhaseGuard};
+use scope_drain_support::failure_phase::{CASE_REAL, Class, Phase, PhaseGuard};
 
 const TEST_GROUP: &str = "group-175";
 const CLUSTER_NAME: &str = "issue175-real-raft-backend";
@@ -528,7 +528,7 @@ async fn build_snapshot(sm: &PersistentStateMachine) -> Result<(openraft::Snapsh
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> Result<()> {
-    let mut phase = PhaseGuard::new(Phase::Bootstrap);
+    let mut phase = PhaseGuard::new(CASE_REAL, Phase::Bootstrap);
     let outcome = real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(&mut phase).await;
     match outcome {
         Ok(()) => {
@@ -542,7 +542,9 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
     }
 }
 
-async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(phase: &mut PhaseGuard) -> Result<()> {
+async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
+    phase: &mut PhaseGuard<Phase>,
+) -> Result<()> {
     let repo = Uuid::new_v4();
     let tenant = Uuid::new_v4();
     let issuer = Uuid::new_v4();

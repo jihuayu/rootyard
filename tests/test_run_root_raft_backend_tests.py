@@ -116,6 +116,7 @@ DIAGNOSTIC_KEYS = {
     "signal",
     "evidence_complete",
     "suite_counts",
+    "case_failures",
     "failure_phase",
     "failure_class",
     "unknown_case",
@@ -678,6 +679,56 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertEqual(evidence.failure_phase, "commit")
         self.assertEqual(evidence.failure_class, "proposal_scope")
 
+    def test_failure_frames_are_attributed_per_case(self) -> None:
+        stdout = (
+            f"running 3 tests\n"
+            f"test {CASE_REAL} ... FAILED\n"
+            f"test {CASE_PRUNED} ... ok\n"
+            f"test {CASE_DRAIN} ... FAILED\n"
+            "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        )
+        stderr = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n"
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_DRAIN} phase=settled_evaluate class=scope_binding\n"
+        )
+        evidence = runner.collect_failure_evidence(stdout, stderr)
+        self.assertTrue(evidence.diagnostics_valid)
+        self.assertEqual(
+            evidence.case_failures,
+            [
+                {"case": CASE_REAL, "phase": "commit", "class": "proposal_scope"},
+                {"case": CASE_DRAIN, "phase": "settled_evaluate", "class": "scope_binding"},
+            ],
+        )
+        self.assertIsNone(evidence.failure_phase)
+        self.assertIsNone(evidence.failure_class)
+        self.assertTrue(evidence.complete)
+        self.assertEqual(evidence.suite_counts, evidence.counts)
+
+        conflict = runner.collect_failure_evidence(
+            stdout,
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n"
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=refusal class=storage\n",
+        )
+        self.assertFalse(conflict.diagnostics_valid)
+        self.assertEqual(conflict.case_failures, [])
+        self.assertIsNone(conflict.failure_phase)
+
+        duplicate = runner.collect_failure_evidence(
+            stdout,
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n"
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n",
+        )
+        self.assertTrue(duplicate.diagnostics_valid)
+        self.assertEqual(len(duplicate.case_failures), 1)
+
+        unknown = runner.collect_failure_evidence(
+            stdout,
+            "ROOTYARD_FAILURE_FRAME v1 case=secret_case phase=commit class=proposal_scope\n",
+        )
+        self.assertTrue(unknown.unknown_case)
+        self.assertEqual(unknown.case_failures, [])
+
     def test_main_retains_partial_evidence_on_nonzero_without_passing(self) -> None:
         path = self.root / "out" / "nonzero-report.json"
         output = NONZERO_FAILED_OUTPUT
@@ -721,6 +772,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             "signal": None,
             "evidence_complete": True,
             "suite_counts": {"passed": 2, "failed": 1, "ignored": 0, "measured": 0, "filtered": 0},
+            "case_failures": [{"case": CASE_REAL, "phase": "commit", "class": "proposal_scope"}],
             "failure_phase": "commit",
             "failure_class": "proposal_scope",
             "unknown_case": False,
@@ -859,6 +911,43 @@ class RootRaftRunnerTest(unittest.TestCase):
                 self.assertTrue(report["diagnostics"]["diagnostics_valid"])
                 self.assertNotIn(SECRET, json.dumps(report))
 
+    def test_main_evidence_drift_after_success_fails_without_losing_cases(self) -> None:
+        path = self.root / "out" / "evidence-changed-success-report.json"
+
+        def fake_execute(*_args, **_kwargs):
+            return runner.ExecutionResult(GOOD_OUTPUT, "", 0, None, "exited")
+
+        def changed(*_args, **_kwargs):
+            raise runner.RunnerError("execute", "evidence_changed")
+
+        with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+             mock.patch.object(runner, "_safe_head", return_value=self.head), \
+             mock.patch.object(
+                 runner,
+                 "load_and_validate",
+                 return_value=(None, "c" * 64, "b" * 64),
+             ), \
+             mock.patch.object(runner, "execute_case", side_effect=fake_execute), \
+             mock.patch.object(runner, "_verify_evidence_unchanged", side_effect=changed):
+            code = runner.main(
+                [
+                    "--test-binary",
+                    str(self.binary),
+                    "--build-receipt",
+                    str(self.receipt),
+                    "--report",
+                    str(path),
+                    "--expected-commit",
+                    self.head,
+                ]
+            )
+        self.assertEqual(code, 1)
+        report = json.loads(path.read_text(encoding="utf-8"))
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["error_class"], "evidence_changed")
+        self.assertEqual(len(report["cases"]), 3)
+        self.assertFalse(report["diagnostics"]["evidence_unchanged"])
+
     def test_report_allowlist_and_privacy(self) -> None:
         cases = [
             {"name": name, "status": "passed"} for name in runner.REQUIRED_CASES
@@ -898,6 +987,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             "signal": None,
             "evidence_complete": True,
             "suite_counts": {"passed": 2, "failed": 1, "ignored": 0, "measured": 0, "filtered": 0},
+            "case_failures": [{"case": CASE_REAL, "phase": "commit", "class": "proposal_scope"}],
             "failure_phase": "commit",
             "failure_class": "proposal_scope",
             "unknown_case": False,

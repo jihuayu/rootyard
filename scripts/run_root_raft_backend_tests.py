@@ -71,26 +71,37 @@ _COUNT_KEYS = ("passed", "failed", "ignored", "measured", "filtered")
 _FAILURE_FRAME = re.compile(
     r"^ROOTYARD_FAILURE_FRAME v1 case=([A-Za-z0-9_:]+) phase=([a-z0-9_]+) class=([a-z0-9_]+)$"
 )
-_FAILURE_PHASES = frozenset(
+_REAL_PHASES = frozenset(
     (
         "bootstrap", "provision", "commit", "refusal", "concurrent", "transition",
         "follower", "isolation", "live_axes", "snapshot", "install", "reopen",
         "partition", "heal", "final_reopen",
     )
 )
+_SCOPE_PHASES = frozenset(
+    (
+        "bootstrap", "provision", "install", "close", "recover", "recovery_rejections",
+        "initial_drain", "binding_rejections", "foreign_bootstrap", "foreign_advance",
+        "foreign_rejection", "pending_bridge", "cancel", "settled_drain",
+        "settled_evaluate", "settled_bridge", "follower", "invalid_options",
+        "partition", "heal", "shutdown",
+    )
+)
 _FAILURE_CLASSES = frozenset(
     (
         "assertion_panic", "proposal_scope", "command_scope", "stale_gate",
         "follower_redirect", "quorum_unavailable", "apply_barrier", "storage",
-        "encode", "wrong_reducer", "recovery_not_observed", "backend_other",
-        "unclassified",
+        "encode", "wrong_reducer", "recovery_not_observed", "scope_binding",
+        "scope_close_recovery", "bridge_database", "bridge_invalid_input",
+        "bridge_authority", "backend_other", "unclassified",
     )
 )
-_FAILURE_CASES = {REQUIRED_CASES[0]: _FAILURE_PHASES}
+_FAILURE_CASES = {REQUIRED_CASES[0]: _REAL_PHASES, REQUIRED_CASES[2]: _SCOPE_PHASES}
 _FAILURE_STATUS = {"ok": "passed", "FAILED": "failed", "ignored": "ignored"}
 _DIAGNOSTIC_KEYS = (
-    "exit_code", "signal", "evidence_complete", "suite_counts", "failure_phase",
-    "failure_class", "unknown_case", "diagnostics_valid", "evidence_unchanged",
+    "exit_code", "signal", "evidence_complete", "suite_counts", "case_failures",
+    "failure_phase", "failure_class", "unknown_case", "diagnostics_valid",
+    "evidence_unchanged",
 )
 
 
@@ -126,6 +137,7 @@ class FailureEvidence:
     counts: dict[str, int]
     suite_counts: dict[str, int] | None
     complete: bool
+    case_failures: list[dict[str, str]]
     failure_phase: str | None
     failure_class: str | None
     unknown_case: bool
@@ -485,7 +497,7 @@ def collect_failure_evidence(
     running = []
     summaries = []
     case_lines = []
-    frame_set = set()
+    frame_sets: dict[str, set[tuple[str, str]]] = {}
     unknown_case = False
     diagnostics_invalid = False
     for raw_line in stdout.splitlines():
@@ -516,7 +528,7 @@ def collect_failure_evidence(
             elif phase not in allowed_phases or class_code not in _FAILURE_CLASSES:
                 diagnostics_invalid = True
             else:
-                frame_set.add((name, phase, class_code))
+                frame_sets.setdefault(name, set()).add((phase, class_code))
 
     by_name: dict[str, str] = {}
     duplicate_case = False
@@ -581,19 +593,24 @@ def collect_failure_evidence(
         if name in by_name
     ]
 
-    phase = None
-    class_code = None
-    if len(frame_set) > 1:
-        diagnostics_invalid = True
-    elif len(frame_set) == 1 and not diagnostics_invalid:
-        _name, phase, class_code = next(iter(frame_set))
+    case_failures = []
+    for case in REQUIRED_CASES:
+        frames = frame_sets.get(case, set())
+        if len(frames) > 1:
+            diagnostics_invalid = True
+        elif len(frames) == 1 and not diagnostics_invalid:
+            phase, class_code = next(iter(frames))
+            case_failures.append({"case": case, "phase": phase, "class": class_code})
+    failure_phase = case_failures[0]["phase"] if len(case_failures) == 1 else None
+    failure_class = case_failures[0]["class"] if len(case_failures) == 1 else None
     return FailureEvidence(
         cases=cases,
         counts=observed,
         suite_counts=suite_counts,
         complete=complete,
-        failure_phase=phase,
-        failure_class=class_code,
+        case_failures=case_failures,
+        failure_phase=failure_phase,
+        failure_class=failure_class,
         unknown_case=unknown_case,
         diagnostics_valid=not diagnostics_invalid,
     )
@@ -661,6 +678,10 @@ def _failure_diagnostics(execution, evidence, evidence_unchanged) -> dict:
         "signal": None if execution is None else execution.signal,
         "evidence_complete": evidence.complete,
         "suite_counts": evidence.suite_counts,
+        "case_failures": [
+            {"case": failure["case"], "phase": failure["phase"], "class": failure["class"]}
+            for failure in evidence.case_failures
+        ],
         "failure_phase": evidence.failure_phase,
         "failure_class": evidence.failure_class,
         "unknown_case": evidence.unknown_case,
