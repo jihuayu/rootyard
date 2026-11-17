@@ -6,12 +6,13 @@
 //! is emitted only on error and is bounded to 8192 bytes. No identity, address, log object, PKI
 //! material or payload is serialized.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Write;
 use std::time::Instant;
 
-use openraft::ServerState;
 use openraft::error::Fatal;
+use openraft::{LogId, ServerState};
 use rootyard::ref_store::raft_backend::{RaftBackendError, RootRaftNode};
 use serde::Serialize;
 
@@ -22,13 +23,14 @@ mod cause;
 
 pub(crate) use cause::Operation;
 
-const SCHEMA: &str = "rootyard.quorum_diagnostics.v1";
-const FRAME_PREFIX: &str = "ROOTYARD_QUORUM_DIAGNOSTICS v1 ";
+const SCHEMA: &str = "rootyard.quorum_diagnostics.v2";
+const FRAME_PREFIX: &str = "ROOTYARD_QUORUM_DIAGNOSTICS v2 ";
 const MAX_FRAME_BYTES: usize = 8_192;
 const MAX_ELAPSED_MS: u64 = 900_000;
 const MAX_TERM: u64 = 1_000_000_000;
 const MAX_LOG_INDEX: u64 = 1_000_000_000_000;
 const MAX_MILLIS_SINCE_QUORUM_ACK: u64 = 900_000;
+const FIXTURE_SLOTS: [u8; 3] = [1, 2, 3];
 
 #[derive(Serialize)]
 struct Frame {
@@ -60,6 +62,15 @@ struct NodeSample {
     voter_count: Option<u64>,
     millis_since_quorum_ack: Option<u64>,
     numeric_overflow: bool,
+    replication_matching: Option<Vec<MatchingSample>>,
+}
+
+#[derive(Serialize)]
+struct MatchingSample {
+    slot: u8,
+    matched_index: Option<u64>,
+    matched_term: Option<u64>,
+    matched_leader_slot: Option<&'static str>,
 }
 
 /// Polls `future` exactly once around two synchronous fixed-node metric snapshots.
@@ -113,18 +124,56 @@ fn node_sample(slot: u8, node: &RootRaftNode) -> NodeSample {
     let voter_count = u64::try_from(metrics.membership_config.membership().voter_ids().count()).ok();
     let millis_since_quorum_ack =
         metrics.millis_since_quorum_ack.map(|value| bounded(value, MAX_MILLIS_SINCE_QUORUM_ACK, &mut numeric_overflow));
+    let observed_leader_slot = leader_slot(metrics.current_leader);
+    let matching = replication_matching(metrics.replication.as_ref(), observed_leader_slot, &mut numeric_overflow);
     NodeSample {
         slot,
         running_state: running_state(&metrics.running_state),
         server_state: server_state(metrics.state),
-        leader_slot: leader_slot(metrics.current_leader),
+        leader_slot: observed_leader_slot,
         term,
         last_log_index,
         last_applied_index,
         voter_count,
         millis_since_quorum_ack,
         numeric_overflow,
+        replication_matching: matching,
     }
+}
+
+/// Projects `RaftMetrics::replication` matching coordinates from the already-read metrics value.
+///
+/// The map is present only on a leader and contains the local leader plus both remote targets. An
+/// exact fixed three-slot key set is required; any other shape is reported as unavailable without
+/// exposing the observed identifiers. A present target with no matching log id keeps all three
+/// coordinate fields null, which is distinct from an absent target. The matched leader slot is the
+/// leader observed in this same publication; this OpenRaft `LogId` does not retain a proposer node
+/// id. This is published per-target progress, not a remote acknowledgment and not a commit claim.
+fn replication_matching(
+    replication: Option<&BTreeMap<u64, Option<LogId<u64>>>>,
+    observed_leader_slot: &'static str,
+    overflow: &mut bool,
+) -> Option<Vec<MatchingSample>> {
+    let replication = replication?;
+    if replication.len() != FIXTURE_SLOTS.len()
+        || !FIXTURE_SLOTS.iter().all(|slot| replication.contains_key(&u64::from(*slot)))
+    {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(FIXTURE_SLOTS.len());
+    for slot in FIXTURE_SLOTS {
+        let matching = replication.get(&u64::from(slot)).copied().flatten();
+        let (matched_index, matched_term, matched_leader_slot) = match matching {
+            Some(log_id) => (
+                Some(bounded(log_id.index, MAX_LOG_INDEX, overflow)),
+                Some(bounded(log_id.leader_id.term, MAX_TERM, overflow)),
+                Some(observed_leader_slot),
+            ),
+            None => (None, None, None),
+        };
+        entries.push(MatchingSample { slot, matched_index, matched_term, matched_leader_slot });
+    }
+    Some(entries)
 }
 
 fn bounded(value: u64, maximum: u64, overflow: &mut bool) -> u64 {

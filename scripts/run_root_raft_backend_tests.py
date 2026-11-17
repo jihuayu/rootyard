@@ -102,8 +102,11 @@ _FAILURE_CLASSES = frozenset(
 )
 _FAILURE_CASES = {REQUIRED_CASES[0]: _REAL_PHASES, REQUIRED_CASES[2]: _SCOPE_PHASES}
 _FAILURE_STATUS = {"ok": "passed", "FAILED": "failed", "ignored": "ignored"}
-_DIAGNOSTIC_PREFIX = "ROOTYARD_QUORUM_DIAGNOSTICS v1 "
-_DIAGNOSTIC_SCHEMA = "rootyard.quorum_diagnostics.v1"
+_DIAGNOSTIC_PREFIX_V1 = "ROOTYARD_QUORUM_DIAGNOSTICS v1 "
+_DIAGNOSTIC_PREFIX_V2 = "ROOTYARD_QUORUM_DIAGNOSTICS v2 "
+_DIAGNOSTIC_PREFIXES = (_DIAGNOSTIC_PREFIX_V1, _DIAGNOSTIC_PREFIX_V2)
+_DIAGNOSTIC_SCHEMA_V1 = "rootyard.quorum_diagnostics.v1"
+_DIAGNOSTIC_SCHEMA_V2 = "rootyard.quorum_diagnostics.v2"
 _MAX_DIAGNOSTIC_FRAME_BYTES = 8_192
 _MAX_DIAGNOSTIC_ELAPSED_MS = 900_000
 _MAX_DIAGNOSTIC_TERM = 1_000_000_000
@@ -141,13 +144,17 @@ _DIAGNOSTIC_TOP_KEYS = frozenset(
     )
 )
 _DIAGNOSTIC_SNAPSHOT_KEYS = frozenset(("at", "nodes"))
-_DIAGNOSTIC_NODE_KEYS = frozenset(
+_DIAGNOSTIC_NODE_KEYS_V1 = frozenset(
     (
         "slot", "running_state", "server_state", "leader_slot", "term",
         "last_log_index", "last_applied_index", "voter_count",
         "millis_since_quorum_ack", "numeric_overflow",
     )
 )
+_DIAGNOSTIC_MATCHING_KEYS = frozenset(
+    ("slot", "matched_index", "matched_term", "matched_leader_slot")
+)
+_DIAGNOSTIC_NODE_KEYS_V2 = _DIAGNOSTIC_NODE_KEYS_V1 | frozenset(("replication_matching",))
 _DIAGNOSTIC_KEYS = (
     "exit_code", "signal", "evidence_complete", "suite_counts", "case_failures",
     "failure_phase", "failure_class", "unknown_case", "diagnostics_valid",
@@ -556,27 +563,91 @@ def _diagnostic_no_duplicate_keys(pairs):
     return result
 
 
+def _rebuild_replication_matching(value):
+    """Rebuild the fixed-slot matching list, or null when the map is unavailable.
+
+    A present list must have exactly the three fixture slots. Each target keeps the distinction
+    between ``None`` matching (all three coordinates null) and a published coordinate (all three
+    fields present). Unknown slots, duplicate slots, extra fields and non-integer coordinates are
+    refused without reflecting the value.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError
+    rebuilt = []
+    for expected_slot, entry in zip((1, 2, 3), value):
+        if not isinstance(entry, dict) or set(entry) != _DIAGNOSTIC_MATCHING_KEYS:
+            raise ValueError
+        if type(entry.get("slot")) is not int or entry.get("slot") != expected_slot:
+            raise ValueError
+        matched_index = entry.get("matched_index")
+        matched_term = entry.get("matched_term")
+        matched_leader_slot = entry.get("matched_leader_slot")
+        if matched_index is None:
+            if matched_term is not None or matched_leader_slot is not None:
+                raise ValueError
+        else:
+            if not _diagnostic_int(matched_index, 0, _MAX_DIAGNOSTIC_LOG_INDEX):
+                raise ValueError
+            if not _diagnostic_int(matched_term, 0, _MAX_DIAGNOSTIC_TERM):
+                raise ValueError
+            if (
+                not isinstance(matched_leader_slot, str)
+                or matched_leader_slot not in _DIAGNOSTIC_LEADER_SLOTS
+            ):
+                raise ValueError
+        rebuilt.append(
+            {
+                "slot": expected_slot,
+                "matched_index": matched_index,
+                "matched_term": matched_term,
+                "matched_leader_slot": matched_leader_slot,
+            }
+        )
+    return rebuilt
+
+
+def _matching_overflow(matching) -> bool:
+    return matching is not None and any(
+        entry["matched_index"] == _MAX_DIAGNOSTIC_LOG_INDEX
+        or entry["matched_term"] == _MAX_DIAGNOSTIC_TERM
+        for entry in matching
+    )
+
+
 def _parse_quorum_diagnostic(line) -> tuple[str, dict]:
     """Validate and safely rebuild one bounded diagnostic JSON frame.
 
-    Any unknown, duplicate or extra field, bad type/range, wrong case/phase or oversized frame
-    raises ``ValueError`` without reflecting the raw value. The returned object is rebuilt from
-    only the validated fields.
+    Both the historical v1 frame (no matching fields) and the v2 frame (fixed-slot replication
+    matching) are accepted. The prefix and schema must agree, so v1 can never acquire an invented
+    matching observation. Any unknown, duplicate or extra field, bad type/range, wrong case/phase
+    or oversized frame raises ``ValueError`` without reflecting the raw value. The returned object
+    is rebuilt from only the validated fields.
     """
     if not isinstance(line, str) or len(line.encode("utf-8")) > _MAX_DIAGNOSTIC_FRAME_BYTES:
         raise ValueError
-    if not line.startswith(_DIAGNOSTIC_PREFIX):
+    prefix = next((item for item in _DIAGNOSTIC_PREFIXES if line.startswith(item)), None)
+    if prefix is None:
         raise ValueError
     try:
         payload = json.loads(
-            line[len(_DIAGNOSTIC_PREFIX):],
+            line[len(prefix):],
             object_pairs_hook=_diagnostic_no_duplicate_keys,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise ValueError from None
     if not isinstance(payload, dict) or set(payload) != _DIAGNOSTIC_TOP_KEYS:
         raise ValueError
-    if payload.get("schema") != _DIAGNOSTIC_SCHEMA:
+    if prefix == _DIAGNOSTIC_PREFIX_V1:
+        schema = _DIAGNOSTIC_SCHEMA_V1
+        node_keys = _DIAGNOSTIC_NODE_KEYS_V1
+        has_matching = False
+    else:
+        schema = _DIAGNOSTIC_SCHEMA_V2
+        node_keys = _DIAGNOSTIC_NODE_KEYS_V2
+        has_matching = True
+    if payload.get("schema") != schema:
         raise ValueError
     case = payload.get("case")
     phase = payload.get("phase")
@@ -619,7 +690,7 @@ def _parse_quorum_diagnostic(line) -> tuple[str, dict]:
             raise ValueError
         rebuilt_nodes = []
         for expected_slot, node in zip((1, 2, 3), nodes):
-            if not isinstance(node, dict) or set(node) != _DIAGNOSTIC_NODE_KEYS:
+            if not isinstance(node, dict) or set(node) != node_keys:
                 raise ValueError
             if type(node.get("slot")) is not int or node.get("slot") != expected_slot:
                 raise ValueError
@@ -650,32 +721,35 @@ def _parse_quorum_diagnostic(line) -> tuple[str, dict]:
                 raise ValueError
             if type(numeric_overflow) is not bool:
                 raise ValueError
+            matching = _rebuild_replication_matching(node.get("replication_matching"))
             if numeric_overflow and not any(
                 (
                     term == _MAX_DIAGNOSTIC_TERM,
                     last_log_index == _MAX_DIAGNOSTIC_LOG_INDEX,
                     last_applied_index == _MAX_DIAGNOSTIC_LOG_INDEX,
                     millis_since_quorum_ack == _MAX_DIAGNOSTIC_MILLIS,
+                    _matching_overflow(matching),
                 )
             ):
                 raise ValueError
-            rebuilt_nodes.append(
-                {
-                    "slot": expected_slot,
-                    "running_state": running_state,
-                    "server_state": server_state,
-                    "leader_slot": leader_slot,
-                    "term": term,
-                    "last_log_index": last_log_index,
-                    "last_applied_index": last_applied_index,
-                    "voter_count": voter_count,
-                    "millis_since_quorum_ack": millis_since_quorum_ack,
-                    "numeric_overflow": numeric_overflow,
-                }
-            )
+            rebuilt_node = {
+                "slot": expected_slot,
+                "running_state": running_state,
+                "server_state": server_state,
+                "leader_slot": leader_slot,
+                "term": term,
+                "last_log_index": last_log_index,
+                "last_applied_index": last_applied_index,
+                "voter_count": voter_count,
+                "millis_since_quorum_ack": millis_since_quorum_ack,
+                "numeric_overflow": numeric_overflow,
+            }
+            if has_matching:
+                rebuilt_node["replication_matching"] = matching
+            rebuilt_nodes.append(rebuilt_node)
         rebuilt_snapshots.append({"at": expected_at, "nodes": rebuilt_nodes})
     return case, {
-        "schema": _DIAGNOSTIC_SCHEMA,
+        "schema": schema,
         "case": case,
         "phase": phase,
         "operation": operation,
@@ -721,7 +795,7 @@ def collect_failure_evidence(
                 case_lines.append((name, outcome))
     for raw_line in stderr.splitlines():
         line = _ANSI.sub("", raw_line).strip()
-        if line.startswith(_DIAGNOSTIC_PREFIX):
+        if line.startswith(_DIAGNOSTIC_PREFIXES):
             try:
                 name, safe = _parse_quorum_diagnostic(line)
             except (TypeError, ValueError):

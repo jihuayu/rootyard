@@ -9,6 +9,7 @@ synthetic source tree and receipt fixture.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -148,6 +149,21 @@ def _diagnostic_node(slot):
     }
 
 
+def _matching_entry(slot, matched_index=None, matched_term=None, matched_leader_slot=None):
+    return {
+        "slot": slot,
+        "matched_index": matched_index,
+        "matched_term": matched_term,
+        "matched_leader_slot": matched_leader_slot,
+    }
+
+
+def _diagnostic_v2_node(slot, replication_matching):
+    node = _diagnostic_node(slot)
+    node["replication_matching"] = replication_matching
+    return node
+
+
 def _diagnostic_payload():
     return {
         "schema": "rootyard.quorum_diagnostics.v1",
@@ -164,10 +180,45 @@ def _diagnostic_payload():
     }
 
 
+def _diagnostic_v2_matching():
+    return [
+        _matching_entry(1, 42, 7, "slot1"),
+        _matching_entry(2, 42, 7, "slot1"),
+        _matching_entry(3),
+    ]
+
+
+def _diagnostic_v2_payload():
+    payload = _diagnostic_payload()
+    payload["schema"] = "rootyard.quorum_diagnostics.v2"
+    payload["snapshots"] = [
+        {
+            "at": at,
+            "nodes": [
+                _diagnostic_v2_node(1, _diagnostic_v2_matching()),
+                _diagnostic_v2_node(2, None),
+                _diagnostic_v2_node(3, None),
+            ],
+        }
+        for at in ("before", "after")
+    ]
+    return payload
+
+
 def _diagnostic_frame(payload=None):
     return (
         "ROOTYARD_QUORUM_DIAGNOSTICS v1 "
         + json.dumps(_diagnostic_payload() if payload is None else payload, separators=(",", ":"))
+        + "\n"
+    )
+
+
+def _diagnostic_v2_frame(payload=None):
+    return (
+        "ROOTYARD_QUORUM_DIAGNOSTICS v2 "
+        + json.dumps(
+            _diagnostic_v2_payload() if payload is None else payload, separators=(",", ":")
+        )
         + "\n"
     )
 
@@ -882,7 +933,7 @@ class RootRaftRunnerTest(unittest.TestCase):
                     set(safe["snapshots"][0]), runner._DIAGNOSTIC_SNAPSHOT_KEYS
                 )
                 self.assertEqual(
-                    set(safe["snapshots"][0]["nodes"][0]), runner._DIAGNOSTIC_NODE_KEYS
+                    set(safe["snapshots"][0]["nodes"][0]), runner._DIAGNOSTIC_NODE_KEYS_V1
                 )
                 self.assertNotIn(SECRET, json.dumps(safe))
 
@@ -1060,6 +1111,243 @@ class RootRaftRunnerTest(unittest.TestCase):
         safe = evidence.quorum_diagnostics[0]
         self.assertTrue(safe["elapsed_overflow"])
         self.assertTrue(safe["snapshots"][0]["nodes"][0]["numeric_overflow"])
+
+    def test_quorum_diagnostic_v2_keeps_null_map_and_none_matching_distinct(self) -> None:
+        evidence = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_v2_frame()
+        )
+        self.assertTrue(evidence.diagnostics_valid)
+        self.assertEqual(len(evidence.quorum_diagnostics), 1)
+        safe = evidence.quorum_diagnostics[0]
+        self.assertEqual(safe["schema"], runner._DIAGNOSTIC_SCHEMA_V2)
+        self.assertEqual(set(safe), runner._DIAGNOSTIC_TOP_KEYS)
+        nodes = safe["snapshots"][0]["nodes"]
+        self.assertEqual([node["slot"] for node in nodes], [1, 2, 3])
+        for node in nodes:
+            self.assertEqual(set(node), runner._DIAGNOSTIC_NODE_KEYS_V2)
+        leader_matching = nodes[0]["replication_matching"]
+        self.assertEqual([entry["slot"] for entry in leader_matching], [1, 2, 3])
+        self.assertEqual(
+            leader_matching[0],
+            {
+                "slot": 1,
+                "matched_index": 42,
+                "matched_term": 7,
+                "matched_leader_slot": "slot1",
+            },
+        )
+        self.assertEqual(
+            leader_matching[2],
+            {
+                "slot": 3,
+                "matched_index": None,
+                "matched_term": None,
+                "matched_leader_slot": None,
+            },
+        )
+        self.assertTrue(
+            all(set(entry) == runner._DIAGNOSTIC_MATCHING_KEYS for entry in leader_matching)
+        )
+        self.assertIsNone(nodes[1]["replication_matching"])
+        self.assertIsNone(nodes[2]["replication_matching"])
+        self.assertNotIn("7-42", json.dumps(safe))
+
+    def test_quorum_diagnostic_v1_and_v2_are_separated(self) -> None:
+        legacy = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_frame()
+        )
+        self.assertTrue(legacy.diagnostics_valid)
+        legacy_safe = legacy.quorum_diagnostics[0]
+        self.assertEqual(legacy_safe["schema"], runner._DIAGNOSTIC_SCHEMA_V1)
+        for node in legacy_safe["snapshots"][0]["nodes"]:
+            self.assertEqual(set(node), runner._DIAGNOSTIC_NODE_KEYS_V1)
+            self.assertNotIn("replication_matching", node)
+
+        injected_v1 = _diagnostic_payload()
+        for node in injected_v1["snapshots"][0]["nodes"]:
+            node["replication_matching"] = None
+        injected = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_frame(injected_v1)
+        )
+        self.assertFalse(injected.diagnostics_valid)
+        self.assertEqual(injected.quorum_diagnostics, [])
+
+        current = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_v2_frame()
+        )
+        self.assertTrue(current.diagnostics_valid)
+        self.assertEqual(current.quorum_diagnostics[0]["schema"], runner._DIAGNOSTIC_SCHEMA_V2)
+
+        v2_with_v1_schema = _diagnostic_v2_payload()
+        v2_with_v1_schema["schema"] = runner._DIAGNOSTIC_SCHEMA_V1
+        mismatch = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_v2_frame(v2_with_v1_schema)
+        )
+        self.assertFalse(mismatch.diagnostics_valid)
+        self.assertEqual(mismatch.quorum_diagnostics, [])
+
+        v1_with_v2_schema = _diagnostic_payload()
+        v1_with_v2_schema["schema"] = runner._DIAGNOSTIC_SCHEMA_V2
+        mismatch = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_frame(v1_with_v2_schema)
+        )
+        self.assertFalse(mismatch.diagnostics_valid)
+        self.assertEqual(mismatch.quorum_diagnostics, [])
+
+        v2_prefix_with_v1_body = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_v2_frame(_diagnostic_payload())
+        )
+        self.assertFalse(v2_prefix_with_v1_body.diagnostics_valid)
+        self.assertEqual(v2_prefix_with_v1_body.quorum_diagnostics, [])
+
+        v1_prefix_with_v2_body = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_frame(_diagnostic_v2_payload())
+        )
+        self.assertFalse(v1_prefix_with_v2_body.diagnostics_valid)
+        self.assertEqual(v1_prefix_with_v2_body.quorum_diagnostics, [])
+
+    def test_quorum_diagnostic_v2_rejects_malformed_matching_shapes(self) -> None:
+        cases = []
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"] = (
+            payload["snapshots"][0]["nodes"][0]["replication_matching"][:2]
+        )
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        matching = payload["snapshots"][0]["nodes"][0]["replication_matching"]
+        payload["snapshots"][0]["nodes"][0]["replication_matching"] = matching + [matching[2]]
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        matching = payload["snapshots"][0]["nodes"][0]["replication_matching"]
+        payload["snapshots"][0]["nodes"][0]["replication_matching"] = [
+            matching[0],
+            copy.deepcopy(matching[0]),
+            matching[2],
+        ]
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][2]["slot"] = 4
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        matching = payload["snapshots"][0]["nodes"][0]["replication_matching"]
+        payload["snapshots"][0]["nodes"][0]["replication_matching"] = [
+            matching[1],
+            matching[0],
+            matching[2],
+        ]
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["log_id"] = "7-42"
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        del payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_term"]
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_index"] = True
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_term"] = True
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_index"] = -1
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_index"] = (
+            runner._MAX_DIAGNOSTIC_LOG_INDEX + 1
+        )
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_term"] = (
+            runner._MAX_DIAGNOSTIC_TERM + 1
+        )
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_index"] = None
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_term"] = None
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_leader_slot"] = None
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_leader_slot"] = "slot4"
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        del payload["snapshots"][0]["nodes"][0]["replication_matching"]
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["replication_matching"] = {}
+        cases.append(payload)
+
+        payload = _diagnostic_v2_payload()
+        payload["snapshots"][0]["nodes"][0]["numeric_overflow"] = True
+        cases.append(payload)
+
+        for payload in cases:
+            with self.subTest(payload=payload):
+                evidence = runner.collect_failure_evidence(
+                    NONZERO_FAILED_OUTPUT, _diagnostic_v2_frame(payload)
+                )
+                self.assertFalse(evidence.diagnostics_valid)
+                self.assertEqual(evidence.quorum_diagnostics, [])
+                self.assertNotIn("7-42", json.dumps(evidence.quorum_diagnostics))
+                self.assertNotIn(SECRET, json.dumps(evidence.quorum_diagnostics))
+
+        oversized = _diagnostic_v2_frame().replace(",", "," + " " * 300)
+        too_large = runner.collect_failure_evidence(NONZERO_FAILED_OUTPUT, oversized)
+        self.assertFalse(too_large.diagnostics_valid)
+        self.assertEqual(too_large.quorum_diagnostics, [])
+
+        duplicate_field = _diagnostic_v2_frame().replace(
+            '"matched_term":7', '"matched_term":7,"matched_term":7', 1
+        )
+        duplicated = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, duplicate_field
+        )
+        self.assertFalse(duplicated.diagnostics_valid)
+        self.assertEqual(duplicated.quorum_diagnostics, [])
+
+    def test_quorum_diagnostic_v2_accepts_bounded_matching_overflow(self) -> None:
+        payload = _diagnostic_v2_payload()
+        node = payload["snapshots"][0]["nodes"][0]
+        node["numeric_overflow"] = True
+        node["replication_matching"][0].update(
+            matched_index=runner._MAX_DIAGNOSTIC_LOG_INDEX,
+            matched_term=runner._MAX_DIAGNOSTIC_TERM,
+        )
+        evidence = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_v2_frame(payload)
+        )
+        self.assertTrue(evidence.diagnostics_valid)
+        safe = evidence.quorum_diagnostics[0]
+        self.assertTrue(safe["snapshots"][0]["nodes"][0]["numeric_overflow"])
+        self.assertEqual(
+            safe["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_index"],
+            runner._MAX_DIAGNOSTIC_LOG_INDEX,
+        )
+        self.assertEqual(
+            safe["snapshots"][0]["nodes"][0]["replication_matching"][0]["matched_term"],
+            runner._MAX_DIAGNOSTIC_TERM,
+        )
 
     def test_quorum_diagnostic_rejects_cross_case_phases_and_scope_conflicts(self) -> None:
         scope_payload = _diagnostic_payload()
