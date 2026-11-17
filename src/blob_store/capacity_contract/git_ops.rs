@@ -67,6 +67,13 @@ impl ObjectFormat {
 }
 
 #[derive(Debug)]
+pub struct PartialUploadFailure {
+    pub detail: GitOpsError,
+    pub put_bytes: u64,
+    pub pack_locator: BlobLocator,
+}
+
+#[derive(Debug)]
 pub enum GitOpsError {
     DeadlineExceeded,
     Blob(BlobError),
@@ -74,7 +81,7 @@ pub enum GitOpsError {
     GitFailed { command: &'static str, detail: String },
     InvalidPack(&'static str),
     LimitExceeded(&'static str),
-    PartialUpload { detail: Box<GitOpsError>, put_bytes: u64, pack_locator: BlobLocator },
+    PartialUpload(Box<PartialUploadFailure>),
     Io(String),
 }
 
@@ -87,8 +94,8 @@ impl fmt::Display for GitOpsError {
             Self::GitFailed { command, detail } => write!(f, "git `{command}` failed: {detail}"),
             Self::InvalidPack(msg) => write!(f, "invalid pack artifact: {msg}"),
             Self::LimitExceeded(msg) => write!(f, "verification bound exceeded: {msg}"),
-            Self::PartialUpload { detail, put_bytes, pack_locator } => {
-                write!(f, "partial upload ({put_bytes} bytes at {}): {detail}", pack_locator.path())
+            Self::PartialUpload(part) => {
+                write!(f, "partial upload ({} bytes at {}): {}", part.put_bytes, part.pack_locator.path(), part.detail)
             }
             Self::Io(msg) => write!(f, "git capacity IO error: {msg}"),
         }
@@ -231,10 +238,12 @@ pub async fn upload_pack_pair(
     let pack_intent =
         store.new_upload(scope.tenant_id, scope.authority_id, scope.generation, "packs", &pack_sha256, pack_length)?;
     let pack_receipt = store.put_file(pack_intent, pack_path, deadline).await?;
-    let partial = |detail: GitOpsError| GitOpsError::PartialUpload {
-        detail: Box::new(detail),
-        put_bytes: pack_length,
-        pack_locator: pack_receipt.locator().clone(),
+    let partial = |detail: GitOpsError| {
+        GitOpsError::PartialUpload(Box::new(PartialUploadFailure {
+            detail,
+            put_bytes: pack_length,
+            pack_locator: pack_receipt.locator().clone(),
+        }))
     };
     if pack_receipt.backend_identity() != store.backend_identity() {
         return Err(partial(GitOpsError::Blob(BlobError::ForeignBackend)));

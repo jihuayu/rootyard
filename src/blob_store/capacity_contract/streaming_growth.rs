@@ -191,9 +191,9 @@ impl StreamingGrowthEngine {
     ) -> GrowthEngineError {
         let mut locs: Vec<BlobLocator> = uploaded.into_iter().map(|r| r.pack_locator).collect();
         let (inner, part_b) = match err {
-            GitOpsError::PartialUpload { detail, put_bytes: pb, pack_locator } => {
-                locs.push(pack_locator);
-                (*detail, pb)
+            GitOpsError::PartialUpload(part) => {
+                locs.push(part.pack_locator);
+                (part.detail, part.put_bytes)
             }
             other => (other, 0),
         };
