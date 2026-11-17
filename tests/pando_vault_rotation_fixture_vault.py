@@ -14,9 +14,8 @@ import os
 from pathlib import Path
 import secrets
 import time
-import urllib.error
-import urllib.request
 
+import pando_vault_rotation_http as http_transaction
 from pando_vault_rotation_fixture import (
     APP_ACTIONS,
     CONTAINER_ID_RE,
@@ -69,8 +68,10 @@ class VaultFixture:
         self.reconciliation = "not_needed"
         self.denied_rotate = False
         self.derived_verified = False
-        self.opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}))
+        # The live opener runs the whole transaction in one owned bounded
+        # child.  Pure contracts may still inject a fake opener.
+        self.opener = http_transaction.BoundedHttpOpener(
+            runner=self.runner, budget=self.budget)
 
     def _now(self):
         return self.clock() if self.clock is not None else time.monotonic()
@@ -147,24 +148,25 @@ class VaultFixture:
         return True
 
     def _request(self, method, path, payload=None, token=None, timeout=5):
+        effective = self._clamp(timeout, "vault_http")
         data = None if payload is None else json.dumps(payload).encode()
         headers = {"Content-Type": "application/json"}
         if token:
             headers["X-Vault-Token"] = token
-        request = urllib.request.Request(
-            self.host_url + path, data=data, method=method, headers=headers)
-        effective = self._clamp(timeout, "vault_http")
+        request = http_transaction.HttpRequest(
+            method, self.host_url + path, data=data, headers=headers)
         try:
             with self.opener.open(request, timeout=effective) as response:
                 status, raw = response.status, response.read(MAX_BODY + 1)
-        except urllib.error.HTTPError as error:
-            status, raw = error.code, b""
-        except (urllib.error.URLError, OSError, ValueError):
+        except FixtureError:
+            raise
+        except Exception:
             if self.budget is not None and self.budget.expired():
                 raise FixtureError("vault_deadline_exceeded") from None
             raise FixtureError("vault_api_failed") from None
-        # Socket connect/read are non-preemptible.  The late recheck is the
-        # only wall-clock claim; the per-request timeout is not a guarantee.
+        # The requested HTTP transaction ran in one owned child whose exact
+        # process group is killed and reaped at the shared deadline.  The late
+        # recheck still prevents a child that returned after D from counting.
         self._late("vault_http")
         return status, raw
 

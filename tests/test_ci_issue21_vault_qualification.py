@@ -20,6 +20,7 @@ for entry in (str(ROOT / "scripts"), str(ROOT / "tests")):
 import pando_vault_rotation as rotation  # noqa: E402
 import pando_vault_rotation_ci_report as adapter  # noqa: E402
 import pando_vault_rotation_fixture as vault_fixture  # noqa: E402
+import pando_vault_rotation_http as vault_http  # noqa: E402
 from test_ci_issue21_qualification import (  # noqa: E402
     PANDO_CLI_STEP,
     PANDO_PITR_STEP,
@@ -200,6 +201,27 @@ class VaultWorkflowTest(unittest.TestCase):
         self.assertEqual(len(harnesses), len(set(harnesses)))
         for relative in harnesses:
             self.assertTrue((ROOT / relative).is_file(), relative)
+
+    def test_vault_http_child_and_pure_tests_are_in_the_closure(self):
+        names = {path.name for path in rotation._harness_files()}
+        for name in (
+            "pando_vault_rotation_http.py",
+            "pando_vault_rotation_http_child.py",
+            "test_pando_vault_rotation_http.py",
+            "test_pando_vault_rotation_http_fixture.py",
+        ):
+            self.assertIn(name, names)
+        self.assertEqual(vault_http.CHILD_SCRIPT.name,
+                         "pando_vault_rotation_http_child.py")
+        harnesses = _flag_values(_manifest_part(), "--harness")
+        for relative in (
+            "tests/pando_vault_rotation_http.py",
+            "tests/pando_vault_rotation_http_child.py",
+            "tests/test_pando_vault_rotation_http.py",
+            "tests/test_pando_vault_rotation_http_fixture.py",
+        ):
+            self.assertIn(relative, harnesses)
+        self.assertIn("tests/" + vault_http.CHILD_SCRIPT.name, harnesses)
 
     def test_harness_glob_binds_reused_pg_command_runner(self):
         names = {path.name for path in rotation._harness_files()}
