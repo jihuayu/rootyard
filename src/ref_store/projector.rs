@@ -7,6 +7,9 @@ pub mod identity;
 pub mod jobs;
 pub mod memory;
 pub mod pg;
+pub mod remote_authz_bridge;
+pub mod remote_authz_grant;
+pub mod remote_authz_pg;
 pub mod replay;
 pub mod session_fence;
 #[cfg(test)]
@@ -32,6 +35,17 @@ pub use pg::{
     projection_tables_present, record_truncation_cutoff_in_tx, replay_page_to_pg,
     verify_projected_operation_non_authorizing,
 };
+pub use remote_authz_bridge::{
+    DrainedOperationTerminal, LinearizableScopeProbe, PgClosingScopeRow, PgDecisionCancellationRow,
+    RemoteAuthzBridgeError, RevocationDrainStatus, await_drain_before_revocation_ack, build_cancel_command_from_pg,
+    evaluate_revocation_drain_barrier, load_closing_scopes_from_pg, load_decision_cancellations_from_pg,
+    plan_close_scope_commands,
+};
+pub use remote_authz_grant::{
+    DecisionGrantKeyring, GrantExpectedRealm, RemoteAuthzGrantError, ServiceMtlsIdentity, SignedDecisionGrant,
+    SignedDecisionGrantPayload, build_scoped_commit_from_grant, grant_commitment_for, verify_signed_decision_grant,
+};
+pub use remote_authz_pg::{PgGrantMintRequest, mint_signed_decision_grant_from_pg};
 pub use replay::{
     CursorTransition, assert_projection_cannot_authorize_write, check_stream_continuity, complete_cursor_resync,
     plan_operation_projection, reconcile_cutoff_on_cursor, refuse_write_from_historical_receipt, validate_cursor_step,
