@@ -256,8 +256,13 @@ fn immutable_install_conflicts_nonregular_and_link_failures_never_replace_or_lea
 }
 
 fn replace_immutable_file(path: &Path, bytes: &[u8]) {
+    use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => panic!("failed to make immutable fixture writable: {error}"),
+    }
     std::fs::write(path, bytes).unwrap();
 }
 
