@@ -1155,10 +1155,88 @@ class Lab:
         assert (clone_mid / 'data.txt').read_text().strip() == 'ROOTYARD_ISSUE21_CONCURRENT_GAMMA_003'
         assert 'ROOTYARD_ISSUE21_SECRET_ALPHA_001' in self.git('show', 'HEAD~2:data.txt', cwd=clone_mid).stdout
 
+        # Independent pre-resume baseline: use the authoritative checkpoint and
+        # envelopes, not the resume response, to derive the this-run eligible set.
+        baseline = json.loads(self.sql(
+            f"""
+            SELECT json_build_object(
+              'checkpoint', (
+                SELECT json_build_object(
+                  'state', state,
+                  'target_id', to_key_id,
+                  'target_version', to_key_version,
+                  'target_provider', checkpoint_json->>'to_provider_kind',
+                  'expected_version', (checkpoint_json->>'expected_to_version')::int,
+                  'completed_pack_ids', checkpoint_json->'completed_pack_ids',
+                  'failed_pack_id', failed_pack_id
+                )
+                FROM pando_lab.kms_rotations
+                WHERE repo='{enc_repo}' AND state='IN_PROGRESS'
+              ),
+              'packs', (
+                SELECT json_agg(json_build_object(
+                  'pack_id', m.pack_id::text,
+                  'key_id', e.key_id,
+                  'key_version', e.key_version,
+                  'encryption_mode', e.encryption_mode,
+                  'provider_kind', e.provider_kind
+                ) ORDER BY m.pack_id)
+                FROM pando_lab.manifests m
+                LEFT JOIN pando_lab.kms_envelopes e
+                  ON e.repo=m.repo AND e.pack_id=m.pack_id
+                WHERE m.repo='{enc_repo}'
+              )
+            )
+            """
+        ))
+        checkpoint = baseline['checkpoint']
+        packs = baseline['packs']
+        assert checkpoint is not None and packs is not None, baseline
+        assert checkpoint['state'] == 'IN_PROGRESS', checkpoint
+        target_key_id = checkpoint['target_id']
+        target_key_version = checkpoint['target_version']
+        assert target_key_id == 'kms-rot-v2', checkpoint
+        assert target_key_version == checkpoint['expected_version'], checkpoint
+        assert checkpoint['target_provider'] == 'local-file-key-provider', checkpoint
+        assert len(packs) == 3, packs
+        assert all(p['key_id'] is not None and p['key_version'] is not None for p in packs), packs
+        assert all(p['encryption_mode'] == 'authenticated-envelope-v1' for p in packs), packs
+        assert all(p['provider_kind'] == 'local-file-key-provider' for p in packs), packs
+        scoped_pack_ids = {p['pack_id'] for p in packs}
+        assert scoped_pack_ids == {p1, p2, p3}, scoped_pack_ids
+        completed_ids = checkpoint['completed_pack_ids']
+        assert isinstance(completed_ids, list) and len(completed_ids) == 1, checkpoint
+        completed_pack_id = completed_ids[0]
+        failed_pack_id = checkpoint['failed_pack_id']
+        assert failed_pack_id is not None, checkpoint
+        assert completed_pack_id in scoped_pack_ids and p3 in scoped_pack_ids, scoped_pack_ids
+        eligible_pack_ids = {
+            p['pack_id'] for p in packs
+            if p['key_id'] != target_key_id or p['key_version'] != target_key_version
+        }
+        assert completed_pack_id not in eligible_pack_ids, eligible_pack_ids
+        assert p3 not in eligible_pack_ids, eligible_pack_ids
+        assert failed_pack_id in eligible_pack_ids, eligible_pack_ids
+        assert eligible_pack_ids == scoped_pack_ids - {completed_pack_id, p3}, eligible_pack_ids
+        expected_rewrapped = len(eligible_pack_ids)
+
         resumed = json.loads(self.cli('kms-rotate', enc_repo, '--resume'))
-        assert resumed['new_key_id'] == 'kms-rot-v2' and resumed['envelopes_rewrapped'] == 3, resumed
+        assert resumed['new_key_id'] == 'kms-rot-v2', resumed
+        assert resumed['new_key_version'] == target_key_version, resumed
+        assert resumed['envelopes_rewrapped'] == expected_rewrapped, resumed
+        assert resumed['envelopes_verified'] == 3 and len(resumed['envelopes']) == 3, resumed
+        assert {e['pack_id'] for e in resumed['envelopes']} == scoped_pack_ids, resumed
+        assert all(
+            e['key_id'] == target_key_id
+            and e['key_version'] == target_key_version
+            and e['encryption_mode'] == 'authenticated-envelope-v1'
+            and e['provider_kind'] == 'local-file-key-provider'
+            for e in resumed['envelopes']
+        ), resumed
         st_done = json.loads(self.cli('kms-status', enc_repo))
         assert st_done['active_rotation']['state'] == 'COMPLETED'
+        assert set(st_done['active_rotation']['target_pack_ids']) == scoped_pack_ids, st_done
+        assert set(st_done['active_rotation']['completed_pack_ids']) == scoped_pack_ids, st_done
         assert hashlib.sha256(c1_path.read_bytes()).hexdigest() == c1_sha
         assert hashlib.sha256(c2_path.read_bytes()).hexdigest() == c2_sha
         assert hashlib.sha256(c2_bytes).hexdigest() == c2_sha and len(p2_sha) == 64 and len(p3_sha) == 64
