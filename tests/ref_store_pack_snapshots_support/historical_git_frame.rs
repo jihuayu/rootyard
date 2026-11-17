@@ -173,15 +173,15 @@ pub fn classify_stderr(stderr: &[u8]) -> u8 {
     if let Some(rest) = line.strip_prefix("fatal: Not a valid object name ") {
         return if rest.is_empty() { 0 } else { 1 };
     }
-    if let Some(rest) = line.strip_prefix("fatal: git cat-file ") {
-        if let Some(rest) = rest.strip_suffix(": bad file") {
-            return if rest.is_empty() { 0 } else { 2 };
-        }
+    if let Some(rest) = line.strip_prefix("fatal: git cat-file ")
+        && let Some(rest) = rest.strip_suffix(": bad file")
+    {
+        return if rest.is_empty() { 0 } else { 2 };
     }
-    if let Some(rest) = line.strip_prefix("fatal: unable to stream ") {
-        if let Some(rest) = rest.strip_suffix(" to stdout") {
-            return if rest.is_empty() { 0 } else { 3 };
-        }
+    if let Some(rest) = line.strip_prefix("fatal: unable to stream ")
+        && let Some(rest) = rest.strip_suffix(" to stdout")
+    {
+        return if rest.is_empty() { 0 } else { 3 };
     }
     if let Some(rest) = line.strip_prefix("fatal: path '") {
         if let Some(rest) = rest.strip_suffix("'") {
