@@ -121,10 +121,14 @@ class ReceiptV2GateTest(unittest.TestCase):
     def test_v1_rejection_precedes_context_and_owned_resources(self):
         context = mock.patch.object(main, "Context").start()
         self.addCleanup(mock.patch.stopall)
-        with mock.patch.object(main, "_source_state", return_value={
-                "commit": COMMIT, "tree": TREE, "clean": True}), \
-             mock.patch.object(main.receipts, "load_receipt",
-                               return_value=validated_v1(self.binary_sha)), \
+        # The live harness validates source/receipt identity in one bounded
+        # owned child.  This test replaces that child with the same fixed v1
+        # rejection code so the ordering contract is still exercised without
+        # any Git or child process.
+        with mock.patch.object(
+                main.source, "validate",
+                side_effect=support.QualificationError(
+                    "receipt_pando_receipt_not_v2", "binding")), \
              mock.patch.object(main.shutil, "which",
                                return_value="/usr/bin/tool"):
             report = main.run_qualification(self.args(), ENVIRONMENT)

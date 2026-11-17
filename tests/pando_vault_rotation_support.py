@@ -14,10 +14,8 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
-import time
 
+from pando_vault_rotation_command import BoundedCommandRunner, CommandError
 from pando_vault_rotation_fixture import FixtureError
 from pando_vault_rotation_fixture_resources import NONCE_RE
 
@@ -43,13 +41,14 @@ REMOTE_ENV_PREFIXES = (
 )
 
 
-class QualificationError(RuntimeError):
-    """A fixed, report-safe qualification failure."""
+class QualificationError(FixtureError):
+    """A fixed, report-safe qualification failure.
 
-    def __init__(self, code, stage=None):
-        self.code = code
-        self.stage = stage
-        super().__init__(code)
+    It deliberately shares the fixture's code/stage shape so an owned PG or
+    Vault operation that times out under the shared deadline is still
+    recognised by the fixture's unknown-outcome handling without exposing any
+    raw exception text.
+    """
 
 
 def require(condition, code, stage=None):
@@ -69,6 +68,24 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def sha256_file_bounded(path, budget, stage="binding"):
+    """Hash one file while charging one shared absolute budget.
+
+    Filesystem reads are not preemptible.  The budget is checked before each
+    chunk and once after the stream closes, so a late completion fails closed
+    instead of being reported as a valid binding.
+    """
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            if budget is not None:
+                budget.late(stage)
+            digest.update(chunk)
+    if budget is not None:
+        budget.late(stage)
+    return digest.hexdigest()
+
+
 def valid_uuid(value):
     return isinstance(value, str) and UUID_RE.fullmatch(value) is not None
 
@@ -82,30 +99,37 @@ class Completed:
 
 
 class Runner:
-    """Bounded subprocess wrapper whose output never leaves RAM."""
+    """Bounded subprocess wrapper whose output never leaves RAM.
 
-    def __init__(self, timeout=90):
+    The default caps and the caller's per-operation timeout remain unchanged.
+    When a shared :class:`Budget` is supplied every call is additionally
+    clamped to the current remaining work/cleanup budget and rechecked after
+    the blocking call.  Running the approved Popen-based runner also means a
+    timeout kills only the exact owned process group and reaps it before the
+    result is returned or abandoned.
+    """
+
+    def __init__(self, timeout=90, budget=None, clock=None):
         self.timeout = timeout
+        self.budget = budget
+        self._commands = BoundedCommandRunner(
+            budget=budget, clock=clock if clock is not None
+            else getattr(budget, "clock", None))
+
+    @property
+    def unresolved_children(self):
+        return bool(getattr(self._commands, "unresolved_children", False))
 
     def run(self, argv, env=None, input=None, timeout=None, stage="subprocess", cwd=None):
-        argv = [str(item) for item in argv]
+        requested = self.timeout if timeout is None else timeout
         try:
-            result = subprocess.run(
-                argv,
-                env=env,
-                input=input,
-                stdin=subprocess.DEVNULL if input is None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=self.timeout if timeout is None else timeout,
-                check=False,
-                cwd=cwd,
-            )
-        except subprocess.TimeoutExpired:
-            raise QualificationError("subprocess_timeout", stage) from None
-        except (OSError, subprocess.SubprocessError):
-            raise QualificationError("subprocess_failed", stage) from None
-        return Completed(argv, result.returncode, result.stdout, result.stderr)
+            result = self._commands.run(
+                argv, env=env, input=input, timeout=requested,
+                stage=stage, cwd=cwd)
+        except CommandError as error:
+            raise QualificationError(error.code, error.stage) from None
+        return Completed(result.argv, result.returncode, result.stdout,
+                         result.stderr)
 
     def ok(self, argv, env=None, input=None, timeout=None, stage="subprocess", cwd=None):
         result = self.run(argv, env=env, input=input, timeout=timeout, stage=stage, cwd=cwd)

@@ -46,12 +46,14 @@ class VaultFixture:
     """One exact-owned ephemeral Vault Transit provider."""
 
     def __init__(self, state_path, runner=None, image=VAULT_IMAGE,
-                 token_factory=None, sleep=None):
+                 token_factory=None, sleep=None, budget=None, clock=None):
         self.state_path = Path(state_path)
         self.runner = runner or DockerRunner()
         self.image = image
         self.token_factory = token_factory or secrets.token_urlsafe
         self.sleep = sleep or time.sleep
+        self.budget = budget
+        self.clock = clock
         self.nonce = secrets.token_hex(6)
         self.container_name = expected_container_name(self.nonce)
         self.key_name = "pando-vault-rotation-" + self.nonce
@@ -70,9 +72,24 @@ class VaultFixture:
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}))
 
+    def _now(self):
+        return self.clock() if self.clock is not None else time.monotonic()
+
+    def _require(self, stage):
+        if self.budget is not None:
+            self.budget.require(stage)
+
+    def _clamp(self, requested, stage, reserve=0.0):
+        if self.budget is None:
+            return requested
+        return self.budget.clamp(requested, stage, reserve=reserve)
+
+    def _late(self, stage):
+        if self.budget is not None:
+            self.budget.late(stage)
+
     def safe_state(self, phase=None):
-        return {
-            "schema": OWNERSHIP_SCHEMA,
+        return {            "schema": OWNERSHIP_SCHEMA,
             "phase": phase or self.phase or (
                 "created" if self.container_id else "intent"),
             "kind": VAULT_KIND,
@@ -114,15 +131,20 @@ class VaultFixture:
         return digests if isinstance(digests, list) else None
 
     def ensure_image(self):
+        self._require("vault_image")
         digests = self._image_digests()
         if digests is None or self.image not in digests:
             result = self.runner.run(
-                ["docker", "pull", self.image], timeout=PULL_TIMEOUT)
+                ["docker", "pull", self.image],
+                timeout=self._clamp(PULL_TIMEOUT, "vault_image"))
             if result.returncode != 0:
                 raise FixtureError("vault_image_unavailable")
+            self._late("vault_image")
             digests = self._image_digests()
         if digests is None or self.image not in digests:
             raise FixtureError("vault_image_digest_unverified")
+        self._late("vault_image")
+        return True
 
     def _request(self, method, path, payload=None, token=None, timeout=5):
         data = None if payload is None else json.dumps(payload).encode()
@@ -131,13 +153,20 @@ class VaultFixture:
             headers["X-Vault-Token"] = token
         request = urllib.request.Request(
             self.host_url + path, data=data, method=method, headers=headers)
+        effective = self._clamp(timeout, "vault_http")
         try:
-            with self.opener.open(request, timeout=timeout) as response:
-                return response.status, response.read(MAX_BODY + 1)
+            with self.opener.open(request, timeout=effective) as response:
+                status, raw = response.status, response.read(MAX_BODY + 1)
         except urllib.error.HTTPError as error:
-            return error.code, b""
+            status, raw = error.code, b""
         except (urllib.error.URLError, OSError, ValueError):
+            if self.budget is not None and self.budget.expired():
+                raise FixtureError("vault_deadline_exceeded") from None
             raise FixtureError("vault_api_failed") from None
+        # Socket connect/read are non-preemptible.  The late recheck is the
+        # only wall-clock claim; the per-request timeout is not a guarantee.
+        self._late("vault_http")
+        return status, raw
 
     def api(self, method, path, payload=None, token=None, timeout=5):
         status, raw = self._request(method, path, payload, token, timeout)
@@ -208,8 +237,10 @@ class VaultFixture:
             self.write_state("intent")
         except OSError:
             raise FixtureError("vault_state_write_failed") from None
+        self._require("vault_start")
         try:
             result = self.runner.run(command, env=environment)
+            self._late("vault_start")
         except FixtureError:
             self.reconcile_creation()
             raise
@@ -238,8 +269,10 @@ class VaultFixture:
             raise FixtureError("vault_port_failed")
         lines = ports.stdout.decode(errors="replace").splitlines()
         self.host_url = published_loopback_url(lines)
-        deadline = time.monotonic() + HEALTH_TIMEOUT
-        while time.monotonic() < deadline:
+        deadline = self._now() + HEALTH_TIMEOUT
+        if self.budget is not None:
+            deadline = min(deadline, self.budget.deadline)
+        while self._now() < deadline:
             try:
                 if self.health():
                     break
@@ -248,6 +281,7 @@ class VaultFixture:
             self.sleep(0.2)
         else:
             raise FixtureError("vault_health_timeout")
+        self._late("vault_health")
         self.version = VAULT_VERSION
 
     def key_metadata(self, key_name=None, token=None):
@@ -459,6 +493,7 @@ class VaultFixture:
             except FixtureError:
                 pass
         result = remove_owned_container(self.runner, state)
+        self._late("cleanup")
         self.remove_state()
         self.release_credentials()
         return result

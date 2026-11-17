@@ -496,4 +496,3 @@ class OwnedFixture:
         return self._finish_cleanup(
             facts, failure, deadline, primary_code
         )
-
