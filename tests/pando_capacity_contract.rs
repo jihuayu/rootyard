@@ -107,11 +107,12 @@ async fn handle_s3(State(state): State<Arc<S3State>>, method: Method, uri: Uri, 
     if !key.contains('/') {
         return Response::new(Body::from("<ListBucketResult/>"));
     }
-    if method == Method::GET
-        && let Some((_, entered, release)) = state.gate.lock().unwrap().take_if(|g| key.contains(&g.0))
-    {
-        entered.notify_one();
-        release.notified().await;
+    if method == Method::GET {
+        let hit = state.gate.lock().unwrap().take_if(|g| key.contains(&g.0));
+        if let Some((_, entered, release)) = hit {
+            entered.notify_one();
+            release.notified().await;
+        }
     }
     let resp = |st: StatusCode, tag: Option<String>, len: usize, b: Body| {
         let r = Response::builder().status(st).header(header::CONTENT_LENGTH, len.to_string());
