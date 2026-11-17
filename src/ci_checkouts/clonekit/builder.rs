@@ -168,7 +168,7 @@ impl Drop for RetentionPinGuard<'_> {
 }
 
 fn read_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, CloneKitError> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
