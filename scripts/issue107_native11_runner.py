@@ -79,6 +79,32 @@ METADATA_REPLAY_ERROR_KINDS = {
 # `historical_error_kind` never returns the reserved blob-provider class.
 HISTORICAL_READ_ERROR_KINDS = frozenset(range(1, 8))
 
+# Independent numeric-only child frame for the historical cat-file outcome.
+HISTORICAL_GIT_PREFIX = "ROOTYARD_I107_HISTORICAL_GIT_V1"
+HISTORICAL_GIT_PROTOCOL = "historical_git_v1"
+HISTORICAL_GIT_PHASE = 17
+HISTORICAL_GIT_SITE = 9
+HISTORICAL_GIT_MAX_LINE = 512
+HISTORICAL_GIT_OUTCOMES = {
+    1: 'exited',
+    2: 'signaled',
+    3: 'timeout',
+    4: 'spawn_io',
+    5: 'wait_io',
+    6: 'other',
+}
+HISTORICAL_GIT_MESSAGE_CLASSES = {
+    0: 'unknown',
+    1: 'invalid_object_name',
+    2: 'bad_file',
+    3: 'stream_stdout',
+    4: 'path_absent',
+}
+HISTORICAL_GIT_KEYS = frozenset({
+    "protocol", "phase", "site", "outcome", "exit_code", "signal",
+    "message_class",
+})
+
 METADATA_REPLAY_PHASES = {
     1: 'setup',
     2: 'tenant_create',
@@ -578,6 +604,7 @@ def _metadata_replay_unknown(invalid=False):
         "checks": None,
         "iteration": None,
         "error_kind": None,
+        "historical_git": None,
     }
 
 
@@ -831,6 +858,42 @@ class _HistoricalTraceState:
         return True
 
 
+def _parse_historical_git_frame(line):
+    if len(line) > HISTORICAL_GIT_MAX_LINE or not line.isascii():
+        raise ValueError
+    parts = line.split("|")
+    if (len(parts) != 7 or parts[0] != HISTORICAL_GIT_PREFIX
+            or parts[1] != str(HISTORICAL_GIT_PHASE)
+            or parts[2] != str(HISTORICAL_GIT_SITE)):
+        raise ValueError
+    outcome = _metadata_replay_uint(
+        parts[3], 1, max(HISTORICAL_GIT_OUTCOMES))
+    exit_code = (None if parts[4] == ""
+                 else _metadata_replay_uint(parts[4], 0, 2_147_483_647))
+    signal = (None if parts[5] == ""
+              else _metadata_replay_uint(parts[5], 1, 127))
+    message_class = _metadata_replay_uint(
+        parts[6], 0, max(HISTORICAL_GIT_MESSAGE_CLASSES))
+    if outcome == 1 and (exit_code is None or signal is not None):
+        raise ValueError
+    if outcome == 2 and (exit_code is not None or signal is None):
+        raise ValueError
+    if outcome in (3, 4, 5, 6):
+        if exit_code is not None or signal is not None:
+            raise ValueError
+        if message_class != 0:
+            raise ValueError
+    return {
+        "protocol": HISTORICAL_GIT_PROTOCOL,
+        "phase": HISTORICAL_GIT_PHASE,
+        "site": HISTORICAL_GIT_SITE,
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "signal": signal,
+        "message_class": message_class,
+    }
+
+
 def _parse_metadata_replay_trace(text):
     """Parse complete fixed frames only; raw rejected text is never retained."""
     trace = _metadata_replay_unknown()
@@ -844,7 +907,22 @@ def _parse_metadata_replay_trace(text):
     frame_count = 0
     truncated = False
     historical = _HistoricalTraceState()
+    # The optional child frame is outside the v1 parent line grammar. It is
+    # consumed only when it is the single frame for a failed site-9 parent.
+    historical_git_frames = []
+    site9_enter_index = None
+    site9_fail_index = None
+    site9_fail_frame = None
     for index, line in enumerate(lines):
+        if line.startswith(HISTORICAL_GIT_PREFIX):
+            if index == len(lines) - 1 and not trailing_newline:
+                return _metadata_replay_unknown(invalid=True)
+            try:
+                historical_git_frames.append(
+                    (index, _parse_historical_git_frame(line)))
+            except ValueError:
+                return _metadata_replay_unknown(invalid=True)
+            continue
         if not line.startswith(METADATA_REPLAY_PREFIX):
             continue
         frame_count += 1
@@ -912,6 +990,12 @@ def _parse_metadata_replay_trace(text):
                     raise ValueError
         except ValueError:
             return _metadata_replay_unknown(invalid=True)
+        if phase == HISTORICAL_GIT_PHASE and site == HISTORICAL_GIT_SITE:
+            if event == 0:
+                site9_enter_index = index
+            elif event == 1 and ok is False and error_kind == 6:
+                site9_fail_index = index
+                site9_fail_frame = frame
         trace["last_event"] = frame
         if event == 0:
             open_frame = frame
@@ -926,6 +1010,20 @@ def _parse_metadata_replay_trace(text):
         last_phase = phase
         last_site = site
     trace["frames"] = frame_count
+    trace["historical_git"] = None
+    if historical_git_frames:
+        if len(historical_git_frames) != 1:
+            return _metadata_replay_unknown(invalid=True)
+        child_index, child = historical_git_frames[0]
+        if site9_enter_index is None or site9_fail_frame is None:
+            return _metadata_replay_unknown(invalid=True)
+        if not site9_enter_index < child_index < site9_fail_index:
+            return _metadata_replay_unknown(invalid=True)
+        if trace["first_failure"] is not site9_fail_frame:
+            return _metadata_replay_unknown(invalid=True)
+        if truncated or historical.stage != "done":
+            return _metadata_replay_unknown(invalid=True)
+        trace["historical_git"] = child
     if frame_count == 0:
         return trace
     if historical.stage == "expect_assert":
@@ -971,6 +1069,48 @@ def _safe_metadata_replay_error_kind(value):
     if number is not None and number not in METADATA_REPLAY_ERROR_KINDS:
         raise ValueError
     return number
+
+
+def _safe_historical_git(raw):
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != HISTORICAL_GIT_KEYS:
+        raise ValueError
+    protocol = raw.get("protocol")
+    phase = raw.get("phase")
+    site = raw.get("site")
+    if not isinstance(protocol, str) or protocol != HISTORICAL_GIT_PROTOCOL:
+        raise ValueError
+    if isinstance(phase, bool) or not isinstance(phase, int) or phase != HISTORICAL_GIT_PHASE:
+        raise ValueError
+    if isinstance(site, bool) or not isinstance(site, int) or site != HISTORICAL_GIT_SITE:
+        raise ValueError
+    outcome = _safe_metadata_replay_optional_int(raw.get("outcome"), 1, 6)
+    message_class = _safe_metadata_replay_optional_int(
+        raw.get("message_class"), 0, 4)
+    exit_code = _safe_metadata_replay_optional_int(
+        raw.get("exit_code"), 0, 2_147_483_647)
+    signal = _safe_metadata_replay_optional_int(raw.get("signal"), 1, 127)
+    if outcome is None or message_class is None:
+        raise ValueError
+    if outcome == 1 and (exit_code is None or signal is not None):
+        raise ValueError
+    if outcome == 2 and (exit_code is not None or signal is None):
+        raise ValueError
+    if outcome in (3, 4, 5, 6):
+        if exit_code is not None or signal is not None:
+            raise ValueError
+        if message_class != 0:
+            raise ValueError
+    return {
+        "protocol": HISTORICAL_GIT_PROTOCOL,
+        "phase": HISTORICAL_GIT_PHASE,
+        "site": HISTORICAL_GIT_SITE,
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "signal": signal,
+        "message_class": message_class,
+    }
 
 
 def _safe_metadata_replay_counts(value):
@@ -1073,6 +1213,23 @@ def _safe_metadata_replay_trace(raw):
             or (first_failure["event"] == 1 and first_failure["ok"] is False)
         ):
             raise ValueError
+        historical_git = _safe_historical_git(raw.get("historical_git"))
+        if historical_git is not None:
+            if invalid or incomplete or not known or frames == 0:
+                raise ValueError
+            if (
+                first_failure is None
+                or first_failure["phase"] != HISTORICAL_GIT_PHASE
+                or first_failure["site"] != HISTORICAL_GIT_SITE
+                or first_failure["event"] != 1
+                or first_failure["ok"] is not False
+                or first_failure["error_kind"] != 6
+                or first_failure["status"] is not None
+                or first_failure["counts"] is not None
+                or first_failure["checks"] is not None
+                or first_failure["iteration"] is not None
+            ):
+                raise ValueError
         if known and last_event is None:
             raise ValueError
         if invalid or frames == 0:
@@ -1094,6 +1251,7 @@ def _safe_metadata_replay_trace(raw):
             "last_incomplete": last_incomplete,
             "last_event": last_event,
             "cleanup_completed": cleanup_completed,
+            "historical_git": historical_git,
         })
         primary = first_failure
         if primary is not None and primary["phase"] == MAX_METADATA_REPLAY_PHASE and last_incomplete is not None:

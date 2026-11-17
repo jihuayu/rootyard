@@ -685,6 +685,26 @@ class MetadataReplayTraceTests(unittest.TestCase):
             iteration, error_kind,
         ])
 
+    def _git_frame(self, outcome, exit_code="", signal="", message="0"):
+        return "|".join([
+            runner.HISTORICAL_GIT_PREFIX,
+            str(runner.HISTORICAL_GIT_PHASE),
+            str(runner.HISTORICAL_GIT_SITE),
+            str(outcome), exit_code, signal, str(message),
+        ])
+
+    def _historical_git_failure(self, child=None, packs=2, site9_kind="6"):
+        lines = self._historical_failure_prefix(9, packs=packs)
+        lines.append(self._frame(17, 9, 0))
+        if child is not None:
+            lines.append(child)
+        lines.extend([
+            self._frame(17, 9, 1, ok="0", error_kind=site9_kind),
+            self._frame(17, 1, 1, ok="0"),
+        ])
+        lines.extend(self._finish(ok=True))
+        return lines
+
     def _project(self, lines, stdout=b"", **changes):
         options = {"phase": "run", "selected_case": self.case}
         options.update(changes)
@@ -917,6 +937,278 @@ class MetadataReplayTraceTests(unittest.TestCase):
             attached = report["targets"][0]["case_trace"]
             self.assertEqual(attached["primary"]["site"], site)
             self.assertEqual(attached["primary"]["error_kind"], kind)
+
+    def test_historical_git_child_frame_is_adopted_without_changing_primary(self):
+        child = self._git_frame(1, exit_code="128", message="2")
+        lines = self._historical_git_failure(child=child)
+        self.assertLess(
+            lines.index(child),
+            lines.index(self._frame(17, 9, 1, ok="0", error_kind="6")))
+        diag = self._project(lines)
+        trace = diag["case_trace"]
+        self.assertTrue(trace["known"])
+        self.assertFalse(trace["incomplete"])
+        self.assertFalse(trace["invalid"])
+        self.assertEqual(trace["frames"], sum(
+            1 for line in lines
+            if line.startswith(runner.METADATA_REPLAY_PREFIX)))
+        self.assertEqual(trace["historical_git"], {
+            "protocol": runner.HISTORICAL_GIT_PROTOCOL,
+            "phase": runner.HISTORICAL_GIT_PHASE,
+            "site": runner.HISTORICAL_GIT_SITE,
+            "outcome": 1,
+            "exit_code": 128,
+            "signal": None,
+            "message_class": 2,
+        })
+        self.assertEqual(trace["first_failure"]["phase"], 17)
+        self.assertEqual(trace["first_failure"]["site"], 9)
+        self.assertEqual(trace["first_failure"]["error_kind"], 6)
+        self.assertEqual(trace["primary"], trace["first_failure"])
+        safe = runner._safe_failure_diagnostic(diag, self.target)["case_trace"]
+        self.assertEqual(safe["historical_git"], trace["historical_git"])
+        self.assertEqual(safe["primary"], trace["primary"])
+        report = {"targets": []}
+        runner._attach_failed_target(report, diag, {}, [])
+        attached = report["targets"][0]["case_trace"]
+        self.assertEqual(attached["historical_git"], trace["historical_git"])
+        self.assertEqual(attached["primary"], trace["primary"])
+        serialized = json.dumps(report)
+        for forbidden in (SECRET, SQL, DSN):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_historical_git_child_accepts_every_closed_outcome_and_class(self):
+        for message in range(5):
+            for outcome, fields in ((1, {"exit_code": "1"}),
+                                    (2, {"signal": "127"})):
+                child = self._git_frame(
+                    outcome, message=str(message), **fields)
+                trace = self._project(
+                    self._historical_git_failure(child=child))["case_trace"]
+                self.assertTrue(trace["known"])
+                self.assertEqual(
+                    trace["historical_git"]["outcome"], outcome)
+                self.assertEqual(
+                    trace["historical_git"]["message_class"], message)
+        for outcome in (3, 4, 5, 6):
+            child = self._git_frame(outcome)
+            trace = self._project(
+                self._historical_git_failure(child=child))["case_trace"]
+            self.assertTrue(trace["known"])
+            self.assertEqual(trace["historical_git"], {
+                "protocol": runner.HISTORICAL_GIT_PROTOCOL,
+                "phase": runner.HISTORICAL_GIT_PHASE,
+                "site": runner.HISTORICAL_GIT_SITE,
+                "outcome": outcome,
+                "exit_code": None,
+                "signal": None,
+                "message_class": 0,
+            })
+
+    def test_historical_git_child_absent_is_unavailable_and_optional(self):
+        lines = self._historical_git_failure(child=None)
+        diag = self._project(lines)
+        trace = diag["case_trace"]
+        self.assertTrue(trace["known"])
+        self.assertFalse(trace["invalid"])
+        self.assertIsNone(trace["historical_git"])
+        self.assertEqual(trace["first_failure"]["site"], 9)
+        self.assertEqual(trace["primary"], trace["first_failure"])
+        safe = runner._safe_failure_diagnostic(diag, self.target)["case_trace"]
+        self.assertIsNone(safe["historical_git"])
+        self.assertEqual(safe["primary"], trace["primary"])
+
+        other = self._historical_failure_prefix(5, packs=2)
+        other.extend([
+            self._frame(17, 5, 0),
+            self._frame(17, 5, 1, ok="0", error_kind="4"),
+            self._frame(17, 1, 1, ok="0"),
+        ])
+        other.extend(self._finish(ok=True))
+        other_trace = self._project(other)["case_trace"]
+        self.assertTrue(other_trace["known"])
+        self.assertFalse(other_trace["invalid"])
+        self.assertIsNone(other_trace["historical_git"])
+        self.assertEqual(other_trace["primary"]["site"], 5)
+
+        success = self._historical_assert(
+            self._historical_parent_success(packs=1))
+        success.extend(self._finish(ok=True))
+        success_trace = self._project(success)["case_trace"]
+        self.assertTrue(success_trace["known"])
+        self.assertIsNone(success_trace["historical_git"])
+
+    def test_historical_git_child_rejects_duplicates_misplacement_and_success(self):
+        child = self._git_frame(1, exit_code="1", message="0")
+        duplicate = self._historical_git_failure(child=child) + [child]
+        conflicting = self._historical_git_failure(child=child) + [
+            self._git_frame(2, signal="9")]
+
+        early = self._historical_failure_prefix(9, packs=2)
+        early.append(child)
+        early.extend([
+            self._frame(17, 9, 0),
+            self._frame(17, 9, 1, ok="0", error_kind="6"),
+            self._frame(17, 1, 1, ok="0"),
+        ])
+        early.extend(self._finish(ok=True))
+
+        late = self._historical_failure_prefix(9, packs=2)
+        late.extend([
+            self._frame(17, 9, 0),
+            self._frame(17, 9, 1, ok="0", error_kind="6"),
+        ])
+        late.append(child)
+        late.extend([
+            self._frame(17, 1, 1, ok="0"),
+        ])
+        late.extend(self._finish(ok=True))
+
+        success = self._historical_parent_success(packs=1)
+        success.insert(success.index(self._frame(17, 9, 0)) + 1, child)
+        success.extend(self._finish(ok=True))
+
+        wrong_parent = self._historical_git_failure(
+            child=child, site9_kind="5")
+        for lines in (duplicate, conflicting, early, late, success,
+                      wrong_parent):
+            trace = self._project(lines)["case_trace"]
+            self.assertFalse(trace["known"])
+            self.assertTrue(trace["invalid"])
+            self.assertIsNone(trace["historical_git"])
+            self.assertIsNone(trace["primary"])
+
+    def test_historical_git_child_rejects_malformed_or_unbounded_forms(self):
+        prefix = runner.HISTORICAL_GIT_PREFIX
+        malformed = [
+            "|".join([prefix, "17", "9", "1", "1", "", "0", "0"]),
+            "|".join([prefix, "17", "9", "1", "1", ""]),
+            "|".join([prefix, "17", "9", "0", "", "", "0"]),
+            "|".join([prefix, "17", "9", "7", "1", "", "0"]),
+            "|".join([prefix, "17", "9", "1", "", "", "0"]),
+            "|".join([prefix, "17", "9", "2", "", "", "0"]),
+            "|".join([prefix, "17", "9", "1", "1", "9", "0"]),
+            "|".join([prefix, "17", "9", "3", "1", "", "0"]),
+            "|".join([prefix, "17", "9", "3", "", "", "1"]),
+            "|".join([prefix, "17", "9", "6", "", "", "1"]),
+            "|".join([prefix, "18", "9", "1", "1", "", "0"]),
+            "|".join([prefix, "17", "8", "1", "1", "", "0"]),
+            "|".join([prefix, "17", "9", "1", "01", "", "0"]),
+            "|".join([prefix, "17", "9", "1", "1", "", "5"]),
+            "|".join([prefix, "17", "9", "1", "1", "", "-1"]),
+            "|".join([prefix, "17", "9", "1", "1", "", "0"]) + "x" * 513,
+            "|".join([prefix, "17", "9", "1", "1", "", "\u0660"]),
+        ]
+        for child in malformed:
+            lines = self._historical_git_failure(child=child)
+            trace = self._project(lines)["case_trace"]
+            self.assertFalse(trace["known"], child)
+            self.assertTrue(trace["invalid"], child)
+            self.assertIsNone(trace["historical_git"], child)
+            self.assertIsNone(trace["primary"], child)
+            serialized = json.dumps(trace)
+            for forbidden in (SECRET, SQL, DSN):
+                self.assertNotIn(forbidden, serialized)
+
+    def test_historical_git_safe_rebuild_rejects_unvalidated_forms(self):
+        diag = self._project(self._historical_git_failure(
+            child=self._git_frame(1, exit_code="128", message="2")))
+        trace = runner._safe_failure_diagnostic(diag, self.target)["case_trace"]
+        self.assertTrue(trace["known"])
+        valid_child = trace["historical_git"]
+        valid_failure = trace["first_failure"]
+        self.assertIsNotNone(valid_child)
+        self.assertIsNotNone(valid_failure)
+
+        missing = dict(valid_child)
+        missing.pop("message_class")
+        invalid_children = [
+            {},
+            dict(valid_child, extra="x"),
+            missing,
+            dict(valid_child, protocol="historical_git_v2"),
+            dict(valid_child, protocol=1),
+            dict(valid_child, phase=18),
+            dict(valid_child, phase=17.0),
+            dict(valid_child, phase=True),
+            dict(valid_child, site=8),
+            dict(valid_child, site=9.0),
+            dict(valid_child, site=False),
+            dict(valid_child, outcome=True),
+            dict(valid_child, outcome="1"),
+            dict(valid_child, outcome=0),
+            dict(valid_child, outcome=7),
+            dict(valid_child, exit_code=True),
+            dict(valid_child, exit_code="128"),
+            dict(valid_child, exit_code=-1),
+            dict(valid_child, exit_code=2_147_483_648),
+            dict(valid_child, signal=True),
+            dict(valid_child, signal=0),
+            dict(valid_child, signal=128),
+            dict(valid_child, signal="9"),
+            dict(valid_child, message_class=True),
+            dict(valid_child, message_class=5),
+            dict(valid_child, message_class="2"),
+            dict(valid_child, exit_code=None),
+            dict(valid_child, signal=9),
+            dict(valid_child, outcome=2, exit_code=None, signal=None),
+            dict(valid_child, outcome=2, exit_code=1, signal=9),
+            dict(valid_child, outcome=3, exit_code=1, signal=None),
+            dict(valid_child, outcome=3, exit_code=None, signal=9),
+            dict(valid_child, outcome=3, exit_code=None, signal=None,
+                 message_class=1),
+            dict(valid_child, outcome=6, exit_code=None, signal=None,
+                 message_class=1),
+        ]
+        for child in invalid_children:
+            raw = dict(trace)
+            raw["historical_git"] = child
+            safe = runner._safe_metadata_replay_trace(raw)
+            self.assertFalse(safe["known"], child)
+            self.assertTrue(safe["invalid"], child)
+            self.assertIsNone(safe["historical_git"], child)
+            self.assertIsNone(safe["primary"], child)
+
+        invalid_parents = [
+            dict(valid_failure, phase=16),
+            dict(valid_failure, site=8),
+            dict(valid_failure, event=0, ok=None),
+            dict(valid_failure, ok=True),
+            dict(valid_failure, error_kind=5),
+            dict(valid_failure, status=500),
+            dict(valid_failure, counts=[0, 0, 0, 0, 0]),
+            dict(valid_failure, checks=[True]),
+            dict(valid_failure, iteration=0),
+        ]
+        for parent in invalid_parents:
+            raw = dict(trace)
+            raw["first_failure"] = parent
+            safe = runner._safe_metadata_replay_trace(raw)
+            self.assertFalse(safe["known"], parent)
+            self.assertTrue(safe["invalid"], parent)
+            self.assertIsNone(safe["historical_git"], parent)
+            self.assertIsNone(safe["primary"], parent)
+
+        for key, value in (("known", False), ("invalid", True),
+                           ("incomplete", True), ("frames", 0)):
+            raw = dict(trace)
+            raw[key] = value
+            safe = runner._safe_metadata_replay_trace(raw)
+            self.assertFalse(safe["known"], key)
+            self.assertTrue(safe["invalid"], key)
+            self.assertIsNone(safe["historical_git"], key)
+            self.assertIsNone(safe["primary"], key)
+
+        raw = dict(trace)
+        raw["historical_git"] = dict(valid_child, protocol=SECRET)
+        safe = runner._safe_metadata_replay_trace(raw)
+        self.assertNotIn(SECRET, json.dumps(safe, sort_keys=True))
+
+        safe = runner._safe_metadata_replay_trace(dict(trace))
+        self.assertTrue(safe["known"])
+        self.assertFalse(safe["invalid"])
+        self.assertEqual(safe["historical_git"], valid_child)
+        self.assertEqual(safe["primary"], valid_failure)
 
     def test_historical_grammar_rejects_skip_backtrack_duplicate_crossphase(self):
         p = self._frame
