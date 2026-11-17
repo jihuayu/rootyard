@@ -301,3 +301,56 @@ async fn fair_admission_contended_deadline_and_rr_order_deduplication() {
     assert_eq!(gate.stats().queued_waiters, 0);
     assert_eq!(gate.rr_order_snapshot().len(), 0);
 }
+
+#[test]
+fn pack_cache_open_enforces_exclusive_root_lock_and_preserves_pinned_packs() {
+    let dir = TempDir::new().unwrap();
+    let replica = dir.path().join("replica");
+    let catalog1 = PackCacheCatalog::open(&replica, ReplicaCacheLimits::default()).unwrap();
+
+    let stage = catalog1.staging_dir().unwrap();
+    let sp = stage.join("p.pack");
+    let si = stage.join("p.idx");
+    std::fs::write(&sp, b"pack-data-1").unwrap();
+    std::fs::write(&si, b"idx-data-1").unwrap();
+    let (tid, rid) = (Uuid::new_v4(), Uuid::new_v4());
+    let p_loc = BlobLocator::new(tid, rid, 1, Uuid::new_v4(), "packs", &digest(b"pack-data-1"), 11).unwrap();
+    let i_loc = BlobLocator::new(tid, rid, 1, Uuid::new_v4(), "packs", &digest(b"idx-data-1"), 10).unwrap();
+    let spec = PackObjectSpec::provider_managed(format!("pack-{}", "c".repeat(40)), p_loc, i_loc);
+    let key = spec.pack_cache_key(&"2".repeat(64), ReplicaObjectFormat::Sha1).unwrap();
+    let pin = catalog1.install_and_pin(key, &sp, &si).unwrap();
+    assert!(pin.pack_path().is_file());
+
+    // Second concurrent open on the same root must fail closed before sweeping active packs.
+    assert!(matches!(PackCacheCatalog::open(&replica, ReplicaCacheLimits::default()), Err(ReplicaCacheError::Io(_))));
+    assert!(pin.pack_path().is_file());
+    assert_eq!(catalog1.entry_count(), 1);
+
+    drop(pin);
+    drop(catalog1);
+    let catalog2 = PackCacheCatalog::open(&replica, ReplicaCacheLimits::default()).unwrap();
+    assert_eq!(catalog2.entry_count(), 0);
+    drop(catalog2);
+
+    // Simulate cross-process lock ownership by locking `.catalog.lock` directly with `fs2`.
+    let peer_pack_dir = replica.join("packs").join("peer-active");
+    std::fs::create_dir_all(&peer_pack_dir).unwrap();
+    let peer_pack = peer_pack_dir.join("active.pack");
+    std::fs::write(&peer_pack, b"peer").unwrap();
+    let ext_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(replica.join("packs").join(error::CATALOG_LOCK_FILE))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&ext_lock).unwrap();
+
+    assert!(matches!(PackCacheCatalog::open(&replica, ReplicaCacheLimits::default()), Err(ReplicaCacheError::Io(_))));
+    assert!(peer_pack.is_file());
+
+    fs2::FileExt::unlock(&ext_lock).unwrap();
+    drop(ext_lock);
+    let catalog3 = PackCacheCatalog::open(&replica, ReplicaCacheLimits::default()).unwrap();
+    assert!(!peer_pack_dir.exists());
+    drop(catalog3);
+}

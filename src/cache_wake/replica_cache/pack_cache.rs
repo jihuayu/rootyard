@@ -13,7 +13,7 @@ use std::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::error::{is_lower_hex_exact, sweep_orphan_cache_dirs, validate_canonical_child_path};
+use super::error::{PackRootLockGuard, is_lower_hex_exact, sweep_orphan_cache_dirs, validate_canonical_child_path};
 use super::types::{PackCacheKey, ReplicaCacheError, ReplicaCacheLimits};
 
 const PACK_DIR_NAME: &str = "packs";
@@ -45,6 +45,7 @@ pub struct PackCacheCatalog {
     root_dir: PathBuf,
     limits: ReplicaCacheLimits,
     inner: Arc<Mutex<PackCatalogInner>>,
+    _root_lock: Arc<PackRootLockGuard>,
 }
 
 pub struct PackCachePin {
@@ -107,8 +108,9 @@ impl PackCacheCatalog {
         ensure_private_dir(&raw_root)?;
         let root_dir = std::fs::canonicalize(&raw_root)
             .map_err(|e| ReplicaCacheError::Io(format!("failed canonicalizing pack cache root: {e}")))?;
+        let root_lock = Arc::new(PackRootLockGuard::acquire(&root_dir)?);
         let _ = sweep_orphan_cache_dirs(&root_dir)?;
-        Ok(Self { root_dir, limits, inner: Arc::new(Mutex::new(PackCatalogInner::default())) })
+        Ok(Self { root_dir, limits, inner: Arc::new(Mutex::new(PackCatalogInner::default())), _root_lock: root_lock })
     }
 
     pub fn staging_dir(&self) -> Result<PathBuf, ReplicaCacheError> {

@@ -2,9 +2,12 @@
 //! Rubicon compute replica cache (Issue #163).
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     fmt,
+    fs::{File, OpenOptions},
+    os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use sha2::{Digest, Sha256};
@@ -236,6 +239,66 @@ pub fn validate_canonical_child_path(root: &Path, child: &Path) -> Result<PathBu
     Ok(canon_root.join(rel))
 }
 
+pub const CATALOG_LOCK_FILE: &str = ".catalog.lock";
+
+static ACTIVE_PACK_ROOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn active_pack_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    ACTIVE_PACK_ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct InProcessRootClaim {
+    root_dir: PathBuf,
+}
+
+impl Drop for InProcessRootClaim {
+    fn drop(&mut self) {
+        let mut active = active_pack_roots().lock().unwrap_or_else(|p| p.into_inner());
+        active.remove(&self.root_dir);
+    }
+}
+
+pub struct PackRootLockGuard {
+    file: File,
+    _in_proc: InProcessRootClaim,
+}
+
+impl PackRootLockGuard {
+    pub fn acquire(root_dir: &Path) -> Result<Self, ReplicaCacheError> {
+        let canon_root = std::fs::canonicalize(root_dir)
+            .map_err(|e| ReplicaCacheError::Io(format!("failed canonicalizing pack lock root: {e}")))?;
+        let claim = {
+            let mut active = active_pack_roots().lock().unwrap_or_else(|p| p.into_inner());
+            if !active.insert(canon_root.clone()) {
+                return Err(ReplicaCacheError::Io(format!(
+                    "pack cache root is already owned in-process: {}",
+                    canon_root.display()
+                )));
+            }
+            InProcessRootClaim { root_dir: canon_root.clone() }
+        };
+        let lock_path = validate_canonical_child_path(&canon_root, &canon_root.join(CATALOG_LOCK_FILE))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|e| ReplicaCacheError::Io(format!("failed opening pack catalog lock: {e}")))?;
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|e| {
+            ReplicaCacheError::Io(format!("pack cache root {} is exclusively locked: {e}", canon_root.display()))
+        })?;
+        Ok(Self { file, _in_proc: claim })
+    }
+}
+
+impl Drop for PackRootLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 pub fn sweep_orphan_cache_dirs(root: &Path) -> Result<u64, ReplicaCacheError> {
     let entries = std::fs::read_dir(root)
         .map_err(|e| ReplicaCacheError::Io(format!("failed reading cache root during reconcile: {e}")))?;
@@ -245,6 +308,12 @@ pub fn sweep_orphan_cache_dirs(root: &Path) -> Result<u64, ReplicaCacheError> {
         let path = entry.path();
         let meta = std::fs::symlink_metadata(&path)
             .map_err(|e| ReplicaCacheError::Io(format!("failed inspecting cache entry: {e}")))?;
+        if entry.file_name() == CATALOG_LOCK_FILE {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(ReplicaCacheError::IntegrityFailed("catalog lock file must remain a regular file"));
+            }
+            continue;
+        }
         if meta.file_type().is_symlink() {
             std::fs::remove_file(&path)
                 .map_err(|e| ReplicaCacheError::Io(format!("failed removing orphan symlink: {e}")))?;
