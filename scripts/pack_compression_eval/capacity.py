@@ -112,9 +112,11 @@ def build_server_env(
 def sanitize_capacity(value: Any) -> dict[str, int | None]:
     """Project one capacity mapping into the fixed numeric report shape.
 
-    Invalid, injected, or inconsistent values fail closed: every field becomes
-    ``None`` so a failure record never advertises unbounded or unvalidated
-    capacity.
+    Invalid, injected, inconsistent, or overprovisioned values fail closed:
+    every field becomes ``None`` so a failure record never advertises
+    unbounded or unvalidated capacity.  The accepted envelope must satisfy
+    ``inflight_bytes == concurrent_branches * request_ceiling_bytes`` exactly,
+    matching ``build_server_env``.
     """
     if not isinstance(value, Mapping):
         return {field: None for field in CAPACITY_FIELDS}
@@ -133,6 +135,6 @@ def sanitize_capacity(value: Any) -> dict[str, int | None]:
     branches = projected["concurrent_branches"]
     ceiling = projected["request_ceiling_bytes"]
     inflight = projected["inflight_bytes"]
-    if branches is None or ceiling is None or inflight is None or inflight < branches * ceiling:
+    if branches is None or ceiling is None or inflight is None or inflight != branches * ceiling:
         return {field: None for field in CAPACITY_FIELDS}
     return projected

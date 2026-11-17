@@ -21,6 +21,7 @@ if str(SCRIPTS) not in sys.path:
 
 import pando_pack_compression_eval as cli  # noqa: E402
 from pack_compression_eval import capacity  # noqa: E402
+from pack_compression_eval.failure_diagnostics import build_failure_record  # noqa: E402
 
 
 class CapacityEnvelopeTest(unittest.TestCase):
@@ -91,6 +92,7 @@ class CapacityEnvelopeTest(unittest.TestCase):
             {**canonical, "concurrent_branches": 4},
             {**canonical, "request_ceiling_bytes": "128"},
             {**canonical, "inflight_bytes": 1},
+            {**canonical, "inflight_bytes": 16 * 1024 * 1024 * 1024},
             {**canonical, "injected": sentinel},
         ):
             with self.subTest(bad=bad):
@@ -100,6 +102,19 @@ class CapacityEnvelopeTest(unittest.TestCase):
                     {"concurrent_branches": None, "request_ceiling_bytes": None, "inflight_bytes": None},
                 )
                 self.assertNotIn(sentinel, json.dumps(projected, sort_keys=True))
+
+    def test_overprovisioned_inflight_is_rejected_by_projection_and_failure_report(self) -> None:
+        overprovisioned = {
+            "concurrent_branches": 3,
+            "request_ceiling_bytes": 128 * 1024 * 1024,
+            "inflight_bytes": 16 * 1024 * 1024 * 1024,
+        }
+        expected = {"concurrent_branches": None, "request_ceiling_bytes": None, "inflight_bytes": None}
+        self.assertEqual(capacity.sanitize_capacity(overprovisioned), expected)
+        self.assertEqual(build_failure_record(fixture_capacity=overprovisioned)["fixture_capacity"], expected)
+        canonical = capacity.derive_capacity_envelope()
+        self.assertEqual(capacity.sanitize_capacity(canonical), canonical)
+        self.assertEqual(build_failure_record(fixture_capacity=canonical)["fixture_capacity"], canonical)
 
     def test_success_report_binding_attaches_exact_capacity(self) -> None:
         envelope = capacity.derive_capacity_envelope()
