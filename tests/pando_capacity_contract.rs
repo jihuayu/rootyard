@@ -410,7 +410,8 @@ async fn fail_closed_boundary_faults_and_backpressure() -> Result<()> {
         free_disk_bytes: 64 * 1024 * 1024,
     };
 
-    let cases: [(&str, fn(&mut AdmissionRequest, AdmissionLimits)); 9] = [
+    type MutateFn = fn(&mut AdmissionRequest, AdmissionLimits);
+    let cases: [(&str, MutateFn); 9] = [
         ("unauthorized", |r, _| r.caller_authorized = false),
         ("oversized_object", |r, l| r.max_single_object_bytes = l.max_object_bytes + 1),
         ("pack_bytes_exceeded", |r, l| r.declared_pack_bytes = l.max_pack_bytes_per_push + 1),
