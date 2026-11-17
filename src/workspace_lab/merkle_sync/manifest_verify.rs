@@ -368,11 +368,11 @@ fn diff_dir_recursive(
         return Ok(());
     }
     let parent_raw = if dir_b64.is_empty() { Vec::new() } else { decode_rel_bytes(dir_b64)? };
-    let to_map = |opt: Option<&super::manifest::MerkleDirNode>| -> BTreeMap<Vec<u8>, &MerkleDirChild> {
+    fn node_children_map(opt: Option<&super::manifest::MerkleDirNode>) -> BTreeMap<Vec<u8>, &MerkleDirChild> {
         opt.map(|n| n.children.iter().filter_map(|c| STANDARD.decode(&c.name_base64).ok().map(|k| (k, c))).collect())
             .unwrap_or_default()
-    };
-    let (prev_map, next_map) = (to_map(prev_node), to_map(next_node));
+    }
+    let (prev_map, next_map) = (node_children_map(prev_node), node_children_map(next_node));
     let names: BTreeSet<Vec<u8>> = prev_map.keys().chain(next_map.keys()).cloned().collect();
     for name in names {
         let child_raw = join_child_rel(&parent_raw, &name);

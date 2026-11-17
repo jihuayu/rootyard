@@ -22,7 +22,7 @@ use super::{
         BlobUploadDriver, CheckpointCommitRecord, CheckpointCommitState, MerkleBlobCheckpointManifest,
         MerkleCheckpointLedger, RemoteObjectLocatorEntry,
     },
-    manifest::{MerkleChildKind, MerkleDirNode, MerkleStateManifest, compute_dir_node_sha256},
+    manifest::{MerkleChildKind, MerkleDirNode, compute_dir_node_sha256},
     manifest_verify::validate_manifest,
     restore::{RestoreReport, RestoreRequest, restore_or_fork_from_blob},
 };
