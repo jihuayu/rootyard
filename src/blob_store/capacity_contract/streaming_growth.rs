@@ -17,13 +17,13 @@ use super::{
     admission_types::{AdmissionClass, AdmissionLimits, AdmissionRejection, AdmissionRequest},
     git_ops::{ObjectFormat, PackDownloadRef, UploadScope, hash_file_bounded, inspect_pack_file, upload_pack_pair},
     git_views::{CompactViewInput, VerifyViewInput, compact_packs_in_view, verify_frontier_in_view},
-    growth_state::{EngineState, apply_cas_mutations, validate_mutations},
+    growth_state::{CommitPushInput, EngineState, apply_cas_mutations, validate_mutations},
     growth_types::{
         CompactionOutcome, EngineScope, GrowthEngineError, GrowthEngineSnapshot, IncrementalPushRequest, PushOutcome,
         VerifiedPackRecord,
     },
     ledger_retention::RetentionLedger,
-    ledger_types::{LedgerBudgetPolicy, LedgerEntryKind, ProtectionHold},
+    ledger_types::{LedgerBudgetPolicy, ProtectionHold},
     limits::{PandoCapacityContract, RESERVED_GIT_OPEN_FDS},
 };
 use crate::blob_store::{BlobLocator, disposable_view::DisposableViewRoot, opendal::BlobStore};
@@ -191,6 +191,7 @@ impl StreamingGrowthEngine {
             let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
             (guard.epoch, guard.active_packs.clone(), guard.acked_refs.clone())
         };
+        let base_pack_ids: BTreeSet<Uuid> = base_packs.iter().map(|p| p.pack_id).collect();
         let resulting_refs = apply_cas_mutations(self.object_format, &base_refs, &req.ref_mutations)?;
 
         let (mut new_pack_bytes, mut new_pack_objects) = (0u64, 0u64);
@@ -267,68 +268,18 @@ impl StreamingGrowthEngine {
         permit.shrink_workspace(total_bytes);
 
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(replayed) = guard.check_replay_or_cancel(req.operation_id, &req.request_digest)? {
-            return Ok(replayed);
-        }
-        let next_refs = apply_cas_mutations(self.object_format, &guard.acked_refs, &req.ref_mutations)?;
-        if guard.active_packs.len().saturating_add(uploaded_records.len())
-            > self.contract.streaming.max_active_frontier_packs
-        {
-            return Err(GrowthEngineError::Admission(AdmissionRejection::PackCountLimitReached {
-                active: guard.active_packs.len(),
-                new_packs: uploaded_records.len(),
-                limit: self.contract.streaming.max_active_frontier_packs,
-            }));
-        }
-        let commit_epoch = guard.epoch + 1;
-        for rec in &uploaded_records {
-            guard.ledger.record_entry(
-                Uuid::new_v4(),
-                LedgerEntryKind::Membership,
-                Some(rec.pack_id),
-                Some(req.operation_id),
-                512,
-                commit_epoch,
-            )?;
-            guard.ledger.record_entry(
-                rec.registration_id,
-                LedgerEntryKind::Registration,
-                Some(rec.pack_id),
-                Some(req.operation_id),
-                1024,
-                commit_epoch,
-            )?;
-        }
-        guard.ledger.record_entry(
-            Uuid::new_v4(),
-            LedgerEntryKind::Receipt,
-            uploaded_records.first().map(|r| r.pack_id),
-            Some(req.operation_id),
-            512,
-            commit_epoch,
-        )?;
-
-        guard.epoch = commit_epoch;
-        guard.acked_refs = next_refs;
-        let added_count = uploaded_records.len();
-        guard.active_packs.extend(uploaded_records);
-        guard.cumulative_packs_added = guard.cumulative_packs_added.saturating_add(added_count as u64);
-        if added_count == 0 {
-            guard.no_new_pack_pushes = guard.no_new_pack_pushes.saturating_add(1);
-        }
-        guard.total_blob_put_bytes = guard.total_blob_put_bytes.saturating_add(put_bytes);
-        guard.total_blob_get_bytes = guard.total_blob_get_bytes.saturating_add(verified.blob_get_bytes);
-        guard.peak_scratch_bytes = guard.peak_scratch_bytes.max(verified.peak_scratch_bytes);
-        let outcome = PushOutcome {
-            epoch: commit_epoch,
-            added_packs: added_count,
-            no_new_pack: added_count == 0,
-            active_frontier_len: guard.active_packs.len(),
-            cumulative_packs_added: guard.cumulative_packs_added,
-            replayed: false,
-        };
-        guard.replayed_operations.insert(req.operation_id, (req.request_digest, outcome.clone()));
-        Ok(outcome)
+        guard.commit_push(CommitPushInput {
+            contract: &self.contract,
+            object_format: self.object_format,
+            operation_id: req.operation_id,
+            request_digest: req.request_digest,
+            ref_mutations: &req.ref_mutations,
+            base_pack_ids: &base_pack_ids,
+            uploaded_records,
+            put_bytes,
+            blob_get_bytes: verified.blob_get_bytes,
+            peak_scratch_bytes: verified.peak_scratch_bytes,
+        })
     }
 
     pub async fn compact_serving_frontier(&self, deadline: Instant) -> Result<CompactionOutcome, GrowthEngineError> {

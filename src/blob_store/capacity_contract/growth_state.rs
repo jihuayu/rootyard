@@ -5,13 +5,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 use super::{
+    admission_types::AdmissionRejection,
     git_ops::{ObjectFormat, UploadedPackPair},
     growth_types::{
         CompactionOutcome, GrowthEngineError, GrowthEngineSnapshot, PushOutcome, RefMutation, VerifiedPackRecord,
     },
     ledger_retention::RetentionLedger,
     ledger_types::LedgerEntryKind,
+    limits::{PandoCapacityContract, RESERVED_GIT_OPEN_FDS},
 };
+
+pub(super) struct CommitPushInput<'a> {
+    pub contract: &'a PandoCapacityContract,
+    pub object_format: ObjectFormat,
+    pub operation_id: Uuid,
+    pub request_digest: String,
+    pub ref_mutations: &'a [RefMutation],
+    pub base_pack_ids: &'a BTreeSet<Uuid>,
+    pub uploaded_records: Vec<VerifiedPackRecord>,
+    pub put_bytes: u64,
+    pub blob_get_bytes: u64,
+    pub peak_scratch_bytes: u64,
+}
 
 pub(super) struct EngineState {
     pub epoch: u64,
@@ -88,22 +103,12 @@ impl EngineState {
             object_count: uploaded.object_count,
             joined_epoch: compaction_epoch,
         };
-        self.ledger.record_compaction_superseded(compaction_epoch, target_ids);
-        self.ledger.record_entry(
-            Uuid::new_v4(),
-            LedgerEntryKind::Membership,
-            Some(compacted_rec.pack_id),
-            None,
-            512,
+        self.ledger = stage_compaction_ledger(
+            &self.ledger,
             compaction_epoch,
-        )?;
-        self.ledger.record_entry(
+            target_ids,
+            compacted_rec.pack_id,
             compacted_rec.registration_id,
-            LedgerEntryKind::Registration,
-            Some(compacted_rec.pack_id),
-            None,
-            1024,
-            compaction_epoch,
         )?;
 
         let mut next_active = Vec::new();
@@ -133,6 +138,131 @@ impl EngineState {
             oid_count,
         })
     }
+
+    pub fn commit_push(&mut self, input: CommitPushInput<'_>) -> Result<PushOutcome, GrowthEngineError> {
+        if let Some(replayed) = self.check_replay_or_cancel(input.operation_id, &input.request_digest)? {
+            return Ok(replayed);
+        }
+        let current_pack_ids: BTreeSet<Uuid> = self.active_packs.iter().map(|p| p.pack_id).collect();
+        if !input.base_pack_ids.is_subset(&current_pack_ids) {
+            return Err(GrowthEngineError::CompactionConflict);
+        }
+        let next_refs = apply_cas_mutations(input.object_format, &self.acked_refs, input.ref_mutations)?;
+        check_commit_window_bounds(input.contract, &self.active_packs, &input.uploaded_records)?;
+
+        let commit_epoch = self.epoch + 1;
+        let next_ledger = stage_push_ledger(&self.ledger, input.operation_id, commit_epoch, &input.uploaded_records)?;
+
+        self.ledger = next_ledger;
+        self.epoch = commit_epoch;
+        self.acked_refs = next_refs;
+        let added_count = input.uploaded_records.len();
+        self.active_packs.extend(input.uploaded_records);
+        self.cumulative_packs_added = self.cumulative_packs_added.saturating_add(added_count as u64);
+        if added_count == 0 {
+            self.no_new_pack_pushes = self.no_new_pack_pushes.saturating_add(1);
+        }
+        self.total_blob_put_bytes = self.total_blob_put_bytes.saturating_add(input.put_bytes);
+        self.total_blob_get_bytes = self.total_blob_get_bytes.saturating_add(input.blob_get_bytes);
+        self.peak_scratch_bytes = self.peak_scratch_bytes.max(input.peak_scratch_bytes);
+        let outcome = PushOutcome {
+            epoch: commit_epoch,
+            added_packs: added_count,
+            no_new_pack: added_count == 0,
+            active_frontier_len: self.active_packs.len(),
+            cumulative_packs_added: self.cumulative_packs_added,
+            replayed: false,
+        };
+        self.replayed_operations.insert(input.operation_id, (input.request_digest, outcome.clone()));
+        Ok(outcome)
+    }
+}
+
+fn check_commit_window_bounds(
+    contract: &PandoCapacityContract,
+    active_packs: &[VerifiedPackRecord],
+    uploaded_records: &[VerifiedPackRecord],
+) -> Result<(), GrowthEngineError> {
+    if uploaded_records.is_empty() {
+        return Ok(());
+    }
+    let next_pairs = active_packs.len().saturating_add(uploaded_records.len());
+    if next_pairs > contract.streaming.max_active_frontier_packs {
+        return Err(GrowthEngineError::Admission(AdmissionRejection::PackCountLimitReached {
+            active: active_packs.len(),
+            new_packs: uploaded_records.len(),
+            limit: contract.streaming.max_active_frontier_packs,
+        }));
+    }
+    let cur_bytes: u64 = active_packs.iter().map(VerifiedPackRecord::total_bytes).sum();
+    let cur_objects: u64 = active_packs.iter().map(|p| p.object_count).sum();
+    let add_bytes: u64 = uploaded_records.iter().map(VerifiedPackRecord::total_bytes).sum();
+    let add_objects: u64 = uploaded_records.iter().map(|p| p.object_count).sum();
+    let next_bytes = cur_bytes.saturating_add(add_bytes);
+    let next_objects = cur_objects.saturating_add(add_objects);
+    if next_bytes > contract.verifier.max_total_bytes_per_window {
+        return Err(GrowthEngineError::Admission(AdmissionRejection::PackBytesExceeded {
+            requested: next_bytes,
+            limit: contract.verifier.max_total_bytes_per_window,
+        }));
+    }
+    if next_objects > contract.verifier.max_objects_per_window {
+        return Err(GrowthEngineError::Admission(AdmissionRejection::TooManyObjects {
+            requested: next_objects,
+            limit: contract.verifier.max_objects_per_window,
+        }));
+    }
+    let next_workspace = next_bytes.saturating_mul(2);
+    if next_workspace > contract.verifier.view_max_logical_bytes {
+        return Err(GrowthEngineError::Admission(AdmissionRejection::WorkspaceBudgetExceeded {
+            requested: next_workspace,
+            limit: contract.verifier.view_max_logical_bytes,
+        }));
+    }
+    let next_fds = (next_pairs as u64).saturating_mul(2).saturating_add(RESERVED_GIT_OPEN_FDS);
+    if next_fds > contract.verifier.git_nofile {
+        return Err(GrowthEngineError::Admission(AdmissionRejection::FdBudgetExceeded {
+            requested: next_fds,
+            limit: contract.verifier.git_nofile,
+        }));
+    }
+    Ok(())
+}
+
+fn stage_push_ledger(
+    ledger: &RetentionLedger,
+    operation_id: Uuid,
+    commit_epoch: u64,
+    uploaded_records: &[VerifiedPackRecord],
+) -> Result<RetentionLedger, GrowthEngineError> {
+    let mut next_ledger = ledger.clone();
+    for rec in uploaded_records {
+        next_ledger.record_entry(
+            Uuid::new_v4(),
+            LedgerEntryKind::Membership,
+            Some(rec.pack_id),
+            Some(operation_id),
+            512,
+            commit_epoch,
+        )?;
+        next_ledger.record_entry(
+            rec.registration_id,
+            LedgerEntryKind::Registration,
+            Some(rec.pack_id),
+            Some(operation_id),
+            1024,
+            commit_epoch,
+        )?;
+    }
+    next_ledger.record_entry(
+        Uuid::new_v4(),
+        LedgerEntryKind::Receipt,
+        uploaded_records.first().map(|r| r.pack_id),
+        Some(operation_id),
+        512,
+        commit_epoch,
+    )?;
+    Ok(next_ledger)
 }
 
 pub(super) fn validate_mutations(
@@ -178,4 +308,166 @@ pub(super) fn apply_cas_mutations(
         }
     }
     Ok(next)
+}
+
+fn stage_compaction_ledger(
+    ledger: &RetentionLedger,
+    compaction_epoch: u64,
+    target_ids: &BTreeSet<Uuid>,
+    pack_id: Uuid,
+    registration_id: Uuid,
+) -> Result<RetentionLedger, GrowthEngineError> {
+    let mut next_ledger = ledger.clone();
+    next_ledger.record_compaction_superseded(compaction_epoch, target_ids);
+    next_ledger.record_entry(
+        Uuid::new_v4(),
+        LedgerEntryKind::Membership,
+        Some(pack_id),
+        None,
+        512,
+        compaction_epoch,
+    )?;
+    next_ledger.record_entry(
+        registration_id,
+        LedgerEntryKind::Registration,
+        Some(pack_id),
+        None,
+        1024,
+        compaction_epoch,
+    )?;
+    Ok(next_ledger)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob_store::{
+        BlobLocator,
+        capacity_contract::ledger_types::{LedgerBudgetPolicy, LedgerRetentionError},
+    };
+
+    fn fake_pack(pack_len: u64, objects: u64, epoch: u64) -> VerifiedPackRecord {
+        let (t, r, a) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let sha = "a".repeat(64);
+        VerifiedPackRecord {
+            pack_id: Uuid::new_v4(),
+            registration_id: Uuid::new_v4(),
+            pack_locator: BlobLocator::new(t, r, epoch as i64, a, "packs", &sha, pack_len).unwrap(),
+            pack_sha256: sha.clone(),
+            pack_length: pack_len,
+            idx_locator: BlobLocator::new(t, r, epoch as i64, a, "pack-idx", &sha, 64).unwrap(),
+            idx_sha256: sha,
+            idx_length: 64,
+            object_count: objects,
+            joined_epoch: epoch,
+        }
+    }
+
+    fn empty_state(contract: &PandoCapacityContract) -> EngineState {
+        EngineState {
+            epoch: 0,
+            active_packs: Vec::new(),
+            retained_old_packs: Vec::new(),
+            acked_refs: BTreeMap::new(),
+            pinned_commits: BTreeMap::new(),
+            replayed_operations: BTreeMap::new(),
+            cancelled_operations: BTreeSet::new(),
+            cumulative_packs_added: 0,
+            no_new_pack_pushes: 0,
+            compactions_completed: 0,
+            total_blob_put_bytes: 0,
+            total_blob_get_bytes: 0,
+            peak_scratch_bytes: 0,
+            ledger: RetentionLedger::new(LedgerBudgetPolicy::from_contract(contract)),
+        }
+    }
+
+    #[test]
+    fn stage_compaction_handles_16_active_and_rolls_back_budget_failures() {
+        let mut contract = PandoCapacityContract::current_standalone();
+        contract.metadata_ledger.repo_max_registrations = 16;
+        let mut ledger = RetentionLedger::new(LedgerBudgetPolicy::from_contract(&contract));
+        let mut target_ids = BTreeSet::new();
+        for i in 1..=16u64 {
+            let pid = Uuid::new_v4();
+            target_ids.insert(pid);
+            ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Membership, Some(pid), None, 512, i).unwrap();
+            ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Registration, Some(pid), None, 1024, i).unwrap();
+        }
+        assert!(matches!(
+            stage_compaction_ledger(&ledger, 17, &target_ids, Uuid::new_v4(), Uuid::new_v4()),
+            Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "registrations",
+                ..
+            }))
+        ));
+        assert_eq!(ledger.summary().active_memberships, 16);
+        assert_eq!(ledger.summary().released_memberships, 0);
+
+        contract.metadata_ledger.repo_max_registrations = 32;
+        let mut ledger2 = RetentionLedger::new(LedgerBudgetPolicy::from_contract(&contract));
+        let mut t2 = BTreeSet::new();
+        for i in 1..=16u64 {
+            let pid = Uuid::new_v4();
+            t2.insert(pid);
+            ledger2.record_entry(Uuid::new_v4(), LedgerEntryKind::Membership, Some(pid), None, 512, i).unwrap();
+            ledger2.record_entry(Uuid::new_v4(), LedgerEntryKind::Registration, Some(pid), None, 1024, i).unwrap();
+        }
+        let compacted = stage_compaction_ledger(&ledger2, 17, &t2, Uuid::new_v4(), Uuid::new_v4()).unwrap();
+        assert_eq!(compacted.summary().active_memberships, 1);
+        assert_eq!(compacted.summary().released_memberships, 16);
+    }
+
+    #[test]
+    fn commit_push_rejects_drift_window_bounds_and_rolls_back_ledger() {
+        let mut contract = PandoCapacityContract::current_standalone();
+        contract.metadata_ledger.repo_max_receipts = 1;
+        contract.verifier.max_total_bytes_per_window = 2048;
+        contract.verifier.max_objects_per_window = 20;
+        let mut state = empty_state(&contract);
+        let p0 = fake_pack(1000, 10, 1);
+        let oid1 = "1".repeat(40);
+        let zero = "0".repeat(40);
+        let m1 = [RefMutation { ref_name: "refs/heads/main".into(), old_oid: zero.clone(), new_oid: oid1 }];
+        let m2 = [RefMutation { ref_name: "refs/heads/other".into(), old_oid: zero, new_oid: "2".repeat(40) }];
+        let run =
+            |st: &mut EngineState, muts: &[RefMutation], base: &BTreeSet<Uuid>, packs: Vec<VerifiedPackRecord>| {
+                let put_b: u64 = packs.iter().map(VerifiedPackRecord::total_bytes).sum();
+                st.commit_push(CommitPushInput {
+                    contract: &contract,
+                    object_format: ObjectFormat::Sha1,
+                    operation_id: Uuid::new_v4(),
+                    request_digest: Uuid::new_v4().to_string(),
+                    ref_mutations: muts,
+                    base_pack_ids: base,
+                    uploaded_records: packs,
+                    put_bytes: put_b,
+                    blob_get_bytes: 0,
+                    peak_scratch_bytes: 0,
+                })
+            };
+        run(&mut state, &m1, &BTreeSet::new(), vec![p0.clone()]).unwrap();
+
+        let snap_before = state.snapshot();
+        let live_ids = BTreeSet::from([p0.pack_id]);
+
+        assert!(matches!(
+            run(&mut state, &m2, &BTreeSet::from([Uuid::new_v4()]), vec![]),
+            Err(GrowthEngineError::CompactionConflict)
+        ));
+        assert!(matches!(
+            run(&mut state, &m2, &live_ids, vec![fake_pack(1500, 5, 2)]),
+            Err(GrowthEngineError::Admission(AdmissionRejection::PackBytesExceeded { .. }))
+        ));
+        assert!(matches!(
+            run(&mut state, &m2, &live_ids, vec![fake_pack(500, 11, 2)]),
+            Err(GrowthEngineError::Admission(AdmissionRejection::TooManyObjects { .. }))
+        ));
+        assert!(matches!(
+            run(&mut state, &m2, &live_ids, vec![fake_pack(500, 5, 2)]),
+            Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted { resource: "receipts", .. }))
+        ));
+        assert_eq!(state.snapshot(), snap_before);
+        assert_eq!(state.active_packs.len(), 1);
+    }
 }

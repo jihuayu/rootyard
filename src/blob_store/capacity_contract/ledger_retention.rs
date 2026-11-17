@@ -335,4 +335,38 @@ mod tests {
         assert_eq!(ledger.archive_released_entries(), 2);
         assert_eq!(ledger.summary().hot_logical_bytes, 0);
     }
+
+    #[test]
+    fn enforces_hot_registration_budget_and_backup_hold_release() {
+        let mut policy = LedgerBudgetPolicy::from_contract(&PandoCapacityContract::current_standalone());
+        policy.repo_max_registrations = 2;
+        let mut ledger = RetentionLedger::new(policy);
+        let (p1, p2, m1, r1, r2, bid) =
+            (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        ledger.record_entry(m1, LedgerEntryKind::Membership, Some(p1), None, 512, 1).unwrap();
+        ledger.record_entry(r1, LedgerEntryKind::Registration, Some(p1), None, 1024, 1).unwrap();
+        ledger.record_entry(r2, LedgerEntryKind::Registration, Some(p2), None, 1024, 2).unwrap();
+        ledger.attach_hold_to_pack(p1, ProtectionHold::BackupManifest { backup_id: bid }).unwrap();
+        ledger.record_compaction_superseded(3, &BTreeSet::from([p1, p2]));
+        assert_eq!(ledger.get(r1).unwrap().classification(), RetentionClassification::CompactedProtected);
+        assert_eq!(ledger.get(r2).unwrap().classification(), RetentionClassification::ReleasedEligibleForArchive);
+        assert!(matches!(ledger.attempt_delete_entry(r1), Err(LedgerRetentionError::ProtectedByHold { .. })));
+        assert!(matches!(
+            ledger.attempt_delete_entry(r2),
+            Err(LedgerRetentionError::CompactionDoesNotAuthorizeDelete { .. })
+        ));
+        assert!(matches!(
+            ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Registration, Some(Uuid::new_v4()), None, 1024, 3),
+            Err(LedgerRetentionError::LedgerBudgetExhausted { resource: "registrations", .. })
+        ));
+        assert_eq!(ledger.archive_released_entries(), 1);
+        assert!(
+            ledger
+                .record_entry(Uuid::new_v4(), LedgerEntryKind::Registration, Some(Uuid::new_v4()), None, 1024, 3)
+                .is_ok()
+        );
+        ledger.release_hold(bid).unwrap();
+        assert_eq!(ledger.get(r1).unwrap().classification(), RetentionClassification::ReleasedEligibleForArchive);
+        assert_eq!(ledger.archive_released_entries(), 2);
+    }
 }

@@ -330,4 +330,41 @@ mod tests {
         drop(permit);
         assert_eq!(ctrl.telemetry().current_workspace_bytes, 0);
     }
+
+    #[tokio::test]
+    async fn fail_closed_boundary_faults_and_backpressure_queue() {
+        let mut c = PandoCapacityContract::current_standalone();
+        c.verifier.max_concurrent_native = 1;
+        c.streaming.max_queue_waiters = 1;
+        let limits = AdmissionLimits::from_contract(&c).unwrap();
+        let (ctrl, dl) = (Arc::new(AdmissionController::new(limits).unwrap()), Instant::now() + Duration::from_secs(5));
+        let base = base_req();
+        type MutateFn = fn(&mut AdmissionRequest, AdmissionLimits);
+        let cases: [(&str, MutateFn); 9] = [
+            ("unauthorized", |r, _| r.caller_authorized = false),
+            ("oversized_object", |r, l| r.max_single_object_bytes = l.max_object_bytes + 1),
+            ("pack_bytes_exceeded", |r, l| r.declared_pack_bytes = l.max_pack_bytes_per_push + 1),
+            ("too_many_objects", |r, l| r.declared_objects = l.max_objects_per_window + 1),
+            ("pack_count_limit_reached", |r, _| r.active_frontier_packs = 16),
+            ("workspace_budget_exceeded", |r, l| r.estimated_workspace_bytes = l.max_workspace_bytes + 1),
+            ("memory_budget_exceeded", |r, l| r.estimated_memory_bytes = l.max_memory_bytes + 1),
+            ("fd_budget_exceeded", |r, l| r.required_fds = l.max_open_fds + 1),
+            ("disk_headroom_exhausted", |r, _| r.free_disk_bytes = 1024),
+        ];
+        for (expected, mutate) in cases {
+            let mut req = base.clone();
+            mutate(&mut req, limits);
+            assert_eq!(ctrl.acquire(&req, dl).await.err().unwrap().reason_key(), expected);
+        }
+        let active = ctrl.acquire(&base, dl).await.unwrap();
+        let (c2, b2) = (Arc::clone(&ctrl), base.clone());
+        let queued = tokio::spawn(async move { c2.acquire(&b2, Instant::now() + Duration::from_secs(5)).await });
+        while ctrl.telemetry().queued_waiters == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(ctrl.acquire(&base, dl).await, Err(AdmissionRejection::QueueFull { .. })));
+        drop(active);
+        let _p2 = queued.await.unwrap().unwrap();
+        assert_eq!(ctrl.telemetry().rejected_by_reason.get("queue_full").copied(), Some(1));
+    }
 }
