@@ -894,6 +894,76 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "server_announcement_invalid")
         self.assertIsNone(server.process)
 
+    def test_stop_waits_the_full_term_grace_before_kill(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(
+            clock, term_leader_delay=0.0, term_child_delay=float("inf"),
+            kill_leader_delay=0.0, kill_child_delay=0.0)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
+        self.assertTrue(server.stop())
+        signals = [(sig, at) for _pgid, sig, at in group.calls
+                   if sig in (signal.SIGTERM, signal.SIGKILL)]
+        self.assertEqual([sig for sig, _at in signals],
+                         [signal.SIGTERM, signal.SIGKILL])
+        self.assertGreaterEqual(signals[1][1], 13.0)
+        self.assertTrue(process.stdout.closed)
+        self.assertIsNone(server.process)
+
+    def test_stop_term_no_exit_uses_the_remaining_kill_slice(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(
+            clock, term_leader_delay=float("inf"),
+            term_child_delay=float("inf"),
+            kill_leader_delay=0.0, kill_child_delay=0.0)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
+        self.assertTrue(server.stop())
+        kills = [at for _pgid, sig, at in group.calls
+                 if sig == signal.SIGKILL]
+        self.assertEqual(len(kills), 1)
+        self.assertGreaterEqual(kills[0], 13.0)
+        self.assertLessEqual(kills[0], 15.0)
+        self.assertGreater(process.waits[-1], 0.0)
+        self.assertTrue(process.stdout.closed)
+
+    def test_stop_delayed_sigkill_exit_is_polled_within_the_same_d(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(
+            clock, term_leader_delay=float("inf"),
+            term_child_delay=float("inf"),
+            kill_leader_delay=0.0, kill_child_delay=1.0)
+        server, process, group, sleep = _server_for_stop(
+            clock, budget, group)
+        self.assertTrue(server.stop())
+        self.assertGreaterEqual(clock.now, 14.0)
+        self.assertLessEqual(clock.now, 15.0)
+        self.assertTrue(sleep.calls)
+        self.assertTrue(process.stdout.closed)
+
+    def test_stop_late_sigkill_exit_retains_owner(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(
+            clock, term_leader_delay=float("inf"),
+            term_child_delay=float("inf"),
+            kill_leader_delay=0.0, kill_child_delay=2.1)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
+        with self.assertRaises(QualificationError) as caught:
+            server.stop()
+        self.assertEqual(caught.exception.code, "server_group_alive")
+        self.assertIs(server.process, process)
+        self.assertTrue(server.owned_group)
+        self.assertFalse(process.stdout.closed)
+
     def test_stop_leader_exit_does_not_hide_a_live_child(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,

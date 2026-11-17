@@ -364,15 +364,26 @@ class Server:
         return True
 
     def _wait_term_slice(self, term_deadline):
-        """Observe the leader once without reaping it (ordering checkpoint)."""
-        state = self._observe_leader()
-        if state == "reaped":
-            self._leader_reaped = True
-            raise QualificationError("server_group_unverified", "cleanup")
-        if state == "unknown":
-            raise QualificationError("server_group_unverified", "cleanup")
-        self._require_stop()
-        return True
+        """Observe the full TERM grace without reaping the leader.
+
+        A prompt leader exit is a zombie anchor, not proof that inherited Git
+        descendants are gone.  The loop therefore stays inside the original
+        TERM slice and only observes leader identity; it never waits for the
+        zombie leader to disappear from killpg(0).
+        """
+        while True:
+            state = self._observe_leader()
+            if state == "reaped":
+                self._leader_reaped = True
+                raise QualificationError("server_group_unverified", "cleanup")
+            if state == "unknown":
+                raise QualificationError("server_group_unverified", "cleanup")
+            remaining = term_deadline - self._now()
+            if remaining <= 0:
+                self._require_stop()
+                return True
+            self._sleep_until(min(self.GROUP_POLL_SECONDS, remaining))
+            self._require_stop()
 
     def _reap_leader_after_signals(self, process, deadline):
         """Reap only after the last numeric PGID signal has been sent."""
@@ -397,9 +408,17 @@ class Server:
         return True
 
     def _poll_group_absence(self, pgid, deadline):
-        """One passive group probe after the leader has been reaped."""
-        self._require_stop()
-        return self._group_state(pgid)
+        """Passively poll group absence after the leader has been reaped."""
+        while True:
+            state = self._group_state(pgid)
+            if state in ("absent", "unknown"):
+                return state
+            remaining = deadline - self._now()
+            if remaining <= 0:
+                self._require_stop()
+                return "present"
+            self._sleep_until(min(self.GROUP_POLL_SECONDS, remaining))
+            self._require_stop()
 
     def _close(self, process):
         stream = getattr(process, "stdout", None)
