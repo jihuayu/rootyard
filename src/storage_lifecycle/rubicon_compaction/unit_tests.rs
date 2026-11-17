@@ -401,23 +401,23 @@ async fn lease_clocks_stay_bounded_across_lease_lifecycles_and_stale_releases() 
     // 1. Repeated acquire -> renew -> release, force_steal + stale release, and expiry replacement.
     for i in 0..16u64 {
         let base = 1_000 + i * 1_000;
-        let t0 = store.acquire_or_renew_lease(&key0, "w0", base, 200).await.unwrap();
-        let t0_renewed = store.acquire_or_renew_lease(&key0, "w0", base + 50, 200).await.unwrap();
+        let t0 = store.acquire_or_renew_lease(&key0, "w0", base, 500).await.unwrap();
+        let t0_renewed = store.acquire_or_renew_lease(&key0, "w0", base + 50, 500).await.unwrap();
         assert_eq!((t0_renewed.lease_id, t0_renewed.fence_epoch), (t0.lease_id, t0.fence_epoch));
-        let t1 = store.acquire_or_renew_lease(&key1, "w1", base, 200).await.unwrap();
+        let t1 = store.acquire_or_renew_lease(&key1, "w1", base, 500).await.unwrap();
         assert_eq!(store.lease_clock_len(), 2);
 
         // Force-steal shard 0; stale release on old t0 must preserve stolen clock entry.
-        let stolen = store.force_steal_lease(&key0, "thief", base + 60, 20).await.unwrap();
+        let stolen = store.force_steal_lease(&key0, "thief", base + 60, 50).unwrap();
         assert_eq!(store.lease_clock_len(), 2);
         store.release_lease(&t0).await.unwrap();
         assert_eq!(store.lease_clock_len(), 2);
         store.verify_lease_active(&stolen, base + 60).await.unwrap();
 
         // Letting stolen expire and re-acquiring replaces its clock entry cleanly.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(75)).await;
         assert!(matches!(store.verify_lease_active(&stolen, base + 60).await, Err(CompactionError::LeaseLost(_))));
-        let next0 = store.acquire_or_renew_lease(&key0, "w2", base + 60, 200).await.unwrap();
+        let next0 = store.acquire_or_renew_lease(&key0, "w2", base + 60, 500).await.unwrap();
         assert!(next0.fence_epoch > stolen.fence_epoch && store.lease_clock_len() == 2);
 
         store.release_lease(&next0).await.unwrap();
@@ -437,6 +437,6 @@ async fn lease_clocks_stay_bounded_across_lease_lifecycles_and_stale_releases() 
     std::fs::remove_file(&j_path).unwrap();
     std::fs::create_dir_all(j_path.join("block-rename")).unwrap();
     assert!(store.release_lease(&active).await.is_err());
-    assert!(store.force_steal_lease(&key0, "other", 50_020, 1_000).await.is_err());
+    assert!(store.force_steal_lease(&key0, "other", 50_020, 1_000).is_err());
     assert_eq!(store.lease_clock_len(), 1);
 }
