@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn scanner_limits_and_manifest_canonical_verification() -> Result<(), Box<dyn std::error::Error>> {
         use super::super::{
-            MAX_WORKSPACE_BYTES,
+            MAX_TOTAL_CHUNKS, MAX_WORKSPACE_BYTES,
             manifest::{compute_dir_node_sha256, compute_index_merkle_root, compute_state_merkle_root},
             manifest_verify::validate_manifest,
         };
@@ -427,6 +427,7 @@ mod tests {
                 },
                 max_e,
                 MAX_WORKSPACE_BYTES,
+                MAX_TOTAL_CHUNKS,
             )?
             .manifest)
         };

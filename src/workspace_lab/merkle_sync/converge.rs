@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    MerkleSyncError,
+    MAX_CHUNK_BYTES, MIN_CHUNK_BYTES, MerkleSyncError,
     git_compare::GitBundleSnapshot,
     git_state::{read_git_state_and_bundle, validate_git_compat},
     manifest::{EmptyDirPolicy, UntrackedPolicy},
@@ -358,6 +358,9 @@ pub fn capture_with_quiescence_barrier(
     if req.max_attempts == 0 {
         return Err(MerkleSyncError::InvalidInput("max_attempts must be >= 1".into()));
     }
+    if !(MIN_CHUNK_BYTES..=MAX_CHUNK_BYTES).contains(&(req.chunk_size_bytes as usize)) {
+        return Err(MerkleSyncError::InvalidInput("chunk_size_bytes out of bounds".into()));
+    }
     let mut last_reason = String::new();
     let mut escalate_full = false;
     for attempt in 1..=req.max_attempts {
@@ -371,18 +374,23 @@ pub fn capture_with_quiescence_barrier(
             });
         }
         let pre_seq = coalescer.current_seq().max(probe.current_watcher_seq());
-        let pre_stamp = match capture_stamp(req.repo_root, pre_seq, pre_rev, pre_epoch) {
-            Ok(stamp) => stamp,
-            Err(MerkleSyncError::UnsupportedGitState(reason)) => {
-                return Ok(ConvergeOutcome::UnsupportedState { reason });
-            }
-            Err(MerkleSyncError::NotQuiescent(reason)) => {
-                last_reason = reason;
-                escalate_full = true;
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
+        macro_rules! barrier_step {
+            ($expr:expr) => {
+                match $expr {
+                    Ok(v) => v,
+                    Err(MerkleSyncError::UnsupportedGitState(reason)) => {
+                        return Ok(ConvergeOutcome::UnsupportedState { reason });
+                    }
+                    Err(MerkleSyncError::NotQuiescent(reason)) | Err(MerkleSyncError::ConcurrentEdit(reason)) => {
+                        last_reason = reason;
+                        escalate_full = true;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                }
+            };
+        }
+        let pre_stamp = barrier_step!(capture_stamp(req.repo_root, pre_seq, pre_rev, pre_epoch));
 
         let (mut dirty_scope, mut stats) = coalescer.into_dirty_scope();
         if escalate_full || attempt > 1 {
@@ -390,27 +398,15 @@ pub fn capture_with_quiescence_barrier(
             stats.used_full_rescan = true;
         }
 
-        let git_res = read_git_state_and_bundle(
+        let (git_state, ignore, git_bundle) = barrier_step!(read_git_state_and_bundle(
             req.repo_root,
             req.untracked_policy,
             req.empty_dir_policy,
             req.use_gitignore,
             req.use_rootyardignore,
-        );
-        let (git_state, ignore, git_bundle) = match git_res {
-            Ok(val) => val,
-            Err(MerkleSyncError::UnsupportedGitState(reason)) => {
-                return Ok(ConvergeOutcome::UnsupportedState { reason });
-            }
-            Err(MerkleSyncError::NotQuiescent(reason)) => {
-                last_reason = reason;
-                escalate_full = true;
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
+        ));
 
-        let scan_res = MerkleWorkspaceScanner::scan(ScanRequest {
+        let scan = barrier_step!(MerkleWorkspaceScanner::scan(ScanRequest {
             repo_root: req.repo_root,
             workspace_id: req.workspace_id,
             checkpoint_id: req.checkpoint_id,
@@ -423,36 +419,13 @@ pub fn capture_with_quiescence_barrier(
             ignore: &ignore,
             previous: req.previous,
             dirty_scope,
-        });
-        let scan = match scan_res {
-            Ok(s) => s,
-            Err(MerkleSyncError::UnsupportedGitState(reason)) => {
-                return Ok(ConvergeOutcome::UnsupportedState { reason });
-            }
-            Err(MerkleSyncError::ConcurrentEdit(reason)) | Err(MerkleSyncError::NotQuiescent(reason)) => {
-                last_reason = reason;
-                escalate_full = true;
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
+        }));
 
         probe.on_post_scan(attempt)?;
         let post_rev = (req.actual_revision_fn)();
         let post_epoch = (req.actual_lease_epoch_fn)();
         let post_seq = coalescer.current_seq().max(probe.current_watcher_seq());
-        let post_stamp = match capture_stamp(req.repo_root, post_seq, post_rev, post_epoch) {
-            Ok(stamp) => stamp,
-            Err(MerkleSyncError::UnsupportedGitState(reason)) => {
-                return Ok(ConvergeOutcome::UnsupportedState { reason });
-            }
-            Err(MerkleSyncError::NotQuiescent(reason)) => {
-                last_reason = reason;
-                escalate_full = true;
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
+        let post_stamp = barrier_step!(capture_stamp(req.repo_root, post_seq, post_rev, post_epoch));
 
         if pre_stamp != post_stamp {
             last_reason = "workspace mutated during single-barrier capture (mixed-point refused)".into();
@@ -462,4 +435,39 @@ pub fn capture_with_quiescence_barrier(
         return Ok(ConvergeOutcome::Converged { scan: Box::new(scan), git_bundle, attempts: attempt, stats });
     }
     Ok(ConvergeOutcome::NotQuiescent { reason: last_reason, attempts: req.max_attempts })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converge_rejects_below_min_chunk_size_early() {
+        let one = || 1i64;
+        let mut co = WatcherCoalescer::new();
+        let req = CaptureBarrierRequest {
+            repo_root: Path::new("."),
+            workspace_id: Uuid::nil(),
+            checkpoint_id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            repo_id: Uuid::nil(),
+            history_id: Uuid::nil(),
+            parent_checkpoint_id: None,
+            chunk_size_bytes: 1,
+            untracked_policy: UntrackedPolicy::IncludeNonIgnored,
+            empty_dir_policy: EmptyDirPolicy::IgnoreEmptyDirs,
+            use_gitignore: true,
+            use_rootyardignore: true,
+            expected_revision: 1,
+            actual_revision_fn: &one,
+            expected_lease_epoch: 1,
+            actual_lease_epoch_fn: &one,
+            previous: None,
+            max_attempts: 1,
+        };
+        assert!(matches!(
+            capture_with_quiescence_barrier(&req, &mut co, &mut NoopBarrierProbe),
+            Err(MerkleSyncError::InvalidInput(_))
+        ));
+    }
 }

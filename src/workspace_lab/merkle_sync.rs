@@ -50,10 +50,12 @@ use crate::blob_store::{BlobError, closure::BlobClosureError, disposable_view::D
 
 pub const MERKLE_MANIFEST_SCHEMA: u32 = 1;
 pub const MERKLE_CODEC_VERSION: &str = "rootyard.merkle-sync.v1";
+pub const MIN_CHUNK_BYTES: usize = 4 * 1024;
 pub const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_TREE_ENTRIES: usize = 100_000;
 pub const MAX_WORKSPACE_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_TOTAL_CHUNKS: usize = 250_000;
 pub const MAX_MANIFEST_JSON_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SYMLINK_HOPS: usize = 40;
 

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    MAX_CHUNK_BYTES, MAX_TREE_ENTRIES, MAX_WORKSPACE_BYTES, MerkleSyncError,
+    MAX_CHUNK_BYTES, MAX_TOTAL_CHUNKS, MAX_TREE_ENTRIES, MAX_WORKSPACE_BYTES, MIN_CHUNK_BYTES, MerkleSyncError,
     git_state::IgnoreSnapshot,
     manifest::{
         GitStateSnapshot, MerkleChildKind, MerkleDirChild, MerkleDirNode, MerkleStateManifest, build_dir_node,
@@ -83,8 +83,10 @@ struct ScanState<'a> {
     work_entries: usize,
     total_entries: usize,
     total_bytes: u64,
+    total_chunks: usize,
     max_entries: usize,
     max_bytes: u64,
+    max_chunks: usize,
     metrics: ScanMetrics,
 }
 
@@ -92,16 +94,17 @@ pub struct MerkleWorkspaceScanner;
 
 impl MerkleWorkspaceScanner {
     pub fn scan(req: ScanRequest<'_>) -> Result<ScanResult, MerkleSyncError> {
-        Self::scan_with_limits(req, MAX_TREE_ENTRIES, MAX_WORKSPACE_BYTES)
+        Self::scan_with_limits(req, MAX_TREE_ENTRIES, MAX_WORKSPACE_BYTES, MAX_TOTAL_CHUNKS)
     }
 
     pub(crate) fn scan_with_limits(
         req: ScanRequest<'_>,
         max_entries: usize,
         max_bytes: u64,
+        max_chunks: usize,
     ) -> Result<ScanResult, MerkleSyncError> {
         let started = Instant::now();
-        if req.chunk_size_bytes == 0 || req.chunk_size_bytes as usize > MAX_CHUNK_BYTES {
+        if (req.chunk_size_bytes as usize) < MIN_CHUNK_BYTES || req.chunk_size_bytes as usize > MAX_CHUNK_BYTES {
             return Err(MerkleSyncError::InvalidInput("chunk_size_bytes out of bounds".into()));
         }
         let mut full_scan = matches!(req.dirty_scope, DirtyScope::FullRescan) || req.previous.is_none();
@@ -180,8 +183,10 @@ impl MerkleWorkspaceScanner {
             work_entries: 0,
             total_entries: 0,
             total_bytes: 0,
+            total_chunks: 0,
             max_entries,
             max_bytes,
+            max_chunks,
             metrics: ScanMetrics {
                 full_scan,
                 scanned_dirs: 0,
@@ -251,7 +256,15 @@ fn copy_clean_subtree(
     for ch in &node.children {
         let name = STANDARD.decode(&ch.name_base64).map_err(|e| MerkleSyncError::InvalidManifest(e.to_string()))?;
         let child_raw = join_rel(&parent_raw, &name);
-        reserve_child_limits(&mut st.total_entries, &mut st.total_bytes, st.max_entries, st.max_bytes, ch)?;
+        reserve_child_limits(
+            &mut st.total_entries,
+            &mut st.total_bytes,
+            &mut st.total_chunks,
+            st.max_entries,
+            st.max_bytes,
+            st.max_chunks,
+            ch,
+        )?;
         match ch.kind {
             MerkleChildKind::File | MerkleChildKind::Symlink => {}
             MerkleChildKind::EmptyDir => st.metrics.retained_empty_dirs += 1,
@@ -391,7 +404,15 @@ fn scan_dir_node(st: &mut ScanState<'_>, dir_raw: &[u8]) -> Result<Option<Merkle
             && let Some(prev_ch) = prev_children.get(&name_bytes)
             && can_reuse_clean_leaf(&meta, prev_ch)
         {
-            reserve_child_limits(&mut st.total_entries, &mut st.total_bytes, st.max_entries, st.max_bytes, prev_ch)?;
+            reserve_child_limits(
+                &mut st.total_entries,
+                &mut st.total_bytes,
+                &mut st.total_chunks,
+                st.max_entries,
+                st.max_bytes,
+                st.max_chunks,
+                prev_ch,
+            )?;
             st.metrics.reused_nodes += 1;
             children.push(prev_ch.clone());
             continue;
@@ -402,8 +423,10 @@ fn scan_dir_node(st: &mut ScanState<'_>, dir_raw: &[u8]) -> Result<Option<Merkle
             hashed_bytes: &mut st.metrics.hashed_bytes,
             total_entries: &mut st.total_entries,
             total_bytes: &mut st.total_bytes,
+            total_chunks: &mut st.total_chunks,
             max_entries: st.max_entries,
             max_bytes: st.max_bytes,
+            max_chunks: st.max_chunks,
             chunk_sources: &mut st.chunk_sources,
         };
         let leaf =
@@ -439,7 +462,15 @@ fn update_ancestor_dir_only(
                 children.push(make_empty_dir_child(ch.name_base64.clone()));
             }
         } else {
-            reserve_child_limits(&mut st.total_entries, &mut st.total_bytes, st.max_entries, st.max_bytes, ch)?;
+            reserve_child_limits(
+                &mut st.total_entries,
+                &mut st.total_bytes,
+                &mut st.total_chunks,
+                st.max_entries,
+                st.max_bytes,
+                st.max_chunks,
+                ch,
+            )?;
             if ch.kind == MerkleChildKind::EmptyDir {
                 st.metrics.retained_empty_dirs += 1;
             } else {

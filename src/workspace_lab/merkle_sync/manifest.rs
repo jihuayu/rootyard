@@ -385,3 +385,103 @@ pub fn build_dir_node(
         subtree_total_bytes,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, process::Command};
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::workspace_lab::merkle_sync::{
+        MAX_TOTAL_CHUNKS, MIN_CHUNK_BYTES,
+        git_state::read_git_state_and_bundle,
+        manifest_verify::validate_manifest,
+        scan_fs::reserve_chunk_budget,
+        scanner::{DirtyScope, MerkleWorkspaceScanner, ScanRequest},
+    };
+
+    #[test]
+    fn chunk_size_floor_and_chunk_fanout_budget_fail_before_allocation() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let repo = dir.path().join("fanout");
+        fs::create_dir_all(&repo)?;
+        assert!(
+            Command::new("git")
+                .args(["-C"])
+                .arg(&repo)
+                .args(["init", "--initial-branch=main"])
+                .output()?
+                .status
+                .success()
+        );
+        fs::write(repo.join("blob.bin"), vec![b'X'; 5 * 4096])?;
+
+        let (up, ep) = (UntrackedPolicy::IncludeNonIgnored, EmptyDirPolicy::IgnoreEmptyDirs);
+        let (gs, ig, _) = read_git_state_and_bundle(&repo, up, ep, true, true)?;
+        let (t, r, h, ws) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mk = |sz: u32, g: &_, i: &_, prev, dirty_scope| ScanRequest {
+            repo_root: &repo,
+            workspace_id: ws,
+            checkpoint_id: Uuid::new_v4(),
+            tenant_id: t,
+            repo_id: r,
+            history_id: h,
+            parent_checkpoint_id: None,
+            chunk_size_bytes: sz,
+            git_state: g,
+            ignore: i,
+            previous: prev,
+            dirty_scope,
+        };
+        for bad_sz in [0u32, 1, (MIN_CHUNK_BYTES - 1) as u32] {
+            let err = MerkleWorkspaceScanner::scan(mk(bad_sz, &gs, &ig, None, DirtyScope::FullRescan));
+            assert!(matches!(err, Err(MerkleSyncError::InvalidInput(_))));
+        }
+        let err4 =
+            MerkleWorkspaceScanner::scan_with_limits(mk(4096, &gs, &ig, None, DirtyScope::FullRescan), 100, 1 << 20, 4);
+        assert!(matches!(err4, Err(MerkleSyncError::InvalidManifest(_))));
+        let ok = MerkleWorkspaceScanner::scan_with_limits(
+            mk(4096, &gs, &ig, None, DirtyScope::FullRescan),
+            100,
+            1 << 20,
+            6,
+        )?;
+        validate_manifest(&ok.manifest)?;
+
+        fs::write(repo.join("extra.bin"), vec![b'Y'; 2 * 4096])?;
+        let (gs2, ig2, _) = read_git_state_and_bundle(&repo, up, ep, true, true)?;
+        let scope = DirtyScope::Subtrees {
+            dirty_dirs: [Vec::new()].into_iter().collect(),
+            dirty_paths: [b"extra.bin".to_vec()].into_iter().collect(),
+            force_rehash_dirs: Default::default(),
+        };
+        let err6 =
+            MerkleWorkspaceScanner::scan_with_limits(mk(4096, &gs2, &ig2, Some(&ok.manifest), scope), 100, 1 << 20, 6);
+        assert!(matches!(err6, Err(MerkleSyncError::InvalidManifest(_))));
+
+        let mut bad_sz_m = ok.manifest.clone();
+        bad_sz_m.chunk_size_bytes = 1;
+        bad_sz_m.merkle_root_digest =
+            compute_state_merkle_root(&bad_sz_m.git_state, &bad_sz_m.ignore_policy, &bad_sz_m.worktree_root_digest, 1);
+        assert!(matches!(validate_manifest(&bad_sz_m), Err(MerkleSyncError::InvalidManifest(_))));
+
+        let mut bomb = ok.manifest;
+        let root = bomb.nodes.get_mut("").unwrap();
+        let mut c0 = root.children[0].chunks[0].clone();
+        (c0.index, c0.offset, c0.len) = (5, 5 * 4096, 0);
+        root.children[0].chunks.push(c0);
+        root.node_sha256 = compute_dir_node_sha256("", &root.children);
+        bomb.worktree_root_digest = root.node_sha256.clone();
+        bomb.merkle_root_digest =
+            compute_state_merkle_root(&bomb.git_state, &bomb.ignore_policy, &bomb.worktree_root_digest, 4096);
+        assert!(matches!(validate_manifest(&bomb), Err(MerkleSyncError::InvalidManifest(_))));
+
+        let mut total = MAX_TOTAL_CHUNKS - 1;
+        assert!(matches!(
+            reserve_chunk_budget(&mut total, 2, MAX_TOTAL_CHUNKS),
+            Err(MerkleSyncError::InvalidManifest(_))
+        ));
+        Ok(())
+    }
+}

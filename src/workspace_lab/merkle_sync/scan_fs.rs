@@ -15,7 +15,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 
 use super::{
-    MAX_SYMLINK_HOPS, MerkleSyncError,
+    MAX_CHUNK_BYTES, MAX_SYMLINK_HOPS, MIN_CHUNK_BYTES, MerkleSyncError,
     git_state::IgnoreSnapshot,
     manifest::{ChunkRef, EmptyDirPolicy, MerkleChildKind, MerkleDirChild, UntrackedPolicy},
 };
@@ -98,25 +98,37 @@ pub(crate) fn can_reuse_clean_leaf(meta: &fs::Metadata, prev: &MerkleDirChild) -
         && (meta.permissions().mode() & 0o777) == prev.mode
 }
 
-pub(crate) fn reserve_tree_entry(total_entries: &mut usize, max_entries: usize) -> Result<(), MerkleSyncError> {
-    *total_entries = total_entries
-        .checked_add(1)
-        .ok_or_else(|| MerkleSyncError::InvalidManifest("manifest entry count overflow".into()))?;
-    if *total_entries > max_entries {
-        return Err(MerkleSyncError::InvalidManifest("manifest entry limit exceeded".into()));
+fn reserve_usize(cur: &mut usize, add: usize, max: usize, what: &str) -> Result<(), MerkleSyncError> {
+    let next =
+        cur.checked_add(add).ok_or_else(|| MerkleSyncError::InvalidManifest(format!("{what} count overflow")))?;
+    if next > max {
+        return Err(MerkleSyncError::InvalidManifest(format!("{what} limit exceeded")));
     }
+    *cur = next;
     Ok(())
 }
 
-pub(crate) fn reserve_workspace_bytes(
-    total_bytes: &mut u64,
-    add_bytes: u64,
-    max_bytes: u64,
-) -> Result<(), MerkleSyncError> {
+pub(crate) fn reserve_tree_entry(total_entries: &mut usize, max_entries: usize) -> Result<(), MerkleSyncError> {
+    reserve_usize(total_entries, 1, max_entries, "manifest entry")
+}
+
+pub(crate) fn reserve_chunk_budget(total: &mut usize, add: usize, max: usize) -> Result<(), MerkleSyncError> {
+    reserve_usize(total, add, max, "manifest chunk")
+}
+
+pub(crate) fn expected_chunk_count(file_len: u64, chunk_size: usize) -> Result<usize, MerkleSyncError> {
+    if !(MIN_CHUNK_BYTES..=MAX_CHUNK_BYTES).contains(&chunk_size) {
+        return Err(MerkleSyncError::InvalidInput("chunk_size_bytes out of bounds".into()));
+    }
+    let chunks = if file_len == 0 { 1 } else { file_len.div_ceil(chunk_size as u64) };
+    usize::try_from(chunks).map_err(|_| MerkleSyncError::InvalidManifest("chunk count overflow".into()))
+}
+
+pub(crate) fn reserve_workspace_bytes(total_bytes: &mut u64, add: u64, max: u64) -> Result<(), MerkleSyncError> {
     let next = total_bytes
-        .checked_add(add_bytes)
+        .checked_add(add)
         .ok_or_else(|| MerkleSyncError::InvalidManifest("workspace size overflow".into()))?;
-    if next > max_bytes {
+    if next > max {
         return Err(MerkleSyncError::InvalidManifest("workspace byte limit exceeded".into()));
     }
     *total_bytes = next;
@@ -126,13 +138,18 @@ pub(crate) fn reserve_workspace_bytes(
 pub(crate) fn reserve_child_limits(
     total_entries: &mut usize,
     total_bytes: &mut u64,
+    total_chunks: &mut usize,
     max_entries: usize,
     max_bytes: u64,
+    max_chunks: usize,
     child: &MerkleDirChild,
 ) -> Result<(), MerkleSyncError> {
     reserve_tree_entry(total_entries, max_entries)?;
     if matches!(child.kind, MerkleChildKind::File | MerkleChildKind::Symlink) {
         reserve_workspace_bytes(total_bytes, child.size, max_bytes)?;
+    }
+    if child.kind == MerkleChildKind::File {
+        reserve_chunk_budget(total_chunks, child.chunks.len(), max_chunks)?;
     }
     Ok(())
 }
@@ -143,8 +160,10 @@ pub(crate) struct LeafMetricsOut<'a> {
     pub hashed_bytes: &'a mut u64,
     pub total_entries: &'a mut usize,
     pub total_bytes: &'a mut u64,
+    pub total_chunks: &'a mut usize,
     pub max_entries: usize,
     pub max_bytes: u64,
+    pub max_chunks: usize,
     pub chunk_sources: &'a mut BTreeMap<String, Vec<(u64, u64, Vec<u8>)>>,
 }
 
@@ -188,8 +207,10 @@ pub(crate) fn build_leaf_child(
         return Err(MerkleSyncError::UnsupportedGitState("special file (FIFO/socket/device) unsupported".into()));
     }
     let expected_len = meta.len();
+    let chunk_count = expected_chunk_count(expected_len, chunk_size)?;
     reserve_tree_entry(out.total_entries, out.max_entries)?;
     reserve_workspace_bytes(out.total_bytes, expected_len, out.max_bytes)?;
+    reserve_chunk_budget(out.total_chunks, chunk_count, out.max_chunks)?;
     let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(full_path)?;
     let opened_meta = file.metadata()?;
     if !opened_meta.is_file() || opened_meta.len() != expected_len {
@@ -207,16 +228,18 @@ pub(crate) fn build_leaf_child(
     *out.scanned_bytes += expected_len;
     *out.hashed_bytes += expected_len;
     let content_sha256 = hex::encode(Sha256::digest(&buf));
-    let mut chunks = Vec::new();
+    let mut chunks = Vec::with_capacity(chunk_count);
     if buf.is_empty() {
         let empty_sha = hex::encode(Sha256::digest(b""));
-        out.chunk_sources.entry(empty_sha.clone()).or_default().push((0, 0, Vec::new()));
+        out.chunk_sources.entry(empty_sha.clone()).or_insert_with(|| vec![(0, 0, Vec::new())]);
         chunks.push(ChunkRef { index: 0, offset: 0, len: 0, sha256: empty_sha });
     } else {
         for (idx, slice) in buf.chunks(chunk_size).enumerate() {
             let offset = (idx * chunk_size) as u64;
             let chunk_sha = hex::encode(Sha256::digest(slice));
-            out.chunk_sources.entry(chunk_sha.clone()).or_default().push((offset, slice.len() as u64, slice.to_vec()));
+            out.chunk_sources
+                .entry(chunk_sha.clone())
+                .or_insert_with(|| vec![(offset, slice.len() as u64, slice.to_vec())]);
             chunks.push(ChunkRef { index: idx as u32, offset, len: slice.len() as u64, sha256: chunk_sha });
         }
     }
@@ -432,30 +455,20 @@ mod tests {
         assert!(stats.duplicate_events_folded >= 1 && stats.out_of_order_batches == 1 && !stats.used_full_rescan);
         assert!(inc.metrics.reused_nodes > 0 && inc.metrics.hashed_bytes < base.metrics.hashed_bytes);
 
+        let gh = b".github/workflows/check.yml";
         fs::create_dir_all(repo.join(".github/workflows"))?;
         fs::write(repo.join(".github/workflows/check.yml"), b"name: ci-v1\n")?;
-        co.ingest(WatcherBatch {
-            seq_start: 4,
-            seq_end: 5,
-            events: vec![WatcherEvent::Create(b".github/workflows/check.yml".to_vec())],
-        });
+        co.ingest(WatcherBatch { seq_start: 4, seq_end: 5, events: vec![WatcherEvent::Create(gh.to_vec())] });
         let ConvergeOutcome::Converged { scan: inc_gh, stats: gh_stats, .. } =
             run(&mut co, Some(&inc.manifest), 3, &mut NoopBarrierProbe)?
         else {
             panic!("expected .github subtree incremental convergence");
         };
-        assert!(
-            !gh_stats.used_full_rescan
-                && inc_gh.metrics.reused_nodes > 0
-                && inc_gh.manifest.merkle_root_digest != inc.manifest.merkle_root_digest
-                && inc_gh.manifest.nodes.contains_key(&super::super::manifest::encode_rel_bytes(b".github/workflows"))
-        );
+        assert!(!gh_stats.used_full_rescan && inc_gh.metrics.reused_nodes > 0);
+        assert!(inc_gh.manifest.merkle_root_digest != inc.manifest.merkle_root_digest);
+        assert!(inc_gh.manifest.nodes.contains_key(&super::super::manifest::encode_rel_bytes(b".github/workflows")));
         fs::write(repo.join(".github/workflows/check.yml"), b"name: ci-v2\n")?;
-        co.ingest(WatcherBatch {
-            seq_start: 5,
-            seq_end: 6,
-            events: vec![WatcherEvent::Modify(b".github/workflows/check.yml".to_vec())],
-        });
+        co.ingest(WatcherBatch { seq_start: 5, seq_end: 6, events: vec![WatcherEvent::Modify(gh.to_vec())] });
         let ConvergeOutcome::Converged { scan: inc_gh2, .. } =
             run(&mut co, Some(&inc_gh.manifest), 3, &mut NoopBarrierProbe)?
         else {
@@ -465,15 +478,16 @@ mod tests {
 
         fs::write(repo.join("sub_b/deep/b_0.txt"), b"changed-during-drop\n")?;
         co.ingest(WatcherBatch { seq_start: 10, seq_end: 11, events: vec![WatcherEvent::Overflow] });
-        let mut p1 =
-            MutatingBarrierProbe { repo: repo.clone(), seq: Arc::new(AtomicU64::new(11)), keep_mutating: false };
+        let run_p = |seq, keep, prev, max_a| {
+            let mut p =
+                MutatingBarrierProbe { repo: repo.clone(), seq: Arc::new(AtomicU64::new(seq)), keep_mutating: keep };
+            run(&mut co, prev, max_a, &mut p)
+        };
         assert!(matches!(
-            run(&mut co, Some(&inc_gh2.manifest), 3, &mut p1)?,
+            run_p(11, false, Some(&inc_gh2.manifest), 3)?,
             ConvergeOutcome::Converged { attempts: 2, .. }
         ));
-        let mut pf =
-            MutatingBarrierProbe { repo: repo.clone(), seq: Arc::new(AtomicU64::new(20)), keep_mutating: true };
-        assert!(matches!(run(&mut co, None, 2, &mut pf)?, ConvergeOutcome::NotQuiescent { attempts: 2, .. }));
+        assert!(matches!(run_p(20, true, None, 2)?, ConvergeOutcome::NotQuiescent { attempts: 2, .. }));
         Ok(())
     }
 }

@@ -291,3 +291,172 @@ pub(crate) fn reconstruct_tree(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::workspace_lab::merkle_sync::backup_restore::{
+        BackupArtifactEntry, MerkleBackupBundle, compute_bundle_digest, validate_backup_bundle_and_artifacts,
+    };
+    use crate::workspace_lab::merkle_sync::ledger::RemoteObjectLocatorEntry;
+    use crate::workspace_lab::merkle_sync::manifest::{
+        EmptyDirPolicy, GitStateSnapshot, IgnorePolicySpec, MerkleObjectFormat, UntrackedPolicy, build_dir_node,
+        compute_index_merkle_root, compute_state_merkle_root, encode_rel_bytes,
+    };
+
+    #[test]
+    fn backup_bundle_rejects_missing_or_mismatched_artifacts_and_inner_scope() -> Result<(), MerkleSyncError> {
+        let (t, r, h, ws, cp) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let ctx = AccessContext {
+            tenant_id: t,
+            repo_id: r,
+            user_id: Uuid::new_v4(),
+            history_id: h,
+            workspace_id: ws,
+            lease_epoch: 1,
+            request_id: Uuid::new_v4(),
+        };
+        let payload = b"hello-chunk";
+        let c_sha = hex::encode(Sha256::digest(payload));
+        let f_child = super::super::manifest::MerkleDirChild {
+            name_base64: encode_rel_bytes(b"a.txt"),
+            kind: MerkleChildKind::File,
+            mode: 0o644,
+            size: payload.len() as u64,
+            content_sha256: Some(c_sha.clone()),
+            target_base64: None,
+            chunks: vec![super::super::manifest::ChunkRef {
+                index: 0,
+                offset: 0,
+                len: payload.len() as u64,
+                sha256: c_sha.clone(),
+            }],
+            subtree_node_sha256: None,
+            subtree_file_count: 1,
+            subtree_total_bytes: payload.len() as u64,
+        };
+        let root_node = build_dir_node(String::new(), vec![f_child])?;
+        let zero_sha = "0".repeat(64);
+        let idx_root = compute_index_merkle_root(MerkleObjectFormat::Sha1, &[], &zero_sha, None, None, None);
+        let git_state = GitStateSnapshot {
+            object_format: MerkleObjectFormat::Sha1,
+            head: super::super::manifest::HeadSnapshot::Unborn { ref_name: "refs/heads/main".into() },
+            index_entries: Vec::new(),
+            index_raw_sha256: zero_sha.clone(),
+            index_merkle_root: idx_root,
+            merge_head: None,
+            cherry_pick_head: None,
+            rebase_head: None,
+        };
+        let ig = IgnorePolicySpec {
+            untracked_policy: UntrackedPolicy::IncludeNonIgnored,
+            empty_dir_policy: EmptyDirPolicy::IgnoreEmptyDirs,
+            use_gitignore: true,
+            use_rootyardignore: true,
+            ignore_rules_digest: zero_sha.clone(),
+        };
+        let state_root = compute_state_merkle_root(&git_state, &ig, &root_node.node_sha256, 16384);
+        let mut nodes = BTreeMap::new();
+        nodes.insert(String::new(), root_node.clone());
+        let state = MerkleStateManifest {
+            schema: MERKLE_MANIFEST_SCHEMA,
+            codec_version: MERKLE_CODEC_VERSION.into(),
+            workspace_id: ws,
+            checkpoint_id: cp,
+            tenant_id: t,
+            repo_id: r,
+            history_id: h,
+            parent_checkpoint_id: None,
+            chunk_size_bytes: 16384,
+            git_state,
+            ignore_policy: ig,
+            worktree_root_digest: root_node.node_sha256.clone(),
+            nodes,
+            merkle_root_digest: state_root.clone(),
+        };
+        let dummy_loc = RemoteObjectLocatorEntry {
+            tenant_id: t,
+            authority_id: r,
+            generation: 1,
+            attempt_id: Uuid::new_v4(),
+            namespace: "merkle-git".into(),
+            sha256: zero_sha.clone(),
+            length: 2,
+        };
+        let remote = MerkleBlobCheckpointManifest {
+            schema: MERKLE_MANIFEST_SCHEMA,
+            codec_version: MERKLE_CODEC_VERSION.into(),
+            checkpoint_id: cp,
+            tenant_id: t,
+            repo_id: r,
+            history_id: h,
+            workspace_id: ws,
+            backend_identity_hex: "b".into(),
+            merkle_root_digest: state_root.clone(),
+            state_manifest: state,
+            git_bundle_locator: dummy_loc,
+            chunk_locators: BTreeMap::new(),
+            node_locators: BTreeMap::new(),
+        };
+        let node_bytes = serde_json::to_vec(&root_node).unwrap();
+        let gb_bytes = br#"{"object_format":"sha1","files":[]}"#;
+        let arts = vec![
+            BackupArtifactEntry {
+                kind: "chunk".into(),
+                key_digest: c_sha.clone(),
+                sha256: c_sha,
+                length: payload.len() as u64,
+                payload_base64: STANDARD.encode(payload),
+            },
+            BackupArtifactEntry {
+                kind: "node".into(),
+                key_digest: root_node.node_sha256.clone(),
+                sha256: hex::encode(Sha256::digest(&node_bytes)),
+                length: node_bytes.len() as u64,
+                payload_base64: STANDARD.encode(&node_bytes),
+            },
+            BackupArtifactEntry {
+                kind: "git_bundle".into(),
+                key_digest: zero_sha,
+                sha256: hex::encode(Sha256::digest(gb_bytes)),
+                length: gb_bytes.len() as u64,
+                payload_base64: STANDARD.encode(gb_bytes),
+            },
+        ];
+        let mut bundle = MerkleBackupBundle {
+            schema: MERKLE_MANIFEST_SCHEMA,
+            codec_version: MERKLE_CODEC_VERSION.into(),
+            backup_id: Uuid::new_v4(),
+            source_checkpoint_id: cp,
+            tenant_id: t,
+            repo_id: r,
+            history_id: h,
+            source_backend_identity_hex: "b".into(),
+            merkle_root_digest: state_root,
+            manifest_bytes_base64: String::new(),
+            artifacts: arts,
+            bundle_sha256: String::new(),
+        };
+        bundle.bundle_sha256 = compute_bundle_digest(&bundle)?;
+        assert!(validate_backup_bundle_and_artifacts(&ctx, &bundle, &remote).is_ok());
+
+        let mut bad_remote = remote.clone();
+        bad_remote.checkpoint_id = Uuid::new_v4();
+        assert!(validate_backup_bundle_and_artifacts(&ctx, &bundle, &bad_remote).is_err());
+
+        let mut bad_key = bundle.clone();
+        bad_key.artifacts[0].key_digest = "f".repeat(64);
+        assert!(validate_backup_bundle_and_artifacts(&ctx, &bad_key, &remote).is_err());
+
+        let mut miss_git = bundle.clone();
+        miss_git.artifacts.pop();
+        assert!(validate_backup_bundle_and_artifacts(&ctx, &miss_git, &remote).is_err());
+
+        let mut miss_chunk = bundle;
+        miss_chunk.artifacts.remove(0);
+        assert!(validate_backup_bundle_and_artifacts(&ctx, &miss_chunk, &remote).is_err());
+        Ok(())
+    }
+}
