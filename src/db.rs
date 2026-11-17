@@ -201,6 +201,9 @@ pub async fn prepare_runtime_schema(pool: &Pool) -> Result<()> {
     }
 }
 
+#[cfg(test)]
+static MIGRATION_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;
     migrate_client(&mut client).await
@@ -210,6 +213,11 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
 /// session-level backup lock. The caller still owns transaction boundaries and
 /// must verify the resulting schema before exposing the database.
 pub(crate) async fn migrate_client(client: &mut tokio_postgres::Client) -> Result<()> {
+    // Unit tests use independent schemas, but the advisory lock below is database-global.
+    // Serialize the whole migration transaction in-process so parallel fixtures do not
+    // queue on that SQL lock past lock_timeout. The guard lives until this function returns.
+    #[cfg(test)]
+    let _migration_gate = MIGRATION_GATE.lock().await;
     let tx = client.transaction().await?;
     tx.execute("SELECT pg_advisory_xact_lock(738390103)", &[]).await?;
     // A restored schema already contains migration 001's tables and ledger in
