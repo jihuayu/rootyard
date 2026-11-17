@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(other, "ROOTYARD_I107_HISTORICAL_GIT_V1|17|9|6|||0\n");
         let widest = HistoricalGitError::exited(i32::MAX, 4).frame_line();
         assert!(widest.len() <= MAX_LINE_BYTES);
-        for line in [exited, signaled, timeout, spawn, wait, other, widest] {
+        for line in [&exited, &signaled, &timeout, &spawn, &wait, &other, &widest] {
             let parts: Vec<&str> = line.trim_end_matches('\n').split('|').collect();
             assert_eq!(parts.len(), 7);
             assert_eq!(parts[0], PREFIX);
