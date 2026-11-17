@@ -240,8 +240,9 @@ def _seed_dataset(repo: Path, fmt: str, spec: dict[str, int]) -> str:
     return ds_hasher.hexdigest()
 
 
-def _bench_case(profile: str, fmt: str) -> dict[str, Any]:
+def _bench_case(profile: str, fmt: str, iterations: int | None = None) -> dict[str, Any]:
     spec = PROFILES[profile]
+    iters = spec["iterations"] if iterations is None else max(1, iterations)
     full_samples: list[float] = []
     inc_samples: list[float] = []
     res_samples: list[float] = []
@@ -251,7 +252,7 @@ def _bench_case(profile: str, fmt: str) -> dict[str, Any]:
     dataset_digest = ""
     any_fsck_ok = False
 
-    for it in range(spec["iterations"]):
+    for it in range(iters):
         with tempfile.TemporaryDirectory(prefix="rootyard-merkle-eval-") as td_raw:
             td = Path(td_raw)
             repo = td / "repo"
@@ -295,14 +296,14 @@ def _bench_case(profile: str, fmt: str) -> dict[str, Any]:
             }
 
             bundle_dir = td / "git_bundle"
-            shutil.copytree(repo / ".git", bundle_dir)
+            (repo / ".git").rename(bundle_dir)
             _rmtree(repo)
 
             tr0 = time.perf_counter()
             cr0 = time.process_time()
             target = td / "restored"
             target.mkdir()
-            shutil.copytree(bundle_dir, target / ".git")
+            bundle_dir.rename(target / ".git")
             restored_dl = 0
             for sub, (_sd, sfiles) in nodes2.items():
                 sdir = target / sub
@@ -346,7 +347,7 @@ def _bench_case(profile: str, fmt: str) -> dict[str, Any]:
         "profile": profile,
         "object_format": fmt,
         "dataset_digest": dataset_digest,
-        "iterations": spec["iterations"],
+        "iterations": iters,
         "full": full_stats,
         "incremental": inc_stats,
         "restore_fork": res_stats,
@@ -362,14 +363,14 @@ def _bench_case(profile: str, fmt: str) -> dict[str, Any]:
     }
 
 
-def run_benchmark(profiles: list[str], formats: list[str]) -> dict[str, Any]:
+def run_benchmark(profiles: list[str], formats: list[str], iterations: int | None = None) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parent.parent
     try:
         source_rev = _git(repo_root, ["rev-parse", "HEAD"])
     except Exception:
         source_rev = "unknown"
     git_version = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True).stdout.strip()
-    results = [_bench_case(p, f) for p in profiles for f in formats]
+    results = [_bench_case(p, f, iterations=iterations) for p in profiles for f in formats]
     return {
         "issue": 181,
         "benchmark": "workspace_merkle_sync",

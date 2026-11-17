@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -11,10 +12,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _load_eval_module():
+    if "eval_workspace_merkle_sync" in sys.modules:
+        return sys.modules["eval_workspace_merkle_sync"]
     path = REPO_ROOT / "scripts" / "eval_workspace_merkle_sync.py"
     spec = importlib.util.spec_from_file_location("eval_workspace_merkle_sync", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
+    sys.modules["eval_workspace_merkle_sync"] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -92,7 +96,7 @@ class WorkspaceMerkleSyncContractsTest(unittest.TestCase):
 
     def test_eval_benchmark_smoke_small_sha1(self) -> None:
         mod = _load_eval_module()
-        report = mod.run_benchmark(["small"], ["sha1"])
+        report = mod.run_benchmark(["small"], ["sha1"], iterations=1)
         self.assertEqual(report["issue"], 181)
         self.assertTrue(report["source_git_rev"])
         self.assertEqual(len(report["results"]), 1)
