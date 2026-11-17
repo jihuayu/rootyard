@@ -10,7 +10,7 @@ use uuid::Uuid;
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_snapshot_fault_rolls_back_without_token_and_releases_lock() {
-    let _lock = test_lock();
+    let _lock = test_lock().await;
     let _hooks = HookGuard::new();
     let (config, root) = config_for("snapshot-rollback");
     let repo = Uuid::new_v4();
@@ -47,7 +47,7 @@ async fn pg_snapshot_fault_rolls_back_without_token_and_releases_lock() {
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_snapshot_retention_uses_live_expiry_not_expired_rows() {
-    let _lock = test_lock();
+    let _lock = test_lock().await;
     let _hooks = HookGuard::new();
     let (config, root) = config_for("snapshot-expiry");
     let repo = Uuid::new_v4();
@@ -76,7 +76,7 @@ async fn pg_snapshot_retention_uses_live_expiry_not_expired_rows() {
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_ordinary_snapshot_still_does_not_retain() {
-    let _lock = test_lock();
+    let _lock = test_lock().await;
     let _hooks = HookGuard::new();
     let (config, root) = config_for("ordinary-snapshot");
     let repo = Uuid::new_v4();

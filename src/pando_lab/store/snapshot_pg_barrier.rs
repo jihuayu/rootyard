@@ -11,12 +11,13 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
 static BARRIER: Mutex<Option<BarrierSpec>> = Mutex::new(None);
 static FAULT: Mutex<Option<FaultSpec>> = Mutex::new(None);
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+static TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 #[derive(Clone)]
 struct BarrierSpec {
@@ -210,8 +211,8 @@ pub(super) async fn wait_for_actor_lock_wait(
     panic!("did not observe the exact actor application_name waiting for {expected_phase}");
 }
 
-pub(super) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+pub(super) async fn test_lock() -> AsyncMutexGuard<'static, ()> {
+    TEST_LOCK.lock().await
 }
 
 pub(super) struct HookGuard;

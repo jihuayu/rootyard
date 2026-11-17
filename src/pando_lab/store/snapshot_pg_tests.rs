@@ -10,7 +10,7 @@ use uuid::Uuid;
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_snapshot_wins_retains_old_pack_before_insert() {
-    let _lock = test_lock();
+    let _lock = test_lock().await;
     let _hooks = HookGuard::new();
     let (config, root) = config_for("snapshot-wins");
     let repo = Uuid::new_v4();
@@ -69,7 +69,7 @@ async fn pg_snapshot_wins_retains_old_pack_before_insert() {
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_repack_wins_snapshot_selects_replacement_after_commit() {
-    let _lock = test_lock();
+    let _lock = test_lock().await;
     let _hooks = HookGuard::new();
     let (config, root) = config_for("repack-wins");
     let repo = Uuid::new_v4();
