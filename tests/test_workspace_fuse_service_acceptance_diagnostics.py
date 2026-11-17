@@ -130,6 +130,107 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
         self.assertIsNone(_child_exit(
             subprocess.CalledProcessError(10 ** 6, ["secret-argv"])))
 
+    def test_api_exit_fallback_is_bounded_and_original_error_wins(self):
+        test = _case(REQUIRED_CASES[2])
+        for value, expected in (
+                (0, 0), (1, 1), (-11, -11),
+                (-255, -255), (255, 255),
+                (-256, None), (256, None), (10 ** 6, None),
+                (True, None), (False, None),
+                ("1", None), (1.0, None), (None, None)):
+            with self.subTest(api_exit=value):
+                test._rootyard_diagnostic_api_exit = value
+                record = _diagnostic_record(
+                    test, AssertionError("synthetic"), None)
+                self.assertEqual(record["child_exit"], expected)
+
+        no_attribute = _case(REQUIRED_CASES[2])
+        self.assertIsNone(_diagnostic_record(
+            no_attribute, AssertionError("synthetic"), None)["child_exit"])
+
+        # The original CalledProcessError code remains authoritative.
+        test._rootyard_diagnostic_api_exit = 7
+        original = subprocess.CalledProcessError(
+            3, ["secret-argv"], output=b"secret")
+        self.assertEqual(_diagnostic_record(
+            test, original, None)["child_exit"], 3)
+
+        # An absent or invalid original code falls back to the test value.
+        invalid = subprocess.CalledProcessError(True, ["secret-argv"])
+        self.assertEqual(_diagnostic_record(
+            test, invalid, None)["child_exit"], 7)
+        self.assertEqual(_diagnostic_record(
+            test, AssertionError("synthetic"), None)["child_exit"], 7)
+
+    def test_api_exit_poison_value_or_payload_is_never_serialized(self):
+        class _Poison:
+            def __init__(self):
+                self.calls = 0
+
+            def __str__(self):
+                self.calls += 1
+                return SECRET
+
+            def __repr__(self):
+                self.calls += 1
+                return SECRET
+
+            def __int__(self):
+                self.calls += 1
+                return 5
+
+            def __index__(self):
+                self.calls += 1
+                return 5
+
+        poison = _Poison()
+        test = _case(REQUIRED_CASES[2])
+        test._rootyard_diagnostic_primary_phase = "joins"
+        test._rootyard_diagnostic_api_exit = poison
+        record = _diagnostic_record(test, _HiddenError(), None)
+
+        self.assertEqual(poison.calls, 0)
+        self.assertIsNone(record["child_exit"])
+        self.assertNotIn(SECRET, json.dumps(record))
+
+        test._rootyard_diagnostic_api_exit = {"payload": poison}
+        payload_record = _diagnostic_record(test, _HiddenError(), None)
+        self.assertEqual(poison.calls, 0)
+        self.assertIsNone(payload_record["child_exit"])
+        self.assertNotIn(SECRET, json.dumps(payload_record))
+
+    def test_api_exit_fallback_keeps_other_fields_and_pass_state(self):
+        error = AssertionError("synthetic")
+        tb = _traceback_at(
+            str(ROOT / "tests/test_workspace_fuse_service.py"),
+            "raise ValueError('synthetic')\n",
+        )
+        test = _case(REQUIRED_CASES[2])
+        test._rootyard_diagnostic_primary_phase = "joins"
+        test._rootyard_diagnostic_api_exit = 1
+        record = _diagnostic_record(test, error, tb)
+
+        self.assertEqual(record, {
+            "phase": "joins",
+            "exception": "AssertionError",
+            "source": {"path": "tests/test_workspace_fuse_service.py", "line": 1},
+            "http_status": None,
+            "errno": None,
+            "child_exit": 1,
+        })
+        self.assertEqual(set(record), set(_unknown_diagnostic()))
+
+        report = _report_payload(
+            scheduled=REQUIRED_CASES,
+            result=_ResultShape(
+                errors=[(test, "raw error detail " + SECRET)]),
+            imported=True,
+            diagnostics={REQUIRED_CASES[2]: record})
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["counts"]["error"], 1)
+        self.assertEqual(report["counts"]["success"], 3)
+        self.assertNotIn(SECRET, json.dumps(report))
+
     def test_source_location_allows_only_known_paths_and_valid_lines(self):
         allowed = _source_location(_traceback_at(
             str(ROOT / "tests/test_workspace_fuse_service.py"),
