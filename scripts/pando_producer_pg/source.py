@@ -25,7 +25,10 @@ import native_build_receipt as receipts  # noqa: E402
 from .errors import RunnerError, require  # noqa: E402
 
 SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SCHEMA_REL = "experimental/pando/schema.sql"
+SOURCE_CAPTURE_CHILD_REL = "scripts/pando_producer_pg/source_capture_child.py"
+SOURCE_CAPTURE_ADAPTER_REL = "scripts/pando_producer_pg/source_capture.py"
 
 # The merged Rust target's producer/snapshot sources plus the approved fixture
 # ownership helpers and this runner.  Missing entries fail closed.
@@ -50,6 +53,8 @@ EXPLICIT_INPUTS = (
     "tests/pando_vault_rotation_fixture_resources.py",
     "tests/pando_vault_rotation_fixture.py",
     "scripts/run_pando_producer_pg.py",
+    SOURCE_CAPTURE_ADAPTER_REL,
+    SOURCE_CAPTURE_CHILD_REL,
     "tests/test_pando_producer_pg_runner.py",
 )
 SUPPORT_GLOBS = ("scripts/pando_producer_pg/*.py",)

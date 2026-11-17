@@ -26,7 +26,14 @@ for entry in (str(SCRIPTS), str(ROOT / "tests")):
     if entry not in sys.path:
         sys.path.insert(0, entry)
 
-from pando_producer_pg import artifacts, cases, report, resources, source  # noqa: E402
+from pando_producer_pg import (  # noqa: E402
+    artifacts,
+    cases,
+    report,
+    resources,
+    source,
+    source_capture,
+)
 from pando_producer_pg.errors import RunnerError, require  # noqa: E402
 from pando_producer_pg.process import ProcessRunner  # noqa: E402
 
@@ -171,7 +178,7 @@ def run(
     environ=None,
 ):
     runner = runner or ProcessRunner(clock=clock)
-    capture_source = capture_source or source.capture
+    capture_source = capture_source or source_capture.capture_bounded
     select_binary = select_binary or artifacts.select_test_binary
     fixture_factory = fixture_factory or resources.OwnedFixture
     execute_cases_fn = execute_cases_fn or cases.execute_cases
@@ -210,6 +217,7 @@ def run(
             environ=environ,
             deadline=work,
             clock=clock,
+            process_runner=runner,
         )
         product = validate_product(
             config.product_receipt,
@@ -264,6 +272,7 @@ def run(
                     environ=environ,
                     deadline=work,
                     clock=clock,
+                    process_runner=runner,
                 )
             except RunnerError as caught:
                 binding["source_rechecked"] = False

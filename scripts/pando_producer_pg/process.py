@@ -8,6 +8,8 @@ retained in an exception or printed by this module.
 from __future__ import annotations
 
 import math
+import os
+import signal
 import subprocess
 import time
 
@@ -94,10 +96,21 @@ class ProcessRunner:
         return Completed(argv, process.returncode, stdout or b"", stderr or b"")
 
     def _terminate(self, process):
-        try:
-            process.kill()
-        except (OSError, ValueError):
-            pass
+        # The child is started in its own session, so killing the group also
+        # terminates any helper Git/psql descendants instead of detaching them.
+        pid = getattr(process, "pid", None)
+        killed_group = False
+        if isinstance(pid, int) and pid > 0 and pid != os.getpid():
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                killed_group = True
+            except (OSError, ValueError):
+                killed_group = False
+        if not killed_group:
+            try:
+                process.kill()
+            except (OSError, ValueError):
+                pass
         try:
             process.wait(timeout=KILL_WAIT_SECONDS)
         except (subprocess.TimeoutExpired, OSError):

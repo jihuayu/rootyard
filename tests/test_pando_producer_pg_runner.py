@@ -250,8 +250,11 @@ class SourceBindingTest(unittest.TestCase):
         )
         paths = {row["path"] for row in binding["input_hashes"]}
         self.assertIn("src/pando_lab/migration/pg_tests.rs", paths)
+        self.assertIn(source.SOURCE_CAPTURE_CHILD_REL, paths)
+        self.assertIn(source.SOURCE_CAPTURE_ADAPTER_REL, paths)
         runner_paths = {row["path"] for row in binding["runner_source_hashes"]}
         self.assertIn("scripts/run_pando_producer_pg.py", runner_paths)
+        self.assertIn(source.SOURCE_CAPTURE_CHILD_REL, runner_paths)
         self.assertTrue(any(row.startswith("tests/test_pando_producer_pg") for row in runner_paths))
 
     def test_commit_tree_clean_mismatches_fail(self):
