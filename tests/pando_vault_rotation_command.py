@@ -67,6 +67,7 @@ class BoundedCommandRunner:
             getattr(budget, "clock", None) if budget is not None else None
         ) or time.monotonic
         self._runner = process_runner or _ApprovedProcessRunner(clock=self.clock)
+        self.unresolved_children = False
 
     def run(
         self,
@@ -97,7 +98,12 @@ class BoundedCommandRunner:
                 fail_on_output_exceeded=True,
             )
         except RunnerError as error:
-            raise CommandError(_mapped_code(error.code), stage) from None
+            code = _mapped_code(error.code)
+            if code in ("subprocess_unreaped", "subprocess_group_unverified"):
+                # A retained live writer/group means the private root cannot be
+                # declared removed by cleanup.
+                self.unresolved_children = True
+            raise CommandError(code, stage) from None
         if self.budget is not None:
             # Popen, pipe readers and the final join are non-preemptible
             # boundaries.  The entire call is charged and a late return fails.

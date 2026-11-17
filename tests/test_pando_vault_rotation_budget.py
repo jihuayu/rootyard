@@ -236,6 +236,33 @@ class BoundedCommandTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "work_deadline_exceeded")
         self.assertEqual(process.calls, [])
 
+    def test_unresolved_child_flag_is_set_only_for_unreaped_groups(self):
+        clock = FakeClock()
+        budget = Budget(100, 20, clock=clock, error_factory=CommandError)
+        for internal, expected_flag in (
+            ("process_unreaped", True),
+            ("process_group_unverified", True),
+            ("process_timeout", False),
+            ("process_output_exceeded", False),
+        ):
+            with self.subTest(internal=internal):
+                clock = FakeClock()
+                budget = Budget(
+                    100, 20, clock=clock, error_factory=CommandError)
+                command, _process = self._runner(
+                    clock, [RunnerError("execute", internal)], budget)
+                with self.assertRaises(CommandError):
+                    command.run(["git", "push"], timeout=90, stage="git")
+                self.assertEqual(
+                    command.unresolved_children, expected_flag)
+
+    def test_successful_reaped_command_leaves_no_unresolved_child(self):
+        clock = FakeClock()
+        budget = Budget(100, 20, clock=clock, error_factory=CommandError)
+        command, _process = self._runner(clock, [Result()], budget)
+        command.run(["git", "fsck"], timeout=90, stage="git")
+        self.assertFalse(command.unresolved_children)
+
 
 if __name__ == "__main__":
     unittest.main()

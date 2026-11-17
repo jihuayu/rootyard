@@ -319,7 +319,11 @@ def case_owned_resource_cleanup(ctx):
     root_owned = bool(ctx.root is not None and ctx.root.created)
     root_removed = True
     root_absent = True
-    safe_to_remove_root = server_stopped and vault_stopped and postgres_dropped
+    live_writer_unresolved = bool(getattr(
+        getattr(ctx, "runner", None), "unresolved_children", False))
+    safe_to_remove_root = bool(
+        server_stopped and vault_stopped and postgres_dropped
+        and not live_writer_unresolved)
     if root_owned and safe_to_remove_root:
         try:
             if budget is not None:

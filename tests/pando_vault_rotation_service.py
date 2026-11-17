@@ -156,6 +156,13 @@ class Server:
         if self.budget is not None:
             self.budget.late_overall(stage)
 
+    def _stop_quietly(self):
+        """Best-effort stop that never replaces the start failure."""
+        try:
+            self.stop()
+        except Exception:
+            pass
+
     def start(self, timeout=45):
         require(self.process is None, "server_already_started", "server")
         effective = self._clamp(timeout, "server")
@@ -179,18 +186,18 @@ class Server:
         try:
             self._late("server")
         except Exception:
-            self.stop()
+            self._stop_quietly()
             raise
         stream = getattr(process, "stdout", None)
         if stream is None:
-            self.stop()
+            self._stop_quietly()
             raise QualificationError("server_start_failed", "server")
         deadline = self._now() + effective
         if self.budget is not None:
             deadline = min(deadline, self.budget.deadline)
         while self._now() < deadline:
             if process.poll() is not None:
-                self.stop()
+                self._stop_quietly()
                 raise QualificationError("server_exited", "server")
             wait = min(0.2, max(0.0, deadline - self._now()))
             ready, _, _ = select.select([stream], [], [], wait)
@@ -199,17 +206,17 @@ class Server:
             line = stream.readline(self.MAX_LINE)
             if not line:
                 if process.poll() is not None:
-                    self.stop()
+                    self._stop_quietly()
                     raise QualificationError("server_exited", "server")
                 continue
             if len(line) >= self.MAX_LINE and not line.endswith("\n"):
-                self.stop()
+                self._stop_quietly()
                 raise QualificationError("server_announcement_invalid", "server")
             if not line.startswith("LISTEN "):
                 try:
                     self._late("server")
                 except Exception:
-                    self.stop()
+                    self._stop_quietly()
                     raise
                 continue
             value = line.split(" ", 1)[1].strip()
@@ -217,20 +224,20 @@ class Server:
                 parsed = urllib.parse.urlsplit(value)
                 port = parsed.port
             except ValueError:
-                self.stop()
+                self._stop_quietly()
                 raise QualificationError("server_announcement_invalid", "server") from None
             if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
                     or not port or parsed.path not in ("", "/")):
-                self.stop()
+                self._stop_quietly()
                 raise QualificationError("server_announcement_invalid", "server")
             try:
                 self._late("server")
             except Exception:
-                self.stop()
+                self._stop_quietly()
                 raise
             self.base = "http://127.0.0.1:" + str(port)
             return self.base
-        self.stop()
+        self._stop_quietly()
         raise QualificationError("server_start_timeout", "server")
 
     def _signal(self, process, sig):
@@ -273,10 +280,15 @@ class Server:
     def stop(self, timeout=15):
         if self.process is None:
             return True
+        process = self.process
+        if process.poll() is not None:
+            self._close(process)
+            self.process = None
+            self.owned_group = False
+            return True
         # Stop is only reached from an owned failure or cleanup; it uses the
         # whole absolute deadline, never a fresh per-operation budget.
         self._late_overall("cleanup")
-        process = self.process
         deadline = self._now() + timeout
         if self.budget is not None:
             deadline = min(deadline, self.budget.overall_deadline)

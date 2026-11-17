@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -24,6 +26,7 @@ for entry in (str(TESTS), str(SCRIPTS)):
 import pando_vault_rotation as main  # noqa: E402
 import pando_vault_rotation_fixture_resources as resources  # noqa: E402
 import pando_vault_rotation_fixture_vault as vault_fixture  # noqa: E402
+import pando_vault_rotation_service as service  # noqa: E402
 from pando_vault_rotation_budget import Budget  # noqa: E402
 from pando_vault_rotation_support import (  # noqa: E402
     CASES,
@@ -388,6 +391,222 @@ class UnknownPostgresOutcomeTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "pg_create_outcome_unknown")
         self.assertFalse(any(sql.startswith("DROP DATABASE")
                              for sql in runner.sql))
+
+
+class RetainedWriterCleanupTest(unittest.TestCase):
+    def test_unreaped_owned_child_blocks_root_removal(self):
+        import pando_vault_rotation_negative as negative
+
+        class Root:
+            created = True
+            path = Path("/never-read-root")
+
+            def remove(self):
+                raise AssertionError("root must not be removed with a live child")
+
+        class Runner:
+            unresolved_children = True
+
+        class Server:
+            process = None
+
+            def stop(self):
+                return True
+
+        class Fixture:
+            container_id = "a" * 64
+            state_written = True
+            state_path = Path("/never-read-state")
+            version = "2.2.2"
+
+            def stop(self):
+                return "stopped"
+
+        class Postgres:
+            prechecked_absent = True
+            created = True
+            dropped = False
+            major = 17
+
+            def drop(self):
+                self.dropped = True
+                return True
+
+        ctx = SimpleNamespace(
+            server=Server(), fixture=Fixture(), postgres=Postgres(),
+            root=Root(), runner=Runner(),
+            repo="11111111-1111-4111-8111-111111111111")
+        result = negative.case_owned_resource_cleanup(ctx)
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["facts"]["root_removed"])
+        self.assertFalse(result["facts"]["root_absent"])
+        self.assertFalse(result["facts"]["cleanup_ok"])
+
+
+class FakeStream:
+    def __init__(self, lines=()):
+        self.lines = list(lines)
+        self.closed = False
+
+    def readline(self, _limit):
+        return self.lines.pop(0) if self.lines else ""
+
+    def close(self):
+        self.closed = True
+
+
+class FakeProcess:
+    """A fake Popen handle; no OS process or thread is created."""
+
+    def __init__(self, pid=4321, lines=(), returncode=None):
+        self.pid = pid
+        self.stdout = FakeStream(lines)
+        self.returncode = returncode
+        self.waits = []
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(["lab"], timeout)
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+
+    def kill(self):
+        self.returncode = -9
+
+
+class FakePopen:
+    def __init__(self, process):
+        self.process = process
+        self.kwargs = None
+        self.argv = None
+
+    def __call__(self, argv, **kwargs):
+        self.argv = list(argv)
+        self.kwargs = dict(kwargs)
+        return self.process
+
+
+class FakeKillpg:
+    def __init__(self, process, exit_on=()):
+        self.process = process
+        self.exit_on = set(exit_on)
+        self.calls = []
+
+    def __call__(self, pgid, sig):
+        self.calls.append((pgid, sig))
+        if sig in self.exit_on:
+            self.process.returncode = 0 if sig == signal.SIGTERM else -9
+
+
+class ServerProcessBoundaryTest(unittest.TestCase):
+    def test_start_owns_group_and_returns_bounded_loopback_announcement(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess(
+            lines=["LISTEN http://127.0.0.1:9000\n"])
+        popen = FakePopen(process)
+        with mock.patch.object(
+                service.select, "select",
+                return_value=([process.stdout], [], [])):
+            server = service.Server(
+                "/bin/lab", {}, budget=budget, clock=clock,
+                popen=popen, killpg=FakeKillpg(process))
+            self.assertEqual(server.start(), "http://127.0.0.1:9000")
+        self.assertTrue(popen.kwargs["start_new_session"])
+        self.assertEqual(popen.argv, ["/bin/lab", "serve"])
+
+    def test_stop_signals_kills_reaps_and_closes_the_exact_group(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess()
+        killpg = FakeKillpg(process, exit_on=(signal.SIGTERM,))
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=killpg)
+        server.process = process
+        server.owned_group = True
+        self.assertTrue(server.stop())
+        self.assertEqual(killpg.calls, [(process.pid, signal.SIGTERM)])
+        self.assertTrue(process.stdout.closed)
+        self.assertIsNone(server.process)
+        self.assertFalse(server.owned_group)
+
+    def test_stop_without_exit_escalates_to_sigkill_before_success(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess()
+        killpg = FakeKillpg(process, exit_on=(signal.SIGKILL,))
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=killpg)
+        server.process = process
+        server.owned_group = True
+        self.assertTrue(server.stop())
+        self.assertEqual(
+            [sig for _pid, sig in killpg.calls],
+            [signal.SIGTERM, signal.SIGKILL])
+        self.assertTrue(process.stdout.closed)
+
+    def test_stop_after_overall_deadline_does_not_start_a_kill(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess()
+        killpg = FakeKillpg(process)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=killpg)
+        server.process = process
+        server.owned_group = True
+        clock.advance(100)
+        with self.assertRaises(QualificationError) as caught:
+            server.stop()
+        self.assertEqual(caught.exception.code, "overall_deadline_exceeded")
+        self.assertEqual(killpg.calls, [])
+        self.assertIs(server.process, process)
+
+    def test_already_exited_server_is_reaped_and_closed_without_signal(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess(returncode=0)
+        killpg = FakeKillpg(process)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=killpg)
+        server.process = process
+        server.owned_group = True
+        self.assertTrue(server.stop())
+        self.assertEqual(killpg.calls, [])
+        self.assertTrue(process.stdout.closed)
+        self.assertIsNone(server.process)
+
+    def test_oversized_announcement_fails_without_losing_primary(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess(lines=["x" * service.Server.MAX_LINE])
+        killpg = FakeKillpg(process, exit_on=(signal.SIGTERM,))
+        with mock.patch.object(
+                service.select, "select",
+                return_value=([process.stdout], [], [])):
+            server = service.Server(
+                "/bin/lab", {}, budget=budget, clock=clock,
+                popen=FakePopen(process), killpg=killpg)
+            with self.assertRaises(QualificationError) as caught:
+                server.start()
+        self.assertEqual(caught.exception.code, "server_announcement_invalid")
+        self.assertEqual(killpg.calls, [(process.pid, signal.SIGTERM)])
+        self.assertTrue(process.stdout.closed)
 
 
 if __name__ == "__main__":

@@ -116,6 +116,10 @@ class Runner:
             budget=budget, clock=clock if clock is not None
             else getattr(budget, "clock", None))
 
+    @property
+    def unresolved_children(self):
+        return bool(getattr(self._commands, "unresolved_children", False))
+
     def run(self, argv, env=None, input=None, timeout=None, stage="subprocess", cwd=None):
         requested = self.timeout if timeout is None else timeout
         try:
