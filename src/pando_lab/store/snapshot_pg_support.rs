@@ -155,7 +155,7 @@ pub(super) async fn seed_single_pack(config: &Config, admin: &Client, repo: Uuid
     let work = config.root.join("work");
     init_work(config, &work).await;
     let commit = commit_file(config, &work, "a.txt", "one\n", "c1").await;
-    let pack = publish(config, admin, repo, &work, &[commit.clone()]).await;
+    let pack = publish(config, admin, repo, &work, std::slice::from_ref(&commit)).await;
     set_ref(admin, repo, "refs/heads/main", &commit).await;
     (pack, commit)
 }
@@ -164,7 +164,7 @@ pub(super) async fn seed_two_packs(config: &Config, admin: &Client, repo: Uuid) 
     let work = config.root.join("work");
     init_work(config, &work).await;
     let first = commit_file(config, &work, "a.txt", "one\n", "c1").await;
-    let live = publish(config, admin, repo, &work, &[first.clone()]).await;
+    let live = publish(config, admin, repo, &work, std::slice::from_ref(&first)).await;
     set_ref(admin, repo, "refs/heads/main", &first).await;
     config.git(&work, &["checkout", "-b", "expired", &first], b"").await.unwrap();
     let second = commit_file(config, &work, "b.txt", "two\n", "c2").await;
