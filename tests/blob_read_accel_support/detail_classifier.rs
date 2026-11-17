@@ -49,6 +49,9 @@ fn classify_generated_detail(detail: &str) -> &'static str {
     if let Some(rest) = detail.strip_prefix("blob staging lease of ") {
         return staging_budget_class(rest);
     }
+    if let Some(detail) = detail.strip_prefix("blob provider error: ") {
+        return provider_detail_class(detail).label();
+    }
     "unknown"
 }
 
@@ -422,6 +425,22 @@ pub(super) fn assert_detail_classifier_contract() {
         "",
     ] {
         assert_eq!(provider_detail_class(detail).label(), "unknown");
+    }
+
+    for (detail, expected) in [
+        ("blob provider error: blob upload task failed", "upload-task"),
+        ("blob provider error: local blob source read failed", "source-read"),
+        ("blob provider error: blob resource context was closed", "resource-context-closed"),
+    ] {
+        assert_eq!(detail_class(detail), expected);
+    }
+
+    for detail in [
+        "blob provider error: blob upload task failed trailing",
+        "blob provider error: local blob source read failed: /tmp/secret",
+        "blob provider error: https://provider.example/path",
+    ] {
+        assert_eq!(detail_class(detail), "unknown");
     }
 }
 
