@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import ast
 import re
+import shlex
+import textwrap
 import unittest
 import warnings
 from pathlib import Path
@@ -305,6 +307,7 @@ CACHE_KEY = (
 # the shared setup, so no job can compile with whatever `cargo` was on PATH.
 FIRST_CARGO = {
     "ci.yml": "cargo fmt --all",
+    "ci-clonekit.yml": "cargo fmt --all",
     "refstore-protocol-acceptance.yml": "cargo test --locked --features pando-lab",
     "redis-contract.yml": "cargo clippy --locked --all-targets --features state-redis",
     "pando-lab.yml": "cargo fmt --all",
@@ -746,6 +749,199 @@ class CargoForkWorkflowTest(unittest.TestCase):
                     path.name + " must consume an immutable prepared binary, "
                     "never invoke cargo/rustc/rustup",
                 )
+
+
+class CloneKitToolSetupContractTest(unittest.TestCase):
+    """Narrow static contract for the CloneKit workflow's CargoFork setup.
+
+    The test reads the workflow and the real installer parser only.  It never
+    executes the installer, Cargo, rustup, a compiler, a container or a network
+    request.
+    """
+
+    WORKFLOW = "ci-clonekit.yml"
+    CACHE_STEP = "Cache CargoFork toolchain binary"
+    INSTALL_STEP = "Install pinned CargoFork 1.101.0 (full 64a6ee6a)"
+    VERIFY_STEP = "Verify CargoFork 64a6ee6a before Cargo"
+    UPLOAD_STEP = "Upload CI CloneKit evidence"
+
+    def workflow(self) -> str:
+        return (WORKFLOWS / self.WORKFLOW).read_text(encoding="utf-8")
+
+    @staticmethod
+    def steps(text: str) -> dict[str, str]:
+        marker = "\n      - name: "
+        steps: dict[str, str] = {}
+        for part in text.split(marker)[1:]:
+            name, _, body = part.partition("\n")
+            steps[name.strip()] = body
+        return steps
+
+    @staticmethod
+    def run_script(body: str) -> str:
+        lines = body.splitlines()
+        for index, line in enumerate(lines):
+            if line.strip() != "run: |":
+                continue
+            indent = len(line) - len(line.lstrip())
+            block: list[str] = []
+            for follow in lines[index + 1:]:
+                if follow.strip() and (len(follow) - len(follow.lstrip())) <= indent:
+                    break
+                block.append(follow)
+            return textwrap.dedent("\n".join(block))
+        raise AssertionError("step has no run block")
+
+    @staticmethod
+    def with_value(body: str, key: str) -> str:
+        pattern = re.compile(r"^\s{10}" + re.escape(key) + r":\s*(\S.*?)\s*$")
+        for line in body.splitlines():
+            match = pattern.match(line)
+            if match:
+                return match.group(1)
+        raise AssertionError(f"step has no with.{key}")
+
+    @staticmethod
+    def parser_flags() -> set[str]:
+        text = (ROOT / "scripts" / "install_ci_cargo_fork.sh").read_text(encoding="utf-8")
+        match = re.search(r"while \[ \$# -gt 0 \]; do\n(.*?)\ndone", text, re.S)
+        if match is None:
+            raise AssertionError("installer argument parser was not found")
+        return set(re.findall(r"--[a-z][a-z-]*", match.group(1)))
+
+    @staticmethod
+    def invocations(script: str) -> list[tuple[str, dict[str, object], list[str]]]:
+        # Join shell line continuations before shlex tokenisation.
+        script = script.replace("\\\n", " ")
+        found: list[tuple[str, dict[str, object], list[str]]] = []
+        for line in script.splitlines():
+            try:
+                argv = shlex.split(line)
+            except ValueError:
+                continue
+            if not argv or Path(argv[0]).name != "install_ci_cargo_fork.sh":
+                continue
+            if len(argv) < 2:
+                continue
+            mode = argv[1]
+            flags: dict[str, object] = {}
+            index = 2
+            while index < len(argv):
+                token = argv[index]
+                if token.startswith("--"):
+                    if token == "--require-path":
+                        flags[token] = True
+                        index += 1
+                    else:
+                        flags[token] = argv[index + 1] if index + 1 < len(argv) else None
+                        index += 2
+                else:
+                    index += 1
+            found.append((mode, flags, argv))
+        return found
+
+    @staticmethod
+    def normalized_cache_root(value: str) -> str:
+        return value.replace("${{ runner.temp }}", "$RUNNER_TEMP")
+
+    def test_installer_calls_use_only_real_parser_flags(self) -> None:
+        text = self.workflow()
+        steps = self.steps(text)
+        install = self.invocations(self.run_script(steps[self.INSTALL_STEP]))
+        verify = self.invocations(self.run_script(steps[self.VERIFY_STEP]))
+        self.assertEqual(1, len(install))
+        self.assertEqual(1, len(verify))
+        self.assertEqual("install", install[0][0])
+        self.assertEqual("verify", verify[0][0])
+
+        supported = self.parser_flags()
+        for flag in ("--cache-dir", "--record", "--require-os", "--require-path"):
+            self.assertIn(flag, supported)
+        self.assertNotIn("--rustup-toolchain", supported)
+
+        for mode, flags, _argv in install + verify:
+            with self.subTest(mode=mode):
+                self.assertEqual(set(), set(flags) - supported)
+
+        # PATH only changes for the next step, so the install step must not
+        # require the selected cargo to already be on PATH.
+        self.assertNotIn("--require-path", install[0][1])
+        self.assertIn("--require-path", verify[0][1])
+
+        for mode, flags, _argv in install + verify:
+            with self.subTest(mode=mode, guard="no-weakening"):
+                self.assertNotIn("--no-github", flags)
+                self.assertNotIn("--reuse", flags)
+                self.assertNotIn("--force", flags)
+
+    def test_install_and_verify_are_separate_steps_sharing_the_cache_root(self) -> None:
+        text = self.workflow()
+        steps = self.steps(text)
+        self.assertLess(text.index(self.INSTALL_STEP), text.index(self.VERIFY_STEP))
+
+        install_script = self.run_script(steps[self.INSTALL_STEP])
+        verify_script = self.run_script(steps[self.VERIFY_STEP])
+        self.assertNotIn("--require-path", install_script)
+        self.assertIn("--require-path", verify_script)
+
+        cache_action_path = self.with_value(steps[self.CACHE_STEP], "path")
+        install_flags = self.invocations(install_script)[0][1]
+        verify_flags = self.invocations(verify_script)[0][1]
+        expected = self.normalized_cache_root(cache_action_path)
+        self.assertEqual(expected, self.normalized_cache_root(str(install_flags["--cache-dir"])))
+        self.assertEqual(expected, self.normalized_cache_root(str(verify_flags["--cache-dir"])))
+
+    def test_record_is_uploaded_and_pinned_identity_is_verified(self) -> None:
+        text = self.workflow()
+        steps = self.steps(text)
+        install_flags = self.invocations(self.run_script(steps[self.INSTALL_STEP]))[0][1]
+        verify_flags = self.invocations(self.run_script(steps[self.VERIFY_STEP]))[0][1]
+
+        record = install_flags.get("--record")
+        self.assertIsInstance(record, str)
+        upload_path = self.with_value(steps[self.UPLOAD_STEP], "path")
+        self.assertTrue(Path(str(record)).is_relative_to(Path(upload_path)))
+        self.assertIn("if: always()", steps[self.UPLOAD_STEP])
+
+        verify_script = self.run_script(steps[self.VERIFY_STEP])
+        for expected in (
+            "cargo -vV | grep -Fx 'release: 1.101.0'",
+            "cargo -vV | grep -Fx 'commit-hash: " + REVISION + "'",
+            "rustc -V | grep -Eq '^rustc 1\\.99\\.1 '",
+        ):
+            self.assertIn(expected, verify_script)
+        self.assertEqual("linux", install_flags.get("--require-os"))
+        self.assertEqual("linux", verify_flags.get("--require-os"))
+
+        cache_key = self.with_value(steps[self.CACHE_STEP], "key")
+        self.assertIn(REVISION, cache_key)
+        self.assertIn("1.99.1", cache_key)
+
+    def test_pins_and_acceptance_commands_are_not_weakened(self) -> None:
+        installer = (ROOT / "scripts" / "install_ci_cargo_fork.sh").read_text(encoding="utf-8")
+        self.assertIn("readonly REVISION=" + REVISION, installer)
+        self.assertIn("readonly RELEASE=" + RELEASE, installer)
+        self.assertIn("readonly BOOTSTRAP_TOOLCHAIN=1.99.1", installer)
+
+        text = self.workflow()
+        self.assertNotIn("--rustup-toolchain", text)
+        self.assertNotIn("--no-github", text)
+        self.assertNotIn("--reuse", text)
+        self.assertNotIn("--force", text)
+        for command in (
+            "cargo fmt --all -- --check",
+            "python3 scripts/check_design_docs.py",
+            "cargo clippy --locked --lib --test ci_clonekit -- -D warnings",
+            "cargo test --locked --lib ci_checkouts::clonekit",
+            "cargo test --locked --test ci_clonekit",
+            "cargo test --locked --test ci_clonekit -- --ignored --test-threads=1",
+            "python3 scripts/eval_ci_clonekit.py --scale full",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(command, text)
+        self.assertIn("timeout-minutes: 45", text)
+        self.assertIn("name: ci-clonekit-evidence", text)
+        self.assertIn("path: test-results/ci-clonekit/", text)
 
 
 if __name__ == "__main__":

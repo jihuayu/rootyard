@@ -70,14 +70,26 @@ jobs:
       - name: Cache CargoFork toolchain binary
         uses: actions/cache@v4
         with:
-          path: /tmp/rootyard-cargo-fork
+          path: ${{ runner.temp }}/rootyard-cargo-fork
           key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
 
-      - name: Install and verify CargoFork 1.101.0 (64a6ee6a)
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
         run: |
           set -euo pipefail
-          scripts/install_ci_cargo_fork.sh install --cache-dir /tmp/rootyard-cargo-fork --rustup-toolchain 1.99.1
-          scripts/install_ci_cargo_fork.sh verify --require-os linux --require-path
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/ci-clonekit/ci-cargo-fork.json
+
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          set -euo pipefail
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
           cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
           rustc -V | grep -Eq '^rustc 1\.99\.1 '
 
