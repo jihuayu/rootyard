@@ -151,18 +151,9 @@ class Server:
     def _now(self):
         return self.clock() if self.clock is not None else time.monotonic()
 
-    def _clamp(self, requested, stage):
-        if self.budget is None:
-            return requested
-        return self.budget.clamp(requested, stage)
-
     def _late(self, stage):
         if self.budget is not None:
             self.budget.late(stage)
-
-    def _late_overall(self, stage):
-        if self.budget is not None:
-            self.budget.late_overall(stage)
 
     def _stop_quietly(self):
         """Best-effort stop that never replaces the start failure."""
