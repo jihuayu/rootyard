@@ -3,6 +3,7 @@
 //! preservation under eviction & cancellation, #174 bounds, and singleflight.
 
 use std::{
+    collections::BTreeMap,
     os::unix::fs::PermissionsExt,
     path::Path,
     process::Command,
@@ -14,18 +15,82 @@ use std::{
 };
 
 use anyhow::{Result, ensure};
+use axum::{
+    Router,
+    body::Body,
+    extract::State,
+    http::{Method, StatusCode, Uri, header},
+    response::{IntoResponse, Response},
+};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::blob_store::{
     BlobLocator,
-    budget::ResourceLimits,
+    budget::{ResourceContext, ResourceLimits},
+    config::BlobProfile,
     opendal::BlobStore,
-    test_support::{deadline, store},
+    test_support::distinct_backend_identities,
 };
 
 use super::*;
+
+#[derive(Default)]
+struct S3MemState {
+    objects: Mutex<BTreeMap<String, Vec<u8>>>,
+}
+
+struct LocalTestS3 {
+    endpoint: String,
+    state: Arc<S3MemState>,
+    _server: tokio::task::JoinHandle<()>,
+}
+
+impl LocalTestS3 {
+    async fn start() -> Result<Self> {
+        let state = Arc::new(S3MemState::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let srv = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().fallback(handle_s3).with_state(srv)).await;
+        });
+        Ok(Self { endpoint: format!("http://127.0.0.1:{port}"), state, _server: server })
+    }
+
+    fn store(&self) -> Result<BlobStore> {
+        let limits = ResourceLimits::new(2, 4, 8 << 20)?;
+        let profile = BlobProfile::memory_profile(limits).with_test_endpoint(&self.endpoint)?;
+        Ok(BlobStore::open_with_resources(profile, Arc::new(ResourceContext::new(limits)))?)
+    }
+
+    fn put_raw(&self, locator: &BlobLocator, data: Vec<u8>) {
+        self.state.objects.lock().unwrap().insert(format!("blob-test-bucket/{}", locator.path()), data);
+    }
+}
+
+async fn handle_s3(State(st): State<Arc<S3MemState>>, method: Method, uri: Uri) -> Response {
+    let key = uri.path().trim_start_matches('/').to_owned();
+    if !key.contains('/') {
+        return Response::new(Body::from("<ListBucketResult/>"));
+    }
+    match method {
+        Method::HEAD | Method::GET => match st.objects.lock().unwrap().get(&key).cloned() {
+            Some(d) => {
+                let tag = format!("\"{}\"", &hex::encode(Sha256::digest(&d))[..32]);
+                let len = if method == Method::HEAD { "0".into() } else { d.len().to_string() };
+                (
+                    [(header::ETAG, tag), (header::CONTENT_LENGTH, len)],
+                    if method == Method::HEAD { Body::empty() } else { Body::from(d) },
+                )
+                    .into_response()
+            }
+            None => (StatusCode::NOT_FOUND, [(header::CONTENT_LENGTH, "0")], Body::empty()).into_response(),
+        },
+        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
+}
 
 fn git_ok(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
@@ -59,7 +124,7 @@ struct MemSeededRepo {
 }
 
 impl MemSeededRepo {
-    async fn create(blob: &BlobStore, format: ReplicaObjectFormat) -> Result<Self> {
+    async fn create(s3: &LocalTestS3, format: ReplicaObjectFormat) -> Result<Self> {
         let work_dir = TempDir::new()?;
         let root = work_dir.path();
         git_ok(root, &["init", format.git_init_flag(), "--initial-branch=main"])?;
@@ -84,11 +149,11 @@ impl MemSeededRepo {
             base_oid,
             tip_oid,
         };
-        s.packs = s.upload_packs(blob).await?;
+        s.packs = s.upload_packs(s3)?;
         Ok(s)
     }
 
-    async fn add_commit(&mut self, blob: &BlobStore) -> Result<()> {
+    fn add_commit(&mut self, s3: &LocalTestS3) -> Result<()> {
         let root = self.work_dir.path();
         std::fs::write(root.join("extra.txt"), b"v2\n")?;
         git_ok(root, &["add", "."])?;
@@ -96,11 +161,11 @@ impl MemSeededRepo {
         git_ok(root, &["repack", "--no-write-bitmap-index"])?;
         self.tip_oid = git_ok(root, &["rev-parse", "HEAD"])?;
         self.refs = vec![ReplicaRefSpec::new("refs/heads/main", &self.tip_oid)];
-        self.packs = self.upload_packs(blob).await?;
+        self.packs = self.upload_packs(s3)?;
         Ok(())
     }
 
-    async fn upload_packs(&self, blob: &BlobStore) -> Result<Vec<PackObjectSpec>> {
+    fn upload_packs(&self, s3: &LocalTestS3) -> Result<Vec<PackObjectSpec>> {
         let pack_dir = self.work_dir.path().join(".git/objects/pack");
         let mut stems: Vec<String> = std::fs::read_dir(&pack_dir)?
             .filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".pack").map(str::to_owned))
@@ -108,19 +173,22 @@ impl MemSeededRepo {
         stems.sort();
         let mut out = Vec::with_capacity(stems.len());
         for stem in stems {
-            let mut upload =
-                |ext: &str| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BlobLocator>> + '_>> {
-                    let path = pack_dir.join(format!("{stem}.{ext}"));
-                    Box::pin(async move {
-                        let bytes = std::fs::read(&path)?;
-                        let sha = hex::encode(Sha256::digest(&bytes));
-                        let intent =
-                            blob.new_upload(self.tenant_id, self.repo_id, 1, "packs", &sha, bytes.len() as u64)?;
-                        let receipt = blob.put_file(intent, &path, deadline()).await?;
-                        Ok(receipt.locator().clone())
-                    })
-                };
-            out.push(PackObjectSpec::provider_managed(stem, upload("pack").await?, upload("idx").await?));
+            let mut upload = |ext: &str| -> Result<BlobLocator> {
+                let bytes = std::fs::read(pack_dir.join(format!("{stem}.{ext}")))?;
+                let sha = hex::encode(Sha256::digest(&bytes));
+                let locator = BlobLocator::new(
+                    self.tenant_id,
+                    self.repo_id,
+                    1,
+                    Uuid::new_v4(),
+                    "packs",
+                    &sha,
+                    bytes.len() as u64,
+                )?;
+                s3.put_raw(&locator, bytes);
+                Ok(locator)
+            };
+            out.push(PackObjectSpec::provider_managed(stem, upload("pack")?, upload("idx")?));
         }
         Ok(out)
     }
@@ -191,12 +259,13 @@ fn assert_clone_ok(repo: &Path, expected_tip: &str) -> Result<()> {
 
 #[tokio::test]
 async fn two_layer_reuse_incremental_rewind_and_push_isolation_sha1_and_sha256() -> Result<()> {
-    let (blob, _) = store(ResourceLimits::new(2, 4, 8 << 20).unwrap());
-    let (other_blob, _) = store(ResourceLimits::new(2, 4, 8 << 20).unwrap());
+    let s3 = LocalTestS3::start().await?;
+    let blob = s3.store()?;
+    let (_, other_id) = distinct_backend_identities();
     let pins = DurablePinRegistry::new();
 
     for fmt in [ReplicaObjectFormat::Sha1, ReplicaObjectFormat::Sha256] {
-        let mut seeded = MemSeededRepo::create(&blob, fmt).await?;
+        let mut seeded = MemSeededRepo::create(&s3, fmt).await?;
         let dir = TempDir::new()?;
         let node = ReplicaCacheNode::open(
             "n1",
@@ -233,7 +302,7 @@ async fn two_layer_reuse_incremental_rewind_and_push_isolation_sha1_and_sha256()
         assert_eq!(git_ok(rewound_view.repo_path()?, &["rev-parse", "refs/heads/main"])?, seeded.base_oid);
         drop(rewound_view);
 
-        seeded.add_commit(&blob).await?;
+        seeded.add_commit(&s3)?;
         *auth.snap.lock().unwrap() = seeded.snapshot(&pins, 3);
         let inc = node.serve_view(&req, &auth, dl).await?;
         assert_eq!(inc.source(), ReplicaServeSource::PackCachePartialRefill);
@@ -248,7 +317,7 @@ async fn two_layer_reuse_incremental_rewind_and_push_isolation_sha1_and_sha256()
         assert_eq!(node.serve_view(&req, &auth, dl).await?.source(), ReplicaServeSource::PackCacheFullReuse);
 
         let mut foreign_req = req.clone();
-        foreign_req.expected_backend_identity = Some(other_blob.backend_identity().clone());
+        foreign_req.expected_backend_identity = Some(other_id.clone());
         assert!(matches!(
             node.serve_view(&foreign_req, &auth, dl).await,
             Err(ReplicaCacheError::BackendIdentityMismatch)
@@ -259,10 +328,11 @@ async fn two_layer_reuse_incremental_rewind_and_push_isolation_sha1_and_sha256()
 
 #[tokio::test]
 async fn active_reader_guard_preserves_view_and_pin_under_eviction_and_tamper() -> Result<()> {
-    let (blob, _) = store(ResourceLimits::new(2, 4, 8 << 20).unwrap());
+    let s3 = LocalTestS3::start().await?;
+    let blob = s3.store()?;
     let pins = DurablePinRegistry::new();
-    let s1 = MemSeededRepo::create(&blob, ReplicaObjectFormat::Sha1).await?;
-    let s2 = MemSeededRepo::create(&blob, ReplicaObjectFormat::Sha1).await?;
+    let s1 = MemSeededRepo::create(&s3, ReplicaObjectFormat::Sha1).await?;
+    let s2 = MemSeededRepo::create(&s3, ReplicaObjectFormat::Sha1).await?;
     let dir = TempDir::new()?;
     let limits = ReplicaCacheLimits { max_view_entries: 2, max_active_views: 4, ..ReplicaCacheLimits::default() };
     let node = ReplicaCacheNode::open("n-pin", &dir.path().join("replica"), blob, None, limits)?;

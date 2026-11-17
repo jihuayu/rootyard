@@ -104,13 +104,14 @@ impl WaiterFlightGuard {
             .filter(|d| !d.is_zero())
             .ok_or(ReplicaCacheError::DeadlineExceeded)?;
         let budget = wait_timeout.min(remaining);
-        let res =
-            tokio::time::timeout(budget, self.receiver.wait_for(|outcome| !matches!(outcome, FlightOutcome::Pending)))
-                .await;
+        let res = {
+            let fut = self.receiver.wait_for(|outcome| !matches!(outcome, FlightOutcome::Pending));
+            tokio::time::timeout(budget, fut).await.map(|r| r.map(|g| g.clone()))
+        };
         let waited_us = started.elapsed().as_micros() as u64;
         self.release_slot();
         match res {
-            Ok(Ok(outcome)) => Ok((outcome.clone(), waited_us)),
+            Ok(Ok(outcome)) => Ok((outcome, waited_us)),
             Ok(Err(_)) => Ok((FlightOutcome::LeaderCancelled, waited_us)),
             Err(_) => Err(ReplicaCacheError::WaitTimeout),
         }
@@ -165,9 +166,9 @@ impl BoundedSingleFlight {
 
     pub fn enter(&self, key: &ReplicaViewKey) -> Result<FlightEntry, ReplicaCacheError> {
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let total_waiters = guard.total_waiters;
         if let Some(entry) = guard.inflight.get_mut(&key.view_key_hex) {
-            if entry.waiters >= self.limits.max_waiters_per_key || guard.total_waiters >= self.limits.max_total_waiters
-            {
+            if entry.waiters >= self.limits.max_waiters_per_key || total_waiters >= self.limits.max_total_waiters {
                 self.queue_rejections.fetch_add(1, Ordering::Relaxed);
                 return Err(ReplicaCacheError::QueueFull("singleflight waiter queue exhausted"));
             }

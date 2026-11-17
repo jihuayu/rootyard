@@ -16,7 +16,6 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
 };
-use uuid::Uuid;
 
 use crate::blob_store::{
     BlobError, BlobLocator, disposable_view::DisposableViewError, envelope::EnvelopeMetadata,
@@ -223,15 +222,11 @@ async fn download_verified_object(
     dst: &Path,
     deadline: Instant,
 ) -> Result<(), ReplicaCacheError> {
-    if store.profile().encryption().is_local_envelope() {
-        let meta = envelope.ok_or(ReplicaCacheError::IntegrityFailed("missing local-envelope metadata"))?;
+    if let Some(meta) = envelope {
         let kp =
             key_provider.ok_or(ReplicaCacheError::InvalidInput("missing KeyProvider for local-envelope".into()))?;
         store.get_decrypted_to_file(locator, meta, kp, dst, deadline).await?;
     } else {
-        if envelope.is_some() {
-            return Err(ReplicaCacheError::InvalidInput("unexpected envelope on provider-managed store".into()));
-        }
         store.get_to_file(locator, dst, deadline).await.map_err(map_blob_err)?;
     }
     verify_file_sha256_and_len(dst, locator.sha256(), locator.length()).await

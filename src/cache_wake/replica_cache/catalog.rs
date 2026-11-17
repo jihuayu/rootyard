@@ -195,17 +195,21 @@ impl ViewCacheCatalog {
     pub fn checkout(&self, key: &ReplicaViewKey) -> Result<(Option<Arc<CachedViewSlot>>, bool), ReplicaCacheError> {
         let candidate = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(entry) = guard.entries.get_mut(&key.view_key_hex) else {
-                return Ok((None, false));
+            let next_seq = guard.lru_counter.saturating_add(1);
+            let slot = {
+                let Some(entry) = guard.entries.get_mut(&key.view_key_hex) else {
+                    return Ok((None, false));
+                };
+                if entry.slot.view_key != *key {
+                    return Err(ReplicaCacheError::TenantIsolationViolation("view cache key mismatch"));
+                }
+                entry.lru_seq = next_seq;
+                let mut st = entry.slot.state.lock().unwrap_or_else(|p| p.into_inner());
+                st.active_readers = st.active_readers.saturating_add(1);
+                Arc::clone(&entry.slot)
             };
-            if entry.slot.view_key != *key {
-                return Err(ReplicaCacheError::TenantIsolationViolation("view cache key mismatch"));
-            }
-            guard.lru_counter = guard.lru_counter.saturating_add(1);
-            entry.lru_seq = guard.lru_counter;
-            let mut st = entry.slot.state.lock().unwrap_or_else(|p| p.into_inner());
-            st.active_readers = st.active_readers.saturating_add(1);
-            Arc::clone(&entry.slot)
+            guard.lru_counter = next_seq;
+            slot
         };
 
         if !candidate.ensure_live_with_margin(self.limits.min_serve_ttl) || !candidate.verify_files_intact() {

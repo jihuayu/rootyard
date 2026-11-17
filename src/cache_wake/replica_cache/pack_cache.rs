@@ -133,16 +133,20 @@ impl PackCacheCatalog {
     ) -> Result<(Option<PackCachePin>, bool), ReplicaCacheError> {
         let paths = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(entry) = guard.entries.get_mut(&key.key_digest) else {
-                return Ok((None, false));
+            let next_seq = guard.lru_counter.saturating_add(1);
+            let paths = {
+                let Some(entry) = guard.entries.get_mut(&key.key_digest) else {
+                    return Ok((None, false));
+                };
+                if entry.key != *key {
+                    return Err(ReplicaCacheError::TenantIsolationViolation("pack cache key mismatch"));
+                }
+                entry.lru_seq = next_seq;
+                entry.pin_count = entry.pin_count.saturating_add(1);
+                (entry.pack_path.clone(), entry.idx_path.clone())
             };
-            if entry.key != *key {
-                return Err(ReplicaCacheError::TenantIsolationViolation("pack cache key mismatch"));
-            }
-            guard.lru_counter = guard.lru_counter.saturating_add(1);
-            entry.lru_seq = guard.lru_counter;
-            entry.pin_count = entry.pin_count.saturating_add(1);
-            (entry.pack_path.clone(), entry.idx_path.clone())
+            guard.lru_counter = next_seq;
+            paths
         };
 
         let pin = PackCachePin {
@@ -183,14 +187,18 @@ impl PackCacheCatalog {
 
         let to_remove = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(existing) = guard.entries.get_mut(&key.key_digest) {
-                guard.lru_counter = guard.lru_counter.saturating_add(1);
-                existing.lru_seq = guard.lru_counter;
+            let next_seq = guard.lru_counter.saturating_add(1);
+            let hit = guard.entries.get_mut(&key.key_digest).map(|existing| {
+                existing.lru_seq = next_seq;
                 existing.pin_count = existing.pin_count.saturating_add(1);
+                (existing.pack_path.clone(), existing.idx_path.clone())
+            });
+            if let Some((pack_path, idx_path)) = hit {
+                guard.lru_counter = next_seq;
                 return Ok(PackCachePin {
                     key_digest: key.key_digest,
-                    pack_path: existing.pack_path.clone(),
-                    idx_path: existing.idx_path.clone(),
+                    pack_path,
+                    idx_path,
                     inner: Arc::clone(&self.inner),
                     released: false,
                 });
@@ -348,7 +356,7 @@ pub fn verify_private_dir(path: &Path) -> Result<(), ReplicaCacheError> {
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(ReplicaCacheError::IntegrityFailed("cache directory must not be a symlink"));
     }
-    if meta.mode() & 0o077 != 0 {
+    if meta.permissions().mode() & 0o077 != 0 {
         return Err(ReplicaCacheError::IntegrityFailed("cache directory must remain 0o700 private"));
     }
     Ok(())
