@@ -182,6 +182,7 @@ fn planner_bounds_work_steps_on_shared_unauthorized_delta_base() {
     let dummy = |i: u128| {
         let mut raw = [0_u8; 20];
         raw[..16].copy_from_slice(&i.to_be_bytes());
+        raw[19] = 0xaa;
         GitOid::parse(GitObjectFormat::Sha1, &hex::encode(raw)).unwrap()
     };
     let (p0, _) = make_pack(&r, 250, 1024, 100, false, vec![]);
