@@ -157,6 +157,19 @@ def _closed_phase_exception_class(error):
     return _PHASE_EXCEPTION_CLASSES.get(type(error), "unknown")
 
 
+def _validated_startup_fields(startup_stage, exit_status):
+    """Revalidate the two closed startup labels at serialization time."""
+    stage = (startup_stage if type(startup_stage) is str
+             and startup_stage in serving.STARTUP_STAGES else "other")
+    status = (exit_status if type(exit_status) is str
+              and exit_status in serving.EXIT_STATUSES else "not_applicable")
+    if stage != "child_exit":
+        status = "not_applicable"
+    elif status == "not_applicable":
+        status = "other_exit"
+    return stage, status
+
+
 class BackendIdentityConflictPhaseError(Exception):
     """Safe, closed phase/class projection for one failed checkpoint.
 
@@ -165,7 +178,7 @@ class BackendIdentityConflictPhaseError(Exception):
     inherited ``Harness.case``/``redact`` projector, which persists only it.
     """
 
-    def __init__(self, phase, exception_class, source_line=None):
+    def __init__(self, phase, exception_class, source_line=None, startup_projection=None):
         if not isinstance(phase, BackendIdentityConflictPhase):
             raise TypeError("phase is not a closed backend-identity projection")
         if exception_class not in _CLOSED_EXCEPTION_LABELS:
@@ -176,14 +189,26 @@ class BackendIdentityConflictPhaseError(Exception):
         self.phase = phase
         self.exception_class = exception_class
         self.source_line = source_line
+        self.startup_stage = None
+        self.exit_status = None
+        if startup_projection is not None:
+            if type(startup_projection) is serving.StartupProjection:
+                stage, status = startup_projection.safe_fields()
+            else:
+                stage, status = "other", "not_applicable"
+            self.startup_stage, self.exit_status = _validated_startup_fields(stage, status)
         super().__init__(phase.value, exception_class)
 
     def __str__(self):
         diagnostic = self.diagnostic()
         source_line = diagnostic.get("source_line", "unknown")
-        return ("backend-identity-conflict phase=" + diagnostic["phase"]
+        text = ("backend-identity-conflict phase=" + diagnostic["phase"]
                 + " class=" + diagnostic["exception_class"]
                 + " source_line=" + str(source_line))
+        if "startup_stage" in diagnostic:
+            text += (" startup_stage=" + diagnostic["startup_stage"]
+                     + " exit_status=" + diagnostic["exit_status"])
+        return text
 
     def diagnostic(self):
         """Transient structured view; never contains the raw exception."""
@@ -195,13 +220,18 @@ class BackendIdentityConflictPhaseError(Exception):
         source_line = _validated_phase_source_line(self.source_line)
         if source_line is not None:
             diagnostic["source_line"] = source_line
+        if self.startup_stage is not None or self.exit_status is not None:
+            stage, status = _validated_startup_fields(self.startup_stage, self.exit_status)
+            diagnostic["startup_stage"] = stage
+            diagnostic["exit_status"] = status
         return diagnostic
 
 
 class _BackendIdentityConflictPhaseContext:
-    def __init__(self, phase, source_line):
+    def __init__(self, phase, source_line, startup_projection=None):
         self.phase = phase
         self.source_line = source_line
+        self.startup_projection = startup_projection
 
     def __enter__(self):
         return self
@@ -211,8 +241,13 @@ class _BackendIdentityConflictPhaseContext:
             return False
         if isinstance(exc, BackendIdentityConflictPhaseError):
             return False
+        projection = self.startup_projection
+        if (type(projection) is not serving.StartupProjection
+                or projection.failed is not True or projection.touched is not True):
+            projection = None
         raise BackendIdentityConflictPhaseError(
-            self.phase, _closed_phase_exception_class(exc), self.source_line) from None
+            self.phase, _closed_phase_exception_class(exc), self.source_line,
+            startup_projection=projection) from None
 
 
 def _source_line_is_phase_wrapper(source_line):
@@ -370,7 +405,10 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
 
     def _backend_identity_conflict_phase(self, phase):
         """Project exactly one existing stage onto the closed phase enum."""
-        return _BackendIdentityConflictPhaseContext(phase, _phase_source_line(sys._getframe(1)))
+        projection = (serving.StartupProjection()
+                      if phase is BackendIdentityConflictPhase.start_conflicting else None)
+        return _BackendIdentityConflictPhaseContext(
+            phase, _phase_source_line(sys._getframe(1)), projection)
 
     # -- native Git helpers -------------------------------------------------
     def push_and_clone(self, repo, label, object_format="sha1", files=None):
@@ -963,9 +1001,10 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
         lookup_status = None
         lookup_error = None
         try:
-            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.start_conflicting):
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.start_conflicting) as phase:
                 self.start(overrides=self.conflicting_blob_identity_overrides(),
-                           label="conflicting-blob-identity")
+                           label="conflicting-blob-identity",
+                           startup_projection=phase.startup_projection)
                 conflicting_pid = self.proc.pid
                 assert conflicting_pid != original_pid
             # This is the same real create request on the same bound name. The

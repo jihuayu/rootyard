@@ -9,11 +9,13 @@ source-closure binding and the separate CI command while keeping the existing
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 import json
 import re
 import sys
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -22,6 +24,7 @@ HARNESS = ROOT / "tests" / "blob_provisioning_service.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "refstore-protocol-acceptance.yml"
 
 sys.path.insert(0, str(HARNESS.parent))
+import blob_only_service as serving
 import blob_provisioning_service as provisioning
 
 EXPECTED_CASES = (
@@ -112,7 +115,7 @@ class _BackendIdentityCaseDouble(provisioning.ProvisioningHarness):
         self._phase_failure(Phase.stop_conflicting if hard else Phase.stop_original)
         self.proc = None
 
-    def start(self, overrides=None, label="server"):
+    def start(self, overrides=None, label="server", startup_projection=None):
         self.start_calls.append(label)
         if label == "conflicting-blob-identity":
             self._phase_failure(Phase.start_conflicting)
@@ -135,6 +138,172 @@ class _BackendIdentityCaseDouble(provisioning.ProvisioningHarness):
 
     def push_and_clone(self, repo, name):
         self._phase_failure(Phase.restored_git)
+        return "a" * 40
+
+
+class _FakeClock:
+    """In-memory clock; no timer, thread or real sleep."""
+
+    def __init__(self, timeout_after=None):
+        self.now = 0.0
+        self.timeout_after = timeout_after
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += self.timeout_after if self.timeout_after is not None else seconds
+
+
+class _FakeProc:
+    """Popen double with only the attributes the inherited start reads."""
+
+    def __init__(self, pid=2000, returncode=None):
+        self.pid = pid
+        self.returncode = returncode
+        self.poll_calls = 0
+
+    def poll(self):
+        self.poll_calls += 1
+        return self.returncode
+
+
+class _FakeLog:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakePath:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeRoot:
+    def __truediv__(self, name):
+        return _FakePath(name)
+
+
+def _raise(error):
+    raise error
+
+
+class _StartHarness(provisioning.ProvisioningHarness):
+    """No Harness constructor, service, process, thread, socket or real file.
+
+    The inherited ``BlobOnlyHarness.start`` runs unmodified except that its
+    Popen/open/clock/hash/native-evidence/http/stop dependencies are doubles.
+    """
+
+    def __init__(self, *, proc=None, http_impl=None, stop_impl=None, clock=None,
+                 binary_digest="fake-digest", hash_error=None, native_error=None,
+                 popen_error=None):
+        self.proc = None
+        self.env = {"ROOTYARD_BLOB_ROOT": "fixture/root"}
+        self.server_count = 0
+        self.root = _FakeRoot()
+        self.log = None
+        self.profile = types.SimpleNamespace(
+            binary="fake-binary", build={"binary_sha256": binary_digest})
+        self.clock = clock or _FakeClock()
+        self.http_impl = http_impl or (lambda path: (200, b"", {}))
+        self.stop_impl = stop_impl or (lambda hard=False: None)
+        self.proc_factory = proc or (lambda: _FakeProc())
+        self.binary_digest = binary_digest
+        self.hash_error = hash_error
+        self.native_error = native_error
+        self.popen_error = popen_error
+        self.popen_calls = 0
+        self.http_calls = 0
+        self.stop_calls = []
+        self.hash_calls = 0
+        self.native_calls = 0
+        self.popen_proc = None
+        self.http = self._http
+        self.stop = self._stop
+
+    def _popen(self, argv, **kwargs):
+        self.popen_calls += 1
+        if self.popen_error is not None:
+            raise self.popen_error
+        self.popen_proc = self.proc_factory()
+        return self.popen_proc
+
+    def _open(self, path, mode="ab", *args, **kwargs):
+        self.log = _FakeLog()
+        return self.log
+
+    def _http(self, path, *args, **kwargs):
+        self.http_calls += 1
+        return self.http_impl(path)
+
+    def _stop(self, hard=False):
+        if self.proc:
+            self.stop_calls.append(hard)
+            self.stop_impl(hard=hard)
+            self.proc = None
+        if self.log:
+            self.log.close()
+            self.log = None
+
+    def _hash(self, path):
+        self.hash_calls += 1
+        if self.hash_error is not None:
+            raise self.hash_error
+        return self.binary_digest
+
+    def _native(self, harness):
+        self.native_calls += 1
+        if self.native_error is not None:
+            raise self.native_error
+
+
+@contextmanager
+def _patched_serving(harness):
+    """Replace only blob_only_service's runtime dependencies with doubles."""
+    with mock.patch.object(serving, "subprocess", types.SimpleNamespace(Popen=harness._popen)), \
+         mock.patch.object(serving, "open", harness._open, create=True), \
+         mock.patch.object(serving, "time", harness.clock), \
+         mock.patch.object(serving, "sha256_file", harness._hash), \
+         mock.patch.object(serving, "native_evidence",
+                           types.SimpleNamespace(started=harness._native)):
+        yield
+
+
+class _BackendIdentityStartupCaseDouble(_StartHarness):
+    """Real inherited case/start/phase machinery; every other step is a double."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.proc = types.SimpleNamespace(pid=1000)
+        self.results = []
+        self.secrets = []
+        self.base_db = "postgresql://base"
+        self.db = "postgresql://db"
+        self.alice = {"token": "fixture-token"}
+        self.authority_calls = 0
+
+    def create(self, name, owner):
+        return {"id": _REPOSITORY_ID}, 201
+
+    def authority(self, repo, expected_name):
+        self.authority_calls += 1
+        return _AUTHORITY
+
+    def post_create(self, payload, attempts=4):
+        return 409, json.dumps({"error": "repository state changed; retry"}).encode(), {}
+
+    def get_repo_status(self, owner, name):
+        return 409, json.dumps({"error": "repository is not ready"}).encode(), {}
+
+    def expect(self, path, code, **kwargs):
+        return json.dumps({"id": _REPOSITORY_ID, "state": "ready"}).encode()
+
+    def push_and_clone(self, repo, name):
         return "a" * 40
 
 
@@ -454,6 +623,247 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             provisioning.BackendIdentityConflictPhaseError(
                 Phase.initial_create, "AssertionError", source_line=0)
+
+    def _start_error(self, harness):
+        with _patched_serving(harness):
+            with self.assertRaises(provisioning.BackendIdentityConflictPhaseError) as caught:
+                with harness._backend_identity_conflict_phase(Phase.start_conflicting) as context:
+                    harness.start(startup_projection=context.startup_projection)
+        return caught.exception
+
+    def test_actual_case_serializes_child_exit_projection(self) -> None:
+        harness = _BackendIdentityStartupCaseDouble(proc=lambda: _FakeProc(returncode=1))
+        with _patched_serving(harness):
+            with self.assertRaises(provisioning.BackendIdentityConflictPhaseError) as caught:
+                harness.case(BACKEND_CASE, getattr(harness, BACKEND_CASE))
+        error = caught.exception
+        self.assertIs(error.phase, Phase.start_conflicting)
+        self.assertEqual(error.exception_class, "RuntimeError")
+        self.assertEqual(error.startup_stage, "child_exit")
+        self.assertEqual(error.exit_status, "exited_1")
+        self.assertEqual(
+            str(error),
+            "backend-identity-conflict phase=start_conflicting class=RuntimeError source_line="
+            + str(error.diagnostic()["source_line"])
+            + " startup_stage=child_exit exit_status=exited_1")
+        self.assertEqual(harness.results[-1]["error"], str(error))
+        self.assertNotIn("serve-blob exited during startup", harness.results[-1]["error"])
+        self.assertNotIn("fixture/root", harness.results[-1]["error"])
+        self.assertEqual(harness.popen_calls, 1)
+        self.assertEqual(harness.popen_proc.poll_calls, 1)
+        self.assertEqual(harness.http_calls, 0)
+        self.assertEqual(harness.hash_calls, 0)
+        self.assertEqual(harness.native_calls, 0)
+        self.assertEqual(harness.stop_calls, [False, False])
+
+    def test_startup_projection_readiness_timeout_has_no_added_probe(self) -> None:
+        clock = _FakeClock(timeout_after=31.0)
+        harness = _StartHarness(
+            proc=lambda: _FakeProc(returncode=None),
+            http_impl=lambda path: _raise(OSError("probe")),
+            clock=clock)
+        error = self._start_error(harness)
+        self.assertEqual(error.startup_stage, "readiness_timeout")
+        self.assertEqual(error.exit_status, "not_applicable")
+        self.assertEqual(error.exception_class, "RuntimeError")
+        self.assertIn("startup_stage=readiness_timeout", str(error))
+        self.assertIn("exit_status=not_applicable", str(error))
+        self.assertEqual(harness.popen_calls, 1)
+        self.assertEqual(harness.popen_proc.poll_calls, 1)
+        self.assertEqual(harness.http_calls, 1)
+        self.assertEqual(harness.stop_calls, [True])
+        self.assertEqual(harness.hash_calls, 0)
+        self.assertEqual(harness.native_calls, 0)
+        self.assertEqual(clock.sleeps, [0.1])
+
+    def test_startup_projection_probe_runtime_error_is_distinct(self) -> None:
+        harness = _StartHarness(
+            proc=lambda: _FakeProc(returncode=None),
+            http_impl=lambda path: _raise(RuntimeError("probe failure")))
+        error = self._start_error(harness)
+        self.assertEqual(error.startup_stage, "readiness_probe")
+        self.assertEqual(error.exit_status, "not_applicable")
+        self.assertEqual(error.exception_class, "RuntimeError")
+        self.assertEqual(harness.popen_calls, 1)
+        self.assertEqual(harness.popen_proc.poll_calls, 1)
+        self.assertEqual(harness.http_calls, 1)
+        self.assertEqual(harness.stop_calls, [])
+        self.assertEqual(harness.hash_calls, 0)
+        self.assertEqual(harness.native_calls, 0)
+
+    def test_startup_projection_post_ready_hash_failure(self) -> None:
+        harness = _StartHarness(
+            proc=lambda: _FakeProc(returncode=None),
+            http_impl=lambda path: (200, b"", {}),
+            binary_digest="expected-digest",
+            hash_error=AssertionError("hash mismatch"))
+        error = self._start_error(harness)
+        self.assertEqual(error.startup_stage, "post_ready")
+        self.assertEqual(error.exit_status, "not_applicable")
+        self.assertEqual(error.exception_class, "AssertionError")
+        self.assertEqual(harness.popen_calls, 1)
+        self.assertEqual(harness.popen_proc.poll_calls, 1)
+        self.assertEqual(harness.http_calls, 1)
+        self.assertEqual(harness.hash_calls, 1)
+        self.assertEqual(harness.native_calls, 0)
+        self.assertEqual(harness.stop_calls, [])
+
+    def test_startup_projection_post_ready_native_evidence_failure(self) -> None:
+        harness = _StartHarness(
+            proc=lambda: _FakeProc(returncode=None),
+            http_impl=lambda path: (200, b"", {}),
+            binary_digest="fake-digest",
+            native_error=RuntimeError("receipt mismatch"))
+        error = self._start_error(harness)
+        self.assertEqual(error.startup_stage, "post_ready")
+        self.assertEqual(error.exit_status, "not_applicable")
+        self.assertEqual(error.exception_class, "RuntimeError")
+        self.assertEqual(harness.http_calls, 1)
+        self.assertEqual(harness.hash_calls, 1)
+        self.assertEqual(harness.native_calls, 1)
+        self.assertEqual(harness.stop_calls, [])
+
+    def test_startup_projection_spawn_failure_is_bounded(self) -> None:
+        harness = _StartHarness(
+            proc=lambda: _FakeProc(),
+            popen_error=OSError("spawn failure"))
+        error = self._start_error(harness)
+        self.assertEqual(error.startup_stage, "spawn")
+        self.assertEqual(error.exit_status, "not_applicable")
+        self.assertEqual(error.exception_class, "OSError")
+        self.assertEqual(harness.popen_calls, 1)
+        self.assertEqual(harness.http_calls, 0)
+        self.assertEqual(harness.stop_calls, [])
+        self.assertEqual(harness.hash_calls, 0)
+        self.assertEqual(harness.native_calls, 0)
+
+    def test_startup_projection_stop_failure_keeps_known_child_exit(self) -> None:
+        raised = []
+
+        def stop_impl(hard=False):
+            if not hard:
+                failure = RuntimeError("stop reclaim")
+                raised.append(failure)
+                raise failure
+
+        harness = _StartHarness(
+            proc=lambda: _FakeProc(returncode=101), stop_impl=stop_impl)
+        projection = serving.StartupProjection()
+        with _patched_serving(harness):
+            with self.assertRaises(RuntimeError) as caught:
+                harness.start(startup_projection=projection)
+        self.assertIs(caught.exception, raised[0])
+        self.assertEqual(projection.safe_fields(), ("child_exit", "exited_101"))
+        self.assertEqual(harness.stop_calls, [False])
+        self.assertEqual(harness.popen_proc.poll_calls, 1)
+        error = provisioning.BackendIdentityConflictPhaseError(
+            Phase.start_conflicting, "RuntimeError", startup_projection=projection)
+        self.assertEqual(error.startup_stage, "child_exit")
+        self.assertEqual(error.exit_status, "exited_101")
+        self.assertIn("startup_stage=child_exit", str(error))
+        self.assertIn("exit_status=exited_101", str(error))
+
+    def test_startup_projection_stop_failure_keeps_known_timeout(self) -> None:
+        raised = []
+
+        def stop_impl(hard=False):
+            failure = RuntimeError("stop reclaim")
+            raised.append(failure)
+            raise failure
+
+        clock = _FakeClock(timeout_after=31.0)
+        harness = _StartHarness(
+            proc=lambda: _FakeProc(returncode=None),
+            http_impl=lambda path: _raise(OSError("probe")),
+            clock=clock,
+            stop_impl=stop_impl)
+        projection = serving.StartupProjection()
+        with _patched_serving(harness):
+            with self.assertRaises(RuntimeError) as caught:
+                harness.start(startup_projection=projection)
+        self.assertIs(caught.exception, raised[0])
+        self.assertEqual(projection.safe_fields(), ("readiness_timeout", "not_applicable"))
+        self.assertEqual(harness.stop_calls, [True])
+        error = provisioning.BackendIdentityConflictPhaseError(
+            Phase.start_conflicting, "RuntimeError", startup_projection=projection)
+        self.assertEqual(error.startup_stage, "readiness_timeout")
+        self.assertEqual(error.exit_status, "not_applicable")
+
+    def test_startup_projection_stop_reclaim_is_fallback_only(self) -> None:
+        projection = serving.StartupProjection()
+        projection.enter("readiness_probe")
+        projection.enter_stop()
+        projection.failed = True
+        projection.mark_stop_reclaim()
+        self.assertEqual(projection.safe_fields(), ("stop_reclaim", "not_applicable"))
+        error = provisioning.BackendIdentityConflictPhaseError(
+            Phase.start_conflicting, "RuntimeError", startup_projection=projection)
+        self.assertEqual(error.diagnostic()["startup_stage"], "stop_reclaim")
+        self.assertEqual(error.diagnostic()["exit_status"], "not_applicable")
+        self.assertIn("startup_stage=stop_reclaim", str(error))
+        self.assertIn("exit_status=not_applicable", str(error))
+
+    def test_startup_projection_invalid_values_fall_back_without_poison(self) -> None:
+        secret = "POISONOUS-STARTUP-SECRET-143"
+
+        class Poison:
+            def __str__(self):
+                return secret
+
+            def __repr__(self):
+                return secret
+
+        projection = serving.StartupProjection()
+        projection._stage = Poison()
+        projection._exit_status = Poison()
+        projection.failed = True
+        projection.touched = True
+        error = provisioning.BackendIdentityConflictPhaseError(
+            Phase.start_conflicting, "RuntimeError", startup_projection=projection)
+        diagnostic = error.diagnostic()
+        self.assertEqual(diagnostic["startup_stage"], "other")
+        self.assertEqual(diagnostic["exit_status"], "not_applicable")
+        self.assertNotIn(secret, str(error))
+        self.assertNotIn(secret, json.dumps(diagnostic, sort_keys=True))
+        self.assertNotIn(secret, json.dumps(error.args, sort_keys=True))
+        other = provisioning.BackendIdentityConflictPhaseError(
+            Phase.start_conflicting, "RuntimeError", startup_projection=Poison())
+        self.assertEqual(other.diagnostic()["startup_stage"], "other")
+        self.assertEqual(other.diagnostic()["exit_status"], "not_applicable")
+        self.assertNotIn(secret, str(other))
+        self.assertEqual(
+            provisioning._validated_startup_fields(True, 101), ("other", "not_applicable"))
+        self.assertEqual(
+            provisioning._validated_startup_fields("child_exit", 1),
+            ("child_exit", "other_exit"))
+        self.assertEqual(serving._exit_status_from_returncode(True), "other_exit")
+        self.assertEqual(serving._exit_status_from_returncode(False), "other_exit")
+        self.assertEqual(serving._exit_status_from_returncode("1"), "other_exit")
+        self.assertEqual(serving._exit_status_from_returncode(-15), "signaled")
+        self.assertEqual(serving._exit_status_from_returncode(0), "exited_0")
+        self.assertEqual(serving._exit_status_from_returncode(1), "exited_1")
+        self.assertEqual(serving._exit_status_from_returncode(101), "exited_101")
+        self.assertEqual(serving._exit_status_from_returncode(2), "other_exit")
+
+    def test_startup_observation_is_inert_without_the_phase_projection(self) -> None:
+        harness = _StartHarness(proc=lambda: _FakeProc(returncode=1))
+        with _patched_serving(harness):
+            with self.assertRaises(RuntimeError) as caught:
+                harness.start()
+        self.assertEqual(
+            str(caught.exception),
+            "serve-blob exited during startup with status 1")
+        self.assertEqual(harness.popen_calls, 1)
+        self.assertEqual(harness.popen_proc.poll_calls, 1)
+        self.assertEqual(harness.http_calls, 0)
+        self.assertEqual(harness.stop_calls, [False])
+        self.assertEqual(harness.hash_calls, 0)
+        self.assertEqual(harness.native_calls, 0)
+        harness = _StartHarness(proc=lambda: _FakeProc(returncode=1))
+        with _patched_serving(harness):
+            with self.assertRaises(RuntimeError):
+                harness.start(startup_projection=object())
+        self.assertEqual(harness.stop_calls, [False])
 
     def test_closed_projection_leaves_inventory_and_failure_status_unchanged(self) -> None:
         self.assertEqual(provisioning.CASES, EXPECTED_CASES)
