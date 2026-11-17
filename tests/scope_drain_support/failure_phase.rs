@@ -132,9 +132,10 @@ impl PhaseGuard {
     }
 
     fn emit(&self, class: Class) {
-        let _ = writeln!(
-            std::io::stdout(),
-            "ROOTYARD_FAILURE_FRAME v1 case={CASE_ID} phase={} class={}",
+        let mut stderr = std::io::stderr().lock();
+        let _ = write!(
+            stderr,
+            "\nROOTYARD_FAILURE_FRAME v1 case={CASE_ID} phase={} class={}\n",
             self.phase.code(),
             class.code()
         );

@@ -10,6 +10,7 @@ synthetic source tree and receipt fixture.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -114,12 +115,34 @@ DIAGNOSTIC_KEYS = {
     "exit_code",
     "signal",
     "evidence_complete",
+    "suite_counts",
     "failure_phase",
     "failure_class",
     "unknown_case",
     "diagnostics_valid",
     "evidence_unchanged",
 }
+
+
+class FakeProcess:
+    def __init__(self, stdout="", stderr="", returncode=0, timeout=False):
+        self.stdout = io.BytesIO(stdout.encode("utf-8") if isinstance(stdout, str) else stdout)
+        self.stderr = io.BytesIO(stderr.encode("utf-8") if isinstance(stderr, str) else stderr)
+        self.returncode = None
+        self._code = returncode
+        self._timeout = timeout
+        self.killed = False
+
+    def wait(self, timeout=None):
+        if self._timeout:
+            self._timeout = False
+            raise subprocess.TimeoutExpired("fake", timeout)
+        self.returncode = self._code
+        return self._code
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
 
 
 class RootRaftRunnerTest(unittest.TestCase):
@@ -415,7 +438,7 @@ class RootRaftRunnerTest(unittest.TestCase):
 
         def fake_run(command, **kwargs):
             calls.append((command, kwargs))
-            return subprocess.CompletedProcess(command, 0, GOOD_OUTPUT, SECRET)
+            return FakeProcess(GOOD_OUTPUT, SECRET, 0)
 
         result = runner.execute_case(self.binary, 900.0, run=fake_run)
         self.assertEqual(result.stdout, GOOD_OUTPUT)
@@ -423,32 +446,37 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIsNone(result.signal)
         self.assertEqual(result.termination, "exited")
+        self.assertFalse(result.capture_truncated)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], [str(self.binary), "--test-threads=1"])
-        self.assertEqual(calls[0][1]["timeout"], 900.0)
-        self.assertIs(calls[0][1]["text"], True)
+        self.assertEqual(calls[0][1]["stdout"], subprocess.PIPE)
+        self.assertEqual(calls[0][1]["stderr"], subprocess.PIPE)
         self.assertNotIn("--", calls[0][0])
+        self.assertNotIn("text", calls[0][1])
+        self.assertNotIn("check", calls[0][1])
 
     def test_execute_retains_nonzero_signal_and_timeout_results(self) -> None:
-        def result(code):
-            def run(command, **_kwargs):
-                return subprocess.CompletedProcess(command, code, "", SECRET)
-            return run
-
-        nonzero = runner.execute_case(self.binary, 900.0, run=result(101))
+        nonzero = runner.execute_case(
+            self.binary, 900.0, run=lambda *_a, **_k: FakeProcess("", SECRET, 101)
+        )
         self.assertEqual(nonzero.returncode, 101)
         self.assertIsNone(nonzero.signal)
         self.assertEqual(nonzero.termination, "exited")
 
-        killed = runner.execute_case(self.binary, 900.0, run=result(-9))
+        killed = runner.execute_case(
+            self.binary, 900.0, run=lambda *_a, **_k: FakeProcess("", SECRET, -9)
+        )
         self.assertIsNone(killed.returncode)
         self.assertEqual(killed.signal, 9)
         self.assertEqual(killed.termination, "signal")
 
-        def timed_out(command, **kwargs):
-            raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=SECRET)
-
-        timed = runner.execute_case(self.binary, 900.0, run=timed_out)
+        timed = runner.execute_case(
+            self.binary,
+            900.0,
+            run=lambda *_a, **_k: FakeProcess("partial out", "partial err", timeout=True),
+        )
+        self.assertEqual(timed.stdout, "partial out")
+        self.assertEqual(timed.stderr, "partial err")
         self.assertIsNone(timed.returncode)
         self.assertIsNone(timed.signal)
         self.assertEqual(timed.termination, "timeout")
@@ -463,6 +491,23 @@ class RootRaftRunnerTest(unittest.TestCase):
             900.0,
             run=spawn_failed,
         )
+
+    def test_execute_bounds_total_capture_across_streams(self) -> None:
+        cap = runner.MAX_TOTAL_CAPTURE_BYTES
+        result = runner.execute_case(
+            self.binary,
+            900.0,
+            run=lambda *_a, **_k: FakeProcess(b"x" * (cap + 4096), b"y" * 4096, 0),
+        )
+        self.assertTrue(result.capture_truncated)
+        self.assertLessEqual(
+            len(result.stdout.encode("utf-8")) + len(result.stderr.encode("utf-8")),
+            cap,
+        )
+        evidence = runner.collect_failure_evidence(
+            GOOD_OUTPUT, "", capture_truncated=True
+        )
+        self.assertFalse(evidence.complete)
 
     def test_failure_evidence_retains_complete_failed_suite(self) -> None:
         evidence = runner.collect_failure_evidence(NONZERO_FAILED_OUTPUT)
@@ -479,6 +524,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             evidence.counts,
             {"passed": 2, "failed": 1, "ignored": 0, "measured": 0, "filtered": 0},
         )
+        self.assertEqual(evidence.suite_counts, evidence.counts)
         self.assertIsNone(evidence.failure_phase)
         self.assertIsNone(evidence.failure_class)
         self.assertTrue(evidence.diagnostics_valid)
@@ -499,6 +545,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             {"passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered": 0},
         )
         self.assertEqual([case["status"] for case in evidence.cases], ["passed"] * 3)
+        self.assertEqual(evidence.suite_counts["passed"], 3)
 
         failed_row_ok_summary = (
             f"running 3 tests\n"
@@ -514,6 +561,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             {"passed": 2, "failed": 1, "ignored": 0, "measured": 0, "filtered": 0},
         )
         self.assertEqual(evidence.cases[0], {"name": CASE_REAL, "status": "failed"})
+        self.assertEqual(evidence.suite_counts, {"passed": 3, "failed": 0, "ignored": 0, "measured": 0, "filtered": 0})
 
         consistent = runner.collect_failure_evidence(
             f"running 3 tests\n"
@@ -540,6 +588,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             evidence.counts,
             {"passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered": 0},
         )
+        self.assertIsNone(evidence.suite_counts)
         empty = runner.collect_failure_evidence("")
         self.assertFalse(empty.complete)
         self.assertEqual(empty.cases, [])
@@ -555,6 +604,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             f"test result: FAILED. 999 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
         )
         self.assertFalse(oversized.complete)
+        self.assertIsNone(oversized.suite_counts)
         self.assertEqual(oversized.counts["passed"], 3)
 
     def test_failure_evidence_rejects_unknown_duplicate_and_bad_frames(self) -> None:
@@ -575,36 +625,69 @@ class RootRaftRunnerTest(unittest.TestCase):
             f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
             "phase=commit class=proposal_scope\n"
         )
-        framed = runner.collect_failure_evidence(frame)
+        framed = runner.collect_failure_evidence("", frame)
         self.assertEqual(framed.failure_phase, "commit")
         self.assertEqual(framed.failure_class, "proposal_scope")
         self.assertTrue(framed.diagnostics_valid)
 
         bad = runner.collect_failure_evidence(
+            "",
             f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
-            "phase=commit class=not_a_class\n" + SECRET
+            "phase=commit class=not_a_class\n" + SECRET,
         )
         self.assertIsNone(bad.failure_phase)
         self.assertFalse(bad.diagnostics_valid)
         self.assertNotIn(SECRET, json.dumps(bad.cases))
 
         conflicting = runner.collect_failure_evidence(
+            "",
             f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n"
-            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=refusal class=storage\n"
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=refusal class=storage\n",
         )
         self.assertIsNone(conflicting.failure_phase)
         self.assertFalse(conflicting.diagnostics_valid)
 
+    def test_failure_evidence_keeps_stdout_rows_and_stderr_frames_separate(self) -> None:
+        frame = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
+            "phase=commit class=proposal_scope\n"
+        )
+        evidence = runner.collect_failure_evidence(NONZERO_FAILED_OUTPUT, frame)
+        self.assertTrue(evidence.complete)
+        self.assertEqual(evidence.failure_phase, "commit")
+        self.assertEqual(evidence.failure_class, "proposal_scope")
+        self.assertEqual(evidence.suite_counts, evidence.counts)
+
+        frame_on_stdout = runner.collect_failure_evidence(frame, "")
+        self.assertEqual(frame_on_stdout.cases, [])
+        self.assertIsNone(frame_on_stdout.failure_phase)
+        self.assertIsNone(frame_on_stdout.failure_class)
+
+        collided = (
+            f"running 3 tests\n"
+            f"test {CASE_PRUNED} ... ok\n"
+            f"test {CASE_REAL} ... {frame.strip()}\n"
+            "FAILED\n"
+            f"test {CASE_DRAIN} ... FAILED\n"
+            "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        )
+        evidence = runner.collect_failure_evidence(collided, frame)
+        self.assertFalse(evidence.complete)
+        self.assertEqual([case["name"] for case in evidence.cases], [CASE_PRUNED, CASE_DRAIN])
+        self.assertEqual(evidence.suite_counts, {"passed": 1, "failed": 2, "ignored": 0, "measured": 0, "filtered": 0})
+        self.assertEqual(evidence.failure_phase, "commit")
+        self.assertEqual(evidence.failure_class, "proposal_scope")
+
     def test_main_retains_partial_evidence_on_nonzero_without_passing(self) -> None:
         path = self.root / "out" / "nonzero-report.json"
-        output = (
-            NONZERO_FAILED_OUTPUT
-            + f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
+        output = NONZERO_FAILED_OUTPUT
+        stderr = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
             "phase=commit class=proposal_scope\n"
         )
 
         def fake_execute(*_args, **_kwargs):
-            return runner.ExecutionResult(output, SECRET, 101, None, "exited")
+            return runner.ExecutionResult(output, stderr, 101, None, "exited")
 
         with mock.patch.object(runner, "require_source_state", return_value=self.head), \
              mock.patch.object(runner, "_safe_head", return_value=self.head), \
@@ -637,6 +720,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             "exit_code": 101,
             "signal": None,
             "evidence_complete": True,
+            "suite_counts": {"passed": 2, "failed": 1, "ignored": 0, "measured": 0, "filtered": 0},
             "failure_phase": "commit",
             "failure_class": "proposal_scope",
             "unknown_case": False,
@@ -718,6 +802,10 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertEqual(report["error_class"], "nonzero_exit")
         self.assertEqual(len(report["cases"]), 3)
         self.assertFalse(report["diagnostics"]["evidence_unchanged"])
+        self.assertEqual(
+            report["diagnostics"]["suite_counts"],
+            {"passed": 2, "failed": 1, "ignored": 0, "measured": 0, "filtered": 0},
+        )
 
     def test_main_timeout_and_signal_keep_partial_evidence(self) -> None:
         partial = (
@@ -765,6 +853,7 @@ class RootRaftRunnerTest(unittest.TestCase):
                 self.assertEqual(report["diagnostics"]["exit_code"], None)
                 self.assertEqual(report["diagnostics"]["signal"], signal)
                 self.assertFalse(report["diagnostics"]["evidence_complete"])
+                self.assertIsNone(report["diagnostics"]["suite_counts"])
                 self.assertIsNone(report["diagnostics"]["failure_phase"])
                 self.assertIsNone(report["diagnostics"]["failure_class"])
                 self.assertTrue(report["diagnostics"]["diagnostics_valid"])
@@ -808,6 +897,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             "exit_code": 101,
             "signal": None,
             "evidence_complete": True,
+            "suite_counts": {"passed": 2, "failed": 1, "ignored": 0, "measured": 0, "filtered": 0},
             "failure_phase": "commit",
             "failure_class": "proposal_scope",
             "unknown_case": False,

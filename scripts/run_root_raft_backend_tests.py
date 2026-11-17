@@ -24,6 +24,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from threading import Lock, Thread
 
 import native_build_receipt as receipt_contract
 
@@ -38,6 +39,8 @@ REQUIRED_CASES = (
 EXPECTED_CASE_COUNT = len(REQUIRED_CASES)
 TEST_ARGS = ("--test-threads=1",)
 MAX_TIMEOUT_SECONDS = 900.0
+MAX_TOTAL_CAPTURE_BYTES = 2 * 1024 * 1024
+_CAPTURE_CHUNK = 64 * 1024
 PHASES = frozenset(("receipt", "source", "execute", "parse", "report", "complete"))
 ERROR_CODES = frozenset(
     (
@@ -86,8 +89,8 @@ _FAILURE_CLASSES = frozenset(
 _FAILURE_CASES = {REQUIRED_CASES[0]: _FAILURE_PHASES}
 _FAILURE_STATUS = {"ok": "passed", "FAILED": "failed", "ignored": "ignored"}
 _DIAGNOSTIC_KEYS = (
-    "exit_code", "signal", "evidence_complete", "failure_phase", "failure_class",
-    "unknown_case", "diagnostics_valid", "evidence_unchanged",
+    "exit_code", "signal", "evidence_complete", "suite_counts", "failure_phase",
+    "failure_class", "unknown_case", "diagnostics_valid", "evidence_unchanged",
 )
 
 
@@ -114,12 +117,14 @@ class ExecutionResult:
     returncode: int | None
     signal: int | None
     termination: str
+    capture_truncated: bool = False
 
 
 @dataclass(frozen=True)
 class FailureEvidence:
     cases: list[dict[str, str]]
     counts: dict[str, int]
+    suite_counts: dict[str, int] | None
     complete: bool
     failure_phase: str | None
     failure_class: str | None
@@ -391,53 +396,99 @@ def _text_output(value) -> str:
     return value if isinstance(value, str) else ""
 
 
-def execute_case(binary: Path, timeout: float, *, run=subprocess.run) -> ExecutionResult:
-    """Execute the supplied binary exactly once and retain RAM-only status/output."""
+def _read_stream(stream, lock, state, key) -> None:
+    chunks = []
+    if stream is None:
+        with lock:
+            state[key] = b""
+        return
+    while True:
+        chunk = stream.read(_CAPTURE_CHUNK)
+        if not chunk:
+            break
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", errors="replace")
+        with lock:
+            remaining = MAX_TOTAL_CAPTURE_BYTES - state["total"]
+            if remaining > 0:
+                retained = chunk[:remaining]
+                chunks.append(retained)
+                state["total"] += len(retained)
+            if len(chunk) > max(remaining, 0):
+                state["truncated"] = True
+    with lock:
+        state[key] = b"".join(chunks)
+
+
+def execute_case(binary: Path, timeout: float, *, run=subprocess.Popen) -> ExecutionResult:
+    """Execute the supplied binary once with separately bounded stdout/stderr capture."""
     command = [str(binary), *TEST_ARGS]
     try:
-        result = run(
+        process = run(
             command,
             cwd=ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        return ExecutionResult(
-            _text_output(getattr(error, "stdout", getattr(error, "output", ""))),
-            _text_output(getattr(error, "stderr", "")),
-            None,
-            None,
-            "timeout",
         )
     except OSError:
         raise RunnerError("execute", "spawn_failed") from None
-    returncode = getattr(result, "returncode", None)
-    _need(
-        isinstance(returncode, int) and not isinstance(returncode, bool),
-        "execute",
-        "spawn_failed",
-    )
-    stdout = _text_output(getattr(result, "stdout", ""))
-    stderr = _text_output(getattr(result, "stderr", ""))
+    lock = Lock()
+    state = {"total": 0, "truncated": False, "stdout": b"", "stderr": b""}
+    stdout_thread = Thread(target=_read_stream, args=(process.stdout, lock, state, "stdout"), daemon=True)
+    stderr_thread = Thread(target=_read_stream, args=(process.stderr, lock, state, "stderr"), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+        if stdout_thread.is_alive() or stderr_thread.is_alive():
+            state["truncated"] = True
+        return ExecutionResult(
+            _text_output(state["stdout"]),
+            _text_output(state["stderr"]),
+            None,
+            None,
+            "timeout",
+            state["truncated"],
+        )
+    stdout_thread.join(timeout=5)
+    stderr_thread.join(timeout=5)
+    if stdout_thread.is_alive() or stderr_thread.is_alive():
+        state["truncated"] = True
+    if not isinstance(returncode, int) or isinstance(returncode, bool):
+        raise RunnerError("execute", "spawn_failed")
+    stdout = _text_output(state["stdout"])
+    stderr = _text_output(state["stderr"])
     if returncode < 0:
-        return ExecutionResult(stdout, stderr, None, -returncode, "signal")
-    return ExecutionResult(stdout, stderr, returncode, None, "exited")
+        return ExecutionResult(stdout, stderr, None, -returncode, "signal", state["truncated"])
+    return ExecutionResult(stdout, stderr, returncode, None, "exited", state["truncated"])
 
 
-def collect_failure_evidence(text) -> FailureEvidence:
-    """Collect only fixed known case rows, an anchored summary and fixed frames."""
-    if not isinstance(text, str):
-        text = ""
+def collect_failure_evidence(
+    stdout, stderr="", *, capture_truncated=False
+) -> FailureEvidence:
+    """Collect observed stdout rows plus one anchored suite summary and stderr frames."""
+    if not isinstance(stdout, str):
+        stdout = ""
+    if not isinstance(stderr, str):
+        stderr = ""
     running = []
     summaries = []
     case_lines = []
     frame_set = set()
     unknown_case = False
     diagnostics_invalid = False
-    for raw_line in text.splitlines():
+    for raw_line in stdout.splitlines():
         line = _ANSI.sub("", raw_line).strip()
         match = _RUNNING.fullmatch(line)
         if match:
@@ -454,7 +505,8 @@ def collect_failure_evidence(text) -> FailureEvidence:
                 unknown_case = True
             else:
                 case_lines.append((name, outcome))
-            continue
+    for raw_line in stderr.splitlines():
+        line = _ANSI.sub("", raw_line).strip()
         match = _FAILURE_FRAME.fullmatch(line)
         if match:
             name, phase, class_code = match.groups()
@@ -485,7 +537,7 @@ def collect_failure_evidence(text) -> FailureEvidence:
 
     summary = summaries[0] if len(summaries) == 1 else None
     summary_status = None
-    summary_counts = None
+    suite_counts = None
     if summary is not None:
         status, passed, failed, ignored, measured, filtered = summary
         candidate = {
@@ -497,35 +549,31 @@ def collect_failure_evidence(text) -> FailureEvidence:
         }
         if not any(value > EXPECTED_CASE_COUNT for value in candidate.values()):
             summary_status = status
-            summary_counts = candidate
+            suite_counts = candidate
 
     summary_consistent = (
-        summary_counts is not None
+        suite_counts is not None
         and summary_status is not None
-        and summary_counts["passed"] == observed["passed"]
-        and summary_counts["failed"] == observed["failed"]
-        and summary_counts["ignored"] == observed["ignored"]
-        and summary_counts["measured"] == observed["measured"]
-        and summary_counts["filtered"] == observed["filtered"]
+        and suite_counts["passed"] == observed["passed"]
+        and suite_counts["failed"] == observed["failed"]
+        and suite_counts["ignored"] == observed["ignored"]
+        and suite_counts["measured"] == observed["measured"]
+        and suite_counts["filtered"] == observed["filtered"]
         and ((summary_status == "FAILED") == (observed["failed"] > 0))
-    )
-    counts = (
-        summary_counts
-        if summary_consistent and not duplicate_case and not unknown_case
-        else observed
     )
     running_count = running[0] if len(running) == 1 else None
     complete = (
         summary_consistent
+        and not capture_truncated
         and running_count is not None
         and not duplicate_case
         and not unknown_case
         and len(case_lines) == EXPECTED_CASE_COUNT
         and len(by_name) == EXPECTED_CASE_COUNT
-        and running_count == sum(summary_counts.values())
+        and running_count == sum(suite_counts.values())
         and running_count == len(case_lines)
-        and summary_counts["measured"] == 0
-        and summary_counts["filtered"] == 0
+        and suite_counts["measured"] == 0
+        and suite_counts["filtered"] == 0
     )
     cases = [
         {"name": name, "status": _FAILURE_STATUS[by_name[name]]}
@@ -541,7 +589,8 @@ def collect_failure_evidence(text) -> FailureEvidence:
         _name, phase, class_code = next(iter(frame_set))
     return FailureEvidence(
         cases=cases,
-        counts=counts,
+        counts=observed,
+        suite_counts=suite_counts,
         complete=complete,
         failure_phase=phase,
         failure_class=class_code,
@@ -611,6 +660,7 @@ def _failure_diagnostics(execution, evidence, evidence_unchanged) -> dict:
         "exit_code": None if execution is None else execution.returncode,
         "signal": None if execution is None else execution.signal,
         "evidence_complete": evidence.complete,
+        "suite_counts": evidence.suite_counts,
         "failure_phase": evidence.failure_phase,
         "failure_class": evidence.failure_class,
         "unknown_case": evidence.unknown_case,
@@ -655,7 +705,6 @@ def main(argv=None) -> int:
         )
         phase = "execute"
         execution = execute_case(binary, timeout)
-        combined = execution.stdout + "\n" + execution.stderr
         if execution.termination == "timeout":
             error_class = "timeout"
         elif execution.termination == "signal":
@@ -670,10 +719,17 @@ def main(argv=None) -> int:
                 phase = error.phase
                 error_class = error.code
             else:
-                phase = "execute"
-                status = 0
+                if execution.capture_truncated:
+                    error_class = "output_invalid"
+                else:
+                    phase = "execute"
+                    status = 0
         if status != 0:
-            evidence = collect_failure_evidence(combined)
+            evidence = collect_failure_evidence(
+                execution.stdout,
+                execution.stderr,
+                capture_truncated=execution.capture_truncated,
+            )
             cases = evidence.cases
             counts = evidence.counts
         if execution is not None:
@@ -688,7 +744,11 @@ def main(argv=None) -> int:
                     status = 1
                     phase = "execute"
                     error_class = "evidence_changed"
-                    evidence = collect_failure_evidence(combined)
+                    evidence = collect_failure_evidence(
+                        execution.stdout,
+                        execution.stderr,
+                        capture_truncated=execution.capture_truncated,
+                    )
                     cases = evidence.cases
                     counts = evidence.counts
         if status == 0:
