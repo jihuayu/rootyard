@@ -1,0 +1,390 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use base64::{Engine, engine::general_purpose::STANDARD};
+
+use super::{
+    MAX_TREE_ENTRIES, MAX_WORKSPACE_BYTES, MERKLE_CODEC_VERSION, MERKLE_MANIFEST_SCHEMA, MerkleSyncError,
+    manifest::{
+        EmptyDirPolicy, HeadSnapshot, MerkleChangeKind, MerkleChildKind, MerkleDiffEntry, MerkleDirChild,
+        MerkleStateManifest, compute_dir_node_sha256, compute_index_merkle_root, compute_state_merkle_root,
+        decode_rel_bytes, encode_rel_bytes, is_valid_oid_hex, is_valid_sha256_hex, validate_rel_path_bytes,
+    },
+};
+
+pub fn validate_manifest(manifest: &MerkleStateManifest) -> Result<(), MerkleSyncError> {
+    if manifest.schema != MERKLE_MANIFEST_SCHEMA || manifest.codec_version != MERKLE_CODEC_VERSION {
+        return Err(MerkleSyncError::InvalidManifest("unsupported merkle manifest schema or codec version".into()));
+    }
+    if manifest.tenant_id.is_nil()
+        || manifest.repo_id.is_nil()
+        || manifest.history_id.is_nil()
+        || manifest.workspace_id.is_nil()
+        || manifest.checkpoint_id.is_nil()
+    {
+        return Err(MerkleSyncError::InvalidManifest("manifest identifiers must be non-nil".into()));
+    }
+    if manifest.chunk_size_bytes == 0 || manifest.chunk_size_bytes as usize > super::MAX_CHUNK_BYTES {
+        return Err(MerkleSyncError::InvalidManifest("invalid chunk_size_bytes".into()));
+    }
+    let fmt = manifest.git_state.object_format;
+    match &manifest.git_state.head {
+        HeadSnapshot::Attached { ref_name, commit_oid, tree_oid } => {
+            if !ref_name.starts_with("refs/") || !is_valid_oid_hex(commit_oid, fmt) || !is_valid_oid_hex(tree_oid, fmt)
+            {
+                return Err(MerkleSyncError::InvalidManifest("invalid attached HEAD metadata".into()));
+            }
+        }
+        HeadSnapshot::Detached { commit_oid, tree_oid } => {
+            if !is_valid_oid_hex(commit_oid, fmt) || !is_valid_oid_hex(tree_oid, fmt) {
+                return Err(MerkleSyncError::InvalidManifest("invalid detached HEAD metadata".into()));
+            }
+        }
+        HeadSnapshot::Unborn { ref_name } => {
+            if !ref_name.starts_with("refs/") {
+                return Err(MerkleSyncError::InvalidManifest("invalid unborn HEAD ref".into()));
+            }
+        }
+    }
+    for entry in &manifest.git_state.index_entries {
+        let path_raw = STANDARD
+            .decode(&entry.path_base64)
+            .map_err(|_| MerkleSyncError::InvalidManifest("invalid index path_base64".into()))?;
+        validate_rel_path_bytes(&path_raw)?;
+        if entry.stage > 3 || !is_valid_oid_hex(&entry.git_oid, fmt) {
+            return Err(MerkleSyncError::InvalidManifest("invalid index entry stage or oid".into()));
+        }
+    }
+    if !is_valid_sha256_hex(&manifest.git_state.index_raw_sha256)
+        || !is_valid_sha256_hex(&manifest.ignore_policy.ignore_rules_digest)
+    {
+        return Err(MerkleSyncError::InvalidManifest("invalid sha256 metadata field".into()));
+    }
+    verify_manifest_integrity(manifest)
+}
+
+pub fn verify_manifest_integrity(manifest: &MerkleStateManifest) -> Result<(), MerkleSyncError> {
+    let expected_index_root = compute_index_merkle_root(
+        manifest.git_state.object_format,
+        &manifest.git_state.index_entries,
+        &manifest.git_state.index_raw_sha256,
+        manifest.git_state.merge_head.as_deref(),
+        manifest.git_state.cherry_pick_head.as_deref(),
+        manifest.git_state.rebase_head.as_deref(),
+    );
+    if expected_index_root != manifest.git_state.index_merkle_root {
+        return Err(MerkleSyncError::IntegrityMismatch("index_merkle_root mismatch".into()));
+    }
+    let root_node =
+        manifest.nodes.get("").ok_or_else(|| MerkleSyncError::InvalidManifest("missing root directory node".into()))?;
+    if root_node.node_sha256 != manifest.worktree_root_digest {
+        return Err(MerkleSyncError::IntegrityMismatch("worktree_root_digest mismatch".into()));
+    }
+    let mut visited_entries = 0usize;
+    let mut total_bytes = 0u64;
+    let mut visited_nodes = BTreeSet::new();
+    verify_node_recursive(manifest, "", &mut visited_entries, &mut total_bytes, &mut visited_nodes)?;
+    if visited_nodes.len() != manifest.nodes.len() {
+        return Err(MerkleSyncError::InvalidManifest("orphan directory node present in manifest".into()));
+    }
+    let expected_state_root = compute_state_merkle_root(
+        &manifest.git_state,
+        &manifest.ignore_policy,
+        &manifest.worktree_root_digest,
+        manifest.chunk_size_bytes,
+    );
+    if expected_state_root != manifest.merkle_root_digest {
+        return Err(MerkleSyncError::IntegrityMismatch("merkle_root_digest mismatch".into()));
+    }
+    Ok(())
+}
+
+fn verify_node_recursive(
+    manifest: &MerkleStateManifest,
+    dir_b64: &str,
+    visited_entries: &mut usize,
+    total_bytes: &mut u64,
+    visited_nodes: &mut BTreeSet<String>,
+) -> Result<(), MerkleSyncError> {
+    if !visited_nodes.insert(dir_b64.to_owned()) {
+        return Err(MerkleSyncError::InvalidManifest("cycle in directory manifest".into()));
+    }
+    let node = manifest
+        .nodes
+        .get(dir_b64)
+        .ok_or_else(|| MerkleSyncError::InvalidManifest("missing referenced directory node".into()))?;
+    if node.schema != MERKLE_MANIFEST_SCHEMA
+        || node.codec_version != MERKLE_CODEC_VERSION
+        || node.dir_path_base64 != dir_b64
+    {
+        return Err(MerkleSyncError::InvalidManifest("directory node header mismatch".into()));
+    }
+    if compute_dir_node_sha256(dir_b64, &node.children) != node.node_sha256 {
+        return Err(MerkleSyncError::IntegrityMismatch("directory node_sha256 mismatch".into()));
+    }
+    let parent_raw = if dir_b64.is_empty() { Vec::new() } else { decode_rel_bytes(dir_b64)? };
+    for ch in &node.children {
+        let name_raw = STANDARD
+            .decode(&ch.name_base64)
+            .map_err(|_| MerkleSyncError::InvalidManifest("invalid child name_base64".into()))?;
+        let mut child_raw = parent_raw.clone();
+        if !child_raw.is_empty() {
+            child_raw.push(b'/');
+        }
+        child_raw.extend_from_slice(&name_raw);
+        validate_rel_path_bytes(&child_raw)?;
+        match ch.kind {
+            MerkleChildKind::File => {
+                *visited_entries += 1;
+                if *visited_entries > MAX_TREE_ENTRIES {
+                    return Err(MerkleSyncError::InvalidManifest("manifest entry limit exceeded".into()));
+                }
+                if ch.mode > 0o777 || ch.mode & 0o7000 != 0 {
+                    return Err(MerkleSyncError::InvalidManifest("invalid file permissions mode".into()));
+                }
+                *total_bytes = total_bytes
+                    .checked_add(ch.size)
+                    .ok_or_else(|| MerkleSyncError::InvalidManifest("workspace size overflow".into()))?;
+                if *total_bytes > MAX_WORKSPACE_BYTES {
+                    return Err(MerkleSyncError::InvalidManifest("workspace byte limit exceeded".into()));
+                }
+                let sha = ch
+                    .content_sha256
+                    .as_deref()
+                    .ok_or_else(|| MerkleSyncError::InvalidManifest("file missing content_sha256".into()))?;
+                if !is_valid_sha256_hex(sha) {
+                    return Err(MerkleSyncError::InvalidManifest("invalid file content_sha256".into()));
+                }
+                let mut sum = 0u64;
+                for (i, chunk) in ch.chunks.iter().enumerate() {
+                    if chunk.index as usize != i || chunk.offset != sum || !is_valid_sha256_hex(&chunk.sha256) {
+                        return Err(MerkleSyncError::InvalidManifest("invalid chunk layout".into()));
+                    }
+                    sum = sum
+                        .checked_add(chunk.len)
+                        .ok_or_else(|| MerkleSyncError::InvalidManifest("chunk offset overflow".into()))?;
+                }
+                if sum != ch.size {
+                    return Err(MerkleSyncError::InvalidManifest("chunk lengths do not sum to file size".into()));
+                }
+            }
+            MerkleChildKind::Symlink => {
+                *visited_entries += 1;
+                if *visited_entries > MAX_TREE_ENTRIES {
+                    return Err(MerkleSyncError::InvalidManifest("manifest entry limit exceeded".into()));
+                }
+                if ch.target_base64.is_none() || !ch.content_sha256.as_deref().is_some_and(is_valid_sha256_hex) {
+                    return Err(MerkleSyncError::InvalidManifest("invalid symlink entry".into()));
+                }
+            }
+            MerkleChildKind::EmptyDir => {
+                if matches!(manifest.ignore_policy.empty_dir_policy, EmptyDirPolicy::IgnoreEmptyDirs) {
+                    return Err(MerkleSyncError::InvalidManifest(
+                        "empty directory entry disallowed by IgnoreEmptyDirs policy".into(),
+                    ));
+                }
+            }
+            MerkleChildKind::Subdir => {
+                let sub_b64 = encode_rel_bytes(&child_raw);
+                let sub_sha = ch
+                    .subtree_node_sha256
+                    .as_deref()
+                    .ok_or_else(|| MerkleSyncError::InvalidManifest("subdir missing subtree_node_sha256".into()))?;
+                let sub_node = manifest
+                    .nodes
+                    .get(&sub_b64)
+                    .ok_or_else(|| MerkleSyncError::InvalidManifest("missing child subdir node".into()))?;
+                if sub_node.node_sha256 != sub_sha {
+                    return Err(MerkleSyncError::IntegrityMismatch("subdir hash mismatch".into()));
+                }
+                verify_node_recursive(manifest, &sub_b64, visited_entries, total_bytes, visited_nodes)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct LeafEntry {
+    path_bytes: Vec<u8>,
+    child: MerkleDirChild,
+}
+
+fn collect_subtree_leaves(
+    manifest: &MerkleStateManifest,
+    dir_b64: &str,
+    out: &mut Vec<LeafEntry>,
+) -> Result<(), MerkleSyncError> {
+    let Some(node) = manifest.nodes.get(dir_b64) else { return Ok(()) };
+    let parent_raw = if dir_b64.is_empty() { Vec::new() } else { decode_rel_bytes(dir_b64)? };
+    for ch in &node.children {
+        let name_raw = STANDARD
+            .decode(&ch.name_base64)
+            .map_err(|_| MerkleSyncError::InvalidManifest("invalid child name_base64".into()))?;
+        let mut child_raw = parent_raw.clone();
+        if !child_raw.is_empty() {
+            child_raw.push(b'/');
+        }
+        child_raw.extend_from_slice(&name_raw);
+        if ch.kind == MerkleChildKind::Subdir {
+            collect_subtree_leaves(manifest, &encode_rel_bytes(&child_raw), out)?;
+        } else {
+            out.push(LeafEntry { path_bytes: child_raw, child: ch.clone() });
+        }
+    }
+    Ok(())
+}
+
+fn diff_dir_recursive(
+    prev: &MerkleStateManifest,
+    next: &MerkleStateManifest,
+    dir_b64: &str,
+    prev_only: &mut Vec<LeafEntry>,
+    next_only: &mut Vec<LeafEntry>,
+    out: &mut Vec<MerkleDiffEntry>,
+) -> Result<(), MerkleSyncError> {
+    let prev_node = prev.nodes.get(dir_b64);
+    let next_node = next.nodes.get(dir_b64);
+    if let (Some(p), Some(n)) = (prev_node, next_node)
+        && p.node_sha256 == n.node_sha256
+    {
+        return Ok(());
+    }
+    let parent_raw = if dir_b64.is_empty() { Vec::new() } else { decode_rel_bytes(dir_b64)? };
+    let to_map = |opt: Option<&super::manifest::MerkleDirNode>| -> BTreeMap<Vec<u8>, &MerkleDirChild> {
+        opt.map(|n| n.children.iter().filter_map(|c| STANDARD.decode(&c.name_base64).ok().map(|k| (k, c))).collect())
+            .unwrap_or_default()
+    };
+    let prev_map = to_map(prev_node);
+    let next_map = to_map(next_node);
+    let names: BTreeSet<Vec<u8>> = prev_map.keys().chain(next_map.keys()).cloned().collect();
+    for name in names {
+        let mut child_raw = parent_raw.clone();
+        if !child_raw.is_empty() {
+            child_raw.push(b'/');
+        }
+        child_raw.extend_from_slice(&name);
+        match (prev_map.get(&name).copied(), next_map.get(&name).copied()) {
+            (Some(p), Some(n)) if p.kind == MerkleChildKind::Subdir && n.kind == MerkleChildKind::Subdir => {
+                if p.subtree_node_sha256 != n.subtree_node_sha256 {
+                    diff_dir_recursive(prev, next, &encode_rel_bytes(&child_raw), prev_only, next_only, out)?;
+                }
+            }
+            (Some(p), Some(n)) if p.kind == MerkleChildKind::Subdir => {
+                collect_subtree_leaves(prev, &encode_rel_bytes(&child_raw), prev_only)?;
+                next_only.push(LeafEntry { path_bytes: child_raw, child: n.clone() });
+            }
+            (Some(p), Some(n)) if n.kind == MerkleChildKind::Subdir => {
+                prev_only.push(LeafEntry { path_bytes: child_raw.clone(), child: p.clone() });
+                collect_subtree_leaves(next, &encode_rel_bytes(&child_raw), next_only)?;
+            }
+            (Some(p), Some(n)) => {
+                let change = if p.kind != n.kind {
+                    Some(MerkleChangeKind::TypeChanged)
+                } else if p.content_sha256 != n.content_sha256 || p.target_base64 != n.target_base64 {
+                    Some(MerkleChangeKind::Modified)
+                } else if p.mode != n.mode {
+                    Some(MerkleChangeKind::ModeChanged)
+                } else {
+                    None
+                };
+                if let Some(ch_kind) = change {
+                    out.push(MerkleDiffEntry {
+                        change: ch_kind,
+                        path_base64: encode_rel_bytes(&child_raw),
+                        old_path_base64: None,
+                        kind: n.kind,
+                        old_mode: Some(p.mode),
+                        new_mode: Some(n.mode),
+                        content_sha256: n.content_sha256.clone(),
+                    });
+                }
+            }
+            (Some(p), None) => {
+                if p.kind == MerkleChildKind::Subdir {
+                    collect_subtree_leaves(prev, &encode_rel_bytes(&child_raw), prev_only)?;
+                } else {
+                    prev_only.push(LeafEntry { path_bytes: child_raw, child: p.clone() });
+                }
+            }
+            (None, Some(n)) => {
+                if n.kind == MerkleChildKind::Subdir {
+                    collect_subtree_leaves(next, &encode_rel_bytes(&child_raw), next_only)?;
+                } else {
+                    next_only.push(LeafEntry { path_bytes: child_raw, child: n.clone() });
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+pub fn diff_manifests(
+    prev: &MerkleStateManifest,
+    next: &MerkleStateManifest,
+) -> Result<Vec<MerkleDiffEntry>, MerkleSyncError> {
+    let mut prev_only = Vec::new();
+    let mut next_only = Vec::new();
+    let mut out = Vec::new();
+    diff_dir_recursive(prev, next, "", &mut prev_only, &mut next_only, &mut out)?;
+
+    let mut matched_prev = vec![false; prev_only.len()];
+    let mut matched_next = vec![false; next_only.len()];
+    for (ni, n) in next_only.iter().enumerate() {
+        if !matches!(n.child.kind, MerkleChildKind::File | MerkleChildKind::Symlink) {
+            continue;
+        }
+        if let Some((pi, p)) = prev_only.iter().enumerate().find(|(pi, p)| {
+            !matched_prev[*pi]
+                && p.child.kind == n.child.kind
+                && p.child.size == n.child.size
+                && p.child.content_sha256 == n.child.content_sha256
+        }) {
+            matched_prev[pi] = true;
+            matched_next[ni] = true;
+            out.push(MerkleDiffEntry {
+                change: MerkleChangeKind::Renamed,
+                path_base64: encode_rel_bytes(&n.path_bytes),
+                old_path_base64: Some(encode_rel_bytes(&p.path_bytes)),
+                kind: n.child.kind,
+                old_mode: Some(p.child.mode),
+                new_mode: Some(n.child.mode),
+                content_sha256: n.child.content_sha256.clone(),
+            });
+        }
+    }
+    for (pi, p) in prev_only.into_iter().enumerate().filter(|(i, _)| !matched_prev[*i]) {
+        let change = if p.child.kind == MerkleChildKind::EmptyDir {
+            MerkleChangeKind::EmptyDirRemoved
+        } else {
+            MerkleChangeKind::Deleted
+        };
+        out.push(MerkleDiffEntry {
+            change,
+            path_base64: encode_rel_bytes(&p.path_bytes),
+            old_path_base64: None,
+            kind: p.child.kind,
+            old_mode: Some(p.child.mode),
+            new_mode: None,
+            content_sha256: p.child.content_sha256,
+        });
+    }
+    for (ni, n) in next_only.into_iter().enumerate().filter(|(i, _)| !matched_next[*i]) {
+        let change = if n.child.kind == MerkleChildKind::EmptyDir {
+            MerkleChangeKind::EmptyDirAdded
+        } else {
+            MerkleChangeKind::Added
+        };
+        out.push(MerkleDiffEntry {
+            change,
+            path_base64: encode_rel_bytes(&n.path_bytes),
+            old_path_base64: None,
+            kind: n.child.kind,
+            old_mode: None,
+            new_mode: Some(n.child.mode),
+            content_sha256: n.child.content_sha256,
+        });
+    }
+    out.sort_by(|a, b| a.path_base64.cmp(&b.path_base64));
+    Ok(out)
+}
