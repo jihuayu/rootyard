@@ -28,9 +28,11 @@
 //! a different ref, then B is released. The original AC requires both
 //! independent refs to commit with exact `ok` report-statuses. The current
 //! repo-wide gate is expected to reject B as `stale info`; this case records
-//! that known source gap rather than weakening the expectation. It does not
-//! prove slow HTTP body overlap and does not cover AC3 GC, backup, PR merge,
-//! crash or Raft.
+//! that known source gap rather than weakening the expectation. On every
+//! post-spawn return, error or panic, the one-shot pause is released and any
+//! still-owned push task is aborted and joined before fixture teardown. It does
+//! not prove slow HTTP body overlap and does not cover AC3 GC, backup, PR
+//! merge, crash or Raft.
 //!
 //! The external `tests/blob_git_gateway.rs` race case and its exact one-ok /
 //! one-ng assertions remain untouched; it stays the unsynchronized stress case.
@@ -64,6 +66,7 @@ use super::session_http_acceptance::fixtures::{
 
 use std::{
     collections::HashMap,
+    panic::AssertUnwindSafe,
     path::Path,
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
@@ -78,6 +81,7 @@ use axum::{
     middleware::{self, Next},
     response::Response,
 };
+use futures_util::FutureExt;
 use serde_json::Value;
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
@@ -109,6 +113,15 @@ type GitReport = (String, Vec<(String, Option<String>)>);
 /// Abort the real `axum::serve` task when the case ends, including on failure.
 struct ServerGuard {
     task: JoinHandle<Result<(), std::io::Error>>,
+}
+
+impl ServerGuard {
+    /// Explicitly abort and join the real server task so request work is
+    /// settled before the fixture schema is torn down.
+    async fn shutdown(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
 }
 
 impl Drop for ServerGuard {
@@ -255,7 +268,7 @@ async fn independent_refs_case(db: &Db) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let app = capture_receive_responses(router(state.clone()), captures.clone());
-    let _server = ServerGuard { task: tokio::spawn(async move { axum::serve(listener, app).await }) };
+    let server = ServerGuard { task: tokio::spawn(async move { axum::serve(listener, app).await }) };
 
     let created = create_repository(address, &owner, &name).await?;
     let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
@@ -283,119 +296,143 @@ async fn independent_refs_case(db: &Db) -> Result<()> {
     let revision_before = gate_revision(db, repository_id).await?;
 
     // B reaches Start::Fresh and pauses with its pending row durable, before
-    // prepare can observe a later gate revision.
-    let mut second_push =
-        spawn_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B);
-    tokio::select! {
-        _ = pause.wait_reached() => {}
-        exited = &mut second_push => {
-            let output = exited.context("the paused independent push task failed")??;
-            return Err(anyhow!(
-                "the independent push exited before its post-admission rendezvous: {}",
-                redacted(&output)
-            ));
+    // prepare can observe a later gate revision. From this point on, every
+    // fallible read/assertion and both push tasks are owned by the guarded
+    // block so the pause is released and the tasks are aborted/joined before
+    // the fixture returns, including on a panic.
+    let mut second_push = Some(spawn_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B));
+    let mut first_push: Option<JoinHandle<Result<git::Output>>> = None;
+    let body_pause = pause.clone();
+    let outcome = AssertUnwindSafe(async {
+        {
+            let second_handle =
+                second_push.as_mut().ok_or_else(|| anyhow!("the independent push task was not created"))?;
+            tokio::select! {
+                _ = body_pause.wait_reached() => {}
+                exited = second_handle => {
+                    let output = exited.context("the paused independent push task failed")??;
+                    return Err(anyhow!(
+                        "the independent push exited before its post-admission rendezvous: {}",
+                        redacted(&output)
+                    ));
+                }
+            }
         }
+        let (second_state, second_terminal) = operation_row(db, repository_id, second_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the paused independent operation has no durable row"))?;
+        ensure!(second_state == "pending", "the paused independent operation is {second_state}, not pending");
+        ensure!(second_terminal.is_none(), "the paused independent operation already has a terminal");
+        ensure!(
+            gate_revision(db, repository_id).await? == revision_before,
+            "the gate moved before the first independent commit"
+        );
+
+        // A commits a different ref while B is paused after admission.
+        first_push = Some(spawn_push_ref(git, first_dir, direct_url, first_operation, INDEPENDENT_A));
+        let first_handle =
+            first_push.take().ok_or_else(|| anyhow!("the first independent push task was not created"))?;
+        let first_output = first_handle.await.context("the first independent push task failed")??;
+        ensure!(first_output.success, "the first independent push failed: {}", redacted(&first_output));
+        let revision_after_first = gate_revision(db, repository_id).await?;
+        ensure!(
+            revision_after_first == revision_before + 1,
+            "the first independent commit did not advance the gate exactly once"
+        );
+
+        body_pause.release();
+        let second_handle = second_push.take().ok_or_else(|| anyhow!("the paused independent push task was lost"))?;
+        let second_output = second_handle.await.context("the paused independent push task failed")??;
+
+        let first_capture =
+            captures.take(first_operation).ok_or_else(|| anyhow!("the first independent push has no raw reply"))?;
+        let second_capture =
+            captures.take(second_operation).ok_or_else(|| anyhow!("the second independent push has no raw reply"))?;
+        ensure!(captures.is_empty(), "the service answered unexpected extra receive-pack operations");
+        ensure!(
+            first_capture.status == 200,
+            "the service answered the first independent push with {}",
+            first_capture.status
+        );
+        ensure!(
+            second_capture.status == 200,
+            "the service answered the second independent push with {}",
+            second_capture.status
+        );
+        ensure!(!first_capture.truncated, "the first independent raw reply is truncated");
+        ensure!(!second_capture.truncated, "the second independent raw reply is truncated");
+        let (first_unpack, first_verdicts) = report_status(&first_capture.body)?;
+        let (second_unpack, second_verdicts) = report_status(&second_capture.body)?;
+        ensure!(first_unpack == "ok", "the first independent report-status did not unpack: {first_unpack}");
+        ensure!(second_unpack == "ok", "the second independent report-status did not unpack: {second_unpack}");
+        ensure!(
+            first_verdicts == vec![(INDEPENDENT_A.to_owned(), None)],
+            "the first independent report-status is not exactly one ok on {INDEPENDENT_A}: {first_verdicts:?}"
+        );
+        ensure!(
+            second_verdicts == vec![(INDEPENDENT_B.to_owned(), None)],
+            "the second independent report-status is not exactly one ok on {INDEPENDENT_B}: {second_verdicts:?}"
+        );
+        ensure!(first_output.success, "the first independent push was refused: {}", redacted(&first_output));
+        ensure!(second_output.success, "the second independent push was refused: {}", redacted(&second_output));
+
+        let first_oid = durable_ref(db, repository_id, INDEPENDENT_A)
+            .await?
+            .ok_or_else(|| anyhow!("durable {INDEPENDENT_A} is missing"))?;
+        let second_oid = durable_ref(db, repository_id, INDEPENDENT_B)
+            .await?
+            .ok_or_else(|| anyhow!("durable {INDEPENDENT_B} is missing"))?;
+        ensure!(first_oid == first_new, "durable {INDEPENDENT_A} is {first_oid}, not {first_new}");
+        ensure!(second_oid == second_new, "durable {INDEPENDENT_B} is {second_oid}, not {second_new}");
+
+        let (first_state, first_terminal) = operation_row(db, repository_id, first_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the first independent operation has no durable row"))?;
+        let (second_state, second_terminal) = operation_row(db, repository_id, second_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the second independent operation has no durable row"))?;
+        ensure!(first_state == "committed", "the first independent operation is {first_state}, not committed");
+        ensure!(second_state == "committed", "the second independent operation is {second_state}, not committed");
+        ensure!(first_terminal.is_some(), "the first independent operation has no terminal");
+        ensure!(second_terminal.is_some(), "the second independent operation has no terminal");
+
+        let revision_after = gate_revision(db, repository_id).await?;
+        ensure!(
+            revision_after == revision_before + 2,
+            "the gate moved {revision_before}->{revision_after}, not exactly two independent revisions"
+        );
+        let (first_event_revision, first_event_outcome) = core_event(db, repository_id, first_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the first independent operation has no core event"))?;
+        let (second_event_revision, second_event_outcome) = core_event(db, repository_id, second_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the second independent operation has no core event"))?;
+        ensure!(first_event_outcome == "committed", "the first core event is {first_event_outcome}, not committed");
+        ensure!(second_event_outcome == "committed", "the second core event is {second_event_outcome}, not committed");
+        ensure!(
+            first_event_revision == revision_before + 1,
+            "the first core event revision is {first_event_revision}, not {}",
+            revision_before + 1
+        );
+        ensure!(
+            second_event_revision == revision_before + 2,
+            "the second core event revision is {second_event_revision}, not {}",
+            revision_before + 2
+        );
+
+        Ok::<(), anyhow::Error>(())
+    })
+    .catch_unwind()
+    .await;
+
+    release_and_drain_pushes(pause.as_ref(), &mut second_push, &mut first_push).await;
+    server.shutdown().await;
+
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(payload) => std::panic::resume_unwind(payload),
     }
-    let (second_state, second_terminal) = operation_row(db, repository_id, second_operation)
-        .await?
-        .ok_or_else(|| anyhow!("the paused independent operation has no durable row"))?;
-    ensure!(second_state == "pending", "the paused independent operation is {second_state}, not pending");
-    ensure!(second_terminal.is_none(), "the paused independent operation already has a terminal");
-    ensure!(
-        gate_revision(db, repository_id).await? == revision_before,
-        "the gate moved before the first independent commit"
-    );
-
-    // A commits a different ref while B is paused after admission.
-    let first_output = spawn_push_ref(git, first_dir, direct_url, first_operation, INDEPENDENT_A).await?;
-    let first_output = first_output.context("the first independent push task failed")?;
-    ensure!(first_output.success, "the first independent push failed: {}", redacted(&first_output));
-    let revision_after_first = gate_revision(db, repository_id).await?;
-    ensure!(
-        revision_after_first == revision_before + 1,
-        "the first independent commit did not advance the gate exactly once"
-    );
-
-    pause.release();
-    let second_output = second_push.await.context("the paused independent push task failed")??;
-
-    let first_capture =
-        captures.take(first_operation).ok_or_else(|| anyhow!("the first independent push has no raw reply"))?;
-    let second_capture =
-        captures.take(second_operation).ok_or_else(|| anyhow!("the second independent push has no raw reply"))?;
-    ensure!(captures.is_empty(), "the service answered unexpected extra receive-pack operations");
-    ensure!(
-        first_capture.status == 200,
-        "the service answered the first independent push with {}",
-        first_capture.status
-    );
-    ensure!(
-        second_capture.status == 200,
-        "the service answered the second independent push with {}",
-        second_capture.status
-    );
-    ensure!(!first_capture.truncated, "the first independent raw reply is truncated");
-    ensure!(!second_capture.truncated, "the second independent raw reply is truncated");
-    let (first_unpack, first_verdicts) = report_status(&first_capture.body)?;
-    let (second_unpack, second_verdicts) = report_status(&second_capture.body)?;
-    ensure!(first_unpack == "ok", "the first independent report-status did not unpack: {first_unpack}");
-    ensure!(second_unpack == "ok", "the second independent report-status did not unpack: {second_unpack}");
-    ensure!(
-        first_verdicts == vec![(INDEPENDENT_A.to_owned(), None)],
-        "the first independent report-status is not exactly one ok on {INDEPENDENT_A}: {first_verdicts:?}"
-    );
-    ensure!(
-        second_verdicts == vec![(INDEPENDENT_B.to_owned(), None)],
-        "the second independent report-status is not exactly one ok on {INDEPENDENT_B}: {second_verdicts:?}"
-    );
-    ensure!(first_output.success, "the first independent push was refused: {}", redacted(&first_output));
-    ensure!(second_output.success, "the second independent push was refused: {}", redacted(&second_output));
-
-    let first_oid = durable_ref(db, repository_id, INDEPENDENT_A)
-        .await?
-        .ok_or_else(|| anyhow!("durable {INDEPENDENT_A} is missing"))?;
-    let second_oid = durable_ref(db, repository_id, INDEPENDENT_B)
-        .await?
-        .ok_or_else(|| anyhow!("durable {INDEPENDENT_B} is missing"))?;
-    ensure!(first_oid == first_new, "durable {INDEPENDENT_A} is {first_oid}, not {first_new}");
-    ensure!(second_oid == second_new, "durable {INDEPENDENT_B} is {second_oid}, not {second_new}");
-
-    let (first_state, first_terminal) = operation_row(db, repository_id, first_operation)
-        .await?
-        .ok_or_else(|| anyhow!("the first independent operation has no durable row"))?;
-    let (second_state, second_terminal) = operation_row(db, repository_id, second_operation)
-        .await?
-        .ok_or_else(|| anyhow!("the second independent operation has no durable row"))?;
-    ensure!(first_state == "committed", "the first independent operation is {first_state}, not committed");
-    ensure!(second_state == "committed", "the second independent operation is {second_state}, not committed");
-    ensure!(first_terminal.is_some(), "the first independent operation has no terminal");
-    ensure!(second_terminal.is_some(), "the second independent operation has no terminal");
-
-    let revision_after = gate_revision(db, repository_id).await?;
-    ensure!(
-        revision_after == revision_before + 2,
-        "the gate moved {revision_before}->{revision_after}, not exactly two independent revisions"
-    );
-    let (first_event_revision, first_event_outcome) = core_event(db, repository_id, first_operation)
-        .await?
-        .ok_or_else(|| anyhow!("the first independent operation has no core event"))?;
-    let (second_event_revision, second_event_outcome) = core_event(db, repository_id, second_operation)
-        .await?
-        .ok_or_else(|| anyhow!("the second independent operation has no core event"))?;
-    ensure!(first_event_outcome == "committed", "the first core event is {first_event_outcome}, not committed");
-    ensure!(second_event_outcome == "committed", "the second core event is {second_event_outcome}, not committed");
-    ensure!(
-        first_event_revision == revision_before + 1,
-        "the first core event revision is {first_event_revision}, not {}",
-        revision_before + 1
-    );
-    ensure!(
-        second_event_revision == revision_before + 2,
-        "the second core event revision is {second_event_revision}, not {}",
-        revision_before + 2
-    );
-
-    Ok(())
 }
 
 async fn case(db: &Db) -> Result<()> {
@@ -653,6 +690,26 @@ fn spawn_push_ref(
         let target = format!("HEAD:{ref_name}");
         git.run(&directory, &["-c", header.as_str(), "push", url.as_str(), target.as_str()]).await
     })
+}
+
+/// Release the selected one-shot pause and abort/join any push task still
+/// owned by the case. This runs before the server task and fixture teardown on
+/// normal, error and panic paths; task join failures are intentionally ignored
+/// so the case's original error or panic remains primary.
+async fn release_and_drain_pushes(
+    pause: &AdmissionPause,
+    second_push: &mut Option<JoinHandle<Result<git::Output>>>,
+    first_push: &mut Option<JoinHandle<Result<git::Output>>>,
+) {
+    pause.release();
+    if let Some(handle) = second_push.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = first_push.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 
 async fn gate_revision(db: &Db, repository_id: Uuid) -> Result<i64> {
