@@ -260,6 +260,11 @@ fn seed_one(dir: &TempDir, tag: &str, file: &str, bytes: &[u8]) -> Result<(Strin
     Ok((oid, p, i))
 }
 
+async fn await_gate(entered: &Notify) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(25), entered.notified()).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn streaming_growth_beyond_16_packs_sha1_and_sha256_lifecycle() -> Result<()> {
     let (s3, dl) = (LoopbackS3::shared(), Instant::now() + Duration::from_secs(90));
@@ -390,7 +395,7 @@ async fn concurrent_commit_rejects_window_overflow_and_compacted_base() -> Resul
 
         let (eng_a, req_a) = (Arc::clone(&engine), push_req("refs/heads/a", &z, &oa, vec![(pa, ia)]));
         let (entered, release, task_a) = s3.spawn_gated(&pa_sha, async move { eng_a.apply_push(req_a, dl).await });
-        entered.notified().await;
+        await_gate(&entered).await?;
         engine.apply_push(push_req("refs/heads/b", &z, &ob, vec![(pb, ib)]), dl).await?;
         release.notify_one();
         let err = task_a.await?.unwrap_err();
@@ -413,7 +418,7 @@ async fn concurrent_commit_rejects_window_overflow_and_compacted_base() -> Resul
     engine.apply_push(push_req("refs/heads/prune", &z, &op, vec![(pp, ip)]), dl).await?;
     let (eng_np, np) = (Arc::clone(&engine), push_req("refs/heads/release", &z, &op, vec![]));
     let (entered, release, task_np) = s3.spawn_gated(&pp_sha, async move { eng_np.apply_push(np, dl).await });
-    entered.notified().await;
+    await_gate(&entered).await?;
     engine.apply_push(push_req("refs/heads/prune", &op, &z, vec![]), dl).await?;
     engine.compact_serving_frontier(dl).await?;
     release.notify_one();
@@ -445,7 +450,7 @@ async fn compaction_barriers_pins_cancel_and_spoofed_object_bounds() -> Result<(
     engine.apply_push(push_req("refs/heads/temp", &o2, &z, vec![]), dl).await?;
     let eng_c = Arc::clone(&engine);
     let (entered, release, task_c) = s3.spawn_gated(&p1_sha, async move { eng_c.compact_serving_frontier(dl).await });
-    entered.notified().await;
+    await_gate(&entered).await?;
     engine.apply_push(push_req("refs/heads/resurrect", &z, &o2, vec![]), dl).await?;
     release.notify_one();
     assert!(matches!(task_c.await?.unwrap_err(), GrowthEngineError::CompactionConflict));
@@ -456,7 +461,7 @@ async fn compaction_barriers_pins_cancel_and_spoofed_object_bounds() -> Result<(
     engine.apply_push(push_req("refs/heads/pin-tmp", &o3, &z, vec![]), dl).await?;
     let eng_p = Arc::clone(&engine);
     let (entered, release, task_p) = s3.spawn_gated(&p3_sha, async move { eng_p.compact_serving_frontier(dl).await });
-    entered.notified().await;
+    await_gate(&entered).await?;
     engine.attach_hold(ProtectionHold::Pin { pin_id: Uuid::new_v4(), purpose: "late".into() }, Some(o3))?;
     release.notify_one();
     assert!(matches!(task_p.await?.unwrap_err(), GrowthEngineError::CompactionConflict));
@@ -475,10 +480,12 @@ async fn compaction_barriers_pins_cancel_and_spoofed_object_bounds() -> Result<(
     let (o_fail, p_fail, i_fail) = seed_one(&dir2, "fail", "f.txt", b"fail")?;
     let (o_win, p_win, i_win) = seed_one(&dir2, "win", "w.txt", b"win")?;
     let (p_fail_sha, _, _) = pack_meta(&p_fail, &i_fail)?;
-    let (eng_f, req_f) = (Arc::clone(&eng2), push_req("refs/heads/main", &z, &o_fail, vec![(p_fail, i_fail)]));
+    let (eng_f, mut req_f) = (Arc::clone(&eng2), push_req("refs/heads/main", &z, &o_fail, vec![(p_fail, i_fail)]));
+    let mut req_win = push_req("refs/heads/main", &z, &o_win, vec![(p_win, i_win)]);
+    (req_f.max_single_object_bytes, req_win.max_single_object_bytes) = (512, 512);
     let (entered, release, task_f) = s3.spawn_gated(&p_fail_sha, async move { eng_f.apply_push(req_f, dl).await });
-    entered.notified().await;
-    eng2.apply_push(push_req("refs/heads/main", &z, &o_win, vec![(p_win, i_win)]), dl).await?;
+    await_gate(&entered).await?;
+    eng2.apply_push(req_win, dl).await?;
     release.notify_one();
     assert!(matches!(task_f.await?.unwrap_err(), GrowthEngineError::CasPreconditionFailed { .. }));
     let snap = eng2.snapshot();
