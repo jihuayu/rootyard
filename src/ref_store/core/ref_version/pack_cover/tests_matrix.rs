@@ -171,26 +171,6 @@ fn planner_verifier_auth_isolation_and_fallback_matrix() {
     };
     assert_eq!(clone_plan.selected_covers.iter().map(|c| c.cover_id).collect::<Vec<_>>(), vec![uid(111), uid(112)]);
 
-    ret.add_hold(CoverRetentionHold::QuarantineHold {
-        incident_id: uid(995),
-        pack_ids: vec![p1_c.entry().pack_id()],
-        cover_ids: vec![],
-        cleared: false,
-    });
-    let fallback = plan_fetch_covers(&clone_req, &graph, &index, &ret).unwrap();
-    assert!(matches!(
-        fallback,
-        FetchPlanOutcome::FallbackToStrongSnapshot { reason: FallbackReason::RetentionLost, .. }
-    ));
-
-    let mut non_common_req = inc_req.clone();
-    non_common_req.isolation = ReadIsolationMode::VersionSet {
-        version_ids: vec![v2.version_id()],
-        session_lower_bound: None,
-        historical_pinned: false,
-    };
-    assert_eq!(plan_fetch_covers(&non_common_req, &graph, &index, &ret), Err(FetchPlanError::NonCommonTimeDenied));
-
     // Verifier enforces session_lower_bound (BehindSession), and both planner & verifier bind PinnedVersion.
     let main_ref = RefName::new("refs/heads/main").unwrap();
     let vc_req = FetchPlanRequest {
@@ -263,6 +243,26 @@ fn planner_verifier_auth_isolation_and_fallback_matrix() {
         ),
         Err(PlanVerifyError::Plan(FetchPlanError::InvalidPlanInput(_)))
     ));
+
+    ret.add_hold(CoverRetentionHold::QuarantineHold {
+        incident_id: uid(995),
+        pack_ids: vec![p1_c.entry().pack_id()],
+        cover_ids: vec![],
+        cleared: false,
+    });
+    let fallback = plan_fetch_covers(&clone_req, &graph, &index, &ret).unwrap();
+    assert!(matches!(
+        fallback,
+        FetchPlanOutcome::FallbackToStrongSnapshot { reason: FallbackReason::RetentionLost, .. }
+    ));
+
+    let mut non_common_req = inc_req.clone();
+    non_common_req.isolation = ReadIsolationMode::VersionSet {
+        version_ids: vec![v2.version_id()],
+        session_lower_bound: None,
+        historical_pinned: false,
+    };
+    assert_eq!(plan_fetch_covers(&non_common_req, &graph, &index, &ret), Err(FetchPlanError::NonCommonTimeDenied));
 
     let mut tampered = c1_for_tamper_test(&r, &p1_c, &v1);
     tampered.tamper_record_digest_for_test();

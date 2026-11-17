@@ -1,17 +1,53 @@
 //! Regression tests for diamond delta-base DAG memoization and bounded expansion work (Issue #184).
 use super::super::closure::{CausalVersionNode, VersionGraph};
+use super::super::pack_set::{PackSetEntry, VerifiedClosurePack};
 use super::super::read_mode::ReadConsumer;
 use super::super::record::RefHead;
 use super::auth::{FetchPlanError, ReadIsolationMode, StrongSnapshotCut};
-use super::model::{CoverCommitLink, CoverHierarchyIndex, CoverTier, compute_cover_membership_digest};
+use super::model::{
+    CoverArtifactPair, CoverCommitLink, CoverHierarchyIndex, CoverTier, compute_cover_membership_digest,
+};
 use super::planner::{FetchPlanOutcome, FetchPlanRequest, WantTarget, plan_fetch_covers};
 use super::retention_class::{CoverRetentionHold, RetentionClassificationIndex};
 use super::tests::{default_auth, make_pack, mint_version, oid, realm, seal_test_cover, uid};
 use super::verifier::verify_fetch_plan_closure;
-use crate::ref_store::contract::RequestDigest;
+use crate::blob_store::BlobLocator;
+use crate::ref_store::contract::{RefVersionRealm, RequestDigest};
 use crate::ref_store::core::types::{GitObjectFormat, GitOid, RefName};
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+fn uniq_pack(r: &RefVersionRealm, id: u128, bases: Vec<Uuid>) -> (VerifiedClosurePack, CoverArtifactPair) {
+    let entry = PackSetEntry::new(
+        uid(1_000_000 + id),
+        uid(2_000_000 + id),
+        RequestDigest::of("uniq-art", &[&id.to_be_bytes()]),
+    )
+    .unwrap();
+    let vpack =
+        VerifiedClosurePack::new(entry, r.tenant_id(), r.repository_id(), "s3", hex::encode([0xab; 32]), 1300, 2)
+            .unwrap();
+    let mut sha = [0_u8; 32];
+    sha[..16].copy_from_slice(&id.to_be_bytes());
+    let sha_p = hex::encode(sha);
+    sha[31] ^= 1;
+    let sha_i = hex::encode(sha);
+    let pack_loc =
+        BlobLocator::new(r.tenant_id(), r.repository_id(), 1, uid(3_000_000 + id), "packs", &sha_p, 1200).unwrap();
+    let idx_loc =
+        BlobLocator::new(r.tenant_id(), r.repository_id(), 1, uid(4_000_000 + id), "packs", &sha_i, 100).unwrap();
+    let mut stem_raw = [0_u8; 20];
+    stem_raw[..16].copy_from_slice(&id.to_be_bytes());
+    let artifacts = CoverArtifactPair {
+        pack_stem: format!("pack-{}", hex::encode(stem_raw)),
+        pack_locator: pack_loc,
+        idx_locator: idx_loc,
+        is_thin_pack: !bases.is_empty(),
+        delta_base_cover_ids: bases,
+    };
+    (vpack, artifacts)
+}
 
 #[test]
 fn planner_expands_diamond_delta_dag_linearly_and_bounds_delta_work() {
@@ -34,7 +70,7 @@ fn planner_expands_diamond_delta_dag_linearly_and_bounds_delta_work() {
                commit: GitOid,
                bases: Vec<Uuid>,
                holds: &mut Vec<Uuid>| {
-        let (pk, art) = make_pack(&r, (id % 240) as u8, 1200, 100, !bases.is_empty(), bases);
+        let (pk, art) = uniq_pack(&r, id, bases);
         ents.push(*pk.entry());
         let g = idx.membership_generation() + 1;
         let m = compute_cover_membership_digest(&r, g, ents).unwrap();
@@ -109,7 +145,9 @@ fn planner_expands_diamond_delta_dag_linearly_and_bounds_delta_work() {
         prev2 = vec![uid(j)];
     }
     add(&mut d_idx, &mut d_ents, 39_999, tip, prev2, &mut d_holds);
+    let t0 = Instant::now();
     assert_eq!(run_req(&d_idx, d_holds).0, Err(FetchPlanError::ClosureBoundsExceeded));
+    assert!(t0.elapsed() < Duration::from_secs(2));
 
     // 3. Dense delta fanout (520 covers << 4096) exhausts work_steps inside expand_delta_bases.
     let (mut b_idx, mut b_ents, mut b_holds) = (CoverHierarchyIndex::new(r, mem0).unwrap(), Vec::new(), Vec::new());
