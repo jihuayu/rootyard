@@ -283,7 +283,7 @@ pub(super) async fn rotate_vault_kms_key_with_options(
             }
             Err(error) => {
                 cp.failed_pack_id = Some(pack.id);
-                persist_checkpoint(c, kms_dir, &cp).await?;
+                persist_checkpoint(c, &kms_dir, &cp).await?;
                 return Err(error.context(format!("final Vault rotation rescan remains resumable at pack {}", pack.id)));
             }
         }
