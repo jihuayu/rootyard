@@ -10,8 +10,12 @@ before closing, and never replaces a primary failure with a cleanup outcome.
 This module adds only the shared absolute deadline: each call is clamped to the
 current remaining work/cleanup budget, the approved runner anchors its own
 operation deadline before ``Popen``, and this interface rechecks the clock after
-the call so a late return cannot be recorded as success.  Existing per-operation
-caps and polls are preserved; nothing here raises a timeout or adds a retry.
+the call so a late return cannot be recorded as success.  The approved runner's
+bounded post-operation reap (2 seconds) plus a small fixed call/hand-off margin
+is reserved inside the current phase deadline, so the child's reap ends at or
+before workD/cleanupD and the dedicated 90-second cleanup window is not
+silently borrowed.  Existing per-operation caps and polls are preserved; this
+reservation only lowers a call's timeout, never raises it or adds a retry.
 """
 from __future__ import annotations
 
@@ -33,6 +37,8 @@ from pando_producer_pg.process import (  # noqa: E402
 # runner receives one of its own fixed stages; the harness keeps its stage in
 # the translated code below.
 _INTERNAL_STAGE = "execute"
+HANDOFF_RESERVE_SECONDS = 0.05
+_PHASE_RESERVE_SECONDS = CLEANUP_RESERVE_SECONDS + HANDOFF_RESERVE_SECONDS
 
 _CODE_MAP = {
     "process_timeout": "subprocess_timeout",
@@ -80,11 +86,14 @@ class BoundedCommandRunner:
     ):
         effective = timeout
         if self.budget is not None:
-            # The approved runner reserves its own bounded reap window after
-            # the operation deadline.  In cleanup that window must remain
-            # below the overall deadline, so it is subtracted here as well.
-            reserve = CLEANUP_RESERVE_SECONDS if self.budget.in_cleanup else 0.0
-            effective = self.budget.clamp(timeout, stage, reserve=reserve)
+            # The approved runner adds its own 2-second reap window after the
+            # operation deadline.  Reserve that window and a small call/handoff
+            # margin inside the current phase so work reap ends no later than
+            # workD and cleanup reap ends no later than overallD.  The fixed
+            # margin is a fail-closed allowance, not a wall-clock claim for an
+            # arbitrarily delayed handoff.
+            effective = self.budget.clamp(
+                timeout, stage, reserve=_PHASE_RESERVE_SECONDS)
         try:
             completed = self._runner.run(
                 [str(item) for item in argv],
