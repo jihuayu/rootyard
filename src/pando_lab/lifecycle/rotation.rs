@@ -336,7 +336,7 @@ pub async fn rotate_kms_key_with_options(
             }
             Err(error) => {
                 cp.failed_pack_id = Some(pack.id);
-                persist_checkpoint(base_client, kms_dir, &cp).await?;
+                persist_checkpoint(base_client, &kms_dir, &cp).await?;
                 return Err(error.context(format!("final Local rotation rescan remains resumable at pack {}", pack.id)));
             }
         }
