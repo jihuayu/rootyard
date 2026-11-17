@@ -355,6 +355,8 @@ jobs:
             --receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
             --source-root "$GITHUB_WORKSPACE" \
             --expected-commit "$GITHUB_SHA" \
+            --timeout-seconds 1080 \
+            --cleanup-reserve-seconds 90 \
             --report test-results/pando-vault-rotation.json
           python3 tests/pando_vault_rotation_ci_report.py \
             --source-root "$GITHUB_WORKSPACE" \

@@ -205,6 +205,17 @@ after the cases. Its report schema is
 `rootyard/issue21-derived-vault-rotation/v1`. Missing Docker, PostgreSQL 17,
 Vault, binary or receipt fails; there is no skip path.
 
+The harness has one absolute monotonic deadline established before input
+validation. The CI step supplies `--timeout-seconds 1080` under its 1200-second
+step cap and the default `--cleanup-reserve-seconds 90`; the work deadline is
+therefore 990 seconds and cleanup may use the whole 1080 seconds. The deadline
+is never reset per case, phase or operation. Existing per-operation caps are
+only clamped to the remaining budget, and a late return from a non-preemptible
+OS/filesystem/Popen/socket boundary fails closed rather than being recorded as
+success. Source Git/receipt reads run in one bounded owned child; a timed-out
+child, unresolved owned resource, failed final binding or failed report write
+cannot produce a passing report. Runtime remains NOT RUN.
+
 The five exact authored IDs, in order, are:
 
 1. `vault_fixture_and_app_capability_boundary`

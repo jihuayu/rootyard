@@ -423,6 +423,17 @@ uses a random owned database prechecked absent, the CI bootstrap DSN only for
 creation/bootstrap, and drops only the exact owned name/OID/owner. The private
 `PANDO_ROOT` is exact-owned and inode-verified before removal.
 
+The harness shares one absolute monotonic deadline from before input validation
+through the final report write. The CI step uses `--timeout-seconds 1080` under
+a 1200-second step and the default 90-second cleanup reserve, so work may use
+990 seconds and cleanup the full 1080 seconds; no case or phase resets it.
+Docker inspect/pull/run, HTTP health/capability calls, PostgreSQL children,
+Git/CLI/server children, wait/drain and cleanup are each clamped to the
+remaining budget with a late recheck. Source Git/receipt binding reads run in a
+bounded owned child. Existing per-operation caps are never increased. A timeout
+or late completion is failure, cleanup cannot replace a primary failure, and an
+expired deadline reports a failed/unresolved cleanup instead of passing.
+
 The stock Git client runs with a filtered environment that excludes Vault
 variables, DB DSNs/passwords, admin tokens and injected Git/proxy/trace settings.
 The Pando server and native hooks retain only their own required app Vault/DB

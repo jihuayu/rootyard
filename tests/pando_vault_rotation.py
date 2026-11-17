@@ -21,6 +21,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 
 TESTS = Path(__file__).resolve().parent
 ROOT = TESTS.parent
@@ -30,6 +31,13 @@ for entry in (str(TESTS), str(SCRIPTS)):
         sys.path.insert(0, entry)
 
 import native_build_receipt as receipts  # noqa: E402
+from pando_vault_rotation_budget import (  # noqa: E402
+    DEFAULT_CLEANUP_RESERVE_SECONDS,
+    DEFAULT_TOTAL_SECONDS,
+    OVERALL_DEADLINE_EXCEEDED,
+    Budget,
+    DeadlineError,
+)
 from pando_vault_rotation_fixture import FixtureError  # noqa: E402
 import pando_vault_rotation_cases as cases  # noqa: E402
 import pando_vault_rotation_negative as negative  # noqa: E402
@@ -51,6 +59,7 @@ from pando_vault_rotation_support import (  # noqa: E402
 )
 
 REPORT_SCHEMA = "rootyard/issue21-derived-vault-rotation/v1"
+REPORT_WRITE_RESERVE_SECONDS = 2.0
 
 
 def required_cases():
@@ -67,6 +76,12 @@ def parse_args(argv=None):
     parser.add_argument("--expected-commit", default=None)
     parser.add_argument("--expected-binary-sha256", default=None)
     parser.add_argument("--report", default=None)
+    parser.add_argument("--timeout-seconds", type=float,
+                        default=DEFAULT_TOTAL_SECONDS,
+                        help="one absolute overall deadline in seconds")
+    parser.add_argument("--cleanup-reserve-seconds", type=float,
+                        default=DEFAULT_CLEANUP_RESERVE_SECONDS,
+                        help="cleanup reserve carved out of the overall deadline")
     return parser.parse_args(argv)
 
 
@@ -128,6 +143,13 @@ def _pando_artifact(receipt, binary_sha256):
     return True
 
 
+# The existing pure contract replaces these two probes with finite fakes.
+# Production never replaces them, so the live harness always takes the bounded
+# child path below; the legacy branch exists only for that unit contract.
+_LEGACY_SOURCE_STATE = _source_state
+_LEGACY_LOAD_RECEIPT = receipts.load_receipt
+
+
 def validate_inputs(args, environ, budget=None, runner=None):
     binary = args.binary or environ.get("ROOTYARD_PANDO_LAB_BIN")
     receipt = args.receipt or environ.get("ROOTYARD_PANDO_BUILD_RECEIPT")
@@ -159,7 +181,9 @@ def validate_inputs(args, environ, budget=None, runner=None):
         require(shutil.which(tool) is not None, tool + "_missing", "input")
     bootstrap = environ.get("ROOTYARD_TEST_DATABASE_URL")
     require(bool(bootstrap), "missing_pg_bootstrap", "input")
-    if budget is not None and runner is not None:
+    if (budget is not None and runner is not None
+            and _source_state is _LEGACY_SOURCE_STATE
+            and receipts.load_receipt is _LEGACY_LOAD_RECEIPT):
         bound = source.validate(
             runner, budget,
             source_root=source_root,
@@ -361,10 +385,66 @@ def _report_path_allowed(path):
                    for part in Path(path).parts)
 
 
-def _write_report(path, payload):
+def _mark_failed(payload, code):
+    payload["passed"] = False
+    payload["status"] = "failed"
+    payload["error_code"] = code
+    payload.setdefault("stage", "report")
+
+
+def _write_report(path, payload, budget=None):
+    """Write the last artifact under the same absolute deadline.
+
+    The write is not preemptible, so this is a late-recheck boundary rather
+    than a wall-clock guarantee.  If the overall deadline is already spent the
+    payload is switched to a truthful failure before the first write; an
+    in-flight write that returns late is rewritten as failed so a stale green
+    report cannot be left behind.  An existing primary failure code is never
+    overwritten by a secondary deadline code.
+    """
     if not _report_path_allowed(path):
         return False
-    atomic_write_json(Path(path), payload)
+    was_passed = payload.get("passed") is True
+    if budget is not None:
+        if budget.remaining_overall() <= REPORT_WRITE_RESERVE_SECONDS:
+            if was_passed:
+                _mark_failed(payload, OVERALL_DEADLINE_EXCEEDED)
+        else:
+            budget.late_overall("report")
+    target = Path(path)
+    atomic_write_json(target, payload)
+    if budget is not None and budget.expired_overall() and payload.get("passed") is True:
+        _mark_failed(payload, OVERALL_DEADLINE_EXCEEDED)
+        try:
+            atomic_write_json(target, payload)
+        except Exception:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            raise
+        budget.late_overall("report")
+    return True
+
+
+def _finish_report(path, payload, budget):
+    try:
+        written = _write_report(path, payload, budget)
+    except QualificationError as error:
+        _mark_failed(payload, error.code)
+        # Last fixed-size failed artifact; a late write is reported as failed
+        # even if this best-effort attempt succeeds.
+        try:
+            atomic_write_json(Path(path), payload)
+        except Exception:
+            pass
+        return False
+    except Exception:
+        _mark_failed(payload, "report_write_failed")
+        return False
+    if not written:
+        _mark_failed(payload, "report_path_rejected")
+        return False
     return True
 
 
@@ -403,8 +483,37 @@ def _safe_build(inputs, rows, cleanup, passed, error_code=None, stage=None):
             return _minimal_failed_report()
 
 
-def run_qualification(args, environ=None):
+def _binding_failure_code(error):
+    code = getattr(error, "code", "")
+    if code in (
+        "work_deadline_exceeded",
+        "cleanup_deadline_exceeded",
+        "overall_deadline_exceeded",
+    ):
+        return code
+    return _final_binding_code(error)
+
+
+def run_qualification(args, environ=None, clock=time.monotonic):
     environ = dict(os.environ if environ is None else environ)
+    report_path = getattr(args, "report", None)
+    try:
+        budget = Budget(
+            getattr(args, "timeout_seconds", DEFAULT_TOTAL_SECONDS),
+            getattr(args, "cleanup_reserve_seconds",
+                    DEFAULT_CLEANUP_RESERVE_SECONDS),
+            clock=clock,
+            error_factory=QualificationError,
+        )
+    except (DeadlineError, TypeError, ValueError):
+        cleanup = _failed_cleanup("qualification_not_started", "cleanup")
+        rows = fill_cases([], "timeout_invalid", "input", cleanup)
+        report = _safe_build(None, rows, cleanup, False,
+                             "timeout_invalid", "input")
+        if report_path:
+            _finish_report(report_path, report, None)
+        return report
+    runner = Runner(budget=budget, clock=clock)
     inputs = None
     context = None
     rows = []
@@ -413,16 +522,16 @@ def run_qualification(args, environ=None):
     fatal_stage = None
     before = None
     try:
-        inputs = validate_inputs(args, environ)
+        inputs = validate_inputs(args, environ, budget=budget, runner=runner)
     except QualificationError as error:
         fatal_code, fatal_stage = error.code, error.stage
     except Exception:
         fatal_code, fatal_stage = "unexpected_error", "input"
     if inputs is not None:
         try:
-            before = binding_snapshot(inputs)
+            before = binding_snapshot(inputs, budget=budget, runner=runner)
         except QualificationError as error:
-            fatal_code, fatal_stage = _final_binding_code(error), "binding"
+            fatal_code, fatal_stage = _binding_failure_code(error), "binding"
         except Exception:
             fatal_code, fatal_stage = "binding_unavailable", "binding"
     if inputs is None or before is None:
@@ -432,33 +541,35 @@ def run_qualification(args, environ=None):
         report = _safe_build(inputs, rows, cleanup, False,
                              fatal_code or "input_validation_failed",
                              fatal_stage or "input")
-        if args.report:
-            try:
-                if not _write_report(args.report, report):
-                    report["passed"] = False
-                    report["status"] = "failed"
-                    report["error_code"] = "report_path_rejected"
-            except Exception:
-                report["passed"] = False
-                report["status"] = "failed"
-                report["error_code"] = "report_write_failed"
+        if report_path:
+            _finish_report(report_path, report, budget)
         return report
     try:
-        context = Context(inputs, environ, Runner())
+        context = Context(inputs, environ, runner, budget=budget)
         try:
+            budget.require("cases")
             context.start_base()
+            budget.late("cases")
             rows.append(cases.case_fixture_and_app_capability_boundary(context))
+            budget.require("cases")
             context.prepare_initial_packs()
+            budget.late("cases")
             rows.append(cases.case_authentic_envelope_digest_and_cold_read(context))
+            budget.require("cases")
             rows.append(cases.case_admin_rotated_target_interrupted_resume_and_new_write(context))
+            budget.require("cases")
             rows.append(negative.case_wrong_key_ciphertext_envelope_and_provider_revocation(context))
-        except QualificationError as error:
-            fatal_code, fatal_stage = error.code, error.stage
-        except FixtureError as error:
-            fatal_code, fatal_stage = error.code, error.stage
+            budget.late("cases")
+        except (QualificationError, FixtureError) as error:
+            if fatal_code is None:
+                fatal_code, fatal_stage = error.code, error.stage
         except Exception:
-            fatal_code, fatal_stage = "unexpected_error", "case"
+            if fatal_code is None:
+                fatal_code, fatal_stage = "unexpected_error", "case"
     finally:
+        # Latch the primary failure before cleanup.  Cleanup outcomes are
+        # recorded separately and never replace an earlier primary code.
+        budget.begin_cleanup()
         if context is not None:
             try:
                 cleanup = negative.case_owned_resource_cleanup(context)
@@ -471,36 +582,41 @@ def run_qualification(args, environ=None):
         if cleanup.get("status") != "passed" and fatal_code is None:
             fatal_code = cleanup.get("code") or "owned_resource_cleanup_unresolved"
             fatal_stage = "cleanup"
+        if budget.expired_overall():
+            if fatal_code is None:
+                fatal_code, fatal_stage = OVERALL_DEADLINE_EXCEEDED, "cleanup"
+            if cleanup.get("status") == "passed":
+                cleanup = dict(cleanup)
+                cleanup["status"] = "failed"
+                cleanup["code"] = OVERALL_DEADLINE_EXCEEDED
+                cleanup["stage"] = "cleanup"
         rows = fill_cases(rows, fatal_code or "mandatory_case_failed",
                           fatal_stage or "case", cleanup)
     binding_ok = True
     if before is not None:
         try:
-            after = binding_snapshot(inputs)
+            after = binding_snapshot(inputs, budget=budget, runner=runner)
         except QualificationError as error:
             binding_ok = False
-            fatal_code, fatal_stage = _final_binding_code(error), "binding"
+            if fatal_code is None:
+                fatal_code, fatal_stage = _binding_failure_code(error), "binding"
         except Exception:
             binding_ok = False
-            fatal_code, fatal_stage = "binding_unavailable", "binding"
+            if fatal_code is None:
+                fatal_code, fatal_stage = "binding_unavailable", "binding"
         else:
             if after != before:
                 binding_ok = False
-                fatal_code, fatal_stage = "binding_changed", "binding"
+                if fatal_code is None:
+                    fatal_code, fatal_stage = "binding_changed", "binding"
     all_green = bool(rows) and all(
         isinstance(row, dict) and row.get("status") == "passed" for row in rows)
     passed = bool(binding_ok and fatal_code is None and all_green
-                  and cleanup is not None and cleanup.get("status") == "passed")
+                  and cleanup is not None
+                  and cleanup.get("status") == "passed"
+                  and not budget.expired_overall())
     report = _safe_build(inputs, rows, cleanup, passed, fatal_code, fatal_stage)
-    try:
-        if not _write_report(inputs["report"], report):
-            report["passed"] = False
-            report["status"] = "failed"
-            report["error_code"] = "report_path_rejected"
-    except Exception:
-        report["passed"] = False
-        report["status"] = "failed"
-        report["error_code"] = "report_write_failed"
+    _finish_report(inputs["report"], report, budget)
     return report
 
 
