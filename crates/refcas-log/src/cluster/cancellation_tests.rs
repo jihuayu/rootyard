@@ -93,7 +93,7 @@ async fn setup(mode: AckMode) -> (MtlsPeerClient, PeerFixture) {
     let mtls_client = MtlsClient::from_paths(&pki.client_paths).expect("build test mTLS client");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test mTLS listener");
     let addr = listener.local_addr().expect("read test listener address").to_string();
-    let mut peers = PeerDirectory::new();
+    let peers = PeerDirectory::new();
     peers.insert(1, addr.clone());
     let client = MtlsPeerClient { target: 1, fallback_addr: addr, peers, client: mtls_client, stream: None };
     let control = Arc::new(Control::new(mode));
