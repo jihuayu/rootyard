@@ -282,6 +282,7 @@ impl PackRootLockGuard {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&lock_path)

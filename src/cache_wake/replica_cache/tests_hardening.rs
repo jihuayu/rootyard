@@ -341,6 +341,7 @@ fn pack_cache_open_enforces_exclusive_root_lock_and_preserves_pinned_packs() {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(replica.join("packs").join(error::CATALOG_LOCK_FILE))
         .unwrap();
     fs2::FileExt::try_lock_exclusive(&ext_lock).unwrap();
