@@ -5,8 +5,13 @@ cannot make the parent accumulate unbounded stdout/stderr.  Ordinary commands
 retain the existing per-stream truncation result; callers can request a fixed
 failure as soon as the aggregate ceiling is crossed.  On any failure the owned
 process group is killed and reaped before a bounded reader join; pipes are
-closed only after their readers have actually stopped.  No argv, environment,
-DSN, SQL or raw child text is retained in an exception or printed.
+closed only after their readers have actually stopped.  Callers may additionally
+pass optional absolute operation/cleanup deadlines.  They only lower the
+relative timeout and its 2-second reserve, are validated before ``Popen``, and
+are checked before ``Popen`` and each new reader start.  If a non-preemptible
+boundary still returns late, the owned child/group is retained and the failure
+is reported rather than discarded.  No argv, environment, DSN, SQL or raw child
+text is retained in an exception or printed.
 """
 from __future__ import annotations
 
@@ -26,6 +31,16 @@ READ_CHUNK = 64 * 1024
 CLEANUP_RESERVE_SECONDS = 2.0
 KILL_WAIT_SECONDS = CLEANUP_RESERVE_SECONDS
 POLL_SECONDS = 0.05
+
+
+def _valid_absolute_deadline(value):
+    """Return whether ``value`` is a finite non-bool deadline number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError):
+        return False
 
 
 class Completed:
@@ -177,6 +192,8 @@ class ProcessRunner:
         max_total=MAX_TOTAL_OUTPUT,
         fail_on_output_exceeded=False,
         output_code="process_output_exceeded",
+        absolute_operation_deadline=None,
+        absolute_cleanup_deadline=None,
     ):
         require(
             isinstance(argv, (list, tuple))
@@ -193,11 +210,55 @@ class ProcessRunner:
             stage,
             "timeout_invalid",
         )
-        # Anchor before Popen and any reader/writer creation or start.  Popen
-        # fork/exec and thread start/join are non-preemptible syscall boundaries;
-        # acquisition time is charged here and a late return fails closed.
-        operation_deadline = self.clock() + float(timeout)
+        require(
+            absolute_operation_deadline is None
+            or _valid_absolute_deadline(absolute_operation_deadline),
+            stage,
+            "invalid_arguments",
+        )
+        require(
+            absolute_cleanup_deadline is None
+            or _valid_absolute_deadline(absolute_cleanup_deadline),
+            stage,
+            "invalid_arguments",
+        )
+        if (
+            absolute_operation_deadline is not None
+            and absolute_cleanup_deadline is not None
+        ):
+            require(
+                float(absolute_cleanup_deadline)
+                >= float(absolute_operation_deadline),
+                stage,
+                "timeout_invalid",
+            )
+        # Anchor once before Popen and any reader/writer creation or start.
+        # Popen fork/exec and thread start/join are non-preemptible syscall
+        # boundaries; acquisition time is charged here and a late return fails
+        # closed.  Optional absolute bounds only lower the operation/cleanup
+        # deadlines; they never replace the relative cap or create a fresh
+        # reader, kill or reap window.
+        now = self.clock()
+        operation_deadline = now + float(timeout)
+        if absolute_operation_deadline is not None:
+            operation_deadline = min(
+                operation_deadline, float(absolute_operation_deadline)
+            )
         cleanup_deadline = operation_deadline + CLEANUP_RESERVE_SECONDS
+        if absolute_cleanup_deadline is not None:
+            require(
+                float(absolute_cleanup_deadline) >= operation_deadline,
+                stage,
+                "timeout_invalid",
+            )
+            cleanup_deadline = min(
+                cleanup_deadline, float(absolute_cleanup_deadline)
+            )
+        require(
+            cleanup_deadline >= operation_deadline,
+            stage,
+            "timeout_invalid",
+        )
         require(
             type(max_stdout) is int
             and type(max_stderr) is int
@@ -211,6 +272,11 @@ class ProcessRunner:
         budget = _OutputBudget(
             max_stdout, max_stderr, max_total, bool(fail_on_output_exceeded)
         )
+        if (
+            absolute_operation_deadline is not None
+            and self.clock() >= operation_deadline
+        ):
+            raise RunnerError(stage, timeout_code)
         try:
             process = self._popen(
                 [str(item) for item in argv],
@@ -229,6 +295,7 @@ class ProcessRunner:
             ) from None
         entries = []
         writer = None
+        start_expired = False
         try:
             if input is not None:
                 stdin = getattr(process, "stdin", None)
@@ -268,6 +335,12 @@ class ProcessRunner:
                     }
                 )
             for entry in entries:
+                if (
+                    absolute_operation_deadline is not None
+                    and self.clock() >= operation_deadline
+                ):
+                    start_expired = True
+                    break
                 entry["start_attempted"] = True
                 try:
                     entry["thread"].start()
@@ -278,6 +351,10 @@ class ProcessRunner:
         except Exception:
             raise self._cleanup_failure(
                 process, entries, stage, "process_failed", cleanup_deadline
+            ) from None
+        if start_expired:
+            raise self._cleanup_failure(
+                process, entries, stage, timeout_code, cleanup_deadline
             ) from None
         if self.clock() >= operation_deadline:
             raise self._cleanup_failure(

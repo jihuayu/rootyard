@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Pure counterexamples for the shared absolute deadline and command bounds.
 
-Only a fake monotonic clock and an injected fake process runner are used.  No
-process, thread, network, container, database or filesystem child is started.
+Only fake monotonic clocks, fake Popen/thread/group seams and injected fake
+process runners are used.  No process, thread, network, container, database or
+filesystem child is started.
 """
 from __future__ import annotations
 
+import io
 from pathlib import Path
+import subprocess
 import sys
 import unittest
+from unittest import mock
 
 TESTS = Path(__file__).resolve().parent
 SCRIPTS = TESTS.parent / "scripts"
@@ -17,11 +21,11 @@ for entry in (str(TESTS), str(SCRIPTS)):
         sys.path.insert(0, entry)
 
 from pando_producer_pg.errors import RunnerError  # noqa: E402
+import pando_producer_pg.process as process_module  # noqa: E402
 import pando_vault_rotation_budget as budget_mod  # noqa: E402
 from pando_vault_rotation_budget import Budget, DeadlineError  # noqa: E402
 from pando_vault_rotation_command import (  # noqa: E402
     CLEANUP_RESERVE_SECONDS,
-    HANDOFF_RESERVE_SECONDS,
     BoundedCommandRunner,
     CommandError,
 )
@@ -158,11 +162,12 @@ class BudgetDeadlineTest(unittest.TestCase):
 
 
 class DeadlineModelRunner:
-    """Fake approved runner that models its own operation and reap deadlines."""
+    """Fake approved runner that records the absolute deadlines it receives."""
 
-    def __init__(self, clock, handoff=0.0):
+    def __init__(self, clock, handoff=0.0, finish="operation"):
         self.clock = clock
         self.handoff = float(handoff)
+        self.finish = finish
         self.calls = []
         self.operation_deadline = None
         self.cleanup_deadline = None
@@ -171,11 +176,111 @@ class DeadlineModelRunner:
         self.calls.append((list(argv), dict(kwargs)))
         self.clock.advance(self.handoff)
         timeout = kwargs["timeout"]
-        self.operation_deadline = self.clock() + timeout
-        self.cleanup_deadline = (
-            self.operation_deadline + CLEANUP_RESERVE_SECONDS)
-        self.clock.advance(timeout + CLEANUP_RESERVE_SECONDS)
+        operation_deadline = kwargs.get("absolute_operation_deadline")
+        if operation_deadline is None:
+            operation_deadline = self.clock() + timeout
+        cleanup_deadline = kwargs.get("absolute_cleanup_deadline")
+        if cleanup_deadline is None:
+            cleanup_deadline = operation_deadline + CLEANUP_RESERVE_SECONDS
+        self.operation_deadline = operation_deadline
+        self.cleanup_deadline = cleanup_deadline
+        target = (
+            cleanup_deadline if self.finish == "cleanup"
+            else operation_deadline
+        )
+        if target > self.clock():
+            self.clock.advance(target - self.clock())
         return Result()
+
+
+class ImmediateThread:
+    """Synchronous fake thread; never creates an OS thread."""
+
+    def __init__(self, target=None, name=None, daemon=None, **kwargs):
+        self.target = target
+        self.started = False
+        self.joined = False
+        self.alive = False
+
+    def start(self):
+        self.started = True
+        self.alive = True
+        try:
+            if self.target is not None:
+                self.target()
+        finally:
+            self.alive = False
+
+    def join(self, timeout=None):
+        self.joined = True
+
+    def is_alive(self):
+        return self.alive
+
+
+class AdvancingPopen:
+    """In-memory child whose wait slices consume the fake clock."""
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.stdout = io.BytesIO(b"")
+        self.stderr = io.BytesIO(b"")
+        self.stdin = None
+        self.pid = 4242
+        self.returncode = 0
+        self._poll = 0
+        self.killed = False
+        self.wait_timeouts = []
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        if timeout is not None:
+            self.clock.advance(timeout)
+        if self.killed:
+            self.returncode = -9
+            self._poll = -9
+            return -9
+        raise subprocess.TimeoutExpired("fake", timeout)
+
+    def poll(self):
+        return self._poll
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+        self._poll = -9
+
+
+class GroupKiller:
+    def __call__(self, pgid, sig):
+        if sig == 0:
+            raise ProcessLookupError()
+        return None
+
+
+class PopenFactory:
+    def __init__(self, fake):
+        self.fake = fake
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.fake
+
+
+class HandoffRunner:
+    """Advance the caller clock before entering the real approved runner."""
+
+    def __init__(self, clock, delay, inner):
+        self.clock = clock
+        self.delay = delay
+        self.inner = inner
+        self.entered = False
+
+    def run(self, argv, **kwargs):
+        self.entered = True
+        self.clock.advance(self.delay)
+        return self.inner.run(argv, **kwargs)
 
 
 class BoundedCommandTest(unittest.TestCase):
@@ -184,16 +289,16 @@ class BoundedCommandTest(unittest.TestCase):
         return BoundedCommandRunner(
             budget=budget, clock=clock, process_runner=process), process
 
-    def test_operation_timeout_is_clamped_to_the_shared_budget(self):
+    def test_operation_budget_is_clamped_by_an_absolute_deadline(self):
         clock = FakeClock()
         budget = Budget(100, 20, clock=clock, error_factory=CommandError)
         command, process = self._runner(clock, [Result()], budget)
         clock.advance(30)
         command.run(["psql"], timeout=90, stage="database")
         _argv, kwargs = process.calls[0]
-        self.assertEqual(
-            kwargs["timeout"],
-            50.0 - CLEANUP_RESERVE_SECONDS - HANDOFF_RESERVE_SECONDS)
+        self.assertEqual(kwargs["timeout"], 90)
+        self.assertEqual(kwargs["absolute_operation_deadline"], 78.0)
+        self.assertEqual(kwargs["absolute_cleanup_deadline"], 80.0)
         self.assertEqual(kwargs["stage"], "execute")
         self.assertTrue(kwargs["fail_on_output_exceeded"])
 
@@ -205,9 +310,21 @@ class BoundedCommandTest(unittest.TestCase):
         budget.begin_cleanup()
         command.run(["docker", "rm"], timeout=30, stage="cleanup")
         _argv, kwargs = process.calls[0]
-        self.assertEqual(
-            kwargs["timeout"],
-            20.0 - CLEANUP_RESERVE_SECONDS - HANDOFF_RESERVE_SECONDS)
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertEqual(kwargs["absolute_operation_deadline"], 98.0)
+        self.assertEqual(kwargs["absolute_cleanup_deadline"], 100.0)
+
+    def test_smaller_per_operation_cap_is_preserved(self):
+        clock = FakeClock()
+        budget = Budget(1080, 90, clock=clock, error_factory=CommandError)
+        model = DeadlineModelRunner(clock)
+        command = BoundedCommandRunner(
+            budget=budget, clock=clock, process_runner=model)
+        command.run(["git", "push"], timeout=5, stage="git")
+        _argv, kwargs = model.calls[0]
+        self.assertEqual(kwargs["timeout"], 5)
+        self.assertEqual(kwargs["absolute_operation_deadline"], 5.0)
+        self.assertEqual(kwargs["absolute_cleanup_deadline"], 7.0)
 
     def test_late_return_after_blocking_call_is_not_success(self):
         clock = FakeClock()
@@ -263,9 +380,17 @@ class BoundedCommandTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "work_deadline_exceeded")
         self.assertEqual(process.calls, [])
 
-    def test_unresolved_child_flag_is_set_only_for_unreaped_groups(self):
+    def test_no_operation_window_before_the_reap_reserve_fails_closed(self):
         clock = FakeClock()
         budget = Budget(100, 20, clock=clock, error_factory=CommandError)
+        command, process = self._runner(clock, [], budget)
+        clock.advance(78.5)  # work deadline is 80; reserve needs 2 seconds
+        with self.assertRaises(CommandError) as caught:
+            command.run(["git", "push"], timeout=30, stage="git")
+        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
+        self.assertEqual(process.calls, [])
+
+    def test_unresolved_child_flag_is_set_only_for_unreaped_groups(self):
         for internal, expected_flag in (
             ("process_unreaped", True),
             ("process_group_unverified", True),
@@ -290,61 +415,135 @@ class BoundedCommandTest(unittest.TestCase):
         command.run(["git", "fsck"], timeout=90, stage="git")
         self.assertFalse(command.unresolved_children)
 
-    def test_work_reap_and_handoff_reserve_keep_the_full_cleanup_window(self):
+    def test_work_absolute_deadline_keeps_the_full_cleanup_window(self):
         clock = FakeClock()
         budget = Budget(1080, 90, clock=clock, error_factory=CommandError)
+        clock.advance(980)
         model = DeadlineModelRunner(clock, handoff=0.02)
         command = BoundedCommandRunner(
             budget=budget, clock=clock, process_runner=model)
-        clock.advance(980)
         command.run(["git", "push"], timeout=30, stage="git")
         _argv, kwargs = model.calls[0]
-        self.assertEqual(
-            kwargs["timeout"],
-            10.0 - CLEANUP_RESERVE_SECONDS - HANDOFF_RESERVE_SECONDS)
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertEqual(kwargs["absolute_operation_deadline"], 988.0)
+        self.assertEqual(kwargs["absolute_cleanup_deadline"], 990.0)
         self.assertLessEqual(model.cleanup_deadline, budget.work_deadline)
         self.assertGreaterEqual(
             budget.overall_deadline - model.cleanup_deadline, 90.0)
 
-    def test_work_timeout_edge_reaps_at_work_d_and_keeps_90_seconds(self):
+    def test_work_edge_uses_exactly_the_90_second_reserve(self):
         clock = FakeClock()
         budget = Budget(1080, 90, clock=clock, error_factory=CommandError)
-        model = DeadlineModelRunner(clock, handoff=HANDOFF_RESERVE_SECONDS)
+        clock.advance(980)
+        model = DeadlineModelRunner(clock, handoff=0.05, finish="cleanup")
         command = BoundedCommandRunner(
             budget=budget, clock=clock, process_runner=model)
-        clock.advance(980)
         with self.assertRaises(CommandError) as caught:
             command.run(["git", "push"], timeout=30, stage="git")
         self.assertEqual(caught.exception.code, "work_deadline_exceeded")
         self.assertEqual(model.cleanup_deadline, budget.work_deadline)
         self.assertEqual(budget.remaining_overall(), 90.0)
 
-    def test_handoff_beyond_the_fixed_margin_fails_closed(self):
+    def test_cleanup_absolute_deadline_ends_within_overall(self):
         clock = FakeClock()
         budget = Budget(1080, 90, clock=clock, error_factory=CommandError)
-        model = DeadlineModelRunner(
-            clock, handoff=HANDOFF_RESERVE_SECONDS + 0.01)
-        command = BoundedCommandRunner(
-            budget=budget, clock=clock, process_runner=model)
-        clock.advance(980)
-        with self.assertRaises(CommandError) as caught:
-            command.run(["git", "push"], timeout=30, stage="git")
-        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
-        self.assertGreater(model.cleanup_deadline, budget.work_deadline)
-        self.assertLess(budget.remaining_overall(), 90.0)
-
-    def test_cleanup_reap_reserve_ends_within_the_overall_deadline(self):
-        clock = FakeClock()
-        budget = Budget(1080, 90, clock=clock, error_factory=CommandError)
+        clock.advance(1000)
         budget.begin_cleanup()
         model = DeadlineModelRunner(clock, handoff=0.02)
         command = BoundedCommandRunner(
             budget=budget, clock=clock, process_runner=model)
-        clock.advance(1000)
         command.run(["docker", "rm"], timeout=100, stage="cleanup")
+        _argv, kwargs = model.calls[0]
+        self.assertEqual(kwargs["timeout"], 100)
+        self.assertEqual(kwargs["absolute_operation_deadline"], 1078.0)
+        self.assertEqual(kwargs["absolute_cleanup_deadline"], 1080.0)
         self.assertLessEqual(
             model.cleanup_deadline, budget.overall_deadline)
         self.assertGreaterEqual(budget.remaining_overall(), 0.0)
+
+
+class ActualHandoffTest(unittest.TestCase):
+    def _command(self, clock, budget, delay):
+        fake = AdvancingPopen(clock)
+        factory = PopenFactory(fake)
+        inner = process_module.ProcessRunner(
+            clock=clock,
+            popen=factory,
+            thread_factory=ImmediateThread,
+            killpg=GroupKiller(),
+        )
+        handoff = HandoffRunner(clock, delay, inner)
+        command = BoundedCommandRunner(
+            budget=budget, clock=clock, process_runner=handoff)
+        return command, handoff, fake, factory
+
+    def test_50ms_and_60ms_handoffs_end_at_work_deadline(self):
+        for delay in (0.05, 0.06):
+            with self.subTest(delay=delay):
+                clock = FakeClock()
+                budget = Budget(
+                    1080, 90, clock=clock, error_factory=CommandError)
+                clock.advance(980)
+                command, handoff, fake, factory = self._command(
+                    clock, budget, delay)
+                with mock.patch.object(
+                    process_module, "POLL_SECONDS", 100.0
+                ):
+                    with self.assertRaises(CommandError) as caught:
+                        command.run(["git", "push"], timeout=30, stage="git")
+                self.assertTrue(handoff.entered)
+                self.assertEqual(caught.exception.code, "subprocess_timeout")
+                self.assertEqual(caught.exception.stage, "git")
+                self.assertEqual(len(factory.calls), 1)
+                self.assertEqual(
+                    fake.wait_timeouts[0], 988.0 - (980.0 + delay))
+                self.assertEqual(fake.wait_timeouts[-1], 2.0)
+                self.assertLessEqual(clock.now, 990.0)
+                self.assertEqual(budget.remaining_overall(), 90.0)
+                self.assertFalse(command.unresolved_children)
+
+    def test_100s_handoff_refuses_before_popen(self):
+        clock = FakeClock()
+        budget = Budget(1080, 90, clock=clock, error_factory=CommandError)
+        clock.advance(980)
+        command, handoff, _fake, factory = self._command(
+            clock, budget, 100.0)
+        with self.assertRaises(CommandError) as caught:
+            command.run(["git", "push"], timeout=30, stage="git")
+        self.assertTrue(handoff.entered)
+        self.assertEqual(caught.exception.code, "subprocess_timeout")
+        self.assertEqual(factory.calls, [])
+        self.assertEqual(clock.now, 1080.0)
+        self.assertEqual(budget.remaining_overall(), 0.0)
+        self.assertFalse(command.unresolved_children)
+
+    def test_handoff_at_exact_operation_deadline_refuses_before_popen(self):
+        clock = FakeClock()
+        budget = Budget(1080, 90, clock=clock, error_factory=CommandError)
+        clock.advance(980)
+        command, _handoff, _fake, factory = self._command(
+            clock, budget, 8.0)
+        with self.assertRaises(CommandError) as caught:
+            command.run(["git", "push"], timeout=30, stage="git")
+        self.assertEqual(caught.exception.code, "subprocess_timeout")
+        self.assertEqual(factory.calls, [])
+
+    def test_cleanup_phase_handoff_ends_at_overall_deadline(self):
+        clock = FakeClock()
+        budget = Budget(1080, 90, clock=clock, error_factory=CommandError)
+        clock.advance(1000)
+        budget.begin_cleanup()
+        command, _handoff, fake, factory = self._command(
+            clock, budget, 0.02)
+        with mock.patch.object(process_module, "POLL_SECONDS", 100.0):
+            with self.assertRaises(CommandError) as caught:
+                command.run(["docker", "rm"], timeout=100, stage="cleanup")
+        self.assertEqual(caught.exception.code, "subprocess_timeout")
+        self.assertEqual(len(factory.calls), 1)
+        self.assertEqual(fake.wait_timeouts[0], 1078.0 - 1000.02)
+        self.assertEqual(fake.wait_timeouts[-1], 2.0)
+        self.assertLessEqual(clock.now, 1080.0)
+        self.assertEqual(budget.remaining_overall(), 0.0)
 
 
 if __name__ == "__main__":
