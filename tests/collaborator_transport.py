@@ -40,6 +40,98 @@ from collaborator_contract import (  # noqa: E402,F401  (re-exported for tests)
 CASE_MODULES = (collaborator_contract.__file__, collaborator_lifecycle.__file__,
                 collaborator_writes.__file__, collaborator_teams.__file__)
 
+_STAGE_OTHER = "OTHER"
+_STAGE_PHASES = ("setup", "fixture")
+_STAGE_SUFFIXES = (
+    "sql.create_schema", "sql.version_probe", "sql.other",
+    "migrate", "create_user", "create_token",
+    "git.version_probe", "git.clone", "git.config", "git.add", "git.commit",
+    "git.rev_parse", "git.push", "git.other",
+    "binary.other", "other",
+)
+_STAGE_LABELS = frozenset(
+    f"{phase}.{suffix}" for phase in _STAGE_PHASES for suffix in _STAGE_SUFFIXES
+) | {_STAGE_OTHER}
+
+
+def _safe_stage(value):
+    """Return a stage only when it is one exact member of the closed enum."""
+    return value if type(value) is str and value in _STAGE_LABELS else None
+
+
+def _argument(argv, index):
+    try:
+        return argv[index]
+    except BaseException:
+        return None
+
+
+def _option_argument(argv, option):
+    try:
+        for index, item in enumerate(argv):
+            if item == option:
+                return _argument(argv, index + 1)
+    except BaseException:
+        return None
+    return None
+
+
+def _stage_label(argv, phase, binary):
+    """Classify one existing command shape in memory; never retain its text."""
+    try:
+        if phase not in _STAGE_PHASES:
+            return _STAGE_OTHER
+        if not isinstance(argv, (list, tuple)) or not argv:
+            return _STAGE_OTHER
+        executable = argv[0]
+        if not isinstance(executable, str) or not executable:
+            return _STAGE_OTHER
+        if executable == "psql" or os.path.basename(executable) == "psql":
+            query = _option_argument(argv, "-c")
+            if isinstance(query, str):
+                normalized = query.strip().upper()
+                if normalized.startswith("CREATE SCHEMA"):
+                    return phase + ".sql.create_schema"
+                if normalized == "SELECT VERSION()":
+                    return phase + ".sql.version_probe"
+            return phase + ".sql.other"
+        if executable == "git" or os.path.basename(executable) == "git":
+            tail = argv[1:]
+            index = 0
+            subcommand = None
+            while index < len(tail):
+                item = tail[index]
+                if not isinstance(item, str):
+                    return _STAGE_OTHER
+                if item in ("-c", "-C", "--git-dir", "--work-tree", "--namespace"):
+                    index += 2
+                    continue
+                if item.startswith("-"):
+                    index += 1
+                    continue
+                subcommand = item
+                break
+            if subcommand is None:
+                if "--version" in tail:
+                    return phase + ".git.version_probe"
+                return phase + ".git.other"
+            suffix = {
+                "clone": "git.clone", "config": "git.config", "add": "git.add",
+                "commit": "git.commit", "rev-parse": "git.rev_parse", "push": "git.push",
+            }.get(subcommand, "git.other")
+            return phase + "." + suffix
+        binary_value = binary if isinstance(binary, str) else None
+        if binary_value is not None and executable == binary_value:
+            subcommand = _argument(argv, 1)
+            suffix = {
+                "migrate": "migrate", "create-user": "create_user",
+                "create-token": "create_token",
+            }.get(subcommand, "binary.other")
+            return phase + "." + suffix
+        return _STAGE_OTHER
+    except BaseException:
+        return _STAGE_OTHER
+
 
 class CollaboratorTransportHarness(collaborator_contract.prerequisite,
                                    collaborator_lifecycle.lifecycle,
@@ -66,6 +158,72 @@ class CollaboratorTransportHarness(collaborator_contract.prerequisite,
         ]
         self.users = {}
         self.member_mutations = 0
+        self._observe_stage = False
+        self._stage_phase = None
+        self._last_run_stage = None
+        self._failed_stage = None
+
+    def case(self, name, fn):
+        """Observe only the environment case; every other case is untouched."""
+        if name != "environment":
+            return super().case(name, fn)
+        previous = (
+            getattr(self, "_observe_stage", False),
+            getattr(self, "_stage_phase", None),
+            getattr(self, "_last_run_stage", None),
+            getattr(self, "_failed_stage", None),
+        )
+        self._observe_stage = True
+        self._stage_phase = "setup"
+        self._last_run_stage = None
+        self._failed_stage = None
+        try:
+            return super().case(name, fn)
+        except Exception:
+            stage = _safe_stage(getattr(self, "_failed_stage", None))
+            if stage is not None:
+                for result in reversed(getattr(self, "results", ())):
+                    if (isinstance(result, dict) and result.get("name") == name
+                            and result.get("status") == "failed"):
+                        result["failed_stage"] = stage
+                        break
+            raise
+        finally:
+            (self._observe_stage, self._stage_phase,
+             self._last_run_stage, self._failed_stage) = previous
+
+    def setup(self):
+        """Keep setup labels distinct from fixture labels after setup succeeds."""
+        if not getattr(self, "_observe_stage", False):
+            return super().setup()
+        self._stage_phase = "setup"
+        result = super().setup()
+        self._stage_phase = "fixture"
+        return result
+
+    def run(self, argv, cwd=None, check=True, data=None, env=None):
+        """Delegate once, then annotate only the original checked AssertionError."""
+        if not getattr(self, "_observe_stage", False):
+            return super().run(argv, cwd=cwd, check=check, data=data, env=env)
+        try:
+            stage = _stage_label(
+                argv,
+                getattr(self, "_stage_phase", None),
+                getattr(getattr(self, "args", None), "binary", None),
+            )
+        except BaseException:
+            stage = _STAGE_OTHER
+        stage = _safe_stage(stage) or _STAGE_OTHER
+        self._last_run_stage = stage
+        try:
+            return super().run(argv, cwd=cwd, check=check, data=data, env=env)
+        except AssertionError as error:
+            self._failed_stage = stage
+            try:
+                object.__setattr__(error, "failed_stage", stage)
+            except BaseException:
+                pass
+            raise
 
     def execute(self):
         """Register all twenty cases; the main loop runs them in order."""

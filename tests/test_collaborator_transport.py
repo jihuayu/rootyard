@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "scripts"))
 import collaborator_contract  # noqa: E402
 import collaborator_transport as harness  # noqa: E402
+import e2e  # noqa: E402  (the shared Harness used only as a mocked base)
 import native_build_receipt as receipts  # noqa: E402
 import source_bound_binary  # noqa: E402
 
@@ -641,6 +642,311 @@ class HarnessContract(unittest.TestCase):
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(listing.returncode, 0, listing.stderr)
         self.assertIn("--report", listing.stdout)
+
+
+class EnvironmentObserverContract(unittest.TestCase):
+    """Fully mocked checks for the environment-case stage observer."""
+
+    @staticmethod
+    def make_harness():
+        h = object.__new__(harness.CollaboratorTransportHarness)
+        h.args = types.SimpleNamespace(binary="/owned/rootyard")
+        h.results = []
+        h.secrets = []
+        h.base_db = "postgresql://base.invalid/db"
+        h.db = "postgresql://base.invalid/db"
+        h._observe_stage = False
+        h._stage_phase = None
+        h._last_run_stage = None
+        h._failed_stage = None
+        return h
+
+    @staticmethod
+    def success(_self, argv, cwd=None, check=True, data=None, env=None):
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    def test_single_delegate_identity_and_order(self):
+        h = self.make_harness()
+        h._observe_stage = True
+        h._stage_phase = "setup"
+        calls = []
+
+        def base(_self, argv, cwd=None, check=True, data=None, env=None):
+            calls.append((argv, cwd, check, data, env))
+            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        argv1 = ["psql", "--dbname", h.db, "-X", "-v", "ON_ERROR_STOP=1", "-At", "-c", 'CREATE SCHEMA "s"']
+        env1 = {"DATABASE_URL": "sentinel"}
+        data1 = b"payload"
+        argv2 = [h.args.binary, "migrate"]
+        argv3 = [h.args.binary, "create-user", "alice"]
+        argv4 = [h.args.binary, "create-token", "alice", "--read-only"]
+        argv5 = ["git", "--version"]
+        argv6 = ["git", "-c", "http.extraHeader=Authorization: Basic SECRET", "clone",
+                 "http://127.0.0.1/git/alice/demo.git", "/tmp/work"]
+        argv7 = ["git", "config", "user.name", "Alice"]
+        argv8 = ["git", "add", "README.md"]
+        argv9 = ["git", "commit", "-m", "seed"]
+        argv10 = ["git", "rev-parse", "HEAD"]
+        argv11 = ["git", "push", "origin", "HEAD:refs/heads/main"]
+        expected = [
+            (argv1, "/tmp", True, data1, env1),
+            (argv2, None, True, None, None),
+            (argv3, None, True, None, None),
+            (argv4, None, True, None, None),
+            (argv5, None, True, None, None),
+            (argv6, "/tmp/work", True, None, {"TOKEN": "SECRET"}),
+            (argv7, "/tmp/work", True, None, None),
+            (argv8, "/tmp/work", True, None, None),
+            (argv9, "/tmp/work", True, None, None),
+            (argv10, "/tmp/work", True, None, None),
+            (argv11, "/tmp/work", False, None, None),
+        ]
+        with mock.patch.object(e2e.Harness, "run", new=base):
+            h.run(argv1, cwd="/tmp", data=data1, env=env1)
+            h.run(argv2)
+            h.run(argv3)
+            h.run(argv4)
+            h.run(argv5)
+            h._stage_phase = "fixture"
+            h.run(argv6, cwd="/tmp/work", env={"TOKEN": "SECRET"})
+            h.run(argv7, cwd="/tmp/work")
+            h.run(argv8, cwd="/tmp/work")
+            h.run(argv9, cwd="/tmp/work")
+            h.run(argv10, cwd="/tmp/work")
+            h.run(argv11, cwd="/tmp/work", check=False)
+        self.assertEqual(calls, expected)
+        self.assertIs(calls[0][0], argv1)
+        self.assertIs(calls[0][3], data1)
+        self.assertIs(calls[0][4], env1)
+        self.assertEqual(len(calls), len(expected))
+
+    def test_closed_labels_and_unknown_shape(self):
+        h = self.make_harness()
+        h._observe_stage = True
+        cases = [
+            ("setup", ["psql", "-c", 'CREATE SCHEMA "s"'], "setup.sql.create_schema"),
+            ("setup", ["psql", "-c", "SELECT version()"], "setup.sql.version_probe"),
+            ("setup", ["psql", "-c", "SELECT 1"], "setup.sql.other"),
+            ("setup", [h.args.binary, "migrate"], "setup.migrate"),
+            ("setup", [h.args.binary, "create-user", "alice"], "setup.create_user"),
+            ("setup", [h.args.binary, "create-token", "alice", "--read-only"], "setup.create_token"),
+            ("setup", ["git", "--version"], "setup.git.version_probe"),
+            ("fixture", ["git", "-c", "http.extraHeader=Authorization: Basic SECRET", "clone",
+                         "https://user:tok@example.invalid/repo", "work"], "fixture.git.clone"),
+            ("fixture", ["git", "config", "user.name", "Alice"], "fixture.git.config"),
+            ("fixture", ["git", "add", "README.md"], "fixture.git.add"),
+            ("fixture", ["git", "commit", "-m", "seed"], "fixture.git.commit"),
+            ("fixture", ["git", "rev-parse", "HEAD"], "fixture.git.rev_parse"),
+            ("fixture", ["git", "push", "origin", "HEAD:refs/heads/main"], "fixture.git.push"),
+            ("fixture", ["git", "status"], "fixture.git.other"),
+            ("setup", ["unknown-tool", "--flag"], "OTHER"),
+        ]
+        with mock.patch.object(e2e.Harness, "run", new=self.success):
+            for phase, argv, expected in cases:
+                h._stage_phase = phase
+                h.run(argv, env={"SECRET": "SECRET"}, data=b"SECRET")
+                self.assertEqual(h._last_run_stage, expected)
+                self.assertIn(h._last_run_stage, harness._STAGE_LABELS)
+                for sentinel in ("SECRET", "http", "/", "postgres", "Authorization"):
+                    self.assertNotIn(sentinel, h._last_run_stage)
+            for argv in (None, [], [None], [object()], ["git", "-c"]):
+                h._stage_phase = "setup"
+                h.run(argv)
+                self.assertIn(h._last_run_stage, harness._STAGE_LABELS)
+
+    def test_same_exception_and_report_enum(self):
+        h = self.make_harness()
+        h._observe_stage = True
+        h._stage_phase = "fixture"
+        primary = AssertionError("Command failed (7): SECRET")
+        primary.failed_stage = "untrusted"
+        with mock.patch.object(e2e.Harness, "run", side_effect=primary):
+            with self.assertRaises(AssertionError) as caught:
+                h.run(["git", "push", "origin", "HEAD:main"], env={"SECRET": "SECRET"})
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(caught.exception.args, ("Command failed (7): SECRET",))
+        self.assertEqual(str(caught.exception), "Command failed (7): SECRET")
+        self.assertEqual(caught.exception.failed_stage, "fixture.git.push")
+        self.assertEqual(h._failed_stage, "fixture.git.push")
+        h.results = []
+        h._observe_stage = False
+
+        def fn():
+            h._stage_phase = "fixture"
+            h.run(["git", "push", "origin", "HEAD:main"], env={"SECRET": "SECRET"})
+
+        with mock.patch.object(e2e.Harness, "run", side_effect=primary):
+            with self.assertRaises(AssertionError):
+                h.case("environment", fn)
+        entry = h.results[-1]
+        self.assertEqual(entry["failed_stage"], "fixture.git.push")
+        self.assertEqual(set(entry), {"name", "status", "seconds", "error", "failed_stage"})
+        self.assertNotIn("untrusted", entry["failed_stage"])
+        self.assertEqual(entry["error"], h.redact(primary))
+
+    def test_timeout_other_errors_and_scope(self):
+        h = self.make_harness()
+        h._observe_stage = True
+        h._stage_phase = "fixture"
+        timeout = subprocess.TimeoutExpired(cmd="git", timeout=60)
+        with mock.patch.object(e2e.Harness, "run", side_effect=timeout):
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                h.run(["git", "push", "origin", "HEAD:main"])
+        self.assertIs(caught.exception, timeout)
+        self.assertFalse(hasattr(timeout, "failed_stage"))
+        self.assertIsNone(h._failed_stage)
+        runtime = RuntimeError("boom")
+        with mock.patch.object(e2e.Harness, "run", side_effect=runtime):
+            with self.assertRaises(RuntimeError) as caught:
+                h.run(["git", "push", "origin", "HEAD:main"])
+        self.assertIs(caught.exception, runtime)
+        self.assertFalse(hasattr(runtime, "failed_stage"))
+        self.assertIsNone(h._failed_stage)
+        h2 = self.make_harness()
+        plain = AssertionError("plain")
+
+        def fail():
+            raise plain
+
+        with self.assertRaises(AssertionError):
+            h2.case("environment", fail)
+        self.assertNotIn("failed_stage", h2.results[-1])
+        h3 = self.make_harness()
+        h3._last_run_stage = "prior"
+        primary = AssertionError("raw")
+        with mock.patch.object(e2e.Harness, "run", side_effect=primary):
+            with self.assertRaises(AssertionError) as caught:
+                h3.run(["git", "push", "origin", "HEAD:main"])
+        self.assertIs(caught.exception, primary)
+        self.assertFalse(hasattr(primary, "failed_stage"))
+        self.assertEqual(h3._last_run_stage, "prior")
+        h4 = self.make_harness()
+        h4._observe_stage = True
+        h4._stage_phase = "fixture"
+        primary4 = AssertionError("primary")
+        with mock.patch.object(harness, "_stage_label", side_effect=RuntimeError("classifier")), \
+                mock.patch.object(e2e.Harness, "run", side_effect=primary4):
+            with self.assertRaises(AssertionError) as caught:
+                h4.run(["git", "push", "origin", "HEAD:main"])
+        self.assertIs(caught.exception, primary4)
+        self.assertEqual(h4._failed_stage, "OTHER")
+        self.assertEqual(primary4.failed_stage, "OTHER")
+
+    def test_phase_scope_and_cleanup(self):
+        h = self.make_harness()
+        h._observe_stage = True
+        h._stage_phase = None
+        with mock.patch.object(e2e.Harness, "setup", return_value=None) as base_setup:
+            h.setup()
+        self.assertEqual(base_setup.call_count, 1)
+        self.assertEqual(h._stage_phase, "fixture")
+        failure = RuntimeError("setup failed")
+        h._stage_phase = "setup"
+        with mock.patch.object(e2e.Harness, "setup", side_effect=failure):
+            with self.assertRaises(RuntimeError) as caught:
+                h.setup()
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(h._stage_phase, "setup")
+        h2 = self.make_harness()
+        h2._stage_phase = "prior"
+        h2._last_run_stage = "prior-last"
+        h2._failed_stage = "prior-failed"
+
+        def ok():
+            return "ok"
+
+        h2.case("environment", ok)
+        self.assertNotIn("failed_stage", h2.results[-1])
+        self.assertEqual(h2.results[-1]["detail"], "ok")
+        self.assertEqual((h2._observe_stage, h2._stage_phase, h2._last_run_stage, h2._failed_stage),
+                         (False, "prior", "prior-last", "prior-failed"))
+        h3 = self.make_harness()
+        h3._stage_phase = "prior"
+        h3._last_run_stage = "prior-last"
+        h3._failed_stage = "prior-failed"
+        case_failure = RuntimeError("case failed")
+
+        def fail():
+            raise case_failure
+
+        with self.assertRaises(RuntimeError) as caught:
+            h3.case("environment", fail)
+        self.assertIs(caught.exception, case_failure)
+        self.assertEqual((h3._observe_stage, h3._stage_phase, h3._last_run_stage, h3._failed_stage),
+                         (False, "prior", "prior-last", "prior-failed"))
+        h4 = self.make_harness()
+        h4._last_run_stage = "prior-last"
+        primary = AssertionError("other")
+
+        def other():
+            h4.run(["git", "push", "origin", "HEAD:main"])
+
+        with mock.patch.object(e2e.Harness, "run", side_effect=primary):
+            with self.assertRaises(AssertionError) as caught:
+                h4.case("staff_owned_fixtures", other)
+        self.assertIs(caught.exception, primary)
+        self.assertNotIn("failed_stage", h4.results[-1])
+        self.assertEqual(h4._last_run_stage, "prior-last")
+        with mock.patch.object(e2e.Harness, "run", new=self.success):
+            h4.run(["git", "--version"])
+        self.assertEqual(h4._last_run_stage, "prior-last")
+
+    def test_privacy_and_redaction(self):
+        h = self.make_harness()
+        h.secrets = ["SECRET"]
+        h.base_db = "postgresql://user:secret@example.invalid/db"
+        h.db = "postgresql://user:secret@example.invalid/db"
+        h._observe_stage = True
+        h._stage_phase = "fixture"
+        primary = AssertionError("Command failed: SECRET")
+        argv = ["git", "-c", "http.extraHeader=Authorization: Basic SECRET", "push",
+                "https://user:SECRET@example.invalid/repo", "HEAD:main"]
+
+        def fn():
+            h._stage_phase = "fixture"
+            h.run(argv, env={"DATABASE_URL": h.db, "ACCESS_TOKEN": "SECRET"},
+                  data=b"SECRET", cwd="/tmp/SECRET")
+
+        with mock.patch.object(e2e.Harness, "run", side_effect=primary):
+            with self.assertRaises(AssertionError):
+                h.case("environment", fn)
+        entry = h.results[-1]
+        self.assertEqual(entry["failed_stage"], "fixture.git.push")
+        self.assertEqual(set(entry), {"name", "status", "seconds", "error", "failed_stage"})
+        self.assertNotIn("SECRET", entry["failed_stage"])
+        self.assertEqual(entry["error"], "Command failed: [REDACTED]")
+
+    def test_invalid_shapes_and_untrusted_attributes(self):
+        h = self.make_harness()
+        untrusted = AssertionError("plain")
+        untrusted.failed_stage = "fixture.git.push"
+
+        def fail():
+            raise untrusted
+
+        with self.assertRaises(AssertionError):
+            h.case("environment", fail)
+        self.assertNotIn("failed_stage", h.results[-1])
+
+        class BadList(list):
+            def __len__(self):
+                raise RuntimeError("bad length")
+
+        for argv in (None, [], [None], [object()], BadList()):
+            h2 = self.make_harness()
+            h2._observe_stage = True
+            h2._stage_phase = "fixture"
+            primary = AssertionError("primary")
+            with mock.patch.object(e2e.Harness, "run", side_effect=primary):
+                with self.assertRaises(AssertionError) as caught:
+                    h2.run(argv)
+            self.assertIs(caught.exception, primary)
+            self.assertEqual(h2._failed_stage, "OTHER")
+            self.assertEqual(primary.failed_stage, "OTHER")
+        for value in (None, 1, "fixture.git.push\n", object(), ["fixture.git.push"]):
+            self.assertIsNone(harness._safe_stage(value))
+        self.assertEqual(harness._safe_stage("fixture.git.push"), "fixture.git.push")
 
 
 if __name__ == "__main__":
