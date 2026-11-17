@@ -660,6 +660,27 @@ class FakePopen:
         return self.process
 
 
+class SequencedPopen:
+    """Return a scripted sequence of fake Popen handles/errors."""
+
+    def __init__(self, items):
+        self.items = list(items)
+        self.calls = 0
+        self.argv = None
+        self.kwargs = None
+
+    def __call__(self, argv, **kwargs):
+        self.calls += 1
+        self.argv = list(argv)
+        self.kwargs = dict(kwargs)
+        if not self.items:
+            raise AssertionError("unexpected Popen")
+        item = self.items.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
 class FakeRead:
     def __init__(self, chunks):
         self.chunks = list(chunks)
@@ -723,7 +744,8 @@ def _server_for_start(clock, budget, process, read_chunks,
         popen=popen, killpg=group.killpg,
         select_fn=selector, read_fn=reader,
         set_blocking_fn=lambda _fd, _flag: None,
-        sleep_fn=sleep, leader_state_fn=_leader_state_for(process, group))
+        sleep_fn=sleep, leader_state_fn=_leader_state_for(process, group),
+        getpgid_fn=lambda pid: pid)
     return server, popen, reader, selector, sleep
 
 
@@ -738,6 +760,7 @@ def _server_for_stop(clock, budget, group=None):
     server.process = process
     server.owned_group = True
     server.pgid = group.pgid
+    server._group_verified = True
     return server, process, group, sleep
 
 
@@ -781,7 +804,8 @@ class ServerProcessBoundaryTest(unittest.TestCase):
             select_fn=selector, read_fn=reader,
             set_blocking_fn=lambda _fd, _flag: None,
             sleep_fn=sleep,
-            leader_state_fn=_leader_state_for(process, process.group))
+            leader_state_fn=_leader_state_for(process, process.group),
+            getpgid_fn=lambda pid: pid)
         with self.assertRaises(QualificationError) as caught:
             server.start()
         self.assertEqual(caught.exception.code, "server_start_timeout")
@@ -875,7 +899,8 @@ class ServerProcessBoundaryTest(unittest.TestCase):
             select_fn=selector, read_fn=LateRead(),
             set_blocking_fn=lambda _fd, _flag: None,
             sleep_fn=sleep,
-            leader_state_fn=_leader_state_for(process, process.group))
+            leader_state_fn=_leader_state_for(process, process.group),
+            getpgid_fn=lambda pid: pid)
         with self.assertRaises(QualificationError) as caught:
             server.start()
         self.assertEqual(caught.exception.code, "work_deadline_exceeded")
@@ -893,6 +918,150 @@ class ServerProcessBoundaryTest(unittest.TestCase):
             server.start()
         self.assertEqual(caught.exception.code, "server_announcement_invalid")
         self.assertIsNone(server.process)
+
+    def _generation_server(self, clock, budget, processes, reads):
+        holder = {}
+
+        def leader_state():
+            process = holder.get("server").process if holder.get("server") else None
+            if process is None:
+                return "reaped"
+            group = process.group
+            if process.returncode is not None or group.leader_reaped:
+                return "reaped"
+            return "exited" if group.leader_exited() else "alive"
+
+        popen = SequencedPopen(processes)
+        sleep = FakeSleep(clock)
+        selector = FakeSelect(clock=clock, ready=True)
+        reader = FakeRead(reads)
+        groups = {process.group.pgid: process.group for process in processes
+                  if isinstance(process, FakeProcess)}
+
+        def killpg(pgid, sig):
+            return groups[pgid].killpg(pgid, sig)
+
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=popen, killpg=killpg, select_fn=selector,
+            read_fn=reader, set_blocking_fn=lambda _fd, _flag: None,
+            sleep_fn=sleep, leader_state_fn=leader_state,
+            getpgid_fn=lambda pid: pid)
+        holder["server"] = server
+        return server, popen, groups, sleep
+
+    def test_stop_restart_stop_uses_a_fresh_owned_generation(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        g1 = FakeGroup(clock, pgid=1111)
+        g2 = FakeGroup(clock, pgid=2222)
+        p1 = FakeProcess(g1, pid=1111)
+        p2 = FakeProcess(g2, pid=2222)
+        server, popen, groups, _sleep = self._generation_server(
+            clock, budget, [p1, p2],
+            [b"LISTEN http://127.0.0.1:9001\n",
+             b"LISTEN http://127.0.0.1:9002\n"])
+        self.assertEqual(server.start(), "http://127.0.0.1:9001")
+        self.assertEqual(server._generation, 1)
+        self.assertEqual(server.pgid, 1111)
+        self.assertTrue(server.stop())
+        self.assertTrue(server._leader_reaped)
+        self.assertEqual(server._generation, 1)
+        self.assertIsNone(server.process)
+        first_calls = len(g1.calls)
+
+        self.assertEqual(server.start(), "http://127.0.0.1:9002")
+        self.assertEqual(server._generation, 2)
+        self.assertFalse(server._leader_reaped)
+        self.assertTrue(server._group_verified)
+        self.assertEqual(server.pgid, 2222)
+        self.assertIs(server.process, p2)
+        self.assertTrue(server.stop())
+        self.assertTrue(server._leader_reaped)
+        self.assertEqual(len(g1.calls), first_calls)
+        kill_index = next(
+            index for index, (_pgid, sig, _at) in enumerate(g2.calls)
+            if sig == signal.SIGKILL)
+        self.assertFalse(g2.reaped_at_call[kill_index])
+        self.assertTrue(p2.stdout.closed)
+
+    def test_successful_stop_then_start_failure_cleans_new_group(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        g1 = FakeGroup(clock, pgid=1111)
+        g2 = FakeGroup(clock, pgid=2222)
+        p1 = FakeProcess(g1, pid=1111)
+        p2 = FakeProcess(g2, pid=2222)
+        server, _popen, _groups, _sleep = self._generation_server(
+            clock, budget, [p1, p2],
+            [b"LISTEN http://127.0.0.1:9001\n", b"HELLO\n"])
+        self.assertEqual(server.start(), "http://127.0.0.1:9001")
+        self.assertTrue(server.stop())
+        first_calls = len(g1.calls)
+
+        with self.assertRaises(QualificationError) as caught:
+            server.start()
+        self.assertEqual(caught.exception.code, "server_announcement_invalid")
+        self.assertEqual(server._generation, 2)
+        self.assertTrue(server._leader_reaped)
+        self.assertIsNone(server.process)
+        self.assertEqual(len(g1.calls), first_calls)
+        kill_index = next(
+            index for index, (_pgid, sig, _at) in enumerate(g2.calls)
+            if sig == signal.SIGKILL)
+        self.assertFalse(g2.reaped_at_call[kill_index])
+        self.assertTrue(p2.stdout.closed)
+
+    def test_popen_creation_failure_preserves_previous_generation_state(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        g1 = FakeGroup(clock, pgid=1111)
+        p1 = FakeProcess(g1, pid=1111)
+        server, popen, _groups, _sleep = self._generation_server(
+            clock, budget, [p1, OSError("popen failed")],
+            [b"LISTEN http://127.0.0.1:9001\n"])
+        self.assertEqual(server.start(), "http://127.0.0.1:9001")
+        self.assertTrue(server.stop())
+        self.assertTrue(server._leader_reaped)
+        generation = server._generation
+        with self.assertRaises(QualificationError) as caught:
+            server.start()
+        self.assertEqual(caught.exception.code, "server_start_failed")
+        self.assertTrue(server._leader_reaped)
+        self.assertEqual(server._generation, generation)
+        self.assertIsNone(server.process)
+
+    def test_unverified_new_session_fails_closed_without_signal(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(clock, pgid=1111)
+        process = FakeProcess(group, pid=1111)
+        popen = FakePopen(process)
+        sleep = FakeSleep(clock)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=popen, killpg=group.killpg,
+            select_fn=FakeSelect(clock=clock, ready=True),
+            read_fn=FakeRead([b"LISTEN http://127.0.0.1:9001\n"]),
+            set_blocking_fn=lambda _fd, _flag: None,
+            sleep_fn=sleep,
+            leader_state_fn=_leader_state_for(process, group),
+            getpgid_fn=lambda pid: pid + 1)
+        with self.assertRaises(QualificationError) as caught:
+            server.start()
+        self.assertEqual(caught.exception.code, "server_group_unverified")
+        self.assertIs(server.process, process)
+        self.assertTrue(server.owned_group)
+        self.assertFalse(server._group_verified)
+        self.assertEqual(group.calls, [])
+        with self.assertRaises(QualificationError) as again:
+            server.start()
+        self.assertEqual(again.exception.code, "server_already_started")
+        self.assertEqual(popen.calls, 1)
 
     def test_stop_waits_the_full_term_grace_before_kill(self):
         clock = Clock()
@@ -1170,6 +1339,7 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         server.process = process
         server.owned_group = True
         server.pgid = group.pgid
+        server._group_verified = True
         with self.assertRaises(QualificationError) as caught:
             server.stop()
         self.assertEqual(caught.exception.code, "server_group_unverified")
@@ -1205,6 +1375,7 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         server.process = process
         server.owned_group = True
         server.pgid = group.pgid
+        server._group_verified = True
         clock.advance(79.9)
         with self.assertRaises(QualificationError) as caught:
             server.stop()

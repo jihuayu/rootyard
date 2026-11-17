@@ -133,7 +133,7 @@ class Server:
     def __init__(self, binary, environment, runner=None, budget=None,
                  clock=None, popen=None, killpg=None, select_fn=None,
                  read_fn=None, set_blocking_fn=None, sleep_fn=None,
-                 leader_state_fn=None):
+                 leader_state_fn=None, getpgid_fn=None):
         self.binary = str(binary)
         self.environment = dict(environment)
         self.runner = runner
@@ -145,6 +145,8 @@ class Server:
         self.pgid = None
         self.stdout_fd = None
         self._leader_reaped = False
+        self._group_verified = False
+        self._generation = 0
         self._popen = popen or subprocess.Popen
         self._killpg = killpg or os.killpg
         self._select = select_fn or select.select
@@ -152,6 +154,18 @@ class Server:
         self._set_blocking = set_blocking_fn or os.set_blocking
         self._sleep = sleep_fn or time.sleep
         self._observe_leader = leader_state_fn or self._default_leader_state
+        self._getpgid = getpgid_fn or os.getpgid
+
+    def _adopt_process(self, process):
+        """Adopt one fresh Popen and reset all per-owner generation state."""
+        self.process = process
+        self.owned_group = True
+        self.pgid = getattr(process, "pid", None)
+        self.stdout_fd = None
+        self.base = None
+        self._leader_reaped = False
+        self._group_verified = False
+        self._generation += 1
 
     def _now(self):
         return self.clock() if self.clock is not None else time.monotonic()
@@ -196,13 +210,22 @@ class Server:
         # The parent retains the handle and group ownership immediately after
         # Popen and before any await/read.  The leader is deliberately not
         # polled or reaped here: its PGID is the owned-group fence used by stop.
-        self.process = process
-        self.owned_group = True
-        self.pgid = getattr(process, "pid", None)
+        # Adoption resets the prior generation before a readiness failure can
+        # invoke _stop_quietly().
+        self._adopt_process(process)
         try:
             if (not isinstance(self.pgid, int) or self.pgid <= 0
                     or self.pgid == os.getpid()):
                 raise QualificationError("server_group_unverified", "server")
+            try:
+                observed_pgid = self._getpgid(self.pgid)
+            except (OSError, ValueError, TypeError):
+                raise QualificationError(
+                    "server_group_unverified", "server") from None
+            if observed_pgid != self.pgid:
+                raise QualificationError("server_group_unverified", "server")
+            self._group_verified = True
+            self._late("server")
             stream = getattr(process, "stdout", None)
             if stream is None:
                 raise QualificationError("server_start_failed", "server")
@@ -434,12 +457,15 @@ class Server:
         self.owned_group = False
         self.pgid = None
         self.stdout_fd = None
+        self._group_verified = False
 
     def stop(self, timeout=15):
         if self.process is None:
             return True
         if (not self.owned_group or not isinstance(self.pgid, int)
                 or self.pgid <= 0 or self.pgid == os.getpid()):
+            raise QualificationError("server_group_unverified", "cleanup")
+        if not self._group_verified:
             raise QualificationError("server_group_unverified", "cleanup")
         process = self.process
         if self._leader_reaped or getattr(process, "returncode", None) is not None:
