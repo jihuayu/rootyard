@@ -73,6 +73,9 @@ pub const RESERVED_GIT_OPEN_FDS: u64 = 24;
 pub const DEFAULT_MAX_RESIDENT_LEDGER_ENTRIES: usize = 4096;
 pub const DEFAULT_MAX_RETAINED_PACK_RECORDS: usize = 1024;
 pub const DEFAULT_MAX_RESIDENT_REPLAY_OPS: usize = 4096;
+pub const DEFAULT_MAX_RESIDENT_OP_FENCES: usize = 65_536;
+pub const LEDGER_REPO_MAX_HOLDS: usize = 256;
+pub const LEDGER_REPO_MAX_NESTED_HOLDS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,6 +108,8 @@ pub struct MetadataLedgerContract {
     pub max_capture_refs: usize,
     pub max_plan_refs: usize,
     pub repo_max_resident_entries: usize,
+    pub repo_max_holds: usize,
+    pub repo_max_nested_holds: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +160,7 @@ pub struct StreamingGrowthContract {
     pub max_single_object_bytes: u64,
     pub max_retained_pack_records: usize,
     pub max_resident_replay_ops: usize,
+    pub max_resident_op_fences: usize,
     pub delete_during_compaction_enabled: bool,
 }
 
@@ -214,6 +220,8 @@ impl PandoCapacityContract {
                 max_capture_refs: LEDGER_MAX_CAPTURE_REFS,
                 max_plan_refs: LEDGER_MAX_PLAN_REFS,
                 repo_max_resident_entries: DEFAULT_MAX_RESIDENT_LEDGER_ENTRIES,
+                repo_max_holds: LEDGER_REPO_MAX_HOLDS,
+                repo_max_nested_holds: LEDGER_REPO_MAX_NESTED_HOLDS,
             },
             blob: BlobLayerContract {
                 max_object_bytes: MAX_OBJECT_BYTES,
@@ -255,6 +263,7 @@ impl PandoCapacityContract {
                 max_single_object_bytes: VERIFIER_WINDOW_MAX_TOTAL_BYTES,
                 max_retained_pack_records: DEFAULT_MAX_RETAINED_PACK_RECORDS,
                 max_resident_replay_ops: DEFAULT_MAX_RESIDENT_REPLAY_OPS,
+                max_resident_op_fences: DEFAULT_MAX_RESIDENT_OP_FENCES,
                 delete_during_compaction_enabled: false,
             },
         }
@@ -309,11 +318,16 @@ impl PandoCapacityContract {
             return Err(CapacityContractError::InvalidBound("queue and object limits must be positive"));
         }
         if self.metadata_ledger.repo_max_resident_entries == 0
+            || self.metadata_ledger.max_capture_refs == 0
+            || self.metadata_ledger.max_plan_refs == 0
+            || self.metadata_ledger.repo_max_holds == 0
+            || self.metadata_ledger.repo_max_nested_holds == 0
             || self.streaming.max_retained_pack_records == 0
             || self.streaming.max_resident_replay_ops == 0
+            || self.streaming.max_resident_op_fences < self.streaming.max_resident_replay_ops
         {
             return Err(CapacityContractError::InvalidBound(
-                "resident ledger, retained pack, and replay caps must be positive",
+                "resident ledger, ref/hold caps, retained pack, and replay/fence caps must be valid",
             ));
         }
         if self.streaming.delete_during_compaction_enabled {

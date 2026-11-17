@@ -4,17 +4,21 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use uuid::Uuid;
 
+#[cfg(test)]
+pub(super) use super::growth_cas::stage_compaction_ledger;
+pub(super) use super::growth_cas::validate_mutations;
 use super::{
     admission_types::AdmissionRejection,
     git_ops::{ObjectFormat, UploadedPackPair},
-    git_views::is_reserved_ref_name,
+    growth_cas::{apply_cas_mutations, stage_push_ledger},
     growth_types::{
         CompactionOutcome, GrowthEngineError, GrowthEngineSnapshot, PushOutcome, RefMutation, VerifiedPackRecord,
     },
     ledger_retention::RetentionLedger,
-    ledger_types::{LedgerEntryKind, LedgerRetentionError},
+    ledger_types::LedgerRetentionError,
     limits::{PandoCapacityContract, RESERVED_GIT_OPEN_FDS},
 };
+use crate::blob_store::BlobLocator;
 
 pub(super) struct CommitPushInput<'a> {
     pub contract: &'a PandoCapacityContract,
@@ -40,7 +44,7 @@ pub(super) struct CommitCompactionInput<'a> {
 }
 
 struct FailedUpload {
-    records: Vec<VerifiedPackRecord>,
+    locators: Vec<BlobLocator>,
     put_bytes: u64,
     get_bytes: u64,
     scratch: u64,
@@ -51,11 +55,12 @@ pub(super) struct EngineState {
     pub closure_revision: u64,
     pub active_packs: Vec<VerifiedPackRecord>,
     pub retained_old_packs: Vec<VerifiedPackRecord>,
-    pub failed_attempt_packs: Vec<VerifiedPackRecord>,
+    pub failed_attempt_locators: Vec<BlobLocator>,
     pub acked_refs: BTreeMap<String, String>,
     pub pinned_commits: BTreeMap<Uuid, String>,
     pub replayed_operations: BTreeMap<Uuid, (String, PushOutcome)>,
     pub replay_order: VecDeque<Uuid>,
+    pub acked_op_fences: BTreeSet<Uuid>,
     pub cancelled_operations: BTreeSet<Uuid>,
     pub cancel_order: VecDeque<Uuid>,
     pub cumulative_packs_added: u64,
@@ -100,6 +105,9 @@ impl EngineState {
             replayed.replayed = true;
             return Ok(Some(replayed));
         }
+        if self.acked_op_fences.contains(&op_id) {
+            return Err(GrowthEngineError::InvalidInput("operation already acknowledged; replay cache evicted"));
+        }
         if self.cancelled_operations.contains(&op_id) {
             return Err(GrowthEngineError::OperationCancelled(op_id));
         }
@@ -107,7 +115,7 @@ impl EngineState {
     }
 
     pub fn record_cancel(&mut self, op_id: Uuid, cap: usize) -> Result<(), GrowthEngineError> {
-        if self.replayed_operations.contains_key(&op_id) {
+        if self.replayed_operations.contains_key(&op_id) || self.acked_op_fences.contains(&op_id) {
             return Err(GrowthEngineError::InvalidInput("cannot cancel already-acked operation"));
         }
         if self.cancelled_operations.insert(op_id) {
@@ -121,7 +129,19 @@ impl EngineState {
         Ok(())
     }
 
+    pub fn check_op_fence_bound(&self, op_id: Uuid, max_fences: usize) -> Result<(), GrowthEngineError> {
+        if !self.acked_op_fences.contains(&op_id) && self.acked_op_fences.len() >= max_fences {
+            return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "op_fences",
+                current: self.acked_op_fences.len() as u64,
+                limit: max_fences as u64,
+            }));
+        }
+        Ok(())
+    }
+
     fn record_replay(&mut self, op_id: Uuid, digest: String, outcome: PushOutcome, cap: usize) {
+        self.acked_op_fences.insert(op_id);
         if !self.replayed_operations.contains_key(&op_id) {
             self.replay_order.push_back(op_id);
         }
@@ -134,7 +154,7 @@ impl EngineState {
     }
 
     pub fn check_resident_pack_bound(&self, max_retained: usize, extra: usize) -> Result<(), GrowthEngineError> {
-        let resident = self.retained_old_packs.len().saturating_add(self.failed_attempt_packs.len());
+        let resident = self.retained_old_packs.len().saturating_add(self.failed_attempt_locators.len());
         if resident.saturating_add(extra) > max_retained {
             return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
                 resource: "retained_packs",
@@ -147,7 +167,7 @@ impl EngineState {
 
     pub fn record_failed_upload(
         &mut self,
-        records: Vec<VerifiedPackRecord>,
+        locators: Vec<BlobLocator>,
         put_bytes: u64,
         blob_get_bytes: u64,
         peak_scratch: u64,
@@ -156,16 +176,13 @@ impl EngineState {
         self.total_blob_put_bytes = self.total_blob_put_bytes.saturating_add(put_bytes);
         self.total_blob_get_bytes = self.total_blob_get_bytes.saturating_add(blob_get_bytes);
         self.peak_scratch_bytes = self.peak_scratch_bytes.max(peak_scratch);
-        if put_bytes > 0 || !records.is_empty() {
+        if put_bytes > 0 || !locators.is_empty() {
             self.failed_attempt_count = self.failed_attempt_count.saturating_add(1);
             self.failed_attempt_blob_bytes = self.failed_attempt_blob_bytes.saturating_add(put_bytes);
-            for rec in records {
-                if self.retained_old_packs.len().saturating_add(self.failed_attempt_packs.len()) >= pack_cap
-                    && !self.failed_attempt_packs.is_empty()
-                {
-                    self.failed_attempt_packs.remove(0);
+            for loc in locators {
+                if self.retained_old_packs.len().saturating_add(self.failed_attempt_locators.len()) < pack_cap {
+                    self.failed_attempt_locators.push(loc);
                 }
-                self.failed_attempt_packs.push(rec);
             }
         }
     }
@@ -178,7 +195,7 @@ impl EngineState {
         match self.try_commit_compaction(input) {
             Ok(outcome) => Ok(outcome),
             Err((err, f)) => {
-                self.record_failed_upload(f.records, f.put_bytes, f.get_bytes, f.scratch, cap);
+                self.record_failed_upload(f.locators, f.put_bytes, f.get_bytes, f.scratch, cap);
                 Err(err)
             }
         }
@@ -202,8 +219,8 @@ impl EngineState {
             joined_epoch: compaction_epoch,
         };
         let put_bytes = rec.total_bytes();
-        let mk_fail = |r| FailedUpload {
-            records: vec![r],
+        let mk_fail = |r: VerifiedPackRecord| FailedUpload {
+            locators: vec![r.pack_locator],
             put_bytes,
             get_bytes: input.blob_get_bytes,
             scratch: input.peak_scratch_bytes,
@@ -259,12 +276,12 @@ impl EngineState {
         let pack_cap = input.contract.streaming.max_retained_pack_records;
         match self.try_commit_push(input) {
             Ok((outcome, None)) => Ok(outcome),
-            Ok((outcome, Some(failed))) => {
-                self.record_failed_upload(failed.records, failed.put_bytes, failed.get_bytes, failed.scratch, pack_cap);
+            Ok((outcome, Some(f))) => {
+                self.record_failed_upload(f.locators, f.put_bytes, f.get_bytes, f.scratch, pack_cap);
                 Ok(outcome)
             }
-            Err((err, failed)) => {
-                self.record_failed_upload(failed.records, failed.put_bytes, failed.get_bytes, failed.scratch, pack_cap);
+            Err((err, f)) => {
+                self.record_failed_upload(f.locators, f.put_bytes, f.get_bytes, f.scratch, pack_cap);
                 Err(err)
             }
         }
@@ -274,36 +291,48 @@ impl EngineState {
         &mut self,
         input: CommitPushInput<'_>,
     ) -> Result<(PushOutcome, Option<FailedUpload>), (GrowthEngineError, FailedUpload)> {
-        let mk_fail = |records, put_bytes, get_bytes, scratch| FailedUpload { records, put_bytes, get_bytes, scratch };
         let (pb, gb, sc) = (input.put_bytes, input.blob_get_bytes, input.peak_scratch_bytes);
+        let mk_fail = |recs: Vec<VerifiedPackRecord>| FailedUpload {
+            locators: recs.into_iter().map(|r| r.pack_locator).collect(),
+            put_bytes: pb,
+            get_bytes: gb,
+            scratch: sc,
+        };
         match self.check_replay_or_cancel(input.operation_id, &input.request_digest) {
             Ok(Some(replayed)) => {
                 let extra = if pb > 0 || !input.uploaded_records.is_empty() {
-                    Some(mk_fail(input.uploaded_records, pb, gb, sc))
+                    Some(mk_fail(input.uploaded_records))
                 } else {
                     None
                 };
                 return Ok((replayed, extra));
             }
             Ok(None) => {}
-            Err(err) => return Err((err, mk_fail(input.uploaded_records, pb, gb, sc))),
+            Err(err) => return Err((err, mk_fail(input.uploaded_records))),
+        }
+        if let Err(err) = self.check_op_fence_bound(input.operation_id, input.contract.streaming.max_resident_op_fences)
+        {
+            return Err((err, mk_fail(input.uploaded_records)));
         }
         let current_pack_ids: BTreeSet<Uuid> = self.active_packs.iter().map(|p| p.pack_id).collect();
         if !input.base_pack_ids.is_subset(&current_pack_ids) {
-            return Err((GrowthEngineError::CompactionConflict, mk_fail(input.uploaded_records, pb, gb, sc)));
+            return Err((GrowthEngineError::CompactionConflict, mk_fail(input.uploaded_records)));
         }
         let next_refs = match apply_cas_mutations(input.object_format, &self.acked_refs, input.ref_mutations) {
             Ok(r) => r,
-            Err(err) => return Err((err, mk_fail(input.uploaded_records, pb, gb, sc))),
+            Err(err) => return Err((err, mk_fail(input.uploaded_records))),
         };
+        if let Err(err) = check_acked_refs_bound(input.contract.metadata_ledger.max_capture_refs, next_refs.len()) {
+            return Err((err, mk_fail(input.uploaded_records)));
+        }
         if let Err(err) = check_commit_window_bounds(input.contract, &self.active_packs, &input.uploaded_records) {
-            return Err((err, mk_fail(input.uploaded_records, pb, gb, sc)));
+            return Err((err, mk_fail(input.uploaded_records)));
         }
         let commit_epoch = self.epoch + 1;
         let next_ledger =
             match stage_push_ledger(&self.ledger, input.operation_id, commit_epoch, &input.uploaded_records) {
                 Ok(l) => l,
-                Err(err) => return Err((err, mk_fail(input.uploaded_records, pb, gb, sc))),
+                Err(err) => return Err((err, mk_fail(input.uploaded_records))),
             };
 
         self.ledger = next_ledger;
@@ -337,148 +366,61 @@ impl EngineState {
     }
 }
 
+pub(super) fn check_acked_refs_bound(cap: usize, next_len: usize) -> Result<(), GrowthEngineError> {
+    if next_len > cap {
+        return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+            resource: "acked_refs",
+            current: next_len as u64,
+            limit: cap as u64,
+        }));
+    }
+    Ok(())
+}
+
 fn check_commit_window_bounds(
-    contract: &PandoCapacityContract,
-    active_packs: &[VerifiedPackRecord],
-    uploaded_records: &[VerifiedPackRecord],
+    c: &PandoCapacityContract,
+    active: &[VerifiedPackRecord],
+    added: &[VerifiedPackRecord],
 ) -> Result<(), GrowthEngineError> {
-    if uploaded_records.is_empty() {
+    if added.is_empty() {
         return Ok(());
     }
-    let next_pairs = active_packs.len().saturating_add(uploaded_records.len());
-    if next_pairs > contract.streaming.max_active_frontier_packs {
-        return Err(GrowthEngineError::Admission(AdmissionRejection::PackCountLimitReached {
-            active: active_packs.len(),
-            new_packs: uploaded_records.len(),
-            limit: contract.streaming.max_active_frontier_packs,
-        }));
+    let fail = |r| Err(GrowthEngineError::Admission(r));
+    let next_pairs = active.len().saturating_add(added.len());
+    if next_pairs > c.streaming.max_active_frontier_packs {
+        return fail(AdmissionRejection::PackCountLimitReached {
+            active: active.len(),
+            new_packs: added.len(),
+            limit: c.streaming.max_active_frontier_packs,
+        });
     }
-    let cur_bytes: u64 = active_packs.iter().map(VerifiedPackRecord::total_bytes).sum();
-    let cur_objects: u64 = active_packs.iter().map(|p| p.object_count).sum();
-    let add_bytes: u64 = uploaded_records.iter().map(VerifiedPackRecord::total_bytes).sum();
-    let add_objects: u64 = uploaded_records.iter().map(|p| p.object_count).sum();
-    let next_bytes = cur_bytes.saturating_add(add_bytes);
-    let next_objects = cur_objects.saturating_add(add_objects);
-    if next_bytes > contract.verifier.max_total_bytes_per_window {
-        return Err(GrowthEngineError::Admission(AdmissionRejection::PackBytesExceeded {
+    let sum = |ps: &[VerifiedPackRecord]| -> (u64, u64) {
+        (ps.iter().map(VerifiedPackRecord::total_bytes).sum(), ps.iter().map(|p| p.object_count).sum())
+    };
+    let ((cb, co), (ab, ao)) = (sum(active), sum(added));
+    let (next_bytes, next_objects) = (cb.saturating_add(ab), co.saturating_add(ao));
+    if next_bytes > c.verifier.max_total_bytes_per_window {
+        return fail(AdmissionRejection::PackBytesExceeded {
             requested: next_bytes,
-            limit: contract.verifier.max_total_bytes_per_window,
-        }));
+            limit: c.verifier.max_total_bytes_per_window,
+        });
     }
-    if next_objects > contract.verifier.max_objects_per_window {
-        return Err(GrowthEngineError::Admission(AdmissionRejection::TooManyObjects {
+    if next_objects > c.verifier.max_objects_per_window {
+        return fail(AdmissionRejection::TooManyObjects {
             requested: next_objects,
-            limit: contract.verifier.max_objects_per_window,
-        }));
+            limit: c.verifier.max_objects_per_window,
+        });
     }
     let next_workspace = next_bytes.saturating_mul(2);
-    if next_workspace > contract.verifier.view_max_logical_bytes {
-        return Err(GrowthEngineError::Admission(AdmissionRejection::WorkspaceBudgetExceeded {
+    if next_workspace > c.verifier.view_max_logical_bytes {
+        return fail(AdmissionRejection::WorkspaceBudgetExceeded {
             requested: next_workspace,
-            limit: contract.verifier.view_max_logical_bytes,
-        }));
+            limit: c.verifier.view_max_logical_bytes,
+        });
     }
     let next_fds = (next_pairs as u64).saturating_mul(2).saturating_add(RESERVED_GIT_OPEN_FDS);
-    if next_fds > contract.verifier.git_nofile {
-        return Err(GrowthEngineError::Admission(AdmissionRejection::FdBudgetExceeded {
-            requested: next_fds,
-            limit: contract.verifier.git_nofile,
-        }));
+    if next_fds > c.verifier.git_nofile {
+        return fail(AdmissionRejection::FdBudgetExceeded { requested: next_fds, limit: c.verifier.git_nofile });
     }
     Ok(())
-}
-
-fn record_pack_entries(
-    ledger: &mut RetentionLedger,
-    pack_id: Uuid,
-    reg_id: Uuid,
-    op_id: Option<Uuid>,
-    epoch: u64,
-) -> Result<(), GrowthEngineError> {
-    ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Membership, Some(pack_id), op_id, 512, epoch)?;
-    ledger.record_entry(reg_id, LedgerEntryKind::Registration, Some(pack_id), op_id, 1024, epoch)?;
-    Ok(())
-}
-
-pub(super) fn stage_compaction_ledger(
-    ledger: &RetentionLedger,
-    compaction_epoch: u64,
-    target_ids: &BTreeSet<Uuid>,
-    pack_id: Uuid,
-    registration_id: Uuid,
-) -> Result<RetentionLedger, GrowthEngineError> {
-    let mut next_ledger = ledger.clone();
-    next_ledger.record_compaction_superseded(compaction_epoch, target_ids);
-    record_pack_entries(&mut next_ledger, pack_id, registration_id, None, compaction_epoch)?;
-    Ok(next_ledger)
-}
-
-fn stage_push_ledger(
-    ledger: &RetentionLedger,
-    operation_id: Uuid,
-    commit_epoch: u64,
-    uploaded_records: &[VerifiedPackRecord],
-) -> Result<RetentionLedger, GrowthEngineError> {
-    let mut next_ledger = ledger.clone();
-    for rec in uploaded_records {
-        record_pack_entries(&mut next_ledger, rec.pack_id, rec.registration_id, Some(operation_id), commit_epoch)?;
-    }
-    next_ledger.record_entry(
-        Uuid::new_v4(),
-        LedgerEntryKind::Receipt,
-        uploaded_records.first().map(|r| r.pack_id),
-        Some(operation_id),
-        512,
-        commit_epoch,
-    )?;
-    Ok(next_ledger)
-}
-
-pub(super) fn validate_mutations(
-    format: ObjectFormat,
-    max_plan_refs: usize,
-    mutations: &[RefMutation],
-) -> Result<(), GrowthEngineError> {
-    if mutations.is_empty() || mutations.len() > max_plan_refs {
-        return Err(GrowthEngineError::InvalidInput("ref_mutations must be 1..=max_plan_refs"));
-    }
-    let mut seen = BTreeSet::new();
-    for m in mutations {
-        if !m.ref_name.starts_with("refs/")
-            || is_reserved_ref_name(&m.ref_name)
-            || m.ref_name.contains("..")
-            || !seen.insert(&m.ref_name)
-        {
-            return Err(GrowthEngineError::InvalidInput("invalid, reserved, or duplicate ref name"));
-        }
-        if !(format.is_valid_oid(&m.old_oid) || format.is_zero_oid(&m.old_oid)) {
-            return Err(GrowthEngineError::InvalidInput("invalid old_oid format"));
-        }
-        if !(format.is_valid_oid(&m.new_oid) || format.is_zero_oid(&m.new_oid)) {
-            return Err(GrowthEngineError::InvalidInput("invalid new_oid format"));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn apply_cas_mutations(
-    format: ObjectFormat,
-    base_refs: &BTreeMap<String, String>,
-    mutations: &[RefMutation],
-) -> Result<BTreeMap<String, String>, GrowthEngineError> {
-    let mut next = base_refs.clone();
-    for m in mutations {
-        let current = next.get(&m.ref_name).map(String::as_str);
-        let old_matches =
-            if format.is_zero_oid(&m.old_oid) { current.is_none() } else { current == Some(m.old_oid.as_str()) };
-        if !old_matches {
-            return Err(GrowthEngineError::CasPreconditionFailed { ref_name: m.ref_name.clone() });
-        }
-        if format.is_zero_oid(&m.new_oid) {
-            next.remove(&m.ref_name);
-        } else {
-            next.insert(m.ref_name.clone(), m.new_oid.clone());
-        }
-    }
-    Ok(next)
 }

@@ -42,6 +42,10 @@ impl RetentionLedger {
         self.entries.len()
     }
 
+    pub fn total_nested_holds(&self) -> usize {
+        self.entries.values().map(|e| e.holds.len()).sum()
+    }
+
     pub fn policy(&self) -> LedgerBudgetPolicy {
         self.policy
     }
@@ -114,6 +118,46 @@ impl RetentionLedger {
                 limit: self.policy.repo_max_resident_entries as u64,
             });
         }
+        let nested = self.total_nested_holds();
+        if nested.saturating_add(1) > self.policy.repo_max_nested_holds {
+            return Err(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "nested_holds",
+                current: nested as u64,
+                limit: self.policy.repo_max_nested_holds as u64,
+            });
+        }
+        Ok(())
+    }
+
+    fn check_hold_addition(&self, hold: &ProtectionHold, add_nested: usize) -> Result<(), LedgerRetentionError> {
+        let is_frontier = matches!(hold, ProtectionHold::ActiveServingFrontier { .. });
+        if !is_frontier && hold.hold_id().is_nil() {
+            return Err(LedgerRetentionError::InvalidArgument("hold_id must be non-nil"));
+        }
+        if !is_frontier {
+            let distinct: BTreeSet<Uuid> = self
+                .entries
+                .values()
+                .flat_map(|e| e.holds.values())
+                .filter(|h| !matches!(h, ProtectionHold::ActiveServingFrontier { .. }))
+                .map(ProtectionHold::hold_id)
+                .collect();
+            if !distinct.contains(&hold.hold_id()) && distinct.len() >= self.policy.repo_max_holds {
+                return Err(LedgerRetentionError::LedgerBudgetExhausted {
+                    resource: "holds",
+                    current: distinct.len() as u64,
+                    limit: self.policy.repo_max_holds as u64,
+                });
+            }
+        }
+        let nested = self.total_nested_holds();
+        if nested.saturating_add(add_nested) > self.policy.repo_max_nested_holds {
+            return Err(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "nested_holds",
+                current: nested as u64,
+                limit: self.policy.repo_max_nested_holds as u64,
+            });
+        }
         Ok(())
     }
 
@@ -162,29 +206,45 @@ impl RetentionLedger {
             return Err(LedgerRetentionError::InvalidArgument("pack_id must be non-nil"));
         }
         let key = format!("{}:{}", hold.label(), hold.hold_id());
-        let mut attached = 0usize;
+        let (mut total, mut add_nested) = (0usize, 0usize);
+        for entry in self.entries.values() {
+            if entry.pack_id == Some(pack_id) && !entry.archived {
+                total += 1;
+                if !entry.holds.contains_key(&key) {
+                    add_nested += 1;
+                }
+            }
+        }
+        if total == 0 {
+            return Err(LedgerRetentionError::EntryNotFound(pack_id));
+        }
+        self.check_hold_addition(&hold, add_nested)?;
         for entry in self.entries.values_mut() {
             if entry.pack_id == Some(pack_id) && !entry.archived {
                 entry.holds.insert(key.clone(), hold.clone());
-                attached += 1;
             }
         }
-        if attached == 0 {
-            return Err(LedgerRetentionError::EntryNotFound(pack_id));
-        }
-        Ok(attached)
+        Ok(total)
     }
 
-    pub fn attach_hold_to_active_frontier(&mut self, hold: ProtectionHold) -> usize {
+    pub fn attach_hold_to_active_frontier(&mut self, hold: ProtectionHold) -> Result<usize, LedgerRetentionError> {
         let key = format!("{}:{}", hold.label(), hold.hold_id());
-        let mut attached = 0usize;
+        let (mut total, mut add_nested) = (0usize, 0usize);
+        for entry in self.entries.values() {
+            if entry.superseded_at_epoch.is_none() && !entry.archived {
+                total += 1;
+                if !entry.holds.contains_key(&key) {
+                    add_nested += 1;
+                }
+            }
+        }
+        self.check_hold_addition(&hold, add_nested)?;
         for entry in self.entries.values_mut() {
             if entry.superseded_at_epoch.is_none() && !entry.archived {
                 entry.holds.insert(key.clone(), hold.clone());
-                attached += 1;
             }
         }
-        attached
+        Ok(total)
     }
 
     /// Marks superseded pack entries at `compaction_epoch` while retaining

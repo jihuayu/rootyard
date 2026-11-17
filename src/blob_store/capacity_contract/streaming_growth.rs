@@ -16,17 +16,20 @@ use super::{
     admission::AdmissionController,
     admission_types::{AdmissionClass, AdmissionLimits, AdmissionRejection, AdmissionRequest},
     git_ops::{
-        GitProcessLimits, ObjectFormat, PackDownloadRef, UploadScope, hash_file_bounded, inspect_pack_file,
-        upload_pack_pair,
+        GitOpsError, GitProcessLimits, ObjectFormat, PackDownloadRef, UploadScope, hash_file_bounded,
+        inspect_pack_file, upload_pack_pair,
     },
     git_views::{CompactViewInput, VerifyViewInput, compact_packs_in_view, verify_frontier_in_view},
-    growth_state::{CommitCompactionInput, CommitPushInput, EngineState, apply_cas_mutations, validate_mutations},
+    growth_state::{
+        CommitCompactionInput, CommitPushInput, EngineState, apply_cas_mutations, check_acked_refs_bound,
+        validate_mutations,
+    },
     growth_types::{
         CompactionOutcome, EngineScope, GrowthEngineError, GrowthEngineSnapshot, IncrementalPushRequest, PushOutcome,
         VerifiedPackRecord,
     },
     ledger_retention::RetentionLedger,
-    ledger_types::{LedgerBudgetPolicy, ProtectionHold},
+    ledger_types::{LedgerBudgetPolicy, LedgerRetentionError, ProtectionHold},
     limits::{PandoCapacityContract, RESERVED_GIT_OPEN_FDS},
 };
 use crate::blob_store::{BlobLocator, disposable_view::DisposableViewRoot, opendal::BlobStore};
@@ -73,11 +76,12 @@ impl StreamingGrowthEngine {
                 closure_revision: 0,
                 active_packs: Vec::new(),
                 retained_old_packs: Vec::new(),
-                failed_attempt_packs: Vec::new(),
+                failed_attempt_locators: Vec::new(),
                 acked_refs: BTreeMap::new(),
                 pinned_commits: BTreeMap::new(),
                 replayed_operations: BTreeMap::new(),
                 replay_order: VecDeque::new(),
+                acked_op_fences: BTreeSet::new(),
                 cancelled_operations: BTreeSet::new(),
                 cancel_order: VecDeque::new(),
                 cumulative_packs_added: 0,
@@ -126,13 +130,7 @@ impl StreamingGrowthEngine {
     }
 
     pub fn failed_attempt_pack_locators(&self) -> Vec<BlobLocator> {
-        self.state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .failed_attempt_packs
-            .iter()
-            .map(|p| p.pack_locator.clone())
-            .collect()
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).failed_attempt_locators.clone()
     }
 
     pub fn cancel_operation(&self, operation_id: Uuid) -> Result<(), GrowthEngineError> {
@@ -151,7 +149,17 @@ impl StreamingGrowthEngine {
         }
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let hold_id = hold.hold_id();
-        let count = guard.ledger.attach_hold_to_active_frontier(hold);
+        if pinned_oid.is_some()
+            && !guard.pinned_commits.contains_key(&hold_id)
+            && guard.pinned_commits.len() >= self.contract.metadata_ledger.repo_max_holds
+        {
+            return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "pins",
+                current: guard.pinned_commits.len() as u64,
+                limit: self.contract.metadata_ledger.repo_max_holds as u64,
+            }));
+        }
+        let count = guard.ledger.attach_hold_to_active_frontier(hold)?;
         if let Some(oid) = pinned_oid {
             guard.pinned_commits.insert(hold_id, oid);
             guard.closure_revision = guard.closure_revision.saturating_add(1);
@@ -173,6 +181,28 @@ impl StreamingGrowthEngine {
 
     pub fn attempt_delete_ledger_entry(&self, entry_id: Uuid) -> Result<(), GrowthEngineError> {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).ledger.attempt_delete_entry(entry_id).map_err(Into::into)
+    }
+
+    fn record_git_upload_failure(
+        &self,
+        uploaded: Vec<VerifiedPackRecord>,
+        put_bytes: u64,
+        err: GitOpsError,
+    ) -> GrowthEngineError {
+        let mut locs: Vec<BlobLocator> = uploaded.into_iter().map(|r| r.pack_locator).collect();
+        let (inner, part_b) = match err {
+            GitOpsError::PartialUpload { detail, put_bytes: pb, pack_locator } => {
+                locs.push(pack_locator);
+                (*detail, pb)
+            }
+            other => (other, 0),
+        };
+        let total = put_bytes.saturating_add(part_b);
+        if !locs.is_empty() || total > 0 {
+            let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            guard.record_failed_upload(locs, total, 0, 0, self.contract.streaming.max_retained_pack_records);
+        }
+        inner.into()
     }
 
     pub async fn apply_push(
@@ -211,11 +241,16 @@ impl StreamingGrowthEngine {
 
         let (base_epoch, base_packs, base_refs) = {
             let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            guard.check_resident_pack_bound(self.contract.streaming.max_retained_pack_records, 0)?;
+            guard.check_op_fence_bound(req.operation_id, self.contract.streaming.max_resident_op_fences)?;
+            guard.check_resident_pack_bound(
+                self.contract.streaming.max_retained_pack_records,
+                req.new_pack_paths.len(),
+            )?;
             (guard.epoch, guard.active_packs.clone(), guard.acked_refs.clone())
         };
         let base_pack_ids: BTreeSet<Uuid> = base_packs.iter().map(|p| p.pack_id).collect();
         let resulting_refs = apply_cas_mutations(self.object_format, &base_refs, &req.ref_mutations)?;
+        check_acked_refs_bound(self.contract.metadata_ledger.max_capture_refs, resulting_refs.len())?;
 
         let (mut new_pack_bytes, mut new_pack_objects) = (0u64, 0u64);
         for (pack_path, idx_path) in &req.new_pack_paths {
@@ -256,19 +291,7 @@ impl StreamingGrowthEngine {
             };
             let uploaded = match upload_pack_pair(&self.store, scope, pack_path, idx_path, deadline).await {
                 Ok(u) => u,
-                Err(err) => {
-                    if !uploaded_records.is_empty() || put_bytes > 0 {
-                        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                        guard.record_failed_upload(
-                            uploaded_records,
-                            put_bytes,
-                            0,
-                            0,
-                            self.contract.streaming.max_retained_pack_records,
-                        );
-                    }
-                    return Err(err.into());
-                }
+                Err(err) => return Err(self.record_git_upload_failure(uploaded_records, put_bytes, err)),
             };
             put_bytes = put_bytes.saturating_add(uploaded.pack_length).saturating_add(uploaded.idx_length);
             uploaded_records.push(VerifiedPackRecord {
@@ -309,17 +332,7 @@ impl StreamingGrowthEngine {
         .await
         {
             Ok(v) => v,
-            Err(err) => {
-                let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                guard.record_failed_upload(
-                    uploaded_records,
-                    put_bytes,
-                    0,
-                    0,
-                    self.contract.streaming.max_retained_pack_records,
-                );
-                return Err(err.into());
-            }
+            Err(err) => return Err(self.record_git_upload_failure(uploaded_records, put_bytes, err)),
         };
         permit.shrink_workspace(total_bytes);
 
@@ -371,7 +384,7 @@ impl StreamingGrowthEngine {
         };
         let _permit = self.admission.acquire(&adm_req, deadline).await?;
         let dl_refs: Vec<PackDownloadRef> = target_packs.iter().map(VerifiedPackRecord::as_download_ref).collect();
-        let summary = compact_packs_in_view(
+        let summary = match compact_packs_in_view(
             CompactViewInput {
                 store: &self.store,
                 view_root: &self.view_root,
@@ -390,7 +403,11 @@ impl StreamingGrowthEngine {
             },
             deadline,
         )
-        .await?;
+        .await
+        {
+            Ok(s) => s,
+            Err(err) => return Err(self.record_git_upload_failure(Vec::new(), 0, err)),
+        };
 
         self.state.lock().unwrap_or_else(|p| p.into_inner()).commit_compaction(CommitCompactionInput {
             target_ids: &target_ids,

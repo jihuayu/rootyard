@@ -8,6 +8,7 @@ pub mod admission;
 pub mod admission_types;
 pub mod git_ops;
 pub mod git_views;
+mod growth_cas;
 pub mod growth_state;
 pub mod growth_types;
 pub mod inventory;
