@@ -139,6 +139,29 @@ class ArtifactSelectionTest(unittest.TestCase):
             runner.calls[0][1]["cwd"], str(self.root.resolve())
         )
 
+    def test_selects_pinned_fork_new_build_dir_out_layout(self):
+        out = (
+            self.root
+            / "target/cargo-fork-cache/targets/rootyard-abc/debug/build"
+            / "rootyard-pando-lab/abc123/out"
+        )
+        out.mkdir(parents=True)
+        executable = out / "rootyard_pando_lab-abc123"
+        executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        selection, _ = self.run_selection(
+            [
+                self.event(executable=executable),
+                {"reason": "build-finished", "success": True},
+            ]
+        )
+        self.assertNotEqual(executable.parent.name, "deps")
+        self.assertEqual(selection["executable_path"], str(executable))
+        self.assertEqual(
+            selection["executable_sha256"],
+            hashlib.sha256(executable.read_bytes()).hexdigest(),
+        )
+
     def test_profile_test_false_is_not_a_bin_test_artifact(self):
         self.assert_code(
             [self.event(test=False), {"reason": "build-finished", "success": True}],
@@ -197,6 +220,13 @@ class ArtifactSelectionTest(unittest.TestCase):
         link.symlink_to(self.exe)
         self.assert_code(
             [self.event(executable=link), {"reason": "build-finished", "success": True}],
+            "artifact_executable",
+        )
+
+    def test_non_executable_test_binary_is_rejected(self):
+        self.exe.chmod(0o644)
+        self.assert_code(
+            [self.event(), {"reason": "build-finished", "success": True}],
             "artifact_executable",
         )
 

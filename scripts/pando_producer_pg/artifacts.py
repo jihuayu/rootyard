@@ -1,10 +1,14 @@
 """Select one real target/test-profile bin executable from Cargo JSON.
 
-The selection command is the existing all-targets cache path.  It compiles no
+The selection command is the existing cache-reusing test path.  It compiles no
 new Rust target and does not consult newest-file globs, the normal CLI path or
 a library/integration artifact.  Exactly one ``compiler-artifact`` named
 ``rootyard-pando-lab`` with a ``bin`` kind, ``profile.test=true`` and an
 executable, plus exactly one successful ``build-finished`` event, is accepted.
+
+The executable parent is not part of the artifact identity.  Upstream Cargo's
+legacy layout places it in ``deps/``; the pinned CargoFork 64a6ee6a default
+new build-dir layout places it in ``build/<pkg>/<hash>/out/``.  Both are valid.
 """
 from __future__ import annotations
 
@@ -144,7 +148,10 @@ def select_test_binary(
     )
     path = Path(executable)
     require(path.is_absolute(), "selection", "artifact_executable")
-    require(path.parent.name == "deps", "selection", "artifact_executable")
+    # The parent is layout-dependent (legacy deps/ or pinned-fork
+    # build/<pkg>/<hash>/out/), not identity.  Test units always carry Cargo's
+    # extra-filename hash, so the normal CLI basename remains a distinct,
+    # sufficient anti-substitution check without fixing the directory.
     require(path.name != TARGET, "selection", "artifact_executable")
     snapshot = _snapshot(
         path,
