@@ -569,6 +569,7 @@ jobs:
             --require-case pando_pitr=post_isolate_stock_git_clone_fetch \
             --require-case pando_pitr=post_isolate_deleted_artifact_refused \
             --require-case pando_pitr=pitr_epoch_rollback_fenced \
+            --require-case organizations_lifecycle=direct_read_view_bundle_revocation \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
             --log-marker "webhook_regressions=concurrent claim fence: passed" \
@@ -600,6 +601,7 @@ jobs:
             --harness tests/organizations_web.py \
             --harness tests/backup_capabilities.py \
             --harness tests/organizations_lifecycle.py \
+            --harness tests/organizations_direct_view_acceptance.py \
             --harness tests/forge_collaboration.py \
             --harness tests/backup.py \
             --harness tests/web_detail_pagination.py \
