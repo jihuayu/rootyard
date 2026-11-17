@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 
 TESTS = Path(__file__).resolve().parent
@@ -18,6 +19,7 @@ for entry in (str(TESTS), str(TESTS.parent / "scripts")):
 
 from pando_vault_rotation_budget import Budget  # noqa: E402
 import pando_vault_rotation_source as source  # noqa: E402
+import pando_vault_rotation_source_child as source_child  # noqa: E402
 from pando_vault_rotation_support import Completed, QualificationError  # noqa: E402
 
 A = "a" * 40
@@ -186,6 +188,50 @@ class SourceSnapshotTest(unittest.TestCase):
         with self.assertRaises(QualificationError) as caught:
             source.snapshot(runner, budget, inputs())
         self.assertEqual(caught.exception.code, "source_became_dirty")
+
+
+class SourceChildArtifactTest(unittest.TestCase):
+    def test_v1_and_v2_pando_artifact_codes_match_the_legacy_gate(self):
+        v1 = SimpleNamespace(
+            schema="v1",
+            payload={"version": 1},
+            artifacts=({"kind": "bin", "target": "rootyard-pando-lab"},),
+        )
+        self.assertEqual(
+            source_child._pando_artifact(v1, C),
+            "receipt_pando_receipt_not_v2")
+
+        v2 = SimpleNamespace(
+            schema="v2",
+            payload={"receipt_schema": "rootyard/native-build-receipt/v2"},
+            artifacts=(),
+        )
+        self.assertEqual(
+            source_child._pando_artifact(v2, C),
+            "receipt_pando_artifact_missing")
+
+        wrong = SimpleNamespace(
+            schema="v2",
+            payload={"receipt_schema": "rootyard/native-build-receipt/v2"},
+            artifacts=({
+                "kind": "bin",
+                "target": "rootyard-pando-lab",
+                "executable_sha256": "f" * 64,
+            },),
+        )
+        self.assertEqual(
+            source_child._pando_artifact(wrong, C),
+            "receipt_pando_artifact_mismatch")
+        good = SimpleNamespace(
+            schema="v2",
+            payload={"receipt_schema": "rootyard/native-build-receipt/v2"},
+            artifacts=({
+                "kind": "bin",
+                "target": "rootyard-pando-lab",
+                "executable_sha256": C,
+            },),
+        )
+        self.assertIsNone(source_child._pando_artifact(good, C))
 
 
 if __name__ == "__main__":

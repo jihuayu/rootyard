@@ -155,13 +155,6 @@ def _pando_artifact(receipt, binary_sha256):
     return True
 
 
-# The existing pure contract replaces these two probes with finite fakes.
-# Production never replaces them, so the live harness always takes the bounded
-# child path below; the legacy branch exists only for that unit contract.
-_LEGACY_SOURCE_STATE = _source_state
-_LEGACY_LOAD_RECEIPT = receipts.load_receipt
-
-
 def validate_inputs(args, environ, budget=None, runner=None):
     binary = args.binary or environ.get("ROOTYARD_PANDO_LAB_BIN")
     receipt = args.receipt or environ.get("ROOTYARD_PANDO_BUILD_RECEIPT")
@@ -193,9 +186,7 @@ def validate_inputs(args, environ, budget=None, runner=None):
         require(shutil.which(tool) is not None, tool + "_missing", "input")
     bootstrap = environ.get("ROOTYARD_TEST_DATABASE_URL")
     require(bool(bootstrap), "missing_pg_bootstrap", "input")
-    if (budget is not None and runner is not None
-            and _source_state is _LEGACY_SOURCE_STATE
-            and receipts.load_receipt is _LEGACY_LOAD_RECEIPT):
+    if budget is not None and runner is not None:
         bound = source.validate(
             runner, budget,
             source_root=source_root,
