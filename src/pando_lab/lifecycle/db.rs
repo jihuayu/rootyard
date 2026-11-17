@@ -4,7 +4,7 @@ use super::{
     provider::{KmsKeyPolicy, ManagedKeyStatus},
     rotation::KmsRotationCheckpoint,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{
     fs::{File, OpenOptions},
