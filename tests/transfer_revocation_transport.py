@@ -27,12 +27,10 @@ from transfer_revocation_timing import (
 
 class SmallBufferHTTPConnection(http.client.HTTPConnection):
     """Loopback HTTP connection whose SO_RCVBUF is set before connect."""
-
     def __init__(self, host, port, *, timeout=15, rcvbuf=16 * 1024):
         self.requested_so_rcvbuf = rcvbuf
         self.effective_so_rcvbuf = None
         super().__init__(host, port, timeout=timeout)
-
     def connect(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -60,7 +58,6 @@ def _sleep_until(target_ns):
 
 def _ms(ns):
     return round(ns / NS_PER_MS, 3)
-
 
 def _reader_stop_or_fail(evidence, trigger_state, *, timed_out, received, now_ns):
     """Keep reader failure inside the finite evidence vocabulary."""
@@ -91,7 +88,6 @@ def _reader_stop_or_fail(evidence, trigger_state, *, timed_out, received, now_ns
     evidence.finish_phase("transport_stop_observe")
     return stop
 
-
 def run_timed_transfer(*, evidence=None, subcase=None, **kwargs):
     """Run the real transfer while retaining a finite safe failure snapshot."""
     evidence = evidence or revocation_failure.FailureEvidence(
@@ -106,7 +102,6 @@ def run_timed_transfer(*, evidence=None, subcase=None, **kwargs):
     except Exception as error:
         evidence.fail_exception(error)
         raise evidence.safe_failure() from None
-
 
 def _run_timed_transfer_impl(
     *,
@@ -467,6 +462,11 @@ def _run_timed_transfer_impl(
             "configured_bound_proven": proof,
         }
         return result
+    except revocation_failure.SafeFailure:
+        raise
+    except Exception as error:
+        evidence.fail_exception(error)
+        raise
     finally:
         primary = sys.exc_info()[1]
         cleanup_error = None
