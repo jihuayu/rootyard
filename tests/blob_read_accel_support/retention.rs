@@ -138,7 +138,7 @@ impl Diag {
 }
 
 struct SafeDiagError {
-    diag: Diag,
+    diag: Box<Diag>,
 }
 
 impl fmt::Debug for SafeDiagError {
@@ -149,7 +149,7 @@ impl fmt::Debug for SafeDiagError {
 
 impl fmt::Display for SafeDiagError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let d = &self.diag;
+        let d = &*self.diag;
         write!(
             f,
             "read-accel retention diagnostic: format={} phase={} error={} blob={} disposable_view={} side={} git_command={} exit_code={:?} signal={:?} io_kind={} raw_os_error={:?}",
@@ -328,7 +328,7 @@ fn assert_git_parity_diagnosed(
             diag.error = ErrorClass::Assertion;
             diag.exit_code = expected.status.code();
             diag.signal = status_signal(&expected.status);
-            return Err(SafeDiagError { diag: *diag });
+            return Err(SafeDiagError { diag: Box::new(*diag) });
         }
         diag.side = Side::Rebuilt;
         let candidate =
@@ -337,7 +337,7 @@ fn assert_git_parity_diagnosed(
             diag.error = ErrorClass::Assertion;
             diag.exit_code = candidate.status.code();
             diag.signal = status_signal(&candidate.status);
-            return Err(SafeDiagError { diag: *diag });
+            return Err(SafeDiagError { diag: Box::new(*diag) });
         }
     }
 
@@ -367,7 +367,7 @@ fn git_cmd_diag(diag: &mut Diag, repo: &Path, args: &[&str], op: GitOp) -> std::
         Err(err) => {
             classify_anyhow(&err, diag);
             diag.git_op = op;
-            Err(SafeDiagError { diag: *diag })
+            Err(SafeDiagError { diag: Box::new(*diag) })
         }
     }
 }
@@ -379,14 +379,14 @@ fn git_ok_diag(diag: &mut Diag, repo: &Path, args: &[&str], op: GitOp) -> std::r
         diag.git_op = op;
         diag.exit_code = output.status.code();
         diag.signal = status_signal(&output.status);
-        return Err(SafeDiagError { diag: *diag });
+        return Err(SafeDiagError { diag: Box::new(*diag) });
     }
     match String::from_utf8(output.stdout) {
         Ok(text) => Ok(text.trim().to_owned()),
         Err(_) => {
             diag.error = ErrorClass::InvalidUtf8;
             diag.git_op = op;
-            Err(SafeDiagError { diag: *diag })
+            Err(SafeDiagError { diag: Box::new(*diag) })
         }
     }
 }
@@ -471,19 +471,19 @@ fn classify_read_accel(err: &ReadAccelError, diag: &mut Diag) {
 fn fail_anyhow(diag: &mut Diag, phase: Phase, err: &anyhow::Error) -> SafeDiagError {
     diag.begin_phase(phase);
     classify_anyhow(err, diag);
-    SafeDiagError { diag: *diag }
+    SafeDiagError { diag: Box::new(*diag) }
 }
 
 fn fail_read_accel(diag: &mut Diag, phase: Phase, err: &ReadAccelError) -> SafeDiagError {
     diag.begin_phase(phase);
     classify_read_accel(err, diag);
-    SafeDiagError { diag: *diag }
+    SafeDiagError { diag: Box::new(*diag) }
 }
 
 fn fail_assert(diag: &mut Diag, phase: Phase) -> SafeDiagError {
     diag.phase = phase;
     diag.error = ErrorClass::Assertion;
-    SafeDiagError { diag: *diag }
+    SafeDiagError { diag: Box::new(*diag) }
 }
 
 #[cfg(unix)]
