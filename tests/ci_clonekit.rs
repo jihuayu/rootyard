@@ -37,6 +37,9 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[path = "ci_clonekit_diag_support/mod.rs"]
+mod ck_diag;
+
 const SECRET: [u8; 32] = [0x42u8; 32];
 const fn pol(ck: bool, fb: bool) -> CheckoutPolicy {
     CheckoutPolicy { use_clonekit: ck, fallback_to_git_on_unusable_kit: fb, require_full_fsck: true }
@@ -328,28 +331,7 @@ async fn clonekit_sha1_and_sha256_incremental_smart_http_and_anti_stale_tip() ->
 
 #[tokio::test]
 async fn clonekit_failed_build_empty_repo_and_history_rotation_preserve_last_valid() -> Result<()> {
-    let (td, ids) = (TempDir::new()?, (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()));
-    let (vr, store) = (private_vr(&td)?, CloneKitPublicationStore::open(&td.path().join("cat"))?);
-    let empty = init_repo(td.path(), "empty.git", Sha1)?;
-    ensure!(build_kit(ids, Sha1, 1, &empty, &td, None, None)?.manifest.status == CloneKitStatus::EmptyRepository);
-
-    let repo = init_repo(td.path(), "active", Sha1)?;
-    let c1 = add_commit(&repo, "a.txt", b"v1", "c1")?;
-    build_kit(ids, Sha1, 1, &repo, &td, Some(&store), None)?;
-    let b2 = build_kit(ids, Sha1, 2, &repo, &td, None, Some(BuildFailurePoint::CorruptStagedPack))?;
-    ensure!(
-        publish_clonekit_versioned(&store, &b2, &git_binary(), None, None).is_err()
-            && store.load_latest(ids.1)?.expect("latest").kit_generation == 1
-    );
-
-    let (g_h2, c_h2) = make_grant((ids.0, ids.1, Uuid::new_v4()), Sha1, &c1, None, 1_750_000_000)?;
-    let (co, mem): (Co<'_>, Arc<dyn CloneKitAuthorityOracle>) =
-        (Co { store: Some(&store), ..Co::new(&vr) }, Arc::new(InMemoryAuthorityOracle::new()));
-    let res = co.run(&g_h2, &c_h2, &mem, pol(true, true), repo.to_str().expect("utf8"), None).await?;
-    ensure!(
-        res.telemetry.strategy == CheckoutStrategy::StockGitFallback { reason: FallbackReason::KitHistoryMismatch }
-    );
-    Ok(())
+    crate::empty_history_case_body!()
 }
 
 #[tokio::test]
