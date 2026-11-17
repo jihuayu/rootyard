@@ -8,6 +8,11 @@ use std::io::Write;
 use rootyard::ref_store::projector::RemoteAuthzBridgeError;
 use rootyard::ref_store::raft_backend::RaftBackendError;
 
+#[path = "quorum_diagnostic.rs"]
+mod quorum_diagnostic;
+
+pub(crate) use quorum_diagnostic::{Operation, observe_call};
+
 pub(crate) const CASE_REAL: &str = "real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart";
 pub(crate) const CASE_SCOPE: &str =
     "scope_drain_support::privileged_scope_drain_query_is_quorum_bound_and_multirepo_complete";
@@ -21,7 +26,12 @@ pub(crate) enum Phase {
     Bootstrap,
     Provision,
     Commit,
-    Refusal,
+    SemanticInputWrite,
+    SemanticInputView,
+    SemanticIdentityWrite,
+    SemanticIdentityView,
+    SemanticHealthyWrite,
+    SemanticHealthyView,
     Concurrent,
     ClosingWrite,
     ClosingView,
@@ -49,7 +59,12 @@ impl PhaseLabel for Phase {
             Self::Bootstrap => "bootstrap",
             Self::Provision => "provision",
             Self::Commit => "commit",
-            Self::Refusal => "refusal",
+            Self::SemanticInputWrite => "semantic_input_write",
+            Self::SemanticInputView => "semantic_input_view",
+            Self::SemanticIdentityWrite => "semantic_identity_write",
+            Self::SemanticIdentityView => "semantic_identity_view",
+            Self::SemanticHealthyWrite => "semantic_healthy_write",
+            Self::SemanticHealthyView => "semantic_healthy_view",
             Self::Concurrent => "concurrent",
             Self::ClosingWrite => "closing_write",
             Self::ClosingView => "closing_view",
@@ -216,6 +231,10 @@ impl<P: PhaseLabel> PhaseGuard<P> {
         if self.armed {
             self.phase = phase;
         }
+    }
+
+    pub(crate) fn current(&self) -> P {
+        self.phase
     }
 
     pub(crate) fn fail(mut self, class: Class) {

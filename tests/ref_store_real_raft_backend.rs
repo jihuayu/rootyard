@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 mod scope_drain_support;
 
-use scope_drain_support::failure_phase::{CASE_REAL, Class, Phase, PhaseGuard};
+use scope_drain_support::failure_phase::{CASE_REAL, Class, Operation, Phase, PhaseGuard, observe_call};
 
 const TEST_GROUP: &str = "group-175";
 const CLUSTER_NAME: &str = "issue175-real-raft-backend";
@@ -591,15 +591,18 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
     assert!(matches!(view.query_operation(operation_id)?, OperationLookup::Known(_)));
     assert!(view.state_digest_hex()?.len() == 64);
 
-    phase.set(Phase::Refusal);
     // Decoded normal commands with semantic-invalid fields are durable typed refusals, not fatal
     // storage/apply errors. Zero lease ticks is valid JSON but core-semantic-invalid; a nil
     // request id is a core InvalidIdentity. Both must advance the applied coordinate without
     // changing business state or the logical clock.
     let before_semantic_floor = view.logical_clock_floor();
     let before_semantic_refs = view.read_refs();
-    let invalid_input = backend
-        .propose(create_pin_command(
+    phase.set(Phase::SemanticInputWrite);
+    let invalid_input = observe_call(
+        phase,
+        &cluster,
+        Operation::ClientWrite,
+        backend.propose(create_pin_command(
             repo,
             tenant,
             Uuid::new_v4(),
@@ -608,21 +611,27 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
             Uuid::new_v4(),
             Uuid::new_v4(),
             0,
-        ))
-        .await?;
+        )),
+    )
+    .await?;
     let invalid_input_kind = match proposal_outcome(&invalid_input) {
         RootRefCasOutcome::Refused(refusal) => refusal.kind,
         RootRefCasOutcome::Applied(_) => panic!("zero-lease pin unexpectedly applied"),
     };
     assert_eq!(invalid_input_kind, RootRefCasRefusalKind::InvalidInput);
     wait_applied_through(&cluster, invalid_input.log_id.index, Duration::from_secs(10)).await?;
-    let after_invalid_input = backend.read_committed_view().await?;
+    phase.set(Phase::SemanticInputView);
+    let after_invalid_input = observe_call(phase, &cluster, Operation::ReadView, backend.read_committed_view()).await?;
     assert!(after_invalid_input.last_applied().is_some_and(|id| id.index >= invalid_input.log_id.index));
     assert_eq!(after_invalid_input.logical_clock_floor(), before_semantic_floor);
     assert_eq!(after_invalid_input.read_refs(), before_semantic_refs);
 
-    let invalid_identity = backend
-        .propose(create_pin_command(
+    phase.set(Phase::SemanticIdentityWrite);
+    let invalid_identity = observe_call(
+        phase,
+        &cluster,
+        Operation::ClientWrite,
+        backend.propose(create_pin_command(
             repo,
             tenant,
             Uuid::new_v4(),
@@ -631,23 +640,35 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
             Uuid::new_v4(),
             Uuid::new_v4(),
             1,
-        ))
-        .await?;
+        )),
+    )
+    .await?;
     let invalid_identity_kind = match proposal_outcome(&invalid_identity) {
         RootRefCasOutcome::Refused(refusal) => refusal.kind,
         RootRefCasOutcome::Applied(_) => panic!("nil-request-id pin unexpectedly applied"),
     };
     assert_eq!(invalid_identity_kind, RootRefCasRefusalKind::InvalidIdentity);
     wait_applied_through(&cluster, invalid_identity.log_id.index, Duration::from_secs(10)).await?;
-    let after_invalid_identity = backend.read_committed_view().await?;
+    phase.set(Phase::SemanticIdentityView);
+    let after_invalid_identity =
+        observe_call(phase, &cluster, Operation::ReadView, backend.read_committed_view()).await?;
     assert!(after_invalid_identity.last_applied().is_some_and(|id| id.index >= invalid_identity.log_id.index));
     assert_eq!(after_invalid_identity.logical_clock_floor(), before_semantic_floor);
     assert_eq!(after_invalid_identity.read_refs(), before_semantic_refs);
 
     // The same quorum still accepts a valid command and serves a fresh ReadIndex view.
-    let healthy_after_semantic = backend.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })).await?;
+    phase.set(Phase::SemanticHealthyWrite);
+    let healthy_after_semantic = observe_call(
+        phase,
+        &cluster,
+        Operation::ClientWrite,
+        backend.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })),
+    )
+    .await?;
     assert!(proposal_outcome(&healthy_after_semantic).is_applied());
-    let healthy_after_semantic_view = backend.read_committed_view().await?;
+    phase.set(Phase::SemanticHealthyView);
+    let healthy_after_semantic_view =
+        observe_call(phase, &cluster, Operation::ReadView, backend.read_committed_view()).await?;
     assert!(
         healthy_after_semantic_view.last_applied().is_some_and(|id| id.index >= healthy_after_semantic.log_id.index)
     );
@@ -683,17 +704,18 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
         pack_mode: SmPackMode::MetadataOnly,
     });
     phase.set(Phase::ClosingWrite);
-    let close_outcome = backend.propose(closing).await?;
+    let close_outcome = observe_call(phase, &cluster, Operation::ClientWrite, backend.propose(closing)).await?;
     assert!(proposal_outcome(&close_outcome).is_applied());
     phase.set(Phase::ClosingView);
-    let closing_view = backend.read_committed_view().await?;
+    let closing_view = observe_call(phase, &cluster, Operation::ReadView, backend.read_committed_view()).await?;
     assert_eq!(closing_view.read_scope_lifecycle().map(|(lifecycle, _)| lifecycle), Some(ScopeLifecycle::Closing));
 
     let refused_operation = Uuid::new_v4();
     let refused_commit =
         commit_command(repo, tenant, issuer, history, 2, refused_operation, 2, "refs/heads/refused", None, oid(2));
     phase.set(Phase::RefusedWrite);
-    let refusal = backend.propose(refused_commit.clone()).await?;
+    let refusal =
+        observe_call(phase, &cluster, Operation::ClientWrite, backend.propose(refused_commit.clone())).await?;
     let refusal_kind = match proposal_outcome(&refusal) {
         RootRefCasOutcome::Refused(refusal) => refusal.kind,
         RootRefCasOutcome::Applied(_) => panic!("gate-closed commit unexpectedly applied"),
@@ -701,11 +723,12 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
     assert_eq!(refusal_kind, RootRefCasRefusalKind::ScopeClosingOrClosed);
     wait_applied_through(&cluster, refusal.log_id.index, Duration::from_secs(10)).await?;
     phase.set(Phase::RefusedView);
-    let refused_view = backend.read_committed_view().await?;
+    let refused_view = observe_call(phase, &cluster, Operation::ReadView, backend.read_committed_view()).await?;
     assert!(refused_view.last_applied().is_some_and(|id| id.index >= refusal.log_id.index));
     assert!(refused_view.read_ref("refs/heads/refused").is_none());
     phase.set(Phase::RefusalLookup);
-    let stored_refusal = backend.query_proposal(refusal.proposal_id.clone()).await?;
+    let stored_refusal =
+        observe_call(phase, &cluster, Operation::Receipt, backend.query_proposal(refusal.proposal_id.clone())).await?;
     let stored_outcome = match stored_refusal {
         ProposalLookup::Found { original_log_id, observed_log_id, outcome, .. } => {
             assert_eq!(original_log_id, refusal.log_id);
@@ -722,7 +745,13 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
     // Same caller-stable ID and canonical digest advances the coordinate on retry but never
     // re-executes the business command; the first typed refusal remains the result.
     phase.set(Phase::RefusalReplay);
-    let refusal_retry = backend.propose_with_id(refusal.proposal_id.clone(), refused_commit).await?;
+    let refusal_retry = observe_call(
+        phase,
+        &cluster,
+        Operation::ClientWrite,
+        backend.propose_with_id(refusal.proposal_id.clone(), refused_commit),
+    )
+    .await?;
     assert_eq!(refusal_retry.decision, ProposalAttemptKind::Replayed);
     assert_eq!(refusal_retry.original_log_id, Some(refusal.log_id));
     assert!(matches!(
@@ -733,10 +762,16 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
     // The healthy quorum still works after the refusal: a valid Noop applies, the applied index
     // advances, and a new ReadIndex-backed view is minted.
     phase.set(Phase::HealthyWrite);
-    let healthy = backend.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })).await?;
+    let healthy = observe_call(
+        phase,
+        &cluster,
+        Operation::ClientWrite,
+        backend.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })),
+    )
+    .await?;
     assert!(proposal_outcome(&healthy).is_applied());
     phase.set(Phase::HealthyView);
-    let healthy_view = backend.read_committed_view().await?;
+    let healthy_view = observe_call(phase, &cluster, Operation::ReadView, backend.read_committed_view()).await?;
     assert!(healthy_view.last_applied().is_some_and(|id| id.index >= healthy.log_id.index));
 
     // A same-node-id standalone SM cannot be attached: the public constructor takes the owned

@@ -122,7 +122,47 @@ DIAGNOSTIC_KEYS = {
     "unknown_case",
     "diagnostics_valid",
     "evidence_unchanged",
+    "quorum_diagnostics",
 }
+
+
+def _diagnostic_node(slot):
+    return {
+        "slot": slot,
+        "running_state": "ok",
+        "server_state": "leader" if slot == 1 else "follower",
+        "leader_slot": "slot1",
+        "term": 7,
+        "last_log_index": 42,
+        "last_applied_index": 41,
+        "voter_count": 3,
+        "millis_since_quorum_ack": 5 if slot == 1 else None,
+        "numeric_overflow": False,
+    }
+
+
+def _diagnostic_payload():
+    return {
+        "schema": "rootyard.quorum_diagnostics.v1",
+        "case": CASE_REAL,
+        "phase": "semantic_input_write",
+        "operation": "client_write",
+        "cause": "write_forward",
+        "elapsed_ms": 12,
+        "elapsed_overflow": False,
+        "snapshots": [
+            {"at": "before", "nodes": [_diagnostic_node(1), _diagnostic_node(2), _diagnostic_node(3)]},
+            {"at": "after", "nodes": [_diagnostic_node(1), _diagnostic_node(2), _diagnostic_node(3)]},
+        ],
+    }
+
+
+def _diagnostic_frame(payload=None):
+    return (
+        "ROOTYARD_QUORUM_DIAGNOSTICS v1 "
+        + json.dumps(_diagnostic_payload() if payload is None else payload, separators=(",", ":"))
+        + "\n"
+    )
 
 
 class FakeProcess:
@@ -643,7 +683,7 @@ class RootRaftRunnerTest(unittest.TestCase):
         conflicting = runner.collect_failure_evidence(
             "",
             f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n"
-            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=refusal class=storage\n",
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=semantic_healthy_write class=storage\n",
         )
         self.assertIsNone(conflicting.failure_phase)
         self.assertFalse(conflicting.diagnostics_valid)
@@ -708,7 +748,7 @@ class RootRaftRunnerTest(unittest.TestCase):
         conflict = runner.collect_failure_evidence(
             stdout,
             f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n"
-            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=refusal class=storage\n",
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=semantic_healthy_write class=storage\n",
         )
         self.assertFalse(conflict.diagnostics_valid)
         self.assertEqual(conflict.case_failures, [])
@@ -717,7 +757,7 @@ class RootRaftRunnerTest(unittest.TestCase):
         partial_conflict = runner.collect_failure_evidence(
             stdout,
             f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n"
-            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=refusal class=storage\n"
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=semantic_healthy_write class=storage\n"
             f"ROOTYARD_FAILURE_FRAME v1 case={CASE_DRAIN} phase=settled_evaluate class=scope_binding\n",
         )
         self.assertFalse(partial_conflict.diagnostics_valid)
@@ -747,6 +787,12 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertEqual(runner.EXPECTED_CASE_COUNT, 3)
         self.assertEqual(runner.REQUIRED_CASES, (CASE_REAL, CASE_PRUNED, CASE_DRAIN))
         phases = (
+            "semantic_input_write",
+            "semantic_input_view",
+            "semantic_identity_write",
+            "semantic_identity_view",
+            "semantic_healthy_write",
+            "semantic_healthy_view",
             "closing_write",
             "closing_view",
             "refused_write",
@@ -778,12 +824,14 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertFalse(wrong_case.diagnostics_valid)
         self.assertEqual(wrong_case.case_failures, [])
 
-        removed_phase = runner.collect_failure_evidence(
-            "",
-            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=transition class=quorum_unavailable\n",
-        )
-        self.assertFalse(removed_phase.diagnostics_valid)
-        self.assertEqual(removed_phase.case_failures, [])
+        for removed in ("transition", "refusal"):
+            with self.subTest(removed=removed):
+                removed_phase = runner.collect_failure_evidence(
+                    "",
+                    f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase={removed} class=quorum_unavailable\n",
+                )
+                self.assertFalse(removed_phase.diagnostics_valid)
+                self.assertEqual(removed_phase.case_failures, [])
 
         secret_phase = runner.collect_failure_evidence(
             "",
@@ -792,6 +840,152 @@ class RootRaftRunnerTest(unittest.TestCase):
         )
         self.assertFalse(secret_phase.diagnostics_valid)
         self.assertNotIn(SECRET, json.dumps(secret_phase.case_failures))
+
+    def test_quorum_diagnostic_is_validated_and_safely_rebuilt(self) -> None:
+        for operation, cause, phase in (
+            ("client_write", "write_forward", "semantic_input_write"),
+            ("client_write", "write_fatal_storage", "semantic_healthy_write"),
+            ("read_view", "read_quorum_shortfall", "closing_view"),
+            ("read_view", "read_outer_deadline", "closing_view"),
+            ("receipt", "read_fatal_panicked", "refusal_lookup"),
+            ("prepare", "unclassified", "commit"),
+        ):
+            with self.subTest(operation=operation, cause=cause):
+                payload = _diagnostic_payload()
+                payload.update(operation=operation, cause=cause, phase=phase)
+                evidence = runner.collect_failure_evidence(
+                    NONZERO_FAILED_OUTPUT, _diagnostic_frame(payload)
+                )
+                self.assertTrue(evidence.diagnostics_valid)
+                self.assertEqual(len(evidence.quorum_diagnostics), 1)
+                safe = evidence.quorum_diagnostics[0]
+                self.assertEqual(set(safe), runner._DIAGNOSTIC_TOP_KEYS)
+                self.assertEqual(safe["schema"], "rootyard.quorum_diagnostics.v1")
+                self.assertEqual(safe["case"], CASE_REAL)
+                self.assertEqual(safe["phase"], phase)
+                self.assertEqual(safe["operation"], operation)
+                self.assertEqual(safe["cause"], cause)
+                self.assertEqual(safe["elapsed_ms"], 12)
+                self.assertFalse(safe["elapsed_overflow"])
+                self.assertEqual([item["at"] for item in safe["snapshots"]], ["before", "after"])
+                self.assertEqual(
+                    [node["slot"] for node in safe["snapshots"][0]["nodes"]], [1, 2, 3]
+                )
+                self.assertEqual(
+                    set(safe["snapshots"][0]), runner._DIAGNOSTIC_SNAPSHOT_KEYS
+                )
+                self.assertEqual(
+                    set(safe["snapshots"][0]["nodes"][0]), runner._DIAGNOSTIC_NODE_KEYS
+                )
+                self.assertNotIn(SECRET, json.dumps(safe))
+
+    def test_quorum_diagnostic_rejects_duplicate_unknown_extra_and_oversized_frames(self) -> None:
+        valid = _diagnostic_frame()
+        duplicate = runner.collect_failure_evidence(NONZERO_FAILED_OUTPUT, valid + valid)
+        self.assertFalse(duplicate.diagnostics_valid)
+        self.assertEqual(duplicate.quorum_diagnostics, [])
+
+        extra_payload = _diagnostic_payload()
+        extra_payload["secret"] = SECRET
+        extra = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_frame(extra_payload)
+        )
+        self.assertFalse(extra.diagnostics_valid)
+        self.assertEqual(extra.quorum_diagnostics, [])
+        self.assertNotIn(SECRET, json.dumps(extra.quorum_diagnostics))
+
+        unknown_payload = _diagnostic_payload()
+        unknown_payload["case"] = "secret_case"
+        unknown = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_frame(unknown_payload)
+        )
+        self.assertTrue(unknown.unknown_case)
+        self.assertFalse(unknown.diagnostics_valid)
+        self.assertEqual(unknown.quorum_diagnostics, [])
+        self.assertNotIn("secret_case", json.dumps(unknown.quorum_diagnostics))
+
+        wrong_known = _diagnostic_payload()
+        wrong_known["case"] = CASE_DRAIN
+        other_case = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_frame(wrong_known)
+        )
+        self.assertFalse(other_case.diagnostics_valid)
+        self.assertEqual(other_case.quorum_diagnostics, [])
+
+        passed = runner.collect_failure_evidence(GOOD_OUTPUT, valid)
+        self.assertFalse(passed.diagnostics_valid)
+        self.assertEqual(passed.quorum_diagnostics, [])
+
+        duplicate_key = _diagnostic_frame().replace(
+            '"elapsed_ms":12', '"elapsed_ms":12,"elapsed_ms":13'
+        )
+        duplicated_field = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, duplicate_key
+        )
+        self.assertFalse(duplicated_field.diagnostics_valid)
+        self.assertEqual(duplicated_field.quorum_diagnostics, [])
+
+        oversized_payload = json.dumps(_diagnostic_payload(), separators=(",", ":"))
+        oversized = (
+            "ROOTYARD_QUORUM_DIAGNOSTICS v1 "
+            + oversized_payload.replace(",", " " * 300 + ",")
+            + "\n"
+        )
+        too_large = runner.collect_failure_evidence(NONZERO_FAILED_OUTPUT, oversized)
+        self.assertFalse(too_large.diagnostics_valid)
+        self.assertEqual(too_large.quorum_diagnostics, [])
+
+    def test_quorum_diagnostic_rejects_bad_types_ranges_cardinality_and_binding(self) -> None:
+        cases = []
+        payload = _diagnostic_payload()
+        payload["elapsed_ms"] = True
+        cases.append(payload)
+        payload = _diagnostic_payload()
+        payload["elapsed_ms"] = 900_001
+        cases.append(payload)
+        payload = _diagnostic_payload()
+        payload["elapsed_overflow"] = 1
+        cases.append(payload)
+        payload = _diagnostic_payload()
+        payload["elapsed_overflow"] = True
+        cases.append(payload)
+        payload = _diagnostic_payload()
+        payload["snapshots"][0]["nodes"] = payload["snapshots"][0]["nodes"][:2]
+        cases.append(payload)
+        payload = _diagnostic_payload()
+        payload["snapshots"][1]["nodes"][2]["slot"] = 2
+        cases.append(payload)
+        payload = _diagnostic_payload()
+        payload["snapshots"][0]["nodes"][0]["term"] = 1_000_000_001
+        cases.append(payload)
+        payload = _diagnostic_payload()
+        payload["snapshots"][0]["nodes"][0]["numeric_overflow"] = True
+        cases.append(payload)
+        payload = _diagnostic_payload()
+        payload["phase"] = "refusal"
+        cases.append(payload)
+        payload = _diagnostic_payload()
+        payload.update(operation="client_write", cause="read_quorum_shortfall")
+        cases.append(payload)
+        payload = _diagnostic_payload()
+        payload["snapshots"][0]["at"] = "after"
+        cases.append(payload)
+        for payload in cases:
+            with self.subTest(payload=payload):
+                evidence = runner.collect_failure_evidence(
+                    NONZERO_FAILED_OUTPUT, _diagnostic_frame(payload)
+                )
+                self.assertFalse(evidence.diagnostics_valid)
+                self.assertEqual(evidence.quorum_diagnostics, [])
+
+        coarse = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=quorum_unavailable\n"
+        )
+        mismatched = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, coarse + _diagnostic_frame()
+        )
+        self.assertFalse(mismatched.diagnostics_valid)
+        self.assertEqual(mismatched.quorum_diagnostics, [])
 
     def test_main_retains_partial_evidence_on_nonzero_without_passing(self) -> None:
         path = self.root / "out" / "nonzero-report.json"
@@ -842,7 +1036,63 @@ class RootRaftRunnerTest(unittest.TestCase):
             "unknown_case": False,
             "diagnostics_valid": True,
             "evidence_unchanged": True,
+            "quorum_diagnostics": [],
         })
+        serialized = json.dumps(report)
+        self.assertNotIn(SECRET, serialized)
+        self.assertNotIn(str(self.root), serialized)
+
+    def test_main_failed_report_includes_safe_quorum_diagnostic(self) -> None:
+        path = self.root / "out" / "quorum-diagnostic-report.json"
+        output = NONZERO_FAILED_OUTPUT
+        stderr = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
+            "phase=semantic_input_write class=quorum_unavailable\n"
+            + _diagnostic_frame()
+        )
+
+        def fake_execute(*_args, **_kwargs):
+            return runner.ExecutionResult(output, stderr, 101, None, "exited")
+
+        with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+             mock.patch.object(runner, "_safe_head", return_value=self.head), \
+             mock.patch.object(
+                 runner,
+                 "load_and_validate",
+                 return_value=(None, "c" * 64, "b" * 64),
+             ), \
+             mock.patch.object(runner, "execute_case", side_effect=fake_execute), \
+             mock.patch.object(runner, "_verify_evidence_unchanged", return_value=None):
+            code = runner.main(
+                [
+                    "--test-binary",
+                    str(self.binary),
+                    "--build-receipt",
+                    str(self.receipt),
+                    "--report",
+                    str(path),
+                    "--expected-commit",
+                    self.head,
+                ]
+            )
+        self.assertEqual(code, 1)
+        report = json.loads(path.read_text(encoding="utf-8"))
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["diagnostics"]["diagnostics_valid"])
+        self.assertEqual(
+            report["diagnostics"]["case_failures"],
+            [{"case": CASE_REAL, "phase": "semantic_input_write", "class": "quorum_unavailable"}],
+        )
+        quorum = report["diagnostics"]["quorum_diagnostics"]
+        self.assertEqual(len(quorum), 1)
+        self.assertEqual(quorum[0]["case"], CASE_REAL)
+        self.assertEqual(quorum[0]["phase"], "semantic_input_write")
+        self.assertEqual(quorum[0]["operation"], "client_write")
+        self.assertEqual(quorum[0]["cause"], "write_forward")
+        self.assertEqual(len(quorum[0]["snapshots"]), 2)
+        self.assertEqual(
+            [node["slot"] for node in quorum[0]["snapshots"][0]["nodes"]], [1, 2, 3]
+        )
         serialized = json.dumps(report)
         self.assertNotIn(SECRET, serialized)
         self.assertNotIn(str(self.root), serialized)
@@ -1057,6 +1307,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             "unknown_case": False,
             "diagnostics_valid": True,
             "evidence_unchanged": True,
+            "quorum_diagnostics": [],
         }
         failed_with_diagnostics = runner.build_report(
             False,
