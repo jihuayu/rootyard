@@ -336,6 +336,11 @@ class Server:
         if self.budget is not None:
             self.budget.require("cleanup")
 
+    def _require_local(self, deadline):
+        """The per-call stop cap is fixed; phaseD remaining cannot extend it."""
+        if self._now() >= deadline:
+            raise QualificationError("server_stop_timeout", "cleanup")
+
     def _default_leader_state(self):
         """Observe leader exit without reaping it (waitid WNOWAIT)."""
         if self.process is None:
@@ -386,34 +391,40 @@ class Server:
         self._sleep(seconds)
         return True
 
-    def _wait_term_slice(self, term_deadline):
+    def _wait_term_slice(self, term_deadline, deadline):
         """Observe the full TERM grace without reaping the leader.
 
         A prompt leader exit is a zombie anchor, not proof that inherited Git
-        descendants are gone.  The loop therefore stays inside the original
-        TERM slice and only observes leader identity; it never waits for the
-        zombie leader to disappear from killpg(0).
+        descendants are gone.  The loop stays inside the original TERM slice
+        and the per-call stop deadline; a sleep that returns after either
+        boundary fails closed before another observation or KILL.
         """
         while True:
+            self._require_local(deadline)
             state = self._observe_leader()
+            self._require_local(deadline)
             if state == "reaped":
                 self._leader_reaped = True
                 raise QualificationError("server_group_unverified", "cleanup")
             if state == "unknown":
                 raise QualificationError("server_group_unverified", "cleanup")
-            remaining = term_deadline - self._now()
+            remaining = min(term_deadline, deadline) - self._now()
             if remaining <= 0:
                 self._require_stop()
+                self._require_local(deadline)
                 return True
             self._sleep_until(min(self.GROUP_POLL_SECONDS, remaining))
             self._require_stop()
+            self._require_local(deadline)
 
     def _reap_leader_after_signals(self, process, deadline):
         """Reap only after the last numeric PGID signal has been sent."""
         if self._leader_reaped:
+            self._require_local(deadline)
             return True
         if getattr(process, "returncode", None) is not None:
             self._leader_reaped = True
+            self._require_local(deadline)
             return True
         remaining = deadline - self._now()
         if remaining <= 0:
@@ -428,20 +439,28 @@ class Server:
             self._leader_reaped = True
             return False
         self._leader_reaped = True
+        # A wait that returns even with an absent group is not a late success.
+        if self._now() >= deadline:
+            return False
         return True
 
     def _poll_group_absence(self, pgid, deadline):
         """Passively poll group absence after the leader has been reaped."""
         while True:
+            self._require_local(deadline)
             state = self._group_state(pgid)
+            # An immediate absent must not clear the owner after a late probe.
+            self._require_local(deadline)
             if state in ("absent", "unknown"):
                 return state
             remaining = deadline - self._now()
             if remaining <= 0:
                 self._require_stop()
+                self._require_local(deadline)
                 return "present"
             self._sleep_until(min(self.GROUP_POLL_SECONDS, remaining))
             self._require_stop()
+            self._require_local(deadline)
 
     def _close(self, process):
         stream = getattr(process, "stdout", None)
@@ -451,8 +470,10 @@ class Server:
             except (OSError, ValueError, AttributeError):
                 pass
 
-    def _finish_stop(self, process):
+    def _finish_stop(self, process, deadline):
+        self._require_local(deadline)
         self._close(process)
+        self._require_local(deadline)
         self.process = None
         self.owned_group = False
         self.pgid = None
@@ -474,50 +495,63 @@ class Server:
             self._leader_reaped = True
             raise QualificationError("server_group_unverified", "cleanup")
         deadline = self._stop_deadline(timeout)
+        self._require_local(deadline)
         pgid = self.pgid
+        self._require_local(deadline)
         state = self._group_state(pgid)
+        self._require_local(deadline)
         if state == "unknown":
             raise QualificationError("server_group_unverified", "cleanup")
         if state == "absent":
             if not self._reap_leader_after_signals(process, deadline):
                 raise QualificationError("server_stop_timeout", "cleanup")
+            self._require_local(deadline)
             self._require_stop()
-            self._finish_stop(process)
+            self._finish_stop(process, deadline)
             return True
         remaining = deadline - self._now()
         if remaining <= 0:
             self._require_stop()
+            self._require_local(deadline)
         # Reserve the original bounded post-TERM slice for KILL/reap/poll.
         reserve = min(MIN_REAP_SECONDS, remaining / 2.0)
         term_deadline = self._now() + max(0.0, remaining - reserve)
+        self._require_local(deadline)
         term_state = self._signal_group(pgid, signal.SIGTERM)
+        self._require_local(deadline)
         if term_state == "unknown":
             raise QualificationError("server_group_unverified", "cleanup")
         if term_state == "absent":
             if not self._reap_leader_after_signals(process, deadline):
                 raise QualificationError("server_stop_timeout", "cleanup")
+            self._require_local(deadline)
             self._require_stop()
-            self._finish_stop(process)
+            self._finish_stop(process, deadline)
             return True
         # Wait the full TERM grace without reaping.  A prompt leader exit is a
         # zombie anchor; surviving descendants still get the same grace.
-        self._wait_term_slice(term_deadline)
+        self._wait_term_slice(term_deadline, deadline)
         # Last possible numeric group signal: the leader is still unreaped and
         # its PID/PGID cannot be reused yet.
+        self._require_local(deadline)
         kill_state = self._signal_group(pgid, signal.SIGKILL)
+        self._require_local(deadline)
         if kill_state == "unknown":
             raise QualificationError("server_group_unverified", "cleanup")
         # Only now may the direct leader be reaped.
         if not self._reap_leader_after_signals(process, deadline):
             raise QualificationError("server_stop_timeout", "cleanup")
+        self._require_local(deadline)
         # After reap, only passive group-absence polling uses the numeric PGID.
         state = self._poll_group_absence(pgid, deadline)
+        self._require_local(deadline)
         if state == "unknown":
             raise QualificationError("server_group_unverified", "cleanup")
         if state != "absent":
             raise QualificationError("server_group_alive", "cleanup")
+        self._require_local(deadline)
         self._require_stop()
-        self._finish_stop(process)
+        self._finish_stop(process, deadline)
         return True
 
     def url(self, repo):
