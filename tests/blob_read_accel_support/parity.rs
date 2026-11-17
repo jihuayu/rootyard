@@ -441,7 +441,7 @@ fn classify_read_accel(err: &ReadAccelError, diag: &mut Diag) {
         }
         ReadAccelError::GitCommandFailed { command, .. } => {
             diag.error = ErrorClass::GitCommandFailed;
-            diag.git_command = GitCommandClass::from_command(*command);
+            diag.git_command = GitCommandClass::from_command(command);
         }
         ReadAccelError::SidecarIntegrityFailed(_) => diag.error = ErrorClass::SidecarIntegrityFailed,
         ReadAccelError::DeadlineExceeded => diag.error = ErrorClass::DeadlineExceeded,
