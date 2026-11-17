@@ -9,14 +9,14 @@
 use super::super::{Config, Pack, lifecycle, store};
 use super::{RepackOptions, repack_repo};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
-fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+async fn test_lock() -> MutexGuard<'static, ()> {
+    TEST_LOCK.lock().await
 }
 
 struct HookGuard;
@@ -247,7 +247,7 @@ fn default_options(sync_object_store: bool) -> RepackOptions {
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_repack_default_local_publishes_one_authority_and_retains_pinned_data() {
-    let _lock = test_lock();
+    let _lock = test_lock().await;
     let _hooks = HookGuard::new();
     preflight_fixture_isolation();
     let (config, root) = config_for("default-local");
@@ -307,7 +307,7 @@ async fn pg_repack_default_local_publishes_one_authority_and_retains_pinned_data
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_repack_generation_race_fails_cleanly_without_authority() {
-    let _lock = test_lock();
+    let _lock = test_lock().await;
     let _hooks = HookGuard::new();
     preflight_fixture_isolation();
     let (config, root) = config_for("generation-race");
@@ -344,7 +344,7 @@ async fn pg_repack_generation_race_fails_cleanly_without_authority() {
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_repack_forced_final_failure_rolls_back_authority_and_mirror() {
-    let _lock = test_lock();
+    let _lock = test_lock().await;
     let _hooks = HookGuard::new();
     preflight_fixture_isolation();
     let (config, root) = config_for("forced-rollback");
@@ -380,7 +380,7 @@ async fn pg_repack_forced_final_failure_rolls_back_authority_and_mirror() {
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_repack_rotation_barrier_keeps_exact_target_and_shared_gate() {
-    let _lock = test_lock();
+    let _lock = test_lock().await;
     let _hooks = HookGuard::new();
     preflight_fixture_isolation();
     let (config, root) = config_for("rotation-barrier");
@@ -444,7 +444,7 @@ async fn pg_repack_rotation_barrier_keeps_exact_target_and_shared_gate() {
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL and the pando_lab schema"]
 async fn pg_repack_no_sync_local_legacy_and_active_target_narrow_reject() {
-    let _lock = test_lock();
+    let _lock = test_lock().await;
     let _hooks = HookGuard::new();
     preflight_fixture_isolation();
     let (config, root) = config_for("no-sync");
