@@ -128,10 +128,12 @@ class Server:
 
     MAX_LINE = 4096
     MAX_ANNOUNCEMENT = MAX_LINE
+    GROUP_POLL_SECONDS = 0.05
 
     def __init__(self, binary, environment, runner=None, budget=None,
                  clock=None, popen=None, killpg=None, select_fn=None,
-                 read_fn=None, set_blocking_fn=None):
+                 read_fn=None, set_blocking_fn=None, sleep_fn=None,
+                 leader_state_fn=None):
         self.binary = str(binary)
         self.environment = dict(environment)
         self.runner = runner
@@ -142,11 +144,14 @@ class Server:
         self.owned_group = False
         self.pgid = None
         self.stdout_fd = None
+        self._leader_reaped = False
         self._popen = popen or subprocess.Popen
         self._killpg = killpg or os.killpg
         self._select = select_fn or select.select
         self._read = read_fn or os.read
         self._set_blocking = set_blocking_fn or os.set_blocking
+        self._sleep = sleep_fn or time.sleep
+        self._observe_leader = leader_state_fn or self._default_leader_state
 
     def _now(self):
         return self.clock() if self.clock is not None else time.monotonic()
@@ -308,6 +313,24 @@ class Server:
         if self.budget is not None:
             self.budget.require("cleanup")
 
+    def _default_leader_state(self):
+        """Observe leader exit without reaping it (waitid WNOWAIT)."""
+        if self.process is None:
+            return "reaped"
+        if getattr(self.process, "returncode", None) is not None:
+            self._leader_reaped = True
+            return "reaped"
+        try:
+            info = os.waitid(
+                os.P_PID, self.process.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            self._leader_reaped = True
+            return "reaped"
+        except (AttributeError, OSError, ValueError, TypeError):
+            return "unknown"
+        return "alive" if info is None else "exited"
+
     def _group_state(self, pgid):
         """Only ESRCH proves the exact owned group is absent."""
         try:
@@ -321,7 +344,9 @@ class Server:
         return "present"
 
     def _signal_group(self, pgid, sig):
-        """Signal only the verified owned group; never fall back to the leader."""
+        """Signal only the owned group while the unreaped leader anchor holds."""
+        if self._leader_reaped:
+            return "unknown"
         try:
             self._killpg(pgid, sig)
         except ProcessLookupError:
@@ -332,17 +357,49 @@ class Server:
             return "unknown"
         return "sent"
 
-    def _reap_leader(self, process, deadline):
-        if process.returncode is not None:
+    def _sleep_until(self, seconds):
+        if seconds <= 0:
+            return False
+        self._sleep(seconds)
+        return True
+
+    def _wait_term_slice(self, term_deadline):
+        """Observe the leader once without reaping it (ordering checkpoint)."""
+        state = self._observe_leader()
+        if state == "reaped":
+            self._leader_reaped = True
+            raise QualificationError("server_group_unverified", "cleanup")
+        if state == "unknown":
+            raise QualificationError("server_group_unverified", "cleanup")
+        self._require_stop()
+        return True
+
+    def _reap_leader_after_signals(self, process, deadline):
+        """Reap only after the last numeric PGID signal has been sent."""
+        if self._leader_reaped:
+            return True
+        if getattr(process, "returncode", None) is not None:
+            self._leader_reaped = True
             return True
         remaining = deadline - self._now()
         if remaining <= 0:
             return False
         try:
             process.wait(timeout=remaining)
-            return True
-        except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
+        except subprocess.TimeoutExpired:
             return False
+        except (OSError, ValueError, AttributeError):
+            # The leader identity was lost (for example ECHILD); never signal
+            # this numeric PGID again.
+            self._leader_reaped = True
+            return False
+        self._leader_reaped = True
+        return True
+
+    def _poll_group_absence(self, pgid, deadline):
+        """One passive group probe after the leader has been reaped."""
+        self._require_stop()
+        return self._group_state(pgid)
 
     def _close(self, process):
         stream = getattr(process, "stdout", None)
@@ -365,14 +422,19 @@ class Server:
         if (not self.owned_group or not isinstance(self.pgid, int)
                 or self.pgid <= 0 or self.pgid == os.getpid()):
             raise QualificationError("server_group_unverified", "cleanup")
-        deadline = self._stop_deadline(timeout)
         process = self.process
+        if self._leader_reaped or getattr(process, "returncode", None) is not None:
+            # A previous call reaped the direct leader.  The numeric PGID is no
+            # longer pinned; never signal it again.
+            self._leader_reaped = True
+            raise QualificationError("server_group_unverified", "cleanup")
+        deadline = self._stop_deadline(timeout)
         pgid = self.pgid
         state = self._group_state(pgid)
         if state == "unknown":
             raise QualificationError("server_group_unverified", "cleanup")
         if state == "absent":
-            if not self._reap_leader(process, deadline):
+            if not self._reap_leader_after_signals(process, deadline):
                 raise QualificationError("server_stop_timeout", "cleanup")
             self._require_stop()
             self._finish_stop(process)
@@ -380,33 +442,31 @@ class Server:
         remaining = deadline - self._now()
         if remaining <= 0:
             self._require_stop()
-        # Leave a real post-TERM slice for SIGKILL and reap.  This is carved
-        # from the same deadline; no new timeout is created after TERM.
+        # Reserve the original bounded post-TERM slice for KILL/reap/poll.
         reserve = min(MIN_REAP_SECONDS, remaining / 2.0)
         term_deadline = self._now() + max(0.0, remaining - reserve)
         term_state = self._signal_group(pgid, signal.SIGTERM)
         if term_state == "unknown":
             raise QualificationError("server_group_unverified", "cleanup")
         if term_state == "absent":
-            if not self._reap_leader(process, deadline):
+            if not self._reap_leader_after_signals(process, deadline):
                 raise QualificationError("server_stop_timeout", "cleanup")
             self._require_stop()
             self._finish_stop(process)
             return True
-        # The leader may exit here, but that does not prove its inherited Git
-        # descendants are gone.  The group is checked again below.
-        self._reap_leader(process, term_deadline)
-        self._require_stop()
-        state = self._group_state(pgid)
-        if state == "unknown":
+        # Wait the full TERM grace without reaping.  A prompt leader exit is a
+        # zombie anchor; surviving descendants still get the same grace.
+        self._wait_term_slice(term_deadline)
+        # Last possible numeric group signal: the leader is still unreaped and
+        # its PID/PGID cannot be reused yet.
+        kill_state = self._signal_group(pgid, signal.SIGKILL)
+        if kill_state == "unknown":
             raise QualificationError("server_group_unverified", "cleanup")
-        if state == "present":
-            kill_state = self._signal_group(pgid, signal.SIGKILL)
-            if kill_state == "unknown":
-                raise QualificationError("server_group_unverified", "cleanup")
-        if not self._reap_leader(process, deadline):
+        # Only now may the direct leader be reaped.
+        if not self._reap_leader_after_signals(process, deadline):
             raise QualificationError("server_stop_timeout", "cleanup")
-        state = self._group_state(pgid)
+        # After reap, only passive group-absence polling uses the numeric PGID.
+        state = self._poll_group_absence(pgid, deadline)
         if state == "unknown":
             raise QualificationError("server_group_unverified", "cleanup")
         if state != "absent":

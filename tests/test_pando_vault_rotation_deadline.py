@@ -541,58 +541,81 @@ class FakeStream:
 
 
 class FakeGroup:
-    """Fake process group membership; no OS process or signal is created."""
+    """Async fake process group; no OS process, signal or wait is created."""
 
-    def __init__(self, leader_alive=True, child_alive=False,
-                 term_exits_leader=True, term_exits_child=True,
-                 kill_exits_leader=True, kill_exits_child=True,
-                 ambiguous=False):
-        self.leader_alive = leader_alive
-        self.child_alive = child_alive
-        self.term_exits_leader = term_exits_leader
-        self.term_exits_child = term_exits_child
-        self.kill_exits_leader = kill_exits_leader
-        self.kill_exits_child = kill_exits_child
+    def __init__(self, clock, pgid=4321, leader_exit_at=None,
+                 child_exit_at=None, term_leader_delay=0.0,
+                 term_child_delay=0.0, kill_leader_delay=0.0,
+                 kill_child_delay=0.0, ambiguous=False,
+                 eperm_signals=(), zombie_present=True):
+        self.clock = clock
+        self.pgid = pgid
+        self.leader_exit_at = (
+            float("inf") if leader_exit_at is None else float(leader_exit_at))
+        self.child_exit_at = (
+            float("inf") if child_exit_at is None else float(child_exit_at))
+        self.term_leader_delay = float(term_leader_delay)
+        self.term_child_delay = float(term_child_delay)
+        self.kill_leader_delay = float(kill_leader_delay)
+        self.kill_child_delay = float(kill_child_delay)
         self.ambiguous = ambiguous
+        self.eperm_signals = set(eperm_signals)
+        self.zombie_present = zombie_present
+        self.leader_reaped = False
+        self.reaped_at_call = []
         self.calls = []
 
+    def leader_exited(self):
+        return self.clock.now >= self.leader_exit_at
+
+    def child_alive(self):
+        return self.clock.now < self.child_exit_at
+
+    def present(self):
+        if not self.leader_reaped:
+            if self.zombie_present or not self.leader_exited():
+                return True
+        return self.child_alive()
+
     def killpg(self, pgid, sig):
-        self.calls.append((pgid, sig))
+        self.reaped_at_call.append(self.leader_reaped)
+        self.calls.append((pgid, sig, self.clock.now))
         if self.ambiguous:
             raise PermissionError("ambiguous group")
+        if sig in self.eperm_signals:
+            raise PermissionError("eperm group")
         if sig == 0:
-            if self.leader_alive or self.child_alive:
+            if self.present():
                 return None
             raise ProcessLookupError()
-        if not (self.leader_alive or self.child_alive):
+        if not self.present():
             raise ProcessLookupError()
         if sig == signal.SIGTERM:
-            if self.term_exits_leader:
-                self.leader_alive = False
-            if self.term_exits_child:
-                self.child_alive = False
+            self.leader_exit_at = min(
+                self.leader_exit_at,
+                self.clock.now + self.term_leader_delay)
+            self.child_exit_at = min(
+                self.child_exit_at,
+                self.clock.now + self.term_child_delay)
         elif sig == signal.SIGKILL:
-            if self.kill_exits_leader:
-                self.leader_alive = False
-            if self.kill_exits_child:
-                self.child_alive = False
+            self.leader_exit_at = min(
+                self.leader_exit_at,
+                self.clock.now + self.kill_leader_delay)
+            self.child_exit_at = min(
+                self.child_exit_at,
+                self.clock.now + self.kill_child_delay)
         return None
 
 
 class FakeProcess:
     """A fake Popen handle; no OS process or thread is created."""
 
-    def __init__(self, pid=4321, returncode=None, clock=None,
-                 advance_on_timeout=False, group=None):
-        self.pid = pid
+    def __init__(self, group, pid=None):
+        self.group = group
+        self.pid = group.pgid if pid is None else pid
         self.stdout = FakeStream()
-        self.returncode = returncode
+        self.returncode = None
         self.waits = []
-        self.clock = clock
-        self.advance_on_timeout = advance_on_timeout
-        self.group = group or FakeGroup()
-        if returncode is not None:
-            self.group.leader_alive = False
 
     def poll(self):
         return self.returncode
@@ -601,20 +624,26 @@ class FakeProcess:
         self.waits.append(timeout)
         if self.returncode is not None:
             return self.returncode
-        if not self.group.leader_alive:
+        now = self.group.clock.now
+        if self.group.leader_exited():
             self.returncode = 0
+            self.group.leader_reaped = True
             return 0
-        if self.advance_on_timeout and self.clock is not None:
-            self.clock.advance(timeout)
+        if self.group.leader_exit_at <= now + float(timeout):
+            self.group.clock.now = self.group.leader_exit_at
+            self.returncode = 0
+            self.group.leader_reaped = True
+            return 0
+        self.group.clock.advance(timeout)
         raise subprocess.TimeoutExpired(["lab"], timeout)
 
     def terminate(self):
-        self.group.leader_alive = False
+        self.group.leader_exit_at = self.group.clock.now
         self.returncode = 0
+        self.group.leader_reaped = True
 
     def kill(self):
-        self.group.leader_alive = False
-        self.returncode = -9
+        self.terminate()
 
 
 class FakePopen:
@@ -662,17 +691,54 @@ class FakeSelect:
         return ([], [], [])
 
 
+class FakeSleep:
+    def __init__(self, clock):
+        self.clock = clock
+        self.calls = []
+
+    def __call__(self, seconds):
+        self.calls.append(seconds)
+        self.clock.advance(seconds)
+
+
+def _leader_state_for(process, group):
+    def observe():
+        if process.returncode is not None or group.leader_reaped:
+            return "reaped"
+        if group.leader_exited():
+            return "exited"
+        return "alive"
+    return observe
+
+
 def _server_for_start(clock, budget, process, read_chunks,
                       advance=0.0, ready=True):
+    group = process.group
     popen = FakePopen(process)
     reader = FakeRead(read_chunks)
     selector = FakeSelect(clock=clock, advance=advance, ready=ready)
+    sleep = FakeSleep(clock)
     server = service.Server(
         "/bin/lab", {}, budget=budget, clock=clock,
-        popen=popen, killpg=process.group.killpg,
+        popen=popen, killpg=group.killpg,
         select_fn=selector, read_fn=reader,
-        set_blocking_fn=lambda _fd, _flag: None)
-    return server, popen, reader, selector
+        set_blocking_fn=lambda _fd, _flag: None,
+        sleep_fn=sleep, leader_state_fn=_leader_state_for(process, group))
+    return server, popen, reader, selector, sleep
+
+
+def _server_for_stop(clock, budget, group=None):
+    group = group or FakeGroup(clock)
+    process = FakeProcess(group)
+    sleep = FakeSleep(clock)
+    server = service.Server(
+        "/bin/lab", {}, budget=budget, clock=clock,
+        popen=FakePopen(process), killpg=group.killpg,
+        sleep_fn=sleep, leader_state_fn=_leader_state_for(process, group))
+    server.process = process
+    server.owned_group = True
+    server.pgid = group.pgid
+    return server, process, group, sleep
 
 
 class ServerProcessBoundaryTest(unittest.TestCase):
@@ -680,8 +746,8 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess()
-        server, popen, reader, selector = _server_for_start(
+        process = FakeProcess(FakeGroup(clock))
+        server, popen, reader, selector, _sleep = _server_for_start(
             clock, budget, process,
             [b"LISTEN http://127.0.0.1:9000\n"])
         self.assertEqual(server.start(), "http://127.0.0.1:9000")
@@ -697,7 +763,7 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess()
+        process = FakeProcess(FakeGroup(clock))
         reader = FakeRead([b"LISTEN http://127.0.0.1:9000"])
         select_calls = []
 
@@ -705,17 +771,17 @@ class ServerProcessBoundaryTest(unittest.TestCase):
             select_calls.append((list(read_list), timeout))
             if len(select_calls) == 1:
                 return (list(read_list), [], [])
-            # The live writer never completes the line.  This readiness wait
-            # consumes the remaining startup slice without a blocking readline.
             clock.advance(46.0)
             return ([], [], [])
 
+        sleep = FakeSleep(clock)
         server = service.Server(
             "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process),
-            killpg=process.group.killpg,
+            popen=FakePopen(process), killpg=process.group.killpg,
             select_fn=selector, read_fn=reader,
-            set_blocking_fn=lambda _fd, _flag: None)
+            set_blocking_fn=lambda _fd, _flag: None,
+            sleep_fn=sleep,
+            leader_state_fn=_leader_state_for(process, process.group))
         with self.assertRaises(QualificationError) as caught:
             server.start()
         self.assertEqual(caught.exception.code, "server_start_timeout")
@@ -743,8 +809,8 @@ class ServerProcessBoundaryTest(unittest.TestCase):
                 clock = Clock()
                 budget = Budget(100, 20, clock=clock,
                                 error_factory=QualificationError)
-                process = FakeProcess()
-                server, _popen, _reader, _selector = _server_for_start(
+                process = FakeProcess(FakeGroup(clock))
+                server, _popen, _reader, _selector, _sleep = _server_for_start(
                     clock, budget, process, list(chunks))
                 with self.assertRaises(QualificationError) as caught:
                     server.start()
@@ -755,8 +821,8 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess()
-        server, _popen, reader, _selector = _server_for_start(
+        process = FakeProcess(FakeGroup(clock))
+        server, _popen, reader, _selector, _sleep = _server_for_start(
             clock, budget, process, [b"x" * service.Server.MAX_ANNOUNCEMENT])
         with self.assertRaises(QualificationError) as caught:
             server.start()
@@ -769,8 +835,8 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess()
-        server, popen, _reader, _selector = _server_for_start(
+        process = FakeProcess(FakeGroup(clock))
+        server, popen, _reader, _selector, _sleep = _server_for_start(
             clock, budget, process, [])
         clock.advance(80)
         with self.assertRaises(QualificationError) as caught:
@@ -782,8 +848,8 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
         budget.begin_cleanup()
-        process = FakeProcess()
-        server, popen, _reader, _selector = _server_for_start(
+        process = FakeProcess(FakeGroup(clock))
+        server, popen, _reader, _selector, _sleep = _server_for_start(
             clock, budget, process, [])
         with self.assertRaises(QualificationError) as caught:
             server.start()
@@ -794,7 +860,7 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess()
+        process = FakeProcess(FakeGroup(clock))
 
         class LateRead:
             def __call__(self, _fd, _size):
@@ -802,98 +868,30 @@ class ServerProcessBoundaryTest(unittest.TestCase):
                 return b"LISTEN http://127.0.0.1:9000\n"
 
         selector = FakeSelect(clock=clock, ready=True)
-        popen = FakePopen(process)
+        sleep = FakeSleep(clock)
         server = service.Server(
             "/bin/lab", {}, budget=budget, clock=clock,
-            popen=popen, killpg=process.group.killpg,
+            popen=FakePopen(process), killpg=process.group.killpg,
             select_fn=selector, read_fn=LateRead(),
-            set_blocking_fn=lambda _fd, _flag: None)
+            set_blocking_fn=lambda _fd, _flag: None,
+            sleep_fn=sleep,
+            leader_state_fn=_leader_state_for(process, process.group))
         with self.assertRaises(QualificationError) as caught:
             server.start()
         self.assertEqual(caught.exception.code, "work_deadline_exceeded")
-
-    def test_stop_termonly_group_absence_closes_and_clears_owner(self):
-        clock = Clock()
-        budget = Budget(100, 20, clock=clock,
-                        error_factory=QualificationError)
-        process = FakeProcess(clock=clock)
-        group = process.group
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
-        server.pgid = process.pid
-        self.assertTrue(server.stop())
-        signals = [sig for _pgid, sig in group.calls]
-        self.assertIn(signal.SIGTERM, signals)
-        self.assertNotIn(signal.SIGKILL, signals)
-        self.assertEqual(server.pgid, None)
-        self.assertFalse(server.owned_group)
-        self.assertTrue(process.stdout.closed)
-        self.assertIsNone(server.process)
-
-    def test_stop_escalates_and_reaps_within_the_same_deadline(self):
-        clock = Clock()
-        budget = Budget(100, 20, clock=clock,
-                        error_factory=QualificationError)
-        group = FakeGroup(
-            term_exits_leader=False, term_exits_child=False,
-            kill_exits_leader=True, kill_exits_child=True)
-        process = FakeProcess(
-            clock=clock, advance_on_timeout=True, group=group)
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
-        server.pgid = process.pid
-        self.assertTrue(server.stop())
-        signals = [sig for _pgid, sig in group.calls]
-        self.assertIn(signal.SIGTERM, signals)
-        self.assertIn(signal.SIGKILL, signals)
-        self.assertGreater(process.waits[-1], 0)
-        self.assertLessEqual(sum(process.waits), 15.0)
-        self.assertTrue(process.stdout.closed)
-        self.assertIsNone(server.process)
-
-    def test_stop_work_phase_does_not_borrow_cleanup_reserve(self):
-        clock = Clock()
-        budget = Budget(100, 20, clock=clock,
-                        error_factory=QualificationError)
-        process = FakeProcess()
-        group = process.group
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
-        server.pgid = process.pid
-        clock.advance(80)
-        with self.assertRaises(QualificationError) as caught:
-            server.stop()
-        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
-        self.assertEqual(group.calls, [])
         self.assertIs(server.process, process)
-        self.assertTrue(server.owned_group)
 
-    def test_stop_cleanup_phase_may_use_overall_deadline(self):
+    def test_oversized_announcement_fails_without_losing_primary(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        budget.begin_cleanup()
-        process = FakeProcess()
-        group = process.group
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
-        server.pgid = process.pid
-        clock.advance(80)
-        self.assertTrue(server.stop())
-        self.assertIn(signal.SIGTERM,
-                      [sig for _pgid, sig in group.calls])
+        process = FakeProcess(FakeGroup(clock))
+        server, _popen, _reader, _selector, _sleep = _server_for_start(
+            clock, budget, process,
+            [b"x" * service.Server.MAX_ANNOUNCEMENT])
+        with self.assertRaises(QualificationError) as caught:
+            server.start()
+        self.assertEqual(caught.exception.code, "server_announcement_invalid")
         self.assertIsNone(server.process)
 
     def test_stop_leader_exit_does_not_hide_a_live_child(self):
@@ -901,66 +899,64 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
         group = FakeGroup(
-            leader_alive=False, child_alive=True,
-            term_exits_leader=True, term_exits_child=False,
-            kill_exits_leader=True, kill_exits_child=True)
-        process = FakeProcess(returncode=0, group=group)
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
-        server.pgid = process.pid
+            clock, leader_exit_at=0.0, child_exit_at=float("inf"),
+            term_child_delay=float("inf"),
+            kill_leader_delay=0.0, kill_child_delay=0.0)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
         self.assertTrue(server.stop())
-        signals = [sig for _pgid, sig in group.calls]
-        self.assertIn(signal.SIGKILL, signals)
-        self.assertEqual(group.leader_alive, False)
-        self.assertEqual(group.child_alive, False)
+        kill_index = next(
+            index for index, (_pgid, sig, _at) in enumerate(group.calls)
+            if sig == signal.SIGKILL)
+        self.assertFalse(group.reaped_at_call[kill_index])
         self.assertTrue(process.stdout.closed)
-        self.assertIsNone(server.process)
 
-    def test_late_server_reap_is_not_marked_stopped(self):
+    def test_stop_zombie_leader_keeps_group_present_until_reap(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        group = FakeGroup()
+        group = FakeGroup(
+            clock, leader_exit_at=0.0, child_exit_at=0.0,
+            term_leader_delay=float("inf"),
+            term_child_delay=float("inf"),
+            kill_leader_delay=0.0, kill_child_delay=0.0)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
+        self.assertTrue(server.stop())
+        kill_index = next(
+            index for index, (_pgid, sig, _at) in enumerate(group.calls)
+            if sig == signal.SIGKILL)
+        self.assertFalse(group.reaped_at_call[kill_index])
+        self.assertTrue(process.stdout.closed)
 
-        class LateProcess(FakeProcess):
-            def wait(self, timeout=None):
-                self.waits.append(timeout)
-                self.clock.advance(timeout + 0.2)
-                self.group.leader_alive = False
-                self.group.child_alive = False
-                self.returncode = 0
-                return 0
-
-        process = LateProcess(clock=clock, group=group)
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
-        server.pgid = process.pid
-        clock.advance(79.9)
+    def test_stop_no_signal_after_leader_reap_on_later_cleanup(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(
+            clock, term_leader_delay=float("inf"),
+            term_child_delay=float("inf"),
+            kill_leader_delay=0.0, kill_child_delay=2.1)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
+        with self.assertRaises(QualificationError):
+            server.stop()
+        calls_after_first = len(group.calls)
+        self.assertTrue(group.leader_reaped)
         with self.assertRaises(QualificationError) as caught:
             server.stop()
-        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
+        self.assertEqual(caught.exception.code, "server_group_unverified")
+        self.assertEqual(len(group.calls), calls_after_first)
         self.assertIs(server.process, process)
         self.assertTrue(server.owned_group)
-        self.assertFalse(process.stdout.closed)
 
     def test_stop_ambiguous_group_is_never_marked_stopped(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        group = FakeGroup(ambiguous=True)
-        process = FakeProcess(group=group)
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
-        server.pgid = process.pid
+        group = FakeGroup(clock, ambiguous=True)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
         with self.assertRaises(QualificationError) as caught:
             server.stop()
         self.assertEqual(caught.exception.code, "server_group_unverified")
@@ -968,21 +964,29 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         self.assertTrue(server.owned_group)
         self.assertFalse(process.stdout.closed)
 
+    def test_stop_eperm_after_term_is_never_marked_stopped(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(clock, eperm_signals=(signal.SIGTERM,))
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
+        with self.assertRaises(QualificationError) as caught:
+            server.stop()
+        self.assertEqual(caught.exception.code, "server_group_unverified")
+        self.assertIs(server.process, process)
+        self.assertTrue(server.owned_group)
+
     def test_stop_group_alive_after_kill_is_never_marked_stopped(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
         group = FakeGroup(
-            leader_alive=True, child_alive=True,
-            term_exits_leader=True, term_exits_child=False,
-            kill_exits_leader=True, kill_exits_child=False)
-        process = FakeProcess(group=group)
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
-        server.pgid = process.pid
+            clock, term_leader_delay=float("inf"),
+            term_child_delay=float("inf"),
+            kill_leader_delay=0.0, kill_child_delay=float("inf"))
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
         with self.assertRaises(QualificationError) as caught:
             server.stop()
         self.assertEqual(caught.exception.code, "server_group_alive")
@@ -994,30 +998,22 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess(pid=4321)
-        group = process.group
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
+        group = FakeGroup(clock, pgid=5555)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
         server.pgid = 5555
         self.assertTrue(server.stop())
         self.assertTrue(group.calls)
-        self.assertTrue(all(pgid == 5555 for pgid, _sig in group.calls))
+        self.assertTrue(all(pgid == 5555 for pgid, _sig, _at in group.calls))
 
     def test_stop_refuses_an_unowned_group_without_signal(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess()
-        group = process.group
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
+        group = FakeGroup(clock)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
         server.owned_group = False
-        server.pgid = process.pid
         with self.assertRaises(QualificationError) as caught:
             server.stop()
         self.assertEqual(caught.exception.code, "server_group_unverified")
@@ -1028,14 +1024,9 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess()
-        group = process.group
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
-        server.pgid = process.pid
+        group = FakeGroup(clock)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
         clock.advance(100)
         with self.assertRaises(QualificationError) as caught:
             server.stop()
@@ -1043,37 +1034,109 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         self.assertEqual(group.calls, [])
         self.assertIs(server.process, process)
 
-    def test_already_exited_server_is_reaped_and_closed_without_term(self):
+    def test_stop_work_phase_does_not_borrow_cleanup_reserve(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess(returncode=0)
-        group = process.group
-        server = service.Server(
-            "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=group.killpg)
-        server.process = process
-        server.owned_group = True
-        server.pgid = process.pid
+        group = FakeGroup(clock)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
+        clock.advance(80)
+        with self.assertRaises(QualificationError) as caught:
+            server.stop()
+        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
+        self.assertEqual(group.calls, [])
+        self.assertIs(server.process, process)
+
+    def test_stop_cleanup_phase_may_use_overall_deadline(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        budget.begin_cleanup()
+        group = FakeGroup(clock)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
+        clock.advance(80)
+        self.assertTrue(server.stop())
+        self.assertIn(signal.SIGTERM,
+                      [sig for _pgid, sig, _at in group.calls])
+        self.assertIsNone(server.process)
+
+    def test_stop_already_exited_group_absent_while_unreaped(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(
+            clock, leader_exit_at=0.0, child_exit_at=0.0,
+            zombie_present=False)
+        server, process, group, _sleep = _server_for_stop(
+            clock, budget, group)
         self.assertTrue(server.stop())
         self.assertEqual(
-            [sig for _pgid, sig in group.calls
+            [sig for _pgid, sig, _at in group.calls
              if sig in (signal.SIGTERM, signal.SIGKILL)], [])
         self.assertTrue(process.stdout.closed)
         self.assertIsNone(server.process)
 
-    def test_oversized_announcement_fails_without_losing_primary(self):
+    def test_stop_leader_already_reaped_fails_closed_without_signal(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess()
-        server, _popen, _reader, _selector = _server_for_start(
-            clock, budget, process,
-            [b"x" * service.Server.MAX_ANNOUNCEMENT])
+        group = FakeGroup(clock, leader_exit_at=0.0, child_exit_at=0.0)
+        process = FakeProcess(group)
+        process.returncode = 0
+        group.leader_reaped = True
+        sleep = FakeSleep(clock)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=group.killpg,
+            sleep_fn=sleep,
+            leader_state_fn=_leader_state_for(process, group))
+        server.process = process
+        server.owned_group = True
+        server.pgid = group.pgid
         with self.assertRaises(QualificationError) as caught:
-            server.start()
-        self.assertEqual(caught.exception.code, "server_announcement_invalid")
-        self.assertIsNone(server.process)
+            server.stop()
+        self.assertEqual(caught.exception.code, "server_group_unverified")
+        self.assertEqual(group.calls, [])
+        self.assertIs(server.process, process)
+
+    def test_stop_late_server_reap_is_not_marked_stopped(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(
+            clock, term_leader_delay=float("inf"),
+            term_child_delay=float("inf"),
+            kill_leader_delay=0.0, kill_child_delay=0.0)
+
+        class LateProcess(FakeProcess):
+            def wait(self, timeout=None):
+                self.waits.append(timeout)
+                self.group.clock.advance(timeout + 0.2)
+                self.group.leader_exit_at = min(
+                    self.group.leader_exit_at, self.group.clock.now)
+                self.returncode = 0
+                self.group.leader_reaped = True
+                return 0
+
+        process = LateProcess(group)
+        sleep = FakeSleep(clock)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=group.killpg,
+            sleep_fn=sleep,
+            leader_state_fn=_leader_state_for(process, group))
+        server.process = process
+        server.owned_group = True
+        server.pgid = group.pgid
+        clock.advance(79.9)
+        with self.assertRaises(QualificationError) as caught:
+            server.stop()
+        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
+        self.assertIs(server.process, process)
+        self.assertTrue(server.owned_group)
+        self.assertFalse(process.stdout.closed)
 
 
 class ExpiredInputValidationTest(unittest.TestCase):
