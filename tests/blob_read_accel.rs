@@ -23,9 +23,9 @@ use rootyard::blob_store::{
     disposable_view::DisposableViewRoot,
     opendal::BlobStore,
     read_accel::{
-        AuthoritativePackSource, AuthoritativeRef, BuildReadAccelRequest, BuiltReadAccelBundle, ENABLE_BY_DEFAULT,
-        ManifestFetchRef, MaterializeViewRequest, MaterializedAccelView, PackRetentionRegistry, ReadAccelConfig,
-        ReadAccelObjectFormat, ReadAccelSidecarStatus, build_and_upload_sidecars, materialize_git_view_with_read_accel,
+        AuthoritativePackSource, AuthoritativeRef, BuildReadAccelRequest, BuiltReadAccelBundle, ManifestFetchRef,
+        MaterializeViewRequest, MaterializedAccelView, PackRetentionRegistry, ReadAccelConfig, ReadAccelObjectFormat,
+        build_and_upload_sidecars, materialize_git_view_with_read_accel,
     },
 };
 use sha2::{Digest, Sha256};
@@ -368,31 +368,7 @@ fn assert_git_parity(expected_repo: &Path, candidate_repo: &Path, sample: &Sampl
 
 #[tokio::test]
 async fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Result<()> {
-    ensure!(!ENABLE_BY_DEFAULT && !ReadAccelConfig::default().enabled);
-    let ctx = test_ctx()?;
-    for format in [ReadAccelObjectFormat::Sha1, ReadAccelObjectFormat::Sha256] {
-        let sample = SampleRepoPacks::seed(format, false)?;
-        let disabled_view = sample.open(&ctx, 1, None, false).await?;
-        ensure!(
-            *disabled_view.status() == ReadAccelSidecarStatus::Disabled
-                && disabled_view.metrics().sidecar_get_attempts == 0
-        );
-        let bundle = sample.build(&ctx, 1, 1, &sample.packs, None).await?;
-        ensure!(bundle.manifest.artifacts.len() == 3);
-        let enabled_view = sample.open(&ctx, 1, Some(&bundle), true).await?;
-        ensure!(
-            *enabled_view.status() == ReadAccelSidecarStatus::Applied && enabled_view.metrics().sidecars_applied == 3
-        );
-        let enabled_path = enabled_view.repo_path()?;
-        git_ok(enabled_path, &["multi-pack-index", "verify"])?;
-        git_ok(enabled_path, &["commit-graph", "verify"])?;
-        ensure!(
-            git_ok(enabled_path, &["rev-list", "--count", "--use-bitmap-index", "--all"])?
-                == git_ok(disabled_view.repo_path()?, &["rev-list", "--count", "--all"])?
-        );
-        assert_git_parity(disabled_view.repo_path()?, enabled_path, &sample)?;
-    }
-    Ok(())
+    blob_read_accel_support::sha1_and_sha256_parity_and_default_disabled_behavior().await
 }
 
 #[tokio::test]
@@ -402,28 +378,5 @@ async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Res
 
 #[tokio::test]
 async fn retention_pin_protects_packs_until_release_and_compaction_rebuild() -> Result<()> {
-    let ctx = test_ctx()?;
-    let sample = SampleRepoPacks::seed(ReadAccelObjectFormat::Sha1, true)?;
-    ensure!(sample.packs.len() >= 2);
-    let registry = PackRetentionRegistry::new();
-    let gen1 = sample.build(&ctx, 1, 1, &sample.packs, Some(registry.clone())).await?;
-    let active_view = sample
-        .open_with_packs(&ctx, 1, &sample.packs, &sample.refs, (Some(&gen1), true), Some(registry.clone()))
-        .await?;
-    ensure!(
-        registry.is_pack_pinned(&sample.packs[0].pack_locator) && registry.is_pack_pinned(&sample.packs[0].idx_locator)
-    );
-    let baseline = sample.open(&ctx, 1, None, false).await?;
-    active_view.reap();
-    ensure!(!registry.is_pack_pinned(&sample.packs[0].pack_locator) && registry.pinned_locator_count() == 0);
-
-    git_ok(sample.work_dir.path(), &["repack", "-ad", "--no-write-bitmap-index"])?;
-    let compacted_packs = sample.collect_and_upload_packs()?;
-    ensure!(compacted_packs.len() == 1);
-    let gen2 = sample.build(&ctx, 2, 2, &compacted_packs, Some(registry)).await?;
-    let gen2_view = sample.open_with_packs(&ctx, 2, &compacted_packs, &sample.refs, (Some(&gen2), true), None).await?;
-    ensure!(*gen2_view.status() == ReadAccelSidecarStatus::Applied);
-    git_ok(gen2_view.repo_path()?, &["multi-pack-index", "verify"])?;
-    assert_git_parity(baseline.repo_path()?, gen2_view.repo_path()?, &sample)?;
-    Ok(())
+    blob_read_accel_support::retention_pin_protects_packs_until_release_and_compaction_rebuild().await
 }
