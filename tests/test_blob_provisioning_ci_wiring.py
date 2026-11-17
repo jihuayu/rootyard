@@ -24,6 +24,7 @@ EXPECTED_CASES = (
     "create_retry_and_service_restart_preserve_head_and_authority",
     "lost_create_ack_proxy_retry_resolves_one_authority",
     "deferred_commit_barrier_kill_rolls_back_and_retry_converges",
+    "backend_identity_conflict_is_explicit_and_preserves_authority",
 )
 DEPENDENCIES = (
     "blob_only_service.py",
@@ -49,7 +50,9 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
                 cases = ast.literal_eval(node.value)
         self.assertEqual(cases, EXPECTED_CASES)
         self.assertIn("FIRST_CHECKPOINT = CASES[:4]", self.harness)
-        self.assertIn("SECOND_CHECKPOINT = CASES[4:]", self.harness)
+        self.assertIn("SECOND_CHECKPOINT = CASES[4:5]", self.harness)
+        self.assertIn("REFUSAL_CHECKPOINT = CASES[5:]", self.harness)
+        self.assertIn('"refusal": list(REFUSAL_CHECKPOINT)', self.harness)
         self.assertIn('assert client_result in ("RemoteDisconnected", "ConnectionReset")', self.harness)
 
     def test_harness_binds_its_own_and_transitive_sources(self) -> None:
@@ -104,6 +107,51 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertNotIn("--case", provisioning)
         self.assertIn("path: test-results/refstore/", self.workflow)
 
+    def test_backend_identity_refusal_checks_the_real_boundary_and_source_mapping(self) -> None:
+        tree = ast.parse(self.harness)
+        functions = {
+            node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        }
+        case_node = functions.get("backend_identity_conflict_is_explicit_and_preserves_authority")
+        self.assertIsNotNone(case_node, "the backend-identity refusal case is missing")
+        case = ast.get_source_segment(self.harness, case_node)
+        # The case must issue the real create request once and assert the exact
+        # closed status/body, not accept a retryable or internal outcome.
+        self.assertIn("self.post_create(", case)
+        self.assertIn("attempts=1", case)
+        self.assertIn("assert refusal_status == 409", case)
+        self.assertIn('"repository state changed; retry"', case)
+        self.assertNotIn("time.sleep", case)
+        # It must compare the full existing authority snapshot before/after the
+        # refused request and restore the original backend before serving Git.
+        self.assertIn("self.authority(repo, name)", case)
+        self.assertIn("after_refusal == before", case)
+        self.assertIn("after_restart == before", case)
+        self.assertIn("self.get_repo_status", case)
+        self.assertIn('"repository is not ready"', case)
+        self.assertIn("self.push_and_clone(repo, name)", case)
+
+        helper_node = functions.get("conflicting_blob_identity_overrides")
+        self.assertIsNotNone(helper_node, "the conflicting backend fixture helper is missing")
+        helper = ast.get_source_segment(self.harness, helper_node)
+        self.assertIn("ROOTYARD_BLOB_ROOT", helper)
+        self.assertIn("uuid.uuid4().hex", helper)
+
+        # The injected boundary is the actual opened-store identity, and the
+        # expected refusal literals are the production mappings. A future source
+        # change that silently reinterprets this case fails here.
+        serving_source = (ROOT / "src" / "ref_store" / "serving.rs").read_text(encoding="utf-8")
+        self.assertIn("binding.backend_identity() != backend.as_hex()", serving_source)
+        self.assertIn('"repository is bound to a different Blob backend"', serving_source)
+        identity_source = (ROOT / "src" / "blob_store" / "backend_identity.rs").read_text(encoding="utf-8")
+        self.assertIn('"root", profile.root()', identity_source)
+        error_source = (ROOT / "src" / "blob_git_gateway" / "error.rs").read_text(encoding="utf-8")
+        conflict = re.search(r'StatusCode::CONFLICT => Self::Conflict\("([^"]+)"\)', error_source)
+        self.assertIsNotNone(conflict, "the gateway 409 mapping is missing")
+        self.assertEqual(conflict.group(1), "repository state changed; retry")
+        session_source = (ROOT / "src" / "blob_git_gateway" / "session.rs").read_text(encoding="utf-8")
+        self.assertIn('StatusCode::CONFLICT => GatewayError::Conflict("repository is not ready")', session_source)
+
     def test_first_checkpoint_stays_first(self) -> None:
         # A reordering that silently turns the independent kill checkpoint into
         # the first thing to run would invalidate the reviewable split.
@@ -114,6 +162,7 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
             "lost_create_ack_proxy_retry_resolves_one_authority",
         ))
         self.assertEqual(EXPECTED_CASES[4], "deferred_commit_barrier_kill_rolls_back_and_retry_converges")
+        self.assertEqual(EXPECTED_CASES[5], "backend_identity_conflict_is_explicit_and_preserves_authority")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,13 @@ Second, independent checkpoint (selected together by default, or alone):
   completes, forces the abandoned transaction to roll back, and proves the
   retry converges on one ready authority.
 
+Refusal checkpoint (selected together by default, or alone):
+
+* the real service is restarted against a fresh, unused Blob root prefix, which
+  is a distinct physical backend identity. A create for an existing bound
+  repository is refused at the production conflict boundary and the catalog,
+  serving intent, readiness and core gate are unchanged.
+
 No SQL inserts a ready repository, binding, gate, protocol row, ref, object or
 ACK. The only fixture SQL writes are a temporary barrier table, a deferred
 constraint trigger and its function in the random schema this run owns; they are
@@ -61,16 +68,19 @@ CASES = (
     "create_retry_and_service_restart_preserve_head_and_authority",
     "lost_create_ack_proxy_retry_resolves_one_authority",
     "deferred_commit_barrier_kill_rolls_back_and_retry_converges",
+    "backend_identity_conflict_is_explicit_and_preserves_authority",
 )
 
 FIRST_CHECKPOINT = CASES[:4]
-SECOND_CHECKPOINT = CASES[4:]
+SECOND_CHECKPOINT = CASES[4:5]
+REFUSAL_CHECKPOINT = CASES[5:]
 
 LIMITATIONS = [
     "Loopback HTTP, one PostgreSQL 17 server and one fixture-owned S3 provider; no Raft, multi-host, HA or physical durability claim.",
     "The retry/restart case kills only this harness's serve-blob process group; it does not claim kernel or power-loss behavior.",
     "The deferred-commit case uses a fixture-owned PostgreSQL deferred constraint trigger, a transaction-scoped advisory barrier and a process SIGKILL; the service's existing 5s statement timeout bounds that window, and the harness kills immediately after observing the barrier. It does not claim PostgreSQL crash recovery.",
     "The ACK-loss case is one real loopback proxy that reads a committed backend 201 and then closes the client connection; it is not exhaustive transport fault injection.",
+    "The backend-identity case restarts the real service against a fresh, unused Blob root prefix and performs no Blob write under that conflicting mapping; it does not claim provider failover or data migration.",
     "No SQL creates a ready repository, binding, gate, protocol row, ref, object or acknowledgment. SQL reads authority state and writes only the temporary barrier in this run's random schema.",
     "The temporary barrier trigger/function/table are dropped in a bounded finally block; transaction-scoped advisory locks are released by PostgreSQL on commit/abort.",
     "Concurrency is a small bounded request group on one process, not a scalability benchmark.",
@@ -209,6 +219,17 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
         self.env["ROOTYARD_MAX_CONCURRENT_GIT"] = "8"
         self.barrier_key = None
         self.barrier_schema = '"' + self.schema + '"'
+
+    def conflicting_blob_identity_overrides(self):
+        """One unused root prefix selects a different physical Blob identity.
+
+        ``BlobBackendIdentity`` includes the configured root prefix, so this is
+        a real distinct backend mapping without changing the provider, bucket,
+        credentials or any shared object. The value stays out of the report.
+        """
+        prefix = self.env.get("ROOTYARD_BLOB_ROOT", "").strip("/")
+        root = (prefix + "/" if prefix else "") + "identity-conflict-" + uuid.uuid4().hex
+        return {"ROOTYARD_BLOB_ROOT": root}
 
     # -- native Git helpers -------------------------------------------------
     def push_and_clone(self, repo, label, object_format="sha1", files=None):
@@ -750,6 +771,67 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
                 "client_result": type(thread_error["value"]).__name__,
                 "retry_status": status, "authority": facts, "ack_oid": oid, "clone_fsck": True}
 
+    def backend_identity_conflict_is_explicit_and_preserves_authority(self):
+        name = "backend-identity-conflict"
+        repo, created_status = self.create(name, self.alice)
+        assert created_status in (201, 202)
+        before = self.authority(repo, name)
+        original_pid = self.proc.pid
+        # Stop cleanly so the owned data-volume lock is released before the
+        # same real binary is restarted with another Blob identity.
+        self.stop(hard=False)
+        conflicting_pid = None
+        refusal_status = None
+        refusal_error = None
+        lookup_status = None
+        lookup_error = None
+        try:
+            self.start(overrides=self.conflicting_blob_identity_overrides(),
+                       label="conflicting-blob-identity")
+            conflicting_pid = self.proc.pid
+            assert conflicting_pid != original_pid
+            # This is the same real create request on the same bound name. The
+            # production check compares the stored binding identity with the
+            # identity of the store this process actually opened.
+            refusal_status, refusal_raw, _ = self.post_create(
+                {"owner": "alice", "name": name, "object_format": "sha1"}, attempts=1)
+            assert refusal_status == 409, (
+                "conflicting Blob backend create was not explicitly refused: " + str(refusal_status))
+            refusal = json.loads(refusal_raw)
+            # The gateway collapses every provisioning 409 into this fixed,
+            # closed literal (src/blob_git_gateway/error.rs); it never echoes a
+            # backend digest or SQL text.
+            assert refusal == {"error": "repository state changed; retry"}, refusal
+            refusal_error = refusal["error"]
+            after_refusal = self.authority(repo, name)
+            assert after_refusal == before, "backend-identity refusal changed the durable authority"
+            # The same binding cannot be served by the conflicting backend
+            # either. This is a closed "not ready" lookup refusal, not a 200.
+            lookup_status, lookup_raw, _ = self.get_repo_status("alice", name)
+            assert lookup_status == 409, (
+                "bound repository was served under a different Blob backend: " + str(lookup_status))
+            lookup = json.loads(lookup_raw)
+            assert lookup == {"error": "repository is not ready"}, lookup
+            lookup_error = lookup["error"]
+        finally:
+            self.stop(hard=True)
+        # Restore the original backend and prove the durable authority and real
+        # Git serving path still work; the refusal was not a partial deletion.
+        self.start(label="after-backend-identity-conflict")
+        assert self.proc.pid != conflicting_pid
+        after_restart = self.authority(repo, name)
+        assert after_restart == before, "authority changed after restoring the original Blob backend"
+        got = json.loads(self.expect("/api/repos/alice/" + name, 200, token=self.alice))
+        assert got["id"] == repo["id"] and got["state"] == "ready", got
+        oid = self.push_and_clone(repo, name)
+        return {"repository_id": repo["id"],
+                "conflicting_backend_service_restarted": True,
+                "refusal_status": refusal_status, "refusal_error": refusal_error,
+                "lookup_status": lookup_status, "lookup_error": lookup_error,
+                "authority_counts": before["counts"], "gate_revision": before["gate_revision"],
+                "authority_unchanged": True, "original_backend_restored": True,
+                "restored_status": 200, "ack_oid": oid, "clone_fsck": True}
+
 
 def report_result(harness, profile, blob_profile, selected, success, hashes):
     errors = []
@@ -781,7 +863,7 @@ def report_result(harness, profile, blob_profile, selected, success, hashes):
         "git_sha256": profile.git_sha256,
         "blob_profile": blob_profile,
         "checkpoints": {"first": list(FIRST_CHECKPOINT), "second": list(SECOND_CHECKPOINT),
-                        "selected": list(selected)},
+                        "refusal": list(REFUSAL_CHECKPOINT), "selected": list(selected)},
         "expected_cases": list(selected),
         "case_count": len(harness.results),
         "expected_count": len(selected),
