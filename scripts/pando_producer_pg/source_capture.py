@@ -212,6 +212,8 @@ def capture_bounded(
         raise
     except Exception:
         raise RunnerError("source", "source_capture_failed") from None
+    if getattr(completed, "output_exceeded", False):
+        raise RunnerError("source", "source_capture_failed")
     raw = getattr(completed, "stdout", b"") or b""
     if not isinstance(raw, (bytes, bytearray)) or len(raw) > MAX_BINDING_BYTES:
         raise RunnerError("source", "source_capture_failed")

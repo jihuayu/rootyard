@@ -312,6 +312,16 @@ class ProcessRunner:
             raise self._cleanup_failure(
                 process, entries, stage, "process_unreaped"
             ) from None
+        # Readers can discover overflow/error while the bounded join is still
+        # finishing.  Re-check after the join, before closing or returning.
+        if budget.reader_error or (writer is not None and writer.failed):
+            raise self._cleanup_failure(
+                process, entries, stage, "process_failed"
+            ) from None
+        if fail_on_output_exceeded and budget.exceeded:
+            raise self._cleanup_failure(
+                process, entries, stage, output_code
+            ) from None
         self._close_streams(process)
         if type(process.returncode) is not int:
             raise RunnerError(stage, "process_failed")

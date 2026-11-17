@@ -188,6 +188,7 @@ class BoundedCaptureTest(unittest.TestCase):
             Completed([], 0, b"not-json", b""),
             Completed([], 0, b"x" * (source_capture.MAX_BINDING_BYTES + 1), b""),
             Completed([], 1, success_payload(), b""),
+            Completed([], 0, success_payload(), b"", output_exceeded=True),
             Completed([], 0, b'{"ok":false,"stage":"source","code":"raw text"}', b""),
         ):
             fake = FakeRunner([response])

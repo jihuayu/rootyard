@@ -59,6 +59,33 @@ class NoRunThread(FakeThread):
         self.run_target = False
 
 
+class DeferredThread(FakeThread):
+    """Reader does not run until join, reproducing late drain interleavings."""
+
+    def start(self):
+        self.started = True
+        self.alive = True
+
+    def join(self, timeout=None):
+        if not self.joined:
+            self.joined = True
+            try:
+                self.target()
+            finally:
+                self.alive = False
+
+
+class LateErrorStream:
+    def __init__(self):
+        self.closed = False
+
+    def read(self, size):
+        raise OSError("late reader failure")
+
+    def close(self):
+        self.closed = True
+
+
 class StartFailThread(FakeThread):
     def start(self):
         raise RuntimeError("reader start failed")
@@ -194,6 +221,64 @@ class StreamingBudgetTest(unittest.TestCase):
         self.assertEqual(result.returncode, 7)
         self.assertEqual(result.stdout, b"out")
         self.assertEqual(fake.stdin.getvalue(), b"schema")
+
+
+class DeferredDrainTest(unittest.TestCase):
+    def test_deferred_overflow_during_join_cannot_be_accepted(self):
+        fake = StreamingPopen(
+            stdout=b'{"ok":true}\n', stderr=b"x" * 2048
+        )
+        group = GroupKiller()
+        runner = process.ProcessRunner(
+            popen=lambda *args, **kwargs: fake,
+            thread_factory=DeferredThread,
+            killpg=group,
+        )
+        with self.assertRaises(RunnerError) as caught:
+            runner.run(
+                ["fixture"],
+                timeout=5,
+                max_stdout=1024,
+                max_stderr=1024,
+                max_total=1024,
+                fail_on_output_exceeded=True,
+                output_code="source_capture_failed",
+            )
+        self.assertEqual(caught.exception.code, "source_capture_failed")
+        self.assertTrue(fake.killed)
+        self.assertIsNotNone(fake.poll())
+
+    def test_deferred_reader_error_during_join_cannot_be_accepted(self):
+        fake = StreamingPopen(stdout=b'{"ok":true}\n')
+        fake.stderr = LateErrorStream()
+        runner = process.ProcessRunner(
+            popen=lambda *args, **kwargs: fake,
+            thread_factory=DeferredThread,
+            killpg=GroupKiller(),
+        )
+        with self.assertRaises(RunnerError) as caught:
+            runner.run(["fixture"], timeout=5)
+        self.assertEqual(caught.exception.code, "process_failed")
+        self.assertTrue(fake.killed)
+
+    def test_deferred_overflow_ordinary_mode_keeps_truncation(self):
+        fake = StreamingPopen(
+            stdout=b'{"ok":true}\n', stderr=b"x" * 2048
+        )
+        result = process.ProcessRunner(
+            popen=lambda *args, **kwargs: fake,
+            thread_factory=DeferredThread,
+            killpg=GroupKiller(),
+        ).run(
+            ["fixture"],
+            timeout=5,
+            max_stdout=1024,
+            max_stderr=1024,
+            max_total=1024,
+        )
+        self.assertTrue(result.output_exceeded)
+        self.assertLessEqual(len(result.stdout) + len(result.stderr), 1024)
+        self.assertFalse(fake.killed)
 
 
 class GroupOwnershipTest(unittest.TestCase):
