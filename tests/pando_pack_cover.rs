@@ -31,9 +31,10 @@ fn s3() -> &'static (String, S3Map) {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
             rt.block_on(async move {
-                let _ = tx.send(());
+                let listener = tokio::net::TcpListener::from_std(l).unwrap();
                 let svc = Router::new().fallback(handle_s3).with_state(st);
-                let _ = axum::serve(tokio::net::TcpListener::from_std(l).unwrap(), svc).await;
+                let _ = tx.send(());
+                let _ = axum::serve(listener, svc).await;
             });
         });
         rx.recv().unwrap();
@@ -43,32 +44,33 @@ fn s3() -> &'static (String, S3Map) {
 
 async fn handle_s3(State(objs): State<S3Map>, m: Method, uri: Uri, body: bytes::Bytes) -> Response {
     let key = uri.path().trim_start_matches('/').to_owned();
-    if !key.contains('/') {
-        return Response::new(Body::from("<ListBucketResult/>"));
-    }
     let rsp = |st, d: &[u8], b| {
-        let et = format!("\"{}\"", &hex::encode(Sha256::digest(d))[..32]);
-        Response::builder().status(st).header(header::CONTENT_LENGTH, d.len()).header(header::ETAG, et).body(b).unwrap()
+        let mut r = Response::builder().status(st).header(header::CONTENT_LENGTH, d.len());
+        if st == StatusCode::OK {
+            r = r.header(header::ETAG, format!("\"{}\"", &hex::encode(Sha256::digest(d))[..32]));
+        }
+        r.body(b).unwrap()
     };
-    if m == Method::PUT {
+    let mut res = if !key.contains('/') {
+        Response::new(Body::from("<ListBucketResult/>"))
+    } else if m == Method::PUT {
         let v = body.to_vec();
         objs.lock().unwrap().insert(key, v.clone());
-        return rsp(StatusCode::OK, &v, Body::empty());
-    }
-    match objs.lock().unwrap().get(&key).cloned() {
-        Some(d) => rsp(StatusCode::OK, &d, if m == Method::HEAD { Body::empty() } else { Body::from(d.clone()) }),
-        None => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_LENGTH, 0)
-            .body(Body::empty())
-            .unwrap(),
-    }
+        rsp(StatusCode::OK, &v, Body::empty())
+    } else {
+        match objs.lock().unwrap().get(&key).cloned() {
+            Some(d) => rsp(StatusCode::OK, &d, if m == Method::HEAD { Body::empty() } else { Body::from(d.clone()) }),
+            None => rsp(StatusCode::NOT_FOUND, &[], Body::empty()),
+        }
+    };
+    res.headers_mut().insert(header::CONNECTION, header::HeaderValue::from_static("close"));
+    res
 }
 
 fn open_s3_store() -> Result<BlobStore> {
     let ((ep, _), _g) = (s3(), ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner()));
     let s = format!(
-        "DRIVER=opendal SERVICE=s3 BUCKET=pc-b REGION=us-east-1 ROOT=r ACCESS_KEY_ID=ak SECRET_ACCESS_KEY=sk ENCRYPTION_MODE=provider-managed RETRY_MAX_TIMES=0 MAX_OBJECT_BYTES=8388608 ENDPOINT={ep}"
+        "DRIVER=opendal SERVICE=s3 BUCKET=pc-b REGION=us-east-1 ROOT=r ACCESS_KEY_ID=ak SECRET_ACCESS_KEY=sk ENCRYPTION_MODE=provider-managed RETRY_MAX_TIMES=3 MAX_OBJECT_BYTES=8388608 ENDPOINT={ep}"
     );
     // SAFETY: serialized via ENV_LOCK; this integration test binary only targets Loopback S3.
     unsafe {
