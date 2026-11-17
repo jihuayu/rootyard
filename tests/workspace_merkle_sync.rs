@@ -442,19 +442,17 @@ async fn authz_tenant_isolation_history_fence_pins_gc_and_backup_restore() -> Re
     );
 
     let (dl, staging) = (Instant::now() + Duration::from_secs(30), h.dir.path().join("staging"));
-    let ck = h.s3.objects.lock().unwrap().keys().find(|k| k.contains("merkle-chunk")).unwrap().clone();
+    let exp = || {
+        ms::backup_restore::export_checkpoint_backup(&ctx_a, &h.auth, &h.store, &h.ledger, &h.holds, cp_a, &staging, dl)
+    };
+    let t_pat = format!("tenants/{}/", ctx_a.tenant_id);
+    let ck =
+        h.s3.objects.lock().unwrap().keys().find(|k| k.contains(&t_pat) && k.contains("merkle-chunk")).unwrap().clone();
     let saved_ck = h.s3.objects.lock().unwrap().remove(&ck).unwrap();
     let active_before_exp = h.holds.active_hold_count();
-    let exp_err = ms::backup_restore::export_checkpoint_backup(
-        &ctx_a, &h.auth, &h.store, &h.ledger, &h.holds, cp_a, &staging, dl,
-    )
-    .await;
-    ensure!(exp_err.is_err() && h.holds.active_hold_count() == active_before_exp);
+    ensure!(exp().await.is_err() && h.holds.active_hold_count() == active_before_exp);
     h.s3.objects.lock().unwrap().insert(ck, saved_ck);
-    let (backup, backup_hold) = ms::backup_restore::export_checkpoint_backup(
-        &ctx_a, &h.auth, &h.store, &h.ledger, &h.holds, cp_a, &staging, dl,
-    )
-    .await?;
+    let (backup, backup_hold) = exp().await?;
     let (ab_s, ab_b) =
         h.scan_only(&ctx_a, &repo_a, ms::EmptyDirPolicy::IgnoreEmptyDirs, None, ms::DirtyScope::FullRescan)?;
     let _ =
