@@ -93,14 +93,15 @@ def summary(status="ok", passed=1, failed=0, ignored=0):
             f"{ignored} ignored; 0 measured; 0 filtered out; finished in 0.01s")
 
 
-def project(output, returncode=101, **changes):
+def project(output, returncode=101, stderr=b"", **changes):
     options = {
         "timed_out": False,
         "phase": "run",
         "selected_case": inventory.TARGETS[TARGET]["cases"][0],
     }
     options.update(changes)
-    return runner.project_target_failure(TARGET, output, returncode, **options)
+    return runner.project_target_failure(
+        TARGET, output, returncode, stderr=stderr, **options)
 
 
 class ProjectionParserTests(unittest.TestCase):
@@ -200,13 +201,15 @@ class ProjectionParserTests(unittest.TestCase):
         cases = inventory.TARGETS[TARGET]["cases"]
         output = "\n".join([
             case_line(cases[0], "FAILED"),
+            summary("FAILED", 0, 1, 0),
+        ]).encode()
+        stderr = "\n".join([
             "thread 'x' panicked at tests/ref_store_pack_snapshots.rs:123:45:",
             "thread 'x' panicked at /tmp/outside.rs:9:1:",
             "thread 'x' panicked at tests/not_an_inventory_file.rs:4:2:",
             "thread 'x' panicked at tests/ref_store_operations.rs:0:1:",
-            summary("FAILED", 0, 1, 0),
         ]).encode()
-        diag = project(output)
+        diag = project(output, stderr=stderr)
         self.assertEqual(diag["source_locations"],
                          [{"file": "tests/ref_store_pack_snapshots.rs", "line": 123}])
         self.assertLessEqual(len(diag["source_locations"]),
@@ -219,10 +222,11 @@ class ProjectionParserTests(unittest.TestCase):
 
     def test_source_location_count_is_bounded(self):
         cases = inventory.TARGETS[TARGET]["cases"]
-        lines = [case_line(cases[0], "FAILED")]
-        lines.extend("thread 'x' panicked at tests/ref_store_operations.rs:%d:1:"
-                     % (index + 1) for index in range(20))
-        diag = project("\n".join(lines).encode())
+        output = (case_line(cases[0], "FAILED") + "\n" + summary("FAILED", 0, 1, 0)).encode()
+        stderr = "\n".join(
+            "thread 'x' panicked at tests/ref_store_operations.rs:%d:1:"
+            % (index + 1) for index in range(20)).encode()
+        diag = project(output, stderr=stderr)
         self.assertEqual(len(diag["source_locations"]),
                          runner.MAX_SOURCE_LOCATIONS)
         self.assertEqual(diag["source_locations"][0],
@@ -232,16 +236,16 @@ class ProjectionParserTests(unittest.TestCase):
         cases = inventory.TARGETS[TARGET]["cases"]
         output = "\n".join([
             case_line(cases[0], "FAILED"),
-            "thread 'x' panicked at tests/ref_store_operations.rs:7:3:",
             summary("FAILED", 0, 1, 0),
         ]).encode()
-        failed = project(output, returncode=-9, timed_out=False)
+        stderr = b"thread 'x' panicked at tests/ref_store_operations.rs:7:3:\n"
+        failed = project(output, stderr=stderr, returncode=-9, timed_out=False)
         self.assertEqual(failed["error_class"], "native_process_failed")
         self.assertEqual(failed["exit"]["returncode"], -9)
         self.assertEqual(failed["exit"]["signal"], 9)
         self.assertEqual(failed["exit"]["signal_name"], "SIGKILL")
         self.assertFalse(failed["timed_out"])
-        timed = project(output, returncode=-9, timed_out=True)
+        timed = project(output, stderr=stderr, returncode=-9, timed_out=True)
         self.assertEqual(timed["error_class"], "native_timeout")
         self.assertTrue(timed["timed_out"])
         self.assertEqual(timed["exit"]["signal_name"], "SIGKILL")
@@ -262,14 +266,16 @@ class ProjectionParserTests(unittest.TestCase):
         cases = inventory.TARGETS[TARGET]["cases"]
         output = "\n".join([
             case_line(cases[0], "FAILED"),
+            summary("FAILED", 0, 1, 0),
+        ]).encode()
+        stderr = "\n".join([
             SECRET,
             SQL,
             DSN,
             "thread 'x' panicked at tests/ref_store_operations.rs:11:2:",
             "panic statement: " + SECRET,
-            summary("FAILED", 0, 1, 0),
         ]).encode()
-        diag = project(output, returncode=101)
+        diag = project(output, stderr=stderr, returncode=101)
         serialized = json.dumps(diag, sort_keys=True)
         for forbidden in (SECRET, SQL, DSN, "panic statement", "supersecret"):
             self.assertNotIn(forbidden, serialized)
@@ -286,30 +292,35 @@ class BoundedFailureProjectionTests(unittest.TestCase):
 
     def test_nonzero_attaches_safe_diagnostic_and_outer_code(self):
         cases = inventory.TARGETS[TARGET]["cases"]
-        payload = "\n".join([
+        output = "\n".join([
             case_line(cases[0], "FAILED"),
-            "thread 'x' panicked at tests/ref_store_operations.rs:19:4:",
-            SECRET,
             summary("FAILED", 0, 1, 0),
         ]).encode()
-        process = FakeProcess(payload, returncode=101)
-        projector = lambda output, _stderr, code, timed_out: runner.project_target_failure(
+        stderr = "\n".join([
+            "thread 'x' panicked at tests/ref_store_operations.rs:19:4:",
+            SECRET,
+        ]).encode()
+        process = FakeProcess(output, stderr=stderr, returncode=101)
+        projector = lambda output, stderr, code, timed_out: runner.project_target_failure(
             TARGET, output, code, timed_out=timed_out, phase="run",
-            selected_case=cases[0])
+            selected_case=cases[0], stderr=stderr)
         with mock.patch.object(runner.subprocess, "Popen", return_value=process):
             with self.assertRaises(runner.RunnerError) as raised:
                 runner.run_bounded(["fake"], timeout=1, failure_projector=projector)
         error = raised.exception
         self.assertEqual(error.code, "native_process_failed")
         self.assertIsInstance(error.diagnostic, dict)
+        self.assertEqual(error.diagnostic["source_locations"],
+                         [{"file": "tests/ref_store_operations.rs", "line": 19}])
         self.assertFalse(hasattr(error, "output"))
         self.assertFalse(hasattr(error, "stdout"))
         self.assertNotIn(SECRET, json.dumps(error.diagnostic))
 
     def test_timeout_keeps_native_timeout_code_and_diagnostic(self):
         process = FakeProcess(b"test secret ... failed\n", returncode=-9, timeout=True)
-        projector = lambda output, _stderr, code, timed_out: runner.project_target_failure(
-            TARGET, output, code, timed_out=timed_out, phase="list")
+        projector = lambda output, stderr, code, timed_out: runner.project_target_failure(
+            TARGET, output, code, timed_out=timed_out, phase="list",
+            stderr=stderr)
         with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
              mock.patch.object(runner.os, "getpgid", return_value=4242), \
              mock.patch.object(runner.os, "killpg"):
@@ -512,15 +523,17 @@ class AcceptanceFailureReportTests(unittest.TestCase):
         name = command[1]
         failing_name = inventory.TARGETS[target]["cases"][self.fail_case_index]
         if target == FAIL_TARGET and name == failing_name:
-            payload = "\n".join([
+            output = "\n".join([
                 case_line(name, "FAILED"),
+                summary("FAILED", 0, 1, 0),
+            ]).encode()
+            stderr = "\n".join([
                 "thread 'x' panicked at tests/ref_store_pack_snapshots.rs:42:9:",
                 SECRET,
                 SQL,
                 DSN,
-                summary("FAILED", 0, 1, 0),
             ]).encode()
-            return FakeProcess(payload, returncode=101)
+            return FakeProcess(output, stderr=stderr, returncode=101)
         payload = "\n".join([case_line(name, "ok"), summary("ok", 1, 0, 0)]).encode()
         return FakeProcess(payload, returncode=0)
 
@@ -671,11 +684,12 @@ class MetadataReplayTraceTests(unittest.TestCase):
             iteration, error_kind,
         ])
 
-    def _project(self, lines, **changes):
+    def _project(self, lines, stdout=b"", **changes):
         options = {"phase": "run", "selected_case": self.case}
         options.update(changes)
         payload = ("\n".join(lines) + ("\n" if lines else "")).encode()
-        return runner.project_target_failure(self.target, payload, 101, **options)
+        return runner.project_target_failure(
+            self.target, stdout, 101, stderr=payload, **options)
 
     def test_valid_frame_survives_projection_safe_rebuild_and_attach(self):
         lines = [
@@ -720,9 +734,9 @@ class MetadataReplayTraceTests(unittest.TestCase):
         lines = [
             self._frame(18, 2, 0),
             self._frame(18, 2, 1, ok="0", status="500"),
-            summary("ok", 1, 0, 0),
         ]
-        diag = self._project(lines)
+        diag = self._project(
+            lines, stdout=(summary("ok", 1, 0, 0) + "\n").encode())
         trace = diag["case_trace"]
         self.assertTrue(trace["known"])
         self.assertEqual(trace["first_failure"]["event"], 1)
@@ -772,8 +786,9 @@ class MetadataReplayTraceTests(unittest.TestCase):
     def test_truncated_frame_is_incomplete_not_a_completion(self):
         diag = runner.project_target_failure(
             self.target,
-            self._frame(17, 1, 0).encode(),
+            b"",
             101,
+            stderr=self._frame(17, 1, 0).encode(),
             phase="run",
             selected_case=self.case,
         )
@@ -808,7 +823,8 @@ class MetadataReplayTraceTests(unittest.TestCase):
         self.assertIsNone(self._project(lines, selected_case=inventory.TARGETS[self.target]["cases"][1])["case_trace"])
         other = inventory.TARGETS[TARGET]["cases"][0]
         diag = runner.project_target_failure(
-            TARGET, ("\n".join(lines) + "\n").encode(), 101,
+            TARGET, b"", 101,
+            stderr=("\n".join(lines) + "\n").encode(),
             phase="run", selected_case=other)
         self.assertIsNone(diag["case_trace"])
 

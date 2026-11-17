@@ -559,6 +559,13 @@ def _metadata_replay_unknown(invalid=False):
     }
 
 
+METADATA_REPLAY_TRACE_KEYS = frozenset(_metadata_replay_unknown())
+METADATA_REPLAY_FRAME_KEYS = frozenset({
+    "phase", "site", "phase_name", "site_name", "event", "ok", "status",
+    "counts", "checks", "iteration", "error_kind",
+})
+
+
 def _metadata_replay_location(phase, site):
     names = METADATA_REPLAY_SITES.get((phase, site))
     if names is None:
@@ -769,6 +776,8 @@ def _safe_metadata_replay_checks(value):
 def _safe_metadata_replay_frame(value):
     if not isinstance(value, dict):
         raise ValueError
+    if set(value) != METADATA_REPLAY_FRAME_KEYS:
+        raise ValueError
     phase = value.get("phase")
     site = value.get("site")
     if isinstance(phase, bool) or not isinstance(phase, int) or not 1 <= phase <= MAX_METADATA_REPLAY_PHASE:
@@ -815,6 +824,8 @@ def _safe_metadata_replay_trace(raw):
     """Rebuild the checkpoint from fixed fields before persistence."""
     if not isinstance(raw, dict) or raw.get("protocol") != METADATA_REPLAY_PROTOCOL:
         return None
+    if set(raw) != METADATA_REPLAY_TRACE_KEYS:
+        return _metadata_replay_unknown(invalid=True)
     try:
         frames = _safe_metadata_replay_optional_int(raw.get("frames"), 0, METADATA_REPLAY_MAX_FRAMES)
         if frames is None:
@@ -937,16 +948,18 @@ def _failure_base(context, returncode, timed_out):
 
 
 def project_target_failure(target, output, returncode, *, timed_out=False,
-                           phase="run", selected_case=None):
-    """Project captured child output into a fixed, privacy-preserving shape.
+                           phase="run", selected_case=None, stderr=None):
+    """Project separate stdout/stderr captures into a fixed safe shape.
 
     This is a pure RAM-only parser: it performs no IO, starts no process and
     never retries or extends a deadline.  Phase and selected case are supplied
-    by the caller and are never inferred from argv or child output.  Only case
-    names that are byte-equal to the frozen inventory, finite numeric counts,
-    fixed error/signal labels, and repo-relative paths from
-    ``SOURCE_ALLOWLIST`` are retained.  Everything else is dropped or counted
-    as unknown, never as success.
+    by the caller and are never inferred from argv or child output.  Libtest
+    rows and summaries are read only from stdout; metadata frames and panic
+    source locations are read only from stderr.  Only case names that are
+    byte-equal to the frozen inventory, finite numeric counts, fixed
+    error/signal labels, and repo-relative paths from ``SOURCE_ALLOWLIST`` are
+    retained.  Everything else is dropped or counted as unknown, never as
+    success.
     """
     context = _normalize_failure_context(target, phase, selected_case)
     diagnostic = _failure_base(context, returncode, timed_out)
@@ -964,7 +977,10 @@ def project_target_failure(target, output, returncode, *, timed_out=False,
     summary_count = 0
     reported_summary = None
 
+    if stderr is None:
+        stderr = b""
     text = output.decode("utf-8", "replace")
+    stderr_text = stderr.decode("utf-8", "replace")
     metadata_replay_enabled = (
         context["target"] == METADATA_REPLAY_TARGET
         and context["phase"] == "run"
@@ -972,30 +988,13 @@ def project_target_failure(target, output, returncode, *, timed_out=False,
         and context["selected_case_known"]
     )
     if metadata_replay_enabled:
-        diagnostic["case_trace"] = _parse_metadata_replay_trace(text)
+        diagnostic["case_trace"] = _parse_metadata_replay_trace(stderr_text)
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         if len(line) > MAX_DIAGNOSTIC_LINE_CHARS:
             line = line[:MAX_DIAGNOSTIC_LINE_CHARS]
-
-        if len(source_locations) < MAX_SOURCE_LOCATIONS:
-            for path in SOURCE_ALLOWLIST:
-                if path not in line:
-                    continue
-                match = re.search(
-                    re.escape(path) + r":([1-9][0-9]{0,7})(?::[0-9]{1,7})?", line)
-                if match is None:
-                    continue
-                line_number = int(match.group(1))
-                key = (path, line_number)
-                if line_number > MAX_SOURCE_LINE or key in source_seen:
-                    continue
-                source_seen.add(key)
-                source_locations.append({"file": path, "line": line_number})
-                if len(source_locations) >= MAX_SOURCE_LOCATIONS:
-                    break
 
         if line.startswith("test result:"):
             match = _SUMMARY_LINE.match(line)
@@ -1039,6 +1038,29 @@ def project_target_failure(target, output, returncode, *, timed_out=False,
                 "ignored": "ignored",
                 "bench": "unknown",
             }[token]
+
+    for raw_line in stderr_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if len(line) > MAX_DIAGNOSTIC_LINE_CHARS:
+            line = line[:MAX_DIAGNOSTIC_LINE_CHARS]
+        if len(source_locations) < MAX_SOURCE_LOCATIONS:
+            for path in SOURCE_ALLOWLIST:
+                if path not in line:
+                    continue
+                match = re.search(
+                    re.escape(path) + r":([1-9][0-9]{0,7})(?::[0-9]{1,7})?", line)
+                if match is None:
+                    continue
+                line_number = int(match.group(1))
+                key = (path, line_number)
+                if line_number > MAX_SOURCE_LINE or key in source_seen:
+                    continue
+                source_seen.add(key)
+                source_locations.append({"file": path, "line": line_number})
+                if len(source_locations) >= MAX_SOURCE_LOCATIONS:
+                    break
 
     ordered = [
         {"name": name, "status": case_rows[name]}
@@ -1180,9 +1202,11 @@ def run_bounded(command, timeout, env=None, failure_projector=None,
                 except subprocess.TimeoutExpired:
                     _fail("cleanup_unresolved")
         finally:
-            _close_stream(process.stdout)
-            _close_stream(process.stderr)
-            _join_readers(readers)
+            try:
+                _join_readers(readers)
+            finally:
+                _close_stream(process.stdout)
+                _close_stream(process.stderr)
     _require(not capture.truncated, "native_output_too_large")
     if timed_out or process.returncode != 0:
         code = "native_timeout" if timed_out else "native_process_failed"
@@ -1202,7 +1226,8 @@ def run_bounded(command, timeout, env=None, failure_projector=None,
                     context["target"], bytes(capture.stdout),
                     process.returncode, timed_out=timed_out,
                     phase=context["phase"],
-                    selected_case=context["selected_case"])
+                    selected_case=context["selected_case"],
+                    stderr=bytes(capture.stderr))
             except Exception:
                 # Context survives even if the parser itself fails.
                 diagnostic = _failure_base(
