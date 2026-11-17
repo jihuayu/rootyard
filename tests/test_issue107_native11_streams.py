@@ -488,14 +488,32 @@ class ProjectionStreamTests(unittest.TestCase):
         return runner.project_target_failure(
             META_TARGET, stdout, 101, stderr=stderr, **options)
 
+    def historical(self, packs=1, assert_ok=True, finish=True):
+        lines = [
+            frame(17, 1, 0),
+            frame(17, 3, 0), frame(17, 3, 1, ok="1"),
+            frame(17, 4, 0), frame(17, 4, 1, ok="1"),
+        ]
+        for _ in range(packs):
+            for site in (5, 7, 6, 8):
+                lines.extend([frame(17, site, 0),
+                              frame(17, site, 1, ok="1")])
+        lines.extend([
+            frame(17, 9, 0), frame(17, 9, 1, ok="1"),
+            frame(17, 1, 1, ok="1"),
+            frame(17, 2, 0),
+        ])
+        if assert_ok:
+            lines.append(frame(17, 2, 1, ok="1"))
+        else:
+            lines.append(frame(17, 2, 2, ok="0", status="404"))
+        if finish:
+            lines.extend([frame(24, 1, 0), frame(24, 1, 1, ok="1")])
+        return lines
+
     def test_stdout_success_row_and_stderr_frame_are_independent(self):
         stdout = (f"test {META_CASE} ... ok\n{summary()}\n").encode()
-        stderr = "\n".join([
-            frame(17, 1, 0),
-            frame(17, 1, 1, ok="1"),
-            frame(24, 1, 0),
-            frame(24, 1, 1, ok="1"),
-        ]).encode() + b"\n"
+        stderr = ("\n".join(self.historical(packs=1)) + "\n").encode()
         runner.parse_case_result(stdout, META_CASE)
         diag = self.project(stdout, stderr)
         self.assertEqual([row["status"] for row in diag["cases"]], ["passed"])
@@ -545,7 +563,7 @@ class ProjectionStreamTests(unittest.TestCase):
 
     def test_rejected_frames_and_safe_rebuild_never_retain_text(self):
         valid = self.project(
-            stderr=(frame(17, 1, 0) + "\n" + frame(17, 1, 1, ok="1") + "\n").encode()
+            stderr=("\n".join(self.historical(packs=1)) + "\n").encode()
         )["case_trace"]
         self.assertTrue(valid["known"])
         unknown = dict(valid)
@@ -576,7 +594,7 @@ class ProjectionStreamTests(unittest.TestCase):
             self.assertNotIn(SECRET, json.dumps(diag, sort_keys=True))
 
     def test_metadata_gate_rejects_wrong_target_and_case(self):
-        stderr = (frame(17, 1, 0) + "\n" + frame(17, 1, 1, ok="1") + "\n").encode()
+        stderr = ("\n".join(self.historical(packs=1)) + "\n").encode()
         diag = runner.project_target_failure(
             "ref_store_operations", b"", 101, stderr=stderr,
             phase="run", selected_case=inventory.TARGETS[

@@ -692,23 +692,75 @@ class MetadataReplayTraceTests(unittest.TestCase):
         return runner.project_target_failure(
             self.target, stdout, 101, stderr=payload, **options)
 
-    def test_valid_frame_survives_projection_safe_rebuild_and_attach(self):
+    def _historical_parent_success(self, packs=2):
         lines = [
             self._frame(17, 1, 0),
-            self._frame(17, 1, 1, ok="1"),
-            self._frame(17, 2, 0),
-            self._frame(17, 2, 2, ok="0", status="404"),
-            self._frame(18, 1, 0),
-            self._frame(18, 1, 1, ok="1", counts="1,2,3,4,5"),
-            self._frame(24, 1, 0),
-            self._frame(24, 1, 1, ok="1"),
+            self._frame(17, 3, 0),
+            self._frame(17, 3, 1, ok="1"),
+            self._frame(17, 4, 0),
+            self._frame(17, 4, 1, ok="1"),
         ]
+        for _ in range(packs):
+            for site in (5, 7, 6, 8):
+                lines.extend([
+                    self._frame(17, site, 0),
+                    self._frame(17, site, 1, ok="1"),
+                ])
+        lines.extend([
+            self._frame(17, 9, 0),
+            self._frame(17, 9, 1, ok="1"),
+            self._frame(17, 1, 1, ok="1"),
+        ])
+        return lines
+
+    def _historical_assert(self, lines, ok=True, status=""):
+        lines.append(self._frame(17, 2, 0))
+        if ok:
+            lines.append(self._frame(17, 2, 1, ok="1", status=status))
+        else:
+            lines.append(self._frame(17, 2, 2, ok="0", status=status))
+        return lines
+
+    def _finish(self, ok=True):
+        return [
+            self._frame(24, 1, 0),
+            self._frame(24, 1, 1, ok="1" if ok else "0"),
+        ]
+
+    def _historical_failure_prefix(self, fail_site, packs=2):
+        lines = [self._frame(17, 1, 0)]
+        if fail_site == 3:
+            return lines
+        lines.extend([
+            self._frame(17, 3, 0),
+            self._frame(17, 3, 1, ok="1"),
+        ])
+        if fail_site == 4:
+            return lines
+        lines.extend([
+            self._frame(17, 4, 0),
+            self._frame(17, 4, 1, ok="1"),
+        ])
+        for _ in range(packs):
+            for site in (5, 7, 6, 8):
+                if site == fail_site:
+                    return lines
+                lines.extend([
+                    self._frame(17, site, 0),
+                    self._frame(17, site, 1, ok="1"),
+                ])
+        return lines
+
+    def test_valid_frame_survives_projection_safe_rebuild_and_attach(self):
+        lines = self._historical_assert(
+            self._historical_parent_success(packs=2), ok=False, status="404")
+        lines.extend(self._finish(ok=True))
         diag = self._project(lines)
         trace = diag["case_trace"]
         self.assertTrue(trace["known"])
         self.assertFalse(trace["incomplete"])
         self.assertFalse(trace["invalid"])
-        self.assertEqual(trace["frames"], 8)
+        self.assertEqual(trace["frames"], len(lines))
         self.assertEqual(trace["first_failure"]["phase"], 17)
         self.assertEqual(trace["first_failure"]["site"], 2)
         self.assertEqual(trace["first_failure"]["status"], 404)
@@ -749,15 +801,16 @@ class MetadataReplayTraceTests(unittest.TestCase):
 
     def test_historical_subsites_and_closed_error_kind_survive_rebuild(self):
         lines = [
+            self._frame(17, 1, 0),
             self._frame(17, 3, 0),
             self._frame(17, 3, 1, ok="1"),
             self._frame(17, 4, 0),
             self._frame(17, 4, 1, ok="1"),
             self._frame(17, 5, 0),
             self._frame(17, 5, 1, ok="0", error_kind="4"),
-            self._frame(24, 1, 0),
-            self._frame(24, 1, 1, ok="1"),
+            self._frame(17, 1, 1, ok="0"),
         ]
+        lines.extend(self._finish(ok=True))
         trace = self._project(lines)["case_trace"]
         self.assertTrue(trace["known"])
         self.assertEqual(trace["first_failure"]["phase_name"], "historical_content")
@@ -769,6 +822,117 @@ class MetadataReplayTraceTests(unittest.TestCase):
             self._project(lines), self.target)["case_trace"]
         self.assertEqual(safe["primary"]["site_name"], "exact_pack_bytes")
         self.assertEqual(safe["primary"]["error_kind"], 4)
+
+    def test_full_historical_producer_sequence_two_packs_survives_all_layers(self):
+        lines = self._historical_assert(
+            self._historical_parent_success(packs=2))
+        lines.extend(self._finish(ok=True))
+        trace = self._project(lines)["case_trace"]
+        self.assertTrue(trace["known"])
+        self.assertFalse(trace["incomplete"])
+        self.assertFalse(trace["invalid"])
+        self.assertEqual(trace["frames"], len(lines))
+        self.assertIsNone(trace["first_failure"])
+        self.assertTrue(trace["cleanup_completed"])
+        # Two complete pack groups in the actual 5 -> 7 -> 6 -> 8 order.
+        self.assertEqual(sum(1 for line in lines
+                             if line == self._frame(17, 5, 0)), 2)
+        sites = [int(line.split("|")[2]) for line in lines
+                 if line.startswith(runner.METADATA_REPLAY_PREFIX)]
+        first = sites.index(5)
+        self.assertEqual(sites[first:first + 8], [5, 5, 7, 7, 6, 6, 8, 8])
+        parent_close = lines.index(self._frame(17, 1, 1, ok="1"))
+        assert_close = lines.index(self._frame(17, 2, 0))
+        self.assertLess(parent_close, assert_close)
+        safe = runner._safe_failure_diagnostic(
+            self._project(lines), self.target)["case_trace"]
+        self.assertTrue(safe["known"])
+        self.assertTrue(safe["cleanup_completed"])
+
+    def test_failure_at_each_historical_subcall_keeps_typed_primary(self):
+        kinds = {3: 1, 4: 1, 5: 4, 7: 1, 6: 4, 8: 1, 9: 6}
+        for site, kind in kinds.items():
+            lines = self._historical_failure_prefix(site, packs=2)
+            lines.extend([
+                self._frame(17, site, 0),
+                self._frame(17, site, 1, ok="0", error_kind=str(kind)),
+                self._frame(17, 1, 1, ok="0"),
+            ])
+            lines.extend(self._finish(ok=True))
+            diag = self._project(lines)
+            trace = diag["case_trace"]
+            self.assertTrue(trace["known"], site)
+            self.assertFalse(trace["invalid"], site)
+            self.assertEqual(trace["first_failure"]["site"], site)
+            self.assertEqual(trace["first_failure"]["error_kind"], kind)
+            self.assertEqual(trace["primary"], trace["first_failure"])
+            self.assertTrue(trace["cleanup_completed"])
+            safe = runner._safe_failure_diagnostic(
+                diag, self.target)["case_trace"]
+            self.assertEqual(safe["primary"]["site"], site)
+            self.assertEqual(safe["primary"]["error_kind"], kind)
+            report = {"targets": []}
+            runner._attach_failed_target(report, diag, {}, [])
+            attached = report["targets"][0]["case_trace"]
+            self.assertEqual(attached["primary"]["site"], site)
+            self.assertEqual(attached["primary"]["error_kind"], kind)
+
+    def test_historical_grammar_rejects_skip_backtrack_duplicate_crossphase(self):
+        p = self._frame
+        invalid = [
+            [p(17, 1, 0), p(17, 3, 0), p(17, 3, 1, ok="1"),
+             p(17, 5, 0)],
+            [p(17, 1, 0), p(17, 3, 0), p(17, 3, 1, ok="1"),
+             p(17, 4, 0), p(17, 4, 1, ok="1"),
+             p(17, 5, 0), p(17, 5, 1, ok="1"), p(17, 6, 0)],
+            [p(17, 1, 0), p(17, 3, 0), p(17, 3, 1, ok="1"),
+             p(17, 4, 0), p(17, 4, 1, ok="1"),
+             p(17, 5, 0), p(17, 5, 1, ok="1"),
+             p(17, 7, 0), p(17, 7, 1, ok="1"), p(17, 7, 0)],
+            [p(17, 1, 0), p(17, 3, 0), p(18, 1, 0)],
+            [p(17, 1, 0), p(17, 3, 0), p(17, 3, 1, ok="0"),
+             p(17, 1, 1, ok="0"), p(18, 1, 0)],
+            [p(17, 1, 0), p(17, 3, 0, iteration="0")],
+            [p(17, 1, 0), p(17, 3, 0), p(17, 3, 1, ok="1"),
+             p(17, 4, 0), p(17, 4, 1, ok="1"),
+             p(17, 5, 0), p(17, 5, 1, ok="1"),
+             p(17, 7, 0), p(17, 7, 1, ok="1"),
+             p(17, 6, 0), p(17, 6, 1, ok="1"),
+             p(17, 8, 0), p(17, 8, 1, ok="1"),
+             p(17, 1, 1, ok="1")],
+            [p(17, 1, 0), p(17, 3, 0), p(17, 3, 1, ok="1"),
+             p(17, 4, 0), p(17, 4, 1, ok="1"),
+             p(17, 5, 0), p(17, 5, 1, ok="1"),
+             p(17, 7, 0), p(17, 7, 1, ok="1"),
+             p(17, 6, 0), p(17, 6, 1, ok="1"),
+             p(17, 8, 0), p(17, 8, 1, ok="1"),
+             p(17, 9, 0), p(17, 9, 1, ok="1"),
+             p(17, 2, 0)],
+            self._historical_parent_success(packs=1),
+        ]
+        for lines in invalid:
+            trace = self._project(lines)["case_trace"]
+            self.assertFalse(trace["known"])
+            self.assertTrue(trace["invalid"])
+            self.assertIsNone(trace["primary"])
+
+    def test_historical_duplicate_site2_and_secret_payload_fail_closed(self):
+        lines = self._historical_assert(
+            self._historical_parent_success(packs=1))
+        duplicated = lines + [self._frame(17, 2, 0)]
+        trace = self._project(duplicated)["case_trace"]
+        self.assertFalse(trace["known"])
+        self.assertTrue(trace["invalid"])
+        secret = self._frame(17, 5, 1, ok="0", status=SECRET)
+        trace = self._project([
+            self._frame(17, 1, 0),
+            self._frame(17, 3, 0), self._frame(17, 3, 1, ok="1"),
+            self._frame(17, 4, 0), self._frame(17, 4, 1, ok="1"),
+            self._frame(17, 5, 0), secret,
+        ])["case_trace"]
+        self.assertFalse(trace["known"])
+        self.assertTrue(trace["invalid"])
+        self.assertNotIn(SECRET, json.dumps(trace, sort_keys=True))
 
     def test_closed_error_kind_map_covers_only_source_classes(self):
         expected = {
@@ -790,20 +954,28 @@ class MetadataReplayTraceTests(unittest.TestCase):
                          set(range(1, runner.METADATA_REPLAY_MAX_ERROR_KIND + 1)))
 
     def test_unknown_or_bool_error_kind_is_rejected_without_text(self):
+        prefix = [
+            self._frame(17, 1, 0),
+            self._frame(17, 3, 0),
+            self._frame(17, 3, 1, ok="1"),
+            self._frame(17, 4, 0),
+            self._frame(17, 4, 1, ok="1"),
+            self._frame(17, 5, 0),
+        ]
         bad = [
             self._frame(17, 5, 1, ok="0", error_kind="9"),
             self._frame(17, 5, 1, ok="0", error_kind=SECRET),
         ]
         for payload in bad:
-            diag = self._project([self._frame(17, 5, 0), payload])
+            diag = self._project(prefix + [payload])
             trace = diag["case_trace"]
             self.assertFalse(trace["known"])
             self.assertTrue(trace["invalid"])
             self.assertNotIn(SECRET, json.dumps(diag, sort_keys=True))
-        valid = self._project([
-            self._frame(17, 5, 0),
-            self._frame(17, 5, 1, ok="1", error_kind="4"),
-        ])["case_trace"]
+        lines = self._historical_assert(
+            self._historical_parent_success(packs=1))
+        lines.extend(self._finish(ok=True))
+        valid = self._project(lines)["case_trace"]
         for bad_kind in (True, 99, "4", SECRET):
             raw = dict(valid)
             raw["last_completed"] = dict(
@@ -873,18 +1045,26 @@ class MetadataReplayTraceTests(unittest.TestCase):
     def test_cleanup_failure_does_not_replace_earlier_incomplete_primary(self):
         lines = [
             self._frame(17, 1, 0),
-            self._frame(24, 1, 0),
-            self._frame(24, 1, 1, ok="0"),
+            self._frame(17, 3, 0),
+            self._frame(17, 3, 1, ok="1"),
+            self._frame(17, 4, 0),
+            self._frame(17, 4, 1, ok="1"),
+            self._frame(17, 5, 0),
+            self._frame(17, 5, 1, ok="0", error_kind="4"),
+            self._frame(17, 1, 1, ok="0"),
         ]
+        lines.extend(self._finish(ok=False))
         trace = self._project(lines)["case_trace"]
+        self.assertEqual(trace["first_failure"]["phase"], 17)
+        self.assertEqual(trace["first_failure"]["site"], 5)
         self.assertEqual(trace["primary"]["phase"], 17)
-        self.assertEqual(trace["primary"]["site"], 1)
-        self.assertEqual(trace["last_incomplete"]["phase"], 17)
-        self.assertEqual(trace["first_failure"]["phase"], 24)
+        self.assertEqual(trace["primary"]["site"], 5)
+        self.assertEqual(trace["last_completed"]["phase"], 24)
         self.assertFalse(trace["cleanup_completed"])
 
     def test_frame_parser_is_gated_to_exact_target_phase_and_case(self):
-        lines = [self._frame(17, 1, 0), self._frame(17, 1, 1, ok="1")]
+        lines = self._historical_assert(
+            self._historical_parent_success(packs=1))
         self.assertIsNone(self._project(lines, phase="list", selected_case=None)["case_trace"])
         self.assertIsNone(self._project(lines, selected_case=inventory.TARGETS[self.target]["cases"][1])["case_trace"])
         other = inventory.TARGETS[TARGET]["cases"][0]
