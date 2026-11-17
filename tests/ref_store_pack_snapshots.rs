@@ -509,7 +509,8 @@ impl GitRepo {
         let repo = Self { bare: root.path().join("fixture.git"), home, template, git, _root: root };
         let object_format = format!("--object-format={}", format.as_str());
         let template_arg = format!("--template={}", repo.template.display());
-        repo.run(&["init", "--bare", "--quiet", object_format.as_str(), template_arg.as_str()], None).await?;
+        repo.run(&["init", "--bare", "--quiet", object_format.as_str(), template_arg.as_str(), "fixture.git"], None)
+            .await?;
         Ok(repo)
     }
     fn command(&self, args: &[&str], stdin: Option<&[u8]>) -> tokio::process::Command {
