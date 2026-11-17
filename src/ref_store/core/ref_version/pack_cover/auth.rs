@@ -10,7 +10,7 @@ use super::model::{CoverHierarchyIndex, CoverHierarchyRecord, CoverMembershipDig
 use crate::ref_store::contract::RequestDigest;
 use crate::ref_store::core::types::{GitOid, RefName};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use uuid::Uuid;
 
@@ -305,8 +305,8 @@ pub(super) fn collect_authorized_commit_scope(
     visible_tips: &[GitOid],
     strong_cut: Option<&StrongSnapshotCut>,
     cover_index: &CoverHierarchyIndex,
-) -> Result<BTreeSet<GitOid>, FetchPlanError> {
-    let mut parent_map: BTreeMap<GitOid, Vec<GitOid>> = BTreeMap::new();
+) -> Result<HashSet<GitOid>, FetchPlanError> {
+    let mut parent_map: HashMap<GitOid, Vec<GitOid>> = HashMap::new();
     for cover in cover_index.all_covers() {
         if cover.realm() != realm {
             return Err(FetchPlanError::RealmMismatch);
@@ -316,7 +316,7 @@ pub(super) fn collect_authorized_commit_scope(
         }
     }
     let mut queue = VecDeque::new();
-    let mut authorized = BTreeSet::new();
+    let mut authorized = HashSet::new();
     for tip in visible_tips {
         if authorized.insert(*tip) {
             queue.push_back(*tip);
@@ -347,7 +347,7 @@ pub(super) fn collect_authorized_commit_scope(
 pub(super) fn cover_exposes_unauthorized_commits(
     cover: &CoverHierarchyRecord,
     auth: &AuthorizationContext,
-    authorized_commits: &BTreeSet<GitOid>,
+    authorized_commits: &HashSet<GitOid>,
 ) -> bool {
     if matches!(auth.visibility, RefVisibilityPolicy::AllAuthorized) {
         return false;

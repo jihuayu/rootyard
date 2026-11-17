@@ -10,14 +10,14 @@ use super::super::digest::{CanonicalWriter, push_oid, validate_realm};
 use super::super::limits::{count_u32, positive_u64};
 use super::super::read_mode::ReadConsumer;
 use super::auth::{
-    AuthorizationContext, FetchPlanError, ReadIsolationMode, StrongSnapshotCut, StrongSnapshotFallback,
+    AuthorizationContext, FallbackReason, FetchPlanError, ReadIsolationMode, StrongSnapshotCut, StrongSnapshotFallback,
     collect_authorized_commit_scope, map_closure_err, validate_isolation_policy,
 };
-use super::model::{CoverCommitLink, CoverHierarchyIndex, CoverTier};
-use super::planner_select::{CoverSelectionCtx, FallbackReason, SelectionResult, fallback_or_err, select_covers};
+use super::model::{CoverCommitLink, CoverHierarchyIndex, CoverTier, oid_bytes};
+use super::planner_select::{CoverSelectionCtx, SelectionResult, fallback_or_err, select_covers};
 use super::retention_class::RetentionClassificationIndex;
 use crate::ref_store::core::types::{GitOid, RefName, RefTarget};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use uuid::Uuid;
 
@@ -177,6 +177,7 @@ pub fn plan_fetch_covers(
         }
     };
     needed_commits.extend(needed_set.iter().copied());
+    needed_commits.sort_by_key(|oid| oid_bytes(*oid));
 
     let selection = if needed_set.is_empty() {
         SelectionResult::default()
@@ -332,9 +333,9 @@ fn resolve_wants(
 fn index_commits_and_covers(
     cover_index: &CoverHierarchyIndex,
     metadata_reads: &mut u64,
-) -> Result<(BTreeMap<GitOid, CoverCommitLink>, BTreeMap<GitOid, Vec<Uuid>>, BTreeMap<Uuid, bool>), FetchPlanError> {
-    let mut links = BTreeMap::new();
-    let mut commit_to_covers: BTreeMap<GitOid, Vec<Uuid>> = BTreeMap::new();
+) -> Result<(HashMap<GitOid, CoverCommitLink>, HashMap<GitOid, Vec<Uuid>>, BTreeMap<Uuid, bool>), FetchPlanError> {
+    let mut links = HashMap::new();
+    let mut commit_to_covers: HashMap<GitOid, Vec<Uuid>> = HashMap::new();
     let mut digest_ok = BTreeMap::new();
     for cover in cover_index.all_covers() {
         *metadata_reads = metadata_reads.saturating_add(1);
@@ -351,11 +352,11 @@ fn index_commits_and_covers(
 fn resolve_verified_haves(
     req: &FetchPlanRequest,
     version_lookup: &dyn CausalVersionLookup,
-    authorized_commits: &BTreeSet<GitOid>,
-    commit_to_covers: &BTreeMap<GitOid, Vec<Uuid>>,
+    authorized_commits: &HashSet<GitOid>,
+    commit_to_covers: &HashMap<GitOid, Vec<Uuid>>,
     metadata_reads: &mut u64,
 ) -> Result<Vec<GitOid>, FetchPlanError> {
-    let mut verified = BTreeSet::new();
+    let mut verified = HashSet::new();
     for oid in &req.haves.have_oids {
         if authorized_commits.contains(oid) {
             verified.insert(*oid);
@@ -378,14 +379,13 @@ fn resolve_verified_haves(
             }
         }
     }
-    Ok(verified.into_iter().collect())
+    let mut out: Vec<GitOid> = verified.into_iter().collect();
+    out.sort_by_key(|oid| oid_bytes(*oid));
+    Ok(out)
 }
 
-pub(super) fn collect_ancestors(
-    roots: &[GitOid],
-    commit_links: &BTreeMap<GitOid, CoverCommitLink>,
-) -> BTreeSet<GitOid> {
-    let mut visited = BTreeSet::new();
+pub(super) fn collect_ancestors(roots: &[GitOid], commit_links: &HashMap<GitOid, CoverCommitLink>) -> HashSet<GitOid> {
+    let mut visited = HashSet::new();
     let mut queue: VecDeque<GitOid> = VecDeque::new();
     for root in roots {
         if visited.insert(*root) {
@@ -406,11 +406,11 @@ pub(super) fn collect_ancestors(
 
 fn collect_missing_commits(
     wants: &[GitOid],
-    have_ancestors: &BTreeSet<GitOid>,
-    commit_links: &BTreeMap<GitOid, CoverCommitLink>,
-    commit_to_covers: &BTreeMap<GitOid, Vec<Uuid>>,
-) -> Result<BTreeSet<GitOid>, FetchPlanError> {
-    let mut needed = BTreeSet::new();
+    have_ancestors: &HashSet<GitOid>,
+    commit_links: &HashMap<GitOid, CoverCommitLink>,
+    commit_to_covers: &HashMap<GitOid, Vec<Uuid>>,
+) -> Result<HashSet<GitOid>, FetchPlanError> {
+    let mut needed = HashSet::new();
     let mut queue = VecDeque::new();
     for want in wants {
         if !have_ancestors.contains(want) && needed.insert(*want) {

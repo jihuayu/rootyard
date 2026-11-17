@@ -19,7 +19,7 @@ use super::model::{CoverCommitLink, CoverHierarchyIndex, CoverHierarchyRecord};
 use super::planner::{FetchPlan, FetchPlanDigest, WantTarget, collect_ancestors, compute_fetch_plan_digest};
 use super::retention_class::{CoverHoldKind, RetentionClassificationIndex};
 use crate::ref_store::core::types::{GitOid, RefTarget};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use uuid::Uuid;
 
@@ -166,7 +166,7 @@ pub fn verify_fetch_plan_closure(
     let authorized_commits =
         collect_authorized_commit_scope(auth, &plan.realm, &expected_want_commits, strong_cut, cover_index)?;
 
-    let mut all_links = BTreeMap::new();
+    let mut all_links = HashMap::new();
     for rec in cover_index.all_covers() {
         for link in rec.covered_commits() {
             all_links.entry(link.commit_oid).or_insert_with(|| link.clone());
@@ -245,8 +245,8 @@ fn verify_wants_and_cut(
 fn verify_selected_covers<'a>(
     plan: &FetchPlan,
     auth: &AuthorizationContext,
-    authorized_commits: &BTreeSet<GitOid>,
-    have_ancestors: &BTreeSet<GitOid>,
+    authorized_commits: &HashSet<GitOid>,
+    have_ancestors: &HashSet<GitOid>,
     cover_index: &'a CoverHierarchyIndex,
     retention_index: &RetentionClassificationIndex,
 ) -> Result<Vec<&'a CoverHierarchyRecord>, PlanVerifyError> {
@@ -331,16 +331,16 @@ fn verify_selected_covers<'a>(
 
 fn verify_commit_dag_closure(
     want_commits: &[GitOid],
-    have_ancestors: &BTreeSet<GitOid>,
+    have_ancestors: &HashSet<GitOid>,
     selected_records: &[&CoverHierarchyRecord],
 ) -> Result<(), PlanVerifyError> {
-    let mut selected_links: BTreeMap<GitOid, &CoverCommitLink> = BTreeMap::new();
+    let mut selected_links: HashMap<GitOid, &CoverCommitLink> = HashMap::new();
     for rec in selected_records {
         for link in rec.covered_commits() {
             selected_links.insert(link.commit_oid, link);
         }
     }
-    let mut visited = BTreeSet::new();
+    let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
     for oid in want_commits {
         if !have_ancestors.contains(oid) && visited.insert(*oid) {

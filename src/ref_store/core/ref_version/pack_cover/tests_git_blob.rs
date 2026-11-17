@@ -1,23 +1,53 @@
-//! Stock Git (SHA-1 & SHA-256) + OpenDAL Memory BlobStore + DisposableViewRoot tests (Issue #184).
+//! Stock Git (SHA-1 & SHA-256) + OpenDAL S3 Loopback BlobStore + DisposableViewRoot tests (Issue #184).
 use super::*;
 use crate::blob_store::BlobLocator;
-use crate::blob_store::budget::ResourceLimits;
+use crate::blob_store::budget::{ResourceContext, ResourceLimits};
+use crate::blob_store::config::BlobProfile;
 use crate::blob_store::disposable_view::DisposableViewRoot;
 use crate::blob_store::opendal::BlobStore;
-use crate::blob_store::test_support::{corrupt_exact, deadline, delete_exact, store as mem_store};
+use crate::blob_store::test_support::deadline;
 use crate::ref_store::contract::{IssuerLane, RequestDigest};
 use crate::ref_store::core::CommitMode;
 use crate::ref_store::core::ref_version::*;
 use crate::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget};
 use anyhow::{Result, ensure};
+use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Method, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::net::TcpListener;
 use uuid::Uuid;
+
+type ObjMap = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
+
+async fn s3_op(State(m): State<ObjMap>, method: Method, uri: Uri) -> Response {
+    let k = uri.path().trim_start_matches('/');
+    let Some(d) = m.lock().expect("objs").get(k).cloned() else {
+        return (StatusCode::NOT_FOUND, [(header::CONTENT_LENGTH, "0".into())], Body::empty()).into_response();
+    };
+    let len = d.len().to_string();
+    let body = if method == Method::HEAD { Body::empty() } else { Body::from(d) };
+    (StatusCode::OK, [(header::CONTENT_LENGTH, len), (header::ETAG, "\"e\"".into())], body).into_response()
+}
+
+async fn s3_srv() -> Result<(String, ObjMap, tokio::task::JoinHandle<()>)> {
+    let l = TcpListener::bind("127.0.0.1:0").await?;
+    let (addr, m) = (l.local_addr()?, Arc::new(Mutex::new(BTreeMap::new())));
+    let app = Router::new().fallback(s3_op).with_state(m.clone());
+    let h = tokio::spawn(async move {
+        let _ = axum::serve(l, app).await;
+    });
+    Ok((format!("http://{addr}"), m, h))
+}
 
 #[cfg(unix)]
 const NULL_CFG: &str = "/dev/null";
@@ -50,6 +80,8 @@ fn git_run(repo: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<String> {
 
 struct MemEnv {
     _dir: TempDir,
+    _srv: tokio::task::JoinHandle<()>,
+    objs: ObjMap,
     repo: PathBuf,
     views: DisposableViewRoot,
     store: BlobStore,
@@ -61,18 +93,29 @@ struct MemEnv {
     entries: Vec<PackSetEntry>,
 }
 
+impl Drop for MemEnv {
+    fn drop(&mut self) {
+        self._srv.abort();
+    }
+}
+
 impl MemEnv {
-    fn new(fmt: GitObjectFormat) -> Result<Self> {
+    async fn new(fmt: GitObjectFormat) -> Result<Self> {
         let (dir, u) = (TempDir::new()?, Uuid::new_v4);
         let repo = dir.path().join("src");
         std::fs::create_dir_all(&repo)?;
         git_run(&repo, &["init", &format!("--object-format={}", fmt.as_str()), "--initial-branch=main"], None)?;
         let views = DisposableViewRoot::open(&dir.path().join("views"), 8, 64 << 20, Duration::from_secs(120))?;
-        let (store, _) = mem_store(ResourceLimits::new(4, 4, 8 << 20).expect("limits"));
+        let limits = ResourceLimits::new(4, 4, 8 << 20)?;
+        let (ep, objs, _srv) = s3_srv().await?;
+        let profile = BlobProfile::memory_profile(limits).with_test_endpoint(&ep)?;
+        let store = BlobStore::open_with_resources(profile, Arc::new(ResourceContext::new(limits)))?;
         let realm = RefVersionRealm::new(u(), u(), u(), AuthorityKind::Pg, 1, 0, 1, fmt);
         let mem = compute_cover_membership_digest(&realm, 1, &[])?;
         Ok(Self {
             _dir: dir,
+            _srv,
+            objs,
             repo,
             views,
             store,
@@ -83,6 +126,10 @@ impl MemEnv {
             seq: 0,
             entries: Vec::new(),
         })
+    }
+
+    fn s3_key(loc: &BlobLocator) -> String {
+        format!("blob-test-bucket/{}", loc.path().trim_start_matches('/'))
     }
 
     fn commit(&self, f: &str, body: &str) -> Result<GitOid> {
@@ -108,8 +155,11 @@ impl MemEnv {
         let (t, r) = (self.realm.tenant_id(), self.realm.repository_id());
         let pl = BlobLocator::new(t, r, 1, u(), "packs", &ps, pk.len() as u64)?;
         let il = BlobLocator::new(t, r, 1, u(), "packs", &is, ix.len() as u64)?;
-        self.store.operator().write(&self.store.object_path(&pl), pk).await?;
-        self.store.operator().write(&self.store.object_path(&il), ix).await?;
+        {
+            let mut g = self.objs.lock().expect("objs");
+            g.insert(Self::s3_key(&pl), pk);
+            g.insert(Self::s3_key(&il), ix);
+        }
         let e = PackSetEntry::new(u(), u(), RequestDigest::of("a", &[ps.as_bytes(), is.as_bytes()]))?;
         let vp = VerifiedClosurePack::new(
             e,
@@ -272,7 +322,7 @@ impl MemEnv {
 #[tokio::test]
 async fn criss_cross_merge_deep_lag_pin_non_ff_and_memory_blob_faults() -> Result<()> {
     for fmt in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
-        let mut env = MemEnv::new(fmt)?;
+        let mut env = MemEnv::new(fmt).await?;
         let (c1, mut pv, cov1) = env.push("refs/heads/main", None, None, "a.txt", "v1\n", vec![]).await?;
         let (mut pc, mut leaves, mut c3, mut v3) = (c1, vec![cov1.clone()], c1, pv.clone());
         for i in 2..=5 {
@@ -412,36 +462,29 @@ async fn criss_cross_merge_deep_lag_pin_non_ff_and_memory_blob_faults() -> Resul
         };
         let proof =
             verify_fetch_plan_closure(&cp, r1.consumer, &r1.auth, Some(&cut), &env.graph, &env.index, &env.ret)?;
-        corrupt_exact(&env.store, &comp.artifacts().pack_locator).await?;
-        ensure!(
-            materialize_and_verify_fetch_plan(
-                &env.store,
-                &env.views,
-                &proof,
-                &cp,
-                &env.index,
-                &[],
-                &[(mr.clone(), m3)],
-                deadline()
-            )
-            .await
-            .is_err()
-        );
-        delete_exact(&env.store, &comp.artifacts().pack_locator).await?;
-        ensure!(
-            materialize_and_verify_fetch_plan(
-                &env.store,
-                &env.views,
-                &proof,
-                &cp,
-                &env.index,
-                &[],
-                &[(mr, m3)],
-                deadline()
-            )
-            .await
-            .is_err()
-        );
+        let key = MemEnv::s3_key(&comp.artifacts().pack_locator);
+        for rm in [false, true] {
+            if rm {
+                env.objs.lock().expect("objs").remove(&key);
+            } else if let Some(b) = env.objs.lock().expect("objs").get_mut(&key) {
+                let mid = b.len() / 2;
+                b[mid] ^= 0xff;
+            }
+            ensure!(
+                materialize_and_verify_fetch_plan(
+                    &env.store,
+                    &env.views,
+                    &proof,
+                    &cp,
+                    &env.index,
+                    &[],
+                    &[(mr.clone(), m3)],
+                    deadline()
+                )
+                .await
+                .is_err()
+            );
+        }
     }
     Ok(())
 }

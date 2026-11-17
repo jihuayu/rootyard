@@ -9,7 +9,7 @@ use super::model::{CoverHierarchyIndex, CoverHierarchyRecord};
 use super::planner::{FetchPlanOutcome, FetchPlanRequest, PlannedCoverEntry};
 use super::retention_class::{CoverHoldKind, RetentionClassificationIndex};
 use crate::ref_store::core::types::GitOid;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use uuid::Uuid;
 
 const SMALL_FETCH_PACK_OVERHEAD_BYTES: u64 = 2048;
@@ -25,9 +25,9 @@ pub(super) struct CoverSelectionCtx<'a> {
     pub(super) req: &'a FetchPlanRequest,
     pub(super) cover_index: &'a CoverHierarchyIndex,
     pub(super) retention_index: &'a RetentionClassificationIndex,
-    pub(super) authorized_commits: &'a BTreeSet<GitOid>,
-    pub(super) have_ancestors: &'a BTreeSet<GitOid>,
-    pub(super) needed_set: &'a BTreeSet<GitOid>,
+    pub(super) authorized_commits: &'a HashSet<GitOid>,
+    pub(super) have_ancestors: &'a HashSet<GitOid>,
+    pub(super) needed_set: &'a HashSet<GitOid>,
     pub(super) digest_ok: &'a BTreeMap<Uuid, bool>,
     pub(super) threshold: usize,
 }
@@ -56,7 +56,7 @@ impl RejectionObservations {
 
 struct CandidateCover<'a> {
     record: &'a CoverHierarchyRecord,
-    covered_needed: BTreeSet<GitOid>,
+    covered_needed: HashSet<GitOid>,
     required_bases: Vec<Uuid>,
     client_satisfied_bases: Vec<Uuid>,
 }
@@ -96,7 +96,7 @@ pub(super) fn select_covers(ctx: &CoverSelectionCtx<'_>) -> Result<SelectionResu
     let is_historical = ctx.req.isolation.is_historical_pinned();
 
     for cover in ctx.cover_index.all_covers() {
-        let covered_needed: BTreeSet<GitOid> =
+        let covered_needed: HashSet<GitOid> =
             cover.covered_commits().iter().map(|c| c.commit_oid).filter(|oid| ctx.needed_set.contains(oid)).collect();
         if covered_needed.is_empty() {
             continue;

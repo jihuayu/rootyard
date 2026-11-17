@@ -8,7 +8,7 @@ use super::model::{
     CompactionPublishOutcome, CoverHierarchyRecord, CoverHierarchyRecordInput, CoverMembershipDigest, CoverModelError,
     CoverRecordDigest, CoverTier, oid_bytes,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use uuid::Uuid;
 
 const COVER_RECORD_DOMAIN: &[u8] = b"ry-pack-cover-record-v1";
@@ -167,7 +167,7 @@ fn verify_compaction_lineage(
     record: &CoverHierarchyRecord,
 ) -> Result<(), CoverModelError> {
     let mut expected_versions = BTreeSet::new();
-    let mut expected_commits = BTreeSet::new();
+    let mut expected_commits = HashSet::new();
     for input_id in record.input_cover_ids() {
         let input = index.get(input_id).ok_or(CoverModelError::MissingInputCover)?;
         if input.realm() != record.realm() || input.tier().rank() >= record.tier().rank() {
@@ -180,7 +180,7 @@ fn verify_compaction_lineage(
         expected_commits.extend(input.covered_commits().iter().map(|c| c.commit_oid));
     }
     let out_versions: BTreeSet<_> = record.covered_versions().iter().copied().collect();
-    let out_commits: BTreeSet<_> = record.covered_commits().iter().map(|c| c.commit_oid).collect();
+    let out_commits: HashSet<_> = record.covered_commits().iter().map(|c| c.commit_oid).collect();
     if !expected_versions.is_subset(&out_versions) || !expected_commits.is_subset(&out_commits) {
         return Err(CoverModelError::InputCoverageDrop);
     }
@@ -360,5 +360,5 @@ pub(super) fn compute_record_digest(input: &CoverHierarchyRecordInput) -> Result
     w.push_u64(input.compaction_epoch);
     w.push_len_prefixed(input.worker_id.as_bytes())?;
     w.push_len_prefixed(input.operation_id.as_bytes())?;
-    Ok(CoverRecordDigest(w.finish()))
+    Ok(CoverRecordDigest::from_bytes(w.finish()))
 }
