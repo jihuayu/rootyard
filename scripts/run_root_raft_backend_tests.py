@@ -598,11 +598,17 @@ def collect_failure_evidence(
         frames = frame_sets.get(case, set())
         if len(frames) > 1:
             diagnostics_invalid = True
-        elif len(frames) == 1 and not diagnostics_invalid:
+        elif len(frames) == 1:
             phase, class_code = next(iter(frames))
             case_failures.append({"case": case, "phase": phase, "class": class_code})
-    failure_phase = case_failures[0]["phase"] if len(case_failures) == 1 else None
-    failure_class = case_failures[0]["class"] if len(case_failures) == 1 else None
+    scalar_is_unambiguous = (
+        len(case_failures) == 1
+        and not diagnostics_invalid
+        and not unknown_case
+        and not duplicate_case
+    )
+    failure_phase = case_failures[0]["phase"] if scalar_is_unambiguous else None
+    failure_class = case_failures[0]["class"] if scalar_is_unambiguous else None
     return FailureEvidence(
         cases=cases,
         counts=observed,

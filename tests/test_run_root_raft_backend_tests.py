@@ -714,6 +714,20 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertEqual(conflict.case_failures, [])
         self.assertIsNone(conflict.failure_phase)
 
+        partial_conflict = runner.collect_failure_evidence(
+            stdout,
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n"
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=refusal class=storage\n"
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_DRAIN} phase=settled_evaluate class=scope_binding\n",
+        )
+        self.assertFalse(partial_conflict.diagnostics_valid)
+        self.assertEqual(
+            partial_conflict.case_failures,
+            [{"case": CASE_DRAIN, "phase": "settled_evaluate", "class": "scope_binding"}],
+        )
+        self.assertIsNone(partial_conflict.failure_phase)
+        self.assertIsNone(partial_conflict.failure_class)
+
         duplicate = runner.collect_failure_evidence(
             stdout,
             f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=commit class=proposal_scope\n"
