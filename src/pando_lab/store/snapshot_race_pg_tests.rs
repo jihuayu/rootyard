@@ -55,8 +55,8 @@ async fn pg_snapshot_retention_uses_live_expiry_not_expired_rows() {
     let admin = connect_named(&config, &actor_appname(&nonce, repo, "admin")).await;
     insert_repo(&admin, repo).await;
     let (live, expired) = seed_two_packs(&config, &admin, repo).await;
-    insert_snapshot(&admin, repo, "live", &[live.clone()], "1 minute").await;
-    insert_snapshot(&admin, repo, "expired", &[expired.clone()], "-1 minute").await;
+    insert_snapshot(&admin, repo, "live", std::slice::from_ref(&live), "1 minute").await;
+    insert_snapshot(&admin, repo, "expired", std::slice::from_ref(&expired), "-1 minute").await;
 
     let opts = options();
     let report = repack::repack_repo(&config, repo, &opts).await.unwrap();
