@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::ref_store::contract::{OperationLookup, OperationState};
 use crate::ref_store::core::state_machine::{
     AppliedLogId, ApplyResponse, CommitScopedRefsCommand, InstallScopedDecisionCommand, RefCasCommand,
-    RefCasStateMachine, StateMachineError,
+    RefCasStateMachine, SmDecisionState, StateMachineError,
 };
 use crate::ref_store::core::terminal::{CommitRejectCode, CommitTerminal, RefCommitResult};
 use crate::ref_store::projector::DecisionGrantKeyring;
@@ -120,12 +120,20 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
         commit: CommitScopedRefsCommand,
     ) -> BackendFuture<'a, AuthorityCommitOutcome> {
         Box::pin(async move {
+            let dec_id = commit.commit.decision_id;
             let install_idx = self.next_log_id();
             {
                 let mut sm = self.sm.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(err) = sm.apply(install_idx, RefCasCommand::InstallScopedDecision(install)) {
-                    let actual_base_oid = sm.read_refs(repository_id).get(base_ref).cloned();
-                    return Ok(map_sm_error_to_outcome(Some(install_idx), err, actual_base_oid));
+                match sm.apply(install_idx, RefCasCommand::InstallScopedDecision(install)) {
+                    Ok(_) => {}
+                    Err(StateMachineError::DecisionConflict {
+                        decision_id,
+                        state: SmDecisionState::Consumed | SmDecisionState::Rejected,
+                    }) if Some(decision_id) == dec_id => {}
+                    Err(err) => {
+                        let actual_base_oid = sm.read_refs(repository_id).get(base_ref).cloned();
+                        return Ok(map_sm_error_to_outcome(Some(install_idx), err, actual_base_oid));
+                    }
                 }
             }
             let op_id = commit.commit.request.identity.operation_id;

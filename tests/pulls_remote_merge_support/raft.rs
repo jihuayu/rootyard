@@ -15,7 +15,7 @@ use rootyard::pulls::remote_merge_finalizer::{AuthorityCommitOutcome, MergeAutho
 use rootyard::ref_store::contract::{OperationLookup, OperationState};
 use rootyard::ref_store::core::state_machine::{
     AppliedLogId, ApplyResponse, CommitScopedRefsCommand, InstallScopedDecisionCommand, RefCasCommand,
-    RefCasStateMachine, StateMachineError,
+    RefCasStateMachine, SmDecisionState, StateMachineError,
 };
 use rootyard::ref_store::core::terminal::CommitTerminal;
 use rustls::pki_types::ServerName;
@@ -375,17 +375,25 @@ impl MergeAuthorityBackend for LiveRaft3Backend {
         commit: CommitScopedRefsCommand,
     ) -> BackendFuture<'a, AuthorityCommitOutcome> {
         Box::pin(async move {
+            let dec_id = commit.commit.decision_id;
             let mut r = self.0.lock().await;
             let (i1, sm1, r1) = r
                 .append(&RefCasCommand::InstallScopedDecision(install))
                 .await
                 .map_err(|e| RemoteMergeError::UnknownOutcome(e.to_string()))?;
-            if let Some(Err(e)) = r1 {
-                return Ok(map_sm_error_to_outcome(
-                    Some(AppliedLogId { term: 1, index: i1 }),
-                    e,
-                    sm1.read_refs(repo).get(base_ref).cloned(),
-                ));
+            match r1 {
+                Some(Ok(_)) | None => {}
+                Some(Err(StateMachineError::DecisionConflict {
+                    decision_id,
+                    state: SmDecisionState::Consumed | SmDecisionState::Rejected,
+                })) if Some(decision_id) == dec_id => {}
+                Some(Err(e)) => {
+                    return Ok(map_sm_error_to_outcome(
+                        Some(AppliedLogId { term: 1, index: i1 }),
+                        e,
+                        sm1.read_refs(repo).get(base_ref).cloned(),
+                    ));
+                }
             }
             let (i2, sm2, r2) = r
                 .append(&RefCasCommand::CommitScopedRefs(commit))
