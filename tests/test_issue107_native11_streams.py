@@ -208,6 +208,115 @@ class BoundedStreamTests(unittest.TestCase):
         self.assertTrue(readers[0].joined)
         self.assertFalse(readers[0].is_alive())
 
+    def test_startup_failure_kills_reaps_joins_before_closing_pipes(self):
+        events = []
+
+        class OrderedPipe(FakePipe):
+            def close(self):
+                events.append(("close", process.killed))
+                super().close()
+
+        class OrderedReader(FakeReader):
+            def join(self, timeout=None):
+                events.append(("join", timeout))
+                super().join(timeout)
+
+        process = FakeProcess(stdout=b"out", stderr=b"err")
+        process.stdout = OrderedPipe(b"out")
+        process.stderr = OrderedPipe(b"err")
+        process.stdout.process = process
+        process.stderr.process = process
+        original_kill = process.kill
+        original_wait = process.wait
+
+        def kill():
+            events.append(("kill",))
+            original_kill()
+
+        def wait(timeout=None):
+            events.append(("wait", timeout))
+            return original_wait(timeout)
+
+        process.kill = kill
+        process.wait = wait
+        readers = []
+
+        def start(target, *args):
+            if readers:
+                raise RuntimeError("second reader start failed")
+            reader = OrderedReader(target, args)
+            readers.append(reader)
+            return reader
+
+        with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
+             mock.patch.object(runner, "_start_reader", side_effect=start), \
+             mock.patch.object(runner.os, "getpgid", return_value=4242), \
+             mock.patch.object(runner.os, "killpg"):
+            with self.assertRaisesRegex(RuntimeError, "second reader start failed"):
+                runner.run_bounded(["fake"], timeout=1)
+        names = [event[0] for event in events]
+        self.assertEqual(names, ["kill", "wait", "join", "close", "close"])
+        self.assertTrue(all(event[1] for event in events if event[0] == "close"))
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+        self.assertEqual(len(readers), 1)
+
+    def test_incomplete_startup_cleanup_preserves_primary_and_skips_close(self):
+        class NeverReapProcess(FakeProcess):
+            def wait(self, timeout=None):
+                self.wait_calls.append(timeout)
+                raise subprocess.TimeoutExpired("fake", timeout)
+
+            def poll(self):
+                return None
+
+        class StuckReader(FakeReader):
+            def join(self, timeout=None):
+                self.joined.append(timeout)
+
+        process = NeverReapProcess(stdout=b"out", stderr=b"err")
+        readers = []
+
+        def start(target, *args):
+            if readers:
+                raise RuntimeError("second reader start failed")
+            reader = StuckReader(target, args)
+            readers.append(reader)
+            return reader
+
+        with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
+             mock.patch.object(runner, "_start_reader", side_effect=start), \
+             mock.patch.object(runner.os, "getpgid", return_value=4242), \
+             mock.patch.object(runner.os, "killpg"):
+            with self.assertRaisesRegex(RuntimeError, "second reader start failed"):
+                runner.run_bounded(["fake"], timeout=1)
+        self.assertEqual(process.wait_calls, [runner.KILL_WAIT_SECONDS])
+        self.assertTrue(readers[0].joined)
+        self.assertFalse(process.stdout.closed)
+        self.assertFalse(process.stderr.closed)
+
+    def test_normal_path_never_closes_while_a_reader_is_still_live(self):
+        class StuckReader(FakeReader):
+            def join(self, timeout=None):
+                self.joined.append(timeout)
+
+        process = FakeProcess(stdout=b"", stderr=b"", returncode=0)
+        readers = []
+
+        def start(target, *args):
+            reader = StuckReader(target, args)
+            readers.append(reader)
+            return reader
+
+        with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
+             mock.patch.object(runner, "_start_reader", side_effect=start):
+            with self.assertRaises(runner.RunnerError) as raised:
+                runner.run_bounded(["fake"], timeout=1)
+        self.assertEqual(raised.exception.code, "cleanup_unresolved")
+        self.assertEqual(len(readers), 2)
+        self.assertFalse(process.stdout.closed)
+        self.assertFalse(process.stderr.closed)
+
 
     def test_execution_path_routes_rows_and_frames_to_their_own_streams(self):
         stdout = "\n".join([

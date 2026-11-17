@@ -1149,6 +1149,37 @@ def _reap_process(process):
             _fail("cleanup_unresolved")
 
 
+def _cleanup_startup(process, readers):
+    """Bound startup cleanup without replacing its primary failure.
+
+    A buffered pipe close may wait on a reader that owns the read lock, so no
+    stream is closed until the owned process group has been killed/reaped and
+    every reader has been joined under the existing aggregate deadline.
+    """
+    reaped = False
+    try:
+        _reap_process(process)
+        reaped = True
+    except Exception:
+        pass
+    joined = False
+    try:
+        _join_readers(readers)
+        joined = True
+    except Exception:
+        pass
+    if reaped and joined:
+        _close_stream(process.stdout)
+        _close_stream(process.stderr)
+
+
+def _join_then_close(process, readers):
+    """Never synchronously close a stream while its reader may still be live."""
+    _join_readers(readers)
+    _close_stream(process.stdout)
+    _close_stream(process.stderr)
+
+
 def _start_reader(target, *args):
     """Retain the reader object before start so partial startup is cleanable."""
     reader = threading.Thread(target=target, args=args, daemon=True)
@@ -1175,12 +1206,7 @@ def run_bounded(command, timeout, env=None, failure_projector=None,
         readers.append(_start_reader(
             capture.drain, process.stderr, capture.stderr))
     except BaseException:
-        _close_stream(process.stdout)
-        _close_stream(process.stderr)
-        try:
-            _reap_process(process)
-        finally:
-            _join_readers(readers)
+        _cleanup_startup(process, readers)
         raise
     timed_out = False
     try:
@@ -1202,11 +1228,7 @@ def run_bounded(command, timeout, env=None, failure_projector=None,
                 except subprocess.TimeoutExpired:
                     _fail("cleanup_unresolved")
         finally:
-            try:
-                _join_readers(readers)
-            finally:
-                _close_stream(process.stdout)
-                _close_stream(process.stderr)
+            _join_then_close(process, readers)
     _require(not capture.truncated, "native_output_too_large")
     if timed_out or process.returncode != 0:
         code = "native_timeout" if timed_out else "native_process_failed"
