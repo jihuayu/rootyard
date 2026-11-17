@@ -1,0 +1,437 @@
+//! Layer 1 verified immutable `.pack` / `.idx` cache scoped strictly by
+//! `(tenant_id, repo_id, backend_identity_hex, object_format, digests)`.
+
+use std::{
+    collections::HashMap,
+    fs::{DirBuilder, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use super::types::{PackCacheKey, ReplicaCacheError, ReplicaCacheLimits};
+
+const PACK_DIR_NAME: &str = "packs";
+const HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+struct PackCacheEntry {
+    key: PackCacheKey,
+    dir_path: PathBuf,
+    pack_path: PathBuf,
+    idx_path: PathBuf,
+    total_bytes: u64,
+    pin_count: usize,
+    lru_seq: u64,
+}
+
+#[derive(Default)]
+struct PackCatalogInner {
+    entries: HashMap<String, PackCacheEntry>,
+    retired_entries: HashMap<String, PackCacheEntry>,
+    total_bytes: u64,
+    lru_counter: u64,
+    evicted_count: u64,
+    pin_protections: u64,
+}
+
+/// Layer 1 verified immutable `.pack` / `.idx` cache.
+#[derive(Clone)]
+pub struct PackCacheCatalog {
+    root_dir: PathBuf,
+    limits: ReplicaCacheLimits,
+    inner: Arc<Mutex<PackCatalogInner>>,
+}
+
+pub struct PackCachePin {
+    key_digest: String,
+    pack_path: PathBuf,
+    idx_path: PathBuf,
+    inner: Arc<Mutex<PackCatalogInner>>,
+    released: bool,
+}
+
+impl PackCachePin {
+    pub fn pack_path(&self) -> &Path {
+        &self.pack_path
+    }
+
+    pub fn idx_path(&self) -> &Path {
+        &self.idx_path
+    }
+}
+
+impl Drop for PackCachePin {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let remove_dir = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = guard.entries.get_mut(&self.key_digest) {
+                entry.pin_count = entry.pin_count.saturating_sub(1);
+                None
+            } else if let Some(entry) = guard.retired_entries.get_mut(&self.key_digest) {
+                entry.pin_count = entry.pin_count.saturating_sub(1);
+                if entry.pin_count == 0 {
+                    guard.retired_entries.remove(&self.key_digest).map(|e| (e.dir_path, e.total_bytes))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((dir, bytes)) = remove_dir {
+            let _ = remove_dir_safely(&dir);
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            guard.total_bytes = guard.total_bytes.saturating_sub(bytes);
+        }
+    }
+}
+
+impl PackCacheCatalog {
+    pub fn open(replica_root: &Path, limits: ReplicaCacheLimits) -> Result<Self, ReplicaCacheError> {
+        limits.validate()?;
+        ensure_private_dir(replica_root)?;
+        let root_dir = replica_root.join(PACK_DIR_NAME);
+        ensure_private_dir(&root_dir)?;
+        Ok(Self { root_dir, limits, inner: Arc::new(Mutex::new(PackCatalogInner::default())) })
+    }
+
+    pub fn staging_dir(&self) -> Result<PathBuf, ReplicaCacheError> {
+        verify_private_dir(&self.root_dir)?;
+        let stage = self.root_dir.join(format!(".stage-{}", Uuid::new_v4().simple()));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&stage)
+            .map_err(|e| ReplicaCacheError::Io(format!("failed creating pack staging dir: {e}")))?;
+        Ok(stage)
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).entries.len()
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).total_bytes
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        (guard.evicted_count, guard.pin_protections)
+    }
+
+    pub fn pin_if_valid(
+        &self,
+        key: &PackCacheKey,
+        verify_sha256: bool,
+    ) -> Result<(Option<PackCachePin>, bool), ReplicaCacheError> {
+        let paths = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(entry) = guard.entries.get_mut(&key.key_digest) else {
+                return Ok((None, false));
+            };
+            if entry.key != *key {
+                return Err(ReplicaCacheError::TenantIsolationViolation("pack cache key mismatch"));
+            }
+            guard.lru_counter = guard.lru_counter.saturating_add(1);
+            entry.lru_seq = guard.lru_counter;
+            entry.pin_count = entry.pin_count.saturating_add(1);
+            (entry.pack_path.clone(), entry.idx_path.clone())
+        };
+
+        let pin = PackCachePin {
+            key_digest: key.key_digest.clone(),
+            pack_path: paths.0.clone(),
+            idx_path: paths.1.clone(),
+            inner: Arc::clone(&self.inner),
+            released: false,
+        };
+        if !verify_cached_pack_files(&paths.0, &paths.1, key, verify_sha256) {
+            drop(pin);
+            self.retire_key(&key.key_digest);
+            return Ok((None, true));
+        }
+        Ok((Some(pin), false))
+    }
+
+    pub fn install_and_pin(
+        &self,
+        key: PackCacheKey,
+        staged_pack: &Path,
+        staged_idx: &Path,
+    ) -> Result<PackCachePin, ReplicaCacheError> {
+        verify_private_dir(&self.root_dir)?;
+        let entry_bytes = key
+            .pack_length
+            .checked_add(key.idx_length)
+            .ok_or(ReplicaCacheError::CacheCapacityExhausted("pack byte count overflow"))?;
+        if entry_bytes > self.limits.max_pack_bytes {
+            return Err(ReplicaCacheError::CacheCapacityExhausted("pack pair exceeds max_pack_bytes"));
+        }
+
+        let target_dir = self.root_dir.join(&key.key_digest);
+        let pack_name = format!("{}.pack", key.pack_stem);
+        let idx_name = format!("{}.idx", key.pack_stem);
+        let target_pack = target_dir.join(&pack_name);
+        let target_idx = target_dir.join(&idx_name);
+
+        let to_remove = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(existing) = guard.entries.get_mut(&key.key_digest) {
+                guard.lru_counter = guard.lru_counter.saturating_add(1);
+                existing.lru_seq = guard.lru_counter;
+                existing.pin_count = existing.pin_count.saturating_add(1);
+                return Ok(PackCachePin {
+                    key_digest: key.key_digest,
+                    pack_path: existing.pack_path.clone(),
+                    idx_path: existing.idx_path.clone(),
+                    inner: Arc::clone(&self.inner),
+                    released: false,
+                });
+            }
+            evict_unpinned_packs(&mut guard, &self.limits, entry_bytes)?
+        };
+        for dir in to_remove {
+            let _ = remove_dir_safely(&dir);
+        }
+
+        let staging_dir = self.root_dir.join(format!(".install-{}", Uuid::new_v4().simple()));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&staging_dir)
+            .map_err(|e| ReplicaCacheError::Io(format!("failed creating pack install dir: {e}")))?;
+        let install_res = (|| -> Result<(), ReplicaCacheError> {
+            copy_readonly(staged_pack, &staging_dir.join(&pack_name))?;
+            copy_readonly(staged_idx, &staging_dir.join(&idx_name))?;
+            let _ = remove_dir_safely(&target_dir);
+            std::fs::rename(&staging_dir, &target_dir)
+                .map_err(|e| ReplicaCacheError::Io(format!("failed committing pack dir: {e}")))?;
+            Ok(())
+        })();
+        if let Err(err) = install_res {
+            let _ = remove_dir_safely(&staging_dir);
+            return Err(err);
+        }
+
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let to_remove_late = evict_unpinned_packs(&mut guard, &self.limits, entry_bytes)?;
+        guard.lru_counter = guard.lru_counter.saturating_add(1);
+        let lru_seq = guard.lru_counter;
+        guard.total_bytes = guard.total_bytes.saturating_add(entry_bytes);
+        guard.entries.insert(
+            key.key_digest.clone(),
+            PackCacheEntry {
+                key: key.clone(),
+                dir_path: target_dir,
+                pack_path: target_pack.clone(),
+                idx_path: target_idx.clone(),
+                total_bytes: entry_bytes,
+                pin_count: 1,
+                lru_seq,
+            },
+        );
+        drop(guard);
+        for dir in to_remove_late {
+            let _ = remove_dir_safely(&dir);
+        }
+        Ok(PackCachePin {
+            key_digest: key.key_digest,
+            pack_path: target_pack,
+            idx_path: target_idx,
+            inner: Arc::clone(&self.inner),
+            released: false,
+        })
+    }
+
+    pub fn retire_key(&self, key_digest: &str) {
+        let remove_dir = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = guard.entries.remove(key_digest) {
+                if entry.pin_count == 0 {
+                    guard.total_bytes = guard.total_bytes.saturating_sub(entry.total_bytes);
+                    Some(entry.dir_path)
+                } else {
+                    guard.retired_entries.insert(key_digest.to_owned(), entry);
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(dir) = remove_dir {
+            let _ = remove_dir_safely(&dir);
+        }
+    }
+
+    pub fn clear_all(&self) {
+        let mut to_remove = Vec::new();
+        {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let keys: Vec<String> = guard.entries.keys().cloned().collect();
+            for key in keys {
+                if let Some(entry) = guard.entries.remove(&key) {
+                    if entry.pin_count == 0 {
+                        guard.total_bytes = guard.total_bytes.saturating_sub(entry.total_bytes);
+                        to_remove.push(entry.dir_path);
+                    } else {
+                        guard.retired_entries.insert(key, entry);
+                    }
+                }
+            }
+        }
+        for dir in to_remove {
+            let _ = remove_dir_safely(&dir);
+        }
+    }
+}
+
+fn evict_unpinned_packs(
+    guard: &mut PackCatalogInner,
+    limits: &ReplicaCacheLimits,
+    needed_bytes: u64,
+) -> Result<Vec<PathBuf>, ReplicaCacheError> {
+    let mut candidates: Vec<(u64, String, u64)> = guard
+        .entries
+        .iter()
+        .filter(|(_, e)| e.pin_count == 0)
+        .map(|(k, e)| (e.lru_seq, k.clone(), e.total_bytes))
+        .collect();
+    candidates.sort_by_key(|(seq, _, _)| *seq);
+
+    let mut projected_count = guard.entries.len();
+    let mut projected_bytes = guard.total_bytes;
+    let mut victims = Vec::new();
+    for (_, key, bytes) in candidates {
+        if projected_count < limits.max_pack_entries
+            && projected_bytes.saturating_add(needed_bytes) <= limits.max_pack_bytes
+        {
+            break;
+        }
+        projected_count = projected_count.saturating_sub(1);
+        projected_bytes = projected_bytes.saturating_sub(bytes);
+        victims.push(key);
+    }
+    if projected_count >= limits.max_pack_entries
+        || projected_bytes.saturating_add(needed_bytes) > limits.max_pack_bytes
+    {
+        guard.pin_protections = guard.pin_protections.saturating_add(1);
+        return Err(ReplicaCacheError::CacheCapacityExhausted("pack cache capacity pinned by active views"));
+    }
+    let mut dirs = Vec::with_capacity(victims.len());
+    for key in victims {
+        if let Some(removed) = guard.entries.remove(&key) {
+            guard.total_bytes = guard.total_bytes.saturating_sub(removed.total_bytes);
+            guard.evicted_count = guard.evicted_count.saturating_add(1);
+            dirs.push(removed.dir_path);
+        }
+    }
+    Ok(dirs)
+}
+
+pub fn ensure_private_dir(dir: &Path) -> Result<(), ReplicaCacheError> {
+    match DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => verify_private_dir(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => verify_private_dir(dir),
+        Err(e) => Err(ReplicaCacheError::Io(format!("failed creating private dir: {e}"))),
+    }
+}
+
+pub fn verify_private_dir(path: &Path) -> Result<(), ReplicaCacheError> {
+    let meta =
+        std::fs::symlink_metadata(path).map_err(|e| ReplicaCacheError::Io(format!("failed inspecting dir: {e}")))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(ReplicaCacheError::IntegrityFailed("cache directory must not be a symlink"));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(ReplicaCacheError::IntegrityFailed("cache directory must remain 0o700 private"));
+    }
+    Ok(())
+}
+
+pub fn remove_dir_safely(dir: &Path) -> Result<(), ReplicaCacheError> {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ReplicaCacheError::Io(format!("failed inspecting dir for removal: {e}"))),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(ReplicaCacheError::IntegrityFailed("refusing to remove symlink or non-directory"));
+            }
+            std::fs::remove_dir_all(dir)
+                .map_err(|e| ReplicaCacheError::Io(format!("failed removing cache dir: {e}")))?;
+            Ok(())
+        }
+    }
+}
+
+pub fn copy_readonly(src: &Path, dst: &Path) -> Result<u64, ReplicaCacheError> {
+    let mut reader = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(src)
+        .map_err(|e| ReplicaCacheError::Io(format!("failed opening source file: {e}")))?;
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o444)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dst)
+        .map_err(|e| ReplicaCacheError::Io(format!("failed creating readonly target: {e}")))?;
+    let mut buf = vec![0u8; HASH_CHUNK_BYTES];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| ReplicaCacheError::Io(format!("read failed: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n]).map_err(|e| ReplicaCacheError::Io(format!("write failed: {e}")))?;
+        total = total.saturating_add(n as u64);
+    }
+    writer.sync_all().map_err(|e| ReplicaCacheError::Io(format!("sync failed: {e}")))?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o444))
+        .map_err(|e| ReplicaCacheError::Io(format!("chmod 0444 failed: {e}")))?;
+    Ok(total)
+}
+
+pub(super) fn check_regular_file_len(path: &Path, expected_len: u64) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    !meta.file_type().is_symlink() && meta.is_file() && meta.len() == expected_len
+}
+
+fn verify_cached_pack_files(pack_path: &Path, idx_path: &Path, key: &PackCacheKey, verify_sha256: bool) -> bool {
+    if !check_regular_file_len(pack_path, key.pack_length) || !check_regular_file_len(idx_path, key.idx_length) {
+        return false;
+    }
+    if !verify_sha256 {
+        return true;
+    }
+    hash_file_matches(pack_path, &key.pack_sha256, key.pack_length)
+        && hash_file_matches(idx_path, &key.idx_sha256, key.idx_length)
+}
+
+pub(super) fn hash_file_matches(path: &Path, expected_sha256: &str, expected_len: u64) -> bool {
+    let Ok(mut file) = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) else {
+        return false;
+    };
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buf = vec![0u8; HASH_CHUNK_BYTES];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.update(&buf[..n]);
+                total = total.saturating_add(n as u64);
+            }
+            Err(_) => return false,
+        }
+    }
+    total == expected_len && hex::encode(hasher.finalize()) == expected_sha256
+}
