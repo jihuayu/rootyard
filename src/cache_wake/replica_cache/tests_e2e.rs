@@ -471,6 +471,7 @@ fn pack_cache_concurrent_install_clear_all_and_catalog_eviction_failure_preserve
         "refs/heads/main",
     )?;
     let l1 = views.view_root().create_view("v1", tid, rid, 1000, Some(limits.view_ttl))?;
+    let vk1_hex = vk1.view_key_hex.clone();
     let s1 = views.admit_and_checkout(vk1, l1, vec![], 1000, vec![])?;
     assert_eq!(views.resident_bytes(), 1000);
     let l2 = views.view_root().create_view("v2", tid, rid, 600, Some(limits.view_ttl))?;
@@ -479,6 +480,7 @@ fn pack_cache_concurrent_install_clear_all_and_catalog_eviction_failure_preserve
         Err(ReplicaCacheError::CacheCapacityExhausted(_))
     ));
     assert_eq!(views.resident_bytes(), 1000);
+    views.unindex_key(&vk1_hex);
     drop(s1);
     assert_eq!(views.resident_bytes(), 0);
     Ok(())
