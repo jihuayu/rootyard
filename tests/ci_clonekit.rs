@@ -456,14 +456,10 @@ async fn pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation(
         let c1 = add_commit(&repo, "big.bin", &payload_bytes(9, 128 * 1024), "c1")?;
         let (ids, token_id) = ((Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()), Uuid::new_v4());
         let client = pool.get().await?;
-        let token_digest_bytes = [7u8; 32];
-        let token_digest: &[u8] = &token_digest_bytes;
-        let repo_name: &str = "ckrepo";
-        let credential_digest_bytes = [9u8; 32];
-        let credential_digest: &[u8] = &credential_digest_bytes;
+        let (token_digest, credential_digest): (&[u8], &[u8]) = (&[7u8; 32], &[9u8; 32]);
         client.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&ids.0, &format!("ck_{}", &ids.0.simple().to_string()[..8])]).await?;
         client.execute("INSERT INTO tokens(id,user_id,digest) VALUES($1,$2,$3)", &[&token_id, &ids.0, &token_digest]).await?;
-        client.execute("INSERT INTO repositories(id,owner_id,name,state,object_format,storage_generation) VALUES($1,$2,$3,'ready','sha1',1)", &[&ids.1, &ids.0, &repo_name]).await?;
+        client.execute("INSERT INTO repositories(id,owner_id,name,state,object_format,storage_generation) VALUES($1,$2,$3,'ready','sha1',1)", &[&ids.1, &ids.0, &"ckrepo"]).await?;
         drop(client);
 
         let pg_dl = tokio::time::Instant::now() + Duration::from_secs(30);
