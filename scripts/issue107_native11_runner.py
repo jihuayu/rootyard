@@ -671,6 +671,7 @@ class _HistoricalTraceState:
         self.stage = "idle"
         self.packs = 0
         self.parent_success = False
+        self.assert_failed = False
 
     def current_open(self):
         if self.child is not None:
@@ -721,8 +722,10 @@ class _HistoricalTraceState:
                 return False
             if self.stage in ("expect_assert", "assert_open"):
                 return False
-            if self.stage == "done" and not self.parent_success:
-                # A failed historical parent is followed only by cleanup.
+            if self.stage == "done" and (
+                    not self.parent_success or self.assert_failed):
+                # A failed historical parent or failed site-2 predicate is
+                # followed only by phase-24 cleanup.
                 return phase == MAX_METADATA_REPLAY_PHASE
             return True
         if frame["iteration"] is not None:
@@ -753,6 +756,11 @@ class _HistoricalTraceState:
                 self.stage = "assert_open"
                 return True
             if self.stage == "assert_open" and event in (1, 2):
+                if event == 1 and ok is not True:
+                    return False
+                if event == 2 and ok is not False:
+                    return False
+                self.assert_failed = event == 2
                 self.assert_frame = None
                 self.stage = "done"
                 return True

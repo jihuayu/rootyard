@@ -849,6 +849,44 @@ class MetadataReplayTraceTests(unittest.TestCase):
         self.assertTrue(safe["known"])
         self.assertTrue(safe["cleanup_completed"])
 
+    def test_failed_site2_rejects_business_phases_but_allows_cleanup(self):
+        for phase in range(18, 24):
+            lines = self._historical_assert(
+                self._historical_parent_success(packs=2), ok=False)
+            lines.extend([
+                self._frame(phase, 1, 0),
+                self._frame(phase, 1, 1, ok="1"),
+            ])
+            lines.extend(self._finish(ok=True))
+            trace = self._project(lines)["case_trace"]
+            self.assertFalse(trace["known"], phase)
+            self.assertTrue(trace["invalid"], phase)
+            self.assertIsNone(trace["primary"], phase)
+        cleanup = self._historical_assert(
+            self._historical_parent_success(packs=2), ok=False)
+        cleanup.extend(self._finish(ok=True))
+        trace = self._project(cleanup)["case_trace"]
+        self.assertTrue(trace["known"])
+        self.assertFalse(trace["invalid"])
+        self.assertEqual(trace["first_failure"]["site"], 2)
+        self.assertEqual(trace["primary"]["site"], 2)
+        self.assertTrue(trace["cleanup_completed"])
+
+    def test_successful_site2_allows_business_phase_then_cleanup(self):
+        lines = self._historical_assert(
+            self._historical_parent_success(packs=2), ok=True)
+        lines.extend([
+            self._frame(18, 1, 0),
+            self._frame(18, 1, 1, ok="1"),
+        ])
+        lines.extend(self._finish(ok=True))
+        trace = self._project(lines)["case_trace"]
+        self.assertTrue(trace["known"])
+        self.assertFalse(trace["invalid"])
+        self.assertIsNone(trace["first_failure"])
+        self.assertTrue(trace["cleanup_completed"])
+        self.assertEqual(trace["last_completed"]["phase"], 24)
+
     def test_failure_at_each_historical_subcall_keeps_typed_primary(self):
         kinds = {3: 1, 4: 1, 5: 4, 7: 1, 6: 4, 8: 1, 9: 6}
         for site, kind in kinds.items():
