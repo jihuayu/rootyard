@@ -687,6 +687,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
         accepted but cannot reach PUT admission until shutdown closes it.
         """
         self._rootyard_diagnostic_phase = "setup"
+        self._rootyard_diagnostic_api_exit = None
         binary, _ = select_runtime_binary()
         self.assertTrue(binary.is_file())
         real_git = shutil.which("git")
@@ -1039,6 +1040,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 self.assertFalse(git_thread.is_alive(),
                                  "Git HTTP request did not resolve after wrapper release")
                 api_exit = support.wait_process_exit(h.proc, timeout=remaining())
+                self._rootyard_diagnostic_api_exit = api_exit
                 self.assertEqual(api_exit, 0,
                                  f"normal service shutdown exit {api_exit}, expected 0")
 

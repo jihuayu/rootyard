@@ -107,6 +107,18 @@ def _child_exit(error):
     return None
 
 
+def _diagnostic_child_exit(test, error):
+    """Use the original process code, else the test's returned API exit."""
+    value = _child_exit(error)
+    if value is not None:
+        return value
+    try:
+        value = getattr(test, "_rootyard_diagnostic_api_exit", None)
+    except BaseException:
+        return None
+    return _bounded_int(value, -255, 255)
+
+
 def _relative_source_path(filename):
     try:
         return Path(filename).resolve().relative_to(ROOT).as_posix()
@@ -165,7 +177,7 @@ def _diagnostic_record(test, error, tb):
         "source": _source_location(tb),
         "http_status": _http_status(error),
         "errno": _errno(error),
-        "child_exit": _child_exit(error),
+        "child_exit": _diagnostic_child_exit(test, error),
     }
 
 
