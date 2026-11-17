@@ -4,13 +4,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use uuid::Uuid;
 
-#[cfg(test)]
-pub(super) use super::growth_cas::stage_compaction_ledger;
-pub(super) use super::growth_cas::validate_mutations;
+pub(super) use super::growth_cas::{apply_cas_mutations, stage_compaction_ledger, validate_mutations};
 use super::{
     admission_types::AdmissionRejection,
     git_ops::{ObjectFormat, UploadedPackPair},
-    growth_cas::{apply_cas_mutations, stage_push_ledger},
+    growth_cas::stage_push_ledger,
     growth_types::{
         CompactionOutcome, GrowthEngineError, GrowthEngineSnapshot, PushOutcome, RefMutation, VerifiedPackRecord,
     },

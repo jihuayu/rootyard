@@ -13,7 +13,7 @@ use axum::{
     Router,
     body::Body,
     extract::State,
-    http::{Method, StatusCode, Uri},
+    http::{Method, Uri},
     response::Response,
 };
 use bytes::Bytes;
@@ -115,12 +115,12 @@ async fn handle_s3(State(st): State<Arc<S3State>>, method: Method, uri: Uri, bod
     }
     let ok = |b: &[u8], body: Body| -> Response {
         let tag = format!("\"{}\"", &hex::encode(Sha256::digest(b))[..32]);
-        Response::builder().status(200).header("etag", tag).header("content-length", b.len()).body(body).unwrap()
+        Response::builder().status(200u16).header("etag", tag).header("content-length", b.len()).body(body).unwrap()
     };
     match method {
         Method::PUT => {
             if st.fail_put.lock().unwrap().take_if(|s| key.contains(s.as_str())).is_some() {
-                return Response::builder().status(500).body(Body::empty()).unwrap();
+                return Response::builder().status(500u16).body(Body::empty()).unwrap();
             }
             let r = ok(body.as_ref(), Body::empty());
             st.objects.lock().unwrap().insert(key, body.to_vec());
@@ -128,9 +128,9 @@ async fn handle_s3(State(st): State<Arc<S3State>>, method: Method, uri: Uri, bod
         }
         Method::HEAD | Method::GET => match st.objects.lock().unwrap().get(&key).cloned() {
             Some(d) => ok(&d.clone(), if method == Method::HEAD { Body::empty() } else { Body::from(d) }),
-            None => Response::builder().status(404).body(Body::empty()).unwrap(),
+            None => Response::builder().status(404u16).body(Body::empty()).unwrap(),
         },
-        _ => Response::builder().status(405).body(Body::empty()).unwrap(),
+        _ => Response::builder().status(405u16).body(Body::empty()).unwrap(),
     }
 }
 
