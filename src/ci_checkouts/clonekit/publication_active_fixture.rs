@@ -64,7 +64,7 @@ pub(super) fn build_active_candidate(
     commit_file(&source_repo, &format!("{label}.bin"), payload, &format!("{label} candidate commit"))?;
     let staging_root = td.path().join(format!("staging-{label}"));
     fs::create_dir_all(&staging_root)?;
-    fs::set_permissions(&staging_root, Permissions::from_mode(0o700))?;
+    fs::set_permissions(&staging_root, std::fs::Permissions::from_mode(0o700))?;
     let built = build_clonekit_from_git(
         &BuildCloneKitRequest {
             tenant_id: ids.0,
