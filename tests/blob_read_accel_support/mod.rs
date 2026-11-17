@@ -1,8 +1,8 @@
 //! Private support module for the Issue #165 read-acceleration integration test.
 //!
-//! The top-level `#[tokio::test]` wrapper in `tests/blob_read_accel.rs` keeps the
-//! public test name and calls the implementation here, keeping both files below
-//! the repository's strict 500-line module budget.
+//! The top-level `#[test]` wrappers in `tests/blob_read_accel.rs` keep the public
+//! test names and call these implementations through one shared process-lifetime
+//! Tokio runtime, keeping both files below the repository's strict 500-line budget.
 
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
