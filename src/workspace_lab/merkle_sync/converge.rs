@@ -211,7 +211,7 @@ pub struct CaptureBarrierRequest<'a> {
 
 #[derive(Clone, Debug)]
 pub enum ConvergeOutcome {
-    Converged { scan: ScanResult, git_bundle: GitBundleSnapshot, attempts: u32, stats: CoalescerStats },
+    Converged { scan: Box<ScanResult>, git_bundle: GitBundleSnapshot, attempts: u32, stats: CoalescerStats },
     NotQuiescent { reason: String, attempts: u32 },
     UnsupportedState { reason: String },
 }
@@ -248,9 +248,9 @@ fn capture_stamp(
     }
     let mut ref_hasher = Sha256::new();
     for (k, v) in ref_entries {
-        ref_hasher.update(&(k.len() as u64).to_le_bytes());
+        ref_hasher.update((k.len() as u64).to_le_bytes());
         ref_hasher.update(&k);
-        ref_hasher.update(&(v.len() as u64).to_le_bytes());
+        ref_hasher.update((v.len() as u64).to_le_bytes());
         ref_hasher.update(&v);
     }
     let mut stat_hasher = Sha256::new();
@@ -303,15 +303,15 @@ fn hash_worktree_stat_tree(root: &Path, rel: &Path, hasher: &mut Sha256) -> Resu
     items.sort_by(|a, b| a.0.cmp(&b.0));
     for (name_bytes, full, child_rel) in items {
         let meta = fs::symlink_metadata(&full)?;
-        hasher.update(&(name_bytes.len() as u64).to_le_bytes());
+        hasher.update((name_bytes.len() as u64).to_le_bytes());
         hasher.update(&name_bytes);
-        hasher.update(&meta.mode().to_le_bytes());
-        hasher.update(&meta.len().to_le_bytes());
-        hasher.update(&meta.ino().to_le_bytes());
-        hasher.update(&meta.mtime().to_le_bytes());
-        hasher.update(&meta.mtime_nsec().to_le_bytes());
-        hasher.update(&meta.ctime().to_le_bytes());
-        hasher.update(&meta.ctime_nsec().to_le_bytes());
+        hasher.update(meta.mode().to_le_bytes());
+        hasher.update(meta.len().to_le_bytes());
+        hasher.update(meta.ino().to_le_bytes());
+        hasher.update(meta.mtime().to_le_bytes());
+        hasher.update(meta.mtime_nsec().to_le_bytes());
+        hasher.update(meta.ctime().to_le_bytes());
+        hasher.update(meta.ctime_nsec().to_le_bytes());
         if meta.is_dir() {
             hasher.update(b"D");
             hash_worktree_stat_tree(root, &child_rel, hasher)?;
@@ -435,7 +435,7 @@ pub fn capture_with_quiescence_barrier(
             escalate_full = true;
             continue;
         }
-        return Ok(ConvergeOutcome::Converged { scan, git_bundle, attempts: attempt, stats });
+        return Ok(ConvergeOutcome::Converged { scan: Box::new(scan), git_bundle, attempts: attempt, stats });
     }
     Ok(ConvergeOutcome::NotQuiescent { reason: last_reason, attempts: req.max_attempts })
 }

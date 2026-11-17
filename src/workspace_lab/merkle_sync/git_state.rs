@@ -306,9 +306,9 @@ fn collect_ignore_files_digest(
     let mut hasher = Sha256::new();
     hasher.update(b"rootyard.merkle-sync.v1:ignore-rules\0");
     for (p, body) in files {
-        hasher.update(&(p.len() as u64).to_le_bytes());
+        hasher.update((p.len() as u64).to_le_bytes());
         hasher.update(&p);
-        hasher.update(&(body.len() as u64).to_le_bytes());
+        hasher.update((body.len() as u64).to_le_bytes());
         hasher.update(&body);
     }
     Ok(hex::encode(hasher.finalize()))

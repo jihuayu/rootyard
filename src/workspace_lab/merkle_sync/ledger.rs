@@ -191,7 +191,7 @@ impl BlobUploadDriver for PgProtectedUploadDriver {
                 args.store.backend_identity().clone(),
                 args.authority_id,
                 args.generation,
-                self.expected_gate_digest.clone(),
+                self.expected_gate_digest,
                 vec![spec],
             )
             .map_err(|e| MerkleSyncError::InvalidInput(e.to_string()))?;
