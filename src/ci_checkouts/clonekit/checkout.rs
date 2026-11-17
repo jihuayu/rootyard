@@ -433,7 +433,7 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
     fs::copy(&staged_idx, &dst_idx).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
 
     let dst_idx_str = dst_idx.to_str().ok_or(CloneKitError::InvalidInput("non-utf8 idx path"))?;
-    if let Err(err) = run_git_command(req.git_binary, Some(&work_repo), &["verify-pack", "-s", dst_idx_str], None) {
+    if let Err(err) = run_git_command(req.git_binary, Some(&work_repo), &["verify-pack", "--", dst_idx_str], None) {
         return if allow_fallback {
             let clean_work = work_repo.with_file_name("checkout-fallback");
             run_stock_git_checkout(

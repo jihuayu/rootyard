@@ -253,7 +253,7 @@ fn verify_idx_in_ephemeral_repo(
             &["init", "--bare", "--quiet", object_format.git_init_flag()],
             cancel,
         )?;
-        run_git_command(git_binary, Some(&verify_repo), &["verify-pack", "-s", idx_str], cancel)?;
+        run_git_command(git_binary, Some(&verify_repo), &["verify-pack", "--", idx_str], cancel)?;
         Ok(())
     })();
     let _ = fs::remove_dir_all(&verify_repo);
@@ -361,7 +361,7 @@ pub fn build_clonekit_from_git(
     let (pack_path, idx_path) =
         (stage_dir.join(format!("clonekit-{pack_hash}.pack")), stage_dir.join(format!("clonekit-{pack_hash}.idx")));
     let idx_arg = idx_path.to_str().ok_or(CloneKitError::InvalidInput("non-utf8 idx path"))?;
-    run_git_command(&req.git_binary, Some(&req.source_repo_dir), &["verify-pack", "-s", idx_arg], cancel)?;
+    run_git_command(&req.git_binary, Some(&req.source_repo_dir), &["verify-pack", "--", idx_arg], cancel)?;
 
     if req.inject_failure == Some(BuildFailurePoint::CorruptStagedPack) {
         let mut corrupted = fs::read(&pack_path).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
