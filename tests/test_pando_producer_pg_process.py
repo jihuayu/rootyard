@@ -51,6 +51,14 @@ class FakeThread:
         return self.alive
 
 
+class NoRunThread(FakeThread):
+    """Reader appears alive forever because a descendant keeps the pipe open."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.run_target = False
+
+
 class StartFailThread(FakeThread):
     def start(self):
         raise RuntimeError("reader start failed")
@@ -186,6 +194,48 @@ class StreamingBudgetTest(unittest.TestCase):
         self.assertEqual(result.returncode, 7)
         self.assertEqual(result.stdout, b"out")
         self.assertEqual(fake.stdin.getvalue(), b"schema")
+
+
+class GroupOwnershipTest(unittest.TestCase):
+    def test_timeout_group_absence_is_verified(self):
+        fake = StreamingPopen(block=True)
+        group = GroupKiller()
+        runner = stream_runner(fake, group=group)
+        with self.assertRaises(RunnerError) as caught:
+            runner.run(["fixture"], timeout=0.05, timeout_code="cargo_timeout")
+        self.assertEqual(caught.exception.code, "cargo_timeout")
+        self.assertTrue(fake.killed)
+        self.assertIsNotNone(fake.poll())
+
+    def test_group_kill_failure_is_unverified_with_primary_context(self):
+        fake = StreamingPopen(block=True)
+        group = GroupKiller(fail=True)
+        runner = stream_runner(fake, group=group)
+        with self.assertRaises(RunnerError) as caught:
+            runner.run(["fixture"], timeout=0.05, timeout_code="cargo_timeout")
+        self.assertEqual(caught.exception.code, "process_group_unverified")
+        self.assertEqual(caught.exception.primary_code, "cargo_timeout")
+        self.assertTrue(fake.killed)
+
+    def test_leader_exit_with_descendant_and_group_failure_is_unverified(self):
+        fake = StreamingPopen(returncode=0)
+        group = GroupKiller(fail=True)
+        runner = stream_runner(fake, thread_factory=NoRunThread, group=group)
+        with self.assertRaises(RunnerError) as caught:
+            runner.run(["fixture"], timeout=5)
+        self.assertEqual(caught.exception.code, "process_group_unverified")
+        self.assertEqual(caught.exception.primary_code, "process_unreaped")
+        self.assertTrue(fake.killed)
+        self.assertEqual(len(group.calls), 1)
+
+    def test_leader_exit_with_descendant_is_not_false_success(self):
+        fake = StreamingPopen(returncode=0)
+        group = GroupKiller()
+        runner = stream_runner(fake, thread_factory=NoRunThread, group=group)
+        with self.assertRaises(RunnerError) as caught:
+            runner.run(["fixture"], timeout=5)
+        self.assertEqual(caught.exception.code, "process_unreaped")
+        self.assertTrue(fake.killed)
 
 
 if __name__ == "__main__":

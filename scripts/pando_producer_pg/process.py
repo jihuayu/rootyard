@@ -328,34 +328,67 @@ class ProcessRunner:
 
     def _cleanup_failure(self, process, entries, stage, primary):
         deadline = self.clock() + KILL_WAIT_SECONDS
-        reaped = self._terminate(process, deadline)
-        joined = self._join_readers(entries, deadline)
+        try:
+            outcome = self._terminate(process, deadline)
+        except Exception:
+            outcome = {"direct_reaped": False, "group_verified": False}
+        try:
+            joined = self._join_readers(entries, deadline)
+        except Exception:
+            joined = False
         if joined:
             self._close_streams(process)
-        if not reaped or not joined:
-            return RunnerError(stage, "process_unreaped")
+        if not outcome.get("group_verified"):
+            return RunnerError(
+                stage, "process_group_unverified", primary_code=primary
+            )
+        if not outcome.get("direct_reaped") or not joined:
+            return RunnerError(stage, "process_unreaped", primary_code=primary)
         return RunnerError(stage, primary)
 
     def _terminate(self, process, deadline):
-        pid = getattr(process, "pid", None)
-        if isinstance(pid, int) and pid > 0 and pid != os.getpid():
+        # The owned child is a new-session leader, so its PID is the group ID.
+        # ESRCH for that exact owned group proves absence; EPERM/other failures
+        # remain unverified even when the direct child is reaped.
+        pgid = getattr(process, "pid", None)
+        group_signal_sent = False
+        group_verified = False
+        if isinstance(pgid, int) and pgid > 0 and pgid != os.getpid():
             try:
-                self._killpg(pid, signal.SIGKILL)
+                self._killpg(pgid, signal.SIGKILL)
+                group_signal_sent = True
+            except ProcessLookupError:
+                group_verified = True
             except (OSError, ValueError, TypeError):
-                pass
+                group_verified = False
         try:
             process.kill()
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):
             pass
         remaining = max(0.0, deadline - self.clock())
         try:
             process.wait(timeout=remaining)
-        except (subprocess.TimeoutExpired, OSError, ValueError):
+        except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
             pass
         try:
-            return process.poll() is not None
-        except (OSError, ValueError):
+            direct_reaped = process.poll() is not None
+        except (OSError, ValueError, AttributeError):
+            direct_reaped = False
+        if group_signal_sent:
+            group_verified = self._group_absent(pgid)
+        return {
+            "direct_reaped": direct_reaped,
+            "group_verified": group_verified,
+        }
+
+    def _group_absent(self, pgid):
+        try:
+            self._killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except (OSError, ValueError, TypeError):
             return False
+        return False
 
     def _join_readers(self, entries, deadline):
         for entry in entries:
@@ -366,17 +399,17 @@ class ProcessRunner:
                 try:
                     if not thread.is_alive():
                         continue
-                except (RuntimeError, OSError, ValueError):
+                except (RuntimeError, OSError, ValueError, AttributeError):
                     return False
             remaining = max(0.0, deadline - self.clock())
             try:
                 thread.join(timeout=remaining)
-            except (RuntimeError, OSError, ValueError):
+            except (RuntimeError, OSError, ValueError, AttributeError):
                 return False
             try:
                 if thread.is_alive():
                     return False
-            except (RuntimeError, OSError, ValueError):
+            except (RuntimeError, OSError, ValueError, AttributeError):
                 return False
         return True
 

@@ -361,6 +361,7 @@ class ProcessOwnershipTest(unittest.TestCase):
         with self.assertRaises(process.RunnerError) as caught:
             runner.run(["cargo"], timeout=0.05, timeout_code="cargo_timeout")
         self.assertEqual(caught.exception.code, "process_unreaped")
+        self.assertEqual(caught.exception.primary_code, "cargo_timeout")
 
 
 if __name__ == "__main__":

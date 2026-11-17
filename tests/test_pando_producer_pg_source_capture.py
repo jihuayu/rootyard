@@ -215,6 +215,27 @@ class BoundedCaptureTest(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "commit_mismatch")
 
+    def test_group_unverified_child_status_is_preserved(self):
+        fake = FakeRunner([
+            RunnerError(
+                "source",
+                "process_group_unverified",
+                primary_code="source_capture_deadline_exceeded",
+            )
+        ])
+        with self.assertRaises(RunnerError) as caught:
+            source_capture.capture_bounded(
+                self.root,
+                COMMIT,
+                deadline=100,
+                clock=self.clock,
+                process_runner=fake,
+            )
+        self.assertEqual(caught.exception.code, "process_group_unverified")
+        self.assertEqual(
+            caught.exception.primary_code, "source_capture_deadline_exceeded"
+        )
+
     def test_binding_shape_requires_helper_relative_rows_and_exact_anchor(self):
         missing_helper = binding()
         missing_helper["input_hashes"] = missing_helper["input_hashes"][1:]

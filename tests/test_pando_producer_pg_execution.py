@@ -173,6 +173,23 @@ class ExecuteCasesTest(unittest.TestCase):
         self.assertEqual(records[2]["code"], "nonzero_exit")
         self.assertTrue(all(row["status"] == "not_run" for row in records[3:]))
 
+    def test_group_unverified_case_is_failed_and_stops(self):
+        fake = FakeRunner([
+            RunnerError(
+                "execute",
+                "process_group_unverified",
+                primary_code="case_timeout",
+            )
+        ])
+        records = cases.execute_cases(
+            BINARY, {}, fake, work_deadline=1000, case_timeout=30,
+            clock=lambda: 0, cwd="/tmp/source",
+        )
+        self.assertEqual(records[0]["status"], "failed")
+        self.assertEqual(records[0]["code"], "process_group_unverified")
+        self.assertTrue(records[0]["executed"])
+        self.assertTrue(all(row["status"] == "not_run" for row in records[1:]))
+
     def test_timeout_and_deadline_are_finite(self):
         fake = FakeRunner([RunnerError("execute", "case_timeout")])
         records = cases.execute_cases(

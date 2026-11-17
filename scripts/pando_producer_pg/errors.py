@@ -107,6 +107,7 @@ CODES = frozenset(
         "process_timeout",
         "process_unreaped",
         "process_output_exceeded",
+        "process_group_unverified",
         "internal_error",
     )
 )
@@ -115,11 +116,14 @@ CODES = frozenset(
 class RunnerError(RuntimeError):
     """A fail-closed refusal with only a registered stage and code."""
 
-    def __init__(self, stage, code):
+    def __init__(self, stage, code, primary_code=None):
         if stage not in STAGES or code not in CODES:
             raise ValueError("unregistered producer PG failure")
+        if primary_code is not None and primary_code not in CODES:
+            raise ValueError("unregistered producer PG primary failure")
         self.stage = stage
         self.code = code
+        self.primary_code = primary_code
         super().__init__(code)
 
 

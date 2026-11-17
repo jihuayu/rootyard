@@ -227,6 +227,37 @@ class RunnerBudgetTest(OrchestrationFakes, unittest.TestCase):
         self.assertFalse(payload["source_bindings"]["source_rechecked"])
         self.assertFalse(payload["fresh_verification"])
 
+    def test_source_recheck_group_unverified_preserves_primary(self):
+        clock = FakeClock(0)
+        initial = self.binding()
+        state = {"calls": 0}
+
+        def capture(*args, **kwargs):
+            state["calls"] += 1
+            if state["calls"] > 1:
+                raise RunnerError(
+                    "source",
+                    "process_group_unverified",
+                    primary_code="source_capture_deadline_exceeded",
+                )
+            return dict(initial)
+
+        payload, _, _, _ = self.invoke(
+            clock, capture=capture, execute=lambda *a, **k: passing_records(),
+            cleanup=None,
+        )
+        self.assertFalse(payload["passed"])
+        self.assertEqual(payload["error_code"], "process_group_unverified")
+        self.assertEqual(payload["stage"], "binding")
+        binding = payload["source_bindings"]
+        self.assertFalse(binding["source_rechecked"])
+        self.assertEqual(binding["verification_code"], "process_group_unverified")
+        self.assertEqual(
+            binding["verification_primary_code"],
+            "source_capture_deadline_exceeded",
+        )
+        self.assertFalse(payload["fresh_verification"])
+
     def test_binary_recheck_deadline_skips_hash_and_marks_unverified(self):
         clock = FakeClock(0)
         initial = self.binding()

@@ -277,15 +277,18 @@ def run(
             except RunnerError as caught:
                 binding["source_rechecked"] = False
                 binding["source_unchanged"] = False
-                code = (
-                    "source_recheck_deadline_exceeded"
-                    if caught.code in (
-                        "source_capture_deadline_exceeded",
-                        "source_recheck_deadline_exceeded",
-                    )
-                    else "source_recheck_failed"
-                )
+                if caught.code == "process_group_unverified":
+                    code = "process_group_unverified"
+                elif caught.code in (
+                    "source_capture_deadline_exceeded",
+                    "source_recheck_deadline_exceeded",
+                ):
+                    code = "source_recheck_deadline_exceeded"
+                else:
+                    code = "source_recheck_failed"
                 binding["verification_code"] = code
+                if getattr(caught, "primary_code", None) is not None:
+                    binding["verification_primary_code"] = caught.primary_code
                 raise RunnerError("binding", code) from None
             binding["source_rechecked"] = True
             binding["source_unchanged"] = source.same(binding, after)

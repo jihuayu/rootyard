@@ -288,6 +288,15 @@ class AbsentThenTimeoutRunner:
         raise RunnerError("cleanup", "root_remove_timeout")
 
 
+class GroupUnverifiedRootRunner:
+    def run(self, argv, **kwargs):
+        raise RunnerError(
+            "cleanup",
+            "process_group_unverified",
+            primary_code="root_remove_timeout",
+        )
+
+
 class BoundedRootRemovalTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -336,6 +345,18 @@ class BoundedRootRemovalTest(unittest.TestCase):
         self.assertEqual(result["code"], "root_cleanup_deadline_exceeded")
         self.assertTrue(fake.killed)
         self.assertIsNotNone(fake.poll())
+        self.assertTrue(root.path.exists())
+
+    def test_group_unverified_child_is_root_remove_unverified(self):
+        root = self.owned_root()
+        remover = root_cleanup.BoundedRootRemover(
+            clock=lambda: 0.0,
+            process_runner=GroupUnverifiedRootRunner(),
+        )
+        result = remover.remove(root, deadline=100)
+        self.assertFalse(result["removed"])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["code"], "root_remove_unverified")
         self.assertTrue(root.path.exists())
 
     def test_verified_child_absence_is_required_for_success(self):

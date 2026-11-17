@@ -82,6 +82,12 @@ class PgFake:
                 return Result(0, b"")
             if self.create_mode == "unknown":
                 raise FixtureError("process_failed")
+            if self.create_mode == "group_unverified":
+                raise process.RunnerError(
+                    "setup",
+                    "process_group_unverified",
+                    primary_code="process_timeout",
+                )
             self.exists = True
             self.identity = {"oid": "999", "datdba": "10", "database": self.database}
             return Result(1, b"")
@@ -95,15 +101,23 @@ class PgFake:
 
 
 class PgFactory:
-    def __init__(self, create_mode="ok", schema_ok=True, validate_fail=False):
+    def __init__(
+        self, create_mode="ok", schema_ok=True, validate_fail=False, bounded=False
+    ):
         self.create_mode = create_mode
         self.schema_ok = schema_ok
         self.validate_fail = validate_fail
+        self.bounded = bounded
         self.pg = None
         self.fake = None
 
     def __call__(self, dsn, nonce, runner):
-        pg = resources.OwnedPostgres(dsn, nonce=nonce, runner=runner)
+        factory = (
+            resources.BoundedOwnedPostgres
+            if self.bounded
+            else resources.OwnedPostgres
+        )
+        pg = factory(dsn, nonce=nonce, runner=runner)
         fake = PgFake(pg.database, self.create_mode, self.validate_fail)
         fake.schema_ok = self.schema_ok
         pg.runner = fake
@@ -217,6 +231,21 @@ class OwnedFixtureTest(unittest.TestCase):
         self.assertTrue(cleanup["root"]["removed"])
         self.assertFalse(cleanup["postgres_cleanup_verified"])
         self.assertTrue(cleanup["root_cleanup_verified"])
+
+    def test_group_unverified_create_is_unknown_and_never_drops(self):
+        factory = PgFactory("group_unverified", bounded=True)
+        fixture = self.fixture(factory)
+        with self.assertRaises(process.RunnerError) as caught:
+            fixture.start(deadline=1e18)
+        self.assertEqual(caught.exception.code, "postgres_create_unknown")
+        self.assertEqual(fixture.postgres.creation_outcome, "unknown")
+        cleanup = fixture.cleanup(1e18)
+        self.assertFalse(cleanup["database_absent"])
+        self.assertFalse(cleanup["postgres_dropped"])
+        self.assertEqual(
+            cleanup["error_code"], "postgres_create_outcome_unknown"
+        )
+        self.assertEqual(factory.fake.drop_sqls, [])
 
     def test_rejected_create_race_never_claims_absent_or_drops(self):
         factory = PgFactory("reject")
