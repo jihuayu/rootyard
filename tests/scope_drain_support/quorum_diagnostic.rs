@@ -15,7 +15,7 @@ use openraft::error::Fatal;
 use rootyard::ref_store::raft_backend::{RaftBackendError, RootRaftNode};
 use serde::Serialize;
 
-use super::{CASE_REAL, Phase, PhaseGuard, PhaseLabel};
+use super::{PhaseGuard, PhaseLabel};
 
 #[path = "../../src/ref_store/raft_backend/backend/cause.rs"]
 mod cause;
@@ -63,13 +63,14 @@ struct NodeSample {
 }
 
 /// Polls `future` exactly once around two synchronous fixed-node metric snapshots.
-pub(crate) async fn observe_call<T, F>(
-    phase: &PhaseGuard<Phase>,
+pub(crate) async fn observe_call<P, T, F>(
+    phase: &PhaseGuard<P>,
     cluster: &crate::TestCluster,
     operation: Operation,
     future: F,
 ) -> Result<T, RaftBackendError>
 where
+    P: PhaseLabel,
     F: Future<Output = Result<T, RaftBackendError>>,
 {
     let started = Instant::now();
@@ -181,8 +182,8 @@ fn classify(error: &RaftBackendError, expected: Operation) -> (Operation, &'stat
     }
 }
 
-fn emit(
-    phase: &PhaseGuard<Phase>,
+fn emit<P: PhaseLabel>(
+    phase: &PhaseGuard<P>,
     expected: Operation,
     error: &RaftBackendError,
     started: Instant,
@@ -195,7 +196,7 @@ fn emit(
         if elapsed > u128::from(MAX_ELAPSED_MS) { (MAX_ELAPSED_MS, true) } else { (elapsed as u64, false) };
     let frame = Frame {
         schema: SCHEMA,
-        case: CASE_REAL,
+        case: phase.case(),
         phase: phase.current().code(),
         operation: operation.code(),
         cause,

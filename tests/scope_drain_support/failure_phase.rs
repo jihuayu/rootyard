@@ -237,6 +237,10 @@ impl<P: PhaseLabel> PhaseGuard<P> {
         self.phase
     }
 
+    pub(crate) fn case(&self) -> &'static str {
+        self.case
+    }
+
     pub(crate) fn fail(mut self, class: Class) {
         self.emit(class);
         self.armed = false;
