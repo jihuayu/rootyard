@@ -326,6 +326,10 @@ class ProcessRunner:
             raise self._cleanup_failure(
                 process, entries, stage, "process_unreaped", cleanup_deadline
             ) from None
+        if self.clock() >= operation_deadline:
+            raise self._cleanup_failure(
+                process, entries, stage, timeout_code, cleanup_deadline
+            ) from None
         # Readers can discover overflow/error while the bounded join is still
         # finishing.  Re-check after the join, before closing or returning.
         if budget.reader_error or (writer is not None and writer.failed):
