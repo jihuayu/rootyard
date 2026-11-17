@@ -205,7 +205,15 @@ pub(super) async fn ensure_snapshot_unchanged(t: &Transaction<'_>, repo: Uuid, b
         .into_iter()
         .map(|r| Pack { id: r.get(0), pack_sha256: r.get(1), idx_sha256: r.get(2) })
         .collect::<Vec<_>>();
-    ensure!(packs == base.packs, "Pando manifests changed after migration parity preparation");
+    ensure!(
+        packs.len() == base.packs.len()
+            && packs.iter().zip(&base.packs).all(|(current, expected)| {
+                current.id == expected.id
+                    && current.pack_sha256 == expected.pack_sha256
+                    && current.idx_sha256 == expected.idx_sha256
+            }),
+        "Pando manifests changed after migration parity preparation"
+    );
     Ok(())
 }
 
