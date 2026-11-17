@@ -466,6 +466,12 @@ impl StageClass {
 mod detail_classifier;
 mod parity;
 mod retention;
-pub(super) use detail_classifier::{DetailClass, cached_fallback_detail_class};
-pub(super) use parity::sha1_and_sha256_parity_and_default_disabled_behavior;
-pub(super) use retention::retention_pin_protects_packs_until_release_and_compaction_rebuild;
+use detail_classifier::{DetailClass, cached_fallback_detail_class};
+
+pub(super) async fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Result<()> {
+    parity::sha1_and_sha256_parity_and_default_disabled_behavior().await
+}
+
+pub(super) async fn retention_pin_protects_packs_until_release_and_compaction_rebuild() -> Result<()> {
+    retention::retention_pin_protects_packs_until_release_and_compaction_rebuild().await
+}
