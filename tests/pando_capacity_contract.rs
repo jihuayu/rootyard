@@ -450,7 +450,7 @@ async fn concurrent_commit_rejects_window_overflow_and_compacted_base() -> Resul
             (
                 engine.snapshot().epoch,
                 engine.snapshot().active_frontier_len,
-                engine.snapshot().ledger.hot_registrations
+                engine.snapshot().ledger.protected_registrations
             ),
             (2, 2, 2)
         );
