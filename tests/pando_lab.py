@@ -778,22 +778,55 @@ class Lab:
         assert manifests, 'Expected at least one committed manifest for object store test'
         pack_id = manifests[0]['pack_id']
 
-        put_rep = json.loads(self.cli('object-store-put', self.repo, pack_id, '--chunk-size', '4096'))
-        assert put_rep['status'] == 'published' and put_rep['chunk_count'] >= 1, put_rep
-        assert put_rep['immutable_mode'] == '0444', put_rep
+        # The catalogue row in pando_lab.manifests is the source pack under test;
+        # it must remain. Only the object-store publication pair may be absent.
+        root_env = self.env.get('PANDO_OBJECT_STORE_ROOT')
+        store_root = Path(root_env) if root_env is not None and root_env.strip() else self.store
+        bucket_env = self.env.get('PANDO_OBJECT_STORE_BUCKET')
+        bucket = bucket_env if bucket_env is not None and bucket_env.strip() else 'pando-default'
+        manifest_path = store_root / 'manifests' / self.repo / f'{pack_id}.json'
+        pack_key = store_root / 'buckets' / bucket / 'repos' / self.repo / 'packs' / f'{pack_id}.pack'
+        idx_key = store_root / 'buckets' / bucket / 'repos' / self.repo / 'packs' / f'{pack_id}.idx'
+        multipart_dir = store_root / 'multipart'
+
+        def assert_unpublished_pair():
+            counts = json.loads(self.sql(
+                "SELECT json_build_object("
+                f"'source_pack',(SELECT count(*) FROM pando_lab.manifests WHERE repo='{self.repo}' AND pack_id='{pack_id}'),"
+                f"'object_store_manifest',(SELECT count(*) FROM pando_lab.object_store_manifests WHERE repo='{self.repo}' AND pack_id='{pack_id}'),"
+                f"'kms_envelope',(SELECT count(*) FROM pando_lab.kms_envelopes WHERE repo='{self.repo}' AND pack_id='{pack_id}'))"
+            ))
+            assert counts == {'source_pack': 1, 'object_store_manifest': 0, 'kms_envelope': 0}, counts
+            assert not manifest_path.exists(), 'object-store manifest exists before publication'
+            assert not pack_key.exists(), 'object-store CAS pack exists before publication'
+            assert not idx_key.exists(), 'object-store CAS idx exists before publication'
+            assert not multipart_dir.exists() or len(list(multipart_dir.iterdir())) == 0, \
+                'multipart staging not empty before publication'
+
+        assert_unpublished_pair()
 
         fail_res = self.run(
             [self.binary, 'object-store-put', self.repo, pack_id, '--chunk-size', '64', '--fail-after-chunks', '1'],
             check=False,
         )
         assert fail_res.returncode != 0, 'Fault injection --fail-after-chunks 1 must fail closed'
+        assert ('fault injection: multipart upload' in fail_res.stderr
+                and 'aborted after 1 chunks' in fail_res.stderr), \
+            'fault-injection diagnostic predicate not met'
+        assert_unpublished_pair()
+
         corrupt_res = self.run(
             [self.binary, 'object-store-put', self.repo, pack_id, '--chunk-size', '64', '--corrupt-chunk', '1'],
             check=False,
         )
         assert corrupt_res.returncode != 0, 'Corrupt chunk part must fail closed'
-        multipart_dir = self.store / 'multipart'
-        assert not multipart_dir.exists() or len(list(multipart_dir.iterdir())) == 0
+        assert 'multipart chunk 1 digest or size mismatch' in corrupt_res.stderr, \
+            'corrupt-chunk diagnostic predicate not met'
+        assert_unpublished_pair()
+
+        put_rep = json.loads(self.cli('object-store-put', self.repo, pack_id, '--chunk-size', '4096'))
+        assert put_rep['status'] == 'published' and put_rep['chunk_count'] >= 1, put_rep
+        assert put_rep['immutable_mode'] == '0444', put_rep
 
         local_pack = self.store / 'objects' / self.repo / f'{pack_id}.pack'
         if local_pack.exists():
