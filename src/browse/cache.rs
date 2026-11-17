@@ -93,7 +93,7 @@ fn parse_cache_environment(raw: Result<String, std::env::VarError>) -> Result<St
 }
 
 fn cache_environment() -> Result<String, Error> {
-    parse_cache_environment(std::env::var("ROOTYARD_CACHE_ENVIRONMENT")).map_err(|reason| Error::internal(reason))
+    parse_cache_environment(std::env::var("ROOTYARD_CACHE_ENVIRONMENT")).map_err(Error::internal)
 }
 
 fn hashed_discriminator(tag: &str, parts: &[Option<&str>], limit: Option<usize>) -> String {
