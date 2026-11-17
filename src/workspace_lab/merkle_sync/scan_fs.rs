@@ -478,7 +478,7 @@ mod tests {
 
         fs::write(repo.join("sub_b/deep/b_0.txt"), b"changed-during-drop\n")?;
         co.ingest(WatcherBatch { seq_start: 10, seq_end: 11, events: vec![WatcherEvent::Overflow] });
-        let run_p = |seq, keep, prev, max_a| {
+        let mut run_p = |seq, keep, prev, max_a| {
             let mut p =
                 MutatingBarrierProbe { repo: repo.clone(), seq: Arc::new(AtomicU64::new(seq)), keep_mutating: keep };
             run(&mut co, prev, max_a, &mut p)

@@ -396,7 +396,7 @@ async fn blob_first_incremental_sync_crash_tamper_and_cross_node_restore_fork() 
     let sb_reused = h.scan_only(&ctx1, &src_repo, pol, Some(&s2.manifest), scope_miss)?;
     ensure!(sb_reused.0.chunk_sources.is_empty());
     fs::write(src_repo.join("pkg/run.sh"), b"#!/bin/sh\necho tampered\n")?;
-    let miss_ledger = MerkleCheckpointLedger::new();
+    let miss_ledger = Ledger::new();
     let race_err = h.upload_scan(&ctx1, &src_repo, &sb_reused, &miss_ledger, None).await;
     ensure!(
         matches!(race_err, Err(MerkleSyncError::ConcurrentEdit(_))) && miss_ledger.committed_locator_paths().is_empty()

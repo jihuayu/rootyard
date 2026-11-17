@@ -395,10 +395,10 @@ mod tests {
     use super::*;
     use crate::workspace_lab::merkle_sync::{
         MAX_TOTAL_CHUNKS, MIN_CHUNK_BYTES,
-        git_state::read_git_state_and_bundle,
+        git_state::{IgnoreSnapshot, read_git_state_and_bundle},
         manifest_verify::validate_manifest,
         scan_fs::reserve_chunk_budget,
-        scanner::{DirtyScope, MerkleWorkspaceScanner, ScanRequest},
+        scanner::{DirtyScope, MerkleWorkspaceScanner, ScanRequest, ScanResult},
     };
 
     #[test]
@@ -420,33 +420,40 @@ mod tests {
         let (up, ep) = (UntrackedPolicy::IncludeNonIgnored, EmptyDirPolicy::IgnoreEmptyDirs);
         let (gs, ig, _) = read_git_state_and_bundle(&repo, up, ep, true, true)?;
         let (t, r, h, ws) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let mk = |sz: u32, g: &_, i: &_, prev, dirty_scope| ScanRequest {
-            repo_root: &repo,
-            workspace_id: ws,
-            checkpoint_id: Uuid::new_v4(),
-            tenant_id: t,
-            repo_id: r,
-            history_id: h,
-            parent_checkpoint_id: None,
-            chunk_size_bytes: sz,
-            git_state: g,
-            ignore: i,
-            previous: prev,
-            dirty_scope,
-        };
+        let ids = [t, r, h, ws];
+        fn run_scan(
+            repo: &std::path::Path,
+            ids: [Uuid; 4],
+            sz: u32,
+            snap: (&GitStateSnapshot, &IgnoreSnapshot),
+            extra: (Option<&MerkleStateManifest>, DirtyScope, Option<usize>),
+        ) -> Result<ScanResult, MerkleSyncError> {
+            let req = ScanRequest {
+                repo_root: repo,
+                workspace_id: ids[3],
+                checkpoint_id: Uuid::new_v4(),
+                tenant_id: ids[0],
+                repo_id: ids[1],
+                history_id: ids[2],
+                parent_checkpoint_id: None,
+                chunk_size_bytes: sz,
+                git_state: snap.0,
+                ignore: snap.1,
+                previous: extra.0,
+                dirty_scope: extra.1,
+            };
+            match extra.2 {
+                Some(c) => MerkleWorkspaceScanner::scan_with_limits(req, 100, 1 << 20, c),
+                None => MerkleWorkspaceScanner::scan(req),
+            }
+        }
         for bad_sz in [0u32, 1, (MIN_CHUNK_BYTES - 1) as u32] {
-            let err = MerkleWorkspaceScanner::scan(mk(bad_sz, &gs, &ig, None, DirtyScope::FullRescan));
+            let err = run_scan(&repo, ids, bad_sz, (&gs, &ig), (None, DirtyScope::FullRescan, None));
             assert!(matches!(err, Err(MerkleSyncError::InvalidInput(_))));
         }
-        let err4 =
-            MerkleWorkspaceScanner::scan_with_limits(mk(4096, &gs, &ig, None, DirtyScope::FullRescan), 100, 1 << 20, 4);
+        let err4 = run_scan(&repo, ids, 4096, (&gs, &ig), (None, DirtyScope::FullRescan, Some(4)));
         assert!(matches!(err4, Err(MerkleSyncError::InvalidManifest(_))));
-        let ok = MerkleWorkspaceScanner::scan_with_limits(
-            mk(4096, &gs, &ig, None, DirtyScope::FullRescan),
-            100,
-            1 << 20,
-            6,
-        )?;
+        let ok = run_scan(&repo, ids, 4096, (&gs, &ig), (None, DirtyScope::FullRescan, Some(6)))?;
         validate_manifest(&ok.manifest)?;
 
         fs::write(repo.join("extra.bin"), vec![b'Y'; 2 * 4096])?;
@@ -456,8 +463,7 @@ mod tests {
             dirty_paths: [b"extra.bin".to_vec()].into_iter().collect(),
             force_rehash_dirs: Default::default(),
         };
-        let err6 =
-            MerkleWorkspaceScanner::scan_with_limits(mk(4096, &gs2, &ig2, Some(&ok.manifest), scope), 100, 1 << 20, 6);
+        let err6 = run_scan(&repo, ids, 4096, (&gs2, &ig2), (Some(&ok.manifest), scope, Some(6)));
         assert!(matches!(err6, Err(MerkleSyncError::InvalidManifest(_))));
 
         let mut bad_sz_m = ok.manifest.clone();
