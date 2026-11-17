@@ -18,7 +18,8 @@ use uuid::Uuid;
 use super::{
     MAX_MANIFEST_JSON_BYTES, MERKLE_CODEC_VERSION, MERKLE_MANIFEST_SCHEMA, MerkleSyncError,
     authz::{
-        AccessContext, HoldPurpose, PinHoldRegistry, TenantRepoScopeKey, WorkspaceAuthAction, WorkspaceAuthorizer,
+        AccessContext, HoldPurpose, PinHoldRegistry, ScopedHoldGuard, TenantRepoScopeKey, WorkspaceAuthAction,
+        WorkspaceAuthorizer,
     },
     git_compare::GitBundleSnapshot,
     ledger::{
@@ -94,7 +95,8 @@ async fn upload_staging_body(
         (0usize, 0usize, 0usize, 0usize);
     let (mut uploaded_bytes, mut reused_bytes) = (0u64, 0u64);
     let mut closure_entries = Vec::new();
-    for (chunk_sha, (rel_path, offset, len)) in collect_file_chunk_locations(manifest)? {
+    let mut staged_scoped_objects = Vec::new();
+    for (chunk_sha, (rel_path, offset, len, expected_file_size)) in collect_file_chunk_locations(manifest)? {
         let key = TenantRepoScopeKey::new(
             params.ctx.tenant_id,
             params.ctx.repo_id,
@@ -102,7 +104,9 @@ async fn upload_staging_body(
             backend_hex,
             &chunk_sha,
         )?;
-        if let Some(existing) = try_reuse_verified(params.store, params.ledger, &key, params.deadline).await? {
+        if let Some(existing) =
+            try_reuse_verified(params.store, params.ledger, &key, Some((&chunk_sha, len)), params.deadline).await?
+        {
             reused_chunks += 1;
             reused_bytes += len;
             closure_entries
@@ -115,8 +119,13 @@ async fn upload_staging_body(
         {
             data.clone()
         } else {
-            read_file_slice(&params.repo_root.join(rel_path), offset, len)?
+            read_file_slice(&params.repo_root.join(rel_path), offset, len, expected_file_size)?
         };
+        if chunk_bytes.len() as u64 != len || hex::encode(Sha256::digest(&chunk_bytes)) != chunk_sha {
+            return Err(MerkleSyncError::ConcurrentEdit(
+                "chunk payload changed after capture; refusing checkpoint commit".into(),
+            ));
+        }
         let receipt = upload_bytes_verified(UploadBytesReq {
             store: params.store,
             driver: params.driver,
@@ -126,11 +135,16 @@ async fn upload_staging_body(
             generation: params.generation,
             namespace: "merkle-chunk",
             bytes: &chunk_bytes,
+            expected_sha256: Some(&chunk_sha),
+            expected_len: Some(len),
             deadline: params.deadline,
         })
         .await?;
         let entry = RemoteObjectLocatorEntry::from_locator(receipt.locator());
-        params.ledger.record_scoped_object(key, entry.clone());
+        if entry.sha256 != chunk_sha || entry.length != len {
+            return Err(MerkleSyncError::IntegrityMismatch("uploaded chunk receipt mismatches ChunkRef".into()));
+        }
+        staged_scoped_objects.push((key, entry.clone()));
         uploaded_chunks += 1;
         uploaded_bytes += len;
         closure_entries
@@ -148,7 +162,7 @@ async fn upload_staging_body(
             backend_hex,
             &node.node_sha256,
         )?;
-        if let Some(existing) = try_reuse_verified(params.store, params.ledger, &key, params.deadline).await? {
+        if let Some(existing) = try_reuse_verified(params.store, params.ledger, &key, None, params.deadline).await? {
             reused_nodes += 1;
             reused_bytes += existing.length;
             closure_entries
@@ -166,11 +180,13 @@ async fn upload_staging_body(
             generation: params.generation,
             namespace: "merkle-node",
             bytes: &node_bytes,
+            expected_sha256: None,
+            expected_len: Some(node_bytes.len() as u64),
             deadline: params.deadline,
         })
         .await?;
         let entry = RemoteObjectLocatorEntry::from_locator(receipt.locator());
-        params.ledger.record_scoped_object(key, entry.clone());
+        staged_scoped_objects.push((key, entry.clone()));
         uploaded_nodes += 1;
         uploaded_bytes += node_bytes.len() as u64;
         closure_entries
@@ -187,6 +203,8 @@ async fn upload_staging_body(
         generation: params.generation,
         namespace: "merkle-git",
         bytes: &bundle_bytes,
+        expected_sha256: None,
+        expected_len: Some(bundle_bytes.len() as u64),
         deadline: params.deadline,
     })
     .await?;
@@ -225,6 +243,8 @@ async fn upload_staging_body(
         generation: params.generation,
         namespace: "merkle-manifest",
         bytes: &manifest_bytes,
+        expected_sha256: None,
+        expected_len: Some(manifest_bytes.len() as u64),
         deadline: params.deadline,
     })
     .await?;
@@ -253,7 +273,15 @@ async fn upload_staging_body(
         manifest.checkpoint_id,
         held_paths,
     )?;
-    params.ledger.commit_atomic(manifest.checkpoint_id, manifest_entry.clone(), hold.hold_id)?;
+    let mut hold_guard = ScopedHoldGuard::new(params.holds, hold);
+    let hold_id = hold_guard.hold_id().unwrap_or_default();
+    params.ledger.commit_atomic_with_objects(
+        manifest.checkpoint_id,
+        manifest_entry.clone(),
+        hold_id,
+        staged_scoped_objects,
+    )?;
+    hold_guard.disarm();
     Ok(SyncUploadReport {
         checkpoint_id: manifest.checkpoint_id,
         merkle_root_digest: manifest.merkle_root_digest.clone(),
@@ -265,7 +293,7 @@ async fn upload_staging_body(
         reused_bytes,
         closure_verified: true,
         manifest_locator: manifest_entry,
-        hold_id: hold.hold_id,
+        hold_id,
     })
 }
 
@@ -273,6 +301,7 @@ pub(crate) async fn try_reuse_verified(
     store: &BlobStore,
     ledger: &MerkleCheckpointLedger,
     key: &TenantRepoScopeKey,
+    expected_ref: Option<(&str, u64)>,
     deadline: Instant,
 ) -> Result<Option<RemoteObjectLocatorEntry>, MerkleSyncError> {
     let Some(entry) = ledger.lookup_scoped_object(key) else { return Ok(None) };
@@ -280,8 +309,19 @@ pub(crate) async fn try_reuse_verified(
     if loc.tenant_id() != key.tenant_id || loc.authority_id() != key.repo_id {
         return Err(MerkleSyncError::TenantScopeMismatch("cached locator scope mismatch".into()));
     }
+    if let Some((exp_sha, exp_len)) = expected_ref
+        && (loc.sha256() != exp_sha || loc.length() != exp_len)
+    {
+        return Err(MerkleSyncError::IntegrityMismatch("cached chunk locator mismatches ChunkRef".into()));
+    }
     match store.verify(&loc, deadline).await {
-        Ok(receipt) if receipt.backend_identity().as_hex() == store.backend_identity().as_hex() => Ok(Some(entry)),
+        Ok(receipt)
+            if receipt.backend_identity().as_hex() == store.backend_identity().as_hex()
+                && receipt.locator().sha256() == loc.sha256()
+                && receipt.locator().length() == loc.length() =>
+        {
+            Ok(Some(entry))
+        }
         _ => Ok(None),
     }
 }
@@ -296,11 +336,23 @@ pub(crate) struct UploadBytesReq<'a> {
     pub(crate) generation: i64,
     pub(crate) namespace: &'a str,
     pub(crate) bytes: &'a [u8],
+    pub(crate) expected_sha256: Option<&'a str>,
+    pub(crate) expected_len: Option<u64>,
     pub(crate) deadline: Instant,
 }
 
 pub(crate) async fn upload_bytes_verified(req: UploadBytesReq<'_>) -> Result<BlobReceipt, MerkleSyncError> {
+    if let Some(exp_len) = req.expected_len
+        && req.bytes.len() as u64 != exp_len
+    {
+        return Err(MerkleSyncError::IntegrityMismatch("payload length mismatches expected reference".into()));
+    }
     let sha = hex::encode(Sha256::digest(req.bytes));
+    if let Some(exp_sha) = req.expected_sha256
+        && sha != exp_sha
+    {
+        return Err(MerkleSyncError::IntegrityMismatch("payload sha256 mismatches expected reference".into()));
+    }
     let tmp = req.staging_dir.join(format!("upload-{}.bin", Uuid::new_v4()));
     {
         let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
@@ -326,13 +378,16 @@ pub(crate) async fn upload_bytes_verified(req: UploadBytesReq<'_>) -> Result<Blo
     if receipt.backend_identity().as_hex() != req.store.backend_identity().as_hex() {
         return Err(MerkleSyncError::ForeignBackend);
     }
+    if receipt.locator().sha256() != sha || receipt.locator().length() != req.bytes.len() as u64 {
+        return Err(MerkleSyncError::IntegrityMismatch("upload receipt locator mismatches payload digest".into()));
+    }
     req.ledger.record_issued_locator(receipt.locator());
     Ok(receipt)
 }
 
 fn collect_file_chunk_locations(
     manifest: &MerkleStateManifest,
-) -> Result<BTreeMap<String, (PathBuf, u64, u64)>, MerkleSyncError> {
+) -> Result<BTreeMap<String, (PathBuf, u64, u64, u64)>, MerkleSyncError> {
     let mut map = BTreeMap::new();
     for (dir_b64, node) in &manifest.nodes {
         let dir_raw = if dir_b64.is_empty() { Vec::new() } else { decode_rel_bytes(dir_b64)? };
@@ -347,7 +402,8 @@ fn collect_file_chunk_locations(
                 rel.extend_from_slice(&name);
                 let rel_path = PathBuf::from(OsString::from_vec(rel));
                 for chunk in &ch.chunks {
-                    map.entry(chunk.sha256.clone()).or_insert_with(|| (rel_path.clone(), chunk.offset, chunk.len));
+                    map.entry(chunk.sha256.clone())
+                        .or_insert_with(|| (rel_path.clone(), chunk.offset, chunk.len, ch.size));
                 }
             }
         }
@@ -355,12 +411,31 @@ fn collect_file_chunk_locations(
     Ok(map)
 }
 
-fn read_file_slice(path: &Path, offset: u64, len: u64) -> Result<Vec<u8>, MerkleSyncError> {
+fn read_file_slice(path: &Path, offset: u64, len: u64, expected_file_size: u64) -> Result<Vec<u8>, MerkleSyncError> {
+    if len > super::MAX_CHUNK_BYTES as u64 {
+        return Err(MerkleSyncError::InvalidManifest("chunk length exceeds MAX_CHUNK_BYTES".into()));
+    }
     let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() != expected_file_size || offset.checked_add(len).is_none_or(|e| meta.len() < e) {
+        return Err(MerkleSyncError::ConcurrentEdit("file size changed after capture before chunk upload".into()));
+    }
     file.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0u8; len as usize];
     file.read_exact(&mut buf)?;
+    let post = file.metadata()?;
+    if post.len() != expected_file_size {
+        return Err(MerkleSyncError::ConcurrentEdit("file changed during chunk readback".into()));
+    }
     Ok(buf)
+}
+
+pub(crate) struct StageDirGuard(pub(crate) PathBuf);
+
+impl Drop for StageDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), MerkleSyncError> {

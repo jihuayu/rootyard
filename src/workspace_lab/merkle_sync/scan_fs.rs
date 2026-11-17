@@ -15,7 +15,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 
 use super::{
-    MAX_SYMLINK_HOPS, MAX_TREE_ENTRIES, MAX_WORKSPACE_BYTES, MerkleSyncError,
+    MAX_SYMLINK_HOPS, MerkleSyncError,
     git_state::IgnoreSnapshot,
     manifest::{ChunkRef, EmptyDirPolicy, MerkleChildKind, MerkleDirChild, UntrackedPolicy},
 };
@@ -98,22 +98,41 @@ pub(crate) fn can_reuse_clean_leaf(meta: &fs::Metadata, prev: &MerkleDirChild) -
         && (meta.permissions().mode() & 0o777) == prev.mode
 }
 
-pub(crate) fn count_leaf_limits(
+pub(crate) fn reserve_tree_entry(total_entries: &mut usize, max_entries: usize) -> Result<(), MerkleSyncError> {
+    *total_entries = total_entries
+        .checked_add(1)
+        .ok_or_else(|| MerkleSyncError::InvalidManifest("manifest entry count overflow".into()))?;
+    if *total_entries > max_entries {
+        return Err(MerkleSyncError::InvalidManifest("manifest entry limit exceeded".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn reserve_workspace_bytes(
+    total_bytes: &mut u64,
+    add_bytes: u64,
+    max_bytes: u64,
+) -> Result<(), MerkleSyncError> {
+    let next = total_bytes
+        .checked_add(add_bytes)
+        .ok_or_else(|| MerkleSyncError::InvalidManifest("workspace size overflow".into()))?;
+    if next > max_bytes {
+        return Err(MerkleSyncError::InvalidManifest("workspace byte limit exceeded".into()));
+    }
+    *total_bytes = next;
+    Ok(())
+}
+
+pub(crate) fn reserve_child_limits(
     total_entries: &mut usize,
     total_bytes: &mut u64,
+    max_entries: usize,
+    max_bytes: u64,
     child: &MerkleDirChild,
 ) -> Result<(), MerkleSyncError> {
+    reserve_tree_entry(total_entries, max_entries)?;
     if matches!(child.kind, MerkleChildKind::File | MerkleChildKind::Symlink) {
-        *total_entries += 1;
-        if *total_entries > MAX_TREE_ENTRIES {
-            return Err(MerkleSyncError::InvalidManifest("manifest entry limit exceeded".into()));
-        }
-        *total_bytes = total_bytes
-            .checked_add(child.size)
-            .ok_or_else(|| MerkleSyncError::InvalidManifest("workspace size overflow".into()))?;
-        if *total_bytes > MAX_WORKSPACE_BYTES {
-            return Err(MerkleSyncError::InvalidManifest("workspace byte limit exceeded".into()));
-        }
+        reserve_workspace_bytes(total_bytes, child.size, max_bytes)?;
     }
     Ok(())
 }
@@ -122,6 +141,10 @@ pub(crate) struct LeafMetricsOut<'a> {
     pub scanned_files: &'a mut u64,
     pub scanned_bytes: &'a mut u64,
     pub hashed_bytes: &'a mut u64,
+    pub total_entries: &'a mut usize,
+    pub total_bytes: &'a mut u64,
+    pub max_entries: usize,
+    pub max_bytes: u64,
     pub chunk_sources: &'a mut BTreeMap<String, Vec<(u64, u64, Vec<u8>)>>,
 }
 
@@ -139,9 +162,11 @@ pub(crate) fn build_leaf_child(
     }
     let rel_path = rel_path_from_bytes(child_raw);
     if meta.file_type().is_symlink() {
+        reserve_tree_entry(out.total_entries, out.max_entries)?;
         let target = fs::read_link(full_path)?;
         validate_symlink_safe(repo, &rel_path, &target)?;
         let target_bytes = target.into_os_string().into_vec();
+        reserve_workspace_bytes(out.total_bytes, target_bytes.len() as u64, out.max_bytes)?;
         let sha = hex::encode(Sha256::digest(&target_bytes));
         *out.scanned_files += 1;
         *out.scanned_bytes += target_bytes.len() as u64;
@@ -163,13 +188,15 @@ pub(crate) fn build_leaf_child(
         return Err(MerkleSyncError::UnsupportedGitState("special file (FIFO/socket/device) unsupported".into()));
     }
     let expected_len = meta.len();
-    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(full_path)?;
+    reserve_tree_entry(out.total_entries, out.max_entries)?;
+    reserve_workspace_bytes(out.total_bytes, expected_len, out.max_bytes)?;
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(full_path)?;
     let opened_meta = file.metadata()?;
     if !opened_meta.is_file() || opened_meta.len() != expected_len {
         return Err(MerkleSyncError::ConcurrentEdit("file changed while opening during scan".into()));
     }
     let mut buf = Vec::with_capacity(expected_len as usize);
-    file.read_to_end(&mut buf)?;
+    file.take(expected_len.saturating_add(1)).read_to_end(&mut buf)?;
     if buf.len() as u64 != expected_len {
         return Err(MerkleSyncError::ConcurrentEdit("file length changed during read".into()));
     }
@@ -405,12 +432,43 @@ mod tests {
         assert!(stats.duplicate_events_folded >= 1 && stats.out_of_order_batches == 1 && !stats.used_full_rescan);
         assert!(inc.metrics.reused_nodes > 0 && inc.metrics.hashed_bytes < base.metrics.hashed_bytes);
 
+        fs::create_dir_all(repo.join(".github/workflows"))?;
+        fs::write(repo.join(".github/workflows/check.yml"), b"name: ci-v1\n")?;
+        co.ingest(WatcherBatch {
+            seq_start: 4,
+            seq_end: 5,
+            events: vec![WatcherEvent::Create(b".github/workflows/check.yml".to_vec())],
+        });
+        let ConvergeOutcome::Converged { scan: inc_gh, stats: gh_stats, .. } =
+            run(&mut co, Some(&inc.manifest), 3, &mut NoopBarrierProbe)?
+        else {
+            panic!("expected .github subtree incremental convergence");
+        };
+        assert!(
+            !gh_stats.used_full_rescan
+                && inc_gh.metrics.reused_nodes > 0
+                && inc_gh.manifest.merkle_root_digest != inc.manifest.merkle_root_digest
+                && inc_gh.manifest.nodes.contains_key(&super::super::manifest::encode_rel_bytes(b".github/workflows"))
+        );
+        fs::write(repo.join(".github/workflows/check.yml"), b"name: ci-v2\n")?;
+        co.ingest(WatcherBatch {
+            seq_start: 5,
+            seq_end: 6,
+            events: vec![WatcherEvent::Modify(b".github/workflows/check.yml".to_vec())],
+        });
+        let ConvergeOutcome::Converged { scan: inc_gh2, .. } =
+            run(&mut co, Some(&inc_gh.manifest), 3, &mut NoopBarrierProbe)?
+        else {
+            panic!("expected .github modify convergence");
+        };
+        assert!(inc_gh2.manifest.merkle_root_digest != inc_gh.manifest.merkle_root_digest);
+
         fs::write(repo.join("sub_b/deep/b_0.txt"), b"changed-during-drop\n")?;
         co.ingest(WatcherBatch { seq_start: 10, seq_end: 11, events: vec![WatcherEvent::Overflow] });
         let mut p1 =
             MutatingBarrierProbe { repo: repo.clone(), seq: Arc::new(AtomicU64::new(11)), keep_mutating: false };
         assert!(matches!(
-            run(&mut co, Some(&inc.manifest), 3, &mut p1)?,
+            run(&mut co, Some(&inc_gh2.manifest), 3, &mut p1)?,
             ConvergeOutcome::Converged { attempts: 2, .. }
         ));
         let mut pf =

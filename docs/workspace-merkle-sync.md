@@ -46,13 +46,13 @@ The implementation lives under [merkle_sync.rs](../src/workspace_lab/merkle_sync
 - Workflow gate: [workspace-merkle-sync.yml](../.github/workflows/workspace-merkle-sync.yml)
 - Benchmark evaluator: [eval_workspace_merkle_sync.py](../scripts/eval_workspace_merkle_sync.py)
 
-Measured baseline (`source_git_rev=b40090eb6fae214d26fa7c76d2bb6b2946cca9ba`, `git version 2.45.1.windows.1`, `Windows-11-10.0.26100-SP0`, `Python 3.12.3`, `chunk_size_bytes=16384`, 5 iterations/case, single-subtree delta):
+Measured baseline (`eval_methodology_version=v2-atomic-git-dir-rename`, `mode=python-dataset-git-rename-plus-chunked-cas-v2`, `source_git_rev=62d978a7884c4c9ae60403ee4689b7a1be52ed7b`, `git version 2.45.1.windows.1`, `Windows-11-10.0.26100-SP0`, `Python 3.12.3`, `chunk_size_bytes=16384`, 5 iterations/case, single-subtree delta):
 
-| Profile / Git Format | Dataset Digest (prefix) | Full Hashed (B) | Incr Hashed (B) | Full Wire (B) | Incr Wire (B) | Full p50 / p95 (ms) | Incr p50 / p95 (ms) | Reused / Recomp Nodes | Restore `git fsck` |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `small` / `sha1` | `3ca488de55e6` | 1,179,648 | 147,456 | 2,360,674 | 34,146 | 623.32 / 903.91 | 25.28 / 40.21 | 8 / 2 | pass |
-| `small` / `sha256` | `c4bf55b6fa47` | 1,179,648 | 147,456 | 2,360,674 | 34,146 | 638.06 / 700.87 | 31.24 / 31.33 | 8 / 2 | pass |
-| `medium` / `sha1` | `89aae28f050c` | 3,145,728 | 196,608 | 6,294,050 | 35,362 | 1914.10 / 1940.64 | 31.31 / 33.36 | 16 / 2 | pass |
-| `medium` / `sha256` | `48a95c4ad1df` | 3,145,728 | 196,608 | 6,294,050 | 35,362 | 1922.92 / 2058.91 | 31.24 / 45.72 | 16 / 2 | pass |
+| Profile / Git Format | Dataset Digest (prefix) | Full Hashed (B) | Incr Hashed (B) | Full Wire (B) | Incr Wire (B) | Full p50 / p95 (ms) | Incr p50 / p95 (ms) | Restore p50 / p95 (ms) | Reused / Recomp Nodes | Restore `git fsck` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `small` / `sha1` | `3ca488de55e6` | 1,179,648 | 147,456 | 2,360,674 | 34,146 | 676.61 / 807.42 | 31.60 / 35.44 | 533.69 / 917.72 | 8 / 2 | pass |
+| `small` / `sha256` | `c4bf55b6fa47` | 1,179,648 | 147,456 | 2,360,674 | 34,146 | 653.55 / 805.64 | 30.03 / 40.37 | 510.29 / 732.25 | 8 / 2 | pass |
+| `medium` / `sha1` | `89aae28f050c` | 3,145,728 | 196,608 | 6,294,050 | 35,362 | 2138.72 / 2438.34 | 36.45 / 39.84 | 1072.18 / 1692.85 | 16 / 2 | pass |
+| `medium` / `sha256` | `48a95c4ad1df` | 3,145,728 | 196,608 | 6,294,050 | 35,362 | 1937.59 / 2145.52 | 30.94 / 33.08 | 944.49 / 1193.49 | 16 / 2 | pass |
 
-**Scope & non-claims**: The table above measures the standalone reproducible Python + stock Git + local CAS evaluator on Windows (`peak_rss_kib` 23,680–28,156 KiB; `temp_disk_bytes` 1,197,410 B / 3,164,706 B) and is distinct from the Rust OpenDAL LoopbackS3 `cargo test` harness run on Linux CI (`ubuntu-24.04`). Windows local toolchains omit Unix `fuser`/MSVC linking, so full Rust compilation, `clippy -D warnings`, `--lib`, and `--test workspace_merkle_sync` execution are gated by Linux GHA.
+**Scope & non-claims**: The table above is explicitly versioned as `v2-atomic-git-dir-rename` (`git_materialization_method=atomic_dir_rename_v2` avoids `shutil.copytree` stack races and is not directly comparable to pre-v2 full-directory `.git` copy measurements). It measures the standalone Python + stock Git + local CAS evaluator on Windows (`peak_rss_kib` 23,416–27,872 KiB; `temp_disk_bytes` 1,197,410 B / 3,164,706 B) and is distinct from the Rust OpenDAL `LoopbackS3` integration suite on Linux CI (`ubuntu-24.04`). This isolated module component does not wire live PostgreSQL / server HTTP workspace handlers, so end-to-end PG/service acceptance remains open on Issue #181 (`Refs #181`).

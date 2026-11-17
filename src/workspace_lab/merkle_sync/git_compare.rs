@@ -392,4 +392,97 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn scanner_limits_and_manifest_canonical_verification() -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::{
+            MAX_WORKSPACE_BYTES,
+            manifest::{compute_dir_node_sha256, compute_index_merkle_root, compute_state_merkle_root},
+            manifest_verify::validate_manifest,
+        };
+        let dir = TempDir::new()?;
+        let repo = dir.path().join("lim");
+        fs::create_dir_all(&repo)?;
+        git_ok(&repo, &["init", "--initial-branch=main"]);
+        for i in 0..5 {
+            fs::create_dir_all(repo.join(format!("e{i}")))?;
+        }
+        let (t, r, h, ws) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let scan_lim = |max_e: usize, pol: EmptyDirPolicy| -> Result<MerkleStateManifest, MerkleSyncError> {
+            let (gs, ig, _) = read_git_state_and_bundle(&repo, UntrackedPolicy::IncludeNonIgnored, pol, true, true)?;
+            Ok(MerkleWorkspaceScanner::scan_with_limits(
+                ScanRequest {
+                    repo_root: &repo,
+                    workspace_id: ws,
+                    checkpoint_id: Uuid::new_v4(),
+                    tenant_id: t,
+                    repo_id: r,
+                    history_id: h,
+                    parent_checkpoint_id: None,
+                    chunk_size_bytes: 16 * 1024,
+                    git_state: &gs,
+                    ignore: &ig,
+                    previous: None,
+                    dirty_scope: DirtyScope::FullRescan,
+                },
+                max_e,
+                MAX_WORKSPACE_BYTES,
+            )?
+            .manifest)
+        };
+        assert!(matches!(scan_lim(4, EmptyDirPolicy::RetainEmptyDirs), Err(MerkleSyncError::InvalidManifest(_))));
+        let big = fs::OpenOptions::new().write(true).create_new(true).open(repo.join("huge.bin"))?;
+        big.set_len(MAX_WORKSPACE_BYTES + 4096)?;
+        drop(big);
+        assert!(matches!(scan_lim(100, EmptyDirPolicy::IgnoreEmptyDirs), Err(MerkleSyncError::InvalidManifest(_))));
+        fs::remove_file(repo.join("huge.bin"))?;
+
+        fs::create_dir_all(repo.join("sub"))?;
+        fs::write(repo.join("a.txt"), b"aa\n")?;
+        fs::write(repo.join("sub/b.txt"), b"bb\n")?;
+        git_ok(&repo, &["add", "--all"]);
+        git_ok(&repo, &["commit", "-m", "m"]);
+        let valid = scan_lim(100, EmptyDirPolicy::IgnoreEmptyDirs)?;
+        validate_manifest(&valid)?;
+
+        let mut bad_cnt = valid.clone();
+        bad_cnt.nodes.get_mut("").unwrap().subtree_file_count += 1;
+        assert!(matches!(validate_manifest(&bad_cnt), Err(MerkleSyncError::IntegrityMismatch(_))));
+
+        let rehash = |m: &mut MerkleStateManifest| {
+            let root = m.nodes.get_mut("").unwrap();
+            root.node_sha256 = compute_dir_node_sha256("", &root.children);
+            m.worktree_root_digest = root.node_sha256.clone();
+            m.merkle_root_digest =
+                compute_state_merkle_root(&m.git_state, &m.ignore_policy, &m.worktree_root_digest, m.chunk_size_bytes);
+        };
+        let mut bad_child = valid.clone();
+        bad_child.nodes.get_mut("").unwrap().children[0].subtree_total_bytes += 1;
+        assert!(matches!(validate_manifest(&bad_child), Err(MerkleSyncError::IntegrityMismatch(_))));
+        let (mut unsort, mut dup, mut bad_idx) = (valid.clone(), valid.clone(), valid);
+        unsort.nodes.get_mut("").unwrap().children.reverse();
+        rehash(&mut unsort);
+        assert!(matches!(validate_manifest(&unsort), Err(MerkleSyncError::InvalidManifest(_))));
+
+        let first = dup.nodes[""].children[0].clone();
+        let root_d = dup.nodes.get_mut("").unwrap();
+        root_d.subtree_file_count += first.subtree_file_count;
+        root_d.subtree_total_bytes += first.subtree_total_bytes;
+        root_d.children.insert(0, first);
+        rehash(&mut dup);
+        assert!(matches!(validate_manifest(&dup), Err(MerkleSyncError::InvalidManifest(_))));
+
+        bad_idx.git_state.index_entries.reverse();
+        bad_idx.git_state.index_merkle_root = compute_index_merkle_root(
+            bad_idx.git_state.object_format,
+            &bad_idx.git_state.index_entries,
+            &bad_idx.git_state.index_raw_sha256,
+            None,
+            None,
+            None,
+        );
+        rehash(&mut bad_idx);
+        assert!(matches!(validate_manifest(&bad_idx), Err(MerkleSyncError::InvalidManifest(_))));
+        Ok(())
+    }
 }

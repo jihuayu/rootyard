@@ -86,6 +86,15 @@ impl WatcherCoalescer {
         }
     }
 
+    fn maybe_mark_ignore_path(&mut self, p: &[u8]) {
+        if is_ignore_control_path(p) {
+            let norm = p.strip_prefix(b"./").unwrap_or(p);
+            let dir = if norm == b".git/info/exclude" { Vec::new() } else { parent_bytes(norm) };
+            self.force_rehash_dirs.insert(dir.clone());
+            self.dirty_dirs.insert(dir);
+        }
+    }
+
     fn record_event(&mut self, ev: WatcherEvent) {
         match ev {
             WatcherEvent::Overflow | WatcherEvent::Dropped(_) => {
@@ -93,32 +102,33 @@ impl WatcherCoalescer {
                 self.overflow_or_drop_escalations += 1;
             }
             WatcherEvent::GitAdminChanged(p) => {
-                if !p.starts_with(b".git") {
+                self.maybe_mark_ignore_path(&p);
+                if !is_git_admin_path(&p) {
                     self.mark_path(p);
                 }
             }
             WatcherEvent::IgnoreRuleChanged(p) => {
-                let dir = parent_bytes(&p);
+                let norm = p.strip_prefix(b"./").unwrap_or(p.as_slice());
+                let dir = if norm == b".git/info/exclude" { Vec::new() } else { parent_bytes(norm) };
                 self.force_rehash_dirs.insert(dir.clone());
                 self.dirty_dirs.insert(dir);
-                self.mark_path(p);
+                if !is_git_admin_path(&p) {
+                    self.mark_path(p);
+                }
             }
             WatcherEvent::Rename { from, to } => {
-                self.mark_path(from);
-                self.mark_path(to);
+                self.maybe_mark_ignore_path(&from);
+                self.maybe_mark_ignore_path(&to);
+                if !is_git_admin_path(&from) {
+                    self.mark_path(from);
+                }
+                if !is_git_admin_path(&to) {
+                    self.mark_path(to);
+                }
             }
             WatcherEvent::Create(p) | WatcherEvent::Modify(p) | WatcherEvent::Remove(p) | WatcherEvent::Chmod(p) => {
-                if p == b".gitignore"
-                    || p.ends_with(b"/.gitignore")
-                    || p == b".rootyardignore"
-                    || p.ends_with(b"/.rootyardignore")
-                    || p == b".git/info/exclude"
-                {
-                    let dir = if p == b".git/info/exclude" { Vec::new() } else { parent_bytes(&p) };
-                    self.force_rehash_dirs.insert(dir.clone());
-                    self.dirty_dirs.insert(dir);
-                }
-                if !p.starts_with(b".git") {
+                self.maybe_mark_ignore_path(&p);
+                if !is_git_admin_path(&p) {
                     self.mark_path(p);
                 }
             }
@@ -161,6 +171,20 @@ impl WatcherCoalescer {
         self.force_rehash_dirs.clear();
         (scope, stats)
     }
+}
+
+fn is_git_admin_path(p: &[u8]) -> bool {
+    let norm = p.strip_prefix(b"./").unwrap_or(p);
+    norm == b".git" || norm.starts_with(b".git/")
+}
+
+fn is_ignore_control_path(p: &[u8]) -> bool {
+    let norm = p.strip_prefix(b"./").unwrap_or(p);
+    norm == b".gitignore"
+        || norm.ends_with(b"/.gitignore")
+        || norm == b".rootyardignore"
+        || norm.ends_with(b"/.rootyardignore")
+        || norm == b".git/info/exclude"
 }
 
 fn parent_bytes(path: &[u8]) -> Vec<u8> {

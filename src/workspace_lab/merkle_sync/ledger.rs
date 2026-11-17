@@ -258,6 +258,16 @@ impl MerkleCheckpointLedger {
         locator: RemoteObjectLocatorEntry,
         hold_id: Uuid,
     ) -> Result<(), MerkleSyncError> {
+        self.commit_atomic_with_objects(checkpoint_id, locator, hold_id, Vec::new())
+    }
+
+    pub fn commit_atomic_with_objects(
+        &self,
+        checkpoint_id: Uuid,
+        locator: RemoteObjectLocatorEntry,
+        hold_id: Uuid,
+        scoped_objects: Vec<(TenantRepoScopeKey, RemoteObjectLocatorEntry)>,
+    ) -> Result<(), MerkleSyncError> {
         let loc_path = locator.to_locator()?.path();
         let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         {
@@ -273,6 +283,9 @@ impl MerkleCheckpointLedger {
             rec.hold_id = Some(hold_id);
         }
         st.all_issued_locators.insert(loc_path);
+        for (key, entry) in scoped_objects {
+            st.scoped_objects.insert(key, entry);
+        }
         Ok(())
     }
 

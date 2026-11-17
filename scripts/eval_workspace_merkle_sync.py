@@ -333,6 +333,7 @@ def _bench_case(profile: str, fmt: str, iterations: int | None = None) -> dict[s
                 "cpu_ms": round(res_cpu, 4),
                 "temp_disk_bytes": disk2,
                 "git_fsck_ok": any_fsck_ok,
+                "git_materialization_method": "atomic_dir_rename_v2",
             }
             _rmtree(td)
 
@@ -347,6 +348,7 @@ def _bench_case(profile: str, fmt: str, iterations: int | None = None) -> dict[s
         "profile": profile,
         "object_format": fmt,
         "dataset_digest": dataset_digest,
+        "eval_methodology_version": "v2-atomic-git-dir-rename",
         "iterations": iters,
         "full": full_stats,
         "incremental": inc_stats,
@@ -374,7 +376,8 @@ def run_benchmark(profiles: list[str], formats: list[str], iterations: int | Non
     return {
         "issue": 181,
         "benchmark": "workspace_merkle_sync",
-        "mode": "python-dataset-git-plus-chunked-cas",
+        "eval_methodology_version": "v2-atomic-git-dir-rename",
+        "mode": "python-dataset-git-rename-plus-chunked-cas-v2",
         "source_git_rev": source_rev,
         "git_version": git_version,
         "platform": platform.platform(),

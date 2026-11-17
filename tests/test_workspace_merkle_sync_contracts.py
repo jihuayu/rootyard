@@ -98,12 +98,14 @@ class WorkspaceMerkleSyncContractsTest(unittest.TestCase):
         mod = _load_eval_module()
         report = mod.run_benchmark(["small"], ["sha1"], iterations=1)
         self.assertEqual(report["issue"], 181)
+        self.assertEqual(report["eval_methodology_version"], "v2-atomic-git-dir-rename")
         self.assertTrue(report["source_git_rev"])
         self.assertEqual(len(report["results"]), 1)
         row = report["results"][0]
         full = row["full"]
         inc = row["incremental"]
         rest = row["restore_fork"]
+        self.assertEqual(rest["git_materialization_method"], "atomic_dir_rename_v2")
         for metric in (
             "scanned_bytes",
             "hashed_bytes",

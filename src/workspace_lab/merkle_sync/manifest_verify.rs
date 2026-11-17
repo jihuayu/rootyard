@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use sha2::{Digest, Sha256};
 
 use super::{
     MAX_TREE_ENTRIES, MAX_WORKSPACE_BYTES, MERKLE_CODEC_VERSION, MERKLE_MANIFEST_SCHEMA, MerkleSyncError,
@@ -45,13 +46,33 @@ pub fn validate_manifest(manifest: &MerkleStateManifest) -> Result<(), MerkleSyn
             }
         }
     }
+    let mut prev_idx_key: Option<(&str, u8)> = None;
     for entry in &manifest.git_state.index_entries {
         let path_raw = STANDARD
             .decode(&entry.path_base64)
             .map_err(|_| MerkleSyncError::InvalidManifest("invalid index path_base64".into()))?;
         validate_rel_path_bytes(&path_raw)?;
+        if encode_rel_bytes(&path_raw) != entry.path_base64 {
+            return Err(MerkleSyncError::InvalidManifest("non-canonical index path_base64".into()));
+        }
         if entry.stage > 3 || !is_valid_oid_hex(&entry.git_oid, fmt) {
             return Err(MerkleSyncError::InvalidManifest("invalid index entry stage or oid".into()));
+        }
+        let key = (entry.path_base64.as_str(), entry.stage);
+        if let Some(prev) = prev_idx_key
+            && prev >= key
+        {
+            return Err(MerkleSyncError::InvalidManifest("index_entries must be unique and sorted".into()));
+        }
+        prev_idx_key = Some(key);
+    }
+    for opt_head in
+        [&manifest.git_state.merge_head, &manifest.git_state.cherry_pick_head, &manifest.git_state.rebase_head]
+    {
+        if let Some(h) = opt_head
+            && !is_valid_oid_hex(h, fmt)
+        {
+            return Err(MerkleSyncError::InvalidManifest("invalid merge/cherry-pick/rebase head oid".into()));
         }
     }
     if !is_valid_sha256_hex(&manifest.git_state.index_raw_sha256)
@@ -74,15 +95,23 @@ pub fn verify_manifest_integrity(manifest: &MerkleStateManifest) -> Result<(), M
     if expected_index_root != manifest.git_state.index_merkle_root {
         return Err(MerkleSyncError::IntegrityMismatch("index_merkle_root mismatch".into()));
     }
+    for k in manifest.nodes.keys() {
+        if !k.is_empty() && encode_rel_bytes(&decode_rel_bytes(k)?) != *k {
+            return Err(MerkleSyncError::InvalidManifest("non-canonical node key base64".into()));
+        }
+    }
     let root_node =
         manifest.nodes.get("").ok_or_else(|| MerkleSyncError::InvalidManifest("missing root directory node".into()))?;
     if root_node.node_sha256 != manifest.worktree_root_digest {
         return Err(MerkleSyncError::IntegrityMismatch("worktree_root_digest mismatch".into()));
     }
-    let mut visited_entries = 0usize;
+    let mut visited_entries = 1usize;
+    if visited_entries > MAX_TREE_ENTRIES {
+        return Err(MerkleSyncError::InvalidManifest("manifest entry limit exceeded".into()));
+    }
     let mut total_bytes = 0u64;
     let mut visited_nodes = BTreeSet::new();
-    verify_node_recursive(manifest, "", &mut visited_entries, &mut total_bytes, &mut visited_nodes)?;
+    let _ = verify_node_recursive(manifest, "", &mut visited_entries, &mut total_bytes, &mut visited_nodes)?;
     if visited_nodes.len() != manifest.nodes.len() {
         return Err(MerkleSyncError::InvalidManifest("orphan directory node present in manifest".into()));
     }
@@ -104,7 +133,7 @@ fn verify_node_recursive(
     visited_entries: &mut usize,
     total_bytes: &mut u64,
     visited_nodes: &mut BTreeSet<String>,
-) -> Result<(), MerkleSyncError> {
+) -> Result<(u64, u64), MerkleSyncError> {
     if !visited_nodes.insert(dir_b64.to_owned()) {
         return Err(MerkleSyncError::InvalidManifest("cycle in directory manifest".into()));
     }
@@ -115,31 +144,47 @@ fn verify_node_recursive(
     if node.schema != MERKLE_MANIFEST_SCHEMA
         || node.codec_version != MERKLE_CODEC_VERSION
         || node.dir_path_base64 != dir_b64
+        || (!dir_b64.is_empty() && node.children.is_empty())
     {
-        return Err(MerkleSyncError::InvalidManifest("directory node header mismatch".into()));
+        return Err(MerkleSyncError::InvalidManifest("directory node header or emptiness invalid".into()));
     }
     if compute_dir_node_sha256(dir_b64, &node.children) != node.node_sha256 {
         return Err(MerkleSyncError::IntegrityMismatch("directory node_sha256 mismatch".into()));
     }
     let parent_raw = if dir_b64.is_empty() { Vec::new() } else { decode_rel_bytes(dir_b64)? };
+    let mut prev_name: Option<Vec<u8>> = None;
+    let (mut exp_files, mut exp_bytes) = (0u64, 0u64);
     for ch in &node.children {
+        *visited_entries += 1;
+        if *visited_entries > MAX_TREE_ENTRIES {
+            return Err(MerkleSyncError::InvalidManifest("manifest entry limit exceeded".into()));
+        }
         let name_raw = STANDARD
             .decode(&ch.name_base64)
             .map_err(|_| MerkleSyncError::InvalidManifest("invalid child name_base64".into()))?;
+        if STANDARD.encode(&name_raw) != ch.name_base64 {
+            return Err(MerkleSyncError::InvalidManifest("non-canonical child name_base64".into()));
+        }
+        if let Some(prev) = &prev_name
+            && *prev >= name_raw
+        {
+            return Err(MerkleSyncError::InvalidManifest("directory children not strictly sorted and unique".into()));
+        }
+        prev_name = Some(name_raw.clone());
         let mut child_raw = parent_raw.clone();
         if !child_raw.is_empty() {
             child_raw.push(b'/');
         }
         child_raw.extend_from_slice(&name_raw);
         validate_rel_path_bytes(&child_raw)?;
-        match ch.kind {
+        let (add_files, add_bytes) = match ch.kind {
             MerkleChildKind::File => {
-                *visited_entries += 1;
-                if *visited_entries > MAX_TREE_ENTRIES {
-                    return Err(MerkleSyncError::InvalidManifest("manifest entry limit exceeded".into()));
-                }
-                if ch.mode > 0o777 || ch.mode & 0o7000 != 0 {
-                    return Err(MerkleSyncError::InvalidManifest("invalid file permissions mode".into()));
+                if ch.mode > 0o777
+                    || ch.mode & 0o7000 != 0
+                    || ch.target_base64.is_some()
+                    || ch.subtree_node_sha256.is_some()
+                {
+                    return Err(MerkleSyncError::InvalidManifest("invalid file child metadata".into()));
                 }
                 *total_bytes = total_bytes
                     .checked_add(ch.size)
@@ -151,8 +196,8 @@ fn verify_node_recursive(
                     .content_sha256
                     .as_deref()
                     .ok_or_else(|| MerkleSyncError::InvalidManifest("file missing content_sha256".into()))?;
-                if !is_valid_sha256_hex(sha) {
-                    return Err(MerkleSyncError::InvalidManifest("invalid file content_sha256".into()));
+                if !is_valid_sha256_hex(sha) || ch.chunks.is_empty() {
+                    return Err(MerkleSyncError::InvalidManifest("invalid file content_sha256 or empty chunks".into()));
                 }
                 let mut sum = 0u64;
                 for (i, chunk) in ch.chunks.iter().enumerate() {
@@ -166,15 +211,40 @@ fn verify_node_recursive(
                 if sum != ch.size {
                     return Err(MerkleSyncError::InvalidManifest("chunk lengths do not sum to file size".into()));
                 }
+                if ch.subtree_file_count != 1 || ch.subtree_total_bytes != ch.size {
+                    return Err(MerkleSyncError::IntegrityMismatch("file subtree counters mismatch".into()));
+                }
+                (1u64, ch.size)
             }
             MerkleChildKind::Symlink => {
-                *visited_entries += 1;
-                if *visited_entries > MAX_TREE_ENTRIES {
-                    return Err(MerkleSyncError::InvalidManifest("manifest entry limit exceeded".into()));
+                *total_bytes = total_bytes
+                    .checked_add(ch.size)
+                    .ok_or_else(|| MerkleSyncError::InvalidManifest("workspace size overflow".into()))?;
+                if *total_bytes > MAX_WORKSPACE_BYTES {
+                    return Err(MerkleSyncError::InvalidManifest("workspace byte limit exceeded".into()));
                 }
-                if ch.target_base64.is_none() || !ch.content_sha256.as_deref().is_some_and(is_valid_sha256_hex) {
-                    return Err(MerkleSyncError::InvalidManifest("invalid symlink entry".into()));
+                let tgt_b64 = ch
+                    .target_base64
+                    .as_deref()
+                    .ok_or_else(|| MerkleSyncError::InvalidManifest("symlink missing target".into()))?;
+                let tgt_raw = STANDARD
+                    .decode(tgt_b64)
+                    .map_err(|_| MerkleSyncError::InvalidManifest("invalid symlink target_base64".into()))?;
+                if STANDARD.encode(&tgt_raw) != tgt_b64
+                    || tgt_raw.is_empty()
+                    || tgt_raw.starts_with(b"/")
+                    || tgt_raw.contains(&0)
+                    || tgt_raw.len() as u64 != ch.size
+                    || ch.mode != 0o777
+                    || !ch.chunks.is_empty()
+                    || ch.subtree_node_sha256.is_some()
+                    || !ch.content_sha256.as_deref().is_some_and(|s| s == hex::encode(Sha256::digest(&tgt_raw)))
+                    || ch.subtree_file_count != 1
+                    || ch.subtree_total_bytes != ch.size
+                {
+                    return Err(MerkleSyncError::InvalidManifest("invalid symlink entry or counters".into()));
                 }
+                (1u64, ch.size)
             }
             MerkleChildKind::EmptyDir => {
                 if matches!(manifest.ignore_policy.empty_dir_policy, EmptyDirPolicy::IgnoreEmptyDirs) {
@@ -182,8 +252,28 @@ fn verify_node_recursive(
                         "empty directory entry disallowed by IgnoreEmptyDirs policy".into(),
                     ));
                 }
+                if ch.mode != 0o755
+                    || ch.size != 0
+                    || !ch.chunks.is_empty()
+                    || ch.content_sha256.is_some()
+                    || ch.target_base64.is_some()
+                    || ch.subtree_node_sha256.is_some()
+                    || ch.subtree_file_count != 0
+                    || ch.subtree_total_bytes != 0
+                {
+                    return Err(MerkleSyncError::InvalidManifest("invalid empty_dir metadata or counters".into()));
+                }
+                (0u64, 0u64)
             }
             MerkleChildKind::Subdir => {
+                if ch.mode != 0o755
+                    || ch.size != 0
+                    || !ch.chunks.is_empty()
+                    || ch.content_sha256.is_some()
+                    || ch.target_base64.is_some()
+                {
+                    return Err(MerkleSyncError::InvalidManifest("invalid subdir entry metadata".into()));
+                }
                 let sub_b64 = encode_rel_bytes(&child_raw);
                 let sub_sha = ch
                     .subtree_node_sha256
@@ -196,11 +286,24 @@ fn verify_node_recursive(
                 if sub_node.node_sha256 != sub_sha {
                     return Err(MerkleSyncError::IntegrityMismatch("subdir hash mismatch".into()));
                 }
-                verify_node_recursive(manifest, &sub_b64, visited_entries, total_bytes, visited_nodes)?;
+                let (sf, sb) = verify_node_recursive(manifest, &sub_b64, visited_entries, total_bytes, visited_nodes)?;
+                if ch.subtree_file_count != sf || ch.subtree_total_bytes != sb {
+                    return Err(MerkleSyncError::IntegrityMismatch("subdir derived subtree counters mismatch".into()));
+                }
+                (sf, sb)
             }
-        }
+        };
+        exp_files = exp_files
+            .checked_add(add_files)
+            .ok_or_else(|| MerkleSyncError::InvalidManifest("node file count overflow".into()))?;
+        exp_bytes = exp_bytes
+            .checked_add(add_bytes)
+            .ok_or_else(|| MerkleSyncError::InvalidManifest("node byte count overflow".into()))?;
     }
-    Ok(())
+    if node.subtree_file_count != exp_files || node.subtree_total_bytes != exp_bytes {
+        return Err(MerkleSyncError::IntegrityMismatch("directory node derived subtree counters mismatch".into()));
+    }
+    Ok((exp_files, exp_bytes))
 }
 
 #[derive(Clone)]

@@ -318,6 +318,11 @@ impl PinHoldRegistry {
         map.values().any(|h| !h.released && h.locator_paths.contains(locator_path))
     }
 
+    pub fn active_hold_count(&self) -> usize {
+        let map = self.holds.lock().unwrap_or_else(|p| p.into_inner());
+        map.values().filter(|h| !h.released).count()
+    }
+
     pub fn plan_gc_sweep(
         &self,
         all_known_locators: &BTreeSet<String>,
@@ -341,5 +346,32 @@ impl PinHoldRegistry {
             }
         }
         GcSweepPlan { protected_locators, gc_eligible_orphan_locators, classifications }
+    }
+}
+
+pub struct ScopedHoldGuard<'a> {
+    registry: &'a PinHoldRegistry,
+    hold_id: Option<Uuid>,
+}
+
+impl<'a> ScopedHoldGuard<'a> {
+    pub fn new(registry: &'a PinHoldRegistry, hold: PinHoldRecord) -> Self {
+        Self { registry, hold_id: Some(hold.hold_id) }
+    }
+
+    pub fn hold_id(&self) -> Option<Uuid> {
+        self.hold_id
+    }
+
+    pub fn disarm(&mut self) -> Option<Uuid> {
+        self.hold_id.take()
+    }
+}
+
+impl Drop for ScopedHoldGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.hold_id.take() {
+            let _ = self.registry.release_hold(id);
+        }
     }
 }

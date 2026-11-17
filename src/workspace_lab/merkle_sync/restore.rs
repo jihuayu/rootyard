@@ -18,12 +18,15 @@ use uuid::Uuid;
 
 use super::{
     MERKLE_CODEC_VERSION, MERKLE_MANIFEST_SCHEMA, MerkleSyncError,
-    authz::{AccessContext, HoldPurpose, PinHoldRegistry, WorkspaceAuthAction, WorkspaceAuthorizer},
-    blob_sync::ensure_private_dir,
+    authz::{AccessContext, HoldPurpose, PinHoldRegistry, ScopedHoldGuard, WorkspaceAuthAction, WorkspaceAuthorizer},
+    blob_sync::{StageDirGuard, ensure_private_dir},
     git_compare::{GitBundleSnapshot, materialize_git_bundle},
     git_state::read_git_state_and_bundle,
     ledger::{MerkleBlobCheckpointManifest, MerkleCheckpointLedger},
-    manifest::{MerkleChildKind, MerkleDirNode, MerkleStateManifest, decode_rel_bytes, is_valid_sha256_hex},
+    manifest::{
+        MerkleChildKind, MerkleDirNode, MerkleStateManifest, compute_dir_node_sha256, decode_rel_bytes,
+        is_valid_sha256_hex,
+    },
     manifest_verify::validate_manifest,
     scan_fs::validate_symlink_safe,
     scanner::{DirtyScope, MerkleWorkspaceScanner, ScanRequest},
@@ -78,9 +81,8 @@ pub async fn restore_or_fork_from_blob(req: RestoreRequest<'_>) -> Result<Restor
     ensure_private_dir(req.staging_parent)?;
     let stage = req.staging_parent.join(format!("restore-{}", Uuid::new_v4()));
     ensure_private_dir(&stage)?;
-    let res = restore_into_stage(&req, &manifest_loc, &stage).await;
-    let _ = fs::remove_dir_all(&stage);
-    res
+    let _stage_guard = StageDirGuard(stage.clone());
+    restore_into_stage(&req, &manifest_loc, &stage).await
 }
 
 async fn restore_into_stage(
@@ -135,6 +137,7 @@ async fn restore_into_stage(
         req.checkpoint_id,
         held_paths,
     )?;
+    let hold_guard = ScopedHoldGuard::new(req.holds, hold);
 
     let bundle_path = stage.join("git-bundle.json");
     let bundle_loc = remote.git_bundle_locator.to_locator()?;
@@ -163,7 +166,9 @@ async fn restore_into_stage(
         downloaded_bytes += n_raw.len() as u64;
         let node: MerkleDirNode =
             serde_json::from_slice(&n_raw).map_err(|e| MerkleSyncError::InvalidManifest(e.to_string()))?;
-        if &node.node_sha256 != sha {
+        if &node.node_sha256 != sha
+            || compute_dir_node_sha256(&node.dir_path_base64, &node.children) != node.node_sha256
+        {
             return Err(MerkleSyncError::IntegrityMismatch("downloaded node_sha256 mismatch".into()));
         }
     }
@@ -204,7 +209,7 @@ async fn restore_into_stage(
         fs::create_dir_all(parent)?;
     }
     fs::rename(&repo_dir, req.target_empty_dir)?;
-    let _ = req.holds.release_hold(hold.hold_id);
+    drop(hold_guard);
 
     Ok(RestoreReport {
         checkpoint_id: req.checkpoint_id,

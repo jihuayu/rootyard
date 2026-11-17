@@ -13,9 +13,10 @@ use uuid::Uuid;
 use super::{
     MERKLE_CODEC_VERSION, MERKLE_MANIFEST_SCHEMA, MerkleSyncError,
     authz::{
-        AccessContext, HoldPurpose, PinHoldRegistry, TenantRepoScopeKey, WorkspaceAuthAction, WorkspaceAuthorizer,
+        AccessContext, HoldPurpose, PinHoldRegistry, ScopedHoldGuard, TenantRepoScopeKey, WorkspaceAuthAction,
+        WorkspaceAuthorizer,
     },
-    blob_sync::{UploadBytesReq, ensure_private_dir, upload_bytes_verified},
+    blob_sync::{StageDirGuard, UploadBytesReq, ensure_private_dir, upload_bytes_verified},
     ledger::{
         BlobUploadDriver, CheckpointCommitRecord, CheckpointCommitState, MerkleBlobCheckpointManifest,
         MerkleCheckpointLedger, RemoteObjectLocatorEntry,
@@ -108,6 +109,7 @@ pub async fn export_checkpoint_backup(
     ensure_private_dir(staging_parent)?;
     let stage = staging_parent.join(format!("backup-exp-{}", Uuid::new_v4()));
     ensure_private_dir(&stage)?;
+    let _stage_guard = StageDirGuard(stage.clone());
 
     let m_path = stage.join("manifest.json");
     store.get_to_file(&manifest_loc, &m_path, deadline).await?;
@@ -115,7 +117,6 @@ pub async fn export_checkpoint_backup(
     let remote: MerkleBlobCheckpointManifest =
         serde_json::from_slice(&m_bytes).map_err(|e| MerkleSyncError::InvalidManifest(e.to_string()))?;
     if remote.tenant_id != ctx.tenant_id || remote.repo_id != ctx.repo_id || remote.history_id != ctx.history_id {
-        let _ = fs::remove_dir_all(&stage);
         return Err(MerkleSyncError::TenantScopeMismatch("backup manifest scope mismatch".into()));
     }
     validate_manifest(&remote.state_manifest)?;
@@ -134,6 +135,7 @@ pub async fn export_checkpoint_backup(
         checkpoint_id,
         held_paths,
     )?;
+    let mut hold_guard = ScopedHoldGuard::new(holds, hold);
 
     let mut artifacts = Vec::new();
     let bundle_loc = remote.git_bundle_locator.to_locator()?;
@@ -173,7 +175,7 @@ pub async fn export_checkpoint_backup(
             payload_base64: STANDARD.encode(&data),
         });
     }
-    let _ = fs::remove_dir_all(&stage);
+    drop(_stage_guard);
 
     let manifest_bytes_base64 = STANDARD.encode(&m_bytes);
     let bundle_sha256 = compute_bundle_digest(
@@ -185,6 +187,7 @@ pub async fn export_checkpoint_backup(
         &manifest_bytes_base64,
         &artifacts,
     )?;
+    let hold_id = hold_guard.disarm().unwrap_or_default();
     Ok((
         MerkleBackupBundle {
             schema: MERKLE_MANIFEST_SCHEMA,
@@ -200,7 +203,7 @@ pub async fn export_checkpoint_backup(
             artifacts,
             bundle_sha256,
         },
-        hold.hold_id,
+        hold_id,
     ))
 }
 
@@ -252,6 +255,7 @@ pub async fn restore_checkpoint_backup(
     ensure_private_dir(params.staging_parent)?;
     let stage = params.staging_parent.join(format!("backup-rest-{}", Uuid::new_v4()));
     ensure_private_dir(&stage)?;
+    let _stage_guard = StageDirGuard(stage.clone());
 
     let backend_hex = params.target_store.backend_identity().as_hex().to_owned();
     let mut chunk_locators = BTreeMap::new();
@@ -263,7 +267,6 @@ pub async fn restore_checkpoint_backup(
     for art in &b.artifacts {
         let data = STANDARD.decode(&art.payload_base64).map_err(|e| MerkleSyncError::InvalidManifest(e.to_string()))?;
         if data.len() as u64 != art.length || hex::encode(Sha256::digest(&data)) != art.sha256 {
-            let _ = fs::remove_dir_all(&stage);
             return Err(MerkleSyncError::IntegrityMismatch("backup artifact integrity mismatch".into()));
         }
         let ns = match art.kind.as_str() {
@@ -271,7 +274,6 @@ pub async fn restore_checkpoint_backup(
             "node" => "merkle-node",
             "git_bundle" => "merkle-git",
             _ => {
-                let _ = fs::remove_dir_all(&stage);
                 return Err(MerkleSyncError::InvalidManifest("unknown backup artifact kind".into()));
             }
         };
@@ -284,6 +286,8 @@ pub async fn restore_checkpoint_backup(
             generation: params.generation,
             namespace: ns,
             bytes: &data,
+            expected_sha256: Some(&art.sha256),
+            expected_len: Some(art.length),
             deadline: params.deadline,
         })
         .await?;
@@ -337,6 +341,8 @@ pub async fn restore_checkpoint_backup(
         generation: params.generation,
         namespace: "merkle-manifest",
         bytes: &new_m_bytes,
+        expected_sha256: None,
+        expected_len: Some(new_m_bytes.len() as u64),
         deadline: params.deadline,
     })
     .await?;
@@ -361,6 +367,8 @@ pub async fn restore_checkpoint_backup(
         remote.checkpoint_id,
         held_paths,
     )?;
+    let mut hold_guard = ScopedHoldGuard::new(params.target_holds, hold);
+    let hold_id = hold_guard.hold_id().unwrap_or_default();
     params.target_ledger.begin_staging(CheckpointCommitRecord {
         checkpoint_id: remote.checkpoint_id,
         tenant_id: params.target_ctx.tenant_id,
@@ -373,8 +381,9 @@ pub async fn restore_checkpoint_backup(
         manifest_locator: None,
         hold_id: None,
     })?;
-    params.target_ledger.commit_atomic(remote.checkpoint_id, m_entry, hold.hold_id)?;
-    let _ = fs::remove_dir_all(&stage);
+    params.target_ledger.commit_atomic(remote.checkpoint_id, m_entry, hold_id)?;
+    hold_guard.disarm();
+    drop(_stage_guard);
 
     let restore_report = restore_or_fork_from_blob(RestoreRequest {
         ctx: params.target_ctx,
@@ -394,7 +403,7 @@ pub async fn restore_checkpoint_backup(
     Ok(BackupRestoreReport {
         backup_id: b.backup_id,
         restored_checkpoint_id: remote.checkpoint_id,
-        hold_id: hold.hold_id,
+        hold_id,
         uploaded_artifacts,
         restore_report,
     })
