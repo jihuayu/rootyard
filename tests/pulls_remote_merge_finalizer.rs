@@ -19,7 +19,7 @@ use rootyard::ref_store::core::state_machine::{
     AppliedLogId, CloseAuthScopeCommand, RefCasCommand, RefCasStateMachine, ScopeLifecycle,
 };
 use rootyard::ref_store::core::types::GitObjectFormat;
-use support::ctx::{TestCtx, git_ok, setup_git_repo};
+use support::ctx::{BuildArgs, TestCtx, git_ok, setup_git_repo};
 use support::raft::{LiveRaft3, LiveRaft3Backend};
 use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
@@ -86,17 +86,17 @@ async fn stock_git_sha1_and_sha256_merge_pack_refcas_sole_commit_and_idempotent_
         seed_pull_rec(&store, &ctx, 2, &h2, &h1);
 
         let prod = PullRemoteMergeProducer::new(&backend, &store, &ctx.keyring);
-        let (s1, p1) = ctx.build(
-            1,
-            1,
-            &base,
-            &h1,
-            &c1.target_oid,
-            MergeStrategy::FastForward,
-            gv1.revision,
-            &gv1.digest().as_hex(),
-            &c1.pack_sha256,
-        );
+        let (s1, p1) = ctx.build(BuildArgs {
+            num: 1,
+            seq: 1,
+            base: &base,
+            head: &h1,
+            target: &c1.target_oid,
+            strat: MergeStrategy::FastForward,
+            rev: gv1.revision(),
+            gd: &gv1.digest().as_hex(),
+            psha: &c1.pack_sha256,
+        });
         let MergeAttemptOutcome::Committed(rec1) =
             prod.execute_merge(&s1, &p1, true, MergeFaultInjection::None).await?
         else {
@@ -107,17 +107,17 @@ async fn stock_git_sha1_and_sha256_merge_pack_refcas_sole_commit_and_idempotent_
             ProjectionOutcome::ProjectedCommitted { replayed: true }
         );
         let gv2 = backend.state_machine().read_gate_version(ctx.repo).unwrap().unwrap();
-        let (s2, p2) = ctx.build(
-            2,
-            2,
-            &h1,
-            &h2,
-            &c2.target_oid,
-            MergeStrategy::MergeCommit,
-            gv2.revision,
-            &gv2.digest().as_hex(),
-            &c2.pack_sha256,
-        );
+        let (s2, p2) = ctx.build(BuildArgs {
+            num: 2,
+            seq: 2,
+            base: &h1,
+            head: &h2,
+            target: &c2.target_oid,
+            strat: MergeStrategy::MergeCommit,
+            rev: gv2.revision(),
+            gd: &gv2.digest().as_hex(),
+            psha: &c2.pack_sha256,
+        });
         let MergeAttemptOutcome::Committed(rec2) =
             prod.execute_merge(&s2, &p2, true, MergeFaultInjection::None).await?
         else {
@@ -172,28 +172,28 @@ async fn concurrent_same_ref_pr_stream_and_crash_timeout_reconciler() -> Result<
     seed_pull_rec(&store, &ctx, 1, &h1, &base);
     seed_pull_rec(&store, &ctx, 2, &h2, &base);
 
-    let (s1, p1) = ctx.build(
-        1,
-        1,
-        &base,
-        &h1,
-        &c1.target_oid,
-        MergeStrategy::FastForward,
-        gv.revision,
-        &gv.digest().as_hex(),
-        &c1.pack_sha256,
-    );
-    let (s2, p2) = ctx.build(
-        2,
-        2,
-        &base,
-        &h2,
-        &c2.target_oid,
-        MergeStrategy::MergeCommit,
-        gv.revision,
-        &gv.digest().as_hex(),
-        &c2.pack_sha256,
-    );
+    let (s1, p1) = ctx.build(BuildArgs {
+        num: 1,
+        seq: 1,
+        base: &base,
+        head: &h1,
+        target: &c1.target_oid,
+        strat: MergeStrategy::FastForward,
+        rev: gv.revision(),
+        gd: &gv.digest().as_hex(),
+        psha: &c1.pack_sha256,
+    });
+    let (s2, p2) = ctx.build(BuildArgs {
+        num: 2,
+        seq: 2,
+        base: &base,
+        head: &h2,
+        target: &c2.target_oid,
+        strat: MergeStrategy::MergeCommit,
+        rev: gv.revision(),
+        gd: &gv.digest().as_hex(),
+        psha: &c2.pack_sha256,
+    });
     let prod = PullRemoteMergeProducer::new(&backend, &store, &ctx.keyring);
     let (r1, r2) = tokio::join!(
         prod.execute_merge(&s1, &p1, true, MergeFaultInjection::CoordinatorTimeoutAfterCasBeforeProjection),
@@ -280,17 +280,17 @@ async fn e2e_pg17_mtls_raft3_stock_git_merge_crash_recovery_and_concurrent_race(
     let pg_store = PgMergeStore::new(pool.clone());
     let prod = PullRemoteMergeProducer::new(&backend, &pg_store, &ctx.keyring);
 
-    let (s1, p1) = ctx.build(
-        1,
-        1,
-        &base,
-        &h1,
-        &c1.target_oid,
-        MergeStrategy::FastForward,
-        gv.revision,
-        &gv.digest().as_hex(),
-        &c1.pack_sha256,
-    );
+    let (s1, p1) = ctx.build(BuildArgs {
+        num: 1,
+        seq: 1,
+        base: &base,
+        head: &h1,
+        target: &c1.target_oid,
+        strat: MergeStrategy::FastForward,
+        rev: gv.revision(),
+        gd: &gv.digest().as_hex(),
+        psha: &c1.pack_sha256,
+    });
     assert!(matches!(
         prod.execute_merge(&s1, &p1, true, MergeFaultInjection::CoordinatorTimeoutAfterCasBeforeProjection).await,
         Err(RemoteMergeError::UnknownOutcome(_))
@@ -306,17 +306,17 @@ async fn e2e_pg17_mtls_raft3_stock_git_merge_crash_recovery_and_concurrent_race(
         ("merged", Some(c1.target_oid.as_str()))
     );
 
-    let (s2, p2) = ctx.build(
-        2,
-        2,
-        &base,
-        &h2,
-        &c2.target_oid,
-        MergeStrategy::MergeCommit,
-        gv.revision,
-        &gv.digest().as_hex(),
-        &c2.pack_sha256,
-    );
+    let (s2, p2) = ctx.build(BuildArgs {
+        num: 2,
+        seq: 2,
+        base: &base,
+        head: &h2,
+        target: &c2.target_oid,
+        strat: MergeStrategy::MergeCommit,
+        rev: gv.revision(),
+        gd: &gv.digest().as_hex(),
+        psha: &c2.pack_sha256,
+    });
     assert!(matches!(
         prod.execute_merge(&s2, &p2, true, MergeFaultInjection::None).await,
         Err(RemoteMergeError::TargetRefMoved { .. })

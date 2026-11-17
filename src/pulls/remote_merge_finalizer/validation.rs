@@ -14,8 +14,8 @@ use crate::ref_store::projector::{
 };
 
 use super::types::{
-    MergeAttemptSpec, MergeBindingInputs, MergePullSnapshot, MergeStrategy, RemoteMergeError, oid_valid_for_format,
-    unique_sorted_checks,
+    MergeAttemptSpec, MergeBindingInputs, MergePullSnapshot, MergeStrategy, RemoteMergeError,
+    compute_merge_binding_digest, oid_valid_for_format, unique_sorted_checks,
 };
 
 #[derive(Clone, Debug)]

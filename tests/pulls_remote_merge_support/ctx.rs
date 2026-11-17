@@ -83,6 +83,18 @@ pub struct TestCtx {
     pub keyring: DecisionGrantKeyring,
 }
 
+pub struct BuildArgs<'a> {
+    pub num: i64,
+    pub seq: i64,
+    pub base: &'a str,
+    pub head: &'a str,
+    pub target: &'a str,
+    pub strat: MergeStrategy,
+    pub rev: i64,
+    pub gd: &'a str,
+    pub psha: &'a str,
+}
+
 impl TestCtx {
     pub fn new(fmt: GitObjectFormat) -> Self {
         let (tenant, repo, actor, scope_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
@@ -146,18 +158,9 @@ impl TestCtx {
         (init, seed)
     }
 
-    pub fn build(
-        &self,
-        num: i64,
-        seq: i64,
-        base: &str,
-        head: &str,
-        target: &str,
-        strat: MergeStrategy,
-        rev: i64,
-        gd: &str,
-        psha: &str,
-    ) -> (MergeAttemptSpec, MergePullSnapshot) {
+    pub fn build(&self, a: BuildArgs<'_>) -> (MergeAttemptSpec, MergePullSnapshot) {
+        let (num, seq, base, head, target, strat, rev, gd, psha) =
+            (a.num, a.seq, a.base, a.head, a.target, a.strat, a.rev, a.gd, a.psha);
         let (op, dec, d) = (Uuid::new_v4(), Uuid::new_v4(), "11".repeat(32));
         let chks = vec!["ci/verify".to_owned()];
         let pull = MergePullSnapshot {

@@ -148,7 +148,7 @@ pub(super) fn setup_fixture(fmt: GitObjectFormat) -> Fixture {
         store,
         base_oid,
         head_oid,
-        base_revision: gate_ver.revision,
+        base_revision: gate_ver.revision(),
         base_gate_digest: gate_ver.digest().as_hex(),
     }
 }

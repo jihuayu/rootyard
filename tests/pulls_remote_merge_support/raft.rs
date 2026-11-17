@@ -93,6 +93,7 @@ impl MtlsNode {
         tokio::task::spawn_blocking(move || {
             let tcp = TcpStream::connect(addr)?;
             tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+            tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
             let mut tls = StreamOwned::new(ClientConnection::new(cfg, ServerName::try_from(dns)?)?, tcp);
             let p = serde_json::to_vec(&req)?;
             tls.write_all(&(p.len() as u32).to_be_bytes())?;
@@ -102,6 +103,8 @@ impl MtlsNode {
             tls.read_exact(&mut lb)?;
             let mut buf = vec![0u8; u32::from_be_bytes(lb) as usize];
             tls.read_exact(&mut buf)?;
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
             Ok(serde_json::from_slice(&buf)?)
         })
         .await?
@@ -242,6 +245,7 @@ impl LiveRaft3 {
         while Instant::now() < dl {
             for n in self.nodes.values() {
                 if let Ok(m) = n.rpc(json!("Metrics")).await
+                    && m.pointer("/Metrics/running_ok").and_then(Value::as_bool) == Some(true)
                     && let Some(lid) = m.pointer("/Metrics/current_leader").and_then(Value::as_u64)
                     && self.nodes.contains_key(&lid)
                     && self.nodes[&lid].rpc(json!("EnsureReadIndex")).await.is_ok_and(|v| v.get("ReadIndex").is_some())
@@ -254,19 +258,40 @@ impl LiveRaft3 {
         bail!("leader timeout")
     }
 
+    async fn kv_put(&self, key: &str, value: &str) -> Result<u64> {
+        let p = serde_json::to_vec(&json!({ "Put": { "key": key, "value": value } }))?;
+        let dl = Instant::now() + Duration::from_secs(20);
+        let mut last = String::new();
+        let mut hint = None;
+        while Instant::now() < dl {
+            let lid = match hint.take() {
+                Some(id) if self.nodes.contains_key(&id) => id,
+                _ => self.wait_leader().await?,
+            };
+            match self.nodes[&lid].rpc(json!({ "ClientWrite": { "payload": p.clone() } })).await {
+                Ok(w) => {
+                    if let Some(idx) = w.pointer("/ClientWrite/log_index").and_then(Value::as_u64) {
+                        return Ok(idx);
+                    }
+                    if let Some(f) = w.pointer("/Error/forward_to_leader_id").and_then(Value::as_u64) {
+                        hint = Some(f);
+                    }
+                    last = w.to_string();
+                }
+                Err(e) => last = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        bail!("kv_put timeout {key}: {last}")
+    }
+
     pub async fn append(
         &mut self,
         cmd: &RefCasCommand,
     ) -> Result<(u64, RefCasStateMachine, Option<Result<ApplyResponse, StateMachineError>>)> {
         let next = self.seq + 1;
-        let lid = self.wait_leader().await?;
-        let p = serde_json::to_vec(
-            &json!({ "Put": { "key": format!("pm/{next:08}"), "value": serde_json::to_string(cmd)? } }),
-        )?;
-        let w = self.nodes[&lid].rpc(json!({ "ClientWrite": { "payload": p } })).await?;
-        let idx = w.pointer("/ClientWrite/log_index").and_then(Value::as_u64).context("idx")?;
-        let hp = serde_json::to_vec(&json!({ "Put": { "key": "pm/head", "value": next.to_string() } }))?;
-        self.nodes[&lid].rpc(json!({ "ClientWrite": { "payload": hp } })).await?;
+        let idx = self.kv_put(&format!("pm/{next:08}"), &serde_json::to_string(cmd)?).await?;
+        let _ = self.kv_put("pm/head", &next.to_string()).await?;
         self.seq = next;
         let (sm, last) = self.replay_sm().await?;
         Ok((idx, sm, last))
