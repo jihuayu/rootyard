@@ -48,8 +48,10 @@ token, S3 credential, raw server stderr or environment dump.
 """
 import argparse
 import concurrent.futures
+import enum
 import http.client
 import json
+import linecache
 import os
 from pathlib import Path
 import random
@@ -110,6 +112,114 @@ def quote_literal(value):
 def sha256_hex(value):
     text = str(value)
     return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+
+class BackendIdentityConflictPhase(enum.Enum):
+    """Closed, finite failure projection for the backend-identity conflict case."""
+
+    initial_create = "initial_create"
+    authority_before = "authority_before"
+    stop_original = "stop_original"
+    start_conflicting = "start_conflicting"
+    conflicting_create = "conflicting_create"
+    authority_after_refusal = "authority_after_refusal"
+    conflicting_lookup = "conflicting_lookup"
+    stop_conflicting = "stop_conflicting"
+    start_restored = "start_restored"
+    authority_after_restore = "authority_after_restore"
+    restored_read = "restored_read"
+    restored_git = "restored_git"
+
+
+# Only these exact exception classes may appear in the diagnostic. Anything
+# else is projected as the bounded literal "unknown". Table lookups use the
+# exact runtime type, never a string/repr/args inspection of the exception.
+_PHASE_EXCEPTION_CLASSES = {
+    AssertionError: "AssertionError",
+    RuntimeError: "RuntimeError",
+    ValueError: "ValueError",
+    TypeError: "TypeError",
+    KeyError: "KeyError",
+    OSError: "OSError",
+    TimeoutError: "TimeoutError",
+    ConnectionError: "ConnectionError",
+    ConnectionResetError: "ConnectionResetError",
+    BrokenPipeError: "BrokenPipeError",
+    json.JSONDecodeError: "JSONDecodeError",
+    http.client.HTTPException: "HTTPException",
+    http.client.RemoteDisconnected: "RemoteDisconnected",
+}
+_CLOSED_EXCEPTION_LABELS = frozenset(_PHASE_EXCEPTION_CLASSES.values()) | {"unknown"}
+
+
+def _closed_phase_exception_class(error):
+    """Project the runtime type through the closed allowlist, else ``unknown``."""
+    return _PHASE_EXCEPTION_CLASSES.get(type(error), "unknown")
+
+
+class BackendIdentityConflictPhaseError(Exception):
+    """Safe, closed phase/class projection for one failed checkpoint.
+
+    The original exception object, value, arguments, message, traceback and
+    chain are deliberately not stored. ``__str__`` is therefore safe for the
+    inherited ``Harness.case``/``redact`` projector, which persists only it.
+    """
+
+    def __init__(self, phase, exception_class, source_line=None):
+        if not isinstance(phase, BackendIdentityConflictPhase):
+            raise TypeError("phase is not a closed backend-identity projection")
+        if exception_class not in _CLOSED_EXCEPTION_LABELS:
+            raise ValueError("exception class is outside the closed allowlist")
+        if source_line is not None and (
+                not isinstance(source_line, int) or isinstance(source_line, bool) or source_line < 1):
+            raise ValueError("source line must be a positive integer or None")
+        self.phase = phase
+        self.exception_class = exception_class
+        self.source_line = source_line
+        super().__init__(phase.value, exception_class)
+
+    def __str__(self):
+        return "backend-identity-conflict phase=" + self.phase.value + " class=" + self.exception_class
+
+    def diagnostic(self):
+        """Transient structured view; never contains the raw exception."""
+        diagnostic = {
+            "case": "backend_identity_conflict_is_explicit_and_preserves_authority",
+            "phase": self.phase.value,
+            "exception_class": self.exception_class,
+        }
+        if self.source_line is not None:
+            diagnostic["source_line"] = self.source_line
+        return diagnostic
+
+
+class _BackendIdentityConflictPhaseContext:
+    def __init__(self, phase, source_line):
+        self.phase = phase
+        self.source_line = source_line
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, exc_tb):
+        if exc is None or not isinstance(exc, Exception):
+            return False
+        if isinstance(exc, BackendIdentityConflictPhaseError):
+            return False
+        raise BackendIdentityConflictPhaseError(
+            self.phase, _closed_phase_exception_class(exc), self.source_line) from None
+
+
+def _phase_source_line(frame):
+    """Return this file's wrapper line, and only when it is actually there."""
+    try:
+        path = Path(frame.f_code.co_filename).resolve()
+        if path != Path(__file__).resolve():
+            return None
+        line = linecache.getline(str(path), frame.f_lineno)
+    except Exception:
+        return None
+    return frame.f_lineno if "_backend_identity_conflict_phase(" in line else None
 
 
 class AckLossProxy:
@@ -236,6 +346,10 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
         prefix = self.env.get("ROOTYARD_BLOB_ROOT", "").strip("/")
         root = (prefix + "/" if prefix else "") + "identity-conflict-" + uuid.uuid4().hex
         return {"ROOTYARD_BLOB_ROOT": root}
+
+    def _backend_identity_conflict_phase(self, phase):
+        """Project exactly one existing stage onto the closed phase enum."""
+        return _BackendIdentityConflictPhaseContext(phase, _phase_source_line(sys._getframe(1)))
 
     # -- native Git helpers -------------------------------------------------
     def push_and_clone(self, repo, label, object_format="sha1", files=None):
@@ -812,64 +926,76 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
 
     def backend_identity_conflict_is_explicit_and_preserves_authority(self):
         name = "backend-identity-conflict"
-        repo, created_status = self.create(name, self.alice)
-        assert created_status in (201, 202)
-        before = self.authority(repo, name)
-        original_pid = self.proc.pid
-        # Stop cleanly so the owned data-volume lock is released before the
-        # same real binary is restarted with another Blob identity.
-        self.stop(hard=False)
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.initial_create):
+            repo, created_status = self.create(name, self.alice)
+            assert created_status in (201, 202)
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.authority_before):
+            before = self.authority(repo, name)
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.stop_original):
+            original_pid = self.proc.pid
+            # Stop cleanly so the owned data-volume lock is released before the
+            # same real binary is restarted with another Blob identity.
+            self.stop(hard=False)
         conflicting_pid = None
         refusal_status = None
         refusal_error = None
         lookup_status = None
         lookup_error = None
         try:
-            self.start(overrides=self.conflicting_blob_identity_overrides(),
-                       label="conflicting-blob-identity")
-            conflicting_pid = self.proc.pid
-            assert conflicting_pid != original_pid
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.start_conflicting):
+                self.start(overrides=self.conflicting_blob_identity_overrides(),
+                           label="conflicting-blob-identity")
+                conflicting_pid = self.proc.pid
+                assert conflicting_pid != original_pid
             # This is the same real create request on the same bound name. The
             # production check compares the stored binding identity with the
             # identity of the store this process actually opened.
-            refusal_status, refusal_raw, _ = self.post_create(
-                {"owner": "alice", "name": name, "object_format": "sha1"}, attempts=1)
-            assert refusal_status == 409, (
-                "conflicting Blob backend create was not explicitly refused: " + str(refusal_status))
-            refusal = json.loads(refusal_raw)
-            # The gateway collapses every provisioning 409 into this fixed,
-            # closed literal (src/blob_git_gateway/error.rs); it never echoes a
-            # backend digest or SQL text.
-            assert refusal == {"error": "repository state changed; retry"}, refusal
-            refusal_error = refusal["error"]
-            after_refusal = self.authority(repo, name)
-            assert after_refusal == before, "backend-identity refusal changed the durable authority"
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.conflicting_create):
+                refusal_status, refusal_raw, _ = self.post_create(
+                    {"owner": "alice", "name": name, "object_format": "sha1"}, attempts=1)
+                assert refusal_status == 409, (
+                    "conflicting Blob backend create was not explicitly refused: " + str(refusal_status))
+                refusal = json.loads(refusal_raw)
+                # The gateway collapses every provisioning 409 into this fixed,
+                # closed literal (src/blob_git_gateway/error.rs); it never echoes a
+                # backend digest or SQL text.
+                assert refusal == {"error": "repository state changed; retry"}, refusal
+                refusal_error = refusal["error"]
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.authority_after_refusal):
+                after_refusal = self.authority(repo, name)
+                assert after_refusal == before, "backend-identity refusal changed the durable authority"
             # The same binding cannot be served by the conflicting backend
             # either. This is a closed "not ready" lookup refusal, not a 200.
-            lookup_status, lookup_raw, _ = self.get_repo_status("alice", name)
-            assert lookup_status == 409, (
-                "bound repository was served under a different Blob backend: " + str(lookup_status))
-            lookup = json.loads(lookup_raw)
-            assert lookup == {"error": "repository is not ready"}, lookup
-            lookup_error = lookup["error"]
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.conflicting_lookup):
+                lookup_status, lookup_raw, _ = self.get_repo_status("alice", name)
+                assert lookup_status == 409, (
+                    "bound repository was served under a different Blob backend: " + str(lookup_status))
+                lookup = json.loads(lookup_raw)
+                assert lookup == {"error": "repository is not ready"}, lookup
+                lookup_error = lookup["error"]
         finally:
-            self.stop(hard=True)
+            with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.stop_conflicting):
+                self.stop(hard=True)
         # Restore the original backend and prove the durable authority and real
         # Git serving path still work; the refusal was not a partial deletion.
-        self.start(label="after-backend-identity-conflict")
-        assert self.proc.pid != conflicting_pid
-        after_restart = self.authority(repo, name)
-        assert after_restart == before, "authority changed after restoring the original Blob backend"
-        got = json.loads(self.expect("/api/repos/alice/" + name, 200, token=self.alice))
-        assert got["id"] == repo["id"] and got["state"] == "ready", got
-        oid = self.push_and_clone(repo, name)
-        return {"repository_id": repo["id"],
-                "conflicting_backend_service_restarted": True,
-                "refusal_status": refusal_status, "refusal_error": refusal_error,
-                "lookup_status": lookup_status, "lookup_error": lookup_error,
-                "authority_counts": before["counts"], "gate_revision": before["gate_revision"],
-                "authority_unchanged": True, "original_backend_restored": True,
-                "restored_status": 200, "ack_oid": oid, "clone_fsck": True}
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.start_restored):
+            self.start(label="after-backend-identity-conflict")
+            assert self.proc.pid != conflicting_pid
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.authority_after_restore):
+            after_restart = self.authority(repo, name)
+            assert after_restart == before, "authority changed after restoring the original Blob backend"
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.restored_read):
+            got = json.loads(self.expect("/api/repos/alice/" + name, 200, token=self.alice))
+            assert got["id"] == repo["id"] and got["state"] == "ready", got
+        with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.restored_git):
+            oid = self.push_and_clone(repo, name)
+            return {"repository_id": repo["id"],
+                    "conflicting_backend_service_restarted": True,
+                    "refusal_status": refusal_status, "refusal_error": refusal_error,
+                    "lookup_status": lookup_status, "lookup_error": lookup_error,
+                    "authority_counts": before["counts"], "gate_revision": before["gate_revision"],
+                    "authority_unchanged": True, "original_backend_restored": True,
+                    "restored_status": 200, "ack_oid": oid, "clone_fsck": True}
 
     def unsupported_legacy_repository_format_is_explicitly_refused(self):
         legacy_name = "legacy-gitfs-format"
