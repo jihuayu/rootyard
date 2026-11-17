@@ -77,6 +77,9 @@ pub const DEFAULT_MAX_RESIDENT_REPLAY_OPS: usize = 4096;
 pub const DEFAULT_MAX_RESIDENT_OP_FENCES: usize = 65_536;
 pub const LEDGER_REPO_MAX_HOLDS: usize = 256;
 pub const LEDGER_REPO_MAX_NESTED_HOLDS: usize = 4096;
+pub const MAX_REF_NAME_BYTES: usize = 255;
+pub const MAX_HOLD_LABEL_BYTES: usize = 256;
+pub const DEFAULT_MAX_RESIDENT_REF_AND_HOLD_BYTES: u64 = 2 * MIB;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,6 +114,7 @@ pub struct MetadataLedgerContract {
     pub repo_max_resident_entries: usize,
     pub repo_max_holds: usize,
     pub repo_max_nested_holds: usize,
+    pub max_resident_ref_and_hold_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +228,7 @@ impl PandoCapacityContract {
                 repo_max_resident_entries: DEFAULT_MAX_RESIDENT_LEDGER_ENTRIES,
                 repo_max_holds: LEDGER_REPO_MAX_HOLDS,
                 repo_max_nested_holds: LEDGER_REPO_MAX_NESTED_HOLDS,
+                max_resident_ref_and_hold_bytes: DEFAULT_MAX_RESIDENT_REF_AND_HOLD_BYTES,
             },
             blob: BlobLayerContract {
                 max_object_bytes: MAX_OBJECT_BYTES,
@@ -325,6 +330,7 @@ impl PandoCapacityContract {
             || self.metadata_ledger.max_plan_refs == 0
             || self.metadata_ledger.repo_max_holds == 0
             || self.metadata_ledger.repo_max_nested_holds == 0
+            || self.metadata_ledger.max_resident_ref_and_hold_bytes == 0
             || self.streaming.max_retained_pack_records == 0
             || self.streaming.max_retained_pack_bytes == 0
             || self.streaming.max_resident_replay_ops == 0
@@ -388,6 +394,7 @@ mod tests {
         assert!(contract.gateway_exceeds_verifier_window());
         assert_eq!(contract.metadata_ledger.repo_max_logical_bytes, 8 * 1024 * 1024);
         assert_eq!(contract.metadata_ledger.repo_max_active_memberships, 16);
+        assert_eq!(contract.metadata_ledger.max_resident_ref_and_hold_bytes, 2 * 1024 * 1024);
         assert_eq!(contract.verifier.max_pairs_per_window, 16);
         assert_eq!(contract.verifier.max_total_bytes_per_window, 64 * 1024 * 1024);
         assert_eq!(contract.verifier.max_objects_per_window, 16_384);
@@ -405,5 +412,9 @@ mod tests {
         let mut bad_delete = PandoCapacityContract::current_standalone();
         bad_delete.streaming.delete_during_compaction_enabled = true;
         assert!(matches!(bad_delete.validate(), Err(CapacityContractError::CrossLayerViolation(_))));
+
+        let mut bad_ref_hold = PandoCapacityContract::current_standalone();
+        bad_ref_hold.metadata_ledger.max_resident_ref_and_hold_bytes = 0;
+        assert!(matches!(bad_ref_hold.validate(), Err(CapacityContractError::InvalidBound(_))));
     }
 }

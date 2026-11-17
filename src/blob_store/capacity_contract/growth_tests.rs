@@ -256,6 +256,7 @@ fn retained_pack_bytes_partial_idx_and_non_evicting_cancel_tombstones() {
     state.record_failed_upload(vec![fake_pack(500, 1, 2).pack_locator], 500, 0, 0, 10, 1500);
     assert_eq!(state.failed_attempt_records.len(), 1);
     assert_eq!(state.resident_retained_bytes(), 1064);
+    assert_eq!((state.snapshot().failed_attempt_count, state.snapshot().failed_attempt_blob_bytes), (2, 1564));
 
     let (c1, c2, c3, op4) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     state.record_cancel(c1, 2).unwrap();
@@ -309,4 +310,86 @@ fn bounded_holds_and_nested_holds_fail_atomically() {
         Err(LedgerRetentionError::LedgerBudgetExhausted { resource: "holds", current: 2, limit: 2 })
     ));
     assert_eq!(ledger.total_nested_holds(), 9);
+}
+
+#[test]
+fn ref_name_length_and_ref_hold_byte_caps_fail_atomically() {
+    let z = "0".repeat(40);
+    let o1 = "1".repeat(40);
+    let ok_ref = format!("refs/heads/{}", "r".repeat(244));
+    assert_eq!(ok_ref.len(), 255);
+    let ok_mut = [RefMutation { ref_name: ok_ref, old_oid: z.clone(), new_oid: o1.clone() }];
+    assert!(validate_mutations(ObjectFormat::Sha1, 4, &ok_mut).is_ok());
+
+    for bad_ref in [format!("refs/heads/{}", "r".repeat(245)), "refs/heads/bad\0name".into()] {
+        let m = [RefMutation { ref_name: bad_ref, old_oid: z.clone(), new_oid: o1.clone() }];
+        assert!(matches!(validate_mutations(ObjectFormat::Sha1, 4, &m), Err(GrowthEngineError::InvalidInput(_))));
+    }
+
+    let mut c = PandoCapacityContract::current_standalone();
+    c.metadata_ledger.max_resident_ref_and_hold_bytes = 280;
+    let mut st = empty_state(&c);
+    let r1 = "refs/heads/main";
+    let p0 = fake_pack(128, 1, 1);
+    let op1 = Uuid::new_v4();
+    st.commit_push(CommitPushInput {
+        contract: &c,
+        object_format: ObjectFormat::Sha1,
+        operation_id: op1,
+        request_digest: "d1".into(),
+        ref_mutations: &[RefMutation { ref_name: r1.into(), old_oid: z.clone(), new_oid: o1.clone() }],
+        base_pack_ids: &BTreeSet::new(),
+        uploaded_records: vec![p0],
+        put_bytes: 192,
+        blob_get_bytes: 0,
+        peak_scratch_bytes: 0,
+    })
+    .unwrap();
+    let (epoch0, rev0, hold_b0) = (st.epoch, st.closure_revision, st.ledger.resident_hold_bytes());
+    let long_ref = format!("refs/heads/{}", "x".repeat(160));
+    let op2 = Uuid::new_v4();
+    assert!(matches!(
+        st.commit_push(CommitPushInput {
+            contract: &c,
+            object_format: ObjectFormat::Sha1,
+            operation_id: op2,
+            request_digest: "d2".into(),
+            ref_mutations: &[RefMutation { ref_name: long_ref.clone(), old_oid: z.clone(), new_oid: o1.clone() }],
+            base_pack_ids: &BTreeSet::from([st.active_packs[0].pack_id]),
+            uploaded_records: Vec::new(),
+            put_bytes: 0,
+            blob_get_bytes: 0,
+            peak_scratch_bytes: 0,
+        }),
+        Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+            resource: "ref_and_hold_bytes",
+            ..
+        }))
+    ));
+    assert_eq!((st.epoch, st.closure_revision, st.acked_refs.len()), (epoch0, rev0, 1));
+    assert!(!st.acked_op_fences.contains(&op2));
+    assert_eq!(st.ledger.resident_hold_bytes(), hold_b0);
+
+    for bad_hold in [
+        ProtectionHold::Pin { pin_id: Uuid::new_v4(), purpose: String::new() },
+        ProtectionHold::Pin { pin_id: Uuid::new_v4(), purpose: "p".repeat(257) },
+        ProtectionHold::RetentionRoot { root_id: Uuid::new_v4(), kind: String::new() },
+        ProtectionHold::RetentionRoot { root_id: Uuid::new_v4(), kind: "k".repeat(257) },
+    ] {
+        assert!(matches!(
+            st.attach_hold_checked(bad_hold, Some(o1.clone()), 16, 280),
+            Err(GrowthEngineError::Ledger(LedgerRetentionError::InvalidArgument(_)))
+        ));
+    }
+    assert_eq!((st.pinned_commits.len(), st.closure_revision), (0, rev0));
+
+    let big_pin = ProtectionHold::Pin { pin_id: Uuid::new_v4(), purpose: "a".repeat(32) };
+    assert!(matches!(
+        st.attach_hold_checked(big_pin, Some(o1), 16, 280),
+        Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+            resource: "ref_and_hold_bytes",
+            ..
+        }))
+    ));
+    assert_eq!((st.pinned_commits.len(), st.closure_revision, st.ledger.resident_hold_bytes()), (0, rev0, hold_b0));
 }

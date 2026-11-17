@@ -19,6 +19,8 @@ pub mod streaming_growth;
 
 #[cfg(test)]
 mod growth_tests;
+#[cfg(test)]
+mod ledger_tests;
 
 pub use admission::{AdmissionController, AdmissionPermit};
 pub use admission_types::{

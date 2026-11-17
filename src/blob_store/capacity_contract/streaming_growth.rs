@@ -29,7 +29,7 @@ use super::{
         VerifiedPackRecord,
     },
     ledger_retention::RetentionLedger,
-    ledger_types::{LedgerBudgetPolicy, LedgerRetentionError, ProtectionHold},
+    ledger_types::{LedgerBudgetPolicy, ProtectionHold},
     limits::{PandoCapacityContract, RESERVED_GIT_OPEN_FDS},
 };
 use crate::blob_store::{BlobLocator, disposable_view::DisposableViewRoot, opendal::BlobStore};
@@ -169,23 +169,12 @@ impl StreamingGrowthEngine {
             return Err(GrowthEngineError::InvalidInput("pinned oid does not match repository format"));
         }
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let hold_id = hold.hold_id();
-        if pinned_oid.is_some()
-            && !guard.pinned_commits.contains_key(&hold_id)
-            && guard.pinned_commits.len() >= self.contract.metadata_ledger.repo_max_holds
-        {
-            return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
-                resource: "pins",
-                current: guard.pinned_commits.len() as u64,
-                limit: self.contract.metadata_ledger.repo_max_holds as u64,
-            }));
-        }
-        let count = guard.ledger.attach_hold_to_active_frontier(hold)?;
-        if let Some(oid) = pinned_oid {
-            guard.pinned_commits.insert(hold_id, oid);
-            guard.closure_revision = guard.closure_revision.saturating_add(1);
-        }
-        Ok(count)
+        guard.attach_hold_checked(
+            hold,
+            pinned_oid,
+            self.contract.metadata_ledger.repo_max_holds,
+            self.contract.metadata_ledger.max_resident_ref_and_hold_bytes,
+        )
     }
 
     pub fn release_hold(&self, hold_id: Uuid) -> Result<usize, GrowthEngineError> {
@@ -270,12 +259,6 @@ impl StreamingGrowthEngine {
         let (base_epoch, base_packs, base_refs) = {
             let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
             guard.check_op_fence_bound(req.operation_id, self.contract.streaming.max_resident_op_fences)?;
-            guard.check_resident_pack_bound(
-                self.contract.streaming.max_retained_pack_records,
-                self.contract.streaming.max_retained_pack_bytes,
-                req.new_pack_paths.len(),
-                0,
-            )?;
             (guard.epoch, guard.active_packs.clone(), guard.acked_refs.clone())
         };
         let base_pack_ids: BTreeSet<Uuid> = base_packs.iter().map(|p| p.pack_id).collect();
@@ -289,15 +272,13 @@ impl StreamingGrowthEngine {
             new_pack_bytes = new_pack_bytes.saturating_add(plen).saturating_add(ilen);
             new_pack_objects = new_pack_objects.saturating_add(objs);
         }
-        if !req.new_pack_paths.is_empty() {
-            let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            guard.check_resident_pack_bound(
-                self.contract.streaming.max_retained_pack_records,
-                self.contract.streaming.max_retained_pack_bytes,
-                req.new_pack_paths.len(),
-                new_pack_bytes,
-            )?;
-        }
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).check_push_preconditions(
+            &self.contract,
+            req.operation_id,
+            req.new_pack_paths.len(),
+            new_pack_bytes,
+            &resulting_refs,
+        )?;
         let frontier_bytes: u64 = base_packs.iter().map(VerifiedPackRecord::total_bytes).sum();
         let frontier_objects: u64 = base_packs.iter().map(|p| p.object_count).sum();
         let total_pairs = base_packs.len().saturating_add(req.new_pack_paths.len());

@@ -6,13 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
-use axum::{
-    body::Body,
-    extract::State,
-    http::{Method, Uri},
-    response::Response,
-};
+use axum::{body::Body, extract::State, http::Method, http::Uri, response::Response};
 use bytes::Bytes;
+use rootyard::blob_store::disposable_view::DisposableViewRoot;
 use rootyard::blob_store::{BlobLocator, capacity_contract::*, opendal::BlobStore};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -132,7 +128,6 @@ fn open_eng(s3: &LoopbackS3, dir: &TempDir, c: Cfg, fmt: ObjectFormat, ac: bool)
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
     b.create(&views)?;
-    use rootyard::blob_store::disposable_view::DisposableViewRoot;
     let vr = DisposableViewRoot::open(&views, 4, 256 * 1024 * 1024, Duration::from_secs(120))?;
     let u = Uuid::new_v4;
     let sc = EngineScope { tenant_id: u(), repo_id: u(), authority_id: u(), object_format: fmt, auto_compact: ac };
@@ -297,8 +292,7 @@ async fn compaction_and_push_budget_failures_preserve_ledger_and_frontier() -> R
         (16, 1, 8 * 1024 * 1024, "receipts", false),
         (1, 16, 8 * 1024 * 1024, "registrations", false),
     ] {
-        let dir = TempDir::new()?;
-        let mut c = Cfg::current_standalone();
+        let (dir, mut c) = (TempDir::new()?, Cfg::current_standalone());
         let ml = &mut c.metadata_ledger;
         (ml.repo_max_registrations, ml.repo_max_receipts) = (regs, rcpts);
         ml.repo_max_logical_bytes = bytes;
@@ -391,11 +385,9 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     let (s3, dir, dl, z, pr) =
         (LoopbackS3::new(), TempDir::new()?, Instant::now() + Duration::from_secs(60), "0".repeat(40), push_req);
     let eng = open_eng(&s3, &dir, PandoCapacityContract::current_standalone(), ObjectFormat::Sha1, false)?;
-    let ((o1, p1, i1), (o2, p2, i2), (o3, p3, i3)) = (
-        seed_one(&dir, "s1", "k.txt", b"main")?,
-        seed_one(&dir, "s2", "r.txt", b"resurrect")?,
-        seed_one(&dir, "s3", "p.txt", b"late-pin")?,
-    );
+    let (o1, p1, i1) = seed_one(&dir, "s1", "k.txt", b"main")?;
+    let (o2, p2, i2) = seed_one(&dir, "s2", "r.txt", b"resurrect")?;
+    let (o3, p3, i3) = seed_one(&dir, "s3", "p.txt", b"late-pin")?;
     let (p1_sha, p3_sha) = (pack_meta(&p1, &i1)?.0, pack_meta(&p3, &i3)?.0);
 
     let pin_hold = |p: &str| ProtectionHold::Pin { pin_id: Uuid::new_v4(), purpose: p.into() };
@@ -488,10 +480,19 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     let ((_, a1, pa1, ia1), (_, a2, pa2, ia2)) = (sr4.next("x.txt", b"x1")?, sr4.next("y.txt", b"y2")?);
     let (b1, b2) = (pack_meta(&pa1, &ia1)?.1, pack_meta(&pa2, &ia2)?.1);
     c4.streaming.max_retained_pack_bytes = b1.max(b2) + 64;
+    c4.metadata_ledger.max_resident_ref_and_hold_bytes = 260;
     let eng4 = open_eng(&s3, &dir4, c4, ObjectFormat::Sha1, false)?;
     eng4.apply_push(pr("refs/heads/main", &z, &a1, vec![(pa1, ia1)]), dl).await?;
     eng4.apply_push(pr("refs/heads/main", &a1, &a2, vec![(pa2, ia2)]), dl).await?;
     err_budget(eng4.compact_serving_frontier(dl).await, "retained_pack_bytes");
     assert_eq!((eng4.active_pack_locators().len(), eng4.archive_released_ledger()), (2, 0));
+    let long_ref = format!("refs/heads/{}", "r".repeat(245));
+    err_invalid(eng4.apply_push(pr(&long_ref, &z, &a2, vec![]), dl).await);
+    let cap_ref = format!("refs/heads/{}", "b".repeat(120));
+    err_budget(eng4.apply_push(pr(&cap_ref, &z, &a2, vec![]), dl).await, "ref_and_hold_bytes");
+    let big_hold = eng4.attach_hold(pin_hold(&"x".repeat(257)), None);
+    assert!(matches!(big_hold, Err(GrowthEngineError::Ledger(LedgerRetentionError::InvalidArgument(_)))));
+    err_budget(eng4.attach_hold(pin_hold("hold-too-big"), Some(a2)), "ref_and_hold_bytes");
+    assert_eq!((eng4.acked_refs().len(), eng4.snapshot().epoch, eng4.snapshot().closure_revision), (1, 2, 2));
     Ok(())
 }

@@ -43,7 +43,11 @@ impl RetentionLedger {
     }
 
     pub fn total_nested_holds(&self) -> usize {
-        self.entries.values().map(|e| e.holds.len()).sum()
+        self.entries.values().filter(|e| !e.archived).map(|e| e.holds.len()).sum()
+    }
+
+    pub fn resident_hold_bytes(&self) -> u64 {
+        self.entries.values().filter(|e| !e.archived).map(entry_hold_bytes).fold(0u64, u64::saturating_add)
     }
 
     pub fn policy(&self) -> LedgerBudgetPolicy {
@@ -54,16 +58,18 @@ impl RetentionLedger {
         self.entries.get(&entry_id)
     }
 
-    fn hot_counts(&self) -> (usize, usize, usize, u64) {
+    fn hot_counts(&self) -> (usize, usize, usize, u64, u64) {
         let mut active_memberships = 0usize;
         let mut hot_registrations = 0usize;
         let mut hot_receipts = 0usize;
-        let mut hot_bytes = 0u64;
+        let mut hot_entry_bytes = 0u64;
+        let mut hot_hold_bytes = 0u64;
         for entry in self.entries.values() {
             if entry.archived {
                 continue;
             }
-            hot_bytes = hot_bytes.saturating_add(entry.logical_bytes);
+            hot_entry_bytes = hot_entry_bytes.saturating_add(entry.logical_bytes);
+            hot_hold_bytes = hot_hold_bytes.saturating_add(entry_hold_bytes(entry));
             match (entry.kind, entry.superseded_at_epoch) {
                 (LedgerEntryKind::Membership, None) => active_memberships += 1,
                 (LedgerEntryKind::Registration, _) => hot_registrations += 1,
@@ -71,7 +77,7 @@ impl RetentionLedger {
                 _ => {}
             }
         }
-        (active_memberships, hot_registrations, hot_receipts, hot_bytes)
+        (active_memberships, hot_registrations, hot_receipts, hot_entry_bytes, hot_hold_bytes)
     }
 
     pub fn check_budget_for(
@@ -80,8 +86,9 @@ impl RetentionLedger {
         add_regs: usize,
         add_receipts: usize,
         add_bytes: u64,
+        add_hold_bytes: u64,
     ) -> Result<(), LedgerRetentionError> {
-        let (act_m, hot_reg, hot_rcpt, hot_b) = self.hot_counts();
+        let (act_m, hot_reg, hot_rcpt, hot_b, hot_hold_b) = self.hot_counts();
         if act_m.saturating_add(add_memberships) > self.policy.repo_max_active_memberships {
             return Err(LedgerRetentionError::LedgerBudgetExhausted {
                 resource: "active_memberships",
@@ -103,12 +110,19 @@ impl RetentionLedger {
                 limit: self.policy.repo_max_receipts as u64,
             });
         }
-        let next_b = hot_b.saturating_add(add_bytes);
-        if next_b > self.policy.repo_max_logical_bytes {
+        let cur_total_b = hot_b.saturating_add(hot_hold_b);
+        if cur_total_b.saturating_add(add_bytes).saturating_add(add_hold_bytes) > self.policy.repo_max_logical_bytes {
             return Err(LedgerRetentionError::LedgerBudgetExhausted {
                 resource: "logical_bytes",
-                current: hot_b,
+                current: cur_total_b,
                 limit: self.policy.repo_max_logical_bytes,
+            });
+        }
+        if hot_hold_b.saturating_add(add_hold_bytes) > self.policy.max_resident_ref_and_hold_bytes {
+            return Err(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "ref_and_hold_bytes",
+                current: hot_hold_b,
+                limit: self.policy.max_resident_ref_and_hold_bytes,
             });
         }
         if self.entries.len().saturating_add(1) > self.policy.repo_max_resident_entries {
@@ -130,10 +144,8 @@ impl RetentionLedger {
     }
 
     fn check_hold_addition(&self, hold: &ProtectionHold, add_nested: usize) -> Result<(), LedgerRetentionError> {
+        hold.validate()?;
         let is_frontier = matches!(hold, ProtectionHold::ActiveServingFrontier { .. });
-        if !is_frontier && hold.hold_id().is_nil() {
-            return Err(LedgerRetentionError::InvalidArgument("hold_id must be non-nil"));
-        }
         if !is_frontier {
             let distinct: BTreeSet<Uuid> = self
                 .entries
@@ -156,6 +168,23 @@ impl RetentionLedger {
                 resource: "nested_holds",
                 current: nested as u64,
                 limit: self.policy.repo_max_nested_holds as u64,
+            });
+        }
+        let add_hold_bytes = (add_nested as u64).saturating_mul(hold.resident_bytes());
+        let (_, _, _, hot_b, hot_hold_b) = self.hot_counts();
+        if hot_hold_b.saturating_add(add_hold_bytes) > self.policy.max_resident_ref_and_hold_bytes {
+            return Err(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "ref_and_hold_bytes",
+                current: hot_hold_b,
+                limit: self.policy.max_resident_ref_and_hold_bytes,
+            });
+        }
+        let cur_total_b = hot_b.saturating_add(hot_hold_b);
+        if cur_total_b.saturating_add(add_hold_bytes) > self.policy.repo_max_logical_bytes {
+            return Err(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "logical_bytes",
+                current: cur_total_b,
+                limit: self.policy.repo_max_logical_bytes,
             });
         }
         Ok(())
@@ -181,9 +210,10 @@ impl RetentionLedger {
             LedgerEntryKind::Registration => (0, 1, 0),
             LedgerEntryKind::Receipt => (0, 0, 1),
         };
-        self.check_budget_for(add_m, add_reg, add_rcpt, logical_bytes)?;
+        let frontier_hold = ProtectionHold::ActiveServingFrontier { epoch };
+        self.check_budget_for(add_m, add_reg, add_rcpt, logical_bytes, frontier_hold.resident_bytes())?;
         let mut holds = BTreeMap::new();
-        holds.insert("frontier".to_owned(), ProtectionHold::ActiveServingFrontier { epoch });
+        holds.insert("frontier".to_owned(), frontier_hold);
         self.entries.insert(
             entry_id,
             LedgerEntry {
@@ -369,19 +399,20 @@ impl RetentionLedger {
                     out.archived_receipts += 1;
                 }
             }
+            let total_b = entry.logical_bytes.saturating_add(entry_hold_bytes(entry));
             match class {
                 RetentionClassification::ActiveProtected => {
-                    out.active_logical_bytes = out.active_logical_bytes.saturating_add(entry.logical_bytes);
-                    out.hot_logical_bytes = out.hot_logical_bytes.saturating_add(entry.logical_bytes);
+                    out.active_logical_bytes = out.active_logical_bytes.saturating_add(total_b);
+                    out.hot_logical_bytes = out.hot_logical_bytes.saturating_add(total_b);
                 }
                 RetentionClassification::CompactedProtected => {
                     out.protected_historical_logical_bytes =
-                        out.protected_historical_logical_bytes.saturating_add(entry.logical_bytes);
-                    out.hot_logical_bytes = out.hot_logical_bytes.saturating_add(entry.logical_bytes);
+                        out.protected_historical_logical_bytes.saturating_add(total_b);
+                    out.hot_logical_bytes = out.hot_logical_bytes.saturating_add(total_b);
                 }
                 RetentionClassification::ReleasedEligibleForArchive => {
-                    out.released_logical_bytes = out.released_logical_bytes.saturating_add(entry.logical_bytes);
-                    out.hot_logical_bytes = out.hot_logical_bytes.saturating_add(entry.logical_bytes);
+                    out.released_logical_bytes = out.released_logical_bytes.saturating_add(total_b);
+                    out.hot_logical_bytes = out.hot_logical_bytes.saturating_add(total_b);
                 }
                 RetentionClassification::ArchivedColdCheckpoint => {
                     out.archived_cold_logical_bytes =
@@ -393,94 +424,6 @@ impl RetentionLedger {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::blob_store::capacity_contract::limits::PandoCapacityContract;
-
-    #[test]
-    fn compaction_preserves_pins_roots_backups_and_blocks_delete() {
-        let contract = PandoCapacityContract::current_standalone();
-        let mut ledger = RetentionLedger::new(LedgerBudgetPolicy::from_contract(&contract));
-        let p1 = Uuid::new_v4();
-        let m1 = Uuid::new_v4();
-        let r1 = Uuid::new_v4();
-        ledger.record_entry(m1, LedgerEntryKind::Membership, Some(p1), None, 512, 1).unwrap();
-        ledger.record_entry(r1, LedgerEntryKind::Registration, Some(p1), None, 1024, 1).unwrap();
-
-        let pin_id = Uuid::new_v4();
-        let root_id = Uuid::new_v4();
-        ledger.attach_hold_to_pack(p1, ProtectionHold::Pin { pin_id, purpose: "ci".into() }).unwrap();
-        ledger.attach_hold_to_pack(p1, ProtectionHold::RetentionRoot { root_id, kind: "pitr".into() }).unwrap();
-
-        ledger.record_compaction_superseded(2, &BTreeSet::from([p1]));
-        assert_eq!(ledger.get(m1).unwrap().classification(), RetentionClassification::CompactedProtected);
-        assert!(matches!(ledger.attempt_delete_entry(m1), Err(LedgerRetentionError::ProtectedByHold { .. })));
-        assert_eq!(ledger.archive_released_entries(), 0);
-
-        ledger.release_hold(pin_id).unwrap();
-        ledger.release_hold(root_id).unwrap();
-        assert_eq!(ledger.get(m1).unwrap().classification(), RetentionClassification::ReleasedEligibleForArchive);
-        assert!(matches!(
-            ledger.attempt_delete_entry(m1),
-            Err(LedgerRetentionError::CompactionDoesNotAuthorizeDelete { .. })
-        ));
-        assert_eq!(ledger.archive_released_entries(), 2);
-        assert_eq!(ledger.summary().hot_logical_bytes, 0);
-    }
-
-    #[test]
-    fn enforces_hot_registration_budget_and_backup_hold_release() {
-        let mut policy = LedgerBudgetPolicy::from_contract(&PandoCapacityContract::current_standalone());
-        policy.repo_max_registrations = 2;
-        let mut ledger = RetentionLedger::new(policy);
-        let (p1, p2, m1, r1, r2, bid) =
-            (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        ledger.record_entry(m1, LedgerEntryKind::Membership, Some(p1), None, 512, 1).unwrap();
-        ledger.record_entry(r1, LedgerEntryKind::Registration, Some(p1), None, 1024, 1).unwrap();
-        ledger.record_entry(r2, LedgerEntryKind::Registration, Some(p2), None, 1024, 2).unwrap();
-        ledger.attach_hold_to_pack(p1, ProtectionHold::BackupManifest { backup_id: bid }).unwrap();
-        ledger.record_compaction_superseded(3, &BTreeSet::from([p1, p2]));
-        assert_eq!(ledger.get(r1).unwrap().classification(), RetentionClassification::CompactedProtected);
-        assert_eq!(ledger.get(r2).unwrap().classification(), RetentionClassification::ReleasedEligibleForArchive);
-        assert!(matches!(ledger.attempt_delete_entry(r1), Err(LedgerRetentionError::ProtectedByHold { .. })));
-        assert!(matches!(
-            ledger.attempt_delete_entry(r2),
-            Err(LedgerRetentionError::CompactionDoesNotAuthorizeDelete { .. })
-        ));
-        assert!(matches!(
-            ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Registration, Some(Uuid::new_v4()), None, 1024, 3),
-            Err(LedgerRetentionError::LedgerBudgetExhausted { resource: "registrations", .. })
-        ));
-        assert_eq!(ledger.archive_released_entries(), 1);
-        assert!(
-            ledger
-                .record_entry(Uuid::new_v4(), LedgerEntryKind::Registration, Some(Uuid::new_v4()), None, 1024, 3)
-                .is_ok()
-        );
-        ledger.release_hold(bid).unwrap();
-        assert_eq!(ledger.get(r1).unwrap().classification(), RetentionClassification::ReleasedEligibleForArchive);
-        assert_eq!(ledger.archive_released_entries(), 2);
-        assert_eq!(ledger.resident_entries_len(), 1);
-        assert_eq!(ledger.summary().protected_registrations, 1);
-        assert_eq!(ledger.summary().archived_registrations, 2);
-    }
-
-    #[test]
-    fn resident_total_bound_fails_closed_until_released_entries_archived() {
-        let mut policy = LedgerBudgetPolicy::from_contract(&PandoCapacityContract::current_standalone());
-        policy.repo_max_resident_entries = 2;
-        let mut ledger = RetentionLedger::new(policy);
-        let p1 = Uuid::new_v4();
-        ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Membership, Some(p1), None, 512, 1).unwrap();
-        ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Receipt, Some(p1), None, 512, 1).unwrap();
-        assert!(matches!(
-            ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Receipt, None, None, 512, 2),
-            Err(LedgerRetentionError::LedgerBudgetExhausted { resource: "resident_entries", .. })
-        ));
-        ledger.record_compaction_superseded(2, &BTreeSet::from([p1]));
-        assert_eq!(ledger.archive_released_entries(), 2);
-        assert_eq!(ledger.resident_entries_len(), 0);
-        assert!(ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Receipt, None, None, 512, 2).is_ok());
-    }
+fn entry_hold_bytes(entry: &LedgerEntry) -> u64 {
+    entry.holds.values().map(ProtectionHold::resident_bytes).fold(0u64, u64::saturating_add)
 }

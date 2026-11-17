@@ -5,11 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 use super::{
+    admission_types::AdmissionRejection,
     git_ops::ObjectFormat,
     git_views::is_reserved_ref_name,
     growth_types::{GrowthEngineError, RefMutation, VerifiedPackRecord},
     ledger_retention::RetentionLedger,
-    ledger_types::LedgerEntryKind,
+    ledger_types::{LedgerEntryKind, LedgerRetentionError},
+    limits::{MAX_REF_NAME_BYTES, PandoCapacityContract, RESERVED_GIT_OPEN_FDS},
 };
 
 fn record_pack_entries(
@@ -69,11 +71,13 @@ pub(super) fn validate_mutations(
     let mut seen = BTreeSet::new();
     for m in mutations {
         if !m.ref_name.starts_with("refs/")
+            || m.ref_name.len() > MAX_REF_NAME_BYTES
+            || m.ref_name.contains('\0')
             || is_reserved_ref_name(&m.ref_name)
             || m.ref_name.contains("..")
             || !seen.insert(&m.ref_name)
         {
-            return Err(GrowthEngineError::InvalidInput("invalid, reserved, or duplicate ref name"));
+            return Err(GrowthEngineError::InvalidInput("invalid, oversized, reserved, or duplicate ref name"));
         }
         if !(format.is_valid_oid(&m.old_oid) || format.is_zero_oid(&m.old_oid)) {
             return Err(GrowthEngineError::InvalidInput("invalid old_oid format"));
@@ -105,4 +109,77 @@ pub(super) fn apply_cas_mutations(
         }
     }
     Ok(next)
+}
+
+pub(super) fn resident_ref_and_hold_bytes(
+    acked_refs: &BTreeMap<String, String>,
+    pinned_commits: &BTreeMap<Uuid, String>,
+    ledger: &RetentionLedger,
+) -> u64 {
+    let ref_b: u64 = acked_refs.iter().map(|(r, o)| (r.len() as u64).saturating_add(o.len() as u64)).sum();
+    let pin_b: u64 = pinned_commits.values().map(|o| 16u64.saturating_add(o.len() as u64)).sum();
+    ref_b.saturating_add(pin_b).saturating_add(ledger.resident_hold_bytes())
+}
+
+pub(super) fn check_ref_and_hold_bytes(
+    limit: u64,
+    next_total: u64,
+    current_total: u64,
+) -> Result<(), GrowthEngineError> {
+    if next_total > limit {
+        return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+            resource: "ref_and_hold_bytes",
+            current: current_total,
+            limit,
+        }));
+    }
+    Ok(())
+}
+
+pub(super) fn check_commit_window_bounds(
+    c: &PandoCapacityContract,
+    active: &[VerifiedPackRecord],
+    added: &[VerifiedPackRecord],
+) -> Result<(), GrowthEngineError> {
+    if added.is_empty() {
+        return Ok(());
+    }
+    let fail = |r| Err(GrowthEngineError::Admission(r));
+    let next_pairs = active.len().saturating_add(added.len());
+    if next_pairs > c.streaming.max_active_frontier_packs {
+        return fail(AdmissionRejection::PackCountLimitReached {
+            active: active.len(),
+            new_packs: added.len(),
+            limit: c.streaming.max_active_frontier_packs,
+        });
+    }
+    let sum = |ps: &[VerifiedPackRecord]| -> (u64, u64) {
+        (ps.iter().map(VerifiedPackRecord::total_bytes).sum(), ps.iter().map(|p| p.object_count).sum())
+    };
+    let ((cb, co), (ab, ao)) = (sum(active), sum(added));
+    let (next_bytes, next_objects) = (cb.saturating_add(ab), co.saturating_add(ao));
+    if next_bytes > c.verifier.max_total_bytes_per_window {
+        return fail(AdmissionRejection::PackBytesExceeded {
+            requested: next_bytes,
+            limit: c.verifier.max_total_bytes_per_window,
+        });
+    }
+    if next_objects > c.verifier.max_objects_per_window {
+        return fail(AdmissionRejection::TooManyObjects {
+            requested: next_objects,
+            limit: c.verifier.max_objects_per_window,
+        });
+    }
+    let next_workspace = next_bytes.saturating_mul(2);
+    if next_workspace > c.verifier.view_max_logical_bytes {
+        return fail(AdmissionRejection::WorkspaceBudgetExceeded {
+            requested: next_workspace,
+            limit: c.verifier.view_max_logical_bytes,
+        });
+    }
+    let next_fds = (next_pairs as u64).saturating_mul(2).saturating_add(RESERVED_GIT_OPEN_FDS);
+    if next_fds > c.verifier.git_nofile {
+        return fail(AdmissionRejection::FdBudgetExceeded { requested: next_fds, limit: c.verifier.git_nofile });
+    }
+    Ok(())
 }

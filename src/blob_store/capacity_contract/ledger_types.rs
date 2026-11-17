@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, fmt};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::limits::PandoCapacityContract;
+use super::limits::{MAX_HOLD_LABEL_BYTES, PandoCapacityContract};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +40,38 @@ impl ProtectionHold {
             Self::Pin { .. } => "pin",
             Self::RetentionRoot { .. } => "retention_root",
             Self::BackupManifest { .. } => "backup_manifest",
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), LedgerRetentionError> {
+        match self {
+            Self::ActiveServingFrontier { epoch } if *epoch == 0 => {
+                return Err(LedgerRetentionError::InvalidArgument("frontier hold epoch must be positive"));
+            }
+            Self::Pin { pin_id, purpose } => {
+                if pin_id.is_nil() || purpose.is_empty() || purpose.len() > MAX_HOLD_LABEL_BYTES {
+                    return Err(LedgerRetentionError::InvalidArgument("pin purpose must be 1..=256 bytes"));
+                }
+            }
+            Self::RetentionRoot { root_id, kind } => {
+                if root_id.is_nil() || kind.is_empty() || kind.len() > MAX_HOLD_LABEL_BYTES {
+                    return Err(LedgerRetentionError::InvalidArgument("retention root kind must be 1..=256 bytes"));
+                }
+            }
+            Self::BackupManifest { backup_id } if backup_id.is_nil() => {
+                return Err(LedgerRetentionError::InvalidArgument("backup_id must be non-nil"));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        match self {
+            Self::ActiveServingFrontier { .. } => 16,
+            Self::Pin { purpose, .. } => 32u64.saturating_add(purpose.len() as u64),
+            Self::RetentionRoot { kind, .. } => 32u64.saturating_add(kind.len() as u64),
+            Self::BackupManifest { .. } => 32,
         }
     }
 }
@@ -92,6 +124,7 @@ pub struct LedgerBudgetPolicy {
     pub repo_max_resident_entries: usize,
     pub repo_max_holds: usize,
     pub repo_max_nested_holds: usize,
+    pub max_resident_ref_and_hold_bytes: u64,
 }
 
 impl LedgerBudgetPolicy {
@@ -104,6 +137,7 @@ impl LedgerBudgetPolicy {
             repo_max_resident_entries: contract.metadata_ledger.repo_max_resident_entries,
             repo_max_holds: contract.metadata_ledger.repo_max_holds,
             repo_max_nested_holds: contract.metadata_ledger.repo_max_nested_holds,
+            max_resident_ref_and_hold_bytes: contract.metadata_ledger.max_resident_ref_and_hold_bytes,
         }
     }
 }

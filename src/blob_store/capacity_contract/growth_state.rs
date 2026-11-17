@@ -4,9 +4,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use uuid::Uuid;
 
-pub(super) use super::growth_cas::{apply_cas_mutations, stage_compaction_ledger, validate_mutations};
+pub(super) use super::growth_cas::{
+    apply_cas_mutations, check_commit_window_bounds, check_ref_and_hold_bytes, resident_ref_and_hold_bytes,
+    stage_compaction_ledger, validate_mutations,
+};
 use super::{
-    admission_types::AdmissionRejection,
     git_ops::{ObjectFormat, UploadedPackPair},
     growth_cas::stage_push_ledger,
     growth_types::{
@@ -14,8 +16,8 @@ use super::{
         VerifiedPackRecord,
     },
     ledger_retention::RetentionLedger,
-    ledger_types::LedgerRetentionError,
-    limits::{PandoCapacityContract, RESERVED_GIT_OPEN_FDS},
+    ledger_types::{LedgerRetentionError, ProtectionHold},
+    limits::PandoCapacityContract,
 };
 use crate::blob_store::BlobLocator;
 
@@ -165,6 +167,69 @@ impl EngineState {
         let old_b: u64 = self.retained_old_packs.iter().map(VerifiedPackRecord::total_bytes).sum();
         let fail_b: u64 = self.failed_attempt_records.iter().map(|r| r.total_bytes).sum();
         old_b.saturating_add(fail_b)
+    }
+
+    pub fn ref_and_hold_bytes(&self) -> u64 {
+        resident_ref_and_hold_bytes(&self.acked_refs, &self.pinned_commits, &self.ledger)
+    }
+
+    pub fn check_push_preconditions(
+        &self,
+        contract: &PandoCapacityContract,
+        op_id: Uuid,
+        new_packs: usize,
+        new_bytes: u64,
+        next_refs: &BTreeMap<String, String>,
+    ) -> Result<(), GrowthEngineError> {
+        self.check_op_fence_bound(op_id, contract.streaming.max_resident_op_fences)?;
+        self.check_resident_pack_bound(
+            contract.streaming.max_retained_pack_records,
+            contract.streaming.max_retained_pack_bytes,
+            new_packs,
+            new_bytes,
+        )?;
+        let expected_frontier_holds_b = (new_packs as u64).saturating_mul(2).saturating_add(1).saturating_mul(16);
+        let next_total = resident_ref_and_hold_bytes(next_refs, &self.pinned_commits, &self.ledger)
+            .saturating_add(expected_frontier_holds_b);
+        check_ref_and_hold_bytes(
+            contract.metadata_ledger.max_resident_ref_and_hold_bytes,
+            next_total,
+            self.ref_and_hold_bytes(),
+        )
+    }
+
+    pub fn attach_hold_checked(
+        &mut self,
+        hold: ProtectionHold,
+        pinned_oid: Option<String>,
+        max_holds: usize,
+        max_ref_and_hold_bytes: u64,
+    ) -> Result<usize, GrowthEngineError> {
+        hold.validate()?;
+        let hold_id = hold.hold_id();
+        if pinned_oid.is_some() && !self.pinned_commits.contains_key(&hold_id) && self.pinned_commits.len() >= max_holds
+        {
+            return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "pins",
+                current: self.pinned_commits.len() as u64,
+                limit: max_holds as u64,
+            }));
+        }
+        let mut next_ledger = self.ledger.clone();
+        let count = next_ledger.attach_hold_to_active_frontier(hold)?;
+        let extra_pin_b = match &pinned_oid {
+            Some(oid) if !self.pinned_commits.contains_key(&hold_id) => 16u64.saturating_add(oid.len() as u64),
+            _ => 0,
+        };
+        let next_total = resident_ref_and_hold_bytes(&self.acked_refs, &self.pinned_commits, &next_ledger)
+            .saturating_add(extra_pin_b);
+        check_ref_and_hold_bytes(max_ref_and_hold_bytes, next_total, self.ref_and_hold_bytes())?;
+        self.ledger = next_ledger;
+        if let Some(oid) = pinned_oid {
+            self.pinned_commits.insert(hold_id, oid);
+            self.closure_revision = self.closure_revision.saturating_add(1);
+        }
+        Ok(count)
     }
 
     pub fn check_resident_pack_bound(
@@ -378,6 +443,14 @@ impl EngineState {
                 Ok(l) => l,
                 Err(err) => return Err((err, mk_fail(input.uploaded_records))),
             };
+        let next_ref_hold = resident_ref_and_hold_bytes(&next_refs, &self.pinned_commits, &next_ledger);
+        if let Err(err) = check_ref_and_hold_bytes(
+            input.contract.metadata_ledger.max_resident_ref_and_hold_bytes,
+            next_ref_hold,
+            self.ref_and_hold_bytes(),
+        ) {
+            return Err((err, mk_fail(input.uploaded_records)));
+        }
 
         self.ledger = next_ledger;
         self.epoch = commit_epoch;
@@ -417,54 +490,6 @@ pub(super) fn check_acked_refs_bound(cap: usize, next_len: usize) -> Result<(), 
             current: next_len as u64,
             limit: cap as u64,
         }));
-    }
-    Ok(())
-}
-
-fn check_commit_window_bounds(
-    c: &PandoCapacityContract,
-    active: &[VerifiedPackRecord],
-    added: &[VerifiedPackRecord],
-) -> Result<(), GrowthEngineError> {
-    if added.is_empty() {
-        return Ok(());
-    }
-    let fail = |r| Err(GrowthEngineError::Admission(r));
-    let next_pairs = active.len().saturating_add(added.len());
-    if next_pairs > c.streaming.max_active_frontier_packs {
-        return fail(AdmissionRejection::PackCountLimitReached {
-            active: active.len(),
-            new_packs: added.len(),
-            limit: c.streaming.max_active_frontier_packs,
-        });
-    }
-    let sum = |ps: &[VerifiedPackRecord]| -> (u64, u64) {
-        (ps.iter().map(VerifiedPackRecord::total_bytes).sum(), ps.iter().map(|p| p.object_count).sum())
-    };
-    let ((cb, co), (ab, ao)) = (sum(active), sum(added));
-    let (next_bytes, next_objects) = (cb.saturating_add(ab), co.saturating_add(ao));
-    if next_bytes > c.verifier.max_total_bytes_per_window {
-        return fail(AdmissionRejection::PackBytesExceeded {
-            requested: next_bytes,
-            limit: c.verifier.max_total_bytes_per_window,
-        });
-    }
-    if next_objects > c.verifier.max_objects_per_window {
-        return fail(AdmissionRejection::TooManyObjects {
-            requested: next_objects,
-            limit: c.verifier.max_objects_per_window,
-        });
-    }
-    let next_workspace = next_bytes.saturating_mul(2);
-    if next_workspace > c.verifier.view_max_logical_bytes {
-        return fail(AdmissionRejection::WorkspaceBudgetExceeded {
-            requested: next_workspace,
-            limit: c.verifier.view_max_logical_bytes,
-        });
-    }
-    let next_fds = (next_pairs as u64).saturating_mul(2).saturating_add(RESERVED_GIT_OPEN_FDS);
-    if next_fds > c.verifier.git_nofile {
-        return fail(AdmissionRejection::FdBudgetExceeded { requested: next_fds, limit: c.verifier.git_nofile });
     }
     Ok(())
 }
