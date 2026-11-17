@@ -350,7 +350,7 @@ impl CompactionSegmentLog {
             };
             if seg.shard_id != plan.shard_id || seg.state != SegmentState::Sealed {
                 return Err(CompactionError::MembershipDrift(
-                    "planned sealed segments were already compacted or moved concurrently",
+                    "planned sealed segments were already compacted or moved concurrently".into(),
                 ));
             }
             if seg.tier != plan.source_tier {
