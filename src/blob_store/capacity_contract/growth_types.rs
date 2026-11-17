@@ -44,6 +44,13 @@ impl VerifiedPackRecord {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct FailedAttemptRecord {
+    pub locators: Vec<BlobLocator>,
+    pub pack_count: usize,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RefMutation {

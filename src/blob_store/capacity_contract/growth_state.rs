@@ -10,7 +10,8 @@ use super::{
     git_ops::{ObjectFormat, UploadedPackPair},
     growth_cas::stage_push_ledger,
     growth_types::{
-        CompactionOutcome, GrowthEngineError, GrowthEngineSnapshot, PushOutcome, RefMutation, VerifiedPackRecord,
+        CompactionOutcome, FailedAttemptRecord, GrowthEngineError, GrowthEngineSnapshot, PushOutcome, RefMutation,
+        VerifiedPackRecord,
     },
     ledger_retention::RetentionLedger,
     ledger_types::LedgerRetentionError,
@@ -35,6 +36,7 @@ pub(super) struct CommitCompactionInput<'a> {
     pub target_ids: &'a BTreeSet<Uuid>,
     pub expected_closure_rev: u64,
     pub max_retained_pack_records: usize,
+    pub max_retained_pack_bytes: u64,
     pub uploaded: UploadedPackPair,
     pub blob_get_bytes: u64,
     pub peak_scratch_bytes: u64,
@@ -53,14 +55,13 @@ pub(super) struct EngineState {
     pub closure_revision: u64,
     pub active_packs: Vec<VerifiedPackRecord>,
     pub retained_old_packs: Vec<VerifiedPackRecord>,
-    pub failed_attempt_locators: Vec<BlobLocator>,
+    pub failed_attempt_records: Vec<FailedAttemptRecord>,
     pub acked_refs: BTreeMap<String, String>,
     pub pinned_commits: BTreeMap<Uuid, String>,
     pub replayed_operations: BTreeMap<Uuid, (String, PushOutcome)>,
     pub replay_order: VecDeque<Uuid>,
     pub acked_op_fences: BTreeSet<Uuid>,
     pub cancelled_operations: BTreeSet<Uuid>,
-    pub cancel_order: VecDeque<Uuid>,
     pub cumulative_packs_added: u64,
     pub no_new_pack_pushes: u64,
     pub compactions_completed: u64,
@@ -112,26 +113,31 @@ impl EngineState {
         Ok(None)
     }
 
-    pub fn record_cancel(&mut self, op_id: Uuid, cap: usize) -> Result<(), GrowthEngineError> {
+    pub fn record_cancel(&mut self, op_id: Uuid, fence_cap: usize) -> Result<(), GrowthEngineError> {
         if self.replayed_operations.contains_key(&op_id) || self.acked_op_fences.contains(&op_id) {
             return Err(GrowthEngineError::InvalidInput("cannot cancel already-acked operation"));
         }
-        if self.cancelled_operations.insert(op_id) {
-            self.cancel_order.push_back(op_id);
-            while self.cancelled_operations.len() > cap {
-                if let Some(evicted) = self.cancel_order.pop_front() {
-                    self.cancelled_operations.remove(&evicted);
-                }
-            }
+        if self.cancelled_operations.contains(&op_id) {
+            return Ok(());
         }
+        let total = self.acked_op_fences.len().saturating_add(self.cancelled_operations.len());
+        if total >= fence_cap {
+            return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "cancel_tombstones",
+                current: total as u64,
+                limit: fence_cap as u64,
+            }));
+        }
+        self.cancelled_operations.insert(op_id);
         Ok(())
     }
 
     pub fn check_op_fence_bound(&self, op_id: Uuid, max_fences: usize) -> Result<(), GrowthEngineError> {
-        if !self.acked_op_fences.contains(&op_id) && self.acked_op_fences.len() >= max_fences {
+        let total = self.acked_op_fences.len().saturating_add(self.cancelled_operations.len());
+        if !self.acked_op_fences.contains(&op_id) && total >= max_fences {
             return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
                 resource: "op_fences",
-                current: self.acked_op_fences.len() as u64,
+                current: total as u64,
                 limit: max_fences as u64,
             }));
         }
@@ -151,13 +157,37 @@ impl EngineState {
         }
     }
 
-    pub fn check_resident_pack_bound(&self, max_retained: usize, extra: usize) -> Result<(), GrowthEngineError> {
-        let resident = self.retained_old_packs.len().saturating_add(self.failed_attempt_locators.len());
-        if resident.saturating_add(extra) > max_retained {
+    pub fn retained_pack_record_count(&self) -> usize {
+        self.retained_old_packs.len().saturating_add(self.failed_attempt_records.iter().map(|r| r.pack_count).sum())
+    }
+
+    pub fn resident_retained_bytes(&self) -> u64 {
+        let old_b: u64 = self.retained_old_packs.iter().map(VerifiedPackRecord::total_bytes).sum();
+        let fail_b: u64 = self.failed_attempt_records.iter().map(|r| r.total_bytes).sum();
+        old_b.saturating_add(fail_b)
+    }
+
+    pub fn check_resident_pack_bound(
+        &self,
+        max_retained: usize,
+        max_retained_bytes: u64,
+        extra_records: usize,
+        extra_bytes: u64,
+    ) -> Result<(), GrowthEngineError> {
+        let resident = self.retained_pack_record_count();
+        if resident.saturating_add(extra_records) > max_retained {
             return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
                 resource: "retained_packs",
                 current: resident as u64,
                 limit: max_retained as u64,
+            }));
+        }
+        let resident_bytes = self.resident_retained_bytes();
+        if resident_bytes.saturating_add(extra_bytes) > max_retained_bytes {
+            return Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+                resource: "retained_pack_bytes",
+                current: resident_bytes,
+                limit: max_retained_bytes,
             }));
         }
         Ok(())
@@ -170,6 +200,7 @@ impl EngineState {
         blob_get_bytes: u64,
         peak_scratch: u64,
         pack_cap: usize,
+        byte_cap: u64,
     ) {
         self.total_blob_put_bytes = self.total_blob_put_bytes.saturating_add(put_bytes);
         self.total_blob_get_bytes = self.total_blob_get_bytes.saturating_add(blob_get_bytes);
@@ -177,10 +208,13 @@ impl EngineState {
         if put_bytes > 0 || !locators.is_empty() {
             self.failed_attempt_count = self.failed_attempt_count.saturating_add(1);
             self.failed_attempt_blob_bytes = self.failed_attempt_blob_bytes.saturating_add(put_bytes);
-            for loc in locators {
-                if self.retained_old_packs.len().saturating_add(self.failed_attempt_locators.len()) < pack_cap {
-                    self.failed_attempt_locators.push(loc);
-                }
+            let pack_count =
+                locators.iter().filter(|l| l.path().contains("/packs/")).count().max(usize::from(!locators.is_empty()));
+            if !locators.is_empty()
+                && self.retained_pack_record_count().saturating_add(pack_count) <= pack_cap
+                && self.resident_retained_bytes().saturating_add(put_bytes) <= byte_cap
+            {
+                self.failed_attempt_records.push(FailedAttemptRecord { locators, pack_count, total_bytes: put_bytes });
             }
         }
     }
@@ -189,11 +223,11 @@ impl EngineState {
         &mut self,
         input: CommitCompactionInput<'_>,
     ) -> Result<CompactionOutcome, GrowthEngineError> {
-        let cap = input.max_retained_pack_records;
+        let (cap, byte_cap) = (input.max_retained_pack_records, input.max_retained_pack_bytes);
         match self.try_commit_compaction(input) {
             Ok(outcome) => Ok(outcome),
             Err((err, f)) => {
-                self.record_failed_upload(f.locators, f.put_bytes, f.get_bytes, f.scratch, cap);
+                self.record_failed_upload(f.locators, f.put_bytes, f.get_bytes, f.scratch, cap, byte_cap);
                 Err(err)
             }
         }
@@ -218,7 +252,7 @@ impl EngineState {
         };
         let put_bytes = rec.total_bytes();
         let mk_fail = |r: VerifiedPackRecord| FailedUpload {
-            locators: vec![r.pack_locator],
+            locators: vec![r.pack_locator, r.idx_locator],
             put_bytes,
             get_bytes: input.blob_get_bytes,
             scratch: input.peak_scratch_bytes,
@@ -227,7 +261,18 @@ impl EngineState {
         if !input.target_ids.is_subset(&active_ids) || self.closure_revision != input.expected_closure_rev {
             return Err((GrowthEngineError::CompactionConflict, mk_fail(rec)));
         }
-        if let Err(err) = self.check_resident_pack_bound(input.max_retained_pack_records, input.target_ids.len()) {
+        let target_bytes: u64 = self
+            .active_packs
+            .iter()
+            .filter(|p| input.target_ids.contains(&p.pack_id))
+            .map(VerifiedPackRecord::total_bytes)
+            .sum();
+        if let Err(err) = self.check_resident_pack_bound(
+            input.max_retained_pack_records,
+            input.max_retained_pack_bytes,
+            input.target_ids.len(),
+            target_bytes,
+        ) {
             return Err((err, mk_fail(rec)));
         }
         let next_ledger = match stage_compaction_ledger(
@@ -271,15 +316,16 @@ impl EngineState {
     }
 
     pub fn commit_push(&mut self, input: CommitPushInput<'_>) -> Result<PushOutcome, GrowthEngineError> {
-        let pack_cap = input.contract.streaming.max_retained_pack_records;
+        let (pack_cap, byte_cap) =
+            (input.contract.streaming.max_retained_pack_records, input.contract.streaming.max_retained_pack_bytes);
         match self.try_commit_push(input) {
             Ok((outcome, None)) => Ok(outcome),
             Ok((outcome, Some(f))) => {
-                self.record_failed_upload(f.locators, f.put_bytes, f.get_bytes, f.scratch, pack_cap);
+                self.record_failed_upload(f.locators, f.put_bytes, f.get_bytes, f.scratch, pack_cap, byte_cap);
                 Ok(outcome)
             }
             Err((err, f)) => {
-                self.record_failed_upload(f.locators, f.put_bytes, f.get_bytes, f.scratch, pack_cap);
+                self.record_failed_upload(f.locators, f.put_bytes, f.get_bytes, f.scratch, pack_cap, byte_cap);
                 Err(err)
             }
         }
@@ -291,7 +337,7 @@ impl EngineState {
     ) -> Result<(PushOutcome, Option<FailedUpload>), (GrowthEngineError, FailedUpload)> {
         let (pb, gb, sc) = (input.put_bytes, input.blob_get_bytes, input.peak_scratch_bytes);
         let mk_fail = |recs: Vec<VerifiedPackRecord>| FailedUpload {
-            locators: recs.into_iter().map(|r| r.pack_locator).collect(),
+            locators: recs.into_iter().flat_map(|r| [r.pack_locator, r.idx_locator]).collect(),
             put_bytes: pb,
             get_bytes: gb,
             scratch: sc,

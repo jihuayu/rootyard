@@ -6,14 +6,14 @@ use uuid::Uuid;
 
 use super::{
     admission_types::AdmissionRejection,
-    git_ops::ObjectFormat,
+    git_ops::{GitOpsError, ObjectFormat, PartialUploadFailure},
     growth_state::{CommitPushInput, EngineState, stage_compaction_ledger, validate_mutations},
     growth_types::{GrowthEngineError, RefMutation, VerifiedPackRecord},
     ledger_retention::RetentionLedger,
     ledger_types::{LedgerBudgetPolicy, LedgerEntryKind, LedgerRetentionError, ProtectionHold},
     limits::PandoCapacityContract,
 };
-use crate::blob_store::BlobLocator;
+use crate::blob_store::{BlobError, BlobLocator};
 
 fn fake_pack(pack_len: u64, objects: u64, epoch: u64) -> VerifiedPackRecord {
     let (t, r, a) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
@@ -38,14 +38,13 @@ fn empty_state(contract: &PandoCapacityContract) -> EngineState {
         closure_revision: 0,
         active_packs: Vec::new(),
         retained_old_packs: Vec::new(),
-        failed_attempt_locators: Vec::new(),
+        failed_attempt_records: Vec::new(),
         acked_refs: BTreeMap::new(),
         pinned_commits: BTreeMap::new(),
         replayed_operations: BTreeMap::new(),
         replay_order: VecDeque::new(),
         acked_op_fences: BTreeSet::new(),
         cancelled_operations: BTreeSet::new(),
-        cancel_order: VecDeque::new(),
         cumulative_packs_added: 0,
         no_new_pack_pushes: 0,
         compactions_completed: 0,
@@ -146,15 +145,15 @@ fn commit_push_rejects_drift_window_bounds_accounts_failed_uploads_and_bounds_re
     assert_eq!(snap_after_failed.failed_attempt_count, 2);
     assert_eq!(snap_after_failed.failed_attempt_blob_bytes, 1564 + 564);
     assert_eq!(snap_after_failed.total_blob_put_bytes, 1064 + 1564 + 564);
-    assert!(state.check_resident_pack_bound(2, 1).is_err());
+    assert!(state.check_resident_pack_bound(2, u64::MAX, 1, 0).is_err());
 
     run(&mut state, Uuid::new_v4(), &m2, &live_ids, vec![]).unwrap();
     assert_eq!(state.snapshot().resident_replay_ops, 1);
     assert_eq!(state.snapshot().closure_revision, 2);
     assert!(matches!(state.record_cancel(op1, 8), Err(GrowthEngineError::InvalidInput(_))));
     assert!(matches!(state.check_replay_or_cancel(op1, &op1.to_string()), Err(GrowthEngineError::InvalidInput(_))));
-    state.record_failed_upload(vec![fake_pack(64, 1, 3).pack_locator], 64, 0, 0, 2);
-    assert_eq!(state.failed_attempt_locators.len(), 2);
+    state.record_failed_upload(vec![fake_pack(64, 1, 3).pack_locator], 64, 0, 0, 2, u64::MAX);
+    assert_eq!(state.retained_pack_record_count(), 2);
     assert!(matches!(
         validate_mutations(
             ObjectFormat::Sha1,
@@ -218,15 +217,65 @@ fn bounded_refs_op_fences_and_off_by_one_failed_pack_limit() {
 
     state.retained_old_packs.extend([fake_pack(100, 1, 1), fake_pack(100, 1, 2)]);
     assert!(matches!(
-        state.check_resident_pack_bound(2, 1),
+        state.check_resident_pack_bound(2, u64::MAX, 1, 0),
         Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
             resource: "retained_packs",
             current: 2,
             limit: 2
         }))
     ));
-    state.record_failed_upload(vec![fake_pack(64, 1, 3).pack_locator], 64, 0, 0, 2);
-    assert!(state.failed_attempt_locators.is_empty());
+    state.record_failed_upload(vec![fake_pack(64, 1, 3).pack_locator], 64, 0, 0, 2, u64::MAX);
+    assert!(state.failed_attempt_records.is_empty());
+}
+
+#[test]
+fn retained_pack_bytes_partial_idx_and_non_evicting_cancel_tombstones() {
+    let contract = PandoCapacityContract::current_standalone();
+    let mut state = empty_state(&contract);
+    let p = fake_pack(1000, 4, 1);
+    let err = GitOpsError::PartialUpload(Box::new(PartialUploadFailure {
+        detail: GitOpsError::Blob(BlobError::ForeignBackend),
+        put_bytes: p.pack_length + p.idx_length,
+        locators: vec![p.pack_locator.clone(), p.idx_locator.clone()],
+    }));
+    let GitOpsError::PartialUpload(part) = err else { panic!("expected partial upload") };
+    state.record_failed_upload(part.locators, part.put_bytes, 0, 0, 10, 1500);
+    assert_eq!(state.snapshot().failed_attempt_blob_bytes, 1064);
+    assert_eq!(state.resident_retained_bytes(), 1064);
+    assert_eq!(state.retained_pack_record_count(), 1);
+    assert_eq!(state.failed_attempt_records[0].locators.len(), 2);
+
+    assert!(matches!(
+        state.check_resident_pack_bound(10, 1500, 1, 500),
+        Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+            resource: "retained_pack_bytes",
+            current: 1064,
+            limit: 1500
+        }))
+    ));
+    state.record_failed_upload(vec![fake_pack(500, 1, 2).pack_locator], 500, 0, 0, 10, 1500);
+    assert_eq!(state.failed_attempt_records.len(), 1);
+    assert_eq!(state.resident_retained_bytes(), 1064);
+
+    let (c1, c2, c3, op4) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    state.record_cancel(c1, 2).unwrap();
+    state.record_cancel(c2, 2).unwrap();
+    state.record_cancel(c1, 2).unwrap();
+    assert!(matches!(
+        state.record_cancel(c3, 2),
+        Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
+            resource: "cancel_tombstones",
+            current: 2,
+            limit: 2
+        }))
+    ));
+    assert!(matches!(state.check_op_fence_bound(op4, 2), Err(GrowthEngineError::Ledger(_))));
+    assert!(
+        matches!(state.check_replay_or_cancel(c1, "d"), Err(GrowthEngineError::OperationCancelled(id)) if id == c1)
+    );
+    assert!(
+        matches!(state.check_replay_or_cancel(c2, "d"), Err(GrowthEngineError::OperationCancelled(id)) if id == c2)
+    );
 }
 
 #[test]

@@ -72,6 +72,7 @@ pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 64 * MIB;
 pub const RESERVED_GIT_OPEN_FDS: u64 = 24;
 pub const DEFAULT_MAX_RESIDENT_LEDGER_ENTRIES: usize = 4096;
 pub const DEFAULT_MAX_RETAINED_PACK_RECORDS: usize = 1024;
+pub const DEFAULT_MAX_RETAINED_PACK_BYTES: u64 = 4 * GIB;
 pub const DEFAULT_MAX_RESIDENT_REPLAY_OPS: usize = 4096;
 pub const DEFAULT_MAX_RESIDENT_OP_FENCES: usize = 65_536;
 pub const LEDGER_REPO_MAX_HOLDS: usize = 256;
@@ -159,6 +160,7 @@ pub struct StreamingGrowthContract {
     pub max_memory_bytes: u64,
     pub max_single_object_bytes: u64,
     pub max_retained_pack_records: usize,
+    pub max_retained_pack_bytes: u64,
     pub max_resident_replay_ops: usize,
     pub max_resident_op_fences: usize,
     pub delete_during_compaction_enabled: bool,
@@ -262,6 +264,7 @@ impl PandoCapacityContract {
                 max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
                 max_single_object_bytes: VERIFIER_WINDOW_MAX_TOTAL_BYTES,
                 max_retained_pack_records: DEFAULT_MAX_RETAINED_PACK_RECORDS,
+                max_retained_pack_bytes: DEFAULT_MAX_RETAINED_PACK_BYTES,
                 max_resident_replay_ops: DEFAULT_MAX_RESIDENT_REPLAY_OPS,
                 max_resident_op_fences: DEFAULT_MAX_RESIDENT_OP_FENCES,
                 delete_during_compaction_enabled: false,
@@ -323,6 +326,7 @@ impl PandoCapacityContract {
             || self.metadata_ledger.repo_max_holds == 0
             || self.metadata_ledger.repo_max_nested_holds == 0
             || self.streaming.max_retained_pack_records == 0
+            || self.streaming.max_retained_pack_bytes == 0
             || self.streaming.max_resident_replay_ops == 0
             || self.streaming.max_resident_op_fences < self.streaming.max_resident_replay_ops
         {

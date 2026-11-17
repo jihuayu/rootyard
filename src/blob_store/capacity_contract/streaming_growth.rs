@@ -76,14 +76,13 @@ impl StreamingGrowthEngine {
                 closure_revision: 0,
                 active_packs: Vec::new(),
                 retained_old_packs: Vec::new(),
-                failed_attempt_locators: Vec::new(),
+                failed_attempt_records: Vec::new(),
                 acked_refs: BTreeMap::new(),
                 pinned_commits: BTreeMap::new(),
                 replayed_operations: BTreeMap::new(),
                 replay_order: VecDeque::new(),
                 acked_op_fences: BTreeSet::new(),
                 cancelled_operations: BTreeSet::new(),
-                cancel_order: VecDeque::new(),
                 cumulative_packs_added: 0,
                 no_new_pack_pushes: 0,
                 compactions_completed: 0,
@@ -130,7 +129,29 @@ impl StreamingGrowthEngine {
     }
 
     pub fn failed_attempt_pack_locators(&self) -> Vec<BlobLocator> {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).failed_attempt_locators.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .failed_attempt_records
+            .iter()
+            .flat_map(|r| r.locators.iter())
+            .filter(|l| l.path().contains("/packs/"))
+            .cloned()
+            .collect()
+    }
+
+    pub fn failed_attempt_blob_locators(&self) -> Vec<BlobLocator> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .failed_attempt_records
+            .iter()
+            .flat_map(|r| r.locators.iter().cloned())
+            .collect()
+    }
+
+    pub fn resident_retained_pack_bytes(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).resident_retained_bytes()
     }
 
     pub fn cancel_operation(&self, operation_id: Uuid) -> Result<(), GrowthEngineError> {
@@ -138,7 +159,7 @@ impl StreamingGrowthEngine {
             return Err(GrowthEngineError::InvalidInput("operation_id must be non-nil"));
         }
         let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        guard.record_cancel(operation_id, self.contract.streaming.max_resident_replay_ops)
+        guard.record_cancel(operation_id, self.contract.streaming.max_resident_op_fences)
     }
 
     pub fn attach_hold(&self, hold: ProtectionHold, pinned_oid: Option<String>) -> Result<usize, GrowthEngineError> {
@@ -189,10 +210,10 @@ impl StreamingGrowthEngine {
         put_bytes: u64,
         err: GitOpsError,
     ) -> GrowthEngineError {
-        let mut locs: Vec<BlobLocator> = uploaded.into_iter().map(|r| r.pack_locator).collect();
+        let mut locs: Vec<BlobLocator> = uploaded.into_iter().flat_map(|r| [r.pack_locator, r.idx_locator]).collect();
         let (inner, part_b) = match err {
             GitOpsError::PartialUpload(part) => {
-                locs.push(part.pack_locator);
+                locs.extend(part.locators);
                 (part.detail, part.put_bytes)
             }
             other => (other, 0),
@@ -200,7 +221,14 @@ impl StreamingGrowthEngine {
         let total = put_bytes.saturating_add(part_b);
         if !locs.is_empty() || total > 0 {
             let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            guard.record_failed_upload(locs, total, 0, 0, self.contract.streaming.max_retained_pack_records);
+            guard.record_failed_upload(
+                locs,
+                total,
+                0,
+                0,
+                self.contract.streaming.max_retained_pack_records,
+                self.contract.streaming.max_retained_pack_bytes,
+            );
         }
         inner.into()
     }
@@ -244,7 +272,9 @@ impl StreamingGrowthEngine {
             guard.check_op_fence_bound(req.operation_id, self.contract.streaming.max_resident_op_fences)?;
             guard.check_resident_pack_bound(
                 self.contract.streaming.max_retained_pack_records,
+                self.contract.streaming.max_retained_pack_bytes,
                 req.new_pack_paths.len(),
+                0,
             )?;
             (guard.epoch, guard.active_packs.clone(), guard.acked_refs.clone())
         };
@@ -258,6 +288,15 @@ impl StreamingGrowthEngine {
             let (_, ilen) = hash_file_bounded(idx_path)?;
             new_pack_bytes = new_pack_bytes.saturating_add(plen).saturating_add(ilen);
             new_pack_objects = new_pack_objects.saturating_add(objs);
+        }
+        if !req.new_pack_paths.is_empty() {
+            let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            guard.check_resident_pack_bound(
+                self.contract.streaming.max_retained_pack_records,
+                self.contract.streaming.max_retained_pack_bytes,
+                req.new_pack_paths.len(),
+                new_pack_bytes,
+            )?;
         }
         let frontier_bytes: u64 = base_packs.iter().map(VerifiedPackRecord::total_bytes).sum();
         let frontier_objects: u64 = base_packs.iter().map(|p| p.object_count).sum();
@@ -357,9 +396,12 @@ impl StreamingGrowthEngine {
             if guard.active_packs.is_empty() {
                 return Err(GrowthEngineError::InvalidInput("cannot compact empty active frontier"));
             }
+            let target_bytes: u64 = guard.active_packs.iter().map(VerifiedPackRecord::total_bytes).sum();
             guard.check_resident_pack_bound(
                 self.contract.streaming.max_retained_pack_records,
+                self.contract.streaming.max_retained_pack_bytes,
                 guard.active_packs.len(),
+                target_bytes,
             )?;
             let pins: Vec<String> = guard.pinned_commits.values().cloned().collect();
             (guard.epoch, guard.closure_revision, guard.active_packs.clone(), guard.acked_refs.clone(), pins)
@@ -413,6 +455,7 @@ impl StreamingGrowthEngine {
             target_ids: &target_ids,
             expected_closure_rev: base_closure_rev,
             max_retained_pack_records: self.contract.streaming.max_retained_pack_records,
+            max_retained_pack_bytes: self.contract.streaming.max_retained_pack_bytes,
             uploaded: summary.uploaded,
             blob_get_bytes: summary.blob_get_bytes,
             peak_scratch_bytes: summary.peak_scratch_bytes,

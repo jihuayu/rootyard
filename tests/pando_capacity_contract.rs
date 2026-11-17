@@ -6,8 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
-use axum::http::{Method, Uri};
-use axum::{body::Body, extract::State, response::Response};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Method, Uri},
+    response::Response,
+};
 use bytes::Bytes;
 use rootyard::blob_store::{BlobLocator, capacity_contract::*, opendal::BlobStore};
 use sha2::{Digest, Sha256};
@@ -39,8 +43,7 @@ impl LoopbackS3 {
             (lis.local_addr().unwrap().port(), Arc::clone(&st), std::sync::mpsc::sync_channel(1));
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
-                let l = tokio::net::TcpListener::from_std(lis).unwrap();
-                let _ = tx.send(());
+                let (l, _) = (tokio::net::TcpListener::from_std(lis).unwrap(), tx.send(()));
                 let _ = axum::serve(l, axum::Router::new().fallback(handle_s3).with_state(srv)).await;
             });
         });
@@ -125,8 +128,7 @@ async fn handle_s3(State(st): State<Arc<S3State>>, method: Method, uri: Uri, bod
 }
 
 fn open_eng(s3: &LoopbackS3, dir: &TempDir, c: Cfg, fmt: ObjectFormat, ac: bool) -> Result<Arc<StreamingGrowthEngine>> {
-    let views = dir.path().join("views");
-    let mut b = fs::DirBuilder::new();
+    let (views, mut b) = (dir.path().join("views"), fs::DirBuilder::new());
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
     b.create(&views)?;
@@ -295,19 +297,19 @@ async fn streaming_growth_beyond_16_packs_sha1_and_sha256_lifecycle() -> Result<
 #[tokio::test]
 async fn compaction_and_push_budget_failures_preserve_ledger_and_frontier() -> Result<()> {
     let (s3, dl) = (LoopbackS3::new(), Instant::now() + Duration::from_secs(60));
-    for (regs, rcpts, bytes, expected, compact) in [
-        (2, 16, 8 * 1024 * 1024, "registrations", true),
-        (16, 16, 4608, "logical_bytes", true),
-        (16, 1, 8 * 1024 * 1024, "receipts", false),
-        (1, 16, 8 * 1024 * 1024, "registrations", false),
+    for (regs, rcpts, bytes, ret_bytes, expected, compact) in [
+        (2, 16, 8 * 1024 * 1024, 64 * 1024 * 1024, "registrations", true),
+        (16, 16, 4608, 64 * 1024 * 1024, "logical_bytes", true),
+        (16, 16, 8 * 1024 * 1024, 512, "retained_pack_bytes", true),
+        (16, 1, 8 * 1024 * 1024, 64 * 1024 * 1024, "receipts", false),
+        (1, 16, 8 * 1024 * 1024, 64 * 1024 * 1024, "registrations", false),
     ] {
         let dir = TempDir::new()?;
         let mut c = PandoCapacityContract::current_standalone();
-        (
-            c.metadata_ledger.repo_max_registrations,
-            c.metadata_ledger.repo_max_receipts,
-            c.metadata_ledger.repo_max_logical_bytes,
-        ) = (regs, rcpts, bytes);
+        c.streaming.max_retained_pack_bytes = ret_bytes;
+        let ml = &mut c.metadata_ledger;
+        (ml.repo_max_registrations, ml.repo_max_receipts) = (regs, rcpts);
+        ml.repo_max_logical_bytes = bytes;
         let eng = open_eng(&s3, &dir, c, ObjectFormat::Sha1, false)?;
         let mut sr = SeedRepo::at(dir.path().join("seed"), ObjectFormat::Sha1)?;
         for s in 0..(if compact { 2 } else { 1 }) {
@@ -469,7 +471,7 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     let ((_, o1, p1, i1), (_, o2, p2, i2)) = (sr.next("a.txt", b"a1")?, sr.next("b.txt", b"b2")?);
     (c3.metadata_ledger.max_capture_refs, c3.metadata_ledger.repo_max_holds) = (1, 1);
     let st = &mut c3.streaming;
-    (st.max_retained_pack_records, st.max_resident_replay_ops, st.max_resident_op_fences) = (2, 1, 4);
+    (st.max_retained_pack_records, st.max_resident_replay_ops, st.max_resident_op_fences) = (1, 1, 4);
     let eng3 = open_eng(&s3, &dir3, c3, ObjectFormat::Sha1, false)?;
     let op3 = Uuid::new_v4();
     let r3 = push_with(op3, "op3", "refs/heads/main", &z, &o1, vec![(p1, i1)]);
@@ -479,7 +481,7 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     err_invalid(eng3.cancel_operation(op3));
     err_invalid(eng3.apply_push(r3, dl).await);
     eng3.attach_hold(pin_hold("p1"), Some(o1.clone()))?;
-    err_budget(eng3.attach_hold(pin_hold("p2"), Some(o1)), "pins");
+    err_budget(eng3.attach_hold(pin_hold("p2"), Some(o1.clone())), "pins");
     let p2_bytes = fs::metadata(&p2)?.len();
     s3.arm_fail_next_put("/pack-idx/");
     err_git(eng3.apply_push(pr("refs/heads/main", &z, &o2, vec![(p2.clone(), i2.clone())]), dl).await);
@@ -487,5 +489,10 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     assert!(eng3.failed_attempt_pack_locators().len() == 1 && s3.exists(&eng3.failed_attempt_pack_locators()[0]));
     err_budget(eng3.apply_push(pr("refs/heads/main", &z, &o2, vec![(p2, i2)]), dl).await, "retained_packs");
     assert_eq!((eng3.failed_attempt_pack_locators().len(), eng3.snapshot().failed_attempt_count), (1, 1));
+    let (c1, c2, c3_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    (eng3.cancel_operation(c1)?, eng3.cancel_operation(c2)?);
+    err_budget(eng3.cancel_operation(c3_id), "cancel_tombstones");
+    let r_c1 = eng3.apply_push(push_with(c1, "c1", "refs/heads/main", &z, &o1, vec![]), dl).await;
+    assert!(matches!(r_c1, Err(GrowthEngineError::OperationCancelled(_))));
     Ok(())
 }
