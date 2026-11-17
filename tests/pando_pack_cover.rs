@@ -205,8 +205,7 @@ impl Env {
         m: CommitMode,
         rn_s: &str,
         base: Option<&VersionRecord>,
-        c: GitOid,
-        parent_oids: Vec<GitOid>,
+        (c, parent_oids): (GitOid, Vec<GitOid>),
         p: CovPair,
         object_deps: Vec<VersionId>,
     ) -> Result<(VersionRecord, CoverHierarchyRecord)> {
@@ -281,7 +280,8 @@ impl Env {
     ) -> Result<(GitOid, VersionRecord, CoverHierarchyRecord)> {
         let c = self.commit(f, txt)?;
         let revs = bc.map_or_else(|| format!("{}\n", c.as_hex()), |b| format!("{}\n^{}\n", c.as_hex(), b.as_hex()));
-        let (v, cov) = self.step(CommitMode::Atomic, r, base, c, bc.into_iter().collect(), self.pack(&revs)?, deps)?;
+        let (v, cov) =
+            self.step(CommitMode::Atomic, r, base, (c, bc.into_iter().collect()), self.pack(&revs)?, deps)?;
         Ok((c, v, cov))
     }
     fn compact(
@@ -437,7 +437,7 @@ async fn atomic_non_atomic_revoked_auth_and_cross_tenant_negative_cases() -> Res
     let c2 = env.commit("m.txt", "2\n")?;
     let p2 = env.pack(&format!("{}\n^{}\n", c2.as_hex(), c1.as_hex()))?;
     let (v2, cov2) =
-        env.step(CommitMode::AcceptedSubset, "refs/heads/main", None, c2, vec![c1], p2, vec![v1.version_id()])?;
+        env.step(CommitMode::AcceptedSubset, "refs/heads/main", None, (c2, vec![c1]), p2, vec![v1.version_id()])?;
     let (_, vh, cov_h) =
         env.push("refs/hidden/internal", None, Some(c2), "secret.txt", "topsecret\n", vec![v2.version_id()])?;
 
