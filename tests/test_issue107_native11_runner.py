@@ -501,9 +501,14 @@ class BoundedProcessTests(unittest.TestCase):
         process = mock.Mock()
         process.pid = 123
         process.stdout = io.BytesIO(b"")
+        process.stderr = io.BytesIO(b"")
         process.wait.side_effect = subprocess.TimeoutExpired("fake", 1)
         process.poll.return_value = None
+        reader = mock.Mock()
+        reader.is_alive.return_value = False
         with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
+             mock.patch.object(runner, "_start_reader",
+                               side_effect=lambda *args: reader), \
              mock.patch.object(runner.os, "getpgid", return_value=123), \
              mock.patch.object(runner.os, "killpg"):
             with self.assertRaises(runner.RunnerError) as raised:

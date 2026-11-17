@@ -1076,6 +1076,64 @@ def project_target_failure(target, output, returncode, *, timed_out=False,
     return diagnostic
 
 
+class _BoundedCapture:
+    """Keep stdout and stderr apart while sharing one capture budget."""
+
+    def __init__(self):
+        self.stdout = bytearray()
+        self.stderr = bytearray()
+        self.truncated = False
+        self._lock = threading.Lock()
+
+    def drain(self, stream, target):
+        while True:
+            try:
+                chunk = stream.read(65536)
+            except (OSError, ValueError):
+                return
+            if not chunk:
+                return
+            with self._lock:
+                room = (MAX_CAPTURE_BYTES - len(self.stdout)
+                        - len(self.stderr))
+                if room > 0:
+                    target.extend(chunk[:room])
+                if len(chunk) > room:
+                    self.truncated = True
+
+
+def _close_stream(stream):
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
+def _join_readers(readers):
+    """Join all readers inside the one existing aggregate kill budget."""
+    deadline = time.monotonic() + KILL_WAIT_SECONDS
+    for reader in readers:
+        reader.join(timeout=max(0.0, deadline - time.monotonic()))
+    _require(not any(reader.is_alive() for reader in readers),
+             "cleanup_unresolved")
+
+
+def _reap_process(process):
+    if process.poll() is None:
+        _kill_group(process)
+        try:
+            process.wait(timeout=KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            _fail("cleanup_unresolved")
+
+
+def _start_reader(target, *args):
+    """Retain the reader object before start so partial startup is cleanable."""
+    reader = threading.Thread(target=target, args=args, daemon=True)
+    reader.start()
+    return reader
+
+
 def run_bounded(command, timeout, env=None, failure_projector=None,
                 failure_context=None):
     """Run one child in its own process group and capture bounded RAM only."""
@@ -1083,50 +1141,49 @@ def run_bounded(command, timeout, env=None, failure_projector=None,
         command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         start_new_session=True,
         env=env,
     )
-    captured = bytearray()
-    truncated = [False]
-
-    def drain():
-        while True:
-            chunk = process.stdout.read(65536)
-            if not chunk:
-                break
-            room = MAX_CAPTURE_BYTES - len(captured)
-            if room > 0:
-                captured.extend(chunk[:room])
-            if len(chunk) > room:
-                truncated[0] = True
-
-    reader = threading.Thread(target=drain, daemon=True)
-    reader.start()
+    capture = _BoundedCapture()
+    readers = []
+    try:
+        readers.append(_start_reader(
+            capture.drain, process.stdout, capture.stdout))
+        readers.append(_start_reader(
+            capture.drain, process.stderr, capture.stderr))
+    except BaseException:
+        _close_stream(process.stdout)
+        _close_stream(process.stderr)
+        try:
+            _reap_process(process)
+        finally:
+            _join_readers(readers)
+        raise
     timed_out = False
     try:
-        process.wait(timeout=max(0.0, timeout))
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_group(process)
         try:
-            process.wait(timeout=KILL_WAIT_SECONDS)
+            process.wait(timeout=max(0.0, timeout))
         except subprocess.TimeoutExpired:
-            _fail("cleanup_unresolved")
-    finally:
-        if process.poll() is None:
+            timed_out = True
             _kill_group(process)
             try:
                 process.wait(timeout=KILL_WAIT_SECONDS)
             except subprocess.TimeoutExpired:
                 _fail("cleanup_unresolved")
+    finally:
         try:
-            process.stdout.close()
-        except Exception:
-            pass
-    reader.join(timeout=KILL_WAIT_SECONDS)
-    _require(not reader.is_alive(), "cleanup_unresolved")
-    _require(not truncated[0], "native_output_too_large")
+            if process.poll() is None:
+                _kill_group(process)
+                try:
+                    process.wait(timeout=KILL_WAIT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    _fail("cleanup_unresolved")
+        finally:
+            _close_stream(process.stdout)
+            _close_stream(process.stderr)
+            _join_readers(readers)
+    _require(not capture.truncated, "native_output_too_large")
     if timed_out or process.returncode != 0:
         code = "native_timeout" if timed_out else "native_process_failed"
         diagnostic = None
@@ -1142,8 +1199,9 @@ def run_bounded(command, timeout, env=None, failure_projector=None,
         if context is not None:
             try:
                 diagnostic = project_target_failure(
-                    context["target"], bytes(captured), process.returncode,
-                    timed_out=timed_out, phase=context["phase"],
+                    context["target"], bytes(capture.stdout),
+                    process.returncode, timed_out=timed_out,
+                    phase=context["phase"],
                     selected_case=context["selected_case"])
             except Exception:
                 # Context survives even if the parser itself fails.
@@ -1152,12 +1210,13 @@ def run_bounded(command, timeout, env=None, failure_projector=None,
         elif failure_projector is not None:
             try:
                 diagnostic = failure_projector(
-                    bytes(captured), process.returncode, timed_out)
+                    bytes(capture.stdout), bytes(capture.stderr),
+                    process.returncode, timed_out)
             except Exception:
                 # Projection must never replace or swallow the outer failure.
                 diagnostic = None
         raise RunnerError(code, diagnostic)
-    return bytes(captured)
+    return bytes(capture.stdout)
 
 
 def parse_listing(output):

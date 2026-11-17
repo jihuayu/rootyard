@@ -38,8 +38,9 @@ class FakeStdout:
 
 
 class FakeProcess:
-    def __init__(self, payload, returncode=0, timeout=False):
-        self.stdout = FakeStdout(payload)
+    def __init__(self, stdout=b"", stderr=b"", returncode=0, timeout=False):
+        self.stdout = FakeStdout(stdout)
+        self.stderr = FakeStdout(stderr)
         self.returncode = returncode
         self.pid = 4242
         self._timeout = timeout
@@ -58,6 +59,29 @@ class FakeProcess:
 
     def kill(self):
         pass
+
+
+class FakeReader:
+    def __init__(self, target, args):
+        self.target = target
+        self.args = args
+        self.alive = True
+
+    def run(self):
+        self.target(*self.args)
+        self.alive = False
+
+    def join(self, timeout=None):
+        self.alive = False
+
+    def is_alive(self):
+        return self.alive
+
+
+def synchronous_start(target, *args):
+    reader = FakeReader(target, args)
+    reader.run()
+    return reader
 
 
 def case_line(name, status="ok"):
@@ -254,6 +278,12 @@ class ProjectionParserTests(unittest.TestCase):
 
 
 class BoundedFailureProjectionTests(unittest.TestCase):
+    def setUp(self):
+        self.reader_patch = mock.patch.object(
+            runner, "_start_reader", side_effect=synchronous_start)
+        self.reader_patch.start()
+        self.addCleanup(self.reader_patch.stop)
+
     def test_nonzero_attaches_safe_diagnostic_and_outer_code(self):
         cases = inventory.TARGETS[TARGET]["cases"]
         payload = "\n".join([
@@ -263,7 +293,7 @@ class BoundedFailureProjectionTests(unittest.TestCase):
             summary("FAILED", 0, 1, 0),
         ]).encode()
         process = FakeProcess(payload, returncode=101)
-        projector = lambda output, code, timed_out: runner.project_target_failure(
+        projector = lambda output, _stderr, code, timed_out: runner.project_target_failure(
             TARGET, output, code, timed_out=timed_out, phase="run",
             selected_case=cases[0])
         with mock.patch.object(runner.subprocess, "Popen", return_value=process):
@@ -278,7 +308,7 @@ class BoundedFailureProjectionTests(unittest.TestCase):
 
     def test_timeout_keeps_native_timeout_code_and_diagnostic(self):
         process = FakeProcess(b"test secret ... failed\n", returncode=-9, timeout=True)
-        projector = lambda output, code, timed_out: runner.project_target_failure(
+        projector = lambda output, _stderr, code, timed_out: runner.project_target_failure(
             TARGET, output, code, timed_out=timed_out, phase="list")
         with mock.patch.object(runner.subprocess, "Popen", return_value=process), \
              mock.patch.object(runner.os, "getpgid", return_value=4242), \
@@ -305,6 +335,12 @@ class BoundedFailureProjectionTests(unittest.TestCase):
 
 
 class ExplicitPhaseContextTests(unittest.TestCase):
+    def setUp(self):
+        self.reader_patch = mock.patch.object(
+            runner, "_start_reader", side_effect=synchronous_start)
+        self.reader_patch.start()
+        self.addCleanup(self.reader_patch.stop)
+
     def test_list_and_run_failure_share_code_but_distinguish_phase(self):
         cases = inventory.TARGETS[TARGET]["cases"]
         cfg = inventory.TARGETS[TARGET]
@@ -425,6 +461,10 @@ def success_report():
 
 class AcceptanceFailureReportTests(unittest.TestCase):
     def setUp(self):
+        self.reader_patch = mock.patch.object(
+            runner, "_start_reader", side_effect=synchronous_start)
+        self.reader_patch.start()
+        self.addCleanup(self.reader_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.source = self.root / "source"
