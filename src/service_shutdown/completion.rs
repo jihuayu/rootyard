@@ -40,7 +40,10 @@ pub(crate) fn startup_join_failure(error: StartupJoinError) -> anyhow::Error {
 }
 
 pub(crate) enum PendingStartup {
-    Owned(StartupReconcile),
+    /// Lifetime-only retention: `_owner` is deliberately never read. Keeping it
+    /// alive until this completion is dropped preserves the original startup
+    /// owner/drop point after the bounded deadline; it is not success evidence.
+    Owned { _owner: StartupReconcile },
     #[cfg(test)]
     Test,
 }

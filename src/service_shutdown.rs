@@ -333,7 +333,7 @@ impl ServiceOwner {
                 primary,
                 vec!["service cleanup was invoked twice".to_owned()],
                 deadline,
-                self.startup.take().map(PendingStartup::Owned),
+                self.startup.take().map(|owner| PendingStartup::Owned { _owner: owner }),
             );
         }
         self.cleanup_started = true;
@@ -453,7 +453,7 @@ impl ServiceOwner {
             failures.push("native Git process cleanup did not prove quiescence".to_owned());
         }
 
-        let pending_startup = self.startup.take().map(PendingStartup::Owned);
+        let pending_startup = self.startup.take().map(|owner| PendingStartup::Owned { _owner: owner });
         ServiceCompletion::new(primary, failures, deadline, pending_startup)
     }
 
