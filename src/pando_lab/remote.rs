@@ -243,7 +243,7 @@ async fn publish_on_writer_session(
                         "INSERT INTO pando_lab.object_store_manifests(repo,pack_id,bucket,pack_key,idx_key,manifest_key,pack_sha256,idx_sha256,pack_bytes,idx_bytes,object_count,chunk_size,chunk_count,manifest_json) \
                          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(repo,pack_id) DO NOTHING",
                         &[&repo,&pack_id,&opts.bucket,&manifest.pack_key,&manifest.idx_key,&remote_manifest_key(repo, manifest)?.path(),
-                            pack_sha256,idx_sha256,&(manifest.pack_bytes as i64),&(manifest.idx_bytes as i64),
+                            &pack_sha256,&idx_sha256,&(manifest.pack_bytes as i64),&(manifest.idx_bytes as i64),
                             &(manifest.object_count as i64),&(manifest.chunk_size as i64),
                             &(manifest.pack_chunks.len() as i64),&value],
                     )
