@@ -18,6 +18,7 @@ import subprocess
 import time
 import urllib.parse
 
+from pando_vault_rotation_budget import MIN_REAP_SECONDS
 from pando_vault_rotation_support import (
     QualificationError,
     Runner,
@@ -304,26 +305,45 @@ class Server:
             raise QualificationError("server_announcement_invalid", "server")
         return port
 
-    def _signal(self, process, sig):
-        pgid = getattr(process, "pid", None)
-        if (self.owned_group and isinstance(pgid, int)
-                and pgid > 0 and pgid != os.getpid()):
-            try:
-                self._killpg(pgid, sig)
-                return
-            except ProcessLookupError:
-                return
-            except (OSError, ValueError, TypeError):
-                pass
-        try:
-            if sig == signal.SIGTERM:
-                process.terminate()
-            else:
-                process.kill()
-        except (OSError, ValueError, AttributeError):
-            pass
+    def _stop_deadline(self, timeout):
+        if self.budget is None:
+            return self._now() + float(timeout)
+        # Work-phase restart/stop stays on the work deadline.  Only the final
+        # cleanup phase may use the whole overall deadline.
+        self.budget.require("cleanup")
+        return min(self._now() + float(timeout), self.budget.deadline)
 
-    def _wait(self, process, deadline):
+    def _require_stop(self):
+        if self.budget is not None:
+            self.budget.require("cleanup")
+
+    def _group_state(self, pgid):
+        """Only ESRCH proves the exact owned group is absent."""
+        try:
+            self._killpg(pgid, 0)
+        except ProcessLookupError:
+            return "absent"
+        except PermissionError:
+            return "unknown"
+        except (OSError, ValueError, TypeError):
+            return "unknown"
+        return "present"
+
+    def _signal_group(self, pgid, sig):
+        """Signal only the verified owned group; never fall back to the leader."""
+        try:
+            self._killpg(pgid, sig)
+        except ProcessLookupError:
+            return "absent"
+        except PermissionError:
+            return "unknown"
+        except (OSError, ValueError, TypeError):
+            return "unknown"
+        return "sent"
+
+    def _reap_leader(self, process, deadline):
+        if process.returncode is not None:
+            return True
         remaining = deadline - self._now()
         if remaining <= 0:
             return False
@@ -341,32 +361,64 @@ class Server:
             except (OSError, ValueError, AttributeError):
                 pass
 
-    def stop(self, timeout=15):
-        if self.process is None:
-            return True
-        process = self.process
-        if process.poll() is not None:
-            self._close(process)
-            self.process = None
-            self.owned_group = False
-            return True
-        # Stop is only reached from an owned failure or cleanup; it uses the
-        # whole absolute deadline, never a fresh per-operation budget.
-        self._late_overall("cleanup")
-        deadline = self._now() + timeout
-        if self.budget is not None:
-            deadline = min(deadline, self.budget.overall_deadline)
-        if process.poll() is None:
-            self._signal(process, signal.SIGTERM)
-            if not self._wait(process, deadline):
-                self._signal(process, signal.SIGKILL)
-                if not self._wait(process, deadline):
-                    raise QualificationError("server_stop_timeout", "cleanup")
-        if process.poll() is None:
-            raise QualificationError("server_stop_timeout", "cleanup")
+    def _finish_stop(self, process):
         self._close(process)
         self.process = None
         self.owned_group = False
+        self.pgid = None
+        self.stdout_fd = None
+
+    def stop(self, timeout=15):
+        if self.process is None:
+            return True
+        if (not self.owned_group or not isinstance(self.pgid, int)
+                or self.pgid <= 0 or self.pgid == os.getpid()):
+            raise QualificationError("server_group_unverified", "cleanup")
+        deadline = self._stop_deadline(timeout)
+        process = self.process
+        pgid = self.pgid
+        state = self._group_state(pgid)
+        if state == "unknown":
+            raise QualificationError("server_group_unverified", "cleanup")
+        if state == "absent":
+            if not self._reap_leader(process, deadline):
+                raise QualificationError("server_stop_timeout", "cleanup")
+            self._finish_stop(process)
+            return True
+        remaining = deadline - self._now()
+        if remaining <= 0:
+            self._require_stop()
+        # Leave a real post-TERM slice for SIGKILL and reap.  This is carved
+        # from the same deadline; no new timeout is created after TERM.
+        reserve = min(MIN_REAP_SECONDS, remaining / 2.0)
+        term_deadline = self._now() + max(0.0, remaining - reserve)
+        term_state = self._signal_group(pgid, signal.SIGTERM)
+        if term_state == "unknown":
+            raise QualificationError("server_group_unverified", "cleanup")
+        if term_state == "absent":
+            if not self._reap_leader(process, deadline):
+                raise QualificationError("server_stop_timeout", "cleanup")
+            self._finish_stop(process)
+            return True
+        # The leader may exit here, but that does not prove its inherited Git
+        # descendants are gone.  The group is checked again below.
+        self._reap_leader(process, term_deadline)
+        self._require_stop()
+        state = self._group_state(pgid)
+        if state == "unknown":
+            raise QualificationError("server_group_unverified", "cleanup")
+        if state == "present":
+            kill_state = self._signal_group(pgid, signal.SIGKILL)
+            if kill_state == "unknown":
+                raise QualificationError("server_group_unverified", "cleanup")
+        if not self._reap_leader(process, deadline):
+            raise QualificationError("server_stop_timeout", "cleanup")
+        state = self._group_state(pgid)
+        if state == "unknown":
+            raise QualificationError("server_group_unverified", "cleanup")
+        if state != "absent":
+            raise QualificationError("server_group_alive", "cleanup")
+        self._finish_stop(process)
         return True
 
     def url(self, repo):

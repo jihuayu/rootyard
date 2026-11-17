@@ -479,6 +479,54 @@ class RetainedWriterCleanupTest(unittest.TestCase):
         self.assertFalse(result["facts"]["root_absent"])
         self.assertFalse(result["facts"]["cleanup_ok"])
 
+    def test_live_server_process_blocks_root_removal(self):
+        import pando_vault_rotation_negative as negative
+
+        class Root:
+            created = True
+            path = Path("/never-read-root")
+
+            def remove(self):
+                raise AssertionError("root must not be removed with a live group")
+
+        class Runner:
+            unresolved_children = False
+
+        class Server:
+            process = object()
+
+            def stop(self):
+                return True
+
+        class Fixture:
+            container_id = "a" * 64
+            state_written = True
+            state_path = Path("/never-read-state")
+            version = "2.2.2"
+
+            def stop(self):
+                return "stopped"
+
+        class Postgres:
+            prechecked_absent = True
+            created = True
+            dropped = False
+            major = 17
+
+            def drop(self):
+                self.dropped = True
+                return True
+
+        ctx = SimpleNamespace(
+            server=Server(), fixture=Fixture(), postgres=Postgres(),
+            root=Root(), runner=Runner(),
+            repo="11111111-1111-4111-8111-111111111111")
+        result = negative.case_owned_resource_cleanup(ctx)
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["facts"]["root_removed"])
+        self.assertFalse(result["facts"]["root_absent"])
+        self.assertFalse(result["facts"]["cleanup_ok"])
+
 
 class FakeStream:
     def __init__(self, fd=99):
@@ -492,33 +540,80 @@ class FakeStream:
         self.closed = True
 
 
+class FakeGroup:
+    """Fake process group membership; no OS process or signal is created."""
+
+    def __init__(self, leader_alive=True, child_alive=False,
+                 term_exits_leader=True, term_exits_child=True,
+                 kill_exits_leader=True, kill_exits_child=True,
+                 ambiguous=False):
+        self.leader_alive = leader_alive
+        self.child_alive = child_alive
+        self.term_exits_leader = term_exits_leader
+        self.term_exits_child = term_exits_child
+        self.kill_exits_leader = kill_exits_leader
+        self.kill_exits_child = kill_exits_child
+        self.ambiguous = ambiguous
+        self.calls = []
+
+    def killpg(self, pgid, sig):
+        self.calls.append((pgid, sig))
+        if self.ambiguous:
+            raise PermissionError("ambiguous group")
+        if sig == 0:
+            if self.leader_alive or self.child_alive:
+                return None
+            raise ProcessLookupError()
+        if not (self.leader_alive or self.child_alive):
+            raise ProcessLookupError()
+        if sig == signal.SIGTERM:
+            if self.term_exits_leader:
+                self.leader_alive = False
+            if self.term_exits_child:
+                self.child_alive = False
+        elif sig == signal.SIGKILL:
+            if self.kill_exits_leader:
+                self.leader_alive = False
+            if self.kill_exits_child:
+                self.child_alive = False
+        return None
+
+
 class FakeProcess:
     """A fake Popen handle; no OS process or thread is created."""
 
     def __init__(self, pid=4321, returncode=None, clock=None,
-                 advance_on_timeout=False):
+                 advance_on_timeout=False, group=None):
         self.pid = pid
         self.stdout = FakeStream()
         self.returncode = returncode
         self.waits = []
         self.clock = clock
         self.advance_on_timeout = advance_on_timeout
+        self.group = group or FakeGroup()
+        if returncode is not None:
+            self.group.leader_alive = False
 
     def poll(self):
         return self.returncode
 
     def wait(self, timeout=None):
         self.waits.append(timeout)
-        if self.returncode is None:
-            if self.advance_on_timeout and self.clock is not None:
-                self.clock.advance(timeout)
-            raise subprocess.TimeoutExpired(["lab"], timeout)
-        return self.returncode
+        if self.returncode is not None:
+            return self.returncode
+        if not self.group.leader_alive:
+            self.returncode = 0
+            return 0
+        if self.advance_on_timeout and self.clock is not None:
+            self.clock.advance(timeout)
+        raise subprocess.TimeoutExpired(["lab"], timeout)
 
     def terminate(self):
+        self.group.leader_alive = False
         self.returncode = 0
 
     def kill(self):
+        self.group.leader_alive = False
         self.returncode = -9
 
 
@@ -534,18 +629,6 @@ class FakePopen:
         self.argv = list(argv)
         self.kwargs = dict(kwargs)
         return self.process
-
-
-class FakeKillpg:
-    def __init__(self, process, exit_on=()):
-        self.process = process
-        self.exit_on = set(exit_on)
-        self.calls = []
-
-    def __call__(self, pgid, sig):
-        self.calls.append((pgid, sig))
-        if sig in self.exit_on:
-            self.process.returncode = 0 if sig == signal.SIGTERM else -9
 
 
 class FakeRead:
@@ -586,7 +669,7 @@ def _server_for_start(clock, budget, process, read_chunks,
     selector = FakeSelect(clock=clock, advance=advance, ready=ready)
     server = service.Server(
         "/bin/lab", {}, budget=budget, clock=clock,
-        popen=popen, killpg=FakeKillpg(process, exit_on=(signal.SIGTERM,)),
+        popen=popen, killpg=process.group.killpg,
         select_fn=selector, read_fn=reader,
         set_blocking_fn=lambda _fd, _flag: None)
     return server, popen, reader, selector
@@ -630,7 +713,7 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         server = service.Server(
             "/bin/lab", {}, budget=budget, clock=clock,
             popen=FakePopen(process),
-            killpg=FakeKillpg(process, exit_on=(signal.SIGTERM,)),
+            killpg=process.group.killpg,
             select_fn=selector, read_fn=reader,
             set_blocking_fn=lambda _fd, _flag: None)
         with self.assertRaises(QualificationError) as caught:
@@ -722,78 +805,230 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         popen = FakePopen(process)
         server = service.Server(
             "/bin/lab", {}, budget=budget, clock=clock,
-            popen=popen, killpg=FakeKillpg(process, exit_on=(signal.SIGTERM,)),
+            popen=popen, killpg=process.group.killpg,
             select_fn=selector, read_fn=LateRead(),
             set_blocking_fn=lambda _fd, _flag: None)
         with self.assertRaises(QualificationError) as caught:
             server.start()
         self.assertEqual(caught.exception.code, "work_deadline_exceeded")
 
-    def test_stop_signals_kills_reaps_and_closes_the_exact_group(self):
+    def test_stop_termonly_group_absence_closes_and_clears_owner(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess()
-        killpg = FakeKillpg(process, exit_on=(signal.SIGTERM,))
+        process = FakeProcess(clock=clock)
+        group = process.group
         server = service.Server(
             "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=killpg)
+            popen=FakePopen(process), killpg=group.killpg)
         server.process = process
         server.owned_group = True
+        server.pgid = process.pid
         self.assertTrue(server.stop())
-        self.assertEqual(killpg.calls, [(process.pid, signal.SIGTERM)])
+        signals = [sig for _pgid, sig in group.calls]
+        self.assertIn(signal.SIGTERM, signals)
+        self.assertNotIn(signal.SIGKILL, signals)
+        self.assertEqual(server.pgid, None)
+        self.assertFalse(server.owned_group)
         self.assertTrue(process.stdout.closed)
         self.assertIsNone(server.process)
-        self.assertFalse(server.owned_group)
 
-    def test_stop_without_exit_escalates_to_sigkill_before_success(self):
+    def test_stop_escalates_and_reaps_within_the_same_deadline(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(
+            term_exits_leader=False, term_exits_child=False,
+            kill_exits_leader=True, kill_exits_child=True)
+        process = FakeProcess(
+            clock=clock, advance_on_timeout=True, group=group)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=group.killpg)
+        server.process = process
+        server.owned_group = True
+        server.pgid = process.pid
+        self.assertTrue(server.stop())
+        signals = [sig for _pgid, sig in group.calls]
+        self.assertIn(signal.SIGTERM, signals)
+        self.assertIn(signal.SIGKILL, signals)
+        self.assertGreater(process.waits[-1], 0)
+        self.assertLessEqual(sum(process.waits), 15.0)
+        self.assertTrue(process.stdout.closed)
+        self.assertIsNone(server.process)
+
+    def test_stop_work_phase_does_not_borrow_cleanup_reserve(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
         process = FakeProcess()
-        killpg = FakeKillpg(process, exit_on=(signal.SIGKILL,))
+        group = process.group
         server = service.Server(
             "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=killpg)
+            popen=FakePopen(process), killpg=group.killpg)
         server.process = process
         server.owned_group = True
+        server.pgid = process.pid
+        clock.advance(80)
+        with self.assertRaises(QualificationError) as caught:
+            server.stop()
+        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
+        self.assertEqual(group.calls, [])
+        self.assertIs(server.process, process)
+        self.assertTrue(server.owned_group)
+
+    def test_stop_cleanup_phase_may_use_overall_deadline(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        budget.begin_cleanup()
+        process = FakeProcess()
+        group = process.group
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=group.killpg)
+        server.process = process
+        server.owned_group = True
+        server.pgid = process.pid
+        clock.advance(80)
         self.assertTrue(server.stop())
-        self.assertEqual(
-            [sig for _pid, sig in killpg.calls],
-            [signal.SIGTERM, signal.SIGKILL])
+        self.assertIn(signal.SIGTERM,
+                      [sig for _pgid, sig in group.calls])
+        self.assertIsNone(server.process)
+
+    def test_stop_leader_exit_does_not_hide_a_live_child(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(
+            leader_alive=False, child_alive=True,
+            term_exits_leader=True, term_exits_child=False,
+            kill_exits_leader=True, kill_exits_child=True)
+        process = FakeProcess(returncode=0, group=group)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=group.killpg)
+        server.process = process
+        server.owned_group = True
+        server.pgid = process.pid
+        self.assertTrue(server.stop())
+        signals = [sig for _pgid, sig in group.calls]
+        self.assertIn(signal.SIGKILL, signals)
+        self.assertEqual(group.leader_alive, False)
+        self.assertEqual(group.child_alive, False)
         self.assertTrue(process.stdout.closed)
+        self.assertIsNone(server.process)
+
+    def test_stop_ambiguous_group_is_never_marked_stopped(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(ambiguous=True)
+        process = FakeProcess(group=group)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=group.killpg)
+        server.process = process
+        server.owned_group = True
+        server.pgid = process.pid
+        with self.assertRaises(QualificationError) as caught:
+            server.stop()
+        self.assertEqual(caught.exception.code, "server_group_unverified")
+        self.assertIs(server.process, process)
+        self.assertTrue(server.owned_group)
+        self.assertFalse(process.stdout.closed)
+
+    def test_stop_group_alive_after_kill_is_never_marked_stopped(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup(
+            leader_alive=True, child_alive=True,
+            term_exits_leader=True, term_exits_child=False,
+            kill_exits_leader=True, kill_exits_child=False)
+        process = FakeProcess(group=group)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=group.killpg)
+        server.process = process
+        server.owned_group = True
+        server.pgid = process.pid
+        with self.assertRaises(QualificationError) as caught:
+            server.stop()
+        self.assertEqual(caught.exception.code, "server_group_alive")
+        self.assertIs(server.process, process)
+        self.assertTrue(server.owned_group)
+        self.assertFalse(process.stdout.closed)
+
+    def test_stop_uses_the_verified_pgid_fence(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess(pid=4321)
+        group = process.group
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=group.killpg)
+        server.process = process
+        server.owned_group = True
+        server.pgid = 5555
+        self.assertTrue(server.stop())
+        self.assertTrue(group.calls)
+        self.assertTrue(all(pgid == 5555 for pgid, _sig in group.calls))
+
+    def test_stop_refuses_an_unowned_group_without_signal(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess()
+        group = process.group
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=group.killpg)
+        server.process = process
+        server.owned_group = False
+        server.pgid = process.pid
+        with self.assertRaises(QualificationError) as caught:
+            server.stop()
+        self.assertEqual(caught.exception.code, "server_group_unverified")
+        self.assertEqual(group.calls, [])
+        self.assertIs(server.process, process)
 
     def test_stop_after_overall_deadline_does_not_start_a_kill(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
         process = FakeProcess()
-        killpg = FakeKillpg(process)
+        group = process.group
         server = service.Server(
             "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=killpg)
+            popen=FakePopen(process), killpg=group.killpg)
         server.process = process
         server.owned_group = True
+        server.pgid = process.pid
         clock.advance(100)
         with self.assertRaises(QualificationError) as caught:
             server.stop()
         self.assertEqual(caught.exception.code, "overall_deadline_exceeded")
-        self.assertEqual(killpg.calls, [])
+        self.assertEqual(group.calls, [])
         self.assertIs(server.process, process)
 
-    def test_already_exited_server_is_reaped_and_closed_without_signal(self):
+    def test_already_exited_server_is_reaped_and_closed_without_term(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
         process = FakeProcess(returncode=0)
-        killpg = FakeKillpg(process)
+        group = process.group
         server = service.Server(
             "/bin/lab", {}, budget=budget, clock=clock,
-            popen=FakePopen(process), killpg=killpg)
+            popen=FakePopen(process), killpg=group.killpg)
         server.process = process
         server.owned_group = True
+        server.pgid = process.pid
         self.assertTrue(server.stop())
-        self.assertEqual(killpg.calls, [])
+        self.assertEqual(
+            [sig for _pgid, sig in group.calls
+             if sig in (signal.SIGTERM, signal.SIGKILL)], [])
         self.assertTrue(process.stdout.closed)
         self.assertIsNone(server.process)
 
