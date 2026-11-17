@@ -455,6 +455,8 @@ async fn criss_cross_merge_deep_lag_pin_non_ff_and_memory_blob_faults() -> Resul
         r_nff.strong_cut = Some(cut.clone());
         r_nff.wants = vec![WantTarget::Ref { ref_name: nr.clone() }];
         r_nff.haves = HaveSpec { have_oids: vec![nf1], have_version_ids: vec![] };
+        ensure!(plan_fetch_covers(&r_nff, &env.graph, &env.index, &env.ret) == Err(FetchPlanError::HiddenRefDenied));
+        r_nff.haves = HaveSpec { have_oids: vec![c1], have_version_ids: vec![] };
         ensure!(env.check(&r_nff, &[comp.artifacts().clone()], &[(nr, nf2)]).await? == vec![cov_n2.cover_id()]);
 
         let FetchPlanOutcome::Planned(cp) = plan_fetch_covers(&r1, &env.graph, &env.index, &env.ret)? else {

@@ -458,7 +458,7 @@ async fn atomic_non_atomic_revoked_auth_and_cross_tenant_negative_cases() -> Res
     let ads = advertise_authorized_refs(&req.auth, &env.realm, &cut.heads.values().cloned().collect::<Vec<_>>())?;
     ensure!(ads.iter().all(|a| a.ref_name != hr) && ads.len() == 2);
     let p = env.plan(&req)?;
-    env.mat(&req, &p, &[], &[(mr.clone(), c2), (pr, c1)]).await?;
+    env.mat(&req, &p, &[], &[(mr.clone(), c2), (pr.clone(), c1)]).await?;
 
     let neg = [
         (0, FetchPlanError::HiddenRefDenied),
@@ -488,6 +488,10 @@ async fn atomic_non_atomic_revoked_auth_and_cross_tenant_negative_cases() -> Res
         historical_pinned: false,
     };
     req.strong_cut = None;
+    req.wants = vec![
+        WantTarget::PinnedVersion { ref_name: pr, version_id: v1.version_id() },
+        WantTarget::PinnedVersion { ref_name: mr, version_id: v2.version_id() },
+    ];
     ensure!(!env.plan(&req)?.common_time);
     Ok(())
 }
