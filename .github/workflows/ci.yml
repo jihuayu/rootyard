@@ -123,7 +123,8 @@ jobs:
           java -version
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --features pando-lab -- -D warnings
-      - run: cargo test --locked --all-targets --features pando-lab
+      - id: cargo_all_targets
+        run: cargo test --locked --all-targets --features pando-lab
       - name: Verify durable PostgreSQL workers
         run: cargo test --locked --features pando-lab --test outbox --test resolution_fences -- --ignored
       - name: Verify PostgreSQL RefStore registry and metadata-core contracts
@@ -162,6 +163,8 @@ jobs:
             --harness scripts/native_build_receipt.py \
             --harness .github/workflows/ci.yml
       - name: Build native bins and RefStore fixtures in one batch
+        id: native_batch
+        if: ${{ !cancelled() && (steps.cargo_all_targets.outcome == 'success' || steps.cargo_all_targets.outcome == 'failure') }}
         timeout-minutes: 10
         run: |
           python3 scripts/build_native_batch.py \
@@ -175,6 +178,8 @@ jobs:
             --manifest-out test-results/native-build-batch.json \
             --artifact-store "$HOME/.cache/rootyard/native-artifacts"
       - name: Export immutable native artifact paths
+        id: native_export
+        if: ${{ !cancelled() && steps.native_batch.outcome == 'success' }}
         run: |
           python3 scripts/export_native_artifacts.py \
             --manifest test-results/native-build-batch.json \
@@ -330,6 +335,7 @@ jobs:
         run: python3 tests/workspace_capture_acceptance.py --binary "$ROOTYARD_BIN" --report test-results/workspace-capture.json
       - name: Start the job-owned workspace FUSE/remote S3 fixture
         id: workspace_garage
+        if: ${{ !cancelled() && steps.native_export.outcome == 'success' }}
         timeout-minutes: 12
         shell: bash
         run: |
@@ -341,12 +347,16 @@ jobs:
           echo "env_file=$env_file" >> "$GITHUB_OUTPUT"
       - name: Exercise original FUSE helper and remote-delete acceptance
         id: workspace_fuse_remote
-        if: always() && steps.workspace_garage.outputs.env_file != ''
+        if: ${{ !cancelled() && steps.native_export.outcome == 'success' && steps.workspace_garage.outcome == 'success' && steps.workspace_garage.outputs.env_file != '' }}
         timeout-minutes: 30
         shell: bash
         run: |
           set -euo pipefail
           set +x
+          test -n "${ROOTYARD_BIN:-}"
+          test -x "$ROOTYARD_BIN"
+          test -n "${ROOTYARD_BUILD_RECEIPT:-}"
+          test -f "$ROOTYARD_BUILD_RECEIPT"
           set -a
           . "${{ steps.workspace_garage.outputs.env_file }}"
           set +a
@@ -359,13 +369,14 @@ jobs:
             exit 1
           fi
       - name: Bind workspace FUSE and remote-delete evidence to the built binary
-        if: always()
+        if: ${{ !cancelled() && steps.native_export.outcome == 'success' && steps.workspace_fuse_remote.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/native_report_manifest.py --mode job             --manifest-out test-results/native-workspace-fuse-gate.json             --expect-commit "$GITHUB_SHA"             --build-receipt "$ROOTYARD_BUILD_RECEIPT"             --binary "$ROOTYARD_BIN"             --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST"             --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256"             --report workspace_fuse_service=test-results/workspace-fuse-service.json             --report workspace_remote_delete=test-results/workspace-remote-delete-policy.json             --require-case workspace_fuse_service=tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_live_editor_capture_checkpoint_and_remount             --require-case workspace_fuse_service=tests.test_workspace_handoff.WorkspaceHandoffTest.test_expired_host_reattach_from_remote_checkpoint             --require-case workspace_fuse_service=tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_normal_sigterm_helper_unmount_precedes_parked_git_join             --require-case workspace_fuse_service=tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_api_sigkill_with_pending_kernel_writer             --require-case workspace_remote_delete=invalid_optin_rejected_at_startup             --require-case workspace_remote_delete=default_retains_failed_remote_cleanup             --require-case workspace_remote_delete=exit77_with_pending_fuse_request             --harness tests/test_workspace_fuse_service.py             --harness tests/test_workspace_handoff.py             --harness tests/workspace_fuse_service_acceptance.py             --harness tests/workspace_remote_delete_policy.py             --harness tests/runtime_binary.py             --harness tests/source_bound_binary.py             --harness tests/ops_provenance.py             --harness tests/native_evidence.py             --harness tests/e2e.py             --harness tests/owned_fuse_cleanup.py             --harness tests/fuse_helper_native_support.py             --harness tests/workspace_normal_shutdown_support.py             --harness tests/workspace_capture_acceptance.py             --harness tests/lfs_hydration_concurrency.py             --harness tests/lfs.py             --harness tests/lfs_remote_contract.py             --harness tests/schema_baseline.py             --harness tests/fixtures/capture_read_gate.c             --harness scripts/native_report_manifest.py             --harness scripts/native_build_receipt.py             --harness .github/workflows/ci.yml             --fixture-rust-from-receipt             --fixture workspace_mount_mode=fuse-helper             --fixture postgres=postgres:17             --fixture garage=garage:2.1.0             --fixture fuse_device="$(stat -Lc '%F mode=%a' /dev/fuse)"
       - name: Exercise four legacy in-process FUSE service-shutdown cases
         id: workspace_legacy_service
+        if: ${{ !cancelled() && steps.native_export.outcome == 'success' }}
         timeout-minutes: 10
         shell: bash
         run: |
