@@ -85,9 +85,21 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+# The private command interface deliberately reuses the source-approved
+# producer-PG owned Popen runner.  These files are part of the harness binding
+# closure so the reused semantics cannot drift without changing the harness
+# hash and the CI manifest harness list.
+BOUND_SUPPORT_FILES = (
+    "scripts/pando_producer_pg/__init__.py",
+    "scripts/pando_producer_pg/errors.py",
+    "scripts/pando_producer_pg/process.py",
+)
+
+
 def _harness_files():
     paths = sorted(TESTS.glob("pando_vault_rotation*.py"))
     paths += sorted(TESTS.glob("test_pando_vault_rotation*.py"))
+    paths += [ROOT / relative for relative in BOUND_SUPPORT_FILES]
     return [path for path in paths if path.is_file()]
 
 
@@ -99,7 +111,7 @@ def _harness_sha256(budget=None):
             digest = sha256_file_bounded(path, budget, "binding")
         else:
             digest = sha256_file(path)
-        rows.append(path.name + "\0" + digest)
+        rows.append(path.relative_to(ROOT).as_posix() + "\0" + digest)
     require(bool(rows), "harness_files_missing", "binding")
     if budget is not None:
         budget.late("binding")

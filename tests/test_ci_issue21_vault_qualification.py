@@ -56,6 +56,9 @@ def _expected_harnesses():
         "scripts/native_artifact_store.py",
         "scripts/build_native_batch.py",
         "scripts/export_native_artifacts.py",
+        "scripts/pando_producer_pg/__init__.py",
+        "scripts/pando_producer_pg/errors.py",
+        "scripts/pando_producer_pg/process.py",
         ".github/workflows/ci.yml",
     ])
     return relative
@@ -197,6 +200,17 @@ class VaultWorkflowTest(unittest.TestCase):
         self.assertEqual(len(harnesses), len(set(harnesses)))
         for relative in harnesses:
             self.assertTrue((ROOT / relative).is_file(), relative)
+
+    def test_harness_glob_binds_reused_pg_command_runner(self):
+        names = {path.name for path in rotation._harness_files()}
+        for name in ("process.py", "errors.py", "__init__.py"):
+            self.assertIn(name, names)
+        self.assertEqual(
+            tuple(rotation.BOUND_SUPPORT_FILES),
+            ("scripts/pando_producer_pg/__init__.py",
+             "scripts/pando_producer_pg/errors.py",
+             "scripts/pando_producer_pg/process.py"),
+        )
 
     def test_vault_pin_matches_fixture_source(self):
         self.assertEqual(

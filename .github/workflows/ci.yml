@@ -414,6 +414,9 @@ jobs:
             --harness scripts/native_artifact_store.py \
             --harness scripts/build_native_batch.py \
             --harness scripts/export_native_artifacts.py \
+            --harness scripts/pando_producer_pg/__init__.py \
+            --harness scripts/pando_producer_pg/errors.py \
+            --harness scripts/pando_producer_pg/process.py \
             --harness .github/workflows/ci.yml
       - name: Exercise live Pando PITR fencing, retention roots, and pg_dump clone safety
         timeout-minutes: 10
