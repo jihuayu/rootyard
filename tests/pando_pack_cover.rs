@@ -221,7 +221,7 @@ impl Env {
             _ => RefPrecondition::Absent,
         };
         let sel = base.map_or(BaseRequestSelector::ExplicitAbsent, |b| BaseRequestSelector::Present(b.version_id()));
-        let intent = RefVersionIntent::new(ref_name.clone(), kind, pre, sel, target);
+        let intent = RefVersionIntent::new(ref_name.clone(), kind, pre, sel, target.clone());
         let op = OperationDigestInput::new(
             realm,
             u(),
@@ -240,7 +240,7 @@ impl Env {
         let operation_digest = operation_digest(&op)?;
         let version_id =
             derive_candidate_version_id(&op, operation_digest, &ref_name, base.map(VersionRecord::ref_generation))?;
-        let ce = CommitSetVersionEntry::new(ref_name.clone(), version_id, kind, target);
+        let ce = CommitSetVersionEntry::new(ref_name.clone(), version_id, kind, target.clone());
         let cs =
             CommitSetInput::new(realm, authority_seq, operation_id, operation_digest, vec![ce], CommitSetHead::Absent);
         let commit_set_id = compute_commit_set_id(&cs)?;
