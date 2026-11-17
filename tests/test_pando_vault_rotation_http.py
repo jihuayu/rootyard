@@ -14,7 +14,9 @@ import socket
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 import urllib.error
+import urllib.request
 
 TESTS = Path(__file__).resolve().parent
 if str(TESTS) not in sys.path:
@@ -187,6 +189,16 @@ class ParentDeadlineTest(unittest.TestCase):
         with self.assertRaises(QualificationError):
             opener.open(request(), timeout=5)
 
+    def test_non_2xx_body_projection_fails_closed(self):
+        raw = json.dumps({
+            "ok": True, "status": 302,
+            "body_b64": base64.b64encode(b"RAW").decode("ascii"),
+        }).encode()
+        opener = http.BoundedHttpOpener(
+            FakeRunner(Result(stdout=raw)), budget(Clock()))
+        with self.assertRaises(QualificationError):
+            opener.open(request(), timeout=5)
+
     def test_unknown_failure_code_fails_closed(self):
         raw = json.dumps({"ok": False, "code": "raw-" + SECRET}).encode()
         opener = http.BoundedHttpOpener(
@@ -273,6 +285,34 @@ class FakeOpener:
         return self.response
 
 
+class TrackingFile(io.BytesIO):
+    def __init__(self, data):
+        super().__init__(data)
+        self.read_called = False
+
+    def read(self, *args, **kwargs):
+        self.read_called = True
+        return super().read(*args, **kwargs)
+
+
+class TrackingHeaders(dict):
+    def __init__(self, location):
+        super().__init__({"location": location})
+        self.location_read = False
+
+    def _note(self, key):
+        if str(key).lower() == "location":
+            self.location_read = True
+
+    def __getitem__(self, key):
+        self._note(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._note(key)
+        return super().get(key, default)
+
+
 def value(**overrides):
     base = {
         "method": "GET",
@@ -309,14 +349,70 @@ class ChildProtocolTest(unittest.TestCase):
                 self.assertEqual(result, {"ok": False, "code": "url_invalid"})
         self.assertEqual(opener.calls, [])
 
-    def test_http_error_has_status_but_no_error_body(self):
-        error = urllib.error.HTTPError(
-            URL, 403, "Forbidden", {}, io.BytesIO(b"RAW-ERROR-BODY"))
-        result = child.run_transaction(value(), opener=FakeOpener(error=error))
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["status"], 403)
-        self.assertEqual(base64.b64decode(result["body_b64"]), b"")
-        self.assertNotIn("RAW-ERROR-BODY", json.dumps(result))
+    def test_actual_opener_refuses_redirects_without_location_or_body_read(self):
+        opener = child._default_opener()
+        redirect_handlers = [
+            handler for handler in opener.handlers
+            if isinstance(handler, urllib.request.HTTPRedirectHandler)
+        ]
+        self.assertEqual(
+            [type(handler) for handler in redirect_handlers],
+            [child.NoRedirectHandler])
+        request = urllib.request.Request(
+            URL, headers={"X-Vault-Token": SECRET})
+        cases = (
+            (301, "http://example.com/v1/sys/health"),
+            (302, "http://127.0.0.1:1/v1/sys/health"),
+            (303, "https://example.com/v1/sys/health"),
+            (307, "http://127.0.0.1:1/v1/sys/health"),
+            (308, "http://example.com/v1/sys/health"),
+            (304, "http://127.0.0.1:1/v1/sys/health"),
+        )
+        for code, location in cases:
+            with self.subTest(code=code, location=location):
+                headers = TrackingHeaders(location)
+                fp = TrackingFile(b"RAW-REDIRECT-OR-304-BODY")
+                with mock.patch.object(
+                        opener, "open",
+                        side_effect=AssertionError("redirect was followed")):
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        opener.error(
+                            "http", request, fp, code, "status", headers)
+                self.assertEqual(caught.exception.code, code)
+                self.assertFalse(headers.location_read)
+                self.assertFalse(fp.read_called)
+                self.assertNotIn(SECRET, str(caught.exception))
+                self.assertNotIn(
+                    "RAW-REDIRECT-OR-304-BODY", str(caught.exception))
+                caught.exception.close()
+        self.assertEqual(request.get_header("X-vault-token"), SECRET)
+
+    def test_non_2xx_returned_response_is_status_only_without_body_read(self):
+        for status in (302, 307, 308, 304, 403, 500):
+            with self.subTest(status=status):
+                response = FakeResponse(
+                    status=status, body=b"RAW-NON-2XX-BODY")
+                opener = FakeOpener(response)
+                result = child.run_transaction(value(), opener=opener)
+                self.assertEqual(result, {
+                    "ok": True, "status": status, "body_b64": "",
+                })
+                self.assertEqual(response.limits, [])
+                self.assertNotIn("RAW-NON-2XX-BODY", json.dumps(result))
+
+    def test_non_2xx_http_error_has_status_but_no_body_read(self):
+        for status in (302, 307, 308, 304, 403, 500):
+            with self.subTest(status=status):
+                fp = TrackingFile(b"RAW-ERROR-BODY")
+                error = urllib.error.HTTPError(
+                    URL, status, "status", {}, fp)
+                result = child.run_transaction(
+                    value(), opener=FakeOpener(error=error))
+                self.assertEqual(result, {
+                    "ok": True, "status": status, "body_b64": "",
+                })
+                self.assertFalse(fp.read_called)
+                self.assertNotIn("RAW-ERROR-BODY", json.dumps(result))
 
     def test_headers_timeout_is_a_fixed_failure(self):
         result = child.run_transaction(

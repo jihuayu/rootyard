@@ -144,8 +144,21 @@ def _validate_url(url):
     return True
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect without reading Location or opening a new URL."""
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        return None
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+
 def _default_opener():
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), NoRedirectHandler())
 
 
 def run_transaction(value, opener=None):
@@ -168,6 +181,11 @@ def run_transaction(value, opener=None):
             status = getattr(response, "status", None)
             if type(status) is not int or not STATUS_MIN <= status <= STATUS_MAX:
                 return _failure("response_invalid")
+            if not 200 <= status < 300:
+                # Never read or project a non-2xx body.  This also covers a
+                # synthetic response object (for example 304) that urllib did
+                # not turn into HTTPError.
+                return _success(status, b"")
             raw = response.read(BODY_LIMIT)
             if not isinstance(raw, (bytes, bytearray)):
                 return _failure("response_invalid")

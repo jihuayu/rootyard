@@ -188,6 +188,8 @@ def _decode_result(raw, stage):
             raise _unavailable(stage) from None
         if len(body) > BODY_LIMIT:
             raise _unavailable(stage)
+        if not 200 <= status < 300 and body:
+            raise _unavailable(stage)
         return status, body
     if ok is False:
         if set(value) != {"ok", "code"}:

@@ -140,6 +140,19 @@ class FixtureHttpIntegrationTest(unittest.TestCase):
             fixture.api("POST", "/v1/transit/keys/k/rotate")
         self.assertEqual(caught.exception.code, "vault_api_failed")
 
+    def test_redirect_and_304_statuses_cannot_satisfy_a_denial_oracle(self):
+        clock = Clock()
+        for status in (302, 307, 308, 304):
+            with self.subTest(status=status):
+                runner = FakeRunner(Result(
+                    stdout=encoded(status=status, body=b"")))
+                fixture = make_fixture(clock, runner, make_budget(clock))
+                self.assertEqual(
+                    fixture.request_status("GET", "/v1/sys/health"), status)
+                with self.assertRaises(common.FixtureError) as caught:
+                    fixture.api("GET", "/v1/sys/health")
+                self.assertEqual(caught.exception.code, "vault_api_failed")
+
     def test_oversized_success_body_is_still_rejected_by_the_existing_api(self):
         clock = Clock()
         runner = FakeRunner(Result(
