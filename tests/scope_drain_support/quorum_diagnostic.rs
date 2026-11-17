@@ -199,12 +199,35 @@ const fn matching_leader_slot(matching: Option<LogId<u64>>) -> Option<&'static s
 /// leader is slot 1, proving the projection does not coerce the historical proposer.
 #[cfg(test)]
 const _: () = {
+    const fn bytes_equal(left: &str, right: &str) -> bool {
+        let left = left.as_bytes();
+        let right = right.as_bytes();
+        if left.len() != right.len() {
+            return false;
+        }
+        let mut index = 0;
+        while index < left.len() {
+            if left[index] != right[index] {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    const fn option_str_is(value: Option<&str>, expected: &str) -> bool {
+        match value {
+            Some(actual) => bytes_equal(actual, expected),
+            None => false,
+        }
+    }
+
     let matched = LogId { leader_id: openraft::CommittedLeaderId { term: 6, node_id: 2 }, index: 11 };
     let observed_current_leader: Option<u64> = Some(1);
-    assert!(matches!(matching_leader_slot(Some(matched)), Some("slot2")));
-    assert!(!matches!(matching_leader_slot(Some(matched)), Some("slot1")));
-    assert!(matches!(matching_leader_slot(None), None));
-    assert!(matches!(leader_slot(observed_current_leader), "slot1"));
+    assert!(option_str_is(matching_leader_slot(Some(matched)), "slot2"));
+    assert!(!option_str_is(matching_leader_slot(Some(matched)), "slot1"));
+    assert!(matching_leader_slot(None).is_none());
+    assert!(bytes_equal(leader_slot(observed_current_leader), "slot1"));
 };
 
 fn bounded(value: u64, maximum: u64, overflow: &mut bool) -> u64 {
