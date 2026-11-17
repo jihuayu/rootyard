@@ -306,6 +306,21 @@ class OwnedFixture:
             root = {}
         return postgres, root
 
+    def _final_records(self):
+        """Refresh nested report records; failure itself is unresolved."""
+        postgres = {}
+        root = {}
+        try:
+            if self.postgres is not None:
+                postgres = self.postgres.safe_record()
+            if self.root is not None:
+                root = self.root.safe_record()
+        except Exception:
+            return {}, {}, False
+        if not isinstance(postgres, dict) or not isinstance(root, dict):
+            return {}, {}, False
+        return postgres, root, True
+
     def _truth_base(self, postgres, root):
         """Build cleanup facts from observations, never from success defaults.
 
@@ -323,27 +338,27 @@ class OwnedFixture:
             and not owned
             and not acknowledged
         )
-        proven_absent = self.postgres is None or (
-            no_create
-            and (
-                postgres.get("pg_major") is None
-                or postgres.get("prechecked_absent") is True
-            )
+        # ``pg_major is None`` only proves this run never owned a database; it
+        # does not prove the generated name is absent.  Only a completed
+        # absence precheck before any CREATE, or an acknowledged owned drop
+        # followed by the canonical recheck, can claim absence.
+        prechecked_absent = bool(
+            no_create and postgres.get("prechecked_absent") is True
         )
-        postgres_absent = bool(proven_absent or postgres.get("dropped"))
+        dropped = bool(postgres.get("dropped"))
+        database_absent = bool(prechecked_absent or dropped)
         root_created = bool(root.get("created"))
-        root_absent = bool(
-            self.root is None or not root_created or root.get("removed")
-        )
+        root_removed = bool(self.root is None or root.get("removed"))
+        root_absent = root_removed
         return {
             "cleanup_ok": False,
             "postgres_owned": owned,
             "postgres_created": created,
-            "postgres_dropped": postgres_absent,
-            "database_absent": postgres_absent,
+            "postgres_dropped": dropped,
+            "database_absent": database_absent,
             "root_owned": root_created,
             "root_created": root_created,
-            "root_removed": root_absent,
+            "root_removed": root_removed,
             "root_absent": root_absent,
             "cleanup_within_deadline": False,
             "no_global_cleanup": True,
@@ -353,9 +368,7 @@ class OwnedFixture:
 
     def _finish_cleanup(self, facts, failure, deadline):
         within = self.clock() < deadline
-        postgres_verified = bool(
-            facts["postgres_dropped"] and facts["database_absent"]
-        )
+        postgres_verified = bool(facts["database_absent"])
         root_verified = bool(facts["root_removed"] and facts["root_absent"])
         facts["postgres_cleanup_verified"] = postgres_verified
         facts["root_cleanup_verified"] = root_verified
@@ -368,6 +381,18 @@ class OwnedFixture:
             facts["error_code"] = failure
         elif not within:
             facts["error_code"] = "cleanup_deadline_exceeded"
+        # The nested records are part of the report evidence.  Refresh them
+        # after the final teardown so they cannot remain pre-cleanup snapshots.
+        final_postgres, final_root, records_ok = self._final_records()
+        if not records_ok:
+            facts["postgres_cleanup_verified"] = False
+            facts["root_cleanup_verified"] = False
+            facts["cleanup_verified"] = False
+            facts["cleanup_ok"] = False
+            if "error_code" not in facts:
+                facts["error_code"] = "cleanup_unresolved"
+        facts["postgres"] = final_postgres
+        facts["root"] = final_root
         return facts
 
     def cleanup(self, deadline):
@@ -378,7 +403,10 @@ class OwnedFixture:
             return self._finish_cleanup(
                 facts, "cleanup_deadline_exceeded", deadline
             )
-        if self.postgres is not None:
+        if self.postgres is None:
+            if failure is None:
+                failure = "cleanup_unresolved"
+        else:
             self._arm_postgres(deadline)
             facts["postgres_owned"] = bool(self.postgres.owned)
             facts["postgres_created"] = bool(self.postgres.created)
@@ -397,18 +425,16 @@ class OwnedFixture:
                 failure = "postgres_create_outcome_unknown"
                 facts["postgres_dropped"] = False
                 facts["database_absent"] = False
-            elif outcome == "not_attempted" and (
-                self.postgres.major is None or self.postgres.prechecked_absent
-            ):
-                # No CREATE was issued by this process, so no owned database
-                # exists.  A failed preflight that found a foreign database is
-                # handled by the final branch and never treated as ours.
-                facts["postgres_dropped"] = True
+            elif outcome == "not_attempted" and self.postgres.prechecked_absent:
+                # The exact generated name was checked absent and no CREATE
+                # was issued.  This is verified absence, not an owned drop.
+                facts["postgres_dropped"] = False
                 facts["database_absent"] = True
             else:
                 # CREATE was attempted without an ownership acknowledgment
-                # (rejected/raced), or the absence preflight found a foreign
-                # database.  Absence is unresolved and no DROP is authorized.
+                # (rejected/raced), validation failed before the absence
+                # precheck, or the preflight found a foreign database.  No
+                # absence claim and no blind DROP are authorized.
                 failure = (
                     "postgres_create_outcome_unknown"
                     if outcome == "unknown"
@@ -442,12 +468,19 @@ class OwnedFixture:
                     "verified": False,
                     "code": "root_remove_failed",
                 }
-            facts["root_removed"] = bool(removal.get("removed"))
-            facts["root_absent"] = bool(removal.get("absent"))
-            if not removal.get("verified") or removal.get("code"):
-                if failure is None:
-                    failure = _cleanup_code(
-                        removal.get("code") or "root_remove_unverified"
-                    )
+            verified = bool(
+                removal.get("verified") is True
+                and removal.get("removed") is True
+                and removal.get("absent") is True
+                and not removal.get("code")
+            )
+            if verified:
+                self.root.removed = True
+            facts["root_removed"] = verified
+            facts["root_absent"] = verified
+            if not verified and failure is None:
+                failure = _cleanup_code(
+                    removal.get("code") or "root_remove_unverified"
+                )
         return self._finish_cleanup(facts, failure, deadline)
 

@@ -255,6 +255,25 @@ class OwnedFixtureDeadlineTest(unittest.TestCase):
         self.assertEqual(len(factory.probe.calls), calls)
         self.assertEqual(factory.probe.drop_sqls, [])
 
+    def test_unverified_child_absence_is_not_marked_removed(self):
+        clock = FakeClock(0)
+        remover = root_cleanup.BoundedRootRemover(
+            clock=clock, process_runner=AbsentThenTimeoutRunner()
+        )
+        fixture, factory = self.fixture(clock, root_remover=remover)
+        fixture.start(deadline=1e18)
+        cleanup = fixture.cleanup(deadline=100)
+        self.assertFalse(Path(fixture.root_path).exists())
+        self.assertFalse(cleanup["root_removed"])
+        self.assertFalse(cleanup["root_absent"])
+        self.assertFalse(cleanup["root"]["removed"])
+        self.assertFalse(cleanup["root_cleanup_verified"])
+        self.assertFalse(cleanup["cleanup_ok"])
+        self.assertEqual(cleanup["error_code"], "cleanup_deadline_exceeded")
+        self.assertTrue(cleanup["postgres_dropped"])
+        self.assertTrue(cleanup["postgres"]["dropped"])
+        self.assertFalse(fixture.root.removed)
+
     def test_unknown_runner_timeout_create_never_drops_or_claims_absence(self):
         clock = FakeClock(0)
         fixture, factory = self.fixture(clock, create_mode="runner_timeout")
@@ -268,6 +287,18 @@ class OwnedFixtureDeadlineTest(unittest.TestCase):
         self.assertFalse(cleanup["postgres_dropped"])
         self.assertEqual(cleanup["error_code"], "postgres_create_outcome_unknown")
         self.assertEqual(factory.probe.drop_sqls, [])
+
+
+class AbsentThenTimeoutRunner:
+    """Child proves absence by deleting, then fails before reporting success."""
+
+    def __init__(self):
+        self.calls = []
+
+    def run(self, argv, **kwargs):
+        self.calls.append((list(argv), dict(kwargs)))
+        shutil.rmtree(Path(argv[2]))
+        raise RunnerError("cleanup", "root_remove_timeout")
 
 
 class BoundedRootRemovalTest(unittest.TestCase):

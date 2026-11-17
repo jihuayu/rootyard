@@ -51,9 +51,10 @@ class Result:
 
 
 class PgFake:
-    def __init__(self, database, create_mode="ok"):
+    def __init__(self, database, create_mode="ok", validate_fail=False):
         self.database = database
         self.create_mode = create_mode
+        self.validate_fail = validate_fail
         self.exists = False
         self.identity = {"oid": "16384", "datdba": "10", "database": database}
         self.calls = []
@@ -64,6 +65,8 @@ class PgFake:
         sql = (kwargs.get("input") or b"").decode(errors="replace")
         self.calls.append(([str(item) for item in argv], dict(kwargs), sql))
         if "SHOW server_version_num" in sql:
+            if self.validate_fail:
+                return Result(1, b"")
             return Result(0, b"170004\n")
         if "oid::text" in sql and "FROM pg_database" in sql:
             if not self.exists:
@@ -92,15 +95,16 @@ class PgFake:
 
 
 class PgFactory:
-    def __init__(self, create_mode="ok", schema_ok=True):
+    def __init__(self, create_mode="ok", schema_ok=True, validate_fail=False):
         self.create_mode = create_mode
         self.schema_ok = schema_ok
+        self.validate_fail = validate_fail
         self.pg = None
         self.fake = None
 
     def __call__(self, dsn, nonce, runner):
         pg = resources.OwnedPostgres(dsn, nonce=nonce, runner=runner)
-        fake = PgFake(pg.database, self.create_mode)
+        fake = PgFake(pg.database, self.create_mode, self.validate_fail)
         fake.schema_ok = self.schema_ok
         pg.runner = fake
         self.pg = pg
@@ -161,6 +165,11 @@ class OwnedFixtureTest(unittest.TestCase):
         self.assertTrue(cleanup["cleanup_ok"])
         self.assertEqual(len(factory.fake.drop_sqls), 1)
         self.assertFalse(Path(fixture.root_path).exists())
+        self.assertTrue(cleanup["postgres"]["dropped"])
+        self.assertTrue(cleanup["root"]["removed"])
+        self.assertTrue(cleanup["postgres_cleanup_verified"])
+        self.assertTrue(cleanup["root_cleanup_verified"])
+        self.assertTrue(cleanup["cleanup_verified"])
 
     def test_escape_variable_presence_fails_before_effects(self):
         factory = PgFactory()
@@ -187,6 +196,11 @@ class OwnedFixtureTest(unittest.TestCase):
         self.assertTrue(cleanup["cleanup_ok"])
         self.assertEqual(len(factory.fake.drop_sqls), 1)
         self.assertFalse(Path(fixture.root_path).exists())
+        self.assertTrue(cleanup["postgres"]["dropped"])
+        self.assertTrue(cleanup["root"]["removed"])
+        self.assertTrue(cleanup["postgres_cleanup_verified"])
+        self.assertTrue(cleanup["root_cleanup_verified"])
+        self.assertTrue(cleanup["cleanup_verified"])
 
     def test_unknown_create_outcome_never_drops(self):
         factory = PgFactory("unknown")
@@ -199,6 +213,10 @@ class OwnedFixtureTest(unittest.TestCase):
         self.assertEqual(cleanup["error_code"], "postgres_create_outcome_unknown")
         self.assertEqual(factory.fake.drop_sqls, [])
         self.assertTrue(cleanup["root_removed"])
+        self.assertFalse(cleanup["postgres"]["dropped"])
+        self.assertTrue(cleanup["root"]["removed"])
+        self.assertFalse(cleanup["postgres_cleanup_verified"])
+        self.assertTrue(cleanup["root_cleanup_verified"])
 
     def test_rejected_create_race_never_claims_absent_or_drops(self):
         factory = PgFactory("reject")
@@ -211,6 +229,64 @@ class OwnedFixtureTest(unittest.TestCase):
         self.assertFalse(cleanup["database_absent"])
         self.assertEqual(cleanup["error_code"], "cleanup_unresolved")
         self.assertEqual(factory.fake.drop_sqls, [])
+        self.assertTrue(cleanup["root_removed"])
+        self.assertFalse(cleanup["postgres"]["dropped"])
+        self.assertTrue(cleanup["root"]["removed"])
+
+    def test_completed_absence_precheck_can_claim_absence(self):
+        fixture = self.fixture()
+        fixture.root = resources.OwnedRoot(base=self.base)
+        fixture.root.create()
+        pg = resources.OwnedPostgres(
+            BOOTSTRAP,
+            nonce=fixture.root.nonce,
+            runner=process.ProcessRunner(popen=lambda *a, **k: None),
+        )
+        pg.major = 17
+        pg.prechecked_absent = True
+        fixture.postgres = pg
+        cleanup = fixture.cleanup(1e18)
+        self.assertFalse(cleanup["postgres_dropped"])
+        self.assertTrue(cleanup["database_absent"])
+        self.assertTrue(cleanup["postgres_cleanup_verified"])
+        self.assertTrue(cleanup["root"]["removed"])
+        self.assertFalse(cleanup["postgres"]["dropped"])
+        self.assertTrue(cleanup["cleanup_ok"])
+        self.assertNotIn("error_code", cleanup)
+
+    def test_nested_record_refresh_failure_is_unresolved(self):
+        factory = PgFactory()
+        fixture = self.fixture(factory)
+        fixture.start(deadline=1e18)
+        with mock.patch.object(
+            fixture.postgres,
+            "safe_record",
+            side_effect=RuntimeError("secret /tmp/path"),
+        ):
+            cleanup = fixture.cleanup(1e18)
+        self.assertFalse(cleanup["cleanup_verified"])
+        self.assertFalse(cleanup["cleanup_ok"])
+        self.assertEqual(cleanup["error_code"], "cleanup_unresolved")
+        self.assertEqual(cleanup["postgres"], {})
+        self.assertNotIn("secret", str(cleanup))
+
+    def test_validation_failure_before_precheck_is_not_absence(self):
+        factory = PgFactory(validate_fail=True)
+        fixture = self.fixture(factory)
+        with self.assertRaises(process.RunnerError) as caught:
+            fixture.start(deadline=1e18)
+        self.assertEqual(caught.exception.code, "postgres_validate_failed")
+        self.assertIsNone(factory.pg.major)
+        self.assertFalse(factory.pg.prechecked_absent)
+        cleanup = fixture.cleanup(1e18)
+        self.assertFalse(cleanup["postgres_dropped"])
+        self.assertFalse(cleanup["database_absent"])
+        self.assertFalse(cleanup["postgres_cleanup_verified"])
+        self.assertFalse(cleanup["cleanup_verified"])
+        self.assertFalse(cleanup["cleanup_ok"])
+        self.assertEqual(cleanup["error_code"], "cleanup_unresolved")
+        self.assertFalse(cleanup["postgres"]["dropped"])
+        self.assertTrue(cleanup["root"]["removed"])
         self.assertTrue(cleanup["root_removed"])
 
     def test_changed_database_identity_is_unresolved(self):
@@ -234,6 +310,8 @@ class OwnedFixtureTest(unittest.TestCase):
         self.assertEqual(cleanup["error_code"], "cleanup_deadline_exceeded")
         self.assertEqual(factory.fake.drop_sqls, [])
         self.assertTrue(Path(fixture.root_path).exists())
+        self.assertFalse(cleanup["postgres"]["dropped"])
+        self.assertFalse(cleanup["root"]["removed"])
         fixture.cleanup(1e18)
 
     def test_unresolved_root_removal_fails_cleanup(self):
