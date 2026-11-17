@@ -919,6 +919,36 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         self.assertTrue(process.stdout.closed)
         self.assertIsNone(server.process)
 
+    def test_late_server_reap_is_not_marked_stopped(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        group = FakeGroup()
+
+        class LateProcess(FakeProcess):
+            def wait(self, timeout=None):
+                self.waits.append(timeout)
+                self.clock.advance(timeout + 0.2)
+                self.group.leader_alive = False
+                self.group.child_alive = False
+                self.returncode = 0
+                return 0
+
+        process = LateProcess(clock=clock, group=group)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process), killpg=group.killpg)
+        server.process = process
+        server.owned_group = True
+        server.pgid = process.pid
+        clock.advance(79.9)
+        with self.assertRaises(QualificationError) as caught:
+            server.stop()
+        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
+        self.assertIs(server.process, process)
+        self.assertTrue(server.owned_group)
+        self.assertFalse(process.stdout.closed)
+
     def test_stop_ambiguous_group_is_never_marked_stopped(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,

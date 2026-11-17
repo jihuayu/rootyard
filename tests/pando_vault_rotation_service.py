@@ -374,6 +374,7 @@ class Server:
         if state == "absent":
             if not self._reap_leader(process, deadline):
                 raise QualificationError("server_stop_timeout", "cleanup")
+            self._require_stop()
             self._finish_stop(process)
             return True
         remaining = deadline - self._now()
@@ -389,6 +390,7 @@ class Server:
         if term_state == "absent":
             if not self._reap_leader(process, deadline):
                 raise QualificationError("server_stop_timeout", "cleanup")
+            self._require_stop()
             self._finish_stop(process)
             return True
         # The leader may exit here, but that does not prove its inherited Git
@@ -409,6 +411,7 @@ class Server:
             raise QualificationError("server_group_unverified", "cleanup")
         if state != "absent":
             raise QualificationError("server_group_alive", "cleanup")
+        self._require_stop()
         self._finish_stop(process)
         return True
 
