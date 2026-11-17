@@ -219,6 +219,247 @@ server logs and PostgreSQL logs in its printed run directory. Tests check:
   `hooks/pre-receive` fencing, `GET /repos/{id}.git/migration`, and safe
   post-switchover rollback with new commits (`rollback`) back to GitFS.
 
+## Qualification status (#21): authored, runtime NOT RUN
+
+**Runtime qualification is NOT RUN on this source.** This documentation change
+did not start Docker, Vault, PostgreSQL, Git/HTTP, the lab server or an exact-head
+product binary. Source review approval, formatting checks and pure oracle tests
+are not real Vault or PostgreSQL passes. The current CI workflow does not invoke
+the Vault harness or the 17-case producer gate described below.
+
+The required gate intent is an exact clean source commit/tree, the actual
+`rootyard-pando-lab` product artifact and its native-build receipt, no skip path,
+and a separate source-bound run of the Local-provider PostgreSQL producer cases.
+The report/projection adapter, the 17-case runner and all workflow wiring are
+still pending; no adapter or runner CLI is invented by this document.
+
+### Five real derived-Vault cases
+
+The actual fixture CLI on this source is `tests/pando_vault_rotation.py`. Its
+help accepts exactly these inputs:
+
+```sh
+python3 tests/pando_vault_rotation.py \
+  --binary "$ROOTYARD_PANDO_LAB_BIN" \
+  --receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
+  --source-root "$PWD" \
+  --expected-commit "$(git rev-parse HEAD)" \
+  --report test-results/pando-vault-rotation.json
+```
+
+`--expected-binary-sha256` is optional. The flags are `--receipt` and
+`--expected-commit`, not `--build-receipt` or `--expect-commit`. The harness
+loads the native receipt with implicit builds forbidden, proves the exact source
+commit/tree/clean state, binary and receipt identity, and rehashes source,
+binary, receipt and harness after execution. The canonical report schema is
+`rootyard/issue21-derived-vault-rotation/v1`; its `binding` field is nested and
+its cases use `id`, not `name`.
+
+The five authored IDs are mandatory and ordered:
+
+1. `vault_fixture_and_app_capability_boundary` — pinned derived
+   `aes256-gcm96` Vault key, app wrap/unwrap/rewrap works, app rotate/delete/
+   config/token/policy administration is denied, and the app cannot change the
+   master version.
+2. `authentic_envelope_digest_and_cold_read` — exact `PANDOENC` ciphertext,
+   manifest/DB envelope digest and length equality, no known plaintext marker,
+   evicted plaintext cache, cold `object-store-get`/`object-store-verify`/
+   `kms-verify`, and a cold stock-Git clone.
+3. `admin_rotated_target_interrupted_resume_and_new_write` — admin-created
+   existing Transit version 2, interrupted `--target-version 2` checkpoint,
+   version-1 readability at the midpoint, latest version 3 appearing during the
+   run, version-2 writes despite latest 3, `--resume`, completion, unchanged
+   ciphertext, and a post-completion version-2 write pin.
+4. `wrong_key_ciphertext_envelope_and_provider_revocation_fail_closed` — a
+   usable wrong scoped key, one-byte ciphertext tamper, DB MAC-only and
+   ciphertext-digest-only tamper, mirror corruption/removal repair from the DB
+   envelope, and final app-token revocation all fail closed without plaintext
+   cache or CAS/DB replacement.
+5. `owned_resource_cleanup` — stop and remove only the exact owned server,
+   Vault container, random database and private root, with identity verification
+   and no global prune/kill; unresolved cleanup fails the run.
+
+The fixture uses the pinned real Vault image with expected version 2.2.2 and a
+derived `aes256-gcm96` key. Its admin fixture alone creates master versions; the
+application token is scoped to key-metadata read plus encrypt/decrypt/rewrap.
+`min_decryption_version` remains 1 for the run, so the unrewrapped version-1
+pack must stay readable at the interrupted midpoint. The fixture creates version
+2, then latest version 3 while the checkpoint still targets 2.
+
+### Existing-target rotation and version pinning
+
+The Vault rotation contract is `existing-vault-version/v1`. It targets an
+already existing Transit version; the product and application do not call
+Transit rotate. The actual existing-target commands exercised by the authored
+case are:
+
+```sh
+"$ROOTYARD_PANDO_LAB_BIN" kms-status "$REPO"
+"$ROOTYARD_PANDO_LAB_BIN" kms-rotate "$REPO" --target-version 2 --fail-after-packs 1
+"$ROOTYARD_PANDO_LAB_BIN" kms-rotate "$REPO" --resume
+"$ROOTYARD_PANDO_LAB_BIN" kms-verify "$REPO"
+```
+
+The interruption must return nonzero and leave a DB-backed `IN_PROGRESS`
+checkpoint with `from_key_id == to_key_id`, target and expected version 2, the
+existing-target contract, positive `write_epoch`, one completed original pack
+and a different failed remaining pack. `kms-status` in Vault mode reports
+`policy: null`, `provider_latest_version` and the active rotation; it does not
+fabricate Local key entries.
+
+Both a remaining version-1 pack and a completed version-2 pack are cold-read at
+the midpoint. After another administrator rotation makes latest version 3, a new
+real push must use version 2, not 3. `--resume` must keep the same rotation
+identity/target, verify all current packs, include the new writer in the
+completed/target sets, and mark the checkpoint `COMPLETED`. A further push after
+completion must still use version 2 while latest remains 3. That durable pin is
+the single completed checkpoint with the highest positive `write_epoch`; an
+ambiguous maximum completed epoch fails closed. Legacy Local epoch-0 completion
+rows are not positive Vault pins.
+
+Only wrapping metadata changes during rotation. The exact stored ciphertext
+SHA-256 and length of every pre-existing and newly written pack must remain
+unchanged. Vault `--revoke-previous` is refused as unimplemented; the app never
+rotates the master key, so the administrator-created latest version must remain
+exactly 3.
+
+### DB envelope authority, mirror repair and cold-cache checks
+
+The complete pair of `pando_lab.object_store_manifests` and
+`pando_lab.kms_envelopes` rows is checked as authority for DB-backed
+publication/recovery and remote S3 reads. The local CAS path is narrower: a
+digest-matching warm pack/index cache returns `verified` before any DB envelope
+lookup. On a cold cache it reads and validates the local CAS manifest plus the
+exact stored ciphertext SHA-256/length, then loads the DB `kms_envelopes` record
+through the repository pack/index digests; it does not query
+`object_store_manifests`. The per-pack JSON at
+`$PANDO_ROOT/object_store/envelopes/<repo>/<pack>.json` is a post-commit mirror,
+not a fallback authority. The missing-DB-envelope/no-mirror-fallback failure
+applies to cold hydration (cache miss), where the DB envelope is loaded and a
+damaged or missing mirror is repaired best-effort; the verified file-only mirror
+path exists only for raw helpers without a DB client.
+
+Every cold negative probe evicts only the exact owned pack/index cache and
+asserts it remains absent after the failure. A cold read validates the immutable
+manifest digest, compares the exact stored ciphertext bytes to the manifest
+SHA-256/length, loads the authoritative DB envelope, validates its MAC and
+wrapped-key identity, decrypts, then rechecks plaintext SHA-256/length and pack
+object count before writing the cache. Corrupting only `envelope_mac`, changing
+only the DB ciphertext digest, flipping stored ciphertext, using a usable wrong
+scoped key, or revoking the app token must not create a plaintext cache, replace
+CAS bytes, or mutate committed DB authority. Because the fixture evicts before
+every provider probe, its cache/provider failure evidence is cold-hydration
+only; it does not establish warm-cache provider revocation or whole-KMS
+access-control runtime behavior.
+
+### Separate 17 Local PostgreSQL producer cases
+
+These are separate Local-provider PG contract tests, not additional Vault cases
+and not part of the Vault report. Exactly 17 ignored tests live in the
+existing `rootyard-pando-lab` bin unit-test harness; the normal CLI executable
+and the library-test target cannot select them. The intended mandatory gate runs
+each fully qualified name serially in the same PG17 job, in a separately owned
+random database initialized from `experimental/pando/schema.sql`, with
+`PANDO_OBJECT_STORE_ROOT`, `PANDO_KMS_KEYRING_DIR`, `PANDO_KMS_PROVIDER` and
+`ROOTYARD_OBJECT_STORE_ENDPOINT` absent before any DB/root creation. The
+existing Cargo bin-test executable is selected directly; no new Rust target is
+invented.
+
+Migration family (7):
+
+- `pando_lab::migration::pg_tests::pg_copy_authenticated_publication_commits_pair_rows_and_mirror_together`
+- `pando_lab::migration::pg_tests::pg_drain_authenticated_incremental_publication_is_atomic_and_targeted`
+- `pando_lab::migration::pg_tests::pg_publication_rollback_leaves_no_authority_rows_or_mirror`
+- `pando_lab::migration::pg_tests::pg_exact_preparation_retry_returns_same_physical_winner`
+- `pando_lab::migration::pg_tests::pg_stale_repository_generation_fails_before_commit`
+- `pando_lab::migration::pg_tests::pg_shared_gate_blocks_exclusive_rotation_and_stale_target_fails_cleanly`
+- `pando_lab::migration::pg_tests::pg_local_default_and_legacy_completed_epoch_zero_keep_raw_behavior`
+
+Repack family (5):
+
+- `pando_lab::repack::pg_tests::pg_repack_default_local_publishes_one_authority_and_retains_pinned_data`
+- `pando_lab::repack::pg_tests::pg_repack_generation_race_fails_cleanly_without_authority`
+- `pando_lab::repack::pg_tests::pg_repack_forced_final_failure_rolls_back_authority_and_mirror`
+- `pando_lab::repack::pg_tests::pg_repack_rotation_barrier_keeps_exact_target_and_shared_gate`
+- `pando_lab::repack::pg_tests::pg_repack_no_sync_local_legacy_and_active_target_narrow_reject`
+
+Snapshot family (5):
+
+- `pando_lab::store::snapshot_pg_tests::pg_snapshot_wins_retains_old_pack_before_insert`
+- `pando_lab::store::snapshot_pg_tests::pg_repack_wins_snapshot_selects_replacement_after_commit`
+- `pando_lab::store::snapshot_race_pg_tests::pg_snapshot_fault_rolls_back_without_token_and_releases_lock`
+- `pando_lab::store::snapshot_race_pg_tests::pg_snapshot_retention_uses_live_expiry_not_expired_rows`
+- `pando_lab::store::snapshot_race_pg_tests::pg_ordinary_snapshot_still_does_not_retain`
+
+One exact-name manual invocation on the existing Cargo target is:
+
+```sh
+cargo test --locked --features pando-lab --bin rootyard-pando-lab \
+  pando_lab::migration::pg_tests::pg_copy_authenticated_publication_commits_pair_rows_and_mirror_together \
+  -- --exact --ignored --test-threads=1
+```
+
+Repeat for each name. The intended CI gate resolves the same bin-test executable
+once from Cargo JSON and executes all 17 serially, then emits a source-bound
+report. That runner and its report are pending integration; this source has no
+merged producer-runner CLI, and a zero-test or missing-report run is a failure,
+never a pass. The tests cover the DB manifest/envelope pair,
+rollback and exact retry, generation/shared-gate fencing, completed-epoch
+behavior, repack authority/mirror rollback, pinned data, snapshot retention
+races and expiry; they do not establish remote S3, Vault or production behavior.
+
+### Resource and credential boundary
+
+The Vault fixture owns exactly one digest-pinned container with a random nonce,
+ownership labels, exact container ID/image reconciliation, a loopback-only
+ephemeral port and no persisted server logs. The admin root token stays in
+fixture memory; the app gets only its scoped Transit token. No token, DSN or
+password is placed in argv, ownership state or sanitized evidence. PostgreSQL
+uses a random owned database prechecked absent, the CI bootstrap DSN only for
+creation/bootstrap, and drops only the exact owned name/OID/owner. The private
+`PANDO_ROOT` is exact-owned and inode-verified before removal.
+
+The stock Git client runs with a filtered environment that excludes Vault
+variables, DB DSNs/passwords, admin tokens and injected Git/proxy/trace settings.
+The Pando server and native hooks retain only their own required app Vault/DB
+configuration; do not strip the server environment to imitate the Git-client
+filter. Psql uses its own connection environment and SQL stdin. Cleanup or
+identity uncertainty, an unknown create outcome, or a hard kill is unresolved
+failure, not cleanup success, and authorizes no global deletion.
+
+No raw server/container logs, `commands.json`, SQL result rows, environment
+dumps, provider bodies, tracebacks or pack/plaintext bytes are report artifacts.
+The report keeps only the fixed sanitized fields and rechecked binding hashes.
+
+### Remote S3 and claims boundary
+
+The five authored Vault cases exercise local CAS only; their report limitations
+include `local_cas_only` and `s3_rotation_unsupported`. This is not a blanket
+ban on S3. Normal standalone remote S3-compatible `object-store-put`,
+`object-store-get` and `object-store-verify` remain implemented, including
+verified remote manifest retrieval, DB envelope authority and best-effort
+mirror repair. The unsupported part is composition: `kms-rotate` refuses while
+`ROOTYARD_OBJECT_STORE_ENDPOINT` is enabled, the encrypted prepared Git-hook
+publication rejects the remote backend, and the migration prepared-publication
+and a compacted repack with object-store sync fail closed instead of mixing a
+remote staging step with local authority in one SQL transaction.
+
+No CloudHSM/HSM service, FIPS 140 validation, production durability/HA or
+security, or cross-process GC/destructive collection guarantee is claimed.
+Source-level zeroization is not an all-disk-at-rest or plaintext-erasure proof.
+
+### Not covered by the five authored cases
+
+The five IDs do not cover the original missing-DB-envelope-row probe: retain a
+valid mirror, remove the authoritative DB envelope row, and prove that a fresh
+cold consumer fails without mirror fallback. They also do not cover a valid
+scoped token that can read key metadata but is denied decrypt. The broader
+Astra matrix, every migration/repack/snapshot producer, remote S3 composition and
+a production environment remain outside these five cases.
+
+See the [KeyProvider and envelope contract](../../docs/key-provider.md) for the
+key-provider, DB-authority and envelope details.
+
 ## Online migration and rollback state machine
 
 1. `copy` (`migrate-step <repo> <gitfs_path> copy`): validates the source GitFS
