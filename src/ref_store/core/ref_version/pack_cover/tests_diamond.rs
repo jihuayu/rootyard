@@ -1,5 +1,6 @@
 //! Regression tests for diamond delta-base DAG memoization and bounded expansion work (Issue #184).
 use super::super::closure::{CausalVersionNode, VersionGraph};
+use super::super::contract::RefVersionRealm;
 use super::super::pack_set::{PackSetEntry, VerifiedClosurePack};
 use super::super::read_mode::ReadConsumer;
 use super::super::record::RefHead;
@@ -12,7 +13,7 @@ use super::retention_class::{CoverRetentionHold, RetentionClassificationIndex};
 use super::tests::{default_auth, make_pack, mint_version, oid, realm, seal_test_cover, uid};
 use super::verifier::verify_fetch_plan_closure;
 use crate::blob_store::BlobLocator;
-use crate::ref_store::contract::{RefVersionRealm, RequestDigest};
+use crate::ref_store::contract::RequestDigest;
 use crate::ref_store::core::types::{GitObjectFormat, GitOid, RefName};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
