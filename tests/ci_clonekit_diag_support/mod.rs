@@ -4,7 +4,7 @@
 //! `CloneKitError` classification.  It is shared by `tests/ci_clonekit.rs` and the pure
 //! contract test; the case body macro is expanded only by the former.
 
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, io::Write, rc::Rc};
 
 use rootyard::ci_checkouts::clonekit::CloneKitError;
 
@@ -170,28 +170,17 @@ impl Recorder {
         }
     }
 
-    pub(crate) fn typed_ck<T>(
+    /// Mark the phase, then evaluate one operation.  A panic therefore sees the marked phase;
+    /// a returned error is classified at this operation's own source checkpoint.
+    pub(crate) fn eager_anyhow<T>(
         &mut self,
         phase: Phase,
         file: &'static str,
         line: u32,
-        result: Result<T, CloneKitError>,
-    ) -> Result<T, CloneKitError> {
-        self.phase = phase;
-        if let Err(err) = &result {
-            self.record(phase, Class::from_ck(err), file, line);
-        }
-        result
-    }
-
-    pub(crate) fn typed_anyhow<T>(
-        &mut self,
-        phase: Phase,
-        file: &'static str,
-        line: u32,
-        result: anyhow::Result<T>,
+        operation: impl FnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        self.phase = phase;
+        self.mark(phase, file, line);
+        let result = operation();
         if let Err(err) = &result {
             let class = err.downcast_ref::<CloneKitError>().map(Class::from_ck).unwrap_or(Class::Other);
             self.record(phase, class, file, line);
@@ -199,20 +188,30 @@ impl Recorder {
         result
     }
 
-    /// Observe the one deliberately expected `Err`.  `Err` records nothing and remains success input;
-    /// only an unexpected `Ok` records `ASSERT`.
-    pub(crate) fn expected_err<T>(
+    /// CloneKitError-returning form of [`Self::eager_anyhow`].
+    pub(crate) fn eager_ck<T>(
         &mut self,
         phase: Phase,
         file: &'static str,
         line: u32,
-        result: Result<T, CloneKitError>,
+        operation: impl FnOnce() -> Result<T, CloneKitError>,
     ) -> Result<T, CloneKitError> {
-        self.phase = phase;
-        if result.is_ok() {
-            self.record(phase, Class::Assert, file, line);
+        self.mark(phase, file, line);
+        let result = operation();
+        if let Err(err) = &result {
+            self.record(phase, Class::from_ck(err), file, line);
         }
         result
+    }
+
+    /// Observe the final original `anyhow::Error` without changing it.  Typed CloneKit errors keep
+    /// their exact class; an untyped error in an assert phase is `ASSERT`, otherwise `OTHER`.
+    pub(crate) fn observe_final(&mut self, err: &anyhow::Error) {
+        let class = err
+            .downcast_ref::<CloneKitError>()
+            .map(Class::from_ck)
+            .unwrap_or_else(|| if self.phase.is_assert_phase() { Class::Assert } else { Class::Other });
+        self.record(self.phase, class, self.file, self.line);
     }
 
     #[allow(dead_code)] // used only by the separate pure contract test
@@ -250,7 +249,11 @@ impl Drop for Recorder {
         if let Some(observer) = &self.observer {
             observer.set(Some(frame));
         } else {
-            eprintln!(
+            // Best-effort, bounded stderr write.  A diagnostic I/O failure must not replace the
+            // test's original error or panic.
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
                 "ISSUE182_EMPTY_HISTORY phase={} class={} source={}:{}",
                 frame.phase.as_str(),
                 frame.class.as_str(),
@@ -263,103 +266,67 @@ impl Drop for Recorder {
 
 /// The exact empty/history case body, moved out of `tests/ci_clonekit.rs` to keep that source
 /// below its strict line contract.  The test wrapper retains the original name, attribute,
-/// inventory, fixtures, order, oracles, and `&&` short-circuit.
+/// inventory, fixtures, order, oracles, and `&&` short-circuit.  The inner async body returns
+/// the original `anyhow::Error` unchanged; only the outer boundary observes it.
 #[allow(unused_macros)] // exported for ci_clonekit; intentionally inert in the pure contract target
 #[macro_export]
 macro_rules! empty_history_case_body {
     () => {{
         let mut diag = crate::ck_diag::Recorder::new(file!(), line!());
         diag.mark(crate::ck_diag::Phase::Setup, file!(), line!());
-        let (td, ids) = (TempDir::new()?, (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()));
-        let vr = diag.typed_anyhow(crate::ck_diag::Phase::Setup, file!(), line!(), private_vr(&td))?;
-        let store = diag.typed_ck(
-            crate::ck_diag::Phase::Setup,
-            file!(),
-            line!(),
-            CloneKitPublicationStore::open(&td.path().join("cat")),
-        )?;
-        let empty = diag.typed_anyhow(
-            crate::ck_diag::Phase::EmptyBuildOrStatus,
-            file!(),
-            line!(),
-            init_repo(td.path(), "empty.git", Sha1),
-        )?;
-        diag.mark(crate::ck_diag::Phase::EmptyBuildOrStatus, file!(), line!());
-        anyhow::ensure!(
-            diag.typed_anyhow(
-                crate::ck_diag::Phase::EmptyBuildOrStatus,
-                file!(),
-                line!(),
-                build_kit(ids, Sha1, 1, &empty, &td, None, None),
-            )?
-            .manifest
-            .status
-                == CloneKitStatus::EmptyRepository
-        );
+        let result: anyhow::Result<()> = async {
+            let td = TempDir::new()?;
+            let ids = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+            let vr = diag.eager_anyhow(crate::ck_diag::Phase::Setup, file!(), line!(), || private_vr(&td))?;
+            let store = diag.eager_ck(crate::ck_diag::Phase::Setup, file!(), line!(), || {
+                CloneKitPublicationStore::open(&td.path().join("cat"))
+            })?;
+            let empty = diag.eager_anyhow(crate::ck_diag::Phase::EmptyBuildOrStatus, file!(), line!(), || {
+                init_repo(td.path(), "empty.git", Sha1)
+            })?;
+            diag.mark(crate::ck_diag::Phase::EmptyBuildOrStatus, file!(), line!());
+            anyhow::ensure!(
+                build_kit(ids, Sha1, 1, &empty, &td, None, None)?.manifest.status == CloneKitStatus::EmptyRepository
+            );
 
-        diag.mark(crate::ck_diag::Phase::ActiveBuild, file!(), line!());
-        let repo = diag.typed_anyhow(
-            crate::ck_diag::Phase::ActiveBuild,
-            file!(),
-            line!(),
-            init_repo(td.path(), "active", Sha1),
-        )?;
-        let c1 = diag.typed_anyhow(
-            crate::ck_diag::Phase::ActiveBuild,
-            file!(),
-            line!(),
-            add_commit(&repo, "a.txt", b"v1", "c1"),
-        )?;
-        diag.typed_anyhow(
-            crate::ck_diag::Phase::ActiveBuild,
-            file!(),
-            line!(),
-            build_kit(ids, Sha1, 1, &repo, &td, Some(&store), None),
-        )?;
-        let b2 = diag.typed_anyhow(
-            crate::ck_diag::Phase::CorruptBuild,
-            file!(),
-            line!(),
-            build_kit(ids, Sha1, 2, &repo, &td, None, Some(BuildFailurePoint::CorruptStagedPack)),
-        )?;
-        diag.mark(crate::ck_diag::Phase::CorruptPublicationPreservesLatest, file!(), line!());
-        anyhow::ensure!(
-            diag.expected_err(
-                crate::ck_diag::Phase::CorruptPublicationPreservesLatest,
-                file!(),
-                line!(),
-                publish_clonekit_versioned(&store, &b2, &git_binary(), None, None),
-            )
-            .is_err()
-                && diag
-                    .typed_ck(
-                        crate::ck_diag::Phase::CorruptPublicationPreservesLatest,
-                        file!(),
-                        line!(),
-                        store.load_latest(ids.1),
-                    )?
-                    .expect("latest")
-                    .kit_generation
-                    == 1
-        );
+            diag.mark(crate::ck_diag::Phase::ActiveBuild, file!(), line!());
+            let repo = diag.eager_anyhow(crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || {
+                init_repo(td.path(), "active", Sha1)
+            })?;
+            let c1 = diag.eager_anyhow(crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || {
+                add_commit(&repo, "a.txt", b"v1", "c1")
+            })?;
+            diag.eager_anyhow(crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || {
+                build_kit(ids, Sha1, 1, &repo, &td, Some(&store), None)
+            })?;
+            let b2 = diag.eager_anyhow(crate::ck_diag::Phase::CorruptBuild, file!(), line!(), || {
+                build_kit(ids, Sha1, 2, &repo, &td, None, Some(BuildFailurePoint::CorruptStagedPack))
+            })?;
+            diag.mark(crate::ck_diag::Phase::CorruptPublicationPreservesLatest, file!(), line!());
+            anyhow::ensure!(
+                publish_clonekit_versioned(&store, &b2, &git_binary(), None, None).is_err()
+                    && store.load_latest(ids.1)?.expect("latest").kit_generation == 1
+            );
 
-        diag.mark(crate::ck_diag::Phase::HistoryGrant, file!(), line!());
-        let (g_h2, c_h2) = diag.typed_anyhow(
-            crate::ck_diag::Phase::HistoryGrant,
-            file!(),
-            line!(),
-            make_grant((ids.0, ids.1, Uuid::new_v4()), Sha1, &c1, None, 1_750_000_000),
-        )?;
-        let (co, mem): (Co<'_>, Arc<dyn CloneKitAuthorityOracle>) =
-            (Co { store: Some(&store), ..Co::new(&vr) }, Arc::new(InMemoryAuthorityOracle::new()));
-        diag.mark(crate::ck_diag::Phase::HistoryCheckout, file!(), line!());
-        let run = co.run(&g_h2, &c_h2, &mem, pol(true, true), repo.to_str().expect("utf8"), None).await;
-        let res = diag.typed_ck(crate::ck_diag::Phase::HistoryCheckout, file!(), line!(), run)?;
-        diag.mark(crate::ck_diag::Phase::HistoryStrategy, file!(), line!());
-        anyhow::ensure!(
-            res.telemetry.strategy == CheckoutStrategy::StockGitFallback { reason: FallbackReason::KitHistoryMismatch }
-        );
-        diag.disarm();
-        Ok(())
+            let (g_h2, c_h2) = diag.eager_anyhow(crate::ck_diag::Phase::HistoryGrant, file!(), line!(), || {
+                make_grant((ids.0, ids.1, Uuid::new_v4()), Sha1, &c1, None, 1_750_000_000)
+            })?;
+            let (co, mem): (Co<'_>, Arc<dyn CloneKitAuthorityOracle>) =
+                (Co { store: Some(&store), ..Co::new(&vr) }, Arc::new(InMemoryAuthorityOracle::new()));
+            diag.mark(crate::ck_diag::Phase::HistoryCheckout, file!(), line!());
+            let res = co.run(&g_h2, &c_h2, &mem, pol(true, true), repo.to_str().expect("utf8"), None).await?;
+            diag.mark(crate::ck_diag::Phase::HistoryStrategy, file!(), line!());
+            anyhow::ensure!(
+                res.telemetry.strategy
+                    == CheckoutStrategy::StockGitFallback { reason: FallbackReason::KitHistoryMismatch }
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        match &result {
+            Ok(()) => diag.disarm(),
+            Err(err) => diag.observe_final(err),
+        }
+        result
     }};
 }
