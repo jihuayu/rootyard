@@ -440,11 +440,7 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     assert!(matches!(eng2.apply_push(spoof, dl).await, Err(GrowthEngineError::GitOps(GitOpsError::LimitExceeded(_)))));
 
     let err_git = |r| assert!(matches!(r, Err(GrowthEngineError::GitOps(_))));
-    let r2 = |r, o, n, p| {
-        let mut q = pr(r, o, n, p);
-        q.max_single_object_bytes = 512;
-        q
-    };
+    let r2 = |r, o, n, p| IncrementalPushRequest { max_single_object_bytes: 512, ..pr(r, o, n, p) };
     let (o_fail, p_fail, i_fail) = seed_one(&dir2, "fail", "f.txt", b"fail")?;
     let (o_win, p_win, i_win) = seed_one(&dir2, "win", "w.txt", b"win")?;
     let p_fail_sha = pack_meta(&p_fail, &i_fail)?.0;
@@ -490,7 +486,8 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     err_budget(eng3.apply_push(pr("refs/heads/main", &z, &o2, vec![(p2, i2)]), dl).await, "retained_packs");
     assert_eq!((eng3.failed_attempt_pack_locators().len(), eng3.snapshot().failed_attempt_count), (1, 1));
     let (c1, c2, c3_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    (eng3.cancel_operation(c1)?, eng3.cancel_operation(c2)?);
+    eng3.cancel_operation(c1)?;
+    eng3.cancel_operation(c2)?;
     err_budget(eng3.cancel_operation(c3_id), "cancel_tombstones");
     let r_c1 = eng3.apply_push(push_with(c1, "c1", "refs/heads/main", &z, &o1, vec![]), dl).await;
     assert!(matches!(r_c1, Err(GrowthEngineError::OperationCancelled(_))));
