@@ -171,16 +171,16 @@ async fn seed_repo(config: &Config, admin: &Client, repo: Uuid) -> Vec<Pack> {
     super::run_sync_git(&config.git, &work, &["config", "user.email", "t@e.c"], b"").unwrap();
 
     let c1 = commit_file(config, &work, "a.txt", "one\n", "c1");
-    let p1 = publish(config, admin, repo, &work, &[c1.clone()]).await;
+    let p1 = publish(config, admin, repo, &work, std::slice::from_ref(&c1)).await;
     set_ref(admin, repo, "refs/heads/main", &c1).await;
 
     let c2 = commit_file(config, &work, "b.txt", "two\n", "c2");
-    let p2 = publish(config, admin, repo, &work, &[c2.clone()]).await;
+    let p2 = publish(config, admin, repo, &work, std::slice::from_ref(&c2)).await;
     set_ref(admin, repo, "refs/heads/main", &c2).await;
 
     super::run_sync_git(&config.git, &work, &["checkout", "-b", "pin", &c1], b"").unwrap();
     let pin = commit_file(config, &work, "pin.txt", "pin\n", "pin");
-    let p3 = publish(config, admin, repo, &work, &[pin.clone()]).await;
+    let p3 = publish(config, admin, repo, &work, std::slice::from_ref(&pin)).await;
     admin
         .execute("INSERT INTO pando_lab.pinned_roots(repo,name,oid) VALUES($1,'ci-pin',$2)", &[&repo, &pin])
         .await
