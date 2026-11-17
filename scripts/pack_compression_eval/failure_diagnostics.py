@@ -18,6 +18,13 @@ from typing import Any
 
 from .capacity import sanitize_capacity
 from .cleanup_diagnostics import sanitize_cleanup
+from .concurrent_outcomes import (
+    FAILURE_CLASSES,
+    HTTP_SUBPHASES,
+    PHASES,
+    finite_http_subphase,
+    sanitize_concurrent_outcomes,
+)
 from .corpus import DATASET_ARCHETYPES, OBJECT_FORMATS
 from .pack_matrix import CANDIDATE_CONFIGS
 
@@ -26,28 +33,7 @@ FAILURE_STATUS = "failed"
 OBJECT_FORMAT_SET = frozenset(OBJECT_FORMATS)
 ARCHETYPE_SET = frozenset(DATASET_ARCHETYPES)
 CONFIG_SET = frozenset(("baseline",) + tuple(spec.name for spec in CANDIDATE_CONFIGS))
-PHASES = (
-    "baseline_seed_push",
-    "baseline_wave_push",
-    "candidate_push",
-    "concurrent_push",
-    "live_setup",
-    "ack_verification",
-    "cleanup",
-    "unknown",
-)
 PROGRESS_PHASES = PHASES + ("none", "baseline_reads", "candidate_reads")
-FAILURE_CLASSES = (
-    "git_push",
-    "git_timeout",
-    "git_spawn",
-    "popen_failed",
-    "exited_early",
-    "readiness_timeout",
-    "cleanup_failure",
-    "unclassified",
-)
-HTTP_SUBPHASES = ("unknown",)
 RECEIPT_SCHEMAS = frozenset(("rootyard/native-build-receipt/v2", "v1", "v2"))
 MODES = ("full", "git-only")
 SCALES = ("quick", "full")
@@ -102,6 +88,7 @@ _RECORD_FIELDS = (
     "completed",
     "s3",
     "bindings", "fixture_capacity",
+    "concurrent_worker_outcomes",
     "cleanup",
 )
 _HTTP_PATTERNS = (
@@ -301,6 +288,7 @@ def build_failure_record(
     completed: Any = None,
     s3: Any = None,
     bindings: Any = None, fixture_capacity: Any = None,
+    concurrent_worker_outcomes: Any = None,
     cleanup: Any = None,
 ) -> dict[str, Any]:
     """Build one fixed-schema failure record from source-known fields only."""
@@ -330,6 +318,7 @@ def build_failure_record(
         "completed": completed_counts(completed),
         "s3": sanitize_s3_snapshot(s3),
         "bindings": sanitize_bindings(bindings), "fixture_capacity": sanitize_capacity(fixture_capacity),
+        "concurrent_worker_outcomes": sanitize_concurrent_outcomes(concurrent_worker_outcomes),
         "cleanup": sanitize_cleanup(cleanup),
     }
 
@@ -384,6 +373,7 @@ def git_failure_record(
     """Build a push-boundary record; raw stderr is parsed and never retained."""
     values = context if isinstance(context, Mapping) else {}
     code, signal = child_outcome(returncode)
+    status = finite_http_status(stderr)
     return build_failure_record(
         phase=values.get("phase"),
         failure_class=failure_class,
@@ -396,7 +386,8 @@ def git_failure_record(
         branch_ordinal=values.get("branch_ordinal"),
         git_returncode=code,
         signal=signal,
-        http_status=finite_http_status(stderr),
+        http_status=status,
+        http_subphase=finite_http_subphase(stderr, status),
         elapsed_ms=elapsed_ms,
         completed=values.get("completed"),
         last_completed_phase=values.get("last_completed_phase"),

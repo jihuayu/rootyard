@@ -15,6 +15,7 @@ import uuid
 
 from .capacity import derive_capacity_envelope
 from .cleanup_diagnostics import remove_tree_checked, run_cleanup_steps
+from .concurrent_outcomes import collect_concurrent_outcomes
 from .corpus import (
     DATASET_ARCHETYPES,
     CommitSpec,
@@ -369,12 +370,8 @@ def run_live_serve_blob_eval(
             ms = push_with_pack_config(
                 git_bin, cdir, base_url + conc_target["repo"]["clone_path"], None, f"HEAD:{branch_ref}", conc_rw_env,
                 context=push_context(
-                    progress, "concurrent_push",
-                    archetype=conc_target["archetype"],
-                    object_format=conc_target["object_format"],
-                    config="baseline",
-                    repo_ordinal=0,
-                    branch_ordinal=bi,
+                    progress, "concurrent_push", archetype=conc_target["archetype"],
+                    object_format=conc_target["object_format"], config="baseline", repo_ordinal=0, branch_ordinal=bi,
                 ),
             )
             with conc_lock:
@@ -396,8 +393,9 @@ def run_live_serve_blob_eval(
         with ThreadPoolExecutor(max_workers=conc_branches + 1) as pool:
             futs = [pool.submit(_conc_push, bi) for bi in range(conc_branches)]
             bfut = pool.submit(_conc_browse_and_pg)
-            for fut in futs + [bfut]:
-                fut.result()
+            first_error = collect_concurrent_outcomes(futs, bfut, branch_count=conc_branches, progress=progress)
+        if first_error is not None:
+            raise first_error
 
         verified_acked = 0
         for clone_path, ref_name, exp_oid, _, ro_user, ro_tok in acked:
@@ -458,6 +456,7 @@ def run_live_serve_blob_eval(
                 completed=progress["completed"],
                 last_completed_phase=progress["last_completed_phase"],
                 bindings=bindings_from_receipt(receipt_info), fixture_capacity=fixture_capacity,
+                concurrent_worker_outcomes=progress.get("concurrent_worker_outcomes"),
             )
         ) from None
     except Exception:
@@ -469,6 +468,7 @@ def run_live_serve_blob_eval(
                 last_completed_phase=progress["last_completed_phase"],
                 s3=s3_snapshot(),
                 bindings=bindings_from_receipt(receipt_info), fixture_capacity=fixture_capacity,
+                concurrent_worker_outcomes=progress.get("concurrent_worker_outcomes"),
             )
         ) from None
     finally:

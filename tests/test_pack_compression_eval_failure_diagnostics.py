@@ -37,6 +37,7 @@ from pack_compression_eval.failure_diagnostics import (  # noqa: E402
     failure_path_for,
     failure_record_from_exception,
     finite_http_status,
+    finite_http_subphase,
     git_failure_record,
     safe_summary,
     sanitize_bindings,
@@ -134,6 +135,7 @@ class FiniteFailureDiagnosticsTest(unittest.TestCase):
             record["fixture_capacity"],
             {"concurrent_branches": None, "request_ceiling_bytes": None, "inflight_bytes": None},
         )
+        self.assertEqual(record["concurrent_worker_outcomes"], [])
         self.assertNotIn(SENTINEL, json.dumps(record, sort_keys=True))
         self.assertNotIn(SENTINEL, safe_summary(record))
 
@@ -246,6 +248,26 @@ class PushBoundaryFailureTest(unittest.TestCase):
             "last_completed_phase": "live_setup",
         }
 
+    def test_http_subphase_is_only_unambiguous(self) -> None:
+        self.assertEqual(finite_http_subphase(b"error: RPC failed; HTTP 503 curl 22", 503), "receive_pack")
+        self.assertEqual(
+            finite_http_subphase(
+                b"fatal: unable to access 'http://host/git/o/r.git/info/refs?service=git-receive-pack': "
+                b"The requested URL returned error: 503",
+                503,
+            ),
+            "info_refs",
+        )
+        self.assertEqual(
+            finite_http_subphase(
+                b"fatal: unable to access 'http://host/git/o/r.git': The requested URL returned error: 503",
+                503,
+            ),
+            "unknown",
+        )
+        self.assertEqual(finite_http_subphase(b"info/refs?service=git-receive-pack", None), "unknown")
+        self.assertEqual(finite_http_subphase(None, 503), "unknown")
+
     def test_push_failure_keeps_finite_context_and_never_raw_stderr(self) -> None:
         fake = subprocess.CompletedProcess(
             args=[SENTINEL],
@@ -280,6 +302,23 @@ class PushBoundaryFailureTest(unittest.TestCase):
         self.assertEqual(record["last_completed_phase"], "live_setup")
         self.assertNotIn(SENTINEL, json.dumps(record, sort_keys=True))
         self.assertNotIn(SENTINEL, str(caught.exception))
+
+    def test_push_failure_classifies_unambiguous_subphase(self) -> None:
+        fake = subprocess.CompletedProcess(
+            args=["git", "push"],
+            returncode=128,
+            stdout=b"",
+            stderr=b"error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503\n",
+        )
+        with mock.patch.object(live_server, "run_git", return_value=(fake, 12.5)):
+            with self.assertRaises(LiveEvalFailure) as caught:
+                live_server.push_with_pack_config(
+                    "git", Path("/tmp"), "http://example.invalid/repo", None, "HEAD:main", {},
+                    context=self.context(),
+                )
+        self.assertEqual(caught.exception.record["http_status"], 503)
+        self.assertEqual(caught.exception.record["http_subphase"], "receive_pack")
+        self.assertNotIn("curl", json.dumps(caught.exception.record, sort_keys=True))
 
     def test_push_timeout_and_spawn_are_classified_safely(self) -> None:
         with mock.patch.object(live_server, "run_git", side_effect=subprocess.TimeoutExpired(SENTINEL, 180)):
