@@ -22,9 +22,11 @@ jobs:
     runs-on: ubuntu-22.04
     # Job cap with bounded headroom for the three populated RefStore/artifact-hold
     # backup drills below: their step caps grow from 5 to 10 minutes each, so the
-    # worst case added here is 3 x 5 = 15 minutes. Keep this bounded; raising it
-    # further must not be used to hide a regression inside one individual step.
-    timeout-minutes: 75
+    # worst case added here is 3 x 5 = 15 minutes. Issue #21 adds one bounded
+    # 10-minute Local PostgreSQL producer step, so this checkpoint cap is
+    # 75 + 10 = 85. Keep this bounded; raising it further must not be used to
+    # hide a regression inside one individual step.
+    timeout-minutes: 85
     services:
       postgres:
         image: postgres:17
@@ -180,8 +182,18 @@ jobs:
             --bin rootyard-pando-lab=ROOTYARD_PANDO_LAB_BIN \
             --bin rootyard-vfs-mount=ROOTYARD_VFS_MOUNT_BIN \
             --bin-receipt rootyard=ROOTYARD_BUILD_RECEIPT \
+            --bin-receipt rootyard-pando-lab=ROOTYARD_PANDO_BUILD_RECEIPT \
             --test ref_store_snapshot_backup_fixture=ROOTYARD_SNAPSHOT_FIXTURE \
             --test ref_store_holds_backup_fixture=ROOTYARD_HOLDS_FIXTURE
+      - name: Run the 17 ignored Pando Local PostgreSQL producer cases
+        timeout-minutes: 10
+        run: |
+          python3 scripts/run_pando_producer_pg.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --expected-commit "$GITHUB_SHA" \
+            --product-receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
+            --report test-results/pando-producer-pg.json \
+            --timeout-seconds 540
       - name: Exercise trusted CI HTTP authority boundaries
         timeout-minutes: 10
         run: python3 tests/ci_trust_boundaries.py --binary "$ROOTYARD_BIN" --report test-results/ci-trust-boundaries.json --expected-commit "$GITHUB_SHA"
@@ -605,7 +617,9 @@ jobs:
           path: |
             test-results/*.json
             ${{ env.ROOTYARD_BUILD_RECEIPT }}
+            ${{ env.ROOTYARD_PANDO_BUILD_RECEIPT }}
             ${{ env.ROOTYARD_BATCH_MANIFEST }}
+            test-results/pando-producer-pg.json
             test-results/ci-webhook-regressions.log
             test-results/evidence/*.jsonl
             test-results/*-evidence/*.jsonl
