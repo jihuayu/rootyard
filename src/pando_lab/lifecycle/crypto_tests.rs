@@ -2,7 +2,9 @@ use super::super::data_key::PandoDataKey;
 use super::super::provider::{PandoKeyProvider, PandoKmsProvider};
 use super::super::wrapped_dek::PandoWrappedDek;
 use super::*;
-use rootyard::blob_store::key_provider::{KeyId, KeyProviderCapabilities, KeyProviderError};
+use rootyard::blob_store::key_provider::{
+    DataKey, KeyId, KeyProvider, KeyProviderCapabilities, KeyProviderError, WrappedKey,
+};
 
 #[derive(Debug)]
 struct PlaintextFallbackProvider(KeyId);
