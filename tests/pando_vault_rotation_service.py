@@ -126,9 +126,11 @@ class Server:
     """One exact-owned Pando HTTP server under the shared absolute deadline."""
 
     MAX_LINE = 4096
+    MAX_ANNOUNCEMENT = MAX_LINE
 
     def __init__(self, binary, environment, runner=None, budget=None,
-                 clock=None, popen=None, killpg=None):
+                 clock=None, popen=None, killpg=None, select_fn=None,
+                 read_fn=None, set_blocking_fn=None):
         self.binary = str(binary)
         self.environment = dict(environment)
         self.runner = runner
@@ -137,8 +139,13 @@ class Server:
         self.process = None
         self.base = None
         self.owned_group = False
+        self.pgid = None
+        self.stdout_fd = None
         self._popen = popen or subprocess.Popen
         self._killpg = killpg or os.killpg
+        self._select = select_fn or select.select
+        self._read = read_fn or os.read
+        self._set_blocking = set_blocking_fn or os.set_blocking
 
     def _now(self):
         return self.clock() if self.clock is not None else time.monotonic()
@@ -165,7 +172,17 @@ class Server:
 
     def start(self, timeout=45):
         require(self.process is None, "server_already_started", "server")
-        effective = self._clamp(timeout, "server")
+        if self.budget is not None and self.budget.in_cleanup:
+            raise QualificationError("work_deadline_exceeded", "server")
+        if self.budget is not None:
+            remaining = self.budget.remaining_work()
+            if remaining <= 0:
+                self.budget.require("server")
+            effective = min(float(timeout), remaining)
+            startup_deadline = self.budget.work_deadline
+        else:
+            effective = float(timeout)
+            startup_deadline = None
         try:
             process = self._popen(
                 [self.binary, "serve"],
@@ -173,72 +190,119 @@ class Server:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
-                bufsize=1,
+                text=False,
+                bufsize=0,
                 start_new_session=True,
             )
         except OSError:
             raise QualificationError("server_start_failed", "server") from None
         # The parent retains the handle and group ownership immediately after
-        # Popen and before any await/read/start join.
+        # Popen and before any await/read.  The leader is deliberately not
+        # polled or reaped here: its PGID is the owned-group fence used by stop.
         self.process = process
         self.owned_group = True
+        self.pgid = getattr(process, "pid", None)
         try:
+            if (not isinstance(self.pgid, int) or self.pgid <= 0
+                    or self.pgid == os.getpid()):
+                raise QualificationError("server_group_unverified", "server")
+            stream = getattr(process, "stdout", None)
+            if stream is None:
+                raise QualificationError("server_start_failed", "server")
+            try:
+                fd = stream.fileno()
+            except (OSError, ValueError, AttributeError):
+                raise QualificationError("server_start_failed", "server") from None
+            if not isinstance(fd, int) or fd < 0:
+                raise QualificationError("server_start_failed", "server")
+            self.stdout_fd = fd
+            try:
+                self._set_blocking(fd, False)
+            except (OSError, ValueError, TypeError):
+                raise QualificationError("server_start_failed", "server") from None
             self._late("server")
-        except Exception:
+            deadline = self._now() + effective
+            if startup_deadline is not None:
+                deadline = min(deadline, startup_deadline)
+            buffer = bytearray()
+            while True:
+                remaining = deadline - self._now()
+                if remaining <= 0:
+                    raise QualificationError("server_start_timeout", "server")
+                if self.budget is not None:
+                    self.budget.require("server")
+                ready, _, _ = self._select(
+                    [fd], [], [], min(0.2, remaining))
+                self._late("server")
+                remaining = deadline - self._now()
+                if remaining <= 0:
+                    raise QualificationError("server_start_timeout", "server")
+                if not ready:
+                    continue
+                capacity = self.MAX_ANNOUNCEMENT - len(buffer)
+                if capacity <= 0:
+                    raise QualificationError(
+                        "server_announcement_invalid", "server")
+                try:
+                    chunk = self._read(fd, min(capacity, 4096))
+                except BlockingIOError:
+                    continue
+                except (OSError, ValueError, TypeError):
+                    raise QualificationError(
+                        "server_start_failed", "server") from None
+                self._late("server")
+                if not isinstance(chunk, (bytes, bytearray)):
+                    raise QualificationError(
+                        "server_start_failed", "server")
+                if len(chunk) == 0:
+                    raise QualificationError("server_exited", "server")
+                buffer.extend(chunk)
+                if len(buffer) > self.MAX_ANNOUNCEMENT:
+                    raise QualificationError(
+                        "server_announcement_invalid", "server")
+                newline = buffer.find(b"\n")
+                if newline < 0:
+                    continue
+                if newline + 1 != len(buffer):
+                    raise QualificationError(
+                        "server_announcement_invalid", "server")
+                try:
+                    text = bytes(buffer[:newline]).decode("ascii")
+                except UnicodeDecodeError:
+                    raise QualificationError(
+                        "server_announcement_invalid", "server") from None
+                port = self._parse_announcement(text)
+                self._late("server")
+                self.base = "http://127.0.0.1:" + str(port)
+                return self.base
+        except QualificationError:
             self._stop_quietly()
             raise
-        stream = getattr(process, "stdout", None)
-        if stream is None:
+        except Exception:
             self._stop_quietly()
-            raise QualificationError("server_start_failed", "server")
-        deadline = self._now() + effective
-        if self.budget is not None:
-            deadline = min(deadline, self.budget.deadline)
-        while self._now() < deadline:
-            if process.poll() is not None:
-                self._stop_quietly()
-                raise QualificationError("server_exited", "server")
-            wait = min(0.2, max(0.0, deadline - self._now()))
-            ready, _, _ = select.select([stream], [], [], wait)
-            if not ready:
-                continue
-            line = stream.readline(self.MAX_LINE)
-            if not line:
-                if process.poll() is not None:
-                    self._stop_quietly()
-                    raise QualificationError("server_exited", "server")
-                continue
-            if len(line) >= self.MAX_LINE and not line.endswith("\n"):
-                self._stop_quietly()
-                raise QualificationError("server_announcement_invalid", "server")
-            if not line.startswith("LISTEN "):
-                try:
-                    self._late("server")
-                except Exception:
-                    self._stop_quietly()
-                    raise
-                continue
-            value = line.split(" ", 1)[1].strip()
-            try:
-                parsed = urllib.parse.urlsplit(value)
-                port = parsed.port
-            except ValueError:
-                self._stop_quietly()
-                raise QualificationError("server_announcement_invalid", "server") from None
-            if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
-                    or not port or parsed.path not in ("", "/")):
-                self._stop_quietly()
-                raise QualificationError("server_announcement_invalid", "server")
-            try:
-                self._late("server")
-            except Exception:
-                self._stop_quietly()
-                raise
-            self.base = "http://127.0.0.1:" + str(port)
-            return self.base
-        self._stop_quietly()
-        raise QualificationError("server_start_timeout", "server")
+            raise QualificationError("server_start_failed", "server") from None
+
+    def _parse_announcement(self, text):
+        """Accept only the exact known LISTEN record, never arbitrary text."""
+        if not text.startswith("LISTEN "):
+            raise QualificationError("server_announcement_invalid", "server")
+        value = text[len("LISTEN "):]
+        if (not value or value != value.strip()
+                or any(char.isspace() for char in value)):
+            raise QualificationError("server_announcement_invalid", "server")
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            port = parsed.port
+        except ValueError:
+            raise QualificationError(
+                "server_announcement_invalid", "server") from None
+        if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
+                or not port or not 1 <= port <= 65535
+                or parsed.path not in ("", "/")
+                or parsed.query or parsed.fragment
+                or parsed.username is not None or parsed.password is not None):
+            raise QualificationError("server_announcement_invalid", "server")
+        return port
 
     def _signal(self, process, sig):
         pgid = getattr(process, "pid", None)

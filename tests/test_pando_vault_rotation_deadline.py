@@ -481,12 +481,12 @@ class RetainedWriterCleanupTest(unittest.TestCase):
 
 
 class FakeStream:
-    def __init__(self, lines=()):
-        self.lines = list(lines)
+    def __init__(self, fd=99):
+        self.fd = fd
         self.closed = False
 
-    def readline(self, _limit):
-        return self.lines.pop(0) if self.lines else ""
+    def fileno(self):
+        return self.fd
 
     def close(self):
         self.closed = True
@@ -495,11 +495,14 @@ class FakeStream:
 class FakeProcess:
     """A fake Popen handle; no OS process or thread is created."""
 
-    def __init__(self, pid=4321, lines=(), returncode=None):
+    def __init__(self, pid=4321, returncode=None, clock=None,
+                 advance_on_timeout=False):
         self.pid = pid
-        self.stdout = FakeStream(lines)
+        self.stdout = FakeStream()
         self.returncode = returncode
         self.waits = []
+        self.clock = clock
+        self.advance_on_timeout = advance_on_timeout
 
     def poll(self):
         return self.returncode
@@ -507,6 +510,8 @@ class FakeProcess:
     def wait(self, timeout=None):
         self.waits.append(timeout)
         if self.returncode is None:
+            if self.advance_on_timeout and self.clock is not None:
+                self.clock.advance(timeout)
             raise subprocess.TimeoutExpired(["lab"], timeout)
         return self.returncode
 
@@ -522,8 +527,10 @@ class FakePopen:
         self.process = process
         self.kwargs = None
         self.argv = None
+        self.calls = 0
 
     def __call__(self, argv, **kwargs):
+        self.calls += 1
         self.argv = list(argv)
         self.kwargs = dict(kwargs)
         return self.process
@@ -541,23 +548,186 @@ class FakeKillpg:
             self.process.returncode = 0 if sig == signal.SIGTERM else -9
 
 
+class FakeRead:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.calls = []
+
+    def __call__(self, fd, size):
+        self.calls.append((fd, size))
+        if not self.chunks:
+            raise AssertionError("unexpected read")
+        item = self.chunks.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+class FakeSelect:
+    def __init__(self, clock=None, advance=0.0, ready=True):
+        self.clock = clock
+        self.advance = advance
+        self.ready = ready
+        self.calls = []
+
+    def __call__(self, read_list, _write_list, _error_list, timeout):
+        self.calls.append((list(read_list), timeout))
+        if self.clock is not None and self.advance:
+            self.clock.advance(self.advance)
+        if self.ready:
+            return (list(read_list), [], [])
+        return ([], [], [])
+
+
+def _server_for_start(clock, budget, process, read_chunks,
+                      advance=0.0, ready=True):
+    popen = FakePopen(process)
+    reader = FakeRead(read_chunks)
+    selector = FakeSelect(clock=clock, advance=advance, ready=ready)
+    server = service.Server(
+        "/bin/lab", {}, budget=budget, clock=clock,
+        popen=popen, killpg=FakeKillpg(process, exit_on=(signal.SIGTERM,)),
+        select_fn=selector, read_fn=reader,
+        set_blocking_fn=lambda _fd, _flag: None)
+    return server, popen, reader, selector
+
+
 class ServerProcessBoundaryTest(unittest.TestCase):
-    def test_start_owns_group_and_returns_bounded_loopback_announcement(self):
+    def test_start_owns_group_and_reads_a_bounded_announcement(self):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess(
-            lines=["LISTEN http://127.0.0.1:9000\n"])
-        popen = FakePopen(process)
-        with mock.patch.object(
-                service.select, "select",
-                return_value=([process.stdout], [], [])):
-            server = service.Server(
-                "/bin/lab", {}, budget=budget, clock=clock,
-                popen=popen, killpg=FakeKillpg(process))
-            self.assertEqual(server.start(), "http://127.0.0.1:9000")
+        process = FakeProcess()
+        server, popen, reader, selector = _server_for_start(
+            clock, budget, process,
+            [b"LISTEN http://127.0.0.1:9000\n"])
+        self.assertEqual(server.start(), "http://127.0.0.1:9000")
         self.assertTrue(popen.kwargs["start_new_session"])
+        self.assertFalse(popen.kwargs.get("text", False))
+        self.assertEqual(popen.kwargs.get("bufsize"), 0)
         self.assertEqual(popen.argv, ["/bin/lab", "serve"])
+        self.assertEqual(reader.calls, [(process.stdout.fd, 4096)])
+        self.assertLessEqual(selector.calls[0][1], 0.2)
+        self.assertEqual(process.waits, [])
+
+    def test_partial_no_newline_live_writer_regains_control_at_startup_d(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess()
+        reader = FakeRead([b"LISTEN http://127.0.0.1:9000"])
+        select_calls = []
+
+        def selector(read_list, _write_list, _error_list, timeout):
+            select_calls.append((list(read_list), timeout))
+            if len(select_calls) == 1:
+                return (list(read_list), [], [])
+            # The live writer never completes the line.  This readiness wait
+            # consumes the remaining startup slice without a blocking readline.
+            clock.advance(46.0)
+            return ([], [], [])
+
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=FakePopen(process),
+            killpg=FakeKillpg(process, exit_on=(signal.SIGTERM,)),
+            select_fn=selector, read_fn=reader,
+            set_blocking_fn=lambda _fd, _flag: None)
+        with self.assertRaises(QualificationError) as caught:
+            server.start()
+        self.assertEqual(caught.exception.code, "server_start_timeout")
+        self.assertEqual(reader.calls, [(process.stdout.fd, 4096)])
+        self.assertEqual(len(select_calls), 2)
+        self.assertLessEqual(select_calls[1][1], 0.2)
+        self.assertIsNone(server.process)
+
+    def test_eof_and_malformed_announcements_fail_closed(self):
+        for chunks, code in (
+            ([b""], "server_exited"),
+            ([b"HELLO\n"], "server_announcement_invalid"),
+            ([b"LISTEN http://0.0.0.0:9000\n"],
+             "server_announcement_invalid"),
+            ([b"LISTEN http://127.0.0.1:9000/extra\n"],
+             "server_announcement_invalid"),
+            ([b"LISTEN http://127.0.0.1:9000?x=1\n"],
+             "server_announcement_invalid"),
+            ([b"LISTEN http://user@127.0.0.1:9000\n"],
+             "server_announcement_invalid"),
+            ([b"LISTEN http://127.0.0.1:9000\nX"],
+             "server_announcement_invalid"),
+        ):
+            with self.subTest(chunks=chunks):
+                clock = Clock()
+                budget = Budget(100, 20, clock=clock,
+                                error_factory=QualificationError)
+                process = FakeProcess()
+                server, _popen, _reader, _selector = _server_for_start(
+                    clock, budget, process, list(chunks))
+                with self.assertRaises(QualificationError) as caught:
+                    server.start()
+                self.assertEqual(caught.exception.code, code)
+                self.assertIsNone(server.process)
+
+    def test_announcement_overflow_fails_without_a_second_read(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess()
+        server, _popen, reader, _selector = _server_for_start(
+            clock, budget, process, [b"x" * service.Server.MAX_ANNOUNCEMENT])
+        with self.assertRaises(QualificationError) as caught:
+            server.start()
+        self.assertEqual(caught.exception.code, "server_announcement_invalid")
+        self.assertEqual(len(reader.calls), 1)
+        self.assertLessEqual(reader.calls[0][1], 4096)
+        self.assertIsNone(server.process)
+
+    def test_expired_budget_and_cleanup_phase_never_start_popen(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess()
+        server, popen, _reader, _selector = _server_for_start(
+            clock, budget, process, [])
+        clock.advance(80)
+        with self.assertRaises(QualificationError) as caught:
+            server.start()
+        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
+        self.assertEqual(popen.calls, 0)
+
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        budget.begin_cleanup()
+        process = FakeProcess()
+        server, popen, _reader, _selector = _server_for_start(
+            clock, budget, process, [])
+        with self.assertRaises(QualificationError) as caught:
+            server.start()
+        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
+        self.assertEqual(popen.calls, 0)
+
+    def test_late_complete_announcement_is_not_success(self):
+        clock = Clock()
+        budget = Budget(100, 20, clock=clock,
+                        error_factory=QualificationError)
+        process = FakeProcess()
+
+        class LateRead:
+            def __call__(self, _fd, _size):
+                clock.advance(81)
+                return b"LISTEN http://127.0.0.1:9000\n"
+
+        selector = FakeSelect(clock=clock, ready=True)
+        popen = FakePopen(process)
+        server = service.Server(
+            "/bin/lab", {}, budget=budget, clock=clock,
+            popen=popen, killpg=FakeKillpg(process, exit_on=(signal.SIGTERM,)),
+            select_fn=selector, read_fn=LateRead(),
+            set_blocking_fn=lambda _fd, _flag: None)
+        with self.assertRaises(QualificationError) as caught:
+            server.start()
+        self.assertEqual(caught.exception.code, "work_deadline_exceeded")
 
     def test_stop_signals_kills_reaps_and_closes_the_exact_group(self):
         clock = Clock()
@@ -631,19 +801,14 @@ class ServerProcessBoundaryTest(unittest.TestCase):
         clock = Clock()
         budget = Budget(100, 20, clock=clock,
                         error_factory=QualificationError)
-        process = FakeProcess(lines=["x" * service.Server.MAX_LINE])
-        killpg = FakeKillpg(process, exit_on=(signal.SIGTERM,))
-        with mock.patch.object(
-                service.select, "select",
-                return_value=([process.stdout], [], [])):
-            server = service.Server(
-                "/bin/lab", {}, budget=budget, clock=clock,
-                popen=FakePopen(process), killpg=killpg)
-            with self.assertRaises(QualificationError) as caught:
-                server.start()
+        process = FakeProcess()
+        server, _popen, _reader, _selector = _server_for_start(
+            clock, budget, process,
+            [b"x" * service.Server.MAX_ANNOUNCEMENT])
+        with self.assertRaises(QualificationError) as caught:
+            server.start()
         self.assertEqual(caught.exception.code, "server_announcement_invalid")
-        self.assertEqual(killpg.calls, [(process.pid, signal.SIGTERM)])
-        self.assertTrue(process.stdout.closed)
+        self.assertIsNone(server.process)
 
 
 class ExpiredInputValidationTest(unittest.TestCase):
