@@ -62,6 +62,9 @@ impl CoverHierarchyIndex {
     pub fn is_retired_from_active(&self, cover_id: &Uuid) -> bool {
         self.retired_from_active.contains(cover_id)
     }
+    pub fn cover_count(&self) -> usize {
+        self.covers.len()
+    }
     pub fn all_covers(&self) -> impl Iterator<Item = &CoverHierarchyRecord> {
         self.covers.values()
     }
