@@ -32,9 +32,13 @@ Every key is built by `CacheKey::new` and contains:
 ry:cache:v2:{environment}:{authority}:{schema}:{history_incarnation}:{tenant}:{repo}:{kind}:{version}:{digest}
 ```
 
-Both `environment` (from `ROOTYARD_CACHE_ENVIRONMENT`, default `"serving"`) and
-`authority` (`gitfs`, `pando`, `git-native`) are validated lowercase ASCII
-scope tokens. In `src/browse/cache.rs`, `history_incarnation` hashes the
+Both `environment` (from `ROOTYARD_CACHE_ENVIRONMENT`) and `authority`
+(`gitfs`, `pando`, `git-native`) are validated lowercase ASCII scope tokens.
+`environment` defaults to `"serving"` only when the variable is absent. A
+present empty, malformed, overlong, uppercase, or non-Unicode value fails
+closed before any cache read or write; it is never substituted with the
+default, and the raw value is not echoed in the fixed service-unavailable
+error. In `src/browse/cache.rs`, `history_incarnation` hashes the
 volume ID, repository ID, authority, `object_format`, and `backend_transition_epoch`,
 while `version` carries PostgreSQL `storage_generation`. Any backend switch,
 format transition, or generation bump moves keys to a disjoint namespace without
@@ -66,7 +70,7 @@ durable PG/Ref-CAS reservation.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ROOTYARD_CACHE_BACKEND` | `memory` | `memory` (default, no Redis dependency) or `redis` (`state-redis` required) |
-| `ROOTYARD_CACHE_ENVIRONMENT` | `serving` | Optional validated scope token isolating environment namespaces |
+| `ROOTYARD_CACHE_ENVIRONMENT` | `serving` only when absent | Optional validated scope token; a present invalid or non-Unicode value fails closed before cache access |
 | `ROOTYARD_CACHE_MAX_ENTRIES` | `4096` | Memory entry cap (Memory only) |
 | `ROOTYARD_CACHE_MAX_BYTES` | `67108864` | Memory byte cap, key + encoded value (Memory only) |
 | `ROOTYARD_CACHE_MAX_VALUE_BYTES` | `1048576` | Per-value cap for Memory and Redis |
