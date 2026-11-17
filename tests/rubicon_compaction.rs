@@ -26,9 +26,11 @@ use tempfile::TempDir;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+type S3Objects = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
+
 struct LoopbackS3 {
     endpoint: String,
-    objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    objects: S3Objects,
 }
 
 static SHARED_S3: OnceLock<LoopbackS3> = OnceLock::new();
@@ -97,7 +99,7 @@ impl LoopbackS3 {
     }
 }
 
-async fn handle_s3(State(objs): State<Arc<Mutex<BTreeMap<String, Vec<u8>>>>>, m: Method, u: Uri, b: Bytes) -> Response {
+async fn handle_s3(State(objs): State<S3Objects>, m: Method, u: Uri, b: Bytes) -> Response {
     let key = u.path().trim_start_matches('/').to_owned();
     if !key.contains('/') {
         return Response::new(Body::from("<ListBucketResult/>"));
