@@ -1,0 +1,120 @@
+name: Workspace Merkle sync verification
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/workspace-merkle-sync.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'src/workspace_lab.rs'
+      - 'src/workspace_lab/merkle_sync.rs'
+      - 'src/workspace_lab/merkle_sync/**'
+      - 'tests/workspace_merkle_sync.rs'
+      - 'tests/test_workspace_merkle_sync_contracts.py'
+      - 'scripts/eval_workspace_merkle_sync.py'
+      - 'docs/workspace-merkle-sync.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workspace-merkle-sync-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-merkle-sync:
+    name: Workspace Merkle Sync Verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify formatting, design docs, and offline contracts
+        run: |
+          set -euo pipefail
+          git --version
+          python3 scripts/check_design_docs.py
+          python3 -m unittest -v \
+            tests.test_ci_workflow_triggers \
+            tests.test_ci_cargo_fork_workflows \
+            tests.test_workspace_merkle_sync_contracts
+
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && rustfmt -V && cargo clippy -V
+
+      - name: Restore pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/workspace-merkle-sync/ci-cargo-fork.json
+
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting and Clippy (-D warnings)
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --locked --no-default-features --lib --test workspace_merkle_sync -- -D warnings
+
+      - name: Run Merkle sync unit tests (-D warnings)
+        env:
+          RUSTFLAGS: '-D warnings'
+        run: cargo test --locked --no-default-features --lib workspace_lab::merkle_sync
+
+      - name: Run OpenDAL S3 Merkle sync integration & adversarial tests (-D warnings)
+        env:
+          RUSTFLAGS: '-D warnings'
+        run: cargo test --locked --no-default-features --test workspace_merkle_sync
+
+      - name: Run reproducible full vs incremental benchmark evaluation
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/workspace-merkle-sync
+          python3 scripts/eval_workspace_merkle_sync.py \
+            --profiles small,medium \
+            --formats sha1,sha256 \
+            --json-out test-results/workspace-merkle-sync/eval-report.json
+
+      - name: Upload Issue #181 test and benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-merkle-sync-evidence
+          path: test-results/workspace-merkle-sync/
+          if-no-files-found: error
