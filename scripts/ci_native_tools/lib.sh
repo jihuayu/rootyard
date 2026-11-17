@@ -93,7 +93,8 @@ prepare_pgdg_repository() {
   require_command gpg
   mkdir -p -- "$work"
   if [ ! -s "$keyring" ]; then
-    curl -fsSL --retry 3 \
+    curl -fsSL --retry 3 --retry-all-errors \
+      --connect-timeout 10 --max-time 20 --retry-max-time 60 \
       https://www.postgresql.org/media/keys/ACCC4CF8.asc \
       -o "$work/pgdg.asc"
     fingerprint=$(gpg --show-keys --with-colons "$work/pgdg.asc" |
