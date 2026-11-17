@@ -8,12 +8,16 @@ result semantics:
 
 * discover the existing ``tests/test_*.py`` set, in unittest order;
 * restore the repository-root import context used by ``python -m unittest``;
+* install the stdlib fatal-signal handler before discovery, so a fatal signal
+  still writes an all-thread Python stack;
+* leave an already-installed process-global handler untouched, and remove only
+  the handler this run installed on exit;
 * run verbosely, keeping normal test-count, skip and failure/error handling;
 * print every test id as it starts, to stderr;
 * ask stdlib faulthandler for all-thread stack dumps every 120 seconds.
 
-faulthandler reports thread stacks only; it does not dump locals, arguments or
-the environment. The periodic timer is cancelled on every exit.
+faulthandler reports thread stacks only; it does not dump locals, arguments,
+the environment, or a core file. The periodic timer is cancelled on every exit.
 """
 from __future__ import annotations
 
@@ -29,6 +33,24 @@ ROOT = SCRIPT_DIR.parent
 TESTS_DIR = ROOT / "tests"
 TEST_PATTERN = "test_*.py"
 TRACEBACK_INTERVAL_SECONDS = 120
+
+
+def _install_fatal_handler(
+    *,
+    is_enabled: Callable[[], bool],
+    enable: Callable[..., None],
+) -> bool:
+    """Install the fatal handler only when no process-global owner exists.
+
+    Return ``True`` when this call installed the handler and therefore owns
+    its removal. An existing handler belongs to the process, possibly to an
+    outer full-suite runner, and must keep its original destination and
+    lifetime.
+    """
+    if is_enabled():
+        return False
+    enable(all_threads=True)
+    return True
 
 
 def _restore_repo_root_import_context() -> None:
@@ -61,16 +83,27 @@ def run(
     traceback_interval: float = TRACEBACK_INTERVAL_SECONDS,
     start_timer: Callable[..., None] = faulthandler.dump_traceback_later,
     stop_timer: Callable[[], None] = faulthandler.cancel_dump_traceback_later,
+    enable_fatal_handler: Callable[..., None] = faulthandler.enable,
+    disable_fatal_handler: Callable[[], None] = faulthandler.disable,
+    is_fatal_handler_enabled: Callable[[], bool] = faulthandler.is_enabled,
 ) -> int:
     """Run discovery and return unittest's success/failure exit status.
 
-    ``start_timer``/``stop_timer`` are injectable so focused tests can avoid
-    touching the process-global watchdog owned by an outer full-suite runner.
+    Timer and fatal-handler seams are injectable so focused tests can avoid
+    touching the process-global faulthandler state owned by an outer
+    full-suite runner.
     """
     output = sys.stderr if stream is None else stream
     diagnostics = sys.stderr if watchdog_stream is None else watchdog_stream
-    start_timer(traceback_interval, repeat=True, file=diagnostics)
+    fatal_handler_owned = False
+    timer_started = False
     try:
+        fatal_handler_owned = _install_fatal_handler(
+            is_enabled=is_fatal_handler_enabled,
+            enable=enable_fatal_handler,
+        )
+        start_timer(traceback_interval, repeat=True, file=diagnostics)
+        timer_started = True
         suite = discover(tests_dir)
         result = unittest.TextTestRunner(stream=output, verbosity=2).run(suite)
         # Match unittest.main.TestProgram.runTests: an empty selection with no
@@ -79,7 +112,12 @@ def run(
             return 5
         return 0 if result.wasSuccessful() else 1
     finally:
-        stop_timer()
+        try:
+            if timer_started:
+                stop_timer()
+        finally:
+            if fatal_handler_owned:
+                disable_fatal_handler()
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -150,6 +150,9 @@ class DiagnosticsRunnerTest(unittest.TestCase):
             stream=output,
             start_timer=start,
             stop_timer=stop,
+            enable_fatal_handler=mock.Mock(),
+            disable_fatal_handler=mock.Mock(),
+            is_fatal_handler_enabled=mock.Mock(return_value=True),
         )
         self.assertEqual(stop.call_count, 1)
         self.assertEqual(
@@ -303,6 +306,9 @@ class DiagnosticsRunnerTest(unittest.TestCase):
                     stream=io.StringIO(),
                     start_timer=start,
                     stop_timer=stop,
+                    enable_fatal_handler=mock.Mock(),
+                    disable_fatal_handler=mock.Mock(),
+                    is_fatal_handler_enabled=mock.Mock(return_value=True),
                 )
         start.assert_called_once()
         stop.assert_called_once_with()
@@ -436,6 +442,112 @@ class DiagnosticsRunnerTest(unittest.TestCase):
         self.assertEqual(payload["code"], 0)
         self.assertTrue(payload["outer_grew"])
         self.assertIn("most recent call first", payload["outer_tail"])
+
+
+class FatalHandlerSeamTest(unittest.TestCase):
+    """Pure-mock checks for the fatal-handler ownership seam.
+
+    The real ``faulthandler.enable``/``disable`` functions are never called;
+    the outer full-suite runner owns the process-global handler.
+    """
+
+    def setUp(self) -> None:
+        self.events: list[tuple[str, object]] = []
+        self.enable = mock.Mock()
+        self.disable = mock.Mock(
+            side_effect=lambda: self.events.append(("disable", None))
+        )
+        self.is_enabled = mock.Mock()
+        self.start_timer = mock.Mock(
+            side_effect=lambda *args, **kwargs: self.events.append(
+                ("timer_start", (args, kwargs))
+            )
+        )
+        self.stop_timer = mock.Mock(
+            side_effect=lambda: self.events.append(("timer_stop", None))
+        )
+
+    def run_runner(
+        self,
+        *,
+        handler_enabled: bool = False,
+        discovery_error: Exception | None = None,
+        enable_error: Exception | None = None,
+    ) -> int:
+        def state() -> bool:
+            self.events.append(("state", None))
+            return handler_enabled
+
+        def enable(**kwargs: object) -> None:
+            self.events.append(("enable", kwargs))
+            if enable_error is not None:
+                raise enable_error
+
+        def discovery(tests_dir: Path) -> unittest.TestSuite:
+            self.events.append(("discover", None))
+            if discovery_error is not None:
+                raise discovery_error
+            return unittest.TestSuite()
+
+        self.is_enabled.side_effect = state
+        self.enable.side_effect = enable
+        with mock.patch.object(runner, "discover", side_effect=discovery):
+            return runner.run(
+                ROOT / "tests",
+                stream=io.StringIO(),
+                start_timer=self.start_timer,
+                stop_timer=self.stop_timer,
+                enable_fatal_handler=self.enable,
+                disable_fatal_handler=self.disable,
+                is_fatal_handler_enabled=self.is_enabled,
+            )
+
+    def test_handler_is_installed_before_discovery_and_removed_after(self) -> None:
+        code = self.run_runner()
+        self.assertEqual(code, 5)
+        self.assertEqual(
+            [name for name, _ in self.events],
+            ["state", "enable", "timer_start", "discover", "timer_stop", "disable"],
+        )
+        self.enable.assert_called_once_with(all_threads=True)
+        self.disable.assert_called_once_with()
+        self.start_timer.assert_called_once()
+        self.assertEqual(
+            self.start_timer.call_args.args, (runner.TRACEBACK_INTERVAL_SECONDS,)
+        )
+        self.assertTrue(self.start_timer.call_args.kwargs["repeat"])
+        self.assertIs(self.start_timer.call_args.kwargs["file"], sys.stderr)
+        self.stop_timer.assert_called_once_with()
+
+    def test_preexisting_handler_is_left_untouched(self) -> None:
+        code = self.run_runner(handler_enabled=True)
+        self.assertEqual(code, 5)
+        self.assertEqual(
+            [name for name, _ in self.events],
+            ["state", "timer_start", "discover", "timer_stop"],
+        )
+        self.enable.assert_not_called()
+        self.disable.assert_not_called()
+
+    def test_discovery_error_still_restores_the_owned_handler(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "fixture discovery error"):
+            self.run_runner(discovery_error=RuntimeError("fixture discovery error"))
+        self.assertEqual(
+            [name for name, _ in self.events],
+            ["state", "enable", "timer_start", "discover", "timer_stop", "disable"],
+        )
+        self.disable.assert_called_once_with()
+
+    def test_handler_install_error_fails_before_discovery_and_timer(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "fixture enable error"):
+            self.run_runner(enable_error=RuntimeError("fixture enable error"))
+        self.assertEqual(
+            [name for name, _ in self.events],
+            ["state", "enable"],
+        )
+        self.start_timer.assert_not_called()
+        self.stop_timer.assert_not_called()
+        self.disable.assert_not_called()
 
 
 if __name__ == "__main__":
