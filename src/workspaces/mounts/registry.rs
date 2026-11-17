@@ -166,6 +166,7 @@ impl<C, I> Registry<C, I> {
         self.entries.iter()
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_in_process(&mut self, id: Uuid, entry: I) {
         self.entries.insert(id, MountEntry::InProcess(entry));
     }

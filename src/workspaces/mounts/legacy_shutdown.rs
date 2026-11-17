@@ -6,13 +6,15 @@
 //! cancels the worker or releases an owner. A ticket is reachable after the
 //! caller has timed out, so a later observer reaps the same worker instead of
 //! starting a second teardown.
+#[cfg(test)]
+use std::time::Instant;
 use std::{
     any::Any,
     io,
     panic::{self, AssertUnwindSafe},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -223,6 +225,7 @@ impl<O> LegacyShutdownTicket<O> {
     /// Bounded wait for one caller. Expiry returns the current incomplete
     /// observation; the ticket and every owner remain retained for a later
     /// observer.
+    #[cfg(test)]
     pub(super) fn wait_until(&self, deadline: Instant) -> LegacyShutdownObservation {
         loop {
             let observation = self.observe();
