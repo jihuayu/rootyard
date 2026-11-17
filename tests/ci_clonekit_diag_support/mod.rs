@@ -272,50 +272,50 @@ impl Drop for Recorder {
 #[macro_export]
 macro_rules! empty_history_case_body {
     () => {{
-        let mut diag = crate::ck_diag::Recorder::new(file!(), line!());
-        diag.mark(crate::ck_diag::Phase::Setup, file!(), line!());
+        let mut diag = $crate::ck_diag::Recorder::new(file!(), line!());
+        diag.mark($crate::ck_diag::Phase::Setup, file!(), line!());
         let result: anyhow::Result<()> = async {
             let td = TempDir::new()?;
             let ids = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-            let vr = diag.eager_anyhow(crate::ck_diag::Phase::Setup, file!(), line!(), || private_vr(&td))?;
-            let store = diag.eager_ck(crate::ck_diag::Phase::Setup, file!(), line!(), || {
+            let vr = diag.eager_anyhow($crate::ck_diag::Phase::Setup, file!(), line!(), || private_vr(&td))?;
+            let store = diag.eager_ck($crate::ck_diag::Phase::Setup, file!(), line!(), || {
                 CloneKitPublicationStore::open(&td.path().join("cat"))
             })?;
-            let empty = diag.eager_anyhow(crate::ck_diag::Phase::EmptyBuildOrStatus, file!(), line!(), || {
+            let empty = diag.eager_anyhow($crate::ck_diag::Phase::EmptyBuildOrStatus, file!(), line!(), || {
                 init_repo(td.path(), "empty.git", Sha1)
             })?;
-            diag.mark(crate::ck_diag::Phase::EmptyBuildOrStatus, file!(), line!());
+            diag.mark($crate::ck_diag::Phase::EmptyBuildOrStatus, file!(), line!());
             anyhow::ensure!(
                 build_kit(ids, Sha1, 1, &empty, &td, None, None)?.manifest.status == CloneKitStatus::EmptyRepository
             );
 
-            diag.mark(crate::ck_diag::Phase::ActiveBuild, file!(), line!());
-            let repo = diag.eager_anyhow(crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || {
+            diag.mark($crate::ck_diag::Phase::ActiveBuild, file!(), line!());
+            let repo = diag.eager_anyhow($crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || {
                 init_repo(td.path(), "active", Sha1)
             })?;
-            let c1 = diag.eager_anyhow(crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || {
+            let c1 = diag.eager_anyhow($crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || {
                 add_commit(&repo, "a.txt", b"v1", "c1")
             })?;
-            diag.eager_anyhow(crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || {
+            diag.eager_anyhow($crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || {
                 build_kit(ids, Sha1, 1, &repo, &td, Some(&store), None)
             })?;
-            let b2 = diag.eager_anyhow(crate::ck_diag::Phase::CorruptBuild, file!(), line!(), || {
+            let b2 = diag.eager_anyhow($crate::ck_diag::Phase::CorruptBuild, file!(), line!(), || {
                 build_kit(ids, Sha1, 2, &repo, &td, None, Some(BuildFailurePoint::CorruptStagedPack))
             })?;
-            diag.mark(crate::ck_diag::Phase::CorruptPublicationPreservesLatest, file!(), line!());
+            diag.mark($crate::ck_diag::Phase::CorruptPublicationPreservesLatest, file!(), line!());
             anyhow::ensure!(
                 publish_clonekit_versioned(&store, &b2, &git_binary(), None, None).is_err()
                     && store.load_latest(ids.1)?.expect("latest").kit_generation == 1
             );
 
-            let (g_h2, c_h2) = diag.eager_anyhow(crate::ck_diag::Phase::HistoryGrant, file!(), line!(), || {
+            let (g_h2, c_h2) = diag.eager_anyhow($crate::ck_diag::Phase::HistoryGrant, file!(), line!(), || {
                 make_grant((ids.0, ids.1, Uuid::new_v4()), Sha1, &c1, None, 1_750_000_000)
             })?;
             let (co, mem): (Co<'_>, Arc<dyn CloneKitAuthorityOracle>) =
                 (Co { store: Some(&store), ..Co::new(&vr) }, Arc::new(InMemoryAuthorityOracle::new()));
-            diag.mark(crate::ck_diag::Phase::HistoryCheckout, file!(), line!());
+            diag.mark($crate::ck_diag::Phase::HistoryCheckout, file!(), line!());
             let res = co.run(&g_h2, &c_h2, &mem, pol(true, true), repo.to_str().expect("utf8"), None).await?;
-            diag.mark(crate::ck_diag::Phase::HistoryStrategy, file!(), line!());
+            diag.mark($crate::ck_diag::Phase::HistoryStrategy, file!(), line!());
             anyhow::ensure!(
                 res.telemetry.strategy
                     == CheckoutStrategy::StockGitFallback { reason: FallbackReason::KitHistoryMismatch }
