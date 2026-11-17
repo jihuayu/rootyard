@@ -237,8 +237,6 @@ async fn post_admission_independent_refs_both_commit() -> Result<()> {
 async fn independent_refs_case(db: &Db) -> Result<()> {
     let store = open_store()?;
     let git: &'static Git = Box::leak(Box::new(Git::new()?));
-    let owner = actor::owner(&db.pool).await?;
-    let name = format!("race-independent-{}", &Uuid::new_v4().simple().to_string()[..12]);
 
     let first_operation = Uuid::new_v4();
     let second_operation = Uuid::new_v4();
@@ -270,52 +268,66 @@ async fn independent_refs_case(db: &Db) -> Result<()> {
     let app = capture_receive_responses(router(state.clone()), captures.clone());
     let server = ServerGuard { task: tokio::spawn(async move { axum::serve(listener, app).await }) };
 
-    let created = create_repository(address, &owner, &name).await?;
-    let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
-    provision_decision_realm(db, &owner, &name, &store).await?;
-
-    // Seed one real main tip, then clone two independent worktrees from it.
-    let work = tempfile::tempdir().context("temporary Git work root")?;
-    let direct_url = clone_url(address, &owner, &name);
-    let seeded = git.clone(work.path(), &direct_url, "seed").await?;
-    ensure!(seeded.success, "real Smart HTTP clone of the empty repository failed");
-    let seed_dir = work.path().join("seed");
-    let seed = git.commit(&seed_dir, SEED_FILE, SEED_CONTENT, "seed commit").await?;
-    let seed_target = format!("HEAD:{SEED_REF}");
-    let pushed = git.run(&seed_dir, &["push", "origin", seed_target.as_str()]).await?;
-    ensure!(pushed.success, "seed push was refused");
-
-    let first_dir = clone_one(git, work.path(), &direct_url, "independent-a").await?;
-    let second_dir = clone_one(git, work.path(), &direct_url, "independent-b").await?;
-    let first_old = git.text(&first_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
-    let second_old = git.text(&second_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
-    ensure!(first_old == seed && second_old == seed, "the two clones did not share the seed tip");
-    let first_new = git.commit(&first_dir, "a.txt", "from a\n", "commit from a").await?;
-    let second_new = git.commit(&second_dir, "b.txt", "from b\n", "commit from b").await?;
-    ensure!(first_new != second_new, "the two independent commits are identical");
-    let revision_before = gate_revision(db, repository_id).await?;
-
-    // B reaches Start::Fresh and pauses with its pending row durable, before
-    // prepare can observe a later gate revision. From this point on, every
-    // fallible read/assertion and both push tasks are owned by the guarded
-    // block so the pause is released and the tasks are aborted/joined before
-    // the fixture returns, including on a panic.
-    let mut second_push = Some(spawn_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B));
+    // Every fallible fixture operation after server startup stays inside the
+    // unwind boundary. The task owners are declared here without fallible
+    // side effects so catch cleanup can release/drain them on every exit.
+    let mut second_push: Option<JoinHandle<Result<git::Output>>> = None;
     let mut first_push: Option<JoinHandle<Result<git::Output>>> = None;
     let body_pause = pause.clone();
     let outcome = AssertUnwindSafe(async {
+        let owner = actor::owner(&db.pool).await?;
+        let name = format!("race-independent-{}", &Uuid::new_v4().simple().to_string()[..12]);
+
+        let created = create_repository(address, &owner, &name).await?;
+        let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
+        provision_decision_realm(db, &owner, &name, &store).await?;
+
+        // Seed one real main tip, then clone two independent worktrees from it.
+        let work = tempfile::tempdir().context("temporary Git work root")?;
+        let direct_url = clone_url(address, &owner, &name);
+        let seeded = git.clone(work.path(), &direct_url, "seed").await?;
+        ensure!(seeded.success, "real Smart HTTP clone of the empty repository failed");
+        let seed_dir = work.path().join("seed");
+        let seed = git.commit(&seed_dir, SEED_FILE, SEED_CONTENT, "seed commit").await?;
+        let seed_target = format!("HEAD:{SEED_REF}");
+        let pushed = git.run(&seed_dir, &["push", "origin", seed_target.as_str()]).await?;
+        ensure!(pushed.success, "seed push was refused");
+
+        let first_dir = clone_one(git, work.path(), &direct_url, "independent-a").await?;
+        let second_dir = clone_one(git, work.path(), &direct_url, "independent-b").await?;
+        let first_old = git.text(&first_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
+        let second_old = git.text(&second_dir, &["rev-parse", "refs/remotes/origin/main"]).await?;
+        ensure!(first_old == seed && second_old == seed, "the two clones did not share the seed tip");
+        let first_new = git.commit(&first_dir, "a.txt", "from a\n", "commit from a").await?;
+        let second_new = git.commit(&second_dir, "b.txt", "from b\n", "commit from b").await?;
+        ensure!(first_new != second_new, "the two independent commits are identical");
+        let revision_before = gate_revision(db, repository_id).await?;
+
+        // B reaches Start::Fresh and pauses with its pending row durable, before
+        // prepare can observe a later gate revision. From this point on, every
+        // fallible read/assertion and both push tasks are owned by the guarded
+        // block so the pause is released and the tasks are aborted/joined before
+        // the fixture returns, including on a panic.
+        second_push = Some(spawn_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B));
         {
-            let second_handle =
-                second_push.as_mut().ok_or_else(|| anyhow!("the independent push task was not created"))?;
-            tokio::select! {
-                _ = body_pause.wait_reached() => {}
-                exited = second_handle => {
-                    let output = exited.context("the paused independent push task failed")??;
-                    return Err(anyhow!(
-                        "the independent push exited before its post-admission rendezvous: {}",
-                        redacted(&output)
-                    ));
+            let selected: Option<std::result::Result<Result<git::Output>, tokio::task::JoinError>> = {
+                let second_handle =
+                    second_push.as_mut().ok_or_else(|| anyhow!("the independent push task was not created"))?;
+                tokio::select! {
+                    _ = body_pause.wait_reached() => None,
+                    exited = second_handle => Some(exited),
                 }
+            };
+            if let Some(exited) = selected {
+                // The select consumed this JoinHandle's output. Remove the
+                // completed handle without polling it again, then preserve the
+                // original completion result.
+                let _consumed = second_push.take();
+                let output = exited.context("the paused independent push task failed")??;
+                return Err(anyhow!(
+                    "the independent push exited before its post-admission rendezvous: {}",
+                    redacted(&output)
+                ));
             }
         }
         let (second_state, second_terminal) = operation_row(db, repository_id, second_operation)
@@ -330,9 +342,13 @@ async fn independent_refs_case(db: &Db) -> Result<()> {
 
         // A commits a different ref while B is paused after admission.
         first_push = Some(spawn_push_ref(git, first_dir, direct_url, first_operation, INDEPENDENT_A));
-        let first_handle =
-            first_push.take().ok_or_else(|| anyhow!("the first independent push task was not created"))?;
-        let first_output = first_handle.await.context("the first independent push task failed")??;
+        let first_join = {
+            let first_handle =
+                first_push.as_mut().ok_or_else(|| anyhow!("the first independent push task was not created"))?;
+            first_handle.await
+        };
+        first_push = None;
+        let first_output = first_join.context("the first independent push task failed")??;
         ensure!(first_output.success, "the first independent push failed: {}", redacted(&first_output));
         let revision_after_first = gate_revision(db, repository_id).await?;
         ensure!(
@@ -341,8 +357,13 @@ async fn independent_refs_case(db: &Db) -> Result<()> {
         );
 
         body_pause.release();
-        let second_handle = second_push.take().ok_or_else(|| anyhow!("the paused independent push task was lost"))?;
-        let second_output = second_handle.await.context("the paused independent push task failed")??;
+        let second_join = {
+            let second_handle =
+                second_push.as_mut().ok_or_else(|| anyhow!("the paused independent push task was lost"))?;
+            second_handle.await
+        };
+        second_push = None;
+        let second_output = second_join.context("the paused independent push task failed")??;
 
         let first_capture =
             captures.take(first_operation).ok_or_else(|| anyhow!("the first independent push has no raw reply"))?;
