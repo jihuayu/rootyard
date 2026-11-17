@@ -466,7 +466,7 @@ async fn sharding_isolated_serving_quota_and_concurrent_ingest() -> Result<()> {
             &h.policy,
         )?;
     }
-    store.seal_aged_segments(100_000, &h.policy)?;
+    store.seal_aged_segments(repo.tenant, repo.repo, repo.history, 100_000, &h.policy)?;
 
     let router = CompactionShardRouter::new(2)?;
     let mut handles = Vec::new();
