@@ -300,6 +300,7 @@ mod tests {
     use crate::workspace_lab::merkle_sync::backup_restore::{
         BackupArtifactEntry, MerkleBackupBundle, compute_bundle_digest, validate_backup_bundle_and_artifacts,
     };
+    use crate::workspace_lab::merkle_sync::git_compare::GitBundleSnapshot;
     use crate::workspace_lab::merkle_sync::ledger::RemoteObjectLocatorEntry;
     use crate::workspace_lab::merkle_sync::manifest::{
         EmptyDirPolicy, GitStateSnapshot, IgnorePolicySpec, MerkleObjectFormat, UntrackedPolicy, build_dir_node,
@@ -401,7 +402,13 @@ mod tests {
             node_locators: BTreeMap::new(),
         };
         let node_bytes = serde_json::to_vec(&root_node).unwrap();
-        let gb_bytes = br#"{"object_format":"sha1","files":[]}"#;
+        let gb_bytes = serde_json::to_vec(&GitBundleSnapshot {
+            schema: MERKLE_MANIFEST_SCHEMA,
+            object_format: MerkleObjectFormat::Sha1,
+            files: Vec::new(),
+            bundle_sha256: zero_sha.clone(),
+        })
+        .unwrap();
         let arts = vec![
             BackupArtifactEntry {
                 kind: "chunk".into(),
