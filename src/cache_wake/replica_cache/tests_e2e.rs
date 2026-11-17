@@ -448,7 +448,7 @@ fn pack_cache_concurrent_install_clear_all_and_catalog_eviction_failure_preserve
         ReplicaObjectFormat::Sha1,
         1,
         1,
-        &[spec.clone()],
+        std::slice::from_ref(&spec),
         &refs,
         "refs/heads/main",
     )?;
