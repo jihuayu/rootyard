@@ -77,7 +77,7 @@ jobs:
           git --version
           cargo fmt --all -- --check
           python3 scripts/check_design_docs.py
-          python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_workspace_remote_namespace.py tests/test_pando_capacity_contracts.py
+          python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_pando_capacity_contracts.py tests.test_workspace_remote_namespace.WorkspaceRemoteNamespaceContractTests
       - name: Run Clippy, library unit tests, and stock-Git OpenDAL integration tests
         run: |
           cargo clippy --locked --no-default-features --lib --test pando_capacity_contract -- -D warnings

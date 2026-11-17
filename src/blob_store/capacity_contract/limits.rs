@@ -9,13 +9,14 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::budget::{
+use crate::blob_store::budget::{
     DEFAULT_ACTIVE_READERS, DEFAULT_ACTIVE_UPLOADS, DEFAULT_STAGING_BYTES, LEASE_UNIT_BYTES, MAX_ACTIVE_SLOTS,
     MAX_STAGING_BYTES,
 };
+use crate::blob_store::opendal::{DOWNLOAD_CHUNK_BYTES, MAX_RANGE_BYTES, UPLOAD_CHUNK_BYTES};
+use crate::blob_store::types::{MAX_NAMESPACE_BYTES, MAX_OBJECT_BYTES};
+
 use super::inventory::{LayerLimitFact, build_fact_inventory};
-use super::opendal::{DOWNLOAD_CHUNK_BYTES, MAX_RANGE_BYTES, UPLOAD_CHUNK_BYTES};
-use super::types::{MAX_NAMESPACE_BYTES, MAX_OBJECT_BYTES};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
