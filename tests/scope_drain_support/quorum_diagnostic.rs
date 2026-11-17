@@ -166,7 +166,7 @@ fn leader_slot(value: Option<u64>) -> &'static str {
 
 fn classify(error: &RaftBackendError, expected: Operation) -> (Operation, &'static str) {
     match error {
-        RaftBackendError::QuorumUnavailable(code) => match cause::Site::decode(*code) {
+        RaftBackendError::QuorumUnavailable(code) => match cause::Site::decode(code) {
             Some(site) => (site.operation(), site.cause().code()),
             None => (expected, "unclassified"),
         },
