@@ -31,12 +31,12 @@ BOOTSTRAP = "postgresql://user:password@127.0.0.1:55432/bootstrap"
 BINARY = "/tmp/owned/target/debug/deps/rootyard_pando_lab-abc"
 
 
-def ok_output(name):
+def ok_output(name, filtered=0):
     return (
         "running 1 test\n"
         "test %s ... ok\n\n"
         "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
-        "0 filtered out; finished in 0.01s\n" % name
+        "%d filtered out; finished in 0.01s\n" % (name, filtered)
     ).encode()
 
 
@@ -78,6 +78,13 @@ class CaseSetTest(unittest.TestCase):
             {"passed": 1, "failed": 0, "ignored": 0, "filtered": 0},
         )
 
+    def test_nonzero_filtered_summary_is_accepted_and_preserved(self):
+        name = cases.CASE_NAMES[0]
+        self.assertEqual(
+            cases.parse_libtest(ok_output(name, filtered=42), name),
+            {"passed": 1, "failed": 0, "ignored": 0, "filtered": 42},
+        )
+
     def assert_code(self, output, name, code):
         with self.assertRaises(RunnerError) as caught:
             cases.parse_libtest(output, name)
@@ -117,16 +124,26 @@ class CaseSetTest(unittest.TestCase):
         ).encode()
         self.assert_code(unexpected, name, "unexpected_case")
 
-    def test_failed_filtered_inconsistent_and_missing_summary_fail(self):
+    def test_failed_inconsistent_and_missing_summary_fail(self):
         name = cases.CASE_NAMES[0]
         self.assert_code(failed_output(name), name, "case_failed")
         self.assert_code(
-            ok_output(name).replace(b"0 filtered out", b"1 filtered out"),
+            ok_output(name).replace(b"1 passed", b"2 passed"),
             name,
             "summary_mismatch",
         )
         self.assert_code(
-            ok_output(name).replace(b"1 passed", b"2 passed"),
+            ok_output(name).replace(b"0 failed", b"1 failed"),
+            name,
+            "summary_mismatch",
+        )
+        self.assert_code(
+            ok_output(name).replace(b"0 ignored", b"1 ignored"),
+            name,
+            "summary_mismatch",
+        )
+        self.assert_code(
+            ok_output(name).replace(b"0 measured", b"1 measured"),
             name,
             "summary_mismatch",
         )
@@ -157,6 +174,19 @@ class ExecuteCasesTest(unittest.TestCase):
             self.assertNotIn("--", argv)
             self.assertEqual(kwargs["env"], {"TMPDIR": "/tmp/owned"})
             self.assertEqual(kwargs["cwd"], "/tmp/source")
+
+    def test_execute_cases_preserves_nonzero_filtered_counts(self):
+        responses = [
+            Completed([], 0, ok_output(name, filtered=42), b"")
+            for name in cases.CASE_NAMES
+        ]
+        records = cases.execute_cases(
+            BINARY, {}, FakeRunner(responses),
+            work_deadline=1000, case_timeout=30, clock=lambda: 0,
+        )
+        self.assertEqual(len(records), 17)
+        self.assertTrue(all(row["status"] == "passed" for row in records))
+        self.assertTrue(all(row["filtered"] == 42 for row in records))
 
     def test_stops_at_first_failure_and_reports_not_run(self):
         responses = [

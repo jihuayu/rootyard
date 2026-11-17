@@ -122,7 +122,13 @@ def not_run_records(code="not_run"):
 
 
 def parse_libtest(raw, requested):
-    """Require exactly the requested case with an anchored passing summary."""
+    """Require exactly the requested case with an anchored passing summary.
+
+    The caller selects one test from the same bin harness with ``--exact``; the
+    other tests in that harness are expected to be filtered out, so a passing
+    summary may legitimately carry a nonzero ``filtered`` count.  That count is
+    captured and returned, not required to be zero.
+    """
     if not isinstance(raw, (bytes, str)):
         raise RunnerError("execute", "output_invalid")
     text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
@@ -157,7 +163,6 @@ def parse_libtest(raw, requested):
         or counts["passed"] != 1
         or counts["failed"] != 0
         or counts["ignored"] != 0
-        or counts["filtered"] != 0
         or int(measured, 10) != 0
     ):
         raise RunnerError("execute", "summary_mismatch")
