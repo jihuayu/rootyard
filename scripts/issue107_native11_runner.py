@@ -76,6 +76,8 @@ METADATA_REPLAY_ERROR_KINDS = {
     7: 'other',
     8: 'blob_provider',
 }
+# `historical_error_kind` never returns the reserved blob-provider class.
+HISTORICAL_READ_ERROR_KINDS = frozenset(range(1, 8))
 
 METADATA_REPLAY_PHASES = {
     1: 'setup',
@@ -682,6 +684,49 @@ class _HistoricalTraceState:
             return self.assert_frame
         return None
 
+    @staticmethod
+    def _no_ancillary(frame):
+        return (
+            frame["status"] is None
+            and frame["counts"] is None
+            and frame["checks"] is None
+            and frame["iteration"] is None
+            and frame["error_kind"] is None
+        )
+
+    def _fields_allowed(self, frame):
+        """Match the exact Rust trace_try/historical_trace_try/predicate shape."""
+        site, event, ok = frame["site"], frame["event"], frame["ok"]
+        if site == 1:
+            if event == 0:
+                return ok is None and self._no_ancillary(frame)
+            return event == 1 and isinstance(ok, bool) and self._no_ancillary(frame)
+        if site == 2:
+            if event == 0:
+                return ok is None and self._no_ancillary(frame)
+            if event == 1:
+                return ok is True and self._no_ancillary(frame)
+            if event == 2:
+                return ok is False and self._no_ancillary(frame)
+            return False
+        if not 3 <= site <= 9:
+            return False
+        if event == 0:
+            return ok is None and self._no_ancillary(frame)
+        if event != 1:
+            return False
+        if ok is True:
+            return self._no_ancillary(frame)
+        if ok is not False:
+            return False
+        return (
+            frame["status"] is None
+            and frame["counts"] is None
+            and frame["checks"] is None
+            and frame["iteration"] is None
+            and frame["error_kind"] in HISTORICAL_READ_ERROR_KINDS
+        )
+
     def _child_enter_allowed(self, site):
         if site == 3:
             return self.stage == "git_repo"
@@ -728,8 +773,7 @@ class _HistoricalTraceState:
                 # followed only by phase-24 cleanup.
                 return phase == MAX_METADATA_REPLAY_PHASE
             return True
-        if frame["iteration"] is not None:
-            # No phase-17 child/parent frame declares a loop index.
+        if not self._fields_allowed(frame):
             return False
         if site == 1:
             if event == 0:

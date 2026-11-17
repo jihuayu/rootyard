@@ -753,7 +753,7 @@ class MetadataReplayTraceTests(unittest.TestCase):
 
     def test_valid_frame_survives_projection_safe_rebuild_and_attach(self):
         lines = self._historical_assert(
-            self._historical_parent_success(packs=2), ok=False, status="404")
+            self._historical_parent_success(packs=2), ok=False)
         lines.extend(self._finish(ok=True))
         diag = self._project(lines)
         trace = diag["case_trace"]
@@ -763,9 +763,11 @@ class MetadataReplayTraceTests(unittest.TestCase):
         self.assertEqual(trace["frames"], len(lines))
         self.assertEqual(trace["first_failure"]["phase"], 17)
         self.assertEqual(trace["first_failure"]["site"], 2)
-        self.assertEqual(trace["first_failure"]["status"], 404)
+        self.assertIsNone(trace["first_failure"]["status"])
+        self.assertIsNone(trace["first_failure"]["error_kind"])
         self.assertEqual(trace["primary"]["site_name"], "exact_first_advance_content_assert")
-        self.assertEqual(trace["status"], 404)
+        self.assertIsNone(trace["status"])
+        self.assertIsNone(trace["error_kind"])
         self.assertIsNone(trace["last_incomplete"])
         self.assertTrue(trace["cleanup_completed"])
         self.assertEqual(trace["last_completed"]["phase"], 24)
@@ -778,7 +780,8 @@ class MetadataReplayTraceTests(unittest.TestCase):
         runner._attach_failed_target(report, diag, {}, [])
         attached = report["targets"][0]["case_trace"]
         self.assertEqual(attached["primary"], trace["primary"])
-        self.assertEqual(attached["first_failure"]["status"], 404)
+        self.assertIsNone(attached["first_failure"]["status"])
+        self.assertIsNone(attached["first_failure"]["error_kind"])
         serialized = json.dumps(report)
         for forbidden in (SECRET, SQL, DSN):
             self.assertNotIn(forbidden, serialized)
@@ -990,6 +993,35 @@ class MetadataReplayTraceTests(unittest.TestCase):
             )
         self.assertEqual(set(runner.METADATA_REPLAY_ERROR_KINDS),
                          set(range(1, runner.METADATA_REPLAY_MAX_ERROR_KIND + 1)))
+
+    def test_phase17_field_schema_rejects_impossible_ancillary_fields(self):
+        p = self._frame
+        parent = self._historical_parent_success(packs=1)
+        child_prefix = self._historical_failure_prefix(5, packs=2)
+        invalid = [
+            [p(17, 1, 0, status="200")],
+            [p(17, 1, 0, iteration="0")],
+            [p(17, 1, 0), p(17, 1, 1, ok="1", error_kind="4")],
+            parent + [p(17, 2, 2, ok="0", status="404")],
+            parent + [p(17, 2, 2, ok="0", error_kind="4")],
+            parent + [p(17, 2, 0), p(17, 2, 2, ok="0", checks="1")],
+            parent + [p(17, 2, 0), p(17, 2, 1, ok="0")],
+            parent + [p(17, 2, 0, counts="1,2,3,4,5")],
+            child_prefix + [p(17, 5, 0, status="200")],
+            child_prefix + [p(17, 5, 0), p(17, 5, 1, ok="1", status="200")],
+            child_prefix + [p(17, 5, 0), p(17, 5, 1, ok="1", error_kind="4")],
+            child_prefix + [p(17, 5, 0), p(17, 5, 1, ok="1", counts="0,0,0,0,0")],
+            child_prefix + [p(17, 5, 0), p(17, 5, 1, ok="1", iteration="0")],
+            child_prefix + [p(17, 5, 0), p(17, 5, 1, ok="0")],
+            child_prefix + [p(17, 5, 0), p(17, 5, 1, ok="0", status="200", error_kind="4")],
+            child_prefix + [p(17, 5, 0), p(17, 5, 1, ok="0", error_kind="8")],
+            child_prefix + [p(17, 5, 0), p(17, 5, 2, ok="0")],
+        ]
+        for lines in invalid:
+            trace = self._project(lines)["case_trace"]
+            self.assertFalse(trace["known"])
+            self.assertTrue(trace["invalid"])
+            self.assertIsNone(trace["primary"])
 
     def test_unknown_or_bool_error_kind_is_rejected_without_text(self):
         prefix = [
