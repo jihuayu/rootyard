@@ -65,29 +65,37 @@ fn planner_expands_diamond_delta_dag_linearly_and_bounds_delta_work() {
         raw[..16].copy_from_slice(&id.to_be_bytes());
         GitOid::parse(GitObjectFormat::Sha1, &hex::encode(raw)).unwrap()
     };
+    let add_many = |idx: &mut CoverHierarchyIndex,
+                    ents: &mut Vec<_>,
+                    id: u128,
+                    commits: Vec<GitOid>,
+                    bases: Vec<Uuid>,
+                    holds: &mut Vec<Uuid>| {
+        let (pk, art) = uniq_pack(&r, id, bases);
+        ents.push(*pk.entry());
+        let g = idx.membership_generation() + 1;
+        let m = compute_cover_membership_digest(&r, g, ents).unwrap();
+        let links = commits
+            .into_iter()
+            .map(|commit_oid| CoverCommitLink {
+                commit_oid,
+                parent_oids: vec![],
+                version_id: v1.version_id(),
+                authority_seq: 1,
+            })
+            .collect();
+        let cov =
+            seal_test_cover(&r, (id, g, (1, 1), m), CoverTier::Delta, (pk, art), vec![v1.version_id()], links, vec![]);
+        holds.push(cov.cover_id());
+        idx.register_leaf_cover(cov, m).unwrap();
+    };
     let add = |idx: &mut CoverHierarchyIndex,
                ents: &mut Vec<_>,
                id: u128,
                commit: GitOid,
                bases: Vec<Uuid>,
                holds: &mut Vec<Uuid>| {
-        let (pk, art) = uniq_pack(&r, id, bases);
-        ents.push(*pk.entry());
-        let g = idx.membership_generation() + 1;
-        let m = compute_cover_membership_digest(&r, g, ents).unwrap();
-        let lk =
-            CoverCommitLink { commit_oid: commit, parent_oids: vec![], version_id: v1.version_id(), authority_seq: 1 };
-        let cov = seal_test_cover(
-            &r,
-            (id, g, (1, 1), m),
-            CoverTier::Delta,
-            (pk, art),
-            vec![v1.version_id()],
-            vec![lk],
-            vec![],
-        );
-        holds.push(cov.cover_id());
-        idx.register_leaf_cover(cov, m).unwrap();
+        add_many(idx, ents, id, vec![commit], bases, holds);
     };
     let run_req = |idx: &CoverHierarchyIndex, holds: Vec<Uuid>| {
         let mut ret = RetentionClassificationIndex::new();
@@ -150,14 +158,15 @@ fn planner_expands_diamond_delta_dag_linearly_and_bounds_delta_work() {
     assert_eq!(run_req(&d_idx, d_holds).0, Err(FetchPlanError::ClosureBoundsExceeded));
     assert!(t0.elapsed() < Duration::from_secs(2));
 
-    // 3. Dense delta fanout (520 covers << 4096) exhausts work_steps inside expand_delta_bases.
+    // 3. Delta fanout within MAX_DELTA_BASES (8 bases x 512 commits, 20 leaves -> 28 covers << 4096) exhausts work_steps in expand_delta_bases.
     let (mut b_idx, mut b_ents, mut b_holds) = (CoverHierarchyIndex::new(r, mem0).unwrap(), Vec::new(), Vec::new());
-    let mut bases = Vec::with_capacity(260);
-    for k in 0..260_u128 {
-        add(&mut b_idx, &mut b_ents, 40_000 + k, dummy(40_000 + k), vec![], &mut b_holds);
-        bases.push(uid(40_000 + k));
+    let mut bases = Vec::with_capacity(8);
+    for b in 0..8_u128 {
+        let commits: Vec<_> = (0..512_u128).map(|i| dummy(100_000 + b * 1000 + i)).collect();
+        add_many(&mut b_idx, &mut b_ents, 40_000 + b, commits, vec![], &mut b_holds);
+        bases.push(uid(40_000 + b));
     }
-    for k in 0..260_u128 {
+    for k in 0..20_u128 {
         add(&mut b_idx, &mut b_ents, 41_000 + k, tip, bases.clone(), &mut b_holds);
     }
     assert_eq!(run_req(&b_idx, b_holds).0, Err(FetchPlanError::ClosureBoundsExceeded));
