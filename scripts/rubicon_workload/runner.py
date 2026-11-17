@@ -420,6 +420,31 @@ def _stop_fleet_preserving_active_error(
         _attach_fleet_cleanup_note(active_error, issues)
 
 
+def _finalize_tier_cleanup(
+    fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]],
+    sampler: ResourceSampler,
+    active_error: BaseException | None,
+) -> None:
+    """Always attempt sampler/fleet cleanup; keep the first workload error."""
+    sampler_error: BaseException | None = None
+    try:
+        sampler.stop()
+    except BaseException as exc:
+        sampler_error = exc
+
+    if sampler_error is not None:
+        if active_error is not None:
+            try:
+                active_error.add_note("sampler cleanup incomplete: stop_error")
+            except (AttributeError, TypeError):
+                pass
+        else:
+            _stop_fleet_preserving_active_error(fleet, sampler_error)
+            raise sampler_error
+
+    _stop_fleet_preserving_active_error(fleet, active_error)
+
+
 def _stop_fleet(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> None:
     """Attempt to stop owned workers and fail with safe per-worker issue facts."""
     issues: list[str] = []
@@ -1005,7 +1030,7 @@ def _phase_cold_warm_and_ci(
 
     sampler.sample_once()
     _stop_fleet(fleet)
-    fleet = _start_fleet(n_procs, pre["binary"], base_env, pre["git"], pg_url, s3_endpoint, tier_scratch)
+    fleet[:] = _start_fleet(n_procs, pre["binary"], base_env, pre["git"], pg_url, s3_endpoint, tier_scratch)
     bases = [item[1] for item in fleet]
     sampler.set_targets([item[0].pid for item in fleet], [item[2] for item in fleet], new_epoch=True, worktree_dirs=[tier_dir])
 
@@ -1146,12 +1171,12 @@ def _run_tier(
     tier_start = time.monotonic()
     records: list[dict[str, Any]] = []
     acked: list[dict[str, Any]] = []
-    s3_before_tier = (
-        s3_proxy.snapshot_after_quiescence(time.monotonic() + METER_BOUNDARY_WAIT_SECONDS)
-        if s3_proxy is not None
-        else None
-    )
     try:
+        s3_before_tier = (
+            s3_proxy.snapshot_after_quiescence(time.monotonic() + METER_BOUNDARY_WAIT_SECONDS)
+            if s3_proxy is not None
+            else None
+        )
         bases = [item[1] for item in fleet]
         repos = _phase_seed(n_procs, config, pre, base_env, users, bases, tier_dir, askpass, records, acked)
         overlap = _phase_concurrent_overlap(n_procs, config, pre, base_env, pg_url, bases, tier_dir, askpass, repos, records, acked)
@@ -1164,11 +1189,9 @@ def _run_tier(
         bases = [item[1] for item in fleet]
         fault_counts, audit = _phase_fault_and_audit(pre, base_env, cli_env, bases, tier_dir, askpass, repos, records, acked, rev_tok)
         pg_final = query_pg_snapshot_json(pg_url, base_env)
-        sampler.stop()
     finally:
         active_error = sys.exc_info()[1]
-        sampler.stop()
-        _stop_fleet_preserving_active_error(fleet, active_error)
+        _finalize_tier_cleanup(fleet, sampler, active_error)
 
     tier_wall = time.monotonic() - tier_start
     s3_tier = (
