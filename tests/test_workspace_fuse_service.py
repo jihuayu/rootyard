@@ -686,6 +686,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
         teardown precedes the Git join.  A raw partial-body PUT is already
         accepted but cannot reach PUT admission until shutdown closes it.
         """
+        self._rootyard_diagnostic_phase = "setup"
         binary, _ = select_runtime_binary()
         self.assertTrue(binary.is_file())
         real_git = shutil.which("git")
@@ -734,6 +735,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 api_pidfd = support.open_pidfd(api_pid)
                 h.api()
                 h.roundtrip()
+                self._rootyard_diagnostic_phase = "API"
 
                 def create_workspace(agent_id, key):
                     return json.loads(h.expect(
@@ -850,6 +852,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                     "SELECT count(*) FROM workspace_operations "
                     f"WHERE workspace_id='{put_id}' AND kind='file_put'"))
 
+                self._rootyard_diagnostic_phase = "workspace"
                 helper_pid = support.find_api_helper_pid(api_pid)
                 helper_identity = support.process_identity(helper_pid)
                 self.assertIsNotNone(helper_identity, "FUSE helper identity is unavailable")
@@ -869,6 +872,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 writer_pidfd = support.open_pidfd(writer.pid)
                 normal_shutdown.wait_for_writer_writing(writer, writer_status, timeout=10)
 
+                self._rootyard_diagnostic_phase = "Gitpark"
                 normal_shutdown.clear_git_markers(marker)
                 Path(str(marker) + ".trigger").touch()
                 git_state = workspace_state(git_id)
@@ -930,6 +934,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 # symlink to it.  The next production Raw read matches the
                 # existing capture interposer and holds the real with_frozen
                 # closure before the writer's next FUSE write is parked.
+                self._rootyard_diagnostic_phase = "capturefreeze"
                 normal_shutdown.enable_capture_proxy(
                     proxy_target, writer_upper / ".git/index",
                     writer_lower / ".git/index")
@@ -955,6 +960,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                             "normal SIGTERM five-second service budget exhausted")
                     return left
 
+                self._rootyard_diagnostic_phase = "signal"
                 os.killpg(api_pid, signal.SIGTERM)
                 # The release is immediate: it is not a 15-second wait.  The
                 # .timeout marker remains an emergency failure guard.
@@ -986,6 +992,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                                      f"{label} mount was replaced after normal SIGTERM")
                 mount_cleanup_proven = True
 
+                self._rootyard_diagnostic_phase = "joins"
                 self.assertTrue(support.wait_pid_gone(helper_pid, remaining()),
                                 "production FUSE helper did not exit on normal SIGTERM")
                 self.assertIsNone(h.proc.poll(),
@@ -1150,9 +1157,13 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                         expected_digest,
                         "prior checkpoint tree bytes/modes/symlink identities changed")
             except BaseException as error:
+                if getattr(self, "_rootyard_diagnostic_primary_phase", None) is None:
+                    self._rootyard_diagnostic_primary_phase = getattr(
+                        self, "_rootyard_diagnostic_phase", None)
                 original_failure = error
                 raise
             finally:
+                self._rootyard_diagnostic_phase = "cleanup"
                 cleanup_failures = []
                 retain_fixture = not mount_cleanup_proven
 
