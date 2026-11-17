@@ -46,6 +46,17 @@ struct LoopbackS3 {
 
 static SHARED_S3: OnceLock<LoopbackS3> = OnceLock::new();
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+static SHARED_TEST_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn shared_runtime() -> &'static tokio::runtime::Runtime {
+    SHARED_TEST_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build shared read-accel test runtime")
+    })
+}
 
 impl LoopbackS3 {
     fn shared() -> &'static Self {
@@ -366,17 +377,18 @@ fn assert_git_parity(expected_repo: &Path, candidate_repo: &Path, sample: &Sampl
     Ok(())
 }
 
-#[tokio::test]
-async fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Result<()> {
-    blob_read_accel_support::sha1_and_sha256_parity_and_default_disabled_behavior().await
+#[test]
+fn sha1_and_sha256_parity_and_default_disabled_behavior() -> Result<()> {
+    shared_runtime().block_on(blob_read_accel_support::sha1_and_sha256_parity_and_default_disabled_behavior())
 }
 
-#[tokio::test]
-async fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Result<()> {
-    blob_read_accel_support::fault_injection_drift_missing_corrupt_and_local_cache_recovery().await
+#[test]
+fn fault_injection_drift_missing_corrupt_and_local_cache_recovery() -> Result<()> {
+    shared_runtime().block_on(blob_read_accel_support::fault_injection_drift_missing_corrupt_and_local_cache_recovery())
 }
 
-#[tokio::test]
-async fn retention_pin_protects_packs_until_release_and_compaction_rebuild() -> Result<()> {
-    blob_read_accel_support::retention_pin_protects_packs_until_release_and_compaction_rebuild().await
+#[test]
+fn retention_pin_protects_packs_until_release_and_compaction_rebuild() -> Result<()> {
+    shared_runtime()
+        .block_on(blob_read_accel_support::retention_pin_protects_packs_until_release_and_compaction_rebuild())
 }
