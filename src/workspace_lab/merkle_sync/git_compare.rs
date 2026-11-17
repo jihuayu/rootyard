@@ -276,7 +276,8 @@ mod tests {
     use crate::workspace_lab::merkle_sync::{
         git_state::read_git_state_and_bundle,
         manifest::{EmptyDirPolicy, MerkleChangeKind, UntrackedPolicy},
-        scanner::{DirtyScope, MerkleWorkspaceScanner, ScanRequest, diff_manifests},
+        manifest_verify::diff_manifests,
+        scanner::{DirtyScope, MerkleWorkspaceScanner, ScanRequest},
     };
 
     fn git(repo: &Path, args: &[&str]) -> std::process::Output {

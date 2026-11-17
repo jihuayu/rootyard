@@ -250,12 +250,12 @@ fn diff_dir_recursive(
         return Ok(());
     }
     let parent_raw = if dir_b64.is_empty() { Vec::new() } else { decode_rel_bytes(dir_b64)? };
-    let to_map = |opt: Option<&super::manifest::MerkleDirNode>| -> BTreeMap<Vec<u8>, &MerkleDirChild> {
+    fn node_children_map(opt: Option<&super::manifest::MerkleDirNode>) -> BTreeMap<Vec<u8>, &MerkleDirChild> {
         opt.map(|n| n.children.iter().filter_map(|c| STANDARD.decode(&c.name_base64).ok().map(|k| (k, c))).collect())
             .unwrap_or_default()
-    };
-    let prev_map = to_map(prev_node);
-    let next_map = to_map(next_node);
+    }
+    let prev_map = node_children_map(prev_node);
+    let next_map = node_children_map(next_node);
     let names: BTreeSet<Vec<u8>> = prev_map.keys().chain(next_map.keys()).cloned().collect();
     for name in names {
         let mut child_raw = parent_raw.clone();
@@ -353,7 +353,7 @@ pub fn diff_manifests(
             });
         }
     }
-    for (pi, p) in prev_only.into_iter().enumerate().filter(|(i, _)| !matched_prev[*i]) {
+    for (_pi, p) in prev_only.into_iter().enumerate().filter(|(i, _)| !matched_prev[*i]) {
         let change = if p.child.kind == MerkleChildKind::EmptyDir {
             MerkleChangeKind::EmptyDirRemoved
         } else {
@@ -369,7 +369,7 @@ pub fn diff_manifests(
             content_sha256: p.child.content_sha256,
         });
     }
-    for (ni, n) in next_only.into_iter().enumerate().filter(|(i, _)| !matched_next[*i]) {
+    for (_ni, n) in next_only.into_iter().enumerate().filter(|(i, _)| !matched_next[*i]) {
         let change = if n.child.kind == MerkleChildKind::EmptyDir {
             MerkleChangeKind::EmptyDirAdded
         } else {

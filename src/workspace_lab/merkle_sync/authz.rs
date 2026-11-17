@@ -92,7 +92,7 @@ pub struct HistoryFenceRegistry {
     inner: Arc<Mutex<HistoryFenceState>>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct HistoryFenceState {
     active: BTreeMap<(Uuid, Uuid), Uuid>,
     fenced: BTreeMap<(Uuid, Uuid), BTreeSet<Uuid>>,
@@ -168,7 +168,7 @@ pub struct LiveWorkspaceAuthRegistry {
     fences: HistoryFenceRegistry,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct AuthRegistryState {
     user_grants: BTreeMap<(Uuid, Uuid, Uuid), UserGrant>,
     workspace_bindings: BTreeMap<Uuid, (Uuid, Uuid, i64)>,

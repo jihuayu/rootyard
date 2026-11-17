@@ -19,7 +19,7 @@ use super::{
 };
 use crate::workspace_lab::{core, ignore::IgnoreMatcher};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct IgnoreSnapshot {
     pub policy: IgnorePolicySpec,
     pub tracked_paths: BTreeSet<Vec<u8>>,

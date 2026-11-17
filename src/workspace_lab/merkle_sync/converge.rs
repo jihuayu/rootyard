@@ -2,11 +2,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs,
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{MetadataExt, PermissionsExt},
-    },
-    path::{Path, PathBuf},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    path::Path,
 };
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +12,8 @@ use uuid::Uuid;
 
 use super::{
     MerkleSyncError,
-    git_state::{GitBundleSnapshot, read_git_state_and_bundle, validate_git_compat},
+    git_compare::GitBundleSnapshot,
+    git_state::{read_git_state_and_bundle, validate_git_compat},
     manifest::{EmptyDirPolicy, UntrackedPolicy},
     scanner::{DirtyScope, MerkleWorkspaceScanner, ScanRequest, ScanResult},
 };
@@ -189,7 +187,7 @@ pub trait QuiescenceBarrierProbe {
 pub struct NoopBarrierProbe;
 impl QuiescenceBarrierProbe for NoopBarrierProbe {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CaptureBarrierRequest<'a> {
     pub repo_root: &'a Path,
     pub workspace_id: Uuid,

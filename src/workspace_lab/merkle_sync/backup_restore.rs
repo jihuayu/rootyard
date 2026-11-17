@@ -15,7 +15,7 @@ use super::{
     authz::{
         AccessContext, HoldPurpose, PinHoldRegistry, TenantRepoScopeKey, WorkspaceAuthAction, WorkspaceAuthorizer,
     },
-    blob_sync::{ensure_private_dir, upload_bytes_verified},
+    blob_sync::{UploadBytesReq, ensure_private_dir, upload_bytes_verified},
     ledger::{
         BlobUploadDriver, CheckpointCommitRecord, CheckpointCommitState, MerkleBlobCheckpointManifest,
         MerkleCheckpointLedger, RemoteObjectLocatorEntry,
@@ -275,17 +275,17 @@ pub async fn restore_checkpoint_backup(
                 return Err(MerkleSyncError::InvalidManifest("unknown backup artifact kind".into()));
             }
         };
-        let receipt = upload_bytes_verified(
-            params.target_store,
-            params.driver,
-            params.target_ledger,
-            &stage,
-            params.target_ctx,
-            params.generation,
-            ns,
-            &data,
-            params.deadline,
-        )
+        let receipt = upload_bytes_verified(UploadBytesReq {
+            store: params.target_store,
+            driver: params.driver,
+            ledger: params.target_ledger,
+            staging_dir: &stage,
+            ctx: params.target_ctx,
+            generation: params.generation,
+            namespace: ns,
+            bytes: &data,
+            deadline: params.deadline,
+        })
         .await?;
         let entry = RemoteObjectLocatorEntry::from_locator(receipt.locator());
         uploaded_artifacts += 1;
@@ -328,17 +328,17 @@ pub async fn restore_checkpoint_backup(
     remote.node_locators = node_locators;
 
     let new_m_bytes = serde_json::to_vec(&remote).map_err(|e| MerkleSyncError::Io(e.to_string()))?;
-    let m_receipt = upload_bytes_verified(
-        params.target_store,
-        params.driver,
-        params.target_ledger,
-        &stage,
-        params.target_ctx,
-        params.generation,
-        "merkle-manifest",
-        &new_m_bytes,
-        params.deadline,
-    )
+    let m_receipt = upload_bytes_verified(UploadBytesReq {
+        store: params.target_store,
+        driver: params.driver,
+        ledger: params.target_ledger,
+        staging_dir: &stage,
+        ctx: params.target_ctx,
+        generation: params.generation,
+        namespace: "merkle-manifest",
+        bytes: &new_m_bytes,
+        deadline: params.deadline,
+    })
     .await?;
     let m_entry = RemoteObjectLocatorEntry::from_locator(m_receipt.locator());
     closure_entries

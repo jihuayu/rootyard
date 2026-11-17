@@ -4,11 +4,9 @@
 use std::{
     collections::BTreeMap,
     fs,
-    future::Future,
     os::unix::ffi::OsStringExt,
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
-    pin::Pin,
     process::Command,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -139,26 +137,22 @@ async fn handle_s3(State(objs): State<ObjMap>, method: Method, uri: Uri, body: B
 }
 
 impl ms::BlobUploadDriver for OpenDalDriver {
-    fn upload_verified<'a>(
-        &'a self,
-        store: &'a BlobStore,
-        tenant_id: Uuid,
-        authority_id: Uuid,
-        generation: i64,
-        namespace: &'a str,
-        sha256: &'a str,
-        length: u64,
-        source_path: &'a Path,
-        deadline: Instant,
-    ) -> Pin<Box<dyn Future<Output = Result<rootyard::blob_store::BlobReceipt, ms::MerkleSyncError>> + Send + 'a>> {
+    fn upload_verified<'a>(&'a self, args: ms::UploadVerifiedArgs<'a>) -> ms::UploadVerifyFuture<'a> {
         Box::pin(async move {
-            let intent = store.new_upload(tenant_id, authority_id, generation, namespace, sha256, length)?;
-            let data = fs::read(source_path)?;
-            if data.len() as u64 != length || hex::encode(Sha256::digest(&data)) != sha256 {
+            let intent = args.store.new_upload(
+                args.tenant_id,
+                args.authority_id,
+                args.generation,
+                args.namespace,
+                args.sha256,
+                args.length,
+            )?;
+            let data = fs::read(args.source_path)?;
+            if data.len() as u64 != args.length || hex::encode(Sha256::digest(&data)) != args.sha256 {
                 return Err(ms::MerkleSyncError::IntegrityMismatch("source mismatch".into()));
             }
             self.op.write(&intent.locator().path(), data).await.map_err(|e| ms::MerkleSyncError::Io(e.to_string()))?;
-            Ok(store.verify(intent.locator(), deadline).await?)
+            Ok(args.store.verify(intent.locator(), args.deadline).await?)
         })
     }
 }

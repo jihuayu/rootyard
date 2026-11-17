@@ -134,19 +134,23 @@ pub enum UploadFailpoint {
     BeforeAtomicCommit,
 }
 
+pub type UploadVerifyFuture<'a> = Pin<Box<dyn Future<Output = Result<BlobReceipt, MerkleSyncError>> + Send + 'a>>;
+
+#[derive(Clone, Copy)]
+pub struct UploadVerifiedArgs<'a> {
+    pub store: &'a BlobStore,
+    pub tenant_id: Uuid,
+    pub authority_id: Uuid,
+    pub generation: i64,
+    pub namespace: &'a str,
+    pub sha256: &'a str,
+    pub length: u64,
+    pub source_path: &'a Path,
+    pub deadline: Instant,
+}
+
 pub trait BlobUploadDriver: Send + Sync {
-    fn upload_verified<'a>(
-        &'a self,
-        store: &'a BlobStore,
-        tenant_id: Uuid,
-        authority_id: Uuid,
-        generation: i64,
-        namespace: &'a str,
-        sha256: &'a str,
-        length: u64,
-        source_path: &'a Path,
-        deadline: Instant,
-    ) -> Pin<Box<dyn Future<Output = Result<BlobReceipt, MerkleSyncError>> + Send + 'a>>;
+    fn upload_verified<'a>(&'a self, args: UploadVerifiedArgs<'a>) -> UploadVerifyFuture<'a>;
 }
 
 pub struct PgProtectedUploadDriver {
@@ -158,23 +162,12 @@ pub struct PgProtectedUploadDriver {
 }
 
 impl BlobUploadDriver for PgProtectedUploadDriver {
-    fn upload_verified<'a>(
-        &'a self,
-        store: &'a BlobStore,
-        _tenant_id: Uuid,
-        authority_id: Uuid,
-        generation: i64,
-        namespace: &'a str,
-        sha256: &'a str,
-        length: u64,
-        source_path: &'a Path,
-        deadline: Instant,
-    ) -> Pin<Box<dyn Future<Output = Result<BlobReceipt, MerkleSyncError>> + Send + 'a>> {
+    fn upload_verified<'a>(&'a self, args: UploadVerifiedArgs<'a>) -> UploadVerifyFuture<'a> {
         Box::pin(async move {
             let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-            let tokio_dl = tokio::time::Instant::from_std(deadline);
+            let tokio_dl = tokio::time::Instant::from_std(args.deadline);
             let op_digest_bytes: [u8; 32] =
-                Sha256::digest(format!("merkle:{namespace}:{sha256}:{seq}").as_bytes()).into();
+                Sha256::digest(format!("merkle:{}:{}:{seq}", args.namespace, args.sha256).as_bytes()).into();
             let op = OperationIdentity::new(
                 self.scope.repository_id(),
                 self.scope.owner_id(),
@@ -184,7 +177,7 @@ impl BlobUploadDriver for PgProtectedUploadDriver {
                 RequestDigest::from_bytes(op_digest_bytes),
             )
             .map_err(|e| MerkleSyncError::InvalidInput(e.to_string()))?;
-            let spec = ArtifactSpec::new(namespace, sha256, length)
+            let spec = ArtifactSpec::new(args.namespace, args.sha256, args.length)
                 .map_err(|e| MerkleSyncError::InvalidInput(e.to_string()))?;
             let mut client =
                 self.pool.get().await.map_err(|_| MerkleSyncError::Io("pg pool checkout failed".into()))?;
@@ -195,15 +188,15 @@ impl BlobUploadDriver for PgProtectedUploadDriver {
                 self.scope,
                 op,
                 Uuid::new_v4(),
-                store.backend_identity().clone(),
-                authority_id,
-                generation,
+                args.store.backend_identity().clone(),
+                args.authority_id,
+                args.generation,
                 self.expected_gate_digest.clone(),
                 vec![spec],
             )
             .map_err(|e| MerkleSyncError::InvalidInput(e.to_string()))?;
             let grant = match PgArtifactHoldStore
-                .acquire(&mut client, store, &req, tokio_dl)
+                .acquire(&mut client, args.store, &req, tokio_dl)
                 .await
                 .map_err(|e| MerkleSyncError::Io(e.to_string()))?
             {
@@ -213,8 +206,8 @@ impl BlobUploadDriver for PgProtectedUploadDriver {
                 }
             };
             drop(client);
-            let pub_res = ProtectedUploader::new(store.clone())
-                .consume_and_upload(&self.pool, grant, &[UploadSource::new(source_path)], deadline)
+            let pub_res = ProtectedUploader::new(args.store.clone())
+                .consume_and_upload(&self.pool, grant, &[UploadSource::new(args.source_path)], args.deadline)
                 .await
                 .map_err(|e| MerkleSyncError::Io(e.to_string()))?;
             Ok(pub_res.receipts()[0].receipt().clone())
@@ -227,7 +220,7 @@ pub struct MerkleCheckpointLedger {
     inner: Arc<Mutex<LedgerState>>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct LedgerState {
     checkpoints: BTreeMap<Uuid, CheckpointCommitRecord>,
     scoped_objects: BTreeMap<TenantRepoScopeKey, RemoteObjectLocatorEntry>,
@@ -265,18 +258,21 @@ impl MerkleCheckpointLedger {
         locator: RemoteObjectLocatorEntry,
         hold_id: Uuid,
     ) -> Result<(), MerkleSyncError> {
+        let loc_path = locator.to_locator()?.path();
         let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let rec = st
-            .checkpoints
-            .get_mut(&checkpoint_id)
-            .ok_or_else(|| MerkleSyncError::MissingArtifact("staging checkpoint missing".into()))?;
-        if rec.state != CheckpointCommitState::Staging {
-            return Err(MerkleSyncError::NotQuiescent("checkpoint not in Staging state".into()));
+        {
+            let rec = st
+                .checkpoints
+                .get_mut(&checkpoint_id)
+                .ok_or_else(|| MerkleSyncError::MissingArtifact("staging checkpoint missing".into()))?;
+            if rec.state != CheckpointCommitState::Staging {
+                return Err(MerkleSyncError::NotQuiescent("checkpoint not in Staging state".into()));
+            }
+            rec.state = CheckpointCommitState::Committed;
+            rec.manifest_locator = Some(locator);
+            rec.hold_id = Some(hold_id);
         }
-        st.all_issued_locators.insert(locator.to_locator()?.path());
-        rec.state = CheckpointCommitState::Committed;
-        rec.manifest_locator = Some(locator);
-        rec.hold_id = Some(hold_id);
+        st.all_issued_locators.insert(loc_path);
         Ok(())
     }
 

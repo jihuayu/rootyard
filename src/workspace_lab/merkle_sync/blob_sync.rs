@@ -23,7 +23,7 @@ use super::{
     git_compare::GitBundleSnapshot,
     ledger::{
         BlobUploadDriver, CheckpointCommitRecord, CheckpointCommitState, MerkleBlobCheckpointManifest,
-        MerkleCheckpointLedger, RemoteObjectLocatorEntry, SyncUploadReport, UploadFailpoint,
+        MerkleCheckpointLedger, RemoteObjectLocatorEntry, SyncUploadReport, UploadFailpoint, UploadVerifiedArgs,
     },
     manifest::{MerkleChildKind, MerkleStateManifest, decode_rel_bytes},
     manifest_verify::validate_manifest,
@@ -117,17 +117,17 @@ async fn upload_staging_body(
         } else {
             read_file_slice(&params.repo_root.join(rel_path), offset, len)?
         };
-        let receipt = upload_bytes_verified(
-            params.store,
-            params.driver,
-            params.ledger,
-            params.staging_dir,
-            params.ctx,
-            params.generation,
-            "merkle-chunk",
-            &chunk_bytes,
-            params.deadline,
-        )
+        let receipt = upload_bytes_verified(UploadBytesReq {
+            store: params.store,
+            driver: params.driver,
+            ledger: params.ledger,
+            staging_dir: params.staging_dir,
+            ctx: params.ctx,
+            generation: params.generation,
+            namespace: "merkle-chunk",
+            bytes: &chunk_bytes,
+            deadline: params.deadline,
+        })
         .await?;
         let entry = RemoteObjectLocatorEntry::from_locator(receipt.locator());
         params.ledger.record_scoped_object(key, entry.clone());
@@ -157,17 +157,17 @@ async fn upload_staging_body(
             continue;
         }
         let node_bytes = serde_json::to_vec(node).map_err(|e| MerkleSyncError::Io(e.to_string()))?;
-        let receipt = upload_bytes_verified(
-            params.store,
-            params.driver,
-            params.ledger,
-            params.staging_dir,
-            params.ctx,
-            params.generation,
-            "merkle-node",
-            &node_bytes,
-            params.deadline,
-        )
+        let receipt = upload_bytes_verified(UploadBytesReq {
+            store: params.store,
+            driver: params.driver,
+            ledger: params.ledger,
+            staging_dir: params.staging_dir,
+            ctx: params.ctx,
+            generation: params.generation,
+            namespace: "merkle-node",
+            bytes: &node_bytes,
+            deadline: params.deadline,
+        })
         .await?;
         let entry = RemoteObjectLocatorEntry::from_locator(receipt.locator());
         params.ledger.record_scoped_object(key, entry.clone());
@@ -178,17 +178,17 @@ async fn upload_staging_body(
         node_locators.insert(node.node_sha256.clone(), entry);
     }
     let bundle_bytes = serde_json::to_vec(params.git_bundle).map_err(|e| MerkleSyncError::Io(e.to_string()))?;
-    let bundle_receipt = upload_bytes_verified(
-        params.store,
-        params.driver,
-        params.ledger,
-        params.staging_dir,
-        params.ctx,
-        params.generation,
-        "merkle-git",
-        &bundle_bytes,
-        params.deadline,
-    )
+    let bundle_receipt = upload_bytes_verified(UploadBytesReq {
+        store: params.store,
+        driver: params.driver,
+        ledger: params.ledger,
+        staging_dir: params.staging_dir,
+        ctx: params.ctx,
+        generation: params.generation,
+        namespace: "merkle-git",
+        bytes: &bundle_bytes,
+        deadline: params.deadline,
+    })
     .await?;
     uploaded_bytes += bundle_bytes.len() as u64;
     let git_bundle_locator = RemoteObjectLocatorEntry::from_locator(bundle_receipt.locator());
@@ -216,17 +216,17 @@ async fn upload_staging_body(
     if manifest_bytes.len() > MAX_MANIFEST_JSON_BYTES {
         return Err(MerkleSyncError::InvalidManifest("remote manifest exceeds limit".into()));
     }
-    let manifest_receipt = upload_bytes_verified(
-        params.store,
-        params.driver,
-        params.ledger,
-        params.staging_dir,
-        params.ctx,
-        params.generation,
-        "merkle-manifest",
-        &manifest_bytes,
-        params.deadline,
-    )
+    let manifest_receipt = upload_bytes_verified(UploadBytesReq {
+        store: params.store,
+        driver: params.driver,
+        ledger: params.ledger,
+        staging_dir: params.staging_dir,
+        ctx: params.ctx,
+        generation: params.generation,
+        namespace: "merkle-manifest",
+        bytes: &manifest_bytes,
+        deadline: params.deadline,
+    })
     .await?;
     uploaded_bytes += manifest_bytes.len() as u64;
     let manifest_entry = RemoteObjectLocatorEntry::from_locator(manifest_receipt.locator());
@@ -286,43 +286,47 @@ pub(crate) async fn try_reuse_verified(
     }
 }
 
-pub(crate) async fn upload_bytes_verified(
-    store: &BlobStore,
-    driver: &dyn BlobUploadDriver,
-    ledger: &MerkleCheckpointLedger,
-    staging_dir: &Path,
-    ctx: &AccessContext,
-    generation: i64,
-    namespace: &str,
-    bytes: &[u8],
-    deadline: Instant,
-) -> Result<BlobReceipt, MerkleSyncError> {
-    let sha = hex::encode(Sha256::digest(bytes));
-    let tmp = staging_dir.join(format!("upload-{}.bin", Uuid::new_v4()));
+#[derive(Clone, Copy)]
+pub(crate) struct UploadBytesReq<'a> {
+    pub(crate) store: &'a BlobStore,
+    pub(crate) driver: &'a dyn BlobUploadDriver,
+    pub(crate) ledger: &'a MerkleCheckpointLedger,
+    pub(crate) staging_dir: &'a Path,
+    pub(crate) ctx: &'a AccessContext,
+    pub(crate) generation: i64,
+    pub(crate) namespace: &'a str,
+    pub(crate) bytes: &'a [u8],
+    pub(crate) deadline: Instant,
+}
+
+pub(crate) async fn upload_bytes_verified(req: UploadBytesReq<'_>) -> Result<BlobReceipt, MerkleSyncError> {
+    let sha = hex::encode(Sha256::digest(req.bytes));
+    let tmp = req.staging_dir.join(format!("upload-{}.bin", Uuid::new_v4()));
     {
         let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
-        f.write_all(bytes)?;
+        f.write_all(req.bytes)?;
         f.sync_all()?;
     }
-    let res = driver
-        .upload_verified(
-            store,
-            ctx.tenant_id,
-            ctx.repo_id,
-            generation,
-            namespace,
-            &sha,
-            bytes.len() as u64,
-            &tmp,
-            deadline,
-        )
+    let res = req
+        .driver
+        .upload_verified(UploadVerifiedArgs {
+            store: req.store,
+            tenant_id: req.ctx.tenant_id,
+            authority_id: req.ctx.repo_id,
+            generation: req.generation,
+            namespace: req.namespace,
+            sha256: &sha,
+            length: req.bytes.len() as u64,
+            source_path: &tmp,
+            deadline: req.deadline,
+        })
         .await;
     let _ = fs::remove_file(&tmp);
     let receipt = res?;
-    if receipt.backend_identity().as_hex() != store.backend_identity().as_hex() {
+    if receipt.backend_identity().as_hex() != req.store.backend_identity().as_hex() {
         return Err(MerkleSyncError::ForeignBackend);
     }
-    ledger.record_issued_locator(receipt.locator());
+    req.ledger.record_issued_locator(receipt.locator());
     Ok(receipt)
 }
 

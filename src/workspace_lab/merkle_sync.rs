@@ -158,6 +158,7 @@ pub use git_state::{IgnoreSnapshot, read_git_state_and_bundle, validate_git_comp
 pub use ledger::{
     BlobUploadDriver, CheckpointCommitRecord, CheckpointCommitState, MerkleBlobCheckpointManifest,
     MerkleCheckpointLedger, PgProtectedUploadDriver, RemoteObjectLocatorEntry, SyncUploadReport, UploadFailpoint,
+    UploadVerifiedArgs, UploadVerifyFuture,
 };
 pub use manifest::{
     ChunkRef, EmptyDirPolicy, GitIndexEntryRecord, GitStateSnapshot, HeadSnapshot, IgnorePolicySpec, MerkleChangeKind,

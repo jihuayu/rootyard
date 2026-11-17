@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
     fs,
     os::unix::ffi::OsStrExt,
     path::Path,
@@ -30,7 +29,7 @@ pub enum DirtyScope {
     Subtrees { dirty_dirs: BTreeSet<Vec<u8>>, dirty_paths: BTreeSet<Vec<u8>>, force_rehash_dirs: BTreeSet<Vec<u8>> },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScanMetrics {
     pub full_scan: bool,
