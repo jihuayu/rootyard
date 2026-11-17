@@ -143,6 +143,8 @@ class BindingAndEnvironmentTest(unittest.TestCase):
             commit = "a" * 40
             binary_sha = support.sha256_file(binary)
             validated = SimpleNamespace(
+                schema="v2",
+                payload={"receipt_schema": main.receipts.RECEIPT_SCHEMA_V2},
                 artifacts=({"kind": "bin", "target": "rootyard-pando-lab",
                             "executable_sha256": binary_sha},),
                 binary_sha256=binary_sha, workspace_commit=commit,
@@ -175,6 +177,8 @@ class BindingAndEnvironmentTest(unittest.TestCase):
             receipt.write_text("{}")
             commit = "a" * 40
             validated = SimpleNamespace(
+                schema="v2",
+                payload={"receipt_schema": main.receipts.RECEIPT_SCHEMA_V2},
                 artifacts=({"kind": "bin", "target": "rootyard"},),
                 binary_sha256=support.sha256_file(binary),
                 workspace_commit=commit, receipt_sha256="b" * 64)

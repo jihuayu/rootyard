@@ -90,16 +90,30 @@ def _source_state(root):
 
 
 def _pando_artifact(receipt, binary_sha256):
+    """Require the modern v2 per-bin Pando artifact, not a v1 secondary row.
+
+    Legacy v1 receipts only bind the supplied binary to their primary artifact;
+    a secondary ``rootyard-pando-lab`` row may omit executable path and hash.
+    This gate therefore rejects v1 outright and requires the v2 artifact row's
+    executable digest to equal the actual selected binary.
+    """
+    require(getattr(receipt, "schema", None) == "v2",
+            "receipt_pando_receipt_not_v2", "binding")
+    payload = getattr(receipt, "payload", None)
+    require(isinstance(payload, dict)
+            and payload.get("receipt_schema") == receipts.RECEIPT_SCHEMA_V2,
+            "receipt_pando_schema_mismatch", "binding")
     rows = [
         row for row in receipt.artifacts
         if isinstance(row, dict) and row.get("kind") == "bin"
         and row.get("target") == "rootyard-pando-lab"
     ]
     require(bool(rows), "receipt_pando_artifact_missing", "binding")
+    require(len(rows) == 1, "receipt_pando_artifact_ambiguous", "binding")
     row = rows[0]
-    if "executable_sha256" in row:
-        require(row["executable_sha256"] == binary_sha256,
-                "receipt_pando_artifact_mismatch", "binding")
+    require(isinstance(row.get("executable_sha256"), str)
+            and row["executable_sha256"] == binary_sha256,
+            "receipt_pando_artifact_mismatch", "binding")
     return True
 
 
