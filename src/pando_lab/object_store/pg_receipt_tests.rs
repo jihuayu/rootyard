@@ -291,7 +291,7 @@ async fn pg_two_shared_writers_barrier_install_one_file_winner_and_retry_verifie
     let session_b = lifecycle::publication::writer_session(&config, repo).await.unwrap();
     let barrier = Arc::new(Barrier::new(2));
     let mut handles = Vec::new();
-    for mut session in [session_a, session_b] {
+    for session in [session_a, session_b] {
         let config = config.clone();
         let opts = opts.clone();
         let barrier = Arc::clone(&barrier);
@@ -311,8 +311,8 @@ async fn pg_two_shared_writers_barrier_install_one_file_winner_and_retry_verifie
             (session, result)
         }));
     }
-    let (mut session_a, result_a) = handles.remove(0).await.unwrap();
-    let (mut session_b, result_b) = handles.remove(0).await.unwrap();
+    let (session_a, result_a) = handles.remove(0).await.unwrap();
+    let (session_b, result_b) = handles.remove(0).await.unwrap();
     let (mut winner_session, prepared) = match (result_a, result_b) {
         (Ok(prepared), Err(_)) => (session_a, prepared),
         (Err(_), Ok(prepared)) => (session_b, prepared),
