@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::blob_store::disposable_view::{DisposableViewRoot, TempViewLease};
 
 use super::{
+    error::PackRootLockGuard,
     lease_pin::ActiveViewSlot,
     pack_cache::{PackCachePin, check_regular_file_len, ensure_private_dir},
     types::{ReplicaCacheError, ReplicaCacheLimits, ReplicaViewKey},
@@ -40,6 +41,7 @@ pub struct CachedViewSlot {
     expected_pack_files: Vec<(String, u64, u64)>,
     state: Mutex<SlotInner>,
     catalog: Arc<Mutex<ViewCatalogInner>>,
+    _root_lock: Option<Arc<PackRootLockGuard>>,
 }
 
 impl CachedViewSlot {
@@ -140,6 +142,7 @@ pub struct ViewCacheCatalog {
     view_root: DisposableViewRoot,
     limits: ReplicaCacheLimits,
     inner: Arc<Mutex<ViewCatalogInner>>,
+    root_lock: Option<Arc<PackRootLockGuard>>,
 }
 
 /// Isolated push scratch directory lease strictly separate from shared views.
@@ -174,7 +177,11 @@ impl ViewCacheCatalog {
         let view_root =
             DisposableViewRoot::open(&views_subdir, limits.max_active_views, limits.max_view_bytes, limits.view_ttl)?;
         let _ = view_root.sweep_expired();
-        Ok(Self { view_root, limits, inner: Arc::new(Mutex::new(ViewCatalogInner::default())) })
+        Ok(Self { view_root, limits, inner: Arc::new(Mutex::new(ViewCatalogInner::default())), root_lock: None })
+    }
+
+    pub(super) fn attach_root_lock(&mut self, lock: Arc<PackRootLockGuard>) {
+        self.root_lock = Some(lock);
     }
 
     pub fn view_root(&self) -> &DisposableViewRoot {
@@ -260,6 +267,7 @@ impl ViewCacheCatalog {
             expected_pack_files,
             state: Mutex::new(SlotInner { active_readers: 1, unindexed: false }),
             catalog: Arc::clone(&self.inner),
+            _root_lock: self.root_lock.clone(),
         });
         let dropped = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());

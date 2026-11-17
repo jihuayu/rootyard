@@ -326,8 +326,13 @@ fn pack_cache_open_enforces_exclusive_root_lock_and_preserves_pinned_packs() {
     assert!(pin.pack_path().is_file());
     assert_eq!(catalog1.entry_count(), 1);
 
-    drop(pin);
+    // Dropping the catalog while a live `PackCachePin` still exists must keep the lock held.
+    let pinned_path = pin.pack_path().to_path_buf();
     drop(catalog1);
+    assert!(matches!(PackCacheCatalog::open(&replica, ReplicaCacheLimits::default()), Err(ReplicaCacheError::Io(_))));
+    assert!(pinned_path.is_file());
+
+    drop(pin);
     let catalog2 = PackCacheCatalog::open(&replica, ReplicaCacheLimits::default()).unwrap();
     assert_eq!(catalog2.entry_count(), 0);
     drop(catalog2);
@@ -354,4 +359,62 @@ fn pack_cache_open_enforces_exclusive_root_lock_and_preserves_pinned_packs() {
     let catalog3 = PackCacheCatalog::open(&replica, ReplicaCacheLimits::default()).unwrap();
     assert!(!peer_pack_dir.exists());
     drop(catalog3);
+}
+
+#[test]
+fn view_slot_guard_retains_root_lock_after_catalogs_drop() {
+    let dir = TempDir::new().unwrap();
+    let replica = dir.path().join("replica-view-lock");
+    let limits = ReplicaCacheLimits::default();
+    let packs = PackCacheCatalog::open(&replica, limits).unwrap();
+    let mut views = ViewCacheCatalog::open(&replica, limits).unwrap();
+    views.attach_root_lock(packs.root_lock());
+
+    let (tid, rid, hid, cid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let stage = packs.staging_dir().unwrap();
+    let sp = stage.join("p.pack");
+    let si = stage.join("p.idx");
+    std::fs::write(&sp, b"view-pack").unwrap();
+    std::fs::write(&si, b"view-idx").unwrap();
+    let p_loc = BlobLocator::new(tid, rid, 1, Uuid::new_v4(), "packs", &digest(b"view-pack"), 9).unwrap();
+    let i_loc = BlobLocator::new(tid, rid, 1, Uuid::new_v4(), "packs", &digest(b"view-idx"), 8).unwrap();
+    let spec = PackObjectSpec::provider_managed(format!("pack-{}", "d".repeat(40)), p_loc, i_loc);
+    let key = spec.pack_cache_key(&"3".repeat(64), ReplicaObjectFormat::Sha1).unwrap();
+    let pin = packs.install_and_pin(key, &sp, &si).unwrap();
+    let pinned_path = pin.pack_path().to_path_buf();
+
+    let view_key = ReplicaViewKey::build(
+        tid,
+        rid,
+        hid,
+        cid,
+        &blob_backend_identity("view-lock"),
+        ReplicaObjectFormat::Sha1,
+        1,
+        1,
+        &[spec],
+        &[ReplicaRefSpec::new("refs/heads/main", "e".repeat(40))],
+        "refs/heads/main",
+    )
+    .unwrap();
+    let lease = views.view_root().create_view("replica-view", tid, rid, 4096, Some(limits.view_ttl)).unwrap();
+    let slot = views.admit_and_checkout(view_key, lease, vec![pin], 4096, Vec::new()).unwrap();
+    let guard = ReplicaViewGuard::new(
+        "node-1".into(),
+        slot,
+        DurablePinRegistry::new().acquire(tid, rid, 1),
+        ReplicaServeSource::ColdBlobMaterialized,
+        ReplicaRequestMetrics::default(),
+        true,
+    );
+
+    drop(views);
+    drop(packs);
+    assert!(matches!(PackCacheCatalog::open(&replica, limits), Err(ReplicaCacheError::Io(_))));
+    assert!(pinned_path.is_file());
+    assert!(guard.repo_path().unwrap().exists());
+
+    drop(guard);
+    let reopened = PackCacheCatalog::open(&replica, limits).unwrap();
+    assert_eq!(reopened.entry_count(), 0);
 }

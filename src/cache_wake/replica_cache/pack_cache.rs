@@ -37,6 +37,7 @@ struct PackCatalogInner {
     lru_counter: u64,
     evicted_count: u64,
     pin_protections: u64,
+    _root_lock: Option<Arc<PackRootLockGuard>>,
 }
 
 /// Layer 1 verified immutable `.pack` / `.idx` cache.
@@ -56,6 +57,7 @@ pub struct PackCachePin {
     idx_path: PathBuf,
     inner: Arc<Mutex<PackCatalogInner>>,
     released: bool,
+    _root_lock: Arc<PackRootLockGuard>,
 }
 
 impl PackCachePin {
@@ -110,7 +112,12 @@ impl PackCacheCatalog {
             .map_err(|e| ReplicaCacheError::Io(format!("failed canonicalizing pack cache root: {e}")))?;
         let root_lock = Arc::new(PackRootLockGuard::acquire(&root_dir)?);
         let _ = sweep_orphan_cache_dirs(&root_dir)?;
-        Ok(Self { root_dir, limits, inner: Arc::new(Mutex::new(PackCatalogInner::default())), _root_lock: root_lock })
+        let inner = PackCatalogInner { _root_lock: Some(Arc::clone(&root_lock)), ..Default::default() };
+        Ok(Self { root_dir, limits, inner: Arc::new(Mutex::new(inner)), _root_lock: root_lock })
+    }
+
+    pub(super) fn root_lock(&self) -> Arc<PackRootLockGuard> {
+        Arc::clone(&self._root_lock)
     }
 
     pub fn staging_dir(&self) -> Result<PathBuf, ReplicaCacheError> {
@@ -135,6 +142,7 @@ impl PackCacheCatalog {
             idx_path,
             inner: Arc::clone(&self.inner),
             released: false,
+            _root_lock: Arc::clone(&self._root_lock),
         }
     }
 
@@ -215,15 +223,8 @@ impl PackCacheCatalog {
 
         let to_remove = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let next_seq = guard.lru_counter.saturating_add(1);
-            let hit = guard.entries.get_mut(key.key_digest()).map(|existing| {
-                existing.lru_seq = next_seq;
-                existing.pin_count = existing.pin_count.saturating_add(1);
-                (existing.dir_path.clone(), existing.pack_path.clone(), existing.idx_path.clone())
-            });
-            if let Some((dir_path, pack_path, idx_path)) = hit {
-                guard.lru_counter = next_seq;
-                return Ok(self.make_pin(key.key_digest().to_owned(), dir_path, pack_path, idx_path));
+            if let Some((d, p, i)) = try_pin_existing(&mut guard, key.key_digest()) {
+                return Ok(self.make_pin(key.key_digest().to_owned(), d, p, i));
             }
             evict_unpinned_packs(&mut guard, &self.limits, entry_bytes)?
         };
@@ -257,17 +258,12 @@ impl PackCacheCatalog {
 
         let (to_remove_late, pin) = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            let next_seq = guard.lru_counter.saturating_add(1);
-            if let Some((dir_path, pack_path, idx_path)) = guard.entries.get_mut(key.key_digest()).map(|existing| {
-                existing.lru_seq = next_seq;
-                existing.pin_count = existing.pin_count.saturating_add(1);
-                (existing.dir_path.clone(), existing.pack_path.clone(), existing.idx_path.clone())
-            }) {
-                guard.lru_counter = next_seq;
+            if let Some((d, p, i)) = try_pin_existing(&mut guard, key.key_digest()) {
                 drop(guard);
                 let _ = remove_child_safely(&self.root_dir, &target_dir);
-                return Ok(self.make_pin(key.key_digest().to_owned(), dir_path, pack_path, idx_path));
+                return Ok(self.make_pin(key.key_digest().to_owned(), d, p, i));
             }
+            let next_seq = guard.lru_counter.saturating_add(1);
             let evicted = match evict_unpinned_packs(&mut guard, &self.limits, entry_bytes) {
                 Ok(v) => v,
                 Err(err) => {
@@ -303,45 +299,44 @@ impl PackCacheCatalog {
         if !is_lower_hex_exact(key_digest, 64) {
             return;
         }
-        let remove_dir = {
-            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(entry) = guard.entries.remove(key_digest) {
-                if entry.pin_count == 0 {
-                    guard.total_bytes = guard.total_bytes.saturating_sub(entry.total_bytes);
-                    Some(entry.dir_path)
-                } else {
-                    guard.retired_entries.insert(entry.dir_path.clone(), entry);
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let remove_dir = retire_entry_in_lock(&mut self.inner.lock().unwrap_or_else(|p| p.into_inner()), key_digest);
         if let Some(dir) = remove_dir {
             let _ = remove_child_safely(&self.root_dir, &dir);
         }
     }
 
     pub fn clear_all(&self) {
-        let mut to_remove = Vec::new();
-        {
+        let to_remove: Vec<PathBuf> = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let keys: Vec<String> = guard.entries.keys().cloned().collect();
-            for key in keys {
-                if let Some(entry) = guard.entries.remove(&key) {
-                    if entry.pin_count == 0 {
-                        guard.total_bytes = guard.total_bytes.saturating_sub(entry.total_bytes);
-                        to_remove.push(entry.dir_path);
-                    } else {
-                        guard.retired_entries.insert(entry.dir_path.clone(), entry);
-                    }
-                }
-            }
-        }
+            keys.into_iter().filter_map(|k| retire_entry_in_lock(&mut guard, &k)).collect()
+        };
         for dir in to_remove {
             let _ = remove_child_safely(&self.root_dir, &dir);
         }
     }
+}
+
+fn retire_entry_in_lock(guard: &mut PackCatalogInner, key_digest: &str) -> Option<PathBuf> {
+    let entry = guard.entries.remove(key_digest)?;
+    if entry.pin_count == 0 {
+        guard.total_bytes = guard.total_bytes.saturating_sub(entry.total_bytes);
+        Some(entry.dir_path)
+    } else {
+        guard.retired_entries.insert(entry.dir_path.clone(), entry);
+        None
+    }
+}
+
+fn try_pin_existing(guard: &mut PackCatalogInner, key_digest: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
+    let next_seq = guard.lru_counter.saturating_add(1);
+    let paths = guard.entries.get_mut(key_digest).map(|existing| {
+        existing.lru_seq = next_seq;
+        existing.pin_count = existing.pin_count.saturating_add(1);
+        (existing.dir_path.clone(), existing.pack_path.clone(), existing.idx_path.clone())
+    })?;
+    guard.lru_counter = next_seq;
+    Some(paths)
 }
 
 fn evict_unpinned_packs(

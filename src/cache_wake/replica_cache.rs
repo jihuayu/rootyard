@@ -110,7 +110,8 @@ impl ReplicaCacheNode {
         }
         limits.validate()?;
         let packs = PackCacheCatalog::open(replica_root, limits)?;
-        let views = ViewCacheCatalog::open(replica_root, limits)?;
+        let mut views = ViewCacheCatalog::open(replica_root, limits)?;
+        views.attach_root_lock(packs.root_lock());
         let singleflight = BoundedSingleFlight::new(limits)?;
         Ok(Self {
             node_id,
