@@ -402,11 +402,13 @@ mod tests {
             node_locators: BTreeMap::new(),
         };
         let node_bytes = serde_json::to_vec(&root_node).unwrap();
+        let bundle_files = Vec::<crate::workspace_lab::merkle_sync::git_compare::GitBundleFile>::new();
+        let bundle_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&bundle_files).unwrap()));
         let gb_bytes = serde_json::to_vec(&GitBundleSnapshot {
             schema: MERKLE_MANIFEST_SCHEMA,
             object_format: MerkleObjectFormat::Sha1,
-            files: Vec::new(),
-            bundle_sha256: zero_sha.clone(),
+            files: bundle_files,
+            bundle_sha256,
         })
         .unwrap();
         let arts = vec![
