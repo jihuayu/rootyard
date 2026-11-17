@@ -291,10 +291,10 @@ fn emit(
         line.push(if ok { '1' } else { '0' });
     }
     line.push('|');
-    if let Some(status) = status {
-        if (100..=599).contains(&status) {
-            let _ = write!(&mut line, "{status}");
-        }
+    if let Some(status) = status
+        && (100..=599).contains(&status)
+    {
+        let _ = write!(&mut line, "{status}");
     }
     line.push('|');
     if let Some((a, b, c, d, e)) = counts {
