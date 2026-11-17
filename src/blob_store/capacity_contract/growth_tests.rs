@@ -200,7 +200,7 @@ fn bounded_refs_op_fences_and_off_by_one_failed_pack_limit() {
         push_mut(&mut state, Uuid::new_v4(), "refs/heads/c", &zero, &oid1),
         Err(GrowthEngineError::Ledger(LedgerRetentionError::LedgerBudgetExhausted {
             resource: "acked_refs",
-            current: 2,
+            current: 3,
             limit: 2
         }))
     ));
@@ -233,7 +233,7 @@ fn bounded_refs_op_fences_and_off_by_one_failed_pack_limit() {
 fn bounded_holds_and_nested_holds_fail_atomically() {
     let mut contract = PandoCapacityContract::current_standalone();
     contract.metadata_ledger.repo_max_holds = 2;
-    contract.metadata_ledger.repo_max_nested_holds = 5;
+    contract.metadata_ledger.repo_max_nested_holds = 9;
     let mut ledger = RetentionLedger::new(LedgerBudgetPolicy::from_contract(&contract));
     let (p1, p2) = (Uuid::new_v4(), Uuid::new_v4());
     ledger.record_entry(Uuid::new_v4(), LedgerEntryKind::Membership, Some(p1), None, 256, 1).unwrap();
@@ -245,18 +245,19 @@ fn bounded_holds_and_nested_holds_fail_atomically() {
     let h2 = ProtectionHold::Pin { pin_id: Uuid::new_v4(), purpose: "p2".into() };
     let h3 = ProtectionHold::Pin { pin_id: Uuid::new_v4(), purpose: "p3".into() };
     assert_eq!(ledger.attach_hold_to_active_frontier(h1).unwrap(), 4);
+    assert_eq!(ledger.total_nested_holds(), 8);
     assert!(matches!(
         ledger.attach_hold_to_active_frontier(h2.clone()),
-        Err(LedgerRetentionError::LedgerBudgetExhausted { resource: "nested_holds", current: 4, limit: 5 })
+        Err(LedgerRetentionError::LedgerBudgetExhausted { resource: "nested_holds", current: 8, limit: 9 })
     ));
-    assert_eq!(ledger.total_nested_holds(), 4);
+    assert_eq!(ledger.total_nested_holds(), 8);
     assert!(matches!(ledger.release_hold(h2.hold_id()), Err(LedgerRetentionError::HoldNotFound(_))));
 
     assert_eq!(ledger.attach_hold_to_pack(p1, h2).unwrap(), 1);
-    assert_eq!(ledger.total_nested_holds(), 5);
+    assert_eq!(ledger.total_nested_holds(), 9);
     assert!(matches!(
         ledger.attach_hold_to_pack(p1, h3),
         Err(LedgerRetentionError::LedgerBudgetExhausted { resource: "holds", current: 2, limit: 2 })
     ));
-    assert_eq!(ledger.total_nested_holds(), 5);
+    assert_eq!(ledger.total_nested_holds(), 9);
 }
