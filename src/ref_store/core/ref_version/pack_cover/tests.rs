@@ -453,16 +453,17 @@ fn thin_pack_uncached_retired_or_historical_delta_base_falls_back_cleanly() {
         allow_strong_fallback: true,
         prefer_compacted_above_delta_count: DEFAULT_COMPACTED_THRESHOLD,
     };
-    let assert_ret_lost = |req: &mut FetchPlanRequest, ret_idx: &RetentionClassificationIndex| {
-        req.allow_strong_fallback = true;
-        assert!(matches!(
-            super::planner::plan_fetch_covers(req, &graph, &index, ret_idx).unwrap(),
-            FetchPlanOutcome::FallbackToStrongSnapshot { reason: FallbackReason::RetentionLost, .. }
-        ));
-        req.allow_strong_fallback = false;
-        assert_eq!(super::planner::plan_fetch_covers(req, &graph, &index, ret_idx), Err(FetchPlanError::RetentionLost));
-    };
-    assert_ret_lost(&mut req, &hist_ret);
+    let assert_ret_lost =
+        |req: &mut FetchPlanRequest, idx: &CoverHierarchyIndex, r_idx: &RetentionClassificationIndex| {
+            req.allow_strong_fallback = true;
+            assert!(matches!(
+                super::planner::plan_fetch_covers(req, &graph, idx, r_idx).unwrap(),
+                FetchPlanOutcome::FallbackToStrongSnapshot { reason: FallbackReason::RetentionLost, .. }
+            ));
+            req.allow_strong_fallback = false;
+            assert_eq!(super::planner::plan_fetch_covers(req, &graph, idx, r_idx), Err(FetchPlanError::RetentionLost));
+        };
+    assert_ret_lost(&mut req, &index, &hist_ret);
 
     let (p_sup, a_sup) = make_pack(&r, 33, 39_000, 1000, false, vec![]);
     let mem2 = compute_cover_membership_digest(&r, 3, &[*p_sup.entry(), *p2_c.entry()]).unwrap();
@@ -490,5 +491,5 @@ fn thin_pack_uncached_retired_or_historical_delta_base_falls_back_cleanly() {
         membership_digest: index.membership_digest(),
         heads,
     });
-    assert_ret_lost(&mut req, &active_ret);
+    assert_ret_lost(&mut req, &index, &active_ret);
 }
