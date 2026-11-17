@@ -1206,6 +1206,31 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertFalse(v1_prefix_with_v2_body.diagnostics_valid)
         self.assertEqual(v1_prefix_with_v2_body.quorum_diagnostics, [])
 
+    def test_quorum_diagnostic_v2_preserves_historical_matching_proposer(self) -> None:
+        payload = _diagnostic_v2_payload()
+        leader_node = payload["snapshots"][0]["nodes"][0]
+        leader_node["replication_matching"][1].update(
+            matched_index=41,
+            matched_term=6,
+            matched_leader_slot="slot2",
+        )
+        evidence = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, _diagnostic_v2_frame(payload)
+        )
+        self.assertTrue(evidence.diagnostics_valid)
+        safe_node = evidence.quorum_diagnostics[0]["snapshots"][0]["nodes"][0]
+        self.assertEqual(safe_node["leader_slot"], "slot1")
+        self.assertEqual(safe_node["term"], 7)
+        self.assertEqual(
+            safe_node["replication_matching"][1],
+            {
+                "slot": 2,
+                "matched_index": 41,
+                "matched_term": 6,
+                "matched_leader_slot": "slot2",
+            },
+        )
+
     def test_quorum_diagnostic_v2_rejects_malformed_matching_shapes(self) -> None:
         cases = []
 

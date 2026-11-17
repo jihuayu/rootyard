@@ -125,7 +125,7 @@ fn node_sample(slot: u8, node: &RootRaftNode) -> NodeSample {
     let millis_since_quorum_ack =
         metrics.millis_since_quorum_ack.map(|value| bounded(value, MAX_MILLIS_SINCE_QUORUM_ACK, &mut numeric_overflow));
     let observed_leader_slot = leader_slot(metrics.current_leader);
-    let matching = replication_matching(metrics.replication.as_ref(), observed_leader_slot, &mut numeric_overflow);
+    let matching = replication_matching(metrics.replication.as_ref(), &mut numeric_overflow);
     NodeSample {
         slot,
         running_state: running_state(&metrics.running_state),
@@ -147,11 +147,12 @@ fn node_sample(slot: u8, node: &RootRaftNode) -> NodeSample {
 /// exact fixed three-slot key set is required; any other shape is reported as unavailable without
 /// exposing the observed identifiers. A present target with no matching log id keeps all three
 /// coordinate fields null, which is distinct from an absent target. The matched leader slot is the
-/// leader observed in this same publication; this OpenRaft `LogId` does not retain a proposer node
-/// id. This is published per-target progress, not a remote acknowledgment and not a commit claim.
+/// actual proposer retained in the matching `LogId` (the pinned configuration keeps
+/// `leader_id.node_id`), not this publication's current leader. A coordinate for an older log is
+/// therefore not relabelled after a leadership change. This is published per-target progress, not a
+/// remote acknowledgment and not a commit claim.
 fn replication_matching(
     replication: Option<&BTreeMap<u64, Option<LogId<u64>>>>,
-    observed_leader_slot: &'static str,
     overflow: &mut bool,
 ) -> Option<Vec<MatchingSample>> {
     let replication = replication?;
@@ -162,19 +163,49 @@ fn replication_matching(
     }
     let mut entries = Vec::with_capacity(FIXTURE_SLOTS.len());
     for slot in FIXTURE_SLOTS {
-        let matching = replication.get(&u64::from(slot)).copied().flatten();
-        let (matched_index, matched_term, matched_leader_slot) = match matching {
+        let matching_log_id = replication.get(&u64::from(slot)).copied().flatten();
+        let (matched_index, matched_term) = match matching_log_id {
             Some(log_id) => (
                 Some(bounded(log_id.index, MAX_LOG_INDEX, overflow)),
                 Some(bounded(log_id.leader_id.term, MAX_TERM, overflow)),
-                Some(observed_leader_slot),
             ),
-            None => (None, None, None),
+            None => (None, None),
         };
-        entries.push(MatchingSample { slot, matched_index, matched_term, matched_leader_slot });
+        entries.push(MatchingSample {
+            slot,
+            matched_index,
+            matched_term,
+            matched_leader_slot: matching_leader_slot(matching_log_id),
+        });
     }
     Some(entries)
 }
+
+/// Maps the actual matching log proposer into the same closed slot vocabulary as `leader_slot`.
+///
+/// Raw node identifiers are never serialized. Unknown identifiers become `"other"`.
+const fn matching_leader_slot(matching: Option<LogId<u64>>) -> Option<&'static str> {
+    match matching {
+        Some(log_id) => Some(leader_slot(Some(log_id.leader_id.node_id))),
+        None => None,
+    }
+}
+
+/// Compile-time regression for proposer attribution with the actual configured `LogId` type.
+///
+/// A runtime `#[test]` cannot be added here without changing the fixed three-case integration-test
+/// inventory. This constant item is compiled by the integration test target and calls the same
+/// helper used by the projection. It constructs a log proposed by slot 2 while the observed current
+/// leader is slot 1, proving the projection does not coerce the historical proposer.
+#[cfg(test)]
+const _: () = {
+    let matched = LogId { leader_id: openraft::CommittedLeaderId { term: 6, node_id: 2 }, index: 11 };
+    let observed_current_leader: Option<u64> = Some(1);
+    assert!(matches!(matching_leader_slot(Some(matched)), Some("slot2")));
+    assert!(!matches!(matching_leader_slot(Some(matched)), Some("slot1")));
+    assert!(matches!(matching_leader_slot(None), None));
+    assert!(matches!(leader_slot(observed_current_leader), "slot1"));
+};
 
 fn bounded(value: u64, maximum: u64, overflow: &mut bool) -> u64 {
     if value > maximum {
@@ -204,7 +235,7 @@ fn server_state(value: ServerState) -> &'static str {
     }
 }
 
-fn leader_slot(value: Option<u64>) -> &'static str {
+const fn leader_slot(value: Option<u64>) -> &'static str {
     match value {
         Some(1) => "slot1",
         Some(2) => "slot2",
