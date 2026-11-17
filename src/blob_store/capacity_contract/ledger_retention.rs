@@ -231,7 +231,7 @@ impl RetentionLedger {
         hasher.update(self.archived_checkpoint_digest.as_bytes());
         for (id, bytes) in &newly_archived {
             hasher.update(id.as_bytes());
-            hasher.update(&bytes.to_be_bytes());
+            hasher.update(bytes.to_be_bytes());
         }
         self.archived_checkpoint_digest = hex::encode(hasher.finalize());
         newly_archived.len()

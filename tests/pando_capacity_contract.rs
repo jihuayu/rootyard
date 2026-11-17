@@ -127,13 +127,13 @@ async fn handle_s3(State(state): State<Arc<S3State>>, method: Method, uri: Uri, 
     }
     match method {
         Method::PUT => {
-            let etag = format!("\"{}\"", &hex::encode(Sha256::digest(&body))[..32]);
+            let etag = format!("\"{}\"", &hex::encode(Sha256::digest(body.as_ref()))[..32]);
             state.objects.lock().unwrap().insert(full_key, body.to_vec());
             s3_resp(StatusCode::OK, Some(&etag), 0, Body::empty())
         }
         Method::HEAD | Method::GET => match state.objects.lock().unwrap().get(&full_key).cloned() {
             Some(data) => {
-                let etag = format!("\"{}\"", &hex::encode(Sha256::digest(&data))[..32]);
+                let etag = format!("\"{}\"", &hex::encode(Sha256::digest(data.as_slice()))[..32]);
                 let payload = if method == Method::HEAD { Body::empty() } else { Body::from(data.clone()) };
                 s3_resp(StatusCode::OK, Some(&etag), data.len(), payload)
             }
