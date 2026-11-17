@@ -34,13 +34,17 @@ Refusal checkpoint (selected together by default, or alone):
 * the real service is restarted against a fresh, unused Blob root prefix, which
   is a distinct physical backend identity. A create for an existing bound
   repository is refused at the production conflict boundary and the catalog,
-  serving intent, readiness and core gate are unchanged.
+  serving intent, readiness and core gate are unchanged;
+* a fixture-owned, unserved legacy ``gitfs`` repository row is the old storage
+  format. The same create path refuses it explicitly instead of adopting or
+  upgrading it; no binding, gate or protocol row appears, the row is not served,
+  and a separately created real ready authority is unchanged.
 
 No SQL inserts a ready repository, binding, gate, protocol row, ref, object or
-ACK. The only fixture SQL writes are a temporary barrier table, a deferred
-constraint trigger and its function in the random schema this run owns; they are
-dropped in a bounded ``finally`` block. Reports contain no DSN, token, S3
-credential, raw server stderr or environment dump.
+ACK. SQL writes only the temporary barrier table/trigger/function in the random
+schema this run owns, plus one unserved legacy ``gitfs`` repository row in the
+old-format case; both are dropped with the schema. Reports contain no DSN,
+token, S3 credential, raw server stderr or environment dump.
 """
 import argparse
 import concurrent.futures
@@ -69,6 +73,7 @@ CASES = (
     "lost_create_ack_proxy_retry_resolves_one_authority",
     "deferred_commit_barrier_kill_rolls_back_and_retry_converges",
     "backend_identity_conflict_is_explicit_and_preserves_authority",
+    "unsupported_legacy_repository_format_is_explicitly_refused",
 )
 
 FIRST_CHECKPOINT = CASES[:4]
@@ -81,7 +86,8 @@ LIMITATIONS = [
     "The deferred-commit case uses a fixture-owned PostgreSQL deferred constraint trigger, a transaction-scoped advisory barrier and a process SIGKILL; the service's existing 5s statement timeout bounds that window, and the harness kills immediately after observing the barrier. It does not claim PostgreSQL crash recovery.",
     "The ACK-loss case is one real loopback proxy that reads a committed backend 201 and then closes the client connection; it is not exhaustive transport fault injection.",
     "The backend-identity case restarts the real service against a fresh, unused Blob root prefix and performs no Blob write under that conflicting mapping; it does not claim provider failover or data migration.",
-    "No SQL creates a ready repository, binding, gate, protocol row, ref, object or acknowledgment. SQL reads authority state and writes only the temporary barrier in this run's random schema.",
+    "The legacy-format case inserts one unserved provisioning/gitfs repository row in this run's random schema. It is negative fixture metadata, not a ready authority; no old binary, migration, import or upgrade path is executed, and the schema cleanup removes the row.",
+    "No SQL creates a ready repository, binding, gate, protocol row, ref, object or acknowledgment. SQL reads authority state and writes only the temporary barrier and the single unserved legacy fixture row in this run's random schema.",
     "The temporary barrier trigger/function/table are dropped in a bounded finally block; transaction-scoped advisory locks are released by PostgreSQL on commit/abort.",
     "Concurrency is a small bounded request group on one process, not a scalability benchmark.",
     "The harness sets the existing ROOTYARD_MAX_CONCURRENT_GIT knob to 8 so the half-ready read probe can run while one create is blocked; it is not a capacity claim.",
@@ -402,6 +408,39 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
             " || '|' || (SELECT count(*) FROM ref_store_core_protocol_repos p JOIN repositories r ON r.id=p.repository_id"
             " WHERE r.owner_id=" + owner + " AND r.name=" + name + ")::text",
             "authority counts for " + expected_name)
+
+    def insert_unserved_legacy_gitfs_repository(self, expected_name):
+        """Create only the old-format metadata the provision path must refuse.
+
+        This is the pre-migration-145 ``gitfs`` storage format in its explicitly
+        unserved ``provisioning`` state. It deliberately has no serving
+        binding, core gate, protocol realm, ref, object or ACK; the production
+        service must not adopt or upgrade it.
+        """
+        owner_id = str(uuid.UUID(str(self.alice["user_id"])))
+        repository_id = str(uuid.uuid4())
+        self.bounded_sql(
+            "INSERT INTO repositories(id,owner_id,name,state,storage_backend,object_format)"
+            " VALUES(" + quote_literal(repository_id) + "," + quote_literal(owner_id) + ","
+            + quote_literal(expected_name) + ",'provisioning','gitfs','sha1')")
+        return repository_id
+
+    def legacy_repository_snapshot(self, expected_name):
+        """Read-only old-format fixture observation; never mints authority."""
+        owner = quote_literal(str(uuid.UUID(str(self.alice["user_id"]))))
+        name = quote_literal(expected_name)
+        counts = self.authority_count_for_name(expected_name)
+        assert counts == "1|0|0|0", "legacy fixture is not one unserved repository row: " + counts
+        row = self.one(
+            "SELECT id::text || '|' || owner_id::text || '|' || name || '|' || state || '|' || storage_backend"
+            " || '|' || object_format || '|' || transition_state FROM repositories"
+            " WHERE owner_id=" + owner + " AND name=" + name,
+            "legacy fixture repository row")
+        fields = row.split("|")
+        assert len(fields) == 7, row
+        assert fields[3] == "provisioning" and fields[4] == "gitfs" and fields[5] == "sha1"
+        assert fields[6] == "stable", row
+        return {"counts": counts, "repository": row}
 
     # -- fixture-owned deferred COMMIT barrier ------------------------------
     def install_deferred_barrier(self, expected_name, owner_id, key):
@@ -831,6 +870,54 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
                 "authority_counts": before["counts"], "gate_revision": before["gate_revision"],
                 "authority_unchanged": True, "original_backend_restored": True,
                 "restored_status": 200, "ack_oid": oid, "clone_fsck": True}
+
+    def unsupported_legacy_repository_format_is_explicitly_refused(self):
+        legacy_name = "legacy-gitfs-format"
+        control_name = "legacy-format-control"
+        # A real ready authority from the real create API is the unchanged
+        # control. No ready fixture is inserted by SQL.
+        control, control_status = self.create(control_name, self.alice)
+        assert control_status in (201, 202)
+        control_before = self.authority(control, control_name)
+        legacy_id = self.insert_unserved_legacy_gitfs_repository(legacy_name)
+        legacy_before = self.legacy_repository_snapshot(legacy_name)
+        # The same authenticated create path must classify the old `gitfs`
+        # row as unsupported before it creates a binding/gate/protocol realm.
+        refusal_status, refusal_raw, _ = self.post_create(
+            {"owner": "alice", "name": legacy_name, "object_format": "sha1"}, attempts=1)
+        assert refusal_status == 409, (
+            "legacy repository format create was not explicitly refused: " + str(refusal_status))
+        refusal = json.loads(refusal_raw)
+        # src/ref_store/serving.rs refuses the foreign backend explicitly; the
+        # gateway maps that 409 to this fixed closed literal, never SQL text.
+        assert refusal == {"error": "repository state changed; retry"}, refusal
+        legacy_after = self.legacy_repository_snapshot(legacy_name)
+        assert legacy_after == legacy_before, "legacy format refusal changed the fixture row"
+        after_refusal = self.authority(control, control_name)
+        assert after_refusal == control_before, "legacy format refusal changed a real ready authority"
+        # No half-ready serving state is visible: the old row is not served and
+        # is absent from the ready catalog list.
+        lookup_status, lookup_raw, _ = self.get_repo_status("alice", legacy_name)
+        assert lookup_status == 404, "legacy fixture was served with status " + str(lookup_status)
+        lookup = json.loads(lookup_raw)
+        assert lookup == {"error": "not found"}, lookup
+        listed = self.listed_repos()
+        legacy_listed = any(item.get("name") == legacy_name for item in listed)
+        assert not legacy_listed, "legacy fixture appeared in the ready catalog list"
+        control_got = json.loads(self.expect("/api/repos/alice/" + control_name, 200, token=self.alice))
+        assert control_got["id"] == control["id"] and control_got["state"] == "ready", control_got
+        oid = self.push_and_clone(control, control_name)
+        return {"legacy_fixture_repository_id": legacy_id,
+                "legacy_repository_state": "provisioning",
+                "legacy_storage_backend": "gitfs",
+                "legacy_object_format": "sha1",
+                "legacy_authority_counts": legacy_before["counts"],
+                "refusal_status": refusal_status, "refusal_error": refusal["error"],
+                "lookup_status": lookup_status, "lookup_error": lookup["error"],
+                "legacy_listed": legacy_listed,
+                "legacy_row_unchanged": True, "control_authority_unchanged": True,
+                "control_repository_id": control["id"],
+                "control_ack_oid": oid, "clone_fsck": True}
 
 
 def report_result(harness, profile, blob_profile, selected, success, hashes):

@@ -25,6 +25,7 @@ EXPECTED_CASES = (
     "lost_create_ack_proxy_retry_resolves_one_authority",
     "deferred_commit_barrier_kill_rolls_back_and_retry_converges",
     "backend_identity_conflict_is_explicit_and_preserves_authority",
+    "unsupported_legacy_repository_format_is_explicitly_refused",
 )
 DEPENDENCIES = (
     "blob_only_service.py",
@@ -68,12 +69,21 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertIn('"source_inputs_sha256": profile.build["source_inputs_sha256"]', self.harness)
 
     def test_harness_never_inserts_a_ready_authority_or_ack(self) -> None:
-        for table in ("repositories", "ref_store_serving_repositories",
+        for table in ("ref_store_serving_repositories",
                       "ref_store_core_gates", "ref_store_core_protocol_repos"):
             with self.subTest(table=table):
                 self.assertNotIn("INSERT INTO " + table, self.harness)
                 self.assertNotIn("INSERT INTO " + table + "(", self.harness)
-        # The only fixture write is the temporary barrier in this run's schema.
+        # The one repository insert is the unserved legacy `gitfs` fixture. It
+        # must never carry a ready state or the pg_refstore backend.
+        self.assertEqual(self.harness.count("INSERT INTO repositories"), 1,
+                         "only the negative legacy fixture may insert a repository row")
+        start = self.harness.index("INSERT INTO repositories")
+        statement = self.harness[start:start + 400]
+        self.assertIn("'provisioning','gitfs','sha1'", statement)
+        self.assertNotIn("'ready'", statement)
+        self.assertNotIn("pg_refstore", statement)
+        # The other fixture writes are the temporary barrier in this run's schema.
         self.assertIn("rootyard_143_barrier", self.harness)
         self.assertIn("CREATE CONSTRAINT TRIGGER rootyard_143_deferred_commit", self.harness)
         self.assertIn("pg_advisory_xact_lock(143,", self.harness)
@@ -152,6 +162,57 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         session_source = (ROOT / "src" / "blob_git_gateway" / "session.rs").read_text(encoding="utf-8")
         self.assertIn('StatusCode::CONFLICT => GatewayError::Conflict("repository is not ready")', session_source)
 
+    def test_legacy_format_refusal_is_real_api_metadata_and_not_an_upgrade_path(self) -> None:
+        tree = ast.parse(self.harness)
+        functions = {
+            node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        }
+        case_node = functions.get("unsupported_legacy_repository_format_is_explicitly_refused")
+        self.assertIsNotNone(case_node, "the legacy-format refusal case is missing")
+        case = ast.get_source_segment(self.harness, case_node)
+        self.assertIn("insert_unserved_legacy_gitfs_repository", case)
+        self.assertIn("legacy_repository_snapshot", case)
+        self.assertIn("self.post_create(", case)
+        self.assertIn("attempts=1", case)
+        self.assertIn("assert refusal_status == 409", case)
+        self.assertIn('"repository state changed; retry"', case)
+        self.assertIn("legacy_after == legacy_before", case)
+        self.assertIn("after_refusal == control_before", case)
+        self.assertIn("self.get_repo_status", case)
+        self.assertIn("assert lookup_status == 404", case)
+        self.assertIn('"not found"', case)
+        self.assertIn("legacy_listed", case)
+        self.assertIn("self.push_and_clone(control, control_name)", case)
+        # The refusal is a real API check, not an old binary, migration, import,
+        # restore or format-upgrade path.
+        for forbidden in ("migrate", "restore", "backup", "--allow-legacy", "upgrade"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, case)
+
+        insert_node = functions.get("insert_unserved_legacy_gitfs_repository")
+        self.assertIsNotNone(insert_node, "the legacy fixture insert helper is missing")
+        insert = ast.get_source_segment(self.harness, insert_node)
+        self.assertIn("'provisioning','gitfs','sha1'", insert)
+        self.assertNotIn("'ready'", insert)
+        self.assertNotIn("pg_refstore", insert)
+        snapshot_node = functions.get("legacy_repository_snapshot")
+        self.assertIsNotNone(snapshot_node, "the legacy fixture observer is missing")
+        snapshot = ast.get_source_segment(self.harness, snapshot_node)
+        self.assertIn("authority_count_for_name", snapshot)
+        self.assertIn('counts == "1|0|0|0"', snapshot)
+        self.assertIn('fields[3] == "provisioning"', snapshot)
+        self.assertIn('fields[4] == "gitfs"', snapshot)
+        self.assertIn('fields[5] == "sha1"', snapshot)
+
+        serving_source = (ROOT / "src" / "ref_store" / "serving.rs").read_text(encoding="utf-8")
+        self.assertIn("scope.storage_backend() != PG_REFSTORE_BACKEND", serving_source)
+        self.assertIn(
+            '"repository exists on another storage backend; the pg_refstore service cannot adopt it"',
+            serving_source)
+        scope_source = (ROOT / "src" / "ref_store" / "core" / "serving_scope.rs").read_text(encoding="utf-8")
+        self.assertIn('LEGACY_GITFS_BACKEND: &str = "gitfs"', scope_source)
+        self.assertIn("LegacyAuthority", scope_source)
+
     def test_first_checkpoint_stays_first(self) -> None:
         # A reordering that silently turns the independent kill checkpoint into
         # the first thing to run would invalidate the reviewable split.
@@ -163,6 +224,7 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         ))
         self.assertEqual(EXPECTED_CASES[4], "deferred_commit_barrier_kill_rolls_back_and_retry_converges")
         self.assertEqual(EXPECTED_CASES[5], "backend_identity_conflict_is_explicit_and_preserves_authority")
+        self.assertEqual(EXPECTED_CASES[6], "unsupported_legacy_repository_format_is_explicitly_refused")
 
 
 if __name__ == "__main__":
