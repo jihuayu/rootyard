@@ -29,6 +29,36 @@ fn attempt_names(store: &CloneKitPublicationStore, repository_id: Uuid) -> Vec<S
         .collect()
 }
 
+fn lock_probe_class(err: &CloneKitError) -> &'static str {
+    match err {
+        CloneKitError::InvalidConfig(_) => "invalid-config",
+        CloneKitError::GitFailed(message) if message.starts_with("open publication lock:") => "open",
+        CloneKitError::GitFailed(message) if message.starts_with("secure publication lock:") => "secure",
+        CloneKitError::GitFailed(message) if message.starts_with("stat publication lock:") => "stat",
+        CloneKitError::GitFailed(message) if message.starts_with("clonekit publication busy:") => "busy",
+        CloneKitError::GitFailed(message) if message.starts_with("publication lock failed:") => "flock",
+        _ => "unknown",
+    }
+}
+
+fn assert_lock_probe_classifier() {
+    let cases = [
+        (CloneKitError::InvalidConfig("arbitrary"), "invalid-config"),
+        (CloneKitError::GitFailed("open publication lock: arbitrary".into()), "open"),
+        (CloneKitError::GitFailed("secure publication lock: arbitrary".into()), "secure"),
+        (CloneKitError::GitFailed("stat publication lock: arbitrary".into()), "stat"),
+        (CloneKitError::GitFailed("clonekit publication busy: arbitrary".into()), "busy"),
+        (CloneKitError::GitFailed("publication lock failed: arbitrary".into()), "flock"),
+        (CloneKitError::GitFailed("open publication lock: clonekit publication busy: injected".into()), "open"),
+        (CloneKitError::GitFailed("clonekit publication busy: publication lock failed: injected".into()), "busy"),
+        (CloneKitError::GitFailed("publication lock failed: open publication lock: injected".into()), "flock"),
+        (CloneKitError::GitFailed("untrusted busy text".into()), "unknown"),
+    ];
+    for (err, expected) in cases {
+        assert_eq!(expected, lock_probe_class(&err), "lock probe classifier");
+    }
+}
+
 #[test]
 fn wait_until_times_out_with_checkpoint_and_count_diagnostic() {
     let _serial = test_seam::serial_with_deadline(Duration::from_millis(100));
@@ -46,6 +76,7 @@ fn wait_until_times_out_with_checkpoint_and_count_diagnostic() {
 fn abandoned_publisher_releases_lock_and_preserves_owned_generation() {
     let _serial = test_seam::serial_with_deadline(Duration::from_secs(10));
     test_seam::reset();
+    assert_lock_probe_classifier();
     let td = TempDir::new().expect("tempdir");
     let store = CloneKitPublicationStore::open(&td.path().join("catalog")).expect("store");
     let repository_id = Uuid::new_v4();
@@ -66,7 +97,10 @@ fn abandoned_publisher_releases_lock_and_preserves_owned_generation() {
     assert!(store.version_dir(repository_id, 1).exists());
     assert!(store.load_latest(repository_id).expect("latest").is_none());
     assert!(attempt_names(&store, repository_id).is_empty());
-    let _guard = store.acquire_publication_lock(repository_id).expect("lock released after abandoned observer");
+    let _guard = match store.acquire_publication_lock(repository_id) {
+        Ok(guard) => guard,
+        Err(err) => panic!("clonekit_lock_probe class={}", lock_probe_class(&err)),
+    };
     test_seam::reset();
 }
 

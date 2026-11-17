@@ -281,7 +281,7 @@ async fn start_http(root: &Path, bearer: &str) -> Result<(String, Arc<AtomicUsiz
     Ok((format!("http://{addr}"), bytes, t))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clonekit_sha1_and_sha256_incremental_smart_http_and_anti_stale_tip() -> Result<()> {
     let (td, ledger) = (TempDir::new()?, RetentionPinLedger::new());
     let (vr, store, origins) =
