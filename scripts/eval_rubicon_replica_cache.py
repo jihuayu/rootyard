@@ -357,7 +357,10 @@ def _worker_main(payload_json: str) -> int:
         "v2-subproc",
     )
     clone_ms = _serve_verify_clone(Path(mat["view_dir"]), Path(req["clone_dir"]), req["expected_tip"])
-    print(json.dumps({**mat, "clone_ms": round(clone_ms, 3), "peak_rss_bytes": _peak_rss_bytes()}))
+    print(json.dumps({**mat, "clone_ms": round(clone_ms, 3), "peak_rss_bytes": _peak_rss_bytes()}), flush=True)
+    if req.get("hold_after_ready"):
+        while True:
+            time.sleep(0.05)
     return 0
 
 
@@ -394,7 +397,7 @@ def run_benchmark(profiles: list[str], formats: list[str]) -> dict[str, Any]:
 
                 scratch_info = _test_push_scratch_isolation(r1, Path(incr_v2["view_dir"]), seed["tip_v2"])
 
-                def _run_subproc(replica_path: Path, tag: str) -> dict[str, Any]:
+                def _worker_args(replica_path: Path, tag: str, hold: bool) -> list[str]:
                     p_req = json.dumps(
                         {
                             "blob_dir": str(seed["blob_dir"]),
@@ -403,15 +406,26 @@ def run_benchmark(profiles: list[str], formats: list[str]) -> dict[str, Any]:
                             "packs": seed["packs_v2"],
                             "expected_tip": seed["tip_v2"],
                             "clone_dir": str(cdir / f"subproc-clone-{tag}"),
+                            "hold_after_ready": hold,
                         }
                     )
-                    out = subprocess.check_output([sys.executable, __file__, "--worker-json", p_req], text=True)
-                    return json.loads(out.strip().splitlines()[-1])
+                    return [sys.executable, __file__, "--worker-json", p_req]
 
-                hot_proc = _run_subproc(cdir / "proc-hot", "hot")
+                hot_popen = subprocess.Popen(_worker_args(cdir / "proc-hot", "hot", True), stdout=subprocess.PIPE, text=True)
+                assert hot_popen.stdout is not None
+                hot_line = hot_popen.stdout.readline()
+                hot_popen.stdout.close()
+                if not hot_line:
+                    raise RuntimeError(f"Hot worker failed before ready (rc={hot_popen.wait()})")
+                hot_proc = json.loads(hot_line)
+                hot_popen.kill()
+                hot_exit_code = hot_popen.wait(timeout=5)
+                kill_mech = "SIGKILL" if os.name == "posix" else "TerminateProcess"
                 shutil.rmtree(cdir / "proc-hot")
+
                 t_fail = time.perf_counter()
-                cold_proc = _run_subproc(r2, "cold")
+                cold_out = subprocess.check_output(_worker_args(r2, "cold", False), text=True)
+                cold_proc = json.loads(cold_out.strip().splitlines()[-1])
                 failover_total_ms = (time.perf_counter() - t_fail) * 1000.0
 
                 rows.append(
@@ -432,8 +446,10 @@ def run_benchmark(profiles: list[str], formats: list[str]) -> dict[str, Any]:
                             "p95_ms": _percentile(warm_lat_ms, 95),
                             "p99_ms": _percentile(warm_lat_ms, 99),
                         },
-                        "failover_two_process": {
-                            "hot_node_killed": True,
+                        "model_failover_two_process": {
+                            "hot_node_killed": hot_exit_code != 0,
+                            "hot_worker_terminated_via": kill_mech,
+                            "hot_worker_exit_code": hot_exit_code,
                             "cold_rebuild_ms": cold_proc["materialize_ms"],
                             "failover_e2e_ms": round(failover_total_ms, 3),
                             "cold_blob_get_count": cold_proc["blob_get_count"],
@@ -448,11 +464,13 @@ def run_benchmark(profiles: list[str], formats: list[str]) -> dict[str, Any]:
     fairness = _benchmark_drr_fairness()
     return {
         "issue": 163,
+        "benchmark_kind": "python_reference_model_with_stock_git",
+        "covers_rust_runtime_acceptance": False,
         "platform": platform.platform(),
         "python_version": platform.python_version(),
         "git_version": subprocess.check_output(["git", "--version"], text=True).strip(),
         "peak_rss_bytes": _peak_rss_bytes(),
-        "fair_admission_contention": fairness,
+        "drr_thread_simulation": fairness,
         "results": rows,
     }
 

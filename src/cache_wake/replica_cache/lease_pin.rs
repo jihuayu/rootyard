@@ -275,6 +275,7 @@ pub struct ReplicaViewGuard {
     metrics: ReplicaRequestMetrics,
     session_bound_checked: bool,
     released: bool,
+    admission_permit: Option<super::fair_admission::FairAdmissionPermit>,
 }
 
 impl ReplicaViewGuard {
@@ -286,7 +287,21 @@ impl ReplicaViewGuard {
         metrics: ReplicaRequestMetrics,
         session_bound_checked: bool,
     ) -> Self {
-        Self { node_id, slot, durable_pin, source, metrics, session_bound_checked, released: false }
+        Self {
+            node_id,
+            slot,
+            durable_pin,
+            source,
+            metrics,
+            session_bound_checked,
+            released: false,
+            admission_permit: None,
+        }
+    }
+
+    pub(crate) fn with_admission_permit(mut self, permit: super::fair_admission::FairAdmissionPermit) -> Self {
+        self.admission_permit = Some(permit);
+        self
     }
 
     pub fn node_id(&self) -> &str {
@@ -342,5 +357,6 @@ impl Drop for ReplicaViewGuard {
             self.released = true;
             self.slot.release_reader();
         }
+        self.admission_permit.take();
     }
 }

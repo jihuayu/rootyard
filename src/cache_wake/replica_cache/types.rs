@@ -122,7 +122,11 @@ impl PackObjectSpec {
         Ok(())
     }
 
-    pub fn pack_cache_key(&self, backend_identity_hex: &str, format: ReplicaObjectFormat) -> PackCacheKey {
+    pub fn pack_cache_key(
+        &self,
+        backend_identity_hex: &str,
+        format: ReplicaObjectFormat,
+    ) -> Result<PackCacheKey, ReplicaCacheError> {
         PackCacheKey::from_spec(self, backend_identity_hex, format)
     }
 }
@@ -141,39 +145,77 @@ impl ReplicaRefSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PackCacheKey {
-    pub tenant_id: Uuid,
-    pub repo_id: Uuid,
-    pub backend_identity_hex: String,
-    pub object_format: ReplicaObjectFormat,
-    pub pack_stem: String,
-    pub pack_sha256: String,
-    pub pack_length: u64,
-    pub idx_sha256: String,
-    pub idx_length: u64,
-    pub key_digest: String,
+    tenant_id: Uuid,
+    repo_id: Uuid,
+    backend_identity_hex: String,
+    object_format: ReplicaObjectFormat,
+    pack_stem: String,
+    pack_sha256: String,
+    pack_length: u64,
+    idx_sha256: String,
+    idx_length: u64,
+    key_digest: String,
 }
 
 impl PackCacheKey {
-    fn from_spec(spec: &PackObjectSpec, backend_identity_hex: &str, object_format: ReplicaObjectFormat) -> Self {
-        let tenant_id = spec.pack_locator.tenant_id();
-        let repo_id = spec.pack_locator.authority_id();
-        let pack_sha256 = spec.pack_locator.sha256();
-        let pack_length = spec.pack_locator.length();
-        let idx_sha256 = spec.idx_locator.sha256();
-        let idx_length = spec.idx_locator.length();
+    fn compute_digest(
+        tenant_id: Uuid,
+        repo_id: Uuid,
+        backend_identity_hex: &str,
+        object_format: ReplicaObjectFormat,
+        pack_stem: &str,
+        pack_sha256: &str,
+        pack_length: u64,
+        idx_sha256: &str,
+        idx_length: u64,
+    ) -> String {
         let mut buf = String::new();
         push_field(&mut buf, "domain", "rootyard.replica.pack.v1");
         push_field(&mut buf, "tenant", &tenant_id.to_string());
         push_field(&mut buf, "repo", &repo_id.to_string());
         push_field(&mut buf, "backend", backend_identity_hex);
         push_field(&mut buf, "fmt", object_format.as_str());
-        push_field(&mut buf, "stem", &spec.pack_stem);
+        push_field(&mut buf, "stem", pack_stem);
         push_field(&mut buf, "pack_sha", pack_sha256);
         push_field(&mut buf, "pack_len", &pack_length.to_string());
         push_field(&mut buf, "idx_sha", idx_sha256);
         push_field(&mut buf, "idx_len", &idx_length.to_string());
-        let key_digest = hex::encode(Sha256::digest(buf.as_bytes()));
-        Self {
+        hex::encode(Sha256::digest(buf.as_bytes()))
+    }
+
+    pub fn from_spec(
+        spec: &PackObjectSpec,
+        backend_identity_hex: &str,
+        object_format: ReplicaObjectFormat,
+    ) -> Result<Self, ReplicaCacheError> {
+        let tenant_id = spec.pack_locator.tenant_id();
+        let repo_id = spec.pack_locator.authority_id();
+        spec.validate(tenant_id, repo_id, object_format)?;
+        if tenant_id.is_nil() || repo_id.is_nil() {
+            return Err(ReplicaCacheError::InvalidInput("pack key requires non-nil UUIDs".into()));
+        }
+        if !is_lower_hex_exact(backend_identity_hex, 64) {
+            return Err(ReplicaCacheError::InvalidInput("pack backend_identity_hex must be 64 lower hex".into()));
+        }
+        let pack_sha256 = spec.pack_locator.sha256();
+        let pack_length = spec.pack_locator.length();
+        let idx_sha256 = spec.idx_locator.sha256();
+        let idx_length = spec.idx_locator.length();
+        if !is_lower_hex_exact(pack_sha256, 64) || !is_lower_hex_exact(idx_sha256, 64) {
+            return Err(ReplicaCacheError::InvalidInput("pack/idx sha256 must be 64 lower hex".into()));
+        }
+        let key_digest = Self::compute_digest(
+            tenant_id,
+            repo_id,
+            backend_identity_hex,
+            object_format,
+            &spec.pack_stem,
+            pack_sha256,
+            pack_length,
+            idx_sha256,
+            idx_length,
+        );
+        Ok(Self {
             tenant_id,
             repo_id,
             backend_identity_hex: backend_identity_hex.to_owned(),
@@ -184,7 +226,58 @@ impl PackCacheKey {
             idx_sha256: idx_sha256.to_owned(),
             idx_length,
             key_digest,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ReplicaCacheError> {
+        if self.tenant_id.is_nil() || self.repo_id.is_nil() {
+            return Err(ReplicaCacheError::InvalidInput("pack key UUIDs must be non-nil".into()));
         }
+        if !is_lower_hex_exact(&self.backend_identity_hex, 64) {
+            return Err(ReplicaCacheError::InvalidInput("pack backend_identity_hex invalid".into()));
+        }
+        validate_pack_stem(&self.pack_stem, self.object_format)?;
+        if self.pack_length == 0
+            || self.idx_length == 0
+            || !is_lower_hex_exact(&self.pack_sha256, 64)
+            || !is_lower_hex_exact(&self.idx_sha256, 64)
+        {
+            return Err(ReplicaCacheError::InvalidInput("pack/idx digest or length invalid".into()));
+        }
+        let expected = Self::compute_digest(
+            self.tenant_id,
+            self.repo_id,
+            &self.backend_identity_hex,
+            self.object_format,
+            &self.pack_stem,
+            &self.pack_sha256,
+            self.pack_length,
+            &self.idx_sha256,
+            self.idx_length,
+        );
+        if self.key_digest != expected {
+            return Err(ReplicaCacheError::TenantIsolationViolation("pack cache key digest mismatch"));
+        }
+        Ok(())
+    }
+
+    pub fn pack_stem(&self) -> &str {
+        &self.pack_stem
+    }
+    pub fn pack_sha256(&self) -> &str {
+        &self.pack_sha256
+    }
+    pub fn pack_length(&self) -> u64 {
+        self.pack_length
+    }
+    pub fn idx_sha256(&self) -> &str {
+        &self.idx_sha256
+    }
+    pub fn idx_length(&self) -> u64 {
+        self.idx_length
+    }
+    pub fn key_digest(&self) -> &str {
+        &self.key_digest
     }
 }
 
@@ -388,16 +481,4 @@ pub struct ReplicaCacheStats {
     pub active_pin_protections: u64,
     pub corrupt_rebuilds: u64,
     pub push_scratch_allocations: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RouteDirectoryHint {
-    pub schema_version: u32,
-    pub node_id: String,
-    pub tenant_id: Uuid,
-    pub repo_id: Uuid,
-    pub history_id: Uuid,
-    pub gate_revision: i64,
-    pub membership_digest: String,
 }

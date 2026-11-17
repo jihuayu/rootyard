@@ -110,6 +110,8 @@ class ReplicaCacheContractsTest(unittest.TestCase):
         doc_text = doc_raw.decode("utf-8")
         for token in ("#163", "#164", "#165", "#174", "DisposableViewRoot", "DurablePinHold", "ServingCache"):
             self.assertIn(token, doc_text)
+        for token in ("python_reference_model_with_stock_git", "drr_thread_simulation"):
+            self.assertIn(token, doc_text)
         for target in re.findall(r"\[[^\]]*\]\(([^)]+)\)", doc_text):
             clean = target.split("#", 1)[0]
             if not clean or "://" in clean:
@@ -124,8 +126,10 @@ class ReplicaCacheContractsTest(unittest.TestCase):
         spec.loader.exec_module(module)
         report = module.run_benchmark(["small"], ["sha1"])
         self.assertEqual(report["issue"], 163)
+        self.assertEqual(report["benchmark_kind"], "python_reference_model_with_stock_git")
+        self.assertIs(report["covers_rust_runtime_acceptance"], False)
         self.assertGreater(report["peak_rss_bytes"], 0)
-        fair = report["fair_admission_contention"]
+        fair = report["drr_thread_simulation"]
         self.assertEqual(fair["normal_rejected"], 0)
         self.assertGreater(fair["noisy_rejected"], 0)
         self.assertEqual(len(report["results"]), 1)
@@ -134,7 +138,11 @@ class ReplicaCacheContractsTest(unittest.TestCase):
         self.assertEqual(row["warm"]["blob_get_count"], 0)
         self.assertEqual(row["warm"]["replicated_bytes"], 0)
         self.assertGreaterEqual(row["incremental_pack_reuse"]["base_packs_reused"], 1)
-        self.assertGreater(row["failover_two_process"]["cold_blob_get_count"], 0)
+        failover = row["model_failover_two_process"]
+        self.assertTrue(failover["hot_node_killed"])
+        self.assertNotEqual(failover["hot_worker_exit_code"], 0)
+        self.assertIn(failover["hot_worker_terminated_via"], ("SIGKILL", "TerminateProcess"))
+        self.assertGreater(failover["cold_blob_get_count"], 0)
         self.assertTrue(row["push_scratch"]["view_isolated"])
         self.assertEqual(row["push_scratch"]["scratch_residual_bytes"], 0)
 

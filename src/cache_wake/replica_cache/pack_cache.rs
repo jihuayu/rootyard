@@ -13,6 +13,7 @@ use std::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::error::{is_lower_hex_exact, sweep_orphan_cache_dirs, validate_canonical_child_path};
 use super::types::{PackCacheKey, ReplicaCacheError, ReplicaCacheLimits};
 
 const PACK_DIR_NAME: &str = "packs";
@@ -47,6 +48,7 @@ pub struct PackCacheCatalog {
 }
 
 pub struct PackCachePin {
+    root_dir: PathBuf,
     key_digest: String,
     dir_path: PathBuf,
     pack_path: PathBuf,
@@ -90,7 +92,7 @@ impl Drop for PackCachePin {
             }
         };
         if let Some((dir, bytes)) = remove_dir {
-            let _ = remove_dir_safely(&dir);
+            let _ = remove_child_safely(&self.root_dir, &dir);
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             guard.total_bytes = guard.total_bytes.saturating_sub(bytes);
         }
@@ -101,19 +103,37 @@ impl PackCacheCatalog {
     pub fn open(replica_root: &Path, limits: ReplicaCacheLimits) -> Result<Self, ReplicaCacheError> {
         limits.validate()?;
         ensure_private_dir(replica_root)?;
-        let root_dir = replica_root.join(PACK_DIR_NAME);
-        ensure_private_dir(&root_dir)?;
+        let raw_root = replica_root.join(PACK_DIR_NAME);
+        ensure_private_dir(&raw_root)?;
+        let root_dir = std::fs::canonicalize(&raw_root)
+            .map_err(|e| ReplicaCacheError::Io(format!("failed canonicalizing pack cache root: {e}")))?;
+        let _ = sweep_orphan_cache_dirs(&root_dir)?;
         Ok(Self { root_dir, limits, inner: Arc::new(Mutex::new(PackCatalogInner::default())) })
     }
 
     pub fn staging_dir(&self) -> Result<PathBuf, ReplicaCacheError> {
         verify_private_dir(&self.root_dir)?;
-        let stage = self.root_dir.join(format!(".stage-{}", Uuid::new_v4().simple()));
+        let stage = validate_canonical_child_path(
+            &self.root_dir,
+            &self.root_dir.join(format!(".stage-{}", Uuid::new_v4().simple())),
+        )?;
         DirBuilder::new()
             .mode(0o700)
             .create(&stage)
             .map_err(|e| ReplicaCacheError::Io(format!("failed creating pack staging dir: {e}")))?;
         Ok(stage)
+    }
+
+    fn make_pin(&self, key_digest: String, dir_path: PathBuf, pack_path: PathBuf, idx_path: PathBuf) -> PackCachePin {
+        PackCachePin {
+            root_dir: self.root_dir.clone(),
+            key_digest,
+            dir_path,
+            pack_path,
+            idx_path,
+            inner: Arc::clone(&self.inner),
+            released: false,
+        }
     }
 
     pub fn entry_count(&self) -> usize {
@@ -134,11 +154,13 @@ impl PackCacheCatalog {
         key: &PackCacheKey,
         verify_sha256: bool,
     ) -> Result<(Option<PackCachePin>, bool), ReplicaCacheError> {
+        key.validate()?;
+        verify_private_dir(&self.root_dir)?;
         let paths = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let next_seq = guard.lru_counter.saturating_add(1);
             let paths = {
-                let Some(entry) = guard.entries.get_mut(&key.key_digest) else {
+                let Some(entry) = guard.entries.get_mut(key.key_digest()) else {
                     return Ok((None, false));
                 };
                 if entry.key != *key {
@@ -152,17 +174,13 @@ impl PackCacheCatalog {
             paths
         };
 
-        let pin = PackCachePin {
-            key_digest: key.key_digest.clone(),
-            dir_path: paths.0,
-            pack_path: paths.1.clone(),
-            idx_path: paths.2.clone(),
-            inner: Arc::clone(&self.inner),
-            released: false,
-        };
-        if !verify_cached_pack_files(&paths.1, &paths.2, key, verify_sha256) {
+        let pin = self.make_pin(key.key_digest().to_owned(), paths.0.clone(), paths.1.clone(), paths.2.clone());
+        let paths_ok = validate_canonical_child_path(&self.root_dir, &paths.0).is_ok()
+            && validate_canonical_child_path(&paths.0, &paths.1).is_ok()
+            && validate_canonical_child_path(&paths.0, &paths.2).is_ok();
+        if !paths_ok || !verify_cached_pack_files(&paths.1, &paths.2, key, verify_sha256) {
             drop(pin);
-            self.retire_key(&key.key_digest);
+            self.retire_key(key.key_digest());
             return Ok((None, true));
         }
         Ok((Some(pin), false))
@@ -174,97 +192,95 @@ impl PackCacheCatalog {
         staged_pack: &Path,
         staged_idx: &Path,
     ) -> Result<PackCachePin, ReplicaCacheError> {
+        key.validate()?;
         verify_private_dir(&self.root_dir)?;
         let entry_bytes = key
-            .pack_length
-            .checked_add(key.idx_length)
+            .pack_length()
+            .checked_add(key.idx_length())
             .ok_or(ReplicaCacheError::CacheCapacityExhausted("pack byte count overflow"))?;
         if entry_bytes > self.limits.max_pack_bytes {
             return Err(ReplicaCacheError::CacheCapacityExhausted("pack pair exceeds max_pack_bytes"));
         }
 
-        let target_dir = self.root_dir.join(format!("{}-{}", key.key_digest, Uuid::new_v4().simple()));
-        let pack_name = format!("{}.pack", key.pack_stem);
-        let idx_name = format!("{}.idx", key.pack_stem);
-        let target_pack = target_dir.join(&pack_name);
-        let target_idx = target_dir.join(&idx_name);
+        let target_dir = validate_canonical_child_path(
+            &self.root_dir,
+            &self.root_dir.join(format!("{}-{}", key.key_digest(), Uuid::new_v4().simple())),
+        )?;
+        let pack_name = format!("{}.pack", key.pack_stem());
+        let idx_name = format!("{}.idx", key.pack_stem());
+        let target_pack = validate_canonical_child_path(&self.root_dir, &target_dir.join(&pack_name))?;
+        let target_idx = validate_canonical_child_path(&self.root_dir, &target_dir.join(&idx_name))?;
 
         let to_remove = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let next_seq = guard.lru_counter.saturating_add(1);
-            let hit = guard.entries.get_mut(&key.key_digest).map(|existing| {
+            let hit = guard.entries.get_mut(key.key_digest()).map(|existing| {
                 existing.lru_seq = next_seq;
                 existing.pin_count = existing.pin_count.saturating_add(1);
                 (existing.dir_path.clone(), existing.pack_path.clone(), existing.idx_path.clone())
             });
             if let Some((dir_path, pack_path, idx_path)) = hit {
                 guard.lru_counter = next_seq;
-                return Ok(PackCachePin {
-                    key_digest: key.key_digest,
-                    dir_path,
-                    pack_path,
-                    idx_path,
-                    inner: Arc::clone(&self.inner),
-                    released: false,
-                });
+                return Ok(self.make_pin(key.key_digest().to_owned(), dir_path, pack_path, idx_path));
             }
             evict_unpinned_packs(&mut guard, &self.limits, entry_bytes)?
         };
         for dir in to_remove {
-            let _ = remove_dir_safely(&dir);
+            let _ = remove_child_safely(&self.root_dir, &dir);
         }
 
-        let staging_dir = self.root_dir.join(format!(".install-{}", Uuid::new_v4().simple()));
+        let staging_dir = validate_canonical_child_path(
+            &self.root_dir,
+            &self.root_dir.join(format!(".install-{}", Uuid::new_v4().simple())),
+        )?;
         DirBuilder::new()
             .mode(0o700)
             .create(&staging_dir)
             .map_err(|e| ReplicaCacheError::Io(format!("failed creating pack install dir: {e}")))?;
         let install_res = (|| -> Result<(), ReplicaCacheError> {
-            copy_readonly(staged_pack, &staging_dir.join(&pack_name))?;
-            copy_readonly(staged_idx, &staging_dir.join(&idx_name))?;
+            let stage_pack = validate_canonical_child_path(&staging_dir, &staging_dir.join(&pack_name))?;
+            let stage_idx = validate_canonical_child_path(&staging_dir, &staging_dir.join(&idx_name))?;
+            copy_readonly(staged_pack, &stage_pack)?;
+            copy_readonly(staged_idx, &stage_idx)?;
             std::fs::rename(&staging_dir, &target_dir)
                 .map_err(|e| ReplicaCacheError::Io(format!("failed committing pack dir: {e}")))?;
+            validate_canonical_child_path(&target_dir, &target_pack)?;
+            validate_canonical_child_path(&target_dir, &target_idx)?;
             Ok(())
         })();
         if let Err(err) = install_res {
-            let _ = remove_dir_safely(&staging_dir);
+            let _ = remove_child_safely(&self.root_dir, &staging_dir);
             return Err(err);
         }
 
         let (to_remove_late, pin) = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let next_seq = guard.lru_counter.saturating_add(1);
-            if let Some((dir_path, pack_path, idx_path)) = guard.entries.get_mut(&key.key_digest).map(|existing| {
+            if let Some((dir_path, pack_path, idx_path)) = guard.entries.get_mut(key.key_digest()).map(|existing| {
                 existing.lru_seq = next_seq;
                 existing.pin_count = existing.pin_count.saturating_add(1);
                 (existing.dir_path.clone(), existing.pack_path.clone(), existing.idx_path.clone())
             }) {
                 guard.lru_counter = next_seq;
                 drop(guard);
-                let _ = remove_dir_safely(&target_dir);
-                return Ok(PackCachePin {
-                    key_digest: key.key_digest,
-                    dir_path,
-                    pack_path,
-                    idx_path,
-                    inner: Arc::clone(&self.inner),
-                    released: false,
-                });
+                let _ = remove_child_safely(&self.root_dir, &target_dir);
+                return Ok(self.make_pin(key.key_digest().to_owned(), dir_path, pack_path, idx_path));
             }
             let evicted = match evict_unpinned_packs(&mut guard, &self.limits, entry_bytes) {
                 Ok(v) => v,
                 Err(err) => {
                     drop(guard);
-                    let _ = remove_dir_safely(&target_dir);
+                    let _ = remove_child_safely(&self.root_dir, &target_dir);
                     return Err(err);
                 }
             };
+            let key_digest = key.key_digest().to_owned();
             guard.lru_counter = next_seq;
             guard.total_bytes = guard.total_bytes.saturating_add(entry_bytes);
             guard.entries.insert(
-                key.key_digest.clone(),
+                key_digest.clone(),
                 PackCacheEntry {
-                    key: key.clone(),
+                    key,
                     dir_path: target_dir.clone(),
                     pack_path: target_pack.clone(),
                     idx_path: target_idx.clone(),
@@ -273,25 +289,18 @@ impl PackCacheCatalog {
                     lru_seq: next_seq,
                 },
             );
-            (
-                evicted,
-                PackCachePin {
-                    key_digest: key.key_digest,
-                    dir_path: target_dir,
-                    pack_path: target_pack,
-                    idx_path: target_idx,
-                    inner: Arc::clone(&self.inner),
-                    released: false,
-                },
-            )
+            (evicted, self.make_pin(key_digest, target_dir, target_pack, target_idx))
         };
         for dir in to_remove_late {
-            let _ = remove_dir_safely(&dir);
+            let _ = remove_child_safely(&self.root_dir, &dir);
         }
         Ok(pin)
     }
 
     pub fn retire_key(&self, key_digest: &str) {
+        if !is_lower_hex_exact(key_digest, 64) {
+            return;
+        }
         let remove_dir = {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(entry) = guard.entries.remove(key_digest) {
@@ -307,7 +316,7 @@ impl PackCacheCatalog {
             }
         };
         if let Some(dir) = remove_dir {
-            let _ = remove_dir_safely(&dir);
+            let _ = remove_child_safely(&self.root_dir, &dir);
         }
     }
 
@@ -328,7 +337,7 @@ impl PackCacheCatalog {
             }
         }
         for dir in to_remove {
-            let _ = remove_dir_safely(&dir);
+            let _ = remove_child_safely(&self.root_dir, &dir);
         }
     }
 }
@@ -396,6 +405,11 @@ pub fn verify_private_dir(path: &Path) -> Result<(), ReplicaCacheError> {
     Ok(())
 }
 
+fn remove_child_safely(root: &Path, dir: &Path) -> Result<(), ReplicaCacheError> {
+    let safe = validate_canonical_child_path(root, dir)?;
+    remove_dir_safely(&safe)
+}
+
 pub fn remove_dir_safely(dir: &Path) -> Result<(), ReplicaCacheError> {
     match std::fs::symlink_metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -448,14 +462,14 @@ pub(super) fn check_regular_file_len(path: &Path, expected_len: u64) -> bool {
 }
 
 fn verify_cached_pack_files(pack_path: &Path, idx_path: &Path, key: &PackCacheKey, verify_sha256: bool) -> bool {
-    if !check_regular_file_len(pack_path, key.pack_length) || !check_regular_file_len(idx_path, key.idx_length) {
+    if !check_regular_file_len(pack_path, key.pack_length()) || !check_regular_file_len(idx_path, key.idx_length()) {
         return false;
     }
     if !verify_sha256 {
         return true;
     }
-    hash_file_matches(pack_path, &key.pack_sha256, key.pack_length)
-        && hash_file_matches(idx_path, &key.idx_sha256, key.idx_length)
+    hash_file_matches(pack_path, key.pack_sha256(), key.pack_length())
+        && hash_file_matches(idx_path, key.idx_sha256(), key.idx_length())
 }
 
 pub(super) fn hash_file_matches(path: &Path, expected_sha256: &str, expected_len: u64) -> bool {

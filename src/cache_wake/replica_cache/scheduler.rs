@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -16,9 +17,7 @@ pub use super::fair_admission::{
 };
 use super::{
     lease_pin::{AuthTask, LiveAuthorizer, ReplicaViewGuard},
-    types::{
-        REPLICA_CACHE_SCHEMA, ReplicaCacheError, ReplicaReadRequest, RouteDirectoryHint, is_retryable_failover_error,
-    },
+    types::{REPLICA_CACHE_SCHEMA, ReplicaCacheError, ReplicaReadRequest, is_retryable_failover_error},
 };
 
 /// Abstract replica node backend implemented by local [`super::ReplicaCacheNode`]
@@ -44,6 +43,18 @@ pub enum ReplicaHealthState {
 struct ManagedNode {
     backend: Arc<dyn ReplicaBackend>,
     health: ReplicaHealthState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteDirectoryHint {
+    pub schema_version: u32,
+    pub node_id: String,
+    pub tenant_id: Uuid,
+    pub repo_id: Uuid,
+    pub history_id: Uuid,
+    pub gate_revision: i64,
+    pub membership_digest: String,
 }
 
 pub struct ScheduledServeOutcome {
@@ -147,7 +158,7 @@ impl ReplicaScheduler {
         authorizer: &dyn LiveAuthorizer,
         deadline: Instant,
     ) -> Result<ScheduledServeOutcome, ReplicaCacheError> {
-        let (_permit, admission_wait_us) = self.fair_gate.acquire(req.tenant_id, deadline).await?;
+        let (permit, admission_wait_us) = self.fair_gate.acquire(req.tenant_id, deadline).await?;
         let mut candidates = self.select_candidates(req).await;
         if candidates.is_empty() {
             return Err(ReplicaCacheError::AllReplicasOverloaded);
@@ -167,7 +178,7 @@ impl ReplicaScheduler {
                 Ok(guard) => {
                     self.record_advisory_hint(guard.view_key(), &node_id).await;
                     return Ok(ScheduledServeOutcome {
-                        guard,
+                        guard: guard.with_admission_permit(permit),
                         routed_node_id: node_id,
                         attempts,
                         failover_used,

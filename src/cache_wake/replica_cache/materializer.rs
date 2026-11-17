@@ -95,7 +95,7 @@ pub async fn materialize_version_view(
 
     let backend_hex = store.backend_identity().as_hex();
     for spec in &sorted_packs {
-        let pack_key = spec.pack_cache_key(backend_hex, snapshot.object_format);
+        let pack_key = spec.pack_cache_key(backend_hex, snapshot.object_format)?;
         expected_files.push((spec.pack_stem.clone(), spec.pack_locator.length(), spec.idx_locator.length()));
         let (maybe_pin, corrupt) = packs_cache.pin_if_valid(&pack_key, true)?;
         if corrupt {

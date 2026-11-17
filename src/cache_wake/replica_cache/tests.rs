@@ -89,12 +89,12 @@ fn keys_and_route_hints_isolate_tenants_histories_backends_and_reject_unknown_fi
     assert_ne!(k_base.view_key_hex, k_ref_only.view_key_hex);
     assert_eq!(k_base.pack_membership_digest, k_ref_only.pack_membership_digest);
     assert_ne!(
-        p1[0].pack_cache_key(b1.as_hex(), ReplicaObjectFormat::Sha1),
-        p2[0].pack_cache_key(b1.as_hex(), ReplicaObjectFormat::Sha1)
+        p1[0].pack_cache_key(b1.as_hex(), ReplicaObjectFormat::Sha1).unwrap(),
+        p2[0].pack_cache_key(b1.as_hex(), ReplicaObjectFormat::Sha1).unwrap()
     );
     assert_ne!(
-        p1[0].pack_cache_key(b1.as_hex(), ReplicaObjectFormat::Sha1),
-        p1[0].pack_cache_key(b2.as_hex(), ReplicaObjectFormat::Sha1)
+        p1[0].pack_cache_key(b1.as_hex(), ReplicaObjectFormat::Sha1).unwrap(),
+        p1[0].pack_cache_key(b2.as_hex(), ReplicaObjectFormat::Sha1).unwrap()
     );
 
     assert!(serde_json::from_slice::<RouteDirectoryHint>(br#"{"schema_version":1,"node_id":"n1","extra":1}"#).is_err());

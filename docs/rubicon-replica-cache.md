@@ -31,20 +31,21 @@ Replicas never hold canonical repository authority. All durable state remains in
 
 ## 4. Reproducible Benchmark & Verified Baseline
 
-[`scripts/eval_rubicon_replica_cache.py`](../scripts/eval_rubicon_replica_cache.py) seeds two-epoch multi-pack Git fixtures (`SHA-1` and `SHA-256`) backed by stock `git`, isolates Layer 1 `.pack`/`.idx` cache vs Layer 2 disposable `views/` and isolated `scratch/`, runs independent hot/cold worker subprocesses across two replica directories with `git clone` + `git fsck --full --strict` parity verification, executes a threaded DRR noisy-tenant flood test, and captures OS peak RSS (`K32GetProcessMemoryInfo` on Windows / `resource.getrusage` on POSIX).
+- **Rust runtime & integration evidence**: [`src/cache_wake/replica_cache/`](../src/cache_wake/replica_cache.rs) unit/hardening suites and [`tests/rubicon_replica_cache.rs`](../tests/rubicon_replica_cache.rs) exercise real `ReplicaCacheNode`, `ReplicaScheduler`, `TenantFairShareGate`, OpenDAL `BlobStore`, and stock `git` parity on `SHA-1` / `SHA-256`. Full production Rubicon Git/HTTP serving and browse handler integration sits outside this cache/scheduler module boundary.
+- **Python reference benchmark (`python_reference_model_with_stock_git`)**: [`scripts/eval_rubicon_replica_cache.py`](../scripts/eval_rubicon_replica_cache.py) sets `"covers_rust_runtime_acceptance": false`. It seeds two-epoch multi-pack Git fixtures (`SHA-1` and `SHA-256`) backed by stock `git`, isolates Layer 1 `.pack`/`.idx` cache vs Layer 2 disposable `views/` and isolated `scratch/`, spawns a live standby hot worker terminated via `SIGKILL` / `TerminateProcess` before cold rebuild across two replica directories with `git clone` + `git fsck --full --strict` verification (`model_failover_two_process`), executes a threaded DRR noisy-tenant simulation (`drr_thread_simulation`), and captures OS peak RSS (`K32GetProcessMemoryInfo` on Windows / `resource.getrusage` on POSIX).
 
-Observed baseline on local host (`Windows-11-10.0.26100-SP0`, `Python 3.12.3`, `git version 2.45.1.windows.1`, process peak RSS `27,328,512` B):
+Observed baseline on local host (`Windows-11-10.0.26100-SP0`, `Python 3.12.3`, `git version 2.45.1.windows.1`, process peak RSS `27,648,000` B):
 
-| Profile | Format | Cold GETs / B (Mat ms) | Incremental GETs / B (Base Packs Reused) | Warm GETs (P50 / P95 / P99 ms) | Two-Process Failover GETs / B (E2E ms / Cold RSS B) | Push Scratch Residual B | Parity |
+| Profile | Format | Cold GETs / B (Mat ms) | Incremental GETs / B (Base Packs Reused) | Warm GETs (P50 / P95 / P99 ms) | Model Two-Process Failover GETs / B (E2E ms / Cold RSS B) | Push Scratch Residual B | Parity |
 |---|---|---:|---:|---:|---:|---:|---|
-| `small` | `sha1` | 2 / 4,372 (70.354) | 2 / 2,439 (1) | 0 (45.384 / 48.934 / 51.322) | 4 / 6,811 (598.832 / 21,528,576) | 0 (`view_isolated=true`) | PASS |
-| `small` | `sha256` | 2 / 5,261 (78.398) | 2 / 2,841 (1) | 0 (47.510 / 55.128 / 60.098) | 4 / 8,102 (618.026 / 21,504,000) | 0 (`view_isolated=true`) | PASS |
-| `medium` | `sha1` | 2 / 10,527 (77.232) | 2 / 4,241 (1) | 0 (52.640 / 64.349 / 70.160) | 4 / 14,768 (596.765 / 21,524,480) | 0 (`view_isolated=true`) | PASS |
-| `medium` | `sha256` | 2 / 13,158 (82.129) | 2 / 5,124 (1) | 0 (49.795 / 51.314 / 51.339) | 4 / 18,282 (667.597 / 21,659,648) | 0 (`view_isolated=true`) | PASS |
+| `small` | `sha1` | 2 / 4,369 (87.075) | 2 / 2,441 (1) | 0 (53.478 / 59.187 / 101.178) | 4 / 6,810 (737.067 / 21,680,128) | 0 (`view_isolated=true`) | PASS |
+| `small` | `sha256` | 2 / 5,253 (77.493) | 2 / 2,841 (1) | 0 (53.119 / 57.421 / 83.743) | 4 / 8,094 (613.830 / 21,561,344) | 0 (`view_isolated=true`) | PASS |
+| `medium` | `sha1` | 2 / 10,522 (81.696) | 2 / 4,246 (1) | 0 (54.928 / 64.755 / 75.177) | 4 / 14,768 (632.381 / 21,602,304) | 0 (`view_isolated=true`) | PASS |
+| `medium` | `sha256` | 2 / 13,163 (104.602) | 2 / 5,122 (1) | 0 (69.909 / 78.301 / 85.034) | 4 / 18,285 (709.718 / 21,614,592) | 0 (`view_isolated=true`) | PASS |
 
-Concurrent DRR fair admission benchmark (2 compute slots, 24 noisy-tenant burst requests vs 6 steady normal-tenant requests, per-tenant queue cap 6):
-- **Normal tenant**: `6` admitted, `0` rejected (`P50 = 13.233 ms`, `P95 = 18.291 ms`).
-- **Noisy tenant**: `8` admitted, `16` shed cleanly (`P95 = 21.077 ms`).
+Threaded DRR fairness simulation (`drr_thread_simulation`: 2 compute slots, 24 noisy-tenant burst requests vs 6 steady normal-tenant requests, per-tenant queue cap 6):
+- **Normal tenant**: `6` admitted, `0` rejected (`P50 = 13.207 ms`, `P95 = 19.507 ms`).
+- **Noisy tenant**: `9` admitted, `15` shed cleanly (`P95 = 21.764 ms`).
 
 ## 5. Verification Commands
 

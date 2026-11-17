@@ -415,7 +415,7 @@ fn pack_cache_concurrent_install_clear_all_and_catalog_eviction_failure_preserve
     )?;
     let bid = blob_backend_identity("pack-test");
     let spec = PackObjectSpec::provider_managed(format!("pack-{}", "a".repeat(40)), p_loc, i_loc);
-    let key = spec.pack_cache_key(bid.as_hex(), ReplicaObjectFormat::Sha1);
+    let key = spec.pack_cache_key(bid.as_hex(), ReplicaObjectFormat::Sha1)?;
     let expected_bytes = (pack_bytes.len() + idx_bytes.len()) as u64;
 
     let mut pins: Vec<pack_cache::PackCachePin> = std::thread::scope(|s| {

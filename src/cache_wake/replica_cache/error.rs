@@ -1,7 +1,11 @@
 //! Error types and canonical identity/digest validators for the disposable
 //! Rubicon compute replica cache (Issue #163).
 
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    path::{Component, Path, PathBuf},
+};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -189,4 +193,73 @@ pub(super) fn push_field(buf: &mut String, name: &str, val: &str) {
     buf.push(':');
     buf.push_str(val);
     buf.push('\n');
+}
+
+pub fn validate_canonical_child_path(root: &Path, child: &Path) -> Result<PathBuf, ReplicaCacheError> {
+    let canon_root = std::fs::canonicalize(root)
+        .map_err(|e| ReplicaCacheError::Io(format!("failed canonicalizing cache root: {e}")))?;
+    let rel = child
+        .strip_prefix(root)
+        .map_err(|_| ReplicaCacheError::TenantIsolationViolation("cache path escapes pack cache root"))?;
+    if rel.as_os_str().is_empty() {
+        return Err(ReplicaCacheError::TenantIsolationViolation("cache child path must not equal root"));
+    }
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => {
+                let s = seg.to_string_lossy();
+                if s.is_empty() || s == "." || s == ".." || s.contains('/') || s.contains('\\') {
+                    return Err(ReplicaCacheError::TenantIsolationViolation("invalid cache path segment"));
+                }
+            }
+            _ => return Err(ReplicaCacheError::TenantIsolationViolation("non-normal cache path component")),
+        }
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(child) {
+        if meta.file_type().is_symlink() {
+            return Err(ReplicaCacheError::IntegrityFailed("cache path must not be a symlink"));
+        }
+        let canon_child = std::fs::canonicalize(child)
+            .map_err(|e| ReplicaCacheError::Io(format!("failed canonicalizing cache child: {e}")))?;
+        if !canon_child.starts_with(&canon_root) {
+            return Err(ReplicaCacheError::TenantIsolationViolation("canonical cache path escapes root"));
+        }
+    } else if let Some(parent) = child.parent()
+        && parent.exists()
+    {
+        let canon_parent = std::fs::canonicalize(parent)
+            .map_err(|e| ReplicaCacheError::Io(format!("failed canonicalizing cache parent: {e}")))?;
+        if !canon_parent.starts_with(&canon_root) {
+            return Err(ReplicaCacheError::TenantIsolationViolation("canonical parent escapes root"));
+        }
+    }
+    Ok(canon_root.join(rel))
+}
+
+pub fn sweep_orphan_cache_dirs(root: &Path) -> Result<u64, ReplicaCacheError> {
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| ReplicaCacheError::Io(format!("failed reading cache root during reconcile: {e}")))?;
+    let mut swept = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(|e| ReplicaCacheError::Io(format!("failed reading cache entry: {e}")))?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| ReplicaCacheError::Io(format!("failed inspecting cache entry: {e}")))?;
+        if meta.file_type().is_symlink() {
+            std::fs::remove_file(&path)
+                .map_err(|e| ReplicaCacheError::Io(format!("failed removing orphan symlink: {e}")))?;
+            swept = swept.saturating_add(1);
+            continue;
+        }
+        let safe_path = validate_canonical_child_path(root, &path)?;
+        if meta.is_dir() {
+            std::fs::remove_dir_all(&safe_path)
+                .map_err(|e| ReplicaCacheError::Io(format!("failed sweeping orphan cache dir: {e}")))?;
+        } else {
+            std::fs::remove_file(&safe_path)
+                .map_err(|e| ReplicaCacheError::Io(format!("failed sweeping orphan cache file: {e}")))?;
+        }
+        swept = swept.saturating_add(1);
+    }
+    Ok(swept)
 }

@@ -28,6 +28,8 @@ pub mod types;
 mod tests;
 #[cfg(test)]
 mod tests_e2e;
+#[cfg(test)]
+mod tests_hardening;
 
 use std::{
     path::Path,
@@ -52,13 +54,13 @@ pub use materializer::verify_read_only_view_files;
 pub use pack_cache::{PackCacheCatalog, PackCachePin};
 pub use scheduler::{
     FairAdmissionPermit, FairnessStatsSnapshot, ReplicaBackend, ReplicaHealthState, ReplicaScheduler,
-    ScheduledServeOutcome, TenantFairShareConfig, TenantFairShareGate,
+    RouteDirectoryHint, ScheduledServeOutcome, TenantFairShareConfig, TenantFairShareGate,
 };
 pub use singleflight::{BoundedSingleFlight, FlightEntry, FlightOutcome};
 pub use types::{
     PackCacheKey, PackObjectSpec, REPLICA_CACHE_SCHEMA, ReplicaCacheLimits, ReplicaCacheStats, ReplicaObjectFormat,
     ReplicaOperation, ReplicaReadRequest, ReplicaRefSpec, ReplicaRequestMetrics, ReplicaServeSource, ReplicaViewKey,
-    RouteDirectoryHint, SessionLowerBound, VersionCheckVerdict,
+    SessionLowerBound, VersionCheckVerdict,
 };
 
 #[derive(Default)]
