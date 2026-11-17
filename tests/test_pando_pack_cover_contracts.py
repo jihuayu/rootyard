@@ -24,6 +24,7 @@ OWNED_RUST_FILES = [
     PACK_COVER_DIR / "planner_select.rs",
     PACK_COVER_DIR / "retention_class.rs",
     PACK_COVER_DIR / "tests.rs",
+    PACK_COVER_DIR / "tests_diamond.rs",
     PACK_COVER_DIR / "tests_git_blob.rs",
     PACK_COVER_DIR / "tests_matrix.rs",
     PACK_COVER_DIR / "tests_safety.rs",

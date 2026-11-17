@@ -98,10 +98,7 @@ pub(super) fn select_covers(ctx: &CoverSelectionCtx<'_>) -> Result<SelectionResu
     let mut work_steps = 0_usize;
 
     for cover in ctx.cover_index.all_covers() {
-        work_steps = work_steps.saturating_add(1 + cover.covered_commits().len());
-        if work_steps > MAX_PLANNER_SCORING_STEPS {
-            return Err((FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded));
-        }
+        step_budget(&mut work_steps, 1 + cover.covered_commits().len())?;
         let covered_needed: HashSet<GitOid> =
             cover.covered_commits().iter().map(|c| c.commit_oid).filter(|oid| ctx.needed_set.contains(oid)).collect();
         if covered_needed.is_empty() {
@@ -123,17 +120,21 @@ pub(super) fn select_covers(ctx: &CoverSelectionCtx<'_>) -> Result<SelectionResu
         if !is_historical && (ctx.cover_index.is_retired_from_active(&cover.cover_id()) || cls.historical_read_only) {
             continue;
         }
-        let mut required_bases = Vec::new();
-        let mut client_bases = Vec::new();
-        let mut visiting = BTreeSet::new();
-        if !expand_delta_bases(ctx, cover, &mut visiting, &mut required_bases, &mut client_bases, &mut obs) {
+        let mut state = DeltaExpandState {
+            visiting: BTreeSet::from([cover.cover_id()]),
+            expanded: BTreeSet::new(),
+            required_bases: Vec::new(),
+            client_bases: Vec::new(),
+            obs: &mut obs,
+        };
+        if !expand_delta_bases(ctx, cover, &mut state, &mut work_steps)? {
             continue;
         }
         candidates.push(CandidateCover {
             record: cover,
             covered_needed,
-            required_bases,
-            client_satisfied_bases: client_bases,
+            required_bases: state.required_bases,
+            client_satisfied_bases: state.client_bases,
         });
     }
 
@@ -156,57 +157,79 @@ pub(super) fn select_covers(ctx: &CoverSelectionCtx<'_>) -> Result<SelectionResu
     Ok(picked)
 }
 
+struct DeltaExpandState<'a> {
+    visiting: BTreeSet<Uuid>,
+    expanded: BTreeSet<Uuid>,
+    required_bases: Vec<Uuid>,
+    client_bases: Vec<Uuid>,
+    obs: &'a mut RejectionObservations,
+}
+
+fn step_budget(work_steps: &mut usize, cost: usize) -> Result<(), (FallbackReason, FetchPlanError)> {
+    *work_steps = work_steps.saturating_add(cost);
+    if *work_steps > MAX_PLANNER_SCORING_STEPS {
+        return Err((FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded));
+    }
+    Ok(())
+}
+
 fn expand_delta_bases(
     ctx: &CoverSelectionCtx<'_>,
     cover: &CoverHierarchyRecord,
-    visiting: &mut BTreeSet<Uuid>,
-    required_bases: &mut Vec<Uuid>,
-    client_bases: &mut Vec<Uuid>,
-    obs: &mut RejectionObservations,
-) -> bool {
+    state: &mut DeltaExpandState<'_>,
+    work_steps: &mut usize,
+) -> Result<bool, (FallbackReason, FetchPlanError)> {
     for base_id in &cover.artifacts().delta_base_cover_ids {
-        if !visiting.insert(*base_id) {
-            return false;
+        step_budget(work_steps, 1)?;
+        if state.visiting.contains(base_id) {
+            return Ok(false);
+        }
+        if state.expanded.contains(base_id) {
+            continue;
         }
         let Some(base) = ctx.cover_index.get(base_id) else {
-            obs.saw_missing_base = true;
-            return false;
+            state.obs.saw_missing_base = true;
+            return Ok(false);
         };
         if !ctx.digest_ok.get(base_id).copied().unwrap_or(false) {
-            obs.saw_tamper = true;
-            return false;
+            state.obs.saw_tamper = true;
+            return Ok(false);
         }
         if cover_exposes_unauthorized_commits(base, &ctx.req.auth, ctx.authorized_commits) {
-            obs.saw_hidden_leak = true;
-            return false;
+            state.obs.saw_hidden_leak = true;
+            return Ok(false);
         }
+        step_budget(work_steps, base.covered_commits().len())?;
         let base_cls = ctx.retention_index.classify_cover(base);
         let base_quarantined = base_cls.active_protectors.contains(&CoverHoldKind::QuarantineHold);
         let client_has_all = !base_quarantined
             && base_cls.physically_present
             && base.covered_commits().iter().all(|c| ctx.have_ancestors.contains(&c.commit_oid));
         if client_has_all {
-            if !client_bases.contains(base_id) {
-                client_bases.push(*base_id);
+            if !state.client_bases.contains(base_id) {
+                state.client_bases.push(*base_id);
             }
         } else if base_cls.physically_present
             && base_cls.plannable_for_fetch
             && (ctx.req.isolation.is_historical_pinned()
                 || (!ctx.cover_index.is_retired_from_active(base_id) && !base_cls.historical_read_only))
         {
-            if !required_bases.contains(base_id) {
-                required_bases.push(*base_id);
+            if !state.required_bases.contains(base_id) {
+                state.required_bases.push(*base_id);
             }
-            if !expand_delta_bases(ctx, base, visiting, required_bases, client_bases, obs) {
-                return false;
+            state.visiting.insert(*base_id);
+            let ok = expand_delta_bases(ctx, base, state, work_steps)?;
+            state.visiting.remove(base_id);
+            if !ok {
+                return Ok(false);
             }
         } else {
-            obs.saw_retention_loss = true;
-            return false;
+            state.obs.saw_retention_loss = true;
+            return Ok(false);
         }
-        visiting.remove(base_id);
+        state.expanded.insert(*base_id);
     }
-    true
+    Ok(true)
 }
 
 fn run_greedy(
@@ -224,17 +247,11 @@ fn run_greedy(
         let mut best_key: (u128, u64, u8, Uuid) = (u128::MAX, u64::MAX, u8::MAX, Uuid::nil());
 
         for (idx, cand) in candidates.iter().enumerate() {
-            *work_steps = work_steps.saturating_add(1);
-            if *work_steps > MAX_PLANNER_SCORING_STEPS {
-                return Err((FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded));
-            }
+            step_budget(work_steps, 1)?;
             if chosen_ids.contains(&cand.record.cover_id()) {
                 continue;
             }
-            *work_steps = work_steps.saturating_add(cand.covered_needed.len());
-            if *work_steps > MAX_PLANNER_SCORING_STEPS {
-                return Err((FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded));
-            }
+            step_budget(work_steps, cand.covered_needed.len())?;
             let gain = cand.covered_needed.iter().filter(|oid| uncovered.contains(oid)).count() as u64;
             if gain == 0 {
                 continue;

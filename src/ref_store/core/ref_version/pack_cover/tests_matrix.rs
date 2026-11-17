@@ -21,7 +21,6 @@ use super::verifier::{PlanVerifyError, verify_fetch_plan_closure};
 use crate::ref_store::contract::RequestDigest;
 use crate::ref_store::core::types::{GitObjectFormat, GitOid, RefName};
 use std::collections::BTreeMap;
-use uuid::Uuid;
 
 #[test]
 fn planner_verifier_auth_isolation_and_fallback_matrix() {
@@ -411,24 +410,9 @@ fn planner_rejects_aggregate_scoring_work_budget_exhaustion() {
         let (pk, art) = make_pack(&r, (k % 250) as u8, 2000 + k as u64, 100, false, vec![]);
         entries.push(*pk.entry());
         mem = compute_cover_membership_digest(&r, index.membership_generation() + 1, &entries).unwrap();
-        let cov = CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
-            cover_id: Uuid::from_u128(10_000 + k as u128),
-            realm: r,
-            tier: CoverTier::Delta,
-            pack: pk,
-            artifacts: art,
-            covered_versions: vec![v1.version_id()],
-            min_authority_seq: 1,
-            max_authority_seq: 1,
-            covered_commits: vec![link.clone()],
-            input_cover_ids: vec![],
-            membership_generation: index.membership_generation() + 1,
-            membership_digest: mem,
-            compaction_epoch: 1,
-            worker_id: uid(701),
-            operation_id: Uuid::from_u128(20_000 + k as u128),
-        })
-        .unwrap();
+        let meta = (10_000 + k as u128, index.membership_generation() + 1, (1, 1), mem);
+        let cov =
+            seal_test_cover(&r, meta, CoverTier::Delta, (pk, art), vec![v1.version_id()], vec![link.clone()], vec![]);
         hold_ids.push(cov.cover_id());
         index.register_leaf_cover(cov, mem).unwrap();
     }
@@ -462,27 +446,11 @@ fn planner_rejects_aggregate_scoring_work_budget_exhaustion() {
 fn c1_for_tamper_test(r: &RefVersionRealm, p: &VerifiedClosurePack, v: &VersionRecord) -> CoverHierarchyRecord {
     let (_, a) = make_pack(r, 99, p.verified_bytes() - 200, 200, false, vec![]);
     let mem = compute_cover_membership_digest(r, 2, &[*p.entry()]).unwrap();
-    CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
-        cover_id: uid(199),
-        realm: *r,
-        tier: CoverTier::Delta,
-        pack: p.clone(),
-        artifacts: a,
-        covered_versions: vec![v.version_id()],
-        min_authority_seq: 1,
-        max_authority_seq: 1,
-        covered_commits: vec![CoverCommitLink {
-            commit_oid: oid(r.object_format(), 1),
-            parent_oids: vec![],
-            version_id: v.version_id(),
-            authority_seq: 1,
-        }],
-        input_cover_ids: vec![],
-        membership_generation: 2,
-        membership_digest: mem,
-        compaction_epoch: 1,
-        worker_id: uid(799),
-        operation_id: uid(899),
-    })
-    .unwrap()
+    let l = CoverCommitLink {
+        commit_oid: oid(r.object_format(), 1),
+        parent_oids: vec![],
+        version_id: v.version_id(),
+        authority_seq: 1,
+    };
+    seal_test_cover(r, (199, 2, (1, 1), mem), CoverTier::Delta, (p.clone(), a), vec![v.version_id()], vec![l], vec![])
 }

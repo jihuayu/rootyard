@@ -1,0 +1,125 @@
+//! Regression tests for diamond delta-base DAG memoization and bounded expansion work (Issue #184).
+use super::super::closure::{CausalVersionNode, VersionGraph};
+use super::super::read_mode::ReadConsumer;
+use super::super::record::RefHead;
+use super::auth::{FetchPlanError, ReadIsolationMode, StrongSnapshotCut};
+use super::model::{CoverCommitLink, CoverHierarchyIndex, CoverTier, compute_cover_membership_digest};
+use super::planner::{FetchPlanOutcome, FetchPlanRequest, WantTarget, plan_fetch_covers};
+use super::retention_class::{CoverRetentionHold, RetentionClassificationIndex};
+use super::tests::{default_auth, make_pack, mint_version, oid, realm, seal_test_cover, uid};
+use super::verifier::verify_fetch_plan_closure;
+use crate::ref_store::contract::RequestDigest;
+use crate::ref_store::core::types::{GitObjectFormat, GitOid, RefName};
+use std::collections::BTreeMap;
+use uuid::Uuid;
+
+#[test]
+fn planner_expands_diamond_delta_dag_linearly_and_bounds_delta_work() {
+    let r = realm(GitObjectFormat::Sha1);
+    let main_ref = RefName::new("refs/heads/main").unwrap();
+    let tip = oid(GitObjectFormat::Sha1, 1);
+    let (p0, _) = make_pack(&r, 250, 1024, 100, false, vec![]);
+    let (v1, p0_c) = mint_version(&r, "refs/heads/main", 1, None, tip, p0, vec![]);
+    let mut graph = VersionGraph::new();
+    graph.insert_active(CausalVersionNode { record: v1.clone(), own_packs: vec![p0_c] });
+
+    let dummy = |id: u128| {
+        let mut raw = [0_u8; 20];
+        raw[..16].copy_from_slice(&id.to_be_bytes());
+        GitOid::parse(GitObjectFormat::Sha1, &hex::encode(raw)).unwrap()
+    };
+    let add = |idx: &mut CoverHierarchyIndex,
+               ents: &mut Vec<_>,
+               id: u128,
+               commit: GitOid,
+               bases: Vec<Uuid>,
+               holds: &mut Vec<Uuid>| {
+        let (pk, art) = make_pack(&r, (id % 240) as u8, 1200, 100, !bases.is_empty(), bases);
+        ents.push(*pk.entry());
+        let g = idx.membership_generation() + 1;
+        let m = compute_cover_membership_digest(&r, g, ents).unwrap();
+        let lk =
+            CoverCommitLink { commit_oid: commit, parent_oids: vec![], version_id: v1.version_id(), authority_seq: 1 };
+        let cov = seal_test_cover(
+            &r,
+            (id, g, (1, 1), m),
+            CoverTier::Delta,
+            (pk, art),
+            vec![v1.version_id()],
+            vec![lk],
+            vec![],
+        );
+        holds.push(cov.cover_id());
+        idx.register_leaf_cover(cov, m).unwrap();
+    };
+    let run_req = |idx: &CoverHierarchyIndex, holds: Vec<Uuid>| {
+        let mut ret = RetentionClassificationIndex::new();
+        ret.add_hold(CoverRetentionHold::ActiveRefHead {
+            ref_name: main_ref.clone(),
+            version_id: v1.version_id(),
+            cover_ids: holds,
+        });
+        let cut = StrongSnapshotCut {
+            authority_seq: 1,
+            snapshot_digest: RequestDigest::of("dag", &[b"cut"]),
+            membership_digest: idx.membership_digest(),
+            heads: BTreeMap::from([(main_ref.clone(), RefHead::from_committed(&v1).unwrap())]),
+        };
+        let mut req =
+            FetchPlanRequest::new(ReadConsumer::SmartHttpFetch, r, default_auth(&r), ReadIsolationMode::StrongSnapshot);
+        req.strong_cut = Some(cut.clone());
+        req.wants = vec![WantTarget::Ref { ref_name: main_ref.clone() }];
+        req.allow_strong_fallback = false;
+        (plan_fetch_covers(&req, &graph, idx, &ret), cut, ret, req)
+    };
+
+    // 1. Valid 3-layer 3-wide diamond (14 covers <= 16 pack bound) succeeds and verifies.
+    let mem0 = compute_cover_membership_digest(&r, 1, &[]).unwrap();
+    let (mut idx, mut ents, mut holds) = (CoverHierarchyIndex::new(r, mem0).unwrap(), Vec::new(), Vec::new());
+    add(&mut idx, &mut ents, 20_000, dummy(20_000), vec![], &mut holds);
+    let mut prev = vec![uid(20_000)];
+    for layer in 0..3_u128 {
+        let mut mid = Vec::new();
+        for k in 0..3_u128 {
+            let id = 20_010 + layer * 10 + k;
+            add(&mut idx, &mut ents, id, dummy(id), prev.clone(), &mut holds);
+            mid.push(uid(id));
+        }
+        let j = 20_050 + layer;
+        add(&mut idx, &mut ents, j, dummy(j), mid, &mut holds);
+        prev = vec![uid(j)];
+    }
+    add(&mut idx, &mut ents, 20_099, tip, prev, &mut holds);
+    let (res, cut, ret, req) = run_req(&idx, holds);
+    let FetchPlanOutcome::Planned(plan) = res.unwrap() else {
+        panic!("expected diamond plan");
+    };
+    assert_eq!(plan.selected_covers.len(), 14);
+    assert!(verify_fetch_plan_closure(&plan, req.consumer, &req.auth, Some(&cut), &graph, &idx, &ret).is_ok());
+
+    // 2. 28-layer binary diamond (2^28 naive paths) finishes linearly via memoization and fails closed.
+    let (mut d_idx, mut d_ents, mut d_holds) = (CoverHierarchyIndex::new(r, mem0).unwrap(), Vec::new(), Vec::new());
+    add(&mut d_idx, &mut d_ents, 30_000, dummy(30_000), vec![], &mut d_holds);
+    let mut prev2 = vec![uid(30_000)];
+    for layer in 0..28_u128 {
+        let (a, b, j) = (31_000 + layer * 3, 31_001 + layer * 3, 31_002 + layer * 3);
+        add(&mut d_idx, &mut d_ents, a, dummy(a), prev2.clone(), &mut d_holds);
+        add(&mut d_idx, &mut d_ents, b, dummy(b), prev2, &mut d_holds);
+        add(&mut d_idx, &mut d_ents, j, dummy(j), vec![uid(a), uid(b)], &mut d_holds);
+        prev2 = vec![uid(j)];
+    }
+    add(&mut d_idx, &mut d_ents, 39_999, tip, prev2, &mut d_holds);
+    assert_eq!(run_req(&d_idx, d_holds).0, Err(FetchPlanError::ClosureBoundsExceeded));
+
+    // 3. Dense delta fanout (520 covers << 4096) exhausts work_steps inside expand_delta_bases.
+    let (mut b_idx, mut b_ents, mut b_holds) = (CoverHierarchyIndex::new(r, mem0).unwrap(), Vec::new(), Vec::new());
+    let mut bases = Vec::with_capacity(260);
+    for k in 0..260_u128 {
+        add(&mut b_idx, &mut b_ents, 40_000 + k, dummy(40_000 + k), vec![], &mut b_holds);
+        bases.push(uid(40_000 + k));
+    }
+    for k in 0..260_u128 {
+        add(&mut b_idx, &mut b_ents, 41_000 + k, tip, bases.clone(), &mut b_holds);
+    }
+    assert_eq!(run_req(&b_idx, b_holds).0, Err(FetchPlanError::ClosureBoundsExceeded));
+}

@@ -15,6 +15,8 @@ pub mod retention_class;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_diamond;
+#[cfg(test)]
 mod tests_git_blob;
 #[cfg(test)]
 mod tests_matrix;
