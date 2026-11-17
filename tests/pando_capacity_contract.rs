@@ -150,12 +150,10 @@ fn git_run(repo: &Path, args: &[&str], stdin: &[u8]) -> Result<String> {
         cmd.env(k, v);
     }
     cmd.env("GIT_CONFIG_GLOBAL", if cfg!(unix) { "/dev/null" } else { "NUL" });
-    if !stdin.is_empty() {
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    }
     let out = if stdin.is_empty() {
         cmd.output()?
     } else {
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut ch = cmd.spawn()?;
         std::io::Write::write_all(&mut ch.stdin.take().unwrap(), stdin)?;
         ch.wait_with_output()?
@@ -254,8 +252,7 @@ async fn streaming_growth_beyond_16_packs_sha1_and_sha256_lifecycle() -> Result<
                 eng.attach_hold(ProtectionHold::RetentionRoot { root_id, kind: "pitr".into() }, None)?;
                 eng.attach_hold(ProtectionHold::BackupManifest { backup_id }, None)?;
                 assert!(eng.apply_push(req.clone(), dl).await?.replayed);
-                let mut bad = req;
-                bad.request_digest = "tampered".into();
+                let bad = IncrementalPushRequest { request_digest: "tampered".into(), ..req };
                 assert!(matches!(eng.apply_push(bad, dl).await, Err(GrowthEngineError::DigestConflict(_))));
             }
             if i == 5 {
@@ -271,11 +268,8 @@ async fn streaming_growth_beyond_16_packs_sha1_and_sha256_lifecycle() -> Result<
         fs::write(&bp, b"NOT_A_VALID_PACK")?;
         fs::write(&bi, b"NOT_A_VALID_IDX")?;
         assert!(eng.apply_push(push_req("refs/heads/broken", &z, &oids[0], vec![(bp, bi)]), dl).await.is_err());
-        assert!(
-            eng.apply_push(push_req("refs/heads/broken", &z, &"f".repeat(fmt.oid_hex_len()), vec![]), dl)
-                .await
-                .is_err()
-        );
+        let miss = push_req("refs/heads/broken", &z, &"f".repeat(fmt.oid_hex_len()), vec![]);
+        assert!(eng.apply_push(miss, dl).await.is_err());
         assert!(!eng.acked_refs().contains_key("refs/heads/broken"));
 
         let s = eng.snapshot();
@@ -297,16 +291,14 @@ async fn streaming_growth_beyond_16_packs_sha1_and_sha256_lifecycle() -> Result<
 #[tokio::test]
 async fn compaction_and_push_budget_failures_preserve_ledger_and_frontier() -> Result<()> {
     let (s3, dl) = (LoopbackS3::new(), Instant::now() + Duration::from_secs(60));
-    for (regs, rcpts, bytes, ret_bytes, expected, compact) in [
-        (2, 16, 8 * 1024 * 1024, 64 * 1024 * 1024, "registrations", true),
-        (16, 16, 4608, 64 * 1024 * 1024, "logical_bytes", true),
-        (16, 16, 8 * 1024 * 1024, 512, "retained_pack_bytes", true),
-        (16, 1, 8 * 1024 * 1024, 64 * 1024 * 1024, "receipts", false),
-        (1, 16, 8 * 1024 * 1024, 64 * 1024 * 1024, "registrations", false),
+    for (regs, rcpts, bytes, expected, compact) in [
+        (2, 16, 8 * 1024 * 1024, "registrations", true),
+        (16, 16, 4608, "logical_bytes", true),
+        (16, 1, 8 * 1024 * 1024, "receipts", false),
+        (1, 16, 8 * 1024 * 1024, "registrations", false),
     ] {
         let dir = TempDir::new()?;
-        let mut c = PandoCapacityContract::current_standalone();
-        c.streaming.max_retained_pack_bytes = ret_bytes;
+        let mut c = Cfg::current_standalone();
         let ml = &mut c.metadata_ledger;
         (ml.repo_max_registrations, ml.repo_max_receipts) = (regs, rcpts);
         ml.repo_max_logical_bytes = bytes;
@@ -491,5 +483,15 @@ async fn compaction_barriers_pins_cancel_spoof_and_tight_caps() -> Result<()> {
     err_budget(eng3.cancel_operation(c3_id), "cancel_tombstones");
     let r_c1 = eng3.apply_push(push_with(c1, "c1", "refs/heads/main", &z, &o1, vec![]), dl).await;
     assert!(matches!(r_c1, Err(GrowthEngineError::OperationCancelled(_))));
+    let (dir4, mut c4) = (TempDir::new()?, Cfg::current_standalone());
+    let mut sr4 = SeedRepo::at(dir4.path().join("seed"), ObjectFormat::Sha1)?;
+    let ((_, a1, pa1, ia1), (_, a2, pa2, ia2)) = (sr4.next("x.txt", b"x1")?, sr4.next("y.txt", b"y2")?);
+    let (b1, b2) = (pack_meta(&pa1, &ia1)?.1, pack_meta(&pa2, &ia2)?.1);
+    c4.streaming.max_retained_pack_bytes = b1.max(b2) + 64;
+    let eng4 = open_eng(&s3, &dir4, c4, ObjectFormat::Sha1, false)?;
+    eng4.apply_push(pr("refs/heads/main", &z, &a1, vec![(pa1, ia1)]), dl).await?;
+    eng4.apply_push(pr("refs/heads/main", &a1, &a2, vec![(pa2, ia2)]), dl).await?;
+    err_budget(eng4.compact_serving_frontier(dl).await, "retained_pack_bytes");
+    assert_eq!((eng4.active_pack_locators().len(), eng4.archive_released_ledger()), (2, 0));
     Ok(())
 }
