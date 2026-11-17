@@ -7,6 +7,7 @@ faulthandler cleanup without Cargo, a database, a container or a network.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -101,6 +102,10 @@ print(json.dumps({
 """
 
 _STARTED_TEST = re.compile(r"^\S+ \(([^)]+)\) \.\.\. ", re.MULTILINE)
+_MARKER = re.compile(
+    rb"DSH-RUNNER-DIAG v=1 state=(START|DONE) "
+    rb"ordinal=(\d{8}) test_sha256=([0-9a-f]{64})\n"
+)
 
 
 def started_test_ids(output: str) -> list[str]:
@@ -153,6 +158,7 @@ class DiagnosticsRunnerTest(unittest.TestCase):
             enable_fatal_handler=mock.Mock(),
             disable_fatal_handler=mock.Mock(),
             is_fatal_handler_enabled=mock.Mock(return_value=True),
+            marker_write=lambda payload: len(payload),
         )
         self.assertEqual(stop.call_count, 1)
         self.assertEqual(
@@ -309,6 +315,7 @@ class DiagnosticsRunnerTest(unittest.TestCase):
                     enable_fatal_handler=mock.Mock(),
                     disable_fatal_handler=mock.Mock(),
                     is_fatal_handler_enabled=mock.Mock(return_value=True),
+                    marker_write=lambda payload: len(payload),
                 )
         start.assert_called_once()
         stop.assert_called_once_with()
@@ -548,6 +555,262 @@ class FatalHandlerSeamTest(unittest.TestCase):
         self.start_timer.assert_not_called()
         self.stop_timer.assert_not_called()
         self.disable.assert_not_called()
+
+
+class MarkerSeamTest(unittest.TestCase):
+    """Pure-mock checks for the bounded per-test marker seam."""
+
+    def setUp(self) -> None:
+        self.markers: list[bytes] = []
+        self.output = io.StringIO()
+        self.start_timer = mock.Mock()
+        self.stop_timer = mock.Mock()
+        self.enable_fatal = mock.Mock()
+        self.disable_fatal = mock.Mock()
+        self.is_fatal_enabled = mock.Mock(return_value=True)
+
+    def write_marker(self, payload: bytes) -> int:
+        self.markers.append(payload)
+        return len(payload)
+
+    def run_suite(self, suite: unittest.TestSuite, *, write=None) -> int:
+        with mock.patch.object(runner, "discover", return_value=suite):
+            return runner.run(
+                ROOT / "tests",
+                stream=self.output,
+                start_timer=self.start_timer,
+                stop_timer=self.stop_timer,
+                enable_fatal_handler=self.enable_fatal,
+                disable_fatal_handler=self.disable_fatal,
+                is_fatal_handler_enabled=self.is_fatal_enabled,
+                marker_write=self.write_marker if write is None else write,
+            )
+
+    def parsed_markers(self) -> list[tuple[str, int, str]]:
+        parsed: list[tuple[str, int, str]] = []
+        for payload in self.markers:
+            match = _MARKER.fullmatch(payload)
+            self.assertIsNotNone(match, payload)
+            assert match is not None
+            parsed.append(
+                (
+                    match.group(1).decode("ascii"),
+                    int(match.group(2)),
+                    match.group(3).decode("ascii"),
+                )
+            )
+        return parsed
+
+    def test_start_done_order_for_pass_fail_error_skip_and_subtest(self) -> None:
+        class Pass(unittest.TestCase):
+            def test_pass(self) -> None:
+                pass
+
+        class Fail(unittest.TestCase):
+            def test_fail(self) -> None:
+                self.fail("secret-failure-text")
+
+        class Error(unittest.TestCase):
+            def test_error(self) -> None:
+                raise RuntimeError("secret-error-text")
+
+        class Skip(unittest.TestCase):
+            def test_skip(self) -> None:
+                self.skipTest("secret-skip-text")
+
+        class SubTest(unittest.TestCase):
+            def test_subtests(self) -> None:
+                with self.subTest(value="first"):
+                    self.fail("secret-subtest-text")
+                with self.subTest(value="second"):
+                    pass
+
+        cases = [
+            Pass("test_pass"),
+            Fail("test_fail"),
+            Error("test_error"),
+            Skip("test_skip"),
+            SubTest("test_subtests"),
+        ]
+        code = self.run_suite(unittest.TestSuite(cases))
+
+        self.assertEqual(code, 1)
+        self.assertIn("Ran 5 tests", self.output.getvalue())
+        self.assertIn(
+            "FAILED (failures=2, errors=1, skipped=1)", self.output.getvalue()
+        )
+
+        parsed = self.parsed_markers()
+        self.assertEqual(len(parsed), 10)
+        self.assertEqual(
+            [state for state, _, _ in parsed], ["START", "DONE"] * 5
+        )
+        self.assertEqual(
+            [ordinal for _, ordinal, _ in parsed],
+            [1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+        )
+        for index, case in enumerate(cases):
+            expected = hashlib.sha256(
+                case.id().encode("utf-8", "surrogatepass")
+            ).hexdigest()
+            self.assertEqual(parsed[index * 2][2], expected)
+            self.assertEqual(parsed[index * 2 + 1][2], expected)
+
+        joined = b"".join(self.markers)
+        for case in cases:
+            self.assertNotIn(
+                case.id().encode("utf-8", "surrogatepass"), joined
+            )
+        for secret in (
+            b"secret-failure-text",
+            b"secret-error-text",
+            b"secret-skip-text",
+            b"secret-subtest-text",
+        ):
+            self.assertNotIn(secret, joined)
+        for payload in self.markers:
+            self.assertLessEqual(len(payload), runner.MARKER_MAX_BYTES)
+        self.start_timer.assert_called_once()
+        self.stop_timer.assert_called_once_with()
+
+    def test_markers_preserve_success_and_skip_counts(self) -> None:
+        class Outcomes(unittest.TestCase):
+            def test_pass(self) -> None:
+                pass
+
+            def test_skip(self) -> None:
+                self.skipTest("fixture skip")
+
+        code = self.run_suite(
+            unittest.TestSuite([Outcomes("test_pass"), Outcomes("test_skip")])
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("Ran 2 tests", self.output.getvalue())
+        self.assertIn("skipped=1", self.output.getvalue())
+        self.assertEqual(
+            [state for state, _, _ in self.parsed_markers()],
+            ["START", "DONE", "START", "DONE"],
+        )
+
+    def test_empty_selection_emits_no_marker_and_keeps_exit_five(self) -> None:
+        code = self.run_suite(unittest.TestSuite())
+        self.assertEqual(code, 5)
+        self.assertEqual(self.markers, [])
+        self.assertIn("Ran 0 tests", self.output.getvalue())
+
+    def test_markers_are_written_immediately_around_the_test_body(self) -> None:
+        events: list[str] = []
+
+        class Body(unittest.TestCase):
+            def test_body(self) -> None:
+                events.append("body")
+
+        def write(payload: bytes) -> int:
+            match = _MARKER.fullmatch(payload)
+            self.assertIsNotNone(match, payload)
+            assert match is not None
+            events.append(match.group(1).decode("ascii"))
+            self.markers.append(payload)
+            return len(payload)
+
+        code = self.run_suite(
+            unittest.TestSuite([Body("test_body")]), write=write
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(events, ["START", "body", "DONE"])
+
+    def test_untrusted_id_is_only_hashed_and_never_serialized(self) -> None:
+        raw_id = (
+            "untrusted\n"
+            + "a" * 64
+            + "\nDSH-RUNNER-DIAG v=1 state=START "
+            + "ordinal=00000000 test_sha256="
+            + "b" * 64
+        )
+
+        class Untrusted(unittest.TestCase):
+            def id(self) -> str:
+                return raw_id
+
+            def runTest(self) -> None:
+                pass
+
+        code = self.run_suite(unittest.TestSuite([Untrusted("runTest")]))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.markers), 2)
+        expected = hashlib.sha256(
+            raw_id.encode("utf-8", "surrogatepass")
+        ).hexdigest()
+        for payload in self.markers:
+            self.assertNotIn(
+                raw_id.encode("utf-8", "surrogatepass"), payload
+            )
+            self.assertEqual(payload.count(expected.encode("ascii")), 1)
+            self.assertEqual(len(re.findall(rb"[0-9a-f]{64}", payload)), 1)
+        self.assertEqual(
+            [digest for _, _, digest in self.parsed_markers()],
+            [expected, expected],
+        )
+
+    def test_marker_failure_fails_closed_without_changing_real_result(self) -> None:
+        class Pass(unittest.TestCase):
+            def test_pass(self) -> None:
+                pass
+
+        def broken(payload: bytes) -> int:
+            raise OSError("marker sink unavailable")
+
+        code = self.run_suite(
+            unittest.TestSuite([Pass("test_pass")]), write=broken
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("Ran 1 test", self.output.getvalue())
+        self.assertIn("OK", self.output.getvalue())
+        self.start_timer.assert_called_once()
+        self.stop_timer.assert_called_once_with()
+
+    def test_marker_failure_does_not_mask_a_real_failure(self) -> None:
+        class Fail(unittest.TestCase):
+            def test_fail(self) -> None:
+                self.fail("fixture failure")
+
+        def broken(payload: bytes) -> int:
+            raise OSError("marker sink unavailable")
+
+        code = self.run_suite(
+            unittest.TestSuite([Fail("test_fail")]), write=broken
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("FAILED (failures=1)", self.output.getvalue())
+
+    def test_marker_failure_preserves_fatal_handler_cleanup(self) -> None:
+        class Pass(unittest.TestCase):
+            def test_pass(self) -> None:
+                pass
+
+        self.is_fatal_enabled.return_value = False
+
+        def broken(payload: bytes) -> int:
+            raise OSError("marker sink unavailable")
+
+        code = self.run_suite(
+            unittest.TestSuite([Pass("test_pass")]), write=broken
+        )
+        self.assertEqual(code, 1)
+        self.enable_fatal.assert_called_once_with(all_threads=True)
+        self.disable_fatal.assert_called_once_with()
+
+    def test_marker_failure_cannot_turn_empty_selection_green(self) -> None:
+        calls: list[bytes] = []
+
+        def broken(payload: bytes) -> int:
+            calls.append(payload)
+            raise OSError("marker sink unavailable")
+
+        code = self.run_suite(unittest.TestSuite(), write=broken)
+        self.assertEqual(code, 5)
+        self.assertEqual(calls, [])
+        self.assertIn("Ran 0 tests", self.output.getvalue())
 
 
 if __name__ == "__main__":
