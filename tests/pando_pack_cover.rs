@@ -379,7 +379,7 @@ async fn sha1_and_sha256_compaction_thin_and_fault_fallback() -> Result<()> {
             git_raw(&env.repo, &["pack-objects", "--revs", "--thin", "--stdout", "--quiet"], Some(revs.as_bytes()))?;
         let stem = format!("pack-{}", &hex::encode(Sha256::digest(&thin))[..fmt.oid_hex_len()]);
         let p4 = env.upload(thin, b"thin-idx".to_vec(), stem, vec![comp.cover_id(), cov3.cover_id()])?;
-        let (v4, cov4) = env.step(CommitMode::Atomic, m, Some(&v3), c4, vec![c3], p4, vec![v3.version_id()])?;
+        let (v4, cov4) = env.step(CommitMode::Atomic, m, Some(&v3), (c4, vec![c3]), p4, vec![v3.version_id()])?;
 
         let (mr, wr) = (RefName::new(m)?, |r: &RefName| WantTarget::Ref { ref_name: r.clone() });
         env.hold(&mr, &v4, &[comp.cover_id(), cov3.cover_id(), cov4.cover_id()]);
