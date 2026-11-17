@@ -62,7 +62,7 @@ def _safe_stage(value):
 def _argument(argv, index):
     try:
         return argv[index]
-    except BaseException:
+    except Exception:
         return None
 
 
@@ -71,7 +71,7 @@ def _option_argument(argv, option):
         for index, item in enumerate(argv):
             if item == option:
                 return _argument(argv, index + 1)
-    except BaseException:
+    except Exception:
         return None
     return None
 
@@ -129,8 +129,13 @@ def _stage_label(argv, phase, binary):
             }.get(subcommand, "binary.other")
             return phase + "." + suffix
         return _STAGE_OTHER
-    except BaseException:
+    except Exception:
         return _STAGE_OTHER
+
+
+def _attach_stage(error, stage):
+    """Best-effort safe attribute; control signals must not be swallowed."""
+    object.__setattr__(error, "failed_stage", stage)
 
 
 class CollaboratorTransportHarness(collaborator_contract.prerequisite,
@@ -211,7 +216,7 @@ class CollaboratorTransportHarness(collaborator_contract.prerequisite,
                 getattr(self, "_stage_phase", None),
                 getattr(getattr(self, "args", None), "binary", None),
             )
-        except BaseException:
+        except Exception:
             stage = _STAGE_OTHER
         stage = _safe_stage(stage) or _STAGE_OTHER
         self._last_run_stage = stage
@@ -220,8 +225,8 @@ class CollaboratorTransportHarness(collaborator_contract.prerequisite,
         except AssertionError as error:
             self._failed_stage = stage
             try:
-                object.__setattr__(error, "failed_stage", stage)
-            except BaseException:
+                _attach_stage(error, stage)
+            except Exception:
                 pass
             raise
 

@@ -892,6 +892,83 @@ class EnvironmentObserverContract(unittest.TestCase):
             h4.run(["git", "--version"])
         self.assertEqual(h4._last_run_stage, "prior-last")
 
+    def test_runtime_error_fallback_at_nested_helpers(self):
+        cases = (
+            ("_argument", ["/owned/rootyard", "migrate"]),
+            ("_option_argument", ["psql", "-c", "SELECT version()"]),
+        )
+        for helper, argv in cases:
+            h = self.make_harness()
+            h._observe_stage = True
+            h._stage_phase = "fixture"
+            delegate = mock.Mock(return_value=types.SimpleNamespace(
+                returncode=0, stdout=b"", stderr=b""))
+            with mock.patch.object(e2e.Harness, "run", new=delegate), \
+                    mock.patch.object(harness, helper, side_effect=RuntimeError("classifier")):
+                h.run(argv)
+            self.assertEqual(delegate.call_count, 1)
+            self.assertEqual(h._last_run_stage, "OTHER")
+
+    def test_control_signals_propagate_before_delegate(self):
+        controls = (KeyboardInterrupt("cancel"), SystemExit(7))
+        cases = (
+            ("_stage_label", ["git", "push", "origin", "HEAD:main"]),
+            ("_argument", ["/owned/rootyard", "migrate"]),
+            ("_option_argument", ["psql", "-c", "SELECT version()"]),
+        )
+        for control in controls:
+            for helper, argv in cases:
+                h = self.make_harness()
+                h._observe_stage = True
+                h._stage_phase = "fixture"
+                delegate = mock.Mock(return_value=types.SimpleNamespace(
+                    returncode=0, stdout=b"", stderr=b""))
+                with mock.patch.object(e2e.Harness, "run", new=delegate), \
+                        mock.patch.object(harness, helper, side_effect=control):
+                    with self.assertRaises(type(control)) as caught:
+                        h.run(argv)
+                self.assertIs(caught.exception, control)
+                self.assertEqual(delegate.call_count, 0)
+                self.assertIsNone(h._failed_stage)
+
+    def test_control_signal_cleanup_restores_observer_state(self):
+        controls = (KeyboardInterrupt("cancel"), SystemExit(9))
+        for control in controls:
+            h = self.make_harness()
+            h._stage_phase = "prior"
+            h._last_run_stage = "prior-last"
+            h._failed_stage = "prior-failed"
+            delegate = mock.Mock()
+
+            def fn():
+                h.run(["git", "push", "origin", "HEAD:main"])
+
+            with mock.patch.object(e2e.Harness, "run", new=delegate), \
+                    mock.patch.object(harness, "_stage_label", side_effect=control):
+                with self.assertRaises(type(control)) as caught:
+                    h.case("environment", fn)
+            self.assertIs(caught.exception, control)
+            self.assertEqual(delegate.call_count, 0)
+            self.assertEqual((h._observe_stage, h._stage_phase, h._last_run_stage, h._failed_stage),
+                             (False, "prior", "prior-last", "prior-failed"))
+            self.assertEqual(h.results, [])
+
+    def test_control_signal_during_stage_attachment(self):
+        controls = (KeyboardInterrupt("cancel"), SystemExit(3))
+        for control in controls:
+            h = self.make_harness()
+            h._observe_stage = True
+            h._stage_phase = "fixture"
+            primary = AssertionError("primary")
+            delegate = mock.Mock(side_effect=primary)
+            with mock.patch.object(e2e.Harness, "run", new=delegate), \
+                    mock.patch.object(harness, "_attach_stage", side_effect=control):
+                with self.assertRaises(type(control)) as caught:
+                    h.run(["git", "push", "origin", "HEAD:main"])
+            self.assertIs(caught.exception, control)
+            self.assertEqual(delegate.call_count, 1)
+            self.assertEqual(h._failed_stage, "fixture.git.push")
+
     def test_privacy_and_redaction(self):
         h = self.make_harness()
         h.secrets = ["SECRET"]
