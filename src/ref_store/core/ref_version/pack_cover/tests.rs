@@ -434,7 +434,8 @@ fn thin_pack_uncached_retired_or_historical_delta_base_falls_back_cleanly() {
         hold_id: uid(1103),
         cover_ids: vec![uid(1101)],
         version_ids: vec![],
-        reason: "hist".into(),
+        active_readers: 1,
+        released: false,
     });
     let mut req = FetchPlanRequest {
         consumer: ReadConsumer::SmartHttpFetch,
