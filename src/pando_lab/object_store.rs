@@ -8,7 +8,14 @@ use std::{
 
 mod authority;
 mod publication;
+mod publish;
 pub(crate) use publication::{PreparedPackPublication, PublicationReceipt, prepare_pack_files_sealed};
+pub(crate) use publish::prepare_known_pack_publication;
+pub(super) use publish::put_pack;
+pub(crate) use publish::put_pack_and_seal_with_suite;
+#[cfg(test)]
+use publish::put_pack_db_inner;
+pub use publish::put_pack_files;
 #[cfg(test)]
 mod pg_receipt_tests;
 #[cfg(test)]
@@ -452,84 +459,6 @@ fn ensure_encrypted_hook_backend_supported(remote: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn prepare_known_pack_publication(
-    config: &Config,
-    client: &Client,
-    repo: Uuid,
-    pack: &Pack,
-    checkpoint: Option<&lifecycle::rotation::KmsRotationCheckpoint>,
-    storage_tier: &str,
-) -> Result<PreparedPackPublication> {
-    // The encrypted prepared hook currently produces local CAS only. Use the
-    // exact same backend switch as ordinary put/get/verify before provider
-    // selection, local sealing, or authoritative SQL publication.
-    ensure_encrypted_hook_backend_supported(remote_enabled())?;
-    let local_root = config.root.join("objects");
-    let pack_bytes = std::fs::read(local_root.join(repo.to_string()).join(format!("{}.pack", pack.id)))?;
-    let idx_bytes = std::fs::read(local_root.join(repo.to_string()).join(format!("{}.idx", pack.id)))?;
-    ensure!(
-        delta::sha256_hex(&pack_bytes) == pack.pack_sha256 && delta::sha256_hex(&idx_bytes) == pack.idx_sha256,
-        "prepared pack or index digest does not match the known pack identity"
-    );
-    let opts = ObjectStorePutOptions {
-        expected_pack_sha256: Some(pack.pack_sha256.clone()),
-        expected_pack_bytes: Some(pack_bytes.len() as u64),
-        ..Default::default()
-    };
-    let prepared = prepare_pack_files_sealed(
-        &store_root(config),
-        &local_root,
-        repo,
-        pack.id,
-        &opts,
-        storage_tier,
-        checkpoint,
-        Some(client),
-    )
-    .await?;
-    let manifest = prepared.manifest();
-    let envelope = prepared.envelope();
-    ensure!(
-        manifest.repo == repo
-            && manifest.pack_id == pack.id
-            && manifest.pack_sha256 == pack.pack_sha256
-            && manifest.idx_sha256 == pack.idx_sha256,
-        "prepared object-store manifest identity mismatch"
-    );
-    ensure!(
-        envelope.encryption_mode == lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE,
-        "prepared envelope is not authenticated"
-    );
-    if let Some(cp) = checkpoint {
-        ensure!(
-            envelope.provider_kind == cp.to_provider_kind
-                && envelope.key_id == cp.to_key_id
-                && envelope.key_version == cp.expected_version(),
-            "prepared envelope does not match the authoritative rotation target"
-        );
-    }
-    Ok(prepared)
-}
-
-pub async fn put_pack_files(
-    store_root_dir: &Path,
-    local_objects_root: &Path,
-    repo: Uuid,
-    pack_id: Uuid,
-    opts: &ObjectStorePutOptions,
-) -> Result<(ObjectStorePutReport, CasPackManifest)> {
-    ensure!(
-        lifecycle::provider_selection::selected_kind()? == lifecycle::provider_selection::PandoProviderSelection::Local,
-        "raw Local object-store helper cannot publish unterminated Vault writes"
-    );
-    let prepared =
-        prepare_pack_files_sealed(store_root_dir, local_objects_root, repo, pack_id, opts, "hot", None, None).await?;
-    // This raw path has no DB authority, so its verified envelope file is the
-    // only metadata authority. The staged prepare itself never writes a mirror.
-    prepared.write_file_only_mirror()?;
-    Ok((prepared.report().clone(), prepared.manifest().clone()))
-}
-
 pub async fn get_pack_files(
     store_root_dir: &Path,
     local_objects_root: &Path,
@@ -722,67 +651,6 @@ async fn verify_repo_files_with_base_inner(
 
 pub async fn verify_repo_files(store_root_dir: &Path, bucket: &str, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
     verify_repo_files_with_base(store_root_dir, infer_base_root(store_root_dir, None), bucket, repo).await
-}
-
-async fn put_pack_db_inner(
-    config: &Config,
-    repo: Uuid,
-    pack_id: Uuid,
-    opts: &ObjectStorePutOptions,
-    storage_tier: &str,
-) -> Result<(ObjectStorePutReport, lifecycle::KmsEnvelopeRecord)> {
-    // Composed remote publication is not this primitive. Keep the boundary
-    // explicit instead of silently committing local CAS under an S3 endpoint.
-    ensure!(
-        !remote_enabled(),
-        "direct local CAS publication is unsupported with ROOTYARD_OBJECT_STORE_ENDPOINT; standalone remote put must use the remote publication path"
-    );
-    let mut session = lifecycle::publication::writer_session(config, repo).await?;
-    let checkpoint = lifecycle::publication::active_rotation(session.client(), repo).await?;
-    // Provider selection, sealing and immutable CAS writes happen while this
-    // dedicated session owns the shared publication gate, but outside SQL.
-    let prepared = prepare_pack_files_sealed(
-        &store_root(config),
-        &config.root.join("objects"),
-        repo,
-        pack_id,
-        opts,
-        storage_tier,
-        checkpoint.as_ref(),
-        Some(session.client()),
-    )
-    .await?;
-    let t = session.client_mut().transaction().await?;
-    let receipt = prepared.publish_in(&t).await?;
-    t.commit().await?;
-    // The receipt is the DB winner. Mirror only after the known commit and
-    // derive the returned report/envelope from the receipt, never the losing
-    // prepared value.
-    receipt.refresh_mirrors();
-    Ok((receipt.report(), receipt.envelope().clone()))
-}
-
-pub(super) async fn put_pack(
-    config: &Config,
-    repo: Uuid,
-    pack_id: Uuid,
-    opts: &ObjectStorePutOptions,
-) -> Result<ObjectStorePutReport> {
-    if remote_enabled() {
-        return super::remote::put(config, repo, pack_id, opts).await;
-    }
-    Ok(put_pack_db_inner(config, repo, pack_id, opts, "hot").await?.0)
-}
-
-pub(crate) async fn put_pack_and_seal_with_suite(
-    config: &Config,
-    repo: Uuid,
-    pack_id: Uuid,
-    cipher_suite: &str,
-    storage_tier: &str,
-) -> Result<lifecycle::KmsEnvelopeRecord> {
-    let opts = ObjectStorePutOptions { cipher_suite: Some(cipher_suite.to_owned()), ..Default::default() };
-    Ok(put_pack_db_inner(config, repo, pack_id, &opts, storage_tier).await?.1)
 }
 
 pub(super) async fn get_pack(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<ObjectStoreGetReport> {
