@@ -175,6 +175,7 @@ impl<C, I> Registry<C, I> {
         self.legacy_closing
     }
 
+    #[cfg(test)]
     pub(super) fn legacy_pending(&self, id: Uuid) -> bool {
         self.legacy_pending.contains_key(&id)
     }
