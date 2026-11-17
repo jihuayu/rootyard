@@ -11,7 +11,6 @@ import contextlib
 import io
 import json
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -31,6 +30,11 @@ import pando_producer_pg.source_capture_child as child  # noqa: E402
 import run_pando_producer_pg as runner  # noqa: E402
 from pando_producer_pg.errors import RunnerError  # noqa: E402
 from pando_producer_pg.process import Completed  # noqa: E402
+from test_pando_producer_pg_process import (  # noqa: E402
+    FakeThread,
+    GroupKiller,
+    StreamingPopen,
+)
 
 BOOTSTRAP = "postgresql://user:password@127.0.0.1:55432/bootstrap"
 BINARY = "/tmp/owned/target/debug/deps/rootyard_pando_lab-abc"
@@ -47,6 +51,16 @@ class FakeClock:
 
     def advance(self, seconds):
         self.now += float(seconds)
+
+
+class StepClock:
+    def __init__(self, step=10.0):
+        self.now = 0.0
+        self.step = float(step)
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
 
 
 def binding(commit=COMMIT, tree=TREE):
@@ -94,33 +108,6 @@ class FakeRunner:
         return item
 
 
-class StallPopen:
-    def __init__(self):
-        self.calls = 0
-        self.killed = False
-        self.returncode = None
-        self._poll = None
-
-    def communicate(self, input=None, timeout=None):
-        self.calls += 1
-        if self.calls == 1:
-            raise subprocess.TimeoutExpired("fake", timeout)
-        self.returncode = -9
-        self._poll = -9
-        return b"", b""
-
-    def kill(self):
-        self.killed = True
-
-    def wait(self, timeout=None):
-        self.returncode = -9
-        self._poll = -9
-        return self._poll
-
-    def poll(self):
-        return self._poll
-
-
 class BoundedCaptureTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -148,6 +135,10 @@ class BoundedCaptureTest(unittest.TestCase):
         self.assertEqual(kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
         self.assertEqual(argv[1], str(source_capture.CHILD_SCRIPT))
         self.assertEqual(argv[2], str(self.root.resolve()))
+        self.assertEqual(kwargs["max_stdout"], source_capture.MAX_BINDING_BYTES)
+        self.assertEqual(kwargs["max_total"], source_capture.MAX_BINDING_BYTES)
+        self.assertTrue(kwargs["fail_on_output_exceeded"])
+        self.assertEqual(kwargs["output_code"], "source_capture_failed")
         self.assertEqual(result["source_commit"], COMMIT)
         self.assertEqual(
             result["input_hashes"][0]["path"],
@@ -171,9 +162,12 @@ class BoundedCaptureTest(unittest.TestCase):
         self.assertEqual(fake.calls, [])
 
     def test_stalled_child_is_killed_reaped_and_fails_fixed(self):
-        stall = StallPopen()
+        stall = StreamingPopen(block=True)
         process_runner = process.ProcessRunner(
-            popen=lambda *args, **kwargs: stall
+            clock=StepClock(),
+            popen=lambda *args, **kwargs: stall,
+            thread_factory=FakeThread,
+            killpg=GroupKiller(),
         )
         with self.assertRaises(RunnerError) as caught:
             source_capture.capture_bounded(
@@ -187,7 +181,6 @@ class BoundedCaptureTest(unittest.TestCase):
             caught.exception.code, "source_capture_deadline_exceeded"
         )
         self.assertTrue(stall.killed)
-        self.assertGreaterEqual(stall.calls, 2)
         self.assertIsNotNone(stall.poll())
 
     def test_invalid_oversized_or_unregistered_child_output_fails_fixed(self):

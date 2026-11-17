@@ -27,22 +27,13 @@ import pando_producer_pg.process as process  # noqa: E402
 import run_pando_producer_pg as runner  # noqa: E402
 from pando_producer_pg.errors import RunnerError  # noqa: E402
 from pando_producer_pg.process import Completed  # noqa: E402
+from test_pando_producer_pg_process import (  # noqa: E402
+    FakeThread,
+    GroupKiller,
+    StreamingPopen,
+)
 
 BOOTSTRAP = "postgresql://user:password@127.0.0.1:55432/bootstrap"
-
-
-class RecordingPopen:
-    def __init__(self, stdout=b""):
-        self.stdout = stdout
-        self.returncode = 0
-        self.argv = None
-        self.kwargs = None
-
-    def communicate(self, input=None, timeout=None):
-        return self.stdout, b""
-
-    def poll(self):
-        return self.returncode
 
 
 class Result:
@@ -114,11 +105,15 @@ class CargoSourceCwdTest(unittest.TestCase):
         def popen(argv, **kwargs):
             recorded["argv"] = list(argv)
             recorded["kwargs"] = dict(kwargs)
-            return RecordingPopen(payload)
+            return StreamingPopen(stdout=payload)
 
         selection = artifacts.select_test_binary(
             self.root,
-            process.ProcessRunner(popen=popen),
+            process.ProcessRunner(
+                popen=popen,
+                thread_factory=FakeThread,
+                killpg=GroupKiller(),
+            ),
             5,
             deadline=100,
             clock=lambda: 0,
@@ -285,11 +280,13 @@ class HarnessSourceCwdTest(unittest.TestCase):
 
         def popen(argv, **kwargs):
             recorded.update(kwargs)
-            return RecordingPopen(b"")
+            return StreamingPopen(stdout=b"")
 
-        process.ProcessRunner(popen=popen).run(
-            ["fixture"], cwd="/tmp/source-root", timeout=5
-        )
+        process.ProcessRunner(
+            popen=popen,
+            thread_factory=FakeThread,
+            killpg=GroupKiller(),
+        ).run(["fixture"], cwd="/tmp/source-root", timeout=5)
         self.assertEqual(recorded["cwd"], "/tmp/source-root")
 
 

@@ -1,9 +1,12 @@
 """Bounded process execution with immediate Popen ownership.
 
-Output is held in RAM up to a fixed cap.  A timed-out or failed child is killed
-and polled to a reaped state before the fixed failure is raised; an unreapable
-child is itself a fixed failure.  No argv, environment, DSN or output is
-retained in an exception or printed by this module.
+Pipe readers enforce one aggregate in-memory budget while draining, so a child
+cannot make the parent accumulate unbounded stdout/stderr.  Ordinary commands
+retain the existing per-stream truncation result; callers can request a fixed
+failure as soon as the aggregate ceiling is crossed.  On any failure the owned
+process group is killed and reaped before a bounded reader join; pipes are
+closed only after their readers have actually stopped.  No argv, environment,
+DSN, SQL or raw child text is retained in an exception or printed.
 """
 from __future__ import annotations
 
@@ -11,29 +14,152 @@ import math
 import os
 import signal
 import subprocess
+import threading
 import time
 
 from .errors import RunnerError, require
 
 MAX_STDOUT = 2 * 1024 * 1024
 MAX_STDERR = 256 * 1024
+MAX_TOTAL_OUTPUT = MAX_STDOUT + MAX_STDERR
+READ_CHUNK = 64 * 1024
+READER_JOIN_SECONDS = 1.0
 KILL_WAIT_SECONDS = 2.0
+POLL_SECONDS = 0.05
 
 
 class Completed:
-    def __init__(self, argv, returncode, stdout, stderr):
+    def __init__(
+        self,
+        argv,
+        returncode,
+        stdout,
+        stderr,
+        output_exceeded=False,
+        stdout_truncated=False,
+        stderr_truncated=False,
+    ):
         self.argv = tuple(argv)
         self.returncode = returncode
         self.stdout = stdout[:MAX_STDOUT]
         self.stderr = stderr[:MAX_STDERR]
+        self.output_exceeded = bool(output_exceeded)
+        self.stdout_truncated = bool(stdout_truncated)
+        self.stderr_truncated = bool(stderr_truncated)
+
+
+class _OutputBudget:
+    """One aggregate stored-byte budget shared by both pipe readers."""
+
+    def __init__(self, max_stdout, max_stderr, max_total, fail_on_exceeded):
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+        self.stdout = bytearray()
+        self.stderr = bytearray()
+        self.max_stdout = max_stdout
+        self.max_stderr = max_stderr
+        self.max_total = max_total
+        self.fail_on_exceeded = fail_on_exceeded
+        self.stored_total = 0
+        self.received_total = 0
+        self.exceeded = False
+        self.reader_error = False
+        self.stream_truncated = {"stdout": False, "stderr": False}
+
+    def append(self, name, chunk):
+        if not chunk:
+            return
+        with self.lock:
+            self.received_total += len(chunk)
+            if self.received_total > self.max_total:
+                self.exceeded = True
+                if self.fail_on_exceeded:
+                    self.stopped.set()
+            buffer = self.stdout if name == "stdout" else self.stderr
+            stream_cap = self.max_stdout if name == "stdout" else self.max_stderr
+            room = min(stream_cap - len(buffer), self.max_total - self.stored_total)
+            if room <= 0:
+                self.stream_truncated[name] = True
+                return
+            take = min(len(chunk), room)
+            buffer.extend(chunk[:take])
+            self.stored_total += take
+            if take < len(chunk):
+                self.stream_truncated[name] = True
+
+    def fail_reader(self):
+        with self.lock:
+            self.reader_error = True
+            self.stopped.set()
+
+    def snapshot(self):
+        with self.lock:
+            return (
+                bytes(self.stdout),
+                bytes(self.stderr),
+                self.exceeded,
+                dict(self.stream_truncated),
+            )
+
+
+class _Reader:
+    def __init__(self, stream, name, budget):
+        self.stream = stream
+        self.name = name
+        self.budget = budget
+
+    def run(self):
+        try:
+            while not self.budget.stopped.is_set():
+                chunk = self.stream.read(READ_CHUNK)
+                if not chunk:
+                    break
+                if not isinstance(chunk, (bytes, bytearray)):
+                    raise TypeError("pipe returned non-bytes")
+                self.budget.append(self.name, bytes(chunk))
+                if self.budget.stopped.is_set():
+                    break
+        except Exception:
+            self.budget.fail_reader()
+
+
+class _Writer:
+    """Owned stdin writer; a child closed early is not a writer failure."""
+
+    def __init__(self, stream, data):
+        self.stream = stream
+        self.data = data
+        self.failed = False
+
+    def run(self):
+        try:
+            self.stream.write(self.data)
+            self.stream.flush()
+        except BrokenPipeError:
+            pass
+        except Exception:
+            self.failed = True
+        finally:
+            try:
+                self.stream.close()
+            except (OSError, ValueError):
+                pass
 
 
 class ProcessRunner:
     """One immediate ``Popen`` per call, always reaped before returning."""
 
-    def __init__(self, clock=time.monotonic, popen=subprocess.Popen):
+    def __init__(
+        self,
+        clock=time.monotonic,
+        popen=subprocess.Popen,
+        thread_factory=threading.Thread,
+        killpg=os.killpg,
+    ):
         self.clock = clock
         self._popen = popen
+        self._thread_factory = thread_factory
+        self._killpg = killpg
 
     def run(
         self,
@@ -46,6 +172,11 @@ class ProcessRunner:
         stage="internal",
         timeout_code="process_timeout",
         spawn_code="process_spawn_failed",
+        max_stdout=MAX_STDOUT,
+        max_stderr=MAX_STDERR,
+        max_total=MAX_TOTAL_OUTPUT,
+        fail_on_output_exceeded=False,
+        output_code="process_output_exceeded",
     ):
         require(
             isinstance(argv, (list, tuple))
@@ -62,6 +193,19 @@ class ProcessRunner:
             stage,
             "timeout_invalid",
         )
+        require(
+            type(max_stdout) is int
+            and type(max_stderr) is int
+            and type(max_total) is int
+            and max_stdout >= 0
+            and max_stderr >= 0
+            and max_total > 0,
+            stage,
+            "invalid_arguments",
+        )
+        budget = _OutputBudget(
+            max_stdout, max_stderr, max_total, bool(fail_on_output_exceeded)
+        )
         try:
             process = self._popen(
                 [str(item) for item in argv],
@@ -74,48 +218,176 @@ class ProcessRunner:
             )
         except (OSError, ValueError, TypeError):
             raise RunnerError(stage, spawn_code) from None
+        entries = []
+        writer = None
         try:
-            stdout, stderr = process.communicate(input=input, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            reaped = self._terminate(process)
+            if input is not None:
+                stdin = getattr(process, "stdin", None)
+                if stdin is None:
+                    raise ValueError("missing stdin pipe")
+                writer = _Writer(stdin, input)
+                entries.append(
+                    {
+                        "reader": writer,
+                        "thread": self._thread_factory(
+                            target=writer.run,
+                            name="producer-pg-stdin",
+                            daemon=True,
+                        ),
+                        "start_attempted": False,
+                        "started": False,
+                        "start_failed": False,
+                    }
+                )
+            for name, stream in (
+                ("stdout", getattr(process, "stdout", None)),
+                ("stderr", getattr(process, "stderr", None)),
+            ):
+                if stream is None:
+                    continue
+                reader = _Reader(stream, name, budget)
+                thread = self._thread_factory(
+                    target=reader.run, name="producer-pg-" + name, daemon=True
+                )
+                entries.append(
+                    {
+                        "reader": reader,
+                        "thread": thread,
+                        "start_attempted": False,
+                        "started": False,
+                        "start_failed": False,
+                    }
+                )
+            for entry in entries:
+                entry["start_attempted"] = True
+                try:
+                    entry["thread"].start()
+                except (RuntimeError, OSError, ValueError):
+                    entry["start_failed"] = True
+                    raise
+                entry["started"] = True
+        except Exception:
+            raise self._cleanup_failure(
+                process, entries, stage, "process_failed"
+            ) from None
+        deadline = self.clock() + float(timeout)
+        while True:
+            if budget.reader_error or (writer is not None and writer.failed):
+                raise self._cleanup_failure(
+                    process, entries, stage, "process_failed"
+                ) from None
+            if fail_on_output_exceeded and budget.exceeded:
+                raise self._cleanup_failure(
+                    process, entries, stage, output_code
+                ) from None
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                raise self._cleanup_failure(
+                    process, entries, stage, timeout_code
+                ) from None
             try:
-                process.communicate(timeout=KILL_WAIT_SECONDS)
-            except (subprocess.TimeoutExpired, OSError, ValueError):
-                pass
-            if not reaped or process.poll() is None:
-                raise RunnerError(stage, "process_unreaped") from None
-            raise RunnerError(stage, timeout_code) from None
-        except (OSError, ValueError, subprocess.SubprocessError):
-            self._terminate(process)
-            raise RunnerError(stage, "process_failed") from None
-        if process.poll() is None:
-            self._terminate(process)
-            raise RunnerError(stage, "process_unreaped")
+                process.wait(timeout=min(remaining, POLL_SECONDS))
+            except subprocess.TimeoutExpired:
+                continue
+            except (OSError, ValueError, subprocess.SubprocessError):
+                raise self._cleanup_failure(
+                    process, entries, stage, "process_failed"
+                ) from None
+            if process.poll() is not None:
+                break
+            raise self._cleanup_failure(
+                process, entries, stage, "process_unreaped"
+            ) from None
+        if budget.reader_error or (writer is not None and writer.failed):
+            raise self._cleanup_failure(
+                process, entries, stage, "process_failed"
+            ) from None
+        if fail_on_output_exceeded and budget.exceeded:
+            raise self._cleanup_failure(
+                process, entries, stage, output_code
+            ) from None
+        if not self._join_readers(
+            entries, self.clock() + READER_JOIN_SECONDS
+        ):
+            raise self._cleanup_failure(
+                process, entries, stage, "process_unreaped"
+            ) from None
+        self._close_streams(process)
         if type(process.returncode) is not int:
             raise RunnerError(stage, "process_failed")
-        return Completed(argv, process.returncode, stdout or b"", stderr or b"")
+        stdout, stderr, exceeded, truncated = budget.snapshot()
+        return Completed(
+            argv,
+            process.returncode,
+            stdout,
+            stderr,
+            output_exceeded=exceeded,
+            stdout_truncated=truncated["stdout"],
+            stderr_truncated=truncated["stderr"],
+        )
 
-    def _terminate(self, process):
-        # The child is started in its own session, so killing the group also
-        # terminates any helper Git/psql descendants instead of detaching them.
+    def _cleanup_failure(self, process, entries, stage, primary):
+        deadline = self.clock() + KILL_WAIT_SECONDS
+        reaped = self._terminate(process, deadline)
+        joined = self._join_readers(entries, deadline)
+        if joined:
+            self._close_streams(process)
+        if not reaped or not joined:
+            return RunnerError(stage, "process_unreaped")
+        return RunnerError(stage, primary)
+
+    def _terminate(self, process, deadline):
         pid = getattr(process, "pid", None)
-        killed_group = False
         if isinstance(pid, int) and pid > 0 and pid != os.getpid():
             try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-                killed_group = True
-            except (OSError, ValueError):
-                killed_group = False
-        if not killed_group:
-            try:
-                process.kill()
-            except (OSError, ValueError):
+                self._killpg(pid, signal.SIGKILL)
+            except (OSError, ValueError, TypeError):
                 pass
         try:
-            process.wait(timeout=KILL_WAIT_SECONDS)
-        except (subprocess.TimeoutExpired, OSError):
+            process.kill()
+        except (OSError, ValueError):
+            pass
+        remaining = max(0.0, deadline - self.clock())
+        try:
+            process.wait(timeout=remaining)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
             pass
         try:
             return process.poll() is not None
         except (OSError, ValueError):
             return False
+
+    def _join_readers(self, entries, deadline):
+        for entry in entries:
+            if not entry.get("start_attempted"):
+                continue
+            thread = entry["thread"]
+            if entry.get("start_failed"):
+                try:
+                    if not thread.is_alive():
+                        continue
+                except (RuntimeError, OSError, ValueError):
+                    return False
+            remaining = max(0.0, deadline - self.clock())
+            try:
+                thread.join(timeout=remaining)
+            except (RuntimeError, OSError, ValueError):
+                return False
+            try:
+                if thread.is_alive():
+                    return False
+            except (RuntimeError, OSError, ValueError):
+                return False
+        return True
+
+    def _close_streams(self, process):
+        for stream in (
+            getattr(process, "stdin", None),
+            getattr(process, "stdout", None),
+            getattr(process, "stderr", None),
+        ):
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError, AttributeError):
+                    pass

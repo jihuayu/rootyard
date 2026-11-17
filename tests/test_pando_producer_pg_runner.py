@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -27,6 +26,11 @@ import native_build_receipt as receipts  # noqa: E402
 import pando_producer_pg.artifacts as artifacts  # noqa: E402
 import pando_producer_pg.process as process  # noqa: E402
 import pando_producer_pg.source as source  # noqa: E402
+from test_pando_producer_pg_process import (  # noqa: E402
+    FakeThread,
+    GroupKiller,
+    StreamingPopen,
+)
 
 COMMIT = "a" * 40
 TREE = "b" * 40
@@ -316,48 +320,30 @@ class SourceBindingTest(unittest.TestCase):
         self.assertFalse(absent["provided"])
 
 
-class FakePopen:
-    def __init__(self, timeout_first=True, reaped=True):
-        self.timeout_first = timeout_first
-        self.reaped = reaped
-        self.calls = 0
-        self.killed = False
-        self.returncode = None
-        self._poll = None
-
-    def communicate(self, input=None, timeout=None):
-        self.calls += 1
-        if self.timeout_first and self.calls == 1:
-            raise subprocess.TimeoutExpired("fake", timeout)
-        if self.reaped:
-            self.returncode = -9
-            self._poll = -9
-        return b"", b""
-
+class UnreapPopen(StreamingPopen):
     def kill(self):
-        self.killed = True
-
-    def wait(self, timeout=None):
-        if self.reaped:
-            self.returncode = -9
-            self._poll = -9
-        return self._poll
-
-    def poll(self):
-        return self._poll
+        pass
 
 
 class ProcessOwnershipTest(unittest.TestCase):
+    def runner_for(self, fake, group=None):
+        return process.ProcessRunner(
+            popen=lambda *args, **kwargs: fake,
+            thread_factory=FakeThread,
+            killpg=group or GroupKiller(),
+        )
+
     def test_timeout_kills_and_reaps_before_failure(self):
-        fake = FakePopen()
-        runner = process.ProcessRunner(popen=lambda *a, **k: fake)
+        fake = StreamingPopen(block=True)
+        group = GroupKiller()
+        runner = self.runner_for(fake, group)
         with self.assertRaises(process.RunnerError) as caught:
-            runner.run(["cargo"], timeout=0.1, stage="selection",
+            runner.run(["cargo"], timeout=0.05, stage="selection",
                        timeout_code="cargo_timeout")
         self.assertEqual(caught.exception.code, "cargo_timeout")
         self.assertTrue(fake.killed)
-        self.assertGreaterEqual(fake.calls, 2)
         self.assertIsNotNone(fake.poll())
+        self.assertEqual(group.calls[0][0], fake.pid)
 
     def test_spawn_failure_is_fixed(self):
         def fail(*args, **kwargs):
@@ -370,10 +356,10 @@ class ProcessOwnershipTest(unittest.TestCase):
         self.assertNotIn("secret", str(caught.exception))
 
     def test_unreaped_process_is_not_reported_as_clean(self):
-        fake = FakePopen(reaped=False)
-        runner = process.ProcessRunner(popen=lambda *a, **k: fake)
+        fake = UnreapPopen(block=True)
+        runner = self.runner_for(fake)
         with self.assertRaises(process.RunnerError) as caught:
-            runner.run(["cargo"], timeout=0.1, timeout_code="cargo_timeout")
+            runner.run(["cargo"], timeout=0.05, timeout_code="cargo_timeout")
         self.assertEqual(caught.exception.code, "process_unreaped")
 
 

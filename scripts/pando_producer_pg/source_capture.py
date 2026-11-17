@@ -202,6 +202,11 @@ def capture_bounded(
             stage="source",
             timeout_code="source_capture_deadline_exceeded",
             spawn_code="source_capture_failed",
+            max_stdout=MAX_BINDING_BYTES,
+            max_stderr=MAX_BINDING_BYTES,
+            max_total=MAX_BINDING_BYTES,
+            fail_on_output_exceeded=True,
+            output_code="source_capture_failed",
         )
     except RunnerError:
         raise

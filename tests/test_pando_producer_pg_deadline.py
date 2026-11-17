@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -29,6 +28,11 @@ import pando_producer_pg.root_cleanup as root_cleanup  # noqa: E402
 import run_pando_producer_pg as runner  # noqa: E402
 from pando_producer_pg.errors import RunnerError  # noqa: E402
 from pando_producer_pg.process import Completed  # noqa: E402
+from test_pando_producer_pg_process import (  # noqa: E402
+    FakeThread,
+    GroupKiller,
+    StreamingPopen,
+)
 
 BOOTSTRAP = "postgresql://user:password@127.0.0.1:55432/bootstrap"
 BINARY = "/tmp/owned/target/debug/deps/rootyard_pando_lab-abc"
@@ -46,6 +50,16 @@ class FakeClock:
 
     def set(self, value):
         self.now = float(value)
+
+
+class StepClock:
+    def __init__(self, step=10.0):
+        self.now = 0.0
+        self.step = float(step)
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
 
 
 class Result:
@@ -143,33 +157,6 @@ class RemovingRootRunner:
     def run(self, argv, **kwargs):
         shutil.rmtree(Path(argv[2]))
         return Completed(argv, 0, b"", b"")
-
-
-class ReapPopen:
-    def __init__(self):
-        self.calls = 0
-        self.killed = False
-        self.returncode = None
-        self._poll = None
-
-    def communicate(self, input=None, timeout=None):
-        self.calls += 1
-        if self.calls == 1:
-            raise subprocess.TimeoutExpired("fake", timeout)
-        self.returncode = -9
-        self._poll = -9
-        return b"", b""
-
-    def kill(self):
-        self.killed = True
-
-    def wait(self, timeout=None):
-        self.returncode = -9
-        self._poll = -9
-        return self._poll
-
-    def poll(self):
-        return self._poll
 
 
 class OwnedFixtureDeadlineTest(unittest.TestCase):
@@ -333,16 +320,21 @@ class BoundedRootRemovalTest(unittest.TestCase):
 
     def test_owned_child_timeout_kills_and_polls_to_reaped(self):
         root = self.owned_root()
-        fake = ReapPopen()
-        process_runner = process.ProcessRunner(popen=lambda *a, **k: fake)
+        fake = StreamingPopen(block=True)
+        clock = StepClock()
+        process_runner = process.ProcessRunner(
+            clock=clock,
+            popen=lambda *a, **k: fake,
+            thread_factory=FakeThread,
+            killpg=GroupKiller(),
+        )
         remover = root_cleanup.BoundedRootRemover(
-            clock=lambda: 0.0, process_runner=process_runner
+            clock=clock, process_runner=process_runner
         )
         result = remover.remove(root, deadline=100)
         self.assertFalse(result["removed"])
         self.assertEqual(result["code"], "root_cleanup_deadline_exceeded")
         self.assertTrue(fake.killed)
-        self.assertGreaterEqual(fake.calls, 2)
         self.assertIsNotNone(fake.poll())
         self.assertTrue(root.path.exists())
 

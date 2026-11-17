@@ -106,6 +106,7 @@ CODES = frozenset(
         "process_failed",
         "process_timeout",
         "process_unreaped",
+        "process_output_exceeded",
         "internal_error",
     )
 )
