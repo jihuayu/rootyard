@@ -747,6 +747,71 @@ class MetadataReplayTraceTests(unittest.TestCase):
         self.assertEqual(diag["case_counts"]["passed"], 0)
         self.assertEqual(diag["cases"], [])
 
+    def test_historical_subsites_and_closed_error_kind_survive_rebuild(self):
+        lines = [
+            self._frame(17, 3, 0),
+            self._frame(17, 3, 1, ok="1"),
+            self._frame(17, 4, 0),
+            self._frame(17, 4, 1, ok="1"),
+            self._frame(17, 5, 0),
+            self._frame(17, 5, 1, ok="0", error_kind="4"),
+            self._frame(24, 1, 0),
+            self._frame(24, 1, 1, ok="1"),
+        ]
+        trace = self._project(lines)["case_trace"]
+        self.assertTrue(trace["known"])
+        self.assertEqual(trace["first_failure"]["phase_name"], "historical_content")
+        self.assertEqual(trace["first_failure"]["site_name"], "exact_pack_bytes")
+        self.assertEqual(trace["first_failure"]["error_kind"], 4)
+        self.assertEqual(trace["primary"], trace["first_failure"])
+        self.assertTrue(trace["cleanup_completed"])
+        safe = runner._safe_failure_diagnostic(
+            self._project(lines), self.target)["case_trace"]
+        self.assertEqual(safe["primary"]["site_name"], "exact_pack_bytes")
+        self.assertEqual(safe["primary"]["error_kind"], 4)
+
+    def test_closed_error_kind_map_covers_only_source_classes(self):
+        expected = {
+            3: "git_repo_new",
+            4: "pack_dir_create",
+            5: "exact_pack_bytes",
+            6: "exact_idx_bytes",
+            7: "write_pack",
+            8: "write_idx",
+            9: "cat_file",
+        }
+        for site, name in expected.items():
+            self.assertEqual(
+                runner._metadata_replay_location(17, site),
+                {"phase": 17, "site": site,
+                 "phase_name": "historical_content", "site_name": name},
+            )
+        self.assertEqual(set(runner.METADATA_REPLAY_ERROR_KINDS),
+                         set(range(1, runner.METADATA_REPLAY_MAX_ERROR_KIND + 1)))
+
+    def test_unknown_or_bool_error_kind_is_rejected_without_text(self):
+        bad = [
+            self._frame(17, 5, 1, ok="0", error_kind="9"),
+            self._frame(17, 5, 1, ok="0", error_kind=SECRET),
+        ]
+        for payload in bad:
+            diag = self._project([self._frame(17, 5, 0), payload])
+            trace = diag["case_trace"]
+            self.assertFalse(trace["known"])
+            self.assertTrue(trace["invalid"])
+            self.assertNotIn(SECRET, json.dumps(diag, sort_keys=True))
+        valid = self._project([
+            self._frame(17, 5, 0),
+            self._frame(17, 5, 1, ok="1", error_kind="4"),
+        ])["case_trace"]
+        for bad_kind in (True, 99, "4", SECRET):
+            raw = dict(valid)
+            raw["last_completed"] = dict(
+                valid["last_completed"], error_kind=bad_kind)
+            safe = runner._safe_metadata_replay_trace(raw)
+            self.assertTrue(safe["invalid"])
+            self.assertNotIn(SECRET, json.dumps(safe, sort_keys=True))
+
     def test_checks_and_counts_are_fixed_bounded_fields(self):
         lines = [
             self._frame(16, 3, 0),

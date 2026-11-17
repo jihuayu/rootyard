@@ -64,6 +64,19 @@ METADATA_REPLAY_MAX_CHECKS = 8
 METADATA_REPLAY_MAX_ERROR_KIND = 8
 MAX_METADATA_REPLAY_PHASE = 24
 
+# Closed source-owned error classes; no raw text, path, object id or provider
+# payload is accepted or persisted.
+METADATA_REPLAY_ERROR_KINDS = {
+    1: 'io',
+    2: 'ref_store_timeout',
+    3: 'ref_store_unsupported',
+    4: 'storage_database',
+    5: 'ref_store_other',
+    6: 'git_process',
+    7: 'other',
+    8: 'blob_provider',
+}
+
 METADATA_REPLAY_PHASES = {
     1: 'setup',
     2: 'tenant_create',
@@ -172,6 +185,13 @@ METADATA_REPLAY_SITES = {
     (16, 4): ('owned_b_materialize', 'each_pack_identity_assert'),
     (17, 1): ('historical_content', 'read_materialized_file'),
     (17, 2): ('historical_content', 'exact_first_advance_content_assert'),
+    (17, 3): ('historical_content', 'git_repo_new'),
+    (17, 4): ('historical_content', 'pack_dir_create'),
+    (17, 5): ('historical_content', 'exact_pack_bytes'),
+    (17, 6): ('historical_content', 'exact_idx_bytes'),
+    (17, 7): ('historical_content', 'write_pack'),
+    (17, 8): ('historical_content', 'write_idx'),
+    (17, 9): ('historical_content', 'cat_file'),
     (18, 1): ('nonowner_read', 'ledger_baseline'),
     (18, 2): ('nonowner_read', 'read_result'),
     (18, 3): ('nonowner_read', 'exact_not_found_match'),
@@ -626,6 +646,15 @@ def _metadata_replay_checks(value):
     return checks
 
 
+def _metadata_replay_error_kind(value):
+    if value == "":
+        return None
+    number = _metadata_replay_uint(value, 1, METADATA_REPLAY_MAX_ERROR_KIND)
+    if number not in METADATA_REPLAY_ERROR_KINDS:
+        raise ValueError
+    return number
+
+
 def _parse_metadata_replay_trace(text):
     """Parse complete fixed frames only; raw rejected text is never retained."""
     trace = _metadata_replay_unknown()
@@ -664,7 +693,7 @@ def _parse_metadata_replay_trace(text):
             counts = _metadata_replay_counts(parts[6])
             checks = _metadata_replay_checks(parts[7])
             iteration = _metadata_replay_optional_uint(parts[8], 0, METADATA_REPLAY_MAX_ITERATION)
-            error_kind = _metadata_replay_optional_uint(parts[9], 1, METADATA_REPLAY_MAX_ERROR_KIND)
+            error_kind = _metadata_replay_error_kind(parts[9])
             if event == 0 and ok is not None:
                 raise ValueError
             if event == 1 and ok is None:
@@ -750,6 +779,14 @@ def _safe_metadata_replay_optional_int(value, minimum, maximum):
     return value
 
 
+def _safe_metadata_replay_error_kind(value):
+    number = _safe_metadata_replay_optional_int(
+        value, 1, METADATA_REPLAY_MAX_ERROR_KIND)
+    if number is not None and number not in METADATA_REPLAY_ERROR_KINDS:
+        raise ValueError
+    return number
+
+
 def _safe_metadata_replay_counts(value):
     if value is None:
         return None
@@ -806,9 +843,8 @@ def _safe_metadata_replay_frame(value):
         "counts": _safe_metadata_replay_counts(value.get("counts")),
         "checks": _safe_metadata_replay_checks(value.get("checks")),
         "iteration": _safe_metadata_replay_optional_int(value.get("iteration"), 0, METADATA_REPLAY_MAX_ITERATION),
-        "error_kind": _safe_metadata_replay_optional_int(
-            value.get("error_kind"), 1, METADATA_REPLAY_MAX_ERROR_KIND
-        ),
+        "error_kind": _safe_metadata_replay_error_kind(
+            value.get("error_kind")),
     })
     return frame
 
