@@ -56,7 +56,7 @@ async fn handle_s3(State(objs): State<S3Map>, m: Method, uri: Uri, body: bytes::
         return rsp(StatusCode::OK, &v, Body::empty());
     }
     match objs.lock().unwrap().get(&key).cloned() {
-        Some(d) => rsp(StatusCode::OK, &d, if m == Method::HEAD { Body::empty() } else { Body::from(d) }),
+        Some(d) => rsp(StatusCode::OK, &d, if m == Method::HEAD { Body::empty() } else { Body::from(d.clone()) }),
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_LENGTH, 0)
@@ -216,7 +216,10 @@ impl Env {
         let d = RequestDigest::of("g", &[&authority_seq.to_be_bytes()]);
         let ref_generation = base.map_or(1, |b| b.ref_generation() + 1);
         let (kind, target) = (RefVersionKind::Publish, RefTarget::Oid(c));
-        let pre = base.and_then(|b| b.target().oid()).map_or(RefPrecondition::Absent, RefPrecondition::Present);
+        let pre = match base.map(VersionRecord::target) {
+            Some(RefTarget::Oid(o)) => RefPrecondition::Present(*o),
+            _ => RefPrecondition::Absent,
+        };
         let sel = base.map_or(BaseRequestSelector::ExplicitAbsent, |b| BaseRequestSelector::Present(b.version_id()));
         let intent = RefVersionIntent::new(ref_name.clone(), kind, pre, sel, target);
         let op = OperationDigestInput::new(
@@ -263,7 +266,7 @@ impl Env {
         let mem = compute_cover_membership_digest(&realm, self.index.membership_generation() + 1, &self.entries)?;
         let ln = CoverCommitLink { commit_oid: c, parent_oids, version_id, authority_seq };
         let cov =
-            self.cov(CoverTier::Delta, p, vec![version_id], (authority_seq, authority_seq), vec![ln], vec![], mem)?;
+            self.cov(CoverTier::Delta, p, (vec![version_id], (authority_seq, authority_seq), vec![ln], vec![], mem))?;
         self.index.register_leaf_cover(cov.clone(), mem)?;
         Ok((v, cov))
     }
@@ -406,7 +409,8 @@ async fn sha1_and_sha256_compaction_thin_and_fault_fallback() -> Result<()> {
 
         let key = format!("pc-b/r/{}", ac.pack_locator.path());
         if let Some(b) = s3().1.lock().unwrap().get_mut(&key) {
-            b[b.len() / 2] ^= 0xff;
+            let mid = b.len() / 2;
+            b[mid] ^= 0xff;
         }
         ensure!(env.mat(&r1, &cp, &[], &[(mr.clone(), c4)]).await.is_err());
         s3().1.lock().unwrap().remove(&key);
@@ -433,7 +437,7 @@ async fn atomic_non_atomic_revoked_auth_and_cross_tenant_negative_cases() -> Res
     let c2 = env.commit("m.txt", "2\n")?;
     let p2 = env.pack(&format!("{}\n^{}\n", c2.as_hex(), c1.as_hex()))?;
     let (v2, cov2) =
-        env.step(CommitMode::BestEffort, "refs/heads/main", None, c2, vec![c1], p2, vec![v1.version_id()])?;
+        env.step(CommitMode::AcceptedSubset, "refs/heads/main", None, c2, vec![c1], p2, vec![v1.version_id()])?;
     let (_, vh, cov_h) =
         env.push("refs/hidden/internal", None, Some(c2), "secret.txt", "topsecret\n", vec![v2.version_id()])?;
 
