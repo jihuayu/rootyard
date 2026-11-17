@@ -58,6 +58,17 @@ class EvalConfig:
     keep: bool
 
 
+def _bind_fixture_capacity(
+    environment: dict[str, Any], e2e_summary: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Bind the exact live fixture capacity into the success-report environment."""
+    if e2e_summary is not None:
+        capacity = e2e_summary.get("fixture_capacity")
+        if isinstance(capacity, dict):
+            environment["fixture_capacity"] = dict(capacity)
+    return environment
+
+
 def _git_source_meta() -> dict[str, Any]:
     root = SCRIPT_DIR.parent
     try:
@@ -114,6 +125,15 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any]:
 
         recommendations = build_recommendations(matrices, candidate_totals, e2e_summary)
         src_meta = _git_source_meta()
+        environment: dict[str, Any] = {
+            "git": str(git_bin),
+            "git_version": git_ver,
+            "platform": platform.system(),
+            "machine": platform.machine(),
+            "logical_cpus": os.cpu_count() or 1,
+            **src_meta,
+        }
+        _bind_fixture_capacity(environment, e2e_summary)
         report: dict[str, Any] = {
             "schema_version": "rootyard/pando-pack-compression-eval/v1",
             "issue": "#178",
@@ -121,14 +141,7 @@ def run_evaluation(config: EvalConfig) -> dict[str, Any]:
             "mode": config.mode,
             "scale": config.scale,
             "seed": config.seed,
-            "environment": {
-                "git": str(git_bin),
-                "git_version": git_ver,
-                "platform": platform.system(),
-                "machine": platform.machine(),
-                "logical_cpus": os.cpu_count() or 1,
-                **src_meta,
-            },
+            "environment": environment,
             "pack_matrix": matrices,
             "candidate_totals": candidate_totals,
             "correctness": correctness,

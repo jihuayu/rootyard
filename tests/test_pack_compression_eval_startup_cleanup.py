@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -22,6 +23,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+from pack_compression_eval import capacity  # noqa: E402
 from pack_compression_eval import e2e_serve_blob as e2e  # noqa: E402
 from pack_compression_eval import live_server  # noqa: E402
 from pack_compression_eval.cleanup_diagnostics import StopPostcondition  # noqa: E402
@@ -311,6 +313,37 @@ class ServerOwnerTest(unittest.TestCase):
         self.assertIs(owner.proc, proc)
         self.assertIs(owner.log_f, log)
         self.assertFalse(log.closed)
+
+    def test_start_uses_checked_capacity_env_builder_not_a_literal(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pack-eval-owner-capacity-") as tmp:
+            root = Path(tmp)
+            owner = live_server.ServeBlobOwner()
+            log = _FakeLog()
+            process = _StartProc()
+            ticks = iter([0.0, 0.0, 31.0])
+            clock = SimpleNamespace(monotonic=lambda: next(ticks, 31.0), sleep=lambda _: None)
+            builder = mock.Mock(wraps=capacity.build_server_env)
+            popen = mock.Mock(return_value=process)
+            before = dict(os.environ)
+            with (
+                mock.patch.object(live_server, "_pick_free_port", return_value=12345),
+                mock.patch.object(live_server, "open", return_value=log, create=True),
+                mock.patch.object(live_server, "http_json_timed", return_value=(200, b"ready", {}, 1.0)),
+                mock.patch.object(live_server, "time", clock),
+                mock.patch.object(live_server, "build_server_env", builder),
+                mock.patch.object(live_server.subprocess, "Popen", popen),
+            ):
+                live_server.start_serve_blob(
+                    "binary", "git", self.live(), "dsn", "http://s3",
+                    root / "scratch", root / "server.log", owner=owner,
+                )
+            builder.assert_called_once()
+            self.assertIs(builder.call_args.args[0], os.environ)
+            self.assertEqual(builder.call_args.args[1], capacity.derive_capacity_envelope())
+            env = popen.call_args.kwargs["env"]
+            self.assertEqual(env[capacity.REQUEST_ENV], "134217728")
+            self.assertEqual(env[capacity.INFLIGHT_ENV], "402653184")
+            self.assertEqual(dict(os.environ), before)
 
     def test_start_refuses_to_overwrite_existing_owner(self) -> None:
         owner = live_server.ServeBlobOwner()

@@ -13,6 +13,7 @@ from typing import Any
 import urllib.parse
 import uuid
 
+from .capacity import derive_capacity_envelope
 from .cleanup_diagnostics import remove_tree_checked, run_cleanup_steps
 from .corpus import (
     DATASET_ARCHETYPES,
@@ -76,6 +77,7 @@ def run_live_serve_blob_eval(
     """Run real PG17 + Garage S3 + serve-blob E2E evaluation across baseline and candidate configs."""
     work_root.mkdir(parents=True, exist_ok=True)
     os.chmod(work_root, 0o700)
+    fixture_capacity = derive_capacity_envelope()
     live = resolve_live_env(os.environ)
     receipt_info = verify_binary_receipt(Path(binary), require_receipt=require_receipt)
     # Every child launch uses the canonical reader's resolved, verified path.
@@ -110,7 +112,7 @@ def run_live_serve_blob_eval(
     def start_owned(log_name: str) -> tuple[subprocess.Popen[bytes], str, Any]:
         return start_serve_blob(
             binary, git_bin, live, pg_url, proxy.endpoint, scratch_dir, work_root / log_name,
-            owner=server_owner,
+            owner=server_owner, capacity=fixture_capacity,
         )
 
     try:
@@ -446,7 +448,7 @@ def run_live_serve_blob_eval(
             },
             "pg_refstore_final": pg_final,
             "resource_peaks": {**sampler.summary(), "work_root_disk_bytes": sum_dir_bytes([work_root])},
-            "physical_savings_claimed": False,
+            "fixture_capacity": fixture_capacity, "physical_savings_claimed": False,
         }
     except LiveEvalFailure as exc:
         raise LiveEvalFailure(
@@ -455,7 +457,7 @@ def run_live_serve_blob_eval(
                 s3=s3_snapshot(),
                 completed=progress["completed"],
                 last_completed_phase=progress["last_completed_phase"],
-                bindings=bindings_from_receipt(receipt_info),
+                bindings=bindings_from_receipt(receipt_info), fixture_capacity=fixture_capacity,
             )
         ) from None
     except Exception:
@@ -466,7 +468,7 @@ def run_live_serve_blob_eval(
                 completed=progress["completed"],
                 last_completed_phase=progress["last_completed_phase"],
                 s3=s3_snapshot(),
-                bindings=bindings_from_receipt(receipt_info),
+                bindings=bindings_from_receipt(receipt_info), fixture_capacity=fixture_capacity,
             )
         ) from None
     finally:
@@ -493,5 +495,5 @@ def run_live_serve_blob_eval(
             s3=s3_at_cleanup,
             completed=progress["completed"],
             last_completed_phase=progress["last_completed_phase"],
-            bindings=bindings_from_receipt(receipt_info),
+            bindings=bindings_from_receipt(receipt_info), fixture_capacity=fixture_capacity,
         )

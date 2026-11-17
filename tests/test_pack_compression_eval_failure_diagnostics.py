@@ -25,6 +25,7 @@ if str(SCRIPTS) not in sys.path:
 
 import pando_pack_compression_eval as cli  # noqa: E402
 from pack_compression_eval import live_server  # noqa: E402
+from pack_compression_eval.capacity import derive_capacity_envelope  # noqa: E402
 from pack_compression_eval.failure_diagnostics import (  # noqa: E402
     FAILURE_SCHEMA,
     FailureArtifactError,
@@ -32,6 +33,7 @@ from pack_compression_eval.failure_diagnostics import (  # noqa: E402
     bindings_from_receipt,
     build_failure_record,
     completed_counts,
+    enrich_failure_record,
     failure_path_for,
     failure_record_from_exception,
     finite_http_status,
@@ -128,8 +130,41 @@ class FiniteFailureDiagnosticsTest(unittest.TestCase):
         self.assertIsNone(record["bindings"]["binary_size_bytes"])
         self.assertIsNone(record["bindings"]["workspace_commit"])
         self.assertEqual(record["bindings"]["receipt_schema"], "unknown")
+        self.assertEqual(
+            record["fixture_capacity"],
+            {"concurrent_branches": None, "request_ceiling_bytes": None, "inflight_bytes": None},
+        )
         self.assertNotIn(SENTINEL, json.dumps(record, sort_keys=True))
         self.assertNotIn(SENTINEL, safe_summary(record))
+
+    def test_fixture_capacity_is_projected_as_fixed_numbers(self) -> None:
+        envelope = derive_capacity_envelope()
+        record = build_failure_record(fixture_capacity=envelope)
+        self.assertEqual(record["fixture_capacity"], envelope)
+        self.assertEqual(
+            record["fixture_capacity"],
+            {
+                "concurrent_branches": 3,
+                "request_ceiling_bytes": 134217728,
+                "inflight_bytes": 402653184,
+            },
+        )
+        self.assertEqual(enrich_failure_record(record)["fixture_capacity"], envelope)
+
+        for bad in (
+            {"concurrent_branches": 4, "request_ceiling_bytes": 134217728, "inflight_bytes": 536870912},
+            {"concurrent_branches": 3, "request_ceiling_bytes": "134217728", "inflight_bytes": 402653184},
+            {"concurrent_branches": 3, "request_ceiling_bytes": 134217728, "inflight_bytes": 1},
+            {"concurrent_branches": 3, "request_ceiling_bytes": 134217728, "inflight_bytes": 402653184, "x": SENTINEL},
+            {SENTINEL: 3},
+        ):
+            with self.subTest(bad=bad):
+                projected = build_failure_record(fixture_capacity=bad)["fixture_capacity"]
+                self.assertEqual(
+                    projected,
+                    {"concurrent_branches": None, "request_ceiling_bytes": None, "inflight_bytes": None},
+                )
+                self.assertNotIn(SENTINEL, json.dumps(projected, sort_keys=True))
 
     def test_s3_snapshot_keeps_known_statuses_and_unknown_bucket(self) -> None:
         result = sanitize_s3_snapshot(

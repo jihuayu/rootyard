@@ -14,6 +14,7 @@ import time
 from typing import Any
 import urllib.parse
 
+from .capacity import build_server_env, derive_capacity_envelope
 from .cleanup_diagnostics import StopPostcondition
 from .corpus import run_git, url_quote_repo
 from .failure_diagnostics import LiveEvalFailure, build_failure_record
@@ -203,6 +204,7 @@ def start_serve_blob(
     log_path: Path,
     *,
     owner: ServeBlobOwner | None = None,
+    capacity: dict[str, int] | None = None,
 ) -> tuple[subprocess.Popen[bytes], str, Any]:
     owned = owner if owner is not None else ServeBlobOwner()
     if owned.has_owner:
@@ -214,7 +216,8 @@ def start_serve_blob(
     port = _pick_free_port()
     bind = f"127.0.0.1:{port}"
     base_url = f"http://{bind}"
-    proc_env = os.environ.copy()
+    envelope = capacity if capacity is not None else derive_capacity_envelope()
+    proc_env = build_server_env(os.environ, envelope)
     proc_env.pop("ROOTYARD_DATA_DIR", None)
     proc_env.update(
         {

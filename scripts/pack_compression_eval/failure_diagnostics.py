@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from .capacity import sanitize_capacity
 from .cleanup_diagnostics import sanitize_cleanup
 from .corpus import DATASET_ARCHETYPES, OBJECT_FORMATS
 from .pack_matrix import CANDIDATE_CONFIGS
@@ -100,7 +101,7 @@ _RECORD_FIELDS = (
     "last_completed_phase",
     "completed",
     "s3",
-    "bindings",
+    "bindings", "fixture_capacity",
     "cleanup",
 )
 _HTTP_PATTERNS = (
@@ -299,7 +300,7 @@ def build_failure_record(
     last_completed_phase: Any = "unknown",
     completed: Any = None,
     s3: Any = None,
-    bindings: Any = None,
+    bindings: Any = None, fixture_capacity: Any = None,
     cleanup: Any = None,
 ) -> dict[str, Any]:
     """Build one fixed-schema failure record from source-known fields only."""
@@ -328,7 +329,7 @@ def build_failure_record(
         "last_completed_phase": _choice(last_completed_phase, PROGRESS_PHASES),
         "completed": completed_counts(completed),
         "s3": sanitize_s3_snapshot(s3),
-        "bindings": sanitize_bindings(bindings),
+        "bindings": sanitize_bindings(bindings), "fixture_capacity": sanitize_capacity(fixture_capacity),
         "cleanup": sanitize_cleanup(cleanup),
     }
 
@@ -436,7 +437,7 @@ def finalize_cleanup(
     s3: Any,
     completed: Any,
     last_completed_phase: Any,
-    bindings: Any,
+    bindings: Any, fixture_capacity: Any = None,
 ) -> None:
     """Preserve a live failure, or fail a successful run whose cleanup failed."""
     if isinstance(active, FailureArtifactError):
@@ -445,7 +446,8 @@ def finalize_cleanup(
         raise LiveEvalFailure(
             build_failure_record(
                 phase="cleanup", failure_class="cleanup_failure", s3=s3, completed=completed,
-                last_completed_phase=last_completed_phase, bindings=bindings, cleanup=cleanup,
+                last_completed_phase=last_completed_phase,
+                bindings=bindings, fixture_capacity=fixture_capacity, cleanup=cleanup,
             )
         ) from None
 
