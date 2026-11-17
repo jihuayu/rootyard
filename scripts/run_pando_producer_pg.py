@@ -35,7 +35,10 @@ from pando_producer_pg import (  # noqa: E402
     source_capture,
 )
 from pando_producer_pg.errors import RunnerError, require  # noqa: E402
-from pando_producer_pg.process import ProcessRunner  # noqa: E402
+from pando_producer_pg.process import (  # noqa: E402
+    CLEANUP_RESERVE_SECONDS,
+    ProcessRunner,
+)
 
 REPORT_SCHEMA = report.REPORT_SCHEMA
 DEFAULT_REPORT = "test-results/pando-producer-pg.json"
@@ -225,7 +228,10 @@ def run(
             config.expected_commit,
             binding["source_inputs_sha256"],
         )
-        remaining = min(config.selection_timeout_seconds, work - clock())
+        remaining = min(
+            config.selection_timeout_seconds,
+            work - clock() - CLEANUP_RESERVE_SECONDS,
+        )
         require(remaining > 0, "selection", "setup_deadline_exceeded")
         selection = select_binary(
             resolved_source,

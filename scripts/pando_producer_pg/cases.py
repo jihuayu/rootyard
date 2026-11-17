@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 
 from .errors import RunnerError, require
+from .process import CLEANUP_RESERVE_SECONDS
 
 FAMILIES = ("migration", "repack", "snapshot")
 CASES = (
@@ -194,7 +195,7 @@ def execute_cases(
         if stopped:
             records.append(row)
             continue
-        remaining = work_deadline - clock()
+        remaining = work_deadline - clock() - CLEANUP_RESERVE_SECONDS
         if remaining <= MIN_CASE_SECONDS:
             row["code"] = "not_run_deadline"
             records.append(row)

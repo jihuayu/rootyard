@@ -268,7 +268,7 @@ class OwnedFixture:
 
         if hashlib.sha256(raw).hexdigest() != self.schema_sha256:
             raise RunnerError("setup", "schema_hash_mismatch")
-        remaining = deadline - self.clock()
+        remaining = deadline - self.clock() - REAP_RESERVE_SECONDS
         if remaining <= 0:
             raise RunnerError("setup", "setup_deadline_exceeded")
         schema_environment = dict(self.postgres.environment)

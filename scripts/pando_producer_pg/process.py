@@ -23,8 +23,8 @@ MAX_STDOUT = 2 * 1024 * 1024
 MAX_STDERR = 256 * 1024
 MAX_TOTAL_OUTPUT = MAX_STDOUT + MAX_STDERR
 READ_CHUNK = 64 * 1024
-READER_JOIN_SECONDS = 1.0
-KILL_WAIT_SECONDS = 2.0
+CLEANUP_RESERVE_SECONDS = 2.0
+KILL_WAIT_SECONDS = CLEANUP_RESERVE_SECONDS
 POLL_SECONDS = 0.05
 
 
@@ -193,6 +193,11 @@ class ProcessRunner:
             stage,
             "timeout_invalid",
         )
+        # Anchor before Popen and any reader/writer creation or start.  Popen
+        # fork/exec and thread start/join are non-preemptible syscall boundaries;
+        # acquisition time is charged here and a late return fails closed.
+        operation_deadline = self.clock() + float(timeout)
+        cleanup_deadline = operation_deadline + CLEANUP_RESERVE_SECONDS
         require(
             type(max_stdout) is int
             and type(max_stderr) is int
@@ -218,6 +223,10 @@ class ProcessRunner:
             )
         except (OSError, ValueError, TypeError):
             raise RunnerError(stage, spawn_code) from None
+        if self.clock() >= operation_deadline:
+            raise self._cleanup_failure(
+                process, [], stage, timeout_code, cleanup_deadline
+            ) from None
         entries = []
         writer = None
         try:
@@ -268,22 +277,25 @@ class ProcessRunner:
                 entry["started"] = True
         except Exception:
             raise self._cleanup_failure(
-                process, entries, stage, "process_failed"
+                process, entries, stage, "process_failed", cleanup_deadline
             ) from None
-        deadline = self.clock() + float(timeout)
+        if self.clock() >= operation_deadline:
+            raise self._cleanup_failure(
+                process, entries, stage, timeout_code, cleanup_deadline
+            ) from None
         while True:
             if budget.reader_error or (writer is not None and writer.failed):
                 raise self._cleanup_failure(
-                    process, entries, stage, "process_failed"
+                    process, entries, stage, "process_failed", cleanup_deadline
                 ) from None
             if fail_on_output_exceeded and budget.exceeded:
                 raise self._cleanup_failure(
-                    process, entries, stage, output_code
+                    process, entries, stage, output_code, cleanup_deadline
                 ) from None
-            remaining = deadline - self.clock()
+            remaining = operation_deadline - self.clock()
             if remaining <= 0:
                 raise self._cleanup_failure(
-                    process, entries, stage, timeout_code
+                    process, entries, stage, timeout_code, cleanup_deadline
                 ) from None
             try:
                 process.wait(timeout=min(remaining, POLL_SECONDS))
@@ -291,36 +303,38 @@ class ProcessRunner:
                 continue
             except (OSError, ValueError, subprocess.SubprocessError):
                 raise self._cleanup_failure(
-                    process, entries, stage, "process_failed"
+                    process, entries, stage, "process_failed", cleanup_deadline
                 ) from None
             if process.poll() is not None:
                 break
             raise self._cleanup_failure(
-                process, entries, stage, "process_unreaped"
+                process, entries, stage, "process_unreaped", cleanup_deadline
+            ) from None
+        if self.clock() >= operation_deadline:
+            raise self._cleanup_failure(
+                process, entries, stage, timeout_code, cleanup_deadline
             ) from None
         if budget.reader_error or (writer is not None and writer.failed):
             raise self._cleanup_failure(
-                process, entries, stage, "process_failed"
+                process, entries, stage, "process_failed", cleanup_deadline
             ) from None
         if fail_on_output_exceeded and budget.exceeded:
             raise self._cleanup_failure(
-                process, entries, stage, output_code
+                process, entries, stage, output_code, cleanup_deadline
             ) from None
-        if not self._join_readers(
-            entries, self.clock() + READER_JOIN_SECONDS
-        ):
+        if not self._join_readers(entries, operation_deadline):
             raise self._cleanup_failure(
-                process, entries, stage, "process_unreaped"
+                process, entries, stage, "process_unreaped", cleanup_deadline
             ) from None
         # Readers can discover overflow/error while the bounded join is still
         # finishing.  Re-check after the join, before closing or returning.
         if budget.reader_error or (writer is not None and writer.failed):
             raise self._cleanup_failure(
-                process, entries, stage, "process_failed"
+                process, entries, stage, "process_failed", cleanup_deadline
             ) from None
         if fail_on_output_exceeded and budget.exceeded:
             raise self._cleanup_failure(
-                process, entries, stage, output_code
+                process, entries, stage, output_code, cleanup_deadline
             ) from None
         self._close_streams(process)
         if type(process.returncode) is not int:
@@ -336,8 +350,10 @@ class ProcessRunner:
             stderr_truncated=truncated["stderr"],
         )
 
-    def _cleanup_failure(self, process, entries, stage, primary):
-        deadline = self.clock() + KILL_WAIT_SECONDS
+    def _cleanup_failure(
+        self, process, entries, stage, primary, cleanup_deadline
+    ):
+        deadline = cleanup_deadline
         try:
             outcome = self._terminate(process, deadline)
         except Exception:

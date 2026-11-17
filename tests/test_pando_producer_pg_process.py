@@ -59,6 +59,49 @@ class NoRunThread(FakeThread):
         self.run_target = False
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += float(seconds)
+
+
+class SlowStartThread(FakeThread):
+    def __init__(self, clock, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.clock = clock
+
+    def start(self):
+        self.started = True
+        self.alive = True
+        self.clock.advance(6)
+
+    def join(self, timeout=None):
+        self.joined = True
+        self.alive = False
+
+
+class RecordingThread(FakeThread):
+    def __init__(self, records, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.records = records
+
+    def start(self):
+        self.started = True
+        self.alive = True
+
+    def join(self, timeout=None):
+        self.records.append(timeout)
+        self.joined = True
+
+    def is_alive(self):
+        return True
+
+
 class DeferredThread(FakeThread):
     """Reader does not run until join, reproducing late drain interleavings."""
 
@@ -133,6 +176,18 @@ class StreamingPopen:
         self.killed = True
         self.returncode = -9
         self._poll = -9
+
+
+class ExitAtDeadlinePopen(StreamingPopen):
+    def __init__(self, clock, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.clock = clock
+
+    def wait(self, timeout=None):
+        self.returncode = 0
+        self._poll = 0
+        self.clock.advance(5)
+        return 0
 
 
 class GroupKiller:
@@ -279,6 +334,82 @@ class DeferredDrainTest(unittest.TestCase):
         self.assertTrue(result.output_exceeded)
         self.assertLessEqual(len(result.stdout) + len(result.stderr), 1024)
         self.assertFalse(fake.killed)
+
+
+class AbsoluteBudgetTest(unittest.TestCase):
+    def test_late_popen_fails_and_reaps_before_reader_start(self):
+        clock = FakeClock()
+        fake = StreamingPopen()
+        started = {"threads": 0}
+
+        def popen(*args, **kwargs):
+            clock.advance(6)
+            return fake
+
+        def factory(*args, **kwargs):
+            started["threads"] += 1
+            return FakeThread(*args, **kwargs)
+
+        runner = process.ProcessRunner(
+            clock=clock,
+            popen=popen,
+            thread_factory=factory,
+            killpg=GroupKiller(),
+        )
+        with self.assertRaises(RunnerError) as caught:
+            runner.run(["fixture"], timeout=5, timeout_code="cargo_timeout")
+        self.assertEqual(caught.exception.code, "cargo_timeout")
+        self.assertEqual(started["threads"], 0)
+        self.assertTrue(fake.killed)
+        self.assertIsNotNone(fake.poll())
+
+    def test_late_thread_start_fails_before_wait(self):
+        clock = FakeClock()
+        fake = StreamingPopen()
+        runner = process.ProcessRunner(
+            clock=clock,
+            popen=lambda *args, **kwargs: fake,
+            thread_factory=lambda *args, **kwargs: SlowStartThread(
+                clock, *args, **kwargs
+            ),
+            killpg=GroupKiller(),
+        )
+        with self.assertRaises(RunnerError) as caught:
+            runner.run(["fixture"], timeout=5, timeout_code="cargo_timeout")
+        self.assertEqual(caught.exception.code, "cargo_timeout")
+        self.assertTrue(fake.killed)
+
+    def test_deadline_passed_at_direct_exit_is_not_success(self):
+        clock = FakeClock()
+        fake = ExitAtDeadlinePopen(clock)
+        runner = process.ProcessRunner(
+            clock=clock,
+            popen=lambda *args, **kwargs: fake,
+            thread_factory=FakeThread,
+            killpg=GroupKiller(),
+        )
+        with self.assertRaises(RunnerError) as caught:
+            runner.run(["fixture"], timeout=5, timeout_code="cargo_timeout")
+        self.assertEqual(caught.exception.code, "cargo_timeout")
+        self.assertTrue(fake.killed)
+
+    def test_drain_and_cleanup_share_one_operation_deadline(self):
+        clock = FakeClock()
+        fake = StreamingPopen(returncode=0)
+        records = []
+        runner = process.ProcessRunner(
+            clock=clock,
+            popen=lambda *args, **kwargs: fake,
+            thread_factory=lambda *args, **kwargs: RecordingThread(
+                records, *args, **kwargs
+            ),
+            killpg=GroupKiller(),
+        )
+        with self.assertRaises(RunnerError) as caught:
+            runner.run(["fixture"], timeout=5)
+        self.assertEqual(caught.exception.code, "process_unreaped")
+        self.assertEqual(records, [5.0, 7.0])
+        self.assertTrue(fake.killed)
 
 
 class GroupOwnershipTest(unittest.TestCase):

@@ -48,6 +48,37 @@ def passing_records():
     return rows
 
 
+class CaseBudgetTest(unittest.TestCase):
+    class Runner:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.calls = []
+
+        def run(self, argv, **kwargs):
+            self.calls.append((list(argv), dict(kwargs)))
+            item = self.responses.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+    def test_case_budget_reserves_the_cleanup_window(self):
+        fake = self.Runner([])
+        records = cases.execute_cases(
+            BINARY, {}, fake, work_deadline=100, case_timeout=30,
+            clock=lambda: 97.5,
+        )
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(records[0]["code"], "not_run_deadline")
+
+        fake = self.Runner([RunnerError("execute", "case_timeout")])
+        records = cases.execute_cases(
+            BINARY, {}, fake, work_deadline=100, case_timeout=30,
+            clock=lambda: 96.5,
+        )
+        self.assertEqual(fake.calls[0][1]["timeout"], 1.5)
+        self.assertEqual(records[0]["code"], "case_timeout")
+
+
 class OrchestrationFakes:
     def binding(self):
         return {
@@ -110,7 +141,8 @@ class FakeFixture:
 
 class RunnerBudgetTest(OrchestrationFakes, unittest.TestCase):
     def invoke(
-        self, clock, capture, execute, cleanup, verify=None, records=None
+        self, clock, capture, execute, cleanup, verify=None, records=None,
+        select=None,
     ):
         cleanup = cleanup or {
             "cleanup_ok": True,
@@ -131,7 +163,9 @@ class RunnerBudgetTest(OrchestrationFakes, unittest.TestCase):
                 runner=object(),
                 clock=clock,
                 capture_source=capture,
-                select_binary=lambda *args, **kwargs: self.selection(),
+                select_binary=select or (
+                    lambda *args, **kwargs: self.selection()
+                ),
                 fixture_factory=lambda *args, **kwargs: fixture,
                 execute_cases_fn=execute,
                 write_report_fn=(
@@ -146,6 +180,27 @@ class RunnerBudgetTest(OrchestrationFakes, unittest.TestCase):
                 environ={"ROOTYARD_TEST_DATABASE_URL": BOOTSTRAP},
             )
         return payload, writes, fixture, verify
+
+    def test_selection_budget_reserves_cleanup_window(self):
+        clock = FakeClock(0)
+        captured = {}
+
+        def capture(*args, **kwargs):
+            clock.set(75)
+            return self.binding()
+
+        def select(source, runner_obj, remaining, **kwargs):
+            captured["remaining"] = remaining
+            return self.selection()
+
+        self.invoke(
+            clock,
+            capture=capture,
+            execute=lambda *args, **kwargs: passing_records(),
+            cleanup=None,
+            select=select,
+        )
+        self.assertEqual(captured["remaining"], 3)
 
     def test_cleanup_secondary_failure_cannot_overwrite_primary_failure(self):
         clock = FakeClock(0)

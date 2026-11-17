@@ -144,7 +144,7 @@ class OwnedFixtureTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def fixture(self, factory=None):
+    def fixture(self, factory=None, clock=None):
         return resources.OwnedFixture(
             self.root,
             BOOTSTRAP,
@@ -154,6 +154,7 @@ class OwnedFixtureTest(unittest.TestCase):
             postgres_factory=factory or PgFactory(),
             root_factory=lambda: resources.OwnedRoot(base=self.base),
             root_remover=FakeRootRemover(),
+            clock=clock,
         )
 
     def test_schema_goes_to_owned_database_only(self):
@@ -184,6 +185,17 @@ class OwnedFixtureTest(unittest.TestCase):
         self.assertTrue(cleanup["postgres_cleanup_verified"])
         self.assertTrue(cleanup["root_cleanup_verified"])
         self.assertTrue(cleanup["cleanup_verified"])
+
+    def test_schema_install_reserves_cleanup_window(self):
+        factory = PgFactory()
+        fixture = self.fixture(factory, clock=lambda: 0.0)
+        fixture.start(deadline=10)
+        schema_calls = [
+            call for call in factory.fake.calls
+            if call[2].startswith("CREATE SCHEMA")
+        ]
+        self.assertEqual(len(schema_calls), 1)
+        self.assertEqual(schema_calls[0][1]["timeout"], 8)
 
     def test_escape_variable_presence_fails_before_effects(self):
         factory = PgFactory()
