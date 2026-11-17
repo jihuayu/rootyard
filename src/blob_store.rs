@@ -10,6 +10,7 @@
 pub(crate) mod archive;
 mod backend_identity;
 pub mod budget;
+pub mod capacity_contract;
 pub mod closure;
 pub mod config;
 pub mod disposable_view;
