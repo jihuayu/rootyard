@@ -73,9 +73,9 @@ async fn pre_commit_rollback_keeps_every_transition_marker_unpublished() {
             "{name} changed the pre-existing marker before commit");
         let mut check_client = pool.get().await.unwrap();
         let check_tx = check_client.transaction().await.unwrap();
-        load_or_init_repo_route(&check_tx, owner, repo_id).await.unwrap();
+        let reloaded = load_or_init_repo_route(&check_tx, owner, repo_id).await.unwrap();
         drop(check_tx);
-        assert_eq!(route.route_epoch, 1, "{name} changed PostgreSQL before commit");
+        assert_eq!(reloaded.route_epoch, route.route_epoch, "{name} changed PostgreSQL before commit");
     }
     drop(local);
     drop(pool);
