@@ -451,6 +451,7 @@ class DeletedClaimAcceptanceHarness(RepositoryLifecycleHarness):
 
     def __init__(self, args):
         super().__init__(args)
+        self.fixture = None
         self.diagnostics = PhaseDiagnostics()
 
     # ------------------------------------------------------------------
