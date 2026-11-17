@@ -83,6 +83,22 @@ class ProjectionError(RuntimeError):
         super().__init__(code)
 
 
+class _DuplicateKey(ValueError):
+    """Internal marker; never carries the offending key or value."""
+
+
+def _reject_duplicate_keys(pairs):
+    """Reject duplicate JSON object keys at every nesting level."""
+    seen = set()
+    result = {}
+    for key, value in pairs:
+        if key in seen:
+            raise _DuplicateKey()
+        seen.add(key)
+        result[key] = value
+    return result
+
+
 def require(condition, code):
     if not condition:
         raise ProjectionError(code)
@@ -248,7 +264,9 @@ def _load_raw(path):
     except UnicodeDecodeError:
         raise ProjectionError("raw_report_invalid_json") from None
     try:
-        payload = json.loads(text)
+        payload = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except _DuplicateKey:
+        raise ProjectionError("raw_report_duplicate_key") from None
     except (json.JSONDecodeError, RecursionError):
         raise ProjectionError("raw_report_invalid_json") from None
     require(isinstance(payload, dict), "raw_report_not_object")
