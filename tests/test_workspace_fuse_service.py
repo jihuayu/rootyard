@@ -815,7 +815,11 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                          token=h.alice, method="PUT", body=parked_body,
                          extra_headers={"Idempotency-Key": "normal-sigterm-parked"})
                 git_state = workspace_state(git_id)
-                self.assertEqual((git_mount / "parked.bin").read_bytes(), b"parked\n")
+                parked_read = json.loads(h.expect(
+                    f"/api/workspaces/{git_id}/files?path=parked.bin", 200,
+                    token=h.alice))
+                self.assertEqual(base64.b64decode(parked_read["content_base64"], validate=True),
+                                 b"parked\n")
                 git_holder = keep_namespace(git_mount, git_mount_id)
 
                 put_ws = create_workspace("normal-sigterm-put",
