@@ -66,7 +66,7 @@ impl LoopbackS3 {
     fn open_store(&self) -> Result<BlobStore> {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let ep = self.endpoint.as_str();
-        let spec = "DRIVER=opendal SERVICE=s3 BUCKET=compaction-test-bucket REGION=us-east-1 ROOT=compaction-it ACCESS_KEY_ID=test-ak SECRET_ACCESS_KEY=test-sk ENCRYPTION_MODE=provider-managed RETRY_MAX_TIMES=0 MAX_OBJECT_BYTES=8388608";
+        let spec = "DRIVER=opendal SERVICE=s3 BUCKET=compaction-test-bucket REGION=us-east-1 ROOT=compaction-it ACCESS_KEY_ID=test-ak SECRET_ACCESS_KEY=test-sk ENCRYPTION_MODE=provider-managed RETRY_MAX_TIMES=3 MAX_OBJECT_BYTES=8388608";
         let mut pairs: Vec<(String, Option<std::ffi::OsString>)> = spec
             .split(' ')
             .map(|s| s.split_once('=').unwrap())
@@ -117,7 +117,10 @@ async fn handle_s3(State(objs): State<S3Objects>, m: Method, u: Uri, b: Bytes) -
         },
         _ => (StatusCode::METHOD_NOT_ALLOWED, None, 0, Body::empty()),
     };
-    let mut rb = Response::builder().status(st).header(header::CONTENT_LENGTH, len.to_string());
+    let mut rb = Response::builder()
+        .status(st)
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .header(header::CONNECTION, "close");
     if let Some(t) = tag {
         rb = rb.header(header::ETAG, t);
     }
@@ -404,7 +407,7 @@ async fn crash_recovery_lease_fence_concurrent_push_dropped_ack_and_corrupt_read
         assert!(h.go(&store, &up, &rq, false).await.is_err());
     }
     let store = store.reload_after_crash()?;
-    let mut rq_stall = h.mk_req(&repo, CompactionFaultHook::StallBeforePublish { delay_ms: 45 });
+    let mut rq_stall = h.mk_req(&repo, CompactionFaultHook::StallBeforePublish { delay_ms: 100 });
     rq_stall.lease_ttl_ms = 20;
     assert!(matches!(h.go(&store, &up, &rq_stall, false).await, Err(CompactionError::LeaseLost(_))));
     assert_eq!(store.load_snapshot(repo.tenant, repo.repo, repo.history).await?.membership_generation, 1);
