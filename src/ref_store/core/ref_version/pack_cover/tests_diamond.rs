@@ -4,7 +4,7 @@ use super::super::contract::RefVersionRealm;
 use super::super::pack_set::{PackSetEntry, VerifiedClosurePack};
 use super::super::read_mode::ReadConsumer;
 use super::super::record::RefHead;
-use super::auth::{FetchPlanError, ReadIsolationMode, StrongSnapshotCut};
+use super::auth::{FetchPlanError, ReadIsolationMode, RefVisibilityPolicy, StrongSnapshotCut};
 use super::model::{
     CoverArtifactPair, CoverCommitLink, CoverHierarchyIndex, CoverTier, compute_cover_membership_digest,
 };
@@ -170,4 +170,129 @@ fn planner_expands_diamond_delta_dag_linearly_and_bounds_delta_work() {
         add(&mut b_idx, &mut b_ents, 41_000 + k, tip, bases.clone(), &mut b_holds);
     }
     assert_eq!(run_req(&b_idx, b_holds).0, Err(FetchPlanError::ClosureBoundsExceeded));
+}
+
+#[test]
+fn planner_bounds_work_steps_on_shared_unauthorized_delta_base() {
+    let r = realm(GitObjectFormat::Sha1);
+    let main_ref = RefName::new("refs/heads/main").unwrap();
+    let pub_ref = RefName::new("refs/heads/pub").unwrap();
+    let tip = oid(GitObjectFormat::Sha1, 1);
+    let hidden_oid = oid(GitObjectFormat::Sha1, 0xff);
+    let dummy = |i: u128| {
+        let mut raw = [0_u8; 20];
+        raw[..16].copy_from_slice(&i.to_be_bytes());
+        GitOid::parse(GitObjectFormat::Sha1, &hex::encode(raw)).unwrap()
+    };
+    let (p0, _) = make_pack(&r, 250, 1024, 100, false, vec![]);
+    let (v1, p0_c) = mint_version(&r, "refs/heads/main", 4, None, tip, p0, vec![]);
+    let (p1, _) = make_pack(&r, 251, 1024, 100, false, vec![]);
+    let (v_pub, p1_c) = mint_version(&r, "refs/heads/pub", 2, None, dummy(2_046), p1, vec![]);
+    let (p2, _) = make_pack(&r, 252, 1024, 100, false, vec![]);
+    let (v_sec, p2_c) = mint_version(&r, "refs/hidden/secret", 3, None, hidden_oid, p2, vec![]);
+    let mut graph = VersionGraph::new();
+    for (record, pk) in [(&v1, p0_c), (&v_pub, p1_c), (&v_sec, p2_c)] {
+        graph.insert_active(CausalVersionNode { record: record.clone(), own_packs: vec![pk] });
+    }
+
+    let mem0 = compute_cover_membership_digest(&r, 1, &[]).unwrap();
+    let (mut idx, mut ents, mut holds) = (CoverHierarchyIndex::new(r, mem0).unwrap(), Vec::new(), Vec::new());
+    let mut unauth_links: Vec<_> = (0..2_047_u128)
+        .map(|i| CoverCommitLink {
+            commit_oid: dummy(i),
+            parent_oids: if i > 0 { vec![dummy(i - 1)] } else { vec![] },
+            version_id: v_pub.version_id(),
+            authority_seq: 2,
+        })
+        .collect();
+    unauth_links.push(CoverCommitLink {
+        commit_oid: hidden_oid,
+        parent_oids: vec![],
+        version_id: v_sec.version_id(),
+        authority_seq: 3,
+    });
+    let (ub_pk, ub_art) = uniq_pack(&r, 50_000, vec![]);
+    ents.push(*ub_pk.entry());
+    let g1 = idx.membership_generation() + 1;
+    let m1 = compute_cover_membership_digest(&r, g1, &ents).unwrap();
+    let ub = seal_test_cover(
+        &r,
+        (50_000, g1, (2, 3), m1),
+        CoverTier::Delta,
+        (ub_pk, ub_art),
+        vec![v_pub.version_id(), v_sec.version_id()],
+        unauth_links,
+        vec![],
+    );
+    holds.push(ub.cover_id());
+    idx.register_leaf_cover(ub, m1).unwrap();
+
+    for k in 0..35_u128 {
+        let (rk_pk, rk_art) = uniq_pack(&r, 51_000 + k, vec![uid(50_000)]);
+        ents.push(*rk_pk.entry());
+        let g = idx.membership_generation() + 1;
+        let m = compute_cover_membership_digest(&r, g, &ents).unwrap();
+        let lk =
+            CoverCommitLink { commit_oid: tip, parent_oids: vec![], version_id: v1.version_id(), authority_seq: 4 };
+        let cov = seal_test_cover(
+            &r,
+            (51_000 + k, g, (4, 4), m),
+            CoverTier::Delta,
+            (rk_pk, rk_art),
+            vec![v1.version_id()],
+            vec![lk],
+            vec![],
+        );
+        holds.push(cov.cover_id());
+        idx.register_leaf_cover(cov, m).unwrap();
+        if k == 0 {
+            // Single root within budget fails closed as UnauthorizedObjectScope, not Bypass.
+            let mut ret1 = RetentionClassificationIndex::new();
+            ret1.add_hold(CoverRetentionHold::ActiveRefHead {
+                ref_name: main_ref.clone(),
+                version_id: v1.version_id(),
+                cover_ids: holds.clone(),
+            });
+            let mut auth = default_auth(&r);
+            auth.visibility = RefVisibilityPolicy::AllowOnly([main_ref.clone(), pub_ref.clone()].into_iter().collect());
+            let heads = BTreeMap::from([
+                (main_ref.clone(), RefHead::from_committed(&v1).unwrap()),
+                (pub_ref.clone(), RefHead::from_committed(&v_pub).unwrap()),
+            ]);
+            let mut req1 =
+                FetchPlanRequest::new(ReadConsumer::SmartHttpFetch, r, auth, ReadIsolationMode::StrongSnapshot);
+            req1.strong_cut = Some(StrongSnapshotCut {
+                authority_seq: 4,
+                snapshot_digest: RequestDigest::of("u1", &[b"c"]),
+                membership_digest: idx.membership_digest(),
+                heads,
+            });
+            req1.wants = vec![WantTarget::Ref { ref_name: main_ref.clone() }];
+            req1.allow_strong_fallback = false;
+            assert_eq!(plan_fetch_covers(&req1, &graph, &idx, &ret1), Err(FetchPlanError::UnauthorizedObjectScope));
+        }
+    }
+
+    let mut ret = RetentionClassificationIndex::new();
+    ret.add_hold(CoverRetentionHold::ActiveRefHead {
+        ref_name: main_ref.clone(),
+        version_id: v1.version_id(),
+        cover_ids: holds,
+    });
+    let mut auth = default_auth(&r);
+    auth.visibility = RefVisibilityPolicy::AllowOnly([main_ref.clone(), pub_ref.clone()].into_iter().collect());
+    let heads = BTreeMap::from([
+        (main_ref.clone(), RefHead::from_committed(&v1).unwrap()),
+        (pub_ref, RefHead::from_committed(&v_pub).unwrap()),
+    ]);
+    let mut req = FetchPlanRequest::new(ReadConsumer::SmartHttpFetch, r, auth, ReadIsolationMode::StrongSnapshot);
+    req.strong_cut = Some(StrongSnapshotCut {
+        authority_seq: 4,
+        snapshot_digest: RequestDigest::of("u35", &[b"c"]),
+        membership_digest: idx.membership_digest(),
+        heads,
+    });
+    req.wants = vec![WantTarget::Ref { ref_name: main_ref }];
+    req.allow_strong_fallback = false;
+    assert_eq!(plan_fetch_covers(&req, &graph, &idx, &ret), Err(FetchPlanError::ClosureBoundsExceeded));
 }

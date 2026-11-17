@@ -195,11 +195,11 @@ fn expand_delta_bases(
             state.obs.saw_tamper = true;
             return Ok(false);
         }
+        step_budget(work_steps, base.covered_commits().len())?;
         if cover_exposes_unauthorized_commits(base, &ctx.req.auth, ctx.authorized_commits) {
             state.obs.saw_hidden_leak = true;
             return Ok(false);
         }
-        step_budget(work_steps, base.covered_commits().len())?;
         let base_cls = ctx.retention_index.classify_cover(base);
         let base_quarantined = base_cls.active_protectors.contains(&CoverHoldKind::QuarantineHold);
         let client_has_all = !base_quarantined
