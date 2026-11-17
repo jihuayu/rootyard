@@ -206,7 +206,7 @@ pub(super) async fn insert_snapshot(
         .execute(
             "INSERT INTO pando_lab.snapshots(\
              id,repo,principal,generation,storage_generation,refs,packs,expires_at) \
-             VALUES($1,$2,$3,0,1,$4,$5,clock_timestamp()+$6::interval)",
+             VALUES($1,$2,$3,0,1,$4,$5,clock_timestamp()+$6::text::interval)",
             &[
                 &id,
                 &repo,
