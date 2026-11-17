@@ -12,7 +12,7 @@ use super::{
         CompactionPublishReceipt, CompactionPublishRequest, PendingOperationRecord,
     },
     segment::CompactionByteAccounting,
-    sharding::pack_set_digest,
+    sharding::{CompactionPackEntry, pack_set_digest},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,6 +20,8 @@ use super::{
 pub(super) struct LeaseSlotState {
     pub(super) next_fence_epoch: u64,
     pub(super) active: Option<CompactionLeaseToken>,
+    pub(super) clock_logical_ms: u64,
+    pub(super) clock_wall_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,6 +40,10 @@ pub(super) struct DurableStoreState {
     pub(super) operations: BTreeMap<Uuid, StoredOpEntry>,
     pub(super) cas_conflict_count: u64,
     pub(super) double_retirement_rejections: u64,
+}
+
+pub(super) fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 pub(super) fn repo_slot_key(tenant_id: Uuid, repo_id: Uuid, history_id: Uuid) -> String {
@@ -71,12 +77,20 @@ pub(super) fn acquire_lease_locked(
     key: &CompactionLeaseKey,
     owner_id: &str,
     now_ms: u64,
+    wall_ms: u64,
     ttl_ms: u64,
 ) -> Result<CompactionLeaseToken, CompactionError> {
-    let slot = state.leases.entry(lease_slot_key(key)).or_insert(LeaseSlotState { next_fence_epoch: 1, active: None });
+    let slot = state.leases.entry(lease_slot_key(key)).or_insert(LeaseSlotState {
+        next_fence_epoch: 1,
+        active: None,
+        clock_logical_ms: now_ms,
+        clock_wall_ms: wall_ms,
+    });
     match &mut slot.active {
         Some(existing) if existing.owner_id == owner_id && now_ms < existing.expires_at_ms => {
             existing.expires_at_ms = now_ms.saturating_add(ttl_ms);
+            slot.clock_logical_ms = now_ms;
+            slot.clock_wall_ms = wall_ms;
             Ok(existing.clone())
         }
         Some(existing) if now_ms < existing.expires_at_ms => {
@@ -93,6 +107,8 @@ pub(super) fn acquire_lease_locked(
                 acquired_at_ms: now_ms,
                 expires_at_ms: now_ms.saturating_add(ttl_ms),
             };
+            slot.clock_logical_ms = now_ms;
+            slot.clock_wall_ms = wall_ms;
             slot.active = Some(fresh.clone());
             Ok(fresh)
         }
@@ -144,22 +160,43 @@ pub(super) fn apply_cas_commit_locked(
             request.expected_membership_generation, repo.membership_generation
         )));
     }
+    if request.merge_plan.shard_id != request.shard_id {
+        return Err(CompactionError::OperationConflict("merge_plan shard_id mismatches request shard_id"));
+    }
+    if request.merge_plan.target_tier != request.merge_plan.source_tier.next_tier() {
+        return Err(CompactionError::OperationConflict("merge_plan target_tier mismatches source_tier"));
+    }
     let retire_set: HashSet<Uuid> = request.retired_pack_ids.iter().copied().collect();
-    let plan_set: HashSet<Uuid> = request.merge_plan.input_packs.iter().map(|p| p.pack_id).collect();
+    let mut plan_by_id: BTreeMap<Uuid, &CompactionPackEntry> = BTreeMap::new();
+    for pack in &request.merge_plan.input_packs {
+        if plan_by_id.insert(pack.pack_id, pack).is_some() {
+            return Err(CompactionError::OperationConflict("duplicate pack_id in merge_plan inputs"));
+        }
+    }
     if request.retired_pack_ids.len() < 2
         || retire_set.len() != request.retired_pack_ids.len()
-        || retire_set != plan_set
+        || plan_by_id.len() != retire_set.len()
+        || !retire_set.iter().all(|id| plan_by_id.contains_key(id))
     {
         return Err(CompactionError::OperationConflict("retired_pack_ids must uniquely match merge_plan inputs"));
     }
+    let serving_by_id: BTreeMap<Uuid, &CompactionPackEntry> =
+        repo.serving_packs.iter().map(|p| (p.pack_id, p)).collect();
     let already_retired = repo.retained_old_packs.iter().any(|p| retire_set.contains(&p.pack_id));
-    let serving_ids: HashSet<Uuid> = repo.serving_packs.iter().map(|p| p.pack_id).collect();
-    if already_retired || !retire_set.iter().all(|id| serving_ids.contains(id)) {
+    let all_match_serving = plan_by_id.iter().all(|(id, pack)| serving_by_id.get(id) == Some(pack));
+    if already_retired || !all_match_serving {
         guard.double_retirement_rejections = guard.double_retirement_rejections.saturating_add(1);
-        return Err(CompactionError::OperationConflict("double retirement or missing serving input pack rejected"));
+        return Err(CompactionError::OperationConflict("double retirement or serving pack mismatch rejected"));
     }
-    if repo.serving_packs.iter().any(|p| p.pack_id == request.replacement_pack.pack_id) {
-        return Err(CompactionError::OperationConflict("replacement pack_id already in serving"));
+    if serving_by_id.contains_key(&request.replacement_pack.pack_id)
+        || repo.retained_old_packs.iter().any(|p| p.pack_id == request.replacement_pack.pack_id)
+    {
+        return Err(CompactionError::OperationConflict("replacement pack_id collides with serving or retired pack"));
+    }
+    if request.replacement_pack.joined_generation != repo.membership_generation.saturating_add(1) {
+        return Err(CompactionError::OperationConflict(
+            "replacement_pack joined_generation mismatches next membership_generation",
+        ));
     }
     request.replacement_pack.validate(repo.shard_count)?;
 

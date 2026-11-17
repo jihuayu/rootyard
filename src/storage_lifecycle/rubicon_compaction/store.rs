@@ -1,8 +1,10 @@
 //! Crash-recoverable atomic-JSON-journaled RefStore & lease authority store (#162).
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use uuid::Uuid;
@@ -21,7 +23,7 @@ use super::{
     },
     store_cas::{
         DurableStoreState, LeaseSlotState, acquire_lease_locked, apply_cas_commit_locked, lease_slot_key,
-        repo_slot_key, validate_lease_in_state,
+        repo_slot_key, validate_lease_in_state, wall_now_ms,
     },
 };
 
@@ -29,12 +31,17 @@ use super::{
 #[derive(Clone, Debug)]
 pub struct DurableCompactionStore {
     inner: Arc<Mutex<DurableStoreState>>,
+    lease_clocks: Arc<Mutex<HashMap<(Uuid, u64), Instant>>>,
     persist_path: Option<PathBuf>,
 }
 
 impl DurableCompactionStore {
     pub fn in_memory() -> Self {
-        Self { inner: Arc::new(Mutex::new(DurableStoreState::default())), persist_path: None }
+        Self {
+            inner: Arc::new(Mutex::new(DurableStoreState::default())),
+            lease_clocks: Arc::new(Mutex::new(HashMap::new())),
+            persist_path: None,
+        }
     }
 
     pub fn open_with_journal(path: impl Into<PathBuf>) -> Result<Self, CompactionError> {
@@ -45,7 +52,35 @@ impl DurableCompactionStore {
         } else {
             DurableStoreState::default()
         };
-        Ok(Self { inner: Arc::new(Mutex::new(state)), persist_path: Some(path) })
+        Ok(Self {
+            inner: Arc::new(Mutex::new(state)),
+            lease_clocks: Arc::new(Mutex::new(HashMap::new())),
+            persist_path: Some(path),
+        })
+    }
+
+    fn effective_lease_now(&self, state: &DurableStoreState, key: &CompactionLeaseKey, passed_now_ms: u64) -> u64 {
+        let Some(slot) = state.leases.get(&lease_slot_key(key)) else {
+            return passed_now_ms;
+        };
+        let elapsed_ms = if let Some(active) = &slot.active {
+            let clocks = self.lease_clocks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(started) = clocks.get(&(active.lease_id, active.fence_epoch)) {
+                started.elapsed().as_millis() as u64
+            } else {
+                wall_now_ms().saturating_sub(slot.clock_wall_ms)
+            }
+        } else {
+            wall_now_ms().saturating_sub(slot.clock_wall_ms)
+        };
+        passed_now_ms.max(slot.clock_logical_ms.saturating_add(elapsed_ms))
+    }
+
+    fn record_lease_clock(&self, token: &CompactionLeaseToken) {
+        self.lease_clocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((token.lease_id, token.fence_epoch), Instant::now());
     }
 
     pub fn reload_after_crash(&self) -> Result<Self, CompactionError> {
@@ -199,8 +234,14 @@ impl DurableCompactionStore {
     ) -> Result<CompactionLeaseToken, CompactionError> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = guard.clone();
-        let slot =
-            next.leases.entry(lease_slot_key(key)).or_insert(LeaseSlotState { next_fence_epoch: 1, active: None });
+        let effective_now = self.effective_lease_now(&next, key, now_ms);
+        let wall_ms = wall_now_ms();
+        let slot = next.leases.entry(lease_slot_key(key)).or_insert(LeaseSlotState {
+            next_fence_epoch: 1,
+            active: None,
+            clock_logical_ms: effective_now,
+            clock_wall_ms: wall_ms,
+        });
         let epoch = slot.next_fence_epoch;
         slot.next_fence_epoch = slot.next_fence_epoch.saturating_add(1);
         let token = CompactionLeaseToken {
@@ -208,12 +249,15 @@ impl DurableCompactionStore {
             lease_id: Uuid::new_v4(),
             owner_id: new_owner.to_owned(),
             fence_epoch: epoch,
-            acquired_at_ms: now_ms,
-            expires_at_ms: now_ms.saturating_add(ttl_ms),
+            acquired_at_ms: effective_now,
+            expires_at_ms: effective_now.saturating_add(ttl_ms),
         };
+        slot.clock_logical_ms = effective_now;
+        slot.clock_wall_ms = wall_ms;
         slot.active = Some(token.clone());
         self.flush_state(&next)?;
         *guard = next;
+        self.record_lease_clock(&token);
         Ok(token)
     }
 
@@ -241,9 +285,12 @@ impl CompactionAuthorityStore for DurableCompactionStore {
             }
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let mut next = guard.clone();
-            let token = acquire_lease_locked(&mut next, key, owner_id, now_ms, ttl_ms)?;
+            let effective_now = self.effective_lease_now(&next, key, now_ms);
+            let wall_ms = wall_now_ms();
+            let token = acquire_lease_locked(&mut next, key, owner_id, effective_now, wall_ms, ttl_ms)?;
             self.flush_state(&next)?;
             *guard = next;
+            self.record_lease_clock(&token);
             Ok(token)
         })
     }
@@ -251,7 +298,8 @@ impl CompactionAuthorityStore for DurableCompactionStore {
     fn verify_lease_active<'a>(&'a self, token: &'a CompactionLeaseToken, now_ms: u64) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            validate_lease_in_state(&guard, &token.key, token.lease_id, token.fence_epoch, now_ms)
+            let effective_now = self.effective_lease_now(&guard, &token.key, now_ms);
+            validate_lease_in_state(&guard, &token.key, token.lease_id, token.fence_epoch, effective_now)
         })
     }
 
@@ -316,7 +364,14 @@ impl CompactionAuthorityStore for DurableCompactionStore {
         Box::pin(async move {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let mut next = guard.clone();
-            let res = apply_cas_commit_locked(&mut next, request, now_ms);
+            let key = CompactionLeaseKey {
+                tenant_id: request.tenant_id,
+                repo_id: request.repo_id,
+                history_id: request.history_id,
+                shard_id: request.shard_id,
+            };
+            let effective_now = self.effective_lease_now(&next, &key, now_ms);
+            let res = apply_cas_commit_locked(&mut next, request, effective_now);
             match res {
                 Ok(receipt) => {
                     self.flush_state(&next)?;

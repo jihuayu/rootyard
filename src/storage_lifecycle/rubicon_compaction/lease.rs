@@ -193,6 +193,7 @@ pub enum CompactionFaultHook {
     None,
     CrashBeforeUpload,
     CrashAfterUploadBeforePublish,
+    StallBeforePublish { delay_ms: u64 },
     LoseLeaseBeforePublish { usurper_owner: String },
     ConcurrentPushBeforePublish(Box<ConcurrentPushFault>),
     DropPublishAck,

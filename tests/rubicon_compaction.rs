@@ -287,34 +287,20 @@ impl Harness {
     fn open() -> Result<(Self, TempDir)> {
         let dir = TempDir::new()?;
         let views = DisposableViewRoot::open(&dir.path().join("views"), 8, 64 << 20, Duration::from_secs(120))?;
-        let budget = CompactionResourceBudget::new(CompactionBudgetConfig::default())?;
         let policy = SegmentTriggerPolicy { max_segment_packs: 2, ..SegmentTriggerPolicy::default() };
-        Ok((
-            Self {
-                blob: LoopbackS3::shared().open_store()?,
-                views,
-                budget,
-                policy,
-                dl: Instant::now() + Duration::from_secs(60),
-            },
-            dir,
-        ))
+        let h = Self {
+            blob: LoopbackS3::shared().open_store()?,
+            views,
+            budget: CompactionResourceBudget::new(CompactionBudgetConfig::default())?,
+            policy,
+            dl: Instant::now() + Duration::from_secs(60),
+        };
+        Ok((h, dir))
     }
 
     fn seed(&self, store: &DurableCompactionStore, r: &MultiPackRepo, fmt: &str, shards: u16) -> Result<()> {
-        store.seed_repository(
-            r.tenant,
-            r.repo,
-            r.history,
-            1,
-            fmt,
-            shards,
-            r.packs.clone(),
-            r.refs.clone(),
-            r.roots.clone(),
-            1_000,
-            &self.policy,
-        )?;
+        let (p, rf, rt) = (r.packs.clone(), r.refs.clone(), r.roots.clone());
+        store.seed_repository(r.tenant, r.repo, r.history, 1, fmt, shards, p, rf, rt, 1_000, &self.policy)?;
         Ok(())
     }
 
@@ -418,6 +404,9 @@ async fn crash_recovery_lease_fence_concurrent_push_dropped_ack_and_corrupt_read
         assert!(h.go(&store, &up, &rq, false).await.is_err());
     }
     let store = store.reload_after_crash()?;
+    let mut rq_stall = h.mk_req(&repo, CompactionFaultHook::StallBeforePublish { delay_ms: 45 });
+    rq_stall.lease_ttl_ms = 20;
+    assert!(matches!(h.go(&store, &up, &rq_stall, false).await, Err(CompactionError::LeaseLost(_))));
     assert_eq!(store.load_snapshot(repo.tenant, repo.repo, repo.history).await?.membership_generation, 1);
 
     let lose = CompactionFaultHook::LoseLeaseBeforePublish { usurper_owner: "usurper".into() };

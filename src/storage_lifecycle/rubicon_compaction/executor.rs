@@ -1,6 +1,10 @@
 //! No-delete shard compaction executor: verify closures, upload/readback, prove equivalence, CAS publish (#162).
 
-use std::{collections::HashSet, path::Path, time::Instant};
+use std::{
+    collections::HashSet,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use uuid::Uuid;
 
@@ -90,9 +94,11 @@ pub async fn execute_shard_compaction_with_retry(
     request: &CompactionRunRequest<'_>,
     deadline: Instant,
 ) -> Result<CompactionRunOutcome, CompactionError> {
+    let started_all = Instant::now();
     let mut attempt_req = request.clone();
     let max_tries = request.max_cas_retries.saturating_add(1);
     for attempt in 1..=max_tries {
+        attempt_req.now_ms = current_now_ms(request.now_ms, started_all);
         match execute_shard_compaction_inner(authority, uploader, store, view_root, budget, &attempt_req, deadline)
             .await
         {
@@ -156,6 +162,7 @@ async fn execute_shard_compaction_inner(
     };
     let lease_token =
         authority.acquire_or_renew_lease(&lease_key, request.owner_id, request.now_ms, request.lease_ttl_ms).await?;
+    let started_at = Instant::now();
     let snap = authority.load_snapshot(request.tenant_id, request.repo_id, request.history_id).await?;
     let fmt = parse_object_format(&snap.object_format)?;
     let Some(plan) = snap.segments.plan_tiered_merge(request.shard_id, &request.policy)? else {
@@ -209,7 +216,7 @@ async fn execute_shard_compaction_inner(
         std::fs::create_dir_all(d).map_err(|e| CompactionError::Io(e.to_string()))?;
     }
 
-    authority.verify_lease_active(&lease_token, request.now_ms).await?;
+    authority.verify_lease_active(&lease_token, current_now_ms(request.now_ms, started_at)).await?;
     let _git_permit = budget.acquire_git_slot(deadline).await?;
     populate_bare_with_entries(store, &before_dir, fmt, &snap.serving_packs, false, deadline).await?;
     let (before_oids, before_closure) =
@@ -278,7 +285,7 @@ async fn execute_shard_compaction_inner(
         clone_verified: clone_ok,
     };
 
-    authority.verify_lease_active(&lease_token, request.now_ms).await?;
+    authority.verify_lease_active(&lease_token, current_now_ms(request.now_ms, started_at)).await?;
     if matches!(request.fault_hook, CompactionFaultHook::CrashBeforeUpload) {
         return Err(CompactionError::Io("injected crash before Blob upload".into()));
     }
@@ -335,7 +342,11 @@ async fn execute_shard_compaction_inner(
     if matches!(request.fault_hook, CompactionFaultHook::CrashAfterUploadBeforePublish) {
         return Err(CompactionError::Io("injected crash after verified upload before CAS publish".into()));
     }
-    authority.inject_fault(&request.fault_hook, &lease_key, request.now_ms, &request.policy).await?;
+    if let CompactionFaultHook::StallBeforePublish { delay_ms } = request.fault_hook {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+    let publish_now = current_now_ms(request.now_ms, started_at);
+    authority.inject_fault(&request.fault_hook, &lease_key, publish_now, &request.policy).await?;
 
     let publish_req = CompactionPublishRequest {
         op_id,
@@ -360,7 +371,7 @@ async fn execute_shard_compaction_inner(
     let receipt = authority
         .cas_publish_compaction(
             &publish_req,
-            request.now_ms,
+            current_now_ms(request.now_ms, started_at),
             matches!(request.fault_hook, CompactionFaultHook::DropPublishAck),
         )
         .await?;
@@ -373,6 +384,10 @@ async fn execute_shard_compaction_inner(
         receipt,
         attempts: 1,
     })))
+}
+
+fn current_now_ms(base_now_ms: u64, started_at: Instant) -> u64 {
+    base_now_ms.saturating_add(started_at.elapsed().as_millis() as u64)
 }
 
 fn replay_outcome(op_id: Uuid, receipt: CompactionPublishReceipt) -> CompactionRunOutcome {

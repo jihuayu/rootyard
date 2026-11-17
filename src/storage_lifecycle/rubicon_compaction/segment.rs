@@ -1,6 +1,6 @@
 //! Open -> sealed pack segments, tiered merge planning, and no-delete byte accounting (#162).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -332,6 +332,50 @@ impl CompactionSegmentLog {
         Ok(None)
     }
 
+    fn validate_merge_plan(&self, plan: &TieredMergePlan) -> Result<(), CompactionError> {
+        if plan.input_segment_ids.is_empty() {
+            return Err(CompactionError::InvalidInput("merge plan input_segment_ids must be non-empty".into()));
+        }
+        if plan.target_tier != plan.source_tier.next_tier() {
+            return Err(CompactionError::OperationConflict("merge plan target_tier mismatches source_tier"));
+        }
+        let mut seen_segs = HashSet::with_capacity(plan.input_segment_ids.len());
+        let mut expected_packs = BTreeMap::new();
+        for seg_id in &plan.input_segment_ids {
+            if !seen_segs.insert(*seg_id) {
+                return Err(CompactionError::OperationConflict("duplicate segment_id in merge plan"));
+            }
+            let Some(seg) = self.segments.get(seg_id) else {
+                return Err(CompactionError::MembershipDrift("planned sealed segment missing".into()));
+            };
+            if seg.shard_id != plan.shard_id || seg.state != SegmentState::Sealed {
+                return Err(CompactionError::MembershipDrift(
+                    "planned sealed segments were already compacted or moved concurrently",
+                ));
+            }
+            if seg.tier != plan.source_tier {
+                return Err(CompactionError::OperationConflict("segment tier mismatches merge plan source_tier"));
+            }
+            for pack in &seg.packs {
+                if expected_packs.insert(pack.pack_id, pack).is_some() {
+                    return Err(CompactionError::OperationConflict("duplicate pack_id inside planned segments"));
+                }
+            }
+        }
+        let mut actual_packs = BTreeMap::new();
+        for pack in &plan.input_packs {
+            if actual_packs.insert(pack.pack_id, pack).is_some() {
+                return Err(CompactionError::OperationConflict("duplicate pack_id in merge plan input_packs"));
+            }
+        }
+        if expected_packs.len() != actual_packs.len()
+            || expected_packs.iter().any(|(id, pack)| actual_packs.get(id) != Some(pack))
+        {
+            return Err(CompactionError::OperationConflict("merge plan input_packs mismatch planned sealed segments"));
+        }
+        Ok(())
+    }
+
     /// Atomically transition planned sealed segments to `Compacted` and append the merged segment.
     pub fn apply_compacted_merge(
         &mut self,
@@ -339,19 +383,7 @@ impl CompactionSegmentLog {
         merged_pack: CompactionPackEntry,
         now_ms: u64,
     ) -> Result<Uuid, CompactionError> {
-        if plan.input_segment_ids.is_empty() {
-            return Err(CompactionError::InvalidInput("merge plan input_segment_ids must be non-empty".into()));
-        }
-        for seg_id in &plan.input_segment_ids {
-            let Some(seg) = self.segments.get(seg_id) else {
-                return Err(CompactionError::MembershipDrift("planned sealed segment missing".into()));
-            };
-            if seg.shard_id != plan.shard_id || seg.state != SegmentState::Sealed {
-                return Err(CompactionError::MembershipDrift(
-                    "planned sealed segments were already compacted or moved concurrently".into(),
-                ));
-            }
-        }
+        self.validate_merge_plan(plan)?;
         for seg_id in &plan.input_segment_ids {
             if let Some(seg) = self.segments.get_mut(seg_id) {
                 seg.state =
