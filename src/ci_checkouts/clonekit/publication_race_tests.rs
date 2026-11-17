@@ -102,6 +102,7 @@ fn store_and_repo(td: &TempDir) -> (CloneKitPublicationStore, Uuid) {
 
 fn publish_baseline(store: &CloneKitPublicationStore, repository_id: Uuid) {
     publish_clonekit_versioned(store, &empty_artifacts(repository_id, 1), git(), None, None).expect("baseline");
+    test_seam::reset();
 }
 
 #[test]
