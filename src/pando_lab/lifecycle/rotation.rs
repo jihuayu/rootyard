@@ -1,13 +1,10 @@
 use super::super::{Config, Pack, object_store};
 use super::{
-    DEFAULT_CIPHER_SUITE, DEFAULT_KMS_KEY_ID, ENVELOPE_SCHEMA, KmsEnvelopeRecord, KmsRotationReport, crypto, data_key,
+    DEFAULT_CIPHER_SUITE, DEFAULT_KMS_KEY_ID, KmsEnvelopeRecord, KmsRotationReport, crypto, data_key,
     db::{self, load_envelope_from_db, persist_checkpoint},
     envelopes, load_repo_packs, provider,
     provider_selection::{self, PandoProviderSelection},
-    publication, valid_kms_key_id,
-    vault_provider::VaultTransitProvider,
-    wrapped_dek::PandoWrappedDek,
-    write_envelope_file,
+    publication, valid_kms_key_id, write_envelope_file,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
