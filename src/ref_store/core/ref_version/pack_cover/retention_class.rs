@@ -297,12 +297,21 @@ pub struct PackRetentionClassification {
     pub physical_gc_owner: &'static str,
 }
 
+/// Authoritative snapshot completeness & explicit retirement ledger for physical GC gating.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorityHoldSnapshot {
+    pub authority_epoch: u64,
+    pub complete: bool,
+    pub explicitly_retired_covers: BTreeSet<Uuid>,
+}
+
 /// Ledger of physical Blob states and authoritative retention protectors.
 #[derive(Clone, Debug, Default)]
 pub struct RetentionClassificationIndex {
     physical_status: BTreeMap<Uuid, PhysicalBlobStatus>,
     holds: Vec<CoverRetentionHold>,
     hints: Vec<NonAuthoritativeHint>,
+    authority_snapshot: Option<AuthorityHoldSnapshot>,
 }
 
 impl RetentionClassificationIndex {
@@ -312,6 +321,23 @@ impl RetentionClassificationIndex {
 
     pub fn set_physical_status(&mut self, pack_id: Uuid, status: PhysicalBlobStatus) {
         self.physical_status.insert(pack_id, status);
+    }
+
+    pub fn set_authority_snapshot(
+        &mut self,
+        authority_epoch: u64,
+        complete: bool,
+        retired_cover_ids: impl IntoIterator<Item = Uuid>,
+    ) {
+        self.authority_snapshot = Some(AuthorityHoldSnapshot {
+            authority_epoch,
+            complete,
+            explicitly_retired_covers: retired_cover_ids.into_iter().collect(),
+        });
+    }
+
+    pub fn clear_authority_snapshot(&mut self) {
+        self.authority_snapshot = None;
     }
 
     pub fn add_hold(&mut self, hold: CoverRetentionHold) {
@@ -409,13 +435,32 @@ impl RetentionClassificationIndex {
             };
         }
 
+        let gc_authorized = self.authority_snapshot.as_ref().is_some_and(|snap| {
+            snap.complete && snap.authority_epoch > 0 && snap.explicitly_retired_covers.contains(&cover_id)
+        });
+        if gc_authorized {
+            return PackRetentionClassification {
+                pack_id,
+                cover_id,
+                state: Some(PackRetentionState::GcEligible),
+                physically_present: true,
+                plannable_for_fetch: false,
+                gc_eligible: true,
+                historical_read_only: false,
+                active_protectors,
+                ignored_non_authoritative_hints,
+                physical_gc_owner: PHYSICAL_GC_OWNER,
+            };
+        }
+
+        // Missing, incomplete, stale-epoch, or unretired cover fails closed: never authorize GC.
         PackRetentionClassification {
             pack_id,
             cover_id,
-            state: Some(PackRetentionState::GcEligible),
+            state: Some(PackRetentionState::PhysicallyPresent),
             physically_present: true,
             plannable_for_fetch: false,
-            gc_eligible: true,
+            gc_eligible: false,
             historical_read_only: false,
             active_protectors,
             ignored_non_authoritative_hints,

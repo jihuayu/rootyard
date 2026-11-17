@@ -326,7 +326,15 @@ fn three_state_retention_rejects_ttl_cache_and_async_projection_deletes() {
     ret.add_non_authoritative_hint(NonAuthoritativeHint::CacheEvicted { cache_key: "redis:k".into() });
     ret.add_non_authoritative_hint(NonAuthoritativeHint::AsyncProjectionMissingOrStale { projection_lag: 42 });
 
-    // No protectors -> gc_eligible despite physical presence, owned by #122/#151/#153.
+    // Without complete non-zero authoritative snapshot & explicit retirement, cover fails closed.
+    let c_missing_auth = ret.classify_pack(pack_id, cover_id, &[v1.version_id()]);
+    assert_eq!(c_missing_auth.state, Some(PackRetentionState::PhysicallyPresent));
+    assert!(!c_missing_auth.gc_eligible && !c_missing_auth.plannable_for_fetch);
+    ret.set_authority_snapshot(0, false, [cover_id]);
+    assert!(!ret.classify_pack(pack_id, cover_id, &[v1.version_id()]).gc_eligible);
+
+    // Complete authoritative snapshot + explicit retirement + no protectors -> gc_eligible, owned by #122/#151/#153.
+    ret.set_authority_snapshot(1, true, [cover_id]);
     let c0 = ret.classify_pack(pack_id, cover_id, &[v1.version_id()]);
     assert_eq!(c0.state, Some(PackRetentionState::GcEligible));
     assert!(c0.physically_present && !c0.plannable_for_fetch && c0.gc_eligible);

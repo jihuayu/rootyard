@@ -18,6 +18,8 @@ mod tests;
 mod tests_git_blob;
 #[cfg(test)]
 mod tests_matrix;
+#[cfg(test)]
+mod tests_safety;
 pub mod verifier;
 
 pub use auth::{
@@ -35,7 +37,7 @@ pub use planner::{
     PlannedCoverEntry, WantTarget, plan_fetch_covers,
 };
 pub use retention_class::{
-    CoverHoldKind, CoverRetentionHold, NonAuthoritativeHint, PHYSICAL_GC_OWNER, PackRetentionClassification,
-    PackRetentionState, PhysicalBlobStatus, RetentionClassificationIndex,
+    AuthorityHoldSnapshot, CoverHoldKind, CoverRetentionHold, NonAuthoritativeHint, PHYSICAL_GC_OWNER,
+    PackRetentionClassification, PackRetentionState, PhysicalBlobStatus, RetentionClassificationIndex,
 };
 pub use verifier::{PlanVerifyError, VerifiedFetchPlanProof, verify_fetch_plan_closure};

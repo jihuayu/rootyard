@@ -15,12 +15,13 @@ use super::model::{
 use super::planner::{
     DEFAULT_COMPACTED_THRESHOLD, FetchPlanOutcome, FetchPlanRequest, HaveSpec, WantTarget, plan_fetch_covers,
 };
-use super::retention_class::{CoverRetentionHold, RetentionClassificationIndex};
+use super::retention_class::{CoverRetentionHold, PackRetentionState, RetentionClassificationIndex};
 use super::tests::{default_auth, make_pack, mint_version, oid, realm, uid};
-use super::verifier::verify_fetch_plan_closure;
+use super::verifier::{PlanVerifyError, verify_fetch_plan_closure};
 use crate::ref_store::contract::RequestDigest;
-use crate::ref_store::core::types::{GitObjectFormat, RefName};
+use crate::ref_store::core::types::{GitObjectFormat, GitOid, RefName};
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 #[test]
 fn planner_verifier_auth_isolation_and_fallback_matrix() {
@@ -218,6 +219,193 @@ fn planner_verifier_auth_isolation_and_fallback_matrix() {
     let mut tampered = c1_for_tamper_test(&r, &p1_c, &v1);
     tampered.tamper_record_digest_for_test();
     assert_eq!(tampered.verify_digest(), Err(CoverModelError::RecordDigestMismatch));
+
+    let mismatched_ver = CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
+        cover_id: uid(198),
+        realm: r,
+        tier: CoverTier::Delta,
+        pack: p1_c.clone(),
+        artifacts: make_pack(&r, 98, p1_c.verified_bytes() - 200, 200, false, vec![]).1,
+        covered_versions: vec![v1.version_id()],
+        min_authority_seq: 1,
+        max_authority_seq: 1,
+        covered_commits: vec![CoverCommitLink {
+            commit_oid: oid(GitObjectFormat::Sha1, 1),
+            parent_oids: vec![],
+            version_id: v2.version_id(),
+            authority_seq: 1,
+        }],
+        input_cover_ids: vec![],
+        membership_generation: 2,
+        membership_digest: compute_cover_membership_digest(&r, 2, &[*p1_c.entry()]).unwrap(),
+        compaction_epoch: 1,
+        worker_id: uid(798),
+        operation_id: uid(898),
+    });
+    assert!(matches!(mismatched_ver, Err(CoverModelError::InvalidShape(_))));
+
+    // Reset holds for forged-cut negative tests (both planner and verifier must reject).
+    let mut active_ret = RetentionClassificationIndex::new();
+    active_ret.add_hold(CoverRetentionHold::ActiveRefHead {
+        ref_name: RefName::new("refs/heads/main").unwrap(),
+        version_id: v2.version_id(),
+        cover_ids: vec![uid(111), uid(112)],
+    });
+    assert_eq!(active_ret.classify_cover(&c1).state, Some(PackRetentionState::PlannableForFetch));
+
+    let FetchPlanOutcome::Planned(valid_plan) = plan_fetch_covers(&inc_req, &graph, &index, &active_ret).unwrap()
+    else {
+        panic!("expected valid plan");
+    };
+
+    let mut forged_heads = heads.clone();
+    forged_heads.insert(RefName::new("refs/heads/main").unwrap(), RefHead::from_committed(&v_sec).unwrap());
+    let forged_cut = StrongSnapshotCut { heads: forged_heads, ..cut.clone() };
+    let mut forged_req = inc_req.clone();
+    forged_req.strong_cut = Some(forged_cut.clone());
+    assert!(matches!(
+        plan_fetch_covers(&forged_req, &graph, &index, &active_ret),
+        Err(FetchPlanError::InvalidPlanInput(_))
+    ));
+    assert!(matches!(
+        verify_fetch_plan_closure(
+            &valid_plan,
+            ReadConsumer::SmartHttpFetch,
+            &restricted_auth,
+            Some(&forged_cut),
+            &graph,
+            &index,
+            &active_ret
+        ),
+        Err(PlanVerifyError::Plan(FetchPlanError::InvalidPlanInput(_)))
+    ));
+
+    let mut wrong_realm_heads = heads.clone();
+    let other_r = realm(GitObjectFormat::Sha1);
+    let (v_other, _) = mint_version(&other_r, "refs/heads/main", 1, None, oid(GitObjectFormat::Sha1, 1), p1, vec![]);
+    wrong_realm_heads.insert(RefName::new("refs/heads/main").unwrap(), RefHead::from_committed(&v_other).unwrap());
+    let wrong_realm_cut = StrongSnapshotCut { heads: wrong_realm_heads, ..cut.clone() };
+    let mut wrong_realm_req = inc_req.clone();
+    wrong_realm_req.strong_cut = Some(wrong_realm_cut.clone());
+    assert_eq!(plan_fetch_covers(&wrong_realm_req, &graph, &index, &active_ret), Err(FetchPlanError::RealmMismatch));
+    assert_eq!(
+        verify_fetch_plan_closure(
+            &valid_plan,
+            ReadConsumer::SmartHttpFetch,
+            &restricted_auth,
+            Some(&wrong_realm_cut),
+            &graph,
+            &index,
+            &active_ret
+        ),
+        Err(PlanVerifyError::Plan(FetchPlanError::RealmMismatch))
+    );
+
+    let stale_seq_cut = StrongSnapshotCut { authority_seq: 1, ..cut.clone() };
+    let mut stale_seq_req = inc_req.clone();
+    stale_seq_req.strong_cut = Some(stale_seq_cut.clone());
+    assert!(matches!(
+        plan_fetch_covers(&stale_seq_req, &graph, &index, &active_ret),
+        Err(FetchPlanError::InvalidPlanInput(_))
+    ));
+    assert!(matches!(
+        verify_fetch_plan_closure(
+            &valid_plan,
+            ReadConsumer::SmartHttpFetch,
+            &restricted_auth,
+            Some(&stale_seq_cut),
+            &graph,
+            &index,
+            &active_ret
+        ),
+        Err(PlanVerifyError::SelectedPackMetadataMismatch)
+            | Err(PlanVerifyError::Plan(FetchPlanError::InvalidPlanInput(_)))
+    ));
+}
+
+#[test]
+fn planner_rejects_aggregate_scoring_work_budget_exhaustion() {
+    let r = realm(GitObjectFormat::Sha1);
+    let tip_oid = oid(GitObjectFormat::Sha1, 1);
+    let (p_base, _) = make_pack(&r, 255, 1024, 100, false, vec![]);
+    let (v1, p1_c) = mint_version(&r, "refs/heads/main", 1, None, tip_oid, p_base, vec![]);
+    let mut graph = VersionGraph::new();
+    graph.insert_active(CausalVersionNode { record: v1.clone(), own_packs: vec![p1_c.clone()] });
+
+    let mut links = Vec::with_capacity(250);
+    let mk_oid = |idx: usize| -> GitOid {
+        if idx == 249 {
+            return tip_oid;
+        }
+        let mut raw = [0_u8; 20];
+        raw[..8].copy_from_slice(&(idx as u64 + 1).to_be_bytes());
+        raw[19] = 2;
+        GitOid::from_bytes(GitObjectFormat::Sha1, &raw).unwrap()
+    };
+    for i in 0..250_usize {
+        let parent_oids = if i > 0 { vec![mk_oid(i - 1)] } else { vec![] };
+        links.push(CoverCommitLink {
+            commit_oid: mk_oid(i),
+            parent_oids,
+            version_id: v1.version_id(),
+            authority_seq: 1,
+        });
+    }
+    let mut entries = Vec::new();
+    let mut mem = compute_cover_membership_digest(&r, 1, &[]).unwrap();
+    let mut index = CoverHierarchyIndex::new(r, mem).unwrap();
+    let mut ret = RetentionClassificationIndex::new();
+    let mut hold_ids = Vec::new();
+    for (k, link) in links.iter().enumerate() {
+        let (pk, art) = make_pack(&r, (k % 250) as u8, 2000 + k as u64, 100, false, vec![]);
+        entries.push(*pk.entry());
+        mem = compute_cover_membership_digest(&r, index.membership_generation() + 1, &entries).unwrap();
+        let cov = CoverHierarchyRecord::seal(CoverHierarchyRecordInput {
+            cover_id: Uuid::from_u128(10_000 + k as u128),
+            realm: r,
+            tier: CoverTier::Delta,
+            pack: pk,
+            artifacts: art,
+            covered_versions: vec![v1.version_id()],
+            min_authority_seq: 1,
+            max_authority_seq: 1,
+            covered_commits: vec![link.clone()],
+            input_cover_ids: vec![],
+            membership_generation: index.membership_generation() + 1,
+            membership_digest: mem,
+            compaction_epoch: 1,
+            worker_id: uid(701),
+            operation_id: Uuid::from_u128(20_000 + k as u128),
+        })
+        .unwrap();
+        hold_ids.push(cov.cover_id());
+        index.register_leaf_cover(cov, mem).unwrap();
+    }
+    ret.add_hold(CoverRetentionHold::ActiveRefHead {
+        ref_name: RefName::new("refs/heads/main").unwrap(),
+        version_id: v1.version_id(),
+        cover_ids: hold_ids,
+    });
+    let mut heads = BTreeMap::new();
+    heads.insert(RefName::new("refs/heads/main").unwrap(), RefHead::from_committed(&v1).unwrap());
+    let cut = StrongSnapshotCut {
+        authority_seq: 1,
+        snapshot_digest: RequestDigest::of("budget", &[b"cut"]),
+        membership_digest: index.membership_digest(),
+        heads,
+    };
+    let req = FetchPlanRequest {
+        consumer: ReadConsumer::SmartHttpFetch,
+        realm: r,
+        auth: default_auth(&r),
+        isolation: ReadIsolationMode::StrongSnapshot,
+        strong_cut: Some(cut),
+        wants: vec![WantTarget::Ref { ref_name: RefName::new("refs/heads/main").unwrap() }],
+        haves: HaveSpec::default(),
+        allow_strong_fallback: false,
+        prefer_compacted_above_delta_count: DEFAULT_COMPACTED_THRESHOLD,
+    };
+    assert_eq!(plan_fetch_covers(&req, &graph, &index, &ret), Err(FetchPlanError::ClosureBoundsExceeded));
 }
 
 fn c1_for_tamper_test(r: &RefVersionRealm, p: &VerifiedClosurePack, v: &VersionRecord) -> CoverHierarchyRecord {

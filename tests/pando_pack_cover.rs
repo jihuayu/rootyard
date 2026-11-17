@@ -353,7 +353,7 @@ impl Env {
         let (c, a, sc, g, x, rt) = (r.consumer, &r.auth, r.strong_cut.as_ref(), &self.graph, &self.index, &self.ret);
         let proof = verify_fetch_plan_closure(p, c, a, sc, g, x, rt)?;
         let dl = Instant::now() + Duration::from_secs(60);
-        let mat = materialize_and_verify_fetch_plan(&self.store, &self.views, &proof, p, x, s, refs, dl).await?;
+        let mat = materialize_and_verify_fetch_plan(&self.store, &self.views, &proof, p, a, x, s, refs, dl).await?;
         ensure!(mat.reachable_object_count > 0);
         for (rf, o) in refs {
             ensure!(git_str(mat.repo_path()?, &["rev-parse", rf.as_str()], None)? == o.as_hex());

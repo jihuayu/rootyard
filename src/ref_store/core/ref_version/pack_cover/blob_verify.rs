@@ -5,6 +5,7 @@
 //! [`DisposableViewRoot`] workspace, verifies backend identity, byte length,
 //! SHA-256 read-back, thin-pack delta-base resolution (`git index-pack --fix-thin`),
 //! and complete Git object closure (`git fsck --full --strict` + `git rev-list`).
+use super::auth::{AuthorizationContext, FetchPlanError, ReadIsolationMode};
 use super::model::{CoverArtifactPair, CoverHierarchyIndex};
 use super::planner::FetchPlan;
 use super::verifier::VerifiedFetchPlanProof;
@@ -18,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -32,6 +34,7 @@ const NULL_GIT_CONFIG: &str = "NUL";
 #[derive(Debug)]
 pub enum BlobVerifyError {
     ProofMismatch,
+    Plan(FetchPlanError),
     CoverMissing(&'static str),
     BackendIdentityMismatch,
     Blob(BlobError),
@@ -46,6 +49,7 @@ impl fmt::Display for BlobVerifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ProofMismatch => f.write_str("fetch plan does not bind the supplied closure proof"),
+            Self::Plan(err) => write!(f, "live authorization rejected fetch materialization: {err}"),
             Self::CoverMissing(msg) => write!(f, "planned cover missing: {msg}"),
             Self::BackendIdentityMismatch => f.write_str("cover pack backend identity mismatches opened BlobStore"),
             Self::Blob(err) => write!(f, "blob verification error: {err}"),
@@ -74,7 +78,7 @@ impl From<DisposableViewError> for BlobVerifyError {
 
 /// Verified temporary Git repository materialized solely from planned Blob packs.
 pub struct MaterializedFetchVerification {
-    lease: TempViewLease,
+    lease: Arc<TempViewLease>,
     repo_path: PathBuf,
     pub blob_get_count: u64,
     pub blob_get_bytes: u64,
@@ -89,24 +93,38 @@ impl MaterializedFetchVerification {
     }
 
     pub fn reap(self) {
-        self.lease.reap();
+        drop(self.lease);
     }
 }
 
 /// Download verified packs from `store` into an isolated `0o700` view under `view_root`
-/// and prove full Git pack/delta/object/fsck closure via stock `git`.
+/// and prove full Git pack/delta/object/fsck closure via stock `git`, re-checking live
+/// authorization and retaining `TempViewLease` ownership across detached transfers.
 pub async fn materialize_and_verify_fetch_plan(
     store: &BlobStore,
     view_root: &DisposableViewRoot,
     proof: &VerifiedFetchPlanProof,
     plan: &FetchPlan,
+    live_auth: &AuthorizationContext,
     cover_index: &CoverHierarchyIndex,
     client_seed_packs: &[CoverArtifactPair],
     expected_refs: &[(RefName, GitOid)],
     deadline: Instant,
 ) -> Result<MaterializedFetchVerification, BlobVerifyError> {
-    if !proof.binds(plan) {
+    live_auth.validate(&plan.realm).map_err(BlobVerifyError::Plan)?;
+    if !proof.binds(plan) || !proof.binds_live_auth(live_auth) {
         return Err(BlobVerifyError::ProofMismatch);
+    }
+    for want in &plan.wants {
+        if !live_auth.can_see_ref(want.ref_name()) {
+            return Err(BlobVerifyError::Plan(FetchPlanError::HiddenRefDenied));
+        }
+    }
+    if plan.isolation.is_historical_pinned() && !live_auth.allow_historical_pins {
+        return Err(BlobVerifyError::Plan(FetchPlanError::AuthDenied("historical pin reads not permitted")));
+    }
+    if matches!(plan.isolation, ReadIsolationMode::VersionSet { .. }) && !live_auth.allow_non_common_time_set {
+        return Err(BlobVerifyError::Plan(FetchPlanError::NonCommonTimeDenied));
     }
     let expected_provider = store.provider().as_str();
     let expected_backend = store.backend_identity().as_hex();
@@ -115,13 +133,13 @@ pub async fn materialize_and_verify_fetch_plan(
     for seed in client_seed_packs {
         reserved = reserved.saturating_add(seed.pack_locator.length()).saturating_add(seed.idx_locator.length());
     }
-    let lease = view_root.create_view(
+    let lease = Arc::new(view_root.create_view(
         "pack-cover-vrf",
         plan.realm.tenant_id(),
         plan.realm.repository_id(),
         reserved.saturating_mul(2).max(8 * 1024 * 1024),
         None,
-    )?;
+    )?);
     let repo_path = lease.repo_path()?.to_path_buf();
     let fmt_flag = match plan.realm.object_format() {
         GitObjectFormat::Sha1 => "--object-format=sha1",
@@ -178,7 +196,7 @@ pub async fn materialize_and_verify_fetch_plan(
 
 async fn download_and_install_pair(
     store: &BlobStore,
-    lease: &TempViewLease,
+    lease: &Arc<TempViewLease>,
     repo_path: &Path,
     pair: &CoverArtifactPair,
     deadline: Instant,
@@ -187,8 +205,8 @@ async fn download_and_install_pair(
         let dir = lease.dir_path()?;
         let pack_stage = dir.join(format!("{}.thin.pack", pair.pack_stem));
         let idx_stage = dir.join(format!("{}.thin.idx", pair.pack_stem));
-        fetch_verified(store, &pair.pack_locator, &pack_stage, deadline).await?;
-        fetch_verified(store, &pair.idx_locator, &idx_stage, deadline).await?;
+        fetch_verified(store, &pair.pack_locator, &pack_stage, deadline, Arc::clone(lease)).await?;
+        fetch_verified(store, &pair.idx_locator, &idx_stage, deadline, Arc::clone(lease)).await?;
         let pack_bytes = tokio::fs::read(&pack_stage).await.map_err(|e| BlobVerifyError::Io(e.to_string()))?;
         if !pack_bytes.starts_with(b"PACK") {
             return Err(BlobVerifyError::IntegrityFailed("missing PACK header on thin pack"));
@@ -201,8 +219,8 @@ async fn download_and_install_pair(
         let idx_rel = Path::new("objects/pack").join(format!("{}.idx", pair.pack_stem));
         let pack_dst = lease.resolve_repo_relative_path(&pack_rel)?;
         let idx_dst = lease.resolve_repo_relative_path(&idx_rel)?;
-        fetch_verified(store, &pair.pack_locator, &pack_dst, deadline).await?;
-        fetch_verified(store, &pair.idx_locator, &idx_dst, deadline).await?;
+        fetch_verified(store, &pair.pack_locator, &pack_dst, deadline, Arc::clone(lease)).await?;
+        fetch_verified(store, &pair.idx_locator, &idx_dst, deadline, Arc::clone(lease)).await?;
         let idx_arg = format!("objects/pack/{}.idx", pair.pack_stem);
         run_git(repo_path, &["verify-pack", "-v", &idx_arg], None, deadline).await?;
     }
@@ -214,11 +232,12 @@ async fn fetch_verified(
     locator: &BlobLocator,
     dst: &Path,
     deadline: Instant,
+    lease_owner: Arc<TempViewLease>,
 ) -> Result<(), BlobVerifyError> {
     if Instant::now() >= deadline {
         return Err(BlobVerifyError::DeadlineExceeded);
     }
-    store.get_to_file(locator, dst, deadline).await?;
+    store.get_to_file_with_owner(locator, dst, deadline, lease_owner).await?;
     let (actual_sha, actual_len) = hash_file_sha256(dst).await?;
     if actual_len != locator.length() || actual_sha != locator.sha256() {
         return Err(BlobVerifyError::IntegrityFailed("downloaded artifact SHA-256 or length mismatch"));

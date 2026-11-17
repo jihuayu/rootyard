@@ -12,8 +12,9 @@ use super::super::limits::{
 };
 use super::super::read_mode::ReadConsumer;
 use super::auth::{
-    AuthorizationContext, FetchPlanError, StrongSnapshotCut, collect_authorized_commit_scope,
-    cover_exposes_unauthorized_commits, map_closure_err, validate_isolation_policy,
+    AuthorizationContext, FetchPlanError, MAX_PLANNER_INDEXED_COVERS, MAX_PLANNER_INDEXED_LINKS, StrongSnapshotCut,
+    collect_authorized_commit_scope, cover_exposes_unauthorized_commits, map_closure_err, validate_isolation_policy,
+    validate_strong_cut,
 };
 use super::model::{CoverCommitLink, CoverHierarchyIndex, CoverHierarchyRecord};
 use super::planner::{FetchPlan, FetchPlanDigest, WantTarget, collect_ancestors, compute_fetch_plan_digest};
@@ -34,6 +35,9 @@ pub struct VerifiedFetchPlanProof {
     proof_digest: [u8; 32],
     plan_digest: FetchPlanDigest,
     realm: RefVersionRealm,
+    actor_id: Uuid,
+    token_id: Uuid,
+    auth_epoch: u64,
     authority_seq: i64,
     common_time: bool,
     selected_cover_ids: Vec<Uuid>,
@@ -52,6 +56,15 @@ impl VerifiedFetchPlanProof {
     pub const fn realm(&self) -> &RefVersionRealm {
         &self.realm
     }
+    pub const fn actor_id(&self) -> Uuid {
+        self.actor_id
+    }
+    pub const fn token_id(&self) -> Uuid {
+        self.token_id
+    }
+    pub const fn auth_epoch(&self) -> u64 {
+        self.auth_epoch
+    }
     pub const fn authority_seq(&self) -> i64 {
         self.authority_seq
     }
@@ -69,6 +82,18 @@ impl VerifiedFetchPlanProof {
     }
     pub const fn total_verified_bytes(&self) -> u64 {
         self.total_verified_bytes
+    }
+
+    pub fn binds_live_auth(&self, auth: &AuthorizationContext) -> bool {
+        !auth.revoked
+            && auth.auth_epoch >= auth.min_valid_auth_epoch
+            && auth.auth_epoch > 0
+            && auth.tenant_id == self.realm.tenant_id()
+            && auth.repository_id == self.realm.repository_id()
+            && auth.history_incarnation == self.realm.history_incarnation()
+            && auth.actor_id == self.actor_id
+            && auth.token_id == self.token_id
+            && auth.auth_epoch == self.auth_epoch
     }
 
     pub fn binds(&self, plan: &FetchPlan) -> bool {
@@ -152,10 +177,11 @@ pub fn verify_fetch_plan_closure(
     if plan.wants.is_empty() {
         return Err(FetchPlanError::NoWantsRequested.into());
     }
-    if let Some(cut) = strong_cut
-        && cut.membership_digest != cover_index.membership_digest()
-    {
-        return Err(FetchPlanError::MembershipDrifted.into());
+    if let Some(cut) = strong_cut {
+        validate_strong_cut(cut, &plan.realm, cover_index.membership_digest())?;
+        if plan.authority_seq != cut.authority_seq {
+            return Err(PlanVerifyError::SelectedPackMetadataMismatch);
+        }
     }
 
     let expected_want_commits = verify_wants_and_cut(plan, strong_cut, auth, version_lookup)?;
@@ -166,8 +192,16 @@ pub fn verify_fetch_plan_closure(
     let authorized_commits =
         collect_authorized_commit_scope(auth, &plan.realm, &expected_want_commits, strong_cut, cover_index)?;
 
+    if cover_index.cover_count() > MAX_PLANNER_INDEXED_COVERS {
+        return Err(FetchPlanError::ClosureBoundsExceeded.into());
+    }
     let mut all_links = HashMap::new();
+    let mut indexed_links = 0_usize;
     for rec in cover_index.all_covers() {
+        indexed_links = indexed_links.saturating_add(rec.covered_commits().len());
+        if indexed_links > MAX_PLANNER_INDEXED_LINKS {
+            return Err(FetchPlanError::ClosureBoundsExceeded.into());
+        }
         for link in rec.covered_commits() {
             all_links.entry(link.commit_oid).or_insert_with(|| link.clone());
         }
@@ -184,7 +218,7 @@ pub fn verify_fetch_plan_closure(
 
     verify_commit_dag_closure(&expected_want_commits, &have_ancestors, &selected_records)?;
 
-    let proof_digest = compute_proof_digest(plan)?;
+    let proof_digest = compute_proof_digest(plan, auth)?;
     let selected_cover_ids = plan.selected_covers.iter().map(|c| c.cover_id).collect();
     let selected_pack_ids = plan.selected_covers.iter().map(|c| c.pack_id).collect();
 
@@ -192,6 +226,9 @@ pub fn verify_fetch_plan_closure(
         proof_digest,
         plan_digest: plan.plan_digest,
         realm: plan.realm,
+        actor_id: auth.actor_id,
+        token_id: auth.token_id,
+        auth_epoch: auth.auth_epoch,
         authority_seq: plan.authority_seq,
         common_time: plan.common_time,
         selected_cover_ids,
@@ -212,25 +249,35 @@ fn verify_wants_and_cut(
         if !auth.can_see_ref(want.ref_name()) {
             return Err(FetchPlanError::HiddenRefDenied.into());
         }
-        let version_id = match want {
+        let (version_id, expected_ref, expected_oid) = match want {
             WantTarget::Ref { ref_name } => {
                 let cut = strong_cut.ok_or(FetchPlanError::StrongCutRequired)?;
                 let head = cut.heads.get(ref_name).ok_or(FetchPlanError::VersionNotFound)?;
-                if head.is_tombstone() {
-                    return Err(FetchPlanError::TargetDeleted.into());
+                if head.realm() != &plan.realm {
+                    return Err(FetchPlanError::RealmMismatch.into());
                 }
-                head.version_id()
-            }
-            WantTarget::PinnedVersion { ref_name, version_id } => {
-                let closure =
-                    verify_dependency_closure(version_lookup, &plan.realm, version_id).map_err(map_closure_err)?;
-                if closure.root().ref_name() != ref_name {
-                    return Err(FetchPlanError::InvalidPlanInput("pinned ref mismatch").into());
+                if head.ref_name() != ref_name {
+                    return Err(FetchPlanError::InvalidPlanInput("snapshot head key mismatch").into());
                 }
-                *version_id
+                let oid = head.target().ok_or(FetchPlanError::TargetDeleted)?;
+                (head.version_id(), ref_name, Some(oid))
             }
+            WantTarget::PinnedVersion { ref_name, version_id } => (*version_id, ref_name, None),
         };
         let closure = verify_dependency_closure(version_lookup, &plan.realm, &version_id).map_err(map_closure_err)?;
+        if closure.root().ref_name() != expected_ref {
+            return Err(FetchPlanError::InvalidPlanInput("version ref_name mismatch").into());
+        }
+        if let Some(cut) = strong_cut
+            && closure.root().authority_seq() > cut.authority_seq
+        {
+            return Err(FetchPlanError::InvalidPlanInput("resolved version exceeds snapshot cut authority_seq").into());
+        }
+        if let Some(exp) = expected_oid
+            && closure.root().target() != &RefTarget::Oid(exp)
+        {
+            return Err(FetchPlanError::InvalidPlanInput("snapshot head target mismatch").into());
+        }
         let oid = match closure.root().target() {
             RefTarget::Oid(oid) => *oid,
             RefTarget::Delete => return Err(FetchPlanError::TargetDeleted.into()),
@@ -360,11 +407,14 @@ fn verify_commit_dag_closure(
     Ok(())
 }
 
-fn compute_proof_digest(plan: &FetchPlan) -> Result<[u8; 32], PlanVerifyError> {
+fn compute_proof_digest(plan: &FetchPlan, auth: &AuthorizationContext) -> Result<[u8; 32], PlanVerifyError> {
     let mut w = CanonicalWriter::new();
     w.push_len_prefixed(PLAN_PROOF_DOMAIN).map_err(|_| PlanVerifyError::PlanDigestMismatch)?;
     w.push_len_prefixed(plan.plan_digest.as_bytes()).map_err(|_| PlanVerifyError::PlanDigestMismatch)?;
     w.push_u64(positive_u64(plan.authority_seq, "authority_seq").map_err(|_| PlanVerifyError::PlanDigestMismatch)?);
+    w.push_len_prefixed(auth.actor_id.as_bytes()).map_err(|_| PlanVerifyError::PlanDigestMismatch)?;
+    w.push_len_prefixed(auth.token_id.as_bytes()).map_err(|_| PlanVerifyError::PlanDigestMismatch)?;
+    w.push_u64(auth.auth_epoch);
     w.push_u32(
         count_u32(plan.selected_covers.len(), "selected_covers").map_err(|_| PlanVerifyError::PlanDigestMismatch)?,
     );

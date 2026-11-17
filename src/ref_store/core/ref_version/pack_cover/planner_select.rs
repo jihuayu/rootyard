@@ -2,7 +2,7 @@
 use super::super::limits::{MAX_CLOSURE_ARTIFACTS, MAX_CLOSURE_PACKS, MAX_CLOSURE_VERIFIED_BYTES};
 use super::super::read_mode::StrongSnapshotState;
 use super::auth::{
-    FallbackReason, FetchPlanError, StrongSnapshotFallback, advertise_authorized_refs,
+    FallbackReason, FetchPlanError, MAX_PLANNER_SCORING_STEPS, StrongSnapshotFallback, advertise_authorized_refs,
     cover_exposes_unauthorized_commits,
 };
 use super::model::{CoverHierarchyIndex, CoverHierarchyRecord};
@@ -94,8 +94,13 @@ pub(super) fn select_covers(ctx: &CoverSelectionCtx<'_>) -> Result<SelectionResu
     let mut obs = RejectionObservations::default();
     let mut candidates = Vec::new();
     let is_historical = ctx.req.isolation.is_historical_pinned();
+    let mut work_steps = 0_usize;
 
     for cover in ctx.cover_index.all_covers() {
+        work_steps = work_steps.saturating_add(1 + cover.covered_commits().len());
+        if work_steps > MAX_PLANNER_SCORING_STEPS {
+            return Err((FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded));
+        }
         let covered_needed: HashSet<GitOid> =
             cover.covered_commits().iter().map(|c| c.commit_oid).filter(|oid| ctx.needed_set.contains(oid)).collect();
         if covered_needed.is_empty() {
@@ -136,11 +141,12 @@ pub(super) fn select_covers(ctx: &CoverSelectionCtx<'_>) -> Result<SelectionResu
     } else {
         SMALL_FETCH_PACK_OVERHEAD_BYTES
     };
-    let mut picked = run_greedy(&candidates, ctx, Strategy::CostAware { pack_overhead_bytes: overhead })
-        .ok_or_else(|| obs.into_error())?;
+    let mut picked =
+        run_greedy(&candidates, ctx, Strategy::CostAware { pack_overhead_bytes: overhead }, &mut work_steps)?
+            .ok_or_else(|| obs.into_error())?;
 
     if picked.selected.len() > MAX_CLOSURE_PACKS {
-        let compact = run_greedy(&candidates, ctx, Strategy::MinPackCount)
+        let compact = run_greedy(&candidates, ctx, Strategy::MinPackCount, &mut work_steps)?
             .ok_or((FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded))?;
         picked = compact;
     }
@@ -202,7 +208,8 @@ fn run_greedy(
     candidates: &[CandidateCover<'_>],
     ctx: &CoverSelectionCtx<'_>,
     strategy: Strategy,
-) -> Option<SelectionResult> {
+    work_steps: &mut usize,
+) -> Result<Option<SelectionResult>, (FallbackReason, FetchPlanError)> {
     let mut uncovered = ctx.needed_set.clone();
     let mut chosen_ids: BTreeSet<Uuid> = BTreeSet::new();
     let mut client_bases: BTreeSet<Uuid> = BTreeSet::new();
@@ -212,8 +219,16 @@ fn run_greedy(
         let mut best_key: (u128, u64, u8, Uuid) = (u128::MAX, u64::MAX, u8::MAX, Uuid::nil());
 
         for (idx, cand) in candidates.iter().enumerate() {
+            *work_steps = work_steps.saturating_add(1);
+            if *work_steps > MAX_PLANNER_SCORING_STEPS {
+                return Err((FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded));
+            }
             if chosen_ids.contains(&cand.record.cover_id()) {
                 continue;
+            }
+            *work_steps = work_steps.saturating_add(cand.covered_needed.len());
+            if *work_steps > MAX_PLANNER_SCORING_STEPS {
+                return Err((FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded));
             }
             let gain = cand.covered_needed.iter().filter(|oid| uncovered.contains(oid)).count() as u64;
             if gain == 0 {
@@ -237,7 +252,9 @@ fn run_greedy(
             }
         }
 
-        let idx = best_idx?;
+        let Some(idx) = best_idx else {
+            return Ok(None);
+        };
         let chosen = &candidates[idx];
         chosen_ids.insert(chosen.record.cover_id());
         for base_id in &chosen.required_bases {
@@ -257,7 +274,9 @@ fn run_greedy(
         }
     }
 
-    let ordered = topo_order_covers(&chosen_ids, ctx.cover_index)?;
+    let Some(ordered) = topo_order_covers(&chosen_ids, ctx.cover_index) else {
+        return Ok(None);
+    };
     let selected = ordered
         .into_iter()
         .map(|rec| PlannedCoverEntry {
@@ -270,7 +289,7 @@ fn run_greedy(
         })
         .collect();
 
-    Some(SelectionResult { selected, external_client_bases: client_bases.into_iter().collect() })
+    Ok(Some(SelectionResult { selected, external_client_bases: client_bases.into_iter().collect() }))
 }
 
 fn effective_bytes(cand: &CandidateCover<'_>, chosen_ids: &BTreeSet<Uuid>, cover_index: &CoverHierarchyIndex) -> u64 {

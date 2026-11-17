@@ -10,8 +10,9 @@ use super::super::digest::{CanonicalWriter, push_oid, validate_realm};
 use super::super::limits::{count_u32, positive_u64};
 use super::super::read_mode::ReadConsumer;
 use super::auth::{
-    AuthorizationContext, FallbackReason, FetchPlanError, ReadIsolationMode, StrongSnapshotCut, StrongSnapshotFallback,
-    collect_authorized_commit_scope, map_closure_err, validate_isolation_policy,
+    AuthorizationContext, FallbackReason, FetchPlanError, MAX_PLANNER_INDEXED_COVERS, MAX_PLANNER_INDEXED_LINKS,
+    ReadIsolationMode, StrongSnapshotCut, StrongSnapshotFallback, collect_authorized_commit_scope, map_closure_err,
+    validate_isolation_policy, validate_strong_cut,
 };
 use super::model::{CoverCommitLink, CoverHierarchyIndex, CoverTier, oid_bytes};
 use super::planner_select::{CoverSelectionCtx, SelectionResult, fallback_or_err, select_covers};
@@ -155,16 +156,37 @@ pub fn plan_fetch_covers(
     validate_isolation_policy(req.consumer, &req.auth, &req.isolation, req.strong_cut.as_ref())?;
     let mut metadata_reads = 0_u64;
 
-    if let Some(cut) = &req.strong_cut
-        && cut.membership_digest != cover_index.membership_digest()
-    {
-        return fallback_or_err(req, FallbackReason::MembershipDrifted, FetchPlanError::MembershipDrifted);
+    if let Some(cut) = &req.strong_cut {
+        match validate_strong_cut(cut, &req.realm, cover_index.membership_digest()) {
+            Ok(()) => {}
+            Err(FetchPlanError::MembershipDrifted) => {
+                return fallback_or_err(req, FallbackReason::MembershipDrifted, FetchPlanError::MembershipDrifted);
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     let (want_commits, authority_seq) = resolve_wants(req, version_lookup, &mut metadata_reads)?;
-    let (commit_links, commit_to_covers, digest_ok) = index_commits_and_covers(cover_index, &mut metadata_reads)?;
-    let authorized_commits =
-        collect_authorized_commit_scope(&req.auth, &req.realm, &want_commits, req.strong_cut.as_ref(), cover_index)?;
+    let (commit_links, commit_to_covers, digest_ok) = match index_commits_and_covers(cover_index, &mut metadata_reads) {
+        Ok(indexed) => indexed,
+        Err(FetchPlanError::ClosureBoundsExceeded) => {
+            return fallback_or_err(req, FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded);
+        }
+        Err(err) => return Err(err),
+    };
+    let authorized_commits = match collect_authorized_commit_scope(
+        &req.auth,
+        &req.realm,
+        &want_commits,
+        req.strong_cut.as_ref(),
+        cover_index,
+    ) {
+        Ok(scope) => scope,
+        Err(FetchPlanError::ClosureBoundsExceeded) => {
+            return fallback_or_err(req, FallbackReason::ClosureBoundsExceeded, FetchPlanError::ClosureBoundsExceeded);
+        }
+        Err(err) => return Err(err),
+    };
 
     let verified_have_commits =
         resolve_verified_haves(req, version_lookup, &authorized_commits, &commit_to_covers, &mut metadata_reads)?;
@@ -284,28 +306,40 @@ fn resolve_wants(
         if !req.auth.can_see_ref(want.ref_name()) {
             return Err(FetchPlanError::HiddenRefDenied);
         }
-        let (version_id, expected_ref) = match want {
+        let (version_id, expected_ref, expected_oid) = match want {
             WantTarget::Ref { ref_name } => {
                 let cut = req.strong_cut.as_ref().ok_or(FetchPlanError::StrongCutRequired)?;
                 let head = cut.heads.get(ref_name).ok_or(FetchPlanError::VersionNotFound)?;
-                if head.is_tombstone() {
-                    return Err(FetchPlanError::TargetDeleted);
+                if head.realm() != &req.realm {
+                    return Err(FetchPlanError::RealmMismatch);
                 }
-                (head.version_id(), None)
+                if head.ref_name() != ref_name {
+                    return Err(FetchPlanError::InvalidPlanInput("snapshot head key does not match RefHead ref_name"));
+                }
+                let oid = head.target().ok_or(FetchPlanError::TargetDeleted)?;
+                (head.version_id(), ref_name, Some(oid))
             }
             WantTarget::PinnedVersion { ref_name, version_id } => {
                 if !req.auth.allow_historical_pins && req.isolation.is_historical_pinned() {
                     return Err(FetchPlanError::AuthDenied("historical pin reads not permitted"));
                 }
-                (*version_id, Some(ref_name))
+                (*version_id, ref_name, None)
             }
         };
         let closure = verify_dependency_closure(version_lookup, &req.realm, &version_id).map_err(map_closure_err)?;
         *metadata_reads = metadata_reads.saturating_add(1 + closure.dependencies().len() as u64);
-        if let Some(ref_name) = expected_ref
-            && closure.root().ref_name() != ref_name
+        if closure.root().ref_name() != expected_ref {
+            return Err(FetchPlanError::InvalidPlanInput("version ref_name mismatch"));
+        }
+        if let Some(cut) = &req.strong_cut
+            && closure.root().authority_seq() > cut.authority_seq
         {
-            return Err(FetchPlanError::InvalidPlanInput("pinned version ref_name mismatch"));
+            return Err(FetchPlanError::InvalidPlanInput("resolved version exceeds snapshot cut authority_seq"));
+        }
+        if let Some(exp) = expected_oid
+            && closure.root().target() != &RefTarget::Oid(exp)
+        {
+            return Err(FetchPlanError::InvalidPlanInput("snapshot head target mismatches version record"));
         }
         let seq = closure.root().authority_seq();
         if !req.isolation.is_historical_pinned()
@@ -334,10 +368,18 @@ fn index_commits_and_covers(
     cover_index: &CoverHierarchyIndex,
     metadata_reads: &mut u64,
 ) -> Result<(HashMap<GitOid, CoverCommitLink>, HashMap<GitOid, Vec<Uuid>>, BTreeMap<Uuid, bool>), FetchPlanError> {
+    if cover_index.cover_count() > MAX_PLANNER_INDEXED_COVERS {
+        return Err(FetchPlanError::ClosureBoundsExceeded);
+    }
     let mut links = HashMap::new();
     let mut commit_to_covers: HashMap<GitOid, Vec<Uuid>> = HashMap::new();
     let mut digest_ok = BTreeMap::new();
+    let mut link_count = 0_usize;
     for cover in cover_index.all_covers() {
+        link_count = link_count.saturating_add(cover.covered_commits().len());
+        if link_count > MAX_PLANNER_INDEXED_LINKS {
+            return Err(FetchPlanError::ClosureBoundsExceeded);
+        }
         *metadata_reads = metadata_reads.saturating_add(1);
         let valid = cover.verify_digest().is_ok();
         digest_ok.insert(cover.cover_id(), valid);

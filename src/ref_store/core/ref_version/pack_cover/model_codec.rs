@@ -269,6 +269,9 @@ fn validate_versions_and_commits(input: &mut CoverHierarchyRecordInput) -> Resul
     for link in &mut input.covered_commits {
         ensure_present_oid(input.realm.object_format(), link.commit_oid, "commit_oid")?;
         positive_u64(link.authority_seq, "commit_authority_seq")?;
+        if input.covered_versions.binary_search(&link.version_id).is_err() {
+            return Err(CoverModelError::InvalidShape("commit version_id missing from covered_versions"));
+        }
         if link.authority_seq < input.min_authority_seq || link.authority_seq > input.max_authority_seq {
             return Err(CoverModelError::InvalidShape("commit authority_seq outside cover range"));
         }

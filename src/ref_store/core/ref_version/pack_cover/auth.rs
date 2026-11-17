@@ -299,6 +299,36 @@ pub(super) fn validate_isolation_policy(
 
 /// Build the exact set of commits reachable from visible authorized tips so hidden-ref
 /// probing and shared-pack cross-ref leakage fail closed.
+pub(super) const MAX_PLANNER_INDEXED_COVERS: usize = 4_096;
+pub(super) const MAX_PLANNER_INDEXED_LINKS: usize = 65_536;
+pub(super) const MAX_PLANNER_SCORING_STEPS: usize = 65_536;
+
+/// Fail-closed validation of `StrongSnapshotCut` keys, realm, sequence, and membership.
+pub(super) fn validate_strong_cut(
+    cut: &StrongSnapshotCut,
+    realm: &RefVersionRealm,
+    expected_membership: CoverMembershipDigest,
+) -> Result<(), FetchPlanError> {
+    if cut.authority_seq <= 0 {
+        return Err(FetchPlanError::InvalidPlanInput("snapshot cut authority_seq must be positive"));
+    }
+    if cut.membership_digest != expected_membership {
+        return Err(FetchPlanError::MembershipDrifted);
+    }
+    for (key, head) in &cut.heads {
+        if head.realm() != realm {
+            return Err(FetchPlanError::RealmMismatch);
+        }
+        if key != head.ref_name() {
+            return Err(FetchPlanError::InvalidPlanInput("snapshot head key does not match RefHead ref_name"));
+        }
+        if head.ref_generation() == 0 {
+            return Err(FetchPlanError::InvalidPlanInput("snapshot head ref_generation must be positive"));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn collect_authorized_commit_scope(
     auth: &AuthorizationContext,
     realm: &RefVersionRealm,
@@ -306,10 +336,18 @@ pub(super) fn collect_authorized_commit_scope(
     strong_cut: Option<&StrongSnapshotCut>,
     cover_index: &CoverHierarchyIndex,
 ) -> Result<HashSet<GitOid>, FetchPlanError> {
+    if cover_index.cover_count() > MAX_PLANNER_INDEXED_COVERS {
+        return Err(FetchPlanError::ClosureBoundsExceeded);
+    }
     let mut parent_map: HashMap<GitOid, Vec<GitOid>> = HashMap::new();
+    let mut indexed_links = 0_usize;
     for cover in cover_index.all_covers() {
         if cover.realm() != realm {
             return Err(FetchPlanError::RealmMismatch);
+        }
+        indexed_links = indexed_links.saturating_add(cover.covered_commits().len());
+        if indexed_links > MAX_PLANNER_INDEXED_LINKS {
+            return Err(FetchPlanError::ClosureBoundsExceeded);
         }
         for link in cover.covered_commits() {
             parent_map.entry(link.commit_oid).or_insert_with(|| link.parent_oids.clone());
@@ -323,8 +361,17 @@ pub(super) fn collect_authorized_commit_scope(
         }
     }
     if let Some(cut) = strong_cut {
+        if cut.authority_seq <= 0 {
+            return Err(FetchPlanError::InvalidPlanInput("snapshot cut authority_seq must be positive"));
+        }
         for (name, head) in &cut.heads {
-            if auth.can_see_ref(name)
+            if head.realm() != realm {
+                return Err(FetchPlanError::RealmMismatch);
+            }
+            if name != head.ref_name() {
+                return Err(FetchPlanError::InvalidPlanInput("snapshot head key does not match RefHead ref_name"));
+            }
+            if auth.can_see_ref(head.ref_name())
                 && let Some(oid) = head.target()
                 && authorized.insert(oid)
             {
