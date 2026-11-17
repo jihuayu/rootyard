@@ -576,7 +576,7 @@ impl GitRepo {
         trace_enabled: bool,
     ) -> Result<Vec<u8>, historical_git_frame::HistoricalGitError> {
         let args = ["cat-file", "-p", spec];
-        let mut child = match self.command(&args, None).spawn() {
+        let child = match self.command(&args, None).spawn() {
             Ok(child) => child,
             Err(_) => {
                 return Err(historical_git_frame::HistoricalGitError::spawn_io().trace_if(trace_enabled));
