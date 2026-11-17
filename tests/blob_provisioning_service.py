@@ -179,7 +179,11 @@ class BackendIdentityConflictPhaseError(Exception):
         super().__init__(phase.value, exception_class)
 
     def __str__(self):
-        return "backend-identity-conflict phase=" + self.phase.value + " class=" + self.exception_class
+        diagnostic = self.diagnostic()
+        source_line = diagnostic.get("source_line", "unknown")
+        return ("backend-identity-conflict phase=" + diagnostic["phase"]
+                + " class=" + diagnostic["exception_class"]
+                + " source_line=" + str(source_line))
 
     def diagnostic(self):
         """Transient structured view; never contains the raw exception."""
@@ -188,8 +192,9 @@ class BackendIdentityConflictPhaseError(Exception):
             "phase": self.phase.value,
             "exception_class": self.exception_class,
         }
-        if self.source_line is not None:
-            diagnostic["source_line"] = self.source_line
+        source_line = _validated_phase_source_line(self.source_line)
+        if source_line is not None:
+            diagnostic["source_line"] = source_line
         return diagnostic
 
 
@@ -210,16 +215,32 @@ class _BackendIdentityConflictPhaseContext:
             self.phase, _closed_phase_exception_class(exc), self.source_line) from None
 
 
+def _source_line_is_phase_wrapper(source_line):
+    """Whether one line number is this exact file's phase-wrapper call."""
+    try:
+        path = Path(__file__).resolve()
+        line = linecache.getline(str(path), source_line)
+    except Exception:
+        return False
+    return "_backend_identity_conflict_phase(" in line
+
+
+def _validated_phase_source_line(source_line):
+    if not isinstance(source_line, int) or isinstance(source_line, bool) or source_line < 1:
+        return None
+    return source_line if _source_line_is_phase_wrapper(source_line) else None
+
+
 def _phase_source_line(frame):
     """Return this file's wrapper line, and only when it is actually there."""
     try:
         path = Path(frame.f_code.co_filename).resolve()
         if path != Path(__file__).resolve():
             return None
-        line = linecache.getline(str(path), frame.f_lineno)
+        source_line = frame.f_lineno
     except Exception:
         return None
-    return frame.f_lineno if "_backend_identity_conflict_phase(" in line else None
+    return _validated_phase_source_line(source_line)
 
 
 class AckLossProxy:

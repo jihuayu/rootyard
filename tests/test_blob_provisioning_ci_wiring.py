@@ -351,9 +351,10 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
                 self.assertEqual(error.exception_class, "AssertionError")
                 self.assertIsInstance(error.source_line, int)
                 self.assertIn("_backend_identity_conflict_phase(", source_lines[error.source_line - 1])
-                self.assertEqual(str(error), "backend-identity-conflict phase="
-                                 + phase.value + " class=AssertionError")
                 diagnostic = error.diagnostic()
+                self.assertEqual(str(error), "backend-identity-conflict phase="
+                                 + phase.value + " class=AssertionError source_line="
+                                 + str(diagnostic["source_line"]))
                 self.assertEqual(diagnostic["phase"], phase.value)
                 self.assertEqual(diagnostic["exception_class"], "AssertionError")
                 self.assertEqual(diagnostic["source_line"], error.source_line)
@@ -402,6 +403,48 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertIsNone(error.__cause__)
         self.assertTrue(error.__suppress_context__)
         self.assertEqual(harness.stop_calls, [False, True])
+
+    def test_harness_case_serializes_phase_class_and_validated_line_without_poison(self) -> None:
+        secret = "POISONED-ORIGINAL-EXCEPTION-STRING"
+        class PoisonedFailure(Exception):
+            def __str__(self):
+                return secret
+
+            def __repr__(self):
+                return secret
+
+        harness = _BackendIdentityCaseDouble(
+            Phase.conflicting_create,
+            lambda: PoisonedFailure(secret, {"secret": secret}))
+        error = self._run_failing_backend_case(harness)
+        saved = harness.results[-1]
+        diagnostic = error.diagnostic()
+        self.assertIsInstance(diagnostic["source_line"], int)
+        self.assertIn("_backend_identity_conflict_phase(",
+                      self.harness.splitlines()[diagnostic["source_line"] - 1])
+        self.assertEqual(
+            saved["error"],
+            "backend-identity-conflict phase=conflicting_create class=unknown source_line="
+            + str(diagnostic["source_line"]))
+        self.assertEqual(saved["error"], str(error))
+        self.assertNotIn(secret, saved["error"])
+        self.assertNotIn(secret, json.dumps(harness.results, sort_keys=True))
+        self.assertIsNone(error.__cause__)
+        self.assertTrue(error.__suppress_context__)
+
+    def test_source_line_is_static_unknown_when_not_validated(self) -> None:
+        missing = provisioning.BackendIdentityConflictPhaseError(
+            Phase.initial_create, "AssertionError")
+        self.assertEqual(
+            str(missing),
+            "backend-identity-conflict phase=initial_create class=AssertionError source_line=unknown")
+        self.assertNotIn("source_line", missing.diagnostic())
+        stale = provisioning.BackendIdentityConflictPhaseError(
+            Phase.initial_create, "AssertionError", source_line=999999)
+        self.assertEqual(
+            str(stale),
+            "backend-identity-conflict phase=initial_create class=AssertionError source_line=unknown")
+        self.assertNotIn("source_line", stale.diagnostic())
 
     def test_phase_error_rejects_values_outside_the_closed_sets(self) -> None:
         with self.assertRaises(TypeError):
