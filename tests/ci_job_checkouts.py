@@ -1443,7 +1443,11 @@ class JobCheckoutHarness(SourcePinHarness):
                     child.set_final_proof(True)
                     evidence.finish_subcase("mirror_source_token_abort", child)
                     evidence.enter_phase("post_revocation_denial")
-                    self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
+                    # The primary wrapper is a separate request authorized by the
+                    # valid operator PAT and is intentionally held until release;
+                    # the revoked integration fetch is mirror-owned. Only the
+                    # mirror root is in scope before release.
+                    self._wait_no_owned_children([self.mirror_proc.pid])
 
                     # Release primary stub and verify revoked job NEVER falls back to ROOTYARD_CI_MIRROR_SOURCE_TOKEN.
                     pause_enabled.unlink(missing_ok=True)

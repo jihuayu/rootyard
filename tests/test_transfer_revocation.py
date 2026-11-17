@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(ROOT / "tests"))
 
+import ci_job_checkouts  # noqa: E402
 import transfer_revocation_backpressure as revocation_backpressure  # noqa: E402
 import transfer_revocation_observer as revocation_observer  # noqa: E402
 import transfer_revocation_probe as revocation_probe  # noqa: E402
@@ -144,6 +145,118 @@ class TestTransferRevocationContract(unittest.TestCase):
         self.assertIn("pub(crate) async fn sync_user_job(", sync_src)
         self.assertIn("collect_git_output_reauthorized(", sync_src)
         self.assertIn("verify_mirror_sync_authority(", sync_src)
+
+    def test_mirror_pre_release_gate_ignores_authorized_paused_primary_child(self):
+        harness = ci_job_checkouts.JobCheckoutHarness.__new__(
+            ci_job_checkouts.JobCheckoutHarness
+        )
+        primary, paused, mirror = 4100, 4101, 4200
+        released = {"value": False}
+
+        def table(uid=None):
+            rows = {
+                primary: revocation_observer.ProcStat(primary, "S", 1, primary, 10),
+                mirror: revocation_observer.ProcStat(mirror, "S", 1, mirror, 20),
+            }
+            if not released["value"]:
+                rows[paused] = revocation_observer.ProcStat(
+                    paused, "S", primary, paused, 11
+                )
+            return rows
+
+        class Clock:
+            def __init__(self):
+                self.now = 0.0
+                self.sleeps = 0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, seconds):
+                self.sleeps += 1
+                self.now += seconds
+
+        clock = Clock()
+        stats = {"reads": 0}
+
+        def read_table(uid=None):
+            stats["reads"] += 1
+            return table()
+
+        with mock.patch.object(
+            ci_job_checkouts.revocation_observer, "read_proc_table", side_effect=read_table
+        ), mock.patch.object(
+            ci_job_checkouts,
+            "time",
+            types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
+        ):
+            harness._wait_no_owned_children([mirror], timeout=0.2)
+            self.assertEqual(stats["reads"], 1)
+            self.assertEqual(clock.sleeps, 0)
+
+            stats["reads"] = 0
+            with self.assertRaises(AssertionError):
+                harness._wait_no_owned_children([primary, mirror], timeout=0.2)
+            self.assertEqual(stats["reads"], 4)
+            self.assertEqual(clock.sleeps, 4)
+
+            released["value"] = True
+            stats["reads"] = 0
+            harness._wait_no_owned_children([primary, mirror], timeout=0.2)
+            self.assertEqual(stats["reads"], 1)
+            self.assertEqual(clock.sleeps, 4)
+
+    def test_pre_release_gate_source_order_is_mirror_only(self):
+        path = ROOT / "tests" / "ci_job_checkouts.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        cls = next(node for node in tree.body
+                   if isinstance(node, ast.ClassDef) and node.name == "JobCheckoutHarness")
+        method = next(node for node in cls.body
+                      if isinstance(node, ast.FunctionDef)
+                      and node.name == "mirror_cannot_bypass_revocation_via_origin")
+
+        def pid_roots(call):
+            node = call.args[0]
+            self.assertIsInstance(node, ast.List)
+            names = []
+            for item in node.elts:
+                self.assertIsInstance(item, ast.Attribute)
+                self.assertEqual(item.attr, "pid")
+                self.assertIsInstance(item.value, ast.Attribute)
+                names.append(item.value.attr)
+            return names
+
+        gate_calls = sorted(
+            (node for node in ast.walk(method)
+             if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute)
+             and node.func.attr == "_wait_no_owned_children"),
+            key=lambda node: (node.lineno, node.col_offset),
+        )
+        self.assertEqual(len(gate_calls), 2)
+        pre, post = gate_calls
+        self.assertEqual(pid_roots(pre), ["mirror_proc"])
+        self.assertEqual(pid_roots(post), ["proc", "mirror_proc"])
+        self.assertLess(pre.lineno, post.lineno)
+
+        phase_line = min(
+            node.lineno for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "enter_phase"
+            and node.args and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "post_revocation_denial"
+        )
+        release_lines = [
+            node.lineno for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "touch"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "release"
+        ]
+        self.assertGreater(pre.lineno, phase_line)
+        self.assertTrue(any(pre.lineno < line < post.lineno for line in release_lines))
 
     def test_original_seventeen_top_level_case_inventory_is_preserved(self):
         path = ROOT / "tests" / "ci_job_checkouts.py"
