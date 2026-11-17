@@ -8,6 +8,8 @@
 #![allow(clippy::too_many_arguments)]
 // This target uses only `backend_identity` from the shared serving harness;
 // sibling test targets use the remaining helpers, so keep them reusable here.
+#[path = "ref_store_pack_snapshots_support/historical_git_frame.rs"]
+mod historical_git_frame;
 #[path = "ref_store_pack_snapshots_support/metadata_replay_trace.rs"]
 mod metadata_replay_trace;
 #[allow(dead_code)]
@@ -50,6 +52,7 @@ use rootyard::ref_store::{
 };
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant as StdInstant};
@@ -509,7 +512,7 @@ impl GitRepo {
         repo.run(&["init", "--bare", "--quiet", object_format.as_str(), template_arg.as_str()], None).await?;
         Ok(repo)
     }
-    async fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+    fn command(&self, args: &[&str], stdin: Option<&[u8]>) -> tokio::process::Command {
         let with_repo = self.bare.is_dir();
         let mut command = tokio::process::Command::new(&self.git);
         command
@@ -541,7 +544,11 @@ impl GitRepo {
         if with_repo {
             command.env("GIT_DIR", &self.bare);
         }
-        let mut child = command.spawn()?;
+        command
+    }
+
+    async fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+        let mut child = self.command(args, stdin).spawn()?;
         if let Some(bytes) = stdin {
             let mut pipe = child.stdin.take().ok_or_else(|| anyhow!("fixture git stdin is not piped"))?;
             pipe.write_all(bytes).await?;
@@ -557,6 +564,40 @@ impl GitRepo {
             String::from_utf8_lossy(&output.stderr).trim()
         );
         Ok(output.stdout)
+    }
+
+    /// The sole historical `cat-file` call. Command construction, cleared
+    /// environment, optional `GIT_DIR`, stdio, and the fixed deadline are the
+    /// same as every other fixture call; only the failure shape is typed.
+    async fn run_cat_file(
+        &self,
+        spec: &str,
+        trace_enabled: bool,
+    ) -> Result<Vec<u8>, historical_git_frame::HistoricalGitError> {
+        let args = ["cat-file", "-p", spec];
+        let mut child = match self.command(&args, None).spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                return Err(historical_git_frame::HistoricalGitError::spawn_io().trace_if(trace_enabled));
+            }
+        };
+        let output = match tokio::time::timeout(Duration::from_secs(GIT_SECONDS), child.wait_with_output()).await {
+            Err(_) => return Err(historical_git_frame::HistoricalGitError::timeout().trace_if(trace_enabled)),
+            Ok(Err(_)) => return Err(historical_git_frame::HistoricalGitError::wait_io().trace_if(trace_enabled)),
+            Ok(Ok(output)) => output,
+        };
+        if output.status.success() {
+            return Ok(output.stdout);
+        }
+        let message_class = historical_git_frame::classify_stderr(&output.stderr);
+        let error = match output.status.code() {
+            Some(code) => historical_git_frame::HistoricalGitError::exited(code, message_class),
+            None => match output.status.signal() {
+                Some(signal) => historical_git_frame::HistoricalGitError::signaled(signal, message_class),
+                None => historical_git_frame::HistoricalGitError::other(),
+            },
+        };
+        Err(error.trace_if(trace_enabled))
     }
     fn text(bytes: &[u8]) -> Result<String> {
         Ok(std::str::from_utf8(bytes)?.trim().to_owned())
@@ -654,7 +695,7 @@ async fn read_materialized_file(
     Ok(historical_trace_try!(
         trace_enabled,
         trace::S17_CAT_FILE,
-        repo.run(&["cat-file", "-p", spec.as_str()], None).await,
+        repo.run_cat_file(spec.as_str(), trace_enabled).await,
         trace::ErrorKind::GitProcess
     ))
 }
