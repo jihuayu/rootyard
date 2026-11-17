@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the three workspace FUSE helper-authority cases in one process.
+"""Run the four workspace FUSE helper-authority cases in one process.
 
 The runner selects the canonical source-bound CI binary first, then imports the
 original test classes with ROOTYARD_TEST_FUSE_BACKEND=fuse-helper already set.
@@ -35,6 +35,7 @@ REQUIRED_CASES = (
     "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_live_editor_capture_checkpoint_and_remount",
     "tests.test_workspace_handoff.WorkspaceHandoffTest.test_expired_host_reattach_from_remote_checkpoint",
     "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_normal_sigterm_helper_unmount_precedes_parked_git_join",
+    "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_api_sigkill_with_pending_kernel_writer",
 )
 SOURCE_PATHS = (
     "tests/test_workspace_fuse_service.py",
@@ -216,7 +217,11 @@ def _report_payload(binary_sha256=None, receipt_sha256=None, source_head=None,
         skipped_ids = {test.id() for test, _ in result.skipped}
         expected_ids = {test.id() for test, _ in result.expectedFailures}
         unexpected_ids = {test.id() for test in result.unexpectedSuccesses}
-        for name in REQUIRED_CASES:
+        # Project only the cases actually scheduled by this run.  A missing
+        # required case must not be reported as a passed case; the exact
+        # scheduled/required comparison below rejects it, and the manifest then
+        # sees that required name absent.
+        for name in scheduled:
             if name in error_ids:
                 status = "error"
             elif name in failure_ids:

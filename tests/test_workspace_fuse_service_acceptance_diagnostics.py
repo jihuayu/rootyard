@@ -32,6 +32,7 @@ from workspace_fuse_service_acceptance import (
 )
 
 SECRET = "SECRET-must-never-appear"
+C5 = "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_api_sigkill_with_pending_kernel_writer"
 
 
 class _HiddenError(Exception):
@@ -62,7 +63,7 @@ def _case(test_id):
 
 
 class _ResultShape:
-    def __init__(self, failures=(), errors=(), skipped=(), tests_run=3):
+    def __init__(self, failures=(), errors=(), skipped=(), tests_run=4):
         self.failures = list(failures)
         self.errors = list(errors)
         self.skipped = list(skipped)
@@ -204,7 +205,7 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
 
         self.assertFalse(report["passed"])
         self.assertEqual(report["counts"], {
-            "success": 1, "failure": 0, "error": 1, "skipped": 1,
+            "success": 2, "failure": 0, "error": 1, "skipped": 1,
             "expected_failure": 0, "unexpected_success": 0,
         })
         by_name = {case["name"]: case for case in report["cases"]}
@@ -232,6 +233,92 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             diagnostics={"junk": {"phase": "signal"}})
         self.assertTrue(passing["passed"])
         self.assertTrue(all("diagnostic" not in case for case in passing["cases"]))
+
+    def test_c5_failure_projection_stays_bounded_and_secret_free(self):
+        error = _HiddenError()
+        tb = _traceback_at(
+            str(ROOT / "tests/test_workspace_fuse_service.py"),
+            "raise ValueError('synthetic')\n",
+        )
+        record = _diagnostic_record(_case(C5), error, tb)
+
+        self.assertEqual(error.text_calls, 0)
+        self.assertEqual(record["exception"], "unknown")
+        self.assertIsNone(record["phase"])
+        self.assertEqual(
+            record["source"],
+            {"path": "tests/test_workspace_fuse_service.py", "line": 1})
+        self.assertNotIn(SECRET, json.dumps(record))
+
+    def test_required_inventory_is_the_exact_existing_four(self):
+        self.assertEqual(REQUIRED_CASES, (
+            "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_live_editor_capture_checkpoint_and_remount",
+            "tests.test_workspace_handoff.WorkspaceHandoffTest.test_expired_host_reattach_from_remote_checkpoint",
+            "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_normal_sigterm_helper_unmount_precedes_parked_git_join",
+            C5,
+        ))
+
+    def test_full_four_only_passes_when_every_required_case_is_scheduled(self):
+        report = _report_payload(
+            scheduled=REQUIRED_CASES, result=_ResultShape(), imported=True)
+
+        self.assertTrue(report["passed"])
+        self.assertEqual([case["name"] for case in report["cases"]],
+                         list(REQUIRED_CASES))
+        self.assertEqual(report["counts"]["success"], 4)
+        self.assertEqual(report["summary"]["required"], 4)
+        self.assertEqual(report["summary"]["scheduled"], 4)
+        self.assertEqual(report["summary"]["tests_run"], 4)
+
+    def test_c5_failed_error_or_skipped_is_rejected(self):
+        for field, status in (
+                ("failures", "failed"),
+                ("errors", "error"),
+                ("skipped", "skipped")):
+            with self.subTest(field=field):
+                report = _report_payload(
+                    scheduled=REQUIRED_CASES,
+                    result=_ResultShape(**{field: [(_case(C5), "raw detail")]}),
+                    imported=True)
+
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["counts"]["success"], 3)
+                case = next(case for case in report["cases"] if case["name"] == C5)
+                self.assertEqual(case["status"], status)
+                if status == "skipped":
+                    self.assertNotIn("diagnostic", case)
+                else:
+                    self.assertEqual(case["diagnostic"], _unknown_diagnostic())
+
+    def test_c5_missing_replacement_duplicate_or_extra_is_rejected(self):
+        replacement = "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_not_in_the_required_inventory"
+
+        missing = _report_payload(
+            scheduled=REQUIRED_CASES[:-1], result=_ResultShape(tests_run=3),
+            imported=True)
+        self.assertFalse(missing["passed"])
+        self.assertNotIn(C5, [case["name"] for case in missing["cases"]])
+
+        replaced = _report_payload(
+            scheduled=REQUIRED_CASES[:-1] + (replacement,),
+            result=_ResultShape(tests_run=4), imported=True)
+        self.assertFalse(replaced["passed"])
+        self.assertNotIn(C5, [case["name"] for case in replaced["cases"]])
+        self.assertIn(replacement, [case["name"] for case in replaced["cases"]])
+
+        duplicated = _report_payload(
+            scheduled=REQUIRED_CASES + (C5,), result=_ResultShape(tests_run=5),
+            imported=True)
+        self.assertFalse(duplicated["passed"])
+        self.assertEqual(duplicated["counts"]["success"], 5)
+        self.assertEqual([case["name"] for case in duplicated["cases"]].count(C5), 2)
+
+        extra = _report_payload(
+            scheduled=REQUIRED_CASES + (replacement,),
+            result=_ResultShape(tests_run=5), imported=True)
+        self.assertFalse(extra["passed"])
+        self.assertEqual(extra["counts"]["success"], 5)
+        self.assertIn(replacement, [case["name"] for case in extra["cases"]])
 
     def test_allowed_type_set_is_closed(self):
         self.assertLessEqual({"AssertionError", "OSError", "NormalShutdownError"},
