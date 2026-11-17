@@ -368,6 +368,7 @@ TARGETS = {
 
 INPUT_GLOBS = (
     "tests/ref_store_*.rs",
+    "tests/ref_store_pack_snapshots_support/**/*.rs",
     "tests/retention_roots_support/**/*.rs",
     "tests/decision_subset_support/**/*.rs",
     "tests/serving_support/**/*.rs",
