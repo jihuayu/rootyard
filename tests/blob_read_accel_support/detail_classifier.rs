@@ -187,6 +187,13 @@ const EXISTING_DETAIL_LABELS: &[&str] = &[
     "destination-fsync",
     "resource-context-conflict",
     "blob-already-exists",
+    "upload-task",
+    "source-open-task",
+    "source-open",
+    "source-metadata",
+    "source-not-regular",
+    "source-read",
+    "resource-context-closed",
 ];
 
 const LENGTH_MISMATCH_LABELS: &[&str] = &[
@@ -218,6 +225,33 @@ fn audited_detail_label(label: &'static str) -> bool {
         || label == "blob-staging-budget"
         || PROVIDER_LABELS.contains(&label)
         || STREAM_LABELS.contains(&label)
+}
+
+pub(super) fn provider_detail_class(detail: &str) -> DetailClass {
+    if let Some(kind) = detail.strip_prefix("provider error kind ") {
+        return DetailClass::from_label(provider_kind_class(kind));
+    }
+    if let Some(kind) = detail.strip_prefix("provider byte stream error kind ") {
+        return DetailClass::from_label(stream_kind_class(kind));
+    }
+    let label = match detail {
+        "blob readback task failed" => "readback-task",
+        "blob destination directory failed" => "destination-directory",
+        "blob staging file creation failed" => "staging-create",
+        "blob staging write failed" => "staging-write",
+        "blob staging fsync failed" => "staging-fsync",
+        "blob destination rename failed" => "destination-rename",
+        "blob destination fsync failed" => "destination-fsync",
+        "blob upload task failed" => "upload-task",
+        "local blob source open task failed" => "source-open-task",
+        "local blob source open failed" => "source-open",
+        "local blob source metadata failed" => "source-metadata",
+        "local blob source is not a regular file" => "source-not-regular",
+        "local blob source read failed" => "source-read",
+        "blob resource context was closed" => "resource-context-closed",
+        _ => "unknown",
+    };
+    DetailClass::from_label(label)
 }
 
 pub(super) fn assert_detail_label_adapter_contract() {
@@ -354,6 +388,40 @@ pub(super) fn assert_detail_classifier_contract() {
         "",
     ] {
         assert_eq!(detail_class(detail), "unknown");
+    }
+
+    for (detail, expected) in [
+        ("provider error kind Unexpected", "provider-kind/Unexpected"),
+        ("provider byte stream error kind NotFound", "stream-kind/NotFound"),
+        ("blob readback task failed", "readback-task"),
+        ("blob destination directory failed", "destination-directory"),
+        ("blob staging file creation failed", "staging-create"),
+        ("blob staging write failed", "staging-write"),
+        ("blob staging fsync failed", "staging-fsync"),
+        ("blob destination rename failed", "destination-rename"),
+        ("blob destination fsync failed", "destination-fsync"),
+        ("blob upload task failed", "upload-task"),
+        ("local blob source open task failed", "source-open-task"),
+        ("local blob source open failed", "source-open"),
+        ("local blob source metadata failed", "source-metadata"),
+        ("local blob source is not a regular file", "source-not-regular"),
+        ("local blob source read failed", "source-read"),
+        ("blob resource context was closed", "resource-context-closed"),
+    ] {
+        assert_eq!(provider_detail_class(detail).label(), expected);
+    }
+
+    for detail in [
+        "provider error kind Unexpected: https://provider.example/x",
+        "provider error kind Unexpected SQL=select * from users",
+        "provider byte stream error kind NotFound trailing",
+        "blob upload task failed trailing",
+        "local blob source read failed: /tmp/secret",
+        "https://provider.example/path",
+        "SQL=select",
+        "",
+    ] {
+        assert_eq!(provider_detail_class(detail).label(), "unknown");
     }
 }
 
