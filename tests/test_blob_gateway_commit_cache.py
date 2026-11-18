@@ -126,8 +126,26 @@ class BlobGatewayCommitCacheShapeTests(unittest.TestCase):
         self.assertIn("struct PausedRequest", native)
         self.assertIn("async fn reap", native)
         self.assertIn("task.abort()", native)
-        self.assertIn("let _ = task.await", native)
-        self.assertIn("PAUSED_REQUEST_LIMIT", native)
+        self.assertIn("CASE_LIMIT", native)
+        self.assertIn("CLEANUP_LIMIT", native)
+
+    def test_paused_case_bounds_action_and_drains_server_before_db_finish(self):
+        native = source("src/blob_git_gateway/session_http_acceptance/cache_tests.rs")
+        http = source("src/blob_git_gateway/session_http_acceptance/support/http.rs")
+        support = source("src/blob_git_gateway/session_http_acceptance/support.rs")
+        self.assertIn("timeout_at(case_deadline, while_paused)", native)
+        self.assertIn("Instant::now() + cleanup_limit", native)
+        self.assertIn("timeout_at(cleanup_deadline, &mut task)", native)
+        self.assertNotIn("let _ = task.await", native)
+        self.assertIn("struct CaseFixture", native)
+        self.assertIn("retain_on_drop", native)
+        self.assertIn("std::mem::forget(gateway)", native)
+        self.assertIn("start_drainable", http)
+        self.assertIn("with_graceful_shutdown", http)
+        self.assertIn("async fn shutdown", http)
+        self.assertIn("timeout_at(deadline, &mut self.task)", http)
+        self.assertNotIn("self.task.await", http)
+        self.assertIn("self._server.shutdown(deadline).await", support)
 
     def test_final_live_authorization_and_session_fence_is_unchanged(self):
         text = source("src/blob_git_gateway/browse/session.rs")

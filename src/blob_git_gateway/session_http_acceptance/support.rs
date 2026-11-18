@@ -88,7 +88,7 @@ impl Gateway {
     /// Build the production router over a real listener, with the production
     /// session key set attached exactly as `standalone` attaches it.
     pub(super) async fn start(db: &Db, store: BlobStore, tokens: SessionTokens) -> Result<Self> {
-        Self::start_with_harness(db, store, tokens, None, None).await
+        Self::start_with_harness(db, store, tokens, None, None, false).await
     }
 
     /// Build the same production router with the advisory cache and the
@@ -100,7 +100,7 @@ impl Gateway {
         cache: Arc<ServingCache>,
         read_pause: Option<Arc<ReadPause>>,
     ) -> Result<Self> {
-        Self::start_with_harness(db, store, tokens, Some(cache), read_pause).await
+        Self::start_with_harness(db, store, tokens, Some(cache), read_pause, true).await
     }
 
     async fn start_with_harness(
@@ -109,6 +109,7 @@ impl Gateway {
         tokens: SessionTokens,
         cache: Option<Arc<ServingCache>>,
         read_pause: Option<Arc<ReadPause>>,
+        drainable_server: bool,
     ) -> Result<Self> {
         let git = Git::new()?;
         let scratch = tempfile::tempdir().context("temporary gateway scratch root")?;
@@ -137,7 +138,11 @@ impl Gateway {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let app = observe_push_session(crate::blob_git_gateway::router(state.clone()), push.clone());
-        let server = ServerGuard::start(listener, app);
+        let server = if drainable_server {
+            ServerGuard::start_drainable(listener, app)
+        } else {
+            ServerGuard::start(listener, app)
+        };
         Ok(Self { address, store, tokens, git, scratch, push, cache, _server: server })
     }
 
@@ -232,6 +237,12 @@ impl Gateway {
     /// Advisory cache counters for the explicit cache-hit/fallback proof.
     pub(super) fn cache_stats(&self) -> Option<ServingStats> {
         self.cache.as_ref().map(|cache| cache.stats())
+    }
+
+    /// Drain the opt-in graceful server before this gateway is dropped. The
+    /// default abort-on-drop fixture never calls this path.
+    pub(super) async fn drain(&mut self, deadline: tokio::time::Instant) -> Result<()> {
+        self._server.shutdown(deadline).await
     }
 }
 
