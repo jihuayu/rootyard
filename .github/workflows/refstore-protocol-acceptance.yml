@@ -2441,6 +2441,87 @@ jobs:
             echo "session174 cases failed (status $status)" >&2
             exit "$status"
           fi
+      - name: "Exercise issue #111 exact commit-cache HTTP proof on the manual owned ref"
+        if: ${{ success() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/goal-issue111-original-ac-source-audit-20261117' }}
+        timeout-minutes: 25
+        shell: bash
+        env:
+          SESSION174_DATABASE: ${{ steps.session174_db.outputs.database }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_RUN_ID" in ''|*[!0-9]*) echo "GITHUB_RUN_ID must be numeric" >&2; exit 1 ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) echo "GITHUB_RUN_ATTEMPT must be numeric" >&2; exit 1 ;; esac
+          expected_db="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}_a${GITHUB_RUN_ATTEMPT}"
+          if [ "${SESSION174_DATABASE:-}" != "$expected_db" ]; then echo "issue #111 cache proof must use the exact run/attempt database" >&2; exit 1; fi
+          case "$SESSION174_DATABASE" in ''|*[!a-z0-9_]*|postgres|rootyard_protocol|template*)
+            echo "refusing a shared or unsafe issue #111 cache database" >&2
+            exit 1
+            ;;
+          esac
+          if [ ! -s "$RUNNER_TEMP/refstore-object-store.env" ]; then echo "missing object-store env" >&2; exit 1; fi
+          evidence="test-results/refstore/session174-cache"
+          mkdir -p "$evidence"
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="session174-cache-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export ROOTYARD_CACHE_ENVIRONMENT="session174-cache"
+          export ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1
+          export ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1
+          export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$SESSION174_DATABASE"
+          export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
+          export ROOTYARD_TEST_GIT="$(command -v git)"
+          lib="${ROOTYARD_174_LIB_ALIAS:?missing immutable #174 lib alias}"
+          receipt="${ROOTYARD_174_LIB_RECEIPT:?missing immutable #174 lib receipt}"
+          preflight="$RUNNER_TEMP/session174-foundation/preflight.json"
+          test -x "$lib"
+          test -f "$receipt"
+          test -s "$preflight"
+          status=0
+          python3 scripts/refstore_issue111_cache_proof.py \
+            --lib "$lib" \
+            --receipt "$receipt" \
+            --preflight "$preflight" \
+            --expected-commit "$GITHUB_SHA" \
+            --database "$SESSION174_DATABASE" \
+            --report "$evidence/cache-report.json" \
+            --summary-log "$evidence/cache-summary.log" || status=$?
+          if ! python3 scripts/collect_evidence_receipts.py \
+            "$preflight" "$RUNNER_TEMP/session174-foundation" "$evidence"; then
+            echo "issue #111 cache receipt collection failed" >&2
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "issue #111 cache cases failed (status $status)" >&2
+            exit "$status"
+          fi
+          python3 scripts/native_report_manifest.py --mode job \
+            --expect-commit "$GITHUB_SHA" \
+            --build-receipt "$evidence/session174-lib-tests.build.json" \
+            --binary "$lib" \
+            --report "cache=$evidence/cache-report.json" \
+            --require-case "cache=blob_git_gateway::session_http_acceptance::cache_tests::exact_commit_http_warm_miss_then_actual_hit_is_byte_equal" \
+            --require-case "cache=blob_git_gateway::session_http_acceptance::cache_tests::exact_commit_http_hit_still_enforces_final_live_authorization" \
+            --require-case "cache=blob_git_gateway::session_http_acceptance::cache_tests::exact_commit_http_hit_still_enforces_restore_incarnation_fence" \
+            --require-case "cache=blob_git_gateway::session_http_acceptance::cache_tests::exact_commit_http_cached_oid_is_not_served_after_it_becomes_unreachable" \
+            --log "cache-summary=$evidence/cache-summary.log" \
+            --log-marker "cache-summary=session174 cache proof: 4/4 passed; 0 failed; 0 skipped" \
+            --harness "scripts/refstore_issue111_cache_proof.py" \
+            --harness "src/blob_git_gateway/session_http_acceptance/cache_tests.rs" \
+            --harness "src/blob_git_gateway/read_cache.rs" \
+            --harness "src/blob_git_gateway/history.rs" \
+            --harness "src/blob_git_gateway/state.rs" \
+            --fixture postgres=postgres:17 \
+            --fixture "garage=Garage v2.1.0 sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78e93ee8da7cf6a" \
+            --fixture-rust-from-receipt \
+            --manifest-out "$evidence/cache-native-job.json"
+
       - name: "Drop only the run-owned #174 foundation database"
         if: always()
         timeout-minutes: 5
