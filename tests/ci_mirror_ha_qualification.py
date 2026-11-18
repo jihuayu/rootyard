@@ -21,6 +21,13 @@ Scenarios covered:
      ``serve-mirror`` daemons killed -> simultaneous burst exercising global
      (4) and per-repo (2) origin fallback budgets and bounded wait wakeup, zero
      ``ROOTYARD_CI_MIRROR_SOURCE_TOKEN`` leaks, and zero leaked child processes.
+  D. A fresh unlisted real ``serve-mirror`` is alive but cannot serve a fresh
+     target -> ``claim`` returns a genuine ``202`` ``waiting`` with no lease or
+     checkout grant; an explicit named-mirror auto-fetch commits target-OID
+     readiness through the same controller/PostgreSQL/storage, after which the
+     same durable queued run claims ``200`` from that exact mirror with the
+     persisted ``(attempt, lease_generation, grant)`` bound to
+     repository/target/storage generation.
 """
 from __future__ import annotations
 
@@ -103,24 +110,34 @@ class HaQualificationHarness:
         self.m1_id = str(uuid.uuid4())
         self.m2_id = str(uuid.uuid4())
         self.m3_id = str(uuid.uuid4())
+        self.m4_id = str(uuid.uuid4())
 
         self.c1_port = free_port()
         self.c2_port = free_port()
         self.m1_port = free_port()
         self.m2_port = free_port()
         self.m3_port = free_port()
+        self.m4_port = free_port()
+        for _ in range(32):
+            if self.m4_port not in {self.c1_port, self.c2_port, self.m1_port, self.m2_port, self.m3_port}:
+                break
+            self.m4_port = free_port()
+        else:
+            raise AssertionError("could not allocate a distinct mirror-4 port")
 
         self.c1_base = f"http://127.0.0.1:{self.c1_port}"
         self.c2_base = f"http://127.0.0.1:{self.c2_port}"
         self.m1_base = f"http://127.0.0.1:{self.m1_port}"
         self.m2_base = f"http://127.0.0.1:{self.m2_port}"
         self.m3_base = f"http://127.0.0.1:{self.m3_port}"
+        self.m4_base = f"http://127.0.0.1:{self.m4_port}"
 
         self.ctrl1_data = self.root / "ctrl1-data"
         self.ctrl2_data = self.root / "ctrl2-data"
         self.mirror1_data = self.root / "mirror1-data"
         self.mirror2_data = self.root / "mirror2-data"
         self.mirror3_data = self.root / "mirror3-data"
+        self.mirror4_data = self.root / "mirror4-data"
 
         self.base_env = os.environ.copy()
         self.base_env.update(
@@ -1038,6 +1055,182 @@ class HaQualificationHarness:
             "source_token_zero_leak": True,
         }
 
+    def scenario_d_controlled_readiness_claim_transition(self) -> dict:
+        # Scenarios B/C leave every allowlisted mirror killed and inactive. This
+        # fresh unlisted mirror is therefore the only live mirror that can be
+        # made ready, and only by the explicit auto-fetch below.
+        self.git("checkout", "-b", "feat-e", "main", cwd=self.work1)
+        (self.work1 / "feat-e.txt").write_text("controlled readiness\n")
+        self.git("add", "feat-e.txt", cwd=self.work1)
+        self.git("commit", "-m", "commit feat-e", cwd=self.work1)
+        target_oid = self.git("rev-parse", "HEAD", cwd=self.work1).stdout.decode().strip()
+        self.git("push", "origin", "HEAD:refs/heads/feat-e", cwd=self.work1, token=self.alice)
+
+        self.start_daemon(
+            "mirror-4", "serve-mirror",
+            self.mirror_env(self.m4_id, self.m4_port, self.mirror4_data, self.c2_base), self.m4_base,
+        )
+        heartbeat = {
+            "audience": self.audience, "url": self.m4_base, "storage_generation": 1,
+            "ready_oids": [], "capacity": 4, "active": True,
+        }
+        self.document(
+            self.c2_base, f"/api/repos/alice/forge/ci-mirrors/{self.m4_id}/heartbeat", 200,
+            token=self.alice, method="POST", body=heartbeat,
+        )
+        st_m4, raw_m4, _ = self.http(self.m4_base, "/metrics")
+        assert st_m4 == 200 and b"rootyard_mirror_sync_total 0\n" in raw_m4, (st_m4, raw_m4.decode(errors="replace"))
+
+        pr4, _ = self.document(
+            self.c2_base, "/api/repos/alice/forge/pulls", 201,
+            token=self.alice, method="POST",
+            body={
+                "title": "Scenario D Controlled Readiness", "body": "pr4",
+                "head_ref": "refs/heads/feat-e", "base_ref": "refs/heads/main",
+            },
+        )
+        assert pr4["head_oid"] == target_oid, pr4
+        runs4 = self.wait_for_runs(
+            self.repo1["id"], pr4["number"], target_oid, ("ci/test", "ci/lint", "ci/b3")
+        )
+        prefix1 = f"/api/repos/alice/forge/integrations/{self.hook1_id}/runs/"
+        run_id = runs4["ci/test"]
+
+        # Refresh the only live mirror and prove it is alive but not ready.
+        self.document(
+            self.c2_base, f"/api/repos/alice/forge/ci-mirrors/{self.m4_id}/heartbeat", 200,
+            token=self.alice, method="POST", body=heartbeat,
+        )
+        before, _ = self.document(
+            self.c2_base, f"/api/repos/alice/forge/ci-mirrors?target_oid={target_oid}", 200, token=self.alice
+        )
+        by_id = {m["mirror_id"]: m for m in before["mirrors"]}
+        assert by_id[self.m4_id]["alive"] is True and by_id[self.m4_id]["target_ready"] is False, by_id
+        assert all(
+            not (m.get("alive") and m.get("target_ready")) for mid, m in by_id.items() if mid != self.m4_id
+        ), by_id
+        assert self.sql(
+            f"SELECT count(*) FROM ci_mirror_nodes WHERE repository_id='{self.repo1['id']}' "
+            f"AND mirror_id<>'{self.m4_id}' AND active=true"
+        ) == "0", "an allowlisted mirror is still active"
+
+        # First real claim: the live target mirror cannot serve the target, so
+        # the only correct answer is a genuine 202 waiting with no lease/grant.
+        waiting_doc, waiting_hdrs = self.document(
+            self.c2_base, prefix1 + run_id + "/claim", 202,
+            bearer=self.hook_secret, method="POST",
+            body={"runner_id": "runner-d-wait", "prefer_mirror": True, "wait_for_ready_ms": 0},
+        )
+        assert waiting_hdrs.get("x-rootyard-ci-state") == "waiting", waiting_hdrs
+        assert waiting_doc["classification"] == "waiting", waiting_doc
+        assert "checkout" not in waiting_doc and "source" not in waiting_doc, waiting_doc
+        assert waiting_doc["availability"]["ready_available_mirrors"] == 0, waiting_doc
+        assert waiting_doc["availability"]["ready_total_mirrors"] == 0, waiting_doc
+        assert waiting_doc["availability"]["healthy_unready_mirrors"] >= 1, waiting_doc
+        queued = self.sql(
+            f"SELECT state||','||attempt||','||lease_generation||','||coalesce(source_url,'')||','||coalesce(runner_id,'') "
+            f"FROM ci_runs WHERE id='{run_id}'"
+        )
+        assert queued == "queued,0,0,,", f"first claim published a lease: {queued}"
+        assert self.sql(
+            f"SELECT count(*) FROM ci_integration_checkout_jobs WHERE run_id='{run_id}'"
+        ) == "0", "first claim published a checkout grant"
+        assert self.sql(
+            f"SELECT count(*) FROM ci_mirror_nodes WHERE repository_id='{self.repo1['id']}' "
+            f"AND active=true AND heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-30 "
+            f"AND ready_oids ? '{target_oid}'"
+        ) == "0", "target became ready without the explicit auto-fetch"
+        st_m4, raw_m4, _ = self.http(self.m4_base, "/metrics")
+        assert st_m4 == 200 and b"rootyard_mirror_sync_total 0\n" in raw_m4, raw_m4.decode(errors="replace")
+
+        # The explicit named-mirror auto-fetch is a real isolate mirror sync on
+        # the same controller/PostgreSQL/storage. Its response is returned only
+        # after publish_ready_oid commits the exact target OID.
+        fetched, fetch_hdrs = self.document(
+            self.m4_base, "/api/repos/alice/forge/mirror-auto-fetch", 200,
+            token=self.prewarm_pat, method="POST", timeout=30.0,
+            body={"target_oid": target_oid, "storage_generation": 1, "wait_ms": 5000, "mirror_id": self.m4_id},
+        )
+        assert fetch_hdrs.get("x-rootyard-ci-state") == "ready", (fetched, fetch_hdrs)
+        assert fetched["target_oid"] == target_oid and fetched["classification"] == "ready", fetched
+        assert fetched["cache_status"] == "miss_fetched", fetched
+        after, _ = self.document(
+            self.c2_base, f"/api/repos/alice/forge/ci-mirrors?target_oid={target_oid}", 200, token=self.alice
+        )
+        after_by_id = {m["mirror_id"]: m for m in after["mirrors"]}
+        assert after_by_id[self.m4_id]["alive"] is True and after_by_id[self.m4_id]["target_ready"] is True, after_by_id
+        assert self.sql(
+            f"SELECT active::text||','||(ready_oids ? '{target_oid}')::text||','||"
+            f"(heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-30)::text "
+            f"FROM ci_mirror_nodes WHERE repository_id='{self.repo1['id']}' AND mirror_id='{self.m4_id}'"
+        ) == "true,true,true", "explicit auto-fetch did not commit readiness"
+        st_m4, raw_m4, _ = self.http(self.m4_base, "/metrics")
+        assert st_m4 == 200 and b"rootyard_mirror_sync_total 0\n" not in raw_m4, raw_m4.decode(errors="replace")
+
+        # The same durable queued run must now claim the exact ready mirror and
+        # persist attempt/lease/grant against this repository, target and generation.
+        claimed, claim_hdrs = self.document(
+            self.c2_base, prefix1 + run_id + "/claim", 200,
+            bearer=self.hook_secret, method="POST",
+            body={"runner_id": "runner-d-ready", "prefer_mirror": True, "wait_for_ready_ms": 0},
+        )
+        assert claim_hdrs.get("x-rootyard-ci-state") == "ready", claim_hdrs
+        assert claimed["run_id"] == run_id, claimed
+        assert claimed["source"] == self.m4_base, claimed
+        assert claimed["head_oid"] == target_oid and claimed["storage_generation"] == 1, claimed
+        assert claimed["attempt"] == 1 and claimed["lease_generation"] == 1, claimed
+        checkout_token = claimed["checkout"]["token"]
+        self.add_secret(checkout_token)
+        plan = claimed["checkout"]["plan"]
+        assert plan["repository_id"] == self.repo1["id"] and plan["job_id"] == claimed["job_id"], plan
+        assert plan["target_oid"] == target_oid and plan["storage_generation"] == 1, plan
+        persisted = self.sql(
+            f"SELECT state||','||attempt||','||lease_generation||','||source_url||','||runner_id||','||"
+            f"storage_generation||','||head_oid||','||repository_id::text||','||job_id::text "
+            f"FROM ci_runs WHERE id='{run_id}'"
+        )
+        assert persisted == (
+            f"leased,1,1,{self.m4_base},runner-d-ready,1,{target_oid},{self.repo1['id']},{claimed['job_id']}"
+        ), persisted
+        assert self.sql(
+            f"SELECT count(*) FROM ci_integration_checkout_jobs WHERE run_id='{run_id}'"
+        ) == "1", "expected exactly one checkout grant"
+        assert self.sql(
+            f"SELECT count(*) FROM ci_integration_checkout_jobs WHERE run_id='{run_id}' "
+            f"AND attempt=1 AND lease_generation=1 AND repository_id='{self.repo1['id']}' "
+            f"AND job_id='{claimed['job_id']}' AND plan->>'target_oid'='{target_oid}' "
+            f"AND plan->>'storage_generation'='1'"
+        ) == "1", "checkout grant is not bound to repo/target/generation"
+        assert self.sql(
+            f"SELECT encode(credential_digest,'hex') FROM ci_integration_checkout_jobs WHERE run_id='{run_id}'"
+        ) == hashlib.sha256(checkout_token.encode()).hexdigest(), "grant/token digest mismatch"
+        assert self.sql(
+            f"SELECT (r.lease_expires_unix>extract(epoch FROM clock_timestamp())::bigint)::text||','||"
+            f"(g.expires_unix>r.lease_expires_unix)::text||','||"
+            f"(g.expires_unix=(g.plan->>'expires_unix')::bigint)::text "
+            f"FROM ci_runs r JOIN ci_integration_checkout_jobs g ON g.run_id=r.id WHERE r.id='{run_id}'"
+        ) == "true,true,true", "lease/grant expiry is not coherent"
+
+        self.verify_git_checkout(
+            f"{self.m4_base}/ci/{target_oid}/git/alice/forge.git",
+            self.root / "clone-d", target_oid, checkout_token,
+        )
+
+        return {
+            "first_claim_http": 202,
+            "first_claim_state": "waiting",
+            "lease_or_grant_before_ready": False,
+            "explicit_autofetch_cache_status": fetched["cache_status"],
+            "target_ready_via_controller": True,
+            "second_claim_http": 200,
+            "persisted_attempt": claimed["attempt"],
+            "persisted_lease_generation": claimed["lease_generation"],
+            "persisted_grant_bound_repo_target_generation": True,
+            "checkout_clone_fsck": "strict_passed",
+            "target_oid": target_oid,
+            "mirror_id": self.m4_id,
+        }
+
     def case(self, name: str, fn) -> None:
         t0 = time.monotonic()
         try:
@@ -1091,6 +1284,7 @@ def main(argv: list[str] | None = None) -> int:
         harness.case("scenario_a_pr_prewarm_and_live_mirror_checkout", harness.scenario_a_pr_prewarm_and_live_mirror_checkout)
         harness.case("scenario_b_sigkill_dual_crash_and_failover", harness.scenario_b_sigkill_dual_crash_and_failover)
         harness.case("scenario_c_coalesced_prewarm_and_origin_burst", harness.scenario_c_coalesced_prewarm_and_origin_burst)
+        harness.case("scenario_d_controlled_readiness_claim_transition", harness.scenario_d_controlled_readiness_claim_transition)
         success = True
     except Exception:
         print(harness.redact(traceback.format_exc()), file=sys.stderr)
@@ -1109,6 +1303,7 @@ def main(argv: list[str] | None = None) -> int:
             "limitations": [
                 "Single-host loopback processes and isolated PostgreSQL 17 schema, not a multi-host network or power-loss test.",
                 "Automatic lease expiry in Scenario B resets lease_expires_unix in the run-owned schema so expiry reconciliation finishes within the CI timeout budget.",
+                "Scenario D commits target readiness only through an explicit named-mirror auto-fetch on an unlisted live mirror; it does not inject a production race or substitute scheduler authority.",
             ],
         }
         payload = json.dumps(report, indent=2) + "\n"
