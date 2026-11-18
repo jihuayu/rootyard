@@ -29,38 +29,70 @@ fn ensure_blocks(source: &str) -> Vec<&str> {
 #[test]
 fn original_ensure_conditions_have_no_diagnostic_wrappers() {
     let blocks = ensure_blocks(SUPPORT);
-    assert_eq!(blocks.len(), 3, "the moved body must still contain the three original ensures");
+    assert_eq!(blocks.len(), 4, "the moved body must contain the two original and two corrupt ensures");
     assert!(blocks.iter().all(|block| !block.contains("diag.")));
     assert!(blocks.iter().all(|block| !block.contains("ck_diag")));
 
     assert!(blocks[0].contains("build_kit(ids, Sha1, 1, &empty, &td, None, None)?"));
     assert!(blocks[0].contains("== CloneKitStatus::EmptyRepository"));
-    assert!(blocks[1].contains("publish_clonekit_versioned(&store, &b2, &git_binary(), None, None).is_err()"));
-    assert!(blocks[1].contains("store.load_latest(ids.1)?.expect(\"latest\").kit_generation"));
-    assert!(blocks[1].contains("== 1"));
-    assert!(blocks[2].contains("res.telemetry.strategy"));
-    assert!(blocks[2].contains("CheckoutStrategy::StockGitFallback"));
+    assert!(blocks[1].contains("injected"));
+    assert!(blocks[1].contains("Some(CloneKitError::CorruptArtifact(_))"));
+    assert!(blocks[1].contains("store.load_latest(ids.1)?.as_ref() == Some(&published_gen1)"));
+    assert!(blocks[1].contains("published_gen1.kit_generation == 1"));
+    assert!(blocks[1].contains("!store.version_dir(ids.1, 2).exists()"));
+    assert!(blocks[2].contains("prepared pack/idx failed digest verification"));
+    assert!(blocks[2].contains("store.load_latest(ids.1)?.as_ref() == Some(&published_gen1)"));
+    assert!(blocks[2].contains("published_gen1.kit_generation == 1"));
+    assert!(blocks[2].contains("!store.version_dir(ids.1, 2).exists()"));
+    assert!(blocks[3].contains("res.telemetry.strategy"));
+    assert!(blocks[3].contains("CheckoutStrategy::StockGitFallback"));
     assert!(!SUPPORT.contains("expected_err"));
     assert!(!SUPPORT.contains("diag.typed_ck"));
     assert!(!SUPPORT.contains("diag.typed_anyhow"));
 }
 
 #[test]
-fn pre_marks_precede_eager_empty_init_and_corrupt_build() {
+fn explicit_negative_checkpoints_keep_typed_classes_and_exact_latest() {
+    let start = SUPPORT.find("CorruptStagedPack").expect("fault-injected corruption");
+    let end = SUPPORT.find("Phase::HistoryGrant").expect("history grant after corruption");
+    let checkpoints = &SUPPORT[start..end];
+    assert!(checkpoints.contains("Some(CloneKitError::CorruptArtifact(_))"));
+    assert!(checkpoints.contains("prepared pack/idx failed digest verification"));
+    assert!(!checkpoints.contains("GitFailed"), "early rejection must retain the exact corrupt-artifact class");
+    assert_eq!(2, checkpoints.matches("Some(&published_gen1)").count());
+    assert_eq!(2, checkpoints.matches("!store.version_dir(ids.1, 2).exists()").count());
+    assert!(!SUPPORT.contains(".is_err()"), "negative checkpoints must inspect exact typed errors");
+}
+
+#[test]
+fn pre_marks_precede_eager_empty_init_and_both_corrupt_builds() {
     let empty_phase = SUPPORT.find("Phase::EmptyBuildOrStatus").expect("empty phase");
     let empty_init = SUPPORT.find("init_repo(td.path(), \"empty.git\"").expect("empty init");
     assert!(empty_phase < empty_init, "empty phase must be marked before the eager empty init");
 
     let corrupt_phase = SUPPORT.find("Phase::CorruptBuild").expect("corrupt phase");
-    let corrupt_build = SUPPORT.find("build_kit(ids, Sha1, 2").expect("corrupt build");
-    assert!(corrupt_phase < corrupt_build, "corrupt phase must be marked before the eager corrupt build");
+    let corrupt_builds = SUPPORT.match_indices("build_kit(ids, Sha1, 2").map(|(index, _)| index).collect::<Vec<_>>();
+    assert_eq!(2, corrupt_builds.len(), "both negative checkpoints must build generation 2");
+    assert!(
+        corrupt_builds.iter().all(|&build| corrupt_phase < build),
+        "corrupt phase must be marked before both eager generation 2 builds"
+    );
 
-    let publication_mark =
-        SUPPORT.find("diag.mark($crate::ck_diag::Phase::CorruptPublicationPreservesLatest").expect("publication mark");
-    let publish = SUPPORT.find("publish_clonekit_versioned(&store, &b2").expect("publish");
-    let latest = SUPPORT.find("expect(\"latest\")").expect("latest expect");
-    assert!(publication_mark < publish, "publication phase must be marked before publish");
-    assert!(publication_mark < latest, "publication phase must be marked before latest expect");
+    let early_rejection = SUPPORT.find("Some(CloneKitError::CorruptArtifact(_))").expect("early rejection");
+    let clean_build = SUPPORT.find("build_kit(ids, Sha1, 2, &repo, &td, None, None)").expect("clean build");
+    assert!(corrupt_builds[0] < early_rejection, "the injected corrupt build must be followed by its rejection");
+    assert!(early_rejection < clean_build, "the early rejection must be observed before the clean build");
+
+    let publication_marks = SUPPORT
+        .match_indices("diag.mark($crate::ck_diag::Phase::CorruptPublicationPreservesLatest")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(1, publication_marks.len(), "only the real corrupt publication is a publication checkpoint");
+    let tamper = SUPPORT.find("std::fs::write(staged_pack, tampered)").expect("owned staged pack tamper");
+    let tampered_publish = SUPPORT.find("publish_clonekit_versioned(&store, &clean_b2").expect("tampered publish");
+    assert!(clean_build < tamper, "clean generation 2 must be built before its owned staged pack is tampered");
+    assert!(tamper < publication_marks[0], "tamper must precede the real publication checkpoint");
+    assert!(publication_marks[0] < tampered_publish, "real publication phase must precede publish");
 }
 
 #[test]

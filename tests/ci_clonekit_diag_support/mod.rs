@@ -299,13 +299,56 @@ macro_rules! empty_history_case_body {
             diag.eager_anyhow($crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || {
                 build_kit(ids, Sha1, 1, &repo, &td, Some(&store), None)
             })?;
-            let b2 = diag.eager_anyhow($crate::ck_diag::Phase::CorruptBuild, file!(), line!(), || {
-                build_kit(ids, Sha1, 2, &repo, &td, None, Some(BuildFailurePoint::CorruptStagedPack))
-            })?;
-            diag.mark($crate::ck_diag::Phase::CorruptPublicationPreservesLatest, file!(), line!());
+            let published_gen1 = diag
+                .eager_ck($crate::ck_diag::Phase::ActiveBuild, file!(), line!(), || store.load_latest(ids.1))?
+                .expect("latest");
+
+            // Git creates the staged pack read-only, so `CorruptStagedPack` cannot rewrite it
+            // and the builder rejects before returning any candidate.  Keep that early
+            // rejection explicit: exact CorruptArtifact and the sealed generation 1.
+            diag.mark($crate::ck_diag::Phase::CorruptBuild, file!(), line!());
+            let injected = build_kit(ids, Sha1, 2, &repo, &td, None, Some(BuildFailurePoint::CorruptStagedPack));
             anyhow::ensure!(
-                publish_clonekit_versioned(&store, &b2, &git_binary(), None, None).is_err()
-                    && store.load_latest(ids.1)?.expect("latest").kit_generation == 1
+                matches!(
+                    injected,
+                    Err(ref err)
+                        if matches!(
+                            err.downcast_ref::<CloneKitError>(),
+                            Some(CloneKitError::CorruptArtifact(_))
+                        )
+                ) && store.load_latest(ids.1)?.as_ref() == Some(&published_gen1)
+                    && published_gen1.kit_generation == 1
+                    && !store.version_dir(ids.1, 2).exists()
+            );
+
+            // A clean generation 2 build records the clean staged-pack digest.  Tamper only
+            // that owned staged pack; publication must reject the exact digest class before
+            // installing generation 2 or replacing the current pointer.
+            let clean_b2 = diag.eager_anyhow($crate::ck_diag::Phase::CorruptBuild, file!(), line!(), || {
+                build_kit(ids, Sha1, 2, &repo, &td, None, None)
+            })?;
+            let staged_pack = clean_b2.staged_pack_path.as_deref().expect("staged pack");
+            assert!(staged_pack.starts_with(td.path().join("st")), "tamper target must be the owned staged pack");
+            let original_permissions = std::fs::metadata(staged_pack)?.permissions();
+            std::fs::set_permissions(
+                staged_pack,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+            )?;
+            let mut tampered = std::fs::read(staged_pack)?;
+            *tampered.first_mut().expect("staged pack prefix") ^= 0xff;
+            std::fs::write(staged_pack, tampered)?;
+            std::fs::set_permissions(staged_pack, original_permissions)?;
+            diag.mark($crate::ck_diag::Phase::CorruptPublicationPreservesLatest, file!(), line!());
+            let tampered_err = publish_clonekit_versioned(&store, &clean_b2, &git_binary(), None, None)
+                .expect_err("tampered staged pack must be rejected");
+            anyhow::ensure!(
+                matches!(
+                    &tampered_err,
+                    CloneKitError::CorruptArtifact(message)
+                        if message.as_str() == "prepared pack/idx failed digest verification"
+                ) && store.load_latest(ids.1)?.as_ref() == Some(&published_gen1)
+                    && published_gen1.kit_generation == 1
+                    && !store.version_dir(ids.1, 2).exists()
             );
 
             let (g_h2, c_h2) = diag.eager_anyhow($crate::ck_diag::Phase::HistoryGrant, file!(), line!(), || {
