@@ -345,6 +345,89 @@ class ReportProjectionTest(unittest.TestCase):
             driver.assert_allowlisted({"note": "postgresql://rootyard@127.0.0.1/db"})
 
 
+class BuildFailureClassificationTest(unittest.TestCase):
+    """Build failures name one fixed target and one fixed reason only."""
+
+    def test_classes_are_exact_and_reported_as_build(self):
+        expected = {
+            "build-integration-producer",
+            "build-integration-executable",
+            "build-integration-receipt",
+            "build-lib-producer",
+            "build-lib-executable",
+            "build-lib-receipt",
+        }
+        self.assertEqual(driver.BUILD_FAILURE_CLASSES, expected)
+        for target in driver.BUILD_FAILURE_TARGETS:
+            for reason in driver.BUILD_FAILURE_REASONS:
+                value = driver.build_failure_class(target, reason)
+                self.assertIn(value, driver.BUILD_FAILURE_CLASSES)
+                report = ReportProjectionTest().report(
+                    stage="build", failure_class=value)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["stage"], "build")
+                self.assertEqual(report["failure_class"], value)
+        for target, reason in (("integration", "cargo"), ("lib", "timeout"),
+                               ("ref-store-operations", "producer"), ("", "")):
+            with self.subTest(target=target, reason=reason):
+                with self.assertRaises(driver.EvidenceError):
+                    driver.build_failure_class(target, reason)
+        with self.assertRaises(driver.EvidenceError):
+            ReportProjectionTest().report(
+                stage="build", failure_class="build-integration-unknown")
+
+    def test_marker_parser_accepts_only_exact_newline_terminated_classes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary)
+            marker = evidence / driver.BUILD_FAILURE_MARKER
+            self.assertIsNone(driver.read_build_failure_class(evidence))
+            for value in sorted(driver.BUILD_FAILURE_CLASSES):
+                marker.write_text(value + "\n", encoding="ascii")
+                self.assertEqual(driver.read_build_failure_class(evidence), value)
+            for raw in ("", "\n", "build-integration-producer",
+                        "build-integration-producer\n\n",
+                        "build-integration-producer \n",
+                        "BUILD-INTEGRATION-PRODUCER\n",
+                        "build-integration-unknown\n",
+                        "build\n"):
+                marker.write_text(raw, encoding="ascii")
+                with self.subTest(raw=raw):
+                    with self.assertRaises(driver.EvidenceError) as caught:
+                        driver.read_build_failure_class(evidence)
+                    self.assertEqual(caught.exception.kind, "build")
+            marker.unlink()
+            marker.symlink_to(evidence / "missing")
+            with self.assertRaises(driver.EvidenceError):
+                driver.read_build_failure_class(evidence)
+
+    def test_finalize_fails_closed_for_unknown_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work, evidence = root / "work", root / "evidence"
+            work.mkdir()
+            evidence.mkdir()
+            (evidence / "stage").write_text("build")
+            (evidence / driver.BUILD_FAILURE_MARKER).write_text(
+                "build-integration-unknown\n")
+            (work / "pg-baseline.json").write_text(json.dumps({
+                "server_version_num": 170005,
+                "databases": ["postgres", "template0", "template1"],
+                "client_major": 17,
+            }))
+            with mock.patch.object(driver, "verify_sources", return_value=provenance()), \
+                    mock.patch.object(driver, "cleanup_databases", return_value=(True, True)):
+                result = driver.cmd_finalize(SimpleNamespace(
+                    work=str(work), evidence=str(evidence),
+                    product=str(root / "product"),
+                    workflow_source=str(root / "workflow-source")))
+            self.assertEqual(result, 1)
+            report = json.loads((evidence / "qualification.json").read_text())
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["stage"], "build")
+            self.assertEqual(report["failure_class"], "build")
+            self.assertNotIn(str(root), json.dumps(report))
+
+
 class PostgresBooleanContractTest(unittest.TestCase):
     """PG17 prints raw bool as t/f and bool::text as true/false."""
 
@@ -1243,6 +1326,192 @@ class WorkflowStaticTest(unittest.TestCase):
                     self.assertFalse(work.exists())
                 if str(evidence):
                     self.assertFalse(evidence.exists())
+
+    BUILD_PRODUCER_STUB = r"""#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$STUB_LOG"
+case "$*" in
+  *"-B scripts/build_native_test.py --test ref_store_operations"*)
+    name=ref-store-operations
+    mode="$STUB_FIRST_MODE"
+    ;;
+  *"-B scripts/build_native_test.py --lib"*)
+    name=slot-zero-lib
+    mode="$STUB_SECOND_MODE"
+    ;;
+  *) exit 90 ;;
+esac
+case "$mode" in
+  nonzero) exit 31 ;;
+  no-output) exit 0 ;;
+  no-receipt)
+    printf '#!/bin/sh\nexit 0\n' > "$STUB_WORK/$name"
+    chmod 700 "$STUB_WORK/$name"
+    exit 0
+    ;;
+  ready)
+    printf '#!/bin/sh\nexit 0\n' > "$STUB_WORK/$name"
+    chmod 700 "$STUB_WORK/$name"
+    : > "$STUB_WORK/$name.build.json"
+    exit 0
+    ;;
+  *) exit 91 ;;
+esac
+"""
+
+    GIT_STUB = r"""#!/bin/sh
+set -eu
+case "$*" in
+  "rev-parse HEAD") printf '%s\n' "$STUB_SHA" ;;
+  "rev-parse HEAD^{tree}") printf '%s\n' "$STUB_TREE" ;;
+  "status --porcelain=v1 --untracked-files=all") : ;;
+  *) exit 1 ;;
+esac
+"""
+
+    CARGO_FORK_STUB = "#!/bin/sh\nexit 0\n"
+
+    def step_script(self, name):
+        marker = f"      - name: {name}\n"
+        self.assertEqual(self.text.count(marker), 1)
+        block = self.text.split(marker, 1)[1].split("\n      - name: ", 1)[0]
+        lines = block.splitlines()
+        start = lines.index("        run: |") + 1
+        body = []
+        for line in lines[start:]:
+            if not line.startswith("          "):
+                break
+            body.append(line[10:])
+        return "\n".join(body) + "\n"
+
+    @staticmethod
+    def write_executable(path, text):
+        path.write_text(text)
+        path.chmod(0o755)
+
+    def run_build_step(self, root, *, first_mode="nonzero", second_mode="ready"):
+        workspace = root / "workspace"
+        product = workspace / "product"
+        workflow_source = workspace / "workflow-source"
+        work = root / "work"
+        evidence = root / "evidence"
+        stub_bin = root / "stub-bin"
+        for directory in (product / "scripts", workflow_source, work, evidence, stub_bin):
+            directory.mkdir(parents=True, exist_ok=True)
+        self.write_executable(stub_bin / "python3", self.BUILD_PRODUCER_STUB)
+        self.write_executable(stub_bin / "git", self.GIT_STUB)
+        self.write_executable(product / "scripts" / "install_ci_cargo_fork.sh",
+                              self.CARGO_FORK_STUB)
+        script = root / "build.sh"
+        script.write_text(self.step_script(
+            "Build and bind both attested native harnesses"))
+        subprocess.run(["bash", "-n", str(script)], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        environment = {
+            "PATH": f"{stub_bin}:{os.environ.get('PATH', '')}",
+            "GITHUB_WORKSPACE": str(workspace),
+            "WORK": str(work),
+            "EVIDENCE": str(evidence),
+            "PRODUCT_SHA": "a" * 40,
+            "PRODUCT_TREE": "b" * 40,
+            "STUB_LOG": str(root / "producer.log"),
+            "STUB_WORK": str(work),
+            "STUB_FIRST_MODE": first_mode,
+            "STUB_SECOND_MODE": second_mode,
+            "STUB_SHA": "a" * 40,
+            "STUB_TREE": "b" * 40,
+        }
+        result = subprocess.run(
+            ["bash", str(script)], cwd=root, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return result, work, evidence, root / "producer.log"
+
+    def finalize_build_failure(self, root, work, evidence):
+        (work / "pg-baseline.json").write_text(json.dumps({
+            "server_version_num": 170005,
+            "databases": ["postgres", "template0", "template1"],
+            "client_major": 17,
+        }))
+        with mock.patch.object(driver, "verify_sources", return_value=provenance()), \
+                mock.patch.object(driver, "cleanup_databases", return_value=(True, True)):
+            result = driver.cmd_finalize(SimpleNamespace(
+                work=str(work), evidence=str(evidence),
+                product=str(root / "workspace" / "product"),
+                workflow_source=str(root / "workspace" / "workflow-source")))
+        self.assertEqual(result, 1)
+        return json.loads((evidence / "qualification.json").read_text())
+
+    def test_build_marker_and_classes_match_driver(self):
+        script = self.step_script("Build and bind both attested native harnesses")
+        self.assertIn("build_failed build-integration-producer", script)
+        self.assertIn("build_failed build-lib-producer", script)
+        self.assertIn('build_failed "build-$target-executable"', script)
+        self.assertIn('build_failed "build-$target-receipt"', script)
+        self.assertIn("require_built ref-store-operations integration", script)
+        self.assertIn("require_built slot-zero-lib lib", script)
+        self.assertIn(f'"$EVIDENCE/{driver.BUILD_FAILURE_MARKER}"', script)
+        self.assertNotIn("if ! (", script)
+        self.assertLess(script.index("--test ref_store_operations"),
+                        script.index("require_built ref-store-operations"))
+        self.assertLess(script.index("require_built ref-store-operations"),
+                        script.index("--lib"))
+
+    def test_first_producer_failure_prevents_second_and_survives_finalize(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, work, evidence, log = self.run_build_step(root)
+            self.assertEqual(result.returncode, 1)
+            invocations = log.read_text().splitlines()
+            self.assertEqual(len(invocations), 1)
+            self.assertIn("--test ref_store_operations", invocations[0])
+            self.assertNotIn("--lib", invocations[0])
+            self.assertEqual((evidence / "stage").read_text(), "build")
+            self.assertEqual((evidence / driver.BUILD_FAILURE_MARKER).read_text(),
+                             "build-integration-producer\n")
+            self.assertNotIn(str(root), result.stdout + result.stderr)
+            report = self.finalize_build_failure(root, work, evidence)
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["stage"], "build")
+            self.assertEqual(report["failure_class"], "build-integration-producer")
+            self.assertEqual(report["counts"]["not_run"], len(driver.ALL_CASES))
+
+    def test_second_producer_failure_survives_finalize(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, work, evidence, log = self.run_build_step(
+                root, first_mode="ready", second_mode="nonzero")
+            self.assertEqual(result.returncode, 1)
+            invocations = log.read_text().splitlines()
+            self.assertEqual(len(invocations), 2)
+            self.assertIn("--test ref_store_operations", invocations[0])
+            self.assertIn("--lib", invocations[1])
+            self.assertEqual((evidence / driver.BUILD_FAILURE_MARKER).read_text(),
+                             "build-lib-producer\n")
+            report = self.finalize_build_failure(root, work, evidence)
+            self.assertEqual(report["stage"], "build")
+            self.assertEqual(report["failure_class"], "build-lib-producer")
+
+    def test_local_executable_and_receipt_failures_are_distinct(self):
+        cases = (
+            ("no-output", "ready", "build-integration-executable"),
+            ("no-receipt", "ready", "build-integration-receipt"),
+            ("ready", "no-output", "build-lib-executable"),
+            ("ready", "no-receipt", "build-lib-receipt"),
+        )
+        for first_mode, second_mode, expected in cases:
+            with self.subTest(first=first_mode, second=second_mode):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    result, work, evidence, log = self.run_build_step(
+                        root, first_mode=first_mode, second_mode=second_mode)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(
+                        (evidence / driver.BUILD_FAILURE_MARKER).read_text(),
+                        expected + "\n")
+                    expected_calls = 1 if expected.startswith("build-integration") else 2
+                    self.assertEqual(len(log.read_text().splitlines()), expected_calls)
+                    report = self.finalize_build_failure(root, work, evidence)
+                    self.assertEqual(report["failure_class"], expected)
 
     def test_all_run_blocks_parse_with_bash(self):
         lines = self.text.splitlines()

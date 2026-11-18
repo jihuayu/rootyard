@@ -49,6 +49,16 @@ EXEC_OUTPUT_OVERFLOW = "output-overflow"
 EXEC_CASE_IO = "case-io"
 EXEC_REAP = "reap"
 JOB_TIMEOUT_MINUTES = 110
+BUILD_FAILURE_MARKER = "failure-class"
+BUILD_FAILURE_LIMIT = 64
+BUILD_FAILURE_TARGETS = ("integration", "lib")
+BUILD_FAILURE_REASONS = ("producer", "executable", "receipt")
+BUILD_FAILURE_CLASSES = frozenset(
+    f"build-{target}-{reason}"
+    for target in BUILD_FAILURE_TARGETS
+    for reason in BUILD_FAILURE_REASONS
+)
+BUILD_FAILURE_FALLBACK = "build"
 DATABASE_PREFIX = "slot0_native_"
 SLOT_ZERO_DATABASE = re.compile(r"slot_zero_[0-9a-f]{32}")
 DATABASE_FULL = re.compile(rf"{DATABASE_PREFIX}[0-9]{{1,12}}_[0-9]{{1,3}}_[0-9a-f]{{32}}")
@@ -117,6 +127,42 @@ class EvidenceError(ValueError):
 def require(condition, kind):
     if not condition:
         raise EvidenceError(kind)
+
+
+def build_failure_class(target, reason):
+    """Return one exact class for a fixed build target and fixed reason."""
+    require(target in BUILD_FAILURE_TARGETS, BUILD_FAILURE_FALLBACK)
+    require(reason in BUILD_FAILURE_REASONS, BUILD_FAILURE_FALLBACK)
+    return f"build-{target}-{reason}"
+
+
+def read_build_failure_class(evidence):
+    """Read the workflow's one-line build marker, or None when it is absent.
+
+    A present marker must be one exact allowlisted class.  Anything else raises
+    a fixed ``build`` error so the finalizer can fail closed without copying
+    marker text into the report.
+    """
+    path = Path(evidence) / BUILD_FAILURE_MARKER
+    try:
+        if not os.path.lexists(path):
+            return None
+        require(path.is_file() and not path.is_symlink(), BUILD_FAILURE_FALLBACK)
+        require(path.stat().st_size <= BUILD_FAILURE_LIMIT, BUILD_FAILURE_FALLBACK)
+        raw = path.read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError) as error:
+        raise EvidenceError(BUILD_FAILURE_FALLBACK) from error
+    require(raw.endswith("\n") and raw.count("\n") == 1, BUILD_FAILURE_FALLBACK)
+    value = raw[:-1]
+    require(value in BUILD_FAILURE_CLASSES, BUILD_FAILURE_FALLBACK)
+    return value
+
+
+def build_failure_is_closed(value):
+    """True when a reported build-prefixed class is one of the fixed classes."""
+    if not isinstance(value, str) or not value.startswith("build-"):
+        return True
+    return value in BUILD_FAILURE_CLASSES
 
 
 def sha256_bytes(data):
@@ -407,9 +453,11 @@ def make_report(*, provenance, validator_sha256, binaries, postgres, cases,
     counts = case_counts(rows)
     pg = postgres if isinstance(postgres, dict) else {}
     cleanup = cleanup if isinstance(cleanup, dict) else {}
-    require(set(cleanup) == {"database_removed", "roster_restored", "work_removed", "evidence_clean"},
+    require(set(cleanup) == {"database_removed", "roster_restored",
+                             "work_removed", "evidence_clean"},
             "evidence-cleanup")
     require(all(type(value) is bool for value in cleanup.values()), "evidence-cleanup")
+    require(build_failure_is_closed(failure_class), "evidence-stage")
 
     checks = (
         failure_class is None,
@@ -1115,6 +1163,10 @@ def cmd_finalize(args):
     stage = _read_optional(evidence / "stage") or "finalize"
     if stage not in {"source", "toolchain", "build", "bind", "postgres", "test", "finalize"}:
         stage = "finalize"
+    try:
+        build_failure = read_build_failure_class(evidence)
+    except EvidenceError:
+        build_failure = BUILD_FAILURE_FALLBACK
     candidate = {}
     binding = {}
     baseline = {}
@@ -1156,6 +1208,7 @@ def cmd_finalize(args):
                 and set(prior["cleanup"]) == {
                     "database_removed", "roster_restored", "work_removed", "evidence_clean"}
                 and all(type(value) is bool for value in prior["cleanup"].values())
+                and build_failure_is_closed(prior.get("failure_class"))
                 and (not prior["passed"] or (
                     prior.get("failure_class") is None and all(prior["cleanup"].values())))):
             status = "ok" if prior["passed"] else "failed"
@@ -1211,6 +1264,8 @@ def cmd_finalize(args):
         failure = "source-changed"
     elif not candidate:
         failure = stage
+    if build_failure is not None and failure in {None, "build"}:
+        failure = build_failure
     if ownership_error:
         if candidate or provenance is None:
             failure = failure or ownership_error
