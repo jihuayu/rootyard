@@ -1,0 +1,132 @@
+name: Pull Request Remote Authz Merge Finalizer (#156)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/pulls-remote-merge.yml'
+      - 'src/pulls.rs'
+      - 'src/pulls/remote_merge_finalizer.rs'
+      - 'src/pulls/remote_merge_finalizer/**'
+      - 'src/ref_store/projector/**'
+      - 'src/ref_store/core/state_machine.rs'
+      - 'src/ref_store/core/state_machine/**'
+      - 'crates/refcas-log/**'
+      - 'tests/pulls_remote_merge_finalizer.rs'
+      - 'tests/pulls_remote_merge_support/**'
+      - 'tests/test_pulls_remote_merge_contracts.py'
+      - 'scripts/eval_pulls_remote_merge.py'
+      - 'docs/pulls-remote-merge-finalizer.md'
+      - 'scripts/install_ci_cargo_fork.sh'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pulls-remote-merge-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pulls-remote-merge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: rootyard_merge156
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd="pg_isready -U rootyard -d rootyard_merge156"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_merge156
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfuse3-dev fuse3 pkg-config build-essential cmake clang libssl-dev openssl git
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && rustfmt -V && cargo clippy -V
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/pulls-remote-merge/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+      - name: Format, design-doc, and offline contract checks
+        run: |
+          git --version
+          openssl version
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_pulls_remote_merge_contracts.py
+      - name: Clippy, unit, and non-ignored integration tests
+        run: |
+          cargo clippy --locked --lib --test pulls_remote_merge_finalizer -- -D warnings
+          RUSTFLAGS="-D warnings" cargo test --locked --lib pulls::remote_merge_finalizer
+          RUSTFLAGS="-D warnings" cargo test --locked --test pulls_remote_merge_finalizer
+      - name: Build raft-node and run PG17 + 3-node mTLS Raft E2E
+        run: |
+          cargo build --locked --manifest-path crates/refcas-log/Cargo.toml --bin raft-node
+          export ROOTYARD_REFCAS_NODE_BIN="$PWD/crates/refcas-log/target/debug/raft-node"
+          test -x "$ROOTYARD_REFCAS_NODE_BIN"
+          RUSTFLAGS="-D warnings" cargo test --locked --test pulls_remote_merge_finalizer -- --ignored --test-threads=1
+      - name: Run reproducible stock-Git evaluator
+        run: |
+          mkdir -p test-results/pulls-remote-merge
+          python3 scripts/eval_pulls_remote_merge.py \
+            --formats sha1,sha256 \
+            --concurrent-prs 16 \
+            --json-out test-results/pulls-remote-merge/eval.json
+      - name: Upload pulls-remote-merge CI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulls-remote-merge-evidence
+          path: test-results/pulls-remote-merge/
+          if-no-files-found: warn

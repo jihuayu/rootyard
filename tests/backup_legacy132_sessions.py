@@ -1434,6 +1434,11 @@ class LegacyArchiveHarness(BackupHarness):
         for version in range(145, CURRENT_SCHEMA_VERSION + 1):
             for name, count in migration_seed_counts(version).items():
                 seeds[name] = seeds.get(name, 0) + count
+        if CURRENT_SCHEMA_VERSION >= 151 and "repository_name_reservations" in new_tables:
+            seeds["repository_name_reservations"] = int(self.query(
+                self.restore_db,
+                "SELECT (SELECT count(*) FROM public.repositories) + "
+                "(SELECT count(*) FROM public.repository_aliases)"))
         assert set(seeds) <= new_tables, (seeds, new_tables)
         counts = {
             name: int(self.query(
