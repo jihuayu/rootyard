@@ -16,6 +16,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import traceback
@@ -55,6 +56,199 @@ FAILURE_PHASES = frozenset((
     "setup", "API", "workspace", "capturefreeze", "Gitpark", "signal", "joins", "cleanup",
 ))
 MAX_DIAGNOSTIC_LINE = 100_000
+
+SHUTDOWN_OUTCOME_UNKNOWN = "unknown"
+SHUTDOWN_OUTCOME_MULTIPLE = "multiple"
+SHUTDOWN_OUTCOMES = frozenset((
+    "helper_internal_503",
+    "helper_deadline",
+    "capture_scan",
+    "git_drain",
+    "http_join",
+    "background_join",
+    "native_quiescence",
+    SHUTDOWN_OUTCOME_MULTIPLE,
+    SHUTDOWN_OUTCOME_UNKNOWN,
+))
+MAX_SHUTDOWN_TAIL_BYTES = 64 * 1024
+MAX_SHUTDOWN_RECORD_BYTES = 8 * 1024
+
+_SHUTDOWN_TERMINAL_PREFIXES = (
+    "Error: normal shutdown incomplete: ",
+    "Error: service cleanup incomplete: ",
+)
+_SHUTDOWN_CONTAINER_PREFIXES = (
+    "workspace capture/helper shutdown did not complete cleanly: ",
+)
+_SHUTDOWN_HELPER_CONTAINER = "workspace FUSE helper shutdown failed: "
+
+
+def _shutdown_pattern(text):
+    return re.compile(re.escape(text))
+
+
+_SHUTDOWN_HELPER_PATTERNS = (
+    (_shutdown_pattern("HTTP 503: service temporarily unavailable"),
+     "helper_internal_503"),
+    (_shutdown_pattern(
+        "HTTP 504: workspace FUSE helper shutdown exceeded the shared "
+        "normal-shutdown deadline"), "helper_deadline"),
+    (_shutdown_pattern(
+        "HTTP 504: workspace FUSE legacy mount teardown exceeded the shared "
+        "normal-shutdown deadline"), "helper_deadline"),
+)
+_SHUTDOWN_TOP_LEVEL_PATTERNS = (
+    (_shutdown_pattern(
+        "owned workspace Git jobs/process cleanup did not complete cleanly"),
+     "git_drain"),
+    (_shutdown_pattern(
+        "late owned workspace Git jobs/process cleanup did not complete cleanly"),
+     "git_drain"),
+    (_shutdown_pattern("HTTP server did not stop cleanly"), "http_join"),
+    (_shutdown_pattern(
+        "HTTP server did not join within the shutdown deadline"), "http_join"),
+    (_shutdown_pattern("background worker did not stop cleanly"),
+     "background_join"),
+    (_shutdown_pattern("session GC task did not join cleanly"),
+     "background_join"),
+    (_shutdown_pattern("sharding controller did not stop cleanly"),
+     "background_join"),
+    (_shutdown_pattern("workspace maintenance task did not stop cleanly"),
+     "background_join"),
+    (_shutdown_pattern("dispatch publisher did not stop cleanly"),
+     "background_join"),
+    (_shutdown_pattern("dispatch delivery worker did not stop cleanly"),
+     "background_join"),
+    (_shutdown_pattern("webhook worker did not stop cleanly"),
+     "background_join"),
+    (_shutdown_pattern("metrics worker did not stop cleanly"),
+     "background_join"),
+    (_shutdown_pattern("native Git process cleanup did not prove quiescence"),
+     "native_quiescence"),
+    (_shutdown_pattern(
+        "workspace capture worker did not stop before the abort-confirmation "
+        "window"), "capture_scan"),
+    (re.compile(
+        r"workspace capture worker abort was requested but its JoinHandle did "
+        r"not complete within the final \d+ms grace; producer-before-helper "
+        r"ordering is not claimed"), "capture_scan"),
+    (re.compile(r"workspace scan workers did not drain within \d+ms"),
+     "capture_scan"),
+    (re.compile(
+        r"workspace capture worker did not finish cleanly during shutdown "
+        r"\([^;\r\n]*\)"), "capture_scan"),
+    (re.compile(
+        r"workspace capture worker did not release cleanly after abort "
+        r"\([^;\r\n]*\)"), "capture_scan"),
+)
+
+
+def _match_shutdown_clause(text, patterns):
+    """Match one exact source-defined clause and return its tail/category."""
+    for pattern, category in patterns:
+        match = pattern.match(text)
+        if match is None:
+            continue
+        tail = text[match.end():]
+        if tail and not tail.startswith("; "):
+            continue
+        return category, tail[2:] if tail else ""
+    return None, text
+
+
+def _classify_shutdown_payload(payload):
+    """Classify only complete, source-defined cleanup clauses."""
+    categories = []
+    rest = payload
+    while rest:
+        if rest.startswith(_SHUTDOWN_HELPER_CONTAINER):
+            rest = rest[len(_SHUTDOWN_HELPER_CONTAINER):]
+            if not rest:
+                return SHUTDOWN_OUTCOME_UNKNOWN
+            category, rest = _match_shutdown_clause(
+                rest, _SHUTDOWN_HELPER_PATTERNS)
+            if category is None:
+                return SHUTDOWN_OUTCOME_UNKNOWN
+            categories.append(category)
+            continue
+        for prefix in _SHUTDOWN_CONTAINER_PREFIXES:
+            if rest.startswith(prefix):
+                rest = rest[len(prefix):]
+                break
+        else:
+            category, rest = _match_shutdown_clause(
+                rest, _SHUTDOWN_TOP_LEVEL_PATTERNS)
+            if category is None:
+                return SHUTDOWN_OUTCOME_UNKNOWN
+            categories.append(category)
+            continue
+        if not rest:
+            return SHUTDOWN_OUTCOME_UNKNOWN
+    if not categories:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    if len(set(categories)) == 1:
+        return categories[0]
+    return SHUTDOWN_OUTCOME_MULTIPLE
+
+
+def project_shutdown_outcome(data):
+    """Project one bounded harness-owned output tail to a closed outcome.
+
+    Only the final complete ``Error:`` terminal record is considered.  The
+    parser returns a fixed category or ``unknown``; it never returns or stores
+    log text, paths, ids, dynamic payloads, request ids, stacks or output.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    if len(data) > MAX_SHUTDOWN_TAIL_BYTES:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    try:
+        text = bytes(data).decode("utf-8")
+    except UnicodeDecodeError:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    terminal = None
+    for line in text.splitlines():
+        if any(line.startswith(prefix) for prefix in _SHUTDOWN_TERMINAL_PREFIXES):
+            terminal = line
+    if terminal is None:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    if len(terminal.encode("utf-8")) > MAX_SHUTDOWN_RECORD_BYTES:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    for prefix in _SHUTDOWN_TERMINAL_PREFIXES:
+        if terminal.startswith(prefix):
+            return _classify_shutdown_payload(terminal[len(prefix):])
+    return SHUTDOWN_OUTCOME_UNKNOWN
+
+
+def _shutdown_log_path(source):
+    if isinstance(source, (str, os.PathLike)):
+        return Path(source)
+    name = getattr(source, "name", None)
+    if isinstance(name, (str, os.PathLike)):
+        return Path(name)
+    return None
+
+
+def read_shutdown_outcome(source):
+    """Read only a bounded tail of harness-owned output and classify it."""
+    try:
+        path = _shutdown_log_path(source)
+        if path is None:
+            return SHUTDOWN_OUTCOME_UNKNOWN
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            start = max(0, size - MAX_SHUTDOWN_TAIL_BYTES)
+            stream.seek(start)
+            data = stream.read(MAX_SHUTDOWN_TAIL_BYTES)
+    except BaseException:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    if start:
+        newline = data.find(b"\n")
+        if newline < 0:
+            return SHUTDOWN_OUTCOME_UNKNOWN
+        data = data[newline + 1:]
+    return project_shutdown_outcome(data)
 
 
 def _flatten(suite):
@@ -159,6 +353,17 @@ def _failure_phase(test):
     return None
 
 
+def _shutdown_outcome(test):
+    """Read only the test's already projected fixed outcome, never raw output."""
+    try:
+        value = getattr(test, "_rootyard_diagnostic_shutdown_outcome", None)
+        if isinstance(value, str) and value in SHUTDOWN_OUTCOMES:
+            return value
+    except BaseException:
+        pass
+    return SHUTDOWN_OUTCOME_UNKNOWN
+
+
 def _unknown_diagnostic():
     return {
         "phase": None,
@@ -167,6 +372,7 @@ def _unknown_diagnostic():
         "http_status": None,
         "errno": None,
         "child_exit": None,
+        "shutdown_outcome": SHUTDOWN_OUTCOME_UNKNOWN,
     }
 
 
@@ -178,6 +384,7 @@ def _diagnostic_record(test, error, tb):
         "http_status": _http_status(error),
         "errno": _errno(error),
         "child_exit": _diagnostic_child_exit(test, error),
+        "shutdown_outcome": _shutdown_outcome(test),
     }
 
 

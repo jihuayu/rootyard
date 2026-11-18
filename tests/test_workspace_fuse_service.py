@@ -33,6 +33,7 @@ from tests import workspace_normal_shutdown_support as normal_shutdown
 from tests.e2e import Harness
 from tests.runtime_binary import select_runtime_binary
 from tests.workspace_capture_acceptance import install_capture_read_gate, wait_capture_gate
+from tests.workspace_fuse_service_acceptance import read_shutdown_outcome
 
 LEGACY_BACKEND = "fuse"
 HELPER_BACKEND = "fuse-helper"
@@ -688,6 +689,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
         """
         self._rootyard_diagnostic_phase = "setup"
         self._rootyard_diagnostic_api_exit = None
+        self._rootyard_diagnostic_shutdown_outcome = "unknown"
         binary, _ = select_runtime_binary()
         self.assertTrue(binary.is_file())
         real_git = shutil.which("git")
@@ -1041,6 +1043,12 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                                  "Git HTTP request did not resolve after wrapper release")
                 api_exit = support.wait_process_exit(h.proc, timeout=remaining())
                 self._rootyard_diagnostic_api_exit = api_exit
+                if api_exit != 0:
+                    # Read only the harness-owned tail, only when this exact
+                    # exit-zero assertion is about to fail. A successful exit
+                    # never opens the log.
+                    self._rootyard_diagnostic_shutdown_outcome = (
+                        read_shutdown_outcome(h.log))
                 self.assertEqual(api_exit, 0,
                                  f"normal service shutdown exit {api_exit}, expected 0")
 
