@@ -10,7 +10,10 @@ use axum::{
 use bytes::Bytes;
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -30,23 +33,29 @@ fn parse_range(value: &str) -> Option<(usize, usize)> {
 #[derive(Default)]
 struct S3State {
     objects: BTreeMap<String, Vec<u8>>,
+    get_delay_ms: Arc<AtomicU64>,
 }
 
 pub struct LoopbackS3 {
     pub endpoint: String,
+    pub get_delay_ms: Arc<AtomicU64>,
     task: JoinHandle<()>,
 }
 
 impl LoopbackS3 {
     pub async fn start() -> Result<Self> {
-        let state = Arc::new(StdMutex::new(S3State::default()));
+        let get_delay_ms = Arc::new(AtomicU64::new(0));
+        let state = Arc::new(StdMutex::new(S3State {
+            objects: BTreeMap::new(),
+            get_delay_ms: get_delay_ms.clone(),
+        }));
         let app = Router::new().fallback(handle).with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        Ok(Self { endpoint, task })
+        Ok(Self { endpoint, get_delay_ms, task })
     }
 }
 
@@ -98,6 +107,10 @@ async fn handle(
             reply(StatusCode::OK, Body::empty(), None, None)
         }
         Method::GET | Method::HEAD => {
+            let delay = state.lock().ok().map(|s| s.get_delay_ms.load(Ordering::Acquire)).unwrap_or(0);
+            if method == Method::GET && delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
             let stored = state.lock().ok().and_then(|s| s.objects.get(&full).cloned());
             let Some(stored) = stored else {
                 return reply(StatusCode::NOT_FOUND, Body::empty(), None, None);

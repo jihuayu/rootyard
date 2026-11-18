@@ -27,7 +27,14 @@ use rootyard::{
     storage::Storage,
 };
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
     sync::{Mutex, MutexGuard},
@@ -83,6 +90,7 @@ pub struct Cluster {
     pub scratch: PathBuf,
     pub git: Git,
     servers: Vec<JoinHandle<()>>,
+    s3_delay: Arc<AtomicU64>,
     _s3: LoopbackS3,
     admin: Pool,
     schema: String,
@@ -204,12 +212,17 @@ impl Cluster {
             scratch,
             git,
             servers: vec![blob_task, main_task],
+            s3_delay: s3.get_delay_ms.clone(),
             _s3: s3,
             admin,
             schema,
             _env: env,
             _lock: lock,
         })
+    }
+
+    pub fn set_s3_get_delay_ms(&self, delay_ms: u64) {
+        self.s3_delay.store(delay_ms, Ordering::Release);
     }
 
     pub async fn create_repository(&self, name: &str, format: &str) -> Result<Repository> {
@@ -471,7 +484,7 @@ async fn issue_actor(pool: &Pool) -> Result<Actor> {
 
 fn schema_pool(url: &str, schema: &str) -> Result<Pool> {
     let mut config: tokio_postgres::Config = url.parse()?;
-    config.options(&format!("-c search_path={schema} -c timezone=UTC -c statement_timeout=30000"));
+    config.options(format!("-c search_path={schema} -c timezone=UTC -c statement_timeout=30000"));
     Ok(Pool::builder(Manager::new(config, tokio_postgres::NoTls))
         .runtime(deadpool_postgres::Runtime::Tokio1)
         .max_size(16)

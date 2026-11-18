@@ -160,6 +160,7 @@ impl Producer {
         snapshot: &PackSnapshotRef,
         deadline: Instant,
     ) {
+        let cleanup_deadline = deadline.max(Instant::now() + std::time::Duration::from_secs(5));
         let Ok(mut client) = pool.get().await else { return };
         let Ok(tx) = client.transaction().await else { return };
         let Ok(request) = ReleaseMetadataPinRequest::new(
@@ -172,9 +173,9 @@ impl Producer {
             return;
         };
         let _ = crate::ref_store::PgRefStoreCore
-            .release_serving_checked(&tx, &request, self.store.backend_identity().as_hex(), deadline)
+            .release_serving_checked(&tx, &request, self.store.backend_identity().as_hex(), cleanup_deadline)
             .await;
-        let _ = commit_owned(tx, deadline).await;
+        let _ = commit_owned(tx, cleanup_deadline).await;
     }
 }
 
@@ -272,10 +273,33 @@ pub(crate) async fn existing_pin(
     .map_err(Error::internal)
 }
 
+/// Validate an existing pin replay against the live repository authority.
+async fn verify_replay_pin(
+    tx: &deadpool_postgres::Transaction<'_>,
+    row: &tokio_postgres::Row,
+    serving: &ServingRepository,
+    target_oid: &str,
+    storage_generation: i64,
+) -> Result<S4PinView, Error> {
+    let same = row.get::<_, String>(3) == target_oid
+        && row.get::<_, i64>(4) == storage_generation
+        && row.get::<_, Uuid>(8) == serving.gate.tenant_id()
+        && row.get::<_, i64>(11) == serving.gate.authority_epoch()
+        && row.get::<_, Uuid>(12) == serving.gate.history_incarnation()
+        && row.get::<_, i64>(13) == serving.gate.group_epoch()
+        && row.get::<_, Uuid>(14) == serving.cluster_incarnation;
+    if !super::s4_schema::gate_live(tx, serving).await? {
+        return Err(Error(StatusCode::CONFLICT, "repository authority changed"));
+    }
+    if row.get::<_, String>(9) == "pinned" && same {
+        super::s4_authority::ensure_root_active(tx, serving.repository.id, row.get(5)).await?;
+        return Ok(pin_view(row));
+    }
+    Err(Error(StatusCode::CONFLICT, "job already has a different target or state"))
+}
 /// Serialize `issue` against `cancel`/`revoke` for one exact job inside the
 /// caller's transaction, so a concurrent terminal write is never lost.
 pub(crate) use super::s4_schema::lock_job;
-
 /// One `ci-pins` create. Exact `(target, generation, tenant)` replay is
 /// idempotent; any other reuse of the same job id is a conflict.
 pub(crate) async fn pin(
@@ -317,6 +341,7 @@ pub(crate) async fn pin(
         .await
         .map_err(|_| Error::timeout())?;
     lock_job(&tx, repository_id, input.job_id).await?;
+    super::s4_schema::ensure_job_not_terminal_in_tx(&tx, repository_id, input.job_id).await?;
     if let Some(row) = existing_pin(&tx, repository_id, input.job_id).await? {
         super::s4_authority::guard_repository(
             &tx,
@@ -328,24 +353,10 @@ pub(crate) async fn pin(
             input.storage_generation,
         )
         .await?;
-        let same = row.get::<_, String>(3) == target_oid
-            && row.get::<_, i64>(4) == input.storage_generation
-            && row.get::<_, Uuid>(8) == tenant_id
-            && row.get::<_, i64>(11) == serving.gate.authority_epoch()
-            && row.get::<_, Uuid>(12) == serving.gate.history_incarnation()
-            && row.get::<_, i64>(13) == serving.gate.group_epoch()
-            && row.get::<_, Uuid>(14) == serving.cluster_incarnation;
-        if !super::s4_schema::gate_live(&tx, &serving).await? {
-            return Err(Error(StatusCode::CONFLICT, "repository authority changed"));
-        }
-        if row.get::<_, String>(9) == "pinned" && same {
-            super::s4_authority::ensure_root_active(&tx, repository_id, row.get(5)).await?;
-            let body = pin_view(&row);
-            commit_owned(tx, deadline).await?;
-            drop(client);
-            return Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response());
-        }
-        return Err(Error(StatusCode::CONFLICT, "job already has a different target or state"));
+        let body = verify_replay_pin(&tx, &row, &serving, target_oid, input.storage_generation).await?;
+        commit_owned(tx, deadline).await?;
+        drop(client);
+        return Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response());
     }
     let _ = tx.rollback().await;
     drop(client);
@@ -390,27 +401,17 @@ pub(crate) async fn pin(
             input.storage_generation,
         )
         .await?;
-        // The existence check precedes root registration, so a concurrent
-        // duplicate commits its business row but never an unreferenced root.
+        super::s4_schema::ensure_job_not_terminal_in_tx(&tx, repository_id, input.job_id).await?;
+        if !super::s4_schema::gate_live(&tx, &serving).await? {
+            return Err(Error(StatusCode::CONFLICT, "repository authority changed"));
+        }
+        // The terminal and existence checks precede root registration, so a
+        // concurrent duplicate or cancellation never leaves an orphan root.
         if let Some(row) = existing_pin(&tx, repository_id, input.job_id).await? {
-            let same = row.get::<_, String>(3) == target_oid
-                && row.get::<_, i64>(4) == input.storage_generation
-                && row.get::<_, Uuid>(8) == tenant_id
-                && row.get::<_, i64>(11) == serving.gate.authority_epoch()
-                && row.get::<_, Uuid>(12) == serving.gate.history_incarnation()
-                && row.get::<_, i64>(13) == serving.gate.group_epoch()
-                && row.get::<_, Uuid>(14) == serving.cluster_incarnation;
-            if !super::s4_schema::gate_live(&tx, &serving).await? {
-                return Err(Error(StatusCode::CONFLICT, "repository authority changed"));
-            }
-            if row.get::<_, String>(9) == "pinned" && same {
-                super::s4_authority::ensure_root_active(&tx, repository_id, row.get(5)).await?;
-                let body = pin_view(&row);
-                commit_owned(tx, deadline).await?;
-                drop(client);
-                return Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response());
-            }
-            return Err(Error(StatusCode::CONFLICT, "job already has a different target or state"));
+            let body = verify_replay_pin(&tx, &row, &serving, target_oid, input.storage_generation).await?;
+            commit_owned(tx, deadline).await?;
+            drop(client);
+            return Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response());
         }
         producer
             .roots

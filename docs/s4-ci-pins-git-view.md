@@ -66,9 +66,12 @@ job was not pinned first):
    is served on `pg_refstore`.
 2. Open a short-lease `PackSnapshot` (120 s) and prove the native + Blob closure
    with `prepare_serving` **outside** PostgreSQL.
-3. In one transaction: register the root, re-check the source pin is live, verify
-   RBAC, repository tenant/generation/state, insert the job, the grant and the
-   pin. The transient source `MetadataPin` is released only after that commit.
+3. In one transaction: lock the job and reject a terminal plan, then re-prove
+   RBAC, repository tenant/generation/state, the live gate and the source pin
+   before registering the root and inserting the job, grant and pin. The job and
+   gate are checked again under the final lock after capture, immediately before
+   `register_serving_in_tx`; a concurrent cancel wins. The transient source
+   `MetadataPin` is released only after that commit.
 4. Return the `ryj_` token. An exact replay of `(target, generation, tenant)` is
    idempotent; any other reuse of the job id is `409`.
 
@@ -86,6 +89,12 @@ is streamed in 16 KiB chunks while the authorization is re-proved every 100 ms;
 on revocation the child `upload-pack` is killed and the stream ends with
 `checkout authorization revoked during transfer`. The shared `state.git_slots`
 permit is owned by the stream and returns to the semaphore on every exit path.
+
+Every S4 and Namespace Git View child runs in its own process group. Timeout,
+revocation, client disconnect and future cancellation all `SIGKILL` the entire
+group, poll `/proc` until it is quiescent, and reap the leader before the request
+releases its gate, slot or temporary repository. Git output and runtime are
+bounded; no unbounded `std::process::Command` path remains on these routes.
 
 ## Namespace GitView
 

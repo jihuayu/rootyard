@@ -6,6 +6,9 @@
 //! `refs/heads/projected`; nothing durable and no unprojected sibling path is
 //! ever exposed.
 use super::views;
+use super::views::s4_git_proc::{
+    GitStdin, META_OUTPUT_CAP, base_command, git_bytes, git_clone, run_git_bounded,
+};
 use crate::{
     AppState, Error, auth, db::Identity, members::models::Role,
     ref_store::core::retention_root::{PgRetentionRoots, RootRef},
@@ -16,12 +19,8 @@ use axum::{
     http::{HeaderMap, HeaderName, StatusCode, header},
     response::Response,
 };
-use std::{
-    fs,
-    path::{Path as FsPath, PathBuf},
-    process::Stdio,
-};
-use tokio::{process::Command, time::Instant};
+use std::{fs, path::PathBuf};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 /// Disposable tree removed before the response is returned.
@@ -55,44 +54,6 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
-}
-
-async fn git(dir: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
-    let out = Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "-C"])
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_PROTOCOL")
-        .output()
-        .await
-        .map_err(Error::internal)?;
-    if !out.status.success() {
-        return Err(Error(StatusCode::CONFLICT, "Git view projection failed"));
-    }
-    Ok(out.stdout)
-}
-
-async fn git_clone(source: &FsPath, dest: &FsPath, extra: &[&str]) -> Result<(), Error> {
-    let out = Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null", "clone"])
-        .args(extra)
-        .arg("--")
-        .arg(source)
-        .arg(dest)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_PROTOCOL")
-        .output()
-        .await
-        .map_err(Error::internal)?;
-    if !out.status.success() {
-        return Err(Error(StatusCode::CONFLICT, "Git view clone failed"));
-    }
-    Ok(())
 }
 
 /// Re-prove the recorded view binding, the live repository authority and the
@@ -161,21 +122,42 @@ async fn materialize_projected_bare(
         deadline,
     )
     .await?;
-    git_clone(holder.path(), &scratch.work(), &["--no-local", "--no-hardlinks", "--no-tags"]).await?;
-    let projected = views::s4_git_view::project(&scratch.work(), &view.source_oid, &view.subdir)?;
+    git_clone(
+        &state.config.git,
+        holder.path(),
+        &scratch.work(),
+        &["--no-local", "--no-hardlinks", "--no-tags"],
+        deadline,
+    )
+    .await?;
+    let projected = views::s4_git_view::project(&state.config.git, &scratch.work(), &view.source_oid, &view.subdir, deadline)
+        .await?;
     if projected != view.projected_oid {
         return Err(Error(StatusCode::CONFLICT, "view projection no longer matches its recorded head"));
     }
     let bare = scratch.bare();
     git_clone(
+        &state.config.git,
         &scratch.work(),
         &bare,
         &["--bare", "--no-local", "--no-hardlinks", "--no-tags", "--single-branch", "--branch", "projected"],
+        deadline,
     )
     .await?;
-    git(&bare, &["symbolic-ref", "HEAD", "refs/heads/projected"]).await?;
-    git(&bare, &["config", "uploadpack.allowAnySHA1InWant", "false"]).await?;
-    git(&bare, &["config", "uploadpack.allowReachableSHA1InWant", "false"]).await?;
+    for args in [
+        &["symbolic-ref", "HEAD", "refs/heads/projected"][..],
+        &["config", "uploadpack.allowAnySHA1InWant", "false"][..],
+        &["config", "uploadpack.allowReachableSHA1InWant", "false"][..],
+    ] {
+        let _ = git_bytes(
+            &state.config.git,
+            &bare,
+            args,
+            deadline,
+            "Git view projection failed",
+        )
+        .await?;
+    }
     Ok(bare)
 }
 
@@ -206,18 +188,20 @@ pub(super) async fn info_refs(
         let root_id = verify_active_binding(state, view, view.id).await?;
         let scratch = Scratch::create()?;
         let bare = materialize_projected_bare(state, view, root_id, &scratch, deadline).await?;
-        let mut cmd = state.storage.git(&state.config);
+        let mut cmd = base_command(&state.config.git);
         cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
         if let Some(proto) = protocol {
             cmd.env("GIT_PROTOCOL", proto);
-        } else {
-            cmd.env_remove("GIT_PROTOCOL");
         }
-        cmd.args(["upload-pack", "--stateless-rpc", "--advertise-refs"]).arg(&bare);
-        let timeout = super::remaining_timeout(deadline)?;
-        let advertised = crate::git_http::collect_git_output(cmd, super::ADVERTISE_LIMIT, timeout)
-            .await
-            .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "projected Git view unavailable"))?;
+        cmd.args(["upload-pack", "--stateless-rpc", "--advertise-refs"]).arg(bare);
+        let advertised = run_git_bounded(
+            cmd,
+            GitStdin::Null,
+            META_OUTPUT_CAP.min(super::ADVERTISE_LIMIT),
+            deadline,
+            Error(StatusCode::SERVICE_UNAVAILABLE, "projected Git view unavailable"),
+        )
+        .await?;
         views::load_for_actor(state, actor, view.id).await?;
         auth::verify_active(&state.pool, actor, view.repository_id, RepoAction::ContentsRead, Role::Read).await?;
         verify_active_binding(state, view, view.id).await?;
@@ -251,31 +235,23 @@ pub(super) async fn upload_pack(
             super::spool_body_to_temp(&scratch.root, view.id, body, gzipped, max_req, deadline).await?;
         let root_id = verify_active_binding(state, view, view.id).await?;
         let bare = materialize_projected_bare(state, view, root_id, &scratch, deadline).await?;
-        let mut cmd = state.storage.git(&state.config);
+        let mut cmd = base_command(&state.config.git);
         cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
         if let Some(proto) = protocol.as_deref() {
             cmd.env("GIT_PROTOCOL", proto);
-        } else {
-            cmd.env_remove("GIT_PROTOCOL");
         }
-        cmd.args(["upload-pack", "--stateless-rpc"]).arg(&bare);
+        cmd.args(["upload-pack", "--stateless-rpc"]).arg(bare);
         let max_out = usize::try_from(state.config.max_output_bytes)
             .unwrap_or(super::UPLOAD_RESULT_CAP)
             .min(super::UPLOAD_RESULT_CAP);
-        let pack = crate::git_http::collect_git_output_input(
+        let pack = run_git_bounded(
             cmd,
+            GitStdin::File(req_file),
             max_out,
-            super::remaining_timeout(deadline)?,
-            Stdio::from(req_file),
+            deadline,
+            Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request"),
         )
-        .await
-        .map_err(|_| {
-            if Instant::now() >= deadline {
-                Error::timeout()
-            } else {
-                Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request")
-            }
-        })?;
+        .await?;
         if pack.get(4..).is_some_and(|rest| rest.starts_with(b"ERR ")) {
             return Err(Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request"));
         }

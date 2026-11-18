@@ -26,6 +26,7 @@ TOUCHED = [
     CI_PINS / "s4_pin.rs",
     CI_PINS / "s4_release.rs",
     CI_PINS / "s4_authority.rs",
+    CI_PINS / "s4_git_runner.rs",
     CI_PINS / "s4_checkout.rs",
     CI_PINS / "s4_transport.rs",
     CI_PINS / "s4_tests.rs",
@@ -36,11 +37,16 @@ TOUCHED = [
     SRC / "namespace_service" / "reverse.rs",
     SRC / "namespace_service" / "reverse_git.rs",
     SRC / "namespace_service" / "s4_git_view.rs",
+    SRC / "namespace_service" / "s4_git_proc.rs",
+    SRC / "namespace_service" / "s4_git_proc_tests.rs",
+    SRC / "namespace_service" / "s4_git_proc_reverse.rs",
     SRC / "namespace_service" / "s4_git_view_reverse.rs",
     SRC / "namespace_service" / "view_git_http.rs",
     SRC / "namespace_service" / "s4_git_view_http.rs",
     TESTS / "s4_ci_pins_git_view.rs",
     TESTS / "s4_ci_pins_git_view_support" / "harness.rs",
+    TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs",
+    TESTS / "s4_ci_pins_git_view_support" / "s3.rs",
 ]
 
 ZERO_TOUCH = [
@@ -204,6 +210,38 @@ class SourceContracts(unittest.TestCase):
         self.assertIn("read_cluster_incarnation_nowait", authority)
         self.assertIn("cluster_incarnation", text(CI_PINS / "s4_schema.rs"))
         self.assertIn("cluster_incarnation", text(CI_PINS / "s4_models.rs"))
+
+    def test_pin_rechecks_terminal_job_under_final_lock(self) -> None:
+        schema = text(CI_PINS / "s4_schema.rs")
+        pin = text(CI_PINS / "s4_pin.rs")
+        self.assertIn("ensure_job_not_terminal_in_tx", schema)
+        self.assertIn("job is terminal", schema)
+        self.assertGreaterEqual(pin.count("ensure_job_not_terminal_in_tx"), 2, "final pin lock must recheck the job")
+        self.assertNotIn("ref_store_core_metadata_pins", pin)
+
+    def test_git_view_subprocesses_are_bounded_and_reaped(self) -> None:
+        proc = text(SRC / "namespace_service" / "s4_git_proc.rs")
+        runner = text(CI_PINS / "s4_git_runner.rs")
+        for body in (
+            text(SRC / "namespace_service" / "s4_git_view.rs"),
+            text(SRC / "namespace_service" / "s4_git_view_http.rs"),
+            text(SRC / "namespace_service" / "s4_git_view_reverse.rs"),
+            text(CI_PINS / "s4_transport.rs"),
+        ):
+            self.assertNotIn("std::process::Command", body)
+            self.assertNotIn("Command::new", body)
+        for body in (proc, runner):
+            self.assertIn("process_group(0)", body)
+            self.assertIn("kill_and_reap", body)
+            self.assertIn("group_quiescent", body)
+        self.assertIn("ReapOnDropGuard", proc)
+        self.assertIn("UploadPackGroup", runner)
+        self.assertIn('env_remove("GIT_PROTOCOL")', proc)
+
+    def test_hold_regressions_cover_the_two_review_items(self) -> None:
+        body = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")
+        for needle in ("/ci-pins", "ref_store_core_root_heads", "/git/views/", "/proc/"):
+            self.assertIn(needle, body)
 
     def test_line_endings_are_pure_lf(self) -> None:
         for path in TOUCHED + [WORKFLOW, DOC]:

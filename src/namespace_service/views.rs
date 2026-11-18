@@ -21,6 +21,14 @@ use uuid::Uuid;
 #[path = "s4_git_view.rs"]
 pub(super) mod s4_git_view;
 
+#[rustfmt::skip]
+#[path = "s4_git_proc.rs"]
+pub(crate) mod s4_git_proc;
+
+#[rustfmt::skip]
+#[path = "s4_git_proc_reverse.rs"]
+pub(crate) mod s4_git_proc_reverse;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateView {

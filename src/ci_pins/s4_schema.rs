@@ -112,6 +112,31 @@ pub(crate) async fn lock_job(
     Ok(())
 }
 
+/// Reject pin registration when the target CI job has already been marked
+/// cancelled or revoked under `lock_job`.
+pub(crate) async fn ensure_job_not_terminal_in_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    repository_id: uuid::Uuid,
+    job_id: uuid::Uuid,
+) -> Result<(), Error> {
+    let row = tx
+        .query_opt(
+            "SELECT cancelled, revoked, plan FROM ci_checkout_jobs \
+             WHERE repository_id=$1 AND job_id=$2 FOR UPDATE",
+            &[&repository_id, &job_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    if row.is_some_and(|row| {
+        row.get::<_, bool>(0)
+            || row.get::<_, bool>(1)
+            || row.get::<_, Option<serde_json::Value>>(2).is_none()
+    }) {
+        return Err(Error(axum::http::StatusCode::CONFLICT, "job is terminal"));
+    }
+    Ok(())
+}
+
 /// Prove that the live gate and serving row still match every authority fact
 /// this issuance is about to record.
 pub(crate) async fn gate_live(

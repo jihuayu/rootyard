@@ -45,7 +45,7 @@ impl Drop for Stage {
     }
 }
 
-pub(super) fn replace_tree(repo: &FsPath, tree: &str, parts: &[&str], projected: &str) -> Result<String, Error> {
+fn replace_tree(repo: &FsPath, tree: &str, parts: &[&str], projected: &str) -> Result<String, Error> {
     let raw = git(repo, &["ls-tree", "-z", tree])?;
     let mut entries = BTreeMap::<Vec<u8>, Vec<u8>>::new();
     for record in raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {

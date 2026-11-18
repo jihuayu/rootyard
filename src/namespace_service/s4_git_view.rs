@@ -11,6 +11,7 @@
 //! *before* PostgreSQL is touched, so the projected object id is known when the
 //! one and only transaction opens. Root registration, RBAC, the view row, its
 //! history and the binding then commit together or not at all.
+use super::s4_git_proc::{git_clone, git_init_bare, git_text};
 use crate::namespace_service::{handlers, views::{CreateView, View}};
 use crate::ref_store::core::pack_commit::PackArtifactRole;
 use crate::{AppState, Error, db::Identity, members::models::Role, token_scopes::RepoAction};
@@ -18,7 +19,6 @@ use axum::http::StatusCode;
 use std::{
     fs,
     path::{Path as FsPath, PathBuf},
-    process::Command,
 };
 use uuid::Uuid;
 
@@ -55,62 +55,13 @@ impl Drop for TempTree {
     }
 }
 
-/// Every Git child gets the same deterministic identity, so a projected commit
-/// never depends on the host user or a missing global configuration.
-fn command() -> Command {
-    let mut command = Command::new("git");
-    command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("FILTER_BRANCH_SQUELCH_WARNING", "1")
-        .env("GIT_AUTHOR_NAME", "Rootyard")
-        .env("GIT_AUTHOR_EMAIL", "view@rootyard.local")
-        .env("GIT_COMMITTER_NAME", "Rootyard")
-        .env("GIT_COMMITTER_EMAIL", "view@rootyard.local");
-    command
-}
-
-fn git(dir: &FsPath, args: &[&str]) -> Result<String, Error> {
-    let out = command()
-        .args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "-C"])
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(Error::internal)?;
-    if !out.status.success() {
-        return Err(Error(StatusCode::CONFLICT, "Git view projection failed"));
-    }
-    String::from_utf8(out.stdout).map_err(Error::internal)
-}
-
-fn git_init(bare: &FsPath, format: &str) -> Result<(), Error> {
-    let argument = format!("--object-format={format}");
-    let out = command()
-        .args(["-c", "core.hooksPath=/dev/null", "init", "--bare", &argument])
-        .arg(bare)
-        .output()
-        .map_err(Error::internal)?;
-    if !out.status.success() {
-        return Err(Error(StatusCode::CONFLICT, "Git view repository could not be initialized"));
-    }
-    Ok(())
-}
-
-fn git_clone(source: &FsPath, dest: &FsPath) -> Result<(), Error> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(Error::internal)?;
-    }
-    let out = command()
-        .args(["-c", "core.hooksPath=/dev/null", "clone", "--no-local", "--no-hardlinks", "--no-tags"])
-        .arg(source)
-        .arg(dest)
-        .output()
-        .map_err(Error::internal)?;
-    if !out.status.success() {
-        return Err(Error(StatusCode::CONFLICT, "Git view clone failed"));
-    }
-    Ok(())
+async fn run_git(
+    git_bin: &FsPath,
+    repo: &FsPath,
+    args: &[&str],
+    deadline: tokio::time::Instant,
+) -> Result<String, Error> {
+    git_text(git_bin, repo, args, deadline, "Git view projection failed").await
 }
 
 /// True only for repositories served on `pg_refstore`.
@@ -196,9 +147,10 @@ async fn materialize_packs(
     captured: &Captured,
     base_oid: &str,
     tree: &TempTree,
+    deadline: tokio::time::Instant,
 ) -> Result<(), Error> {
     let bare = tree.bare();
-    git_init(&bare, &captured.object_format)?;
+    git_init_bare(&state.config.git, &bare, &captured.object_format, deadline).await?;
     let packs = bare.join("objects/pack");
     fs::create_dir_all(&packs).map_err(Error::internal)?;
     let std_deadline = std::time::Instant::now() + state.config.git_timeout;
@@ -215,7 +167,7 @@ async fn materialize_packs(
                 .map_err(Error::internal)?;
         }
     }
-    git(&bare, &["update-ref", "refs/heads/main", base_oid])?;
+    run_git(&state.config.git, &bare, &["update-ref", "refs/heads/main", base_oid], deadline).await?;
     Ok(())
 }
 
@@ -223,23 +175,35 @@ async fn materialize_packs(
 /// survives `--subdirectory-filter` for a non-empty `subdir`. Remote-tracking
 /// refs are deleted first so they can never leak unrelated root files into a
 /// bundle.
-pub(crate) fn project(work: &FsPath, base: &str, subdir: &str) -> Result<String, Error> {
-    git(work, &["checkout", "-B", "projected", base])?;
-    let remotes = git(work, &["for-each-ref", "--format=%(refname)", "refs/remotes"])?;
+pub(crate) async fn project(
+    git_bin: &FsPath,
+    work: &FsPath,
+    base: &str,
+    subdir: &str,
+    deadline: tokio::time::Instant,
+) -> Result<String, Error> {
+    run_git(git_bin, work, &["checkout", "-B", "projected", base], deadline).await?;
+    let remotes = run_git(git_bin, work, &["for-each-ref", "--format=%(refname)", "refs/remotes"], deadline).await?;
     for reference in remotes.lines().filter(|line| !line.is_empty()) {
-        let _ = git(work, &["update-ref", "-d", reference]);
+        let _ = run_git(git_bin, work, &["update-ref", "-d", reference], deadline).await;
     }
     if !subdir.is_empty() {
-        let kind = git(work, &["cat-file", "-t", &format!("{base}^{{tree}}:{subdir}")])
-            .map_err(|_| Error::bad_request())?;
+        let path = format!("{base}^{{tree}}:{subdir}");
+        let kind = run_git(git_bin, work, &["cat-file", "-t", &path], deadline).await.map_err(|_| Error::bad_request())?;
         if kind.trim() != "tree" {
             return Err(Error::bad_request());
         }
-        git(work, &["filter-branch", "-f", "--subdirectory-filter", subdir, "--", "refs/heads/projected"])?;
-        let _ = git(work, &["update-ref", "-d", "refs/original/refs/heads/projected"]);
+        run_git(
+            git_bin,
+            work,
+            &["filter-branch", "-f", "--subdirectory-filter", subdir, "--", "refs/heads/projected"],
+            deadline,
+        )
+        .await?;
+        let _ = run_git(git_bin, work, &["update-ref", "-d", "refs/original/refs/heads/projected"], deadline).await;
     }
-    let projected = git(work, &["rev-parse", "refs/heads/projected"])?.trim().to_owned();
-    git(work, &["symbolic-ref", "HEAD", "refs/heads/projected"])?;
+    let projected = run_git(git_bin, work, &["rev-parse", "refs/heads/projected"], deadline).await?.trim().to_owned();
+    run_git(git_bin, work, &["symbolic-ref", "HEAD", "refs/heads/projected"], deadline).await?;
     Ok(projected)
 }
 
@@ -253,12 +217,15 @@ pub(crate) async fn verify_mounted_commit(
     let deadline = tokio::time::Instant::now() + state.config.git_timeout;
     let captured = capture(state, actor, mount, deadline).await.map_err(|_| Error::bad_request())?;
     let tree = TempTree::create()?;
-    let checked = materialize_packs(state, &captured, &mount.base_oid, &tree).await;
+    let checked = materialize_packs(state, &captured, &mount.base_oid, &tree, deadline).await;
     let snapshot_scope = captured.prepared.snapshot_scope;
     let snapshot = captured.prepared.snapshot;
     captured.producer.release_source_snapshot(&state.pool, snapshot_scope, &snapshot, deadline).await;
     checked.map_err(|_| Error::bad_request())?;
-    git(&tree.bare(), &["cat-file", "-e", &format!("{}^{{commit}}", mount.base_oid)]).map_err(|_| Error::bad_request())?;
+    let commit = format!("{}^{{commit}}", mount.base_oid);
+    run_git(&state.config.git, &tree.bare(), &["cat-file", "-e", &commit], deadline)
+        .await
+        .map_err(|_| Error::bad_request())?;
     Ok(())
 }
 
@@ -281,9 +248,16 @@ pub(super) async fn create(
             return Err(Error::not_found());
         }
         let tree = TempTree::create()?;
-        materialize_packs(state, &captured, &mount.base_oid, &tree).await?;
-        git_clone(&tree.bare(), &tree.work())?;
-        let projected = project(&tree.work(), &mount.base_oid, &input.subdir)?;
+        materialize_packs(state, &captured, &mount.base_oid, &tree, deadline).await?;
+        git_clone(
+            &state.config.git,
+            &tree.bare(),
+            &tree.work(),
+            &["--no-local", "--no-hardlinks", "--no-tags"],
+            deadline,
+        )
+        .await?;
+        let projected = project(&state.config.git, &tree.work(), &mount.base_oid, &input.subdir, deadline).await?;
         let vid = Uuid::new_v4();
         let root_id = captured.prepared.request.candidate().root_id();
         let register_digest = captured.prepared.request.candidate().register_digest().as_hex();
@@ -433,14 +407,21 @@ pub(super) async fn bundle(
     )
     .await?;
     let tree = TempTree::create()?;
-    git_clone(holder.path(), &tree.work())?;
-    let projected = project(&tree.work(), &view.source_oid, &view.subdir)?;
+    git_clone(
+        &state.config.git,
+        holder.path(),
+        &tree.work(),
+        &["--no-local", "--no-hardlinks", "--no-tags"],
+        deadline,
+    )
+    .await?;
+    let projected = project(&state.config.git, &tree.work(), &view.source_oid, &view.subdir, deadline).await?;
     if projected != view.projected_oid {
         return Err(Error(StatusCode::CONFLICT, "view projection no longer matches its recorded head"));
     }
     let file = tree.root.join("view.bundle");
     let file = file.to_str().ok_or_else(Error::bad_request)?;
-    git(&tree.work(), &["bundle", "create", file, "refs/heads/projected", "HEAD"])?;
+    run_git(&state.config.git, &tree.work(), &["bundle", "create", file, "refs/heads/projected", "HEAD"], deadline).await?;
     let bytes = fs::read(file).map_err(Error::internal)?;
     if bytes.len() > 32 * 1024 * 1024 {
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "view bundle too large"));

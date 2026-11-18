@@ -4,7 +4,8 @@
 #[rustfmt::skip]
 #[path = "s4_ci_pins_git_view_support/harness.rs"]
 pub mod harness;
-
+#[path = "s4_ci_pins_git_view_support/hold_regressions.rs"]
+mod hold_regressions;
 use anyhow::{Result, ensure};
 use harness::{Cluster, Repository};
 use reqwest::StatusCode;
@@ -134,7 +135,6 @@ async fn set_gate_epoch(pool: &deadpool_postgres::Pool, repo_id: Uuid, epoch: i6
     tx.commit().await?;
     Ok(())
 }
-
 #[tokio::test]
 #[ignore = "requires real PG17, an S3 endpoint and native Git"]
 async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()> {
@@ -391,7 +391,6 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
     .await;
     cluster.finish(outcome).await
 }
-
 #[tokio::test]
 #[ignore = "requires real PG17, an S3 endpoint and native Git"]
 async fn s4_git_view_bundle_is_projected_only_and_reverse_merges_the_subtree() -> Result<()> {
@@ -476,4 +475,14 @@ async fn s4_sha256_pin_clone_and_reverse_round_trip() -> Result<()> {
     }
     .await;
     cluster.finish(outcome).await
+}
+#[tokio::test]
+#[ignore = "requires real PG17, an S3 endpoint and native Git"]
+async fn s4_terminal_job_rechecks_under_final_lock() -> Result<()> {
+    hold_regressions::terminal_job_race().await
+}
+#[tokio::test]
+#[ignore = "requires real PG17, an S3 endpoint and native Git"]
+async fn s4_git_children_are_bounded_and_reaped() -> Result<()> {
+    hold_regressions::bounded_child_lifecycle().await
 }

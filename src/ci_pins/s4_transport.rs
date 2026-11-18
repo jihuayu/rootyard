@@ -15,13 +15,9 @@ use axum::{
     http::{StatusCode, header},
     response::Response,
 };
-use std::{
-    path::{Path as FsPath, PathBuf},
-    process::Stdio,
-};
+use std::path::{Path as FsPath, PathBuf};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
     time::Instant,
 };
 
@@ -70,21 +66,15 @@ impl Drop for DisposableCiView {
     }
 }
 
-fn git(dir: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
-    let output = std::process::Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null", "--git-dir"])
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_PROTOCOL")
-        .output()
-        .map_err(Error::internal)?;
-    if !output.status.success() {
-        return Err(Error(StatusCode::CONFLICT, "retained root could not be materialized"));
-    }
-    Ok(output.stdout)
+async fn git_dir(state: &AppState, dir: &FsPath, args: &[&str], deadline: Instant) -> Result<Vec<u8>, Error> {
+    super::s4_authority::run_git_dir_bounded(
+        &state.config.git,
+        Some(dir),
+        args,
+        deadline,
+        Error(StatusCode::CONFLICT, "retained root could not be materialized"),
+    )
+    .await
 }
 
 fn write_pack(dir: &FsPath, pack_id: Uuid, pack: &[u8], idx: &[u8]) -> Result<(), Error> {
@@ -96,18 +86,16 @@ fn write_pack(dir: &FsPath, pack_id: Uuid, pack: &[u8], idx: &[u8]) -> Result<()
     Ok(())
 }
 
-fn init_bare(dir: &FsPath, format: &str) -> Result<(), Error> {
-    let init = std::process::Command::new("git")
-        .args(["init", "--bare", "--quiet"])
-        .arg(format!("--object-format={format}"))
-        .arg(dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .map_err(Error::internal)?;
-    if !init.status.success() {
-        return Err(Error::internal("bare repository initialization failed"));
-    }
+async fn init_bare(state: &AppState, dir: &FsPath, format: &str, deadline: Instant) -> Result<(), Error> {
+    let object_format = format!("--object-format={format}");
+    super::s4_authority::run_git_dir_bounded(
+        &state.config.git,
+        None,
+        &["init", "--bare", "--quiet", &object_format],
+        deadline,
+        Error::internal("bare repository initialization failed"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -128,7 +116,7 @@ pub(crate) async fn materialize(
         .map_err(|_| Error(StatusCode::CONFLICT, "retained root unavailable or released"))?;
     let holder = DisposableCiView::create()?;
     let dir = holder.path().to_path_buf();
-    init_bare(&dir, view.object_format().as_str())?;
+    init_bare(state, &dir, view.object_format().as_str(), deadline).await?;
     for pack in view.packs() {
         let bytes = view
             .pack_bytes(pack.pack_id(), deadline)
@@ -141,12 +129,12 @@ pub(crate) async fn materialize(
         write_pack(&dir, pack.pack_id(), &bytes, &idx)?;
     }
     let target = target_oid;
-    git(&dir, &["config", "uploadpack.allowAnySHA1InWant", "false"])?;
-    git(&dir, &["config", "uploadpack.allowReachableSHA1InWant", "false"])?;
-    git(&dir, &["config", "uploadpack.allowFilter", "false"])?;
-    git(&dir, &["update-ref", "refs/heads/main", target])?;
-    git(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
-    git(&dir, &["cat-file", "-e", &format!("{target}^{{commit}}")])?;
+    git_dir(state, &dir, &["config", "uploadpack.allowAnySHA1InWant", "false"], deadline).await?;
+    git_dir(state, &dir, &["config", "uploadpack.allowReachableSHA1InWant", "false"], deadline).await?;
+    git_dir(state, &dir, &["config", "uploadpack.allowFilter", "false"], deadline).await?;
+    git_dir(state, &dir, &["update-ref", "refs/heads/main", target], deadline).await?;
+    git_dir(state, &dir, &["symbolic-ref", "HEAD", "refs/heads/main"], deadline).await?;
+    git_dir(state, &dir, &["cat-file", "-e", &format!("{target}^{{commit}}")], deadline).await?;
     Ok(holder)
 }
 
@@ -350,7 +338,7 @@ pub(crate) async fn info_refs(
         deadline,
     )
     .await?;
-    let out = git(holder.path(), &["upload-pack", "--stateless-rpc", "--advertise-refs"])?;
+    let out = git_dir(&state, holder.path(), &["upload-pack", "--stateless-rpc", "--advertise-refs"], deadline).await?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-git-upload-pack-advertisement")
@@ -389,25 +377,12 @@ pub(crate) async fn upload_pack(
     )
     .await?;
     let slot = StreamSlot::acquire(&state)?;
-    let mut child = Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null", "upload-pack", "--stateless-rpc"])
-        .arg(holder.path())
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_PROTOCOL")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(Error::internal)?;
-    let mut stdin = child.stdin.take().ok_or_else(|| Error::internal("upload-pack stdin"))?;
+    let mut child = super::s4_authority::UploadPackGroup::spawn(&state.config.git, holder.path())?;
+    let (mut stdin, mut stdout) = child.take_pipes()?;
     tokio::spawn(async move {
         let _ = stdin.write_all(&body).await;
         let _ = stdin.shutdown().await;
     });
-    let mut stdout = child.stdout.take().ok_or_else(|| Error::internal("upload-pack stdout"))?;
     let stream_state = state.clone();
     let stream_grant = authorized.grant.clone();
     let stream_digest = authorized.digest.clone();
@@ -448,7 +423,7 @@ pub(crate) async fn upload_pack(
                     if live {
                         continue;
                     }
-                    let _ = child.kill().await;
+                    child.kill_and_reap().await;
                     Err(std::io::Error::other("checkout authorization revoked during transfer"))
                 }
             };
@@ -457,7 +432,7 @@ pub(crate) async fn upload_pack(
                 None => break,
             }
         }
-        let status = child.wait().await?;
+        let status = child.finish().await.map_err(|_| std::io::Error::other("upload-pack failed"))?;
         if !status.success() {
             Err(std::io::Error::other("upload-pack failed"))?;
         }
