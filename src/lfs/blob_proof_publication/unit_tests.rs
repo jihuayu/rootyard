@@ -216,6 +216,9 @@ fn attestation_digest_locator_roundtrip_and_auth_headers_are_deterministic() {
     att.pointers[0].size_bytes = 9999;
     assert_eq!(att.verify_integrity().unwrap_err().code, LfsProofRejectCode::AttestationEquivocation);
 
+    let missing_auth = extract_credentials_header(&HeaderMap::new()).unwrap_err();
+    assert_eq!(missing_auth.code, LfsProofRejectCode::Unauthenticated);
+    assert_eq!(missing_auth.code.http_status().as_u16(), 401);
     let mut hdrs = HeaderMap::new();
     let encoded = BASE64.encode("bob:secret-token-123");
     hdrs.insert(header::AUTHORIZATION, format!("Basic {encoded}").parse().unwrap());

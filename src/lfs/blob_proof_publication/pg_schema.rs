@@ -171,10 +171,10 @@ impl PgLfsBlobStore {
             .query_opt("SELECT actor_id, username, secret_sha256 FROM lfs_blob_principals WHERE username=$1", &[&username])
             .await
             .map_err(pg_err)?
-            .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "unknown principal"))?;
+            .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "unknown principal"))?;
         let stored: String = row.get(2);
         if stored != expected {
-            return Err(LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "invalid principal token"));
+            return Err(LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "invalid principal token"));
         }
         Ok(LfsPrincipal { actor_id: row.get(0), username: row.get(1), secret_sha256: stored })
     }

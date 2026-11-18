@@ -255,6 +255,8 @@ pub async fn exercise_restart_recovery_hydration_and_shared_holds(inp: RestartSh
         format!("version https://git-lfs.github.com/spec/v1\noid sha256:{shared_oid}\nsize {}\n", shared_bytes.len());
     std::fs::write(fork_wt.path().join("shared_weights.bin"), ptr_body)?;
     run_git_ok(fork_wt.path(), home, &["add", "shared_weights.bin"])?;
+    std::fs::write(fork_wt.path().join(".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n")?;
+    run_git_ok(fork_wt.path(), home, &["add", ".gitattributes"])?;
     run_git_ok(fork_wt.path(), home, &["commit", "-m", "cross-owner shared pointer"])?;
 
     // Inactive shared hold must reject push with `unauthorized_shared_hold`.
@@ -283,7 +285,6 @@ pub async fn exercise_restart_recovery_hydration_and_shared_holds(inp: RestartSh
     let fork_clone = TempDir::new()?;
     run_git_ok(fork_clone.path(), home, &["clone", &fork_url, "."])?;
     run_git_ok(fork_clone.path(), home, &["lfs", "install", "--local"])?;
-    std::fs::write(fork_clone.path().join(".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n")?;
     run_git_ok(fork_clone.path(), home, &["lfs", "pull"])?;
     ensure!(std::fs::read(fork_clone.path().join("shared_weights.bin"))? == shared_bytes);
 

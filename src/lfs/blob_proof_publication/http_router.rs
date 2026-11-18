@@ -124,7 +124,7 @@ pub(super) fn lfs_json_response(status: StatusCode, payload: impl serde::Seriali
 pub(super) fn lfs_err_response(err: LfsBlobError) -> Response {
     let status = err.code.http_status();
     let mut res = lfs_json_response(status, json!({ "code": err.code.as_str(), "message": err.message }));
-    if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
+    if status == StatusCode::UNAUTHORIZED {
         let _ = res.headers_mut().insert(header::WWW_AUTHENTICATE, "Basic realm=\"rootyard-lfs\"".parse().unwrap());
     }
     res
@@ -296,7 +296,7 @@ struct LockCreateBody {
     _ref: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LockUnlockBody {
     #[serde(default)]
@@ -348,7 +348,8 @@ async fn handle_list_locks(
     let cursor = q.get("cursor").and_then(|s| Uuid::parse_str(s).ok());
     let limit = q.get("limit").and_then(|s| s.parse::<i64>().ok()).unwrap_or(100);
     match svc.pg.list_locks(realm.repository_id, path_filter, id_filter, cursor, limit).await {
-        Ok((locks, next_cursor)) => lfs_json_response(StatusCode::OK, json!({ "locks": locks, "next_cursor": next_cursor })),
+        Ok((locks, Some(nc))) => lfs_json_response(StatusCode::OK, json!({ "locks": locks, "next_cursor": nc })),
+        Ok((locks, None)) => lfs_json_response(StatusCode::OK, json!({ "locks": locks })),
         Err(e) => lfs_err_response(e),
     }
 }
@@ -381,11 +382,19 @@ async fn handle_unlock(
     State(svc): State<Arc<LfsBlobProofService>>,
     Path((owner, repo, id)): Path<(String, String, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<LockUnlockBody>,
+    raw: Bytes,
 ) -> Response {
     let (_, _, _, access, _) = match svc.auth_repo(&headers, &owner, &repo, true).await {
         Ok(t) => t,
         Err(e) => return lfs_err_response(e),
+    };
+    let body = if raw.is_empty() {
+        LockUnlockBody::default()
+    } else {
+        match serde_json::from_slice::<LockUnlockBody>(&raw) {
+            Ok(v) => v,
+            Err(_) => return lfs_err_response(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "bad unlock JSON")),
+        }
     };
     match svc.pg.unlock(&access, id, body.force).await {
         Ok(lock) => lfs_json_response(StatusCode::OK, json!({ "lock": lock })),

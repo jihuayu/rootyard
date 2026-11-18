@@ -24,6 +24,7 @@ const ATTESTATION_DOMAIN: &[u8] = b"rootyard/lfs/pointer-attestation/v1";
 pub enum LfsProofRejectCode {
     RemoteBlobUnconfigured,
     RemoteBlobUnreachable,
+    Unauthenticated,
     InvalidInput,
     MalformedLfsPointer,
     MissingRemoteBlob,
@@ -42,6 +43,7 @@ impl LfsProofRejectCode {
         match self {
             Self::RemoteBlobUnconfigured => "remote_blob_unconfigured",
             Self::RemoteBlobUnreachable => "remote_blob_unreachable",
+            Self::Unauthenticated => "unauthenticated",
             Self::InvalidInput => "invalid_input",
             Self::MalformedLfsPointer => "malformed_lfs_pointer",
             Self::MissingRemoteBlob => "missing_remote_blob",
@@ -61,6 +63,7 @@ impl LfsProofRejectCode {
             Self::RemoteBlobUnconfigured | Self::RemoteBlobUnreachable | Self::PgDatabase => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            Self::Unauthenticated => StatusCode::UNAUTHORIZED,
             Self::InvalidInput => StatusCode::BAD_REQUEST,
             Self::MalformedLfsPointer | Self::SizeOrDigestMismatch => StatusCode::UNPROCESSABLE_ENTITY,
             Self::MissingRemoteBlob => StatusCode::NOT_FOUND,

@@ -195,30 +195,30 @@ pub fn extract_credentials_header(headers: &HeaderMap) -> Result<(String, String
     let raw = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "missing Authorization header"))?;
+        .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "missing Authorization header"))?;
     if let Some(b64) = raw.strip_prefix("Basic ").or_else(|| raw.strip_prefix("basic ")) {
-        let decoded = BASE64.decode(b64.trim()).map_err(|_| {
-            LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "malformed Basic credentials")
-        })?;
-        let text = std::str::from_utf8(&decoded).map_err(|_| {
-            LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "non-UTF8 Basic credentials")
-        })?;
-        let (user, secret) = text.split_once(':').ok_or_else(|| {
-            LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "Basic auth missing colon")
-        })?;
+        let decoded = BASE64
+            .decode(b64.trim())
+            .map_err(|_| LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "malformed Basic credentials"))?;
+        let text = std::str::from_utf8(&decoded)
+            .map_err(|_| LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "non-UTF8 Basic credentials"))?;
+        let (user, secret) = text
+            .split_once(':')
+            .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "Basic auth missing colon"))?;
         if user.is_empty() || secret.is_empty() {
-            return Err(LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "empty Basic user or token"));
+            return Err(LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "empty Basic user or token"));
         }
         return Ok((user.to_owned(), secret.to_owned()));
     }
     if let Some(tok) = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer ")) {
-        let (user, secret) = tok.trim().split_once(':').ok_or_else(|| {
-            LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "Bearer token must be user:secret")
-        })?;
+        let (user, secret) = tok
+            .trim()
+            .split_once(':')
+            .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "Bearer token must be user:secret"))?;
         if user.is_empty() || secret.is_empty() {
-            return Err(LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "empty Bearer user or token"));
+            return Err(LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "empty Bearer user or token"));
         }
         return Ok((user.to_owned(), secret.to_owned()));
     }
-    Err(LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, "unsupported Authorization scheme"))
+    Err(LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "unsupported Authorization scheme"))
 }

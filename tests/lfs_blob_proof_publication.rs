@@ -225,12 +225,15 @@ async fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_share
             run_git_ok(carol_wt.path(), home_dir.path(), &["commit", "-m", "carol write attempt"])?;
             ensure!(!run_git_raw(carol_wt.path(), home_dir.path(), &["push", "origin", "main"])?.status.success());
 
-            // Owner `alice` attempting `git rm weights.bin` while `bob` holds lock fails closed with `locked_path_conflict`!
+            // Owner `alice` attempting `git rm weights.bin` while `bob` holds lock fails closed on both client & server!
             run_git_ok(alice_wt.path(), home_dir.path(), &["rm", "weights.bin"])?;
             run_git_ok(alice_wt.path(), home_dir.path(), &["commit", "-m", "delete while locked"])?;
-            let locked_rm = run_git_raw(alice_wt.path(), home_dir.path(), &["push", "origin", "main"])?;
-            ensure!(!locked_rm.status.success(), "deleting locked path must be rejected");
-            ensure!(String::from_utf8_lossy(&locked_rm.stderr).contains("locked_path_conflict"));
+            let client_locked_rm = run_git_raw(alice_wt.path(), home_dir.path(), &["push", "origin", "main"])?;
+            ensure!(!client_locked_rm.status.success(), "client git-lfs lock verify must reject push");
+            let server_locked_rm =
+                run_git_raw(alice_wt.path(), home_dir.path(), &["push", "--no-verify", "origin", "main"])?;
+            ensure!(!server_locked_rm.status.success(), "deleting locked path must be rejected by server pre-receive");
+            ensure!(String::from_utf8_lossy(&server_locked_rm.stderr).contains("locked_path_conflict"));
             run_git_ok(alice_wt.path(), home_dir.path(), &["reset", "--hard", "HEAD~1"])?;
 
             // `bob` unlocks `weights.bin`, pushes updated LFS v2 on a branch, then deletes `weights.bin` on `main` & deletes branch!
