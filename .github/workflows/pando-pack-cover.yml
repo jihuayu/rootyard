@@ -1,0 +1,97 @@
+name: Pando Pack Cover
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/pando-pack-cover.yml'
+      - 'src/ref_store/core/ref_version/mod.rs'
+      - 'src/ref_store/core/ref_version/pack_cover.rs'
+      - 'src/ref_store/core/ref_version/pack_cover/**'
+      - 'tests/pando_pack_cover.rs'
+      - 'tests/test_pando_pack_cover_contracts.py'
+      - 'scripts/eval_pando_pack_cover.py'
+      - 'docs/pando-pack-cover.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pando-pack-cover-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  pando-pack-cover:
+    name: Pando Pack Cover (SHA-1 & SHA-256 + OpenDAL + Stock Git)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned Rust 1.99.1 toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && rustfmt -V && cargo clippy -V
+
+      - name: Restore cached CargoFork
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+
+      - name: Install pinned CargoFork
+        run: |
+          mkdir -p test-results/pando-pack-cover
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/pando-pack-cover/cargo-fork.json
+
+      - name: Verify active CargoFork before running cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pando-pack-cover
+
+      - name: Run formatting, docs, CI workflow contracts, clippy, unit, integration, and eval gates
+        run: |
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest \
+            tests/test_ci_workflow_triggers.py \
+            tests/test_ci_cargo_fork_workflows.py \
+            tests/test_pando_pack_cover_contracts.py
+          cargo clippy --locked --no-default-features --lib --test pando_pack_cover -- -D warnings
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib ref_store::core::ref_version::pack_cover
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test pando_pack_cover
+          python3 scripts/eval_pando_pack_cover.py \
+            --profiles small \
+            --formats sha1,sha256 \
+            --trials 15 \
+            --out-json test-results/pando-pack-cover/eval-summary.json
+
+      - name: Upload test & benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pando-pack-cover-results
+          path: test-results/pando-pack-cover/
+          retention-days: 14
