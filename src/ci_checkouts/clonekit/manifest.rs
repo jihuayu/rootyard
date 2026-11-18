@@ -356,19 +356,14 @@ pub(super) fn valid_branch_ref(raw: &str) -> bool {
         && !raw.bytes().any(|b| b.is_ascii_control() || b == b'\\' || b == b' ')
 }
 
-/// Read the fixed-size Git pack trailer checksum without hashing the pack body.
-///
-/// Git discovers packs as `pack-<trailer>.<pack|idx>` in both SHA-1 and SHA-256
-/// repositories, so this trailer (not the whole-file SHA-256 digest) is the
-/// canonical pack basename.
+/// Read Git's canonical pack trailer checksum without hashing the pack body.
 pub(super) fn read_pack_trailer_hex(path: &Path, object_format: CloneKitObjectFormat) -> Result<String, CloneKitError> {
     let meta = fs::symlink_metadata(path).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
     if meta.file_type().is_symlink() || !meta.is_file() {
         return Err(CloneKitError::CorruptArtifact(format!("{} is not a regular file", path.display())));
     }
     let trailer_len = object_format.oid_hex_len() / 2;
-    let header_len = 12u64;
-    if meta.len() < header_len.saturating_add(trailer_len as u64) {
+    if meta.len() < 12 + trailer_len as u64 {
         return Err(CloneKitError::CorruptArtifact("staged pack shorter than header plus trailer".into()));
     }
     let mut file = fs::File::open(path).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
@@ -484,38 +479,20 @@ pub(super) const fn default_git_timeout() -> Duration {
 #[cfg(test)]
 mod pack_trailer_tests {
     use super::*;
+    use CloneKitObjectFormat::{Sha1, Sha256};
 
     #[test]
     fn pack_trailer_reads_format_sized_tail_and_rejects_short_files() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let pack = dir.path().join("owned.pack");
-        let header = b"PACK\x00\x00\x00\x02\x00\x00\x00\x00";
-
-        let mut sha1 = header.to_vec();
-        sha1.extend_from_slice(&[0x11; 20]);
-        fs::write(&pack, &sha1).expect("sha1 pack");
-        assert_eq!(
-            read_pack_trailer_hex(&pack, CloneKitObjectFormat::Sha1).expect("sha1 trailer"),
-            hex::encode([0x11; 20])
-        );
-
-        let mut sha256 = header.to_vec();
-        sha256.extend_from_slice(&[0x22; 32]);
-        fs::write(&pack, &sha256).expect("sha256 pack");
-        assert_eq!(
-            read_pack_trailer_hex(&pack, CloneKitObjectFormat::Sha256).expect("sha256 trailer"),
-            hex::encode([0x22; 32])
-        );
-
-        fs::write(&pack, [0u8; 31]).expect("short sha1 pack");
-        assert!(matches!(
-            read_pack_trailer_hex(&pack, CloneKitObjectFormat::Sha1),
-            Err(CloneKitError::CorruptArtifact(_))
-        ));
-        fs::write(&pack, [0u8; 43]).expect("short sha256 pack");
-        assert!(matches!(
-            read_pack_trailer_hex(&pack, CloneKitObjectFormat::Sha256),
-            Err(CloneKitError::CorruptArtifact(_))
-        ));
+        for (format, len) in [(Sha1, 20), (Sha256, 32)] {
+            let mut bytes = b"PACK\x00\x00\x00\x02\x00\x00\x00\x00".to_vec();
+            bytes.extend(std::iter::repeat_n(0x11, len));
+            fs::write(&pack, &bytes).expect("pack");
+            assert_eq!(read_pack_trailer_hex(&pack, format).expect("trailer"), "11".repeat(len));
+            fs::write(&pack, vec![0u8; 11 + len]).expect("short pack");
+            let err = read_pack_trailer_hex(&pack, format);
+            assert!(matches!(err, Err(CloneKitError::CorruptArtifact(_))));
+        }
     }
 }
