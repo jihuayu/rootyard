@@ -41,7 +41,22 @@ async fn raw_http_exchange(addr: std::net::SocketAddr, request: &str) -> (u16, V
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .expect("status code");
-    (status, raw[sep + 4..].to_vec())
+    let body_raw = &raw[sep + 4..];
+    if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        let (mut out, mut rest) = (Vec::new(), body_raw);
+        while let Some(pos) = rest.windows(2).position(|w| w == b"\r\n") {
+            let len = usize::from_str_radix(std::str::from_utf8(&rest[..pos]).unwrap().trim(), 16).unwrap();
+            rest = &rest[pos + 2..];
+            if len == 0 {
+                break;
+            }
+            out.extend_from_slice(&rest[..len]);
+            rest = &rest[len + 2..];
+        }
+        (status, out)
+    } else {
+        (status, body_raw.to_vec())
+    }
 }
 
 #[tokio::test]

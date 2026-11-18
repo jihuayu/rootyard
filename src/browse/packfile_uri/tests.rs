@@ -186,7 +186,7 @@ pub(super) fn build_verified_fixture(
             input_cover_ids: Vec::new(),
             membership_generation: next_gen,
             membership_digest: mem,
-            compaction_epoch: 0,
+            compaction_epoch: cover_index.compaction_epoch(),
             worker_id: Uuid::new_v4(),
             operation_id: Uuid::new_v4(),
         })
