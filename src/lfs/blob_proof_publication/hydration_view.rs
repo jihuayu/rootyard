@@ -12,7 +12,7 @@ use crate::lfs::models::valid_lfs_oid;
 
 use super::authz::verify_shared_hold_grant;
 use super::locks_store::run_git_quarantined;
-use super::pg_store::{LfsRepoRealm, PgLfsBlobStore, pg_err};
+use super::pg_store::pg_err;
 use super::transfer::LfsTransferContext;
 use super::types::{
     CommittedLfsBlobRecord, LfsBlobError, LfsProofRejectCode, PointerInspection, PointerResolutionSource,

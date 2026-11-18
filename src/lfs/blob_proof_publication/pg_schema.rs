@@ -312,7 +312,7 @@ impl PgLfsBlobStore {
             || (require_write
                 && (archived
                     || transition != "stable"
-                    || crate::auth::lifecycle::has_active_transfer(&**tx, realm.repository_id)
+                    || crate::auth::lifecycle::has_active_transfer(&*tx, realm.repository_id)
                         .await
                         .map_err(pg_err)?))
         {

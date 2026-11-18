@@ -16,8 +16,8 @@ use rootyard::{
     AppState, auth,
     journal::RefChange,
     lfs::blob_proof_publication::{
-        LfsBlobError, LfsProofRejectCode, PgLfsBlobStore, PushAttestationSession, active_blob_gate,
-        extract_stable_operation_id, with_push_attestation_session,
+        LfsBlobError, PgLfsBlobStore, PushAttestationSession, active_blob_gate, extract_stable_operation_id,
+        with_push_attestation_session,
     },
     token_scopes::RepoAction,
 };
