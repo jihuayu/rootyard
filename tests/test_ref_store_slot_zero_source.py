@@ -17,6 +17,7 @@ SLOT_ZERO = ROOT / 'src/ref_store/pg/slot_zero.rs'
 SLOT_ZERO_TESTS = ROOT / 'src/ref_store/pg/slot_zero/tests.rs'
 PUBLISH = ROOT / 'src/blob_git_gateway/publish.rs'
 PACK_SNAPSHOT_MOD = ROOT / 'src/ref_store/core/pack_snapshot/mod.rs'
+SERVING_READ_SQL = ROOT / 'src/ref_store/core/pack_snapshot/serving_read_sql.rs'
 SEALED = ROOT / 'src/ref_store/core/pack_snapshot/serving_read_sql/sealed.rs'
 PG = ROOT / 'src/ref_store/pg.rs'
 CORE_PACK = ROOT / 'src/ref_store/core/pack_commit/pg.rs'
@@ -32,6 +33,7 @@ class SlotZeroSourceTest(unittest.TestCase):
         cls.production = cls.source.split('#[cfg(test)]', 1)[0]
         cls.tests = SLOT_ZERO_TESTS.read_text()
         cls.pack_snapshot_mod = PACK_SNAPSHOT_MOD.read_text()
+        cls.serving_read_sql = SERVING_READ_SQL.read_text()
         cls.sealed = SEALED.read_text()
         cls.pg = PG.read_text()
         cls.core_pack = CORE_PACK.read_text()
@@ -125,7 +127,15 @@ class SlotZeroSourceTest(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertIn('pack_snapshot::lock_cluster_incarnation', self.production)
         self.assertNotIn('SELECT incarnation FROM cluster_authority', self.production)
-        self.assertIn('lock_cluster_incarnation', self.pack_snapshot_mod)
+        self.assertIn(
+            'pub(crate) use sealed::lock_cluster_incarnation;',
+            self.serving_read_sql,
+        )
+        self.assertNotIn('pub(super) use sealed::lock_cluster_incarnation;', self.serving_read_sql)
+        self.assertIn(
+            'pub(crate) use serving_read_sql::{ServingReadRow, lock_cluster_incarnation};',
+            self.pack_snapshot_mod,
+        )
         self.assertIn('FOR SHARE', self.sealed)
         self.assertNotIn('NOWAIT', self.sealed)
         self.assertIn('public.cluster_authority', self.sealed)
