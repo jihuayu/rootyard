@@ -66,9 +66,24 @@ impl SafeGcRepoSnapshot {
 
     pub(super) fn refresh_group_receipts_quiescence(&mut self) -> Result<(), SafeGcError> {
         let cur_gen = self.authority.membership_generation;
+        self.reader_leases.refresh_drain_watermark(cur_gen);
         for idx in 0..self.group_receipts.len() {
-            let retired_ids = self.group_receipts[idx].retired_pack_ids.clone();
-            let ret_gen = self.group_receipts[idx].retired_at_generation;
+            let cur = &self.group_receipts[idx];
+            let min_active =
+                self.reader_leases.active_leases.values().map(|l| l.pinned_generation).min().unwrap_or(cur_gen);
+            let blocking =
+                self.reader_leases.blocking_readers_for_packs(&cur.retired_pack_ids, cur.retired_at_generation);
+            let rq = &cur.reader_quiescence;
+            if rq.observed_seq > 0
+                && rq.min_active_reader_generation == min_active
+                && rq.active_blocking_readers == blocking
+                && rq.drain_watermark_generation == self.reader_leases.completed_drain_generation
+                && rq.pg_exclusive_reader_barrier_epoch == self.reader_leases.pg_exclusive_barrier_epoch
+            {
+                continue;
+            }
+            let retired_ids = cur.retired_pack_ids.clone();
+            let ret_gen = cur.retired_at_generation;
             let obs = self.reader_leases.observe_for_retirement(&retired_ids, ret_gen, cur_gen)?;
             let mut updated = self.group_receipts[idx].clone();
             updated.reader_quiescence = obs;
