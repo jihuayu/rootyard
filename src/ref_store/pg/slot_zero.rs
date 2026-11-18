@@ -11,8 +11,9 @@
 //!    migration 152's own lock function (the same hash key the legacy adapter
 //!    uses), then the locked wrapper row;
 //! 2. resolve an exact replay from the wrapper before touching the issuer lane;
-//!    otherwise validate the strict ready `pg_refstore` realm/backend/gate and
-//!    preview the issuer sequence under its row lock;
+//!    otherwise take the public restore-incarnation row `FOR SHARE`, preview the
+//!    issuer sequence under its row lock, then validate the strict ready
+//!    `pg_refstore` realm/backend and lock the gate;
 //! 3. the caller builds the canonical plan from that preview; this module
 //!    validates every identity, realm, sequence, mode and digest field;
 //! 4. write the public wrapper, the slot-zero private attempt, advance the
@@ -20,8 +21,11 @@
 //!    exact migration-147 producer binding, all in that order.
 //!
 //! Only the caller's `COMMIT` publishes those rows and the sequence; every
-//! rollback discards them. This function never begins, commits or rolls back a
-//! transaction, never opens another connection and performs no Blob/Git IO.
+//! rollback discards them. The restore-incarnation `FOR SHARE` lock is held from
+//! step 2 through that `COMMIT`/`ROLLBACK`, so a restore fence cannot rotate the
+//! singleton between the last trigger check and publication. This function never
+//! begins, commits or rolls back a transaction, never opens another connection
+//! and performs no Blob/Git IO.
 use super::{LockedSequence, PgRefStore, advance_sequence, bound, db_error, ensure_repository, insert_operation};
 use crate::ref_store::{
     CommitMode, GitObjectFormat, IssuerLane, OperationState, RefStoreError, RequestDigest,
@@ -31,6 +35,7 @@ use crate::ref_store::{
             GATE_REVISION_MISMATCH_DETAIL, PackCommitError, PackCommitPlan, PackCommitRejectCode, PackCommitRejection,
             PackMode, PgPackCommit,
         },
+        pack_snapshot::lock_cluster_incarnation,
         serving_scope::{LockedScope, RealmField, ScopeRefusal, ServingBinding},
     },
 };
@@ -190,6 +195,32 @@ where
     ensure_unclaimed(tx, request.repository_id, request.public_id).await.map_err(PackCommitError::from)?;
     ensure_unclaimed(tx, request.repository_id, request.private_id).await.map_err(PackCommitError::from)?;
 
+    // Restore fence: take and hold the public singleton incarnation row
+    // `FOR SHARE` until the caller commits or rolls back. A restore fence takes
+    // that row `FOR UPDATE` first, so the admission cannot observe one
+    // incarnation, pass the migration-152 trigger checks and commit after the
+    // restore row moved. This is deliberately acquired before the issuer lane
+    // and repository/gate so it cannot wait on a lock held by a path that
+    // already owns repository authority.
+    let incarnation = lock_cluster_incarnation(tx).await.map_err(PackCommitError::from)?;
+    if incarnation != request.restore_incarnation {
+        return Err(PackCommitError::Invalid("slot zero restore incarnation differs from the live cluster authority"));
+    }
+
+    // Issuer lane before repository/binding/gate, matching the legacy pending
+    // order: `PgRefStore::begin` holds the lane row before
+    // `begin_serving_pending_in_tx` takes the repository scope and gate. A
+    // different operation id on this issuer/lane must wait here, never take the
+    // repository/gate locks first and then wait for the lane.
+    // Dropping the preview value does not release the transaction-scoped row
+    // lock; the conditional advance below still proves this candidate is current.
+    let locked =
+        LockedSequence::preview(tx, request.repository_id, request.issuer_id, request.private_id, &request.lane)
+            .await
+            .map_err(PackCommitError::from)?;
+    let sequence = locked.sequence;
+    drop(locked);
+
     let scope = LockedScope::lock(tx, request.repository_id, false)
         .await
         .map_err(PackCommitError::from)?
@@ -198,18 +229,6 @@ where
         scope.require_serving(request.admission_owner_id, &request.backend_identity).map_err(map_scope_refusal)?;
     validate_binding_realm(binding, request)?;
 
-    let incarnation: Uuid = tx
-        .query_one("SELECT incarnation FROM cluster_authority WHERE singleton", &[])
-        .await
-        .map_err(db_error)
-        .map_err(PackCommitError::from)?
-        .get(0);
-    if incarnation != request.restore_incarnation {
-        return Err(PackCommitError::Invalid("slot zero restore incarnation differs from the live cluster authority"));
-    }
-
-    // Lock order stays repository -> serving binding (shared) -> gate (exclusive),
-    // matching the existing fresh core mutation paths.
     let gate = PgRefStoreCore
         .read_gate_in_tx(tx, request.repository_id, true)
         .await
@@ -225,15 +244,6 @@ where
         .get(0);
     let pack_mode = PackMode::parse(&mode_value).map_err(PackCommitError::from)?;
 
-    // Preview under the issuer row lock. Dropping the value does not release the
-    // transaction-scoped lock; the conditional advance below still proves that
-    // this candidate is current.
-    let locked =
-        LockedSequence::preview(tx, request.repository_id, request.issuer_id, request.private_id, &request.lane)
-            .await
-            .map_err(PackCommitError::from)?;
-    let sequence = locked.sequence;
-    drop(locked);
     let preview = SlotZeroPreview { sequence, base_revision };
 
     let plan = build_plan(preview)?;

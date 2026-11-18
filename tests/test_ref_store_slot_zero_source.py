@@ -2,8 +2,10 @@
 
 The hosted PostgreSQL tests are ignored. These checks pin the executable order
 and the closed gateway boundary so a refactor cannot silently write the private
-operation before its wrapper/attempt, skip the locked preview, or wire the
-wrapper into the legacy production path.
+operation before its wrapper/attempt, take repository/gate locks before the
+issuer lane, skip the shared restore-incarnation fence, or wire the wrapper into
+the legacy production path. The ignored bodies are checked for positive
+pg_blocking_pids observations, bounded release, and failure-path abort/rollback.
 """
 from pathlib import Path
 import unittest
@@ -13,6 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SLOT_ZERO = ROOT / 'src/ref_store/pg/slot_zero.rs'
 SLOT_ZERO_TESTS = ROOT / 'src/ref_store/pg/slot_zero/tests.rs'
 PUBLISH = ROOT / 'src/blob_git_gateway/publish.rs'
+PACK_SNAPSHOT_MOD = ROOT / 'src/ref_store/core/pack_snapshot/mod.rs'
+SEALED = ROOT / 'src/ref_store/core/pack_snapshot/serving_read_sql/sealed.rs'
+PG = ROOT / 'src/ref_store/pg.rs'
+CORE_PACK = ROOT / 'src/ref_store/core/pack_commit/pg.rs'
+BACKUP_AUTHORITY = ROOT / 'src/backup/authority.rs'
+SERVING_AUTH = ROOT / 'src/ref_store/serving/authority.rs'
+RETENTION_SQL = ROOT / 'src/ref_store/core/retention_root/sql.rs'
 
 
 class SlotZeroSourceTest(unittest.TestCase):
@@ -21,6 +30,13 @@ class SlotZeroSourceTest(unittest.TestCase):
         cls.source = SLOT_ZERO.read_text()
         cls.production = cls.source.split('#[cfg(test)]', 1)[0]
         cls.tests = SLOT_ZERO_TESTS.read_text()
+        cls.pack_snapshot_mod = PACK_SNAPSHOT_MOD.read_text()
+        cls.sealed = SEALED.read_text()
+        cls.pg = PG.read_text()
+        cls.core_pack = CORE_PACK.read_text()
+        cls.backup_authority = BACKUP_AUTHORITY.read_text()
+        cls.serving_auth = SERVING_AUTH.read_text()
+        cls.retention_sql = RETENTION_SQL.read_text()
 
     def test_locked_preview_precedes_wrapper_attempt_advance_operation_binding(self):
         markers = [
@@ -53,6 +69,73 @@ class SlotZeroSourceTest(unittest.TestCase):
         self.assertIn('begin_serving_pending_in_tx', publish)
         self.assertNotIn('admit_slot_zero', publish)
         self.assertNotIn('slot_zero', publish)
+
+    def test_restore_fence_is_shared_before_lane_and_repository_locks(self):
+        markers = [
+            'rootyard_ref_store_lock_public_operation',
+            'lock_cluster_incarnation(tx).await',
+            'LockedSequence::preview(',
+            'LockedScope::lock(',
+            'read_gate_in_tx(',
+            'insert_wrapper(tx, request)',
+        ]
+        positions = [self.production.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('pack_snapshot::lock_cluster_incarnation', self.production)
+        self.assertNotIn('SELECT incarnation FROM cluster_authority', self.production)
+        self.assertIn('lock_cluster_incarnation', self.pack_snapshot_mod)
+        self.assertIn('FOR SHARE', self.sealed)
+        self.assertNotIn('NOWAIT', self.sealed)
+        self.assertIn('public.cluster_authority', self.sealed)
+        fence = ' '.join(self.backup_authority.split())
+        self.assertLess(
+            fence.index('UPDATE public.cluster_authority'),
+            fence.index('DELETE FROM public.cluster_transport_nonces'),
+        )
+
+    def test_post_repository_cluster_readers_stay_nonblocking(self):
+        # `serving::authority` intentionally holds token/repository locks before
+        # its cluster read, and retention roots holds repository/gate/pin/root.
+        # They must keep NOWAIT: a blocking SHARE there would reverse slot-zero's
+        # cluster -> lane -> repository/gate order.
+        self.assertIn('FOR SHARE NOWAIT', self.serving_auth)
+        self.assertIn('FOR SHARE NOWAIT', self.retention_sql)
+
+    def test_legacy_pending_order_is_lane_then_repository_and_gate(self):
+        begin = self.pg.split('async fn begin_inner(', 1)[1].split('/// A candidate sequence', 1)[0]
+        self.assertLess(
+            begin.index('lock_lane(tx, identity)'),
+            begin.index('insert_operation(tx, identity, OperationState::Pending'),
+        )
+        pending = self.core_pack.split('async fn begin_pending_in_tx(', 1)[1].split('/// Capture the closure context', 1)[0]
+        self.assertLess(pending.index('PgRefStore.begin('), pending.index('ensure_repository(tx, plan, false)'))
+        self.assertLess(pending.index('ensure_repository(tx, plan, false)'), pending.index('sql::gate_locked('))
+
+    def test_ignored_regressions_observe_both_blockers_and_release(self):
+        restore = self.tests.split('async fn slot_zero_restore_rotation_waits_for_admission_commit()', 1)[1].split(
+            'async fn slot_zero_waits_for_legacy_lane', 1
+        )[0]
+        lane = self.tests.split('async fn slot_zero_waits_for_legacy_lane_before_scope_and_gate()', 1)[1].split(
+            'fn sample_request()', 1
+        )[0]
+        for body in (restore, lane):
+            self.assertIn('pg_blocking_pids', body)
+            self.assertIn("wait_event_type='Lock'", body)
+            self.assertIn('timeout(Duration::from_secs(10)', body)
+            self.assertIn('if waiting', body)
+            self.assertIn('.abort()', body)
+            self.assertIn('.rollback()', body)
+        self.assertIn('UPDATE public.cluster_authority', restore)
+        self.assertIn('assert_eq!(receipt.sequence, 1)', restore)
+        self.assertIn('assert_ne!(incarnation, fixture.restore)', restore)
+        self.assertLess(restore.rindex('tx.commit().await?'), restore.index('&mut restore'))
+        self.assertIn('PgRefStore.begin', lane)
+        self.assertIn('ref_store_issuer_lanes', lane)
+        self.assertIn('pg_locks', lane)
+        self.assertIn("l.mode <> 'AccessShareLock'", lane)
+        self.assertIn('assert_eq!(receipt.sequence, 2)', lane)
+        self.assertLess(lane.index('legacy_tx.commit().await'), lane.index('&mut admission'))
+        self.assertGreaterEqual(self.tests.count('#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]'), 6)
 
     def test_ignored_tests_drive_the_real_admission_entry(self):
         self.assertGreaterEqual(self.tests.count('.admit_slot_zero_in_tx('), 4)

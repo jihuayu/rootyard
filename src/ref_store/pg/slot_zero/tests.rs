@@ -18,7 +18,10 @@ use crate::{
 };
 use deadpool_postgres::{Manager, Pool, Runtime};
 use std::{future::Future, time::Duration};
-use tokio::time::Instant;
+use tokio::{
+    sync::oneshot,
+    time::{Instant, sleep, timeout},
+};
 use tokio_postgres::Transaction;
 use uuid::Uuid;
 
@@ -26,6 +29,7 @@ fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(15)
 }
 
+#[derive(Clone)]
 struct Fixture {
     admin: Pool,
     pool: Pool,
@@ -519,6 +523,193 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
             .await?
             .get(0);
         assert_eq!(last, max);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn slot_zero_restore_rotation_waits_for_admission_commit() -> anyhow::Result<()> {
+    with_fixture(|fixture| async move {
+        let request = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
+        let mut admission = fixture.pool.get().await?;
+        let tx = admission.transaction().await?;
+        let receipt = PgRefStore
+            .admit_slot_zero_in_tx(&tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .await?;
+        assert_eq!(receipt.sequence, 1);
+        let admission_pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+
+        let restore_pool = fixture.pool.clone();
+        let (pid_tx, pid_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let mut restore = tokio::spawn(async move {
+            let mut client = restore_pool.get().await?;
+            let tx = client.transaction().await?;
+            let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            let _ = pid_tx.send(pid);
+            let changed = tx
+                .execute(
+                    "UPDATE public.cluster_authority SET incarnation=gen_random_uuid(),rotated_at=clock_timestamp()
+                     WHERE singleton=true",
+                    &[],
+                )
+                .await?;
+            let _ = done_tx.send(changed);
+            tx.commit().await?;
+            Ok::<(), anyhow::Error>(())
+        });
+        let restore_pid = pid_rx.await?;
+        let observer = fixture.pool.get().await?;
+        let observed = timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting: bool = observer
+                    .query_one(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM pg_stat_activity a
+                             WHERE a.pid=$1 AND a.state='active' AND a.wait_event_type='Lock'
+                               AND a.query LIKE 'UPDATE public.cluster_authority%'
+                               AND $2 = ANY(pg_blocking_pids($1)))",
+                        &[&restore_pid, &admission_pid],
+                    )
+                    .await?
+                    .get(0);
+                if waiting {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if let Err(error) = observed {
+            restore.abort();
+            let _ = tx.rollback().await;
+            return Err(anyhow::anyhow!("restore rotation never waited on the slot-zero admission: {error}"));
+        }
+        if let Err(error) = tx.commit().await {
+            restore.abort();
+            return Err(error.into());
+        }
+        let joined = match timeout(Duration::from_secs(10), &mut restore).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                restore.abort();
+                return Err(anyhow::anyhow!("restore rotation did not finish after the admission commit"));
+            }
+        };
+        joined??;
+        let changed = done_rx.await?;
+        assert_eq!(changed, 1);
+        let incarnation: Uuid = admission
+            .query_one("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[])
+            .await?
+            .get(0);
+        assert_ne!(incarnation, fixture.restore);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn slot_zero_waits_for_legacy_lane_before_scope_and_gate() -> anyhow::Result<()> {
+    with_fixture(|fixture| async move {
+        let lane = IssuerLane::new("slot-zero").unwrap();
+        let seed = fixture.pool.get().await?;
+        seed.execute(
+            "INSERT INTO ref_store_issuer_lanes(repository_id,issuer_id,lane,last_reserved_sequence)
+                 VALUES($1,$2,$3,0)",
+            &[&fixture.repo, &fixture.actor, &lane.as_str()],
+        )
+        .await?;
+        drop(seed);
+        let legacy_private = Uuid::new_v4();
+        let legacy_identity = OperationIdentity::new(
+            fixture.repo,
+            fixture.actor,
+            lane,
+            1,
+            legacy_private,
+            RequestDigest::from_bytes([42; 32]),
+        )
+        .map_err(PackCommitError::from)?;
+        let mut legacy_client = fixture.pool.get().await?;
+        let legacy_tx = legacy_client.transaction().await?;
+        let _legacy = PgRefStore.begin(&legacy_tx, &legacy_identity, deadline()).await?;
+        let legacy_pid: i32 = legacy_tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+
+        let request = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
+        let admission_fixture = fixture.clone();
+        let (pid_tx, pid_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let mut admission = tokio::spawn(async move {
+            let mut client = admission_fixture.pool.get().await?;
+            let tx = client.transaction().await?;
+            let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            let _ = pid_tx.send(pid);
+            let receipt = PgRefStore
+                .admit_slot_zero_in_tx(
+                    &tx,
+                    &request,
+                    |preview| plan_for(&admission_fixture, &request, preview),
+                    deadline(),
+                )
+                .await?;
+            tx.commit().await?;
+            let _ = done_tx.send(receipt);
+            Ok::<(), anyhow::Error>(())
+        });
+        let admission_pid = pid_rx.await?;
+        let observer = fixture.pool.get().await?;
+        let observed = timeout(Duration::from_secs(10), async {
+            loop {
+                let row = observer
+                    .query_one(
+                        "SELECT
+                           EXISTS(SELECT 1 FROM pg_stat_activity a
+                             WHERE a.pid=$1 AND a.state='active' AND a.wait_event_type='Lock'
+                               AND a.query LIKE 'SELECT last_reserved_sequence + 1 FROM ref_store_issuer_lanes%'
+                               AND $2 = ANY(pg_blocking_pids($1))),
+                           EXISTS(SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
+                             WHERE l.pid=$1 AND l.granted AND l.mode <> 'AccessShareLock'
+                               AND c.relname IN ('repositories','ref_store_core_gates'))",
+                        &[&admission_pid, &legacy_pid],
+                    )
+                    .await?;
+                let waiting: bool = row.get(0);
+                let scope_locked: bool = row.get(1);
+                if waiting {
+                    if scope_locked {
+                        return Err(anyhow::anyhow!(
+                            "slot-zero took repository/gate locks before waiting for the legacy lane"
+                        ));
+                    }
+                    break Ok::<(), anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if let Err(error) = observed {
+            admission.abort();
+            let _ = legacy_tx.rollback().await;
+            return Err(anyhow::anyhow!("slot-zero never waited on the legacy lane before repository/gate: {error}"));
+        }
+        if let Err(error) = legacy_tx.commit().await {
+            admission.abort();
+            return Err(error.into());
+        }
+        let joined = match timeout(Duration::from_secs(10), &mut admission).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                admission.abort();
+                return Err(anyhow::anyhow!("slot-zero admission did not finish after the legacy lane commit"));
+            }
+        };
+        joined??;
+        let receipt = done_rx.await?;
+        assert_eq!(receipt.sequence, 2);
         Ok(())
     })
     .await
