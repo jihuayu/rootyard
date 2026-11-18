@@ -102,6 +102,15 @@ class BlobGatewayCommitCacheShapeTests(unittest.TestCase):
         self.assertIn("tokio::spawn", native)
         self.assertIn("NATIVE_ACCEPTANCE_SERIAL", native)
         self.assertIn("db.finish(outcome).await", native)
+        self.assertEqual(native.count("require_owned_disposable_fixture()?;"), 4)
+        self.assertEqual(native.count("let db = Db::setup().await?;"), 4)
+        for marker in (
+            "ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES",
+            "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB",
+            "public.cluster_authority",
+            "dedicated whole database",
+        ):
+            self.assertIn(marker, native)
 
     def test_final_live_authorization_and_session_fence_is_unchanged(self):
         text = source("src/blob_git_gateway/browse/session.rs")

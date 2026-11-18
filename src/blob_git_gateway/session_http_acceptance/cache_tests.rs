@@ -5,6 +5,19 @@
 //! cache is the real `ServingCache::standalone_memory()` attached exactly as
 //! the standalone target attaches it. No handler is called directly and no
 //! authority, ref, pack or session fact is fabricated.
+//!
+//! These cases seed `public.cluster_authority` outside the random per-test
+//! schema, and the restore case rotates that global row while a request is
+//! paused. `Db::finish` drops only the random schema, never the whole database.
+//! Each case therefore requires both ownership markers before `Db::setup`:
+//!
+//! * `ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1` attests one dedicated whole
+//!   database that the caller disposes after the suite, never a shared schema;
+//! * `ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1` attests the configured Blob
+//!   bucket/namespace is wholly owned and disposed after the run.
+//!
+//! A missing marker is a hard ownership refusal, not a skip. The restore case's
+//! rotation is safe only because that dedicated database is discarded whole.
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -22,6 +35,24 @@ use super::{
     },
 };
 use crate::cache_wake::ServingCache;
+
+const OWNED_POSTGRES_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES";
+const OWNED_BLOB_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB";
+
+/// Attest that the caller owns one whole disposable database and Blob prefix.
+///
+/// `Db::setup` seeds `public.cluster_authority` outside its random schema and
+/// `Db::finish` drops only that schema. The PostgreSQL marker is therefore an
+/// ownership assertion, never a shared-schema claim.
+fn require_owned_disposable_fixture() -> Result<()> {
+    let postgres = matches!(std::env::var(OWNED_POSTGRES_OPT_IN).as_deref(), Ok("1"));
+    let blob = matches!(std::env::var(OWNED_BLOB_OPT_IN).as_deref(), Ok("1"));
+    ensure!(
+        postgres && blob,
+        "this real cache fixture requires {OWNED_POSTGRES_OPT_IN}=1 and {OWNED_BLOB_OPT_IN}=1: the PostgreSQL target must be one dedicated whole database disposed after the suite (never a shared schema, even if the URL is valid), and the Blob bucket/namespace must be wholly owned and disposed after the run"
+    );
+    Ok(())
+}
 
 /// A fresh production router with the explicit standalone memory cache.
 async fn cache_gateway(db: &Db, read_pause: Option<Arc<ReadPause>>) -> Result<Gateway> {
@@ -49,6 +80,7 @@ fn commit_url(gateway: &Gateway, owner: &Actor, name: &str, oid: &str) -> String
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and native Git"]
 async fn exact_commit_http_warm_miss_then_actual_hit_is_byte_equal() -> Result<()> {
     let _serial = super::super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
+    require_owned_disposable_fixture()?;
     let db = Db::setup().await?;
     let outcome = async {
         let gateway = cache_gateway(&db, None).await?;
@@ -83,6 +115,7 @@ async fn exact_commit_http_warm_miss_then_actual_hit_is_byte_equal() -> Result<(
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and native Git"]
 async fn exact_commit_http_hit_still_enforces_final_live_authorization() -> Result<()> {
     let _serial = super::super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
+    require_owned_disposable_fixture()?;
     let db = Db::setup().await?;
     let outcome = async {
         let pause = Arc::new(ReadPause::new());
@@ -135,6 +168,7 @@ async fn exact_commit_http_hit_still_enforces_final_live_authorization() -> Resu
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and native Git"]
 async fn exact_commit_http_hit_still_enforces_restore_incarnation_fence() -> Result<()> {
     let _serial = super::super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
+    require_owned_disposable_fixture()?;
     let db = Db::setup().await?;
     let outcome = async {
         let pause = Arc::new(ReadPause::new());
@@ -194,6 +228,7 @@ async fn exact_commit_http_hit_still_enforces_restore_incarnation_fence() -> Res
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and native Git"]
 async fn exact_commit_http_cached_oid_is_not_served_after_it_becomes_unreachable() -> Result<()> {
     let _serial = super::super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
+    require_owned_disposable_fixture()?;
     let db = Db::setup().await?;
     let outcome = async {
         let gateway = cache_gateway(&db, None).await?;
