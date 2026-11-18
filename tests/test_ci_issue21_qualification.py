@@ -33,8 +33,15 @@ EXPORT_STEP = "Export immutable native artifact paths"
 PG_STEP = "Run the 17 ignored Pando Local PostgreSQL producer cases"
 PANDO_CLI_STEP = "Exercise Pando object store delta resolution, graph traversal, and differential export"
 PANDO_PITR_STEP = "Exercise live Pando PITR fencing, retention roots, and pg_dump clone safety"
+COLD_LFS_STEP = "Qualify #85 cold tenant LFS retention on owned Garage"
 UPLOAD_STEP = "Upload end-to-end report"
 UPLOAD_ALLOWED_LOG = "test-results/ci-webhook-regressions.log"
+
+# The 159-minute verify/lifecycle budget already contains the 24-minute owned
+# Redis step, so it is not added again.  #304 contributes an independent
+# 12-minute cold tenant LFS gate on owned Garage: 159 + 12 = 171.
+VERIFY_BASE_BUDGET_MINUTES = 159
+COLD_LFS_BUDGET_MINUTES = 12
 
 
 def _lines():
@@ -200,7 +207,14 @@ def _unsafe_upload_paths(paths):
 class WorkflowWiringTest(unittest.TestCase):
     def test_verify_budget_includes_pg_vault_lifecycle_and_owned_redis(self):
         lines = _verify_lines()
-        self.assertEqual(_job_scalar(lines, "timeout-minutes"), "159")
+        self.assertEqual(
+            _job_scalar(lines, "timeout-minutes"),
+            str(VERIFY_BASE_BUDGET_MINUTES + COLD_LFS_BUDGET_MINUTES),
+        )
+        cold_lfs = _step(COLD_LFS_STEP)
+        self.assertEqual(
+            cold_lfs["timeout-minutes"], str(COLD_LFS_BUDGET_MINUTES)
+        )
         pg = _step(PG_STEP)
         self.assertEqual(pg["timeout-minutes"], "10")
         vault = _step("Qualify pinned real Vault rotation and bind the Pando native gate")
