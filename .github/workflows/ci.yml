@@ -24,9 +24,10 @@ jobs:
     # backup drills below: their step caps grow from 5 to 10 minutes each, so the
     # worst case added here is 3 x 5 = 15 minutes. Issue #21 adds a 10-minute
     # Local PostgreSQL producer step and a 20-minute real Vault qualification.
-    # Three repository lifecycle acceptance steps add 10 minutes each:
-    # 75 + 10 + 20 + 3 x 10 = 135 minutes in total.
-    timeout-minutes: 135
+    # Three repository lifecycle steps add 10 minutes each. The state-redis
+    # CLI build and owned Redis browse restore proof add 20 minutes.
+    # 75 + 10 + 20 + 3 x 10 + 20 = 155 minutes in total.
+    timeout-minutes: 155
     services:
       postgres:
         image: postgres:17
@@ -303,6 +304,82 @@ jobs:
         run: python3 tests/backup_refstore_holds141.py --binary "$ROOTYARD_BIN" --holds-fixture-binary "$ROOTYARD_HOLDS_FIXTURE" --report test-results/backup-refstore-holds.json
       - name: Exercise restored schema-003 recovery protections
         run: python3 tests/backup_recovery.py --binary "$ROOTYARD_BIN" --report test-results/backup-recovery.json
+      - name: Verify browse cache incarnation across restore with owned Redis
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d "${RUNNER_TEMP:?}/rootyard-browse-restore.XXXXXX")
+          trap 'rm -rf -- "$scratch"' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          binary="$scratch/browse-restore-rootyard"
+          receipt="$binary.build.json"
+          report="$scratch/browse-restore-cache.json"
+          manifest="$scratch/native-browse-restore-cache.json"
+
+          if ! timeout --kill-after=30s 13m env -u CARGO_BUILD_JOBS python3 scripts/build_native.py \
+            --features state-redis \
+            --strip-debuginfo \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            --output "$binary" >/dev/null 2>&1; then
+            echo 'Browse restore CLI build failed'
+            exit 1
+          fi
+          if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
+            timeout --kill-after=30s 5m python3 tests/backup_recovery.py \
+              --browse-restore-cache --binary "$binary" --expect-commit "$GITHUB_SHA" \
+              --report "$report" >/dev/null 2>&1; then
+            echo 'Browse restore cache proof failed'
+            exit 1
+          fi
+          test -s "$report"
+          test "$(wc -c < "$report")" -le 4096
+
+          if ! python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out "$manifest" --build-receipt "$receipt" --binary "$binary" \
+            --expect-commit "$GITHUB_SHA" --report "browse_restore_cache=$report" \
+            --require-case browse_restore_cache=browse_restore_incarnation_cache \
+            --fixture postgres=postgres:17 \
+            --harness tests/backup_recovery.py \
+            --harness tests/backup_recovery_cache.py \
+            --harness tests/backup.py \
+            --harness tests/cross_process.py \
+            --harness tests/e2e.py \
+            --harness tests/native_evidence.py \
+            --harness tests/owned_fuse_cleanup.py \
+            --harness tests/schema_baseline.py \
+            --harness schema/142_catalog.json \
+            --harness schema/143_catalog.json \
+            --harness schema/151_catalog.json \
+            --harness scripts/build_native.py \
+            --harness scripts/native_artifact_store.py \
+            --harness scripts/native_build_receipt.py \
+            --harness scripts/native_report_manifest.py \
+            --harness .github/workflows/ci.yml >/dev/null 2>&1; then
+            echo 'Browse restore native manifest failed'
+            exit 1
+          fi
+          if ! python3 -I - "$report" "$manifest" >/dev/null 2>&1 <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          report, manifest = (json.loads(Path(path).read_text()) for path in sys.argv[1:])
+          case, = report["cases"]
+          assert case["detail"]["owned_cleanup_completed"] is True
+          assert report["source_head"] == manifest["source_commit"]
+          assert report["source_inputs_sha256"] == manifest["source_inputs_sha256"]
+          assert report["build_receipt_sha256"] == manifest["build_receipt"]["sha256"]
+          PY
+          then
+            echo 'Browse restore cleanup or receipt binding failed'
+            exit 1
+          fi
+          mv -- "$report" "$receipt" "$manifest" test-results/
+          rm -rf -- "$scratch"
+          test ! -e "$scratch"
+          trap - EXIT INT TERM
       - name: Exercise independent workers after fresh restore
         run: python3 tests/restored_workers.py --binary "$ROOTYARD_BIN" --report test-results/restored-workers.json
       - name: Exercise explicit recovery and metrics
