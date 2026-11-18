@@ -98,6 +98,7 @@ use axum::{
     middleware::{self, Next},
     response::Response,
 };
+use futures_util::future::FutureExt;
 use serde_json::Value;
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
@@ -126,6 +127,9 @@ const FAILURE_PHASE_MARKER: &str = "ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKE
 /// gateway's own operation deadline is 120s; this leaves transport and native
 /// Git some headroom while still aborting a detached task on a hang.
 const PUSH_BOUND: Duration = Duration::from_secs(180);
+/// A failed normal join is followed by one bounded stop attempt. Settling the
+/// Task here is containment, not proof that the stock Git child was reaped.
+const CLEANUP_STOP_BOUND: Duration = Duration::from_secs(30);
 /// One authenticated operation read is a small bounded JSON response. The whole
 /// send-to-body loop uses this deadline, never the request's larger operation
 /// deadline, and never an unbounded `json()`/`bytes()` helper.
@@ -244,17 +248,29 @@ impl Drop for PushTask {
 }
 
 impl PushTask {
-    /// Abort the client task, then wait up to `bound` for the join. A timeout
-    /// is a failure, not proof of cleanup; an expected self-abort is the only
-    /// cancellation accepted here.
-    async fn abort_and_join(mut self, bound: Duration) -> Result<()> {
-        self.0.abort();
+    /// Wait for the task's real `Git::run` future to finish and return its
+    /// `Output`. Only `Ok(Ok(Output))` proves `Command::output` completed and
+    /// the child was waited/reaped. A timeout leaves the owned handle in its
+    /// caller's slot; it never aborts or discards it here.
+    async fn join_proven(&mut self, bound: Duration) -> Result<git::Output> {
         match tokio::time::timeout(bound, &mut self.0).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) if error.is_cancelled() => Ok(()),
-            Ok(Err(_)) => Err(anyhow!("stock push task did not join cleanly")),
-            Err(_) => Err(anyhow!("stock push task drain exceeded its bound")),
+            Ok(Ok(Ok(output))) => Ok(output),
+            Ok(Ok(Err(_))) => Err(anyhow!("stock push task ended without a Git output proof")),
+            Ok(Err(_)) => Err(anyhow!("stock push task did not join normally")),
+            Err(_) => Err(anyhow!("stock push task join exceeded its bound")),
         }
+    }
+
+    /// Containment only: abort the task and wait a smaller bound for the task
+    /// itself to settle. Returning true does not prove the Git child was
+    /// waited/reaped, so callers keep their cleanup-unproven state.
+    async fn stop_unproven(&mut self, bound: Duration) -> bool {
+        self.0.abort();
+        tokio::time::timeout(bound, &mut self.0).await.is_ok()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.0.is_finished()
     }
 }
 
@@ -706,8 +722,10 @@ async fn admitted_refusal_case(db: &Db, phase: &mut &'static str) -> Result<()> 
     let mut race_work: Option<tempfile::TempDir> = None;
     let mut server = RaceServer::start(listener, app);
     let mut loser_push: Option<PushTask> = None;
+    let mut winner_push: Option<PushTask> = None;
+    let mut join_unproven = false;
 
-    let outcome = async {
+    let outcome = std::panic::AssertUnwindSafe(async {
         *phase = "repository_seed";
         let created = create_repository(address, &owner, &name).await?;
         let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
@@ -768,7 +786,8 @@ async fn admitted_refusal_case(db: &Db, phase: &mut &'static str) -> Result<()> 
 
         // The winner uses a different commit, the same old OID and the SAME ref.
         *phase = "winner_publish";
-        let winner_output = wait_push(spawn_push(git, first_dir, direct_url, winner_operation), "winning").await?;
+        winner_push = Some(spawn_push(git, first_dir, direct_url, winner_operation));
+        let winner_output = take_push_output(&mut winner_push, "winning", &mut join_unproven).await?;
         ensure!(winner_output.success, "the winning stock push failed: {}", redacted(&winner_output));
 
         // The winner is the only writer so far, and the older admitted attempt is
@@ -817,8 +836,7 @@ async fn admitted_refusal_case(db: &Db, phase: &mut &'static str) -> Result<()> 
         *phase = "superseded_refusal_await";
         pause.release();
         pause_guard.disarm();
-        let loser_task = loser_push.take().ok_or_else(|| anyhow!("the losing stock push task was not retained"))?;
-        let loser_output = wait_push(loser_task, "losing").await?;
+        let loser_output = take_push_output(&mut loser_push, "losing", &mut join_unproven).await?;
         ensure!(!loser_output.success, "the admitted older attempt unexpectedly succeeded");
         let loser_text = output_text(&loser_output);
         for forbidden in
@@ -996,46 +1014,46 @@ async fn admitted_refusal_case(db: &Db, phase: &mut &'static str) -> Result<()> 
         }
 
         Ok(())
-    }
+    })
+    .catch_unwind()
     .await;
+    // The payload is discarded. The outer failure is only the fixed phase.
+    let panicked = outcome.is_err();
+    let outcome = outcome.unwrap_or_else(|_| Err(anyhow!("admitted refusal fixture assertion panicked")));
 
-    // Release any still-paused request before waiting on either owner. The
-    // hook turns an abandoned rendezvous into the fixed pre-upload refusal, so
-    // an early failure cannot let the pending loser write. Join the client and
-    // the real server under the same bound before this case drops the Blob
-    // store, scratch/work trees or returns to the DB-schema owner.
-    let cleanup = async {
-        pause_guard.abandon();
-        let mut first_error = None;
-        if let Some(task) = loser_push.take() {
-            if let Err(error) = task.abort_and_join(PUSH_BOUND).await {
-                first_error = Some(error);
+    // Release the still-paused request before joining either owner. The hook
+    // turns an abandoned rendezvous into the fixed pre-upload refusal, so an
+    // early failure cannot let the pending loser write. A normal join after
+    // `Git::output` is the only proof that the stock child was waited/reaped;
+    // an ordinary-wait timeout is never promoted to a clean cleanup.
+    pause_guard.abandon();
+    let loser_clean = confirm_or_stop(&mut loser_push, join_unproven, PUSH_BOUND).await;
+    let winner_clean = confirm_or_stop(&mut winner_push, join_unproven, PUSH_BOUND).await;
+    let server_clean = server.drain(PUSH_BOUND).await.is_ok();
+    let cleanup_proven = !join_unproven && loser_clean && winner_clean && server_clean;
+
+    if cleanup_proven {
+        // The client work tree and gateway scratch are deleted only after both
+        // real Git tasks and the server disposal are proved.
+        drop(race_work.take());
+        if panicked {
+            *phase = "panic_assertion";
+            return Err(anyhow!("admitted refusal fixture assertion panicked"));
+        }
+        outcome
+    } else {
+        // Keep every unresolved owned handle from being dropped/aborted as if
+        // that were proof. The schema, work tree and scratch stay retained.
+        for slot in [&mut loser_push, &mut winner_push] {
+            if let Some(task) = slot.take() {
+                std::mem::forget(task);
             }
         }
-        if let Err(error) = server.drain(PUSH_BOUND).await {
-            first_error.get_or_insert(error);
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => {
-                // Remove the client work tree only after the real Git tasks and
-                // the server drain both succeeded.
-                drop(race_work.take());
-                Ok(())
-            }
-        }
-    }
-    .await;
-
-    if let Err(error) = cleanup {
         *phase = "cleanup_drain";
-        // The join/drain is unresolved: retain fixture-owned directories for
-        // the possibly live handler instead of deleting them under it.
         std::mem::forget(race_work.take());
         std::mem::forget(scratch);
-        return Err(error);
+        Err(anyhow!("admitted refusal fixture join/drain was not proved"))
     }
-    outcome
 }
 
 fn open_store() -> Result<BlobStore> {
@@ -1108,6 +1126,64 @@ async fn wait_push(task: PushTask, label: &str) -> Result<git::Output> {
         .await
         .map_err(|_| anyhow!("the {label} stock push exceeded its bound"))?;
     Ok(joined.with_context(|| format!("the {label} stock push task failed"))??)
+}
+
+/// Wait for one real push output without discarding its owned handle on a
+/// timeout. The caller keeps the slot so cleanup can either prove a normal join
+/// or perform bounded containment and retain an unresolved handle.
+async fn take_push_output(slot: &mut Option<PushTask>, label: &str, join_unproven: &mut bool) -> Result<git::Output> {
+    let joined = match slot.as_mut() {
+        Some(task) => task.join_proven(PUSH_BOUND).await,
+        None => return Err(anyhow!("the {label} stock push task was not retained")),
+    };
+    match joined {
+        Ok(output) => {
+            drop(slot.take());
+            Ok(output)
+        }
+        Err(error) => {
+            *join_unproven = true;
+            Err(error)
+        }
+    }
+}
+
+/// Prove a normal join when no earlier ordinary wait timed out. Once any
+/// ordinary wait is unproven, only containment is attempted and the result is
+/// never promoted to a clean cleanup.
+async fn confirm_or_stop(slot: &mut Option<PushTask>, join_unproven: bool, bound: Duration) -> bool {
+    if slot.is_none() {
+        return true;
+    }
+    if !join_unproven {
+        let joined = match slot.as_mut() {
+            Some(task) => task.join_proven(bound).await,
+            None => return true,
+        };
+        if joined.is_ok() {
+            drop(slot.take());
+            return true;
+        }
+    }
+    // A JoinHandle whose Ready was already consumed must not be polled again.
+    // Such a settled task is containment-complete but still not child-reap
+    // proof, so the caller's cleanup-unproven state is preserved.
+    let finished = match slot.as_ref() {
+        Some(task) => task.is_finished(),
+        None => true,
+    };
+    let settled = if finished {
+        true
+    } else {
+        match slot.as_mut() {
+            Some(task) => task.stop_unproven(CLEANUP_STOP_BOUND).await,
+            None => true,
+        }
+    };
+    if settled {
+        drop(slot.take());
+    }
+    false
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
