@@ -116,7 +116,7 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
     // 1. FULL SERVER RESTART: stop gw1, wipe scratch + reclaim dir + in-memory receipt ring, boot fresh gw2.
     let gw1_reclaim = gateway_reclaim_ledger_dir_for_scratch(gw1.scratch.path());
     let _ = gw1.stop.send(());
-    drop(gw1);
+    drop(gw1.scratch);
     let _ = std::fs::remove_dir_all(&gw1_reclaim);
     clear_observed_gateway_receipts();
     ensure!(recent_gateway_push_receipt(op2).is_none(), "in-memory receipt ring must be empty after restart");
