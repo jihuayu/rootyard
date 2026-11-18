@@ -477,10 +477,12 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
 
         let g_ok = wticket(inc.new_cluster_incarnation, inc.new_history_incarnation, inc.new_authority_epoch, inc.new_group_epoch, inc.new_authz_floor);
         let d_ok = dticket(inc.new_cluster_incarnation, inc.new_storage_authority_id, inc.new_storage_generation, inc.new_deleter_epoch);
-        verify_pg_live_incarnation(&*dst_c, fix.repo, &g_ok, Some(&d_ok)).await?;
-        assert!(verify_pg_live_incarnation(&*dst_c, fix.repo, &wticket(manifest.pg_cutpoint.source_cluster_incarnation, fix.history, 2, 3, 5), None).await.is_err());
-        let d_old = dticket(manifest.pg_cutpoint.source_cluster_incarnation, manifest.pg_cutpoint.source_storage_authority_id, 1, 7);
-        assert!(matches!(verify_pg_live_incarnation(&*dst_c, fix.repo, &g_ok, Some(&d_old)).await.unwrap_err(), PairedBackupError::StaleDeleterRefused(_)));
+        verify_pg_live_incarnation(&dst_c, fix.repo, &g_ok, Some(&d_ok)).await?;
+        let sc = &manifest.pg_cutpoint;
+        let g_old = wticket(sc.source_cluster_incarnation, fix.history, 2, 3, 5);
+        assert!(verify_pg_live_incarnation(&dst_c, fix.repo, &g_old, None).await.is_err());
+        let d_old = dticket(sc.source_cluster_incarnation, sc.source_storage_authority_id, 1, 7);
+        assert!(matches!(verify_pg_live_incarnation(&dst_c, fix.repo, &g_ok, Some(&d_old)).await.unwrap_err(), PairedBackupError::StaleDeleterRefused(_)));
         Ok(())
     }.await;
     if let Ok(adm) = admin.get().await {
