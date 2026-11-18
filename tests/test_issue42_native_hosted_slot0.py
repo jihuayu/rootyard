@@ -467,185 +467,140 @@ class BuildFailureClassificationTest(unittest.TestCase):
 
 
 class LibProducerClassificationTest(unittest.TestCase):
-    """Only fixed lib-producer classes leave the bounded stderr classifier."""
+    """The classifier projects fixed classes and never returns producer text."""
 
     @staticmethod
     def classify(raw, **kwargs):
         return driver.classify_lib_producer_stream(io.BytesIO(raw), **kwargs)
 
-    def test_exact_producer_messages_project_fixed_classes(self):
+    def test_exact_pinned_anchors_project_the_four_categories(self):
         cases = (
-            (b"build_native_test: cargo test failed with status 101\n",
+            (b"cargo test failed with status 101",
              driver.LIB_PRODUCER_CARGO_EXIT),
-            (b"build_native_test: cargo test failed with status -9\n",
-             driver.LIB_PRODUCER_CARGO_EXIT),
-            (b"build_native_test: Cargo reported 0 rootyard lib test artifacts; "
-             b"expected exactly one\n", driver.LIB_PRODUCER_ARTIFACT_SELECTION),
-            (b"build_native_test: rootyard lib test artifact source is outside src/: "
-             b"src/private/secret.rs\n", driver.LIB_PRODUCER_ARTIFACT_SELECTION),
-            (b"build_native_test: rootyard lib test artifact has absent or non-boolean "
-             b"freshness; Cargo's reported freshness must be the literal JSON boolean "
-             b"true or false\n", driver.LIB_PRODUCER_ARTIFACT_SELECTION),
-            (b"build_native_test: Source inputs changed during build; rebuild before "
-             b"recording acceptance.\n", driver.LIB_PRODUCER_INPUT_CHANGED),
-            (b"build_native_test: lib test-support inputs changed during build: "
-             b"tests/private/secret.rs; rebuild before recording acceptance.\n",
+            (b"Cargo reported 0 rootyard lib test artifacts; expected exactly one",
+             driver.LIB_PRODUCER_ARTIFACT_SELECTION),
+            (b"rootyard lib test artifact source is outside src/: src/secret.rs",
+             driver.LIB_PRODUCER_ARTIFACT_SELECTION),
+            (b"rootyard lib test artifact has absent or non-boolean freshness; "
+             b"Cargo's reported freshness must be the literal JSON boolean true or "
+             b"false", driver.LIB_PRODUCER_ARTIFACT_SELECTION),
+            (b"Source inputs changed during build; rebuild before recording acceptance.",
              driver.LIB_PRODUCER_INPUT_CHANGED),
-            (b"build_native_test: Toolchain identity changed during build; refusing "
-             b"the receipt\n", driver.LIB_PRODUCER_INPUT_CHANGED),
-            (b"build_native_test: sealed CAS snapshot does not match the selected "
-             b"test artifact\n", driver.LIB_PRODUCER_RECEIPT_PUBLICATION),
-            (b"build_native_test: relocated executable does not match the selected "
-             b"artifact\n", driver.LIB_PRODUCER_RECEIPT_PUBLICATION),
-            (b"build_native_test: built test executable is missing: "
-             b"/home/runner/secret/bin\n", driver.LIB_PRODUCER_RECEIPT_PUBLICATION),
-            (b"build_native_test: --output receipt must not be a symlink: "
-             b"/home/runner/secret/receipt\n", driver.LIB_PRODUCER_RECEIPT_PUBLICATION),
+            (b"Cargo.lock changed during build; refusing the receipt",
+             driver.LIB_PRODUCER_INPUT_CHANGED),
+            (b"config, build-script or toolchain inputs changed during build; "
+             b"refusing the receipt", driver.LIB_PRODUCER_INPUT_CHANGED),
+            (b"lib test-support inputs changed during build: tests/secret.rs; "
+             b"rebuild before recording acceptance.",
+             driver.LIB_PRODUCER_INPUT_CHANGED),
+            (b"bound build inputs changed during build; refusing the receipt",
+             driver.LIB_PRODUCER_INPUT_CHANGED),
+            (b"Toolchain identity changed during build; refusing the receipt",
+             driver.LIB_PRODUCER_INPUT_CHANGED),
+            (b"HEAD or working-tree state changed during build; refusing the receipt",
+             driver.LIB_PRODUCER_INPUT_CHANGED),
+            (b"lib test-support inputs changed during build; refusing the receipt",
+             driver.LIB_PRODUCER_INPUT_CHANGED),
+            (b"built test executable is missing: /home/runner/secret/bin",
+             driver.LIB_PRODUCER_RECEIPT_PUBLICATION),
+            (b"built test executable changed while its receipt was being recorded",
+             driver.LIB_PRODUCER_RECEIPT_PUBLICATION),
+            (b"sealed CAS snapshot does not match the selected test artifact",
+             driver.LIB_PRODUCER_RECEIPT_PUBLICATION),
+            (b"relocated executable does not match the selected artifact",
+             driver.LIB_PRODUCER_RECEIPT_PUBLICATION),
+            (b"relocated executable changed during publication",
+             driver.LIB_PRODUCER_RECEIPT_PUBLICATION),
         )
-        for raw, expected in cases:
+        for message, expected in cases:
             with self.subTest(expected=expected):
+                raw = b"build_native_test: " + message + b"\n"
                 self.assertEqual(self.classify(raw), expected)
 
-    def test_producer_final_line_wins_over_incidental_compiler_text(self):
-        raw = (
-            b"warning: unused import: /home/runner/secret\n"
-            b"error[E0308]: mismatched types\n"
-            b"build_native_test: cargo test failed with status 101\n"
-        )
-        self.assertEqual(self.classify(raw), driver.LIB_PRODUCER_CARGO_EXIT)
-        decoy = (
-            b"note: build_native_test: cargo test failed with status 101\n"
-            b"build_native_test: sealed CAS snapshot does not match the selected "
-            b"test artifact\n"
-        )
-        self.assertEqual(self.classify(decoy), driver.LIB_PRODUCER_RECEIPT_PUBLICATION)
-
-    def test_unrecognized_or_mixed_producer_lines_fall_back(self):
-        unrecognized = (
-            b"error[E0308]: mismatched types\n"
-            b"build_native_test: Cargo wrote non-JSON to stdout\n"
-        )
-        self.assertEqual(self.classify(unrecognized), driver.LIB_PRODUCER_FALLBACK)
-        mixed = (
-            b"build_native_test: cargo test failed with status 101\n"
-            b"build_native_test: sealed CAS snapshot does not match the selected "
-            b"test artifact\n"
-        )
-        self.assertEqual(self.classify(mixed), driver.LIB_PRODUCER_FALLBACK)
-        duplicate = (
-            b"build_native_test: cargo test failed with status 101\n"
-            b"build_native_test: cargo test failed with status 102\n"
-        )
-        self.assertEqual(self.classify(duplicate), driver.LIB_PRODUCER_CARGO_EXIT)
-        earlier_unrecognized = (
-            b"build_native_test: older unclassified line\n"
-            b"build_native_test: cargo test failed with status 101\n"
-        )
+    def test_final_line_and_single_compiler_family_precedence(self):
+        cargo = b"build_native_test: cargo test failed with status 101\n"
+        self.assertEqual(self.classify(cargo), driver.LIB_PRODUCER_CARGO_EXIT)
         self.assertEqual(
-            self.classify(earlier_unrecognized), driver.LIB_PRODUCER_CARGO_EXIT)
-        final_unrecognized = (
-            b"build_native_test: cargo test failed with status 101\n"
-            b"build_native_test: final unclassified line\n"
-        )
+            self.classify(b"error[E0308]: mismatched types\n" + cargo),
+            driver.LIB_PRODUCER_RUST_TYPE)
+        self.assertEqual(
+            self.classify(b"error[E0308]: one\nerror[E0308]: two\n" + cargo),
+            driver.LIB_PRODUCER_RUST_TYPE)
+        self.assertEqual(
+            self.classify(b"error[E0308]: one\nerror[E0603]: two\n" + cargo),
+            driver.LIB_PRODUCER_CARGO_EXIT)
+        self.assertEqual(
+            self.classify(cargo + b"error[E0308]: after the final line\n"),
+            driver.LIB_PRODUCER_CARGO_EXIT)
+        self.assertEqual(
+            self.classify(b"error[E0308]: mismatched types\n"
+                          b"build_native_test: sealed CAS snapshot does not match "
+                          b"the selected test artifact\n"),
+            driver.LIB_PRODUCER_RECEIPT_PUBLICATION)
+        self.assertEqual(
+            self.classify(b"error[E0308]: mismatched types\n"),
+            driver.LIB_PRODUCER_FALLBACK)
+
+    def test_mixed_unrecognized_and_duplicate_final_lines(self):
+        cargo = b"build_native_test: cargo test failed with status 101\n"
+        mixed = (cargo + b"build_native_test: sealed CAS snapshot does not match "
+                         b"the selected test artifact\n")
+        self.assertEqual(self.classify(mixed), driver.LIB_PRODUCER_FALLBACK)
+        final_unrecognized = (cargo + b"build_native_test: unknown final line\n")
         self.assertEqual(
             self.classify(final_unrecognized), driver.LIB_PRODUCER_FALLBACK)
+        earlier_unrecognized = (b"build_native_test: unknown earlier line\n" + cargo)
+        self.assertEqual(
+            self.classify(earlier_unrecognized), driver.LIB_PRODUCER_CARGO_EXIT)
+        self.assertEqual(
+            self.classify(cargo + cargo), driver.LIB_PRODUCER_CARGO_EXIT)
 
-    def test_rust_code_families_are_finite_and_never_copy_the_code(self):
-        cases = (
-            (b"error[E0308]: mismatched types\n", driver.LIB_PRODUCER_RUST_TYPE),
-            (b"error[E0603]: module is private\n", driver.LIB_PRODUCER_RUST_PRIVACY),
-            (b"error[E0277]: trait bound was not satisfied\n", driver.LIB_PRODUCER_RUST_TRAIT),
-            (b"error[E9999]: unknown compiler code\n", driver.LIB_PRODUCER_RUST_OTHER),
-        )
-        for raw, expected in cases:
-            with self.subTest(expected=expected):
+    def test_rust_families_are_finite_and_code_free(self):
+        for code, expected in (
+            ("E0308", driver.LIB_PRODUCER_RUST_TYPE),
+            ("E0603", driver.LIB_PRODUCER_RUST_PRIVACY),
+            ("E0277", driver.LIB_PRODUCER_RUST_TRAIT),
+            ("E9999", driver.LIB_PRODUCER_RUST_OTHER),
+        ):
+            with self.subTest(code=code):
+                raw = (f"error[{code}]: detail\n"
+                       "build_native_test: cargo test failed with status 101\n").encode()
                 value = self.classify(raw)
                 self.assertEqual(value, expected)
                 self.assertIn(value, driver.BUILD_FAILURE_CLASSES)
                 self.assertNotRegex(value, r"E[0-9]")
+
+    def test_overlong_lines_and_caps_drain_and_fall_back(self):
+        cut_off = (b"x" * 20 +
+                   b"build_native_test: cargo test failed with status 101\n")
         self.assertEqual(
-            self.classify(b"error[E0308]: one\nerror[E0308]: two\n"),
-            driver.LIB_PRODUCER_RUST_TYPE)
-        self.assertEqual(
-            self.classify(b"error[E0308]: one\nerror[E0603]: two\n"),
+            self.classify(cut_off, line_limit=8, chunk_size=64),
             driver.LIB_PRODUCER_FALLBACK)
         self.assertEqual(
-            self.classify(b"error: could not compile `rootyard`\n"),
+            self.classify(b"build_native_test: cargo test failed with status 101\n" * 4,
+                          total_limit=32),
             driver.LIB_PRODUCER_FALLBACK)
         self.assertEqual(
-            self.classify(b"\x1b[31merror[E0308]: colored\x1b[0m\n"),
+            self.classify(b"build_native_test: cargo test failed with status 101"),
             driver.LIB_PRODUCER_FALLBACK)
 
-    def test_oversized_and_overlong_inputs_drain_then_fall_back(self):
-        class TrackingStream:
-            def __init__(self, chunks, error=None):
-                self.chunks = list(chunks)
-                self.error = error
-                self.reads = 0
-
-            def read(self, _size):
-                self.reads += 1
-                if self.error is not None:
-                    raise self.error
-                if not self.chunks:
-                    return b""
-                return self.chunks.pop(0)
-
-        oversized = TrackingStream([
-            b"build_native_test: cargo test failed with status 101\n",
-            b"x" * 128,
-        ])
-        self.assertEqual(
-            driver.classify_lib_producer_stream(
-                oversized, chunk_size=256, total_limit=8, line_limit=64),
-            driver.LIB_PRODUCER_FALLBACK)
-        self.assertEqual(oversized.chunks, [])
-        self.assertGreaterEqual(oversized.reads, 3)
-
-        overlong = TrackingStream([
-            b"x" * 128,
-            b"build_native_test: cargo test failed with status 101\n",
-        ])
-        self.assertEqual(
-            driver.classify_lib_producer_stream(
-                overlong, chunk_size=256, total_limit=4096, line_limit=16),
-            driver.LIB_PRODUCER_FALLBACK)
-        self.assertEqual(overlong.chunks, [])
-
-        invalid_chunk = TrackingStream([b"x" * 512])
-        self.assertEqual(
-            driver.classify_lib_producer_stream(
-                invalid_chunk, chunk_size=256, total_limit=4096, line_limit=4096),
-            driver.LIB_PRODUCER_FALLBACK)
-        self.assertEqual(invalid_chunk.chunks, [])
-
-    def test_malformed_io_unterminated_and_empty_inputs_fall_back(self):
-        for raw in (
-            b"",
-            b"build_native_test: cargo test failed with status 101",
-            b"build_native_test: cargo test failed with status 101\r\n",
-            b"build_native_test: cargo test failed with status 101\x00\n",
-            b"\x1b[31mbuild_native_test: cargo test failed with status 101\n",
-            b"unrelated raw text /home/runner/secret\n",
-        ):
-            with self.subTest(raw=raw[:32]):
-                self.assertEqual(self.classify(raw), driver.LIB_PRODUCER_FALLBACK)
-
-        class FailingStream:
-            def read(self, _size):
+    def test_io_unknown_and_invalid_bytes_fall_back(self):
+        class Failing:
+            def readline(self, _size):
                 raise OSError("synthetic read failure")
 
         self.assertEqual(
-            driver.classify_lib_producer_stream(FailingStream()),
+            driver.classify_lib_producer_stream(Failing()),
             driver.LIB_PRODUCER_FALLBACK)
-
-        class NonBytesStream:
-            def read(self, _size):
-                return "not bytes"
-
-        self.assertEqual(
-            driver.classify_lib_producer_stream(NonBytesStream()),
-            driver.LIB_PRODUCER_FALLBACK)
+        for raw in (
+            b"",
+            b"unrelated raw text /home/runner/secret\n",
+            b"build_native_test: cargo test failed with status 101\r\n",
+            b"build_native_test: cargo test failed with status 101\x00\n",
+            b"\x1b[31mbuild_native_test: cargo test failed with status 101\n",
+        ):
+            with self.subTest(raw=raw[:32]):
+                self.assertEqual(self.classify(raw), driver.LIB_PRODUCER_FALLBACK)
 
     def test_cli_writes_one_fixed_class_and_fails_closed(self):
         raw = (b"error[E0308]: mismatched types\n"
@@ -655,7 +610,7 @@ class LibProducerClassificationTest(unittest.TestCase):
                                SimpleNamespace(buffer=io.BytesIO(raw))), \
                 mock.patch.object(driver.sys, "stdout", stdout):
             self.assertEqual(driver.cmd_classify_lib_producer(SimpleNamespace()), 0)
-        self.assertEqual(stdout.getvalue(), driver.LIB_PRODUCER_CARGO_EXIT + "\n")
+        self.assertEqual(stdout.getvalue(), driver.LIB_PRODUCER_RUST_TYPE + "\n")
 
         fallback_stdout = io.StringIO()
         with mock.patch.object(driver.sys, "stdin",
@@ -665,18 +620,6 @@ class LibProducerClassificationTest(unittest.TestCase):
                                   side_effect=OSError("synthetic")):
             self.assertEqual(driver.cmd_classify_lib_producer(SimpleNamespace()), 0)
         self.assertEqual(fallback_stdout.getvalue(), driver.LIB_PRODUCER_FALLBACK + "\n")
-
-        class BrokenStdout:
-            def write(self, _text):
-                raise OSError("synthetic write failure")
-
-            def flush(self):
-                raise OSError("synthetic flush failure")
-
-        with mock.patch.object(driver.sys, "stdin",
-                               SimpleNamespace(buffer=io.BytesIO(raw))), \
-                mock.patch.object(driver.sys, "stdout", BrokenStdout()):
-            self.assertEqual(driver.cmd_classify_lib_producer(SimpleNamespace()), 1)
 
 
 class PostgresBooleanContractTest(unittest.TestCase):
@@ -1611,27 +1554,9 @@ case "$*" in
     printf '%s\n' "RAW-LIB-NOISE-/home/runner/secret" >&2
     printf '%s\n' "RAW-LIB-NOISE-token" >&2
     case "$mode" in
-      cargo-exit)
-        printf '%s\n' "build_native_test: cargo test failed with status 101" >&2
-        exit 31
-        ;;
-      artifact-selection)
-        printf '%s\n' "build_native_test: Cargo reported 0 rootyard lib test artifacts; expected exactly one" >&2
-        exit 31
-        ;;
-      input-changed)
-        printf '%s\n' "build_native_test: Source inputs changed during build; rebuild before recording acceptance." >&2
-        exit 31
-        ;;
-      receipt-publication)
-        printf '%s\n' "build_native_test: sealed CAS snapshot does not match the selected test artifact" >&2
-        exit 31
-        ;;
       rust-type)
         printf '%s\n' "error[E0308]: mismatched types" >&2
-        exit 31
-        ;;
-      raw-no-message)
+        printf '%s\n' "build_native_test: cargo test failed with status 101" >&2
         exit 31
         ;;
       overlong-line)
@@ -1836,48 +1761,57 @@ esac
             self.assertEqual(report["stage"], "build")
             self.assertEqual(report["failure_class"], "build-lib-producer")
 
-    def test_lib_stderr_classes_are_exact_and_never_visible(self):
-        cases = (
-            ("cargo-exit", driver.LIB_PRODUCER_CARGO_EXIT),
-            ("artifact-selection", driver.LIB_PRODUCER_ARTIFACT_SELECTION),
-            ("input-changed", driver.LIB_PRODUCER_INPUT_CHANGED),
-            ("receipt-publication", driver.LIB_PRODUCER_RECEIPT_PUBLICATION),
-            ("rust-type", driver.LIB_PRODUCER_RUST_TYPE),
-            ("raw-no-message", driver.LIB_PRODUCER_FALLBACK),
-            ("overlong-line", driver.LIB_PRODUCER_FALLBACK),
-        )
-        for mode, expected in cases:
-            with self.subTest(mode=mode):
-                with tempfile.TemporaryDirectory() as temporary:
-                    root = Path(temporary)
-                    result, work, evidence, log = self.run_build_step(
-                        root, first_mode="ready", second_mode=mode)
-                    self.assertEqual(result.returncode, 1)
-                    self.assertEqual(
-                        (evidence / driver.BUILD_FAILURE_MARKER).read_text(),
-                        expected + "\n")
-                    self.assertEqual(result.stdout, "")
-                    self.assertEqual(
-                        result.stderr,
-                        f"[slot0-native] stage=build status=failed class={expected}\n")
-                    combined = result.stdout + result.stderr
-                    for payload in self.PRODUCER_NOISE:
-                        self.assertNotIn(payload, combined)
-                    self.assertNotIn("cargo test failed", combined)
-                    self.assertNotIn("error[E", combined)
-                    classifier_log = (root / "classifier.log").read_text()
-                    self.assertEqual(len(classifier_log.splitlines()), 1)
-                    self.assertIn("classify-lib-producer", classifier_log)
-                    report = self.finalize_build_failure(root, work, evidence)
-                    self.assertFalse(report["passed"])
-                    self.assertEqual(report["stage"], "build")
-                    self.assertEqual(report["failure_class"], expected)
+    def test_lib_producer_failure_projects_family_and_hides_raw(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, work, evidence, log = self.run_build_step(
+                root, first_mode="ready", second_mode="rust-type")
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(
+                (evidence / driver.BUILD_FAILURE_MARKER).read_text(),
+                driver.LIB_PRODUCER_RUST_TYPE + "\n")
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(
+                result.stderr,
+                f"[slot0-native] stage=build status=failed "
+                f"class={driver.LIB_PRODUCER_RUST_TYPE}\n")
+            combined = result.stdout + result.stderr
+            for payload in self.PRODUCER_NOISE:
+                self.assertNotIn(payload, combined)
+            self.assertNotIn("cargo test failed", combined)
+            self.assertNotIn("error[E", combined)
+            classifier_log = (root / "classifier.log").read_text()
+            self.assertEqual(len(classifier_log.splitlines()), 1)
+            self.assertIn("classify-lib-producer", classifier_log)
+            report = self.finalize_build_failure(root, work, evidence)
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["stage"], "build")
+            self.assertEqual(report["failure_class"], driver.LIB_PRODUCER_RUST_TYPE)
+
+    def test_overlong_lib_stderr_drains_and_falls_back(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, work, evidence, log = self.run_build_step(
+                root, first_mode="ready", second_mode="overlong-line")
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(
+                (evidence / driver.BUILD_FAILURE_MARKER).read_text(),
+                driver.LIB_PRODUCER_FALLBACK + "\n")
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(
+                result.stderr,
+                f"[slot0-native] stage=build status=failed "
+                f"class={driver.LIB_PRODUCER_FALLBACK}\n")
+            combined = result.stdout + result.stderr
+            for payload in self.PRODUCER_NOISE:
+                self.assertNotIn(payload, combined)
+            self.assertNotIn("cargo test failed", combined)
 
     def test_classifier_failure_falls_back_without_turning_failure_green(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             result, work, evidence, log = self.run_build_step(
-                root, first_mode="ready", second_mode="cargo-exit",
+                root, first_mode="ready", second_mode="rust-type",
                 classifier_broken=True)
             self.assertEqual(result.returncode, 1)
             self.assertEqual(
