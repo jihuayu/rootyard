@@ -68,8 +68,11 @@ pub struct PointerRejectionInput<'a> {
 
 pub async fn exercise_named_pointer_rejections_and_attestation_replay(inp: PointerRejectionInput<'_>) -> Result<()> {
     let PointerRejectionInput { srv, gate, pg, realm, home, committed_oid, committed_size } = inp;
-    let url = format!("{}/{}/{}.git", srv.base_url, realm.owner_username, realm.repo_name)
-        .replacen("http://", "http://alice:alice-tok@");
+    let url = format!("{}/{}/{}.git", srv.base_url, realm.owner_username, realm.repo_name).replacen(
+        "http://",
+        "http://alice:alice-tok@",
+        1,
+    );
 
     // 1. MissingRemoteBlob: push raw pointer referencing an unuploaded SHA-256 OID (`--no-verify` bypasses client pre-push).
     let missing_wt = TempDir::new()?;
@@ -240,8 +243,11 @@ pub async fn exercise_restart_recovery_hydration_and_shared_holds(inp: RestartSh
     })
     .await?;
 
-    let fork_url =
-        format!("{}/{}/fork-engine.git", restarted.base_url, dave.username).replacen("http://", "http://bob:bob-tok@");
+    let fork_url = format!("{}/{}/fork-engine.git", restarted.base_url, dave.username).replacen(
+        "http://",
+        "http://bob:bob-tok@",
+        1,
+    );
     let fork_wt = TempDir::new()?;
     run_git_ok(fork_wt.path(), home, &["init", "--initial-branch=main", &format!("--object-format={fmt_str}")])?;
     run_git_ok(fork_wt.path(), home, &["remote", "add", "origin", &fork_url])?;

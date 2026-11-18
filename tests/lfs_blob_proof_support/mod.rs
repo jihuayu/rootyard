@@ -3,7 +3,7 @@
 pub mod adversarial;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::{
     Arc, Mutex, OnceLock,

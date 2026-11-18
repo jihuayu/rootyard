@@ -116,12 +116,21 @@ async fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_share
 
             let gate = LfsBlobRuntimeGate::configured(store.clone());
             let srv = RunningLfsServer::start(gate.clone(), pg.clone()).await?;
-            let alice_url = format!("{}/{}/engine.git", srv.base_url, alice.username)
-                .replacen("http://", &format!("http://{}:{alice_sec}@", alice.username));
-            let bob_url = format!("{}/{}/engine.git", srv.base_url, alice.username)
-                .replacen("http://", &format!("http://{}:{bob_sec}@", bob.username));
-            let carol_url = format!("{}/{}/engine.git", srv.base_url, alice.username)
-                .replacen("http://", &format!("http://{}:{carol_sec}@", carol.username));
+            let alice_url = format!("{}/{}/engine.git", srv.base_url, alice.username).replacen(
+                "http://",
+                &format!("http://{}:{alice_sec}@", alice.username),
+                1,
+            );
+            let bob_url = format!("{}/{}/engine.git", srv.base_url, alice.username).replacen(
+                "http://",
+                &format!("http://{}:{bob_sec}@", bob.username),
+                1,
+            );
+            let carol_url = format!("{}/{}/engine.git", srv.base_url, alice.username).replacen(
+                "http://",
+                &format!("http://{}:{carol_sec}@", carol.username),
+                1,
+            );
 
             // 1. Official `git-lfs` track + push by owner `alice`.
             let alice_wt = TempDir::new()?;
