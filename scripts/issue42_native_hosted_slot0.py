@@ -80,6 +80,11 @@ ALL_CASES = (
     (LIB, "ref_store::pg::slot_zero::tests::slot_zero_rejects_equal_ids_private_conflict_and_wire_rebinding", True),
     (LIB, "ref_store::pg::slot_zero::tests::slot_zero_replay_rejects_missing_or_wrong_producer_binding", True),
     (LIB, "ref_store::pg::slot_zero::tests::slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overflow", True),
+    (LIB, "ref_store::pg::slot_zero::tests::slot_zero_typed_plan_error_rolls_back_only_the_savepoint", True),
+    (LIB, "ref_store::pg::slot_zero::tests::slot_zero_cancelled_owned_tx_cannot_be_committed", True),
+    (LIB, "ref_store::pg::slot_zero::tests::slot_zero_restore_rotation_waits_for_admission_commit", True),
+    (LIB, "ref_store::pg::slot_zero::tests::slot_zero_waits_for_legacy_lane_before_scope_and_gate", True),
+    (LIB, "ref_store::pg::slot_zero::tests::slot_zero_fixture_setup_error_drops_only_its_owned_database", True),
     (LIB, "ref_store::pg::slot_zero::tests::slot_zero_request_rejects_equal_ids_and_noncanonical_backend", False),
     (LIB, "ref_store::pg::slot_zero::tests::slot_zero_proof_binds_sequence_plan_and_wire", False),
 )

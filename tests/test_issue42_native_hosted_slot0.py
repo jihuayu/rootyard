@@ -81,6 +81,51 @@ def passed_cases():
 
 
 class LibtestParserTest(unittest.TestCase):
+    def test_inventory_is_exact_serial_and_ordered(self):
+        expected = (
+            (driver.INTEGRATION, "fresh_lane_creation_waits_for_an_uncommitted_creator", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_admission_commits_then_exact_retry_replays", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_rejects_equal_ids_private_conflict_and_wire_rebinding", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_replay_rejects_missing_or_wrong_producer_binding", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overflow", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_typed_plan_error_rolls_back_only_the_savepoint", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_cancelled_owned_tx_cannot_be_committed", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_restore_rotation_waits_for_admission_commit", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_waits_for_legacy_lane_before_scope_and_gate", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_fixture_setup_error_drops_only_its_owned_database", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_request_rejects_equal_ids_and_noncanonical_backend", False),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_proof_binds_sequence_plan_and_wire", False),
+        )
+        self.assertEqual(driver.ALL_CASES, expected)
+        self.assertEqual(len({(target, name) for target, name, _ in expected}), len(expected))
+        self.assertEqual(sum(ignored for _, _, ignored in expected), 10)
+        self.assertEqual(sum(not ignored for _, _, ignored in expected), 2)
+        self.assertFalse(driver.ALL_CASES[-1][2])
+        self.assertFalse(driver.ALL_CASES[-2][2])
+
+    def test_run_cases_executes_inventory_serially(self):
+        calls = []
+        binaries = {driver.INTEGRATION: "integration-binary",
+                    driver.LIB: "lib-binary"}
+
+        def execute(binary, name, ignored, *, database, timeout, cwd):
+            calls.append((binary, name, ignored, database, timeout, cwd))
+            return libtest(name, filtered=4)
+
+        with mock.patch.object(driver, "execute_case", side_effect=execute):
+            statuses, failure = driver.run_cases(
+                binaries=binaries, database="owned", deadline=time.monotonic() + 900,
+                cwd=Path("/product"))
+        self.assertIsNone(failure)
+        self.assertEqual(len(calls), len(driver.ALL_CASES))
+        self.assertEqual(len({(call[1], call[2]) for call in calls}), len(calls))
+        self.assertEqual(
+            [(call[0], call[1], call[2]) for call in calls],
+            [(binaries[target], name, ignored) for target, name, ignored in driver.ALL_CASES])
+        self.assertTrue(all(call[3] == "owned" and call[5] == Path("/product") for call in calls))
+        self.assertTrue(all(0 < call[4] <= driver.CASE_TIMEOUT_SECONDS for call in calls))
+        self.assertTrue(all(row["status"] == "passed" for row in statuses))
+
     def test_exact_passed_ignored_case(self):
         name = driver.ALL_CASES[1][1]
         parsed = driver.parse_case_output(libtest(name, filtered=27), name)
@@ -90,7 +135,7 @@ class LibtestParserTest(unittest.TestCase):
         self.assertEqual(parsed["filtered_out"], 27)
 
     def test_exact_pure_case(self):
-        name = driver.ALL_CASES[5][1]
+        name = next(name for _, name, ignored in driver.ALL_CASES if not ignored)
         parsed = driver.parse_case_output(libtest(name, filtered=2), name)
         self.assertEqual(parsed["status"], "passed")
 
@@ -266,8 +311,10 @@ class ReportProjectionTest(unittest.TestCase):
         self.assertEqual(report["bounds"]["job_timeout_minutes"], driver.JOB_TIMEOUT_MINUTES)
         self.assertEqual(report["workflow"]["head"], report["workflow"]["commit"])
         self.assertEqual(report["event_head"], report["workflow"]["commit"])
-        self.assertEqual(report["counts"], {"expected": 7, "executed": 7, "passed": 7,
-                                            "failed": 0, "not_run": 0, "ignored": 0})
+        expected = len(driver.ALL_CASES)
+        self.assertEqual(report["counts"], {"expected": expected, "executed": expected,
+                                            "passed": expected, "failed": 0,
+                                            "not_run": 0, "ignored": 0})
         self.assertEqual(report["run"], {"id": 42, "attempt": 2})
         encoded = json.dumps(report)
         for forbidden in ('"command":', '"stdout":', '"stderr":', "postgresql://", "/tmp/", "password="):
@@ -280,7 +327,7 @@ class ReportProjectionTest(unittest.TestCase):
         rows[2]["observed"] = None
         report = self.report(cases=rows, failure_class="case")
         self.assertFalse(report["passed"])
-        self.assertEqual(report["counts"]["passed"], 6)
+        self.assertEqual(report["counts"]["passed"], len(driver.ALL_CASES) - 1)
         self.assertEqual(report["counts"]["failed"], 1)
 
     def test_missing_binary_or_cleanup_is_never_green(self):
@@ -391,7 +438,7 @@ class HostedFlowMockTest(unittest.TestCase):
                 patcher.stop()
         report = json.loads((self.evidence / "qualification.json").read_text())
         self.assertTrue(report["passed"])
-        self.assertEqual(report["counts"]["passed"], 7)
+        self.assertEqual(report["counts"]["passed"], len(driver.ALL_CASES))
         self.assertTrue(report["cleanup"]["work_removed"])
         self.assertEqual([entry.name for entry in self.evidence.iterdir()], ["qualification.json"])
         self.assertNotIn(str(self.root), json.dumps(report))
@@ -463,7 +510,7 @@ class HostedFlowMockTest(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertEqual(report["counts"]["passed"], 2)
         self.assertEqual(report["counts"]["failed"], 1)
-        self.assertEqual(report["counts"]["not_run"], 4)
+        self.assertEqual(report["counts"]["not_run"], len(driver.ALL_CASES) - 3)
         self.assertEqual(report["failure_class"], "case")
 
 
@@ -1011,8 +1058,9 @@ class WorkflowStaticTest(unittest.TestCase):
             self.assertIn(action, self.text)
         pin = self.text.split("PRODUCT_SHA:", 1)[1].splitlines()[0].strip()
         tree = self.text.split("PRODUCT_TREE:", 1)[1].splitlines()[0].strip()
-        self.assertRegex(pin, r"^[0-9a-f]{40}$")
-        self.assertRegex(tree, r"^[0-9a-f]{40}$")
+        self.assertEqual(pin, "d148e5e75e441facf122b686dbd4647ff79fb266")
+        self.assertEqual(tree, "7570397d3765bfa92dff4226b7876799f0071f5a")
+        self.assertIn("Run exactly the twelve bounded native cases", self.text)
 
     def test_owned_postgres_and_fixed_artifact(self):
         self.assertEqual(driver.WORKFLOW_PATH, self.path.relative_to(ROOT).as_posix())
