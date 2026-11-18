@@ -365,7 +365,8 @@ pub(super) fn verify_local_replica_caught_up(
             &json!({ "InspectReplicaKv": { "key": "refcas/head_seq" } }),
             raft.cfg.rpc_timeout,
         ) {
-            let seq = response.pointer("/KvValue/value").and_then(Value::as_str).and_then(|raw| raw.parse().ok());
+            let seq =
+                response.pointer("/KvValue/value").and_then(Value::as_str).and_then(|raw| raw.parse::<u64>().ok());
             if seq.is_some_and(|seq| seq >= required_seq) {
                 return Ok(cert_sha);
             }

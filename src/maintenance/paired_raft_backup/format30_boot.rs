@@ -21,6 +21,7 @@ use super::pg_freeze_settings::{
 };
 use super::pg_restore_admission::verify_pg_restored_cursors;
 use super::production_runtime::PairedProductionRuntimeGuard;
+use super::quorum_wal::DurableRaftBackend;
 use super::types::{NewIncarnationAuthority, PairedBackupError, RestoreOutcome};
 
 /// Restore the complete `schema 151` / `format 30` archive (`pg_restore` + `BlobStore` rebuild) into

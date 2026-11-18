@@ -65,7 +65,7 @@ pub fn installed_peer_attestation_daemon_addr() -> Option<String> {
 }
 
 pub fn shutdown_installed_peer_attestation_daemon() {
-    let slot = peer_attestation_slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut slot = peer_attestation_slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(daemon) = slot.take() {
         daemon.shutdown();
     }
