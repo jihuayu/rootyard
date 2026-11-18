@@ -1,10 +1,10 @@
-use super::{
-    ENVELOPE_SCHEMA, KmsEnvelopeRecord, crypto, provider, valid_cipher_suite,
-    valid_encryption_mode, valid_kms_key_id, valid_sha256_hex, valid_storage_tier,
-};
 use super::super::{Pack, delta};
+use super::wrapped_dek::PandoWrappedDek;
+use super::{
+    ENVELOPE_SCHEMA, KmsEnvelopeRecord, crypto, valid_cipher_suite, valid_encryption_mode, valid_kms_key_id,
+    valid_sha256_hex, valid_storage_tier,
+};
 use anyhow::{Context, Result, ensure};
-use rootyard::blob_store::key_provider::WrappedKey;
 use std::{
     fs::{File, OpenOptions},
     io::Write,
@@ -12,24 +12,11 @@ use std::{
 };
 use uuid::Uuid;
 
-pub fn compute_envelope_mac(
-    key_id: &str,
-    key_version: i32,
-    pack_sha256: &str,
-    idx_sha256: &str,
-) -> Result<String> {
+pub fn compute_envelope_mac(key_id: &str, key_version: i32, pack_sha256: &str, idx_sha256: &str) -> Result<String> {
     let trimmed = key_id.trim();
-    ensure!(
-        valid_kms_key_id(trimmed) && key_version >= 1,
-        "invalid kms key parameters"
-    );
-    ensure!(
-        valid_sha256_hex(pack_sha256) && valid_sha256_hex(idx_sha256),
-        "invalid pack/idx sha256"
-    );
-    Ok(delta::sha256_hex(
-        format!("{trimmed}||{key_version}||{pack_sha256}||{idx_sha256}").as_bytes(),
-    ))
+    ensure!(valid_kms_key_id(trimmed) && key_version >= 1, "invalid kms key parameters");
+    ensure!(valid_sha256_hex(pack_sha256) && valid_sha256_hex(idx_sha256), "invalid pack/idx sha256");
+    Ok(delta::sha256_hex(format!("{trimmed}||{key_version}||{pack_sha256}||{idx_sha256}").as_bytes()))
 }
 
 /// Builds an explicitly labeled synthetic metadata-only lab envelope (does NOT encrypt pack bytes).
@@ -43,13 +30,10 @@ pub fn build_envelope_record(
 ) -> Result<KmsEnvelopeRecord> {
     let trimmed = key_id.trim();
     ensure!(
-        valid_kms_key_id(trimmed)
-            && valid_cipher_suite(cipher_suite)
-            && valid_storage_tier(storage_tier),
+        valid_kms_key_id(trimmed) && valid_cipher_suite(cipher_suite) && valid_storage_tier(storage_tier),
         "invalid envelope parameters"
     );
-    let envelope_mac =
-        compute_envelope_mac(trimmed, key_version, &pack.pack_sha256, &pack.idx_sha256)?;
+    let envelope_mac = compute_envelope_mac(trimmed, key_version, &pack.pack_sha256, &pack.idx_sha256)?;
     Ok(KmsEnvelopeRecord {
         schema: ENVELOPE_SCHEMA.to_owned(),
         repo,
@@ -86,6 +70,10 @@ pub fn build_authenticated_envelope_record(
             && sealed.plaintext_sha256 == pack.pack_sha256,
         "invalid authenticated envelope parameters"
     );
+    PandoWrappedDek::from_json(sealed.wrapped_key_json.as_bytes())
+        .map_err(|err| anyhow::anyhow!("invalid wrapped DEK in envelope: {err}"))?
+        .validate_binding(&sealed.provider_kind, &sealed.key_id, sealed.key_version)
+        .map_err(|err| anyhow::anyhow!("wrapped DEK does not match envelope identity: {err}"))?;
     let mac = crypto::compute_authenticated_envelope_mac(&crypto::EnvelopeMacInputs {
         encryption_mode: crypto::AUTHENTICATED_ENVELOPE_MODE,
         repo,
@@ -119,7 +107,7 @@ pub fn build_authenticated_envelope_record(
         wrapped_key_json: Some(sealed.wrapped_key_json.clone()),
         ciphertext_sha256: Some(sealed.ciphertext_sha256.clone()),
         ciphertext_bytes: Some(sealed.ciphertext_bytes),
-        provider_kind: provider::PROVIDER_KIND_LOCAL.to_owned(),
+        provider_kind: sealed.provider_kind.clone(),
     })
 }
 
@@ -135,24 +123,16 @@ pub fn verify_envelope_record(env: &KmsEnvelopeRecord) -> Result<()> {
         "invalid KMS envelope fields"
     );
     if crypto::is_authenticated_mode(&env.encryption_mode) {
-        ensure!(
-            env.provider_kind == provider::PROVIDER_KIND_LOCAL,
-            "unsupported KMS envelope provider_kind"
-        );
         let envelope_id = env.envelope_id.context("missing envelope_id in envelope")?;
         let nonce = env.nonce_prefix.as_deref().context("missing nonce_prefix")?;
-        let wrapped = env
-            .wrapped_key_json
-            .as_deref()
-            .context("missing wrapped_key_json")?;
-        let cipher_sha = env
-            .ciphertext_sha256
-            .as_deref()
-            .context("missing ciphertext_sha256")?;
+        let wrapped = env.wrapped_key_json.as_deref().context("missing wrapped_key_json")?;
+        let cipher_sha = env.ciphertext_sha256.as_deref().context("missing ciphertext_sha256")?;
         let cipher_len = env.ciphertext_bytes.context("missing ciphertext_bytes")?;
         ensure!(valid_sha256_hex(cipher_sha), "invalid ciphertext_sha256");
-        WrappedKey::from_json(wrapped.as_bytes())
-            .map_err(|err| anyhow::anyhow!("invalid wrapped DEK in envelope: {err}"))?;
+        PandoWrappedDek::from_json(wrapped.as_bytes())
+            .map_err(|err| anyhow::anyhow!("invalid wrapped DEK in envelope: {err}"))?
+            .validate_binding(&env.provider_kind, &env.key_id, env.key_version)
+            .map_err(|err| anyhow::anyhow!("wrapped DEK does not match envelope identity: {err}"))?;
         let expected = crypto::compute_authenticated_envelope_mac(&crypto::EnvelopeMacInputs {
             encryption_mode: &env.encryption_mode,
             repo: env.repo,
@@ -170,22 +150,14 @@ pub fn verify_envelope_record(env: &KmsEnvelopeRecord) -> Result<()> {
         });
         ensure!(env.envelope_mac == expected, "authenticated KMS envelope MAC mismatch");
     } else {
-        let expected =
-            compute_envelope_mac(&env.key_id, env.key_version, &env.pack_sha256, &env.idx_sha256)?;
-        ensure!(
-            env.envelope_mac == expected,
-            "KMS envelope MAC verification failed for pack {}",
-            env.pack_id
-        );
+        let expected = compute_envelope_mac(&env.key_id, env.key_version, &env.pack_sha256, &env.idx_sha256)?;
+        ensure!(env.envelope_mac == expected, "KMS envelope MAC verification failed for pack {}", env.pack_id);
     }
     Ok(())
 }
 
 pub fn envelope_file_path(root: &Path, repo: Uuid, pack_id: Uuid) -> PathBuf {
-    root.join("object_store")
-        .join("envelopes")
-        .join(repo.to_string())
-        .join(format!("{pack_id}.json"))
+    root.join("object_store").join("envelopes").join(repo.to_string()).join(format!("{pack_id}.json"))
 }
 
 pub fn write_envelope_file(root: &Path, env: &KmsEnvelopeRecord) -> Result<PathBuf> {
@@ -203,18 +175,11 @@ pub fn write_envelope_file(root: &Path, env: &KmsEnvelopeRecord) -> Result<PathB
     Ok(path)
 }
 
-pub fn read_and_verify_envelope_file(
-    root: &Path,
-    repo: Uuid,
-    pack_id: Uuid,
-) -> Result<KmsEnvelopeRecord> {
+pub fn read_and_verify_envelope_file(root: &Path, repo: Uuid, pack_id: Uuid) -> Result<KmsEnvelopeRecord> {
     let path = envelope_file_path(root, repo, pack_id);
     ensure!(path.is_file(), "missing KMS envelope file for pack {pack_id}");
     let env: KmsEnvelopeRecord = serde_json::from_slice(&std::fs::read(&path)?)?;
-    ensure!(
-        env.repo == repo && env.pack_id == pack_id,
-        "KMS envelope repo/pack_id mismatch"
-    );
+    ensure!(env.repo == repo && env.pack_id == pack_id, "KMS envelope repo/pack_id mismatch");
     verify_envelope_record(&env)?;
     Ok(env)
 }

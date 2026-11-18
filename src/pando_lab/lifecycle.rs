@@ -4,15 +4,21 @@ use std::{collections::BTreeSet, fs::File};
 
 mod cli;
 pub mod crypto;
+mod data_key;
 mod db;
 pub mod envelopes;
 mod eval;
 pub mod provider;
+pub(crate) mod provider_selection;
+pub(crate) mod publication;
 pub mod rotation;
+mod vault_provider;
+mod wrapped_dek;
 
+pub(crate) use db::load_envelope_from_db;
 pub use envelopes::{
-    build_authenticated_envelope_record, build_envelope_record, envelope_file_path,
-    read_and_verify_envelope_file, verify_envelope_record, write_envelope_file,
+    build_authenticated_envelope_record, build_envelope_record, envelope_file_path, read_and_verify_envelope_file,
+    verify_envelope_record, write_envelope_file,
 };
 pub(crate) use eval::load_repo_packs;
 
@@ -166,15 +172,10 @@ pub struct LifecycleStatusReport {
 
 pub fn valid_kms_key_id(key_id: &str) -> bool {
     let t = key_id.trim();
-    t.len() >= 3
-        && t.len() <= 128
-        && rootyard::blob_store::key_provider::KeyId::parse(t).is_ok()
+    t.len() >= 3 && t.len() <= 128 && rootyard::blob_store::key_provider::KeyId::parse(t).is_ok()
 }
 pub fn valid_cipher_suite(suite: &str) -> bool {
-    matches!(
-        suite,
-        "AES-256-GCM-HMAC-SHA256" | "CHACHA20-POLY1305-SHA256"
-    )
+    matches!(suite, "AES-256-GCM-HMAC-SHA256" | "CHACHA20-POLY1305-SHA256")
 }
 pub fn valid_storage_tier(tier: &str) -> bool {
     matches!(tier, "hot" | "cold_archive")
@@ -183,13 +184,10 @@ pub fn valid_sha256_hex(hex_str: &str) -> bool {
     crypto::is_valid_sha256_hex(hex_str)
 }
 pub fn valid_encryption_mode(mode: &str) -> bool {
-    matches!(
-        mode,
-        crypto::AUTHENTICATED_ENVELOPE_MODE | crypto::SYNTHETIC_METADATA_MODE
-    )
+    matches!(mode, crypto::AUTHENTICATED_ENVELOPE_MODE | crypto::SYNTHETIC_METADATA_MODE)
 }
 
-pub fn compute_fragmentation_metrics(
+pub async fn compute_fragmentation_metrics(
     root: &Path,
     store_root_dir: &Path,
     repo: Uuid,
@@ -208,12 +206,10 @@ pub fn compute_fragmentation_metrics(
             pack.id,
             Some(&pack.pack_sha256),
             Some(&pack.idx_sha256),
-        )?;
+        )
+        .await?;
         let pfx = objects_root.join(repo.to_string()).join(pack.id.to_string());
-        let (pb, ib) = (
-            std::fs::read(pfx.with_extension("pack"))?,
-            std::fs::read(pfx.with_extension("idx"))?,
-        );
+        let (pb, ib) = (std::fs::read(pfx.with_extension("pack"))?, std::fs::read(pfx.with_extension("idx"))?);
         total_pack_bytes += pb.len() as u64;
         total_idx_bytes += ib.len() as u64;
         let rep = delta::verify_pack(&pb, &delta::Limits::default())?;
@@ -222,11 +218,7 @@ pub fn compute_fragmentation_metrics(
     }
     let unique_objects = unique_oids.len();
     let duplicate_objects = total_objs.saturating_sub(unique_objects);
-    let duplicate_object_ratio = if total_objs == 0 {
-        0.0
-    } else {
-        (duplicate_objects as f64) / (total_objs as f64)
-    };
+    let duplicate_object_ratio = if total_objs == 0 { 0.0 } else { (duplicate_objects as f64) / (total_objs as f64) };
     Ok(FragmentationMetrics {
         active_packs: packs.len(),
         total_pack_bytes,
@@ -241,22 +233,16 @@ pub fn compute_fragmentation_metrics(
 pub fn evict_cold_pack_local(root: &Path, store_root_dir: &Path, repo: Uuid, pack: &Pack) -> Result<bool> {
     let env = read_and_verify_envelope_file(root, repo, pack.id)?;
     ensure!(
-        env.storage_tier == "cold_archive"
-            && env.pack_sha256 == pack.pack_sha256
-            && env.idx_sha256 == pack.idx_sha256,
+        env.storage_tier == "cold_archive" && env.pack_sha256 == pack.pack_sha256 && env.idx_sha256 == pack.idx_sha256,
         "pack not eligible for cold eviction"
     );
     ensure!(
-        store_root_dir
-            .join(object_store::manifest_key(repo, pack.id))
-            .is_file(),
+        store_root_dir.join(object_store::manifest_key(repo, pack.id)).is_file(),
         "remote object-store manifest required before evicting local pack"
     );
     let repo_dir = root.join("objects").join(repo.to_string());
-    let (local_idx, local_pack) = (
-        repo_dir.join(format!("{}.idx", pack.id)),
-        repo_dir.join(format!("{}.pack", pack.id)),
-    );
+    let (local_idx, local_pack) =
+        (repo_dir.join(format!("{}.idx", pack.id)), repo_dir.join(format!("{}.pack", pack.id)));
     ensure!(
         local_idx.is_file() && delta::sha256_hex(&std::fs::read(&local_idx)?) == pack.idx_sha256,
         "local .idx missing or corrupt for cold pack"
@@ -270,7 +256,7 @@ pub fn evict_cold_pack_local(root: &Path, store_root_dir: &Path, repo: Uuid, pac
     }
 }
 
-pub fn hydrate_cold_pack_verified(
+pub async fn hydrate_cold_pack_verified(
     root: &Path,
     store_root_dir: &Path,
     bucket: &str,
@@ -287,10 +273,7 @@ pub fn hydrate_cold_pack_verified(
         env.pack_sha256 == pack.pack_sha256 && env.idx_sha256 == pack.idx_sha256,
         "KMS envelope digest mismatch against pack manifest"
     );
-    let local_idx = root
-        .join("objects")
-        .join(repo.to_string())
-        .join(format!("{}.idx", pack.id));
+    let local_idx = root.join("objects").join(repo.to_string()).join(format!("{}.idx", pack.id));
     ensure!(
         local_idx.is_file() && delta::sha256_hex(&std::fs::read(&local_idx)?) == pack.idx_sha256,
         "local .idx missing or corrupt before cold pack hydration"
@@ -304,6 +287,7 @@ pub fn hydrate_cold_pack_verified(
         Some(&pack.pack_sha256),
         Some(&pack.idx_sha256),
     )
+    .await
 }
 
 pub(super) async fn evaluate_lifecycle(
@@ -314,18 +298,11 @@ pub(super) async fn evaluate_lifecycle(
     eval::evaluate_lifecycle_inner(config, repo, opts).await
 }
 
-pub(super) async fn rotate_kms_key(
-    config: &Config,
-    repo: Uuid,
-    new_key_id: &str,
-) -> Result<KmsRotationReport> {
+pub(super) async fn rotate_kms_key(config: &Config, repo: Uuid, new_key_id: &str) -> Result<KmsRotationReport> {
     rotation::rotate_kms_key_with_options(
         config,
         repo,
-        &rotation::KmsRotateOptions {
-            target_key_id: Some(new_key_id.to_owned()),
-            ..Default::default()
-        },
+        &rotation::KmsRotateOptions { target_key_id: Some(new_key_id.to_owned()), ..Default::default() },
     )
     .await
 }
@@ -337,8 +314,8 @@ pub(super) async fn status(config: &Config, repo: Uuid) -> Result<LifecycleStatu
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn authenticated_pack_encryption_rotation_revocation_and_tamper_rejection() {
+    #[tokio::test]
+    async fn authenticated_pack_encryption_rotation_revocation_and_tamper_rejection() {
         let tmp = std::env::temp_dir().join(format!("pando-lifecycle-test-{}", Uuid::new_v4()));
         let objects_root = tmp.join("objects");
         let (repo, pack_id) = (Uuid::new_v4(), Uuid::new_v4());
@@ -355,8 +332,13 @@ mod tests {
         std::fs::write(dir.join(format!("{pack_id}.pack")), &pack_bytes).unwrap();
         std::fs::write(dir.join(format!("{pack_id}.idx")), &idx_bytes).unwrap();
 
-        let pack = Pack { id: pack_id, pack_sha256: delta::sha256_hex(&pack_bytes), idx_sha256: delta::sha256_hex(&idx_bytes) };
-        let (put_rep, _) = object_store::put_pack_files(&tmp, &objects_root, repo, pack_id, &Default::default()).unwrap();
+        let pack = Pack {
+            id: pack_id,
+            pack_sha256: delta::sha256_hex(&pack_bytes),
+            idx_sha256: delta::sha256_hex(&idx_bytes),
+        };
+        let (put_rep, _) =
+            object_store::put_pack_files(&tmp, &objects_root, repo, pack_id, &Default::default()).await.unwrap();
         let cipher_on_disk = std::fs::read(&put_rep.bucket_pack_path).unwrap();
         assert!(!cipher_on_disk.starts_with(b"PACK"));
         assert!(!cipher_on_disk.windows(pack_bytes.len()).any(|w| w == pack_bytes.as_slice()));
@@ -381,16 +363,27 @@ mod tests {
         assert!(verify_envelope_record(&changed_provider).is_err());
         env.storage_tier = "cold_archive".to_owned();
         env.envelope_mac = crypto::compute_authenticated_envelope_mac(&crypto::EnvelopeMacInputs {
-            encryption_mode: &env.encryption_mode, repo, pack_id, key_id: &env.key_id, key_version: env.key_version,
-            cipher_suite: &env.cipher_suite, pack_sha256: &env.pack_sha256, idx_sha256: &env.idx_sha256,
-            ciphertext_sha256: env.ciphertext_sha256.as_deref().unwrap(), ciphertext_bytes: env.ciphertext_bytes.unwrap(),
-            envelope_id: env.envelope_id.unwrap(), nonce_prefix: env.nonce_prefix.as_deref().unwrap(),
+            encryption_mode: &env.encryption_mode,
+            repo,
+            pack_id,
+            key_id: &env.key_id,
+            key_version: env.key_version,
+            cipher_suite: &env.cipher_suite,
+            pack_sha256: &env.pack_sha256,
+            idx_sha256: &env.idx_sha256,
+            ciphertext_sha256: env.ciphertext_sha256.as_deref().unwrap(),
+            ciphertext_bytes: env.ciphertext_bytes.unwrap(),
+            envelope_id: env.envelope_id.unwrap(),
+            nonce_prefix: env.nonce_prefix.as_deref().unwrap(),
             wrapped_key_json: env.wrapped_key_json.as_deref().unwrap(),
         });
         write_envelope_file(&tmp, &env).unwrap();
         assert!(evict_cold_pack_local(&tmp, &tmp, repo, &pack).unwrap());
-        let hydrated = hydrate_cold_pack_verified(&tmp, &tmp, "pando-default", repo, &pack).unwrap();
-        assert!(hydrated.rehydrated_from_object_store && std::fs::read(dir.join(format!("{pack_id}.pack"))).unwrap() == pack_bytes);
+        let hydrated = hydrate_cold_pack_verified(&tmp, &tmp, "pando-default", repo, &pack).await.unwrap();
+        assert!(
+            hydrated.rehydrated_from_object_store
+                && std::fs::read(dir.join(format!("{pack_id}.pack"))).unwrap() == pack_bytes
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
