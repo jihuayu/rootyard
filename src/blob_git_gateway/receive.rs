@@ -37,7 +37,15 @@ use super::{
     snapshot,
     state::BlobGitState,
 };
-use crate::ref_store::{CommitMode, CommitRejectCode, RefCommitResult};
+use crate::{
+    namespace_service::push_causal_stream::{
+        DurableGatewayReceiptArgs, GatewayIncomingProofArgs, GatewayPairSummary, UploadReclaimState,
+        classify_gateway_reclaim_error, materialize_durable_gateway_receipt, prove_gateway_incoming_pack_closure,
+        record_gateway_staging_inflight, settle_aborted_gateway_reclaim, spool_receive_stream_shared_deadline,
+        sweep_gateway_reclaim_ledger, verify_gateway_authority_closure,
+    },
+    ref_store::{CommitMode, CommitRejectCode, RefCommitResult},
+};
 
 const MAX_NEW_PACKS: usize = 8;
 
@@ -83,7 +91,7 @@ async fn receive_pack_authorized(
     let work = state.temp_dir("receive")?;
     let request_path = work.path().join("request.bin");
     let encoding = content_encoding(&headers)?;
-    let received = native::spool_body_with_encoding(
+    let (received, streamed_prefix) = spool_receive_stream_shared_deadline(
         body,
         &request_path,
         state.limits().max_request_bytes,
@@ -96,20 +104,33 @@ async fn receive_pack_authorized(
         return Err(GatewayError::BadRequest("push request is truncated"));
     }
     let prefix = native::read_prefix(&request_path, protocol::MAX_COMMAND_BYTES).await?;
-    let request = protocol::parse_push(&prefix, format)?;
+    if !prefix.starts_with(&streamed_prefix) {
+        return Err(GatewayError::Internal("spooled push command prefix disagrees with streamed pkt-lines"));
+    }
+    let request = protocol::parse_push(&streamed_prefix, format)?;
     let mode = if request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset };
     let digest =
         operation::request_digest(repository_id, operation, format, &request, mode, &request_path, deadline).await?;
 
-    // Immutable operation identity before native fresh writes. A terminal is
-    // replayed from the durable receipt; a pending operation stays unknown.
+    let backend_hex = state.store().backend_identity().as_hex();
+    let receipt_args = |settle_reclaim: bool| DurableGatewayReceiptArgs {
+        pool: state.pool(),
+        store: state.store(),
+        git_binary: state.git_binary(),
+        scratch_root: settle_reclaim.then(|| state.scratch_root()),
+        sandbox_root: Some(state.scratch_root()),
+        repository_id,
+        operation_id: operation,
+        deadline,
+    };
+
     match operation::probe(&state, &serving, &identity, operation, &request, digest, deadline).await? {
         Claim::Pending => return Err(GatewayError::OutcomeUnknown),
         Claim::Cancelled(reason) => {
-            let results = cancelled_results(&request, reason);
-            return terminal_response(&request, &results, operation);
+            return terminal_response(&request, &cancelled_results(&request, reason), operation);
         }
         Claim::Replay(terminal) => {
+            materialize_durable_gateway_receipt(receipt_args(false)).await?;
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
             return committed_response(CommittedResponse {
@@ -127,38 +148,72 @@ async fn receive_pack_authorized(
         }
         Claim::Fresh => {}
     }
+    // Reclaim sweeping is a fresh-admission side effect only: a pending, cancelled or replayed
+    // claim must never mutate the local reclaim ledger or delete a remote staging object.
+    let _ = sweep_gateway_reclaim_ledger(state.pool(), state.scratch_root(), backend_hex, deadline).await;
 
-    // Real sealed read view; the native process sees the exact refs/bytes of the
-    // pack-aware snapshot, never a legacy working copy.
+    // Real sealed read view; verify authority snapshot closure before building
+    // the native Git view so base packs never skip closure verification.
     let refs = snapshot::load_ref_view(&state, &serving, deadline).await?;
+    let closure_ctx =
+        match verify_gateway_authority_closure(&serving.gate, &identity, refs.handle.as_ref(), &refs.refs, backend_hex)
+        {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                snapshot::release_view(&state, &refs, deadline).await;
+                return Err(error);
+            }
+        };
     let view = snapshot::build_view(&state, &refs, deadline).await?;
     let before = pack_stems(view.repo())?;
+    let target_oids: Vec<String> = request.commands.iter().filter(|c| !c.is_delete()).map(|c| c.new.clone()).collect();
+    prove_gateway_incoming_pack_closure(GatewayIncomingProofArgs {
+        operation_id: operation,
+        git_binary: state.git_binary(),
+        scratch_root: Some(state.scratch_root()),
+        view_repo: view.repo(),
+        request_path: &request_path,
+        pack_offset: streamed_prefix.len(),
+        closure: &closure_ctx,
+        target_oids: &target_oids,
+        deadline,
+    })
+    .await?;
 
     let mut command = view.command(state.git_binary());
     command.arg("receive-pack").arg("--stateless-rpc").arg(view.repo());
     let captured = native::run_capture(command, Some(request_path.as_path()), 4 * 1024 * 1024, deadline).await?;
     if !captured.success {
-        // The operation was unknown when probed, so nothing was published: a
-        // complete native refusal proves no authoritative ref change. Only an
-        // all-`ng`/unpack-failure report is passed through; a local report that
-        // claims an applied ref is never turned into durable success.
+        // Unknown when probed, so only an all-`ng`/unpack-failure report passes through.
         if protocol::native_report_is_rejection(&captured.stdout) {
             return response(StatusCode::OK, "application/x-git-receive-pack-result", captured.stdout, operation);
         }
         return Err(GatewayError::BadRequest("push was refused by native Git validation"));
     }
 
-    // A ref-only update (or a push whose objects already exist) legitimately
-    // stages no new pack: the sealed verifier then proves the target objects
-    // from the current registered memberships. A missing object fails there.
     let new_pairs = collect_pairs(view.repo(), &before)?;
     if new_pairs.len() > MAX_NEW_PACKS {
         return Err(GatewayError::TooLarge);
     }
     let mut pairs = Vec::with_capacity(new_pairs.len());
+    let mut pair_summaries = Vec::with_capacity(new_pairs.len());
     for (pack, idx) in new_pairs {
-        pairs.push(Pair::stage(pack, idx, operation).await?);
+        let staged = Pair::stage(pack, idx, operation).await?;
+        pair_summaries.push(GatewayPairSummary {
+            pack_sha256: staged.pack_sha.clone(),
+            pack_len: staged.pack_len,
+            idx_sha256: staged.idx_sha.clone(),
+            idx_len: staged.idx_len,
+        });
+        pairs.push(staged);
     }
+    record_gateway_staging_inflight(
+        state.scratch_root(),
+        operation,
+        &closure_ctx.snapshot,
+        backend_hex,
+        &pair_summaries,
+    )?;
 
     let published =
         publish::push(&state, &serving, &identity, operation, digest, &request, &pairs, mode, deadline).await;
@@ -167,6 +222,7 @@ async fn receive_pack_authorized(
         // Git report-status. Mixed/accepted-subset terminals are replayed
         // exactly as recorded.
         Ok(PushOutcome::Terminal(terminal)) => {
+            materialize_durable_gateway_receipt(receipt_args(true)).await?;
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
             committed_response(CommittedResponse {
@@ -183,12 +239,34 @@ async fn receive_pack_authorized(
             .await
         }
         Ok(PushOutcome::Cancelled(reason)) => {
-            let results = cancelled_results(&request, reason);
-            terminal_response(&request, &results, operation)
+            let s = state.scratch_root();
+            let _ = settle_aborted_gateway_reclaim(
+                state.pool(),
+                s,
+                repository_id,
+                operation,
+                backend_hex,
+                UploadReclaimState::AbortUnpromoted,
+                reason,
+            )
+            .await;
+            terminal_response(&request, &cancelled_results(&request, reason), operation)
         }
-        // Contention, an unverified adapter and an unknown COMMIT stay HTTP
-        // errors with the operation header; they never become `ng`/`ok`.
-        Err(error) => Err(error),
+        Err(error) => {
+            let st = classify_gateway_reclaim_error(&error);
+            let s = state.scratch_root();
+            let _ = settle_aborted_gateway_reclaim(
+                state.pool(),
+                s,
+                repository_id,
+                operation,
+                backend_hex,
+                st,
+                error.message(),
+            )
+            .await;
+            Err(error)
+        }
     }
 }
 
