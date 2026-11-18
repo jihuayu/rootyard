@@ -51,13 +51,14 @@ EXEC_REAP = "reap"
 JOB_TIMEOUT_MINUTES = 110
 BUILD_FAILURE_MARKER = "failure-class"
 BUILD_FAILURE_LIMIT = 64
-BUILD_FAILURE_TARGETS = ("integration", "lib")
-BUILD_FAILURE_REASONS = ("producer", "executable", "receipt")
-BUILD_FAILURE_CLASSES = frozenset(
-    f"build-{target}-{reason}"
-    for target in BUILD_FAILURE_TARGETS
-    for reason in BUILD_FAILURE_REASONS
-)
+BUILD_FAILURE_CLASSES = frozenset({
+    "build-integration-producer",
+    "build-integration-executable",
+    "build-integration-receipt",
+    "build-lib-producer",
+    "build-lib-executable",
+    "build-lib-receipt",
+})
 BUILD_FAILURE_FALLBACK = "build"
 DATABASE_PREFIX = "slot0_native_"
 SLOT_ZERO_DATABASE = re.compile(r"slot_zero_[0-9a-f]{32}")
@@ -129,31 +130,30 @@ def require(condition, kind):
         raise EvidenceError(kind)
 
 
-def build_failure_class(target, reason):
-    """Return one exact class for a fixed build target and fixed reason."""
-    require(target in BUILD_FAILURE_TARGETS, BUILD_FAILURE_FALLBACK)
-    require(reason in BUILD_FAILURE_REASONS, BUILD_FAILURE_FALLBACK)
-    return f"build-{target}-{reason}"
-
-
 def read_build_failure_class(evidence):
     """Read the workflow's one-line build marker, or None when it is absent.
 
-    A present marker must be one exact allowlisted class.  Anything else raises
-    a fixed ``build`` error so the finalizer can fail closed without copying
-    marker text into the report.
+    A present marker must be one exact allowlisted ASCII class terminated by
+    one LF.  The binary read is capped at one byte past the fixed limit and the
+    file is closed immediately; anything else raises a fixed ``build`` error so
+    the finalizer can fail closed without copying marker text into the report.
     """
     path = Path(evidence) / BUILD_FAILURE_MARKER
     try:
         if not os.path.lexists(path):
             return None
         require(path.is_file() and not path.is_symlink(), BUILD_FAILURE_FALLBACK)
-        require(path.stat().st_size <= BUILD_FAILURE_LIMIT, BUILD_FAILURE_FALLBACK)
-        raw = path.read_text(encoding="ascii")
-    except (OSError, UnicodeDecodeError) as error:
+        with path.open("rb") as source:
+            raw = source.read(BUILD_FAILURE_LIMIT + 1)
+    except OSError as error:
         raise EvidenceError(BUILD_FAILURE_FALLBACK) from error
-    require(raw.endswith("\n") and raw.count("\n") == 1, BUILD_FAILURE_FALLBACK)
-    value = raw[:-1]
+    require(len(raw) <= BUILD_FAILURE_LIMIT, BUILD_FAILURE_FALLBACK)
+    require(b"\r" not in raw, BUILD_FAILURE_FALLBACK)
+    require(raw.endswith(b"\n") and raw.count(b"\n") == 1, BUILD_FAILURE_FALLBACK)
+    try:
+        value = raw[:-1].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(BUILD_FAILURE_FALLBACK) from error
     require(value in BUILD_FAILURE_CLASSES, BUILD_FAILURE_FALLBACK)
     return value
 

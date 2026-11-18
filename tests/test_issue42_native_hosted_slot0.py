@@ -358,40 +358,43 @@ class BuildFailureClassificationTest(unittest.TestCase):
             "build-lib-receipt",
         }
         self.assertEqual(driver.BUILD_FAILURE_CLASSES, expected)
-        for target in driver.BUILD_FAILURE_TARGETS:
-            for reason in driver.BUILD_FAILURE_REASONS:
-                value = driver.build_failure_class(target, reason)
-                self.assertIn(value, driver.BUILD_FAILURE_CLASSES)
-                report = ReportProjectionTest().report(
-                    stage="build", failure_class=value)
-                self.assertFalse(report["passed"])
-                self.assertEqual(report["stage"], "build")
-                self.assertEqual(report["failure_class"], value)
-        for target, reason in (("integration", "cargo"), ("lib", "timeout"),
-                               ("ref-store-operations", "producer"), ("", "")):
-            with self.subTest(target=target, reason=reason):
+        for value in sorted(expected):
+            report = ReportProjectionTest().report(
+                stage="build", failure_class=value)
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["stage"], "build")
+            self.assertEqual(report["failure_class"], value)
+        for unknown in ("build-integration-cargo", "build-lib-timeout",
+                        "build-integration-unknown", "build-unknown-producer"):
+            with self.subTest(unknown=unknown):
                 with self.assertRaises(driver.EvidenceError):
-                    driver.build_failure_class(target, reason)
-        with self.assertRaises(driver.EvidenceError):
-            ReportProjectionTest().report(
-                stage="build", failure_class="build-integration-unknown")
+                    ReportProjectionTest().report(
+                        stage="build", failure_class=unknown)
 
-    def test_marker_parser_accepts_only_exact_newline_terminated_classes(self):
+    def test_marker_parser_accepts_only_exact_lf_ascii_classes(self):
         with tempfile.TemporaryDirectory() as temporary:
             evidence = Path(temporary)
             marker = evidence / driver.BUILD_FAILURE_MARKER
             self.assertIsNone(driver.read_build_failure_class(evidence))
             for value in sorted(driver.BUILD_FAILURE_CLASSES):
-                marker.write_text(value + "\n", encoding="ascii")
+                marker.write_bytes(value.encode("ascii") + b"\n")
                 self.assertEqual(driver.read_build_failure_class(evidence), value)
-            for raw in ("", "\n", "build-integration-producer",
-                        "build-integration-producer\n\n",
-                        "build-integration-producer \n",
-                        "BUILD-INTEGRATION-PRODUCER\n",
-                        "build-integration-unknown\n",
-                        "build\n"):
-                marker.write_text(raw, encoding="ascii")
-                with self.subTest(raw=raw):
+            invalid = (
+                b"",
+                b"\n",
+                b"build-integration-producer",
+                b"build-integration-producer\n\n",
+                b"build-integration-producer \n",
+                b"build-integration-producer\r\n",
+                b"BUILD-INTEGRATION-PRODUCER\n",
+                b"build-integration-unknown\n",
+                b"build\n",
+                b"build-integration-producer\xff\n",
+                b"build-integration-producer\n" + b"x" * driver.BUILD_FAILURE_LIMIT,
+            )
+            for raw in invalid:
+                marker.write_bytes(raw)
+                with self.subTest(raw=raw[:32]):
                     with self.assertRaises(driver.EvidenceError) as caught:
                         driver.read_build_failure_class(evidence)
                     self.assertEqual(caught.exception.kind, "build")
@@ -426,6 +429,32 @@ class BuildFailureClassificationTest(unittest.TestCase):
             self.assertEqual(report["stage"], "build")
             self.assertEqual(report["failure_class"], "build")
             self.assertNotIn(str(root), json.dumps(report))
+
+    def test_valid_marker_does_not_override_non_build_stage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work, evidence = root / "work", root / "evidence"
+            work.mkdir()
+            evidence.mkdir()
+            (evidence / "stage").write_text("postgres")
+            (evidence / driver.BUILD_FAILURE_MARKER).write_text(
+                "build-integration-producer\n")
+            (work / "pg-baseline.json").write_text(json.dumps({
+                "server_version_num": 170005,
+                "databases": ["postgres", "template0", "template1"],
+                "client_major": 17,
+            }))
+            with mock.patch.object(driver, "verify_sources", return_value=provenance()), \
+                    mock.patch.object(driver, "cleanup_databases", return_value=(True, True)):
+                result = driver.cmd_finalize(SimpleNamespace(
+                    work=str(work), evidence=str(evidence),
+                    product=str(root / "product"),
+                    workflow_source=str(root / "workflow-source")))
+            self.assertEqual(result, 1)
+            report = json.loads((evidence / "qualification.json").read_text())
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["stage"], "postgres")
+            self.assertEqual(report["failure_class"], "postgres")
 
 
 class PostgresBooleanContractTest(unittest.TestCase):
@@ -1327,6 +1356,13 @@ class WorkflowStaticTest(unittest.TestCase):
                 if str(evidence):
                     self.assertFalse(evidence.exists())
 
+    PRODUCER_NOISE = (
+        "FAKE-PRODUCER-STDOUT-INTEGRATION",
+        "FAKE-PRODUCER-STDERR-INTEGRATION",
+        "FAKE-PRODUCER-STDOUT-LIB",
+        "FAKE-PRODUCER-STDERR-LIB",
+    )
+
     BUILD_PRODUCER_STUB = r"""#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$STUB_LOG"
@@ -1334,10 +1370,17 @@ case "$*" in
   *"-B scripts/build_native_test.py --test ref_store_operations"*)
     name=ref-store-operations
     mode="$STUB_FIRST_MODE"
+    printf '%s\n' "FAKE-PRODUCER-STDOUT-INTEGRATION"
+    printf '%s\n' "FAKE-PRODUCER-STDERR-INTEGRATION" >&2
     ;;
   *"-B scripts/build_native_test.py --lib"*)
     name=slot-zero-lib
     mode="$STUB_SECOND_MODE"
+    printf '%s\n' "FAKE-PRODUCER-STDOUT-LIB"
+    printf '%s\n' "FAKE-PRODUCER-STDERR-LIB" >&2
+    ;;
+  *"issue42_native_hosted_slot0.py bind"*)
+    exit 0
     ;;
   *) exit 90 ;;
 esac
@@ -1449,6 +1492,14 @@ esac
         self.assertIn('build_failed "build-$target-receipt"', script)
         self.assertIn("require_built ref-store-operations integration", script)
         self.assertIn("require_built slot-zero-lib lib", script)
+        integration = script.split(
+            "python3 -B scripts/build_native_test.py --test ref_store_operations",
+            1)[1].split("build_failed build-integration-producer", 1)[0]
+        lib = script.split(
+            "python3 -B scripts/build_native_test.py --lib", 1)[1].split(
+            "build_failed build-lib-producer", 1)[0]
+        self.assertIn(">/dev/null 2>&1; then", integration)
+        self.assertIn(">/dev/null 2>&1; then", lib)
         self.assertIn(f'"$EVIDENCE/{driver.BUILD_FAILURE_MARKER}"', script)
         self.assertNotIn("if ! (", script)
         self.assertLess(script.index("--test ref_store_operations"),
@@ -1468,6 +1519,12 @@ esac
             self.assertEqual((evidence / "stage").read_text(), "build")
             self.assertEqual((evidence / driver.BUILD_FAILURE_MARKER).read_text(),
                              "build-integration-producer\n")
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(
+                result.stderr,
+                "[slot0-native] stage=build status=failed class=build-integration-producer\n")
+            for payload in self.PRODUCER_NOISE:
+                self.assertNotIn(payload, result.stdout + result.stderr)
             self.assertNotIn(str(root), result.stdout + result.stderr)
             report = self.finalize_build_failure(root, work, evidence)
             self.assertFalse(report["passed"])
@@ -1487,9 +1544,34 @@ esac
             self.assertIn("--lib", invocations[1])
             self.assertEqual((evidence / driver.BUILD_FAILURE_MARKER).read_text(),
                              "build-lib-producer\n")
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(
+                result.stderr,
+                "[slot0-native] stage=build status=failed class=build-lib-producer\n")
+            for payload in self.PRODUCER_NOISE:
+                self.assertNotIn(payload, result.stdout + result.stderr)
+            self.assertNotIn(str(root), result.stdout + result.stderr)
             report = self.finalize_build_failure(root, work, evidence)
             self.assertEqual(report["stage"], "build")
             self.assertEqual(report["failure_class"], "build-lib-producer")
+
+    def test_success_bind_route_keeps_producer_noise_suppressed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, work, evidence, log = self.run_build_step(
+                root, first_mode="ready", second_mode="ready")
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "[slot0-native] stage=build status=ok\n")
+            self.assertEqual(result.stderr, "")
+            invocations = log.read_text().splitlines()
+            self.assertEqual(len(invocations), 3)
+            self.assertIn("--test ref_store_operations", invocations[0])
+            self.assertIn("--lib", invocations[1])
+            self.assertIn("issue42_native_hosted_slot0.py bind", invocations[2])
+            for payload in self.PRODUCER_NOISE:
+                self.assertNotIn(payload, result.stdout + result.stderr)
+            self.assertNotIn(str(root), result.stdout + result.stderr)
+            self.assertFalse((evidence / driver.BUILD_FAILURE_MARKER).exists())
 
     def test_local_executable_and_receipt_failures_are_distinct(self):
         cases = (
