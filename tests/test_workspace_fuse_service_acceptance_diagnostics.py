@@ -5,12 +5,12 @@ service, a FUSE mount, a child process, PostgreSQL, Git, or the network.
 """
 import io
 import json
-import os
 from pathlib import Path
 import subprocess
 import tempfile
 import types
 import unittest
+from unittest import mock
 import urllib.error
 
 from workspace_fuse_service_acceptance import (
@@ -38,7 +38,6 @@ from workspace_fuse_service_acceptance import (
     _unknown_diagnostic,
     project_shutdown_outcome,
     read_shutdown_outcome,
-    shutdown_output_stable,
 )
 
 SECRET = "SECRET-must-never-appear"
@@ -306,43 +305,57 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
         self.assertEqual(project_shutdown_outcome("not bytes"),
                          SHUTDOWN_OUTCOME_UNKNOWN)
 
-    def test_read_shutdown_outcome_reads_only_an_owned_bounded_tail(self):
+    def test_read_shutdown_outcome_reads_only_a_bound_bounded_tail(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            path, proc = root / "server.log", root / "proc"
-            proc.mkdir()
+            path = root / "server.log"
             path.write_bytes(b"rootyard: unrelated line\n" * (
                 MAX_SHUTDOWN_TAIL_BYTES // 22 + 2) + _terminal(
                     "background worker did not stop cleanly"))
-            self.assertEqual(read_shutdown_outcome(path, proc_root=proc),
-                             "background_join")
-            self.assertEqual(read_shutdown_outcome(str(path), proc_root=proc),
-                             "background_join")
-            with path.open("rb") as stream:
-                self.assertEqual(read_shutdown_outcome(stream, proc_root=proc),
+            with path.open("ab") as source:
+                self.assertEqual(read_shutdown_outcome(source),
                                  "background_join")
-            self.assertEqual(
-                read_shutdown_outcome(root / "missing.log", proc_root=proc),
-                SHUTDOWN_OUTCOME_UNKNOWN)
-            self.assertEqual(read_shutdown_outcome(None, proc_root=proc),
+                self.assertEqual(
+                    read_shutdown_outcome(source, proc_fd_root=root / "absent"),
+                    "background_join")
+            self.assertEqual(read_shutdown_outcome(str(path)), "background_join")
+            self.assertEqual(read_shutdown_outcome(root / "missing.log"),
+                             SHUTDOWN_OUTCOME_UNKNOWN)
+            self.assertEqual(read_shutdown_outcome(None),
                              SHUTDOWN_OUTCOME_UNKNOWN)
 
-            holder = proc / "4242"
-            holder.mkdir()
-            (holder / "status").write_text(
-                f"Name:\tfixture\nUid:\t{os.geteuid()}\t0\t0\t0\n",
-                encoding="utf-8")
-            (holder / "fd").mkdir()
-            (holder / "fd" / "2").symlink_to(path)
-            self.assertEqual(read_shutdown_outcome(path, proc_root=proc),
-                             SHUTDOWN_OUTCOME_UNKNOWN)
-            self.assertFalse(shutdown_output_stable(
-                os.stat(path), proc_root=proc))
-            self.assertFalse(shutdown_output_stable(
-                os.stat(path), proc_root=root / "missing-proc"))
-            (holder / "status").unlink()
-            self.assertEqual(read_shutdown_outcome(path, proc_root=proc),
-                             SHUTDOWN_OUTCOME_UNKNOWN)
+    def test_read_shutdown_outcome_rejects_a_replacement_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "server.log"
+            replacement = root / "replacement.log"
+            proc = root / "proc"
+            proc.mkdir()
+            path.write_bytes(_terminal("background worker did not stop cleanly"))
+            replacement.write_bytes(_terminal(
+                "native Git process cleanup did not prove quiescence"))
+            with path.open("ab") as source:
+                (proc / str(source.fileno())).symlink_to(replacement)
+                self.assertEqual(
+                    read_shutdown_outcome(source, proc_fd_root=proc),
+                    SHUTDOWN_OUTCOME_UNKNOWN)
+            with path.open("ab") as source:
+                path.unlink()
+                path.write_bytes(_terminal(
+                    "native Git process cleanup did not prove quiescence"))
+                self.assertEqual(
+                    read_shutdown_outcome(source, proc_fd_root=root / "absent"),
+                    SHUTDOWN_OUTCOME_UNKNOWN)
+
+    def test_read_shutdown_outcome_rejects_denied_proc_inspect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_bytes(_terminal("background worker did not stop cleanly"))
+            with path.open("ab") as source, mock.patch(
+                    "workspace_fuse_service_acceptance._open_bound_snapshot",
+                    side_effect=PermissionError("denied")):
+                self.assertEqual(read_shutdown_outcome(source),
+                                 SHUTDOWN_OUTCOME_UNKNOWN)
 
     def test_shutdown_outcome_field_is_closed_and_never_formats_test_data(self):
         class _Poison:

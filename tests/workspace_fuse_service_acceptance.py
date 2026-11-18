@@ -171,72 +171,46 @@ def _shutdown_log_path(source):
     return None
 
 
-def _process_uid(status_path):
+def _bound_source(source):
+    """Return the harness-owned descriptor identity, never just its path."""
+    path = _shutdown_log_path(source)
+    if isinstance(source, (str, os.PathLike)) or not hasattr(source, "fileno"):
+        return None, path
+    fd = source.fileno()
+    if type(fd) is not int or fd < 0:
+        raise OSError("source descriptor is unavailable")
+    return (fd, os.fstat(fd)), path
+
+
+def _open_bound_snapshot(fd, path, proc_fd_root):
+    """Open the exact bound inode; only a confirmed path/proc ENOENT falls back."""
     try:
-        text = status_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return None
-    for line in text.splitlines():
-        if line.startswith("Uid:"):
-            fields = line.split()
-            if len(fields) >= 2 and fields[1].isdigit():
-                return int(fields[1])
-    return None
-
-
-def shutdown_output_stable(target, proc_root=Path("/proc"),
-                           own_pid=None, own_uid=None):
-    """True only when no other same-uid process holds this exact file open."""
-    own_pid = os.getpid() if own_pid is None else own_pid
-    own_uid = os.geteuid() if own_uid is None else own_uid
-    try:
-        entries = os.listdir(proc_root)
-    except OSError:
-        return False
-    for name in entries:
-        if not name.isdigit():
-            continue
-        pid = int(name)
-        if pid == own_pid:
-            continue
-        process = proc_root / name
-        try:
-            os.stat(process)
-        except OSError:
-            continue
-        uid = _process_uid(process / "status")
-        if uid is None:
-            return False
-        if uid != own_uid:
-            continue
-        fd_dir = process / "fd"
-        try:
-            fds = os.listdir(fd_dir)
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return False
-        for fd in fds:
-            try:
-                info = os.stat(fd_dir / fd)
-            except OSError:
-                continue
-            if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
-                return False
-    return True
-
-
-def read_shutdown_outcome(source, proc_root=Path("/proc")):
-    """Snapshot only a bounded tail with no other same-uid open writer."""
-    try:
-        path = _shutdown_log_path(source)
+        return os.open(Path(proc_fd_root) / str(fd), os.O_RDONLY)
+    except (FileNotFoundError, ProcessLookupError):
         if path is None:
-            return SHUTDOWN_OUTCOME_UNKNOWN
-        with open(path, "rb") as stream:
-            target = os.fstat(stream.fileno())
-            size = target.st_size
-            if not shutdown_output_stable(target, proc_root=proc_root):
+            raise
+        return os.open(path, os.O_RDONLY)
+
+
+def read_shutdown_outcome(source, proc_fd_root=Path("/proc/self/fd")):
+    """Read a bounded tail tied to the exact source descriptor identity."""
+    try:
+        bound, path = _bound_source(source)
+        if bound is None:
+            if path is None:
                 return SHUTDOWN_OUTCOME_UNKNOWN
+            read_fd = os.open(path, os.O_RDONLY)
+            target = None
+        else:
+            fd, target = bound
+            read_fd = _open_bound_snapshot(fd, path, proc_fd_root)
+        with os.fdopen(read_fd, "rb") as stream:
+            current = os.fstat(stream.fileno())
+            if target is not None and (
+                    (current.st_dev, current.st_ino)
+                    != (target.st_dev, target.st_ino)):
+                return SHUTDOWN_OUTCOME_UNKNOWN
+            size = target.st_size if target is not None else current.st_size
             start = max(0, size - MAX_SHUTDOWN_TAIL_BYTES)
             previous = b""
             if start:
@@ -244,7 +218,7 @@ def read_shutdown_outcome(source, proc_root=Path("/proc")):
                 previous = stream.read(1)
             stream.seek(start)
             data = stream.read(size - start)
-    except BaseException:
+    except (OSError, TypeError, ValueError):
         return SHUTDOWN_OUTCOME_UNKNOWN
     if start and previous != b"\n":
         newline = data.find(b"\n")
