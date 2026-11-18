@@ -393,7 +393,7 @@ async fn slot_zero_admission_commits_then_exact_retry_replays() -> anyhow::Resul
         let private = Uuid::new_v4();
         let request = slot_zero_request(&fixture, public, private);
         let mut client = fixture.pool.get().await?;
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, receipt) = PgRefStore
             .admit_slot_zero_in_tx(tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
             .await?
@@ -436,7 +436,7 @@ async fn slot_zero_admission_commits_then_exact_retry_replays() -> anyhow::Resul
         assert_eq!(row.get::<_, String>(11), "pending");
 
         let retry = slot_zero_request(&fixture, public, Uuid::new_v4());
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, replay) = PgRefStore
             .admit_slot_zero_in_tx(
                 tx,
@@ -453,7 +453,7 @@ async fn slot_zero_admission_commits_then_exact_retry_replays() -> anyhow::Resul
         tx.rollback().await?;
 
         let next_request = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, next) = PgRefStore
             .admit_slot_zero_in_tx(tx, &next_request, |preview| plan_for(&fixture, &next_request, preview), deadline())
             .await?
@@ -474,7 +474,7 @@ async fn slot_zero_rejects_equal_ids_private_conflict_and_wire_rebinding() -> an
         let private = Uuid::new_v4();
         let equal = slot_zero_request(&fixture, public, public);
         let mut client = fixture.pool.get().await?;
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
                 tx,
@@ -489,7 +489,7 @@ async fn slot_zero_rejects_equal_ids_private_conflict_and_wire_rebinding() -> an
         tx.rollback().await?;
 
         let request = slot_zero_request(&fixture, public, private);
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, receipt) = PgRefStore
             .admit_slot_zero_in_tx(tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
             .await?
@@ -498,7 +498,7 @@ async fn slot_zero_rejects_equal_ids_private_conflict_and_wire_rebinding() -> an
         tx.commit().await?;
 
         let conflict = slot_zero_request(&fixture, Uuid::new_v4(), private);
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
                 tx,
@@ -514,7 +514,7 @@ async fn slot_zero_rejects_equal_ids_private_conflict_and_wire_rebinding() -> an
 
         let mut rebind = slot_zero_request(&fixture, public, Uuid::new_v4());
         rebind.wire_digest = RequestDigest::from_bytes([2; 32]);
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
                 tx,
@@ -549,7 +549,7 @@ async fn slot_zero_replay_rejects_missing_or_wrong_producer_binding() -> anyhow:
         });
         let mut client = fixture.pool.get().await?;
 
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         seed_wrapper_without_binding(&tx, &fixture, &request, plan_digest, proof).await?;
         let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
@@ -564,7 +564,7 @@ async fn slot_zero_replay_rejects_missing_or_wrong_producer_binding() -> anyhow:
         assert_ledger_integrity(&error, "slot zero serving producer binding is missing");
         tx.rollback().await?;
 
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         seed_wrapper_without_binding(&tx, &fixture, &request, plan_digest, proof).await?;
         tx.execute(
             "INSERT INTO ref_store_serving_operations(
@@ -599,7 +599,7 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
         let request = slot_zero_request(&fixture, public, private);
         let mut client = fixture.pool.get().await?;
 
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, receipt) = PgRefStore
             .admit_slot_zero_in_tx(tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
             .await?
@@ -626,7 +626,7 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
             .get(0);
         assert_eq!((wrappers, lanes, operations, bindings), (0, 0, 0, 0));
 
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, receipt) = PgRefStore
             .admit_slot_zero_in_tx(tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
             .await?
@@ -646,7 +646,7 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
             .await?;
         let mut overflow = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
         overflow.lane = overflow_lane.clone();
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
         let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
                 tx,
@@ -683,7 +683,7 @@ async fn slot_zero_typed_plan_error_rolls_back_only_the_savepoint() -> anyhow::R
         let mut request = slot_zero_request(&fixture, public, private);
         request.lane = lane.clone();
         let mut client = fixture.pool.get().await?;
-        let tx = client.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
 
         // The unique lane is absent, so preview inserts last_reserved_sequence=0
         // before build_plan returns this typed error.
@@ -756,7 +756,7 @@ async fn slot_zero_cancelled_owned_tx_cannot_be_committed() -> anyhow::Result<()
         // Real uncommitted row lock: the admission future blocks in the owned
         // outer transaction and cannot reach RELEASE while this holder lives.
         let mut holder_client = fixture.pool.get().await?;
-        let holder_tx = holder_client.transaction().await?;
+        let holder_tx = tokio_postgres::Client::transaction(&mut holder_client).await?;
         let holder_pid: i32 = holder_tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
         holder_tx
             .query_one(
@@ -773,9 +773,9 @@ async fn slot_zero_cancelled_owned_tx_cannot_be_committed() -> anyhow::Result<()
         let worker_request = request.clone();
         let worker_pool = fixture.pool.clone();
         let (pid_tx, pid_rx) = oneshot::channel();
-        let mut admission = tokio::spawn(async move {
+        let mut admission: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
             let mut client = worker_pool.get().await?;
-            let tx = client.transaction().await?;
+            let tx = tokio_postgres::Client::transaction(&mut client).await?;
             let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
             let _ = pid_tx.send(pid);
             let admission = PgRefStore
@@ -823,7 +823,7 @@ async fn slot_zero_cancelled_owned_tx_cannot_be_committed() -> anyhow::Result<()
         admission.abort();
         match timeout(WAIT, &mut admission).await {
             Ok(Err(error)) if error.is_cancelled() => {}
-            Ok(Ok(())) => return Err(anyhow::anyhow!("aborted admission unexpectedly returned normally")),
+            Ok(Ok(_worker_result)) => return Err(anyhow::anyhow!("aborted admission unexpectedly returned normally")),
             Ok(Err(error)) => return Err(error.into()),
             Err(_) => return Err(anyhow::anyhow!("aborted admission task did not join")),
         }
@@ -878,7 +878,7 @@ async fn slot_zero_restore_rotation_waits_for_admission_commit() -> anyhow::Resu
     with_fixture(|fixture| async move {
         let request = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
         let mut admission = fixture.pool.get().await?;
-        let tx = admission.transaction().await?;
+        let tx = tokio_postgres::Client::transaction(&mut admission).await?;
         let (tx, receipt) = PgRefStore
             .admit_slot_zero_in_tx(tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
             .await?
@@ -898,7 +898,7 @@ async fn slot_zero_restore_rotation_waits_for_admission_commit() -> anyhow::Resu
         let (done_tx, done_rx) = oneshot::channel();
         let mut restore = tokio::spawn(async move {
             let mut client = restore_pool.get().await?;
-            let tx = client.transaction().await?;
+            let tx = tokio_postgres::Client::transaction(&mut client).await?;
             let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
             let _ = pid_tx.send(pid);
             let changed = tx
@@ -1010,7 +1010,7 @@ async fn slot_zero_waits_for_legacy_lane_before_scope_and_gate() -> anyhow::Resu
         )
         .map_err(PackCommitError::from)?;
         let mut legacy_client = fixture.pool.get().await?;
-        let mut legacy_tx = Some(legacy_client.transaction().await?);
+        let mut legacy_tx = Some(tokio_postgres::Client::transaction(&mut legacy_client).await?);
         let legacy_pid: i32 = {
             let legacy_tx_ref = legacy_tx.as_ref().expect("legacy transaction must exist");
             let _legacy = PgRefStore.begin(legacy_tx_ref, &legacy_identity, deadline()).await?;
@@ -1023,7 +1023,7 @@ async fn slot_zero_waits_for_legacy_lane_before_scope_and_gate() -> anyhow::Resu
         let (done_tx, done_rx) = oneshot::channel();
         let mut admission = tokio::spawn(async move {
             let mut client = admission_fixture.pool.get().await?;
-            let tx = client.transaction().await?;
+            let tx = tokio_postgres::Client::transaction(&mut client).await?;
             let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
             let _ = pid_tx.send(pid);
             let (tx, receipt) = PgRefStore
@@ -1218,8 +1218,15 @@ async fn slot_zero_fixture_setup_error_drops_only_its_owned_database() -> anyhow
         "setup cleanup replaced the original error: {chain}"
     );
     assert!(!chain.contains("fixture setup database cleanup"), "setup cleanup failed: {chain}");
-    let exists: bool =
-        admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)", &[&database]).await?.get(0);
+    let admin_client =
+        timeout(WAIT, admin.get()).await.context("setup database absence admin checkout did not finish")??;
+    let exists: bool = timeout(
+        WAIT,
+        admin_client.query_one("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)", &[&database]),
+    )
+    .await
+    .context("setup database absence query did not finish")??
+    .get(0);
     assert!(!exists, "owned setup database {database} survived cleanup");
     Ok(())
 }
