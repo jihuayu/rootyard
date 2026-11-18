@@ -1,0 +1,100 @@
+name: Packfile URI Delivery
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/packfile-uri-delivery.yml'
+      - 'src/browse.rs'
+      - 'src/browse/packfile_uri.rs'
+      - 'src/browse/packfile_uri/**'
+      - 'tests/packfile_uri_delivery.rs'
+      - 'tests/packfile_uri_support/**'
+      - 'tests/test_packfile_uri_contracts.py'
+      - 'scripts/eval_packfile_uri_delivery.py'
+      - 'docs/packfile-uri-delivery.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packfile-uri-delivery-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packfile-uri-delivery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && rustfmt -V && cargo clippy -V
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/packfile-uri-delivery/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+      - name: Format, design-doc and offline contract checks
+        run: |
+          git --version
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_packfile_uri_contracts.py
+      - name: Run Clippy, library unit tests, and stock-Git TLS offload tests
+        run: |
+          cargo clippy --locked --no-default-features --lib --test packfile_uri_delivery -- -D warnings
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib browse::packfile_uri
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test packfile_uri_delivery
+      - name: Run reproducible packfile-uri benchmark evaluator
+        run: |
+          mkdir -p test-results/packfile-uri-delivery
+          python3 scripts/eval_packfile_uri_delivery.py \
+            --profiles small,medium \
+            --formats sha1,sha256 \
+            --json-out test-results/packfile-uri-delivery/benchmark.json
+      - name: Upload packfile-uri-delivery CI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packfile-uri-delivery-evidence
+          path: test-results/packfile-uri-delivery/
+          if-no-files-found: warn
