@@ -1209,9 +1209,10 @@ jobs:
             --skip smart_http_push_then_reclone_without_compute_views_has_exact_oid \
             > "$report_dir/native.log" 2>&1 || status=$?
           python3 - "$report_dir/native.log" "$status" <<'PY'
-          import hashlib, itertools, json, pathlib, re, sys
+          import hashlib, io, itertools, json, pathlib, re, sys
 
           native_log = pathlib.Path(sys.argv[1])
+          outcome_path = native_log.with_name('native-outcome.json')
           status = sys.argv[2]
           targets = [
               'atomic_push_with_rewritten_old_oid_rejects_both_refs_and_leaves_gate_unchanged',
@@ -1267,70 +1268,101 @@ jobs:
                   if (re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', commit)
                           and all(re.fullmatch(r'[0-9a-f]{64}', value) for value in digests.values())):
                       return {'workspace_commit': commit, **digests}
-              except (OSError, ValueError, KeyError, TypeError):
+              except (OSError, ValueError, KeyError, TypeError, RecursionError):
                   pass
               return None
 
-          try:
-              log = native_log.read_text()
-          except (OSError, UnicodeError):
-              log = None
-          outcome = {
-              'version': 1, 'issue': 126, 'suite': 'blob_git_gateway', 'accepted': False,
-              'phase': 'log_unreadable' if log is None else ('native_exit' if status != '0' else 'acceptance_check'),
-              'exit_code': exit_code,
-              'tests': {name: case_outcome(log or '', name) for name in targets},
-              'skipped': skipped,
-              'summary': finite_summary(log or ''),
-              'binding': build_binding(),
-          }
-
-          def write_outcome():
-              path = native_log.with_name('native-outcome.json')
-              pending = path.with_name('.native-outcome.tmp')
+          def read_native_input():
               try:
+                  snapshot = native_log.read_bytes()
+              except OSError:
+                  return None, {'state': 'unreadable', 'sha256': None, 'byte_length': None}
+              provenance = {'state': 'read', 'sha256': hashlib.sha256(snapshot).hexdigest(),
+                            'byte_length': len(snapshot)}
+              try:
+                  # Preserve read_text's encoding and universal newline behavior.
+                  with io.TextIOWrapper(io.BytesIO(snapshot)) as stream:
+                      return stream.read(), provenance
+              except UnicodeError:
+                  provenance['state'] = 'undecodable'
+                  return None, provenance
+
+          def warn_outcome_write():
+              print('warning: #126 native outcome report could not be written', file=sys.stderr)
+
+          def write_outcome(verdict, log, provenance):
+              tests = {name: case_outcome(log or '', name) for name in targets}
+              summary = finite_summary(log or '')
+              binding = build_binding()
+              completed = re.finditer(r'^test ([A-Za-z0-9_]+) \.\.\. (?:ok|FAILED|ignored)$', log or '', re.M)
+              complete = (log is not None and exit_code is not None and binding is not None and summary is not None
+                          and all(case['status'] == 'matched' for case in tests.values())
+                          and all(row[1] in targets for row in completed)
+                          and all(summary[key] == sum(case['result'] == result for case in tests.values())
+                                  for key, result in (('passed', 'ok'), ('failed', 'failed'), ('ignored', 'ignored'))))
+              outcome = {
+                  'version': 2, 'issue': 126, 'suite': 'blob_git_gateway',
+                  'acceptance_verdict': verdict, 'diagnostic_complete': complete,
+                  'phase': ('complete' if verdict == 'passed' else 'log_unreadable' if log is None
+                            else 'native_exit' if status != '0' else 'acceptance_check'),
+                  'exit_code': exit_code, 'native_input': provenance,
+                  'tests': tests, 'skipped': skipped, 'summary': summary, 'binding': binding,
+              }
+              pending = outcome_path.with_name('.native-outcome.tmp')
+              try:
+                  pending.unlink(missing_ok=True)
                   pending.write_text(json.dumps(outcome, indent=2) + '\n')
-                  pending.replace(path)
+                  pending.replace(outcome_path)
               except OSError:
                   try:
                       pending.unlink(missing_ok=True)
                   except OSError:
                       pass
-                  raise SystemExit('native log check failed: outcome write failed') from None
+                  warn_outcome_write()
 
-          # Keep failed outcomes available without widening the acceptance gate.
-          write_outcome()
-          if log is None:
-              raise SystemExit('native log check failed: output unreadable')
-          if status != '0':
-              raise SystemExit('native log check failed: test executable exit status '
-                               + ('unknown' if exit_code is None else str(exit_code)))
-          rows = re.findall(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;',
-                            log, re.MULTILINE)
-          if rows != [('ok', '3', '0', '0')]:
-              raise SystemExit('native log check failed: expected exactly one "test result: ok. 3 passed; 0 failed; 0 ignored" row')
-          ok_names = re.findall(r'^test ([A-Za-z0-9_]+) \.\.\. ok$', log, re.MULTILINE)
-          for name in targets:
-              count = ok_names.count(name)
-              if count != 1 or re.search(r'^test ' + re.escape(name) + r' \.\.\. (?!ok$)', log, re.MULTILINE):
-                  raise SystemExit('native log check failed: target ' + name + ' was not reported "ok" exactly once')
-          extra = sorted(set(ok_names) - set(targets))
-          if extra:
-              raise SystemExit('native log check failed: unexpected completed tests')
-          failures = re.findall(r'^test ([A-Za-z0-9_]+) \.\.\. (FAILED|ignored)$', log, re.MULTILINE)
-          if failures:
-              raise SystemExit('native log check failed: target failures/ignored')
-          native_log.with_name('acceptance.json').write_text(json.dumps({
-              'version': 1, 'issue': 126, 'suite': 'blob_git_gateway',
-              'accepted': True,
-              'tests': {name: 'ok' for name in targets},
-              'skipped': skipped,
-              'result': {'state': 'ok', 'passed': 3, 'failed': 0, 'ignored': 0},
-          }, indent=2) + '\n')
-          if (outcome['binding'] is not None and outcome['summary'] is not None
-                  and all(case['result'] == 'ok' for case in outcome['tests'].values())):
-              outcome.update(accepted=True, phase='complete')
-              write_outcome()
+          def check_acceptance(log):
+              if log is None:
+                  raise SystemExit('native log check failed: output unreadable')
+              if status != '0':
+                  raise SystemExit('native log check failed: test executable exit status '
+                                   + ('unknown' if exit_code is None else str(exit_code)))
+              rows = re.findall(r'^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;',
+                                log, re.MULTILINE)
+              if rows != [('ok', '3', '0', '0')]:
+                  raise SystemExit('native log check failed: expected exactly one "test result: ok. 3 passed; 0 failed; 0 ignored" row')
+              ok_names = re.findall(r'^test ([A-Za-z0-9_]+) \.\.\. ok$', log, re.MULTILINE)
+              for name in targets:
+                  count = ok_names.count(name)
+                  if count != 1 or re.search(r'^test ' + re.escape(name) + r' \.\.\. (?!ok$)', log, re.MULTILINE):
+                      raise SystemExit('native log check failed: target ' + name + ' was not reported "ok" exactly once')
+              extra = sorted(set(ok_names) - set(targets))
+              if extra:
+                  raise SystemExit('native log check failed: unexpected completed tests')
+              failures = re.findall(r'^test ([A-Za-z0-9_]+) \.\.\. (FAILED|ignored)$', log, re.MULTILINE)
+              if failures:
+                  raise SystemExit('native log check failed: target failures/ignored')
+              native_log.with_name('acceptance.json').write_text(json.dumps({
+                  'version': 1, 'issue': 126, 'suite': 'blob_git_gateway',
+                  'accepted': True,
+                  'tests': {name: 'ok' for name in targets},
+                  'skipped': skipped,
+                  'result': {'state': 'ok', 'passed': 3, 'failed': 0, 'ignored': 0},
+              }, indent=2) + '\n')
+
+          publish_outcome = True
+          try:
+              outcome_path.unlink(missing_ok=True)
+          except OSError:
+              warn_outcome_write()
+              publish_outcome = False
+          log, provenance = read_native_input()
+          verdict = 'failed'
+          try:
+              check_acceptance(log)
+              verdict = 'passed'
+          finally:
+              if publish_outcome:
+                  write_outcome(verdict, log, provenance)
           PY
           [ "$status" -eq 0 ]
       - name: Exercise the Git LFS remote read contract against the job-owned Garage fixture
@@ -2623,5 +2655,7 @@ jobs:
         if: always()
         with:
           name: refstore-protocol-native-${{ github.run_id }}-${{ github.run_attempt }}
-          path: test-results/refstore/
+          path: |
+            test-results/refstore/
+            !test-results/refstore/blob_git_gateway/native.log
           if-no-files-found: error
