@@ -136,6 +136,38 @@ class DeletedClaimFixtureInitializationTests(unittest.TestCase):
 
 
 class DeletedClaimReclaimTests(unittest.TestCase):
+    def test_expiry_requires_a_strictly_past_whole_second(self):
+        second = 1_700_000_000
+        for microseconds in (499_999, 500_000, 999_999):
+            now_ns = second * 1_000_000_000 + microseconds * 1_000
+            for updated, state, expires, accepted in (
+                ("run-id", "leased", second - 1, True),
+                ("", "queued", second - 1, True),
+                ("run-id", "leased", second, False),
+                ("", "leased", second - 1, False),
+            ):
+                with self.subTest(
+                    microseconds=microseconds, state=state, expires=expires, updated=bool(updated)
+                ):
+                    harness = object.__new__(acceptance.DeletedClaimAcceptanceHarness)
+                    harness.sql = mock.Mock(return_value=updated)
+                    harness.run_row = mock.Mock(return_value={
+                        "state": state, "lease_expires_unix": expires,
+                    })
+                    with mock.patch.object(acceptance.time, "time_ns", return_value=now_ns):
+                        if accepted:
+                            self.assertIs(harness.expire_lease_metadata("run-id"), True)
+                        else:
+                            with self.assertRaises(AssertionError):
+                                harness.expire_lease_metadata("run-id")
+                    harness.sql.assert_called_once_with(
+                        "UPDATE ci_runs SET lease_expires_unix="
+                        "floor(extract(epoch FROM clock_timestamp()))::bigint-1,"
+                        "updated_at=clock_timestamp() "
+                        "WHERE id='run-id' AND state='leased' RETURNING id::text"
+                    )
+                    harness.run_row.assert_called_once_with("run-id")
+
     def test_denied_reclaim_keeps_exactly_the_preexisting_grant_rows(self):
         before = ["control-run|1|1", "control-run|2|2", "deleted-run|1|1"]
         for label, after in (
