@@ -20,10 +20,10 @@ jobs:
     # reaps orphaned Git grandchildren. Do not introduce a global child
     # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
     runs-on: ubuntu-22.04
-    # Keep 95 minutes for the existing checks and reserve 28 for the shared
-    # Redis step (13 build, 5 restore/flush, 3 partition, 4 failover, 3 cleanup
-    # and manifest binding).
-    timeout-minutes: 123
+    # 95 minutes baseline, 12 for the #304 cold tenant LFS gate on owned Garage,
+    # and 28 for the full Redis qualification (13 build, 5 restore/flush,
+    # 3 partition, 4 failover, 3 cleanup and manifest binding).
+    timeout-minutes: 135
     services:
       postgres:
         image: postgres:17
@@ -209,6 +209,50 @@ jobs:
       - name: Exercise repository archive, rename aliases, soft-delete purge, and ownership transfer (#85)
         timeout-minutes: 10
         run: python3 tests/repository_lifecycle.py --binary "$ROOTYARD_BIN" --report test-results/repository-lifecycle.json
+      - name: "Qualify #85 cold tenant LFS retention on owned Garage"
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          umask 077
+          final_report="test-results/repository-lifecycle-remote-tenant-lfs.json"
+          [[ ! -e "$final_report" && ! -L "$final_report" ]]
+          scratch="$(mktemp -d "$RUNNER_TEMP/issue85-tenant-lfs.XXXXXX")"
+          garage_dir="$scratch/garage"
+          object_store_env="$scratch/object-store.env"
+          staged_report="$scratch/report.json"
+          fixture_started=0
+          finalize() {
+            local status=$?
+            trap - EXIT
+            if [[ "$fixture_started" == 1 && ! -d "$garage_dir" ]] ||
+               ! scripts/owned_garage_fixture.sh stop --directory "$garage_dir" >/dev/null 2>&1 ||
+               [[ -e "$garage_dir" || -L "$garage_dir" || -e "$object_store_env" || -L "$object_store_env" ]]; then
+              echo "Owned Garage cleanup failed." >&2
+              exit 1
+            fi
+            rm -f -- "$staged_report"
+            rmdir -- "$scratch"
+            if [[ "$status" == 0 ]]; then
+              printf '%s\n' "$report_json" >"$final_report"
+            fi
+            exit "$status"
+          }
+          trap finalize EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          ROOTYARD_FIXTURE_PULL_TIMEOUT=120 scripts/owned_garage_fixture.sh start \
+            --directory "$garage_dir" --output-env "$object_store_env" \
+            --bucket-prefix rootyard-issue85-lfs >/dev/null 2>&1
+          fixture_started=1
+          (
+            set -a
+            source "$object_store_env"
+            set +a
+            timeout --signal=INT --kill-after=15 240 python3 tests/repository_lifecycle.py \
+              --remote-tenant-lfs --binary "$ROOTYARD_BIN" --report "$staged_report"
+          ) >/dev/null 2>&1
+          [[ -f "$staged_report" && ! -L "$staged_report" && -s "$staged_report" ]]
+          report_json="$(<"$staged_report")"
       - name: Exercise deleted webhook-claim fence (#85)
         timeout-minutes: 10
         run: ROOTYARD_EXPECTED_SOURCE_COMMIT="$GITHUB_SHA" python3 tests/repository_lifecycle_deleted_claim_acceptance.py --binary "$ROOTYARD_BIN" --report test-results/repository-lifecycle-deleted-claim.json
@@ -629,6 +673,7 @@ jobs:
             --manifest-out test-results/native-pr-gate.json \
             --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
             --binary "$ROOTYARD_BIN" \
+            --expect-commit "$GITHUB_SHA" \
             --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST" \
             --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
             --report web_sessions=test-results/web-sessions.json \
@@ -649,6 +694,7 @@ jobs:
             --report organizations_lifecycle=test-results/organizations-lifecycle.json \
             --report forge_collaboration=test-results/forge-collaboration.json \
             --report repository_lifecycle=test-results/repository-lifecycle.json \
+            --report repository_lifecycle_remote_tenant_lfs=test-results/repository-lifecycle-remote-tenant-lfs.json \
             --report repository_lifecycle_deleted_claim=test-results/repository-lifecycle-deleted-claim.json \
             --report issue85_literal_lifecycle=test-results/repository-lifecycle-issue85-literal.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
@@ -733,6 +779,8 @@ jobs:
             --harness tests/organizations_direct_view_acceptance.py \
             --harness tests/forge_collaboration.py \
             --harness tests/repository_lifecycle.py \
+            --harness scripts/owned_garage_fixture.sh \
+            --harness scripts/owned_object_store_env.py \
             --harness tests/repository_lifecycle_deleted_claim_acceptance.py \
             --harness tests/repository_lifecycle_acceptance.py \
             --harness tests/repository_lifecycle_acceptance_support.py \
@@ -822,6 +870,7 @@ jobs:
             --require-case repository_lifecycle=rename_aliases_and_authz_before_redirect \
             --require-case repository_lifecycle=soft_delete_restore_and_purge_holds \
             --require-case repository_lifecycle=ownership_transfer_and_crash_recovery \
+            --require-case repository_lifecycle_remote_tenant_lfs=remote_tenant_lfs_cold_retention \
             --require-case repository_lifecycle_deleted_claim=source_claim_fence_contract \
             --require-case repository_lifecycle_deleted_claim=live_control_secret_claim_and_expired_reclaim \
             --require-case repository_lifecycle_deleted_claim=live_main_run_expired_lease_fixture \

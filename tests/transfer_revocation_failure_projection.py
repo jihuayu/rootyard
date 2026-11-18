@@ -12,10 +12,12 @@ PROOF_COMPONENTS = (
 SOURCE_BOOLS = (
     "witness_available", "witness_bound", "qualified",
     "source_identity_unique", "source_position_unchanged", "source_unfinished",
+    "source_pipe_full",
 )
 SOURCE_INTS = (
     "witness_version", "witness_kind_code", "failure_code",
     "fatal_failure_code", "source_position", "source_size", "source_remaining",
+    "source_proof_kind_code",
 )
 BACKPRESSURE_BOOLS = (
     "qualified", "server_tx_positive_every_sample",
