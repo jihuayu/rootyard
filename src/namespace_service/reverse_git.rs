@@ -180,6 +180,10 @@ pub(super) fn git(repo: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
 pub(super) fn git_oid(repo: &FsPath, args: &[&str]) -> Result<String, Error> {
     String::from_utf8(git(repo, args)?).map(|s| s.trim().to_owned()).map_err(Error::internal)
 }
+pub(super) fn git_input_bytes(repo: &FsPath, args: &[&str], input: &[u8]) -> Result<Vec<u8>, Error> {
+    run(command(repo, args), Some(input))
+}
+
 pub(super) fn git_input(repo: &FsPath, args: &[&str], input: &[u8], actor: Option<&str>) -> Result<String, Error> {
     let mut cmd = command(repo, args);
     if let Some(actor) = actor {

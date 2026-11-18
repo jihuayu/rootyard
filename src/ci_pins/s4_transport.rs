@@ -1,0 +1,486 @@
+//! S4 CI Smart HTTP data plane for `pg_refstore` repositories.
+//!
+//! This is a read-only transport. `git-receive-pack` is refused unconditionally,
+//! only a narrow `ryj_` job credential is accepted, and every request re-proves
+//! the grant, the pin, the retained root, the token and live RBAC in PostgreSQL
+//! before a single byte is materialized.
+//!
+//! The transfer is served from a disposable bare repository rebuilt from the
+//! retained root's verified `.pack`/`.idx` bytes, so a deleted branch, a rewritten
+//! history or a wiped local cache cannot change what a pinned job sees.
+use super::s4_models::{GrantExpectation, S4ClosureGrant, fixed_oid, is_lower_hex};
+use super::s4_authority::{StreamSlot, wide_credential};
+use super::s4_pin::refstore_repository;
+use super::*;
+use crate::members::{models::Role, rbac};
+use crate::ref_store::core::retention_root::{PgRetentionRoots, RootRef};
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{StatusCode, header},
+    response::Response,
+};
+use std::{
+    path::{Path as FsPath, PathBuf},
+    process::Stdio,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    time::Instant,
+};
+
+/// Fixed chunk size of the streamed pack response.
+const CHUNK: usize = 16 * 1024;
+/// How often the stream re-proves authorization, independent of chunk size.
+const RECHECK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A verified, still-live job grant.
+#[derive(Clone)]
+struct Authorized {
+    grant: S4ClosureGrant,
+    digest: Vec<u8>,
+}
+
+/// Disposable `0o700` bare repository removed when the response ends.
+pub(crate) struct DisposableCiView {
+    dir: PathBuf,
+}
+
+impl DisposableCiView {
+    fn create() -> Result<Self, Error> {
+        let dir = std::env::temp_dir().join(format!("rootyard-s4-{}", Uuid::new_v4()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .map_err(Error::internal)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&dir).map_err(Error::internal)?;
+        Ok(Self { dir })
+    }
+
+    pub(crate) fn path(&self) -> &FsPath {
+        &self.dir
+    }
+}
+
+impl Drop for DisposableCiView {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn git(dir: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
+    let output = std::process::Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null", "--git-dir"])
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(Error::internal)?;
+    if !output.status.success() {
+        return Err(Error(StatusCode::CONFLICT, "retained root could not be materialized"));
+    }
+    Ok(output.stdout)
+}
+
+fn write_pack(dir: &FsPath, pack_id: Uuid, pack: &[u8], idx: &[u8]) -> Result<(), Error> {
+    let base = format!("pack-{pack_id}");
+    let packs = dir.join("objects/pack");
+    std::fs::create_dir_all(&packs).map_err(Error::internal)?;
+    std::fs::write(packs.join(format!("{base}.pack")), pack).map_err(Error::internal)?;
+    std::fs::write(packs.join(format!("{base}.idx")), idx).map_err(Error::internal)?;
+    Ok(())
+}
+
+fn init_bare(dir: &FsPath, format: &str) -> Result<(), Error> {
+    let init = std::process::Command::new("git")
+        .args(["init", "--bare", "--quiet"])
+        .arg(format!("--object-format={format}"))
+        .arg(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .map_err(Error::internal)?;
+    if !init.status.success() {
+        return Err(Error::internal("bare repository initialization failed"));
+    }
+    Ok(())
+}
+
+/// Rebuild one exact retained commit as a throwaway bare repository with a
+/// single `refs/heads/main` and no other reachable object.
+pub(crate) async fn materialize(
+    state: &AppState,
+    store: &crate::blob_store::opendal::BlobStore,
+    repository_id: Uuid,
+    root_id: Uuid,
+    target_oid: &str,
+    deadline: Instant,
+) -> Result<DisposableCiView, Error> {
+    let roots = PgRetentionRoots::new(store.clone(), state.config.git.clone()).map_err(Error::internal)?;
+    let root = RootRef::new(repository_id, root_id, 1).map_err(Error::internal)?;
+    let view = roots
+        .materialize_serving(&state.pool, root, deadline)
+        .await
+        .map_err(|_| Error(StatusCode::CONFLICT, "retained root unavailable or released"))?;
+    let holder = DisposableCiView::create()?;
+    let dir = holder.path().to_path_buf();
+    init_bare(&dir, view.object_format().as_str())?;
+    for pack in view.packs() {
+        let bytes = view
+            .pack_bytes(pack.pack_id(), deadline)
+            .await
+            .map_err(|_| Error(StatusCode::CONFLICT, "retained pack unavailable"))?;
+        let idx = view
+            .idx_bytes(pack.pack_id(), deadline)
+            .await
+            .map_err(|_| Error(StatusCode::CONFLICT, "retained index unavailable"))?;
+        write_pack(&dir, pack.pack_id(), &bytes, &idx)?;
+    }
+    let target = target_oid;
+    git(&dir, &["config", "uploadpack.allowAnySHA1InWant", "false"])?;
+    git(&dir, &["config", "uploadpack.allowReachableSHA1InWant", "false"])?;
+    git(&dir, &["config", "uploadpack.allowFilter", "false"])?;
+    git(&dir, &["update-ref", "refs/heads/main", target])?;
+    git(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    git(&dir, &["cat-file", "-e", &format!("{target}^{{commit}}")])?;
+    Ok(holder)
+}
+
+/// One exact still-live authorization decision for the requested object id.
+async fn authorize(
+    state: &AppState,
+    store: &crate::blob_store::opendal::BlobStore,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    target: &str,
+    deadline: Instant,
+) -> Result<Authorized, Error> {
+    if wide_credential(headers) {
+        return Err(Error(StatusCode::FORBIDDEN, "wide user credentials cannot access CI transport"));
+    }
+    let (_, token) = auth::credentials_for(headers, super::s4_models::JOB_PREFIX)?;
+    let repository = refstore_repository(state, owner, name).await?.ok_or_else(Error::not_found)?;
+    let format = repository.object_format.clone();
+    let target = fixed_oid(target, &format)?.to_owned();
+    let digest = db::digest(&token);
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    crate::ref_store::pg::bound(&tx, deadline)
+        .await
+        .map_err(|_| Error::timeout())?;
+    let row = tx
+        .query_opt(
+            "SELECT g.grant_json, g.expires_unix, g.revoked, g.cancelled, j.cancelled, j.revoked, \
+                    j.expires_unix, r.owner_id, r.state, r.storage_generation, t.user_id, j.job_id \
+             FROM s4_ci_retention.closure_grants g \
+             JOIN ci_checkout_jobs j ON j.repository_id=g.repository_id AND j.job_id=g.job_id \
+             JOIN repositories r ON r.id=g.repository_id \
+             JOIN tokens t ON t.id=j.issuer_token_id \
+             WHERE g.repository_id=$1 AND g.credential_digest=$2 \
+               AND g.target_oid=$3 AND r.name=$4",
+            &[&repository.id, &digest, &target, &name],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::unauthorized)?;
+    if row.get::<_, bool>(2)
+        || row.get::<_, bool>(3)
+        || row.get::<_, bool>(4)
+        || row.get::<_, bool>(5)
+        || row.get::<_, String>(8) != "ready"
+        || row.get::<_, i64>(9) != repository.storage_generation
+    {
+        return Err(Error::unauthorized());
+    }
+    let owner_tenant: Uuid = row.get(7);
+    let actor: Uuid = row.get(10);
+    let now = tx
+        .query_one("SELECT extract(epoch FROM clock_timestamp())::bigint", &[])
+        .await
+        .map_err(Error::internal)?
+        .get::<_, i64>(0);
+    if row.get::<_, i64>(1) <= now || row.get::<_, i64>(6) <= now {
+        return Err(Error::unauthorized());
+    }
+    let role = rbac::resolve_effective_role_by_id(&tx, repository.id, owner_tenant, actor)
+        .await
+        .map_err(Error::internal)?;
+    if !role.is_some_and(|role| role >= Role::Read) {
+        return Err(Error::unauthorized());
+    }
+    let token_live = tx
+        .query_opt(
+            "SELECT 1 FROM ci_checkout_jobs j JOIN tokens t ON t.id=j.issuer_token_id \
+             WHERE j.repository_id=$1 AND j.job_id=$2 AND NOT t.revoked \
+               AND (t.expires_at IS NULL OR t.expires_at>clock_timestamp())",
+            &[&repository.id, &row.get::<_, Uuid>(11)],
+        )
+        .await
+        .map_err(Error::internal)?;
+    if token_live.is_none() {
+        return Err(Error::unauthorized());
+    }
+    let grant: S4ClosureGrant = serde_json::from_value(row.get(0)).map_err(|_| Error::unauthorized())?;
+    grant.authorize(&GrantExpectation {
+        repository_id: repository.id,
+        owner_tenant_id: owner_tenant,
+        storage_generation: repository.storage_generation,
+        authority_epoch: grant.authority_epoch,
+        mirror_audience: crate::ci_checkouts::audience()?,
+        target_oid: &target,
+        now_unix: now,
+    })?;
+    let pin = tx
+        .query_opt(
+            "SELECT 1 FROM s4_ci_retention.ci_pins \
+             WHERE repository_id=$1 AND job_id=$2 AND state='pinned'",
+            &[&repository.id, &grant.job_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    if pin.is_none() {
+        return Err(Error::unauthorized());
+    }
+    let root = RootRef::new(repository.id, grant.retention_root_id, 1).map_err(Error::internal)?;
+    let record = PgRetentionRoots::root_record_in_tx(&tx, root)
+        .await
+        .map_err(|_| Error::unauthorized())?;
+    if !record.is_some_and(|record| record.is_active()) {
+        return Err(Error::unauthorized());
+    }
+    let _ = tx.rollback().await;
+    let _ = store;
+    Ok(Authorized { grant, digest })
+}
+
+/// Cheap periodic re-proof used by the streaming body.
+async fn still_authorized(state: &AppState, authorized: &Authorized) -> bool {
+    super::s4_authority::still_authorized(
+        state,
+        authorized.grant.job_id,
+        &authorized.digest,
+        authorized.grant.repository_id,
+        authorized.grant.storage_generation,
+    )
+    .await
+    .unwrap_or(false)
+}
+
+/// Re-check authorization before every chunk is handed to the HTTP body. The
+/// check is deliberately inside the stream: a `last` timestamp reset after every
+/// read would let a fast local loopback stream finish before the next interval.
+pub(crate) fn guarded_chunks<S, F>(
+    source: S,
+    mut authorized: F,
+    slot: StreamSlot,
+) -> impl futures_util::Stream<Item = std::io::Result<bytes::Bytes>>
+where
+    S: futures_util::Stream<Item = std::io::Result<bytes::Bytes>>,
+    F: FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+{
+    async_stream::try_stream! {
+        let _slot = slot;
+        futures_util::pin_mut!(source);
+        while let Some(chunk) = futures_util::StreamExt::next(&mut source).await {
+            let chunk = chunk?;
+            if !authorized().await {
+                Err(std::io::Error::other("checkout authorization revoked during transfer"))?;
+            }
+            yield chunk;
+        }
+    }
+}
+
+/// Any `want` line must name exactly the granted commit.
+pub(crate) fn refused_want(body: &[u8], target: &str) -> bool {
+    let mut index = 0;
+    while let Some(found) = body[index..].windows(5).position(|window| window == b"want ") {
+        let start = index + found + 5;
+        let candidate = body
+            .get(start..start + target.len())
+            .and_then(|bytes| std::str::from_utf8(bytes).ok());
+        if let Some(value) = candidate
+            && is_lower_hex(value, target.len())
+            && value != target
+        {
+            return true;
+        }
+        index = start;
+    }
+    false
+}
+
+fn advertisement(service: &str, refs: &[u8]) -> Vec<u8> {
+    let line = format!("# service=git-{service}\n");
+    let mut body = format!("{:04x}", line.len() + 4).into_bytes();
+    body.extend_from_slice(line.as_bytes());
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(refs);
+    body
+}
+
+fn store() -> Result<crate::blob_store::opendal::BlobStore, Error> {
+    let profile = crate::blob_store::config::BlobProfile::from_env().map_err(Error::internal)?;
+    crate::blob_store::opendal::BlobStore::open(profile).map_err(Error::internal)
+}
+
+/// `GET /ci/{target}/git/{owner}/{name}/info/refs`
+pub(crate) async fn info_refs(
+    State(state): State<Arc<AppState>>,
+    Path((target, owner, name)): Path<(String, String, String)>,
+    request: Request<Body>,
+) -> Result<Response, Error> {
+    let (owner, name) = split_name(owner, name);
+    if request.uri().query().is_some_and(|query| query.contains("service=git-receive-pack")) {
+        return Err(Error(StatusCode::FORBIDDEN, "CI transport is read-only"));
+    }
+    if refstore_repository(&state, &owner, &name).await?.is_none() {
+        return crate::git_http::handle(state, request).await;
+    }
+    let headers = request.headers().clone();
+    let deadline = Instant::now() + state.config.git_timeout;
+    let store = store()?;
+    let authorized = authorize(&state, &store, &headers, &owner, &name, &target, deadline).await?;
+    let holder = materialize(
+        &state,
+        &store,
+        authorized.grant.repository_id,
+        authorized.grant.retention_root_id,
+        &authorized.grant.target_oid,
+        deadline,
+    )
+    .await?;
+    let out = git(holder.path(), &["upload-pack", "--stateless-rpc", "--advertise-refs"])?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-advertisement")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(advertisement("upload-pack", &out)))
+        .map_err(Error::internal)
+}
+
+/// `POST /ci/{target}/git/{owner}/{name}/git-upload-pack`
+pub(crate) async fn upload_pack(
+    State(state): State<Arc<AppState>>,
+    Path((target, owner, name)): Path<(String, String, String)>,
+    request: Request<Body>,
+) -> Result<Response, Error> {
+    let (owner, name) = split_name(owner, name);
+    if refstore_repository(&state, &owner, &name).await?.is_none() {
+        return crate::git_http::handle(state, request).await;
+    }
+    let headers = request.headers().clone();
+    let deadline = Instant::now() + state.config.git_timeout;
+    let body = axum::body::to_bytes(request.into_body(), 16 * 1024 * 1024)
+        .await
+        .map_err(|_| Error::bad_request())?;
+    let store = store()?;
+    let authorized = authorize(&state, &store, &headers, &owner, &name, &target, deadline).await?;
+    if refused_want(&body, &authorized.grant.target_oid) {
+        return Err(Error(StatusCode::FORBIDDEN, "requested object is outside the granted closure"));
+    }
+    let holder = materialize(
+        &state,
+        &store,
+        authorized.grant.repository_id,
+        authorized.grant.retention_root_id,
+        &authorized.grant.target_oid,
+        deadline,
+    )
+    .await?;
+    let slot = StreamSlot::acquire(&state)?;
+    let mut child = Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null", "upload-pack", "--stateless-rpc"])
+        .arg(holder.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(Error::internal)?;
+    let mut stdin = child.stdin.take().ok_or_else(|| Error::internal("upload-pack stdin"))?;
+    tokio::spawn(async move {
+        let _ = stdin.write_all(&body).await;
+        let _ = stdin.shutdown().await;
+    });
+    let mut stdout = child.stdout.take().ok_or_else(|| Error::internal("upload-pack stdout"))?;
+    let stream_state = state.clone();
+    let stream_grant = authorized.grant.clone();
+    let stream_digest = authorized.digest.clone();
+    let check = move || -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+        let state = stream_state.clone();
+        let grant = stream_grant.clone();
+        let digest = stream_digest.clone();
+        Box::pin(async move {
+            super::s4_authority::still_authorized(
+                &state,
+                grant.job_id,
+                &digest,
+                grant.repository_id,
+                grant.storage_generation,
+            )
+            .await
+            .unwrap_or(false)
+        })
+    };
+    let stream_auth = authorized.clone();
+    let source = async_stream::try_stream! {
+        let _holder = holder;
+        let mut ticker = tokio::time::interval(RECHECK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut buffer = vec![0u8; CHUNK];
+        loop {
+            tokio::select! {
+                read = stdout.read(&mut buffer) => {
+                    let read = read?;
+                    if read == 0 {
+                        break;
+                    }
+                    yield bytes::Bytes::copy_from_slice(&buffer[..read]);
+                }
+                _ = ticker.tick() => {
+                    if !still_authorized(&stream_state, &stream_auth).await {
+                        let _ = child.kill().await;
+                        Err(std::io::Error::other(
+                            "checkout authorization revoked during transfer",
+                        ))?;
+                    }
+                }
+            }
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            Err(std::io::Error::other("upload-pack failed"))?;
+        }
+    };
+    let stream = guarded_chunks(source, check, slot);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(stream))
+        .map_err(Error::internal)
+}
+
+/// `POST /ci/{target}/git/{owner}/{name}/git-receive-pack` is always refused.
+pub(crate) async fn receive_pack() -> Result<Response, Error> {
+    Err(Error(StatusCode::FORBIDDEN, "CI transport is read-only"))
+}
+
+fn split_name(owner: String, name: String) -> (String, String) {
+    let name = name.strip_suffix(".git").unwrap_or(&name).to_owned();
+    (owner, name)
+}
