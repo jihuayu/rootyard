@@ -64,6 +64,10 @@ impl NativeView {
         Ok(Self { lease, git_dir, incoming, template, runner, format })
     }
 
+    pub(super) fn bound_stack(&mut self) {
+        self.runner.bound_stack();
+    }
+
     /// Directory holding the verified pack/idx copies.
     pub(super) fn incoming(&self) -> &Path {
         &self.incoming

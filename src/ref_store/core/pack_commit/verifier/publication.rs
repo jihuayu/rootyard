@@ -24,6 +24,7 @@
 use super::budget::budgets;
 use super::download;
 use super::lease::VerificationLease;
+use super::merge::{MergeClaim, VerifiedMergeAttestation};
 use super::publication_support::{check_workspace, facts_digest, membership_rows, old_ref_map, preflight_workspace};
 use super::view::NativeView;
 use super::{AdmissionClass, acquire_slot_with_class, acquire_view_budget_with_class, arm, refuse};
@@ -34,6 +35,7 @@ use crate::ref_store::core::pack_commit::artifact::{RegisteredPack, packs_digest
 use crate::ref_store::core::pack_commit::context::{CapturedRef, MembershipDigest, PackCommitBaseline};
 use crate::ref_store::core::pack_commit::contract::{
     MAX_ACTIVE_MEMBERSHIPS, MAX_BATCH_NEW_PACKS, PackArtifactRole, VERIFIER_MAX_PAIRS, VERIFIER_MAX_TOTAL_BYTES,
+    VERIFIER_VIEW_MAX_LOGICAL_BYTES,
 };
 use crate::ref_store::core::pack_commit::error::{PackCommitError, PackCommitRejectCode, PackCommitRejection};
 use crate::ref_store::core::pack_commit::facts::LfsByteWitness;
@@ -254,8 +256,21 @@ impl PublicationFactsEngine {
         lfs: &dyn LfsByteWitness,
         deadline: Instant,
     ) -> Result<VerifiedPublicationFacts, PackCommitError> {
+        self.facts_with_merge(plan, baseline, new_packs, lfs, None, deadline).await.map(|(facts, _)| facts)
+    }
+
+    pub(crate) async fn facts_with_merge(
+        &self,
+        plan: &PackCommitPlan,
+        baseline: &PackCommitBaseline,
+        new_packs: Vec<RegisteredPack>,
+        lfs: &dyn LfsByteWitness,
+        claim: Option<&MergeClaim>,
+        deadline: Instant,
+    ) -> Result<(VerifiedPublicationFacts, Option<VerifiedMergeAttestation>), PackCommitError> {
         let deadline = arm(deadline)?;
         let request = Request::check(plan, baseline, new_packs)?;
+        let merge = claim.map(|claim| claim.check(plan, &request.old_refs)).transpose()?;
         let mut registered = Vec::with_capacity(request.old.len() + request.new.len());
         registered.extend(request.old.iter());
         registered.extend(request.new.iter());
@@ -268,10 +283,14 @@ impl PublicationFactsEngine {
         let class = AdmissionClass::Foreground;
         // Phase 1: view budget, staging reservation, and download slot (no native Git CPU slot yet).
         let view_budget = acquire_view_budget_with_class(class, deadline).await?;
-        let staging = budgets().reserve_staging(initial_staging, class, deadline).await?;
+        let staging_bytes = if merge.is_some() { VERIFIER_VIEW_MAX_LOGICAL_BYTES } else { initial_staging };
+        let staging = budgets().reserve_staging(staging_bytes, class, deadline).await?;
         let download_permit = budgets().acquire_download(class, deadline).await?;
         let lease = VerificationLease::with_view_budget(view_budget, staging, download_permit)?;
-        let view = NativeView::create(&self.git, Arc::clone(&lease), request.format)?;
+        let mut view = NativeView::create(&self.git, Arc::clone(&lease), request.format)?;
+        if merge.is_some() {
+            view.bound_stack();
+        }
         check_workspace(&lease, deadline).await?;
         preflight_workspace(&lease, initial_staging, deadline).await?;
         let staged_pairs =
@@ -297,7 +316,9 @@ impl PublicationFactsEngine {
             }
             download::remove_pair_files(&staged.pack, &staged.idx, &lease, deadline).await?;
             cleaned_incoming = cleaned_incoming.saturating_add(staged.bytes);
-            lease.shrink_staging_to(initial_staging.saturating_sub(cleaned_incoming));
+            if merge.is_none() {
+                lease.shrink_staging_to(initial_staging.saturating_sub(cleaned_incoming));
+            }
             check_workspace(&lease, deadline).await?;
         }
         view.check_pack_directory(indexed.len())?;
@@ -311,6 +332,13 @@ impl PublicationFactsEngine {
 
         let probe = super::probe::probe_refs(&view, request.plan, &old_map, lfs, &lease, deadline).await?;
         check_workspace(&lease, deadline).await?;
+        let verified_merge = match merge {
+            Some(merge) => Some(merge.verify(&view, &probe.refs, deadline).await?),
+            None => None,
+        };
+        if verified_merge.is_some() {
+            check_workspace(&lease, deadline).await?;
+        }
 
         let mut packs = Vec::with_capacity(registered.len());
         for pack in &registered {
@@ -328,7 +356,9 @@ impl PublicationFactsEngine {
         // Every child spawned above is confirmed reaped by the runner. Native
         // capacity returns now; the workspace and view budget stay owned.
         lease.release_native();
-        Ok(VerifiedPublicationFacts::mint(&request, probe, packs, pairs, bytes, lease))
+        let facts = VerifiedPublicationFacts::mint(&request, probe, packs, pairs, bytes, lease);
+        let attestation = verified_merge.map(|merge| merge.attest(plan, &facts));
+        Ok((facts, attestation))
     }
 }
 

@@ -53,11 +53,16 @@ pub(super) struct GitRunner {
     binary: PathBuf,
     home: PathBuf,
     template: PathBuf,
+    bounded_stack: bool,
 }
 
 impl GitRunner {
     pub(super) fn new(binary: PathBuf, home: PathBuf, template: PathBuf) -> Self {
-        Self { binary, home, template }
+        Self { binary, home, template, bounded_stack: false }
+    }
+
+    pub(super) fn bound_stack(&mut self) {
+        self.bounded_stack = true;
     }
 
     /// Run one closed step. `git_dir` adds `--git-dir <owned dir>` (never used by
@@ -103,11 +108,10 @@ impl GitRunner {
                 command.stdin(Stdio::from(file));
             }
         }
-        // SAFETY: the closure only calls async-signal-safe libc setters and
+        let bounded_stack = self.bounded_stack;
+        // SAFETY: the closure only calls async-signal-safe libc operations and
         // allocates nothing between fork and exec.
-        unsafe {
-            command.pre_exec(limit_child);
-        }
+        unsafe { command.pre_exec(move || limit_child(bounded_stack)) };
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(_) => {
@@ -233,7 +237,7 @@ fn report_step(step: &'static str, class: &'static str) {
 }
 
 /// Frozen verifier limits, applied after `fork` and before `exec`.
-fn limit_child() -> io::Result<()> {
+fn limit_child(bounded_stack: bool) -> io::Result<()> {
     if unsafe { libc::setpgid(0, 0) } == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -247,6 +251,23 @@ fn limit_child() -> io::Result<()> {
         if unsafe { libc::setrlimit(resource, &value) } == -1 {
             return Err(io::Error::last_os_error());
         }
+    }
+    if bounded_stack {
+        limit_stack()?;
+    }
+    Ok(())
+}
+
+fn limit_stack() -> io::Result<()> {
+    const STACK_BYTES: libc::rlim_t = 8 * 1024 * 1024;
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut limit) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    limit.rlim_max = limit.rlim_max.min(STACK_BYTES);
+    limit.rlim_cur = limit.rlim_cur.min(limit.rlim_max);
+    if unsafe { libc::setrlimit(libc::RLIMIT_STACK, &limit) } == -1 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

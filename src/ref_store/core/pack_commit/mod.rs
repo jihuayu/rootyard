@@ -71,7 +71,7 @@ pub use pg::PgPackCommit;
 pub use plan::{ContentDigest, PackCommitExpectation, PackCommitPlan, PackCommitScope, PlannedArtifact, PlannedPack};
 pub(crate) use producer::read_serving_operation;
 pub use proof::PackClosureProof;
-pub use proof::verifier::PackVerifier;
+pub use proof::verifier::{MergeClaim, MergeStrategy, PackVerifier, VerifiedMergeAttestation};
 pub(crate) use proof::verifier::{NativeReadClosure, NativeReadEngine, NativeReadRequest};
 pub use receipt::{
     PackCommitReceipt, PackCommitTerminal, PackRegistrationAck, PackRegistrationReceipt, PackTerminalRegistration,

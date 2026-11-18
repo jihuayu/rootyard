@@ -57,6 +57,7 @@ mod handoff;
 #[cfg(test)]
 mod handoff_tests;
 mod lease;
+mod merge;
 mod mint;
 mod pointer;
 mod probe;
@@ -70,6 +71,7 @@ mod validate;
 mod view;
 
 pub(super) use budget::{AdmissionClass, NativePermit, ViewPermit, budgets};
+pub use merge::{MergeClaim, MergeStrategy, VerifiedMergeAttestation};
 pub(crate) use publication::{PublicationFactsEngine, VerifiedPublicationFacts};
 pub(crate) use read::{NativeReadClosure, NativeReadEngine, NativeReadRequest};
 
