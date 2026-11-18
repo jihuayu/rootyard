@@ -14,6 +14,7 @@ use crate::{
                 PackCommitScope, PackMode,
             },
         },
+        pg::public_attempt::{PublicAttemptLookup, PublicAttemptRequest},
     },
 };
 use anyhow::Context;
@@ -1229,4 +1230,170 @@ async fn slot_zero_fixture_setup_error_drops_only_its_owned_database() -> anyhow
     .get(0);
     assert!(!exists, "owned setup database {database} survived cleanup");
     Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AttemptLedgerFacts {
+    wrappers: i64,
+    attempts: i64,
+    operations: i64,
+    bindings: i64,
+    lanes: i64,
+    cancellations: i64,
+    events: i64,
+    gate_revision: i64,
+    restore_incarnation: Uuid,
+}
+
+async fn attempt_ledger_facts(
+    client: &tokio_postgres::Client,
+    fixture: &Fixture,
+) -> anyhow::Result<AttemptLedgerFacts> {
+    let row = client
+        .query_one(
+            "SELECT
+               (SELECT count(*) FROM ref_store_public_operations WHERE repository_id=$1),
+               (SELECT count(*) FROM ref_store_private_attempts WHERE repository_id=$1),
+               (SELECT count(*) FROM ref_store_operations WHERE repository_id=$1),
+               (SELECT count(*) FROM ref_store_serving_operations WHERE repository_id=$1),
+               (SELECT count(*) FROM ref_store_issuer_lanes WHERE repository_id=$1),
+               (SELECT count(*) FROM ref_store_cancellations WHERE repository_id=$1),
+               (SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1),
+               (SELECT revision FROM ref_store_core_gates WHERE repository_id=$1),
+               (SELECT incarnation FROM public.cluster_authority WHERE singleton)",
+            &[&fixture.repo],
+        )
+        .await?;
+    Ok(AttemptLedgerFacts {
+        wrappers: row.get(0),
+        attempts: row.get(1),
+        operations: row.get(2),
+        bindings: row.get(3),
+        lanes: row.get(4),
+        cancellations: row.get(5),
+        events: row.get(6),
+        gate_revision: row.get(7),
+        restore_incarnation: row.get(8),
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn slot_zero_public_attempt_lookup_is_exact_and_read_only() -> anyhow::Result<()> {
+    with_fixture(|fixture| async move {
+        let public = Uuid::new_v4();
+        let private = Uuid::new_v4();
+        let admission_request = slot_zero_request(&fixture, public, private);
+        let mut client = fixture.pool.get().await?;
+
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
+        let (tx, receipt) = PgRefStore
+            .admit_slot_zero_in_tx(
+                tx,
+                &admission_request,
+                |preview| plan_for(&fixture, &admission_request, preview),
+                deadline(),
+            )
+            .await?
+            .into_parts();
+        let receipt = receipt?;
+        assert!(!receipt.replayed);
+        assert_eq!(receipt.public_id, public);
+        assert_eq!(receipt.private_id, private);
+        assert_eq!(receipt.sequence, 1);
+        assert_eq!(receipt.state, OperationState::Pending);
+        tx.commit().await?;
+
+        let migrations = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=147),
+                        EXISTS(SELECT 1 FROM schema_migrations WHERE version=152)",
+                &[],
+            )
+            .await?;
+        assert!(migrations.get::<_, bool>(0), "fixture must include migration 147");
+        assert!(migrations.get::<_, bool>(1), "fixture must include migration 152");
+
+        let live_restore: Uuid =
+            client.query_one("SELECT incarnation FROM public.cluster_authority WHERE singleton", &[]).await?.get(0);
+        assert_eq!(live_restore, fixture.restore, "fixture restore incarnation must still be current");
+
+        let binding = client
+            .query_one(
+                "SELECT producer_request_digest,plan_parent_digest
+                   FROM ref_store_serving_operations
+                  WHERE repository_id=$1 AND operation_id=$2",
+                &[&fixture.repo, &private],
+            )
+            .await?;
+        assert_eq!(binding.get::<_, String>(0), admission_request.wire_digest.as_hex());
+        assert_eq!(binding.get::<_, String>(1), receipt.plan_digest.as_hex());
+
+        let lookup_request = PublicAttemptRequest {
+            repository_id: fixture.repo,
+            admission_owner_id: fixture.actor,
+            issuer_id: fixture.actor,
+            public_id: public,
+            wire_digest: admission_request.wire_digest,
+            request_mode: admission_request.request_mode,
+            backend_identity: fixture.backend.clone(),
+            object_format: admission_request.object_format,
+            history_incarnation: fixture.history,
+            authority_epoch: admission_request.authority_epoch,
+            group_epoch: admission_request.group_epoch,
+            restore_incarnation: fixture.restore,
+        };
+        assert_eq!(lookup_request.public_id, public);
+        assert_eq!(lookup_request.admission_owner_id, fixture.actor);
+        assert_eq!(lookup_request.restore_incarnation, fixture.restore);
+        assert_eq!(lookup_request.wire_digest, receipt.wire_digest);
+
+        let before = attempt_ledger_facts(&client, &fixture).await?;
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
+        tx.batch_execute("SET TRANSACTION READ ONLY").await?;
+        let read_only: String = tx.query_one("SHOW transaction_read_only", &[]).await?.get(0);
+        assert_eq!(read_only, "on", "lookup smoke must use a read-only transaction");
+
+        match PgRefStore.lookup_public_attempt(&tx, &lookup_request, deadline()).await? {
+            PublicAttemptLookup::Pending(evidence) => {
+                assert_eq!(evidence.public_id, public);
+                assert!(evidence.retired.is_none());
+                assert_eq!(evidence.current.slot, 0);
+                assert_eq!(evidence.current.private_id, private);
+                assert_eq!(evidence.current.plan_digest, receipt.plan_digest);
+                assert_eq!(evidence.current.proof_digest, receipt.proof_digest);
+                assert_eq!(evidence.current.base_revision, receipt.base_revision);
+                assert_eq!(evidence.current.lane, admission_request.lane);
+                assert_eq!(evidence.current.sequence, receipt.sequence);
+                assert_eq!(evidence.current.state, OperationState::Pending);
+                assert!(evidence.current.event_id.is_none());
+                assert!(evidence.current.event_revision.is_none());
+            }
+            other => panic!("expected pending public attempt, got {other:?}"),
+        }
+
+        let mut unknown_request = lookup_request.clone();
+        unknown_request.public_id = Uuid::new_v4();
+        assert_eq!(
+            PgRefStore.lookup_public_attempt(&tx, &unknown_request, deadline()).await?,
+            PublicAttemptLookup::Unknown
+        );
+
+        let mut wrong_wire = lookup_request.clone();
+        wrong_wire.wire_digest = RequestDigest::from_bytes([2; 32]);
+        match PgRefStore.lookup_public_attempt(&tx, &wrong_wire, deadline()).await {
+            Err(PackCommitError::RefStore(RefStoreError::DigestConflict)) => {}
+            other => {
+                return Err(anyhow::anyhow!(
+                    "wrong-wire public attempt lookup did not return DigestConflict: {other:?}"
+                ));
+            }
+        }
+
+        tx.rollback().await?;
+        let after = attempt_ledger_facts(&client, &fixture).await?;
+        assert_eq!(before, after, "read-only public attempt lookup changed the attempt ledger");
+        Ok(())
+    })
+    .await
 }
