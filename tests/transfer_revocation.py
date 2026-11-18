@@ -2,20 +2,18 @@
 """Native slow Git upload-pack transfer revocation on primary and CI mirror."""
 import argparse
 import hashlib
-import http.client
 import json
 import os
 from pathlib import Path
 import sys
 import time
-import urllib.parse
 import uuid
 
 from ci_mirror import MirrorHarness
-
-
-def packet(payload):
-    return f"{len(payload) + 4:04x}".encode() + payload
+import transfer_revocation_git_source as revocation_git_source
+import transfer_revocation_observer as revocation_observer
+import transfer_revocation_timing as revocation_timing
+import transfer_revocation_transport as revocation_transport
 
 
 class RevocationHarness(MirrorHarness):
@@ -25,47 +23,80 @@ class RevocationHarness(MirrorHarness):
             f"hashtextextended('rootyard-data-v1:{repo}', 0)); ROLLBACK")
         return "t" in output.splitlines()
 
-    def stream_until_revoked(self, base, path, token, target, revoke):
-        url = urllib.parse.urlsplit(base)
-        connection = http.client.HTTPConnection(url.hostname, url.port, timeout=5)
+    def _wait_no_owned_children(self, service_pids, timeout=2.5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            table = revocation_observer.read_proc_table(uid=os.geteuid())
+            descendants = revocation_observer.descendant_pids(table, service_pids)
+            if not any(table[pid].live for pid in descendants):
+                return
+            time.sleep(0.05)
+        raise AssertionError("owned service descendant remained live after transfer cleanup")
+
+    def _db_clock_sample(self):
+        started = time.monotonic_ns()
+        raw = self.sql("SELECT extract(epoch FROM clock_timestamp())")
+        ended = time.monotonic_ns()
+        return revocation_timing.DbClockSample(started, ended, float(raw))
+
+    def _set_token_natural_expiry(self, token_id, seconds=8):
+        token = uuid.UUID(token_id)
+        self.sql(
+            "UPDATE tokens SET expires_at=to_timestamp(floor(extract(epoch FROM clock_timestamp()))"
+            f" + {int(seconds)}) WHERE id='{token}'"
+        )
+        return float(self.sql(f"SELECT extract(epoch FROM expires_at) FROM tokens WHERE id='{token}'"))
+
+    def _git_transfer(self, base, path, token, target, payload_bytes, *, trigger=None,
+                      natural_expiry=None, service_pid=None):
+        def packet(payload):
+            return f"{len(payload) + 4:04x}".encode() + payload
+
         body = packet(f"want {target} side-band-64k\n".encode()) + b"0000" + packet(b"done\n")
-        headers = {"Authorization": "Bearer " + token,
-                   "Content-Type": "application/x-git-upload-pack-request"}
-        try:
-            connection.request("POST", path + "/git-upload-pack", body=body, headers=headers)
-            response = connection.getresponse()
-            assert response.status == 200, (response.status, response.read(200))
-            first = response.read(4096)
-            assert first, "upload-pack returned no data before revocation"
-            assert not self.barrier_available(), "physical GC lock bypassed active Git stream"
-            received = len(first)
-            started = time.monotonic()
-            revoke()
-            interrupted = False
-            while time.monotonic() - started < 5:
-                try:
-                    chunk = response.read(64 * 1024)
-                except (http.client.IncompleteRead, OSError):
-                    interrupted = True
-                    break
-                if not chunk:
-                    break
-                received += len(chunk)
-                time.sleep(0.02)
-            elapsed = time.monotonic() - started
-            assert interrupted, f"Git transfer completed or stalled after revocation ({received} bytes)"
-            assert received < 32 * 1024 * 1024, "entire pack escaped after revocation"
-            assert elapsed < 5, f"transfer cancellation took {elapsed:.2f}s"
-            for _ in range(30):
-                if self.barrier_available():
-                    break
-                time.sleep(0.1)
-            else:
-                raise AssertionError("physical GC lock remained held after transfer abort")
-            return {"received_before_abort": received, "abort_seconds": round(elapsed, 3),
-                    "gc_blocked_while_active": True, "gc_unblocked_after_abort": True}
-        finally:
-            connection.close()
+        result = revocation_transport.run_timed_transfer(
+            base=base,
+            path=path + "/git-upload-pack",
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + token,
+                "Content-Type": "application/x-git-upload-pack-request",
+            },
+            body=body,
+            expected_size=payload_bytes + 8 * 1024 * 1024,
+            initial_bytes=4096,
+            framing="chunked",
+            service_pid=service_pid or self.proc.pid,
+            bound_ms=1200,
+            trigger=trigger,
+            trigger_kind="committed_mutation",
+            natural_expiry=natural_expiry,
+            post_pause_ms=800,
+            rcvbuf=16 * 1024,
+            require_backpressure=True,
+            require_group=True,
+            active_barrier_check=lambda: not self.barrier_available(),
+            source_witness_factory=lambda observer: revocation_git_source.GitSourceWitness(
+                service_pid or self.proc.pid, observer.identities,
+                arch=os.uname().machine,
+            ),
+            transfer_kind="git",
+        )
+        result["configured_bound_proven"] = bool(result["configured_bound_proven"])
+        result["received_before_abort"] = result["client_stop"]["received_bytes"]
+        result["abort_seconds"] = round(result["client_stop_after_lower_ms"] / 1000, 3)
+        return result
+
+    def stream_until_revoked(self, base, path, token, target, revoke, *, service_pid=None):
+        return self._git_transfer(
+            base, path, token, target, 32 * 1024 * 1024,
+            trigger=revoke, service_pid=service_pid or self.proc.pid,
+        )
+
+    def stream_until_expiry(self, base, path, token, target, expiry_clock, *, service_pid=None):
+        return self._git_transfer(
+            base, path, token, target, 32 * 1024 * 1024,
+            natural_expiry=expiry_clock, service_pid=service_pid or self.proc.pid,
+        )
 
     def active_transfer_revocation(self):
         audience = str(uuid.uuid4())
@@ -86,15 +117,25 @@ class RevocationHarness(MirrorHarness):
         self.sync()
 
         def revoke_human():
-            self.sql(f"UPDATE tokens SET revoked=true WHERE id='{uuid.UUID(writer['token_id'])}'")
+            self.cli("revoke-token", writer["token_id"])
 
-        def expire_human():
-            self.sql(f"UPDATE tokens SET expires_at=now()-interval '1 second' WHERE id='{uuid.UUID(expiring['token_id'])}'")
+        exp_epoch = self._set_token_natural_expiry(expiring["token_id"], seconds=10)
+        expiry_before = self._db_clock_sample()
+        expiry_before_clock = revocation_timing.reconcile_expiry([expiry_before], exp_epoch)
 
         human = self.stream_until_revoked(self.base, "/git/alice/demo.git",
-                                          writer["token"], target, revoke_human)
-        expired = self.stream_until_revoked(self.base, "/git/alice/demo.git",
-                                            expiring["token"], target, expire_human)
+                                          writer["token"], target, revoke_human,
+                                          service_pid=self.proc.pid)
+        expired = self.stream_until_expiry(self.base, "/git/alice/demo.git",
+                                           expiring["token"], target, expiry_before_clock,
+                                           service_pid=self.proc.pid)
+        expiry_after = self._db_clock_sample()
+        expired = revocation_timing.apply_natural_expiry_clock(
+            expired,
+            revocation_timing.reconcile_expiry([expiry_before, expiry_after], exp_epoch),
+            1200,
+        )
+        self._wait_no_owned_children([self.proc.pid])
         self.expect("/api/repos/alice/demo/collaborators/bob", (200, 201), method="PUT",
                     token=self.alice, body={"role": "read", "username": "bob"})
         try:
@@ -103,6 +144,7 @@ class RevocationHarness(MirrorHarness):
                 lambda: self.expect("/api/repos/alice/demo/collaborators/bob", 200, method="DELETE", token=self.alice))
         finally:
             self.http("/api/repos/alice/demo/collaborators/bob", method="DELETE", token=self.alice)
+        self._wait_no_owned_children([self.proc.pid])
 
         repo_id = self.repo["id"]
         try:
@@ -111,6 +153,7 @@ class RevocationHarness(MirrorHarness):
                 lambda: self.sql(f"UPDATE repositories SET storage_generation=2 WHERE id='{repo_id}'"))
         finally:
             self.sql(f"UPDATE repositories SET storage_generation=1 WHERE id='{repo_id}'")
+        self._wait_no_owned_children([self.proc.pid])
 
         job = str(uuid.uuid4())
         self.create_pin(oid=target, job=job)
@@ -126,14 +169,25 @@ class RevocationHarness(MirrorHarness):
                         token=self.alice, method="POST", body=b"")
 
         mirror = self.stream_until_revoked(self.mirror_base, self.path(target),
-                                           credential, target, cancel_job)
-        return {
+                                           credential, target, cancel_job,
+                                           service_pid=self.mirror_proc.pid)
+        self._wait_no_owned_children([self.proc.pid, self.mirror_proc.pid])
+        results = {
             "human_token": human,
             "expired_token": expired,
             "removed_collaborator": member_removed,
             "generation_changed": gen_changed,
             "cancelled_ci_job": mirror,
         }
+        proofs = {name: bool(result["configured_bound_proven"]) for name, result in results.items()}
+        unproven = sorted(name for name, proven in proofs.items() if not proven)
+        assert not unproven, {"configured_bound_ms": 1200, "unproven_subcases": unproven}
+        results["bound_proof_summary"] = {
+            "configured_bound_ms": 1200,
+            "subcases": proofs,
+            "all_proven": True,
+        }
+        return results
 
 
 def main():
