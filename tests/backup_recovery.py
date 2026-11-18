@@ -6,6 +6,7 @@ ROOTYARD_RESTORE_TEST_DATABASE_URL provides a second PostgreSQL server. Never us
 production. Synthetic prepared journals do not claim successful pushes.
 """
 import argparse
+import base64
 from contextlib import ExitStack
 import hashlib
 import json
@@ -19,7 +20,7 @@ from urllib.parse import urlsplit
 import uuid
 from backup import BackupHarness
 from backup_recovery_cache import (
-    CASE, ENVIRONMENT, HIT, MISS, TTL_SECONDS, OwnedRestoreRedis, build_binding,
+    CASE, ENVIRONMENT, FLUSH_CASE, HIT, MISS, TTL_SECONDS, OwnedRestoreRedis, build_binding,
     preview_key_scope, preview_request, prove_restored_preview,
 )
 from cross_process import CrossProcessHarness
@@ -377,6 +378,98 @@ class BrowseRestoreCacheHarness(BackupRecoveryHarness):
             self.redis, self.preview, self.old_key, self.old_entry, self.old_response,
         )
 
+    def flush_authority(self):
+        api = '/api/repos/alice/resolved'
+        remote = self.resolved['remote']
+        repo_id = str(uuid.UUID(self.resolved['repo']['id']))
+        ref = 'refs/heads/main'
+
+        def git_receipts():
+            return self.rows("SELECT * FROM git_operations WHERE repository_id='" + repo_id + "' ORDER BY sequence")
+
+        def refs_at(oid):
+            response = json.loads(self.expect(api + '/refs', 200, token=self.reader))
+            assert response['repository_id'] == repo_id and response['storage_generation'] == 2
+            assert response['head']['target'] == ref and response['head']['oid'] == oid
+            assert [item['oid'] for item in response['items'] if item['name'] == ref] == [oid]
+            return response
+
+        keys_before = self.redis.keys()
+        refs_before_push = preview_request(self.redis, lambda: refs_at(self.second), MISS)
+        hint_key, = self.redis.keys() - keys_before
+        assert hint_key.split(b':')[9] == b'ref-snapshot-hint'
+        assert preview_request(self.redis, lambda: refs_at(self.second), HIT) == refs_before_push
+        _, stale_hint = self.redis.entry(hint_key)
+        receipts_before = git_receipts()
+        assert self.git('rev-parse', 'HEAD', cwd=self.work).stdout.decode().strip() == self.second
+        payload = b'cache flush authority\n'
+        (self.work / 'hello.txt').write_bytes(payload)
+        self.git('commit', '-am', 'advance restored authority', cwd=self.work)
+        commit = self.git('rev-parse', 'HEAD', cwd=self.work).stdout.decode().strip()
+        blob = self.git('rev-parse', 'HEAD:hello.txt', cwd=self.work).stdout.decode().strip()
+        assert commit != self.second
+        self.git('push', remote, 'HEAD:' + ref, cwd=self.work, token=self.alice)
+        receipts_after_push = git_receipts()
+        assert receipts_after_push[:-1] == receipts_before
+        assert receipts_after_push[-1]['outcome'] == 'recorded' and receipts_after_push[-1]['storage_generation'] == 2
+
+        def assert_smart_ref():
+            advertised = self.git('ls-remote', '--refs', remote, ref, token=self.reader).stdout
+            assert advertised == f'{commit}\t{ref}\n'.encode()
+
+        assert self.redis.entry(hint_key)[1] == stale_hint, 'Push did not leave the original hint intact'
+        assert_smart_ref()
+        refs_after_push = preview_request(self.redis, lambda: refs_at(commit), (1, 1, 1))
+        assert self.redis.entry(hint_key)[1] != stale_hint, 'Origin did not refresh the stale hint'
+
+        path = api + '/blob/' + blob
+        probe = self.account('create-token', 'alice', '--read-only')
+
+        def read_blob(token):
+            response = json.loads(self.expect(path, 200, token=token))
+            assert response['oid'] == blob and response['size'] == len(payload)
+            assert base64.b64decode(response['content_base64'], validate=True) == payload
+            return response
+
+        def assert_revoked(expected_flushes):
+            status = preview_request(self.redis, lambda: self.http(path, token=probe)[0],
+                                     (0, 0, 0), expected_flushes=expected_flushes)
+            assert status == 401, 'Revoked grant could read the object'
+
+        keys_before = self.redis.keys()
+        warm_blob = preview_request(self.redis, lambda: read_blob(probe), MISS)
+        blob_key, = self.redis.keys() - keys_before
+        assert preview_key_scope(blob_key)[6:8] == [self.old_scope['owner_id'], repo_id]
+        assert preview_request(self.redis, lambda: read_blob(probe), HIT) == warm_blob
+        _, warm_digest = self.redis.entry(blob_key)
+        self.cli('revoke-token', probe['token_id'])
+        assert_revoked(0)
+        assert self.redis.entry(blob_key)[1] == warm_digest
+
+        self.redis.flushall_owned()
+        assert_revoked(1)
+        assert not self.redis.keys()
+        assert preview_request(self.redis, lambda: read_blob(self.reader), MISS, expected_flushes=1) == warm_blob
+        assert self.redis.keys() == {blob_key} and self.redis.entry(blob_key)[1] == warm_digest
+        assert preview_request(self.redis, lambda: read_blob(self.reader), HIT, expected_flushes=1) == warm_blob
+        assert preview_request(self.redis, lambda: refs_at(commit), MISS, expected_flushes=1) == refs_after_push
+        assert_smart_ref()
+        clone = self.root / 'flush-authority-clone'
+        self.git('clone', '--branch', 'main', remote, str(clone), token=self.reader)
+        assert self.git('rev-parse', 'HEAD', cwd=clone).stdout.decode().strip() == commit
+        assert self.git('rev-parse', 'HEAD:hello.txt', cwd=clone).stdout.decode().strip() == blob
+        assert (clone / 'hello.txt').read_bytes() == payload
+        self.git('fsck', '--full', '--strict', cwd=clone)
+        assert git_receipts() == receipts_after_push
+        assert self.redis.identity() == self.redis.run_id
+        self.redis.counts(expected_flushes=1)
+        return dict(
+            restore_witness_completed=True, authoritative_refs_over_stale_hint=True,
+            revoked_grant_denied_without_cache=True, owned_flushall_verified=True,
+            exact_object_miss_refill_hit=True, smart_git_refs_clone_and_fsck=True,
+            git_operation_receipts_unchanged=True,
+        )
+
     def cleanup(self):
         with ExitStack() as cleanup:
             cleanup.callback(shutil.rmtree, self.root)
@@ -386,7 +479,8 @@ class BrowseRestoreCacheHarness(BackupRecoveryHarness):
             self.stop()
 
 
-def browse_restore_cache_report(args):
+def browse_restore_cache_report(args, *, flush=False):
+    case_name = FLUSH_CASE if flush else CASE
     binding = {}
     h = None
     stage = 'preflight'
@@ -409,6 +503,9 @@ def browse_restore_cache_report(args):
         h.restore_exact()
         stage = 'restored_preview'
         detail = h.restored_preview()
+        if flush:
+            stage = 'flush_authority'
+            detail = h.flush_authority()
         stage = 'receipt_changed'
         assert build_binding(args.binary, args.expect_commit) == binding
         stage = None
@@ -420,9 +517,9 @@ def browse_restore_cache_report(args):
                 h.cleanup()
             except (Exception, KeyboardInterrupt):
                 stage = 'cleanup'
-    case = dict(name=CASE, status='passed', detail=dict(detail, owned_cleanup_completed=True))
+    case = dict(name=case_name, status='passed', detail=dict(detail, owned_cleanup_completed=True))
     if stage is not None:
-        case = dict(name=CASE, status='failed', error=stage)
+        case = dict(name=case_name, status='failed', error=stage)
     return dict(passed=stage is None, cases=[case], **binding)
 
 
@@ -431,18 +528,21 @@ def main():
     parser.add_argument('--binary', default='target/debug/rootyard')
     parser.add_argument('--report', type=Path)
     parser.add_argument('--keep', action='store_true')
-    parser.add_argument('--browse-restore-cache', action='store_true',
-                        help='run only the browse cache restore proof with owned loopback Redis')
+    cache_cases = parser.add_mutually_exclusive_group()
+    cache_cases.add_argument('--browse-restore-cache', action='store_true',
+                             help='run only the browse cache restore proof with owned loopback Redis')
+    cache_cases.add_argument('--browse-flush-authority', action='store_true',
+                             help='prove Git authority across an owned Redis flush after the restore witness')
     parser.add_argument('--expect-commit', help='exact checkout commit for the opt-in native receipt')
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
-    if args.browse_restore_cache:
+    if args.browse_restore_cache or args.browse_flush_authority:
         def interrupted(_signum, _frame):
             raise KeyboardInterrupt
 
         previous = signal.signal(signal.SIGTERM, interrupted)
         try:
-            report = browse_restore_cache_report(args)
+            report = browse_restore_cache_report(args, flush=args.browse_flush_authority)
         finally:
             signal.signal(signal.SIGTERM, previous)
         if args.report:
@@ -452,11 +552,12 @@ def main():
                     json.dump(report, output, indent=2)
                     output.write('\n')
             except OSError:
-                report = dict(passed=False, cases=[dict(name=CASE, status='failed', error='report_write')])
+                case_name = FLUSH_CASE if args.browse_flush_authority else CASE
+                report = dict(passed=False, cases=[dict(name=case_name, status='failed', error='report_write')])
         print(json.dumps(report, indent=2))
         return 0 if report['passed'] else 1
     if args.expect_commit is not None:
-        parser.error('--expect-commit requires --browse-restore-cache')
+        parser.error('--expect-commit requires a browse cache case')
     if not os.environ.get('ROOTYARD_TEST_DATABASE_URL'):
         parser.error('dedicated synthetic ROOTYARD_TEST_DATABASE_URL required')
     h = BackupRecoveryHarness(args)
