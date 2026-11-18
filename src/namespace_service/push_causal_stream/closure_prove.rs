@@ -87,7 +87,7 @@ pub fn verify_base_packs_and_dependencies<'a>(
                     "closure base pack belongs to another tenant or authority".into(),
                 ));
             }
-            allowed_pack_entries.insert(pack.entry());
+            allowed_pack_entries.insert(*pack.entry());
         }
         closure.closure_digest().as_hex()
     } else {
