@@ -462,7 +462,7 @@ async fn real_s3_and_git_two_phase_compaction_retention_and_safe_gc_both_formats
 
         authority.set_gc_mode(GcMode::ArmedDestructive(arm))?;
         let report = execute_safe_gc_sweep(&authority, &S3FencedDeleteSink, build_sweep_req(&auth, proof, dl)).await?;
-        assert_eq!(report.deleted_keys, vec![srv2.pack_key.object_path]);
+        assert_eq!(report.deleted_keys, vec![srv2.pack_key.object_path.clone()]);
         assert!(!s3.has_key(&p2_loc));
         assert!(s3.has_key(&new_pk_loc));
 
