@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import inspect
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -1036,6 +1037,144 @@ class WorkflowStaticTest(unittest.TestCase):
     def setUpClass(cls):
         cls.path = ROOT / driver.WORKFLOW_PATH
         cls.text = cls.path.read_text()
+
+
+    def prepare_block(self):
+        return self.text.split(
+            "      - name: Prepare job-owned scratch directories\n", 1)[1].split(
+            "\n      - name: Check out", 1)[0]
+
+    def prepare_script(self):
+        lines = self.prepare_block().splitlines()
+        start = lines.index("        run: |") + 1
+        body = []
+        for line in lines[start:]:
+            if not line.startswith("          "):
+                break
+            body.append(line[10:])
+        return "\n".join(body) + "\n"
+
+    def run_prepare(self, root, env):
+        script = root / "prepare.sh"
+        script.write_text(self.prepare_script())
+        subprocess.run(["bash", "-n", str(script)], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return subprocess.run(["bash", str(script)], env=env, cwd=root,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def prepare_env(self, runner, work, evidence, github_env):
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            "RUNNER_TEMP": str(runner),
+            "WORK": str(work),
+            "EVIDENCE": str(evidence),
+            "GITHUB_ENV": str(github_env),
+            "GITHUB_RUN_ID": "42",
+            "GITHUB_RUN_ATTEMPT": "7",
+        }
+
+    def test_runner_context_is_limited_to_prepare_steps_env(self):
+        top = self.text.split("\njobs:\n", 1)[0]
+        job_prefix = self.text.split("  library-layer:\n", 1)[1].split("    steps:\n", 1)[0]
+        for section in (top, job_prefix):
+            self.assertNotIn("${{ runner.", section)
+            self.assertNotIn("\n  WORK:", section)
+            self.assertNotIn("\n  EVIDENCE:", section)
+        prepare = self.prepare_block()
+        self.assertEqual(self.text.count("${{ runner."), 2)
+        self.assertIn("        env:\n", prepare)
+        self.assertIn("WORK: ${{ runner.temp }}/issue42-native-slot0-${{ github.run_id }}-${{ github.run_attempt }}", prepare)
+        self.assertIn("EVIDENCE: ${{ runner.temp }}/issue42-native-slot0-evidence-${{ github.run_id }}-${{ github.run_attempt }}", prepare)
+        self.assertLess(prepare.index("mkdir -m 700 \"$WORK\""),
+                        prepare.index("printf 'WORK=%s\\n'"))
+        self.assertLess(prepare.index("mkdir -m 700 \"$EVIDENCE\""),
+                        prepare.index("printf 'EVIDENCE=%s\\n'"))
+        self.assertLess(prepare.index("printf 'EVIDENCE=%s\\n'"),
+                        prepare.index("printf 'SLOT0_PATHS_READY=1\\n'"))
+        guard = "if: ${{ always() && env.SLOT0_PATHS_READY == '1' && env.WORK != '' && env.EVIDENCE != '' }}"
+        self.assertEqual(self.text.count(guard), 2)
+        upload = self.text.split("      - name: Upload only the fixed allowlist qualification JSON\n", 1)[1]
+        self.assertIn("          path: ${{ env.EVIDENCE }}/qualification.json", upload)
+        self.assertNotIn("runner.temp", upload)
+
+    def test_prepare_step_exports_only_after_owned_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "runner"
+            runner.mkdir()
+            work = runner / "issue42-native-slot0-42-7"
+            evidence = runner / "issue42-native-slot0-evidence-42-7"
+            github_env = root / "github_env"
+            github_env.write_text("")
+            result = self.run_prepare(root, self.prepare_env(runner, work, evidence, github_env))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("stage=workspace status=ok", result.stdout)
+            self.assertTrue(work.is_dir())
+            self.assertTrue(evidence.is_dir())
+            self.assertEqual(work.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(evidence.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(github_env.read_text(),
+                             f"WORK={work}\nEVIDENCE={evidence}\nSLOT0_PATHS_READY=1\n")
+
+    def test_prepare_step_failure_does_not_export_or_reuse_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "runner"
+            runner.mkdir()
+            work = runner / "issue42-native-slot0-42-7"
+            evidence = runner / "issue42-native-slot0-evidence-42-7"
+            evidence.mkdir(mode=0o700)
+            github_env = root / "github_env"
+            github_env.write_text("KEEP=1\n")
+            result = self.run_prepare(root, self.prepare_env(runner, work, evidence, github_env))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(work.exists())
+            self.assertEqual(github_env.read_text(), "KEEP=1\n")
+
+    def test_prepare_step_rejects_empty_or_unbound_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = root / "runner"
+            runner.mkdir()
+            github_env = root / "github_env"
+            github_env.write_text("KEEP=1\n")
+            candidates = (
+                ("", ""),
+                (runner / "issue42-native-slot0-99-7",
+                 runner / "issue42-native-slot0-evidence-42-7"),
+            )
+            for work, evidence in candidates:
+                result = self.run_prepare(
+                    root, self.prepare_env(runner, work, evidence, github_env))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(github_env.read_text(), "KEEP=1\n")
+                if str(work):
+                    self.assertFalse(work.exists())
+                if str(evidence):
+                    self.assertFalse(evidence.exists())
+
+    def test_all_run_blocks_parse_with_bash(self):
+        lines = self.text.splitlines()
+        blocks = []
+        index = 0
+        while index < len(lines):
+            if lines[index].strip() != "run: |":
+                index += 1
+                continue
+            indent = len(lines[index]) - len(lines[index].lstrip())
+            body = []
+            index += 1
+            while index < len(lines):
+                line = lines[index]
+                if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                    break
+                body.append(line[indent + 2:] if line.strip() else "")
+                index += 1
+            blocks.append("\n".join(body) + "\n")
+        self.assertGreaterEqual(len(blocks), 7)
+        for block in blocks:
+            subprocess.run(["bash", "-n"], input=block, text=True, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def test_trigger_is_only_the_owned_scratch_branch_and_this_workflow(self):
         self.assertIn("  push:\n    branches: [codex/goal-issue42-original-ac-source-audit-20261117]", self.text)
