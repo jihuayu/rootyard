@@ -449,6 +449,7 @@ async fn real_opendal_s3_git_default_off_staging_versioned_delete_exact_epoch_an
                 .await,
                 Err(SafeGcError::StaleDeleterFenced(_))
             ));
+            reopened.set_pg_reader_barrier_epoch(Some(1))?;
         }
         let rec_rep = reconcile_pending_delete_after_restart_fenced(
             &reopened,
