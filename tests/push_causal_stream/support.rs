@@ -211,7 +211,7 @@ pub fn build_base_version(s: BaseVersionSpec<'_>) -> VersionGraphEntry {
         vec![],
     );
     let op_dig = operation_digest(&op_in).unwrap();
-    let vid = derive_candidate_version_id(&op_in, &op_dig, &ref_name, s.parent_v.map(|_| 1u64)).unwrap();
+    let vid = derive_candidate_version_id(&op_in, op_dig, &ref_name, s.parent_v.map(|_| 1u64)).unwrap();
     let cs = compute_commit_set_id(&CommitSetInput::new(
         s.realm,
         s.seq,
