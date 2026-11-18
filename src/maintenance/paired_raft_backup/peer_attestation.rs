@@ -365,8 +365,7 @@ pub(super) fn verify_local_replica_caught_up(
             &json!({ "InspectReplicaKv": { "key": "refcas/head_seq" } }),
             raft.cfg.rpc_timeout,
         ) {
-            let seq =
-                response.pointer("/KvValue/value").and_then(Value::as_str).and_then(|raw| raw.parse::<u64>().ok());
+            let seq = parse_replica_head_seq(&response);
             if seq.is_some_and(|seq| seq >= required_seq) {
                 return Ok(cert_sha);
             }
@@ -376,6 +375,16 @@ pub(super) fn verify_local_replica_caught_up(
     Err(PairedBackupError::FreezeNotHeld(
         "consensus quorum committed on remote mTLS peers, but local Raft replica WAL/apply lagged",
     ))
+}
+
+/// Parse the replica's applied `refcas/head_seq`; a pristine replica reports it as `null`,
+/// which is sequence zero. Error responses and malformed values fail closed (`None`).
+fn parse_replica_head_seq(response: &Value) -> Option<u64> {
+    match response.pointer("/KvValue/value") {
+        Some(Value::Null) => Some(0u64),
+        Some(Value::String(raw)) => raw.parse::<u64>().ok(),
+        _ => None,
+    }
 }
 
 /// Probe one voter's `PeerAttestationDaemon` and prove its `Identity` is bound to the
@@ -437,4 +446,39 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, PairedBackupE
     rustls_pemfile::private_key(&mut BufReader::new(File::open(path)?))
         .map_err(|_| PairedBackupError::FreezeNotHeld("invalid peer attestor private key PEM"))?
         .ok_or(PairedBackupError::FreezeNotHeld("missing peer attestor private key"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_replica_head_seq;
+    use serde_json::json;
+
+    #[test]
+    fn pristine_replica_null_head_seq_is_zero() {
+        let response = json!({ "KvValue": { "key": "refcas/head_seq", "value": null } });
+        let required_seq = 0u64;
+        assert_eq!(parse_replica_head_seq(&response), Some(0));
+        assert!(parse_replica_head_seq(&response).is_some_and(|seq| seq >= required_seq));
+        assert!(!parse_replica_head_seq(&response).is_some_and(|seq| seq >= 1));
+    }
+
+    #[test]
+    fn numeric_head_seq_is_parsed() {
+        let response = json!({ "KvValue": { "key": "refcas/head_seq", "value": "42" } });
+        assert_eq!(parse_replica_head_seq(&response), Some(42));
+    }
+
+    #[test]
+    fn error_response_fails_closed() {
+        let response = json!({ "Error": "node unavailable" });
+        assert_eq!(parse_replica_head_seq(&response), None);
+    }
+
+    #[test]
+    fn malformed_head_seq_fails_closed() {
+        let response = json!({ "KvValue": { "key": "refcas/head_seq", "value": "not-a-number" } });
+        assert_eq!(parse_replica_head_seq(&response), None);
+        assert_eq!(parse_replica_head_seq(&json!({ "KvValue": { "value": true } })), None);
+        assert_eq!(parse_replica_head_seq(&json!({ "KvValue": { "value": [] } })), None);
+    }
 }
