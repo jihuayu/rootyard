@@ -302,6 +302,44 @@ class WorkflowWiringTests(unittest.TestCase):
             self.assertIn(required, step)
         self.assertNotIn("GITHUB_ENV", step)
 
+    def test_only_the_scoped_step_requests_owned_disposable_postgres(self):
+        marker = "ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1"
+        self.assertEqual(self.text.count(marker), 1)
+        step = self.step('"Replay exactly one #42 slot-one rotation case')
+        default_step = self.step('"Exercise the #174 HTTP foundation cases')
+        self.assertIn("export " + marker, step)
+        self.assertNotIn(marker, default_step)
+        # The opt-in is emitted only after the exact run-owned name is checked.
+        opt_in = step.index("export " + marker)
+        expected = (
+            'expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}'
+            '_a${GITHUB_RUN_ATTEMPT}"')
+        self.assertIn(expected, step)
+        self.assertLess(step.index(expected), opt_in)
+        self.assertIn('if [ "$SESSION174_DATABASE" != "$expected" ]', step)
+        self.assertLess(
+            step.index('if [ "$SESSION174_DATABASE" != "$expected" ]'), opt_in)
+
+    def test_checkpoint_and_cleanup_use_the_same_owned_database_output(self):
+        new = self.step('"Replay exactly one #42 slot-one rotation case')
+        cleanup = self.step('"Drop only the run-owned #174 foundation database"')
+        expected = (
+            'expected="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}'
+            '_a${GITHUB_RUN_ATTEMPT}"')
+        env = "SESSION174_DATABASE: ${{ steps.session174_db.outputs.database }}"
+        equality = 'if [ "$SESSION174_DATABASE" != "$expected" ]'
+        for step in (new, cleanup):
+            self.assertIn(env, step)
+            self.assertIn(expected, step)
+            self.assertIn(equality, step)
+        # No second owned name, adoption path or generic PG override.
+        self.assertIn(
+            'export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/'
+            '$SESSION174_DATABASE"', new)
+        for forbidden in ("PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD",
+                          "ROOTYARD_TEST_DATABASE_OVERRIDE"):
+            self.assertNotIn(forbidden, new)
+
     def test_report_is_collected_with_existing_174_evidence(self):
         step = self.step('"Collect #174 acceptance evidence"')
         self.assertIn("slot-one-rotation.json", step)
