@@ -161,7 +161,7 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     };
     // Durable RefStore rows the paired closure depends on; the restore compares
     // them with the restored database before rebuilding any byte.
-    let refstore = if format == FORMAT_PAIRED { Some(ledger::carry(&tx, until).await?) } else { None };
+    let refstore = if format == FORMAT_PAIRED { Some(ledger::carry(&tx, format, until).await?) } else { None };
     let paired = blob_closure.is_some();
     let manifest = Manifest {
         format,

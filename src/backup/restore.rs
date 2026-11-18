@@ -329,8 +329,12 @@ pub async fn restore(
         );
         ensure!(
             Some(
-                ledger::carry(&client, tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600)))
-                    .await?
+                ledger::carry(
+                    &client,
+                    manifest.format,
+                    tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600)),
+                )
+                .await?
             ) == manifest.refstore,
             "restored RefStore rows differ from the archive cut"
         );

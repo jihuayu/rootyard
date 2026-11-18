@@ -80,6 +80,18 @@ class ParallelBoundariesTest(unittest.TestCase):
             with self.subTest(format=format):
                 self.assertEqual(schema_baseline.backup_schema_versions(catalog_rs, format, schema_151 + [152]), schema_151)
 
+    def test_paired_refstore_carry_uses_the_archive_format(self):
+        backup = ROOT / 'src/backup'
+        self.assertIn('for table in catalog::relations(format, true)?', (backup / 'ledger.rs').read_text())
+        self.assertRegex(
+            (backup / 'snapshot.rs').read_text(),
+            r'if format == FORMAT_PAIRED\s*\{\s*Some\(ledger::carry\(&tx, format, until\)\.await\?\)',
+        )
+        self.assertRegex(
+            (backup / 'restore.rs').read_text(),
+            r'ledger::carry\(\s*&client,\s*manifest\.format,[^;]+?\)\s*\.await\?\s*\) == manifest\.refstore',
+        )
+
     def test_backup_tables_match_schema_baseline(self):
         # The backup now consumes the frozen catalog directly. Native schema
         # and backup suites check it against PostgreSQL; this is a wiring guard.
