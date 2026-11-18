@@ -299,8 +299,9 @@ impl SafeGcRepoSnapshot {
                     }
                 }
                 GlobalHoldState::Released { released_at_seq } => {
+                    let is_dist = matches!(lane, AuthorityLane::DistributedRefCas { .. });
                     if released_at_seq > self.paired_cursors.pg_applied_seq
-                        || released_at_seq > self.paired_cursors.refcas_applied_index
+                        || (is_dist && released_at_seq > self.paired_cursors.refcas_applied_index)
                     {
                         return Err(SafeGcError::ConcurrentRetentionRace("release-before-register cursor gap"));
                     }

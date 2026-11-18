@@ -241,8 +241,9 @@ fn collect_holds(
                 }
             }
             GlobalHoldState::Released { released_at_seq } => {
+                let is_dist = matches!(p.lane, AuthorityLane::DistributedRefCas { .. });
                 if released_at_seq > p.paired_cursors.pg_applied_seq
-                    || released_at_seq > p.paired_cursors.refcas_applied_index
+                    || (is_dist && released_at_seq > p.paired_cursors.refcas_applied_index)
                 {
                     return Err(SafeGcError::ConcurrentRetentionRace("hold release sequence overtakes paired cursors"));
                 }
