@@ -1043,6 +1043,8 @@ class DeletedClaimAcceptanceHarness(RepositoryLifecycleHarness):
         with self.phase("deleted_reclaim_assertions"):
             assert self.deleted is not None, "delete case must run first"
             before = self.checkout_rows()
+            original_grant_count = sum(row.partition("|")[0] == deleted["id"] for row in before)
+            assert original_grant_count == 1, "expired lease fixture must retain its original checkout grant"
             before_run = self.run_row(deleted["id"])
             assert before_run["attempt"] == 1, before_run
             assert before_run["lease_expires_unix"] <= int(time.time()), before_run
@@ -1055,6 +1057,7 @@ class DeletedClaimAcceptanceHarness(RepositoryLifecycleHarness):
             assert json.loads(raw) == {"error": "not found"}, self.redact(raw[:300])
             assert headers.get("cache-control") == "no-store", headers
             after = self.checkout_rows()
+            # The original grant must survive unchanged, with no newly minted rows.
             assert after == before, (before, after)
             after_run = self.run_row(deleted["id"])
             assert after_run["attempt"] == before_run["attempt"], (before_run, after_run)
@@ -1062,7 +1065,6 @@ class DeletedClaimAcceptanceHarness(RepositoryLifecycleHarness):
                 before_run,
                 after_run,
             )
-            assert all(deleted["id"] not in line for line in after), "deleted reclaim minted a new hold"
         return {
             "expired_reclaim_status_after_delete": 404,
             "checkout_rows_before": len(before),

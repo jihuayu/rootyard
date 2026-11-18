@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermetic regression for deleted-claim fixture initialization.
+"""Hermetic regressions for deleted-claim fixture setup and assertions.
 
 The real ``DeletedClaimAcceptanceHarness`` constructor is used. Only the base
 class external-resource initialization and the fixture's HTTP/Git operations are
@@ -133,6 +133,42 @@ class DeletedClaimFixtureInitializationTests(unittest.TestCase):
         self.assertIs(second, first)
         self.assertEqual(setup_calls, [1])
         self.assertEqual(len(repository_calls), 1)
+
+
+class DeletedClaimReclaimTests(unittest.TestCase):
+    def test_denied_reclaim_keeps_exactly_the_preexisting_grant_rows(self):
+        before = ["control-run|1|1", "control-run|2|2", "deleted-run|1|1"]
+        for label, after in (
+            ("unchanged", before.copy()),
+            ("added", [*before, "deleted-run|2|2"]),
+            ("replaced", [*before[:-1], "deleted-run|2|2"]),
+            ("removed", before[:-1]),
+        ):
+            with self.subTest(rows=label):
+                harness = object.__new__(acceptance.DeletedClaimAcceptanceHarness)
+                harness.fixture = {"deleted_run": {"id": "deleted-run"}}
+                harness.deleted = {"deleted": True}
+                harness.diagnostics = acceptance.PhaseDiagnostics()
+                harness.checkout_rows = mock.Mock(side_effect=(before, after))
+                harness.run_row = mock.Mock(return_value={
+                    "attempt": 1, "lease_generation": 1, "lease_expires_unix": 0,
+                })
+                harness._claim_raw = mock.Mock(return_value=(
+                    404, b'{"error":"not found"}', {"cache-control": "no-store"},
+                ))
+                reclaim = harness.deleted_expired_lease_reclaim_denied_without_new_grant
+
+                if label == "unchanged":
+                    self.assertEqual(reclaim(), {
+                        "expired_reclaim_status_after_delete": 404,
+                        "checkout_rows_before": 3,
+                        "checkout_rows_after": 3,
+                        "no_new_hold": True,
+                    })
+                else:
+                    with self.assertRaises(AssertionError):
+                        reclaim()
+                harness._claim_raw.assert_called_once_with("deleted-run", "deleted-expired-reclaim")
 
 
 if __name__ == "__main__":
