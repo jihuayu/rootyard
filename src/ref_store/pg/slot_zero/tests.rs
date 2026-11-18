@@ -393,10 +393,12 @@ async fn slot_zero_admission_commits_then_exact_retry_replays() -> anyhow::Resul
         let private = Uuid::new_v4();
         let request = slot_zero_request(&fixture, public, private);
         let mut client = fixture.pool.get().await?;
-        let mut tx = client.transaction().await?;
-        let receipt = PgRefStore
-            .admit_slot_zero_in_tx(&mut tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
-            .await?;
+        let tx = client.transaction().await?;
+        let (tx, receipt) = PgRefStore
+            .admit_slot_zero_in_tx(tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .await?
+            .into_parts();
+        let receipt = receipt?;
         assert!(!receipt.replayed);
         assert_eq!(receipt.sequence, 1);
         assert_eq!(receipt.private_id, private);
@@ -434,30 +436,29 @@ async fn slot_zero_admission_commits_then_exact_retry_replays() -> anyhow::Resul
         assert_eq!(row.get::<_, String>(11), "pending");
 
         let retry = slot_zero_request(&fixture, public, Uuid::new_v4());
-        let mut tx = client.transaction().await?;
-        let replay = PgRefStore
+        let tx = client.transaction().await?;
+        let (tx, replay) = PgRefStore
             .admit_slot_zero_in_tx(
-                &mut tx,
+                tx,
                 &retry,
                 |_| Err(PackCommitError::Invalid("an exact replay must not build a plan")),
                 deadline(),
             )
-            .await?;
+            .await?
+            .into_parts();
+        let replay = replay?;
         assert!(replay.replayed);
         assert_eq!(replay.private_id, private);
         assert_eq!(replay.sequence, 1);
         tx.rollback().await?;
 
         let next_request = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
-        let mut tx = client.transaction().await?;
-        let next = PgRefStore
-            .admit_slot_zero_in_tx(
-                &mut tx,
-                &next_request,
-                |preview| plan_for(&fixture, &next_request, preview),
-                deadline(),
-            )
-            .await?;
+        let tx = client.transaction().await?;
+        let (tx, next) = PgRefStore
+            .admit_slot_zero_in_tx(tx, &next_request, |preview| plan_for(&fixture, &next_request, preview), deadline())
+            .await?
+            .into_parts();
+        let next = next?;
         assert_eq!(next.sequence, 2);
         tx.rollback().await?;
         Ok(())
@@ -473,52 +474,57 @@ async fn slot_zero_rejects_equal_ids_private_conflict_and_wire_rebinding() -> an
         let private = Uuid::new_v4();
         let equal = slot_zero_request(&fixture, public, public);
         let mut client = fixture.pool.get().await?;
-        let mut tx = client.transaction().await?;
-        let error = PgRefStore
+        let tx = client.transaction().await?;
+        let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
-                &mut tx,
+                tx,
                 &equal,
                 |_| Err(PackCommitError::Invalid("equal ids must not build a plan")),
                 deadline(),
             )
-            .await
-            .unwrap_err();
+            .await?
+            .into_parts();
+        let error = error.unwrap_err();
         assert!(matches!(error, PackCommitError::RefStore(RefStoreError::InvalidIdentity(_))));
         tx.rollback().await?;
 
         let request = slot_zero_request(&fixture, public, private);
-        let mut tx = client.transaction().await?;
-        PgRefStore
-            .admit_slot_zero_in_tx(&mut tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
-            .await?;
+        let tx = client.transaction().await?;
+        let (tx, receipt) = PgRefStore
+            .admit_slot_zero_in_tx(tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .await?
+            .into_parts();
+        let _ = receipt?;
         tx.commit().await?;
 
         let conflict = slot_zero_request(&fixture, Uuid::new_v4(), private);
-        let mut tx = client.transaction().await?;
-        let error = PgRefStore
+        let tx = client.transaction().await?;
+        let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
-                &mut tx,
+                tx,
                 &conflict,
                 |_| Err(PackCommitError::Invalid("private conflict must not build a plan")),
                 deadline(),
             )
-            .await
-            .unwrap_err();
+            .await?
+            .into_parts();
+        let error = error.unwrap_err();
         assert!(matches!(error, PackCommitError::RefStore(RefStoreError::IdentityConflict)));
         tx.rollback().await?;
 
         let mut rebind = slot_zero_request(&fixture, public, Uuid::new_v4());
         rebind.wire_digest = RequestDigest::from_bytes([2; 32]);
-        let mut tx = client.transaction().await?;
-        let error = PgRefStore
+        let tx = client.transaction().await?;
+        let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
-                &mut tx,
+                tx,
                 &rebind,
                 |_| Err(PackCommitError::Invalid("wire rebinding must not build a plan")),
                 deadline(),
             )
-            .await
-            .unwrap_err();
+            .await?
+            .into_parts();
+        let error = error.unwrap_err();
         assert!(matches!(error, PackCommitError::RefStore(RefStoreError::DigestConflict)));
         tx.rollback().await?;
         Ok(())
@@ -543,21 +549,22 @@ async fn slot_zero_replay_rejects_missing_or_wrong_producer_binding() -> anyhow:
         });
         let mut client = fixture.pool.get().await?;
 
-        let mut tx = client.transaction().await?;
+        let tx = client.transaction().await?;
         seed_wrapper_without_binding(&tx, &fixture, &request, plan_digest, proof).await?;
-        let error = PgRefStore
+        let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
-                &mut tx,
+                tx,
                 &request,
                 |_| Err(PackCommitError::Invalid("a replay must not build a plan")),
                 deadline(),
             )
-            .await
-            .unwrap_err();
+            .await?
+            .into_parts();
+        let error = error.unwrap_err();
         assert_ledger_integrity(&error, "slot zero serving producer binding is missing");
         tx.rollback().await?;
 
-        let mut tx = client.transaction().await?;
+        let tx = client.transaction().await?;
         seed_wrapper_without_binding(&tx, &fixture, &request, plan_digest, proof).await?;
         tx.execute(
             "INSERT INTO ref_store_serving_operations(
@@ -566,15 +573,16 @@ async fn slot_zero_replay_rejects_missing_or_wrong_producer_binding() -> anyhow:
             &[&fixture.repo, &private, &fixture.actor, &"d".repeat(64), &plan_digest.as_hex()],
         )
         .await?;
-        let error = PgRefStore
+        let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
-                &mut tx,
+                tx,
                 &request,
                 |_| Err(PackCommitError::Invalid("a replay must not build a plan")),
                 deadline(),
             )
-            .await
-            .unwrap_err();
+            .await?
+            .into_parts();
+        let error = error.unwrap_err();
         assert_ledger_integrity(&error, "slot zero serving producer binding differs from the wrapper");
         tx.rollback().await?;
         Ok(())
@@ -591,10 +599,12 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
         let request = slot_zero_request(&fixture, public, private);
         let mut client = fixture.pool.get().await?;
 
-        let mut tx = client.transaction().await?;
-        let receipt = PgRefStore
-            .admit_slot_zero_in_tx(&mut tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
-            .await?;
+        let tx = client.transaction().await?;
+        let (tx, receipt) = PgRefStore
+            .admit_slot_zero_in_tx(tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .await?
+            .into_parts();
+        let receipt = receipt?;
         assert_eq!(receipt.sequence, 1);
         tx.rollback().await?;
 
@@ -616,10 +626,12 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
             .get(0);
         assert_eq!((wrappers, lanes, operations, bindings), (0, 0, 0, 0));
 
-        let mut tx = client.transaction().await?;
-        let receipt = PgRefStore
-            .admit_slot_zero_in_tx(&mut tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
-            .await?;
+        let tx = client.transaction().await?;
+        let (tx, receipt) = PgRefStore
+            .admit_slot_zero_in_tx(tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .await?
+            .into_parts();
+        let receipt = receipt?;
         assert_eq!(receipt.sequence, 1);
         tx.commit().await?;
 
@@ -634,16 +646,17 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
             .await?;
         let mut overflow = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
         overflow.lane = overflow_lane.clone();
-        let mut tx = client.transaction().await?;
-        let error = PgRefStore
+        let tx = client.transaction().await?;
+        let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
-                &mut tx,
+                tx,
                 &overflow,
                 |_| Err(PackCommitError::Invalid("overflow must not build a plan")),
                 deadline(),
             )
-            .await
-            .unwrap_err();
+            .await?
+            .into_parts();
+        let error = error.unwrap_err();
         assert!(matches!(error, PackCommitError::RefStore(RefStoreError::Database(_))));
         tx.rollback().await?;
         let last: i64 = client
@@ -670,19 +683,20 @@ async fn slot_zero_typed_plan_error_rolls_back_only_the_savepoint() -> anyhow::R
         let mut request = slot_zero_request(&fixture, public, private);
         request.lane = lane.clone();
         let mut client = fixture.pool.get().await?;
-        let mut tx = client.transaction().await?;
+        let tx = client.transaction().await?;
 
         // The unique lane is absent, so preview inserts last_reserved_sequence=0
         // before build_plan returns this typed error.
-        let error = PgRefStore
+        let (tx, error) = PgRefStore
             .admit_slot_zero_in_tx(
-                &mut tx,
+                tx,
                 &request,
                 |_| Err(PackCommitError::Invalid("slot zero plan rejected after preview")),
                 deadline(),
             )
-            .await
-            .unwrap_err();
+            .await?
+            .into_parts();
+        let error = error.unwrap_err();
         match error {
             PackCommitError::Invalid("slot zero plan rejected after preview") => {}
             other => panic!("expected the original typed plan error, got {other:?}"),
@@ -727,20 +741,151 @@ async fn slot_zero_typed_plan_error_rolls_back_only_the_savepoint() -> anyhow::R
 
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn slot_zero_cancelled_owned_tx_cannot_be_committed() -> anyhow::Result<()> {
+    with_fixture(|fixture| async move {
+        let lane = IssuerLane::new("slot-zero").unwrap();
+        let seed = fixture.pool.get().await?;
+        seed.execute(
+            "INSERT INTO ref_store_issuer_lanes(repository_id,issuer_id,lane,last_reserved_sequence)
+                 VALUES($1,$2,$3,0)",
+            &[&fixture.repo, &fixture.actor, &lane.as_str()],
+        )
+        .await?;
+        drop(seed);
+
+        // Real uncommitted row lock: the admission future blocks in the owned
+        // outer transaction and cannot reach RELEASE while this holder lives.
+        let mut holder_client = fixture.pool.get().await?;
+        let holder_tx = holder_client.transaction().await?;
+        let holder_pid: i32 = holder_tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+        holder_tx
+            .query_one(
+                "SELECT last_reserved_sequence FROM ref_store_issuer_lanes
+                 WHERE repository_id=$1 AND issuer_id=$2 AND lane=$3 FOR UPDATE",
+                &[&fixture.repo, &fixture.actor, &lane.as_str()],
+            )
+            .await?;
+
+        let public = Uuid::new_v4();
+        let private = Uuid::new_v4();
+        let request = slot_zero_request(&fixture, public, private);
+        let worker_fixture = fixture.clone();
+        let worker_request = request.clone();
+        let worker_pool = fixture.pool.clone();
+        let (pid_tx, pid_rx) = oneshot::channel();
+        let mut admission = tokio::spawn(async move {
+            let mut client = worker_pool.get().await?;
+            let tx = client.transaction().await?;
+            let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            let _ = pid_tx.send(pid);
+            let admission = PgRefStore
+                .admit_slot_zero_in_tx(
+                    tx,
+                    &worker_request,
+                    |preview| plan_for(&worker_fixture, &worker_request, preview),
+                    deadline(),
+                )
+                .await?;
+            // This must not be reached while the lane lock is held. Dropping the
+            // returned transaction still rolls it back; returning Err makes the
+            // contract violation visible to the test.
+            drop(admission);
+            Err(anyhow::anyhow!("slot-zero admission returned while the lane lock was still held"))
+        });
+
+        let admission_pid =
+            timeout(WAIT, pid_rx).await.context("cancelled admission never reported its backend pid")??;
+        let observer = fixture.pool.get().await?;
+        timeout(WAIT, async {
+            loop {
+                let waiting: bool = observer
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity a
+                         WHERE a.pid=$1 AND a.state='active' AND a.wait_event_type='Lock'
+                           AND a.query LIKE 'SELECT last_reserved_sequence + 1 FROM ref_store_issuer_lanes%'
+                           AND $2 = ANY(pg_blocking_pids($1)))",
+                        &[&admission_pid, &holder_pid],
+                    )
+                    .await?
+                    .get(0);
+                if waiting {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("cancelled admission never blocked on the held lane lock")??;
+
+        // Cancel the future while it owns the outer transaction. The caller
+        // never receives a SlotZeroAdmission for this path; the dropped future
+        // owns and rolls back the outer transaction.
+        admission.abort();
+        match timeout(WAIT, &mut admission).await {
+            Ok(Err(error)) if error.is_cancelled() => {}
+            Ok(Ok(())) => return Err(anyhow::anyhow!("aborted admission unexpectedly returned normally")),
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err(anyhow::anyhow!("aborted admission task did not join")),
+        }
+
+        holder_tx.rollback().await?;
+        timeout(WAIT, async {
+            loop {
+                let clear: bool = observer
+                    .query_one(
+                        "SELECT NOT EXISTS(
+                             SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
+                             WHERE l.pid=$1 AND l.granted
+                               AND c.relname IN ('cluster_authority','ref_store_issuer_lanes',
+                                                 'repositories','ref_store_core_gates'))",
+                        &[&admission_pid],
+                    )
+                    .await?
+                    .get(0);
+                if clear {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("cancelled admission backend kept an admission lock")??;
+
+        let row = observer
+            .query_one(
+                "SELECT
+                   (SELECT count(*) FROM ref_store_public_operations WHERE repository_id=$1),
+                   (SELECT count(*) FROM ref_store_private_attempts WHERE repository_id=$1),
+                   (SELECT count(*) FROM ref_store_operations WHERE repository_id=$1),
+                   (SELECT count(*) FROM ref_store_serving_operations WHERE repository_id=$1),
+                   (SELECT last_reserved_sequence FROM ref_store_issuer_lanes
+                     WHERE repository_id=$1 AND issuer_id=$2 AND lane=$3)",
+                &[&fixture.repo, &fixture.actor, &lane.as_str()],
+            )
+            .await?;
+        for index in 0..4usize {
+            assert_eq!(row.get::<_, i64>(index), 0, "cancelled ownership boundary left a row in column {index}");
+        }
+        assert_eq!(row.get::<_, i64>(4), 0, "cancelled admission advanced the issuer lane");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
 async fn slot_zero_restore_rotation_waits_for_admission_commit() -> anyhow::Result<()> {
     with_fixture(|fixture| async move {
         let request = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
         let mut admission = fixture.pool.get().await?;
-        let mut tx = Some(admission.transaction().await?);
-        let receipt = PgRefStore
-            .admit_slot_zero_in_tx(
-                tx.as_mut().expect("admission transaction must exist"),
-                &request,
-                |preview| plan_for(&fixture, &request, preview),
-                deadline(),
-            )
-            .await?;
+        let tx = admission.transaction().await?;
+        let (tx, receipt) = PgRefStore
+            .admit_slot_zero_in_tx(tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .await?
+            .into_parts();
+        let receipt = receipt?;
         assert_eq!(receipt.sequence, 1);
+        let mut tx = Some(tx);
         let admission_pid: i32 = tx
             .as_ref()
             .expect("admission transaction must exist")
@@ -878,17 +1023,19 @@ async fn slot_zero_waits_for_legacy_lane_before_scope_and_gate() -> anyhow::Resu
         let (done_tx, done_rx) = oneshot::channel();
         let mut admission = tokio::spawn(async move {
             let mut client = admission_fixture.pool.get().await?;
-            let mut tx = client.transaction().await?;
+            let tx = client.transaction().await?;
             let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
             let _ = pid_tx.send(pid);
-            let receipt = PgRefStore
+            let (tx, receipt) = PgRefStore
                 .admit_slot_zero_in_tx(
-                    &mut tx,
+                    tx,
                     &request,
                     |preview| plan_for(&admission_fixture, &request, preview),
                     deadline(),
                 )
-                .await?;
+                .await?
+                .into_parts();
+            let receipt = receipt?;
             tx.commit().await?;
             let _ = done_tx.send(receipt);
             Ok::<(), anyhow::Error>(())

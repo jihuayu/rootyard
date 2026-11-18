@@ -5,7 +5,8 @@
 //! feature flag selects this module, and nothing here uploads a pack, commits a
 //! ref or serves HTTP.
 //!
-//! One caller-owned transaction performs the fixed order:
+//! One caller-supplied transaction, taken by value for the admission future,
+//! performs the fixed order:
 //!
 //! 1. take the normalized public/proposed/existing-attempt advisory keys with
 //!    migration 152's own lock function (the same hash key the legacy adapter
@@ -26,14 +27,19 @@
 //! caller that commits unrelated work cannot publish a partial admission. The
 //! success path only releases the savepoint; the caller's outer `COMMIT` is
 //! still the durability point. A cleanup failure is returned as an explicit
-//! database error carrying the original and cleanup errors, never as success.
+//! database error carrying the original and cleanup errors, never as success,
+//! and the owned outer transaction is dropped (full rollback) rather than
+//! handed back as commit-able.
 //!
 //! Only the caller's `COMMIT` publishes those rows and the sequence; every
 //! rollback discards them. The restore-incarnation `FOR SHARE` lock is held from
 //! step 2 through that `COMMIT`/`ROLLBACK`, so a restore fence cannot rotate the
-//! singleton between the last trigger check and publication. This function never
-//! begins, commits or rolls back a transaction, never opens another connection
-//! and performs no Blob/Git IO.
+//! singleton between the last trigger check and publication. This function
+//! never begins an outer transaction and never commits one. Its explicit SQL
+//! only releases or rolls back the named savepoint; on a fatal or unconfirmed
+//! error the owned outer transaction is dropped, so the SDK queues its outer
+//! `ROLLBACK`, and no commit-able handle escapes. It never opens another
+//! connection and performs no Blob/Git IO.
 use super::{LockedSequence, PgRefStore, advance_sequence, bound, db_error, ensure_repository, insert_operation};
 use crate::ref_store::{
     CommitMode, GitObjectFormat, IssuerLane, OperationState, RefStoreError, RequestDigest,
@@ -129,61 +135,119 @@ pub(crate) struct SlotZeroReceipt {
     pub replayed: bool,
 }
 
+/// The outer transaction is returned only when it is safe to use for unrelated
+/// work. Fatal/uncertain admission errors return `Err` from
+/// `admit_slot_zero_in_tx` and own/drop the outer transaction, so the caller
+/// cannot issue `COMMIT` after a cancelled future, an unknown query/RELEASE
+/// outcome, an SQL abort, or failed savepoint cleanup.
+#[allow(dead_code)] // Crate-private foundation: the ignored tests consume it before the gateway cutover.
+pub(crate) enum SlotZeroAdmission<'a> {
+    /// The named savepoint was released successfully, or no write-capable step
+    /// ran (exact replay). The receipt is durable only after the caller's outer
+    /// `COMMIT`.
+    Released { tx: Transaction<'a>, receipt: SlotZeroReceipt },
+    /// A normal typed/domain refusal. Any savepoint was confirmed rolled back
+    /// and released, so the outer transaction may commit unrelated work without
+    /// publishing a lane/operation/attempt side effect.
+    Refused { tx: Transaction<'a>, error: PackCommitError },
+}
+
+impl<'a> SlotZeroAdmission<'a> {
+    fn released(tx: Transaction<'a>, receipt: SlotZeroReceipt) -> Self {
+        Self::Released { tx, receipt }
+    }
+
+    fn refused(tx: Transaction<'a>, error: PackCommitError) -> Self {
+        Self::Refused { tx, error }
+    }
+
+    /// Split the returned transaction from its bound admission result. This is
+    /// the only way a caller reaches a transaction that it may commit.
+    #[allow(dead_code)] // The ignored tests and the future gateway cutover consume it.
+    pub(crate) fn into_parts(self) -> (Transaction<'a>, Result<SlotZeroReceipt, PackCommitError>) {
+        match self {
+            Self::Released { tx, receipt } => (tx, Ok(receipt)),
+            Self::Refused { tx, error } => (tx, Err(error)),
+        }
+    }
+}
+
 impl PgRefStore {
-    /// Admit (or exactly replay) one slot-zero initial operation in the
-    /// caller-owned outer transaction.
+    /// Admit (or exactly replay) one slot-zero initial operation while owning
+    /// the outer transaction for the whole admission future.
     ///
     /// Preflight reads and the normalized operation/wrapper locks run directly
     /// in the outer transaction. Every step that can write, including a fresh
     /// lane preview, runs inside one real SDK savepoint
     /// (`Transaction::savepoint`). Success only `RELEASE`s that savepoint; the
-    /// caller's outer `COMMIT` remains the durability point. A typed, SQL,
-    /// plan, deadline or scope/gate failure in that fresh path rolls the same
-    /// savepoint back before this method returns, so the outer transaction is
-    /// clean enough to commit unrelated work.
+    /// caller's outer `COMMIT` remains the durability point.
+    ///
+    /// The return contract is the safety boundary. `Ok(Released)` returns a
+    /// transaction whose `RELEASE` was acknowledged. `Ok(Refused)` returns a
+    /// transaction whose savepoint was either never created or was confirmed
+    /// rolled back and released; that transaction may commit unrelated work but
+    /// carries no admission write. `Err` means the outer transaction cannot be
+    /// handed back: it is dropped here, so the SDK queues a full outer
+    /// `ROLLBACK`; callers cannot publish a released, still-savepointed,
+    /// aborted, or cleanup-uncertain admission.
+    ///
+    /// If this future itself is dropped, the owned outer `Transaction` drops
+    /// with it and queues `ROLLBACK`; no caller can reach a commit-able handle.
     ///
     /// `build_plan` is called exactly once, after the fence/lane/scope/gate
     /// locks and sequence preview, and before any write. An exact replay returns
     /// before the savepoint is created and never touches the issuer lane.
     ///
     /// Deadline handling uses the existing `bound` per-statement statement/lock
-    /// timeouts plus a pre-release expiry check. If this future itself is
-    /// dropped, the SDK nested `Transaction` drop queues `ROLLBACK TO` on the
-    /// same connection, so a later outer `COMMIT` cannot publish a partially
-    /// admitted slot-zero operation.
-    ///
-    /// Cleanup failure is never success: a failed `ROLLBACK TO`/`RELEASE`
-    /// returns a database error that carries the original admission error and
-    /// the cleanup error, and requires the outer transaction to be rolled back.
+    /// timeouts plus a pre-release expiry check. A timeout in the write-capable
+    /// savepoint is rolled back and released before a `Refused(Timeout)` is
+    /// returned; if that cleanup is not confirmed, no transaction is returned.
     #[allow(dead_code)] // No production caller until the wrapper entry is deliberately opened.
-    pub(crate) async fn admit_slot_zero_in_tx<F>(
+    pub(crate) async fn admit_slot_zero_in_tx<'a, F>(
         &self,
-        tx: &mut Transaction<'_>,
+        mut tx: Transaction<'a>,
         request: &SlotZeroAdmissionRequest,
         build_plan: F,
         deadline: Instant,
-    ) -> Result<SlotZeroReceipt, PackCommitError>
+    ) -> Result<SlotZeroAdmission<'a>, PackCommitError>
     where
         F: FnOnce(SlotZeroPreview) -> Result<PackCommitPlan, PackCommitError>,
     {
-        validate_request(request).map_err(PackCommitError::from)?;
-        bound(&*tx, deadline).await.map_err(PackCommitError::from)?;
+        if let Err(error) = validate_request(request) {
+            return Ok(SlotZeroAdmission::refused(tx, PackCommitError::from(error)));
+        }
+        if Instant::now() >= deadline {
+            return Ok(SlotZeroAdmission::refused(tx, PackCommitError::from(RefStoreError::Timeout)));
+        }
+        if let Err(error) = bound(&tx, deadline).await {
+            // `bound` executed SET LOCAL. Any error after the explicit deadline
+            // check has an unknown/aborted connection outcome, so keep no tx.
+            return Err(PackCommitError::from(error));
+        }
 
-        let preflight = match timeout_at(deadline, admit_slot_zero_preflight(&*tx, request)).await {
-            Ok(result) => result?,
+        let preflight = match timeout_at(deadline, admit_slot_zero_preflight(&tx, request)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) if slot_zero_error_keeps_outer(&error) => {
+                return Ok(SlotZeroAdmission::refused(tx, error));
+            }
+            Ok(Err(error)) => return Err(error),
             Err(_) => return Err(PackCommitError::from(RefStoreError::Timeout)),
         };
         if let Some(receipt) = preflight {
-            return Ok(receipt);
+            // Exact replay is read-only; no savepoint or lane/operation write ran.
+            return Ok(SlotZeroAdmission::released(tx, receipt));
         }
         if Instant::now() >= deadline {
-            return Err(PackCommitError::from(RefStoreError::Timeout));
+            return Ok(SlotZeroAdmission::refused(tx, PackCommitError::from(RefStoreError::Timeout)));
         }
 
         // From here on even the lane preview may insert `last_reserved_sequence=0`.
         // Everything goes through one nested transaction; its `commit` is only
         // `RELEASE SAVEPOINT`, never the outer transaction's `COMMIT`.
-        let nested = tx.savepoint(SLOT_ZERO_SAVEPOINT).await.map_err(slot_zero_savepoint_begin_failed)?;
+        let nested = match tx.savepoint(SLOT_ZERO_SAVEPOINT).await {
+            Ok(nested) => nested,
+            Err(error) => return Err(slot_zero_savepoint_begin_failed(error)),
+        };
 
         let outcome = match timeout_at(deadline, admit_slot_zero_fresh(&nested, request, build_plan, deadline)).await {
             Ok(result) => result,
@@ -193,27 +257,58 @@ impl PgRefStore {
             Ok(receipt) => {
                 if Instant::now() >= deadline {
                     let rollback = nested.rollback().await;
-                    return Err(slot_zero_savepoint_failure(
-                        tx,
-                        rollback,
-                        PackCommitError::from(RefStoreError::Timeout),
-                    )
-                    .await);
+                    return slot_zero_savepoint_recovered(tx, rollback, PackCommitError::from(RefStoreError::Timeout))
+                        .await;
                 }
+                // tokio-postgres 0.7.18 `Transaction::commit(mut self)` sets
+                // `done = true` before awaiting `RELEASE`. Owning the outer
+                // transaction is the safety boundary: a cancelled or
+                // unacknowledged RELEASE can never hand the caller a commit-able
+                // outer handle; on every uncertain branch it is dropped here and
+                // the SDK queues a full outer ROLLBACK.
                 match nested.commit().await {
-                    Ok(()) => Ok(receipt),
+                    Ok(()) => Ok(SlotZeroAdmission::released(tx, receipt)),
                     Err(release_error) => {
-                        let undo = undo_slot_zero_savepoint(tx).await;
-                        Err(slot_zero_release_failed(release_error, undo))
+                        let undo = undo_slot_zero_savepoint(&mut tx).await;
+                        match slot_zero_release_failed(release_error, undo) {
+                            SlotZeroRecovery::Safe(error) => Ok(SlotZeroAdmission::refused(tx, error)),
+                            SlotZeroRecovery::Unsafe(error) => Err(error),
+                        }
                     }
                 }
             }
             Err(original) => {
                 let rollback = nested.rollback().await;
-                Err(slot_zero_savepoint_failure(tx, rollback, original).await)
+                slot_zero_savepoint_recovered(tx, rollback, original).await
             }
         }
     }
+}
+
+/// Preflight is read/lock-only. These variants mean SQL, query cancellation, or
+/// an unacknowledged outcome may have aborted or left work on the transaction;
+/// all other variants are explicit domain/ledger refusals after a completed
+/// read. Preflight performs no INSERT/UPDATE, so its only SQL mappings are
+/// `Database`/`Timeout`; the SQL unique-violation mapping to `IdentityConflict`
+/// is unreachable here. Never return a commit-able outer transaction for the
+/// unsafe set.
+fn slot_zero_error_keeps_outer(error: &PackCommitError) -> bool {
+    !matches!(
+        error,
+        PackCommitError::CommitUnknown { .. }
+            | PackCommitError::RefStore(
+                RefStoreError::Database(_) | RefStoreError::Timeout | RefStoreError::CommitUnknown { .. }
+            )
+    )
+}
+
+enum SlotZeroRecovery {
+    /// The admission savepoint is confirmed rolled back and released, or its
+    /// release was already confirmed; the outer transaction is safe.
+    Safe(PackCommitError),
+    /// The release/rollback outcome is unknown; the outer transaction must not
+    /// be returned and drops as a full rollback.
+    Unsafe(PackCommitError),
 }
 
 /// Read-only and lock-only prefix: schema/repository checks, the normalized
@@ -383,24 +478,25 @@ fn slot_zero_savepoint_begin_failed(error: tokio_postgres::Error) -> PackCommitE
 ///
 /// `rollback` is the result of the SDK's `ROLLBACK TO SAVEPOINT`. On success
 /// the savepoint is explicitly released so repeated failures do not accumulate
-/// names; only then is the original typed/admission error returned. A cleanup
-/// failure is returned as a database error naming both the original error and
-/// the cleanup error, never as success.
-async fn slot_zero_savepoint_failure(
-    tx: &mut Transaction<'_>,
+/// names; only then is the original typed/admission error returned together
+/// with the still-safe outer transaction. If the release is not acknowledged,
+/// the transaction is dropped instead of returned, so the caller cannot commit
+/// an unconfirmed savepoint state.
+async fn slot_zero_savepoint_recovered<'a>(
+    tx: Transaction<'a>,
     rollback: Result<(), tokio_postgres::Error>,
     original: PackCommitError,
-) -> PackCommitError {
+) -> Result<SlotZeroAdmission<'a>, PackCommitError> {
     match rollback {
         Ok(()) => match tx.batch_execute(&format!("RELEASE SAVEPOINT {SLOT_ZERO_SAVEPOINT}")).await {
-            Ok(()) => original,
-            Err(release_error) => PackCommitError::from(RefStoreError::Database(format!(
+            Ok(()) => Ok(SlotZeroAdmission::refused(tx, original)),
+            Err(release_error) => Err(PackCommitError::from(RefStoreError::Database(format!(
                 "slot zero admission failed ({original}); savepoint rollback succeeded but releasing the savepoint failed ({release_error}); admission writes were rolled back and the savepoint release is unconfirmed"
-            ))),
+            )))),
         },
-        Err(rollback_error) => PackCommitError::from(RefStoreError::Database(format!(
+        Err(rollback_error) => Err(PackCommitError::from(RefStoreError::Database(format!(
             "slot zero admission failed ({original}); savepoint rollback also failed ({rollback_error}); the outer transaction must be rolled back"
-        ))),
+        )))),
     }
 }
 
@@ -428,20 +524,22 @@ async fn undo_slot_zero_savepoint(tx: &mut Transaction<'_>) -> SlotZeroSavepoint
     }
 }
 
-fn slot_zero_release_failed(release_error: tokio_postgres::Error, undo: SlotZeroSavepointUndo) -> PackCommitError {
+fn slot_zero_release_failed(release_error: tokio_postgres::Error, undo: SlotZeroSavepointUndo) -> SlotZeroRecovery {
     match undo {
-        SlotZeroSavepointUndo::RolledBackAndReleased => PackCommitError::from(RefStoreError::Database(format!(
-            "slot zero admission savepoint release failed ({release_error}); the admission was rolled back to its savepoint and is not committed"
-        ))),
+        SlotZeroSavepointUndo::RolledBackAndReleased => {
+            SlotZeroRecovery::Safe(PackCommitError::from(RefStoreError::Database(format!(
+                "slot zero admission savepoint release failed ({release_error}); the admission was rolled back to its savepoint and is not committed"
+            ))))
+        }
         SlotZeroSavepointUndo::ReleaseAfterRollback(release_after_rollback) => {
-            PackCommitError::from(RefStoreError::Database(format!(
+            SlotZeroRecovery::Unsafe(PackCommitError::from(RefStoreError::Database(format!(
                 "slot zero admission savepoint release failed ({release_error}); rollback to the savepoint succeeded but releasing it also failed ({release_after_rollback}); admission writes were rolled back and the savepoint release is unconfirmed"
-            )))
+            ))))
         }
         SlotZeroSavepointUndo::RollbackFailed(rollback_error) => {
-            PackCommitError::from(RefStoreError::Database(format!(
+            SlotZeroRecovery::Unsafe(PackCommitError::from(RefStoreError::Database(format!(
                 "slot zero admission savepoint release failed ({release_error}); rollback to the savepoint also failed ({rollback_error}); the admission may already be released into the outer transaction and the outer transaction must be rolled back"
-            )))
+            ))))
         }
     }
 }

@@ -66,7 +66,7 @@ class SlotZeroSourceTest(unittest.TestCase):
         self.assertIn('nested.rollback().await', self.production)
         self.assertIn('ROLLBACK TO SAVEPOINT', self.production)
         self.assertIn('RELEASE SAVEPOINT', self.production)
-        self.assertIn('bound(&*tx, deadline)', self.production)
+        self.assertIn('bound(&tx, deadline)', self.production)
         self.assertIn('timeout_at(deadline, admit_slot_zero_preflight', self.production)
         self.assertIn('timeout_at(deadline, admit_slot_zero_fresh', self.production)
 
@@ -74,8 +74,8 @@ class SlotZeroSourceTest(unittest.TestCase):
         entry = self.production.split('pub(crate) async fn admit_slot_zero_in_tx', 1)[1].split(
             'async fn admit_slot_zero_preflight', 1
         )[0]
-        self.assertIn('tx: &mut Transaction', entry)
-        self.assertLess(entry.index('admit_slot_zero_preflight(&*tx'), entry.index('tx.savepoint(SLOT_ZERO_SAVEPOINT)'))
+        self.assertIn('mut tx: Transaction<\'a>,', entry)
+        self.assertLess(entry.index('admit_slot_zero_preflight(&tx'), entry.index('tx.savepoint(SLOT_ZERO_SAVEPOINT)'))
         self.assertLess(entry.index('tx.savepoint(SLOT_ZERO_SAVEPOINT)'), entry.index('admit_slot_zero_fresh(&nested'))
         self.assertIn('nested.commit().await', entry)
         self.assertIn('nested.rollback().await', entry)
@@ -152,6 +152,71 @@ class SlotZeroSourceTest(unittest.TestCase):
         pending = self.core_pack.split('async fn begin_pending_in_tx(', 1)[1].split('/// Capture the closure context', 1)[0]
         self.assertLess(pending.index('PgRefStore.begin('), pending.index('ensure_repository(tx, plan, false)'))
         self.assertLess(pending.index('ensure_repository(tx, plan, false)'), pending.index('sql::gate_locked('))
+
+    def test_owned_transaction_returns_only_after_confirmed_release_or_rollback(self):
+        self.assertIn("pub(crate) enum SlotZeroAdmission<'a>", self.production)
+        self.assertIn("Released { tx: Transaction<'a>, receipt: SlotZeroReceipt }", self.production)
+        self.assertIn("Refused { tx: Transaction<'a>, error: PackCommitError }", self.production)
+        self.assertIn("pub(crate) fn into_parts(self) -> (Transaction<'a>, Result<SlotZeroReceipt, PackCommitError>)", self.production)
+
+        entry = self.production.split('pub(crate) async fn admit_slot_zero_in_tx', 1)[1].split(
+            'async fn admit_slot_zero_preflight', 1
+        )[0]
+        self.assertIn("mut tx: Transaction<'a>,", entry)
+        self.assertIn("Result<SlotZeroAdmission<'a>, PackCommitError>", entry)
+        self.assertIn('return Err(PackCommitError::from(error));', entry)
+        self.assertIn('Err(_) => return Err(PackCommitError::from(RefStoreError::Timeout)),', entry)
+        self.assertIn('Ok(Err(error)) => return Err(error),', entry)
+        self.assertIn('slot_zero_savepoint_recovered(tx, rollback,', entry)
+        self.assertIn('slot_zero_release_failed(release_error, undo)', entry)
+        self.assertIn('SlotZeroRecovery::Safe(error) => Ok(SlotZeroAdmission::refused(tx, error))', entry)
+        self.assertIn('SlotZeroRecovery::Unsafe(error) => Err(error)', entry)
+        self.assertIn('Ok(SlotZeroAdmission::released(tx, receipt))', entry)
+
+        recovery = self.production.split('async fn slot_zero_savepoint_recovered', 1)[1].split(
+            '/// Explicit outcome of undoing a savepoint', 1
+        )[0]
+        self.assertIn('Ok(()) => Ok(SlotZeroAdmission::refused(tx, original))', recovery)
+        self.assertIn('savepoint rollback succeeded but releasing the savepoint failed', recovery)
+        self.assertIn('savepoint rollback also failed', recovery)
+
+        classifier = self.production.split('fn slot_zero_error_keeps_outer', 1)[1].split(
+            'enum SlotZeroRecovery', 1
+        )[0]
+        for unsafe in ('RefStoreError::Database(_)', 'RefStoreError::Timeout', 'RefStoreError::CommitUnknown'):
+            self.assertIn(unsafe, classifier)
+        self.assertIn('PackCommitError::CommitUnknown { .. }', classifier)
+
+        release = self.production.split('fn slot_zero_release_failed', 1)[1].split(
+            '/// Exact retry:', 1
+        )[0]
+        safe = release.split('RolledBackAndReleased =>', 1)[1].split('ReleaseAfterRollback', 1)[0]
+        self.assertIn('SlotZeroRecovery::Safe(', safe)
+        self.assertIn('SlotZeroRecovery::Unsafe(', release.split('ReleaseAfterRollback', 1)[1].split('RollbackFailed', 1)[0])
+        self.assertIn('SlotZeroRecovery::Unsafe(', release.split('RollbackFailed', 1)[1])
+
+        typed = self.tests.split('async fn slot_zero_typed_plan_error_rolls_back_only_the_savepoint()', 1)[1].split(
+            '#[tokio::test]', 1
+        )[0]
+        self.assertIn('into_parts();', typed)
+        self.assertIn('let error = error.unwrap_err();', typed)
+        self.assertIn('tx.commit().await?;', typed)
+
+        self.assertIn(
+            '#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]\n'
+            'async fn slot_zero_cancelled_owned_tx_cannot_be_committed()',
+            self.tests,
+        )
+        cancelled = self.tests.split('async fn slot_zero_cancelled_owned_tx_cannot_be_committed()', 1)[1].split(
+            '#[tokio::test]', 1
+        )[0]
+        self.assertIn('admission.abort();', cancelled)
+        self.assertIn('pg_blocking_pids', cancelled)
+        self.assertIn('ref_store_issuer_lanes', cancelled)
+        self.assertIn("c.relname IN ('cluster_authority'", cancelled)
+        self.assertIn('if waiting', cancelled)
+        self.assertIn('if clear', cancelled)
+        self.assertNotIn('elapsed', cancelled.lower())
 
     def test_ignored_regressions_require_successful_probe_results_and_cleanup(self):
         restore = self.tests.split('async fn slot_zero_restore_rotation_waits_for_admission_commit()', 1)[1].split(
