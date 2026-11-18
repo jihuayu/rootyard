@@ -83,7 +83,7 @@ pub struct SafeGcRepoSnapshot {
 
 impl SafeGcRepoSnapshot {
     pub fn compute_membership_digest(&self) -> String {
-        compute_membership_digest(self.authority.membership_generation, &self.active_packs, &self.retired_packs)
+        compute_membership_digest(self.authority.membership_generation, &self.active_packs)
     }
 
     pub fn directly_pinned_pack_ids(&self) -> BTreeSet<Uuid> {

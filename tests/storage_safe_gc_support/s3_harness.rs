@@ -17,7 +17,7 @@ use axum::{
     Router,
     body::Body,
     extract::State,
-    http::{Method, StatusCode, Uri, header},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     response::Response,
 };
 use bytes::Bytes;
@@ -140,7 +140,7 @@ impl LoopbackS3 {
     }
 }
 
-async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, b: Bytes) -> Response {
+async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, hdrs: HeaderMap, b: Bytes) -> Response {
     let key = u.path().trim_start_matches('/').to_owned();
     if !key.contains('/') {
         return Response::builder()
@@ -150,6 +150,7 @@ async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, b: Bytes) 
             .unwrap();
     }
     let etag = |d: &[u8]| format!("\"{}\"", &hex::encode(Sha256::digest(d))[..32]);
+    let mut content_range: Option<String> = None;
     let (status, tag, len, body) = match m {
         Method::PUT => {
             st.put_requests.fetch_add(1, Ordering::SeqCst);
@@ -167,12 +168,25 @@ async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, b: Bytes) 
                 st.head_requests.fetch_add(1, Ordering::SeqCst);
             }
             match st.objects.lock().unwrap().get(&key).cloned() {
-                Some(d) => (
-                    StatusCode::OK,
-                    Some(etag(&d)),
-                    d.len(),
-                    if m == Method::HEAD { Body::empty() } else { Body::from(d) },
-                ),
+                Some(d) => {
+                    let tag = Some(etag(&d));
+                    if m == Method::GET
+                        && let Some((s_str, e_str)) = hdrs
+                            .get(header::RANGE)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|r| r.strip_prefix("bytes="))
+                            .and_then(|r| r.split_once('-'))
+                        && let Ok(start) = s_str.parse::<usize>()
+                        && start < d.len()
+                    {
+                        let end = e_str.parse::<usize>().unwrap_or(d.len() - 1).min(d.len() - 1);
+                        let slice = d[start..=end].to_vec();
+                        content_range = Some(format!("bytes {start}-{end}/{}", d.len()));
+                        (StatusCode::PARTIAL_CONTENT, tag, slice.len(), Body::from(slice))
+                    } else {
+                        (StatusCode::OK, tag, d.len(), if m == Method::HEAD { Body::empty() } else { Body::from(d) })
+                    }
+                }
                 None => (StatusCode::NOT_FOUND, None, 0, Body::empty()),
             }
         }
@@ -195,6 +209,9 @@ async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, b: Bytes) 
         .header(header::CONNECTION, "close");
     if let Some(t) = tag {
         rb = rb.header(header::ETAG, t);
+    }
+    if let Some(cr) = content_range {
+        rb = rb.header(header::CONTENT_RANGE, cr);
     }
     rb.body(body).unwrap()
 }

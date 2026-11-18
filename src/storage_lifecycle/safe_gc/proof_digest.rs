@@ -34,16 +34,11 @@ pub fn compute_group_receipt_digest(r: &GroupClosureReceipt) -> String {
     hex::encode(h.finalize())
 }
 
-pub fn compute_membership_digest(
-    membership_generation: u64,
-    active_packs: &[ServingPackRecord],
-    retired_packs: &[ServingPackRecord],
-) -> String {
+pub fn compute_membership_digest(membership_generation: u64, active_packs: &[ServingPackRecord]) -> String {
     let mut h = Sha256::new();
     h.update(b"safe-gc-membership-v2|");
     h.update(membership_generation.to_be_bytes());
     encode_pack_records(&mut h, b"active|", active_packs);
-    encode_pack_records(&mut h, b"retired|", retired_packs);
     hex::encode(h.finalize())
 }
 
