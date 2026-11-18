@@ -345,6 +345,7 @@ impl PgRefStore {
         request: &PublicAttemptRequest,
         deadline: Instant,
     ) -> Result<PublicAttemptLookup, PackCommitError> {
+        // The schema probe has its own statement/lock budget.
         bound(tx, deadline).await.map_err(|error| {
             PackCommitError::from(match error {
                 RefStoreError::Timeout => RefStoreError::Timeout,
@@ -362,6 +363,16 @@ impl PgRefStore {
                 "public attempt lookup requires migration 152",
             )));
         }
+
+        // PostgreSQL applies statement_timeout per statement. The schema probe
+        // may have consumed its own budget, so refresh the same absolute
+        // deadline immediately before the one snapshot query.
+        bound(tx, deadline).await.map_err(|error| {
+            PackCommitError::from(match error {
+                RefStoreError::Timeout => RefStoreError::Timeout,
+                _ => RefStoreError::Database("public attempt lookup database error"),
+            })
+        })?;
 
         let row = tx
             .query_one(SELECT_SNAPSHOT, &[&request.repository_id, &request.public_id])
