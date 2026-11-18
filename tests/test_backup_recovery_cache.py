@@ -1,4 +1,5 @@
 """Pure witnesses for the opt-in browse restore cache drill."""
+import io
 import json
 import os
 from pathlib import Path
@@ -6,7 +7,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import backup_recovery as recovery
@@ -43,7 +44,8 @@ class RedisWitness:
         assert ttl > 0, "Redis entry missing or expired"
         return ttl, digest
 
-    def counts(self):
+    def counts(self, *, expected_flushes=0):
+        assert expected_flushes == 0
         return self.strlen, self.getrange, self.set
 
     def fetch(self):
@@ -109,6 +111,51 @@ class CacheWitnessTest(unittest.TestCase):
         redis.redis_command.return_value += b"cmdstat_flushall:calls=1,usec=1\r\n"
         with self.assertRaisesRegex(AssertionError, "Redis was flushed"):
             redis.counts()
+        self.assertEqual(redis.counts(expected_flushes=1), (1, 0, 1))
+        redis.redis_command.return_value += b"cmdstat_flushdb:calls=1,usec=1\r\n"
+        with self.assertRaisesRegex(AssertionError, "Redis was flushed"):
+            redis.counts(expected_flushes=1)
+
+    def test_denial_after_a_warm_read_fails_the_zero_cache_witness(self):
+        redis = RedisWitness(route=OLD_KEY)
+
+        def fetch():
+            redis.fetch()
+            return 401
+
+        with self.assertRaisesRegex(AssertionError, "Unexpected Redis command counts"):
+            cache.preview_request(redis, fetch, (0, 0, 0))
+
+    def test_flush_requires_ownership_on_the_command_connection(self):
+        owned_pid, owned_run = 17, b"a" * 40
+        for pid, run_id in ((owned_pid, owned_run), (18, owned_run), (owned_pid, b"b" * 40)):
+            with self.subTest(pid_matches=pid == owned_pid, run_matches=run_id == owned_run):
+                redis = cache.OwnedRestoreRedis("unused")
+                redis.process = SimpleNamespace(pid=owned_pid, poll=lambda: None)
+                redis.redis_port = 12345
+                redis.run_id = owned_run
+                redis.keys = Mock(side_effect=[{OLD_KEY}, set()])
+                redis.counts = Mock(return_value=(1, 1, 1))
+                redis.identity = Mock(return_value=owned_run)
+                info = b"process_id:%d\r\nrun_id:%s\r\n" % (pid, run_id)
+                connection = MagicMock()
+                connection.__enter__.return_value = connection
+                connection.makefile.return_value = io.BytesIO(b"$%d\r\n" % len(info) + info + b"\r\n+OK\r\n")
+                with patch.object(cache.socket, "create_connection", return_value=connection) as connect:
+                    if (pid, run_id) == (owned_pid, owned_run):
+                        redis.flushall_owned()
+                        self.assertEqual(redis.counts.call_args_list, [call(), call(expected_flushes=1)])
+                        self.assertEqual(connection.sendall.call_args_list, [
+                            call(b"*2\r\n$4\r\nINFO\r\n$6\r\nserver\r\n"),
+                            call(b"*1\r\n$8\r\nFLUSHALL\r\n"),
+                        ])
+                    else:
+                        with self.assertRaisesRegex(AssertionError, "PID differs|identity changed"):
+                            redis.flushall_owned()
+                        self.assertEqual(connection.sendall.call_args_list, [
+                            call(b"*2\r\n$4\r\nINFO\r\n$6\r\nserver\r\n"),
+                        ])
+                    connect.assert_called_once()
 
 
 class ReceiptBindingTest(unittest.TestCase):
@@ -186,6 +233,38 @@ class RunReportTest(unittest.TestCase):
         self.harness.recovery_source.assert_called_once_with(before_backup=self.harness.warm_preview)
         self.harness.restore_exact.assert_called_once()
         self.harness.restored_preview.assert_called_once()
+        self.harness.flush_authority.assert_not_called()
+        self.harness.cleanup.assert_called_once()
+
+    def test_flush_opt_in_runs_after_the_restore_witness_and_before_cleanup(self):
+        self.harness.flush_authority.return_value = dict(owned_flushall_verified=True)
+        report = recovery.browse_restore_cache_report(self.args, flush=True)
+        self.assertEqual(report, dict(passed=True, cases=[
+            dict(name=cache.CASE, status="passed",
+                 detail=dict(restored_repeat_hit=True, owned_cleanup_completed=True)),
+            dict(name=cache.FLUSH_CASE, status="passed",
+                 detail=dict(owned_flushall_verified=True, owned_cleanup_completed=True)),
+        ], **self.binding))
+        self.assertEqual(self.harness.method_calls, [
+            call.recovery_source(before_backup=self.harness.warm_preview),
+            call.restore_exact(), call.restored_preview(), call.flush_authority(), call.cleanup(),
+        ])
+
+    def test_failed_restore_witness_cannot_flush_or_expose_error_details(self):
+        self.harness.restored_preview.side_effect = RuntimeError("fixture-specific restore failure")
+        report = recovery.browse_restore_cache_report(self.args, flush=True)
+        self.assertEqual(report, dict(passed=False, cases=[dict(
+            name=cache.FLUSH_CASE, status="failed", error="restored_preview",
+        )], **self.binding))
+        self.harness.flush_authority.assert_not_called()
+        self.harness.cleanup.assert_called_once()
+
+    def test_failed_flush_does_not_emit_partial_success(self):
+        self.harness.flush_authority.side_effect = RuntimeError("fixture-specific flush failure")
+        report = recovery.browse_restore_cache_report(self.args, flush=True)
+        self.assertEqual(report, dict(passed=False, cases=[dict(
+            name=cache.FLUSH_CASE, status="failed", error="flush_authority",
+        )], **self.binding))
         self.harness.cleanup.assert_called_once()
 
     def test_missing_receipt_never_constructs_a_fixture(self):

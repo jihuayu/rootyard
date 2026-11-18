@@ -12,6 +12,7 @@ from native_evidence import ROOT, receipts
 
 
 CASE = "browse_restore_incarnation_cache"
+FLUSH_CASE = "browse_flushall_preserves_git_authority"
 ENVIRONMENT = "backup-recovery"
 TTL_SECONDS = 1800
 HIT = (1, 1, 0)
@@ -82,8 +83,11 @@ class OwnedRestoreRedis:
         raise AssertionError("Owned Redis readiness timed out")
 
     def identity(self):
+        return self._identity_on(self.redis_command)
+
+    def _identity_on(self, command):
         assert self.process.poll() is None, "Owned Redis process exited"
-        fields = dict(line.split(b":", 1) for line in self.redis_command("INFO", "server").splitlines()
+        fields = dict(line.split(b":", 1) for line in command("INFO", "server").splitlines()
                       if b":" in line)
         assert int(fields[b"process_id"]) == self.process.pid, "Redis PID differs from owned process"
         run_id = fields[b"run_id"]
@@ -100,22 +104,35 @@ class OwnedRestoreRedis:
         assert isinstance(raw, bytes) and raw, "Redis entry missing a cached value"
         return ttl, hashlib.sha256(raw).digest()
 
-    def counts(self):
+    def counts(self, *, expected_flushes=0):
         raw = self.redis_command("INFO", "commandstats")
         assert raw.startswith(b"# Commandstats"), "Redis command counters missing"
         calls = dict(re.findall(rb"^cmdstat_([^:]+):calls=(\d+),", raw, re.MULTILINE))
-        assert not any(int(calls.get(command, b"0")) for command in (b"flushall", b"flushdb")), "Redis was flushed"
+        flushes = tuple(int(calls.get(command, b"0")) for command in (b"flushall", b"flushdb"))
+        assert flushes == (expected_flushes, 0), "Redis was flushed outside the expected phase"
         return tuple(int(calls.get(command, b"0")) for command in COMMANDS)
+
+    def flushall_owned(self):
+        def verify(command):
+            assert self._identity_on(command) == self.run_id, "Redis process identity changed"
+            assert self.process.poll() is None, "Owned Redis process exited"
+
+        assert self.keys(), "Flush requires existing cache entries"
+        before = self.counts()
+        assert self.redis_command("FLUSHALL", before_send=verify) == b"OK"
+        assert self.counts(expected_flushes=1) == before, "Flush changed cache operation counters"
+        assert self.identity() == self.run_id and not self.keys(), "Owned Redis did not empty"
 
     def stop(self):
         CrossProcessHarness.stop_process(self.process)
         assert self.process is None or self.process.poll() is not None, "Owned Redis did not exit"
 
 
-def preview_request(redis, fetch, expected):
-    before = redis.counts()
+def preview_request(redis, fetch, expected, *, expected_flushes=0):
+    before = redis.counts(expected_flushes=expected_flushes)
     response = fetch()
-    delta = tuple(after - start for after, start in zip(redis.counts(), before, strict=True))
+    after = redis.counts(expected_flushes=expected_flushes)
+    delta = tuple(end - start for end, start in zip(after, before, strict=True))
     assert delta == expected, "Unexpected Redis command counts for the preview request"
     return response
 
