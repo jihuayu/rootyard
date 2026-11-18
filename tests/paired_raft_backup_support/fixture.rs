@@ -65,6 +65,12 @@ impl Drop for S3EnvGuard {
     }
 }
 
+impl Default for LoopbackS3 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoopbackS3 {
     pub fn apply_env(&self, bucket: &str) -> S3EnvGuard {
         let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
