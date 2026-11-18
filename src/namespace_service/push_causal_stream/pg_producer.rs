@@ -24,7 +24,7 @@ use super::commit_gate::{build_pg_commit_request, evaluate_push_auth_precheck, r
 use super::git_proc::sha256_and_len_sync;
 use super::pg_producer_plan::{
     HeldUploadArgs, PendingPlanArgs, acquire_and_upload_held_pair, begin_pending_pack_plan,
-    handle_authorized_commit_err, map_authorized_err, pooled_client,
+    handle_authorized_commit_err, map_authorized_err, pooled_client, resolve_or_reserve_pg_sequence,
 };
 use super::quarantine::OperationHoldGuard;
 use super::receipt::{CausalPushProofReceipt, commit_mode_from_capabilities};
@@ -135,6 +135,9 @@ async fn commit_pack_with_scoped_decision(
         deadline,
     })
     .await?;
+    let effective_ticket = OperationTicket { sequence: plan.identity().sequence(), ..ticket.clone() };
+    receipt.sequence = effective_ticket.sequence;
+    receipt.proof_digest = receipt.recompute_digest();
 
     let planned_pack = plan
         .packs()
@@ -166,14 +169,14 @@ async fn commit_pack_with_scoped_decision(
     let terminal = match decide_and_commit_pack(&adapter, pool, actor, plan, auth_mode, deadline).await {
         Ok(term) => term,
         Err(err) => {
-            handle_authorized_commit_err(&err, ticket.operation_id, hold_guard, reclaim_ledger)?;
-            return Err(map_authorized_err(err, ticket.operation_id));
+            handle_authorized_commit_err(&err, effective_ticket.operation_id, hold_guard, reclaim_ledger)?;
+            return Err(map_authorized_err(err, effective_ticket.operation_id));
         }
     };
 
     finalize_pg_outcome(FinalizeArgs {
         snapshot,
-        ticket,
+        ticket: &effective_ticket,
         backend_hex,
         capabilities,
         revision: terminal.revision,
@@ -201,8 +204,21 @@ async fn commit_metadata_with_scoped_decision(
         deadline,
         ..
     } = params;
+    let pg_seq = resolve_or_reserve_pg_sequence(
+        pool,
+        snapshot.repository_id,
+        actor.id,
+        ticket.operation_id,
+        &ticket.lane,
+        deadline,
+    )
+    .await?;
+    let effective_ticket = OperationTicket { sequence: pg_seq, ..ticket.clone() };
+    receipt.sequence = effective_ticket.sequence;
+    receipt.proof_digest = receipt.recompute_digest();
+
     let backend_hex = store.backend_identity().as_hex();
-    let req = build_pg_commit_request(receipt, snapshot, ticket, capabilities, backend_hex)?;
+    let req = build_pg_commit_request(receipt, snapshot, &effective_ticket, capabilities, backend_hex)?;
     let commit_receipt = match PgAuthorizedMetadata.prepare(pool, req, actor, deadline).await {
         Ok(MetadataDecisionPreparation::Prepared(prepared)) => {
             PgAuthorizedMetadata.commit(pool, &prepared, deadline).await
@@ -213,13 +229,13 @@ async fn commit_metadata_with_scoped_decision(
     let committed = match commit_receipt {
         Ok(r) => r,
         Err(err) => {
-            handle_authorized_commit_err(&err, ticket.operation_id, hold_guard, reclaim_ledger)?;
-            return Err(map_authorized_err(err, ticket.operation_id));
+            handle_authorized_commit_err(&err, effective_ticket.operation_id, hold_guard, reclaim_ledger)?;
+            return Err(map_authorized_err(err, effective_ticket.operation_id));
         }
     };
     finalize_pg_outcome(FinalizeArgs {
         snapshot,
-        ticket,
+        ticket: &effective_ticket,
         backend_hex,
         capabilities,
         revision: committed.terminal.revision,

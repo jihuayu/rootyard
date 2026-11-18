@@ -43,6 +43,7 @@ pub struct DurableGatewayReceiptArgs<'a> {
     pub store: &'a BlobStore,
     pub git_binary: &'a Path,
     pub scratch_root: Option<&'a Path>,
+    pub sandbox_root: Option<&'a Path>,
     pub repository_id: Uuid,
     pub operation_id: Uuid,
     pub deadline: TokioInstant,
@@ -157,6 +158,7 @@ pub async fn load_durable_gateway_push_receipt(
             .collect();
         prove_committed_blob_pairs_closure(CommittedBlobProofArgs {
             git_binary: args.git_binary,
+            scratch_root: args.sandbox_root.or(args.scratch_root),
             store: args.store,
             format: meta.object_format,
             base_packs: &snapshot.authorized_base_packs,

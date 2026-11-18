@@ -33,6 +33,7 @@ pub(super) fn extract_and_check_wire_pack(
     pack_offset: usize,
     dest_pack: &Path,
     format: GitObjectFormat,
+    ingest_limits: &StreamIngestLimits,
 ) -> Result<Option<u32>, String> {
     let mut f = File::open(request_path).map_err(|e| e.to_string())?;
     let total_len = f.metadata().map_err(|e| e.to_string())?.len();
@@ -53,6 +54,12 @@ pub(super) fn extract_and_check_wire_pack(
         return Err("invalid PACK magic or version".into());
     }
     let count = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+    if count > ingest_limits.max_pack_objects {
+        return Err("PACK object count exceeded max_pack_objects".into());
+    }
+    if count == 0 && pack_len != (12 + hash_len) as u64 {
+        return Err("empty PACK stream carries trailing payload bytes".into());
+    }
     out.write_all(&hdr).map_err(|e| e.to_string())?;
 
     let mut sha1_h = RingDigest::new(&SHA1_FOR_LEGACY_USE_ONLY);
@@ -94,7 +101,7 @@ pub(super) async fn inspect_verify_pack_bin(
     let raw =
         run_git_bin(git_bin, repo_dir, &["verify-pack", "-v", idx_str], GitStdin::Null, proc_limits, deadline).await?;
     let text = String::from_utf8(raw).map_err(|e| PushCausalError::CorruptPack(e.to_string()))?;
-    let (mut entries, mut delta_count, mut max_depth) = (Vec::new(), 0u64, 0u32);
+    let (mut entries, mut delta_count, mut max_depth, mut total_unpacked) = (Vec::new(), 0u64, 0u32, 0u64);
     for line in text.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 5
@@ -105,8 +112,10 @@ pub(super) async fn inspect_verify_pack_bin(
         }
         let unpacked: u64 = parts[2].parse().map_err(|_| PushCausalError::CorruptPack("bad size".into()))?;
         let offset: u64 = parts[4].parse().map_err(|_| PushCausalError::CorruptPack("bad offset".into()))?;
-        if unpacked > ingest_limits.max_unpacked_object_bytes {
-            return Err(PushCausalError::LimitExceeded("unpacked object exceeded limit"));
+        total_unpacked = total_unpacked.saturating_add(unpacked);
+        if unpacked > ingest_limits.max_unpacked_object_bytes || total_unpacked > ingest_limits.max_inflated_pack_bytes
+        {
+            return Err(PushCausalError::LimitExceeded("unpacked object or total inflated pack exceeded limit"));
         }
         let mut base_oid = None;
         if parts.len() >= 7 {

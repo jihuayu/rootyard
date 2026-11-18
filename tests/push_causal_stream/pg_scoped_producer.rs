@@ -95,7 +95,7 @@ pub async fn exercise_pg_scoped_producer(env: PgScopedTestEnv<'_>) -> Result<()>
         AcceptedRefProof {
             ref_name: "refs/heads/stale".into(),
             old_oid: Some("1".repeat(40)),
-            new_oid: Some(c1),
+            new_oid: Some(c1.clone()),
             target_kind: "commit".into(),
         },
     ];
@@ -182,5 +182,61 @@ pub async fn exercise_pg_scoped_producer(env: PgScopedTestEnv<'_>) -> Result<()>
     ensure!(receipt.accepted_updates.len() == 1 && receipt.rejected_updates.len() == 1);
     let wire_txt = String::from_utf8_lossy(&outcome.report_status_wire);
     ensure!(wire_txt.contains("ok refs/heads/main\n") && wire_txt.contains("ng refs/heads/stale"));
+
+    // Second pack push on the same lane (`ticket2_in.sequence = 1` pre-reservation) MUST rebind `receipt2.sequence == 2`!
+    let c2 = mk_commit(&work, "p2.txt", "pg-scoped-v2\n", "c2")?;
+    let raw_pack2 = run_git(&work, &["pack-objects", "--revs", "--stdout"], Some(format!("{c2}\n^{c1}\n").as_bytes()))?;
+    let p2_path = bare.join("objects/pack/p2.pack");
+    let idx2_path = bare.join("objects/pack/p2.idx");
+    run_git(&bare, &["index-pack", "--stdin", "--strict", p2_path.to_str().unwrap()], Some(&raw_pack2))?;
+
+    let mut snap2 = snapshot.clone();
+    snap2.expected_gate_revision = outcome.committed_revision;
+    snap2.snapshot_seq = outcome.committed_revision;
+    snap2.current_refs.insert("refs/heads/main".into(), c1.clone());
+    let op_id2 = Uuid::new_v4();
+    let ticket2_in =
+        OperationTicket { issuer_id: env.actor.identity.id, lane: "pg-push".into(), sequence: 1, operation_id: op_id2 };
+    let acc2 = vec![AcceptedRefProof {
+        ref_name: "refs/heads/main".into(),
+        old_oid: Some(c1),
+        new_oid: Some(c2),
+        target_kind: "commit".into(),
+    }];
+    let sub2 = rootyard::namespace_service::push_causal_stream::receipt::compute_accepted_subset_digest(&acc2, &[]);
+    let mut receipt2 = CausalPushProofReceipt {
+        operation_id: op_id2,
+        sequence: 1,
+        base_snapshot_seq: snap2.snapshot_seq,
+        expected_gate_revision: snap2.expected_gate_revision,
+        committed_gate_revision: None,
+        accepted_updates: acc2,
+        rejected_updates: vec![],
+        accepted_subset_digest: sub2,
+        proof_digest: String::new(),
+        ..receipt
+    };
+    receipt2.proof_digest = receipt2.recompute_digest();
+    let mut hg2 = OperationHoldGuard::acquire(op_id2, vec![], vec![]);
+    let out2 = commit_push_on_pg(PgScopedPushParams {
+        pool: env.pool,
+        store: env.store,
+        git_binary: env.git_binary,
+        actor: &env.actor.identity,
+        owner_id: repo_owner_id,
+        snapshot: &snap2,
+        ticket: &ticket2_in,
+        auth: &auth,
+        capabilities: &caps,
+        staged_pack_pair: Some((&p2_path, &idx2_path)),
+        reclaim_ledger: Some(&reclaim),
+        receipt: &mut receipt2,
+        hold_guard: &mut hg2,
+        deadline: dl,
+    })
+    .await?;
+    ensure!(receipt2.sequence == 2, "expected PG sequence 2 on second commit_push_on_pg, got {}", receipt2.sequence);
+    let expected_t2 = OperationTicket { sequence: 2, ..ticket2_in };
+    receipt2.verify_commit_binding(&snap2, &expected_t2, env.backend_hex, &out2.terminal_refs)?;
     Ok(())
 }

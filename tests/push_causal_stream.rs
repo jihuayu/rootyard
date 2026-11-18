@@ -1,13 +1,13 @@
 //! Real OpenDAL S3 + stock Git (`SHA-1` & `SHA-256`) streaming push & causal proof tests (#183).
 
 #[path = "push_causal_stream/pg_http_gateway.rs"]
-mod pg_http_gateway;
+pub mod pg_http_gateway;
 #[path = "push_causal_stream/pg_restart_and_reclaim.rs"]
-mod pg_restart_and_reclaim;
+pub mod pg_restart_and_reclaim;
 #[path = "push_causal_stream/pg_scoped_producer.rs"]
-mod pg_scoped_producer;
+pub mod pg_scoped_producer;
 #[path = "push_causal_stream/support.rs"]
-mod support;
+pub mod support;
 
 use std::collections::BTreeMap;
 

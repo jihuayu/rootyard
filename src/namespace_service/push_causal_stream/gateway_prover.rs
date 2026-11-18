@@ -65,6 +65,7 @@ pub struct GatewayObjectClosureProof {
 pub struct GatewayIncomingProofArgs<'a> {
     pub operation_id: Uuid,
     pub git_binary: &'a Path,
+    pub scratch_root: Option<&'a Path>,
     pub view_repo: &'a Path,
     pub request_path: &'a Path,
     pub pack_offset: usize,
@@ -83,8 +84,8 @@ pub async fn prove_gateway_incoming_pack_closure(
     let proc_limits = GitSubprocessLimits::default();
     let ingest_limits = StreamIngestLimits::default();
 
-    let proof_tmp =
-        QuarantineSlot::create(None).map_err(|_| GatewayError::Internal("could not create causal proof sandbox"))?;
+    let proof_tmp = QuarantineSlot::create(args.scratch_root)
+        .map_err(|_| GatewayError::Internal("could not create causal proof sandbox"))?;
     init_isolated_bare_repo_bin(
         args.git_binary,
         proof_tmp.dir(),
@@ -115,6 +116,7 @@ pub async fn prove_gateway_incoming_pack_closure(
         args.pack_offset,
         &incoming_path,
         args.closure.snapshot.object_format,
+        &ingest_limits,
     )
     .map_err(|reason| {
         record_causal_rejection(args.operation_id, reason);
@@ -215,6 +217,7 @@ pub async fn prove_gateway_incoming_pack_closure(
 /// Arguments for deterministic object-level closure proof over committed `BlobStore` pairs.
 pub struct CommittedBlobProofArgs<'a> {
     pub git_binary: &'a Path,
+    pub scratch_root: Option<&'a Path>,
     pub store: &'a BlobStore,
     pub format: GitObjectFormat,
     pub base_packs: &'a [BasePackRef],
@@ -231,6 +234,7 @@ pub async fn prove_committed_blob_pairs_closure(
 ) -> Result<GatewayObjectClosureProof, PushCausalError> {
     let CommittedBlobProofArgs {
         git_binary,
+        scratch_root,
         store,
         format,
         base_packs,
@@ -239,7 +243,7 @@ pub async fn prove_committed_blob_pairs_closure(
         terminal_refs,
         deadline,
     } = args;
-    let proof_tmp = QuarantineSlot::create(None)?;
+    let proof_tmp = QuarantineSlot::create(scratch_root)?;
     let proc_limits = GitSubprocessLimits::default();
     let ingest_limits = StreamIngestLimits::default();
     init_isolated_bare_repo_bin(git_binary, proof_tmp.dir(), format, &proc_limits, deadline).await?;

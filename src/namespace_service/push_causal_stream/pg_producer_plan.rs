@@ -66,27 +66,77 @@ pub(super) struct HeldUploadArgs<'a> {
     pub(super) deadline: Instant,
 }
 
+pub(super) async fn resolve_or_reserve_pg_sequence(
+    pool: &Pool,
+    repository_id: Uuid,
+    issuer_id: Uuid,
+    operation_id: Uuid,
+    lane_str: &str,
+    deadline: Instant,
+) -> Result<i64, PushCausalError> {
+    let lane = IssuerLane::new(lane_str)?;
+    let mut client = pooled_client(pool, deadline).await?;
+    let tx = begin_bounded(&mut client, deadline).await?;
+    let staged = timeout_at(deadline, async {
+        tx.execute("SET LOCAL synchronous_commit = 'on'", &[]).await.map_err(|e| PushCausalError::Io(e.to_string()))?;
+        resolve_or_reserve_in_tx(&tx, repository_id, issuer_id, operation_id, &lane, deadline).await
+    })
+    .await
+    .map_err(|_| PushCausalError::DeadlineExceeded)?;
+    match staged {
+        Ok(seq) => {
+            commit_bounded(tx, deadline, repository_id, Some(operation_id)).await?;
+            Ok(seq)
+        }
+        Err(err) => {
+            let _ = timeout_at(deadline, tx.rollback()).await;
+            Err(err)
+        }
+    }
+}
+
+async fn resolve_or_reserve_in_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    repository_id: Uuid,
+    issuer_id: Uuid,
+    operation_id: Uuid,
+    lane: &IssuerLane,
+    deadline: Instant,
+) -> Result<i64, PushCausalError> {
+    if let Some(row) = tx
+        .query_opt(
+            "SELECT sequence FROM ref_store_operations WHERE repository_id = $1 AND operation_id = $2",
+            &[&repository_id, &operation_id],
+        )
+        .await
+        .map_err(|e| PushCausalError::Io(e.to_string()))?
+    {
+        Ok(row.get(0))
+    } else {
+        Ok(PgRefStore.reserve_sequence(tx, repository_id, issuer_id, operation_id, lane, deadline).await?.sequence())
+    }
+}
+
 pub(super) async fn begin_pending_pack_plan(args: PendingPlanArgs<'_>) -> Result<PackCommitPlan, PushCausalError> {
     let lane = IssuerLane::new(args.ticket.lane.as_str())?;
     let mut client = pooled_client(args.pool, args.deadline).await?;
     let tx = begin_bounded(&mut client, args.deadline).await?;
     let staged = timeout_at(args.deadline, async {
         tx.execute("SET LOCAL synchronous_commit = 'on'", &[]).await.map_err(|e| PushCausalError::Io(e.to_string()))?;
-        let seq = PgRefStore
-            .reserve_sequence(
-                &tx,
-                args.snapshot.repository_id,
-                args.actor.id,
-                args.ticket.operation_id,
-                &lane,
-                args.deadline,
-            )
-            .await?;
+        let seq = resolve_or_reserve_in_tx(
+            &tx,
+            args.snapshot.repository_id,
+            args.actor.id,
+            args.ticket.operation_id,
+            &lane,
+            args.deadline,
+        )
+        .await?;
         let identity = OperationIdentity::new(
             args.snapshot.repository_id,
             args.actor.id,
             lane,
-            seq.sequence(),
+            seq,
             args.ticket.operation_id,
             args.producer_digest,
         )?;

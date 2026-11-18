@@ -12,7 +12,7 @@ use deadpool_postgres::Pool;
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::blob_store::protected::{ProtectedUploader, UploadSource};
 use rootyard::namespace_service::push_causal_stream::*;
-use rootyard::ref_store::core::artifact_hold::{
+use rootyard::ref_store::artifact_hold::{
     AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldPurpose, ArtifactSpec, HoldScope, PgArtifactHoldStore,
 };
 use rootyard::ref_store::serving::lookup;
@@ -124,9 +124,11 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
     let gw2 = LiveGateway::start(env.pool.clone(), env.store.clone(), Duration::from_secs(60)).await?;
     let url2 = format!("http://{}/git/{}/{repo_name}.git/git-receive-pack", gw2.addr, env.actor.username);
 
-    // Replay `op2` over HTTP against fresh `gw2` (`Claim::Replay`): must rebuild byte-identical `CausalPushProofReceipt`!
+    // Replay `op2` over HTTP against fresh `gw2` (`Claim::Replay`): must rebuild byte-identical `CausalPushProofReceipt` with ZERO reclaim writes!
     let (st2_rep, body2_rep) = post_receive(&url2, &auth_hdr, op2, wire2).await?;
     ensure!(st2_rep == StatusCode::OK && body2_rep == body2, "HTTP replay wire mismatch across restart");
+    let gw2_replay_ledger = open_gateway_reclaim_ledger(gw2.scratch.path()).map_err(|e| anyhow!("{e:?}"))?;
+    ensure!(gw2_replay_ledger.load(op2)?.is_none(), "pure HTTP Claim::Replay must perform 0 reclaim ledger writes");
     let rec2_after =
         recent_gateway_push_receipt(op2).ok_or_else(|| anyhow!("missing op2 receipt after HTTP replay"))?;
     rec2_after.verify_digest()?;
@@ -139,6 +141,7 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
         store: env.store,
         git_binary: env.git_binary,
         scratch_root: None,
+        sandbox_root: None,
         repository_id: repo_id,
         operation_id: op2,
         deadline: dl,
@@ -284,9 +287,9 @@ async fn stage_three_aborted_pairs_in_s3_and_ledger(
     let req_dig = RequestDigest::of("reclaim-multi", &[op_id.as_bytes()]);
     let mut client = env.pool.get().await?;
     let tx = client.transaction().await?;
-    let seq = PgRefStore.reserve_sequence(&tx, repo_id, env.actor.identity.id, op_id, &lane, dl).await?;
+    let seq = PgRefStore.reserve_sequence(&*tx, repo_id, env.actor.identity.id, op_id, &lane, dl).await?;
     let identity = OperationIdentity::new(repo_id, env.actor.identity.id, lane, seq.sequence(), op_id, req_dig)?;
-    PgRefStore.begin(&tx, &identity, dl).await?;
+    PgRefStore.begin(&*tx, &identity, dl).await?;
     tx.commit().await?;
 
     let tmp = TempDir::new()?;
@@ -350,7 +353,7 @@ async fn stage_three_aborted_pairs_in_s3_and_ledger(
 
     // Cancel the aborted operation in PG so its terminal state is `'cancelled'` (`0` memberships!).
     let tx_cancel = client.transaction().await?;
-    PgRefStore.cancel(&tx_cancel, &identity, dl).await?;
+    PgRefStore.cancel(&*tx_cancel, &identity, dl).await?;
     tx_cancel.commit().await?;
     Ok(op_id)
 }

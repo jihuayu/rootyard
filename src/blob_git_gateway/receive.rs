@@ -114,11 +114,12 @@ async fn receive_pack_authorized(
 
     let backend_hex = state.store().backend_identity().as_hex();
     let _ = sweep_gateway_reclaim_ledger(state.pool(), state.scratch_root(), backend_hex, deadline).await;
-    let receipt_args = || DurableGatewayReceiptArgs {
+    let receipt_args = |settle_reclaim: bool| DurableGatewayReceiptArgs {
         pool: state.pool(),
         store: state.store(),
         git_binary: state.git_binary(),
-        scratch_root: Some(state.scratch_root()),
+        scratch_root: settle_reclaim.then(|| state.scratch_root()),
+        sandbox_root: Some(state.scratch_root()),
         repository_id,
         operation_id: operation,
         deadline,
@@ -130,7 +131,7 @@ async fn receive_pack_authorized(
             return terminal_response(&request, &cancelled_results(&request, reason), operation);
         }
         Claim::Replay(terminal) => {
-            materialize_durable_gateway_receipt(receipt_args()).await?;
+            materialize_durable_gateway_receipt(receipt_args(false)).await?;
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
             return committed_response(CommittedResponse {
@@ -167,6 +168,7 @@ async fn receive_pack_authorized(
     prove_gateway_incoming_pack_closure(GatewayIncomingProofArgs {
         operation_id: operation,
         git_binary: state.git_binary(),
+        scratch_root: Some(state.scratch_root()),
         view_repo: view.repo(),
         request_path: &request_path,
         pack_offset: streamed_prefix.len(),
@@ -180,19 +182,13 @@ async fn receive_pack_authorized(
     command.arg("receive-pack").arg("--stateless-rpc").arg(view.repo());
     let captured = native::run_capture(command, Some(request_path.as_path()), 4 * 1024 * 1024, deadline).await?;
     if !captured.success {
-        // The operation was unknown when probed, so nothing was published: a
-        // complete native refusal proves no authoritative ref change. Only an
-        // all-`ng`/unpack-failure report is passed through; a local report that
-        // claims an applied ref is never turned into durable success.
+        // Unknown when probed, so only an all-`ng`/unpack-failure report passes through.
         if protocol::native_report_is_rejection(&captured.stdout) {
             return response(StatusCode::OK, "application/x-git-receive-pack-result", captured.stdout, operation);
         }
         return Err(GatewayError::BadRequest("push was refused by native Git validation"));
     }
 
-    // A ref-only update (or a push whose objects already exist) legitimately
-    // stages no new pack: the sealed verifier then proves the target objects
-    // from the current registered memberships. A missing object fails there.
     let new_pairs = collect_pairs(view.repo(), &before)?;
     if new_pairs.len() > MAX_NEW_PACKS {
         return Err(GatewayError::TooLarge);
@@ -224,7 +220,7 @@ async fn receive_pack_authorized(
         // Git report-status. Mixed/accepted-subset terminals are replayed
         // exactly as recorded.
         Ok(PushOutcome::Terminal(terminal)) => {
-            materialize_durable_gateway_receipt(receipt_args()).await?;
+            materialize_durable_gateway_receipt(receipt_args(true)).await?;
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
             committed_response(CommittedResponse {
