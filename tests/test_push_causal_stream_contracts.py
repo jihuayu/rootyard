@@ -46,6 +46,7 @@ RUST_FILES = [
     ROOT / "tests" / "push_causal_stream" / "pg_http_gateway.rs",
     ROOT / "tests" / "push_causal_stream" / "pg_scoped_producer.rs",
     ROOT / "tests" / "push_causal_stream" / "pg_restart_and_reclaim.rs",
+    ROOT / "tests" / "push_causal_stream" / "pg_reclaim_terminal_and_replay.rs",
 ]
 WORKFLOW = ROOT / ".github" / "workflows" / "push-causal-stream.yml"
 DOC = ROOT / "docs" / "push-causal-stream.md"
@@ -76,6 +77,11 @@ class PushCausalStreamContractsTest(unittest.TestCase):
         self.assertIn("prove_gateway_incoming_pack_closure", receive_src)
         self.assertIn("materialize_durable_gateway_receipt", receive_src)
         self.assertIn("sweep_gateway_reclaim_ledger", receive_src)
+        self.assertLess(
+            receive_src.index("Claim::Fresh"),
+            receive_src.index("sweep_gateway_reclaim_ledger("),
+            "Claim::Fresh must precede sweep_gateway_reclaim_ledger for request-entry zero-write replay",
+        )
 
         commit_gate_src = (ROOT / "src" / "namespace_service" / "push_causal_stream" / "commit_gate.rs").read_text(
             encoding="utf-8"

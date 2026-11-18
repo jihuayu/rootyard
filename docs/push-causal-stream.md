@@ -16,3 +16,12 @@
 
 4. **Multi-Pair Recoverable Reclaim Ledger & Remote Sweeper (`reclaim.rs`, `reclaim_sweeper.rs`, `tests/push_causal_stream/pg_restart_and_reclaim.rs`)**:
    - `QuarantineReclaimLedger` records all `0..=8` staged `.pack`/`.idx` pairs; `sweep_gateway_reclaim_ledger` and `settle_aborted_gateway_reclaim` sweep 100% of unpromoted/partial/rejected remote staging packs once PostgreSQL proves terminal abort with zero active memberships or pins (`OverlappedPipeline` vs `#164` naive full-repo repack, `SHA-1` & `SHA-256`).
+
+5. **Positive Durable Terminal-Abort Proof (`reclaim_sweeper.rs`, `tests/push_causal_stream/pg_reclaim_terminal_and_replay.rs`)**:
+   - `is_operation_proven_aborted_and_unreferenced` requires POSITIVE durable PostgreSQL terminal-abort proof: `ref_store_operations.state IN ('rejected','cancelled')`, or — only when NO `ref_store_operations` row exists — a durable `ref_store_cancellations` row or a terminal `'REJECTED'`/`'CANCELLED'` `ref_store_publication_decisions` row.
+   - A missing or still-`pending` operation row is never deletable, even with `0` references, so the quarantined record stays in `QuarantineReclaimLedger` and `0` S3 `DELETE`s are issued.
+   - Positive proof additionally requires `0` live references across `ref_store_core_pack_memberships`, `ref_store_core_snapshot_packs`, `ref_store_core_serving_read_packs`, active (`state = 'active'`) `ref_store_core_root_heads`/`ref_store_core_root_packs`, and `ref_store_publication_decisions` in `'OPEN'`/`'CONSUMED'`.
+
+6. **Strict Replay Zero-Write Contract (`src/blob_git_gateway/receive.rs`, `reclaim_sweeper.rs`)**:
+   - `sweep_gateway_reclaim_ledger` runs strictly AFTER `operation::probe` resolves `Claim::Fresh`, so `Claim::Pending`, `Claim::Cancelled` and `Claim::Replay` never sweep. The sweeper also resolves the reclaim operator and requires an existing private ledger directory before opening the ledger, so a no-op sweep never creates `reclaim-*.json`.
+   - An HTTP `Claim::Replay` is therefore 100% zero-write: `0` reclaim-ledger files or `modified()` timestamps changed, `0` PostgreSQL rows changed across the operation/decision/event/hold/membership/cancellation ledgers, and `0` S3 `PUT`/`DELETE` mutations.

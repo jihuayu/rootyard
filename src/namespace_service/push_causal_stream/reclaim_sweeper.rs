@@ -1,9 +1,11 @@
 //! Production remote partial/unpromoted `.pack`/`.idx` reclaim consumer & sweeper (#183).
 //!
 //! Collects ALL `0..=8` staged/uploaded `.pack` and `.idx` remote `BlobLocator` paths from
-//! `artifact_holds` + `QuarantineReclaimLedger`, verifies in PostgreSQL that the operation
-//! is terminal (`rejected`/`cancelled`) or rolled-back with ZERO active pack memberships or
-//! snapshot/serving-read pins, and sweeps 100% of quarantined remote objects via OpenDAL
+//! `artifact_holds` + `QuarantineReclaimLedger`, requires POSITIVE durable PostgreSQL terminal-abort
+//! proof (`ref_store_operations.state IN ('rejected','cancelled')`, or a durable
+//! `ref_store_cancellations` / `REJECTED`|`CANCELLED` decision tombstone for a missing operation row)
+//! with ZERO active pack memberships, snapshot/serving-read pins, active retention roots or
+//! open/consumed decisions, and only then sweeps 100% of quarantined remote objects via OpenDAL
 //! when remote reclaim deletion is enabled (default-off when `BlobDeletePolicy::Disabled`).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -146,8 +148,15 @@ pub async fn query_operation_hold_blob_paths(
     Ok((paths, total_bytes))
 }
 
-/// Authoritatively verify in PostgreSQL that `operation_id` is NOT `pending` or `committed` and
-/// that ZERO active pack memberships, snapshot pins, or serving reads reference its artifacts.
+/// Authoritatively verify in PostgreSQL that `operation_id` has POSITIVE durable terminal-abort
+/// proof (`ref_store_operations.state IN ('rejected', 'cancelled')`, OR when absent from
+/// `ref_store_operations`, an explicit durable row in `ref_store_cancellations` or terminal
+/// `'REJECTED'`/`'CANCELLED'` row in `ref_store_publication_decisions`) AND that ZERO active
+/// pack memberships, snapshot pins, serving reads, active retention roots, or open/consumed
+/// decisions reference its artifacts.
+///
+/// A missing `ref_store_operations` row with no durable abort tombstone NEVER qualifies as
+/// deletable (`Ok(false)`), even when all reference counts are zero.
 pub async fn is_operation_proven_aborted_and_unreferenced(
     pool: &Pool,
     repository_id: Uuid,
@@ -169,11 +178,33 @@ pub async fn is_operation_proven_aborted_and_unreferenced(
     .map_err(|_| PushCausalError::DeadlineExceeded)?
     .map_err(|e| PushCausalError::Io(e.to_string()))?;
 
-    if let Some(row) = op_row {
-        let state: &str = row.get(0);
-        if !matches!(state, "rejected" | "cancelled") {
-            return Ok(false);
+    let proven_terminal_abort = match op_row {
+        Some(row) => {
+            let state: &str = row.get(0);
+            matches!(state, "rejected" | "cancelled")
         }
+        None => {
+            let tomb_row = timeout_at(
+                deadline,
+                client.query_one(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM ref_store_cancellations
+                         WHERE repository_id = $1 AND operation_id = $2
+                     ) OR EXISTS(
+                         SELECT 1 FROM ref_store_publication_decisions
+                         WHERE repository_id = $1 AND operation_id = $2 AND state IN ('REJECTED', 'CANCELLED')
+                     )",
+                    &[&repository_id, &operation_id],
+                ),
+            )
+            .await
+            .map_err(|_| PushCausalError::DeadlineExceeded)?
+            .map_err(|e| PushCausalError::Io(e.to_string()))?;
+            tomb_row.get::<_, bool>(0)
+        }
+    };
+    if !proven_terminal_abort {
+        return Ok(false);
     }
 
     let ref_row = timeout_at(
@@ -188,7 +219,14 @@ pub async fn is_operation_proven_aborted_and_unreferenced(
                 WHERE p.repository_id = $1 AND p.plan_operation_id = $2)
              + (SELECT COUNT(*) FROM ref_store_core_serving_read_packs srp
                 JOIN ref_store_core_pack_publications p ON p.registration_id = srp.registration_id
-                WHERE p.repository_id = $1 AND p.plan_operation_id = $2)",
+                WHERE p.repository_id = $1 AND p.plan_operation_id = $2)
+             + (SELECT COUNT(*) FROM ref_store_core_root_packs rp
+                JOIN ref_store_core_root_heads rh
+                  ON rh.repository_id = rp.repository_id AND rh.root_id = rp.root_id AND rh.state = 'active'
+                JOIN ref_store_core_pack_publications p ON p.registration_id = rp.registration_id
+                WHERE rp.repository_id = $1 AND p.plan_operation_id = $2)
+             + (SELECT COUNT(*) FROM ref_store_publication_decisions d
+                WHERE d.repository_id = $1 AND d.operation_id = $2 AND d.state IN ('OPEN', 'CONSUMED'))",
             &[&repository_id, &operation_id],
         ),
     )
@@ -235,19 +273,28 @@ pub async fn settle_aborted_gateway_reclaim(
 }
 
 /// Startup & request-entry recovery consumer: scans `QuarantineReclaimLedger` for `needs_recovery()`
-/// records whose PG operations have now settled as `rejected`/`cancelled`/rolled-back and sweeps
-/// all unpromoted remote `.pack` and `.idx` objects from `BlobStore`.
+/// records whose PG operations have now settled as `rejected`/`cancelled` with positive durable
+/// terminal-abort proof and sweeps all unpromoted remote `.pack` and `.idx` objects from `BlobStore`.
+///
+/// The sweep is a fresh-admission side effect only (`Claim::Fresh`). Callers never invoke it on a
+/// `Claim::Pending`, `Claim::Cancelled` or `Claim::Replay` path, so a pure replay performs zero local
+/// ledger writes, zero state transitions and zero remote deletes. A backend without an armed reclaim
+/// operator or a scratch root without an existing private ledger directory is a strict no-op: the
+/// ledger directory is never created for a sweep that cannot delete anything.
 pub async fn sweep_gateway_reclaim_ledger(
     pool: &Pool,
     scratch_root: &Path,
     backend_hex: &str,
     deadline: TokioInstant,
 ) -> Result<usize, PushCausalError> {
-    let ledger = open_gateway_reclaim_ledger(scratch_root)
-        .map_err(|_| PushCausalError::Io("could not open gateway reclaim ledger".into()))?;
     let Some(op) = resolve_reclaim_operator(backend_hex) else {
         return Ok(0);
     };
+    if !super::gateway_bridge::gateway_reclaim_ledger_dir_for_scratch(scratch_root).is_dir() {
+        return Ok(0);
+    }
+    let ledger = open_gateway_reclaim_ledger(scratch_root)
+        .map_err(|_| PushCausalError::Io("could not open gateway reclaim ledger".into()))?;
     let mut swept = 0usize;
     for rec in ledger.list_recoverable()? {
         if rec.backend_identity != backend_hex {
@@ -261,9 +308,12 @@ pub async fn sweep_gateway_reclaim_ledger(
         if all_paths != rec.recorded_blob_paths {
             let _ = ledger.transition(rec.operation_id, rec.state, all_paths.clone(), hold_bytes, &rec.detail);
         }
-        if is_operation_proven_aborted_and_unreferenced(pool, rec.repository_id, rec.operation_id, deadline).await? {
+        // A missing operation row or a still-`pending` row is NOT positive durable abort proof, so the
+        // quarantined record and every staged remote object stay intact (`0` deletes, `0` transitions).
+        let (rid, oid) = (rec.repository_id, rec.operation_id);
+        if is_operation_proven_aborted_and_unreferenced(pool, rid, oid, deadline).await? {
             delete_and_verify_absent(&op, &all_paths, deadline).await?;
-            ledger.mark_reclaimed_if_proven_aborted(rec.operation_id, true)?;
+            ledger.mark_reclaimed_if_proven_aborted(oid, true)?;
             swept += 1;
         }
     }

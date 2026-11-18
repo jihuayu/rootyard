@@ -2,6 +2,8 @@
 
 #[path = "push_causal_stream/pg_http_gateway.rs"]
 pub mod pg_http_gateway;
+#[path = "push_causal_stream/pg_reclaim_terminal_and_replay.rs"]
+pub mod pg_reclaim_terminal_and_replay;
 #[path = "push_causal_stream/pg_restart_and_reclaim.rs"]
 pub mod pg_restart_and_reclaim;
 #[path = "push_causal_stream/pg_scoped_producer.rs"]
@@ -121,7 +123,6 @@ async fn e2e_sha1_and_sha256_thin_packs_multi_deps_duplicates_and_fail_closed() 
                 },
             ],
         };
-
         let mut exec = StateMachinePushExecutor::new();
         exec.initialize_repo_gate(
             &snapshot,
@@ -204,7 +205,6 @@ async fn e2e_sha1_and_sha256_thin_packs_multi_deps_duplicates_and_fail_closed() 
             })
             .await;
         assert!(matches!(bad_res, Err(PushCausalError::UnauthorizedBaseDependency(_))));
-
         // Empty repo + thin pack with missing delta base -> fails closed in index-pack.
         let mut empty_base_snap = unverified_snap;
         empty_base_snap.authorized_base_packs.clear();

@@ -22,6 +22,9 @@ use tokio::time::Instant as TokioInstant;
 use uuid::Uuid;
 
 use super::pg_http_gateway::{LiveGateway, PgActor, base64_basic, create_and_provision_repo, git_http};
+use super::pg_reclaim_terminal_and_replay::ReclaimGateCtx;
+use super::pg_reclaim_terminal_and_replay::verify_http_replay_strict_zero_write;
+use super::pg_reclaim_terminal_and_replay::verify_missing_and_pending_op_rows_never_sweep_until_durably_aborted;
 use super::support::{LoopbackS3, build_receive_wire, mk_commit, run_git};
 
 pub struct RestartReclaimSuiteEnv<'a> {
@@ -123,16 +126,27 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
 
     let gw2 = LiveGateway::start(env.pool.clone(), env.store.clone(), Duration::from_secs(60)).await?;
     let url2 = format!("http://{}/git/{}/{repo_name}.git/git-receive-pack", gw2.addr, env.actor.username);
+    let remote2 = format!(
+        "http://{}:{}@{}/git/{}/{repo_name}.git",
+        env.actor.username, env.actor.token, gw2.addr, env.actor.username
+    );
+    // `work` was cloned from the stopped `gw1`; re-point it at `gw2` for every later fresh push.
+    git_http(&work, &["remote", "set-url", "origin", &remote2]).await?;
+    let replay_ctx = ReclaimGateCtx {
+        pool: env.pool,
+        s3: env.s3,
+        backend_hex: env.backend_hex,
+        scratch_root: gw2.scratch.path(),
+        work: &work,
+        url: &url2,
+        auth_hdr: &auth_hdr,
+        repo_id,
+        actor_id: env.actor.identity.id,
+    };
 
-    // Replay `op2` over HTTP against fresh `gw2` (`Claim::Replay`): must rebuild byte-identical `CausalPushProofReceipt` with ZERO reclaim writes!
-    let (st2_rep, body2_rep) = post_receive(&url2, &auth_hdr, op2, wire2).await?;
-    ensure!(st2_rep == StatusCode::OK && body2_rep == body2, "HTTP replay wire mismatch across restart");
-    let gw2_replay_ledger = open_gateway_reclaim_ledger(gw2.scratch.path()).map_err(|e| anyhow!("{e:?}"))?;
-    ensure!(gw2_replay_ledger.load(op2)?.is_none(), "pure HTTP Claim::Replay must perform 0 reclaim ledger writes");
-    let rec2_after =
-        recent_gateway_push_receipt(op2).ok_or_else(|| anyhow!("missing op2 receipt after HTTP replay"))?;
-    rec2_after.verify_digest()?;
-    ensure!(rec2_after == rec2_before, "replayed CausalPushProofReceipt differed after server restart");
+    // Replay `op2` over HTTP against fresh `gw2` (`Claim::Replay`): byte-identical durable receipt and a
+    // strict zero-write contract (0 ledger / SQL / S3 mutations) while S3 reclaim is ARMED.
+    verify_http_replay_strict_zero_write(&replay_ctx, op2, &wire2, &body2, &rec2_before).await?;
 
     clear_observed_gateway_receipts();
     let dl = TokioInstant::now() + Duration::from_secs(30);
@@ -189,10 +203,6 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
 
     // 3A. REJECTED HTTP PUSH REMOTE SWEEP: stale-CAS push built on `c1` passes causal closure, uploads `.pack`+`.idx` to S3, gets rejected (`200 OK` `ng`), and sweeps 100% of remote staging blobs.
     let stale_work = tmp.path().join("stale-work");
-    let remote2 = format!(
-        "http://{}:{}@{}/git/{}/{repo_name}.git",
-        env.actor.username, env.actor.token, gw2.addr, env.actor.username
-    );
     git_http(tmp.path(), &["clone", "--no-hardlinks", &remote2, stale_work.to_str().unwrap()]).await?;
     run_git(&stale_work, &["reset", "--hard", &c1], None)?;
     let c_stale = mk_commit(&stale_work, "stale.txt", "stale-branch-content\n", "stale")?;
@@ -223,12 +233,10 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
         ensure!(env.s3.objects.lock().unwrap().contains_key(&key), "expected staged S3 key before sweep: {key}");
     }
 
-    // First verify default-off (`BlobDeletePolicy::Disabled`) performs ZERO provider deletes while preserving ledger!
+    // First verify default-off (`BlobDeletePolicy::Disabled`) performs ZERO provider deletes on a fresh push!
     clear_gateway_remote_reclaim_s3(env.backend_hex);
-    let replay_wire =
-        build_receive_wire(&[(c1.as_str(), c2.as_str(), "refs/heads/main")], "report-status", &thin_pack2);
-    let (st_off, _) = post_receive(&url2, &auth_hdr, op2, replay_wire.clone()).await?;
-    ensure!(st_off == StatusCode::OK);
+    mk_commit(&work, "reclaim-default-off.txt", "reclaim-default-off\n", "default-off-check")?;
+    git_http(&work, &["push", "origin", "HEAD:refs/heads/default-off-check"]).await?;
     for p in &multi_paths {
         let key = format!("push-causal-bucket/push-causal-it/{p}");
         ensure!(env.s3.objects.lock().unwrap().contains_key(&key), "default-off must NOT delete S3 key: {key}");
@@ -238,7 +246,7 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
         "default-off must retain recoverable ledger record"
     );
 
-    // Re-arm explicit S3 reclaim operator and verify next receive-pack sweeps all 6/6 S3 objects!
+    // Re-arm explicit S3 reclaim operator and verify the next fresh push sweeps all 6/6 S3 objects!
     configure_gateway_remote_reclaim_s3(
         env.backend_hex,
         RemoteS3ReclaimConfig {
@@ -250,12 +258,15 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
             secret_access_key: "test-sk".into(),
         },
     )?;
-    let (st_trig, _) = post_receive(&url2, &auth_hdr, op2, replay_wire).await?;
-    ensure!(st_trig == StatusCode::OK);
+    mk_commit(&work, "reclaim-armed-sweep.txt", "reclaim-armed-sweep\n", "armed-multi-sweep")?;
+    git_http(&work, &["push", "origin", "HEAD:refs/heads/armed-multi-sweep"]).await?;
     assert_s3_paths_swept(env.s3, &multi_paths)?;
     let multi_rec = gw2_ledger.load(op_multi)?.ok_or_else(|| anyhow!("missing multi-pair reclaim record"))?;
     ensure!(multi_rec.staged_pairs.len() == 3 && multi_rec.recorded_blob_paths.len() == 6);
     ensure!(multi_rec.state == UploadReclaimState::ReclaimedAfterAbort);
+
+    // Missing / pending `ref_store_operations` rows NEVER sweep; a durable `cancelled` terminal does.
+    verify_missing_and_pending_op_rows_never_sweep_until_durably_aborted(&replay_ctx).await?;
 
     // Verify committed repository packs are 100% intact via fresh clone + `git fsck --full --strict`.
     let verify_clone = tmp.path().join("verify-clone");
@@ -367,7 +378,12 @@ fn assert_s3_paths_swept(s3: &LoopbackS3, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn post_receive(url: &str, auth_hdr: &str, op_id: Uuid, body: Vec<u8>) -> Result<(StatusCode, Vec<u8>)> {
+pub(super) async fn post_receive(
+    url: &str,
+    auth_hdr: &str,
+    op_id: Uuid,
+    body: Vec<u8>,
+) -> Result<(StatusCode, Vec<u8>)> {
     let resp = reqwest::Client::new()
         .post(url)
         .header(header::AUTHORIZATION, auth_hdr)

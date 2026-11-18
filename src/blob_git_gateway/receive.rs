@@ -113,7 +113,6 @@ async fn receive_pack_authorized(
         operation::request_digest(repository_id, operation, format, &request, mode, &request_path, deadline).await?;
 
     let backend_hex = state.store().backend_identity().as_hex();
-    let _ = sweep_gateway_reclaim_ledger(state.pool(), state.scratch_root(), backend_hex, deadline).await;
     let receipt_args = |settle_reclaim: bool| DurableGatewayReceiptArgs {
         pool: state.pool(),
         store: state.store(),
@@ -149,6 +148,9 @@ async fn receive_pack_authorized(
         }
         Claim::Fresh => {}
     }
+    // Reclaim sweeping is a fresh-admission side effect only: a pending, cancelled or replayed
+    // claim must never mutate the local reclaim ledger or delete a remote staging object.
+    let _ = sweep_gateway_reclaim_ledger(state.pool(), state.scratch_root(), backend_hex, deadline).await;
 
     // Real sealed read view; verify authority snapshot closure before building
     // the native Git view so base packs never skip closure verification.
