@@ -356,6 +356,7 @@ class FailureProjectionTest(unittest.TestCase):
         case_id = result.errors[0][0].id()
         self.assertIn(case_id, result.started_ids)
         self.assertIn(case_id, result.diagnostics)
+        self.assertEqual(result.first_diagnostics, {})
         diagnostic = result.diagnostics[case_id]
         self.assertEqual(diagnostic["stage"], "setup")
         self.assertTrue(diagnostic["started"])
@@ -375,11 +376,115 @@ class FailureProjectionTest(unittest.TestCase):
         self.assertEqual(payload["cases"][0]["status"], "error")
         self.assertIsNone(payload["cases"][0]["detail"])
         self.assertEqual(payload["cases"][0]["diagnostic"], diagnostic)
+        self.assertEqual(
+            set(payload["cases"][0]),
+            {"name", "status", "detail", "diagnostic"},
+        )
         self.assertEqual(payload["tests_run"], 1)
         self.assertEqual(payload["counts"]["error"], 1)
         self.assertEqual(payload["counts"]["success"], 0)
         self.assertFalse(payload["cleanup"]["owned_mounts_remaining_known"])
         self.assertIsNone(payload["cleanup"]["owned_mounts_remaining"])
+
+    def test_body_failure_then_teardown_error_keeps_first_and_last(self):
+        class BodyRaisingDict(dict):
+            def get(self, name, default=None):
+                raise AssertionError("body-secret")
+
+        class BodyFailureThenTeardownErrorCase(unittest.TestCase):
+            def test_case(self):
+                report._binding_value(BodyRaisingDict(), "value")
+
+            def tearDown(self):
+                next(report._flatten(1))
+
+        BodyFailureThenTeardownErrorCase.__module__ = "tests.fake_repeated_event"
+        BodyFailureThenTeardownErrorCase.__qualname__ = (
+            "BodyFailureThenTeardownErrorCase"
+        )
+        result = _run_inventory(BodyFailureThenTeardownErrorCase)
+        case_id = result.errors[0][0].id()
+        self.assertEqual([test.id() for test, _ in result.failures], [case_id])
+        self.assertEqual([test.id() for test, _ in result.errors], [case_id])
+        first = result.first_diagnostics[case_id]
+        last = result.diagnostics[case_id]
+
+        source_lines = (ROOT / REPORT_SOURCE).read_text(encoding="utf-8").splitlines()
+        binding_line = next(
+            index for index, line in enumerate(source_lines, 1)
+            if line.strip() == "value = binding.get(name)"
+        )
+        flatten_line = next(
+            index for index, line in enumerate(source_lines, 1)
+            if line.strip() == "for test in suite:"
+        )
+
+        diagnostic_keys = {
+            "schema", "kind", "case_id", "started", "stage", "exception_class",
+            "locus", "frames", "frames_truncated",
+        }
+        self.assertEqual(set(first), diagnostic_keys)
+        self.assertEqual(set(last), diagnostic_keys)
+        self.assertEqual(first["schema"], report.DIAGNOSTIC_SCHEMA)
+        self.assertEqual(last["schema"], report.DIAGNOSTIC_SCHEMA)
+        self.assertEqual(first["stage"], "test")
+        self.assertEqual(last["stage"], "teardown")
+        self.assertEqual(first["kind"], "failure")
+        self.assertEqual(last["kind"], "error")
+        self.assertEqual(first["exception_class"], "AssertionError")
+        self.assertEqual(last["exception_class"], "TypeError")
+        self.assertTrue(first["started"])
+        self.assertTrue(last["started"])
+        self.assertEqual(first["case_id"], case_id)
+        self.assertEqual(last["case_id"], case_id)
+        self.assertLessEqual(len(first["frames"]), report.DIAGNOSTIC_FRAME_CAP)
+        self.assertLessEqual(len(last["frames"]), report.DIAGNOSTIC_FRAME_CAP)
+        self.assertEqual(first["frames"], [{
+            "path": REPORT_SOURCE,
+            "line": binding_line,
+            "function": "_binding_value",
+        }])
+        self.assertEqual(last["frames"], [{
+            "path": REPORT_SOURCE,
+            "line": flatten_line,
+            "function": "_flatten",
+        }])
+
+        with mock.patch.object(acceptance, "REQUIRED_CASES", (case_id,)), \
+                mock.patch.object(acceptance, "CASE_DETAILS", {}):
+            payload = report._report_payload(
+                scheduled=(case_id,),
+                result=result,
+                imported=True,
+                containment_owner=ownership.ContainmentOwner(),
+            )
+        case = payload["cases"][0]
+        self.assertEqual(set(case), {
+            "name", "status", "detail", "diagnostic", "first_diagnostic",
+        })
+        self.assertEqual(case["status"], "error")
+        self.assertEqual(case["diagnostic"], last)
+        self.assertEqual(case["first_diagnostic"], first)
+        self.assertEqual(payload["counts"], {
+            "success": 0,
+            "failure": 0,
+            "error": 1,
+            "skipped": 0,
+            "expected_failure": 0,
+            "unexpected_success": 0,
+            "not_run": 0,
+        })
+        self.assertEqual(payload["tests_run"], 1)
+        self.assertEqual(payload["summary"]["error"], 1)
+        self.assertEqual(payload["summary"]["success"], 0)
+        self.assertFalse(payload["cleanup"]["owned_mounts_remaining_known"])
+        self.assertIsNone(payload["cleanup"]["owned_mounts_remaining"])
+        self.assertFalse(payload["passed"])
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["failure_diagnostics"]["unstarted"], [])
+        encoded = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("body-secret", encoded)
+        self.assertNotIn("not iterable", encoded)
 
     def test_class_setup_failure_stays_unstarted_and_separate(self):
         class ClassSetupFailureCase(unittest.TestCase):

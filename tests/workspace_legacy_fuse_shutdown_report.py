@@ -202,6 +202,7 @@ class InventoryResult(unittest.TextTestResult):
         super().__init__(*args, **kwargs)
         self.started_ids = []
         self.diagnostics = {}
+        self.first_diagnostics = {}
         self.unstarted_diagnostics = []
 
     def startTest(self, test):
@@ -228,6 +229,14 @@ class InventoryResult(unittest.TextTestResult):
                 "frames_truncated": False,
             }
         if started:
+            # A case may report more than once (body failure plus teardown
+            # error). Keep the newest projection as ``diagnostic`` and retain
+            # only the first projection separately so the opening failure is
+            # not overwritten.
+            if case_id in self.diagnostics:
+                self.first_diagnostics.setdefault(
+                    case_id, self.diagnostics[case_id]
+                )
             self.diagnostics[case_id] = diagnostic
         else:
             # Class/module setup has no executed case id; keep it separate.
@@ -288,6 +297,9 @@ def _case_inventory(result, scheduled):
     )}
     tests_run = 0
     diagnostics = getattr(result, "diagnostics", None) if result is not None else None
+    first_diagnostics = (
+        getattr(result, "first_diagnostics", None) if result is not None else None
+    )
     if result is not None:
         started_ids = set(getattr(result, "started_ids", ()))
         failure_ids = {test.id() for test, _ in result.failures}
@@ -310,7 +322,7 @@ def _case_inventory(result, scheduled):
                 status = "unexpected_success"
             else:
                 status = "passed"
-            cases.append({
+            case = {
                 "name": name,
                 "status": status,
                 "detail": acceptance.CASE_DETAILS.get(name),
@@ -318,7 +330,10 @@ def _case_inventory(result, scheduled):
                     diagnostics.get(name)
                     if isinstance(diagnostics, dict) else None
                 ),
-            })
+            }
+            if isinstance(first_diagnostics, dict) and name in first_diagnostics:
+                case["first_diagnostic"] = first_diagnostics[name]
+            cases.append(case)
             counts[{"passed": "success", "failed": "failure"}.get(status, status)] += 1
         tests_run = int(result.testsRun)
     return cases, counts, tests_run
