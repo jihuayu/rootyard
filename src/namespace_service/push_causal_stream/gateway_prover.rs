@@ -140,15 +140,12 @@ pub async fn prove_gateway_incoming_pack_closure(
     {
         let resolved_idx = proof_tmp.dir().join("objects/pack/incoming.idx");
         let resolved_pack = proof_tmp.dir().join("objects/pack/incoming.pack");
-        fs::rename(&incoming_path, &resolved_pack)
-            .map_err(|_| GatewayError::Internal("could not move incoming pack into proof sandbox"))?;
-        let idx_str = resolved_idx.to_str().ok_or(GatewayError::Internal("non-utf8 proof idx"))?;
         let pack_str = resolved_pack.to_str().ok_or(GatewayError::Internal("non-utf8 proof pack"))?;
         run_git_bin(
             args.git_binary,
             proof_tmp.dir(),
-            &["index-pack", "--fix-thin", "--strict", "-o", idx_str, pack_str],
-            GitStdin::Null,
+            &["index-pack", "--stdin", "--fix-thin", "--strict", pack_str],
+            GitStdin::File(&incoming_path),
             &proc_limits,
             std_dl,
         )
