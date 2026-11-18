@@ -123,17 +123,21 @@ async fn privileged_scope_drain_query_is_quorum_bound_and_multirepo_complete_bod
     let repo_b = Uuid::new_v4();
     let backend_a = backend_on(&cluster, leader_id, repo_a, tenant, realm.clone(), options).await?;
     let backend_b = backend_on(&cluster, leader_id, repo_b, tenant, realm.clone(), options).await?;
-    assert!(proposal_outcome(&backend_a.propose(init_command(repo_a, tenant, history)).await?).is_applied());
-    assert!(proposal_outcome(&backend_b.propose(init_command(repo_b, tenant, history)).await?).is_applied());
-    let gate_a = backend_a
-        .read_committed_view()
+    let init_a =
+        observe_call(phase, &cluster, Operation::ClientWrite, backend_a.propose(init_command(repo_a, tenant, history)))
+            .await?;
+    assert!(proposal_outcome(&init_a).is_applied());
+    let init_b =
+        observe_call(phase, &cluster, Operation::ClientWrite, backend_b.propose(init_command(repo_b, tenant, history)))
+            .await?;
+    assert!(proposal_outcome(&init_b).is_applied());
+    let gate_a = observe_call(phase, &cluster, Operation::ReadView, backend_a.read_committed_view())
         .await?
         .read_gate_version()?
         .context("repo A gate after init")?
         .digest()
         .as_hex();
-    let gate_b = backend_b
-        .read_committed_view()
+    let gate_b = observe_call(phase, &cluster, Operation::ReadView, backend_b.read_committed_view())
         .await?
         .read_gate_version()?
         .context("repo B gate after init")?
