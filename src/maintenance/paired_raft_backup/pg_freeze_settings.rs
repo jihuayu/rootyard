@@ -11,9 +11,6 @@ use crate::config::Config;
 use super::pg_cutpoint::pg_err;
 use super::types::PairedBackupError;
 
-const CLIENT_BACKEND_STATES: &str =
-    "'active','idle in transaction','idle in transaction (aborted)','fastpath function call'";
-
 /// Database-wide durable freeze setting stored in PostgreSQL `pg_db_role_setting`
 /// (outside the `public` schema catalog so `schema 151` / `format 30` stays unmodified).
 pub const PG_FREEZE_SETTING: &str = "rootyard.paired_backup_freeze";
@@ -82,7 +79,7 @@ pub async fn terminate_and_await_other_pg_sessions(
         .query(
             "SELECT pid, pg_terminate_backend(pid) FROM pg_stat_activity \
              WHERE datname = current_database() AND pid <> pg_backend_pid() \
-               AND backend_type = 'client backend'",
+               AND (backend_type = 'client backend' OR backend_type IS NULL)",
             &[],
         )
         .await
@@ -118,13 +115,13 @@ async fn remaining_other_client_backends(
     terminated_pids: &[i32],
 ) -> Result<i64, PairedBackupError> {
     let pids: Vec<i32> = terminated_pids.to_vec();
-    let sql = format!(
-        "SELECT count(*)::bigint FROM pg_stat_activity \
+    let sql = "SELECT count(*)::bigint FROM pg_stat_activity \
          WHERE datname = current_database() AND pid <> pg_backend_pid() \
-           AND backend_type = 'client backend' \
-           AND (pid = ANY($1) OR backend_xid IS NOT NULL OR state IN ({CLIENT_BACKEND_STATES}))"
-    );
-    let count: i64 = client.query_one(&sql, &[&pids]).await.map_err(pg_err)?.get(0);
+           AND (backend_type = 'client backend' OR backend_type IS NULL) \
+           AND (pid = ANY($1) OR backend_xid IS NOT NULL OR state IS NULL \
+                OR state IN ('active', 'idle in transaction', 'idle in transaction (aborted)', \
+                             'fastpath function call'))";
+    let count: i64 = client.query_one(sql, &[&pids]).await.map_err(pg_err)?.get(0);
     Ok(count)
 }
 
@@ -132,8 +129,9 @@ async fn remaining_other_client_backends(
 pub async fn verify_no_active_pg_writers(client: &(impl GenericClient + Sync)) -> Result<(), PairedBackupError> {
     let sql = "SELECT count(*)::bigint FROM pg_stat_activity \
          WHERE datname = current_database() AND pid <> pg_backend_pid() \
-           AND backend_type = 'client backend' \
+           AND (backend_type = 'client backend' OR backend_type IS NULL) \
            AND (backend_xid IS NOT NULL \
+                OR state IS NULL \
                 OR state IN ('active','idle in transaction','idle in transaction (aborted)'))";
     let count: i64 = client.query_one(sql, &[]).await.map_err(pg_err)?.get(0);
     if count != 0 {

@@ -168,8 +168,14 @@ pub struct PeerAttestationConfig {
     pub data_dir: PathBuf,
     pub raft_node_addr: String,
     pub ca_cert_pem: PathBuf,
+    /// TLS server leaf for this daemon (`DNS:raft-node-{id}.refcas.internal`), whose
+    /// SHA-256 is also the pinned voter identity.
     pub node_cert_pem: PathBuf,
     pub node_key_pem: PathBuf,
+    /// mTLS client leaf for calling the local `raft-node` control RPCs
+    /// (`Metrics`, `InspectReplicaKv`), which require `DNS:raft-client.refcas.internal`.
+    pub raft_client_cert_pem: PathBuf,
+    pub raft_client_key_pem: PathBuf,
     pub rpc_timeout: Duration,
 }
 
@@ -221,8 +227,8 @@ impl PeerAttestationDaemon {
             voter_endpoints: BTreeMap::new(),
             attestor_endpoints: BTreeMap::new(),
             ca_cert_pem: cfg.ca_cert_pem.clone(),
-            client_cert_pem: cfg.node_cert_pem.clone(),
-            client_key_pem: cfg.node_key_pem.clone(),
+            client_cert_pem: cfg.raft_client_cert_pem.clone(),
+            client_key_pem: cfg.raft_client_key_pem.clone(),
             rpc_timeout: cfg.rpc_timeout,
         })?;
         let voter_id = derive_voter_uuid_bound(cfg.group_id, cfg.node_id, &cert_sha256, &pubkey_hex);

@@ -348,22 +348,32 @@ pub(super) fn attest_group_cutpoint(
         let Some(binding) = raft.voter_bindings.get(&node_id) else {
             continue;
         };
-        let Ok((response, _cert_sha)) = mtls_rpc_call(
-            &raft.tls_cfg,
-            endpoint,
-            node_id,
-            &json!({ "AttestCutpoint": {
-                "group_id": raft.cfg.group_id,
-                "group_epoch": group_epoch,
-                "expected_seq": applied.index,
-                "expected_state_digest": state_digest,
-                "expected_snapshot_checksum": snapshot.checksum.as_str(),
-            }}),
-            raft.cfg.rpc_timeout,
-        ) else {
-            continue;
-        };
-        let Ok(attestation) = decode_attestation(&response, "cutpoint") else {
+        let mut attested = None;
+        for attempt in 0..10 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            let Ok((response, _cert_sha)) = mtls_rpc_call(
+                &raft.tls_cfg,
+                endpoint,
+                node_id,
+                &json!({ "AttestCutpoint": {
+                    "group_id": raft.cfg.group_id,
+                    "group_epoch": group_epoch,
+                    "expected_seq": applied.index,
+                    "expected_state_digest": state_digest,
+                    "expected_snapshot_checksum": snapshot.checksum.as_str(),
+                }}),
+                raft.cfg.rpc_timeout,
+            ) else {
+                continue;
+            };
+            if let Ok(attestation) = decode_attestation(&response, "cutpoint") {
+                attested = Some(attestation);
+                break;
+            }
+        }
+        let Some(attestation) = attested else {
             continue;
         };
         let claims = &attestation.claims;

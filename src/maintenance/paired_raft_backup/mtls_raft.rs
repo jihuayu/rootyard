@@ -320,9 +320,9 @@ impl MtlsLiveRaftBackend {
         commit_raft_idx: u64,
         command_sha256: &str,
     ) -> Result<Vec<VoterWalAck>, PairedBackupError> {
-        for attempt in 0..2 {
+        for attempt in 0..15 {
             if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(Duration::from_millis(80));
             }
             let (infos, _) = self.probe_live_voters()?;
             let mut acks = Vec::new();

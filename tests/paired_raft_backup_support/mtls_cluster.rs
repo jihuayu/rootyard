@@ -297,6 +297,8 @@ impl LiveMtlsRaftGroup {
                 ca_cert_pem: pki.ca_cert.clone(),
                 node_cert_pem: cert,
                 node_key_pem: key,
+                raft_client_cert_pem: pki.client_cert.clone(),
+                raft_client_key_pem: pki.client_key.clone(),
                 rpc_timeout: Duration::from_secs(4),
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -398,6 +400,8 @@ impl LiveMtlsRaftGroup {
                 ca_cert_pem: self.pki.ca_cert.clone(),
                 node_cert_pem: cert,
                 node_key_pem: key,
+                raft_client_cert_pem: self.pki.client_cert.clone(),
+                raft_client_key_pem: self.pki.client_key.clone(),
                 rpc_timeout: Duration::from_secs(4),
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
