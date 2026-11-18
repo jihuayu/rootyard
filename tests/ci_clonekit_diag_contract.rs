@@ -56,7 +56,7 @@ fn pre_marks_precede_eager_empty_init_and_corrupt_build() {
     assert!(corrupt_phase < corrupt_build, "corrupt phase must be marked before the eager corrupt build");
 
     let publication_mark =
-        SUPPORT.find("diag.mark(crate::ck_diag::Phase::CorruptPublicationPreservesLatest").expect("publication mark");
+        SUPPORT.find("diag.mark($crate::ck_diag::Phase::CorruptPublicationPreservesLatest").expect("publication mark");
     let publish = SUPPORT.find("publish_clonekit_versioned(&store, &b2").expect("publish");
     let latest = SUPPORT.find("expect(\"latest\")").expect("latest expect");
     assert!(publication_mark < publish, "publication phase must be marked before publish");
