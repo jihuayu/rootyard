@@ -1,4 +1,4 @@
-"""Offline source checks for the schema 152 late-cancellation contract."""
+"""Offline source checks for schema 152 slot-zero and late-cancellation evidence."""
 from pathlib import Path
 import re
 import unittest
@@ -12,6 +12,30 @@ if not MIGRATION.is_file():
 
 
 class LateCancellationSourceTest(unittest.TestCase):
+    def test_slot_zero_fixture_reserves_after_mapping_and_requires_exact_binding(self):
+        sql = (FIXTURES / 'ref_store_schema152_late_cancellation.sql').read_text()
+        admission = sql.split('FOREACH scenario IN ARRAY', 1)[1].split('SET CONSTRAINTS ALL IMMEDIATE;', 1)[0]
+        steps = [
+            'rootyard_ref_store_lock_public_operation(repo, public_op, private_op)',
+            "CASE WHEN scenario = 'pending' THEN 0 ELSE 2 END",
+            'SELECT last_reserved_sequence + 1 INTO STRICT initial_sequence',
+            'FOR UPDATE;',
+            'INSERT INTO ref_store_public_operations',
+            'INSERT INTO ref_store_private_attempts',
+            'SET last_reserved_sequence = initial_sequence',
+            'AND last_reserved_sequence = initial_sequence - 1',
+            'VALUES (repo, issuer, scenario, initial_sequence, private_op, parent_digest,',
+            'FOREACH wrong_wire IN ARRAY ARRAY[NULL::text, proof_digest]',
+            'IF wrong_wire IS NOT NULL THEN',
+            'VALUES (repo, private_op, issuer, wrong_wire, parent_digest)',
+            'SET CONSTRAINTS ref_store_private_attempt_evidence IMMEDIATE;',
+            'EXCEPTION WHEN check_violation THEN',
+            "IF failed_constraint IS DISTINCT FROM 'ref_store_public_attempt_evidence' THEN RAISE; END IF;",
+            'VALUES (repo, private_op, issuer, wire_digest, parent_digest)',
+        ]
+        positions = [admission.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions))
+
     def test_wrapper_evidence_distinguishes_late_and_winning_tombstones(self):
         sql = MIGRATION.read_text()
         verifier = sql.split('CREATE FUNCTION rootyard_ref_store_verify_public_operation(', 1)[1].split('END $$;', 1)[0]

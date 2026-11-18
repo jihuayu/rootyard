@@ -25,6 +25,7 @@ DECLARE
     next_op uuid;
     audit_event uuid;
     scope_revision bigint;
+    initial_sequence bigint;
     scenario text;
     winner text;
     receipt jsonb;
@@ -32,6 +33,7 @@ DECLARE
     before_event jsonb;
     before_wrapper jsonb;
     wrong_key text;
+    wrong_wire text;
     failed_constraint text;
 BEGIN
     INSERT INTO users(id, username) VALUES (issuer, 'issue42-cancel-probe');
@@ -56,15 +58,46 @@ BEGIN
         PERFORM rootyard_ref_store_lock_public_operation(repo, public_op, private_op);
         SELECT revision INTO STRICT scope_revision FROM ref_store_core_gates WHERE repository_id = repo;
         INSERT INTO ref_store_issuer_lanes(repository_id, issuer_id, lane, last_reserved_sequence)
-        VALUES (repo, issuer, scenario, 2);
+        VALUES (repo, issuer, scenario, CASE WHEN scenario = 'pending' THEN 0 ELSE 2 END);
+        initial_sequence := 1;
+        IF scenario = 'pending' THEN
+            SELECT last_reserved_sequence + 1 INTO STRICT initial_sequence
+            FROM ref_store_issuer_lanes
+            WHERE (repository_id, issuer_id, lane) = (repo, issuer, scenario)
+            FOR UPDATE;
+        END IF;
         INSERT INTO ref_store_public_operations(repository_id, public_id, admission_owner_id, issuer_id, wire_digest,
                                                 request_mode, backend_identity, object_format, history_incarnation,
                                                 authority_epoch, group_epoch, restore_incarnation)
         SELECT repo, public_op, issuer, issuer, wire_digest, 'atomic', backend, 'sha1', history, 1, 1, incarnation
         FROM public.cluster_authority WHERE singleton;
         INSERT INTO ref_store_private_attempts VALUES (repo, public_op, 0, private_op, parent_digest, proof_digest, scope_revision);
+        IF scenario = 'pending' THEN
+            UPDATE ref_store_issuer_lanes SET last_reserved_sequence = initial_sequence, updated_at = clock_timestamp()
+            WHERE (repository_id, issuer_id, lane) = (repo, issuer, scenario)
+                AND last_reserved_sequence = initial_sequence - 1;
+            IF NOT FOUND OR initial_sequence <> 1 THEN
+                RAISE EXCEPTION 'slot zero must reserve the first issuer sequence after mapping';
+            END IF;
+        END IF;
         INSERT INTO ref_store_operations(repository_id, issuer_id, lane, sequence, operation_id, request_digest, state)
-        VALUES (repo, issuer, scenario, 1, private_op, parent_digest, 'pending');
+        VALUES (repo, issuer, scenario, initial_sequence, private_op, parent_digest, 'pending');
+        IF scenario = 'pending' THEN
+            FOREACH wrong_wire IN ARRAY ARRAY[NULL::text, proof_digest] LOOP
+                BEGIN
+                    IF wrong_wire IS NOT NULL THEN
+                        INSERT INTO ref_store_serving_operations
+                            (repository_id, operation_id, issuer_id, producer_request_digest, plan_parent_digest)
+                        VALUES (repo, private_op, issuer, wrong_wire, parent_digest);
+                    END IF;
+                    SET CONSTRAINTS ref_store_private_attempt_evidence IMMEDIATE;
+                    RAISE EXCEPTION 'slot zero accepted an absent or wrong producer binding';
+                EXCEPTION WHEN check_violation THEN
+                    GET STACKED DIAGNOSTICS failed_constraint = CONSTRAINT_NAME;
+                    IF failed_constraint IS DISTINCT FROM 'ref_store_public_attempt_evidence' THEN RAISE; END IF;
+                END;
+            END LOOP;
+        END IF;
         INSERT INTO ref_store_serving_operations(repository_id, operation_id, issuer_id, producer_request_digest, plan_parent_digest)
         VALUES (repo, private_op, issuer, wire_digest, parent_digest);
         SET CONSTRAINTS ALL IMMEDIATE;
