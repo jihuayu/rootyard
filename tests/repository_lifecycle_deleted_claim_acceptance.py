@@ -1057,7 +1057,6 @@ class DeletedClaimAcceptanceHarness(RepositoryLifecycleHarness):
             assert json.loads(raw) == {"error": "not found"}, self.redact(raw[:300])
             assert headers.get("cache-control") == "no-store", headers
             after = self.checkout_rows()
-            # The original grant must survive unchanged, with no newly minted rows.
             assert after == before, (before, after)
             after_run = self.run_row(deleted["id"])
             assert after_run["attempt"] == before_run["attempt"], (before_run, after_run)
