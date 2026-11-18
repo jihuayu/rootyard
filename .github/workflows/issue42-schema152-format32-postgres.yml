@@ -1,0 +1,485 @@
+name: Issue 42 schema 152 format 32 qualification
+
+on:
+  push:
+    branches: [codex/goal-issue42-original-ac-source-audit-20261117]
+    paths: [.github/workflows/issue42-schema152-format32-postgres.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  format32:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 130
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: rootyard_protocol
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_protocol"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PRODUCT_SHA: 1570316ae1954fdc553d67fc652e8b6a8e03bf60
+      PRODUCT_TREE: 1d1d8434e941b7ea4e91e0728369e0be7beef2d3
+      WORKFLOW_PATH: .github/workflows/issue42-schema152-format32-postgres.yml
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONOPTIMIZE: ''
+    defaults:
+      run:
+        shell: bash
+        working-directory: product
+    steps:
+      - name: Check out the exact workflow source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        timeout-minutes: 3
+        with:
+          ref: ${{ github.sha }}
+          path: workflow-source
+          persist-credentials: false
+      - name: Check out the pinned product source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        timeout-minutes: 3
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          persist-credentials: false
+      - name: Verify both exact source roles
+        timeout-minutes: 2
+        run: |
+          workflow_source="$GITHUB_WORKSPACE/workflow-source"
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/codex/goal-issue42-original-ac-source-audit-20261117
+          test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$WORKFLOW_PATH@$GITHUB_REF"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test "$(git -C "$workflow_source" rev-parse HEAD)" = "$GITHUB_SHA"
+          workflow_status=$(git -C "$workflow_source" status --porcelain=v1 --untracked-files=all)
+          test -z "$workflow_status"
+          git -C "$workflow_source" cat-file -e "HEAD:$WORKFLOW_PATH"
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          product_status=$(git status --porcelain=v1 --untracked-files=all)
+          test -z "$product_status"
+          umask 077
+          mkdir -- "$RUNNER_TEMP/issue42-format32" "$RUNNER_TEMP/issue42-format32-evidence"
+      - name: Set up the project Python version
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        timeout-minutes: 3
+        with:
+          python-version: '3.12'
+      - name: Install the existing native tools and pinned Rust and CargoFork
+        timeout-minutes: 24
+        run: |
+          work="$RUNNER_TEMP/issue42-format32"
+          if ! bash -euo pipefail -c '
+            work=$1
+            scripts/install_ci_native_tools.sh install --prefix "$work/native-tools"
+            echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
+            rustup toolchain install 1.99.1 --profile minimal
+            rustup default 1.99.1
+            scripts/install_ci_cargo_fork.sh install --cache-dir "$work/cargo-fork" --require-os linux
+            python3 -m pip install --disable-pip-version-check -r tests/requirements-blob-backup.txt
+          ' _ "$work" >/dev/null 2>&1; then
+            echo 'Format 32 tool installation failed' >&2
+            exit 1
+          fi
+      - name: Build the immutable product CLI and paired-backup seed fixture
+        timeout-minutes: 43
+        run: |
+          work="$RUNNER_TEMP/issue42-format32"
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          product_status=$(git status --porcelain=v1 --untracked-files=all)
+          test -z "$product_status"
+          if ! bash -euo pipefail -c '
+            work=$1
+            scripts/install_ci_cargo_fork.sh verify --cache-dir "$work/cargo-fork" --require-os linux --require-path
+            unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+            export CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0
+            python3 -B scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo \
+              --artifact-store "$work/store" --output "$work/rootyard"
+            python3 -B scripts/build_native_test.py --test ref_store_format22_backup_fixture \
+              --features pando-lab,format22-fixture --no-default-features --package-debug 0 --strip-debuginfo \
+              --artifact-store "$work/store" --output "$work/fixture"
+          ' _ "$work" >/dev/null 2>&1; then
+            echo 'Format 32 prebuilt artifacts failed' >&2
+            exit 1
+          fi
+          for path in "$work/rootyard" "$work/fixture"; do
+            [[ -f "$path" && -x "$path" && ! -w "$path" && ! -L "$path" ]]
+            [[ -f "$path.build.json" && ! -w "$path.build.json" && ! -L "$path.build.json" ]]
+          done
+          product_status=$(git status --porcelain=v1 --untracked-files=all)
+          test -z "$product_status"
+      - name: Verify owned PostgreSQL and start the private Garage fixture
+        timeout-minutes: 9
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/issue42-format32"
+          [[ "$PG_CONTAINER" =~ ^[0-9a-f]{64}$ ]]
+          test "$(docker port "$PG_CONTAINER" 5432/tcp 2>/dev/null)" = 127.0.0.1:55432
+          cat > "$work/check-pg.sh" <<'SH'
+          set -euo pipefail
+          env -i PATH="$PATH" PGHOST=127.0.0.1 PGPORT=55432 PGUSER=rootyard PGDATABASE=rootyard_protocol \
+            PGSSLMODE=disable PGCONNECT_TIMEOUT=5 timeout 15s psql -XqAt -v ON_ERROR_STOP=1 2>/dev/null <<'SQL'
+          SELECT current_setting('server_version_num') || '|' || (
+            session_user = 'rootyard' AND current_database() = 'rootyard_protocol' AND
+            (SELECT array_agg(datname::text ORDER BY datname::text COLLATE "C") FROM pg_catalog.pg_database)
+              = ARRAY['postgres','rootyard_protocol','template0','template1']
+          )::text;
+          SQL
+          SH
+          before=$(bash "$work/check-pg.sh")
+          [[ "$before" =~ ^17[0-9]{4}\|true$ ]]
+          printf '%s\n' "$before" > "$work/pg-before"
+          if ! ROOTYARD_FIXTURE_PULL_TIMEOUT=120 timeout --signal=TERM --kill-after=20s 450s \
+            scripts/owned_garage_fixture.sh start --directory "$work/garage" --output-env "$work/garage.env" \
+            --bucket-prefix rootyard-format32 --region garage >/dev/null 2>&1; then
+            echo 'Format 32 owned Garage setup failed' >&2
+            exit 1
+          fi
+          cid=$(sed -n 's/^container_id=//p' "$work/garage/.rootyard-owned-fixture")
+          [[ "$cid" =~ ^[0-9a-f]{64}$ ]]
+          test "$(docker port "$cid" 3900/tcp 2>/dev/null)" = 127.0.0.1:3900
+          printf '%s\n' "$cid" > "$work/garage-container"
+      - name: Qualify the full format 32 paired recovery inventory
+        timeout-minutes: 28
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/issue42-format32"
+          workflow_source="$GITHUB_WORKSPACE/workflow-source"
+          mkdir -- "$work/fixtures"
+          EVENT_TREE=$(git -C "$workflow_source" rev-parse "$GITHUB_SHA^{tree}")
+          WORKFLOW_DIGEST=$(git -C "$workflow_source" show "$GITHUB_WORKFLOW_SHA:$WORKFLOW_PATH" | sha256sum | cut -d ' ' -f 1)
+          export EVENT_TREE WORKFLOW_DIGEST
+          export ROOTYARD_EXPECTED_SOURCE_COMMIT="$PRODUCT_SHA"
+          export ROOTYARD_TEST_DATABASE_URL=postgresql://rootyard@127.0.0.1:55432/rootyard_protocol
+          export ROOTYARD_GIT=$(command -v git)
+          unset ROOTYARD_RESTORE_TEST_DATABASE_URL ROOTYARD_TEST_EVIDENCE_DIR
+          [[ -f "$work/garage.env" && ! -L "$work/garage.env" ]]
+          test "$(stat -c '%a' "$work/garage.env")" = 600
+          set -a
+          . "$work/garage.env"
+          set +a
+          test "$ROOTYARD_OBJECT_STORE_ENDPOINT" = http://127.0.0.1:3900
+          [[ "$ROOTYARD_OBJECT_STORE_BUCKET" == "rootyard-format32-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-"* ]]
+          test "$ROOTYARD_OBJECT_STORE_REGION" = garage
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3 ROOTYARD_BLOB_DELETE=disabled
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET" ROOTYARD_BLOB_REGION=garage
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="format32-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export AWS_EC2_METADATA_DISABLED=true
+          cat > "$work/project.py" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          sys.path.insert(0, str(Path.cwd() / "scripts"))
+          from native_build_receipt import load_receipt, sha256_file
+
+          CASES = (
+              "real_http_sha1_sha256_source_without_persistent_bare",
+              "offline_volume_and_postgres_snapshot_barriers",
+              "incomplete_and_damaged_archives_rejected_before_sql",
+              "existing_database_and_directory_targets_refused",
+              "corrupt_source_missing_pack_refused_before_publication",
+              "corrupt_source_missing_idx_refused_before_publication",
+              "corrupt_source_missing_all_artifacts_refused_before_publication",
+              "corrupt_source_wrong_artifact_set_digest_refused_before_publication",
+              "corrupt_source_missing_hold_refused_before_publication",
+              "corrupt_source_mismatched_hold_locator_refused_before_publication",
+              "post_backup_acknowledged_write_excluded",
+              "fresh_database_restore_clone_refs_content_fsck",
+              "restored_exact_receive_replay_without_second_effect",
+              "format22_active_released_roots_distinct_producer_roundtrip",
+          )
+          GARAGE_DIGEST = "sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a"
+          CARGO_FORK = "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"
+          MESSAGE_FORMAT = "--message-format=json-render-diagnostics"
+          STRIP = 'strip="debuginfo"'
+          DEBUG = "debug=0"
+          CLI = ["cargo", "build", "--locked", "--no-default-features", "--config",
+                 "profile.dev.package.rootyard." + DEBUG, "--bin", "rootyard", "--config",
+                 "profile.dev.package.rootyard." + STRIP, MESSAGE_FORMAT, "--jobs", "2"]
+          FIXTURE = ["cargo", "--config", "profile.dev.package.rootyard." + DEBUG,
+                     "--config", "profile.test.package.rootyard." + DEBUG,
+                     "--config", "profile.dev.package.rootyard." + STRIP,
+                     "--config", "profile.test.package.rootyard." + STRIP,
+                     "rustc", "--locked", "--profile", "test", "--test", "ref_store_format22_backup_fixture",
+                     "--features", "pando-lab,format22-fixture", "--no-default-features", MESSAGE_FORMAT, "--jobs", "2"]
+
+          def need(condition):
+              if not condition:
+                  raise ValueError("invalid format 32 qualification evidence")
+
+          def unique(pairs):
+              result = dict(pairs)
+              need(len(result) == len(pairs))
+              return result
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], timeout=10, stderr=subprocess.DEVNULL, text=True).strip()
+
+          def artifact(work, name, kind, command, features, head, tree):
+              binary = work / name
+              receipt = load_receipt(binary.with_suffix(".build.json"), binary_path=binary,
+                                     expected_commit=head, source_root=Path.cwd(), verify_source_files=True)
+              payload = receipt.payload
+              need(receipt.schema == "v2" and payload["git_head"] == head
+                   and payload["working_tree"] == {"tree": tree, "status": ""})
+              need(payload["kind"] == kind and payload["relocated_artifact"] is True
+                   and payload["command"] == command
+                   and payload["features"] == {"enabled": features, "no_default_features": True})
+              need(receipt.toolchain["rustc"]["release"] == "1.99.1" and
+                   receipt.toolchain["cargo"]["release"] == "1.101.0" and
+                   receipt.toolchain["cargo"]["commit_hash"] == CARGO_FORK)
+              need(payload["cargo_lock_sha256"] == sha256_file(Path("Cargo.lock")))
+              identity = {"binary_sha256": receipt.binary_sha256, "receipt_sha256": receipt.receipt_sha256,
+                          "source_inputs_sha256": receipt.source_inputs_sha256}
+              if name == "fixture":
+                  source = Path("tests/ref_store_format22_backup_fixture.rs")
+                  need(payload["integration_test_source"] == source.as_posix()
+                       and payload["integration_test_source_sha256"] == sha256_file(source))
+                  identity["fixture_source_sha256"] = payload["integration_test_source_sha256"]
+              return identity
+
+          def provenance(work):
+              head, tree = os.environ["PRODUCT_SHA"], os.environ["PRODUCT_TREE"]
+              event = os.environ["GITHUB_SHA"]
+              workflow = os.environ["GITHUB_WORKFLOW_SHA"]
+              event_tree = os.environ["EVENT_TREE"]
+              workflow_digest = os.environ["WORKFLOW_DIGEST"]
+              need(all(re.fullmatch(r"[0-9a-f]{40}", value) for value in (head, tree, event, workflow, event_tree)))
+              need(event == workflow and event != head and re.fullmatch(r"[0-9a-f]{64}", workflow_digest))
+              need(git("rev-parse", "HEAD") == head and git("rev-parse", "HEAD^{tree}") == tree
+                   and not git("status", "--porcelain=v1", "--untracked-files=all"))
+              cli = artifact(work, "rootyard", "native-binary", CLI, [], head, tree)
+              fixture = artifact(work, "fixture", "rust-integration-test", FIXTURE, ["pando-lab", "format22-fixture"], head, tree)
+              need(cli["source_inputs_sha256"] == fixture["source_inputs_sha256"])
+              garage = json.loads((work / "garage/garage-image.json").read_bytes())
+              pg = (work / "pg-before").read_text().strip()
+              need(garage["image_digest"] == GARAGE_DIGEST and garage["version"] == "2.1.0"
+                   and re.fullmatch(r"17[0-9]{4}\|true", pg))
+              return {"event_head": event, "event_tree": event_tree, "workflow_head": workflow,
+                      "workflow_sha256": workflow_digest, "source_head": head, "source_tree": tree,
+                      "cargo_lock_sha256": sha256_file(Path("Cargo.lock")), "binary_sha256": cli["binary_sha256"],
+                      "git_sha256": sha256_file(Path(os.environ["ROOTYARD_GIT"]).resolve()),
+                      "cli": cli, "fixture": fixture, "garage_image_digest": GARAGE_DIGEST,
+                      "postgres_version_num": int(pg.split("|")[0]),
+                      "harness_sha256": sha256_file(Path("tests/backup_blob_serving147.py")),
+                      "blob_only_service_sha256": sha256_file(Path("tests/blob_only_service.py")),
+                      "format22_support_sha256": sha256_file(Path("tests/backup_blob_serving169_support.py"))}
+
+          def recovery(entries):
+              source, cut = entries[CASES[0]], entries[CASES[1]]
+              need(source["formats"] == ["sha1", "sha256"] and source["owned_databases"] == 2
+                   and source["real_git_push_clone_fsck"] is True and source["no_persistent_bare"] is True)
+              need(cut["format"] == 32 and cut["schema"] == 152 and cut["blob_bytes_in_archive"] is True)
+              artifacts = cut["closure_artifacts"]
+              need(type(artifacts) is int and 4 <= artifacts <= 1024 and artifacts % 2 == 0)
+              for name in CASES[4:10]:
+                  negative = entries[name]
+                  need(all(negative[key] is True for key in ("clone_dropped", "failed_closed",
+                                                            "original_blob_objects_intact", "api_source_unchanged")))
+              need(entries[CASES[9]]["all_negatives_refused_by_validator"] is True
+                   and entries[CASES[9]]["untouched_target_restored"] is True
+                   and entries[CASES[9]]["restored_closure_artifacts"] == artifacts)
+              restored = entries[CASES[11]]
+              need(restored["formats"] == ["sha1", "sha256"]
+                   and restored["restore_gate"] == "parked-pg_restore-exclusive-lock-proven"
+                   and all(restored[key] is True for key in (
+                       "fresh_database", "exact_refs_content_fsck", "same_backend_identity",
+                       "original_blob_objects_deleted_before_restore", "independent_blob_closure_restore",
+                       "post_boundary_commit_excluded", "source_scratch_deleted")))
+              need(all(entries[CASES[12]][key] is True for key in (
+                  "exact_original_report", "ledger_counters_unchanged", "immutable_rows_unchanged")))
+              roots = entries[CASES[13]]
+              archive, restored_roots = roots["archive"], roots["restore"]
+              need(roots["format"] == archive["format"] == 32
+                   and archive["member_paths_exact"] is True and archive["pair_identity_shared"] is True
+                   and restored_roots["restored"] is True and restored_roots["verify"] is True
+                   and restored_roots["artifacts"] == archive["closure_artifacts"]
+                   and restored_roots["producer_distinct_from_tenant"] is True)
+              active, released = restored_roots["active_roots"], restored_roots["released_roots"]
+              packs = restored_roots["serving_read"]["verified_pairs"]
+              need(all(type(value) is int and 1 <= value <= 1024 for value in (active, released, packs)))
+              return {"archive_format": 32, "schema_version": 152, "git_formats": ["sha1", "sha256"],
+                      "closure_artifacts": artifacts, "corruption_cases": 6, "clean_archive_restored_after_refusals": True,
+                      "same_backend_reconstructed_after_deletion": True, "restored_refs_content_fsck": True,
+                      "post_boundary_write_excluded": True, "exact_replay_without_new_effects": True,
+                      "active_roots": active, "released_roots": released, "verified_serving_read_pairs": packs}
+
+          def project(raw, binding):
+              need(len(raw) <= 65536)
+              body, exit_code, tail = raw.rsplit(b"\n", 2) if raw.count(b"\n") >= 2 else (b"", raw.strip(), b"")
+              need(not tail and re.fullmatch(rb"[0-9]{1,3}", exit_code) and int(exit_code) <= 255)
+              index = body.find(b"\n{")
+              if body.startswith(b"{"):
+                  prefix, content = [], body
+              elif index >= 0:
+                  prefix, content = body[:index].splitlines(), body[index + 1:]
+              else:
+                  prefix, content = body.splitlines(), b""
+              need(prefix == [f"{case}: passed".encode() for case in CASES[:len(prefix)]])
+              report = json.loads(content, object_pairs_hook=unique) if content else None
+              passed = exit_code == b"0"
+              rows, details = [], {}
+              if report is not None:
+                  need(report["kind"] == "rootyard/paired-blob-backup-restore-acceptance" and report["passed"] is passed)
+                  need(report["expected_cases"] == list(CASES) and report["skips"] == 0 and report["ci_release_gate"] is False)
+                  observed = report["cases"]
+                  need(isinstance(observed, list) and len(observed) <= len(CASES) + 1)
+                  if observed and observed[-1]["name"] == "cleanup":
+                      need(not passed and observed[-1]["status"] == "failed")
+                      observed = observed[:-1]
+                  need(len(observed) <= len(CASES) and len(prefix) <= len(observed) <= len(prefix) + 1)
+                  for i, row in enumerate(observed):
+                      name = CASES[i]
+                      status = "passed" if i < len(prefix) else "failed"
+                      need(row["name"] == name and row["status"] == status)
+                      if status == "passed":
+                          need(not row.get("error") and not row.get("trace"))
+                          details[name] = row["detail"]
+                      rows.append({"name": name, "status": status})
+              else:
+                  need(not passed)
+                  rows = [{"name": name, "status": "passed"} for name in CASES[:len(prefix)]]
+              proof = None
+              if passed:
+                  need(report is not None and len(prefix) == len(CASES)
+                       and report["qualification_kind"] == "clean-candidate"
+                       and report["independent_blob_closure_backup_claimed"] is True
+                       and not any(field in report for field in ("error", "binding_error", "retained_directory", "fixture_unavailable")))
+                  for key in ("source_head", "binary_sha256", "git_sha256", "harness_sha256",
+                              "blob_only_service_sha256", "format22_support_sha256"):
+                      need(report[key] == binding[key])
+                  need(report["source_inputs_sha256"] == binding["cli"]["source_inputs_sha256"])
+                  need(report["format22_fixture"] == {
+                      "workspace_commit": binding["source_head"],
+                      "binary_sha256": binding["fixture"]["binary_sha256"],
+                      "source_inputs_sha256": binding["fixture"]["source_inputs_sha256"],
+                      "integration_test_source_sha256": binding["fixture"]["fixture_source_sha256"],
+                  })
+                  proof = recovery(details)
+              projected = rows + [{"name": name, "status": "not_run"} for name in CASES[len(rows):]]
+              return {"schema": "rootyard/issue42-format32-hosted/v1", "harness_passed": passed,
+                      "producer_exit": int(exit_code), "cases": projected, "recovery": proof, **binding}
+
+          def main():
+              mode, root = sys.argv[1:]
+              work = Path(root)
+              pinned = work / "provenance.json"
+              binding = provenance(work)
+              if mode == "bind":
+                  pinned.write_text(json.dumps(binding))
+              else:
+                  need(mode == "report" and binding == json.loads(pinned.read_text()))
+                  result = project(sys.stdin.buffer.read(65537), binding)
+                  (work / "candidate.json").write_text(json.dumps(result, sort_keys=True, separators=(",", ":")))
+
+          if __name__ == "__main__":
+              main()
+          PY
+          if ! python3 -B -I "$work/project.py" bind "$work" >/dev/null 2>&1; then
+            echo 'Format 32 provenance rejected before execution' >&2
+            exit 1
+          fi
+          set +e
+          (
+            TMPDIR="$work/fixtures" timeout --signal=TERM --kill-after=30s 1500s \
+              python3 -B tests/backup_blob_serving147.py --binary "$work/rootyard" --git "$ROOTYARD_GIT" \
+              --format22-fixture "$work/fixture" 2>/dev/null
+            status=$?
+            printf '%s\n' "$status"
+            exit "$status"
+          ) | python3 -B -I "$work/project.py" report "$work" 2>/dev/null
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          if (( statuses[0] != 0 || statuses[1] != 0 )); then
+            echo 'Format 32 paired recovery or evidence validation failed' >&2
+            if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+            exit "${statuses[1]}"
+          fi
+      - name: Verify and seal owned cleanup evidence
+        if: always()
+        timeout-minutes: 5
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/issue42-format32"
+          evidence="$RUNNER_TEMP/issue42-format32-evidence"
+          test -d "$work" || exit 0
+          garage=false postgres=false fixtures=false removed=false
+          if timeout --kill-after=10s 120s "$GITHUB_WORKSPACE/product/scripts/owned_garage_fixture.sh" \
+              stop --directory "$work/garage" >/dev/null 2>&1 &&
+              [[ ! -e "$work/garage" && ! -L "$work/garage" && ! -e "$work/garage.env" && ! -L "$work/garage.env" ]]; then
+            garage=true
+            if [[ -f "$work/garage-container" ]]; then
+              cid=$(<"$work/garage-container")
+              if ! [[ "$cid" =~ ^[0-9a-f]{64}$ ]] ||
+                  ! remaining=$(docker ps -aq --no-trunc --filter "id=$cid" 2>/dev/null) || [[ -n "$remaining" ]]; then
+                garage=false
+              fi
+            fi
+          fi
+          if [[ -f "$work/pg-before" ]] && after=$(bash "$work/check-pg.sh") && [[ "$after" == "$(<"$work/pg-before")" ]]; then
+            postgres=true
+          fi
+          if [[ -d "$work/fixtures" ]] && remaining=$(find "$work/fixtures" -mindepth 1 -print -quit) && [[ -z "$remaining" ]]; then
+            fixtures=true
+          fi
+          if [[ -f "$work/candidate.json" && ! -L "$work/candidate.json" ]]; then
+            mv -- "$work/candidate.json" "$evidence/pending.json"
+          fi
+          if [[ "$garage" == true ]] && rm -rf -- "$work" >/dev/null 2>&1 && [[ ! -e "$work" && ! -L "$work" ]]; then
+            removed=true
+          fi
+          if [[ -f "$evidence/pending.json" ]]; then
+            python3 -B -I - "$evidence" "$garage" "$postgres" "$fixtures" "$removed" 2>/dev/null <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          pending = root / "pending.json"
+          report = json.loads(pending.read_bytes())
+          flags = ("garage_removed", "postgres_database_roster_restored", "harness_tmp_empty", "owned_work_removed")
+          checks = dict(zip(flags, (value == "true" for value in sys.argv[2:]), strict=True))
+          report["cleanup"] = checks
+          report["passed"] = report["harness_passed"] and all(checks.values())
+          encoded = json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+          if len(encoded) > 8192:
+              raise ValueError("bounded evidence exceeded")
+          pending.write_text(encoded)
+          os.replace(pending, root / "qualification.json")
+          sys.exit(0 if all(checks.values()) else 1)
+          PY
+          elif [[ "$garage" != true || "$removed" != true ]]; then
+            echo 'Format 32 owned cleanup failed' >&2
+            exit 1
+          fi
+      - name: Upload the finite paired qualification report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        timeout-minutes: 2
+        with:
+          name: issue42-format32-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue42-format32-evidence/qualification.json
+          if-no-files-found: error
+          retention-days: 7
