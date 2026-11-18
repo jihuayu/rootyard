@@ -348,6 +348,31 @@ async fn lock_operation_key(
     Ok(())
 }
 
+/// Acquire the exact migration-138 operation advisory key under the caller's
+/// deadline.
+///
+/// This is the same transaction-scoped key `reserve_sequence`/`begin`/`cancel`
+/// take. Reacquiring it inside one transaction is a no-op, so a caller that must
+/// resolve a stored identity before cancelling can hold the same
+/// operation -> lane/... prefix as every other mutation instead of introducing a
+/// second lock domain. The call is bounded by both the absolute deadline and the
+/// local statement/lock timeout installed by [`bound`].
+pub(crate) async fn lock_operation(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    operation_id: Uuid,
+    deadline: Instant,
+) -> Result<(), RefStoreError> {
+    if repository_id.is_nil() || operation_id.is_nil() {
+        return Err(RefStoreError::InvalidIdentity("operation lock ids must be non-nil".into()));
+    }
+    before_deadline(deadline, async {
+        bound(tx, deadline).await?;
+        lock_operation_key(tx, repository_id, operation_id).await
+    })
+    .await
+}
+
 pub(crate) async fn bound(tx: &Transaction<'_>, deadline: Instant) -> Result<(), RefStoreError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {

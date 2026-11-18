@@ -76,11 +76,24 @@ pub(crate) fn compute_history_incarnation(
     Uuid::from_bytes(bytes)
 }
 
-fn cache_environment() -> String {
-    match std::env::var("ROOTYARD_CACHE_ENVIRONMENT") {
-        Ok(raw) if validate_scope_token("environment", &raw).is_ok() => raw,
-        _ => "serving".to_owned(),
+const INVALID_CACHE_ENVIRONMENT: &str = "invalid cache environment";
+
+/// Parse the one environment scope value. Only an absent variable selects the
+/// documented default. A present empty, malformed, overlong, uppercase, or
+/// non-Unicode value fails closed before the caller can touch the cache.
+fn parse_cache_environment(raw: Result<String, std::env::VarError>) -> Result<String, &'static str> {
+    match raw {
+        Ok(value) => {
+            validate_scope_token("environment", &value).map_err(|_| INVALID_CACHE_ENVIRONMENT)?;
+            Ok(value)
+        }
+        Err(std::env::VarError::NotPresent) => Ok("serving".to_owned()),
+        Err(std::env::VarError::NotUnicode(_)) => Err(INVALID_CACHE_ENVIRONMENT),
     }
+}
+
+fn cache_environment() -> Result<String, Error> {
+    parse_cache_environment(std::env::var("ROOTYARD_CACHE_ENVIRONMENT")).map_err(Error::internal)
 }
 
 fn hashed_discriminator(tag: &str, parts: &[Option<&str>], limit: Option<usize>) -> String {
@@ -157,10 +170,11 @@ pub(crate) async fn authorize_and_scope(
     let authority = authority_token(storage_backend);
     let history_incarnation =
         compute_history_incarnation(state.storage.volume_id, access.repo_id, authority, object_format, epoch);
+    let environment = cache_environment()?;
     let scope = BrowseRepoScope {
         repo_id: access.repo_id,
         tenant_id: access.owner_id,
-        environment: cache_environment(),
+        environment,
         authority,
         history_incarnation,
         storage_generation,
@@ -352,6 +366,48 @@ mod tests {
             history_incarnation: compute_history_incarnation(volume, repo, authority, "sha1", epoch),
             storage_generation: generation,
         }
+    }
+
+    #[test]
+    fn cache_environment_defaults_only_when_absent() {
+        assert_eq!(
+            parse_cache_environment(Err(std::env::VarError::NotPresent)).unwrap(),
+            "serving"
+        );
+    }
+
+    #[test]
+    fn cache_environment_preserves_valid_tokens_at_boundaries() {
+        for token in ["a", "z9-_"] {
+            assert_eq!(parse_cache_environment(Ok(token.to_owned())).unwrap(), token);
+        }
+        let boundary = "a".repeat(32);
+        assert_eq!(parse_cache_environment(Ok(boundary.clone())).unwrap(), boundary);
+    }
+
+    #[test]
+    fn cache_environment_rejects_present_invalid_values_with_fixed_error() {
+        let invalid = [
+            String::new(),
+            "Production".to_owned(),
+            "prod env".to_owned(),
+            "prod/env".to_owned(),
+            "a".repeat(33),
+        ];
+        for value in invalid {
+            assert_eq!(parse_cache_environment(Ok(value)), Err(INVALID_CACHE_ENVIRONMENT));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_environment_rejects_non_unicode_values_without_reading_process_env() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        assert_eq!(
+            parse_cache_environment(Err(std::env::VarError::NotUnicode(raw))),
+            Err(INVALID_CACHE_ENVIRONMENT)
+        );
     }
 
     #[test]

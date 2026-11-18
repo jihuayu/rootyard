@@ -203,6 +203,8 @@ jobs:
           ROOTYARD_JGIT_CLASSPATH="$PWD/test-results/ci-tools/clients/jgit-libs/*" ROOTYARD_PYGIT2_PYTHON="$PWD/test-results/ci-tools/client-venv/bin/python" python3 tests/client_compatibility.py --binary "$ROOTYARD_BIN" --report test-results/client-compatibility.json
       - name: Verify parallel track and schema baseline boundaries
         run: python3 -m unittest discover -s tests -p 'test_parallel_boundaries.py'
+      - name: Install Python CI test requirements
+        run: python3 -m pip install -r tests/requirements-python-ci.txt
       - name: Run all Python unit and Tier-5 adversarial contract suites
         # Full discovery stays unfiltered; the runner adds per-test progress and
         # periodic stderr thread stacks without changing exit semantics.

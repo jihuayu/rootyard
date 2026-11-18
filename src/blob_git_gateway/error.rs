@@ -26,6 +26,7 @@ pub enum GatewayError {
     Conflict(&'static str),
     OutcomeUnknown,
     TooLarge,
+    TooManyRequests(&'static str),
     Timeout,
     Unavailable(&'static str),
     Internal(&'static str),
@@ -42,6 +43,7 @@ impl GatewayError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::OutcomeUnknown => StatusCode::SERVICE_UNAVAILABLE,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -57,6 +59,7 @@ impl GatewayError {
             | Self::NotImplemented(reason)
             | Self::Conflict(reason)
             | Self::Unavailable(reason)
+            | Self::TooManyRequests(reason)
             | Self::Internal(reason) => reason,
             Self::NotFound => "not found",
             Self::OutcomeUnknown => "publication outcome is unknown; query the operation or inspect refs",
