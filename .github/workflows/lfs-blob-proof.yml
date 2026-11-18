@@ -111,12 +111,14 @@ jobs:
           cargo fmt --all -- --check
           python3 scripts/check_design_docs.py
           python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_lfs_blob_proof_contracts.py
-      - name: Run Clippy, library unit tests, and PG17 + LoopbackS3 + official git-lfs E2E suite
+      - name: Run Clippy and library unit tests
         run: |
           cargo clippy --locked --no-default-features --lib --test lfs_blob_proof_publication -- -D warnings
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib lfs::blob_proof_publication
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test lfs_blob_proof_publication
-          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test lfs_blob_proof_publication -- --ignored --test-threads=1
+      - name: Run PG17 + LoopbackS3 + official git-lfs 3.6.1 E2E suite
+        run: |
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test lfs_blob_proof_publication -- --ignored --test-threads=1 --nocapture
       - name: Build receipted test binary and run stock-Git reference evaluator
         run: |
           mkdir -p test-results/lfs-blob-proof

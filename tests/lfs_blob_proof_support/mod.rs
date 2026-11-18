@@ -264,15 +264,27 @@ pub fn init_git_lfs_home(home: &Path) -> Result<()> {
 }
 
 pub fn run_git_raw(cwd: &Path, home: &Path, args: &[&str]) -> Result<Output> {
-    Ok(Command::new("git")
-        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
-        .args(args)
-        .current_dir(cwd)
-        .env("HOME", home)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "/bin/false")
-        .output()?)
+    let cwd_buf = cwd.to_path_buf();
+    let home_buf = home.to_path_buf();
+    let owned_args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let res = Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+            .args(&owned_args)
+            .current_dir(&cwd_buf)
+            .env("HOME", &home_buf)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "/bin/false")
+            .output();
+        let _ = tx.send(res);
+    });
+    tokio::task::block_in_place(|| {
+        rx.recv_timeout(Duration::from_secs(45))
+            .map_err(|_| anyhow::anyhow!("git {args:?} timed out after 45s"))?
+            .map_err(Into::into)
+    })
 }
 
 pub fn run_git_ok(cwd: &Path, home: &Path, args: &[&str]) -> Result<String> {

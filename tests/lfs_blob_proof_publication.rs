@@ -31,7 +31,7 @@ fn dummy_lazy_pool() -> Result<Pool> {
         .build()?)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unconfigured_blob_gate_fails_closed_on_startup_and_every_lfs_or_git_endpoint() -> Result<()> {
     let gate = LfsBlobRuntimeGate::unconfigured("ROOTYARD_BLOB_ENDPOINT absent");
     let Err(gate_err) = gate.require_store() else {
@@ -70,7 +70,7 @@ async fn unconfigured_blob_gate_fails_closed_on_startup_and_every_lfs_or_git_end
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires PostgreSQL 17 (ROOTYARD_TEST_DATABASE_URL) and official git-lfs client"]
 async fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_shared_holds() -> Result<()> {
     run_with_migrated_pg_schema(|pool| async move {
