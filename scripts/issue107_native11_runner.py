@@ -487,7 +487,8 @@ def validate_target_build_command(command, target, cfg):
     return {"subcommand": subcommand, "test_targets": tuple(test_targets)}
 
 
-def _receipt_identity(target, binary, receipt, source_root, source_head):
+def _receipt_identity(target, binary, receipt, source_root, source_head,
+                      scope=inventory.NORMAL_SCOPE):
     cfg = inventory.TARGETS[target]
     _require(Path(receipt).resolve() == Path(binary).with_suffix(".build.json").resolve(),
              "target_receipt_not_adjacent")
@@ -532,7 +533,7 @@ def _receipt_identity(target, binary, receipt, source_root, source_head):
         "config_digest": validated.config_digest,
         "kind": payload.get("kind"),
         "profile": payload.get("profile"),
-        "test_count": len(cfg["cases"]),
+        "test_count": inventory.target_expected_count(target, scope),
         "required_env": list(cfg["required_env"]),
         "command_test_targets": list(command_shape["test_targets"]),
     }
@@ -567,18 +568,21 @@ def _bounded_int(value):
     return value
 
 
-def _normalize_failure_context(target, phase, selected_case):
+def _normalize_failure_context(target, phase, selected_case,
+                               scope=inventory.NORMAL_SCOPE):
     """Validate caller-owned phase context without reading argv or output."""
     _require(target in inventory.TARGETS, "unknown_target")
     _require(phase in FAILURE_PHASES, "invalid_failure_phase")
-    cases = inventory.TARGETS[target]["cases"]
+    _require(scope in inventory.scope_names(), "invalid_scope")
+    cases = inventory.cases(target, scope)
     if phase == "list":
-        return {"target": target, "phase": phase, "selected_case": None,
-                "selected_case_known": False}
+        return {"target": target, "phase": phase, "scope": scope,
+                "selected_case": None, "selected_case_known": False}
     known = selected_case in set(cases)
     return {
         "target": target,
         "phase": phase,
+        "scope": scope,
         "selected_case": selected_case if known else None,
         "selected_case_known": known,
     }
@@ -1281,7 +1285,8 @@ def _failure_base(context, returncode, timed_out):
     """Fixed context/exit/unknown shell, valid even when nothing is parsed."""
     target = context["target"]
     phase = context["phase"]
-    expected = tuple(inventory.TARGETS[target]["cases"])
+    scope = context.get("scope", inventory.NORMAL_SCOPE)
+    expected = tuple(inventory.cases(target, scope))
     numeric, signal_number, signal_name = _returncode_detail(returncode)
     return {
         "kind": FAILURE_KIND,
@@ -1328,7 +1333,8 @@ def _failure_base(context, returncode, timed_out):
 
 
 def project_target_failure(target, output, returncode, *, timed_out=False,
-                           phase="run", selected_case=None, stderr=None):
+                           phase="run", selected_case=None, stderr=None,
+                           scope=inventory.NORMAL_SCOPE):
     """Project separate stdout/stderr captures into a fixed safe shape.
 
     This is a pure RAM-only parser: it performs no IO, starts no process and
@@ -1341,10 +1347,9 @@ def project_target_failure(target, output, returncode, *, timed_out=False,
     retained.  Everything else is dropped or counted as unknown, never as
     success.
     """
-    context = _normalize_failure_context(target, phase, selected_case)
+    context = _normalize_failure_context(target, phase, selected_case, scope)
     diagnostic = _failure_base(context, returncode, timed_out)
-    cfg = inventory.TARGETS[target]
-    expected = tuple(cfg["cases"])
+    expected = tuple(inventory.cases(target, scope))
     expected_set = set(expected)
 
     case_rows = {}
@@ -1633,7 +1638,8 @@ def run_bounded(command, timeout, env=None, failure_projector=None,
                 context = _normalize_failure_context(
                     failure_context.get("target"),
                     failure_context.get("phase"),
-                    failure_context.get("selected_case"))
+                    failure_context.get("selected_case"),
+                    failure_context.get("scope", inventory.NORMAL_SCOPE))
             except Exception:
                 context = None
         if context is not None:
@@ -1643,6 +1649,7 @@ def run_bounded(command, timeout, env=None, failure_projector=None,
                     process.returncode, timed_out=timed_out,
                     phase=context["phase"],
                     selected_case=context["selected_case"],
+                    scope=context["scope"],
                     stderr=bytes(capture.stderr))
             except Exception:
                 # Context survives even if the parser itself fails.
@@ -1680,35 +1687,55 @@ def parse_case_result(output, name):
     _require(passed == 1 and failed == 0 and ignored == 0, "test_partial_or_skipped")
 
 
-def _list_target(binary, cfg, remaining, target=None):
+def _list_target(binary, cfg, remaining, target=None,
+                 scope=inventory.NORMAL_SCOPE):
+    _require(scope in inventory.scope_names(), "invalid_scope")
+    target_name = target
+    if target_name is None:
+        target_name = next(
+            (name for name in inventory.TARGET_ORDER
+             if inventory.TARGETS[name] is cfg),
+            None)
+    _require(target_name in inventory.TARGET_ORDER, "unknown_target")
     failure_context = None
     if target is not None:
         failure_context = {
             "target": target,
             "phase": "list",
+            "scope": scope,
             "selected_case": None,
         }
+    command = [str(binary), "--list"]
+    if inventory.listing_ignored(target_name, scope):
+        command.append("--ignored")
+    command.extend(["--format", "terse"])
     output = run_bounded(
-        [str(binary), "--list", "--ignored", "--format", "terse"],
+        command,
         timeout=min(60.0, remaining), env=os.environ.copy(),
         failure_context=failure_context)
     actual = parse_listing(output)
-    expected = list(cfg["cases"])
+    expected = list(inventory.cases(target_name, scope))
     _require(len(actual) == len(expected) and len(set(actual)) == len(actual)
              and set(actual) == set(expected), "static_inventory_mismatch")
     return actual
 
 
-def _run_one(binary, name, remaining, case_seconds=DEFAULT_CASE_SECONDS, target=None):
+def _run_one(binary, name, remaining, case_seconds=DEFAULT_CASE_SECONDS, target=None,
+             ignored=True, scope=inventory.NORMAL_SCOPE):
     failure_context = None
     if target is not None:
         failure_context = {
             "target": target,
             "phase": "run",
+            "scope": scope,
             "selected_case": name,
         }
+    command = [str(binary), name, "--exact"]
+    if ignored:
+        command.append("--ignored")
+    command.extend(["--test-threads=1", "--format", "pretty"])
     output = run_bounded(
-        [str(binary), name, "--exact", "--ignored", "--test-threads=1", "--format", "pretty"],
+        command,
         timeout=min(case_seconds, remaining), env=os.environ.copy(),
         failure_context=failure_context)
     parse_case_result(output, name)
@@ -1760,9 +1787,10 @@ def _safe_source_locations(values):
     return locations
 
 
-def _safe_failure_diagnostic(diagnostic, target, observed_cases=None):
+def _safe_failure_diagnostic(diagnostic, target, observed_cases=None,
+                             scope=inventory.NORMAL_SCOPE):
     """Rebuild the failure diagnostic from fixed fields before persistence."""
-    expected = tuple(inventory.TARGETS[target]["cases"])
+    expected = tuple(inventory.cases(target, scope))
     allowed_names = set(expected)
     status_by_name = {}
     # The child that just failed is authoritative for its own case line, so it
@@ -1887,7 +1915,9 @@ def _attach_failed_target(report, diagnostic, identities, observed_cases=None):
     target = diagnostic.get("target")
     if target not in inventory.TARGETS:
         return
-    safe_diagnostic = _safe_failure_diagnostic(diagnostic, target, observed_cases)
+    safe_diagnostic = _safe_failure_diagnostic(
+        diagnostic, target, observed_cases,
+        scope=report.get("scope", inventory.NORMAL_SCOPE))
     row = {
         "prefix": safe_diagnostic["prefix"],
         "target": target,
@@ -1925,8 +1955,10 @@ def _attach_failed_target(report, diagnostic, identities, observed_cases=None):
 
 def run_acceptance(source_head, source_root, targets, receipts_by_name,
                    report_path=None, overall_seconds=DEFAULT_OVERALL_SECONDS,
-                   case_seconds=DEFAULT_CASE_SECONDS):
+                   case_seconds=DEFAULT_CASE_SECONDS,
+                   scope=inventory.NORMAL_SCOPE):
     validate_target_set(targets, receipts_by_name)
+    _require(scope in inventory.scope_names(), "invalid_scope")
     _require(re.fullmatch(r"[0-9a-f]{40,64}", str(source_head)) is not None,
              "invalid_source_head")
     _require(Path(source_root).is_dir(), "missing_source_root")
@@ -1936,13 +1968,14 @@ def run_acceptance(source_head, source_root, targets, receipts_by_name,
         "passed": False,
         "measurement_kind": "native_execution",
         "simulated_fields": False,
+        "scope": scope,
+        "scope_version": inventory.scope_version(scope),
         "source_head": source_head,
         "input_closure_sha256": before,
         "harness_inputs_before_sha256": before,
         "targets": [],
         "case_count": 0,
-        "expected_count": sum(len(inventory.TARGETS[name]["cases"])
-                              for name in inventory.TARGET_ORDER),
+        "expected_count": inventory.expected_count(scope),
         "skips": 0,
         "pending_cases": [],
         "cleanup_unresolved": False,
@@ -1961,7 +1994,7 @@ def run_acceptance(source_head, source_root, targets, receipts_by_name,
             _require(Path(receipt).is_absolute() and Path(receipt).is_file(),
                      "target_receipt_missing")
             identities[target] = _receipt_identity(
-                target, binary, receipt, source_root, source_head)
+                target, binary, receipt, source_root, source_head, scope)
         validate_batch_command_consistency(identities)
         for target in inventory.TARGET_ORDER:
             remaining = deadline - time.monotonic()
@@ -1969,11 +2002,12 @@ def run_acceptance(source_head, source_root, targets, receipts_by_name,
             binary = targets[target]
             cfg = inventory.TARGETS[target]
             completed_cases = []
-            _list_target(binary, cfg, remaining, target)
-            for name in cfg["cases"]:
+            _list_target(binary, cfg, remaining, target, scope=scope)
+            for name, ignored in inventory.case_specs(target, scope):
                 remaining = deadline - time.monotonic()
                 _require(remaining > 0, "overall_timeout")
-                _run_one(binary, name, remaining, case_seconds, target)
+                _run_one(binary, name, remaining, case_seconds, target,
+                         ignored=ignored, scope=scope)
                 completed_cases.append({"name": name, "status": "passed"})
             report["targets"].append({
                 **identities[target],
@@ -2019,12 +2053,24 @@ def run_acceptance(source_head, source_root, targets, receipts_by_name,
     return report
 
 
-def validate_report(report, expected_source_head=None):
+def validate_report(report, expected_source_head=None, scope=None):
     """Pure report-shape validator for later CI integration."""
     _require(isinstance(report, dict), "report_not_object")
     _require(report.get("kind") == REPORT_KIND, "wrong_report_kind")
     _require(report.get("measurement_kind") == "native_execution", "not_native_execution")
     _require(report.get("simulated_fields") is False, "simulated_evidence")
+    report_scope = report.get("scope", inventory.NORMAL_SCOPE)
+    _require(report_scope in inventory.scope_names(), "wrong_scope")
+    if scope is not None:
+        _require(scope in inventory.scope_names(), "wrong_scope")
+        _require(report_scope == scope, "wrong_scope")
+    scope = report_scope
+    if "scope_version" in report:
+        _require(report.get("scope_version") == inventory.scope_version(scope),
+                 "wrong_scope_version")
+    else:
+        # Older normal-scope reports predate the explicit version field.
+        _require(scope == inventory.NORMAL_SCOPE, "wrong_scope_version")
     if expected_source_head is not None:
         _require(report.get("source_head") == expected_source_head, "wrong_source_head")
     _require([row.get("target") for row in report.get("targets", [])]
@@ -2032,20 +2078,25 @@ def validate_report(report, expected_source_head=None):
     total = 0
     for row in report["targets"]:
         target = row.get("target")
-        cfg = inventory.TARGETS[target]
+        _require(target in inventory.TARGETS, "unknown_target")
+        expected_cases = inventory.cases(target, scope)
         _require(row.get("passed") is True, "target_not_passed")
-        _require(row.get("case_count") == len(cfg["cases"]), "target_case_count_mismatch")
+        _require(row.get("test_count") == len(expected_cases),
+                 "target_test_count_mismatch")
+        _require(row.get("case_count") == len(expected_cases), "target_case_count_mismatch")
         _require([case.get("name") for case in row.get("cases", [])]
-                 == list(cfg["cases"]), "target_case_inventory_mismatch")
+                 == list(expected_cases), "target_case_inventory_mismatch")
         _require(all(case.get("status") == "passed" for case in row.get("cases", [])),
                  "target_case_failed")
-        total += len(cfg["cases"])
+        total += len(expected_cases)
     case_count = report.get("case_count")
     expected_count = report.get("expected_count")
     _require(isinstance(case_count, int) and not isinstance(case_count, bool)
              and case_count == total, "total_case_count_mismatch")
     _require(isinstance(expected_count, int) and not isinstance(expected_count, bool)
              and expected_count == total, "total_case_count_mismatch")
+    _require(expected_count == inventory.expected_count(scope),
+             "total_case_count_mismatch")
     _require(isinstance(report.get("skips"), int) and not isinstance(report.get("skips"), bool)
              and report.get("skips") == 0, "skipped_cases")
     _require(report.get("pending_cases") == [], "pending_cases")
@@ -2064,6 +2115,8 @@ def main(argv=None):
     parser.add_argument("--target", action="append", default=[], metavar="NAME=PATH")
     parser.add_argument("--receipt", action="append", default=[], metavar="NAME=PATH")
     parser.add_argument("--report")
+    parser.add_argument("--scope", choices=inventory.scope_names(),
+                        default=inventory.NORMAL_SCOPE)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_OVERALL_SECONDS)
     parser.add_argument("--case-timeout-seconds", type=float, default=DEFAULT_CASE_SECONDS)
     args = parser.parse_args(argv)
@@ -2073,7 +2126,7 @@ def main(argv=None):
         report = run_acceptance(
             args.source_head, args.source_root, targets, receipt_paths,
             report_path=args.report, overall_seconds=args.timeout_seconds,
-            case_seconds=args.case_timeout_seconds)
+            case_seconds=args.case_timeout_seconds, scope=args.scope)
     except RunnerError as error:
         print(json.dumps({"passed": False, "error": error.code}), file=sys.stderr)
         return 1

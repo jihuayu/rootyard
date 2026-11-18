@@ -120,8 +120,32 @@ class HostedWiringTests(unittest.TestCase):
         self.assertNotIn("rustc", acceptance)
         for target in native_inventory.TARGET_ORDER:
             self.assertIn(target, step)
-        self.assertIn("runner.validate_report(report, sys.argv[1])", acceptance)
+        self.assertIn("runner.validate_report(report, sys.argv[1], scope=sys.argv[3])",
+                      acceptance)
         self.assertIn("test-results/refstore/issue107-native11.json", acceptance)
+
+    def test_native11_scope_is_manual_exact_issue42_ref_only(self):
+        step = inventory_step()
+        text = WORKFLOW.read_text()
+        self.assertEqual(
+            text.count("refs/heads/codex/goal-issue42-original-ac-source-audit-20261117"),
+            1,
+        )
+        self.assertIn(
+            "ISSUE42_MANUAL_REF: refs/heads/codex/goal-issue42-original-ac-source-audit-20261117",
+            text,
+        )
+        self.assertIn("scope=normal", step)
+        self.assertIn(
+            'if [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && \\\n'
+            '             [ "${GITHUB_REF:-}" = "${ISSUE42_MANUAL_REF:-}" ]; then',
+            step,
+        )
+        self.assertIn("scope=issue42", step)
+        self.assertIn('--scope "$scope"', step)
+        self.assertNotIn("--scope issue42", step)
+        self.assertIn("runner.validate_report(report, sys.argv[1], scope=sys.argv[3])",
+                      step)
 
     def test_existing_unfiltered_sequence_still_has_all_legacy_reports(self):
         text = WORKFLOW.read_text()

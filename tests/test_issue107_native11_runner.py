@@ -20,28 +20,33 @@ import issue107_native11_inventory as inventory  # noqa: E402
 import issue107_native11_runner as runner  # noqa: E402
 
 HEAD = "1" * 40
+FRESH_LANE_REGULAR = "fresh_lane_wait_probe_requires_the_insert_and_the_creator_as_blocker"
+FRESH_LANE_IGNORED = "fresh_lane_creation_waits_for_an_uncommitted_creator"
 
 
-def target_report():
+def target_report(scope=inventory.NORMAL_SCOPE):
     targets = []
     for target in inventory.TARGET_ORDER:
         cases = [{"name": name, "status": "passed"}
-                 for name in inventory.TARGETS[target]["cases"]]
+                 for name, _ in inventory.case_specs(target, scope)]
         targets.append({
             "target": target,
             "passed": True,
             "cases": cases,
             "case_count": len(cases),
+            "test_count": len(cases),
             "binary_sha256": "b" * 64,
             "receipt_sha256": "e" * 64,
             "source_inputs_sha256": "c" * 64,
         })
-    total = sum(len(inventory.TARGETS[name]["cases"]) for name in inventory.TARGET_ORDER)
+    total = inventory.expected_count(scope)
     return {
         "kind": runner.REPORT_KIND,
         "passed": True,
         "measurement_kind": "native_execution",
         "simulated_fields": False,
+        "scope": scope,
+        "scope_version": inventory.scope_version(scope),
         "source_head": HEAD,
         "targets": targets,
         "case_count": total,
@@ -87,6 +92,171 @@ class StaticInventoryTests(unittest.TestCase):
         with self.assertRaises(runner.RunnerError) as raised:
             runner._pairs(["a=1", "a=2"], "target")
         self.assertEqual(raised.exception.code, "duplicate_target")
+
+
+class ScopeTests(unittest.TestCase):
+    def test_issue42_extension_is_exactly_two_named_selectors(self):
+        self.assertEqual(inventory.expected_count(inventory.NORMAL_SCOPE), 167)
+        self.assertEqual(inventory.expected_count(inventory.ISSUE42_SCOPE), 169)
+        extension = inventory.SCOPE_EXTENSIONS[inventory.ISSUE42_SCOPE]
+        self.assertEqual(set(extension), {"ref_store_operations"})
+        self.assertEqual(
+            inventory.case_specs("ref_store_operations", inventory.ISSUE42_SCOPE)[-2:],
+            ((FRESH_LANE_REGULAR, False), (FRESH_LANE_IGNORED, True)),
+        )
+        for target in inventory.TARGET_ORDER:
+            if target != "ref_store_operations":
+                self.assertEqual(
+                    inventory.cases(target, inventory.ISSUE42_SCOPE),
+                    inventory.cases(target, inventory.NORMAL_SCOPE),
+                )
+
+    def test_issue42_listing_is_strict_and_normal_rejects_the_extension(self):
+        cfg = inventory.TARGETS["ref_store_operations"]
+        extended = inventory.cases("ref_store_operations", inventory.ISSUE42_SCOPE)
+        good = b"\n".join(name.encode() + b": test" for name in extended)
+        with mock.patch.object(runner, "run_bounded", return_value=good):
+            self.assertEqual(
+                len(runner._list_target(
+                    "fake", cfg, 5.0, target="ref_store_operations",
+                    scope=inventory.ISSUE42_SCOPE)),
+                9,
+            )
+        with mock.patch.object(runner, "run_bounded", return_value=good):
+            with self.assertRaises(runner.RunnerError) as raised:
+                runner._list_target(
+                    "fake", cfg, 5.0, target="ref_store_operations",
+                    scope=inventory.NORMAL_SCOPE)
+            self.assertEqual(raised.exception.code, "static_inventory_mismatch")
+        for bad in (
+            good.splitlines()[:-1],
+            good.splitlines() + [b"extra: test"],
+            good.splitlines() + [good.splitlines()[0]],
+        ):
+            with mock.patch.object(runner, "run_bounded", return_value=b"\n".join(bad)):
+                with self.assertRaises(runner.RunnerError) as raised:
+                    runner._list_target(
+                        "fake", cfg, 5.0, target="ref_store_operations",
+                        scope=inventory.ISSUE42_SCOPE)
+                self.assertEqual(raised.exception.code, "static_inventory_mismatch")
+
+    def test_extension_names_match_real_source_and_ignore_flags(self):
+        source = (ROOT / "tests/ref_store_operations.rs").read_text()
+        extension = inventory.SCOPE_EXTENSIONS[inventory.ISSUE42_SCOPE][
+            "ref_store_operations"]
+        for name, ignored in extension:
+            marker = f"fn {name}("
+            self.assertEqual(source.count(marker), 1, name)
+            before = source.split(marker, 1)[0].rsplit("\n", 3)[-3:]
+            if ignored:
+                self.assertTrue(any("#[ignore" in line for line in before), name)
+            else:
+                self.assertFalse(any("#[ignore" in line for line in before), name)
+
+    def test_issue42_regular_case_omits_the_ignored_flag(self):
+        def ok_for(name):
+            return (b"test " + name.encode() + b" ... ok\n\n"
+                    b"test result: ok. 1 passed; 0 failed; 0 ignored; "
+                    b"0 measured; 0 filtered out; finished in 0.00s\n")
+
+        with mock.patch.object(
+                runner, "run_bounded",
+                return_value=ok_for(FRESH_LANE_REGULAR)) as called:
+            runner._run_one(
+                "fake", FRESH_LANE_REGULAR, 5.0,
+                target="ref_store_operations", ignored=False,
+                scope=inventory.ISSUE42_SCOPE)
+        command = called.call_args[0][0]
+        self.assertEqual(command[2], "--exact")
+        self.assertNotIn("--ignored", command)
+        with mock.patch.object(
+                runner, "run_bounded",
+                return_value=ok_for(FRESH_LANE_IGNORED)) as called:
+            runner._run_one(
+                "fake", FRESH_LANE_IGNORED, 5.0,
+                target="ref_store_operations", ignored=True,
+                scope=inventory.ISSUE42_SCOPE)
+        self.assertIn("--ignored", called.call_args[0][0])
+
+    def test_issue42_report_is_169_and_scope_is_strict(self):
+        report = target_report(inventory.ISSUE42_SCOPE)
+        self.assertEqual(
+            runner.validate_report(report, HEAD, scope=inventory.ISSUE42_SCOPE),
+            {"targets": 11, "cases": 169},
+        )
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_report(report, HEAD, scope=inventory.NORMAL_SCOPE)
+        self.assertEqual(raised.exception.code, "wrong_scope")
+        wrong = target_report(inventory.ISSUE42_SCOPE)
+        wrong["scope_version"] = "issue42-native11-other-v1"
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_report(wrong, HEAD, scope=inventory.ISSUE42_SCOPE)
+        self.assertEqual(raised.exception.code, "wrong_scope_version")
+        wrong = target_report(inventory.ISSUE42_SCOPE)
+        wrong["targets"][0]["cases"].pop()
+        with self.assertRaises(runner.RunnerError) as raised:
+            runner.validate_report(wrong, HEAD, scope=inventory.ISSUE42_SCOPE)
+        self.assertEqual(raised.exception.code, "target_case_inventory_mismatch")
+
+    def test_issue42_run_acceptance_is_169_with_exact_flags(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            targets = {}
+            receipts = {}
+            identities = {}
+            for target in inventory.TARGET_ORDER:
+                binary = root / target
+                binary.write_bytes(b"fake")
+                binary.chmod(0o755)
+                receipt = root / (target + ".build.json")
+                receipt.write_text("{}")
+                targets[target] = str(binary)
+                receipts[target] = str(receipt)
+                identities[target] = {
+                    "target": target,
+                    "binary_sha256": "b" * 64,
+                    "receipt_sha256": "e" * 64,
+                    "source_inputs_sha256": "c" * 64,
+                    "test_count": inventory.target_expected_count(
+                        target, inventory.ISSUE42_SCOPE),
+                }
+            seen = []
+
+            def fake_list(binary, cfg, remaining, target=None,
+                          scope=inventory.NORMAL_SCOPE):
+                seen.append(("list", target, scope))
+
+            def fake_run(binary, name, remaining, case_seconds=0, target=None,
+                         ignored=True, scope=inventory.NORMAL_SCOPE):
+                seen.append(("run", target, name, ignored, scope))
+
+            with mock.patch.object(runner, "input_hashes",
+                                   return_value={"a": "f" * 64}), \
+                 mock.patch.object(runner, "_required_environment",
+                                   return_value=None), \
+                 mock.patch.object(
+                     runner, "_receipt_identity",
+                     side_effect=lambda target, *args: identities[target]), \
+                 mock.patch.object(runner, "_list_target", side_effect=fake_list), \
+                 mock.patch.object(runner, "_run_one", side_effect=fake_run):
+                report = runner.run_acceptance(
+                    HEAD, str(source), targets, receipts,
+                    scope=inventory.ISSUE42_SCOPE)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["scope"], inventory.ISSUE42_SCOPE)
+        self.assertEqual(report["scope_version"],
+                         inventory.scope_version(inventory.ISSUE42_SCOPE))
+        self.assertEqual(report["expected_count"], 169)
+        self.assertEqual(report["case_count"], 169)
+        self.assertEqual(sum(1 for item in seen if item[0] == "run"), 169)
+        self.assertIn(
+            ("run", "ref_store_operations", FRESH_LANE_REGULAR, False,
+             inventory.ISSUE42_SCOPE), seen)
+        self.assertIn(
+            ("run", "ref_store_operations", FRESH_LANE_IGNORED, True,
+             inventory.ISSUE42_SCOPE), seen)
 
 
 class EnvironmentTests(unittest.TestCase):
