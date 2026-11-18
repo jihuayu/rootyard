@@ -19,7 +19,7 @@ pub const MAX_GROUPS_PER_PROOF: usize = 1_024;
 pub const MAX_PACKS_PER_CLOSURE: usize = 4_096;
 pub const MAX_CANDIDATES_PER_SWEEP: usize = 8_192;
 pub const MAX_PRODUCER_ITEMS: usize = 6;
-pub const MAX_STRING_FIELD_BYTES: usize = 256;
+pub const MAX_STRING_FIELD_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SafeGcObjectFormat {
