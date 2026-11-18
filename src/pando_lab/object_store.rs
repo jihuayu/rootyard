@@ -15,6 +15,7 @@ pub(super) use publish::put_pack;
 pub(crate) use publish::put_pack_and_seal_with_suite;
 #[cfg(test)]
 use publish::put_pack_db_inner;
+#[cfg_attr(not(test), expect(unused_imports, reason = "unit tests exercise the raw file publication reexport"))]
 pub use publish::put_pack_files;
 #[cfg(test)]
 mod pg_receipt_tests;
