@@ -292,6 +292,7 @@ impl PackDownloaderConfig {
     pub fn build(policy: &OffloadPolicyConfig) -> Result<Self, PackfileUriError> {
         let client = reqwest::Client::builder()
             .redirect(redirect::Policy::none())
+            .no_proxy()
             .timeout(Duration::from_millis(policy.request_deadline_ms))
             .build()
             .map_err(|e| PackfileUriError::Internal(format!("client init failed: {e}")))?;

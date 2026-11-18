@@ -253,6 +253,7 @@ async fn reqwest_retry_live_auth_and_pin_revocation_over_tls_work_end_to_end() -
     let cert = reqwest::Certificate::from_pem(&std::fs::read(&tls.cert_path)?)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .add_root_certificate(cert)
         .resolve("cdn.rootyard.test", SocketAddr::from(([127, 0, 0, 1], cdn.port)))
         .timeout(Duration::from_secs(10))
@@ -267,20 +268,23 @@ async fn reqwest_retry_live_auth_and_pin_revocation_over_tls_work_end_to_end() -
     // Retry #1 recovers after transient 503 and verifies SHA-256 + trailer cleanly.
     let res =
         fetch_pack_with_integrity_and_retry(&dl_cfg, desc, PackObjectFormat::Sha1, &policy, &public_ips()).await?;
-    ensure!(matches!(res, FetchAttemptResult::Verified { attempts: 2, .. }));
+    ensure!(matches!(res, FetchAttemptResult::Verified { attempts: 2, .. }), "unexpected fetch result: {res:?}");
 
     // Live auth revocation fails closed immediately even while signature & TTL stay valid.
     allow.store(false, Ordering::SeqCst);
     let denied =
         fetch_pack_with_integrity_and_retry(&dl_cfg, desc, PackObjectFormat::Sha1, &policy, &public_ips()).await;
-    ensure!(matches!(denied, Err(PackfileUriError::Unauthorized)));
+    ensure!(matches!(denied, Err(PackfileUriError::Unauthorized)), "expected Unauthorized, got {denied:?}");
 
     // Re-enable auth, then revoke active retention pin -> fail closed with RetentionPinMissing.
     allow.store(true, Ordering::SeqCst);
     ensure!(leases.revoke_pin(desc.pin_id));
     let unpinned =
         fetch_pack_with_integrity_and_retry(&dl_cfg, desc, PackObjectFormat::Sha1, &policy, &public_ips()).await;
-    ensure!(matches!(unpinned, Err(PackfileUriError::RetentionPinMissing(_))));
+    ensure!(
+        matches!(unpinned, Err(PackfileUriError::RetentionPinMissing(_))),
+        "expected RetentionPinMissing, got {unpinned:?}"
+    );
     ensure!(pack_state.rejected_requests.load(Ordering::SeqCst) >= 2);
     Ok(())
 }

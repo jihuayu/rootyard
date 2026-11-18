@@ -146,43 +146,89 @@ pub struct EphemeralCert {
     pub server_cfg: Arc<rustls::ServerConfig>,
 }
 
-pub fn build_ephemeral_tls_cert(dir: &Path) -> Result<EphemeralCert> {
-    let cert_path = dir.join("cdn.cert.pem");
-    let key_path = dir.join("cdn.key.pem");
+fn run_openssl(args: &[&str]) -> Result<()> {
     let status = Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-keyout",
-            key_path.to_str().unwrap(),
-            "-out",
-            cert_path.to_str().unwrap(),
-            "-days",
-            "1",
-            "-subj",
-            "/CN=cdn.rootyard.test",
-            "-addext",
-            "subjectAltName=DNS:cdn.rootyard.test,IP:127.0.0.1",
-        ])
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .context("spawn openssl")?;
-    ensure!(status.success(), "openssl cert generation failed");
+    ensure!(status.success(), "openssl failed: {args:?}");
+    Ok(())
+}
+
+pub fn build_ephemeral_tls_cert(dir: &Path) -> Result<EphemeralCert> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (ca_k, ca_c) = (dir.join("ca.key.pem"), dir.join("ca.cert.pem"));
+    let (ext_p, l_key, l_csr, l_crt) =
+        (dir.join("leaf.ext"), dir.join("cdn.key.pem"), dir.join("cdn.csr.pem"), dir.join("cdn.cert.pem"));
+    run_openssl(&[
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-days",
+        "1",
+        "-keyout",
+        ca_k.to_str().unwrap(),
+        "-out",
+        ca_c.to_str().unwrap(),
+        "-subj",
+        "/CN=rootyard-test-ca",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+        "-addext",
+        "keyUsage=critical,keyCertSign,cRLSign",
+    ])?;
+    std::fs::write(
+        &ext_p,
+        "[v3_req]\nbasicConstraints = CA:FALSE\nkeyUsage = digitalSignature, keyEncipherment\n\
+         extendedKeyUsage = serverAuth\nsubjectAltName = DNS:cdn.rootyard.test,IP:127.0.0.1\n",
+    )?;
+    run_openssl(&[
+        "req",
+        "-new",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        l_key.to_str().unwrap(),
+        "-out",
+        l_csr.to_str().unwrap(),
+        "-subj",
+        "/CN=cdn.rootyard.test",
+    ])?;
+    run_openssl(&[
+        "x509",
+        "-req",
+        "-in",
+        l_csr.to_str().unwrap(),
+        "-CA",
+        ca_c.to_str().unwrap(),
+        "-CAkey",
+        ca_k.to_str().unwrap(),
+        "-CAcreateserial",
+        "-out",
+        l_crt.to_str().unwrap(),
+        "-days",
+        "1",
+        "-extfile",
+        ext_p.to_str().unwrap(),
+        "-extensions",
+        "v3_req",
+    ])?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(&cert_path)?))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(&key_path)?))?.context("missing key")?;
+    let certs =
+        rustls_pemfile::certs(&mut BufReader::new(File::open(&l_crt)?)).collect::<std::result::Result<Vec<_>, _>>()?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(&l_key)?))?.context("missing key")?;
     let server_cfg = Arc::new(
         rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
             .with_single_cert(certs, key)?,
     );
-    Ok(EphemeralCert { cert_path, server_cfg })
+    Ok(EphemeralCert { cert_path: ca_c, server_cfg })
 }
 
 pub struct TlsCdnServer {
@@ -313,6 +359,8 @@ fn handle_tls_cdn_conn(mut stream: TcpStream, ctx: &TlsCdnConnCtx) -> Result<()>
     tls.write_all(hdr.as_bytes())?;
     tls.write_all(&body)?;
     tls.flush()?;
+    tls.conn.send_close_notify();
+    let _ = tls.flush();
     Ok(())
 }
 
@@ -380,6 +428,7 @@ async fn handle_upload_pack(State(st): State<Arc<OriginState>>, body: Bytes) -> 
     let text = String::from_utf8_lossy(&body);
     let resp_bytes = if text.contains("command=ls-refs") {
         let mut out = Vec::new();
+        push_pkt_line(&mut out, format!("{} HEAD symref-target:refs/heads/main\n", st.head_oid).as_bytes()).unwrap();
         push_pkt_line(&mut out, format!("{} refs/heads/main\n", st.head_oid).as_bytes()).unwrap();
         out.extend_from_slice(b"0000");
         out
