@@ -1,6 +1,13 @@
-//! Core domain types, bounds, errors, and redaction helpers for `packfile-uris` delivery.
+//! Core domain types, bounds, errors, subject bindings, and byte limiters
+//! for optional `packfile-uris` delivery.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -21,6 +28,9 @@ pub const DEFAULT_RETENTION_GRACE_SECS: u64 = 60;
 pub const MAX_URIS_PER_FETCH_CAP: usize = 16;
 pub const DEFAULT_MAX_URIS_PER_FETCH: usize = 4;
 pub const DEFAULT_MAX_INFLIGHT_DOWNLOADS: usize = 4;
+pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_ACTIVE_LEASES: usize = 4_096;
+pub const MAX_ACTIVE_LEASES_HARD_CAP: usize = 65_536;
 pub const DEFAULT_MAX_RETRIES_PER_PACK: usize = 2;
 pub const MAX_RETRIES_HARD_CAP: usize = 3;
 pub const MAX_OFFLOAD_BYTES_HARD_CAP: u64 = 8 * 1024 * 1024 * 1024;
@@ -85,7 +95,34 @@ impl fmt::Display for PackfileUriError {
 
 impl std::error::Error for PackfileUriError {}
 
+/// Authenticated caller subject bound into signed URLs, retention leases, and live re-auth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadSubjectContext {
+    pub actor_id: Uuid,
+    pub token_id: Uuid,
+    pub auth_epoch: u64,
+}
+
+impl DownloadSubjectContext {
+    pub fn new(actor_id: Uuid, token_id: Uuid, auth_epoch: u64) -> Result<Self, PackfileUriError> {
+        let ctx = Self { actor_id, token_id, auth_epoch };
+        ctx.validate()?;
+        Ok(ctx)
+    }
+
+    /// Fails closed on nil actor/token UUIDs or zero auth epoch.
+    pub fn validate(&self) -> Result<(), PackfileUriError> {
+        if self.actor_id.is_nil() || self.token_id.is_nil() || self.auth_epoch == 0 {
+            return Err(PackfileUriError::Unauthorized);
+        }
+        Ok(())
+    }
+}
+
 /// Policy configuration controlling optional HTTPS-only `packfile-uris` offload.
+///
+/// Defaults strictly to disabled (`enabled: false`, `advertise_in_capabilities: false`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OffloadPolicyConfig {
@@ -100,14 +137,24 @@ pub struct OffloadPolicyConfig {
     pub max_uris_per_fetch: usize,
     pub max_pack_bytes_per_request: u64,
     pub max_inflight_downloads: usize,
+    pub max_inflight_bytes: u64,
+    pub max_active_leases: usize,
     pub max_retries_per_pack: usize,
     pub request_deadline_ms: u64,
     pub min_pack_bytes_for_offload: u64,
     pub fallback_on_unhealthy_cdn: bool,
+    #[serde(skip)]
+    loopback_test_port: Option<u16>,
+}
+
+impl Default for OffloadPolicyConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
 }
 
 impl OffloadPolicyConfig {
-    /// Strict production baseline requiring HTTPS, explicit host allowlist, and short TTL.
+    /// Strict production baseline requiring HTTPS, port 443, non-loopback public DNS, and short TTL.
     pub fn strict_production(allowed_hosts: Vec<String>, key_id: impl Into<String>) -> Self {
         Self {
             enabled: true,
@@ -121,14 +168,17 @@ impl OffloadPolicyConfig {
             max_uris_per_fetch: DEFAULT_MAX_URIS_PER_FETCH,
             max_pack_bytes_per_request: 512 * 1024 * 1024,
             max_inflight_downloads: DEFAULT_MAX_INFLIGHT_DOWNLOADS,
+            max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
+            max_active_leases: DEFAULT_MAX_ACTIVE_LEASES,
             max_retries_per_pack: DEFAULT_MAX_RETRIES_PER_PACK,
             request_deadline_ms: 30_000,
             min_pack_bytes_for_offload: 4 * 1024,
             fallback_on_unhealthy_cdn: true,
+            loopback_test_port: None,
         }
     }
 
-    /// Safe baseline configuration with offload disabled so callers use full inline delivery.
+    /// Safe default-off baseline; all offload boundaries fail closed while disabled.
     pub fn disabled() -> Self {
         Self {
             enabled: false,
@@ -142,10 +192,78 @@ impl OffloadPolicyConfig {
             max_uris_per_fetch: DEFAULT_MAX_URIS_PER_FETCH,
             max_pack_bytes_per_request: 512 * 1024 * 1024,
             max_inflight_downloads: DEFAULT_MAX_INFLIGHT_DOWNLOADS,
+            max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
+            max_active_leases: DEFAULT_MAX_ACTIVE_LEASES,
             max_retries_per_pack: DEFAULT_MAX_RETRIES_PER_PACK,
             request_deadline_ms: 30_000,
             min_pack_bytes_for_offload: 4 * 1024,
             fallback_on_unhealthy_cdn: true,
+            loopback_test_port: None,
+        }
+    }
+
+    /// Narrow programmatic opt-in for local TLS tests (`*.localhost` only, never deserializable).
+    pub fn with_loopback_localhost_for_test(mut self, port: u16) -> Result<Self, PackfileUriError> {
+        if port == 0 || self.allowed_hosts.is_empty() || !self.allowed_hosts.iter().all(|h| h.ends_with(".localhost")) {
+            return Err(PackfileUriError::InvalidPolicy(
+                "test loopback mode requires non-zero port and *.localhost hosts only".to_owned(),
+            ));
+        }
+        self.loopback_test_port = Some(port);
+        Ok(self)
+    }
+
+    pub const fn loopback_test_port(&self) -> Option<u16> {
+        self.loopback_test_port
+    }
+
+    pub const fn loopback_allowed(&self) -> bool {
+        self.loopback_test_port.is_some()
+    }
+}
+
+/// Shared global byte limiter bounding concurrent inflight pack transfers.
+#[derive(Debug)]
+pub struct InflightBytesLimiter {
+    max_bytes: u64,
+    used_bytes: AtomicU64,
+}
+
+impl InflightBytesLimiter {
+    pub fn new(max_bytes: u64) -> Self {
+        Self { max_bytes: max_bytes.max(1), used_bytes: AtomicU64::new(0) }
+    }
+
+    pub fn try_reserve(self: &Arc<Self>, bytes: u64) -> Result<InflightBytesGuard, PackfileUriError> {
+        let mut cur = self.used_bytes.load(Ordering::Acquire);
+        loop {
+            let next = cur
+                .checked_add(bytes)
+                .filter(|&sum| sum <= self.max_bytes)
+                .ok_or_else(|| PackfileUriError::CapacityExceeded("global inflight byte limit exceeded".to_owned()))?;
+            match self.used_bytes.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(InflightBytesGuard { limiter: Arc::clone(self), bytes, released: false }),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    pub fn used_bytes(&self) -> u64 {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+}
+
+pub struct InflightBytesGuard {
+    limiter: Arc<InflightBytesLimiter>,
+    bytes: u64,
+    released: bool,
+}
+
+impl Drop for InflightBytesGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.limiter.used_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
         }
     }
 }
@@ -163,21 +281,16 @@ pub struct PackfileClosureMember {
 }
 
 impl PackfileClosureMember {
-    /// Builds a validated candidate descriptor from metadata.
     pub fn validate(&self, object_format: PackObjectFormat) -> Result<(), PackfileUriError> {
         validate_catalog_pack_oid(&self.pack_oid, object_format)?;
         validate_pack_oid(&self.pack_hash_hex, object_format)?;
         validate_hex_sha256(&self.sha256_hex)?;
         if self.byte_len == 0 || self.byte_len > MAX_OFFLOAD_BYTES_HARD_CAP {
-            return Err(PackfileUriError::InvalidPolicy(format!(
-                "invalid pack byte length: {}",
-                self.byte_len
-            )));
+            return Err(PackfileUriError::InvalidPolicy(format!("invalid pack byte length: {}", self.byte_len)));
         }
         Ok(())
     }
 
-    /// Converts from a cataloged [`PackSetEntry`] plus verified pack checksum, byte length, and wire hash.
     pub fn from_pack_set_entry(
         entry: &PackSetEntry,
         pack_hash_hex: String,
@@ -195,37 +308,28 @@ impl PackfileClosureMember {
     }
 }
 
-/// Validates a catalog pack identifier (`40`/`64` hex for repository object format or 64-hex RefStore pack id).
 pub fn validate_catalog_pack_oid(value: &str, format: PackObjectFormat) -> Result<(), PackfileUriError> {
     if is_lower_hex_exact(value, format.oid_hex_len()) || is_lower_hex_exact(value, 64) {
         Ok(())
     } else {
-        Err(PackfileUriError::InvalidPolicy(
-            "catalog pack_oid must be 40 or 64 lowercase hex chars".to_owned(),
-        ))
+        Err(PackfileUriError::InvalidPolicy("catalog pack_oid must be 40 or 64 lowercase hex chars".to_owned()))
     }
 }
 
-/// Validates a lowercase pack identifier or Git pack trailer checksum matching [`PackObjectFormat`].
 pub fn validate_pack_oid(value: &str, format: PackObjectFormat) -> Result<(), PackfileUriError> {
     let expected = format.oid_hex_len();
     if is_lower_hex_exact(value, expected) {
         Ok(())
     } else {
-        Err(PackfileUriError::InvalidPolicy(format!(
-            "pack oid/hash must be {expected} lowercase hex chars"
-        )))
+        Err(PackfileUriError::InvalidPolicy(format!("pack oid/hash must be {expected} lowercase hex chars")))
     }
 }
 
-/// Validates an exact 64-char lowercase SHA-256 hex digest.
 pub fn validate_hex_sha256(value: &str) -> Result<(), PackfileUriError> {
     if is_lower_hex_exact(value, 64) {
         Ok(())
     } else {
-        Err(PackfileUriError::InvalidPolicy(
-            "sha256 digest must be 64 lowercase hex chars".to_owned(),
-        ))
+        Err(PackfileUriError::InvalidPolicy("sha256 digest must be 64 lowercase hex chars".to_owned()))
     }
 }
 
@@ -242,6 +346,7 @@ pub struct SignedPackfileDescriptor {
     pub pin_id: Uuid,
     pub key_id: String,
     pub scope_nonce: String,
+    pub subject: DownloadSubjectContext,
 }
 
 impl fmt::Debug for SignedPackfileDescriptor {
@@ -254,6 +359,7 @@ impl fmt::Debug for SignedPackfileDescriptor {
             .field("expires_at_unix", &self.expires_at_unix)
             .field("pin_id", &self.pin_id)
             .field("key_id", &self.key_id)
+            .field("actor_id", &self.subject.actor_id)
             .finish_non_exhaustive()
     }
 }

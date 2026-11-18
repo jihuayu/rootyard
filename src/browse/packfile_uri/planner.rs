@@ -1,10 +1,9 @@
-//! Bounded Git fetch delivery planner combining live auth, Protocol v2
-//! negotiation, closure validation, active retention pins, CDN health breaker,
-//! and deterministic inline fallback.
+//! Bounded Git fetch delivery planner integrating #184 `VerifiedFetchPlanProof`
+//! closure verification, live auth binding, active retention pins with rollback,
+//! CDN circuit breaker, and deterministic inline fallback.
 
 use std::{
-    collections::HashSet,
-    net::IpAddr,
+    collections::HashMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -14,13 +13,21 @@ use std::{
 
 use uuid::Uuid;
 
+use crate::ref_store::ref_version::{
+    MAX_CLOSURE_PACKS,
+    pack_cover::{
+        AuthorizationContext, CoverHierarchyIndex, FetchPlan, PackRetentionState, RetentionClassificationIndex,
+        VerifiedFetchPlanProof,
+    },
+};
+
 use super::{
     protocol_v2::FetchV2Request,
-    retention::{AcquireLeaseParams, PackDeliveryLeaseRegistry},
+    retention::{AcquireLeaseParams, OffloadPackPinGuard, PackDeliveryLeaseRegistry},
     signing::{LivePackReadAuthorizer, MintUriRequest, PackUriKeyring, mint_signed_offload_uri},
-    ssrf_guard::validate_policy_config,
+    ssrf_guard::{PackUriDnsResolver, validate_policy_config},
     types::{
-        DeliveryMode, DeliveryTelemetry, FallbackReason, OffloadPolicyConfig, PackObjectFormat,
+        DeliveryMode, DeliveryTelemetry, DownloadSubjectContext, FallbackReason, OffloadPolicyConfig, PackObjectFormat,
         PackfileClosureMember, PackfileUriError,
     },
 };
@@ -117,29 +124,31 @@ impl Drop for CdnProbeGuard<'_> {
     }
 }
 
-/// Exact object closure accounting for one repository `fetch` response.
+/// Verified wire hashes and byte length for one `#184` `pack_id` staged on CDN/pack cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PackClosurePlan {
-    pub total_objects: u64,
-    pub total_inline_bytes: u64,
-    pub offload_candidates: Vec<PackfileClosureMember>,
-    pub residual_inline_objects: u64,
-    pub residual_inline_bytes: u64,
+pub struct PackWireMeta {
+    pub pack_oid: String,
+    pub pack_hash_hex: String,
+    pub sha256_hex: String,
+    pub byte_len: u64,
+    pub cache_warm: bool,
 }
 
-impl PackClosurePlan {
-    /// Ensures selected offload candidates plus residual objects cover the exact requested closure.
-    pub fn is_closure_complete(&self) -> bool {
-        let mut seen_packs = HashSet::with_capacity(self.offload_candidates.len());
-        let mut seen_hashes = HashSet::with_capacity(self.offload_candidates.len());
-        let mut offloaded_objs = 0u64;
-        for c in &self.offload_candidates {
-            if c.covered_objects == 0 || !seen_packs.insert(&c.pack_oid) || !seen_hashes.insert(&c.pack_hash_hex) {
-                return false;
-            }
-            offloaded_objs = offloaded_objs.saturating_add(c.covered_objects);
-        }
-        self.total_objects > 0 && offloaded_objs.saturating_add(self.residual_inline_objects) == self.total_objects
+/// Proof-bound `#184` closure input replacing unverified caller object counters.
+pub struct VerifiedPackCoverInput<'a> {
+    pub auth: &'a AuthorizationContext,
+    pub plan: &'a FetchPlan,
+    pub proof: &'a VerifiedFetchPlanProof,
+    pub cover_index: &'a CoverHierarchyIndex,
+    pub retention_index: &'a RetentionClassificationIndex,
+    pub wire_packs: &'a HashMap<Uuid, PackWireMeta>,
+    pub residual_inline_bytes: u64,
+    pub full_fallback_inline_bytes: u64,
+}
+
+impl VerifiedPackCoverInput<'_> {
+    pub fn total_planned_commits(&self) -> u64 {
+        self.plan.needed_commits.len() as u64
     }
 }
 
@@ -147,15 +156,14 @@ impl PackClosurePlan {
 pub struct DeliveryPlanRequest<'a> {
     pub tenant_id: Uuid,
     pub repository_id: Uuid,
-    pub actor_id: Uuid,
     pub gate_revision: i64,
     pub object_format: PackObjectFormat,
     pub fetch_req: &'a FetchV2Request,
-    pub closure: &'a PackClosurePlan,
+    pub cover: &'a VerifiedPackCoverInput<'a>,
     pub cdn_health: CdnHealthState,
     pub allowed_host: &'a str,
     pub now_unix: u64,
-    pub resolved_ips: &'a [IpAddr],
+    pub resolver: &'a dyn PackUriDnsResolver,
     pub policy: &'a OffloadPolicyConfig,
     pub active_queue_saturated: bool,
 }
@@ -192,52 +200,43 @@ impl DeliveryPlanner {
         &self.breaker
     }
 
-    /// Evaluates live auth, protocol support, CDN health, bounds, and retention pins.
+    /// Evaluates `#184` proof + live auth, protocol support, CDN health, bounds, and retention pins.
     pub async fn plan_fetch(
         &self,
         authorizer: &dyn LivePackReadAuthorizer,
         req: &DeliveryPlanRequest<'_>,
     ) -> Result<PlannedFetchResponse, PackfileUriError> {
+        let auth = req.cover.auth;
+        let subject = DownloadSubjectContext::new(auth.actor_id, auth.token_id, auth.auth_epoch)?;
+        if req.tenant_id.is_nil()
+            || req.repository_id.is_nil()
+            || auth.tenant_id != req.tenant_id
+            || auth.repository_id != req.repository_id
+            || !req.cover.proof.binds_live_auth(auth)
+        {
+            return Err(PackfileUriError::Unauthorized);
+        }
         authorizer
-            .authorize_pack_download(
-                req.tenant_id,
-                req.repository_id,
-                req.actor_id,
-                "closure-plan",
-                Uuid::nil(),
-            )
+            .authorize_pack_download(req.tenant_id, req.repository_id, &subject, "closure-plan", Uuid::nil())
             .await?;
 
         if let Some(reason) = self.check_fallback_preconditions(req)? {
-            return Ok(Self::build_inline_response(req.closure, reason));
+            return Ok(Self::build_inline_response(req.cover, reason));
         }
 
-        let mut selected = Vec::new();
-        let mut selected_bytes = 0u64;
-        let mut residual_inline_bytes = req.closure.residual_inline_bytes;
-        let mut residual_objects = req.closure.residual_inline_objects;
-
-        for candidate in &req.closure.offload_candidates {
-            candidate.validate(req.object_format)?;
-            let within_count = selected.len() < req.policy.max_uris_per_fetch;
-            let fits_budget = selected_bytes.saturating_add(candidate.byte_len) <= req.policy.max_pack_bytes_per_request;
-            if within_count && fits_budget && candidate.byte_len >= req.policy.min_pack_bytes_for_offload {
-                selected.push(candidate);
-                selected_bytes = selected_bytes.saturating_add(candidate.byte_len);
-            } else {
-                residual_inline_bytes = residual_inline_bytes.saturating_add(candidate.byte_len);
-                residual_objects = residual_objects.saturating_add(candidate.covered_objects);
-            }
-        }
+        let (selected, residual_inline_bytes, residual_objects) = match Self::select_proof_bound_candidates(req)? {
+            Some(tuple) => tuple,
+            None => return Ok(Self::build_inline_response(req.cover, FallbackReason::IncompleteClosure)),
+        };
         if selected.is_empty() {
-            return Ok(Self::build_inline_response(req.closure, FallbackReason::BelowOffloadThreshold));
+            return Ok(Self::build_inline_response(req.cover, FallbackReason::BelowOffloadThreshold));
         }
-        self.mint_offloaded_descriptors(req, &selected, residual_inline_bytes, residual_objects)
+        self.mint_offloaded_descriptors(req, subject, &selected, residual_inline_bytes, residual_objects)
     }
 
     /// Explicit clean pre-body escalation to a full inline pack response after bounded retries fail.
-    pub fn plan_full_inline_retry(closure: &PackClosurePlan, reason: FallbackReason) -> PlannedFetchResponse {
-        Self::build_inline_response(closure, reason)
+    pub fn plan_full_inline_retry(cover: &VerifiedPackCoverInput<'_>, reason: FallbackReason) -> PlannedFetchResponse {
+        Self::build_inline_response(cover, reason)
     }
 
     fn check_fallback_preconditions(
@@ -254,7 +253,18 @@ impl DeliveryPlanner {
         if !req.fetch_req.client_supports_https_offload() {
             return Ok(Some(FallbackReason::ClientUnsupportedProtocols));
         }
-        if !req.closure.is_closure_complete() {
+        if req.cover.proof.selected_cover_ids().len() > MAX_CLOSURE_PACKS
+            || req.cover.plan.selected_covers.len() > MAX_CLOSURE_PACKS
+            || req.cover.wire_packs.len() > MAX_CLOSURE_PACKS
+        {
+            return Err(PackfileUriError::CapacityExceeded(
+                "closure candidate count exceeds MAX_CLOSURE_PACKS".to_owned(),
+            ));
+        }
+        if !req.cover.proof.binds(req.cover.plan)
+            || req.cover.proof.realm().tenant_id() != req.tenant_id
+            || req.cover.proof.realm().repository_id() != req.repository_id
+        {
             return Ok(Some(FallbackReason::IncompleteClosure));
         }
         if req.active_queue_saturated {
@@ -271,16 +281,76 @@ impl DeliveryPlanner {
         Ok(None)
     }
 
+    fn select_proof_bound_candidates(
+        req: &DeliveryPlanRequest<'_>,
+    ) -> Result<Option<(Vec<PackfileClosureMember>, u64, u64)>, PackfileUriError> {
+        let cover_ids = req.cover.proof.selected_cover_ids();
+        let pack_ids = req.cover.proof.selected_pack_ids();
+        if cover_ids.is_empty() || cover_ids.len() != pack_ids.len() {
+            return Ok(None);
+        }
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0u64;
+        let mut residual_inline_bytes = req.cover.residual_inline_bytes;
+        let mut residual_objects = 0u64;
+
+        for (cover_id, pack_id) in cover_ids.iter().zip(pack_ids.iter()) {
+            let Some(record) = req.cover.cover_index.get(cover_id) else {
+                return Ok(None);
+            };
+            if record.verify_digest().is_err() || record.pack().entry().pack_id() != *pack_id {
+                return Ok(None);
+            }
+            let commit_cnt = record.covered_commits().len() as u64;
+            let cls = req.cover.retention_index.classify_cover(record);
+            let retention_ok = cls.state == Some(PackRetentionState::PlannableForFetch)
+                && cls.physically_present
+                && cls.plannable_for_fetch
+                && !cls.gc_eligible
+                && !record.artifacts().is_thin_pack;
+
+            let Some(wire) = req.cover.wire_packs.get(pack_id) else {
+                residual_inline_bytes = residual_inline_bytes.saturating_add(record.artifacts().pack_locator.length());
+                residual_objects = residual_objects.saturating_add(commit_cnt);
+                continue;
+            };
+            if wire.byte_len != record.artifacts().pack_locator.length() {
+                return Ok(None);
+            }
+            let member = PackfileClosureMember {
+                pack_oid: wire.pack_oid.clone(),
+                pack_hash_hex: wire.pack_hash_hex.clone(),
+                sha256_hex: wire.sha256_hex.clone(),
+                byte_len: wire.byte_len,
+                covered_objects: commit_cnt.max(1),
+                cache_warm: wire.cache_warm,
+            };
+            member.validate(req.object_format)?;
+
+            let within_count = selected.len() < req.policy.max_uris_per_fetch;
+            let fits_budget = selected_bytes.saturating_add(member.byte_len) <= req.policy.max_pack_bytes_per_request;
+            if retention_ok && within_count && fits_budget && member.byte_len >= req.policy.min_pack_bytes_for_offload {
+                selected_bytes = selected_bytes.saturating_add(member.byte_len);
+                selected.push(member);
+            } else {
+                residual_inline_bytes = residual_inline_bytes.saturating_add(member.byte_len);
+                residual_objects = residual_objects.saturating_add(commit_cnt);
+            }
+        }
+        Ok(Some((selected, residual_inline_bytes, residual_objects)))
+    }
+
     fn mint_offloaded_descriptors(
         &self,
         req: &DeliveryPlanRequest<'_>,
-        selected: &[&PackfileClosureMember],
+        subject: DownloadSubjectContext,
+        selected: &[PackfileClosureMember],
         residual_inline_bytes: u64,
         residual_objects: u64,
     ) -> Result<PlannedFetchResponse, PackfileUriError> {
         let expires_at_unix = req.now_unix.saturating_add(req.policy.ttl_secs);
         let mut offloaded = Vec::with_capacity(selected.len());
-        let mut lease_pins = Vec::with_capacity(selected.len());
+        let mut lease_pins: Vec<Arc<OffloadPackPinGuard>> = Vec::with_capacity(selected.len());
         let mut telemetry = DeliveryTelemetry { offload_used: true, inline_bytes: residual_inline_bytes, ..Default::default() };
 
         for candidate in selected {
@@ -288,20 +358,23 @@ impl DeliveryPlanner {
                 tenant_id: req.tenant_id,
                 repository_id: req.repository_id,
                 pack_oid: &candidate.pack_oid,
+                subject,
                 gate_revision: req.gate_revision,
                 now_unix: req.now_unix,
                 expires_at_unix,
                 grace_secs: req.policy.retention_grace_secs,
             }) else {
-                return Ok(Self::build_inline_response(req.closure, FallbackReason::PinAcquisitionFailed));
+                self.rollback_leases(&mut lease_pins, req.now_unix);
+                return Ok(Self::build_inline_response(req.cover, FallbackReason::PinAcquisitionFailed));
             };
             let seq = self.nonce_seq.fetch_add(1, Ordering::Relaxed);
             let nonce = format!("{:016x}{:016x}", Uuid::new_v4().as_u128() >> 64, seq);
-            let desc = mint_signed_offload_uri(
+            let desc = match mint_signed_offload_uri(
                 &self.keyring,
                 &MintUriRequest {
                     tenant_id: req.tenant_id,
                     repository_id: req.repository_id,
+                    subject,
                     pack_oid: &candidate.pack_oid,
                     pack_hash_hex: &candidate.pack_hash_hex,
                     sha256_hex: &candidate.sha256_hex,
@@ -312,9 +385,16 @@ impl DeliveryPlanner {
                     scope_nonce: &nonce,
                     now_unix: req.now_unix,
                     policy: req.policy,
-                    resolved_ips: req.resolved_ips,
+                    resolver: req.resolver,
                 },
-            )?;
+            ) {
+                Ok(d) => d,
+                Err(err) => {
+                    lease_pins.push(pin_guard);
+                    self.rollback_leases(&mut lease_pins, req.now_unix);
+                    return Err(err);
+                }
+            };
             telemetry.offloaded_bytes = telemetry.offloaded_bytes.saturating_add(desc.byte_len);
             if candidate.cache_warm {
                 telemetry.cache_hits = telemetry.cache_hits.saturating_add(1);
@@ -337,19 +417,26 @@ impl DeliveryPlanner {
         })
     }
 
-    fn build_inline_response(closure: &PackClosurePlan, reason: FallbackReason) -> PlannedFetchResponse {
+    fn rollback_leases(&self, lease_pins: &mut Vec<Arc<OffloadPackPinGuard>>, now_unix: u64) {
+        for pin in lease_pins.drain(..) {
+            let id = pin.pin_id();
+            drop(pin);
+            self.leases.revoke_pin(id);
+        }
+        self.leases.sweep_expired(now_unix);
+    }
+
+    fn build_inline_response(cover: &VerifiedPackCoverInput<'_>, reason: FallbackReason) -> PlannedFetchResponse {
+        let total_inline_bytes = cover.full_fallback_inline_bytes;
+        let total_objects = cover.total_planned_commits();
         PlannedFetchResponse {
-            mode: DeliveryMode::InlineFallback {
-                reason,
-                total_inline_bytes: closure.total_inline_bytes,
-                total_objects: closure.total_objects,
-            },
+            mode: DeliveryMode::InlineFallback { reason, total_inline_bytes, total_objects },
             telemetry: DeliveryTelemetry {
                 offload_used: false,
                 fallback_reason: Some(reason),
-                blob_get_count: u64::from(closure.total_inline_bytes > 0),
-                blob_get_bytes: closure.total_inline_bytes,
-                inline_bytes: closure.total_inline_bytes,
+                blob_get_count: u64::from(total_inline_bytes > 0),
+                blob_get_bytes: total_inline_bytes,
+                inline_bytes: total_inline_bytes,
                 ..Default::default()
             },
         }

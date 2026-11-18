@@ -14,11 +14,16 @@ except ImportError:  # pragma: no cover
 
 ROOT = Path(__file__).resolve().parents[1]
 MOD_DIR = ROOT / "src" / "browse" / "packfile_uri"
-RUST_FILES = [
+SUPPORT_DIR = ROOT / "tests" / "packfile_uri_support"
+OWNED_RUST_FILES = [
     ROOT / "src" / "browse" / "packfile_uri.rs",
     *sorted(MOD_DIR.glob("*.rs")),
     ROOT / "tests" / "packfile_uri_delivery.rs",
-    ROOT / "tests" / "packfile_uri_support" / "harness.rs",
+    *sorted(SUPPORT_DIR.glob("*.rs")),
+]
+GATEWAY_WIRING_FILES = [
+    ROOT / "src" / "blob_git_gateway" / "state.rs",
+    ROOT / "src" / "blob_git_gateway" / "smart_http.rs",
 ]
 WORKFLOW = ROOT / ".github" / "workflows" / "packfile-uri-delivery.yml"
 DOC = ROOT / "docs" / "packfile-uri-delivery.md"
@@ -33,10 +38,11 @@ class PackfileUriContractsTest(unittest.TestCase):
         browse_txt = browse_raw.decode("utf-8")
         self.assertIn("pub mod packfile_uri;", browse_txt)
         self.assertLess(len(browse_txt.splitlines()), 100)
+        self.assertLess(len((ROOT / "src" / "browse" / "packfile_uri.rs").read_text("utf-8").splitlines()), 100)
         self.assertFalse(list((ROOT / "src" / "browse").rglob("mod.rs")))
 
         total_deserialize = 0
-        for path in RUST_FILES:
+        for path in OWNED_RUST_FILES:
             with self.subTest(file=path.relative_to(ROOT).as_posix()):
                 raw = path.read_bytes()
                 self.assertNotIn(b"\r\n", raw, f"CRLF detected in {path.name}")
@@ -52,6 +58,31 @@ class PackfileUriContractsTest(unittest.TestCase):
                     total_deserialize += 1
                     self.assertIn("deny_unknown_fields", match.group(0), f"{match.group(1)} lacks deny_unknown_fields")
         self.assertGreaterEqual(total_deserialize, 4)
+
+        for gw_path in GATEWAY_WIRING_FILES:
+            raw = gw_path.read_bytes()
+            self.assertNotIn(b"\r\n", raw, f"CRLF detected in {gw_path.name}")
+            text = raw.decode("utf-8")
+            self.assertLess(len(text.splitlines()), 500, f"{gw_path.name} exceeds 500 lines")
+        smart_txt = (ROOT / "src" / "blob_git_gateway" / "smart_http.rs").read_text("utf-8")
+        self.assertNotIn("#[allow(", smart_txt)
+        self.assertIn("inject_packfile_uris_into_v2_advertisement", smart_txt)
+        self.assertIn("try_serve_upload_pack_v2", smart_txt)
+
+    def test_security_and_closure_proof_contracts(self) -> None:
+        types_txt = (MOD_DIR / "types.rs").read_text("utf-8")
+        self.assertIn("Self::disabled()", types_txt)
+        self.assertIn("DownloadSubjectContext", types_txt)
+        ssrf_txt = (MOD_DIR / "ssrf_guard.rs").read_text("utf-8")
+        self.assertIn("pinned_addrs", ssrf_txt)
+        dl_txt = (MOD_DIR / "downloader.rs").read_text("utf-8")
+        self.assertIn("resolve_to_addrs", dl_txt)
+        self.assertIn(".chunk()", dl_txt)
+        planner_txt = (MOD_DIR / "planner.rs").read_text("utf-8")
+        self.assertIn("VerifiedFetchPlanProof", planner_txt)
+        self.assertIn("binds_live_auth", planner_txt)
+        delivery_txt = (MOD_DIR / "delivery.rs").read_text("utf-8")
+        self.assertIn("Body::from_stream", delivery_txt)
 
     def test_workflow_contract_and_required_triggers(self) -> None:
         wf_raw = WORKFLOW.read_bytes()
@@ -72,6 +103,8 @@ class PackfileUriContractsTest(unittest.TestCase):
                 "src/browse.rs",
                 "src/browse/packfile_uri.rs",
                 "src/browse/packfile_uri/**",
+                "src/blob_git_gateway/state.rs",
+                "src/blob_git_gateway/smart_http.rs",
                 "tests/packfile_uri_delivery.rs",
                 "tests/packfile_uri_support/**",
                 "tests/test_packfile_uri_contracts.py",
@@ -86,6 +119,7 @@ class PackfileUriContractsTest(unittest.TestCase):
             "scripts/install_ci_cargo_fork.sh verify",
             "1.99.1",
             'RUSTFLAGS="-D warnings"',
+            "postgres:17",
         ):
             self.assertIn(token, wf_text)
 

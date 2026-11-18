@@ -4,37 +4,34 @@ Refs #185
 
 ## Overview
 
-`src/browse/packfile_uri.rs` (and submodules under `src/browse/packfile_uri/`) implements optional Git Protocol v2 `packfile-uris` offload paired with deterministic inline fallback inside `rootyard::browse::packfile_uri`.
+`src/browse/packfile_uri.rs` (with submodules under `src/browse/packfile_uri/`) and optional wiring in `src/blob_git_gateway/{state.rs, smart_http.rs}` implement default-off Git Protocol v2 `packfile-uris` offload paired with deterministic inline fallback.
 
-When enabled for a tenant/repository and advertised in `fetch` capabilities (`shallow filter wait-for-done packfile-uris`), clients advertising `packfile-uris https` receive short-lived HMAC-SHA256 signed `https://` descriptors referencing immutable pre-materialized `.pack` objects (`40`-hex SHA-1 or `64`-hex SHA-256 pack trailer hash) plus only the small residual inline delta closure over the multiplexed `packfile` band.
+`OffloadPolicyConfig::default()` returns `OffloadPolicyConfig::disabled()` (`enabled: false`, `advertise_in_capabilities: false`), and `BlobGitState::new` leaves `packfile_offload: None` unless explicitly configured via `BlobGitState::with_packfile_offload`. When disabled, capability advertisement omits `packfile-uris` and every mint, verification, streaming, router (`503`), response-encoder, and downloader boundary fails closed.
 
 ## Architecture & Security Invariants
 
-1. **Opt-in Protocol v2 Negotiation (`protocol_v2.rs`)**
-   - Server capability `packfile-uris` is emitted only when policy enables and advertises offload.
-   - `parse_fetch_v2_request` strictly validates Git Protocol v2 `command=fetch` pkt-lines (`0001` delim / `0000` flush), enforces `object-format` matching (`sha1`/`sha256`), and rejects duplicate `packfile-uris` lines.
-   - Only `https` offload URIs are emitted; HTTP-only client requests (`packfile-uris http`) deterministically select full inline fallback.
-2. **SSRF, Host Allowlist & Query Tampering Guard (`ssrf_guard.rs`)**
-   - `validate_policy_config` and `validate_offload_uri` enforce HTTPS-only scheme, explicit lowercase multi-label DNS host allowlist (`allowed_hosts`), default port (`443` / omitted), clean traversal-free paths inside `path_prefix`, and no userinfo (`@`), backslashes, fragments, IP literals, or internal suffixes (`.local`, `.internal`, `.localhost`, `metadata.google.internal`).
-   - Resolved peer IPs are checked via `crate::webhooks::policy::permitted_peer(..., false)` so loopback (`127.0.0.0/8`, `::1`), link-local metadata (`169.254.169.254`, `fe80::/10`), RFC1918, ULA (`fc00::/7`), and IPv4-mapped private addresses fail closed.
-   - HTTP redirects are refused (`redirect::Policy::none()`) rather than blindly followed.
-   - `redact_uri_for_log` strips signed query parameters before logging or returning error strings.
-3. **Short-lived Signing & Mandatory Live Authorization (`signing.rs`)**
-   - `PackUriKeyring` binds each download URL via domain-separated HMAC-SHA256 (`rootyard-packfile-uri-v1`) across `(tenant_id, repository_id, pack_oid, object_format, "https", allowed_host, 443, canonical_path, expires_at_unix, key_id, scope_nonce, pin_id)` using zeroizing `SigningKeyMaterial` and supports key rotation (`retire_for_signing`) plus instant revocation (`revoke_key`).
-   - Query parsing rejects duplicate query keys and unknown parameters (`#[serde(deny_unknown_fields)]`).
-   - `verify_signed_download_request` always calls `LivePackReadAuthorizer::authorize_pack_download` before streaming bytes; a signed URL or cache hit never substitutes for live authorization.
-4. **Active Retention Pins & Compaction Safety (`retention.rs`)**
-   - `PackDeliveryLeaseRegistry` wraps Issue #163 `DurablePinRegistry` (`DurablePinHold`) across the offload lease lifetime `[now .. expires_at + retention_grace_secs]` and increments `inflight_downloads` via `InflightDownloadGuard`.
-   - `can_sweep_pack` returns `false` while any active lease, grace window, guard ref, or live download remains active so concurrent GC, compaction, or history switches never drop needed packs mid-fetch.
-   - Pin revocation invalidates streaming mid-chunk (`is_hold_still_valid`) and fails HTTP fetches closed (`410 Gone`).
-5. **Deterministic Inline Fallback & Bounded Delivery (`planner.rs`, `delivery.rs`)**
-   - `DeliveryPlanner` triggers clean full-inline fallback when the feature is disabled, client omits `packfile-uris` or omits `https`, closure coverage is incomplete, queue capacity is saturated, CDN health is unavailable, `CdnCircuitBreaker` is open, pin acquisition fails, or candidate packs fall below `min_pack_bytes_for_offload`.
-   - Unauthorized callers always fail closed (`Unauthorized`) before fallback selection.
-   - Client downloads (`fetch_pack_with_integrity_and_retry`) enforce bounded concurrency, byte limits, request deadline, bounded retries (`<= 3`), exact `.pack` trailer hash check, and SHA-256 verification before accepting pack data. Failed HTTP `401`/`403`/`410` responses fail closed immediately instead of masking auth/pin failures.
+1. **Default-Off Policy & Protocol v2 Negotiation (`types.rs`, `protocol_v2.rs`, `smart_http.rs`)**
+   - `should_advertise_packfile_uris` and `inject_packfile_uris_into_v2_advertisement` advertise `packfile-uris` strictly when `policy.enabled && policy.advertise_in_capabilities`.
+   - `parse_fetch_v2_request` enforces pkt-line framing, repository `object-format` (`sha1`/`sha256`), `MAX_FETCH_WANTS = 1024`, `MAX_FETCH_HAVES = 4096`, and single `packfile-uris` protocol declaration.
+   - `encode_fetch_v2_response` refuses `OffloadPlusResidual` emission if `!policy.enabled` or if any descriptor is non-`https://`.
+2. **Pinned Single-Resolution SSRF & Host Allowlist Guard (`ssrf_guard.rs`, `downloader.rs`)**
+   - `validate_policy_config` and `validate_offload_uri_and_resolve` fail closed when `!policy.enabled`, enforce `https` on port `443` in `strict_production` (`loopback_allowed = false`), reject empty resolved peer address sets (`SsrfBlocked`), reject raw IP literals/wildcards/userinfo/traversal, and validate every resolved `SocketAddr` via `crate::webhooks::policy::permitted_peer`.
+   - `fetch_pack_with_integrity_and_retry` resolves once via `PackUriDnsResolver` and pins those exact `SocketAddr`s into `reqwest::Client::builder().resolve_to_addrs(&validated.host, &validated.pinned_addrs)` with `redirect::Policy::none()`, eliminating DNS rebinding TOCTOU between validation and connect.
+3. **Subject- & `Host`-Bound HMAC Signing + Live Per-Request/Chunk Re-Authorization (`signing.rs`, `delivery.rs`, `gateway_bridge.rs`)**
+   - `DownloadSubjectContext` rejects nil `actor_id` / `token_id` UUIDs and `auth_epoch == 0`.
+   - `SignedDownloadClaims` binds `(tenant_id, repository_id, pack_oid, object_format, "https", allowed_host, port, canonical_path, actor_id, token_id, auth_epoch, expires_at_unix, key_id, scope_nonce, pin_id)` inside domain-separated HMAC-SHA256 (`rootyard-packfile-uri-v1`).
+   - `axum_serve_handler` extracts and validates the real inbound HTTP `Host` / authority header against `allowed_hosts` and the signed `allowed_host`, validates optional `x-rootyard-actor` / `x-rootyard-token-id` / `x-rootyard-auth-epoch` headers, and invokes `LivePackReadAuthorizer::authorize_pack_download` (`ReadAuthorization::revalidate` against live PostgreSQL tokens/RBAC/scope/realm/backend) before streaming and on every 32 KiB chunk.
+4. **Real `#184` `VerifiedFetchPlanProof` Closure Verification (`cover_builder.rs`, `planner.rs`)**
+   - `DeliveryPlanner::plan_fetch` requires `#184` `AuthorizationContext`, `FetchPlan`, `VerifiedFetchPlanProof`, `CoverHierarchyIndex`, and `RetentionClassificationIndex` (`proof.binds_live_auth(auth)` and `proof.binds(plan)`), capping candidates to `MAX_CLOSURE_PACKS` and selecting only non-thin `PlannableForFetch` covers (`>= min_pack_bytes_for_offload`).
+   - `build_verified_cover_proof_from_repo` seals `#184` `VersionRecord` and `CoverHierarchyRecord` structures over materialized `.pack`/`.idx` pairs, proves closure via `plan_fetch_covers` + `verify_fetch_plan_closure`, and packs `(wants \ haves) \ offloaded_oids` inline via `build_residual_pack_bytes`.
+5. **Bounded Streaming Guards, Lease Sweeping & Transactional Pin Rollback (`retention.rs`, `delivery.rs`, `downloader.rs`)**
+   - `PackDeliveryLeaseRegistry` auto-sweeps expired unreferenced leases in `acquire_offload_pin`, enforces `max_active_leases`, binds `DownloadSubjectContext` on `begin_download_hold`, and rolls back/revokes+sweeps earlier pins in `DeliveryPlanner` on partial mint/pin failure.
+   - `serve_signed_packfile_stream` streams 32 KiB chunks via `Body::from_stream` holding `OwnedSemaphorePermit`, `InflightBytesGuard`, `InflightDownloadGuard`, and stream `deadline` until EOF or drop, aborting mid-stream on policy disable, pin revocation, or live auth revocation.
+   - `fetch_pack_with_integrity_and_retry` streams response chunks via `resp.chunk().await` bounded by `min(desc.byte_len, max_pack_bytes)` and `InflightBytesLimiter`, verifying exact byte length, SHA-256, and `.pack` trailer hash.
 
 ## Measured Baseline (#164 Inline) vs Offload (#185) Comparison
 
-Generated via [eval_packfile_uri_delivery.py](../scripts/eval_packfile_uri_delivery.py) (`--profiles small,medium --formats sha1,sha256`) using real stock Git (`git version 2.45.1.windows.1`), Smart HTTP v2, and local TLS `CONNECT` proxy:
+Generated via [eval_packfile_uri_delivery.py](../scripts/eval_packfile_uri_delivery.py) (`--profiles small,medium --formats sha1,sha256`) using real stock Git, Smart HTTP v2, and local TLS termination:
 
 | Profile | Format | Baseline (#164) Origin Egress | Offload (#185) Origin Egress | Origin Reduction | CDN Cache Hits | Blob GET Count (Base -> Offload) | Inline P50 / P95 (ms) | Offload P50 / P95 (ms) | `git fsck` |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -44,5 +41,4 @@ Generated via [eval_packfile_uri_delivery.py](../scripts/eval_packfile_uri_deliv
 | `medium` | `sha256` | 1,319,985 B | 6,180 B | 99.53% | 4 / 5 | 5 -> 1 | 238.6 / 270.0 | 328.8 / 346.9 | Pass |
 
 **Scope & Topology Notes**:
-- All benchmarks ran in a single-host loopback harness with real stock `git clone` and TLS `CONNECT` termination; results measure origin egress offload, Blob storage GET amplification reduction (`N -> 1` cache misses), and warm CDN cache reuse, and make no claims regarding cross-region WAN CDN latency or multi-region SLAs.
-- On tiny packs (`min_pack_bytes_for_offload`), a separate TLS handshake adds single-host overhead compared with a single-stream inline fetch, which is why small candidates stay inline below `min_pack_bytes_for_offload`.
+- Benchmarks ran in a single-host loopback harness with real stock `git clone` and TLS termination; results measure origin egress offload, Blob storage GET amplification reduction (`N -> 1` cache misses), and warm CDN cache reuse, and make no claims regarding cross-region WAN CDN latency or multi-region SLAs.

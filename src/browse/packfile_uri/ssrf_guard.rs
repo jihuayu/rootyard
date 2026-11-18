@@ -1,32 +1,107 @@
-//! Strict HTTPS-only SSRF, host allowlist, path-traversal, and DNS IP guards
-//! for signed `packfile-uris` offload delivery.
+//! Strict HTTPS-only SSRF, host allowlist, path-traversal, and pinned DNS
+//! peer-address validation for signed `packfile-uris` offload delivery.
 
-use std::net::IpAddr;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    sync::Mutex,
+};
 
 use axum::http::Uri;
 
 use crate::webhooks::policy::{host_is_loopback, permitted_peer};
 
 use super::types::{
-    MAX_DEADLINE_MS, MAX_OFFLOAD_BYTES_HARD_CAP, MAX_OFFLOAD_TTL_SECS, MAX_RETENTION_GRACE_SECS,
-    MAX_RETRIES_HARD_CAP, MAX_URIS_PER_FETCH_CAP, MIN_DEADLINE_MS, MIN_OFFLOAD_TTL_SECS, OffloadPolicyConfig,
-    PackfileUriError,
+    MAX_ACTIVE_LEASES_HARD_CAP, MAX_DEADLINE_MS, MAX_OFFLOAD_BYTES_HARD_CAP, MAX_OFFLOAD_TTL_SECS,
+    MAX_RETENTION_GRACE_SECS, MAX_RETRIES_HARD_CAP, MAX_URIS_PER_FETCH_CAP, MIN_DEADLINE_MS, MIN_OFFLOAD_TTL_SECS,
+    OffloadPolicyConfig, PackfileUriError,
 };
 
 const MAX_URI_LEN: usize = 2048;
 
-/// Canonical parsed offload URI validated against scheme, allowlist, path, and DNS IP rules.
+/// Resolver returning concrete peer [`SocketAddr`]s that are validated and pinned into the HTTP client.
+pub trait PackUriDnsResolver: Send + Sync {
+    fn resolve_host(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, PackfileUriError>;
+}
+
+/// Production OS resolver (`std::net::ToSocketAddrs`) whose output is validated and pinned per request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemDnsResolver;
+
+impl PackUriDnsResolver for SystemDnsResolver {
+    fn resolve_host(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, PackfileUriError> {
+        let addrs: Vec<SocketAddr> = (host, port)
+            .to_socket_addrs()
+            .map_err(|_| PackfileUriError::SsrfBlocked(format!("dns resolution failed for '{host}'")))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(PackfileUriError::SsrfBlocked("dns returned empty address list".to_owned()));
+        }
+        Ok(addrs)
+    }
+}
+
+/// Deterministic resolver used by unit/adversarial SSRF and DNS-rebinding tests.
+#[derive(Default)]
+pub struct StaticMapDnsResolver {
+    entries: Mutex<HashMap<String, Vec<SocketAddr>>>,
+}
+
+impl StaticMapDnsResolver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_host_addrs(&self, host: impl Into<String>, addrs: Vec<SocketAddr>) {
+        let mut guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        guard.insert(host.into(), addrs);
+    }
+}
+
+impl PackUriDnsResolver for StaticMapDnsResolver {
+    fn resolve_host(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, PackfileUriError> {
+        let guard = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let list = guard
+            .get(host)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut a| {
+                if a.port() == 0 {
+                    a.set_port(port);
+                }
+                a
+            })
+            .collect::<Vec<_>>();
+        Ok(list)
+    }
+}
+
+struct SliceIpResolver<'a>(&'a [IpAddr]);
+
+impl PackUriDnsResolver for SliceIpResolver<'_> {
+    fn resolve_host(&self, _host: &str, port: u16) -> Result<Vec<SocketAddr>, PackfileUriError> {
+        Ok(self.0.iter().map(|&ip| SocketAddr::new(ip, port)).collect())
+    }
+}
+
+/// Canonical parsed offload URI together with the non-empty validated peer [`SocketAddr`]s to pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedOffloadUri {
     pub scheme: String,
     pub host: String,
-    pub port: Option<u16>,
+    pub port: u16,
     pub path: String,
     pub query: String,
+    pub pinned_addrs: Vec<SocketAddr>,
 }
 
-/// Validates an offload host allowlist entry: lowercase public multi-label DNS name only.
+/// Validates a public offload host allowlist entry: lowercase multi-label DNS name only.
 pub fn validate_offload_host_pattern(host: &str) -> Result<String, PackfileUriError> {
+    validate_offload_host_with_mode(host, false)
+}
+
+fn validate_offload_host_with_mode(host: &str, loopback_localhost_allowed: bool) -> Result<String, PackfileUriError> {
     let trimmed = host.trim();
     if trimmed.is_empty() || trimmed.len() > 253 {
         return Err(PackfileUriError::SsrfBlocked("empty or overlong offload host".to_owned()));
@@ -46,15 +121,15 @@ pub fn validate_offload_host_pattern(host: &str) -> Result<String, PackfileUriEr
             "raw IP literals are forbidden as offload hosts".to_owned(),
         ));
     }
-    if is_blocked_internal_hostname(trimmed) {
-        return Err(PackfileUriError::SsrfBlocked(format!(
-            "internal or loopback hostname forbidden: {trimmed}"
-        )));
-    }
     if !trimmed.contains('.') || trimmed.starts_with('.') || trimmed.ends_with('.') {
         return Err(PackfileUriError::SsrfBlocked(
             "offload host must be a multi-label DNS name".to_owned(),
         ));
+    }
+    if is_blocked_internal_hostname(trimmed, loopback_localhost_allowed) {
+        return Err(PackfileUriError::SsrfBlocked(format!(
+            "internal or loopback hostname forbidden: {trimmed}"
+        )));
     }
     for label in trimmed.split('.') {
         if label.is_empty()
@@ -69,7 +144,10 @@ pub fn validate_offload_host_pattern(host: &str) -> Result<String, PackfileUriEr
     Ok(trimmed.to_owned())
 }
 
-fn is_blocked_internal_hostname(host: &str) -> bool {
+fn is_blocked_internal_hostname(host: &str, loopback_localhost_allowed: bool) -> bool {
+    if loopback_localhost_allowed && host.ends_with(".localhost") && host != "localhost" {
+        return false;
+    }
     host_is_loopback(host)
         || host == "metadata.google.internal"
         || host == "metadata"
@@ -85,16 +163,17 @@ pub fn validate_path_prefix(prefix: &str) -> Result<String, PackfileUriError> {
         return Err(PackfileUriError::InvalidPolicy("path_prefix must start with '/'".to_owned()));
     }
     if prefix.len() > 1 && prefix.ends_with('/') {
-        return Err(PackfileUriError::InvalidPolicy(
-            "path_prefix must not end with '/'".to_owned(),
-        ));
+        return Err(PackfileUriError::InvalidPolicy("path_prefix must not end with '/'".to_owned()));
     }
     validate_clean_path(prefix)?;
     Ok(prefix.to_owned())
 }
 
-/// Validates [`OffloadPolicyConfig`] before advertising or minting offload URIs.
+/// Validates [`OffloadPolicyConfig`] for active offload operations; fails closed when `!policy.enabled`.
 pub fn validate_policy_config(policy: &OffloadPolicyConfig) -> Result<(), PackfileUriError> {
+    if !policy.enabled {
+        return Err(PackfileUriError::InvalidPolicy("packfile-uris offload is disabled".to_owned()));
+    }
     if policy.allowed_scheme != "https" {
         return Err(PackfileUriError::UnsupportedProtocol(format!(
             "only 'https' offload scheme is permitted, got '{}'",
@@ -131,30 +210,35 @@ pub fn validate_policy_config(policy: &OffloadPolicyConfig) -> Result<(), Packfi
     if policy.max_inflight_downloads == 0 || policy.max_inflight_downloads > 64 {
         return Err(PackfileUriError::InvalidPolicy("max_inflight_downloads must stay in 1..=64".to_owned()));
     }
+    if policy.max_inflight_bytes == 0 || policy.max_inflight_bytes > MAX_OFFLOAD_BYTES_HARD_CAP {
+        return Err(PackfileUriError::InvalidPolicy("invalid max_inflight_bytes".to_owned()));
+    }
+    if policy.max_active_leases == 0 || policy.max_active_leases > MAX_ACTIVE_LEASES_HARD_CAP {
+        return Err(PackfileUriError::InvalidPolicy("invalid max_active_leases".to_owned()));
+    }
     if policy.max_retries_per_pack > MAX_RETRIES_HARD_CAP {
-        return Err(PackfileUriError::InvalidPolicy(format!(
-            "max_retries_per_pack exceeds {MAX_RETRIES_HARD_CAP}"
-        )));
+        return Err(PackfileUriError::InvalidPolicy(format!("max_retries_per_pack exceeds {MAX_RETRIES_HARD_CAP}")));
     }
     if !(MIN_DEADLINE_MS..=MAX_DEADLINE_MS).contains(&policy.request_deadline_ms) {
         return Err(PackfileUriError::InvalidPolicy("request_deadline_ms out of bounds".to_owned()));
     }
-    if policy.enabled && policy.allowed_hosts.is_empty() {
+    if policy.allowed_hosts.is_empty() {
         return Err(PackfileUriError::InvalidPolicy(
             "enabled offload policy requires at least one allowlisted host".to_owned(),
         ));
     }
+    let loopback_ok = policy.loopback_allowed();
     for host in &policy.allowed_hosts {
-        validate_offload_host_pattern(host)?;
+        validate_offload_host_with_mode(host, loopback_ok)?;
     }
     Ok(())
 }
 
-/// Validates a concrete offload URI against HTTPS-only, allowlist, traversal, port, and resolved DNS IPs.
-pub fn validate_offload_uri(
+/// Validates a concrete offload URI and resolves/validates non-empty peer [`SocketAddr`]s for pinning.
+pub fn validate_offload_uri_and_resolve(
     raw_uri: &str,
     policy: &OffloadPolicyConfig,
-    resolved_ips: &[IpAddr],
+    resolver: &dyn PackUriDnsResolver,
 ) -> Result<ValidatedOffloadUri, PackfileUriError> {
     validate_policy_config(policy)?;
     if raw_uri.is_empty() || raw_uri.len() > MAX_URI_LEN {
@@ -177,51 +261,67 @@ pub fn validate_offload_uri(
     if authority.as_str().contains('@') {
         return Err(PackfileUriError::SsrfBlocked("userinfo '@' is forbidden in offload uri".to_owned()));
     }
-    if let Some(port) = parsed.port_u16()
-        && port != 443
-    {
-        return Err(PackfileUriError::SsrfBlocked(format!(
-            "arbitrary offload port :{port} is forbidden"
-        )));
-    }
-    let host = validate_offload_host_pattern(authority.host())?;
+    let effective_port = match policy.loopback_test_port() {
+        Some(test_port) => {
+            if parsed.port_u16() != Some(test_port) {
+                return Err(PackfileUriError::SsrfBlocked("test loopback port mismatch".to_owned()));
+            }
+            test_port
+        }
+        None => {
+            if let Some(port) = parsed.port_u16()
+                && port != 443
+            {
+                return Err(PackfileUriError::SsrfBlocked(format!("arbitrary offload port :{port} is forbidden")));
+            }
+            443
+        }
+    };
+    let host = validate_offload_host_with_mode(authority.host(), policy.loopback_allowed())?;
     if !policy.allowed_hosts.iter().any(|allowed| allowed == &host) {
-        return Err(PackfileUriError::SsrfBlocked(format!(
-            "host '{host}' is not in offload allowlist"
-        )));
+        return Err(PackfileUriError::SsrfBlocked(format!("host '{host}' is not in offload allowlist")));
     }
-    for &ip in resolved_ips {
-        if !permitted_peer(host_is_loopback(&host), ip, false) {
+    let pinned_addrs = resolver.resolve_host(&host, effective_port)?;
+    if pinned_addrs.is_empty() {
+        return Err(PackfileUriError::SsrfBlocked("empty resolved peer address set".to_owned()));
+    }
+    let is_loopback_host = host_is_loopback(&host);
+    for addr in &pinned_addrs {
+        if addr.port() != effective_port || !permitted_peer(is_loopback_host, addr.ip(), policy.loopback_allowed()) {
             return Err(PackfileUriError::SsrfBlocked(format!(
-                "resolved peer address {ip} violates public-egress SSRF policy"
+                "resolved peer address {addr} violates SSRF egress policy"
             )));
         }
     }
     let path = parsed.path();
     validate_clean_path(path)?;
     if !path_matches_prefix(path, &policy.path_prefix) {
-        return Err(PackfileUriError::SsrfBlocked(
-            "offload uri path outside configured path_prefix".to_owned(),
-        ));
+        return Err(PackfileUriError::SsrfBlocked("offload uri path outside configured path_prefix".to_owned()));
     }
-    let query = parsed.query().unwrap_or_default().to_owned();
     Ok(ValidatedOffloadUri {
         scheme: "https".to_owned(),
         host,
-        port: parsed.port_u16(),
+        port: effective_port,
         path: path.to_owned(),
-        query,
+        query: parsed.query().unwrap_or_default().to_owned(),
+        pinned_addrs,
     })
+}
+
+/// Validates a concrete offload URI against a caller-supplied resolved IP slice (failing closed if empty).
+pub fn validate_offload_uri(
+    raw_uri: &str,
+    policy: &OffloadPolicyConfig,
+    resolved_ips: &[IpAddr],
+) -> Result<ValidatedOffloadUri, PackfileUriError> {
+    validate_offload_uri_and_resolve(raw_uri, policy, &SliceIpResolver(resolved_ips))
 }
 
 fn path_matches_prefix(path: &str, prefix: &str) -> bool {
     if prefix == "/" {
         return path.starts_with('/');
     }
-    path == prefix
-        || path
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/'))
+    path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn validate_clean_path(path: &str) -> Result<(), PackfileUriError> {

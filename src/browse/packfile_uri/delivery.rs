@@ -1,10 +1,10 @@
-//! Bounded packfile HTTP download client (retry, SHA-256 + trailer checksum,
-//! SSRF redirect refusal) and Axum signed packfile server with live auth & pin
-//! re-validation before and during chunked streaming.
+//! Axum signed `packfile-uris` server with bounded pack storage, inbound `Host`
+//! & caller-header validation, and `Body::from_stream` chunked streaming holding
+//! concurrency, byte, and retention pin guards until stream completion or drop.
 
 use std::{
     collections::HashMap,
-    net::IpAddr,
+    io,
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -16,24 +16,25 @@ use axum::{
     Router,
     body::Body,
     extract::{Path as AxumPath, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::get,
 };
 use bytes::Bytes;
-use reqwest::redirect;
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, time::Instant};
 use uuid::Uuid;
 
 use super::{
     retention::PackDeliveryLeaseRegistry,
     signing::{LivePackReadAuthorizer, PackUriKeyring, VerifyDownloadParams, verify_signed_download_request},
-    ssrf_guard::{redact_uri_for_log, validate_offload_uri},
-    types::{FallbackReason, OffloadPolicyConfig, PackObjectFormat, PackfileUriError, SignedPackfileDescriptor},
+    ssrf_guard::{PackUriDnsResolver, redact_uri_for_log, validate_policy_config},
+    types::{DownloadSubjectContext, InflightBytesLimiter, OffloadPolicyConfig, PackObjectFormat, PackfileUriError},
 };
 
 const STREAM_CHUNK_BYTES: usize = 32 * 1024;
+const DEFAULT_MAX_CACHED_PACKS: usize = 256;
 
 /// Verified immutable pack blob stored behind an offload endpoint.
 #[derive(Clone)]
@@ -59,33 +60,94 @@ impl PackStreamMeta {
     }
 }
 
-/// Shared state serving signed `https://` packfile requests with live checks.
+#[derive(Default)]
+struct BoundedPackStore {
+    entries: HashMap<String, PackStreamMeta>,
+    total_bytes: u64,
+}
+
+/// Shared state serving signed `https://` packfile requests with live checks & byte bounds.
 pub struct PackHttpServerState {
     pub keyring: Arc<PackUriKeyring>,
     pub leases: PackDeliveryLeaseRegistry,
-    pub policy: OffloadPolicyConfig,
-    pub allowed_resolved_ips: Vec<IpAddr>,
+    policy: RwLock<OffloadPolicyConfig>,
+    pub resolver: Arc<dyn PackUriDnsResolver>,
     pub authorizer: Arc<dyn LivePackReadAuthorizer>,
-    pub packs: Arc<RwLock<HashMap<String, PackStreamMeta>>>,
+    packs: RwLock<BoundedPackStore>,
+    pub max_cached_packs: usize,
+    pub max_cached_bytes: u64,
     pub inflight_limiter: Arc<Semaphore>,
+    pub inflight_bytes: Arc<InflightBytesLimiter>,
     pub clock_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
     pub served_requests: AtomicU64,
     pub rejected_requests: AtomicU64,
 }
 
 impl PackHttpServerState {
+    pub fn new(
+        keyring: Arc<PackUriKeyring>,
+        leases: PackDeliveryLeaseRegistry,
+        policy: OffloadPolicyConfig,
+        resolver: Arc<dyn PackUriDnsResolver>,
+        authorizer: Arc<dyn LivePackReadAuthorizer>,
+        clock_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        let inflight_downloads = policy.max_inflight_downloads.max(1);
+        let max_bytes = policy.max_inflight_bytes.max(1);
+        Self {
+            keyring,
+            leases,
+            policy: RwLock::new(policy),
+            resolver,
+            authorizer,
+            packs: RwLock::new(BoundedPackStore::default()),
+            max_cached_packs: DEFAULT_MAX_CACHED_PACKS,
+            max_cached_bytes: max_bytes,
+            inflight_limiter: Arc::new(Semaphore::new(inflight_downloads)),
+            inflight_bytes: Arc::new(InflightBytesLimiter::new(max_bytes)),
+            clock_unix,
+            served_requests: AtomicU64::new(0),
+            rejected_requests: AtomicU64::new(0),
+        }
+    }
+
+    pub fn current_policy(&self) -> OffloadPolicyConfig {
+        self.policy.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub fn set_policy(&self, updated: OffloadPolicyConfig) {
+        *self.policy.write().unwrap_or_else(|p| p.into_inner()) = updated;
+    }
+
     pub fn insert_pack(&self, meta: PackStreamMeta) -> Result<(), PackfileUriError> {
         meta.validate_bytes()?;
+        let new_len = meta.payload.len() as u64;
         let key = scoped_pack_key(meta.tenant_id, meta.repository_id, &meta.pack_oid);
         let mut guard = self.packs.write().unwrap_or_else(|p| p.into_inner());
-        guard.insert(key, meta);
+        let replaced_len = guard.entries.get(&key).map_or(0, |old| old.payload.len() as u64);
+        let is_new = !guard.entries.contains_key(&key);
+        let projected = guard.total_bytes.saturating_sub(replaced_len).saturating_add(new_len);
+        if (is_new && guard.entries.len() >= self.max_cached_packs) || projected > self.max_cached_bytes {
+            let now = (self.clock_unix)();
+            guard.entries.retain(|_, existing| {
+                !self.leases.can_sweep_pack(existing.tenant_id, existing.repository_id, &existing.pack_oid, now)
+            });
+            guard.total_bytes = guard.entries.values().map(|e| e.payload.len() as u64).sum();
+        }
+        let replaced_after = guard.entries.get(&key).map_or(0, |old| old.payload.len() as u64);
+        let projected_after = guard.total_bytes.saturating_sub(replaced_after).saturating_add(new_len);
+        if (!guard.entries.contains_key(&key) && guard.entries.len() >= self.max_cached_packs)
+            || projected_after > self.max_cached_bytes
+        {
+            return Err(PackfileUriError::CapacityExceeded("pack store capacity exceeded".to_owned()));
+        }
+        guard.total_bytes = projected_after;
+        guard.entries.insert(key, meta);
         Ok(())
     }
 
-    pub fn remove_pack(&self, tenant_id: Uuid, repository_id: Uuid, pack_oid: &str) -> bool {
-        let key = scoped_pack_key(tenant_id, repository_id, pack_oid);
-        let mut guard = self.packs.write().unwrap_or_else(|p| p.into_inner());
-        guard.remove(&key).is_some()
+    pub fn pack_count(&self) -> usize {
+        self.packs.read().unwrap_or_else(|p| p.into_inner()).entries.len()
     }
 }
 
@@ -118,51 +180,59 @@ pub fn validate_pack_bytes_integrity(
     }
     let actual_trailer = hex::encode(&bytes[bytes.len() - trailer_len..]);
     if actual_trailer != expected_pack_hash_hex {
-        return Err(PackfileUriError::IntegrityMismatch(
-            "pack trailing checksum mismatches descriptor".to_owned(),
-        ));
+        return Err(PackfileUriError::IntegrityMismatch("pack trailing checksum mismatches descriptor".to_owned()));
     }
     let actual_sha256 = hex::encode(Sha256::digest(bytes));
     if actual_sha256 != expected_sha256_hex {
-        return Err(PackfileUriError::IntegrityMismatch(
-            "pack sha256 mismatches signed expectation".to_owned(),
-        ));
+        return Err(PackfileUriError::IntegrityMismatch("pack sha256 mismatches signed expectation".to_owned()));
     }
     Ok(())
 }
 
-/// Validates signature, live auth, retention pin hold, and streams pack bytes safely.
-pub async fn serve_signed_packfile(
-    state: &PackHttpServerState,
-    raw_uri: &str,
-    tenant_id: Uuid,
-    repository_id: Uuid,
-    pack_oid: &str,
-    object_format: PackObjectFormat,
-    actor_id: Uuid,
-) -> Result<Vec<u8>, PackfileUriError> {
-    let _permit = state
-        .inflight_limiter
-        .try_acquire()
-        .map_err(|_| PackfileUriError::CapacityExceeded("inflight offload concurrency limit reached".to_owned()))?;
+/// Parameters authenticating and scoping a server-side signed packfile stream.
+pub struct ServePackRequest<'a> {
+    pub raw_uri: &'a str,
+    pub inbound_host: &'a str,
+    pub tenant_id: Uuid,
+    pub repository_id: Uuid,
+    pub pack_oid: &'a str,
+    pub object_format: PackObjectFormat,
+    pub presented_subject: Option<DownloadSubjectContext>,
+}
+
+/// Prepares a guarded chunked [`Body`] holding concurrency, byte, and pin guards until EOF/drop.
+pub async fn serve_signed_packfile_stream(
+    state: Arc<PackHttpServerState>,
+    req: &ServePackRequest<'_>,
+) -> Result<Body, PackfileUriError> {
+    let policy = state.current_policy();
+    if let Err(err) = validate_policy_config(&policy) {
+        state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        return Err(err);
+    }
+    let permit = state.inflight_limiter.clone().try_acquire_owned().map_err(|_| {
+        state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        PackfileUriError::CapacityExceeded("inflight offload concurrency limit reached".to_owned())
+    })?;
     let now_unix = (state.clock_unix)();
-    let res = verify_signed_download_request(
+    let verified = match verify_signed_download_request(
         &state.keyring,
         state.authorizer.as_ref(),
         &VerifyDownloadParams {
-            raw_uri,
-            expected_tenant_id: tenant_id,
-            expected_repository_id: repository_id,
-            expected_pack_oid: pack_oid,
-            expected_format: object_format,
-            actor_id,
+            raw_uri: req.raw_uri,
+            inbound_host: req.inbound_host,
+            expected_tenant_id: req.tenant_id,
+            expected_repository_id: req.repository_id,
+            expected_pack_oid: req.pack_oid,
+            expected_format: req.object_format,
+            presented_subject: req.presented_subject,
             now_unix,
-            policy: &state.policy,
-            resolved_ips: &state.allowed_resolved_ips,
+            policy: &policy,
+            resolver: state.resolver.as_ref(),
         },
     )
-    .await;
-    let verified = match res {
+    .await
+    {
         Ok(v) => v,
         Err(err) => {
             state.rejected_requests.fetch_add(1, Ordering::Relaxed);
@@ -170,11 +240,12 @@ pub async fn serve_signed_packfile(
         }
     };
 
-    let _hold = match state.leases.begin_download_hold(
+    let hold = match state.leases.begin_download_hold(
         verified.claims.pin_id,
-        tenant_id,
-        repository_id,
-        pack_oid,
+        req.tenant_id,
+        req.repository_id,
+        req.pack_oid,
+        &verified.claims.subject,
         now_unix,
     ) {
         Ok(h) => h,
@@ -185,24 +256,77 @@ pub async fn serve_signed_packfile(
     };
     let meta = {
         let guard = state.packs.read().unwrap_or_else(|p| p.into_inner());
-        guard
-            .get(&scoped_pack_key(tenant_id, repository_id, pack_oid))
-            .cloned()
+        guard.entries.get(&scoped_pack_key(req.tenant_id, req.repository_id, req.pack_oid)).cloned()
     }
-    .ok_or_else(|| PackfileUriError::RetentionPinMissing("pack missing from storage".to_owned()))?;
-
+    .ok_or_else(|| {
+        state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        PackfileUriError::RetentionPinMissing("pack missing from storage".to_owned())
+    })?;
     meta.validate_bytes()?;
-    let mut out = Vec::with_capacity(meta.payload.len());
-    for chunk in meta.payload.chunks(STREAM_CHUNK_BYTES) {
-        if !state.leases.is_hold_still_valid(verified.claims.pin_id) {
-            state.rejected_requests.fetch_add(1, Ordering::Relaxed);
-            return Err(PackfileUriError::RetentionPinMissing(
-                "retention pin revoked during pack stream".to_owned(),
-            ));
+    let bytes_guard = state.inflight_bytes.try_reserve(meta.payload.len() as u64).inspect_err(|_| {
+        state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+    })?;
+
+    let deadline = Instant::now() + Duration::from_millis(policy.request_deadline_ms);
+    let claims = verified.claims;
+    let payload = meta.payload;
+    let stream = async_stream::stream! {
+        let _permit_keep = permit;
+        let _bytes_keep = bytes_guard;
+        let _hold_keep = hold;
+        let mut offset = 0usize;
+        while offset < payload.len() {
+            if !state.current_policy().enabled
+                || Instant::now() > deadline
+                || !state.leases.is_hold_still_valid(claims.pin_id)
+            {
+                state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                yield Err(io::Error::other("packfile stream aborted by policy, deadline, or pin revocation"));
+                return;
+            }
+            if state
+                .authorizer
+                .authorize_pack_download(
+                    claims.tenant_id,
+                    claims.repository_id,
+                    &claims.subject,
+                    &claims.pack_oid,
+                    claims.pin_id,
+                )
+                .await
+                .is_err()
+            {
+                state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                yield Err(io::Error::new(io::ErrorKind::PermissionDenied, "live auth revoked during stream"));
+                return;
+            }
+            let end = (offset + STREAM_CHUNK_BYTES).min(payload.len());
+            yield Ok::<Bytes, io::Error>(payload.slice(offset..end));
+            offset = end;
         }
-        out.extend_from_slice(chunk);
+        state.served_requests.fetch_add(1, Ordering::Relaxed);
+    };
+    Ok(Body::from_stream(stream))
+}
+
+/// Convenience helper collecting [`serve_signed_packfile_stream`] into a verified byte vector.
+pub async fn serve_signed_packfile(
+    state: Arc<PackHttpServerState>,
+    req: &ServePackRequest<'_>,
+) -> Result<Vec<u8>, PackfileUriError> {
+    let body = serve_signed_packfile_stream(state, req).await?;
+    let mut stream = body.into_data_stream();
+    let mut out = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let chunk = frame.map_err(|e| {
+            if e.to_string().contains("live auth") {
+                PackfileUriError::Unauthorized
+            } else {
+                PackfileUriError::RetentionPinMissing(e.to_string())
+            }
+        })?;
+        out.extend_from_slice(&chunk);
     }
-    state.served_requests.fetch_add(1, Ordering::Relaxed);
     Ok(out)
 }
 
@@ -213,6 +337,9 @@ pub struct SignedPackRouteQuery {
     pub repo: Uuid,
     pub pack: String,
     pub fmt: String,
+    pub actor: Uuid,
+    pub tok: Uuid,
+    pub epoch: u64,
     pub exp: u64,
     pub kid: String,
     pub nonce: String,
@@ -220,14 +347,11 @@ pub struct SignedPackRouteQuery {
     pub sig: String,
 }
 
-/// Builds an Axum router exposing signed pack downloads with `Connection: close`.
+/// Builds an Axum router exposing chunked signed pack downloads with strict `Host` & policy checks.
 pub fn build_signed_packfile_router(state: Arc<PackHttpServerState>) -> Router {
-    let prefix = if state.policy.path_prefix == "/" {
-        String::new()
-    } else {
-        state.policy.path_prefix.clone()
-    };
-    let route = format!("{prefix}/{{tenant}}/{{repo}}/{{pack_file}}");
+    let prefix = state.current_policy().path_prefix;
+    let base = if prefix == "/" { String::new() } else { prefix };
+    let route = format!("{base}/{{tenant}}/{{repo}}/{{pack_file}}");
     Router::new().route(&route, get(axum_serve_handler)).with_state(state)
 }
 
@@ -235,188 +359,113 @@ async fn axum_serve_handler(
     State(state): State<Arc<PackHttpServerState>>,
     AxumPath((tenant, repo, pack_file)): AxumPath<(Uuid, Uuid, String)>,
     Query(query): Query<SignedPackRouteQuery>,
-    uri: axum::http::Uri,
+    headers: HeaderMap,
+    uri: Uri,
 ) -> Response {
+    let policy = state.current_policy();
+    if !policy.enabled {
+        state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        return closed_response(StatusCode::SERVICE_UNAVAILABLE, Body::from("offload disabled"));
+    }
     let Some(pack_oid) = pack_file.strip_suffix(".pack") else {
-        return closed_response(StatusCode::BAD_REQUEST, b"invalid pack suffix".to_vec());
+        return closed_response(StatusCode::BAD_REQUEST, Body::from("invalid pack suffix"));
     };
-    let Some(host) = state.policy.allowed_hosts.first() else {
-        return closed_response(StatusCode::SERVICE_UNAVAILABLE, b"no offload host".to_vec());
+    let Ok((inbound_host, authority)) = extract_inbound_authority(&headers, &uri, &policy) else {
+        state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+        return closed_response(StatusCode::BAD_REQUEST, Body::from("invalid Host authority"));
+    };
+    let presented_subject = match extract_optional_subject_headers(&headers) {
+        Ok(sub) => sub,
+        Err(_) => {
+            state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            return closed_response(StatusCode::FORBIDDEN, Body::from("invalid caller identity headers"));
+        }
     };
     let fmt = match query.fmt.as_str() {
         "sha1" => PackObjectFormat::Sha1,
         "sha256" => PackObjectFormat::Sha256,
-        _ => return closed_response(StatusCode::BAD_REQUEST, b"invalid object format".to_vec()),
+        _ => return closed_response(StatusCode::BAD_REQUEST, Body::from("invalid object format")),
     };
-    let full_uri = format!(
-        "https://{host}{}?tenant={}&repo={}&pack={}&fmt={}&exp={}&kid={}&nonce={}&pin={}&sig={}",
-        uri.path(),
-        query.tenant.hyphenated(),
-        query.repo.hyphenated(),
-        query.pack,
-        query.fmt,
-        query.exp,
-        query.kid,
-        query.nonce,
-        query.pin.hyphenated(),
-        query.sig
-    );
+    let raw_q = uri.query().unwrap_or_default();
+    let full_uri = format!("https://{authority}{}?{raw_q}", uri.path());
     let _ = redact_uri_for_log(&full_uri);
-    match serve_signed_packfile(&state, &full_uri, tenant, repo, pack_oid, fmt, Uuid::nil()).await {
-        Ok(bytes) => closed_response(StatusCode::OK, bytes),
-        Err(PackfileUriError::Unauthorized) => closed_response(StatusCode::FORBIDDEN, b"forbidden".to_vec()),
+    let req = ServePackRequest {
+        raw_uri: &full_uri,
+        inbound_host: &inbound_host,
+        tenant_id: tenant,
+        repository_id: repo,
+        pack_oid,
+        object_format: fmt,
+        presented_subject,
+    };
+    match serve_signed_packfile_stream(Arc::clone(&state), &req).await {
+        Ok(body) => closed_response(StatusCode::OK, body),
+        Err(PackfileUriError::Unauthorized | PackfileUriError::ScopeMismatch(_)) => {
+            closed_response(StatusCode::FORBIDDEN, Body::from("forbidden"))
+        }
         Err(PackfileUriError::TokenExpired | PackfileUriError::RetentionPinMissing(_)) => {
-            closed_response(StatusCode::GONE, b"expired or unpinned".to_vec())
+            closed_response(StatusCode::GONE, Body::from("expired or unpinned"))
         }
-        Err(PackfileUriError::CapacityExceeded(_)) => {
-            closed_response(StatusCode::TOO_MANY_REQUESTS, b"busy".to_vec())
-        }
-        Err(_) => closed_response(StatusCode::BAD_REQUEST, b"rejected".to_vec()),
+        Err(PackfileUriError::CapacityExceeded(_)) => closed_response(StatusCode::TOO_MANY_REQUESTS, Body::from("busy")),
+        Err(_) => closed_response(StatusCode::BAD_REQUEST, Body::from("rejected")),
     }
 }
 
-fn closed_response(status: StatusCode, body: Vec<u8>) -> Response {
+fn extract_inbound_authority(
+    headers: &HeaderMap,
+    uri: &Uri,
+    policy: &OffloadPolicyConfig,
+) -> Result<(String, String), PackfileUriError> {
+    let raw_hdr = headers.get(header::HOST).and_then(|v| v.to_str().ok()).map(str::trim);
+    let raw_uri = uri.authority().map(|a| a.as_str());
+    let raw = match (raw_hdr, raw_uri) {
+        (Some(h), Some(u)) if !h.eq_ignore_ascii_case(u) => {
+            return Err(PackfileUriError::ScopeMismatch("Host and URI authority conflict".to_owned()));
+        }
+        (Some(h), _) if !h.is_empty() => h,
+        (_, Some(u)) if !u.is_empty() => u,
+        _ => return Err(PackfileUriError::ScopeMismatch("missing Host header".to_owned())),
+    };
+    let authority: axum::http::uri::Authority = raw
+        .parse()
+        .map_err(|_| PackfileUriError::ScopeMismatch("malformed Host authority".to_owned()))?;
+    let host = authority.host().to_ascii_lowercase();
+    let formatted = match (policy.loopback_test_port(), authority.port_u16()) {
+        (Some(tp), Some(p)) if p == tp => format!("{host}:{tp}"),
+        (None, None | Some(443)) => host.clone(),
+        _ => return Err(PackfileUriError::ScopeMismatch("unexpected Host port".to_owned())),
+    };
+    Ok((host, formatted))
+}
+
+fn extract_optional_subject_headers(headers: &HeaderMap) -> Result<Option<DownloadSubjectContext>, PackfileUriError> {
+    let a = headers.get("x-rootyard-actor");
+    let t = headers.get("x-rootyard-token-id");
+    let e = headers.get("x-rootyard-auth-epoch");
+    match (a, t, e) {
+        (None, None, None) => Ok(None),
+        (Some(av), Some(tv), Some(ev)) => {
+            let actor = Uuid::parse_str(av.to_str().map_err(|_| PackfileUriError::Unauthorized)?)
+                .map_err(|_| PackfileUriError::Unauthorized)?;
+            let tok = Uuid::parse_str(tv.to_str().map_err(|_| PackfileUriError::Unauthorized)?)
+                .map_err(|_| PackfileUriError::Unauthorized)?;
+            let ep = ev
+                .to_str()
+                .map_err(|_| PackfileUriError::Unauthorized)?
+                .parse::<u64>()
+                .map_err(|_| PackfileUriError::Unauthorized)?;
+            Ok(Some(DownloadSubjectContext::new(actor, tok, ep)?))
+        }
+        _ => Err(PackfileUriError::Unauthorized),
+    }
+}
+
+fn closed_response(status: StatusCode, body: Body) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONNECTION, "close")
+        .header(header::CACHE_CONTROL, "no-store")
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from(body))
+        .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-}
-
-/// Bounded HTTP pack download client config enforcing no auto-redirects and strict byte/deadline caps.
-#[derive(Clone)]
-pub struct PackDownloaderConfig {
-    pub client: reqwest::Client,
-    pub concurrency_limit: Arc<Semaphore>,
-    pub request_deadline: Duration,
-    pub max_retries: usize,
-    pub max_pack_bytes: u64,
-}
-
-impl PackDownloaderConfig {
-    pub fn build(policy: &OffloadPolicyConfig) -> Result<Self, PackfileUriError> {
-        let client = reqwest::Client::builder()
-            .redirect(redirect::Policy::none())
-            .no_proxy()
-            .timeout(Duration::from_millis(policy.request_deadline_ms))
-            .build()
-            .map_err(|e| PackfileUriError::Internal(format!("client init failed: {e}")))?;
-        Ok(Self {
-            client,
-            concurrency_limit: Arc::new(Semaphore::new(policy.max_inflight_downloads.max(1))),
-            request_deadline: Duration::from_millis(policy.request_deadline_ms),
-            max_retries: policy.max_retries_per_pack,
-            max_pack_bytes: policy.max_pack_bytes_per_request,
-        })
-    }
-}
-
-/// Outcome of downloading and verifying a signed pack URI.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FetchAttemptResult {
-    Verified {
-        bytes: Vec<u8>,
-        attempts: usize,
-        retransmitted_bytes: u64,
-    },
-    NeedsInlineFallback(FallbackReason),
-}
-
-/// Downloads a signed offload pack with redirect refusal, bounded retries, deadline,
-/// and SHA-256 + trailer checksum verification.
-pub async fn fetch_pack_with_integrity_and_retry(
-    cfg: &PackDownloaderConfig,
-    desc: &SignedPackfileDescriptor,
-    object_format: PackObjectFormat,
-    policy: &OffloadPolicyConfig,
-    resolved_ips: &[IpAddr],
-) -> Result<FetchAttemptResult, PackfileUriError> {
-    validate_offload_uri(&desc.uri, policy, resolved_ips)?;
-    if desc.byte_len > cfg.max_pack_bytes {
-        return Err(PackfileUriError::CapacityExceeded("pack exceeds byte cap".to_owned()));
-    }
-    let _permit = cfg
-        .concurrency_limit
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| PackfileUriError::CapacityExceeded("downloader semaphore closed".to_owned()))?;
-
-    let mut retransmitted_bytes = 0u64;
-    let total_attempts = cfg.max_retries.saturating_add(1);
-    for attempt in 1..=total_attempts {
-        let fut = single_fetch_attempt(&cfg.client, &desc.uri, cfg.max_pack_bytes);
-        let outcome = tokio::time::timeout(cfg.request_deadline, fut).await;
-        let bytes = match outcome {
-            Ok(Ok(data)) => data,
-            Ok(Err(
-                err @ (PackfileUriError::SsrfBlocked(_)
-                | PackfileUriError::CapacityExceeded(_)
-                | PackfileUriError::Unauthorized
-                | PackfileUriError::RetentionPinMissing(_)),
-            )) => return Err(err),
-            Ok(Err(_)) | Err(_) => {
-                if attempt == total_attempts {
-                    return Ok(FetchAttemptResult::NeedsInlineFallback(
-                        FallbackReason::PreDownloadRetryExhausted,
-                    ));
-                }
-                continue;
-            }
-        };
-        if bytes.len() as u64 != desc.byte_len && attempt < total_attempts {
-            retransmitted_bytes = retransmitted_bytes.saturating_add(bytes.len() as u64);
-            continue;
-        }
-        validate_pack_bytes_integrity(&bytes, desc.byte_len, &desc.sha256_hex, &desc.pack_hash_hex, object_format)?;
-        return Ok(FetchAttemptResult::Verified { bytes, attempts: attempt, retransmitted_bytes });
-    }
-    Ok(FetchAttemptResult::NeedsInlineFallback(
-        FallbackReason::PreDownloadRetryExhausted,
-    ))
-}
-
-async fn single_fetch_attempt(
-    client: &reqwest::Client,
-    uri: &str,
-    max_bytes: u64,
-) -> Result<Vec<u8>, PackfileUriError> {
-    let resp = client
-        .get(uri)
-        .send()
-        .await
-        .map_err(|_| PackfileUriError::CdnUnavailable("offload http transport error".to_owned()))?;
-    if resp.status().is_redirection() {
-        return Err(PackfileUriError::SsrfBlocked(
-            "unexpected redirect blocked by SSRF policy".to_owned(),
-        ));
-    }
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED || resp.status() == reqwest::StatusCode::FORBIDDEN {
-        return Err(PackfileUriError::Unauthorized);
-    }
-    if resp.status() == reqwest::StatusCode::GONE {
-        return Err(PackfileUriError::RetentionPinMissing(
-            "offload lease revoked or expired".to_owned(),
-        ));
-    }
-    if !resp.status().is_success() {
-        return Err(PackfileUriError::CdnUnavailable(format!(
-            "offload endpoint returned {}",
-            resp.status().as_u16()
-        )));
-    }
-    if let Some(cl) = resp.content_length()
-        && cl > max_bytes
-    {
-        return Err(PackfileUriError::CapacityExceeded("response content-length exceeds cap".to_owned()));
-    }
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|_| PackfileUriError::CdnUnavailable("interrupted response body".to_owned()))?;
-    if body.len() as u64 > max_bytes {
-        return Err(PackfileUriError::CapacityExceeded("response body exceeded cap".to_owned()));
-    }
-    Ok(body.to_vec())
 }

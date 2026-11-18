@@ -1,5 +1,6 @@
 //! Short-lived domain-separated HMAC-SHA256 offload URL signing, key rotation,
-//! strict claim/scope binding, and mandatory live per-request authorization.
+//! strict `(actor_id, token_id, auth_epoch)` + `Host` binding, and mandatory
+//! live per-request authorization.
 
 use std::{collections::HashMap, fmt};
 
@@ -11,24 +12,24 @@ use zeroize::Zeroizing;
 use crate::cache_wake::replica_cache::{error::is_lower_hex_exact, lease_pin::AuthTask};
 
 use super::{
-    ssrf_guard::{validate_offload_host_pattern, validate_offload_uri, validate_policy_config},
+    ssrf_guard::{PackUriDnsResolver, validate_offload_uri_and_resolve, validate_policy_config},
     types::{
-        MAX_OFFLOAD_TTL_SECS, OffloadPolicyConfig, PackObjectFormat, PackfileUriError, SignedPackfileDescriptor,
-        validate_catalog_pack_oid, validate_hex_sha256, validate_pack_oid,
+        DownloadSubjectContext, MAX_OFFLOAD_TTL_SECS, OffloadPolicyConfig, PackObjectFormat, PackfileUriError,
+        SignedPackfileDescriptor, validate_catalog_pack_oid, validate_hex_sha256, validate_pack_oid,
     },
 };
 
 const SIGNING_DOMAIN: &[u8] = b"rootyard-packfile-uri-v1";
 const MIN_SIGNING_SECRET_BYTES: usize = 32;
-const EXPECTED_QUERY_KEY_COUNT: usize = 9;
+const EXPECTED_QUERY_KEY_COUNT: usize = 12;
 
-/// Async live authorization hook invoked on EVERY download before reading or streaming bytes.
+/// Async live authorization hook invoked on EVERY download and chunk with bound subject.
 pub trait LivePackReadAuthorizer: Send + Sync {
     fn authorize_pack_download<'a>(
         &'a self,
         tenant_id: Uuid,
         repository_id: Uuid,
-        actor_id: Uuid,
+        subject: &'a DownloadSubjectContext,
         pack_oid: &'a str,
         pin_id: Uuid,
     ) -> AuthTask<'a, Result<(), PackfileUriError>>;
@@ -53,7 +54,6 @@ impl fmt::Debug for SigningKeyMaterial {
 }
 
 impl SigningKeyMaterial {
-    /// Constructs validated signing key material (`secret.len() >= 32`).
     pub fn new(key_id: impl Into<String>, secret: Vec<u8>) -> Result<Self, PackfileUriError> {
         let key_id = key_id.into();
         if key_id.is_empty()
@@ -92,7 +92,6 @@ impl PackUriKeyring {
         self.keys.insert(material.key_id.clone(), material);
     }
 
-    /// Retires `key_id` from issuing new URLs while continuing to verify existing unexpired URLs.
     pub fn retire_for_signing(&mut self, key_id: &str) -> bool {
         if let Some(entry) = self.keys.get_mut(key_id) {
             entry.active_for_signing = false;
@@ -102,7 +101,6 @@ impl PackUriKeyring {
         }
     }
 
-    /// Immediately revokes `key_id` so neither signing nor verification succeeds under it.
     pub fn revoke_key(&mut self, key_id: &str) -> bool {
         self.keys.remove(key_id).is_some()
     }
@@ -140,7 +138,9 @@ pub struct SignedDownloadClaims {
     pub pack_oid: String,
     pub object_format: PackObjectFormat,
     pub allowed_host: String,
+    pub port: u16,
     pub canonical_path: String,
+    pub subject: DownloadSubjectContext,
     pub expires_at_unix: u64,
     pub key_id: String,
     pub scope_nonce: String,
@@ -149,7 +149,7 @@ pub struct SignedDownloadClaims {
 
 impl SignedDownloadClaims {
     fn canonical_transcript(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(256);
+        let mut out = Vec::with_capacity(320);
         append_lp(&mut out, SIGNING_DOMAIN);
         append_lp(&mut out, self.tenant_id.hyphenated().to_string().as_bytes());
         append_lp(&mut out, self.repository_id.hyphenated().to_string().as_bytes());
@@ -157,8 +157,11 @@ impl SignedDownloadClaims {
         append_lp(&mut out, self.object_format.as_str().as_bytes());
         append_lp(&mut out, b"https");
         append_lp(&mut out, self.allowed_host.as_bytes());
-        append_lp(&mut out, b"443");
+        append_lp(&mut out, self.port.to_string().as_bytes());
         append_lp(&mut out, self.canonical_path.as_bytes());
+        append_lp(&mut out, self.subject.actor_id.hyphenated().to_string().as_bytes());
+        append_lp(&mut out, self.subject.token_id.hyphenated().to_string().as_bytes());
+        append_lp(&mut out, self.subject.auth_epoch.to_string().as_bytes());
         append_lp(&mut out, self.expires_at_unix.to_string().as_bytes());
         append_lp(&mut out, self.key_id.as_bytes());
         append_lp(&mut out, self.scope_nonce.as_bytes());
@@ -177,6 +180,7 @@ fn append_lp(out: &mut Vec<u8>, bytes: &[u8]) {
 pub struct MintUriRequest<'a> {
     pub tenant_id: Uuid,
     pub repository_id: Uuid,
+    pub subject: DownloadSubjectContext,
     pub pack_oid: &'a str,
     pub pack_hash_hex: &'a str,
     pub sha256_hex: &'a str,
@@ -187,17 +191,20 @@ pub struct MintUriRequest<'a> {
     pub scope_nonce: &'a str,
     pub now_unix: u64,
     pub policy: &'a OffloadPolicyConfig,
-    pub resolved_ips: &'a [std::net::IpAddr],
+    pub resolver: &'a dyn PackUriDnsResolver,
 }
 
-/// Mints and SSRF-validates a signed short-lived `https://` offload URL.
+/// Mints and SSRF-validates a signed short-lived `https://` offload URL; fails closed when disabled.
 pub fn mint_signed_offload_uri(
     keyring: &PackUriKeyring,
     req: &MintUriRequest<'_>,
 ) -> Result<SignedPackfileDescriptor, PackfileUriError> {
     validate_policy_config(req.policy)?;
-    let host = validate_offload_host_pattern(req.allowed_host)?;
-    if !req.policy.allowed_hosts.iter().any(|allowed| allowed == &host) {
+    req.subject.validate()?;
+    if req.tenant_id.is_nil() || req.repository_id.is_nil() || req.pin_id.is_nil() {
+        return Err(PackfileUriError::Unauthorized);
+    }
+    if !req.policy.allowed_hosts.iter().any(|allowed| allowed == req.allowed_host) {
         return Err(PackfileUriError::SsrfBlocked("target host outside policy allowlist".to_owned()));
     }
     validate_catalog_pack_oid(req.pack_oid, req.object_format)?;
@@ -215,6 +222,7 @@ pub fn mint_signed_offload_uri(
         .now_unix
         .checked_add(req.policy.ttl_secs)
         .ok_or_else(|| PackfileUriError::InvalidPolicy("ttl overflow".to_owned()))?;
+    let port = req.policy.loopback_test_port().unwrap_or(443);
     let canonical_path = build_canonical_pack_path(
         &req.policy.path_prefix,
         req.tenant_id,
@@ -226,27 +234,36 @@ pub fn mint_signed_offload_uri(
         repository_id: req.repository_id,
         pack_oid: req.pack_oid.to_owned(),
         object_format: req.object_format,
-        allowed_host: host.clone(),
+        allowed_host: req.allowed_host.to_owned(),
+        port,
         canonical_path: canonical_path.clone(),
+        subject: req.subject,
         expires_at_unix,
         key_id: req.policy.key_id.clone(),
         scope_nonce: req.scope_nonce.to_owned(),
         pin_id: req.pin_id,
     };
     let sig = keyring.sign_bytes(&req.policy.key_id, &claims.canonical_transcript())?;
+    let authority = match req.policy.loopback_test_port() {
+        Some(p) => format!("{}:{p}", req.allowed_host),
+        None => req.allowed_host.to_owned(),
+    };
     let uri = format!(
-        "https://{host}{canonical_path}?tenant={}&repo={}&pack={}&fmt={}&exp={}&kid={}&nonce={}&pin={}&sig={}",
+        "https://{authority}{canonical_path}?tenant={}&repo={}&pack={}&fmt={}&actor={}&tok={}&epoch={}&exp={}&kid={}&nonce={}&pin={}&sig={}",
         req.tenant_id.hyphenated(),
         req.repository_id.hyphenated(),
         req.pack_oid,
         req.object_format.as_str(),
+        req.subject.actor_id.hyphenated(),
+        req.subject.token_id.hyphenated(),
+        req.subject.auth_epoch,
         expires_at_unix,
         req.policy.key_id,
         req.scope_nonce,
         req.pin_id.hyphenated(),
         sig
     );
-    validate_offload_uri(&uri, req.policy, req.resolved_ips)?;
+    validate_offload_uri_and_resolve(&uri, req.policy, req.resolver)?;
     Ok(SignedPackfileDescriptor {
         pack_oid: req.pack_oid.to_owned(),
         pack_hash_hex: req.pack_hash_hex.to_owned(),
@@ -257,41 +274,59 @@ pub fn mint_signed_offload_uri(
         pin_id: req.pin_id,
         key_id: req.policy.key_id.clone(),
         scope_nonce: req.scope_nonce.to_owned(),
+        subject: req.subject,
     })
 }
 
 /// Parameters verifying an inbound signed offload download request.
 pub struct VerifyDownloadParams<'a> {
     pub raw_uri: &'a str,
+    pub inbound_host: &'a str,
     pub expected_tenant_id: Uuid,
     pub expected_repository_id: Uuid,
     pub expected_pack_oid: &'a str,
     pub expected_format: PackObjectFormat,
-    pub actor_id: Uuid,
+    pub presented_subject: Option<DownloadSubjectContext>,
     pub now_unix: u64,
     pub policy: &'a OffloadPolicyConfig,
-    pub resolved_ips: &'a [std::net::IpAddr],
+    pub resolver: &'a dyn PackUriDnsResolver,
 }
 
-/// Verified download claims returned only after SSRF, scope, HMAC, TTL, and live auth pass.
+/// Verified download claims returned only after policy, SSRF, `Host`, HMAC, TTL, and live auth pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedDownloadContext {
     pub claims: SignedDownloadClaims,
 }
 
-/// Verifies URL SSRF safety, strict claim/path binding, HMAC-SHA256 tag, expiry, and live authorization.
+/// Verifies policy enabled, SSRF/DNS, `Host` header, subject binding, HMAC-SHA256, TTL, and live auth.
 pub async fn verify_signed_download_request(
     keyring: &PackUriKeyring,
     authorizer: &dyn LivePackReadAuthorizer,
     params: &VerifyDownloadParams<'_>,
 ) -> Result<VerifiedDownloadContext, PackfileUriError> {
-    let validated = validate_offload_uri(params.raw_uri, params.policy, params.resolved_ips)?;
+    validate_policy_config(params.policy)?;
+    if let Some(presented) = params.presented_subject {
+        presented.validate()?;
+    }
+    let validated = validate_offload_uri_and_resolve(params.raw_uri, params.policy, params.resolver)?;
+    if validated.host != params.inbound_host {
+        return Err(PackfileUriError::ScopeMismatch(
+            "inbound HTTP Host mismatches signed offload host".to_owned(),
+        ));
+    }
     let query_map = parse_strict_query(&validated.query)?;
-    let claims = extract_and_bind_claims(&validated.host, &validated.path, &query_map, params)?;
+    let claims = extract_and_bind_claims(&validated.host, validated.port, &validated.path, &query_map, params)?;
     let sig = query_map
         .get("sig")
         .ok_or_else(|| PackfileUriError::InvalidSignature("missing signature".to_owned()))?;
     keyring.verify_bytes(&claims.key_id, &claims.canonical_transcript(), sig)?;
+    if let Some(presented) = params.presented_subject
+        && presented != claims.subject
+    {
+        return Err(PackfileUriError::ScopeMismatch(
+            "presented caller identity mismatches signed subject".to_owned(),
+        ));
+    }
     if params.now_unix > claims.expires_at_unix {
         return Err(PackfileUriError::TokenExpired);
     }
@@ -302,7 +337,7 @@ pub async fn verify_signed_download_request(
         .authorize_pack_download(
             claims.tenant_id,
             claims.repository_id,
-            params.actor_id,
+            &claims.subject,
             &claims.pack_oid,
             claims.pin_id,
         )
@@ -329,7 +364,12 @@ fn parse_strict_query(query: &str) -> Result<HashMap<&str, &str>, PackfileUriErr
         let Some((k, v)) = pair.split_once('=') else {
             return Err(PackfileUriError::InvalidSignature("malformed query parameter".to_owned()));
         };
-        if v.is_empty() || !matches!(k, "tenant" | "repo" | "pack" | "fmt" | "exp" | "kid" | "nonce" | "pin" | "sig") {
+        if v.is_empty()
+            || !matches!(
+                k,
+                "tenant" | "repo" | "pack" | "fmt" | "actor" | "tok" | "epoch" | "exp" | "kid" | "nonce" | "pin" | "sig"
+            )
+        {
             return Err(PackfileUriError::InvalidSignature("unexpected or empty query key".to_owned()));
         }
         if map.insert(k, v).is_some() {
@@ -344,6 +384,7 @@ fn parse_strict_query(query: &str) -> Result<HashMap<&str, &str>, PackfileUriErr
 
 fn extract_and_bind_claims(
     host: &str,
+    port: u16,
     path: &str,
     map: &HashMap<&str, &str>,
     params: &VerifyDownloadParams<'_>,
@@ -352,8 +393,19 @@ fn extract_and_bind_claims(
         .map_err(|_| PackfileUriError::ScopeMismatch("invalid tenant uuid".to_owned()))?;
     let repository_id = Uuid::parse_str(map["repo"])
         .map_err(|_| PackfileUriError::ScopeMismatch("invalid repo uuid".to_owned()))?;
+    let actor_id = Uuid::parse_str(map["actor"])
+        .map_err(|_| PackfileUriError::ScopeMismatch("invalid actor uuid".to_owned()))?;
+    let token_id = Uuid::parse_str(map["tok"])
+        .map_err(|_| PackfileUriError::ScopeMismatch("invalid token uuid".to_owned()))?;
+    let auth_epoch = map["epoch"]
+        .parse::<u64>()
+        .map_err(|_| PackfileUriError::ScopeMismatch("invalid auth epoch".to_owned()))?;
+    let subject = DownloadSubjectContext::new(actor_id, token_id, auth_epoch)?;
     let pin_id = Uuid::parse_str(map["pin"])
         .map_err(|_| PackfileUriError::ScopeMismatch("invalid pin uuid".to_owned()))?;
+    if pin_id.is_nil() {
+        return Err(PackfileUriError::ScopeMismatch("nil pin uuid".to_owned()));
+    }
     let pack_oid = map["pack"].to_owned();
     let fmt = match map["fmt"] {
         "sha1" => PackObjectFormat::Sha1,
@@ -389,7 +441,9 @@ fn extract_and_bind_claims(
         pack_oid,
         object_format: fmt,
         allowed_host: host.to_owned(),
+        port,
         canonical_path: expected_path,
+        subject,
         expires_at_unix,
         key_id: map["kid"].to_owned(),
         scope_nonce: scope_nonce.to_owned(),
