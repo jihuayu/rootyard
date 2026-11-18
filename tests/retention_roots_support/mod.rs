@@ -13,3 +13,4 @@ pub mod db;
 pub mod git;
 pub mod pack;
 pub mod roots;
+pub mod serving;

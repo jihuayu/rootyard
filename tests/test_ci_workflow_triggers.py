@@ -15,9 +15,9 @@ same full gate (2026-11-10: push 42783486160 and pull_request 42783651096 for
   ``redis-contract``) are unchanged, and no job-level ``name:`` renames them.
 
 Only the trigger block and the job keys are read, by indentation, with the
-standard library only: the repository declares no PyYAML dependency, and this
-module therefore has none. Job steps are owned by other changes; full YAML
-validity is proven by GitHub parsing the pushed workflow.
+standard library only: this module needs no declared YAML dependency. Job
+steps are owned by other changes; full YAML validity is proven by GitHub
+parsing the pushed workflow.
 """
 from __future__ import annotations
 

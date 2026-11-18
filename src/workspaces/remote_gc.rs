@@ -19,13 +19,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub(super) async fn lock_key(tx: &deadpool_postgres::Transaction<'_>, tenant: Uuid, digest: &str) -> Result<(), Error> {
-    tx.query_one(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':' || $2::text, 702))",
-        &[&tenant, &digest],
-    )
-    .await
-    .map_err(Error::internal)?;
-    Ok(())
+    crate::storage::remote_key_claims::lock_object_key(tx, tenant, "workspace", digest).await
 }
 
 async fn cleanup_pending_objects(client: &deadpool_postgres::Client, checkpoint: Uuid) -> Result<i64, Error> {

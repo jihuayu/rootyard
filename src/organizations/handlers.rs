@@ -42,31 +42,16 @@ pub struct TeamInput {
     pub name: String,
     pub role: Role,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransferInput {
-    pub new_owner: String,
-}
-
-/// Tenant IDs and remote object keys derive from the owner's namespace ID.
-/// A transfer cannot be published safely until all such data is rekeyed as a
-/// single recoverable operation, so the API explicitly refuses it for now.
+/// Crash-recoverable repository ownership transfer (#85). Existing
+/// compatibility callers omitting `expected_version` continue to receive `409`
+/// after authorization checks succeed.
 pub async fn transfer_ownership(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(input): Json<TransferInput>,
+    Json(input): Json<crate::repositories::transfer_model::TransferInput>,
 ) -> Res {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
-    if !db::valid_name(&input.new_owner) {
-        return Err(Error::bad_request());
-    }
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin)
-        .await?;
-    auth::finish_tx(tx, &actor, true).await?;
-    Err(Error(StatusCode::CONFLICT, "repository ownership transfer is unsupported"))
+    crate::repositories::transfer_db::start_or_drive_transfer(&state, &owner, &name, headers, input).await
 }
 
 pub(crate) async fn org_id(tx: &Transaction<'_>, slug: &str) -> Result<Uuid, Error> {

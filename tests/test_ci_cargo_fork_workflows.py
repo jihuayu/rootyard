@@ -15,9 +15,9 @@ import unittest
 import warnings
 from pathlib import Path
 
-try:  # PyYAML is optional on the runner; the structural checks never need it.
+try:  # PyYAML is a declared CI test dependency; keep a local minimal-runner fallback.
     import yaml
-except ImportError:  # pragma: no cover - exercised on a minimal runner
+except ImportError:  # pragma: no cover - local runners without the CI requirements
     yaml = None
 
 ROOT = Path(__file__).resolve().parents[1]

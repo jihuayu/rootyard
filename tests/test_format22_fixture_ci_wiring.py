@@ -52,7 +52,7 @@ PROTOCOL_SUITES = (
 # Counts verified by running every binary with `--ignored --test-threads=1`.
 PROTOCOL_COUNTS = {
     "ref_store_packs": 8,
-    "ref_store_retention_roots": 11,
+    "ref_store_retention_roots": 23,
     "ref_store_materialized_reads": 12,
     "ref_store_decision_subset": 23,
 }
@@ -493,17 +493,27 @@ class WorkflowWiringTest(unittest.TestCase):
         # The artifact upload keeps that same directory (relative to the
         # checkout), so it retains the executable and the builder's adjacent
         # <output>.build.json receipt (tests/backup_blob_serving147.py reads it).
-        name_index = self._anchor("name: refstore-protocol-native-${{ github.run_id }}-${{ github.run_attempt }}")
+        artifact_name = "name: refstore-protocol-native-${{ github.run_id }}-${{ github.run_attempt }}"
+        name_index = self._anchor(artifact_name)
         step_start = max(index for index in range(name_index) if self.lines[index].strip() == "- uses: actions/upload-artifact@v4")
         step_end = next((index for index in range(step_start + 1, len(self.lines))
                          if self.lines[index].startswith("      - ")), len(self.lines))
-        step = [line.strip() for line in self.lines[step_start:step_end]]
-        self.assertIn("path: test-results/refstore/", step)
+        step_lines = self.lines[step_start:step_end]
+        step = [line.strip() for line in step_lines]
+        self.assertIn(artifact_name, step)
+        self.assertIn("if: always()", step)
         self.assertIn("if-no-files-found: error", step)
         self.assertLess(fixture_index, step_start)
-        # The upload path (relative to the checkout) names exactly that directory.
+        # The upload root still covers the fixture and excludes only the #126 raw log.
         self.assertEqual(directory.replace("$GITHUB_WORKSPACE/", ""), "test-results/refstore")
-        uploaded = next(line.split(":", 1)[1].strip() for line in step if line.startswith("path:"))
+        paths = re.search(r"(?ms)^ {10}path: \|\n(.*?)(?=^ {0,10}\S|\Z)", "\n".join(step_lines))
+        self.assertIsNotNone(paths)
+        upload_patterns = [line.strip() for line in paths[1].splitlines() if line.strip()]
+        self.assertEqual(upload_patterns, [
+            "test-results/refstore/",
+            "!test-results/refstore/blob_git_gateway/native.log",
+        ])
+        uploaded = upload_patterns[0]
         self.assertEqual(Path(uploaded.rstrip("/")) / FIXTURE,
                          Path("test-results/refstore/ref_store_format22_backup_fixture"))
         self.assertEqual((Path(uploaded.rstrip("/")) / FIXTURE).with_suffix(".build.json").as_posix(),
@@ -624,7 +634,7 @@ class ProtocolSuiteCountTest(unittest.TestCase):
         self.assertIsNotNone(assertion, "the step has no sorted suite-count assertion")
         asserted = ast.literal_eval(assertion.group(1))
         self.assertEqual(asserted, sorted(counts.values()))
-        self.assertEqual(asserted, [8, 11, 12, 23])
+        self.assertEqual(asserted, [8, 12, 23, 23])
 
     def test_strip_rust_comments_handles_comments_and_char_literals(self) -> None:
         sample = (
