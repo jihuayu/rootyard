@@ -92,7 +92,7 @@ jobs:
             --pushes 4 \
             --base-commits 6 \
             --payload-kb 32 \
-            --build-receipt test-results/push-causal-stream/cargo-fork.json \
+            --cargo-fork-record test-results/push-causal-stream/cargo-fork.json \
             --json-out test-results/push-causal-stream/benchmark.json
       - name: Upload push-causal-stream CI evidence
         if: always()

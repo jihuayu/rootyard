@@ -258,14 +258,52 @@ def _benchmark_format(fmt: str, pushes: int, base_commits: int, payload_kb: int)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_benchmark(*, formats: list[str], pushes: int, base_commits: int, payload_kb: int, build_receipt: Path | None) -> dict[str, Any]:
+PINNED_CARGO_FORK_REVISION = "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"
+PINNED_CARGO_FORK_RELEASE = "1.101.0"
+
+
+def _validate_cargo_fork_record(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("cargo-fork record must be a JSON object")
+    rev = payload.get("revision")
+    rel = payload.get("release")
+    sha = payload.get("binary_sha256")
+    if rev != PINNED_CARGO_FORK_REVISION:
+        raise ValueError(f"unexpected cargo-fork revision: {rev!r}")
+    if rel != PINNED_CARGO_FORK_RELEASE:
+        raise ValueError(f"unexpected cargo-fork release: {rel!r}")
+    if not isinstance(sha, str) or len(sha) != 64:
+        raise ValueError("cargo-fork record missing 64-hex binary_sha256")
+    return {
+        "schema": payload.get("schema"),
+        "revision": rev,
+        "release": rel,
+        "host": payload.get("host"),
+        "binary_sha256": sha,
+    }
+
+
+def run_benchmark(
+    *,
+    formats: list[str],
+    pushes: int,
+    base_commits: int,
+    payload_kb: int,
+    build_receipt: Path | None = None,
+    cargo_fork_record: Path | None = None,
+) -> dict[str, Any]:
+    git_head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True)
     out: dict[str, Any] = {
         "schema_version": 1,
         "issue": 183,
         "reference_baseline": 164,
         "git_version": subprocess.check_output(["git", "--version"]).decode().strip(),
+        "repo_head": git_head.stdout.strip() if git_head.returncode == 0 else "unknown",
         "formats": {},
     }
+    if cargo_fork_record is not None:
+        record_payload = json.loads(cargo_fork_record.read_text(encoding="utf-8"))
+        out["cargo_fork_record"] = _validate_cargo_fork_record(record_payload)
     if build_receipt is not None:
         sys.path.insert(0, str(ROOT / "scripts"))
         from native_build_receipt import validate_receipt
@@ -284,7 +322,8 @@ def main() -> int:
     parser.add_argument("--pushes", type=int, default=4, help="Incremental thin pushes per mode")
     parser.add_argument("--base-commits", type=int, default=6, help="Base history commits")
     parser.add_argument("--payload-kb", type=int, default=32, help="Base payload size in KiB")
-    parser.add_argument("--build-receipt", type=Path, default=None, help="Optional CargoFork build receipt")
+    parser.add_argument("--cargo-fork-record", type=Path, default=None, help="Optional CargoFork installer record")
+    parser.add_argument("--build-receipt", type=Path, default=None, help="Optional native build receipt")
     parser.add_argument("--json-out", type=Path, default=None, help="Write JSON output path")
     args = parser.parse_args()
 
@@ -295,11 +334,12 @@ def main() -> int:
         base_commits=args.base_commits,
         payload_kb=args.payload_kb,
         build_receipt=args.build_receipt,
+        cargo_fork_record=args.cargo_fork_record,
     )
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(rendered + "\n", encoding="utf-8")
+        args.json_out.write_text(rendered + "\n", encoding="utf-8", newline="\n")
     print(rendered)
     return 0
 

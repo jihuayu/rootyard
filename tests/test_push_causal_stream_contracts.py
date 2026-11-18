@@ -107,11 +107,38 @@ class PushCausalStreamContractsTest(unittest.TestCase):
         self.assertLess(len(doc_text.splitlines()), 500)
 
     def test_eval_script_runs_and_reports_overlap_vs_naive_repack(self) -> None:
+        import json
+        import tempfile
+
         spec = importlib.util.spec_from_file_location("eval_push_causal_stream", EVAL_SCRIPT)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        report = module.run_benchmark(formats=["sha1"], pushes=2, base_commits=3, payload_kb=8, build_receipt=None)
+        with tempfile.TemporaryDirectory() as td:
+            record_path = Path(td) / "cargo-fork.json"
+            record_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "rootyard.cargo-fork.v1",
+                        "revision": "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b",
+                        "release": "1.101.0",
+                        "host": "x86_64-unknown-linux-gnu",
+                        "binary_sha256": "c9f673fba0eaf2c894a3b36e7b67fde518dde69ff93fdc606c4de927613e229c",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = module.run_benchmark(
+                formats=["sha1"],
+                pushes=2,
+                base_commits=3,
+                payload_kb=8,
+                cargo_fork_record=record_path,
+            )
+        self.assertEqual(
+            report["cargo_fork_record"]["revision"],
+            "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b",
+        )
         sha1 = report["formats"]["sha1"]
         self.assertLess(sha1["overlapped_stream"]["blob_put_bytes"], sha1["naive_full_repack"]["blob_put_bytes"])
         self.assertEqual(sha1["overlapped_stream"]["duplicate_materialized_bytes"], 0)
