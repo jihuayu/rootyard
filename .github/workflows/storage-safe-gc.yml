@@ -1,0 +1,99 @@
+name: Storage Safe GC and Two-Phase Compaction
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/storage-safe-gc.yml'
+      - 'src/storage_lifecycle.rs'
+      - 'src/storage_lifecycle/safe_gc.rs'
+      - 'src/storage_lifecycle/safe_gc/**'
+      - 'tests/storage_safe_gc.rs'
+      - 'tests/test_storage_safe_gc_contracts.py'
+      - 'scripts/eval_storage_safe_gc.py'
+      - 'docs/storage-safe-gc.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-safe-gc-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  storage-safe-gc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && rustfmt -V && cargo clippy -V
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/storage-safe-gc/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+      - name: Format, design-doc and offline contract checks
+        run: |
+          git --version
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_storage_safe_gc_contracts.py
+      - name: Run Clippy, unit tests, and stock-Git OpenDAL Safe GC integration tests
+        run: |
+          cargo clippy --locked --no-default-features --lib --test storage_safe_gc -- -D warnings
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib storage_lifecycle::safe_gc
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test storage_safe_gc
+      - name: Run reproducible Safe GC evaluator
+        run: |
+          mkdir -p test-results/storage-safe-gc
+          python3 scripts/eval_storage_safe_gc.py \
+            --profiles small,sustained \
+            --formats sha1,sha256 \
+            --json-out test-results/storage-safe-gc/eval-summary.json
+      - name: Upload storage-safe-gc CI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-safe-gc-evidence
+          path: test-results/storage-safe-gc/
+          if-no-files-found: warn
