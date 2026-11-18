@@ -192,22 +192,42 @@ remove_owned_output() {
   rm -f -- "$file"
 }
 
+bounded_docker() {
+  timeout --signal=TERM --kill-after=2s 5s docker "$@"
+}
+
+discover_container() {
+  # Start issues one create for one name. Refuse duplicate, truncated or
+  # malformed results, including a failed Docker query with empty stdout.
+  bounded_docker ps --all --no-trunc --filter "$1" --format '{{.ID}}' 2>/dev/null \
+    | python3 -c '
+import re
+import sys
+
+raw = sys.stdin.buffer.read(66)
+if raw and not re.fullmatch(rb"[0-9a-f]{64}\n", raw):
+    raise SystemExit(1)
+sys.stdout.buffer.write(raw.rstrip(b"\n"))
+'
+}
+
 verify_owned_container() {
-  local cid=$1 nonce=$2
-  local actual kind label_nonce label_path label_uid label_name
-  actual=$(docker inspect --type container --format '{{.Id}}' "$cid" 2>/dev/null) \
+  local cid=$1 nonce=$2 name=$3
+  local actual actual_name kind label_nonce label_path label_uid label_name
+  actual=$(bounded_docker inspect --type container --format '{{.Id}}' "$cid" 2>/dev/null) \
     || fail "sentinel container $cid is absent or unreadable; refusing cleanup"
   [ "$actual" = "$cid" ] || fail "sentinel container id $cid resolved to $actual; refusing cleanup"
-  kind=$(docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.kind"}}' "$cid" 2>/dev/null || true)
-  label_nonce=$(docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.nonce"}}' "$cid" 2>/dev/null || true)
-  label_path=$(docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.directory"}}' "$cid" 2>/dev/null || true)
-  label_uid=$(docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.uid"}}' "$cid" 2>/dev/null || true)
-  label_name=$(docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.name"}}' "$cid" 2>/dev/null || true)
+  kind=$(bounded_docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.kind"}}' "$cid" 2>/dev/null) || fail "cannot inspect container ownership"
+  label_nonce=$(bounded_docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.nonce"}}' "$cid" 2>/dev/null) || fail "cannot inspect container ownership"
+  label_path=$(bounded_docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.directory"}}' "$cid" 2>/dev/null) || fail "cannot inspect container ownership"
+  label_uid=$(bounded_docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.uid"}}' "$cid" 2>/dev/null) || fail "cannot inspect container ownership"
+  label_name=$(bounded_docker inspect --type container --format '{{index .Config.Labels "rootyard.fixture.name"}}' "$cid" 2>/dev/null) || fail "cannot inspect container ownership"
+  actual_name=$(bounded_docker inspect --type container --format '{{.Name}}' "$cid" 2>/dev/null) || fail "cannot inspect container ownership"
   [ "$kind" = "owned-garage" ] || fail "container $cid lacks the owned-fixture label; refusing cleanup"
   [ "$label_nonce" = "$nonce" ] || fail "container $cid nonce does not match the sentinel; refusing cleanup"
   [ "$label_path" = "$directory" ] || fail "container $cid path does not match the sentinel; refusing cleanup"
   [ "$label_uid" = "$(id -u)" ] || fail "container $cid uid does not match; refusing cleanup"
-  [ "$label_name" = "$(sentinel_value container_name "$sentinel")" ] \
+  [ "$label_name" = "$name" ] && [ "$actual_name" = "/$name" ] \
     || fail "container $cid name does not match the sentinel; refusing cleanup"
 }
 
@@ -228,22 +248,48 @@ stop() {
     || fail "refusing $directory: sentinel is bound to another path"
   [ "$(sentinel_value uid "$sentinel")" = "$(id -u)" ] \
     || fail "refusing $directory: sentinel belongs to another uid"
-  local nonce cid env
+  local nonce cid env name attempted found
   nonce=$(sentinel_value nonce "$sentinel")
-  [ -n "$nonce" ] || fail "refusing $directory: sentinel has no unique nonce"
+  [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || fail "sentinel has no valid unique nonce"
   cid=$(sentinel_value container_id "$sentinel")
   env=$(sentinel_value output_env "$sentinel")
-  if [ -n "$cid" ]; then
+  name=$(sentinel_value container_name "$sentinel")
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fail "sentinel has no valid container name"
+  attempted=$(sentinel_value create_attempted "$sentinel")
+  case "$attempted" in
+    0) [ -z "$cid" ] || fail "pre-create sentinel unexpectedly records a container id" ;;
+    1 | '') ;;
+    *) fail "sentinel has invalid create state" ;;
+  esac
+  if [ "$attempted" != 0 ]; then
     command -v docker >/dev/null 2>&1 || fail "docker is required to remove the owned container"
-    verify_owned_container "$cid" "$nonce"
-    docker rm -f -- "$cid" >/dev/null || fail "docker could not remove owned container $cid"
+    command -v timeout >/dev/null 2>&1 || fail "timeout(1) is required to bound Docker cleanup"
+    if [ -z "$cid" ]; then
+      cid=$(discover_container "label=rootyard.fixture.nonce=$nonce") || fail "cannot discover the attempted Garage container"
+      # Docker may still be completing a create whose client lost its reply.
+      # An empty list is only conclusive if create was never attempted.
+      [ -n "$cid" ] || fail "Garage create outcome is ambiguous; preserving ownership evidence"
+      found=$cid
+    else
+      [[ "$cid" =~ ^[0-9a-f]{64}$ ]] || fail "sentinel has an invalid container id"
+      found=$(discover_container "id=$cid") || fail "cannot query the recorded Garage container"
+      [ -z "$found" ] || [ "$found" = "$cid" ] || fail "sentinel container id resolved to a different id; refusing cleanup"
+    fi
+    if [ -n "$found" ]; then
+      verify_owned_container "$cid" "$nonce" "$name"
+      bounded_docker rm -f -- "$cid" >/dev/null 2>&1 || fail "docker could not remove owned container $cid"
+    fi
+    found=$(discover_container "label=rootyard.fixture.nonce=$nonce") || fail "cannot prove Garage nonce absence"
+    [ -z "$found" ] || fail "a Garage nonce match remains; preserving ownership evidence"
+    found=$(discover_container "id=$cid") || fail "cannot prove Garage container absence"
+    [ -z "$found" ] || fail "the Garage container remains; preserving ownership evidence"
   fi
   remove_owned_output "$env"
   rm -rf -- "$directory"
 }
 
 write_sentinel() {
-  local cid=$1 name=$2 nonce=$3
+  local cid=$1 name=$2 nonce=$3 attempted=$4
   local tmp="$directory/${sentinel_name}.tmp"
   umask 077
   {
@@ -252,6 +298,7 @@ write_sentinel() {
     printf 'directory=%s\n' "$directory"
     printf 'uid=%s\n' "$(id -u)"
     printf 'nonce=%s\n' "$nonce"
+    printf 'create_attempted=%s\n' "$attempted"
     printf 'container_id=%s\n' "$cid"
     printf 'container_name=%s\n' "$name"
     printf 'output_env=%s\n' "$output"
@@ -292,7 +339,7 @@ start() {
   nonce=$(openssl rand -hex 16)
   uid=$(id -u)
   name="rootyard-owned-garage-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-${nonce:0:12}"
-  write_sentinel "" "$name" "$nonce"
+  write_sentinel "" "$name" "$nonce" 0
   rootyard_fixture_owned=1
   trap on_start_exit EXIT
   local image_id repo_digests version_line
@@ -337,7 +384,8 @@ TOML
   mkdir -p "$directory/meta" "$directory/data"
 
   local container_id
-  container_id=$(docker create --rm \
+  write_sentinel "" "$name" "$nonce" 1
+  container_id=$(timeout --signal=TERM --kill-after=5s 30s docker create --rm \
     --name "$name" \
     --label "rootyard.fixture.kind=owned-garage" \
     --label "rootyard.fixture.nonce=$nonce" \
@@ -349,8 +397,9 @@ TOML
     -v "$directory/garage.toml:/etc/garage.toml:ro" \
     -v "$directory:/var/lib/garage" \
     "$image")
-  write_sentinel "$container_id" "$name" "$nonce"
-  verify_owned_container "$container_id" "$nonce"
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || fail "docker create did not report a full container id"
+  write_sentinel "$container_id" "$name" "$nonce" 1
+  verify_owned_container "$container_id" "$nonce" "$name"
   docker start "$container_id" >/dev/null
 
   local garage=(docker exec "$container_id" /garage -c /etc/garage.toml)

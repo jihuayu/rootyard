@@ -58,6 +58,7 @@ class FixtureGuardTest(unittest.TestCase):
         self.bin.mkdir()
         self.log = self.root / "docker.log"
         self.log.write_text("")
+        self.container_state = self.root / "container.state"
         docker = self.bin / "docker"
         docker.write_text(
             f"""#!/usr/bin/env bash
@@ -81,7 +82,21 @@ case "$*" in
     [ -n "${{STUB_IMAGE_STATE:-}}" ] && : >"$STUB_IMAGE_STATE"
     exit 0 ;;
   *'run --rm'*'--version'*) printf '%s\\n' 'garage v2.1.0 [features: bundled-libs]' ;;
-  *'create --rm'*) printf '%s\\n' "${{STUB_CONTAINER_ID:?}}" ;;
+  *'create --rm'*)
+    if [ "${{STUB_CREATE_WITHOUT_OWNER:-0}}" -eq 0 ]; then
+      printf '%s\\n' "${{STUB_CONTAINER_ID:?}}" >"${{STUB_CONTAINER_STATE:?}}"
+    fi
+    [ "${{STUB_CREATE_EXIT:-0}}" -eq 0 ] || exit "$STUB_CREATE_EXIT"
+    printf '%s\\n' "${{STUB_CONTAINER_ID:?}}" ;;
+  'ps --all --no-trunc '*)
+    [ "${{STUB_QUERY_EXIT:-0}}" -eq 0 ] || exit "$STUB_QUERY_EXIT"
+    if [ -n "${{STUB_QUERY_OUTPUT:-}}" ]; then
+      printf '%s\\n' "$STUB_QUERY_OUTPUT"
+    elif [ -f "${{STUB_CONTAINER_STATE:?}}" ]; then
+      cat "$STUB_CONTAINER_STATE"
+    else
+      exit "${{STUB_ABSENCE_EXIT:-0}}"
+    fi ;;
   exec*)
     case "$*" in
       *'node id'*)
@@ -107,12 +122,15 @@ case "$*" in
       *) exit 0 ;;
     esac ;;
   *'{{{{.Id}}}}'*) printf '%s\\n' "${{STUB_CONTAINER_ID:?}}" ;;
+  *'{{{{.Name}}}}'*) printf '/%s\\n' "${{STUB_ACTUAL_NAME:-$(sentinel_field container_name)}}" ;;
   *'rootyard.fixture.kind'*) printf '%s\\n' "${{STUB_KIND:-owned-garage}}" ;;
   *'rootyard.fixture.nonce'*) printf '%s\\n' "${{STUB_NONCE:-$(sentinel_field nonce)}}" ;;
   *'rootyard.fixture.directory'*) printf '%s\\n' "${{STUB_PATH:-$(sentinel_field directory)}}" ;;
   *'rootyard.fixture.uid'*) printf '%s\\n' "${{STUB_UID:-$(sentinel_field uid)}}" ;;
   *'rootyard.fixture.name'*) printf '%s\\n' "${{STUB_NAME:-$(sentinel_field container_name)}}" ;;
-  rm*) exit "${{STUB_RM_EXIT:-0}}" ;;
+  rm*)
+    [ "${{STUB_RM_EXIT:-0}}" -eq 0 ] || exit "$STUB_RM_EXIT"
+    [ "${{STUB_RM_LEAVES_PRESENT:-0}}" -eq 1 ] || rm -f -- "${{STUB_CONTAINER_STATE:?}}" ;;
   start*) exit "${{STUB_START_EXIT:-0}}" ;;
   *) exit 1 ;;
 esac
@@ -122,12 +140,13 @@ esac
         self.env = isolated_environment()
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env["PATH"]
         self.env["STUB_DOCKER_LOG"] = str(self.log)
+        self.env["STUB_CONTAINER_STATE"] = str(self.container_state)
         self.env["STUB_STATUS_COUNTER"] = str(self.root / "status.count")
         self.env["STUB_NODE_COUNTER"] = str(self.root / "node.count")
         self.env.pop("GITHUB_WORKSPACE", None)
         self.env.pop("RUNNER_TEMP", None)
         self.cid = "c" * 64
-        self.nonce = "n" * 32
+        self.nonce = "a" * 32
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -141,7 +160,7 @@ esac
         self.assertFalse(set(OBJECT_STORE_ENV_KEYS) & set(env))
 
     def sentinel(self, directory, *, cid=None, nonce=None, kind="rootyard-owned-garage-fixture",
-                 output_env="", name="owned-name"):
+                 output_env="", name="owned-name", attempted=None):
         directory.mkdir(parents=True, exist_ok=True)
         rows = {
             "kind": kind,
@@ -153,6 +172,10 @@ esac
             "container_name": name,
             "output_env": str(output_env),
         }
+        if attempted is not None:
+            rows["create_attempted"] = attempted
+        if rows["container_id"]:
+            self.container_state.write_text(rows["container_id"] + "\n")
         path = directory / ".rootyard-owned-fixture"
         path.write_text("".join(f"{key}={value}\n" for key, value in rows.items()))
         path.chmod(0o600)
@@ -181,6 +204,7 @@ esac
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=100,
         )
         self.assertEqual(expect, process.returncode, process.stderr)
         return process
@@ -330,6 +354,99 @@ esac
         self.assertIn(f"rm -f -- {self.cid}", self.docker_calls())
         self.assertFalse(directory.exists())
         self.assertFalse((self.root / "outside.env").exists())
+
+    def test_lost_create_acknowledgement_removes_verified_owned_container(self):
+        directory = self.root / "lost-ack"
+        self.start(directory, 124, env={"STUB_CREATE_EXIT": "124"})
+        self.assertIn("ps --all --no-trunc --filter label=rootyard.fixture.nonce=", self.docker_calls())
+        self.assertIn(f"rm -f -- {self.cid}", self.docker_calls())
+        self.assertFalse(self.container_state.exists())
+        self.assertFalse(directory.exists())
+
+    def test_failed_container_id_persistence_reconciles_empty_id_sentinel(self):
+        directory = self.root / "lost-persistence"
+        mv = self.bin / "mv"
+        mv.write_text("""#!/usr/bin/env bash
+if [[ "$*" == *'.rootyard-owned-fixture' ]] && grep -Eq '^container_id=[0-9a-f]{64}$' "$3"; then
+  exit 8
+fi
+exec /bin/mv "$@"
+""")
+        mv.chmod(0o755)
+        self.start(directory, 8)
+        self.assertIn("ps --all --no-trunc --filter label=rootyard.fixture.nonce=", self.docker_calls())
+        self.assertIn(f"rm -f -- {self.cid}", self.docker_calls())
+        self.assertFalse(self.container_state.exists())
+        self.assertFalse(directory.exists())
+
+    def test_empty_pending_discovery_keeps_evidence_for_possible_late_create(self):
+        directory = self.root / "late-ack"
+        self.start(directory, 124, env={"STUB_CREATE_EXIT": "124", "STUB_CREATE_WITHOUT_OWNER": "1"})
+        sentinel = directory / ".rootyard-owned-fixture"
+        retained = sentinel.read_text()
+        nonce = next(line.split("=", 1)[1] for line in retained.splitlines() if line.startswith("nonce="))
+        name = next(line.split("=", 1)[1] for line in retained.splitlines() if line.startswith("container_name="))
+        self.assertIn("create_attempted=1\n", retained)
+        self.assertIn("container_id=\n", retained)
+        self.assertNotIn("rm -f", self.docker_calls())
+        self.container_state.write_text(self.cid + "\n")
+        self.run_script("stop", directory, 0, {"STUB_NONCE": nonce, "STUB_NAME": name})
+        self.assertFalse(directory.exists())
+        self.assertFalse(self.container_state.exists())
+
+    def test_pre_create_sentinel_allows_cleanup_without_docker_discovery(self):
+        directory = self.root / "pre-create"
+        self.sentinel(directory, cid="", attempted="0")
+        self.run_script("stop", directory, 0, {"STUB_QUERY_EXIT": "3"})
+        self.assertEqual(self.docker_calls(), "")
+        self.assertFalse(directory.exists())
+
+    def test_discovered_container_requires_exact_labels_and_docker_name(self):
+        directory = self.root / "foreign-label"
+        sentinel = self.sentinel(directory, cid="", attempted="1")
+        original = sentinel.read_bytes()
+        self.container_state.write_text(self.cid + "\n")
+        for override in ({"STUB_KIND": "foreign"}, {"STUB_NONCE": "b" * 32}, {"STUB_PATH": "/not-owned"},
+                         {"STUB_UID": str(os.getuid() + 1)}, {"STUB_NAME": "foreign"}, {"STUB_ACTUAL_NAME": "foreign"}):
+            with self.subTest(override=override):
+                self.run_script("stop", directory, 1, override)
+                self.assertEqual(sentinel.read_bytes(), original)
+                self.assertTrue(self.container_state.exists())
+        self.assertNotIn("rm -f", self.docker_calls())
+
+    def test_failed_or_non_unique_discovery_preserves_pending_evidence(self):
+        directory = self.root / "unproven-discovery"
+        env_file = self.root / "outside.env"
+        env_file.write_text("private fixture metadata")
+        env_file.chmod(0o600)
+        sentinel = self.sentinel(directory, cid="", attempted="1", output_env=env_file)
+        original = sentinel.read_bytes()
+        for override in ({"STUB_QUERY_EXIT": "3"}, {"STUB_QUERY_OUTPUT": self.cid + "\n" + "d" * 64}):
+            with self.subTest(override=override):
+                self.run_script("stop", directory, 1, override)
+                self.assertEqual(sentinel.read_bytes(), original)
+                self.assertTrue(env_file.is_file())
+        self.assertNotIn("rm -f", self.docker_calls())
+
+    def test_uncertain_or_nonempty_absence_check_keeps_sentinel_and_credentials(self):
+        for env in ({"STUB_ABSENCE_EXIT": "3"}, {"STUB_RM_LEAVES_PRESENT": "1"}):
+            with self.subTest(env=env):
+                directory = self.root / f"absence-{next(iter(env))}"
+                credentials = directory.with_suffix(".env")
+                credentials.touch(mode=0o600)
+                sentinel = self.sentinel(directory, output_env=credentials)
+                original = sentinel.read_bytes()
+                self.run_script("stop", directory, 1, env)
+                self.assertEqual(sentinel.read_bytes(), original)
+                self.assertTrue(credentials.is_file())
+
+    def test_recorded_id_already_absent_cleans_only_after_successful_queries(self):
+        directory = self.root / "already-absent"
+        self.sentinel(directory)
+        self.container_state.unlink()
+        self.run_script("stop", directory, 0)
+        self.assertFalse(directory.exists())
+        self.assertNotIn("rm -f", self.docker_calls())
 
     def test_failed_cleanup_reports_but_keeps_the_original_start_status(self):
         directory = self.root / "owned"
