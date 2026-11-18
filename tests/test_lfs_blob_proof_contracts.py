@@ -122,10 +122,23 @@ class LfsBlobProofContractTests(unittest.TestCase):
             "SET LOCAL synchronous_commit = 'on'",
             "hydrate_clean_compute_view",
             "reconcile_in_flight_uploads",
+            "InFlightUploadGuard",
+            "reconcile_stale_pending_uploads",
+            "abort_upload_on_cancel",
+            "aborted_cancelled",
         )
         for token in required:
             with self.subTest(token=token):
                 self.assertIn(token, combined)
+
+        prod_routes_src = (MOD_DIR / "prod_routes.rs").read_text(encoding="utf-8")
+        self.assertIn("reconcile_stale_pending_uploads", prod_routes_src)
+        self.assertIn("InFlightUploadGuard", prod_routes_src)
+        schema_src = (MOD_DIR / "pg_schema.rs").read_text(encoding="utf-8")
+        self.assertIn('format!("{repository_id}.git")', schema_src)
+        hook_src = (TEST_SUPPORT / "git_smart_http.rs").read_text(encoding="utf-8")
+        self.assertIn("    b = s.recv(65536)", hook_src)
+        self.assertIn("    sys.exit(1)", hook_src)
 
         policy_src = (ROOT / "src" / "browse" / "policy.rs").read_text(encoding="utf-8")
         self.assertIn("validate_new_refs_for_hook", policy_src)

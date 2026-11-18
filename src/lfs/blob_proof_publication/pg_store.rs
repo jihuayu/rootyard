@@ -168,7 +168,7 @@ impl PgLfsBlobStore {
             )
             .await
             .map_err(pg_err)?;
-        let op_row = Self::decode_upload_op_row(&row)?;
+        let mut op_row = Self::decode_upload_op_row(&row)?;
         if op_row.tenant_id != tenant_id
             || op_row.actor_id != actor_id
             || op_row.oid_sha256 != oid_sha256
@@ -178,6 +178,19 @@ impl PgLfsBlobStore {
                 LfsProofRejectCode::AttestationEquivocation,
                 "upload operation_id reused with conflicting tenant, actor, OID, or byte size",
             ));
+        }
+        if matches!(op_row.state.as_str(), "aborted_failed" | "aborted_cancelled") {
+            let reopened = tx
+                .query_one(
+                    "UPDATE lfs_blob_upload_operations
+                     SET state='pending', updated_at=clock_timestamp()
+                     WHERE repository_id=$1 AND operation_id=$2
+                     RETURNING repository_id, operation_id, tenant_id, actor_id, oid_sha256, size_bytes, state, locator_json, hold_id",
+                    &[&repository_id, &operation_id],
+                )
+                .await
+                .map_err(pg_err)?;
+            op_row = Self::decode_upload_op_row(&reopened)?;
         }
         tx.commit().await.map_err(pg_err)?;
         Ok(op_row)

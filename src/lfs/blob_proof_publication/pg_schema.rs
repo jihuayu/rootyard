@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS lfs_blob_upload_attempts (
     actor_id UUID NOT NULL,
     oid_sha256 TEXT NOT NULL CHECK (oid_sha256 ~ '^[0-9a-f]{64}$'),
     size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
-    state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'aborted_failed')),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'aborted_failed', 'aborted_cancelled')),
     failure_reason TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS lfs_blob_upload_operations (
     actor_id UUID NOT NULL,
     oid_sha256 TEXT NOT NULL CHECK (oid_sha256 ~ '^[0-9a-f]{64}$'),
     size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
-    state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'aborted_failed')),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'aborted_failed', 'aborted_cancelled')),
     locator_json JSONB,
     hold_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
@@ -141,7 +141,14 @@ CREATE TABLE IF NOT EXISTS lfs_pointer_attestations (
 
 pub async fn init_lfs_blob_proof_tables(pool: &Pool) -> Result<(), LfsBlobError> {
     let client = pool.get().await.map_err(pg_err)?;
-    client.batch_execute(LFS_BLOB_PROOF_DDL).await.map_err(pg_err)?;
+    let exists: bool = client
+        .query_one("SELECT to_regclass('lfs_blob_repo_realms') IS NOT NULL", &[])
+        .await
+        .map_err(pg_err)?
+        .get(0);
+    if !exists {
+        client.batch_execute(LFS_BLOB_PROOF_DDL).await.map_err(pg_err)?;
+    }
     Ok(())
 }
 
@@ -201,7 +208,7 @@ impl PgLfsBlobStore {
             "sha256" => GitObjectFormat::Sha256,
             other => return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, format!("bad format {other}"))),
         };
-        let bare_path = data_root.join("repos").join(repository_id.to_string());
+        let bare_path = data_root.join("repos").join(format!("{repository_id}.git"));
         let bare_git_dir = bare_path
             .to_str()
             .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::InvalidInput, "non-UTF8 repo path"))?
@@ -287,6 +294,8 @@ impl PgLfsBlobStore {
             )
             .await
             .map_err(pg_err)?;
+        drop(client);
+        let _ = self.reconcile_stale_pending_uploads(repository_id, Duration::from_secs(30)).await?;
         Self::decode_realm(&saved)
     }
 

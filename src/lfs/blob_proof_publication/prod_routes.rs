@@ -25,6 +25,7 @@ use crate::{
 };
 
 use super::authz::{LfsBlobRuntimeGate, extract_stable_operation_id};
+use super::locks_store::InFlightUploadGuard;
 use super::pg_store::PgLfsBlobStore;
 pub(crate) use super::prod_publication::{active_push_quarantine_dirs, enforce_blob_gate_if_requested, to_app_error};
 use super::prod_publication::{
@@ -35,9 +36,8 @@ pub use super::prod_publication::{
     set_runtime_gate_override, with_push_attestation_session,
 };
 use super::transfer::{
-    EphemeralScratchGuard, LfsTransferContext, PreStreamedScratch, acquire_transfer_permit,
-    open_verified_remote_download_file, process_batch_request, upload_streamed_lfs_object_to_remote,
-    verify_lfs_object_remote,
+    LfsTransferContext, PreStreamedScratch, acquire_transfer_permit, open_verified_remote_download_file,
+    process_batch_request, upload_streamed_lfs_object_to_remote, verify_lfs_object_remote,
 };
 use super::types::{LfsBlobError, LfsProofRejectCode};
 
@@ -88,6 +88,12 @@ async fn auth_and_prepare_prod(
         Ok(r) => r,
         Err(e) => return Err(Box::new(lfs_blob_err_response(e))),
     };
+    if write {
+        let stale_window = state.config.git_timeout.max(std::time::Duration::from_secs(5));
+        if let Err(e) = pg.reconcile_stale_pending_uploads(realm.repository_id, stale_window).await {
+            return Err(Box::new(lfs_blob_err_response(e)));
+        }
+    }
     let auth_access = match pg.resolve_authoritative_repo_access(&realm, actor.id, &actor.username, write, false).await
     {
         Ok(a) => a,
@@ -228,19 +234,36 @@ pub(crate) async fn prod_upload(
             return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
         }
     }
-    if headers
+    let content_len_opt = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .is_some_and(|cl| cl > state.config.max_request_bytes)
-    {
+        .and_then(|s| s.parse::<u64>().ok());
+    if content_len_opt.is_some_and(|cl| cl > state.config.max_request_bytes) {
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
+    }
+    let declared_size: Option<i64> = size_param.or_else(|| content_len_opt.and_then(|cl| i64::try_from(cl).ok()));
+
+    let repo_id = realm.repository_id;
+    let tenant_id = realm.owner_tenant_id;
+    if let (Some(explicit_op), Some(decl_sz)) = (op_id, declared_size)
+        && let Err(e) = pg
+            .begin_or_load_upload_operation(repo_id, explicit_op, tenant_id, actor.id, &oid, decl_sz)
+            .await
+    {
+        return Ok(lfs_blob_err_response(e));
+    }
+    let attempt_id = Uuid::new_v4();
+    let attempt_res = pg
+        .record_upload_attempt_start(attempt_id, tenant_id, repo_id, actor.id, &oid, declared_size.unwrap_or(0))
+        .await;
+    if let Err(e) = attempt_res {
+        return Ok(lfs_blob_err_response(e));
     }
 
     let scratch = ephemeral_scratch_root();
     fs::create_dir_all(&scratch).await.map_err(Error::internal)?;
     let scratch_path = scratch.join(format!(".lfs-stream-up-{}.tmp", Uuid::new_v4()));
-    let _guard = EphemeralScratchGuard(scratch_path.clone());
+    let mut upload_guard = InFlightUploadGuard::new(pg.clone(), repo_id, attempt_id, op_id, scratch_path.clone());
     let mut hasher = Sha256::new();
     let mut written: u64 = 0;
     {
@@ -253,9 +276,13 @@ pub(crate) async fn prod_upload(
         let mut out_file = fs::File::from_std(std_file);
         let mut data_stream = body.into_data_stream();
         while let Some(chunk_res) = data_stream.next().await {
-            let chunk = chunk_res.map_err(|_| Error::bad_request())?;
+            let Some(chunk) = chunk_res.ok() else {
+                upload_guard.abort_now("upload_stream_error_or_oversize").await;
+                return Err(Error::bad_request());
+            };
             written = written.saturating_add(chunk.len() as u64);
             if written > state.config.max_request_bytes {
+                upload_guard.abort_now("upload_stream_error_or_oversize").await;
                 return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
             }
             hasher.update(&chunk);
@@ -269,6 +296,7 @@ pub(crate) async fn prod_upload(
         path: scratch_path,
         size_bytes: written as i64,
         sha256_hex: hex::encode(hasher.finalize()),
+        pre_attempt_id: Some(attempt_id),
     };
     let ctx = LfsTransferContext {
         gate: &gate,
@@ -280,8 +308,12 @@ pub(crate) async fn prod_upload(
     };
     let committed = match upload_streamed_lfs_object_to_remote(&ctx, op_id, &oid, expected_size, &streamed).await {
         Ok(c) => c,
-        Err(e) => return Ok(lfs_blob_err_response(e)),
+        Err(e) => {
+            upload_guard.abort_now(&e.message).await;
+            return Ok(lfs_blob_err_response(e));
+        }
     };
+    upload_guard.mark_committed();
     reauthorize_repo(
         &state,
         &actor,

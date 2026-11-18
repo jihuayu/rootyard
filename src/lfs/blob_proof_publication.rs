@@ -31,7 +31,7 @@ pub use authz::{
     derive_default_upload_operation_id, evaluate_subject_tenant_access, extract_credentials_header,
     extract_stable_operation_id, operation_token_to_uuid, verify_shared_hold_grant,
 };
-pub use locks_store::valid_lfs_lock_path;
+pub use locks_store::{InFlightUploadGuard, valid_lfs_lock_path};
 pub use pg_store::{LfsRepoRealm, PgLfsBlobStore, ReconcileUploadsReport, UploadOperationRow, init_lfs_blob_proof_tables};
 pub use prod_routes::{
     PushAttestationSession, active_blob_gate, prod_validate_and_attest_hook, prod_validate_and_attest_push,

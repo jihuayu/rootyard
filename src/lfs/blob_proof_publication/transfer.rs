@@ -44,6 +44,7 @@ pub struct PreStreamedScratch {
     pub path: PathBuf,
     pub size_bytes: i64,
     pub sha256_hex: String,
+    pub pre_attempt_id: Option<Uuid>,
 }
 
 pub async fn process_batch_request(
@@ -245,17 +246,23 @@ pub async fn upload_streamed_lfs_object_to_remote(
     if !valid_lfs_oid(oid_sha256) || expected_size < 0 {
         return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "invalid LFS oid or negative size"));
     }
-    let attempt_id = Uuid::new_v4();
-    ctx.pg
-        .record_upload_attempt_start(
-            attempt_id,
-            ctx.realm.owner_tenant_id,
-            ctx.realm.repository_id,
-            ctx.access.actor_id,
-            oid_sha256,
-            expected_size,
-        )
-        .await?;
+    let attempt_id = match streamed.pre_attempt_id {
+        Some(id) => id,
+        None => {
+            let id = Uuid::new_v4();
+            ctx.pg
+                .record_upload_attempt_start(
+                    id,
+                    ctx.realm.owner_tenant_id,
+                    ctx.realm.repository_id,
+                    ctx.access.actor_id,
+                    oid_sha256,
+                    expected_size,
+                )
+                .await?;
+            id
+        }
+    };
 
     if streamed.size_bytes != expected_size {
         let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, "upload byte length mismatch").await;
@@ -432,6 +439,7 @@ pub async fn upload_lfs_object_to_remote(
         path: scratch_path,
         size_bytes: payload.len() as i64,
         sha256_hex: hex::encode(Sha256::digest(payload)),
+        pre_attempt_id: None,
     };
     upload_streamed_lfs_object_to_remote(ctx, operation_id, oid_sha256, expected_size, &streamed).await
 }

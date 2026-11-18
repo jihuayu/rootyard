@@ -18,6 +18,9 @@ use support::adversarial::{
     exercise_org_authority_restart_recovery_hydration_and_shared_holds,
     exercise_same_operation_upload_retries_locator_repair_and_corruption_guard,
 };
+use support::adversarial_cancel::{
+    UploadCancelReconcileInput, exercise_production_upload_cancellation_and_stale_reconciler,
+};
 use support::adversarial_default_ops::{
     DefaultOpClientInput, exercise_unmodified_client_default_operation_replay_and_canonical_repair,
 };
@@ -319,6 +322,10 @@ async fn run_pg17_loopback_s3_e2e() -> Result<()> {
                     committed_size: weights_v1.len() as i64,
                 }))
                 .await?;
+
+                let cancel_inp =
+                    UploadCancelReconcileInput { srv: &srv, pool: &pool, pg: &pg, realm: &realm, alice: &alice };
+                Box::pin(exercise_production_upload_cancellation_and_stale_reconciler(cancel_inp)).await?;
 
                 let saved_repos = TempDir::new()?;
                 copy_dir_recursive(&srv.state.storage.root.join("repos"), saved_repos.path())?;

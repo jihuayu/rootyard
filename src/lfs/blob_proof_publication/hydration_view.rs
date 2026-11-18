@@ -393,7 +393,7 @@ impl PgLfsBlobStore {
             let cand =
                 derive_default_upload_operation_id(repository_id, tenant_id, actor_id, oid_sha256, size_bytes, ep);
             match by_id.get(&cand).map(String::as_str) {
-                Some("pending" | "aborted_failed") => return Ok(cand),
+                Some("pending" | "aborted_failed" | "aborted_cancelled") => return Ok(cand),
                 Some("committed") => continue,
                 _ => {
                     if !force_new_repair_epoch && ep > 0 {

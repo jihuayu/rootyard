@@ -2,7 +2,7 @@
 //! and quarantined Git tree/log inspection (`Refs #145`).
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -51,24 +51,37 @@ impl PgLfsBlobStore {
         Ok(row.map(|r| (r.get(0), r.get(1))))
     }
 
-    pub async fn reconcile_in_flight_uploads(&self, repository_id: Uuid) -> Result<ReconcileUploadsReport, LfsBlobError> {
+    pub async fn reconcile_stale_pending_uploads(
+        &self,
+        repository_id: Uuid,
+        stale_after: Duration,
+    ) -> Result<ReconcileUploadsReport, LfsBlobError> {
+        let stale_secs: f64 = stale_after.as_secs_f64();
         let mut client = self.pool().get().await.map_err(pg_err)?;
         let tx = client.transaction().await.map_err(pg_err)?;
+        tx.batch_execute("SET LOCAL synchronous_commit = 'on'").await.map_err(pg_err)?;
         let aborted_attempts = tx
             .execute(
                 "UPDATE lfs_blob_upload_attempts
-                 SET state='aborted_failed', failure_reason='reconciled_orphaned_after_restart', updated_at=clock_timestamp()
-                 WHERE repository_id=$1 AND state='pending'",
-                &[&repository_id],
+                 SET state='aborted_failed',
+                     failure_reason='reconciled_stale_pending_upload',
+                     updated_at=clock_timestamp()
+                 WHERE repository_id=$1
+                   AND state='pending'
+                   AND updated_at <= clock_timestamp() - make_interval(secs => $2)",
+                &[&repository_id, &stale_secs],
             )
             .await
             .map_err(pg_err)?;
         let aborted_ops = tx
             .execute(
                 "UPDATE lfs_blob_upload_operations
-                 SET state='aborted_failed', updated_at=clock_timestamp()
-                 WHERE repository_id=$1 AND state='pending'",
-                &[&repository_id],
+                 SET state='aborted_failed',
+                     updated_at=clock_timestamp()
+                 WHERE repository_id=$1
+                   AND state='pending'
+                   AND updated_at <= clock_timestamp() - make_interval(secs => $2)",
+                &[&repository_id, &stale_secs],
             )
             .await
             .map_err(pg_err)?;
@@ -86,6 +99,45 @@ impl PgLfsBlobStore {
             aborted_orphaned_operations: aborted_ops,
             committed_objects_preserved: preserved.max(0) as u64,
         })
+    }
+
+    pub async fn reconcile_in_flight_uploads(
+        &self,
+        repository_id: Uuid,
+    ) -> Result<ReconcileUploadsReport, LfsBlobError> {
+        self.reconcile_stale_pending_uploads(repository_id, Duration::ZERO).await
+    }
+
+    pub async fn abort_upload_on_cancel(
+        &self,
+        repository_id: Uuid,
+        attempt_id: Uuid,
+        operation_id: Option<Uuid>,
+        reason: &str,
+    ) -> Result<(), LfsBlobError> {
+        let mut client = self.pool().get().await.map_err(pg_err)?;
+        let tx = client.transaction().await.map_err(pg_err)?;
+        tx.batch_execute("SET LOCAL synchronous_commit = 'on'").await.map_err(pg_err)?;
+        tx.execute(
+            "UPDATE lfs_blob_upload_attempts
+             SET state='aborted_cancelled', failure_reason=$2, updated_at=clock_timestamp()
+             WHERE attempt_id=$1 AND state='pending'",
+            &[&attempt_id, &reason],
+        )
+        .await
+        .map_err(pg_err)?;
+        if let Some(op_id) = operation_id {
+            tx.execute(
+                "UPDATE lfs_blob_upload_operations
+                 SET state='aborted_cancelled', updated_at=clock_timestamp()
+                 WHERE repository_id=$1 AND operation_id=$2 AND state='pending'",
+                &[&repository_id, &op_id],
+            )
+            .await
+            .map_err(pg_err)?;
+        }
+        tx.commit().await.map_err(pg_err)?;
+        Ok(())
     }
 
     pub async fn grant_shared_hold(&self, g: &SharedLfsHoldGrant) -> Result<(), LfsBlobError> {
@@ -155,6 +207,66 @@ impl PgLfsBlobStore {
                 active: r.get(9),
             })
             .collect())
+    }
+}
+
+pub struct InFlightUploadGuard {
+    pg: PgLfsBlobStore,
+    repository_id: Uuid,
+    attempt_id: Uuid,
+    operation_id: Option<Uuid>,
+    scratch_path: PathBuf,
+    settled: bool,
+}
+
+impl InFlightUploadGuard {
+    pub fn new(
+        pg: PgLfsBlobStore,
+        repository_id: Uuid,
+        attempt_id: Uuid,
+        operation_id: Option<Uuid>,
+        scratch_path: PathBuf,
+    ) -> Self {
+        Self { pg, repository_id, attempt_id, operation_id, scratch_path, settled: false }
+    }
+
+    pub const fn attempt_id(&self) -> Uuid {
+        self.attempt_id
+    }
+
+    pub fn mark_committed(&mut self) {
+        self.settled = true;
+    }
+
+    pub async fn abort_now(&mut self, reason: &str) {
+        if !self.settled {
+            self.settled = true;
+            let _ = std::fs::remove_file(&self.scratch_path);
+            let _ =
+                self.pg.abort_upload_on_cancel(self.repository_id, self.attempt_id, self.operation_id, reason).await;
+        }
+    }
+}
+
+impl Drop for InFlightUploadGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.scratch_path);
+        if !self.settled {
+            self.settled = true;
+            let pg = self.pg.clone();
+            let repo_id = self.repository_id;
+            let attempt_id = self.attempt_id;
+            let op_id = self.operation_id;
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        pg.abort_upload_on_cancel(repo_id, attempt_id, op_id, "client_upload_stream_cancelled"),
+                    )
+                    .await;
+                });
+            }
+        }
     }
 }
 

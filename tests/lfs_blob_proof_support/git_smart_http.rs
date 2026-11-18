@@ -80,35 +80,40 @@ struct HookWireOut {
 }
 
 fn install_loopback_pre_receive(bare_dir: &FsPath, port: u16) -> std::io::Result<()> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let hooks_dir = bare_dir.join("hooks");
     std::fs::create_dir_all(&hooks_dir)?;
     let hook_path = hooks_dir.join("pre-receive");
-    let script = format!(
-        "#!/usr/bin/env python3\n\
-import json, os, socket, sys\n\
-payload = json.dumps({{\n\
-  'git_object_dir': os.environ.get('GIT_OBJECT_DIRECTORY'),\n\
-  'git_alternate_object_dirs': os.environ.get('GIT_ALTERNATE_OBJECT_DIRECTORIES'),\n\
-  'stdin': sys.stdin.read(),\n\
-}}).encode('utf-8')\n\
-s = socket.create_connection(('127.0.0.1', {port}), timeout=25)\n\
-s.sendall(payload)\n\
-s.shutdown(socket.SHUT_WR)\n\
-chunks = []\n\
-while True:\n\
-    b = s.recv(65536)\n\
-    if not b:\n\
-        break\n\
-    chunks.append(b)\n\
-s.close()\n\
-res = json.loads(b''.join(chunks).decode('utf-8'))\n\
-if not res.get('ok', False):\n\
-    sys.stderr.write(res.get('message', 'pre-receive rejected') + '\\n')\n\
-    sys.exit(1)\n\
-sys.exit(0)\n"
-    );
+    let connect_line = format!("s = socket.create_connection(('127.0.0.1', {port}), timeout=25)");
+    let script = [
+        "#!/usr/bin/env python3",
+        "import json, os, socket, sys",
+        "payload = json.dumps({",
+        "    'git_object_dir': os.environ.get('GIT_OBJECT_DIRECTORY'),",
+        "    'git_alternate_object_dirs': os.environ.get('GIT_ALTERNATE_OBJECT_DIRECTORIES'),",
+        "    'stdin': sys.stdin.read(),",
+        "}).encode('utf-8')",
+        connect_line.as_str(),
+        "s.sendall(payload)",
+        "s.shutdown(socket.SHUT_WR)",
+        "chunks = []",
+        "while True:",
+        "    b = s.recv(65536)",
+        "    if not b:",
+        "        break",
+        "    chunks.append(b)",
+        "s.close()",
+        "res = json.loads(b''.join(chunks).decode('utf-8'))",
+        "if not res.get('ok', False):",
+        "    sys.stderr.write(res.get('message', 'pre-receive rejected') + '\\n')",
+        "    sys.exit(1)",
+        "sys.exit(0)",
+        "",
+    ]
+    .join("\n");
     std::fs::write(&hook_path, script)?;
+    #[cfg(unix)]
     std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
     Ok(())
 }
