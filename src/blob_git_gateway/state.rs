@@ -54,6 +54,10 @@ pub struct BlobGitState {
     /// cannot be selected by any request, header or runtime configuration.
     #[cfg(test)]
     admission_pause: Option<Arc<AdmissionPause>>,
+    /// Acceptance-only rendezvous after the admission `COMMIT` and before the
+    /// first protected upload. Also absent from every non-test build.
+    #[cfg(test)]
+    publication_pause: Option<Arc<AdmissionPause>>,
 }
 
 impl BlobGitState {
@@ -79,6 +83,8 @@ impl BlobGitState {
             packfile_offload: None,
             #[cfg(test)]
             admission_pause: None,
+            #[cfg(test)]
+            publication_pause: None,
         })
     }
 
@@ -106,11 +112,32 @@ impl BlobGitState {
         self
     }
 
+    /// Acceptance-only: attach a private rendezvous that fires after the
+    /// admission transaction committed and before the first protected upload.
+    /// It is a distinct hook from the pre-admission pause so one fixture can
+    /// hold either side of the immutable `COMMIT` without changing production
+    /// behavior.
+    #[cfg(test)]
+    pub(crate) fn with_publication_pause(mut self, pause: Arc<AdmissionPause>) -> Self {
+        self.publication_pause = Some(pause);
+        self
+    }
+
     /// Called after the publish baseline was captured and before the admission
     /// transaction starts. In production this method does not exist.
     #[cfg(test)]
     pub(crate) async fn pause_before_admission(&self, operation_id: Uuid) {
         if let Some(pause) = &self.admission_pause {
+            pause.pause(operation_id).await;
+        }
+    }
+
+    /// Called after the caller-owned admission transaction returned a definite
+    /// `COMMIT` and before any A3 hold/upload. The pause therefore never holds a
+    /// PostgreSQL transaction open. In production this method does not exist.
+    #[cfg(test)]
+    pub(crate) async fn pause_after_admission(&self, operation_id: Uuid) {
+        if let Some(pause) = &self.publication_pause {
             pause.pause(operation_id).await;
         }
     }

@@ -203,6 +203,12 @@ pub(super) async fn push(
         Start::Cancelled(reason) => Ok(PushOutcome::Cancelled(reason)),
         Start::Rebaseline => Err(GatewayError::Internal("admission rebase escaped its bounded loop")),
         Start::Fresh { plan, _token: token } => {
+            // Acceptance-only rendezvous after the caller-owned admission
+            // transaction has returned a definite COMMIT and before the first
+            // A3 hold or protected upload. It is outside every PostgreSQL
+            // transaction; production compiles this method away.
+            #[cfg(test)]
+            state.pause_after_admission(operation_id).await;
             let result = async {
                 for (index, pair) in pairs.iter().enumerate() {
                     let planned =
