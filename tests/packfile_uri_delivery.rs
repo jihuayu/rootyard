@@ -14,7 +14,7 @@ use std::{
     },
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use axum::body::Bytes;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use gateway_env::{IsolatedPgDb, LoopbackS3, create_and_provision_repo, issue_owner_actor, spawn_gateway};
@@ -168,10 +168,10 @@ async fn run_production_gateway_matrix(db: &IsolatedPgDb) -> Result<()> {
                 &def_url,
                 clone_def.to_str().unwrap(),
             ],
-            None,
+            Some(tmp.path()),
             None,
         )?;
-        git_cmd(&["-C", clone_def.to_str().unwrap(), "fsck", "--full", "--strict"], None, None)?;
+        git_cmd(&["fsck", "--full", "--strict"], Some(&clone_def), None).context("fsck clone_def")?;
         ensure!(offload.pack_server().served_requests.load(Ordering::SeqCst) == 0);
 
         // 2. Enabled offload gateway: advertises `packfile-uris` and serves base pack over TLS Axum + inline residual.
@@ -202,10 +202,10 @@ async fn run_production_gateway_matrix(db: &IsolatedPgDb) -> Result<()> {
                 &off_url,
                 clone_off.to_str().unwrap(),
             ],
-            None,
+            Some(tmp.path()),
             None,
         )?;
-        git_cmd(&["-C", clone_off.to_str().unwrap(), "fsck", "--full", "--strict"], None, None)?;
+        git_cmd(&["fsck", "--full", "--strict"], Some(&clone_off), None).context("fsck clone_off after clone")?;
         ensure!(std::fs::read(clone_off.join("base.bin"))? == base_payload);
         ensure!(clone_off.join("delta.txt").is_file());
         ensure!(offload.offload_responses.load(Ordering::SeqCst) == 1);
@@ -221,8 +221,6 @@ async fn run_production_gateway_matrix(db: &IsolatedPgDb) -> Result<()> {
 
         git_cmd(
             &[
-                "-C",
-                clone_off.to_str().unwrap(),
                 "-c",
                 "protocol.version=2",
                 "-c",
@@ -232,13 +230,15 @@ async fn run_production_gateway_matrix(db: &IsolatedPgDb) -> Result<()> {
                 "-c",
                 &proxy_cfg,
                 "fetch",
+                "--no-auto-maintenance",
                 "origin",
             ],
-            None,
+            Some(&clone_off),
             None,
         )?;
-        git_cmd(&["-C", clone_off.to_str().unwrap(), "merge", "--ff-only", "FETCH_HEAD"], None, None)?;
-        git_cmd(&["-C", clone_off.to_str().unwrap(), "fsck", "--full", "--strict"], None, None)?;
+        git_cmd(&["merge", "--ff-only", "FETCH_HEAD"], Some(&clone_off), None)?;
+        git_cmd(&["fsck", "--full", "--strict"], Some(&clone_off), None)
+            .context("fsck clone_off after incremental fetch")?;
         ensure!(std::fs::read(clone_off.join("inc.bin"))? == inc_payload);
         ensure!(offload.offload_responses.load(Ordering::SeqCst) == 2);
         ensure!(offload.pack_server().served_requests.load(Ordering::SeqCst) == 2);
@@ -255,10 +255,10 @@ async fn run_production_gateway_matrix(db: &IsolatedPgDb) -> Result<()> {
                 &off_url,
                 clone_no_uri.to_str().unwrap(),
             ],
-            None,
+            Some(tmp.path()),
             None,
         )?;
-        git_cmd(&["-C", clone_no_uri.to_str().unwrap(), "fsck", "--full", "--strict"], None, None)?;
+        git_cmd(&["fsck", "--full", "--strict"], Some(&clone_no_uri), None).context("fsck clone_nouri")?;
         ensure!(offload.last_fallback_reason() == Some(FallbackReason::ClientOmittedPackfileUris));
         ensure!(offload.pack_server().served_requests.load(Ordering::SeqCst) == 2);
 
@@ -274,10 +274,10 @@ async fn run_production_gateway_matrix(db: &IsolatedPgDb) -> Result<()> {
                 &off_url,
                 clone_deg.to_str().unwrap(),
             ],
-            None,
+            Some(tmp.path()),
             None,
         )?;
-        git_cmd(&["-C", clone_deg.to_str().unwrap(), "fsck", "--full", "--strict"], None, None)?;
+        git_cmd(&["fsck", "--full", "--strict"], Some(&clone_deg), None).context("fsck clone_deg")?;
         ensure!(offload.last_fallback_reason() == Some(FallbackReason::CdnUnhealthy));
         offload.set_cdn_health(CdnHealthState::Healthy);
 
