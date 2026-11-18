@@ -16,7 +16,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::State,
-    http::{Method, StatusCode, Uri, header},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use deadpool_postgres::{Manager, Pool};
@@ -115,7 +115,24 @@ pub fn set_blob_env(endpoint: &str, root_prefix: &str) {
     }
 }
 
-async fn handle_s3(State(st): State<Arc<S3MemState>>, method: Method, uri: Uri, body: Bytes) -> Response {
+fn parse_byte_range(hdr: &str, total: usize) -> Option<(usize, usize)> {
+    let spec = hdr.trim().strip_prefix("bytes=")?;
+    let (s_raw, e_raw) = spec.split_once('-')?;
+    let start: usize = s_raw.parse().ok()?;
+    if total == 0 || start >= total {
+        return None;
+    }
+    let end = if e_raw.is_empty() { total - 1 } else { e_raw.parse::<usize>().ok()?.min(total - 1) };
+    (start <= end).then_some((start, end))
+}
+
+async fn handle_s3(
+    State(st): State<Arc<S3MemState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     if st.fail_503.load(Ordering::SeqCst) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -142,6 +159,33 @@ async fn handle_s3(State(st): State<Arc<S3MemState>>, method: Method, uri: Uri, 
         Method::HEAD | Method::GET => match st.objects.lock().unwrap().get(&key).cloned() {
             Some(bytes) => {
                 let etag = format!("\"{}\"", &hex::encode(Sha256::digest(&bytes))[..32]);
+                if method == Method::GET
+                    && let Some(r_str) = headers.get(header::RANGE).and_then(|v| v.to_str().ok())
+                {
+                    let Some((start, end)) = parse_byte_range(r_str, bytes.len()) else {
+                        return (
+                            StatusCode::RANGE_NOT_SATISFIABLE,
+                            [
+                                (header::CONTENT_RANGE, format!("bytes */{}", bytes.len())),
+                                (header::CONNECTION, "close".into()),
+                            ],
+                            Body::empty(),
+                        )
+                            .into_response();
+                    };
+                    let slice = bytes[start..=end].to_vec();
+                    return (
+                        StatusCode::PARTIAL_CONTENT,
+                        [
+                            (header::ETAG, etag),
+                            (header::CONTENT_RANGE, format!("bytes {start}-{end}/{}", bytes.len())),
+                            (header::CONTENT_LENGTH, slice.len().to_string()),
+                            (header::CONNECTION, "close".into()),
+                        ],
+                        Body::from(slice),
+                    )
+                        .into_response();
+                }
                 let len = bytes.len().to_string();
                 (
                     StatusCode::OK,

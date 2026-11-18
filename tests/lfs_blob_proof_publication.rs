@@ -141,6 +141,7 @@ async fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_share
             )?;
             run_git_ok(alice_wt.path(), home_dir.path(), &["lfs", "install", "--local"])?;
             run_git_ok(alice_wt.path(), home_dir.path(), &["remote", "add", "origin", &alice_url])?;
+            run_git_ok(alice_wt.path(), home_dir.path(), &["config", "lfs.locksverify", "true"])?;
             run_git_ok(alice_wt.path(), home_dir.path(), &["lfs", "track", "*.bin"])?;
             let weights_v1: Vec<u8> = (0..131_072u32).map(|n| ((n * 17 + 3) & 0xff) as u8).collect();
             let weights_v1_oid = hex::encode(Sha256::digest(&weights_v1));
