@@ -773,6 +773,16 @@ mod tests {
     }
 
     #[test]
+    fn legacy_identity_collision_keeps_the_fixed_conflict_refusal() {
+        use crate::ref_store::RefStoreError;
+
+        let expected = GatewayError::Conflict("operation identity conflicts with a durable record");
+        let collision = RefStoreError::IdentityConflict;
+        assert_eq!(ref_error(collision.clone()), expected);
+        assert_eq!(map_authorized(AuthorizedCommitError::from(collision)), expected);
+    }
+
+    #[test]
     fn durable_cancellation_keeps_the_fixed_conflict_refusal() {
         let operation_id = Uuid::new_v4();
         let cases = [

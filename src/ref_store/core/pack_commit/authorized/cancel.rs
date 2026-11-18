@@ -103,7 +103,8 @@ impl PgAuthorizedCommit {
     /// the registry read, so this resolution is linearized with a concurrent
     /// begin/commit on the same UUID. A known record must also have its exact
     /// migration-147 producer binding; a missing or inconsistent binding is a
-    /// ledger refusal, never a weaker cancellation.
+    /// ledger refusal, never a weaker cancellation. Wrapper and attempt UUIDs
+    /// are conflicts at this legacy entrypoint.
     ///
     /// `Ok(None)` means no operation row exists for this repository; the
     /// transaction is rolled back and **no cancellation tombstone is written**.
@@ -197,7 +198,7 @@ async fn resolve_registered_operation(
     operation_id: Uuid,
     deadline: Instant,
 ) -> Result<Option<OperationRecord>, AuthorizedCommitError> {
-    let record = match PgRefStore.get(tx, repository_id, operation_id, deadline).await? {
+    let record = match PgRefStore.get_legacy_locked(tx, repository_id, operation_id, deadline).await? {
         OperationLookup::Unknown => return Ok(None),
         OperationLookup::Known(record) => record,
     };
