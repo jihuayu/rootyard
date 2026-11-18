@@ -1,4 +1,4 @@
-//! Canonical SHA-256 preimage encoding for DeletionProof & GroupClosureReceipt (#122).
+//! Canonical SHA-256 preimage encoding for DeletionProof, GroupClosureReceipt & Membership (#122).
 
 use sha2::{Digest, Sha256};
 
@@ -8,13 +8,15 @@ use super::{
         PairedCursorReconciliation, ProducerReconciliationEntry, SourceFreshness, encode_len_bytes,
     },
     proof::DeletionProof,
+    store::ServingPackRecord,
 };
 
 pub fn compute_group_receipt_digest(r: &GroupClosureReceipt) -> String {
     let mut h = Sha256::new();
-    h.update(b"safe-gc-group-v1|");
+    h.update(b"safe-gc-group-v2|");
     encode_len_bytes(&mut h, r.group_id.as_bytes());
     h.update(r.epoch.to_be_bytes());
+    h.update(r.retired_at_generation.to_be_bytes());
     h.update((r.retired_pack_ids.len() as u64).to_be_bytes());
     for id in &r.retired_pack_ids {
         h.update(id.as_bytes());
@@ -23,13 +25,56 @@ pub fn compute_group_receipt_digest(r: &GroupClosureReceipt) -> String {
     for id in &r.replacement_pack_ids {
         h.update(id.as_bytes());
     }
-    h.update([u8::from(r.replacement_closure_verified), u8::from(r.quiesced)]);
+    h.update((r.replacement_oids.len() as u64).to_be_bytes());
+    for oid in &r.replacement_oids {
+        encode_len_bytes(&mut h, oid.as_bytes());
+    }
+    h.update([u8::from(r.replacement_closure_verified)]);
+    r.reader_quiescence.encode_canonical(&mut h);
     hex::encode(h.finalize())
+}
+
+pub fn compute_membership_digest(
+    membership_generation: u64,
+    active_packs: &[ServingPackRecord],
+    retired_packs: &[ServingPackRecord],
+) -> String {
+    let mut h = Sha256::new();
+    h.update(b"safe-gc-membership-v2|");
+    h.update(membership_generation.to_be_bytes());
+    encode_pack_records(&mut h, b"active|", active_packs);
+    encode_pack_records(&mut h, b"retired|", retired_packs);
+    hex::encode(h.finalize())
+}
+
+fn encode_pack_records(h: &mut Sha256, tag: &[u8], records: &[ServingPackRecord]) {
+    let mut sorted: Vec<&ServingPackRecord> = records.iter().collect();
+    sorted.sort_by_key(|r| (r.pack_id, r.group_id.as_str()));
+    h.update(tag);
+    h.update((sorted.len() as u64).to_be_bytes());
+    for rec in sorted {
+        h.update(rec.pack_id.as_bytes());
+        encode_len_bytes(h, rec.group_id.as_bytes());
+        encode_len_bytes(h, rec.pack_key.object_path.as_bytes());
+        encode_len_bytes(h, rec.pack_key.object_sha256.as_bytes());
+        h.update(rec.pack_key.incarnation_epoch.to_be_bytes());
+        encode_len_bytes(h, rec.idx_key.object_path.as_bytes());
+        encode_len_bytes(h, rec.idx_key.object_sha256.as_bytes());
+        h.update(rec.idx_key.incarnation_epoch.to_be_bytes());
+        rec.pack_locator.encode_canonical(h);
+        rec.idx_locator.encode_canonical(h);
+        let mut oids: Vec<&str> = rec.contained_oids.iter().map(String::as_str).collect();
+        oids.sort_unstable();
+        h.update((oids.len() as u64).to_be_bytes());
+        for oid in oids {
+            encode_len_bytes(h, oid.as_bytes());
+        }
+    }
 }
 
 pub fn compute_proof_digest(p: &DeletionProof) -> String {
     let mut h = Sha256::new();
-    h.update(b"safe-gc-proof-v1|");
+    h.update(b"safe-gc-proof-v2|");
     h.update(p.schema_version.to_be_bytes());
     h.update(p.tenant_id.as_bytes());
     h.update(p.repo_id.as_bytes());
@@ -37,8 +82,11 @@ pub fn compute_proof_digest(p: &DeletionProof) -> String {
     encode_len_bytes(&mut h, p.object_format.as_str().as_bytes());
     h.update(p.incarnation_id.as_bytes());
     h.update(p.incarnation_epoch.to_be_bytes());
+    h.update(p.membership_generation.to_be_bytes());
+    encode_len_bytes(&mut h, p.membership_digest.as_bytes());
     h.update(p.live_ref_seq.to_be_bytes());
     p.lane.encode_canonical(&mut h);
+    p.reader_quiescence.encode_canonical(&mut h);
     encode_live_refs(&mut h, &p.live_refs);
     encode_producers(&mut h, &p.producers);
     encode_holds(&mut h, &p.global_holds);
@@ -52,10 +100,13 @@ pub fn compute_proof_digest(p: &DeletionProof) -> String {
     h.update((p.candidates.len() as u64).to_be_bytes());
     for c in &p.candidates {
         h.update(c.pack_id.as_bytes());
+        encode_len_bytes(&mut h, c.key_role.as_bytes());
         encode_len_bytes(&mut h, c.group_id.as_bytes());
         encode_len_bytes(&mut h, c.physical_key.as_bytes());
         encode_len_bytes(&mut h, c.object_sha256.as_bytes());
+        h.update(c.provider_generation.to_be_bytes());
         h.update(c.key_epoch.to_be_bytes());
+        encode_len_bytes(&mut h, c.retention_state.as_str().as_bytes());
         h.update((c.contained_oids.len() as u64).to_be_bytes());
         for oid in &c.contained_oids {
             encode_len_bytes(&mut h, oid.as_bytes());

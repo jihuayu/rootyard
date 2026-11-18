@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::SafeGcError;
+use crate::ref_store::ref_version::pack_cover::PackRetentionState;
 
-pub const SAFE_GC_SCHEMA_VERSION: u32 = 1;
+use super::{SafeGcError, quiescence::ReaderQuiescenceObservation};
+
+pub const SAFE_GC_SCHEMA_VERSION: u32 = 2;
 /// Mandatory safe-by-default invariant: destructive GC is OFF unless armed.
 pub const SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT: bool = false;
 
@@ -46,8 +48,8 @@ impl SafeGcObjectFormat {
 /// Authority lane under which safe-GC operates (#122).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorityLane {
-    /// Standalone single-node PostgreSQL gate (independently testable).
-    SingleNodePg { pg_authority_id: Uuid, pg_tx_seq: u64, local_quiesced: bool },
+    /// Standalone single-node PostgreSQL gate bound to live PG tx, gc_epoch, and reader barrier.
+    SingleNodePg { pg_authority_id: Uuid, pg_tx_seq: u64, pg_gc_fence_epoch: u64, reader_barrier_epoch: u64 },
     /// Distributed Ref-CAS gate requiring #151 global hold bridge + #153 backup roots.
     DistributedRefCas {
         ref_cas_authority_id: Uuid,
@@ -65,12 +67,14 @@ pub enum AuthorityLane {
 impl AuthorityLane {
     pub fn validate_for_destructive_gc(&self) -> Result<(), SafeGcError> {
         match self {
-            Self::SingleNodePg { pg_authority_id, pg_tx_seq, local_quiesced } => {
+            Self::SingleNodePg { pg_authority_id, pg_tx_seq, pg_gc_fence_epoch, reader_barrier_epoch } => {
                 if pg_authority_id.is_nil() || *pg_tx_seq == 0 {
                     return Err(SafeGcError::ArmingRejected("single-node PG lane missing tx authority"));
                 }
-                if !*local_quiesced {
-                    return Err(SafeGcError::ArmingRejected("single-node PG repo not quiesced/fenced"));
+                if *pg_gc_fence_epoch == 0 || *reader_barrier_epoch == 0 {
+                    return Err(SafeGcError::ArmingRejected(
+                        "single-node PG lane requires live gc_epoch fence and exclusive reader barrier epoch",
+                    ));
                 }
                 Ok(())
             }
@@ -104,13 +108,46 @@ impl AuthorityLane {
         }
     }
 
+    pub fn verify_cursor_coverage(
+        &self,
+        live_ref_seq: u64,
+        cursors: &PairedCursorReconciliation,
+    ) -> Result<(), SafeGcError> {
+        match self {
+            Self::SingleNodePg { pg_tx_seq, .. } => {
+                let floor = (*pg_tx_seq).max(live_ref_seq);
+                if cursors.pg_applied_seq < floor {
+                    return Err(SafeGcError::IncompleteProof(
+                        "paired PG cursor has not covered SingleNodePg tx/ref sequence",
+                    ));
+                }
+                Ok(())
+            }
+            Self::DistributedRefCas { raft_commit_index, global_hold_bridge_seq, .. } => {
+                let refcas_floor = (*raft_commit_index).max(*global_hold_bridge_seq).max(live_ref_seq);
+                if cursors.refcas_applied_index < refcas_floor {
+                    return Err(SafeGcError::IncompleteProof(
+                        "paired Ref-CAS cursor has not covered raft_commit_index / global_hold_bridge_seq",
+                    ));
+                }
+                if cursors.pg_applied_seq < *global_hold_bridge_seq {
+                    return Err(SafeGcError::IncompleteProof(
+                        "paired PG cursor has not covered #151 global_hold_bridge_seq",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn encode_canonical(&self, h: &mut Sha256) {
         match self {
-            Self::SingleNodePg { pg_authority_id, pg_tx_seq, local_quiesced } => {
-                h.update(b"pg-single|");
+            Self::SingleNodePg { pg_authority_id, pg_tx_seq, pg_gc_fence_epoch, reader_barrier_epoch } => {
+                h.update(b"pg-single-v2|");
                 h.update(pg_authority_id.as_bytes());
                 h.update(pg_tx_seq.to_be_bytes());
-                h.update([u8::from(*local_quiesced)]);
+                h.update(pg_gc_fence_epoch.to_be_bytes());
+                h.update(reader_barrier_epoch.to_be_bytes());
             }
             Self::DistributedRefCas {
                 ref_cas_authority_id,
@@ -123,7 +160,7 @@ impl AuthorityLane {
                 remote_backup_root_epoch,
                 async_projection_only,
             } => {
-                h.update(b"dist-refcas|");
+                h.update(b"dist-refcas-v2|");
                 h.update(ref_cas_authority_id.as_bytes());
                 h.update(quorum_epoch.to_be_bytes());
                 h.update(raft_commit_index.to_be_bytes());
@@ -185,7 +222,7 @@ impl SafeGcArmReceipt {
 
     pub fn compute_digest(&self) -> String {
         let mut h = Sha256::new();
-        h.update(b"safe-gc-arm-v1|");
+        h.update(b"safe-gc-arm-v2|");
         h.update(self.schema_version.to_be_bytes());
         h.update(self.tenant_id.as_bytes());
         h.update(self.repo_id.as_bytes());
@@ -362,10 +399,13 @@ pub struct PairedCursorReconciliation {
 pub struct GroupClosureReceipt {
     pub group_id: String,
     pub epoch: u64,
+    pub retired_at_generation: u64,
     pub retired_pack_ids: Vec<Uuid>,
     pub replacement_pack_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub replacement_oids: Vec<String>,
     pub replacement_closure_verified: bool,
-    pub quiesced: bool,
+    pub reader_quiescence: ReaderQuiescenceObservation,
     pub receipt_digest: String,
 }
 
@@ -373,10 +413,13 @@ pub struct GroupClosureReceipt {
 #[serde(deny_unknown_fields)]
 pub struct CandidatePackTarget {
     pub pack_id: Uuid,
+    pub key_role: String,
     pub group_id: String,
     pub physical_key: String,
     pub object_sha256: String,
+    pub provider_generation: i64,
     pub key_epoch: u64,
+    pub retention_state: PackRetentionState,
     pub contained_oids: Vec<String>,
 }
 

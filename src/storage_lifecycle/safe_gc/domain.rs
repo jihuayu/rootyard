@@ -1,4 +1,4 @@
-//! Domain boundaries, non-forgeable delete tickets, and storage traits (#122).
+//! Domain boundaries, non-forgeable delete tickets, active fences, and storage traits (#122).
 
 use std::{future::Future, path::Path, pin::Pin, time::Instant};
 
@@ -8,9 +8,15 @@ use uuid::Uuid;
 
 use crate::blob_store::{BlobLocator, opendal::BlobStore};
 
-use super::{SafeGcError, anti_aba::PhysicalBlobKey, model::encode_len_bytes};
+use super::{
+    SafeGcError,
+    anti_aba::PhysicalBlobKey,
+    model::{encode_len_bytes, validate_bounded_name, validate_sha256_hex},
+    store::DurableSafeGcAuthority,
+};
 
 pub type SafeGcFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SafeGcError>> + Send + 'a>>;
+pub type ExternalFenceCheck<'a> = &'a (dyn Fn() -> Result<(), SafeGcError> + Send + Sync);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,17 +31,8 @@ pub struct AuthorityRecord {
     pub lease_epoch: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UploadedCompactionPair {
-    pub pack_locator: BlobLocatorRecord,
-    pub idx_locator: BlobLocatorRecord,
-    pub pack_key: PhysicalBlobKey,
-    pub idx_key: PhysicalBlobKey,
-}
-
 /// Serializable Blob coordinate mirror preserving BlobLocator invariants.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobLocatorRecord {
     pub tenant_id: Uuid,
@@ -72,6 +69,62 @@ impl BlobLocatorRecord {
         )
         .map_err(SafeGcError::from)
     }
+
+    pub(crate) fn encode_canonical(&self, h: &mut Sha256) {
+        h.update(self.tenant_id.as_bytes());
+        h.update(self.authority_id.as_bytes());
+        h.update(self.generation.to_be_bytes());
+        h.update(self.attempt_id.as_bytes());
+        encode_len_bytes(h, self.namespace.as_bytes());
+        encode_len_bytes(h, self.sha256.as_bytes());
+        h.update(self.length.to_be_bytes());
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UploadedCompactionPair {
+    pub pack_locator: BlobLocatorRecord,
+    pub idx_locator: BlobLocatorRecord,
+    pub pack_key: PhysicalBlobKey,
+    pub idx_key: PhysicalBlobKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StagedUploadState {
+    Uploading,
+    AbandonedPendingCleanup,
+    CleanedUp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedCompactionUpload {
+    pub op_id: Uuid,
+    pub incarnation_epoch: u64,
+    pub pack_key: PhysicalBlobKey,
+    pub idx_key: PhysicalBlobKey,
+    pub pack_locator: BlobLocatorRecord,
+    pub idx_locator: BlobLocatorRecord,
+    pub state: StagedUploadState,
+}
+
+/// Explicit terminal outcome of a remote provider physical delete operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderDeleteOutcome {
+    /// Pre-delete stat saw expected bytes, DELETE succeeded, post-delete stat returned NotFound.
+    ConfirmedDeleted,
+    /// Pre-delete stat confirmed the object was already absent on the provider.
+    AlreadyAbsent,
+    /// Provider timeout, 5xx, transport drop, or post-delete stat indeterminate; never treated as deleted.
+    OutcomeUnknown { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemotePresence {
+    Present { content_length: u64 },
+    Absent,
+    Unknown { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +133,7 @@ pub struct CompactionPublishResult {
     pub op_id: Uuid,
     pub new_pack_id: Uuid,
     pub new_membership_generation: u64,
+    pub new_membership_digest: String,
     pub retired_pack_ids: Vec<Uuid>,
     pub replacement_pack: BlobLocatorRecord,
     pub replacement_idx: BlobLocatorRecord,
@@ -104,23 +158,40 @@ pub struct DeleteExecutionReport {
     pub proof_digest: String,
     pub incarnation_epoch: u64,
     pub deleted_keys: Vec<String>,
+    pub already_absent_keys: Vec<String>,
+    pub unknown_outcome_keys: Vec<String>,
     pub skipped_or_already_deleted: Vec<String>,
     pub failed_keys: Vec<String>,
     pub reconciled_from_checkpoint: bool,
+    pub aborted_stale_incarnation: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagingCleanupReport {
+    pub deleted_keys: Vec<String>,
+    pub already_absent_keys: Vec<String>,
+    pub unknown_outcome_keys: Vec<String>,
 }
 
 /// Non-forgeable delete authorization minted solely after barrier fencing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteAuthorizationTicket {
     batch_id: Uuid,
+    step_fence_id: Uuid,
     incarnation_id: Uuid,
     incarnation_epoch: u64,
     lease_epoch: u64,
+    membership_generation: u64,
+    membership_digest: String,
     proof_digest: String,
     pack_id: Uuid,
+    key_role: String,
     physical_key: String,
     object_sha256: String,
-    locator: Option<BlobLocatorRecord>,
+    provider_generation: i64,
+    locator: BlobLocatorRecord,
+    staging_cleanup_only: bool,
     ticket_digest: String,
 }
 
@@ -132,48 +203,98 @@ pub struct CasCompactionPublish {
     pub expected_incarnation_id: Uuid,
     pub expected_incarnation_epoch: u64,
     pub expected_generation: u64,
+    pub expected_membership_digest: String,
     pub retired_pack_ids: Vec<Uuid>,
     pub uploaded: UploadedCompactionPair,
     pub replacement_oids: Vec<String>,
     pub equivalence_digest: String,
 }
 
+pub(crate) struct TicketMintSpec {
+    pub batch_id: Uuid,
+    pub step_fence_id: Uuid,
+    pub incarnation_id: Uuid,
+    pub incarnation_epoch: u64,
+    pub lease_epoch: u64,
+    pub membership_generation: u64,
+    pub membership_digest: String,
+    pub proof_digest: String,
+    pub pack_id: Uuid,
+    pub key_role: String,
+    pub physical_key: String,
+    pub object_sha256: String,
+    pub locator: BlobLocatorRecord,
+    pub staging_cleanup_only: bool,
+}
+
 impl DeleteAuthorizationTicket {
-    pub(super) fn mint(
-        batch: (Uuid, Uuid, u64, u64),
-        proof_digest: String,
-        pack_id: Uuid,
-        target: (String, String, Option<BlobLocatorRecord>),
-    ) -> Self {
-        let (batch_id, incarnation_id, incarnation_epoch, lease_epoch) = batch;
-        let (physical_key, object_sha256, locator) = target;
+    pub(super) fn mint(spec: TicketMintSpec) -> Self {
+        let provider_generation = spec.locator.generation;
+        let mut ticket = Self {
+            batch_id: spec.batch_id,
+            step_fence_id: spec.step_fence_id,
+            incarnation_id: spec.incarnation_id,
+            incarnation_epoch: spec.incarnation_epoch,
+            lease_epoch: spec.lease_epoch,
+            membership_generation: spec.membership_generation,
+            membership_digest: spec.membership_digest,
+            proof_digest: spec.proof_digest,
+            pack_id: spec.pack_id,
+            key_role: spec.key_role,
+            physical_key: spec.physical_key,
+            object_sha256: spec.object_sha256,
+            provider_generation,
+            locator: spec.locator,
+            staging_cleanup_only: spec.staging_cleanup_only,
+            ticket_digest: String::new(),
+        };
+        ticket.ticket_digest = ticket.compute_digest();
+        ticket
+    }
+
+    pub fn compute_digest(&self) -> String {
         let mut h = Sha256::new();
-        h.update(b"safe-gc-delete-ticket-v1|");
-        h.update(batch_id.as_bytes());
-        h.update(incarnation_id.as_bytes());
-        h.update(incarnation_epoch.to_be_bytes());
-        h.update(lease_epoch.to_be_bytes());
-        encode_len_bytes(&mut h, proof_digest.as_bytes());
-        h.update(pack_id.as_bytes());
-        encode_len_bytes(&mut h, physical_key.as_bytes());
-        encode_len_bytes(&mut h, object_sha256.as_bytes());
-        let ticket_digest = hex::encode(h.finalize());
-        Self {
-            batch_id,
-            incarnation_id,
-            incarnation_epoch,
-            lease_epoch,
-            proof_digest,
-            pack_id,
-            physical_key,
-            object_sha256,
-            locator,
-            ticket_digest,
+        h.update(b"safe-gc-delete-ticket-v2|");
+        h.update(self.batch_id.as_bytes());
+        h.update(self.step_fence_id.as_bytes());
+        h.update(self.incarnation_id.as_bytes());
+        h.update(self.incarnation_epoch.to_be_bytes());
+        h.update(self.lease_epoch.to_be_bytes());
+        h.update(self.membership_generation.to_be_bytes());
+        encode_len_bytes(&mut h, self.membership_digest.as_bytes());
+        encode_len_bytes(&mut h, self.proof_digest.as_bytes());
+        h.update(self.pack_id.as_bytes());
+        encode_len_bytes(&mut h, self.key_role.as_bytes());
+        encode_len_bytes(&mut h, self.physical_key.as_bytes());
+        encode_len_bytes(&mut h, self.object_sha256.as_bytes());
+        h.update(self.provider_generation.to_be_bytes());
+        self.locator.encode_canonical(&mut h);
+        h.update([u8::from(self.staging_cleanup_only)]);
+        hex::encode(h.finalize())
+    }
+
+    pub fn verify_digest_and_locator(&self) -> Result<(), SafeGcError> {
+        validate_bounded_name("physical_key", &self.physical_key)?;
+        validate_sha256_hex(&self.object_sha256)?;
+        validate_sha256_hex(&self.membership_digest)?;
+        if self.provider_generation <= 0
+            || self.locator.generation != self.provider_generation
+            || self.locator.sha256 != self.object_sha256
+        {
+            return Err(SafeGcError::StaleDeleterFenced("ticket provider_generation or sha256 disagrees with locator"));
         }
+        if self.ticket_digest != self.compute_digest() {
+            return Err(SafeGcError::StaleDeleterFenced("delete ticket digest tampered"));
+        }
+        Ok(())
     }
 
     pub fn batch_id(&self) -> Uuid {
         self.batch_id
+    }
+
+    pub fn step_fence_id(&self) -> Uuid {
+        self.step_fence_id
     }
 
     pub fn incarnation_id(&self) -> Uuid {
@@ -188,12 +309,24 @@ impl DeleteAuthorizationTicket {
         self.lease_epoch
     }
 
+    pub fn membership_generation(&self) -> u64 {
+        self.membership_generation
+    }
+
+    pub fn membership_digest(&self) -> &str {
+        &self.membership_digest
+    }
+
     pub fn proof_digest(&self) -> &str {
         &self.proof_digest
     }
 
     pub fn pack_id(&self) -> Uuid {
         self.pack_id
+    }
+
+    pub fn key_role(&self) -> &str {
+        &self.key_role
     }
 
     pub fn physical_key(&self) -> &str {
@@ -204,12 +337,49 @@ impl DeleteAuthorizationTicket {
         &self.object_sha256
     }
 
-    pub fn locator(&self) -> Option<&BlobLocatorRecord> {
-        self.locator.as_ref()
+    pub fn provider_generation(&self) -> i64 {
+        self.provider_generation
+    }
+
+    pub fn locator(&self) -> &BlobLocatorRecord {
+        &self.locator
+    }
+
+    pub fn is_staging_cleanup_only(&self) -> bool {
+        self.staging_cleanup_only
     }
 
     pub fn ticket_digest(&self) -> &str {
         &self.ticket_digest
+    }
+}
+
+/// Active fence held continuously across the entire provider delete operation.
+pub struct ActiveDeleteFence<'a> {
+    authority: &'a DurableSafeGcAuthority,
+    ticket: &'a DeleteAuthorizationTicket,
+    external_check: Option<ExternalFenceCheck<'a>>,
+}
+
+impl<'a> ActiveDeleteFence<'a> {
+    pub(super) fn new(
+        authority: &'a DurableSafeGcAuthority,
+        ticket: &'a DeleteAuthorizationTicket,
+        external_check: Option<ExternalFenceCheck<'a>>,
+    ) -> Self {
+        Self { authority, ticket, external_check }
+    }
+
+    pub fn verify_active_for_ticket(&self, candidate: &DeleteAuthorizationTicket) -> Result<(), SafeGcError> {
+        if candidate != self.ticket {
+            return Err(SafeGcError::StaleDeleterFenced("provider called with mismatched delete ticket"));
+        }
+        candidate.verify_digest_and_locator()?;
+        self.authority.verify_active_step_ticket(candidate)?;
+        if let Some(ext) = self.external_check {
+            ext()?;
+        }
+        Ok(())
     }
 }
 
@@ -225,13 +395,20 @@ pub trait SafeGcCompactionUploader: Send + Sync {
     ) -> SafeGcFuture<'a, UploadedCompactionPair>;
 }
 
-/// Physical delete backend invoked ONLY with a fenced [`DeleteAuthorizationTicket`].
+/// Physical delete backend invoked ONLY under a live [`ActiveDeleteFence`].
 pub trait SafeGcDeleteBackend: Send + Sync {
     fn delete_authorized<'a>(
         &'a self,
+        fence: &'a ActiveDeleteFence<'a>,
         ticket: &'a DeleteAuthorizationTicket,
         deadline: Instant,
-    ) -> SafeGcFuture<'a, ()>;
+    ) -> SafeGcFuture<'a, ProviderDeleteOutcome>;
+
+    fn probe_presence<'a>(
+        &'a self,
+        locator: &'a BlobLocatorRecord,
+        deadline: Instant,
+    ) -> SafeGcFuture<'a, RemotePresence>;
 }
 
 /// Default readback-only BlobStore backend preserving `BlobStore::delete == DeleteDisabled`.
@@ -242,15 +419,30 @@ pub struct BlobStoreReadbackBackend<'a> {
 impl<'a> SafeGcDeleteBackend for BlobStoreReadbackBackend<'a> {
     fn delete_authorized<'b>(
         &'b self,
+        fence: &'b ActiveDeleteFence<'b>,
         ticket: &'b DeleteAuthorizationTicket,
         deadline: Instant,
-    ) -> SafeGcFuture<'b, ()> {
+    ) -> SafeGcFuture<'b, ProviderDeleteOutcome> {
         Box::pin(async move {
-            let Some(loc_rec) = ticket.locator() else {
-                return Err(SafeGcError::BlobDeleteDisabled);
-            };
-            let loc = loc_rec.to_locator()?;
-            self.store.delete(&loc, deadline).await.map_err(SafeGcError::from)
+            fence.verify_active_for_ticket(ticket)?;
+            let loc = ticket.locator().to_locator()?;
+            self.store.delete(&loc, deadline).await?;
+            Ok(ProviderDeleteOutcome::ConfirmedDeleted)
+        })
+    }
+
+    fn probe_presence<'b>(
+        &'b self,
+        locator: &'b BlobLocatorRecord,
+        deadline: Instant,
+    ) -> SafeGcFuture<'b, RemotePresence> {
+        Box::pin(async move {
+            let loc = locator.to_locator()?;
+            match self.store.head(&loc, deadline).await {
+                Ok(Some(content_length)) => Ok(RemotePresence::Present { content_length }),
+                Ok(None) => Ok(RemotePresence::Absent),
+                Err(err) => Ok(RemotePresence::Unknown { reason: err.to_string() }),
+            }
         })
     }
 }

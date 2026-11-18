@@ -45,7 +45,7 @@ pub(crate) async fn run_once_scoped(
     })
     .await?
     else {
-        return Ok(None);
+        return super::safe_gc::pg_maintenance::run_claimed_safe_gc_once(state, policy, owner).await;
     };
     // The persisted attempt and repository generation are safe numeric
     // correlation. The raw job, repository, tenant and actor IDs stay out.

@@ -164,6 +164,37 @@ impl AntiAbaKeyRegistry {
         Ok(())
     }
 
+    pub fn rollback_delete_barrier(&mut self, path: &str) -> Result<(), SafeGcError> {
+        if self.deleted_tombstones.contains(path) {
+            return Ok(());
+        }
+        if let Some(entry) = self.keys_by_path.get_mut(path)
+            && entry.state == KeyLifecycleState::DeletePendingBarrier
+        {
+            entry.state = KeyLifecycleState::RetiredPendingProof;
+        }
+        Ok(())
+    }
+
+    pub fn tombstone_abandoned_staging(&mut self, path: &str) -> Result<(), SafeGcError> {
+        if self.deleted_tombstones.contains(path) {
+            return Ok(());
+        }
+        let entry = self
+            .keys_by_path
+            .get_mut(path)
+            .ok_or_else(|| SafeGcError::InvalidInput(format!("unknown staging key `{path}`")))?;
+        if entry.state != KeyLifecycleState::CompactionStaging {
+            return Err(SafeGcError::ProtectionOverlap(format!(
+                "refusing staging tombstone on non-staging key `{path}` ({:?})",
+                entry.state
+            )));
+        }
+        entry.state = KeyLifecycleState::PhysicallyDeletedTombstone;
+        self.deleted_tombstones.insert(path.to_owned());
+        Ok(())
+    }
+
     pub fn assert_late_put_allowed(&self, key_path: &str, writer_epoch: u64) -> Result<(), SafeGcError> {
         if writer_epoch < self.max_incarnation_epoch {
             return Err(SafeGcError::StaleIncarnation("late PUT from stale incarnation rejected"));

@@ -1,4 +1,4 @@
-//! Unit tests for Safe GC default-off gates, unified DeletionProof, and anti-ABA keys (#122).
+//! Unit tests for Safe GC default-off gates, unified DeletionProof, #288 retention & anti-ABA (#122).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -9,17 +9,23 @@ use std::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::ref_store::ref_version::pack_cover::PackRetentionState;
+
 use super::{
     SafeGcError,
     anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState, PhysicalBlobKey},
-    domain::{AuthorityRecord, BlobLocatorRecord, DeleteAuthorizationTicket, SafeGcDeleteBackend, SafeGcFuture},
+    domain::{
+        ActiveDeleteFence, AuthorityRecord, BlobLocatorRecord, DeleteAuthorizationTicket, ProviderDeleteOutcome,
+        RemotePresence, SafeGcDeleteBackend, SafeGcFuture,
+    },
     executor::{DeleteFaultHook, SafeGcSweepRequest, execute_safe_gc_sweep},
     model::{
         AuthorityLane, CandidatePackTarget, GcMode, GroupClosureReceipt, LiveRefRoot, PairedCursorReconciliation,
-        ProducerReconciliationEntry, RetentionProducer, SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT, SafeGcArmReceipt,
-        SafeGcObjectFormat, SourceFreshness,
+        ProducerReconciliationEntry, RetentionProducer, SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT, SAFE_GC_SCHEMA_VERSION,
+        SafeGcArmReceipt, SafeGcObjectFormat, SourceFreshness,
     },
     proof::{DeletionProofInputs, build_and_verify_deletion_proof, seal_group_receipt, verify_deletion_proof},
+    quiescence::{ReaderLeaseRegistry, ReaderQuiescenceObservation},
     store::{DurableSafeGcAuthority, SafeGcRepoSnapshot, ServingPackRecord},
 };
 
@@ -27,21 +33,46 @@ use super::{
 pub(super) struct RecordingDeleteBackend {
     pub(super) deleted: Mutex<Vec<String>>,
     pub(super) fail_key: Mutex<Option<String>>,
+    pub(super) unknown_key: Mutex<Option<String>>,
+    pub(super) already_absent: Mutex<BTreeSet<String>>,
 }
 
 impl SafeGcDeleteBackend for RecordingDeleteBackend {
     fn delete_authorized<'a>(
         &'a self,
+        fence: &'a ActiveDeleteFence<'a>,
         ticket: &'a DeleteAuthorizationTicket,
         _deadline: Instant,
-    ) -> SafeGcFuture<'a, ()> {
+    ) -> SafeGcFuture<'a, ProviderDeleteOutcome> {
         Box::pin(async move {
+            fence.verify_active_for_ticket(ticket)?;
             let path = ticket.physical_key().to_owned();
+            if self.already_absent.lock().unwrap().contains(&path) {
+                return Ok(ProviderDeleteOutcome::AlreadyAbsent);
+            }
+            if self.unknown_key.lock().unwrap().as_deref() == Some(path.as_str()) {
+                return Ok(ProviderDeleteOutcome::OutcomeUnknown { reason: "simulated 503 timeout".into() });
+            }
             if self.fail_key.lock().unwrap().as_deref() == Some(path.as_str()) {
                 return Err(SafeGcError::Io("injected backend delete failure".into()));
             }
             self.deleted.lock().unwrap().push(path);
-            Ok(())
+            Ok(ProviderDeleteOutcome::ConfirmedDeleted)
+        })
+    }
+
+    fn probe_presence<'a>(
+        &'a self,
+        locator: &'a BlobLocatorRecord,
+        _deadline: Instant,
+    ) -> SafeGcFuture<'a, RemotePresence> {
+        Box::pin(async move {
+            let absent = self.already_absent.lock().unwrap().iter().any(|k| k.ends_with(&locator.sha256));
+            if absent {
+                Ok(RemotePresence::Absent)
+            } else {
+                Ok(RemotePresence::Present { content_length: locator.length })
+            }
         })
     }
 }
@@ -65,16 +96,15 @@ pub(super) fn make_pack_record(
     tag: &str,
     state: KeyLifecycleState,
     contained_oids: Vec<String>,
-) -> (ServingPackRecord, CandidatePackTarget) {
+) -> (ServingPackRecord, Vec<CandidatePackTarget>) {
     let psha = sha(&format!("pack-{tag}"));
     let isha = sha(&format!("idx-{tag}"));
-    let p_nonce = Uuid::new_v4();
-    let i_nonce = Uuid::new_v4();
+    let (p_nonce, i_nonce) = (Uuid::new_v4(), Uuid::new_v4());
     let scope = (auth.tenant_id, auth.repo_id, auth.history_id, auth.incarnation_epoch);
     let p_path = PhysicalBlobKey::canonical_path(scope, seq, p_nonce, "pack", &psha);
     let i_path = PhysicalBlobKey::canonical_path(scope, seq + 1, i_nonce, "idx", &isha);
     let pack_key = PhysicalBlobKey {
-        schema_version: 1,
+        schema_version: SAFE_GC_SCHEMA_VERSION,
         tenant_id: auth.tenant_id,
         repo_id: auth.repo_id,
         history_id: auth.history_id,
@@ -87,7 +117,7 @@ pub(super) fn make_pack_record(
         state,
     };
     let idx_key = PhysicalBlobKey {
-        schema_version: 1,
+        schema_version: SAFE_GC_SCHEMA_VERSION,
         tenant_id: auth.tenant_id,
         repo_id: auth.repo_id,
         history_id: auth.history_id,
@@ -96,20 +126,21 @@ pub(super) fn make_pack_record(
         nonce: i_nonce,
         role: "idx".into(),
         object_sha256: isha.clone(),
-        object_path: i_path,
+        object_path: i_path.clone(),
         state,
     };
     let pack_id = Uuid::new_v4();
+    let blob_gen = auth.membership_generation as i64;
     let pack_loc = BlobLocatorRecord {
         tenant_id: auth.tenant_id,
         authority_id: auth.repo_id,
-        generation: auth.membership_generation as i64,
+        generation: blob_gen,
         attempt_id: Uuid::new_v4(),
         namespace: "packs".into(),
         sha256: psha.clone(),
         length: 512,
     };
-    let idx_loc = BlobLocatorRecord { sha256: isha, attempt_id: Uuid::new_v4(), ..pack_loc.clone() };
+    let idx_loc = BlobLocatorRecord { sha256: isha.clone(), attempt_id: Uuid::new_v4(), ..pack_loc.clone() };
     let rec = ServingPackRecord {
         pack_id,
         group_id: group_id.into(),
@@ -119,15 +150,31 @@ pub(super) fn make_pack_record(
         idx_locator: idx_loc,
         contained_oids: contained_oids.clone(),
     };
-    let cand = CandidatePackTarget {
-        pack_id,
-        group_id: group_id.into(),
-        physical_key: p_path,
-        object_sha256: psha,
-        key_epoch: auth.incarnation_epoch,
-        contained_oids,
-    };
-    (rec, cand)
+    let cands = vec![
+        CandidatePackTarget {
+            pack_id,
+            key_role: "pack".into(),
+            group_id: group_id.into(),
+            physical_key: p_path,
+            object_sha256: psha,
+            provider_generation: blob_gen,
+            key_epoch: auth.incarnation_epoch,
+            retention_state: PackRetentionState::GcEligible,
+            contained_oids: contained_oids.clone(),
+        },
+        CandidatePackTarget {
+            pack_id,
+            key_role: "idx".into(),
+            group_id: group_id.into(),
+            physical_key: i_path,
+            object_sha256: isha,
+            provider_generation: blob_gen,
+            key_epoch: auth.incarnation_epoch,
+            retention_state: PackRetentionState::GcEligible,
+            contained_oids,
+        },
+    ];
+    (rec, cands)
 }
 
 pub(super) fn reconciled_producers(epoch: u64, seq: u64, ci_pin_oid: String) -> Vec<ProducerReconciliationEntry> {
@@ -160,9 +207,7 @@ pub(super) fn seed_fixture(
         live_ref_seq: 10,
         lease_epoch: 1,
     };
-    let live_oid = oid(fmt, 1);
-    let pin_oid = oid(fmt, 2);
-    let dead_oid = oid(fmt, 9);
+    let (live_oid, pin_oid, dead_oid) = (oid(fmt, 1), oid(fmt, 2), oid(fmt, 9));
     let (active_rec, _) = make_pack_record(
         &auth,
         1,
@@ -171,15 +216,23 @@ pub(super) fn seed_fixture(
         KeyLifecycleState::ActiveServing,
         vec![live_oid.clone(), pin_oid.clone()],
     );
-    let (retired_rec, cand) =
+    let (retired_rec, cands) =
         make_pack_record(&auth, 3, "g1", "old", KeyLifecycleState::RetiredPendingProof, vec![dead_oid]);
+    let mut reader_leases = ReaderLeaseRegistry::new();
+    if !distributed {
+        reader_leases.set_pg_exclusive_barrier_epoch(Some(1));
+    }
+    reader_leases.refresh_drain_watermark(2);
+    let rq: ReaderQuiescenceObservation = reader_leases.observe_for_retirement(&[retired_rec.pack_id], 2, 2).unwrap();
     let gr = seal_group_receipt(GroupClosureReceipt {
         group_id: "g1".into(),
         epoch: 1,
+        retired_at_generation: 2,
         retired_pack_ids: vec![retired_rec.pack_id],
         replacement_pack_ids: vec![active_rec.pack_id],
+        replacement_oids: active_rec.contained_oids.clone(),
         replacement_closure_verified: true,
-        quiesced: true,
+        reader_quiescence: rq.clone(),
         receipt_digest: String::new(),
     })
     .unwrap();
@@ -196,7 +249,12 @@ pub(super) fn seed_fixture(
             async_projection_only: false,
         }
     } else {
-        AuthorityLane::SingleNodePg { pg_authority_id: auth.repo_id, pg_tx_seq: 10, local_quiesced: true }
+        AuthorityLane::SingleNodePg {
+            pg_authority_id: auth.repo_id,
+            pg_tx_seq: 10,
+            pg_gc_fence_epoch: 1,
+            reader_barrier_epoch: 1,
+        }
     };
     let arm = SafeGcArmReceipt::seal(
         auth.tenant_id,
@@ -218,6 +276,26 @@ pub(super) fn seed_fixture(
         refcas_applied_index: 10,
         refcas_required_index: 10,
     };
+    let snap = SafeGcRepoSnapshot {
+        authority: auth.clone(),
+        object_format: fmt,
+        gc_mode: GcMode::DisabledByDefault,
+        live_refs: live_refs.clone(),
+        active_packs: vec![active_rec],
+        retired_packs: vec![retired_rec],
+        group_receipts: vec![gr.clone()],
+        producers: producers.clone(),
+        global_holds: vec![],
+        in_flight_decisions: vec![],
+        paired_cursors: paired_cursors.clone(),
+        reader_leases,
+        staged_uploads: vec![],
+        key_registry: AntiAbaKeyRegistry::new(),
+        pending_delete: None,
+        completed_batches: BTreeMap::new(),
+        aborted_batches: BTreeMap::new(),
+        audit_log: vec![],
+    };
     let proof = build_and_verify_deletion_proof(DeletionProofInputs {
         tenant_id: auth.tenant_id,
         repo_id: auth.repo_id,
@@ -225,34 +303,20 @@ pub(super) fn seed_fixture(
         object_format: fmt,
         incarnation_id: auth.incarnation_id,
         incarnation_epoch: 1,
+        membership_generation: 2,
+        membership_digest: snap.compute_membership_digest(),
         live_ref_seq: 10,
         arm_receipt: arm.clone(),
-        live_refs: live_refs.clone(),
-        producers: producers.clone(),
-        global_holds: vec![],
-        in_flight_decisions: vec![],
-        paired_cursors: paired_cursors.clone(),
-        group_receipts: vec![gr.clone()],
-        candidates: vec![cand],
-    })
-    .unwrap();
-    let snap = SafeGcRepoSnapshot {
-        authority: auth,
-        object_format: fmt,
-        gc_mode: GcMode::DisabledByDefault,
+        reader_quiescence: rq,
         live_refs,
-        active_packs: vec![active_rec],
-        retired_packs: vec![retired_rec],
-        group_receipts: vec![gr],
         producers,
         global_holds: vec![],
         in_flight_decisions: vec![],
         paired_cursors,
-        key_registry: AntiAbaKeyRegistry::new(),
-        pending_delete: None,
-        completed_batches: BTreeMap::new(),
-        audit_log: vec![],
-    };
+        group_receipts: vec![gr],
+        candidates: cands,
+    })
+    .unwrap();
     (snap, arm, proof)
 }
 
@@ -271,7 +335,7 @@ async fn default_off_gate_and_ttl_or_tampered_arming_fail_closed() {
             deleter_incarnation_id: authority.snapshot().authority.incarnation_id,
             deleter_incarnation_epoch: 1,
             deleter_lease_epoch: 1,
-            proof: proof.clone(),
+            proof,
             deadline: Instant::now() + Duration::from_secs(5),
             fault: DeleteFaultHook::None,
         },
@@ -313,30 +377,62 @@ fn distributed_refcas_lane_refuses_async_projection_and_missing_151_153() {
     }
 }
 
-#[test]
-fn unified_deletion_proof_rejects_every_missing_lagging_and_overlapping_source() {
-    let (_, _, mut base_proof) = seed_fixture(SafeGcObjectFormat::Sha256, true);
+#[tokio::test]
+async fn proof_and_live_barrier_reject_forged_header_oids_lane_cursor_and_active_readers() {
+    let (snap, arm, mut base_proof) = seed_fixture(SafeGcObjectFormat::Sha256, true);
     verify_deletion_proof(&base_proof).unwrap();
 
-    // Missing producer (#6 backup dropped).
-    let mut p_missing = base_proof.clone();
-    p_missing.producers.pop();
-    p_missing.proof_digest = super::proof_digest::compute_proof_digest(&p_missing);
-    assert!(matches!(verify_deletion_proof(&p_missing), Err(SafeGcError::IncompleteProof(_))));
+    // 1. Lane cursor coverage: raft_commit_index=10 requires refcas_applied_index >= 10!
+    let mut p_lane_lag = base_proof.clone();
+    p_lane_lag.paired_cursors.refcas_required_index = 5;
+    p_lane_lag.paired_cursors.refcas_applied_index = 9;
+    p_lane_lag.proof_digest = super::proof_digest::compute_proof_digest(&p_lane_lag);
+    assert!(matches!(verify_deletion_proof(&p_lane_lag), Err(SafeGcError::IncompleteProof(_))));
 
-    // Lagging producer cursor.
-    let mut p_lag = base_proof.clone();
-    p_lag.producers[0].observed_cursor_seq = 9;
-    p_lag.proof_digest = super::proof_digest::compute_proof_digest(&p_lag);
-    assert!(matches!(verify_deletion_proof(&p_lag), Err(SafeGcError::IncompleteProof(_))));
+    // 2. Forged contained_oids: vec![] passes stateless syntax if unreferenced, MUST fail authoritative barrier!
+    let authority = DurableSafeGcAuthority::in_memory(snap.clone()).unwrap();
+    authority.set_gc_mode(GcMode::ArmedDestructive(arm.clone())).unwrap();
+    let mut p_forged_oids = base_proof.clone();
+    p_forged_oids.candidates[0].contained_oids.clear();
+    p_forged_oids.proof_digest = super::proof_digest::compute_proof_digest(&p_forged_oids);
+    assert!(matches!(
+        authority.begin_delete_batch(Uuid::new_v4(), snap.authority.incarnation_id, 1, 1, p_forged_oids),
+        Err(SafeGcError::IncompleteProof(_))
+    ));
 
-    // Lagging Ref-CAS paired cursor.
-    let mut p_cur = base_proof.clone();
-    p_cur.paired_cursors.refcas_applied_index = 9;
-    p_cur.proof_digest = super::proof_digest::compute_proof_digest(&p_cur);
-    assert!(matches!(verify_deletion_proof(&p_cur), Err(SafeGcError::IncompleteProof(_))));
+    // 3. Cross-repo proof header paired with current deleter args MUST fail closed!
+    let other_repo = Uuid::new_v4();
+    let other_arm = SafeGcArmReceipt::seal(
+        snap.authority.tenant_id,
+        other_repo,
+        snap.authority.history_id,
+        snap.authority.incarnation_id,
+        1,
+        true,
+        arm.lane.clone(),
+    )
+    .unwrap();
+    let mut p_wrong_repo = base_proof.clone();
+    p_wrong_repo.repo_id = other_repo;
+    p_wrong_repo.lane = other_arm.lane;
+    p_wrong_repo.proof_digest = super::proof_digest::compute_proof_digest(&p_wrong_repo);
+    assert!(matches!(
+        authority.begin_delete_batch(Uuid::new_v4(), snap.authority.incarnation_id, 1, 1, p_wrong_repo),
+        Err(SafeGcError::IncompleteProof(_))
+    ));
 
-    // Tampered proof digest.
+    // 4. Live active reader lease pinning retired pack blocks proof build & delete barrier until released!
+    let retired_id = snap.retired_packs[0].pack_id;
+    let lease = authority.acquire_reader_lease("clone-reader", vec![retired_id]).unwrap();
+    assert!(matches!(
+        authority.build_authoritative_deletion_proof(arm.clone(), &[]),
+        Err(SafeGcError::ReaderQuiescenceUnverified(_))
+    ));
+    authority.release_reader_lease(lease.lease_id).unwrap();
+    let fresh_proof = authority.build_authoritative_deletion_proof(arm, &[]).unwrap();
+    assert_eq!(fresh_proof.candidates.len(), 2);
+
+    // 5. Tampered proof digest rejected.
     base_proof.live_ref_seq = 999;
     assert!(matches!(verify_deletion_proof(&base_proof), Err(SafeGcError::ProofDigestMismatch)));
 }
@@ -362,7 +458,6 @@ fn anti_aba_registry_forbids_reuse_even_after_deletion_and_same_sha_reupload() {
     )
     .unwrap();
 
-    // Classic A -> delete -> A re-upload must produce a strictly distinct physical key!
     let k2 = reg.mint_immutable_key((t, r, h, 1), "pack", &same_sha, KeyLifecycleState::ActiveServing).unwrap();
     assert_ne!(k1.object_path, k2.object_path);
     assert!(k2.allocation_seq > k1.allocation_seq);

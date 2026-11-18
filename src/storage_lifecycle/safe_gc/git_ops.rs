@@ -4,6 +4,7 @@ use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Instant,
 };
 
@@ -13,7 +14,7 @@ use tokio::{
     process::Command,
 };
 
-use crate::blob_store::{BlobLocator, opendal::BlobStore};
+use crate::blob_store::{BlobLocator, disposable_view::TempViewLease, opendal::BlobStore};
 
 use super::{SafeGcError, model::SafeGcObjectFormat};
 
@@ -131,12 +132,13 @@ pub async fn download_and_verify_pair(
     pack_loc: &BlobLocator,
     idx_loc: &BlobLocator,
     dest_dir: &Path,
+    view_owner: Arc<TempViewLease>,
     deadline: Instant,
 ) -> Result<(PathBuf, PathBuf), SafeGcError> {
     let pack_out = dest_dir.join("pack-readback.pack");
     let idx_out = dest_dir.join("pack-readback.idx");
-    store.get_to_file(pack_loc, &pack_out, deadline).await?;
-    store.get_to_file(idx_loc, &idx_out, deadline).await?;
+    store.get_to_file_with_owner(pack_loc, &pack_out, deadline, Arc::clone(&view_owner)).await?;
+    store.get_to_file_with_owner(idx_loc, &idx_out, deadline, view_owner).await?;
     Ok((pack_out, idx_out))
 }
 
@@ -159,9 +161,28 @@ async fn write_refs_to_repo(
     Ok(())
 }
 
+async fn list_idx_oids(
+    repo: &Path,
+    idx_path: &Path,
+    object_format: SafeGcObjectFormat,
+    deadline: Instant,
+) -> Result<BTreeSet<String>, SafeGcError> {
+    let idx_bytes = tokio::fs::read(idx_path).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
+    let flag = format!("--object-format={}", format_arg(object_format));
+    let out = run_git_isolated(Some(repo), &["show-index", &flag], Some(&idx_bytes), deadline).await?;
+    let mut set = BTreeSet::new();
+    for line in String::from_utf8_lossy(&out).lines() {
+        if let Some(oid) = line.split_whitespace().nth(1) {
+            set.insert(oid.to_owned());
+        }
+    }
+    Ok(set)
+}
+
 pub async fn build_self_contained_pack_from_sources(
     work_repo: &Path,
-    source_pairs: &[(PathBuf, PathBuf)],
+    selected_pairs: &[(PathBuf, PathBuf)],
+    unselected_pairs: &[(PathBuf, PathBuf)],
     closure_roots: (&[(String, String)], &[String]),
     out_stage_prefix: &Path,
     object_format: SafeGcObjectFormat,
@@ -177,8 +198,16 @@ pub async fn build_self_contained_pack_from_sources(
     .await?;
     let pack_dir = work_repo.join("objects").join("pack");
     tokio::fs::create_dir_all(&pack_dir).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
-    for (idx, (pk, ix)) in source_pairs.iter().enumerate() {
-        let stem = format!("src-{idx}");
+    let mut selected_oids = BTreeSet::new();
+    for (idx, (pk, ix)) in selected_pairs.iter().enumerate() {
+        let stem = format!("sel-{idx}");
+        tokio::fs::copy(pk, pack_dir.join(format!("{stem}.pack"))).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
+        let dst_ix = pack_dir.join(format!("{stem}.idx"));
+        tokio::fs::copy(ix, &dst_ix).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
+        selected_oids.extend(list_idx_oids(work_repo, &dst_ix, object_format, deadline).await?);
+    }
+    for (idx, (pk, ix)) in unselected_pairs.iter().enumerate() {
+        let stem = format!("keep-{idx}");
         tokio::fs::copy(pk, pack_dir.join(format!("{stem}.pack"))).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
         tokio::fs::copy(ix, pack_dir.join(format!("{stem}.idx"))).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
     }
@@ -189,6 +218,7 @@ pub async fn build_self_contained_pack_from_sources(
     let mut pack_input = String::new();
     for line in String::from_utf8_lossy(&rev_raw).lines() {
         if let Some(oid) = line.split_whitespace().next().filter(|s| !s.is_empty())
+            && (unselected_pairs.is_empty() || selected_oids.contains(oid))
             && oids.insert(oid.to_owned())
         {
             pack_input.push_str(oid);
@@ -196,7 +226,9 @@ pub async fn build_self_contained_pack_from_sources(
         }
     }
     if oids.is_empty() {
-        return Err(SafeGcError::CompactionVerificationFailed("no reachable objects to compact".into()));
+        return Err(SafeGcError::CompactionVerificationFailed(
+            "no reachable objects to compact in selected set".into(),
+        ));
     }
     if let Some(parent) = out_stage_prefix.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
@@ -211,6 +243,7 @@ pub async fn build_self_contained_pack_from_sources(
 pub async fn verify_readback_pack_closure(
     verify_repo: &Path,
     pair: (&Path, &Path),
+    unselected_pairs: &[(PathBuf, PathBuf)],
     closure_roots: (&[(String, String)], &[String]),
     expected_oids: &[String],
     object_format: SafeGcObjectFormat,
@@ -231,28 +264,20 @@ pub async fn verify_readback_pack_closure(
     let dst_pack = pack_dir.join("verified.pack");
     tokio::fs::copy(pack_path, &dst_pack).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
     tokio::fs::copy(idx_path, &dst_idx).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
-
-    write_refs_to_repo(verify_repo, refs, extra_roots, deadline).await?;
+    // Verify replacement pack is self-contained (zero thin/unresolved deltas) BEFORE staging unselected packs.
     run_git_isolated(Some(verify_repo), &["verify-pack", "-v", dst_idx.to_str().unwrap_or("")], None, deadline).await?;
-    run_git_isolated(Some(verify_repo), &["fsck", "--full", "--strict"], None, deadline).await?;
-
-    let raw_objs = run_git_isolated(
-        Some(verify_repo),
-        &["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
-        None,
-        deadline,
-    )
-    .await?;
-    let actual: BTreeSet<String> = String::from_utf8_lossy(&raw_objs)
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let idx_oids = list_idx_oids(verify_repo, &dst_idx, object_format, deadline).await?;
     for oid in expected_oids {
-        if !actual.contains(oid) {
-            return Err(SafeGcError::CompactionVerificationFailed(format!("readback closure missing object {oid}")));
+        if !idx_oids.contains(oid) {
+            return Err(SafeGcError::CompactionVerificationFailed(format!("readback pack missing object {oid}")));
         }
     }
+    for (idx, (pk, ix)) in unselected_pairs.iter().enumerate() {
+        let stem = format!("keep-{idx}");
+        tokio::fs::copy(pk, pack_dir.join(format!("{stem}.pack"))).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
+        tokio::fs::copy(ix, pack_dir.join(format!("{stem}.idx"))).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
+    }
+    write_refs_to_repo(verify_repo, refs, extra_roots, deadline).await?;
+    run_git_isolated(Some(verify_repo), &["fsck", "--full", "--strict"], None, deadline).await?;
     Ok(())
 }

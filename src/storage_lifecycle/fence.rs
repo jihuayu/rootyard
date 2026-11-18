@@ -374,3 +374,107 @@ pub async fn acquire(
         released: false,
     })
 }
+
+/// Acquire Phase 1 physical GC admission fence for a `pg_refstore` Blob Safe-GC repo (#122).
+pub async fn acquire_blob_safe_gc(state: &Arc<AppState>, job: &Job, lease: &Lease, policy: &Policy) -> Result<Fence> {
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    let mut client = state.pool.get().await?;
+    let tx = client.transaction().await?;
+    tx.batch_execute(
+        "SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='5s'; \
+         SET LOCAL idle_in_transaction_session_timeout='60s'",
+    )
+    .await?;
+    let row = tx
+        .query_opt(
+            "SELECT storage_generation,state,storage_backend,gc_epoch,gc_owner,gc_job_id, \
+             COALESCE(gc_lease_until > clock_timestamp(), false) \
+             FROM repositories WHERE id=$1 AND owner_id=$2 FOR UPDATE",
+            &[&job.repository_id, &job.tenant_id],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repository changed before blob safe GC"))?;
+    let (generation, repo_state, backend): (i64, String, String) = (row.get(0), row.get(1), row.get(2));
+    let (mut epoch, existing_owner, existing_job, existing_active): (i64, Option<Uuid>, Option<Uuid>, bool) =
+        (row.get(3), row.get(4), row.get(5), row.get(6));
+    ensure!(
+        generation == job.repository_generation && repo_state == "ready" && backend == "pg_refstore",
+        "repository changed before blob safe GC"
+    );
+    let same_claim = existing_active && existing_job == Some(job.id) && existing_owner == Some(job.lease_owner);
+    ensure!(!existing_active || same_claim, "another physical GC holds the repository fence");
+    if !same_claim {
+        epoch = epoch.checked_add(1).context("physical GC epoch exhausted")?;
+    }
+    let lease_seconds = policy.lease_seconds.clamp(5, 300);
+    tx.execute(
+        "UPDATE repositories SET gc_epoch=$2,gc_owner=$3,gc_job_id=$4, \
+         gc_lease_until=clock_timestamp()+make_interval(secs=>($5::bigint)::double precision), \
+         gc_fence_started_at=clock_timestamp(),gc_quiesced_at=NULL WHERE id=$1",
+        &[&job.repository_id, &epoch, &job.lease_owner, &job.id, &lease_seconds],
+    )
+    .await?;
+    lock_retention_rows(&*tx, job.repository_id).await?;
+    let deadline = Instant::now() + Duration::from_secs(policy.quiescence_seconds as u64);
+    loop {
+        let active: i64 = tx
+            .query_one(
+                "SELECT count(*) FROM storage_write_admissions \
+                 WHERE repository_id=$1 AND state='active' AND lease_until > clock_timestamp()",
+                &[&job.repository_id],
+            )
+            .await?
+            .get(0);
+        if active == 0 {
+            break;
+        }
+        ensure!(Instant::now() < deadline, "admitted writers did not quiesce before blob safe GC");
+        lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tx.execute("UPDATE repositories SET gc_quiesced_at=clock_timestamp() WHERE id=$1", &[&job.repository_id]).await?;
+    let sql_roots = retention::collect_sql_roots(&*tx, job.repository_id).await?;
+    timeout(Duration::from_secs(2), tx.commit()).await.map_err(|_| anyhow::anyhow!("gc fence commit timed out"))??;
+    let (active_send, active) = watch::channel(Some(Instant::now()));
+    let (hb_state, hb_owner, hb_job, hb_repo, hb_epoch) =
+        (state.clone(), job.lease_owner, job.id, job.repository_id, epoch);
+    let task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(HEARTBEAT);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let ok = timeout(HEARTBEAT_TIMEOUT, async {
+                let c = hb_state.pool.get().await?;
+                let n = c
+                    .execute(
+                        "UPDATE repositories SET gc_lease_until=clock_timestamp() \
+                         + make_interval(secs=>($5::bigint)::double precision) \
+                         WHERE id=$1 AND gc_owner=$2 AND gc_job_id=$3 AND gc_epoch=$4 AND gc_lease_until > clock_timestamp()",
+                        &[&hb_repo, &hb_owner, &hb_job, &hb_epoch, &lease_seconds],
+                    )
+                    .await?;
+                anyhow::Ok(n == 1)
+            })
+            .await;
+            if matches!(ok, Ok(Ok(true))) {
+                let _ = active_send.send_replace(Some(Instant::now()));
+            } else {
+                active_send.send_replace(None);
+                break;
+            }
+        }
+    });
+    Ok(Fence {
+        state: state.clone(),
+        repository_id: job.repository_id,
+        owner: job.lease_owner,
+        job_id: job.id,
+        epoch,
+        native_roots: Vec::new(),
+        sql_roots,
+        keep: None,
+        active,
+        task: Some(task),
+        released: false,
+    })
+}

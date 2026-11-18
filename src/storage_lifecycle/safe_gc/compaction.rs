@@ -3,13 +3,17 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::blob_store::{disposable_view::DisposableViewRoot, opendal::BlobStore};
+use crate::blob_store::{
+    disposable_view::{DisposableViewRoot, TempViewLease},
+    opendal::BlobStore,
+};
 
 use super::{
     SafeGcError,
@@ -18,7 +22,7 @@ use super::{
         build_self_contained_pack_from_sources, download_and_verify_pair, sha256_file_and_len,
         verify_readback_pack_closure,
     },
-    model::{DecisionState, GlobalHoldState, LiveRefRoot, encode_len_bytes},
+    model::{DecisionState, GlobalHoldEntry, GlobalHoldState, LiveRefRoot, encode_len_bytes},
     store::{DurableSafeGcAuthority, SafeGcRepoSnapshot, ServingPackRecord},
 };
 
@@ -26,6 +30,7 @@ use super::{
 pub enum CompactionFault {
     None,
     ConcurrentRefBeforeCas(LiveRefRoot),
+    AttachHoldBeforeCas(GlobalHoldEntry),
     RotateIncarnationBeforeCas,
 }
 
@@ -55,32 +60,34 @@ pub async fn execute_two_phase_compaction(
     req: SafeGcCompactionRequest<'_>,
 ) -> Result<SafeGcCompactionResult, SafeGcError> {
     let snap = authority.snapshot();
-    let inputs = select_input_packs(&snap, &req.target_pack_ids)?;
+    let expected_membership_digest = snap.compute_membership_digest();
+    let (inputs, unselected) = select_input_and_kept_packs(&snap, &req.target_pack_ids)?;
     let refs: Vec<(String, String)> =
         snap.live_refs.iter().map(|r| (r.ref_name.clone(), r.target_oid.clone())).collect();
     let extra_roots = collect_retained_roots(&snap);
 
-    let view = req.view_root.create_view(
+    let view = Arc::new(req.view_root.create_view(
         "safe-gc-compact",
         snap.authority.tenant_id,
         snap.authority.repo_id,
         64 * 1024 * 1024,
         None,
-    )?;
+    )?);
     let root = view.dir_path()?.to_path_buf();
-    let in_dir = root.join("inputs");
-    let work_repo = root.join("work.git");
-    let stage_prefix = root.join("stage").join("compacted");
-    let readback_dir = root.join("readback");
-    let verify_repo = root.join("verify.git");
-    for d in [&in_dir, &readback_dir] {
+    let (in_dir, keep_dir) = (root.join("inputs"), root.join("kept"));
+    let (work_repo, verify_repo) = (root.join("work.git"), root.join("verify.git"));
+    let (stage_prefix, readback_dir) = (root.join("stage").join("compacted"), root.join("readback"));
+    for d in [&in_dir, &keep_dir, &readback_dir] {
         tokio::fs::create_dir_all(d).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
     }
 
-    let (source_pairs, old_pack_bytes) = download_input_packs(store, &inputs, &in_dir, req.deadline).await?;
+    let (source_pairs, old_pack_bytes) =
+        download_pack_list(store, &inputs, &in_dir, Arc::clone(&view), req.deadline).await?;
+    let (kept_pairs, _) = download_pack_list(store, &unselected, &keep_dir, Arc::clone(&view), req.deadline).await?;
     let (new_pack_path, new_idx_path, closure_oids) = build_self_contained_pack_from_sources(
         &work_repo,
         &source_pairs,
+        &kept_pairs,
         (&refs, &extra_roots),
         &stage_prefix,
         snap.object_format,
@@ -102,71 +109,114 @@ pub async fn execute_two_phase_compaction(
             req.deadline,
         )
         .await?;
-    if uploaded.pack_locator.sha256 != pack_sha256
-        || uploaded.pack_locator.length != new_pack_bytes
-        || uploaded.idx_locator.sha256 != idx_sha256
-        || uploaded.idx_locator.length != idx_len
-    {
-        return Err(SafeGcError::CompactionVerificationFailed(
-            "uploaded locator digest/length disagrees with staged pack".into(),
-        ));
-    }
+    authority.record_staged_upload(req.op_id, &uploaded)?;
 
-    // Phase 1b: Read back uploaded blobs directly through BlobStore and verify full closure before CAS!
-    let pk_loc = uploaded.pack_locator.to_locator()?;
-    let ix_loc = uploaded.idx_locator.to_locator()?;
-    let (rb_pack, rb_idx) = download_and_verify_pair(store, &pk_loc, &ix_loc, &readback_dir, req.deadline).await?;
-    verify_readback_pack_closure(
-        &verify_repo,
-        (&rb_pack, &rb_idx),
-        (&refs, &extra_roots),
-        &closure_oids,
-        snap.object_format,
-        req.deadline,
-    )
-    .await?;
-
-    match req.fault {
-        CompactionFault::None => {}
-        CompactionFault::ConcurrentRefBeforeCas(r) => authority.register_concurrent_ref(r)?,
-        CompactionFault::RotateIncarnationBeforeCas => {
-            let _ = authority.rotate_incarnation()?;
+    let post_upload = async {
+        if uploaded.pack_locator.sha256 != pack_sha256
+            || uploaded.pack_locator.length != new_pack_bytes
+            || uploaded.idx_locator.sha256 != idx_sha256
+            || uploaded.idx_locator.length != idx_len
+        {
+            return Err(SafeGcError::CompactionVerificationFailed(
+                "uploaded locator digest/length disagrees with staged pack".into(),
+            ));
         }
-    }
-    let live_after = authority.snapshot();
-    if live_after.authority.live_ref_seq != snap.authority.live_ref_seq {
-        return Err(SafeGcError::MembershipOrRootDrift(
-            "live refs mutated during compaction; keeping prior closure active".into(),
-        ));
-    }
 
-    let eq_digest = compute_equivalence_digest(&closure_oids, &pack_sha256, &idx_sha256);
-    let retired_ids: Vec<Uuid> = inputs.iter().map(|p| p.pack_id).collect();
-    let publish = authority.cas_publish_compaction(CasCompactionPublish {
-        op_id: req.op_id,
-        group_id: req.group_id.to_owned(),
-        expected_incarnation_id: snap.authority.incarnation_id,
-        expected_incarnation_epoch: snap.authority.incarnation_epoch,
-        expected_generation: snap.authority.membership_generation,
-        retired_pack_ids: retired_ids,
-        uploaded,
-        replacement_oids: closure_oids.clone(),
-        equivalence_digest: eq_digest,
-    })?;
+        // Phase 1b: Read back uploaded blobs through BlobStore keeping Arc<TempViewLease> alive!
+        let pk_loc = uploaded.pack_locator.to_locator()?;
+        let ix_loc = uploaded.idx_locator.to_locator()?;
+        let (rb_pack, rb_idx) =
+            download_and_verify_pair(store, &pk_loc, &ix_loc, &readback_dir, Arc::clone(&view), req.deadline).await?;
+        verify_readback_pack_closure(
+            &verify_repo,
+            (&rb_pack, &rb_idx),
+            &kept_pairs,
+            (&refs, &extra_roots),
+            &closure_oids,
+            snap.object_format,
+            req.deadline,
+        )
+        .await?;
 
-    Ok(SafeGcCompactionResult { publish, compacted_object_count: closure_oids.len(), old_pack_bytes, new_pack_bytes })
+        match req.fault {
+            CompactionFault::None => {}
+            CompactionFault::ConcurrentRefBeforeCas(r) => authority.register_concurrent_ref(r)?,
+            CompactionFault::AttachHoldBeforeCas(h) => authority.upsert_global_hold(h)?,
+            CompactionFault::RotateIncarnationBeforeCas => {
+                let _ = authority.rotate_incarnation()?;
+            }
+        }
+        let live_after = authority.snapshot();
+        if live_after.authority.live_ref_seq != snap.authority.live_ref_seq
+            || collect_retained_roots(&live_after) != extra_roots
+        {
+            return Err(SafeGcError::MembershipOrRootDrift(
+                "live refs or retention roots mutated during compaction; keeping prior closure active".into(),
+            ));
+        }
+        let retired_ids: Vec<Uuid> = inputs.iter().map(|p| p.pack_id).collect();
+        let pinned_after = live_after.directly_pinned_pack_ids();
+        if retired_ids.iter().any(|id| pinned_after.contains(id)) {
+            return Err(SafeGcError::ProtectionOverlap(
+                "input pack pinned concurrently during compaction; keeping prior closure active".into(),
+            ));
+        }
+
+        let eq_digest = compute_equivalence_digest(&closure_oids, &pack_sha256, &idx_sha256);
+        let publish = authority.cas_publish_compaction(CasCompactionPublish {
+            op_id: req.op_id,
+            group_id: req.group_id.to_owned(),
+            expected_incarnation_id: snap.authority.incarnation_id,
+            expected_incarnation_epoch: snap.authority.incarnation_epoch,
+            expected_generation: snap.authority.membership_generation,
+            expected_membership_digest,
+            retired_pack_ids: retired_ids,
+            uploaded,
+            replacement_oids: closure_oids.clone(),
+            equivalence_digest: eq_digest,
+        })?;
+        Ok(SafeGcCompactionResult {
+            publish,
+            compacted_object_count: closure_oids.len(),
+            old_pack_bytes,
+            new_pack_bytes,
+        })
+    }
+    .await;
+
+    if post_upload.is_err() {
+        let _ = authority.mark_staged_upload_abandoned(req.op_id);
+    }
+    post_upload
 }
 
-fn select_input_packs(snap: &SafeGcRepoSnapshot, targets: &[Uuid]) -> Result<Vec<ServingPackRecord>, SafeGcError> {
-    let selected: Vec<_> = if targets.is_empty() {
-        snap.active_packs.clone()
-    } else {
-        snap.active_packs.iter().filter(|p| targets.contains(&p.pack_id)).cloned().collect()
-    };
+fn select_input_and_kept_packs(
+    snap: &SafeGcRepoSnapshot,
+    targets: &[Uuid],
+) -> Result<(Vec<ServingPackRecord>, Vec<ServingPackRecord>), SafeGcError> {
+    let pinned = snap.directly_pinned_pack_ids();
+    if !targets.is_empty() && targets.iter().any(|id| pinned.contains(id)) {
+        return Err(SafeGcError::ProtectionOverlap(
+            "explicitly targeted pack is directly pinned by hold/producer/reader".into(),
+        ));
+    }
+    let mut selected = Vec::new();
+    let mut unselected = Vec::new();
+    for p in &snap.active_packs {
+        let want = if targets.is_empty() { !pinned.contains(&p.pack_id) } else { targets.contains(&p.pack_id) };
+        if want {
+            selected.push(p.clone());
+        } else {
+            unselected.push(p.clone());
+        }
+    }
     if selected.is_empty() {
+        if !snap.active_packs.is_empty() && targets.is_empty() {
+            return Err(SafeGcError::ProtectionOverlap("all active packs are directly pinned".into()));
+        }
         return Err(SafeGcError::InvalidInput("no active packs selected for compaction".into()));
     }
-    Ok(selected)
+    Ok((selected, unselected))
 }
 
 fn collect_retained_roots(snap: &SafeGcRepoSnapshot) -> Vec<String> {
@@ -187,28 +237,29 @@ fn collect_retained_roots(snap: &SafeGcRepoSnapshot) -> Vec<String> {
     roots.into_iter().collect()
 }
 
-async fn download_input_packs(
+async fn download_pack_list(
     store: &BlobStore,
-    inputs: &[ServingPackRecord],
-    in_dir: &Path,
+    items: &[ServingPackRecord],
+    base_dir: &Path,
+    view_owner: Arc<TempViewLease>,
     deadline: Instant,
 ) -> Result<(Vec<(PathBuf, PathBuf)>, u64), SafeGcError> {
-    let mut pairs = Vec::with_capacity(inputs.len());
-    let mut old_bytes = 0_u64;
-    for (idx, item) in inputs.iter().enumerate() {
-        let sub = in_dir.join(format!("p-{idx}"));
+    let mut pairs = Vec::with_capacity(items.len());
+    let mut bytes_sum = 0_u64;
+    for (idx, item) in items.iter().enumerate() {
+        let sub = base_dir.join(format!("p-{idx}"));
         tokio::fs::create_dir_all(&sub).await.map_err(|e| SafeGcError::Io(e.to_string()))?;
         let pk = item.pack_locator.to_locator()?;
         let ix = item.idx_locator.to_locator()?;
-        old_bytes = old_bytes.saturating_add(pk.length());
-        pairs.push(download_and_verify_pair(store, &pk, &ix, &sub, deadline).await?);
+        bytes_sum = bytes_sum.saturating_add(pk.length());
+        pairs.push(download_and_verify_pair(store, &pk, &ix, &sub, Arc::clone(&view_owner), deadline).await?);
     }
-    Ok((pairs, old_bytes))
+    Ok((pairs, bytes_sum))
 }
 
 fn compute_equivalence_digest(oids: &[String], pack_sha: &str, idx_sha: &str) -> String {
     let mut h = Sha256::new();
-    h.update(b"safe-gc-eq-v1|");
+    h.update(b"safe-gc-eq-v2|");
     encode_len_bytes(&mut h, pack_sha.as_bytes());
     encode_len_bytes(&mut h, idx_sha.as_bytes());
     h.update((oids.len() as u64).to_be_bytes());

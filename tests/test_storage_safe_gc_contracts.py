@@ -14,6 +14,9 @@ except ImportError:  # pragma: no cover
 
 ROOT = Path(__file__).resolve().parents[1]
 RUST_FILES = [
+    ROOT / "src" / "storage_lifecycle" / "fence.rs",
+    ROOT / "src" / "storage_lifecycle" / "scheduler.rs",
+    ROOT / "src" / "storage_lifecycle" / "worker.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "anti_aba.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "compaction.rs",
@@ -22,13 +25,22 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "executor.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "git_ops.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "model.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "pg_maintenance.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "pg_reconcile.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "proof.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "proof_digest.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "provider_delete.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "quiescence.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "retention_bridge.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "store.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "store_barrier.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "store_reconcile.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "store_verify.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_concurrency.rs",
     ROOT / "tests" / "storage_safe_gc.rs",
+    ROOT / "tests" / "storage_safe_gc_maintenance.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "s3_harness.rs",
 ]
 WORKFLOW = ROOT / ".github" / "workflows" / "storage-safe-gc.yml"
 DOC = ROOT / "docs" / "storage-safe-gc.md"
@@ -53,13 +65,18 @@ class StorageSafeGcContractsTest(unittest.TestCase):
                 self.assertLess(len(lines), 500, f"{path.name} has {len(lines)} lines (>= 500)")
                 self.assertNotIn("#[allow(", text, f"lint suppression forbidden in {path.name}")
 
-        for name in ("model.rs", "proof.rs", "anti_aba.rs", "store.rs", "domain.rs"):
+        for name in ("model.rs", "proof.rs", "anti_aba.rs", "store.rs", "domain.rs", "quiescence.rs"):
             src = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / name).read_text(encoding="utf-8")
             for m in re.finditer(r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*pub struct (\w+)", src):
                 self.assertIn("deny_unknown_fields", m.group(0), f"{name}:{m.group(1)} missing deny_unknown_fields")
 
         model = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "model.rs").read_text(encoding="utf-8")
         self.assertIn("pub const SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT: bool = false;", model)
+        bridge = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "retention_bridge.rs").read_text(encoding="utf-8")
+        self.assertIn("PackRetentionState::GcEligible", bridge)
+        provider = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "provider_delete.rs").read_text(encoding="utf-8")
+        for outcome in ("ConfirmedDeleted", "AlreadyAbsent", "OutcomeUnknown"):
+            self.assertIn(outcome, provider)
 
     def test_workflow_and_doc_contracts(self) -> None:
         wf_raw = WORKFLOW.read_bytes()
@@ -79,6 +96,7 @@ class StorageSafeGcContractsTest(unittest.TestCase):
                 "src/storage_lifecycle/safe_gc.rs",
                 "src/storage_lifecycle/safe_gc/**",
                 "tests/storage_safe_gc.rs",
+                "tests/storage_safe_gc_maintenance.rs",
                 "scripts/eval_storage_safe_gc.py",
                 "docs/storage-safe-gc.md",
             ):
@@ -86,10 +104,12 @@ class StorageSafeGcContractsTest(unittest.TestCase):
 
         for token in (
             "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b",
+            "postgres:17",
             "scripts/install_ci_cargo_fork.sh install",
             "scripts/install_ci_cargo_fork.sh verify",
             "cargo test --locked --no-default-features --lib storage_lifecycle::safe_gc",
             "cargo test --locked --no-default-features --test storage_safe_gc",
+            "cargo test --locked --no-default-features --test storage_safe_gc_maintenance",
             "scripts/eval_storage_safe_gc.py",
         ):
             self.assertIn(token, wf_text)

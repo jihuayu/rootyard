@@ -6,9 +6,14 @@ on:
     paths:
       - '.github/workflows/storage-safe-gc.yml'
       - 'src/storage_lifecycle.rs'
+      - 'src/storage_lifecycle/fence.rs'
+      - 'src/storage_lifecycle/scheduler.rs'
+      - 'src/storage_lifecycle/worker.rs'
       - 'src/storage_lifecycle/safe_gc.rs'
       - 'src/storage_lifecycle/safe_gc/**'
       - 'tests/storage_safe_gc.rs'
+      - 'tests/storage_safe_gc_maintenance.rs'
+      - 'tests/storage_safe_gc_support/**'
       - 'tests/test_storage_safe_gc_contracts.py'
       - 'scripts/eval_storage_safe_gc.py'
       - 'docs/storage-safe-gc.md'
@@ -26,12 +31,28 @@ concurrency:
 jobs:
   storage-safe-gc:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: rootyard_safegc122
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd="pg_isready -U rootyard -d rootyard_safegc122"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_safegc122
+      ROOTYARD_SAFE_GC_REQUIRE_PG: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,6 +60,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfuse3-dev fuse3 pkg-config build-essential libssl-dev openssl git
       - name: Install pinned Rust 1.99.1 gate tools
         run: |
           rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
@@ -78,11 +104,12 @@ jobs:
           cargo fmt --all -- --check
           python3 scripts/check_design_docs.py
           python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_storage_safe_gc_contracts.py
-      - name: Run Clippy, unit tests, and stock-Git OpenDAL Safe GC integration tests
+      - name: Run Clippy, unit tests, and stock-Git PG17 OpenDAL Safe GC integration tests
         run: |
-          cargo clippy --locked --no-default-features --lib --test storage_safe_gc -- -D warnings
+          cargo clippy --locked --no-default-features --lib --test storage_safe_gc --test storage_safe_gc_maintenance -- -D warnings
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib storage_lifecycle::safe_gc
-          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test storage_safe_gc
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test storage_safe_gc -- --test-threads=1
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test storage_safe_gc_maintenance -- --test-threads=1
       - name: Run reproducible Safe GC evaluator
         run: |
           mkdir -p test-results/storage-safe-gc

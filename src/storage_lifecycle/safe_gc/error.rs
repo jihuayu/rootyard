@@ -10,6 +10,7 @@ pub enum SafeGcError {
     IncompleteProof(&'static str),
     ProofDigestMismatch,
     ProtectionOverlap(String),
+    ReaderQuiescenceUnverified(&'static str),
     DistributedPrereqsMissing(&'static str),
     StaleIncarnation(&'static str),
     StaleDeleterFenced(&'static str),
@@ -18,6 +19,7 @@ pub enum SafeGcError {
     AbaKeyReuseDetected(String),
     CompactionVerificationFailed(String),
     BlobDeleteDisabled,
+    DeleteOutcomeUnknown(String),
     PartialDeleteFailure(String),
     Serialization(String),
     Blob(BlobError),
@@ -49,6 +51,7 @@ impl fmt::Display for SafeGcError {
             Self::IncompleteProof(reason) => write!(f, "deletion proof incomplete: {reason}"),
             Self::ProofDigestMismatch => f.write_str("deletion proof digest mismatch"),
             Self::ProtectionOverlap(msg) => write!(f, "candidate overlaps retained closure: {msg}"),
+            Self::ReaderQuiescenceUnverified(msg) => write!(f, "reader quiescence unverified: {msg}"),
             Self::DistributedPrereqsMissing(msg) => {
                 write!(f, "distributed GC prerequisites missing (#151/#153): {msg}")
             }
@@ -63,6 +66,7 @@ impl fmt::Display for SafeGcError {
                 write!(f, "two-phase compaction readback verification failed: {msg}")
             }
             Self::BlobDeleteDisabled => f.write_str("BlobStore physical delete stays disabled on this backend"),
+            Self::DeleteOutcomeUnknown(msg) => write!(f, "provider delete outcome unknown: {msg}"),
             Self::PartialDeleteFailure(msg) => write!(f, "partial physical delete failure: {msg}"),
             Self::Serialization(msg) => write!(f, "safe-gc serialization error: {msg}"),
             Self::Blob(err) => write!(f, "blob error: {err}"),

@@ -2,13 +2,9 @@
 //!
 //! Destructive physical deletion is disabled by default
 //! ([`SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT`] = `false` / [`GcMode::DisabledByDefault`]).
-//! Enabling deletion requires explicit arming bound to a live incarnation and
-//! lane ([`AuthorityLane::SingleNodePg`] or [`AuthorityLane::DistributedRefCas`]
-//! with `#151` global hold bridge + `#153` remote backup root + Ref-CAS quorum),
-//! plus a complete [`DeletionProof`] reconciling live refs, all 6 retention
-//! producer domains, global holds, in-flight decisions, paired PG/Ref-CAS
-//! cursors, and group closure receipts. Physical keys follow strict monotonic
-//! anti-ABA non-reuse across generations, compaction retries, and restores.
+//! Enabling deletion requires explicit arming, live reader quiescence, `#184`
+//! `GcEligible` pack-cover retention classification, a complete [`DeletionProof`],
+//! and continuous fence verification across real OpenDAL S3 provider operations.
 
 #[path = "safe_gc/anti_aba.rs"]
 pub mod anti_aba;
@@ -24,14 +20,28 @@ pub mod executor;
 pub mod git_ops;
 #[path = "safe_gc/model.rs"]
 pub mod model;
+#[path = "safe_gc/pg_maintenance.rs"]
+pub mod pg_maintenance;
+#[path = "safe_gc/pg_reconcile.rs"]
+pub mod pg_reconcile;
 #[path = "safe_gc/proof.rs"]
 pub mod proof;
 #[path = "safe_gc/proof_digest.rs"]
-mod proof_digest;
+pub mod proof_digest;
+#[path = "safe_gc/provider_delete.rs"]
+pub mod provider_delete;
+#[path = "safe_gc/quiescence.rs"]
+pub mod quiescence;
+#[path = "safe_gc/retention_bridge.rs"]
+pub mod retention_bridge;
 #[path = "safe_gc/store.rs"]
 pub mod store;
 #[path = "safe_gc/store_barrier.rs"]
 mod store_barrier;
+#[path = "safe_gc/store_reconcile.rs"]
+mod store_reconcile;
+#[path = "safe_gc/store_verify.rs"]
+mod store_verify;
 #[cfg(test)]
 #[path = "safe_gc/tests.rs"]
 mod tests;
@@ -42,13 +52,15 @@ mod tests_concurrency;
 pub use anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState, PhysicalBlobKey};
 pub use compaction::{SafeGcCompactionRequest, SafeGcCompactionResult, execute_two_phase_compaction};
 pub use domain::{
-    AuthorityRecord, BlobStoreReadbackBackend, CasCompactionPublish, CompactionPublishResult,
-    DeleteAuthorizationTicket, DeleteExecutionReport, GcAuditEvent, SafeGcCompactionUploader, SafeGcDeleteBackend,
-    UploadedCompactionPair,
+    ActiveDeleteFence, AuthorityRecord, BlobStoreReadbackBackend, CasCompactionPublish, CompactionPublishResult,
+    DeleteAuthorizationTicket, DeleteExecutionReport, GcAuditEvent, ProviderDeleteOutcome, RemotePresence,
+    SafeGcCompactionUploader, SafeGcDeleteBackend, StagingCleanupReport, UploadedCompactionPair,
 };
 pub use error::SafeGcError;
 pub use executor::{
-    DeleteFaultHook, SafeGcSweepRequest, execute_safe_gc_sweep, reconcile_pending_delete_after_restart,
+    DeleteFaultHook, PostTicketDriftFault, SafeGcSweepRequest, execute_safe_gc_sweep,
+    execute_safe_gc_sweep_with_external_fence, reclaim_abandoned_compaction_staging,
+    reconcile_pending_delete_after_restart,
 };
 pub use model::{
     AuthorityLane, CandidatePackTarget, DecisionKind, DecisionState, GcMode, GlobalHoldEntry, GlobalHoldState,
@@ -57,5 +69,9 @@ pub use model::{
     ProducerReconciliationEntry, RetentionProducer, SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT, SAFE_GC_SCHEMA_VERSION,
     SafeGcArmReceipt, SafeGcObjectFormat, SourceFreshness,
 };
+pub use pg_maintenance::{ENV_BLOB_SAFE_GC_DESTRUCTIVE, safe_gc_destructive_env_enabled, safe_gc_journal_path};
+pub use pg_reconcile::{reconcile_pg_refstore_authority, reconcile_refcas_quorum_into_authority};
 pub use proof::{DeletionProof, DeletionProofInputs, build_and_verify_deletion_proof, verify_deletion_proof};
-pub use store::{DurableSafeGcAuthority, SafeGcRepoSnapshot};
+pub use provider_delete::{OpenDalS3GcProvider, S3OperatorCredentials};
+pub use quiescence::{ActiveReaderLease, ReaderLeaseRegistry, ReaderQuiescenceObservation};
+pub use store::{DurableSafeGcAuthority, SafeGcRepoSnapshot, ServingPackRecord};
