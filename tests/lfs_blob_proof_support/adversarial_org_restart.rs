@@ -130,13 +130,15 @@ pub async fn exercise_org_authority_restart_recovery_hydration_and_shared_holds(
         .await?;
     ensure!(retry_res.status() == StatusCode::OK);
 
-    let bob_access = pg.resolve_authoritative_repo_access(realm, bob.user_id, &bob.username, false, false).await?;
+    let restarted_realm = pg.ensure_realm_for_repository(realm.repository_id, &restarted.state.storage.root).await?;
+    let bob_access =
+        pg.resolve_authoritative_repo_access(&restarted_realm, bob.user_id, &bob.username, false, false).await?;
     let compute_dir = TempDir::new()?;
     let scratch = TempDir::new()?;
     let ctx = LfsTransferContext {
         gate: &fresh_gate,
         pg,
-        realm,
+        realm: &restarted_realm,
         access: &bob_access,
         scratch_dir: scratch.path(),
         timeout: Duration::from_secs(20),
