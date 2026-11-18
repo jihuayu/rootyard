@@ -1,0 +1,495 @@
+name: Draft issue 42 witness qualification
+
+on:
+  push:
+    branches: [codex/goal-issue42-original-ac-source-audit-20261117]
+    paths: [.github/workflows/issue42-witness-draft.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      SOURCE_SHA: 14552a1ffbc717a1aa950e9b1633fd4ee5c4ced3
+      SOURCE_TREE: bc59f7839c7a59e53d1a085635bcec2d73f97c35
+      TRIGGER_SHA: ${{ github.sha }}
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONOPTIMIZE: ''
+      ROOTYARD_TEST_GIT: /usr/bin/git
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare qualification driver
+        timeout-minutes: 2
+        run: |
+          work="$RUNNER_TEMP/issue42-witness"
+          mkdir -m 700 "$work"
+          cat > "$work/qualify.py" <<'PY'
+          import contextlib
+          import fcntl
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import selectors
+          import subprocess
+          import sys
+          import time
+
+          WORK = Path(__file__).resolve().parent
+          ROOT = Path(os.environ["GITHUB_WORKSPACE"])
+          LIB = WORK / "witness-lib"
+          RECEIPT = LIB.with_suffix(".build.json")
+          CASE = "blob_git_gateway::admission_race_acceptance::post_admission_independent_refs_both_commit"
+          STALE = ('the second independent report-status is not exactly one ok on '
+                   'refs/heads/indep-b: [("refs/heads/indep-b", Some("stale info"))]')
+          CLEANUP = ("post-admission witness cleanup failed (",
+                     "post-admission witness cleanup fallback panicked")
+          SUMMARY = re.compile(
+              r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+              r"(\d+) measured; \d+ filtered out; finished in [0-9.]+s")
+          REASONS = {"cli-exit", "timeout", "parent-control-eof", "leaked-descendants",
+                     "signal-SIGTERM", "signal-SIGINT"}
+          HASH_FIELDS = ("source_inputs_sha256", "config_digest", "cargo_lock_sha256",
+                         "lib_test_support_inputs_sha256", "binary_sha256", "receipt_sha256",
+                         "cargo_sha256", "rustc_sha256", "git_sha256")
+          TEST_SECONDS = 600
+          PROOF_GRACE = 20
+
+          def write(name, doc):
+              temp = WORK / (name + ".tmp")
+              temp.write_text(json.dumps(doc, sort_keys=True) + "\n")
+              temp.replace(WORK / name)
+
+          def read(name):
+              try:
+                  value = json.loads((WORK / name).read_text())
+                  return value if isinstance(value, dict) else {}
+              except (OSError, ValueError):
+                  return {}
+
+          def digest(value, length):
+              return value if isinstance(value, str) and re.fullmatch(
+                  f"[0-9a-f]{{{length}}}", value) else None
+
+          def checkout_is_clean(receipts):
+              state = receipts.git_state(ROOT)
+              return (state["commit"] == os.environ["SOURCE_SHA"]
+                      and state["tree"] == os.environ["SOURCE_TREE"]
+                      and state["status_with_untracked"] == "")
+
+          def provenance():
+              import build_native_test as builder
+              import native_build_receipt as receipts
+
+              assert checkout_is_clean(receipts)
+              environment = builder.normalize_environment()["environment"]
+              toolchain = builder.probe_toolchain(environment)
+              cargo, rustc = toolchain["cargo"], toolchain["rustc"]
+              assert cargo["commit_hash"] == "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b"
+              assert cargo["release"] == "1.101.0" and rustc["release"] == "1.99.1"
+              assert cargo["host"] == rustc["host"] == "x86_64-unknown-linux-gnu"
+              command = [
+                  "cargo", "--config", "profile.dev.package.rootyard.debug=0",
+                  "--config", "profile.test.package.rootyard.debug=0",
+                  "--config", 'profile.dev.package.rootyard.strip="debuginfo"',
+                  "--config", 'profile.test.package.rootyard.strip="debuginfo"',
+                  "test", "--locked", "--no-default-features", "--lib", "--no-run",
+                  "--message-format=json-render-diagnostics", "--jobs", "2",
+              ]
+              for path in (LIB, RECEIPT):
+                  assert path.is_file() and not path.is_symlink() and not path.stat().st_mode & 0o222
+              assert os.access(LIB, os.X_OK)
+              validated = receipts.load_receipt(
+                  RECEIPT, binary_path=LIB, source_root=ROOT, expected_commit=os.environ["SOURCE_SHA"],
+                  expected_command=command, expected_profile="test", expected_toolchain=toolchain,
+                  forbid_implicit_build=True,
+              )
+              payload = validated.payload
+              assert validated.schema == "v2" and payload["kind"] == "rust-library-test"
+              assert payload["working_tree"] == {"tree": os.environ["SOURCE_TREE"], "status": ""}
+              assert payload["features"] == {"enabled": [], "no_default_features": True}
+              artifact, = validated.artifacts
+              assert (artifact["kind"], artifact["target"], artifact["source"]) == (
+                  "lib-test", "rootyard", "src/lib.rs")
+              assert artifact["profile"]["test"] is True and artifact["profile"]["debuginfo"] == 0
+              assert artifact["executable_sha256"] == validated.binary_sha256
+              assert payload["lib_test_support_inputs_sha256"] == builder.lib_test_support_digest()
+              store = payload["artifact_store"]
+              assert store["schema"] == "rootyard/native-artifact-store/v1"
+              assert store["root"] == str(WORK / "store")
+              assert store["output_alias"]["path"] == str(LIB)
+              assert store["output_alias"]["receipt"] == str(RECEIPT)
+              assert store["binary_sha256"] == validated.binary_sha256
+              canonical = Path(store["binary"])
+              canonical_receipt = Path(store["build_receipt"])
+              for path in (canonical, canonical_receipt):
+                  assert path.is_file() and not path.is_symlink() and not path.stat().st_mode & 0o222
+                  assert path.resolve().is_relative_to(WORK / "store")
+              assert receipts.sha256_file(canonical) == validated.binary_sha256
+              assert receipts.sha256_file(canonical_receipt) == validated.receipt_sha256
+              git = os.environ["ROOTYARD_TEST_GIT"]
+              version = subprocess.check_output([git, "--version"], text=True, timeout=5)
+              version = re.fullmatch(r"git version (\d+)\.(\d+)\.(\d+)\n", version)
+              assert version is not None
+              write("provenance.json", {
+                  "source_inputs_sha256": validated.source_inputs_sha256,
+                  "config_digest": validated.config_digest,
+                  "cargo_lock_sha256": payload["cargo_lock_sha256"],
+                  "lib_test_support_inputs_sha256": payload["lib_test_support_inputs_sha256"],
+                  "binary_sha256": validated.binary_sha256,
+                  "receipt_sha256": validated.receipt_sha256,
+                  "cargo_sha256": cargo["executable_sha256"],
+                  "rustc_sha256": rustc["executable_sha256"],
+                  "git_sha256": receipts.sha256_file(git),
+                  "git_version": [int(part) for part in version.groups()],
+              })
+
+          def database():
+              run, attempt = (os.environ[name] for name in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
+              assert all(re.fullmatch(r"[1-9][0-9]{0,18}", value) for value in (run, attempt))
+              return f"issue42_witness_r{run}_a{attempt}"
+
+          def psql(db, sql):
+              container = os.environ["PG_CONTAINER"]
+              assert digest(container, 64)
+              result = subprocess.run(
+                  ["docker", "exec", "-i", container, "psql", "-XqAt", "-h", "127.0.0.1",
+                   "-U", "rootyard", "-d", db, "-v", "ON_ERROR_STOP=1"],
+                  input=sql + "\n", capture_output=True, text=True, check=True, timeout=20,
+              )
+              return result.stdout.strip()
+
+          def database_exists(db):
+              present = psql("postgres", f"SELECT EXISTS (SELECT FROM pg_database WHERE datname = '{db}');")
+              assert present in ("t", "f")
+              return present == "t"
+
+          def prepare_database():
+              db = database()
+              assert (WORK / "provenance.json").is_file()
+              assert not database_exists(db)
+              with (WORK / "owned-db").open("x") as claim:
+                  claim.write(db)
+              psql("postgres", f'CREATE DATABASE "{db}";')
+              migration = (ROOT / "migrations/085_cluster_authority.sql").read_text().splitlines()
+              assert migration[-1] == "INSERT INTO schema_migrations (version) VALUES (85) ON CONFLICT DO NOTHING;"
+              psql(db, "BEGIN;\nSET LOCAL search_path = public;\n" + "\n".join(migration[:-1]) + "\nCOMMIT;")
+              assert psql(db, """SELECT count(*) = 1 FROM public.cluster_authority
+                WHERE singleton AND incarnation <> '00000000-0000-0000-0000-000000000000';""") == "t"
+
+          def supervisor_proof(raw, pid, exit_code):
+              try:
+                  if not raw.endswith(b"\n"):
+                      return "unproven", None, None
+                  frames = [json.loads(line) for line in raw.splitlines()]
+                  if not all(isinstance(frame, dict) and frame.get("supervisor_pid") == pid for frame in frames):
+                      return "unproven", None, None
+                  events = [frame.get("event") for frame in frames]
+                  if events == ["refused"] and exit_code == 3:
+                      if frames[0].get("reason") == "preflight-failed" and frames[0].get("leader_started") is False:
+                          return "not_started", None, "preflight-failed"
+                  if (len(events) >= 2 and events[0] == "ready" and events[-1] == "quit"
+                          and all(event == "progress" for event in events[1:-1])
+                          and frames[0].get("resource_fds") == 1):
+                      quit_frame = frames[-1]
+                      leader, reason = quit_frame.get("leader_exit"), quit_frame.get("reason")
+                      if (type(leader) is int and -64 <= leader <= 255 and reason in REASONS
+                              and quit_frame.get("cleanup") == "quiescent"
+                              and quit_frame.get("resources_closed") is True
+                              and exit_code == (0 if leader == 0 else 3)):
+                          return "quiescent", leader, reason
+              except (ValueError, TypeError):
+                  pass
+              return "unproven", None, None
+
+          def classify(stdout, stderr, leader, reason, transport_failure):
+              stdout = stdout.decode("utf-8", errors="replace").splitlines()
+              stderr = stderr.decode("utf-8", errors="replace").splitlines()
+              lines = [line.removeprefix("Error: ") for line in stdout + stderr]
+              cleanup_failed = any(line.startswith(CLEANUP) for line in lines)
+              if transport_failure or reason != "cli-exit" or leader not in (0, 101):
+                  return "invalid_run", None, None, cleanup_failed
+              rows = [SUMMARY.fullmatch(line) for line in stdout if line.startswith("test result:")]
+              cases = [line for line in stdout if line.startswith("test ") and not line.startswith("test result:")]
+              running = [line for line in stdout if line.startswith("running ")]
+              if len(rows) != 1 or rows[0] is None or running != ["running 1 test"]:
+                  return "invalid_run", None, None, cleanup_failed
+              state, *counts = rows[0].groups()
+              counts = [int(value) for value in counts]
+              if (leader, state, counts, cases) == (0, "ok", [1, 0, 0, 0], [f"test {CASE} ... ok"]):
+                  return "unexpected_pass", "both_ok", counts, cleanup_failed
+              if (leader, state, counts, cases) != (101, "FAILED", [0, 1, 0, 0], [f"test {CASE} ... FAILED"]):
+                  return "invalid_run", None, counts, cleanup_failed
+              failure = []
+              headings = [i for i, line in enumerate(stdout) if line == "failures:"]
+              header = f"---- {CASE} stdout ----"
+              if len(headings) == 2 and stdout.count(header) == 1:
+                  capture = stdout.index(header)
+                  if headings[0] < capture < headings[1]:
+                      failure = [line.removeprefix("Error: ") for line in stdout[capture + 1:headings[1]]]
+              if (failure.count(STALE) == 1 and lines.count(STALE) == 1
+                      and not any("panicked at" in line for line in lines)):
+                  return ("cleanup_failed" if cleanup_failed else "expected_red"), "b_stale", counts, cleanup_failed
+              return "unexpected_failure", None, counts, cleanup_failed
+
+          def supervise(environment):
+              limits = {"stdout": 1024 * 1024, "stderr": 1024 * 1024, "status": 256 * 1024}
+              captured = {name: bytearray() for name in limits}
+              overflow = set()
+              started = time.monotonic()
+              deadline = started + TEST_SECONDS + PROOF_GRACE
+              exit_code = None
+              with contextlib.ExitStack() as stack:
+                  lease = stack.enter_context((WORK / "fixture.lock").open("xb"))
+                  fcntl.flock(lease, fcntl.LOCK_EX)
+                  control_read, control_write = (stack.enter_context(os.fdopen(fd, "rb" if i == 0 else "wb"))
+                                                 for i, fd in enumerate(os.pipe()))
+                  status_read, status_write = (stack.enter_context(os.fdopen(fd, "rb" if i == 0 else "wb"))
+                                               for i, fd in enumerate(os.pipe()))
+                  command = [
+                      sys.executable, str(ROOT / "scripts/native_acceptance_supervisor.py"),
+                      "--timeout", str(TEST_SECONDS), "--resource-fd", str(lease.fileno()),
+                      "--parent-control-fd", str(control_read.fileno()), "--status-fd", str(status_write.fileno()),
+                      "--", str(LIB), "--ignored", "--exact", CASE, "--test-threads=1",
+                  ]
+                  (WORK / "process-armed").touch(exist_ok=False)
+                  proc = subprocess.Popen(
+                      command, cwd=ROOT, env=environment,
+                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                      pass_fds=(lease.fileno(), control_read.fileno(), status_write.fileno()),
+                  )
+                  control_read.close()
+                  status_write.close()
+                  streams = stack.enter_context(selectors.DefaultSelector())
+                  for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr), ("status", status_read)):
+                      stack.enter_context(stream)
+                      streams.register(stream, selectors.EVENT_READ, name)
+                  while streams.get_map() and time.monotonic() < deadline:
+                      for key, _ in streams.select(max(0, deadline - time.monotonic())):
+                          chunk = os.read(key.fd, 16384)
+                          name = key.data
+                          if not chunk:
+                              streams.unregister(key.fileobj)
+                          elif name not in overflow:
+                              if len(captured[name]) + len(chunk) <= limits[name]:
+                                  captured[name].extend(chunk)
+                              else:
+                                  overflow.add(name)
+                                  captured[name].clear()
+                                  control_write.close()
+                                  deadline = min(deadline, time.monotonic() + PROOF_GRACE)
+                  complete = not streams.get_map()
+                  if complete:
+                      try:
+                          exit_code = proc.wait(timeout=max(0, deadline - time.monotonic()))
+                      except subprocess.TimeoutExpired:
+                          complete = False
+                  proof, leader, reason = supervisor_proof(captured["status"], proc.pid, exit_code)
+              failure = "output_overflow" if overflow else ("supervisor_deadline" if not complete else None)
+              if proof == "unproven" and failure is None:
+                  failure = "missing_process_proof"
+              return captured, proof, leader, reason, failure, int((time.monotonic() - started) * 1000)
+
+          def run_case():
+              import native_build_receipt as receipts
+
+              assert checkout_is_clean(receipts)
+              build = read("provenance.json")
+              assert receipts.sha256_file(LIB) == build["binary_sha256"]
+              assert receipts.sha256_file(RECEIPT) == build["receipt_sha256"]
+              assert receipts.sha256_file(os.environ["ROOTYARD_TEST_GIT"]) == build["git_sha256"]
+              environment = {key: value for key, value in os.environ.items()
+                             if not key.startswith(("RUST_TEST_", "NATIVE_ACCEPTANCE_SUPERVISOR_"))}
+              environment.update({
+                  "ROOTYARD_TEST_DATABASE_URL": "postgresql://rootyard@127.0.0.1:55432/" + database(),
+                  "ROOTYARD_BLOB_DRIVER": "opendal", "ROOTYARD_BLOB_SERVICE": "s3",
+                  "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB": "1",
+                  "RUST_BACKTRACE": "0", "RUST_LIB_BACKTRACE": "0",
+              })
+              for target, source in (
+                  ("ENDPOINT", "ENDPOINT"), ("BUCKET", "BUCKET"), ("REGION", "REGION"),
+                  ("ACCESS_KEY_ID", "ACCESS_KEY"), ("SECRET_ACCESS_KEY", "SECRET_KEY"),
+              ):
+                  environment[f"ROOTYARD_BLOB_{target}"] = os.environ[f"ROOTYARD_OBJECT_STORE_{source}"]
+              output, proof, leader, reason, failure, elapsed = supervise(environment)
+              write("process-proof.json", {"process": proof})
+              verdict, observed, counts, cleanup_failed = classify(
+                  output["stdout"], output["stderr"], leader, reason, failure)
+              write("case.json", {"verdict": verdict, "observed": observed, "counts": counts,
+                                  "cleanup_failed": cleanup_failed, "leader_exit": leader,
+                                  "reason": reason, "transport": failure, "elapsed_ms": elapsed})
+
+          def cleanup_fixtures(process):
+              claim, garage, env = (WORK / name for name in ("owned-db", "garage", "garage.env"))
+              schema = pg = blob = "not_started"
+              if process == "unproven":
+                  return "unchecked", "runner_teardown", "runner_teardown"
+              if claim.exists():
+                  schema, pg = "unchecked", "failed"
+                  try:
+                      db = database()
+                      assert claim.read_text() == db
+                      if database_exists(db):
+                          absent = psql(db, """SELECT NOT EXISTS (
+                            SELECT FROM pg_namespace WHERE nspname ~ '^blob_git_gateway_[0-9a-f]{32}$');""")
+                          assert absent in ("t", "f")
+                          schema = "absent" if absent == "t" else "retained"
+                          psql("postgres", f'DROP DATABASE "{db}" WITH (FORCE);')
+                      if not database_exists(db):
+                          pg = "removed"
+                  except (AssertionError, OSError, subprocess.SubprocessError):
+                      pass
+              if garage.exists() or garage.is_symlink() or env.exists() or env.is_symlink():
+                  blob = "failed"
+                  try:
+                      subprocess.run(
+                          [str(ROOT / "scripts/owned_garage_fixture.sh"), "stop", "--directory", str(garage)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=45,
+                      )
+                      if not any(path.exists() or path.is_symlink() for path in (garage, env)):
+                          blob = "removed"
+                  except (OSError, subprocess.SubprocessError):
+                      pass
+              return schema, pg, blob
+
+          def number(value):
+              return value if type(value) is int and -(2**63) <= value < 2**63 else None
+
+          def number_list(value, length):
+              if isinstance(value, list) and len(value) == length and all(number(item) is not None for item in value):
+                  return value
+              return None
+
+          def choice(value, *allowed):
+              return value if value in allowed else None
+
+          def finalize():
+              build, case = read("provenance.json"), read("case.json")
+              process = choice(read("process-proof.json").get("process"), "quiescent", "not_started", "unproven")
+              process = process or ("unproven" if (WORK / "process-armed").exists() else "not_started")
+              schema, pg, blob = cleanup_fixtures(process)
+              verdict = choice(case.get("verdict"), "expected_red", "unexpected_pass", "unexpected_failure",
+                               "invalid_run", "cleanup_failed")
+              verdict = verdict or "invalid_run"
+              observed = choice(case.get("observed"), "b_stale", "both_ok")
+              if (case.get("cleanup_failed") is True or process == "unproven"
+                      or schema == "retained" or pg == "failed" or blob == "failed"):
+                  verdict = "cleanup_failed"
+              if verdict in ("expected_red", "unexpected_pass") and (schema, pg, blob) != ("absent", "removed", "removed"):
+                  verdict = "cleanup_failed"
+              identity = {name.lower(): digest(os.environ.get(name), 40)
+                          for name in ("TRIGGER_SHA", "WORKFLOW_SHA", "SOURCE_SHA", "SOURCE_TREE")}
+              hashes = {key: digest(build.get(key), 64) for key in HASH_FIELDS}
+              version = number_list(build.get("git_version"), 3)
+              counts = number_list(case.get("counts"), 4)
+              leader_exit = number(case.get("leader_exit"))
+              reason = choice(case.get("reason"), *REASONS, "preflight-failed")
+              transport = choice(case.get("transport"), "output_overflow", "supervisor_deadline", "missing_process_proof")
+              if verdict == "expected_red" and not (
+                  process == "quiescent" and leader_exit == 101 and reason == "cli-exit" and transport is None
+                  and observed == "b_stale" and counts == [0, 1, 0, 0]
+                  and all(identity.values()) and all(hashes.values()) and version
+              ):
+                  verdict = "invalid_run"
+              write("outcome.json", {
+                  "schema": "rootyard/issue42-witness/v1", "outcome": verdict, "selector": CASE,
+                  "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+                  **identity, **hashes, "git_version": version,
+                  "observed": observed, "counts_passed_failed_ignored_measured": counts,
+                  "leader_exit": leader_exit, "elapsed_ms": number(case.get("elapsed_ms")),
+                  "reason": reason, "transport": transport,
+                  "cleanup": {"process": process, "schema": schema, "postgres": pg, "garage": blob},
+              })
+              print(f"Issue 42 witness outcome: {verdict}")
+              return 0 if verdict == "expected_red" else 1
+
+          if __name__ == "__main__":
+              sys.path.insert(0, str(ROOT / "scripts"))
+              mode = {"provenance": provenance, "prepare-db": prepare_database, "run": run_case,
+                      "finalize": finalize}[sys.argv[1]]
+              try:
+                  sys.exit(mode())
+              except Exception:
+                  sys.exit("Issue 42 witness driver failed")
+          PY
+      - uses: actions/checkout@v4
+        timeout-minutes: 3
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Install stock Git and the pinned build tools
+        timeout-minutes: 23
+        run: |
+          exec >/dev/null 2>&1
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git
+          test -x "$ROOTYARD_TEST_GIT"
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          bash scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/issue42-witness/cargo-fork" --require-os linux
+      - name: Build and bind the frozen witness libtest
+        timeout-minutes: 26
+        run: |
+          exec >/dev/null 2>&1
+          work="$RUNNER_TEMP/issue42-witness"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          bash scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$work/cargo-fork" --require-os linux --require-path
+          python3 scripts/build_native_test.py --lib --no-default-features --package-debug 0 --strip-debuginfo \
+            --artifact-store "$work/store" --output "$work/witness-lib"
+          python3 "$work/qualify.py" provenance
+      - name: Prepare disposable PostgreSQL and Garage fixtures
+        timeout-minutes: 14
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          exec >/dev/null 2>&1
+          work="$RUNNER_TEMP/issue42-witness"
+          python3 "$work/qualify.py" prepare-db
+          scripts/owned_garage_fixture.sh start --directory "$work/garage" \
+            --output-env "$work/garage.env" --bucket-prefix issue42-witness --region garage
+      - name: Supervise exactly the independent-ref witness
+        timeout-minutes: 12
+        run: |
+          exec >/dev/null 2>&1
+          work="$RUNNER_TEMP/issue42-witness"
+          set -a
+          . "$work/garage.env"
+          set +a
+          python3 "$work/qualify.py" run
+      - name: Dispose fixtures and report the redacted outcome
+        if: always()
+        timeout-minutes: 4
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: python3 "$RUNNER_TEMP/issue42-witness/qualify.py" finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        timeout-minutes: 2
+        with:
+          name: issue42-witness-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue42-witness/outcome.json
+          if-no-files-found: error
+          retention-days: 7
