@@ -187,8 +187,8 @@ pub fn seed_gate_and_commit(
     let mut prev: Option<GitOid> = None;
     for (idx, hex_oid) in commits.iter().enumerate() {
         let oid = GitOid::parse(GitObjectFormat::Sha256, hex_oid)?;
-        let pre = prev.clone().map_or(RefPrecondition::Absent, RefPrecondition::Present);
-        let upd = RefUpdate::new(RefName::new("refs/heads/main")?, pre, RefTarget::Oid(oid.clone()));
+        let pre = prev.map_or(RefPrecondition::Absent, RefPrecondition::Present);
+        let upd = RefUpdate::new(RefName::new("refs/heads/main")?, pre, RefTarget::Oid(oid));
         let req = CommitRefsRequest::new(
             repo,
             tenant,

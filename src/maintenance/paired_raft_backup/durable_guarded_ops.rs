@@ -84,7 +84,7 @@ pub async fn upsert_repo_access_collaborator_guarded(
             "PostgreSQL durable paired_backup_freeze / read_only fence active; concurrent repo_access write rejected",
         ));
     }
-    let tx = (&mut **client).transaction().await.map_err(pg_err)?;
+    let tx = tokio_postgres::Client::transaction(&mut client).await.map_err(pg_err)?;
     let _ = tx
         .query_opt(
             "SELECT version FROM public.ref_store_decision_scopes \

@@ -1,13 +1,13 @@
 //! OpenDAL S3 + real stock Git (`SHA-1`/`SHA-256`) + live PG 17 integration tests (#153).
 
 #[path = "paired_raft_backup_support/fixture.rs"]
-mod fixture;
+pub mod fixture;
 #[path = "paired_raft_backup_support/format30_e2e.rs"]
-mod format30_e2e;
+pub mod format30_e2e;
 #[path = "paired_raft_backup_support/format30_helpers.rs"]
-mod format30_helpers;
+pub mod format30_helpers;
 #[path = "paired_raft_backup_support/mtls_cluster.rs"]
-mod mtls_cluster;
+pub mod mtls_cluster;
 
 use std::fs;
 

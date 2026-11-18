@@ -294,9 +294,9 @@ fn boot_active_and_peer_mtls_raft_incarnation(
     active_raft.write_freeze_record(&boot_thaw)?;
 
     for peer in &manifest.raft_cutpoint.peer_groups {
-        let pr = peer_rafts.get_mut(&peer.group_id).ok_or_else(|| {
-            PairedBackupError::IncompleteCut("missing booted 3-voter mTLS Raft cluster for peer group")
-        })?;
+        let pr = peer_rafts
+            .get_mut(&peer.group_id)
+            .ok_or(PairedBackupError::IncompleteCut("missing booted 3-voter mTLS Raft cluster for peer group"))?;
         boot_single_peer_mtls_raft(pr, peer, inc, &boot_thaw)?;
     }
     Ok(git_verified_refs)
@@ -385,7 +385,7 @@ fn replay_repo_onto_booted_raft(
                 rev,
                 HeadUpdate::Keep,
                 CommitMode::Atomic,
-                vec![RefUpdate::new(rn.clone(), RefPrecondition::Present(oid.clone()), RefTarget::Oid(oid.clone()))],
+                vec![RefUpdate::new(rn.clone(), RefPrecondition::Present(oid), RefTarget::Oid(oid))],
             )
             .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
             raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
