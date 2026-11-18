@@ -5,11 +5,14 @@ crash-recoverable ownership transfer against the real binary and PostgreSQL."""
 import argparse
 import base64
 import concurrent.futures
+from contextlib import ExitStack
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
+import subprocess
 import sys
 import time
 import traceback
@@ -23,10 +26,60 @@ if str(TESTS_DIR) not in sys.path:
 from web_sessions import BrowserHarness  # noqa: E402
 
 LFS_MIME = "application/vnd.git-lfs+json"
+REMOTE_TENANT_LFS_CASE = "remote_tenant_lfs_cold_retention"
+OBJECT_STORE_FIELDS = tuple(
+    "ROOTYARD_OBJECT_STORE_" + field for field in ("ENDPOINT", "BUCKET", "REGION", "ACCESS_KEY", "SECRET_KEY")
+)
 
 
 def quote(value):
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def remote_tenant_lfs_env(environ):
+    fixture = {name: environ.get(name, "") for name in OBJECT_STORE_FIELDS}
+    if not all(value and value == value.strip() for value in fixture.values()):
+        raise ValueError("remote tenant LFS requires explicit object-store fixture settings")
+    try:
+        endpoint = urllib.parse.urlsplit(fixture["ROOTYARD_OBJECT_STORE_ENDPOINT"])
+        port = endpoint.port
+    except ValueError:
+        raise ValueError("remote tenant LFS requires a loopback HTTP object-store origin") from None
+    if not port or fixture["ROOTYARD_OBJECT_STORE_ENDPOINT"] != f"http://127.0.0.1:{port}":
+        raise ValueError("remote tenant LFS requires a loopback HTTP object-store origin")
+    return fixture
+
+
+def verify_owned_lfs_cache(root, repository_id, payload, *, evict=False):
+    oid = hashlib.sha256(payload).hexdigest()
+    uid = os.geteuid()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as owners:
+        directory = os.open(root, directory_flags)
+        owners.callback(os.close, directory)
+        if os.fstat(directory).st_uid != uid:
+            raise ValueError("LFS scratch directory is not owned")
+        for component in ("data", "lfs", str(uuid.UUID(repository_id))):
+            directory = os.open(component, directory_flags, dir_fd=directory)
+            owners.callback(os.close, directory)
+            if os.fstat(directory).st_uid != uid:
+                raise ValueError("LFS cache directory is not owned")
+        entry = os.stat(oid, dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISREG(entry.st_mode) or entry.st_uid != uid or entry.st_nlink != 1:
+            raise ValueError("LFS cache is not an owned regular file")
+        fd = os.open(oid, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        owners.callback(os.close, fd)
+        if not os.path.samestat(entry, os.fstat(fd)) or os.read(fd, len(payload) + 1) != payload:
+            raise ValueError("LFS cache bytes do not match the fixture")
+        if evict:
+            if not os.path.samestat(entry, os.stat(oid, dir_fd=directory, follow_symlinks=False)):
+                raise ValueError("LFS cache was replaced before eviction")
+            os.unlink(oid, dir_fd=directory)
+            try:
+                os.stat(oid, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            raise ValueError("LFS cache still exists after eviction")
 
 
 class RepositoryLifecycleHarness(BrowserHarness):
@@ -347,27 +400,28 @@ class RepositoryLifecycleHarness(BrowserHarness):
         shared_oid = self.batch_upload("alice", "shared-a", shared_payload, self.alice)
         self.batch_upload("alice", "shared-b", shared_payload, self.alice)
 
-        peer_repo = self.create_repository({"owner": "charlie", "name": "purge-peer"}, token=self.charlie)
-        alice_tenant, peer_tenant = self.alice["user_id"], self.charlie["user_id"]
-        assert alice_tenant != peer_tenant
-        peer_payload = b"cross-tenant-purge-lfs-" * 64
-        alice_oid = self.batch_upload("alice", "shared-a", peer_payload, self.alice)
-        peer_oid = self.batch_upload("charlie", "purge-peer", peer_payload, self.charlie)
-        assert alice_oid == peer_oid == hashlib.sha256(peer_payload).hexdigest()
-        assert peer_oid != shared_oid
-        bindings = self.sql(
-            "SELECT repository_id::text || ':' || tenant_id::text || ':' || size::text || ':' || state "
-            f"FROM lfs_objects WHERE oid = {quote(peer_oid)}"
-        ).splitlines()
-        assert set(bindings) == {
-            f"{repo_a['id']}:{alice_tenant}:{len(peer_payload)}:ready",
-            f"{peer_repo['id']}:{peer_tenant}:{len(peer_payload)}:ready",
-        }
-        object_path = f"/info/lfs/objects/{peer_oid}/{len(peer_payload)}"
-        peer_download = f"/git/charlie/purge-peer.git{object_path}"
-        assert self.expect(f"/git/alice/shared-a.git{object_path}", 200, token=self.alice) == peer_payload
-        self.expect(peer_download, 404, token=self.alice)
-        assert self.expect(peer_download, 200, token=self.charlie) == peer_payload
+        if self.args.remote_tenant_lfs:
+            peer_repo = self.create_repository({"owner": "charlie", "name": "purge-peer"}, token=self.charlie)
+            alice_tenant, peer_tenant = self.alice["user_id"], self.charlie["user_id"]
+            assert alice_tenant != peer_tenant
+            peer_payload = b"cross-tenant-purge-lfs-" * 64
+            alice_oid = self.batch_upload("alice", "shared-a", peer_payload, self.alice)
+            peer_oid = self.batch_upload("charlie", "purge-peer", peer_payload, self.charlie)
+            assert alice_oid == peer_oid == hashlib.sha256(peer_payload).hexdigest()
+            assert peer_oid != shared_oid
+            bindings = self.sql(
+                "SELECT repository_id::text || ':' || tenant_id::text || ':' || size::text || ':' || state "
+                f"FROM lfs_objects WHERE oid = {quote(peer_oid)}"
+            ).splitlines()
+            assert set(bindings) == {
+                f"{repo_a['id']}:{alice_tenant}:{len(peer_payload)}:ready",
+                f"{peer_repo['id']}:{peer_tenant}:{len(peer_payload)}:ready",
+            }
+            object_path = f"/info/lfs/objects/{peer_oid}/{len(peer_payload)}"
+            peer_download = f"/git/charlie/purge-peer.git{object_path}"
+            assert self.expect(f"/git/alice/shared-a.git{object_path}", 200, token=self.alice) == peer_payload
+            self.expect(peer_download, 404, token=self.alice)
+            assert self.expect(peer_download, 200, token=self.charlie) == peer_payload
 
         work_a = self.root / "shared-a-work"
         base_a = self.push_file("alice", "shared-a", work_a, "data.txt", "keep me\n", "main", "seed a", self.alice)
@@ -493,13 +547,19 @@ class RepositoryLifecycleHarness(BrowserHarness):
             200,
             token=self.alice,
         ) == shared_payload
-        assert self.expect(peer_download, 200, token=self.charlie) == peer_payload
-        return {
+        detail = {
             "blocked_hold_kinds": sorted(hold_kinds),
             "purged_repo": repo_a["id"],
             "restored_collaborator_role": "read",
-            "different_tenant_lfs_retained": True,
         }
+        if self.args.remote_tenant_lfs:
+            assert purged["deleted_lfs_keys"] == 1 and purged["preserved_shared_lfs_keys"] == 1
+            verify_owned_lfs_cache(self.root, peer_repo["id"], peer_payload, evict=True)
+            status, body, _ = self.raw_http(peer_download, token=self.charlie)
+            assert status == 200 and body == peer_payload, "cold LFS download did not return the fixture bytes"
+            verify_owned_lfs_cache(self.root, peer_repo["id"], peer_payload)
+            detail[REMOTE_TENANT_LFS_CASE] = True
+        return detail
 
     def ownership_transfer_and_crash_recovery(self):
         org = self.doc("/api/orgs", 201, token=self.alice, method="POST", body={"slug": "dest-org"}, extra_headers={"Idempotency-Key": "org-dest"})
@@ -1266,18 +1326,84 @@ class RepositoryLifecycleHarness(BrowserHarness):
         return {"parity_repo": repo["id"], "ws_uncertain_kept_closed": ws_uncertain}
 
 
+def run_remote_tenant_lfs(args, fixture):
+    h = None
+    passed = False
+    binary_sha256 = source_head = None
+    try:
+        binary_sha256 = hashlib.sha256(Path(args.binary).read_bytes()).hexdigest()
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"], cwd=TESTS_DIR.parent,
+            capture_output=True, check=True, text=True, timeout=5,
+        ).stdout.strip()
+        if len(head) != 40 or any(char not in "0123456789abcdef" for char in head):
+            raise ValueError("remote tenant LFS source commit is invalid")
+        source_head = head
+        h = RepositoryLifecycleHarness(args)
+        h.env = {
+            name: value for name, value in h.env.items()
+            if not name.startswith(("AWS_", "ROOTYARD_OBJECT_STORE_"))
+        }
+        h.env.update(fixture)
+        h.setup()
+        h.charlie = h.account("create-user", "charlie")
+        passed = h.soft_delete_restore_and_purge_holds().get(REMOTE_TENANT_LFS_CASE) is True
+    except Exception:
+        print("remote tenant LFS qualification failed", file=sys.stderr)
+    finally:
+        if h is not None:
+            try:
+                h.cleanup()
+            except Exception:
+                passed = False
+                print("remote tenant LFS scratch cleanup failed", file=sys.stderr)
+    report = {
+        "passed": passed,
+        "cases": [{
+            "name": REMOTE_TENANT_LFS_CASE,
+            "status": "passed" if passed else "failed",
+            "detail": {REMOTE_TENANT_LFS_CASE: passed},
+        }],
+        "binary_sha256": binary_sha256,
+        "source_head": source_head,
+    }
+    try:
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(report, indent=2) + "\n")
+    except OSError:
+        print("remote tenant LFS report write failed", file=sys.stderr)
+        return 1
+    print(json.dumps(report, indent=2))
+    return 0 if passed else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rootyard")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--remote-tenant-lfs", action="store_true",
+        help="Run only the soft-delete case with an explicit loopback object-store fixture",
+    )
     args = parser.parse_args()
+    fixture = None
+    if args.remote_tenant_lfs:
+        if args.keep or not __debug__:
+            parser.error("--remote-tenant-lfs requires scratch cleanup and enabled assertions")
+        try:
+            fixture = remote_tenant_lfs_env(os.environ)
+        except ValueError as exc:
+            parser.error(str(exc))
     args.binary = str(Path(args.binary).resolve())
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
         parser.error("ROOTYARD_TEST_DATABASE_URL is required; use a dedicated test database")
     for exe in ("git", "git-lfs", "psql", args.binary):
         if not shutil.which(exe):
             parser.error("Required executable not found: " + exe)
+    if fixture is not None:
+        return run_remote_tenant_lfs(args, fixture)
     h = RepositoryLifecycleHarness(args)
     passed = False
     try:
