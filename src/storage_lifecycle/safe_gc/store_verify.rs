@@ -103,13 +103,16 @@ impl SafeGcRepoSnapshot {
 
     pub(super) fn verify_staging_cleanup_ticket(&self, ticket: &DeleteAuthorizationTicket) -> Result<(), SafeGcError> {
         let arm = self.gc_mode.require_armed()?;
-        if arm.incarnation_id != self.authority.incarnation_id
+        if ticket.proof_digest() != arm.arm_digest
+            || arm.incarnation_id != self.authority.incarnation_id
             || arm.incarnation_epoch != self.authority.incarnation_epoch
             || self.authority.incarnation_id != ticket.incarnation_id()
             || self.authority.incarnation_epoch != ticket.incarnation_epoch()
             || self.authority.lease_epoch != ticket.lease_epoch()
         {
-            return Err(SafeGcError::StaleDeleterFenced("staging cleanup ticket fenced by exact epoch mismatch"));
+            return Err(SafeGcError::StaleDeleterFenced(
+                "staging cleanup ticket fenced by exact epoch or arm_digest mismatch",
+            ));
         }
         if self
             .active_packs

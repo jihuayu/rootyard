@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
@@ -16,6 +17,64 @@ use super::{
     refcas_cut::RefCasReconciledCut,
     store::DurableSafeGcAuthority,
 };
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciledSourceTracker {
+    #[serde(default)]
+    pub sql_hold_ids: BTreeSet<Uuid>,
+    #[serde(default)]
+    pub sql_decision_ids: BTreeSet<Uuid>,
+    #[serde(default)]
+    pub sm_hold_ids: BTreeSet<Uuid>,
+    #[serde(default)]
+    pub sm_decision_ids: BTreeSet<Uuid>,
+    #[serde(default)]
+    pub sm_pin_oids: BTreeSet<String>,
+}
+
+fn replace_reconciled_holds(
+    target: &mut Vec<GlobalHoldEntry>,
+    prev_source_ids: &mut BTreeSet<Uuid>,
+    other_source_ids: &BTreeSet<Uuid>,
+    incoming: Vec<GlobalHoldEntry>,
+) {
+    let next_ids: BTreeSet<Uuid> = incoming.iter().map(|h| h.hold_id).collect();
+    target.retain(|h| {
+        !prev_source_ids.contains(&h.hold_id) || next_ids.contains(&h.hold_id) || other_source_ids.contains(&h.hold_id)
+    });
+    for hold in incoming {
+        if let Some(slot) = target.iter_mut().find(|h| h.hold_id == hold.hold_id) {
+            *slot = hold;
+        } else {
+            target.push(hold);
+        }
+    }
+    *prev_source_ids = next_ids;
+}
+
+fn replace_reconciled_decisions(
+    target: &mut Vec<InFlightDecisionRecord>,
+    prev_source_ids: &mut BTreeSet<Uuid>,
+    other_source_ids: &BTreeSet<Uuid>,
+    incoming: Vec<InFlightDecisionRecord>,
+) {
+    let next_ids: BTreeSet<Uuid> = incoming.iter().map(|d| d.decision_id).collect();
+    let mut map: BTreeMap<Uuid, InFlightDecisionRecord> = target
+        .drain(..)
+        .filter(|d| {
+            !prev_source_ids.contains(&d.decision_id)
+                || next_ids.contains(&d.decision_id)
+                || other_source_ids.contains(&d.decision_id)
+        })
+        .map(|d| (d.decision_id, d))
+        .collect();
+    for dec in incoming {
+        map.insert(dec.decision_id, dec);
+    }
+    *target = map.into_values().collect();
+    *prev_source_ids = next_ids;
+}
 
 impl DurableSafeGcAuthority {
     pub(super) fn apply_refcas_quorum_refs(
@@ -45,26 +104,34 @@ impl DurableSafeGcAuthority {
         self.update_persisted(|s| {
             s.live_refs = live_refs;
             s.authority.live_ref_seq = s.authority.live_ref_seq.max(cut.sm_applied_log_index);
+            let next_pins: BTreeSet<String> = sm_pin_oids.into_iter().collect();
             for prod in &mut s.producers {
-                if prod.producer == RetentionProducer::Workspace && !sm_pin_oids.is_empty() {
-                    let mut merged: BTreeSet<String> = prod.root_oids.iter().cloned().collect();
-                    merged.extend(sm_pin_oids.iter().cloned());
+                if prod.producer == RetentionProducer::Workspace {
+                    let mut merged: BTreeSet<String> = prod
+                        .root_oids
+                        .iter()
+                        .filter(|o| !s.reconciled_sources.sm_pin_oids.contains(*o))
+                        .cloned()
+                        .collect();
+                    merged.extend(next_pins.iter().cloned());
                     prod.root_oids = merged.into_iter().collect();
                 }
             }
-            for hold in sm_holds {
-                if let Some(slot) = s.global_holds.iter_mut().find(|h| h.hold_id == hold.hold_id) {
-                    *slot = hold;
-                } else {
-                    s.global_holds.push(hold);
-                }
-            }
-            let mut merged_dec: BTreeMap<Uuid, InFlightDecisionRecord> =
-                s.in_flight_decisions.iter().cloned().map(|d| (d.decision_id, d)).collect();
-            for dec in sm_decisions {
-                merged_dec.insert(dec.decision_id, dec);
-            }
-            s.in_flight_decisions = merged_dec.into_values().collect();
+            s.reconciled_sources.sm_pin_oids = next_pins;
+            let other_holds = s.reconciled_sources.sql_hold_ids.clone();
+            replace_reconciled_holds(
+                &mut s.global_holds,
+                &mut s.reconciled_sources.sm_hold_ids,
+                &other_holds,
+                sm_holds,
+            );
+            let other_decs = s.reconciled_sources.sql_decision_ids.clone();
+            replace_reconciled_decisions(
+                &mut s.in_flight_decisions,
+                &mut s.reconciled_sources.sm_decision_ids,
+                &other_decs,
+                sm_decisions,
+            );
             s.paired_cursors.refcas_freshness = SourceFreshness::Reconciled;
             s.paired_cursors.refcas_applied_index = cut.sm_applied_log_index;
             s.paired_cursors.refcas_required_index = cut.sm_applied_log_index;
@@ -80,19 +147,20 @@ impl DurableSafeGcAuthority {
             s.authority.live_ref_seq = bundle.max_ref_seq.max(s.authority.live_ref_seq);
             s.producers = bundle.producers;
             s.paired_cursors = bundle.cursors;
-            for hold in bundle.sql_holds {
-                if let Some(slot) = s.global_holds.iter_mut().find(|h| h.hold_id == hold.hold_id) {
-                    *slot = hold;
-                } else {
-                    s.global_holds.push(hold);
-                }
-            }
-            let mut merged_decisions: BTreeMap<Uuid, InFlightDecisionRecord> =
-                s.in_flight_decisions.iter().cloned().map(|d| (d.decision_id, d)).collect();
-            for dec in bundle.sql_decisions {
-                merged_decisions.insert(dec.decision_id, dec);
-            }
-            s.in_flight_decisions = merged_decisions.into_values().collect();
+            let other_holds = s.reconciled_sources.sm_hold_ids.clone();
+            replace_reconciled_holds(
+                &mut s.global_holds,
+                &mut s.reconciled_sources.sql_hold_ids,
+                &other_holds,
+                bundle.sql_holds,
+            );
+            let other_decs = s.reconciled_sources.sm_decision_ids.clone();
+            replace_reconciled_decisions(
+                &mut s.in_flight_decisions,
+                &mut s.reconciled_sources.sql_decision_ids,
+                &other_decs,
+                bundle.sql_decisions,
+            );
 
             s.reader_leases.active_leases.retain(|_, l| l.reader_label != "pg_serving_read_pin");
             for lease in bundle.transient_reads {

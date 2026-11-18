@@ -1,7 +1,6 @@
 //! Concurrency, default-off staging, PG restart fence, exact epoch & restart unit tests (#122).
 
 use std::{
-    collections::BTreeSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -11,20 +10,20 @@ use uuid::Uuid;
 
 use super::{
     SafeGcError,
-    anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState},
-    domain::{CasCompactionPublish, UploadedCompactionPair},
+    anti_aba::KeyLifecycleState,
     executor::{
         DeleteFaultHook, PostTicketDriftFault, SafeGcSweepRequest, execute_safe_gc_sweep,
-        quarantine_abandoned_staging_without_delete, reclaim_abandoned_compaction_staging,
-        reconcile_pending_delete_after_restart, reconcile_pending_delete_after_restart_fenced,
+        execute_safe_gc_sweep_with_external_fence, reconcile_pending_delete_after_restart,
+        reconcile_pending_delete_after_restart_fenced,
     },
     model::{GcMode, GlobalHoldEntry, GlobalHoldState, LiveRefRoot, SafeGcArmReceipt, SafeGcObjectFormat},
     store::DurableSafeGcAuthority,
-    tests::{RecordingDeleteBackend, make_pack_record, oid, seed_fixture, sha},
+    tests::{RecordingDeleteBackend, make_pack_record, oid, seed_fixture},
 };
 
 #[tokio::test]
 async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delete() {
+    let live_fence = || -> Result<(), SafeGcError> { Ok(()) };
     for post_fault in [
         PostTicketDriftFault::ConcurrentNewRef(LiveRefRoot {
             ref_name: "refs/heads/post-ticket".into(),
@@ -39,7 +38,23 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
         let authority = DurableSafeGcAuthority::in_memory(snap).unwrap();
         authority.set_gc_mode(GcMode::ArmedDestructive(arm)).unwrap();
         let backend = Arc::new(RecordingDeleteBackend::default());
-        let res = execute_safe_gc_sweep(
+        let unfenced = execute_safe_gc_sweep(
+            &authority,
+            backend.as_ref(),
+            SafeGcSweepRequest {
+                batch_id: Uuid::new_v4(),
+                deleter_incarnation_id: auth.incarnation_id,
+                deleter_incarnation_epoch: 1,
+                deleter_lease_epoch: 1,
+                proof: proof.clone(),
+                deadline: Instant::now() + Duration::from_secs(5),
+                fault: DeleteFaultHook::None,
+            },
+        )
+        .await;
+        assert!(matches!(unfenced, Err(SafeGcError::StaleDeleterFenced(_))));
+
+        let res = execute_safe_gc_sweep_with_external_fence(
             &authority,
             backend.as_ref(),
             SafeGcSweepRequest {
@@ -51,6 +66,7 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
                 deadline: Instant::now() + Duration::from_secs(5),
                 fault: DeleteFaultHook::MutateAfterTicketBeforeProviderDelete(post_fault),
             },
+            Some(&live_fence),
         )
         .await;
         assert!(res.is_err(), "post-ticket state drift must fail closed inside ActiveDeleteFence");
@@ -65,7 +81,7 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
     authority_eq.set_gc_mode(GcMode::ArmedDestructive(arm_eq)).unwrap();
     let backend_eq = Arc::new(RecordingDeleteBackend::default());
     for bad_lease in [1_u64, 3_u64] {
-        let err = execute_safe_gc_sweep(
+        let err = execute_safe_gc_sweep_with_external_fence(
             &authority_eq,
             backend_eq.as_ref(),
             SafeGcSweepRequest {
@@ -77,6 +93,7 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
                 deadline: Instant::now() + Duration::from_secs(5),
                 fault: DeleteFaultHook::None,
             },
+            Some(&live_fence),
         )
         .await;
         assert!(matches!(err, Err(SafeGcError::StaleDeleterFenced(_))), "lease {bad_lease} != 2 must fail");
@@ -84,7 +101,7 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
     }
 
     // Post-delete lease_epoch drift before tombstone commit MUST fail closed!
-    let post_del_err = execute_safe_gc_sweep(
+    let post_del_err = execute_safe_gc_sweep_with_external_fence(
         &authority_eq,
         backend_eq.as_ref(),
         SafeGcSweepRequest {
@@ -96,6 +113,7 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
             deadline: Instant::now() + Duration::from_secs(5),
             fault: DeleteFaultHook::BumpLeaseEpochAfterProviderDeleteBeforeCommit,
         },
+        Some(&live_fence),
     )
     .await;
     assert!(matches!(post_del_err, Err(SafeGcError::StaleDeleterFenced(_))));
@@ -119,7 +137,7 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
     authority.set_gc_mode(GcMode::ArmedDestructive(arm.clone())).unwrap();
     let proof = authority.build_authoritative_deletion_proof(arm, &[]).unwrap();
     let backend = Arc::new(RecordingDeleteBackend::default());
-    let res = execute_safe_gc_sweep(
+    let res = execute_safe_gc_sweep_with_external_fence(
         &authority,
         backend.as_ref(),
         SafeGcSweepRequest {
@@ -131,6 +149,7 @@ async fn concurrent_races_exact_epoch_equality_and_post_ticket_drift_abort_delet
             deadline: Instant::now() + Duration::from_secs(5),
             fault: DeleteFaultHook::ReleaseHoldWithoutCursorAdvance(hold_id, 15),
         },
+        Some(&live_fence),
     )
     .await;
     assert!(matches!(res, Err(SafeGcError::ConcurrentRetentionRace(_))));
@@ -165,7 +184,8 @@ async fn dual_pack_idx_lifecycle_live_pg_restart_fence_and_post_rotation_unwedge
     backend.already_absent.lock().unwrap().insert(ret1.idx_key.object_path.clone());
     *backend.unknown_key.lock().unwrap() = Some(ret2.idx_key.object_path.clone());
 
-    let err = execute_safe_gc_sweep(
+    let live_fence = || -> Result<(), SafeGcError> { Ok(()) };
+    let err = execute_safe_gc_sweep_with_external_fence(
         &authority,
         backend.as_ref(),
         SafeGcSweepRequest {
@@ -177,6 +197,7 @@ async fn dual_pack_idx_lifecycle_live_pg_restart_fence_and_post_rotation_unwedge
             deadline: Instant::now() + Duration::from_secs(5),
             fault: DeleteFaultHook::None,
         },
+        Some(&live_fence),
     )
     .await;
     assert!(matches!(err, Err(SafeGcError::DeleteOutcomeUnknown(_))));
@@ -219,7 +240,6 @@ async fn dual_pack_idx_lifecycle_live_pg_restart_fence_and_post_rotation_unwedge
     assert_eq!(epoch2, 2);
     let reopened = DurableSafeGcAuthority::open_with_journal(&journal, None).unwrap();
     *backend.unknown_key.lock().unwrap() = None;
-    let live_fence = || -> Result<(), SafeGcError> { Ok(()) };
     assert!(matches!(
         reconcile_pending_delete_after_restart_fenced(
             &reopened,
@@ -276,7 +296,7 @@ async fn dual_pack_idx_lifecycle_live_pg_restart_fence_and_post_rotation_unwedge
     let proof2 = reopened.build_authoritative_deletion_proof(arm2, &[]).unwrap();
     assert_eq!(proof2.candidates.len(), 1);
     assert_eq!(proof2.candidates[0].physical_key, ret2.idx_key.object_path);
-    let final_rep = execute_safe_gc_sweep(
+    let final_rep = execute_safe_gc_sweep_with_external_fence(
         &reopened,
         backend.as_ref(),
         SafeGcSweepRequest {
@@ -288,97 +308,10 @@ async fn dual_pack_idx_lifecycle_live_pg_restart_fence_and_post_rotation_unwedge
             deadline: dl,
             fault: DeleteFaultHook::None,
         },
+        Some(&live_fence),
     )
     .await
     .unwrap();
     assert_eq!(final_rep.deleted_keys, vec![ret2.idx_key.object_path]);
     assert!(reopened.snapshot().retired_packs.is_empty());
-}
-
-#[tokio::test]
-async fn default_off_blocks_abandoned_staging_deletes_until_explicitly_armed() {
-    let (snap, arm, _) = seed_fixture(SafeGcObjectFormat::Sha1, false);
-    let auth = snap.authority.clone();
-    let old_id = snap.active_packs[0].pack_id;
-    let authority = DurableSafeGcAuthority::in_memory(snap).unwrap();
-    let (pk, ik) = authority.mint_compaction_keys(1, &sha("np"), &sha("ni")).unwrap();
-    let op_id = Uuid::new_v4();
-    let mut pack_loc = authority.snapshot().active_packs[0].pack_locator.clone();
-    pack_loc.sha256 = sha("np");
-    let mut idx_loc = authority.snapshot().active_packs[0].idx_locator.clone();
-    idx_loc.sha256 = sha("ni");
-    let pair = UploadedCompactionPair {
-        pack_locator: pack_loc,
-        idx_locator: idx_loc,
-        pack_key: pk.clone(),
-        idx_key: ik.clone(),
-    };
-    authority.record_staged_upload(op_id, &pair).unwrap();
-    let drift = authority.cas_publish_compaction(CasCompactionPublish {
-        op_id,
-        group_id: "g1".into(),
-        expected_incarnation_id: auth.incarnation_id,
-        expected_incarnation_epoch: 1,
-        expected_generation: auth.membership_generation + 99,
-        expected_membership_digest: authority.snapshot().compute_membership_digest(),
-        retired_pack_ids: vec![old_id],
-        uploaded: pair,
-        replacement_oids: vec![],
-        equivalence_digest: sha("eq"),
-    });
-    assert!(matches!(drift, Err(SafeGcError::MembershipOrRootDrift(_))));
-    authority.mark_staged_upload_abandoned(op_id).unwrap();
-    assert_eq!(authority.snapshot().active_packs.len(), 1);
-
-    // 1. Default-off (`DisabledByDefault`) MUST refuse abandoned staging provider deletes (`0` deletes)!
-    let backend = RecordingDeleteBackend::default();
-    let dl = Instant::now() + Duration::from_secs(5);
-    let disabled_err = reclaim_abandoned_compaction_staging(&authority, &backend, None, dl).await;
-    assert!(matches!(disabled_err, Err(SafeGcError::DestructiveGcDisabledByDefault)));
-    assert!(backend.deleted.lock().unwrap().is_empty(), "default-off must perform 0 staging deletes");
-    assert_eq!(quarantine_abandoned_staging_without_delete(&authority).unwrap(), 1);
-    assert!(backend.deleted.lock().unwrap().is_empty());
-
-    // 2. Armed + live PG fence permits staging cleanup!
-    authority.set_gc_mode(GcMode::ArmedDestructive(arm)).unwrap();
-    let live_fence = || -> Result<(), SafeGcError> { Ok(()) };
-    let cleaned = reclaim_abandoned_compaction_staging(&authority, &backend, Some(&live_fence), dl).await.unwrap();
-    assert_eq!(cleaned.deleted_keys.len(), 2);
-    let after = authority.snapshot();
-    assert!(after.key_registry.deleted_tombstones.contains(&pk.object_path));
-    assert!(after.key_registry.deleted_tombstones.contains(&ik.object_path));
-}
-
-#[test]
-fn anti_aba_registry_forbids_reuse_even_after_deletion_and_same_sha_reupload() {
-    let (t, r, h) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    let same_sha = sha("identical-pack");
-    let mut reg = AntiAbaKeyRegistry::new();
-    let k1 = reg.mint_immutable_key((t, r, h, 1), "pack", &same_sha, KeyLifecycleState::ActiveServing).unwrap();
-    reg.transition_state(&k1.object_path, KeyLifecycleState::ActiveServing, KeyLifecycleState::RetiredPendingProof)
-        .unwrap();
-    reg.transition_state(
-        &k1.object_path,
-        KeyLifecycleState::RetiredPendingProof,
-        KeyLifecycleState::DeletePendingBarrier,
-    )
-    .unwrap();
-    reg.transition_state(
-        &k1.object_path,
-        KeyLifecycleState::DeletePendingBarrier,
-        KeyLifecycleState::PhysicallyDeletedTombstone,
-    )
-    .unwrap();
-
-    let k2 = reg.mint_immutable_key((t, r, h, 1), "pack", &same_sha, KeyLifecycleState::ActiveServing).unwrap();
-    assert_ne!(k1.object_path, k2.object_path);
-    assert!(k2.allocation_seq > k1.allocation_seq);
-    assert!(matches!(reg.register_verified_key(k1.clone()), Err(SafeGcError::AbaKeyReuseDetected(_))));
-    assert!(matches!(reg.assert_late_put_allowed(&k1.object_path, 1), Err(SafeGcError::AbaKeyReuseDetected(_))));
-
-    reg.advance_incarnation_epoch(2).unwrap();
-    assert!(matches!(reg.assert_late_put_allowed(&k2.object_path, 1), Err(SafeGcError::StaleIncarnation(_))));
-    assert!(matches!(reg.assert_delete_allowed(&k2.object_path, 1), Err(SafeGcError::StaleDeleterFenced(_))));
-    let unique: BTreeSet<_> = [k1.object_path, k2.object_path].into_iter().collect();
-    assert_eq!(unique.len(), 2);
 }

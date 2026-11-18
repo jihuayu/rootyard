@@ -130,9 +130,11 @@ pub async fn reconcile_refcas_cut_with_pg<C: GenericClient + Sync>(
         .ok_or(SafeGcError::IncompleteProof("refcas repository gate not initialized"))?;
     if gate.tenant_id != snap_before.authority.tenant_id
         || gate.history_incarnation != snap_before.authority.history_id
+        || gate.authority_epoch <= 0
+        || gate.authority_epoch as u64 != snap_before.authority.incarnation_epoch
         || gate.group_epoch <= 0
     {
-        return Err(SafeGcError::IncompleteProof("refcas gate realm disagrees with safe_gc authority"));
+        return Err(SafeGcError::IncompleteProof("refcas gate realm/epoch disagrees with safe_gc authority"));
     }
     let last_applied =
         sm_snap.body.last_applied.ok_or(SafeGcError::IncompleteProof("refcas has no applied log entries"))?;

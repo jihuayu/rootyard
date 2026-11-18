@@ -50,6 +50,9 @@ mod tests;
 #[cfg(test)]
 #[path = "safe_gc/tests_concurrency.rs"]
 mod tests_concurrency;
+#[cfg(test)]
+#[path = "safe_gc/tests_reconcile.rs"]
+mod tests_reconcile;
 
 pub use anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState, PhysicalBlobKey};
 pub use compaction::{SafeGcCompactionRequest, SafeGcCompactionResult, execute_two_phase_compaction};

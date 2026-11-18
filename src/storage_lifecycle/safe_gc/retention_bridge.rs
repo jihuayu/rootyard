@@ -212,7 +212,7 @@ pub fn build_pack_cover_retention_index(inputs: &PackCoverBridgeInputs<'_>) -> R
             p.freshness == SourceFreshness::Reconciled
                 && p.observed_cursor_seq >= p.required_cursor_seq
                 && p.authority_epoch == p.expected_authority_epoch
-                && p.expected_authority_epoch >= inputs.incarnation_epoch
+                && p.expected_authority_epoch == inputs.incarnation_epoch
         });
     let cursors_complete = inputs.paired_cursors.pg_freshness == SourceFreshness::Reconciled
         && inputs.paired_cursors.pg_applied_seq >= inputs.paired_cursors.pg_required_seq

@@ -225,9 +225,9 @@ async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, hdrs: Head
             let found = st.objects.lock().unwrap().get(&key).cloned();
             match found {
                 Some(obj) => {
-                    if if_match_hdr.as_deref().is_some_and(|im| im != obj.etag)
-                        || query_vid.as_deref().is_some_and(|qv| qv != obj.version_id)
-                    {
+                    if query_vid.as_deref().is_some_and(|qv| qv != obj.version_id) {
+                        (StatusCode::NOT_FOUND, None, 0, Body::empty())
+                    } else if if_match_hdr.as_deref().is_some_and(|im| im != obj.etag) {
                         (StatusCode::PRECONDITION_FAILED, None, 0, Body::empty())
                     } else {
                         if m == Method::HEAD {
@@ -459,6 +459,7 @@ pub fn build_snapshot(
         pending_delete: None,
         completed_batches: BTreeMap::new(),
         aborted_batches: BTreeMap::new(),
+        reconciled_sources: Default::default(),
         audit_log: vec![],
     }
 }

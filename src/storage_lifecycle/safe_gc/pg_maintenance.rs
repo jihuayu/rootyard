@@ -235,7 +235,11 @@ async fn execute_claimed_pg_refstore_job(state: &Arc<AppState>, job: &Job, polic
     let _write = state.storage.write_lock(job.repository_id).await;
 
     let pg_fence = fence::acquire_blob_safe_gc(state, job, &lease, policy).await?;
-    let fence_epoch = pg_fence.epoch().max(1) as u64;
+    if pg_fence.epoch() <= 0 {
+        pg_fence.release().await;
+        anyhow::bail!("PG gc_epoch fence returned non-positive epoch {}", pg_fence.epoch());
+    }
+    let fence_epoch = pg_fence.epoch() as u64;
 
     let run_res = run_safe_gc_phases(state, job, policy, (destructive_env, fence_epoch), (&lease, &pg_fence)).await;
     pg_fence.release().await;
@@ -272,7 +276,11 @@ async fn run_safe_gc_phases(
     let deadline = Instant::now() + Duration::from_secs(120);
     let ext_guard = || -> std::result::Result<(), SafeGcError> {
         lease.ensure_active().map_err(|_| SafeGcError::StaleDeleterFenced("PG exclusive reader lease lost"))?;
-        pg_fence.ensure_active().map_err(|_| SafeGcError::StaleDeleterFenced("PG gc_epoch fence heartbeat lost"))
+        pg_fence.ensure_active().map_err(|_| SafeGcError::StaleDeleterFenced("PG gc_epoch fence heartbeat lost"))?;
+        if pg_fence.epoch() <= 0 || pg_fence.epoch() as u64 != fence_epoch {
+            return Err(SafeGcError::StaleDeleterFenced("PG gc_epoch fence epoch drifted from exact fence_epoch"));
+        }
+        Ok(())
     };
 
     let mut compacted = false;
@@ -351,22 +359,20 @@ async fn run_safe_gc_phases(
     let mut deleted_keys = Vec::new();
     let mut already_absent_keys = Vec::new();
     let snap_rec = authority.snapshot();
-    if snap_rec.pending_delete.is_some() {
-        if let Some(rep) = reconcile_pending_delete_after_restart_fenced(
-            &authority,
-            &provider,
-            snap_rec.authority.incarnation_id,
-            snap_rec.authority.incarnation_epoch,
-            snap_rec.authority.lease_epoch,
-            Some(&ext_guard),
-            deadline,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("reconcile_pending_delete_after_restart_fenced: {e}"))?
-        {
-            deleted_keys.extend(rep.deleted_keys);
-            already_absent_keys.extend(rep.already_absent_keys);
-        }
+    if let Some(rep) = reconcile_pending_delete_after_restart_fenced(
+        &authority,
+        &provider,
+        snap_rec.authority.incarnation_id,
+        snap_rec.authority.incarnation_epoch,
+        snap_rec.authority.lease_epoch,
+        Some(&ext_guard),
+        deadline,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("reconcile_pending_delete_after_restart_fenced: {e}"))?
+    {
+        deleted_keys.extend(rep.deleted_keys);
+        already_absent_keys.extend(rep.already_absent_keys);
     }
 
     let snap_after = authority.snapshot();

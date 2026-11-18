@@ -377,7 +377,7 @@ impl DurableSafeGcAuthority {
 
     pub fn mint_staging_cleanup_tickets(&self) -> Result<Vec<DeleteAuthorizationTicket>, SafeGcError> {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let _arm = guard.gc_mode.require_armed()?;
+        let arm = guard.gc_mode.require_armed()?;
         let membership_digest = guard.compute_membership_digest();
         let mut out = Vec::new();
         for entry in guard.staged_uploads.iter().filter(|u| u.state == StagedUploadState::AbandonedPendingCleanup) {
@@ -396,7 +396,7 @@ impl DurableSafeGcAuthority {
                     lease_epoch: guard.authority.lease_epoch,
                     membership_generation: guard.authority.membership_generation,
                     membership_digest: membership_digest.clone(),
-                    proof_digest: membership_digest.clone(),
+                    proof_digest: arm.arm_digest.clone(),
                     pack_id: entry.op_id,
                     key_role: role.to_owned(),
                     physical_key: key.object_path.clone(),

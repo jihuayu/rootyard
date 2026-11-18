@@ -24,6 +24,7 @@ use super::{
     proof_digest::compute_membership_digest,
     quiescence::{ActiveReaderLease, ReaderLeaseRegistry},
     store_barrier::persist_snapshot,
+    store_reconcile::ReconciledSourceTracker,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +79,8 @@ pub struct SafeGcRepoSnapshot {
     pub completed_batches: BTreeMap<Uuid, DeleteExecutionReport>,
     #[serde(default)]
     pub aborted_batches: BTreeMap<Uuid, DeleteExecutionReport>,
+    #[serde(default)]
+    pub reconciled_sources: ReconciledSourceTracker,
     pub audit_log: Vec<GcAuditEvent>,
 }
 

@@ -19,7 +19,7 @@ use axum::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use opendal::{
     Buffer, Error as SdkError, ErrorKind, Operator, Result as SdkResult,
     layers::{ConcurrentLimitLayer, HttpClientLayer, RetryLayer, TimeoutLayer},
-    raw::{HttpBody, HttpClient, HttpFetch},
+    raw::{HttpBody, HttpClient, HttpFetch, percent_decode_path},
     services::S3,
 };
 use sha2::{Digest, Sha256};
@@ -70,7 +70,12 @@ impl HttpFetch for ConditionalDeleteFetch {
             let uri_path = request.uri().path().to_owned();
             let cond = {
                 let guard = self.armed.lock().unwrap_or_else(|p| p.into_inner());
-                guard.iter().find(|(rel, _)| uri_path.ends_with(rel.as_str())).map(|(_, v)| v.clone())
+                guard
+                    .iter()
+                    .find(|(rel, _)| {
+                        uri_path.strip_suffix(rel.as_str()).is_some_and(|p| p.is_empty() || p.ends_with('/'))
+                    })
+                    .map(|(_, v)| v.clone())
             };
             let Some((expected_etag, expected_vid)) = cond else {
                 return Err(SdkError::new(
@@ -78,10 +83,17 @@ impl HttpFetch for ConditionalDeleteFetch {
                     "unconditional S3 DELETE forbidden by Safe GC",
                 ));
             };
-            if expected_vid.is_some() && !request.uri().query().unwrap_or_default().contains("versionId=") {
+            let query_vid = request
+                .uri()
+                .query()
+                .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("versionId=")))
+                .map(percent_decode_path);
+            if let Some(ref vid) = expected_vid
+                && query_vid.as_deref() != Some(vid.as_str())
+            {
                 return Err(SdkError::new(
                     ErrorKind::ConditionNotMatch,
-                    "S3 DELETE missing required versionId query parameter",
+                    "S3 DELETE missing or mismatched exact versionId query parameter",
                 ));
             }
             let hv = HeaderValue::from_str(&expected_etag).map_err(|_| {
@@ -164,9 +176,9 @@ impl OpenDalS3GcProvider {
             .layer(ConcurrentLimitLayer::new(profile.concurrency()))
             .layer(RetryLayer::new().with_max_times(profile.retry_max_times()));
         let cap = operator.info().full_capability();
-        if !(cap.stat && cap.read && cap.write && cap.delete && cap.delete_with_version) {
+        if !(cap.stat && cap.stat_with_version && cap.read && cap.write && cap.delete && cap.delete_with_version) {
             return Err(SafeGcError::InvalidInput(
-                "S3 operator lacks stat/read/write/delete_with_version capabilities".into(),
+                "S3 operator lacks stat_with_version/read/write/delete_with_version capabilities".into(),
             ));
         }
         Ok(Self { store: store.clone(), operator, armed_deletes })
@@ -321,8 +333,15 @@ impl OpenDalS3GcProvider {
             }
         }
 
-        // 3. Post-delete stat confirmation + post-delete exact epoch/fence check.
-        match tokio::time::timeout_at(dl, self.operator.stat(&rel_path)).await {
+        // 3. Post-delete versioned stat confirmation + post-delete exact epoch/fence check.
+        let post_stat = async {
+            if let Some(ref vid) = expected_vid {
+                self.operator.stat_with(&rel_path).version(vid).await
+            } else {
+                self.operator.stat(&rel_path).await
+            }
+        };
+        match tokio::time::timeout_at(dl, post_stat).await {
             Ok(Err(err)) if err.kind() == ErrorKind::NotFound => {
                 fence.verify_active_for_ticket(ticket)?;
                 Ok(ProviderDeleteOutcome::ConfirmedDeleted)

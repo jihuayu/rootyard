@@ -331,6 +331,7 @@ pub(super) fn seed_fixture(
         pending_delete: None,
         completed_batches: BTreeMap::new(),
         aborted_batches: BTreeMap::new(),
+        reconciled_sources: Default::default(),
         audit_log: vec![],
     };
     let proof = build_and_verify_deletion_proof(DeletionProofInputs {

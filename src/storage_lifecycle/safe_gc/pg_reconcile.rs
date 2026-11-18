@@ -72,8 +72,8 @@ pub async fn reconcile_pg_refstore_authority<C: GenericClient + Sync>(
     let live_refs = load_pg_live_refs(client, repo_id, gate_rev).await?;
     let max_ref_seq = live_refs.iter().map(|r| r.version_seq).max().unwrap_or(gate_rev).max(gate_rev);
 
-    if authority_epoch_i64 <= 0 || snap_before.authority.incarnation_epoch < authority_epoch_i64 as u64 {
-        return Err(SafeGcError::IncompleteProof("safe_gc incarnation_epoch lags pg_refstore authority_epoch"));
+    if authority_epoch_i64 <= 0 || snap_before.authority.incarnation_epoch != authority_epoch_i64 as u64 {
+        return Err(SafeGcError::IncompleteProof("safe_gc incarnation_epoch != pg_refstore authority_epoch"));
     }
     let producers = load_pg_producers(
         client,

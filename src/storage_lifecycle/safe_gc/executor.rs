@@ -55,6 +55,19 @@ pub async fn execute_safe_gc_sweep(
     execute_safe_gc_sweep_with_external_fence(authority, backend, req, None).await
 }
 
+fn require_lane_external_fence(
+    lane: &AuthorityLane,
+    external_check: Option<ExternalFenceCheck<'_>>,
+) -> Result<(), SafeGcError> {
+    match (matches!(lane, AuthorityLane::SingleNodePg { .. }), external_check) {
+        (true, None) => Err(SafeGcError::StaleDeleterFenced(
+            "SingleNodePg provider delete requires live PG lease and gc_epoch fence",
+        )),
+        (_, Some(chk)) => chk(),
+        (false, None) => Ok(()),
+    }
+}
+
 pub async fn execute_safe_gc_sweep_with_external_fence(
     authority: &DurableSafeGcAuthority,
     backend: &dyn SafeGcDeleteBackend,
@@ -63,11 +76,8 @@ pub async fn execute_safe_gc_sweep_with_external_fence(
 ) -> Result<DeleteExecutionReport, SafeGcError> {
     let snap = authority.snapshot();
     let arm = snap.gc_mode.require_armed()?;
-    if matches!(arm.lane, AuthorityLane::SingleNodePg { .. })
-        && let Some(chk) = external_check
-    {
-        chk()?;
-    }
+    require_lane_external_fence(&arm.lane, external_check)?;
+    require_lane_external_fence(&req.proof.lane, external_check)?;
     let batch = authority.begin_delete_batch(
         req.batch_id,
         req.deleter_incarnation_id,
@@ -132,16 +142,8 @@ pub async fn reconcile_pending_delete_after_restart_fenced(
             "restart reconciliation deleter epochs do not exactly equal live authority",
         ));
     }
-    if matches!(batch.proof.lane, AuthorityLane::SingleNodePg { .. })
-        || matches!(arm.lane, AuthorityLane::SingleNodePg { .. })
-    {
-        let Some(chk) = external_check else {
-            return Err(SafeGcError::StaleDeleterFenced(
-                "SingleNodePg restart reconciliation requires live PG lease and gc_epoch fence",
-            ));
-        };
-        chk()?;
-    }
+    require_lane_external_fence(&arm.lane, external_check)?;
+    require_lane_external_fence(&batch.proof.lane, external_check)?;
 
     if batch.incarnation_epoch < snap.authority.incarnation_epoch
         || batch.incarnation_id != snap.authority.incarnation_id
@@ -190,11 +192,7 @@ pub async fn reclaim_abandoned_compaction_staging(
 ) -> Result<StagingCleanupReport, SafeGcError> {
     let snap = authority.snapshot();
     let arm = snap.gc_mode.require_armed()?;
-    if matches!(arm.lane, AuthorityLane::SingleNodePg { .. })
-        && let Some(chk) = external_check
-    {
-        chk()?;
-    }
+    require_lane_external_fence(&arm.lane, external_check)?;
     let tickets = authority.mint_staging_cleanup_tickets()?;
     let mut deleted_keys = Vec::new();
     let mut already_absent_keys = Vec::new();

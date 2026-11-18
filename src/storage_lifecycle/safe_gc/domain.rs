@@ -11,7 +11,7 @@ use crate::blob_store::{BlobLocator, opendal::BlobStore};
 use super::{
     SafeGcError,
     anti_aba::PhysicalBlobKey,
-    model::{encode_len_bytes, validate_bounded_name, validate_sha256_hex},
+    model::{AuthorityLane, encode_len_bytes, validate_bounded_name, validate_sha256_hex},
     store::DurableSafeGcAuthority,
 };
 
@@ -397,8 +397,16 @@ impl<'a> ActiveDeleteFence<'a> {
         }
         candidate.verify_digest_and_locator()?;
         self.authority.verify_active_step_ticket(candidate)?;
-        if let Some(ext) = self.external_check {
-            ext()?;
+        let is_pg =
+            matches!(self.authority.snapshot().gc_mode.require_armed()?.lane, AuthorityLane::SingleNodePg { .. });
+        match (is_pg, self.external_check) {
+            (true, None) => {
+                return Err(SafeGcError::StaleDeleterFenced(
+                    "SingleNodePg ActiveDeleteFence requires live PG lease and gc_epoch fence",
+                ));
+            }
+            (_, Some(ext)) => ext()?,
+            (false, None) => {}
         }
         Ok(())
     }
