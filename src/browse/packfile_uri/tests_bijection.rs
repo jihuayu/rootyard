@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::ref_store::GitObjectFormat;
 
 use super::{
+    cover_git::{collect_bounded_pack_paths, discover_repo_packs},
     pack_bijection::{parse_and_verify_idx_v2_oids, verify_raw_pack_stream_bijection},
     protocol_v2::push_pkt_line,
     tests::{build_v2_fetch_wire, sample_keyring, sample_policy, sample_resolver, sample_subject},
@@ -314,4 +315,60 @@ async fn pre_delim_fetch_header_detection_and_dynamic_set_policy_arming_work() {
     let uris = decode_packfile_uris_section(&resp, PackObjectFormat::Sha1).unwrap();
     assert_eq!(uris.len(), 1);
     assert!(uris[0].1.starts_with("https://cdn.rootyard.test/"));
+}
+
+#[tokio::test]
+async fn discover_repo_packs_enforces_streaming_pack_and_entry_budget_during_iteration() {
+    // Lazy source proves enumeration short-circuits on the first over-budget `.pack`, so the
+    // remaining 99,996 entries are never produced or allocated.
+    let visited = Arc::new(AtomicUsize::new(0));
+    let visited_clone = Arc::clone(&visited);
+    let iter = (0..100_000usize).map(move |i| {
+        visited_clone.fetch_add(1, Ordering::SeqCst);
+        Ok(PathBuf::from(format!("pack-{i:06}.pack")))
+    });
+    let err = collect_bounded_pack_paths(iter, 3).unwrap_err();
+    assert!(matches!(
+        err,
+        PackfileUriError::CapacityExceeded(ref msg) if msg.contains("repository pack count exceeds scan bound")
+    ));
+    assert_eq!(visited.load(Ordering::SeqCst), 4);
+
+    let git_bin = find_git_bin();
+
+    let tmp_packs = TempDir::new().unwrap();
+    let packs_dir = tmp_packs.path().join("objects").join("pack");
+    std::fs::create_dir_all(&packs_dir).unwrap();
+    for name in ["pack-a.pack", "pack-b.pack", "pack-c.pack"] {
+        std::fs::write(packs_dir.join(name), b"").unwrap();
+    }
+    let res = discover_repo_packs(
+        &git_bin,
+        tmp_packs.path(),
+        PackObjectFormat::Sha1,
+        &HelperResourceLimits { max_scanned_packs: 2, ..HelperResourceLimits::default() },
+    )
+    .await;
+    assert!(matches!(
+        res,
+        Err(PackfileUriError::CapacityExceeded(msg)) if msg.contains("repository pack count exceeds scan bound")
+    ));
+
+    let tmp_spam = TempDir::new().unwrap();
+    let spam_dir = tmp_spam.path().join("objects").join("pack");
+    std::fs::create_dir_all(&spam_dir).unwrap();
+    for i in 0..20 {
+        std::fs::write(spam_dir.join(format!("spam-{i:02}.tmp")), b"").unwrap();
+    }
+    let res = discover_repo_packs(
+        &git_bin,
+        tmp_spam.path(),
+        PackObjectFormat::Sha1,
+        &HelperResourceLimits { max_scanned_packs: 2, ..HelperResourceLimits::default() },
+    )
+    .await;
+    assert!(matches!(
+        res,
+        Err(PackfileUriError::CapacityExceeded(msg)) if msg.contains("directory entry count exceeds scan bound")
+    ));
 }

@@ -268,24 +268,56 @@ pub async fn build_residual_pack_bytes(
     .await
 }
 
+pub(super) fn collect_bounded_pack_paths<I>(
+    entries: I,
+    max_scanned_packs: usize,
+) -> Result<Vec<PathBuf>, PackfileUriError>
+where
+    I: IntoIterator<Item = std::io::Result<PathBuf>>,
+{
+    let max_dir_entries = max_scanned_packs.saturating_mul(8).max(16);
+    let mut dir_entries_seen: usize = 0;
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(max_scanned_packs.min(64));
+    for entry_res in entries {
+        let path = entry_res.map_err(|e| {
+            PackfileUriError::Internal(format!("failed reading objects/pack directory entry: {e}"))
+        })?;
+        dir_entries_seen = dir_entries_seen.saturating_add(1);
+        if dir_entries_seen > max_dir_entries {
+            return Err(PackfileUriError::CapacityExceeded(
+                "objects/pack directory entry count exceeds scan bound".to_owned(),
+            ));
+        }
+        if path.extension().is_some_and(|ext| ext == "pack") {
+            if paths.len() >= max_scanned_packs {
+                return Err(PackfileUriError::CapacityExceeded(
+                    "repository pack count exceeds scan bound".to_owned(),
+                ));
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 pub(super) async fn discover_repo_packs(
     git_bin: &Path,
     repo_dir: &Path,
     fmt: PackObjectFormat,
     limits: &HelperResourceLimits,
 ) -> Result<(Vec<DiscoveredPack>, bool), PackfileUriError> {
-    let Ok(rd) = std::fs::read_dir(repo_dir.join("objects").join("pack")) else {
-        return Ok((Vec::new(), false));
+    let pack_dir = repo_dir.join("objects").join("pack");
+    let rd = match std::fs::read_dir(&pack_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
+        Err(e) => {
+            return Err(PackfileUriError::Internal(format!(
+                "failed to open objects/pack directory: {e}"
+            )));
+        }
     };
-    let mut paths: Vec<PathBuf> = rd
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "pack"))
-        .collect();
-    if paths.len() > limits.max_scanned_packs {
-        return Err(PackfileUriError::CapacityExceeded("repository pack count exceeds scan bound".to_owned()));
-    }
-    paths.sort();
+    let paths = collect_bounded_pack_paths(rd.map(|res| res.map(|e| e.path())), limits.max_scanned_packs)?;
     let hex_len = fmt.oid_hex_len();
     let trailer_len = hex_len / 2;
     let mut total_scanned: u64 = 0;
