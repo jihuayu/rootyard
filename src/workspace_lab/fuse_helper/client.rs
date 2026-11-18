@@ -70,8 +70,8 @@ impl HelperError {
         Self { code, message: message.into() }
     }
 
-    fn child_exited() -> Self {
-        Self::new(libc::ECHILD, "workspace FUSE helper exited unsuccessfully")
+    fn child_exited(status: &ExitView) -> Self {
+        Self::new(libc::ECHILD, format!("workspace FUSE helper exited with {}", status.description))
     }
 
     fn child_missing() -> Self {
@@ -79,11 +79,11 @@ impl HelperError {
     }
 
     fn child_reap_deadline() -> Self {
-        Self::new(libc::ECHILD, "workspace FUSE helper child reap deadline expired")
+        Self::new(libc::ECHILD, "workspace FUSE helper was killed but did not reap within the shutdown deadline")
     }
 
-    fn child_reap_error() -> Self {
-        Self::new(libc::ECHILD, "workspace FUSE helper child wait failed")
+    fn child_reap_error(message: String) -> Self {
+        Self::new(libc::ECHILD, message)
     }
 
     pub fn disconnected() -> Self {
@@ -320,16 +320,17 @@ where
 fn terminal_exit(observation: ExitObservation) -> Option<Result<(), HelperShutdownError>> {
     match observation {
         ExitObservation::Exited(Ok(status)) if status.success => Some(Ok(())),
-        ExitObservation::Exited(Ok(_)) => {
-            Some(Err(HelperShutdownError::new(HelperError::child_exited(), HelperShutdownOutcome::ChildExited)))
+        ExitObservation::Exited(Ok(status)) => {
+            Some(Err(HelperShutdownError::new(HelperError::child_exited(&status), HelperShutdownOutcome::ChildExited)))
         }
         ExitObservation::Exited(Err(ReapFailure::Deadline)) => Some(Err(HelperShutdownError::new(
             HelperError::child_reap_deadline(),
             HelperShutdownOutcome::ChildReapDeadline,
         ))),
-        ExitObservation::Exited(Err(ReapFailure::WaitError)) => {
-            Some(Err(HelperShutdownError::new(HelperError::child_reap_error(), HelperShutdownOutcome::ChildReapError)))
-        }
+        ExitObservation::Exited(Err(ReapFailure::WaitError(message))) => Some(Err(HelperShutdownError::new(
+            HelperError::child_reap_error(message),
+            HelperShutdownOutcome::ChildReapError,
+        ))),
         ExitObservation::Missing => {
             Some(Err(HelperShutdownError::new(HelperError::child_missing(), HelperShutdownOutcome::ChildMissing)))
         }
@@ -683,8 +684,8 @@ impl Inner {
                     }
                     thread::sleep(limit.saturating_duration_since(now).min(Duration::from_millis(10)));
                 }
-                Err(_) => {
-                    lock(&self.child).record_exit(Err(ReapFailure::WaitError));
+                Err(error) => {
+                    lock(&self.child).record_exit(Err(ReapFailure::WaitError(error.to_string())));
                     return;
                 }
             }
@@ -720,8 +721,8 @@ impl Inner {
                     }
                     thread::sleep(deadline.saturating_duration_since(now).min(Duration::from_millis(10)));
                 }
-                Err(_) => {
-                    lock(&self.child).record_exit(Err(ReapFailure::WaitError));
+                Err(error) => {
+                    lock(&self.child).record_exit(Err(ReapFailure::WaitError(error.to_string())));
                     return;
                 }
             }
@@ -1388,22 +1389,33 @@ mod tests {
     }
 
     #[test]
-    fn reap_deadline_and_wait_error_are_distinct_through_the_real_waiter_mapping() {
-        for (failure, outcome) in [
-            (ReapFailure::Deadline, HelperShutdownOutcome::ChildReapDeadline),
-            (ReapFailure::WaitError, HelperShutdownOutcome::ChildReapError),
-        ] {
-            let mut slot = ChildSlot::default();
-            slot.record_exit(Err(failure));
-            let observation = slot.observe();
-            let error = terminal_exit(observation)
-                .expect("a recorded reap failure is terminal")
-                .expect_err("a reap failure is never success");
-            assert_eq!(error.outcome, outcome);
-            assert_eq!(error.error.code, libc::ECHILD);
-            assert!(!error.error.message.contains("try_wait"));
-            assert!(!error.error.message.contains("Operation"));
-        }
+    fn public_shutdown_error_messages_are_reconstructed_from_private_observations() {
+        let deadline = terminal_exit(ExitObservation::Exited(Err(ReapFailure::Deadline)))
+            .expect("a recorded reap failure is terminal")
+            .expect_err("a reap failure is never success");
+        assert_eq!(deadline.outcome, HelperShutdownOutcome::ChildReapDeadline);
+        assert_eq!(deadline.error.code, libc::ECHILD);
+        assert_eq!(
+            deadline.error.message,
+            "workspace FUSE helper was killed but did not reap within the shutdown deadline"
+        );
+
+        let wait = terminal_exit(ExitObservation::Exited(Err(ReapFailure::WaitError("wait failed".into()))))
+            .expect("a recorded wait failure is terminal")
+            .expect_err("a wait failure is never success");
+        assert_eq!(wait.outcome, HelperShutdownOutcome::ChildReapError);
+        assert_eq!(wait.error.code, libc::ECHILD);
+        assert_eq!(wait.error.message, "wait failed");
+
+        let exited = terminal_exit(ExitObservation::Exited(Ok(ExitView {
+            success: false,
+            description: "exit status: 9".into(),
+        })))
+        .expect("a recorded exit is terminal")
+        .expect_err("a nonzero exit is never success");
+        assert_eq!(exited.outcome, HelperShutdownOutcome::ChildExited);
+        assert_eq!(exited.error.code, libc::ECHILD);
+        assert_eq!(exited.error.message, "workspace FUSE helper exited with exit status: 9");
     }
 
     #[test]

@@ -553,11 +553,33 @@ async fn wait_legacy_until(
     }
 }
 
+struct HelperTeardownFailure {
+    generation: u64,
+    error: HelperError,
+    outcome: HelperShutdownOutcome,
+}
+
+impl HelperTeardownFailure {
+    /// Exact original public detail. It is used only for the original generic
+    /// result path; the private evidence path uses the typed outcome instead.
+    fn public_detail(&self) -> String {
+        format!("helper generation {}: {}", self.generation, self.error)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HelperFailureRendering {
+    /// Existing exported result-only shutdown wrappers: original generic 503.
+    OriginalPublic,
+    /// Private CLI normal-service-shutdown evidence: one fixed bounded clause.
+    PrivateEvidence,
+}
+
 /// Aggregate one normal-shutdown helper failure into a closed outcome. The
 /// precedence is fixed: an observed child exit wins over a missing handle, a
 /// reap deadline, a wait error, a timeout and the generic class. This keeps one
 /// bounded clause even when several retained generations failed.
-fn helper_teardown_outcome(failures: &[(HelperShutdownOutcome, String)]) -> HelperShutdownOutcome {
+fn helper_teardown_outcome(failures: &[HelperTeardownFailure]) -> HelperShutdownOutcome {
     fn rank(outcome: HelperShutdownOutcome) -> u8 {
         match outcome {
             HelperShutdownOutcome::ChildExited => 0,
@@ -570,7 +592,7 @@ fn helper_teardown_outcome(failures: &[(HelperShutdownOutcome, String)]) -> Help
     }
     failures
         .iter()
-        .map(|(outcome, _)| *outcome)
+        .map(|failure| failure.outcome)
         .min_by_key(|outcome| rank(*outcome))
         .unwrap_or(HelperShutdownOutcome::Other)
 }
@@ -588,16 +610,26 @@ fn helper_teardown_clause(outcome: HelperShutdownOutcome) -> Option<&'static str
     }
 }
 
-fn helper_teardown_error(failures: Vec<(HelperShutdownOutcome, String)>) -> Error {
-    let outcome = helper_teardown_outcome(&failures);
-    match helper_teardown_clause(outcome) {
-        // The fixed clause is isolated to this private normal-shutdown result.
-        // The status stays 503, the existing internal-error observation is
-        // preserved and the HTTP/API generic redaction is unchanged.
-        Some(clause) => Error::internal_shutdown_diagnostic(clause, clause),
-        None => {
-            let details = failures.into_iter().map(|(_, detail)| detail).collect::<Vec<_>>().join("; ");
-            Error::internal(format!("workspace FUSE helper teardown incomplete: {details}"))
+/// Exact original result-only helper teardown error: one generic 503 whose
+/// private detail preserves the prior boundary and `HelperError` Display.
+fn helper_teardown_public_error(failures: &[HelperTeardownFailure]) -> Error {
+    let details = failures.iter().map(HelperTeardownFailure::public_detail).collect::<Vec<_>>().join("; ");
+    Error::internal(format!("workspace FUSE helper teardown incomplete: {details}"))
+}
+
+fn render_helper_teardown_error(failures: Vec<HelperTeardownFailure>, rendering: HelperFailureRendering) -> Error {
+    match rendering {
+        HelperFailureRendering::OriginalPublic => helper_teardown_public_error(&failures),
+        HelperFailureRendering::PrivateEvidence => {
+            let outcome = helper_teardown_outcome(&failures);
+            match helper_teardown_clause(outcome) {
+                // The fixed clause is isolated to this private normal-shutdown
+                // evidence result. The status stays 503, the existing
+                // internal-error observation is preserved and the HTTP/API
+                // generic redaction is unchanged.
+                Some(clause) => Error::internal_shutdown_diagnostic(clause, clause),
+                None => helper_teardown_public_error(&failures),
+            }
         }
     }
 }
@@ -641,8 +673,9 @@ fn mount_namespace_inode() -> u64 {
 /// The returned bounded legacy evidence is present only when the legacy result
 /// itself succeeded; a helper-only failure does not erase an already-proven
 /// legacy join.
-pub async fn shutdown_helper_until_with_evidence(
+async fn shutdown_helper_until_core(
     deadline: tokio::time::Instant,
+    rendering: HelperFailureRendering,
 ) -> (Result<(), Error>, Option<LegacyShutdownEvidence>) {
     let ShutdownSnapshot { clients, helpers, legacy } = take_shutdown_snapshot();
     if clients.is_empty() && helpers.is_empty() && legacy.is_none() {
@@ -660,8 +693,11 @@ pub async fn shutdown_helper_until_with_evidence(
             let mut failures = Vec::new();
             for client in &clients {
                 if let Err(error) = client.shutdown_until_observed(effective) {
-                    failures
-                        .push((error.outcome, format!("helper generation {}: {}", client.generation(), error.error)));
+                    failures.push(HelperTeardownFailure {
+                        generation: client.generation(),
+                        error: error.error,
+                        outcome: error.outcome,
+                    });
                 }
             }
             // Keep the registry entries alive until every retained generation
@@ -669,7 +705,7 @@ pub async fn shutdown_helper_until_with_evidence(
             // leaves the helper stage an error; it is never converted to clean
             // quiescence.
             drop(helpers);
-            if failures.is_empty() { Ok(()) } else { Err(helper_teardown_error(failures)) }
+            if failures.is_empty() { Ok(()) } else { Err(render_helper_teardown_error(failures, rendering)) }
         });
         run_helper_cleanup(cleanup, tokio::time::Instant::from_std(effective)).await
     };
@@ -693,9 +729,18 @@ pub async fn shutdown_helper_until_with_evidence(
     (combine_shutdown_results(helper_result, legacy_result), legacy_evidence)
 }
 
+/// Private CLI normal-service-shutdown evidence path. Helper-owned failures use
+/// one fixed bounded clause; the result-only compatibility wrappers below keep
+/// the original generic error and boundary messages.
+pub async fn shutdown_helper_until_with_evidence(
+    deadline: tokio::time::Instant,
+) -> (Result<(), Error>, Option<LegacyShutdownEvidence>) {
+    shutdown_helper_until_core(deadline, HelperFailureRendering::PrivateEvidence).await
+}
+
 /// Compatibility entry point preserving the original result-only API.
 pub async fn shutdown_helper_until(deadline: tokio::time::Instant) -> Result<(), Error> {
-    shutdown_helper_until_with_evidence(deadline).await.0
+    shutdown_helper_until_core(deadline, HelperFailureRendering::OriginalPublic).await.0
 }
 
 /// Compatibility path used when no normal-shutdown deadline was published.
@@ -714,12 +759,19 @@ async fn shutdown_helper_without_deadline() -> Result<(), Error> {
             let mut failures = Vec::new();
             for client in &clients {
                 if let Err(error) = client.shutdown_until_observed(Instant::now() + HELPER_SHUTDOWN_GRACE) {
-                    failures
-                        .push((error.outcome, format!("helper generation {}: {}", client.generation(), error.error)));
+                    failures.push(HelperTeardownFailure {
+                        generation: client.generation(),
+                        error: error.error,
+                        outcome: error.outcome,
+                    });
                 }
             }
             drop(helpers);
-            if failures.is_empty() { Ok(()) } else { Err(helper_teardown_error(failures)) }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(render_helper_teardown_error(failures, HelperFailureRendering::OriginalPublic))
+            }
         })
         .await
     };
@@ -856,15 +908,19 @@ mod tests {
         assert!(legacy_success_within_deadline(&clean, deadline - Duration::from_millis(1), deadline));
     }
 
+    fn helper_failure(outcome: HelperShutdownOutcome, detail: &str) -> HelperTeardownFailure {
+        HelperTeardownFailure { generation: 7, error: HelperError::new(libc::ECHILD, detail), outcome }
+    }
+
     #[test]
     fn helper_teardown_outcome_is_closed_and_exactly_precedenced() {
         let all = vec![
-            (HelperShutdownOutcome::Other, "generic".to_owned()),
-            (HelperShutdownOutcome::Timeout, "timeout".to_owned()),
-            (HelperShutdownOutcome::ChildReapError, "wait error".to_owned()),
-            (HelperShutdownOutcome::ChildReapDeadline, "reap deadline".to_owned()),
-            (HelperShutdownOutcome::ChildMissing, "missing".to_owned()),
-            (HelperShutdownOutcome::ChildExited, "exit".to_owned()),
+            helper_failure(HelperShutdownOutcome::Other, "generic"),
+            helper_failure(HelperShutdownOutcome::Timeout, "timeout"),
+            helper_failure(HelperShutdownOutcome::ChildReapError, "wait error"),
+            helper_failure(HelperShutdownOutcome::ChildReapDeadline, "reap deadline"),
+            helper_failure(HelperShutdownOutcome::ChildMissing, "missing"),
+            helper_failure(HelperShutdownOutcome::ChildExited, "exit"),
         ];
         assert_eq!(helper_teardown_outcome(&all), HelperShutdownOutcome::ChildExited);
         assert_eq!(helper_teardown_outcome(&all[..5]), HelperShutdownOutcome::ChildMissing);
@@ -876,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn helper_teardown_clauses_are_fixed_and_bounded() {
+    fn private_evidence_rendering_uses_only_the_fixed_clause() {
         for (outcome, expected) in [
             (HelperShutdownOutcome::ChildExited, "workspace FUSE helper child exited unsuccessfully"),
             (HelperShutdownOutcome::ChildMissing, "workspace FUSE helper child exit was not observed"),
@@ -885,10 +941,39 @@ mod tests {
             (HelperShutdownOutcome::Timeout, "workspace FUSE helper teardown timed out"),
         ] {
             assert_eq!(helper_teardown_clause(outcome), Some(expected));
-            let error = helper_teardown_error(vec![(outcome, "raw detail must not escape".to_owned())]);
+            let error = render_helper_teardown_error(
+                vec![helper_failure(outcome, "raw detail must not escape")],
+                HelperFailureRendering::PrivateEvidence,
+            );
             assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(error.1, expected);
+            assert!(!error.1.contains("raw detail"));
         }
         assert_eq!(helper_teardown_clause(HelperShutdownOutcome::Other), None);
+        let other = render_helper_teardown_error(
+            vec![helper_failure(HelperShutdownOutcome::Other, "raw detail must not escape")],
+            HelperFailureRendering::PrivateEvidence,
+        );
+        assert_eq!(other.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(other.1, "service temporarily unavailable");
+    }
+
+    #[test]
+    fn public_compatibility_rendering_stays_generic_for_every_helper_outcome() {
+        for outcome in [
+            HelperShutdownOutcome::Other,
+            HelperShutdownOutcome::Timeout,
+            HelperShutdownOutcome::ChildReapError,
+            HelperShutdownOutcome::ChildReapDeadline,
+            HelperShutdownOutcome::ChildMissing,
+            HelperShutdownOutcome::ChildExited,
+        ] {
+            let error = render_helper_teardown_error(
+                vec![helper_failure(outcome, "raw detail must not escape")],
+                HelperFailureRendering::OriginalPublic,
+            );
+            assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error.1, "service temporarily unavailable");
+        }
     }
 }

@@ -8,11 +8,14 @@ use std::process::{Child, ExitStatus};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ExitView {
     pub success: bool,
+    /// Original `ExitStatus` Display retained only to reconstruct the public
+    /// shutdown error; private evidence uses the typed outcome instead.
+    pub description: String,
 }
 
 impl From<ExitStatus> for ExitView {
     fn from(status: ExitStatus) -> Self {
-        Self { success: status.success() }
+        Self { success: status.success(), description: status.to_string() }
     }
 }
 
@@ -20,8 +23,8 @@ impl From<ExitStatus> for ExitView {
 pub(super) enum ReapFailure {
     /// The published shutdown deadline expired after the child was killed.
     Deadline,
-    /// `Child::try_wait` itself failed.
-    WaitError,
+    /// `Child::try_wait` itself failed with the original private message.
+    WaitError(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +86,7 @@ impl ChildSlot {
             match child.try_wait() {
                 Ok(Some(status)) => observed = Some(Ok(ExitView::from(status))),
                 Ok(None) => {}
-                Err(_) => observed = Some(Err(ReapFailure::WaitError)),
+                Err(error) => observed = Some(Err(ReapFailure::WaitError(error.to_string()))),
             }
         }
         if let Some(result) = observed {
@@ -123,7 +126,7 @@ mod tests {
     #[test]
     fn a_recorded_exit_blocks_a_second_reap_and_stays_observable() {
         let mut slot = ChildSlot::default();
-        let success = ExitView { success: true };
+        let success = ExitView { success: true, description: "exit status: 0".into() };
         slot.record_exit(Ok(success.clone()));
         assert!(slot.take_for_reap().is_none(), "an observed exit must not be reaped twice");
         assert_eq!(slot.observe(), ExitObservation::Exited(Ok(success)));
@@ -133,11 +136,11 @@ mod tests {
     fn only_an_observed_exit_is_reaped() {
         let mut waiting = ChildSlot::default();
         assert!(!waiting.reaped(), "a missing handle is not reap proof");
-        waiting.record_exit(Err(ReapFailure::WaitError));
+        waiting.record_exit(Err(ReapFailure::WaitError("wait failed".into())));
         assert!(!waiting.reaped(), "a wait error is not reap proof");
 
         let mut reaped = ChildSlot::default();
-        reaped.record_exit(Ok(ExitView { success: false }));
+        reaped.record_exit(Ok(ExitView { success: false, description: "exit status: 9".into() }));
         assert!(reaped.reaped(), "an observed nonzero exit was still reaped");
     }
 
@@ -149,15 +152,15 @@ mod tests {
         assert!(!deadline.reaped(), "a reap deadline is not an exit");
 
         let mut wait_error = ChildSlot::default();
-        wait_error.record_exit(Err(ReapFailure::WaitError));
-        assert_eq!(wait_error.observe(), ExitObservation::Exited(Err(ReapFailure::WaitError)));
+        wait_error.record_exit(Err(ReapFailure::WaitError("wait failed".into())));
+        assert_eq!(wait_error.observe(), ExitObservation::Exited(Err(ReapFailure::WaitError("wait failed".into()))));
         assert!(!wait_error.reaped(), "a wait error is not an exit");
     }
 
     #[test]
     fn a_recorded_nonzero_exit_is_preserved_for_the_waiter() {
         let mut slot = ChildSlot::default();
-        let failure = ExitView { success: false };
+        let failure = ExitView { success: false, description: "exit status: 7".into() };
         slot.record_exit(Ok(failure.clone()));
         assert_eq!(slot.observe(), ExitObservation::Exited(Ok(failure)));
     }
