@@ -3,6 +3,8 @@
 mod changesets;
 #[path = "namespace_service/handlers.rs"]
 mod handlers;
+#[path = "namespace_service/push_causal_stream.rs"]
+pub mod push_causal_stream;
 #[path = "namespace_service/reverse.rs"]
 mod reverse;
 #[path = "namespace_service/view_git_http.rs"]
