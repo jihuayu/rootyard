@@ -252,7 +252,7 @@ impl PackReadSnapshot {
     /// snapshot digest, refs+HEAD, membership and every full pack identity
     /// digest. T2 recomputes it and requires exact equality before a public
     /// materialized view may exist.
-    pub(in crate::ref_store::core) fn materialization_digest(&self) -> RequestDigest {
+    pub(in crate::ref_store) fn materialization_digest(&self) -> RequestDigest {
         let mut fields: Vec<Vec<u8>> = vec![
             self.read_digest.as_bytes().to_vec(),
             self.source.as_str().as_bytes().to_vec(),

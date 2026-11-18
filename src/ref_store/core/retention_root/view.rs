@@ -24,6 +24,7 @@ pub struct RootReadView {
     native: NativeReadClosure,
     binding: RequestDigest,
     scope: RootsScope,
+    serving_cluster_incarnation: Option<Uuid>,
 }
 
 impl std::fmt::Debug for RootReadView {
@@ -42,12 +43,36 @@ impl RootReadView {
         native: NativeReadClosure,
         binding: RequestDigest,
     ) -> Result<Self, RootError> {
+        Self::seal_with_cluster(capture, native, binding, None)
+    }
+
+    /// Serving-lane seal with the ephemeral T1 cluster anchor. The anchor stays
+    /// private and is only available to the future coordinator's post-encoding
+    /// fence; it is not proof, session state or a current HWM.
+    pub(super) fn seal_serving(
+        capture: RawCapture,
+        native: NativeReadClosure,
+        binding: RequestDigest,
+        serving_cluster_incarnation: Uuid,
+    ) -> Result<Self, RootError> {
+        if serving_cluster_incarnation.is_nil() {
+            return Err(RootError::RootRealmMismatch("serving root read has a nil cluster anchor"));
+        }
+        Self::seal_with_cluster(capture, native, binding, Some(serving_cluster_incarnation))
+    }
+
+    fn seal_with_cluster(
+        capture: RawCapture,
+        native: NativeReadClosure,
+        binding: RequestDigest,
+        serving_cluster_incarnation: Option<Uuid>,
+    ) -> Result<Self, RootError> {
         // The scope is rebuilt once here: every accessor below reads a validated retained header.
         let scope = capture.scope()?;
         if capture.binding_digest()? != binding {
             return Err(RootError::RootDigestConflict("materialized root binding changed before sealing"));
         }
-        Ok(Self { capture, native, binding, scope })
+        Ok(Self { capture, native, binding, scope, serving_cluster_incarnation })
     }
 
     pub fn root_id(&self) -> Uuid {
@@ -95,6 +120,14 @@ impl RootReadView {
     }
     pub fn verified_bytes(&self) -> u64 {
         self.native.verified_bytes()
+    }
+
+    /// Serving-lane T1 cluster anchor for a future post-encoding coordinator
+    /// fence. `None` for the unchanged direct-core materialization path. This is
+    /// not an HTTP/session/proof value.
+    #[allow(dead_code)] // Wired into the future serving coordinator's post-encoding fence.
+    pub(crate) fn serving_cluster_incarnation(&self) -> Option<Uuid> {
+        self.serving_cluster_incarnation
     }
 
     /// Read one exact verified local pack copy. Never re-opens the Blob backend and never exposes the workspace.

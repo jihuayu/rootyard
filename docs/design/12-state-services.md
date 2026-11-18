@@ -236,7 +236,7 @@ atomic 全成全败；accepted-subset 按原请求顺序固定每 ref verdict �
 | F. fresh restore | PG+Raft+Blob 协调备份、隔离恢复、投影重建、fsck | 未实现；无 RPO/RTO 声明 |
 | G. 运维/HA | 监控、限流、备份演练、业务 PG HA 选择 | 未实现；Patroni 等不改变 ref 权威 |
 
-原始 #107 仍保持 OPEN；本表只记录能力拆分，不把历史 PR142 库级验收或候选 `serve-blob` 能力合并为最终关闭。固定 Native11/HTTP13 候选结果绑定较早源码，不延伸到当前最终 head。
+截至 2026-11-18，原始 #107 的单机 PG 范围已实现，并随 [PR #256](https://github.com/jihuayu/rootyard/pull/256) 合并为 `5107e59d9054994af1fa3a659bc944eda79cd691`（tree `ae6ee6df591f2c5f8edafcd38b044e20023a47f9`）。对应验收在 PR 精确 head `01c228dc3d668477fe781d9c7895669cb080931e`/tree `ac68474f276f5b30173c2da461f8f00eec7c80e6` 上通过：7/7 workflows、8/8 checks；HTTP13 4 suites/13 cases、Native11 11 targets/167 cases/0 skips；collaborator transport 20/20（[CI run](https://github.com/jihuayu/rootyard/actions/runs/44122210788)、[Native11/HTTP13 run](https://github.com/jihuayu/rootyard/actions/runs/44122210645)）。合并树本身未单独重跑验收。原始单机 PG AC 因此已满足，本文档收口后关闭 [#107](https://github.com/jihuayu/rootyard/issues/107)；默认入口 [#148](https://github.com/jihuayu/rootyard/issues/148)、分布式 [#115](https://github.com/jihuayu/rootyard/issues/115)、LFS/PR/Workspace/CI producer、HA/restore/GC、S4、release [#123](https://github.com/jihuayu/rootyard/issues/123) 及完整 Proposed 架构仍按各自计划推进，不在该关闭范围内。
 
 ## 12. 未决问题
 

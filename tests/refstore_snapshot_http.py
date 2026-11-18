@@ -1,0 +1,785 @@
+#!/usr/bin/env python3
+"""Root-only real-service HTTP contract for durable snapshot metadata.
+
+The implementation worker only py-compiles and statically inspects this file.
+Root runs it on the final reviewed Linux source with the attested standalone
+CLI, real PostgreSQL/S3 and stock Git.
+
+The controller still owns authorization, current role/scope, ready
+binding/backend/realm/cluster fencing and the final commit. This fixture only
+drives the bounded HTTP DTOs and asserts safe projections, statuses, replay and
+no-effect state. It never creates a ready repository, ACK, terminal, artifact
+grant or successful receipt through SQL.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import time
+import urllib.parse
+import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import blob_commit_unknown_service as checkpoint  # noqa: E402
+import blob_only_service as blob  # noqa: E402
+
+CREATE_READ = "snapshot_http_create_read_replay_after_ref_advance"
+LIFECYCLE = "snapshot_http_renew_release_expiry_and_exact_replay"
+AUTHZ = "snapshot_http_authz_malformed_and_cross_repo_refusals"
+HISTORICAL = "snapshot_http_historical_tree_blob_and_current_reachability"
+BROWSE_REFUSALS = "snapshot_http_historical_tree_blob_auth_and_state_refusals"
+BLOB_BOUND = "snapshot_http_historical_blob_common_read_bound"
+CASES = (CREATE_READ, LIFECYCLE, AUTHZ, HISTORICAL, BROWSE_REFUSALS, BLOB_BOUND)
+
+LIMITATIONS = [
+    "Root-only real-service HTTP fixture: requires the attested standalone binary, real PostgreSQL/S3/stock Git and the owned Blob profile. The implementation worker only py-compiled it.",
+    "The repository and captured refs/packs come from real API provisioning and stock Git publication; no ready/ACK/terminal/artifact-grant/receipt row is fabricated.",
+    "The fixture exercises bounded HTTP DTO/receipt projections and coordinator decisions. Its historical content cases exercise the retained materialization/read contract and expected byte-closure behavior at source level, but actual native execution/byte-closure runtime proof, a #174 session/HWM, root/retention HTTP, hosted CI and full issue107 closure are not claimed here.",
+    "The token/collaborator metadata cases are fixture inputs: read-only/restricted tokens use the real token API and real PATCH where shown; the write collaborator role row is labeled initial role metadata, not production collaborator API transport.",
+    "Exact rows/counters are compared through the run-owned schema. No kernel, power-loss, distributed or scalability claim is made.",
+    "The historical tree/blob cases exercise the retained snapshot HTTP content surface; they do not claim a session/HWM, root materialization, hosted inventory or full issue107 acceptance.",
+    "The HTTP fixture has no deterministic production seam between complete content encoding and the final read-scope fence; late-scope removal is covered by the coordinator source/real-PG fixtures, not a live HTTP race here.",
+    "Ordinary current Browse may carry a legitimate optional X-Rootyard-Session header when a session keyring is configured. Only retained snapshot metadata/content/mutation responses assert header absence; no ordinary proof/header absence is claimed.",
+]
+
+
+def input_hashes():
+    return blob.http_input_hashes()
+
+
+class SnapshotHttpProfile(checkpoint.CheckpointProfile):
+    def __init__(self, binary, git_flag, env):
+        super().__init__(binary, git_flag, env)
+        self.snapshot_http_sha256 = blob.sha256_file(Path(__file__))
+
+
+class SnapshotHttpHarness(checkpoint.CheckpointHarness):
+    def _snapshots_path(self, repo, suffix=""):
+        return ("/api/repos/" + urllib.parse.quote(repo["owner"], safe="") + "/"
+                + urllib.parse.quote(repo["name"], safe="") + "/snapshots" + suffix)
+
+    def _request(self, method, path, token, body=None, assert_no_session=True):
+        """Bound the response policy. Ordinary current Browse may legitimately
+        emit X-Rootyard-Session when the optional session keyring is enabled;
+        only those callers pass assert_no_session=False. Every retained
+        snapshot metadata/content/mutation response keeps the strict absence
+        assertion, including denials.
+        """
+        status, raw, headers = self.http(path, token=token, method=method, body=body)
+        assert blob.header_value(headers, "cache-control") == "no-store", (status, headers)
+        if assert_no_session:
+            assert blob.header_value(headers, "x-rootyard-session") is None, headers
+        return status, (json.loads(raw) if raw else None), headers
+
+    def _create(self, repo, key, lease, token=None):
+        return self._request("POST", self._snapshots_path(repo), token or self.alice,
+                             {"idempotency_key": key, "lease_seconds": lease})
+
+    def _read(self, repo, snapshot, token=None):
+        return self._request("GET", self._snapshots_path(repo, "/" + str(snapshot)), token or self.alice)
+
+    def _await_pin_expiry(self, repo, pin_id, label):
+        """Poll the real DB clock against the immutable active-pin expiry."""
+        rid = str(uuid.UUID(repo["id"]))
+        pid = str(uuid.UUID(pin_id))
+        until = time.monotonic() + 10
+        while time.monotonic() < until:
+            state = self.sql(
+                "SELECT (expires_at <= clock_timestamp())::text FROM ref_store_core_pins "
+                "WHERE pin_id='" + pid + "' AND repository_id='" + rid + "'"
+            )
+            assert state in ("true", "false"), (label, state)
+            if state == "true":
+                return
+            time.sleep(0.05)
+        raise AssertionError(label + ": pin did not expire naturally within 10s")
+
+    def _configured_blob_read_cap(self):
+        max_inflight = int(self.env.get("ROOTYARD_MAX_INFLIGHT_BYTES", str(256 << 20)))
+        max_response = int(self.env.get("ROOTYARD_MAX_OUTPUT_BYTES", str(512 << 20)))
+        memory = min(32 << 20, max_inflight)
+        return min(4 << 20, memory // 12, max_response // 8, (memory // 12) // 12)
+
+    def _renew(self, repo, snapshot, key, generation, lease, token=None):
+        return self._request("POST", self._snapshots_path(repo, "/" + str(snapshot) + "/renew"),
+                             token or self.alice,
+                             {"idempotency_key": key, "expected_generation": generation,
+                              "lease_seconds": lease})
+
+    def _release(self, repo, snapshot, key, generation, token=None):
+        return self._request("DELETE", self._snapshots_path(repo, "/" + str(snapshot)),
+                             token or self.alice,
+                             {"idempotency_key": key, "expected_generation": generation})
+
+    def _repo_path(self, repo, suffix=""):
+        return ("/api/repos/" + urllib.parse.quote(repo["owner"], safe="") + "/"
+                + urllib.parse.quote(repo["name"], safe="") + suffix)
+
+    @staticmethod
+    def _query_path(path, params):
+        values = {key: value for key, value in params.items() if value is not None}
+        query = urllib.parse.urlencode(values)
+        return path + ("?" + query if query else "")
+
+    def _tree(self, repo, snapshot, *, oid=None, path=None, after=None, limit=None, token=None):
+        suffix = "/" + str(snapshot) + "/tree"
+        return self._request("GET", self._query_path(self._snapshots_path(repo, suffix), {
+            "oid": oid, "path": path, "after": after, "limit": limit,
+        }), token or self.alice)
+
+    def _blob(self, repo, snapshot, oid, *, path=None, token=None):
+        suffix = "/" + str(snapshot) + "/blob/" + str(oid)
+        return self._request("GET", self._query_path(self._snapshots_path(repo, suffix), {"path": path}),
+                             token or self.alice)
+
+    def _current_tree(self, repo, token=None):
+        # Optional session-keyring configuration may legitimately issue a
+        # current-Browse session; retained snapshot routes must never do so.
+        return self._request("GET", self._query_path(self._repo_path(repo, "/tree"), {"oid": "HEAD"}),
+                             token or self.alice, assert_no_session=False)
+
+    def _current_blob(self, repo, oid, token=None):
+        return self._request("GET", self._repo_path(repo, "/blob/" + str(oid)), token or self.alice,
+                             assert_no_session=False)
+
+    @staticmethod
+    def _tree_item(tree, name):
+        for item in tree["items"]:
+            if item["name"] == name:
+                return item
+        raise AssertionError("tree omitted " + name)
+
+    def _assert_tree_view(self, tree):
+        assert set(tree) == {"oid", "tree_oid", "path", "items", "next_after"}, tree
+        for item in tree["items"]:
+            assert set(item) == {"name", "path", "mode", "kind", "oid", "size"}, item
+        self._forbidden_markers(tree)
+
+    def _assert_blob_view(self, blob):
+        assert set(blob) == {"oid", "size", "is_binary", "content", "content_base64"}, blob
+        self._forbidden_markers(blob)
+
+    def _issue_scoped(self, repo, label, actions, read_only=False):
+        payload = {
+            "display_name": label,
+            "expires_in_days": 1,
+            "read_only": read_only,
+            "repository_grants": [{"repository_id": repo["id"], "actions": list(actions)}],
+            "namespace_grants": [],
+        }
+        status, data, _ = self._request("POST", "/api/tokens", self.alice, payload)
+        assert status == 201, (label, status, data)
+        self.secrets.append(data["secret"])
+        assert data.get("is_restricted") is True, data
+        return {"username": "alice", "token": data["secret"], "id": data["id"],
+                "scope_version": data["scope_version"]}
+
+    def _patch_scope(self, repo, token, actions):
+        body = {
+            "expected_scope_version": token["scope_version"],
+            "repository_grants": [{"repository_id": repo["id"], "actions": list(actions)}],
+            "namespace_grants": [],
+        }
+        status, data, _ = self._request("PATCH", "/api/tokens/" + token["id"], self.alice, body)
+        assert status == 200, (status, data)
+        token["scope_version"] = data["scope_version"]
+        return data
+
+    def _insert_write_collaborator(self, repo, user_id):
+        rid = str(uuid.UUID(repo["id"]))
+        uid = str(uuid.UUID(user_id))
+        owner = self.sql("SELECT owner_id FROM repositories WHERE id='" + rid + "'")
+        assert owner, "fixture repository has no owner"
+        self.sql("INSERT INTO repository_collaborators(repository_id,tenant_id,user_id,role) "
+                 "VALUES('" + rid + "','" + owner + "','" + uid + "','write')")
+        return owner
+
+    def _ledger(self, repo):
+        rid = str(uuid.UUID(repo["id"]))
+        owner = "(SELECT owner_id FROM repositories WHERE id='" + rid + "')"
+        query = (
+            "SELECT jsonb_build_object("
+            "'refs',(SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY r.ref_name),'[]'::jsonb) "
+            "        FROM ref_store_core_refs r WHERE r.repository_id='" + rid + "'),"
+            "'gate',(SELECT coalesce(jsonb_agg(to_jsonb(g) ORDER BY g.repository_id),'[]'::jsonb) "
+            "        FROM ref_store_core_gates g WHERE g.repository_id='" + rid + "'),"
+            "'events',(SELECT coalesce(jsonb_agg(to_jsonb(e) ORDER BY e.event_id),'[]'::jsonb) "
+            "          FROM ref_store_core_events e WHERE e.repository_id='" + rid + "'),"
+            "'snapshots',(SELECT coalesce(jsonb_agg(to_jsonb(s) ORDER BY s.snapshot_id),'[]'::jsonb) "
+            "             FROM ref_store_core_snapshots s WHERE s.repository_id='" + rid + "'),"
+            "'pins',(SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY p.pin_id),'[]'::jsonb) "
+            "        FROM ref_store_core_pins p WHERE p.repository_id='" + rid + "'),"
+            "'receipts',(SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.request_id),'[]'::jsonb) "
+            "            FROM ref_store_core_receipts c WHERE c.repository_id='" + rid + "'),"
+            "'history',(SELECT coalesce(jsonb_agg(to_jsonb(h) ORDER BY h.request_id),'[]'::jsonb) "
+            "           FROM ref_store_core_pack_snapshot_history h WHERE h.repository_id='" + rid + "'),"
+            "'snapshot_refs',(SELECT coalesce(jsonb_agg(to_jsonb(r) ORDER BY r.snapshot_id,r.ref_name),'[]'::jsonb) "
+            "                 FROM ref_store_core_snapshot_refs r "
+            "                 JOIN ref_store_core_snapshots s USING(snapshot_id) WHERE s.repository_id='" + rid + "'),"
+            "'snapshot_packs',(SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY p.snapshot_id,p.pack_id),'[]'::jsonb) "
+            "                  FROM ref_store_core_snapshot_packs p WHERE p.repository_id='" + rid + "'),"
+            "'pack_usage',(SELECT coalesce(jsonb_agg(to_jsonb(u)),'[]'::jsonb) "
+            "              FROM ref_store_core_pack_snapshot_repo_usage u WHERE u.repository_id='" + rid + "'),"
+            "'pack_tenant_usage',(SELECT coalesce(jsonb_agg(to_jsonb(u)),'[]'::jsonb) "
+            "                     FROM ref_store_core_pack_snapshot_tenant_usage u WHERE u.tenant_id=" + owner + "),"
+            "'a2_repo_usage',(SELECT coalesce(jsonb_agg(to_jsonb(u)),'[]'::jsonb) "
+            "                 FROM ref_store_core_repo_usage u WHERE u.repository_id='" + rid + "'),"
+            "'a2_tenant_usage',(SELECT coalesce(jsonb_agg(to_jsonb(u)),'[]'::jsonb) "
+            "                   FROM ref_store_core_tenant_usage u WHERE u.tenant_id=" + owner + ")"
+            ")::text"
+        )
+        return self.sql(query)
+
+    @staticmethod
+    def _forbidden_markers(view):
+        text = json.dumps(view, sort_keys=True).lower()
+        for marker in ("provider", "backend_identity", "locator", "hold_id", "namespace",
+                       "blob_key", "object_key", "secret", "x-rootyard-session",
+                       "high_watermark", "s3://"):
+            assert marker not in text, (marker, view)
+
+    def _assert_create_view(self, view):
+        assert set(view) == {
+            "action", "snapshot_id", "pin_id", "pin_generation", "gate_revision", "gate_digest",
+            "head_ref", "head_oid", "ref_count", "refs_digest", "membership_digest", "pack_count",
+            "pack_mode", "snapshot_digest", "logical_bytes", "expires_at_unix_micros",
+            "expires_at_is_historical", "replayed", "receipt_only", "receipt_grants_live_lease",
+            "complete_registered_pack_membership", "complete_git_read_snapshot",
+        }, view
+        assert view["action"] == "create", view
+        assert view["pack_mode"] == "pack_verified", view
+        assert view["receipt_only"] is True and view["receipt_grants_live_lease"] is False, view
+        assert view["complete_registered_pack_membership"] is False, view
+        assert view["complete_git_read_snapshot"] is False, view
+        assert view["pack_count"] >= 1 and view["ref_count"] >= 1, view
+        self._forbidden_markers(view)
+
+    def _assert_pin_view(self, view):
+        assert set(view) == {
+            "action", "snapshot_id", "pin_id", "pin_generation", "expires_at_unix_micros",
+            "released_at_unix_micros", "release_reason", "expires_at_is_historical", "replayed",
+            "receipt_only", "receipt_grants_live_lease", "complete_git_read_snapshot",
+        }, view
+        assert view["action"] in ("renew", "release"), view
+        assert view["receipt_only"] is True and view["receipt_grants_live_lease"] is False, view
+        assert view["complete_git_read_snapshot"] is False, view
+        self._forbidden_markers(view)
+
+    def _assert_read_view(self, view):
+        assert set(view) == {
+            "snapshot_id", "pin_id", "pin_generation", "gate_revision", "gate_digest",
+            "head_ref", "head_oid", "ref_count", "refs", "pack_count", "pack_mode", "packs",
+            "membership_digest", "snapshot_digest", "logical_bytes", "expires_at_unix_micros",
+            "source_kind", "complete_registered_pack_membership", "complete_git_read_snapshot",
+        }, view
+        assert view["pack_mode"] == "pack_verified", view
+        assert view["source_kind"] == "retained_durable", view
+        assert view["complete_registered_pack_membership"] is True, view
+        assert view["complete_git_read_snapshot"] is False, view
+        assert view["pack_count"] >= 1 and view["ref_count"] >= 1, view
+        for reference in view["refs"]:
+            assert set(reference) == {"name", "oid"}, reference
+        for pack in view["packs"]:
+            assert set(pack) == {
+                "pack_id", "registration_id", "artifact_set_digest", "joined_revision",
+                "artifact_count", "verified_bytes", "artifacts",
+            }, pack
+            assert pack["artifact_count"] == len(pack["artifacts"]) >= 2, pack
+            for artifact in pack["artifacts"]:
+                assert set(artifact) == {"role", "sha256", "length"}, artifact
+                assert artifact["role"] in ("pack", "idx"), artifact
+        self._forbidden_markers(view)
+
+    def _main_ref(self, view):
+        matches = [item["oid"] for item in view["refs"] if item["name"] == "refs/heads/main"]
+        assert len(matches) == 1, view["refs"]
+        return matches[0]
+
+    def snapshot_http_create_read_replay_after_ref_advance(self):
+        repo, _remote, work, old_oid = self.seed("snap-http")
+        baseline = self._ledger(repo)
+        status, created, _ = self._create(repo, "create-one", 300)
+        assert status == 201, (status, created)
+        self._assert_create_view(created)
+        snapshot = created["snapshot_id"]
+        pin = created["pin_id"]
+        gate = created["gate_revision"]
+        expires = created["expires_at_unix_micros"]
+        after_create = self._ledger(repo)
+        assert after_create != baseline, "create did not append durable metadata"
+
+        status, read, _ = self._read(repo, snapshot)
+        assert status == 200, (status, read)
+        self._assert_read_view(read)
+        assert read["snapshot_id"] == snapshot and read["pin_id"] == pin, read
+        assert read["head_ref"] == "refs/heads/main" and read["head_oid"] == old_oid, read
+        assert read["gate_revision"] == gate, read
+        assert self._main_ref(read) == old_oid, read["refs"]
+
+        new_oid = self.commit_files(work, "snapshot advance", {"advance.txt": "advance\n"})
+        self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice)
+        assert new_oid != old_oid
+        after_advance = self._ledger(repo)
+        assert after_advance != after_create, "second ref publication did not advance the gate"
+
+        status, replay, _ = self._create(repo, "create-one", 300)
+        assert status == 200 and replay["replayed"] is True, (status, replay)
+        assert replay["snapshot_id"] == snapshot and replay["pin_id"] == pin, replay
+        assert replay["gate_revision"] == gate and replay["expires_at_unix_micros"] == expires, replay
+        assert replay["expires_at_is_historical"] is True, replay
+        assert self._create(repo, "create-one", 300)[1]["replayed"] is True
+        assert self._ledger(repo) == after_advance, "exact create replay changed durable state"
+
+        status, changed, _ = self._create(repo, "create-one", 301)
+        assert status == 409, (status, changed)
+        assert self._ledger(repo) == after_advance, "changed create intent changed durable state"
+
+        status, historical, _ = self._read(repo, snapshot)
+        assert status == 200, (status, historical)
+        assert historical["gate_revision"] == gate and historical["head_oid"] == old_oid, historical
+        assert self._main_ref(historical) == old_oid, historical["refs"]
+        assert self._ledger(repo) == after_advance, "historical read changed durable state"
+        return {
+            "snapshot_id": snapshot,
+            "pin_id": pin,
+            "gate_revision": gate,
+            "created_oid": old_oid,
+            "advanced_oid": new_oid,
+            "create_replayed_after_advance": True,
+            "changed_intent_conflict": True,
+            "historical_read_kept_old_gate_and_refs": True,
+        }
+
+    def snapshot_http_renew_release_expiry_and_exact_replay(self):
+        repo, _remote, _work, _oid = self.seed("snap-life")
+        status, created, _ = self._create(repo, "life-create", 300)
+        assert status == 201, (status, created)
+        snapshot = created["snapshot_id"]
+        after_create = self._ledger(repo)
+
+        status, renewed, _ = self._renew(repo, snapshot, "renew-one", 1, 120)
+        assert status == 200, (status, renewed)
+        self._assert_pin_view(renewed)
+        assert renewed["action"] == "renew" and renewed["replayed"] is False, renewed
+        assert renewed["pin_generation"] == 2 and renewed["expires_at_is_historical"] is False, renewed
+        after_renew = self._ledger(repo)
+        assert after_renew != after_create, "renew did not append a live receipt"
+
+        status, replayed, _ = self._renew(repo, snapshot, "renew-one", 1, 120)
+        assert status == 200 and replayed["replayed"] is True, (status, replayed)
+        assert replayed["pin_generation"] == 2 and replayed["expires_at_is_historical"] is True, replayed
+        assert self._ledger(repo) == after_renew, "exact renew replay changed durable state"
+
+        status, changed_lease, _ = self._renew(repo, snapshot, "renew-one", 1, 121)
+        assert status == 409, (status, changed_lease)
+        status, stale, _ = self._renew(repo, snapshot, "renew-stale", 1, 120)
+        assert status == 409, (status, stale)
+        assert self._ledger(repo) == after_renew, "renew conflicts changed durable state"
+
+        status, read, _ = self._read(repo, snapshot)
+        assert status == 200 and read["pin_generation"] == 2, (status, read)
+
+        status, released, _ = self._release(repo, snapshot, "release-one", 2)
+        assert status == 200, (status, released)
+        self._assert_pin_view(released)
+        assert released["action"] == "release" and released["replayed"] is False, released
+        assert released["pin_generation"] == 2 and released["released_at_unix_micros"] is not None, released
+        assert released["release_reason"] == "client_done" and released["expires_at_is_historical"] is True, released
+        after_release = self._ledger(repo)
+        assert after_release != after_renew, "release did not append a terminal receipt"
+
+        status, release_replay, _ = self._release(repo, snapshot, "release-one", 2)
+        assert status == 200 and release_replay["replayed"] is True, (status, release_replay)
+        assert self._ledger(repo) == after_release, "exact release replay changed durable state"
+
+        status, released_read, _ = self._read(repo, snapshot)
+        assert status == 409, (status, released_read)
+        status, released_renew, _ = self._renew(repo, snapshot, "renew-after-release", 2, 120)
+        assert status == 409, (status, released_renew)
+        assert self._ledger(repo) == after_release, "released denial changed durable state"
+
+        status, expired, _ = self._create(repo, "expired-create", 1)
+        assert status == 201, (status, expired)
+        expired_id = expired["snapshot_id"]
+        self._await_pin_expiry(repo, expired["pin_id"], "expired-create")
+        expired_baseline = self._ledger(repo)
+        status, expired_read, _ = self._read(repo, expired_id)
+        assert status == 409, (status, expired_read)
+        status, expired_renew, _ = self._renew(repo, expired_id, "renew-expired", 1, 120)
+        assert status == 409, (status, expired_renew)
+        assert self._ledger(repo) == expired_baseline, "expired denial changed durable state"
+        return {
+            "snapshot_id": snapshot,
+            "renew_generation": 2,
+            "released": True,
+            "release_reason": "client_done",
+            "released_read_status": 409,
+            "expired_read_status": 409,
+            "exact_renew_release_replay": True,
+        }
+
+    def snapshot_http_authz_malformed_and_cross_repo_refusals(self):
+        repo, _remote, _work, _oid = self.seed("snap-authz")
+        status, created, _ = self._create(repo, "authz-create", 300)
+        assert status == 201, (status, created)
+        snapshot = created["snapshot_id"]
+        baseline = self._ledger(repo)
+
+        # Unrestricted read-only owner token: read works; mutations are refused.
+        status, read, _ = self._read(repo, snapshot, token=self.reader)
+        assert status == 200, (status, read)
+        for label, call in (
+            ("read-only create", lambda: self._create(repo, "readonly-create", 300, token=self.reader)),
+            ("read-only renew", lambda: self._renew(repo, snapshot, "readonly-renew", 1, 120, token=self.reader)),
+            ("read-only release", lambda: self._release(repo, snapshot, "readonly-release", 1, token=self.reader)),
+        ):
+            code, payload, _ = call()
+            assert code == 403, (label, code, payload)
+        assert self._ledger(repo) == baseline, "read-only mutations changed durable state"
+
+        # Restricted ContentsRead token accepts read; mutation is refused.
+        reader = self._issue_scoped(repo, "restricted-reader", ["contents_read"], read_only=True)
+        status, _, _ = self._read(repo, snapshot, token=reader)
+        assert status == 200
+        status, _, _ = self._create(repo, "restricted-reader-create", 300, token=reader)
+        assert status == 403
+
+        # Real API PATCH narrowing: write grant removed, read grant retained.
+        patched = self._issue_scoped(repo, "patched", ["contents_read", "contents_write"])
+        self._patch_scope(repo, patched, ["contents_read"])
+        status, _, _ = self._read(repo, snapshot, token=patched)
+        assert status == 200
+        status, _, _ = self._create(repo, "patched-create", 300, token=patched)
+        assert status == 403
+        assert self._ledger(repo) == baseline, "scope-narrowed refusals changed durable state"
+
+        # Write-only scoped token can create on a separate repo but cannot read it.
+        write_repo, _wr, _ww, _wo = self.seed("snap-write-only")
+        write_only = self._issue_scoped(write_repo, "write-only", ["contents_write"])
+        status, write_created, _ = self._create(write_repo, "write-only-create", 300, token=write_only)
+        assert status == 201, (status, write_created)
+        baseline = self._ledger(repo)
+        write_baseline = self._ledger(write_repo)
+        status, _, _ = self._read(write_repo, write_created["snapshot_id"], token=write_only)
+        assert status == 403
+        assert self._ledger(write_repo) == write_baseline, "write-only denial changed durable state"
+
+        # Non-member and then initial fixture-only write collaborator role.
+        status, _, _ = self._read(repo, snapshot, token=self.bob)
+        assert status == 404
+        status, _, _ = self._create(repo, "bob-nonmember", 300, token=self.bob)
+        assert status == 404
+        self._insert_write_collaborator(repo, self.bob["user_id"])
+        status, _, _ = self._read(repo, snapshot, token=self.bob)
+        assert status == 403
+        status, _, _ = self._create(repo, "bob-write-collab", 300, token=self.bob)
+        assert status == 403
+        assert self._ledger(repo) == baseline, "non-member/collaborator refusals changed durable state"
+
+        # Repository-scoped snapshot selector under another same-owner repo.
+        cross_repo, _cr, _cw, _co = self.seed("snap-cross")
+        cross_baseline = self._ledger(cross_repo)
+        status, _, _ = self._read(cross_repo, snapshot)
+        assert status == 404
+        assert self._ledger(cross_repo) == cross_baseline, "cross-repository refusal changed state"
+
+        # Invalid credentials.
+        status, _, _ = self._read(repo, snapshot, token={"token": "ryt_" + "0" * 64})
+        assert status == 401
+
+        # Malformed selector/DTO/key/lease/generation and unknown fields.
+        malformed = [
+            ("malformed snapshot selector", "GET", self._snapshots_path(repo, "/not-a-uuid"), None, 400),
+            ("nil snapshot selector", "GET", self._snapshots_path(repo, "/" + str(uuid.UUID(int=0))), None, 400),
+            ("unknown create field", "POST", self._snapshots_path(repo),
+             {"idempotency_key": "unknown-field", "lease_seconds": 300, "snapshot_id": snapshot}, 400),
+            ("empty key", "POST", self._snapshots_path(repo),
+             {"idempotency_key": "", "lease_seconds": 300}, 400),
+            ("non-opaque key", "POST", self._snapshots_path(repo),
+             {"idempotency_key": "bad key", "lease_seconds": 300}, 400),
+            ("zero lease", "POST", self._snapshots_path(repo),
+             {"idempotency_key": "zero-lease", "lease_seconds": 0}, 400),
+            ("oversized lease", "POST", self._snapshots_path(repo),
+             {"idempotency_key": "large-lease", "lease_seconds": 1000000}, 400),
+            ("zero generation", "POST", self._snapshots_path(repo, "/" + str(snapshot) + "/renew"),
+             {"idempotency_key": "zero-generation", "expected_generation": 0, "lease_seconds": 120}, 400),
+            ("unknown release field", "DELETE", self._snapshots_path(repo, "/" + str(snapshot)),
+             {"idempotency_key": "unknown-release", "expected_generation": 1, "reason": "client_done"}, 400),
+        ]
+        for label, method, path, body, expected in malformed:
+            status, payload, _ = self._request(method, path, self.alice, body)
+            assert status == expected, (label, status, payload)
+        assert self._ledger(repo) == baseline, "malformed requests changed durable state"
+        return {
+            "snapshot_id": snapshot,
+            "read_only_write_status": 403,
+            "restricted_write_status": 403,
+            "write_only_read_status": 403,
+            "nonmember_status": 404,
+            "write_collaborator_status": 403,
+            "cross_repo_status": 404,
+            "invalid_token_status": 401,
+            "malformed_cases": len(malformed),
+        }
+
+
+    def snapshot_http_historical_tree_blob_and_current_reachability(self):
+        repo, _remote, work, old_oid = self.seed("snap-browse")
+        created = self._create(repo, "browse-create", 300)
+        assert created[0] == 201, created
+        snapshot = created[1]["snapshot_id"]
+
+        new_oid = self.commit_files(work, "browse advance", {"advance.txt": "advance v2\n"})
+        self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice)
+        big = b"x" * (5 * 1024 * 1024)
+        self.commit_files(work, "browse big", {"big.bin": big})
+        self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice)
+        big_snapshot = self._create(repo, "browse-big", 300)[1]["snapshot_id"]
+        baseline = self._ledger(repo)
+
+        status, old_tree, _ = self._tree(repo, snapshot, oid=old_oid)
+        assert status == 200, (status, old_tree)
+        self._assert_tree_view(old_tree)
+        assert old_tree["oid"] == old_oid and old_tree["path"] == "", old_tree
+        base = self._tree_item(old_tree, "base.txt")
+        assert base["kind"] == "blob" and base["path"] == "base.txt", base
+        status, old_blob, _ = self._blob(repo, snapshot, base["oid"])
+        assert status == 200, (status, old_blob)
+        self._assert_blob_view(old_blob)
+        assert old_blob["oid"] == base["oid"] and old_blob["size"] == len(b"seed snap-browse\n"), old_blob
+        assert old_blob["is_binary"] is False, old_blob
+        assert base64.b64decode(old_blob["content_base64"]) == b"seed snap-browse\n", old_blob
+        assert old_blob["content"] == "seed snap-browse\n", old_blob
+        status, metadata, _ = self._read(repo, snapshot)
+        assert status == 200 and metadata["complete_git_read_snapshot"] is False, (status, metadata)
+
+        status, current_tree, _ = self._current_tree(repo)
+        assert status == 200, (status, current_tree)
+        advance = self._tree_item(current_tree, "advance.txt")
+        assert advance["kind"] == "blob", advance
+        big_item = self._tree_item(current_tree, "big.bin")
+        assert big_item["size"] == len(big), big_item
+        status, current_blob, _ = self._current_blob(repo, advance["oid"])
+        assert status == 200 and current_blob["content"] == "advance v2\n", (status, current_blob)
+
+        status, old_again, _ = self._tree(repo, snapshot, oid=old_oid)
+        assert status == 200 and self._tree_item(old_again, "base.txt")["oid"] == base["oid"], old_again
+        status, old_blob_again, _ = self._blob(repo, snapshot, base["oid"])
+        assert status == 200 and base64.b64decode(old_blob_again["content_base64"]) == b"seed snap-browse\n"
+
+        status, _, _ = self._tree(repo, snapshot, oid=new_oid)
+        assert status == 404, ("new commit leaked through old snapshot tree", status)
+        status, _, _ = self._blob(repo, snapshot, advance["oid"])
+        assert status == 404, ("new blob leaked through old snapshot", status)
+
+        status, big_tree, _ = self._tree(repo, big_snapshot)
+        assert status == 200, (status, big_tree)
+        big_retained = self._tree_item(big_tree, "big.bin")
+        status, big_blob, _ = self._blob(repo, big_snapshot, big_retained["oid"])
+        assert status == 413, ("oversized retained blob was not bounded", status, big_blob)
+
+        self.no_bare(repo, "after retained historical tree/blob")
+        assert self._ledger(repo) == baseline, "historical tree/blob reads changed durable metadata"
+        return {
+            "snapshot_id": snapshot,
+            "old_oid": old_oid,
+            "new_oid": new_oid,
+            "historical_base_oid": base["oid"],
+            "historical_base_bytes": old_blob["content"],
+            "current_advance_oid": advance["oid"],
+            "new_commit_outside_old_closure": True,
+            "oversized_blob_status": 413,
+            "metadata_complete_git_read_snapshot": False,
+        }
+
+    def snapshot_http_historical_tree_blob_auth_and_state_refusals(self):
+        repo, _remote, work, old_oid = self.seed("snap-browse-refusals")
+        active = self._create(repo, "browse-active", 300)
+        assert active[0] == 201, active
+        active_snapshot = active[1]["snapshot_id"]
+
+        new_oid = self.commit_files(work, "browse ref advance", {"advance.txt": "advance refusal\n"})
+        self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice)
+        status, current_tree, _ = self._current_tree(repo)
+        assert status == 200, (status, current_tree)
+        advance = self._tree_item(current_tree, "advance.txt")
+
+        released = self._create(repo, "browse-released", 300)[1]["snapshot_id"]
+        status, released_view, _ = self._release(repo, released, "browse-release", 1)
+        assert status == 200 and released_view["released_at_unix_micros"] is not None, (status, released_view)
+        expired = self._create(repo, "browse-expired", 1)[1]
+        self._await_pin_expiry(repo, expired["pin_id"], "browse-expired")
+        expired_snapshot = expired["snapshot_id"]
+        baseline = self._ledger(repo)
+
+        status, reader_tree, _ = self._tree(repo, active_snapshot, oid=old_oid, token=self.reader)
+        assert status == 200, (status, reader_tree)
+        self._assert_tree_view(reader_tree)
+
+        status, _, _ = self._tree(repo, active_snapshot, token=self.bob)
+        assert status == 404, "non-member tree read was not denied"
+        status, _, _ = self._blob(repo, active_snapshot, old_oid, token=self.bob)
+        assert status == 404, "non-member blob read was not denied"
+        self._insert_write_collaborator(repo, self.bob["user_id"])
+        status, _, _ = self._tree(repo, active_snapshot, token=self.bob)
+        assert status == 403, "write collaborator tree read was not denied"
+        status, _, _ = self._blob(repo, active_snapshot, old_oid, token=self.bob)
+        assert status == 403, "write collaborator blob read was not denied"
+
+        scoped = self._issue_scoped(repo, "browse-scope", ["contents_read", "contents_write"])
+        self._patch_scope(repo, scoped, ["contents_write"])
+        status, _, _ = self._tree(repo, active_snapshot, token=scoped)
+        assert status == 403, "missing read scope tree read was not denied"
+        status, _, _ = self._blob(repo, active_snapshot, old_oid, token=scoped)
+        assert status == 403, "missing read scope blob read was not denied"
+
+        other_repo, _other_remote, _other_work, _other_oid = self.seed("snap-browse-other")
+        status, _, _ = self._tree(other_repo, active_snapshot)
+        assert status == 404, "cross-repository retained snapshot was observable"
+        status, _, _ = self._blob(other_repo, active_snapshot, old_oid)
+        assert status == 404, "cross-repository retained snapshot blob was observable"
+
+        status, _, _ = self._tree(repo, released)
+        assert status == 409, "released retained snapshot tree read was not refused"
+        status, _, _ = self._blob(repo, released, old_oid)
+        assert status == 409, "released retained snapshot blob read was not refused"
+        status, _, _ = self._tree(repo, expired_snapshot)
+        assert status == 409, "expired retained snapshot tree read was not refused"
+        status, _, _ = self._blob(repo, expired_snapshot, old_oid)
+        assert status == 409, "expired retained snapshot blob read was not refused"
+
+        status, _, _ = self._tree(repo, active_snapshot, path="../secret")
+        assert status == 400, "malformed retained tree path was accepted"
+        status, _, _ = self._blob(repo, active_snapshot, old_oid, path="../secret")
+        assert status == 400, "malformed retained blob path was accepted"
+        status, _, _ = self._tree(repo, active_snapshot, limit=101)
+        assert status == 400, "out-of-range retained tree limit was accepted"
+        status, _, _ = self._request("GET", self._snapshots_path(repo, "/not-a-uuid/tree"), self.alice)
+        assert status == 400, "malformed retained snapshot selector was accepted"
+
+        status, _, _ = self._tree(repo, active_snapshot, oid=new_oid)
+        assert status == 404, "new commit leaked through active historical tree"
+        status, _, _ = self._blob(repo, active_snapshot, advance["oid"])
+        assert status == 404, "new blob leaked through active historical view"
+
+        self.no_bare(repo, "after retained browse refusals")
+        assert self._ledger(repo) == baseline, "retained browse refusals changed durable metadata"
+        return {
+            "snapshot_id": active_snapshot,
+            "read_only_owner_status": 200,
+            "nonmember_status": 404,
+            "write_collaborator_status": 403,
+            "missing_read_scope_status": 403,
+            "cross_repo_status": 404,
+            "released_status": 409,
+            "expired_status": 409,
+            "outside_closure_status": 404,
+            "malformed_status": 400,
+        }
+
+    def snapshot_http_historical_blob_common_read_bound(self):
+        cap = self._configured_blob_read_cap()
+        assert cap > 2, cap
+        repo, _remote, work, _oid = self.seed("snap-bounds")
+        sizes = {"below.bin": cap - 1, "exact.bin": cap, "above.bin": cap + 1}
+        self.commit_files(work, "browse blob bounds", {name: b"z" * size for name, size in sizes.items()})
+        self.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=self.alice)
+        snapshot = self._create(repo, "browse-bounds", 300)[1]["snapshot_id"]
+        baseline = self._ledger(repo)
+        status, tree, _ = self._tree(repo, snapshot, oid="HEAD")
+        assert status == 200, (status, tree)
+        for name, size in sizes.items():
+            oid = self._tree_item(tree, name)["oid"]
+            retained_status, retained_view, _ = self._blob(repo, snapshot, oid)
+            ordinary_status, ordinary_view, _ = self._current_blob(repo, oid)
+            expected = 413 if name == "above.bin" else 200
+            assert retained_status == expected, (name, retained_status, retained_view)
+            assert ordinary_status == expected, (name, ordinary_status, ordinary_view)
+            if expected == 200:
+                assert retained_view["size"] == size and ordinary_view["size"] == size, (name, retained_view, ordinary_view)
+                assert len(base64.b64decode(retained_view["content_base64"])) == size
+                assert len(base64.b64decode(ordinary_view["content_base64"])) == size
+        status, metadata, _ = self._read(repo, snapshot)
+        assert status == 200 and metadata["complete_git_read_snapshot"] is False, (status, metadata)
+        self.no_bare(repo, "after common blob read boundary")
+        assert self._ledger(repo) == baseline, "common blob boundary reads changed durable metadata"
+        return {
+            "snapshot_id": snapshot,
+            "effective_cap": cap,
+            "below": cap - 1,
+            "exact": cap,
+            "above": cap + 1,
+            "retained_and_current_statuses_match": True,
+        }
+
+def select_cases(names):
+    if not names:
+        return list(CASES)
+    unknown = [name for name in names if name not in CASES]
+    if unknown:
+        raise blob.ProfileError("unknown case(s): " + ", ".join(unknown))
+    selected = [name for name in CASES if name in set(names)]
+    if not selected:
+        raise blob.ProfileError("no cases selected; a zero-case run cannot be green")
+    return selected
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", required=True, help="absolute attested rootyard binary")
+    parser.add_argument("--git", help="absolute trusted Git (defaults to ROOTYARD_GIT)")
+    parser.add_argument("--report", type=Path)
+    parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--case", action="append", default=[])
+    args = parser.parse_args(argv)
+    env = os.environ.copy()
+    hashes = None
+    try:
+        hashes = input_hashes()
+        profile = SnapshotHttpProfile(str(Path(args.binary).resolve()), args.git, env)
+        blob_profile = blob.check_blob_profile(env)
+        blob.need(env.get("ROOTYARD_TEST_DATABASE_URL"), "ROOTYARD_TEST_DATABASE_URL is required")
+        blob.need(shutil.which("psql"), "psql is required")
+        selected = select_cases(args.case)
+    except Exception as error:
+        blob.write_report(args.report, {
+            "kind": "rootyard/refstore-snapshot-http", "passed": False,
+            "preflight_failed": True, "error": str(error), "cases": [],
+            "expected_cases": [], "skips": 0, "limitations": LIMITATIONS,
+            "harness_inputs_sha256": hashes or {},
+        })
+        print("preflight failed: " + str(error), file=sys.stderr)
+        return 2
+
+    args.binary = str(profile.binary)
+    harness = SnapshotHttpHarness(args, profile, blob_profile)
+    success = False
+    try:
+        harness.prepare()
+        for name in selected:
+            harness.case(name, getattr(harness, name))
+        success = True
+    except Exception as error:
+        print(harness.redact(error), file=sys.stderr)
+    finally:
+        try:
+            harness.cleanup()
+        except Exception as error:
+            harness.results.append({"name": "cleanup", "status": "failed", "error": harness.redact(error)})
+            success = False
+        report = blob.build_report(harness, profile, blob_profile, selected, success)
+        report["kind"] = "rootyard/refstore-snapshot-http"
+        report["limitations"] = LIMITATIONS
+        blob.bind_http_report(report, Path(__file__).name, hashes, profile)
+        blob.write_report(args.report, report)
+        print(json.dumps(report, indent=2))
+    return 0 if report["passed"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

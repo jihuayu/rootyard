@@ -149,7 +149,7 @@ impl PgRefStoreCore {
         let tx = begin_bounded(client, deadline).await?;
         let result = async {
             snapshot_sql::durable_write(&tx, deadline).await?;
-            self.renew_in_tx(&tx, request, deadline).await
+            self.renew_in_tx(&tx, request, deadline, snapshot_sql::ScopeLane::Unserved { require_unserved: true }).await
         }
         .await;
         match result {
@@ -171,13 +171,33 @@ impl PgRefStoreCore {
         }
     }
 
+    /// Serving renew inside a caller-owned transaction. The coordinator owns
+    /// the commit and late token check; the A5a ledger/CAS path is unchanged.
+    pub(crate) async fn renew_serving_checked(
+        &self,
+        tx: &Transaction<'_>,
+        request: &RenewMetadataPinRequest,
+        backend_identity_hex: &str,
+        deadline: Instant,
+    ) -> Result<MetadataPinOutcome, RefStoreError> {
+        snapshot_sql::durable_write(tx, deadline).await?;
+        self.renew_in_tx(
+            tx,
+            request,
+            deadline,
+            snapshot_sql::ScopeLane::Serving { backend_identity: backend_identity_hex },
+        )
+        .await
+    }
+
     async fn renew_in_tx(
         &self,
         tx: &Transaction<'_>,
         request: &RenewMetadataPinRequest,
         deadline: Instant,
+        lane: snapshot_sql::ScopeLane<'_>,
     ) -> Result<MetadataPinOutcome, RefStoreError> {
-        pg::before_deadline(deadline, self.renew_checked(tx, request, deadline)).await
+        pg::before_deadline(deadline, self.renew_checked(tx, request, deadline, lane)).await
     }
 
     async fn renew_checked(
@@ -185,6 +205,7 @@ impl PgRefStoreCore {
         tx: &Transaction<'_>,
         request: &RenewMetadataPinRequest,
         deadline: Instant,
+        lane: snapshot_sql::ScopeLane<'_>,
     ) -> Result<MetadataPinOutcome, RefStoreError> {
         let scope = request.scope();
         pg::bound(tx, deadline).await?;
@@ -242,7 +263,7 @@ impl PgRefStoreCore {
         let a2_delta = UsageDelta::receipt(receipt_logical_bytes(MAX_RECEIPT_BODY_BYTES));
         let usage = self.lock_pin_usage(tx, scope, pack_header.is_some(), a2_delta).await?;
 
-        snapshot_sql::lock_scope(tx, scope, true, false).await?;
+        snapshot_sql::lock_scope_lane(tx, scope, lane, false).await?;
         let pin = snapshot_sql::pin_for_update(tx, request.pin_id(), scope.repository_id())
             .await?
             .ok_or(RefStoreError::MetadataPinNotFound { pin_id: request.pin_id() })?;
@@ -352,7 +373,8 @@ impl PgRefStoreCore {
         let tx = begin_bounded(client, deadline).await?;
         let result = async {
             snapshot_sql::durable_write(&tx, deadline).await?;
-            self.release_in_tx(&tx, request, deadline).await
+            self.release_in_tx(&tx, request, deadline, snapshot_sql::ScopeLane::Unserved { require_unserved: false })
+                .await
         }
         .await;
         match result {
@@ -374,13 +396,33 @@ impl PgRefStoreCore {
         }
     }
 
+    /// Serving release inside a caller-owned transaction. It still requires a
+    /// current ready serving binding/backend and the exact stored generation.
+    pub(crate) async fn release_serving_checked(
+        &self,
+        tx: &Transaction<'_>,
+        request: &ReleaseMetadataPinRequest,
+        backend_identity_hex: &str,
+        deadline: Instant,
+    ) -> Result<MetadataPinOutcome, RefStoreError> {
+        snapshot_sql::durable_write(tx, deadline).await?;
+        self.release_in_tx(
+            tx,
+            request,
+            deadline,
+            snapshot_sql::ScopeLane::Serving { backend_identity: backend_identity_hex },
+        )
+        .await
+    }
+
     async fn release_in_tx(
         &self,
         tx: &Transaction<'_>,
         request: &ReleaseMetadataPinRequest,
         deadline: Instant,
+        lane: snapshot_sql::ScopeLane<'_>,
     ) -> Result<MetadataPinOutcome, RefStoreError> {
-        pg::before_deadline(deadline, self.release_checked(tx, request, deadline)).await
+        pg::before_deadline(deadline, self.release_checked(tx, request, deadline, lane)).await
     }
 
     async fn release_checked(
@@ -388,6 +430,7 @@ impl PgRefStoreCore {
         tx: &Transaction<'_>,
         request: &ReleaseMetadataPinRequest,
         deadline: Instant,
+        lane: snapshot_sql::ScopeLane<'_>,
     ) -> Result<MetadataPinOutcome, RefStoreError> {
         let scope = request.scope();
         pg::bound(tx, deadline).await?;
@@ -446,7 +489,7 @@ impl PgRefStoreCore {
         // Release deliberately does not require the repository to still be an
         // unserved core repository: a transition must not strand a pin. The
         // stored snapshot/pin rows are the authority for its exact scope.
-        snapshot_sql::lock_scope(tx, scope, false, false).await?;
+        snapshot_sql::lock_scope_lane(tx, scope, lane, false).await?;
         let pin = snapshot_sql::pin_for_update(tx, request.pin_id(), scope.repository_id())
             .await?
             .ok_or(RefStoreError::MetadataPinNotFound { pin_id: request.pin_id() })?;
