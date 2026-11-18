@@ -128,29 +128,33 @@ fn resolve_git_binary() -> Result<PathBuf> {
     Err(anyhow!("stock git binary not found at /usr/bin/git"))
 }
 
-async fn issue_writable_actor(pool: &Pool, prefix: &str) -> Result<(db::Identity, String, String)> {
+struct PgActor {
+    identity: db::Identity,
+    username: String,
+    token: String,
+}
+
+async fn issue_writable_actor(pool: &Pool, prefix: &str) -> Result<PgActor> {
     let username = format!("{prefix}{}", &Uuid::new_v4().simple().to_string()[..10]);
     let val = db::issue_token(pool, &username, true, false).await.map_err(|e| anyhow!("{e}"))?;
     let token = val["token"].as_str().ok_or_else(|| anyhow!("missing token"))?.to_owned();
     let mut headers = HeaderMap::new();
     headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}"))?);
     let identity = rootyard::auth::authenticate(pool, &headers).await.map_err(|e| anyhow!("{}", e.1))?;
-    Ok((identity, username, token))
+    Ok(PgActor { identity, username, token })
 }
 
 async fn create_and_provision_repo(
     addr: SocketAddr,
     pool: &Pool,
     store: &BlobStore,
-    identity: &db::Identity,
-    username: &str,
-    token: &str,
+    actor: &PgActor,
     name: &str,
     fmt: &str,
 ) -> Result<Uuid> {
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/repos"))
-        .bearer_auth(token)
+        .bearer_auth(&actor.token)
         .json(&json!({"name": name, "object_format": fmt}))
         .send()
         .await?;
@@ -160,7 +164,7 @@ async fn create_and_provision_repo(
     let repo_id = Uuid::parse_str(body["id"].as_str().ok_or_else(|| anyhow!("missing repo id"))?)?;
 
     let dl = TokioInstant::now() + Duration::from_secs(30);
-    let serving = lookup(pool, identity, username, name, true, store.backend_identity(), dl).await?;
+    let serving = lookup(pool, &actor.identity, &actor.username, name, true, store.backend_identity(), dl).await?;
     let gate = serving.gate;
     let exp = RealmExpectation::new(
         gate.repository_id(),
@@ -189,16 +193,15 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
     let s3 = LoopbackS3::shared();
     let store = s3.open_store()?;
     let gw = LiveGateway::start(pg.pool.clone(), store.clone(), Duration::from_secs(60)).await?;
-    let (owner_id, username, token) = issue_writable_actor(&pg.pool, "push183").await?;
+    let actor = issue_writable_actor(&pg.pool, "push183").await?;
     let backend_hex = store.backend_identity().as_hex().to_owned();
 
     // 1. Exercise real production `POST /git/{owner}/{name}.git/git-receive-pack` with stock `git` (`sha1` & `sha256`).
     for (fmt_str, git_fmt) in [("sha1", GitObjectFormat::Sha1), ("sha256", GitObjectFormat::Sha256)] {
         let repo_name = format!("gw-{fmt_str}-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        let repo_id =
-            create_and_provision_repo(gw.addr, &pg.pool, &store, &owner_id, &username, &token, &repo_name, fmt_str)
-                .await?;
-        let remote_url = format!("http://{username}:{token}@{}/git/{username}/{repo_name}.git", gw.addr);
+        let repo_id = create_and_provision_repo(gw.addr, &pg.pool, &store, &actor, &repo_name, fmt_str).await?;
+        let remote_url =
+            format!("http://{}:{}@{}/git/{}/{repo_name}.git", actor.username, actor.token, gw.addr, actor.username);
 
         let tmp = TempDir::new()?;
         let clone1 = tmp.path().join("clone1");
@@ -222,7 +225,9 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
             receipt.committed_gate_revision
         );
         ensure!(
-            receipt.accepted_updates.len() == 1 && receipt.accepted_updates[0].new_oid.as_deref() == Some(c2.as_str())
+            receipt.accepted_updates.len() == 1
+                && receipt.accepted_updates[0].old_oid.as_deref() == Some(c1.as_str())
+                && receipt.accepted_updates[0].new_oid.as_deref() == Some(c2.as_str())
         );
         receipt.verify_digest()?;
 
@@ -269,25 +274,23 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
 
     // 2. Direct `commit_push_on_pg` acceptance: proves PG producer gates on scoped decision + durable holds
     //    and rebinds `CausalPushProofReceipt` to the actual `AcceptedSubset` CAS outcome (#183 Merge Gate 3).
-    exercise_pg_scoped_producer(pg, &store, gw.addr, &owner_id, &username, &token, &backend_hex).await?;
+    exercise_pg_scoped_producer(pg, &store, gw.addr, &actor, &backend_hex).await?;
 
     // 3. Real TCP HTTP slowloris command-phase stall against production `git-receive-pack` (#183 Merge Gate 1).
     let tight_gw = LiveGateway::start(pg.pool.clone(), store.clone(), Duration::from_millis(250)).await?;
     let stall_repo = format!("stall-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    let stall_repo_id =
-        create_and_provision_repo(tight_gw.addr, &pg.pool, &store, &owner_id, &username, &token, &stall_repo, "sha1")
-            .await?;
-    let auth_b64 = base64_basic(&username, &token);
+    let stall_repo_id = create_and_provision_repo(tight_gw.addr, &pg.pool, &store, &actor, &stall_repo, "sha1").await?;
+    let auth_b64 = base64_basic(&actor.username, &actor.token);
     let mut stream = TcpStream::connect(tight_gw.addr).await?;
     let partial_pkt = b"0067000000000000"; // incomplete pkt-line command (stalls before `0000` flush!)
     let req_head = format!(
-        "POST /git/{username}/{stall_repo}.git/git-receive-pack HTTP/1.1\r\n\
+        "POST /git/{}/{stall_repo}.git/git-receive-pack HTTP/1.1\r\n\
          Host: {}\r\n\
          Authorization: Basic {auth_b64}\r\n\
          Content-Type: application/x-git-receive-pack-request\r\n\
          Content-Length: 4096\r\n\
          Connection: close\r\n\r\n",
-        tight_gw.addr
+        actor.username, tight_gw.addr
     );
     stream.write_all(req_head.as_bytes()).await?;
     stream.write_all(partial_pkt).await?;
@@ -318,18 +321,17 @@ async fn exercise_pg_scoped_producer(
     pg: &PgSchemaGuard,
     store: &BlobStore,
     addr: SocketAddr,
-    owner: &db::Identity,
-    username: &str,
-    token: &str,
+    actor: &PgActor,
     backend_hex: &str,
 ) -> Result<()> {
     let repo_name = format!("pgprod-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    let repo_id = create_and_provision_repo(addr, &pg.pool, store, owner, username, token, &repo_name, "sha1").await?;
+    let repo_id = create_and_provision_repo(addr, &pg.pool, store, actor, &repo_name, "sha1").await?;
     let dl = TokioInstant::now() + Duration::from_secs(30);
     let mut db_client = pg.pool.get().await?;
     let repo_owner_id: Uuid =
         db_client.query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&repo_id]).await?.get(0);
-    let serving = lookup(&pg.pool, owner, username, &repo_name, true, store.backend_identity(), dl).await?;
+    let serving =
+        lookup(&pg.pool, &actor.identity, &actor.username, &repo_name, true, store.backend_identity(), dl).await?;
     let gate = serving.gate;
     let baseline = PgPackCommit.capture_baseline(&mut db_client, repo_id, gate.tenant_id(), dl).await?;
     drop(db_client);
@@ -369,8 +371,9 @@ async fn exercise_pg_scoped_producer(
         authorized_base_packs: Vec::new(),
     };
     let op_id = Uuid::new_v4();
-    let ticket = OperationTicket { issuer_id: owner.id, lane: "pg-push".into(), sequence: 1, operation_id: op_id };
-    let auth = active_auth(owner.id, true);
+    let ticket =
+        OperationTicket { issuer_id: actor.identity.id, lane: "pg-push".into(), sequence: 1, operation_id: op_id };
+    let auth = active_auth(actor.identity.id, true);
     let caps = ReceiveCapabilities { report_status: true, atomic: false, ..ReceiveCapabilities::default() };
 
     // Two updates in `AcceptedSubset`: `refs/heads/main` (Absent -> c1, succeeds) + `refs/heads/stale` (Present(fake) -> c1, rejected).
@@ -399,7 +402,7 @@ async fn exercise_pg_scoped_producer(
         group_epoch: snapshot.group_epoch,
         object_format: GitObjectFormat::Sha1,
         operation_id: op_id,
-        issuer_id: owner.id,
+        issuer_id: actor.identity.id,
         lane: ticket.lane.clone(),
         sequence: 1,
         base_snapshot_seq: snapshot.snapshot_seq,
@@ -435,7 +438,7 @@ async fn exercise_pg_scoped_producer(
         pool: &pg.pool,
         store,
         git_binary: &git_bin,
-        actor: owner,
+        actor: &actor.identity,
         owner_id: repo_owner_id,
         snapshot: &snapshot,
         ticket: &ticket,
