@@ -17,19 +17,10 @@ use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::{Router, response::Response, routing::any};
-use deadpool_postgres::{Manager, Pool};
-use rootyard::blob_store::{config::BlobProfile, disposable_view::DisposableViewRoot, opendal::BlobStore};
+use rootyard::blob_store::{disposable_view::DisposableViewRoot, opendal::BlobStore};
 use rootyard::ci_checkouts::clonekit::{
     CloneKitObjectFormat::{Sha1, Sha256 as FmtSha256},
     *,
-};
-use rootyard::{
-    db,
-    ref_store::{
-        CoreGateInit, GitObjectFormat, IssuerLane, OperationIdentity, OperationState, PgRefStore, PgRefStoreCore,
-        RefName, RequestDigest,
-        artifact_hold::{ArtifactHoldPurpose, HoldScope},
-    },
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -39,6 +30,8 @@ use uuid::Uuid;
 
 #[path = "ci_clonekit_diag_support/mod.rs"]
 mod ck_diag;
+#[path = "ci_clonekit_live_support/mod.rs"]
+mod ck_live;
 
 const SECRET: [u8; 32] = [0x42u8; 32];
 const KIT_CREATED_UNIX: i64 = 1_750_000_000;
@@ -440,60 +433,5 @@ async fn clonekit_fail_closed_auth_revocation_cancel_gc_pin_and_dependencies() -
 #[tokio::test]
 #[ignore = "requires PostgreSQL (ROOTYARD_TEST_DATABASE_URL) and controlled S3 (ROOTYARD_BLOB_*)"]
 async fn pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation() -> Result<()> {
-    let url = std::env::var("ROOTYARD_TEST_DATABASE_URL").expect("ROOTYARD_TEST_DATABASE_URL");
-    let (admin, schema) = (db::pool(&url)?, format!("clonekit_test_{}", Uuid::new_v4().simple()));
-    admin.get().await?.batch_execute(&format!("CREATE SCHEMA {schema}")).await?;
-    let mut cfg: tokio_postgres::Config = url.parse()?;
-    cfg.options(format!("-c search_path={schema} -c timezone=UTC -c statement_timeout=30000"));
-    let pool = Pool::builder(Manager::new(cfg, tokio_postgres::NoTls))
-        .runtime(deadpool_postgres::Runtime::Tokio1)
-        .max_size(8)
-        .build()?;
-    let res = async {
-        db::migrate(&pool).await?;
-        let (blob, td) = (BlobStore::open(BlobProfile::from_env()?)?, TempDir::new()?);
-        let (vr, repo) = (private_vr(&td)?, init_repo(td.path(), "pg_repo", Sha1)?);
-        let c1 = add_commit(&repo, "big.bin", &payload_bytes(9, 128 * 1024), "c1")?;
-        let (ids, token_id) = ((Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()), Uuid::new_v4());
-        let client = pool.get().await?;
-        let (token_digest, credential_digest): (&[u8], &[u8]) = (&[7u8; 32], &[9u8; 32]);
-        client.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&ids.0, &format!("ck_{}", &ids.0.simple().to_string()[..8])]).await?;
-        client.execute("INSERT INTO tokens(id,user_id,digest) VALUES($1,$2,$3)", &[&token_id, &ids.0, &token_digest]).await?;
-        client.execute("INSERT INTO repositories(id,owner_id,name,state,object_format,storage_generation) VALUES($1,$2,$3,'provisioning','sha1',1)", &[&ids.1, &ids.0, &"ckrepo"]).await?;
-        drop(client);
-        let pg_dl = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut c = pool.get().await?;
-        let gate = *PgRefStoreCore.initialize(&mut c, &CoreGateInit::new(ids.1, ids.0, GitObjectFormat::Sha1, ids.2, 1, 1, RefName::branch("refs/heads/main")?)?, pg_dl).await?.digest();
-        let op = OperationIdentity::new(ids.1, ids.0, IssuerLane::new("ci-clonekit")?, 1, Uuid::new_v4(), RequestDigest::from_bytes([1u8; 32]))?;
-        let tx = c.transaction().await?;
-        ensure!(PgRefStore.begin(&tx, &op, pg_dl).await?.record.state() == OperationState::Pending);
-        tx.commit().await?;
-        drop(c);
-        let now: i64 = pool.get().await?.query_one("SELECT extract(epoch FROM clock_timestamp())::bigint", &[]).await?.get(0);
-        let mut built = build_kit_with_clock(ids, Sha1, 1, (&repo, &td), None, None, Some(now))?;
-        let receipts = publish_clonekit_to_blob_store(&pool, &blob, &BlobHoldPublishContext { scope: HoldScope::new(ids.1, ids.0, ids.0, ArtifactHoldPurpose::RefPublication, GitObjectFormat::Sha1, ids.2, 1, 1)?, operation: op, expected_gate_digest: gate, authority_id: ids.1, authority_generation: 1 }, &mut built, None).await?;
-        ensure!(receipts.len() == 2 && built.manifest.pack.as_ref().and_then(|p| p.blob_locator.as_ref()).is_some());
-        // Publish from the unserved core lane, then become ready for the checkout oracle.
-        let updated = pool.get().await?.execute("UPDATE repositories SET state='ready' WHERE id=$1", &[&ids.1]).await?;
-        ensure!(updated == 1, "fixture readiness transition updated {updated} rows");
-        let c2 = add_commit(&repo, "next.txt", b"delta2\n", "c2")?;
-        let (signed, ctx) = make_grant(ids, Sha1, &c2, None, now)?;
-        let plan = serde_json::json!({"version":1,"job_id":ctx.job_id,"owner_id":ids.0,"repository_id":ids.1,"storage_generation":1,"object_format":"sha1","target_oid":c2,"source_receipt_sha256":"a".repeat(64),"mirror_audience":ctx.audience,"expires_unix":signed.claims.not_after_unix});
-        pool.get().await?.execute("INSERT INTO ci_checkout_jobs(repository_id,job_id,owner_id,plan,issuer_token_id,credential_digest,expires_unix) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&ids.1, &ctx.job_id, &ids.0, &plan, &token_id, &credential_digest, &signed.claims.not_after_unix]).await?;
-
-        let pg_auth: Arc<dyn CloneKitAuthorityOracle> = Arc::new(PgCheckoutAuthorityOracle::new(pool.clone()));
-        let co = Co { manifest: Some(&built.manifest), blob: Some(&blob), ..Co::new(&vr) };
-        let outcome = co.run(&signed, &ctx, &pg_auth, pol(true, true), repo.to_str().expect("utf8"), None).await?;
-        ensure!(outcome.telemetry.strategy == CheckoutStrategy::CloneKitIncremental { kit_generation: 1, base_commit_oid: c1 });
-        ensure!(pool.get().await?.query_one("SELECT count(*) FROM artifact_holds WHERE state = 'active'", &[]).await?.get::<_, i64>(0) == 2);
-
-        pool.get().await?.execute("UPDATE ci_checkout_jobs SET revoked = true WHERE repository_id=$1 AND job_id=$2", &[&ids.1, &ctx.job_id]).await?;
-        ensure!(matches!(co.run(&signed, &ctx, &pg_auth, pol(false, true), repo.to_str().expect("utf8"), None).await, Err(CloneKitError::GrantRevoked(_))));
-        Ok(())
-    }.await;
-    pool.close();
-    drop(pool);
-    admin.get().await?.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await?;
-    admin.close();
-    res
+    ck_live::run().await
 }

@@ -8,11 +8,14 @@ on:
       - 'src/blob_store/**'
       - 'src/ref_store/**'
       - 'tests/ci_clonekit.rs'
+      - 'tests/ci_clonekit_live_support/mod.rs'
       - 'tests/test_ci_clonekit_contracts.py'
       - 'tests/test_ci_clonekit_projection.py'
+      - 'tests/test_ci_clonekit_live_receipt.py'
       - 'scripts/eval_ci_clonekit.py'
       - 'scripts/ci_clonekit_focused_receipt.sh'
       - 'scripts/ci_clonekit_integration_receipt.sh'
+      - 'scripts/ci_clonekit_live_receipt.sh'
       - 'docs/ci-clonekit.md'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -110,7 +113,8 @@ jobs:
             tests.test_ci_workflow_triggers \
             tests.test_ci_cargo_fork_workflows \
             tests.test_ci_clonekit_contracts \
-            tests.test_ci_clonekit_projection
+            tests.test_ci_clonekit_projection \
+            tests.test_ci_clonekit_live_receipt
 
       - name: Clippy and CloneKit unit plus Smart-HTTP integration tests
         run: |
@@ -152,6 +156,10 @@ jobs:
       - name: Run live PostgreSQL 17 and Garage S3 CloneKit acceptance test
         run: |
           set -euo pipefail
+          live_receipt=test-results/ci-clonekit/live-command.json
+          live_rust_receipt=test-results/ci-clonekit/live-rust.json
+          live_stage=env_setup
+          trap 'status=$?; trap - EXIT; set +e; scripts/ci_clonekit_live_receipt.sh stage "$live_stage" "$status" "$live_receipt"; receipt_status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; [ "$receipt_status" -eq 0 ] || exit 1; exit 0' EXIT
           set -a
           # shellcheck disable=SC1090
           source "$OBJECT_STORE_ENV_FILE"
@@ -163,7 +171,20 @@ jobs:
           export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
           export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
           export ROOTYARD_BLOB_ROOT="ci-clonekit-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          cargo test --locked --test ci_clonekit -- --ignored --test-threads=1
+          live_stage=cargo_test
+          set +e
+          cargo test --locked --test ci_clonekit -- --ignored --test-threads=1 2>&1 | scripts/ci_clonekit_live_receipt.sh project "$live_rust_receipt"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          producer_status=${pipeline_status[0]:-1}
+          collector_status=${pipeline_status[1]:-1}
+          if [ "$producer_status" -ne 0 ]; then
+            exit "$producer_status"
+          fi
+          if [ "$collector_status" -ne 0 ]; then
+            exit "$collector_status"
+          fi
+          live_stage=complete
 
       - name: Run full empirical CloneKit evaluation
         run: |

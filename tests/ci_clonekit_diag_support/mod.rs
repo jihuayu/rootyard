@@ -68,7 +68,7 @@ pub(crate) enum Class {
 }
 
 impl Class {
-    fn from_ck(err: &CloneKitError) -> Self {
+    pub(crate) fn from_ck(err: &CloneKitError) -> Self {
         match err {
             CloneKitError::InvalidConfig(_) => Self::InvalidConfig,
             CloneKitError::InvalidInput(_) => Self::InvalidInput,
