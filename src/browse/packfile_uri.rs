@@ -24,6 +24,8 @@ mod tests_bijection;
 #[cfg(test)]
 mod tests_luna_gates;
 #[cfg(test)]
+mod tests_pinned_dir;
+#[cfg(test)]
 mod tests_same_bytes;
 
 pub use cover_builder::{

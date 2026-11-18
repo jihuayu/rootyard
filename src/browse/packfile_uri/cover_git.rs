@@ -16,25 +16,20 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{
-    cache_wake::replica_cache::error::is_lower_hex_exact,
-    ref_store::{
-        GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget,
-        contract::{IssuerLane, RequestDigest},
-        core::CommitMode,
-        ref_version::{
-            BaseRequestSelector, CommitSetHead, CommitSetInput, CommitSetVersionEntry, OperationDigestInput,
-            PackSetEntry, RefVersionIntent, RefVersionKind, RefVersionRealm, VersionId, VersionRecord,
-            VersionRecordInput, compute_commit_set_id, compute_pack_set_digest, derive_candidate_version_id,
-            operation_digest,
-        },
+use crate::ref_store::{
+    GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget,
+    contract::{IssuerLane, RequestDigest},
+    core::CommitMode,
+    ref_version::{
+        BaseRequestSelector, CommitSetHead, CommitSetInput, CommitSetVersionEntry, OperationDigestInput, PackSetEntry,
+        RefVersionIntent, RefVersionKind, RefVersionRealm, VersionId, VersionRecord, VersionRecordInput,
+        compute_commit_set_id, compute_pack_set_digest, derive_candidate_version_id, operation_digest,
     },
 };
 
 use super::{
     pack_bijection::{
-        parse_and_verify_idx_v2_oids, read_confined_regular_pack_artifact, verify_confined_pack_dir,
-        verify_raw_pack_stream_bijection,
+        PinnedPackDir, parse_and_verify_idx_v2_oids, parse_verify_pack_objects, verify_raw_pack_stream_bijection,
     },
     types::{
         DEFAULT_HELPER_TIMEOUT_MS, MAX_CLOSURE_COMMITS, MAX_CLOSURE_OBJECTS, MAX_HELPER_STDERR_BYTES,
@@ -308,23 +303,20 @@ pub(super) async fn discover_repo_packs(
     fmt: PackObjectFormat,
     limits: &HelperResourceLimits,
 ) -> Result<(Vec<DiscoveredPack>, bool), PackfileUriError> {
-    let Some(pack_dir) = verify_confined_pack_dir(repo_dir)? else {
+    let Some(pinned_pack_dir) = PinnedPackDir::open_confined(repo_dir)? else {
         return Ok((Vec::new(), false));
     };
-    let rd = match std::fs::read_dir(&pack_dir) {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
-        Err(e) => return Err(PackfileUriError::Internal(format!("failed to open objects/pack directory: {e}"))),
-    };
+    let rd = pinned_pack_dir.read_dir()?;
     let mut saw_nonregular_artifact = false;
     let iter = rd.map(|res| {
         let entry = res?;
-        let path = entry.path();
         let ft = entry.file_type()?;
-        if path.extension().is_some_and(|ext| ext == "pack" || ext == "idx") && (ft.is_symlink() || !ft.is_file()) {
+        let name_path = PathBuf::from(entry.file_name());
+        let is_artifact = name_path.extension().is_some_and(|ext| ext == "pack" || ext == "idx");
+        if is_artifact && (ft.is_symlink() || !ft.is_file()) {
             saw_nonregular_artifact = true;
         }
-        Ok(path)
+        Ok(name_path)
     });
     let paths = collect_bounded_pack_paths(iter, limits.max_scanned_packs)?;
     if saw_nonregular_artifact {
@@ -332,15 +324,10 @@ pub(super) async fn discover_repo_packs(
     }
     let (hex_len, trailer_len) = (fmt.oid_hex_len(), fmt.oid_hex_len() / 2);
     let (mut total_scanned, mut rejected_corrupt_pack, mut out) = (0u64, false, Vec::new());
-    for pack_path in paths {
-        let idx_path = pack_path.with_extension("idx");
-        let (Some(pack_name), Some(idx_name)) = (pack_path.file_name(), idx_path.file_name()) else {
-            rejected_corrupt_pack = true;
-            continue;
-        };
-        let pack_bytes = match read_confined_regular_pack_artifact(
-            &pack_dir,
-            pack_name,
+    for pack_rel in paths {
+        let idx_rel = pack_rel.with_extension("idx");
+        let pack_bytes = match pinned_pack_dir.read_regular_artifact(
+            pack_rel.as_os_str(),
             limits.max_single_pack_bytes,
             &mut total_scanned,
             limits.max_total_scanned_bytes,
@@ -354,9 +341,8 @@ pub(super) async fn discover_repo_packs(
             }
             Err(e) => return Err(e),
         };
-        let idx_bytes = match read_confined_regular_pack_artifact(
-            &pack_dir,
-            idx_name,
+        let idx_bytes = match pinned_pack_dir.read_regular_artifact(
+            idx_rel.as_os_str(),
             limits.max_single_idx_bytes,
             &mut total_scanned,
             limits.max_total_scanned_bytes,
@@ -386,32 +372,15 @@ pub(super) async fn discover_repo_packs(
                 continue;
             }
         };
-        let mut defined_oids = HashSet::with_capacity(object_count);
-        let mut delta_bases = Vec::new();
-        let mut commits = Vec::new();
-        for line in String::from_utf8_lossy(&vp_out).lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 5
-                && matches!(parts[1], "commit" | "tree" | "blob" | "tag")
-                && is_lower_hex_exact(parts[0], hex_len)
-            {
-                defined_oids.insert(parts[0].to_owned());
-                if parts[1] == "commit" {
-                    commits.push(parts[0].to_owned());
-                }
-                if parts.len() >= 7 && is_lower_hex_exact(parts[6], hex_len) {
-                    delta_bases.push(parts[6].to_owned());
-                }
-            }
-        }
-        if defined_oids.len() != object_count || defined_oids != idx_oids {
+        let Some((defined_oids, commits, is_standalone)) =
+            parse_verify_pack_objects(&vp_out, object_count, hex_len, &idx_oids)
+        else {
             rejected_corrupt_pack = true;
             continue;
-        }
+        };
         if commits.is_empty() {
             continue;
         }
-        let is_standalone = delta_bases.iter().all(|base| defined_oids.contains(base));
         let pack_hash_hex = hex::encode(&pack_bytes[pack_bytes.len() - trailer_len..]);
         let pack_sha256_hex = hex::encode(Sha256::digest(&pack_bytes[..]));
         out.push(DiscoveredPack {

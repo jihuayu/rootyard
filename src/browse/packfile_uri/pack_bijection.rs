@@ -5,8 +5,19 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
 };
+#[cfg(unix)]
+use std::{
+    ffi::CString,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+        io::{AsRawFd, FromRawFd},
+    },
+};
 
 use uuid::Uuid;
+
+use crate::cache_wake::replica_cache::error::is_lower_hex_exact;
 
 use super::{
     cover_git::{HelperResourceLimits, run_git_bounded},
@@ -98,140 +109,321 @@ impl Drop for ScratchDir {
     }
 }
 
-/// Verifies `repo_dir`, `repo_dir/objects`, and `repo_dir/objects/pack` are real non-symlink directories.
-/// Returns `Ok(None)` cleanly when `objects` or `objects/pack` does not exist yet (`NotFound`).
-pub(super) fn verify_confined_pack_dir(repo_dir: &Path) -> Result<Option<PathBuf>, PackfileUriError> {
-    let repo_meta = std::fs::symlink_metadata(repo_dir)
-        .map_err(|e| PackfileUriError::Internal(format!("stat repo_dir failed: {e}")))?;
-    if repo_meta.file_type().is_symlink() || !repo_meta.file_type().is_dir() {
-        return Err(PackfileUriError::IntegrityMismatch("repo_dir is not a real directory".to_owned()));
-    }
-    let objects_dir = repo_dir.join("objects");
-    match std::fs::symlink_metadata(&objects_dir) {
-        Ok(m) if !m.file_type().is_symlink() && m.file_type().is_dir() => {}
-        Ok(_) => return Err(PackfileUriError::IntegrityMismatch("objects is not a real directory".to_owned())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(PackfileUriError::Internal(format!("stat objects dir failed: {e}"))),
-    }
-    let pack_dir = objects_dir.join("pack");
-    let pack_lmeta = match std::fs::symlink_metadata(&pack_dir) {
-        Ok(m) if !m.file_type().is_symlink() && m.file_type().is_dir() => m,
-        Ok(_) => return Err(PackfileUriError::IntegrityMismatch("objects/pack is not a real directory".to_owned())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(PackfileUriError::Internal(format!("stat objects/pack dir failed: {e}"))),
-    };
+/// Retained verified directory handle for `objects/pack` (or a private `ScratchDir`).
+/// On Unix, holds the live `O_DIRECTORY | O_NOFOLLOW` file descriptor and its `(dev, ino)` identity;
+/// all directory enumeration and `.pack`/`.idx` opens execute strictly relative to this descriptor
+/// (`openat` + `/proc/self/fd/<fd>`) without re-resolving parent pathname components.
+pub(super) struct PinnedPackDir {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let dir_f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&pack_dir)
-            .map_err(|e| PackfileUriError::IntegrityMismatch(format!("open objects/pack dir failed: {e}")))?;
-        let dir_fmeta = dir_f
-            .metadata()
-            .map_err(|e| PackfileUriError::Internal(format!("fstat objects/pack dir failed: {e}")))?;
-        if (dir_fmeta.dev(), dir_fmeta.ino()) != (pack_lmeta.dev(), pack_lmeta.ino()) {
-            return Err(PackfileUriError::IntegrityMismatch("objects/pack dir inode swapped".to_owned()));
-        }
-    }
+    dir_file: std::fs::File,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
     #[cfg(not(unix))]
-    {
-        let _ = &pack_lmeta;
-    }
-    Ok(Some(pack_dir))
+    dir_path: PathBuf,
 }
 
-/// Opens a single-component regular file inside `pack_dir` without following symlinks (`O_NOFOLLOW`)
-/// and reads its bytes in bounded chunks while enforcing `max_file_bytes` and cumulative `max_total_bytes`.
-/// Returns `Ok(None)` only when the file was concurrently unlinked (`NotFound`) before open.
-pub(super) fn read_confined_regular_pack_artifact(
-    pack_dir: &Path,
-    file_name: &std::ffi::OsStr,
-    max_file_bytes: u64,
-    total_scanned: &mut u64,
-    max_total_bytes: u64,
-) -> Result<Option<bytes::Bytes>, PackfileUriError> {
-    let mut comps = Path::new(file_name).components();
-    match (comps.next(), comps.next()) {
-        (Some(std::path::Component::Normal(_)), None) => {}
-        _ => return Err(PackfileUriError::IntegrityMismatch("non-local pack artifact filename".to_owned())),
-    }
-    let dir_meta = std::fs::symlink_metadata(pack_dir)
-        .map_err(|e| PackfileUriError::Internal(format!("re-stat objects/pack failed: {e}")))?;
-    if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
-        return Err(PackfileUriError::IntegrityMismatch("objects/pack ceased to be a real directory".to_owned()));
-    }
-    let path = pack_dir.join(file_name);
-    let lmeta = match std::fs::symlink_metadata(&path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(PackfileUriError::Internal(format!("lstat pack artifact failed: {e}"))),
-    };
-    if lmeta.file_type().is_symlink() || !lmeta.file_type().is_file() {
-        return Err(PackfileUriError::IntegrityMismatch("non-regular entry in objects/pack".to_owned()));
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
+impl PinnedPackDir {
+    /// Opens one single-component child directory strictly relative to `parent` without symlink traversal.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    fn openat_subdir(parent: &std::fs::File, child_name: &str) -> Result<Option<std::fs::File>, PackfileUriError> {
+        let c_name = CString::new(child_name)
+            .map_err(|_| PackfileUriError::IntegrityMismatch("invalid subdir name".to_owned()))?;
+        // SAFETY: `parent` is a live verified directory descriptor, `c_name` is a valid
+        // single-component NUL-terminated string, and `O_DIRECTORY | O_NOFOLLOW` never follows symlinks.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(PackfileUriError::IntegrityMismatch(format!("refused opening subdir {child_name}: {err}")));
+        }
+        // SAFETY: `fd` is a fresh non-negative file descriptor owned exclusively here.
+        let dir_file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let meta = dir_file
+            .metadata()
+            .map_err(|e| PackfileUriError::Internal(format!("fstat subdir {child_name}: {e}")))?;
+        if !meta.is_dir() {
+            return Err(PackfileUriError::IntegrityMismatch(format!("{child_name} is not a directory")));
+        }
+        Ok(Some(dir_file))
     }
-    let file = match opts.open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(PackfileUriError::IntegrityMismatch(format!("refused opening pack artifact: {e}"))),
-    };
-    let fmeta = file
-        .metadata()
-        .map_err(|e| PackfileUriError::Internal(format!("fstat pack artifact failed: {e}")))?;
-    if !fmeta.file_type().is_file() {
-        return Err(PackfileUriError::IntegrityMismatch("opened pack artifact is not a regular file".to_owned()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if (fmeta.dev(), fmeta.ino()) != (lmeta.dev(), lmeta.ino()) {
-            return Err(PackfileUriError::IntegrityMismatch("pack artifact inode swapped during open".to_owned()));
+
+    /// Opens a single directory `dir` directly as a `PinnedPackDir`, verifying `lstat`/`fstat` inode identity.
+    pub(super) fn open_dir_direct(dir: &Path) -> Result<Self, PackfileUriError> {
+        #[cfg(unix)]
+        {
+            let lmeta = std::fs::symlink_metadata(dir)
+                .map_err(|e| PackfileUriError::IntegrityMismatch(format!("lstat dir failed: {e}")))?;
+            if lmeta.file_type().is_symlink() || !lmeta.file_type().is_dir() {
+                return Err(PackfileUriError::IntegrityMismatch("target is not a real directory".to_owned()));
+            }
+            let dir_file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(dir)
+                .map_err(|e| PackfileUriError::IntegrityMismatch(format!("open dir failed: {e}")))?;
+            let fmeta =
+                dir_file.metadata().map_err(|e| PackfileUriError::Internal(format!("fstat dir failed: {e}")))?;
+            if !fmeta.is_dir() || (fmeta.dev(), fmeta.ino()) != (lmeta.dev(), lmeta.ino()) {
+                return Err(PackfileUriError::IntegrityMismatch("directory inode swapped during open".to_owned()));
+            }
+            Ok(Self { dir_file, dev: fmeta.dev(), ino: fmeta.ino() })
+        }
+        #[cfg(not(unix))]
+        {
+            let lmeta = std::fs::symlink_metadata(dir)
+                .map_err(|e| PackfileUriError::IntegrityMismatch(format!("lstat dir failed: {e}")))?;
+            if lmeta.file_type().is_symlink() || !lmeta.file_type().is_dir() {
+                return Err(PackfileUriError::IntegrityMismatch("target is not a real directory".to_owned()));
+            }
+            Ok(Self { dir_path: dir.to_path_buf() })
         }
     }
-    if fmeta.len() > max_file_bytes {
-        return Err(PackfileUriError::CapacityExceeded("pack or idx file exceeds scan byte cap".to_owned()));
-    }
-    if total_scanned.checked_add(fmeta.len()).is_none_or(|sum| sum > max_total_bytes) {
-        return Err(PackfileUriError::CapacityExceeded("cumulative scanned pack bytes exceed cap".to_owned()));
-    }
-    let cap_hint = usize::try_from(fmeta.len()).unwrap_or(0).min(8 * 1024 * 1024);
-    let mut buf = Vec::with_capacity(cap_hint);
-    let mut limited = std::io::Read::take(file, max_file_bytes.saturating_add(1));
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let n = std::io::Read::read(&mut limited, &mut chunk)
-            .map_err(|e| PackfileUriError::Internal(format!("read pack artifact failed: {e}")))?;
-        if n == 0 {
-            break;
+
+    /// Steps `repo_dir -> objects -> pack` with `openat(O_NOFOLLOW)` hops and retains only the final
+    /// verified `objects/pack` descriptor; `Ok(None)` when `objects`/`objects/pack` is absent (`ENOENT`).
+    pub(super) fn open_confined(repo_dir: &Path) -> Result<Option<Self>, PackfileUriError> {
+        #[cfg(unix)]
+        {
+            let repo_pinned = Self::open_dir_direct(repo_dir)?;
+            let Some(objects_file) = Self::openat_subdir(&repo_pinned.dir_file, "objects")? else {
+                return Ok(None);
+            };
+            let Some(pack_file) = Self::openat_subdir(&objects_file, "pack")? else {
+                return Ok(None);
+            };
+            let pack_meta = pack_file
+                .metadata()
+                .map_err(|e| PackfileUriError::Internal(format!("fstat objects/pack: {e}")))?;
+            if !pack_meta.is_dir() {
+                return Err(PackfileUriError::IntegrityMismatch("objects/pack is not a directory".to_owned()));
+            }
+            Ok(Some(Self { dir_file: pack_file, dev: pack_meta.dev(), ino: pack_meta.ino() }))
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() as u64 > max_file_bytes {
-            return Err(PackfileUriError::CapacityExceeded("pack or idx file grew past scan byte cap".to_owned()));
+        #[cfg(not(unix))]
+        {
+            let repo_meta = std::fs::symlink_metadata(repo_dir)
+                .map_err(|e| PackfileUriError::Internal(format!("stat repo_dir failed: {e}")))?;
+            if repo_meta.file_type().is_symlink() || !repo_meta.file_type().is_dir() {
+                return Err(PackfileUriError::IntegrityMismatch("repo_dir is not a real directory".to_owned()));
+            }
+            let objects_dir = repo_dir.join("objects");
+            match std::fs::symlink_metadata(&objects_dir) {
+                Ok(m) if !m.file_type().is_symlink() && m.file_type().is_dir() => {}
+                Ok(_) => return Err(PackfileUriError::IntegrityMismatch("objects is not a real directory".to_owned())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(PackfileUriError::Internal(format!("stat objects dir failed: {e}"))),
+            }
+            let pack_dir = objects_dir.join("pack");
+            match std::fs::symlink_metadata(&pack_dir) {
+                Ok(m) if !m.file_type().is_symlink() && m.file_type().is_dir() => {}
+                Ok(_) => {
+                    return Err(PackfileUriError::IntegrityMismatch("objects/pack is not a real directory".to_owned()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(PackfileUriError::Internal(format!("stat objects/pack dir failed: {e}"))),
+            }
+            Ok(Some(Self { dir_path: pack_dir }))
         }
-        *total_scanned = total_scanned
-            .checked_add(n as u64)
-            .filter(|&sum| sum <= max_total_bytes)
-            .ok_or_else(|| PackfileUriError::CapacityExceeded("cumulative scanned pack bytes exceed cap".to_owned()))?;
     }
-    if buf.len() as u64 != fmeta.len() {
-        return Err(PackfileUriError::IntegrityMismatch(
-            "pack or idx length changed concurrently during read".to_owned(),
-        ));
+
+    /// Re-`fstat`s the retained handle so a swapped/replaced directory can never be re-resolved by path.
+    pub(super) fn verify_handle_intact(&self) -> Result<(), PackfileUriError> {
+        #[cfg(unix)]
+        {
+            let meta = self
+                .dir_file
+                .metadata()
+                .map_err(|e| PackfileUriError::Internal(format!("fstat pinned pack dir: {e}")))?;
+            if !meta.is_dir() || (meta.dev(), meta.ino()) != (self.dev, self.ino) {
+                return Err(PackfileUriError::IntegrityMismatch(
+                    "pinned pack directory handle identity mismatch".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let meta = std::fs::symlink_metadata(&self.dir_path)
+                .map_err(|e| PackfileUriError::Internal(format!("stat pinned pack dir: {e}")))?;
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(PackfileUriError::IntegrityMismatch(
+                    "pinned pack directory handle identity mismatch".to_owned(),
+                ));
+            }
+            Ok(())
+        }
     }
-    Ok(Some(bytes::Bytes::from(buf)))
+
+    /// Enumerates the pinned directory through its descriptor (`/proc/self/fd/<fd>`), never the parent path.
+    pub(super) fn read_dir(&self) -> Result<std::fs::ReadDir, PackfileUriError> {
+        self.verify_handle_intact()?;
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_dir(format!("/proc/self/fd/{}", self.dir_file.as_raw_fd()))
+                .map_err(|e| PackfileUriError::Internal(format!("read_dir pinned fd failed: {e}")))
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            std::fs::read_dir(format!("/dev/fd/{}", self.dir_file.as_raw_fd()))
+                .map_err(|e| PackfileUriError::Internal(format!("read_dir pinned fd failed: {e}")))
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::read_dir(&self.dir_path)
+                .map_err(|e| PackfileUriError::Internal(format!("read_dir pack dir failed: {e}")))
+        }
+    }
+
+    /// Opens and reads one single-component regular file through the pinned descriptor (`openat` with
+    /// `O_NOFOLLOW`/`O_NONBLOCK`), in bounded chunks under per-file and cumulative caps; `Ok(None)` on `ENOENT`.
+    pub(super) fn read_regular_artifact(
+        &self,
+        file_name: &std::ffi::OsStr,
+        max_file_bytes: u64,
+        total_scanned: &mut u64,
+        max_total_bytes: u64,
+    ) -> Result<Option<bytes::Bytes>, PackfileUriError> {
+        let mut comps = Path::new(file_name).components();
+        match (comps.next(), comps.next()) {
+            (Some(std::path::Component::Normal(_)), None) => {}
+            _ => return Err(PackfileUriError::IntegrityMismatch("non-local pack artifact filename".to_owned())),
+        }
+        if file_name.to_string_lossy().contains(['/', '\\', '\0']) {
+            return Err(PackfileUriError::IntegrityMismatch("invalid separator in pack artifact filename".to_owned()));
+        }
+        self.verify_handle_intact()?;
+        #[cfg(unix)]
+        let file = {
+            let c_name = CString::new(file_name.as_bytes())
+                .map_err(|_| PackfileUriError::IntegrityMismatch("nul byte in pack artifact filename".to_owned()))?;
+            // SAFETY: `self.dir_file` is a live verified directory descriptor, `c_name` is a
+            // single-component NUL-terminated string, and `O_NOFOLLOW | O_NONBLOCK` never follows
+            // symlinks or blocks on FIFOs.
+            let fd = unsafe {
+                libc::openat(
+                    self.dir_file.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ENOENT) {
+                    return Ok(None);
+                }
+                return Err(PackfileUriError::IntegrityMismatch(format!(
+                    "refused opening pack artifact via dirfd: {err}"
+                )));
+            }
+            // SAFETY: `fd` is a fresh non-negative descriptor owned exclusively by `file`.
+            unsafe { std::fs::File::from_raw_fd(fd) }
+        };
+        #[cfg(not(unix))]
+        let file = {
+            let path = self.dir_path.join(file_name);
+            let lmeta = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(PackfileUriError::Internal(format!("lstat pack artifact failed: {e}"))),
+            };
+            if lmeta.file_type().is_symlink() || !lmeta.file_type().is_file() {
+                return Err(PackfileUriError::IntegrityMismatch("non-regular entry in objects/pack".to_owned()));
+            }
+            match std::fs::OpenOptions::new().read(true).open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(PackfileUriError::IntegrityMismatch(format!("refused opening pack artifact: {e}")));
+                }
+            }
+        };
+        let fmeta = file
+            .metadata()
+            .map_err(|e| PackfileUriError::Internal(format!("fstat pack artifact failed: {e}")))?;
+        if !fmeta.file_type().is_file() {
+            return Err(PackfileUriError::IntegrityMismatch("opened pack artifact is not a regular file".to_owned()));
+        }
+        if fmeta.len() > max_file_bytes {
+            return Err(PackfileUriError::CapacityExceeded("pack or idx file exceeds scan byte cap".to_owned()));
+        }
+        if total_scanned.checked_add(fmeta.len()).is_none_or(|sum| sum > max_total_bytes) {
+            return Err(PackfileUriError::CapacityExceeded("cumulative scanned pack bytes exceed cap".to_owned()));
+        }
+        let cap_hint = usize::try_from(fmeta.len()).unwrap_or(0).min(8 * 1024 * 1024);
+        let mut buf = Vec::with_capacity(cap_hint);
+        let mut limited = std::io::Read::take(file, max_file_bytes.saturating_add(1));
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let n = std::io::Read::read(&mut limited, &mut chunk)
+                .map_err(|e| PackfileUriError::Internal(format!("read pack artifact failed: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() as u64 > max_file_bytes {
+                return Err(PackfileUriError::CapacityExceeded("pack or idx file grew past scan byte cap".to_owned()));
+            }
+            *total_scanned = total_scanned
+                .checked_add(n as u64)
+                .filter(|&sum| sum <= max_total_bytes)
+                .ok_or_else(|| {
+                    PackfileUriError::CapacityExceeded("cumulative scanned pack bytes exceed cap".to_owned())
+                })?;
+        }
+        if buf.len() as u64 != fmeta.len() {
+            return Err(PackfileUriError::IntegrityMismatch(
+                "pack or idx length changed concurrently during read".to_owned(),
+            ));
+        }
+        Ok(Some(bytes::Bytes::from(buf)))
+    }
 }
 
-/// Writes the exact already-read `pack_bytes` into a private `0o700` `ScratchDir`,
-/// runs bounded `git index-pack --strict -o` to enforce byte-for-byte `.idx` bijection,
-/// and runs bounded `git verify-pack -v` against that exact scratch pair (never re-reading `repo_dir`).
+/// Parses bounded `git verify-pack -v` object lines into `(defined_oids, commits, is_standalone)`;
+/// `None` unless the reported object set is exactly the `.idx` v2 OID table.
+pub(super) fn parse_verify_pack_objects(
+    vp_out: &[u8],
+    object_count: usize,
+    hex_len: usize,
+    idx_oids: &HashSet<String>,
+) -> Option<(HashSet<String>, Vec<String>, bool)> {
+    let mut defined_oids = HashSet::with_capacity(object_count);
+    let mut delta_bases = Vec::new();
+    let mut commits = Vec::new();
+    for line in String::from_utf8_lossy(vp_out).lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 5
+            && matches!(parts[1], "commit" | "tree" | "blob" | "tag")
+            && is_lower_hex_exact(parts[0], hex_len)
+        {
+            defined_oids.insert(parts[0].to_owned());
+            if parts[1] == "commit" {
+                commits.push(parts[0].to_owned());
+            }
+            if parts.len() >= 7 && is_lower_hex_exact(parts[6], hex_len) {
+                delta_bases.push(parts[6].to_owned());
+            }
+        }
+    }
+    if defined_oids.len() != object_count || *idx_oids != defined_oids {
+        return None;
+    }
+    let is_standalone = delta_bases.iter().all(|base| defined_oids.contains(base));
+    Some((defined_oids, commits, is_standalone))
+}
+
+/// Writes `pack_bytes` into a private `0o700` `ScratchDir`, runs bounded `git index-pack --strict -o`
+/// to enforce byte-for-byte `.idx` bijection, then bounded `git verify-pack -v` on that exact scratch pair.
 pub(super) async fn verify_raw_pack_stream_bijection(
     git_bin: &Path,
     repo_dir: &Path,
@@ -261,9 +453,9 @@ pub(super) async fn verify_raw_pack_stream_bijection(
     };
     run_git_bounded(git_bin, repo_dir, &["index-pack", "--strict", "-o", out_str, pack_str], None, 4096, limits.timeout)
         .await?;
+    let scratch_pinned = PinnedPackDir::open_dir_direct(&scratch.0)?;
     let mut fresh_total = 0u64;
-    let Some(fresh_idx) = read_confined_regular_pack_artifact(
-        &scratch.0,
+    let Some(fresh_idx) = scratch_pinned.read_regular_artifact(
         std::ffi::OsStr::new("candidate.idx"),
         limits.max_single_idx_bytes,
         &mut fresh_total,

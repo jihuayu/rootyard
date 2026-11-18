@@ -17,7 +17,7 @@ use crate::ref_store::GitObjectFormat;
 
 use super::{
     cover_git::discover_repo_packs,
-    pack_bijection::{read_confined_regular_pack_artifact, verify_confined_pack_dir},
+    pack_bijection::PinnedPackDir,
     tests::{build_v2_fetch_wire, sample_keyring, sample_policy, sample_resolver, sample_subject},
     *,
 };
@@ -123,11 +123,11 @@ async fn confined_pack_open_rejects_symlinks_traversal_and_nonregular_entries_wi
     let git_bin = find_git_bin();
     let tmp = TempDir::new().unwrap();
     let (bare, tip) = create_repacked_bare_repo(tmp.path(), &git_bin);
-    let pack_dir = pack_dir_of(&bare);
+    let pinned = PinnedPackDir::open_confined(&bare).unwrap().expect("pinned pack dir");
 
     for bad in ["../outside.pack", "sub/evil.pack", "."] {
         let mut total = 0u64;
-        let res = read_confined_regular_pack_artifact(&pack_dir, OsStr::new(bad), 1 << 20, &mut total, 1 << 20);
+        let res = pinned.read_regular_artifact(OsStr::new(bad), 1 << 20, &mut total, 1 << 20);
         assert!(matches!(res, Err(PackfileUriError::IntegrityMismatch(_))), "accepted traversal name {bad}");
         assert_eq!(total, 0);
     }
@@ -135,13 +135,14 @@ async fn confined_pack_open_rejects_symlinks_traversal_and_nonregular_entries_wi
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
+        let pack_dir = pack_dir_of(&bare);
         let outside = tmp.path().join("outside.pack");
         let outside_bytes = b"PACK-OUTSIDE-SECRET-MUST-NEVER-BE-READ";
         std::fs::write(&outside, outside_bytes).unwrap();
         let evil = pack_dir.join("pack-evil.pack");
         symlink(&outside, &evil).unwrap();
         let mut total = 0u64;
-        let res = read_confined_regular_pack_artifact(&pack_dir, OsStr::new("pack-evil.pack"), 1 << 20, &mut total, 1 << 20);
+        let res = pinned.read_regular_artifact(OsStr::new("pack-evil.pack"), 1 << 20, &mut total, 1 << 20);
         assert!(matches!(res, Err(PackfileUriError::IntegrityMismatch(_))));
         assert_eq!(total, 0, "symlink target must never be opened or read");
         assert_eq!(std::fs::read(&outside).unwrap(), &outside_bytes[..]);
@@ -182,11 +183,12 @@ async fn confined_pack_open_rejects_symlinks_traversal_and_nonregular_entries_wi
 
         // Replacing `objects/pack` itself with a symlinked directory must fail closed too.
         std::fs::remove_file(&evil).unwrap();
+        drop(pinned);
         std::fs::remove_dir_all(&pack_dir).unwrap();
         let attacker_dir = tmp.path().join("attacker-pack-dir");
         std::fs::create_dir_all(&attacker_dir).unwrap();
         symlink(&attacker_dir, &pack_dir).unwrap();
-        assert!(matches!(verify_confined_pack_dir(&bare), Err(PackfileUriError::IntegrityMismatch(_))));
+        assert!(matches!(PinnedPackDir::open_confined(&bare), Err(PackfileUriError::IntegrityMismatch(_))));
         let res = offload
             .try_serve_upload_pack_v2(GatewayFetchBridgeInput {
                 git_binary: &git_bin,
@@ -224,22 +226,21 @@ async fn bounded_artifact_reader_enforces_single_file_and_cumulative_byte_caps()
     let pack_dir = tmp.path().join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir).unwrap();
     std::fs::write(pack_dir.join("big.pack"), vec![0x5au8; 4096]).unwrap();
+    let pinned = PinnedPackDir::open_dir_direct(&pack_dir).unwrap();
     let name = OsStr::new("big.pack");
 
     let mut total = 0u64;
-    let res = read_confined_regular_pack_artifact(&pack_dir, name, 2048, &mut total, 1 << 20);
+    let res = pinned.read_regular_artifact(name, 2048, &mut total, 1 << 20);
     assert!(matches!(res, Err(PackfileUriError::CapacityExceeded(_))));
     assert_eq!(total, 0);
 
     let mut total = 3000u64;
-    let res = read_confined_regular_pack_artifact(&pack_dir, name, 8192, &mut total, 5000);
+    let res = pinned.read_regular_artifact(name, 8192, &mut total, 5000);
     assert!(matches!(res, Err(PackfileUriError::CapacityExceeded(_))));
     assert_eq!(total, 3000);
 
     let mut total = 1000u64;
-    let bytes = read_confined_regular_pack_artifact(&pack_dir, name, 4096, &mut total, 10_000)
-        .unwrap()
-        .expect("within-cap artifact");
+    let bytes = pinned.read_regular_artifact(name, 4096, &mut total, 10_000).unwrap().expect("within-cap artifact");
     assert_eq!(bytes.len(), 4096);
     assert_eq!(total, 5096);
 }

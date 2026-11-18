@@ -92,11 +92,23 @@ class PackfileUriContractsTest(unittest.TestCase):
         self.assertIn("impl Drop for PreflightSessionGuard", pf_txt)
         self.assertIn("impl Drop for StagedPinBatchGuard", pf_txt)
         bij_txt = (MOD_DIR / "pack_bijection.rs").read_text("utf-8")
-        self.assertIn("verify_raw_pack_stream_bijection", bij_txt)
-        self.assertIn("read_confined_regular_pack_artifact", bij_txt)
-        self.assertIn("verify_confined_pack_dir", bij_txt)
-        self.assertIn("O_NOFOLLOW", bij_txt)
-        self.assertIn("index-pack", bij_txt)
+        for token in (
+            "PinnedPackDir",
+            "open_confined",
+            "read_regular_artifact",
+            "libc::openat",
+            "O_DIRECTORY",
+            "O_NOFOLLOW",
+            "// SAFETY:",
+            "verify_raw_pack_stream_bijection",
+            "index-pack",
+        ):
+            self.assertIn(token, bij_txt)
+        for sibling in sorted(MOD_DIR.glob("*.rs")):
+            if sibling.name == "pack_bijection.rs":
+                continue
+            sibling_txt = sibling.read_text("utf-8")
+            self.assertNotIn("unsafe", sibling_txt, f"unsafe outside pack_bijection.rs: {sibling.name}")
         bridge_txt = (MOD_DIR / "gateway_bridge.rs").read_text("utf-8")
         self.assertIn("try_serve_upload_pack_v2_with_guard", bridge_txt)
         self.assertIn("is_v2_fetch_command_request", bridge_txt)
