@@ -92,6 +92,37 @@ impl Source<'_> {
         Ok(PgPackCommit.capture_baseline(&mut client, gate.repository_id(), gate.tenant_id(), deadline()).await?)
     }
 
+    async fn seed_effects(&self, plan: &PackCommitPlan) -> Result<serde_json::Value> {
+        let row = self
+            .db
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT jsonb_build_object(
+                    'gate', (SELECT to_jsonb(g) FROM ref_store_core_gates g WHERE repository_id=$1),
+                    'refs', (SELECT jsonb_agg(to_jsonb(r) ORDER BY r.ref_name)
+                             FROM ref_store_core_refs r WHERE repository_id=$1),
+                    'operations', (SELECT jsonb_agg(to_jsonb(o) ORDER BY o.operation_id)
+                                   FROM ref_store_operations o WHERE repository_id=$1),
+                    'publications', (SELECT jsonb_agg(to_jsonb(p) ORDER BY p.registration_id)
+                                     FROM ref_store_core_pack_publications p WHERE repository_id=$1),
+                    'artifacts', (SELECT jsonb_agg(to_jsonb(a) ORDER BY a.registration_id,a.slot)
+                                  FROM ref_store_core_pack_artifacts a WHERE repository_id=$1),
+                    'memberships', (SELECT jsonb_agg(to_jsonb(m) ORDER BY m.pack_id)
+                                    FROM ref_store_core_pack_memberships m WHERE repository_id=$1),
+                    'history', (SELECT jsonb_agg(to_jsonb(h) ORDER BY h.history_id)
+                                FROM ref_store_core_pack_history h WHERE repository_id=$1),
+                    'events', (SELECT jsonb_agg(to_jsonb(e) ORDER BY e.event_id)
+                               FROM ref_store_core_events e WHERE repository_id=$1),
+                    'repo_usage', (SELECT to_jsonb(u) FROM ref_store_core_pack_repo_usage u WHERE repository_id=$1),
+                    'tenant_usage', (SELECT to_jsonb(u) FROM ref_store_core_pack_tenant_usage u WHERE tenant_id=$2))",
+                &[&plan.repository_id(), &plan.tenant_id()],
+            )
+            .await?;
+        Ok(row.try_get(0)?)
+    }
+
     fn check_context(&self, context: &PackClosureContext, has_pair: bool) -> Result<()> {
         ensure!(
             context.old_refs() == self.baseline.refs()
@@ -231,6 +262,21 @@ async fn exercise(db: &Db, store: &BlobStore, git: &GitRepo, format: GitObjectFo
     );
     let verifier = PackVerifier::new(store.clone(), git.git.clone())?;
     let source = Source { db, store, baseline, verifier };
+
+    let committed_lookup = OperationLookup::Known(receipt.record.clone());
+    ensure!(source.lookup(&seed.plan).await? == committed_lookup, "seed lookup differs from the first receipt");
+    let seed_effects = source.seed_effects(&seed.plan).await?;
+    let replay = commit(db, &seed.plan, &seed.token, &proof).await?;
+    ensure!(replay.is_committed() && replay.replayed, "exact seed commit did not replay the committed operation");
+    ensure!(
+        replay.record == receipt.record && replay.terminal == receipt.terminal,
+        "seed replay changed the original identity, revision or terminal effects"
+    );
+    ensure!(source.lookup(&seed.plan).await? == committed_lookup, "seed replay changed the operation lookup");
+    ensure!(
+        source.seed_effects(&seed.plan).await? == seed_effects,
+        "seed replay changed the refs, gate, operation or publication effects"
+    );
 
     let base_oid = GitOid::parse(format, &base)?;
     let fast_oid = GitOid::parse(format, &fast_head)?;
