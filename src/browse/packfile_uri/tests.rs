@@ -371,30 +371,37 @@ async fn planner_fallbacks_breaker_and_fail_closed_integrity_checks() {
         residual_inline_bytes: 256,
     };
 
-    let make_req = |fetch_req: &FetchV2Request,
-                    cl: &PackClosurePlan,
-                    pol: &OffloadPolicyConfig,
-                    cdn_health: CdnHealthState,
-                    sat: bool| DeliveryPlanRequest {
-        tenant_id: tenant,
-        repository_id: repo,
-        actor_id: Uuid::new_v4(),
-        gate_revision: 1,
-        object_format: PackObjectFormat::Sha1,
-        fetch_req,
-        closure: cl,
-        cdn_health,
-        allowed_host: "cdn.rootyard.test",
-        now_unix: 1_000,
-        resolved_ips: &public_ips(),
-        policy: pol,
-        active_queue_saturated: sat,
-    };
+    fn make_req<'a>(
+        ids: (Uuid, Uuid),
+        fetch_req: &'a FetchV2Request,
+        cl: &'a PackClosurePlan,
+        ips: &'a [IpAddr],
+        pol: &'a OffloadPolicyConfig,
+        opts: (CdnHealthState, bool),
+    ) -> DeliveryPlanRequest<'a> {
+        DeliveryPlanRequest {
+            tenant_id: ids.0,
+            repository_id: ids.1,
+            actor_id: Uuid::new_v4(),
+            gate_revision: 1,
+            object_format: PackObjectFormat::Sha1,
+            fetch_req,
+            closure: cl,
+            cdn_health: opts.0,
+            allowed_host: "cdn.rootyard.test",
+            now_unix: 1_000,
+            resolved_ips: ips,
+            policy: pol,
+            active_queue_saturated: opts.1,
+        }
+    }
 
+    let ips = public_ips();
+    let ids = (tenant, repo);
     // Unauthorized caller fails before any fallback or offload.
     assert!(matches!(
         planner
-            .plan_fetch(&auth, &make_req(&fetch_https, &closure, &policy, CdnHealthState::Healthy, false))
+            .plan_fetch(&auth, &make_req(ids, &fetch_https, &closure, &ips, &policy, (CdnHealthState::Healthy, false)))
             .await,
         Err(PackfileUriError::Unauthorized)
     ));
@@ -408,7 +415,7 @@ async fn planner_fallbacks_breaker_and_fail_closed_integrity_checks() {
         (&fetch_https, &closure, &policy, CdnHealthState::Healthy, true, FallbackReason::OverloadedOrQueueSaturated),
     ];
     for (fq, cl, pol, health, sat, expected) in cases {
-        let res = planner.plan_fetch(&auth, &make_req(fq, cl, pol, health, sat)).await.unwrap();
+        let res = planner.plan_fetch(&auth, &make_req(ids, fq, cl, &ips, pol, (health, sat))).await.unwrap();
         assert!(matches!(res.mode, DeliveryMode::InlineFallback { reason, .. } if reason == expected));
         assert_eq!(res.telemetry.fallback_reason, Some(expected));
     }
@@ -416,7 +423,7 @@ async fn planner_fallbacks_breaker_and_fail_closed_integrity_checks() {
     let mut incomplete = closure.clone();
     incomplete.residual_inline_objects = 0;
     let res = planner
-        .plan_fetch(&auth, &make_req(&fetch_https, &incomplete, &policy, CdnHealthState::Healthy, false))
+        .plan_fetch(&auth, &make_req(ids, &fetch_https, &incomplete, &ips, &policy, (CdnHealthState::Healthy, false)))
         .await
         .unwrap();
     assert!(matches!(
@@ -429,7 +436,7 @@ async fn planner_fallbacks_breaker_and_fail_closed_integrity_checks() {
     breaker.try_begin().unwrap().record_err();
     assert!(breaker.is_open());
     let tripped = planner
-        .plan_fetch(&auth, &make_req(&fetch_https, &closure, &policy, CdnHealthState::Healthy, false))
+        .plan_fetch(&auth, &make_req(ids, &fetch_https, &closure, &ips, &policy, (CdnHealthState::Healthy, false)))
         .await
         .unwrap();
     assert!(matches!(

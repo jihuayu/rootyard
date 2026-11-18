@@ -1,7 +1,7 @@
 //! Git Protocol v2 `packfile-uris` capability negotiation, bounded pkt-line
 //! `fetch` request parsing, and response section encoding.
 
-use crate::cache_wake::replica_cache::is_lower_hex_exact;
+use crate::cache_wake::replica_cache::error::is_lower_hex_exact;
 
 use super::types::{DeliveryMode, PackObjectFormat, PackfileUriError};
 

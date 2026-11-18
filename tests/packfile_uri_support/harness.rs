@@ -88,8 +88,6 @@ pub fn git_cmd(args: &[&str], cwd: Option<&Path>, stdin_data: Option<&[u8]>) -> 
 }
 
 pub struct PreparedRepo {
-    pub bare: PathBuf,
-    pub work: PathBuf,
     pub head_oid: String,
     pub base_pack: Vec<u8>,
     pub residual_pack: Vec<u8>,
@@ -140,7 +138,7 @@ pub fn prepare_dual_pack_repo(dir: &Path, fmt: PackObjectFormat) -> Result<Prepa
         None,
         Some(format!("{c2}\n").as_bytes()),
     )?;
-    Ok(PreparedRepo { bare, work, head_oid: c2, base_pack, residual_pack, full_pack, pack_hash, sha256_hex })
+    Ok(PreparedRepo { head_oid: c2, base_pack, residual_pack, full_pack, pack_hash, sha256_hex })
 }
 
 pub struct EphemeralCert {

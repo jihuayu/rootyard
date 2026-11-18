@@ -8,7 +8,7 @@ use ring::hmac;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::cache_wake::replica_cache::{is_lower_hex_exact, lease_pin::AuthTask};
+use crate::cache_wake::replica_cache::{error::is_lower_hex_exact, lease_pin::AuthTask};
 
 use super::{
     ssrf_guard::{validate_offload_host_pattern, validate_offload_uri, validate_policy_config},

@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::{
     browse::object_format::ObjectFormat,
-    cache_wake::replica_cache::{ReplicaObjectFormat, is_lower_hex_exact},
-    ref_store::core::ref_version::pack_set::PackSetEntry,
+    cache_wake::replica_cache::{ReplicaObjectFormat, error::is_lower_hex_exact},
+    ref_store::ref_version::PackSetEntry,
 };
 
 pub use crate::cache_wake::replica_cache::ReplicaObjectFormat as PackObjectFormat;
