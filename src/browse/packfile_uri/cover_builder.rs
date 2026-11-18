@@ -7,6 +7,7 @@ use std::{
     path::Path,
 };
 
+use bytes::Bytes;
 use uuid::Uuid;
 
 use crate::{
@@ -43,7 +44,7 @@ pub struct MaterializedCoverBundle {
     pub cover_index: CoverHierarchyIndex,
     pub retention_index: RetentionClassificationIndex,
     pub wire_packs: HashMap<Uuid, PackWireMeta>,
-    pub raw_pack_bytes: HashMap<String, Vec<u8>>,
+    pub raw_pack_bytes: HashMap<String, Bytes>,
     pub pack_defined_oids: HashMap<String, HashSet<String>>,
     pub wanted_closure_oids: HashSet<String>,
     pub rejected_unauthorized_pack: bool,
@@ -227,7 +228,7 @@ pub async fn build_verified_cover_proof_from_repo(
     let mut retention = RetentionClassificationIndex::new();
     let mut entries: Vec<PackSetEntry> = Vec::new();
     let mut wire_packs: HashMap<Uuid, PackWireMeta> = HashMap::new();
-    let mut raw_pack_bytes: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut raw_pack_bytes: HashMap<String, Bytes> = HashMap::new();
     let mut pack_defined_oids: HashMap<String, HashSet<String>> = HashMap::new();
     let mut commit_ver_map: HashMap<String, VersionId> = HashMap::new();
 

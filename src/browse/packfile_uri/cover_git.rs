@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -31,7 +32,10 @@ use crate::{
 };
 
 use super::{
-    pack_bijection::{parse_and_verify_idx_v2_oids, verify_raw_pack_stream_bijection},
+    pack_bijection::{
+        parse_and_verify_idx_v2_oids, read_confined_regular_pack_artifact, verify_confined_pack_dir,
+        verify_raw_pack_stream_bijection,
+    },
     types::{
         DEFAULT_HELPER_TIMEOUT_MS, MAX_CLOSURE_COMMITS, MAX_CLOSURE_OBJECTS, MAX_HELPER_STDERR_BYTES,
         MAX_HELPER_STDIN_BYTES, MAX_HELPER_STDOUT_BYTES, MAX_PACK_OBJECTS_PER_PACK, MAX_SCANNED_PACK_FILES,
@@ -93,7 +97,7 @@ pub(super) struct DiscoveredPack {
     pub pack_hash_hex: String,
     pub pack_sha256_hex: String,
     pub idx_sha256_hex: String,
-    pub pack_bytes: Vec<u8>,
+    pub pack_bytes: Bytes,
     pub idx_len: u64,
     pub object_count: usize,
     pub commits: Vec<String>,
@@ -268,13 +272,10 @@ pub async fn build_residual_pack_bytes(
     .await
 }
 
-pub(super) fn collect_bounded_pack_paths<I>(
+pub(super) fn collect_bounded_pack_paths<I: IntoIterator<Item = std::io::Result<PathBuf>>>(
     entries: I,
     max_scanned_packs: usize,
-) -> Result<Vec<PathBuf>, PackfileUriError>
-where
-    I: IntoIterator<Item = std::io::Result<PathBuf>>,
-{
+) -> Result<Vec<PathBuf>, PackfileUriError> {
     let max_dir_entries = max_scanned_packs.saturating_mul(8).max(16);
     let mut dir_entries_seen: usize = 0;
     let mut paths: Vec<PathBuf> = Vec::with_capacity(max_scanned_packs.min(64));
@@ -307,38 +308,66 @@ pub(super) async fn discover_repo_packs(
     fmt: PackObjectFormat,
     limits: &HelperResourceLimits,
 ) -> Result<(Vec<DiscoveredPack>, bool), PackfileUriError> {
-    let pack_dir = repo_dir.join("objects").join("pack");
+    let Some(pack_dir) = verify_confined_pack_dir(repo_dir)? else {
+        return Ok((Vec::new(), false));
+    };
     let rd = match std::fs::read_dir(&pack_dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
-        Err(e) => {
-            return Err(PackfileUriError::Internal(format!(
-                "failed to open objects/pack directory: {e}"
-            )));
-        }
+        Err(e) => return Err(PackfileUriError::Internal(format!("failed to open objects/pack directory: {e}"))),
     };
-    let paths = collect_bounded_pack_paths(rd.map(|res| res.map(|e| e.path())), limits.max_scanned_packs)?;
-    let hex_len = fmt.oid_hex_len();
-    let trailer_len = hex_len / 2;
-    let mut total_scanned: u64 = 0;
-    let mut rejected_corrupt_pack = false;
-    let mut out = Vec::new();
-
+    let mut saw_nonregular_artifact = false;
+    let iter = rd.map(|res| {
+        let entry = res?;
+        let path = entry.path();
+        let ft = entry.file_type()?;
+        if path.extension().is_some_and(|ext| ext == "pack" || ext == "idx") && (ft.is_symlink() || !ft.is_file()) {
+            saw_nonregular_artifact = true;
+        }
+        Ok(path)
+    });
+    let paths = collect_bounded_pack_paths(iter, limits.max_scanned_packs)?;
+    if saw_nonregular_artifact {
+        return Err(PackfileUriError::IntegrityMismatch("non-regular pack or idx entry in objects/pack".to_owned()));
+    }
+    let (hex_len, trailer_len) = (fmt.oid_hex_len(), fmt.oid_hex_len() / 2);
+    let (mut total_scanned, mut rejected_corrupt_pack, mut out) = (0u64, false, Vec::new());
     for pack_path in paths {
         let idx_path = pack_path.with_extension("idx");
-        let (Ok(p_meta), Ok(i_meta)) = (std::fs::metadata(&pack_path), std::fs::metadata(&idx_path)) else {
+        let (Some(pack_name), Some(idx_name)) = (pack_path.file_name(), idx_path.file_name()) else {
+            rejected_corrupt_pack = true;
             continue;
         };
-        if p_meta.len() > limits.max_single_pack_bytes || i_meta.len() > limits.max_single_idx_bytes {
-            return Err(PackfileUriError::CapacityExceeded("pack or idx file exceeds scan byte cap".to_owned()));
-        }
-        total_scanned = total_scanned
-            .checked_add(p_meta.len().saturating_add(i_meta.len()))
-            .filter(|&sum| sum <= limits.max_total_scanned_bytes)
-            .ok_or_else(|| PackfileUriError::CapacityExceeded("cumulative scanned pack bytes exceed cap".to_owned()))?;
-
-        let (Ok(pack_bytes), Ok(idx_bytes)) = (std::fs::read(&pack_path), std::fs::read(&idx_path)) else {
-            continue;
+        let pack_bytes = match read_confined_regular_pack_artifact(
+            &pack_dir,
+            pack_name,
+            limits.max_single_pack_bytes,
+            &mut total_scanned,
+            limits.max_total_scanned_bytes,
+        ) {
+            Ok(Some(b)) => b,
+            Ok(None) => continue,
+            Err(e @ PackfileUriError::CapacityExceeded(_)) => return Err(e),
+            Err(PackfileUriError::IntegrityMismatch(_)) => {
+                rejected_corrupt_pack = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let idx_bytes = match read_confined_regular_pack_artifact(
+            &pack_dir,
+            idx_name,
+            limits.max_single_idx_bytes,
+            &mut total_scanned,
+            limits.max_total_scanned_bytes,
+        ) {
+            Ok(Some(b)) => b,
+            Err(e @ PackfileUriError::CapacityExceeded(_)) => return Err(e),
+            Ok(None) | Err(PackfileUriError::IntegrityMismatch(_)) => {
+                rejected_corrupt_pack = true;
+                continue;
+            }
+            Err(e) => return Err(e),
         };
         let (object_count, idx_oids) =
             match parse_and_verify_idx_v2_oids(&pack_bytes, &idx_bytes, fmt, limits.max_pack_objects) {
@@ -349,24 +378,7 @@ pub(super) async fn discover_repo_packs(
                     continue;
                 }
             };
-        match verify_raw_pack_stream_bijection(git_bin, repo_dir, &pack_path, &idx_bytes, limits).await {
-            Ok(()) => {}
-            Err(e @ (PackfileUriError::CapacityExceeded(_) | PackfileUriError::Timeout(_))) => return Err(e),
-            Err(_) => {
-                rejected_corrupt_pack = true;
-                continue;
-            }
-        }
-        let vp_out = match run_git_bounded(
-            git_bin,
-            repo_dir,
-            &["verify-pack", "-v", idx_path.to_str().unwrap_or_default()],
-            None,
-            limits.max_stdout_bytes,
-            limits.timeout,
-        )
-        .await
-        {
+        let vp_out = match verify_raw_pack_stream_bijection(git_bin, repo_dir, &pack_bytes, &idx_bytes, limits).await {
             Ok(v) => v,
             Err(e @ (PackfileUriError::CapacityExceeded(_) | PackfileUriError::Timeout(_))) => return Err(e),
             Err(_) => {
@@ -401,12 +413,12 @@ pub(super) async fn discover_repo_packs(
         }
         let is_standalone = delta_bases.iter().all(|base| defined_oids.contains(base));
         let pack_hash_hex = hex::encode(&pack_bytes[pack_bytes.len() - trailer_len..]);
-        let pack_sha256_hex = hex::encode(Sha256::digest(&pack_bytes));
+        let pack_sha256_hex = hex::encode(Sha256::digest(&pack_bytes[..]));
         out.push(DiscoveredPack {
             pack_oid: pack_sha256_hex.clone(),
             pack_hash_hex,
             pack_sha256_hex,
-            idx_sha256_hex: hex::encode(Sha256::digest(&idx_bytes)),
+            idx_sha256_hex: hex::encode(Sha256::digest(&idx_bytes[..])),
             pack_bytes,
             idx_len: idx_bytes.len() as u64,
             object_count,

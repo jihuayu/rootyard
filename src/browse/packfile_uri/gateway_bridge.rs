@@ -13,7 +13,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use bytes::Bytes;
 use uuid::Uuid;
 
 use crate::ref_store::GitObjectFormat;
@@ -243,11 +242,19 @@ impl GatewayPackfileOffload {
                 self.record_fallback(reason);
                 return Ok(None);
             }
+            Err(PackfileUriError::Unauthorized) => return Err(PackfileUriError::Unauthorized),
             Err(PackfileUriError::CapacityExceeded(_) | PackfileUriError::Timeout(_)) => {
                 self.record_fallback(FallbackReason::ResourceBoundsExceeded);
                 return Ok(None);
             }
-            Err(e) => return Err(e),
+            Err(PackfileUriError::IntegrityMismatch(_)) => {
+                self.record_fallback(FallbackReason::PackContainsUnauthorizedObjects);
+                return Ok(None);
+            }
+            Err(_) => {
+                self.record_fallback(FallbackReason::IncompleteClosure);
+                return Ok(None);
+            }
         };
 
         let acked_haves: Vec<String> = if fetch_req.done {
@@ -285,7 +292,7 @@ impl GatewayPackfileOffload {
             policy.allowed_hosts.first().map_or("", String::as_str)
         };
         let cdn_health = *self.cdn_health.read().unwrap_or_else(|p| p.into_inner());
-        let planned = self
+        let planned = match self
             .planner
             .plan_fetch(
                 self.live_auth.as_ref(),
@@ -304,7 +311,23 @@ impl GatewayPackfileOffload {
                     active_queue_saturated: false,
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(p) => p,
+            Err(PackfileUriError::Unauthorized) => return Err(PackfileUriError::Unauthorized),
+            Err(PackfileUriError::CapacityExceeded(_) | PackfileUriError::Timeout(_)) => {
+                self.record_fallback(FallbackReason::ResourceBoundsExceeded);
+                return Ok(None);
+            }
+            Err(PackfileUriError::RetentionPinMissing(_)) => {
+                self.record_fallback(FallbackReason::PinAcquisitionFailed);
+                return Ok(None);
+            }
+            Err(_) => {
+                self.record_fallback(FallbackReason::CdnUnhealthy);
+                return Ok(None);
+            }
+        };
 
         let DeliveryMode::OffloadPlusResidual { offloaded, residual_inline_bytes, residual_objects, lease_pins } =
             planned.mode
@@ -341,9 +364,12 @@ impl GatewayPackfileOffload {
                 pack_hash_hex: desc.pack_hash_hex.clone(),
                 object_format: pack_fmt,
                 sha256_hex: desc.sha256_hex.clone(),
-                payload: Bytes::from(raw.clone()),
+                payload: raw.clone(),
             };
-            meta.validate_bytes()?;
+            if meta.validate_bytes().is_err() {
+                self.record_fallback(FallbackReason::PackContainsUnauthorizedObjects);
+                return Ok(None);
+            }
             offloaded_oids.extend(oids.iter().cloned());
             pending_packs.push(meta);
         }
@@ -360,11 +386,15 @@ impl GatewayPackfileOffload {
         .await
         {
             Ok(bytes) => bytes,
+            Err(PackfileUriError::Unauthorized) => return Err(PackfileUriError::Unauthorized),
             Err(PackfileUriError::CapacityExceeded(_) | PackfileUriError::Timeout(_)) => {
                 self.record_fallback(FallbackReason::ResourceBoundsExceeded);
                 return Ok(None);
             }
-            Err(e) => return Err(e),
+            Err(_) => {
+                self.record_fallback(FallbackReason::IncompleteClosure);
+                return Ok(None);
+            }
         };
 
         let grace = policy.retention_grace_secs;
@@ -402,18 +432,17 @@ impl GatewayPackfileOffload {
                 self.record_fallback(FallbackReason::ResourceBoundsExceeded);
                 return Ok(None);
             }
-            Err(e) => return Err(e),
+            Err(_) => {
+                self.record_fallback(FallbackReason::IncompleteClosure);
+                return Ok(None);
+            }
         };
         (input.live_revalidator)().await?;
         let response_guard = reserve_response(body.len() as u64)?;
-        match self.pack_server.insert_packs_atomic(pending_packs) {
-            Ok(()) => {}
-            Err(PackfileUriError::CapacityExceeded(_)) => {
-                drop(response_guard);
-                self.record_fallback(FallbackReason::OverloadedOrQueueSaturated);
-                return Ok(None);
-            }
-            Err(e) => return Err(e),
+        if self.pack_server.insert_packs_atomic(pending_packs).is_err() {
+            drop(response_guard);
+            self.record_fallback(FallbackReason::OverloadedOrQueueSaturated);
+            return Ok(None);
         }
         staged.commit();
         drop(preflight_guard);

@@ -106,7 +106,7 @@ async fn raw_pack_trailing_gap_bytes_rejected_by_bijection_and_never_offloaded()
     let orig_idx = std::fs::read(&idx_path).unwrap();
 
     // Valid pack passes raw stream bijection before tampering.
-    verify_raw_pack_stream_bijection(&git_bin, &bare, &pack_path, &orig_idx, &HelperResourceLimits::default())
+    verify_raw_pack_stream_bijection(&git_bin, &bare, &orig_pack, &orig_idx, &HelperResourceLimits::default())
         .await
         .expect("untampered pack must pass bijection");
 
@@ -132,7 +132,7 @@ async fn raw_pack_trailing_gap_bytes_rejected_by_bijection_and_never_offloaded()
 
     // ...but `verify_raw_pack_stream_bijection` (`git index-pack --strict -o`) catches the unindexed bytes!
     assert!(
-        verify_raw_pack_stream_bijection(&git_bin, &bare, &pack_path, &tampered_idx, &HelperResourceLimits::default())
+        verify_raw_pack_stream_bijection(&git_bin, &bare, &tampered_pack, &tampered_idx, &HelperResourceLimits::default())
             .await
             .is_err()
     );
