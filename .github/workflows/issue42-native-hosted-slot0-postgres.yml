@@ -18,8 +18,8 @@ permissions:
   contents: read
 
 env:
-  PRODUCT_SHA: f73d5b77c42ed8ec23b6c42fdde2b2baf74121f5
-  PRODUCT_TREE: c982838da207a13965bc88190305dc87b1e324b8
+  PRODUCT_SHA: f0a472b56f37b386a0a09e8934fe2a3f7447bd32
+  PRODUCT_TREE: 73587884ec942dc63fb71da0fc234c7f2cab590e
   WORKFLOW_PATH: .github/workflows/issue42-native-hosted-slot0-postgres.yml
   CARGO_BUILD_JOBS: '2'
   CARGO_INCREMENTAL: '0'
@@ -281,7 +281,7 @@ jobs:
           fi
           printf '[slot0-native] stage=build status=ok\n'
 
-      - name: Run exactly the thirteen bounded native cases
+      - name: Run exactly the fourteen bounded native cases
         timeout-minutes: 18
         run: |
           set -euo pipefail

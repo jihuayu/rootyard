@@ -98,14 +98,15 @@ class LibtestParserTest(unittest.TestCase):
             (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_request_rejects_equal_ids_and_noncanonical_backend", False),
             (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_proof_binds_sequence_plan_and_wire", False),
             (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_public_attempt_lookup_is_exact_and_read_only", True),
+            (driver.LIB, "ref_store::pg::slot_zero::tests::slot_zero_public_terminal_mirror_commits_then_exactly_replays", True),
         )
         self.assertEqual(driver.ALL_CASES, expected)
         self.assertEqual(len({(target, name) for target, name, _ in expected}), len(expected))
-        self.assertEqual(len(expected), 13)
-        self.assertEqual(sum(ignored for _, _, ignored in expected), 11)
+        self.assertEqual(len(expected), 14)
+        self.assertEqual(sum(ignored for _, _, ignored in expected), 12)
         self.assertEqual(sum(not ignored for _, _, ignored in expected), 2)
         self.assertTrue(driver.ALL_CASES[-1][2])
-        self.assertFalse(driver.ALL_CASES[-2][2])
+        self.assertTrue(driver.ALL_CASES[-2][2])
         self.assertFalse(driver.ALL_CASES[-3][2])
 
     def test_run_cases_executes_inventory_serially(self):
@@ -2128,9 +2129,9 @@ esac
             self.assertIn(action, self.text)
         pin = self.text.split("PRODUCT_SHA:", 1)[1].splitlines()[0].strip()
         tree = self.text.split("PRODUCT_TREE:", 1)[1].splitlines()[0].strip()
-        self.assertEqual(pin, "f73d5b77c42ed8ec23b6c42fdde2b2baf74121f5")
-        self.assertEqual(tree, "c982838da207a13965bc88190305dc87b1e324b8")
-        self.assertIn("Run exactly the thirteen bounded native cases", self.text)
+        self.assertEqual(pin, "f0a472b56f37b386a0a09e8934fe2a3f7447bd32")
+        self.assertEqual(tree, "73587884ec942dc63fb71da0fc234c7f2cab590e")
+        self.assertIn("Run exactly the fourteen bounded native cases", self.text)
 
     def test_owned_postgres_and_fixed_artifact(self):
         self.assertEqual(driver.WORKFLOW_PATH, self.path.relative_to(ROOT).as_posix())
