@@ -1,0 +1,305 @@
+name: Issue 42 schema 152 slot-zero admission qualification
+
+on:
+  push:
+    branches: [codex/goal-issue42-original-ac-source-audit-20261117]
+    paths: [.github/workflows/issue42-schema152-slot0-postgres.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  schema152-slot0:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 24
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      PRODUCT_SHA: 1e10ee22fbde8e2c99784876ad309af93775d6a4
+      PRODUCT_TREE: 74a7f1a1ead027b41e407f021b952eea4f431cc9
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact workflow source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        timeout-minutes: 3
+        with:
+          ref: ${{ github.sha }}
+          path: workflow-source
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check out the pinned SQL fixture and migrations
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        timeout-minutes: 3
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          persist-credentials: false
+      - name: Install the catalog job's PG17 client
+        timeout-minutes: 7
+        run: |
+          set -euo pipefail
+          exec >/dev/null 2>&1
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL --connect-timeout 8 --max-time 60 https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+      - name: Run the exact schema 152 admission and cancellation fixture
+        timeout-minutes: 6
+        run: |
+          umask 077
+          exec python3 -I - 2>/dev/null <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import secrets
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          ROOT = Path(os.environ["GITHUB_WORKSPACE"])
+          WORKFLOW = ".github/workflows/issue42-schema152-slot0-postgres.yml"
+          BRANCH = "refs/heads/codex/goal-issue42-original-ac-source-audit-20261117"
+          SCRATCH_PARENT = "70c8fc005717458370565a3cdba3599e40070438"
+          PRODUCT = ROOT / "product"
+          PRODUCT_SHA, PRODUCT_TREE = os.environ["PRODUCT_SHA"], os.environ["PRODUCT_TREE"]
+          MIGRATIONS_TREE = "d55a04db8889e4472263f43cd5928299f32a85b7"
+          CHAIN_SHA256 = "36fd1c0b9ae6a789655a3d9e0f76665b41155795221df9b855a14894753c43fb"
+          MIGRATION_152 = "152_ref_store_public_attempts.sql"
+          MIGRATION_SHA256 = "b087c771b8be173019408bcbbb83fb1be3342ea744f0f670ff835d2e503d0d58"
+          FIXTURE = "tests/fixtures/ref_store_schema152_late_cancellation.sql"
+          FIXTURE_SHA256 = "2315574ff2917e4165c58194325ecb2cd890c3b20b4bf3b416b8e1902da6cad5"
+          ORACLES = (
+              "slot0_reserves_first_lane_sequence_after_mapping",
+              "missing_producer_binding_rejected",
+              "wrong_producer_binding_rejected",
+              "exact_producer_binding_accepted",
+              "prior_cancellation_has_no_event",
+              "invalid_private_tombstones_rejected",
+              "late_cancellation_preserves_durable_winners",
+              "restricted_legacy_cancellation_allowed",
+          )
+          TOUCHED_TABLES = (
+              "users", "repositories", "ref_store_core_gates", "ref_store_core_protocol_repos",
+              "ref_store_serving_repositories", "ref_store_issuer_lanes", "ref_store_public_operations",
+              "ref_store_private_attempts", "ref_store_operations", "ref_store_serving_operations",
+              "ref_store_core_events", "ref_store_cancellations",
+          )
+          ROLE = "issue42_legacy_cancel_probe"
+          PSQL = "/usr/lib/postgresql/17/bin/psql"
+          PG_ENV = dict(LC_ALL="C", PGHOST="127.0.0.1", PGPORT="55432", PGUSER="rootyard",
+                        PGCONNECT_TIMEOUT="5", PGPASSFILE="/dev/null", PGSSLMODE="disable",
+                        PGOPTIONS="-c statement_timeout=25000 -c lock_timeout=2000")
+          WORK_DEADLINE = time.monotonic() + 240
+          CLEANUP_DEADLINE = WORK_DEADLINE + 60
+
+          def require(condition):
+              if not condition:
+                  raise ValueError("qualification check failed")
+
+          def run(args, *, cwd=None, env=None, limit=8, capture=False, cleanup=False):
+              deadline = CLEANUP_DEADLINE if cleanup else WORK_DEADLINE
+              remaining = deadline - time.monotonic()
+              require(remaining > 0)
+              result = subprocess.run(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, timeout=min(limit, remaining), check=True)
+              if capture:
+                  require(len(result.stdout) <= 32768)
+                  return result.stdout.decode("ascii").strip()
+
+          def git(root, *args):
+              return run(["git", *args], cwd=root, capture=True)
+
+          def sha(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def source():
+              workflow_root = ROOT / "workflow-source"
+              head, tree = git(workflow_root, "rev-parse", "HEAD", "HEAD^{tree}").splitlines()
+              require(all(re.fullmatch(r"[0-9a-f]{40}", value) for value in (head, tree)))
+              require(os.environ["GITHUB_EVENT_NAME"] == "push" and os.environ["GITHUB_REF"] == BRANCH)
+              require(os.environ["GITHUB_WORKFLOW_REF"] == f'{os.environ["GITHUB_REPOSITORY"]}/{WORKFLOW}@{BRANCH}')
+              require(head == os.environ["GITHUB_SHA"] == os.environ["GITHUB_WORKFLOW_SHA"])
+              require(git(workflow_root, "rev-list", "--parents", "-n", "1", "HEAD").split()
+                      == [head, SCRATCH_PARENT, PRODUCT_SHA])
+              require(git(workflow_root, "diff-tree", "--no-commit-id", "--name-status", "--no-renames", "-r",
+                          "HEAD^1", "HEAD") == f"A\t{WORKFLOW}")
+              for root in (workflow_root, PRODUCT):
+                  require(not git(root, "status", "--porcelain=v1", "--untracked-files=all"))
+              require(git(PRODUCT, "rev-parse", "HEAD", "HEAD^{tree}", "HEAD:migrations").splitlines()
+                      == [PRODUCT_SHA, PRODUCT_TREE, MIGRATIONS_TREE])
+              names = git(PRODUCT, "ls-tree", "--name-only", "HEAD:migrations").splitlines()
+              require(len(names) == 75 and names == sorted(names)
+                      and all(re.fullmatch(r"[0-9]{3}_[a-z0-9_]+\.sql", name) for name in names))
+              versions = [int(name[:3]) for name in names]
+              require(versions == sorted(set(versions)) and [versions[0], *versions[-2:]] == [1, 151, 152])
+              require(names[-1] == MIGRATION_152 and sha(PRODUCT / "migrations" / MIGRATION_152) == MIGRATION_SHA256)
+              chain = "".join(f"{sha(PRODUCT / 'migrations' / name)}  {name}\n" for name in names)
+              require(hashlib.sha256(chain.encode("ascii")).hexdigest() == CHAIN_SHA256)
+              require(sha(PRODUCT / FIXTURE) == FIXTURE_SHA256)
+              return names, versions, {
+                  "event_commit": head, "workflow_commit": head, "workflow_tree": tree,
+                  "workflow_sha256": sha(workflow_root / WORKFLOW), "product_commit": PRODUCT_SHA,
+                  "product_tree": PRODUCT_TREE, "fixture_sha256": FIXTURE_SHA256,
+                  "migration_152_sha256": MIGRATION_SHA256, "migrations_tree": MIGRATIONS_TREE,
+                  "migration_chain_sha256": CHAIN_SHA256, "migration_count": len(versions),
+              }
+
+          def psql(db, *args, limit=8, capture=False, cleanup=False):
+              return run([PSQL, "-XqAtw", "-v", "ON_ERROR_STOP=1", *args], cwd=PRODUCT,
+                         env=dict(PG_ENV, PGDATABASE=db), limit=limit, capture=capture, cleanup=cleanup)
+
+          def query(db, sql):
+              return psql(db, "-c", sql, capture=True)
+
+          def roster(*, cleanup=False):
+              databases, roles = json.loads(psql("postgres", "-c", """
+                  SELECT json_build_array(
+                    (SELECT json_agg(d ORDER BY oid) FROM
+                       (SELECT oid, datname, datdba FROM pg_database ORDER BY oid LIMIT 16) d),
+                    (SELECT json_agg(r ORDER BY oid) FROM
+                       (SELECT oid, rolname, rolcanlogin, rolsuper, rolinherit, rolcreaterole,
+                               rolcreatedb, rolreplication, rolbypassrls
+                        FROM pg_roles ORDER BY oid LIMIT 128) r));
+              """, capture=True, cleanup=cleanup))
+              require(len(databases) < 16 and len(roles) < 128)
+              return ({row["datname"]: row for row in databases}, {row["rolname"]: row for row in roles})
+
+          def ledger(db, versions):
+              require(query(db, "SELECT string_agg(version::text, ',' ORDER BY version) "
+                                "FROM public.schema_migrations;") == ",".join(map(str, versions)))
+
+          def migrate(db, names, limit):
+              files = [part for name in names for part in ("-f", f"migrations/{name}")]
+              psql(db, "--single-transaction", "-c", "SELECT pg_advisory_xact_lock(738390103)", *files, limit=limit)
+
+          def empty_fixture_state(db):
+              terms = [f"NOT EXISTS (SELECT FROM public.{table})" for table in TOUCHED_TABLES]
+              require(query(db, "SELECT " + " AND ".join(terms) + ";") == "t")
+
+          def cleanup(db, owned, before, fixture_started):
+              databases, roles = roster(cleanup=True)
+              row = databases.get(db)
+              if row is None:
+                  require(owned is not None)
+              else:
+                  require(row == owned if owned is not None else row["datdba"] == before[1]["rootyard"]["oid"])
+                  psql("postgres", "-c", f'DROP DATABASE "{db}" WITH (FORCE);', limit=12, cleanup=True)
+              probe = roles.get(ROLE)
+              if probe is not None:
+                  require(fixture_started)
+                  require(not any(probe[key] for key in ("rolcanlogin", "rolsuper", "rolcreaterole",
+                                                         "rolcreatedb", "rolreplication", "rolbypassrls")))
+                  require(probe["rolinherit"] is True)
+                  psql("postgres", "-c", f"DROP ROLE {ROLE};", limit=12, cleanup=True)
+              require(roster(cleanup=True) == before)
+
+          def qualify():
+              report = dict(version=1, scope="schema152_slot0_and_late_cancellation", passed=False,
+                            stage="source", sources=None, pg_version_num=None, fixture_completed=False,
+                            oracles=dict.fromkeys(ORACLES, False), fixture_rollback=False, cleanup="not_started")
+              db = owned = None
+              interrupted = cleaning = fixture_started = False
+
+              def stop(_signum, _frame):
+                  nonlocal interrupted
+                  interrupted = True
+                  if not cleaning:
+                      raise InterruptedError
+
+              signal.signal(signal.SIGTERM, stop)
+              signal.signal(signal.SIGINT, stop)
+              try:
+                  names, versions, report["sources"] = source()
+                  report["stage"] = "postgres_preflight"
+                  require(re.fullmatch(r"psql \(PostgreSQL\) 17\.[0-9]{1,3}(?: [^\r\n]{1,100})?",
+                                       run([PSQL, "--version"], env=dict(LC_ALL="C"), capture=True)))
+                  version = query("postgres", "SHOW server_version_num;")
+                  require(re.fullmatch(r"17[0-9]{4}", version))
+                  report["pg_version_num"] = int(version)
+                  before = roster()
+                  require(set(before[0]) == {"postgres", "template0", "template1"} and ROLE not in before[1])
+                  require(before[1]["rootyard"]["rolsuper"] is True and not interrupted)
+                  report["stage"] = "database_create"
+                  db = "issue42_slot0_" + secrets.token_hex(12)
+                  psql("postgres", "-c", f'CREATE DATABASE "{db}" TEMPLATE template0;', limit=15)
+                  after, roles = roster()
+                  row = after.get(db)
+                  require(row is not None and row["datdba"] == before[1]["rootyard"]["oid"])
+                  owned = row
+                  require(after == dict(before[0], **{db: owned}) and roles == before[1] and not interrupted)
+                  report["stage"] = "migration_151"
+                  migrate(db, names[:-1], 80)
+                  ledger(db, versions[:-1])
+                  require(not interrupted)
+                  report["stage"] = "migration_152"
+                  migrate(db, names[-1:], 25)
+                  ledger(db, versions)
+                  empty_fixture_state(db)
+                  require(not interrupted)
+                  report["stage"] = "fixture"
+                  fixture_started = True
+                  psql(db, "-f", FIXTURE, limit=45)
+                  report["fixture_completed"] = True
+                  report["stage"] = "rollback"
+                  empty_fixture_state(db)
+                  ledger(db, versions)
+                  require(roster() == (dict(before[0], **{db: owned}), before[1]))
+                  report["fixture_rollback"] = True
+                  report["stage"] = "source_recheck"
+                  require(source() == (names, versions, report["sources"]) and not interrupted)
+                  report["oracles"] = dict.fromkeys(ORACLES, True)
+                  report["stage"] = "complete"
+              except Exception:
+                  pass
+              finally:
+                  cleaning = True
+                  if db is not None:
+                      report["cleanup"] = "unproven"
+                      try:
+                          cleanup(db, owned, before, fixture_started)
+                          report["cleanup"] = "verified"
+                      except Exception:
+                          pass
+              if report["stage"] == "complete":
+                  report["stage"] = "interrupted" if interrupted else (
+                      "passed" if report["cleanup"] == "verified" else "cleanup")
+              report["passed"] = report["stage"] == "passed"
+              return report
+
+          if __name__ == "__main__":
+              report = qualify()
+              payload = json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+              require(len(payload) <= 4096)
+              with (Path(os.environ["RUNNER_TEMP"]) / "issue42-slot0-qualification.json").open("x", encoding="ascii") as output:
+                  output.write(payload)
+              sys.exit(0 if report["passed"] else 1)
+          PY
+      - name: Upload only the bounded qualification JSON
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        timeout-minutes: 2
+        with:
+          name: issue42-schema152-slot0-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue42-slot0-qualification.json
+          if-no-files-found: error
+          retention-days: 7
