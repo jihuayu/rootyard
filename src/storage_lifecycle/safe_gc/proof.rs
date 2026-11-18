@@ -131,7 +131,7 @@ pub fn verify_deletion_proof(proof: &DeletionProof) -> Result<(), SafeGcError> {
     collect_holds(proof, &mut protected_oids, &mut protected_packs, &mut protected_keys)?;
     collect_decisions(proof, &mut protected_oids, &mut protected_packs)?;
     verify_paired_cursors(&proof.paired_cursors)?;
-    proof.lane.verify_cursor_coverage(proof.live_ref_seq, &proof.paired_cursors)?;
+    proof.lane.verify_cursor_coverage(proof.history_id, proof.live_ref_seq, &proof.paired_cursors)?;
     verify_candidates_and_pack_cover(proof, &protected_oids, &protected_packs, &protected_keys, require_pg_barrier)
 }
 
@@ -192,10 +192,12 @@ fn collect_producers(
             return Err(SafeGcError::IncompleteProof("producer retention state is not reconciled"));
         }
         if entry.observed_cursor_seq < entry.required_cursor_seq
-            || entry.authority_epoch != entry.expected_authority_epoch
-            || entry.expected_authority_epoch < p.incarnation_epoch
+            || entry.authority_epoch != p.incarnation_epoch
+            || entry.expected_authority_epoch != p.incarnation_epoch
         {
-            return Err(SafeGcError::IncompleteProof("producer cursor or epoch is stale/lagging"));
+            return Err(SafeGcError::IncompleteProof(
+                "producer cursor or epoch disagrees with exact incarnation_epoch",
+            ));
         }
         root_budget = root_budget
             .checked_add(entry.root_oids.len())
@@ -335,6 +337,10 @@ fn verify_candidates_and_pack_cover(
         validate_bounded_name("group_id", &c.group_id)?;
         validate_bounded_name("physical_key", &c.physical_key)?;
         validate_sha256_hex(&c.object_sha256)?;
+        validate_bounded_name("remote_etag", &c.remote_etag)?;
+        if let Some(ref vid) = c.remote_version_id {
+            validate_bounded_name("remote_version_id", vid)?;
+        }
         if !seen_roles.insert((c.pack_id, c.key_role.as_str())) {
             return Err(SafeGcError::InvalidInput("duplicate (pack_id, key_role) candidate".into()));
         }

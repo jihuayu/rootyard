@@ -50,6 +50,8 @@ impl DurableSafeGcAuthority {
                     group_id: rec.group_id.clone(),
                     physical_key: key.object_path.clone(),
                     object_sha256: key.object_sha256.clone(),
+                    remote_etag: loc.remote_etag.clone(),
+                    remote_version_id: loc.remote_version_id.clone(),
                     provider_generation: loc.generation,
                     key_epoch: key.incarnation_epoch,
                     retention_state: PackRetentionState::GcEligible,
@@ -207,6 +209,16 @@ impl DurableSafeGcAuthority {
         already_absent: bool,
     ) -> Result<(), SafeGcError> {
         self.update_persisted(|s| {
+            let _arm = s.gc_mode.require_armed()?;
+            let Some(batch_chk) = s.pending_delete.as_ref().filter(|b| b.batch_id == batch_id) else {
+                return Err(SafeGcError::StaleDeleterFenced("pending delete batch missing on post-delete commit"));
+            };
+            if batch_chk.incarnation_id != s.authority.incarnation_id
+                || batch_chk.incarnation_epoch != s.authority.incarnation_epoch
+                || batch_chk.lease_epoch != s.authority.lease_epoch
+            {
+                return Err(SafeGcError::StaleDeleterFenced("epoch or lease drifted before post-delete commit"));
+            }
             if !s.key_registry.deleted_tombstones.contains(physical_key) {
                 s.key_registry.transition_state(
                     physical_key,
@@ -239,7 +251,14 @@ impl DurableSafeGcAuthority {
         reason: &str,
     ) -> Result<(), SafeGcError> {
         self.update_persisted(|s| {
+            let _arm = s.gc_mode.require_armed()?;
             if let Some(batch) = s.pending_delete.as_mut().filter(|b| b.batch_id == batch_id) {
+                if batch.incarnation_id != s.authority.incarnation_id
+                    || batch.incarnation_epoch != s.authority.incarnation_epoch
+                    || batch.lease_epoch != s.authority.lease_epoch
+                {
+                    return Err(SafeGcError::StaleDeleterFenced("epoch or lease drifted on unknown outcome record"));
+                }
                 batch.active_step_fence = None;
                 if !batch.unknown_keys.iter().any(|k| k == physical_key) {
                     batch.unknown_keys.push(physical_key.to_owned());
@@ -345,8 +364,20 @@ impl DurableSafeGcAuthority {
         })
     }
 
+    pub fn quarantine_abandoned_staging(&self) -> Result<usize, SafeGcError> {
+        self.update_persisted(|s| {
+            let count =
+                s.staged_uploads.iter().filter(|u| u.state == StagedUploadState::AbandonedPendingCleanup).count();
+            if count > 0 {
+                s.push_audit("quarantined_staging_delete_disabled", &count.to_string());
+            }
+            Ok(count)
+        })
+    }
+
     pub fn mint_staging_cleanup_tickets(&self) -> Result<Vec<DeleteAuthorizationTicket>, SafeGcError> {
         let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let _arm = guard.gc_mode.require_armed()?;
         let membership_digest = guard.compute_membership_digest();
         let mut out = Vec::new();
         for entry in guard.staged_uploads.iter().filter(|u| u.state == StagedUploadState::AbandonedPendingCleanup) {
@@ -380,6 +411,7 @@ impl DurableSafeGcAuthority {
 
     pub fn record_staging_key_cleaned(&self, op_id: Uuid, physical_key: &str) -> Result<(), SafeGcError> {
         self.update_persisted(|s| {
+            let _arm = s.gc_mode.require_armed()?;
             s.key_registry.tombstone_abandoned_staging(physical_key)?;
             if let Some(entry) = s.staged_uploads.iter_mut().find(|u| u.op_id == op_id)
                 && s.key_registry.deleted_tombstones.contains(&entry.pack_key.object_path)

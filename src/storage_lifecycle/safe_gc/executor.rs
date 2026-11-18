@@ -10,7 +10,7 @@ use super::{
         ActiveDeleteFence, DeleteExecutionReport, ExternalFenceCheck, ProviderDeleteOutcome, RemotePresence,
         SafeGcDeleteBackend, StagingCleanupReport,
     },
-    model::{GlobalHoldEntry, GlobalHoldState, LiveRefRoot},
+    model::{AuthorityLane, GlobalHoldEntry, GlobalHoldState, LiveRefRoot},
     proof::DeletionProof,
     store::{DurableSafeGcAuthority, PendingDeleteBatch},
 };
@@ -32,6 +32,7 @@ pub enum DeleteFaultHook {
     AttachHoldAfterBarrier(GlobalHoldEntry),
     ReleaseHoldWithoutCursorAdvance(Uuid, u64),
     MutateAfterTicketBeforeProviderDelete(PostTicketDriftFault),
+    BumpLeaseEpochAfterProviderDeleteBeforeCommit,
     SimulateCrashAfterDeletes(usize),
 }
 
@@ -61,7 +62,12 @@ pub async fn execute_safe_gc_sweep_with_external_fence(
     external_check: Option<ExternalFenceCheck<'_>>,
 ) -> Result<DeleteExecutionReport, SafeGcError> {
     let snap = authority.snapshot();
-    let _arm = snap.gc_mode.require_armed()?;
+    let arm = snap.gc_mode.require_armed()?;
+    if matches!(arm.lane, AuthorityLane::SingleNodePg { .. })
+        && let Some(chk) = external_check
+    {
+        chk()?;
+    }
     let batch = authority.begin_delete_batch(
         req.batch_id,
         req.deleter_incarnation_id,
@@ -92,17 +98,60 @@ pub async fn reconcile_pending_delete_after_restart(
     deleter_lease_epoch: u64,
     deadline: Instant,
 ) -> Result<Option<DeleteExecutionReport>, SafeGcError> {
+    reconcile_pending_delete_after_restart_fenced(
+        authority,
+        backend,
+        deleter_incarnation_id,
+        deleter_incarnation_epoch,
+        deleter_lease_epoch,
+        None,
+        deadline,
+    )
+    .await
+}
+
+pub async fn reconcile_pending_delete_after_restart_fenced(
+    authority: &DurableSafeGcAuthority,
+    backend: &dyn SafeGcDeleteBackend,
+    deleter_incarnation_id: Uuid,
+    deleter_incarnation_epoch: u64,
+    deleter_lease_epoch: u64,
+    external_check: Option<ExternalFenceCheck<'_>>,
+    deadline: Instant,
+) -> Result<Option<DeleteExecutionReport>, SafeGcError> {
     let snap = authority.snapshot();
     let Some(batch) = snap.pending_delete.clone() else {
         return Ok(None);
     };
+    let arm = snap.gc_mode.require_armed()?;
+    if deleter_incarnation_id != snap.authority.incarnation_id
+        || deleter_incarnation_epoch != snap.authority.incarnation_epoch
+        || deleter_lease_epoch != snap.authority.lease_epoch
+    {
+        return Err(SafeGcError::StaleDeleterFenced(
+            "restart reconciliation deleter epochs do not exactly equal live authority",
+        ));
+    }
+    if matches!(batch.proof.lane, AuthorityLane::SingleNodePg { .. })
+        || matches!(arm.lane, AuthorityLane::SingleNodePg { .. })
+    {
+        let Some(chk) = external_check else {
+            return Err(SafeGcError::StaleDeleterFenced(
+                "SingleNodePg restart reconciliation requires live PG lease and gc_epoch fence",
+            ));
+        };
+        chk()?;
+    }
+
     if batch.incarnation_epoch < snap.authority.incarnation_epoch
         || batch.incarnation_id != snap.authority.incarnation_id
     {
-        // Stale-incarnation batch after rotation: probe remote absence without issuing new deletes,
-        // roll remaining barrier keys back to RetiredPendingProof, and clear pending_delete!
+        // Stale-incarnation batch after rotation: probe remote absence under live fence without issuing new deletes!
         let mut confirmed_absent = Vec::new();
         for key in &batch.pending_keys {
+            if let Some(chk) = external_check {
+                chk()?;
+            }
             if let Some(loc) = find_retired_locator_for_key(&snap, key)
                 && matches!(backend.probe_presence(&loc, deadline).await?, RemotePresence::Absent)
             {
@@ -117,7 +166,7 @@ pub async fn reconcile_pending_delete_after_restart(
             authority,
             backend,
             deleter: (deleter_incarnation_id, deleter_incarnation_epoch, deleter_lease_epoch),
-            external_check: None,
+            external_check,
             reconciled: true,
             deadline,
         },
@@ -128,12 +177,24 @@ pub async fn reconcile_pending_delete_after_restart(
     Ok(Some(report))
 }
 
+/// Default-off non-destructive staging quarantine: records audit state with ZERO provider deletes.
+pub fn quarantine_abandoned_staging_without_delete(authority: &DurableSafeGcAuthority) -> Result<usize, SafeGcError> {
+    authority.quarantine_abandoned_staging()
+}
+
 pub async fn reclaim_abandoned_compaction_staging(
     authority: &DurableSafeGcAuthority,
     backend: &dyn SafeGcDeleteBackend,
     external_check: Option<ExternalFenceCheck<'_>>,
     deadline: Instant,
 ) -> Result<StagingCleanupReport, SafeGcError> {
+    let snap = authority.snapshot();
+    let arm = snap.gc_mode.require_armed()?;
+    if matches!(arm.lane, AuthorityLane::SingleNodePg { .. })
+        && let Some(chk) = external_check
+    {
+        chk()?;
+    }
     let tickets = authority.mint_staging_cleanup_tickets()?;
     let mut deleted_keys = Vec::new();
     let mut already_absent_keys = Vec::new();
@@ -142,10 +203,12 @@ pub async fn reclaim_abandoned_compaction_staging(
         let fence = ActiveDeleteFence::new(authority, ticket, external_check);
         match backend.delete_authorized(&fence, ticket, deadline).await? {
             ProviderDeleteOutcome::ConfirmedDeleted => {
+                fence.verify_active_for_ticket(ticket)?;
                 authority.record_staging_key_cleaned(ticket.batch_id(), ticket.physical_key())?;
                 deleted_keys.push(ticket.physical_key().to_owned());
             }
             ProviderDeleteOutcome::AlreadyAbsent => {
+                fence.verify_active_for_ticket(ticket)?;
                 authority.record_staging_key_cleaned(ticket.batch_id(), ticket.physical_key())?;
                 already_absent_keys.push(ticket.physical_key().to_owned());
             }
@@ -208,10 +271,16 @@ async fn drive_pending_batch_ctx(
         let fence = ActiveDeleteFence::new(ctx.authority, &ticket, ctx.external_check);
         match ctx.backend.delete_authorized(&fence, &ticket, ctx.deadline).await {
             Ok(ProviderDeleteOutcome::ConfirmedDeleted) => {
+                if matches!(fault, DeleteFaultHook::BumpLeaseEpochAfterProviderDeleteBeforeCommit) {
+                    fault = DeleteFaultHook::None;
+                    let _ = ctx.authority.bump_lease_epoch()?;
+                }
+                fence.verify_active_for_ticket(&ticket)?;
                 ctx.authority.record_key_deleted(batch.batch_id, key, false)?;
                 deleted_this_pass += 1;
             }
             Ok(ProviderDeleteOutcome::AlreadyAbsent) => {
+                fence.verify_active_for_ticket(&ticket)?;
                 ctx.authority.record_key_deleted(batch.batch_id, key, true)?;
                 deleted_this_pass += 1;
             }
@@ -221,7 +290,6 @@ async fn drive_pending_batch_ctx(
                 retry_keys.push(key.clone());
             }
             Err(err) => {
-                // Fence loss / post-ticket drift / disabled backend aborts fail-closed immediately!
                 if matches!(
                     err,
                     SafeGcError::StaleIncarnation(_)
@@ -232,6 +300,7 @@ async fn drive_pending_batch_ctx(
                         | SafeGcError::ReaderQuiescenceUnverified(_)
                         | SafeGcError::DestructiveGcDisabledByDefault
                         | SafeGcError::BlobDeleteDisabled
+                        | SafeGcError::CompactionVerificationFailed(_)
                 ) {
                     return Err(err);
                 }
@@ -262,51 +331,15 @@ fn find_retired_locator_for_key(
     snap: &super::store::SafeGcRepoSnapshot,
     physical_key: &str,
 ) -> Option<super::domain::BlobLocatorRecord> {
-    snap.retired_packs.iter().find_map(|p| {
+    for p in &snap.retired_packs {
         if p.pack_key.object_path == physical_key {
-            Some(p.pack_locator.clone())
-        } else if p.idx_key.object_path == physical_key {
-            Some(p.idx_locator.clone())
-        } else {
-            None
+            return Some(p.pack_locator.clone());
         }
-    })
-}
-
-fn apply_pre_ticket_fault(
-    authority: &DurableSafeGcAuthority,
-    fault: &mut DeleteFaultHook,
-    deleted_so_far: usize,
-) -> Result<(), SafeGcError> {
-    if matches!(
-        fault,
-        DeleteFaultHook::None
-            | DeleteFaultHook::SimulateCrashAfterDeletes(_)
-            | DeleteFaultHook::MutateAfterTicketBeforeProviderDelete(_)
-    ) || deleted_so_far > 0
-    {
-        return Ok(());
+        if p.idx_key.object_path == physical_key {
+            return Some(p.idx_locator.clone());
+        }
     }
-    match std::mem::replace(fault, DeleteFaultHook::None) {
-        DeleteFaultHook::RotateIncarnationAfterBarrier => {
-            let _ = authority.rotate_incarnation()?;
-        }
-        DeleteFaultHook::ConcurrentNewRefAfterBarrier(r) => authority.register_concurrent_ref(r)?,
-        DeleteFaultHook::AttachHoldAfterBarrier(h) => authority.upsert_global_hold(h)?,
-        DeleteFaultHook::ReleaseHoldWithoutCursorAdvance(hold_id, future_seq) => {
-            let snap = authority.snapshot();
-            if let Some(mut released) = snap.global_holds.into_iter().find(|x| x.hold_id == hold_id) {
-                released.state = GlobalHoldState::Released { released_at_seq: future_seq };
-                authority.upsert_global_hold(released)?;
-            } else {
-                return Err(SafeGcError::InvalidInput("fault hold_id not found".into()));
-            }
-        }
-        DeleteFaultHook::None
-        | DeleteFaultHook::SimulateCrashAfterDeletes(_)
-        | DeleteFaultHook::MutateAfterTicketBeforeProviderDelete(_) => {}
-    }
-    Ok(())
+    None
 }
 
 fn apply_post_ticket_fault(authority: &DurableSafeGcAuthority, fault: PostTicketDriftFault) -> Result<(), SafeGcError> {
@@ -314,9 +347,42 @@ fn apply_post_ticket_fault(authority: &DurableSafeGcAuthority, fault: PostTicket
         PostTicketDriftFault::ConcurrentNewRef(r) => authority.register_concurrent_ref(r),
         PostTicketDriftFault::AttachGlobalHold(h) => authority.upsert_global_hold(h),
         PostTicketDriftFault::AcquireReaderLease(packs) => {
-            authority.acquire_reader_lease("post-ticket-reader", packs).map(|_| ())
+            authority.acquire_reader_lease("post-ticket", packs).map(drop)
         }
-        PostTicketDriftFault::BumpLeaseEpoch => authority.bump_lease_epoch().map(|_| ()),
-        PostTicketDriftFault::RotateIncarnation => authority.rotate_incarnation().map(|_| ()),
+        PostTicketDriftFault::BumpLeaseEpoch => authority.bump_lease_epoch().map(drop),
+        PostTicketDriftFault::RotateIncarnation => authority.rotate_incarnation().map(drop),
     }
+}
+
+fn apply_pre_ticket_fault(
+    authority: &DurableSafeGcAuthority,
+    fault: &mut DeleteFaultHook,
+    deleted_so_far: usize,
+) -> Result<(), SafeGcError> {
+    match fault {
+        DeleteFaultHook::RotateIncarnationAfterBarrier => {
+            *fault = DeleteFaultHook::None;
+            let _ = authority.rotate_incarnation()?;
+        }
+        DeleteFaultHook::ConcurrentNewRefAfterBarrier(r) if deleted_so_far == 0 => {
+            let root = r.clone();
+            *fault = DeleteFaultHook::None;
+            authority.register_concurrent_ref(root)?;
+        }
+        DeleteFaultHook::AttachHoldAfterBarrier(h) if deleted_so_far == 0 => {
+            let hold = h.clone();
+            *fault = DeleteFaultHook::None;
+            authority.upsert_global_hold(hold)?;
+        }
+        DeleteFaultHook::ReleaseHoldWithoutCursorAdvance(hold_id, seq) if deleted_so_far == 0 => {
+            let (id, release_seq) = (*hold_id, *seq);
+            *fault = DeleteFaultHook::None;
+            if let Some(mut existing) = authority.snapshot().global_holds.into_iter().find(|h| h.hold_id == id) {
+                existing.state = GlobalHoldState::Released { released_at_seq: release_seq };
+                authority.upsert_global_hold(existing)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }

@@ -32,6 +32,8 @@ pub mod proof_digest;
 pub mod provider_delete;
 #[path = "safe_gc/quiescence.rs"]
 pub mod quiescence;
+#[path = "safe_gc/refcas_cut.rs"]
+pub mod refcas_cut;
 #[path = "safe_gc/retention_bridge.rs"]
 pub mod retention_bridge;
 #[path = "safe_gc/store.rs"]
@@ -59,8 +61,9 @@ pub use domain::{
 pub use error::SafeGcError;
 pub use executor::{
     DeleteFaultHook, PostTicketDriftFault, SafeGcSweepRequest, execute_safe_gc_sweep,
-    execute_safe_gc_sweep_with_external_fence, reclaim_abandoned_compaction_staging,
-    reconcile_pending_delete_after_restart,
+    execute_safe_gc_sweep_with_external_fence, quarantine_abandoned_staging_without_delete,
+    reclaim_abandoned_compaction_staging, reconcile_pending_delete_after_restart,
+    reconcile_pending_delete_after_restart_fenced,
 };
 pub use model::{
     AuthorityLane, CandidatePackTarget, DecisionKind, DecisionState, GcMode, GlobalHoldEntry, GlobalHoldState,
@@ -74,4 +77,5 @@ pub use pg_reconcile::{reconcile_pg_refstore_authority, reconcile_refcas_quorum_
 pub use proof::{DeletionProof, DeletionProofInputs, build_and_verify_deletion_proof, verify_deletion_proof};
 pub use provider_delete::{OpenDalS3GcProvider, S3OperatorCredentials};
 pub use quiescence::{ActiveReaderLease, ReaderLeaseRegistry, ReaderQuiescenceObservation};
+pub use refcas_cut::{RefCasReconciledCut, reconcile_refcas_cut_with_pg};
 pub use store::{DurableSafeGcAuthority, SafeGcRepoSnapshot, ServingPackRecord};

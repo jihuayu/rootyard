@@ -31,6 +31,7 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "proof_digest.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "provider_delete.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "quiescence.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "refcas_cut.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "retention_bridge.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "store.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "store_barrier.rs",
@@ -40,6 +41,7 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_concurrency.rs",
     ROOT / "tests" / "storage_safe_gc.rs",
     ROOT / "tests" / "storage_safe_gc_maintenance.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "s3_harness.rs",
 ]
 WORKFLOW = ROOT / ".github" / "workflows" / "storage-safe-gc.yml"
@@ -65,7 +67,7 @@ class StorageSafeGcContractsTest(unittest.TestCase):
                 self.assertLess(len(lines), 500, f"{path.name} has {len(lines)} lines (>= 500)")
                 self.assertNotIn("#[allow(", text, f"lint suppression forbidden in {path.name}")
 
-        for name in ("model.rs", "proof.rs", "anti_aba.rs", "store.rs", "domain.rs", "quiescence.rs"):
+        for name in ("model.rs", "proof.rs", "anti_aba.rs", "store.rs", "domain.rs", "quiescence.rs", "refcas_cut.rs"):
             src = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / name).read_text(encoding="utf-8")
             for m in re.finditer(r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*pub struct (\w+)", src):
                 self.assertIn("deny_unknown_fields", m.group(0), f"{name}:{m.group(1)} missing deny_unknown_fields")

@@ -31,7 +31,7 @@ pub struct AuthorityRecord {
     pub lease_epoch: u64,
 }
 
-/// Serializable Blob coordinate mirror preserving BlobLocator invariants.
+/// Serializable Blob coordinate mirror preserving BlobLocator and remote object version invariants.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobLocatorRecord {
@@ -42,10 +42,12 @@ pub struct BlobLocatorRecord {
     pub namespace: String,
     pub sha256: String,
     pub length: u64,
+    pub remote_etag: String,
+    pub remote_version_id: Option<String>,
 }
 
 impl BlobLocatorRecord {
-    pub fn from_locator(loc: &BlobLocator) -> Self {
+    pub fn from_locator_versioned(loc: &BlobLocator, remote_etag: String, remote_version_id: Option<String>) -> Self {
         Self {
             tenant_id: loc.tenant_id(),
             authority_id: loc.authority_id(),
@@ -54,7 +56,17 @@ impl BlobLocatorRecord {
             namespace: loc.namespace().to_owned(),
             sha256: loc.sha256().to_owned(),
             length: loc.length(),
+            remote_etag,
+            remote_version_id,
         }
+    }
+
+    pub fn validate_version_binding(&self) -> Result<(), SafeGcError> {
+        validate_bounded_name("remote_etag", &self.remote_etag)?;
+        if let Some(ref vid) = self.remote_version_id {
+            validate_bounded_name("remote_version_id", vid)?;
+        }
+        Ok(())
     }
 
     pub fn to_locator(&self) -> Result<BlobLocator, SafeGcError> {
@@ -78,6 +90,14 @@ impl BlobLocatorRecord {
         encode_len_bytes(h, self.namespace.as_bytes());
         encode_len_bytes(h, self.sha256.as_bytes());
         h.update(self.length.to_be_bytes());
+        encode_len_bytes(h, self.remote_etag.as_bytes());
+        match &self.remote_version_id {
+            Some(vid) => {
+                h.update([1]);
+                encode_len_bytes(h, vid.as_bytes());
+            }
+            None => h.update([0]),
+        }
     }
 }
 
@@ -277,6 +297,7 @@ impl DeleteAuthorizationTicket {
         validate_bounded_name("physical_key", &self.physical_key)?;
         validate_sha256_hex(&self.object_sha256)?;
         validate_sha256_hex(&self.membership_digest)?;
+        self.locator.validate_version_binding()?;
         if self.provider_generation <= 0
             || self.locator.generation != self.provider_generation
             || self.locator.sha256 != self.object_sha256

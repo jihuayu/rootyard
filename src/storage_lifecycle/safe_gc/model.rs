@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::ref_store::ref_version::pack_cover::PackRetentionState;
 
-use super::{SafeGcError, quiescence::ReaderQuiescenceObservation};
+use super::{SafeGcError, quiescence::ReaderQuiescenceObservation, refcas_cut::RefCasReconciledCut};
 
 pub const SAFE_GC_SCHEMA_VERSION: u32 = 2;
 /// Mandatory safe-by-default invariant: destructive GC is OFF unless armed.
@@ -110,24 +110,48 @@ impl AuthorityLane {
 
     pub fn verify_cursor_coverage(
         &self,
+        history_id: Uuid,
         live_ref_seq: u64,
         cursors: &PairedCursorReconciliation,
     ) -> Result<(), SafeGcError> {
         match self {
-            Self::SingleNodePg { pg_tx_seq, .. } => {
+            Self::SingleNodePg { pg_tx_seq, pg_gc_fence_epoch, reader_barrier_epoch, .. } => {
+                if pg_gc_fence_epoch != reader_barrier_epoch {
+                    return Err(SafeGcError::StaleDeleterFenced(
+                        "SingleNodePg gc_epoch fence disagrees with reader_barrier_epoch",
+                    ));
+                }
                 let floor = (*pg_tx_seq).max(live_ref_seq);
                 if cursors.pg_applied_seq < floor {
                     return Err(SafeGcError::IncompleteProof(
                         "paired PG cursor has not covered SingleNodePg tx/ref sequence",
                     ));
                 }
+                if cursors.refcas_required_index > 0 {
+                    let Some(ref cut) = cursors.refcas_cut else {
+                        return Err(SafeGcError::IncompleteProof(
+                            "Ref-CAS projection stream active in PG without verified RefCasReconciledCut",
+                        ));
+                    };
+                    cut.verify_reconciled(history_id, cursors.refcas_required_index, cut.group_epoch)?;
+                } else if let Some(ref cut) = cursors.refcas_cut {
+                    cut.verify_reconciled(history_id, 1, cut.group_epoch)?;
+                }
                 Ok(())
             }
-            Self::DistributedRefCas { raft_commit_index, global_hold_bridge_seq, .. } => {
+            Self::DistributedRefCas { quorum_epoch, raft_commit_index, global_hold_bridge_seq, .. } => {
                 let refcas_floor = (*raft_commit_index).max(*global_hold_bridge_seq).max(live_ref_seq);
-                if cursors.refcas_applied_index < refcas_floor {
+                let Some(ref cut) = cursors.refcas_cut else {
                     return Err(SafeGcError::IncompleteProof(
-                        "paired Ref-CAS cursor has not covered raft_commit_index / global_hold_bridge_seq",
+                        "DistributedRefCas requires an authoritative RefCasReconciledCut; PG ref seq cannot prove Ref-CAS cut",
+                    ));
+                };
+                cut.verify_reconciled(history_id, refcas_floor, *quorum_epoch)?;
+                if cursors.refcas_applied_index != cut.sm_applied_log_index
+                    || cursors.refcas_applied_index < refcas_floor
+                {
+                    return Err(SafeGcError::IncompleteProof(
+                        "paired Ref-CAS cursor disagrees with verified RefCasReconciledCut",
                     ));
                 }
                 if cursors.pg_applied_seq < *global_hold_bridge_seq {
@@ -392,6 +416,8 @@ pub struct PairedCursorReconciliation {
     pub refcas_freshness: SourceFreshness,
     pub refcas_applied_index: u64,
     pub refcas_required_index: u64,
+    #[serde(default)]
+    pub refcas_cut: Option<RefCasReconciledCut>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,6 +443,8 @@ pub struct CandidatePackTarget {
     pub group_id: String,
     pub physical_key: String,
     pub object_sha256: String,
+    pub remote_etag: String,
+    pub remote_version_id: Option<String>,
     pub provider_generation: i64,
     pub key_epoch: u64,
     pub retention_state: PackRetentionState,

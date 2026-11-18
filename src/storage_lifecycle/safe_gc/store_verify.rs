@@ -23,6 +23,15 @@ impl DurableSafeGcAuthority {
         let Some(batch) = guard.pending_delete.as_ref().filter(|b| b.batch_id == ticket.batch_id()) else {
             return Err(SafeGcError::StaleDeleterFenced("pending delete batch absent or completed during delete"));
         };
+        if batch.incarnation_id != guard.authority.incarnation_id
+            || batch.incarnation_epoch != guard.authority.incarnation_epoch
+            || batch.lease_epoch != guard.authority.lease_epoch
+            || ticket.lease_epoch() != guard.authority.lease_epoch
+        {
+            return Err(SafeGcError::StaleDeleterFenced(
+                "batch or ticket epoch does not exactly equal live authority epoch",
+            ));
+        }
         if batch.active_step_fence.as_ref() != Some(&(ticket.step_fence_id(), ticket.physical_key().to_owned())) {
             return Err(SafeGcError::StaleDeleterFenced("active step fence superseded or cleared"));
         }
@@ -93,11 +102,14 @@ impl SafeGcRepoSnapshot {
     }
 
     pub(super) fn verify_staging_cleanup_ticket(&self, ticket: &DeleteAuthorizationTicket) -> Result<(), SafeGcError> {
-        if self.authority.incarnation_id != ticket.incarnation_id()
+        let arm = self.gc_mode.require_armed()?;
+        if arm.incarnation_id != self.authority.incarnation_id
+            || arm.incarnation_epoch != self.authority.incarnation_epoch
+            || self.authority.incarnation_id != ticket.incarnation_id()
             || self.authority.incarnation_epoch != ticket.incarnation_epoch()
             || self.authority.lease_epoch != ticket.lease_epoch()
         {
-            return Err(SafeGcError::StaleDeleterFenced("staging cleanup ticket fenced by authority rotation"));
+            return Err(SafeGcError::StaleDeleterFenced("staging cleanup ticket fenced by exact epoch mismatch"));
         }
         if self
             .active_packs
@@ -156,11 +168,21 @@ impl SafeGcRepoSnapshot {
         {
             return Err(SafeGcError::StaleIncarnation("authority incarnation rotated"));
         }
-        if deleter_lease_epoch < self.authority.lease_epoch {
-            return Err(SafeGcError::StaleDeleterFenced("stale deleter lease epoch"));
+        if deleter_lease_epoch != self.authority.lease_epoch {
+            return Err(SafeGcError::StaleDeleterFenced(
+                "deleter lease_epoch does not exactly equal live authority lease_epoch",
+            ));
         }
         if proof.lane != arm.lane {
             return Err(SafeGcError::DistributedPrereqsMissing("proof lane disagrees with armed authority lane"));
+        }
+        if let AuthorityLane::SingleNodePg { pg_gc_fence_epoch, reader_barrier_epoch, .. } = arm.lane
+            && (pg_gc_fence_epoch != reader_barrier_epoch
+                || self.reader_leases.pg_exclusive_barrier_epoch != Some(reader_barrier_epoch))
+        {
+            return Err(SafeGcError::StaleDeleterFenced(
+                "SingleNodePg live fence epoch does not exactly equal armed barrier epoch",
+            ));
         }
         if proof.membership_generation != self.authority.membership_generation
             || proof.membership_digest != self.compute_membership_digest()
@@ -172,7 +194,11 @@ impl SafeGcRepoSnapshot {
         {
             return Err(SafeGcError::ConcurrentRetentionRace("live refs mutated or omitted from proof"));
         }
-        arm.lane.verify_cursor_coverage(self.authority.live_ref_seq, &self.paired_cursors)?;
+        arm.lane.verify_cursor_coverage(
+            self.authority.history_id,
+            self.authority.live_ref_seq,
+            &self.paired_cursors,
+        )?;
         self.verify_authoritative_candidates_and_live_state(proof, &arm.lane)
     }
 
@@ -247,9 +273,10 @@ impl SafeGcRepoSnapshot {
         for p in &self.producers {
             if p.freshness != SourceFreshness::Reconciled
                 || p.observed_cursor_seq < p.required_cursor_seq
-                || p.authority_epoch < self.authority.incarnation_epoch
+                || p.authority_epoch != self.authority.incarnation_epoch
+                || p.expected_authority_epoch != self.authority.incarnation_epoch
             {
-                return Err(SafeGcError::ConcurrentRetentionRace("live producer lagged or drifted"));
+                return Err(SafeGcError::ConcurrentRetentionRace("live producer lagged or epoch drifted"));
             }
             if p.pinned_pack_ids.iter().any(|id| cand_ids.contains(id))
                 || p.root_oids.iter().any(|o| cand_oids.contains(o.as_str()))
@@ -334,10 +361,14 @@ fn verify_candidate_matches_retired(snap: &SafeGcRepoSnapshot, c: &CandidatePack
     };
     if c.physical_key != key.object_path
         || c.object_sha256 != key.object_sha256
+        || c.remote_etag != loc.remote_etag
+        || c.remote_version_id != loc.remote_version_id
         || c.key_epoch != key.incarnation_epoch
         || c.provider_generation != loc.generation
     {
-        return Err(SafeGcError::IncompleteProof("candidate physical key/digest/epoch disagrees with authority"));
+        return Err(SafeGcError::IncompleteProof(
+            "candidate physical key/digest/version/epoch disagrees with authority",
+        ));
     }
     let exp_oids: BTreeSet<&str> = ret.contained_oids.iter().map(String::as_str).collect();
     let got_oids: BTreeSet<&str> = c.contained_oids.iter().map(String::as_str).collect();

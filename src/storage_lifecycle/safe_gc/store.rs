@@ -249,7 +249,6 @@ impl DurableSafeGcAuthority {
                 s.live_refs.push(next.clone());
             }
             s.paired_cursors.pg_applied_seq = s.paired_cursors.pg_applied_seq.max(s.authority.live_ref_seq);
-            s.paired_cursors.refcas_applied_index = s.paired_cursors.refcas_applied_index.max(s.authority.live_ref_seq);
             s.push_audit("concurrent_ref", &next.ref_name);
             Ok(())
         })

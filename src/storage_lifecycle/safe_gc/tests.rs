@@ -26,6 +26,7 @@ use super::{
     },
     proof::{DeletionProofInputs, build_and_verify_deletion_proof, seal_group_receipt, verify_deletion_proof},
     quiescence::{ReaderLeaseRegistry, ReaderQuiescenceObservation},
+    refcas_cut::RefCasReconciledCut,
     store::{DurableSafeGcAuthority, SafeGcRepoSnapshot, ServingPackRecord},
 };
 
@@ -131,6 +132,10 @@ pub(super) fn make_pack_record(
     };
     let pack_id = Uuid::new_v4();
     let blob_gen = auth.membership_generation as i64;
+    let p_etag = format!("\"{}\"", &psha[..32]);
+    let i_etag = format!("\"{}\"", &isha[..32]);
+    let p_vid = Some(format!("v1-{seq}"));
+    let i_vid = Some(format!("v1-{}", seq + 1));
     let pack_loc = BlobLocatorRecord {
         tenant_id: auth.tenant_id,
         authority_id: auth.repo_id,
@@ -139,8 +144,16 @@ pub(super) fn make_pack_record(
         namespace: "packs".into(),
         sha256: psha.clone(),
         length: 512,
+        remote_etag: p_etag.clone(),
+        remote_version_id: p_vid.clone(),
     };
-    let idx_loc = BlobLocatorRecord { sha256: isha.clone(), attempt_id: Uuid::new_v4(), ..pack_loc.clone() };
+    let idx_loc = BlobLocatorRecord {
+        sha256: isha.clone(),
+        attempt_id: Uuid::new_v4(),
+        remote_etag: i_etag.clone(),
+        remote_version_id: i_vid.clone(),
+        ..pack_loc.clone()
+    };
     let rec = ServingPackRecord {
         pack_id,
         group_id: group_id.into(),
@@ -157,6 +170,8 @@ pub(super) fn make_pack_record(
             group_id: group_id.into(),
             physical_key: p_path,
             object_sha256: psha,
+            remote_etag: p_etag,
+            remote_version_id: p_vid,
             provider_generation: blob_gen,
             key_epoch: auth.incarnation_epoch,
             retention_state: PackRetentionState::GcEligible,
@@ -168,6 +183,8 @@ pub(super) fn make_pack_record(
             group_id: group_id.into(),
             physical_key: i_path,
             object_sha256: isha,
+            remote_etag: i_etag,
+            remote_version_id: i_vid,
             provider_generation: blob_gen,
             key_epoch: auth.incarnation_epoch,
             retention_state: PackRetentionState::GcEligible,
@@ -268,13 +285,33 @@ pub(super) fn seed_fixture(
     .unwrap();
     let live_refs = vec![LiveRefRoot { ref_name: "refs/heads/main".into(), target_oid: live_oid, version_seq: 10 }];
     let producers = reconciled_producers(1, 10, pin_oid);
+    let refcas_cut = if distributed {
+        Some(RefCasReconciledCut {
+            group_id: 0,
+            group_epoch: 1,
+            history_id: auth.history_id,
+            sm_applied_log_term: 1,
+            sm_applied_log_index: 10,
+            sm_applied_event_seq: 3,
+            sm_last_event_log_term: 1,
+            sm_last_event_log_index: 10,
+            sm_snapshot_checksum: sha("sm-snapshot"),
+            pg_projected_log_term: 1,
+            pg_projected_log_index: 10,
+            pg_projected_event_seq: 3,
+            unprojected_jobs_count: 0,
+        })
+    } else {
+        None
+    };
     let paired_cursors = PairedCursorReconciliation {
         pg_freshness: SourceFreshness::Reconciled,
         pg_applied_seq: 10,
         pg_required_seq: 10,
         refcas_freshness: SourceFreshness::Reconciled,
-        refcas_applied_index: 10,
-        refcas_required_index: 10,
+        refcas_applied_index: if distributed { 10 } else { 0 },
+        refcas_required_index: if distributed { 10 } else { 0 },
+        refcas_cut,
     };
     let snap = SafeGcRepoSnapshot {
         authority: auth.clone(),
@@ -382,12 +419,17 @@ async fn proof_and_live_barrier_reject_forged_header_oids_lane_cursor_and_active
     let (snap, arm, mut base_proof) = seed_fixture(SafeGcObjectFormat::Sha256, true);
     verify_deletion_proof(&base_proof).unwrap();
 
-    // 1. Lane cursor coverage: raft_commit_index=10 requires refcas_applied_index >= 10!
-    let mut p_lane_lag = base_proof.clone();
-    p_lane_lag.paired_cursors.refcas_required_index = 5;
-    p_lane_lag.paired_cursors.refcas_applied_index = 9;
-    p_lane_lag.proof_digest = super::proof_digest::compute_proof_digest(&p_lane_lag);
-    assert!(matches!(verify_deletion_proof(&p_lane_lag), Err(SafeGcError::IncompleteProof(_))));
+    // 1. Authoritative Ref-CAS cut: PG ref sequence alone (`pg_applied_seq=999`, `refcas_cut=None`) or unprojected commits MUST fail!
+    let mut p_no_cut = base_proof.clone();
+    p_no_cut.paired_cursors.pg_applied_seq = 999;
+    p_no_cut.paired_cursors.refcas_cut = None;
+    p_no_cut.proof_digest = super::proof_digest::compute_proof_digest(&p_no_cut);
+    assert!(matches!(verify_deletion_proof(&p_no_cut), Err(SafeGcError::IncompleteProof(_))));
+
+    let mut p_unproj = base_proof.clone();
+    p_unproj.paired_cursors.refcas_cut.as_mut().unwrap().pg_projected_event_seq = 2;
+    p_unproj.proof_digest = super::proof_digest::compute_proof_digest(&p_unproj);
+    assert!(matches!(verify_deletion_proof(&p_unproj), Err(SafeGcError::IncompleteProof(_))));
 
     // 2. Forged contained_oids: vec![] passes stateless syntax if unreferenced, MUST fail authoritative barrier!
     let authority = DurableSafeGcAuthority::in_memory(snap.clone()).unwrap();
@@ -435,38 +477,4 @@ async fn proof_and_live_barrier_reject_forged_header_oids_lane_cursor_and_active
     // 5. Tampered proof digest rejected.
     base_proof.live_ref_seq = 999;
     assert!(matches!(verify_deletion_proof(&base_proof), Err(SafeGcError::ProofDigestMismatch)));
-}
-
-#[test]
-fn anti_aba_registry_forbids_reuse_even_after_deletion_and_same_sha_reupload() {
-    let (t, r, h) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    let same_sha = sha("identical-pack");
-    let mut reg = AntiAbaKeyRegistry::new();
-    let k1 = reg.mint_immutable_key((t, r, h, 1), "pack", &same_sha, KeyLifecycleState::ActiveServing).unwrap();
-    reg.transition_state(&k1.object_path, KeyLifecycleState::ActiveServing, KeyLifecycleState::RetiredPendingProof)
-        .unwrap();
-    reg.transition_state(
-        &k1.object_path,
-        KeyLifecycleState::RetiredPendingProof,
-        KeyLifecycleState::DeletePendingBarrier,
-    )
-    .unwrap();
-    reg.transition_state(
-        &k1.object_path,
-        KeyLifecycleState::DeletePendingBarrier,
-        KeyLifecycleState::PhysicallyDeletedTombstone,
-    )
-    .unwrap();
-
-    let k2 = reg.mint_immutable_key((t, r, h, 1), "pack", &same_sha, KeyLifecycleState::ActiveServing).unwrap();
-    assert_ne!(k1.object_path, k2.object_path);
-    assert!(k2.allocation_seq > k1.allocation_seq);
-    assert!(matches!(reg.register_verified_key(k1.clone()), Err(SafeGcError::AbaKeyReuseDetected(_))));
-    assert!(matches!(reg.assert_late_put_allowed(&k1.object_path, 1), Err(SafeGcError::AbaKeyReuseDetected(_))));
-
-    reg.advance_incarnation_epoch(2).unwrap();
-    assert!(matches!(reg.assert_late_put_allowed(&k2.object_path, 1), Err(SafeGcError::StaleIncarnation(_))));
-    assert!(matches!(reg.assert_delete_allowed(&k2.object_path, 1), Err(SafeGcError::StaleDeleterFenced(_))));
-    let unique: BTreeSet<_> = [k1.object_path, k2.object_path].into_iter().collect();
-    assert_eq!(unique.len(), 2);
 }

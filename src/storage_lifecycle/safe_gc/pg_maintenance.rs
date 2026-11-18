@@ -26,7 +26,8 @@ use super::{
     compaction::{CompactionFault, SafeGcCompactionRequest, execute_two_phase_compaction},
     executor::{
         DeleteFaultHook, SafeGcSweepRequest, execute_safe_gc_sweep_with_external_fence,
-        reclaim_abandoned_compaction_staging, reconcile_pending_delete_after_restart,
+        quarantine_abandoned_staging_without_delete, reclaim_abandoned_compaction_staging,
+        reconcile_pending_delete_after_restart_fenced,
     },
     model::{AuthorityLane, GcMode, SafeGcArmReceipt},
     pg_reconcile::reconcile_pg_refstore_authority,
@@ -84,12 +85,12 @@ pub async fn schedule_pg_refstore(state: &AppState, policy: &Policy) -> Result<u
         let auth = DurableSafeGcAuthority::open_with_journal(&journal, None)
             .map_err(|e| anyhow::anyhow!("open safe_gc journal failed: {e}"))?;
         let snap = auth.snapshot();
+        let armed_destructive = destructive_env && matches!(snap.gc_mode, GcMode::ArmedDestructive(_));
         let need_compact = snap.active_packs.len() >= policy.pack_threshold as usize;
-        let need_staging =
-            snap.staged_uploads.iter().any(|u| u.state == super::domain::StagedUploadState::AbandonedPendingCleanup);
-        let need_reconcile = snap.pending_delete.is_some();
-        let need_sweep =
-            destructive_env && matches!(snap.gc_mode, GcMode::ArmedDestructive(_)) && !snap.retired_packs.is_empty();
+        let need_staging = armed_destructive
+            && snap.staged_uploads.iter().any(|u| u.state == super::domain::StagedUploadState::AbandonedPendingCleanup);
+        let need_reconcile = armed_destructive && snap.pending_delete.is_some();
+        let need_sweep = armed_destructive && !snap.retired_packs.is_empty();
         let queued = need_compact || need_staging || need_reconcile || need_sweep;
         let scan_meta = json!({
             "source": "pg_refstore_safe_gc",
@@ -150,7 +151,8 @@ pub async fn run_claimed_safe_gc_once(
     let generation: i64 = claimed_row.get(2);
     let scan_json: Value = claimed_row.get(3);
     let want_delete = scan_json.get("need_sweep").and_then(Value::as_bool).unwrap_or(false)
-        || scan_json.get("need_reconcile").and_then(Value::as_bool).unwrap_or(false);
+        || scan_json.get("need_reconcile").and_then(Value::as_bool).unwrap_or(false)
+        || scan_json.get("need_staging").and_then(Value::as_bool).unwrap_or(false);
     let job_kind = if want_delete { "pando_tombstone_delete" } else { "pando_repack" };
     let job_id = Uuid::new_v4();
 
@@ -297,25 +299,70 @@ async fn run_safe_gc_phases(
         compacted = true;
     }
 
+    let snap_post_compact = authority.snapshot();
+    if !destructive_env || matches!(snap_post_compact.gc_mode, GcMode::DisabledByDefault) {
+        let quarantined = quarantine_abandoned_staging_without_delete(&authority)
+            .map_err(|e| anyhow::anyhow!("quarantine staging failed: {e}"))?;
+        ensure!(
+            snap_post_compact.pending_delete.is_none(),
+            "destructive GC is disabled; refusing to execute pending delete batch without arming"
+        );
+        return Ok(json!({
+            "compacted": compacted,
+            "destructive_env_enabled": false,
+            "staging_quarantined_without_delete": quarantined,
+            "staging_cleaned": 0,
+            "deleted_keys": [],
+            "already_absent_keys": [],
+            "gc_epoch": fence_epoch,
+        }));
+    }
+
+    let GcMode::ArmedDestructive(existing_arm) = snap_post_compact.gc_mode else {
+        unreachable!("checked armed destructive above");
+    };
+    let upgraded_lane = match existing_arm.lane {
+        AuthorityLane::SingleNodePg { pg_authority_id, pg_tx_seq, .. } => AuthorityLane::SingleNodePg {
+            pg_authority_id,
+            pg_tx_seq: pg_tx_seq.max(reconciled.gate_revision),
+            pg_gc_fence_epoch: fence_epoch,
+            reader_barrier_epoch: fence_epoch,
+        },
+        other => other,
+    };
+    let live_arm = SafeGcArmReceipt::seal(
+        snap_post_compact.authority.tenant_id,
+        snap_post_compact.authority.repo_id,
+        snap_post_compact.authority.history_id,
+        snap_post_compact.authority.incarnation_id,
+        snap_post_compact.authority.incarnation_epoch,
+        true,
+        upgraded_lane,
+    )
+    .map_err(|e| anyhow::anyhow!("re-seal live PG arm: {e}"))?;
+    authority
+        .rebind_pending_delete_live_pg_fence(fence_epoch, live_arm.clone())
+        .map_err(|e| anyhow::anyhow!("rebind_pending_delete_live_pg_fence: {e}"))?;
+
     let staging = reclaim_abandoned_compaction_staging(&authority, &provider, Some(&ext_guard), deadline)
         .await
         .map_err(|e| anyhow::anyhow!("staging cleanup failed: {e}"))?;
 
     let mut deleted_keys = Vec::new();
     let mut already_absent_keys = Vec::new();
-    let snap = authority.snapshot();
-    if snap.pending_delete.is_some() {
-        ensure!(destructive_env, "{ENV_BLOB_SAFE_GC_DESTRUCTIVE} is disabled; refusing pending destructive batch");
-        if let Some(rep) = reconcile_pending_delete_after_restart(
+    let snap_rec = authority.snapshot();
+    if snap_rec.pending_delete.is_some() {
+        if let Some(rep) = reconcile_pending_delete_after_restart_fenced(
             &authority,
             &provider,
-            snap.authority.incarnation_id,
-            snap.authority.incarnation_epoch,
-            snap.authority.lease_epoch,
+            snap_rec.authority.incarnation_id,
+            snap_rec.authority.incarnation_epoch,
+            snap_rec.authority.lease_epoch,
+            Some(&ext_guard),
             deadline,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("reconcile_pending_delete_after_restart: {e}"))?
+        .map_err(|e| anyhow::anyhow!("reconcile_pending_delete_after_restart_fenced: {e}"))?
         {
             deleted_keys.extend(rep.deleted_keys);
             already_absent_keys.extend(rep.already_absent_keys);
@@ -323,30 +370,7 @@ async fn run_safe_gc_phases(
     }
 
     let snap_after = authority.snapshot();
-    if destructive_env
-        && !snap_after.retired_packs.is_empty()
-        && let GcMode::ArmedDestructive(existing_arm) = snap_after.gc_mode
-    {
-        let upgraded_lane = match existing_arm.lane {
-            AuthorityLane::SingleNodePg { pg_authority_id, pg_tx_seq, .. } => AuthorityLane::SingleNodePg {
-                pg_authority_id,
-                pg_tx_seq: pg_tx_seq.max(reconciled.gate_revision),
-                pg_gc_fence_epoch: fence_epoch,
-                reader_barrier_epoch: fence_epoch,
-            },
-            other => other,
-        };
-        let live_arm = SafeGcArmReceipt::seal(
-            snap_after.authority.tenant_id,
-            snap_after.authority.repo_id,
-            snap_after.authority.history_id,
-            snap_after.authority.incarnation_id,
-            snap_after.authority.incarnation_epoch,
-            true,
-            upgraded_lane,
-        )
-        .map_err(|e| anyhow::anyhow!("re-seal live PG arm: {e}"))?;
-        authority.set_gc_mode(GcMode::ArmedDestructive(live_arm.clone())).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !snap_after.retired_packs.is_empty() && snap_after.pending_delete.is_none() {
         let proof = authority
             .build_authoritative_deletion_proof(live_arm, &[])
             .map_err(|e| anyhow::anyhow!("build_authoritative_deletion_proof: {e}"))?;

@@ -99,6 +99,14 @@ pub fn compute_proof_digest(p: &DeletionProof) -> String {
         encode_len_bytes(&mut h, c.group_id.as_bytes());
         encode_len_bytes(&mut h, c.physical_key.as_bytes());
         encode_len_bytes(&mut h, c.object_sha256.as_bytes());
+        encode_len_bytes(&mut h, c.remote_etag.as_bytes());
+        match &c.remote_version_id {
+            Some(vid) => {
+                h.update([1]);
+                encode_len_bytes(&mut h, vid.as_bytes());
+            }
+            None => h.update([0]),
+        }
         h.update(c.provider_generation.to_be_bytes());
         h.update(c.key_epoch.to_be_bytes());
         encode_len_bytes(&mut h, c.retention_state.as_str().as_bytes());
@@ -194,6 +202,13 @@ fn encode_cursors(h: &mut Sha256, c: &PairedCursorReconciliation) {
     h.update(c.pg_required_seq.to_be_bytes());
     h.update(c.refcas_applied_index.to_be_bytes());
     h.update(c.refcas_required_index.to_be_bytes());
+    match &c.refcas_cut {
+        Some(cut) => {
+            h.update([1]);
+            cut.encode_canonical(h);
+        }
+        None => h.update([0]),
+    }
 }
 
 fn encode_freshness(h: &mut Sha256, f: SourceFreshness) {

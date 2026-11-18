@@ -1,4 +1,4 @@
-//! Shared LoopbackS3 + real OpenDAL S3 + stock Git harness for Safe GC tests (#122).
+//! Shared versioned LoopbackS3 + real OpenDAL S3 + stock Git harness for Safe GC (#122).
 
 use std::{
     collections::BTreeMap,
@@ -32,20 +32,32 @@ use rootyard::{
         },
         provider_delete::OpenDalS3GcProvider,
         quiescence::ReaderLeaseRegistry,
+        refcas_cut::RefCasReconciledCut,
         store::{SafeGcRepoSnapshot, ServingPackRecord},
     },
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[derive(Clone)]
+pub struct StoredS3Object {
+    pub bytes: Vec<u8>,
+    pub etag: String,
+    pub version_id: String,
+}
+
 #[derive(Default)]
 pub struct S3State {
-    pub objects: Mutex<BTreeMap<String, Vec<u8>>>,
+    pub objects: Mutex<BTreeMap<String, StoredS3Object>>,
     pub fail_delete_substring: Mutex<Option<String>>,
+    pub replace_same_len_on_head_substring: Mutex<Option<String>>,
     pub corrupt_next_put: AtomicBool,
+    pub next_version_seq: AtomicUsize,
     pub put_requests: AtomicUsize,
     pub head_requests: AtomicUsize,
     pub delete_requests: AtomicUsize,
+    pub conditional_delete_requests: AtomicUsize,
+    pub unconditional_delete_rejections: AtomicUsize,
 }
 
 pub struct LoopbackS3 {
@@ -55,6 +67,14 @@ pub struct LoopbackS3 {
 
 static S3: OnceLock<LoopbackS3> = OnceLock::new();
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn compute_etag(data: &[u8]) -> String {
+    format!("\"{}\"", &hex::encode(Sha256::digest(data))[..32])
+}
+
+fn mint_version_id(seq: usize, data: &[u8]) -> String {
+    format!("v1-{seq}-{}", &hex::encode(Sha256::digest(data))[..12])
+}
 
 impl LoopbackS3 {
     pub fn shared() -> &'static Self {
@@ -131,6 +151,31 @@ impl LoopbackS3 {
         self.state.objects.lock().unwrap().contains_key(&Self::key(loc))
     }
 
+    pub fn get_stored(&self, loc: &BlobLocator) -> Option<StoredS3Object> {
+        self.state.objects.lock().unwrap().get(&Self::key(loc)).cloned()
+    }
+
+    pub fn restore_stored(&self, loc: &BlobLocator, obj: StoredS3Object) {
+        self.state.objects.lock().unwrap().insert(Self::key(loc), obj);
+    }
+
+    pub fn overwrite_same_length(&self, loc: &BlobLocator, fill: u8) -> StoredS3Object {
+        let mut guard = self.state.objects.lock().unwrap();
+        let cur = guard.get(&Self::key(loc)).expect("existing object").clone();
+        let mut new_bytes = vec![fill; cur.bytes.len()];
+        if new_bytes == cur.bytes && !new_bytes.is_empty() {
+            new_bytes[0] ^= 0x5a;
+        }
+        let seq = self.state.next_version_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let next = StoredS3Object {
+            etag: compute_etag(&new_bytes),
+            version_id: mint_version_id(seq, &new_bytes),
+            bytes: new_bytes,
+        };
+        guard.insert(Self::key(loc), next.clone());
+        next
+    }
+
     pub fn request_totals(&self) -> (usize, usize, usize) {
         (
             self.state.put_requests.load(Ordering::SeqCst),
@@ -138,6 +183,10 @@ impl LoopbackS3 {
             self.state.delete_requests.load(Ordering::SeqCst),
         )
     }
+}
+
+fn parse_query_version_id(u: &Uri) -> Option<String> {
+    u.query()?.split('&').find_map(|kv| kv.strip_prefix("versionId=")).map(str::to_owned)
 }
 
 async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, hdrs: HeaderMap, b: Bytes) -> Response {
@@ -149,8 +198,11 @@ async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, hdrs: Head
             .body(Body::from("<ListBucketResult/>"))
             .unwrap();
     }
-    let etag = |d: &[u8]| format!("\"{}\"", &hex::encode(Sha256::digest(d))[..32]);
+    let query_vid = parse_query_version_id(&u);
+    let if_match_hdr = hdrs.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let mut content_range: Option<String> = None;
+    let mut resp_vid: Option<String> = None;
+
     let (status, tag, len, body) = match m {
         Method::PUT => {
             st.put_requests.fetch_add(1, Ordering::SeqCst);
@@ -159,32 +211,71 @@ async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, hdrs: Head
                 let mid = data.len() / 2;
                 data[mid] ^= 0xff;
             }
-            let tag = etag(&data);
-            st.objects.lock().unwrap().insert(key, data);
+            let seq = st.next_version_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            let tag = compute_etag(&data);
+            let vid = mint_version_id(seq, &data);
+            resp_vid = Some(vid.clone());
+            st.objects.lock().unwrap().insert(key, StoredS3Object { bytes: data, etag: tag.clone(), version_id: vid });
             (StatusCode::OK, Some(tag), 0, Body::empty())
         }
         Method::HEAD | Method::GET => {
             if m == Method::HEAD {
                 st.head_requests.fetch_add(1, Ordering::SeqCst);
             }
-            match st.objects.lock().unwrap().get(&key).cloned() {
-                Some(d) => {
-                    let tag = Some(etag(&d));
-                    if m == Method::GET
-                        && let Some((s_str, e_str)) = hdrs
-                            .get(header::RANGE)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|r| r.strip_prefix("bytes="))
-                            .and_then(|r| r.split_once('-'))
-                        && let Ok(start) = s_str.parse::<usize>()
-                        && start < d.len()
+            let found = st.objects.lock().unwrap().get(&key).cloned();
+            match found {
+                Some(obj) => {
+                    if if_match_hdr.as_deref().is_some_and(|im| im != obj.etag)
+                        || query_vid.as_deref().is_some_and(|qv| qv != obj.version_id)
                     {
-                        let end = e_str.parse::<usize>().unwrap_or(d.len() - 1).min(d.len() - 1);
-                        let slice = d[start..=end].to_vec();
-                        content_range = Some(format!("bytes {start}-{end}/{}", d.len()));
-                        (StatusCode::PARTIAL_CONTENT, tag, slice.len(), Body::from(slice))
+                        (StatusCode::PRECONDITION_FAILED, None, 0, Body::empty())
                     } else {
-                        (StatusCode::OK, tag, d.len(), if m == Method::HEAD { Body::empty() } else { Body::from(d) })
+                        if m == Method::HEAD {
+                            let should_replace = st
+                                .replace_same_len_on_head_substring
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .is_some_and(|pat| key.contains(pat.as_str()));
+                            if should_replace {
+                                *st.replace_same_len_on_head_substring.lock().unwrap() = None;
+                                let mut alt = obj.bytes.clone();
+                                if let Some(first) = alt.first_mut() {
+                                    *first ^= 0xa5;
+                                }
+                                let seq = st.next_version_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                                let replaced = StoredS3Object {
+                                    etag: compute_etag(&alt),
+                                    version_id: mint_version_id(seq, &alt),
+                                    bytes: alt,
+                                };
+                                st.objects.lock().unwrap().insert(key.clone(), replaced);
+                            }
+                        }
+                        resp_vid = Some(obj.version_id);
+                        let d = obj.bytes;
+                        let tag = Some(obj.etag);
+                        if m == Method::GET
+                            && let Some((s_str, e_str)) = hdrs
+                                .get(header::RANGE)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|r| r.strip_prefix("bytes="))
+                                .and_then(|r| r.split_once('-'))
+                            && let Ok(start) = s_str.parse::<usize>()
+                            && start < d.len()
+                        {
+                            let end = e_str.parse::<usize>().unwrap_or(d.len() - 1).min(d.len() - 1);
+                            let slice = d[start..=end].to_vec();
+                            content_range = Some(format!("bytes {start}-{end}/{}", d.len()));
+                            (StatusCode::PARTIAL_CONTENT, tag, slice.len(), Body::from(slice))
+                        } else {
+                            (
+                                StatusCode::OK,
+                                tag,
+                                d.len(),
+                                if m == Method::HEAD { Body::empty() } else { Body::from(d) },
+                            )
+                        }
                     }
                 }
                 None => (StatusCode::NOT_FOUND, None, 0, Body::empty()),
@@ -192,13 +283,31 @@ async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, hdrs: Head
         }
         Method::DELETE => {
             st.delete_requests.fetch_add(1, Ordering::SeqCst);
+            let Some(req_vid) = query_vid else {
+                st.unconditional_delete_rejections.fetch_add(1, Ordering::SeqCst);
+                return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
+            };
+            let Some(req_etag) = if_match_hdr else {
+                st.unconditional_delete_rejections.fetch_add(1, Ordering::SeqCst);
+                return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
+            };
+            st.conditional_delete_requests.fetch_add(1, Ordering::SeqCst);
             let should_fail =
                 st.fail_delete_substring.lock().unwrap().as_ref().is_some_and(|pat| key.contains(pat.as_str()));
             if should_fail {
                 (StatusCode::SERVICE_UNAVAILABLE, None, 0, Body::empty())
             } else {
-                st.objects.lock().unwrap().remove(&key);
-                (StatusCode::NO_CONTENT, None, 0, Body::empty())
+                let mut guard = st.objects.lock().unwrap();
+                match guard.get(&key) {
+                    None => (StatusCode::NOT_FOUND, None, 0, Body::empty()),
+                    Some(cur) if cur.version_id != req_vid || cur.etag != req_etag => {
+                        (StatusCode::PRECONDITION_FAILED, None, 0, Body::empty())
+                    }
+                    Some(_) => {
+                        guard.remove(&key);
+                        (StatusCode::NO_CONTENT, None, 0, Body::empty())
+                    }
+                }
             }
         }
         _ => (StatusCode::METHOD_NOT_ALLOWED, None, 0, Body::empty()),
@@ -209,6 +318,9 @@ async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, hdrs: Head
         .header(header::CONNECTION, "close");
     if let Some(t) = tag {
         rb = rb.header(header::ETAG, t);
+    }
+    if let Some(vid) = resp_vid {
+        rb = rb.header("x-amz-version-id", vid);
     }
     if let Some(cr) = content_range {
         rb = rb.header(header::CONTENT_RANGE, cr);
@@ -248,40 +360,39 @@ pub async fn build_pack_via_opendal(
     rev: &str,
     scope: (Uuid, Uuid, i64),
     deadline: Instant,
-) -> Result<(BlobLocator, BlobLocator, String, Vec<String>)> {
+) -> Result<(BlobLocator, BlobLocatorRecord, BlobLocator, BlobLocatorRecord, String, Vec<String>)> {
     let raw_oids = git_cmd(repo, &["rev-list", "--objects", rev], None)?;
     let oids: Vec<String> = raw_oids.lines().filter_map(|l| l.split_whitespace().next()).map(str::to_owned).collect();
     std::fs::create_dir_all(stage)?;
     let stdin_list = format!("{}\n", oids.join("\n"));
     let hash = git_cmd(repo, &["pack-objects", "-q", stage.join("p").to_str().unwrap()], Some(&stdin_list))?;
-    let pk = provider
+    let (pk, pk_rec) = provider
         .upload_pack_file(scope.0, scope.1, scope.2, "packs", &stage.join(format!("p-{hash}.pack")), deadline)
         .await?;
-    let ix = provider
+    let (ix, ix_rec) = provider
         .upload_pack_file(scope.0, scope.1, scope.2, "packs", &stage.join(format!("p-{hash}.idx")), deadline)
         .await?;
     let tip = git_cmd(repo, &["rev-parse", rev], None)?;
-    Ok((pk, ix, tip, oids))
+    Ok((pk, pk_rec, ix, ix_rec, tip, oids))
 }
 
 pub fn make_serving_record(
     reg: &mut AntiAbaKeyRegistry,
     auth: &AuthorityRecord,
-    pl: &BlobLocator,
-    il: &BlobLocator,
+    pl: BlobLocatorRecord,
+    il: BlobLocatorRecord,
     oids: Vec<String>,
 ) -> ServingPackRecord {
     let scope = (auth.tenant_id, auth.repo_id, auth.history_id, 1);
-    let mut mint = |role, l: &BlobLocator| {
-        reg.mint_immutable_key(scope, role, l.sha256(), KeyLifecycleState::ActiveServing).unwrap()
-    };
+    let mut mint =
+        |role, sha: &str| reg.mint_immutable_key(scope, role, sha, KeyLifecycleState::ActiveServing).unwrap();
     ServingPackRecord {
         pack_id: Uuid::new_v4(),
         group_id: "g-main".into(),
-        pack_key: mint("pack", pl),
-        idx_key: mint("idx", il),
-        pack_locator: BlobLocatorRecord::from_locator(pl),
-        idx_locator: BlobLocatorRecord::from_locator(il),
+        pack_key: mint("pack", &pl.sha256),
+        idx_key: mint("idx", &il.sha256),
+        pack_locator: pl,
+        idx_locator: il,
         contained_oids: oids,
     }
 }
@@ -292,6 +403,7 @@ pub fn build_snapshot(
     main_oid: String,
     active_packs: Vec<ServingPackRecord>,
     key_registry: AntiAbaKeyRegistry,
+    refcas_cut: Option<RefCasReconciledCut>,
 ) -> SafeGcRepoSnapshot {
     let producers = RetentionProducer::ALL
         .iter()
@@ -306,6 +418,7 @@ pub fn build_snapshot(
             pinned_pack_ids: vec![],
         })
         .collect();
+    let idx = refcas_cut.as_ref().map_or(0, |c| c.sm_applied_log_index);
     SafeGcRepoSnapshot {
         authority: auth.clone(),
         object_format: fmt,
@@ -336,8 +449,9 @@ pub fn build_snapshot(
             pg_applied_seq: 1,
             pg_required_seq: 1,
             refcas_freshness: SourceFreshness::Reconciled,
-            refcas_applied_index: 1,
-            refcas_required_index: 1,
+            refcas_applied_index: idx,
+            refcas_required_index: idx,
+            refcas_cut,
         },
         reader_leases: ReaderLeaseRegistry::new(),
         staged_uploads: vec![],
