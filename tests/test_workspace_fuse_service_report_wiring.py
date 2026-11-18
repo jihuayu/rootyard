@@ -20,9 +20,10 @@ CI_YML = ROOT / ".github/workflows/ci.yml"
 GENERIC_RUNNER = ROOT / "scripts/run_python_ci_tests.py"
 
 # Current main's verify/lifecycle budget (95 existing + 12 cold tenant LFS gate
-# on owned Garage + 24 combined Redis restore/FLUSHALL/partition gate).
+# on owned Garage + 28 full Redis qualification, including restore/FLUSHALL,
+# partition, failover, and cleanup/manifest binding).
 # The merged job keeps it and adds only this branch's independent FUSE phases.
-MAIN_VERIFY_BUDGET = 131
+MAIN_VERIFY_BUDGET = 135
 
 C5 = "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_api_sigkill_with_pending_kernel_writer"
 EXISTING_REQUIRED = (
@@ -141,12 +142,13 @@ class WorkspaceFuseServiceReportWiringTest(unittest.TestCase):
         self.assertIn("--report test-results/workspace-fuse-service.json", " ".join(helper.split()))
         self.assertIn(f"--require-case workspace_fuse_service={C5}", self.manifest)
         self.assertEqual(_cap(helper), 30)
-        # The merged verify job keeps main's 131-minute budget and adds only
-        # those three phases; keeping 131 alone would under-budget the lane.
+        # The merged verify job keeps main's 135-minute budget and adds only
+        # those three phases; keeping 135 alone would under-budget the lane.
         self.assertIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET + sum(phases)}", verify)
         self.assertNotIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET}", verify)
-        # No pre-existing main step cap is inflated by this branch.
-        self.assertEqual(_cap(redis), 24)
+        # No pre-existing main step cap is inflated by this branch; the Redis
+        # step already holds main's 28-minute promotion allowance.
+        self.assertEqual(_cap(redis), 28)
 
     def test_existing_upload_path_keeps_reports_on_always(self):
         step = _step(self.ci, "Upload workspace FUSE/remote acceptance reports")
