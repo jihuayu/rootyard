@@ -36,7 +36,8 @@ fn original_ensure_conditions_have_no_diagnostic_wrappers() {
     assert!(blocks[0].contains("build_kit(ids, Sha1, 1, &empty, &td, None, None)?"));
     assert!(blocks[0].contains("== CloneKitStatus::EmptyRepository"));
     assert!(blocks[1].contains("injected"));
-    assert!(blocks[1].contains("Some(CloneKitError::CorruptArtifact(_))"));
+    assert!(blocks[1].contains("Some(CloneKitError::GitFailed(message))"));
+    assert!(blocks[1].contains("injected failure after pack generation"));
     assert!(blocks[1].contains("store.load_latest(ids.1)?.as_ref() == Some(&published_gen1)"));
     assert!(blocks[1].contains("published_gen1.kit_generation == 1"));
     assert!(blocks[1].contains("!store.version_dir(ids.1, 2).exists()"));
@@ -53,12 +54,15 @@ fn original_ensure_conditions_have_no_diagnostic_wrappers() {
 
 #[test]
 fn explicit_negative_checkpoints_keep_typed_classes_and_exact_latest() {
-    let start = SUPPORT.find("CorruptStagedPack").expect("fault-injected corruption");
+    let start = SUPPORT.find("AfterPackBeforeIdx").expect("deterministic early fault");
     let end = SUPPORT.find("Phase::HistoryGrant").expect("history grant after corruption");
     let checkpoints = &SUPPORT[start..end];
-    assert!(checkpoints.contains("Some(CloneKitError::CorruptArtifact(_))"));
+    assert!(checkpoints.contains("Some(CloneKitError::GitFailed(message))"));
+    assert!(checkpoints.contains("injected failure after pack generation"));
     assert!(checkpoints.contains("prepared pack/idx failed digest verification"));
-    assert!(!checkpoints.contains("GitFailed"), "early rejection must retain the exact corrupt-artifact class");
+    assert!(checkpoints.contains("CloneKitError::CorruptArtifact(message)"));
+    assert!(!SUPPORT.contains("CorruptStagedPack"), "the incidental permission fault must not remain");
+    assert!(!SUPPORT.contains("set_permissions"), "owned-pack tamper must not depend on file permissions");
     assert_eq!(2, checkpoints.matches("Some(&published_gen1)").count());
     assert_eq!(2, checkpoints.matches("!store.version_dir(ids.1, 2).exists()").count());
     assert!(!SUPPORT.contains(".is_err()"), "negative checkpoints must inspect exact typed errors");
@@ -78,9 +82,9 @@ fn pre_marks_precede_eager_empty_init_and_both_corrupt_builds() {
         "corrupt phase must be marked before both eager generation 2 builds"
     );
 
-    let early_rejection = SUPPORT.find("Some(CloneKitError::CorruptArtifact(_))").expect("early rejection");
+    let early_rejection = SUPPORT.find("injected failure after pack generation").expect("early rejection");
     let clean_build = SUPPORT.find("build_kit(ids, Sha1, 2, &repo, &td, None, None)").expect("clean build");
-    assert!(corrupt_builds[0] < early_rejection, "the injected corrupt build must be followed by its rejection");
+    assert!(corrupt_builds[0] < early_rejection, "the injected early build must be followed by its rejection");
     assert!(early_rejection < clean_build, "the early rejection must be observed before the clean build");
 
     let publication_marks = SUPPORT
@@ -88,7 +92,7 @@ fn pre_marks_precede_eager_empty_init_and_both_corrupt_builds() {
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     assert_eq!(1, publication_marks.len(), "only the real corrupt publication is a publication checkpoint");
-    let tamper = SUPPORT.find("std::fs::write(staged_pack, tampered)").expect("owned staged pack tamper");
+    let tamper = SUPPORT.find("std::fs::rename(&tampered_path, staged_pack)").expect("owned staged pack tamper");
     let tampered_publish = SUPPORT.find("publish_clonekit_versioned(&store, &clean_b2").expect("tampered publish");
     assert!(clean_build < tamper, "clean generation 2 must be built before its owned staged pack is tampered");
     assert!(tamper < publication_marks[0], "tamper must precede the real publication checkpoint");
