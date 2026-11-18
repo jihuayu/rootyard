@@ -1,20 +1,21 @@
 //! Slot-one rotation over the identical retried wire ref command, exact pending
-//! replay and read-only resolver checks.
+//! replay, the pre-mirror resolver refusal and current terminal mirroring.
 
 use super::db::deadline;
 use super::{
-    REF_RETRY, Retired, SLOT_ZERO_LANE, db,
+    REF_RETRY, REF_SIDE, Retired, SLOT_ZERO_LANE, db,
     publication::{authorized_commit, capture_baseline, plan_from_baseline, ref_update, stage, wire_digest},
-    readback::stored_ref,
+    readback::{attempt_rows, operation_event_id, public_attempt_event_count, stored_ref},
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::ref_store::{
-    CommitMode, CoreGateVersion, IssuerLane, OperationState,
+    CommitMode, CoreGateVersion, IssuerLane, OperationRecord, OperationState,
     core::pack_commit::{PackCommitError, PackCommitPlan, PackCommitRejectCode},
     pg::{
         PgRefStore,
         public_attempt::{PublicAttemptLookup, PublicAttemptRequest},
+        public_terminal::{PublicAttemptTerminalOutcome, PublicAttemptTerminalReceipt},
         slot_one::{SlotOneRotationReceipt, SlotOneRotationRequest},
     },
 };
@@ -194,11 +195,10 @@ async fn lookup_public(db: &db::Db, request: &PublicAttemptRequest) -> Result<Pu
 }
 
 pub(super) async fn assert_current_pending_wrapper_gap(db: &db::Db, retired: &Retired) -> Result<()> {
-    // The terminal writer that closes a slot-one wrapper is deliberately a
-    // separate product checkpoint. At 9cf the real P2 commit is durable in the
-    // migration-138 registry while the migration-152 wrapper remains pending;
-    // the resolver must fail closed on that exact mismatch. Integration later
-    // replaces this assertion with the committed wrapper read.
+    // The real P2 commit is durable in the migration-138 registry while the
+    // migration-152 wrapper is still pending. Before the explicit terminal
+    // mirror below, the resolver must fail closed on that exact mismatch; the
+    // committed readback is asserted only after the mirror commits.
     match lookup_public_raw(db, &retired.public).await? {
         Err(PackCommitError::Rejected(rejection)) => {
             ensure!(
@@ -214,4 +214,164 @@ pub(super) async fn assert_current_pending_wrapper_gap(db: &db::Db, retired: &Re
         Ok(other) => bail!("expected the current pending-wrapper gap, got {other:?}"),
     }
     Ok(())
+}
+
+pub(super) async fn mirror_p2_terminal_and_prove_replay(
+    db: &db::Db,
+    retired: &Retired,
+    p2: &SlotOneRotationReceipt,
+) -> Result<()> {
+    let p2_record = operation_record(db, retired.repository.id, p2.private_id).await?;
+    ensure!(
+        p2_record.identity().operation_id() == p2.private_id,
+        "P2 durable operation identity differs from the rotation receipt"
+    );
+    ensure!(
+        p2_record.identity().digest() == &p2.plan_digest,
+        "P2 durable operation plan digest differs from the rotation receipt"
+    );
+    ensure!(p2_record.state() == OperationState::Committed, "P2 durable operation is not committed");
+    let expected_event = operation_event_id(db, retired.repository.id, p2.private_id)
+        .await?
+        .ok_or_else(|| anyhow!("P2 committed operation has no core event"))?;
+    let event_count_before = public_attempt_event_count(db, retired.repository.id, retired.public.public_id).await?;
+    let attempts_before = attempt_rows(db, retired.repository.id, retired.public.public_id).await?;
+    let main_before = stored_ref(db, retired.repository.id, "refs/heads/main").await?;
+    let retry_before = stored_ref(db, retired.repository.id, REF_RETRY).await?;
+    let side_before = stored_ref(db, retired.repository.id, REF_SIDE).await?;
+
+    let first = mirror_terminal_commit(db, &retired.public, &p2_record).await?;
+    ensure!(first.state == OperationState::Committed, "first P2 terminal mirror is not committed");
+    ensure!(!first.replayed, "first P2 terminal mirror replayed instead of publishing");
+    ensure!(first.event_id == expected_event, "first P2 terminal mirror used another core event");
+
+    let committed_lookup = lookup_public(db, &retired.public).await?;
+    let evidence = match &committed_lookup {
+        PublicAttemptLookup::Committed(evidence) => evidence,
+        _ => bail!("mirrored P2 public attempt is not committed"),
+    };
+    ensure!(evidence.current.slot == 1, "mirrored P2 current attempt is not slot one");
+    ensure!(evidence.current.private_id == p2.private_id, "mirrored P2 current private id differs");
+    ensure!(evidence.current.state == OperationState::Committed, "mirrored P2 current attempt is not committed");
+    ensure!(evidence.current.event_id == Some(expected_event), "mirrored P2 current event id differs");
+    ensure!(
+        evidence.current.event_revision == Some(p2.base_revision + 1),
+        "mirrored P2 current event revision differs"
+    );
+    let retired_attempt =
+        evidence.retired.as_ref().ok_or_else(|| anyhow!("mirrored P2 wrapper has no retired slot-zero attempt"))?;
+    ensure!(retired_attempt.slot == 0, "mirrored P2 retired attempt is not slot zero");
+    ensure!(retired_attempt.private_id == retired.admission.private_id, "mirrored P2 retired private id changed");
+    ensure!(retired_attempt.state == OperationState::Rejected, "mirrored P2 retired attempt is not rejected");
+    ensure!(retired_attempt.event_id == Some(retired.retirement.event_id), "mirrored P2 retired event id changed");
+    ensure!(
+        retired_attempt.event_revision == Some(retired.retirement.event_revision),
+        "mirrored P2 retired event revision changed"
+    );
+
+    let p0_record = operation_record(db, retired.repository.id, retired.admission.private_id).await?;
+    let refusal = mirror_terminal_refusal(db, &retired.public, &p0_record).await?;
+    match refusal {
+        PackCommitError::Rejected(rejection) => {
+            ensure!(
+                rejection.code == PackCommitRejectCode::LedgerIntegrity,
+                "old P0 terminal retry raised the wrong rejection code"
+            );
+            ensure!(
+                rejection.detail == "slot one current private identity differs from the terminal record",
+                "old P0 terminal retry raised an unexpected detail"
+            );
+        }
+        _ => bail!("old P0 terminal retry did not fail closed"),
+    }
+    ensure!(
+        lookup_public(db, &retired.public).await? == committed_lookup,
+        "old P0 terminal retry changed the current committed wrapper"
+    );
+
+    let replay = mirror_terminal_commit(db, &retired.public, &p2_record).await?;
+    ensure!(replay.state == OperationState::Committed, "second P2 terminal mirror is not committed");
+    ensure!(replay.replayed, "second exact P2 terminal mirror was not a replay");
+    ensure!(replay.event_id == expected_event, "second P2 terminal mirror used another core event");
+
+    ensure!(
+        lookup_public(db, &retired.public).await? == committed_lookup,
+        "exact P2 terminal replay changed the committed wrapper"
+    );
+    ensure!(
+        stored_ref(db, retired.repository.id, "refs/heads/main").await? == main_before,
+        "exact P2 terminal replay changed main"
+    );
+    ensure!(
+        stored_ref(db, retired.repository.id, REF_RETRY).await? == retry_before,
+        "exact P2 terminal replay changed ref A"
+    );
+    ensure!(
+        stored_ref(db, retired.repository.id, REF_SIDE).await? == side_before,
+        "exact P2 terminal replay changed ref B"
+    );
+    ensure!(
+        attempt_rows(db, retired.repository.id, retired.public.public_id).await? == attempts_before,
+        "exact P2 terminal replay changed private attempts"
+    );
+    ensure!(
+        public_attempt_event_count(db, retired.repository.id, retired.public.public_id).await? == event_count_before,
+        "exact P2 terminal replay changed the core event count"
+    );
+    ensure!(
+        operation_event_id(db, retired.repository.id, retired.admission.private_id).await?
+            == Some(retired.retirement.event_id),
+        "exact P2 terminal replay changed the retired P0 event"
+    );
+    ensure!(
+        operation_event_id(db, retired.repository.id, p2.private_id).await? == Some(expected_event),
+        "exact P2 terminal replay changed the current P2 event"
+    );
+    Ok(())
+}
+
+async fn mirror_terminal_commit(
+    db: &db::Db,
+    request: &PublicAttemptRequest,
+    record: &OperationRecord,
+) -> Result<PublicAttemptTerminalReceipt> {
+    let mut client = db.pool.get().await?;
+    let tx = client.transaction().await?;
+    match PgRefStore.mirror_public_attempt_terminal_in_tx(&tx, request, record, deadline()).await {
+        Ok(PublicAttemptTerminalOutcome::Mirrored(receipt)) => {
+            tx.commit().await?;
+            Ok(receipt)
+        }
+        Ok(PublicAttemptTerminalOutcome::RetirementRequired(_)) => {
+            tx.rollback().await?;
+            bail!("current slot-one terminal mirror requested retirement")
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(anyhow!("current slot-one terminal mirror failed: {error:?}"))
+        }
+    }
+}
+
+async fn mirror_terminal_refusal(
+    db: &db::Db,
+    request: &PublicAttemptRequest,
+    record: &OperationRecord,
+) -> Result<PackCommitError> {
+    let mut client = db.pool.get().await?;
+    let tx = client.transaction().await?;
+    match PgRefStore.mirror_public_attempt_terminal_in_tx(&tx, request, record, deadline()).await {
+        Err(error) => {
+            tx.rollback().await?;
+            Ok(error)
+        }
+        Ok(PublicAttemptTerminalOutcome::Mirrored(_)) => {
+            tx.rollback().await?;
+            bail!("old P0 terminal retry unexpectedly published")
+        }
+        Ok(PublicAttemptTerminalOutcome::RetirementRequired(_)) => {
+            tx.rollback().await?;
+            bail!("old P0 terminal retry unexpectedly requested retirement")
+        }
+    }
 }

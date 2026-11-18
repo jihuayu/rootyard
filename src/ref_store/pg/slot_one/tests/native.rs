@@ -67,7 +67,7 @@ use rootyard::ref_store::{
 
 use readback::{assert_a5_after_rotation, assert_no_registry_promotion, publication_for, stored_ref};
 use retirement::retire_p0;
-use rotation::{assert_current_pending_wrapper_gap, rotate_and_commit};
+use rotation::{assert_current_pending_wrapper_gap, mirror_p2_terminal_and_prove_replay, rotate_and_commit};
 use setup::{require_owned_disposable_blob_fixture, require_postgres_17};
 
 const REF_RETRY: &str = "refs/heads/retry";
@@ -148,6 +148,7 @@ async fn slot_one_rotation_replays_identical_wire_command_on_real_a3_a4_a5() -> 
         assert_a5_after_rotation(&db, &store, &retired, &plan).await?;
         assert_no_registry_promotion(&db, &retired, &plan, &rotation, &p0_publication).await?;
         assert_current_pending_wrapper_gap(&db, &retired).await?;
+        mirror_p2_terminal_and_prove_replay(&db, &retired, &rotation).await?;
         ensure!(gate.revision() == retired.gate.revision() + 1, "P2 did not advance the gate exactly one revision");
         Ok(())
     }

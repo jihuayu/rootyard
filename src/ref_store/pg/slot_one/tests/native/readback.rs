@@ -39,6 +39,39 @@ pub(super) async fn stored_ref(db: &db::Db, repository_id: Uuid, name: &str) -> 
     Ok(row.map(|row| row.get(0)))
 }
 
+pub(super) async fn operation_event_id(db: &db::Db, repository_id: Uuid, operation_id: Uuid) -> Result<Option<Uuid>> {
+    let row = db
+        .pool
+        .get()
+        .await?
+        .query_opt(
+            "SELECT event_id FROM ref_store_core_events WHERE repository_id=$1 AND operation_id=$2",
+            &[&repository_id, &operation_id],
+        )
+        .await?;
+    Ok(row.map(|row| row.get(0)))
+}
+
+pub(super) async fn public_attempt_event_count(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> Result<i64> {
+    let row = db
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT count(*)
+               FROM ref_store_core_events e
+              WHERE e.repository_id=$1
+                AND e.operation_id IN (
+                    SELECT a.private_id
+                      FROM ref_store_private_attempts a
+                     WHERE a.repository_id=$1 AND a.public_id=$2
+                )",
+            &[&repository_id, &public_id],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
 pub(super) async fn assert_a5_after_rotation(
     db: &db::Db,
     store: &BlobStore,
@@ -116,7 +149,7 @@ pub(super) async fn publication_for(db: &db::Db, repository_id: Uuid, operation_
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct AttemptRow {
+pub(super) struct AttemptRow {
     slot: i16,
     private_id: Uuid,
     plan_digest: String,
@@ -124,7 +157,7 @@ struct AttemptRow {
     base_revision: i64,
 }
 
-async fn attempt_rows(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> Result<Vec<AttemptRow>> {
+pub(super) async fn attempt_rows(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> Result<Vec<AttemptRow>> {
     let rows = db
         .pool
         .get()
