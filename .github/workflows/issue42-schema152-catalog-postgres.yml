@@ -1,0 +1,413 @@
+name: Draft issue 42 schema 152 catalog qualification
+
+on:
+  push:
+    branches: [codex/goal-issue42-original-ac-source-audit-20261117]
+    paths: [.github/workflows/issue42-schema152-catalog-postgres.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  schema152:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      TRIGGER_SHA: ${{ github.sha }}
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+      SCHEMA_SOURCE_SHA: 45ee3dd8fb213616763b83938b3161401c8db517
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONOPTIMIZE: ''
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare the redacted verifier
+        timeout-minutes: 1
+        run: |
+          work="$RUNNER_TEMP/issue42-schema152-catalog"
+          umask 077
+          mkdir -- "$work"
+          cat >"$work/verify.py" <<'PY'
+          import ast
+          import hashlib
+          import json
+          import os
+          import re
+          import secrets
+          import shutil
+          import subprocess
+          import sys
+          import urllib.parse
+          from pathlib import Path
+
+          WORK = Path(__file__).parent
+          STATE = WORK / "state.json"
+          OVERLAY = WORK / "overlay"
+          DUMPS = WORK / "generator-temp"
+          WORKFLOW = ".github/workflows/issue42-schema152-catalog-postgres.yml"
+          PARENT = "79e9871cb796518861eeb6243223e7353b62a67f"
+          PARENT_TREE = "f48530f8515a0365e33a7461cb73dbbd29154a1e"
+          SCHEMA_SOURCE = "45ee3dd8fb213616763b83938b3161401c8db517"
+          SCHEMA_TREE = "744f7d01829e99d9a03fb8d81377d6f8a1a4fb11"
+          CANDIDATE = "tests/fixtures/ref_store_public_attempts_migration_152.sql"
+          FIXTURE = "tests/fixtures/ref_store_schema152_late_cancellation.sql"
+          PROJECTOR = "schema/151_catalog.sql"
+          BASELINE = "tests/schema_baseline.py"
+          GENERATOR = "tests/schema_contract.py"
+          INPUTS = {
+              CANDIDATE: "b087c771b8be173019408bcbbb83fb1be3342ea744f0f670ff835d2e503d0d58",
+              FIXTURE: "2a8c3373aa8045481b4b42d1388bb8e6c741b8af5c9ab9a7b7940679bae3a3f0",
+              PROJECTOR: "b03fe77daf23bdc30c8a2e2d79928919daad6ccefd8bcb4049055c395e5a136d",
+              BASELINE: "cb72b19c1fa862778af20d3d769709b63a29284fceee034492ed8454d37990f7",
+              GENERATOR: "2d60de37e2fac8258a202396113c5452975f474c71b64811c80873faad054252",
+          }
+          CATALOGS = ("152_catalog.json", "152_restored_catalog.json", "152_upgraded_catalog.json")
+          CATALOG_KEYS = {"columns", "constraints", "event_triggers", "functions", "indexes", "internal_disabled_triggers",
+                          "policies", "rules", "tables", "triggers"}
+          ASSERTIONS = ("canonical", "roundtrip", "restored003_upgrade", "restored006_upgrade", "restored007_upgrade",
+                        "upgraded_roundtrip", "custom_search_path_bootstrap", "custom_migrate_idempotent")
+          MAINTENANCE_DATABASES = {"postgres", "template0", "template1"}
+          GENERATOR_DATABASE = re.compile(r"rootyard_contract_[0-9a-f]{32}_(fresh|restored|legacy|upgraded|legacy6|upgrade6|legacy7|upgrade7|upgrade_rt|custom)")
+          PROBE_DATABASE = re.compile(r"issue42_schema152_[0-9a-f]{24}")
+          PROBE_ROLE = "issue42_legacy_cancel_probe"
+          PG_BIN = Path("/usr/lib/postgresql/17/bin")
+          BOOTSTRAP = '''
+          import runpy
+          import sys
+          import types
+          from pathlib import Path
+
+          path = Path("tests/schema_baseline.py").resolve()
+          source, marker, _ = path.read_bytes().partition(b"EXPECTED_TABLES = catalog_tables(LATEST_VERSION)\\n")
+          assert marker
+          baseline = types.ModuleType("schema_baseline")
+          baseline.__file__ = str(path)
+          exec(compile(source, str(path), "exec"), baseline.__dict__)
+          assert baseline.CURRENT_SCHEMA_VERSION == 152 and baseline.LATEST_PREFIX == "152"
+          sys.modules["schema_baseline"] = baseline
+          sys.argv = sys.argv[1:]
+          runpy.run_path(sys.argv[0], run_name="__main__")
+          '''
+
+          def require(condition):
+              if not condition:
+                  raise ValueError("schema 152 qualification check failed")
+
+          def hex_digest(value, length):
+              return value if isinstance(value, str) and re.fullmatch(f"[0-9a-f]{{{length}}}", value) else None
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def initial():
+              return {"phase": "source_failed", "source": None, "tree": None, "bound_schema_source": False,
+                      "tool_versions": {}, "pg_version_num": None, "owned": False, "probe_db": None,
+                      "catalogs": {}, "generator_assertions": [], "fixture_invocations": 0, "fixture_rollback": "not_checked"}
+
+          def save(state):
+              pending = STATE.with_suffix(".tmp")
+              pending.write_text(json.dumps(state), encoding="ascii")
+              pending.replace(STATE)
+
+          def command(args, *, cwd=None, env=None, capture=False, limit=10):
+              result = subprocess.run(args, cwd=cwd, env=env, timeout=limit, check=True,
+                                      stdout=subprocess.PIPE if capture else subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              return result.stdout
+
+          def git(checkout, *args):
+              return command(["git", "-C", str(checkout), *args], capture=True).decode("ascii").strip()
+
+          def pinned(checkout, path):
+              data = (checkout / path).read_bytes()
+              require(sha(data) == INPUTS[path])
+              return data
+
+          def stage(state):
+              scratch = Path(os.environ["GITHUB_WORKSPACE"]) / "scratch"
+              base = scratch.with_name("schema151")
+              source, tree = git(scratch, "rev-parse", "HEAD", "HEAD^{tree}").splitlines()
+              require(hex_digest(source, 40) and hex_digest(tree, 40) and source == os.environ["TRIGGER_SHA"] == os.environ["WORKFLOW_SHA"])
+              require(git(scratch, "rev-parse", "HEAD^", "HEAD^^{tree}").splitlines() == [PARENT, PARENT_TREE])
+              require(git(scratch, "diff-tree", "--no-commit-id", "--name-status", "--no-renames", "-r", "HEAD") == f"A\t{WORKFLOW}")
+              require(not git(scratch, "status", "--porcelain", "--untracked-files=normal"))
+              require(os.environ["SCHEMA_SOURCE_SHA"] == SCHEMA_SOURCE)
+              require(git(base, "rev-parse", "HEAD", "HEAD^{tree}").splitlines() == [SCHEMA_SOURCE, SCHEMA_TREE])
+              require(not git(base, "status", "--porcelain", "--untracked-files=normal"))
+              migration, fixture = (pinned(scratch, path) for path in (CANDIDATE, FIXTURE))
+              projector, baseline, generator = (pinned(base, path) for path in (PROJECTOR, BASELINE, GENERATOR))
+              names = git(base, "ls-tree", "--name-only", "HEAD:migrations").splitlines()
+              require(len(names) == 74 and all(re.fullmatch(r"[0-9]{3}_[a-z0-9_]+\.sql", name) for name in names))
+              versions = [int(name[:3]) for name in names]
+              require(versions == sorted(set(versions)) and versions[0] == 1 and versions[-1] == 151)
+              state.update(source=source, tree=tree, bound_schema_source=True, phase="loader_blocked")
+              save(state)
+              imports = [tuple(alias.name for alias in node.names) for node in ast.parse(generator).body
+                         if isinstance(node, ast.ImportFrom) and node.module == "schema_baseline"]
+              require(imports == [("CATALOG_SQL_PATH", "LATEST_PREFIX", "SCHEMA_VERSIONS")])
+              require(baseline.count(b"CURRENT_SCHEMA_VERSION = 151\n") == 1 and
+                      baseline.count(b"EXPECTED_TABLES = catalog_tables(LATEST_VERSION)\n") == 1)
+              for directory in ("migrations", "schema", "tests"):
+                  (OVERLAY / directory).mkdir(parents=True)
+              for name in names:
+                  shutil.copyfile(base / "migrations" / name, OVERLAY / "migrations" / name)
+              (OVERLAY / "migrations/152_ref_store_public_attempts.sql").write_bytes(migration)
+              (OVERLAY / "schema/152_catalog.sql").write_bytes(projector)
+              (OVERLAY / GENERATOR).write_bytes(generator)
+              (OVERLAY / BASELINE).write_bytes(baseline.replace(b"CURRENT_SCHEMA_VERSION = 151\n", b"CURRENT_SCHEMA_VERSION = 152\n"))
+              (OVERLAY / FIXTURE).parent.mkdir()
+              (OVERLAY / FIXTURE).write_bytes(fixture)
+              state["phase"] = "setup_failed"
+              save(state)
+              return versions + [152]
+
+          def pg_env(db):
+              env = {name: value for name, value in os.environ.items() if not name.startswith("PG")}
+              env.update(PGHOST="127.0.0.1", PGPORT="55432", PGUSER="rootyard", PGDATABASE=db,
+                         PGCONNECT_TIMEOUT="5", PGPASSFILE="/dev/null", PGSSLMODE="disable",
+                         PGOPTIONS="-c statement_timeout=25000 -c lock_timeout=2000")
+              return env
+
+          def psql(db, args, *, capture=False, limit=45):
+              return command([str(PG_BIN / "psql"), "-XqAtw", "-v", "ON_ERROR_STOP=1", *args],
+                             env=pg_env(db), cwd=OVERLAY if OVERLAY.is_dir() else None, capture=capture, limit=limit)
+
+          def scalar(db, sql):
+              result = psql(db, ["-c", sql], capture=True, limit=10)
+              require(len(result) <= 4096)
+              return result.decode("ascii").strip()
+
+          def database_names():
+              names = scalar("postgres", "SELECT datname FROM pg_database ORDER BY datname LIMIT 32;").splitlines()
+              require(MAINTENANCE_DATABASES <= set(names) and len(names) < 32)
+              return set(names)
+
+          def role_present():
+              result = scalar("postgres", f"SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = '{PROBE_ROLE}');")
+              require(result in ("t", "f"))
+              return result == "t"
+
+          def verify_tools(state):
+              versions = {}
+              for tool in ("psql", "pg_dump", "pg_restore"):
+                  raw = command([str(PG_BIN / tool), "--version"], capture=True)
+                  match = re.fullmatch(rb"[a-z_]+ \(PostgreSQL\) (17\.[0-9]{1,3})(?: [^\r\n]{1,100})?\n", raw)
+                  require(match and raw.startswith(tool.encode() + b" "))
+                  versions[tool] = match[1].decode("ascii")
+              version = scalar("postgres", "SHOW server_version_num;")
+              require(re.fullmatch(r"17[0-9]{4}", version))
+              require(database_names() == MAINTENANCE_DATABASES and not role_present())
+              state.update(tool_versions=versions, pg_version_num=int(version), owned=True)
+              save(state)
+
+          def catalog_files():
+              found = {file.name for file in (OVERLAY / "schema").glob("*.json")}
+              require(found == set(CATALOGS))
+              files = {}
+              for name in CATALOGS:
+                  path = OVERLAY / "schema" / name
+                  require(path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= 8 * 1024 * 1024)
+                  data = path.read_bytes()
+                  parsed = json.loads(data)
+                  require(set(parsed) == CATALOG_KEYS)
+                  require((json.dumps(parsed, indent=2, sort_keys=True) + "\n").encode() == data)
+                  require({"ref_store_public_operations", "ref_store_private_attempts"} <=
+                          {table["name"] for table in parsed["tables"] if table["kind"] == "r"})
+                  require(any(t["name"] == "ref_store_private_cancellation_evidence" and t["table"] == "ref_store_cancellations"
+                              and t["deferrable"] is True and t["deferred"] is True for t in parsed["triggers"]))
+                  files[name] = data
+              return files
+
+          def generate(state):
+              DUMPS.mkdir()
+              env = pg_env("postgres")
+              admin_url = urllib.parse.urlunsplit(("postgresql", "rootyard@127.0.0.1:55432", "/postgres", "", ""))
+              env.update(ROOTYARD_TEST_DATABASE_URL=admin_url, PATH=str(PG_BIN) + os.pathsep + env["PATH"], TMPDIR=str(DUMPS))
+              state["phase"] = "catalog_generation_failed"
+              save(state)
+              raw = command(["timeout", "-k", "5s", "600s", sys.executable, "-B", "-c", BOOTSTRAP,
+                             GENERATOR, "--sql-migrate", "--write"], cwd=OVERLAY, env=env, capture=True, limit=615)
+              state["phase"] = "catalog_validation_failed"
+              save(state)
+              require(len(raw) <= 4096)
+              result = json.loads(raw)
+              counts = ("tables", "functions", "triggers")
+              require(set(result) == {"schema_version", "migration_mode", *ASSERTIONS, *counts})
+              require(result["schema_version"] == "152" and result["migration_mode"] == "sql")
+              require(all(result[name] is True for name in ASSERTIONS))
+              files = catalog_files()
+              fresh = json.loads(files[CATALOGS[0]])
+              require(all(type(result[name]) is int and result[name] == len(fresh[name]) for name in counts))
+              require(database_names() == MAINTENANCE_DATABASES)
+              state.update(catalogs={name: sha(data) for name, data in files.items()}, generator_assertions=list(ASSERTIONS))
+              save(state)
+
+          def probe(state, versions):
+              db = "issue42_schema152_" + secrets.token_hex(12)
+              require(db not in database_names())
+              state.update(probe_db=db, phase="fixture_migration_failed")
+              save(state)
+              psql("postgres", ["-c", f'CREATE DATABASE "{db}" TEMPLATE template0;'], limit=15)
+              migrations = sorted((OVERLAY / "migrations").glob("*.sql"))
+              require([int(path.name[:3]) for path in migrations] == versions)
+              prefix = ["--single-transaction", "-c", "SELECT pg_advisory_xact_lock(738390103)"]
+              version_query = "SELECT string_agg(version::text, ',' ORDER BY version) FROM public.schema_migrations;"
+              args = [arg for path in migrations[:-1] for arg in ("-f", str(path))]
+              psql(db, prefix + args, limit=75)
+              require(scalar(db, version_query) == ",".join(map(str, versions[:-1])))
+              psql(db, prefix + ["-f", str(migrations[-1])])
+              require(scalar(db, version_query) == ",".join(map(str, versions)))
+              state.update(phase="late_cancellation_failed", fixture_invocations=None)
+              save(state)
+              psql(db, ["-f", FIXTURE], limit=45)
+              state.update(phase="fixture_rollback_failed", fixture_invocations=1, fixture_rollback="unproven")
+              save(state)
+              clean = scalar(db, "SELECT NOT EXISTS (SELECT FROM users WHERE username='issue42-cancel-probe') "
+                             "AND NOT EXISTS (SELECT FROM ref_store_public_operations) "
+                             "AND NOT EXISTS (SELECT FROM ref_store_private_attempts) "
+                             "AND NOT EXISTS (SELECT FROM ref_store_cancellations);")
+              require(clean == "t" and not role_present())
+              state.update(phase="checks_passed", fixture_rollback="verified")
+              save(state)
+
+          def run():
+              state = initial()
+              save(state)
+              versions = stage(state)
+              verify_tools(state)
+              generate(state)
+              probe(state, versions)
+
+          def cleanup_database(state):
+              if not state["owned"]:
+                  return "not_started"
+              db = state["probe_db"]
+              require(db is None or PROBE_DATABASE.fullmatch(db))
+              names = database_names() - MAINTENANCE_DATABASES
+              clean = True
+              for name in sorted(names):
+                  if name == db or GENERATOR_DATABASE.fullmatch(name):
+                      try:
+                          psql("postgres", ["-c", f'DROP DATABASE "{name}" WITH (FORCE);'], limit=12)
+                      except Exception:
+                          clean = False
+                  else:
+                      clean = False
+              if role_present():
+                  psql("postgres", ["-c", f"DROP ROLE {PROBE_ROLE};"], limit=12)
+              return "verified" if clean and database_names() == MAINTENANCE_DATABASES and not role_present() else "unproven"
+
+          def finalize():
+              state = json.loads(STATE.read_text(encoding="ascii")) if STATE.exists() else initial()
+              try:
+                  database = cleanup_database(state)
+              except Exception:
+                  database = "unproven"
+              verdict = state["phase"]
+              require(verdict in ("source_failed", "loader_blocked", "setup_failed", "catalog_generation_failed",
+                                  "catalog_validation_failed", "fixture_migration_failed", "late_cancellation_failed",
+                                  "fixture_rollback_failed", "checks_passed"))
+              files = {}
+              if verdict == "checks_passed" and database == "verified":
+                  try:
+                      require(state["generator_assertions"] == list(ASSERTIONS) and state["fixture_invocations"] == 1
+                              and state["fixture_rollback"] == "verified" and state["bound_schema_source"])
+                      files = catalog_files()
+                      require({name: sha(data) for name, data in files.items()} == state["catalogs"])
+                      verdict = "passed"
+                  except Exception:
+                      files, verdict = {}, "catalog_validation_failed"
+              try:
+                  for directory in (OVERLAY, DUMPS):
+                      if directory.exists():
+                          shutil.rmtree(directory)
+                  require(not OVERLAY.exists() and not DUMPS.exists())
+                  workspace = "verified"
+              except Exception:
+                  workspace = "unproven"
+              if database == "unproven" or workspace == "unproven":
+                  files, verdict = {}, "cleanup_failed"
+              require(verdict != "checks_passed")
+              report = {
+                  "version": 1, "scope": "catalogs_and_fresh_cancellation", "verdict": verdict,
+                  "trigger_sha": hex_digest(os.getenv("TRIGGER_SHA"), 40), "workflow_sha": hex_digest(os.getenv("WORKFLOW_SHA"), 40),
+                  "source_sha": state["source"], "source_tree": state["tree"], "parent_sha": PARENT, "parent_tree": PARENT_TREE,
+                  "schema_source_sha": SCHEMA_SOURCE if state["bound_schema_source"] else None,
+                  "schema_source_tree": SCHEMA_TREE if state["bound_schema_source"] else None,
+                  "inputs_sha256": INPUTS if state["bound_schema_source"] else {}, "tool_versions": state["tool_versions"],
+                  "pg_version_num": state["pg_version_num"], "generator_assertions": state["generator_assertions"],
+                  "fixture_invocations": state["fixture_invocations"], "fixture_rollback": state["fixture_rollback"],
+                  "database_cleanup": database, "workspace_cleanup": workspace, "restored_privileges": "outside_scope",
+                  "catalogs_sha256": {name: sha(data) for name, data in files.items()},
+              }
+              pending = WORK / "publish"
+              pending.mkdir()
+              for name, data in files.items():
+                  (pending / name).write_bytes(data)
+              (pending / "outcome.json").write_text(json.dumps(report, sort_keys=True) + "\n", encoding="ascii")
+              pending.rename(WORK / "artifact")
+              return verdict == "passed"
+
+          if __name__ == "__main__":
+              try:
+                  if sys.argv[1] == "run":
+                      run()
+                      ok = True
+                  else:
+                      ok = sys.argv[1] == "finalize" and finalize()
+              except Exception:
+                  ok = False
+              sys.exit(0 if ok else 1)
+          PY
+      - uses: actions/checkout@v4
+        timeout-minutes: 3
+        with:
+          ref: ${{ github.sha }}
+          path: scratch
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        timeout-minutes: 3
+        with:
+          ref: ${{ env.SCHEMA_SOURCE_SHA }}
+          path: schema151
+          persist-credentials: false
+      - name: Install the existing PG17 client toolchain
+        timeout-minutes: 7
+        run: |
+          exec >/dev/null 2>&1
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+      - name: Generate schema catalogs and test exact late cancellation
+        timeout-minutes: 14
+        run: python3 "$RUNNER_TEMP/issue42-schema152-catalog/verify.py" run
+      - name: Dispose of owned resources and publish only verified catalogs
+        if: always()
+        timeout-minutes: 4
+        run: python3 "$RUNNER_TEMP/issue42-schema152-catalog/verify.py" finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        timeout-minutes: 2
+        with:
+          name: issue42-schema152-catalog-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue42-schema152-catalog/artifact
+          if-no-files-found: error
+          retention-days: 7
