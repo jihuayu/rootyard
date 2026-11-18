@@ -112,8 +112,8 @@ where
             .await
             .map_err(|e| PushCausalError::MalformedProtocol(format!("incomplete pkt-line header: {e}")))?;
         command_bytes_read = command_bytes_read.saturating_add(4);
-        if command_bytes_read > limits.max_command_bytes {
-            return Err(PushCausalError::LimitExceeded("receive-pack command block exceeded max_command_bytes"));
+        if command_bytes_read > limits.max_command_bytes || (command_bytes_read as u64) > limits.max_stream_bytes {
+            return Err(PushCausalError::LimitExceeded("receive-pack command block exceeded stream/command budget"));
         }
         let header = std::str::from_utf8(&len_buf)
             .map_err(|_| PushCausalError::MalformedProtocol("non-utf8 pkt-line length".into()))?;
@@ -130,8 +130,8 @@ where
         }
         let payload_len = length - 4;
         command_bytes_read = command_bytes_read.saturating_add(payload_len);
-        if command_bytes_read > limits.max_command_bytes {
-            return Err(PushCausalError::LimitExceeded("receive-pack command block exceeded max_command_bytes"));
+        if command_bytes_read > limits.max_command_bytes || (command_bytes_read as u64) > limits.max_stream_bytes {
+            return Err(PushCausalError::LimitExceeded("receive-pack command block exceeded stream/command budget"));
         }
         let mut payload = vec![0u8; payload_len];
         decoder

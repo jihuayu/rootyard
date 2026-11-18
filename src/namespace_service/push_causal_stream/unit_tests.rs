@@ -209,7 +209,7 @@ fn ref_advertisement_verifies_capability_stacked_branches_force_with_lease_and_n
     assert_eq!(fallback.strategy_used, AdvertisementStrategy::FullAuthorizedFallback);
     assert!(fallback.advertised_refs.iter().all(|r| r.ref_name != "refs/heads/secret"));
     let adv_wire = encode_ref_advertisement(&fallback, GitObjectFormat::Sha1, true).unwrap();
-    assert!(adv_wire.starts_with(b"001e# service=git-receive-pack\n0000"));
+    assert!(adv_wire.starts_with(b"001f# service=git-receive-pack\n0000"));
 
     let mut secret_lease = client;
     secret_lease.force_with_lease_refs.insert("refs/heads/secret".into(), oid2);
