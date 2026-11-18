@@ -236,7 +236,7 @@ def build_failure_is_closed(value):
 
 
 # Narrow anchors for the exact fixed strings emitted by
-# scripts/build_native_test.py at PRODUCT_SHA ebc1f9f3f2b2b4eefa2ed0b097731eb351876c54.
+# scripts/build_native_test.py at PRODUCT_SHA f73d5b77c42ed8ec23b6c42fdde2b2baf74121f5.
 # Only path-bearing suffixes are wildcarded; suffixes are never projected.
 LIB_PRODUCER_PREFIX = b"build_native_test: "
 LIB_PRODUCER_CHUNK = 65536
