@@ -301,7 +301,10 @@ pub(super) fn reconcile_pg_raft_repositories(
 ) -> Result<(), PairedBackupError> {
     for r in close_receipts {
         r.verify()?;
-        if r.raft_log_index > applied.index || r.raft_log_term != applied.term || r.lifecycle != ScopeLifecycle::Closed
+        if r.raft_log_index > applied.index
+            || r.raft_log_term == 0
+            || r.raft_log_term > applied.term
+            || r.lifecycle != ScopeLifecycle::Closed
         {
             return Err(PairedBackupError::ScopeNotClosed("close receipt log/lifecycle mismatches Raft cut".into()));
         }

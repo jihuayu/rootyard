@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rustls::ClientConfig;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -25,6 +26,13 @@ use super::types::{NewIncarnationAuthority, PairedBackupError, sha256_json_tagge
 
 const FREEZE_KV_KEY: &str = "refcas/paired_freeze";
 const INCARNATION_KV_KEY: &str = "refcas/cluster_incarnation";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRaftCmd {
+    term: u64,
+    cmd: RefCasCommand,
+}
 
 #[derive(Clone, Debug)]
 struct AuthenticatedVoterInfo {
@@ -91,7 +99,7 @@ impl MtlsLiveRaftBackend {
     pub fn write_freeze_record(&self, rec: &DurableRaftFreezeRecord) -> Result<u64, PairedBackupError> {
         rec.verify()?;
         let raw = serde_json::to_string(rec).map_err(|_| PairedBackupError::IncompleteCut("freeze serialize"))?;
-        let idx = self.quorum_kv_put(FREEZE_KV_KEY, &raw)?;
+        let (idx, _) = self.quorum_kv_put(FREEZE_KV_KEY, &raw)?;
         self.trigger_leader_snapshot()?;
         Ok(idx)
     }
@@ -108,7 +116,7 @@ impl MtlsLiveRaftBackend {
 
     pub fn write_incarnation_record(&self, inc: &NewIncarnationAuthority) -> Result<u64, PairedBackupError> {
         let raw = serde_json::to_string(inc).map_err(|_| PairedBackupError::IncompleteCut("incarnation serialize"))?;
-        let idx = self.quorum_kv_put(INCARNATION_KV_KEY, &raw)?;
+        let (idx, _) = self.quorum_kv_put(INCARNATION_KV_KEY, &raw)?;
         self.trigger_leader_snapshot()?;
         Ok(idx)
     }
@@ -123,6 +131,7 @@ impl MtlsLiveRaftBackend {
     }
 
     fn probe_live_voters(&self) -> Result<(BTreeMap<u64, AuthenticatedVoterInfo>, u64), PairedBackupError> {
+        let expected_ids: BTreeSet<u64> = self.cfg.voter_endpoints.keys().copied().collect();
         let mut infos = BTreeMap::new();
         let mut leader_opt = None;
         for (&node_id, addr) in &self.cfg.voter_endpoints {
@@ -143,8 +152,11 @@ impl MtlsLiveRaftBackend {
             if derive_voter_uuid(self.cfg.group_id, node_id, &cert_sha) != expected_uuid {
                 return Err(PairedBackupError::FreezeNotHeld("live peer X.509 certificate changed unexpectedly"));
             }
-            let members_len = m["membership_voters"].as_array().map_or(0, Vec::len);
-            if members_len < MIN_QUORUM_VOTERS {
+            let mv: BTreeSet<u64> = m["membership_voters"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_u64).collect())
+                .unwrap_or_default();
+            if mv.len() < MIN_QUORUM_VOTERS || mv != expected_ids {
                 continue;
             }
             if let Some(cl) = m["current_leader"].as_u64() {
@@ -170,22 +182,20 @@ impl MtlsLiveRaftBackend {
         Ok((infos, leader_id))
     }
 
-    fn quorum_kv_put(&self, key: &str, value: &str) -> Result<u64, PairedBackupError> {
+    fn quorum_kv_put(&self, key: &str, value: &str) -> Result<(u64, u64), PairedBackupError> {
         let payload = serde_json::to_vec(&json!({ "Put": { "key": key, "value": value } }))
             .map_err(|_| PairedBackupError::IncompleteCut("Put payload encode"))?;
         let deadline = Instant::now() + Duration::from_secs(12);
         let mut target: Option<u64> = None;
         while Instant::now() < deadline {
-            let candidate = match target.take() {
-                Some(id) if self.cfg.voter_endpoints.contains_key(&id) => id,
-                _ => match self.probe_live_voters() {
-                    Ok((_, lid)) => lid,
-                    Err(_) => {
-                        std::thread::sleep(Duration::from_millis(60));
-                        continue;
-                    }
-                },
+            let (infos, lid) = match self.probe_live_voters() {
+                Ok(v) => v,
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(60));
+                    continue;
+                }
             };
+            let candidate = target.take().filter(|id| self.cfg.voter_endpoints.contains_key(id)).unwrap_or(lid);
             let addr = &self.cfg.voter_endpoints[&candidate];
             if let Ok((resp, _)) = mtls_rpc_call(
                 &self.tls_cfg,
@@ -195,7 +205,8 @@ impl MtlsLiveRaftBackend {
                 self.cfg.rpc_timeout,
             ) {
                 if let Some(idx) = resp.pointer("/ClientWrite/log_index").and_then(Value::as_u64) {
-                    return Ok(idx);
+                    let term = infos.get(&candidate).map_or(1, |i| i.current_term.max(1));
+                    return Ok((idx, term));
                 }
                 if let Some(fwd) = resp.pointer("/Error/forward_to_leader_id").and_then(Value::as_u64)
                     && fwd != candidate
@@ -282,9 +293,9 @@ impl MtlsLiveRaftBackend {
             let raw = self
                 .linearizable_kv_get(&format!("refcas/cmd/{seq:08}"))?
                 .ok_or(PairedBackupError::IncompleteCut("missing committed refcas/cmd entry"))?;
-            let cmd: RefCasCommand =
+            let entry: PersistedRaftCmd =
                 serde_json::from_str(&raw).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-            sm.apply(AppliedLogId { term: 1, index: seq }, cmd)
+            sm.apply(AppliedLogId { term: entry.term.max(1), index: seq }, entry.cmd)
                 .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
         }
         Ok(sm)
@@ -361,16 +372,26 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
         &mut self,
         cmd: RefCasCommand,
     ) -> Result<(DurableRaftApplyReceipt, ApplyResponse), PairedBackupError> {
-        let (_, head_before) = self.replay_linearizable_sm()?;
+        let (before_sm, head_before) = self.replay_linearizable_sm()?;
+        let floor_term = before_sm.snapshot().ok().and_then(|s| s.body.last_applied.map(|a| a.term)).unwrap_or(1);
+        let (infos, lid) = self.probe_live_voters()?;
+        let observed_term = infos.get(&lid).map_or(1, |i| i.current_term).max(floor_term).max(1);
         let seq = head_before.saturating_add(1);
-        let log_id = AppliedLogId { term: 1, index: seq };
         let group_epoch = self.resolve_group_epoch(&cmd);
         let wire_bytes = encode_command(&cmd).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
         let command_sha256 = hex::encode(Sha256::digest(&wire_bytes));
-        let cmd_json = serde_json::to_string(&cmd).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+        let persisted = PersistedRaftCmd { term: observed_term, cmd: cmd.clone() };
+        let cmd_json = serde_json::to_string(&persisted).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
 
-        let _ = self.quorum_kv_put(&format!("refcas/cmd/{seq:08}"), &cmd_json)?;
-        let commit_raft_idx = self.quorum_kv_put("refcas/head_seq", &seq.to_string())?;
+        let (_, cmd_term) = self.quorum_kv_put(&format!("refcas/cmd/{seq:08}"), &cmd_json)?;
+        let final_term = observed_term.max(cmd_term);
+        if final_term > observed_term {
+            let updated = PersistedRaftCmd { term: final_term, cmd: cmd.clone() };
+            let raw = serde_json::to_string(&updated).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+            let _ = self.quorum_kv_put(&format!("refcas/cmd/{seq:08}"), &raw)?;
+        }
+        let (commit_raft_idx, _) = self.quorum_kv_put("refcas/head_seq", &seq.to_string())?;
+        let log_id = AppliedLogId { term: final_term, index: seq };
         let _ = self.trigger_leader_snapshot();
 
         let acks = self.collect_voter_acks(log_id, seq, commit_raft_idx, &command_sha256)?;

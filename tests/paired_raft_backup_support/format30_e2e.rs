@@ -133,8 +133,6 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
             ensure!(push_out.status.success(), "git push failed: {}", String::from_utf8_lossy(&push_out.stderr));
             pushed_oids.push(head);
         }
-        gw_jh.abort();
-        let _ = gw_jh.await;
 
         seed_gate_and_commit(
             &mut raft1,
@@ -149,7 +147,7 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         ensure!(specs.len() == 1 && specs[0].expected_packs.len() == 2);
         let src_authority_id = specs[0].authority_id;
 
-        // 2. Enter durable PG + 3-voter mTLS Raft freeze & verify survival across process/conn restarts!
+        // 2. Enter durable PG + 3-voter mTLS Raft freeze & verify engine-level + restart survival!
         let mut peer_rafts = BTreeMap::from([(2i64, raft2)]);
         let freeze_handle = {
             let mut c = src_pool.get().await?;
@@ -160,35 +158,44 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
                 repos: &specs,
                 peer_repos_by_group: BTreeMap::from([(2i64, vec![(peer_repo, peer_tenant, src_authority_id)])]),
             };
-            let h = enter_durable_pg_raft_freeze(&mut c, &mut raft1, &mut peer_rafts, &req).await?;
-            let (s1, _) = raft1.durable_state()?;
-            let (s2, _) = peer_rafts[&2].durable_state()?;
-            let (a1, a2) = (s1.body.last_applied.unwrap(), s2.body.last_applied.unwrap());
-            c.execute("DELETE FROM public.ref_cas_projection_cursors", &[]).await?;
-            c.execute(
-                "INSERT INTO public.ref_cas_projection_cursors(\
-                   group_id, history_incarnation, group_epoch, applied_event_seq, \
-                   applied_log_index, applied_log_term, stream_state) \
-                 VALUES (1, $1, $2, $3, $4, $5, 'active'), (2, $6, 4, $7, $8, $9, 'active')",
-                &[
-                    &gate.history_incarnation(),
-                    &gate.group_epoch(),
-                    &(s1.body.next_event_seq as i64),
-                    &(a1.index as i64),
-                    &(a1.term as i64),
-                    &peer_hist,
-                    &(s2.body.next_event_seq as i64),
-                    &(a2.index as i64),
-                    &(a2.term as i64),
-                ],
-            )
-            .await?;
-            h
+            enter_durable_pg_raft_freeze(&mut c, &mut raft1, &mut peer_rafts, &req).await?
         };
+
+        // Direct unmodified Smart-HTTP gateway (`POST /api/repos` + stock `git push`) MUST fail while frozen!
+        let frozen_api = reqwest::Client::new()
+            .post(format!("http://{gw_addr}/api/repos"))
+            .bearer_auth(&owner.token)
+            .json(&json!({ "name": "blocked-while-frozen", "object_format": "sha256" }))
+            .send()
+            .await?;
+        ensure!(!frozen_api.status().is_success(), "production POST /api/repos must fail during PG freeze");
+        fs::write(work_clone.join("frozen.txt"), "must-not-land\n")?;
+        ensure!(run_git_cli(&git, &work_clone, &["add", "."]).status.success());
+        ensure!(run_git_cli(&git, &work_clone, &["commit", "-q", "-m", "frozen"]).status.success());
+        ensure!(
+            !run_git_cli(&git, &work_clone, &["push", "origin", "HEAD:refs/heads/main"]).status.success(),
+            "production Smart-HTTP git push must fail during PG freeze"
+        );
+        gw_jh.abort();
+        let _ = gw_jh.await;
 
         g1.kill_and_restart_node(2)?;
         raft1.update_endpoints(g1.endpoints())?;
         let fresh_src_pool = db::pool(&src_url)?;
+        // Direct unguarded SQL write to `public.repository_collaborators` (`repo_access`) MUST fail in PG 17!
+        ensure!(
+            fresh_src_pool
+                .get()
+                .await?
+                .execute(
+                    "INSERT INTO public.repository_collaborators(repository_id, tenant_id, user_id, role) \
+                     VALUES($1, $2, $3, 'read')",
+                    &[&repo_id, &gate.tenant_id(), &stranger.id],
+                )
+                .await
+                .is_err(),
+            "raw SQL INSERT into repository_collaborators must be blocked by durable PG read-only freeze"
+        );
         assert!(matches!(
             upsert_repo_access_collaborator_guarded(&fresh_src_pool, &raft1, repo_id, stranger.id, "read")
                 .await
@@ -272,6 +279,24 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         let thawed_pool = db::pool(&src_url)?;
         {
             let mut tc = thawed_pool.get().await?;
+            let mut forged = seal_receipt.clone();
+            forged.receipt_seal = "0".repeat(64);
+            ensure!(
+                thaw_durable_pg_raft_freeze(&mut tc, &raft1, &peer_rafts, &freeze_handle, &archive_dir, &forged)
+                    .await
+                    .is_err(),
+                "forged seal_receipt must not thaw PG or 3-voter mTLS Raft"
+            );
+            ensure!(
+                tc.execute(
+                    "INSERT INTO public.repository_collaborators(repository_id, tenant_id, user_id, role) \
+                     VALUES($1, $2, $3, 'read')",
+                    &[&repo_id, &gate.tenant_id(), &stranger.id],
+                )
+                .await
+                .is_err(),
+                "PG read-only freeze must remain active after backup::create until verified thaw"
+            );
             let post_floor =
                 thaw_durable_pg_raft_freeze(&mut tc, &raft1, &peer_rafts, &freeze_handle, &archive_dir, &seal_receipt)
                     .await?;
@@ -285,7 +310,7 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         // 4. Wipe S3 bytes & boot fresh incarnation on empty PG17 `dst_db` + fresh 3-voter mTLS Raft clusters!
         s3.state.objects.lock().unwrap().clear();
         ensure!(s3.state.objects.lock().unwrap().is_empty());
-        let dst_g1 = LiveMtlsRaftGroup::start_three(1)?;
+        let mut dst_g1 = LiveMtlsRaftGroup::start_three(1)?;
         let dst_g2 = LiveMtlsRaftGroup::start_three(2)?;
         let mut booted_raft1 = dst_g1.connect_backend(1)?;
         let booted_raft2 = dst_g2.connect_backend(1)?;
@@ -404,9 +429,9 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
             1,
             Uuid::new_v4(),
             GitObjectFormat::Sha256,
-            gate.history_incarnation(),
-            gate.authority_epoch(),
-            gate.group_epoch(),
+            inc.new_history_incarnation,
+            inc.new_authority_epoch,
+            inc.new_group_epoch,
             cur_rev,
             HeadUpdate::Keep,
             CommitMode::Atomic,
@@ -431,9 +456,14 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
             .unwrap_err(),
             PairedBackupError::StaleGrantRefused(_)
         ));
+        let dst_lid = dst_g1.wait_leader()?;
+        dst_g1.kill_and_restart_node(dst_lid)?;
+        booted_raft1.update_endpoints(dst_g1.endpoints())?;
         propose_raft_ref_write_guarded(&dst_pool, &mut booted_raft1, repo_id, inc.new_authz_floor, raft_cmd).await?;
+        let post_snap = booted_raft1.durable_state()?.0;
+        ensure!(post_snap.body.last_applied.unwrap().term >= 2, "leader failover must advance durable consensus term");
         ensure!(
-            booted_raft1.durable_state()?.0.body.refs[0].refs.get("refs/heads/main") == Some(&post_oid),
+            post_snap.body.refs[0].refs.get("refs/heads/main") == Some(&post_oid),
             "3-voter mTLS Raft cluster committed post-restore ref advance"
         );
         drop(dst_pool);

@@ -93,15 +93,15 @@ async fn install_new_incarnation_on_restored_schema151(
     client: &mut Client,
     manifest: &Format30PairedManifest,
 ) -> Result<NewIncarnationAuthority, PairedBackupError> {
-    let max_auth_e = manifest.pg_cutpoint.repositories.iter().map(|r| r.authority_epoch).max().unwrap_or(1);
-    let max_grp_e = manifest
-        .pg_cutpoint
-        .repositories
-        .iter()
-        .map(|r| r.group_epoch)
-        .chain(manifest.raft_cutpoint.group_epochs.values().copied())
-        .max()
-        .unwrap_or(1);
+    let gate_auth_e = manifest.pg_cutpoint.repositories.iter().map(|r| r.authority_epoch).max().unwrap_or(1).max(1);
+    let active_grp_e = manifest
+        .raft_cutpoint
+        .group_epochs
+        .get(&manifest.raft_cutpoint.group_id)
+        .copied()
+        .or_else(|| manifest.pg_cutpoint.repositories.first().map(|r| r.group_epoch))
+        .unwrap_or(1)
+        .max(1);
     let max_floor = manifest
         .raft_cutpoint
         .close_receipts
@@ -117,7 +117,6 @@ async fn install_new_incarnation_on_restored_schema151(
     let new_cluster_inc = Uuid::new_v4();
     let new_storage_auth = Uuid::new_v4();
     let new_storage_gen = manifest.pg_cutpoint.source_storage_generation.saturating_add(2);
-    let new_auth_epoch = max_auth_e.saturating_add(1);
     let primary_hist =
         manifest.pg_cutpoint.repositories.first().map(|r| r.history_incarnation).unwrap_or_else(Uuid::new_v4);
 
@@ -133,11 +132,11 @@ async fn install_new_incarnation_on_restored_schema151(
             "UPDATE public.pando_storage_authorities \
              SET authority_id = $1, generation = GREATEST(generation + 1, $2), \
                  restore_generation = GREATEST(restore_generation + 1, $3), \
-                 authority_epoch = GREATEST(authority_epoch + 1, $4), \
+                 authority_epoch = $4, \
                  remote_delete_fenced = false, remote_delete_fence_reason = NULL, rotated_at = clock_timestamp() \
              WHERE singleton = true \
              RETURNING generation, authority_epoch",
-            &[&new_storage_auth, &new_storage_gen, &deleter_floor_i64, &new_auth_epoch],
+            &[&new_storage_auth, &new_storage_gen, &deleter_floor_i64, &gate_auth_e],
         )
         .await
         .map_err(pg_err)?;
@@ -207,12 +206,18 @@ async fn install_new_incarnation_on_restored_schema151(
         new_storage_generation: actual_storage_gen,
         new_history_incarnation: primary_hist,
         new_authority_epoch: actual_auth_e,
-        new_group_epoch: max_grp_e,
+        new_group_epoch: active_grp_e,
         new_authz_floor,
         new_deleter_epoch,
         fenced_prior_incarnations: fenced_inc,
         fenced_pre_backup_decision_ids: fenced_decisions,
     })
+}
+
+#[derive(Default)]
+struct EntrySlot<'a> {
+    pack: Option<&'a BlobArtifactEntry>,
+    idx: Option<&'a BlobArtifactEntry>,
 }
 
 fn boot_active_and_peer_mtls_raft_incarnation(
@@ -229,21 +234,21 @@ fn boot_active_and_peer_mtls_raft_incarnation(
 
     for repo in &manifest.pg_cutpoint.repositories {
         repo_access_floors.insert(repo.repository_id, inc.new_authz_floor);
-        let mut by_pack: BTreeMap<Uuid, (Option<&BlobArtifactEntry>, Option<&BlobArtifactEntry>)> = BTreeMap::new();
+        let mut by_pack: BTreeMap<Uuid, EntrySlot<'_>> = BTreeMap::new();
         for e in manifest.blob_closure.entries.iter().filter(|e| e.repository_id == repo.repository_id) {
             let slot = by_pack.entry(e.pack_id).or_default();
             if e.role == "pack" {
-                slot.0 = Some(e);
+                slot.pack = Some(e);
             } else {
-                slot.1 = Some(e);
+                slot.idx = Some(e);
             }
         }
         let mut pairs = Vec::with_capacity(by_pack.len());
         let mut expected_packs = Vec::with_capacity(by_pack.len());
-        for (&pack_id, &(p_opt, i_opt)) in &by_pack {
+        for (&pack_id, slot) in &by_pack {
             let (pe, ie) = (
-                p_opt.ok_or_else(|| PairedBackupError::BlobClosureIncomplete("missing .pack".into()))?,
-                i_opt.ok_or_else(|| PairedBackupError::BlobClosureIncomplete("missing .idx".into()))?,
+                slot.pack.ok_or_else(|| PairedBackupError::BlobClosureIncomplete("missing .pack".into()))?,
+                slot.idx.ok_or_else(|| PairedBackupError::BlobClosureIncomplete("missing .idx".into()))?,
             );
             pairs.push((fmt30_dir.join(&pe.archive_rel_path), fmt30_dir.join(&ie.archive_rel_path)));
             expected_packs.push(ExpectedPackPairSpec {
@@ -401,16 +406,14 @@ fn boot_single_peer_mtls_raft(
     inc: &NewIncarnationAuthority,
     boot_thaw: &DurableRaftFreezeRecord,
 ) -> Result<(), PairedBackupError> {
-    let next_hist = Uuid::new_v4();
-    let next_grp_e = peer.group_epoch.saturating_add(1);
     for gate in &peer.snapshot.body.gates {
         let init = CoreGateInit::new(
             gate.repository_id,
             gate.tenant_id,
             gate.object_format,
-            next_hist,
-            gate.authority_epoch.saturating_add(1),
-            next_grp_e,
+            gate.history_incarnation,
+            gate.authority_epoch,
+            peer.group_epoch,
             RefName::branch(&gate.head_ref).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?,
         )
         .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
@@ -438,9 +441,9 @@ fn boot_single_peer_mtls_raft(
                 1,
                 Uuid::new_v4(),
                 gate.object_format,
-                next_hist,
-                gate.authority_epoch.saturating_add(1),
-                next_grp_e,
+                gate.history_incarnation,
+                gate.authority_epoch,
+                peer.group_epoch,
                 1,
                 HeadUpdate::Keep,
                 CommitMode::Atomic,

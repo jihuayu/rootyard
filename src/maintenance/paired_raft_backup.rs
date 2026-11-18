@@ -14,6 +14,7 @@ pub mod mtls_raft;
 pub mod mtls_wire;
 pub mod peer_groups;
 pub mod pg_cutpoint;
+pub mod pg_freeze_settings;
 pub mod pg_restore_admission;
 pub mod quorum_wal;
 pub mod raft_barrier;

@@ -26,6 +26,7 @@ use super::peer_groups::{
     verify_archived_peer_groups,
 };
 use super::pg_cutpoint::{ExpectedRaftCut, capture_pg_cutpoint_in_tx, pg_err};
+use super::pg_freeze_settings::{drop_ephemeral_backup_role, provision_ephemeral_backup_role};
 use super::quorum_wal::DurableRaftBackend;
 use super::raft_barrier::SealedArchiveReceipt;
 use super::types::{
@@ -108,10 +109,10 @@ pub async fn create_format30_paired_raft_backup(
     let active_cut = ExpectedGroupCursorCut::from_verified_snapshot(req.raft.group_id(), &snapshot)?;
     let (peer_cuts, peer_proofs) = extract_peer_expected_cuts(req.raft.group_id(), &req.peer_groups)?;
 
+    let parsed_dsn: tokio_postgres::Config = req.src_config.database_url.parse().map_err(pg_err)?;
     let pg_proof = {
-        let parsed: tokio_postgres::Config = req.src_config.database_url.parse().map_err(pg_err)?;
         let mut pg_client =
-            crate::db::connect_config(parsed).await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
+            crate::db::connect_config(parsed_dsn).await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
         req.freeze_handle.verify_still_frozen_on(&pg_client, req.raft).await?;
         let tx = pg_client
             .build_transaction()
@@ -139,10 +140,14 @@ pub async fn create_format30_paired_raft_backup(
     }
     fs::create_dir_all(&work_dir)?;
 
+    // Keep `<db>` at `default_transaction_read_only = on` continuously; run `crate::backup::create`
+    // via a dedicated ephemeral backup role (`ALTER ROLE ... IN DATABASE ... SET default_transaction_read_only = off`).
     let fmt30_dir = work_dir.join(FORMAT30_SUBDIR);
-    crate::backup::create(req.src_config, &fmt30_dir)
-        .await
-        .map_err(|e| PairedBackupError::Postgres(format!("format 30 backup::create failed: {e:#}")))?;
+    let (role_cfg, role_name, db_name) = provision_ephemeral_backup_role(req.src_config).await?;
+    let create_res = crate::backup::create(&role_cfg, &fmt30_dir).await;
+    let cleanup_res = drop_ephemeral_backup_role(req.src_config, &role_name, &db_name).await;
+    create_res.map_err(|e| PairedBackupError::Postgres(format!("format 30 backup::create failed: {e:#}")))?;
+    cleanup_res?;
     crate::backup::check(&fmt30_dir).map_err(|_| PairedBackupError::IncompleteCut("inner format 30 check failed"))?;
 
     let (fmt30_binding, blob_closure) =

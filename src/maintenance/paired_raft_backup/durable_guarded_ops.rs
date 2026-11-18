@@ -10,24 +10,30 @@ use uuid::Uuid;
 use crate::ref_store::GitObjectFormat;
 use crate::ref_store::core::state_machine::{AcquireHoldBatchCommand, ApplyResponse, RefCasCommand};
 
-use super::durable_freeze_gate::read_pg_database_freeze_marker;
+use super::durable_freeze_gate::{read_pg_database_freeze_marker, read_pg_database_read_only};
 use super::freeze_drain::RepoBackupRegistrationSpec;
 use super::mtls_raft::MtlsLiveRaftBackend;
 use super::pg_cutpoint::pg_err;
 use super::quorum_wal::DurableRaftBackend;
 use super::types::{DeleterLeaseTicket, ExpectedPackPairSpec, PairedBackupError};
 
-/// Query BOTH durable PostgreSQL (`pg_db_role_setting` + `pando_storage_authorities` +
-/// `ref_store_decision_scopes('repo_access', repo_id)`) AND live 3-voter mTLS Raft
-/// (`EnsureReadIndex` `refcas/paired_freeze`) to enforce fail-closed write admission.
+#[derive(Default)]
+struct RawPackSlot {
+    pack: Option<(String, u64)>,
+    idx: Option<(String, u64)>,
+}
+
+/// Query BOTH durable PostgreSQL (`default_transaction_read_only` + `pg_db_role_setting` +
+/// `pando_storage_authorities` + `ref_store_decision_scopes('repo_access', repo_id)`) AND live
+/// 3-voter mTLS Raft (`EnsureReadIndex` `refcas/paired_freeze`) for fail-closed write admission.
 pub async fn require_unfrozen_pg_and_raft(
     pg_client: &(impl GenericClient + Sync),
     raft: &MtlsLiveRaftBackend,
     repository_id: Uuid,
 ) -> Result<i64, PairedBackupError> {
-    if read_pg_database_freeze_marker(pg_client).await?.is_some() {
+    if read_pg_database_freeze_marker(pg_client).await?.is_some() || read_pg_database_read_only(pg_client).await? {
         return Err(PairedBackupError::FreezeNotHeld(
-            "PostgreSQL durable paired_backup_freeze marker active; concurrent writes rejected",
+            "PostgreSQL durable paired_backup_freeze / read_only fence active; concurrent writes rejected",
         ));
     }
     let fenced: bool = pg_client
@@ -73,7 +79,12 @@ pub async fn upsert_repo_access_collaborator_guarded(
     role: &str,
 ) -> Result<i64, PairedBackupError> {
     let mut client = pool.get().await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
-    let tx = client.transaction().await.map_err(pg_err)?;
+    if read_pg_database_freeze_marker(&**client).await?.is_some() || read_pg_database_read_only(&**client).await? {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "PostgreSQL durable paired_backup_freeze / read_only fence active; concurrent repo_access write rejected",
+        ));
+    }
+    let tx = (&mut **client).transaction().await.map_err(pg_err)?;
     let _ = tx
         .query_opt(
             "SELECT version FROM public.ref_store_decision_scopes \
@@ -83,14 +94,23 @@ pub async fn upsert_repo_access_collaborator_guarded(
         .await
         .map_err(pg_err)?;
     let _ = require_unfrozen_pg_and_raft(&tx, raft, repository_id).await?;
-    tx.execute(
-        "INSERT INTO public.repository_collaborators(repository_id, user_id, role) \
-         VALUES($1, $2, $3) \
-         ON CONFLICT (repository_id, user_id) DO UPDATE SET role = EXCLUDED.role",
-        &[&repository_id, &user_id, &role],
-    )
-    .await
-    .map_err(pg_err)?;
+    let affected = tx
+        .execute(
+            "INSERT INTO public.repository_collaborators(repository_id, tenant_id, user_id, role) \
+             SELECT id, owner_id, $2, $3 FROM public.repositories WHERE id = $1 \
+             ON CONFLICT (repository_id, user_id) DO UPDATE \
+             SET role = EXCLUDED.role, \
+                 version = public.repository_collaborators.version + 1, \
+                 updated_at = clock_timestamp()",
+            &[&repository_id, &user_id, &role],
+        )
+        .await
+        .map_err(pg_err)?;
+    if affected != 1 {
+        return Err(PairedBackupError::Postgres(
+            "target repository missing for repository_collaborators upsert".into(),
+        ));
+    }
     let next_ver: i64 = tx
         .query_one(
             "INSERT INTO public.ref_store_decision_scopes(scope_kind, scope_id, version, state, change_id) \
@@ -214,7 +234,7 @@ pub async fn load_pg_repo_backup_specs(
             )
             .await
             .map_err(pg_err)?;
-        let mut by_pack: BTreeMap<Uuid, (Option<(String, u64)>, Option<(String, u64)>)> = BTreeMap::new();
+        let mut by_pack: BTreeMap<Uuid, RawPackSlot> = BTreeMap::new();
         for ar in art_rows {
             let pid: Uuid = ar.get(0);
             let role: String = ar.get(1);
@@ -222,16 +242,16 @@ pub async fn load_pg_repo_backup_specs(
             let len = u64::try_from(ar.get::<_, i64>(3)).unwrap_or(0);
             let entry = by_pack.entry(pid).or_default();
             if role == "pack" {
-                entry.0 = Some((sha, len));
+                entry.pack = Some((sha, len));
             } else if role == "idx" {
-                entry.1 = Some((sha, len));
+                entry.idx = Some((sha, len));
             }
         }
         let mut expected_packs = Vec::with_capacity(by_pack.len());
-        for (pack_id, (p_opt, i_opt)) in by_pack {
+        for (pack_id, slot) in by_pack {
             let ((pack_sha256, pack_bytes), (idx_sha256, idx_bytes)) = (
-                p_opt.ok_or_else(|| PairedBackupError::BlobClosureIncomplete("PG missing .pack".into()))?,
-                i_opt.ok_or_else(|| PairedBackupError::BlobClosureIncomplete("PG missing .idx".into()))?,
+                slot.pack.ok_or_else(|| PairedBackupError::BlobClosureIncomplete("PG missing .pack".into()))?,
+                slot.idx.ok_or_else(|| PairedBackupError::BlobClosureIncomplete("PG missing .idx".into()))?,
             );
             expected_packs.push(ExpectedPackPairSpec { pack_id, pack_sha256, pack_bytes, idx_sha256, idx_bytes });
         }
