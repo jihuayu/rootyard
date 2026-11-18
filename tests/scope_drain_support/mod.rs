@@ -302,10 +302,14 @@ async fn privileged_scope_drain_query_is_quorum_bound_and_multirepo_complete_bod
     let foreign_repo = Uuid::new_v4();
     let foreign_backend =
         backend_on(&foreign_cluster, foreign_leader, foreign_repo, foreign_tenant, foreign_realm, options).await?;
-    assert!(
-        proposal_outcome(&foreign_backend.propose(init_command(foreign_repo, foreign_tenant, foreign_history)).await?)
-            .is_applied()
-    );
+    let foreign_init = observe_call(
+        phase,
+        &foreign_cluster,
+        Operation::ClientWrite,
+        foreign_backend.propose(init_command(foreign_repo, foreign_tenant, foreign_history)),
+    )
+    .await?;
+    assert!(proposal_outcome(&foreign_init).is_applied());
     phase.set(ScopePhase::ForeignAdvance);
     let mut foreign_rounds = 0_u64;
     while foreign_cluster
