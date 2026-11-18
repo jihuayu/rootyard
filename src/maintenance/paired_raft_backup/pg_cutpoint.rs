@@ -1,33 +1,21 @@
-//! PostgreSQL 17 consistent cutpoint capture and cursor `group_epoch` reconciliation (#153).
+//! PostgreSQL 17 consistent cutpoint capture and multi-group durable Raft cursor reconciliation (#153).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use tokio_postgres::{GenericClient, Transaction};
 use uuid::Uuid;
 
 use crate::ref_store::GitObjectFormat;
 
+use super::peer_groups::{ExpectedGroupCursorCut, verify_all_group_cursors};
 use super::types::{
     PairedBackupError, PgCutpointProof, PgProjectionCursorCut, PgRepositoryRowProof, sha256_json_tagged,
 };
 
 #[derive(Clone, Debug)]
 pub struct ExpectedRaftCut {
-    pub group_id: i64,
-    pub history_incarnation: Uuid,
-    pub group_epoch: i64,
-    pub peer_group_epochs: BTreeMap<i64, i64>,
-    pub applied_index: u64,
-    pub applied_term: u64,
-    pub applied_event_seq: u64,
-}
-
-impl ExpectedRaftCut {
-    pub fn all_group_epochs(&self) -> BTreeMap<i64, i64> {
-        let mut all = self.peer_group_epochs.clone();
-        all.insert(self.group_id, self.group_epoch);
-        all
-    }
+    pub active: ExpectedGroupCursorCut,
+    pub peers: Vec<ExpectedGroupCursorCut>,
 }
 
 pub(super) fn pg_err(err: tokio_postgres::Error) -> PairedBackupError {
@@ -63,7 +51,7 @@ pub async fn freeze_pg_deleter(client: &impl GenericClient, reason: &str) -> Res
 }
 
 /// Capture an immutable PG 17 repeatable-read cutpoint and reconcile projection cursors
-/// (`group_epoch` across all Raft groups + log index/term/seq) and pending decisions/outbox.
+/// against verified durable Raft cuts across BOTH active and peer Raft groups.
 pub async fn capture_pg_cutpoint_in_tx(
     tx: &Transaction<'_>,
     expected: &ExpectedRaftCut,
@@ -151,63 +139,6 @@ pub async fn capture_pg_cutpoint_in_tx(
         });
     }
 
-    let expected_epochs = expected.all_group_epochs();
-    if projection_cursors.len() != expected_epochs.len() {
-        return Err(PairedBackupError::CutpointSkew(format!(
-            "PG projection_cursors count ({}) != expected Raft group count ({})",
-            projection_cursors.len(),
-            expected_epochs.len()
-        )));
-    }
-    let mut seen_groups = BTreeSet::new();
-    for cur in &projection_cursors {
-        if !seen_groups.insert(cur.group_id)
-            || cur.group_epoch <= 0
-            || cur.history_incarnation.is_nil()
-            || cur.stream_state != "active"
-        {
-            return Err(PairedBackupError::CutpointSkew(format!(
-                "PG cursor group {} duplicate, invalid group_epoch {}, or stream_state {}",
-                cur.group_id, cur.group_epoch, cur.stream_state
-            )));
-        }
-        let Some(&exp_epoch) = expected_epochs.get(&cur.group_id) else {
-            return Err(PairedBackupError::CutpointSkew(format!("unbound PG cursor for group {}", cur.group_id)));
-        };
-        if cur.group_epoch != exp_epoch {
-            return Err(PairedBackupError::CutpointSkew(format!(
-                "PG cursor group {} group_epoch {} != Raft group_epoch {}",
-                cur.group_id, cur.group_epoch, exp_epoch
-            )));
-        }
-    }
-
-    let matched_cursor = projection_cursors
-        .iter()
-        .find(|c| c.group_id == expected.group_id && c.history_incarnation == expected.history_incarnation)
-        .ok_or_else(|| {
-            PairedBackupError::CutpointSkew(
-                "missing PG ref_cas_projection_cursors row for active Raft group/incarnation".into(),
-            )
-        })?;
-    if matched_cursor.group_epoch != expected.group_epoch
-        || matched_cursor.applied_log_index as u64 != expected.applied_index
-        || matched_cursor.applied_log_term as u64 != expected.applied_term
-        || matched_cursor.applied_event_seq as u64 != expected.applied_event_seq
-    {
-        return Err(PairedBackupError::CutpointSkew(format!(
-            "PG projection cursor (grp_epoch={},{},{},{}) != Raft cut (grp_epoch={},{},{},{})",
-            matched_cursor.group_epoch,
-            matched_cursor.applied_log_term,
-            matched_cursor.applied_log_index,
-            matched_cursor.applied_event_seq,
-            expected.group_epoch,
-            expected.applied_term,
-            expected.applied_index,
-            expected.applied_event_seq,
-        )));
-    }
-
     let repo_rows = tx
         .query(
             "SELECT r.id, r.owner_id, r.name, r.object_format, r.storage_backend, \
@@ -224,11 +155,6 @@ pub async fn capture_pg_cutpoint_in_tx(
         let repository_id: Uuid = row.get(0);
         let history_incarnation: Uuid = row.get(5);
         let group_epoch: i64 = row.get(7);
-        if history_incarnation != expected.history_incarnation || group_epoch != expected.group_epoch {
-            return Err(PairedBackupError::CutpointSkew(format!(
-                "PG repository {repository_id} (inc={history_incarnation}, group_epoch={group_epoch}) != Raft cut",
-            )));
-        }
         let ref_rows = tx
             .query(
                 "SELECT ref_name, oid FROM ref_store_core_refs WHERE repository_id = $1 ORDER BY ref_name",
@@ -256,7 +182,7 @@ pub async fn capture_pg_cutpoint_in_tx(
         });
     }
 
-    PgCutpointProof {
+    let proof = PgCutpointProof {
         schema_head_version: schema_head,
         wal_lsn,
         snapshot_tx,
@@ -272,5 +198,7 @@ pub async fn capture_pg_cutpoint_in_tx(
         repositories,
         cutpoint_digest: String::new(),
     }
-    .seal()
+    .seal()?;
+    verify_all_group_cursors(&proof, &expected.active, &expected.peers)?;
+    Ok(proof)
 }

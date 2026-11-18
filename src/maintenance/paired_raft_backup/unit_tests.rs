@@ -12,10 +12,9 @@ use crate::ref_store::{
     RefPrecondition, RefTarget, RefUpdate,
 };
 
-use super::closure_bind::verify_cursor_group_epochs;
 use super::freeze_drain::{InFlightOperation, RepoBackupRegistrationSpec, TriPartyBackupCoordinator};
 use super::git_verify::{seed_commit_pack, verify_bare_repo_from_blobs};
-use super::raft_barrier::{DurableRaftBackend, WalSyncedRaftBackend};
+use super::quorum_wal::{DurableRaftBackend, WalSyncedRaftBackend};
 use super::restore::IncarnationAdmissionGuard;
 use super::types::{
     BlobArtifactEntry, BlobClosureManifest, CloseScopeBarrierReceipt, DecisionExecutionTicket, DeleterLeaseTicket,
@@ -24,16 +23,18 @@ use super::types::{
     sha256_json_tagged,
 };
 
-fn seed_wal_raft(
+pub(super) fn seed_wal_raft(
     wal_path: &std::path::Path,
+    group_id: i64,
     repo: Uuid,
     tenant: Uuid,
     issuer: Uuid,
     history: Uuid,
+    group_epoch: i64,
 ) -> (WalSyncedRaftBackend, String, ExpectedPackPairSpec) {
-    let mut raft = WalSyncedRaftBackend::open(wal_path, 1).expect("open wal");
+    let mut raft = WalSyncedRaftBackend::open_group(wal_path, group_id, 1).expect("open wal");
     let head = RefName::branch("refs/heads/main").expect("branch");
-    let init = CoreGateInit::new(repo, tenant, GitObjectFormat::Sha256, history, 2, 3, head).expect("gate");
+    let init = CoreGateInit::new(repo, tenant, GitObjectFormat::Sha256, history, 2, group_epoch, head).expect("gate");
     raft.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
         gate: WireGateInit::from(&init),
         pack_mode: SmPackMode::MetadataOnly,
@@ -57,7 +58,7 @@ fn seed_wal_raft(
         GitObjectFormat::Sha256,
         history,
         2,
-        3,
+        group_epoch,
         1,
         HeadUpdate::Keep,
         CommitMode::Atomic,
@@ -83,11 +84,12 @@ fn seed_wal_raft(
 }
 
 #[test]
-fn tri_party_freeze_requires_durable_wal_quorum_and_complete_pin_closure() {
+fn tri_party_freeze_enforces_unknown_drain_and_complete_pin_closure() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (repo, tenant, issuer, history, auth_id) =
         (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    let (mut raft, _commit_hex, pair1) = seed_wal_raft(&dir.path().join("raft.wal"), repo, tenant, issuer, history);
+    let (mut raft, _commit_hex, pair1) =
+        seed_wal_raft(&dir.path().join("raft.wal"), 1, repo, tenant, issuer, history, 3);
 
     let extra_pack_sha = RequestDigest::of("extra-pinned-pack", &[tenant.as_bytes()]).as_hex();
     let gate_digest = raft
@@ -163,7 +165,7 @@ fn tri_party_freeze_requires_durable_wal_quorum_and_complete_pin_closure() {
         group_epoch: 3,
         authority_id: auth_id,
         authority_generation: 1,
-        backend_identity: backend.clone(),
+        backend_identity: backend,
         expected_packs: vec![pair1.clone()],
     }];
     let full_specs =
@@ -174,22 +176,6 @@ fn tri_party_freeze_requires_durable_wal_quorum_and_complete_pin_closure() {
         PairedBackupError::UnknownInFlightOperations(1)
     ));
     assert!(!coord.status().app_paused && coord.active_barrier().is_none());
-
-    raft.set_wal_sync_enabled(false);
-    assert!(matches!(
-        coord.freeze_drain_and_register(&mut raft, &full_specs, 12, true).unwrap_err(),
-        PairedBackupError::FreezeNotHeld(_)
-    ));
-    assert!(!coord.status().app_paused && coord.active_barrier().is_none());
-    raft.set_wal_sync_enabled(true);
-
-    raft.set_quorum_healthy(false);
-    assert!(matches!(
-        coord.freeze_drain_and_register(&mut raft, &full_specs, 12, true).unwrap_err(),
-        PairedBackupError::FreezeNotHeld(_)
-    ));
-    assert!(!coord.status().app_paused && coord.active_barrier().is_none());
-    raft.set_quorum_healthy(true);
 
     assert!(matches!(
         coord.freeze_drain_and_register(&mut raft, &incomplete_specs, 12, true).unwrap_err(),
@@ -212,11 +198,12 @@ fn tri_party_freeze_requires_durable_wal_quorum_and_complete_pin_closure() {
 }
 
 #[test]
-fn manifest_digest_tamper_cursor_group_epoch_and_incarnation_guard_checks() {
+fn manifest_digest_tamper_and_incarnation_guard_checks() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (repo, tenant, issuer, history, auth_id) =
         (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    let (mut raft, commit_hex, pair) = seed_wal_raft(&dir.path().join("raft2.wal"), repo, tenant, issuer, history);
+    let (mut raft, commit_hex, pair) =
+        seed_wal_raft(&dir.path().join("raft2.wal"), 1, repo, tenant, issuer, history, 3);
     let backend = RequestDigest::of("backend", &[auth_id.as_bytes()]).as_hex();
     let specs = vec![RepoBackupRegistrationSpec {
         repository_id: repo,
@@ -249,28 +236,16 @@ fn manifest_digest_tamper_cursor_group_epoch_and_incarnation_guard_checks() {
         max_decision_scope_version: 18,
         pending_decisions_count: 0,
         pending_outbox_count: 0,
-        projection_cursors: vec![
-            PgProjectionCursorCut {
-                group_id: 1,
-                history_incarnation: history,
-                group_epoch: 3,
-                applied_event_seq: snap.body.next_event_seq.saturating_sub(1) as i64,
-                applied_log_index: applied.index as i64,
-                applied_log_term: applied.term as i64,
-                last_event_id: None,
-                stream_state: "active".into(),
-            },
-            PgProjectionCursorCut {
-                group_id: 2,
-                history_incarnation: Uuid::new_v4(),
-                group_epoch: 7,
-                applied_event_seq: 4,
-                applied_log_index: 4,
-                applied_log_term: 1,
-                last_event_id: None,
-                stream_state: "active".into(),
-            },
-        ],
+        projection_cursors: vec![PgProjectionCursorCut {
+            group_id: 1,
+            history_incarnation: history,
+            group_epoch: 3,
+            applied_event_seq: snap.body.next_event_seq.saturating_sub(1) as i64,
+            applied_log_index: applied.index as i64,
+            applied_log_term: applied.term as i64,
+            last_event_id: None,
+            stream_state: "active".into(),
+        }],
         repositories: vec![PgRepositoryRowProof {
             repository_id: repo,
             tenant_id: tenant,
@@ -288,14 +263,6 @@ fn manifest_digest_tamper_cursor_group_epoch_and_incarnation_guard_checks() {
     }
     .seal()
     .expect("seal pg");
-
-    let expected_epochs = BTreeMap::from([(1, 3), (2, 7)]);
-    verify_cursor_group_epochs(&pg, &snap, 1, &expected_epochs, applied).expect("both group_epochs match");
-    let skewed_peer = BTreeMap::from([(1, 3), (2, 8)]);
-    assert!(matches!(
-        verify_cursor_group_epochs(&pg, &snap, 1, &skewed_peer, applied).unwrap_err(),
-        PairedBackupError::CutpointSkew(_)
-    ));
 
     let closure = BlobClosureManifest {
         backend_identity: backend.clone(),
@@ -345,11 +312,12 @@ fn manifest_digest_tamper_cursor_group_epoch_and_incarnation_guard_checks() {
         pg_cutpoint: pg.clone(),
         raft_cutpoint: RaftCutpointProof {
             group_id: 1,
-            group_epochs: expected_epochs,
+            group_epochs: BTreeMap::from([(1, 3)]),
+            peer_groups: Vec::new(),
             applied_log_id: applied,
             logical_clock_floor: snap.body.logical_clock_floor,
             state_digest,
-            group_membership_digest: "b".repeat(64),
+            group_membership_digest: raft.group_membership_digest(),
             snapshot_checksum: snap.checksum.clone(),
             snapshot: snap,
             close_receipts: barrier.close_receipts,

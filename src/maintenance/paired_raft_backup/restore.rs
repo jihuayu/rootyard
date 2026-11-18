@@ -1,4 +1,4 @@
-//! Archive verification, clean-room new-incarnation restore, stock-Git clone/fsck,
+//! Archive verification, clean-room multi-group new-incarnation restore, stock-Git clone/fsck,
 //! and fail-closed stale credential/grant/decision/deleter admission (#153).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,16 +20,19 @@ use crate::ref_store::{
     CommitMode, CommitRefsRequest, CoreGateInit, HeadUpdate, IssuerLane, RefName, RefPrecondition, RefTarget, RefUpdate,
 };
 
+pub use super::admission_guard::IncarnationAdmissionGuard;
 use super::backup::{reconcile_pg_raft_repositories, stream_sha256_file};
-use super::closure_bind::{verify_blob_closure_against_durable_raft, verify_cursor_group_epochs};
+use super::closure_bind::verify_blob_closure_against_durable_raft;
 use super::freeze_drain::{RepoBackupRegistrationSpec, TriPartyBackupCoordinator};
 use super::git_verify::verify_bare_repo_from_blobs;
+use super::peer_groups::{
+    ExpectedGroupCursorCut, restore_peer_groups_state, verify_all_group_cursors, verify_archived_peer_groups,
+};
 use super::pg_restore_admission::{install_restored_pg_incarnation, verify_pg_restored_cursors};
-use super::raft_barrier::{DurableRaftBackend, WalSyncedRaftBackend};
+use super::quorum_wal::{DurableRaftBackend, WalSyncedRaftBackend};
 use super::types::{
-    COMPLETE_MARKER, DecisionExecutionTicket, DeleterLeaseTicket, ExpectedPackPairSpec, MANIFEST_FILE,
-    MAX_MANIFEST_BYTES, NewIncarnationAuthority, PAIRED_BACKUP_FORMAT_V1, PairedBackupError, PairedBackupManifest,
-    RestoreOutcome, WriterGrantTicket,
+    COMPLETE_MARKER, ExpectedPackPairSpec, MANIFEST_FILE, MAX_MANIFEST_BYTES, NewIncarnationAuthority,
+    PAIRED_BACKUP_FORMAT_V1, PairedBackupError, PairedBackupManifest, RestoreOutcome,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -39,74 +42,8 @@ pub struct RestoreTargetScope {
     pub expected_backend_identity: Option<String>,
 }
 
-/// Fail-closed guard loaded into a restored cluster to refuse pre-backup credentials.
-#[derive(Clone, Debug)]
-pub struct IncarnationAdmissionGuard {
-    pub live: NewIncarnationAuthority,
-}
-
-impl IncarnationAdmissionGuard {
-    pub fn verify_writer_grant(&self, ticket: &WriterGrantTicket) -> Result<(), PairedBackupError> {
-        if ticket.cluster_incarnation != self.live.new_cluster_incarnation
-            || self.live.fenced_prior_incarnations.contains(&ticket.cluster_incarnation)
-        {
-            return Err(PairedBackupError::StaleIncarnation {
-                field: "cluster_incarnation",
-                expected: self.live.new_cluster_incarnation.to_string(),
-                got: ticket.cluster_incarnation.to_string(),
-            });
-        }
-        if ticket.history_incarnation != self.live.new_history_incarnation
-            || self.live.fenced_prior_incarnations.contains(&ticket.history_incarnation)
-        {
-            return Err(PairedBackupError::StaleIncarnation {
-                field: "history_incarnation",
-                expected: self.live.new_history_incarnation.to_string(),
-                got: ticket.history_incarnation.to_string(),
-            });
-        }
-        if ticket.authority_epoch < self.live.new_authority_epoch || ticket.group_epoch < self.live.new_group_epoch {
-            return Err(PairedBackupError::StaleGrantRefused(
-                "authority_epoch or group_epoch from pre-backup incarnation",
-            ));
-        }
-        if ticket.authz_epoch < self.live.new_authz_floor {
-            return Err(PairedBackupError::StaleGrantRefused("authz_epoch below restored authz_floor"));
-        }
-        Ok(())
-    }
-
-    pub fn verify_decision_execution(&self, ticket: &DecisionExecutionTicket) -> Result<(), PairedBackupError> {
-        if self.live.fenced_pre_backup_decision_ids.contains(&ticket.decision_id) {
-            return Err(PairedBackupError::StaleDecisionRefused(ticket.decision_id));
-        }
-        if ticket.history_incarnation != self.live.new_history_incarnation
-            || ticket.authority_epoch < self.live.new_authority_epoch
-            || ticket.group_epoch < self.live.new_group_epoch
-            || ticket.authz_epoch < self.live.new_authz_floor
-        {
-            return Err(PairedBackupError::StaleDecisionRefused(ticket.decision_id));
-        }
-        Ok(())
-    }
-
-    pub fn verify_deleter_lease(&self, ticket: &DeleterLeaseTicket) -> Result<(), PairedBackupError> {
-        if ticket.cluster_incarnation != self.live.new_cluster_incarnation
-            || ticket.storage_authority_id != self.live.new_storage_authority_id
-        {
-            return Err(PairedBackupError::StaleDeleterRefused("deleter belongs to pre-backup cluster/authority"));
-        }
-        if ticket.storage_generation < self.live.new_storage_generation
-            || ticket.deleter_epoch < self.live.new_deleter_epoch
-        {
-            return Err(PairedBackupError::StaleDeleterRefused("deleter generation/epoch superseded by restore"));
-        }
-        Ok(())
-    }
-}
-
-/// Strictly verify `COMPLETE` seal, manifest integrity, PG <-> Raft `group_epoch` + index cutpoint,
-/// scope close receipts, complete durable hold/root/pin Blob closure, and archived Blob SHA-256s.
+/// Strictly verify `COMPLETE` seal, manifest integrity, active + peer durable Raft snapshots,
+/// PG <-> Raft `group_epoch` + index cursors, complete durable hold/root/pin Blob closure, and Blob SHA-256s.
 pub fn verify_backup_archive(
     source: &Path,
     expected_backend_identity: Option<&str>,
@@ -161,17 +98,19 @@ pub fn verify_backup_archive(
     {
         return Err(PairedBackupError::CutpointSkew("Raft snapshot last_applied or checksum mismatch".into()));
     }
+    let rebuilt_active =
+        RefCasStateMachine::restore(&raft.snapshot).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+    if rebuilt_active.state_digest().map_err(|e| PairedBackupError::StateMachine(e.to_string()))? != raft.state_digest {
+        return Err(PairedBackupError::CutpointSkew("active Raft state_digest mismatches snapshot".into()));
+    }
     if raft.close_receipts.is_empty() || raft.backup_holds.is_empty() {
         return Err(PairedBackupError::IncompleteCut("manifest missing close barrier receipts or backup holds"));
     }
 
-    verify_cursor_group_epochs(
-        &manifest.pg_cutpoint,
-        &raft.snapshot,
-        raft.group_id,
-        &raft.group_epochs,
-        raft.applied_log_id,
-    )?;
+    let active_cut = ExpectedGroupCursorCut::from_verified_snapshot(raft.group_id, &raft.snapshot)?;
+    let peer_cuts =
+        verify_archived_peer_groups(raft.group_id, active_cut.group_epoch, &raft.group_epochs, &raft.peer_groups)?;
+    verify_all_group_cursors(&manifest.pg_cutpoint, &active_cut, &peer_cuts)?;
     reconcile_pg_raft_repositories(&manifest.pg_cutpoint, &raft.snapshot, raft.applied_log_id, &raft.close_receipts)?;
     verify_blob_closure_against_durable_raft(
         &raft.snapshot,
@@ -203,7 +142,7 @@ pub fn verify_backup_archive(
 
 /// Clean-room restore creating a strictly fresh incarnation (`history_incarnation`,
 /// `cluster_incarnation`, bumped epochs & `authz_floor`), uploading verified blobs into `target_store`,
-/// checking real `git clone` + `git fsck --full --strict`, and committing via fsynced WAL.
+/// checking real `git clone` + `git fsck --full --strict`, and committing via 3-voter fsynced WAL.
 pub async fn restore_new_incarnation(
     source: &Path,
     work_dir: &Path,
@@ -211,6 +150,26 @@ pub async fn restore_new_incarnation(
     scope: &RestoreTargetScope,
     deadline: Instant,
 ) -> Result<(RestoreOutcome, RefCasStateMachine, IncarnationAdmissionGuard), PairedBackupError> {
+    let (out, sm, guard, _peers) =
+        restore_new_incarnation_full(source, work_dir, target_store, scope, deadline).await?;
+    Ok((out, sm, guard))
+}
+
+async fn restore_new_incarnation_full(
+    source: &Path,
+    work_dir: &Path,
+    target_store: &BlobStore,
+    scope: &RestoreTargetScope,
+    deadline: Instant,
+) -> Result<
+    (
+        RestoreOutcome,
+        RefCasStateMachine,
+        IncarnationAdmissionGuard,
+        BTreeMap<i64, crate::ref_store::core::state_machine::RefCasSnapshot>,
+    ),
+    PairedBackupError,
+> {
     let manifest = verify_backup_archive(source, scope.expected_backend_identity.as_deref())?;
     let target_backend = target_store.backend_identity().as_hex();
     if manifest.blob_closure.backend_identity != target_backend {
@@ -251,6 +210,7 @@ pub async fn restore_new_incarnation(
         .raft_cutpoint
         .close_receipts
         .iter()
+        .chain(manifest.raft_cutpoint.peer_groups.iter().flat_map(|p| p.freeze_barrier.close_receipts.iter()))
         .map(|r| r.authz_floor)
         .max()
         .unwrap_or(1)
@@ -261,6 +221,9 @@ pub async fn restore_new_incarnation(
     ]);
     for r in &manifest.pg_cutpoint.repositories {
         fenced_inc.insert(r.history_incarnation);
+    }
+    for p in &manifest.raft_cutpoint.peer_groups {
+        fenced_inc.insert(p.history_incarnation);
     }
     let fenced_decisions: BTreeSet<Uuid> =
         manifest.raft_cutpoint.snapshot.body.decisions.iter().map(|d| d.decision_id).collect();
@@ -301,7 +264,7 @@ pub async fn restore_new_incarnation(
     if wal_path.exists() {
         fs::remove_file(&wal_path)?;
     }
-    let mut wal_raft = WalSyncedRaftBackend::open(&wal_path, 1)?;
+    let mut wal_raft = WalSyncedRaftBackend::open_group(&wal_path, manifest.raft_cutpoint.group_id, 1)?;
     let mut specs = Vec::with_capacity(manifest.pg_cutpoint.repositories.len());
 
     for repo in &manifest.pg_cutpoint.repositories {
@@ -440,6 +403,7 @@ pub async fn restore_new_incarnation(
     let (durable_snap, _) = wal_raft.durable_state()?;
     durable_snap.verify_integrity().map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
 
+    let restored_peers = restore_peer_groups_state(work_dir, &manifest.raft_cutpoint.peer_groups, &inc)?;
     let guard = IncarnationAdmissionGuard { live: inc.clone() };
     let outcome = RestoreOutcome {
         backup_id: manifest.backup_id,
@@ -449,11 +413,11 @@ pub async fn restore_new_incarnation(
         git_verified_refs,
         incarnation: inc,
     };
-    Ok((outcome, wal_raft.into_state_machine(), guard))
+    Ok((outcome, wal_raft.into_state_machine(), guard, restored_peers))
 }
 
-/// Clean-room restore also persisting new-incarnation state, `authz_floor` scopes,
-/// and verified `group_epoch` cursors into PostgreSQL 17.
+/// Clean-room restore also persisting new-incarnation state, `authz_floor` + `deleter_epoch`
+/// floors, and verified active + peer `group_epoch` cursors into PostgreSQL 17.
 pub async fn restore_new_incarnation_with_pg(
     source: &Path,
     work_dir: &Path,
@@ -463,7 +427,8 @@ pub async fn restore_new_incarnation_with_pg(
     deadline: Instant,
 ) -> Result<(RestoreOutcome, RefCasStateMachine, IncarnationAdmissionGuard), PairedBackupError> {
     let manifest = verify_backup_archive(source, scope.expected_backend_identity.as_deref())?;
-    let (outcome, sm, guard) = restore_new_incarnation(source, work_dir, target_store, scope, deadline).await?;
+    let (outcome, sm, guard, restored_peers) =
+        restore_new_incarnation_full(source, work_dir, target_store, scope, deadline).await?;
     let restored_snap = sm.snapshot().map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
     install_restored_pg_incarnation(
         pg_client,
@@ -471,9 +436,9 @@ pub async fn restore_new_incarnation_with_pg(
         &outcome.incarnation,
         manifest.raft_cutpoint.group_id,
         &restored_snap,
+        &restored_peers,
     )
     .await?;
-    let expected_group_ids: Vec<i64> = manifest.pg_cutpoint.projection_cursors.iter().map(|c| c.group_id).collect();
-    verify_pg_restored_cursors(pg_client, &expected_group_ids, manifest.raft_cutpoint.group_id, &restored_snap).await?;
+    verify_pg_restored_cursors(pg_client, manifest.raft_cutpoint.group_id, &restored_snap, &restored_peers).await?;
     Ok((outcome, sm, guard))
 }

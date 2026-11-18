@@ -76,20 +76,29 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         ):
             self.assertIn(token, types_src)
 
-        barrier_src = (MOD_DIR / "raft_barrier.rs").read_text(encoding="utf-8")
+        barrier_src = (MOD_DIR / "raft_barrier.rs").read_text(encoding="utf-8") + (
+            MOD_DIR / "quorum_wal.rs"
+        ).read_text(encoding="utf-8")
         for token in (
             "DurableRaftBackend",
             "WalSyncedRaftBackend",
+            "QuorumCommitReceipt",
+            "LocalWalApplyReceipt",
+            "VoterWalAck",
             "DurableFreezeBarrierProof",
             "SealedArchiveReceipt",
             "sync_data",
         ):
             self.assertIn(token, barrier_src)
 
-        bind_src = (MOD_DIR / "closure_bind.rs").read_text(encoding="utf-8")
+        bind_src = (MOD_DIR / "closure_bind.rs").read_text(encoding="utf-8") + (
+            MOD_DIR / "peer_groups.rs"
+        ).read_text(encoding="utf-8")
         for token in (
             "compute_canonical_pack_set_digest",
-            "verify_cursor_group_epochs",
+            "PeerRaftCutpointProof",
+            "verify_archived_peer_groups",
+            "verify_all_group_cursors",
             "verify_blob_closure_against_durable_raft",
             "verify_registration_spec_completeness",
         ):
@@ -110,7 +119,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         backup_src = (MOD_DIR / "backup.rs").read_text(encoding="utf-8")
         self.assertIn("IsolationLevel::RepeatableRead", backup_src)
         self.assertIn("verify_blob_closure_against_durable_raft", backup_src)
-        self.assertIn("verify_cursor_group_epochs", backup_src)
+        self.assertIn("verify_all_group_cursors", backup_src)
 
         pg_src = (MOD_DIR / "pg_cutpoint.rs").read_text(encoding="utf-8") + (
             MOD_DIR / "pg_restore_admission.rs"

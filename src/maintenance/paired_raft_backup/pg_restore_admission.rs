@@ -1,5 +1,7 @@
-//! PostgreSQL 17 clean-room new-incarnation restore persistence, cursor `group_epoch`
-//! verification, and restored `ref_store_decision_scopes` `authz_epoch` floor admission (#153).
+//! PostgreSQL 17 clean-room new-incarnation restore persistence, multi-group cursor
+//! verification, and restored `authz_epoch` + `deleter_epoch` floor admission (#153).
+
+use std::collections::BTreeMap;
 
 use tokio_postgres::Client;
 use uuid::Uuid;
@@ -14,19 +16,24 @@ use super::types::{
 };
 
 /// Restore clean-room PG 17 tables under a strictly new incarnation, rotate authority,
-/// persist `ref_store_decision_scopes` `authz_floor`, and align `ref_cas_projection_cursors`.
+/// persist `ref_store_decision_scopes` `authz_floor` + `deleter_epoch` floor, and align
+/// `ref_cas_projection_cursors` across active AND restored peer Raft groups.
 pub async fn install_restored_pg_incarnation(
     client: &mut Client,
     manifest: &PairedBackupManifest,
     inc: &NewIncarnationAuthority,
     restored_group_id: i64,
     restored_snap: &RefCasSnapshot,
+    restored_peer_snaps: &BTreeMap<i64, RefCasSnapshot>,
 ) -> Result<(), PairedBackupError> {
-    let restored_last = restored_snap
-        .body
-        .last_applied
-        .ok_or(PairedBackupError::IncompleteCut("restored Raft snapshot missing last_applied"))?;
-    let restored_seq = restored_snap.body.next_event_seq.saturating_sub(1) as i64;
+    let mut all_restored_snaps = restored_peer_snaps.clone();
+    all_restored_snaps.insert(restored_group_id, restored_snap.clone());
+    for cur in &manifest.pg_cutpoint.projection_cursors {
+        if !all_restored_snaps.contains_key(&cur.group_id) {
+            return Err(PairedBackupError::IncompleteCut("missing restored durable Raft snapshot for PG cursor group"));
+        }
+    }
+    let deleter_floor_i64 = i64::try_from(inc.new_deleter_epoch).unwrap_or(i64::MAX);
 
     let tx = client.transaction().await.map_err(pg_err)?;
     tx.batch_execute(
@@ -52,12 +59,13 @@ pub async fn install_restored_pg_incarnation(
     let storage_row = tx
         .query_one(
             "UPDATE pando_storage_authorities \
-             SET authority_id = $1, generation = $2, restore_generation = restore_generation + 1, \
+             SET authority_id = $1, generation = $2, \
+                 restore_generation = GREATEST(restore_generation + 1, $4), \
                  authority_epoch = $3, remote_delete_fenced = false, remote_delete_fence_reason = NULL, \
                  rotated_at = clock_timestamp() \
              WHERE singleton = true \
              RETURNING restore_generation",
-            &[&inc.new_storage_authority_id, &inc.new_storage_generation, &inc.new_authority_epoch],
+            &[&inc.new_storage_authority_id, &inc.new_storage_generation, &inc.new_authority_epoch, &deleter_floor_i64],
         )
         .await
         .map_err(pg_err)?;
@@ -190,15 +198,19 @@ pub async fn install_restored_pg_incarnation(
     }
 
     for cur in &manifest.pg_cutpoint.projection_cursors {
-        let (ev_seq, log_idx, log_term) = if cur.group_id == restored_group_id {
-            (restored_seq, restored_last.index as i64, restored_last.term as i64)
-        } else {
-            (0i64, 0i64, 1i64)
-        };
+        let gsnap = all_restored_snaps
+            .get(&cur.group_id)
+            .ok_or(PairedBackupError::IncompleteCut("missing restored group snapshot"))?;
+        let glast = gsnap
+            .body
+            .last_applied
+            .ok_or(PairedBackupError::IncompleteCut("restored group snapshot missing last_applied"))?;
+        let gseq = gsnap.body.next_event_seq.saturating_sub(1) as i64;
+        let (log_idx, log_term) = (glast.index as i64, glast.term as i64);
         tx.execute(
             "INSERT INTO ref_cas_projection_cursors(group_id, history_incarnation, group_epoch, applied_event_seq, applied_log_index, applied_log_term, last_event_id, stream_state) \
              VALUES($1, $2, $3, $4, $5, $6, NULL, 'active')",
-            &[&cur.group_id, &inc.new_history_incarnation, &inc.new_group_epoch, &ev_seq, &log_idx, &log_term],
+            &[&cur.group_id, &inc.new_history_incarnation, &inc.new_group_epoch, &gseq, &log_idx, &log_term],
         )
         .await
         .map_err(pg_err)?;
@@ -208,19 +220,16 @@ pub async fn install_restored_pg_incarnation(
     Ok(())
 }
 
-/// Verify restored PG `ref_cas_projection_cursors` `group_epoch` equality across all Raft groups.
+/// Verify restored PG `ref_cas_projection_cursors` `(history_incarnation, group_epoch, seq, index, term)`
+/// against each group's actual restored durable `RefCasSnapshot`.
 pub async fn verify_pg_restored_cursors(
     client: &Client,
-    expected_group_ids: &[i64],
     restored_group_id: i64,
     restored_snap: &RefCasSnapshot,
+    restored_peer_snaps: &BTreeMap<i64, RefCasSnapshot>,
 ) -> Result<(), PairedBackupError> {
-    let (raft_inc, raft_grp_epoch) = extract_raft_group_realm(restored_snap)?;
-    let restored_last = restored_snap
-        .body
-        .last_applied
-        .ok_or(PairedBackupError::IncompleteCut("restored snapshot missing last_applied"))?;
-    let expected_seq = restored_snap.body.next_event_seq.saturating_sub(1) as i64;
+    let mut expected_snaps = restored_peer_snaps.clone();
+    expected_snaps.insert(restored_group_id, restored_snap.clone());
     let rows = client
         .query(
             "SELECT group_id, history_incarnation, group_epoch, applied_event_seq, applied_log_index, applied_log_term, stream_state \
@@ -229,30 +238,38 @@ pub async fn verify_pg_restored_cursors(
         )
         .await
         .map_err(pg_err)?;
-    if rows.len() != expected_group_ids.len() {
-        return Err(PairedBackupError::CutpointSkew("restored PG cursor count mismatches Raft groups".into()));
+    if rows.len() != expected_snaps.len() {
+        return Err(PairedBackupError::CutpointSkew("restored PG cursor count mismatches restored Raft groups".into()));
     }
     for row in rows {
         let (gid, hinc, gepoch, seq, idx, term, st): (i64, Uuid, i64, i64, i64, i64, String) =
             (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4), row.get(5), row.get(6));
-        if !expected_group_ids.contains(&gid) || hinc != raft_inc || gepoch != raft_grp_epoch || st != "active" {
-            return Err(PairedBackupError::CutpointSkew(format!(
-                "restored PG cursor group {gid} (inc={hinc}, group_epoch={gepoch}, state={st}) skewed from Raft"
-            )));
-        }
-        if gid == restored_group_id
-            && (seq != expected_seq || idx != restored_last.index as i64 || term != restored_last.term as i64)
+        let Some(gsnap) = expected_snaps.get(&gid) else {
+            return Err(PairedBackupError::CutpointSkew(format!("unexpected restored PG cursor group {gid}")));
+        };
+        let (raft_inc, raft_grp_epoch) = extract_raft_group_realm(gsnap)?;
+        let glast = gsnap
+            .body
+            .last_applied
+            .ok_or(PairedBackupError::IncompleteCut("restored group snapshot missing last_applied"))?;
+        let expected_seq = gsnap.body.next_event_seq.saturating_sub(1) as i64;
+        if hinc != raft_inc
+            || gepoch != raft_grp_epoch
+            || seq != expected_seq
+            || idx != glast.index as i64
+            || term != glast.term as i64
+            || st != "active"
         {
-            return Err(PairedBackupError::CutpointSkew(
-                "restored PG cursor log index/term/seq skewed from Raft".into(),
-            ));
+            return Err(PairedBackupError::CutpointSkew(format!(
+                "restored PG cursor group {gid} (inc={hinc}, grp_epoch={gepoch}, term={term}, idx={idx}, seq={seq}) skewed from restored Raft"
+            )));
         }
     }
     Ok(())
 }
 
 /// Fail-closed SQL admission check enforcing restored `cluster_incarnation`, `history_incarnation`,
-/// `authority_epoch`, `group_epoch`, AND `ref_store_decision_scopes` restored `authz_epoch` floor.
+/// `authority_epoch`, `group_epoch`, `ref_store_decision_scopes` `authz_epoch` floor, AND `deleter_epoch` floor.
 pub async fn verify_pg_live_incarnation(
     client: &Client,
     repository_id: Uuid,
@@ -274,14 +291,14 @@ pub async fn verify_pg_live_incarnation(
     }
     let auth_row = client
         .query_one(
-            "SELECT authority_id, generation, authority_epoch, remote_delete_fenced \
+            "SELECT authority_id, generation, restore_generation, authority_epoch, remote_delete_fenced \
              FROM pando_storage_authorities WHERE singleton = true",
             &[],
         )
         .await
         .map_err(pg_err)?;
-    let (live_auth_id, auth_gen, storage_auth_e, fenced): (Uuid, i64, i64, bool) =
-        (auth_row.get(0), auth_row.get(1), auth_row.get(2), auth_row.get(3));
+    let (live_auth_id, auth_gen, restore_gen, storage_auth_e, fenced): (Uuid, i64, i64, i64, bool) =
+        (auth_row.get(0), auth_row.get(1), auth_row.get(2), auth_row.get(3), auth_row.get(4));
 
     let gate_row = client
         .query_one(
@@ -352,10 +369,12 @@ pub async fn verify_pg_live_incarnation(
         && (fenced
             || del.storage_authority_id != live_auth_id
             || del.storage_generation < auth_gen
+            || restore_gen <= 0
+            || del.deleter_epoch < restore_gen as u64
             || del.cluster_incarnation != cluster_inc)
     {
         return Err(PairedBackupError::StaleDeleterRefused(
-            "deleter authority/generation/cluster_incarnation rejected by PG",
+            "deleter authority/generation/deleter_epoch/cluster_incarnation rejected by PG",
         ));
     }
     Ok(())

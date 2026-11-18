@@ -1,4 +1,4 @@
-//! Shared LoopbackS3 + 2-pack-pair durable WAL fixture for `#153` integration tests.
+//! Shared LoopbackS3 + 2-pack-pair + multi-group durable 3-voter WAL fixture for `#153` tests.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,11 +19,11 @@ use rootyard::blob_store::capacity_contract::git_ops::{UploadScope, upload_pack_
 use rootyard::blob_store::{config::BlobProfile, opendal::BlobStore};
 use rootyard::db;
 use rootyard::maintenance::paired_raft_backup::{
-    DeleterLeaseTicket, DurableFreezeBarrierProof, DurableRaftBackend, ExpectedPackPairSpec, PairedBackupError,
-    PairedBackupManifest, PairedBackupRequest, PgCutpointProof, PgProjectionCursorCut, PgRepositoryRowProof,
-    PreparedBlobArtifact, RepoBackupRegistrationSpec, SealedArchiveReceipt, TriPartyBackupCoordinator,
-    WalSyncedRaftBackend, WriterGrantTicket, create_paired_backup, git_verify::seed_commit_pack,
-    types::sha256_json_tagged,
+    DeleterLeaseTicket, DurableFreezeBarrierProof, DurableRaftBackend, ExpectedGroupCursorCut, ExpectedPackPairSpec,
+    PairedBackupError, PairedBackupManifest, PairedBackupRequest, PeerGroupBackupInput, PgCutpointProof,
+    PgProjectionCursorCut, PgRepositoryRowProof, PreparedBlobArtifact, RepoBackupRegistrationSpec,
+    SealedArchiveReceipt, TriPartyBackupCoordinator, WalSyncedRaftBackend, WriterGrantTicket, create_paired_backup,
+    git_verify::seed_commit_pack, types::sha256_json_tagged,
 };
 use rootyard::ref_store::core::state_machine::{
     CommitRefsCommand, InitializeGateCommand, RefCasCommand, RepositoryLane, SmPackMode, WireCommitRefsRequest,
@@ -136,6 +136,19 @@ pub struct Fixture {
     pub artifacts: Vec<PreparedBlobArtifact>,
 }
 
+pub struct PeerGroupFixture {
+    pub group_id: i64,
+    pub cut: ExpectedGroupCursorCut,
+    pub raft: WalSyncedRaftBackend,
+    pub barrier: DurableFreezeBarrierProof,
+}
+
+impl PeerGroupFixture {
+    pub fn as_input(&self) -> PeerGroupBackupInput<'_> {
+        PeerGroupBackupInput { group_id: self.group_id, freeze_barrier: &self.barrier, raft: &self.raft }
+    }
+}
+
 pub fn dl() -> Instant {
     Instant::now() + Duration::from_secs(45)
 }
@@ -160,13 +173,12 @@ pub fn mk_req<'a>(
     dir: &'a Path,
     dest: &'a Path,
     arts: Vec<PreparedBlobArtifact>,
-    peer_group_epochs: BTreeMap<i64, i64>,
+    peer_groups: Vec<PeerGroupBackupInput<'a>>,
 ) -> PairedBackupRequest<'a> {
     PairedBackupRequest {
         backup_id: Uuid::new_v4(),
         group_id: 1,
-        peer_group_epochs,
-        group_membership_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        peer_groups,
         freeze_barrier: &f.barrier,
         raft: &f.raft,
         artifacts: arts,
@@ -186,7 +198,65 @@ pub async fn try_backup(
     pg: Option<&PgCutpointProof>,
 ) -> std::result::Result<(PairedBackupManifest, SealedArchiveReceipt), PairedBackupError> {
     let dest = dir.join(name);
-    create_paired_backup(mk_req(f, s, dir, &dest, arts, BTreeMap::new()), pg).await
+    create_paired_backup(mk_req(f, s, dir, &dest, arts, Vec::new()), pg).await
+}
+
+pub fn build_peer_group_fixture(
+    dir: &Path,
+    group_id: i64,
+    group_epoch: i64,
+    authority: Uuid,
+) -> Result<PeerGroupFixture> {
+    let (repo, tenant, issuer, history) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let mut raft = WalSyncedRaftBackend::open_group(dir.join(format!("peer-{group_id}.wal")), group_id, 1)?;
+    let init = CoreGateInit::new(
+        repo,
+        tenant,
+        GitObjectFormat::Sha256,
+        history,
+        2,
+        group_epoch,
+        RefName::branch("refs/heads/main")?,
+    )?;
+    raft.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
+        gate: WireGateInit::from(&init),
+        pack_mode: SmPackMode::MetadataOnly,
+        lane: RepositoryLane::ServingRefStore,
+        authz_floor: 5,
+    }))?;
+    let upd = RefUpdate::new(
+        RefName::new("refs/heads/main")?,
+        RefPrecondition::Absent,
+        RefTarget::Oid(GitOid::parse(GitObjectFormat::Sha256, &"b".repeat(64))?),
+    );
+    let req = CommitRefsRequest::new(
+        repo,
+        tenant,
+        issuer,
+        IssuerLane::new("peer")?,
+        1,
+        Uuid::new_v4(),
+        GitObjectFormat::Sha256,
+        history,
+        2,
+        group_epoch,
+        1,
+        HeadUpdate::Keep,
+        CommitMode::Atomic,
+        vec![upd],
+    )?;
+    raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
+        request: WireCommitRefsRequest::from(&req),
+        decision_id: None,
+        required_holds: Vec::new(),
+        policy_rejects: BTreeMap::new(),
+        logical_tick: 10,
+    }))?;
+    let mut coord = TriPartyBackupCoordinator::new(7, 4);
+    let barrier = coord.freeze_peer_group_and_close(&mut raft, &[(repo, tenant, authority)], 15)?;
+    let (snap, _) = raft.durable_state()?;
+    let cut = ExpectedGroupCursorCut::from_verified_snapshot(group_id, &snap)?;
+    Ok(PeerGroupFixture { group_id, cut, raft, barrier })
 }
 
 pub async fn build_fixture(store: &BlobStore, dir: &Path, fmt: GitObjectFormat) -> Result<Fixture> {
@@ -200,7 +270,7 @@ pub async fn build_fixture(store: &BlobStore, dir: &Path, fmt: GitObjectFormat) 
     let up1 = upload_pack_pair(store, scope, &p1_path, &i1_path, dl()).await?;
     let up2 = upload_pack_pair(store, scope, &p2_path, &i2_path, dl()).await?;
 
-    let mut raft = WalSyncedRaftBackend::open(dir.join("raft.wal"), 1)?;
+    let mut raft = WalSyncedRaftBackend::open_group(dir.join("raft.wal"), 1, 1)?;
     let init = CoreGateInit::new(repo, tenant, fmt, history, 2, 3, RefName::branch("refs/heads/main")?)?;
     raft.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
         gate: WireGateInit::from(&init),

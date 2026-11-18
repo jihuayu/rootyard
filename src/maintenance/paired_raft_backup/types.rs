@@ -10,6 +10,8 @@ use uuid::Uuid;
 use crate::ref_store::GitObjectFormat;
 use crate::ref_store::core::state_machine::{AppliedLogId, RefCasSnapshot, ScopeLifecycle};
 
+use super::peer_groups::PeerRaftCutpointProof;
+
 pub const PAIRED_BACKUP_FORMAT_V1: &str = "rootyard-paired-pg-raft-blob-v1";
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const COMPLETE_MARKER: &str = "COMPLETE";
@@ -292,6 +294,7 @@ impl PgCutpointProof {
 pub struct RaftCutpointProof {
     pub group_id: i64,
     pub group_epochs: BTreeMap<i64, i64>,
+    pub peer_groups: Vec<PeerRaftCutpointProof>,
     pub applied_log_id: AppliedLogId,
     pub logical_clock_floor: u64,
     pub state_digest: String,

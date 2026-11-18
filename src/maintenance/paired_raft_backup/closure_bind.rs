@@ -5,11 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use uuid::Uuid;
 
-use crate::ref_store::core::state_machine::{AppliedLogId, RefCasSnapshot, SmHoldState, SmPinState, SmRootState};
+use crate::ref_store::core::state_machine::{RefCasSnapshot, SmHoldState, SmPinState, SmRootState};
 
 use super::types::{
-    BackupRetentionHoldRecord, BlobArtifactEntry, ExpectedPackPairSpec, PairedBackupError, PgCutpointProof,
-    PgRepositoryRowProof, sha256_json_tagged, validate_hex64,
+    BackupRetentionHoldRecord, BlobArtifactEntry, ExpectedPackPairSpec, PairedBackupError, PgRepositoryRowProof,
+    sha256_json_tagged, validate_hex64,
 };
 
 /// Domain-tagged 64-hex SHA-256 over the canonical sorted set of paired `(pack, idx)` artifacts.
@@ -104,88 +104,6 @@ pub fn extract_raft_group_realm(snap: &RefCasSnapshot) -> Result<(Uuid, i64), Pa
         }
     }
     Ok((first.history_incarnation, first.group_epoch))
-}
-
-/// Verify PG <-> Raft cursor `(history_incarnation, group_epoch, index, term, event_seq)` alignment
-/// and `group_epoch` equality across all Raft groups.
-pub fn verify_cursor_group_epochs(
-    pg: &PgCutpointProof,
-    snap: &RefCasSnapshot,
-    active_group_id: i64,
-    expected_group_epochs: &BTreeMap<i64, i64>,
-    applied: AppliedLogId,
-) -> Result<(), PairedBackupError> {
-    let (raft_inc, raft_group_epoch) = extract_raft_group_realm(snap)?;
-    if expected_group_epochs.get(&active_group_id) != Some(&raft_group_epoch) {
-        return Err(PairedBackupError::CutpointSkew(format!(
-            "bound group_epochs map disagrees with active Raft group {active_group_id} epoch {raft_group_epoch}"
-        )));
-    }
-    if pg.projection_cursors.len() != expected_group_epochs.len() {
-        return Err(PairedBackupError::CutpointSkew(format!(
-            "PG projection_cursors count ({}) != bound Raft group_epochs count ({})",
-            pg.projection_cursors.len(),
-            expected_group_epochs.len()
-        )));
-    }
-    let mut seen_groups = BTreeSet::new();
-    for cur in &pg.projection_cursors {
-        if !seen_groups.insert(cur.group_id)
-            || cur.group_epoch <= 0
-            || cur.history_incarnation.is_nil()
-            || cur.stream_state != "active"
-        {
-            return Err(PairedBackupError::CutpointSkew(format!(
-                "PG cursor group {} duplicate, invalid group_epoch {}, or stream_state {}",
-                cur.group_id, cur.group_epoch, cur.stream_state
-            )));
-        }
-        let Some(&exp_epoch) = expected_group_epochs.get(&cur.group_id) else {
-            return Err(PairedBackupError::CutpointSkew(format!(
-                "unbound PG projection cursor for Raft group {}",
-                cur.group_id
-            )));
-        };
-        if cur.group_epoch != exp_epoch {
-            return Err(PairedBackupError::CutpointSkew(format!(
-                "PG cursor group {} group_epoch {} != Raft group_epoch {}",
-                cur.group_id, cur.group_epoch, exp_epoch
-            )));
-        }
-    }
-    let expected_seq = snap.body.next_event_seq.saturating_sub(1) as i64;
-    let active_cur = pg.projection_cursors.iter().find(|c| c.group_id == active_group_id).ok_or_else(|| {
-        PairedBackupError::CutpointSkew(format!("PG cursor missing for Raft group {active_group_id}"))
-    })?;
-    if active_cur.history_incarnation != raft_inc
-        || active_cur.group_epoch != raft_group_epoch
-        || active_cur.applied_log_index != applied.index as i64
-        || active_cur.applied_log_term != applied.term as i64
-        || active_cur.applied_event_seq != expected_seq
-    {
-        return Err(PairedBackupError::CutpointSkew(format!(
-            "PG cursor (inc={}, grp_epoch={}, term={}, idx={}, seq={}) skewed from Raft (inc={}, grp_epoch={}, term={}, idx={}, seq={})",
-            active_cur.history_incarnation,
-            active_cur.group_epoch,
-            active_cur.applied_log_term,
-            active_cur.applied_log_index,
-            active_cur.applied_event_seq,
-            raft_inc,
-            raft_group_epoch,
-            applied.term,
-            applied.index,
-            expected_seq,
-        )));
-    }
-    for repo in &pg.repositories {
-        if repo.history_incarnation != raft_inc || repo.group_epoch != raft_group_epoch {
-            return Err(PairedBackupError::CutpointSkew(format!(
-                "PG repository {} realm ({}, group_epoch={}) skewed from Raft cursor/gate ({}, group_epoch={})",
-                repo.repository_id, repo.history_incarnation, repo.group_epoch, raft_inc, raft_group_epoch
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Bind and verify exported/archived Blob closure entries against the COMPLETE pack set

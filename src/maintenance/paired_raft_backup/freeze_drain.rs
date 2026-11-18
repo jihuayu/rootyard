@@ -1,5 +1,5 @@
 //! Three-party write freeze (app, worker, deleter), unknown in-flight drain,
-//! durable WAL/quorum backup closure/hold registration, `CloseAuthScope` barriers,
+//! quorum+local WAL backup closure/hold registration, `CloseAuthScope` barriers,
 //! and receipt-gated thaw (#153).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,16 +10,14 @@ use uuid::Uuid;
 use crate::ref_store::contract::{MetadataPinPurpose, RequestDigest};
 use crate::ref_store::core::state_machine::{
     AcquireHoldBatchCommand, ApplyResponse, CancelCommand, CloseAuthScopeCommand, CreateSnapshotPinCommand,
-    RefCasCommand, RegisterRootCommand, ScopeLifecycle, SmHoldState, SmRootState, WireHoldArtifactSpec,
-    WireOperationIdentity,
+    RefCasCommand, RegisterRootCommand, ScopeLifecycle, WireHoldArtifactSpec, WireOperationIdentity,
 };
 use crate::ref_store::{GitObjectFormat, IssuerLane};
 
 use super::backup::stream_sha256_file;
 use super::closure_bind::{compute_canonical_pack_set_digest, verify_registration_spec_completeness};
-use super::raft_barrier::{
-    DurableFreezeBarrierProof, DurableRaftApplyReceipt, DurableRaftBackend, SealedArchiveReceipt,
-};
+use super::quorum_wal::DurableRaftBackend;
+use super::raft_barrier::{DurableFreezeBarrierProof, DurableRaftApplyReceipt, SealedArchiveReceipt};
 use super::types::{
     BackupRetentionHoldRecord, COMPLETE_MARKER, CloseScopeBarrierReceipt, ExpectedPackPairSpec, FreezePartyStatus,
     PairedBackupError, sha256_json_tagged,
@@ -52,8 +50,8 @@ pub struct RepoBackupRegistrationSpec {
     pub expected_packs: Vec<ExpectedPackPairSpec>,
 }
 
-/// Coordinates tri-party backup freeze/thaw gated on durable Raft WAL/quorum state
-/// and verified archive sealing receipts, without pausing Raft consensus/elections.
+/// Coordinates tri-party backup freeze/thaw gated on independent `QuorumCommitReceipt`
+/// + `LocalWalApplyReceipt` state and verified archive sealing receipts.
 #[derive(Clone, Debug)]
 pub struct TriPartyBackupCoordinator {
     status: FreezePartyStatus,
@@ -119,9 +117,30 @@ impl TriPartyBackupCoordinator {
         &self.registered_backup_holds
     }
 
+    /// Freeze a metadata-only peer Raft group and close its repository/authority auth scopes
+    /// with full `QuorumCommitReceipt` + `LocalWalApplyReceipt` verification.
+    pub fn freeze_peer_group_and_close(
+        &mut self,
+        raft: &mut impl DurableRaftBackend,
+        peer_repos: &[(Uuid, Uuid, Uuid)],
+        scope_authz_floor: i64,
+    ) -> Result<DurableFreezeBarrierProof, PairedBackupError> {
+        if peer_repos.is_empty() || scope_authz_floor <= 0 {
+            return Err(PairedBackupError::InvalidArgument("peer_repos must be non-empty and authz_floor positive"));
+        }
+        let mut next_status = self.staged_frozen_status();
+        next_status.worker_drain_settled = 0;
+        let mut apply_receipts = Vec::new();
+        let mut close_receipts = Vec::new();
+        for &target in peer_repos {
+            Self::close_repo_scopes(raft, target, scope_authz_floor, &mut apply_receipts, &mut close_receipts)?;
+        }
+        self.finalize_barrier(raft, next_status, apply_receipts, close_receipts, Vec::new(), false)
+    }
+
     /// Freeze app, worker, and deleter; drain/settle unknown in-flight operations;
-    /// register durable backup pin+holds+root (both `.pack` and `.idx`); close scopes;
-    /// and verify durable Raft WAL snapshot before committing the freeze barrier.
+    /// register durable backup pin+holds+root; close scopes; and verify both
+    /// `QuorumCommitReceipt`s and reopened `LocalWalApplyReceipt` state before committing.
     pub fn freeze_drain_and_register(
         &mut self,
         raft: &mut impl DurableRaftBackend,
@@ -137,16 +156,12 @@ impl TriPartyBackupCoordinator {
             return Err(PairedBackupError::UnknownInFlightOperations(unresolved_raw));
         }
 
-        let mut next_status = self.status.clone();
-        next_status.deleter_fenced = true;
-        next_status.fenced_deleter_epoch = next_status.fenced_deleter_epoch.saturating_add(1);
-        next_status.app_paused = true;
-        next_status.app_fence_seq = next_status.app_fence_seq.saturating_add(1);
-        next_status.worker_paused = true;
-
+        let mut next_status = self.staged_frozen_status();
+        let gid = raft.group_id();
+        let mem = raft.group_membership_digest();
         let mut apply_receipts: Vec<DurableRaftApplyReceipt> = Vec::new();
-        let pending_ops = self.in_flight.clone();
-        for op in pending_ops {
+
+        for op in self.in_flight.clone() {
             if op.settled_committed {
                 next_status.worker_drain_settled += 1;
             } else {
@@ -164,7 +179,7 @@ impl TriPartyBackupCoordinator {
                     logical_tick: tick,
                 });
                 let (receipt, _) = raft.commit_and_apply(cmd)?;
-                receipt.verify(None)?;
+                receipt.verify(Some(gid), Some(&mem))?;
                 apply_receipts.push(receipt);
                 next_status.unknown_ops_resolved += 1;
             }
@@ -172,94 +187,25 @@ impl TriPartyBackupCoordinator {
 
         let mut holds = Vec::with_capacity(repos.len());
         for spec in repos {
-            let hold_rec = self.register_backup_closure_hold(raft, spec, &mut apply_receipts)?;
-            holds.push(hold_rec);
+            holds.push(self.register_backup_closure_hold(raft, spec, &mut apply_receipts)?);
         }
 
         let mut close_receipts = Vec::new();
         for spec in repos {
-            let mut scope_ids = BTreeSet::new();
-            scope_ids.insert(("repo_lifecycle", spec.repository_id));
-            scope_ids.insert(("authority", spec.authority_id));
-            for (kind, sid) in scope_ids {
-                let tick = raft.durable_state_machine().logical_clock_floor().saturating_add(1);
-                let cmd = RefCasCommand::CloseAuthScope(CloseAuthScopeCommand {
-                    scope_kind: kind.to_owned(),
-                    scope_id: sid,
-                    repository_id: Some(spec.repository_id),
-                    tenant_id: Some(spec.tenant_id),
-                    lifecycle: ScopeLifecycle::Closed,
-                    authz_floor: scope_authz_floor,
-                    change_id: Uuid::new_v4(),
-                    logical_tick: tick,
-                });
-                let (apply_rec, resp) = raft.commit_and_apply(cmd)?;
-                apply_rec.verify(None)?;
-                let log_id = apply_rec.log_id;
-                apply_receipts.push(apply_rec);
-
-                let ApplyResponse::AuthScopeClosed {
-                    scope_kind,
-                    scope_id,
-                    lifecycle,
-                    authz_floor,
-                    open_decision_ids,
-                    pending_operation_ids,
-                    ..
-                } = resp
-                else {
-                    return Err(PairedBackupError::StateMachine("unexpected response for CloseAuthScope".into()));
-                };
-                if !open_decision_ids.is_empty() || !pending_operation_ids.is_empty() {
-                    return Err(PairedBackupError::UnknownInFlightOperations(
-                        open_decision_ids.len() + pending_operation_ids.len(),
-                    ));
-                }
-                let receipt = CloseScopeBarrierReceipt {
-                    scope_kind,
-                    scope_id,
-                    repository_id: Some(spec.repository_id),
-                    tenant_id: Some(spec.tenant_id),
-                    lifecycle,
-                    authz_floor,
-                    raft_log_index: log_id.index,
-                    raft_log_term: log_id.term,
-                    pending_operation_ids,
-                    open_decision_ids,
-                    receipt_digest: String::new(),
-                }
-                .seal()?;
-                receipt.verify()?;
-                close_receipts.push(receipt);
-            }
+            Self::close_repo_scopes(
+                raft,
+                (spec.repository_id, spec.tenant_id, spec.authority_id),
+                scope_authz_floor,
+                &mut apply_receipts,
+                &mut close_receipts,
+            )?;
         }
-
-        let (durable_snap, durable_digest) = raft.durable_state()?;
-        let barrier_log_id =
-            apply_receipts.last().map(|r| r.log_id).ok_or(PairedBackupError::FreezeNotHeld("empty barrier log"))?;
-        let proof = DurableFreezeBarrierProof {
-            barrier_id: Uuid::new_v4(),
-            status: next_status.clone(),
-            barrier_log_id,
-            barrier_state_digest: durable_digest.clone(),
-            apply_receipts,
-            close_receipts,
-            backup_holds: holds.clone(),
-            proof_digest: String::new(),
-        }
-        .seal()?;
-        proof.verify_against_raft(&durable_snap, &durable_digest)?;
-
-        self.in_flight.clear();
-        self.status = next_status;
-        self.registered_backup_holds = holds;
-        self.active_barrier = Some(proof.clone());
-        Ok(proof)
+        self.finalize_barrier(raft, next_status, apply_receipts, close_receipts, holds, true)
     }
 
     /// Thaw app, worker, and deleter ONLY after verifying the active durable freeze barrier,
-    /// the sealed archive receipt, on-disk `verify_backup_archive` (`COMPLETE` + manifest + Blobs),
-    /// and durable Raft WAL state preserving active backup holds/roots and closed auth scopes.
+    /// `SealedArchiveReceipt`, on-disk `verify_backup_archive`, durable `quorum_commit_index`,
+    /// and reopened local WAL snapshot preserving active backup holds/roots and closed scopes.
     pub fn unfreeze_after_backup(
         &mut self,
         raft: &dyn DurableRaftBackend,
@@ -270,19 +216,7 @@ impl TriPartyBackupCoordinator {
             .active_barrier
             .as_ref()
             .ok_or(PairedBackupError::FreezeNotHeld("cannot unfreeze without an active durable freeze barrier"))?;
-        barrier.verify()?;
-        seal_receipt.verify()?;
-        if seal_receipt.barrier_id != barrier.barrier_id
-            || seal_receipt.fenced_deleter_epoch != barrier.status.fenced_deleter_epoch
-            || seal_receipt.app_fence_seq != barrier.status.app_fence_seq
-            || seal_receipt.barrier_log_id != barrier.barrier_log_id
-            || seal_receipt.barrier_state_digest != barrier.barrier_state_digest
-        {
-            return Err(PairedBackupError::FreezeNotHeld(
-                "sealed archive receipt does not match active durable freeze barrier",
-            ));
-        }
-
+        barrier.verify_thaw_receipt_binds(raft, seal_receipt)?;
         let manifest = super::restore::verify_backup_archive(archive_dir, None)?;
         let (_, complete_sha) = stream_sha256_file(&archive_dir.join(COMPLETE_MARKER))?;
         if manifest.backup_id != seal_receipt.backup_id
@@ -293,42 +227,7 @@ impl TriPartyBackupCoordinator {
                 "archive manifest or COMPLETE marker disagrees with SealedArchiveReceipt",
             ));
         }
-
-        let (durable_snap, _) = raft.durable_state()?;
-        durable_snap.verify_integrity().map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-        let Some(last_durable) = durable_snap.body.last_applied else {
-            return Err(PairedBackupError::FreezeNotHeld("durable Raft WAL has no applied entries at thaw"));
-        };
-        if (last_durable.term, last_durable.index) < (barrier.barrier_log_id.term, barrier.barrier_log_id.index) {
-            return Err(PairedBackupError::FreezeNotHeld(
-                "durable Raft WAL lags behind freeze barrier log_id; refusing thaw on volatile apply",
-            ));
-        }
-        for rid in &seal_receipt.root_ids {
-            if !durable_snap.body.roots.iter().any(|r| r.root_id == *rid && r.state == SmRootState::Active) {
-                return Err(PairedBackupError::FreezeNotHeld(
-                    "backup retention root missing or inactive in durable WAL",
-                ));
-            }
-        }
-        for hid in &seal_receipt.hold_ids {
-            if !durable_snap.body.holds.iter().any(|h| h.hold_id == *hid && h.state != SmHoldState::Retired) {
-                return Err(PairedBackupError::FreezeNotHeld("backup hold missing or retired in durable WAL"));
-            }
-        }
-        for cr in &barrier.close_receipts {
-            let found = durable_snap.body.scope_floors.iter().any(|s| {
-                s.key.scope_kind == cr.scope_kind
-                    && s.key.scope_id == cr.scope_id
-                    && s.lifecycle == ScopeLifecycle::Closed
-                    && s.authz_floor >= cr.authz_floor
-            });
-            if !found {
-                return Err(PairedBackupError::ScopeNotClosed(
-                    "closed auth scope missing from durable WAL at thaw".into(),
-                ));
-            }
-        }
+        barrier.verify_thaw_durable_wal(raft, seal_receipt)?;
 
         self.status.app_paused = false;
         self.status.worker_paused = false;
@@ -337,12 +236,128 @@ impl TriPartyBackupCoordinator {
         Ok(())
     }
 
+    fn staged_frozen_status(&self) -> FreezePartyStatus {
+        let mut next = self.status.clone();
+        next.deleter_fenced = true;
+        next.fenced_deleter_epoch = next.fenced_deleter_epoch.saturating_add(1);
+        next.app_paused = true;
+        next.app_fence_seq = next.app_fence_seq.saturating_add(1);
+        next.worker_paused = true;
+        next
+    }
+
+    fn close_repo_scopes(
+        raft: &mut impl DurableRaftBackend,
+        (repository_id, tenant_id, authority_id): (Uuid, Uuid, Uuid),
+        scope_authz_floor: i64,
+        apply_receipts: &mut Vec<DurableRaftApplyReceipt>,
+        close_receipts: &mut Vec<CloseScopeBarrierReceipt>,
+    ) -> Result<(), PairedBackupError> {
+        let gid = raft.group_id();
+        let mem = raft.group_membership_digest();
+        let scopes = BTreeSet::from([("repo_lifecycle", repository_id), ("authority", authority_id)]);
+        for (kind, sid) in scopes {
+            let tick = raft.durable_state_machine().logical_clock_floor().saturating_add(1);
+            let cmd = RefCasCommand::CloseAuthScope(CloseAuthScopeCommand {
+                scope_kind: kind.to_owned(),
+                scope_id: sid,
+                repository_id: Some(repository_id),
+                tenant_id: Some(tenant_id),
+                lifecycle: ScopeLifecycle::Closed,
+                authz_floor: scope_authz_floor,
+                change_id: Uuid::new_v4(),
+                logical_tick: tick,
+            });
+            let (apply_rec, resp) = raft.commit_and_apply(cmd)?;
+            apply_rec.verify(Some(gid), Some(&mem))?;
+            let log_id = apply_rec.log_id;
+            apply_receipts.push(apply_rec);
+
+            let ApplyResponse::AuthScopeClosed {
+                scope_kind,
+                scope_id,
+                lifecycle,
+                authz_floor,
+                open_decision_ids,
+                pending_operation_ids,
+                ..
+            } = resp
+            else {
+                return Err(PairedBackupError::StateMachine("unexpected response for CloseAuthScope".into()));
+            };
+            if !open_decision_ids.is_empty() || !pending_operation_ids.is_empty() {
+                return Err(PairedBackupError::UnknownInFlightOperations(
+                    open_decision_ids.len() + pending_operation_ids.len(),
+                ));
+            }
+            let receipt = CloseScopeBarrierReceipt {
+                scope_kind,
+                scope_id,
+                repository_id: Some(repository_id),
+                tenant_id: Some(tenant_id),
+                lifecycle,
+                authz_floor,
+                raft_log_index: log_id.index,
+                raft_log_term: log_id.term,
+                pending_operation_ids,
+                open_decision_ids,
+                receipt_digest: String::new(),
+            }
+            .seal()?;
+            receipt.verify()?;
+            close_receipts.push(receipt);
+        }
+        Ok(())
+    }
+
+    fn finalize_barrier(
+        &mut self,
+        raft: &impl DurableRaftBackend,
+        next_status: FreezePartyStatus,
+        apply_receipts: Vec<DurableRaftApplyReceipt>,
+        close_receipts: Vec<CloseScopeBarrierReceipt>,
+        holds: Vec<BackupRetentionHoldRecord>,
+        require_holds: bool,
+    ) -> Result<DurableFreezeBarrierProof, PairedBackupError> {
+        let gid = raft.group_id();
+        let mem = raft.group_membership_digest();
+        let committed_idx = raft.committed_quorum_index()?;
+        let (durable_snap, durable_digest) = raft.durable_state()?;
+        let barrier_log_id =
+            apply_receipts.last().map(|r| r.log_id).ok_or(PairedBackupError::FreezeNotHeld("empty barrier log"))?;
+        if committed_idx < barrier_log_id.index {
+            return Err(PairedBackupError::FreezeNotHeld("quorum_commit_index behind barrier_log_id"));
+        }
+        let proof = DurableFreezeBarrierProof {
+            barrier_id: Uuid::new_v4(),
+            group_id: gid,
+            group_membership_digest: mem.clone(),
+            status: next_status.clone(),
+            barrier_log_id,
+            barrier_state_digest: durable_digest.clone(),
+            apply_receipts,
+            close_receipts,
+            backup_holds: holds.clone(),
+            proof_digest: String::new(),
+        }
+        .seal()?;
+        proof.verify_against_raft_group(gid, &mem, &durable_snap, &durable_digest, require_holds)?;
+
+        self.in_flight.clear();
+        self.status = next_status;
+        self.registered_backup_holds = holds;
+        self.active_barrier = Some(proof.clone());
+        Ok(proof)
+    }
+
     pub(super) fn register_backup_closure_hold(
         &self,
         raft: &mut impl DurableRaftBackend,
         spec: &RepoBackupRegistrationSpec,
         apply_receipts: &mut Vec<DurableRaftApplyReceipt>,
     ) -> Result<BackupRetentionHoldRecord, PairedBackupError> {
+        let gid = raft.group_id();
+        let mem = raft.group_membership_digest();
         let pack_set_digest = compute_canonical_pack_set_digest(&spec.expected_packs)?;
         let mut sorted_packs = spec.expected_packs.clone();
         sorted_packs.sort();
@@ -350,7 +365,6 @@ impl TriPartyBackupCoordinator {
         let pre_snap =
             raft.durable_state_machine().snapshot().map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
         let pack_digests = verify_registration_spec_completeness(&pre_snap, spec.repository_id, &sorted_packs)?;
-
         let gate_ver = raft
             .durable_state_machine()
             .read_gate_version(spec.repository_id)
@@ -401,7 +415,7 @@ impl TriPartyBackupCoordinator {
             pack_digests,
             request_digest: req_digest("backup-pin"),
         }))?;
-        pin_rec.verify(None)?;
+        pin_rec.verify(Some(gid), Some(&mem))?;
         apply_receipts.push(pin_rec);
 
         let (hold_rec, _) = raft.commit_and_apply(RefCasCommand::AcquireHoldBatch(AcquireHoldBatchCommand {
@@ -418,7 +432,7 @@ impl TriPartyBackupCoordinator {
             expected_gate_digest: gate_digest,
             artifacts: wire_specs,
         }))?;
-        hold_rec.verify(None)?;
+        hold_rec.verify(Some(gid), Some(&mem))?;
         apply_receipts.push(hold_rec);
 
         let refs_map = raft.durable_state_machine().read_refs(spec.repository_id);
@@ -448,7 +462,7 @@ impl TriPartyBackupCoordinator {
             register_digest: req_digest("backup-register"),
             request_digest: req_digest("backup-root-req"),
         }))?;
-        root_rec.verify(None)?;
+        root_rec.verify(Some(gid), Some(&mem))?;
         let raft_log_index = root_rec.log_id.index;
         apply_receipts.push(root_rec);
 

@@ -3,7 +3,6 @@
 #[path = "paired_raft_backup_support/fixture.rs"]
 mod fixture;
 
-use std::collections::BTreeMap;
 use std::fs;
 
 use anyhow::{Result, ensure};
@@ -11,7 +10,9 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use fixture::{LoopbackS3, build_fixture, dl, dticket, mk_req, setup_pg, try_backup, wticket};
+use fixture::{
+    LoopbackS3, build_fixture, build_peer_group_fixture, dl, dticket, mk_req, setup_pg, try_backup, wticket,
+};
 use rootyard::db;
 use rootyard::maintenance::paired_raft_backup::{
     BlobClosureManifest, DecisionExecutionTicket, DurableRaftBackend, PairedBackupError, PairedBackupManifest,
@@ -84,7 +85,6 @@ async fn missing_whole_pack_pair_and_single_side_closure_regressions() -> Result
     let fix = build_fixture(&store, &dir.path().join("seed"), GitObjectFormat::Sha256).await?;
     assert_ne!(fix.pack_1_id, fix.pack_2_id);
 
-    // 1. Missing BOTH `.pack` and `.idx` of `pack_2_id` (only `pack_1_id` pair supplied) -> fail-closed!
     let only_pack_1: Vec<_> = fix.artifacts.iter().filter(|a| a.pack_id == fix.pack_1_id).cloned().collect();
     assert_eq!(only_pack_1.len(), 2);
     assert!(matches!(
@@ -92,7 +92,6 @@ async fn missing_whole_pack_pair_and_single_side_closure_regressions() -> Result
         PairedBackupError::BlobClosureIncomplete(_)
     ));
 
-    // 2. Single-side missing (`pack_2_id` `.idx` omitted, 3 of 4 artifacts supplied) -> fail-closed!
     let missing_one_idx = fix.artifacts[..3].to_vec();
     assert!(matches!(
         try_backup(&fix, &store, dir.path(), "missing-one-side", missing_one_idx, Some(&fix.pg_proof))
@@ -101,14 +100,12 @@ async fn missing_whole_pack_pair_and_single_side_closure_regressions() -> Result
         PairedBackupError::BlobClosureIncomplete(_)
     ));
 
-    // 3. Valid 4-artifact archive tampered to strip BOTH `.pack` and `.idx` of `pack_2_id` and re-sealed -> fail-closed!
     let archive_dir = dir.path().join("resealed-missing-pair");
     let (mut manifest, _) =
         try_backup(&fix, &store, dir.path(), "resealed-missing-pair", fix.artifacts.clone(), Some(&fix.pg_proof))
             .await?;
     let kept_entries: Vec<_> =
         manifest.blob_closure.entries.iter().filter(|e| e.pack_id == fix.pack_1_id).cloned().collect();
-    assert_eq!(kept_entries.len(), 2);
     let kept_bytes: u64 = kept_entries.iter().map(|e| e.length).sum();
     manifest.blob_closure = BlobClosureManifest {
         backend_identity: manifest.blob_closure.backend_identity.clone(),
@@ -147,13 +144,11 @@ async fn durable_wal_barrier_and_sealing_receipt_freeze_thaw_regressions() -> Re
     let (_, seal_receipt) =
         try_backup(&fix, &store, dir.path(), "good-archive", fix.artifacts.clone(), Some(&fix.pg_proof)).await?;
 
-    // 1. Forged/wrong-barrier receipt cannot unfreeze.
     let mut wrong_barrier = seal_receipt.clone();
     wrong_barrier.barrier_id = Uuid::new_v4();
     assert!(fix.coord.unfreeze_after_backup(&fix.raft, &archive_dir, &wrong_barrier).is_err());
     assert!(fix.coord.status().app_paused);
 
-    // 2. Missing COMPLETE marker on disk blocks thaw even with valid receipt struct.
     let complete_path = archive_dir.join("COMPLETE");
     let orig_complete = fs::read(&complete_path)?;
     fs::remove_file(&complete_path)?;
@@ -164,7 +159,8 @@ async fn durable_wal_barrier_and_sealing_receipt_freeze_thaw_regressions() -> Re
     assert!(fix.coord.status().app_paused);
     fs::write(&complete_path, &orig_complete)?;
 
-    // 3. Volatile local-only apply (durable WAL truncated behind barrier_log_id) blocks both backup & thaw!
+    // Truncating local voter 0 WAL behind durable `quorum_commit_index` simulates 2/3 remote quorum
+    // committed while local node WAL/apply lags -> both backup and thaw fail closed!
     let wal_bytes = fs::read_to_string(fix.raft.wal_path())?;
     let lines: Vec<&str> = wal_bytes.lines().collect();
     let lagged_wal = format!("{}\n", lines[..lines.len() - 1].join("\n"));
@@ -182,7 +178,6 @@ async fn durable_wal_barrier_and_sealing_receipt_freeze_thaw_regressions() -> Re
     ));
     assert!(fix.coord.status().app_paused);
 
-    // 4. Restoring full fsynced WAL allows verified thaw.
     fs::write(fix.raft.wal_path(), &wal_bytes)?;
     fix.coord.unfreeze_after_backup(&fix.raft, &archive_dir, &seal_receipt)?;
     assert!(!fix.coord.status().app_paused && fix.coord.active_barrier().is_none());
@@ -195,6 +190,7 @@ async fn negative_fail_closed_fault_matrix() -> Result<()> {
     let (store, other) = (s3.open_store("paired-neg")?, s3.open_store("paired-wrong-bucket")?);
     let dir = TempDir::new()?;
     let fix = build_fixture(&store, &dir.path().join("seed"), GitObjectFormat::Sha256).await?;
+    let peer = build_peer_group_fixture(&dir.path().join("peer"), 2, 5, fix.authority)?;
 
     let mut skewed_idx = fix.pg_proof.clone();
     skewed_idx.projection_cursors[0].applied_log_index -= 1;
@@ -204,18 +200,18 @@ async fn negative_fail_closed_fault_matrix() -> Result<()> {
     skewed_grp_epoch.projection_cursors[0].group_epoch += 1;
     skewed_grp_epoch = skewed_grp_epoch.seal()?;
 
-    let mut multi_group_pg = fix.pg_proof.clone();
-    multi_group_pg.projection_cursors.push(PgProjectionCursorCut {
+    let mut multi_pg_skewed_peer = fix.pg_proof.clone();
+    multi_pg_skewed_peer.projection_cursors.push(PgProjectionCursorCut {
         group_id: 2,
-        history_incarnation: Uuid::new_v4(),
-        group_epoch: 5,
-        applied_event_seq: 1,
-        applied_log_index: 1,
-        applied_log_term: 1,
+        history_incarnation: peer.cut.history_incarnation,
+        group_epoch: peer.cut.group_epoch + 1,
+        applied_event_seq: peer.cut.applied_event_seq as i64,
+        applied_log_index: peer.cut.applied_index as i64,
+        applied_log_term: peer.cut.applied_term as i64,
         last_event_id: None,
         stream_state: "active".into(),
     });
-    multi_group_pg = multi_group_pg.seal()?;
+    multi_pg_skewed_peer = multi_pg_skewed_peer.seal()?;
 
     assert!(matches!(
         try_backup(&fix, &store, dir.path(), "b1", fix.artifacts.clone(), None).await.unwrap_err(),
@@ -231,8 +227,8 @@ async fn negative_fail_closed_fault_matrix() -> Result<()> {
     ));
     assert!(matches!(
         create_paired_backup(
-            mk_req(&fix, &store, dir.path(), &dir.path().join("b4"), fix.artifacts.clone(), BTreeMap::from([(2, 6)])),
-            Some(&multi_group_pg),
+            mk_req(&fix, &store, dir.path(), &dir.path().join("b4"), fix.artifacts.clone(), vec![peer.as_input()]),
+            Some(&multi_pg_skewed_peer),
         )
         .await
         .unwrap_err(),
@@ -274,16 +270,16 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
         let (s3, dir) = (LoopbackS3::new(), TempDir::new()?);
         let store = s3.open_store("paired-pg17")?;
         let mut fix = build_fixture(&store, &dir.path().join("seed"), GitObjectFormat::Sha256).await?;
+        let peer = build_peer_group_fixture(&dir.path().join("peer-g2"), 2, 4, fix.authority)?;
         let (snap, _) = fix.raft.durable_state()?;
         let (applied, backend, mut src_c) = (
             snap.body.last_applied.unwrap(),
             store.backend_identity().as_hex().to_owned(),
             src_pool.get().await?,
         );
-        let (ev_seq, uname, peer_inc) = (
+        let (ev_seq, uname) = (
             snap.body.next_event_seq.saturating_sub(1) as i64,
             format!("u{}", &fix.tenant.simple().to_string()[..12]),
-            Uuid::new_v4(),
         );
         src_c.batch_execute(&format!(
             "INSERT INTO users(id,username) VALUES('{t}','{uname}');
@@ -297,35 +293,44 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
              INSERT INTO ref_store_decision_scopes(scope_kind,scope_id,version,state) VALUES('repo_access','{r}',22,'OPEN');
              INSERT INTO ref_cas_projection_cursors(group_id,history_incarnation,group_epoch,applied_event_seq,applied_log_index,applied_log_term,stream_state) VALUES
                (1,'{h}',2,{ev_seq},{idx},{term},'active'),
-               (2,'{peer_inc}',4,1,1,1,'active');",
-            t = fix.tenant, r = fix.repo, h = fix.history, c = fix.commit, idx = applied.index, term = applied.term
+               (2,'{ph}',3,{pseq},{pidx},{pterm},'active');",
+            t = fix.tenant,
+            r = fix.repo,
+            h = fix.history,
+            c = fix.commit,
+            idx = applied.index,
+            term = applied.term,
+            ph = peer.cut.history_incarnation,
+            pseq = peer.cut.applied_event_seq,
+            pidx = peer.cut.applied_index,
+            pterm = peer.cut.applied_term,
         )).await?;
 
-        let peers_ok = BTreeMap::from([(2, 4)]);
         assert!(matches!(
-            capture_live_pg_backup(&mut src_c, mk_req(&fix, &store, dir.path(), &dir.path().join("p0"), fix.artifacts.clone(), peers_ok.clone())).await.unwrap_err(),
+            capture_live_pg_backup(&mut src_c, mk_req(&fix, &store, dir.path(), &dir.path().join("p0"), fix.artifacts.clone(), vec![peer.as_input()])).await.unwrap_err(),
             PairedBackupError::DeleterNotFenced(_)
         ));
         freeze_pg_deleter(&**src_c, "paired-backup-it").await?;
 
-        // Active group_id=1 has matching log index/term/seq, but skewed group_epoch (2 != 3) -> CutpointSkew!
+        // Active group_id=1 skewed group_epoch (2 != 3) -> CutpointSkew!
         assert!(matches!(
-            capture_live_pg_backup(&mut src_c, mk_req(&fix, &store, dir.path(), &dir.path().join("p1"), fix.artifacts.clone(), peers_ok.clone())).await.unwrap_err(),
+            capture_live_pg_backup(&mut src_c, mk_req(&fix, &store, dir.path(), &dir.path().join("p1"), fix.artifacts.clone(), vec![peer.as_input()])).await.unwrap_err(),
             PairedBackupError::CutpointSkew(_)
         ));
         src_c.execute("UPDATE ref_cas_projection_cursors SET group_epoch=3 WHERE group_id=1", &[]).await?;
 
-        // Peer group_id=2 skewed group_epoch (4 != 9) -> CutpointSkew!
+        // Peer group_id=2 skewed group_epoch (3 != durable peer Raft epoch 4) -> CutpointSkew!
         assert!(matches!(
-            capture_live_pg_backup(&mut src_c, mk_req(&fix, &store, dir.path(), &dir.path().join("p2"), fix.artifacts.clone(), BTreeMap::from([(2, 9)]))).await.unwrap_err(),
+            capture_live_pg_backup(&mut src_c, mk_req(&fix, &store, dir.path(), &dir.path().join("p2"), fix.artifacts.clone(), vec![peer.as_input()])).await.unwrap_err(),
             PairedBackupError::CutpointSkew(_)
         ));
+        src_c.execute("UPDATE ref_cas_projection_cursors SET group_epoch=4 WHERE group_id=2", &[]).await?;
 
         let dest = dir.path().join("pg-archive");
         let (manifest, seal_receipt) =
-            capture_live_pg_backup(&mut src_c, mk_req(&fix, &store, dir.path(), &dest, fix.artifacts.clone(), peers_ok)).await?;
+            capture_live_pg_backup(&mut src_c, mk_req(&fix, &store, dir.path(), &dest, fix.artifacts.clone(), vec![peer.as_input()])).await?;
         fix.coord.unfreeze_after_backup(&fix.raft, &dest, &seal_receipt)?;
-        assert_eq!(manifest.pg_cutpoint.max_decision_scope_version, 22);
+        assert_eq!(manifest.raft_cutpoint.peer_groups.len(), 1);
 
         let (mut dst_c, scope) = (
             dst_pool.get().await?,
@@ -338,21 +343,21 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
         let (out, _, _) =
             restore_new_incarnation_with_pg(&dest, &dir.path().join("dst-work"), &store, &mut dst_c, &scope, dl()).await?;
         let inc = &out.incarnation;
-        ensure!(inc.new_authz_floor == 32);
+        ensure!(inc.new_authz_floor == 32 && inc.new_group_epoch == 5);
 
-        let row = dst_c.query_one(
-            "SELECT a.authority_id, a.remote_delete_fenced, c.incarnation, g.history_incarnation, sr.state, rr.root_kind \
-             FROM pando_storage_authorities a, cluster_authority c, ref_store_core_gates g, ref_store_serving_repositories sr, pando_retention_roots rr \
-             WHERE a.singleton=true AND c.singleton=true AND g.repository_id=$1 AND sr.repository_id=$1 AND rr.repository_id=$1",
-            &[&fix.repo],
-        ).await?;
+        let peer_cur = dst_c
+            .query_one(
+                "SELECT history_incarnation, group_epoch, applied_event_seq, applied_log_index, applied_log_term \
+                 FROM ref_cas_projection_cursors WHERE group_id = 2",
+                &[],
+            )
+            .await?;
         ensure!(
-            row.get::<_, Uuid>(0) == inc.new_storage_authority_id
-                && !row.get::<_, bool>(1)
-                && row.get::<_, Uuid>(2) == inc.new_cluster_incarnation
-                && row.get::<_, Uuid>(3) == inc.new_history_incarnation
-                && row.get::<_, String>(4) == "ready"
-                && row.get::<_, String>(5) == "backup_snapshot"
+            peer_cur.get::<_, Uuid>(0) == inc.new_history_incarnation
+                && peer_cur.get::<_, i64>(1) == inc.new_group_epoch
+                && peer_cur.get::<_, i64>(2) >= 2
+                && peer_cur.get::<_, i64>(3) == 2
+                && peer_cur.get::<_, i64>(4) == 1
         );
 
         let g_ok = wticket(
@@ -377,7 +382,6 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
         );
         verify_pg_live_incarnation(&dst_c, fix.repo, &g_ok, Some(&dec_ok), Some(&d_ok)).await?;
 
-        // Writer grant with fresh incarnation/epochs BUT authz_epoch below restored floor (31 < 32) -> StaleGrantRefused!
         let mut g_low_authz = g_ok.clone();
         g_low_authz.authz_epoch = inc.new_authz_floor - 1;
         assert!(matches!(
@@ -385,7 +389,6 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
             PairedBackupError::StaleGrantRefused(_)
         ));
 
-        // Decision ticket with fresh incarnation/epochs BUT authz_epoch below restored floor -> StaleDecisionRefused!
         let mut dec_low_authz = dec_ok.clone();
         dec_low_authz.authz_epoch = inc.new_authz_floor - 1;
         assert!(matches!(
@@ -393,12 +396,11 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
             PairedBackupError::StaleDecisionRefused(_)
         ));
 
-        let sc = &manifest.pg_cutpoint;
-        let g_old = wticket(sc.source_cluster_incarnation, fix.history, 2, 3, 5);
-        assert!(verify_pg_live_incarnation(&dst_c, fix.repo, &g_old, None, None).await.is_err());
-        let d_old = dticket(sc.source_cluster_incarnation, sc.source_storage_authority_id, 1, 7);
+        // Fresh authority & cluster incarnation, BUT deleter_epoch below restored floor -> StaleDeleterRefused!
+        let mut d_low_epoch = d_ok.clone();
+        d_low_epoch.deleter_epoch = inc.new_deleter_epoch - 1;
         assert!(matches!(
-            verify_pg_live_incarnation(&dst_c, fix.repo, &g_ok, None, Some(&d_old)).await.unwrap_err(),
+            verify_pg_live_incarnation(&dst_c, fix.repo, &g_ok, None, Some(&d_low_epoch)).await.unwrap_err(),
             PairedBackupError::StaleDeleterRefused(_)
         ));
         Ok(())

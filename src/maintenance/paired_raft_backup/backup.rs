@@ -1,4 +1,4 @@
-//! Coordinated PG cutpoint + durable Raft barrier + OpenDAL Blob closure backup (#153).
+//! Coordinated PG cutpoint + durable multi-group Raft barrier + OpenDAL Blob closure backup (#153).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -14,11 +14,13 @@ use crate::blob_store::{BlobLocator, opendal::BlobStore};
 use crate::ref_store::GitObjectFormat;
 use crate::ref_store::core::state_machine::{AppliedLogId, RefCasSnapshot, ScopeLifecycle};
 
-use super::closure_bind::{
-    extract_raft_group_realm, verify_blob_closure_against_durable_raft, verify_cursor_group_epochs,
+use super::closure_bind::verify_blob_closure_against_durable_raft;
+use super::peer_groups::{
+    ExpectedGroupCursorCut, PeerGroupBackupInput, extract_peer_expected_cuts, verify_all_group_cursors,
 };
 use super::pg_cutpoint::{ExpectedRaftCut, capture_pg_cutpoint_in_tx};
-use super::raft_barrier::{DurableFreezeBarrierProof, DurableRaftBackend, SealedArchiveReceipt};
+use super::quorum_wal::DurableRaftBackend;
+use super::raft_barrier::{DurableFreezeBarrierProof, SealedArchiveReceipt};
 use super::types::{
     BlobArtifactEntry, BlobClosureManifest, COMPLETE_MARKER, CloseScopeBarrierReceipt, MANIFEST_FILE, MAX_ARTIFACTS,
     MAX_MANIFEST_BYTES, MAX_REPOSITORIES, PairedBackupError, PairedBackupManifest, PgCutpointProof, RaftCutpointProof,
@@ -37,8 +39,7 @@ pub struct PreparedBlobArtifact {
 pub struct PairedBackupRequest<'a> {
     pub backup_id: Uuid,
     pub group_id: i64,
-    pub peer_group_epochs: BTreeMap<i64, i64>,
-    pub group_membership_digest: &'a str,
+    pub peer_groups: Vec<PeerGroupBackupInput<'a>>,
     pub freeze_barrier: &'a DurableFreezeBarrierProof,
     pub raft: &'a dyn DurableRaftBackend,
     pub artifacts: Vec<PreparedBlobArtifact>,
@@ -48,29 +49,24 @@ pub struct PairedBackupRequest<'a> {
     pub deadline: Instant,
 }
 
-/// Capture live PG 17 repeatable-read cutpoint + durable Raft cut + Blob closure into `destination`.
+/// Capture live PG 17 repeatable-read cutpoint + durable active & peer Raft cuts + Blob closure.
 pub async fn capture_live_pg_backup(
     pg_client: &mut Client,
     req: PairedBackupRequest<'_>,
 ) -> Result<(PairedBackupManifest, SealedArchiveReceipt), PairedBackupError> {
+    if req.raft.group_id() != req.group_id {
+        return Err(PairedBackupError::CutpointSkew("active Raft backend group_id mismatches request".into()));
+    }
+    let committed_idx = req.raft.committed_quorum_index()?;
     let (durable_snap, durable_digest) = req.raft.durable_state()?;
-    req.freeze_barrier.verify_against_raft(&durable_snap, &durable_digest)?;
-    let last = durable_snap
-        .body
-        .last_applied
-        .ok_or(PairedBackupError::IncompleteCut("durable Raft snapshot has no applied index"))?;
-    let event_seq = durable_snap.body.next_event_seq.saturating_sub(1);
-    let (raft_inc, raft_group_epoch) = extract_raft_group_realm(&durable_snap)?;
-
-    let expected_cut = ExpectedRaftCut {
-        group_id: req.group_id,
-        history_incarnation: raft_inc,
-        group_epoch: raft_group_epoch,
-        peer_group_epochs: req.peer_group_epochs.clone(),
-        applied_index: last.index,
-        applied_term: last.term,
-        applied_event_seq: event_seq,
-    };
+    let mem_digest = req.raft.group_membership_digest();
+    req.freeze_barrier.verify_against_raft_group(req.group_id, &mem_digest, &durable_snap, &durable_digest, true)?;
+    if committed_idx < req.freeze_barrier.barrier_log_id.index {
+        return Err(PairedBackupError::FreezeNotHeld("active Raft quorum_commit_index behind freeze barrier"));
+    }
+    let active_cut = ExpectedGroupCursorCut::from_verified_snapshot(req.group_id, &durable_snap)?;
+    let (peer_cuts, _) = extract_peer_expected_cuts(req.group_id, &req.peer_groups)?;
+    let expected_cut = ExpectedRaftCut { active: active_cut, peers: peer_cuts };
 
     let tx = pg_client
         .build_transaction()
@@ -85,15 +81,14 @@ pub async fn capture_live_pg_backup(
     Ok(result)
 }
 
-/// Export a sealed paired backup archive proving durable freeze barrier, empty close-scope drains,
-/// complete durable hold/root/pin Blob closure, exact PG <-> Raft `group_epoch` + index cutpoint,
-/// and verified Blob bytes, returning `(PairedBackupManifest, SealedArchiveReceipt)`.
+/// Export a sealed paired backup archive proving quorum+local freeze barriers across all Raft groups,
+/// complete durable hold/root/pin Blob closure, exact PG <-> Raft cursor alignment, and verified Blobs.
 pub async fn create_paired_backup(
     req: PairedBackupRequest<'_>,
     pg_proof: Option<&PgCutpointProof>,
 ) -> Result<(PairedBackupManifest, SealedArchiveReceipt), PairedBackupError> {
-    if req.backup_id.is_nil() || req.group_membership_digest.len() != 64 {
-        return Err(PairedBackupError::InvalidArgument("backup_id and 64-hex membership digest required"));
+    if req.backup_id.is_nil() {
+        return Err(PairedBackupError::InvalidArgument("non-nil backup_id required"));
     }
     if req.destination.exists() {
         return Err(PairedBackupError::InvalidArgument("destination already exists"));
@@ -109,19 +104,34 @@ pub async fn create_paired_backup(
     if pg.repositories.is_empty() || pg.repositories.len() > MAX_REPOSITORIES {
         return Err(PairedBackupError::IncompleteCut("PG cutpoint must cover 1..=MAX_REPOSITORIES repositories"));
     }
+    if req.raft.group_id() != req.group_id {
+        return Err(PairedBackupError::CutpointSkew("active Raft backend group_id mismatches request".into()));
+    }
 
+    let committed_idx = req.raft.committed_quorum_index()?;
     let (snapshot, state_digest) = req.raft.durable_state()?;
-    req.freeze_barrier.verify_against_raft(&snapshot, &state_digest)?;
-    let applied_log_id: AppliedLogId = snapshot
-        .body
-        .last_applied
-        .ok_or(PairedBackupError::IncompleteCut("durable Raft snapshot missing applied_log_id"))?;
-    let (_, raft_group_epoch) = extract_raft_group_realm(&snapshot)?;
-    let mut group_epochs = req.peer_group_epochs.clone();
-    group_epochs.insert(req.group_id, raft_group_epoch);
+    let group_membership_digest = req.raft.group_membership_digest();
+    req.freeze_barrier.verify_against_raft_group(
+        req.group_id,
+        &group_membership_digest,
+        &snapshot,
+        &state_digest,
+        true,
+    )?;
+    if committed_idx < req.freeze_barrier.barrier_log_id.index {
+        return Err(PairedBackupError::FreezeNotHeld("quorum_commit_index behind freeze barrier"));
+    }
+    let active_cut = ExpectedGroupCursorCut::from_verified_snapshot(req.group_id, &snapshot)?;
+    let (peer_cuts, peer_proofs) = extract_peer_expected_cuts(req.group_id, &req.peer_groups)?;
+    verify_all_group_cursors(pg, &active_cut, &peer_cuts)?;
 
-    verify_cursor_group_epochs(pg, &snapshot, req.group_id, &group_epochs, applied_log_id)?;
+    let applied_log_id = AppliedLogId { term: active_cut.applied_term, index: active_cut.applied_index };
     reconcile_pg_raft_repositories(pg, &snapshot, applied_log_id, &req.freeze_barrier.close_receipts)?;
+
+    let mut group_epochs = BTreeMap::from([(req.group_id, active_cut.group_epoch)]);
+    for pc in &peer_cuts {
+        group_epochs.insert(pc.group_id, pc.group_epoch);
+    }
 
     let work_dir = req.staging_dir.join(format!(".paired-{}.partial", req.backup_id));
     if work_dir.exists() {
@@ -205,10 +215,11 @@ pub async fn create_paired_backup(
     let raft_cutpoint = RaftCutpointProof {
         group_id: req.group_id,
         group_epochs,
+        peer_groups: peer_proofs,
         applied_log_id,
         logical_clock_floor: snapshot.body.logical_clock_floor,
         state_digest,
-        group_membership_digest: req.group_membership_digest.to_owned(),
+        group_membership_digest,
         snapshot_checksum: snapshot.checksum.clone(),
         snapshot,
         close_receipts: req.freeze_barrier.close_receipts.clone(),
