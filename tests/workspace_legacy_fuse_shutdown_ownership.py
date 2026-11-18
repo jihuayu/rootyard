@@ -19,7 +19,7 @@ import time
 from tests import fuse_helper_native_support as support
 from tests.workspace_legacy_fuse_shutdown_support import (
     LegacyAcceptanceError,
-    mount_namespace_inode,
+    namespace_inodes,
 )
 
 SAFE_CONTAINMENT_ERRORS = frozenset((
@@ -112,22 +112,35 @@ def capture_holder_identity(holder, service_proc):
     if identity.get("state") == "Z":
         raise LegacyAcceptanceError("namespace holder is not a live observer")
     starttime = _positive_int(identity.get("starttime"), "namespace holder starttime")
+    if service_proc is None or service_proc.poll() is not None:
+        raise LegacyAcceptanceError("owned service exited before namespace holder capture")
     service_pid, service_pgid = owned_service_group(service_proc)
-    service_namespace = _positive_int(
-        mount_namespace_inode(service_pid), "service mount namespace"
+    service_identity = support.process_identity(service_pid)
+    if not isinstance(service_identity, dict):
+        raise LegacyAcceptanceError("owned service identity is unavailable at holder capture")
+    if int(service_identity.get("pid", -1)) != service_pid:
+        raise LegacyAcceptanceError("owned service identity PID changed at holder capture")
+    if service_identity.get("state") == "Z":
+        raise LegacyAcceptanceError("owned service exited before namespace holder capture")
+    service_starttime = _positive_int(
+        service_identity.get("starttime"), "service starttime"
     )
-    holder_namespace = _positive_int(
-        mount_namespace_inode(pid), "holder mount namespace"
-    )
-    if holder_namespace != service_namespace:
+    service_namespaces = namespace_inodes(service_pid)
+    holder_namespaces = namespace_inodes(pid)
+    if holder_namespaces["mount"] != service_namespaces["mount"]:
         raise LegacyAcceptanceError("namespace holder mount namespace does not match the service")
+    if holder_namespaces["user"] != service_namespaces["user"]:
+        raise LegacyAcceptanceError("namespace holder user namespace does not match the service")
     return {
         "service_pid": service_pid,
         "service_pgid": service_pgid,
+        "service_starttime": service_starttime,
         "holder_pid": pid,
         "holder_starttime": starttime,
-        "holder_mount_namespace": holder_namespace,
-        "service_namespace": service_namespace,
+        "holder_mount_namespace": holder_namespaces["mount"],
+        "holder_user_namespace": holder_namespaces["user"],
+        "service_namespace": service_namespaces["mount"],
+        "service_user_namespace": service_namespaces["user"],
     }
 
 

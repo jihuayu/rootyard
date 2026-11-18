@@ -214,10 +214,15 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         os.killpg(proc.pid, sig)
 
     def _attach_holder(self, service_proc):
-        api_pid = int(service_proc.pid)
-        holder = legacy_support.attach_namespace_holder(
-            api_pid, time.monotonic() + legacy_support.ORACLE_SECONDS
-        )
+        try:
+            holder = legacy_support.attach_namespace_holder(
+                service_proc, time.monotonic() + legacy_support.ORACLE_SECONDS
+            )
+        except legacy_support.LegacyAcceptanceError as error:
+            pending = getattr(error, "holder", None)
+            if pending is not None:
+                self.containment_owner.retain_fixture(pending)
+            raise
         self.holders.append(holder)
         proof = legacy_ownership.capture_holder_identity(holder, service_proc)
         self.holder_proofs.append((holder, proof))

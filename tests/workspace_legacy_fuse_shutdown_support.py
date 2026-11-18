@@ -35,6 +35,8 @@ ORACLE_SECONDS = 5.0
 STARTUP_OBSERVATION_SECONDS = 15.0
 PREP_SHUTDOWN_SECONDS = 180.0
 FUSE_SOURCE = "rootyard-vfs"
+ATTACH_POLL_SECONDS = 0.02
+MAX_HOLDER_ATTACH_ATTEMPTS = 3
 _MAX_SAFE_LOG_BYTES = 4 * 1024 * 1024
 
 
@@ -45,6 +47,26 @@ class LegacyAcceptanceError(RuntimeError):
 def workspace_hash(workspace_id) -> str:
     """Stable hash of the canonical lowercase UUID form used by the service."""
     return hashlib.sha256(str(uuid.UUID(str(workspace_id))).encode()).hexdigest()
+
+
+def probe_namespace_inodes(pid: int):
+    """Return exact user/mount namespace inodes, or None when unreadable."""
+    try:
+        user = int(os.stat(f"/proc/{int(pid)}/ns/user").st_ino)
+        mount = int(os.stat(f"/proc/{int(pid)}/ns/mnt").st_ino)
+    except (OSError, TypeError, ValueError):
+        return None
+    if user < 1 or mount < 1:
+        return None
+    return {"user": user, "mount": mount}
+
+
+def namespace_inodes(pid: int) -> dict:
+    """Return exact user/mount namespace inodes for an owned process."""
+    pair = probe_namespace_inodes(pid)
+    if pair is None:
+        raise LegacyAcceptanceError("process namespace identity is unavailable")
+    return pair
 
 
 def mount_namespace_inode(pid: int) -> int:
@@ -137,21 +159,293 @@ def force_stop_owned_service(harness) -> None:
     os.killpg(proc.pid, signal.SIGKILL)
 
 
-def attach_namespace_holder(api_pid: int, deadline: float):
-    """Enter the service's own user/mount namespaces before it exits."""
-    while time.monotonic() < deadline:
-        if not Path(f"/proc/{int(api_pid)}").exists():
-            break
-        try:
-            holder = support.spawn_api_namespace_holder(api_pid)
-        except support.HarnessError:
-            raise
-        if holder.poll() is not None:
-            support.terminate_process(holder)
-            time.sleep(0.02)
+def _attach_error(message: str, holder=None):
+    """Build the existing bounded error, optionally handing back one child."""
+    error = LegacyAcceptanceError(message)
+    error.holder = holder
+    return error
+
+
+def _safe_namespaces(reader, pid):
+    try:
+        value = reader(pid)
+    except OSError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    try:
+        user = int(value["user"])
+        mount = int(value["mount"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if user < 1 or mount < 1:
+        return None
+    return {"user": user, "mount": mount}
+
+
+def _poll_pause(deadline: float, clock, sleep):
+    now = clock()
+    if now >= deadline:
+        return
+    sleep(min(ATTACH_POLL_SECONDS, max(0.0, deadline - now)))
+
+
+def _live_starttime(proc, read_identity, expected_starttime=None):
+    """Return the exact live Popen starttime, or None when it is gone."""
+    if proc is None or proc.poll() is not None:
+        return None
+    try:
+        identity = read_identity(proc.pid)
+    except OSError:
+        return None
+    if not isinstance(identity, dict):
+        return None
+    try:
+        pid = int(identity.get("pid", -1))
+    except (TypeError, ValueError):
+        raise LegacyAcceptanceError("owned process identity PID is not numeric") from None
+    if pid != int(proc.pid):
+        raise LegacyAcceptanceError("owned process identity PID changed before namespace readiness")
+    if identity.get("state") == "Z":
+        return None
+    try:
+        starttime = int(identity.get("starttime"))
+    except (TypeError, ValueError):
+        raise LegacyAcceptanceError("owned process starttime is not numeric") from None
+    if starttime < 1:
+        raise LegacyAcceptanceError("owned process starttime is not positive")
+    if expected_starttime is not None and starttime != int(expected_starttime):
+        raise LegacyAcceptanceError("owned process starttime changed before namespace readiness")
+    return starttime
+
+
+def _prove_service_namespaces(
+    service_proc,
+    deadline: float,
+    *,
+    clock,
+    sleep,
+    read_identity,
+    read_namespaces,
+):
+    """Prove the exact owned service is live and already in private namespaces.
+
+    The wrapper execs ``unshare -Urm`` in the same PID, so the service must be
+    observed outside both the enclosing fixture's user and mount namespaces
+    before any observer is spawned. This is namespace identity, never a PID,
+    command-line or timing guess.
+    """
+    if service_proc is None:
+        raise LegacyAcceptanceError("owned service process is unavailable")
+    enclosing = _safe_namespaces(read_namespaces, os.getpid())
+    if enclosing is None:
+        raise LegacyAcceptanceError("enclosing fixture namespace identity is unavailable")
+    while True:
+        if clock() >= deadline:
+            raise _attach_error(
+                "owned service did not enter private namespaces within the attach bound"
+            )
+        if service_proc.poll() is not None:
+            raise _attach_error("owned service exited before namespace readiness")
+        starttime = _live_starttime(service_proc, read_identity)
+        if starttime is None:
+            _poll_pause(deadline, clock, sleep)
             continue
-        return holder
-    raise LegacyAcceptanceError("independent namespace holder could not attach before service exit")
+        namespaces = _safe_namespaces(read_namespaces, service_proc.pid)
+        if (
+            namespaces is not None
+            and namespaces["user"] != enclosing["user"]
+            and namespaces["mount"] != enclosing["mount"]
+        ):
+            stable_starttime = _live_starttime(service_proc, read_identity, starttime)
+            stable_namespaces = _safe_namespaces(read_namespaces, service_proc.pid)
+            if stable_starttime == starttime and stable_namespaces == namespaces:
+                return {
+                    "service_pid": int(service_proc.pid),
+                    "service_starttime": starttime,
+                    "namespaces": namespaces,
+                }
+        _poll_pause(deadline, clock, sleep)
+
+
+def _require_service_stable(service_proc, service, *, read_identity, read_namespaces):
+    """Terminally fail unless the exact owned service still owns its namespaces."""
+    if service_proc is None or service_proc.poll() is not None:
+        raise _attach_error("owned service exited before the holder attached")
+    starttime = _live_starttime(
+        service_proc, read_identity, service["service_starttime"]
+    )
+    if starttime is None:
+        raise _attach_error("owned service exited before the holder attached")
+    namespaces = _safe_namespaces(read_namespaces, service_proc.pid)
+    if namespaces != service["namespaces"]:
+        raise _attach_error("owned service namespaces changed before the holder attached")
+
+
+def _holder_still_matches(holder, starttime, namespaces, *, read_identity, read_namespaces):
+    if holder.poll() is not None:
+        return False
+    if _live_starttime(holder, read_identity, starttime) != starttime:
+        return False
+    return _safe_namespaces(read_namespaces, holder.pid) == namespaces
+
+
+def _wait_holder_ready(
+    holder,
+    service,
+    service_proc,
+    deadline: float,
+    *,
+    clock,
+    sleep,
+    read_identity,
+    read_namespaces,
+):
+    """Poll one exact owned holder until setns completed in the same namespaces."""
+    holder_starttime = None
+    while clock() < deadline:
+        if holder.poll() is not None:
+            return False
+        _require_service_stable(
+            service_proc,
+            service,
+            read_identity=read_identity,
+            read_namespaces=read_namespaces,
+        )
+        starttime = _live_starttime(holder, read_identity, holder_starttime)
+        if starttime is None:
+            _poll_pause(deadline, clock, sleep)
+            continue
+        holder_starttime = starttime
+        namespaces = _safe_namespaces(read_namespaces, holder.pid)
+        if namespaces != service["namespaces"]:
+            _poll_pause(deadline, clock, sleep)
+            continue
+        # Recheck holder and service in a fixed order so no stale pre-setns
+        # namespace or changed service identity can satisfy readiness.
+        if not _holder_still_matches(
+            holder,
+            starttime,
+            namespaces,
+            read_identity=read_identity,
+            read_namespaces=read_namespaces,
+        ):
+            if holder.poll() is not None:
+                return False
+            _poll_pause(deadline, clock, sleep)
+            continue
+        _require_service_stable(
+            service_proc,
+            service,
+            read_identity=read_identity,
+            read_namespaces=read_namespaces,
+        )
+        if not _holder_still_matches(
+            holder,
+            starttime,
+            namespaces,
+            read_identity=read_identity,
+            read_namespaces=read_namespaces,
+        ):
+            if holder.poll() is not None:
+                return False
+            _poll_pause(deadline, clock, sleep)
+            continue
+        _require_service_stable(
+            service_proc,
+            service,
+            read_identity=read_identity,
+            read_namespaces=read_namespaces,
+        )
+        return True
+    return False
+
+
+def _stop_owned_holder(holder, deadline: float, *, clock, sleep):
+    """Kill and reap only this exact Popen; return it when still pending at D."""
+    if holder is None:
+        return None
+    if holder.poll() is None:
+        try:
+            holder.kill()
+        except OSError:
+            pass
+    while True:
+        if holder.poll() is not None:
+            return None
+        now = clock()
+        if now >= deadline:
+            return holder
+        sleep(min(ATTACH_POLL_SECONDS, max(0.0, deadline - now)))
+
+
+def attach_namespace_holder(
+    service_proc,
+    deadline: float,
+    *,
+    clock=time.monotonic,
+    sleep=time.sleep,
+    read_identity=support.process_identity,
+    read_namespaces=probe_namespace_inodes,
+    spawn=support.spawn_api_namespace_holder,
+):
+    """Enter the service's own user/mount namespaces before it exits.
+
+    One absolute deadline bounds service namespace readiness, every holder
+    spawn, setns completion, identity/namespace rechecks, and exact-child
+    cleanup. A holder is returned only after the exact owned service PID and
+    starttime are live in the captured private namespaces and the exact owned
+    holder PID and starttime are live in those same namespaces. A still-running
+    pre-setns holder is never accepted; an exited or reparented/identity-changed
+    child is reaped before a bounded retry or an unequivocal failure.
+    """
+    service = _prove_service_namespaces(
+        service_proc,
+        deadline,
+        clock=clock,
+        sleep=sleep,
+        read_identity=read_identity,
+        read_namespaces=read_namespaces,
+    )
+    for _attempt in range(MAX_HOLDER_ATTACH_ATTEMPTS):
+        if clock() >= deadline:
+            break
+        _require_service_stable(
+            service_proc,
+            service,
+            read_identity=read_identity,
+            read_namespaces=read_namespaces,
+        )
+        holder = spawn(int(service_proc.pid))
+        try:
+            if _wait_holder_ready(
+                holder,
+                service,
+                service_proc,
+                deadline,
+                clock=clock,
+                sleep=sleep,
+                read_identity=read_identity,
+                read_namespaces=read_namespaces,
+            ):
+                return holder
+        except BaseException:
+            pending = _stop_owned_holder(
+                holder, deadline, clock=clock, sleep=sleep
+            )
+            if pending is not None:
+                raise _attach_error(
+                    "independent namespace holder could not be reaped within the attach bound",
+                    pending,
+                ) from None
+            raise
+        pending = _stop_owned_holder(holder, deadline, clock=clock, sleep=sleep)
+        if pending is not None:
+            raise _attach_error(
+                "independent namespace holder could not be reaped within the attach bound",
+                pending,
+            )
+    raise _attach_error("independent namespace holder could not attach before service exit")
 
 
 def _owned_rows(pid: int, mountpoint: Path):

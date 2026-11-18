@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Pure owner-liveness tests for legacy failure-containment children.
+"""Pure owner-liveness and namespace-attach readiness tests.
 
-These tests use fake clocks, fake Popen handles, fake mountinfo and fake mount
-disappearance observations. They never start a process, send a signal, enter a
-namespace, read real /proc, use FUSE, service, PG, network or Docker.
+These tests use fake clocks, fake Popen handles, fake namespace identity, fake
+mountinfo and fake mount disappearance observations. They never start a
+process, send a signal, enter a namespace, read real /proc, use FUSE, service,
+PG, network or Docker.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import threading
 import unittest
 from unittest import mock
 
+from tests import fuse_helper_native_support as native_support
 from tests import workspace_legacy_fuse_shutdown_acceptance as acceptance
 from tests import workspace_legacy_fuse_shutdown_ownership as ownership
 from tests import workspace_legacy_fuse_shutdown_report as report
@@ -137,6 +139,79 @@ class FakeResult:
         self.expectedFailures = []
         self.unexpectedSuccesses = []
         self.testsRun = len(self.started_ids)
+
+
+class FakeAttachClock:
+    def __init__(self, now=0.0):
+        self.now = now
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += max(seconds, 1e-9)
+
+
+class FakeAttachIdentity:
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    def __call__(self, pid):
+        self.calls.append(pid)
+        value = self.rows[pid]
+        if isinstance(value, list):
+            if len(value) > 1:
+                return value.pop(0)
+            return value[0]
+        if callable(value):
+            return value()
+        return value
+
+
+class FakeAttachNamespaces:
+    def __init__(self, rows, enclosing):
+        self.rows = rows
+        self.enclosing = dict(enclosing)
+        self.calls = []
+
+    def __call__(self, pid):
+        self.calls.append(pid)
+        value = self.rows.get(pid, self.enclosing)
+        if isinstance(value, list):
+            if len(value) > 1:
+                return value.pop(0)
+            return value[0]
+        if callable(value):
+            return value()
+        return dict(value)
+
+
+class FakeAttachSpawn:
+    def __init__(self, children, events=None):
+        self.children = list(children)
+        self.calls = []
+        self.events = events
+
+    def __call__(self, api_pid):
+        child = self.children.pop(0)
+        self.calls.append(api_pid)
+        if self.events is not None:
+            self.events.append(("spawn", child.pid))
+        return child
+
+
+def _attach_identity(service_pid, holder_pid, service_starttime=1000, holder_starttime=2000):
+    return FakeAttachIdentity({
+        service_pid: {"pid": service_pid, "state": "S", "starttime": service_starttime},
+        holder_pid: {"pid": holder_pid, "state": "S", "starttime": holder_starttime},
+    })
+
+
+def _attach_service(pid):
+    return FakeChild(pid=pid)
 
 
 def _contain(clock, child, spawn=None, mounts=None, wait_gone=None, owner=None):
@@ -411,6 +486,242 @@ class ContainmentOwnerTest(unittest.TestCase):
         finally:
             acceptance.CASE_DETAILS.clear()
             acceptance.CASE_DETAILS.update(saved)
+
+
+class NamespaceAttachReadinessTest(unittest.TestCase):
+    """Pure readiness proof for the owned service/holder attach race."""
+
+    SERVICE_PID = 4100
+    HOLDER_PID = 4200
+    OLD = {"user": 101, "mount": 201}
+    NEW = {"user": 102, "mount": 202}
+
+    def test_service_stays_in_parent_namespace_until_wrapper_unshares(self):
+        clock = FakeAttachClock()
+        service = _attach_service(self.SERVICE_PID)
+        holder = _attach_service(self.HOLDER_PID)
+        namespaces = FakeAttachNamespaces(
+            {self.SERVICE_PID: [self.OLD, self.NEW], self.HOLDER_PID: [self.NEW]},
+            enclosing=self.OLD,
+        )
+        events = []
+
+        def read_namespaces(pid):
+            value = namespaces(pid)
+            events.append(("ns", pid, value["mount"]))
+            return value
+
+        spawn = FakeAttachSpawn([holder], events=events)
+        result = support.attach_namespace_holder(
+            service,
+            1.0,
+            clock=clock,
+            sleep=clock.sleep,
+            read_identity=_attach_identity(self.SERVICE_PID, self.HOLDER_PID),
+            read_namespaces=read_namespaces,
+            spawn=spawn,
+        )
+        self.assertIs(result, holder)
+        self.assertEqual(spawn.calls, [self.SERVICE_PID])
+        spawn_at = events.index(("spawn", self.HOLDER_PID))
+        service_mounts = [
+            value for kind, pid, value in events[:spawn_at]
+            if kind == "ns" and pid == self.SERVICE_PID
+        ]
+        self.assertEqual(service_mounts[0], self.OLD["mount"])
+        self.assertIn(self.NEW["mount"], service_mounts)
+
+    def test_pre_setns_holder_is_not_accepted_until_same_namespaces(self):
+        clock = FakeAttachClock()
+        service = _attach_service(self.SERVICE_PID)
+        holder = _attach_service(self.HOLDER_PID)
+        holder_reads = []
+        namespaces = FakeAttachNamespaces(
+            {self.SERVICE_PID: [self.NEW], self.HOLDER_PID: [self.OLD, self.NEW]},
+            enclosing=self.OLD,
+        )
+
+        def read_namespaces(pid):
+            value = namespaces(pid)
+            if pid == self.HOLDER_PID:
+                holder_reads.append(value["mount"])
+            return value
+
+        result = support.attach_namespace_holder(
+            service,
+            1.0,
+            clock=clock,
+            sleep=clock.sleep,
+            read_identity=_attach_identity(self.SERVICE_PID, self.HOLDER_PID),
+            read_namespaces=read_namespaces,
+            spawn=FakeAttachSpawn([holder]),
+        )
+        self.assertIs(result, holder)
+        self.assertGreaterEqual(len(holder_reads), 2)
+        self.assertEqual(holder_reads[0], self.OLD["mount"])
+        self.assertEqual(holder_reads[-1], self.NEW["mount"])
+        self.assertEqual(holder.kills, 0)
+
+    def test_early_exit_holder_is_reaped_and_attach_fails_bounded(self):
+        clock = FakeAttachClock()
+        service = _attach_service(self.SERVICE_PID)
+        children = [
+            FakeChild(pid=self.HOLDER_PID + index, returncode=7)
+            for index in range(support.MAX_HOLDER_ATTACH_ATTEMPTS)
+        ]
+        spawn = FakeAttachSpawn(children)
+        with self.assertRaises(support.LegacyAcceptanceError) as caught:
+            support.attach_namespace_holder(
+                service,
+                1.0,
+                clock=clock,
+                sleep=clock.sleep,
+                read_identity=_attach_identity(self.SERVICE_PID, self.HOLDER_PID),
+                read_namespaces=FakeAttachNamespaces(
+                    {self.SERVICE_PID: [self.NEW]}, enclosing=self.OLD
+                ),
+                spawn=spawn,
+            )
+        self.assertEqual(
+            spawn.calls, [self.SERVICE_PID] * support.MAX_HOLDER_ATTACH_ATTEMPTS
+        )
+        self.assertTrue(all(child.kills == 0 for child in children))
+        self.assertIsNone(getattr(caught.exception, "holder", None))
+
+    def test_service_identity_change_stops_the_exact_holder(self):
+        clock = FakeAttachClock()
+        service = _attach_service(self.SERVICE_PID)
+        holder = FakeChild(pid=self.HOLDER_PID, exits_on_kill=True)
+        state = {"service_starttime": 1000}
+        identities = FakeAttachIdentity({
+            self.SERVICE_PID: lambda: {
+                "pid": self.SERVICE_PID,
+                "state": "S",
+                "starttime": state["service_starttime"],
+            },
+            self.HOLDER_PID: {
+                "pid": self.HOLDER_PID,
+                "state": "S",
+                "starttime": 2000,
+            },
+        })
+
+        def read_namespaces(pid):
+            if pid == self.HOLDER_PID:
+                state["service_starttime"] = 1001
+                return dict(self.OLD)
+            if pid == self.SERVICE_PID:
+                return dict(self.NEW)
+            return dict(self.OLD)
+
+        with self.assertRaises(support.LegacyAcceptanceError) as caught:
+            support.attach_namespace_holder(
+                service,
+                1.0,
+                clock=clock,
+                sleep=clock.sleep,
+                read_identity=identities,
+                read_namespaces=read_namespaces,
+                spawn=FakeAttachSpawn([holder]),
+            )
+        self.assertEqual(holder.kills, 1)
+        self.assertIsNone(getattr(caught.exception, "holder", None))
+
+    def test_deadline_cleans_pre_setns_holder_and_fails(self):
+        clock = FakeAttachClock()
+        service = _attach_service(self.SERVICE_PID)
+        holder = FakeChild(pid=self.HOLDER_PID, exits_on_kill=True)
+        with self.assertRaises(support.LegacyAcceptanceError) as caught:
+            support.attach_namespace_holder(
+                service,
+                0.05,
+                clock=clock,
+                sleep=clock.sleep,
+                read_identity=_attach_identity(self.SERVICE_PID, self.HOLDER_PID),
+                read_namespaces=FakeAttachNamespaces(
+                    {self.SERVICE_PID: [self.NEW], self.HOLDER_PID: [self.OLD]},
+                    enclosing=self.OLD,
+                ),
+                spawn=FakeAttachSpawn([holder]),
+            )
+        self.assertEqual(holder.kills, 1)
+        self.assertIsNone(getattr(caught.exception, "holder", None))
+
+    def test_unreapable_holder_is_handed_back_with_failure(self):
+        clock = FakeAttachClock()
+        service = _attach_service(self.SERVICE_PID)
+        holder = FakeChild(pid=self.HOLDER_PID, exits_on_kill=False)
+        with self.assertRaises(support.LegacyAcceptanceError) as caught:
+            support.attach_namespace_holder(
+                service,
+                0.05,
+                clock=clock,
+                sleep=clock.sleep,
+                read_identity=_attach_identity(self.SERVICE_PID, self.HOLDER_PID),
+                read_namespaces=FakeAttachNamespaces(
+                    {self.SERVICE_PID: [self.NEW], self.HOLDER_PID: [self.OLD]},
+                    enclosing=self.OLD,
+                ),
+                spawn=FakeAttachSpawn([holder]),
+            )
+        self.assertEqual(holder.kills, 1)
+        self.assertIs(getattr(caught.exception, "holder", None), holder)
+
+    def test_attach_never_uses_real_process_or_namespace_probes(self):
+        clock = FakeAttachClock()
+        service = _attach_service(self.SERVICE_PID)
+        holder = _attach_service(self.HOLDER_PID)
+        spawn = FakeAttachSpawn([holder])
+        with mock.patch.object(
+            native_support, "process_identity",
+            side_effect=AssertionError("real identity"),
+        ), mock.patch.object(
+            support, "probe_namespace_inodes",
+            side_effect=AssertionError("real namespace"),
+        ), mock.patch.object(
+            native_support, "spawn_api_namespace_holder",
+            side_effect=AssertionError("real spawn"),
+        ):
+            result = support.attach_namespace_holder(
+                service,
+                1.0,
+                clock=clock,
+                sleep=clock.sleep,
+                read_identity=_attach_identity(self.SERVICE_PID, self.HOLDER_PID),
+                read_namespaces=FakeAttachNamespaces(
+                    {self.SERVICE_PID: [self.NEW], self.HOLDER_PID: [self.NEW]},
+                    enclosing=self.OLD,
+                ),
+                spawn=spawn,
+            )
+        self.assertIs(result, holder)
+
+    def test_capture_rejects_user_namespace_mismatch(self):
+        holder = FakeChild(pid=self.HOLDER_PID)
+        service = FakeChild(pid=self.SERVICE_PID)
+
+        def read_identity(pid):
+            starttime = 2000 if pid == self.HOLDER_PID else 1000
+            return {"pid": pid, "state": "S", "starttime": starttime}
+
+        with mock.patch.object(
+            ownership.support, "process_identity", side_effect=read_identity
+        ), mock.patch.object(
+            ownership,
+            "namespace_inodes",
+            side_effect=[
+                {"user": 101, "mount": 201},
+                {"user": 999, "mount": 201},
+            ],
+        ), mock.patch.object(ownership.os, "getpgid", return_value=self.SERVICE_PID):
+            with self.assertRaises(ownership.LegacyAcceptanceError):
+                ownership.capture_holder_identity(holder, service)
+
+    def test_capture_rejects_service_that_exited_before_capture(self):
+        holder = FakeChild(pid=self.HOLDER_PID)
+        service = FakeChild(pid=self.SERVICE_PID, returncode=1)
+        with self.assertRaises(ownership.LegacyAcceptanceError):
+            ownership.capture_holder_identity(holder, service)
 
 
 if __name__ == "__main__":
