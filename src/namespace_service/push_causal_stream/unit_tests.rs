@@ -362,7 +362,7 @@ fn version_graph_dependency_closure_blocks_foreign_or_retired_base_pack() {
         commit_set_id: cset,
     })
     .unwrap();
-    let vpack = VerifiedClosurePack::new(pack_entry, tenant, repo, "s3", &"a".repeat(64), 1024, 2).unwrap();
+    let vpack = VerifiedClosurePack::new(pack_entry, tenant, repo, "s3", "a".repeat(64), 1024, 2).unwrap();
     let mut graph = VersionGraph::new();
     graph.insert_active(CausalVersionNode { record: rec.clone(), own_packs: vec![vpack] });
 

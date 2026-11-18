@@ -26,7 +26,7 @@ use rootyard::namespace_service::push_causal_stream::PushAuthContext;
 use rootyard::ref_store::contract::{IssuerLane, RequestDigest};
 use rootyard::ref_store::core::contract::CommitMode;
 use rootyard::ref_store::core::ref_version::*;
-use rootyard::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget};
+use rootyard::ref_store::core::types::{GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget};
 use uuid::Uuid;
 
 pub type S3Objects = Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>;

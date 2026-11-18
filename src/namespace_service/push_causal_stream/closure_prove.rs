@@ -283,14 +283,14 @@ async fn prove_inside_quarantine(
         )
         .await?;
 
-    if let Some(ref uploaded) = uploaded_opt {
-        if fault_hook == FaultInjectionHook::AbortAfterBlobQuarantineUpload {
-            slot.record_unpromoted_blob(uploaded.pack_receipt.locator());
-            slot.record_unpromoted_blob(uploaded.idx_receipt.locator());
-            return Err(PushCausalError::StateMachine(
-                "injected fault abort after quarantine Blob upload; refs untouched".into(),
-            ));
-        }
+    if let Some(ref uploaded) = uploaded_opt
+        && fault_hook == FaultInjectionHook::AbortAfterBlobQuarantineUpload
+    {
+        slot.record_unpromoted_blob(uploaded.pack_receipt.locator());
+        slot.record_unpromoted_blob(uploaded.idx_receipt.locator());
+        return Err(PushCausalError::StateMachine(
+            "injected fault abort after quarantine Blob upload; refs untouched".into(),
+        ));
     }
 
     let mut accepted_updates = Vec::with_capacity(commands.len());

@@ -223,10 +223,9 @@ impl StateMachinePushExecutor {
             expected_commitment: commitment,
         }));
 
-        let ApplyResponse::RefsCommitted(commit_receipt) = resp.map_err(|e| {
+        let ApplyResponse::RefsCommitted(commit_receipt) = resp.inspect_err(|_| {
             let _ = hold_guard.release_on_proven_abort();
             self.holds.insert(ticket.operation_id, hold_guard.clone());
-            e
         })?
         else {
             return Err(PushCausalError::StateMachine("expected RefsCommitted response".into()));
