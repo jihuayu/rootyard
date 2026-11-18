@@ -139,6 +139,7 @@ class Format31Harness(BackupHarness):
         self.deadline = work_deadline
         self.cleanup_deadline = cleanup_deadline
         self.created = []
+        self.creation_unverified = False
         self.backup = root / "backup"
         self.target = root / "restored-data"
 
@@ -157,9 +158,14 @@ class Format31Harness(BackupHarness):
     def new_database(self, admin):
         require(admin == self.admin)
         name = "rootyard_b31_" + uuid.uuid4().hex
-        require(not self.database_exists(name))
-        self.created.append(name)
-        self.query(admin, f'CREATE DATABASE "{name}" TEMPLATE template0')
+        try:
+            require(not self.database_exists(name))
+            self.query(admin, f'CREATE DATABASE "{name}" TEMPLATE template0')
+            self.created.append(name)
+        except Exception:
+            # The prior absence check cannot prove ownership after a collision or a lost reply.
+            self.creation_unverified = True
+            raise
         return urlsplit(admin)._replace(path="/" + name).geturl()
 
     def prepare(self):
@@ -210,7 +216,7 @@ class Format31Harness(BackupHarness):
 
     def cleanup(self):
         self.deadline = self.cleanup_deadline
-        removed = True
+        removed = not self.creation_unverified
         for name in reversed(self.created):
             try:
                 require(re.fullmatch(r"rootyard_b31_[0-9a-f]{32}", name))
