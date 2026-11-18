@@ -737,14 +737,16 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
     phase.set(Phase::Concurrent);
     // Concurrent proposals can advance the applied snapshot beyond another write's exact index.
     // Propose must recover its own receipt with a >= apply barrier, not return a Storage error.
-    let concurrent_a = backend.clone();
-    let concurrent_b = backend.clone();
-    let (concurrent_a, concurrent_b) = tokio::join!(
-        concurrent_a.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })),
-        concurrent_b.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })),
-    );
-    let concurrent_a = concurrent_a?;
-    let concurrent_b = concurrent_b?;
+    // Keep the cloned backend owners inside this block so both drop before the final reopen.
+    let (concurrent_a, concurrent_b) = {
+        let concurrent_a = backend.clone();
+        let concurrent_b = backend.clone();
+        let (left, right) = tokio::join!(
+            concurrent_a.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })),
+            concurrent_b.propose(RefCasCommand::Noop(NoopCommand { logical_tick: None })),
+        );
+        (left?, right?)
+    };
     assert!(proposal_outcome(&concurrent_a).is_applied());
     assert!(proposal_outcome(&concurrent_b).is_applied());
     assert_ne!(concurrent_a.log_id, concurrent_b.log_id);
