@@ -61,8 +61,8 @@ class ParallelBoundariesTest(unittest.TestCase):
             {f'{schema_baseline.LATEST_PREFIX}_{name}.json'
              for name in ('catalog', 'restored_catalog', 'upgraded_catalog')},
             'current format must freeze the newest schema catalog fixtures')
-        self.assertRegex(
-            catalog_rs, schema_baseline.backup_format_arm(current) + r' Ok\(crate::db::SCHEMA_VERSIONS\.to_vec\(\)\)',
+        self.assertEqual(
+            schema_baseline.backup_schema_versions(catalog_rs, current), schema_baseline.SCHEMA_VERSIONS,
             'current format must consume exactly the migrations embedded in this binary')
         restore_rs = (ROOT / 'src/backup/restore.rs').read_text()
         legacy_formats = {
@@ -72,6 +72,13 @@ class ParallelBoundariesTest(unittest.TestCase):
         self.assertNotIn(
             current, legacy_formats,
             'the current format must stay rejected without a legacy schema opt-in')
+
+    def test_backup_formats_29_and_30_keep_the_schema_151_roster(self):
+        catalog_rs = (ROOT / 'src/backup/catalog.rs').read_text()
+        schema_151 = [version for version in schema_baseline.SCHEMA_VERSIONS if version <= 151]
+        for format in (29, 30):
+            with self.subTest(format=format):
+                self.assertEqual(schema_baseline.backup_schema_versions(catalog_rs, format, schema_151 + [152]), schema_151)
 
     def test_backup_tables_match_schema_baseline(self):
         # The backup now consumes the frozen catalog directly. Native schema

@@ -156,7 +156,7 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
         23 | 24 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 148).collect()),
         25 | 26 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 149).collect()),
         27 | 28 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 150).collect()),
-        29 | 30 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
+        29 | 30 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 151).collect()),
         _ => bail!("unsupported backup format"),
     }
 }

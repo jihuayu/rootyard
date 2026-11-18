@@ -4,6 +4,7 @@ Centralizes version lists, table sets, and catalog paths so parallel tracks
 adding new migrations do not cause cross-suite test conflicts.
 """
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,3 +77,18 @@ A5_PACK_SNAPSHOT_TABLES = schema_delta(143)
 def backup_format_arm(format):
     """Match a complete decimal Rust pattern arm, including shared catalogs."""
     return rf"\n\s*(?:\d+\s*\|\s*)*{format}(?:\s*\|\s*\d+)*\s*=>"
+
+
+def backup_schema_versions(catalog_source, format, versions=SCHEMA_VERSIONS):
+    """Evaluate the catalog's full or version-capped roster against a supplied migration list."""
+    arm = re.search(
+        backup_format_arm(format) + r"\s*Ok\(crate::db::SCHEMA_VERSIONS"
+        r"(?:\.to_vec\(\)|\.iter\(\)\.copied\(\)\.filter\(\|version\| \*version <= (\d+)\)\.collect\(\))\)",
+        catalog_source,
+    )
+    if arm is None:
+        raise AssertionError(f"missing schema version roster for backup format {format}")
+    ceiling = arm.group(1)
+    if ceiling is None:
+        return list(versions)
+    return [version for version in versions if version <= int(ceiling)]
