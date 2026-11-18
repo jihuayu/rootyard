@@ -81,6 +81,75 @@ EOF
   apt_update
 }
 
+# The one official PGDG signing-key endpoint and its fixed fingerprint. The
+# download is retried here rather than delegated to curl's --retry because a
+# failed receive (for example curl exit 56) can leave a truncated body, and
+# curl's default retry set does not cover every receive failure. Each attempt
+# writes to its own mktemp file; failed bodies are removed and never reused.
+PGDG_KEY_URL=https://www.postgresql.org/media/keys/ACCC4CF8.asc
+PGDG_KEY_FINGERPRINT=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+PGDG_KEY_CONNECT_TIMEOUT_SECONDS=10
+PGDG_KEY_TRANSFER_TIMEOUT_SECONDS=30
+PGDG_KEY_RETRY_ATTEMPTS=3
+PGDG_KEY_RETRY_DELAY_SECONDS=2
+# Three 30-second transfers plus two 2-second delays. The loop also checks
+# this wall-clock budget, so a hung transfer cannot outlive the CI step.
+PGDG_KEY_TOTAL_TIMEOUT_SECONDS=95
+
+# Download the official PGDG signing key into <destination> with a bounded
+# number of attempts. The fingerprint is checked only after a complete body
+# arrives; an integrity failure is fatal and is not retried. On terminal
+# failure this exits non-zero before any dearmor, install, or apt change.
+download_pgdg_signing_key() {
+  local work=$1 destination=$2
+  local attempt=1 status= fingerprint tmp remaining attempt_timeout deadline
+  require_command curl
+  require_command gpg
+  require_command mktemp
+  mkdir -p -- "$work"
+  deadline=$((SECONDS + PGDG_KEY_TOTAL_TIMEOUT_SECONDS))
+  while [ "$attempt" -le "$PGDG_KEY_RETRY_ATTEMPTS" ]; do
+    remaining=$((deadline - SECONDS))
+    if [ "$remaining" -le 0 ]; then
+      fail "PGDG key download exceeded ${PGDG_KEY_TOTAL_TIMEOUT_SECONDS}s total budget"
+    fi
+    attempt_timeout=$PGDG_KEY_TRANSFER_TIMEOUT_SECONDS
+    if [ "$attempt_timeout" -gt "$remaining" ]; then
+      attempt_timeout=$remaining
+    fi
+    tmp=$(mktemp -- "$work/.pgdg-key.XXXXXXXX") ||
+      fail "cannot create a temporary PGDG key file in $work"
+    if curl -fsSL \
+      --connect-timeout "$PGDG_KEY_CONNECT_TIMEOUT_SECONDS" \
+      --max-time "$attempt_timeout" \
+      --url "$PGDG_KEY_URL" \
+      -o "$tmp"; then
+      fingerprint=$(gpg --show-keys --with-colons "$tmp" |
+        awk -F: '$1 == "fpr" { print $10; exit }')
+      if [ "$fingerprint" != "$PGDG_KEY_FINGERPRINT" ]; then
+        rm -f -- "$tmp"
+        fail "PGDG key fingerprint mismatch: ${fingerprint:-missing}"
+      fi
+      mv -- "$tmp" "$destination" ||
+        { rm -f -- "$tmp"; fail "cannot store the PGDG signing key at $destination"; }
+      return 0
+    else
+      status=$?
+      rm -f -- "$tmp"
+    fi
+    if [ "$attempt" -lt "$PGDG_KEY_RETRY_ATTEMPTS" ]; then
+      remaining=$((deadline - SECONDS))
+      if [ "$remaining" -le 0 ]; then
+        fail "PGDG key download exceeded ${PGDG_KEY_TOTAL_TIMEOUT_SECONDS}s total budget (last curl exit $status)"
+      fi
+      log "PGDG key download attempt $attempt/${PGDG_KEY_RETRY_ATTEMPTS} failed (curl exit $status); retrying in ${PGDG_KEY_RETRY_DELAY_SECONDS}s"
+      sleep "$PGDG_KEY_RETRY_DELAY_SECONDS"
+    fi
+    attempt=$((attempt + 1))
+  done
+  fail "PGDG key download failed after ${PGDG_KEY_RETRY_ATTEMPTS} attempts (last curl exit ${status:-unknown})"
+}
+
 # Install the signed PGDG repository and key exactly as the manual
 # native-kernel-acceptance workflow does, but additionally pin the expected
 # key fingerprint so a replaced key cannot silently authorise the index.
@@ -93,13 +162,8 @@ prepare_pgdg_repository() {
   require_command gpg
   mkdir -p -- "$work"
   if [ ! -s "$keyring" ]; then
-    curl -fsSL --retry 3 \
-      https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-      -o "$work/pgdg.asc"
-    fingerprint=$(gpg --show-keys --with-colons "$work/pgdg.asc" |
-      awk -F: '$1 == "fpr" { print $10; exit }')
-    [ "$fingerprint" = "B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8" ] ||
-      fail "PGDG key fingerprint mismatch: ${fingerprint:-missing}"
+    download_pgdg_signing_key "$work" "$work/pgdg.asc"
+    fingerprint=$PGDG_KEY_FINGERPRINT
     gpg --dearmor --yes -o "$work/pgdg.gpg" "$work/pgdg.asc"
     sudo install -d -m 0755 /etc/apt/keyrings
     sudo install -m 0644 "$work/pgdg.gpg" "$keyring"

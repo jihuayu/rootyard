@@ -919,7 +919,9 @@ for _guard_name in ('rename', 'replace', 'link', 'unlink', 'remove'):
         section = self.source[start:end]
         self.assertEqual(section.count(
             'artifact_store="$HOME/.cache/rootyard/native-artifacts"'), 2)
-        self.assertEqual(section.count('--artifact-store "$artifact_store"'), 4)
+        # The native11 target loop adds the fifth immutable CAS helper: one
+        # literal --artifact-store used for each of the 11 test binaries.
+        self.assertEqual(section.count('--artifact-store "$artifact_store"'), 5)
         for alias in (
             '--output "$fixture_dir/ref_store_format22_backup_fixture"',
             '--output "$standalone_dir/rootyard"',

@@ -73,11 +73,14 @@ pub(super) async fn provision_with(pool: &Pool, actor: &db::Identity, name: &str
     Ok(receipt.repository.id)
 }
 
-/// Grant the producer `write` on the owner's bound repository through the real
+/// Grant the producer `admin` on the owner's bound repository through the real
 /// owner route (`POST /api/repos/{owner}/bound/collaborators`), then read the
-/// stored grant back through the producer's own token. The owner's admin role is
-/// resolved by the production `auth::authorize_repo_with_role`; the insertion is
-/// the production `members::rbac::upsert_collaborator`, never SQL here.
+/// stored grant back through the producer's own token. The actor-owned serving
+/// facades require the existing Admin gate; this fixture-only grant does not
+/// weaken the product rule and separate HTTP/Write cases remain the writer
+/// boundary proof. The owner's admin role is resolved by production
+/// `auth::authorize_repo_with_role`; insertion is production
+/// `members::rbac::upsert_collaborator`, never SQL here.
 pub(super) async fn grant_producer(
     http: &http::Http,
     owner_token: &str,
@@ -87,9 +90,9 @@ pub(super) async fn grant_producer(
     let (owner_id, whoami_owner) = http.whoami(owner_token).await?;
     ensure!(whoami_owner == owner_username, "the owner token authenticates another user");
     let (status, body) =
-        http.post_collaborator(owner_token, owner_username, "bound", &producer.username, Role::Write).await?;
+        http.post_collaborator(owner_token, owner_username, "bound", &producer.username, Role::Admin).await?;
     ensure!(status == axum::http::StatusCode::CREATED, "the owner collaborator grant answered {status}");
-    http::ensure_created(&body, &producer.username, Role::Write)?;
+    http::ensure_created(&body, &producer.username, Role::Admin)?;
     let stored_user: Uuid = body["user_id"]
         .as_str()
         .and_then(|value| Uuid::parse_str(value).ok())
@@ -98,12 +101,12 @@ pub(super) async fn grant_producer(
     // The producer's own token must now read that exact grant.
     let (status, stored) = http.get_collaborator(&producer.token, owner_username, "bound", &producer.username).await?;
     ensure!(status == axum::http::StatusCode::OK, "the producer collaborator read answered {status}");
-    http::ensure_read_back(&stored, producer.user_id, &producer.username, Role::Write)?;
+    http::ensure_read_back(&stored, producer.user_id, &producer.username, Role::Admin)?;
     Ok(json!({
         "repository_owner_id": owner_id.to_string(),
         "user_id": producer.user_id.to_string(),
         "username": producer.username,
-        "role": Role::Write.as_str(),
+        "role": Role::Admin.as_str(),
         "route": format!("/api/repos/{owner_username}/bound/collaborators"),
         "status": status.as_u16(),
     }))

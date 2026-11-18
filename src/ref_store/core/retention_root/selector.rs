@@ -156,6 +156,23 @@ fn validate_oid(format: GitObjectFormat, oid: &str, ordinal: usize) -> Result<St
     Ok(parsed.as_hex())
 }
 
+/// Canonical marker for one caller intent before source refs are read.
+///
+/// A whole-snapshot selector is represented by an empty vector (its concrete
+/// object ids are derived only from the sealed source). An explicit selector is
+/// validated/canonicalized exactly by the same core resolver later used by
+/// prepare. This lets replay compare a changed selector without reimplementing
+/// Git OID validation in the serving facade.
+pub(crate) fn canonical_intent_oids(
+    selector: &RootSelector,
+    format: GitObjectFormat,
+) -> Result<Vec<String>, RootError> {
+    match selector {
+        RootSelector::Snapshot => Ok(Vec::new()),
+        RootSelector::ObjectIds(_) => resolve_oids(selector, format, &[], None),
+    }
+}
+
 /// Resolve the final, sorted, unique selector object ids for this capture.
 ///
 /// `refs` is the sealed captured ref set (already canonical and sorted). The returned vector is the exact

@@ -63,6 +63,18 @@
 //! (so an old body stays byte-identical and replays exactly), an old metadata
 //! pin mutation on a pack-aware pin is routed through this ledger/counter path,
 //! and a fresh metadata-only create is refused on a `pack_verified` gate.
+use super::snapshot_contract::MetadataSnapshotScope;
+use uuid::Uuid;
+
+/// Trusted stored identity of one durable pack snapshot, reconstructed from its
+/// immutable header and pin rows. It carries no live authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ServingSnapshotIdentity {
+    pub scope: MetadataSnapshotScope,
+    pub snapshot_id: Uuid,
+    pub pin_id: Uuid,
+}
+
 mod backup_read;
 mod contract;
 mod materialize;
@@ -97,6 +109,7 @@ pub use contract::{
     TENANT_MAX_PACK_SNAPSHOTS, TENANT_PACK_FACTOR,
 };
 pub(crate) use materialize::MaterializedServingRead;
+pub(crate) use materialize::RetainedServingPreparation;
 pub use materialize::{MaterializedPackRead, PgPackSnapshotMaterializer};
 pub use pg::PgPackSnapshot;
 pub use read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};

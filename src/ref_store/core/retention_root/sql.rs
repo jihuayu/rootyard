@@ -36,6 +36,39 @@ pub(super) async fn gate_realm(
     row.as_ref().map(GateRealm::from_row).transpose()
 }
 
+/// Read the live cluster authority incarnation after the caller has taken the
+/// repository/gate/pin/root locks it needs. This deliberately uses `FOR SHARE
+/// NOWAIT` and no preflight: callers preserve pin/root -> cluster order and only
+/// compare this anchor in the later short transaction. Contention is a bounded
+/// retryable refusal, never a silent empty anchor.
+pub(super) async fn cluster_incarnation_nowait(tx: &Transaction<'_>) -> Result<Uuid, RootError> {
+    let rows = match tx
+        .query("SELECT incarnation FROM public.cluster_authority WHERE singleton=true FOR SHARE NOWAIT", &[])
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) if error.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+            return Err(RootError::Store(RefStoreError::Unsupported(
+                "cluster authority is busy; retry the same request",
+            )));
+        }
+        Err(error) => return Err(RootError::Store(pg::db_error(error))),
+    };
+    let [row] = rows.as_slice() else {
+        return Err(RootError::Store(RefStoreError::Database(format!(
+            "cluster authority has {} singleton incarnation rows, expected exactly one",
+            rows.len()
+        ))));
+    };
+    let incarnation: Uuid = row.try_get(0).map_err(|_| {
+        RootError::Store(RefStoreError::Database("cluster authority row has no uuid incarnation".into()))
+    })?;
+    if incarnation.is_nil() {
+        return Err(RootError::Store(RefStoreError::Database("cluster authority incarnation is nil".into())));
+    }
+    Ok(incarnation)
+}
+
 /// Require one gate realm to belong to the root scope (tenant/format/history/epochs). A root is captured at an
 /// exact realm; a later epoch move does not re-own or widen it.
 pub(super) fn require_realm(
