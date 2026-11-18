@@ -1,7 +1,12 @@
 //! Byte-exact `.pack` header, `.idx` v2 OID table, and raw `.pack` stream
 //! `git index-pack --strict -o` bijection verifier (preventing unindexed gap/trailing bytes).
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
+
+use uuid::Uuid;
 
 use super::{
     cover_git::{HelperResourceLimits, run_git_bounded},
@@ -67,6 +72,28 @@ pub(super) fn parse_and_verify_idx_v2_oids(
     Ok((pack_nr, oids))
 }
 
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn create() -> Result<Self, PackfileUriError> {
+        let path = std::env::temp_dir().join(format!("rootyard-pack-bij-{}", Uuid::new_v4().simple()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path).map_err(|e| PackfileUriError::Internal(format!("scratch dir: {e}")))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Sequentially indexes 100% of raw `.pack` stream bytes into a temporary `.idx` via
 /// bounded `git index-pack --strict -o` and enforces byte-for-byte equality with `expected_idx_bytes`.
 pub(super) async fn verify_raw_pack_stream_bijection(
@@ -76,8 +103,8 @@ pub(super) async fn verify_raw_pack_stream_bijection(
     expected_idx_bytes: &[u8],
     limits: &HelperResourceLimits,
 ) -> Result<(), PackfileUriError> {
-    let scratch = tempfile::tempdir().map_err(|e| PackfileUriError::Internal(format!("scratch tempdir: {e}")))?;
-    let scratch_idx = scratch.path().join("bijection.idx");
+    let scratch = ScratchDir::create()?;
+    let scratch_idx = scratch.0.join("bijection.idx");
     let (Some(out_str), Some(pack_str)) = (scratch_idx.to_str(), pack_path.to_str()) else {
         return Err(PackfileUriError::IntegrityMismatch("non-utf8 pack path".to_owned()));
     };
