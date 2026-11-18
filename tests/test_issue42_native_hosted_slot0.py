@@ -6,9 +6,12 @@ that keeps the scratch job isolated from the production path.
 """
 from pathlib import Path
 from types import SimpleNamespace
+import inspect
 import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -417,6 +420,169 @@ class HostedFlowMockTest(unittest.TestCase):
         self.assertEqual(report["counts"]["failed"], 1)
         self.assertEqual(report["counts"]["not_run"], 4)
         self.assertEqual(report["failure_class"], "case")
+
+
+class BoundedExecutionTest(unittest.TestCase):
+    """Controllable local children for the bounded stdout/stderr collector."""
+
+    CHILD = r"""import os
+import sys
+import time
+
+arguments = sys.argv[1:]
+name = arguments[arguments.index("--exact") + 1]
+mode = os.environ.get("CHILD_MODE")
+parent_pid_file = os.environ.get("CHILD_PID_FILE")
+descendant_pid_file = os.environ.get("DESCENDANT_PID_FILE")
+
+
+def write_pid(path):
+    if path:
+        with open(path, "w") as stream:
+            stream.write(str(os.getpid()))
+
+
+if mode == "normal":
+    sys.stdout.write("running 1 test\n")
+    sys.stdout.write("test %s ... ok\n\n" % name)
+    sys.stdout.write(
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+        "4 filtered out; finished in 0.01s\n")
+    sys.stderr.write("local child noise\n")
+    sys.stdout.flush()
+    sys.stderr.flush()
+elif mode == "stdout-overflow":
+    sys.stdout.write("x" * 70000)
+    sys.stdout.flush()
+elif mode == "stderr-overflow":
+    sys.stderr.write("x" * 9000)
+    sys.stderr.flush()
+elif mode == "timeout":
+    write_pid(parent_pid_file)
+    time.sleep(5)
+elif mode == "hold-stdout":
+    write_pid(parent_pid_file)
+    child = os.fork()
+    if child == 0:
+        write_pid(descendant_pid_file)
+        time.sleep(5)
+        os._exit(0)
+    time.sleep(0.05)
+    os._exit(0)
+else:
+    sys.exit(3)
+"""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.script = self.root / "local-child"
+        self.script.write_text("#!" + sys.executable + "\n" + self.CHILD)
+        self.script.chmod(0o755)
+        self.environment = mock.patch.dict(os.environ, {
+            "PGUSER": "local", "PGHOST": "127.0.0.1", "PGPORT": "1"})
+        self.environment.start()
+
+    def tearDown(self):
+        self.environment.stop()
+        self.directory.cleanup()
+
+    def run_child(self, mode, *, timeout, pid_file=None, descendant_file=None):
+        environment = {"CHILD_MODE": mode}
+        if pid_file is not None:
+            environment["CHILD_PID_FILE"] = str(pid_file)
+        if descendant_file is not None:
+            environment["DESCENDANT_PID_FILE"] = str(descendant_file)
+        with mock.patch.dict(os.environ, environment):
+            return driver.execute_case(
+                self.script, "local_case", False, database="local", timeout=timeout,
+                cwd=self.root)
+
+    def assert_pid_gone(self, pid):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail("child process was not reaped")
+
+    def test_normal_child_keeps_one_bounded_pass(self):
+        raw = self.run_child("normal", timeout=2)
+        parsed = driver.parse_case_output(raw, "local_case")
+        self.assertEqual(parsed["passed"], 1)
+        self.assertLessEqual(len(raw), driver.OUTPUT_LIMIT)
+
+    def test_stdout_overflow_is_a_fixed_failure(self):
+        started = time.monotonic()
+        with self.assertRaises(driver.EvidenceError) as caught:
+            self.run_child("stdout-overflow", timeout=2)
+        self.assertEqual(caught.exception.kind, driver.EXEC_OUTPUT_OVERFLOW)
+        self.assertEqual(str(caught.exception), "qualification check failed")
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_stderr_overflow_is_a_fixed_failure(self):
+        started = time.monotonic()
+        with self.assertRaises(driver.EvidenceError) as caught:
+            self.run_child("stderr-overflow", timeout=2)
+        self.assertEqual(caught.exception.kind, driver.EXEC_OUTPUT_OVERFLOW)
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_deadline_kills_and_reaps_the_direct_child(self):
+        pid_file = self.root / "timeout.pid"
+        started = time.monotonic()
+        with self.assertRaises(driver.EvidenceError) as caught:
+            self.run_child("timeout", timeout=1.0, pid_file=pid_file)
+        self.assertEqual(caught.exception.kind, "timeout")
+        self.assertLess(time.monotonic() - started, 3)
+        self.assert_pid_gone(int(pid_file.read_text()))
+
+    def test_descendant_holding_stdout_cannot_hold_the_parent(self):
+        pid_file = self.root / "parent.pid"
+        descendant_file = self.root / "descendant.pid"
+        started = time.monotonic()
+        with self.assertRaises(driver.EvidenceError) as caught:
+            self.run_child("hold-stdout", timeout=1.0, pid_file=pid_file,
+                           descendant_file=descendant_file)
+        self.assertEqual(caught.exception.kind, "timeout")
+        self.assertLess(time.monotonic() - started, 3)
+        self.assert_pid_gone(int(pid_file.read_text()))
+        self.assertTrue(descendant_file.is_file())
+        self.assert_pid_gone(int(descendant_file.read_text()))
+
+    def test_cleanup_failure_cannot_produce_a_pass(self):
+        fake = mock.Mock(pid=os.getpid())
+        with mock.patch.object(driver.subprocess, "Popen", return_value=fake), \
+                mock.patch.object(driver, "_collect_bounded", return_value=(b"x", b"", 0)), \
+                mock.patch.object(driver, "_close_process_pipes", return_value=False), \
+                mock.patch.object(driver, "_terminate_process",
+                                  side_effect=driver.EvidenceError(driver.EXEC_REAP)):
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.execute_case(self.script, "local_case", False, database="local",
+                                    timeout=1, cwd=self.root)
+        self.assertEqual(caught.exception.kind, driver.EXEC_REAP)
+
+    def test_timeout_cleanup_failure_is_never_a_pass(self):
+        fake = mock.Mock(pid=os.getpid())
+        with mock.patch.object(driver.subprocess, "Popen", return_value=fake), \
+                mock.patch.object(driver, "_collect_bounded",
+                                  side_effect=driver.EvidenceError("timeout")), \
+                mock.patch.object(driver, "_terminate_process",
+                                  side_effect=driver.EvidenceError(driver.EXEC_REAP)):
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.execute_case(self.script, "local_case", False, database="local",
+                                    timeout=1, cwd=self.root)
+        self.assertEqual(caught.exception.kind, driver.EXEC_REAP)
+
+    def test_process_group_kill_refuses_the_caller_group(self):
+        with mock.patch.object(driver.os, "killpg") as killpg:
+            driver._kill_process_group(os.getpgrp())
+        killpg.assert_not_called()
+
+    def test_no_unbounded_communicate_remains(self):
+        source = inspect.getsource(driver.execute_case) + inspect.getsource(driver._collect_bounded)
+        self.assertNotIn("communicate", source)
 
 
 class WorkflowStaticTest(unittest.TestCase):

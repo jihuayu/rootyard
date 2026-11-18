@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import selectors
 import signal
 import shutil
 import subprocess
@@ -39,8 +40,14 @@ RUSTC_RELEASE = "1.99.1"
 TARGET = "x86_64-unknown-linux-gnu"
 CASE_TIMEOUT_SECONDS = 180
 CASE_DEADLINE_SECONDS = 900
-OUTPUT_LIMIT = 65536
+OUTPUT_LIMIT = 65536  # existing exact-libtest parser bound
+STDERR_LIMIT = 8192  # existing panic-screening bound
 REPORT_LIMIT = 8192
+REAP_TIMEOUT_SECONDS = 5
+READ_POLL_SECONDS = 0.25
+EXEC_OUTPUT_OVERFLOW = "output-overflow"
+EXEC_CASE_IO = "case-io"
+EXEC_REAP = "reap"
 JOB_TIMEOUT_MINUTES = 110
 DATABASE_PREFIX = "slot0_native_"
 SLOT_ZERO_DATABASE = re.compile(r"slot_zero_[0-9a-f]{32}")
@@ -600,6 +607,108 @@ def _database_url(name):
         os.environ["PGUSER"], os.environ["PGHOST"], os.environ["PGPORT"], name)
 
 
+def _close_process_pipes(process):
+    """Close both owned read ends; return False if either close failed."""
+    closed = True
+    for stream in (process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except Exception:
+            closed = False
+    return closed
+
+
+def _kill_process_group(process_group):
+    """Never signal the caller's own group; otherwise kill the captured group."""
+    if process_group == os.getpgrp():
+        return
+    with contextlib.suppress(OSError):
+        os.killpg(process_group, signal.SIGKILL)
+
+
+def _terminate_process(process, process_group):
+    """Kill only this invocation's captured process group, reap and close pipes."""
+    # start_new_session made the direct child the leader of a private group.
+    _kill_process_group(process_group)
+    pipes_closed = _close_process_pipes(process)
+    try:
+        process.wait(timeout=REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(process_group)
+        try:
+            process.wait(timeout=REAP_TIMEOUT_SECONDS)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvidenceError(EXEC_REAP) from error
+    except (OSError, subprocess.SubprocessError) as error:
+        raise EvidenceError(EXEC_REAP) from error
+    if not pipes_closed:
+        raise EvidenceError(EXEC_REAP)
+
+
+def _collect_bounded(process, timeout):
+    """Read both pipes under one monotonic deadline and fixed per-stream caps."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    stdout_fd = process.stdout.fileno()
+    stderr_fd = process.stderr.fileno()
+    buffers = {stdout_fd: bytearray(), stderr_fd: bytearray()}
+    limits = {stdout_fd: OUTPUT_LIMIT, stderr_fd: STDERR_LIMIT}
+    eof = {stdout_fd: False, stderr_fd: False}
+    selector = selectors.DefaultSelector()
+    try:
+        for fd in buffers:
+            try:
+                os.set_blocking(fd, False)
+                selector.register(fd, selectors.EVENT_READ)
+            except OSError as error:
+                raise EvidenceError(EXEC_CASE_IO) from error
+        while True:
+            if process.poll() is not None and all(eof.values()):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EvidenceError("timeout")
+            if all(eof.values()):
+                try:
+                    process.wait(timeout=min(remaining, READ_POLL_SECONDS))
+                except subprocess.TimeoutExpired:
+                    pass
+                except (OSError, subprocess.SubprocessError) as error:
+                    raise EvidenceError(EXEC_REAP) from error
+                continue
+            try:
+                events = selector.select(timeout=min(remaining, READ_POLL_SECONDS))
+            except OSError as error:
+                raise EvidenceError(EXEC_CASE_IO) from error
+            for key, _ in events:
+                fd = key.fd
+                data = buffers[fd]
+                try:
+                    chunk = os.read(fd, min(65536, limits[fd] - len(data) + 1))
+                except BlockingIOError:
+                    continue
+                except OSError as error:
+                    raise EvidenceError(EXEC_CASE_IO) from error
+                if not chunk:
+                    eof[fd] = True
+                    with contextlib.suppress(Exception):
+                        selector.unregister(fd)
+                    continue
+                data.extend(chunk)
+                if len(data) > limits[fd]:
+                    raise EvidenceError(EXEC_OUTPUT_OVERFLOW)
+        try:
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            raise EvidenceError("timeout") from error
+        except (OSError, subprocess.SubprocessError) as error:
+            raise EvidenceError(EXEC_REAP) from error
+        return bytes(buffers[stdout_fd]), bytes(buffers[stderr_fd]), returncode
+    finally:
+        selector.close()
+
+
 def execute_case(binary, name, ignored, *, database, timeout, cwd):
     environment = os.environ.copy()
     environment["ROOTYARD_TEST_DATABASE_URL"] = _database_url(database)
@@ -622,14 +731,31 @@ def execute_case(binary, name, ignored, *, database, timeout, cwd):
     except OSError as error:
         raise EvidenceError("case") from error
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(OSError):
-            os.killpg(process.pid, signal.SIGKILL)
-        stdout, stderr = process.communicate()
-        raise EvidenceError("timeout")
-    require(process.returncode == 0, "case")
-    require(len(stderr) <= 8192 and b"panicked" not in stderr, "case")
+        process_group = os.getpgid(process.pid)
+    except OSError:
+        process_group = process.pid
+    try:
+        stdout, stderr, returncode = _collect_bounded(process, timeout)
+    except EvidenceError as error:
+        try:
+            _terminate_process(process, process_group)
+        except EvidenceError as cleanup_error:
+            raise EvidenceError(EXEC_REAP) from cleanup_error
+        raise error
+    except Exception as error:
+        try:
+            _terminate_process(process, process_group)
+        except EvidenceError as cleanup_error:
+            raise EvidenceError(EXEC_REAP) from cleanup_error
+        raise EvidenceError(EXEC_CASE_IO) from error
+    if not _close_process_pipes(process):
+        try:
+            _terminate_process(process, process_group)
+        except EvidenceError as cleanup_error:
+            raise EvidenceError(EXEC_REAP) from cleanup_error
+        raise EvidenceError(EXEC_REAP)
+    require(returncode == 0, "case")
+    require(len(stderr) <= STDERR_LIMIT and b"panicked" not in stderr, "case")
     return stdout
 
 
