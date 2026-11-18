@@ -11,7 +11,7 @@ permissions:
 jobs:
   scratch:
     runs-on: ubuntu-22.04
-    timeout-minutes: 12
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:17
@@ -44,16 +44,20 @@ jobs:
           import os
           import re
           import secrets
+          import select
           import subprocess
           import sys
           import tarfile
+          import time
           from pathlib import Path
 
           WORK = Path(__file__).parent
           STATE = WORK / "state.json"
-          FIXTURE_PARENT = "e24f20101904d63466dfaab92170b23750aa9d9f"
-          FIXTURE_TREE = "618ecbb6898bf7c53baf7f4b832c4e7ba71f74ca"
+          BASE_SHA = "95f37e2f9538771eb3fcb069732b45b751e510c7"
+          BASE_TREE = "c0da82be808c95198d4c82c01b132cd031ad9fcf"
           ENTRY = "tests/fixtures/issue42_attempt_contract_test.sql"
+          LOCK_SETUP = "tests/fixtures/issue42_lock_setup.sql"
+          LOCK_CASES = ["same_wrapper_serialized", "reverse_order_normalized", "changed_set_refused"]
           INPUTS = {
               "tests/fixtures/issue42_attempt_contract.sql": "47823a2d7593bf71ef0ac55c4759ca23e106f6d417b301c58a9faa84d3538e76",
               ENTRY: "c3a004920996ed35deb7dd7c8ee91922293129f2f751e03e137bb3f0553ec3d8",
@@ -76,7 +80,9 @@ jobs:
 
           def initial():
               return {"source": None, "tree": None, "db": None, "created": False,
-                      "invocations": 0, "session_ended": False, "phase": "source_failed"}
+                      "invocations": 0, "session_ended": False, "phase": "source_failed",
+                      "pg_version_num": None, "rollback_schema": "not_checked", "lock_setup": False,
+                      "lock_sessions": 0, "lock_cases": []}
 
           def git(*args):
               return subprocess.run(["git", *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -86,15 +92,26 @@ jobs:
               source = digest(git("rev-parse", "HEAD"), 40)
               tree = digest(git("rev-parse", "HEAD^{tree}"), 40)
               require(source and tree and source == os.environ["TRIGGER_SHA"] == os.environ["WORKFLOW_SHA"])
-              require(git("rev-parse", "HEAD^", "HEAD^^{tree}").splitlines() == [FIXTURE_PARENT, FIXTURE_TREE])
+              require(git("rev-parse", "HEAD^", "HEAD^^{tree}").splitlines() == [BASE_SHA, BASE_TREE])
               require(git("diff-tree", "--no-commit-id", "--name-status", "--no-renames", "-r", "HEAD") ==
-                      "A\t.github/workflows/issue42-scratch-postgres.yml")
+                      "M\t.github/workflows/issue42-scratch-postgres.yml")
               require(not git("status", "--porcelain", "--untracked-files=normal"))
+              inputs = {name: Path(name).read_bytes() for name in INPUTS}
+              require(all(hashlib.sha256(data).hexdigest() == INPUTS[name] for name, data in inputs.items()))
+              prelude, separator, _ = inputs[ENTRY].partition(b"\nDO $$\nDECLARE\n    repo constant uuid")
+              require(separator and prelude.startswith(b"-- Run with psql") and b"CREATE FUNCTION fixture_state()" in prelude)
+              inputs[LOCK_SETUP] = prelude + b"""
+          DO $$ BEGIN
+              PERFORM fixture_lock(20, 10);
+              PERFORM fixture_public(20);
+              PERFORM fixture_attempt(20, 0, 10);
+              PERFORM fixture_serving_operation(10);
+          END $$;
+          COMMIT;
+          """
               archive = io.BytesIO()
               with tarfile.open(fileobj=archive, mode="w") as tar:
-                  for name, expected in INPUTS.items():
-                      data = Path(name).read_bytes()
-                      require(hashlib.sha256(data).hexdigest() == expected)
+                  for name, data in inputs.items():
                       item = tarfile.TarInfo(name)
                       item.size = len(data)
                       tar.addfile(item, io.BytesIO(data))
@@ -108,39 +125,48 @@ jobs:
               require(re.fullmatch(r"[1-9][0-9]{0,19}", run) and re.fullmatch(r"[1-9][0-9]{0,4}", attempt))
               return f"issue42_s_r{run}_a{attempt}_"
 
-          def docker(*args, data=None, capture=False, limit=15):
+          def docker_command(*args):
               container = digest(os.getenv("PG_CONTAINER"), 64)
               require(container)
+              return ["docker", "exec", "-i", "-e", "PGCONNECT_TIMEOUT=5", "-e",
+                      "PGOPTIONS=-c statement_timeout=5000 -c lock_timeout=2000", container, *args]
+
+          def docker(*args, data=None, capture=False, limit=15):
               return subprocess.run(
-                  ["docker", "exec", "-i", "-e", "PGCONNECT_TIMEOUT=5", "-e",
-                   "PGOPTIONS=-c statement_timeout=5000 -c lock_timeout=2000", container, *args],
+                  docker_command(*args),
                   input=data, stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
                   stderr=subprocess.DEVNULL, timeout=limit,
               )
 
-          def admin(db, sql, *, boolean=False):
+          def admin(db, sql, *, result_kind=None):
               result = docker("psql", "-XqAtw", "-h", "127.0.0.1", "-U", "rootyard", "-d", db,
-                              "-v", "ON_ERROR_STOP=1", "-c", sql, capture=boolean)
+                              "-v", "ON_ERROR_STOP=1", "-c", sql, capture=result_kind is not None)
               require(result.returncode == 0)
-              if boolean:
+              if result_kind == "boolean":
                   require(result.stdout in (b"t\n", b"f\n"))
                   return result.stdout == b"t\n"
+              if result_kind == "pg_version":
+                  require(re.fullmatch(rb"17[0-9]{4}\n", result.stdout))
+                  return int(result.stdout)
 
           def exists(db):
-              return admin("postgres", f"SELECT EXISTS (SELECT FROM pg_database WHERE datname = '{db}');", boolean=True)
+              return admin("postgres", f"SELECT EXISTS (SELECT FROM pg_database WHERE datname = '{db}');", result_kind="boolean")
 
-          def run():
-              state = initial()
-              save(state)
-              archive = source_archive(state)
-              require(admin("postgres", "SELECT current_setting('server_version_num')::int / 10000 = 17;", boolean=True))
-              db = database_prefix() + secrets.token_hex(6)
-              require(not exists(db))
-              state["db"] = db
-              save(state)
-              admin("postgres", f'CREATE DATABASE "{db}" TEMPLATE template0;')
-              state.update(created=True, invocations=None, phase="interrupted")
-              save(state)
+          def sessions_drained(db):
+              stop_at = time.monotonic() + 3
+              while admin("postgres", f"SELECT EXISTS (SELECT FROM pg_stat_activity WHERE datname = '{db}');",
+                          result_kind="boolean"):
+                  if time.monotonic() >= stop_at:
+                      return False
+                  time.sleep(0.05)
+              return True
+
+          def schema_status(db):
+              present = admin(db, "SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'issue42_attempt_scratch');",
+                              result_kind="boolean")
+              return "present" if present else "absent"
+
+          def run_file(db, entry, archive):
               fixture = r'''
           set -eu
           dir=$(mktemp -d)
@@ -153,21 +179,197 @@ jobs:
             -f "$dir/$2" >/dev/null 2>&1
           '''
               try:
-                  result = docker("sh", "-c", fixture, "sh", db, ENTRY, data=archive, capture=True, limit=65)
+                  result = docker("sh", "-c", fixture, "sh", db, entry, data=archive, capture=True, limit=65)
               except subprocess.TimeoutExpired:
-                  state["phase"] = "fixture_timeout"
-              else:
-                  started = result.stdout == b"fixture\n"
-                  state["invocations"] = 1 if started else None
-                  state["session_ended"] = started and result.returncode in (0, 1, 2, 3)
-                  if started and result.returncode == 0:
-                      state["phase"] = "fixture_passed"
-                  elif result.returncode in (124, 137):
-                      state["phase"] = "fixture_timeout"
-                  else:
-                      state["phase"] = "fixture_failed"
+                  return None, False, "fixture_timeout"
+              started = result.stdout == b"fixture\n"
+              ended = started and result.returncode in (0, 1, 2, 3)
+              verdict = "fixture_failed"
+              if started and result.returncode == 0:
+                  verdict = "fixture_passed"
+              elif result.returncode in (124, 137):
+                  verdict = "fixture_timeout"
+              return 1 if started else None, ended, verdict
+
+          class Session:
+              def __init__(self, db, role, deadline):
+                  self.deadline = deadline
+                  self.proc = subprocess.Popen(
+                      docker_command("env", f"PGAPPNAME=issue42_{role}", "timeout", "-k", "3s", "70s", "stdbuf", "-oL", "psql",
+                                     "-XqAtw", "-h", "127.0.0.1", "-U", "rootyard", "-d", db, "-v", "ON_ERROR_STOP=1"),
+                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+                  )
+
+              def send(self, sql, marker):
+                  data = f"{sql}\n\\echo {marker}\n".encode("ascii")
+                  require(len(data) < 4096 and self.proc.stdin.write(data) == len(data))
+
+              def expect(self, marker):
+                  expected = (marker + "\n").encode("ascii")
+                  data = b""
+                  while data != expected:
+                      remaining = self.deadline - time.monotonic()
+                      if remaining <= 0 or not select.select([self.proc.stdout], [], [], remaining)[0]:
+                          raise TimeoutError("lock marker deadline")
+                      chunk = os.read(self.proc.stdout.fileno(), len(expected) - len(data) + 1)
+                      data += chunk
+                      require(chunk and expected.startswith(data))
+
+              def exchange(self, sql, marker):
+                  self.send(sql, marker)
+                  self.expect(marker)
+
+          def sessions_closed(sessions):
+              for session in sessions:
+                  session.proc.stdin.close()
+              clean = True
+              for session in sessions:
+                  try:
+                      clean = session.proc.wait(timeout=5) == 0 and clean
+                  except subprocess.TimeoutExpired:
+                      session.proc.kill()
+                      session.proc.wait(timeout=3)
+                      clean = False
+                  finally:
+                      session.proc.stdout.close()
+              return bool(sessions) and clean
+
+          START_SESSION = """
+          SET search_path = issue42_attempt_scratch, pg_catalog, pg_temp;
+          SET lock_timeout = '10s';
+          SET statement_timeout = '12s';
+          SET idle_in_transaction_session_timeout = '15s';
+          """
+          WAIT_FOR_FIRST_KEY = """
+          DO $$
+          DECLARE stop_at timestamptz := clock_timestamp() + interval '5 seconds';
+          BEGIN
+              LOOP
+                  PERFORM pg_stat_clear_snapshot();
+                  EXIT WHEN EXISTS (
+                      SELECT FROM pg_stat_activity a JOIN pg_locks l ON l.pid = a.pid
+                      WHERE a.application_name = 'issue42_waiter' AND a.datname = current_database()
+                      AND l.locktype = 'advisory' AND l.objsubid = 1 AND l.mode = 'ExclusiveLock' AND NOT l.granted
+                      AND ((l.classid::bigint << 32) | l.objid::bigint) = operation_lock_key(fixture_id(1), fixture_id(10))
+                      AND pg_backend_pid() = ANY(pg_blocking_pids(a.pid))
+                      AND NOT EXISTS (SELECT FROM pg_locks held WHERE held.pid = a.pid
+                                      AND held.locktype = 'advisory' AND held.granted)
+                  );
+                  IF clock_timestamp() >= stop_at THEN RAISE EXCEPTION 'first-key barrier not reached'; END IF;
+                  PERFORM pg_sleep(0.02);
+              END LOOP;
+          END $$;
+          """
+          ROTATE = """
+          UPDATE ref_store_core_gates SET revision = 7 WHERE repository_id = fixture_id(1);
+          DO $$ BEGIN
+              PERFORM fixture_stale_reject(10, 110);
+              PERFORM fixture_select_next(20, 21);
+          END $$;
+          COMMIT;
+          """
+          REFUSE_CHANGED = """
+          BEGIN ISOLATION LEVEL READ COMMITTED;
+          DO $$ BEGIN
+              BEGIN
+                  PERFORM lock_wrapper(fixture_id(1), fixture_id(20), fixture_id(10));
+                  RAISE EXCEPTION 'changed lock set admitted';
+              EXCEPTION WHEN serialization_failure THEN
+                  IF SQLERRM <> 'wrapper lock set changed' THEN RAISE; END IF;
+              END;
+              PERFORM fixture_assert(wrapper_lock_ids(fixture_id(1), fixture_id(20), fixture_id(10)) =
+                                     ARRAY[fixture_id(10), fixture_id(20), fixture_id(21)], 'rotated set visible');
+              PERFORM fixture_assert(NOT EXISTS (SELECT FROM pg_locks WHERE pid = pg_backend_pid()
+                                                AND locktype = 'advisory' AND granted), 'refused lock set released');
+          END $$;
+          COMMIT;
+          """
+
+          def acquire(public, proposed):
+              return f"""
+          BEGIN ISOLATION LEVEL READ COMMITTED;
+          DO $$ BEGIN
+              PERFORM fixture_assert(wrapper_lock_ids(fixture_id(1), fixture_id({public}), fixture_id({proposed})) =
+                                     ARRAY[fixture_id(10), fixture_id(20)], 'canonical pair');
+              PERFORM lock_wrapper(fixture_id(1), fixture_id({public}), fixture_id({proposed}));
+              PERFORM require_operation_lock(fixture_id(1), fixture_id(10));
+              PERFORM require_operation_lock(fixture_id(1), fixture_id(20));
+          END $$;
+          """
+
+          def lock_proof(db, state):
+              sessions = []
+              deadline = time.monotonic() + 45
+              try:
+                  for role in ("holder", "waiter"):
+                      session = Session(db, role, deadline)
+                      sessions.append(session)
+                      session.exchange(START_SESSION, "ready")
+                      state["lock_sessions"] += 1
+                      save(state)
+                  holder, waiter = sessions
+                  # The reversed call probes the two candidate IDs, not a second public wrapper.
+                  for case, pair in zip(LOCK_CASES[:2], ((20, 10), (10, 20))):
+                      holder.exchange(acquire(20, 10), "held")
+                      waiter.send(acquire(*pair), "entered")
+                      holder.exchange(WAIT_FOR_FIRST_KEY, "blocked_on_first")
+                      holder.exchange("COMMIT;", "released")
+                      waiter.expect("entered")
+                      waiter.exchange("COMMIT;", case)
+                      state["lock_cases"].append(case)
+                      save(state)
+                  holder.exchange("""
+          BEGIN ISOLATION LEVEL READ COMMITTED;
+          DO $$ BEGIN PERFORM fixture_lock(20, 21); END $$;
+          """, "held")
+                  waiter.send(REFUSE_CHANGED, LOCK_CASES[2])
+                  holder.exchange(WAIT_FOR_FIRST_KEY, "blocked_on_first")
+                  holder.exchange(ROTATE, "rotated")
+                  waiter.expect(LOCK_CASES[2])
+                  state["lock_cases"].append(LOCK_CASES[2])
+              except TimeoutError:
+                  state["phase"] = "lock_timeout"
+              finally:
+                  state["session_ended"] = sessions_closed(sessions)
+                  save(state)
+              return state["session_ended"] and state["lock_cases"] == LOCK_CASES
+
+          def run():
+              state = initial()
               save(state)
-              return state["phase"] == "fixture_passed"
+              archive = source_archive(state)
+              state["pg_version_num"] = admin("postgres", "SELECT current_setting('server_version_num');", result_kind="pg_version")
+              db = database_prefix() + secrets.token_hex(6)
+              require(not exists(db))
+              state["db"] = db
+              save(state)
+              admin("postgres", f'CREATE DATABASE "{db}" TEMPLATE template0;')
+              state.update(created=True, invocations=None, phase="interrupted")
+              save(state)
+              state["invocations"], state["session_ended"], state["phase"] = run_file(db, ENTRY, archive)
+              save(state)
+              if state["phase"] != "fixture_passed":
+                  return False
+              state.update(phase="rollback_failed", rollback_schema="unproven")
+              save(state)
+              if sessions_drained(db):
+                  state["rollback_schema"] = schema_status(db)
+              save(state)
+              if state["rollback_schema"] != "absent":
+                  return False
+              state.update(lock_setup=True, session_ended=False, phase="lock_setup_failed")
+              save(state)
+              setup_count, state["session_ended"], setup_verdict = run_file(db, LOCK_SETUP, archive)
+              save(state)
+              if setup_count != 1 or setup_verdict != "fixture_passed":
+                  return False
+              state.update(session_ended=False, phase="lock_failed")
+              save(state)
+              if lock_proof(db, state):
+                  state["phase"] = "lock_passed"
+                  save(state)
+                  return True
+              return False
 
           def cleanup(state):
               db = state["db"]
@@ -176,12 +378,10 @@ jobs:
               require(re.fullmatch(re.escape(database_prefix()) + r"[0-9a-f]{12}", db))
               schema = "unproven"
               try:
-                  if exists(db) and (state["invocations"] == 0 or state["session_ended"]) and not admin(
-                      "postgres", f"SELECT EXISTS (SELECT FROM pg_stat_activity WHERE datname = '{db}');", boolean=True,
-                  ):
-                      present = admin(db, "SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'issue42_attempt_scratch');",
-                                      boolean=True)
-                      schema = "present" if present else "absent"
+                  if exists(db) and (state["invocations"] == 0 or state["session_ended"]) and sessions_drained(db):
+                      if state["lock_setup"] and state["rollback_schema"] == "absent":
+                          admin(db, "DROP SCHEMA IF EXISTS issue42_attempt_scratch CASCADE;")
+                      schema = schema_status(db)
               except Exception:
                   pass
               database = "unproven"
@@ -197,17 +397,29 @@ jobs:
               state = json.loads(STATE.read_text(encoding="ascii")) if STATE.exists() else initial()
               schema, database = cleanup(state)
               verdict = state["phase"]
-              require(verdict in ("source_failed", "setup_failed", "interrupted", "fixture_passed", "fixture_timeout", "fixture_failed"))
+              require(verdict in ("source_failed", "setup_failed", "interrupted", "fixture_passed", "fixture_timeout",
+                                  "fixture_failed", "rollback_failed", "lock_setup_failed", "lock_failed", "lock_timeout", "lock_passed"))
               require(state["invocations"] is None or type(state["invocations"]) is int and state["invocations"] in (0, 1))
-              if verdict == "fixture_passed":
+              require(type(state["lock_sessions"]) is int and state["lock_sessions"] in (0, 1, 2)
+                      and state["lock_cases"] == LOCK_CASES[:len(state["lock_cases"])])
+              require(state["rollback_schema"] in ("not_checked", "unproven", "absent", "present"))
+              version = state["pg_version_num"]
+              require(version is None or type(version) is int and 170000 <= version < 180000)
+              if verdict == "lock_passed":
+                  require(state["lock_sessions"] == 2 and state["lock_cases"] == LOCK_CASES and state["rollback_schema"] == "absent")
                   verdict = "passed" if (state["invocations"], schema, database) == (1, "absent", "dropped") else "cleanup_failed"
+              elif verdict == "fixture_passed":
+                  verdict = "interrupted"
               elif database == "unproven" or schema == "present" or (state["session_ended"] and schema != "absent"):
                   verdict = "cleanup_failed"
               report = {
-                  "version": 1, "scope": "single_session", "verdict": verdict,
+                  "version": 2, "scope": "scratch_and_two_session_lock", "verdict": verdict,
                   "trigger_sha": digest(os.getenv("TRIGGER_SHA"), 40), "workflow_sha": digest(os.getenv("WORKFLOW_SHA"), 40),
                   "source_sha": digest(state["source"], 40), "source_tree": digest(state["tree"], 40),
                   "inputs_sha256": INPUTS if digest(state["source"], 40) else {}, "fixture_invocations": state["invocations"],
+                  "reference_sha": BASE_SHA, "reference_tree": BASE_TREE, "pg_version_num": version,
+                  "rollback_schema": state["rollback_schema"], "lock_sessions": state["lock_sessions"],
+                  "lock_cases": state["lock_cases"], "lock_case_count": len(state["lock_cases"]),
                   "schema": schema, "database": database,
               }
               (WORK / "outcome.json").write_text(json.dumps(report, sort_keys=True) + "\n", encoding="ascii")
@@ -226,8 +438,8 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 2
           persist-credentials: false
-      - name: Run the single-session rollback fixture
-        timeout-minutes: 3
+      - name: Run the rollback fixture and two-session lock proof
+        timeout-minutes: 5
         env:
           PG_CONTAINER: ${{ job.services.postgres.id }}
         run: python3 "$RUNNER_TEMP/issue42-scratch-postgres/verify.py" run
