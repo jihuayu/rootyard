@@ -77,6 +77,17 @@ fn create_repacked_bare_repo(root: &Path, git_bin: &Path, fmt: PackObjectFormat)
     (bare, tip)
 }
 
+fn overwrite_pack_file(path: &Path, data: &[u8]) {
+    #[cfg(not(unix))]
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+    std::fs::remove_file(path).unwrap();
+    std::fs::write(path, data).unwrap();
+}
+
 #[tokio::test]
 async fn raw_pack_trailing_gap_bytes_rejected_by_bijection_and_never_offloaded() {
     let git_bin = find_git_bin();
@@ -115,8 +126,8 @@ async fn raw_pack_trailing_gap_bytes_rejected_by_bijection_and_never_offloaded()
     // Header + fanout + OID table + checksums still match superficially...
     assert!(parse_and_verify_idx_v2_oids(&tampered_pack, &tampered_idx, PackObjectFormat::Sha256, 1024).is_ok());
 
-    std::fs::write(&pack_path, &tampered_pack).unwrap();
-    std::fs::write(&idx_path, &tampered_idx).unwrap();
+    overwrite_pack_file(&pack_path, &tampered_pack);
+    overwrite_pack_file(&idx_path, &tampered_idx);
 
     // ...but `verify_raw_pack_stream_bijection` (`git index-pack --strict -o`) catches the unindexed bytes!
     assert!(
