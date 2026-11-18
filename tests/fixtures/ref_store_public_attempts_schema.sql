@@ -161,6 +161,8 @@ DECLARE
     other_repo constant uuid := fixture_id(2);
     prior_owner constant uuid := fixture_id(3);
     next_owner constant uuid := fixture_id(4);
+    invalid_slot_public_id constant uuid := fixture_id(32);
+    invalid_slot_private_id constant uuid := fixture_id(50);
     occupied uuid;
     ids uuid[];
 BEGIN
@@ -200,10 +202,14 @@ BEGIN
                             '23505', 'candidate_claim');
     PERFORM fixture_refuses('SELECT fixture_admit(fixture_id(1), fixture_id(3), fixture_id(40), fixture_id(20))',
                             '23505', 'candidate_claim');
-    PERFORM lock_candidates(repo, fixture_id(30), fixture_id(50), NULL);
-    PERFORM fixture_refuses('INSERT INTO ref_store_private_attempts VALUES (fixture_id(1), fixture_id(30), 2, fixture_id(50))',
+    PERFORM lock_candidates(repo, invalid_slot_public_id, fixture_id(31), invalid_slot_private_id);
+    PERFORM require_operation_lock(repo, invalid_slot_public_id);
+    PERFORM require_unclaimed(repo, invalid_slot_private_id);
+    PERFORM fixture_refuses(format('INSERT INTO ref_store_private_attempts VALUES (%L, %L, 2, %L)',
+                                   repo, invalid_slot_public_id, invalid_slot_private_id),
                             '23514', 'attempt_slot');
 
+    -- Exercise the relational owner change. The transfer API refuses pg_refstore.
     UPDATE repositories SET owner_id = next_owner WHERE id = repo;
     IF (SELECT owner_id FROM repositories WHERE id = repo) IS DISTINCT FROM next_owner
        OR (SELECT count(*) FROM ref_store_public_operations WHERE repository_id = repo AND admission_owner_id = prior_owner) <> 2
@@ -228,8 +234,8 @@ BEGIN
                             '55000', 'admission_history');
     PERFORM fixture_refuses('TRUNCATE ref_store_public_operations, ref_store_private_attempts', '55000', 'admission_history');
 
-    -- Model only the SQL delete after lifecycle authorization has succeeded.
-    -- The delete fixture has no existing 138 operation or cancellation ledger.
+    -- Model the SQL cascade for a parent delete that has already passed authorization.
+    -- Deployed purge still refuses pg_refstore and repositories with RefStore ledgers.
     DELETE FROM repositories WHERE id = other_repo;
     IF EXISTS (SELECT FROM ref_store_public_operations WHERE repository_id = other_repo)
        OR EXISTS (SELECT FROM ref_store_private_attempts WHERE repository_id = other_repo)
