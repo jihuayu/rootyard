@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -525,6 +526,26 @@ def seed_synthetic_manifest(
 
 
 def run_suite(binary: str) -> dict:
+    stage = "setup"
+
+    def enter_stage(next_stage: str) -> str:
+        nonlocal stage
+        previous_stage = stage
+        stage = next_stage
+        return previous_stage
+
+    try:
+        return _run_live_suite(binary, enter_stage)
+    except AssertionError:
+        try:
+            print(f"pando PITR live assertion stage ({stage})", file=sys.stderr, flush=True)
+        except Exception:
+            # A diagnostic write failure must preserve the original assertion.
+            pass
+        raise
+
+
+def _run_live_suite(binary: str, enter_stage: Callable[[str], str]) -> dict:
     admin_url = os.environ["ROOTYARD_TEST_DATABASE_URL"]
     root = Path(tempfile.mkdtemp(prefix="rootyard-pitr-svc-"))
     suffix = uuid.uuid4().hex[:12]
@@ -575,6 +596,7 @@ def run_suite(binary: str) -> dict:
         src_env = {**base_env, "DATABASE_URL": src_url, "ROOTYARD_DATA_DIR": str(src_data)}
 
         # 1. Invalid ROOTYARD_PANDO_REMOTE_DELETE value fails closed at startup.
+        enter_stage("startup_fail_closed")
         run_cmd([binary, "migrate"], env=src_env)
         bogus_env = {**src_env, "ROOTYARD_PANDO_REMOTE_DELETE": "maybe", "ROOTYARD_BIND": f"127.0.0.1:{alloc_port()}"}
         bogus = run_cmd([binary, "serve"], env=bogus_env, check=False)
@@ -582,6 +604,7 @@ def run_suite(binary: str) -> dict:
         assert b"ROOTYARD_PANDO_REMOTE_DELETE" in bogus.stderr, bogus.stderr
 
         # 2. Live source service attests epoch 1 proof and exposes CLI status/verify.
+        enter_stage("authority")
         alice = json.loads(run_cmd([binary, "create-user", "alice"], env=src_env).stdout.decode())
         src_live_env = {**src_env, "ROOTYARD_PANDO_REMOTE_DELETE": "true", "ROOTYARD_STORAGE_MAINTENANCE": "false"}
         src_svc = ServiceHandle(binary, src_live_env, root / "src.log")
@@ -598,6 +621,7 @@ def run_suite(binary: str) -> dict:
         assert verify_1["authority_id"] == src_auth_id
 
         # 2b. Create real Pando repository via HTTP + pando-transition cutover + stock git push.
+        enter_stage("repo_cutover")
         code, real_repo = src_svc.http_json("/api/repos", alice["token"], method="POST", payload={"name": "pitr-git-real"})
         assert code in (200, 201, 202), (code, real_repo)
         real_repo_id = real_repo["id"]
@@ -662,6 +686,7 @@ def run_suite(binary: str) -> dict:
         assert i_code == 200 and head2.encode() in src_refs, (i_code, src_refs[:400])
 
         # 3. Create synthetic retention repo, switch repo to serving Pando, test retention roots + safe pruning.
+        enter_stage("retention_prune")
         code, repo = src_svc_pando.http_json("/api/repos", alice["token"], method="POST", payload={"name": "pitr-live"})
         assert code in (200, 201, 202), (code, repo)
         repo_id = repo["id"]
@@ -746,6 +771,7 @@ def run_suite(binary: str) -> dict:
 
         # Seed an unlinked probe manifest before pg_dump so the clone test can retire an unreachable
         # artifact while keeping live serving packs healthy for post-isolate hydration checks.
+        enter_stage("dump_restore_clone")
         _m_probe_id, probe_keys = seed_synthetic_manifest(src_url, s3, repo_id, owner_id, src_auth_id, "probe")
 
         # 4. Real pg_dump + pg_restore clone sharing the SAME bucket MUST fail closed.
@@ -818,6 +844,7 @@ def run_suite(binary: str) -> dict:
 
         # 5. Operator isolate --confirm-shared-bucket rotates clone authority cleanly without touching old S3 keys,
         # migrates live scoped objects to the new authority, and serves HTTP browse + stock Git from empty cache.
+        enter_stage("isolate")
         isolated = json.loads(
             run_cmd([binary, "pando-authority", "isolate", "--confirm-shared-bucket"], env=clone_env).stdout.decode()
         )
@@ -916,6 +943,7 @@ def run_suite(binary: str) -> dict:
         results["operator_isolate_recovered"] = True
 
         # 6. Simulated PITR epoch rollback on source DB fails closed and latches fence.
+        enter_stage("epoch_rollback")
         sql_query(src_url, "UPDATE pando_storage_authorities SET authority_epoch = authority_epoch - 1 WHERE singleton;")
         verify_rollback = run_cmd([binary, "pando-authority", "verify"], env=src_live_env, check=False)
         rollback_err = verify_rollback.stderr.decode(errors="replace")
@@ -934,6 +962,7 @@ def run_suite(binary: str) -> dict:
         results["passed"] = True
         return results
     finally:
+        previous_stage = enter_stage("cleanup")
         for svc in services:
             try:
                 svc.stop()
@@ -947,6 +976,7 @@ def run_suite(binary: str) -> dict:
             except Exception:
                 pass
         shutil.rmtree(root, ignore_errors=True)
+        enter_stage(previous_stage)
 
 
 class EvidenceError(RuntimeError):
