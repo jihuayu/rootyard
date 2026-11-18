@@ -392,15 +392,18 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
         self.barrier_key = None
         self.barrier_schema = '"' + self.schema + '"'
 
-    def conflicting_blob_identity_overrides(self):
-        """One unused root prefix selects a different physical Blob identity.
+    def conflicting_blob_identity_overrides(self, identity=None):
+        """One unused child segment selects a different physical Blob identity.
 
         ``BlobBackendIdentity`` includes the configured root prefix, so this is
         a real distinct backend mapping without changing the provider, bucket,
-        credentials or any shared object. The value stays out of the report.
+        credentials or any shared object. The child is one production-valid
+        segment: a short label plus the complete 32-hex UUID, comfortably below
+        ``MAX_NAMESPACE_BYTES`` (48). The value stays out of the report.
         """
+        identity = uuid.uuid4() if identity is None else identity
         prefix = self.env.get("ROOTYARD_BLOB_ROOT", "").strip("/")
-        root = (prefix + "/" if prefix else "") + "identity-conflict-" + uuid.uuid4().hex
+        root = (prefix + "/" if prefix else "") + "conflict-" + identity.hex
         return {"ROOTYARD_BLOB_ROOT": root}
 
     def _backend_identity_conflict_phase(self, phase):

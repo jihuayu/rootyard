@@ -15,6 +15,7 @@ import re
 import sys
 import types
 import unittest
+import uuid
 from unittest import mock
 from pathlib import Path
 
@@ -430,7 +431,9 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertIsNotNone(helper_node, "the conflicting backend fixture helper is missing")
         helper = ast.get_source_segment(self.harness, helper_node)
         self.assertIn("ROOTYARD_BLOB_ROOT", helper)
-        self.assertIn("uuid.uuid4().hex", helper)
+        self.assertIn("uuid.uuid4()", helper)
+        self.assertIn("identity.hex", helper)
+        self.assertNotIn("identity-conflict-", helper)
 
         # The injected boundary is the actual opened-store identity, and the
         # expected refusal literals are the production mappings. A future source
@@ -446,6 +449,69 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertEqual(conflict.group(1), "repository state changed; retry")
         session_source = (ROOT / "src" / "blob_git_gateway" / "session.rs").read_text(encoding="utf-8")
         self.assertIn('StatusCode::CONFLICT => GatewayError::Conflict("repository is not ready")', session_source)
+
+    def test_conflicting_blob_identity_fixture_stays_within_production_root_bounds(self) -> None:
+        # Pure fixture check: no service, process, socket, database or Cargo run.
+        fixed = uuid.UUID("0123456789abcdef0123456789abcdef")
+        other = uuid.UUID("fedcba9876543210fedcba9876543210")
+        self.assertEqual(len(fixed.hex), 32)
+        self.assertEqual(len(other.hex), 32)
+        parent = "owned-parent/run-289"
+        env = {
+            "ROOTYARD_BLOB_ROOT": parent,
+            "ROOTYARD_BLOB_SERVICE": "s3",
+            "ROOTYARD_BLOB_BUCKET": "fixture-bucket",
+            "ROOTYARD_BLOB_ACCESS_KEY_ID": "fixture-access-key",
+            "ROOTYARD_BLOB_SECRET_ACCESS_KEY": "fixture-secret",
+        }
+        harness = types.SimpleNamespace(env=dict(env))
+        overrides = [
+            (provisioning.ProvisioningHarness.conflicting_blob_identity_overrides(harness, identity), identity)
+            for identity in (fixed, other)
+        ]
+        generated = provisioning.ProvisioningHarness.conflicting_blob_identity_overrides(harness)
+        # The override preserves the owned parent prefix, provider, bucket and
+        # credentials. Only the fixture's root mapping changes.
+        self.assertEqual(harness.env, env, "fixture mutated provider, bucket, credentials or parent prefix")
+        self.assertEqual(set(generated), {"ROOTYARD_BLOB_ROOT"})
+        self.assertEqual(generated["ROOTYARD_BLOB_ROOT"].rpartition("/")[0], parent)
+        self.assertRegex(generated["ROOTYARD_BLOB_ROOT"].rpartition("/")[2],
+                         r"\Aconflict-[0-9a-f]{32}\Z")
+        # The production bound is read from the source the service validates
+        # at startup, not duplicated as a local constant.
+        types_source = (ROOT / "src" / "blob_store" / "types.rs").read_text(encoding="utf-8")
+        namespace_match = re.search(r"(?m)^pub const MAX_NAMESPACE_BYTES: usize = (\d+);$", types_source)
+        self.assertIsNotNone(namespace_match, "production MAX_NAMESPACE_BYTES is missing")
+        namespace_bound = int(namespace_match.group(1))
+        config_source = (ROOT / "src" / "blob_store" / "config.rs").read_text(encoding="utf-8")
+        total_match = re.search(r"root\.len\(\) > (\d+)", config_source)
+        self.assertIsNotNone(total_match, "production root total-length bound is missing")
+        total_bound = int(total_match.group(1))
+        roots = []
+        for override, identity in overrides:
+            self.assertEqual(set(override), {"ROOTYARD_BLOB_ROOT"})
+            root = override["ROOTYARD_BLOB_ROOT"]
+            roots.append(root)
+            self.assertTrue(root.isascii(), "fixture root must be ASCII")
+            self.assertFalse(root.startswith("/"))
+            self.assertFalse(root.endswith("/"))
+            self.assertLessEqual(len(root), total_bound)
+            segments = root.split("/")
+            self.assertEqual(segments[:-1], parent.split("/"),
+                             "fixture replaced rather than appended to the owned parent prefix")
+            for segment in segments:
+                self.assertTrue(segment)
+                self.assertNotIn(segment, (".", ".."))
+                self.assertRegex(segment, r"\A[A-Za-z0-9._-]+\Z")
+                self.assertLessEqual(len(segment), namespace_bound)
+            child = segments[-1]
+            self.assertEqual(child, "conflict-" + identity.hex)
+            self.assertRegex(child, r"\Aconflict-[0-9a-f]{32}\Z")
+            self.assertLess(len(child), namespace_bound,
+                            "fixture child must keep a margin below the production namespace bound")
+        self.assertNotEqual(roots[0], roots[1], "controlled identities must select distinct backend mappings")
+        self.assertEqual(roots[0].rpartition("/")[0], roots[1].rpartition("/")[0],
+                         "controlled identities must keep one stable parent prefix")
 
     def test_legacy_format_refusal_is_real_api_metadata_and_not_an_upgrade_path(self) -> None:
         tree = ast.parse(self.harness)
