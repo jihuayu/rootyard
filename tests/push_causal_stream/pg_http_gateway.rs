@@ -371,8 +371,10 @@ async fn exercise_concurrent_same_ref_http_race(
             .await?;
         let new_oid = mk_commit(&dir, &format!("{tag}.txt"), &format!("racer-{tag}\n"), &format!("race {tag}"))?;
         let pack = run_git(&dir, &["--no-pager", "pack-objects", "--stdout", "--all"], Some(b""))?;
-        let cmd = format!("{base_oid} {new_oid} refs/heads/race");
-        wires.push((Uuid::new_v4(), build_receive_wire(&[cmd.as_str()], "report-status", &pack)));
+        wires.push((
+            Uuid::new_v4(),
+            build_receive_wire(&[(base_oid.as_str(), new_oid.as_str(), "refs/heads/race")], "report-status", &pack),
+        ));
     }
 
     let url = format!("http://{addr}/git/{}/{repo_name}.git/git-receive-pack", actor.username);
