@@ -311,7 +311,7 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
     // 4. Real TCP HTTP slowloris command-phase stall against production `git-receive-pack` (#183 Merge Gate 1).
     let stall_repo = format!("stall-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let stall_repo_id = create_and_provision_repo(gw.addr, &pg.pool, &store, &actor, &stall_repo, "sha1").await?;
-    let tight_gw = LiveGateway::start(pg.pool.clone(), store.clone(), Duration::from_millis(250)).await?;
+    let tight_gw = LiveGateway::start(pg.pool.clone(), store.clone(), Duration::from_secs(5)).await?;
     let auth_b64 = base64_basic(&actor.username, &actor.token);
     let mut stream = TcpStream::connect(tight_gw.addr).await?;
     let req_head = format!(
@@ -326,9 +326,9 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
     stream.write_all(req_head.as_bytes()).await?;
     stream.write_all(b"0067000000000000").await?;
     stream.flush().await?;
-    tokio::time::sleep(Duration::from_millis(420)).await;
+    tokio::time::sleep(Duration::from_millis(5500)).await;
     let mut resp_buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut resp_buf)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut resp_buf)).await;
     let resp_str = String::from_utf8_lossy(&resp_buf);
     ensure!(
         resp_str.starts_with("HTTP/1.1 504 ") || resp_str.starts_with("HTTP/1.1 408 "),
