@@ -170,7 +170,7 @@ impl StateMachinePushExecutor {
             .map_err(|e| PushCausalError::StateMachine(format!("{e:?}")))?
             .ok_or_else(|| PushCausalError::StateMachine("repository gate not initialized".into()))?;
 
-        let (hold_ids, consume_request_id, mut hold_guard) = match build_acquire_holds_cmd(
+        let (hold_ids, hold_req_pair, mut hold_guard) = match build_acquire_holds_cmd(
             &bundle.receipt,
             snapshot,
             ticket,
@@ -178,9 +178,9 @@ impl StateMachinePushExecutor {
             backend_hex,
             &gate_ver.digest().as_hex(),
         ) {
-            Some((cmd, ids, cid, guard)) => {
+            Some((cmd, ids, pair, guard)) => {
                 self.apply(cmd)?;
-                (ids, Some(cid), guard)
+                (ids, Some(pair), guard)
             }
             None => (Vec::new(), None, OperationHoldGuard::acquire(ticket.operation_id, Vec::new(), Vec::new())),
         };
@@ -243,10 +243,10 @@ impl StateMachinePushExecutor {
         let has_applied = commit_receipt.is_committed()
             || commit_receipt.terminal.refs.iter().any(|r| matches!(r, RefCommitResult::Applied { .. }));
         if has_applied {
-            if let Some(cid) = consume_request_id
+            if let Some((batch_req_id, consume_req_id)) = hold_req_pair
                 && !hold_ids.is_empty()
             {
-                self.apply(build_mark_consumed_cmd(snapshot, cid, &hold_ids))?;
+                self.apply(build_mark_consumed_cmd(snapshot, batch_req_id, consume_req_id, &hold_ids))?;
             }
             hold_guard.mark_committed()?;
         } else {

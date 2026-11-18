@@ -96,7 +96,7 @@ pub(super) fn build_acquire_holds_cmd(
     auth: &PushAuthContext,
     backend_hex: &str,
     gate_digest: &str,
-) -> Option<(RefCasCommand, Vec<Uuid>, Uuid, OperationHoldGuard)> {
+) -> Option<(RefCasCommand, Vec<Uuid>, (Uuid, Uuid), OperationHoldGuard)> {
     let (Some(pack_loc), Some(idx_loc)) = (&receipt.pack_locator, &receipt.idx_locator) else {
         return None;
     };
@@ -116,10 +116,11 @@ pub(super) fn build_acquire_holds_cmd(
             logical_bytes: 512,
         });
     }
+    let batch_request_id = Uuid::new_v4();
     let consume_request_id = Uuid::new_v4();
     let backend_digest = RequestDigest::of("blob-backend-id", &[backend_hex.as_bytes()]).as_hex();
     let cmd = RefCasCommand::AcquireHoldBatch(AcquireHoldBatchCommand {
-        request_id: Uuid::new_v4(),
+        request_id: batch_request_id,
         consume_request_id,
         operation_id: ticket.operation_id,
         repository_id: snapshot.repository_id,
@@ -134,7 +135,7 @@ pub(super) fn build_acquire_holds_cmd(
     });
     let guard =
         OperationHoldGuard::acquire(ticket.operation_id, hold_ids.clone(), vec![pack_loc.clone(), idx_loc.clone()]);
-    Some((cmd, hold_ids, consume_request_id, guard))
+    Some((cmd, hold_ids, (batch_request_id, consume_request_id), guard))
 }
 
 pub(super) struct ScopedDecisionCtx<'a> {
@@ -193,7 +194,7 @@ pub(super) fn build_scoped_decision_cmd(ctx: ScopedDecisionCtx<'_>) -> (RefCasCo
             decision_id: ctx.decision_id,
             repository_id: ctx.snapshot.repository_id,
             tenant_id: ctx.snapshot.tenant_id,
-            actor_id: ctx.auth.actor_id,
+            actor_id: ctx.req.identity().issuer_id(),
             operation_id: ctx.ticket.operation_id,
             kind,
             base_revision: ctx.snapshot.expected_gate_revision,
@@ -216,12 +217,13 @@ pub(super) fn build_scoped_decision_cmd(ctx: ScopedDecisionCtx<'_>) -> (RefCasCo
 
 pub(super) fn build_mark_consumed_cmd(
     snapshot: &AuthorizedSnapshotState,
+    batch_request_id: Uuid,
     consume_request_id: Uuid,
     hold_ids: &[Uuid],
 ) -> RefCasCommand {
     RefCasCommand::MarkHoldConsumed(MarkHoldConsumedCommand {
         consume_request_id,
-        request_id: Uuid::new_v4(),
+        request_id: batch_request_id,
         repository_id: snapshot.repository_id,
         tenant_id: snapshot.tenant_id,
         hold_ids: hold_ids.to_vec(),
