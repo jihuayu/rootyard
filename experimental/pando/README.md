@@ -219,22 +219,19 @@ server logs and PostgreSQL logs in its printed run directory. Tests check:
   `hooks/pre-receive` fencing, `GET /repos/{id}.git/migration`, and safe
   post-switchover rollback with new commits (`rollback`) back to GitFS.
 
-## Qualification status (#21): source-integrated, CI-required, runtime NOT RUN
+## Hosted qualification evidence (#21)
 
-**Runtime qualification is NOT RUN on this source.** This documentation change
-did not start Docker, Vault, PostgreSQL, Git/HTTP, the lab server or an exact-head
-product binary. Source review approval, formatting checks and pure oracle tests
-are not real Vault or PostgreSQL passes. The existing `verify` job now wires the
-Vault harness and the 17-case producer gate as mandatory steps, but only an
-exact-head hosted run can produce runtime evidence.
+The historical hosted `verify` job passed all five real Vault cases, all 17
+Local PostgreSQL producer cases, and all seven PITR cases for PR #283's synthetic
+merge `2b8da9d52602839d27075b249d5b36c487a97808`. The evidence is in artifact
+`14422436208` from [run 44284634068](https://github.com/jihuayu/rootyard/actions/runs/44284634068).
+Later compositions require fresh exact-head hosted verification.
 
 The required gate is an exact clean source commit/tree, the actual
 `rootyard-pando-lab` product artifact and its native-build receipt, no skip path,
 and a separate source-bound run of the Local-provider PostgreSQL producer cases.
 The report/projection adapter, the 17-case runner and the workflow wiring are
-integrated in this source and required by the existing `verify` job. This is
-source and CI wiring evidence only: the real Vault and PostgreSQL cases remain
-NOT RUN pending exact-head results, so no qualification is claimed here.
+integrated in this source and required by the existing `verify` job.
 
 ### Five real derived-Vault cases
 
@@ -405,12 +402,11 @@ cargo test --locked --features pando-lab --bin rootyard-pando-lab \
 Repeat for each name. The CI gate resolves the same bin-test executable once
 from Cargo JSON and executes all 17 serially, then emits a source-bound report.
 The runner and its report are integrated in this source and wired as a mandatory
-step in the existing `verify` job; a zero-test or missing-report run is a
-failure, never a pass. Actual 17-case PostgreSQL execution is still NOT RUN
-pending exact-head hosted results. The tests cover the DB manifest/envelope
-pair, rollback and exact retry, generation/shared-gate fencing, completed-epoch
-behavior, repack authority/mirror rollback, pinned data, snapshot retention
-races and expiry; they do not establish remote S3, Vault or production behavior.
+step in the existing `verify` job. A zero-test or missing-report run fails the
+gate. The tests cover the DB manifest/envelope pair, rollback and exact retry,
+generation/shared-gate fencing, completed-epoch behavior, repack authority/mirror
+rollback, pinned data, snapshot retention races and expiry. Remote S3, Vault
+and production behavior are outside this case inventory.
 
 ### Resource and credential boundary
 

@@ -175,12 +175,11 @@ and never asks Vault to create one.
 
 ## Issue #21 real-Vault and Local producer qualification boundary
 
-**Status on this source: source-integrated and CI-required in the existing
-verify job; runtime NOT RUN pending exact-head hosted results.** No Docker
-image, Vault Transit provider, PostgreSQL database, Git/HTTP fixture, lab server
-or exact-head product binary was started for this documentation change. A source
-approval, `cargo fmt` or another formatting check, and pure oracle tests are not
-a real Vault or PostgreSQL pass.
+The historical hosted `verify` job passed all five real Vault cases, all 17
+Local PostgreSQL producer cases, and all seven PITR cases for PR #283's synthetic
+merge `2b8da9d52602839d27075b249d5b36c487a97808`. The evidence is in artifact
+`14422436208` from [run 44284634068](https://github.com/jihuayu/rootyard/actions/runs/44284634068).
+Later compositions require fresh exact-head hosted verification.
 
 ### Required five real Vault cases
 
@@ -214,7 +213,7 @@ only clamped to the remaining budget, and a late return from a non-preemptible
 OS/filesystem/Popen/socket boundary fails closed rather than being recorded as
 success. Source Git/receipt reads run in one bounded owned child; a timed-out
 child, unresolved owned resource, failed final binding or failed report write
-cannot produce a passing report. Runtime remains NOT RUN.
+cannot produce a passing report.
 
 The five exact authored IDs, in order, are:
 
@@ -309,9 +308,7 @@ CLI executable or the library-test harness. The runner, its source-bound report
 and the workflow wiring are integrated in this source: the existing verify job
 runs the 17-case runner as a mandatory bounded step, and separately runs the
 five-case Vault harness, strict adapter and Pando-specific native manifest as a
-mandatory bounded step. That is CI wiring only; actual Vault and PostgreSQL
-results remain NOT RUN pending an exact-head hosted run, and no qualification
-is claimed here.
+mandatory bounded step.
 
 ### Remote S3, claims and uncovered cases
 
