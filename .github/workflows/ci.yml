@@ -20,9 +20,9 @@ jobs:
     # reaps orphaned Git grandchildren. Do not introduce a global child
     # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
     runs-on: ubuntu-22.04
-    # Existing verify and lifecycle steps have 95 minutes. Reserve another
-    # 20 for the state-redis CLI build and isolated browse restore proof.
-    timeout-minutes: 115
+    # Keep the 115-minute verify/lifecycle budget and add three minutes for
+    # the Redis partition drill plus one for cleanup and report binding.
+    timeout-minutes: 119
     services:
       postgres:
         image: postgres:17
@@ -290,7 +290,7 @@ jobs:
       - name: Exercise restored schema-003 recovery protections
         run: python3 tests/backup_recovery.py --binary "$ROOTYARD_BIN" --report test-results/backup-recovery.json
       - name: Verify browse cache incarnation across restore with owned Redis
-        timeout-minutes: 20
+        timeout-minutes: 24
         shell: bash
         run: |
           set -euo pipefail
@@ -301,7 +301,44 @@ jobs:
           binary="$scratch/browse-restore-rootyard"
           receipt="$binary.build.json"
           report="$scratch/browse-restore-cache.json"
+          flush_report="$scratch/browse-flush-authority.json"
+          partition_report="$scratch/redis-wake-partition.json"
           manifest="$scratch/native-browse-restore-cache.json"
+
+          publish_failure() {
+            python3 -I - "$1" "$2" "$GITHUB_SHA" >/dev/null 2>&1 <<'PY' || :
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          source_path, mode, head = sys.argv[1:]
+          filename, name, stages = {
+              "restore": ("browse-restore-cache-failure.json", "browse_flushall_preserves_git_authority",
+                          {"source_warm_backup", "restore", "restored_preview", "flush_authority"}),
+              "partition": ("redis-wake-partition-failure.json", "real_redis_partition_pg_fallback_and_wake",
+                            {"fixture", "partition"}),
+          }[mode]
+          with Path(source_path).open("rb") as source:
+              raw = source.read(4097)
+          assert 0 < len(raw) <= 4096
+          report = json.loads(raw)
+          basic = {"passed", "cases"}
+          hashes = {"source_tree": 40, "source_inputs_sha256": 64,
+                    "binary_sha256": 64, "build_receipt_sha256": 64}
+          assert set(report) in (basic, basic | {"source_head", *hashes})
+          if "source_head" in report:
+              assert report["source_head"] == head
+              assert all(re.fullmatch(rf"[0-9a-f]{{{size}}}", report[key]) for key, size in hashes.items())
+          assert report["passed"] is False
+          case, = report["cases"]
+          assert set(case) == {"name", "status", "error"}
+          assert case["name"] == name and case["status"] == "failed"
+          assert case["error"] in stages | {"preflight", "receipt_changed", "cleanup", "report_write"}
+          with (Path("test-results") / filename).open("x") as output:
+              json.dump({"passed": False, "cases": [case]}, output)
+          PY
+          }
 
           if ! timeout --kill-after=30s 13m env -u CARGO_BUILD_JOBS python3 scripts/build_native.py \
             --features state-redis \
@@ -315,48 +352,56 @@ jobs:
             timeout --kill-after=30s 5m python3 tests/backup_recovery.py \
               --browse-flush-authority --binary "$binary" --expect-commit "$GITHUB_SHA" \
               --report "$report" >/dev/null 2>&1; then
-            python3 -I - "$report" "$GITHUB_SHA" >/dev/null 2>&1 <<'PY' || :
-          import json
-          from pathlib import Path
-          import re
-          import sys
-
-          with Path(sys.argv[1]).open("rb") as source:
-              raw = source.read(4097)
-          assert 0 < len(raw) <= 4096
-          report = json.loads(raw)
-          basic = {"passed", "cases"}
-          hashes = {"source_tree": 40, "source_inputs_sha256": 64,
-                    "binary_sha256": 64, "build_receipt_sha256": 64}
-          assert set(report) in (basic, basic | {"source_head", *hashes})
-          if "source_head" in report:
-              assert report["source_head"] == sys.argv[2]
-              assert all(re.fullmatch(rf"[0-9a-f]{{{size}}}", report[key]) for key, size in hashes.items())
-          assert report["passed"] is False
-          case, = report["cases"]
-          assert set(case) == {"name", "status", "error"}
-          assert case["name"] == "browse_flushall_preserves_git_authority" and case["status"] == "failed"
-          assert case["error"] in {"preflight", "source_warm_backup", "restore", "restored_preview",
-                                   "flush_authority", "receipt_changed", "cleanup", "report_write"}
-          with Path("test-results/browse-restore-cache-failure.json").open("x") as output:
-              json.dump({"passed": False, "cases": [case]}, output)
-          PY
+            publish_failure "$report" restore
             echo 'Browse restore or flush cache proof failed'
             exit 1
           fi
-          test -s "$report"
-          test "$(wc -c < "$report")" -le 4096
+          if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
+            timeout --kill-after=30s 3m python3 tests/cross_process_partition.py \
+              --binary "$binary" --expect-commit "$GITHUB_SHA" --report "$partition_report" >/dev/null 2>&1; then
+            publish_failure "$partition_report" partition
+            echo 'Redis wake partition proof failed'
+            exit 1
+          fi
+          for proof in "$report" "$partition_report"; do
+            test -s "$proof"
+            test "$(wc -c < "$proof")" -le 4096
+          done
+          if ! python3 -I - "$report" "$flush_report" >/dev/null 2>&1 <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          report = json.loads(Path(sys.argv[1]).read_bytes())
+          restore, flush = report["cases"]
+          assert report["passed"] is True
+          assert restore["name"] == "browse_restore_incarnation_cache"
+          assert flush["name"] == "browse_flushall_preserves_git_authority" and flush["status"] == "passed"
+          with Path(sys.argv[2]).open("x") as output:
+              json.dump(dict(report, cases=[flush]), output, indent=2)
+              output.write("\n")
+          PY
+          then
+            echo 'Browse flush report projection failed'
+            exit 1
+          fi
 
           if ! python3 scripts/native_report_manifest.py --mode job \
             --manifest-out "$manifest" --build-receipt "$receipt" --binary "$binary" \
             --expect-commit "$GITHUB_SHA" --report "browse_restore_cache=$report" \
+            --report "browse_flush_authority=$flush_report" \
+            --report "redis_wake_partition=$partition_report" \
             --require-case browse_restore_cache=browse_restore_incarnation_cache \
             --require-case browse_restore_cache=browse_flushall_preserves_git_authority \
+            --require-case browse_flush_authority=browse_flushall_preserves_git_authority \
+            --require-case redis_wake_partition=real_redis_partition_pg_fallback_and_wake \
             --fixture postgres=postgres:17 \
             --harness tests/backup_recovery.py \
             --harness tests/backup_recovery_cache.py \
             --harness tests/backup.py \
             --harness tests/cross_process.py \
+            --harness tests/cross_process_partition.py \
+            --harness tests/redis_partition_relay.py \
             --harness tests/e2e.py \
             --harness tests/native_evidence.py \
             --harness tests/owned_fuse_cleanup.py \
@@ -372,31 +417,45 @@ jobs:
             echo 'Browse restore native manifest failed'
             exit 1
           fi
-          if ! python3 -I - "$report" "$manifest" >/dev/null 2>&1 <<'PY'
+          if ! python3 -I - "$manifest" "$report" "$flush_report" "$partition_report" \
+            "$(git rev-parse HEAD^{tree})" >/dev/null 2>&1 <<'PY'
           import hashlib
           import json
           from pathlib import Path
           import sys
 
-          payload = Path(sys.argv[1]).read_bytes()
-          report = json.loads(payload)
-          manifest = json.loads(Path(sys.argv[2]).read_bytes())
-          expected = ["browse_restore_incarnation_cache", "browse_flushall_preserves_git_authority"]
-          cases = report["cases"]
-          assert [case["name"] for case in cases] == expected
-          assert all(case["detail"]["owned_cleanup_completed"] is True for case in cases)
-          entry = manifest["reports"]["browse_restore_cache"]
-          assert entry["case_names"] == expected and entry["sha256"] == hashlib.sha256(payload).hexdigest()
-          assert report["source_head"] == manifest["source_commit"]
-          assert report["source_inputs_sha256"] == manifest["source_inputs_sha256"]
-          assert report["binary_sha256"] == manifest["binary_sha256"]
-          assert report["build_receipt_sha256"] == manifest["build_receipt"]["sha256"]
+          manifest_path, combined_path, flush_path, partition_path, tree = sys.argv[1:]
+          manifest = json.loads(Path(manifest_path).read_bytes())
+          restore = "browse_restore_incarnation_cache"
+          flush = "browse_flushall_preserves_git_authority"
+          partition = "real_redis_partition_pg_fallback_and_wake"
+          inputs = {
+              "browse_restore_cache": (combined_path, [restore, flush]),
+              "browse_flush_authority": (flush_path, [flush]),
+              "redis_wake_partition": (partition_path, [partition]),
+          }
+          assert manifest["reports"].keys() == inputs.keys()
+          reports = {}
+          for label, (path, expected) in inputs.items():
+              payload = Path(path).read_bytes()
+              report = reports[label] = json.loads(payload)
+              cases = report["cases"]
+              assert [case["name"] for case in cases] == expected
+              assert all(case["detail"]["owned_cleanup_completed"] is True for case in cases)
+              entry = manifest["reports"][label]
+              assert entry["case_names"] == expected and entry["sha256"] == hashlib.sha256(payload).hexdigest()
+              assert report["source_head"] == manifest["source_commit"] and report["source_tree"] == tree
+              assert report["source_inputs_sha256"] == manifest["source_inputs_sha256"]
+              assert report["binary_sha256"] == manifest["binary_sha256"]
+              assert report["build_receipt_sha256"] == manifest["build_receipt"]["sha256"]
+          combined = reports["browse_restore_cache"]
+          assert reports["browse_flush_authority"] == dict(combined, cases=[combined["cases"][1]])
           PY
           then
             echo 'Browse restore cleanup or receipt binding failed'
             exit 1
           fi
-          mv -- "$report" "$receipt" "$manifest" test-results/
+          mv -- "$report" "$flush_report" "$partition_report" "$receipt" "$manifest" test-results/
           rm -rf -- "$scratch"
           test ! -e "$scratch"
           trap - EXIT INT TERM
