@@ -291,10 +291,11 @@ jobs:
         # periodic stderr thread stacks without changing exit semantics.
         env:
           ROOTYARD_PYTHON_CI_REPORT: ${{ github.event.pull_request.number == 258 && 'test-results/python-ci-result.json' || '' }}
+          ROOTYARD_PYTHON_SUITE_REPORT: ${{ (github.event.pull_request.number == 258 || github.event.pull_request.number == 283) && 'test-results/python-ci-result.json' || '' }}
         run: |
           report_args=()
-          if [[ -n "$ROOTYARD_PYTHON_CI_REPORT" ]]; then
-            report_args=(--report-out "$ROOTYARD_PYTHON_CI_REPORT" --expected-commit="${GITHUB_SHA:-}")
+          if [[ -n "$ROOTYARD_PYTHON_SUITE_REPORT" ]]; then
+            report_args=(--report-out "$ROOTYARD_PYTHON_SUITE_REPORT" --expected-commit="${GITHUB_SHA:-}")
           fi
           python3 scripts/run_python_ci_tests.py "${report_args[@]}"
       - name: Exercise native Git end to end

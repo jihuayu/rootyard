@@ -495,6 +495,43 @@ class PandoPitrEvidenceBoundaryTest(ReceiptFixture):
         self.assertIn("--harness tests/pando_pitr_service.py", manifest)
         self.assertIn("--harness tests/test_pando_pitr_service.py", manifest)
 
+    def test_ci_pitr_failure_checkpoint_remains_pr_258_only(self) -> None:
+        text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        start = text.index(
+            "      - name: Run all Python unit and Tier-5 adversarial contract suites"
+        )
+        end = text.index("\n      - name:", start + 1)
+        step = text[start:end]
+        self.assertIn(
+            "ROOTYARD_PYTHON_CI_REPORT: ${{ "
+            "github.event.pull_request.number == 258 && "
+            "'test-results/python-ci-result.json' || '' }}",
+            step,
+        )
+        self.assertIn(
+            "ROOTYARD_PYTHON_SUITE_REPORT: ${{ "
+            "(github.event.pull_request.number == 258 || "
+            "github.event.pull_request.number == 283) && "
+            "'test-results/python-ci-result.json' || '' }}",
+            step,
+        )
+        self.assertIn(
+            'if [[ -n "$ROOTYARD_PYTHON_SUITE_REPORT" ]]; then', step
+        )
+        self.assertIn('--report-out "$ROOTYARD_PYTHON_SUITE_REPORT"', step)
+        self.assertIn('--expected-commit="${GITHUB_SHA:-}"', step)
+        self.assertNotIn('--report-out "$ROOTYARD_PYTHON_CI_REPORT"', step)
+        self.assertTrue(_pitr_failure_checkpoint_enabled(
+            {FAILURE_CHECKPOINT_ENV: FAILURE_CHECKPOINT_OPT_IN}
+        ))
+        for environ in (
+            {},
+            {FAILURE_CHECKPOINT_ENV: ""},
+            {"ROOTYARD_PYTHON_SUITE_REPORT": FAILURE_CHECKPOINT_OPT_IN},
+        ):
+            with self.subTest(environ=environ):
+                self.assertFalse(_pitr_failure_checkpoint_enabled(environ))
+
 
 class PandoPitrStageDiagnosticTest(unittest.TestCase):
     def test_marker_uses_the_stage_of_the_escaping_assertion(self) -> None:

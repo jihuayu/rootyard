@@ -249,6 +249,60 @@ class WorkflowWiringTest(unittest.TestCase):
         self.assertIsNone(_step(PANDO_CLI_STEP)["timeout-minutes"])
         self.assertEqual(_step(PANDO_PITR_STEP)["timeout-minutes"], "10")
 
+    def test_python_suite_report_is_source_bound_for_258_and_283_only(self):
+        suite = _step("Run all Python unit and Tier-5 adversarial contract suites")
+        env = suite["env"]
+        pitr_selector = (
+            "${{ github.event.pull_request.number == 258 && "
+            "'test-results/python-ci-result.json' || '' }}"
+        )
+        suite_selector = (
+            "${{ (github.event.pull_request.number == 258 || "
+            "github.event.pull_request.number == 283) && "
+            "'test-results/python-ci-result.json' || '' }}"
+        )
+        # The PITR failure checkpoint keeps its old #258-only switch, while the
+        # full-suite report accepts both source-bound PR heads that used to
+        # select the same old report target.
+        self.assertEqual(env["ROOTYARD_PYTHON_CI_REPORT"], pitr_selector)
+        self.assertEqual(env["ROOTYARD_PYTHON_SUITE_REPORT"], suite_selector)
+        self.assertIn(
+            "== 258 || github.event.pull_request.number == 283",
+            suite_selector,
+        )
+        self.assertTrue(suite_selector.endswith("|| '' }}"))
+        run = suite["run"]
+        self.assertIn(
+            'if [[ -n "$ROOTYARD_PYTHON_SUITE_REPORT" ]]; then', run
+        )
+        self.assertIn('--report-out "$ROOTYARD_PYTHON_SUITE_REPORT"', run)
+        self.assertIn('--expected-commit="${GITHUB_SHA:-}"', run)
+        self.assertNotIn('--report-out "$ROOTYARD_PYTHON_CI_REPORT"', run)
+        # The empty fallback plus the non-empty guard gives the exact truth
+        # table: 258 and 283 report; no PR and every other PR do not.
+        selector = re.fullmatch(
+            r"\$\{\{ \(github\.event\.pull_request\.number == (\d+) \|\| "
+            r"github\.event\.pull_request\.number == (\d+)\) && "
+            r"'([^']+)' \|\| '' \}\}",
+            suite_selector,
+        )
+        self.assertIsNotNone(selector)
+        first, second, target = selector.groups()
+        for number, expected in (
+            (258, target),
+            (283, target),
+            (257, ""),
+            (None, ""),
+        ):
+            with self.subTest(pull_request=number):
+                selected = (
+                    target
+                    if number is not None
+                    and number in (int(first), int(second))
+                    else ""
+                )
+                self.assertEqual(selected, expected)
+
     def test_single_native_batch_exports_the_pando_receipt(self):
         steps = _steps()
         builds = [step for step in steps
