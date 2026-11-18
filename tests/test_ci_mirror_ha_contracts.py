@@ -102,6 +102,55 @@ class CiMirrorHaContractsTest(unittest.TestCase):
         self.assertIn("JoinSet", ctrl_src)
         self.assertNotIn("LIMIT 1", ctrl_src.split("trigger_coalesced_prewarm", 1)[1])
 
+    def test_checkout_snapshot_is_one_coherent_fact(self) -> None:
+        ctrl_src = (ROOT / "src" / "webhooks" / "ci_controller.rs").read_text(encoding="utf-8")
+        sql_src = ctrl_src.split("const CHECKOUT_SNAPSHOT_SQL", 1)[1].split(
+            "pub(crate) async fn select_ready_mirror", 1
+        )[0]
+        sql = " ".join(sql_src.split())
+        self.assertEqual(sql.count("statement_timestamp()"), 1)
+        self.assertNotIn("clock_timestamp()", sql)
+        for cte in (
+            "now_fact AS MATERIALIZED",
+            "lease_counts AS MATERIALIZED",
+            "mirror_facts AS MATERIALIZED",
+            "eligible AS MATERIALIZED",
+            "winner AS MATERIALIZED",
+            "origin_counts AS MATERIALIZED",
+        ):
+            self.assertIn(cte, sql)
+        self.assertIn("GROUP BY c.source_url", sql)
+        self.assertIn("FROM origin_counts o", sql)
+        self.assertIn("winner AS MATERIALIZED (SELECT url FROM eligible WHERE $7::boolean", sql)
+        self.assertIn("SELECT (SELECT count(*) FROM eligible) AS ready_avail", sql)
+        self.assertIn("(SELECT count(*) FROM mirror_facts WHERE target_ready) AS ready_total", sql)
+        self.assertIn("(SELECT count(*) FROM mirror_facts WHERE NOT target_ready) AS healthy_unready", sql)
+        self.assertIn(
+            "ORDER BY active_leases ASC,(capacity-active_leases) DESC,heartbeat_unix DESC,mirror_id ASC LIMIT 1",
+            sql,
+        )
+        self.assertIn("m.heartbeat_unix>now_fact.now_epoch::bigint-$4", sql)
+        self.assertIn("c.lease_expires_unix>now_fact.now_epoch", sql)
+        self.assertIn("count(*) FILTER (WHERE c.repository_id=$1) AS per_repo_active", sql)
+        lease_src = sql.split("lease_counts AS MATERIALIZED", 1)[1].split(
+            "mirror_facts AS MATERIALIZED", 1
+        )[0]
+        self.assertNotIn("repository_id", lease_src)
+        self.assertNotIn("pg_advisory", sql)
+
+        runs_src = (ROOT / "src" / "webhooks" / "runs.rs").read_text(encoding="utf-8")
+        claim_src = runs_src.split("pub async fn claim", 1)[1].split("pub async fn heartbeat", 1)[0]
+        self.assertLess(
+            claim_src.index("pg_advisory_xact_lock(1062026)"),
+            claim_src.index("choose_checkout_source"),
+        )
+        ops_src = (ROOT / "src" / "webhooks" / "run_ops.rs").read_text(encoding="utf-8")
+        failover_src = ops_src.split("pub async fn failover", 1)[1]
+        self.assertLess(
+            failover_src.index("pg_advisory_xact_lock(1062026)"),
+            failover_src.index("choose_checkout_source"),
+        )
+
     def test_ci_mirror_ha_workflow_and_docs_contracts(self) -> None:
         self.assertTrue(WORKFLOW.is_file(), f"Missing {WORKFLOW}")
         raw_yml = WORKFLOW.read_bytes()

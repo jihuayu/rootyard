@@ -52,15 +52,21 @@ pub struct CheckoutTarget<'a> {
 }
 
 /// Emit a selected mirror route only when the same snapshot counted it as
-/// available. The negative returns the snapshot for state classification
-/// instead of inventing a route or a contradictory "no ready mirror" response.
-pub fn route_from_snapshot(
-    source: Option<String>,
-    availability: AvailabilitySummary,
-) -> Result<String, AvailabilitySummary> {
-    match source {
-        Some(source) if availability.ready_available_mirrors > 0 => Ok(source),
-        _ => Err(availability),
+/// available. A missing route with positive availability, or a route with zero
+/// availability, is an impossible snapshot and must fail closed rather than
+/// become a contradictory "ready" rejection.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SnapshotRoute {
+    Selected(String),
+    Unavailable(AvailabilitySummary),
+    Inconsistent,
+}
+
+pub fn route_from_snapshot(source: Option<String>, availability: AvailabilitySummary) -> SnapshotRoute {
+    match (source, availability.ready_available_mirrors) {
+        (Some(source), ready) if ready > 0 => SnapshotRoute::Selected(source),
+        (None, 0) => SnapshotRoute::Unavailable(availability),
+        _ => SnapshotRoute::Inconsistent,
     }
 }
 
@@ -260,16 +266,17 @@ mod tests {
             },
         };
         assert_eq!(
-            route_from_snapshot(Some("https://mirror.example".into()), base.clone()).unwrap(),
-            "https://mirror.example"
+            route_from_snapshot(Some("https://mirror.example".into()), base.clone()),
+            SnapshotRoute::Selected("https://mirror.example".into())
         );
+        assert_eq!(route_from_snapshot(None, base.clone()), SnapshotRoute::Inconsistent);
         let blocked = AvailabilitySummary {
             ready_available_mirrors: 0,
             ready_total_mirrors: 0,
             healthy_unready_mirrors: 1,
             ..base
         };
-        assert_eq!(route_from_snapshot(None, blocked.clone()).unwrap_err(), blocked);
-        assert!(route_from_snapshot(Some("https://mirror.example".into()), blocked).is_err());
+        assert_eq!(route_from_snapshot(None, blocked.clone()), SnapshotRoute::Unavailable(blocked.clone()));
+        assert_eq!(route_from_snapshot(Some("https://mirror.example".into()), blocked), SnapshotRoute::Inconsistent);
     }
 }
