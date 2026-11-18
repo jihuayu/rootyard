@@ -54,14 +54,14 @@ pub async fn publish_remote(
 /// called from a read path; callers are explicit write workflows such as a
 /// re-issued LFS Batch upload for an object that is already ready locally.
 pub fn schedule_remote_repair(
+    pool: deadpool_postgres::Pool,
     data_root: PathBuf,
     repo_id: Uuid,
-    tenant_id: Uuid,
     oid: String,
     size: u64,
     timeout: Duration,
 ) {
-    hydration::schedule_repair(data_root, repo_id, tenant_id, oid, size, timeout);
+    hydration::schedule_repair(pool, data_root, repo_id, oid, size, timeout);
 }
 
 pub async fn ensure_readable(
