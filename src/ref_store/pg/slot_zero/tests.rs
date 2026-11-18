@@ -6,7 +6,7 @@ use crate::{
     db,
     ref_store::{
         CommitMode, CommitRejectCode, CommitRejection, CommitTerminal, GitObjectFormat, IssuerLane, OperationIdentity,
-        OperationState, PgRefStore, RefCommitResult, RefStoreError, RequestDigest, TerminalOutcome,
+        OperationLookup, OperationState, PgRefStore, RefCommitResult, RefStoreError, RequestDigest, TerminalOutcome,
         core::{
             CoreGate, GitOid, HeadUpdate, RefName, RefPrecondition, RefUpdate,
             pack_commit::{
