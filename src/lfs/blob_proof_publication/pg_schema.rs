@@ -413,7 +413,7 @@ impl PgLfsBlobStore {
         tx.commit().await.map_err(pg_err)?;
 
         let authority = match (best_org_role, best_repo_role) {
-            (Some((org_id, org_r)), Some(repo_r)) if repo_r > org_r => {
+            (Some((_org_id, org_r)), Some(repo_r)) if repo_r > org_r => {
                 SubjectTenantAuthority::RepositoryCollaborator { namespace_slug: ns_slug, role: repo_r }
             }
             (Some((org_id, org_r)), _) => SubjectTenantAuthority::OrganizationMember {

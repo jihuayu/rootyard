@@ -125,46 +125,46 @@ async fn auth_and_prepare_prod(
         super::pg_store::LfsRepoRealm,
         super::authz::AuthorizedRepoAccess,
     ),
-    Result<Response, Error>,
+    Box<Response>,
 > {
     if let Err(e) = gate.require_store() {
-        return Err(Ok(lfs_blob_err_response(e)));
+        return Err(Box::new(lfs_blob_err_response(e)));
     }
     let clean_headers = sanitize_headers(headers);
-    let actor = auth::authenticate(&state.pool, &clean_headers).await.map_err(Err)?;
+    let actor = auth::authenticate(&state.pool, &clean_headers).await.map_err(|e| Box::new(e.into_response()))?;
     if write {
-        auth::writable(&actor).map_err(Err)?;
+        auth::writable(&actor).map_err(|e| Box::new(e.into_response()))?;
     }
-    let name = models::normalize_repo_name(repo_raw).map_err(Err)?;
+    let name = models::normalize_repo_name(repo_raw).map_err(|e| Box::new(e.into_response()))?;
     let repo_lookup = state
         .pool
         .get()
         .await
-        .map_err(|e| Err(Error::internal(e)))?
+        .map_err(|e| Box::new(Error::internal(e).into_response()))?
         .query_opt(
             "SELECT r.id, r.owner_id FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id
              WHERE ns.slug = $1 AND r.name = $2 AND r.deleted_at IS NULL",
             &[&owner, &name],
         )
         .await
-        .map_err(|e| Err(Error::internal(e)))?
-        .ok_or_else(|| Err(Error::not_found()))?;
+        .map_err(|e| Box::new(Error::internal(e).into_response()))?
+        .ok_or_else(|| Box::new(Error::not_found().into_response()))?;
     let lookup_repo_id: Uuid = repo_lookup.get(0);
     let lookup_tenant_id: Uuid = repo_lookup.get(1);
 
     let pg = PgLfsBlobStore::new(state.pool.clone());
     let realm = match pg.ensure_realm_for_repository(lookup_repo_id, &state.storage.root).await {
         Ok(r) => r,
-        Err(e) => return Err(Ok(lfs_blob_err_response(e))),
+        Err(e) => return Err(Box::new(lfs_blob_err_response(e))),
     };
     let auth_access = match pg.resolve_authoritative_repo_access(&realm, actor.id, &actor.username, write, false).await
     {
         Ok(a) => a,
-        Err(e) => return Err(Ok(lfs_blob_err_response(e))),
+        Err(e) => return Err(Box::new(lfs_blob_err_response(e))),
     };
     let (repo_id, tenant_id) = {
-        let mut client = state.pool.get().await.map_err(|e| Err(Error::internal(e)))?;
-        let tx = client.transaction().await.map_err(|e| Err(Error::internal(e)))?;
+        let mut client = state.pool.get().await.map_err(|e| Box::new(Error::internal(e).into_response()))?;
+        let tx = client.transaction().await.map_err(|e| Box::new(Error::internal(e).into_response()))?;
         let access = auth::authorize_repo_with_role(
             &tx,
             &actor,
@@ -174,12 +174,12 @@ async fn auth_and_prepare_prod(
             if write { RepoAction::ContentsWrite } else { RepoAction::ContentsRead },
         )
         .await
-        .map_err(Err)?;
-        auth::finish_tx(tx, &actor, false).await.map_err(Err)?;
+        .map_err(|e| Box::new(e.into_response()))?;
+        auth::finish_tx(tx, &actor, false).await.map_err(|e| Box::new(e.into_response()))?;
         (access.repo_id, access.owner_id)
     };
     if repo_id != lookup_repo_id || tenant_id != lookup_tenant_id || realm.owner_tenant_id != tenant_id {
-        return Err(Err(Error(StatusCode::CONFLICT, "repository identity changed")));
+        return Err(Box::new(Error(StatusCode::CONFLICT, "repository identity changed").into_response()));
     }
     Ok((actor, name.to_owned(), pg, realm, auth_access))
 }
@@ -218,7 +218,7 @@ pub(crate) async fn prod_batch(
     let (actor, name, pg, realm, access) =
         match auth_and_prepare_prod(&state, &gate, &headers, &owner, &repo_raw, write).await {
             Ok(t) => t,
-            Err(early) => return early,
+            Err(early) => return Ok(*early),
         };
     let scratch = ephemeral_scratch_root();
     let ctx = LfsTransferContext {
@@ -270,7 +270,7 @@ pub(crate) async fn prod_upload(
     let (actor, name, pg, realm, access) =
         match auth_and_prepare_prod(&state, &gate, &headers, &owner, &repo_raw, true).await {
             Ok(t) => t,
-            Err(early) => return early,
+            Err(early) => return Ok(*early),
         };
     if !models::valid_lfs_oid(&oid) {
         return Ok(lfs_blob_err_response(LfsBlobError::new(
@@ -353,7 +353,7 @@ pub(crate) async fn prod_verify(
     let (actor, name, pg, realm, access) =
         match auth_and_prepare_prod(&state, &gate, &headers, &owner, &repo_raw, true).await {
             Ok(t) => t,
-            Err(early) => return early,
+            Err(early) => return Ok(*early),
         };
     let scratch = ephemeral_scratch_root();
     let ctx = LfsTransferContext {
@@ -397,7 +397,7 @@ pub(crate) async fn prod_download(
     let (actor, name, pg, realm, access) =
         match auth_and_prepare_prod(&state, &gate, &headers, &owner, &repo_raw, false).await {
             Ok(t) => t,
-            Err(early) => return early,
+            Err(early) => return Ok(*early),
         };
     let scratch = ephemeral_scratch_root();
     let ctx = LfsTransferContext {
