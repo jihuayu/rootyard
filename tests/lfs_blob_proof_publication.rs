@@ -34,10 +34,14 @@ fn dummy_lazy_pool() -> Result<Pool> {
 #[tokio::test]
 async fn unconfigured_blob_gate_fails_closed_on_startup_and_every_lfs_or_git_endpoint() -> Result<()> {
     let gate = LfsBlobRuntimeGate::unconfigured("ROOTYARD_BLOB_ENDPOINT absent");
-    assert_eq!(gate.require_store().unwrap_err().code, LfsProofRejectCode::RemoteBlobUnconfigured);
+    let Err(gate_err) = gate.require_store() else {
+        anyhow::bail!("unconfigured gate must fail closed");
+    };
+    assert_eq!(gate_err.code, LfsProofRejectCode::RemoteBlobUnconfigured);
 
     let pg = PgLfsBlobStore::new(dummy_lazy_pool()?);
     let srv = RunningLfsServer::start(gate, pg).await?;
+    assert_eq!(srv.svc.base_url(), srv.base_url);
     let cli = reqwest::Client::new();
 
     let batch_res = cli

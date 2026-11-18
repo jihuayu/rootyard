@@ -20,7 +20,9 @@ use super::types::{
 #[test]
 fn unconfigured_runtime_gate_fails_closed_with_named_error() {
     let gate = LfsBlobRuntimeGate::unconfigured("ROOTYARD_BLOB_ENDPOINT missing");
-    let err = gate.require_store().expect_err("unconfigured gate must fail closed");
+    let Err(err) = gate.require_store() else {
+        panic!("unconfigured gate must fail closed");
+    };
     assert_eq!(err.code, LfsProofRejectCode::RemoteBlobUnconfigured);
     assert_eq!(err.code.http_status().as_u16(), 503);
 }

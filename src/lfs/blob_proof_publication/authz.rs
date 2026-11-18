@@ -1,5 +1,7 @@
 //! Fail-closed OpenDAL Blob startup/request gate and cross-owner / shared-hold authz (`Refs #145`).
 
+use std::sync::Arc;
+
 use axum::http::{HeaderMap, header};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use sha2::{Digest, Sha256};
@@ -15,7 +17,7 @@ use super::types::{
 #[derive(Clone)]
 pub enum LfsBlobRuntimeGate {
     Unconfigured { reason: String },
-    Configured(BlobStore),
+    Configured(Arc<BlobStore>),
 }
 
 impl std::fmt::Debug for LfsBlobRuntimeGate {
@@ -35,7 +37,7 @@ impl LfsBlobRuntimeGate {
     }
 
     pub fn configured(store: BlobStore) -> Self {
-        Self::Configured(store)
+        Self::Configured(Arc::new(store))
     }
 
     /// Strict startup constructor reading `ROOTYARD_BLOB_*` environment settings.
@@ -47,14 +49,14 @@ impl LfsBlobRuntimeGate {
 
     pub fn open_profile(profile: BlobProfile) -> Result<Self, LfsBlobError> {
         let store = BlobStore::open(profile).map_err(LfsBlobError::from_blob_error)?;
-        Ok(Self::Configured(store))
+        Ok(Self::Configured(Arc::new(store)))
     }
 
     /// Fail-closed request check: every LFS Batch, Transfer, Lock, Hydration, and Push
     /// Attestation path invokes this before touching PostgreSQL or Git.
     pub fn require_store(&self) -> Result<&BlobStore, LfsBlobError> {
         match self {
-            Self::Configured(store) => Ok(store),
+            Self::Configured(store) => Ok(store.as_ref()),
             Self::Unconfigured { reason } => Err(LfsBlobError::new(
                 LfsProofRejectCode::RemoteBlobUnconfigured,
                 format!("remote OpenDAL Blob is not configured: {reason}"),
