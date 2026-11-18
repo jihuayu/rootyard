@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use sha1::Sha1;
+use ring::digest::{Context as RingDigest, SHA1_FOR_LEGACY_USE_ONLY};
 use sha2::{Digest, Sha256};
 
 use crate::ref_store::core::types::GitObjectFormat;
@@ -55,9 +55,9 @@ pub(super) fn extract_and_check_wire_pack(
     let count = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
     out.write_all(&hdr).map_err(|e| e.to_string())?;
 
-    let mut sha1_h = Sha1::new();
+    let mut sha1_h = RingDigest::new(&SHA1_FOR_LEGACY_USE_ONLY);
     let mut sha256_h = Sha256::new();
-    sha1_h.update(hdr);
+    sha1_h.update(&hdr);
     sha256_h.update(hdr);
     let mut rem = body_len - 12;
     let mut buf = [0u8; STREAM_CHUNK_BYTES];
@@ -73,7 +73,7 @@ pub(super) fn extract_and_check_wire_pack(
     f.read_exact(&mut trailer).map_err(|e| e.to_string())?;
     out.write_all(&trailer).map_err(|e| e.to_string())?;
     let expected = match format {
-        GitObjectFormat::Sha1 => sha1_h.finalize().to_vec(),
+        GitObjectFormat::Sha1 => sha1_h.finish().as_ref().to_vec(),
         GitObjectFormat::Sha256 => sha256_h.finalize().to_vec(),
     };
     if trailer != expected {

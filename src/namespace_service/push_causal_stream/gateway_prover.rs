@@ -10,7 +10,6 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::blob_git_gateway::GatewayError;
@@ -25,6 +24,7 @@ use super::gateway_prover_pack::{
 use super::git_proc::{
     GitStdin, init_isolated_bare_repo_bin, list_idx_oids_bin, run_git_bin, sha256_and_len_sync, verify_file_sha256_len,
 };
+use super::quarantine::QuarantineSlot;
 use super::receipt::CommittedPackPairProof;
 use super::types::{BasePackRef, GitSubprocessLimits, PushCausalError, StreamIngestLimits};
 
@@ -83,10 +83,11 @@ pub async fn prove_gateway_incoming_pack_closure(
     let proc_limits = GitSubprocessLimits::default();
     let ingest_limits = StreamIngestLimits::default();
 
-    let proof_tmp = TempDir::new().map_err(|_| GatewayError::Internal("could not create causal proof sandbox"))?;
+    let proof_tmp =
+        QuarantineSlot::create(None).map_err(|_| GatewayError::Internal("could not create causal proof sandbox"))?;
     init_isolated_bare_repo_bin(
         args.git_binary,
-        proof_tmp.path(),
+        proof_tmp.dir(),
         args.closure.snapshot.object_format,
         &proc_limits,
         std_dl,
@@ -97,7 +98,7 @@ pub async fn prove_gateway_incoming_pack_closure(
     let base_oids = stage_verified_view_bases(
         args.git_binary,
         args.view_repo,
-        proof_tmp.path(),
+        proof_tmp.dir(),
         &args.closure.snapshot.authorized_base_packs,
         &proc_limits,
         std_dl,
@@ -108,7 +109,7 @@ pub async fn prove_gateway_incoming_pack_closure(
         GatewayError::BadRequest("base pack set failed causal closure verification")
     })?;
 
-    let incoming_path = proof_tmp.path().join("incoming.pack");
+    let incoming_path = proof_tmp.dir().join("incoming.pack");
     let maybe_count = extract_and_check_wire_pack(
         args.request_path,
         args.pack_offset,
@@ -135,15 +136,15 @@ pub async fn prove_gateway_incoming_pack_closure(
     if let Some(declared_count) = maybe_count
         && declared_count > 0
     {
-        let resolved_idx = proof_tmp.path().join("objects/pack/incoming.idx");
-        let resolved_pack = proof_tmp.path().join("objects/pack/incoming.pack");
+        let resolved_idx = proof_tmp.dir().join("objects/pack/incoming.idx");
+        let resolved_pack = proof_tmp.dir().join("objects/pack/incoming.pack");
         fs::rename(&incoming_path, &resolved_pack)
             .map_err(|_| GatewayError::Internal("could not move incoming pack into proof sandbox"))?;
         let idx_str = resolved_idx.to_str().ok_or(GatewayError::Internal("non-utf8 proof idx"))?;
         let pack_str = resolved_pack.to_str().ok_or(GatewayError::Internal("non-utf8 proof pack"))?;
         run_git_bin(
             args.git_binary,
-            proof_tmp.path(),
+            proof_tmp.dir(),
             &["index-pack", "--fix-thin", "--strict", "-o", idx_str, pack_str],
             GitStdin::Null,
             &proc_limits,
@@ -157,7 +158,7 @@ pub async fn prove_gateway_incoming_pack_closure(
 
         let vp = inspect_verify_pack_bin(
             args.git_binary,
-            proof_tmp.path(),
+            proof_tmp.dir(),
             &resolved_idx,
             &ingest_limits,
             &proc_limits,
@@ -195,7 +196,7 @@ pub async fn prove_gateway_incoming_pack_closure(
     if !args.target_oids.is_empty() {
         proof.required_ancestor_oids = verify_reachability_and_ancestors(
             args.git_binary,
-            proof_tmp.path(),
+            proof_tmp.dir(),
             args.target_oids,
             &authorized_tips,
             &base_oids,
@@ -238,11 +239,11 @@ pub async fn prove_committed_blob_pairs_closure(
         terminal_refs,
         deadline,
     } = args;
-    let proof_tmp = TempDir::new().map_err(|e| PushCausalError::Io(e.to_string()))?;
+    let proof_tmp = QuarantineSlot::create(None)?;
     let proc_limits = GitSubprocessLimits::default();
     let ingest_limits = StreamIngestLimits::default();
-    init_isolated_bare_repo_bin(git_binary, proof_tmp.path(), format, &proc_limits, deadline).await?;
-    let pack_dir = proof_tmp.path().join("objects/pack");
+    init_isolated_bare_repo_bin(git_binary, proof_tmp.dir(), format, &proc_limits, deadline).await?;
+    let pack_dir = proof_tmp.dir().join("objects/pack");
 
     let mut base_oids = BTreeSet::new();
     for (i, base) in base_packs.iter().enumerate() {
@@ -252,7 +253,7 @@ pub async fn prove_committed_blob_pairs_closure(
         store.get_to_file(&base.idx_locator, &bi, deadline).await?;
         verify_file_sha256_len(&bp, &base.pack_sha256, base.pack_length)?;
         verify_file_sha256_len(&bi, &base.idx_sha256, base.idx_length)?;
-        base_oids.extend(list_idx_oids_bin(git_binary, proof_tmp.path(), &bi, &proc_limits, deadline).await?);
+        base_oids.extend(list_idx_oids_bin(git_binary, proof_tmp.dir(), &bi, &proc_limits, deadline).await?);
     }
 
     let mut proof = GatewayObjectClosureProof::default();
@@ -266,8 +267,8 @@ pub async fn prove_committed_blob_pairs_closure(
         verify_file_sha256_len(&op_p, &pair.pack_sha256, pair.pack_bytes)?;
         verify_file_sha256_len(&op_i, &pair.idx_sha256, pair.idx_bytes)?;
 
-        let vp = inspect_verify_pack_bin(git_binary, proof_tmp.path(), &op_i, &ingest_limits, &proc_limits, deadline)
-            .await?;
+        let vp =
+            inspect_verify_pack_bin(git_binary, proof_tmp.dir(), &op_i, &ingest_limits, &proc_limits, deadline).await?;
         proof.object_count = proof.object_count.saturating_add(vp.entries.len() as u64);
         proof.delta_object_count = proof.delta_object_count.saturating_add(vp.delta_count);
         proof.max_delta_chain_depth = proof.max_delta_chain_depth.max(vp.max_depth);
@@ -294,7 +295,7 @@ pub async fn prove_committed_blob_pairs_closure(
     if !targets.is_empty() {
         proof.required_ancestor_oids = verify_reachability_and_ancestors(
             git_binary,
-            proof_tmp.path(),
+            proof_tmp.dir(),
             &targets,
             base_tips,
             &base_oids,
