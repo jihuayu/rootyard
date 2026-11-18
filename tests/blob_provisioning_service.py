@@ -1014,7 +1014,7 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
             # production check compares the stored binding identity with the
             # identity of the store this process actually opened.
             with self._backend_identity_conflict_phase(BackendIdentityConflictPhase.conflicting_create):
-                refusal_status, refusal_raw, _ = self.post_create(
+                refusal_status, refusal_raw = self.post_create(
                     {"owner": "alice", "name": name, "object_format": "sha1"}, attempts=1)
                 assert refusal_status == 409, (
                     "conflicting Blob backend create was not explicitly refused: " + str(refusal_status))
@@ -1072,7 +1072,7 @@ class ProvisioningHarness(serving.BlobOnlyHarness):
         legacy_before = self.legacy_repository_snapshot(legacy_name)
         # The same authenticated create path must classify the old `gitfs`
         # row as unsupported before it creates a binding/gate/protocol realm.
-        refusal_status, refusal_raw, _ = self.post_create(
+        refusal_status, refusal_raw = self.post_create(
             {"owner": "alice", "name": legacy_name, "object_format": "sha1"}, attempts=1)
         assert refusal_status == 409, (
             "legacy repository format create was not explicitly refused: " + str(refusal_status))

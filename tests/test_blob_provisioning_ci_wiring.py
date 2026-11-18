@@ -127,7 +127,7 @@ class _BackendIdentityCaseDouble(provisioning.ProvisioningHarness):
 
     def post_create(self, payload, attempts=4):
         self._phase_failure(Phase.conflicting_create)
-        return 409, json.dumps({"error": "repository state changed; retry"}).encode(), {}
+        return 409, json.dumps({"error": "repository state changed; retry"}).encode()
 
     def get_repo_status(self, owner, name):
         self._phase_failure(Phase.conflicting_lookup)
@@ -296,7 +296,7 @@ class _BackendIdentityStartupCaseDouble(_StartHarness):
         return _AUTHORITY
 
     def post_create(self, payload, attempts=4):
-        return 409, json.dumps({"error": "repository state changed; retry"}).encode(), {}
+        return 409, json.dumps({"error": "repository state changed; retry"}).encode()
 
     def get_repo_status(self, owner, name):
         return 409, json.dumps({"error": "repository is not ready"}).encode(), {}
@@ -449,6 +449,33 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         self.assertEqual(conflict.group(1), "repository state changed; retry")
         session_source = (ROOT / "src" / "blob_git_gateway" / "session.rs").read_text(encoding="utf-8")
         self.assertIn('StatusCode::CONFLICT => GatewayError::Conflict("repository is not ready")', session_source)
+
+    def test_post_create_returns_the_real_two_value_caller_shape(self) -> None:
+        # The real HTTP helper returns (status, body, headers); post_create is
+        # the two-value adapter every case call site unpacks. A fake HTTP triple
+        # and the real method pin that boundary without a service or network.
+        raw = json.dumps({"error": "repository state changed; retry"}).encode()
+        headers = {"content-type": "application/json"}
+        requests = []
+
+        def fake_http(path, **kwargs):
+            requests.append((path, kwargs))
+            return 409, raw, headers
+
+        harness = types.SimpleNamespace(http=fake_http, alice={"token": "fixture-token"})
+        result = provisioning.ProvisioningHarness.post_create(
+            harness,
+            {"owner": "alice", "name": "conflict", "object_format": "sha1"},
+            attempts=1)
+        self.assertEqual(result, (409, raw))
+        self.assertIs(result[1], raw)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0][0], "/api/repos")
+        self.assertEqual(requests[0][1], {
+            "token": {"token": "fixture-token"},
+            "method": "POST",
+            "body": {"owner": "alice", "name": "conflict", "object_format": "sha1"},
+        })
 
     def test_conflicting_blob_identity_fixture_stays_within_production_root_bounds(self) -> None:
         # Pure fixture check: no service, process, socket, database or Cargo run.
