@@ -1,0 +1,226 @@
+name: Issue 42 native hosted slot-zero library qualification
+
+# Qualification of the unswitched library layer only. This job starts its own
+# PostgreSQL 17, runs the exact ignored native cases against the second,
+# pinned product checkout, and uploads one bounded allowlist JSON. It does not
+# switch the production path and does not claim the original #42 acceptance.
+#
+# To move to a reviewed Luna candidate, change only PRODUCT_SHA/PRODUCT_TREE
+# below to the exact commit and tree of that candidate. The push path names
+# only this workflow file, so a validator/test edit must also touch this file
+# to re-trigger the qualification.
+on:
+  push:
+    branches: [codex/goal-issue42-original-ac-source-audit-20261117]
+    paths: [.github/workflows/issue42-native-hosted-slot0-postgres.yml]
+
+permissions:
+  contents: read
+
+env:
+  PRODUCT_SHA: a4198c083203bb63bdf267757134bdef4bceba71
+  PRODUCT_TREE: 600c4bf65c68acbf0a23f9765399a859a795675d
+  WORKFLOW_PATH: .github/workflows/issue42-native-hosted-slot0-postgres.yml
+  WORK: ${{ runner.temp }}/issue42-native-slot0-${{ github.run_id }}-${{ github.run_attempt }}
+  EVIDENCE: ${{ runner.temp }}/issue42-native-slot0-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONOPTIMIZE: ''
+  PGHOST: 127.0.0.1
+  PGPORT: '55432'
+  PGUSER: rootyard
+  PGDATABASE: postgres
+  PGSSLMODE: disable
+  PGCONNECT_TIMEOUT: '5'
+
+jobs:
+  library-layer:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 110
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - name: Prepare job-owned scratch directories
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$RUNNER_TEMP"
+          mkdir -m 700 "$WORK"
+          mkdir -m 700 "$EVIDENCE"
+          printf '[slot0-native] stage=workspace status=ok\n'
+
+      - name: Check out the exact workflow source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        timeout-minutes: 4
+        with:
+          ref: ${{ github.sha }}
+          path: workflow-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out the exact product source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        timeout-minutes: 4
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify workflow and product provenance
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          printf 'source' > "$EVIDENCE/stage"
+          if ! (
+            workflow_source="$GITHUB_WORKSPACE/workflow-source"
+            product="$GITHUB_WORKSPACE/product"
+            test "$GITHUB_EVENT_NAME" = push
+            test "$GITHUB_REF" = "refs/heads/codex/goal-issue42-original-ac-source-audit-20261117"
+            test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$WORKFLOW_PATH@$GITHUB_REF"
+            test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+            test "$(git -C "$workflow_source" rev-parse HEAD)" = "$GITHUB_SHA"
+            test -z "$(git -C "$workflow_source" status --porcelain=v1 --untracked-files=all)"
+            test -f "$workflow_source/$WORKFLOW_PATH"
+            test "$(git -C "$workflow_source" rev-parse "$PRODUCT_SHA^{tree}")" = "$PRODUCT_TREE"
+            git -C "$workflow_source" merge-base --is-ancestor "$PRODUCT_SHA" "$GITHUB_SHA"
+            test "$(git -C "$product" rev-parse HEAD)" = "$PRODUCT_SHA"
+            test "$(git -C "$product" rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+            test -z "$(git -C "$product" status --porcelain=v1 --untracked-files=all)"
+          ) >/dev/null 2>&1; then
+            printf '[slot0-native] stage=source status=failed class=source\n' >&2
+            exit 1
+          fi
+          printf '[slot0-native] stage=source status=ok\n'
+
+      - name: Install only the pinned native tools
+        timeout-minutes: 22
+        run: |
+          set -euo pipefail
+          umask 077
+          printf 'toolchain' > "$EVIDENCE/stage"
+          if ! (
+            sudo install -d -m 0755 /etc/apt/keyrings
+            curl -fsSL --connect-timeout 8 --max-time 60 \
+              https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+              | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+            . /etc/os-release
+            echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+              | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client-17
+            echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
+            rustup toolchain install 1.99.1 --profile minimal
+            rustup default 1.99.1
+            bash "$GITHUB_WORKSPACE/product/scripts/install_ci_cargo_fork.sh" install \
+              --cache-dir "$WORK/cargo-fork" --require-os linux
+          ) >/dev/null 2>&1; then
+            printf '[slot0-native] stage=toolchain status=failed class=toolchain\n' >&2
+            exit 1
+          fi
+          printf '[slot0-native] stage=toolchain status=ok\n'
+
+      - name: Record the owned PostgreSQL 17 baseline
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          umask 077
+          printf 'postgres' > "$EVIDENCE/stage"
+          if ! python3 -I "$GITHUB_WORKSPACE/workflow-source/scripts/issue42_native_hosted_slot0.py" \
+              pg-baseline --work "$WORK"; then
+            printf '[slot0-native] stage=postgres status=failed class=postgres\n' >&2
+            printf 'postgres' > "$EVIDENCE/stage"
+            exit 1
+          fi
+
+      - name: Build and bind both attested native harnesses
+        timeout-minutes: 40
+        run: |
+          set -euo pipefail
+          umask 077
+          printf 'build' > "$EVIDENCE/stage"
+          work="$WORK"
+          product="$GITHUB_WORKSPACE/product"
+          workflow_source="$GITHUB_WORKSPACE/workflow-source"
+          cd "$product"
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          if ! bash scripts/install_ci_cargo_fork.sh verify --cache-dir "$work/cargo-fork" \
+              --require-os linux --require-path >/dev/null 2>&1; then
+            printf '[slot0-native] stage=build status=failed class=toolchain\n' >&2
+            printf 'toolchain' > "$EVIDENCE/stage"
+            exit 1
+          fi
+          unset CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          export CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0
+          if ! (
+            python3 -B scripts/build_native_test.py --test ref_store_operations \
+              --features pando-lab --no-default-features --package-debug 0 --strip-debuginfo \
+              --artifact-store "$work/store" --output "$work/ref-store-operations"
+            python3 -B scripts/build_native_test.py --lib \
+              --features pando-lab --no-default-features --package-debug 0 --strip-debuginfo \
+              --artifact-store "$work/store" --output "$work/slot-zero-lib"
+          ) >/dev/null 2>&1; then
+            printf '[slot0-native] stage=build status=failed class=build\n' >&2
+            printf 'build' > "$EVIDENCE/stage"
+            exit 1
+          fi
+          for name in ref-store-operations slot-zero-lib; do
+            test -f "$work/$name"
+            test -x "$work/$name"
+            test ! -L "$work/$name"
+            test -f "$work/$name.build.json"
+            test ! -L "$work/$name.build.json"
+          done
+          if ! python3 -I "$workflow_source/scripts/issue42_native_hosted_slot0.py" bind \
+              --work "$work" --product "$product" --workflow-source "$workflow_source" \
+              --integration "$work/ref-store-operations" --lib "$work/slot-zero-lib"; then
+            printf 'bind' > "$EVIDENCE/stage"
+            exit 1
+          fi
+          printf '[slot0-native] stage=build status=ok\n'
+
+      - name: Run exactly the seven bounded native cases
+        timeout-minutes: 18
+        run: |
+          set -euo pipefail
+          umask 077
+          printf 'test' > "$EVIDENCE/stage"
+          python3 -I "$GITHUB_WORKSPACE/workflow-source/scripts/issue42_native_hosted_slot0.py" run \
+            --work "$WORK" --product "$GITHUB_WORKSPACE/product" \
+            --workflow-source "$GITHUB_WORKSPACE/workflow-source" \
+            --integration "$WORK/ref-store-operations" --lib "$WORK/slot-zero-lib"
+
+      - name: Check cleanup and seal the allowlist report
+        if: always()
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p -m 700 "$EVIDENCE"
+          python3 -I "$GITHUB_WORKSPACE/workflow-source/scripts/issue42_native_hosted_slot0.py" finalize \
+            --work "$WORK" --evidence "$EVIDENCE" --product "$GITHUB_WORKSPACE/product" \
+            --workflow-source "$GITHUB_WORKSPACE/workflow-source"
+
+      - name: Upload only the fixed allowlist qualification JSON
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        timeout-minutes: 2
+        with:
+          name: issue42-native-slot0-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue42-native-slot0-evidence-${{ github.run_id }}-${{ github.run_attempt }}/qualification.json
+          if-no-files-found: error
+          retention-days: 7
