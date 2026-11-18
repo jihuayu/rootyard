@@ -54,6 +54,15 @@ fn wait_queue_limit() -> usize {
         .clamp(1, 1024)
 }
 
+pub(crate) struct CheckoutSnapshot {
+    pub source: Option<String>,
+    pub availability: AvailabilitySummary,
+}
+
+/// Select a ready mirror and count availability in one statement. A heartbeat
+/// committed between two statements could otherwise make selection miss a
+/// candidate that the following availability probe reports as ready, yielding
+/// a contradictory 429 "no ready mirror" for a genuinely ready mirror.
 pub(crate) async fn select_ready_mirror(
     client: &(impl GenericClient + Sync),
     repo_id: Uuid,
@@ -61,26 +70,46 @@ pub(crate) async fn select_ready_mirror(
     audience: Uuid,
     head_oid: &str,
     excluded: &[String],
-) -> Result<Option<String>, Error> {
+) -> Result<CheckoutSnapshot, Error> {
     let row = client
-        .query_opt(
-            "SELECT m.url FROM ci_mirror_nodes m \
-             WHERE m.repository_id=$1 AND m.storage_generation=$2 AND m.audience=$3 \
-               AND m.active=true AND m.url<>'origin' \
+        .query_one(
+            "SELECT (SELECT m2.url FROM ci_mirror_nodes m2 \
+               WHERE m2.repository_id=$1 AND m2.storage_generation=$2 AND m2.audience=$3 \
+                 AND m2.active=true AND m2.url<>'origin' \
+                 AND m2.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
+                 AND m2.ready_oids ? $5 AND NOT (m2.url = ANY($6::text[])) \
+                 AND (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
+                   AND c.source_url=m2.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) < m2.capacity \
+               ORDER BY (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
+                   AND c.source_url=m2.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) ASC, \
+                 (m2.capacity - (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
+                   AND c.source_url=m2.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp()))) DESC, \
+                 m2.heartbeat_unix DESC, m2.mirror_id ASC LIMIT 1) AS selected_url, \
+             count(*) FILTER (WHERE m.active=true AND m.url<>'origin' AND m.audience=$3 \
                AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
                AND m.ready_oids ? $5 AND NOT (m.url = ANY($6::text[])) \
-               AND (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
-                 AND c.source_url=m.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) < m.capacity \
-             ORDER BY (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
-                 AND c.source_url=m.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) ASC, \
-               (m.capacity - (SELECT count(*) FROM ci_runs c WHERE c.state='leased' \
-                 AND c.source_url=m.url AND c.lease_expires_unix>extract(epoch FROM clock_timestamp()))) DESC, \
-               m.heartbeat_unix DESC, m.mirror_id ASC LIMIT 1",
+               AND (SELECT count(*) FROM ci_runs c WHERE c.state='leased' AND c.source_url=m.url \
+                 AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) < m.capacity) AS ready_avail, \
+             count(*) FILTER (WHERE m.active=true AND m.url<>'origin' AND m.audience=$3 \
+               AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
+               AND m.ready_oids ? $5 AND NOT (m.url = ANY($6::text[]))) AS ready_total, \
+             count(*) FILTER (WHERE m.active=true AND m.url<>'origin' AND m.audience=$3 \
+               AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
+               AND NOT (m.ready_oids ? $5) AND NOT (m.url = ANY($6::text[]))) AS healthy_unready \
+             FROM ci_mirror_nodes m WHERE m.repository_id=$1 AND m.storage_generation=$2",
             &[&repo_id, &storage_generation, &audience, &MIRROR_HEARTBEAT_TTL_SECS, &head_oid, &excluded],
         )
         .await
         .map_err(Error::internal)?;
-    Ok(row.map(|r| r.get(0)))
+    Ok(CheckoutSnapshot {
+        source: row.get("selected_url"),
+        availability: AvailabilitySummary {
+            ready_available_mirrors: row.get::<_, i64>("ready_avail").max(0) as usize,
+            ready_total_mirrors: row.get::<_, i64>("ready_total").max(0) as usize,
+            healthy_unready_mirrors: row.get::<_, i64>("healthy_unready").max(0) as usize,
+            origin_budget: query_origin_budget(client, repo_id).await?,
+        },
+    })
 }
 
 pub(crate) async fn probe_availability(
@@ -91,31 +120,7 @@ pub(crate) async fn probe_availability(
     head_oid: &str,
     excluded: &[String],
 ) -> Result<AvailabilitySummary, Error> {
-    let row = client
-        .query_one(
-            "SELECT \
-               count(*) FILTER (WHERE m.active=true AND m.url<>'origin' AND m.audience=$3 \
-                 AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
-                 AND m.ready_oids ? $5 AND NOT (m.url = ANY($6::text[])) \
-                 AND (SELECT count(*) FROM ci_runs c WHERE c.state='leased' AND c.source_url=m.url \
-                   AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())) < m.capacity) AS ready_avail, \
-               count(*) FILTER (WHERE m.active=true AND m.url<>'origin' AND m.audience=$3 \
-                 AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
-                 AND m.ready_oids ? $5 AND NOT (m.url = ANY($6::text[]))) AS ready_total, \
-               count(*) FILTER (WHERE m.active=true AND m.url<>'origin' AND m.audience=$3 \
-                 AND m.heartbeat_unix>extract(epoch FROM clock_timestamp())::bigint-$4 \
-                 AND NOT (m.ready_oids ? $5) AND NOT (m.url = ANY($6::text[]))) AS healthy_unready \
-             FROM ci_mirror_nodes m WHERE m.repository_id=$1 AND m.storage_generation=$2",
-            &[&repo_id, &storage_generation, &audience, &MIRROR_HEARTBEAT_TTL_SECS, &head_oid, &excluded],
-        )
-        .await
-        .map_err(Error::internal)?;
-    Ok(AvailabilitySummary {
-        ready_available_mirrors: row.get::<_, i64>("ready_avail").max(0) as usize,
-        ready_total_mirrors: row.get::<_, i64>("ready_total").max(0) as usize,
-        healthy_unready_mirrors: row.get::<_, i64>("healthy_unready").max(0) as usize,
-        origin_budget: query_origin_budget(client, repo_id).await?,
-    })
+    Ok(select_ready_mirror(client, repo_id, storage_generation, audience, head_oid, excluded).await?.availability)
 }
 
 pub(crate) async fn query_origin_budget(

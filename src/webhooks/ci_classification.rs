@@ -51,6 +51,19 @@ pub struct CheckoutTarget<'a> {
     pub excluded: &'a [String],
 }
 
+/// Emit a selected mirror route only when the same snapshot counted it as
+/// available. The negative returns the snapshot for state classification
+/// instead of inventing a route or a contradictory "no ready mirror" response.
+pub fn route_from_snapshot(
+    source: Option<String>,
+    availability: AvailabilitySummary,
+) -> Result<String, AvailabilitySummary> {
+    match source {
+        Some(source) if availability.ready_available_mirrors > 0 => Ok(source),
+        _ => Err(availability),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckoutStateClass {
@@ -231,5 +244,32 @@ mod tests {
             classify_checkout_state(ClassificationInput { allow_origin: false, ..base }),
             CheckoutStateClass::Missing
         );
+    }
+
+    #[test]
+    fn checkout_route_requires_a_ready_source_in_the_same_snapshot() {
+        let base = AvailabilitySummary {
+            ready_available_mirrors: 1,
+            ready_total_mirrors: 1,
+            healthy_unready_mirrors: 0,
+            origin_budget: OriginBudgetStatus {
+                global_active: 0,
+                global_limit: 4,
+                per_repo_active: 0,
+                per_repo_limit: 2,
+            },
+        };
+        assert_eq!(
+            route_from_snapshot(Some("https://mirror.example".into()), base.clone()).unwrap(),
+            "https://mirror.example"
+        );
+        let blocked = AvailabilitySummary {
+            ready_available_mirrors: 0,
+            ready_total_mirrors: 0,
+            healthy_unready_mirrors: 1,
+            ..base
+        };
+        assert_eq!(route_from_snapshot(None, blocked.clone()).unwrap_err(), blocked);
+        assert!(route_from_snapshot(Some("https://mirror.example".into()), blocked).is_err());
     }
 }
