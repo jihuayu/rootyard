@@ -22,7 +22,7 @@ belongs to a different workstream.
     COMPLETE
     manifest.json
     metadata.dump
-    blob/<repository>/<pack>/{pack,idx}
+    blob/<repository>/<pack>/{pack.pack,idx.idx}
     volume/
 ```
 

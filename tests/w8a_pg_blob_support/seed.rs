@@ -300,19 +300,20 @@ async fn seed_runtime_rows(
         "mirror_audience": Uuid::new_v4().to_string(),
         "expires_unix": expires,
     });
-    let credential = vec![0xA5u8; 32];
+    let credential: &[u8] = &[0xA5u8; 32];
     client
         .execute(
             "INSERT INTO ci_checkout_jobs(repository_id,job_id,owner_id,cancelled,revoked,plan,issuer_token_id,credential_digest,expires_unix)
              VALUES($1,$2,$3,false,false,$4,$5,$6,$7)",
-            &[&repo.id, &job_id, &owner_id, &plan, &developer.identity.token_id, credential.as_slice(), &expires],
+            &[&repo.id, &job_id, &owner_id, &plan, &developer.identity.token_id, &credential, &expires],
         )
         .await?;
+    let csrf: &[u8] = &[0x42u8; 32];
     client
         .execute(
             "INSERT INTO web_sessions(token_id,csrf_digest,expires_at)
              VALUES($1,$2,clock_timestamp()+interval '1 hour')",
-            &[&browser.identity.token_id, &vec![0x42u8; 32]],
+            &[&browser.identity.token_id, &csrf],
         )
         .await?;
     client
@@ -364,10 +365,12 @@ pub fn write_volume(directory: &Path) -> Result<()> {
     Ok(())
 }
 pub fn write_keyring(directory: &Path) -> Result<PathBuf> {
+    write_keyring_with(directory, "w8a-key-1", 0x5A)
+}
+pub fn write_keyring_with(directory: &Path, id: &str, key_byte: u8) -> Result<PathBuf> {
     std::fs::create_dir_all(directory)?;
     set_mode(directory, 0o700)?;
-    let id = "w8a-key-1";
-    let key = [0x5Au8; 32];
+    let key = [key_byte; 32];
     let path = directory.join(format!("{id}.key"));
     std::fs::write(&path, key)?;
     set_mode(&path, 0o600)?;

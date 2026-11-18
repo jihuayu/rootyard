@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::blob_store::encryption_config::BlobEncryptionConfig;
-use crate::blob_store::key_provider::{DATA_KEY_BYTES, KeyProvider, WrapContext, WrappedKey};
+use crate::blob_store::key_provider::{DATA_KEY_BYTES, WrapContext, WrappedKey};
 
 use super::{W8aError, W8aResult};
 pub const MANIFEST_SEAL_DOMAIN: &[u8] = b"rootyard-w8a-manifest-v1\0";
@@ -264,11 +264,14 @@ fn derived_uuid(probe: &[u8; DATA_KEY_BYTES], label: &[u8]) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeyringManifest {
+    schema: u32,
     current: String,
     keys: Vec<KeyringEntry>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeyringEntry {
     key_id: String,
     sha256: String,
@@ -294,6 +297,9 @@ fn keyring_identity(dir: &Path) -> W8aResult<(String, Vec<String>, String)> {
         .map_err(|error| W8aError::KeyReferenceMismatch(format!("reading keyring manifest: {error}")))?;
     let manifest: KeyringManifest = serde_json::from_slice(&bytes)
         .map_err(|error| W8aError::KeyReferenceMismatch(format!("parsing keyring manifest: {error}")))?;
+    if manifest.schema != 1 {
+        return Err(mismatch("keyring manifest schema must be 1"));
+    }
     let mut entries: Vec<(String, String)> =
         manifest.keys.into_iter().map(|entry| (entry.key_id, entry.sha256)).collect();
     entries.sort();

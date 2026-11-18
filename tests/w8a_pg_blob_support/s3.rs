@@ -110,7 +110,8 @@ impl Drop for EnvGuard {
 }
 
 fn response(status: StatusCode, len: Option<usize>, extra: &[(&str, &str)], body: Body) -> Response {
-    let mut builder = Response::builder().status(status).header(header::ACCEPT_RANGES, "bytes");
+    let mut builder =
+        Response::builder().status(status).header(header::ACCEPT_RANGES, "bytes").header(header::CONNECTION, "close");
     for (name, value) in extra {
         builder = builder.header(*name, *value);
     }

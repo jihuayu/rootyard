@@ -206,7 +206,7 @@ async fn build(
 }
 
 async fn read_source(config: &Config) -> W8aResult<SourceIdentity> {
-    let mut client = super::super::pg(config).await.map_err(backup_error)?;
+    let client = super::super::pg(config).await.map_err(backup_error)?;
     let row = client
         .query_one(
             "SELECT

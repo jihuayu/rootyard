@@ -44,7 +44,7 @@ fn keyring(directory: &Path, current: &str, keys: &[(&str, [u8; 32])]) {
         private_file(&directory.join(format!("{id}.key"))).write_all(key).unwrap();
         entries.push(serde_json::json!({"key_id": id, "sha256": sha(key)}));
     }
-    let manifest = serde_json::json!({"current": current, "keys": entries});
+    let manifest = serde_json::json!({"schema": 1, "current": current, "keys": entries});
     write_mode(&directory.join("keyring.json"), &serde_json::to_vec(&manifest).unwrap());
 }
 

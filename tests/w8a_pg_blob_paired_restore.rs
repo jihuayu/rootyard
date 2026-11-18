@@ -172,7 +172,7 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
     seed::create_database(&admin, &source_db).await?;
     let source_url = seed::with_database(&admin, &source_db);
     let first_keys = seed::write_keyring(&temp.path().join("keys-first"))?;
-    let second_keys = seed::write_keyring(&temp.path().join("keys-second"))?;
+    let second_keys = seed::write_keyring_with(&temp.path().join("keys-second"), "w8a-key-1", 0xA5)?;
     let keyring = first_keys.to_str().ok_or_else(|| anyhow!("keyring path is not UTF-8"))?.to_owned();
     let endpoint = server.endpoint().to_owned();
     let mut env = EnvGuard::set(&[
@@ -361,17 +361,17 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
     ensure!(rootyard::events::pending_count(&destination_pool).await? == 0, "outbox did not drain after restore");
 
     let policy = Policy::from_env()?;
-    let fence_client = destination_pool.get().await?;
+    let mut fence_client = rootyard::db::connect_url(&destination_url).await?;
     ensure!(
         matches!(
-            admit_deleter_epoch(&*fence_client, seeded.authority_epoch, &policy).await,
+            admit_deleter_epoch(&fence_client, seeded.authority_epoch, &policy).await,
             Err(W8aError::StaleDeleterFenced { .. })
         ),
         "source-epoch deleter was not fenced"
     );
     ensure!(
         matches!(
-            admit_deleter_epoch(&*fence_client, restored.new_storage_authority_epoch, &policy).await,
+            admit_deleter_epoch(&fence_client, restored.new_storage_authority_epoch, &policy).await,
             Err(W8aError::StaleDeleterFenced { remote_delete_fenced: true, .. })
         ),
         "new-epoch deleter was not fenced by remote_delete_fenced"
@@ -380,13 +380,11 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
     enabled.enabled = true;
     ensure!(
         matches!(
-            admit_deleter_epoch(&*fence_client, restored.new_storage_authority_epoch, &enabled).await,
+            admit_deleter_epoch(&fence_client, restored.new_storage_authority_epoch, &enabled).await,
             Err(W8aError::DestructiveGcForbidden(_))
         ),
         "enabled destructive GC was not refused before the fence"
     );
-
-    drop(fence_client);
 
     init_remote_merge_tables(&destination_pool).await?;
     let record = PendingMergeRecord {
@@ -414,11 +412,11 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
         reject_reason: None,
     };
     PgMergeStore::new(destination_pool.clone()).insert_pending(&record).await?;
-    let mut merge_client = rootyard::db::connect_url(&destination_url).await?;
     let merge_fence =
-        fence_w8a_fresh_incarnation(&mut merge_client, seeded.cluster_incarnation, seeded.authority_epoch).await?;
+        fence_w8a_fresh_incarnation(&mut fence_client, seeded.cluster_incarnation, seeded.authority_epoch).await?;
     ensure!(merge_fence.aborted_pull_merges == 1, "pending remote merge was not aborted");
 
+    drop(fence_client);
     drop(destination_pool);
     drop(source);
     let _ = seed::drop_database(&admin, &destination).await;
