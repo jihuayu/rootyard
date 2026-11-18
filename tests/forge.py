@@ -60,6 +60,17 @@ class ForgeHarness(Harness):
                 "DROP CONSTRAINT IF EXISTS forge_pulls_next_review_comment_number_check"
             )
             replay = "DELETE FROM schema_migrations WHERE version IN (6,7,150)"
+            if 151 in SCHEMA_VERSIONS:
+                # Dropping forge_issues/forge_issue_comments also removes migration 151's
+                # rekeyed cascade FKs; replay 151 so those constraints and lifecycle objects match.
+                drops += (
+                    "; DROP TABLE IF EXISTS repository_lifecycle_idempotency,"
+                    "repository_transfers,repository_aliases; "
+                    "ALTER TABLE repositories "
+                    "DROP CONSTRAINT IF EXISTS repositories_deleted_purge_window_chk, "
+                    "DROP CONSTRAINT IF EXISTS repositories_version_check"
+                )
+                replay = "DELETE FROM schema_migrations WHERE version IN (6,7,150,151)"
         self.sql(
             drops + "; " + replay + "; CREATE TABLE forge_issue_comments(dummy integer)"
         )

@@ -363,12 +363,87 @@ async fn hydrate(store: &RemoteObjectStore, key: &HydrationKey, deadline: Instan
 }
 
 /// Explicit, bounded repair workflow for an already-acknowledged upload whose
-/// local bytes are still verified but whose remote copy may be missing. It is
-/// deliberately never invoked from a read path.
+/// local bytes are still verified but whose remote copy may be missing. Holds a
+/// transfer-aware write admission lease and re-checks the live repository owner.
+async fn live_repair_owner_ready(
+    pool: &deadpool_postgres::Pool,
+    repo_id: Uuid,
+    oid: &str,
+    size: i64,
+) -> Result<Option<(Uuid, i64)>> {
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT r.owner_id, r.storage_generation \
+             FROM repositories r \
+             JOIN lfs_objects l ON l.repository_id = r.id AND l.tenant_id = r.owner_id \
+             WHERE r.id = $1 AND r.deleted_at IS NULL AND r.archived_at IS NULL \
+               AND r.transition_state = 'stable' \
+               AND l.oid = $2 AND l.size = $3 AND l.state = 'ready' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM repository_transfers t \
+                 WHERE t.repository_id = r.id AND t.state NOT IN ('completed', 'rolled_back', 'failed') \
+               )",
+            &[&repo_id, &oid, &size],
+        )
+        .await?;
+    Ok(row.map(|r| (r.get(0), r.get(1))))
+}
+
+pub(super) async fn repair_remote_object_with_store(
+    pool: &deadpool_postgres::Pool,
+    data_root: &Path,
+    store: &RemoteObjectStore,
+    repo_id: Uuid,
+    oid: &str,
+    size: u64,
+    deadline: Instant,
+) -> Result<()> {
+    let size_i64 = i64::try_from(size).context("LFS repair object size exceeds i64")?;
+    let Some((_, storage_gen)) = live_repair_owner_ready(pool, repo_id, oid, size_i64).await? else {
+        return Ok(());
+    };
+    let admission = crate::storage::admission::acquire(pool, repo_id, storage_gen, "lfs_repair", deadline)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.1))?;
+    let res: Result<()> = async {
+        let Some((owner_id, _)) = live_repair_owner_ready(pool, repo_id, oid, size_i64).await? else {
+            return Ok(());
+        };
+        admission.ensure_active().map_err(|e| anyhow::anyhow!(e.1))?;
+        crate::storage::remote_key_claims::wait_or_clear_delete_claim(pool, Some(store), owner_id, "lfs", oid, deadline)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.1))?;
+        admission.ensure_active().map_err(|e| anyhow::anyhow!(e.1))?;
+        let key = ObjectKey::new(owner_id, "lfs", oid)?;
+        if store.head(&key, deadline).await?.is_none_or(|head| head.size != size) {
+            let mut client = pool.get().await?;
+            let tx = client.transaction().await?;
+            crate::storage::remote_key_claims::lock_object_key(&tx, owner_id, "lfs", oid)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.1))?;
+            ensure!(
+                !crate::storage::remote_key_claims::has_active_delete_claim(&tx, owner_id, "lfs", oid)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.1))?,
+                "remote object delete claim active during LFS repair"
+            );
+            tx.commit().await?;
+            admission.ensure_active().map_err(|e| anyhow::anyhow!(e.1))?;
+            store.put_file(&key, &object_path(data_root, repo_id, oid)?, size, deadline).await?;
+            admission.ensure_active().map_err(|e| anyhow::anyhow!(e.1))?;
+        }
+        Ok(())
+    }
+    .await;
+    admission.finish().await;
+    res
+}
+
 pub(super) fn schedule_repair(
+    pool: deadpool_postgres::Pool,
     data_root: PathBuf,
     repo_id: Uuid,
-    tenant_id: Uuid,
     oid: String,
     size: u64,
     timeout: std::time::Duration,
@@ -387,13 +462,8 @@ pub(super) fn schedule_repair(
             let Some(store) = remote_store(&data_root)? else {
                 return Ok::<(), anyhow::Error>(());
             };
-            let key = ObjectKey::new(tenant_id, "lfs", &oid)?;
             let deadline = Instant::now() + timeout;
-            if store.head(&key, deadline).await?.is_none_or(|head| head.size != size) {
-                let path = object_path(&data_root, repo_id, &oid)?;
-                store.put_file(&key, &path, size, deadline).await?;
-            }
-            Ok(())
+            repair_remote_object_with_store(&pool, &data_root, &store, repo_id, &oid, size, deadline).await
         }
         .await;
         if let Err(error) = result {
