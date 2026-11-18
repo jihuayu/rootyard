@@ -4,6 +4,7 @@ pub mod checks;
 pub mod handlers;
 pub mod merge;
 pub mod models;
+pub mod remote_merge_finalizer;
 pub mod review_comment_actions;
 pub mod review_comments;
 pub mod rules;
