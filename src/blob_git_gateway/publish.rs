@@ -208,7 +208,7 @@ pub(super) async fn push(
             // A3 hold or protected upload. It is outside every PostgreSQL
             // transaction; production compiles this method away.
             #[cfg(test)]
-            state.pause_after_admission(operation_id).await;
+            state.pause_after_admission(operation_id).await?;
             let result = async {
                 for (index, pair) in pairs.iter().enumerate() {
                     let planned =

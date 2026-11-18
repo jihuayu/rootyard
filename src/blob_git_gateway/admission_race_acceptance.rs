@@ -126,6 +126,11 @@ const FAILURE_PHASE_MARKER: &str = "ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKE
 /// gateway's own operation deadline is 120s; this leaves transport and native
 /// Git some headroom while still aborting a detached task on a hang.
 const PUSH_BOUND: Duration = Duration::from_secs(180);
+/// One authenticated operation read is a small bounded JSON response. The whole
+/// send-to-body loop uses this deadline, never the request's larger operation
+/// deadline, and never an unbounded `json()`/`bytes()` helper.
+const OPERATION_VIEW_BOUND: Duration = Duration::from_secs(10);
+const MAX_OPERATION_VIEW_BYTES: usize = 64 * 1024;
 /// Exact persisted detail of the post-admission immutable-plan refusal built by
 /// `authorized/refusal.rs` (`RevisionMismatch` + this detail). No production
 /// constant names this literal, so it stays local to the assertion instead of
@@ -147,6 +152,86 @@ impl Drop for ServerGuard {
     }
 }
 
+/// Graceful, bounded server owner for the admitted-refusal fixture. Unlike a
+/// bare abort, `drain` stops accepting, releases no request by itself, and
+/// waits for the real serve task (including its connection tasks) to finish.
+struct RaceServer {
+    task: JoinHandle<Result<(), std::io::Error>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl RaceServer {
+    fn start(listener: TcpListener, app: Router) -> Self {
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        Self { task, shutdown: Some(shutdown) }
+    }
+
+    async fn drain(&mut self, bound: Duration) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        match tokio::time::timeout(bound, &mut self.task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(_))) => Err(anyhow!("race server exited with an error")),
+            Ok(Err(_)) => Err(anyhow!("race server task did not join cleanly")),
+            Err(_) => {
+                self.task.abort();
+                Err(anyhow!("race server drain exceeded its bound"))
+            }
+        }
+    }
+}
+
+impl Drop for RaceServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task.abort();
+    }
+}
+
+/// Armed pause guard for the admitted-refusal fixture. Error paths call
+/// `abandon` before draining the client/server; the Drop fallback makes an
+/// unwind release the rendezvous too, so a paused handler returns the fixed
+/// pre-upload refusal instead of writing or waiting forever.
+struct PauseReleaseGuard {
+    pause: Arc<AdmissionPause>,
+    armed: bool,
+}
+
+impl PauseReleaseGuard {
+    fn new(pause: Arc<AdmissionPause>) -> Self {
+        Self { pause, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn abandon(&mut self) {
+        if self.armed {
+            self.pause.abandon();
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for PauseReleaseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pause.abandon();
+        }
+    }
+}
+
 /// One real stock push task that is aborted if the case returns early or
 /// unwinds before it is joined. This keeps a paused request from outliving its
 /// fixture without a detached wait.
@@ -155,6 +240,21 @@ struct PushTask(JoinHandle<Result<git::Output>>);
 impl Drop for PushTask {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+impl PushTask {
+    /// Abort the client task, then wait up to `bound` for the join. A timeout
+    /// is a failure, not proof of cleanup; an expected self-abort is the only
+    /// cancellation accepted here.
+    async fn abort_and_join(mut self, bound: Duration) -> Result<()> {
+        self.0.abort();
+        match tokio::time::timeout(bound, &mut self.0).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) if error.is_cancelled() => Ok(()),
+            Ok(Err(_)) => Err(anyhow!("stock push task did not join cleanly")),
+            Err(_) => Err(anyhow!("stock push task drain exceeded its bound")),
+        }
     }
 }
 
@@ -527,8 +627,11 @@ async fn admitted_same_ref_attempt_is_refused_after_winner_commits() -> Result<(
         require_owned_disposable_blob_fixture()?;
         let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
         let db = Db::setup().await?;
-        require_per_run_blob_prefix()?;
-        let outcome = admitted_refusal_case(&db, &mut phase).await;
+        let outcome = async {
+            require_per_run_blob_prefix()?;
+            admitted_refusal_case(&db, &mut phase).await
+        }
+        .await;
         if outcome.is_ok() {
             phase = "fixture_cleanup";
         }
@@ -545,7 +648,11 @@ async fn admitted_same_ref_attempt_is_refused_after_winner_commits() -> Result<(
             .open(path)
             .and_then(|mut file| file.write_all(phase.as_bytes()));
     }
-    result
+    // The test failure exposes only the finite phase. Detailed assertion,
+    // database/Git/HTTP errors and any identity material stay inside the
+    // fixture and are never formatted into the outer error.
+    let final_phase = phase;
+    result.map_err(|_| anyhow!("admitted refusal fixture failed during fixed phase `{final_phase}`"))
 }
 
 /// Post-admission immutable-refusal case: two distinct commits from the same
@@ -563,8 +670,10 @@ async fn admitted_refusal_case(db: &Db, phase: &mut &'static str) -> Result<()> 
     ensure!(winner_operation != loser_operation, "the race pins shared an operation id");
 
     // A distinct post-admission rendezvous: the existing pre-admission hook is
-    // deliberately not attached here.
+    // deliberately not attached here. The guard abandons and releases the
+    // rendezvous on every early return or unwind.
     let pause = Arc::new(AdmissionPause::new(loser_operation));
+    let mut pause_guard = PauseReleaseGuard::new(pause.clone());
     let captures = Captures::default();
     let scratch = tempfile::tempdir().context("temporary gateway scratch root")?;
     let state = Arc::new(
@@ -586,256 +695,333 @@ async fn admitted_refusal_case(db: &Db, phase: &mut &'static str) -> Result<()> 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let app = capture_receive_responses(router(state.clone()), captures.clone());
-    let _server = ServerGuard { task: tokio::spawn(async move { axum::serve(listener, app).await }) };
+    let mut race_work: Option<tempfile::TempDir> = None;
+    let mut server = RaceServer::start(listener, app);
+    let mut loser_push: Option<PushTask> = None;
 
-    *phase = "repository_seed";
-    let created = create_repository(address, &owner, &name).await?;
-    let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
-    provision_decision_realm(db, &owner, &name, &store).await?;
-    let SameTipRace { work: _work, direct_url, seed, first_dir, second_dir, first_new, second_new, revision_before } =
-        seed_same_tip_race(db, git, address, &owner, &name, repository_id).await?;
+    let outcome = async {
+        *phase = "repository_seed";
+        let created = create_repository(address, &owner, &name).await?;
+        let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
+        provision_decision_realm(db, &owner, &name, &store).await?;
+        let SameTipRace { work, direct_url, seed, first_dir, second_dir, first_new, second_new, revision_before } =
+            seed_same_tip_race(db, git, address, &owner, &name, repository_id).await?;
+        race_work = Some(work);
 
-    // Start the loser and wait for its admitted pending row and serving binding.
-    // The pause is after the caller-owned admission `COMMIT` and before the
-    // first A3 hold/protected upload.
-    *phase = "post_admission_barrier";
-    let mut loser_push = spawn_push(git, second_dir, direct_url.clone(), loser_operation);
-    tokio::select! {
-        reached = tokio::time::timeout(PUSH_BOUND, pause.wait_reached()) => {
-            reached.map_err(|_| anyhow!("the losing stock push did not reach its post-admission rendezvous"))?;
+        // Start the loser and wait for its admitted pending row and serving binding.
+        // The pause is after the caller-owned admission `COMMIT` and before the
+        // first A3 hold/protected upload.
+        *phase = "post_admission_barrier";
+        loser_push = Some(spawn_push(git, second_dir, direct_url.clone(), loser_operation));
+        {
+            let loser_task =
+                loser_push.as_mut().ok_or_else(|| anyhow!("the losing stock push task was not retained"))?;
+            tokio::select! {
+                reached = tokio::time::timeout(PUSH_BOUND, pause.wait_reached()) => {
+                    reached.map_err(|_| anyhow!("the losing stock push did not reach its post-admission rendezvous"))?;
+                }
+                exited = loser_task => {
+                    let output = exited.context("the losing stock push task failed")??;
+                    return Err(anyhow!(
+                        "the losing stock push exited before its post-admission rendezvous: {}",
+                        redacted(&output)
+                    ));
+                }
+            }
         }
-        exited = &mut loser_push => {
-            let output = exited.context("the losing stock push task failed")??;
-            return Err(anyhow!(
-                "the losing stock push exited before its post-admission rendezvous: {}",
-                redacted(&output)
-            ));
+
+        *phase = "pre_release_assertions";
+        let loser_before = operation_witness(db, repository_id, loser_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the admitted operation has no durable row"))?;
+        ensure!(loser_before.state == "pending", "the admitted older attempt is {}, not pending", loser_before.state);
+        ensure!(loser_before.terminal.is_none(), "the admitted older attempt already has a terminal");
+        let binding_before = loser_before
+            .binding
+            .clone()
+            .ok_or_else(|| anyhow!("the admitted operation has no serving-operation binding"))?;
+        ensure!(
+            binding_before.issuer_id == loser_before.identity.issuer_id,
+            "the serving binding issuer differs from its stored operation"
+        );
+        ensure!(
+            binding_before.parent_digest == loser_before.identity.request_digest,
+            "the serving binding parent digest differs from its stored operation identity"
+        );
+        ensure!(
+            operation_events(db, repository_id, loser_operation).await?.is_empty(),
+            "the admitted older attempt emitted an event before release"
+        );
+        ensure!(durable_main(db, repository_id).await? == seed, "durable main changed before the winner started");
+        ensure!(gate_revision(db, repository_id).await? == revision_before, "the gate moved before the winner started");
+        ensure!(ref_count(db, repository_id).await? == 1, "the acknowledged ref set is not exactly main");
+        let memberships_before = membership_stats(db, repository_id, revision_before).await?;
+        ensure!(memberships_before.above_revision == 0, "a membership was recorded beyond the current revision");
+
+        // The winner uses a different commit, the same old OID and the SAME ref.
+        *phase = "winner_publish";
+        let winner_output = wait_push(spawn_push(git, first_dir, direct_url, winner_operation), "winning").await?;
+        ensure!(winner_output.success, "the winning stock push failed: {}", redacted(&winner_output));
+
+        // The winner is the only writer so far, and the older admitted attempt is
+        // still pending with no terminal/event before release.
+        *phase = "post_winner_assertions";
+        let revision_after = gate_revision(db, repository_id).await?;
+        ensure!(
+            revision_after == revision_before + 1,
+            "the gate moved {revision_before}->{revision_after}, not exactly one winner revision"
+        );
+        ensure!(durable_main(db, repository_id).await? == first_new, "durable main is not the winning commit");
+        let loser_mid = operation_witness(db, repository_id, loser_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the admitted operation row disappeared before release"))?;
+        ensure!(loser_mid.state == "pending", "the admitted older attempt settled before release");
+        ensure!(loser_mid.terminal.is_none(), "the admitted older attempt has a terminal before release");
+        ensure!(
+            loser_mid.identity == loser_before.identity,
+            "the admitted attempt's stored identity changed before release"
+        );
+        ensure!(
+            loser_mid.binding == loser_before.binding,
+            "the admitted attempt's serving binding changed before release"
+        );
+        ensure!(
+            operation_events(db, repository_id, loser_operation).await?.is_empty(),
+            "the admitted older attempt emitted an event before release"
+        );
+        let memberships_after_winner = membership_stats(db, repository_id, revision_after).await?;
+        ensure!(
+            memberships_after_winner.total == memberships_before.total + 1,
+            "the winner did not add exactly one pack membership"
+        );
+        ensure!(
+            memberships_after_winner.at_revision == 1,
+            "the winner added {} pack memberships at its revision, not one",
+            memberships_after_winner.at_revision
+        );
+        ensure!(
+            memberships_after_winner.above_revision == 0,
+            "a pack membership was recorded beyond the winner revision"
+        );
+
+        // Release the older admitted plan. Its A3 gate proof now sees the winner's
+        // revision; it must be closed with the fixed superseded refusal.
+        *phase = "superseded_refusal_await";
+        pause.release();
+        pause_guard.disarm();
+        let loser_task = loser_push.take().ok_or_else(|| anyhow!("the losing stock push task was not retained"))?;
+        let loser_output = wait_push(loser_task, "losing").await?;
+        ensure!(!loser_output.success, "the admitted older attempt unexpectedly succeeded");
+        let loser_text = output_text(&loser_output);
+        for forbidden in
+            ["409", "503", "non-fast-forward", "fetch first", "unexpected disconnect", "remote end hung up"]
+        {
+            let found = match forbidden {
+                "409" | "503" => has_stock_http_error(&loser_text, forbidden),
+                _ => loser_text.contains(forbidden),
+            };
+            ensure!(!found, "the admitted older attempt saw `{forbidden}`, not a report-status");
+        }
+        ensure!(
+            loser_text.contains("[rejected]") && loser_text.contains("stale info"),
+            "the admitted older attempt did not print the stock stale-info rejection"
+        );
+
+        *phase = "report_assertions";
+        let winner_capture = captures.take(winner_operation).ok_or_else(|| anyhow!("the winner has no raw reply"))?;
+        let loser_capture = captures.take(loser_operation).ok_or_else(|| anyhow!("the loser has no raw reply"))?;
+        ensure!(captures.is_empty(), "the service answered unexpected extra receive-pack operations");
+        ensure!(winner_capture.status == 200, "the service answered the winner with {}", winner_capture.status);
+        ensure!(loser_capture.status == 200, "the service answered the loser with {}", loser_capture.status);
+        ensure!(!winner_capture.truncated, "the winner's raw service reply is truncated");
+        ensure!(!loser_capture.truncated, "the loser's raw service reply is truncated");
+        let (winner_unpack, winner_verdicts) = report_status(&winner_capture.body)?;
+        ensure!(winner_unpack == "ok", "the winner's report-status did not unpack: {winner_unpack}");
+        ensure!(
+            winner_verdicts == vec![(SEED_REF.to_owned(), None)],
+            "the winner's report-status is not exactly one ok on main: {winner_verdicts:?}"
+        );
+        let (loser_unpack, loser_verdicts) = report_status(&loser_capture.body)?;
+        ensure!(loser_unpack == "ok", "the loser's report-status did not unpack: {loser_unpack}");
+        ensure!(
+            loser_verdicts == vec![(SEED_REF.to_owned(), Some("stale info".to_owned()))],
+            "the loser's report-status is not exactly one ng stale info on main: {loser_verdicts:?}"
+        );
+
+        // Scoped durable terminal: the current legacy shape still names the correct
+        // repository, the exact superseded operation refusal and the fixed per-ref
+        // `OldOidMismatch`. The older attempt's identity and binding are immutable.
+        *phase = "durable_refusal_assertions";
+        let loser_after = operation_witness(db, repository_id, loser_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the rejected operation has no durable row"))?;
+        ensure!(loser_after.state == "rejected", "the admitted older attempt is {}, not rejected", loser_after.state);
+        ensure!(
+            loser_after.identity == loser_before.identity,
+            "the admitted attempt's stored identity was mutated or relabelled"
+        );
+        ensure!(
+            loser_after.binding == loser_before.binding,
+            "the admitted attempt's serving binding was mutated or relabelled"
+        );
+        let terminal_value =
+            loser_after.terminal.clone().ok_or_else(|| anyhow!("the rejected admitted attempt has no terminal"))?;
+        let terminal: PackCommitTerminal = serde_json::from_value(terminal_value.clone())
+            .map_err(|_| anyhow!("the rejected terminal does not match the pack terminal schema"))?;
+        ensure!(terminal.kind == TerminalKind::Rejected, "the rejected terminal has another kind: {terminal:?}");
+        ensure!(
+            terminal.repository_id == repository_id,
+            "the rejected terminal names another repository: {terminal:?}"
+        );
+        ensure!(
+            terminal.revision == revision_after,
+            "the rejected terminal recorded revision {}, not the winner's {revision_after}: {terminal:?}",
+            terminal.revision
+        );
+        ensure!(
+            terminal.head_ref.as_deref() == Some(SEED_REF),
+            "the rejected terminal names another head: {terminal:?}"
+        );
+        ensure!(
+            terminal.registrations.is_empty(),
+            "the refused admitted attempt registered pack membership: {terminal:?}"
+        );
+        ensure!(terminal.refs.len() == 1, "the rejected terminal does not cover exactly one ref: {terminal:?}");
+        match &terminal.refs[0] {
+            RefCommitResult::NotApplied { name, reason } => {
+                ensure!(name.as_str() == SEED_REF, "the rejected terminal names another ref: {terminal:?}");
+                ensure!(
+                    *reason == CommitRejectCode::OldOidMismatch,
+                    "the rejected terminal reason is {reason:?}, not the fixed per-ref OldOidMismatch: {terminal:?}"
+                );
+            }
+            RefCommitResult::Applied { .. } => {
+                return Err(anyhow!("the rejected terminal contains an applied ref: {terminal:?}"));
+            }
+        }
+        let rejection = terminal
+            .rejection
+            .as_ref()
+            .ok_or_else(|| anyhow!("the rejected terminal has no operation-level rejection: {terminal:?}"))?;
+        let rejection_code = PackCommitRejectCode::parse(&rejection.code)
+            .map_err(|_| anyhow!("the rejected terminal carries an unknown rejection code: {terminal:?}"))?;
+        ensure!(
+            rejection_code == PackCommitRejectCode::RevisionMismatch,
+            "the admitted older attempt was closed as {rejection_code:?}, not RevisionMismatch: {terminal:?}"
+        );
+        ensure!(
+            rejection.detail == POST_ADMISSION_REFUSAL_DETAIL,
+            "the admitted older attempt detail is {:?}, not the exact superseded reason: {terminal:?}",
+            rejection.detail
+        );
+        ensure!(
+            (rejection.code.as_str(), rejection.detail.as_str())
+                == (PackCommitRejectCode::RevisionMismatch.as_str(), POST_ADMISSION_REFUSAL_DETAIL),
+            "the admitted older attempt is not the fixed admitted_base_superseded terminal: {terminal:?}"
+        );
+
+        // Exactly one correlated rejected event, and the authenticated operation
+        // read returns the same terminal without appending another event.
+        let events = operation_events(db, repository_id, loser_operation).await?;
+        ensure!(
+            events.len() == 1,
+            "the rejected admitted attempt has {} RefStore events, not exactly one",
+            events.len()
+        );
+        ensure!(events[0].0 == "rejected", "the single RefStore event is not `rejected`");
+        ensure!(events[0].1 == terminal_value, "the rejected RefStore event payload differs from the durable terminal");
+
+        *phase = "authenticated_operation_read";
+        let view = operation_view(address, &owner, &name, loser_operation).await?;
+        ensure!(view["state"].as_str() == Some("rejected"), "the authenticated operation read is not rejected");
+        ensure!(view["terminal"] == terminal_value, "the authenticated operation read returned a different terminal");
+        ensure!(
+            operation_events(db, repository_id, loser_operation).await?.len() == 1,
+            "the authenticated operation read appended another RefStore event"
+        );
+
+        // The winner remains the only writer and membership gain; the loser added
+        // no ref, no terminal beyond the refusal above and no membership.
+        ensure!(
+            gate_revision(db, repository_id).await? == revision_after,
+            "the refused admitted attempt advanced the gate"
+        );
+        ensure!(
+            durable_main(db, repository_id).await? == first_new,
+            "durable main is not the winner after the refusal"
+        );
+        ensure!(
+            ref_count(db, repository_id).await? == 1,
+            "the refused admitted attempt changed the acknowledged ref set"
+        );
+        ensure!(
+            membership_stats(db, repository_id, revision_after).await? == memberships_after_winner,
+            "the refused admitted attempt changed pack membership"
+        );
+        let winner_after = operation_witness(db, repository_id, winner_operation)
+            .await?
+            .ok_or_else(|| anyhow!("the winning operation row disappeared"))?;
+        ensure!(winner_after.state == "committed", "the winning operation is {}, not committed", winner_after.state);
+        let winner_terminal: PackCommitTerminal = serde_json::from_value(
+            winner_after.terminal.ok_or_else(|| anyhow!("the committed operation has no terminal"))?,
+        )
+        .map_err(|_| anyhow!("the committed terminal does not match the pack terminal schema"))?;
+        ensure!(winner_terminal.kind == TerminalKind::Committed, "the winning terminal is not committed");
+        ensure!(winner_terminal.repository_id == repository_id, "the winning terminal names another repository");
+        ensure!(winner_terminal.revision == revision_after, "the winning terminal recorded another revision");
+        ensure!(winner_terminal.refs.len() == 1, "the winning terminal does not cover exactly one ref");
+        match &winner_terminal.refs[0] {
+            RefCommitResult::Applied { name, old_oid, new_oid } => {
+                ensure!(name.as_str() == SEED_REF, "the winning terminal names another ref");
+                ensure!(
+                    old_oid.as_deref() == Some(seed.as_str()),
+                    "the winning terminal did not use the shared old OID"
+                );
+                ensure!(
+                    new_oid.as_deref() == Some(first_new.as_str()),
+                    "the winning terminal did not apply the winner"
+                );
+            }
+            RefCommitResult::NotApplied { .. } => {
+                return Err(anyhow!("the winning terminal contains a refused ref"));
+            }
+        }
+
+        Ok(())
+    }
+    .await;
+
+    // Release any still-paused request before waiting on either owner. The
+    // hook turns an abandoned rendezvous into the fixed pre-upload refusal, so
+    // an early failure cannot let the pending loser write. Join the client and
+    // the real server under the same bound before this case drops the Blob
+    // store, scratch/work trees or returns to the DB-schema owner.
+    let cleanup = async {
+        pause_guard.abandon();
+        let mut first_error = None;
+        if let Some(task) = loser_push.take() {
+            if let Err(error) = task.abort_and_join(PUSH_BOUND).await {
+                first_error = Some(error);
+            }
+        }
+        if let Err(error) = server.drain(PUSH_BOUND).await {
+            first_error.get_or_insert(error);
+        }
+        // Remove the client work tree only after the real Git tasks and server
+        // drain attempt, never while a child could still be using it.
+        drop(race_work.take());
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
+    .await;
 
-    *phase = "pre_release_assertions";
-    let loser_before = operation_witness(db, repository_id, loser_operation)
-        .await?
-        .ok_or_else(|| anyhow!("the admitted operation has no durable row"))?;
-    ensure!(loser_before.state == "pending", "the admitted older attempt is {}, not pending", loser_before.state);
-    ensure!(loser_before.terminal.is_none(), "the admitted older attempt already has a terminal");
-    let binding_before = loser_before
-        .binding
-        .clone()
-        .ok_or_else(|| anyhow!("the admitted operation has no serving-operation binding"))?;
-    ensure!(
-        binding_before.issuer_id == loser_before.identity.issuer_id,
-        "the serving binding issuer differs from its stored operation"
-    );
-    ensure!(
-        binding_before.parent_digest == loser_before.identity.request_digest,
-        "the serving binding parent digest differs from its stored operation identity"
-    );
-    ensure!(
-        operation_events(db, repository_id, loser_operation).await?.is_empty(),
-        "the admitted older attempt emitted an event before release"
-    );
-    ensure!(durable_main(db, repository_id).await? == seed, "durable main changed before the winner started");
-    ensure!(gate_revision(db, repository_id).await? == revision_before, "the gate moved before the winner started");
-    ensure!(ref_count(db, repository_id).await? == 1, "the acknowledged ref set is not exactly main");
-    let memberships_before = membership_stats(db, repository_id, revision_before).await?;
-    ensure!(memberships_before.above_revision == 0, "a membership was recorded beyond the current revision");
-
-    // The winner uses a different commit, the same old OID and the SAME ref.
-    *phase = "winner_publish";
-    let winner_output = wait_push(spawn_push(git, first_dir, direct_url, winner_operation), "winning").await?;
-    ensure!(winner_output.success, "the winning stock push failed: {}", redacted(&winner_output));
-
-    // The winner is the only writer so far, and the older admitted attempt is
-    // still pending with no terminal/event before release.
-    *phase = "post_winner_assertions";
-    let revision_after = gate_revision(db, repository_id).await?;
-    ensure!(
-        revision_after == revision_before + 1,
-        "the gate moved {revision_before}->{revision_after}, not exactly one winner revision"
-    );
-    ensure!(durable_main(db, repository_id).await? == first_new, "durable main is not the winning commit");
-    let loser_mid = operation_witness(db, repository_id, loser_operation)
-        .await?
-        .ok_or_else(|| anyhow!("the admitted operation row disappeared before release"))?;
-    ensure!(loser_mid.state == "pending", "the admitted older attempt settled before release");
-    ensure!(loser_mid.terminal.is_none(), "the admitted older attempt has a terminal before release");
-    ensure!(
-        loser_mid.identity == loser_before.identity,
-        "the admitted attempt's stored identity changed before release"
-    );
-    ensure!(loser_mid.binding == loser_before.binding, "the admitted attempt's serving binding changed before release");
-    ensure!(
-        operation_events(db, repository_id, loser_operation).await?.is_empty(),
-        "the admitted older attempt emitted an event before release"
-    );
-    let memberships_after_winner = membership_stats(db, repository_id, revision_after).await?;
-    ensure!(
-        memberships_after_winner.total == memberships_before.total + 1,
-        "the winner did not add exactly one pack membership"
-    );
-    ensure!(
-        memberships_after_winner.at_revision == 1,
-        "the winner added {} pack memberships at its revision, not one",
-        memberships_after_winner.at_revision
-    );
-    ensure!(memberships_after_winner.above_revision == 0, "a pack membership was recorded beyond the winner revision");
-
-    // Release the older admitted plan. Its A3 gate proof now sees the winner's
-    // revision; it must be closed with the fixed superseded refusal.
-    *phase = "superseded_refusal_await";
-    pause.release();
-    let loser_output = wait_push(loser_push, "losing").await?;
-    ensure!(!loser_output.success, "the admitted older attempt unexpectedly succeeded");
-    let loser_text = output_text(&loser_output);
-    for forbidden in ["409", "503", "non-fast-forward", "fetch first", "unexpected disconnect", "remote end hung up"] {
-        let found = match forbidden {
-            "409" | "503" => has_stock_http_error(&loser_text, forbidden),
-            _ => loser_text.contains(forbidden),
-        };
-        ensure!(!found, "the admitted older attempt saw `{forbidden}`, not a report-status");
+    if let Err(error) = cleanup {
+        *phase = "cleanup_drain";
+        return Err(error);
     }
-    ensure!(
-        loser_text.contains("[rejected]") && loser_text.contains("stale info"),
-        "the admitted older attempt did not print the stock stale-info rejection"
-    );
-
-    *phase = "report_assertions";
-    let winner_capture = captures.take(winner_operation).ok_or_else(|| anyhow!("the winner has no raw reply"))?;
-    let loser_capture = captures.take(loser_operation).ok_or_else(|| anyhow!("the loser has no raw reply"))?;
-    ensure!(captures.is_empty(), "the service answered unexpected extra receive-pack operations");
-    ensure!(winner_capture.status == 200, "the service answered the winner with {}", winner_capture.status);
-    ensure!(loser_capture.status == 200, "the service answered the loser with {}", loser_capture.status);
-    ensure!(!winner_capture.truncated, "the winner's raw service reply is truncated");
-    ensure!(!loser_capture.truncated, "the loser's raw service reply is truncated");
-    let (winner_unpack, winner_verdicts) = report_status(&winner_capture.body)?;
-    ensure!(winner_unpack == "ok", "the winner's report-status did not unpack: {winner_unpack}");
-    ensure!(
-        winner_verdicts == vec![(SEED_REF.to_owned(), None)],
-        "the winner's report-status is not exactly one ok on main: {winner_verdicts:?}"
-    );
-    let (loser_unpack, loser_verdicts) = report_status(&loser_capture.body)?;
-    ensure!(loser_unpack == "ok", "the loser's report-status did not unpack: {loser_unpack}");
-    ensure!(
-        loser_verdicts == vec![(SEED_REF.to_owned(), Some("stale info".to_owned()))],
-        "the loser's report-status is not exactly one ng stale info on main: {loser_verdicts:?}"
-    );
-
-    // Scoped durable terminal: the current legacy shape still names the correct
-    // repository, the exact superseded operation refusal and the fixed per-ref
-    // `OldOidMismatch`. The older attempt's identity and binding are immutable.
-    *phase = "durable_refusal_assertions";
-    let loser_after = operation_witness(db, repository_id, loser_operation)
-        .await?
-        .ok_or_else(|| anyhow!("the rejected operation has no durable row"))?;
-    ensure!(loser_after.state == "rejected", "the admitted older attempt is {}, not rejected", loser_after.state);
-    ensure!(
-        loser_after.identity == loser_before.identity,
-        "the admitted attempt's stored identity was mutated or relabelled"
-    );
-    ensure!(
-        loser_after.binding == loser_before.binding,
-        "the admitted attempt's serving binding was mutated or relabelled"
-    );
-    let terminal_value =
-        loser_after.terminal.clone().ok_or_else(|| anyhow!("the rejected admitted attempt has no terminal"))?;
-    let terminal: PackCommitTerminal = serde_json::from_value(terminal_value.clone())
-        .map_err(|_| anyhow!("the rejected terminal does not match the pack terminal schema"))?;
-    ensure!(terminal.kind == TerminalKind::Rejected, "the rejected terminal has another kind: {terminal:?}");
-    ensure!(terminal.repository_id == repository_id, "the rejected terminal names another repository: {terminal:?}");
-    ensure!(
-        terminal.revision == revision_after,
-        "the rejected terminal recorded revision {}, not the winner's {revision_after}: {terminal:?}",
-        terminal.revision
-    );
-    ensure!(terminal.head_ref.as_deref() == Some(SEED_REF), "the rejected terminal names another head: {terminal:?}");
-    ensure!(terminal.registrations.is_empty(), "the refused admitted attempt registered pack membership: {terminal:?}");
-    ensure!(terminal.refs.len() == 1, "the rejected terminal does not cover exactly one ref: {terminal:?}");
-    match &terminal.refs[0] {
-        RefCommitResult::NotApplied { name, reason } => {
-            ensure!(name.as_str() == SEED_REF, "the rejected terminal names another ref: {terminal:?}");
-            ensure!(
-                *reason == CommitRejectCode::OldOidMismatch,
-                "the rejected terminal reason is {reason:?}, not the fixed per-ref OldOidMismatch: {terminal:?}"
-            );
-        }
-        RefCommitResult::Applied { .. } => {
-            return Err(anyhow!("the rejected terminal contains an applied ref: {terminal:?}"));
-        }
-    }
-    let rejection = terminal
-        .rejection
-        .as_ref()
-        .ok_or_else(|| anyhow!("the rejected terminal has no operation-level rejection: {terminal:?}"))?;
-    let rejection_code = PackCommitRejectCode::parse(&rejection.code)
-        .map_err(|_| anyhow!("the rejected terminal carries an unknown rejection code: {terminal:?}"))?;
-    ensure!(
-        rejection_code == PackCommitRejectCode::RevisionMismatch,
-        "the admitted older attempt was closed as {rejection_code:?}, not RevisionMismatch: {terminal:?}"
-    );
-    ensure!(
-        rejection.detail == POST_ADMISSION_REFUSAL_DETAIL,
-        "the admitted older attempt detail is {:?}, not the exact superseded reason: {terminal:?}",
-        rejection.detail
-    );
-    ensure!(
-        (rejection.code.as_str(), rejection.detail.as_str())
-            == (PackCommitRejectCode::RevisionMismatch.as_str(), POST_ADMISSION_REFUSAL_DETAIL),
-        "the admitted older attempt is not the fixed admitted_base_superseded terminal: {terminal:?}"
-    );
-
-    // Exactly one correlated rejected event, and the authenticated operation
-    // read returns the same terminal without appending another event.
-    let events = operation_events(db, repository_id, loser_operation).await?;
-    ensure!(events.len() == 1, "the rejected admitted attempt has {} RefStore events, not exactly one", events.len());
-    ensure!(events[0].0 == "rejected", "the single RefStore event is not `rejected`");
-    ensure!(events[0].1 == terminal_value, "the rejected RefStore event payload differs from the durable terminal");
-
-    *phase = "authenticated_operation_read";
-    let view = operation_view(address, &owner, &name, loser_operation).await?;
-    ensure!(view["state"].as_str() == Some("rejected"), "the authenticated operation read is not rejected");
-    ensure!(view["terminal"] == terminal_value, "the authenticated operation read returned a different terminal");
-    ensure!(
-        operation_events(db, repository_id, loser_operation).await?.len() == 1,
-        "the authenticated operation read appended another RefStore event"
-    );
-
-    // The winner remains the only writer and membership gain; the loser added
-    // no ref, no terminal beyond the refusal above and no membership.
-    ensure!(
-        gate_revision(db, repository_id).await? == revision_after,
-        "the refused admitted attempt advanced the gate"
-    );
-    ensure!(durable_main(db, repository_id).await? == first_new, "durable main is not the winner after the refusal");
-    ensure!(ref_count(db, repository_id).await? == 1, "the refused admitted attempt changed the acknowledged ref set");
-    ensure!(
-        membership_stats(db, repository_id, revision_after).await? == memberships_after_winner,
-        "the refused admitted attempt changed pack membership"
-    );
-    let winner_after = operation_witness(db, repository_id, winner_operation)
-        .await?
-        .ok_or_else(|| anyhow!("the winning operation row disappeared"))?;
-    ensure!(winner_after.state == "committed", "the winning operation is {}, not committed", winner_after.state);
-    let winner_terminal: PackCommitTerminal = serde_json::from_value(
-        winner_after.terminal.ok_or_else(|| anyhow!("the committed operation has no terminal"))?,
-    )
-    .map_err(|_| anyhow!("the committed terminal does not match the pack terminal schema"))?;
-    ensure!(winner_terminal.kind == TerminalKind::Committed, "the winning terminal is not committed");
-    ensure!(winner_terminal.repository_id == repository_id, "the winning terminal names another repository");
-    ensure!(winner_terminal.revision == revision_after, "the winning terminal recorded another revision");
-    ensure!(winner_terminal.refs.len() == 1, "the winning terminal does not cover exactly one ref");
-    match &winner_terminal.refs[0] {
-        RefCommitResult::Applied { name, old_oid, new_oid } => {
-            ensure!(name.as_str() == SEED_REF, "the winning terminal names another ref");
-            ensure!(old_oid.as_deref() == Some(seed.as_str()), "the winning terminal did not use the shared old OID");
-            ensure!(new_oid.as_deref() == Some(first_new.as_str()), "the winning terminal did not apply the winner");
-        }
-        RefCommitResult::NotApplied { .. } => {
-            return Err(anyhow!("the winning terminal contains a refused ref"));
-        }
-    }
-
-    Ok(())
+    outcome
 }
 
 fn open_store() -> Result<BlobStore> {
@@ -1026,21 +1212,44 @@ async fn ref_count(db: &Db, repository_id: Uuid) -> Result<i64> {
 /// Authenticated historical operation read via the existing production route.
 /// The caller compares the returned terminal with the scoped durable row.
 async fn operation_view(address: SocketAddr, owner: &Actor, name: &str, operation: Uuid) -> Result<Value> {
-    let client = reqwest::Client::builder().no_proxy().build()?;
-    let response = client
-        .get(format!("http://{address}/api/repos/{}/{name}/operations/{operation}", owner.username))
-        .bearer_auth(&owner.token)
-        .send()
-        .await?;
-    let status = response.status();
-    let body: Value = response.json().await?;
-    ensure!(status.is_success(), "authenticated operation read returned {status}");
-    let expected = operation.to_string();
-    ensure!(
-        body["operation_id"].as_str() == Some(expected.as_str()),
-        "authenticated operation read returned another identity"
-    );
-    Ok(body)
+    let result = tokio::time::timeout(OPERATION_VIEW_BOUND, async {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| anyhow!("operation view client unavailable"))?;
+        let mut response = client
+            .get(format!("http://{address}/api/repos/{}/{name}/operations/{operation}", owner.username))
+            .bearer_auth(&owner.token)
+            .send()
+            .await
+            .map_err(|_| anyhow!("operation view transport failed"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!("operation view returned a non-success status"));
+        }
+        if matches!(response.content_length(), Some(length) if length > MAX_OPERATION_VIEW_BYTES as u64) {
+            return Err(anyhow!("operation view body exceeded its fixed cap"));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| anyhow!("operation view body read failed"))? {
+            let next =
+                body.len().checked_add(chunk.len()).ok_or_else(|| anyhow!("operation view body length overflow"))?;
+            if next > MAX_OPERATION_VIEW_BYTES {
+                return Err(anyhow!("operation view body exceeded its fixed cap"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body: Value =
+            serde_json::from_slice(&body).map_err(|_| anyhow!("operation view body was not valid JSON"))?;
+        let expected = operation.to_string();
+        ensure!(body["operation_id"].as_str() == Some(expected.as_str()), "operation view identity mismatch");
+        Ok(body)
+    })
+    .await;
+    match result {
+        Ok(value) => value,
+        Err(_) => Err(anyhow!("operation view exceeded its fixed deadline")),
+    }
 }
 
 async fn gate_revision(db: &Db, repository_id: Uuid) -> Result<i64> {
