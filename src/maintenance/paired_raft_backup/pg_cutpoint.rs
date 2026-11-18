@@ -202,3 +202,34 @@ pub async fn capture_pg_cutpoint_in_tx(
     verify_all_group_cursors(&proof, &expected.active, &expected.peers)?;
     Ok(proof)
 }
+
+pub(super) async fn sync_restored_pg_projection_cursors(
+    client: &mut tokio_postgres::Client,
+    active_gid: i64,
+    active_snap: &crate::ref_store::core::state_machine::RefCasSnapshot,
+    peer_snaps: &BTreeMap<i64, crate::ref_store::core::state_machine::RefCasSnapshot>,
+) -> Result<(), PairedBackupError> {
+    let tx = client.transaction().await.map_err(pg_err)?;
+    tx.execute("DELETE FROM public.ref_cas_projection_cursors", &[]).await.map_err(pg_err)?;
+    for (gid, gsnap) in std::iter::once((active_gid, active_snap)).chain(peer_snaps.iter().map(|(&k, v)| (k, v))) {
+        let cut = ExpectedGroupCursorCut::from_verified_snapshot(gid, gsnap)?;
+        tx.execute(
+            "INSERT INTO public.ref_cas_projection_cursors(\
+               group_id, history_incarnation, group_epoch, applied_event_seq, \
+               applied_log_index, applied_log_term, last_event_id, stream_state) \
+             VALUES($1, $2, $3, $4, $5, $6, NULL, 'active')",
+            &[
+                &gid,
+                &cut.history_incarnation,
+                &cut.group_epoch,
+                &(cut.applied_event_seq as i64),
+                &(cut.applied_index as i64),
+                &(cut.applied_term as i64),
+            ],
+        )
+        .await
+        .map_err(pg_err)?;
+    }
+    tx.commit().await.map_err(pg_err)?;
+    Ok(())
+}

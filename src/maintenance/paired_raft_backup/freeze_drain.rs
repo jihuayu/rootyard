@@ -255,7 +255,11 @@ impl TriPartyBackupCoordinator {
     ) -> Result<(), PairedBackupError> {
         let gid = raft.group_id();
         let mem = raft.group_membership_digest();
-        let scopes = BTreeSet::from([("repo_lifecycle", repository_id), ("authority", authority_id)]);
+        let scopes = BTreeSet::from([
+            ("repo_access", repository_id),
+            ("repo_lifecycle", repository_id),
+            ("authority", authority_id),
+        ]);
         for (kind, sid) in scopes {
             let tick = raft.durable_state_machine().logical_clock_floor().saturating_add(1);
             let cmd = RefCasCommand::CloseAuthScope(CloseAuthScopeCommand {

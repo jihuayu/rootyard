@@ -186,7 +186,7 @@ fn tri_party_freeze_enforces_unknown_drain_and_complete_pin_closure() {
     let mut fresh_coord = TriPartyBackupCoordinator::new(10, 4);
     let barrier = fresh_coord.freeze_drain_and_register(&mut raft, &full_specs, 12, true).expect("durable freeze");
     barrier.verify().expect("barrier valid");
-    assert_eq!(barrier.close_receipts.len(), 2);
+    assert_eq!(barrier.close_receipts.len(), 3);
     assert_eq!(barrier.backup_holds[0].hold_ids.len(), 4);
     for cr in &barrier.close_receipts {
         assert_eq!(cr.lifecycle, ScopeLifecycle::Closed);

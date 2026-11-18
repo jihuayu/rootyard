@@ -2,6 +2,12 @@
 
 #[path = "paired_raft_backup_support/fixture.rs"]
 mod fixture;
+#[path = "paired_raft_backup_support/format30_e2e.rs"]
+mod format30_e2e;
+#[path = "paired_raft_backup_support/format30_helpers.rs"]
+mod format30_helpers;
+#[path = "paired_raft_backup_support/mtls_cluster.rs"]
+mod mtls_cluster;
 
 use std::fs;
 
@@ -412,4 +418,10 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
             .await;
     }
     res
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires live PostgreSQL 17 + built refcas-log raft-node + pg_dump/pg_restore 17"]
+async fn production_mtls_quorum_durable_freeze_format30_and_new_incarnation_boot() -> Result<()> {
+    format30_e2e::run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot().await
 }

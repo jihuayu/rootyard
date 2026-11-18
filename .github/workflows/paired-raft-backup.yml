@@ -6,7 +6,11 @@ on:
       - '.github/workflows/paired-raft-backup.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'crates/refcas-log/**'
       - 'migrations/**'
+      - 'schema/**'
+      - 'src/backup.rs'
+      - 'src/backup/**'
       - 'src/maintenance.rs'
       - 'src/maintenance/paired_raft_backup.rs'
       - 'src/maintenance/paired_raft_backup/**'
@@ -29,7 +33,7 @@ jobs:
   paired-raft-backup:
     name: Paired PG + Raft + Blob Backup & Restore (#153)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17
@@ -38,15 +42,15 @@ jobs:
           POSTGRES_PASSWORD: password
           POSTGRES_DB: rootyard_test
         ports:
-          - 5432:5432
+          - 127.0.0.1:5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres -d rootyard_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
     env:
-      DATABASE_URL: postgres://postgres:password@localhost:5432/rootyard_test
-      ROOTYARD_TEST_DATABASE_URL: postgres://postgres:password@localhost:5432/rootyard_test
+      DATABASE_URL: postgres://postgres:password@127.0.0.1:5432/rootyard_test
+      ROOTYARD_TEST_DATABASE_URL: postgres://postgres:password@127.0.0.1:5432/rootyard_test
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -54,6 +58,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install PostgreSQL 17 client, OpenSSL, and native prerequisites
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg postgresql-common openssl libssl-dev \
+            pkg-config build-essential libfuse3-dev fuse3 cmake clang
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_dump --version | grep -E '17\.'
+          /usr/lib/postgresql/17/bin/pg_restore --version | grep -E '17\.'
+          openssl version
       - name: Install pinned Rust 1.99.1 gate tools
         run: |
           rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
@@ -85,15 +102,21 @@ jobs:
         with:
           cache-directories: |
             target
+            crates/refcas-log/target
             ~/.cargo/registry
             ~/.cargo/git
       - name: Format, design-doc and offline contract checks
         run: |
           git --version
+          pg_dump --version
           cargo fmt --all -- --check
           python3 scripts/check_design_docs.py
           python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_paired_raft_backup_contracts.py tests.test_workspace_remote_namespace.WorkspaceRemoteNamespaceContractTests
-      - name: Run Clippy, library unit tests, OpenDAL S3 + Git tests, and live PG 17 restore tests
+      - name: Build multi-process refcas-log raft-node binary
+        run: |
+          cargo build --locked --manifest-path crates/refcas-log/Cargo.toml --bin raft-node
+          echo "ROOTYARD_REFCAS_NODE_BIN=$GITHUB_WORKSPACE/crates/refcas-log/target/debug/raft-node" >> "$GITHUB_ENV"
+      - name: Run Clippy, library unit tests, OpenDAL S3 + Git tests, and live PG 17 + 3-voter mTLS Raft format 30 restore tests
         run: |
           cargo clippy --locked --no-default-features --lib --test paired_raft_backup_restore -- -D warnings
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib maintenance::paired_raft_backup

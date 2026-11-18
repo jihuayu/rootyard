@@ -135,6 +135,30 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         ):
             self.assertIn(token, pg_src)
 
+        mtls_and_fmt30_src = (
+            (MOD_DIR / "mtls_raft.rs").read_text(encoding="utf-8")
+            + (MOD_DIR / "mtls_wire.rs").read_text(encoding="utf-8")
+            + (MOD_DIR / "durable_freeze_gate.rs").read_text(encoding="utf-8")
+            + (MOD_DIR / "durable_guarded_ops.rs").read_text(encoding="utf-8")
+            + (MOD_DIR / "format30_paired.rs").read_text(encoding="utf-8")
+            + (MOD_DIR / "format30_boot.rs").read_text(encoding="utf-8")
+        )
+        for token in (
+            "MtlsLiveRaftBackend",
+            "raft-node-",
+            "peer_certificates",
+            "PG_FREEZE_SETTING",
+            "repo_access",
+            "upsert_repo_access_collaborator_guarded",
+            "create_format30_paired_raft_backup",
+            "restore_and_boot_format30_new_incarnation",
+            "STANDARD_PAIRED_PG_FORMAT",
+            "STANDARD_SCHEMA_HEAD",
+            "crate::backup::create",
+            "crate::backup::restore",
+        ):
+            self.assertIn(token, mtls_and_fmt30_src)
+
         it_src = (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8") + (
             ROOT / "tests" / "paired_raft_backup_support" / "fixture.rs"
         ).read_text(encoding="utf-8")
@@ -143,6 +167,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         self.assertIn('"close"', it_src)
         self.assertIn("missing_whole_pack_pair_and_single_side_closure_regressions", it_src)
         self.assertIn("durable_wal_barrier_and_sealing_receipt_freeze_thaw_regressions", it_src)
+        self.assertIn("production_mtls_quorum_durable_freeze_format30_and_new_incarnation_boot", it_src)
 
     def test_workflow_contract_and_doc_links(self) -> None:
         raw_wf = WORKFLOW.read_bytes()

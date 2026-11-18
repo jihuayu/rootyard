@@ -46,7 +46,42 @@ pub struct LoopbackS3 {
     pub state: Arc<S3State>,
 }
 
+pub struct S3EnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(String, Option<std::ffi::OsString>)>,
+}
+
+impl Drop for S3EnvGuard {
+    fn drop(&mut self) {
+        for (k, old) in self.saved.drain(..) {
+            unsafe {
+                if let Some(v) = old {
+                    std::env::set_var(&k, v);
+                } else {
+                    std::env::remove_var(&k);
+                }
+            }
+        }
+    }
+}
+
 impl LoopbackS3 {
+    pub fn apply_env(&self, bucket: &str) -> S3EnvGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let spec = format!(
+            "DRIVER=opendal SERVICE=s3 BUCKET={bucket} REGION=us-east-1 ROOT=paired-it ACCESS_KEY_ID=test-ak SECRET_ACCESS_KEY=test-sk ENCRYPTION_MODE=provider-managed RETRY_MAX_TIMES=3 MAX_OBJECT_BYTES=67108864 ENDPOINT={}",
+            self.endpoint
+        );
+        let mut saved = vec![("ROOTYARD_BLOB_KEYRING_DIR".into(), std::env::var_os("ROOTYARD_BLOB_KEYRING_DIR"))];
+        unsafe { std::env::remove_var("ROOTYARD_BLOB_KEYRING_DIR") };
+        for (k, v) in spec.split(' ').map(|kv| kv.split_once('=').unwrap()) {
+            let ek = format!("ROOTYARD_BLOB_{k}");
+            saved.push((ek.clone(), std::env::var_os(&ek)));
+            unsafe { std::env::set_var(&ek, v) };
+        }
+        S3EnvGuard { _lock: lock, saved }
+    }
+
     pub fn new() -> Self {
         let (state, lis) = (Arc::new(S3State::default()), std::net::TcpListener::bind("127.0.0.1:0").unwrap());
         lis.set_nonblocking(true).unwrap();
@@ -63,29 +98,8 @@ impl LoopbackS3 {
     }
 
     pub fn open_store(&self, bucket: &str) -> Result<BlobStore> {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let spec = format!(
-            "DRIVER=opendal SERVICE=s3 BUCKET={bucket} REGION=us-east-1 ROOT=paired-it ACCESS_KEY_ID=test-ak SECRET_ACCESS_KEY=test-sk ENCRYPTION_MODE=provider-managed RETRY_MAX_TIMES=3 MAX_OBJECT_BYTES=67108864 ENDPOINT={}",
-            self.endpoint
-        );
-        let mut saved = vec![("ROOTYARD_BLOB_KEYRING_DIR".into(), std::env::var_os("ROOTYARD_BLOB_KEYRING_DIR"))];
-        unsafe { std::env::remove_var("ROOTYARD_BLOB_KEYRING_DIR") };
-        for (k, v) in spec.split(' ').map(|kv| kv.split_once('=').unwrap()) {
-            let ek = format!("ROOTYARD_BLOB_{k}");
-            saved.push((ek.clone(), std::env::var_os(&ek)));
-            unsafe { std::env::set_var(&ek, v) };
-        }
-        let res = BlobStore::open(BlobProfile::from_env()?);
-        for (k, old) in saved {
-            unsafe {
-                if let Some(v) = old {
-                    std::env::set_var(&k, v);
-                } else {
-                    std::env::remove_var(&k);
-                }
-            }
-        }
-        Ok(res?)
+        let _env = self.apply_env(bucket);
+        Ok(BlobStore::open(BlobProfile::from_env()?)?)
     }
 }
 
