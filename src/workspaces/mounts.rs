@@ -24,7 +24,7 @@ use crate::{
     AppState, Error,
     members::models::Role,
     workspace_lab::{
-        fuse_helper::{HelperClient, HelperError, HelperErrorKind},
+        fuse_helper::{HelperClient, HelperError, HelperShutdownOutcome},
         fuse_mount::{LazySource, LegacySpawnFailure, MountHandle, MutationGate, Overlay},
     },
 };
@@ -555,38 +555,42 @@ async fn wait_legacy_until(
 
 /// Aggregate one normal-shutdown helper failure into a closed outcome. The
 /// precedence is fixed: an observed child exit wins over a missing handle, a
-/// reap error, a protocol failure, a timeout and the generic class. This keeps
-/// one bounded clause even when several retained generations failed.
-fn helper_teardown_outcome(failures: &[(HelperErrorKind, String)]) -> HelperErrorKind {
-    fn rank(kind: HelperErrorKind) -> u8 {
-        match kind {
-            HelperErrorKind::ChildExited => 0,
-            HelperErrorKind::ChildMissing => 1,
-            HelperErrorKind::ChildReap => 2,
-            HelperErrorKind::Protocol => 3,
-            HelperErrorKind::Timeout => 4,
-            HelperErrorKind::Other => 5,
+/// reap deadline, a wait error, a timeout and the generic class. This keeps one
+/// bounded clause even when several retained generations failed.
+fn helper_teardown_outcome(failures: &[(HelperShutdownOutcome, String)]) -> HelperShutdownOutcome {
+    fn rank(outcome: HelperShutdownOutcome) -> u8 {
+        match outcome {
+            HelperShutdownOutcome::ChildExited => 0,
+            HelperShutdownOutcome::ChildMissing => 1,
+            HelperShutdownOutcome::ChildReapDeadline => 2,
+            HelperShutdownOutcome::ChildReapError => 3,
+            HelperShutdownOutcome::Timeout => 4,
+            HelperShutdownOutcome::Other => 5,
         }
     }
-    failures.iter().map(|(kind, _)| *kind).min_by_key(|kind| rank(*kind)).unwrap_or(HelperErrorKind::Other)
+    failures
+        .iter()
+        .map(|(outcome, _)| *outcome)
+        .min_by_key(|outcome| rank(*outcome))
+        .unwrap_or(HelperShutdownOutcome::Other)
 }
 
 /// Fixed private normal-shutdown clauses. `None` keeps the existing generic
 /// `Error::internal` redaction for every failure that is not helper-owned.
-fn helper_teardown_clause(kind: HelperErrorKind) -> Option<&'static str> {
-    match kind {
-        HelperErrorKind::ChildExited => Some("workspace FUSE helper child exited unsuccessfully"),
-        HelperErrorKind::ChildMissing => Some("workspace FUSE helper child exit was not observed"),
-        HelperErrorKind::ChildReap => Some("workspace FUSE helper child reaping failed"),
-        HelperErrorKind::Protocol => Some("workspace FUSE helper control protocol failed"),
-        HelperErrorKind::Timeout => Some("workspace FUSE helper teardown timed out"),
-        HelperErrorKind::Other => None,
+fn helper_teardown_clause(outcome: HelperShutdownOutcome) -> Option<&'static str> {
+    match outcome {
+        HelperShutdownOutcome::ChildExited => Some("workspace FUSE helper child exited unsuccessfully"),
+        HelperShutdownOutcome::ChildMissing => Some("workspace FUSE helper child exit was not observed"),
+        HelperShutdownOutcome::ChildReapDeadline => Some("workspace FUSE helper child reap deadline expired"),
+        HelperShutdownOutcome::ChildReapError => Some("workspace FUSE helper child wait failed"),
+        HelperShutdownOutcome::Timeout => Some("workspace FUSE helper teardown timed out"),
+        HelperShutdownOutcome::Other => None,
     }
 }
 
-fn helper_teardown_error(failures: Vec<(HelperErrorKind, String)>) -> Error {
-    let kind = helper_teardown_outcome(&failures);
-    match helper_teardown_clause(kind) {
+fn helper_teardown_error(failures: Vec<(HelperShutdownOutcome, String)>) -> Error {
+    let outcome = helper_teardown_outcome(&failures);
+    match helper_teardown_clause(outcome) {
         // The fixed clause is isolated to this private normal-shutdown result.
         // The status stays 503, the existing internal-error observation is
         // preserved and the HTTP/API generic redaction is unchanged.
@@ -655,8 +659,9 @@ pub async fn shutdown_helper_until_with_evidence(
         let cleanup: HelperShutdown = Box::new(move || {
             let mut failures = Vec::new();
             for client in &clients {
-                if let Err(error) = client.shutdown_until(effective) {
-                    failures.push((error.kind, format!("helper generation {}: {error}", client.generation())));
+                if let Err(error) = client.shutdown_until_observed(effective) {
+                    failures
+                        .push((error.outcome, format!("helper generation {}: {}", client.generation(), error.error)));
                 }
             }
             // Keep the registry entries alive until every retained generation
@@ -708,8 +713,9 @@ async fn shutdown_helper_without_deadline() -> Result<(), Error> {
         super::blocking::run_control(move || {
             let mut failures = Vec::new();
             for client in &clients {
-                if let Err(error) = client.shutdown(HELPER_SHUTDOWN_GRACE) {
-                    failures.push((error.kind, format!("helper generation {}: {error}", client.generation())));
+                if let Err(error) = client.shutdown_until_observed(Instant::now() + HELPER_SHUTDOWN_GRACE) {
+                    failures
+                        .push((error.outcome, format!("helper generation {}: {}", client.generation(), error.error)));
                 }
             }
             drop(helpers);
@@ -853,36 +859,36 @@ mod tests {
     #[test]
     fn helper_teardown_outcome_is_closed_and_exactly_precedenced() {
         let all = vec![
-            (HelperErrorKind::Other, "generic".to_owned()),
-            (HelperErrorKind::Timeout, "timeout".to_owned()),
-            (HelperErrorKind::Protocol, "protocol".to_owned()),
-            (HelperErrorKind::ChildReap, "reap".to_owned()),
-            (HelperErrorKind::ChildMissing, "missing".to_owned()),
-            (HelperErrorKind::ChildExited, "exit".to_owned()),
+            (HelperShutdownOutcome::Other, "generic".to_owned()),
+            (HelperShutdownOutcome::Timeout, "timeout".to_owned()),
+            (HelperShutdownOutcome::ChildReapError, "wait error".to_owned()),
+            (HelperShutdownOutcome::ChildReapDeadline, "reap deadline".to_owned()),
+            (HelperShutdownOutcome::ChildMissing, "missing".to_owned()),
+            (HelperShutdownOutcome::ChildExited, "exit".to_owned()),
         ];
-        assert_eq!(helper_teardown_outcome(&all), HelperErrorKind::ChildExited);
-        assert_eq!(helper_teardown_outcome(&all[..5]), HelperErrorKind::ChildMissing);
-        assert_eq!(helper_teardown_outcome(&all[..4]), HelperErrorKind::ChildReap);
-        assert_eq!(helper_teardown_outcome(&all[..3]), HelperErrorKind::Protocol);
-        assert_eq!(helper_teardown_outcome(&all[..2]), HelperErrorKind::Timeout);
-        assert_eq!(helper_teardown_outcome(&all[..1]), HelperErrorKind::Other);
-        assert_eq!(helper_teardown_outcome(&[]), HelperErrorKind::Other);
+        assert_eq!(helper_teardown_outcome(&all), HelperShutdownOutcome::ChildExited);
+        assert_eq!(helper_teardown_outcome(&all[..5]), HelperShutdownOutcome::ChildMissing);
+        assert_eq!(helper_teardown_outcome(&all[..4]), HelperShutdownOutcome::ChildReapDeadline);
+        assert_eq!(helper_teardown_outcome(&all[..3]), HelperShutdownOutcome::ChildReapError);
+        assert_eq!(helper_teardown_outcome(&all[..2]), HelperShutdownOutcome::Timeout);
+        assert_eq!(helper_teardown_outcome(&all[..1]), HelperShutdownOutcome::Other);
+        assert_eq!(helper_teardown_outcome(&[]), HelperShutdownOutcome::Other);
     }
 
     #[test]
     fn helper_teardown_clauses_are_fixed_and_bounded() {
-        for (kind, expected) in [
-            (HelperErrorKind::ChildExited, "workspace FUSE helper child exited unsuccessfully"),
-            (HelperErrorKind::ChildMissing, "workspace FUSE helper child exit was not observed"),
-            (HelperErrorKind::ChildReap, "workspace FUSE helper child reaping failed"),
-            (HelperErrorKind::Protocol, "workspace FUSE helper control protocol failed"),
-            (HelperErrorKind::Timeout, "workspace FUSE helper teardown timed out"),
+        for (outcome, expected) in [
+            (HelperShutdownOutcome::ChildExited, "workspace FUSE helper child exited unsuccessfully"),
+            (HelperShutdownOutcome::ChildMissing, "workspace FUSE helper child exit was not observed"),
+            (HelperShutdownOutcome::ChildReapDeadline, "workspace FUSE helper child reap deadline expired"),
+            (HelperShutdownOutcome::ChildReapError, "workspace FUSE helper child wait failed"),
+            (HelperShutdownOutcome::Timeout, "workspace FUSE helper teardown timed out"),
         ] {
-            assert_eq!(helper_teardown_clause(kind), Some(expected));
-            let error = helper_teardown_error(vec![(kind, "raw detail must not escape".to_owned())]);
+            assert_eq!(helper_teardown_clause(outcome), Some(expected));
+            let error = helper_teardown_error(vec![(outcome, "raw detail must not escape".to_owned())]);
             assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(error.1, expected);
         }
-        assert_eq!(helper_teardown_clause(HelperErrorKind::Other), None);
+        assert_eq!(helper_teardown_clause(HelperShutdownOutcome::Other), None);
     }
 }

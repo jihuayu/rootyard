@@ -259,11 +259,11 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
                 "HTTP 503: workspace FUSE helper child exit was not observed"),
              "helper_child_absent"),
             (capture + helper + (
-                "HTTP 503: workspace FUSE helper child reaping failed"),
-             "helper_child_reap"),
+                "HTTP 503: workspace FUSE helper child reap deadline expired"),
+             "helper_child_reap_deadline"),
             (capture + helper + (
-                "HTTP 503: workspace FUSE helper control protocol failed"),
-             "helper_protocol"),
+                "HTTP 503: workspace FUSE helper child wait failed"),
+             "helper_child_reap_error"),
             (capture + helper + (
                 "HTTP 503: workspace FUSE helper teardown timed out"),
              "helper_timeout"),
@@ -311,6 +311,10 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             _terminal("HTTP 503: service temporarily unavailable"),
             _terminal(
                 "HTTP 503: workspace FUSE helper child exited unsuccessfully"),
+            _terminal(
+                "workspace capture/helper shutdown did not complete cleanly: "
+                "workspace FUSE helper shutdown failed: "
+                "HTTP 503: workspace FUSE helper child reaping failed"),
             known[:-1], known[:-1] + b"; not-a-source-clause\n",
             known.replace(b"native Git", b"not-native Git"),
             known + other, other + known, known + b"trailing non-Error output\n",

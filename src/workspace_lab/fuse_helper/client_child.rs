@@ -16,6 +16,14 @@ impl From<ExitStatus> for ExitView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReapFailure {
+    /// The published shutdown deadline expired after the child was killed.
+    Deadline,
+    /// `Child::try_wait` itself failed.
+    WaitError,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ExitObservation {
     Running,
@@ -23,14 +31,14 @@ pub(super) enum ExitObservation {
     Reaping,
     /// The handle vanished without an observed exit. This is never success.
     Missing,
-    Exited(Result<ExitView, String>),
+    Exited(Result<ExitView, ReapFailure>),
 }
 
 #[derive(Default)]
 pub(super) struct ChildSlot {
     child: Option<Child>,
     reaping: bool,
-    status: Option<Result<ExitView, String>>,
+    status: Option<Result<ExitView, ReapFailure>>,
 }
 
 impl ChildSlot {
@@ -50,7 +58,7 @@ impl ChildSlot {
     }
 
     /// Record a status obtained from the reaper's own `Child::try_wait`.
-    pub(super) fn record_exit(&mut self, observed: Result<ExitView, String>) {
+    pub(super) fn record_exit(&mut self, observed: Result<ExitView, ReapFailure>) {
         if self.status.is_none() {
             self.status = Some(observed);
         }
@@ -75,7 +83,7 @@ impl ChildSlot {
             match child.try_wait() {
                 Ok(Some(status)) => observed = Some(Ok(ExitView::from(status))),
                 Ok(None) => {}
-                Err(error) => observed = Some(Err(error.to_string())),
+                Err(_) => observed = Some(Err(ReapFailure::WaitError)),
             }
         }
         if let Some(result) = observed {
@@ -125,12 +133,25 @@ mod tests {
     fn only_an_observed_exit_is_reaped() {
         let mut waiting = ChildSlot::default();
         assert!(!waiting.reaped(), "a missing handle is not reap proof");
-        waiting.record_exit(Err("wait failed".into()));
+        waiting.record_exit(Err(ReapFailure::WaitError));
         assert!(!waiting.reaped(), "a wait error is not reap proof");
 
         let mut reaped = ChildSlot::default();
         reaped.record_exit(Ok(ExitView { success: false }));
         assert!(reaped.reaped(), "an observed nonzero exit was still reaped");
+    }
+
+    #[test]
+    fn reap_deadline_and_wait_error_remain_distinct() {
+        let mut deadline = ChildSlot::default();
+        deadline.record_exit(Err(ReapFailure::Deadline));
+        assert_eq!(deadline.observe(), ExitObservation::Exited(Err(ReapFailure::Deadline)));
+        assert!(!deadline.reaped(), "a reap deadline is not an exit");
+
+        let mut wait_error = ChildSlot::default();
+        wait_error.record_exit(Err(ReapFailure::WaitError));
+        assert_eq!(wait_error.observe(), ExitObservation::Exited(Err(ReapFailure::WaitError)));
+        assert!(!wait_error.reaped(), "a wait error is not an exit");
     }
 
     #[test]

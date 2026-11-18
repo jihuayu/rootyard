@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 #[path = "client_child.rs"]
 mod child_lifecycle;
-use child_lifecycle::{ChildSlot, ExitObservation, ExitView};
+use child_lifecycle::{ChildSlot, ExitObservation, ExitView, ReapFailure};
 
 /// Bound on queued cancel frames. One worker sends them, so a caller that
 /// abandons a begin/mount can never spawn an unbounded number of threads.
@@ -57,68 +57,33 @@ const CONTROL_SEND_FLAGS: i32 = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const CONTROL_SEND_FLAGS: i32 = libc::MSG_DONTWAIT;
 
-/// Closed parent-side helper failure classes. A normal-shutdown diagnostic may
-/// map one of these to a fixed clause; the class never carries raw status text,
-/// a path, a PID, a child-provided message or a protocol payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HelperErrorKind {
-    /// No more specific class is available.
-    Other,
-    /// `Child::try_wait` observed a real, unsuccessful child exit.
-    ChildExited,
-    /// The child handle disappeared without an observed exit.
-    ChildMissing,
-    /// The exit wait or reap itself failed; no child exit was observed.
-    ChildReap,
-    /// The control protocol was malformed or violated.
-    Protocol,
-    /// A bounded helper operation or exit wait expired.
-    Timeout,
-}
-
 /// Failure while talking to the helper. The code is an errno value when one is
 /// meaningful, so callers can distinguish `EBUSY`/`ESTALE`/timeouts.
 #[derive(Debug, Clone)]
 pub struct HelperError {
     pub code: i32,
     pub message: String,
-    /// Closed class for bounded teardown diagnostics; it never contains the
-    /// raw child status, a path or an identifier.
-    pub kind: HelperErrorKind,
 }
 
 impl HelperError {
     pub fn new(code: i32, message: impl Into<String>) -> Self {
-        let kind = match code {
-            libc::ETIMEDOUT => HelperErrorKind::Timeout,
-            libc::EPROTO => HelperErrorKind::Protocol,
-            _ => HelperErrorKind::Other,
-        };
-        Self::classified(code, message, kind)
-    }
-
-    fn classified(code: i32, message: impl Into<String>, kind: HelperErrorKind) -> Self {
-        Self { code, message: message.into(), kind }
+        Self { code, message: message.into() }
     }
 
     fn child_exited() -> Self {
-        Self::classified(libc::ECHILD, "workspace FUSE helper exited unsuccessfully", HelperErrorKind::ChildExited)
+        Self::new(libc::ECHILD, "workspace FUSE helper exited unsuccessfully")
     }
 
     fn child_missing() -> Self {
-        Self::classified(
-            libc::ECHILD,
-            "workspace FUSE helper child handle disappeared before an exit was observed",
-            HelperErrorKind::ChildMissing,
-        )
+        Self::new(libc::ECHILD, "workspace FUSE helper child handle disappeared before an exit was observed")
     }
 
-    fn child_reap() -> Self {
-        Self::classified(
-            libc::ECHILD,
-            "workspace FUSE helper child reaping failed before an exit was observed",
-            HelperErrorKind::ChildReap,
-        )
+    fn child_reap_deadline() -> Self {
+        Self::new(libc::ECHILD, "workspace FUSE helper child reap deadline expired")
+    }
+
+    fn child_reap_error() -> Self {
+        Self::new(libc::ECHILD, "workspace FUSE helper child wait failed")
     }
 
     pub fn disconnected() -> Self {
@@ -126,7 +91,7 @@ impl HelperError {
     }
 
     pub fn protocol(message: impl Into<String>) -> Self {
-        Self::classified(libc::EPROTO, message, HelperErrorKind::Protocol)
+        Self::new(libc::EPROTO, message.into())
     }
 
     pub fn is_disconnected(&self) -> bool {
@@ -141,6 +106,41 @@ impl HelperError {
 impl std::fmt::Display for HelperError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} (errno {})", self.message, self.code)
+    }
+}
+
+/// Closed private reason a normal-shutdown teardown failed. It is carried
+/// beside [`HelperError`] only inside the crate; the public error keeps its
+/// original errno/message shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperShutdownOutcome {
+    Other,
+    ChildExited,
+    ChildMissing,
+    ChildReapDeadline,
+    ChildReapError,
+    Timeout,
+}
+
+/// Crate-private shutdown result. `error` is exactly the value the original
+/// public shutdown call returned; `outcome` is the finite diagnostic class.
+#[derive(Debug)]
+pub(crate) struct HelperShutdownError {
+    pub(crate) error: HelperError,
+    pub(crate) outcome: HelperShutdownOutcome,
+}
+
+impl HelperShutdownError {
+    fn new(error: HelperError, outcome: HelperShutdownOutcome) -> Self {
+        Self { error, outcome }
+    }
+
+    fn other(error: HelperError) -> Self {
+        Self::new(error, HelperShutdownOutcome::Other)
+    }
+
+    fn timeout(error: HelperError) -> Self {
+        Self::new(error, HelperShutdownOutcome::Timeout)
     }
 }
 
@@ -312,6 +312,36 @@ where
             format!("workspace FUSE helper control flush failed: {error}"),
         )
     })
+}
+
+/// Map one non-sleeping child observation to the shared shutdown outcome.
+/// `None` means the child is still running/reaping and the caller must apply
+/// its existing absolute deadline; it is never success.
+fn terminal_exit(observation: ExitObservation) -> Option<Result<(), HelperShutdownError>> {
+    match observation {
+        ExitObservation::Exited(Ok(status)) if status.success => Some(Ok(())),
+        ExitObservation::Exited(Ok(_)) => {
+            Some(Err(HelperShutdownError::new(HelperError::child_exited(), HelperShutdownOutcome::ChildExited)))
+        }
+        ExitObservation::Exited(Err(ReapFailure::Deadline)) => Some(Err(HelperShutdownError::new(
+            HelperError::child_reap_deadline(),
+            HelperShutdownOutcome::ChildReapDeadline,
+        ))),
+        ExitObservation::Exited(Err(ReapFailure::WaitError)) => {
+            Some(Err(HelperShutdownError::new(HelperError::child_reap_error(), HelperShutdownOutcome::ChildReapError)))
+        }
+        ExitObservation::Missing => {
+            Some(Err(HelperShutdownError::new(HelperError::child_missing(), HelperShutdownOutcome::ChildMissing)))
+        }
+        ExitObservation::Running | ExitObservation::Reaping => None,
+    }
+}
+
+/// A returned request error keeps its original `HelperError`; only a retained
+/// `ETIMEDOUT` errno selects the timeout class. Protocol/generic errors remain
+/// `Other` because the public error does not retain a typed protocol cause.
+fn shutdown_error_for(error: HelperError) -> HelperShutdownError {
+    if error.code == libc::ETIMEDOUT { HelperShutdownError::timeout(error) } else { HelperShutdownError::other(error) }
 }
 
 impl Inner {
@@ -599,29 +629,24 @@ impl Inner {
         self.call_full_until(workspace, db_epoch, body, deadline).1
     }
 
-    fn wait_exit_until(&self, deadline: Instant) -> Result<(), HelperError> {
+    fn wait_exit_until(&self, deadline: Instant) -> Result<(), HelperShutdownError> {
         loop {
             // One short observation under the lock; sleep never happens here.
             let observation = {
                 let mut slot = lock(&self.child);
                 slot.observe()
             };
-            match observation {
-                ExitObservation::Exited(Ok(status)) if status.success => return Ok(()),
-                ExitObservation::Exited(Ok(_)) => return Err(HelperError::child_exited()),
-                ExitObservation::Exited(Err(_)) => return Err(HelperError::child_reap()),
-                ExitObservation::Missing => return Err(HelperError::child_missing()),
-                ExitObservation::Running | ExitObservation::Reaping => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(HelperError::new(
-                            libc::ETIMEDOUT,
-                            "workspace FUSE helper did not exit within the shutdown deadline",
-                        ));
-                    }
-                    thread::sleep(deadline.saturating_duration_since(now).min(Duration::from_millis(10)));
-                }
+            if let Some(result) = terminal_exit(observation) {
+                return result;
             }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(HelperShutdownError::timeout(HelperError::new(
+                    libc::ETIMEDOUT,
+                    "workspace FUSE helper did not exit within the shutdown deadline",
+                )));
+            }
+            thread::sleep(deadline.saturating_duration_since(now).min(Duration::from_millis(10)));
         }
     }
 
@@ -652,16 +677,14 @@ impl Inner {
                         continue;
                     };
                     if now >= limit {
-                        lock(&self.child).record_exit(Err(
-                            "workspace FUSE helper was killed but did not reap within the shutdown deadline".into(),
-                        ));
+                        lock(&self.child).record_exit(Err(ReapFailure::Deadline));
                         std::mem::forget(child);
                         return;
                     }
                     thread::sleep(limit.saturating_duration_since(now).min(Duration::from_millis(10)));
                 }
-                Err(error) => {
-                    lock(&self.child).record_exit(Err(error.to_string()));
+                Err(_) => {
+                    lock(&self.child).record_exit(Err(ReapFailure::WaitError));
                     return;
                 }
             }
@@ -691,16 +714,14 @@ impl Inner {
                 Ok(None) => {
                     let now = Instant::now();
                     if now >= deadline {
-                        lock(&self.child).record_exit(Err(
-                            "workspace FUSE helper was killed but did not reap within the shutdown deadline".into(),
-                        ));
+                        lock(&self.child).record_exit(Err(ReapFailure::Deadline));
                         std::mem::forget(child);
                         return;
                     }
                     thread::sleep(deadline.saturating_duration_since(now).min(Duration::from_millis(10)));
                 }
-                Err(error) => {
-                    lock(&self.child).record_exit(Err(error.to_string()));
+                Err(_) => {
+                    lock(&self.child).record_exit(Err(ReapFailure::WaitError));
                     return;
                 }
             }
@@ -975,6 +996,13 @@ impl HelperClient {
     /// absolute deadline and may only tighten it. No fresh grace is started
     /// after the caller's remaining normal-shutdown budget is exhausted.
     pub fn shutdown_until(&self, deadline: Instant) -> Result<(), HelperError> {
+        self.shutdown_until_observed(deadline).map_err(|error| error.error)
+    }
+
+    /// Crate-private typed shutdown used only by the normal-shutdown diagnostic.
+    /// The public `shutdown`/`shutdown_until` calls keep returning exactly the
+    /// original `HelperError` errno/message.
+    pub(crate) fn shutdown_until_observed(&self, deadline: Instant) -> Result<(), HelperShutdownError> {
         let deadline = self.inner.begin_teardown_deadline(deadline);
         if Instant::now() >= deadline {
             // No remaining budget: still make one nonblocking, canonical
@@ -989,8 +1017,8 @@ impl HelperClient {
                     Ok(())
                 }
                 Err(error) => {
-                    self.inner.fail_generation(error.code, error.message.clone());
-                    if attempted { Err(error) } else { Err(control_deadline_error()) }
+                    self.inner.fail_generation(error.error.code, error.error.message.clone());
+                    if attempted { Err(error) } else { Err(HelperShutdownError::timeout(control_deadline_error())) }
                 }
             };
         }
@@ -1002,12 +1030,15 @@ impl HelperClient {
                 self.inner.mark_dead();
                 match request {
                     Ok(Body::ShuttingDown) | Err(HelperError { code: libc::ECONNRESET, .. }) => Ok(()),
-                    Ok(other) => Err(HelperError::protocol(format!("unexpected shutdown reply `{}`", other.op()))),
-                    Err(error) => Err(error),
+                    Ok(other) => Err(HelperShutdownError::other(HelperError::protocol(format!(
+                        "unexpected shutdown reply `{}`",
+                        other.op()
+                    )))),
+                    Err(error) => Err(shutdown_error_for(error)),
                 }
             }
             Err(error) => {
-                self.inner.fail_generation(error.code, error.message.clone());
+                self.inner.fail_generation(error.error.code, error.error.message.clone());
                 Err(error)
             }
         }
@@ -1357,12 +1388,32 @@ mod tests {
     }
 
     #[test]
-    fn helper_error_kinds_are_closed_and_classify_teardown_observations() {
-        assert_eq!(HelperError::new(libc::ETIMEDOUT, "timeout").kind, HelperErrorKind::Timeout);
-        assert_eq!(HelperError::protocol("protocol").kind, HelperErrorKind::Protocol);
-        assert_eq!(HelperError::new(libc::EBUSY, "busy").kind, HelperErrorKind::Other);
-        assert_eq!(HelperError::child_exited().kind, HelperErrorKind::ChildExited);
-        assert_eq!(HelperError::child_missing().kind, HelperErrorKind::ChildMissing);
-        assert_eq!(HelperError::child_reap().kind, HelperErrorKind::ChildReap);
+    fn reap_deadline_and_wait_error_are_distinct_through_the_real_waiter_mapping() {
+        for (failure, outcome) in [
+            (ReapFailure::Deadline, HelperShutdownOutcome::ChildReapDeadline),
+            (ReapFailure::WaitError, HelperShutdownOutcome::ChildReapError),
+        ] {
+            let mut slot = ChildSlot::default();
+            slot.record_exit(Err(failure));
+            let observation = slot.observe();
+            let error = terminal_exit(observation)
+                .expect("a recorded reap failure is terminal")
+                .expect_err("a reap failure is never success");
+            assert_eq!(error.outcome, outcome);
+            assert_eq!(error.error.code, libc::ECHILD);
+            assert!(!error.error.message.contains("try_wait"));
+            assert!(!error.error.message.contains("Operation"));
+        }
+    }
+
+    #[test]
+    fn request_error_class_uses_only_the_retained_errno_and_preserves_public_error() {
+        let timeout = shutdown_error_for(HelperError::new(libc::ETIMEDOUT, "deadline"));
+        assert_eq!(timeout.outcome, HelperShutdownOutcome::Timeout);
+        assert_eq!((timeout.error.code, timeout.error.message.as_str()), (libc::ETIMEDOUT, "deadline"));
+
+        let generic = shutdown_error_for(HelperError::new(libc::EBUSY, "busy"));
+        assert_eq!(generic.outcome, HelperShutdownOutcome::Other);
+        assert_eq!((generic.error.code, generic.error.message.as_str()), (libc::EBUSY, "busy"));
     }
 }

@@ -49,7 +49,8 @@ pub mod protocol;
 #[path = "fuse_helper/server.rs"]
 pub mod server;
 
-pub use client::{HelperClient, HelperError, HelperErrorKind, RemoteFreezeToken};
+pub(crate) use client::HelperShutdownOutcome;
+pub use client::{HelperClient, HelperError, RemoteFreezeToken};
 pub use server::run as run_child;
 
 /// Argument that puts the service binary into helper mode. `main` checks it
