@@ -1,0 +1,103 @@
+name: Push Causal Stream
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/push-causal-stream.yml'
+      - 'src/namespace_service.rs'
+      - 'src/namespace_service/push_causal_stream.rs'
+      - 'src/namespace_service/push_causal_stream/**'
+      - 'tests/push_causal_stream.rs'
+      - 'tests/push_causal_stream/**'
+      - 'tests/test_push_causal_stream_contracts.py'
+      - 'scripts/eval_push_causal_stream.py'
+      - 'docs/push-causal-stream.md'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: push-causal-stream-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  push-causal-stream:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && rustfmt -V && cargo clippy -V
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/push-causal-stream/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+      - name: Format, design-doc and offline contract checks
+        run: |
+          git --version
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_push_causal_stream_contracts.py
+      - name: Run Clippy, library unit tests, and stock-Git OpenDAL S3 push integration tests
+        run: |
+          cargo clippy --locked --no-default-features --lib --test push_causal_stream -- -D warnings
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib namespace_service::push_causal_stream
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test push_causal_stream
+      - name: Run reproducible #183 streaming push vs naive repack benchmark evaluator
+        run: |
+          mkdir -p test-results/push-causal-stream
+          python3 scripts/eval_push_causal_stream.py \
+            --formats sha1,sha256 \
+            --pushes 4 \
+            --base-commits 6 \
+            --payload-kb 32 \
+            --build-receipt test-results/push-causal-stream/cargo-fork.json \
+            --json-out test-results/push-causal-stream/benchmark.json
+      - name: Upload push-causal-stream CI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: push-causal-stream-evidence
+          path: test-results/push-causal-stream/
+          if-no-files-found: warn
