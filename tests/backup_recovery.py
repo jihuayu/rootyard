@@ -484,7 +484,6 @@ def browse_restore_cache_report(args, *, flush=False):
     binding = {}
     h = None
     stage = 'preflight'
-    detail = {}
     try:
         if not __debug__ or args.keep or os.environ.get('ROOTYARD_TEST_EVIDENCE_DIR'):
             raise RuntimeError('Browse restore proof requires assertions and disposable evidence')
@@ -502,10 +501,10 @@ def browse_restore_cache_report(args, *, flush=False):
         stage = 'restore'
         h.restore_exact()
         stage = 'restored_preview'
-        detail = h.restored_preview()
+        restore_detail = h.restored_preview()
         if flush:
             stage = 'flush_authority'
-            detail = h.flush_authority()
+            flush_detail = h.flush_authority()
         stage = 'receipt_changed'
         assert build_binding(args.binary, args.expect_commit) == binding
         stage = None
@@ -517,10 +516,12 @@ def browse_restore_cache_report(args, *, flush=False):
                 h.cleanup()
             except (Exception, KeyboardInterrupt):
                 stage = 'cleanup'
-    case = dict(name=case_name, status='passed', detail=dict(detail, owned_cleanup_completed=True))
     if stage is not None:
-        case = dict(name=case_name, status='failed', error=stage)
-    return dict(passed=stage is None, cases=[case], **binding)
+        return dict(passed=False, cases=[dict(name=case_name, status='failed', error=stage)], **binding)
+    cases = [dict(name=CASE, status='passed', detail=dict(restore_detail, owned_cleanup_completed=True))]
+    if flush:
+        cases.append(dict(name=FLUSH_CASE, status='passed', detail=dict(flush_detail, owned_cleanup_completed=True)))
+    return dict(passed=True, cases=cases, **binding)
 
 
 def main():

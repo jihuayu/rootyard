@@ -239,10 +239,12 @@ class RunReportTest(unittest.TestCase):
     def test_flush_opt_in_runs_after_the_restore_witness_and_before_cleanup(self):
         self.harness.flush_authority.return_value = dict(owned_flushall_verified=True)
         report = recovery.browse_restore_cache_report(self.args, flush=True)
-        self.assertEqual(report, dict(passed=True, cases=[dict(
-            name=cache.FLUSH_CASE, status="passed",
-            detail=dict(owned_flushall_verified=True, owned_cleanup_completed=True),
-        )], **self.binding))
+        self.assertEqual(report, dict(passed=True, cases=[
+            dict(name=cache.CASE, status="passed",
+                 detail=dict(restored_repeat_hit=True, owned_cleanup_completed=True)),
+            dict(name=cache.FLUSH_CASE, status="passed",
+                 detail=dict(owned_flushall_verified=True, owned_cleanup_completed=True)),
+        ], **self.binding))
         self.assertEqual(self.harness.method_calls, [
             call.recovery_source(before_backup=self.harness.warm_preview),
             call.restore_exact(), call.restored_preview(), call.flush_authority(), call.cleanup(),
@@ -255,6 +257,14 @@ class RunReportTest(unittest.TestCase):
             name=cache.FLUSH_CASE, status="failed", error="restored_preview",
         )], **self.binding))
         self.harness.flush_authority.assert_not_called()
+        self.harness.cleanup.assert_called_once()
+
+    def test_failed_flush_does_not_emit_partial_success(self):
+        self.harness.flush_authority.side_effect = RuntimeError("fixture-specific flush failure")
+        report = recovery.browse_restore_cache_report(self.args, flush=True)
+        self.assertEqual(report, dict(passed=False, cases=[dict(
+            name=cache.FLUSH_CASE, status="failed", error="flush_authority",
+        )], **self.binding))
         self.harness.cleanup.assert_called_once()
 
     def test_missing_receipt_never_constructs_a_fixture(self):
