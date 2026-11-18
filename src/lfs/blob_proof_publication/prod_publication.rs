@@ -254,5 +254,10 @@ pub async fn prod_validate_and_attest_push(
         git_object_dir: s.git_object_dir,
         git_alternate_object_dirs: s.git_alternate_object_dirs,
     };
-    attest_and_authorize_push(&ctx, &req).await
+    attest_and_authorize_push_with_auth(
+        &ctx,
+        &req,
+        Some(PushCommitAuthCheck { actor_id: s.actor_id, token_id: None, expected_generation: None }),
+    )
+    .await
 }

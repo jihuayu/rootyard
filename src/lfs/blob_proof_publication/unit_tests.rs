@@ -48,7 +48,7 @@ fn pointer_inspector_classifies_canonical_legacy_ordinary_and_malformed_blobs() 
     ));
 
     assert_eq!(inspect_candidate_lfs_pointer(b"ordinary source code\nfn main() {}\n"), PointerInspection::NonPointer);
-    assert_eq!(inspect_candidate_lfs_pointer(&vec![b'x'; 2048]), PointerInspection::NonPointer);
+    assert_eq!(inspect_candidate_lfs_pointer(&[b'x'; 2048]), PointerInspection::NonPointer);
 
     let bad_oid = "version https://git-lfs.github.com/spec/v1\noid sha256:nothex\nsize 12\n";
     let missing_size = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\n");

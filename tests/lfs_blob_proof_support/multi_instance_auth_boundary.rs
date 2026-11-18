@@ -352,7 +352,7 @@ async fn finish_streaming_upload(mut stream: tokio::net::TcpStream, payload: &[u
     stream.shutdown().await?;
     let mut head = Vec::new();
     let mut buf = [0u8; 4096];
-    while !head.windows(4).any(|w| w == &b"\r\n\r\n"[..]) {
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
         let n = stream.read(&mut buf).await?;
         if n == 0 {
             break;
