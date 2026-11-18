@@ -325,21 +325,28 @@ class HostedFlowMockTest(unittest.TestCase):
             "client_major": 17,
         }))
         (self.evidence / "stage").write_text("test")
+        self.environment = mock.patch.dict(os.environ, {"PGUSER": "local"})
+        self.environment.start()
+        self.nonce = "1" * 32
+        self.owned_name = driver.database_candidate_name(42, 2, self.nonce)
         self.owned_present = False
 
     def tearDown(self):
+        self.environment.stop()
         self.directory.cleanup()
 
     def patches(self):
-        def create():
+        def create(work, baseline, provenance):
+            marker = driver.ownership_marker(provenance, baseline, self.nonce, state="created")
+            driver.write_ownership_marker(Path(work), marker)
             self.owned_present = True
-            return "slot0_native_" + "1" * 32
+            return marker["database"]
 
         def roster():
             values = ["postgres", "template0", "template1"]
-            return values + (["slot0_native_" + "1" * 32] if self.owned_present else [])
+            return values + ([self.owned_name] if self.owned_present else [])
 
-        def cleanup(owned, baseline):
+        def cleanup(baseline, marker):
             self.owned_present = False
             return True, True
 
@@ -389,6 +396,44 @@ class HostedFlowMockTest(unittest.TestCase):
         self.assertEqual([entry.name for entry in self.evidence.iterdir()], ["qualification.json"])
         self.assertNotIn(str(self.root), json.dumps(report))
 
+    def test_partial_create_owner_failure_uses_marker_for_cleanup(self):
+        patches = self.patches()
+        for patcher in patches:
+            patcher.start()
+
+        def create_partial(work, baseline, provenance):
+            marker = driver.ownership_marker(provenance, baseline, self.nonce, state="candidate")
+            driver.write_ownership_marker(Path(work), marker)
+            self.owned_present = True
+            raise driver.EvidenceError("postgres")
+
+        def cleanup_marker(baseline, marker):
+            self.assertEqual(marker["database"], self.owned_name)
+            self.owned_present = False
+            return True, True
+
+        driver.create_database.side_effect = create_partial
+        driver.cleanup_databases.side_effect = cleanup_marker
+        try:
+            run = driver.cmd_run(SimpleNamespace(
+                work=str(self.work), product=str(self.product),
+                workflow_source=str(self.root), integration=str(self.work / "ref-store-operations"),
+                lib=str(self.work / "slot-zero-lib")))
+        finally:
+            for patcher in reversed(patches):
+                patcher.stop()
+        self.assertEqual(run, 1)
+        candidate = json.loads((self.work / "candidate.json").read_text())
+        self.assertEqual(candidate["failure_class"], "postgres")
+        self.assertTrue(candidate["cleanup"]["database_removed"])
+        self.assertTrue(candidate["cleanup"]["roster_restored"])
+        marker = driver.load_ownership_marker(self.work, {
+            "server_version_num": 170005,
+            "databases": ["postgres", "template0", "template1"],
+            "client_major": 17,
+        }, provenance())
+        self.assertEqual(marker["state"], "candidate")
+
     def test_failed_case_is_red_but_still_reports_cleanup(self):
         patches = self.patches()
         for patcher in patches:
@@ -420,6 +465,360 @@ class HostedFlowMockTest(unittest.TestCase):
         self.assertEqual(report["counts"]["failed"], 1)
         self.assertEqual(report["counts"]["not_run"], 4)
         self.assertEqual(report["failure_class"], "case")
+
+
+class OwnershipMarkerTest(unittest.TestCase):
+    """Pure marker contracts: exact ownership, fail-closed cleanup, retryable finalize."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.work = self.root / "work"
+        self.evidence = self.root / "evidence"
+        self.product = self.root / "product"
+        self.work.mkdir()
+        self.evidence.mkdir()
+        self.product.mkdir()
+        self.environment = mock.patch.dict(os.environ, {"PGUSER": "local"})
+        self.environment.start()
+        self.provenance = provenance()
+        self.baseline = {
+            "server_version_num": 170005,
+            "databases": ["postgres", "template0", "template1"],
+            "client_major": 17,
+        }
+        self.nonce = "2" * 32
+        self.name = driver.database_candidate_name(42, 2, self.nonce)
+
+    def tearDown(self):
+        self.environment.stop()
+        self.directory.cleanup()
+
+    def marker(self, *, state="candidate", nonce=None, provenance_value=None, baseline=None):
+        return driver.ownership_marker(
+            provenance_value or self.provenance,
+            baseline or self.baseline,
+            nonce or self.nonce,
+            state=state)
+
+    def write_marker(self, marker=None):
+        marker = marker or self.marker()
+        driver.write_ownership_marker(self.work, marker)
+        return marker
+
+    def test_candidate_name_binds_run_attempt_and_nonce(self):
+        self.assertRegex(self.name, driver.DATABASE_FULL)
+        self.assertLessEqual(len(self.name), 63)
+        self.assertEqual(self.name, driver.database_candidate_name(42, 2, self.nonce))
+        self.assertNotEqual(self.name, driver.database_candidate_name(42, 3, self.nonce))
+        self.assertNotEqual(self.name, driver.database_candidate_name(42, 2, "3" * 32))
+
+    def test_marker_publication_is_exclusive_and_bounded(self):
+        first = self.write_marker()
+        path = self.work / driver.OWNERSHIP_MARKER
+        before = path.read_bytes()
+        self.assertLessEqual(len(before), driver.OWNERSHIP_LIMIT)
+        with self.assertRaises(driver.EvidenceError) as caught:
+            driver.write_ownership_marker(self.work, self.marker(state="preexisting"))
+        self.assertEqual(caught.exception.kind, "ownership")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_marker_delivery_failure_never_creates_database(self):
+        with mock.patch.object(driver, "database_exists", return_value=False), \
+                mock.patch.object(driver, "psql_outcome") as psql, \
+                mock.patch.object(driver, "write_ownership_marker",
+                                  side_effect=driver.EvidenceError("ownership")):
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.create_database(self.work, self.baseline, self.provenance)
+        self.assertEqual(caught.exception.kind, "ownership")
+        psql.assert_not_called()
+        self.assertFalse((self.work / driver.OWNERSHIP_MARKER).exists())
+
+    def test_marker_already_present_stops_before_create(self):
+        inherited = self.write_marker()
+        with mock.patch.object(driver, "database_exists", return_value=False), \
+                mock.patch.object(driver, "psql_outcome") as psql:
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.create_database(self.work, self.baseline, self.provenance)
+        self.assertEqual(caught.exception.kind, "ownership")
+        psql.assert_not_called()
+        self.assertEqual(driver.load_ownership_marker(
+            self.work, self.baseline, self.provenance), inherited)
+
+    def test_old_run_or_changed_baseline_is_not_inherited(self):
+        self.write_marker()
+        old = dict(self.provenance)
+        old["run_id"] = 99
+        with self.assertRaises(driver.EvidenceError) as caught:
+            driver.load_ownership_marker(self.work, self.baseline, old)
+        self.assertEqual(caught.exception.kind, "ownership")
+        changed = dict(self.baseline)
+        changed["databases"] = list(self.baseline["databases"]) + ["slot_zero_" + "4" * 32]
+        with self.assertRaises(driver.EvidenceError) as caught:
+            driver.load_ownership_marker(self.work, changed, self.provenance)
+        self.assertEqual(caught.exception.kind, "ownership")
+
+    def test_preexisting_name_is_rejected_before_marker(self):
+        with mock.patch.object(driver, "database_exists", return_value=True), \
+                mock.patch.object(driver, "psql_outcome") as psql:
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.create_database(self.work, self.baseline, self.provenance)
+        self.assertEqual(caught.exception.kind, "database-exists")
+        psql.assert_not_called()
+        self.assertFalse((self.work / driver.OWNERSHIP_MARKER).exists())
+
+    def test_generated_name_already_in_baseline_is_rejected(self):
+        baseline = dict(self.baseline)
+        baseline["databases"] = list(self.baseline["databases"]) + [self.name]
+        with mock.patch.object(driver.secrets, "token_hex", return_value=self.nonce), \
+                mock.patch.object(driver, "database_exists") as exists, \
+                mock.patch.object(driver, "psql_outcome") as psql:
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.create_database(self.work, baseline, self.provenance)
+        self.assertEqual(caught.exception.kind, "database-exists")
+        exists.assert_not_called()
+        psql.assert_not_called()
+        self.assertFalse((self.work / driver.OWNERSHIP_MARKER).exists())
+
+    def test_uncreated_candidate_marker_is_clean(self):
+        marker = self.write_marker()
+        with mock.patch.object(driver, "roster", return_value=self.baseline["databases"]), \
+                mock.patch.object(driver, "drop_database") as drop:
+            removed, restored = driver.cleanup_databases(self.baseline["databases"], marker)
+        self.assertTrue(removed)
+        self.assertTrue(restored)
+        drop.assert_not_called()
+
+    def test_unknown_create_response_with_owner_evidence_cleans_exactly(self):
+        with mock.patch.object(driver, "database_exists", return_value=False), \
+                mock.patch.object(driver, "psql_outcome",
+                                  side_effect=driver.EvidenceError("postgres")):
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.create_database(self.work, self.baseline, self.provenance)
+        self.assertEqual(caught.exception.kind, "postgres")
+        marker = driver.load_ownership_marker(self.work, self.baseline, self.provenance)
+        self.assertEqual(marker["state"], "candidate")
+        present = {marker["database"]: True}
+
+        def roster():
+            return self.baseline["databases"] + ([marker["database"]] if present[marker["database"]] else [])
+
+        def drop(name):
+            present[name] = False
+
+        with mock.patch.object(driver, "roster", side_effect=roster), \
+                mock.patch.object(driver, "database_owner", return_value="local"), \
+                mock.patch.object(driver, "drop_database", side_effect=drop) as drop_mock:
+            removed, restored = driver.cleanup_databases(self.baseline["databases"], marker)
+        self.assertTrue(removed)
+        self.assertTrue(restored)
+        drop_mock.assert_called_once_with(marker["database"])
+
+    def test_successful_create_writes_created_marker(self):
+        with mock.patch.object(driver, "database_exists", return_value=False), \
+                mock.patch.object(driver, "psql_outcome", return_value=(0, b"", b"")), \
+                mock.patch.object(driver, "database_owner", return_value="local"):
+            name = driver.create_database(self.work, self.baseline, self.provenance)
+        marker = driver.load_ownership_marker(self.work, self.baseline, self.provenance)
+        self.assertEqual(name, marker["database"])
+        self.assertEqual(marker["state"], "created")
+        self.assertEqual(marker["run_id"], 42)
+        self.assertEqual(marker["run_attempt"], 2)
+        self.assertEqual(marker["owner"], "local")
+        self.assertNotIn(str(self.root), json.dumps(marker))
+
+    def test_owner_check_unavailable_after_create_is_cleaned(self):
+        with mock.patch.object(driver, "database_exists", return_value=False), \
+                mock.patch.object(driver, "psql_outcome", return_value=(0, b"", b"")), \
+                mock.patch.object(driver, "database_owner",
+                                  side_effect=driver.EvidenceError("postgres")):
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.create_database(self.work, self.baseline, self.provenance)
+        self.assertEqual(caught.exception.kind, "postgres")
+        marker = driver.load_ownership_marker(self.work, self.baseline, self.provenance)
+        self.assertEqual(marker["state"], "candidate")
+        present = {marker["database"]: True}
+
+        def roster():
+            return self.baseline["databases"] + ([marker["database"]] if present[marker["database"]] else [])
+
+        def drop(name):
+            present[name] = False
+
+        with mock.patch.object(driver, "roster", side_effect=roster), \
+                mock.patch.object(driver, "database_owner", return_value="local"), \
+                mock.patch.object(driver, "drop_database", side_effect=drop) as drop_mock:
+            removed, restored = driver.cleanup_databases(self.baseline["databases"], marker)
+        self.assertTrue(removed)
+        self.assertTrue(restored)
+        drop_mock.assert_called_once_with(marker["database"])
+
+    def test_owner_mismatch_keeps_marker_and_never_drops(self):
+        with mock.patch.object(driver, "database_exists", return_value=False), \
+                mock.patch.object(driver, "psql_outcome", return_value=(0, b"", b"")), \
+                mock.patch.object(driver, "database_owner", return_value="other"):
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.create_database(self.work, self.baseline, self.provenance)
+        self.assertEqual(caught.exception.kind, "ownership")
+        marker = driver.load_ownership_marker(self.work, self.baseline, self.provenance)
+        self.assertEqual(marker["state"], "owner-mismatch")
+        with mock.patch.object(driver, "roster",
+                               return_value=self.baseline["databases"] + [marker["database"]]), \
+                mock.patch.object(driver, "database_owner", return_value="other"), \
+                mock.patch.object(driver, "drop_database") as drop:
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.cleanup_databases(self.baseline["databases"], marker)
+        self.assertEqual(caught.exception.kind, "ownership")
+        drop.assert_not_called()
+
+    def test_duplicate_create_is_preexisting_and_never_dropped(self):
+        with mock.patch.object(driver, "database_exists", return_value=False), \
+                mock.patch.object(driver, "psql_outcome", return_value=(
+                    1, b"", b'ERROR:  database "x" already exists\n')):
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.create_database(self.work, self.baseline, self.provenance)
+        self.assertEqual(caught.exception.kind, "ownership")
+        marker = driver.load_ownership_marker(self.work, self.baseline, self.provenance)
+        self.assertEqual(marker["state"], "preexisting")
+        with mock.patch.object(driver, "roster",
+                               return_value=self.baseline["databases"] + [marker["database"]]), \
+                mock.patch.object(driver, "database_owner", return_value="local"), \
+                mock.patch.object(driver, "drop_database") as drop:
+            with self.assertRaises(driver.EvidenceError) as caught:
+                driver.cleanup_databases(self.baseline["databases"], marker)
+        self.assertEqual(caught.exception.kind, "ownership")
+        drop.assert_not_called()
+
+    def test_unknown_sibling_is_never_scanned_or_dropped(self):
+        sibling = "slot0_native_999_9_" + "f" * 32
+        with mock.patch.object(driver, "roster",
+                               return_value=self.baseline["databases"] + [sibling]), \
+                mock.patch.object(driver, "drop_database") as drop:
+            removed, restored = driver.cleanup_databases(self.baseline["databases"], None)
+        self.assertFalse(removed)
+        self.assertFalse(restored)
+        drop.assert_not_called()
+
+    def test_invalid_marker_fails_closed_without_drop(self):
+        old = dict(self.provenance)
+        old["run_id"] = 99
+        marker = driver.ownership_marker(old, self.baseline, self.nonce, state="created")
+        driver.write_ownership_marker(self.work, marker)
+        (self.work / "pg-baseline.json").write_text(json.dumps(self.baseline))
+        (self.evidence / "stage").write_text("test")
+        with mock.patch.object(driver, "verify_sources", return_value=self.provenance), \
+                mock.patch.object(driver, "roster",
+                                  return_value=self.baseline["databases"] + [marker["database"]]), \
+                mock.patch.object(driver, "drop_database") as drop:
+            result = driver.cmd_finalize(SimpleNamespace(
+                work=str(self.work), evidence=str(self.evidence),
+                product=str(self.product), workflow_source=str(self.root)))
+        self.assertEqual(result, 1)
+        report = json.loads((self.evidence / "qualification.json").read_text())
+        self.assertEqual(report["failure_class"], "ownership")
+        self.assertFalse(report["cleanup"]["work_removed"])
+        self.assertTrue(self.work.exists())
+        drop.assert_not_called()
+
+    def test_finalize_owner_mismatch_retains_marker(self):
+        marker = self.write_marker(self.marker(state="owner-mismatch"))
+        (self.work / "pg-baseline.json").write_text(json.dumps(self.baseline))
+        (self.evidence / "stage").write_text("test")
+        with mock.patch.object(driver, "verify_sources", return_value=self.provenance), \
+                mock.patch.object(driver, "roster",
+                                  return_value=self.baseline["databases"] + [marker["database"]]), \
+                mock.patch.object(driver, "drop_database") as drop:
+            result = driver.cmd_finalize(SimpleNamespace(
+                work=str(self.work), evidence=str(self.evidence),
+                product=str(self.product), workflow_source=str(self.root)))
+        self.assertEqual(result, 1)
+        report = json.loads((self.evidence / "qualification.json").read_text())
+        self.assertEqual(report["failure_class"], "ownership")
+        self.assertFalse(report["cleanup"]["work_removed"])
+        self.assertTrue(self.work.exists())
+        self.assertEqual(driver.load_ownership_marker(
+            self.work, self.baseline, self.provenance), marker)
+        drop.assert_not_called()
+
+    def test_pg_unavailable_keeps_work_and_marker(self):
+        marker = self.write_marker(self.marker(state="created"))
+        (self.work / "pg-baseline.json").write_text(json.dumps(self.baseline))
+        (self.evidence / "stage").write_text("test")
+        with mock.patch.object(driver, "verify_sources", return_value=self.provenance), \
+                mock.patch.object(driver, "roster",
+                                  side_effect=driver.EvidenceError("postgres")), \
+                mock.patch.object(driver, "drop_database") as drop:
+            result = driver.cmd_finalize(SimpleNamespace(
+                work=str(self.work), evidence=str(self.evidence),
+                product=str(self.product), workflow_source=str(self.root)))
+        self.assertEqual(result, 1)
+        report = json.loads((self.evidence / "qualification.json").read_text())
+        self.assertEqual(report["failure_class"], "postgres")
+        self.assertFalse(report["cleanup"]["work_removed"])
+        self.assertTrue(self.work.exists())
+        self.assertEqual(driver.load_ownership_marker(
+            self.work, self.baseline, self.provenance), marker)
+        drop.assert_not_called()
+
+    def test_finalize_retries_after_cleanup_failure(self):
+        self.write_marker(self.marker(state="created"))
+        (self.work / "pg-baseline.json").write_text(json.dumps(self.baseline))
+        (self.evidence / "stage").write_text("test")
+        calls = [driver.EvidenceError("postgres"), (True, True)]
+        with mock.patch.object(driver, "verify_sources", return_value=self.provenance), \
+                mock.patch.object(driver, "cleanup_databases", side_effect=calls):
+            first = driver.cmd_finalize(SimpleNamespace(
+                work=str(self.work), evidence=str(self.evidence),
+                product=str(self.product), workflow_source=str(self.root)))
+            self.assertEqual(first, 1)
+            self.assertTrue(self.work.exists())
+            second = driver.cmd_finalize(SimpleNamespace(
+                work=str(self.work), evidence=str(self.evidence),
+                product=str(self.product), workflow_source=str(self.root)))
+        self.assertEqual(second, 1)
+        self.assertFalse(self.work.exists())
+
+    def test_repeated_finalize_preserves_existing_report(self):
+        self.work.rmdir()
+        report_path = self.evidence / "qualification.json"
+        report_path.write_text(json.dumps({
+            "schema": driver.SCHEMA,
+            "run": {"id": 42, "attempt": 2},
+            "product": {"commit": self.provenance["product_commit"],
+                        "tree": self.provenance["product_tree"]},
+            "workflow": {"sha256": self.provenance["workflow_sha256"]},
+            "validator_sha256": driver.sha256_file(Path(driver.__file__).resolve()),
+            "passed": True,
+            "failure_class": None,
+            "cleanup": {"database_removed": True, "roster_restored": True,
+                        "work_removed": True, "evidence_clean": True},
+        }))
+        before = report_path.read_bytes()
+        with mock.patch.object(driver, "verify_sources", return_value=self.provenance):
+            result = driver.cmd_finalize(SimpleNamespace(
+                work=str(self.work), evidence=str(self.evidence),
+                product=str(self.product), workflow_source=str(self.root)))
+        self.assertEqual(result, 0)
+        self.assertEqual(report_path.read_bytes(), before)
+
+    def test_old_report_with_different_run_is_not_inherited(self):
+        self.work.rmdir()
+        report_path = self.evidence / "qualification.json"
+        report_path.write_text(json.dumps({
+            "schema": driver.SCHEMA,
+            "run": {"id": 99, "attempt": 2},
+            "passed": True,
+            "failure_class": None,
+            "cleanup": {"database_removed": True, "roster_restored": True,
+                        "work_removed": True, "evidence_clean": True},
+        }))
+        with mock.patch.object(driver, "verify_sources", return_value=self.provenance):
+            result = driver.cmd_finalize(SimpleNamespace(
+                work=str(self.work), evidence=str(self.evidence),
+                product=str(self.product), workflow_source=str(self.root)))
+        self.assertEqual(result, 1)
+        report = json.loads(report_path.read_text())
+        self.assertFalse(report["passed"])
 
 
 class BoundedExecutionTest(unittest.TestCase):

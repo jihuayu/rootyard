@@ -51,7 +51,14 @@ EXEC_REAP = "reap"
 JOB_TIMEOUT_MINUTES = 110
 DATABASE_PREFIX = "slot0_native_"
 SLOT_ZERO_DATABASE = re.compile(r"slot_zero_[0-9a-f]{32}")
-DATABASE_FULL = re.compile(rf"{DATABASE_PREFIX}[0-9a-f]{{32}}")
+DATABASE_FULL = re.compile(rf"{DATABASE_PREFIX}[0-9]{{1,12}}_[0-9]{{1,3}}_[0-9a-f]{{32}}")
+OWNERSHIP_MARKER = "database-ownership.json"
+OWNERSHIP_SCHEMA = "rootyard/issue42-hosted-database-ownership/v1"
+OWNERSHIP_LIMIT = 4096
+OWNERSHIP_STATES = frozenset({"candidate", "unknown", "created", "preexisting", "owner-mismatch"})
+OWNERSHIP_FIELDS = frozenset({
+    "schema", "run_id", "run_attempt", "nonce", "database", "baseline_sha256", "owner", "state",
+})
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 FORBIDDEN_KEY = {
@@ -557,13 +564,173 @@ def database_exists(name):
     return psql(f"SELECT count(*) FROM pg_database WHERE datname = '{name}';") != "0"
 
 
-def create_database():
-    name = DATABASE_PREFIX + secrets.token_hex(16)
+def database_owner(name):
     require(DATABASE_FULL.fullmatch(name), "postgres")
+    return psql(f"SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{name}';") or None
+
+
+def psql_outcome(sql, *, database="postgres", limit=20):
+    """Run one psql command and return its fixed outcome without printing it."""
+    try:
+        process = subprocess.run(
+            [_psql_binary(), "-XqAtw", "-v", "ON_ERROR_STOP=1", "-c", sql],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_psql_env(database),
+            timeout=limit,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise EvidenceError("postgres") from error
+    return process.returncode, process.stdout, process.stderr
+
+
+def baseline_fingerprint(baseline):
+    try:
+        databases = baseline.get("databases")
+        version = int(baseline.get("server_version_num", 0))
+        require(isinstance(databases, list) and all(isinstance(name, str) for name in databases),
+                "ownership")
+        require(version > 0, "ownership")
+    except (AttributeError, TypeError, ValueError) as error:
+        raise EvidenceError("ownership") from error
+    return sha256_bytes(canonical({"databases": sorted(databases), "server_version_num": version}))
+
+
+def database_candidate_name(run_id, run_attempt, nonce):
+    require(type(run_id) is int and 0 < run_id <= 999999999999, "ownership")
+    require(type(run_attempt) is int and 0 < run_attempt <= 999, "ownership")
+    require(re.fullmatch(r"[0-9a-f]{32}", nonce or "") is not None, "ownership")
+    name = f"{DATABASE_PREFIX}{run_id}_{run_attempt}_{nonce}"
+    require(len(name) <= 63 and DATABASE_FULL.fullmatch(name) is not None, "ownership")
+    return name
+
+
+def ownership_marker(provenance, baseline, nonce, *, state="candidate"):
+    require(state in OWNERSHIP_STATES, "ownership")
+    run_id = provenance.get("run_id")
+    run_attempt = provenance.get("run_attempt")
+    name = database_candidate_name(run_id, run_attempt, nonce)
+    owner = os.environ.get("PGUSER", "")
+    require(bool(owner), "ownership")
+    marker = {
+        "schema": OWNERSHIP_SCHEMA,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "nonce": nonce,
+        "database": name,
+        "baseline_sha256": baseline_fingerprint(baseline),
+        "owner": owner,
+        "state": state,
+    }
+    require(set(marker) == OWNERSHIP_FIELDS, "ownership")
+    return marker
+
+
+def _ownership_path(work):
+    return Path(work) / OWNERSHIP_MARKER
+
+
+def _ownership_exists(work):
+    return os.path.lexists(_ownership_path(work))
+
+
+def write_ownership_marker(work, marker):
+    """Publish one exact marker atomically; never overwrite an inherited one."""
+    path = _ownership_path(work)
+    data = (json.dumps(marker, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            + "\n").encode("ascii")
+    require(len(data) <= OWNERSHIP_LIMIT, "ownership")
+    require(not os.path.lexists(path), "ownership")
+    temporary = path.with_name(path.name + "." + secrets.token_hex(8) + ".tmp")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o600)
+        try:
+            os.link(temporary, path)
+        except OSError as error:
+            raise EvidenceError("ownership") from error
+    except OSError as error:
+        raise EvidenceError("ownership") from error
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+
+
+def load_ownership_marker(work, baseline, provenance):
+    path = _ownership_path(work)
+    try:
+        if not os.path.lexists(path):
+            return None
+        require(path.is_file() and not path.is_symlink(), "ownership")
+        require(path.stat().st_size <= OWNERSHIP_LIMIT, "ownership")
+        marker = read_json(path)
+    except OSError as error:
+        raise EvidenceError("ownership") from error
+    except EvidenceError as error:
+        if error.kind == "ownership":
+            raise
+        raise EvidenceError("ownership") from error
+    try:
+        require(isinstance(marker, dict) and set(marker) == OWNERSHIP_FIELDS, "ownership")
+        require(marker.get("schema") == OWNERSHIP_SCHEMA, "ownership")
+        require(marker.get("state") in OWNERSHIP_STATES, "ownership")
+        require(type(marker.get("run_id")) is int, "ownership")
+        require(type(marker.get("run_attempt")) is int, "ownership")
+        require(marker.get("run_id") == provenance.get("run_id"), "ownership")
+        require(marker.get("run_attempt") == provenance.get("run_attempt"), "ownership")
+        require(marker.get("database") == database_candidate_name(
+            provenance.get("run_id"), provenance.get("run_attempt"), marker.get("nonce")), "ownership")
+        require(marker.get("baseline_sha256") == baseline_fingerprint(baseline), "ownership")
+        require(marker.get("owner") == os.environ.get("PGUSER", ""), "ownership")
+        require(marker.get("database") not in (baseline.get("databases") or []), "ownership")
+    except EvidenceError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise EvidenceError("ownership") from error
+    return marker
+
+
+def update_ownership_marker(work, marker, state):
+    require(state in OWNERSHIP_STATES, "ownership")
+    path = _ownership_path(work)
+    try:
+        existing = read_json(path)
+    except EvidenceError as error:
+        raise EvidenceError("ownership") from error
+    require(existing == marker, "ownership")
+    updated = dict(marker)
+    updated["state"] = state
+    try:
+        write_json(path, updated, limit=OWNERSHIP_LIMIT)
+    except EvidenceError as error:
+        raise EvidenceError("ownership") from error
+    return updated
+
+
+def create_database(work, baseline, provenance):
+    nonce = secrets.token_hex(16)
+    marker = ownership_marker(provenance, baseline, nonce, state="candidate")
+    name = marker["database"]
+    require(name not in (baseline.get("databases") or []), "database-exists")
     require(not database_exists(name), "database-exists")
-    psql(f'CREATE DATABASE "{name}" TEMPLATE template0;')
-    owner = psql(f"SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{name}';")
-    require(owner == os.environ.get("PGUSER"), "postgres")
+    write_ownership_marker(work, marker)
+    returncode, _stdout, stderr = psql_outcome(f'CREATE DATABASE "{name}" TEMPLATE template0;')
+    if returncode != 0:
+        state = "preexisting" if (b"already exists" in stderr or b"42P04" in stderr) else "unknown"
+        update_ownership_marker(work, marker, state)
+        raise EvidenceError("ownership" if state == "preexisting" else "postgres")
+    owner = database_owner(name)
+    if owner is None:
+        update_ownership_marker(work, marker, "unknown")
+        raise EvidenceError("ownership")
+    if owner != marker["owner"]:
+        update_ownership_marker(work, marker, "owner-mismatch")
+        raise EvidenceError("ownership")
+    update_ownership_marker(work, marker, "created")
     return name
 
 
@@ -572,17 +739,28 @@ def drop_database(name):
     psql(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE);', limit=30)
 
 
-def cleanup_databases(owned, baseline):
-    """Drop only the database this run created and its exact slot-zero children."""
+def cleanup_databases(baseline, marker):
+    """Drop only the exact marker database and exact slot-zero children."""
     baseline = set(baseline)
+    if marker is not None and marker["database"] in baseline:
+        raise EvidenceError("ownership")
     current = set(roster())
     for name in sorted(current - baseline):
-        if name == owned or SLOT_ZERO_DATABASE.fullmatch(name):
+        if SLOT_ZERO_DATABASE.fullmatch(name):
             drop_database(name)
-        else:
-            return False, False
+            continue
+        if marker is not None and name == marker["database"]:
+            if marker["state"] in {"preexisting", "owner-mismatch"}:
+                raise EvidenceError("ownership")
+            owner = database_owner(name)
+            if owner is None:
+                continue
+            require(owner == marker["owner"], "ownership")
+            drop_database(name)
+            continue
+        return False, False
     after = set(roster())
-    return (owned is None or owned not in after), after == baseline
+    return (marker is None or marker["database"] not in after), after == baseline
 
 
 def check_postgres(baseline):
@@ -865,9 +1043,8 @@ def cmd_run(args):
         except OSError as error:
             raise EvidenceError("binary") from error
         pg = check_postgres(baseline)
-        database = create_database()
+        database = create_database(work, baseline, provenance)
         pg["owned_database_created"] = True
-        (work / "owned-db").write_text(database + "\n", encoding="ascii")
         rows, failure = run_cases(
             binaries={INTEGRATION: args.integration, LIB: args.lib},
             database=database, deadline=deadline, cwd=product)
@@ -875,15 +1052,19 @@ def cmd_run(args):
         failure = error.kind
         rows = expected_rows(statuses)
     finally:
+        marker = None
         try:
-            current = roster()
-            baseline_databases = baseline.get("databases") or []
-            if database is None:
-                database_removed, roster_restored = True, sorted(current) == sorted(baseline_databases)
-            else:
-                database_removed, roster_restored = cleanup_databases(database, baseline_databases)
-        except EvidenceError:
+            marker = load_ownership_marker(work, baseline, provenance)
+            if marker is not None and marker["state"] in {"preexisting", "owner-mismatch"}:
+                failure = failure or "ownership"
+        except EvidenceError as error:
+            failure = failure or error.kind
+        try:
+            database_removed, roster_restored = cleanup_databases(
+                baseline.get("databases") or [], marker)
+        except EvidenceError as error:
             database_removed, roster_restored = False, False
+            failure = failure or error.kind
         if not (database_removed and roster_restored):
             failure = failure or "cleanup"
         try:
@@ -922,13 +1103,13 @@ def _read_optional(path):
 
 def cmd_finalize(args):
     work, evidence, product = Path(args.work), Path(args.evidence), Path(args.product)
+    existing = evidence / "qualification.json"
     stage = _read_optional(evidence / "stage") or "finalize"
     if stage not in {"source", "toolchain", "build", "bind", "postgres", "test", "finalize"}:
         stage = "finalize"
     candidate = {}
     binding = {}
     baseline = {}
-    owned = _read_optional(work / "owned-db") or None
     try:
         candidate = read_json(work / "candidate.json")
     except EvidenceError:
@@ -947,20 +1128,62 @@ def cmd_finalize(args):
     except EvidenceError:
         provenance = None
 
+    if provenance is not None and not work.exists() and existing.is_file():
+        try:
+            prior = read_json(existing)
+        except EvidenceError:
+            prior = None
+        if (isinstance(prior, dict)
+                and prior.get("schema") == SCHEMA
+                and prior.get("run") == {"id": provenance.get("run_id"),
+                                         "attempt": provenance.get("run_attempt")}
+                and isinstance(prior.get("product"), dict)
+                and prior["product"].get("commit") == provenance.get("product_commit")
+                and prior["product"].get("tree") == provenance.get("product_tree")
+                and isinstance(prior.get("workflow"), dict)
+                and prior["workflow"].get("sha256") == provenance.get("workflow_sha256")
+                and prior.get("validator_sha256") == sha256_file(Path(__file__).resolve())
+                and type(prior.get("passed")) is bool
+                and isinstance(prior.get("cleanup"), dict)
+                and set(prior["cleanup"]) == {
+                    "database_removed", "roster_restored", "work_removed", "evidence_clean"}
+                and all(type(value) is bool for value in prior["cleanup"].values())
+                and (not prior["passed"] or (
+                    prior.get("failure_class") is None and all(prior["cleanup"].values())))):
+            status = "ok" if prior["passed"] else "failed"
+            print(f"[slot0-native] stage=finalize status={status} class={prior.get('failure_class') or 'incomplete'}")
+            return 0 if prior["passed"] else 1
+
+    marker = None
+    ownership_error = None
+    marker_present = _ownership_exists(work)
+    if marker_present:
+        if provenance is None:
+            ownership_error = "ownership"
+        else:
+            try:
+                marker = load_ownership_marker(work, baseline, provenance)
+            except EvidenceError as error:
+                ownership_error = error.kind
+    if marker is not None and marker["state"] in {"preexisting", "owner-mismatch"}:
+        ownership_error = ownership_error or "ownership"
+    if marker is None and ownership_error is None and candidate and (
+            candidate.get("postgres", {}).get("owned_database_created") is True
+            or candidate.get("passed") is True):
+        ownership_error = "ownership"
+
     database_removed, roster_restored = True, False
+    cleanup_error = None
     if baseline:
         try:
-            current = set(roster())
-            if owned and owned in current:
-                drop_database(owned)
-            for name in sorted(current - set(baseline.get("databases") or [])):
-                if name == owned or SLOT_ZERO_DATABASE.fullmatch(name):
-                    drop_database(name)
-            after = set(roster())
-            database_removed = owned is None or owned not in after
-            roster_restored = sorted(after) == sorted(baseline.get("databases") or [])
-        except EvidenceError:
+            database_removed, roster_restored = cleanup_databases(
+                baseline.get("databases") or [], marker)
+        except EvidenceError as error:
             database_removed, roster_restored = False, False
+            cleanup_error = error.kind
+    else:
+        database_removed, roster_restored = False, False
+        cleanup_error = "cleanup"
 
     rows = candidate.get("cases") or expected_rows({})
     source_recheck = bool(candidate.get("source_recheck")) and bool(provenance) \
@@ -971,7 +1194,7 @@ def cmd_finalize(args):
         "major": baseline.get("server_version_num", 0) // 10000,
         "client_major": baseline.get("client_major", 0),
         "baseline_database_count": len(baseline.get("databases") or []),
-        "owned_database_created": bool(owned),
+        "owned_database_created": bool(marker),
     }
     failure = candidate.get("failure_class")
     if provenance is None:
@@ -980,13 +1203,26 @@ def cmd_finalize(args):
         failure = "source-changed"
     elif not candidate:
         failure = stage
+    if ownership_error:
+        if candidate or provenance is None:
+            failure = failure or ownership_error
+        else:
+            failure = ownership_error
+    if cleanup_error:
+        if ownership_error:
+            pass
+        elif candidate:
+            failure = failure or cleanup_error
+        else:
+            failure = cleanup_error
     if not (database_removed and roster_restored):
         failure = failure or "cleanup"
 
-    try:
-        shutil.rmtree(work)
-    except OSError:
-        pass
+    if cleanup_error is None and ownership_error is None and database_removed and roster_restored:
+        try:
+            shutil.rmtree(work)
+        except OSError:
+            pass
     work_removed = not work.exists()
     entries = list(evidence.iterdir()) if evidence.exists() else []
     for entry in entries:
