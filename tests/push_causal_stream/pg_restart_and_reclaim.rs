@@ -287,9 +287,9 @@ async fn stage_three_aborted_pairs_in_s3_and_ledger(
     let req_dig = RequestDigest::of("reclaim-multi", &[op_id.as_bytes()]);
     let mut client = env.pool.get().await?;
     let tx = client.transaction().await?;
-    let seq = PgRefStore.reserve_sequence(&*tx, repo_id, env.actor.identity.id, op_id, &lane, dl).await?;
+    let seq = PgRefStore.reserve_sequence(&tx, repo_id, env.actor.identity.id, op_id, &lane, dl).await?;
     let identity = OperationIdentity::new(repo_id, env.actor.identity.id, lane, seq.sequence(), op_id, req_dig)?;
-    PgRefStore.begin(&*tx, &identity, dl).await?;
+    PgRefStore.begin(&tx, &identity, dl).await?;
     tx.commit().await?;
 
     let tmp = TempDir::new()?;
@@ -324,7 +324,7 @@ async fn stage_three_aborted_pairs_in_s3_and_ledger(
         });
 
         let req = AcquireArtifactHoldsRequest::new(
-            scope.clone(),
+            scope,
             identity.clone(),
             Uuid::new_v4(),
             env.store.backend_identity().clone(),
@@ -353,7 +353,7 @@ async fn stage_three_aborted_pairs_in_s3_and_ledger(
 
     // Cancel the aborted operation in PG so its terminal state is `'cancelled'` (`0` memberships!).
     let tx_cancel = client.transaction().await?;
-    PgRefStore.cancel(&*tx_cancel, &identity, dl).await?;
+    PgRefStore.cancel(&tx_cancel, &identity, dl).await?;
     tx_cancel.commit().await?;
     Ok(op_id)
 }
