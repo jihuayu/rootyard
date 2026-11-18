@@ -278,7 +278,7 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
             src_pool.get().await?,
         );
         let (ev_seq, uname) = (
-            snap.body.next_event_seq.saturating_sub(1) as i64,
+            snap.body.next_event_seq as i64,
             format!("u{}", &fix.tenant.simple().to_string()[..12]),
         );
         src_c.batch_execute(&format!(

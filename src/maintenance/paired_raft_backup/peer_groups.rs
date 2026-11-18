@@ -67,7 +67,7 @@ impl ExpectedGroupCursorCut {
             group_epoch,
             applied_index: applied.index,
             applied_term: applied.term,
-            applied_event_seq: snap.body.next_event_seq.saturating_sub(1),
+            applied_event_seq: snap.body.next_event_seq,
         })
     }
 }

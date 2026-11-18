@@ -240,7 +240,7 @@ fn manifest_digest_tamper_and_incarnation_guard_checks() {
             group_id: 1,
             history_incarnation: history,
             group_epoch: 3,
-            applied_event_seq: snap.body.next_event_seq.saturating_sub(1) as i64,
+            applied_event_seq: snap.body.next_event_seq as i64,
             applied_log_index: applied.index as i64,
             applied_log_term: applied.term as i64,
             last_event_id: None,

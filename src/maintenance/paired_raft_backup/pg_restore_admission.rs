@@ -205,7 +205,7 @@ pub async fn install_restored_pg_incarnation(
             .body
             .last_applied
             .ok_or(PairedBackupError::IncompleteCut("restored group snapshot missing last_applied"))?;
-        let gseq = gsnap.body.next_event_seq.saturating_sub(1) as i64;
+        let gseq = gsnap.body.next_event_seq as i64;
         let (log_idx, log_term) = (glast.index as i64, glast.term as i64);
         tx.execute(
             "INSERT INTO ref_cas_projection_cursors(group_id, history_incarnation, group_epoch, applied_event_seq, applied_log_index, applied_log_term, last_event_id, stream_state) \
@@ -252,7 +252,7 @@ pub async fn verify_pg_restored_cursors(
             .body
             .last_applied
             .ok_or(PairedBackupError::IncompleteCut("restored group snapshot missing last_applied"))?;
-        let expected_seq = gsnap.body.next_event_seq.saturating_sub(1) as i64;
+        let expected_seq = gsnap.body.next_event_seq as i64;
         if hinc != raft_inc
             || gepoch != raft_grp_epoch
             || seq != expected_seq
