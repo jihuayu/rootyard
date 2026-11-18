@@ -28,7 +28,7 @@ use super::{
         AuthorityLane, DecisionKind, DecisionState, GcMode, GlobalHoldEntry, GlobalHoldState, InFlightDecisionRecord,
         RetentionProducer, SafeGcArmReceipt, SafeGcObjectFormat,
     },
-    pg_maintenance_dist::{FsSealedRefCasCutpointSource, persist_refcas_cutpoint_snapshot},
+    pg_maintenance_dist::{FsSealedRefCasCutpointSource, RefCasCutpointSource, persist_refcas_cutpoint_snapshot},
     refcas_cut::RefCasReconciledCut,
     store::DurableSafeGcAuthority,
     store_reconcile::PgReconciledBundle,

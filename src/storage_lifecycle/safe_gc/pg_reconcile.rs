@@ -14,7 +14,6 @@ use super::{
         PairedCursorReconciliation, ProducerReconciliationEntry, RetentionProducer, SourceFreshness,
     },
     quiescence::ActiveReaderLease,
-    refcas_cut::RefCasReconciledCut,
     store::DurableSafeGcAuthority,
 };
 
@@ -87,8 +86,8 @@ pub async fn reconcile_pg_refstore_authority<C: GenericClient + Sync>(
     let sql_decisions = load_pg_open_decisions(client, repo_id, max_ref_seq).await?;
     let transient_reads =
         load_pg_serving_read_leases(client, repo_id, snap_before.authority.membership_generation).await?;
-    let (refcas_freshness, refcas_applied_index, refcas_required_index, refcas_cut) =
-        load_pg_refcas_stream_state(client, repo_id, history_id, &snap_before.paired_cursors).await?;
+    let (refcas_freshness, refcas_applied_index, refcas_required_index) =
+        load_pg_refcas_stream_state(client, repo_id, history_id).await?;
 
     let cursors = PairedCursorReconciliation {
         pg_freshness: SourceFreshness::Reconciled,
@@ -97,7 +96,7 @@ pub async fn reconcile_pg_refstore_authority<C: GenericClient + Sync>(
         refcas_freshness,
         refcas_applied_index,
         refcas_required_index,
-        refcas_cut,
+        refcas_cut: None,
     };
 
     authority.apply_pg_reconciled_bundle(super::store_reconcile::PgReconciledBundle {
@@ -380,12 +379,13 @@ async fn load_pg_serving_read_leases<C: GenericClient + Sync>(
         .collect())
 }
 
+/// Read PG Ref-CAS projection freshness; a previous pass's cut is never carried forward, so any
+/// projection cursor row forces the caller to mint a fresh verified `RefCasReconciledCut`.
 async fn load_pg_refcas_stream_state<C: GenericClient + Sync>(
     client: &C,
     repo_id: Uuid,
     history_id: Uuid,
-    prev: &PairedCursorReconciliation,
-) -> Result<(SourceFreshness, u64, u64, Option<RefCasReconciledCut>), SafeGcError> {
+) -> Result<(SourceFreshness, u64, u64), SafeGcError> {
     let unresolved_jobs: i64 = client
         .query_one(
             "SELECT count(*) FROM ref_cas_projection_jobs \
@@ -396,12 +396,12 @@ async fn load_pg_refcas_stream_state<C: GenericClient + Sync>(
         .map_err(|e| SafeGcError::Io(format!("read ref_cas_projection_jobs failed: {e}")))?
         .get(0);
     if unresolved_jobs > 0 {
-        return Ok((SourceFreshness::Lagging { behind_seq: unresolved_jobs as u64 }, 0, 1, None));
+        return Ok((SourceFreshness::Lagging { behind_seq: unresolved_jobs as u64 }, 0, 1));
     }
 
     let rows = client
         .query(
-            "SELECT group_id, group_epoch, applied_event_seq, applied_log_index, applied_log_term, stream_state \
+            "SELECT applied_log_index, stream_state \
              FROM ref_cas_projection_cursors WHERE history_incarnation = $1 ORDER BY group_id",
             &[&history_id],
         )
@@ -409,43 +409,18 @@ async fn load_pg_refcas_stream_state<C: GenericClient + Sync>(
         .map_err(|e| SafeGcError::Io(format!("read ref_cas_projection_cursors failed: {e}")))?;
 
     if rows.is_empty() {
-        if let Some(ref cut) = prev.refcas_cut {
-            return Ok((
-                SourceFreshness::Reconciled,
-                cut.sm_applied_log_index,
-                cut.sm_applied_log_index.max(1),
-                Some(cut.clone()),
-            ));
-        }
-        return Ok((SourceFreshness::Reconciled, 0, 0, None));
+        return Ok((SourceFreshness::Reconciled, 0, 0));
     }
 
     let mut max_proj_idx = 0_u64;
     for r in &rows {
-        let state: &str = r.get(5);
+        let state: &str = r.get(1);
         if state != "active" {
-            return Ok((SourceFreshness::Unknown, 0, 1, None));
+            return Ok((SourceFreshness::Unknown, 0, 1));
         }
-        let g_id: i64 = r.get(0);
-        let g_epoch = r.get::<_, i64>(1).max(0) as u64;
-        let ev_seq = r.get::<_, i64>(2).max(0) as u64;
-        let log_idx = r.get::<_, i64>(3).max(0) as u64;
-        let log_term = r.get::<_, i64>(4).max(0) as u64;
+        let log_idx = r.get::<_, i64>(0).max(0) as u64;
         max_proj_idx = max_proj_idx.max(log_idx);
-        let matched = prev.refcas_cut.as_ref().is_some_and(|cut| {
-            cut.history_id == history_id
-                && cut.group_id == g_id
-                && cut.group_epoch == g_epoch
-                && cut.pg_projected_event_seq == ev_seq
-                && cut.pg_projected_log_index == log_idx
-                && cut.pg_projected_log_term == log_term
-                && cut.verify_reconciled(history_id, 1, g_epoch).is_ok()
-        });
-        if !matched {
-            return Ok((SourceFreshness::Unknown, 0, max_proj_idx.max(1), None));
-        }
     }
 
-    let cut = prev.refcas_cut.clone().expect("verified matching refcas_cut");
-    Ok((SourceFreshness::Reconciled, cut.sm_applied_log_index, cut.sm_applied_log_index.max(1), Some(cut)))
+    Ok((SourceFreshness::Unknown, 0, max_proj_idx.max(1)))
 }

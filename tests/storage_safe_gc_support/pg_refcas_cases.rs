@@ -31,9 +31,10 @@ use rootyard::{
             ENV_BLOB_SAFE_GC_DESTRUCTIVE, SafeGcArmReceipt, SafeGcError,
             anti_aba::AntiAbaKeyRegistry,
             domain::AuthorityRecord,
-            model::{AuthorityLane, GcMode, SafeGcObjectFormat},
+            model::{AuthorityLane, GcMode, SafeGcObjectFormat, SourceFreshness},
             pg_maintenance::safe_gc_journal_path,
             pg_maintenance_dist::{InMemoryRefCasCutpointSource, persist_refcas_cutpoint_snapshot},
+            pg_reconcile::reconcile_pg_refstore_authority,
             refcas_cut::reconcile_refcas_cut_with_pg,
             store::DurableSafeGcAuthority,
         },
@@ -163,7 +164,7 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
     assert_eq!(off_out.kind, "pando_repack");
     assert_eq!(off_out.state, "succeeded");
     assert_eq!(s3.state.delete_requests.load(Ordering::SeqCst), pre_default_off_deletes, "0 deletes when default-off");
-    assert!(s3.has_key(&p_main) && s3.has_key(&p_orph));
+    assert!(s3.has_key(&p_main) && s3.has_key(&i_main) && s3.has_key(&p_orph) && s3.has_key(&i_orph));
 
     let reloaded = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
     let snap_off = reloaded.snapshot();
@@ -342,10 +343,18 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         std::env::remove_var(ENV_BLOB_SAFE_GC_DESTRUCTIVE);
     }
 
+    assert!(!s3.has_key(&p_main) && !s3.has_key(&i_main));
     assert!(!s3.has_key(&p_orph) && !s3.has_key(&i_orph));
     let reloaded = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
     let cut = reloaded.snapshot().paired_cursors.refcas_cut.expect("persisted RefCasReconciledCut");
     assert_eq!(cut.sm_applied_event_seq, 1);
+
+    // A later pass with projected cursors must never carry this cut forward as Reconciled.
+    let pgc_reset = pool.get().await?;
+    reconcile_pg_refstore_authority(&**pgc_reset, repo_id, &blob_store, &reloaded, Some(2)).await?;
+    drop(pgc_reset);
+    assert!(reloaded.snapshot().paired_cursors.refcas_cut.is_none());
+    assert_eq!(reloaded.snapshot().paired_cursors.refcas_freshness, SourceFreshness::Unknown);
 
     let verify_dir = dir.path().join("verify-pg-surviving");
     let (pk_dst, ix_dst) = (verify_dir.join("objects/pack/surv.pack"), verify_dir.join("objects/pack/surv.idx"));

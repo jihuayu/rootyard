@@ -19,7 +19,7 @@ use crate::ref_store::core::state_machine::{RefCasLogEntry, RefCasSnapshot, RefC
 
 use super::{
     SafeGcError,
-    model::{AuthorityLane, GcMode, SafeGcArmReceipt},
+    model::{AuthorityLane, GcMode, SafeGcArmReceipt, SourceFreshness},
     refcas_cut::{RefCasReconciledCut, reconcile_refcas_cut_with_pg},
     store::DurableSafeGcAuthority,
 };
@@ -140,18 +140,19 @@ pub(super) async fn reconcile_worker_refcas_cut_if_needed<C: GenericClient + Syn
     destructive_env: bool,
 ) -> Result<Option<RefCasReconciledCut>, anyhow::Error> {
     let snap = authority.snapshot();
-    let is_armed_dist = destructive_env
-        && matches!(
-            snap.gc_mode,
-            GcMode::ArmedDestructive(SafeGcArmReceipt { lane: AuthorityLane::DistributedRefCas { .. }, .. })
-        );
+    let is_armed_dist = matches!(
+        snap.gc_mode,
+        GcMode::ArmedDestructive(SafeGcArmReceipt { lane: AuthorityLane::DistributedRefCas { .. }, .. })
+    );
     let fs_default = FsSealedRefCasCutpointSource::new(storage_root);
     let source: &dyn RefCasCutpointSource = explicit_source.unwrap_or(&fs_default);
     let captured =
         source.capture_state_machine(repo_id).map_err(|e| anyhow::anyhow!("capture Ref-CAS state machine: {e}"))?;
-    match (is_armed_dist, captured) {
+    let requires_cut = destructive_env
+        && (is_armed_dist || snap.paired_cursors.refcas_freshness != SourceFreshness::Reconciled || captured.is_some());
+    match (requires_cut, captured) {
         (true, None) => bail!(
-            "DistributedRefCas scheduled Safe GC requires an authoritative RefCasCutpointSource; \
+            "scheduled Safe GC requires an authoritative RefCasCutpointSource; \
              PG ref sequence cannot prove Ref-CAS cut"
         ),
         (true, Some((group_id, sm))) => {
