@@ -135,7 +135,7 @@ pub async fn exercise_unmodified_client_default_operation_replay_and_canonical_r
         derive_default_upload_operation_id(realm.repository_id, realm.owner_tenant_id, alice.user_id, &oid, sz, 1);
     let uop1_row =
         pg.load_upload_operation(realm.repository_id, expected_uop1).await?.context("repair epoch=1 upload op")?;
-    ensure!(uop1_row.state == "committed" && uop1_row.locator == Some(repaired_rec.locator));
+    ensure!(uop1_row.state == "committed" && uop1_row.locator.as_ref() == Some(&repaired_rec.locator));
 
     run_git_ok(&bare_dir, home, &["update-ref", "refs/heads/main", &prev_head])?;
     run_git_ok(wt.path(), home, &["push", "origin", "main"])?;
