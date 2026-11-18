@@ -19,7 +19,7 @@ impl From<ExitStatus> for ExitView {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ReapFailure {
     /// The published shutdown deadline expired after the child was killed.
     Deadline,
@@ -155,6 +155,14 @@ mod tests {
         wait_error.record_exit(Err(ReapFailure::WaitError("wait failed".into())));
         assert_eq!(wait_error.observe(), ExitObservation::Exited(Err(ReapFailure::WaitError("wait failed".into()))));
         assert!(!wait_error.reaped(), "a wait error is not an exit");
+    }
+
+    #[test]
+    fn repeated_wait_error_observation_clones_the_private_message() {
+        let mut slot = ChildSlot::default();
+        slot.record_exit(Err(ReapFailure::WaitError("wait failed".into())));
+        assert_eq!(slot.observe(), ExitObservation::Exited(Err(ReapFailure::WaitError("wait failed".into()))));
+        assert_eq!(slot.observe(), ExitObservation::Exited(Err(ReapFailure::WaitError("wait failed".into()))));
     }
 
     #[test]
