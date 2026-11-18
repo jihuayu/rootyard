@@ -7,6 +7,19 @@ BEGIN
     END IF;
 END $$;
 
+CREATE TYPE core_realm AS (
+    repository_id uuid, tenant_id uuid, object_format text, history_incarnation uuid,
+    authority_epoch bigint, group_epoch bigint
+);
+
+-- Modeled authoritative inputs. The scratch schema has no serving registry,
+-- provider profile, restore coordinator or protocol-realm enforcement.
+CREATE TABLE modeled_serving_scope (
+    repository_id uuid PRIMARY KEY REFERENCES repositories(id),
+    restore_incarnation uuid NOT NULL,
+    backend_identity text NOT NULL CHECK (backend_identity ~ '^[0-9a-f]{64}$')
+);
+
 CREATE TABLE public_operations (
     repository_id uuid NOT NULL REFERENCES repositories(id),
     public_id uuid NOT NULL,
@@ -14,7 +27,7 @@ CREATE TABLE public_operations (
     wire_digest text NOT NULL CHECK (wire_digest ~ '^[0-9a-f]{64}$'),
     request_mode text NOT NULL CHECK (request_mode IN ('atomic', 'accepted_subset')),
     backend_identity text NOT NULL CHECK (backend_identity ~ '^[0-9a-f]{64}$'),
-    realm_id uuid NOT NULL,
+    realm core_realm NOT NULL CHECK (realm IS NOT NULL AND (realm).repository_id = repository_id),
     restore_incarnation uuid NOT NULL,
     current_slot smallint NOT NULL DEFAULT 0,
     state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'committed', 'rejected', 'cancelled')),
@@ -43,6 +56,52 @@ CREATE TABLE private_attempts (
 ALTER TABLE public_operations ADD CONSTRAINT current_attempt
     FOREIGN KEY (repository_id, public_id, current_slot)
     REFERENCES private_attempts(repository_id, public_id, slot) DEFERRABLE INITIALLY DEFERRED;
+
+CREATE FUNCTION gate_realm(g ref_store_core_gates) RETURNS core_realm LANGUAGE sql IMMUTABLE AS $$
+    SELECT ROW((g).repository_id, (g).tenant_id, (g).object_format, (g).history_incarnation,
+               (g).authority_epoch, (g).group_epoch)::core_realm
+$$;
+
+CREATE FUNCTION exact_serving_binding(w public_operations, private_op uuid, parent_digest text)
+RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+        SELECT FROM ref_store_serving_operations s JOIN ref_store_operations o USING (repository_id, operation_id)
+        WHERE (s.repository_id, s.operation_id) = ((w).repository_id, private_op)
+        AND (s.issuer_id, s.producer_request_digest, s.plan_parent_digest, o.issuer_id, o.request_digest)
+            = ((w).issuer_id, (w).wire_digest, parent_digest, (w).issuer_id, parent_digest)
+    )
+$$;
+
+-- The caller already holds the wrapper and operation advisory prefix. This
+-- models the locked RealmExpectation comparison and the advanced-gate check.
+CREATE FUNCTION lock_stale_gate(w public_operations) RETURNS ref_store_core_gates LANGUAGE plpgsql AS $$
+DECLARE
+    attempt private_attempts;
+    scope modeled_serving_scope;
+    gate ref_store_core_gates;
+BEGIN
+    PERFORM require_operation_lock(w.repository_id, w.public_id);
+    SELECT * INTO attempt FROM private_attempts
+        WHERE (repository_id, public_id, slot) = (w.repository_id, w.public_id, w.current_slot);
+    IF FOUND THEN
+        PERFORM require_operation_lock(w.repository_id, attempt.private_id);
+    END IF;
+    IF NOT exact_serving_binding(w, attempt.private_id, attempt.plan_digest) THEN
+        RAISE EXCEPTION 'stale attempt serving binding differs' USING ERRCODE = '23514', CONSTRAINT = 'stale_serving_binding';
+    END IF;
+    SELECT * INTO scope FROM modeled_serving_scope WHERE repository_id = w.repository_id FOR SHARE;
+    IF NOT FOUND OR (scope.restore_incarnation, scope.backend_identity) IS DISTINCT FROM (w.restore_incarnation, w.backend_identity) THEN
+        RAISE EXCEPTION 'stale attempt serving scope differs' USING ERRCODE = '23514', CONSTRAINT = 'stale_serving_scope';
+    END IF;
+    SELECT * INTO gate FROM ref_store_core_gates WHERE repository_id = w.repository_id FOR UPDATE;
+    IF NOT FOUND OR gate_realm(gate) IS DISTINCT FROM w.realm THEN
+        RAISE EXCEPTION 'stale attempt realm differs' USING ERRCODE = '23514', CONSTRAINT = 'stale_realm';
+    END IF;
+    IF gate.revision <= attempt.base_revision THEN
+        RAISE EXCEPTION 'stale rejection requires an advanced gate' USING ERRCODE = '23514', CONSTRAINT = 'stale_revision';
+    END IF;
+    RETURN gate;
+END $$;
 
 CREATE FUNCTION operation_lock_key(repo uuid, op uuid) RETURNS bigint LANGUAGE sql IMMUTABLE AS $$
     SELECT hashtextextended('rootyard-ref-store-operation-v1/' || repo::text || '/' || op::text, 0)
@@ -105,10 +164,10 @@ BEGIN
             RAISE EXCEPTION 'public operation identifier occupied' USING ERRCODE = '23505';
         END IF;
     ELSIF (OLD.repository_id, OLD.public_id, OLD.issuer_id, OLD.wire_digest, OLD.request_mode, OLD.backend_identity,
-           OLD.realm_id, OLD.restore_incarnation)
+           OLD.realm, OLD.restore_incarnation)
           IS DISTINCT FROM
           (NEW.repository_id, NEW.public_id, NEW.issuer_id, NEW.wire_digest, NEW.request_mode, NEW.backend_identity,
-           NEW.realm_id, NEW.restore_incarnation)
+           NEW.realm, NEW.restore_incarnation)
           OR OLD.state <> 'pending'
           OR NOT ((OLD.current_slot = 0 AND NEW.current_slot = 1 AND NEW.state = 'pending')
                   OR (OLD.current_slot = NEW.current_slot AND NEW.state <> 'pending')) THEN
@@ -125,22 +184,30 @@ BEGIN
         ) THEN
             RAISE EXCEPTION 'rotation requires slot zero history' USING ERRCODE = '23514';
         END IF;
+        IF OLD.current_slot = 0 AND NEW.current_slot = 1 THEN
+            PERFORM lock_stale_gate(OLD);
+        END IF;
     END IF;
     RETURN NEW;
 END $$;
 
 CREATE FUNCTION guard_attempt_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    wrapper public_operations;
 BEGIN
     PERFORM require_operation_lock(NEW.repository_id, NEW.public_id);
     PERFORM require_operation_lock(NEW.repository_id, NEW.private_id);
-    IF NOT EXISTS (SELECT FROM public_operations WHERE (repository_id, public_id) = (NEW.repository_id, NEW.public_id)
-                   AND current_slot = 0 AND state = 'pending') THEN
+    SELECT * INTO wrapper FROM public_operations WHERE (repository_id, public_id) = (NEW.repository_id, NEW.public_id);
+    IF NOT FOUND OR wrapper.current_slot <> 0 OR wrapper.state <> 'pending' THEN
         RAISE EXCEPTION 'wrapper cannot reserve an attempt' USING ERRCODE = '23514';
     END IF;
     IF EXISTS (SELECT FROM public_operations WHERE (repository_id, public_id) = (NEW.repository_id, NEW.private_id))
        OR EXISTS (SELECT FROM ref_store_operations WHERE (repository_id, operation_id) = (NEW.repository_id, NEW.private_id))
        OR EXISTS (SELECT FROM ref_store_cancellations WHERE (repository_id, operation_id) = (NEW.repository_id, NEW.private_id)) THEN
         RAISE EXCEPTION 'private operation identifier occupied' USING ERRCODE = '23505';
+    END IF;
+    IF NEW.slot = 1 THEN
+        PERFORM lock_stale_gate(wrapper);
     END IF;
     RETURN NEW;
 END $$;
@@ -194,6 +261,11 @@ BEGIN
            OR (TG_OP = 'INSERT' AND NEW.state <> 'pending') THEN
             RAISE EXCEPTION 'private operation binding differs' USING ERRCODE = '23514';
         END IF;
+        IF TG_OP = 'UPDATE' AND NEW.state = 'rejected' AND NEW.terminal_result#>>'{rejection,code}' = 'revision_mismatch' THEN
+            IF NEW.terminal_result->'revision' IS DISTINCT FROM to_jsonb((lock_stale_gate(wrapper)).revision) THEN
+                RAISE EXCEPTION 'stale rejection revision differs from the locked gate' USING ERRCODE = '23514';
+            END IF;
+        END IF;
     ELSIF TG_TABLE_NAME = 'ref_store_cancellations' THEN
         IF NOT EXISTS (
             SELECT FROM ref_store_operations o WHERE (o.repository_id, o.operation_id) = (repo, op)
@@ -229,6 +301,7 @@ BEGIN
     SELECT * INTO STRICT wrapper FROM public_operations WHERE (repository_id, public_id) = (repo, public_op);
     FOR attempt IN
         SELECT a.slot, a.base_revision, o.state AS core_state, o.terminal_result, e.event_id, e.outcome, e.payload, e.revision,
+               exact_serving_binding(wrapper, a.private_id, a.plan_digest) AS serving_bound,
                c.operation_id IS NOT NULL AS cancelled
         FROM private_attempts a
         LEFT JOIN ref_store_operations o ON (o.repository_id, o.operation_id) = (a.repository_id, a.private_id)
@@ -236,6 +309,9 @@ BEGIN
         LEFT JOIN ref_store_cancellations c ON (c.repository_id, c.operation_id) = (a.repository_id, a.private_id)
         WHERE (a.repository_id, a.public_id) = (repo, public_op)
     LOOP
+        IF NOT attempt.serving_bound THEN
+            RAISE EXCEPTION 'private attempt lacks exact serving binding' USING ERRCODE = '23514', CONSTRAINT = 'attempt_serving_binding';
+        END IF;
         IF (attempt.cancelled AND attempt.terminal_result IS DISTINCT FROM '{"state":"cancelled","reason":"cancel_requested"}'::jsonb)
            OR attempt.slot > wrapper.current_slot
            OR (attempt.event_id IS NOT NULL AND
@@ -271,7 +347,8 @@ CREATE CONSTRAINT TRIGGER verify_wrapper AFTER INSERT ON ref_store_core_events
 
 -- Internal routing result only. A legacy result delegates to the existing
 -- binding/receipt path. A tombstone alone is a cancel fence, never a replay.
-CREATE FUNCTION lookup_public(repo uuid, op uuid, issuer uuid, wire text, mode text, backend text)
+CREATE FUNCTION lookup_public(repo uuid, op uuid, issuer uuid, wire text, mode text, backend text,
+                              realm core_realm, incarnation uuid)
 RETURNS TABLE (route text, operation_id uuid, state text, event_id uuid) LANGUAGE sql STABLE AS $$
     SELECT CASE
                WHEN a.private_id IS NOT NULL THEN 'private'
@@ -289,6 +366,12 @@ RETURNS TABLE (route text, operation_id uuid, state text, event_id uuid) LANGUAG
     LEFT JOIN public_operations w ON (w.repository_id, w.public_id) = (lookup_key.repository_id, lookup_key.operation_id)
     LEFT JOIN ref_store_operations o ON (o.repository_id, o.operation_id) = (lookup_key.repository_id, lookup_key.operation_id)
     LEFT JOIN ref_store_cancellations c ON (c.repository_id, c.operation_id) = (lookup_key.repository_id, lookup_key.operation_id)
-    CROSS JOIN LATERAL (SELECT (w.issuer_id, w.wire_digest, w.request_mode, w.backend_identity) =
-                               (issuer, wire, mode, backend) AS matches) binding
+    LEFT JOIN ref_store_core_gates g ON g.repository_id = w.repository_id
+    LEFT JOIN modeled_serving_scope s ON s.repository_id = w.repository_id
+    CROSS JOIN LATERAL (
+        SELECT (w.issuer_id, w.wire_digest, w.request_mode, w.backend_identity, w.realm, w.restore_incarnation) =
+               ($3, $4, $5, $6, $7, $8)
+               AND (w.realm, w.restore_incarnation, w.backend_identity) =
+                   (gate_realm(g), s.restore_incarnation, s.backend_identity) AS matches
+    ) binding
 $$;

@@ -24,6 +24,7 @@ VALUES (fixture_id(1), fixture_id(2), 'fixture', 1000);
 INSERT INTO ref_store_core_gates(repository_id, tenant_id, object_format, history_incarnation,
                                  authority_epoch, group_epoch, head_ref, revision)
 VALUES (fixture_id(1), fixture_id(2), 'sha1', fixture_id(3), 1, 1, 'refs/heads/main', 6);
+INSERT INTO modeled_serving_scope VALUES (fixture_id(1), fixture_id(4), repeat('d', 64));
 INSERT INTO ref_store_core_refs(repository_id, ref_name, oid, revision)
 VALUES (fixture_id(1), 'refs/heads/main', repeat('a', 40), 6);
 
@@ -49,8 +50,9 @@ END $$;
 
 CREATE FUNCTION fixture_public(n int) RETURNS void LANGUAGE sql AS $$
     INSERT INTO public_operations(repository_id, public_id, issuer_id, wire_digest, request_mode, backend_identity,
-                                  realm_id, restore_incarnation)
-    VALUES (fixture_id(1), fixture_id(n), fixture_id(2), repeat('a', 64), 'atomic', repeat('d', 64), fixture_id(3), fixture_id(4))
+                                  realm, restore_incarnation)
+    VALUES (fixture_id(1), fixture_id(n), fixture_id(2), repeat('a', 64), 'atomic', repeat('d', 64),
+            ROW(fixture_id(1), fixture_id(2), 'sha1', fixture_id(3), 1, 1)::core_realm, fixture_id(4))
 $$;
 
 CREATE FUNCTION fixture_attempt(public_no int, slot_no int, private_no int) RETURNS void LANGUAGE sql AS $$
@@ -64,6 +66,19 @@ CREATE FUNCTION fixture_operation(n int, digest text DEFAULT repeat('b', 64)) RE
     INSERT INTO ref_store_operations(repository_id, issuer_id, lane, sequence, operation_id, request_digest, state)
     VALUES (fixture_id(1), fixture_id(2), 'fixture', n, fixture_id(n), digest, 'pending')
 $$;
+
+CREATE FUNCTION fixture_bind(n int, parent_digest text, producer_digest text DEFAULT repeat('a', 64))
+RETURNS void LANGUAGE sql AS $$
+    INSERT INTO ref_store_serving_operations(repository_id, operation_id, issuer_id, producer_request_digest, plan_parent_digest)
+    VALUES (fixture_id(1), fixture_id(n), fixture_id(2), producer_digest, parent_digest)
+$$;
+
+-- Exercise the actual 138 and 147 definitions in the same scratch transaction.
+CREATE FUNCTION fixture_serving_operation(n int, parent_digest text DEFAULT repeat('b', 64)) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM fixture_operation(n, parent_digest);
+    PERFORM fixture_bind(n, parent_digest);
+END $$;
 
 CREATE FUNCTION fixture_tombstone(n int) RETURNS void LANGUAGE sql AS $$
     INSERT INTO ref_store_cancellations(repository_id, issuer_id, lane, sequence, operation_id, request_digest)
@@ -88,28 +103,24 @@ $$;
 
 CREATE FUNCTION fixture_stale_reject(n int, event_no int) RETURNS int LANGUAGE plpgsql AS $$
 DECLARE
-    admitted_revision bigint;
-    observed_revision bigint;
-    observed_head text;
+    wrapper public_operations;
+    gate ref_store_core_gates;
     body text;
 BEGIN
-    SELECT base_revision INTO STRICT admitted_revision FROM private_attempts
-        WHERE (repository_id, private_id) = (fixture_id(1), fixture_id(n));
+    SELECT w.* INTO STRICT wrapper FROM public_operations w
+        JOIN private_attempts a ON (a.repository_id, a.public_id, a.slot) = (w.repository_id, w.public_id, w.current_slot)
+        WHERE (a.repository_id, a.private_id) = (fixture_id(1), fixture_id(n)) AND w.state = 'pending';
     PERFORM 1 FROM fixture_a4_usage WHERE repository_id = fixture_id(1) FOR UPDATE;
-    SELECT revision, head_ref INTO STRICT observed_revision, observed_head FROM ref_store_core_gates
-        WHERE repository_id = fixture_id(1) FOR UPDATE;
-    IF observed_revision <= admitted_revision THEN
-        RAISE EXCEPTION 'stale rejection requires an advanced gate' USING ERRCODE = '23514';
-    END IF;
+    gate := lock_stale_gate(wrapper);
     body := format(
         '{"kind":"rejected","repository_id":"%s","revision":%s,"head_ref":%s,"mode":"metadata_only",'
         '"refs":[{"outcome":"not_applied","name":"refs/heads/main","reason":"old_oid_mismatch"}],'
         '"registrations":[],"rejection":{"code":"revision_mismatch","detail":"admitted base was superseded"}}',
-        fixture_id(1), observed_revision, to_json(observed_head));
+        fixture_id(1), gate.revision, to_json(gate.head_ref));
     UPDATE ref_store_operations SET state = 'rejected', terminal_at = clock_timestamp(), terminal_result = body::jsonb
         WHERE (repository_id, operation_id) = (fixture_id(1), fixture_id(n));
     INSERT INTO ref_store_core_events(event_id, repository_id, revision, operation_id, outcome, payload)
-    VALUES (fixture_id(event_no), fixture_id(1), observed_revision, fixture_id(n), 'rejected', body::jsonb);
+    VALUES (fixture_id(event_no), fixture_id(1), gate.revision, fixture_id(n), 'rejected', body::jsonb);
     -- Charge::membership(0, 0, terminal_body_bytes) retains two body copies,
     -- two fixed row overheads and one receipt. The charge uses compact bytes.
     UPDATE fixture_a4_usage SET logical_bytes = logical_bytes + 2 * (256 + octet_length(body)), receipts = receipts + 1
@@ -121,7 +132,7 @@ CREATE FUNCTION fixture_select_next(public_no int, private_no int) RETURNS void 
 BEGIN
     PERFORM fixture_attempt(public_no, 1, private_no);
     UPDATE public_operations SET current_slot = 1 WHERE public_id = fixture_id(public_no);
-    PERFORM fixture_operation(private_no, repeat('d', 64));
+    PERFORM fixture_serving_operation(private_no, repeat('d', 64));
 END $$;
 
 CREATE FUNCTION fixture_finish(public_no int, private_no int, event_no int, revision_no bigint DEFAULT 7,
@@ -159,6 +170,31 @@ BEGIN
     RAISE EXCEPTION 'fixture expected a refusal';
 END $$;
 
+CREATE FUNCTION fixture_state() RETURNS jsonb LANGUAGE sql STABLE AS $$
+    SELECT jsonb_build_array(
+        (SELECT jsonb_agg(v ORDER BY repository_id, public_id) FROM public_operations v),
+        (SELECT jsonb_agg(v ORDER BY repository_id, public_id, slot) FROM private_attempts v),
+        (SELECT jsonb_agg(v ORDER BY repository_id, issuer_id, lane) FROM ref_store_issuer_lanes v),
+        (SELECT jsonb_agg(v ORDER BY repository_id, operation_id) FROM ref_store_operations v),
+        (SELECT jsonb_agg(v ORDER BY repository_id, operation_id) FROM ref_store_serving_operations v),
+        (SELECT jsonb_agg(v ORDER BY repository_id, operation_id) FROM ref_store_cancellations v),
+        (SELECT jsonb_agg(v ORDER BY event_id) FROM ref_store_core_events v),
+        (SELECT jsonb_agg(v ORDER BY repository_id) FROM fixture_a4_usage v),
+        (SELECT jsonb_agg(v ORDER BY repository_id) FROM modeled_serving_scope v),
+        (SELECT jsonb_agg(v ORDER BY repository_id) FROM ref_store_core_gates v),
+        (SELECT jsonb_agg(v ORDER BY repository_id, ref_name) FROM ref_store_core_refs v)
+    )
+$$;
+
+CREATE FUNCTION fixture_refuses_unchanged(statement text, expected_constraint text, expected_state text DEFAULT '23514')
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    before_state jsonb := fixture_state();
+BEGIN
+    PERFORM fixture_refuses(statement, expected_state, expected_constraint);
+    PERFORM fixture_assert(fixture_state() = before_state, 'stale refusal leaves scratch state unchanged');
+END $$;
+
 DO $$
 DECLARE
     repo constant uuid := fixture_id(1);
@@ -166,6 +202,9 @@ DECLARE
     wire constant text := repeat('a', 64);
     request_mode constant text := 'atomic';
     backend constant text := repeat('d', 64);
+    realm constant core_realm := ROW(repo, issuer, 'sha1', fixture_id(3), 1, 1)::core_realm;
+    changed_realm constant core_realm := ROW(repo, issuer, 'sha1', fixture_id(3), 2, 1)::core_realm;
+    incarnation constant uuid := fixture_id(4);
     retired_body_bytes int;
 BEGIN
     PERFORM fixture_refuses('SELECT fixture_public(98)', '55000');
@@ -178,22 +217,28 @@ BEGIN
     PERFORM fixture_refuses('SELECT fixture_public(10)', '23505');
     PERFORM fixture_refuses('SELECT fixture_operation(10, repeat(''e'', 64))', '23514');
     PERFORM fixture_operation(10);
+    PERFORM fixture_refuses_unchanged('SELECT fixture_bind(10, repeat(''e'', 64))', NULL, 'P0001');
+    PERFORM fixture_refuses_unchanged('SELECT fixture_stale_reject(10, 110)', 'stale_serving_binding');
+    PERFORM fixture_lock(20, 21);
+    PERFORM fixture_refuses_unchanged('SELECT fixture_select_next(20, 21)', 'stale_serving_binding');
+    PERFORM fixture_bind(10, repeat('b', 64));
     SET CONSTRAINTS ALL IMMEDIATE;
     SET CONSTRAINTS ALL DEFERRED;
 
     PERFORM fixture_assert((SELECT route = 'wrapper' AND operation_id = fixture_id(20) AND state = 'pending' AND event_id IS NULL
-                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, backend)), 'exact public pending');
+                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, backend, realm, incarnation)),
+                           'exact public pending');
     PERFORM fixture_assert((SELECT route = 'conflict' AND operation_id IS NULL AND state IS NULL
-                            FROM lookup_public(repo, fixture_id(20), issuer, repeat('b', 64), request_mode, backend)),
+                            FROM lookup_public(repo, fixture_id(20), issuer, repeat('b', 64), request_mode, backend, realm, incarnation)),
                            'core digest cannot replay wire');
     PERFORM fixture_assert((SELECT route = 'conflict' AND operation_id IS NULL AND state IS NULL
-                            FROM lookup_public(repo, fixture_id(20), fixture_id(3), wire, request_mode, backend)), 'issuer bound');
+                            FROM lookup_public(repo, fixture_id(20), fixture_id(3), wire, request_mode, backend, realm, incarnation)), 'issuer bound');
     PERFORM fixture_assert((SELECT route = 'conflict' AND operation_id IS NULL AND state IS NULL AND event_id IS NULL
-                            FROM lookup_public(repo, fixture_id(20), issuer, wire, 'accepted_subset', backend)), 'request mode bound');
+                            FROM lookup_public(repo, fixture_id(20), issuer, wire, 'accepted_subset', backend, realm, incarnation)), 'request mode bound');
     PERFORM fixture_assert((SELECT route = 'conflict' AND operation_id IS NULL AND state IS NULL AND event_id IS NULL
-                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, repeat('e', 64))), 'backend bound');
+                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, repeat('e', 64), realm, incarnation)), 'backend bound');
     PERFORM fixture_assert((SELECT route = 'private' AND operation_id IS NULL AND state IS NULL AND event_id IS NULL
-                            FROM lookup_public(repo, fixture_id(10), issuer, wire, request_mode, backend)),
+                            FROM lookup_public(repo, fixture_id(10), issuer, wire, request_mode, backend, realm, incarnation)),
                            'slot zero never reaches legacy lookup');
     PERFORM fixture_refuses('SELECT fixture_operation(20)', '23505');
     PERFORM fixture_refuses('SELECT fixture_tombstone(20)', '23505');
@@ -209,7 +254,8 @@ BEGIN
     PERFORM fixture_core_commit(30);
     PERFORM fixture_event(30, 130);
     PERFORM fixture_tombstone(30);
-    PERFORM fixture_assert((SELECT route = 'legacy_operation' FROM lookup_public(repo, fixture_id(30), issuer, wire, request_mode, backend))
+    PERFORM fixture_assert((SELECT route = 'legacy_operation'
+                            FROM lookup_public(repo, fixture_id(30), issuer, wire, request_mode, backend, realm, incarnation))
                            AND (SELECT state = 'committed' FROM ref_store_operations WHERE operation_id = fixture_id(30)),
                            'cancel after a legacy terminal preserves the replay route');
     PERFORM fixture_refuses('SELECT fixture_public(30)', '23505');
@@ -218,7 +264,7 @@ BEGIN
     PERFORM fixture_lock(40);
     PERFORM fixture_tombstone(40);
     PERFORM fixture_assert((SELECT route = 'legacy_tombstone' AND state IS NULL AND event_id IS NULL
-                            FROM lookup_public(repo, fixture_id(40), issuer, wire, request_mode, backend)),
+                            FROM lookup_public(repo, fixture_id(40), issuer, wire, request_mode, backend, realm, incarnation)),
                            'cancel-before-register is only a fence');
     PERFORM fixture_refuses('SELECT fixture_public(40)', '23505');
     PERFORM fixture_refuses('SELECT fixture_attempt(20, 1, 40)', '23505');
@@ -226,7 +272,8 @@ BEGIN
                                      state, terminal_result, terminal_at)
     VALUES (repo, issuer, 'fixture', 40, fixture_id(40), repeat('b', 64), 'cancelled',
             '{"state":"cancelled","reason":"cancel_before_register"}', clock_timestamp());
-    PERFORM fixture_assert((SELECT route = 'legacy_operation' FROM lookup_public(repo, fixture_id(40), issuer, wire, request_mode, backend))
+    PERFORM fixture_assert((SELECT route = 'legacy_operation'
+                            FROM lookup_public(repo, fixture_id(40), issuer, wire, request_mode, backend, realm, incarnation))
                            AND (SELECT state = 'cancelled' FROM ref_store_operations WHERE operation_id = fixture_id(40)),
                            'registered legacy cancellation delegates to operation replay');
 
@@ -240,8 +287,50 @@ BEGIN
                            'proposed ID already in set is deduplicated');
     PERFORM fixture_refuses('SELECT fixture_attempt(20, 0, 21)', '23505');
     PERFORM fixture_refuses('SELECT fixture_attempt(20, 2, 21)', '23514');
-    PERFORM fixture_refuses('SELECT fixture_stale_reject(10, 110)', '23514');
+    PERFORM fixture_refuses_unchanged('SELECT fixture_stale_reject(10, 110)', 'stale_revision');
     UPDATE ref_store_core_gates SET revision = 7 WHERE repository_id = repo;
+
+    UPDATE ref_store_core_gates SET authority_epoch = 2 WHERE repository_id = repo;
+    PERFORM fixture_refuses_unchanged('SELECT fixture_stale_reject(10, 110)', 'stale_realm');
+    PERFORM fixture_refuses_unchanged('SELECT fixture_select_next(20, 21)', 'stale_realm');
+    PERFORM fixture_assert((SELECT route = 'conflict' AND operation_id IS NULL AND state IS NULL AND event_id IS NULL
+                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, backend, realm, incarnation)),
+                           'current gate realm change fences lookup');
+    UPDATE ref_store_core_gates SET authority_epoch = 1, history_incarnation = fixture_id(5) WHERE repository_id = repo;
+    PERFORM fixture_refuses_unchanged('SELECT fixture_stale_reject(10, 110)', 'stale_realm');
+    PERFORM fixture_refuses_unchanged('SELECT fixture_select_next(20, 21)', 'stale_realm');
+    UPDATE ref_store_core_gates SET history_incarnation = fixture_id(3) WHERE repository_id = repo;
+
+    UPDATE modeled_serving_scope SET restore_incarnation = fixture_id(5) WHERE repository_id = repo;
+    PERFORM fixture_refuses_unchanged('SELECT fixture_stale_reject(10, 110)', 'stale_serving_scope');
+    PERFORM fixture_refuses_unchanged('SELECT fixture_select_next(20, 21)', 'stale_serving_scope');
+    PERFORM fixture_assert((SELECT route = 'conflict' AND operation_id IS NULL AND state IS NULL AND event_id IS NULL
+                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, backend, realm, incarnation)),
+                           'current restore incarnation change fences lookup');
+    UPDATE modeled_serving_scope SET restore_incarnation = incarnation, backend_identity = repeat('e', 64)
+        WHERE repository_id = repo;
+    PERFORM fixture_refuses_unchanged('SELECT fixture_stale_reject(10, 110)', 'stale_serving_scope');
+    PERFORM fixture_refuses_unchanged('SELECT fixture_select_next(20, 21)', 'stale_serving_scope');
+    PERFORM fixture_assert((SELECT route = 'conflict' AND operation_id IS NULL AND state IS NULL AND event_id IS NULL
+                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, backend, realm, incarnation)),
+                           'current backend change fences lookup');
+    UPDATE modeled_serving_scope SET backend_identity = backend WHERE repository_id = repo;
+
+    -- 147 can store a different producer digest, but this wrapper must refuse
+    -- it. A savepoint keeps the deliberately inconsistent admission local.
+    BEGIN
+        PERFORM fixture_lock(80, 81);
+        PERFORM fixture_public(80);
+        PERFORM fixture_attempt(80, 0, 81);
+        PERFORM fixture_operation(81);
+        PERFORM fixture_bind(81, repeat('b', 64), repeat('e', 64));
+        PERFORM fixture_lock(80, 82);
+        PERFORM fixture_refuses_unchanged('SELECT fixture_stale_reject(81, 181)', 'stale_serving_binding');
+        PERFORM fixture_refuses_unchanged('SELECT fixture_select_next(80, 82)', 'stale_serving_binding');
+        RAISE SQLSTATE 'P4201';
+    EXCEPTION WHEN SQLSTATE 'P4201' THEN NULL;
+    END;
+
     PERFORM fixture_refuses('SELECT fixture_select_next(20, 21)', '23514');
     PERFORM fixture_refuses($trial$DO $cancel$
         BEGIN
@@ -259,6 +348,9 @@ BEGIN
                            AND (SELECT state = 'rejected' FROM ref_store_operations WHERE operation_id = fixture_id(10))
                            AND (SELECT outcome = 'rejected' AND revision = 7 AND operation_id = fixture_id(10)
                                 FROM ref_store_core_events WHERE event_id = fixture_id(110))
+                           AND (SELECT count(*) = 2 AND bool_and(producer_request_digest = wire AND plan_parent_digest =
+                                    CASE operation_id WHEN fixture_id(10) THEN repeat('b', 64) ELSE repeat('d', 64) END)
+                                FROM ref_store_serving_operations WHERE operation_id IN (fixture_id(10), fixture_id(21)))
                            AND NOT EXISTS (SELECT FROM ref_store_cancellations WHERE operation_id = fixture_id(10)),
                            'rotation preserves a rejected audit event and leaves public pending');
     PERFORM fixture_assert((SELECT registrations = 2 AND artifacts = 4 AND memberships = 1 AND receipts = 6
@@ -272,13 +364,13 @@ BEGIN
     PERFORM fixture_refuses('SELECT fixture_core_commit(10)', '55000');
     PERFORM fixture_refuses('SELECT fixture_tombstone(10)', '55000');
     PERFORM fixture_assert((SELECT route = 'private' AND operation_id IS NULL AND state IS NULL
-                            FROM lookup_public(repo, fixture_id(21), issuer, wire, request_mode, backend)),
+                            FROM lookup_public(repo, fixture_id(21), issuer, wire, request_mode, backend, realm, incarnation)),
                            'slot one never reaches legacy lookup');
 
     PERFORM fixture_lock(60, 61);
     PERFORM fixture_public(60);
     PERFORM fixture_attempt(60, 0, 61);
-    PERFORM fixture_operation(61);
+    PERFORM fixture_serving_operation(61);
     PERFORM fixture_tombstone(61);
     PERFORM fixture_cancel(61, 'cancel_requested');
     PERFORM fixture_refuses('SELECT fixture_event(61, 161)', '23514');
@@ -294,15 +386,21 @@ BEGIN
     SET CONSTRAINTS ALL DEFERRED;
 
     PERFORM fixture_assert((SELECT route = 'wrapper' AND operation_id = fixture_id(60) AND state = 'cancelled' AND event_id IS NULL
-                            FROM lookup_public(repo, fixture_id(60), issuer, wire, request_mode, backend))
+                            FROM lookup_public(repo, fixture_id(60), issuer, wire, request_mode, backend, realm, incarnation))
                            AND NOT EXISTS (SELECT FROM ref_store_core_events WHERE operation_id = fixture_id(61)),
                            'public cancel has no event');
     PERFORM fixture_refuses('SELECT fixture_event(61, 161)', '55000');
     PERFORM fixture_assert((SELECT route = 'wrapper' AND operation_id = fixture_id(20) AND state = 'committed' AND event_id = fixture_id(121)
-                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, backend))
+                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, backend, realm, incarnation))
                            AND (SELECT count(*) = 2 FROM ref_store_core_events WHERE operation_id IN (fixture_id(10), fixture_id(21)))
                            AND (SELECT operation_id = fixture_id(21) AND outcome = 'committed' FROM ref_store_core_events WHERE event_id = fixture_id(121)),
                            'public terminal links only the winner and retains the retired audit event');
+    PERFORM fixture_assert((SELECT route = 'conflict' AND operation_id IS NULL AND state IS NULL AND event_id IS NULL
+                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, backend, changed_realm, incarnation)),
+                           'terminal replay requires the stored realm');
+    PERFORM fixture_assert((SELECT route = 'conflict' AND operation_id IS NULL AND state IS NULL AND event_id IS NULL
+                            FROM lookup_public(repo, fixture_id(20), issuer, wire, request_mode, backend, realm, fixture_id(5))),
+                           'terminal replay requires the stored restore incarnation');
     PERFORM fixture_refuses('SELECT fixture_event(21, 122)', '55000');
     PERFORM fixture_refuses('UPDATE public_operations SET state = ''cancelled'', event_id = NULL WHERE public_id = fixture_id(20)', '23514');
     PERFORM fixture_refuses('DELETE FROM ref_store_core_events WHERE event_id = fixture_id(121)', '55000');
@@ -310,7 +408,7 @@ BEGIN
     PERFORM fixture_lock(70, 71);
     PERFORM fixture_public(70);
     PERFORM fixture_attempt(70, 0, 71);
-    PERFORM fixture_operation(71);
+    PERFORM fixture_serving_operation(71);
     SET CONSTRAINTS ALL IMMEDIATE;
     SET CONSTRAINTS ALL DEFERRED;
     PERFORM fixture_refuses('UPDATE public_operations SET state = ''committed'', event_id = fixture_id(130) WHERE public_id = fixture_id(70)', '23514');
