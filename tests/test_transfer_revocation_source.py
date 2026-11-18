@@ -530,7 +530,8 @@ class TestGitSourceWitness(unittest.TestCase):
         fd_dir = self.proc / "100" / "fd"
         fd_dir.mkdir(parents=True, exist_ok=True)
         (fd_dir / "5").symlink_to(f"pipe:[{self.pipe_inode}]")
-        _fdinfo(self.proc / "100" / "fdinfo" / "5", pos=0, flags=0, ino=0)
+        _fdinfo(self.proc / "100" / "fdinfo" / "5", pos=0, flags=0,
+                ino=self.pipe_inode)
 
     def _task_files(self, *, fd=1, syscall="1 0x1 0x2 0x10 0x0 0x0 0x0",
                     wchan="pipe_write\n", pipe_inode=None, pgid=200,
@@ -548,7 +549,7 @@ class TestGitSourceWitness(unittest.TestCase):
             link.unlink()
         link.symlink_to(f"pipe:[{pipe_inode}]")
         _fdinfo(self.proc / "200" / "fdinfo" / "1", pos=0,
-                flags=1 if fd == 1 else 2, ino=0)
+                flags=1 if fd == 1 else 2, ino=pipe_inode)
         task_fd_dir = task / "fd"
         task_fd_dir.mkdir(parents=True, exist_ok=True)
         task_link = task_fd_dir / "1"
@@ -556,7 +557,23 @@ class TestGitSourceWitness(unittest.TestCase):
             task_link.unlink()
         task_link.symlink_to(f"pipe:[{pipe_inode}]")
         _fdinfo(task / "fdinfo" / "1", pos=0,
-                flags=1 if fd == 1 else 2, ino=0)
+                flags=1 if fd == 1 else 2, ino=pipe_inode)
+
+    def _sample_running_recheck(self, witness, wchan, *, change=None):
+        self._task_files(wchan=wchan)
+        task_path = self.proc / "200" / "task" / "201" / "stat"
+        read_text = witness._task_text
+
+        def read_then_run(tgid, tid, name):
+            text = read_text(tgid, tid, name)
+            if name == "wchan":
+                _write(task_path, _stat_text(201, "git", state="R", pgid=200, starttime=61))
+                if change is not None:
+                    change()
+            return text
+
+        with mock.patch.object(witness, "_task_text", side_effect=read_then_run):
+            return witness.sample()
 
     def test_sleeping_write_to_owned_stdout_pipe_qualifies(self):
         self.assertTrue(self.witness.bind())
@@ -574,7 +591,7 @@ class TestGitSourceWitness(unittest.TestCase):
 
     def test_missing_wchan_diagnoses_once_and_stays_fatal(self):
         for wchan, state, starttime, expected in (
-            (" \n", "R", 61, "same_writer_running"),
+            (" \n", "D", 61, "same_writer_sleeping_in_stdout_write"),
             ("0\n", "S", 61, "same_writer_sleeping_in_stdout_write"),
             ("0\n", "T", 61, "same_writer_other"),
             ("0\n", "R", 62, "identity_changed"),
@@ -599,6 +616,100 @@ class TestGitSourceWitness(unittest.TestCase):
                 self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_WCHAN)
                 self.assertEqual(report["wchan_shape"], "zero" if wchan.strip() else "empty")
                 self.assertEqual(report["wchan_writer_recheck"], expected)
+
+    def test_running_recheck_rejects_sample_and_requires_a_fresh_pressure_window(self):
+        self.assertTrue(self.witness.bind())
+        writer = self.witness.writer
+        window = revocation_backpressure.SustainedStallWindow(500_000_000)
+        for now_ms in range(20, 521, 20):
+            now = now_ms * 1_000_000
+            window.observe(_window_sample(now, self.witness.sample()["qualified"]), now)
+        self.assertTrue(window.qualified)
+
+        for now, wchan in ((540_000_000, "0\n"), (560_000_000, " \n")):
+            report = self._sample_running_recheck(self.witness, wchan)
+            self.assertFalse(report["qualified"])
+            self.assertFalse(report["source_writer_blocked"])
+            self.assertEqual(report["failure_code"], source.SOURCE_FAILURE_WRITER_RUNNING)
+            self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_NONE)
+            self.assertNotIn("wchan_writer_recheck", report)
+            self.assertIs(self.witness.writer, writer)
+            self.assertFalse(window.observe(_window_sample(now, report["qualified"]), now))
+            self.assertEqual(window.last_reset_reason, "source_unqualified")
+            self.assertEqual(window.samples, [])
+
+        self._task_files()
+        for now_ms in range(580, 1081, 20):
+            now = now_ms * 1_000_000
+            report = self.witness.sample()
+            self.assertTrue(report["qualified"])
+            self.assertEqual(
+                window.observe(_window_sample(now, report["qualified"]), now), now_ms == 1080,
+            )
+        self.assertIs(self.witness.writer, writer)
+
+    def test_running_recheck_with_changed_stat_or_fd_stays_fatal(self):
+        task_stat = self.proc / "200" / "task" / "201" / "stat"
+        for path, changed, expected in (
+            (task_stat, "malformed stat", "unavailable"),
+            (task_stat, _stat_text(202, "git", state="R", pgid=200, starttime=61), "unavailable"),
+            (task_stat, _stat_text(201, "git", state="R", pgid=201, starttime=61), "identity_changed"),
+            (self.proc / "100" / "stat", _stat_text(100, "rootyard", starttime=51), "identity_changed"),
+            (self.proc / "200" / "stat", _stat_text(200, "git", pgid=201, starttime=60), "identity_changed"),
+            (self.proc / "100" / "fdinfo" / "5",
+             "pos: 0\nflags: 01\nino: 700\nmnt_id: 77\n", "identity_changed"),
+            (self.proc / "200" / "fdinfo" / "1",
+             "pos: 0\nflags: 01\nino: 701\nmnt_id: 77\n", "identity_changed"),
+            (self.proc / "200" / "fdinfo" / "1", "malformed fdinfo", "unavailable"),
+        ):
+            with self.subTest(path=path.relative_to(self.proc), changed=changed):
+                self._task_files()
+                original = path.read_text(encoding="utf-8")
+                witness = git_source.GitSourceWitness(
+                    self.service_pid, [self.identity], proc_root=self.proc)
+                self.assertTrue(witness.bind())
+                report = self._sample_running_recheck(
+                    witness, "0\n", change=lambda: _write(path, changed))
+                _write(path, original)
+                self._task_files()
+                self.assertFalse(report["qualified"])
+                self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_WCHAN)
+                self.assertEqual(report["wchan_writer_recheck"], expected)
+                self.assertEqual(witness.sample(), report)
+
+    def test_running_recheck_with_replaced_pipe_stays_fatal(self):
+        self.assertTrue(self.witness.bind())
+        writer_fd = self.proc / "200" / "fd" / "1"
+
+        def replace_pipe():
+            writer_fd.unlink()
+            writer_fd.symlink_to("pipe:[701]")
+
+        report = self._sample_running_recheck(self.witness, "0\n", change=replace_pipe)
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_WCHAN)
+        self.assertEqual(report["wchan_writer_recheck"], "identity_changed")
+        self._task_files()
+        self.assertEqual(self.witness.sample(), report)
+
+    def test_missing_or_undecodable_wchan_file_stays_fatal(self):
+        path = self.proc / "200" / "task" / "201" / "wchan"
+        for contents in (None, b"\xff"):
+            with self.subTest(contents=contents):
+                self._task_files()
+                witness = git_source.GitSourceWitness(
+                    self.service_pid, [self.identity], proc_root=self.proc)
+                self.assertTrue(witness.bind())
+                if contents is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(contents)
+                report = witness.sample()
+                self.assertFalse(report["qualified"])
+                self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_UNOBSERVABLE)
+                self.assertNotIn("wchan_writer_recheck", report)
+                self._task_files()
+                self.assertEqual(witness.sample(), report)
 
     def test_writev_on_owned_stdout_pipe_qualifies(self):
         self._task_files(syscall="20 0x1 0x2 0x3 0x0 0x0 0x0")

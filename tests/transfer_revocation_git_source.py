@@ -82,19 +82,15 @@ class GitSourceWitness:
             "qualified": bool(qualified),
             "failure_code": int(failure_code),
             "fatal_failure_code": int(self.fatal_failure_code),
-            "source_identity_unique": bool(
-                self.writer is not None and not self.fatal_failure_code),
-            "source_pipe_paired": bool(
-                self.writer is not None and not self.fatal_failure_code),
+            "source_identity_unique": bool(self.writer is not None and not self.fatal_failure_code),
+            "source_pipe_paired": bool(self.writer is not None and not self.fatal_failure_code),
             "source_writer_blocked": bool(qualified),
             "source_proof_kind_code": int(self.proof_kind),
-            "source_pipe_full": (
-                self.proof_kind == SOURCE_PROOF_KIND_OWNED_STDOUT_PIPE_FULL),
-            "source_writer_starttime": (
-                int(self.writer.starttime) if self.writer is not None else 0),
-            "source_syscall_kind_code": (
-                1 if self.writer is not None and self.writer.syscall_kind == "write"
-                else 2 if self.writer is not None else 0),
+            "source_pipe_full": self.proof_kind == (
+                SOURCE_PROOF_KIND_OWNED_STDOUT_PIPE_FULL),
+            "source_writer_starttime": int(
+                self.writer.starttime) if self.writer is not None else 0,
+            "source_syscall_kind_code": 1 if self.writer is not None and self.writer.syscall_kind == "write" else 2 if self.writer is not None else 0,
             **self._wchan_diagnostic,
         }
         return report
@@ -125,10 +121,8 @@ class GitSourceWitness:
         return pipes
 
     def _tasks_for_group(self, table, group):
-        members = [
-            process.pid for process in table.values()
-            if process.pgid == group.pgid and process.live
-        ]
+        members = [p.pid for p in table.values()
+                   if p.pgid == group.pgid and p.live]
         for tgid in sorted(members):
             task_dir = self.proc_root / str(tgid) / "task"
             try:
@@ -139,20 +133,25 @@ class GitSourceWitness:
                 if entry.name.isdigit():
                     yield tgid, int(entry.name)
 
-    def _task_stat(self, tgid, tid):
-        path = self.proc_root / str(tgid) / "task" / str(tid) / "stat"
+    def _read_stat(self, path, expected_pid):
         try:
-            return parse_proc_stat(path.read_text(encoding="utf-8"), pid=tid)
+            task = parse_proc_stat(path.read_text(encoding="utf-8"))
+            if task.pid != expected_pid: raise ValueError("PID mismatch")
+            return task
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as error:
             raise SourceParseError("task metadata unavailable") from error
 
+    def _task_stat(self, tgid, tid):
+        path = self.proc_root / str(tgid) / "task" / str(tid) / "stat"
+        return self._read_stat(path, tid)
+
     def _task_text(self, tgid, tid, name):
         path = self.proc_root / str(tgid) / "task" / str(tid) / name
         try:
             return path.read_text(encoding="utf-8")
-        except OSError as error:
+        except (OSError, UnicodeDecodeError) as error:
             raise SourceParseError(f"task {name} unavailable") from error
 
     def _syscall_state(self, text):
@@ -174,10 +173,8 @@ class GitSourceWitness:
 
     def _wchan_kind(self, tgid, tid):
         text = self._task_text(tgid, tid, "wchan").strip()
-        if not text:
-            return "empty"
-        if text == "0":
-            return "zero"
+        if not text: return "empty"
+        if text == "0": return "zero"
         try:
             parse_wchan(text)
         except SourceParseError:
@@ -185,11 +182,8 @@ class GitSourceWitness:
         return "pipe_write"
 
     def _candidate(self, tgid, tid, group, read_pipes, task=None):
-        if task is None:
-            task = self._task_stat(tgid, tid)
-            if task is None:
-                return None
-        if task.pgid != group.pgid:
+        task = task or self._task_stat(tgid, tid)
+        if task is None or task.pgid != group.pgid:
             return None
         fd_path = self.proc_root / str(tgid) / "fd" / "1"
         try:
@@ -209,14 +203,10 @@ class GitSourceWitness:
                 or (fd_info.flags & os.O_NONBLOCK)):
             return None
         matches = [fd for fd, inode in read_pipes if inode == pipe_inode]
-        if len(matches) != 1:
-            return None
-        if task.state not in ("S", "D"):
+        if len(matches) != 1 or task.state not in ("S", "D"):
             return None
         state = self._syscall_state(self._task_text(tgid, tid, "syscall"))
-        if state in ("running", "other"):
-            return None
-        if state.fd != 1 or state.count <= 0:
+        if state in ("running", "other") or state.fd != 1 or state.count <= 0:
             return None
         wchan_kind = self._wchan_kind(tgid, tid)
         service_dev = -1
@@ -241,9 +231,7 @@ class GitSourceWitness:
         candidates = []
         for tgid, tid in self._tasks_for_group(table, group):
             candidate = self._candidate(
-                tgid, tid, group, read_pipes,
-                task=prefetched.get((tgid, tid)),
-            )
+                tgid, tid, group, read_pipes, prefetched.get((tgid, tid)))
             if candidate is not None:
                 candidates.append(candidate)
         return candidates
@@ -295,11 +283,25 @@ class GitSourceWitness:
     def _recheck_wchan_writer(self, writer, group):
         try:
             task = self._task_stat(writer.tgid, writer.tid)
-            if task is None:
-                return "unavailable"
+            if task is None: return "unavailable"
             if task.starttime != writer.starttime or task.pgid != group.pgid:
                 return "identity_changed"
             if task.state == "R":
+                service = self._read_stat(
+                    self.proc_root / str(self.service_pid) / "stat", self.service_pid)
+                leader = self._read_stat(
+                    self.proc_root / str(group.leader_pid) / "stat", group.leader_pid)
+                if service is None or leader is None:
+                    return "unavailable"
+                if (service.starttime != self.service_identity.starttime or not service.live
+                        or leader.starttime != group.leader_starttime
+                        or leader.pgid != group.pgid or not leader.live):
+                    return "identity_changed"
+                pipe_failure = self._pipe_failure(writer, verify_fdinfo_inode=True)
+                if pipe_failure == SOURCE_FAILURE_PIPE:
+                    return "identity_changed"
+                if pipe_failure:
+                    return "unavailable"
                 return "same_writer_running"
             if task.state in ("S", "D"):
                 state = self._syscall_state(self._task_text(writer.tgid, writer.tid, "syscall"))
@@ -309,8 +311,36 @@ class GitSourceWitness:
             return "unavailable"
         return "same_writer_other"
 
+    def _pipe_failure(self, writer, *, task_fd=False, verify_fdinfo_inode=False,
+                      verify_dev=False):
+        pid = f"{writer.tgid}/task/{writer.tid}" if task_fd else writer.tgid
+        try:
+            pipe_inode = read_pipe_inode(self.proc_root, pid, 1)
+            fd_info = read_fdinfo(self.proc_root, pid, 1)
+            service_info = read_fdinfo(
+                self.proc_root, self.service_pid, writer.service_fd)
+            service_inode = read_pipe_inode(
+                self.proc_root, self.service_pid, writer.service_fd)
+            service_pipe = (
+                _read_pipe_stat(self.proc_root, self.service_pid, writer.service_fd)
+                if verify_dev and writer.service_dev >= 0 else None)
+        except (OSError, SourceParseError):
+            return SOURCE_FAILURE_UNOBSERVABLE
+        if (pipe_inode != writer.pipe_inode
+                or service_inode != writer.pipe_inode
+                or (service_pipe is not None
+                    and (service_pipe.dev != writer.service_dev
+                         or service_pipe.ino != writer.pipe_inode))
+                or (fd_info.flags & os.O_ACCMODE) != os.O_WRONLY
+                or (fd_info.flags & os.O_NONBLOCK)
+                or (service_info.flags & os.O_ACCMODE) != os.O_RDONLY):
+            return SOURCE_FAILURE_PIPE
+        if verify_fdinfo_inode and (fd_info.ino != pipe_inode
+                                    or service_info.ino != service_inode):
+            return SOURCE_FAILURE_PIPE
+        return SOURCE_FAILURE_NONE
+
     def _audit_bound(self, group, writer):
-        """Verify the whole owned writer identity immediately around a probe."""
         if not verify_service_identity(self.service_identity, proc_root=self.proc_root):
             return "fatal", SOURCE_FAILURE_IDENTITY, None
         try:
@@ -323,44 +353,19 @@ class GitSourceWitness:
                 or leader.pgid != group.pgid
                 or leader.starttime != group.leader_starttime):
             return "fatal", SOURCE_FAILURE_IDENTITY, None
-        service_matches = [
-            fd for fd, inode in read_pipes if inode == writer.pipe_inode
-        ]
+        service_matches = [fd for fd, inode in read_pipes
+                           if inode == writer.pipe_inode]
         if service_matches != [writer.service_fd]:
             return "fatal", SOURCE_FAILURE_PIPE, None
         try:
             task = self._task_stat(writer.tgid, writer.tid)
         except SourceParseError:
             return "fatal", SOURCE_FAILURE_UNOBSERVABLE, None
-        if task is None:
+        if task is None or task.starttime != writer.starttime or task.pgid != group.pgid:
             return "fatal", SOURCE_FAILURE_TASK, None
-        if task.starttime != writer.starttime or task.pgid != group.pgid:
-            return "fatal", SOURCE_FAILURE_TASK, None
-        task_fd = f"{writer.tgid}/task/{writer.tid}"
-        try:
-            pipe_inode = read_pipe_inode(self.proc_root, task_fd, 1)
-            fd_info = read_fdinfo(self.proc_root, task_fd, 1)
-            service_info = read_fdinfo(
-                self.proc_root, self.service_pid, writer.service_fd
-            )
-            service_inode = read_pipe_inode(
-                self.proc_root, self.service_pid, writer.service_fd
-            )
-            service_pipe = (
-                _read_pipe_stat(self.proc_root, self.service_pid, writer.service_fd)
-                if writer.service_dev >= 0 else None
-            )
-        except SourceParseError:
-            return "fatal", SOURCE_FAILURE_UNOBSERVABLE, None
-        if (pipe_inode != writer.pipe_inode
-                or service_inode != writer.pipe_inode
-                or (service_pipe is not None
-                    and (service_pipe.dev != writer.service_dev
-                         or service_pipe.ino != writer.pipe_inode))
-                or (fd_info.flags & os.O_ACCMODE) != os.O_WRONLY
-                or (fd_info.flags & os.O_NONBLOCK)
-                or (service_info.flags & os.O_ACCMODE) != os.O_RDONLY):
-            return "fatal", SOURCE_FAILURE_PIPE, None
+        pipe_failure = self._pipe_failure(writer, task_fd=True, verify_dev=True)
+        if pipe_failure:
+            return "fatal", pipe_failure, None
         if task.state not in ("S", "D"):
             return "transient", SOURCE_FAILURE_WRITER_RUNNING, None
         try:
@@ -373,9 +378,7 @@ class GitSourceWitness:
             return "transient", SOURCE_FAILURE_NO_BLOCKED_WRITER, None
         try:
             candidates = self._census(
-                table, group, read_pipes,
-                prefetched={(writer.tgid, writer.tid): task},
-            )
+                table, group, read_pipes, {(writer.tgid, writer.tid): task})
         except (OSError, SourceParseError):
             return "fatal", SOURCE_FAILURE_UNOBSERVABLE, None
         if not candidates:
@@ -392,10 +395,7 @@ class GitSourceWitness:
         return "ok", SOURCE_FAILURE_NONE, candidate
 
     def _apply_audit_failure(self, status, code):
-        if status == "fatal":
-            self._fatal(code)
-        else:
-            self._transient(code)
+        (self._fatal if status == "fatal" else self._transient)(code)
         return False
 
     def _sample_writer(self, group):
@@ -416,6 +416,9 @@ class GitSourceWitness:
             self._transient(SOURCE_FAILURE_NO_BLOCKED_WRITER)
             return False
         recheck = self._recheck_wchan_writer(writer, group)
+        if recheck == "same_writer_running":
+            self._transient(SOURCE_FAILURE_WRITER_RUNNING)
+            return False
         if (candidate.wchan_kind == "empty"
                 or recheck != "same_writer_sleeping_in_stdout_write"):
             self._fatal(SOURCE_FAILURE_WCHAN)
@@ -424,17 +427,13 @@ class GitSourceWitness:
                 "wchan_writer_recheck": recheck,
             }
             return False
-        # Exactly a literal zero wchan, and the same writer is still sleeping
-        # in a positive stdout write.  writev's third field is an iovec count,
-        # so only write(fd=1,count>0) may use the full-pipe proof.
+        # Literal zero: only a real write(fd=1,count>0) may prove fullness.
         if candidate.syscall_kind != "write":
             self._transient(SOURCE_FAILURE_SYSCALL)
             return False
         result = observe_owned_stdout_pipe_full(
             self.proc_root, self.service_pid, writer.service_fd,
-            expected_dev=writer.service_dev,
-            expected_ino=writer.pipe_inode,
-        )
+            expected_dev=writer.service_dev, expected_ino=writer.pipe_inode)
         if result == PIPE_FULL_MISMATCH:
             self._fatal(SOURCE_FAILURE_PIPE)
             return False
