@@ -61,8 +61,8 @@ class ParallelBoundariesTest(unittest.TestCase):
             {f'{schema_baseline.LATEST_PREFIX}_{name}.json'
              for name in ('catalog', 'restored_catalog', 'upgraded_catalog')},
             'current format must freeze the newest schema catalog fixtures')
-        self.assertRegex(
-            catalog_rs, schema_baseline.backup_format_arm(current) + r' Ok\(crate::db::SCHEMA_VERSIONS\.to_vec\(\)\)',
+        self.assertEqual(
+            schema_baseline.backup_schema_versions(catalog_rs, current), schema_baseline.SCHEMA_VERSIONS,
             'current format must consume exactly the migrations embedded in this binary')
         restore_rs = (ROOT / 'src/backup/restore.rs').read_text()
         legacy_formats = {
@@ -72,6 +72,78 @@ class ParallelBoundariesTest(unittest.TestCase):
         self.assertNotIn(
             current, legacy_formats,
             'the current format must stay rejected without a legacy schema opt-in')
+
+    def test_backup_formats_29_and_30_keep_the_schema_151_roster(self):
+        catalog_rs = (ROOT / 'src/backup/catalog.rs').read_text()
+        schema_151 = [version for version in schema_baseline.SCHEMA_VERSIONS if version <= 151]
+        for format in (29, 30):
+            with self.subTest(format=format):
+                self.assertEqual(schema_baseline.backup_schema_versions(catalog_rs, format, schema_151 + [152]), schema_151)
+
+    def test_schema_152_archive_formats_preserve_frozen_catalogs_and_layouts(self):
+        backup = ROOT / 'src/backup'
+        catalog = (backup / 'catalog.rs').read_text()
+        for format, version in ((29, 151), (30, 151), (31, 152), (32, 152)):
+            with self.subTest(format=format):
+                arm = re.search(schema_baseline.backup_format_arm(format) + r' \[(.*?)\n\s*\],', catalog, re.S)
+                self.assertIsNotNone(arm)
+                self.assertEqual(re.findall(r'schema/([^"/]+\.json)', arm.group(1)), [
+                    f'{version}_{suffix}.json' for suffix in ('catalog', 'restored_catalog', 'upgraded_catalog')
+                ])
+                self.assertEqual(schema_baseline.backup_schema_versions(catalog, format, [151, 152, 153]),
+                                 [item for item in (151, 152, 153) if item <= version])
+        self.assertRegex(catalog, r'fn is_paired\(format: u32\) -> bool\s*\{\s*matches!\(format, 28 \| 30 \| FORMAT_PAIRED\)')
+        self.assertIn('if served > 0 { FORMAT_PAIRED } else { FORMAT }', (backup / 'snapshot.rs').read_text())
+        self.assertIn('format if catalog::is_paired(format)', (backup / 'restore/verify.rs').read_text())
+        restore = (backup / 'restore.rs').read_text()
+        self.assertIn('let paired = catalog::is_paired(manifest.format);', restore)
+        self.assertIn('manifest.format >= 6 && !paired', restore)
+        self.assertIn('if paired {', restore)
+
+    def test_schema_152_cancellation_acl_is_checked_before_publication(self):
+        backup = ROOT / 'src/backup'
+        catalog = (backup / 'catalog.rs').read_text()
+        self.assertRegex(catalog, r'fn has_public_attempts\(format: u32\) -> bool\s*\{\s*matches!\(format, 31 \| 32\)')
+        signature = 'public.rootyard_ref_store_private_cancellation_evidence()'
+        postgres = (backup / 'postgres.rs').read_text()
+        self.assertIn(f'let signature = "{signature}";', postgres)
+        self.assertIn('p.oid = pg_catalog.to_regprocedure($1)', postgres)
+        self.assertIn('&[&signature]', postgres)
+        self.assertIn('p.prosecdef AND NOT EXISTS', postgres)
+        self.assertIn("COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))", postgres)
+        self.assertIn("acl.grantee = 0::pg_catalog.oid AND acl.privilege_type = 'EXECUTE'", postgres)
+        self.assertRegex(postgres, r'if catalog::has_public_attempts\(format\) \{\s*verify_public_attempt_cancellation_acl\(client\).await\?;')
+        snapshot = (backup / 'snapshot.rs').read_text()
+        self.assertLess(snapshot.index('schema(&tx, format).await?'), snapshot.index('pg_export_snapshot()'))
+        restore = (backup / 'restore.rs').read_text()
+        acl_steps = (
+            '"--no-privileges"',
+            'checked(&mut restore).await?;',
+            'if catalog::has_public_attempts(manifest.format)',
+            f'REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC',
+            'schema(&client, manifest.format).await?',
+            'crate::db::migrate_client(&mut upgraded).await?',
+            'schema(&upgraded, super::catalog::FORMAT).await?',
+            'publish(&staging, &target)?;',
+        )
+        positions = [restore.index(step) for step in acl_steps]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(restore.count('REVOKE EXECUTE'), 1)
+        clone = (ROOT / 'tests/backup_blob_serving147.py').read_text().split('    def quarantined_copy(', 1)[1]
+        self.assertLess(clone.index('"--no-privileges"'), clone.index('REVOKE EXECUTE ON FUNCTION'))
+        self.assertLess(clone.index(f'{signature} FROM PUBLIC'), clone.index('input=corruption_sql(case)'))
+
+    def test_paired_refstore_carry_uses_the_archive_format(self):
+        backup = ROOT / 'src/backup'
+        self.assertIn('for table in catalog::relations(format, true)?', (backup / 'ledger.rs').read_text())
+        self.assertRegex(
+            (backup / 'snapshot.rs').read_text(),
+            r'if format == FORMAT_PAIRED\s*\{\s*Some\(ledger::carry\(&tx, format, until\)\.await\?\)',
+        )
+        self.assertRegex(
+            (backup / 'restore.rs').read_text(),
+            r'ledger::carry\(\s*&client,\s*manifest\.format,[^;]+?\)\s*\.await\?\s*\) == manifest\.refstore',
+        )
 
     def test_backup_tables_match_schema_baseline(self):
         # The backup now consumes the frozen catalog directly. Native schema

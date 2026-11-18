@@ -1,11 +1,19 @@
 # 状态服务：当前模式、拒绝边界与历史 W0 归档
 
-> 状态（2026-11-14）：本页区分**当前代码可运行模式**与**冻结的 W0 历史归档**。
+> 状态（2026-11-18）：本页区分**当前代码可运行模式**与**冻结的 W0 历史归档**。
 > 当前默认仍是 legacy `rootyard serve`（GitFS/PG，既有可选 Pando 路径）；显式候选
 > `rootyard serve-blob` 已使用 PostgreSQL 业务库、PG RefStore 和远程 OpenDAL Blob；
 > 分布式 Raft Ref-CAS 仍是 **PROPOSED**，未在运行时可选择。`serve-blob` 不是默认入口；
 > 默认入口切换由 [#148](https://github.com/jihuayu/rootyard/issues/148) 单独跟踪，不是
-> #106 契约/基线的前置循环。**#106 保持 OPEN；本页不声称完整验收或生产资格。**
+> #106 契约/基线的前置循环。**#106 的契约/模式基线已完成并关闭；#107 原始单机 PG
+> 范围已实现并随 [PR #256](https://github.com/jihuayu/rootyard/pull/256) 合并为
+> `5107e59d9054994af1fa3a659bc944eda79cd691`（tree
+> `ae6ee6df591f2c5f8edafcd38b044e20023a47f9`），在精确 head
+> `01c228dc3d668477fe781d9c7895669cb080931e`/tree
+> `ac68474f276f5b30173c2da461f8f00eec7c80e6` 通过 HTTP13/native11 资格验收；合并树
+> 本身未单独重跑，本文档收口后关闭
+> [#107](https://github.com/jihuayu/rootyard/issues/107)。本页仍不声称默认入口切换、
+> 分布式、LFS/PR/Workspace/CI producer、HA/restore/GC 或完整目标架构。**
 
 规范以 [第 12 章](../12-state-services.md) 和 [ADR](../../architecture.md) 为准；下面的
 “当前模式/拒绝边界”以实际代码为准，历史 W0 JSON/config 只作为归档输入。
@@ -157,8 +165,21 @@ python3 scripts/state_services_baseline.py \
 Raft、Redis 测量全部 `unavailable`。独立的有界 root baseline 见上文，不与本地 Git
 smoke 混算。
 
-## 明确未完成（#106 保持 OPEN）
+## 明确未完成（#106 基线已完成；#107 原始单机 PG 范围已验收）
 
+- #106 的契约/模式基线已完成并关闭；#107 原始单机 PG 范围已实现并随
+  [PR #256](https://github.com/jihuayu/rootyard/pull/256) 合并为
+  `5107e59d9054994af1fa3a659bc944eda79cd691`（tree
+  `ae6ee6df591f2c5f8edafcd38b044e20023a47f9`），在精确 head
+  `01c228dc3d668477fe781d9c7895669cb080931e`/tree
+  `ac68474f276f5b30173c2da461f8f00eec7c80e6` 上通过 HTTP13（4 suites/13
+  cases）与 Native11（11 targets/167 cases/0 skips）资格验收，collaborator
+  transport 20/20（[CI run](https://github.com/jihuayu/rootyard/actions/runs/44122210788)、
+  [Native11/HTTP13 run](https://github.com/jihuayu/rootyard/actions/runs/44122210645)）；
+  合并树本身未单独重跑，本文档收口后关闭
+  [#107](https://github.com/jihuayu/rootyard/issues/107)。默认入口 #148、分布式
+  #115、LFS/PR/Workspace/CI producer、HA/restore/GC、S4 与 release #123 等仍按
+  各自计划推进。
 - 默认入口仍是 legacy `serve`；standalone/Blob-only 入口切换由 #148 单独跟踪，
   不是 #106 的前置循环。
 - `serve-blob` 已是候选入口，但默认入口替换、LFS/PR/Workspace/CI 接入、完整业务
@@ -168,4 +189,4 @@ smoke 混算。
 - Fresh restore、HA、多主机/多故障域、容量成本、GC 和完整 producer coverage
   仍未验收；物理 Blob 删除保持关闭。
 - 历史 d689bf8/v5 legacy Pando 基线和历史 W0 deployment-contract/config 不等于
-  target/new deployment；#106 不能因本页或基线证据而标为 complete/closed。
+  target/new deployment；这些冻结归档只保留历史语义，不能作为 #107 的资格证据。

@@ -174,6 +174,7 @@ pub(super) type RefStoreCarry = BTreeMap<String, TableDigest>;
 /// retains one bounded row instead of copying the operation history to RAM.
 pub(super) async fn carry(
     client: &(impl GenericClient + Sync),
+    format: u32,
     deadline: tokio::time::Instant,
 ) -> Result<RefStoreCarry> {
     use futures_util::TryStreamExt;
@@ -188,7 +189,7 @@ pub(super) async fn carry(
         }
     }
     let mut result = BTreeMap::new();
-    for table in catalog::relations(FORMAT, true)?
+    for table in catalog::relations(format, true)?
         .into_iter()
         .filter(|name| name.starts_with("ref_store_") || name.starts_with("artifact_hold"))
     {

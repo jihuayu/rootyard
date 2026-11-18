@@ -2,7 +2,8 @@
 use anyhow::{Result, anyhow, ensure};
 use rootyard::blob_store::config::BlobProfile;
 use rootyard::blob_store::opendal::BlobStore;
-use rootyard::ref_store::core::retention_root::PgRetentionRoots;
+use rootyard::ref_store::core::retention_root::{PgRetentionRoots, RootPurpose};
+use rootyard::ref_store::serving::PgServingRetentionRoots;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -49,9 +50,10 @@ pub async fn run(options: &Options) -> Result<Value> {
         producer_identity.id == producer && producer != tenant,
         "the pack producer/issuer is not a distinct real user from the repository tenant"
     );
-    // The producer is a collaborator with `write`, through the owner's real HTTP
-    // route, before any of its packs commits: the decision-gated `select`
-    // resolves exactly this live role and refuses anything lower.
+    // The producer is a collaborator with `admin` through the owner's real HTTP
+    // route before any of its packs or actor-owned facade calls. The added
+    // actor-owned snapshot/root paths preserve the existing Admin gate; separate
+    // HTTP/Write cases remain the write-authorization boundary proof.
     let collaborator = grant_producer(&http, &owner_user.token, &owner.username, &producer_user).await?;
     let (target, fixture) = repo::open(&db, repo_id, tenant, &options.git).await?;
     // The pack producer (durable hold/publication/acquirer owner) is the real
@@ -74,64 +76,85 @@ pub async fn run(options: &Options) -> Result<Value> {
     };
     // Diagnostic only: an unchanged typed error behind this boundary names the
     // A5 snapshot step and the verified gate revision it expects.
-    let snapshot = repo::producer_snapshot(&db, &verified, producer, ROOT_SLOTS).await.map_err(|error| {
-        anyhow!("stage=producer_snapshot expected_revision={}: {error:#}", verified.gate.revision())
-    })?;
-    let source = repo::as_source(&snapshot);
+    let snapshot =
+        repo::producer_snapshot(&db, &store, &verified, &producer_identity, &owner.username, "bound", ROOT_SLOTS)
+            .await
+            .map_err(|error| {
+                anyhow!("stage=producer_snapshot expected_revision={}: {error:#}", verified.gate.revision())
+            })?;
 
-    // 3. Roots registered by the same producer owner as the snapshot/pin.
-    let adapter = PgRetentionRoots::new(store.clone(), options.git.clone())
-        .map_err(|error| anyhow!("retention roots adapter rejected the Blob/Git configuration: {error:?}"))?;
-    let scope = roots::producer_scope(repo_id, tenant, producer, &verified.gate)?;
+    // 3. Two roots through the actor-owned serving facade. The facade derives
+    //    stable ids and the producer owner from the authenticated actor; both
+    //    are created while the A5 source pin is live.
+    let adapter = PgServingRetentionRoots::new(
+        PgRetentionRoots::new(store.clone(), options.git.clone())
+            .map_err(|error| anyhow!("retention roots adapter rejected the Blob/Git configuration: {error:?}"))?,
+    );
     let mut root_rows = Vec::new();
-    for state in ["active", "released"] {
-        let root_id = Uuid::new_v4();
-        let operation_id = Uuid::new_v4();
-        let ids = roots::RootRequestIds { root_id, operation_id, request_id: Uuid::new_v4() };
-        let candidate = roots::prepare(&adapter, &db.pool, scope, &source, ids, deadline())
+    for (state, create_key, release_key) in
+        [("active", "format22-active", None), ("released", "format22-released", Some("format22-released-root"))]
+    {
+        let create = roots::create_input(&owner.username, "bound", snapshot.snapshot_id, create_key);
+        let receipt = adapter
+            .create_actor_owned(&db.pool, &producer_identity, create, deadline())
             .await
-            .map_err(|error| anyhow!("{state} root prepare refused: {error:?}"))?;
-        ensure!(candidate.pack_count() == PACKS, "a root candidate does not cover every registered pack");
-        let register_digest = candidate.register_digest().as_hex();
-        let receipt = roots::register(&adapter, &db.pool, candidate, Uuid::new_v4(), deadline())
-            .await
-            .map_err(|error| anyhow!("{state} root register refused: {error:?}"))?;
-        if state == "released" {
-            let release_digest = marker::release_digest("format22-released");
-            let request = roots::ReleaseRequest {
-                scope,
-                root_id,
-                request_id: Uuid::new_v4(),
-                expected_register_digest: &register_digest,
-                release_digest: &release_digest,
-            };
-            let released = roots::release(&adapter, &db.pool, request, deadline())
+            .map_err(|error| anyhow!("{state} actor-owned root create refused: {error:?}"))?;
+        ensure!(receipt.state() == "active" && !receipt.replayed(), "the {state} root is not a fresh active capture");
+        ensure!(
+            receipt.owner_id() == producer && receipt.tenant_id() == tenant,
+            "the {state} root receipt owner/tenant differs"
+        );
+        let root_id = receipt.root_id();
+        if let Some(release_key) = release_key {
+            let release =
+                roots::release_input(&owner.username, "bound", root_id, release_key, "operator released retained root");
+            let released = adapter
+                .release_actor_owned(&db.pool, &producer_identity, release, deadline())
                 .await
-                .map_err(|error| anyhow!("released root release refused: {error:?}"))?;
-            ensure!(released.state() == "released", "the released root did not reach released");
-        } else {
+                .map_err(|error| anyhow!("released actor-owned root release refused: {error:?}"))?;
             ensure!(
-                receipt.state() == "active" && !receipt.replayed(),
-                "the active root is not a fresh active capture"
+                released.state() == "released"
+                    && released.root_id() == root_id
+                    && released.owner_id() == producer
+                    && released.tenant_id() == tenant,
+                "the released root did not reach the same actor-owned released terminal"
             );
         }
+        let read = roots::read_input(&owner.username, "bound", root_id);
+        let record = adapter
+            .metadata_actor_owned(&db.pool, &producer_identity, read, deadline())
+            .await
+            .map_err(|error| anyhow!("{state} actor-owned root metadata refused: {error:?}"))?
+            .ok_or_else(|| anyhow!("{state} actor-owned root metadata is absent"))?;
+        roots::ensure_root_id(root_id, record.root_id())?;
+        ensure!(
+            record.owner_id() == producer
+                && record.tenant_id() == tenant
+                && record.state() == state
+                && record.purpose() == RootPurpose::Backup
+                && record.source_snapshot_id() == snapshot.snapshot_id
+                && record.pack_count() == PACKS,
+            "{state} root record owner/tenant/source/pack shape differs"
+        );
         root_rows.push(json!({
-            "root_id": root_id.to_string(),
-            "operation_id": operation_id.to_string(),
-            "state": state,
-            "tenant_id": tenant.to_string(),
-            "owner_id": producer.to_string(),
-            "register_digest": register_digest,
+            "root_id": record.root_id().to_string(),
+            "operation_id": record.operation_id().to_string(),
+            "state": record.state(),
+            "tenant_id": record.tenant_id().to_string(),
+            "owner_id": record.owner_id().to_string(),
+            "register_digest": record.register_digest_hex(),
         }));
     }
-    // The source pin is released, but the pin is not what retains the packs:
-    // the immutable snapshot descriptor survives (migration 143 keeps
-    // `snapshot_packs` with the snapshot), so both roots and that retained
-    // snapshot still declare every registration; the transient serving read
-    // below adds the third declaring set.
-    repo::release_snapshot_pin(&db, &snapshot, &verified.gate).await.map_err(|error| {
-        anyhow!("stage=release_snapshot_pin expected_revision={}: {error:#}", verified.gate.revision())
-    })?;
+    // The source pin is released through the actor-owned snapshot facade, but
+    // the pin is not what retains the packs: the immutable snapshot descriptor
+    // survives (migration 143 keeps `snapshot_packs` with the snapshot), so both
+    // roots and that retained snapshot still declare every registration; the
+    // transient serving read below adds the third declaring set.
+    repo::release_snapshot_pin(&db, &store, &producer_identity, &owner.username, "bound", &snapshot, &verified.gate)
+        .await
+        .map_err(|error| {
+            anyhow!("stage=release_snapshot_pin expected_revision={}: {error:#}", verified.gate.revision())
+        })?;
 
     // 3b. One nonempty transient serving read by the third real user, over the
     //     same verified gate, captured only by the production
@@ -190,8 +213,8 @@ pub async fn run(options: &Options) -> Result<Value> {
     };
     let marker = json!({
         "kind": marker::KIND,
-        "format": 28,
-        "schema_version": 150,
+        "format": 32,
+        "schema_version": 152,
         "bound_repository_id": repo_id.to_string(),
         "empty_repository_id": empty.to_string(),
         "unrelated_repository_id": unrelated.to_string(),

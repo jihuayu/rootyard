@@ -7003,7 +7003,7 @@ class SchemaBoundaryIntegrationFixture:
             raise AssertionError(
                 f"backup format {fmt} must consume the latest frozen catalogs {expected_includes}, got {includes}"
             )
-        if not re.search(schema_baseline.backup_format_arm(fmt) + r"\s*Ok\(crate::db::SCHEMA_VERSIONS\.to_vec\(\)\)", catalog_src):
+        if schema_baseline.backup_schema_versions(catalog_src, fmt) != schema_baseline.SCHEMA_VERSIONS:
             raise AssertionError(f"backup format {fmt} must accept every SCHEMA_VERSIONS migration")
 
         # catalog::relations() is the single source of the locked relation list:

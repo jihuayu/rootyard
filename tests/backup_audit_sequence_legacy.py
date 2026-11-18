@@ -551,7 +551,7 @@ class AuditSequenceLegacyHarness(BackupHarness):
         self.stop()
         self.backup_result = json.loads(self.backup_command().stdout)
         manifest = json.loads((self.backup / "manifest.json").read_text())
-        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 27, manifest["format"]
+        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 31, manifest["format"]
         assert manifest["schema_versions"][-1] == CURRENT_SCHEMA_VERSION
         assert manifest.get("blob_closure") is None and not manifest.get("blob_artifacts"), \
             "a paired Blob archive would bypass this storage/format family"

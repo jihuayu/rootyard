@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow, ensure};
 use deadpool_postgres::Pool;
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::blob_store::protected::{ProtectedPublication, ProtectedUploader, UploadSource};
+use rootyard::db::{Identity, Repository};
 use rootyard::ref_store::artifact_hold::{
     AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldPurpose, ArtifactSpec, HoldScope, PgArtifactHoldStore,
 };
@@ -21,6 +22,7 @@ use rootyard::ref_store::core::{
     CreatePackSnapshotRequest, MetadataPinOutcome, MetadataSnapshotScope, PackReadSnapshot, PackSnapshotExpectation,
     PackSnapshotOutcome, PackSnapshotRef, PgPackSnapshot, ReleaseMetadataPinRequest,
 };
+use rootyard::ref_store::serving::{PgServingSnapshotMetadata, ServingSnapshotCreate, ServingSnapshotRead};
 use rootyard::ref_store::{
     CoreGateVersion, GitObjectFormat, GitOid, HeadUpdate, IssuerLane, MetadataPinPurpose, OperationIdentity,
     PinReleaseReason, RefName, RefPrecondition, RefStoreError, RefTarget, RefUpdate, RequestDigest,
@@ -119,7 +121,12 @@ fn hold_scope(plan: &PackCommitPlan) -> Result<HoldScope> {
     .map_err(|error| anyhow!("hold scope rejected: {error}"))
 }
 
-async fn publish(db: &Db, store: &BlobStore, plan: &PackCommitPlan, file: &PairFiles) -> Result<ProtectedPublication> {
+pub(super) async fn publish(
+    db: &Db,
+    store: &BlobStore,
+    plan: &PackCommitPlan,
+    file: &PairFiles,
+) -> Result<ProtectedPublication> {
     let (pack_sha, pack_len) = digest_file(&file.pack)?;
     let (idx_sha, idx_len) = digest_file(&file.idx)?;
     let request = AcquireArtifactHoldsRequest::new(
@@ -152,7 +159,12 @@ async fn publish(db: &Db, store: &BlobStore, plan: &PackCommitPlan, file: &PairF
     Ok(publication)
 }
 
-async fn register(db: &Db, plan: &PackCommitPlan, pack_id: Uuid, publication: &ProtectedPublication) -> Result<()> {
+pub(super) async fn register(
+    db: &Db,
+    plan: &PackCommitPlan,
+    pack_id: Uuid,
+    publication: &ProtectedPublication,
+) -> Result<()> {
     let mut client = db.pool.get().await?;
     let request = PackRegistrationRequest::new(plan, pack_id, publication)?;
     PgPackCommit.register_publication(&mut client, request, deadline()).await?;
@@ -201,6 +213,18 @@ pub async fn verify_new(
 ) -> Result<Verified> {
     let (tenant, repo) = db.business(format).await?;
     let gate = db.gate(repo, tenant, format).await?;
+    verify_new_in_repo(db, store, git, format, tenant, repo, gate).await
+}
+
+pub(super) async fn verify_new_in_repo(
+    db: &Db,
+    store: &BlobStore,
+    git: &std::path::Path,
+    format: GitObjectFormat,
+    tenant: Uuid,
+    repo: Uuid,
+    gate: CoreGateVersion,
+) -> Result<Verified> {
     let fixture = GitRepo::new(git.to_path_buf(), format).await?;
     let commit_oid = fixture.build_commit("file.txt", b"root fixture\n", "fixture main").await?;
     fixture.update_ref("refs/heads/main", &commit_oid).await?;
@@ -280,6 +304,56 @@ pub struct SourceSnapshot {
     pub snapshot_id: Uuid,
     pub pin_id: Uuid,
     pub read: PackReadSnapshot,
+}
+
+impl SourceSnapshot {
+    pub fn snapshot_id(&self) -> Uuid {
+        self.snapshot_id
+    }
+}
+
+/// Create and read a real serving-lane pack snapshot through the production
+/// serving snapshot coordinator. The returned SourceSnapshot is a genuine A5
+/// pinned source for the roots fixture.
+pub async fn create_serving_snapshot(
+    db: &Db,
+    store: &BlobStore,
+    actor: &Identity,
+    repository: &Repository,
+    lease: i64,
+) -> Result<SourceSnapshot> {
+    let metadata = PgServingSnapshotMetadata;
+    let outcome = metadata
+        .create(
+            &db.pool,
+            actor,
+            ServingSnapshotCreate {
+                owner: repository.owner.clone(),
+                name: repository.name.clone(),
+                idempotency_key: format!("serving-root-source-{}", Uuid::new_v4().simple()),
+                lease_seconds: lease,
+            },
+            store.backend_identity(),
+            deadline(),
+        )
+        .await
+        .map_err(|error| anyhow!("serving snapshot create failed: {error}"))?;
+    ensure!(!outcome.replayed, "fresh serving snapshot replayed");
+    let snapshot_id = outcome.receipt.snapshot_id();
+    let request_id = outcome.receipt.request_id();
+    let pin_id = outcome.receipt.pin_id();
+    let read = metadata
+        .read(
+            &db.pool,
+            actor,
+            ServingSnapshotRead { owner: repository.owner.clone(), name: repository.name.clone(), snapshot_id },
+            store.backend_identity(),
+            deadline(),
+        )
+        .await
+        .map_err(|error| anyhow!("serving snapshot read failed: {error}"))?;
+    ensure!(read.pack_count() > 0, "serving source has no registered pack membership");
+    Ok(SourceSnapshot { scope: *read.scope(), request_id, snapshot_id, pin_id, read })
 }
 
 pub async fn create_snapshot(db: &Db, verified: &Verified, lease: i64) -> Result<SourceSnapshot> {
