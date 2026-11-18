@@ -14,7 +14,6 @@ use rootyard::{
     },
     storage,
     storage_lifecycle::{
-        models::Policy,
         safe_gc::{
             ENV_BLOB_SAFE_GC_DESTRUCTIVE, SafeGcArmReceipt, SafeGcError,
             anti_aba::AntiAbaKeyRegistry,
@@ -270,7 +269,7 @@ async fn pg17_distributed_refcas_pending_delete_interruption_requires_new_pg_fen
     let final_snap = final_auth.snapshot();
     assert!(final_snap.pending_delete.is_none());
     assert!(final_snap.retired_packs.is_empty());
-    assert!(final_snap.completed_batches.get(&batch1.batch_id).is_some());
+    assert!(final_snap.completed_batches.contains_key(&batch1.batch_id));
     assert!(
         final_snap
             .audit_log
