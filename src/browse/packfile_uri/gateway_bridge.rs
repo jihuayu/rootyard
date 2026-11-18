@@ -347,7 +347,8 @@ impl GatewayPackfileOffload {
         };
 
         let grace = policy.retention_grace_secs;
-        for (desc, pin_guard) in offloaded.iter().zip(staged.pins().iter()) {
+        let cloned_pins = staged.pins().to_vec();
+        for (desc, pin_guard) in offloaded.iter().zip(cloned_pins.iter()) {
             staged.stage_registered_pin(
                 desc.pin_id,
                 RegisteredPinAuth {
@@ -365,7 +366,7 @@ impl GatewayPackfileOffload {
             offloaded,
             residual_inline_bytes,
             residual_objects,
-            lease_pins: staged.pins().to_vec(),
+            lease_pins: cloned_pins,
         };
         let body = encode_fetch_v2_response_bounded(
             &policy,

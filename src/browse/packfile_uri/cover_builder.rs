@@ -283,7 +283,7 @@ pub async fn build_verified_cover_proof_from_repo(
             params.provider,
             params.backend_identity_hex,
             pack_loc.length() + idx_loc.length(),
-            dp.object_count as u64,
+            2,
         )
         .map_err(internal_err)?;
 
