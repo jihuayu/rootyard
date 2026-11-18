@@ -66,7 +66,7 @@ class BlobGatewayCommitCacheShapeTests(unittest.TestCase):
         version_body = body(text, "fn version(&self) -> u64", "}\n\n/// Read one immutable")
         for domain in ("object_format", "storage_generation", "gate_revision", "restore_incarnation"):
             self.assertIn(domain, version_body)
-        for forbidden in ("token", "Authorization", "Bearer", "credential"):
+        for forbidden in ("token", "authorization", "bearer", "credential"):
             self.assertNotIn(forbidden, key_body.lower())
 
     def test_miss_or_invalid_value_uses_the_real_origin_and_cache_is_advisory(self):
