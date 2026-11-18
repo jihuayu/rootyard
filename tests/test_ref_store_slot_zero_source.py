@@ -357,6 +357,29 @@ class SlotZeroSourceTest(unittest.TestCase):
         self.assertIn('tx.rollback().await?', self.tests)
         self.assertIn('tx.commit().await?', self.tests)
 
+    def test_ignored_fixtures_use_owned_tokio_transactions_and_bounded_admin_checkout(self):
+        # Pooled deadpool clients own a wrapper transaction type. Every owning
+        # callsite must instead start the direct tokio-postgres transaction that
+        # the admission and rollback APIs accept.
+        self.assertNotIn('.transaction().await', self.tests)
+        self.assertEqual(self.tests.count('tokio_postgres::Client::transaction'), 19)
+        self.assertEqual(self.tests.count('tokio_postgres::Client::transaction(&mut client)'), 16)
+        self.assertIn('tokio_postgres::Client::transaction(&mut holder_client)', self.tests)
+        self.assertIn('tokio_postgres::Client::transaction(&mut admission)', self.tests)
+        self.assertIn('tokio_postgres::Client::transaction(&mut legacy_client)', self.tests)
+
+        cancelled = self.tests.split('async fn slot_zero_cancelled_owned_tx_cannot_be_committed()', 1)[1].split(
+            '#[tokio::test]', 1
+        )[0]
+        self.assertIn('JoinHandle<anyhow::Result<()>>', cancelled)
+        self.assertIn('Ok(Ok(_worker_result))', cancelled)
+        self.assertNotIn('Ok(Ok(()))', cancelled)
+
+        setup = self.tests.split('async fn slot_zero_fixture_setup_error_drops_only_its_owned_database()', 1)[1]
+        self.assertIn('timeout(WAIT, admin.get())', setup)
+        self.assertIn('admin_client.query_one("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)"', setup)
+        self.assertIn('setup database absence query did not finish', setup)
+
 
 if __name__ == '__main__':
     unittest.main()
