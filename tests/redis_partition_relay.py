@@ -114,9 +114,12 @@ class RedisPartitionRelay:
         assert all(not thread.is_alive() for thread in threads), "Owned relay sockets did not close"
         return len(threads)
 
-    def heal(self):
+    def heal(self, *, redis_port=None):
         with self.lock:
             assert self.partitioned and not self.sessions and not self.stopped.is_set()
+            if redis_port is not None:
+                assert type(redis_port) is int and 0 < redis_port <= 65535
+                self.target = ("127.0.0.1", redis_port)
             self.partitioned = False
 
     def close(self):

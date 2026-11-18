@@ -111,7 +111,14 @@ class RedisPartitionHarness(CrossProcessHarness):
         assert self.relay.counts().forwarded > relay_before.forwarded and self.subscriber_count() == 1
         return oid
 
-    def partition(self):
+    def prepare_outage(self, published):
+        self.assert_redis_alive()
+        return published
+
+    def heal_endpoint(self):
+        self.relay.heal()
+
+    def exercise_wake_cut(self):
         start = time.monotonic()
         worker = self.spawn_worker(poll=POLL_SECONDS * 1000, transport="redis")
         server = self.proc
@@ -130,7 +137,7 @@ class RedisPartitionHarness(CrossProcessHarness):
         assert self.relay.cut() >= 1
         self.until(lambda: self.subscriber_count() == 0 and self.relay.counts().refused > relay_before.refused,
                    "established subscriber cut and reconnect refused", timeout=5)
-        self.assert_redis_alive()
+        published = self.prepare_outage(published)
         cut = self.push_oid()
         time.sleep(max(0, first_poll - 1 - time.monotonic()))
         assert self.pending() == 2 and self.scans() == healthy_scans and time.monotonic() < first_poll
@@ -148,7 +155,7 @@ class RedisPartitionHarness(CrossProcessHarness):
         self.git("fsck", "--full", "--strict", cwd=clone)
 
         assert self.relay.port == self.redis_port
-        self.relay.heal()
+        self.heal_endpoint()
         self.until(lambda: self.subscriber_count() == self.relay.counts().active == 1,
                    "existing worker resubscribed at the same endpoint", timeout=5)
         self.until(lambda: self.scans() == partitioned_scans + 1, "reconnect catch-up scan finished", timeout=5)
@@ -157,6 +164,10 @@ class RedisPartitionHarness(CrossProcessHarness):
         self.assert_effects(healed, 3)
         self.assert_redis_alive()
         assert self.proc is server and server.poll() is None and worker.poll() is None
+        return healed, partitioned_scans + 3, second_poll
+
+    def partition(self):
+        self.exercise_wake_cut()
         return dict(
             producer_and_worker_used_relay=True, established_and_new_connections_cut=True,
             redis_process_survived_without_flush=True, acknowledged_push_delivered_once_by_pg_poll=True,
@@ -164,19 +175,22 @@ class RedisPartitionHarness(CrossProcessHarness):
             post_heal_wake_before_next_poll=True,
         )
 
+    def stop_redis_fixtures(self):
+        self.owned_redis.stop()
+
     def cleanup(self):
         with ExitStack() as cleanup:
             cleanup.callback(shutil.rmtree, self.root)
             if self.schema_created:
                 cleanup.callback(self.sql, f'DROP SCHEMA "{self.schema}" CASCADE', isolated=False)
-            cleanup.callback(self.owned_redis.stop)
+            cleanup.callback(self.stop_redis_fixtures)
             if self.relay is not None:
                 cleanup.callback(self.relay.close)
             cleanup.callback(self.stop)
             self.stop_workers()
 
 
-def partition_report(args):
+def partition_report(args, *, harness_type=None, case_name=CASE, fault_stage="partition"):
     binding = {}
     harness = None
     stage = "preflight"
@@ -189,9 +203,9 @@ def partition_report(args):
         redis_binary = CrossProcessHarness.resolve_redis()
         assert redis_binary
         stage = "fixture"
-        harness = RedisPartitionHarness(args, redis_binary)
+        harness = (harness_type or RedisPartitionHarness)(args, redis_binary)
         harness.setup_partition()
-        stage = "partition"
+        stage = fault_stage
         detail = harness.partition()
         stage = "receipt_changed"
         assert build_binding(args.binary, args.expect_commit) == binding
@@ -204,14 +218,14 @@ def partition_report(args):
                 harness.cleanup()
             except (Exception, KeyboardInterrupt):
                 stage = "cleanup"
-    case = dict(name=CASE, status="failed", error=stage) if stage else dict(
-        name=CASE, status="passed", detail=dict(detail, owned_cleanup_completed=True),
+    case = dict(name=case_name, status="failed", error=stage) if stage else dict(
+        name=case_name, status="passed", detail=dict(detail, owned_cleanup_completed=True),
     )
     return dict(passed=stage is None, cases=[case], **binding)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(report_case=partition_report, *, case_name=CASE, description=__doc__):
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--expect-commit", required=True)
     parser.add_argument("--report", type=Path, required=True)
@@ -223,14 +237,14 @@ def main():
 
     previous = signal.signal(signal.SIGTERM, interrupted)
     try:
-        report = partition_report(args)
+        report = report_case(args)
         try:
             args.report.parent.mkdir(parents=True, exist_ok=True)
             with args.report.open("x") as output:
                 json.dump(report, output, indent=2)
                 output.write("\n")
         except OSError:
-            report = dict(passed=False, cases=[dict(name=CASE, status="failed", error="report_write")])
+            report = dict(passed=False, cases=[dict(name=case_name, status="failed", error="report_write")])
     finally:
         signal.signal(signal.SIGTERM, previous)
     print(json.dumps(report, indent=2))
