@@ -81,17 +81,19 @@ while IFS= read -r line || [ -n "$line" ]; do
       ;;
     "ISSUE182_EMPTY_HISTORY "*)
       saw_failure=1
-      rest=${line#ISSUE182_EMPTY_HISTORY }
-      token=${rest%% *}
-      rest=${rest#* }
-      class_token=${rest%% *}
-      case "$token" in
-        phase=*) [ -n "$phase" ] || phase=$(canonical_phase "${token#phase=}") ;;
-      esac
-      case "$class_token" in
-        class=*) [ -n "$class" ] || class=$(canonical_class "${class_token#class=}") ;;
-      esac
-      case_id=EMPTY_HISTORY
+      note_case EMPTY_HISTORY
+      if [ "$case_id" = EMPTY_HISTORY ]; then
+        rest=${line#ISSUE182_EMPTY_HISTORY }
+        token=${rest%% *}
+        rest=${rest#* }
+        class_token=${rest%% *}
+        case "$token" in
+          phase=*) [ -n "$phase" ] || phase=$(canonical_phase "${token#phase=}") ;;
+        esac
+        case "$class_token" in
+          class=*) [ -n "$class" ] || class=$(canonical_class "${class_token#class=}") ;;
+        esac
+      fi
       ;;
     "test result: FAILED."*)
       saw_failure=1

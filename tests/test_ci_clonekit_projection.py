@@ -117,6 +117,51 @@ class IntegrationProjectionTest(unittest.TestCase):
                 self.projected(output),
             )
 
+    def test_projection_selects_first_failure_event_and_binds_typed_fields_only_to_its_owner(self) -> None:
+        events = (
+            (
+                "test clonekit_sha1_and_sha256_incremental_smart_http_and_anti_stale_tip ... FAILED",
+                "ISSUE182_EMPTY_HISTORY phase=HISTORY_STRATEGY class=ASSERT source=x:1",
+                "SMART_HTTP",
+                None,
+                None,
+            ),
+            (
+                "ISSUE182_EMPTY_HISTORY phase=HISTORY_STRATEGY class=ASSERT source=x:1",
+                "test clonekit_sha1_and_sha256_incremental_smart_http_and_anti_stale_tip ... FAILED",
+                "EMPTY_HISTORY",
+                "HISTORY_STRATEGY",
+                "ASSERT",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for index, (first, second, case, phase, typed) in enumerate(events):
+                with self.subTest(case=case):
+                    text = "\n".join(
+                        (
+                            first,
+                            second,
+                            "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured",
+                            "",
+                        )
+                    )
+                    output = root / f"cross-{index}.json"
+                    proc = self.run_projection(text, output)
+                    self.assertEqual(0, proc.returncode, proc.stderr)
+                    self.assertEqual(text, proc.stdout)
+                    self.assertEqual(
+                        {
+                            "version": 1,
+                            "source_commit": self.SHA,
+                            "case": case,
+                            "phase": phase,
+                            "class": typed,
+                            "counts": {"passed": 1, "failed": 2, "ignored": 0},
+                        },
+                        self.projected(output),
+                    )
+
     def test_projection_maps_unknown_case_and_tokens_to_closed_other(self) -> None:
         cases = (
             (

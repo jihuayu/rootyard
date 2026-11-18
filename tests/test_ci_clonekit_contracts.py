@@ -189,7 +189,13 @@ class FocusedCommandReceiptTest(unittest.TestCase):
             check=False,
         )
 
-    def run_trap(self, body: str, receipt: Path) -> subprocess.CompletedProcess[str]:
+    def run_trap(
+        self,
+        body: str,
+        receipt: Path,
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         script = "\n".join(
             (
                 "set -euo pipefail",
@@ -201,6 +207,7 @@ class FocusedCommandReceiptTest(unittest.TestCase):
         )
         environment = os.environ.copy()
         environment["GITHUB_SHA"] = "a" * 40
+        environment.update(extra_env or {})
         return subprocess.run(
             ["bash", "-c", script],
             cwd=str(ROOT),
@@ -210,6 +217,11 @@ class FocusedCommandReceiptTest(unittest.TestCase):
             timeout=10,
             check=False,
         )
+
+    def integration_block(self) -> str:
+        block = "focused_group=integration" + self.focused_script().split("focused_group=integration", 1)[1]
+        block = block.replace("cargo test --locked --test ci_clonekit", '"$PRODUCER"')
+        return block.replace('scripts/ci_clonekit_integration_receipt.sh "$integration_receipt"', '"$COLLECTOR"')
 
     def test_focused_step_keeps_three_commands_and_installs_one_receipt_trap(self) -> None:
         script = self.focused_script()
@@ -224,15 +236,30 @@ class FocusedCommandReceiptTest(unittest.TestCase):
         command_lines = [line for line in lines if line.startswith("cargo ")]
         commands = [line.split(" 2>&1 |", 1)[0] for line in command_lines]
         self.assertEqual(commands, list(FOCUSED_COMMANDS))
-        self.assertNotIn("2>&1 |", command_lines[0])
-        self.assertNotIn("2>&1 |", command_lines[1])
+        self.assertEqual([False, False], ["2>&1 |" in line for line in command_lines[:2]])
         self.assertEqual(
             "cargo test --locked --test ci_clonekit 2>&1 | "
             "scripts/ci_clonekit_integration_receipt.sh \"$integration_receipt\"",
             command_lines[2],
         )
-        for group, command in zip(FOCUSED_GROUPS, command_lines):
+        for group, command in zip(FOCUSED_GROUPS[:2], command_lines[:2]):
             self.assertEqual(f"focused_group={group}", lines[lines.index(command) - 1])
+
+        integration_index = lines.index(command_lines[2])
+        self.assertEqual("set +e", lines[integration_index - 1])
+        self.assertEqual(
+            "focused_group=integration",
+            [line for line in lines[:integration_index] if line.startswith("focused_group=")][-1],
+        )
+        self.assertEqual(1, script.count("PIPESTATUS"))
+        self.assertEqual('pipeline_status=("${PIPESTATUS[@]}")', lines[integration_index + 1])
+        self.assertEqual("set -e", lines[integration_index + 2])
+        self.assertEqual("producer_status=${pipeline_status[0]:-1}", lines[integration_index + 3])
+        self.assertEqual("collector_status=${pipeline_status[1]:-1}", lines[integration_index + 4])
+        self.assertEqual('if [ "$producer_status" -ne 0 ]; then', lines[integration_index + 5])
+        self.assertEqual('  exit "$producer_status"', lines[integration_index + 6])
+        self.assertEqual("fi", lines[integration_index + 7])
+        self.assertEqual('exit "$collector_status"', lines[integration_index + 8])
 
         trap = self.trap_line()
         self.assertLess(script.index(trap), script.index("focused_group=clippy"))
@@ -429,6 +456,42 @@ class FocusedCommandReceiptTest(unittest.TestCase):
                 blocked,
             )
             self.assertEqual(7, proc.returncode)
+
+    def test_integration_status_prefers_producer_and_falls_back_to_collector(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            producer = root / "producer.sh"
+            collector = root / "collector.sh"
+            producer.write_text('#!/usr/bin/env bash\nexit "${PRODUCER_STATUS:-0}"\n', encoding="utf-8")
+            collector.write_text('#!/usr/bin/env bash\nexit "${COLLECTOR_STATUS:-0}"\n', encoding="utf-8")
+            producer.chmod(0o755)
+            collector.chmod(0o755)
+
+            cases = ((101, 0, 101), (0, 7, 7), (101, 7, 101), (1, 101, 1), (0, 141, 141), (0, 0, 0))
+            for index, (producer_status, collector_status, expected) in enumerate(cases):
+                with self.subTest(producer=producer_status, collector=collector_status):
+                    receipt = root / f"receipt-{index}.json"
+                    proc = self.run_trap(
+                        self.integration_block(),
+                        receipt,
+                        extra_env={
+                            "PRODUCER": str(producer),
+                            "COLLECTOR": str(collector),
+                            "PRODUCER_STATUS": str(producer_status),
+                            "COLLECTOR_STATUS": str(collector_status),
+                        },
+                    )
+                    self.assertEqual(expected, proc.returncode)
+                    self.assertEqual("", proc.stdout)
+                    self.assertEqual("", proc.stderr)
+                    expected_receipt = {
+                        "version": 1,
+                        "source_commit": "a" * 40,
+                        "first_failure": None if expected == 0 else "integration",
+                        "exit_code": expected,
+                        "not_run": [],
+                    }
+                    self.assertEqual(expected_receipt, json.loads(receipt.read_bytes()))
 
 
 if __name__ == "__main__":
