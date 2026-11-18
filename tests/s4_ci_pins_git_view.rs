@@ -316,15 +316,20 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
         let gate_sql = "SELECT authority_epoch, history_incarnation FROM ref_store_core_gates WHERE repository_id=$1";
         let row = cluster.pool.get().await?.query_one(gate_sql, &[&repo.id]).await?;
         let (old_epoch, old_incarnation): (i64, Uuid) = (row.get(0), row.get(1));
-        set_gate_epoch(&cluster.pool, repo.id, old_epoch + 1, Uuid::new_v4()).await?;
-        let epoch_errored = drain_pack(&mut epoch_stream, &mut epoch_received).await;
-        ensure!(
-            epoch_errored || epoch_received < 550_000,
-            "an epoch-bumped stream delivered the complete retained pack ({epoch_received} bytes)"
-        );
-        let epoch_dead = job_status(&cluster, &repo, &big_oid, &epoch_token).await?;
-        ensure!(epoch_dead == StatusCode::UNAUTHORIZED, "an epoch-bumped credential still authorized");
+        let epoch_res: Result<()> = async {
+            set_gate_epoch(&cluster.pool, repo.id, old_epoch + 1, Uuid::new_v4()).await?;
+            let epoch_errored = drain_pack(&mut epoch_stream, &mut epoch_received).await;
+            ensure!(
+                epoch_errored || epoch_received < 550_000,
+                "an epoch-bumped stream delivered the complete retained pack ({epoch_received} bytes)"
+            );
+            let epoch_dead = job_status(&cluster, &repo, &big_oid, &epoch_token).await?;
+            ensure!(epoch_dead == StatusCode::UNAUTHORIZED, "an epoch-bumped credential still authorized");
+            Ok(())
+        }
+        .await;
         set_gate_epoch(&cluster.pool, repo.id, old_epoch, old_incarnation).await?;
+        epoch_res?;
 
         // Rotating the cluster anchor must end the stream and the credential.
         let cluster_job = Uuid::new_v4();
@@ -335,12 +340,8 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
             return Err(anyhow::anyhow!("the cluster pack stream produced no first chunk"));
         };
         let mut cluster_received = chunk.len();
-        let anchor = cluster.pool.get().await?;
-        let read = "SELECT incarnation FROM public.cluster_authority WHERE singleton=true";
-        let old_cluster_inc: Uuid = anchor.query_one(read, &[]).await?.get(0);
-        let rotate =
-            "UPDATE public.cluster_authority SET incarnation=$1, rotated_at=clock_timestamp() WHERE singleton=true";
-        anchor.execute(rotate, &[&Uuid::new_v4()]).await?;
+        let mut authority_guard =
+            hold_regressions::ClusterAuthorityRestoreGuard::rotate(&cluster.pool, Uuid::new_v4()).await?;
         let cluster_errored = drain_pack(&mut cluster_stream, &mut cluster_received).await;
         ensure!(
             cluster_errored || cluster_received < 550_000,
@@ -348,8 +349,7 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
         );
         let cluster_dead = job_status(&cluster, &repo, &big_oid, &cluster_token).await?;
         ensure!(cluster_dead == StatusCode::UNAUTHORIZED, "a cluster-rotated credential still authorized");
-        let restore = "UPDATE public.cluster_authority SET incarnation=$1 WHERE singleton=true";
-        anchor.execute(restore, &[&old_cluster_inc]).await?;
+        authority_guard.restore(&cluster.pool).await?;
 
         // pg_refstore identity is guarded, so no product API can move a
         // repository between tenants. Re-seat the same repository under a new
@@ -485,4 +485,9 @@ async fn s4_terminal_job_rechecks_under_final_lock() -> Result<()> {
 #[ignore = "requires real PG17, an S3 endpoint and native Git"]
 async fn s4_git_children_are_bounded_and_reaped() -> Result<()> {
     hold_regressions::bounded_child_lifecycle().await
+}
+#[tokio::test]
+#[ignore = "requires real PG17, an S3 endpoint and native Git"]
+async fn s4_cluster_authority_fixture_restores_on_failure() -> Result<()> {
+    hold_regressions::cluster_authority_restores_on_failure_and_panic().await
 }

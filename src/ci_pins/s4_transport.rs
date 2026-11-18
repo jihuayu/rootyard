@@ -15,7 +15,10 @@ use axum::{
     http::{StatusCode, header},
     response::Response,
 };
-use std::path::{Path as FsPath, PathBuf};
+use std::{
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     time::Instant,
@@ -33,9 +36,18 @@ struct Authorized {
     digest: Vec<u8>,
 }
 
-/// Disposable `0o700` bare repository removed when the response ends.
+struct DisposableDir(PathBuf);
+
+impl Drop for DisposableDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Disposable `0o700` bare repository removed when the last hold is dropped.
+#[derive(Clone)]
 pub(crate) struct DisposableCiView {
-    dir: PathBuf,
+    dir: Arc<DisposableDir>,
 }
 
 impl DisposableCiView {
@@ -44,35 +56,35 @@ impl DisposableCiView {
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&dir)
-                .map_err(Error::internal)?;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).map_err(Error::internal)?;
         }
         #[cfg(not(unix))]
         std::fs::create_dir_all(&dir).map_err(Error::internal)?;
-        Ok(Self { dir })
+        Ok(Self { dir: Arc::new(DisposableDir(dir)) })
     }
 
     pub(crate) fn path(&self) -> &FsPath {
-        &self.dir
+        &self.dir.0
+    }
+
+    pub(crate) fn hold(&self) -> super::s4_authority::ScratchHold {
+        self.dir.clone()
     }
 }
 
-impl Drop for DisposableCiView {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-async fn git_dir(state: &AppState, dir: &FsPath, args: &[&str], deadline: Instant) -> Result<Vec<u8>, Error> {
+async fn git_dir(
+    state: &AppState,
+    holder: &DisposableCiView,
+    args: &[&str],
+    deadline: Instant,
+) -> Result<Vec<u8>, Error> {
     super::s4_authority::run_git_dir_bounded(
         &state.config.git,
-        Some(dir),
+        Some(holder.path()),
         args,
         deadline,
         Error(StatusCode::CONFLICT, "retained root could not be materialized"),
+        Some(holder.hold()),
     )
     .await
 }
@@ -86,14 +98,21 @@ fn write_pack(dir: &FsPath, pack_id: Uuid, pack: &[u8], idx: &[u8]) -> Result<()
     Ok(())
 }
 
-async fn init_bare(state: &AppState, dir: &FsPath, format: &str, deadline: Instant) -> Result<(), Error> {
+async fn init_bare(
+    state: &AppState,
+    holder: &DisposableCiView,
+    format: &str,
+    deadline: Instant,
+) -> Result<(), Error> {
     let object_format = format!("--object-format={format}");
+    let target = holder.path().to_str().ok_or_else(|| Error::internal("invalid disposable repo path"))?;
     super::s4_authority::run_git_dir_bounded(
         &state.config.git,
         None,
-        &["init", "--bare", "--quiet", &object_format],
+        &["init", "--bare", "--quiet", &object_format, target],
         deadline,
         Error::internal("bare repository initialization failed"),
+        Some(holder.hold()),
     )
     .await?;
     Ok(())
@@ -116,7 +135,7 @@ pub(crate) async fn materialize(
         .map_err(|_| Error(StatusCode::CONFLICT, "retained root unavailable or released"))?;
     let holder = DisposableCiView::create()?;
     let dir = holder.path().to_path_buf();
-    init_bare(state, &dir, view.object_format().as_str(), deadline).await?;
+    init_bare(state, &holder, view.object_format().as_str(), deadline).await?;
     for pack in view.packs() {
         let bytes = view
             .pack_bytes(pack.pack_id(), deadline)
@@ -129,12 +148,12 @@ pub(crate) async fn materialize(
         write_pack(&dir, pack.pack_id(), &bytes, &idx)?;
     }
     let target = target_oid;
-    git_dir(state, &dir, &["config", "uploadpack.allowAnySHA1InWant", "false"], deadline).await?;
-    git_dir(state, &dir, &["config", "uploadpack.allowReachableSHA1InWant", "false"], deadline).await?;
-    git_dir(state, &dir, &["config", "uploadpack.allowFilter", "false"], deadline).await?;
-    git_dir(state, &dir, &["update-ref", "refs/heads/main", target], deadline).await?;
-    git_dir(state, &dir, &["symbolic-ref", "HEAD", "refs/heads/main"], deadline).await?;
-    git_dir(state, &dir, &["cat-file", "-e", &format!("{target}^{{commit}}")], deadline).await?;
+    git_dir(state, &holder, &["config", "uploadpack.allowAnySHA1InWant", "false"], deadline).await?;
+    git_dir(state, &holder, &["config", "uploadpack.allowReachableSHA1InWant", "false"], deadline).await?;
+    git_dir(state, &holder, &["config", "uploadpack.allowFilter", "false"], deadline).await?;
+    git_dir(state, &holder, &["update-ref", "refs/heads/main", target], deadline).await?;
+    git_dir(state, &holder, &["symbolic-ref", "HEAD", "refs/heads/main"], deadline).await?;
+    git_dir(state, &holder, &["cat-file", "-e", &format!("{target}^{{commit}}")], deadline).await?;
     Ok(holder)
 }
 
@@ -338,7 +357,7 @@ pub(crate) async fn info_refs(
         deadline,
     )
     .await?;
-    let out = git_dir(&state, holder.path(), &["upload-pack", "--stateless-rpc", "--advertise-refs"], deadline).await?;
+    let out = git_dir(&state, &holder, &["upload-pack", "--stateless-rpc", "--advertise-refs"], deadline).await?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-git-upload-pack-advertisement")
@@ -377,7 +396,9 @@ pub(crate) async fn upload_pack(
     )
     .await?;
     let slot = StreamSlot::acquire(&state)?;
-    let mut child = super::s4_authority::UploadPackGroup::spawn(&state.config.git, holder.path())?;
+    let hold = holder.hold();
+    let mut child = super::s4_authority::UploadPackGroup::spawn(&state.config.git, holder.path(), Some(hold))?;
+    drop(holder);
     let (mut stdin, mut stdout) = child.take_pipes()?;
     tokio::spawn(async move {
         let _ = stdin.write_all(&body).await;
@@ -404,7 +425,6 @@ pub(crate) async fn upload_pack(
     };
     let stream_auth = authorized;
     let source = async_stream::try_stream! {
-        let _holder = holder;
         let mut ticker = tokio::time::interval(RECHECK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut buffer = vec![0u8; CHUNK];

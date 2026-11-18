@@ -1,29 +1,37 @@
 //! Bounded, isolated child Git processes for S4 CI transport.
 use super::*;
 use crate::git_http::{finish_group_child, group_quiescent, kill_group_child};
-use std::{path::Path as FsPath, process::ExitStatus, time::Duration};
+use std::{path::Path as FsPath, process::{ExitStatus, Stdio}, time::Duration};
 use tokio::{
     io::AsyncReadExt,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command},
     time::Instant,
 };
 
 const GROUP_CLEANUP: Duration = Duration::from_secs(2);
-const DROP_GROUP_BUDGET: Duration = Duration::from_millis(250);
+const DROP_GROUP_BUDGET: Duration = Duration::from_millis(500);
 const GIT_DIR_CAP: usize = 64 * 1024 * 1024;
 
+/// One refcounted scratch owner that must outlive a child process group.
+pub(crate) type ScratchHold = std::sync::Arc<dyn std::any::Any + Send + Sync>;
 /// One isolated `git upload-pack` (or bounded disposable-repo command) child.
 pub(crate) struct UploadPackGroup {
     child: Option<Child>,
     pid: i32,
+    scratch_hold: Option<ScratchHold>,
 }
-
 impl UploadPackGroup {
-    pub(crate) fn spawn(git_bin: &FsPath, dir: &FsPath) -> Result<Self, Error> {
-        Self::spawn_argv(git_bin, Some(dir), &["upload-pack", "--stateless-rpc"], Stdio::piped())
+    pub(crate) fn spawn(git_bin: &FsPath, dir: &FsPath, scratch_hold: Option<ScratchHold>) -> Result<Self, Error> {
+        Self::spawn_argv(git_bin, Some(dir), &["upload-pack", "--stateless-rpc"], Stdio::piped(), scratch_hold)
     }
 
-    fn spawn_argv(git_bin: &FsPath, dir: Option<&FsPath>, args: &[&str], stdin: Stdio) -> Result<Self, Error> {
+    fn spawn_argv(
+        git_bin: &FsPath,
+        dir: Option<&FsPath>,
+        args: &[&str],
+        stdin: Stdio,
+        scratch_hold: Option<ScratchHold>,
+    ) -> Result<Self, Error> {
         let mut cmd = Command::new(git_bin);
         cmd.args(["-c", "core.hooksPath=/dev/null"]);
         if let Some(dir) = dir {
@@ -58,7 +66,7 @@ impl UploadPackGroup {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        Ok(Self { child: Some(child), pid })
+        Ok(Self { child: Some(child), pid, scratch_hold })
     }
 
     pub(crate) fn take_pipes(&mut self) -> Result<(ChildStdin, ChildStdout), Error> {
@@ -86,6 +94,7 @@ impl UploadPackGroup {
             Ok(status) => {
                 self.child = None;
                 self.pid = 0;
+                self.scratch_hold = None;
                 Ok(status)
             }
             Err(error) => {
@@ -112,12 +121,19 @@ impl UploadPackGroup {
         }
         self.child = None;
         self.pid = 0;
+        self.scratch_hold = None;
     }
 }
-
 impl Drop for UploadPackGroup {
     fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else { return };
+        if self.child.is_none() {
+            self.scratch_hold = None;
+            return;
+        }
+        let Some(mut child) = self.child.take() else {
+            self.scratch_hold = None;
+            return;
+        };
         let pid = std::mem::replace(&mut self.pid, 0);
         #[cfg(unix)]
         if pid > 1 {
@@ -127,16 +143,31 @@ impl Drop for UploadPackGroup {
             }
         }
         let _ = child.start_kill();
+        let mut reaped = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
         #[cfg(unix)]
-        if pid > 1 {
+        {
             let started = std::time::Instant::now();
-            while started.elapsed() < DROP_GROUP_BUDGET && matches!(group_quiescent(pid), Ok(false)) {
+            while started.elapsed() < DROP_GROUP_BUDGET {
+                if !reaped {
+                    reaped = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
+                }
+                let quiet = pid <= 1 || matches!(group_quiescent(pid), Ok(true) | Err(_));
+                if reaped && quiet {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
-        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+        let reaped = reaped || matches!(child.try_wait(), Ok(Some(_)) | Err(_));
+        #[cfg(unix)]
+        let quiet = pid <= 1 || matches!(group_quiescent(pid), Ok(true) | Err(_));
+        #[cfg(not(unix))]
+        let quiet = true;
+        if reaped && quiet {
+            self.scratch_hold = None;
             return;
         }
+        let hold = self.scratch_hold.take();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 #[cfg(unix)]
@@ -147,22 +178,39 @@ impl Drop for UploadPackGroup {
                     }
                 }
                 let _ = tokio::time::timeout(GROUP_CLEANUP, child.wait()).await;
+                drop(hold);
+            });
+        } else {
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                while started.elapsed() < GROUP_CLEANUP {
+                    let done = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
+                    #[cfg(unix)]
+                    let quiet = pid <= 1 || matches!(group_quiescent(pid), Ok(true) | Err(_));
+                    #[cfg(not(unix))]
+                    let quiet = true;
+                    if done && quiet {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                drop(hold);
             });
         }
     }
 }
-
 pub(crate) async fn run_git_dir_bounded(
     git_bin: &FsPath,
     dir: Option<&FsPath>,
     args: &[&str],
     deadline: Instant,
     fail_error: Error,
+    scratch_hold: Option<ScratchHold>,
 ) -> Result<Vec<u8>, Error> {
     if Instant::now() >= deadline {
         return Err(Error::timeout());
     }
-    let mut guard = UploadPackGroup::spawn_argv(git_bin, dir, args, Stdio::null())?;
+    let mut guard = UploadPackGroup::spawn_argv(git_bin, dir, args, Stdio::null(), scratch_hold)?;
     let mut stdout = guard.take_stdout()?;
     let mut output = Vec::new();
     let read =

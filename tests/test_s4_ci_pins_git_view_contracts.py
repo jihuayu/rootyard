@@ -238,6 +238,28 @@ class SourceContracts(unittest.TestCase):
         self.assertIn("UploadPackGroup", runner)
         self.assertIn('env_remove("GIT_PROTOCOL")', proc)
 
+    def test_scratch_holds_outlive_child_process_groups(self) -> None:
+        runner = text(CI_PINS / "s4_git_runner.rs")
+        tokio_block = runner.split("use tokio::{", 1)[1].split("};", 1)[0]
+        self.assertIn("process::{", tokio_block)
+        tokio_process = tokio_block.split("process::{", 1)[1].split("}", 1)[0]
+        self.assertNotIn("Stdio", tokio_process, "Stdio must come from std::process, not tokio::process")
+        std_block = runner.split("use std::{", 1)[1].split("};", 1)[0]
+        self.assertIn("Stdio", std_block)
+        for rel in (
+            SRC / "namespace_service" / "s4_git_view.rs",
+            SRC / "namespace_service" / "s4_git_view_http.rs",
+            SRC / "namespace_service" / "s4_git_view_reverse.rs",
+        ):
+            body = text(rel)
+            self.assertIn("ScratchDir", body, rel)
+            self.assertIn("with_scratch", body, rel)
+        for rel in (
+            TESTS / "s4_ci_pins_git_view.rs",
+            TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs",
+        ):
+            self.assertIn("ClusterAuthorityRestoreGuard", text(rel), rel)
+
     def test_hold_regressions_cover_the_two_review_items(self) -> None:
         body = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")
         for needle in ("/ci-pins", "ref_store_core_root_heads", "/git/views/", "/proc/"):

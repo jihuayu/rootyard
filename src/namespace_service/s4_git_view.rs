@@ -11,49 +11,16 @@
 //! *before* PostgreSQL is touched, so the projected object id is known when the
 //! one and only transaction opens. Root registration, RBAC, the view row, its
 //! history and the binding then commit together or not at all.
-use super::s4_git_proc::{git_clone, git_init_bare, git_text};
+use super::s4_git_proc::{ScratchDir, git_clone, git_init_bare, git_text, with_scratch};
 use crate::namespace_service::{handlers, views::{CreateView, View}};
 use crate::ref_store::core::pack_commit::PackArtifactRole;
 use crate::{AppState, Error, db::Identity, members::models::Role, token_scopes::RepoAction};
 use axum::http::StatusCode;
 use std::{
     fs,
-    path::{Path as FsPath, PathBuf},
+    path::Path as FsPath,
 };
 use uuid::Uuid;
-
-/// Disposable `0o700` tree that holds one bare repository and one work tree.
-struct TempTree {
-    root: PathBuf,
-}
-
-impl TempTree {
-    fn create() -> Result<Self, Error> {
-        let root = std::env::temp_dir().join(format!("rootyard-s4-view-{}", Uuid::new_v4()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new().recursive(true).mode(0o700).create(&root).map_err(Error::internal)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(&root).map_err(Error::internal)?;
-        Ok(Self { root })
-    }
-
-    fn bare(&self) -> PathBuf {
-        self.root.join("repo.git")
-    }
-
-    fn work(&self) -> PathBuf {
-        self.root.join("work")
-    }
-}
-
-impl Drop for TempTree {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
 
 async fn run_git(
     git_bin: &FsPath,
@@ -146,7 +113,7 @@ async fn materialize_packs(
     state: &AppState,
     captured: &Captured,
     base_oid: &str,
-    tree: &TempTree,
+    tree: &ScratchDir,
     deadline: tokio::time::Instant,
 ) -> Result<(), Error> {
     let bare = tree.bare();
@@ -216,17 +183,20 @@ pub(crate) async fn verify_mounted_commit(
 ) -> Result<(), Error> {
     let deadline = tokio::time::Instant::now() + state.config.git_timeout;
     let captured = capture(state, actor, mount, deadline).await.map_err(|_| Error::bad_request())?;
-    let tree = TempTree::create()?;
-    let checked = materialize_packs(state, &captured, &mount.base_oid, &tree, deadline).await;
-    let snapshot_scope = captured.prepared.snapshot_scope;
-    let snapshot = captured.prepared.snapshot;
-    captured.producer.release_source_snapshot(&state.pool, snapshot_scope, &snapshot, deadline).await;
-    checked.map_err(|_| Error::bad_request())?;
-    let commit = format!("{}^{{commit}}", mount.base_oid);
-    run_git(&state.config.git, &tree.bare(), &["cat-file", "-e", &commit], deadline)
-        .await
-        .map_err(|_| Error::bad_request())?;
-    Ok(())
+    let tree = ScratchDir::create("rootyard-s4-view")?;
+    with_scratch(vec![tree.hold()], async {
+        let checked = materialize_packs(state, &captured, &mount.base_oid, &tree, deadline).await;
+        let snapshot_scope = captured.prepared.snapshot_scope;
+        let snapshot = captured.prepared.snapshot;
+        captured.producer.release_source_snapshot(&state.pool, snapshot_scope, &snapshot, deadline).await;
+        checked.map_err(|_| Error::bad_request())?;
+        let commit = format!("{}^{{commit}}", mount.base_oid);
+        run_git(&state.config.git, &tree.bare(), &["cat-file", "-e", &commit], deadline)
+            .await
+            .map_err(|_| Error::bad_request())?;
+        Ok(())
+    })
+    .await
 }
 
 /// Create one durable `pg_refstore` view: materialize, project, then one commit.
@@ -247,17 +217,20 @@ pub(super) async fn create(
         if captured.repository_id != repository_id {
             return Err(Error::not_found());
         }
-        let tree = TempTree::create()?;
-        materialize_packs(state, &captured, &mount.base_oid, &tree, deadline).await?;
-        git_clone(
-            &state.config.git,
-            &tree.bare(),
-            &tree.work(),
-            &["--no-local", "--no-hardlinks", "--no-tags"],
-            deadline,
-        )
+        let tree = ScratchDir::create("rootyard-s4-view")?;
+        let projected = with_scratch(vec![tree.hold()], async {
+            materialize_packs(state, &captured, &mount.base_oid, &tree, deadline).await?;
+            git_clone(
+                &state.config.git,
+                &tree.bare(),
+                &tree.work(),
+                &["--no-local", "--no-hardlinks", "--no-tags"],
+                deadline,
+            )
+            .await?;
+            project(&state.config.git, &tree.work(), &mount.base_oid, &input.subdir, deadline).await
+        })
         .await?;
-        let projected = project(&state.config.git, &tree.work(), &mount.base_oid, &input.subdir, deadline).await?;
         let vid = Uuid::new_v4();
         let root_id = captured.prepared.request.candidate().root_id();
         let register_digest = captured.prepared.request.candidate().register_digest().as_hex();
@@ -406,23 +379,32 @@ pub(super) async fn bundle(
         deadline,
     )
     .await?;
-    let tree = TempTree::create()?;
-    git_clone(
-        &state.config.git,
-        holder.path(),
-        &tree.work(),
-        &["--no-local", "--no-hardlinks", "--no-tags"],
-        deadline,
-    )
+    let tree = ScratchDir::create("rootyard-s4-view")?;
+    let bytes = with_scratch(vec![tree.hold(), holder.hold()], async {
+        git_clone(
+            &state.config.git,
+            holder.path(),
+            &tree.work(),
+            &["--no-local", "--no-hardlinks", "--no-tags"],
+            deadline,
+        )
+        .await?;
+        let projected = project(&state.config.git, &tree.work(), &view.source_oid, &view.subdir, deadline).await?;
+        if projected != view.projected_oid {
+            return Err(Error(StatusCode::CONFLICT, "view projection no longer matches its recorded head"));
+        }
+        let file = tree.root().join("view.bundle");
+        let file = file.to_str().ok_or_else(Error::bad_request)?;
+        run_git(
+            &state.config.git,
+            &tree.work(),
+            &["bundle", "create", file, "refs/heads/projected", "HEAD"],
+            deadline,
+        )
+        .await?;
+        fs::read(file).map_err(Error::internal)
+    })
     .await?;
-    let projected = project(&state.config.git, &tree.work(), &view.source_oid, &view.subdir, deadline).await?;
-    if projected != view.projected_oid {
-        return Err(Error(StatusCode::CONFLICT, "view projection no longer matches its recorded head"));
-    }
-    let file = tree.root.join("view.bundle");
-    let file = file.to_str().ok_or_else(Error::bad_request)?;
-    run_git(&state.config.git, &tree.work(), &["bundle", "create", file, "refs/heads/projected", "HEAD"], deadline).await?;
-    let bytes = fs::read(file).map_err(Error::internal)?;
     if bytes.len() > 32 * 1024 * 1024 {
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "view bundle too large"));
     }

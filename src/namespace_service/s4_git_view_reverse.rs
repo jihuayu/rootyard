@@ -44,24 +44,6 @@ use std::{
 use uuid::Uuid;
 const HOLD_NAMESPACE: &str = "gateway-pack";
 const ISSUER_LANE: &str = "s4-view-reverse";
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn create() -> Result<Self, Error> {
-        let path = std::env::temp_dir().join(format!("rootyard-s4-reverse-{}", Uuid::new_v4()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new().recursive(true).mode(0o700).create(&path).map_err(Error::internal)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(&path).map_err(Error::internal)?;
-        Ok(Self(path))
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
-}
 struct Binding {
     root_id: Uuid,
     source_oid: String,
@@ -160,81 +142,88 @@ pub(super) async fn create(
         deadline,
     )
     .await?;
-    let scratch = Scratch::create()?;
-    let work = scratch.0.join("projected");
-    git_clone(
-        &state.config.git,
-        holder.path(),
-        &work,
-        &["--no-local", "--no-hardlinks", "--no-tags"],
-        deadline,
-    )
-    .await?;
-    let work_text = work.to_str().ok_or_else(Error::bad_request)?;
-    let projected = views::s4_git_view::project(&state.config.git, &work, &binding.source_oid, &binding.subdir, deadline)
+    let scratch = views::s4_git_proc::ScratchDir::create("rootyard-s4-reverse")?;
+    let (new_oid, pack, idx, planned, pack_id, pack_path, idx_path) =
+        views::s4_git_proc::with_scratch(vec![scratch.hold(), holder.hold()], async {
+            let git = &state.config.git;
+            let subdir = binding.subdir.as_str();
+            let projected_oid = binding.projected_oid.as_str();
+            let max_repo = state.config.max_repo_bytes;
+            let work = scratch.root().join("projected");
+            git_clone(
+                &state.config.git,
+                holder.path(),
+                &work,
+                &["--no-local", "--no-hardlinks", "--no-tags"],
+                deadline,
+            )
+            .await?;
+            let work_text = work.to_str().ok_or_else(Error::bad_request)?;
+            let projected = views::s4_git_view::project(git, &work, &binding.source_oid, subdir, deadline).await?;
+            if projected != binding.projected_oid {
+                return Err(Error(StatusCode::CONFLICT, "view projection no longer matches its recorded head"));
+            }
+            let bundle_path = scratch.root().join("proposal.bundle");
+            write_bundle(&bundle_path, bundle)?;
+            let bundle_text = bundle_path.to_str().ok_or_else(Error::bad_request)?;
+            run_git(state, &work, &["bundle", "verify", bundle_text], deadline).await?;
+            run_git(state, &work, &["fetch", "--no-tags", bundle_text, input.bundle_ref.as_str()], deadline).await?;
+            let candidate = git_oid(&state.config.git, &work, &["rev-parse", "FETCH_HEAD^{commit}"], deadline).await?;
+            let merge_base = ["merge-base", "--is-ancestor", binding.projected_oid.as_str(), candidate.as_str()];
+            run_git(state, &work, &merge_base, deadline).await?;
+            let candidate_bytes = verify_candidate_budget(git, &work, &candidate, projected_oid, deadline).await?;
+            run_git(state, &work, &["fsck", "--strict", "--no-reflogs", candidate.as_str()], deadline).await?;
+            let candidate_tree = format!("{candidate}^{{tree}}");
+            let projected_tree = git_oid(&state.config.git, &work, &["rev-parse", &candidate_tree], deadline).await?;
+            let old_tree_arg = format!("{}^{{tree}}", binding.projected_oid);
+            let old_projected_tree = git_oid(&state.config.git, &work, &["rev-parse", &old_tree_arg], deadline).await?;
+            if projected_tree == old_projected_tree {
+                return Err(Error(StatusCode::CONFLICT, "projected tree is unchanged"));
+            }
+            let source = holder.path();
+            let source_bytes = crate::storage::disk_bytes(source, max_repo).map_err(Error::internal)?;
+            if source_bytes.saturating_add(candidate_bytes) > max_repo {
+                return Err(Error(StatusCode::INSUFFICIENT_STORAGE, "repository quota reached"));
+            }
+            run_git(state, &work, &["update-ref", "refs/heads/reverse-import", candidate.as_str()], deadline).await?;
+            run_git(
+                state,
+                source,
+                &["fetch", "--no-tags", "--no-write-fetch-head", work_text, "refs/heads/reverse-import"],
+                deadline,
+            )
+            .await?;
+            let source_tree_arg = format!("{}^{{tree}}", binding.source_oid);
+            let old_tree = git_oid(&state.config.git, source, &["rev-parse", &source_tree_arg], deadline).await?;
+            let new_tree = if binding.subdir.is_empty() {
+                projected_tree
+            } else {
+                let parts: Vec<&str> = binding.subdir.split('/').collect();
+                replace_tree(&state.config.git, source, &old_tree, &parts, &projected_tree, deadline).await?
+            };
+            let body = format!("{}\n", input.message);
+            let commit_args = ["commit-tree", new_tree.as_str(), "-p", binding.source_oid.as_str()];
+            let new_oid = git_input(
+                &state.config.git,
+                GitInputSpec {
+                    repo: source,
+                    args: &commit_args,
+                    input: body.as_bytes(),
+                    actor: Some(actor.username.as_str()),
+                    max_out: 64 * 1024 * 1024,
+                },
+                deadline,
+            )
+            .await?;
+            let new_oid = String::from_utf8(new_oid).map_err(Error::internal)?.trim().to_owned();
+            let (pack_path, idx_path) =
+                new_pack(&state.config.git, scratch.root(), source, &new_oid, &binding.source_oid, deadline).await?;
+            let pack = fs::read(&pack_path).map_err(Error::internal)?;
+            let idx = fs::read(&idx_path).map_err(Error::internal)?;
+            let (planned, pack_id) = planned_pack(&pack, &idx)?;
+            Ok::<_, Error>((new_oid, pack, idx, planned, pack_id, pack_path, idx_path))
+        })
         .await?;
-    if projected != binding.projected_oid {
-        return Err(Error(StatusCode::CONFLICT, "view projection no longer matches its recorded head"));
-    }
-    let bundle_path = scratch.0.join("proposal.bundle");
-    write_bundle(&bundle_path, bundle)?;
-    let bundle_text = bundle_path.to_str().ok_or_else(Error::bad_request)?;
-    run_git(state, &work, &["bundle", "verify", bundle_text], deadline).await?;
-    run_git(state, &work, &["fetch", "--no-tags", bundle_text, input.bundle_ref.as_str()], deadline).await?;
-    let candidate = git_oid(&state.config.git, &work, &["rev-parse", "FETCH_HEAD^{commit}"], deadline).await?;
-    let merge_base = ["merge-base", "--is-ancestor", binding.projected_oid.as_str(), candidate.as_str()];
-    run_git(state, &work, &merge_base, deadline).await?;
-    let candidate_bytes =
-        verify_candidate_budget(&state.config.git, &work, &candidate, &binding.projected_oid, deadline).await?;
-    run_git(state, &work, &["fsck", "--strict", "--no-reflogs", candidate.as_str()], deadline).await?;
-    let candidate_tree = format!("{candidate}^{{tree}}");
-    let projected_tree = git_oid(&state.config.git, &work, &["rev-parse", &candidate_tree], deadline).await?;
-    let old_tree_arg = format!("{}^{{tree}}", binding.projected_oid);
-    let old_projected_tree = git_oid(&state.config.git, &work, &["rev-parse", &old_tree_arg], deadline).await?;
-    if projected_tree == old_projected_tree {
-        return Err(Error(StatusCode::CONFLICT, "projected tree is unchanged"));
-    }
-    let source = holder.path();
-    let source_bytes = crate::storage::disk_bytes(source, state.config.max_repo_bytes).map_err(Error::internal)?;
-    if source_bytes.saturating_add(candidate_bytes) > state.config.max_repo_bytes {
-        return Err(Error(StatusCode::INSUFFICIENT_STORAGE, "repository quota reached"));
-    }
-    run_git(state, &work, &["update-ref", "refs/heads/reverse-import", candidate.as_str()], deadline).await?;
-    run_git(
-        state,
-        source,
-        &["fetch", "--no-tags", "--no-write-fetch-head", work_text, "refs/heads/reverse-import"],
-        deadline,
-    )
-    .await?;
-    let source_tree_arg = format!("{}^{{tree}}", binding.source_oid);
-    let old_tree = git_oid(&state.config.git, source, &["rev-parse", &source_tree_arg], deadline).await?;
-    let new_tree = if binding.subdir.is_empty() {
-        projected_tree
-    } else {
-        let parts: Vec<&str> = binding.subdir.split('/').collect();
-        replace_tree(&state.config.git, source, &old_tree, &parts, &projected_tree, deadline).await?
-    };
-    let body = format!("{}\n", input.message);
-    let commit_args = ["commit-tree", new_tree.as_str(), "-p", binding.source_oid.as_str()];
-    let new_oid = git_input(
-        &state.config.git,
-        GitInputSpec {
-            repo: source,
-            args: &commit_args,
-            input: body.as_bytes(),
-            actor: Some(actor.username.as_str()),
-            max_out: 64 * 1024 * 1024,
-        },
-        deadline,
-    )
-    .await?;
-    let new_oid = String::from_utf8(new_oid).map_err(Error::internal)?.trim().to_owned();
-    let (pack_path, idx_path) =
-        new_pack(&state.config.git, &scratch.0, source, &new_oid, &binding.source_oid, deadline).await?;
-    let pack = fs::read(&pack_path).map_err(Error::internal)?;
-    let idx = fs::read(&idx_path).map_err(Error::internal)?;
-    let (planned, pack_id) = planned_pack(&pack, &idx)?;
     let publication = Publication {
         namespace_id,
         view,

@@ -3,22 +3,6 @@ use std::path::PathBuf;
 
 const SCRIPT: &str = r#"sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > "$1"; trap "" TERM; while :; do sleep 1; done"#;
 
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("rootyard-s4-proc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn try_pids(path: &FsPath) -> Option<(i32, i32)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut values = text.split_whitespace().filter_map(|value| value.parse::<i32>().ok());
@@ -35,17 +19,6 @@ async fn wait_pids(path: &FsPath) -> (i32, i32) {
     panic!("test Git wrapper did not publish its process group");
 }
 
-async fn wait_absent(pid: i32) {
-    let path = std::path::PathBuf::from(format!("/proc/{pid}"));
-    for _ in 0..50 {
-        if !path.exists() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("process {pid} survived bounded process-group cleanup");
-}
-
 fn command(pidfile: &FsPath) -> Command {
     let mut cmd = base_command(FsPath::new("/bin/sh"));
     cmd.args(["-c", SCRIPT, "sh", pidfile.to_str().unwrap()]);
@@ -55,26 +28,36 @@ fn command(pidfile: &FsPath) -> Command {
 #[cfg(unix)]
 #[tokio::test]
 async fn timeout_kills_process_group_and_reaps_leader() {
-    let dir = TestDir::new();
-    let pidfile = dir.0.join("timeout.pid");
+    let scratch = ScratchDir::create("rootyard-s4-proc-order").unwrap();
+    let root = scratch.root().to_path_buf();
+    let pidfile = root.join("timeout.pid");
     let deadline = Instant::now() + Duration::from_millis(700);
-    let error = run_git_bounded(command(&pidfile), GitStdin::Null, 1024, deadline, Error::internal("failed"))
-        .await
-        .unwrap_err();
+    let error = with_scratch(
+        vec![scratch.hold()],
+        run_git_bounded(command(&pidfile), GitStdin::Null, 1024, deadline, Error::internal("failed")),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
     let (leader, grandchild) = wait_pids(&pidfile).await;
-    wait_absent(leader).await;
-    wait_absent(grandchild).await;
+    assert!(root.exists(), "the scratch directory vanished before the reaped check");
+    assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
+    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
+    drop(scratch);
+    assert!(!root.exists());
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn cancelled_future_drop_kills_process_group_and_reaps_leader() {
-    let dir = TestDir::new();
-    let pidfile = dir.0.join("cancel.pid");
+    let scratch = ScratchDir::create("rootyard-s4-proc-order").unwrap();
+    let root = scratch.root().to_path_buf();
+    let pidfile = root.join("cancel.pid");
     let deadline = Instant::now() + Duration::from_secs(30);
-    let future = run_git_bounded(command(&pidfile), GitStdin::Null, 1024, deadline, Error::internal("failed"));
-    tokio::pin!(future);
+    let mut future = Box::pin(with_scratch(
+        vec![scratch.hold()],
+        run_git_bounded(command(&pidfile), GitStdin::Null, 1024, deadline, Error::internal("failed")),
+    ));
     let (leader, grandchild) = loop {
         if let Some(pids) = try_pids(&pidfile) {
             break pids;
@@ -85,6 +68,14 @@ async fn cancelled_future_drop_kills_process_group_and_reaps_leader() {
         }
     };
     drop(future);
-    wait_absent(leader).await;
-    wait_absent(grandchild).await;
+    drop(scratch);
+    for _ in 0..100 {
+        if !root.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!root.exists(), "the scratch directory outlived the cancelled Git command");
+    assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
+    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
 }

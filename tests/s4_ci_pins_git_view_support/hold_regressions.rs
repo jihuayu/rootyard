@@ -12,10 +12,16 @@ use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
 const STALL_SCRIPT: &str = r#"#!/bin/sh
+scratch=""
+for arg in "$@"; do
+  case "$arg" in
+    *rootyard-s4-view*) scratch="$(dirname "$arg")" ;;
+  esac
+done
 for arg in "$@"; do
   if [ "$arg" = "upload-pack" ] || [ "$arg" = "bundle" ]; then
     sh -c 'trap "" TERM; while :; do sleep 1; done' &
-    printf '%s %s\n' "$$" "$!" > "__PIDFILE__"
+    printf '%s %s %s\n' "$$" "$!" "$scratch" > "__PIDFILE__"
     trap "" TERM
     while :; do sleep 1; done
   fi
@@ -186,12 +192,12 @@ async fn spawn_view_server(
 }
 
 #[cfg(unix)]
-async fn wait_pids(path: &FsPath, tries: usize) -> Result<(String, String)> {
+async fn wait_pids(path: &FsPath, tries: usize) -> Result<(String, String, String)> {
     for _ in 0..tries {
         if let Ok(text) = std::fs::read_to_string(path) {
             let mut parts = text.split_whitespace();
-            if let (Some(leader), Some(grandchild)) = (parts.next(), parts.next()) {
-                return Ok((leader.to_owned(), grandchild.to_owned()));
+            if let (Some(leader), Some(grandchild), Some(scratch)) = (parts.next(), parts.next(), parts.next()) {
+                return Ok((leader.to_owned(), grandchild.to_owned(), scratch.to_owned()));
             }
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -200,15 +206,18 @@ async fn wait_pids(path: &FsPath, tries: usize) -> Result<(String, String)> {
 }
 
 #[cfg(unix)]
-async fn assert_reaped(pids: &[String]) -> Result<()> {
-    for _ in 0..60 {
-        let alive = pids.iter().filter(|pid| PathBuf::from(format!("/proc/{pid}")).exists()).count();
-        if alive == 0 {
+async fn wait_scratch_gone(scratch: &str, pids: &[String]) -> Result<()> {
+    ensure!(!scratch.is_empty(), "the stalled Git child did not publish its scratch directory");
+    let root = PathBuf::from(scratch);
+    for _ in 0..200 {
+        if !root.exists() {
+            let alive = pids.iter().filter(|pid| PathBuf::from(format!("/proc/{pid}")).exists()).count();
+            ensure!(alive == 0, "a Git view child survived scratch deletion: {pids:?}");
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    Err(anyhow::anyhow!("a Git view child survived kill-and-reap: {pids:?}"))
+    Err(anyhow::anyhow!("the Git view scratch directory was never removed: {}", root.display()))
 }
 
 pub async fn bounded_child_lifecycle() -> Result<()> {
@@ -259,17 +268,17 @@ pub async fn bounded_child_lifecycle() -> Result<()> {
             .status();
         ensure!(status == StatusCode::GATEWAY_TIMEOUT, "stalled Git view returned {status}");
         #[cfg(unix)]
-        let (leader, grandchild) = wait_pids(&pidfile, 60).await?;
+        let (leader, grandchild, scratch_dir) = wait_pids(&pidfile, 60).await?;
         #[cfg(unix)]
-        assert_reaped(&[leader, grandchild]).await?;
+        wait_scratch_gone(&scratch_dir, &[leader, grandchild]).await?;
         let _ = std::fs::remove_file(&pidfile);
         let url = format!("{timeout_url}/api/views/{view}/bundle");
         let status = reqwest::Client::new().get(url).bearer_auth(&cluster.owner.token).send().await?.status();
         ensure!(status == StatusCode::GATEWAY_TIMEOUT, "stalled bundle returned {status}");
         #[cfg(unix)]
-        let (leader, grandchild) = wait_pids(&pidfile, 60).await?;
+        let (leader, grandchild, scratch_dir) = wait_pids(&pidfile, 60).await?;
         #[cfg(unix)]
-        assert_reaped(&[leader, grandchild]).await?;
+        wait_scratch_gone(&scratch_dir, &[leader, grandchild]).await?;
         timeout_server.abort();
 
         let notify = Arc::new(Notify::new());
@@ -287,15 +296,118 @@ pub async fn bounded_child_lifecycle() -> Result<()> {
         let pids = wait_pids(&pidfile, 600).await;
         notify.notify_waiters();
         #[cfg(unix)]
-        let (leader, grandchild) = pids?;
+        let (leader, grandchild, scratch_dir) = pids?;
         let status = response.await??;
         ensure!(status == StatusCode::REQUEST_TIMEOUT, "cancelled Git view returned {status}");
         #[cfg(unix)]
-        assert_reaped(&[leader, grandchild]).await?;
+        wait_scratch_gone(&scratch_dir, &[leader, grandchild]).await?;
         ensure!(slots.available_permits() == 2, "a cancelled Git view leaked a Git slot");
         cancel_server.abort();
         Ok(())
     }
     .await;
     cluster.finish(outcome).await
+}
+
+async fn cluster_incarnation(pool: &deadpool_postgres::Pool) -> Result<Uuid> {
+    let row = pool
+        .get()
+        .await?
+        .query_one("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[])
+        .await?;
+    Ok(row.get(0))
+}
+
+/// Restores `public.cluster_authority.incarnation` even when a test fails early.
+pub struct ClusterAuthorityRestoreGuard {
+    db_url: String,
+    original_incarnation: Uuid,
+    disarmed: bool,
+}
+
+impl ClusterAuthorityRestoreGuard {
+    pub async fn rotate(pool: &deadpool_postgres::Pool, next: Uuid) -> Result<Self> {
+        let db_url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
+        let original_incarnation = cluster_incarnation(pool).await?;
+        let guard = Self { db_url, original_incarnation, disarmed: false };
+        let client = pool.get().await?;
+        client
+            .execute(
+                "UPDATE public.cluster_authority SET incarnation=$1, rotated_at=clock_timestamp() WHERE singleton=true",
+                &[&next],
+            )
+            .await?;
+        Ok(guard)
+    }
+
+    pub async fn restore(&mut self, pool: &deadpool_postgres::Pool) -> Result<()> {
+        let client = pool.get().await?;
+        client
+            .execute(
+                "UPDATE public.cluster_authority SET incarnation=$1 WHERE singleton=true",
+                &[&self.original_incarnation],
+            )
+            .await?;
+        self.disarmed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ClusterAuthorityRestoreGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        let db_url = self.db_url.clone();
+        let original = self.original_incarnation;
+        let handle = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok((client, connection)) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls).await else {
+                    return;
+                };
+                let task = tokio::spawn(connection);
+                let _ = client
+                    .execute("UPDATE public.cluster_authority SET incarnation=$1 WHERE singleton=true", &[&original])
+                    .await;
+                drop(client);
+                let _ = task.await;
+            });
+        });
+        let _ = handle.join();
+    }
+}
+
+pub async fn cluster_authority_restores_on_failure_and_panic() -> Result<()> {
+    let cluster = Cluster::setup().await?;
+    let baseline = cluster_incarnation(&cluster.pool).await?;
+    let rotated_err = Uuid::new_v4();
+    let failed: Result<()> = async {
+        let _guard = ClusterAuthorityRestoreGuard::rotate(&cluster.pool, rotated_err).await?;
+        ensure!(
+            cluster_incarnation(&cluster.pool).await? == rotated_err,
+            "the cluster authority rotation was not applied"
+        );
+        Err(anyhow::anyhow!("simulated failure before explicit restore"))
+    }
+    .await;
+    ensure!(failed.is_err(), "the simulated failure returned Ok");
+    ensure!(
+        cluster_incarnation(&cluster.pool).await? == baseline,
+        "the cluster authority was not restored after the simulated failure"
+    );
+    let rotated_panic = Uuid::new_v4();
+    let panicked = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        let _guard = ClusterAuthorityRestoreGuard::rotate(&cluster.pool, rotated_panic).await.expect("rotate");
+        panic!("simulated panic before explicit restore");
+    }))
+    .await;
+    ensure!(panicked.is_err(), "the simulated panic did not unwind");
+    ensure!(
+        cluster_incarnation(&cluster.pool).await? == baseline,
+        "the cluster authority was not restored after the simulated panic"
+    );
+    cluster.finish(Ok(())).await
 }

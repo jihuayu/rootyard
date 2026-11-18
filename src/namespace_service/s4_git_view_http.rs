@@ -7,7 +7,7 @@
 //! ever exposed.
 use super::views;
 use super::views::s4_git_proc::{
-    GitStdin, META_OUTPUT_CAP, base_command, git_bytes, git_clone, run_git_bounded,
+    GitStdin, META_OUTPUT_CAP, ScratchDir, base_command, git_bytes, git_clone, run_git_bounded, with_scratch,
 };
 use crate::{
     AppState, Error, auth, db::Identity, members::models::Role,
@@ -19,42 +19,9 @@ use axum::{
     http::{HeaderMap, HeaderName, StatusCode, header},
     response::Response,
 };
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 use tokio::time::Instant;
 use uuid::Uuid;
-
-/// Disposable tree removed before the response is returned.
-struct Scratch {
-    root: PathBuf,
-}
-
-impl Scratch {
-    fn create() -> Result<Self, Error> {
-        let root = std::env::temp_dir().join(format!("rootyard-s4-view-http-{}", Uuid::new_v4()));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new().recursive(true).mode(0o700).create(&root).map_err(Error::internal)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(&root).map_err(Error::internal)?;
-        Ok(Self { root })
-    }
-
-    fn work(&self) -> PathBuf {
-        self.root.join("work")
-    }
-
-    fn bare(&self) -> PathBuf {
-        self.root.join("repo.git")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
 
 /// Re-prove the recorded view binding, the live repository authority and the
 /// retained root before a single object is served.
@@ -109,7 +76,7 @@ async fn materialize_projected_bare(
     state: &AppState,
     view: &views::View,
     root_id: Uuid,
-    scratch: &Scratch,
+    scratch: &ScratchDir,
     deadline: Instant,
 ) -> Result<PathBuf, Error> {
     let producer = crate::ci_pins::s4_pin::Producer::open(state)?;
@@ -122,43 +89,40 @@ async fn materialize_projected_bare(
         deadline,
     )
     .await?;
-    git_clone(
-        &state.config.git,
-        holder.path(),
-        &scratch.work(),
-        &["--no-local", "--no-hardlinks", "--no-tags"],
-        deadline,
-    )
-    .await?;
-    let projected = views::s4_git_view::project(&state.config.git, &scratch.work(), &view.source_oid, &view.subdir, deadline)
-        .await?;
-    if projected != view.projected_oid {
-        return Err(Error(StatusCode::CONFLICT, "view projection no longer matches its recorded head"));
-    }
-    let bare = scratch.bare();
-    git_clone(
-        &state.config.git,
-        &scratch.work(),
-        &bare,
-        &["--bare", "--no-local", "--no-hardlinks", "--no-tags", "--single-branch", "--branch", "projected"],
-        deadline,
-    )
-    .await?;
-    for args in [
-        &["symbolic-ref", "HEAD", "refs/heads/projected"][..],
-        &["config", "uploadpack.allowAnySHA1InWant", "false"][..],
-        &["config", "uploadpack.allowReachableSHA1InWant", "false"][..],
-    ] {
-        let _ = git_bytes(
+    with_scratch(vec![scratch.hold(), holder.hold()], async {
+        let git = &state.config.git;
+        let work = scratch.work();
+        git_clone(
             &state.config.git,
-            &bare,
-            args,
+            holder.path(),
+            &scratch.work(),
+            &["--no-local", "--no-hardlinks", "--no-tags"],
             deadline,
-            "Git view projection failed",
         )
         .await?;
-    }
-    Ok(bare)
+        let projected = views::s4_git_view::project(git, &work, &view.source_oid, &view.subdir, deadline).await?;
+        if projected != view.projected_oid {
+            return Err(Error(StatusCode::CONFLICT, "view projection no longer matches its recorded head"));
+        }
+        let bare = scratch.bare();
+        git_clone(
+            &state.config.git,
+            &work,
+            &bare,
+            &["--bare", "--no-local", "--no-hardlinks", "--no-tags", "--single-branch", "--branch", "projected"],
+            deadline,
+        )
+        .await?;
+        for args in [
+            &["symbolic-ref", "HEAD", "refs/heads/projected"][..],
+            &["config", "uploadpack.allowAnySHA1InWant", "false"][..],
+            &["config", "uploadpack.allowReachableSHA1InWant", "false"][..],
+        ] {
+            let _ = git_bytes(&state.config.git, &bare, args, deadline, "Git view projection failed").await?;
+        }
+        Ok(bare)
+    })
+    .await
 }
 
 fn reply(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> Result<Response, Error> {
@@ -184,30 +148,33 @@ pub(super) async fn info_refs(
         .try_acquire_owned()
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let deadline = Instant::now() + state.config.git_timeout;
-    let advertised = super::run_bounded(deadline, async {
-        let root_id = verify_active_binding(state, view, view.id).await?;
-        let scratch = Scratch::create()?;
-        let bare = materialize_projected_bare(state, view, root_id, &scratch, deadline).await?;
-        let mut cmd = base_command(&state.config.git);
-        cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
-        if let Some(proto) = protocol {
-            cmd.env("GIT_PROTOCOL", proto);
-        }
-        cmd.args(["upload-pack", "--stateless-rpc", "--advertise-refs"]).arg(bare);
-        let advertised = run_git_bounded(
+    let root_id = super::run_bounded(deadline, verify_active_binding(state, view, view.id)).await?;
+    let scratch = ScratchDir::create("rootyard-s4-view-http")?;
+    let bare = materialize_projected_bare(state, view, root_id, &scratch, deadline).await?;
+    let mut cmd = base_command(&state.config.git);
+    cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
+    if let Some(proto) = protocol {
+        cmd.env("GIT_PROTOCOL", proto);
+    }
+    cmd.args(["upload-pack", "--stateless-rpc", "--advertise-refs"]).arg(bare);
+    let advertised = with_scratch(
+        vec![scratch.hold()],
+        run_git_bounded(
             cmd,
             GitStdin::Null,
             META_OUTPUT_CAP.min(super::ADVERTISE_LIMIT),
             deadline,
             Error(StatusCode::SERVICE_UNAVAILABLE, "projected Git view unavailable"),
-        )
-        .await?;
-        views::load_for_actor(state, actor, view.id).await?;
-        auth::verify_active(&state.pool, actor, view.repository_id, RepoAction::ContentsRead, Role::Read).await?;
-        verify_active_binding(state, view, view.id).await?;
-        Ok(advertised)
-    })
+        ),
+    )
     .await?;
+    super::run_bounded(deadline, views::load_for_actor(state, actor, view.id)).await?;
+    super::run_bounded(
+        deadline,
+        auth::verify_active(&state.pool, actor, view.repository_id, RepoAction::ContentsRead, Role::Read),
+    )
+    .await?;
+    super::run_bounded(deadline, verify_active_binding(state, view, view.id)).await?;
     let mut body = super::service_prefix("git-upload-pack");
     body.extend_from_slice(&advertised);
     reply(StatusCode::OK, "application/x-git-upload-pack-advertisement", body)
@@ -229,37 +196,40 @@ pub(super) async fn upload_pack(
         .try_acquire_owned()
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let deadline = Instant::now() + state.config.git_timeout;
-    let pack = super::run_bounded(deadline, async {
-        let scratch = Scratch::create()?;
-        let (req_file, _tmp_guard) =
-            super::spool_body_to_temp(&scratch.root, view.id, body, gzipped, max_req, deadline).await?;
-        let root_id = verify_active_binding(state, view, view.id).await?;
-        let bare = materialize_projected_bare(state, view, root_id, &scratch, deadline).await?;
-        let mut cmd = base_command(&state.config.git);
-        cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
-        if let Some(proto) = protocol.as_deref() {
-            cmd.env("GIT_PROTOCOL", proto);
-        }
-        cmd.args(["upload-pack", "--stateless-rpc"]).arg(bare);
-        let max_out = usize::try_from(state.config.max_output_bytes)
-            .unwrap_or(super::UPLOAD_RESULT_CAP)
-            .min(super::UPLOAD_RESULT_CAP);
-        let pack = run_git_bounded(
+    let scratch = ScratchDir::create("rootyard-s4-view-http")?;
+    let root = scratch.root();
+    let (req_file, _tmp_guard) = super::spool_body_to_temp(root, view.id, body, gzipped, max_req, deadline).await?;
+    let root_id = super::run_bounded(deadline, verify_active_binding(state, view, view.id)).await?;
+    let bare = materialize_projected_bare(state, view, root_id, &scratch, deadline).await?;
+    let mut cmd = base_command(&state.config.git);
+    cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects"]);
+    if let Some(proto) = protocol.as_deref() {
+        cmd.env("GIT_PROTOCOL", proto);
+    }
+    cmd.args(["upload-pack", "--stateless-rpc"]).arg(bare);
+    let max_out = usize::try_from(state.config.max_output_bytes)
+        .unwrap_or(super::UPLOAD_RESULT_CAP)
+        .min(super::UPLOAD_RESULT_CAP);
+    let pack = with_scratch(
+        vec![scratch.hold()],
+        run_git_bounded(
             cmd,
             GitStdin::File(req_file),
             max_out,
             deadline,
             Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request"),
-        )
-        .await?;
-        if pack.get(4..).is_some_and(|rest| rest.starts_with(b"ERR ")) {
-            return Err(Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request"));
-        }
-        views::load_for_actor(state, actor, view.id).await?;
-        auth::verify_active(&state.pool, actor, view.repository_id, RepoAction::ContentsRead, Role::Read).await?;
-        verify_active_binding(state, view, view.id).await?;
-        Ok(pack)
-    })
+        ),
+    )
     .await?;
+    if pack.get(4..).is_some_and(|rest| rest.starts_with(b"ERR ")) {
+        return Err(Error(StatusCode::BAD_REQUEST, "invalid or unauthorized Git object request"));
+    }
+    super::run_bounded(deadline, views::load_for_actor(state, actor, view.id)).await?;
+    super::run_bounded(
+        deadline,
+        auth::verify_active(&state.pool, actor, view.repository_id, RepoAction::ContentsRead, Role::Read),
+    )
+    .await?;
+    super::run_bounded(deadline, verify_active_binding(state, view, view.id)).await?;
     reply(StatusCode::OK, "application/x-git-upload-pack-result", pack)
 }
