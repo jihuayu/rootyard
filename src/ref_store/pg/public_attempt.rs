@@ -349,7 +349,7 @@ impl PgRefStore {
         bound(tx, deadline).await.map_err(|error| {
             PackCommitError::from(match error {
                 RefStoreError::Timeout => RefStoreError::Timeout,
-                _ => RefStoreError::Database("public attempt lookup database error"),
+                _ => RefStoreError::Database("public attempt lookup database error".into()),
             })
         })?;
 
@@ -370,7 +370,7 @@ impl PgRefStore {
         bound(tx, deadline).await.map_err(|error| {
             PackCommitError::from(match error {
                 RefStoreError::Timeout => RefStoreError::Timeout,
-                _ => RefStoreError::Database("public attempt lookup database error"),
+                _ => RefStoreError::Database("public attempt lookup database error".into()),
             })
         })?;
 
@@ -791,7 +791,7 @@ fn lookup_db_error(error: tokio_postgres::Error) -> RefStoreError {
         Some(code) if *code == SqlState::QUERY_CANCELED || *code == SqlState::LOCK_NOT_AVAILABLE => {
             RefStoreError::Timeout
         }
-        _ => RefStoreError::Database("public attempt lookup database error"),
+        _ => RefStoreError::Database("public attempt lookup database error".into()),
     }
 }
 
