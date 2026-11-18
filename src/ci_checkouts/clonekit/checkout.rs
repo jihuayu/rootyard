@@ -18,7 +18,7 @@ use super::{
     },
     manifest::{
         CloneKitError, CloneKitManifest, CloneKitStatus, compute_file_sha256, default_git_timeout,
-        ensure_not_cancelled, ensure_private_dir, run_git_command, write_atomic_private_file,
+        ensure_not_cancelled, ensure_private_dir, read_pack_trailer_hex, run_git_command, write_atomic_private_file,
     },
 };
 use crate::blob_store::{
@@ -425,10 +425,26 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
         req.cancel.as_ref(),
     )?;
 
-    let pack_sha = &manifest.pack.as_ref().ok_or(CloneKitError::MissingKit)?.sha256;
+    let pack_id = match read_pack_trailer_hex(&staged_pack, claims.object_format) {
+        Ok(pack_id) => pack_id,
+        Err(err) => {
+            return if allow_fallback {
+                let clean_work = work_repo.with_file_name("checkout-fallback");
+                run_stock_git_checkout(
+                    req,
+                    clean_work,
+                    lease,
+                    CheckoutStrategy::StockGitFallback { reason: FallbackReason::CorruptKit },
+                )
+                .await
+            } else {
+                Err(err)
+            };
+        }
+    };
     let pack_dir = work_repo.join(".git").join("objects").join("pack");
     let (dst_pack, dst_idx) =
-        (pack_dir.join(format!("pack-{pack_sha}.pack")), pack_dir.join(format!("pack-{pack_sha}.idx")));
+        (pack_dir.join(format!("pack-{pack_id}.pack")), pack_dir.join(format!("pack-{pack_id}.idx")));
     fs::copy(&staged_pack, &dst_pack).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
     fs::copy(&staged_idx, &dst_idx).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
 

@@ -3,7 +3,7 @@
 use std::{
     fmt,
     fs::{self, Permissions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
     process::Command,
@@ -356,6 +356,29 @@ pub(super) fn valid_branch_ref(raw: &str) -> bool {
         && !raw.bytes().any(|b| b.is_ascii_control() || b == b'\\' || b == b' ')
 }
 
+/// Read the fixed-size Git pack trailer checksum without hashing the pack body.
+///
+/// Git discovers packs as `pack-<trailer>.<pack|idx>` in both SHA-1 and SHA-256
+/// repositories, so this trailer (not the whole-file SHA-256 digest) is the
+/// canonical pack basename.
+pub(super) fn read_pack_trailer_hex(path: &Path, object_format: CloneKitObjectFormat) -> Result<String, CloneKitError> {
+    let meta = fs::symlink_metadata(path).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(CloneKitError::CorruptArtifact(format!("{} is not a regular file", path.display())));
+    }
+    let trailer_len = object_format.oid_hex_len() / 2;
+    let header_len = 12u64;
+    if meta.len() < header_len.saturating_add(trailer_len as u64) {
+        return Err(CloneKitError::CorruptArtifact("staged pack shorter than header plus trailer".into()));
+    }
+    let mut file = fs::File::open(path).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
+    file.seek(SeekFrom::Start(meta.len() - trailer_len as u64))
+        .map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
+    let mut trailer = [0u8; 32];
+    file.read_exact(&mut trailer[..trailer_len]).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
+    Ok(hex::encode(&trailer[..trailer_len]))
+}
+
 /// Stream-hash a regular file to lowercase SHA-256 hex + exact byte length.
 pub(super) fn compute_file_sha256(path: &Path) -> Result<(String, u64), CloneKitError> {
     let meta = fs::symlink_metadata(path).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?;
@@ -456,4 +479,43 @@ pub(super) fn ensure_not_cancelled(cancel: Option<&CancellationToken>) -> Result
 /// Keep default wait bounded across tests and helpers.
 pub(super) const fn default_git_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+#[cfg(test)]
+mod pack_trailer_tests {
+    use super::*;
+
+    #[test]
+    fn pack_trailer_reads_format_sized_tail_and_rejects_short_files() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let pack = dir.path().join("owned.pack");
+        let header = b"PACK\x00\x00\x00\x02\x00\x00\x00\x00";
+
+        let mut sha1 = header.to_vec();
+        sha1.extend_from_slice(&[0x11; 20]);
+        fs::write(&pack, &sha1).expect("sha1 pack");
+        assert_eq!(
+            read_pack_trailer_hex(&pack, CloneKitObjectFormat::Sha1).expect("sha1 trailer"),
+            hex::encode([0x11; 20])
+        );
+
+        let mut sha256 = header.to_vec();
+        sha256.extend_from_slice(&[0x22; 32]);
+        fs::write(&pack, &sha256).expect("sha256 pack");
+        assert_eq!(
+            read_pack_trailer_hex(&pack, CloneKitObjectFormat::Sha256).expect("sha256 trailer"),
+            hex::encode([0x22; 32])
+        );
+
+        fs::write(&pack, [0u8; 31]).expect("short sha1 pack");
+        assert!(matches!(
+            read_pack_trailer_hex(&pack, CloneKitObjectFormat::Sha1),
+            Err(CloneKitError::CorruptArtifact(_))
+        ));
+        fs::write(&pack, [0u8; 43]).expect("short sha256 pack");
+        assert!(matches!(
+            read_pack_trailer_hex(&pack, CloneKitObjectFormat::Sha256),
+            Err(CloneKitError::CorruptArtifact(_))
+        ));
+    }
 }
