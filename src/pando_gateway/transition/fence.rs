@@ -24,7 +24,8 @@ pub(super) async fn begin(state: &AppState, repo_id: Uuid, direction: super::Dir
     let tx = client.transaction().await.map_err(Error::internal)?;
     let row = tx
         .query_opt(
-            "SELECT storage_backend,state,storage_generation,backend_transition_epoch,transition_state \
+            "SELECT storage_backend,state,storage_generation,backend_transition_epoch,transition_state, \
+                    deleted_at IS NOT NULL AS deleted, archived_at IS NOT NULL AS archived \
         FROM repositories WHERE id=$1 FOR UPDATE",
             &[&repo_id],
         )
@@ -36,7 +37,18 @@ pub(super) async fn begin(state: &AppState, repo_id: Uuid, direction: super::Dir
     let generation: i64 = row.get("storage_generation");
     let epoch: i64 = row.get("backend_transition_epoch");
     let transition_state: String = row.get("transition_state");
+    let deleted: bool = row.get("deleted");
+    let archived: bool = row.get("archived");
+    if deleted {
+        return Err(Error::not_found());
+    }
+    if archived {
+        return Err(Error(StatusCode::FORBIDDEN, "repository is archived and read-only"));
+    }
     if repo_state != "ready" || !matches!(transition_state.as_str(), "stable" | "failed") {
+        return Err(conflict());
+    }
+    if crate::auth::lifecycle::has_active_transfer(&*tx, repo_id).await? {
         return Err(conflict());
     }
     let expected = match direction {

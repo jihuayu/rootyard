@@ -2,7 +2,8 @@
 use super::handlers::{lfs_json, reauthorize_repo, sanitize_headers};
 use crate::{
     AppState, Error, auth,
-    lfs::{models, storage},
+    lfs::{hydration, models, storage},
+    storage::remote_key_claims::{has_active_delete_claim, lock_object_key, wait_or_clear_delete_claim},
 };
 use axum::{
     body::Body,
@@ -13,8 +14,12 @@ use axum::{
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
+
+const MAX_UPLOAD_CLAIM_RETRIES: usize = 8;
 
 static UPLOAD_WAITERS: OnceLock<Mutex<HashMap<Uuid, usize>>> = OnceLock::new();
 fn waiters() -> &'static Mutex<HashMap<Uuid, usize>> {
@@ -121,6 +126,7 @@ async fn upload_inner(
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
     }
 
+    let remote_store = hydration::remote_store(&state.storage.root).map_err(Error::internal)?;
     let (repo_id, tenant_id, expected_size) = {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
@@ -141,26 +147,79 @@ async fn upload_inner(
             )
             .await
             .map_err(Error::internal)?;
-        let (expected, inserted) = if let Some(r) = row {
-            let db_size: i64 = r.get(0);
-            if size_param.is_some_and(|sz| sz != db_size) {
-                return Err(Error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object size mismatch"));
+        let fast_ready = match &row {
+            Some(r) if r.get::<_, &str>(1) == "ready" => {
+                let db_size: i64 = r.get(0);
+                if size_param.is_some_and(|sz| sz != db_size) {
+                    return Err(Error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object size mismatch"));
+                }
+                Some(db_size as u64)
             }
-            (db_size as u64, false)
-        } else if let Some(sz) = size_param {
-            tx.execute(
-                "INSERT INTO lfs_objects (tenant_id, repository_id, oid, size, state) VALUES ($1, $2, $3, $4, 'pending')",
-                &[&tenant_id, &repo_id, &oid, &sz],
-            )
-            .await
-            .map_err(Error::internal)?;
-            (sz as u64, true)
-        } else {
-            return Err(Error::not_found());
+            _ => None,
         };
-        auth::finish_tx(tx, &actor, inserted).await?;
+        auth::finish_tx(tx, &actor, false).await?;
         drop(client);
-        (repo_id, tenant_id, expected)
+        if let Some(expected) = fast_ready {
+            (repo_id, tenant_id, expected)
+        } else {
+            let mut resolved = None;
+            for attempt in 0..MAX_UPLOAD_CLAIM_RETRIES {
+                wait_or_clear_delete_claim(&state.pool, remote_store.as_ref(), tenant_id, "lfs", &oid, deadline).await?;
+                let mut client = state.pool.get().await.map_err(Error::internal)?;
+                let tx = client.transaction().await.map_err(Error::internal)?;
+                let reauth = auth::authorize_repo_with_role(
+                    &tx,
+                    &actor,
+                    &owner,
+                    name,
+                    auth::Role::Write,
+                    crate::token_scopes::RepoAction::ContentsWrite,
+                )
+                .await?;
+                if reauth.repo_id != repo_id || reauth.owner_id != tenant_id {
+                    return Err(Error(StatusCode::CONFLICT, "repository identity changed"));
+                }
+                lock_object_key(&tx, tenant_id, "lfs", &oid).await?;
+                if has_active_delete_claim(&tx, tenant_id, "lfs", &oid).await? {
+                    tx.rollback().await.map_err(Error::internal)?;
+                    drop(client);
+                    if attempt + 1 >= MAX_UPLOAD_CLAIM_RETRIES || Instant::now() >= deadline {
+                        return Err(Error(StatusCode::CONFLICT, "remote object delete claim in progress"));
+                    }
+                    sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                let row = tx
+                    .query_opt(
+                        "SELECT size FROM lfs_objects WHERE tenant_id = $1 AND repository_id = $2 AND oid = $3 FOR UPDATE",
+                        &[&tenant_id, &repo_id, &oid],
+                    )
+                    .await
+                    .map_err(Error::internal)?;
+                let (expected, inserted) = if let Some(r) = row {
+                    let db_size: i64 = r.get(0);
+                    if size_param.is_some_and(|sz| sz != db_size) {
+                        return Err(Error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object size mismatch"));
+                    }
+                    (db_size as u64, false)
+                } else if let Some(sz) = size_param {
+                    tx.execute(
+                        "INSERT INTO lfs_objects (tenant_id, repository_id, oid, size, state) VALUES ($1, $2, $3, $4, 'pending')",
+                        &[&tenant_id, &repo_id, &oid, &sz],
+                    )
+                    .await
+                    .map_err(Error::internal)?;
+                    (sz as u64, true)
+                } else {
+                    return Err(Error::not_found());
+                };
+                auth::finish_tx(tx, &actor, inserted).await?;
+                drop(client);
+                resolved = Some((repo_id, tenant_id, expected));
+                break;
+            }
+            resolved.ok_or(Error(StatusCode::CONFLICT, "remote object delete claim in progress"))?
+        }
     };
 
     let waiter = UploadWaiter::new(repo_id);
@@ -204,6 +263,9 @@ async fn upload_inner(
         drop(client);
         is_ready
     };
+    if already_ready {
+        wait_or_clear_delete_claim(&state.pool, remote_store.as_ref(), tenant_id, "lfs", &oid, deadline).await?;
+    }
     if already_ready
         && storage::ensure_readable(&state.storage.root, repo_id, tenant_id, &oid, expected_size, deadline)
             .await
@@ -222,9 +284,9 @@ async fn upload_inner(
         )
         .await?;
         storage::schedule_remote_repair(
+            state.pool.clone(),
             state.storage.root.clone(),
             repo_id,
-            tenant_id,
             oid.clone(),
             expected_size,
             state.config.git_timeout,
