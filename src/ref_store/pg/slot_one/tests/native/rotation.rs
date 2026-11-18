@@ -5,7 +5,7 @@ use super::db::deadline;
 use super::{
     REF_RETRY, REF_SIDE, Retired, SLOT_ZERO_LANE, db,
     publication::{authorized_commit, capture_baseline, plan_from_baseline, ref_update, stage, wire_digest},
-    readback::{attempt_rows, operation_event_id, public_attempt_event_count, stored_ref},
+    readback::{attempt_rows, operation_event_id, operation_record, public_attempt_event_count, stored_ref},
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use rootyard::blob_store::opendal::BlobStore;
