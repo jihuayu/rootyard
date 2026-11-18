@@ -223,6 +223,13 @@ pub async fn restore(
         ])
         .arg(source.join("metadata.dump"));
     checked(&mut restore).await?;
+    if catalog::has_public_attempts(manifest.format) {
+        client
+            .batch_execute(
+                "REVOKE EXECUTE ON FUNCTION public.rootyard_ref_store_private_cancellation_evidence() FROM PUBLIC",
+            )
+            .await?;
+    }
     ensure!(schema(&client, manifest.format).await? == manifest.schema_versions, "restored schema mismatch");
     // The catalog projection ends with SET search_path=pg_catalog. Restore the
     // target's public application schema before applying the reviewed upgrade.
@@ -284,7 +291,8 @@ pub async fn restore(
             .get(0);
         ensure!(!unsafe_grants, "restored checkout credentials were not invalidated");
     }
-    if manifest.format >= 6 && manifest.format != FORMAT_PAIRED {
+    let paired = catalog::is_paired(manifest.format);
+    if manifest.format >= 6 && !paired {
         authority::fence(&client).await?;
         // Rotate the storage authority exactly once for the whole restored
         // database before importing any repository closure. Per-repository
@@ -321,7 +329,7 @@ pub async fn restore(
             }
         }
     }
-    if manifest.format == FORMAT_PAIRED {
+    if paired {
         let closure = manifest.blob_closure.as_ref().context("paired archive carries no Blob closure")?;
         ensure!(
             manifest.repositories.iter().all(|r| r.backend.as_deref() == Some("pg_refstore")),

@@ -426,9 +426,9 @@ class DrillWiringTest(unittest.TestCase):
         self.assertIn('self.env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))',
                       method_source("offline_backup_and_fresh_database_restore"))
 
-    def test_drill_stays_on_the_format21_gitfs_family(self):
+    def test_drill_stays_on_the_current_gitfs_archive_family(self):
         self.assertNotIn("serve-blob", self.source)
-        self.assertIn("== 29", self.source)
+        self.assertIn("== 31", self.source)
         self.assertIn("blob_closure", self.source)
 
 
