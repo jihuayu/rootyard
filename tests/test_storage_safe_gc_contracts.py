@@ -18,6 +18,7 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "anti_aba.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "compaction.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "domain.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "error.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "executor.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "git_ops.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "model.rs",
@@ -39,6 +40,8 @@ class StorageSafeGcContractsTest(unittest.TestCase):
         facade = (ROOT / "src" / "storage_lifecycle.rs").read_text(encoding="utf-8")
         self.assertIn("pub mod safe_gc;", facade)
         self.assertLess(len(facade.splitlines()), 110)
+        safe_gc_facade = (ROOT / "src" / "storage_lifecycle" / "safe_gc.rs").read_text(encoding="utf-8")
+        self.assertLess(len(safe_gc_facade.splitlines()), 100)
         self.assertFalse(list((ROOT / "src" / "storage_lifecycle").rglob("mod.rs")))
 
         for path in RUST_FILES:
