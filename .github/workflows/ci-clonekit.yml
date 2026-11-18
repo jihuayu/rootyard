@@ -111,8 +111,14 @@ jobs:
       - name: Clippy and CloneKit unit plus Smart-HTTP integration tests
         run: |
           set -euo pipefail
+          focused_receipt=test-results/ci-clonekit/focused-command.json
+          focused_group=
+          trap 'status=$?; trap - EXIT; set +e; scripts/ci_clonekit_focused_receipt.sh "${focused_group:-invalid}" "$status" "$focused_receipt"; receipt_status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; [ "$receipt_status" -eq 0 ] || exit 1; exit 0' EXIT
+          focused_group=clippy
           cargo clippy --locked --lib --test ci_clonekit -- -D warnings
+          focused_group=lib
           cargo test --locked --lib ci_checkouts::clonekit
+          focused_group=integration
           cargo test --locked --test ci_clonekit
 
       - name: Start job-owned Garage 2.1 S3 fixture
