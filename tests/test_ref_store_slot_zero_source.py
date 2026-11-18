@@ -3,9 +3,10 @@
 The hosted PostgreSQL tests are ignored. These checks pin the executable order
 and the closed gateway boundary so a refactor cannot silently write the private
 operation before its wrapper/attempt, take repository/gate locks before the
-issuer lane, skip the shared restore-incarnation fence, or wire the wrapper into
-the legacy production path. The ignored bodies are checked for positive
-pg_blocking_pids observations, bounded release, and failure-path abort/rollback.
+issuer lane, skip the shared restore-incarnation fence, put a fresh-lane write
+outside the admission savepoint, or wire the wrapper into the legacy production
+path. The ignored bodies are checked for positive pg_blocking_pids observations,
+bounded release, and failure-path abort/rollback.
 """
 from pathlib import Path
 import unittest
@@ -56,12 +57,53 @@ class SlotZeroSourceTest(unittest.TestCase):
             self.production.index('insert_wrapper(tx, request)'),
         )
 
-    def test_slice_never_commits_rolls_back_or_opens_another_connection(self):
-        self.assertNotIn('.commit(', self.production)
-        self.assertNotIn('.rollback(', self.production)
+    def test_slice_never_ends_the_outer_transaction_or_opens_a_connection(self):
+        self.assertNotIn('tx.commit(', self.production)
+        self.assertNotIn('tx.rollback(', self.production)
         self.assertNotIn('pool.get()', self.production)
-        self.assertIn('timeout_at(deadline, admit_slot_zero_inner', self.production)
-        self.assertIn('bound(tx, deadline)', self.production)
+        self.assertIn('tx.savepoint(SLOT_ZERO_SAVEPOINT)', self.production)
+        self.assertIn('nested.commit().await', self.production)
+        self.assertIn('nested.rollback().await', self.production)
+        self.assertIn('ROLLBACK TO SAVEPOINT', self.production)
+        self.assertIn('RELEASE SAVEPOINT', self.production)
+        self.assertIn('bound(&*tx, deadline)', self.production)
+        self.assertIn('timeout_at(deadline, admit_slot_zero_preflight', self.production)
+        self.assertIn('timeout_at(deadline, admit_slot_zero_fresh', self.production)
+
+    def test_fresh_path_is_one_savepoint_before_any_write(self):
+        entry = self.production.split('pub(crate) async fn admit_slot_zero_in_tx', 1)[1].split(
+            'async fn admit_slot_zero_preflight', 1
+        )[0]
+        self.assertIn('tx: &mut Transaction', entry)
+        self.assertLess(entry.index('admit_slot_zero_preflight(&*tx'), entry.index('tx.savepoint(SLOT_ZERO_SAVEPOINT)'))
+        self.assertLess(entry.index('tx.savepoint(SLOT_ZERO_SAVEPOINT)'), entry.index('admit_slot_zero_fresh(&nested'))
+        self.assertIn('nested.commit().await', entry)
+        self.assertIn('nested.rollback().await', entry)
+
+        preflight = self.production.split('async fn admit_slot_zero_preflight', 1)[1].split(
+            '/// The write-capable prefix', 1
+        )[0]
+        for write in ('insert_wrapper(', 'insert_attempt(', 'advance_sequence(', 'insert_operation('):
+            self.assertNotIn(write, preflight)
+
+        fresh = self.production.split('async fn admit_slot_zero_fresh', 1)[1].split(
+            'fn slot_zero_savepoint_begin_failed', 1
+        )[0]
+        markers = [
+            'lock_cluster_incarnation(tx).await',
+            'LockedSequence::preview(',
+            'LockedScope::lock(',
+            'read_gate_in_tx(',
+            'build_plan(preview)',
+            "SET LOCAL synchronous_commit = 'on'",
+            'insert_wrapper(tx, request)',
+            'insert_attempt(tx, request',
+            'advance_sequence(',
+            'insert_operation(tx, plan.identity()',
+            'bind_existing_serving_pending_in_tx',
+        ]
+        positions = [fresh.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
 
     def test_gateway_keeps_the_legacy_reservation_and_binding_path(self):
         publish = PUBLISH.read_text()
@@ -135,7 +177,20 @@ class SlotZeroSourceTest(unittest.TestCase):
         self.assertIn("l.mode <> 'AccessShareLock'", lane)
         self.assertIn('assert_eq!(receipt.sequence, 2)', lane)
         self.assertLess(lane.index('legacy_tx.commit().await'), lane.index('&mut admission'))
-        self.assertGreaterEqual(self.tests.count('#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]'), 6)
+        atomic = self.tests.split('async fn slot_zero_typed_plan_error_rolls_back_only_the_savepoint()', 1)[1].split(
+            '#[tokio::test]', 1
+        )[0]
+        self.assertIn('IssuerLane::new("slot-zero-atomic")', atomic)
+        self.assertIn('slot zero plan rejected after preview', atomic)
+        self.assertIn('INSERT INTO users(id,username)', atomic)
+        self.assertIn('tx.commit().await?', atomic)
+        self.assertIn('ref_store_issuer_lanes', atomic)
+        self.assertIn('ref_store_public_operations', atomic)
+        self.assertIn('ref_store_private_attempts', atomic)
+        self.assertIn('ref_store_operations', atomic)
+        self.assertIn('ref_store_serving_operations', atomic)
+        self.assertIn('for index in 0..5', atomic)
+        self.assertGreaterEqual(self.tests.count('#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]'), 7)
 
     def test_ignored_tests_drive_the_real_admission_entry(self):
         self.assertGreaterEqual(self.tests.count('.admit_slot_zero_in_tx('), 4)

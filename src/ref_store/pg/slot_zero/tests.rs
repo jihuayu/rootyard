@@ -266,9 +266,9 @@ async fn slot_zero_admission_commits_then_exact_retry_replays() -> anyhow::Resul
         let private = Uuid::new_v4();
         let request = slot_zero_request(&fixture, public, private);
         let mut client = fixture.pool.get().await?;
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         let receipt = PgRefStore
-            .admit_slot_zero_in_tx(&tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .admit_slot_zero_in_tx(&mut tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
             .await?;
         assert!(!receipt.replayed);
         assert_eq!(receipt.sequence, 1);
@@ -307,10 +307,10 @@ async fn slot_zero_admission_commits_then_exact_retry_replays() -> anyhow::Resul
         assert_eq!(row.get::<_, String>(11), "pending");
 
         let retry = slot_zero_request(&fixture, public, Uuid::new_v4());
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         let replay = PgRefStore
             .admit_slot_zero_in_tx(
-                &tx,
+                &mut tx,
                 &retry,
                 |_| Err(PackCommitError::Invalid("an exact replay must not build a plan")),
                 deadline(),
@@ -322,9 +322,14 @@ async fn slot_zero_admission_commits_then_exact_retry_replays() -> anyhow::Resul
         tx.rollback().await?;
 
         let next_request = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         let next = PgRefStore
-            .admit_slot_zero_in_tx(&tx, &next_request, |preview| plan_for(&fixture, &next_request, preview), deadline())
+            .admit_slot_zero_in_tx(
+                &mut tx,
+                &next_request,
+                |preview| plan_for(&fixture, &next_request, preview),
+                deadline(),
+            )
             .await?;
         assert_eq!(next.sequence, 2);
         tx.rollback().await?;
@@ -341,10 +346,10 @@ async fn slot_zero_rejects_equal_ids_private_conflict_and_wire_rebinding() -> an
         let private = Uuid::new_v4();
         let equal = slot_zero_request(&fixture, public, public);
         let mut client = fixture.pool.get().await?;
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         let error = PgRefStore
             .admit_slot_zero_in_tx(
-                &tx,
+                &mut tx,
                 &equal,
                 |_| Err(PackCommitError::Invalid("equal ids must not build a plan")),
                 deadline(),
@@ -355,17 +360,17 @@ async fn slot_zero_rejects_equal_ids_private_conflict_and_wire_rebinding() -> an
         tx.rollback().await?;
 
         let request = slot_zero_request(&fixture, public, private);
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         PgRefStore
-            .admit_slot_zero_in_tx(&tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .admit_slot_zero_in_tx(&mut tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
             .await?;
         tx.commit().await?;
 
         let conflict = slot_zero_request(&fixture, Uuid::new_v4(), private);
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         let error = PgRefStore
             .admit_slot_zero_in_tx(
-                &tx,
+                &mut tx,
                 &conflict,
                 |_| Err(PackCommitError::Invalid("private conflict must not build a plan")),
                 deadline(),
@@ -377,10 +382,10 @@ async fn slot_zero_rejects_equal_ids_private_conflict_and_wire_rebinding() -> an
 
         let mut rebind = slot_zero_request(&fixture, public, Uuid::new_v4());
         rebind.wire_digest = RequestDigest::from_bytes([2; 32]);
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         let error = PgRefStore
             .admit_slot_zero_in_tx(
-                &tx,
+                &mut tx,
                 &rebind,
                 |_| Err(PackCommitError::Invalid("wire rebinding must not build a plan")),
                 deadline(),
@@ -411,11 +416,11 @@ async fn slot_zero_replay_rejects_missing_or_wrong_producer_binding() -> anyhow:
         });
         let mut client = fixture.pool.get().await?;
 
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         seed_wrapper_without_binding(&tx, &fixture, &request, plan_digest, proof).await?;
         let error = PgRefStore
             .admit_slot_zero_in_tx(
-                &tx,
+                &mut tx,
                 &request,
                 |_| Err(PackCommitError::Invalid("a replay must not build a plan")),
                 deadline(),
@@ -425,7 +430,7 @@ async fn slot_zero_replay_rejects_missing_or_wrong_producer_binding() -> anyhow:
         assert_ledger_integrity(&error, "slot zero serving producer binding is missing");
         tx.rollback().await?;
 
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         seed_wrapper_without_binding(&tx, &fixture, &request, plan_digest, proof).await?;
         tx.execute(
             "INSERT INTO ref_store_serving_operations(
@@ -436,7 +441,7 @@ async fn slot_zero_replay_rejects_missing_or_wrong_producer_binding() -> anyhow:
         .await?;
         let error = PgRefStore
             .admit_slot_zero_in_tx(
-                &tx,
+                &mut tx,
                 &request,
                 |_| Err(PackCommitError::Invalid("a replay must not build a plan")),
                 deadline(),
@@ -459,9 +464,9 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
         let request = slot_zero_request(&fixture, public, private);
         let mut client = fixture.pool.get().await?;
 
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         let receipt = PgRefStore
-            .admit_slot_zero_in_tx(&tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .admit_slot_zero_in_tx(&mut tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
             .await?;
         assert_eq!(receipt.sequence, 1);
         tx.rollback().await?;
@@ -484,9 +489,9 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
             .get(0);
         assert_eq!((wrappers, lanes, operations, bindings), (0, 0, 0, 0));
 
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         let receipt = PgRefStore
-            .admit_slot_zero_in_tx(&tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .admit_slot_zero_in_tx(&mut tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
             .await?;
         assert_eq!(receipt.sequence, 1);
         tx.commit().await?;
@@ -502,10 +507,10 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
             .await?;
         let mut overflow = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
         overflow.lane = overflow_lane.clone();
-        let tx = client.transaction().await?;
+        let mut tx = client.transaction().await?;
         let error = PgRefStore
             .admit_slot_zero_in_tx(
-                &tx,
+                &mut tx,
                 &overflow,
                 |_| Err(PackCommitError::Invalid("overflow must not build a plan")),
                 deadline(),
@@ -530,13 +535,78 @@ async fn slot_zero_rollback_leaves_no_sequence_or_half_binding_and_rejects_overf
 
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn slot_zero_typed_plan_error_rolls_back_only_the_savepoint() -> anyhow::Result<()> {
+    with_fixture(|fixture| async move {
+        let lane = IssuerLane::new("slot-zero-atomic").unwrap();
+        let public = Uuid::new_v4();
+        let private = Uuid::new_v4();
+        let mut request = slot_zero_request(&fixture, public, private);
+        request.lane = lane.clone();
+        let mut client = fixture.pool.get().await?;
+        let mut tx = client.transaction().await?;
+
+        // The unique lane is absent, so preview inserts last_reserved_sequence=0
+        // before build_plan returns this typed error.
+        let error = PgRefStore
+            .admit_slot_zero_in_tx(
+                &mut tx,
+                &request,
+                |_| Err(PackCommitError::Invalid("slot zero plan rejected after preview")),
+                deadline(),
+            )
+            .await
+            .unwrap_err();
+        match error {
+            PackCommitError::Invalid("slot zero plan rejected after preview") => {}
+            other => panic!("expected the original typed plan error, got {other:?}"),
+        }
+
+        // The outer transaction must still be usable: commit unrelated work.
+        let marker = Uuid::new_v4();
+        tx.execute(
+            "INSERT INTO users(id,username) VALUES($1,$2)",
+            &[&marker, &format!("slotzeroafter{}", &marker.simple().to_string()[..12])],
+        )
+        .await?;
+        tx.commit().await?;
+
+        let committed: bool =
+            client.query_one("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", &[&marker]).await?.get(0);
+        assert!(committed, "unrelated outer transaction work must commit");
+
+        let row = client
+            .query_one(
+                "SELECT
+                   (SELECT count(*) FROM ref_store_issuer_lanes
+                     WHERE repository_id=$1 AND issuer_id=$2 AND lane=$3),
+                   (SELECT count(*) FROM ref_store_public_operations
+                     WHERE repository_id=$1 AND public_id=$4),
+                   (SELECT count(*) FROM ref_store_private_attempts
+                     WHERE repository_id=$1 AND private_id=$5),
+                   (SELECT count(*) FROM ref_store_operations
+                     WHERE repository_id=$1 AND operation_id=$5),
+                   (SELECT count(*) FROM ref_store_serving_operations
+                     WHERE repository_id=$1 AND operation_id=$5)",
+                &[&fixture.repo, &fixture.actor, &lane.as_str(), &public, &private],
+            )
+            .await?;
+        for index in 0..5usize {
+            assert_eq!(row.get::<_, i64>(index), 0, "slot-zero savepoint rollback left a row in column {index}");
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
 async fn slot_zero_restore_rotation_waits_for_admission_commit() -> anyhow::Result<()> {
     with_fixture(|fixture| async move {
         let request = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
         let mut admission = fixture.pool.get().await?;
-        let tx = admission.transaction().await?;
+        let mut tx = admission.transaction().await?;
         let receipt = PgRefStore
-            .admit_slot_zero_in_tx(&tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .admit_slot_zero_in_tx(&mut tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
             .await?;
         assert_eq!(receipt.sequence, 1);
         let admission_pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
@@ -645,12 +715,12 @@ async fn slot_zero_waits_for_legacy_lane_before_scope_and_gate() -> anyhow::Resu
         let (done_tx, done_rx) = oneshot::channel();
         let mut admission = tokio::spawn(async move {
             let mut client = admission_fixture.pool.get().await?;
-            let tx = client.transaction().await?;
+            let mut tx = client.transaction().await?;
             let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
             let _ = pid_tx.send(pid);
             let receipt = PgRefStore
                 .admit_slot_zero_in_tx(
-                    &tx,
+                    &mut tx,
                     &request,
                     |preview| plan_for(&admission_fixture, &request, preview),
                     deadline(),
