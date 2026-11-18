@@ -1,11 +1,23 @@
 //! Default-off staging, arm_digest fence, PG/Ref-CAS reconcile & anti-ABA unit tests (#122).
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
 
 use uuid::Uuid;
+
+use crate::ref_store::{
+    CommitRefsRequest, IssuerLane,
+    core::{
+        contract::CommitMode,
+        state_machine::{
+            AppliedLogId, BeginOperationCommand, CommitRefsCommand, InitializeGateCommand, RefCasCommand,
+            RefCasStateMachine, RepositoryLane, SmPackMode, WireCommitRefsRequest, WireGateInit,
+        },
+        types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget, RefUpdate},
+    },
+};
 
 use super::{
     SafeGcError,
@@ -16,6 +28,7 @@ use super::{
         AuthorityLane, DecisionKind, DecisionState, GcMode, GlobalHoldEntry, GlobalHoldState, InFlightDecisionRecord,
         RetentionProducer, SafeGcArmReceipt, SafeGcObjectFormat,
     },
+    pg_maintenance_dist::{FsSealedRefCasCutpointSource, persist_refcas_cutpoint_snapshot},
     refcas_cut::RefCasReconciledCut,
     store::DurableSafeGcAuthority,
     store_reconcile::PgReconciledBundle,
@@ -257,4 +270,106 @@ fn anti_aba_registry_forbids_reuse_even_after_deletion_and_same_sha_reupload() {
     assert!(matches!(reg.assert_delete_allowed(&k2.object_path, 1), Err(SafeGcError::StaleDeleterFenced(_))));
     let unique: BTreeSet<_> = [k1.object_path, k2.object_path].into_iter().collect();
     assert_eq!(unique.len(), 2);
+}
+
+#[test]
+fn refcas_cut_rejects_event_seq_off_by_one_against_pg_projection() {
+    let history_id = Uuid::new_v4();
+    let base = RefCasReconciledCut {
+        group_id: 0,
+        group_epoch: 1,
+        history_id,
+        sm_applied_log_term: 1,
+        sm_applied_log_index: 3,
+        sm_applied_event_seq: 1,
+        sm_last_event_log_term: 1,
+        sm_last_event_log_index: 3,
+        sm_snapshot_checksum: sha("sm-cut"),
+        pg_projected_log_term: 1,
+        pg_projected_log_index: 3,
+        pg_projected_event_seq: 0,
+        unprojected_jobs_count: 0,
+    };
+    assert!(matches!(base.verify_reconciled(history_id, 3, 1), Err(SafeGcError::IncompleteProof(_))));
+    let mut aligned = base;
+    aligned.pg_projected_event_seq = 1;
+    aligned.verify_reconciled(history_id, 3, 1).unwrap();
+}
+
+fn one_commit_state_machine(repo_id: Uuid, tenant_id: Uuid, history_id: Uuid, main_oid: &str) -> RefCasStateMachine {
+    let mut sm = RefCasStateMachine::new();
+    sm.apply(
+        AppliedLogId { term: 1, index: 1 },
+        RefCasCommand::InitializeGate(InitializeGateCommand {
+            gate: WireGateInit {
+                repository_id: repo_id,
+                tenant_id,
+                object_format: GitObjectFormat::Sha1,
+                history_incarnation: history_id,
+                authority_epoch: 1,
+                group_epoch: 1,
+                head_ref: "refs/heads/main".into(),
+            },
+            lane: RepositoryLane::LegacyUnservedGitfs,
+            pack_mode: SmPackMode::MetadataOnly,
+            authz_floor: 0,
+        }),
+    )
+    .unwrap();
+    let request = CommitRefsRequest::new(
+        repo_id,
+        tenant_id,
+        Uuid::new_v4(),
+        IssuerLane::new("push").unwrap(),
+        1,
+        Uuid::new_v4(),
+        GitObjectFormat::Sha1,
+        history_id,
+        1,
+        1,
+        1,
+        HeadUpdate::Keep,
+        CommitMode::Atomic,
+        vec![RefUpdate::new(
+            RefName::new("refs/heads/main").unwrap(),
+            RefPrecondition::Absent,
+            RefTarget::Oid(GitOid::parse(GitObjectFormat::Sha1, main_oid).unwrap()),
+        )],
+    )
+    .unwrap();
+    let wire = WireCommitRefsRequest::from(&request);
+    sm.apply(
+        AppliedLogId { term: 1, index: 2 },
+        RefCasCommand::BeginOperation(BeginOperationCommand { identity: wire.identity.clone(), logical_tick: 1 }),
+    )
+    .unwrap();
+    sm.apply(
+        AppliedLogId { term: 1, index: 3 },
+        RefCasCommand::CommitRefs(CommitRefsCommand {
+            request: wire,
+            decision_id: None,
+            required_holds: Vec::new(),
+            policy_rejects: BTreeMap::new(),
+            logical_tick: 2,
+        }),
+    )
+    .unwrap();
+    sm
+}
+
+#[test]
+fn persisted_refcas_cutpoint_round_trips_and_corruption_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (tenant_id, repo_id, history_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let main_oid = oid(SafeGcObjectFormat::Sha1, 7);
+    let sm = one_commit_state_machine(repo_id, tenant_id, history_id, &main_oid);
+    let path = persist_refcas_cutpoint_snapshot(dir.path(), repo_id, 0, &sm, &[]).unwrap();
+
+    let source = FsSealedRefCasCutpointSource::new(dir.path());
+    let (group_id, restored) = source.capture_state_machine(repo_id).unwrap().expect("sealed Ref-CAS cutpoint");
+    assert_eq!(group_id, 0);
+    assert_eq!(restored.snapshot().unwrap().body.next_event_seq, 1);
+
+    std::fs::write(&path, b"{\"group_id\":0,\"snapshot\":{\"body\":{}}").unwrap();
+    assert!(matches!(source.capture_state_machine(repo_id), Err(SafeGcError::IncompleteProof(_))));
 }

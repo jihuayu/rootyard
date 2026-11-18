@@ -124,6 +124,15 @@ pub async fn run_claimed_safe_gc_once(
     policy: &Policy,
     owner: Uuid,
 ) -> Result<Option<JobOutcome>> {
+    run_claimed_safe_gc_once_with_refcas(state, policy, owner, None).await
+}
+
+pub async fn run_claimed_safe_gc_once_with_refcas(
+    state: &Arc<AppState>,
+    policy: &Policy,
+    owner: Uuid,
+    refcas_source: Option<&dyn super::pg_maintenance_dist::RefCasCutpointSource>,
+) -> Result<Option<JobOutcome>> {
     let safe_gc_dir = state.storage.root.join("safe-gc");
     if !safe_gc_dir.is_dir() {
         return Ok(None);
@@ -177,7 +186,7 @@ pub async fn run_claimed_safe_gc_once(
         lease_owner: owner,
     };
 
-    match execute_claimed_pg_refstore_job(state, &job, policy).await {
+    match execute_claimed_pg_refstore_job(state, &job, policy, refcas_source).await {
         Ok(res_val) => {
             finish_safe_gc_job_row(state, job_id, "succeeded", res_val, None).await?;
             Ok(Some(JobOutcome {
@@ -216,7 +225,12 @@ async fn finish_safe_gc_job_row(
     Ok(())
 }
 
-async fn execute_claimed_pg_refstore_job(state: &Arc<AppState>, job: &Job, policy: &Policy) -> Result<Value> {
+async fn execute_claimed_pg_refstore_job(
+    state: &Arc<AppState>,
+    job: &Job,
+    policy: &Policy,
+    refcas_source: Option<&dyn super::pg_maintenance_dist::RefCasCutpointSource>,
+) -> Result<Value> {
     let destructive_env = safe_gc_destructive_env_enabled()?;
     let mut barrier_conn = state.pool.get().await?;
     let barrier_tx = barrier_conn.transaction().await?;
@@ -242,7 +256,9 @@ async fn execute_claimed_pg_refstore_job(state: &Arc<AppState>, job: &Job, polic
     }
     let fence_epoch = raw_epoch as u64;
 
-    let run_res = run_safe_gc_phases(state, job, policy, (destructive_env, fence_epoch), (&lease, &pg_fence)).await;
+    let flags = (destructive_env, fence_epoch);
+    let barriers = (&lease, &pg_fence);
+    let run_res = run_safe_gc_phases(state, job, policy, flags, barriers, refcas_source).await;
     pg_fence.release().await;
     let out = run_res?;
     lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
@@ -256,6 +272,7 @@ async fn run_safe_gc_phases(
     policy: &Policy,
     flags: (bool, u64),
     barriers: (&crate::storage::read_leases::Lease, &fence::Fence),
+    refcas_source: Option<&dyn super::pg_maintenance_dist::RefCasCutpointSource>,
 ) -> Result<Value> {
     let (destructive_env, fence_epoch) = flags;
     let (lease, pg_fence) = barriers;
@@ -272,6 +289,15 @@ async fn run_safe_gc_phases(
         reconcile_pg_refstore_authority(&**pg_client, job.repository_id, &blob_store, &authority, Some(fence_epoch))
             .await
             .map_err(|e| anyhow::anyhow!("reconcile_pg_refstore_authority: {e}"))?;
+    let fresh_cut = super::pg_maintenance_dist::reconcile_worker_refcas_cut_if_needed(
+        &**pg_client,
+        job.repository_id,
+        &state.storage.root,
+        refcas_source,
+        &authority,
+        destructive_env,
+    )
+    .await?;
     drop(pg_client);
 
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -330,15 +356,13 @@ async fn run_safe_gc_phases(
     let GcMode::ArmedDestructive(existing_arm) = snap_post_compact.gc_mode else {
         unreachable!("checked armed destructive above");
     };
-    let upgraded_lane = match existing_arm.lane {
-        AuthorityLane::SingleNodePg { pg_authority_id, pg_tx_seq, .. } => AuthorityLane::SingleNodePg {
-            pg_authority_id,
-            pg_tx_seq: pg_tx_seq.max(reconciled.gate_revision),
-            pg_gc_fence_epoch: fence_epoch,
-            reader_barrier_epoch: fence_epoch,
-        },
-        other => other,
-    };
+    let is_dist = matches!(&existing_arm.lane, AuthorityLane::DistributedRefCas { .. });
+    let upgraded_lane = super::pg_maintenance_dist::upgrade_armed_lane_for_worker(
+        existing_arm.lane,
+        reconciled.gate_revision,
+        fence_epoch,
+        fresh_cut.as_ref(),
+    )?;
     let live_arm = SafeGcArmReceipt::seal(
         snap_post_compact.authority.tenant_id,
         snap_post_compact.authority.repo_id,
@@ -404,6 +428,9 @@ async fn run_safe_gc_phases(
     Ok(json!({
         "compacted": compacted,
         "destructive_env_enabled": destructive_env,
+        "authority_lane": if is_dist { "distributed_refcas" } else { "single_node_pg" },
+        "refcas_cut_event_seq": fresh_cut.as_ref().map(|c| c.sm_applied_event_seq),
+        "refcas_cut_log_index": fresh_cut.as_ref().map(|c| c.sm_applied_log_index),
         "staging_cleaned": staging.deleted_keys.len() + staging.already_absent_keys.len(),
         "deleted_keys": deleted_keys,
         "already_absent_keys": already_absent_keys,

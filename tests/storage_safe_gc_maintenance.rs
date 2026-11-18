@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 pub(crate) static PG_SAFE_GC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn test_policy() -> Policy {
+pub(crate) fn test_policy() -> Policy {
     Policy {
         enabled: true,
         poll: Duration::from_secs(1),
@@ -62,7 +62,7 @@ fn test_policy() -> Policy {
     }
 }
 
-fn app_config(root: &Path, db_url: String) -> Config {
+pub(crate) fn app_config(root: &Path, db_url: String) -> Config {
     let git_bin = std::env::var("ROOTYARD_GIT")
         .or_else(|_| std::env::var("ROOTYARD_GIT_PATH"))
         .map(PathBuf::from)

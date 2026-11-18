@@ -103,7 +103,8 @@ impl DurableSafeGcAuthority {
     ) -> Result<(), SafeGcError> {
         self.update_persisted(|s| {
             s.live_refs = live_refs;
-            s.authority.live_ref_seq = s.authority.live_ref_seq.max(cut.sm_applied_log_index);
+            s.authority.live_ref_seq = cut.sm_applied_log_index.max(1);
+            s.paired_cursors.pg_applied_seq = s.paired_cursors.pg_applied_seq.max(cut.sm_applied_log_index.max(1));
             let next_pins: BTreeSet<String> = sm_pin_oids.into_iter().collect();
             for prod in &mut s.producers {
                 if prod.producer == RetentionProducer::Workspace {
@@ -176,9 +177,10 @@ impl DurableSafeGcAuthority {
         })
     }
 
-    /// Re-bind an in-flight SingleNodePg pending delete batch to a freshly acquired
-    /// live PostgreSQL `gc_epoch` fence after restart ONLY if incarnation, lease_epoch,
-    /// and all live retention/quiescence invariants still hold.
+    /// Re-bind an in-flight pending delete batch (SingleNodePg or DistributedRefCas)
+    /// to a freshly acquired live PostgreSQL `gc_epoch` fence after restart ONLY if
+    /// incarnation, lease_epoch, lane kind, and all live retention/quiescence
+    /// invariants still hold.
     pub fn rebind_pending_delete_live_pg_fence(
         &self,
         fence_epoch: u64,
@@ -207,14 +209,27 @@ impl DurableSafeGcAuthority {
                 ));
             }
             let mut updated_proof = batch_existing.proof.clone();
-            if matches!(updated_proof.lane, AuthorityLane::SingleNodePg { .. }) {
-                updated_proof.lane = live_arm.lane;
-                updated_proof.reader_quiescence.pg_exclusive_reader_barrier_epoch = Some(fence_epoch);
-                updated_proof.group_receipts = s.group_receipts.clone();
-                updated_proof.paired_cursors = s.paired_cursors.clone();
-                updated_proof.proof_digest = compute_proof_digest(&updated_proof);
-                verify_deletion_proof(&updated_proof)?;
+            let same_lane_kind = matches!(
+                (&updated_proof.lane, &live_arm.lane),
+                (AuthorityLane::SingleNodePg { .. }, AuthorityLane::SingleNodePg { .. })
+                    | (AuthorityLane::DistributedRefCas { .. }, AuthorityLane::DistributedRefCas { .. })
+            );
+            if !same_lane_kind {
+                return Err(SafeGcError::IncompleteProof(
+                    "pending delete batch authority lane kind changed across restart",
+                ));
             }
+            updated_proof.lane = live_arm.lane;
+            updated_proof.live_ref_seq = s.authority.live_ref_seq;
+            updated_proof.live_refs = s.live_refs.clone();
+            updated_proof.producers = s.producers.clone();
+            updated_proof.global_holds = s.global_holds.clone();
+            updated_proof.in_flight_decisions = s.in_flight_decisions.clone();
+            updated_proof.reader_quiescence.pg_exclusive_reader_barrier_epoch = Some(fence_epoch);
+            updated_proof.group_receipts = s.group_receipts.clone();
+            updated_proof.paired_cursors = s.paired_cursors.clone();
+            updated_proof.proof_digest = compute_proof_digest(&updated_proof);
+            verify_deletion_proof(&updated_proof)?;
             s.require_live_barrier(
                 s.authority.incarnation_id,
                 s.authority.incarnation_epoch,

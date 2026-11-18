@@ -26,6 +26,7 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "git_ops.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "model.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "pg_maintenance.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "pg_maintenance_dist.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "pg_reconcile.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "proof.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "proof_digest.rs",
@@ -68,7 +69,16 @@ class StorageSafeGcContractsTest(unittest.TestCase):
                 self.assertLess(len(lines), 500, f"{path.name} has {len(lines)} lines (>= 500)")
                 self.assertNotIn("#[allow(", text, f"lint suppression forbidden in {path.name}")
 
-        for name in ("model.rs", "proof.rs", "anti_aba.rs", "store.rs", "domain.rs", "quiescence.rs", "refcas_cut.rs"):
+        for name in (
+            "model.rs",
+            "proof.rs",
+            "anti_aba.rs",
+            "store.rs",
+            "domain.rs",
+            "quiescence.rs",
+            "refcas_cut.rs",
+            "pg_maintenance_dist.rs",
+        ):
             src = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / name).read_text(encoding="utf-8")
             for m in re.finditer(r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*pub struct (\w+)", src):
                 self.assertIn("deny_unknown_fields", m.group(0), f"{name}:{m.group(1)} missing deny_unknown_fields")
@@ -80,6 +90,14 @@ class StorageSafeGcContractsTest(unittest.TestCase):
         provider = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "provider_delete.rs").read_text(encoding="utf-8")
         for outcome in ("ConfirmedDeleted", "AlreadyAbsent", "OutcomeUnknown"):
             self.assertIn(outcome, provider)
+        maintenance = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "pg_maintenance.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("reconcile_worker_refcas_cut_if_needed", maintenance)
+        dist = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / "pg_maintenance_dist.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("reconcile_refcas_cut_with_pg", dist)
 
     def test_workflow_and_doc_contracts(self) -> None:
         wf_raw = WORKFLOW.read_bytes()

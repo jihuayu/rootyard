@@ -22,6 +22,8 @@ pub mod git_ops;
 pub mod model;
 #[path = "safe_gc/pg_maintenance.rs"]
 pub mod pg_maintenance;
+#[path = "safe_gc/pg_maintenance_dist.rs"]
+pub mod pg_maintenance_dist;
 #[path = "safe_gc/pg_reconcile.rs"]
 pub mod pg_reconcile;
 #[path = "safe_gc/proof.rs"]
@@ -76,6 +78,10 @@ pub use model::{
     SafeGcArmReceipt, SafeGcObjectFormat, SourceFreshness,
 };
 pub use pg_maintenance::{ENV_BLOB_SAFE_GC_DESTRUCTIVE, safe_gc_destructive_env_enabled, safe_gc_journal_path};
+pub use pg_maintenance_dist::{
+    FsSealedRefCasCutpointSource, InMemoryRefCasCutpointSource, PersistedRefCasCutpointEnvelope, RefCasCutpointSource,
+    persist_refcas_cutpoint_snapshot, safe_gc_refcas_cutpoint_path,
+};
 pub use pg_reconcile::{reconcile_pg_refstore_authority, reconcile_refcas_quorum_into_authority};
 pub use proof::{DeletionProof, DeletionProofInputs, build_and_verify_deletion_proof, verify_deletion_proof};
 pub use provider_delete::{OpenDalS3GcProvider, S3OperatorCredentials};

@@ -138,7 +138,8 @@ pub async fn reconcile_refcas_cut_with_pg<C: GenericClient + Sync>(
     }
     let last_applied =
         sm_snap.body.last_applied.ok_or(SafeGcError::IncompleteProof("refcas has no applied log entries"))?;
-    let sm_applied_event_seq = sm_snap.body.next_event_seq.saturating_sub(1);
+    let last_event_seq = sm_snap.body.events.last().map(|ev| ev.event_seq).unwrap_or(0);
+    let sm_applied_event_seq = last_event_seq.max(sm_snap.body.next_event_seq);
     let (sm_last_event_log_term, sm_last_event_log_index) =
         sm_snap.body.events.last().map_or((0, 0), |ev| (ev.log_term, ev.log_index));
 

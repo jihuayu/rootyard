@@ -21,9 +21,22 @@ use uuid::Uuid;
 
 /// Run one bounded claim with a fresh operation context for external callers.
 pub async fn run_once(state: &Arc<AppState>, policy: &Policy, owner: Uuid) -> Result<Option<JobOutcome>> {
+    run_once_with_refcas_source(state, policy, owner, None).await
+}
+
+pub async fn run_once_with_refcas_source(
+    state: &Arc<AppState>,
+    policy: &Policy,
+    owner: Uuid,
+    refcas_source: Option<&dyn super::safe_gc::RefCasCutpointSource>,
+) -> Result<Option<JobOutcome>> {
     let operation = OperationContext::new(WorkerKind::StorageLifecycle);
-    observability::worker::run(&operation, Phase::Claim, Box::pin(run_once_scoped(state, policy, owner, &operation)))
-        .await
+    observability::worker::run(
+        &operation,
+        Phase::Claim,
+        Box::pin(run_once_scoped_with_refcas(state, policy, owner, &operation, refcas_source)),
+    )
+    .await
 }
 
 pub(crate) async fn run_once_scoped(
@@ -31,6 +44,16 @@ pub(crate) async fn run_once_scoped(
     policy: &Policy,
     owner: Uuid,
     operation: &OperationContext,
+) -> Result<Option<JobOutcome>> {
+    run_once_scoped_with_refcas(state, policy, owner, operation, None).await
+}
+
+async fn run_once_scoped_with_refcas(
+    state: &Arc<AppState>,
+    policy: &Policy,
+    owner: Uuid,
+    operation: &OperationContext,
+    refcas_source: Option<&dyn super::safe_gc::RefCasCutpointSource>,
 ) -> Result<Option<JobOutcome>> {
     // Observe a claim failure inside the Claim scope before `?` drops it, so
     // the event keeps the worker, the fixed phase and any SQLSTATE.
@@ -45,7 +68,13 @@ pub(crate) async fn run_once_scoped(
     })
     .await?
     else {
-        return super::safe_gc::pg_maintenance::run_claimed_safe_gc_once(state, policy, owner).await;
+        return super::safe_gc::pg_maintenance::run_claimed_safe_gc_once_with_refcas(
+            state,
+            policy,
+            owner,
+            refcas_source,
+        )
+        .await;
     };
     // The persisted attempt and repository generation are safe numeric
     // correlation. The raw job, repository, tenant and actor IDs stay out.
