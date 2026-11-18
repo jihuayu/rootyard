@@ -134,9 +134,9 @@ if [ "$#" -eq 2 ] && [ "$1" = project ]; then
     printf '%s\n' "$line"
 
     case "$line" in
-      "ISSUE182_LIVE_PG_GARAGE "*)
+      *"ISSUE182_LIVE_PG_GARAGE "*)
         saw_failure=1
-        rest=${line#ISSUE182_LIVE_PG_GARAGE }
+        rest=${line#*ISSUE182_LIVE_PG_GARAGE }
         token=${rest%% *}
         rest=${rest#* }
         class_token=${rest%% *}

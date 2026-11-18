@@ -34,6 +34,10 @@ use uuid::Uuid;
 use super::ck_diag::Class;
 use super::{Co, add_commit, build_kit_with_clock, init_repo, make_grant, payload_bytes, pol, private_vr};
 
+const LIVE_COMPLETION_ENV: &str = "ROOTYARD_LIVE_COMPLETION_FILE";
+const LIVE_COMPLETION_DEFAULT: &str = "test-results/ci-clonekit/live-case-complete";
+const LIVE_COMPLETION_MARKER: &str = "ISSUE182_LIVE_PG_GARAGE_COMPLETE";
+
 /// Closed phases for the live case, in execution order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LivePhase {
@@ -172,7 +176,7 @@ impl Drop for LiveRecorder {
         let mut stderr = std::io::stderr().lock();
         let _ = writeln!(
             stderr,
-            "ISSUE182_LIVE_PG_GARAGE phase={} class={} source={}:{}",
+            "\nISSUE182_LIVE_PG_GARAGE phase={} class={} source={}:{}",
             frame.phase.as_str(),
             frame.class.as_str(),
             frame.file,
@@ -224,6 +228,20 @@ pub(crate) async fn run() -> Result<()> {
         Err(err) => diag.observe_final(err),
     }
     result
+}
+
+enum DeniedReplay {
+    Expected,
+    UnexpectedSuccess,
+    Typed(CloneKitError),
+}
+
+fn classify_denied_replay<T>(denied: std::result::Result<T, CloneKitError>) -> DeniedReplay {
+    match denied {
+        Err(CloneKitError::GrantRevoked(_)) => DeniedReplay::Expected,
+        Ok(_) => DeniedReplay::UnexpectedSuccess,
+        Err(err) => DeniedReplay::Typed(err),
+    }
 }
 
 async fn run_body(diag: &mut LiveRecorder, pool: &Pool) -> Result<()> {
@@ -358,11 +376,15 @@ async fn run_body(diag: &mut LiveRecorder, pool: &Pool) -> Result<()> {
         .await?;
     diag.mark(LivePhase::DeniedReplay, file!(), line!());
     let denied = co.run(&signed, &ctx, &pg_auth, pol(false, true), repo.to_str().expect("utf8"), None).await;
-    if !matches!(denied, Err(CloneKitError::GrantRevoked(_))) {
-        diag.fail_assert(file!(), line!());
-        return Err(anyhow::Error::msg(
-            "Condition failed: `matches!(co.run(&signed, &ctx, &pg_auth, pol(false, true), repo.to_str().expect(\"utf8\"), None).await, Err(CloneKitError::GrantRevoked(_)))`",
-        ));
+    match classify_denied_replay(denied) {
+        DeniedReplay::Expected => {}
+        DeniedReplay::UnexpectedSuccess => {
+            diag.fail_assert(file!(), line!());
+            return Err(anyhow::Error::msg(
+                "Condition failed: `matches!(co.run(&signed, &ctx, &pg_auth, pol(false, true), repo.to_str().expect(\"utf8\"), None).await, Err(CloneKitError::GrantRevoked(_)))`",
+            ));
+        }
+        DeniedReplay::Typed(err) => return Err(anyhow::Error::new(err)),
     }
     Ok(())
 }
@@ -412,6 +434,19 @@ mod tests {
         assert_eq!(frame.class, Class::Assert);
         assert_eq!(frame.line, predicate_line);
         recorder.disarm_for_test();
+    }
+
+    #[test]
+    fn denied_replay_preserves_typed_errors_and_asserts_only_unexpected_success() {
+        assert!(matches!(
+            classify_denied_replay::<()>(Err(CloneKitError::GrantRevoked("synthetic"))),
+            DeniedReplay::Expected
+        ));
+        assert!(matches!(classify_denied_replay::<()>(Ok(())), DeniedReplay::UnexpectedSuccess));
+        assert!(matches!(
+            classify_denied_replay::<()>(Err(CloneKitError::GitFailed("synthetic".to_owned()))),
+            DeniedReplay::Typed(CloneKitError::GitFailed(_))
+        ));
     }
 
     #[test]

@@ -230,7 +230,7 @@ class LiveReceiptTest(unittest.TestCase):
             for raw in (b"pg_and_garage", b"source=", b"tests/", b"SECRET", b"test result", b"running"):
                 self.assertNotIn(raw, data)
 
-    def test_project_maps_unknown_and_malformed_tokens_to_other_and_first_wins(self) -> None:
+    def test_project_maps_unknown_malformed_and_merged_prefix_tokens(self) -> None:
         cases = (
             (
                 "\n".join(
@@ -245,6 +245,7 @@ class LiveReceiptTest(unittest.TestCase):
             ),
             ("ISSUE182_LIVE_PG_GARAGE phase=CHECKOUT\n", "CHECKOUT", "OTHER"),
             ("ISSUE182_LIVE_PG_GARAGE phase=FUTURE class=GIT_FAILED source=x:1\n", "OTHER", "GIT_FAILED"),
+            ("test pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation ... ISSUE182_LIVE_PG_GARAGE phase=CHECKOUT class=GIT_FAILED source=x:1\n", "CHECKOUT", "GIT_FAILED"),
         )
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -482,7 +483,12 @@ class LiveReceiptTest(unittest.TestCase):
         self.assertNotIn(b"\r", module)
         self.assertLess(len(module.decode("utf-8").splitlines()), 500)
         self.assertNotIn("#[allow(", module.decode("utf-8"))
+        self.assertIn('const LIVE_COMPLETION_ENV: &str = "ROOTYARD_LIVE_COMPLETION_FILE";', module.decode("utf-8"))
+        self.assertIn('const LIVE_COMPLETION_DEFAULT: &str = "test-results/ci-clonekit/live-case-complete";', module.decode("utf-8"))
+        self.assertIn('const LIVE_COMPLETION_MARKER: &str = "ISSUE182_LIVE_PG_GARAGE_COMPLETE";', module.decode("utf-8"))
+        self.assertIn('"\\nISSUE182_LIVE_PG_GARAGE phase={} class={} source={}:{}"', module.decode("utf-8"))
         script = LIVE_HELPER.read_bytes()
+        self.assertIn("COMPLETION_MARKER='ISSUE182_LIVE_PG_GARAGE_COMPLETE'", script.decode("utf-8"))
         self.assertNotIn(b"\r", script)
         self.assertLess(len(script.decode("utf-8").splitlines()), 500)
 
