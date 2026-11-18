@@ -459,9 +459,8 @@ async fn pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation(
         let (token_digest, credential_digest): (&[u8], &[u8]) = (&[7u8; 32], &[9u8; 32]);
         client.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&ids.0, &format!("ck_{}", &ids.0.simple().to_string()[..8])]).await?;
         client.execute("INSERT INTO tokens(id,user_id,digest) VALUES($1,$2,$3)", &[&token_id, &ids.0, &token_digest]).await?;
-        client.execute("INSERT INTO repositories(id,owner_id,name,state,object_format,storage_generation) VALUES($1,$2,$3,'ready','sha1',1)", &[&ids.1, &ids.0, &"ckrepo"]).await?;
+        client.execute("INSERT INTO repositories(id,owner_id,name,state,object_format,storage_generation) VALUES($1,$2,$3,'provisioning','sha1',1)", &[&ids.1, &ids.0, &"ckrepo"]).await?;
         drop(client);
-
         let pg_dl = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut c = pool.get().await?;
         let gate = *PgRefStoreCore.initialize(&mut c, &CoreGateInit::new(ids.1, ids.0, GitObjectFormat::Sha1, ids.2, 1, 1, RefName::branch("refs/heads/main")?)?, pg_dl).await?.digest();
@@ -470,12 +469,13 @@ async fn pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation(
         ensure!(PgRefStore.begin(&tx, &op, pg_dl).await?.record.state() == OperationState::Pending);
         tx.commit().await?;
         drop(c);
-
         let now: i64 = pool.get().await?.query_one("SELECT extract(epoch FROM clock_timestamp())::bigint", &[]).await?.get(0);
         let mut built = build_kit_with_clock(ids, Sha1, 1, (&repo, &td), None, None, Some(now))?;
         let receipts = publish_clonekit_to_blob_store(&pool, &blob, &BlobHoldPublishContext { scope: HoldScope::new(ids.1, ids.0, ids.0, ArtifactHoldPurpose::RefPublication, GitObjectFormat::Sha1, ids.2, 1, 1)?, operation: op, expected_gate_digest: gate, authority_id: ids.1, authority_generation: 1 }, &mut built, None).await?;
         ensure!(receipts.len() == 2 && built.manifest.pack.as_ref().and_then(|p| p.blob_locator.as_ref()).is_some());
-
+        // Publish from the unserved core lane, then become ready for the checkout oracle.
+        let updated = pool.get().await?.execute("UPDATE repositories SET state='ready' WHERE id=$1", &[&ids.1]).await?;
+        ensure!(updated == 1, "fixture readiness transition updated {updated} rows");
         let c2 = add_commit(&repo, "next.txt", b"delta2\n", "c2")?;
         let (signed, ctx) = make_grant(ids, Sha1, &c2, None, now)?;
         let plan = serde_json::json!({"version":1,"job_id":ctx.job_id,"owner_id":ids.0,"repository_id":ids.1,"storage_generation":1,"object_format":"sha1","target_oid":c2,"source_receipt_sha256":"a".repeat(64),"mirror_audience":ctx.audience,"expires_unix":signed.claims.not_after_unix});
