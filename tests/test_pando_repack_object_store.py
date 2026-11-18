@@ -8,6 +8,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import uuid
 
 from tests.pando_lab import Lab
@@ -679,15 +680,47 @@ class PandoLabHarnessAndMainGatewayRoutingOfflineTests(unittest.TestCase):
                     return list(ensure_repo(lab.repo)["packs"])
                 return []
 
+            target = f"repo='{lab.repo}' AND pack_id='{pid0}'"
+            proof_tables = {
+                "source_pack": "manifests",
+                "object_store_manifest": "object_store_manifests",
+                "kms_envelope": "kms_envelopes",
+            }
+            proof_query = "SELECT json_build_object(" + ",".join(
+                f"'{field}',(SELECT count(*) FROM pando_lab.{table} WHERE {target})"
+                for field, table in proof_tables.items()
+            ) + ")"
+
             def fake_sql(query: str) -> str:
-                return "1"
+                if query == proof_query:
+                    return json.dumps({
+                        "source_pack": sum(pack["pack_id"] == pid0 for pack in st0["packs"]),
+                        "object_store_manifest": int(pid0 in st0["os_manifests"]),
+                        "kms_envelope": 0,
+                    })
+                if query.startswith("INSERT INTO pando_lab.acl("):
+                    return "1"
+                raise AssertionError(f"Unexpected SQL query: {query}")
 
             orig_run = lab.run
 
             def fake_run(cmd, cwd=None, env=None, data=None, check=True, timeout=90):
                 if isinstance(cmd, list) and len(cmd) >= 2 and cmd[1] == "object-store-put":
-                    if "--fail-after-chunks" in cmd or "--corrupt-chunk" in cmd:
-                        return subprocess.CompletedProcess(cmd, 1, "", "fault injected")
+                    faults = {
+                        kwarg: int(cmd[cmd.index(flag) + 1])
+                        for flag, kwarg in (
+                            ("--fail-after-chunks", "fail_after_chunks"),
+                            ("--corrupt-chunk", "corrupt_chunk_part"),
+                        )
+                        if flag in cmd
+                    }
+                    try:
+                        _sim_put_pack_files(
+                            lab.store, lab.store / "objects", cmd[2], cmd[3],
+                            chunk_size=int(cmd[cmd.index("--chunk-size") + 1]), **faults,
+                        )
+                    except RuntimeError as error:
+                        return subprocess.CompletedProcess(cmd, 1, "", str(error))
                     return subprocess.CompletedProcess(cmd, 0, "", "")
                 return orig_run(cmd, cwd=cwd, env=env, data=data, check=check, timeout=timeout)
 
@@ -829,6 +862,14 @@ class PandoLabHarnessAndMainGatewayRoutingOfflineTests(unittest.TestCase):
             lab.cli = fake_cli
             lab.http = fake_http
             lab.git = fake_git
+
+            counts = json.loads(fake_sql(proof_query))
+            for field, invalid in (("source_pack", 0), ("object_store_manifest", 1), ("kms_envelope", 1)):
+                bad_counts = counts | {field: invalid}
+                with self.subTest(field=field), patch.object(lab, "sql", return_value=json.dumps(bad_counts)):
+                    with self.assertRaises(AssertionError) as caught:
+                        lab.object_store_cas_and_cache_recovery()
+                    self.assertEqual(caught.exception.args, (bad_counts,))
 
             os_res = lab.object_store_cas_and_cache_recovery()
             self.assertTrue(os_res["rehydrated"])
