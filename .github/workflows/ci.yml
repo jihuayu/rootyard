@@ -25,9 +25,10 @@ jobs:
     # worst case added here is 3 x 5 = 15 minutes. Issue #21 adds a 10-minute
     # Local PostgreSQL producer step and a 20-minute real Vault qualification.
     # Three repository lifecycle steps add 10 minutes each. The state-redis
-    # CLI build and owned Redis browse restore proof add 20 minutes.
-    # 75 + 10 + 20 + 3 x 10 + 20 = 155 minutes in total.
-    timeout-minutes: 155
+    # CLI build and owned Redis browse restore proof add 20 minutes, plus
+    # three for the Redis partition drill and one for cleanup and binding.
+    # 75 + 10 + 20 + 3 x 10 + 24 = 159 minutes in total.
+    timeout-minutes: 159
     services:
       postgres:
         image: postgres:17
@@ -244,6 +245,168 @@ jobs:
         run: python3 tests/ci_mirror.py --binary "$ROOTYARD_BIN" --report test-results/ci-mirror.json
       - name: Exercise exact-target source retention and mirror preparation
         run: python3 tests/ci_source_pins.py --binary "$ROOTYARD_BIN" --report test-results/ci-source-pins.json
+      - name: Verify browse cache incarnation across restore with owned Redis
+        timeout-minutes: 24
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d "${RUNNER_TEMP:?}/rootyard-browse-restore.XXXXXX")
+          trap 'rm -rf -- "$scratch"' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          binary="$scratch/browse-restore-rootyard"
+          receipt="$binary.build.json"
+          published_receipt="test-results/${receipt##*/}"
+          report="$scratch/browse-restore-cache.json"
+          manifest="$scratch/native-browse-restore-cache.json"
+          partition_report="$scratch/redis-wake-partition.json"
+          partition_manifest="$scratch/native-redis-wake-partition.json"
+          restore_case=browse_restore_incarnation_cache
+          flush_case=browse_flushall_preserves_git_authority
+          partition_case=real_redis_partition_pg_fallback_and_wake
+          tree=$(git rev-parse 'HEAD^{tree}')
+
+          publish_failure() {
+            python3 -I - "$1" "$2" "$GITHUB_SHA" >/dev/null 2>&1 <<'PY' || :
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          source_path, mode, head = sys.argv[1:]
+          filename, name, stages = {
+              "restore": ("browse-restore-cache-failure.json", "browse_flushall_preserves_git_authority",
+                          {"source_warm_backup", "restore", "restored_preview", "flush_authority"}),
+              "partition": ("redis-wake-partition-failure.json", "real_redis_partition_pg_fallback_and_wake",
+                            {"fixture", "partition"}),
+          }[mode]
+          with Path(source_path).open("rb") as source:
+              raw = source.read(4097)
+          assert 0 < len(raw) <= 4096
+          report = json.loads(raw)
+          basic = {"passed", "cases"}
+          hashes = {"source_tree": 40, "source_inputs_sha256": 64,
+                    "binary_sha256": 64, "build_receipt_sha256": 64}
+          assert set(report) in (basic, basic | {"source_head", *hashes})
+          if "source_head" in report:
+              assert report["source_head"] == head
+              assert all(re.fullmatch(rf"[0-9a-f]{{{size}}}", report[key]) for key, size in hashes.items())
+          assert report["passed"] is False
+          case, = report["cases"]
+          assert set(case) == {"name", "status", "error"}
+          assert case["name"] == name and case["status"] == "failed"
+          assert case["error"] in stages | {"preflight", "receipt_changed", "cleanup", "report_write"}
+          with (Path("test-results") / filename).open("x") as output:
+              json.dump({"passed": False, "cases": [case]}, output)
+          PY
+          }
+
+          write_manifest() {
+            local proof=$1
+            shift
+            test -s "$proof" && test "$(wc -c < "$proof")" -le 4096 &&
+              python3 scripts/native_report_manifest.py --mode job \
+                --binary "$binary" --expect-commit "$GITHUB_SHA" --fixture postgres=postgres:17 \
+                --harness tests/backup_recovery_cache.py \
+                --harness tests/cross_process.py \
+                --harness tests/e2e.py \
+                --harness tests/native_evidence.py \
+                --harness tests/owned_fuse_cleanup.py \
+                --harness scripts/build_native.py \
+                --harness scripts/native_artifact_store.py \
+                --harness scripts/native_build_receipt.py \
+                --harness scripts/native_report_manifest.py \
+                --harness .github/workflows/ci.yml "$@" >/dev/null 2>&1
+          }
+
+          verify_proof_binding() {
+            python3 -I - "$tree" "$@" >/dev/null 2>&1 <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          tree, manifest_path, report_path, label, *expected = sys.argv[1:]
+          manifest = json.loads(Path(manifest_path).read_bytes())
+          payload = Path(report_path).read_bytes()
+          report = json.loads(payload)
+          cases = report["cases"]
+          assert [case["name"] for case in cases] == expected
+          assert all(case["detail"]["owned_cleanup_completed"] is True for case in cases)
+          assert set(manifest["reports"]) == {label}
+          entry = manifest["reports"][label]
+          assert entry["case_names"] == expected and entry["sha256"] == hashlib.sha256(payload).hexdigest()
+          assert report["source_head"] == manifest["source_commit"] and report["source_tree"] == tree
+          assert report["source_inputs_sha256"] == manifest["source_inputs_sha256"]
+          assert report["binary_sha256"] == manifest["binary_sha256"]
+          assert report["build_receipt_sha256"] == manifest["build_receipt"]["sha256"]
+          PY
+          }
+
+          if ! timeout --kill-after=30s 13m env -u CARGO_BUILD_JOBS python3 scripts/build_native.py \
+            --features state-redis \
+            --strip-debuginfo \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            --output "$binary" >/dev/null 2>&1; then
+            echo 'Browse restore CLI build failed'
+            exit 1
+          fi
+          if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
+            timeout --kill-after=30s 5m python3 tests/backup_recovery.py \
+              --browse-flush-authority --binary "$binary" --expect-commit "$GITHUB_SHA" \
+              --report "$report" >/dev/null 2>&1; then
+            publish_failure "$report" restore
+            echo 'Browse restore or flush cache proof failed'
+            exit 1
+          fi
+          if ! write_manifest "$report" \
+            --manifest-out "$manifest" --build-receipt "$receipt" \
+            --report "browse_restore_cache=$report" \
+            --require-case "browse_restore_cache=$restore_case" \
+            --require-case "browse_restore_cache=$flush_case" \
+            --harness tests/backup_recovery.py \
+            --harness tests/backup.py \
+            --harness tests/schema_baseline.py \
+            --harness schema/142_catalog.json \
+            --harness schema/143_catalog.json \
+            --harness schema/151_catalog.json; then
+            echo 'Browse restore native manifest failed'
+            exit 1
+          fi
+          if ! verify_proof_binding "$manifest" "$report" browse_restore_cache "$restore_case" "$flush_case"; then
+            echo 'Browse restore cleanup or receipt binding failed'
+            exit 1
+          fi
+
+          # Keep the adjacent receipt for the shared CLI and publish the verified
+          # restore evidence before the partition drill can fail.
+          cp -- "$receipt" "$published_receipt"
+          mv -- "$report" "$manifest" test-results/
+
+          if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
+            timeout --kill-after=30s 3m python3 tests/cross_process_partition.py \
+              --binary "$binary" --expect-commit "$GITHUB_SHA" --report "$partition_report" >/dev/null 2>&1; then
+            publish_failure "$partition_report" partition
+            echo 'Redis wake partition proof failed'
+            exit 1
+          fi
+          if ! write_manifest "$partition_report" \
+            --manifest-out "$partition_manifest" --build-receipt "$published_receipt" \
+            --report "redis_wake_partition=$partition_report" \
+            --require-case "redis_wake_partition=$partition_case" \
+            --harness tests/cross_process_partition.py \
+            --harness tests/redis_partition_relay.py; then
+            echo 'Redis wake partition native manifest failed'
+            exit 1
+          fi
+          if ! verify_proof_binding "$partition_manifest" "$partition_report" redis_wake_partition "$partition_case"; then
+            echo 'Redis wake partition cleanup or receipt binding failed'
+            exit 1
+          fi
+          mv -- "$partition_report" "$partition_manifest" test-results/
+          rm -rf -- "$scratch"
+          test ! -e "$scratch"
+          trap - EXIT INT TERM
       - name: Exercise isolated job checkout authorization and object closure
         run: python3 tests/ci_job_checkouts.py --binary "$ROOTYARD_BIN" --report test-results/ci-job-checkouts.json
       - name: Exercise exact pinned dependency checkout and origin fallback boundaries
@@ -311,117 +474,6 @@ jobs:
         run: python3 tests/backup_refstore_holds141.py --binary "$ROOTYARD_BIN" --holds-fixture-binary "$ROOTYARD_HOLDS_FIXTURE" --report test-results/backup-refstore-holds.json
       - name: Exercise restored schema-003 recovery protections
         run: python3 tests/backup_recovery.py --binary "$ROOTYARD_BIN" --report test-results/backup-recovery.json
-      - name: Verify browse cache incarnation across restore with owned Redis
-        timeout-minutes: 20
-        shell: bash
-        run: |
-          set -euo pipefail
-          scratch=$(mktemp -d "${RUNNER_TEMP:?}/rootyard-browse-restore.XXXXXX")
-          trap 'rm -rf -- "$scratch"' EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-          binary="$scratch/browse-restore-rootyard"
-          receipt="$binary.build.json"
-          report="$scratch/browse-restore-cache.json"
-          manifest="$scratch/native-browse-restore-cache.json"
-
-          if ! timeout --kill-after=30s 13m env -u CARGO_BUILD_JOBS python3 scripts/build_native.py \
-            --features state-redis \
-            --strip-debuginfo \
-            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
-            --output "$binary" >/dev/null 2>&1; then
-            echo 'Browse restore CLI build failed'
-            exit 1
-          fi
-          if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
-            timeout --kill-after=30s 5m python3 tests/backup_recovery.py \
-              --browse-flush-authority --binary "$binary" --expect-commit "$GITHUB_SHA" \
-              --report "$report" >/dev/null 2>&1; then
-            python3 -I - "$report" "$GITHUB_SHA" >/dev/null 2>&1 <<'PY' || :
-          import json
-          from pathlib import Path
-          import re
-          import sys
-
-          with Path(sys.argv[1]).open("rb") as source:
-              raw = source.read(4097)
-          assert 0 < len(raw) <= 4096
-          report = json.loads(raw)
-          basic = {"passed", "cases"}
-          hashes = {"source_tree": 40, "source_inputs_sha256": 64,
-                    "binary_sha256": 64, "build_receipt_sha256": 64}
-          assert set(report) in (basic, basic | {"source_head", *hashes})
-          if "source_head" in report:
-              assert report["source_head"] == sys.argv[2]
-              assert all(re.fullmatch(rf"[0-9a-f]{{{size}}}", report[key]) for key, size in hashes.items())
-          assert report["passed"] is False
-          case, = report["cases"]
-          assert set(case) == {"name", "status", "error"}
-          assert case["name"] == "browse_flushall_preserves_git_authority" and case["status"] == "failed"
-          assert case["error"] in {"preflight", "source_warm_backup", "restore", "restored_preview",
-                                   "flush_authority", "receipt_changed", "cleanup", "report_write"}
-          with Path("test-results/browse-restore-cache-failure.json").open("x") as output:
-              json.dump({"passed": False, "cases": [case]}, output)
-          PY
-            echo 'Browse restore or flush cache proof failed'
-            exit 1
-          fi
-          test -s "$report"
-          test "$(wc -c < "$report")" -le 4096
-
-          if ! python3 scripts/native_report_manifest.py --mode job \
-            --manifest-out "$manifest" --build-receipt "$receipt" --binary "$binary" \
-            --expect-commit "$GITHUB_SHA" --report "browse_restore_cache=$report" \
-            --require-case browse_restore_cache=browse_restore_incarnation_cache \
-            --require-case browse_restore_cache=browse_flushall_preserves_git_authority \
-            --fixture postgres=postgres:17 \
-            --harness tests/backup_recovery.py \
-            --harness tests/backup_recovery_cache.py \
-            --harness tests/backup.py \
-            --harness tests/cross_process.py \
-            --harness tests/e2e.py \
-            --harness tests/native_evidence.py \
-            --harness tests/owned_fuse_cleanup.py \
-            --harness tests/schema_baseline.py \
-            --harness schema/142_catalog.json \
-            --harness schema/143_catalog.json \
-            --harness schema/151_catalog.json \
-            --harness scripts/build_native.py \
-            --harness scripts/native_artifact_store.py \
-            --harness scripts/native_build_receipt.py \
-            --harness scripts/native_report_manifest.py \
-            --harness .github/workflows/ci.yml >/dev/null 2>&1; then
-            echo 'Browse restore native manifest failed'
-            exit 1
-          fi
-          if ! python3 -I - "$report" "$manifest" >/dev/null 2>&1 <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-          import sys
-
-          payload = Path(sys.argv[1]).read_bytes()
-          report = json.loads(payload)
-          manifest = json.loads(Path(sys.argv[2]).read_bytes())
-          expected = ["browse_restore_incarnation_cache", "browse_flushall_preserves_git_authority"]
-          cases = report["cases"]
-          assert [case["name"] for case in cases] == expected
-          assert all(case["detail"]["owned_cleanup_completed"] is True for case in cases)
-          entry = manifest["reports"]["browse_restore_cache"]
-          assert entry["case_names"] == expected and entry["sha256"] == hashlib.sha256(payload).hexdigest()
-          assert report["source_head"] == manifest["source_commit"]
-          assert report["source_inputs_sha256"] == manifest["source_inputs_sha256"]
-          assert report["binary_sha256"] == manifest["binary_sha256"]
-          assert report["build_receipt_sha256"] == manifest["build_receipt"]["sha256"]
-          PY
-          then
-            echo 'Browse restore cleanup or receipt binding failed'
-            exit 1
-          fi
-          mv -- "$report" "$receipt" "$manifest" test-results/
-          rm -rf -- "$scratch"
-          test ! -e "$scratch"
-          trap - EXIT INT TERM
       - name: Exercise independent workers after fresh restore
         run: python3 tests/restored_workers.py --binary "$ROOTYARD_BIN" --report test-results/restored-workers.json
       - name: Exercise explicit recovery and metrics

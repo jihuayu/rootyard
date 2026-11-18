@@ -200,13 +200,13 @@ def _unsafe_upload_paths(paths):
 class WorkflowWiringTest(unittest.TestCase):
     def test_verify_budget_includes_pg_vault_lifecycle_and_owned_redis(self):
         lines = _verify_lines()
-        self.assertEqual(_job_scalar(lines, "timeout-minutes"), "155")
+        self.assertEqual(_job_scalar(lines, "timeout-minutes"), "159")
         pg = _step(PG_STEP)
         self.assertEqual(pg["timeout-minutes"], "10")
         vault = _step("Qualify pinned real Vault rotation and bind the Pando native gate")
         self.assertEqual(vault["timeout-minutes"], "20")
         redis = _step("Verify browse cache incarnation across restore with owned Redis")
-        self.assertEqual(redis["timeout-minutes"], "20")
+        self.assertEqual(redis["timeout-minutes"], "24")
         for name in (
             "Exercise repository archive, rename aliases, soft-delete purge, and ownership transfer (#85)",
             "Exercise deleted webhook-claim fence (#85)",
