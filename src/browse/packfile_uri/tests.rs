@@ -256,6 +256,10 @@ fn protocol_v2_negotiation_bounds_and_policy_gates() {
     let injected = inject_packfile_uris_into_v2_advertisement(&raw_adv, &sample_policy()).unwrap();
     assert!(String::from_utf8_lossy(&injected).contains("fetch=shallow wait-for-done packfile-uris\n"));
 
+    let with_uri = build_v2_fetch_wire(&["thin-pack", "packfile-uris https", "done\n"]);
+    let stripped = strip_packfile_uris_from_v2_request(&with_uri).unwrap();
+    assert_eq!(parse_fetch_v2_request(&stripped, PackObjectFormat::Sha1).unwrap().uri_protocols, None);
+
     let oid = "a".repeat(40);
     let want_line = format!("want {oid}\n");
     let mut too_many_wants = vec!["packfile-uris https"];

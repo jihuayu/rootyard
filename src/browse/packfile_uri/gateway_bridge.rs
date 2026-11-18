@@ -21,7 +21,9 @@ use super::{
     cover_builder::{RepoCoverBuildParams, build_residual_pack_bytes, build_verified_cover_proof_from_repo},
     delivery::{PackHttpServerState, PackStreamMeta},
     planner::{CdnCircuitBreaker, CdnHealthState, DeliveryPlanRequest, DeliveryPlanner, VerifiedPackCoverInput},
-    protocol_v2::{encode_fetch_v2_response, parse_fetch_v2_request, should_advertise_packfile_uris},
+    protocol_v2::{
+        encode_fetch_v2_response_with_acks, parse_fetch_v2_request, should_advertise_packfile_uris,
+    },
     retention::{OffloadPackPinGuard, PackDeliveryLeaseRegistry},
     signing::{LivePackReadAuthorizer, PackUriKeyring},
     ssrf_guard::PackUriDnsResolver,
@@ -215,7 +217,7 @@ impl GatewayPackfileOffload {
             GitObjectFormat::Sha256 => PackObjectFormat::Sha256,
         };
         let fetch_req = parse_fetch_v2_request(input.request_bytes, pack_fmt)?;
-        if !fetch_req.done || fetch_req.wants.is_empty() {
+        if fetch_req.wants.is_empty() || (!fetch_req.done && (fetch_req.haves.is_empty() || fetch_req.wait_for_done)) {
             return Ok(None);
         }
         let policy = self.current_policy();
@@ -250,6 +252,24 @@ impl GatewayPackfileOffload {
         else {
             self.record_fallback(FallbackReason::IncompleteClosure);
             return Ok(None);
+        };
+
+        let acked_haves: Vec<String> = if fetch_req.done {
+            Vec::new()
+        } else {
+            if bundle.plan.verified_have_commits.is_empty() {
+                return Ok(None);
+            }
+            let needed_set: HashSet<_> = bundle.plan.needed_commits.iter().copied().collect();
+            let has_unacked_root = bundle
+                .cover_index
+                .all_covers()
+                .flat_map(|c| c.covered_commits().iter())
+                .any(|link| needed_set.contains(&link.commit_oid) && link.parent_oids.is_empty());
+            if has_unacked_root {
+                return Ok(None);
+            }
+            bundle.plan.verified_have_commits.iter().copied().map(crate::ref_store::GitOid::as_hex).collect()
         };
 
         let now_unix = (self.pack_server.clock_unix)();
@@ -333,7 +353,7 @@ impl GatewayPackfileOffload {
             &fetch_req.haves,
             &offloaded_oids,
         )?;
-        let encoded = encode_fetch_v2_response(&policy, &planned.mode, &residual_pack, true)?;
+        let encoded = encode_fetch_v2_response_with_acks(&policy, &planned.mode, &acked_haves, &residual_pack, true)?;
         for (desc, pin_guard) in offloaded.iter().zip(lease_pins.iter()) {
             self.live_auth.pins.lock().unwrap_or_else(|p| p.into_inner()).insert(
                 desc.pin_id,

@@ -33,9 +33,9 @@ pub use planner::{
 };
 pub use protocol_v2::{
     FetchV2Request, MAX_FETCH_HAVES, MAX_FETCH_WANTS, ParsedUriProtocolSet, decode_packfile_uris_section,
-    encode_fetch_v2_response, fetch_capability_tokens, format_fetch_capability_line,
+    encode_fetch_v2_response, encode_fetch_v2_response_with_acks, fetch_capability_tokens, format_fetch_capability_line,
     format_fetch_capability_line_for_policy, inject_packfile_uris_into_v2_advertisement, parse_fetch_v2_request,
-    parse_uri_protocol_list, should_advertise_packfile_uris,
+    parse_uri_protocol_list, should_advertise_packfile_uris, strip_packfile_uris_from_v2_request,
 };
 pub use retention::{
     AcquireLeaseParams, InflightDownloadGuard, OffloadPackPinGuard, PackDeliveryLeaseRegistry, RetentionLeaseState,

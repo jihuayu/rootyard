@@ -248,18 +248,23 @@ async fn try_offload_upload_pack_v2(ctx: OffloadUploadCtx<'_>) -> Result<Option<
     match outcome {
         Ok(Some(v2_body)) => {
             ctx.authorization.revalidate(ctx.deadline).await?;
-            Ok(Some(v2_body))
+            return Ok(Some(v2_body));
         }
-        Ok(None) => Ok(None),
         Err(PackfileUriError::Unauthorized) => {
-            Err(GatewayError::Forbidden("repository authorization is no longer valid"))
+            return Err(GatewayError::Forbidden("repository authorization is no longer valid"));
         }
         Err(PackfileUriError::ProtocolSyntax(_)) => {
-            Err(GatewayError::BadRequest("invalid Git protocol v2 fetch request"))
+            return Err(GatewayError::BadRequest("invalid Git protocol v2 fetch request"));
         }
-        Err(PackfileUriError::CapacityExceeded(_)) => Err(GatewayError::TooLarge),
-        Err(_) => Ok(None),
+        Err(PackfileUriError::CapacityExceeded(_)) => return Err(GatewayError::TooLarge),
+        Ok(None) | Err(_) => {}
     }
+    if let Some(stripped) = crate::browse::packfile_uri::strip_packfile_uris_from_v2_request(&request_bytes) {
+        tokio::fs::write(ctx.request_path, &stripped)
+            .await
+            .map_err(|_| GatewayError::Internal("could not rewrite upload-pack fallback request"))?;
+    }
+    Ok(None)
 }
 
 fn repository_name(raw: &str) -> Result<&str, GatewayError> {

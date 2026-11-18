@@ -120,6 +120,7 @@ pub struct FetchV2Request {
     pub wants: Vec<String>,
     pub haves: Vec<String>,
     pub done: bool,
+    pub wait_for_done: bool,
     pub thin_pack: bool,
     pub no_progress: bool,
     pub ofs_delta: bool,
@@ -214,6 +215,7 @@ pub fn parse_fetch_v2_request(
         wants: Vec::new(),
         haves: Vec::new(),
         done: false,
+        wait_for_done: false,
         thin_pack: false,
         no_progress: bool::default(),
         ofs_delta: false,
@@ -276,6 +278,8 @@ fn apply_fetch_arg(req: &mut FetchV2Request, line: &str, oid_len: usize) -> Resu
         req.uri_protocols = Some(parse_uri_protocol_list(protos)?);
     } else if line == "done" {
         req.done = true;
+    } else if line == "wait-for-done" {
+        req.wait_for_done = true;
     } else if line == "thin-pack" {
         req.thin_pack = true;
     } else if line == "no-progress" {
@@ -288,6 +292,30 @@ fn apply_fetch_arg(req: &mut FetchV2Request, line: &str, oid_len: usize) -> Resu
     Ok(())
 }
 
+/// Strips any `packfile-uris ...` argument line from a Protocol v2 `command=fetch`
+/// stream before handing inline fallback / negotiation to native `git upload-pack`.
+pub fn strip_packfile_uris_from_v2_request(stream: &[u8]) -> Option<Vec<u8>> {
+    let pkts = split_v2_pkt_lines(stream).ok()?;
+    let mut stripped_any = false;
+    let mut out = Vec::with_capacity(stream.len());
+    for pkt in pkts {
+        match pkt {
+            RawPkt::Delim => out.extend_from_slice(b"0001"),
+            RawPkt::Flush => out.extend_from_slice(b"0000"),
+            RawPkt::Data(raw) => {
+                if let Ok(text) = std::str::from_utf8(raw)
+                    && text.strip_suffix('\n').unwrap_or(text).starts_with("packfile-uris ")
+                {
+                    stripped_any = true;
+                    continue;
+                }
+                push_pkt_line(&mut out, raw).ok()?;
+            }
+        }
+    }
+    stripped_any.then_some(out)
+}
+
 /// Encodes a Protocol v2 `fetch` response; refuses `packfile-uris` emission unless `policy.enabled`.
 pub fn encode_fetch_v2_response(
     policy: &OffloadPolicyConfig,
@@ -295,7 +323,27 @@ pub fn encode_fetch_v2_response(
     inline_pack_bytes: &[u8],
     client_supports_https: bool,
 ) -> Result<Vec<u8>, PackfileUriError> {
+    encode_fetch_v2_response_with_acks(policy, delivery, &[], inline_pack_bytes, client_supports_https)
+}
+
+/// Encodes a Protocol v2 `fetch` response with optional `acknowledgments` + `ready` section.
+pub fn encode_fetch_v2_response_with_acks(
+    policy: &OffloadPolicyConfig,
+    delivery: &DeliveryMode,
+    acked_haves: &[String],
+    inline_pack_bytes: &[u8],
+    client_supports_https: bool,
+) -> Result<Vec<u8>, PackfileUriError> {
     let mut out = Vec::with_capacity(inline_pack_bytes.len() + 512);
+    if !acked_haves.is_empty() {
+        push_pkt_line(&mut out, b"acknowledgments\n")?;
+        for h in acked_haves {
+            let ack_line = format!("ACK {h}\n");
+            push_pkt_line(&mut out, ack_line.as_bytes())?;
+        }
+        push_pkt_line(&mut out, b"ready\n")?;
+        out.extend_from_slice(b"0001");
+    }
     if let DeliveryMode::OffloadPlusResidual { offloaded, .. } = delivery {
         if !policy.enabled {
             return Err(PackfileUriError::InvalidPolicy(
