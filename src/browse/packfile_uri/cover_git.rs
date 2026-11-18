@@ -196,7 +196,7 @@ pub(super) fn seal_synth_version(
         op_id,
         seq,
         req_d,
-        CommitMode::NonAtomic,
+        CommitMode::Atomic,
         HeadUpdate::Keep,
         vec![intent],
         req_d,
