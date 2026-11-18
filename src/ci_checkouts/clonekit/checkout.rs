@@ -418,21 +418,15 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
 
     req.authority.check_active(claims).await?;
     ensure_not_cancelled(req.cancel.as_ref())?;
-    run_git_command(
-        req.git_binary,
-        Some(&work_repo),
-        &["init", "--quiet", claims.object_format.git_init_flag()],
-        req.cancel.as_ref(),
-    )?;
 
+    // Read the trailer before init so an allowed trailer failure can reuse this still-empty work_repo.
     let pack_id = match read_pack_trailer_hex(&staged_pack, claims.object_format) {
         Ok(pack_id) => pack_id,
         Err(err) => {
             return if allow_fallback {
-                let clean_work = work_repo.with_file_name("checkout-fallback");
                 run_stock_git_checkout(
                     req,
-                    clean_work,
+                    work_repo,
                     lease,
                     CheckoutStrategy::StockGitFallback { reason: FallbackReason::CorruptKit },
                 )
@@ -442,6 +436,13 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
             };
         }
     };
+
+    run_git_command(
+        req.git_binary,
+        Some(&work_repo),
+        &["init", "--quiet", claims.object_format.git_init_flag()],
+        req.cancel.as_ref(),
+    )?;
     let pack_dir = work_repo.join(".git").join("objects").join("pack");
     let (dst_pack, dst_idx) =
         (pack_dir.join(format!("pack-{pack_id}.pack")), pack_dir.join(format!("pack-{pack_id}.idx")));
