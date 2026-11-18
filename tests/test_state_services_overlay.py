@@ -362,6 +362,16 @@ class IntegratedManifestTest(unittest.TestCase):
             self.check(role_drift)
         with self.assertRaisesRegex(ValueError, "dependencies.rootyard-refcas-log is missing"):
             self.check(role_drift, integrated=self.rehashed(role_drift))
+        # An empty string is the version shorthand default and must not stand in
+        # for the reviewed path table even when the manifest hash is recomputed.
+        empty_string = self.mutated(reviewed, 'rootyard-refcas-log = ""')
+        with self.assertRaisesRegex(ValueError, "differs from the reviewed integrated manifest"):
+            self.check(empty_string)
+        self.check()
+        self.assertTrue(isinstance(checks.parse_manifest(self.manifest_text)
+                                   ["dependencies"]["rootyard-refcas-log"], dict))
+        with self.assertRaisesRegex(ValueError, "integrated dependency dependencies.rootyard-refcas-log changed"):
+            self.check(empty_string, integrated=self.rehashed(empty_string))
 
     def test_other_dependency_paths_are_not_automatically_accepted(self):
         # A reviewed registry dependency cannot be repointed at an in-repo path.
