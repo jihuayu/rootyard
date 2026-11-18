@@ -49,10 +49,15 @@ pub struct BlobGitState {
     inflight: Arc<AtomicU64>,
     workspace: Arc<AtomicU64>,
     sessions: Option<SessionTokens>,
+    packfile_offload: Option<Arc<crate::browse::packfile_uri::GatewayPackfileOffload>>,
     /// Acceptance-only rendezvous. It is absent in every non-test build and
     /// cannot be selected by any request, header or runtime configuration.
     #[cfg(test)]
     admission_pause: Option<Arc<AdmissionPause>>,
+    /// Acceptance-only rendezvous after the admission `COMMIT` and before the
+    /// first protected upload. Also absent from every non-test build.
+    #[cfg(test)]
+    publication_pause: Option<Arc<AdmissionPause>>,
 }
 
 impl BlobGitState {
@@ -75,8 +80,11 @@ impl BlobGitState {
             inflight: Arc::new(AtomicU64::new(0)),
             workspace: Arc::new(AtomicU64::new(0)),
             sessions: None,
+            packfile_offload: None,
             #[cfg(test)]
             admission_pause: None,
+            #[cfg(test)]
+            publication_pause: None,
         })
     }
 
@@ -85,6 +93,13 @@ impl BlobGitState {
     /// explicit `501`; nothing falls back to a generated or shared default key.
     pub fn with_sessions(mut self, sessions: SessionTokens) -> Self {
         self.sessions = Some(sessions);
+        self
+    }
+
+    /// Attach optional Smart-HTTP v2 `packfile-uris` offload runtime (#185).
+    /// Absent (`None`) by default so gateway behavior stays strictly inline unless enabled.
+    pub fn with_packfile_offload(mut self, offload: Arc<crate::browse::packfile_uri::GatewayPackfileOffload>) -> Self {
+        self.packfile_offload = Some(offload);
         self
     }
 
@@ -97,13 +112,41 @@ impl BlobGitState {
         self
     }
 
+    /// Acceptance-only: attach a private rendezvous that fires after the
+    /// admission transaction committed and before the first protected upload.
+    /// It is a distinct hook from the pre-admission pause so one fixture can
+    /// hold either side of the immutable `COMMIT` without changing production
+    /// behavior.
+    #[cfg(test)]
+    pub(crate) fn with_publication_pause(mut self, pause: Arc<AdmissionPause>) -> Self {
+        self.publication_pause = Some(pause);
+        self
+    }
+
     /// Called after the publish baseline was captured and before the admission
     /// transaction starts. In production this method does not exist.
     #[cfg(test)]
     pub(crate) async fn pause_before_admission(&self, operation_id: Uuid) {
         if let Some(pause) = &self.admission_pause {
-            pause.pause(operation_id).await;
+            let _ = pause.pause(operation_id).await;
         }
+    }
+
+    /// Called after the caller-owned admission transaction returned a definite
+    /// `COMMIT` and before any A3 hold/upload. The pause therefore never holds a
+    /// PostgreSQL transaction open. In production this method does not exist.
+    ///
+    /// An armed test-side release guard can abandon the rendezvous on an early
+    /// failure or panic. The selected operation then returns this fixed refusal
+    /// before the first protected upload instead of continuing into a write.
+    #[cfg(test)]
+    pub(crate) async fn pause_after_admission(&self, operation_id: Uuid) -> Result<(), GatewayError> {
+        if let Some(pause) = &self.publication_pause {
+            if pause.pause(operation_id).await && pause.was_abandoned() {
+                return Err(GatewayError::Conflict("acceptance publication was abandoned before upload"));
+            }
+        }
+        Ok(())
     }
 
     pub fn pool(&self) -> &Pool {
@@ -114,6 +157,11 @@ impl BlobGitState {
     /// presented session header is an explicit `501`, never a guessed key.
     pub(super) fn sessions(&self) -> Option<&SessionTokens> {
         self.sessions.as_ref()
+    }
+
+    /// Optional Smart-HTTP v2 `packfile-uris` offload runtime (#185).
+    pub(super) fn packfile_offload(&self) -> Option<&Arc<crate::browse::packfile_uri::GatewayPackfileOffload>> {
+        self.packfile_offload.as_ref()
     }
 
     pub fn store(&self) -> &BlobStore {
@@ -204,12 +252,13 @@ impl BlobGitState {
     }
 }
 
-/// Acceptance-only rendezvous used by the deterministic pre-admission race
-/// case. The pause is keyed by operation UUID and can fire at most once.
+/// Acceptance-only rendezvous used by the deterministic stale-baseline cases.
+/// The pause is keyed by operation UUID and can fire at most once.
 #[cfg(test)]
 pub(crate) struct AdmissionPause {
     operation: Uuid,
     paused: AtomicBool,
+    abandoned: AtomicBool,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -220,19 +269,21 @@ impl AdmissionPause {
         Self {
             operation,
             paused: AtomicBool::new(false),
+            abandoned: AtomicBool::new(false),
             reached: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         }
     }
 
-    async fn pause(&self, operation: Uuid) {
+    async fn pause(&self, operation: Uuid) -> bool {
         if operation != self.operation || self.paused.swap(true, Ordering::AcqRel) {
-            return;
+            return false;
         }
         // `notify_one` stores a permit, so a test that starts waiting after the
         // request arrived still observes the rendezvous.
         self.reached.notify_one();
         self.release.notified().await;
+        true
     }
 
     /// Wait until the selected operation reached the post-capture pause.
@@ -243,6 +294,18 @@ impl AdmissionPause {
     /// Let the paused operation continue into admission.
     pub(crate) fn release(&self) {
         self.release.notify_one();
+    }
+
+    /// Mark the rendezvous abandoned and let the paused operation return. The
+    /// release permit is stored even if the request has not reached the pause
+    /// yet, so an early failure cannot leave a server-side handler waiting.
+    pub(crate) fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+        self.release.notify_one();
+    }
+
+    fn was_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
     }
 }
 
