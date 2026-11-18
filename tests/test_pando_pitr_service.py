@@ -26,40 +26,18 @@ COMMIT = "a" * 40
 FAILURE_CHECKPOINT_ENV = "ROOTYARD_PYTHON_CI_REPORT"
 FAILURE_CHECKPOINT_OPT_IN = "test-results/python-ci-result.json"
 FAILURE_CHECKPOINT_NAME = "pando-pitr-failure.json"
-FAILURE_CHECKPOINT_MAX_BYTES = 4096
 _FAILURE_CHECKPOINT_STAGES = frozenset({"preflight", "suite", "postflight", "report"})
-_FAILURE_CHECKPOINT_CODES = frozenset({
-    "binary_mismatch",
-    "binary_missing",
-    "binary_unreadable",
-    "deadline_exceeded",
-    "expect_commit_missing",
-    "extra_invalid",
-    "git_unavailable",
-    "harness_missing",
-    "harness_unreadable",
-    "invalid_result",
-    "mandatory_case_not_passed",
-    "provenance_changed",
-    "receipt_changed",
-    "receipt_commit_mismatch",
-    "receipt_config_digest_missing",
-    "receipt_file_closure_missing",
-    "receipt_invalid",
-    "receipt_missing",
-    "receipt_schema_not_v2",
-    "receipt_toolchain_incomplete",
-    "receipt_toolchain_missing",
-    "receipt_unreadable",
-    "report_invalid",
-    "report_missing",
-    "source_head_changed",
-    "source_head_mismatch",
-    "spec_invalid",
-    "suite_failed",
-    "suite_not_passed",
-    "unexpected_failure",
-})
+_FAILURE_CHECKPOINT_CODES = frozenset((
+    "binary_mismatch binary_missing binary_unreadable deadline_exceeded "
+    "expect_commit_missing extra_invalid git_unavailable harness_missing "
+    "harness_unreadable invalid_result mandatory_case_not_passed "
+    "provenance_changed receipt_changed receipt_commit_mismatch "
+    "receipt_config_digest_missing receipt_file_closure_missing receipt_invalid "
+    "receipt_missing receipt_schema_not_v2 receipt_toolchain_incomplete "
+    "receipt_toolchain_missing receipt_unreadable report_invalid report_missing "
+    "source_head_changed source_head_mismatch spec_invalid suite_failed "
+    "suite_not_passed"
+).split())
 _FAILURE_CHECKPOINT_STATUSES = frozenset({"passed", "failed", "missing"})
 _FULL_SHA1 = re.compile(r"[0-9a-f]{40}")
 _FULL_SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -74,14 +52,9 @@ def _pitr_failure_checkpoint_enabled(environ=None) -> bool:
         return False
 
 
-def _pitr_failure_checkpoint_path() -> Path:
-    """Return the fixed in-repository checkpoint path; never use the env value."""
-    return ROOT / "test-results" / FAILURE_CHECKPOINT_NAME
-
-
 def _pitr_failure_checkpoint_source(expect_commit: str | None) -> tuple[str, str] | None:
     """Bind the checkpoint to the exact expected checkout commit and tree."""
-    if not isinstance(expect_commit, str) or _FULL_SHA1.fullmatch(expect_commit) is None:
+    if not isinstance(expect_commit, str) or not _FULL_SHA1.fullmatch(expect_commit):
         return None
     try:
         binding = run_python_ci_tests._checkout_binding(expect_commit)
@@ -93,7 +66,7 @@ def _pitr_failure_checkpoint_source(expect_commit: str | None) -> tuple[str, str
     if (
         commit != expect_commit
         or not isinstance(tree, str)
-        or _FULL_SHA1.fullmatch(tree) is None
+        or not _FULL_SHA1.fullmatch(tree)
     ):
         return None
     return commit, tree
@@ -101,20 +74,18 @@ def _pitr_failure_checkpoint_source(expect_commit: str | None) -> tuple[str, str
 
 def _pitr_failure_checkpoint_cases(report) -> list[dict]:
     """Project only the seven known cases and their closed status vocabulary."""
-    names = tuple(pando_pitr_service.MANDATORY_CASES)
-    statuses: dict[str, str] = {}
-    records = report.get("cases") if isinstance(report, dict) else None
-    if isinstance(records, list):
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            name = record.get("name")
-            status = record.get("status")
-            if name in names and status in _FAILURE_CHECKPOINT_STATUSES:
-                statuses[name] = status
+    rows = report.get("cases") if isinstance(report, dict) else None
+    statuses = {
+        row.get("name"): row.get("status")
+        for row in (rows if isinstance(rows, list) else [])
+        if isinstance(row, dict)
+    }
+    for name, status in tuple(statuses.items()):
+        if status not in _FAILURE_CHECKPOINT_STATUSES:
+            del statuses[name]
     return [
         {"name": name, "status": statuses.get(name, "missing")}
-        for name in names
+        for name in pando_pitr_service.MANDATORY_CASES
     ]
 
 
@@ -135,10 +106,39 @@ def _pitr_failure_checkpoint_stage_code(report) -> tuple[str, str]:
     return "report", "report_invalid"
 
 
+def _pitr_failure_checkpoint_live_stage(report, live_stage) -> str | None:
+    """Return a live stage only when it is closed and the failure is a suite crash."""
+    if (
+        not isinstance(live_stage, str)
+        or live_stage not in pando_pitr_service.LIVE_ASSERTION_STAGES
+    ):
+        return None
+    if report is None:
+        return live_stage
+    failure = report.get("failure") if isinstance(report, dict) else None
+    authoritative = isinstance(failure, dict) and (
+        failure.get("phase"), failure.get("code")
+    ) == ("suite", "suite_failed")
+    return live_stage if authoritative else None
+
+
+def _pando_live_suite(stages: list[str]):
+    """Pass the live assertion stage to the opt-in sidecar without touching logs."""
+    def capture(stage: str) -> None:
+        if isinstance(stage, str) and stage in pando_pitr_service.LIVE_ASSERTION_STAGES:
+            stages.append(stage)
+
+    def suite(binary: str) -> dict:
+        return pando_pitr_service.run_suite(binary, on_assertion_stage=capture)
+
+    return suite
+
+
 def _pitr_failure_checkpoint_record(
     report,
     *,
     expect_commit: str | None,
+    live_stage: str | None = None,
 ) -> dict | None:
     """Build the bounded checkpoint body for one pre-assert failure."""
     if isinstance(report, dict) and report.get("passed") is True:
@@ -155,6 +155,9 @@ def _pitr_failure_checkpoint_record(
         "code": code,
         "cases": _pitr_failure_checkpoint_cases(report),
     }
+    closed_live_stage = _pitr_failure_checkpoint_live_stage(report, live_stage)
+    if closed_live_stage is not None:
+        record["live_stage"] = closed_live_stage
     receipt_digest = report.get("build_receipt_sha256") if isinstance(report, dict) else None
     if isinstance(receipt_digest, str) and _FULL_SHA256.fullmatch(receipt_digest):
         record["build_receipt_sha256"] = receipt_digest
@@ -165,39 +168,22 @@ def _write_pitr_failure_checkpoint(
     report,
     *,
     expect_commit: str | None,
+    live_stage: str | None = None,
     environ=None,
 ) -> Path | None:
-    """Best-effort atomic publication; never replace the original assertion."""
+    """Best-effort publication; the runner helper supplies the atomic bound."""
     try:
         if not _pitr_failure_checkpoint_enabled(environ):
             return None
-        record = _pitr_failure_checkpoint_record(report, expect_commit=expect_commit)
+        record = _pitr_failure_checkpoint_record(
+            report,
+            expect_commit=expect_commit,
+            live_stage=live_stage,
+        )
         if record is None:
             return None
-        payload = (
-            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        ).encode("ascii")
-        if not payload or len(payload) > FAILURE_CHECKPOINT_MAX_BYTES:
-            return None
-        destination = _pitr_failure_checkpoint_path()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=destination.parent,
-                prefix=f".{FAILURE_CHECKPOINT_NAME}.",
-                delete=False,
-            ) as output:
-                temporary = Path(output.name)
-                output.write(payload)
-            temporary.replace(destination)
-            temporary = None
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink()
-                except OSError:
-                    pass
+        destination = ROOT / "test-results" / FAILURE_CHECKPOINT_NAME
+        run_python_ci_tests._write_report(destination, record)
         return destination
     except Exception:
         return None
@@ -528,6 +514,7 @@ class PandoPitrStageDiagnosticTest(unittest.TestCase):
                 operations.vault.close.side_effect = cleanup_failure
                 admin_url = "postgresql://fixture.invalid/example"
                 stderr = io.StringIO()
+                stages: list[str] = []
                 with (
                     redirect_stderr(stderr),
                     mock.patch.dict(os.environ, {"ROOTYARD_TEST_DATABASE_URL": admin_url}, clear=True),
@@ -541,8 +528,11 @@ class PandoPitrStageDiagnosticTest(unittest.TestCase):
                     ),
                     self.assertRaises(AssertionError) as raised,
                 ):
-                    pando_pitr_service.run_suite("fake-rootyard")
+                    pando_pitr_service.run_suite(
+                        "fake-rootyard", on_assertion_stage=stages.append
+                    )
                 self.assertIs(raised.exception, expected_error)
+                self.assertEqual(stages, [stage])
                 self.assertEqual(stderr.getvalue(), f"pando PITR live assertion stage ({stage})\n")
                 self.assertEqual(operations.run_cmd.call_args.args[0], ["fake-rootyard", "migrate"])
                 cleanup_calls = [mock.call.vault.close()]
@@ -558,31 +548,63 @@ class PandoPitrStageDiagnosticTest(unittest.TestCase):
                 self.assertEqual(operations.mock_calls[3:], cleanup_calls)
                 self.assertEqual(root.exists(), cleanup_failure is not None)
 
-    def test_marker_flush_failure_preserves_the_original_assertion(self) -> None:
+    def test_marker_and_callback_failures_preserve_the_original_assertion(self) -> None:
         original = AssertionError("fake setup detail")
         stderr = mock.Mock(wraps=io.StringIO())
         stderr.flush.side_effect = OSError("fake stderr failure")
+        stages: list[str] = []
+
+        def broken_callback(stage: str) -> None:
+            stages.append(stage)
+            raise OSError("fake callback failure")
+
         with (
             redirect_stderr(stderr),
             mock.patch.object(pando_pitr_service, "_run_live_suite", side_effect=original),
             self.assertRaises(AssertionError) as raised,
         ):
-            pando_pitr_service.run_suite("fake-rootyard")
+            pando_pitr_service.run_suite(
+                "fake-rootyard", on_assertion_stage=broken_callback
+            )
         self.assertIs(raised.exception, original)
+        self.assertEqual(stages, ["setup"])
         stderr.flush.assert_called_once_with()
         self.assertEqual(stderr.getvalue(), "pando PITR live assertion stage (setup)\n")
 
-    def test_non_assertion_has_no_stage_marker(self) -> None:
+    def test_non_assertion_has_no_stage_marker_or_callback(self) -> None:
         original = RuntimeError("fake suite detail")
         stderr = io.StringIO()
+        stages: list[str] = []
         with (
             redirect_stderr(stderr),
             mock.patch.object(pando_pitr_service, "_run_live_suite", side_effect=original),
             self.assertRaises(RuntimeError) as raised,
         ):
-            pando_pitr_service.run_suite("fake-rootyard")
+            pando_pitr_service.run_suite(
+                "fake-rootyard", on_assertion_stage=stages.append
+            )
         self.assertIs(raised.exception, original)
+        self.assertEqual(stages, [])
         self.assertEqual(stderr.getvalue(), "")
+
+    def test_unknown_stage_is_not_forwarded(self) -> None:
+        original = AssertionError("fake suite detail")
+        stages: list[str] = []
+
+        def unknown_stage(binary, enter_stage):
+            enter_stage("raw stage detail")
+            raise original
+
+        with (
+            mock.patch.object(pando_pitr_service, "_run_live_suite", side_effect=unknown_stage),
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(AssertionError) as raised,
+        ):
+            pando_pitr_service.run_suite(
+                "fake-rootyard", on_assertion_stage=stages.append
+            )
+        self.assertIs(raised.exception, original)
+        self.assertEqual(stages, [])
 
 
 class PandoPitrServiceTest(unittest.TestCase):
@@ -643,25 +665,32 @@ class PandoPitrServiceTest(unittest.TestCase):
                 self.fail(message)
             self.skipTest(message)
 
+        checkpoint_enabled = _pitr_failure_checkpoint_enabled()
+        live_stages: list[str] = []
         with tempfile.TemporaryDirectory(prefix="rootyard-pando-pitr-unittest-") as temporary:
             report_path = Path(temporary) / "pando-pitr-service.json"
+            acceptance = {
+                "binary": str(binary),
+                "build_receipt": str(receipt),
+                "expect_commit": expect_commit,
+                "report_path": report_path,
+            }
+            if checkpoint_enabled:
+                acceptance["suite"] = _pando_live_suite(live_stages)
             try:
-                report = pando_pitr_service.run_acceptance(
-                    binary=str(binary),
-                    build_receipt=str(receipt),
-                    expect_commit=expect_commit,
-                    report_path=report_path,
-                )
+                report = pando_pitr_service.run_acceptance(**acceptance)
             except Exception as error:
                 _write_pitr_failure_checkpoint(
                     None,
                     expect_commit=expect_commit,
+                    live_stage=live_stages[-1] if live_stages else None,
                 )
                 self.fail(f"bound PITR acceptance failed ({type(error).__name__})")
             if not isinstance(report, dict) or report.get("passed") is not True:
                 _write_pitr_failure_checkpoint(
                     report,
                     expect_commit=expect_commit,
+                    live_stage=live_stages[-1] if live_stages else None,
                 )
             self._assert_bound_report(report)
             try:
@@ -694,6 +723,7 @@ class PandoPitrServiceTest(unittest.TestCase):
         *,
         expect_error: bool = False,
         extra_env: dict[str, str] | None = None,
+        live_stage: str | None = None,
     ):
         with tempfile.TemporaryDirectory(prefix="rootyard-pando-pitr-wrapper-test-") as temporary:
             binary = Path(temporary) / "rootyard"
@@ -713,10 +743,20 @@ class PandoPitrServiceTest(unittest.TestCase):
 
             def fake_bound(**kwargs) -> dict:
                 calls.append(kwargs)
+                if "suite" in kwargs:
+                    try:
+                        kwargs["suite"](str(binary))
+                    except AssertionError:
+                        pass
                 Path(kwargs["report_path"]).write_text(
                     json.dumps(report), encoding="utf-8"
                 )
                 return report
+
+            def fake_suite(binary, on_assertion_stage=None):
+                if live_stage is not None and callable(on_assertion_stage):
+                    on_assertion_stage(live_stage)
+                raise AssertionError("direct suite bypass")
 
             with mock.patch.dict(os.environ, env, clear=True), \
                     mock.patch.object(runtime_binary, "select_runtime_binary_path",
@@ -724,7 +764,7 @@ class PandoPitrServiceTest(unittest.TestCase):
                     mock.patch.object(pando_pitr_service, "run_acceptance",
                                       side_effect=fake_bound), \
                     mock.patch.object(pando_pitr_service, "run_suite",
-                                      side_effect=AssertionError("direct suite bypass")):
+                                      side_effect=fake_suite):
                 case = PandoPitrServiceTest(
                     "test_pando_pitr_pg_dump_clone_and_retention_roots"
                 )
@@ -742,6 +782,7 @@ class PandoPitrServiceTest(unittest.TestCase):
         self.assertEqual(kwargs["build_receipt"], str(receipt))
         self.assertEqual(kwargs["expect_commit"], COMMIT)
         report_path = Path(kwargs["report_path"])
+        self.assertNotIn("suite", kwargs)
         self.assertNotEqual(report_path, ROOT / "test-results" / "pando-pitr-service.json")
         self.assertIn("rootyard-pando-pitr-unittest-", str(report_path))
 
@@ -758,12 +799,12 @@ class PandoPitrServiceTest(unittest.TestCase):
             expect_error=True,
         )
 
-    def test_live_wrapper_publishes_a_failed_report_only_under_the_exact_opt_in(self) -> None:
+    def test_live_wrapper_publishes_the_closed_live_stage_only_under_the_exact_opt_in(self) -> None:
         failed = self._bound_report()
         failed["passed"] = False
         failed["failure"] = {
             "phase": "suite",
-            "code": "mandatory_case_not_passed",
+            "code": "suite_failed",
             "exception_class": "AssertionError",
         }
         failed["cases"][0]["status"] = "failed"
@@ -777,17 +818,21 @@ class PandoPitrServiceTest(unittest.TestCase):
                         "_pitr_failure_checkpoint_source",
                         return_value=(COMMIT, "b" * 40),
                     ):
-                self._run_live_wrapper(
+                kwargs, _, _ = self._run_live_wrapper(
                     failed,
                     expect_error=True,
                     extra_env={FAILURE_CHECKPOINT_ENV: FAILURE_CHECKPOINT_OPT_IN},
+                    live_stage="dump_restore_clone",
                 )
+                self.assertTrue(callable(kwargs["suite"]))
                 checkpoint_path = root / "test-results" / FAILURE_CHECKPOINT_NAME
-                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                data = checkpoint_path.read_bytes()
+                checkpoint = json.loads(data)
                 self.assertEqual(checkpoint["stage"], "suite")
-                self.assertEqual(checkpoint["code"], "mandatory_case_not_passed")
+                self.assertEqual(checkpoint["code"], "suite_failed")
+                self.assertEqual(checkpoint["live_stage"], "dump_restore_clone")
                 self.assertEqual(len(checkpoint["cases"]), 7)
-                self.assertNotIn("AssertionError", checkpoint_path.read_text(encoding="utf-8"))
+                self.assertNotIn(b"AssertionError", data)
 
     def test_live_wrapper_rejects_incomplete_config_and_missing_mandatory_case(self) -> None:
         invalid = self._bound_report()
@@ -815,29 +860,24 @@ class PandoPitrFailureCheckpointTest(unittest.TestCase):
         )
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.module = sys.modules[__name__]
         self.enabled = {FAILURE_CHECKPOINT_ENV: FAILURE_CHECKPOINT_OPT_IN}
         self.target = self.root / "test-results" / FAILURE_CHECKPOINT_NAME
         for patcher in (
-            mock.patch.object(self.module, "ROOT", self.root),
+            mock.patch.object(sys.modules[__name__], "ROOT", self.root),
             mock.patch.object(
-                self.module,
-                "_pitr_failure_checkpoint_source",
+                run_python_ci_tests, "_checkout_binding",
                 return_value=(COMMIT, self.TREE),
             ),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def failed_report(self, *, failed_case: str | None = None) -> dict:
+    def failed_report(self) -> dict:
         cases = [
             {"name": name, "status": "passed"}
             for name in pando_pitr_service.MANDATORY_CASES
         ]
-        if failed_case is not None:
-            for case in cases:
-                if case["name"] == failed_case:
-                    case["status"] = "failed"
+        cases[0]["status"] = "failed"
         return {
             "passed": False,
             "source_commit": "c" * 40,
@@ -845,56 +885,71 @@ class PandoPitrFailureCheckpointTest(unittest.TestCase):
             "build_receipt_sha256": self.RECEIPT_SHA256,
             "failure": {
                 "phase": "suite",
-                "code": "mandatory_case_not_passed",
+                "code": "suite_failed",
                 "exception_class": "AssertionError",
             },
             "cases": cases + [{"name": "not-a-known-case", "status": "failed"}],
             "private": "raw /tmp/path Exception detail",
         }
 
-    def test_failed_report_writes_only_the_closed_bounded_projection(self) -> None:
-        failed_case = "clone_fail_closed_zero_deletes"
+    def test_closed_projection_live_stage_and_missing_report(self) -> None:
         path = _write_pitr_failure_checkpoint(
-            self.failed_report(failed_case=failed_case),
+            self.failed_report(),
             expect_commit=COMMIT,
+            live_stage="dump_restore_clone",
             environ=self.enabled,
         )
         self.assertEqual(path, self.target)
         data = self.target.read_bytes()
-        self.assertLessEqual(len(data), FAILURE_CHECKPOINT_MAX_BYTES)
+        self.assertLessEqual(len(data), run_python_ci_tests.REPORT_MAX_BYTES)
         checkpoint = json.loads(data)
         self.assertEqual(set(checkpoint), {
-            "passed",
-            "source_commit",
-            "source_tree",
-            "stage",
-            "code",
-            "build_receipt_sha256",
-            "cases",
+            "passed", "source_commit", "source_tree", "stage", "code",
+            "live_stage", "build_receipt_sha256", "cases",
         })
         self.assertEqual(checkpoint["source_commit"], COMMIT)
         self.assertEqual(checkpoint["source_tree"], self.TREE)
         self.assertEqual((checkpoint["stage"], checkpoint["code"]), (
-            "suite", "mandatory_case_not_passed",
+            "suite", "suite_failed",
         ))
+        self.assertEqual(checkpoint["live_stage"], "dump_restore_clone")
         self.assertEqual(checkpoint["build_receipt_sha256"], self.RECEIPT_SHA256)
         self.assertEqual(
             [case["name"] for case in checkpoint["cases"]],
             list(pando_pitr_service.MANDATORY_CASES),
         )
-        self.assertEqual(
-            [case["status"] for case in checkpoint["cases"]].count("failed"), 1
-        )
         for forbidden in (
-            b"AssertionError",
-            b"private",
-            b"/tmp",
-            b"not-a-known-case",
-            b"raw",
+            b"AssertionError", b"private", b"/tmp", b"not-a-known-case", b"raw",
         ):
             self.assertNotIn(forbidden, data)
+        self.assertNotIn("live_stage", _pitr_failure_checkpoint_record(
+            self.failed_report(), expect_commit=COMMIT, live_stage="raw stage",
+        ))
+        preflight = self.failed_report()
+        preflight["failure"]["phase"] = "preflight"
+        self.assertNotIn("live_stage", _pitr_failure_checkpoint_record(
+            preflight, expect_commit=COMMIT, live_stage="cleanup",
+        ))
 
-    def test_disabled_or_clean_runs_do_not_write(self) -> None:
+        self.target.unlink()
+        path = _write_pitr_failure_checkpoint(
+            None, expect_commit=COMMIT, environ=self.enabled,
+        )
+        self.assertEqual(path, self.target)
+        diagnostic = json.loads(self.target.read_bytes())
+        self.assertEqual((diagnostic["stage"], diagnostic["code"]), (
+            "report", "report_missing",
+        ))
+        self.assertEqual(
+            diagnostic["cases"],
+            [
+                {"name": name, "status": "missing"}
+                for name in pando_pitr_service.MANDATORY_CASES
+            ],
+        )
+        self.assertNotIn("failure", diagnostic)
+
+    def test_disabled_clean_unbound_or_unwritable_never_writes(self) -> None:
         report = self.failed_report()
         for environ in (
             {},
@@ -904,62 +959,26 @@ class PandoPitrFailureCheckpointTest(unittest.TestCase):
         ):
             with self.subTest(environ=environ):
                 self.assertIsNone(_write_pitr_failure_checkpoint(
-                    report,
-                    expect_commit=COMMIT,
-                    environ=environ,
+                    report, expect_commit=COMMIT, environ=environ,
                 ))
                 self.assertFalse(self.target.exists())
         clean = self.failed_report()
         clean["passed"] = True
         clean["failure"] = None
-        clean["cases"] = [
-            {"name": name, "status": "passed"}
-            for name in pando_pitr_service.MANDATORY_CASES
-        ]
         self.assertIsNone(_write_pitr_failure_checkpoint(
-            clean,
-            expect_commit=COMMIT,
-            environ=self.enabled,
+            clean, expect_commit=COMMIT, environ=self.enabled,
         ))
+        for binding in (None, (COMMIT, "not-a-tree")):
+            with self.subTest(binding=binding), mock.patch.object(
+                run_python_ci_tests, "_checkout_binding", return_value=binding,
+            ):
+                self.assertIsNone(_write_pitr_failure_checkpoint(
+                    report, expect_commit=COMMIT, environ=self.enabled,
+                ))
         self.assertFalse(self.target.exists())
-
-    def test_missing_report_is_one_fixed_diagnostic(self) -> None:
-        path = _write_pitr_failure_checkpoint(
-            None,
-            expect_commit=COMMIT,
-            environ=self.enabled,
-        )
-        self.assertEqual(path, self.target)
-        checkpoint = json.loads(self.target.read_bytes())
-        self.assertEqual((checkpoint["stage"], checkpoint["code"]), (
-            "report", "report_missing",
-        ))
-        self.assertEqual(
-            checkpoint["cases"],
-            [
-                {"name": name, "status": "missing"}
-                for name in pando_pitr_service.MANDATORY_CASES
-            ],
-        )
-        self.assertNotIn("failure", checkpoint)
-
-    def test_unbound_source_or_write_failure_is_silently_skipped(self) -> None:
-        report = self.failed_report()
-        with mock.patch.object(
-            self.module, "_pitr_failure_checkpoint_source", return_value=None
-        ):
-            self.assertIsNone(_write_pitr_failure_checkpoint(
-                report,
-                expect_commit=COMMIT,
-                environ=self.enabled,
-            ))
-        self.assertFalse(self.target.exists())
-
         self.target.parent.write_text("not a directory", encoding="utf-8")
         self.assertIsNone(_write_pitr_failure_checkpoint(
-            report,
-            expect_commit=COMMIT,
-            environ=self.enabled,
+            report, expect_commit=COMMIT, environ=self.enabled,
         ))
 
 
