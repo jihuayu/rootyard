@@ -1,0 +1,667 @@
+use super::{
+    PublicAttemptLookup, PublicAttemptRequest, RawAttempt, RawSnapshot, RawWrapper, SELECT_SNAPSHOT, evaluate,
+};
+use crate::ref_store::{
+    CommitMode, GitObjectFormat, OperationState, RefStoreError, RequestDigest,
+    core::pack_commit::{PackCommitError, PackCommitRejectCode},
+};
+use uuid::Uuid;
+
+fn id(value: u128) -> Uuid {
+    Uuid::from_u128(value)
+}
+
+fn digest(byte: u8) -> RequestDigest {
+    RequestDigest::from_bytes([byte; 32])
+}
+
+fn repo() -> Uuid {
+    id(1)
+}
+
+fn public() -> Uuid {
+    id(2)
+}
+
+fn owner() -> Uuid {
+    id(3)
+}
+
+fn issuer() -> Uuid {
+    id(4)
+}
+
+fn history() -> Uuid {
+    id(5)
+}
+
+fn restore() -> Uuid {
+    id(6)
+}
+
+fn private0() -> Uuid {
+    id(7)
+}
+
+fn private1() -> Uuid {
+    id(8)
+}
+
+fn event0() -> Uuid {
+    id(9)
+}
+
+fn event1() -> Uuid {
+    id(10)
+}
+
+fn wire() -> RequestDigest {
+    digest(0x11)
+}
+
+fn plan0() -> RequestDigest {
+    digest(0x21)
+}
+
+fn proof0() -> RequestDigest {
+    digest(0x22)
+}
+
+fn plan1() -> RequestDigest {
+    digest(0x31)
+}
+
+fn proof1() -> RequestDigest {
+    digest(0x32)
+}
+
+fn backend() -> String {
+    "0123456789abcdef".repeat(4)
+}
+
+fn request() -> PublicAttemptRequest {
+    PublicAttemptRequest {
+        repository_id: repo(),
+        admission_owner_id: owner(),
+        issuer_id: issuer(),
+        public_id: public(),
+        wire_digest: wire(),
+        request_mode: CommitMode::Atomic,
+        backend_identity: backend(),
+        object_format: GitObjectFormat::Sha1,
+        history_incarnation: history(),
+        authority_epoch: 1,
+        group_epoch: 2,
+        restore_incarnation: restore(),
+    }
+}
+
+fn wrapper(current_slot: i16, state: &str) -> RawWrapper {
+    RawWrapper {
+        repository_id: repo(),
+        public_id: public(),
+        admission_owner_id: owner(),
+        issuer_id: issuer(),
+        wire_digest: wire().as_hex(),
+        request_mode: "atomic".into(),
+        backend_identity: backend(),
+        object_format: "sha1".into(),
+        history_incarnation: history(),
+        authority_epoch: 1,
+        group_epoch: 2,
+        restore_incarnation: restore(),
+        current_slot,
+        state: state.into(),
+        event_id: if matches!(state, "committed" | "rejected") { Some(event1()) } else { None },
+        retired_event_id: if current_slot == 1 { Some(event0()) } else { None },
+        cancelled_private_id: if state == "cancelled" {
+            Some(if current_slot == 1 { private1() } else { private0() })
+        } else {
+            None
+        },
+    }
+}
+
+fn base_attempt(slot: i16, private_id: Uuid, plan: RequestDigest, proof: RequestDigest, sequence: i64) -> RawAttempt {
+    RawAttempt {
+        slot,
+        private_id,
+        plan_digest: plan.as_hex(),
+        proof_digest: proof.as_hex(),
+        base_revision: 1,
+        serving_bound: true,
+        operation_issuer_id: Some(issuer()),
+        operation_lane: Some("lane".into()),
+        operation_sequence: Some(sequence),
+        operation_request_digest: Some(plan.as_hex()),
+        operation_state: Some("pending".into()),
+        terminal_present: false,
+        terminal_cancelled_exact: false,
+        event_id: None,
+        event_revision: None,
+        event_outcome_matches: false,
+        event_body_matches: false,
+        tombstone_present: false,
+        tombstone_absent: true,
+        tombstone_matches_lane: false,
+        tombstone_exact_operation: false,
+        revision_mismatch_rejection: false,
+    }
+}
+
+fn pending_attempt(
+    slot: i16,
+    private_id: Uuid,
+    plan: RequestDigest,
+    proof: RequestDigest,
+    sequence: i64,
+    base_revision: i64,
+) -> RawAttempt {
+    let mut attempt = base_attempt(slot, private_id, plan, proof, sequence);
+    attempt.base_revision = base_revision;
+    attempt
+}
+
+fn retired_attempt() -> RawAttempt {
+    let mut attempt = base_attempt(0, private0(), plan0(), proof0(), 1);
+    attempt.operation_state = Some("rejected".into());
+    attempt.terminal_present = true;
+    attempt.event_id = Some(event0());
+    attempt.event_revision = Some(2);
+    attempt.event_outcome_matches = true;
+    attempt.event_body_matches = true;
+    attempt.revision_mismatch_rejection = true;
+    attempt
+}
+
+fn committed_attempt() -> RawAttempt {
+    let mut attempt = base_attempt(0, private0(), plan0(), proof0(), 1);
+    attempt.operation_state = Some("committed".into());
+    attempt.terminal_present = true;
+    attempt.event_id = Some(event1());
+    attempt.event_revision = Some(2);
+    attempt.event_outcome_matches = true;
+    attempt.event_body_matches = true;
+    attempt
+}
+
+fn cancelled_attempt() -> RawAttempt {
+    let mut attempt = base_attempt(0, private0(), plan0(), proof0(), 1);
+    attempt.operation_state = Some("cancelled".into());
+    attempt.terminal_present = true;
+    attempt.terminal_cancelled_exact = true;
+    attempt.tombstone_present = true;
+    attempt.tombstone_absent = false;
+    attempt.tombstone_matches_lane = true;
+    attempt.tombstone_exact_operation = true;
+    attempt
+}
+
+fn snapshot(wrapper: RawWrapper, attempts: Vec<RawAttempt>) -> RawSnapshot {
+    RawSnapshot {
+        wrapper: Some(wrapper),
+        attempts,
+        private_occupied: false,
+        legacy_operation: false,
+        legacy_cancellation: false,
+        realm_matches: true,
+    }
+}
+
+fn empty_snapshot() -> RawSnapshot {
+    RawSnapshot {
+        wrapper: None,
+        attempts: Vec::new(),
+        private_occupied: false,
+        legacy_operation: false,
+        legacy_cancellation: false,
+        realm_matches: true,
+    }
+}
+
+fn assert_ledger(result: Result<PublicAttemptLookup, PackCommitError>) {
+    match result {
+        Err(PackCommitError::Rejected(rejection)) => {
+            assert_eq!(rejection.code, PackCommitRejectCode::LedgerIntegrity);
+        }
+        other => panic!("expected ledger integrity, got {other:?}"),
+    }
+}
+
+fn assert_identity_conflict(result: Result<PublicAttemptLookup, PackCommitError>) {
+    assert!(matches!(result, Err(PackCommitError::RefStore(RefStoreError::IdentityConflict))));
+}
+
+fn assert_digest_conflict(result: Result<PublicAttemptLookup, PackCommitError>) {
+    assert!(matches!(result, Err(PackCommitError::RefStore(RefStoreError::DigestConflict))));
+}
+
+#[test]
+fn pending_slot_zero_is_resolved_from_the_current_attempt() {
+    let result = evaluate(
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &request(),
+    )
+    .expect("valid pending slot zero");
+    match result {
+        PublicAttemptLookup::Pending(evidence) => {
+            assert_eq!(evidence.public_id, public());
+            assert_eq!(evidence.current.slot, 0);
+            assert_eq!(evidence.current.private_id, private0());
+            assert_eq!(evidence.current.state, OperationState::Pending);
+            assert_eq!(evidence.current.plan_digest, plan0());
+            assert_eq!(evidence.current.proof_digest, proof0());
+            assert!(evidence.current.event_id.is_none());
+            assert!(evidence.retired.is_none());
+        }
+        other => panic!("expected pending slot zero, got {other:?}"),
+    }
+}
+
+#[test]
+fn pending_slot_one_returns_pending_and_never_the_retired_rejection() {
+    let result = evaluate(
+        snapshot(
+            wrapper(1, "pending"),
+            vec![retired_attempt(), pending_attempt(1, private1(), plan1(), proof1(), 2, 2)],
+        ),
+        &request(),
+    )
+    .expect("valid pending slot one");
+    match result {
+        PublicAttemptLookup::Pending(evidence) => {
+            assert_eq!(evidence.current.slot, 1);
+            assert_eq!(evidence.current.private_id, private1());
+            let retired = evidence.retired.expect("slot-zero retirement evidence");
+            assert_eq!(retired.slot, 0);
+            assert_eq!(retired.private_id, private0());
+            assert_eq!(retired.state, OperationState::Rejected);
+            assert_eq!(retired.event_id, Some(event0()));
+        }
+        PublicAttemptLookup::Rejected(_) => panic!("retired slot zero must not be the public final result"),
+        other => panic!("expected pending slot one, got {other:?}"),
+    }
+}
+
+#[test]
+fn slot_zero_rejection_with_a_pending_wrapper_fails_closed() {
+    assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![retired_attempt()]), &request()));
+}
+
+#[test]
+fn committed_requires_the_exact_event_and_terminal_body() {
+    let result =
+        evaluate(snapshot(wrapper(0, "committed"), vec![committed_attempt()]), &request()).expect("valid committed");
+    match result {
+        PublicAttemptLookup::Committed(evidence) => {
+            assert_eq!(evidence.current.state, OperationState::Committed);
+            assert_eq!(evidence.current.event_id, Some(event1()));
+            assert_eq!(evidence.current.event_revision, Some(2));
+        }
+        other => panic!("expected committed, got {other:?}"),
+    }
+
+    let mut wrong_body = committed_attempt();
+    wrong_body.event_body_matches = false;
+    assert_ledger(evaluate(snapshot(wrapper(0, "committed"), vec![wrong_body]), &request()));
+
+    let mut wrong_outcome = committed_attempt();
+    wrong_outcome.event_outcome_matches = false;
+    assert_ledger(evaluate(snapshot(wrapper(0, "committed"), vec![wrong_outcome]), &request()));
+
+    assert_ledger(evaluate(snapshot(wrapper(0, "committed"), vec![retired_attempt()]), &request()));
+}
+
+#[test]
+fn cancelled_requires_the_current_private_id_and_exact_tombstone() {
+    let result =
+        evaluate(snapshot(wrapper(0, "cancelled"), vec![cancelled_attempt()]), &request()).expect("valid cancelled");
+    match result {
+        PublicAttemptLookup::Cancelled(evidence) => {
+            assert_eq!(evidence.current.state, OperationState::Cancelled);
+            assert_eq!(evidence.current.private_id, private0());
+            assert!(evidence.current.event_id.is_none());
+        }
+        other => panic!("expected cancelled, got {other:?}"),
+    }
+
+    let mut wrong_current = wrapper(0, "cancelled");
+    wrong_current.cancelled_private_id = Some(private1());
+    assert_ledger(evaluate(snapshot(wrong_current, vec![cancelled_attempt()]), &request()));
+
+    let mut wrong_tombstone = cancelled_attempt();
+    wrong_tombstone.tombstone_exact_operation = false;
+    assert_ledger(evaluate(snapshot(wrapper(0, "cancelled"), vec![wrong_tombstone]), &request()));
+
+    let mut wrong_lane_tombstone = cancelled_attempt();
+    wrong_lane_tombstone.tombstone_matches_lane = false;
+    assert_ledger(evaluate(snapshot(wrapper(0, "cancelled"), vec![wrong_lane_tombstone]), &request()));
+
+    let mut wrong_terminal = cancelled_attempt();
+    wrong_terminal.terminal_cancelled_exact = false;
+    assert_ledger(evaluate(snapshot(wrapper(0, "cancelled"), vec![wrong_terminal]), &request()));
+
+    let mut no_tombstone = cancelled_attempt();
+    no_tombstone.tombstone_present = false;
+    no_tombstone.tombstone_absent = true;
+    no_tombstone.tombstone_matches_lane = false;
+    no_tombstone.tombstone_exact_operation = false;
+    assert_ledger(evaluate(snapshot(wrapper(0, "cancelled"), vec![no_tombstone]), &request()));
+}
+
+#[test]
+fn cancelled_slot_one_binds_only_the_current_attempt() {
+    let mut current = wrapper(1, "cancelled");
+    current.cancelled_private_id = Some(private1());
+    let mut cancelled = base_attempt(1, private1(), plan1(), proof1(), 2);
+    cancelled.base_revision = 2;
+    cancelled.operation_state = Some("cancelled".into());
+    cancelled.terminal_present = true;
+    cancelled.terminal_cancelled_exact = true;
+    cancelled.tombstone_present = true;
+    cancelled.tombstone_absent = false;
+    cancelled.tombstone_matches_lane = true;
+    cancelled.tombstone_exact_operation = true;
+
+    let result = evaluate(snapshot(current.clone(), vec![retired_attempt(), cancelled.clone()]), &request())
+        .expect("valid cancelled slot one");
+    match result {
+        PublicAttemptLookup::Cancelled(evidence) => {
+            assert_eq!(evidence.current.slot, 1);
+            assert_eq!(evidence.current.private_id, private1());
+            assert_eq!(evidence.retired.expect("retired evidence").private_id, private0());
+        }
+        other => panic!("expected cancelled slot one, got {other:?}"),
+    }
+
+    current.cancelled_private_id = Some(private0());
+    assert_ledger(evaluate(snapshot(current, vec![retired_attempt(), cancelled]), &request()));
+}
+
+#[test]
+fn retired_attempt_must_be_the_advanced_revision_mismatch_rejection() {
+    let mut wrong_revision = retired_attempt();
+    wrong_revision.event_revision = Some(1);
+    assert_ledger(evaluate(
+        snapshot(wrapper(1, "pending"), vec![wrong_revision, pending_attempt(1, private1(), plan1(), proof1(), 2, 2)]),
+        &request(),
+    ));
+
+    let mut wrong_retirement = retired_attempt();
+    wrong_retirement.revision_mismatch_rejection = false;
+    assert_ledger(evaluate(
+        snapshot(
+            wrapper(1, "pending"),
+            vec![wrong_retirement, pending_attempt(1, private1(), plan1(), proof1(), 2, 2)],
+        ),
+        &request(),
+    ));
+
+    let mut wrong_body = retired_attempt();
+    wrong_body.event_body_matches = false;
+    assert_ledger(evaluate(
+        snapshot(wrapper(1, "pending"), vec![wrong_body, pending_attempt(1, private1(), plan1(), proof1(), 2, 2)]),
+        &request(),
+    ));
+
+    let mut wrong_state = retired_attempt();
+    wrong_state.operation_state = Some("committed".into());
+    assert_ledger(evaluate(
+        snapshot(wrapper(1, "pending"), vec![wrong_state, pending_attempt(1, private1(), plan1(), proof1(), 2, 2)]),
+        &request(),
+    ));
+}
+
+#[test]
+fn stale_realm_is_refused() {
+    let mut stale = snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
+    stale.realm_matches = false;
+    assert_ledger(evaluate(stale, &request()));
+}
+
+#[test]
+fn attempt_set_must_be_exactly_the_slots_required_by_the_current_slot() {
+    assert_ledger(evaluate(snapshot(wrapper(0, "pending"), Vec::new()), &request()));
+
+    let mut duplicate = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    duplicate.proof_digest = proof1().as_hex();
+    assert_ledger(evaluate(
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1), duplicate]),
+        &request(),
+    ));
+
+    assert_ledger(evaluate(
+        snapshot(wrapper(1, "pending"), vec![pending_attempt(1, private1(), plan1(), proof1(), 2, 2)]),
+        &request(),
+    ));
+
+    assert_ledger(evaluate(
+        snapshot(
+            wrapper(0, "pending"),
+            vec![retired_attempt(), pending_attempt(1, private1(), plan1(), proof1(), 2, 2)],
+        ),
+        &request(),
+    ));
+
+    assert_ledger(evaluate(
+        snapshot(
+            wrapper(1, "pending"),
+            vec![retired_attempt(), pending_attempt(1, private0(), plan1(), proof1(), 2, 2)],
+        ),
+        &request(),
+    ));
+}
+
+#[test]
+fn private_and_legacy_markers_never_expose_legacy_data() {
+    let mut private = empty_snapshot();
+    private.private_occupied = true;
+    private.legacy_operation = true;
+    private.legacy_cancellation = true;
+    assert!(matches!(evaluate(private, &request()).expect("private marker"), PublicAttemptLookup::PrivateIdentifier));
+
+    let mut legacy = empty_snapshot();
+    legacy.legacy_operation = true;
+    assert!(matches!(evaluate(legacy, &request()).expect("legacy marker"), PublicAttemptLookup::LegacyPath));
+
+    let mut legacy_cancellation = empty_snapshot();
+    legacy_cancellation.legacy_cancellation = true;
+    assert!(matches!(
+        evaluate(legacy_cancellation, &request()).expect("legacy cancellation marker"),
+        PublicAttemptLookup::LegacyPath
+    ));
+
+    assert!(matches!(evaluate(empty_snapshot(), &request()).expect("unknown marker"), PublicAttemptLookup::Unknown));
+}
+
+#[test]
+fn public_identifier_cannot_alias_a_private_or_legacy_claim() {
+    let mut private_alias =
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
+    private_alias.private_occupied = true;
+    assert_ledger(evaluate(private_alias, &request()));
+
+    let mut legacy_alias =
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
+    legacy_alias.legacy_operation = true;
+    assert_ledger(evaluate(legacy_alias, &request()));
+
+    let mut cancellation_alias =
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
+    cancellation_alias.legacy_cancellation = true;
+    assert_ledger(evaluate(cancellation_alias, &request()));
+}
+
+#[test]
+fn wrapper_identity_mismatches_are_fixed_typed_errors() {
+    let attempt = || vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)];
+
+    let mut wrong_wire = request();
+    wrong_wire.wire_digest = plan0();
+    assert_digest_conflict(evaluate(snapshot(wrapper(0, "pending"), attempt()), &wrong_wire));
+
+    let mut wrong_issuer = request();
+    wrong_issuer.issuer_id = private1();
+    assert_identity_conflict(evaluate(snapshot(wrapper(0, "pending"), attempt()), &wrong_issuer));
+
+    let mut wrong_mode = request();
+    wrong_mode.request_mode = CommitMode::AcceptedSubset;
+    assert_identity_conflict(evaluate(snapshot(wrapper(0, "pending"), attempt()), &wrong_mode));
+}
+
+#[test]
+fn request_shape_rejects_nil_non_hex_and_non_positive_epochs() {
+    let mut nil_repo = request();
+    nil_repo.repository_id = Uuid::nil();
+    assert!(matches!(nil_repo.validate(), Err(PackCommitError::Invalid(_))));
+
+    let mut nil_issuer = request();
+    nil_issuer.issuer_id = Uuid::nil();
+    assert!(matches!(nil_issuer.validate(), Err(PackCommitError::Invalid(_))));
+
+    let mut non_hex = request();
+    non_hex.backend_identity = "not-a-digest".into();
+    assert!(matches!(non_hex.validate(), Err(PackCommitError::Invalid(_))));
+
+    let mut zero_epoch = request();
+    zero_epoch.authority_epoch = 0;
+    assert!(matches!(zero_epoch.validate(), Err(PackCommitError::Invalid(_))));
+
+    let mut negative_epoch = request();
+    negative_epoch.group_epoch = -1;
+    assert!(matches!(negative_epoch.validate(), Err(PackCommitError::Invalid(_))));
+
+    assert!(request().validate().is_ok());
+}
+
+#[test]
+fn attempt_binding_and_event_evidence_are_fail_closed() {
+    let mut unbound = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    unbound.serving_bound = false;
+    assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![unbound]), &request()));
+
+    let mut pending_with_event = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    pending_with_event.event_id = Some(event1());
+    assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![pending_with_event]), &request()));
+
+    let mut partial_tombstone = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    partial_tombstone.tombstone_present = true;
+    partial_tombstone.tombstone_absent = false;
+    assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![partial_tombstone]), &request()));
+
+    let mut pending_terminal = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    pending_terminal.terminal_present = true;
+    assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![pending_terminal]), &request()));
+}
+
+#[test]
+fn stored_wrapper_and_attempt_evidence_is_fail_closed() {
+    let mut bad_wire = wrapper(0, "pending");
+    bad_wire.wire_digest = "not-a-wire-digest".into();
+    assert_ledger(evaluate(
+        snapshot(bad_wire, vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &request(),
+    ));
+
+    let mut bad_backend = wrapper(0, "pending");
+    bad_backend.backend_identity = "not-a-backend".into();
+    assert_ledger(evaluate(
+        snapshot(bad_backend, vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &request(),
+    ));
+
+    let mut bad_state = wrapper(0, "pending");
+    bad_state.state = "unknown".into();
+    assert_ledger(evaluate(
+        snapshot(bad_state, vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &request(),
+    ));
+
+    let mut bad_plan = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    bad_plan.plan_digest = "not-a-plan".into();
+    assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![bad_plan]), &request()));
+
+    let mut bad_operation_state = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    bad_operation_state.operation_state = Some("unknown".into());
+    assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![bad_operation_state]), &request()));
+}
+
+#[test]
+fn debug_output_is_redacted() {
+    let lookup = evaluate(
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &request(),
+    )
+    .expect("valid pending lookup");
+    let lookup_debug = format!("{lookup:?}");
+    for secret in [
+        public().to_string(),
+        private0().to_string(),
+        plan0().as_hex(),
+        proof0().as_hex(),
+        wire().as_hex(),
+        event0().to_string(),
+    ] {
+        assert!(!lookup_debug.contains(secret.as_str()), "lookup Debug leaked {secret}");
+    }
+    assert!(lookup_debug.contains("Pending"));
+    assert!(lookup_debug.contains("slot: 0"));
+
+    let request_debug = format!("{:?}", request());
+    for secret in [
+        repo().to_string(),
+        public().to_string(),
+        owner().to_string(),
+        issuer().to_string(),
+        history().to_string(),
+        restore().to_string(),
+        wire().as_hex(),
+        backend(),
+    ] {
+        assert!(!request_debug.contains(secret.as_str()), "request Debug leaked {secret}");
+    }
+    assert!(request_debug.contains("Atomic"));
+}
+
+#[test]
+fn snapshot_sql_is_one_read_only_statement_with_finite_evidence() {
+    let sql = SELECT_SNAPSHOT.to_ascii_lowercase();
+    for table in [
+        "ref_store_public_operations",
+        "ref_store_private_attempts",
+        "ref_store_operations",
+        "ref_store_core_events",
+        "ref_store_cancellations",
+        "ref_store_core_gates",
+        "ref_store_serving_repositories",
+        "ref_store_core_protocol_repos",
+        "cluster_authority",
+        "repositories",
+    ] {
+        assert!(sql.contains(table), "snapshot SQL is missing {table}");
+    }
+    assert!(sql.contains("rootyard_ref_store_attempt_has_binding"));
+    for evidence in [
+        "terminal_present",
+        "terminal_cancelled_exact",
+        "event_outcome_matches",
+        "event_body_matches",
+        "revision_mismatch_rejection",
+        "tombstone_present",
+        "tombstone_absent",
+        "tombstone_matches_lane",
+        "tombstone_exact_operation",
+        "realm_matches",
+    ] {
+        assert!(sql.contains(evidence), "snapshot SQL is missing {evidence}");
+    }
+    for realm in ["r.archived_at", "s.backend_identity", "p.decision_required", "c.incarnation"] {
+        assert!(sql.contains(realm), "snapshot SQL is missing realm evidence {realm}");
+    }
+    for payload in ["operation_terminal_result", "event_payload", "tombstone_request_digest"] {
+        assert!(!sql.contains(payload), "snapshot SQL still projects payload column {payload}");
+    }
+    for forbidden in [" insert ", " update ", " delete ", " for update", " for share", "pg_advisory", ";"] {
+        assert!(!sql.contains(forbidden), "snapshot SQL contains forbidden {forbidden:?}");
+    }
+}
