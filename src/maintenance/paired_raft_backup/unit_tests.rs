@@ -431,25 +431,27 @@ fn manifest_digest_tamper_cursor_group_epoch_and_incarnation_guard_checks() {
 }
 
 #[test]
-fn git_verify_roundtrip_sha1_and_sha256_and_rejects_corrupt_pack() {
+fn git_verify_roundtrip_sha1_and_sha256_reverse_pack_order_and_rejects_corrupt_pack() {
     for fmt in [GitObjectFormat::Sha1, GitObjectFormat::Sha256] {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (commit, pack, idx) =
-            seed_commit_pack(&dir.path().join("seed"), fmt, "hello.txt", b"paired-backup-payload\n", None)
-                .expect("seed commit");
+        let seed_dir = dir.path().join("seed");
+        let (c1, pack1, idx1) =
+            seed_commit_pack(&seed_dir, fmt, "hello.txt", b"paired-backup-payload\n", None).expect("seed commit 1");
+        let (commit, pack2, idx2) =
+            seed_commit_pack(&seed_dir, fmt, "next.txt", b"second-pack\n", Some(&c1)).expect("seed commit 2");
         let refs = BTreeMap::from([("refs/heads/main".to_owned(), commit)]);
         let n = verify_bare_repo_from_blobs(
             &dir.path().join("bare"),
             fmt,
             &refs,
-            &[(pack.clone(), idx.clone())],
+            &[(pack2.clone(), idx2), (pack1.clone(), idx1.clone())],
             &dir.path().join("clone"),
         )
-        .expect("git fsck & clone pass");
+        .expect("git fsck & clone pass even when incremental pack precedes base pack");
         assert_eq!(n, 1);
 
         let corrupt_pack = dir.path().join("corrupt.pack");
-        let mut bytes = std::fs::read(&pack).expect("read pack");
+        let mut bytes = std::fs::read(&pack1).expect("read pack");
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         std::fs::write(&corrupt_pack, bytes).expect("write corrupt pack");
@@ -458,7 +460,7 @@ fn git_verify_roundtrip_sha1_and_sha256_and_rejects_corrupt_pack() {
                 &dir.path().join("bare-bad"),
                 fmt,
                 &refs,
-                &[(corrupt_pack, idx)],
+                &[(corrupt_pack, idx1)],
                 &dir.path().join("clone-bad"),
             )
             .is_err()

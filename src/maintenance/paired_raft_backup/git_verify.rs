@@ -68,14 +68,26 @@ pub fn verify_bare_repo_from_blobs(
 
     let pack_dst_dir = bare.join("objects").join("pack");
     fs::create_dir_all(&pack_dst_dir)?;
+    let mut staged_packs = Vec::with_capacity(pack_pairs.len());
     for (idx, (pack_path, idx_path)) in pack_pairs.iter().enumerate() {
         let pack_dst = pack_dst_dir.join(format!("pack-restored-{idx:04}.pack"));
         let idx_dst = pack_dst_dir.join(format!("pack-restored-{idx:04}.idx"));
         fs::copy(pack_path, &pack_dst)?;
         fs::copy(idx_path, &idx_dst)?;
-        run_git(Some(&bare), &["index-pack", "--strict", &pack_dst.to_string_lossy()], &[])?;
         run_git(Some(&bare), &["verify-pack", "-v", &idx_dst.to_string_lossy()], &[])?;
+        staged_packs.push(pack_dst);
     }
+    let strict_scratch = work_dir.join("strict-idx-check");
+    fs::create_dir_all(&strict_scratch)?;
+    for (idx, pack_dst) in staged_packs.iter().enumerate() {
+        let scratch_idx = strict_scratch.join(format!("check-{idx:04}.idx"));
+        run_git(
+            Some(&bare),
+            &["index-pack", "--strict", "-o", &scratch_idx.to_string_lossy(), &pack_dst.to_string_lossy()],
+            &[],
+        )?;
+    }
+    fs::remove_dir_all(&strict_scratch)?;
 
     let mut batch = String::new();
     for (ref_name, oid) in refs {
