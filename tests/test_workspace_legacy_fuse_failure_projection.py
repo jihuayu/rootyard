@@ -173,15 +173,23 @@ class _FakeResult:
 
 
 class FailureProjectionTest(unittest.TestCase):
-    def test_source_whitelist_is_exactly_the_bound_eleven_files(self):
-        expected = tuple(acceptance.SOURCE_PATHS) + (
+    def test_source_whitelist_is_exactly_the_bound_twelve_files(self):
+        expected = (
+            "tests/workspace_legacy_fuse_shutdown_acceptance.py",
+            "tests/workspace_legacy_fuse_shutdown_support.py",
+            "tests/workspace_legacy_fuse_shutdown_fixtures.py",
+            "tests/workspace_legacy_fuse_shutdown_ownership.py",
+            "tests/workspace_legacy_fuse_shutdown_fifo.py",
+            "tests/workspace_legacy_fuse_shutdown_report.py",
+            "tests/fixtures/api_bind_gate.c",
+            "tests/fixtures/legacy_stat_gate.c",
             "tests/e2e.py",
             "tests/runtime_binary.py",
             "tests/native_evidence.py",
             "tests/fuse_helper_native_support.py",
         )
         self.assertEqual(report.DIAGNOSTIC_SOURCE_PATHS, expected)
-        self.assertEqual(len(set(expected)), 11)
+        self.assertEqual(len(set(expected)), 12)
         for relative in report.DIAGNOSTIC_SOURCE_PATHS:
             self.assertTrue((ROOT / relative).is_file(), relative)
         self.assertNotIn(
