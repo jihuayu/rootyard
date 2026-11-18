@@ -236,11 +236,8 @@ class CrossProcessHarness(Harness):
                       deterministic_sql_pause_seconds=6)
         return result
 
-    def redis_command(self, *parts):
-        with socket.create_connection(("127.0.0.1", self.redis_port), timeout=2) as conn:
-            data = [str(part).encode() if not isinstance(part, bytes) else part for part in parts]
-            conn.sendall(b"*%d\r\n" % len(data) + b"".join(b"$%d\r\n" % len(p) + p + b"\r\n" for p in data))
-            stream = conn.makefile("rb")
+    def redis_command(self, *parts, before_send=None):
+        with socket.create_connection(("127.0.0.1", self.redis_port), timeout=2) as conn, conn.makefile("rb") as stream:
             def read():
                 line = stream.readline(4096)
                 assert line.endswith(b"\r\n"), "Incomplete Redis response"
@@ -256,7 +253,14 @@ class CrossProcessHarness(Harness):
                     assert 0 <= size <= 128
                     return [read() for _ in range(size)]
                 raise AssertionError("Unexpected Redis response type")
-            return read()
+            def command(*args):
+                data = [str(part).encode() if not isinstance(part, bytes) else part for part in args]
+                conn.sendall(b"*%d\r\n" % len(data) + b"".join(b"$%d\r\n" % len(p) + p + b"\r\n" for p in data))
+                return read()
+
+            if before_send is not None:
+                before_send(command)
+            return command(*parts)
 
     def start_redis(self):
         self.redis_log = open(self.root / "redis.log", "ab")
