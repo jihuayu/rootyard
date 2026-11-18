@@ -136,8 +136,11 @@ async fn run_pg17_loopback_s3_e2e() -> Result<()> {
             let carol_url = srv.git_url_for(&carol, &alice.username, "engine");
             let cli = reqwest::Client::new();
 
-            // Unrelated `mallory` and read-only `carol` (on upload) receive `403 unauthorized_collaborator`!
-            for denied_actor in [&mallory, &carol] {
+            // Non-member `mallory` gets non-disclosing `404`; read-only `carol` gets `403 unauthorized_collaborator`.
+            for (denied_actor, expected_status, expected_code) in [
+                (&mallory, StatusCode::NOT_FOUND, "not_found"),
+                (&carol, StatusCode::FORBIDDEN, "unauthorized_collaborator"),
+            ] {
                 let denied_res = cli
                     .post(format!("{}/{}/engine.git/info/lfs/objects/batch", srv.base_url, alice.username))
                     .basic_auth(&denied_actor.username, Some(&denied_actor.token))
@@ -146,9 +149,9 @@ async fn run_pg17_loopback_s3_e2e() -> Result<()> {
                     .json(&json!({ "operation": "upload", "objects": [{ "oid": "b".repeat(64), "size": 16 }] }))
                     .send()
                     .await?;
-                ensure!(denied_res.status() == StatusCode::FORBIDDEN);
+                ensure!(denied_res.status() == expected_status);
                 let denied_json: Value = denied_res.json().await?;
-                ensure!(denied_json["code"] == "unauthorized_collaborator", "got {denied_json}");
+                ensure!(denied_json["code"] == expected_code, "got {denied_json}");
             }
 
             // 1. Official `git-lfs` track + push by owner `alice` with explicit `X-Rootyard-Operation-Id`.

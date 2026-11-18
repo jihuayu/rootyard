@@ -78,6 +78,22 @@ pub(super) fn lfs_blob_err_response(err: LfsBlobError) -> Response {
     )
 }
 
+pub(super) fn map_pre_auth_err(err: Error) -> Box<Response> {
+    match err.0 {
+        StatusCode::UNAUTHORIZED => {
+            Box::new(lfs_blob_err_response(LfsBlobError::new(LfsProofRejectCode::Unauthenticated, err.1)))
+        }
+        StatusCode::FORBIDDEN => {
+            Box::new(lfs_blob_err_response(LfsBlobError::new(LfsProofRejectCode::UnauthorizedCollaborator, err.1)))
+        }
+        StatusCode::NOT_FOUND => Box::new(lfs_blob_json(
+            StatusCode::NOT_FOUND,
+            json!({ "code": "not_found", "error": "not found", "message": "not found" }),
+        )),
+        _ => Box::new(err.into_response()),
+    }
+}
+
 pub(super) fn build_base_url(headers: &HeaderMap) -> String {
     let scheme = headers
         .get("x-forwarded-proto")

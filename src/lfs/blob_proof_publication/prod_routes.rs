@@ -31,6 +31,7 @@ use super::prod_auth_tx::ProdCommitAuthCheck;
 pub(crate) use super::prod_publication::{active_push_quarantine_dirs, enforce_blob_gate_if_requested, to_app_error};
 use super::prod_publication::{
     build_base_url, collect_forwarded_action_headers, ephemeral_scratch_root, lfs_blob_err_response, lfs_blob_json,
+    map_pre_auth_err,
 };
 pub use super::prod_publication::{
     PushAttestationSession, active_blob_gate, prod_validate_and_attest_hook, prod_validate_and_attest_push,
@@ -59,9 +60,9 @@ async fn auth_and_prepare_prod(
         return Err(Box::new(lfs_blob_err_response(e)));
     }
     let clean_headers = sanitize_headers(headers);
-    let actor = auth::authenticate(&state.pool, &clean_headers).await.map_err(|e| Box::new(e.into_response()))?;
+    let actor = auth::authenticate(&state.pool, &clean_headers).await.map_err(map_pre_auth_err)?;
     if write {
-        auth::writable(&actor).map_err(|e| Box::new(e.into_response()))?;
+        auth::writable(&actor).map_err(map_pre_auth_err)?;
     }
     let name = models::normalize_repo_name(repo_raw).map_err(|e| Box::new(e.into_response()))?;
     // STEP 1: authorization must pass before any realm or `pending` row mutation.
@@ -77,7 +78,7 @@ async fn auth_and_prepare_prod(
             if write { RepoAction::ContentsWrite } else { RepoAction::ContentsRead },
         )
         .await
-        .map_err(|e| Box::new(e.into_response()))?;
+        .map_err(map_pre_auth_err)?;
         let storage_generation: i64 = tx
             .query_one("SELECT storage_generation FROM repositories WHERE id = $1", &[&access.repo_id])
             .await
@@ -94,7 +95,7 @@ async fn auth_and_prepare_prod(
         )
         .await
         .map_err(|e| Box::new(lfs_blob_err_response(e)))?;
-        auth::finish_tx(tx, &actor, false).await.map_err(|e| Box::new(e.into_response()))?;
+        auth::finish_tx(tx, &actor, false).await.map_err(map_pre_auth_err)?;
         (access, storage_generation, auth_access)
     };
     // STEP 2: post-auth realm ensure and active-aware stale reconciliation.
