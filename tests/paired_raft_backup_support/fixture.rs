@@ -114,7 +114,7 @@ async fn handle_s3(State(st): State<Arc<S3State>>, method: Method, uri: Uri, bod
         }
         Method::HEAD | Method::GET => st.objects.lock().unwrap().get(&key).cloned().map_or_else(
             || empty(404, ""),
-            |d| ok(&d, if method == Method::HEAD { Body::empty() } else { Body::from(d) }),
+            |d| ok(&d, if method == Method::HEAD { Body::empty() } else { Body::from(d.clone()) }),
         ),
         _ => empty(405, ""),
     }

@@ -102,7 +102,7 @@ fn tri_party_freeze_requires_durable_wal_quorum_and_complete_pin_closure() {
         repository_id: repo,
         tenant_id: tenant,
         owner_id: tenant,
-        purpose: MetadataPinPurpose::ReadView,
+        purpose: MetadataPinPurpose::Verification,
         snapshot_id: Uuid::new_v4(),
         pin_id: Uuid::new_v4(),
         object_format: GitObjectFormat::Sha256,
