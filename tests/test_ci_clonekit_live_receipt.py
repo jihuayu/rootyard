@@ -276,6 +276,22 @@ class LiveReceiptTest(unittest.TestCase):
             self.assertTrue(blocked.is_dir())
             self.assertFalse(any(path.name.startswith(".live-receipt.") for path in root.iterdir()))
 
+    def test_live_primary_body_error_precedes_teardown_and_cleanup(self) -> None:
+        source = "".join(LIVE_MODULE.read_text(encoding="utf-8").split())
+        body_error = "ifletErr(err)=&body{"
+        body_record = "diag.observe_final(err);}"
+        teardown = "diag.mark(LivePhase::Teardown,file!(),line!());"
+        cleanup = "letcleanup:Result<()>=async{"
+        self.assertIn(body_error, source)
+        self.assertIn(body_record, source)
+        self.assertIn(teardown, source)
+        self.assertIn(cleanup, source)
+        self.assertLess(source.index(body_error), source.index(body_record))
+        self.assertLess(source.index(body_record), source.index(teardown))
+        self.assertLess(source.index(teardown), source.index(cleanup))
+        self.assertIn("matchcleanup{Ok(())=>body,Err(err)=>Err(err),}", source)
+        self.assertIn("Ok(())=>diag.complete()", source)
+
     def test_live_checkout_plan_keeps_canonical_dependency_object(self) -> None:
         source = "".join(LIVE_MODULE.read_text(encoding="utf-8").split())
         dependencies = '"dependencies":{"version":1,"history":"full","tags":[],"lfs":[],"submodules":[]}'

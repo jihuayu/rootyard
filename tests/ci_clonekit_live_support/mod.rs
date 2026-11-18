@@ -4,9 +4,12 @@
 //! unchanged fixture/proof body lives here so its finite phases can be marked without
 //! growing that source past its line contract. A failure or panic emits exactly one fixed
 //! marker with a closed phase/class and a source location, never an error body,
-//! environment value or command output.
+//! environment value or command output. Successful body plus cleanup writes one fixed
+//! completion marker to `ROOTYARD_LIVE_COMPLETION_FILE`; the collector requires exactly
+//! one marker line for a green live step.
 
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,8 +131,22 @@ impl LiveRecorder {
         self.record(self.phase, class, self.file, self.line);
     }
 
-    pub(crate) fn disarm(&mut self) {
+    /// Write exactly one successful exact-case completion after body and cleanup finish.
+    ///
+    /// The marker is a file so it survives libtest's capture of passing-test stderr.
+    /// The post-pipeline collector requires the file to contain exactly one fixed line.
+    pub(crate) fn complete(&mut self) {
+        if !self.armed || self.first.is_some() {
+            return;
+        }
         self.armed = false;
+        let path = std::env::var(LIVE_COMPLETION_ENV).unwrap_or_else(|_| LIVE_COMPLETION_DEFAULT.to_owned());
+        if let Some(parent) = Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(file, "{LIVE_COMPLETION_MARKER}");
+        }
     }
 }
 
@@ -176,19 +193,29 @@ pub(crate) async fn run() -> Result<()> {
             .runtime(deadpool_postgres::Runtime::Tokio1)
             .max_size(8)
             .build()?;
-        let res = run_body(&mut diag, &pool).await;
-        if res.is_ok() {
-            diag.mark(LivePhase::Teardown, file!(), line!());
+        let body = run_body(&mut diag, &pool).await;
+        if let Err(err) = &body {
+            // Keep the real body failure as primary before cleanup can replace the returned error.
+            diag.observe_final(err);
         }
+        diag.mark(LivePhase::Teardown, file!(), line!());
         pool.close();
         drop(pool);
-        admin.get().await?.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await?;
-        admin.close();
-        res
+        let cleanup: Result<()> = async {
+            admin.get().await?.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await?;
+            admin.close();
+            Ok(())
+        }
+        .await;
+        // Preserve the original return semantics: cleanup failure wins; otherwise return the body.
+        match cleanup {
+            Ok(()) => body,
+            Err(err) => Err(err),
+        }
     }
     .await;
     match &result {
-        Ok(()) => diag.disarm(),
+        Ok(()) => diag.complete(),
         Err(err) => diag.observe_final(err),
     }
     result
