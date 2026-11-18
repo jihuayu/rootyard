@@ -8,6 +8,7 @@ tokens, request payloads, logs or raw subprocess output.
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import os
@@ -369,19 +370,20 @@ class VaultFixture:
             raise FixtureError("vault_scoped_token_missing")
         token = entry["token"]
         metadata = self.key_metadata(key_name=key_name, token=token)
-        plaintext = __import__("base64").b64encode(os.urandom(32)).decode()
-        encrypted = self._app_api(key_name, "encrypt", {"plaintext": plaintext})
+        plaintext = base64.b64encode(os.urandom(32)).decode("ascii")
+        context = base64.b64encode(b"rootyard-vault-scoped-probe").decode("ascii")
+        encrypted = self._app_api(key_name, "encrypt", {"plaintext": plaintext, "context": context})
         ciphertext = (encrypted.get("data") or {}).get("ciphertext")
         if not isinstance(ciphertext, str) or not ciphertext:
             raise FixtureError("vault_app_encrypt_failed")
-        decrypted = self._app_api(key_name, "decrypt", {"ciphertext": ciphertext})
+        decrypted = self._app_api(key_name, "decrypt", {"ciphertext": ciphertext, "context": context})
         if (decrypted.get("data") or {}).get("plaintext") != plaintext:
             raise FixtureError("vault_app_decrypt_failed")
-        rewrapped = self._app_api(key_name, "rewrap", {"ciphertext": ciphertext})
+        rewrapped = self._app_api(key_name, "rewrap", {"ciphertext": ciphertext, "context": context})
         ciphertext2 = (rewrapped.get("data") or {}).get("ciphertext")
         if not isinstance(ciphertext2, str) or not ciphertext2:
             raise FixtureError("vault_app_rewrap_failed")
-        decrypted2 = self._app_api(key_name, "decrypt", {"ciphertext": ciphertext2})
+        decrypted2 = self._app_api(key_name, "decrypt", {"ciphertext": ciphertext2, "context": context})
         if (decrypted2.get("data") or {}).get("plaintext") != plaintext:
             raise FixtureError("vault_app_rewrap_roundtrip_failed")
         latest = metadata["latest_version"]

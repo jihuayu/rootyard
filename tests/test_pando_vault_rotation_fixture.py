@@ -8,6 +8,7 @@ setup, restricted application policy and exact cleanup boundaries.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -267,6 +268,62 @@ class PinAndPolicyTest(unittest.TestCase):
         config_call = next(call for call in calls if call[1].endswith("/config"))
         self.assertEqual(config_call[2], {"min_decryption_version": 1})
         self.assertTrue(all(call[3] == "root-token" for call in calls))
+
+    def test_scoped_derived_key_probe_keeps_one_context_and_checks_denials(self):
+        value = fixture("/tmp/unused", FakeRunner([]))
+        token = "app-token"
+        key = value.key_name
+        value.tokens[key] = {"token": token}
+        key_path = "/v1/transit/keys/" + key
+        metadata = {"data": {
+            "type": "aes256-gcm96", "derived": True, "latest_version": 1,
+            "min_decryption_version": 1, "min_encryption_version": 0,
+        }}
+        plain = b"p" * 32
+        plaintext = base64.b64encode(plain).decode("ascii")
+        context = base64.b64encode(b"rootyard-vault-scoped-probe").decode("ascii")
+        encrypted = "vault:v1:fixture-encrypted"
+        rewrapped = "vault:v1:fixture-rewrapped"
+        value.api = mock.Mock(side_effect=[
+            metadata,
+            {"data": {"ciphertext": encrypted}},
+            {"data": {"plaintext": plaintext}},
+            {"data": {"ciphertext": rewrapped}},
+            {"data": {"plaintext": plaintext}},
+            metadata,
+        ])
+        value.request_status = mock.Mock(return_value=403)
+
+        with mock.patch.object(vault.os, "urandom", return_value=plain):
+            result = value.verify_app_capabilities()
+
+        self.assertEqual(value.api.call_args_list, [
+            mock.call("GET", key_path, token=token),
+            mock.call("POST", "/v1/transit/encrypt/" + key,
+                      {"plaintext": plaintext, "context": context}, token=token),
+            mock.call("POST", "/v1/transit/decrypt/" + key,
+                      {"ciphertext": encrypted, "context": context}, token=token),
+            mock.call("POST", "/v1/transit/rewrap/" + key,
+                      {"ciphertext": encrypted, "context": context}, token=token),
+            mock.call("POST", "/v1/transit/decrypt/" + key,
+                      {"ciphertext": rewrapped, "context": context}, token=token),
+            mock.call("GET", key_path, token=token),
+        ])
+        self.assertEqual(value.request_status.call_args_list, [
+            mock.call("POST", key_path + "/rotate", token=token),
+            mock.call("DELETE", key_path, None, token=token),
+            mock.call("POST", key_path + "/config",
+                      {"min_decryption_version": 2}, token=token),
+            mock.call("POST", "/v1/auth/token/create",
+                      {"policies": ["default"], "ttl": "1m"}, token=token),
+            mock.call("GET", "/v1/sys/policies/acl/" + value.policy_name, None, token=token),
+        ])
+        self.assertEqual(result, {
+            "metadata": metadata["data"],
+            "rotate_denied": True, "latest_unchanged": True, "encrypt_decrypt_rewrap": True,
+            "delete_denied": True, "config_denied": True,
+            "token_admin_denied": True, "policy_admin_denied": True,
+        })
 
     def test_scoped_environment_is_pando_only_and_safe_record_has_no_token(self):
         value = fixture("/tmp/unused", FakeRunner([]))
