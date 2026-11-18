@@ -153,7 +153,7 @@ class SlotZeroSourceTest(unittest.TestCase):
         self.assertLess(pending.index('PgRefStore.begin('), pending.index('ensure_repository(tx, plan, false)'))
         self.assertLess(pending.index('ensure_repository(tx, plan, false)'), pending.index('sql::gate_locked('))
 
-    def test_ignored_regressions_observe_both_blockers_and_release(self):
+    def test_ignored_regressions_require_successful_probe_results_and_cleanup(self):
         restore = self.tests.split('async fn slot_zero_restore_rotation_waits_for_admission_commit()', 1)[1].split(
             'async fn slot_zero_waits_for_legacy_lane', 1
         )[0]
@@ -163,20 +163,50 @@ class SlotZeroSourceTest(unittest.TestCase):
         for body in (restore, lane):
             self.assertIn('pg_blocking_pids', body)
             self.assertIn("wait_event_type='Lock'", body)
-            self.assertIn('timeout(Duration::from_secs(10)', body)
+            self.assertIn('timeout(WAIT, pid_rx)', body)
+            self.assertIn('timeout(WAIT, async {', body)
+            self.assertIn('.context(', body)
+            self.assertIn('??;', body)
             self.assertIn('if waiting', body)
-            self.assertIn('.abort()', body)
-            self.assertIn('.rollback()', body)
+            self.assertIn('break Ok::<(), anyhow::Error>(())', body)
+            self.assertNotIn('is_finished', body)
+            self.assertNotIn('elapsed', body.lower())
+            self.assertIn('let outcome: anyhow::Result<()> = async {', body)
+            self.assertIn('if let Err(mut error) = outcome', body)
+            self.assertIn('append_cleanup(', body)
+            self.assertIn('rollback_bounded(owned)', body)
+            self.assertNotIn('observed', body)
         self.assertIn('UPDATE public.cluster_authority', restore)
         self.assertIn('assert_eq!(receipt.sequence, 1)', restore)
-        self.assertIn('assert_ne!(incarnation, fixture.restore)', restore)
-        self.assertLess(restore.rindex('tx.commit().await?'), restore.index('&mut restore'))
+        self.assertIn('restore wait probe did not finish")??', restore)
+        self.assertIn('restore worker never reported its backend pid")??', restore)
+        self.assertIn('restore worker did not finish")?', restore)
+        self.assertIn('restore result did not arrive")??', restore)
+        self.assertIn('admission commit did not finish")??', restore)
+        self.assertIn('restore_joined = true', restore)
+        self.assertIn('if !restore_joined', restore)
+        self.assertIn('abort_worker(&mut restore)', restore)
+        self.assertIn('changed != 1', restore)
+        self.assertIn('incarnation == fixture.restore', restore)
+        self.assertLess(restore.index('owned.commit()'), restore.index('&mut restore'))
+
         self.assertIn('PgRefStore.begin', lane)
         self.assertIn('ref_store_issuer_lanes', lane)
         self.assertIn('pg_locks', lane)
         self.assertIn("l.mode <> 'AccessShareLock'", lane)
-        self.assertIn('assert_eq!(receipt.sequence, 2)', lane)
-        self.assertLess(lane.index('legacy_tx.commit().await'), lane.index('&mut admission'))
+        self.assertIn('slot-zero lane wait probe did not finish")??', lane)
+        self.assertIn('slot-zero worker never reported its backend pid")??', lane)
+        self.assertIn('slot-zero admission did not finish")?', lane)
+        self.assertIn('slot-zero admission result did not arrive")??', lane)
+        self.assertIn('legacy lane commit did not finish")??', lane)
+        self.assertIn('slot-zero took repository/gate locks before waiting for the legacy lane', lane)
+        self.assertIn('admission_joined = true', lane)
+        self.assertIn('if !admission_joined', lane)
+        self.assertIn('abort_worker(&mut admission)', lane)
+        self.assertIn('legacy transaction missing before commit', lane)
+        self.assertIn('receipt.sequence != 2', lane)
+        self.assertLess(lane.index('owned.commit()'), lane.index('&mut admission'))
+
         atomic = self.tests.split('async fn slot_zero_typed_plan_error_rolls_back_only_the_savepoint()', 1)[1].split(
             '#[tokio::test]', 1
         )[0]

@@ -16,6 +16,7 @@ use crate::{
         },
     },
 };
+use anyhow::Context;
 use deadpool_postgres::{Manager, Pool, Runtime};
 use std::{future::Future, time::Duration};
 use tokio::{
@@ -27,6 +28,33 @@ use uuid::Uuid;
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(15)
+}
+
+const WAIT: Duration = Duration::from_secs(10);
+
+fn append_cleanup(mut error: anyhow::Error, label: &str, cleanup: anyhow::Result<()>) -> anyhow::Error {
+    if let Err(cleanup_error) = cleanup {
+        error = anyhow::anyhow!("{error:#}; {label} also failed: {cleanup_error:#}");
+    }
+    error
+}
+
+async fn rollback_bounded(tx: Transaction<'_>) -> anyhow::Result<()> {
+    match timeout(WAIT, tx.rollback()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err(anyhow::anyhow!("transaction rollback did not finish within {WAIT:?}")),
+    }
+}
+
+async fn abort_worker(worker: &mut tokio::task::JoinHandle<anyhow::Result<()>>) -> anyhow::Result<()> {
+    worker.abort();
+    match timeout(WAIT, &mut *worker).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) if error.is_cancelled() => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err(anyhow::anyhow!("aborted worker did not join within {WAIT:?}")),
+    }
 }
 
 #[derive(Clone)]
@@ -604,12 +632,22 @@ async fn slot_zero_restore_rotation_waits_for_admission_commit() -> anyhow::Resu
     with_fixture(|fixture| async move {
         let request = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
         let mut admission = fixture.pool.get().await?;
-        let mut tx = admission.transaction().await?;
+        let mut tx = Some(admission.transaction().await?);
         let receipt = PgRefStore
-            .admit_slot_zero_in_tx(&mut tx, &request, |preview| plan_for(&fixture, &request, preview), deadline())
+            .admit_slot_zero_in_tx(
+                tx.as_mut().expect("admission transaction must exist"),
+                &request,
+                |preview| plan_for(&fixture, &request, preview),
+                deadline(),
+            )
             .await?;
         assert_eq!(receipt.sequence, 1);
-        let admission_pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+        let admission_pid: i32 = tx
+            .as_ref()
+            .expect("admission transaction must exist")
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
 
         let restore_pool = fixture.pool.clone();
         let (pid_tx, pid_rx) = oneshot::channel();
@@ -630,52 +668,75 @@ async fn slot_zero_restore_rotation_waits_for_admission_commit() -> anyhow::Resu
             tx.commit().await?;
             Ok::<(), anyhow::Error>(())
         });
-        let restore_pid = pid_rx.await?;
-        let observer = fixture.pool.get().await?;
-        let observed = timeout(Duration::from_secs(10), async {
-            loop {
-                let waiting: bool = observer
-                    .query_one(
-                        "SELECT EXISTS(
-                             SELECT 1 FROM pg_stat_activity a
-                             WHERE a.pid=$1 AND a.state='active' AND a.wait_event_type='Lock'
-                               AND a.query LIKE 'UPDATE public.cluster_authority%'
-                               AND $2 = ANY(pg_blocking_pids($1)))",
-                        &[&restore_pid, &admission_pid],
-                    )
-                    .await?
-                    .get(0);
-                if waiting {
-                    break Ok::<(), anyhow::Error>(());
+
+        let mut restore_joined = false;
+        let outcome: anyhow::Result<()> = async {
+            let restore_pid =
+                timeout(WAIT, pid_rx).await.context("restore worker never reported its backend pid")??;
+            let observer = timeout(WAIT, fixture.pool.get()).await.context("observer pool checkout timed out")??;
+            timeout(WAIT, async {
+                loop {
+                    let waiting: bool = observer
+                        .query_one(
+                            "SELECT EXISTS(
+                                 SELECT 1 FROM pg_stat_activity a
+                                 WHERE a.pid=$1 AND a.state='active' AND a.wait_event_type='Lock'
+                                   AND a.query LIKE 'UPDATE public.cluster_authority%'
+                                   AND $2 = ANY(pg_blocking_pids($1)))",
+                            &[&restore_pid, &admission_pid],
+                        )
+                        .await?
+                        .get(0);
+                    if waiting {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    sleep(Duration::from_millis(10)).await;
                 }
-                sleep(Duration::from_millis(10)).await;
+            })
+            .await
+            .context("restore wait probe did not finish")??;
+
+            let owned = tx.take().ok_or_else(|| anyhow::anyhow!("admission transaction missing before commit"))?;
+            timeout(WAIT, owned.commit()).await.context("admission commit did not finish")??;
+
+            let joined = timeout(WAIT, &mut restore).await.context("restore worker did not finish")?;
+            restore_joined = true;
+            joined.context("restore worker panicked")??;
+
+            let changed = timeout(WAIT, done_rx).await.context("restore result did not arrive")??;
+            if changed != 1 {
+                return Err(anyhow::anyhow!("restore UPDATE changed {changed} rows, expected 1"));
             }
-        })
+            Ok(())
+        }
         .await;
-        if let Err(error) = observed {
-            restore.abort();
-            let _ = tx.rollback().await;
-            return Err(anyhow::anyhow!("restore rotation never waited on the slot-zero admission: {error}"));
-        }
-        if let Err(error) = tx.commit().await {
-            restore.abort();
-            return Err(error.into());
-        }
-        let joined = match timeout(Duration::from_secs(10), &mut restore).await {
-            Ok(joined) => joined,
-            Err(_) => {
-                restore.abort();
-                return Err(anyhow::anyhow!("restore rotation did not finish after the admission commit"));
+
+        if let Err(mut error) = outcome {
+            if !restore_joined {
+                error = append_cleanup(error, "restore worker abort/join", abort_worker(&mut restore).await);
             }
-        };
-        joined??;
-        let changed = done_rx.await?;
-        assert_eq!(changed, 1);
-        let incarnation: Uuid = admission
-            .query_one("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[])
-            .await?
-            .get(0);
-        assert_ne!(incarnation, fixture.restore);
+            if let Some(owned) = tx.take() {
+                error = append_cleanup(error, "admission rollback", rollback_bounded(owned).await);
+            }
+            return Err(error);
+        }
+        if let Some(owned) = tx.take() {
+            let error = anyhow::anyhow!("admission transaction remained uncommitted after a successful outcome");
+            let cleanup = rollback_bounded(owned).await;
+            return Err(append_cleanup(error, "admission rollback", cleanup));
+        }
+        drop(tx);
+
+        let incarnation: Uuid = timeout(
+            WAIT,
+            admission.query_one("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[]),
+        )
+        .await
+        .context("rotated incarnation query did not finish")??
+        .get(0);
+        if incarnation == fixture.restore {
+            return Err(anyhow::anyhow!("restore rotation did not change the cluster authority incarnation"));
+        }
         Ok(())
     })
     .await
@@ -705,9 +766,12 @@ async fn slot_zero_waits_for_legacy_lane_before_scope_and_gate() -> anyhow::Resu
         )
         .map_err(PackCommitError::from)?;
         let mut legacy_client = fixture.pool.get().await?;
-        let legacy_tx = legacy_client.transaction().await?;
-        let _legacy = PgRefStore.begin(&legacy_tx, &legacy_identity, deadline()).await?;
-        let legacy_pid: i32 = legacy_tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+        let mut legacy_tx = Some(legacy_client.transaction().await?);
+        let legacy_pid: i32 = {
+            let legacy_tx_ref = legacy_tx.as_ref().expect("legacy transaction must exist");
+            let _legacy = PgRefStore.begin(legacy_tx_ref, &legacy_identity, deadline()).await?;
+            legacy_tx_ref.query_one("SELECT pg_backend_pid()", &[]).await?.get(0)
+        };
 
         let request = slot_zero_request(&fixture, Uuid::new_v4(), Uuid::new_v4());
         let admission_fixture = fixture.clone();
@@ -730,56 +794,72 @@ async fn slot_zero_waits_for_legacy_lane_before_scope_and_gate() -> anyhow::Resu
             let _ = done_tx.send(receipt);
             Ok::<(), anyhow::Error>(())
         });
-        let admission_pid = pid_rx.await?;
-        let observer = fixture.pool.get().await?;
-        let observed = timeout(Duration::from_secs(10), async {
-            loop {
-                let row = observer
-                    .query_one(
-                        "SELECT
-                           EXISTS(SELECT 1 FROM pg_stat_activity a
-                             WHERE a.pid=$1 AND a.state='active' AND a.wait_event_type='Lock'
-                               AND a.query LIKE 'SELECT last_reserved_sequence + 1 FROM ref_store_issuer_lanes%'
-                               AND $2 = ANY(pg_blocking_pids($1))),
-                           EXISTS(SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
-                             WHERE l.pid=$1 AND l.granted AND l.mode <> 'AccessShareLock'
-                               AND c.relname IN ('repositories','ref_store_core_gates'))",
-                        &[&admission_pid, &legacy_pid],
-                    )
-                    .await?;
-                let waiting: bool = row.get(0);
-                let scope_locked: bool = row.get(1);
-                if waiting {
-                    if scope_locked {
-                        return Err(anyhow::anyhow!(
-                            "slot-zero took repository/gate locks before waiting for the legacy lane"
-                        ));
+
+        let mut admission_joined = false;
+        let outcome: anyhow::Result<()> = async {
+            let admission_pid =
+                timeout(WAIT, pid_rx).await.context("slot-zero worker never reported its backend pid")??;
+            let observer = timeout(WAIT, fixture.pool.get()).await.context("observer pool checkout timed out")??;
+            timeout(WAIT, async {
+                loop {
+                    let row = observer
+                        .query_one(
+                            "SELECT
+                               EXISTS(SELECT 1 FROM pg_stat_activity a
+                                 WHERE a.pid=$1 AND a.state='active' AND a.wait_event_type='Lock'
+                                   AND a.query LIKE 'SELECT last_reserved_sequence + 1 FROM ref_store_issuer_lanes%'
+                                   AND $2 = ANY(pg_blocking_pids($1))),
+                               EXISTS(SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid=l.relation
+                                 WHERE l.pid=$1 AND l.granted AND l.mode <> 'AccessShareLock'
+                                   AND c.relname IN ('repositories','ref_store_core_gates'))",
+                            &[&admission_pid, &legacy_pid],
+                        )
+                        .await?;
+                    let waiting: bool = row.get(0);
+                    let scope_locked: bool = row.get(1);
+                    if waiting {
+                        if scope_locked {
+                            return Err(anyhow::anyhow!(
+                                "slot-zero took repository/gate locks before waiting for the legacy lane"
+                            ));
+                        }
+                        break Ok::<(), anyhow::Error>(());
                     }
-                    break Ok::<(), anyhow::Error>(());
+                    sleep(Duration::from_millis(10)).await;
                 }
-                sleep(Duration::from_millis(10)).await;
+            })
+            .await
+            .context("slot-zero lane wait probe did not finish")??;
+
+            let owned = legacy_tx.take().ok_or_else(|| anyhow::anyhow!("legacy transaction missing before commit"))?;
+            timeout(WAIT, owned.commit()).await.context("legacy lane commit did not finish")??;
+
+            let joined = timeout(WAIT, &mut admission).await.context("slot-zero admission did not finish")?;
+            admission_joined = true;
+            joined.context("slot-zero admission task panicked")??;
+
+            let receipt = timeout(WAIT, done_rx).await.context("slot-zero admission result did not arrive")??;
+            if receipt.sequence != 2 {
+                return Err(anyhow::anyhow!("slot-zero admission reserved {}, expected 2", receipt.sequence));
             }
-        })
+            Ok(())
+        }
         .await;
-        if let Err(error) = observed {
-            admission.abort();
-            let _ = legacy_tx.rollback().await;
-            return Err(anyhow::anyhow!("slot-zero never waited on the legacy lane before repository/gate: {error}"));
-        }
-        if let Err(error) = legacy_tx.commit().await {
-            admission.abort();
-            return Err(error.into());
-        }
-        let joined = match timeout(Duration::from_secs(10), &mut admission).await {
-            Ok(joined) => joined,
-            Err(_) => {
-                admission.abort();
-                return Err(anyhow::anyhow!("slot-zero admission did not finish after the legacy lane commit"));
+
+        if let Err(mut error) = outcome {
+            if !admission_joined {
+                error = append_cleanup(error, "slot-zero admission abort/join", abort_worker(&mut admission).await);
             }
-        };
-        joined??;
-        let receipt = done_rx.await?;
-        assert_eq!(receipt.sequence, 2);
+            if let Some(owned) = legacy_tx.take() {
+                error = append_cleanup(error, "legacy rollback", rollback_bounded(owned).await);
+            }
+            return Err(error);
+        }
+        if let Some(owned) = legacy_tx.take() {
+            let error = anyhow::anyhow!("legacy transaction remained uncommitted after a successful outcome");
+            let cleanup = rollback_bounded(owned).await;
+            return Err(append_cleanup(error, "legacy rollback", cleanup));
+        }
         Ok(())
     })
     .await
