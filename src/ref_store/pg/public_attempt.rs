@@ -82,6 +82,11 @@ const SCHEMA_PROBE: &str = "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE 
         to_regprocedure('rootyard_ref_store_attempt_has_binding(\
             ref_store_public_operations,ref_store_private_attempts)') IS NOT NULL";
 
+/// The exact schema refusal that a GET adapter may consider for a *proven*
+/// pre-migration-152 catalog. Any other `Unsupported` value stays a typed
+/// refusal and is never treated as a legacy fallback.
+pub(crate) const PUBLIC_ATTEMPT_SCHEMA_REQUIRED: &str = "public attempt lookup requires migration 152";
+
 /// One statement snapshot. The wrapper and attempt subqueries deliberately use
 /// plain reads; the migration-152 binding predicate is a SQL `STABLE` function
 /// so this adapter reuses the reviewed durable check instead of inventing a
@@ -577,7 +582,7 @@ async fn read_public_snapshot_sql(
     let schema = tx.query_one(SCHEMA_PROBE, &[]).await.map_err(lookup_db_error).map_err(PackCommitError::from)?;
     if !schema.get::<_, bool>(0) || !schema.get::<_, bool>(1) || !schema.get::<_, bool>(2) || !schema.get::<_, bool>(3)
     {
-        return Err(PackCommitError::from(RefStoreError::Unsupported("public attempt lookup requires migration 152")));
+        return Err(PackCommitError::from(RefStoreError::Unsupported(PUBLIC_ATTEMPT_SCHEMA_REQUIRED)));
     }
 
     // PostgreSQL applies statement_timeout per statement. The schema probe
@@ -594,6 +599,29 @@ async fn read_public_snapshot_sql(
     let snapshot: Value = row.get(0);
     serde_json::from_value::<RawSnapshot>(snapshot)
         .map_err(|_| ledger("public attempt lookup snapshot shape is not recognized"))
+}
+
+/// Prove that migration 152's whole public-attempt catalog is absent. This is
+/// the only evidence a GET adapter may use to preserve pre-152 legacy wire
+/// semantics; a partial or broken catalog is not a fallback.
+pub(crate) async fn public_attempt_catalog_absent(
+    tx: &Transaction<'_>,
+    deadline: Instant,
+) -> Result<bool, RefStoreError> {
+    bound(tx, deadline).await?;
+    let absent = tx
+        .query_one(
+            "SELECT NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version=152)
+                    AND to_regclass('ref_store_public_operations') IS NULL
+                    AND to_regclass('ref_store_private_attempts') IS NULL
+                    AND to_regprocedure('rootyard_ref_store_attempt_has_binding(
+                        ref_store_public_operations,ref_store_private_attempts)') IS NULL",
+            &[],
+        )
+        .await
+        .map_err(lookup_db_error)?
+        .get(0);
+    Ok(absent)
 }
 
 fn validate_request(request: &PublicAttemptRequest) -> Result<(), PackCommitError> {

@@ -16,6 +16,7 @@ API = ROOT / 'src/blob_git_gateway/api.rs'
 OPERATION = ROOT / 'src/blob_git_gateway/operation.rs'
 CANCEL = ROOT / 'src/ref_store/core/pack_commit/authorized/cancel.rs'
 PUBLISH = ROOT / 'src/blob_git_gateway/publish.rs'
+ADAPTER = ROOT / 'src/blob_git_gateway/operation_read.rs'
 
 
 def slice_between(source, start, end):
@@ -30,6 +31,7 @@ class LegacyCollisionSourceTest(unittest.TestCase):
         cls.operation = OPERATION.read_text()
         cls.cancel = CANCEL.read_text()
         cls.publish = PUBLISH.read_text()
+        cls.adapter = ADAPTER.read_text()
 
     def test_reserve_begin_and_cancel_refuse_after_the_operation_lock(self):
         for name in ('reserve_sequence_inner', 'begin_inner', 'cancel_inner'):
@@ -61,10 +63,11 @@ class LegacyCollisionSourceTest(unittest.TestCase):
         self.assertLess(guarded.index('refuse_legacy_collision'), guarded.index('self.get_inner('))
 
     def test_http_get_and_receive_probe_take_the_operation_key_first(self):
-        api = slice_between(self.api, 'let loaded: Result<(OperationLookup, Option<Role>)', 'let _ = tokio::time::timeout_at')
+        api = slice_between(self.api, 'let loaded: Result<OperationRead', 'let _ = tokio::time::timeout_at')
         self.assertLess(api.index('lock_operation('), api.index('lookup_in_tx('))
-        self.assertLess(api.index('lock_operation('), api.index('get_legacy_locked('))
+        self.assertLess(api.index('lock_operation('), api.index('operation_read::resolve('))
         self.assertNotIn('PgRefStore.get(&tx', api)
+        self.assertIn('get_legacy_locked(', self.adapter)
 
         lookup = slice_between(self.operation, 'pub(super) async fn lookup(', 'pub(super) async fn lookup_in_tx(')
         self.assertLess(lookup.index('lock_operation('), lookup.index('lookup_in_tx('))
