@@ -286,9 +286,6 @@ pub async fn resolve(
 /// Idempotent post-commit cleanup. Changed evidence creates a new incident;
 /// resolution never authorizes discarding a different or later journal.
 pub async fn retire_resolved_journals(pool: &Pool, storage: &Storage, repo: Uuid) -> Result<()> {
-    let guard_client = pool.get().await?;
-    enforce_maintenance_pg_write_guard(&**guard_client, true).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    drop(guard_client);
     for op in journal::pending(&storage.root, repo)? {
         let _ = retire_if_resolved(pool, storage, &op).await?;
     }
@@ -296,11 +293,13 @@ pub async fn retire_resolved_journals(pool: &Pool, storage: &Storage, repo: Uuid
 }
 pub async fn retire_if_resolved(pool: &Pool, storage: &Storage, op: &journal::Operation) -> Result<bool> {
     let client = pool.get().await?;
-    enforce_maintenance_pg_write_guard(&**client, true).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let row=client.query_opt("SELECT r.journal_digest,r.operation_digest,to_jsonb(o),resolution.volume_id FROM operation_resolutions r JOIN git_operations o ON o.id=r.operation_id JOIN recovery_resolutions resolution ON resolution.id=r.resolution_id WHERE r.operation_id=$1 AND r.repository_id=$2",&[&op.id,&op.repository_id]).await?;
     let Some(row) = row else {
         return Ok(false);
     };
+    // Retiring a journal entry is a write: only fence once a resolution actually matches so
+    // empty/no-op scans stay side-effect free while a freeze still blocks real deletion.
+    enforce_maintenance_pg_write_guard(&**client, true).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     ensure!(row.get::<_, Uuid>(3) == storage.volume_id, "resolution belongs to another storage volume");
     let expected: Option<String> = row.get(0);
     ensure!(

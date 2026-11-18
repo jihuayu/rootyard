@@ -1,7 +1,7 @@
 //! Issue #153 merge gates: PG pooled-session reset + verified writer exit, server-side Ed25519
 //! peer attestations, pristine target incarnation, and production freeze/epoch guards.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -9,10 +9,11 @@ use uuid::Uuid;
 
 use rootyard::db;
 use rootyard::maintenance::paired_raft_backup::{
-    DecisionExecutionTicket, DeleterLeaseTicket, DurableRaftBackend, IncarnationAdmissionGuard,
-    NewIncarnationAuthority, PairedBackupError, PairedProductionRuntimeGuard, WalSyncedRaftBackend,
-    WorkerProjectionTicket, WriterGrantTicket, compute_group_membership_digest, read_pg_database_read_only,
-    terminate_and_await_other_pg_sessions, verify_cutpoint_attestations, verify_no_active_pg_writers,
+    DecisionExecutionTicket, DeleterLeaseTicket, DurableFreezeRequest, DurableRaftBackend, IncarnationAdmissionGuard,
+    NewIncarnationAuthority, PairedBackupError, PairedProductionRuntimeGuard, RepoBackupRegistrationSpec,
+    WalSyncedRaftBackend, WorkerProjectionTicket, WriterGrantTicket, compute_group_membership_digest,
+    enter_durable_pg_raft_freeze, read_pg_database_read_only, terminate_and_await_other_pg_sessions,
+    verify_cutpoint_attestations, verify_no_active_pg_writers,
 };
 use rootyard::ref_store::core::state_machine::{
     CloseAuthScopeCommand, InitializeGateCommand, RefCasCommand, RepositoryLane, ScopeLifecycle, SmPackMode,
@@ -70,27 +71,28 @@ async fn gate1_pooled_pg_session_read_only_reset_and_verified_writer_exit() -> R
         let url = super::format30_helpers::replace_db_in_url(&base_url, &gate1_db)?;
         let pool = db::pool(&url)?;
         let survivor = pool.get().await?;
+        let survivor_pg: &tokio_postgres::Client = &survivor;
         // The exact statements `enter_durable_pg_raft_freeze` uses around the freeze transaction.
-        survivor.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await?;
-        let read_write: String = survivor.query_one("SHOW transaction_read_only", &[]).await?.get(0);
+        survivor_pg.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await?;
+        let read_write: String = survivor_pg.query_one("SHOW transaction_read_only", &[]).await?.get(0);
         ensure!(read_write == "off", "READ WRITE session must report transaction_read_only=off");
-        survivor.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").await?;
-        let read_only: String = survivor.query_one("SHOW transaction_read_only", &[]).await?.get(0);
+        survivor_pg.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").await?;
+        let read_only: String = survivor_pg.query_one("SHOW transaction_read_only", &[]).await?.get(0);
         ensure!(read_only == "on", "pooled session must be reset to READ ONLY on both Ok and Err paths");
 
         // A genuinely concurrent writer must be terminated AND observed to be gone.
         let doomed = pool.get().await?;
         doomed.batch_execute("BEGIN; SELECT 1").await?;
         let terminated =
-            terminate_and_await_other_pg_sessions(&**survivor, Duration::from_secs(5)).await.map_err(pg)?;
+            terminate_and_await_other_pg_sessions(survivor_pg, Duration::from_secs(5)).await.map_err(pg)?;
         ensure!(terminated >= 1, "at least the concurrent in-transaction session must be terminated");
-        verify_no_active_pg_writers(&**survivor).await.map_err(pg)?;
+        verify_no_active_pg_writers(survivor_pg).await.map_err(pg)?;
         ensure!(doomed.batch_execute("SELECT 1").await.is_err(), "terminated backend must no longer serve queries");
         drop(doomed);
 
         // The database-wide fence itself is untouched by a session-level reset.
         ensure!(
-            !read_pg_database_read_only(&**survivor).await.map_err(pg)?,
+            !read_pg_database_read_only(survivor_pg).await.map_err(pg)?,
             "no database-wide READ ONLY fence expected"
         );
 
@@ -99,14 +101,66 @@ async fn gate1_pooled_pg_session_read_only_reset_and_verified_writer_exit() -> R
         holder.batch_execute("BEGIN; SELECT txid_current()").await?;
         let mut ucfg: tokio_postgres::Config = url.parse()?;
         ucfg.user(&unpriv).password("gate1-unpriv-pw").dbname(&gate1_db);
-        let unpriv_client = db::connect_config(ucfg).await?;
+        let mut unpriv_client = db::connect_config(ucfg).await?;
         let refused = terminate_and_await_other_pg_sessions(&unpriv_client, Duration::from_millis(400)).await;
         ensure!(
             matches!(refused, Err(PairedBackupError::FreezeNotHeld(_))),
             "non-superuser termination against a superuser writer must fail closed"
         );
-        drop(unpriv_client);
         drop(holder);
+
+        // Early `Err` before `set_pg_database_read_only(true)`: `ALTER DATABASE` is refused for a
+        // non-owner role, and the still-unfrozen session must keep its original characteristic.
+        let grp = LiveMtlsRaftGroup::start_three(19)?;
+        let mut raft = grp.connect_backend(1)?;
+        let repos = [RepoBackupRegistrationSpec {
+            repository_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            owner_id: Uuid::new_v4(),
+            object_format: GitObjectFormat::Sha256,
+            history_incarnation: Uuid::new_v4(),
+            authority_epoch: 2,
+            group_epoch: 3,
+            authority_id: Uuid::new_v4(),
+            authority_generation: 1,
+            backend_identity: "gate1-unpriv-freeze".to_owned(),
+            expected_packs: Vec::new(),
+        }];
+        let freeze_req = DurableFreezeRequest {
+            fenced_deleter_epoch: 5,
+            app_fence_seq: 6,
+            scope_authz_floor: 7,
+            repos: &repos,
+            peer_repos_by_group: BTreeMap::new(),
+        };
+        let early =
+            enter_durable_pg_raft_freeze(&mut unpriv_client, &mut raft, &mut BTreeMap::new(), &freeze_req).await;
+        ensure!(early.is_err(), "ALTER DATABASE from a non-owner role must fail the freeze");
+        ensure!(
+            !read_pg_database_read_only(&unpriv_client).await.map_err(pg)?,
+            "an early freeze failure must not latch the database-wide READ ONLY fence"
+        );
+        let still_rw: String = unpriv_client.query_one("SHOW transaction_read_only", &[]).await?.get(0);
+        ensure!(still_rw == "off", "an early freeze error must leave the unfrozen session READ WRITE");
+
+        // Late `Err` after `set_pg_database_read_only(true)`: `gate1_db` has no repository /
+        // `ref_store_decision_scopes` schema, so the freeze fails only once the fence is latched
+        // and the pooled session must come back READ ONLY.
+        drop(unpriv_client);
+        drop(survivor);
+        let mut pooled = pool.get().await?;
+        let late = enter_durable_pg_raft_freeze(&mut pooled, &mut raft, &mut BTreeMap::new(), &freeze_req).await;
+        ensure!(late.is_err(), "a freeze that fails after the READ ONLY fence must return an error");
+        let pooled_pg: &tokio_postgres::Client = &pooled;
+        ensure!(
+            read_pg_database_read_only(pooled_pg).await.map_err(pg)?,
+            "a late freeze error must leave the database-wide READ ONLY fence latched"
+        );
+        drop(pooled);
+        let recycled = pool.get().await?;
+        let recycled_ro: String = recycled.query_one("SHOW transaction_read_only", &[]).await?.get(0);
+        ensure!(recycled_ro == "on", "a failed freeze must return its pooled session READ ONLY");
+        drop(recycled);
         drop(pool);
         Ok(())
     }

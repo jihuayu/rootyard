@@ -82,6 +82,10 @@ pub async fn enter_durable_pg_raft_freeze(
         ));
     }
     let barrier_id = Uuid::new_v4();
+    // A pooled `RecyclingMethod::Fast` session may already carry a latched `READ ONLY`
+    // characteristic from an earlier freeze attempt; remember it so a failure *before*
+    // `set_pg_database_read_only(true)` does not poison this unfrozen connection.
+    let prior_ro: String = pg_client.query_one("SHOW default_transaction_read_only", &[]).await.map_err(pg_err)?.get(0);
     pg_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await.map_err(pg_err)?;
 
     let outcome: Result<DurableFreezeHandle, PairedBackupError> = async {
@@ -239,12 +243,20 @@ pub async fn enter_durable_pg_raft_freeze(
     }
     .await;
 
-    // Always hand the pooled session back as `READ ONLY`, on both `Ok` and `Err`, so
-    // `deadpool_postgres::RecyclingMethod::Fast` can never leak a `READ WRITE` connection
-    // into another request (`POST /api/repos` -> `BlobGitState`).
-    let lock_ro = pg_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").await.map_err(pg_err);
+    // Hand the pooled session back as `READ ONLY` whenever `deadpool_postgres::RecyclingMethod::Fast`
+    // could otherwise leak a `READ WRITE` connection into another request (`POST /api/repos` ->
+    // `BlobGitState`). A failure *before* the database-wide fence only restores the characteristic
+    // the session already had, so an unfrozen connection is never poisoned.
+    let must_stay_ro =
+        outcome.is_ok() || prior_ro == "on" || read_pg_database_read_only(pg_client).await.unwrap_or(true);
+    let restore_sql = if must_stay_ro {
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
+    } else {
+        "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE"
+    };
+    let restore_char = pg_client.batch_execute(restore_sql).await.map_err(pg_err);
     let handle = outcome?;
-    lock_ro?;
+    restore_char?;
     Ok(handle)
 }
 
