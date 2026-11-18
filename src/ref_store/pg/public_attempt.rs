@@ -492,7 +492,10 @@ fn evaluate(snapshot: RawSnapshot, request: &PublicAttemptRequest) -> Result<Pub
     }
 }
 
-fn validate_wrapper(wrapper: &RawWrapper, request: &PublicAttemptRequest) -> Result<OperationState, PackCommitError> {
+pub(super) fn validate_wrapper(
+    wrapper: &RawWrapper,
+    request: &PublicAttemptRequest,
+) -> Result<OperationState, PackCommitError> {
     let stored_wire = parse_digest(&wrapper.wire_digest, "stored public operation wire digest is not canonical")?;
     let stored_mode = parse_mode(&wrapper.request_mode, "stored public operation request mode is not recognized")?;
     let stored_format =
@@ -754,15 +757,15 @@ fn public_attempt(facts: AttemptFacts) -> PublicAttempt {
     }
 }
 
-fn parse_digest(value: &str, detail: &'static str) -> Result<RequestDigest, PackCommitError> {
+pub(super) fn parse_digest(value: &str, detail: &'static str) -> Result<RequestDigest, PackCommitError> {
     value.parse().map_err(|_| ledger(detail))
 }
 
-fn parse_state(value: &str, detail: &'static str) -> Result<OperationState, PackCommitError> {
+pub(super) fn parse_state(value: &str, detail: &'static str) -> Result<OperationState, PackCommitError> {
     OperationState::parse(value).ok_or_else(|| ledger(detail))
 }
 
-fn parse_mode(value: &str, detail: &'static str) -> Result<CommitMode, PackCommitError> {
+pub(super) fn parse_mode(value: &str, detail: &'static str) -> Result<CommitMode, PackCommitError> {
     match value {
         "atomic" => Ok(CommitMode::Atomic),
         "accepted_subset" => Ok(CommitMode::AcceptedSubset),
@@ -770,19 +773,19 @@ fn parse_mode(value: &str, detail: &'static str) -> Result<CommitMode, PackCommi
     }
 }
 
-fn parse_format(value: &str, detail: &'static str) -> Result<GitObjectFormat, PackCommitError> {
+pub(super) fn parse_format(value: &str, detail: &'static str) -> Result<GitObjectFormat, PackCommitError> {
     GitObjectFormat::parse(value).map_err(|_| ledger(detail))
 }
 
-fn is_canonical_hex_64(value: &str) -> bool {
+pub(super) fn is_canonical_hex_64(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn ledger(detail: &'static str) -> PackCommitError {
+pub(super) fn ledger(detail: &'static str) -> PackCommitError {
     PackCommitError::Rejected(PackCommitRejection::new(PackCommitRejectCode::LedgerIntegrity, detail))
 }
 
-fn stale_realm() -> PackCommitError {
+pub(super) fn stale_realm() -> PackCommitError {
     ledger("public operation wrapper does not belong to the current repository realm")
 }
 
@@ -795,7 +798,7 @@ fn lookup_db_error(error: tokio_postgres::Error) -> RefStoreError {
     }
 }
 
-struct Redacted;
+pub(super) struct Redacted;
 
 impl fmt::Debug for Redacted {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -814,8 +817,26 @@ struct RawSnapshot {
     realm_matches: bool,
 }
 
+impl RawWrapper {
+    pub(super) fn current_slot(&self) -> i16 {
+        self.current_slot
+    }
+
+    pub(super) fn event_id(&self) -> Option<Uuid> {
+        self.event_id
+    }
+
+    pub(super) fn retired_event_id(&self) -> Option<Uuid> {
+        self.retired_event_id
+    }
+
+    pub(super) fn cancelled_private_id(&self) -> Option<Uuid> {
+        self.cancelled_private_id
+    }
+}
+
 #[derive(Clone, Deserialize)]
-struct RawWrapper {
+pub(super) struct RawWrapper {
     repository_id: Uuid,
     public_id: Uuid,
     admission_owner_id: Uuid,

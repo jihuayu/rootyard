@@ -23,6 +23,10 @@ pub(crate) mod slot_zero;
 /// Read-only migration-152 public operation/current attempt resolver.
 pub(crate) mod public_attempt;
 
+/// Crate-private migration-152 slot-zero terminal mirror.
+#[allow(dead_code)]
+pub(crate) mod public_terminal;
+
 const MAX_QUERY_WINDOW: Duration = Duration::from_secs(30);
 pub const OPERATION_LOCK_DOMAIN: &str = "rootyard-ref-store-operation-v1";
 pub const OPERATION_LOCK_SQL: &str =
