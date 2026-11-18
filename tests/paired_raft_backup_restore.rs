@@ -110,7 +110,7 @@ async fn handle_s3(State(st): State<Arc<S3State>>, method: Method, uri: Uri, bod
         }
         Method::HEAD | Method::GET => st.objects.lock().unwrap().get(&key).cloned().map_or_else(
             || empty(404, ""),
-            |d| ok(&d, if method == Method::HEAD { Body::empty() } else { Body::from(d) }),
+            |d| ok(&d, if method == Method::HEAD { Body::empty() } else { Body::from(d.clone()) }),
         ),
         _ => empty(405, ""),
     }
@@ -158,7 +158,7 @@ fn mk_req<'a>(
     PairedBackupRequest {
         backup_id: Uuid::new_v4(),
         group_id: 1,
-        group_membership_digest: &"c".repeat(64),
+        group_membership_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         freeze: f.coord.status(),
         sm: &f.sm,
         close_receipts: f.receipts.clone(),
@@ -463,7 +463,7 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
         )).await?;
 
         assert!(matches!(capture_live_pg_backup(&mut src_c, mk_req(&fix, &store, dir.path(), &dir.path().join("p0"), fix.artifacts.clone())).await.unwrap_err(), PairedBackupError::DeleterNotFenced(_)));
-        freeze_pg_deleter(&*src_c, "paired-backup-it").await?;
+        freeze_pg_deleter(&**src_c, "paired-backup-it").await?;
         assert!(matches!(capture_live_pg_backup(&mut src_c, mk_req(&fix, &store, dir.path(), &dir.path().join("p1"), fix.artifacts.clone())).await.unwrap_err(), PairedBackupError::CutpointSkew(_)));
         src_c.execute("UPDATE ref_cas_projection_cursors SET applied_log_index=$1 WHERE group_id=1 AND history_incarnation=$2", &[&(applied.index as i64), &fix.history]).await?;
 
