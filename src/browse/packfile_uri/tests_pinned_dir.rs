@@ -4,7 +4,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -13,6 +13,7 @@ use std::{
 };
 
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::ref_store::GitObjectFormat;
@@ -322,16 +323,40 @@ async fn platforms_without_handle_confinement_fallback_cleanly_to_standard_inlin
     assert_eq!(offload.planner().leases().active_pin_count(), 0);
 
     let stripped = strip_packfile_uris_from_v2_request(&wire).expect("strip packfile-uris");
-    let inline_resp = run_git_bounded(
-        &git_bin,
-        &bare,
-        &["-c", "protocol.version=2", "upload-pack", "--stateless-rpc", "."],
-        Some(&stripped),
-        4 * 1024 * 1024,
-        Duration::from_secs(10),
-    )
-    .await
-    .unwrap();
+    let dev_null = if cfg!(unix) { "/dev/null" } else { "NUL" };
+    let mut cmd = tokio::process::Command::new(&git_bin);
+    cmd.env_clear();
+    #[cfg(unix)]
+    cmd.env("PATH", "/usr/bin:/bin");
+    #[cfg(not(unix))]
+    {
+        if let Some(p) = std::env::var_os("PATH") {
+            cmd.env("PATH", p);
+        }
+        if let Some(sr) = std::env::var_os("SystemRoot") {
+            cmd.env("SystemRoot", sr);
+        }
+    }
+    let mut child = cmd
+        .current_dir(&bare)
+        .env("GIT_PROTOCOL", "version=2")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", dev_null)
+        .args(["upload-pack", "--stateless-rpc", "."])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git upload-pack");
+    {
+        let mut sin = child.stdin.take().expect("upload-pack stdin");
+        sin.write_all(&stripped).await.expect("write stripped v2 request");
+        sin.shutdown().await.expect("close upload-pack stdin");
+    }
+    let output = child.wait_with_output().await.expect("wait git upload-pack");
+    assert!(output.status.success(), "upload-pack failed: {}", String::from_utf8_lossy(&output.stderr));
+    let inline_resp = output.stdout;
     assert!(decode_packfile_uris_section(&inline_resp, PackObjectFormat::Sha1).unwrap().is_empty());
     assert!(inline_resp.windows(9).any(|w| w == b"packfile\n"));
     assert!(inline_resp.windows(4).any(|w| w == b"PACK"));
