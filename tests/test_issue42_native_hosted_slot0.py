@@ -366,8 +366,10 @@ class BuildFailureClassificationTest(unittest.TestCase):
             "build-lib-executable",
             "build-lib-receipt",
         }
-        self.assertEqual(driver.BUILD_FAILURE_CLASSES, expected)
-        for value in sorted(expected):
+        self.assertEqual(
+            driver.BUILD_FAILURE_CLASSES,
+            expected | driver.LIB_PRODUCER_RUST_TYPE_REFINEMENTS)
+        for value in sorted(expected | driver.LIB_PRODUCER_RUST_TYPE_REFINEMENTS):
             report = ReportProjectionTest().report(
                 stage="build", failure_class=value)
             self.assertFalse(report["passed"])
@@ -569,6 +571,129 @@ class LibProducerClassificationTest(unittest.TestCase):
                 self.assertEqual(value, expected)
                 self.assertIn(value, driver.BUILD_FAILURE_CLASSES)
                 self.assertNotRegex(value, r"E[0-9]")
+
+    def test_type_location_refinement_is_exact_finite_and_safe(self):
+        expected_paths = {
+            b"src/ref_store/pg/slot_zero/tests.rs": "slot-zero-tests",
+            b"src/ref_store/pg/slot_zero.rs": "slot-zero",
+            b"src/ref_store/pg.rs": "ref-store-pg",
+            b"src/ref_store/core/pack_commit/producer.rs": "pack-commit-producer",
+            b"src/ref_store/core/pack_commit/authorized/cancel.rs": "pack-cancel",
+            b"src/ref_store/core/pack_snapshot/mod.rs": "pack-snapshot",
+            b"src/ref_store/core/pack_snapshot/serving_read_sql.rs": "pack-serving-read",
+            b"src/ref_store/core/pack_snapshot/serving_read_sql/sealed.rs": "pack-sealed-read",
+            b"src/blob_git_gateway/api.rs": "blob-api",
+            b"src/blob_git_gateway/operation.rs": "blob-operation",
+            b"src/blob_git_gateway/publish.rs": "blob-publish",
+            b"src/blob_git_gateway/state.rs": "blob-state",
+            b"src/backup/lifetime.rs": "backup-lifetime",
+            b"src/db.rs": "db",
+        }
+        self.assertEqual(driver.LIB_PRODUCER_SOURCE_TOKENS, expected_paths)
+        self.assertEqual(len(set(expected_paths.values())), len(expected_paths))
+        self.assertEqual(
+            len(driver.LIB_PRODUCER_RUST_TYPE_REFINEMENTS),
+            len(driver.LIB_PRODUCER_RUST_TYPE_CODES) * len(expected_paths))
+        for value in driver.LIB_PRODUCER_RUST_TYPE_REFINEMENTS:
+            with self.subTest(value=value):
+                self.assertIn(value, driver.BUILD_FAILURE_CLASSES)
+                self.assertLessEqual(len(value) + 1, driver.BUILD_FAILURE_LIMIT)
+                self.assertNotIn("/", value)
+                self.assertNotIn(":", value)
+                self.assertNotIn("src", value)
+                self.assertNotRegex(value, r"\s")
+
+    def test_type_header_with_one_trusted_immediate_location_refines(self):
+        cargo = b"build_native_test: cargo test failed with status 101\n"
+        expected = driver.LIB_PRODUCER_RUST_TYPE + "-E0308-slot-zero-tests"
+        for indent in (b" ", b"  ", b"   ", b"        "):
+            with self.subTest(indent=indent):
+                raw = (b"error[E0308]: mismatched types\n" + indent +
+                       b"--> src/ref_store/pg/slot_zero/tests.rs:321:17\n" + cargo)
+                self.assertEqual(self.classify(raw), expected)
+        repeated = (
+            b"error[E0308]: mismatched types\n"
+            b"   --> src/ref_store/pg/slot_zero/tests.rs:321:17\n"
+            b"error[E0308]: mismatched types\n"
+            b"   --> src/ref_store/pg/slot_zero/tests.rs:322:9\n" + cargo)
+        self.assertEqual(self.classify(repeated), expected)
+
+    def test_type_refinement_rejects_absolute_traversal_suffix_and_bad_arrows(self):
+        cargo = b"build_native_test: cargo test failed with status 101\n"
+        header = b"error[E0308]: mismatched types\n"
+        coarse = driver.LIB_PRODUCER_RUST_TYPE
+        for path in (
+            b"/workspace/product/src/ref_store/pg/slot_zero/tests.rs",
+            b"../src/ref_store/pg/slot_zero/tests.rs",
+            b"product/src/ref_store/pg/slot_zero/tests.rs",
+            b"src/../src/ref_store/pg/slot_zero/tests.rs",
+            b"src/ref_store/pg/slot_zero/tests.rs.bak",
+            b"tests.rs",
+        ):
+            with self.subTest(path=path):
+                raw = header + b"  --> " + path + b":7:3\n" + cargo
+                self.assertEqual(self.classify(raw), coarse)
+        for line in (
+            b"  --> src/ref_store/pg/slot_zero/tests.rs:7\n",
+            b"  --> src/ref_store/pg/slot_zero/tests.rs:seven:3\n",
+            b"  --> src/ref_store/pg/slot_zero/tests.rs:7:3 extra\n",
+            b"  --> src/ref_store/pg/slot_zero/tests.rs:1234567890:3\n",
+            b"  --> src/ref_store/pg/slot_zero/tests.rs:7:1234567890\n",
+            b"  => src/ref_store/pg/slot_zero/tests.rs:7:3\n",
+            b"note --> src/ref_store/pg/slot_zero/tests.rs:7:3\n",
+            b"--> src/ref_store/pg/slot_zero/tests.rs:7:3\n",
+            b"\t--> src/ref_store/pg/slot_zero/tests.rs:7:3\n",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.classify(header + line + b"\n" + cargo),
+                                 coarse)
+
+    def test_type_refinement_rejects_mixed_unanchored_and_unknown_evidence(self):
+        cargo = b"build_native_test: cargo test failed with status 101\n"
+        header = b"error[E0308]: mismatched types\n"
+        known = b"  --> src/db.rs:1:1\n"
+        other = b"  --> src/ref_store/pg.rs:2:2\n"
+        coarse = driver.LIB_PRODUCER_RUST_TYPE
+        self.assertEqual(
+            self.classify(header + known + header + other + cargo), coarse)
+        self.assertEqual(
+            self.classify(header + known + header +
+                          b"  --> /workspace/src/db.rs:1:1\n" + cargo), coarse)
+        self.assertEqual(
+            self.classify(header + b"\n" + known + cargo), coarse)
+        self.assertEqual(
+            self.classify(header + b"  |\n" + known + cargo), coarse)
+        self.assertEqual(
+            self.classify(b"note " + header + known + cargo),
+            driver.LIB_PRODUCER_CARGO_EXIT)
+        self.assertEqual(
+            self.classify(b"error[E9999]: unknown\n" + known + cargo),
+            driver.LIB_PRODUCER_RUST_OTHER)
+        self.assertEqual(
+            self.classify(b"error[E0603]: privacy\n" + known + cargo),
+            driver.LIB_PRODUCER_RUST_PRIVACY)
+
+    def test_type_refinement_falls_back_to_coarse_without_location(self):
+        cargo = b"build_native_test: cargo test failed with status 101\n"
+        self.assertEqual(
+            self.classify(b"error[E0308]: mismatched types\n" + cargo),
+            driver.LIB_PRODUCER_RUST_TYPE)
+        self.assertEqual(
+            self.classify(b"error[E0308]: mismatched types\n"
+                          b"  --> src/db.rs:1:1\n"
+                          b"error[E0308]: mismatched types\n" + cargo),
+            driver.LIB_PRODUCER_RUST_TYPE)
+
+    def test_refinement_uses_only_evidence_before_the_final_producer_line(self):
+        cargo = b"build_native_test: cargo test failed with status 101\n"
+        header = b"error[E0308]: mismatched types\n"
+        first = b"  --> src/db.rs:1:1\n"
+        second = b"  --> src/ref_store/pg.rs:2:2\n"
+        expected = driver.LIB_PRODUCER_RUST_TYPE + "-E0308-db"
+        self.assertEqual(self.classify(header + first + cargo + header + second),
+                         expected)
+        self.assertEqual(self.classify(cargo + header + first),
+                         driver.LIB_PRODUCER_CARGO_EXIT)
 
     def test_overlong_lines_and_caps_drain_and_fall_back(self):
         cut_off = (b"x" * 20 +
@@ -1559,6 +1684,12 @@ case "$*" in
         printf '%s\n' "build_native_test: cargo test failed with status 101" >&2
         exit 31
         ;;
+      rust-type-location)
+        printf '%s\n' "error[E0308]: mismatched types" >&2
+        printf '%s\n' "   --> src/ref_store/pg/slot_zero/tests.rs:321:17" >&2
+        printf '%s\n' "build_native_test: cargo test failed with status 101" >&2
+        exit 31
+        ;;
       overlong-line)
         printf '%05000d\n' 0 >&2
         printf '%s\n' "build_native_test: cargo test failed with status 101" >&2
@@ -1703,6 +1834,14 @@ esac
         self.assertIn("classifier_status=${pipeline_status[1]:-1}", lib)
         self.assertIn("set +e", script)
         self.assertIn("set -e", script)
+        self.assertIn("accept_lib_class()", script)
+        self.assertIn("build-lib-rust-type-*", script)
+        self.assertIn('test "$1" = "build-lib-rust-type-$class_code-$class_token"',
+                      script)
+        for code in driver.LIB_PRODUCER_RUST_TYPE_CODES:
+            self.assertIn(code, script)
+        for token in driver.LIB_PRODUCER_SOURCE_TOKENS.values():
+            self.assertIn(token, script)
         self.assertNotIn("lib-producer.stderr", script)
         self.assertNotIn("producer.log", script)
         self.assertNotIn("cat \"$lib_class_file\"", script)
@@ -1787,6 +1926,79 @@ esac
             self.assertFalse(report["passed"])
             self.assertEqual(report["stage"], "build")
             self.assertEqual(report["failure_class"], driver.LIB_PRODUCER_RUST_TYPE)
+
+    def test_lib_type_location_projects_closed_refinement_and_hides_raw(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, work, evidence, log = self.run_build_step(
+                root, first_mode="ready", second_mode="rust-type-location")
+            expected = driver.LIB_PRODUCER_RUST_TYPE + "-E0308-slot-zero-tests"
+            self.assertIn(expected, driver.LIB_PRODUCER_RUST_TYPE_REFINEMENTS)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(
+                (evidence / driver.BUILD_FAILURE_MARKER).read_text(),
+                expected + "\n")
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(
+                result.stderr,
+                f"[slot0-native] stage=build status=failed class={expected}\n")
+            combined = result.stdout + result.stderr
+            for payload in self.PRODUCER_NOISE:
+                self.assertNotIn(payload, combined)
+            self.assertNotIn("cargo test failed", combined)
+            self.assertNotIn("error[E", combined)
+            self.assertNotIn("src/ref_store", combined)
+            self.assertNotIn(":321:17", combined)
+            classifier_log = (root / "classifier.log").read_text()
+            self.assertEqual(len(classifier_log.splitlines()), 1)
+            report = self.finalize_build_failure(root, work, evidence)
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["stage"], "build")
+            self.assertEqual(report["failure_class"], expected)
+            encoded = json.dumps(report)
+            self.assertNotIn("src/ref_store", encoded)
+            self.assertNotIn(":321:17", encoded)
+
+    def test_shell_lib_class_validation_is_finite_and_fail_closed(self):
+        script = self.step_script("Build and bind both attested native harnesses")
+        start = script.index("accept_lib_class() {")
+        end = script.index("\n}\n", start) + len("\n}\n")
+        helper = ("#!/bin/sh\n" + script[start:end] +
+                  "\naccept_lib_class \"$1\"\n")
+        refined = driver.LIB_PRODUCER_RUST_TYPE
+        accepted = [
+            "build-lib-producer",
+            driver.LIB_PRODUCER_RUST_TYPE,
+            f"{refined}-E0308-slot-zero-tests",
+        ]
+        accepted += [f"{refined}-{code}-db"
+                     for code in sorted(driver.LIB_PRODUCER_RUST_TYPE_CODES)]
+        accepted += [f"{refined}-E0308-{token}"
+                     for token in sorted(driver.LIB_PRODUCER_SOURCE_TOKENS.values())]
+        rejected = (
+            "",
+            "build-lib-rust-type-",
+            "build-lib-rust-type-E0308-",
+            "build-lib-rust-type-E0308-unknown",
+            "build-lib-rust-type-E9999-db",
+            "build-lib-rust-type-e0308-db",
+            "build-lib-rust-type-E0308-db-extra",
+            "build-lib-rust-type-E0308-../../src/db.rs",
+            "build-lib-rust-type-E0308-/workspace/src/db.rs",
+            "build-lib-rust-type-E0308-db\nbuild-lib-producer",
+        )
+        for value in accepted:
+            with self.subTest(accepted=value):
+                result = subprocess.run(
+                    ["bash", "-c", helper, "bash", value],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        for value in rejected:
+            with self.subTest(rejected=value):
+                result = subprocess.run(
+                    ["bash", "-c", helper, "bash", value],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.assertNotEqual(result.returncode, 0)
 
     def test_overlong_lib_stderr_drains_and_falls_back(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -233,14 +233,40 @@ jobs:
           producer_status=${pipeline_status[0]:-1}
           classifier_status=${pipeline_status[1]:-1}
           set -e
+          accept_lib_class() {
+            case "$1" in
+              build-lib-producer|build-lib-cargo-exit|build-lib-artifact-selection|build-lib-input-changed|build-lib-receipt-publication|build-lib-rust-type|build-lib-rust-privacy|build-lib-rust-trait|build-lib-rust-compiler-other)
+                return 0
+                ;;
+              build-lib-rust-type-*)
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+            class_rest=${1#build-lib-rust-type-}
+            case "$class_rest" in
+              *-*) ;;
+              *) return 1 ;;
+            esac
+            class_code=${class_rest%%-*}
+            class_token=${class_rest#*-}
+            case "$class_code" in
+              E0061|E0063|E0308|E0412|E0425|E0432|E0433|E0560|E0599|E0609|E0614) ;;
+              *) return 1 ;;
+            esac
+            case "$class_token" in
+              slot-zero-tests|slot-zero|ref-store-pg|pack-commit-producer|pack-cancel|pack-snapshot|pack-serving-read|pack-sealed-read|blob-api|blob-operation|blob-publish|blob-state|backup-lifetime|db) ;;
+              *) return 1 ;;
+            esac
+            test "$1" = "build-lib-rust-type-$class_code-$class_token"
+          }
           if [ "$classifier_status" -eq 0 ] && [ -f "$lib_class_file" ] && \
               [ ! -L "$lib_class_file" ]; then
             IFS= read -r candidate_class < "$lib_class_file" || candidate_class=
-            case "${candidate_class:-}" in
-              build-lib-producer|build-lib-cargo-exit|build-lib-artifact-selection|build-lib-input-changed|build-lib-receipt-publication|build-lib-rust-type|build-lib-rust-privacy|build-lib-rust-trait|build-lib-rust-compiler-other)
-                lib_class=$candidate_class
-                ;;
-            esac
+            if accept_lib_class "${candidate_class:-}"; then
+              lib_class=$candidate_class
+            fi
           fi
           rm -f "$lib_class_file" 2>/dev/null || true
           if [ "$producer_status" -ne 0 ]; then

@@ -83,6 +83,36 @@ LIB_PRODUCER_RUST_FAMILIES = {
     "E0284": LIB_PRODUCER_RUST_TRAIT,
     "E0477": LIB_PRODUCER_RUST_TRAIT,
 }
+LIB_PRODUCER_RUST_TYPE_CODES = frozenset(
+    code for code, family in LIB_PRODUCER_RUST_FAMILIES.items()
+    if family == LIB_PRODUCER_RUST_TYPE
+)
+# Exact checked-in relative source paths map to fixed, short file IDs.  The
+# classifier never normalizes compiler output: a path outside this table (an
+# absolute path, a traversal, a suffix or a lookalike) falls back to the coarse
+# family class.  Tokens are deliberately independent of path spelling so the
+# report never carries a path prefix or derivative.
+LIB_PRODUCER_SOURCE_TOKENS = {
+    b"src/ref_store/pg/slot_zero/tests.rs": "slot-zero-tests",
+    b"src/ref_store/pg/slot_zero.rs": "slot-zero",
+    b"src/ref_store/pg.rs": "ref-store-pg",
+    b"src/ref_store/core/pack_commit/producer.rs": "pack-commit-producer",
+    b"src/ref_store/core/pack_commit/authorized/cancel.rs": "pack-cancel",
+    b"src/ref_store/core/pack_snapshot/mod.rs": "pack-snapshot",
+    b"src/ref_store/core/pack_snapshot/serving_read_sql.rs": "pack-serving-read",
+    b"src/ref_store/core/pack_snapshot/serving_read_sql/sealed.rs": "pack-sealed-read",
+    b"src/blob_git_gateway/api.rs": "blob-api",
+    b"src/blob_git_gateway/operation.rs": "blob-operation",
+    b"src/blob_git_gateway/publish.rs": "blob-publish",
+    b"src/blob_git_gateway/state.rs": "blob-state",
+    b"src/backup/lifetime.rs": "backup-lifetime",
+    b"src/db.rs": "db",
+}
+LIB_PRODUCER_RUST_TYPE_REFINEMENTS = frozenset(
+    f"{LIB_PRODUCER_RUST_TYPE}-{code}-{token}"
+    for code in LIB_PRODUCER_RUST_TYPE_CODES
+    for token in LIB_PRODUCER_SOURCE_TOKENS.values()
+)
 BUILD_FAILURE_CLASSES = frozenset({
     "build-integration-producer",
     "build-integration-executable",
@@ -93,6 +123,7 @@ BUILD_FAILURE_CLASSES = frozenset({
     LIB_PRODUCER_INPUT_CHANGED,
     LIB_PRODUCER_RECEIPT_PUBLICATION,
     *LIB_PRODUCER_RUST_FAMILIES.values(),
+    *LIB_PRODUCER_RUST_TYPE_REFINEMENTS,
     LIB_PRODUCER_RUST_OTHER,
     "build-lib-executable",
     "build-lib-receipt",
@@ -248,6 +279,38 @@ LIB_PRODUCER_RULES = (
     (re.compile(rb"relocated executable changed during publication"),
      LIB_PRODUCER_RECEIPT_PUBLICATION),
 )
+LIB_PRODUCER_LOCATION_ARROW = b"--> "
+LIB_PRODUCER_LOCATION_INDENT_LIMIT = 8
+LIB_PRODUCER_LOCATION_PART_LIMIT = 9
+
+
+def _lib_producer_location(line):
+    """Return a fixed source token for an exact compiler location line.
+
+    ``None`` means the line is not a location at all, ``False`` means it looks
+    like a location but is malformed or names no exact checked-in source path.
+    Only a leading gutter of spaces followed by ``--> <path>:<row>:<column>``
+    is accepted; paths are looked up verbatim, never by suffix or normalization.
+    """
+    trimmed = line.lstrip(b" ")
+    if not trimmed.startswith(b"-->"):
+        return None
+    indent = len(line) - len(trimmed)
+    if not 1 <= indent <= LIB_PRODUCER_LOCATION_INDENT_LIMIT:
+        return False
+    if not trimmed.startswith(LIB_PRODUCER_LOCATION_ARROW):
+        return False
+    fields = trimmed[len(LIB_PRODUCER_LOCATION_ARROW):].rsplit(b":", 2)
+    if len(fields) != 3:
+        return False
+    path, row, column = fields
+    if not (row.isdigit() and column.isdigit()):
+        return False
+    if not (1 <= len(row) <= LIB_PRODUCER_LOCATION_PART_LIMIT
+            and 1 <= len(column) <= LIB_PRODUCER_LOCATION_PART_LIMIT):
+        return False
+    token = LIB_PRODUCER_SOURCE_TOKENS.get(path)
+    return False if token is None else token
 
 
 def classify_lib_producer_stream(stream, *, chunk_size=LIB_PRODUCER_CHUNK,
@@ -259,25 +322,47 @@ def classify_lib_producer_stream(stream, *, chunk_size=LIB_PRODUCER_CHUNK,
     classes.  A cargo-exit final line may use exactly one recognized compiler
     family seen before that final line; without a header, or with mixed
     families, it stays cargo-exit.  Compiler text alone never decides a cause.
-    Overlong/unterminated lines, oversized totals, invalid bytes, read errors,
-    mixed producer classes and unrecognized final lines fall back.
+    A type family is narrowed further only when every recognized type header
+    before the final producer line is immediately followed by a location line
+    naming one exact checked-in source path and all such headers share one
+    unambiguous (code, file-ID) pair.  The refinement is a finite allowlisted
+    class; absent, unknown, multiple, invalid or ambiguous evidence falls back
+    to the coarse type class.  Overlong/unterminated lines, oversized totals,
+    invalid bytes, read errors, mixed producer classes and unrecognized final
+    lines fall back.
     """
     producer_classes = set()
     producer_last = None
     producer_seen = False
     rust_classes = set()
     rust_at_final = set()
+    type_pairs = set()
+    type_pair_untrusted = False
+    type_pairs_at_final = set()
+    type_untrusted_at_final = False
+    pending_type_code = None
     invalid = False
     total = 0
 
     def consume(line):
         nonlocal producer_last, producer_seen, rust_at_final, invalid
+        nonlocal type_pair_untrusted, type_pairs_at_final, type_untrusted_at_final
+        nonlocal pending_type_code
         if not line:
+            if pending_type_code is not None:
+                type_pair_untrusted = True
+                pending_type_code = None
             return
         if b"\r" in line or b"\x00" in line or b"\x1b" in line:
             invalid = True
+            if pending_type_code is not None:
+                type_pair_untrusted = True
+                pending_type_code = None
             return
         if line.startswith(LIB_PRODUCER_PREFIX):
+            if pending_type_code is not None:
+                type_pair_untrusted = True
+                pending_type_code = None
             producer_seen = True
             message = line[len(LIB_PRODUCER_PREFIX):]
             value = next((cls for pattern, cls in LIB_PRODUCER_RULES
@@ -286,11 +371,27 @@ def classify_lib_producer_stream(stream, *, chunk_size=LIB_PRODUCER_CHUNK,
             if value is not None:
                 producer_classes.add(value)
             rust_at_final = set(rust_classes)
+            type_pairs_at_final = set(type_pairs)
+            type_untrusted_at_final = type_pair_untrusted
             return
         header = LIB_PRODUCER_COMPILER_HEADER.match(line)
         if header is not None:
-            rust_classes.add(LIB_PRODUCER_RUST_FAMILIES.get(
-                header.group(1).decode("ascii"), LIB_PRODUCER_RUST_OTHER))
+            if pending_type_code is not None:
+                type_pair_untrusted = True
+            pending_type_code = None
+            code = header.group(1).decode("ascii")
+            family = LIB_PRODUCER_RUST_FAMILIES.get(code, LIB_PRODUCER_RUST_OTHER)
+            rust_classes.add(family)
+            if family == LIB_PRODUCER_RUST_TYPE:
+                pending_type_code = code
+            return
+        if pending_type_code is not None:
+            token = _lib_producer_location(line)
+            if token is None or token is False:
+                type_pair_untrusted = True
+            else:
+                type_pairs.add((pending_type_code, token))
+            pending_type_code = None
 
     def drain_all():
         while True:
@@ -344,7 +445,15 @@ def classify_lib_producer_stream(stream, *, chunk_size=LIB_PRODUCER_CHUNK,
         if producer_last is None or len(producer_classes) != 1:
             return LIB_PRODUCER_FALLBACK
         if producer_last == LIB_PRODUCER_CARGO_EXIT and len(rust_at_final) == 1:
-            return next(iter(rust_at_final))
+            family = next(iter(rust_at_final))
+            if (family == LIB_PRODUCER_RUST_TYPE
+                    and not type_untrusted_at_final
+                    and len(type_pairs_at_final) == 1):
+                code, token = next(iter(type_pairs_at_final))
+                refined = f"{LIB_PRODUCER_RUST_TYPE}-{code}-{token}"
+                if refined in LIB_PRODUCER_RUST_TYPE_REFINEMENTS:
+                    return refined
+            return family
         return producer_last
     return LIB_PRODUCER_FALLBACK
 
