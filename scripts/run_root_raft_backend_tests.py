@@ -105,6 +105,11 @@ _FAILURE_STATUS = {"ok": "passed", "FAILED": "failed", "ignored": "ignored"}
 _DIAGNOSTIC_PREFIX_V1 = "ROOTYARD_QUORUM_DIAGNOSTICS v1 "
 _DIAGNOSTIC_PREFIX_V2 = "ROOTYARD_QUORUM_DIAGNOSTICS v2 "
 _DIAGNOSTIC_PREFIXES = (_DIAGNOSTIC_PREFIX_V1, _DIAGNOSTIC_PREFIX_V2)
+_APPEND_WITNESS_PREFIX = "ROOTYARD_APPEND_WITNESS v1 "
+_APPEND_WITNESS_SCHEMA = "rootyard.append_witness.v1"
+_MAX_APPEND_FRAME_BYTES = 8_192
+_MAX_APPEND_ENTRIES = 1_000_000
+_MAX_APPEND_COUNT = 1_000_000
 _DIAGNOSTIC_SCHEMA_V1 = "rootyard.quorum_diagnostics.v1"
 _DIAGNOSTIC_SCHEMA_V2 = "rootyard.quorum_diagnostics.v2"
 _MAX_DIAGNOSTIC_FRAME_BYTES = 8_192
@@ -154,11 +159,23 @@ _DIAGNOSTIC_NODE_KEYS_V1 = frozenset(
 _DIAGNOSTIC_MATCHING_KEYS = frozenset(
     ("slot", "matched_index", "matched_term", "matched_leader_slot")
 )
+_APPEND_WITNESS_TOP_KEYS = frozenset(("schema", "case", "observations"))
+_APPEND_WITNESS_OBSERVATION_KEYS = frozenset(
+    (
+        "target_slot", "sender_slot", "decoded", "handled", "handler",
+        "write_ok", "write_error", "term", "prev_index", "first_index",
+        "last_index", "entry_count", "overflow",
+    )
+)
+_APPEND_WITNESS_HANDLERS = frozenset(
+    ("none", "success", "partial_success", "conflict", "higher_vote", "raft_error", "other")
+)
+_APPEND_WITNESS_CASES = frozenset((REQUIRED_CASES[0],))
 _DIAGNOSTIC_NODE_KEYS_V2 = _DIAGNOSTIC_NODE_KEYS_V1 | frozenset(("replication_matching",))
 _DIAGNOSTIC_KEYS = (
     "exit_code", "signal", "evidence_complete", "suite_counts", "case_failures",
     "failure_phase", "failure_class", "unknown_case", "diagnostics_valid",
-    "evidence_unchanged", "quorum_diagnostics",
+    "evidence_unchanged", "quorum_diagnostics", "append_witness",
 )
 
 
@@ -200,6 +217,7 @@ class FailureEvidence:
     unknown_case: bool
     diagnostics_valid: bool
     quorum_diagnostics: list[dict]
+    append_witness: list[dict]
 
 
 def _safe_digest(path) -> str | None:
@@ -760,6 +778,123 @@ def _parse_quorum_diagnostic(line) -> tuple[str, dict]:
     }
 
 
+def _parse_append_witness(line) -> tuple[str, dict]:
+    """Validate and safely rebuild one bounded fixed-slot AppendEntries witness.
+
+    The frame is a companion to the historical case-level failure receipt. It can only name the
+    real Root Raft case, and every observation is rebuilt from fixed slot labels, closed handler
+    names and bounded integers. No request, identity, path, address, payload or log text is
+    accepted or reflected.
+    """
+    if not isinstance(line, str) or len(line.encode("utf-8")) > _MAX_APPEND_FRAME_BYTES:
+        raise ValueError
+    if not line.startswith(_APPEND_WITNESS_PREFIX):
+        raise ValueError
+    try:
+        payload = json.loads(
+            line[len(_APPEND_WITNESS_PREFIX):],
+            object_pairs_hook=_diagnostic_no_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError from None
+    if not isinstance(payload, dict) or set(payload) != _APPEND_WITNESS_TOP_KEYS:
+        raise ValueError
+    if payload.get("schema") != _APPEND_WITNESS_SCHEMA:
+        raise ValueError
+    case = payload.get("case")
+    if not isinstance(case, str) or case not in _APPEND_WITNESS_CASES:
+        raise ValueError
+    observations = payload.get("observations")
+    if not isinstance(observations, list) or len(observations) > 9:
+        raise ValueError
+    rebuilt = []
+    seen = set()
+    for entry in observations:
+        if not isinstance(entry, dict) or set(entry) != _APPEND_WITNESS_OBSERVATION_KEYS:
+            raise ValueError
+        target_slot = entry.get("target_slot")
+        sender_slot = entry.get("sender_slot")
+        if type(target_slot) is not int or target_slot not in (1, 2, 3):
+            raise ValueError
+        if type(sender_slot) is not int or sender_slot not in (1, 2, 3):
+            raise ValueError
+        slot_pair = (target_slot, sender_slot)
+        if slot_pair in seen:
+            raise ValueError
+        seen.add(slot_pair)
+        decoded = entry.get("decoded")
+        handled = entry.get("handled")
+        write_ok = entry.get("write_ok")
+        write_error = entry.get("write_error")
+        if not _diagnostic_int(decoded, 1, _MAX_APPEND_COUNT):
+            raise ValueError
+        if not _diagnostic_int(handled, 0, decoded):
+            raise ValueError
+        if not _diagnostic_int(write_ok, 0, decoded):
+            raise ValueError
+        if not _diagnostic_int(write_error, 0, decoded):
+            raise ValueError
+        handler = entry.get("handler")
+        if not isinstance(handler, str) or handler not in _APPEND_WITNESS_HANDLERS:
+            raise ValueError
+        overflow = entry.get("overflow")
+        if type(overflow) is not bool:
+            raise ValueError
+        term = entry.get("term")
+        prev_index = entry.get("prev_index")
+        first_index = entry.get("first_index")
+        last_index = entry.get("last_index")
+        entry_count = entry.get("entry_count")
+        if not _diagnostic_int(term, 0, _MAX_DIAGNOSTIC_TERM):
+            raise ValueError
+        if not _diagnostic_optional_int(prev_index, 0, _MAX_DIAGNOSTIC_LOG_INDEX):
+            raise ValueError
+        if not _diagnostic_int(first_index, 0, _MAX_DIAGNOSTIC_LOG_INDEX):
+            raise ValueError
+        if not _diagnostic_int(last_index, 0, _MAX_DIAGNOSTIC_LOG_INDEX):
+            raise ValueError
+        if first_index > last_index:
+            raise ValueError
+        if not _diagnostic_int(entry_count, 1, _MAX_APPEND_ENTRIES):
+            raise ValueError
+        if overflow and not any(
+            (
+                term == _MAX_DIAGNOSTIC_TERM,
+                prev_index == _MAX_DIAGNOSTIC_LOG_INDEX,
+                first_index == _MAX_DIAGNOSTIC_LOG_INDEX,
+                last_index == _MAX_DIAGNOSTIC_LOG_INDEX,
+                entry_count == _MAX_APPEND_ENTRIES,
+                decoded == _MAX_APPEND_COUNT,
+                handled == _MAX_APPEND_COUNT,
+                write_ok == _MAX_APPEND_COUNT,
+                write_error == _MAX_APPEND_COUNT,
+            )
+        ):
+            raise ValueError
+        rebuilt.append(
+            {
+                "target_slot": target_slot,
+                "sender_slot": sender_slot,
+                "decoded": decoded,
+                "handled": handled,
+                "handler": handler,
+                "write_ok": write_ok,
+                "write_error": write_error,
+                "term": term,
+                "prev_index": prev_index,
+                "first_index": first_index,
+                "last_index": last_index,
+                "entry_count": entry_count,
+                "overflow": overflow,
+            }
+        )
+    return case, {
+        "schema": _APPEND_WITNESS_SCHEMA,
+        "case": case,
+        "observations": rebuilt,
+    }
+
+
 def collect_failure_evidence(
     stdout, stderr="", *, capture_truncated=False
 ) -> FailureEvidence:
@@ -774,6 +909,8 @@ def collect_failure_evidence(
     frame_sets: dict[str, set[tuple[str, str]]] = {}
     quorum_frames: list[tuple[str, dict]] = []
     quorum_seen: dict[str, int] = {}
+    append_frames: list[tuple[str, dict]] = []
+    append_seen: dict[str, int] = {}
     unknown_case = False
     diagnostics_invalid = False
     for raw_line in stdout.splitlines():
@@ -811,6 +948,18 @@ def collect_failure_evidence(
             quorum_seen[name] = quorum_seen.get(name, 0) + 1
             if quorum_seen[name] == 1:
                 quorum_frames.append((name, safe))
+            else:
+                diagnostics_invalid = True
+            continue
+        if line.startswith(_APPEND_WITNESS_PREFIX):
+            try:
+                name, safe = _parse_append_witness(line)
+            except (TypeError, ValueError):
+                diagnostics_invalid = True
+                continue
+            append_seen[name] = append_seen.get(name, 0) + 1
+            if append_seen[name] == 1:
+                append_frames.append((name, safe))
             else:
                 diagnostics_invalid = True
             continue
@@ -915,8 +1064,23 @@ def collect_failure_evidence(
                 continue
         quorum_diagnostics.append(safe)
     quorum_diagnostics.sort(key=lambda item: REQUIRED_CASES.index(item["case"]))
+    append_witness = []
+    for case, safe in append_frames:
+        if append_seen.get(case, 0) != 1:
+            diagnostics_invalid = True
+            continue
+        if by_name.get(case) != "FAILED":
+            diagnostics_invalid = True
+            continue
+        frames = frame_sets.get(case, set())
+        if len(frames) != 1:
+            diagnostics_invalid = True
+            continue
+        append_witness.append(safe)
+    append_witness.sort(key=lambda item: REQUIRED_CASES.index(item["case"]))
     if diagnostics_invalid:
         quorum_diagnostics = []
+        append_witness = []
     scalar_is_unambiguous = (
         len(case_failures) == 1
         and not diagnostics_invalid
@@ -936,6 +1100,7 @@ def collect_failure_evidence(
         unknown_case=unknown_case,
         diagnostics_valid=not diagnostics_invalid,
         quorum_diagnostics=quorum_diagnostics,
+        append_witness=append_witness,
     )
 
 
@@ -1011,6 +1176,7 @@ def _failure_diagnostics(execution, evidence, evidence_unchanged) -> dict:
         "diagnostics_valid": evidence.diagnostics_valid,
         "evidence_unchanged": evidence_unchanged,
         "quorum_diagnostics": evidence.quorum_diagnostics,
+        "append_witness": evidence.append_witness,
     }
 
 

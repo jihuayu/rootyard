@@ -1,7 +1,9 @@
 //! Fixed failure-phase frames for the two long Root Raft cases.
 //!
 //! Frames contain only a fixed case identifier, a closed phase code and a closed class code. They
-//! never include panic payloads, error text, identities, paths, metrics or other runtime data.
+//! never include panic payloads, error text, identities, paths, metrics or other runtime data. On
+//! a real-case failure only, one fixed append-witness companion is written from retained listener
+//! counters; it never changes the phase or class receipt.
 
 use std::io::Write;
 
@@ -11,7 +13,10 @@ use rootyard::ref_store::raft_backend::RaftBackendError;
 #[path = "quorum_diagnostic.rs"]
 mod quorum_diagnostic;
 
-pub(crate) use quorum_diagnostic::{Operation, observe_call};
+pub(crate) use quorum_diagnostic::{
+    Operation, emit_append_witness, note_append_decoded, note_append_handled, note_append_written, observe_call,
+    reset_append_witness,
+};
 
 pub(crate) const CASE_REAL: &str = "real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart";
 pub(crate) const CASE_SCOPE: &str =
@@ -251,14 +256,19 @@ impl<P: PhaseLabel> PhaseGuard<P> {
     }
 
     fn emit(&self, class: Class) {
-        let mut stderr = std::io::stderr().lock();
-        let _ = write!(
-            stderr,
-            "\nROOTYARD_FAILURE_FRAME v1 case={} phase={} class={}\n",
-            self.case,
-            self.phase.code(),
-            class.code()
-        );
+        {
+            let mut stderr = std::io::stderr().lock();
+            let _ = write!(
+                stderr,
+                "\nROOTYARD_FAILURE_FRAME v1 case={} phase={} class={}\n",
+                self.case,
+                self.phase.code(),
+                class.code()
+            );
+        }
+        if self.case == CASE_REAL {
+            emit_append_witness(self.case);
+        }
     }
 }
 

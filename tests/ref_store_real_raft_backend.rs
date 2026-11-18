@@ -46,7 +46,10 @@ use uuid::Uuid;
 
 mod scope_drain_support;
 
-use scope_drain_support::failure_phase::{CASE_REAL, Class, Operation, Phase, PhaseGuard, observe_call};
+use scope_drain_support::failure_phase::{
+    CASE_REAL, Class, Operation, Phase, PhaseGuard, note_append_decoded, note_append_handled, note_append_written,
+    observe_call, reset_append_witness,
+};
 
 const TEST_GROUP: &str = "group-175";
 const CLUSTER_NAME: &str = "issue175-real-raft-backend";
@@ -255,7 +258,14 @@ impl TestCluster {
             let raft_addr = listener.local_addr()?.to_string();
             raft_map.insert(id, raft_addr.clone());
             let (stop, stop_rx) = watch::channel(false);
-            spawn_rpc_listener(mtls_server, listener, node.clone(), peer_dir.clone(), stop_rx);
+            spawn_rpc_listener(
+                u8::try_from(id).expect("fixture slot"),
+                mtls_server,
+                listener,
+                node.clone(),
+                peer_dir.clone(),
+                stop_rx,
+            );
 
             nodes.push(TestNode { id, dir, node, peer_dir, stop });
         }
@@ -336,6 +346,7 @@ impl TestCluster {
 }
 
 fn spawn_rpc_listener(
+    slot: u8,
     server: MtlsServer,
     listener: TcpListener,
     node: RootRaftNode,
@@ -382,6 +393,23 @@ fn spawn_rpc_listener(
                             if peers.is_blocked(sender) {
                                 break;
                             }
+                            let append_observed = match &request {
+                                RpcRequest::AppendEntries(append)
+                                    if append.vote.leader_id.node_id == sender && !append.entries.is_empty() =>
+                                {
+                                    note_append_decoded(
+                                        slot,
+                                        sender,
+                                        append.vote.leader_id.term,
+                                        append.prev_log_id.map(|log_id| log_id.index),
+                                        append.entries.first().expect("nonempty append").log_id.index,
+                                        append.entries.last().expect("nonempty append").log_id.index,
+                                        u64::try_from(append.entries.len()).expect("append entry count"),
+                                    );
+                                    true
+                                }
+                                _ => false,
+                            };
                             let response = match request {
                                 RpcRequest::Vote(vote) if vote.vote.leader_id.node_id == sender => {
                                     node.handle_peer_rpc(RpcRequest::Vote(vote)).await
@@ -397,7 +425,14 @@ fn spawn_rpc_listener(
                                     forward_to_leader_id: None,
                                 },
                             };
-                            if write_frame_async(&mut tls, &response).await.is_err() {
+                            if append_observed {
+                                note_append_handled(slot, sender, &response);
+                            }
+                            let write_result = write_frame_async(&mut tls, &response).await;
+                            if append_observed {
+                                note_append_written(slot, sender, write_result.is_ok());
+                            }
+                            if write_result.is_err() {
                                 break;
                             }
                         }
@@ -545,6 +580,7 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart() -> R
 async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
     phase: &mut PhaseGuard<Phase>,
 ) -> Result<()> {
+    reset_append_witness();
     let repo = Uuid::new_v4();
     let tenant = Uuid::new_v4();
     let issuer = Uuid::new_v4();

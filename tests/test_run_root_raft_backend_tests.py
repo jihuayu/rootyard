@@ -131,6 +131,7 @@ DIAGNOSTIC_KEYS = {
     "diagnostics_valid",
     "evidence_unchanged",
     "quorum_diagnostics",
+    "append_witness",
 }
 
 
@@ -218,6 +219,57 @@ def _diagnostic_v2_frame(payload=None):
         "ROOTYARD_QUORUM_DIAGNOSTICS v2 "
         + json.dumps(
             _diagnostic_v2_payload() if payload is None else payload, separators=(",", ":")
+        )
+        + "\n"
+    )
+
+
+def _append_observation(
+    target_slot=2,
+    sender_slot=1,
+    decoded=3,
+    handled=3,
+    handler="success",
+    write_ok=3,
+    write_error=0,
+    term=7,
+    prev_index=19,
+    first_index=20,
+    last_index=20,
+    entry_count=1,
+    overflow=False,
+):
+    return {
+        "target_slot": target_slot,
+        "sender_slot": sender_slot,
+        "decoded": decoded,
+        "handled": handled,
+        "handler": handler,
+        "write_ok": write_ok,
+        "write_error": write_error,
+        "term": term,
+        "prev_index": prev_index,
+        "first_index": first_index,
+        "last_index": last_index,
+        "entry_count": entry_count,
+        "overflow": overflow,
+    }
+
+
+def _append_witness_payload(observations=None, case=CASE_REAL):
+    return {
+        "schema": "rootyard.append_witness.v1",
+        "case": case,
+        "observations": [_append_observation()] if observations is None else observations,
+    }
+
+
+def _append_witness_frame(payload=None):
+    return (
+        "ROOTYARD_APPEND_WITNESS v1 "
+        + json.dumps(
+            _append_witness_payload() if payload is None else payload,
+            separators=(",", ":"),
         )
         + "\n"
     )
@@ -1084,6 +1136,146 @@ class RootRaftRunnerTest(unittest.TestCase):
                     [1, 2, 3],
                 )
 
+    def test_append_witness_is_bound_to_failed_real_case_receipt(self) -> None:
+        scalar = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=heal class=quorum_unavailable\n"
+        )
+        evidence = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, scalar + _append_witness_frame()
+        )
+        self.assertTrue(evidence.diagnostics_valid)
+        self.assertEqual(len(evidence.append_witness), 1)
+        safe = evidence.append_witness[0]
+        self.assertEqual(set(safe), runner._APPEND_WITNESS_TOP_KEYS)
+        self.assertEqual(safe["schema"], runner._APPEND_WITNESS_SCHEMA)
+        self.assertEqual(safe["case"], CASE_REAL)
+        observation = safe["observations"][0]
+        self.assertEqual(set(observation), runner._APPEND_WITNESS_OBSERVATION_KEYS)
+        self.assertEqual(observation["target_slot"], 2)
+        self.assertEqual(observation["sender_slot"], 1)
+        self.assertEqual(observation["decoded"], 3)
+        self.assertEqual(observation["handled"], 3)
+        self.assertEqual(observation["handler"], "success")
+        self.assertEqual(observation["write_ok"], 3)
+        self.assertEqual(observation["write_error"], 0)
+        self.assertEqual(observation["term"], 7)
+        self.assertEqual(observation["prev_index"], 19)
+        self.assertEqual(observation["first_index"], 20)
+        self.assertEqual(observation["last_index"], 20)
+        self.assertEqual(observation["entry_count"], 1)
+        self.assertFalse(observation["overflow"])
+        self.assertNotIn(SECRET, json.dumps(evidence.append_witness))
+
+    def test_append_witness_rejects_bad_shapes_and_bindings(self) -> None:
+        scalar = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=heal class=quorum_unavailable\n"
+        )
+        valid = _append_witness_frame()
+
+        no_receipt = runner.collect_failure_evidence(NONZERO_FAILED_OUTPUT, valid)
+        self.assertFalse(no_receipt.diagnostics_valid)
+        self.assertEqual(no_receipt.append_witness, [])
+
+        passed = runner.collect_failure_evidence(GOOD_OUTPUT, valid)
+        self.assertFalse(passed.diagnostics_valid)
+        self.assertEqual(passed.append_witness, [])
+
+        duplicate = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, scalar + valid + valid
+        )
+        self.assertFalse(duplicate.diagnostics_valid)
+        self.assertEqual(duplicate.append_witness, [])
+
+        duplicate_key = valid.replace('"decoded":3', '"decoded":3,"decoded":4')
+        duplicated_field = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, scalar + duplicate_key
+        )
+        self.assertFalse(duplicated_field.diagnostics_valid)
+        self.assertEqual(duplicated_field.append_witness, [])
+
+        oversized = (
+            "ROOTYARD_APPEND_WITNESS v1 "
+            + " " * runner._MAX_APPEND_FRAME_BYTES
+            + json.dumps(_append_witness_payload(), separators=(",", ":"))
+            + "\n"
+        )
+        too_large = runner.collect_failure_evidence(NONZERO_FAILED_OUTPUT, scalar + oversized)
+        self.assertFalse(too_large.diagnostics_valid)
+        self.assertEqual(too_large.append_witness, [])
+
+        cases = []
+        payload = _append_witness_payload()
+        payload["schema"] = "rootyard.append_witness.v2"
+        cases.append(payload)
+        payload = _append_witness_payload(case=CASE_DRAIN)
+        cases.append(payload)
+        payload = _append_witness_payload(observations=[])
+        payload["case"] = CASE_PRUNED
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["target_slot"] = 4
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["decoded"] = 0
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["handled"] = 4
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["handler"] = "secret_handler"
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["first_index"] = 21
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["entry_count"] = 0
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["overflow"] = True
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["prev_index"] = -1
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["secret"] = SECRET
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"].append(copy.deepcopy(payload["observations"][0]))
+        cases.append(payload)
+        for payload in cases:
+            with self.subTest(payload=payload):
+                evidence = runner.collect_failure_evidence(
+                    NONZERO_FAILED_OUTPUT, scalar + _append_witness_frame(payload)
+                )
+                self.assertFalse(evidence.diagnostics_valid)
+                self.assertEqual(evidence.append_witness, [])
+                self.assertNotIn(SECRET, json.dumps(evidence.append_witness))
+
+    def test_append_witness_accepts_null_previous_index_and_bounded_overflow(self) -> None:
+        scalar = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=heal class=quorum_unavailable\n"
+        )
+        payload = _append_witness_payload()
+        payload["observations"][0].update(
+            prev_index=None,
+            term=runner._MAX_DIAGNOSTIC_TERM,
+            first_index=runner._MAX_DIAGNOSTIC_LOG_INDEX,
+            last_index=runner._MAX_DIAGNOSTIC_LOG_INDEX,
+            decoded=runner._MAX_APPEND_COUNT,
+            handled=runner._MAX_APPEND_COUNT,
+            write_ok=runner._MAX_APPEND_COUNT,
+            overflow=True,
+        )
+        evidence = runner.collect_failure_evidence(
+            NONZERO_FAILED_OUTPUT, scalar + _append_witness_frame(payload)
+        )
+        self.assertTrue(evidence.diagnostics_valid)
+        self.assertEqual(len(evidence.append_witness), 1)
+        observation = evidence.append_witness[0]["observations"][0]
+        self.assertIsNone(observation["prev_index"])
+        self.assertTrue(observation["overflow"])
+        self.assertEqual(observation["decoded"], runner._MAX_APPEND_COUNT)
+
     def test_quorum_diagnostic_accepts_bounded_overflow(self) -> None:
         payload = _diagnostic_payload()
         payload.update(
@@ -1515,6 +1707,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             "diagnostics_valid": True,
             "evidence_unchanged": True,
             "quorum_diagnostics": [],
+            "append_witness": [],
         })
         serialized = json.dumps(report)
         self.assertNotIn(SECRET, serialized)
@@ -1786,6 +1979,7 @@ class RootRaftRunnerTest(unittest.TestCase):
             "diagnostics_valid": True,
             "evidence_unchanged": True,
             "quorum_diagnostics": [],
+            "append_witness": [],
         }
         failed_with_diagnostics = runner.build_report(
             False,
