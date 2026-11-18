@@ -12,9 +12,9 @@ use axum::http::Uri;
 use crate::webhooks::policy::{host_is_loopback, permitted_peer};
 
 use super::types::{
-    MAX_ACTIVE_LEASES_HARD_CAP, MAX_DEADLINE_MS, MAX_OFFLOAD_BYTES_HARD_CAP, MAX_OFFLOAD_TTL_SECS,
-    MAX_RETENTION_GRACE_SECS, MAX_RETRIES_HARD_CAP, MAX_URIS_PER_FETCH_CAP, MIN_DEADLINE_MS, MIN_OFFLOAD_TTL_SECS,
-    OffloadPolicyConfig, PackfileUriError,
+    MAX_ACTIVE_LEASES_HARD_CAP, MAX_CONCURRENT_PREFLIGHTS_CAP, MAX_DEADLINE_MS, MAX_OFFLOAD_BYTES_HARD_CAP,
+    MAX_OFFLOAD_TTL_SECS, MAX_RETENTION_GRACE_SECS, MAX_RETRIES_HARD_CAP, MAX_URIS_PER_FETCH_CAP, MIN_DEADLINE_MS,
+    MIN_OFFLOAD_TTL_SECS, OffloadPolicyConfig, PackfileUriError,
 };
 
 const MAX_URI_LEN: usize = 2048;
@@ -215,6 +215,12 @@ pub fn validate_policy_config(policy: &OffloadPolicyConfig) -> Result<(), Packfi
     }
     if policy.max_active_leases == 0 || policy.max_active_leases > MAX_ACTIVE_LEASES_HARD_CAP {
         return Err(PackfileUriError::InvalidPolicy("invalid max_active_leases".to_owned()));
+    }
+    if policy.max_concurrent_preflights == 0 || policy.max_concurrent_preflights > MAX_CONCURRENT_PREFLIGHTS_CAP {
+        return Err(PackfileUriError::InvalidPolicy("invalid max_concurrent_preflights".to_owned()));
+    }
+    if policy.max_v2_response_bytes == 0 || policy.max_v2_response_bytes > MAX_OFFLOAD_BYTES_HARD_CAP {
+        return Err(PackfileUriError::InvalidPolicy("invalid max_v2_response_bytes".to_owned()));
     }
     if policy.max_retries_per_pack > MAX_RETRIES_HARD_CAP {
         return Err(PackfileUriError::InvalidPolicy(format!("max_retries_per_pack exceeds {MAX_RETRIES_HARD_CAP}")));

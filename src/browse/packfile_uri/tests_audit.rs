@@ -450,6 +450,7 @@ async fn bounded_pack_store_and_multi_candidate_rollback_never_leak_leases() {
         wire_packs: &single_fx.wire_packs,
         residual_inline_bytes: 0,
         full_fallback_inline_bytes: raw.len() as u64,
+        rejected_unauthorized_pack: false,
     };
     let err_mint = planner
         .plan_fetch(

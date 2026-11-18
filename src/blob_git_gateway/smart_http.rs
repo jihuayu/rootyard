@@ -172,11 +172,14 @@ async fn upload_pack_authorized(
             authorization: &authorization,
             request_path: &request_path,
             repo_dir: view.repo(),
+            advertised_refs: &refs.refs,
             object_format: refs.format,
             deadline,
         })
         .await?
     {
+        drop(lease);
+        let _response_lease = state.reserve_bytes(v2_body.len() as u64)?;
         return Ok(bytes_response("application/x-git-upload-pack-result", v2_body));
     }
     let mut command = view.command_with_protocol(state.git_binary(), git_protocol(&headers));
@@ -207,6 +210,7 @@ struct OffloadUploadCtx<'a> {
     authorization: &'a super::session::ReadAuthorization,
     request_path: &'a std::path::Path,
     repo_dir: &'a std::path::Path,
+    advertised_refs: &'a [(String, String)],
     object_format: crate::ref_store::GitObjectFormat,
     deadline: tokio::time::Instant,
 }
@@ -219,6 +223,11 @@ async fn try_offload_upload_pack_v2(ctx: OffloadUploadCtx<'_>) -> Result<Option<
     let epoch = u64::try_from(ctx.serving.gate.authority_epoch().max(1)).unwrap_or(1);
     let subject = DownloadSubjectContext::new(ctx.identity.id, ctx.identity.scope_token_id(), epoch)
         .map_err(|_| GatewayError::Forbidden("repository authorization is no longer valid"))?;
+    let request_timeout = ctx.deadline.saturating_duration_since(tokio::time::Instant::now());
+    if request_timeout.is_zero() {
+        return Err(GatewayError::Timeout);
+    }
+    let max_resp = ctx.state.limits().max_response_bytes;
     let auth_guard = ctx.authorization.clone();
     let live_revalidator: crate::browse::packfile_uri::LiveRevalidatorFn = Arc::new(move || {
         let auth_guard = auth_guard.clone();
@@ -232,6 +241,7 @@ async fn try_offload_upload_pack_v2(ctx: OffloadUploadCtx<'_>) -> Result<Option<
         .try_serve_upload_pack_v2(GatewayFetchBridgeInput {
             git_binary: ctx.state.git_binary(),
             repo_dir: ctx.repo_dir,
+            advertised_refs: ctx.advertised_refs,
             object_format: ctx.object_format,
             request_bytes: &request_bytes,
             tenant_id: ctx.serving.gate.tenant_id(),
@@ -242,12 +252,16 @@ async fn try_offload_upload_pack_v2(ctx: OffloadUploadCtx<'_>) -> Result<Option<
             subject,
             provider: ctx.state.store().provider().as_str(),
             backend_identity_hex: ctx.state.store().backend_identity().as_hex(),
+            request_timeout,
+            max_response_bytes: max_resp,
             live_revalidator,
         })
         .await;
     match outcome {
         Ok(Some(v2_body)) => {
-            ctx.authorization.revalidate(ctx.deadline).await?;
+            if v2_body.len() as u64 > max_resp {
+                return Err(GatewayError::TooLarge);
+            }
             return Ok(Some(v2_body));
         }
         Err(PackfileUriError::Unauthorized) => {

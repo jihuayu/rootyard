@@ -21,7 +21,7 @@ use deadpool_postgres::{Manager, Pool};
 use rootyard::{
     blob_git_gateway::{BlobGitConfig, BlobGitState, router},
     blob_store::{config::BlobProfile, opendal::BlobStore},
-    browse::packfile_uri::GatewayPackfileOffload,
+    browse::packfile_uri::{FallbackReason, GatewayPackfileOffload, protocol_v2::push_pkt_line},
     db,
     ref_store::{
         GitObjectFormat,
@@ -308,4 +308,175 @@ pub async fn create_and_provision_repo(
     let mut client = pool.get().await?;
     PgDecisionProtocol.provision(&mut client, &exp, dl).await?;
     Ok(gate.repository_id())
+}
+
+pub struct SecurityGateCheckCtx<'a> {
+    pub tmp_dir: &'a Path,
+    pub pusher_dir: &'a Path,
+    pub fmt_str: &'a str,
+    pub off_addr: SocketAddr,
+    pub off_url: &'a str,
+    pub owner_user: &'a str,
+    pub repo_name: &'a str,
+    pub basic_hdr: &'a str,
+    pub ca_cfg: &'a str,
+    pub proxy_cfg: &'a str,
+    pub non_tip_c1: &'a str,
+    pub tip_c3: &'a str,
+    pub side_payload: &'a [u8],
+    pub offload: &'a GatewayPackfileOffload,
+}
+
+/// Exercises unadvertised `want` rejection, unsupported/unknown v2 arg native fallback,
+/// and whole-pack closure isolation on multi-ref shared packs over production `blob_git_gateway`.
+pub async fn verify_production_gateway_security_gates(
+    ctx: &SecurityGateCheckCtx<'_>,
+    git_fn: fn(&[&str], Option<&Path>, Option<&[u8]>) -> Result<Vec<u8>>,
+) -> Result<String> {
+    let http = reqwest::Client::new();
+    let up_url = format!("http://{}/git/{}/{}.git/git-upload-pack", ctx.off_addr, ctx.owner_user, ctx.repo_name);
+    let served_before = ctx.offload.pack_server().served_requests.load(std::sync::atomic::Ordering::SeqCst);
+
+    // A. Unadvertised `want` (ancestor `non_tip_c1`, not an advertised ref tip) -> UnadvertisedWant.
+    let mut unadv_wire = Vec::new();
+    push_pkt_line(&mut unadv_wire, b"command=fetch\n")?;
+    unadv_wire.extend_from_slice(b"0001");
+    push_pkt_line(&mut unadv_wire, b"packfile-uris https\n")?;
+    push_pkt_line(&mut unadv_wire, format!("want {}\n", ctx.non_tip_c1).as_bytes())?;
+    push_pkt_line(&mut unadv_wire, b"done\n")?;
+    unadv_wire.extend_from_slice(b"0000");
+    let unadv_resp = http
+        .post(&up_url)
+        .header("Authorization", ctx.basic_hdr)
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .header("Git-Protocol", "version=2")
+        .body(unadv_wire)
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    ensure!(ctx.offload.last_fallback_reason() == Some(FallbackReason::UnadvertisedWant));
+    ensure!(!String::from_utf8_lossy(&unadv_resp).contains("packfile-uris"));
+
+    // B. Stock `git clone --depth 1` (`deepen 1`) + unknown v2 arg -> UnsupportedFetchArgs native fallback.
+    let shallow_dir = ctx.tmp_dir.join(format!("clone_shallow_{}", ctx.fmt_str));
+    git_fn(
+        &[
+            "-c",
+            "protocol.version=2",
+            "-c",
+            "fetch.uriprotocols=https",
+            "-c",
+            ctx.ca_cfg,
+            "-c",
+            ctx.proxy_cfg,
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            "main",
+            ctx.off_url,
+            shallow_dir.to_str().unwrap(),
+        ],
+        Some(ctx.tmp_dir),
+        None,
+    )?;
+    git_fn(&["fsck", "--full", "--strict"], Some(&shallow_dir), None)?;
+    let cnt = String::from_utf8(git_fn(&["rev-list", "--count", "HEAD"], Some(&shallow_dir), None)?)?;
+    ensure!(cnt.trim() == "1", "shallow fallback clone expected depth 1, got {}", cnt.trim());
+    ensure!(ctx.offload.last_fallback_reason() == Some(FallbackReason::UnsupportedFetchArgs));
+
+    let mut unk_wire = Vec::new();
+    push_pkt_line(&mut unk_wire, b"command=fetch\n")?;
+    unk_wire.extend_from_slice(b"0001");
+    push_pkt_line(&mut unk_wire, b"packfile-uris https\n")?;
+    push_pkt_line(&mut unk_wire, b"unknown-v2-arg value\n")?;
+    push_pkt_line(&mut unk_wire, format!("want {}\n", ctx.tip_c3).as_bytes())?;
+    push_pkt_line(&mut unk_wire, b"done\n")?;
+    unk_wire.extend_from_slice(b"0000");
+    let unk_resp = http
+        .post(&up_url)
+        .header("Authorization", ctx.basic_hdr)
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .header("Git-Protocol", "version=2")
+        .body(unk_wire)
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    ensure!(!String::from_utf8_lossy(&unk_resp).contains("packfile-uris"));
+    ensure!(ctx.offload.pack_server().served_requests.load(std::sync::atomic::Ordering::SeqCst) == served_before);
+
+    // C. Atomic multi-ref push creates ONE shared `.pack` containing both `main` and `side-branch`;
+    //    `--single-branch --branch main` must NEVER offload that mixed `.pack` or leak `side_secret.bin`!
+    std::fs::write(ctx.pusher_dir.join("main_c4.txt"), b"main branch commit 4\n")?;
+    git_fn(&["add", "main_c4.txt"], Some(ctx.pusher_dir), None)?;
+    git_fn(&["commit", "-m", "main c4"], Some(ctx.pusher_dir), None)?;
+    let main_c4 = String::from_utf8(git_fn(&["rev-parse", "HEAD"], Some(ctx.pusher_dir), None)?)?.trim().to_owned();
+
+    git_fn(&["checkout", "--orphan", "side-branch"], Some(ctx.pusher_dir), None)?;
+    git_fn(&["rm", "-rf", "."], Some(ctx.pusher_dir), None)?;
+    std::fs::write(ctx.pusher_dir.join("side_secret.bin"), ctx.side_payload)?;
+    git_fn(&["add", "side_secret.bin"], Some(ctx.pusher_dir), None)?;
+    git_fn(&["commit", "-m", "side secret"], Some(ctx.pusher_dir), None)?;
+    let side_tip = String::from_utf8(git_fn(&["rev-parse", "HEAD"], Some(ctx.pusher_dir), None)?)?.trim().to_owned();
+    let side_blob = String::from_utf8(git_fn(&["rev-parse", "HEAD:side_secret.bin"], Some(ctx.pusher_dir), None)?)?
+        .trim()
+        .to_owned();
+
+    git_fn(
+        &["push", ctx.off_url, &format!("{main_c4}:refs/heads/main"), &format!("{side_tip}:refs/heads/side-branch")],
+        Some(ctx.pusher_dir),
+        None,
+    )?;
+
+    let mut inc_mixed = Vec::new();
+    push_pkt_line(&mut inc_mixed, b"command=fetch\n")?;
+    inc_mixed.extend_from_slice(b"0001");
+    push_pkt_line(&mut inc_mixed, b"packfile-uris https\n")?;
+    push_pkt_line(&mut inc_mixed, format!("want {main_c4}\n").as_bytes())?;
+    push_pkt_line(&mut inc_mixed, format!("have {}\n", ctx.tip_c3).as_bytes())?;
+    push_pkt_line(&mut inc_mixed, b"done\n")?;
+    inc_mixed.extend_from_slice(b"0000");
+    let mixed_resp = http
+        .post(&up_url)
+        .header("Authorization", ctx.basic_hdr)
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .header("Git-Protocol", "version=2")
+        .body(inc_mixed)
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    ensure!(ctx.offload.last_fallback_reason() == Some(FallbackReason::PackContainsUnauthorizedObjects));
+    ensure!(!String::from_utf8_lossy(&mixed_resp).contains("packfile-uris"));
+
+    let single_main = ctx.tmp_dir.join(format!("clone_single_main_{}", ctx.fmt_str));
+    git_fn(
+        &[
+            "-c",
+            "protocol.version=2",
+            "-c",
+            "fetch.uriprotocols=https",
+            "-c",
+            ctx.ca_cfg,
+            "-c",
+            ctx.proxy_cfg,
+            "clone",
+            "--single-branch",
+            "--branch",
+            "main",
+            ctx.off_url,
+            single_main.to_str().unwrap(),
+        ],
+        Some(ctx.tmp_dir),
+        None,
+    )?;
+    git_fn(&["fsck", "--full", "--strict"], Some(&single_main), None)?;
+    ensure!(single_main.join("main_c4.txt").is_file());
+    ensure!(
+        git_fn(&["cat-file", "-e", &side_blob], Some(&single_main), None).is_err(),
+        "mixed pack leaked unrequested side-branch blob {side_blob} into main single-branch clone"
+    );
+    Ok(main_c4)
 }

@@ -7,6 +7,7 @@ pub mod delivery;
 pub mod downloader;
 pub mod gateway_bridge;
 pub mod planner;
+pub mod preflight_guard;
 pub mod protocol_v2;
 pub mod retention;
 pub mod signing;
@@ -17,9 +18,12 @@ pub mod types;
 mod tests;
 #[cfg(test)]
 mod tests_audit;
+#[cfg(test)]
+mod tests_luna_gates;
 
 pub use cover_builder::{
-    MaterializedCoverBundle, RepoCoverBuildParams, build_residual_pack_bytes, build_verified_cover_proof_from_repo,
+    CoverBuildOutcome, HelperResourceLimits, MaterializedCoverBundle, RepoCoverBuildParams, build_residual_pack_bytes,
+    build_verified_cover_proof_from_repo, run_git_bounded,
 };
 pub use delivery::{
     PackHttpServerState, PackStreamMeta, ServePackRequest, SignedPackRouteQuery, build_signed_packfile_router,
@@ -32,8 +36,9 @@ pub use planner::{
     VerifiedPackCoverInput,
 };
 pub use protocol_v2::{
-    FetchV2Request, MAX_FETCH_HAVES, MAX_FETCH_WANTS, ParsedUriProtocolSet, decode_packfile_uris_section,
-    encode_fetch_v2_response, encode_fetch_v2_response_with_acks, fetch_capability_tokens, format_fetch_capability_line,
+    FetchV2Request, MAX_FETCH_HAVES, MAX_FETCH_WANTS, MAX_UNSUPPORTED_FETCH_ARGS, ParsedUriProtocolSet,
+    decode_packfile_uris_section, encode_fetch_v2_response, encode_fetch_v2_response_bounded,
+    encode_fetch_v2_response_with_acks, fetch_capability_tokens, format_fetch_capability_line,
     format_fetch_capability_line_for_policy, inject_packfile_uris_into_v2_advertisement, parse_fetch_v2_request,
     parse_uri_protocol_list, should_advertise_packfile_uris, strip_packfile_uris_from_v2_request,
 };
@@ -50,11 +55,13 @@ pub use ssrf_guard::{
     validate_policy_config,
 };
 pub use types::{
-    DEFAULT_MAX_ACTIVE_LEASES, DEFAULT_MAX_INFLIGHT_BYTES, DEFAULT_MAX_INFLIGHT_DOWNLOADS,
-    DEFAULT_MAX_RETRIES_PER_PACK, DEFAULT_MAX_URIS_PER_FETCH, DEFAULT_OFFLOAD_TTL_SECS, DEFAULT_RETENTION_GRACE_SECS,
-    DeliveryMode, DeliveryTelemetry, DownloadSubjectContext, FallbackReason, InflightBytesGuard, InflightBytesLimiter,
-    MAX_ACTIVE_LEASES_HARD_CAP, MAX_OFFLOAD_BYTES_HARD_CAP, MAX_OFFLOAD_TTL_SECS, MAX_RETENTION_GRACE_SECS,
-    MAX_URIS_PER_FETCH_CAP, MIN_OFFLOAD_TTL_SECS, OffloadPolicyConfig, PackObjectFormat, PackfileClosureMember,
-    PackfileUriError, SignedPackfileDescriptor, from_browse_format, to_browse_format, validate_catalog_pack_oid,
-    validate_hex_sha256, validate_pack_oid,
+    DEFAULT_MAX_ACTIVE_LEASES, DEFAULT_MAX_CONCURRENT_PREFLIGHTS, DEFAULT_MAX_INFLIGHT_BYTES,
+    DEFAULT_MAX_INFLIGHT_DOWNLOADS, DEFAULT_MAX_RETRIES_PER_PACK, DEFAULT_MAX_URIS_PER_FETCH,
+    DEFAULT_MAX_V2_RESPONSE_BYTES, DEFAULT_OFFLOAD_TTL_SECS, DEFAULT_RETENTION_GRACE_SECS, DeliveryMode,
+    DeliveryTelemetry, DownloadSubjectContext, FallbackReason, InflightBytesGuard, InflightBytesLimiter,
+    MAX_ACTIVE_LEASES_HARD_CAP, MAX_CONCURRENT_PREFLIGHTS_CAP, MAX_OFFLOAD_BYTES_HARD_CAP, MAX_OFFLOAD_TTL_SECS,
+    MAX_PACK_OBJECTS_PER_PACK, MAX_RETENTION_GRACE_SECS, MAX_SCANNED_PACK_FILES, MAX_URIS_PER_FETCH_CAP,
+    MIN_OFFLOAD_TTL_SECS, OffloadPolicyConfig, PackObjectFormat, PackfileClosureMember, PackfileUriError,
+    SignedPackfileDescriptor, from_browse_format, to_browse_format, validate_catalog_pack_oid, validate_hex_sha256,
+    validate_pack_oid,
 };

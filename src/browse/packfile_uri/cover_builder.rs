@@ -1,6 +1,6 @@
 //! Constructs real #184 `CoverHierarchyIndex`, `RetentionClassificationIndex`,
-//! `FetchPlan`, and unforgeable `VerifiedFetchPlanProof` from materialized
-//! repository `.pack`/`.idx` artifacts and Git commit ancestry.
+//! `FetchPlan`, and unforgeable `VerifiedFetchPlanProof` bound to authorized
+//! advertised refs and verified whole-pack object closures.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -28,14 +28,14 @@ use crate::{
     },
 };
 
-pub use super::cover_git::build_residual_pack_bytes;
+pub use super::cover_git::{HelperResourceLimits, build_residual_pack_bytes, run_git_bounded};
 use super::{
-    cover_git::{discover_repo_packs, internal_err, run_git, seal_synth_version},
+    cover_git::{discover_repo_packs, internal_err, seal_synth_version},
     planner::PackWireMeta,
-    types::{DownloadSubjectContext, PackObjectFormat, PackfileUriError},
+    types::{DownloadSubjectContext, FallbackReason, PackObjectFormat, PackfileUriError},
 };
 
-/// Verified `#184` artifacts and raw bytes assembled from a materialized bare Git view.
+/// Verified `#184` artifacts, whole-pack closure sets, and raw bytes from a materialized bare Git view.
 pub struct MaterializedCoverBundle {
     pub auth: AuthorizationContext,
     pub plan: FetchPlan,
@@ -45,14 +45,24 @@ pub struct MaterializedCoverBundle {
     pub wire_packs: HashMap<Uuid, PackWireMeta>,
     pub raw_pack_bytes: HashMap<String, Vec<u8>>,
     pub pack_defined_oids: HashMap<String, HashSet<String>>,
+    pub wanted_closure_oids: HashSet<String>,
+    pub rejected_unauthorized_pack: bool,
 }
 
-/// Inputs identifying the materialized bare repository and authority realm.
+/// Outcome of verifying advertised-ref `wants` and whole-pack closure over a bare Git view.
+pub enum CoverBuildOutcome {
+    Planned(Box<MaterializedCoverBundle>),
+    Fallback(FallbackReason),
+}
+
+/// Inputs identifying the materialized bare repository, authorized advertised refs, and resource limits.
 pub struct RepoCoverBuildParams<'a> {
     pub git_binary: &'a Path,
     pub repo_dir: &'a Path,
+    pub advertised_refs: &'a [(String, String)],
     pub wants: &'a [String],
     pub haves: &'a [String],
+    pub include_tag: bool,
     pub tenant_id: Uuid,
     pub repository_id: Uuid,
     pub history_incarnation: Uuid,
@@ -62,54 +72,133 @@ pub struct RepoCoverBuildParams<'a> {
     pub subject: DownloadSubjectContext,
     pub provider: &'a str,
     pub backend_identity_hex: &'a str,
+    pub limits: HelperResourceLimits,
 }
 
-/// Builds and verifies a `#184` [`VerifiedFetchPlanProof`] over a materialized bare Git view.
-pub fn build_verified_cover_proof_from_repo(
+async fn collect_bounded_object_closure(
+    git_bin: &Path,
+    repo_dir: &Path,
+    roots: &[String],
+    limits: &HelperResourceLimits,
+) -> Result<HashSet<String>, PackfileUriError> {
+    let mut stdin_buf = String::new();
+    for r in roots {
+        stdin_buf.push_str(r);
+        stdin_buf.push('\n');
+    }
+    let raw = run_git_bounded(
+        git_bin,
+        repo_dir,
+        &["rev-list", "--objects", "--stdin"],
+        Some(stdin_buf.as_bytes()),
+        limits.max_stdout_bytes,
+        limits.timeout,
+    )
+    .await?;
+    let mut set = HashSet::new();
+    for line in String::from_utf8_lossy(&raw).lines() {
+        let Some(oid) = line.split_whitespace().next() else { continue };
+        set.insert(oid.to_owned());
+        if set.len() > limits.max_closure_objects {
+            return Err(PackfileUriError::CapacityExceeded("reachable object closure exceeds bound".to_owned()));
+        }
+    }
+    Ok(set)
+}
+
+/// Builds and verifies a `#184` [`VerifiedFetchPlanProof`] bound strictly to `advertised_refs`.
+pub async fn build_verified_cover_proof_from_repo(
     params: &RepoCoverBuildParams<'_>,
-) -> Result<Option<MaterializedCoverBundle>, PackfileUriError> {
+) -> Result<CoverBuildOutcome, PackfileUriError> {
     params.subject.validate()?;
+    if params.advertised_refs.is_empty() || params.wants.is_empty() {
+        return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
+    }
     let pack_fmt = match params.object_format {
         GitObjectFormat::Sha1 => PackObjectFormat::Sha1,
         GitObjectFormat::Sha256 => PackObjectFormat::Sha256,
     };
-    let mut want_commit_hexes = Vec::new();
-    for w in params.wants {
-        let Ok(raw) =
-            run_git(params.git_binary, params.repo_dir, &["rev-parse", "--verify", &format!("{w}^{{commit}}")], None)
-        else {
-            return Ok(None);
+
+    let mut adv_oid_to_ref: BTreeMap<String, RefName> = BTreeMap::new();
+    let mut adv_root_oids: Vec<String> = Vec::new();
+    for (ref_str, oid_hex) in params.advertised_refs {
+        let Ok(rname) = RefName::new(ref_str.clone()) else {
+            return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
         };
-        let hex_c = String::from_utf8_lossy(&raw).trim().to_owned();
-        if !want_commit_hexes.contains(&hex_c) {
-            want_commit_hexes.push(hex_c);
+        if GitOid::parse(params.object_format, oid_hex).is_err() {
+            return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
+        }
+        if !adv_oid_to_ref.contains_key(oid_hex) {
+            adv_oid_to_ref.insert(oid_hex.clone(), rname);
+            adv_root_oids.push(oid_hex.clone());
         }
     }
-    if want_commit_hexes.is_empty() {
-        return Ok(None);
+
+    if params.include_tag
+        && params
+            .advertised_refs
+            .iter()
+            .any(|(r, oid)| r.starts_with("refs/tags/") && !params.wants.iter().any(|w| w == oid))
+    {
+        return Ok(CoverBuildOutcome::Fallback(FallbackReason::UnsupportedFetchArgs));
     }
+
+    let mut want_commit_hexes = Vec::new();
+    for w in params.wants {
+        if !adv_oid_to_ref.contains_key(w) {
+            return Ok(CoverBuildOutcome::Fallback(FallbackReason::UnadvertisedWant));
+        }
+        let Ok(kind_raw) =
+            run_git_bounded(params.git_binary, params.repo_dir, &["cat-file", "-t", w], None, 64, params.limits.timeout)
+                .await
+        else {
+            return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
+        };
+        if String::from_utf8_lossy(&kind_raw).trim() != "commit" {
+            return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
+        }
+        if !want_commit_hexes.contains(w) {
+            want_commit_hexes.push(w.clone());
+        }
+    }
+
+    let advertised_closure_oids =
+        collect_bounded_object_closure(params.git_binary, params.repo_dir, &adv_root_oids, &params.limits).await?;
+    let wanted_closure_oids =
+        collect_bounded_object_closure(params.git_binary, params.repo_dir, &want_commit_hexes, &params.limits).await?;
+    if wanted_closure_oids.is_empty() || !wanted_closure_oids.is_subset(&advertised_closure_oids) {
+        return Ok(CoverBuildOutcome::Fallback(FallbackReason::UnadvertisedWant));
+    }
+
     let mut rev_in = String::new();
     for wc in &want_commit_hexes {
         rev_in.push_str(wc);
         rev_in.push('\n');
     }
-    let rev_raw = run_git(
+    let rev_raw = run_git_bounded(
         params.git_binary,
         params.repo_dir,
         &["rev-list", "--topo-order", "--reverse", "--parents", "--stdin"],
         Some(rev_in.as_bytes()),
-    )?;
+        params.limits.max_stdout_bytes,
+        params.limits.timeout,
+    )
+    .await?;
     let mut ordered_commits = Vec::new();
     let mut commit_parents: HashMap<String, Vec<String>> = HashMap::new();
     for line in String::from_utf8_lossy(&rev_raw).lines() {
         let mut parts = line.split_whitespace();
         let Some(c) = parts.next() else { continue };
         ordered_commits.push(c.to_owned());
+        if ordered_commits.len() > params.limits.max_closure_commits {
+            return Err(PackfileUriError::CapacityExceeded("commit closure exceeds bound".to_owned()));
+        }
         commit_parents.insert(c.to_owned(), parts.map(str::to_owned).collect());
     }
-    let mut packs = discover_repo_packs(params.git_binary, params.repo_dir, pack_fmt)?;
+
+    let mut packs = discover_repo_packs(params.git_binary, params.repo_dir, pack_fmt, &params.limits).await?;
     if ordered_commits.is_empty() || packs.is_empty() {
-        return Ok(None);
+        return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
     }
     let pos_map: HashMap<&str, usize> = ordered_commits.iter().enumerate().map(|(i, c)| (c.as_str(), i)).collect();
     packs.sort_by_key(|p| p.commits.iter().filter_map(|c| pos_map.get(c.as_str()).copied()).min().unwrap_or(usize::MAX));
@@ -142,6 +231,7 @@ pub fn build_verified_cover_proof_from_repo(
     let mut assigned: HashSet<String> = HashSet::new();
     let mut prev_ver: Option<VersionRecord> = None;
     let mut all_cover_ids: Vec<Uuid> = Vec::new();
+    let mut rejected_unauthorized_pack = false;
     let mut seq = 0i64;
 
     for dp in packs {
@@ -193,7 +283,7 @@ pub fn build_verified_cover_proof_from_repo(
             params.provider,
             params.backend_identity_hex,
             pack_loc.length() + idx_loc.length(),
-            2,
+            dp.object_count as u64,
         )
         .map_err(internal_err)?;
 
@@ -216,6 +306,15 @@ pub fn build_verified_cover_proof_from_repo(
                 .map(|p| GitOid::parse(params.object_format, p).map_err(internal_err))
                 .collect::<Result<Vec<_>, _>>()?;
             links.push(CoverCommitLink { commit_oid: coid, parent_oids: p_oids, version_id: vid, authority_seq: seq });
+        }
+        let whole_pack_in_authorized_wants = dp.object_count > 0
+            && dp.defined_oids.len() == dp.object_count
+            && dp
+                .defined_oids
+                .iter()
+                .all(|oid| wanted_closure_oids.contains(oid) && advertised_closure_oids.contains(oid));
+        if !whole_pack_in_authorized_wants {
+            rejected_unauthorized_pack = true;
         }
         let delta_bases = if dp.is_standalone { Vec::new() } else { all_cover_ids.clone() };
         let cover_id = Uuid::new_v4();
@@ -245,14 +344,16 @@ pub fn build_verified_cover_proof_from_repo(
         .map_err(internal_err)?;
         cover_index.register_leaf_cover(cov, mem).map_err(internal_err)?;
         retention.set_physical_status(pse.pack_id(), PhysicalBlobStatus::Present);
-        if dp.is_standalone {
+        if dp.is_standalone && whole_pack_in_authorized_wants {
             wire_packs.insert(
                 pse.pack_id(),
                 PackWireMeta {
                     pack_oid: dp.pack_oid.clone(),
-                    pack_hash_hex: dp.pack_hash_hex.clone(),
+                    pack_hash_hex: dp.pack_hash_hex,
                     sha256_hex: dp.pack_sha256_hex,
                     byte_len: dp.pack_bytes.len() as u64,
+                    object_count: dp.object_count,
+                    all_objects_authorized: true,
                     cache_warm: true,
                 },
             );
@@ -263,28 +364,37 @@ pub fn build_verified_cover_proof_from_repo(
         prev_ver = Some(ver);
     }
 
-    let Some(tip_ver) = prev_ver else { return Ok(None) };
+    let Some(tip_ver) = prev_ver else {
+        return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
+    };
     if assigned.len() != ordered_commits.len() {
-        return Ok(None);
+        return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
     }
     let mut heads = BTreeMap::new();
     heads.insert(synth_ref.clone(), RefHead::from_committed(&tip_ver).map_err(internal_err)?);
     retention.add_hold(CoverRetentionHold::ActiveRefHead {
-        ref_name: synth_ref,
+        ref_name: synth_ref.clone(),
         version_id: tip_ver.version_id(),
         cover_ids: all_cover_ids,
     });
 
     let mut want_targets = Vec::with_capacity(want_commit_hexes.len());
-    for (idx, wc) in want_commit_hexes.iter().enumerate() {
+    for wc in &want_commit_hexes {
         let w_oid = GitOid::parse(params.object_format, wc).map_err(internal_err)?;
-        let Some(&owner_vid) = commit_ver_map.get(wc) else { return Ok(None) };
+        let Some(&owner_vid) = commit_ver_map.get(wc) else {
+            return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
+        };
+        let Some(real_ref) = adv_oid_to_ref.get(wc).cloned() else {
+            return Ok(CoverBuildOutcome::Fallback(FallbackReason::UnadvertisedWant));
+        };
+        if real_ref == synth_ref {
+            return Ok(CoverBuildOutcome::Fallback(FallbackReason::UnadvertisedWant));
+        }
         seq += 1;
-        let w_ref = RefName::new(format!("refs/heads/__packfile_uri_want_{idx}")).map_err(internal_err)?;
-        let w_ver = seal_synth_version(&realm, &w_ref, seq, None, vec![owner_vid], w_oid, &[])?;
+        let w_ver = seal_synth_version(&realm, &real_ref, seq, None, vec![owner_vid], w_oid, &[])?;
         graph.insert_active(CausalVersionNode { record: w_ver.clone(), own_packs: Vec::new() });
-        heads.insert(w_ref.clone(), RefHead::from_committed(&w_ver).map_err(internal_err)?);
-        want_targets.push(WantTarget::Ref { ref_name: w_ref });
+        heads.insert(real_ref.clone(), RefHead::from_committed(&w_ver).map_err(internal_err)?);
+        want_targets.push(WantTarget::Ref { ref_name: real_ref });
     }
 
     let cut = StrongSnapshotCut {
@@ -306,7 +416,7 @@ pub fn build_verified_cover_proof_from_repo(
     plan_req.haves = HaveSpec { have_oids, have_version_ids: Vec::new() };
 
     let Ok(FetchPlanOutcome::Planned(plan_box)) = plan_fetch_covers(&plan_req, &graph, &cover_index, &retention) else {
-        return Ok(None);
+        return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
     };
     let Ok(proof) = verify_fetch_plan_closure(
         &plan_box,
@@ -317,9 +427,9 @@ pub fn build_verified_cover_proof_from_repo(
         &cover_index,
         &retention,
     ) else {
-        return Ok(None);
+        return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
     };
-    Ok(Some(MaterializedCoverBundle {
+    Ok(CoverBuildOutcome::Planned(Box::new(MaterializedCoverBundle {
         auth,
         plan: *plan_box,
         proof,
@@ -328,5 +438,7 @@ pub fn build_verified_cover_proof_from_repo(
         wire_packs,
         raw_pack_bytes,
         pack_defined_oids,
-    }))
+        wanted_closure_oids,
+        rejected_unauthorized_pack,
+    })))
 }

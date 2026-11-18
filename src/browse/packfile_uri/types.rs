@@ -36,6 +36,28 @@ pub const MAX_RETRIES_HARD_CAP: usize = 3;
 pub const MAX_OFFLOAD_BYTES_HARD_CAP: u64 = 8 * 1024 * 1024 * 1024;
 pub const MIN_DEADLINE_MS: u64 = 100;
 pub const MAX_DEADLINE_MS: u64 = 600_000;
+pub const DEFAULT_MAX_CONCURRENT_PREFLIGHTS: usize = 16;
+pub const MAX_CONCURRENT_PREFLIGHTS_CAP: usize = 256;
+pub const DEFAULT_MAX_V2_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_SCANNED_PACK_FILES: usize = 64;
+pub const MAX_SINGLE_IDX_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_SINGLE_PACK_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_TOTAL_SCANNED_PACK_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_PACK_OBJECTS_PER_PACK: usize = 100_000;
+pub const MAX_CLOSURE_COMMITS: usize = 16_384;
+pub const MAX_CLOSURE_OBJECTS: usize = 200_000;
+pub const MAX_HELPER_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_HELPER_STDERR_BYTES: u64 = 64 * 1024;
+pub const MAX_HELPER_STDIN_BYTES: usize = 512 * 1024;
+pub const DEFAULT_HELPER_TIMEOUT_MS: u64 = 10_000;
+
+const fn default_max_concurrent_preflights() -> usize {
+    DEFAULT_MAX_CONCURRENT_PREFLIGHTS
+}
+
+const fn default_max_v2_response_bytes() -> u64 {
+    DEFAULT_MAX_V2_RESPONSE_BYTES
+}
 
 /// Converts [`ObjectFormat`] into canonical [`PackObjectFormat`].
 pub fn from_browse_format(format: ObjectFormat) -> PackObjectFormat {
@@ -139,6 +161,10 @@ pub struct OffloadPolicyConfig {
     pub max_inflight_downloads: usize,
     pub max_inflight_bytes: u64,
     pub max_active_leases: usize,
+    #[serde(default = "default_max_concurrent_preflights")]
+    pub max_concurrent_preflights: usize,
+    #[serde(default = "default_max_v2_response_bytes")]
+    pub max_v2_response_bytes: u64,
     pub max_retries_per_pack: usize,
     pub request_deadline_ms: u64,
     pub min_pack_bytes_for_offload: u64,
@@ -170,6 +196,8 @@ impl OffloadPolicyConfig {
             max_inflight_downloads: DEFAULT_MAX_INFLIGHT_DOWNLOADS,
             max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
             max_active_leases: DEFAULT_MAX_ACTIVE_LEASES,
+            max_concurrent_preflights: DEFAULT_MAX_CONCURRENT_PREFLIGHTS,
+            max_v2_response_bytes: DEFAULT_MAX_V2_RESPONSE_BYTES,
             max_retries_per_pack: DEFAULT_MAX_RETRIES_PER_PACK,
             request_deadline_ms: 30_000,
             min_pack_bytes_for_offload: 4 * 1024,
@@ -194,6 +222,8 @@ impl OffloadPolicyConfig {
             max_inflight_downloads: DEFAULT_MAX_INFLIGHT_DOWNLOADS,
             max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
             max_active_leases: DEFAULT_MAX_ACTIVE_LEASES,
+            max_concurrent_preflights: DEFAULT_MAX_CONCURRENT_PREFLIGHTS,
+            max_v2_response_bytes: DEFAULT_MAX_V2_RESPONSE_BYTES,
             max_retries_per_pack: DEFAULT_MAX_RETRIES_PER_PACK,
             request_deadline_ms: 30_000,
             min_pack_bytes_for_offload: 4 * 1024,
@@ -371,6 +401,10 @@ pub enum FallbackReason {
     FeatureDisabled,
     ClientOmittedPackfileUris,
     ClientUnsupportedProtocols,
+    UnsupportedFetchArgs,
+    UnadvertisedWant,
+    PackContainsUnauthorizedObjects,
+    ResourceBoundsExceeded,
     BelowOffloadThreshold,
     CdnBreakerOpen,
     CdnUnhealthy,

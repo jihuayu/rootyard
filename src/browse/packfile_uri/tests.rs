@@ -200,6 +200,8 @@ pub(super) fn build_verified_fixture(
                 pack_hash_hex: pack_hash.to_owned(),
                 sha256_hex: sha256.to_owned(),
                 byte_len,
+                object_count: 2,
+                all_objects_authorized: true,
                 cache_warm: true,
             },
         );
@@ -411,6 +413,7 @@ async fn planner_verifies_184_proof_retention_states_and_rollback_bounds() {
         wire_packs: &fx.wire_packs,
         residual_inline_bytes: 128,
         full_fallback_inline_bytes: 8_352,
+        rejected_unauthorized_pack: false,
     };
     let base_req = DeliveryPlanRequest {
         tenant_id: tenant,

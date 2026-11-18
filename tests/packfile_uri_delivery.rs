@@ -17,7 +17,10 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use axum::body::Bytes;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use gateway_env::{IsolatedPgDb, LoopbackS3, create_and_provision_repo, issue_owner_actor, spawn_gateway};
+use gateway_env::{
+    IsolatedPgDb, LoopbackS3, SecurityGateCheckCtx, create_and_provision_repo, issue_owner_actor, spawn_gateway,
+    verify_production_gateway_security_gates,
+};
 use harness::{
     build_ephemeral_tls_cert, git_cmd, now_unix, reserve_loopback_listener, resolve_git_binary, shared_keyring,
     spawn_tls_axum_cdn_server,
@@ -139,6 +142,7 @@ async fn run_production_gateway_matrix(db: &IsolatedPgDb) -> Result<()> {
         std::fs::write(pusher.join("base.bin"), &base_payload)?;
         git_cmd(&["add", "base.bin"], Some(&pusher), None)?;
         git_cmd(&["commit", "-m", "base pack"], Some(&pusher), None)?;
+        let non_tip_c1 = String::from_utf8(git_cmd(&["rev-parse", "HEAD"], Some(&pusher), None)?)?.trim().to_owned();
         git_cmd(&["push", &def_url, "HEAD:refs/heads/main"], Some(&pusher), None)?;
 
         std::fs::write(pusher.join("delta.txt"), b"small residual delta\n")?;
@@ -281,12 +285,35 @@ async fn run_production_gateway_matrix(db: &IsolatedPgDb) -> Result<()> {
         ensure!(offload.last_fallback_reason() == Some(FallbackReason::CdnUnhealthy));
         offload.set_cdn_health(CdnHealthState::Healthy);
 
-        // 5. Live PostgreSQL token revocation denies still-unexpired signed offload URL immediately.
+        // 5. Advertised-ref `wants`, unsupported/unknown v2 args, & whole-pack multi-ref closure gates.
+        let side_payload = incompressible_bytes(0x9753_1eca, 18_432);
+        let tip_c4 = verify_production_gateway_security_gates(
+            &SecurityGateCheckCtx {
+                tmp_dir: tmp.path(),
+                pusher_dir: &pusher,
+                fmt_str: fmt.as_str(),
+                off_addr,
+                off_url: &off_url,
+                owner_user: &owner.username,
+                repo_name: &repo_name,
+                basic_hdr: &basic_hdr,
+                ca_cfg: &ca_cfg,
+                proxy_cfg: &proxy_cfg,
+                non_tip_c1: &non_tip_c1,
+                tip_c3: &tip_c3,
+                side_payload: &side_payload,
+                offload: &offload,
+            },
+            git_cmd,
+        )
+        .await?;
+
+        // 6. Live PostgreSQL token revocation denies still-unexpired signed offload URL immediately.
         let mut v2_wire = Vec::new();
         push_pkt_line(&mut v2_wire, b"command=fetch")?;
         v2_wire.extend_from_slice(b"0001");
         push_pkt_line(&mut v2_wire, b"packfile-uris https")?;
-        push_pkt_line(&mut v2_wire, format!("want {tip_c3}\n").as_bytes())?;
+        push_pkt_line(&mut v2_wire, format!("want {tip_c4}\n").as_bytes())?;
         push_pkt_line(&mut v2_wire, b"done\n")?;
         v2_wire.extend_from_slice(b"0000");
         let fetch_resp = http_client

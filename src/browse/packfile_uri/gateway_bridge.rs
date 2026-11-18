@@ -1,9 +1,10 @@
 //! Production Smart-HTTP v2 `packfile-uris` runtime bridge connecting
-//! `crate::blob_git_gateway` to `#184` `VerifiedFetchPlanProof` planning,
-//! live PostgreSQL/RBAC re-authorization, and signed Axum packfile serving.
+//! `crate::blob_git_gateway` to advertised-ref `wants` & whole-pack closure
+//! verification, native fallback on unknown v2 args, bounded helpers, and
+//! cancellation-safe RAII preflight/pin guards.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::Path,
     sync::{
         Arc, Mutex, RwLock,
@@ -15,16 +16,19 @@ use std::{
 use bytes::Bytes;
 use uuid::Uuid;
 
-use crate::{cache_wake::replica_cache::lease_pin::AuthTask, ref_store::GitObjectFormat};
+use crate::ref_store::GitObjectFormat;
 
+pub use super::preflight_guard::LiveRevalidatorFn;
 use super::{
-    cover_builder::{RepoCoverBuildParams, build_residual_pack_bytes, build_verified_cover_proof_from_repo},
+    cover_builder::{
+        CoverBuildOutcome, HelperResourceLimits, RepoCoverBuildParams, build_residual_pack_bytes,
+        build_verified_cover_proof_from_repo,
+    },
     delivery::{PackHttpServerState, PackStreamMeta},
     planner::{CdnCircuitBreaker, CdnHealthState, DeliveryPlanRequest, DeliveryPlanner, VerifiedPackCoverInput},
-    protocol_v2::{
-        encode_fetch_v2_response_with_acks, parse_fetch_v2_request, should_advertise_packfile_uris,
-    },
-    retention::{OffloadPackPinGuard, PackDeliveryLeaseRegistry},
+    preflight_guard::{GatewayLiveAuthorizer, RegisteredPinAuth, StagedPinBatchGuard},
+    protocol_v2::{encode_fetch_v2_response_bounded, parse_fetch_v2_request, should_advertise_packfile_uris},
+    retention::PackDeliveryLeaseRegistry,
     signing::{LivePackReadAuthorizer, PackUriKeyring},
     ssrf_guard::PackUriDnsResolver,
     types::{
@@ -32,73 +36,11 @@ use super::{
     },
 };
 
-/// Async callback re-running live gateway authority (`ReadAuthorization::revalidate`).
-pub type LiveRevalidatorFn = Arc<dyn Fn() -> AuthTask<'static, Result<(), PackfileUriError>> + Send + Sync>;
-
-struct RegisteredPinAuth {
-    tenant_id: Uuid,
-    repository_id: Uuid,
-    subject: DownloadSubjectContext,
-    expires_at_unix: u64,
-    revalidate: LiveRevalidatorFn,
-    _pin_guard: Arc<OffloadPackPinGuard>,
-}
-
-struct GatewayLiveAuthorizer {
-    pins: Mutex<HashMap<Uuid, RegisteredPinAuth>>,
-    preflight: Mutex<HashMap<(Uuid, Uuid, DownloadSubjectContext), LiveRevalidatorFn>>,
-    clock_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
-}
-
-impl GatewayLiveAuthorizer {
-    fn sweep(&self, now_unix: u64) {
-        let mut guard = self.pins.lock().unwrap_or_else(|p| p.into_inner());
-        guard.retain(|_, v| now_unix <= v.expires_at_unix);
-    }
-}
-
-impl LivePackReadAuthorizer for GatewayLiveAuthorizer {
-    fn authorize_pack_download<'a>(
-        &'a self,
-        tenant_id: Uuid,
-        repository_id: Uuid,
-        subject: &'a DownloadSubjectContext,
-        _pack_oid: &'a str,
-        pin_id: Uuid,
-    ) -> AuthTask<'a, Result<(), PackfileUriError>> {
-        if let Err(e) = subject.validate() {
-            return Box::pin(async move { Err(e) });
-        }
-        if tenant_id.is_nil() || repository_id.is_nil() {
-            return Box::pin(async { Err(PackfileUriError::Unauthorized) });
-        }
-        let cb = if pin_id.is_nil() {
-            let guard = self.preflight.lock().unwrap_or_else(|p| p.into_inner());
-            guard.get(&(tenant_id, repository_id, *subject)).cloned()
-        } else {
-            let now = (self.clock_unix)();
-            let guard = self.pins.lock().unwrap_or_else(|p| p.into_inner());
-            guard
-                .get(&pin_id)
-                .filter(|rec| {
-                    rec.tenant_id == tenant_id
-                        && rec.repository_id == repository_id
-                        && rec.subject == *subject
-                        && now <= rec.expires_at_unix
-                })
-                .map(|rec| Arc::clone(&rec.revalidate))
-        };
-        let Some(revalidator) = cb else {
-            return Box::pin(async { Err(PackfileUriError::Unauthorized) });
-        };
-        Box::pin(async move { (revalidator)().await })
-    }
-}
-
 /// Request inputs passed from `blob_git_gateway::smart_http::upload_pack`.
 pub struct GatewayFetchBridgeInput<'a> {
     pub git_binary: &'a Path,
     pub repo_dir: &'a Path,
+    pub advertised_refs: &'a [(String, String)],
     pub object_format: GitObjectFormat,
     pub request_bytes: &'a [u8],
     pub tenant_id: Uuid,
@@ -109,6 +51,8 @@ pub struct GatewayFetchBridgeInput<'a> {
     pub subject: DownloadSubjectContext,
     pub provider: &'a str,
     pub backend_identity_hex: &'a str,
+    pub request_timeout: Duration,
+    pub max_response_bytes: u64,
     pub live_revalidator: LiveRevalidatorFn,
 }
 
@@ -138,11 +82,7 @@ impl GatewayPackfileOffload {
                 .as_secs()
         });
         let leases = PackDeliveryLeaseRegistry::with_max_leases(Default::default(), policy.max_active_leases);
-        let live_auth = Arc::new(GatewayLiveAuthorizer {
-            pins: Mutex::new(HashMap::new()),
-            preflight: Mutex::new(HashMap::new()),
-            clock_unix: Arc::clone(&clock),
-        });
+        let live_auth = Arc::new(GatewayLiveAuthorizer::new(policy.max_concurrent_preflights, Arc::clone(&clock)));
         let auth_dyn: Arc<dyn LivePackReadAuthorizer> = live_auth.clone();
         let pack_server = Arc::new(PackHttpServerState::new(
             Arc::clone(&keyring),
@@ -194,13 +134,25 @@ impl GatewayPackfileOffload {
         *self.last_fallback.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    pub fn active_preflight_count(&self) -> usize {
+        self.live_auth.active_preflight_count()
+    }
+
+    pub fn available_preflight_permits(&self) -> usize {
+        self.live_auth.available_preflight_permits()
+    }
+
+    pub fn preflight_saturation_fallbacks(&self) -> u64 {
+        self.live_auth.preflight_rejections.load(Ordering::Relaxed)
+    }
+
     fn record_fallback(&self, reason: FallbackReason) {
         self.inline_fallback_responses.fetch_add(1, Ordering::Relaxed);
         *self.last_fallback.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason);
     }
 
     /// Evaluates a Protocol v2 upload-pack request; returns `Ok(Some(body))` for offload+residual
-    /// or `Ok(None)` when `ls-refs`/negotiation/inline-fallback should run native `git upload-pack`.
+    /// or `Ok(None)` when `ls-refs`, negotiation, unsupported v2 args, or fallback should run native `upload-pack`.
     pub async fn try_serve_upload_pack_v2(
         &self,
         input: GatewayFetchBridgeInput<'_>,
@@ -217,6 +169,10 @@ impl GatewayPackfileOffload {
             GitObjectFormat::Sha256 => PackObjectFormat::Sha256,
         };
         let fetch_req = parse_fetch_v2_request(input.request_bytes, pack_fmt)?;
+        if fetch_req.has_unsupported_args() {
+            self.record_fallback(FallbackReason::UnsupportedFetchArgs);
+            return Ok(None);
+        }
         if fetch_req.wants.is_empty() || (!fetch_req.done && (fetch_req.haves.is_empty() || fetch_req.wait_for_done)) {
             return Ok(None);
         }
@@ -234,11 +190,27 @@ impl GatewayPackfileOffload {
             return Ok(None);
         }
 
-        let Some(bundle) = build_verified_cover_proof_from_repo(&RepoCoverBuildParams {
+        let now_unix = (self.pack_server.clock_unix)();
+        let preflight_exp = now_unix.saturating_add(policy.ttl_secs.max(30));
+        let Ok(preflight_guard) = self.live_auth.begin_preflight(
+            input.tenant_id,
+            input.repository_id,
+            input.subject,
+            preflight_exp,
+            Arc::clone(&input.live_revalidator),
+        ) else {
+            self.record_fallback(FallbackReason::OverloadedOrQueueSaturated);
+            return Ok(None);
+        };
+
+        let limits = HelperResourceLimits::for_gateway(&policy, input.request_timeout, input.max_response_bytes);
+        let bundle = match build_verified_cover_proof_from_repo(&RepoCoverBuildParams {
             git_binary: input.git_binary,
             repo_dir: input.repo_dir,
+            advertised_refs: input.advertised_refs,
             wants: &fetch_req.wants,
             haves: &fetch_req.haves,
+            include_tag: fetch_req.include_tag,
             tenant_id: input.tenant_id,
             repository_id: input.repository_id,
             history_incarnation: input.history_incarnation,
@@ -248,10 +220,20 @@ impl GatewayPackfileOffload {
             subject: input.subject,
             provider: input.provider,
             backend_identity_hex: input.backend_identity_hex,
-        })?
-        else {
-            self.record_fallback(FallbackReason::IncompleteClosure);
-            return Ok(None);
+            limits,
+        })
+        .await
+        {
+            Ok(CoverBuildOutcome::Planned(b)) => b,
+            Ok(CoverBuildOutcome::Fallback(reason)) => {
+                self.record_fallback(reason);
+                return Ok(None);
+            }
+            Err(PackfileUriError::CapacityExceeded(_) | PackfileUriError::Timeout(_)) => {
+                self.record_fallback(FallbackReason::ResourceBoundsExceeded);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
         };
 
         let acked_haves: Vec<String> = if fetch_req.done {
@@ -272,15 +254,6 @@ impl GatewayPackfileOffload {
             bundle.plan.verified_have_commits.iter().copied().map(crate::ref_store::GitOid::as_hex).collect()
         };
 
-        let now_unix = (self.pack_server.clock_unix)();
-        self.live_auth.sweep(now_unix);
-        let pf_key = (input.tenant_id, input.repository_id, input.subject);
-        self.live_auth
-            .preflight
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(pf_key, Arc::clone(&input.live_revalidator));
-
         let cover_in = VerifiedPackCoverInput {
             auth: &bundle.auth,
             plan: &bundle.plan,
@@ -290,9 +263,10 @@ impl GatewayPackfileOffload {
             wire_packs: &bundle.wire_packs,
             residual_inline_bytes: 0,
             full_fallback_inline_bytes: bundle.plan.total_selected_bytes,
+            rejected_unauthorized_pack: bundle.rejected_unauthorized_pack,
         };
         let cdn_health = *self.cdn_health.read().unwrap_or_else(|p| p.into_inner());
-        let planned_res = self
+        let planned = self
             .planner
             .plan_fetch(
                 self.live_auth.as_ref(),
@@ -311,30 +285,37 @@ impl GatewayPackfileOffload {
                     active_queue_saturated: false,
                 },
             )
-            .await;
-        self.live_auth
-            .preflight
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&pf_key);
-        let planned = planned_res?;
+            .await?;
+        drop(preflight_guard);
 
-        let DeliveryMode::OffloadPlusResidual { ref offloaded, ref lease_pins, .. } = planned.mode else {
+        let DeliveryMode::OffloadPlusResidual { offloaded, residual_inline_bytes, residual_objects, lease_pins } =
+            planned.mode
+        else {
             if let DeliveryMode::InlineFallback { reason, .. } = planned.mode {
                 self.record_fallback(reason);
             }
             return Ok(None);
         };
 
+        let mut staged = StagedPinBatchGuard::new(
+            lease_pins,
+            self.planner.leases().clone(),
+            Arc::clone(&self.live_auth),
+            now_unix,
+        );
         let mut offloaded_oids: HashSet<String> = HashSet::new();
-        for desc in offloaded {
-            let Some(raw) = bundle.raw_pack_bytes.get(&desc.pack_oid) else {
+        for desc in &offloaded {
+            let (Some(raw), Some(oids)) =
+                (bundle.raw_pack_bytes.get(&desc.pack_oid), bundle.pack_defined_oids.get(&desc.pack_oid))
+            else {
                 self.record_fallback(FallbackReason::IncompleteClosure);
                 return Ok(None);
             };
-            if let Some(oids) = bundle.pack_defined_oids.get(&desc.pack_oid) {
-                offloaded_oids.extend(oids.iter().cloned());
+            if oids.is_empty() || !oids.iter().all(|oid| bundle.wanted_closure_oids.contains(oid)) {
+                self.record_fallback(FallbackReason::PackContainsUnauthorizedObjects);
+                return Ok(None);
             }
+            offloaded_oids.extend(oids.iter().cloned());
             self.pack_server.insert_pack(PackStreamMeta {
                 tenant_id: input.tenant_id,
                 repository_id: input.repository_id,
@@ -346,28 +327,57 @@ impl GatewayPackfileOffload {
             })?;
         }
 
-        let residual_pack = build_residual_pack_bytes(
+        let residual_pack = match build_residual_pack_bytes(
             input.git_binary,
             input.repo_dir,
             &fetch_req.wants,
             &fetch_req.haves,
             &offloaded_oids,
-        )?;
-        let encoded = encode_fetch_v2_response_with_acks(&policy, &planned.mode, &acked_haves, &residual_pack, true)?;
-        for (desc, pin_guard) in offloaded.iter().zip(lease_pins.iter()) {
-            self.live_auth.pins.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            &bundle.wanted_closure_oids,
+            &limits,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(PackfileUriError::CapacityExceeded(_) | PackfileUriError::Timeout(_)) => {
+                self.record_fallback(FallbackReason::ResourceBoundsExceeded);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let grace = policy.retention_grace_secs;
+        for (desc, pin_guard) in offloaded.iter().zip(staged.pins().iter()) {
+            staged.stage_registered_pin(
                 desc.pin_id,
                 RegisteredPinAuth {
                     tenant_id: input.tenant_id,
                     repository_id: input.repository_id,
-                    subject: desc.subject,
-                    expires_at_unix: desc.expires_at_unix.saturating_add(policy.retention_grace_secs),
+                    subject: input.subject,
+                    expires_at_unix: desc.expires_at_unix.saturating_add(grace),
                     revalidate: Arc::clone(&input.live_revalidator),
                     _pin_guard: Arc::clone(pin_guard),
                 },
             );
         }
+
+        let mode_ref = DeliveryMode::OffloadPlusResidual {
+            offloaded,
+            residual_inline_bytes,
+            residual_objects,
+            lease_pins: staged.pins().to_vec(),
+        };
+        let body = encode_fetch_v2_response_bounded(
+            &policy,
+            &mode_ref,
+            &acked_haves,
+            &residual_pack,
+            true,
+            input.max_response_bytes,
+        )?;
+        (input.live_revalidator)().await?;
+        staged.commit();
         self.offload_responses.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(encoded))
+        Ok(Some(body))
     }
 }

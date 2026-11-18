@@ -11,6 +11,7 @@ pub const MAX_FETCH_V2_WIRE_BYTES: usize = 1024 * 1024;
 pub const MAX_FETCH_V2_PKTS: usize = 16_384;
 pub const MAX_FETCH_WANTS: usize = 1_024;
 pub const MAX_FETCH_HAVES: usize = 4_096;
+pub const MAX_UNSUPPORTED_FETCH_ARGS: usize = 64;
 const MAX_PROTOCOL_TOKENS: usize = 8;
 
 /// Returns `true` strictly when policy both enables offload and allows capability advertisement.
@@ -126,11 +127,16 @@ pub struct FetchV2Request {
     pub ofs_delta: bool,
     pub include_tag: bool,
     pub uri_protocols: Option<ParsedUriProtocolSet>,
+    pub unsupported_args: Vec<String>,
 }
 
 impl FetchV2Request {
     pub fn client_supports_https_offload(&self) -> bool {
         self.uri_protocols.as_ref().is_some_and(|p| p.supports_https)
+    }
+
+    pub fn has_unsupported_args(&self) -> bool {
+        !self.unsupported_args.is_empty()
     }
 }
 
@@ -221,6 +227,7 @@ pub fn parse_fetch_v2_request(
         ofs_delta: false,
         include_tag: false,
         uri_protocols: None,
+        unsupported_args: Vec::new(),
     };
     let oid_len = expected_format.oid_hex_len();
     for pkt in pkts {
@@ -232,16 +239,7 @@ pub fn parse_fetch_v2_request(
                     .map_err(|_| PackfileUriError::ProtocolSyntax("non-utf8 fetch argument".to_owned()))?;
                 let line = text.strip_suffix('\n').unwrap_or(text);
                 if !in_args {
-                    if line == "command=fetch" {
-                        saw_command_fetch = true;
-                    } else if let Some(fmt) = line.strip_prefix("object-format=")
-                        && fmt != expected_format.as_str()
-                    {
-                        return Err(PackfileUriError::ScopeMismatch(format!(
-                            "object-format={fmt} mismatches repository {}",
-                            expected_format.as_str()
-                        )));
-                    }
+                    apply_capability_header(&mut req, &mut saw_command_fetch, line, expected_format)?;
                     continue;
                 }
                 apply_fetch_arg(&mut req, line, oid_len)?;
@@ -252,6 +250,45 @@ pub fn parse_fetch_v2_request(
         return Err(PackfileUriError::ProtocolSyntax("missing command=fetch header".to_owned()));
     }
     Ok(req)
+}
+
+fn push_unsupported_arg(req: &mut FetchV2Request, line: &str) -> Result<(), PackfileUriError> {
+    if line.is_empty() || line.bytes().any(|b| b < 32 || b == 127) {
+        return Err(PackfileUriError::ProtocolSyntax("malformed control/empty fetch line".to_owned()));
+    }
+    if req.unsupported_args.len() >= MAX_UNSUPPORTED_FETCH_ARGS {
+        return Err(PackfileUriError::CapacityExceeded("unsupported fetch argument count exceeds bound".to_owned()));
+    }
+    req.unsupported_args.push(line.to_owned());
+    Ok(())
+}
+
+fn apply_capability_header(
+    req: &mut FetchV2Request,
+    saw_command_fetch: &mut bool,
+    line: &str,
+    expected_format: PackObjectFormat,
+) -> Result<(), PackfileUriError> {
+    if line == "command=fetch" {
+        if *saw_command_fetch {
+            return Err(PackfileUriError::ProtocolSyntax("duplicate command=fetch header".to_owned()));
+        }
+        *saw_command_fetch = true;
+    } else if let Some(fmt) = line.strip_prefix("object-format=") {
+        if fmt != expected_format.as_str() {
+            return Err(PackfileUriError::ScopeMismatch(format!(
+                "object-format={fmt} mismatches repository {}",
+                expected_format.as_str()
+            )));
+        }
+    } else if let Some(val) = line.strip_prefix("agent=").or_else(|| line.strip_prefix("session-id=")) {
+        if val.is_empty() || val.len() > 256 || val.bytes().any(|b| b < 32 || b == 127) {
+            return Err(PackfileUriError::ProtocolSyntax("invalid v2 client metadata header".to_owned()));
+        }
+    } else {
+        push_unsupported_arg(req, line)?;
+    }
+    Ok(())
 }
 
 fn apply_fetch_arg(req: &mut FetchV2Request, line: &str, oid_len: usize) -> Result<(), PackfileUriError> {
@@ -288,6 +325,8 @@ fn apply_fetch_arg(req: &mut FetchV2Request, line: &str, oid_len: usize) -> Resu
         req.ofs_delta = true;
     } else if line == "include-tag" {
         req.include_tag = true;
+    } else {
+        push_unsupported_arg(req, line)?;
     }
     Ok(())
 }
@@ -334,12 +373,38 @@ pub fn encode_fetch_v2_response_with_acks(
     inline_pack_bytes: &[u8],
     client_supports_https: bool,
 ) -> Result<Vec<u8>, PackfileUriError> {
-    let mut out = Vec::with_capacity(inline_pack_bytes.len() + 512);
+    encode_fetch_v2_response_bounded(
+        policy,
+        delivery,
+        acked_haves,
+        inline_pack_bytes,
+        client_supports_https,
+        policy.max_v2_response_bytes,
+    )
+}
+
+/// Encodes a Protocol v2 `fetch` response enforcing a hard byte ceiling on total output size.
+pub fn encode_fetch_v2_response_bounded(
+    policy: &OffloadPolicyConfig,
+    delivery: &DeliveryMode,
+    acked_haves: &[String],
+    inline_pack_bytes: &[u8],
+    client_supports_https: bool,
+    max_response_bytes: u64,
+) -> Result<Vec<u8>, PackfileUriError> {
+    let cap = max_response_bytes.min(policy.max_v2_response_bytes);
+    if cap == 0 || inline_pack_bytes.len() as u64 >= cap {
+        return Err(PackfileUriError::CapacityExceeded("v2 fetch response exceeds byte bound".to_owned()));
+    }
+    let mut out = Vec::with_capacity(inline_pack_bytes.len().saturating_add(512));
     if !acked_haves.is_empty() {
         push_pkt_line(&mut out, b"acknowledgments\n")?;
         for h in acked_haves {
             let ack_line = format!("ACK {h}\n");
             push_pkt_line(&mut out, ack_line.as_bytes())?;
+            if out.len() as u64 > cap {
+                return Err(PackfileUriError::CapacityExceeded("v2 fetch response exceeds byte bound".to_owned()));
+            }
         }
         push_pkt_line(&mut out, b"ready\n")?;
         out.extend_from_slice(b"0001");
@@ -358,6 +423,9 @@ pub fn encode_fetch_v2_response_with_acks(
                 }
                 let line = format!("{} {}\n", desc.pack_hash_hex, desc.uri);
                 push_pkt_line(&mut out, line.as_bytes())?;
+                if out.len() as u64 > cap {
+                    return Err(PackfileUriError::CapacityExceeded("v2 fetch response exceeds byte bound".to_owned()));
+                }
             }
             out.extend_from_slice(b"0001");
         }
@@ -368,8 +436,14 @@ pub fn encode_fetch_v2_response_with_acks(
         frame.push(1);
         frame.extend_from_slice(chunk);
         push_pkt_line(&mut out, &frame)?;
+        if out.len() as u64 > cap {
+            return Err(PackfileUriError::CapacityExceeded("v2 fetch response exceeds byte bound".to_owned()));
+        }
     }
     out.extend_from_slice(b"0000");
+    if out.len() as u64 > cap {
+        return Err(PackfileUriError::CapacityExceeded("v2 fetch response exceeds byte bound".to_owned()));
+    }
     Ok(out)
 }
 

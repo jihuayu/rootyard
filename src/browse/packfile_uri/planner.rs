@@ -27,8 +27,8 @@ use super::{
     signing::{LivePackReadAuthorizer, MintUriRequest, PackUriKeyring, mint_signed_offload_uri},
     ssrf_guard::{PackUriDnsResolver, validate_policy_config},
     types::{
-        DeliveryMode, DeliveryTelemetry, DownloadSubjectContext, FallbackReason, OffloadPolicyConfig, PackObjectFormat,
-        PackfileClosureMember, PackfileUriError,
+        DeliveryMode, DeliveryTelemetry, DownloadSubjectContext, FallbackReason, MAX_PACK_OBJECTS_PER_PACK,
+        OffloadPolicyConfig, PackObjectFormat, PackfileClosureMember, PackfileUriError,
     },
 };
 
@@ -124,13 +124,15 @@ impl Drop for CdnProbeGuard<'_> {
     }
 }
 
-/// Verified wire hashes and byte length for one `#184` `pack_id` staged on CDN/pack cache.
+/// Verified wire hashes, object count, and whole-pack authorization flag for one `#184` `pack_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackWireMeta {
     pub pack_oid: String,
     pub pack_hash_hex: String,
     pub sha256_hex: String,
     pub byte_len: u64,
+    pub object_count: usize,
+    pub all_objects_authorized: bool,
     pub cache_warm: bool,
 }
 
@@ -144,6 +146,7 @@ pub struct VerifiedPackCoverInput<'a> {
     pub wire_packs: &'a HashMap<Uuid, PackWireMeta>,
     pub residual_inline_bytes: u64,
     pub full_fallback_inline_bytes: u64,
+    pub rejected_unauthorized_pack: bool,
 }
 
 impl VerifiedPackCoverInput<'_> {
@@ -224,12 +227,18 @@ impl DeliveryPlanner {
             return Ok(Self::build_inline_response(req.cover, reason));
         }
 
-        let (selected, residual_inline_bytes, residual_objects) = match Self::select_proof_bound_candidates(req)? {
-            Some(tuple) => tuple,
-            None => return Ok(Self::build_inline_response(req.cover, FallbackReason::IncompleteClosure)),
-        };
+        let (selected, residual_inline_bytes, residual_objects, saw_unauth_pack) =
+            match Self::select_proof_bound_candidates(req)? {
+                Some(tuple) => tuple,
+                None => return Ok(Self::build_inline_response(req.cover, FallbackReason::IncompleteClosure)),
+            };
         if selected.is_empty() {
-            return Ok(Self::build_inline_response(req.cover, FallbackReason::BelowOffloadThreshold));
+            let reason = if saw_unauth_pack || req.cover.rejected_unauthorized_pack {
+                FallbackReason::PackContainsUnauthorizedObjects
+            } else {
+                FallbackReason::BelowOffloadThreshold
+            };
+            return Ok(Self::build_inline_response(req.cover, reason));
         }
         self.mint_offloaded_descriptors(req, subject, &selected, residual_inline_bytes, residual_objects)
     }
@@ -247,6 +256,9 @@ impl DeliveryPlanner {
             return Ok(Some(FallbackReason::FeatureDisabled));
         }
         validate_policy_config(req.policy)?;
+        if req.fetch_req.has_unsupported_args() {
+            return Ok(Some(FallbackReason::UnsupportedFetchArgs));
+        }
         if req.fetch_req.uri_protocols.is_none() {
             return Ok(Some(FallbackReason::ClientOmittedPackfileUris));
         }
@@ -283,7 +295,7 @@ impl DeliveryPlanner {
 
     fn select_proof_bound_candidates(
         req: &DeliveryPlanRequest<'_>,
-    ) -> Result<Option<(Vec<PackfileClosureMember>, u64, u64)>, PackfileUriError> {
+    ) -> Result<Option<(Vec<PackfileClosureMember>, u64, u64, bool)>, PackfileUriError> {
         let cover_ids = req.cover.proof.selected_cover_ids();
         let pack_ids = req.cover.proof.selected_pack_ids();
         if cover_ids.is_empty() || cover_ids.len() != pack_ids.len() {
@@ -293,6 +305,7 @@ impl DeliveryPlanner {
         let mut selected_bytes = 0u64;
         let mut residual_inline_bytes = req.cover.residual_inline_bytes;
         let mut residual_objects = 0u64;
+        let mut saw_unauth_pack = false;
 
         for (cover_id, pack_id) in cover_ids.iter().zip(pack_ids.iter()) {
             let Some(record) = req.cover.cover_index.get(cover_id) else {
@@ -317,12 +330,21 @@ impl DeliveryPlanner {
             if wire.byte_len != record.artifacts().pack_locator.length() {
                 return Ok(None);
             }
+            if wire.object_count > MAX_PACK_OBJECTS_PER_PACK {
+                return Err(PackfileUriError::CapacityExceeded("pack object count exceeds bound".to_owned()));
+            }
+            if !wire.all_objects_authorized || wire.object_count == 0 {
+                saw_unauth_pack = true;
+                residual_inline_bytes = residual_inline_bytes.saturating_add(wire.byte_len);
+                residual_objects = residual_objects.saturating_add(commit_cnt);
+                continue;
+            }
             let member = PackfileClosureMember {
                 pack_oid: wire.pack_oid.clone(),
                 pack_hash_hex: wire.pack_hash_hex.clone(),
                 sha256_hex: wire.sha256_hex.clone(),
                 byte_len: wire.byte_len,
-                covered_objects: commit_cnt.max(1),
+                covered_objects: wire.object_count as u64,
                 cache_warm: wire.cache_warm,
             };
             member.validate(req.object_format)?;
@@ -337,7 +359,7 @@ impl DeliveryPlanner {
                 residual_objects = residual_objects.saturating_add(commit_cnt);
             }
         }
-        Ok(Some((selected, residual_inline_bytes, residual_objects)))
+        Ok(Some((selected, residual_inline_bytes, residual_objects, saw_unauth_pack)))
     }
 
     fn mint_offloaded_descriptors(
