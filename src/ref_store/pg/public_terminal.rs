@@ -59,24 +59,23 @@
 //! slot-one branch never returns that outcome and never mutates the retired
 //! attempt; it only publishes or exactly replays the already-current terminal.
 use super::{
-    bound,
+    PgRefStore, bound,
     public_attempt::{
-        ledger, parse_digest, parse_state, stale_realm, validate_wrapper, PublicAttemptRequest, RawWrapper, Redacted,
+        PublicAttemptRequest, RawWrapper, Redacted, ledger, parse_digest, parse_state, stale_realm, validate_wrapper,
     },
-    PgRefStore,
 };
 use crate::ref_store::{
+    OperationRecord, OperationState, RefStoreError,
     core::{
         pack_commit::{PackCommitError, PackCommitRejectCode},
         pack_snapshot::lock_cluster_incarnation,
     },
-    OperationRecord, OperationState, RefStoreError,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
 use tokio::time::Instant;
-use tokio_postgres::{error::SqlState, Transaction};
+use tokio_postgres::{Transaction, error::SqlState};
 use uuid::Uuid;
 
 /// Probe exactly the migration-152 objects this mirror uses. The relation and
@@ -134,9 +133,16 @@ SELECT jsonb_build_object(
                        AS revision_mismatch_rejection,
                    COALESCE(c.operation_id IS NOT NULL, false) AS tombstone_present,
                    (c.operation_id IS NULL AND k.operation_id IS NULL) AS tombstone_absent,
-                   COALESCE(c.operation_id IS NOT NULL AND c.operation_id = k.operation_id, false)
+                   COALESCE(c.operation_id IS NOT NULL
+                            AND c.repository_id = k.repository_id
+                            AND c.operation_id = k.operation_id
+                            AND c.issuer_id = k.issuer_id
+                            AND c.lane = k.lane
+                            AND c.sequence = k.sequence
+                            AND c.request_digest = k.request_digest, false)
                        AS tombstone_matches_lane,
                    COALESCE(c.operation_id IS NOT NULL
+                            AND c.repository_id = a.repository_id
                             AND c.operation_id = a.private_id
                             AND c.issuer_id = o.issuer_id
                             AND c.lane = o.lane
@@ -590,10 +596,40 @@ fn slot_one_attempts(attempts: &[MirrorAttempt]) -> Result<(&MirrorAttempt, &Mir
     Ok((retired, current))
 }
 
+/// A terminal private attempt may have the immutable cancellation tombstone
+/// that migration 138 permits on a terminal lane. That tombstone is accepted
+/// only when both the ForOperation and issuer-lane lookups resolve to the same
+/// exact repository/operation/issuer/lane/sequence/request-digest binding. No
+/// tombstone is allowed on pending evidence, and a missing, mixed, stale or
+/// otherwise divergent tombstone remains a ledger refusal.
+fn validate_terminal_tombstone(
+    attempt: &MirrorAttempt,
+    state: OperationState,
+    mismatch_detail: &'static str,
+) -> Result<(), PackCommitError> {
+    if attempt.tombstone_present {
+        if !attempt.tombstone_matches_lane || !attempt.tombstone_exact_operation {
+            return Err(ledger(mismatch_detail));
+        }
+        if state == OperationState::Pending {
+            return Err(ledger("pending private attempt has a cancellation tombstone"));
+        }
+        return Ok(());
+    }
+    if !attempt.tombstone_absent {
+        return Err(ledger("private attempt cancellation evidence differs from its operation lane"));
+    }
+    if state == OperationState::Cancelled {
+        return Err(ledger("cancelled private attempt has no cancellation tombstone"));
+    }
+    Ok(())
+}
+
 /// Re-prove the already-retired slot-zero attempt from the same snapshot. Its
 /// event must be the wrapper's exact retired event, its terminal body must be
-/// the canonical revision-mismatch rejection at an advanced revision, and it
-/// must not carry a cancellation tombstone.
+/// the canonical revision-mismatch rejection at an advanced revision, and its
+/// cancellation evidence must be absent or the exact immutable terminal
+/// tombstone accepted by migration 152.
 fn validate_slot_zero_retired(
     attempt: &MirrorAttempt,
     request: &PublicAttemptRequest,
@@ -658,21 +694,18 @@ fn validate_slot_zero_retired(
     if !attempt.revision_mismatch_rejection {
         return Err(ledger("retired public attempt is not the exact revision-mismatch rejection"));
     }
-    if attempt.tombstone_present {
-        if !attempt.tombstone_matches_lane || !attempt.tombstone_exact_operation {
-            return Err(ledger("retired private attempt cancellation tombstone differs from its operation"));
-        }
-        return Err(ledger("retired public attempt carries a cancellation tombstone"));
-    }
-    if !attempt.tombstone_absent {
-        return Err(ledger("retired private attempt cancellation evidence differs from its operation lane"));
-    }
+    validate_terminal_tombstone(
+        attempt,
+        state,
+        "retired private attempt cancellation tombstone differs from its operation",
+    )?;
     Ok((sequence, event_revision))
 }
 
 /// Re-prove that the caller's terminal record is the actual current slot-one
 /// private operation: exact identity/digest, canonical proof, exact migration
-/// 138 operation row, migration 139 event and no cancellation tombstone.
+/// 138 operation row, migration 139 event, and absent or exact immutable
+/// terminal cancellation evidence.
 fn validate_slot_one_current(
     attempt: &MirrorAttempt,
     request: &PublicAttemptRequest,
@@ -722,15 +755,11 @@ fn validate_slot_one_current(
     if !attempt.event_outcome_matches || !attempt.event_body_matches {
         return Err(ledger("slot one current private event differs from its operation"));
     }
-    if attempt.tombstone_present {
-        if !attempt.tombstone_matches_lane || !attempt.tombstone_exact_operation {
-            return Err(ledger("slot one current cancellation tombstone differs from its operation"));
-        }
-        return Err(ledger("slot one current terminal carries a cancellation tombstone"));
-    }
-    if !attempt.tombstone_absent {
-        return Err(ledger("slot one current cancellation evidence differs from its operation lane"));
-    }
+    validate_terminal_tombstone(
+        attempt,
+        record.state(),
+        "slot one current cancellation tombstone differs from its operation",
+    )?;
     Ok(sequence)
 }
 
@@ -1027,9 +1056,67 @@ struct MirrorEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_revision_mismatch_rejection, retirement_candidate, validate_revision, validate_slot_one_lineage};
+    use super::{
+        MirrorAttempt, is_revision_mismatch_rejection, retirement_candidate, validate_revision,
+        validate_slot_one_lineage, validate_terminal_tombstone,
+    };
     use crate::ref_store::OperationState;
     use serde_json::json;
+    use uuid::Uuid;
+
+    fn mirror_attempt() -> MirrorAttempt {
+        MirrorAttempt {
+            slot: 1,
+            private_id: Uuid::from_u128(1),
+            plan_digest: String::new(),
+            proof_digest: String::new(),
+            base_revision: 1,
+            serving_bound: true,
+            operation_issuer_id: Some(Uuid::from_u128(2)),
+            operation_lane: Some("lane".into()),
+            operation_sequence: Some(2),
+            operation_request_digest: Some(String::new()),
+            operation_state: Some("rejected".into()),
+            terminal_present: true,
+            event_id: Some(Uuid::from_u128(3)),
+            event_revision: Some(2),
+            event_outcome_matches: true,
+            event_body_matches: true,
+            tombstone_present: false,
+            tombstone_absent: true,
+            tombstone_matches_lane: false,
+            tombstone_exact_operation: false,
+            revision_mismatch_rejection: true,
+        }
+    }
+
+    #[test]
+    fn terminal_tombstones_require_exact_non_pending_binding() {
+        let absent = mirror_attempt();
+        assert!(validate_terminal_tombstone(&absent, OperationState::Rejected, "mismatch").is_ok());
+        assert!(validate_terminal_tombstone(&absent, OperationState::Committed, "mismatch").is_ok());
+
+        let exact = MirrorAttempt {
+            tombstone_present: true,
+            tombstone_absent: false,
+            tombstone_matches_lane: true,
+            tombstone_exact_operation: true,
+            ..mirror_attempt()
+        };
+        assert!(validate_terminal_tombstone(&exact, OperationState::Rejected, "mismatch").is_ok());
+        assert!(validate_terminal_tombstone(&exact, OperationState::Committed, "mismatch").is_ok());
+        assert!(validate_terminal_tombstone(&exact, OperationState::Pending, "mismatch").is_err());
+
+        let mixed = MirrorAttempt { tombstone_matches_lane: false, ..exact.clone() };
+        assert!(validate_terminal_tombstone(&mixed, OperationState::Rejected, "mismatch").is_err());
+
+        let wrong = MirrorAttempt { tombstone_exact_operation: false, ..exact };
+        assert!(validate_terminal_tombstone(&wrong, OperationState::Rejected, "mismatch").is_err());
+
+        let unreadable = MirrorAttempt { tombstone_absent: false, ..mirror_attempt() };
+        assert!(validate_terminal_tombstone(&unreadable, OperationState::Rejected, "mismatch").is_err());
+        assert!(validate_terminal_tombstone(&unreadable, OperationState::Cancelled, "mismatch").is_err());
+    }
 
     #[test]
     fn committed_revision_is_exactly_base_plus_one_with_checked_overflow() {
