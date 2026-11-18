@@ -37,10 +37,10 @@ COLD_LFS_STEP = "Qualify #85 cold tenant LFS retention on owned Garage"
 UPLOAD_STEP = "Upload end-to-end report"
 UPLOAD_ALLOWED_LOG = "test-results/ci-webhook-regressions.log"
 
-# The 159-minute verify/lifecycle budget already contains the 24-minute owned
+# The 163-minute verify/lifecycle budget already contains the 28-minute owned
 # Redis step, so it is not added again.  #304 contributes an independent
-# 12-minute cold tenant LFS gate on owned Garage: 159 + 12 = 171.
-VERIFY_BASE_BUDGET_MINUTES = 159
+# 12-minute cold tenant LFS gate on owned Garage: 163 + 12 = 175.
+VERIFY_BASE_BUDGET_MINUTES = 163
 COLD_LFS_BUDGET_MINUTES = 12
 
 
@@ -220,7 +220,7 @@ class WorkflowWiringTest(unittest.TestCase):
         vault = _step("Qualify pinned real Vault rotation and bind the Pando native gate")
         self.assertEqual(vault["timeout-minutes"], "20")
         redis = _step("Verify browse cache incarnation across restore with owned Redis")
-        self.assertEqual(redis["timeout-minutes"], "24")
+        self.assertEqual(redis["timeout-minutes"], "28")
         for name in (
             "Exercise repository archive, rename aliases, soft-delete purge, and ownership transfer (#85)",
             "Exercise deleted webhook-claim fence (#85)",
