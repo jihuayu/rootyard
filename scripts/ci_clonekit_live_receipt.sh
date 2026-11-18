@@ -5,13 +5,17 @@
 # receipt:
 #   * `stage` is called from the workflow's single EXIT trap and records which shell
 #     stage was current (`env_setup`, `cargo_test`, `complete`) plus the exact
-#     GITHUB_SHA and repository checkout commit/tree;
+#     GITHUB_SHA and repository checkout commit/tree, which must agree;
 #   * `project` reads the live cargo/test output, echoes it unchanged, and records
-#     only the fixed typed marker's closed phase/class when the Rust fixture emits it.
-# A missing or malformed marker is not guessed from unrelated text.
+#     only the fixed typed failure marker or exactly one fixed completion marker.
+# The completion marker is one fixed line in ROOTYARD_LIVE_COMPLETION_FILE because
+# libtest captures passing-test stderr. A green producer is evidence only when that file
+# is exactly one fixed line; missing, duplicate or mixed evidence is rejected. No raw
+# output is stored.
 set -u
 
 readonly MAX_BYTES=512
+readonly COMPLETION_MARKER='ISSUE182_LIVE_PG_GARAGE_COMPLETE'
 readonly PHASES='SETUP SCHEMA MIGRATE BLOB_OPEN SEED CORE_INIT OPERATION_REGISTER BUILD_KIT PUBLISH READINESS JOB_INSERT CHECKOUT ACTIVE_HOLDS REVOCATION DENIED_REPLAY TEARDOWN'
 readonly CLASSES='ASSERT PANIC OTHER INVALID_CONFIG INVALID_INPUT UNAUTHORIZED GRANT_EXPIRED GRANT_REVOKED CROSS_TENANT_DENIED MISSING_KIT EMPTY_REPOSITORY STALE_GENERATION HISTORY_CHANGED CORRUPT_ARTIFACT FOREIGN_BACKEND INCOMPLETE_CLOSURE DEPENDENCY_CHECK_FAILED PIN_PROTECTION_ACTIVE TRANSFER_CANCELLED GIT_FAILED BLOB_FAILED DATABASE_FAILED'
 
@@ -21,6 +25,10 @@ unavailable() {
 
 rust_unavailable() {
   printf '%s\n' "live CloneKit rust phase unavailable" >&2
+}
+
+completion_unavailable() {
+  printf '%s\n' "live CloneKit completion marker unavailable" >&2
 }
 
 fail() {
@@ -97,6 +105,7 @@ if [ "$#" -eq 4 ] && [ "$1" = stage ]; then
   checkout_commit=$(git rev-parse HEAD 2>/dev/null) || checkout_commit=
   checkout_tree=$(git rev-parse 'HEAD^{tree}' 2>/dev/null) || checkout_tree=
   valid_sha "$checkout_commit" || fail 1
+  [ "$source_commit" = "$checkout_commit" ] || fail 1
   valid_sha "$checkout_tree" || fail 1
 
   case "$stage" in
@@ -111,18 +120,22 @@ fi
 
 if [ "$#" -eq 2 ] && [ "$1" = project ]; then
   output=$2
+  completion_file=${ROOTYARD_LIVE_COMPLETION_FILE:-}
+  if [ -z "$completion_file" ]; then
+    completion_file=$(dirname -- "$output")/live-case-complete
+  fi
   if [ -n "$output" ] && [ ! -d "$output" ]; then
     rm -f -- "$output" 2>/dev/null
   fi
   phase=
   class=
-  saw=0
+  saw_failure=0
   while IFS= read -r line || [ -n "$line" ]; do
     printf '%s\n' "$line"
 
     case "$line" in
       "ISSUE182_LIVE_PG_GARAGE "*)
-        saw=1
+        saw_failure=1
         rest=${line#ISSUE182_LIVE_PG_GARAGE }
         token=${rest%% *}
         rest=${rest#* }
@@ -143,24 +156,53 @@ if [ "$#" -eq 2 ] && [ "$1" = project ]; then
     esac
   done
 
-  [ "$saw" -eq 0 ] && exit 0
-  [ -n "$phase" ] || phase=OTHER
-  [ -n "$class" ] || class=OTHER
-
   source_commit=${GITHUB_SHA:-}
   checkout_commit=$(git rev-parse HEAD 2>/dev/null) || checkout_commit=
   checkout_tree=$(git rev-parse 'HEAD^{tree}' 2>/dev/null) || checkout_tree=
-  if ! valid_sha "$source_commit" || ! valid_sha "$checkout_commit" || ! valid_sha "$checkout_tree"; then
-    rust_unavailable
-    exit 0
+
+  if [ "$saw_failure" -ne 0 ]; then
+    [ -n "$phase" ] || phase=OTHER
+    [ -n "$class" ] || class=OTHER
+    if ! valid_sha "$source_commit" || ! valid_sha "$checkout_commit" || ! valid_sha "$checkout_tree" \
+      || [ "$source_commit" != "$checkout_commit" ]; then
+      rm -f -- "$completion_file" 2>/dev/null
+      rust_unavailable
+      exit 1
+    fi
+    payload=$(printf '{"version":1,"case":"PG_GARAGE_DURABLE_HOLD","source_commit":"%s","checkout_commit":"%s","checkout_tree":"%s","phase":"%s","class":"%s"}' \
+      "$source_commit" "$checkout_commit" "$checkout_tree" "$phase" "$class") || {
+      rm -f -- "$completion_file" 2>/dev/null
+      rust_unavailable
+      exit 1
+    }
+    if ! write_receipt "$payload" "$output"; then
+      rm -f -- "$completion_file" 2>/dev/null
+      rust_unavailable
+      exit 1
+    fi
+    rm -f -- "$completion_file" 2>/dev/null
+    exit 1
   fi
-  payload=$(printf '{"version":1,"case":"PG_GARAGE_DURABLE_HOLD","source_commit":"%s","checkout_commit":"%s","checkout_tree":"%s","phase":"%s","class":"%s"}' \
-    "$source_commit" "$checkout_commit" "$checkout_tree" "$phase" "$class") || {
+
+  if [ ! -f "$completion_file" ] || ! printf '%s\n' "$COMPLETION_MARKER" | cmp -s - "$completion_file"; then
+    rm -f -- "$completion_file" 2>/dev/null
+    completion_unavailable
+    exit 1
+  fi
+  rm -f -- "$completion_file" 2>/dev/null
+  if ! valid_sha "$source_commit" || ! valid_sha "$checkout_commit" || ! valid_sha "$checkout_tree" \
+    || [ "$source_commit" != "$checkout_commit" ]; then
     rust_unavailable
-    exit 0
+    exit 1
+  fi
+  payload=$(printf '{"version":1,"case":"PG_GARAGE_DURABLE_HOLD","source_commit":"%s","checkout_commit":"%s","checkout_tree":"%s","outcome":"COMPLETE"}' \
+    "$source_commit" "$checkout_commit" "$checkout_tree") || {
+    rust_unavailable
+    exit 1
   }
   if ! write_receipt "$payload" "$output"; then
     rust_unavailable
+    exit 1
   fi
   exit 0
 fi

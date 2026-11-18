@@ -27,9 +27,19 @@ CHECKOUT_TREE = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd
 class LiveReceiptTest(unittest.TestCase):
     """Guard the two bounded live-stage records and the unchanged live command."""
 
-    SHA = "d" * 40
+    SHA = CHECKOUT_COMMIT
+    COMPLETION = "ISSUE182_LIVE_PG_GARAGE_COMPLETE"
     UNAVAILABLE = "live CloneKit evidence unavailable\n"
     RUST_UNAVAILABLE = "live CloneKit rust phase unavailable\n"
+    COMPLETION_UNAVAILABLE = "live CloneKit completion marker unavailable\n"
+    OK_TEXT = "\n".join(
+        (
+            "running 1 test",
+            "test pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation ... ok",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+            "",
+        )
+    )
 
     def run_stage(
         self, stage: str, status: str, output: Path, *, sha: str | None = SHA
@@ -49,12 +59,14 @@ class LiveReceiptTest(unittest.TestCase):
         )
 
     def run_project(
-        self, text: str, output: Path, *, sha: str | None = SHA
+        self, text: str, output: Path, *, sha: str | None = SHA, completion: Path | None = None
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.pop("GITHUB_SHA", None)
         if sha is not None:
             environment["GITHUB_SHA"] = sha
+        completion = output.with_name("live-case-complete") if completion is None else completion
+        environment["ROOTYARD_LIVE_COMPLETION_FILE"] = str(completion)
         return subprocess.run(
             [str(LIVE_HELPER), "project", str(output)],
             cwd=str(ROOT),
@@ -65,6 +77,9 @@ class LiveReceiptTest(unittest.TestCase):
             timeout=10,
             check=False,
         )
+
+    def mismatch_sha(self) -> str:
+        return ("1" if self.SHA[0] != "1" else "0") + self.SHA[1:]
 
     def trap_line(self) -> str:
         workflow = (ROOT / ".github" / "workflows" / "ci-clonekit.yml").read_text(encoding="utf-8")
@@ -195,7 +210,7 @@ class LiveReceiptTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             output = Path(td) / "nested" / "live-rust.json"
             proc = self.run_project(text, output)
-            self.assertEqual(0, proc.returncode, proc.stderr)
+            self.assertEqual(1, proc.returncode)
             self.assertEqual(text, proc.stdout)
             self.assertEqual("", proc.stderr)
             self.assertEqual(
@@ -210,6 +225,7 @@ class LiveReceiptTest(unittest.TestCase):
                 },
                 self.projected(output),
             )
+            self.assertFalse(output.with_name("live-case-complete").exists())
             data = output.read_bytes()
             for raw in (b"pg_and_garage", b"source=", b"tests/", b"SECRET", b"test result", b"running"):
                 self.assertNotIn(raw, data)
@@ -236,7 +252,7 @@ class LiveReceiptTest(unittest.TestCase):
                 with self.subTest(index=index):
                     output = root / f"unknown-{index}.json"
                     proc = self.run_project(text, output)
-                    self.assertEqual(0, proc.returncode, proc.stderr)
+                    self.assertEqual(1, proc.returncode)
                     self.assertEqual(text, proc.stdout)
                     self.assertEqual("", proc.stderr)
                     self.assertEqual(phase, self.projected(output)["phase"])
@@ -246,35 +262,100 @@ class LiveReceiptTest(unittest.TestCase):
                         self.assertNotIn(raw, data)
 
     def test_project_without_marker_is_silent_and_creates_nothing(self) -> None:
-        text = "\n".join(
-            (
-                "running 1 test",
-                "test pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation ... ok",
-                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
-                "",
-            )
-        )
+        text = self.OK_TEXT
         with tempfile.TemporaryDirectory() as td:
             output = Path(td) / "live-rust.json"
             output.write_text("stale evidence", encoding="utf-8")
             proc = self.run_project(text, output)
+            self.assertEqual(1, proc.returncode)
+            self.assertEqual(text, proc.stdout)
+            self.assertEqual(self.COMPLETION_UNAVAILABLE, proc.stderr)
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_name("live-case-complete").exists())
+
+    def test_project_accepts_exactly_one_completion_marker(self) -> None:
+        text = self.OK_TEXT
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            output = root / "nested" / "live-rust.json"
+            completion = root / "live-case-complete"
+            completion.write_text(self.COMPLETION + "\n", encoding="utf-8")
+            proc = self.run_project(text, output, completion=completion)
             self.assertEqual(0, proc.returncode, proc.stderr)
             self.assertEqual(text, proc.stdout)
             self.assertEqual("", proc.stderr)
-            self.assertFalse(output.exists())
+            self.assertEqual(
+                {
+                    "version": 1,
+                    "case": "PG_GARAGE_DURABLE_HOLD",
+                    "source_commit": self.SHA,
+                    "checkout_commit": CHECKOUT_COMMIT,
+                    "checkout_tree": CHECKOUT_TREE,
+                    "outcome": "COMPLETE",
+                },
+                self.projected(output),
+            )
+            self.assertFalse(completion.exists())
+            data = output.read_bytes()
+            for raw in (b"pg_and_garage", b"source=", b"tests/", b"test result", b"running"):
+                self.assertNotIn(raw, data)
 
-    def test_project_write_failure_is_bounded_and_does_not_mask_output(self) -> None:
-        text = "ISSUE182_LIVE_PG_GARAGE phase=CHECKOUT class=GIT_FAILED source=x:1\n"
+    def test_project_rejects_zero_duplicate_or_mixed_completion_markers(self) -> None:
+        text = self.OK_TEXT
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            blocked = root / "blocked.json"
-            blocked.mkdir()
-            proc = self.run_project(text, blocked)
-            self.assertEqual(0, proc.returncode, proc.stderr)
+            zero = root / "zero-complete"
+            output = root / "zero.json"
+            proc = self.run_project(text, output, completion=zero)
+            self.assertEqual(1, proc.returncode)
+            self.assertEqual(text, proc.stdout)
+            self.assertEqual(self.COMPLETION_UNAVAILABLE, proc.stderr)
+            self.assertFalse(output.exists())
+
+            duplicate = root / "duplicate-complete"
+            duplicate.write_text(self.COMPLETION + "\n" + self.COMPLETION + "\n", encoding="utf-8")
+            output = root / "duplicate.json"
+            proc = self.run_project(text, output, completion=duplicate)
+            self.assertEqual(1, proc.returncode)
+            self.assertEqual(text, proc.stdout)
+            self.assertEqual(self.COMPLETION_UNAVAILABLE, proc.stderr)
+            self.assertFalse(output.exists())
+            self.assertFalse(duplicate.exists())
+
+            mixed = root / "mixed-complete"
+            mixed.write_text(self.COMPLETION + "\n", encoding="utf-8")
+            failure = "ISSUE182_LIVE_PG_GARAGE phase=CHECKOUT class=GIT_FAILED source=x:1\n"
+            output = root / "mixed.json"
+            proc = self.run_project(failure, output, completion=mixed)
+            self.assertEqual(1, proc.returncode)
+            self.assertEqual(failure, proc.stdout)
+            self.assertEqual("", proc.stderr)
+            self.assertEqual("CHECKOUT", self.projected(output)["phase"])
+            self.assertEqual("GIT_FAILED", self.projected(output)["class"])
+            self.assertFalse(mixed.exists())
+
+    def test_stage_rejects_source_checkout_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            output = Path(td) / "mismatch.json"
+            proc = self.run_stage("complete", "0", output, sha=self.mismatch_sha())
+            self.assertEqual(1, proc.returncode)
+            self.assertEqual("", proc.stdout)
+            self.assertEqual(self.UNAVAILABLE, proc.stderr)
+            self.assertFalse(output.exists())
+
+    def test_project_rejects_source_checkout_mismatch(self) -> None:
+        text = self.OK_TEXT
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            output = root / "mismatch.json"
+            completion = root / "live-case-complete"
+            completion.write_text(self.COMPLETION + "\n", encoding="utf-8")
+            proc = self.run_project(text, output, sha=self.mismatch_sha(), completion=completion)
+            self.assertEqual(1, proc.returncode)
             self.assertEqual(text, proc.stdout)
             self.assertEqual(self.RUST_UNAVAILABLE, proc.stderr)
-            self.assertTrue(blocked.is_dir())
-            self.assertFalse(any(path.name.startswith(".live-receipt.") for path in root.iterdir()))
+            self.assertFalse(output.exists())
+            self.assertFalse(completion.exists())
 
     def test_live_primary_body_error_precedes_teardown_and_cleanup(self) -> None:
         source = "".join(LIVE_MODULE.read_text(encoding="utf-8").split())
@@ -333,20 +414,6 @@ class LiveReceiptTest(unittest.TestCase):
             self.assertEqual(0, data["exit_code"])
             self.assertEqual([], data["not_run"])
 
-            blocked = root / "blocked.json"
-            blocked.mkdir()
-            proc = self.run_trap(
-                """
-                live_stage=cargo_test
-                true
-                live_stage=complete
-                """,
-                blocked,
-            )
-            self.assertEqual(1, proc.returncode)
-            self.assertEqual(self.UNAVAILABLE, proc.stderr)
-            self.assertTrue(blocked.is_dir())
-
     def test_workflow_wires_live_trap_and_preserves_original_command(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci-clonekit.yml").read_text(encoding="utf-8")
         self.assertIn("      - 'scripts/ci_clonekit_live_receipt.sh'", workflow)
@@ -362,6 +429,9 @@ class LiveReceiptTest(unittest.TestCase):
         )
         self.assertIn("live_receipt=test-results/ci-clonekit/live-command.json", lines)
         self.assertIn("live_rust_receipt=test-results/ci-clonekit/live-rust.json", lines)
+        self.assertIn("live_completion_file=test-results/ci-clonekit/live-case-complete", lines)
+        self.assertIn('rm -f -- "$live_completion_file"', lines)
+        self.assertIn('export ROOTYARD_LIVE_COMPLETION_FILE="$live_completion_file"', lines)
         self.assertIn("live_stage=env_setup", lines)
         self.assertIn("live_stage=cargo_test", lines)
         self.assertIn("live_stage=complete", lines)
@@ -384,9 +454,17 @@ class LiveReceiptTest(unittest.TestCase):
         )
         source_index = lines.index('source "$OBJECT_STORE_ENV_FILE"')
         cargo_index = lines.index(command)
+        completion_index = lines.index('export ROOTYARD_LIVE_COMPLETION_FILE="$live_completion_file"')
         self.assertLess(lines.index("live_stage=env_setup"), source_index)
+        self.assertLess(source_index, lines.index('rm -f -- "$live_completion_file"'))
+        self.assertLess(lines.index('rm -f -- "$live_completion_file"'), completion_index)
+        self.assertLess(completion_index, cargo_index)
         self.assertLess(lines.index("live_stage=cargo_test"), cargo_index)
         self.assertLess(cargo_index, lines.index("live_stage=complete"))
+        producer_index = lines.index('if [ "$producer_status" -ne 0 ]; then')
+        collector_index = lines.index('if [ "$collector_status" -ne 0 ]; then')
+        self.assertLess(producer_index, collector_index)
+        self.assertLess(collector_index, lines.index("live_stage=complete"))
 
         traps = [line for line in lines if line.startswith("trap '")]
         self.assertEqual(1, len(traps))

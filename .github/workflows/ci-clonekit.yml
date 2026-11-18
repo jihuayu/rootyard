@@ -171,6 +171,9 @@ jobs:
           export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
           export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
           export ROOTYARD_BLOB_ROOT="ci-clonekit-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          live_completion_file=test-results/ci-clonekit/live-case-complete
+          rm -f -- "$live_completion_file"
+          export ROOTYARD_LIVE_COMPLETION_FILE="$live_completion_file"
           live_stage=cargo_test
           set +e
           cargo test --locked --test ci_clonekit -- --ignored --test-threads=1 2>&1 | scripts/ci_clonekit_live_receipt.sh project "$live_rust_receipt"
