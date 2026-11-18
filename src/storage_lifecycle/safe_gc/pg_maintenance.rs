@@ -1,6 +1,7 @@
 //! Real `storage_lifecycle` scheduler & worker integration for `pg_refstore` Safe GC (#122).
 
 use std::{
+    collections::BTreeSet,
     env,
     path::{Path, PathBuf},
     sync::Arc,
@@ -133,6 +134,16 @@ pub async fn run_claimed_safe_gc_once_with_refcas(
     owner: Uuid,
     refcas_source: Option<&dyn super::pg_maintenance_dist::RefCasCutpointSource>,
 ) -> Result<Option<JobOutcome>> {
+    run_claimed_safe_gc_once_with_fault(state, policy, owner, refcas_source, DeleteFaultHook::None).await
+}
+
+pub async fn run_claimed_safe_gc_once_with_fault(
+    state: &Arc<AppState>,
+    policy: &Policy,
+    owner: Uuid,
+    refcas_source: Option<&dyn super::pg_maintenance_dist::RefCasCutpointSource>,
+    sweep_fault: DeleteFaultHook,
+) -> Result<Option<JobOutcome>> {
     let safe_gc_dir = state.storage.root.join("safe-gc");
     if !safe_gc_dir.is_dir() {
         return Ok(None);
@@ -186,7 +197,7 @@ pub async fn run_claimed_safe_gc_once_with_refcas(
         lease_owner: owner,
     };
 
-    match execute_claimed_pg_refstore_job(state, &job, policy, refcas_source).await {
+    match execute_claimed_pg_refstore_job(state, &job, policy, refcas_source, sweep_fault).await {
         Ok(res_val) => {
             finish_safe_gc_job_row(state, job_id, "succeeded", res_val, None).await?;
             Ok(Some(JobOutcome {
@@ -230,6 +241,7 @@ async fn execute_claimed_pg_refstore_job(
     job: &Job,
     policy: &Policy,
     refcas_source: Option<&dyn super::pg_maintenance_dist::RefCasCutpointSource>,
+    sweep_fault: DeleteFaultHook,
 ) -> Result<Value> {
     let destructive_env = safe_gc_destructive_env_enabled()?;
     let mut barrier_conn = state.pool.get().await?;
@@ -258,7 +270,7 @@ async fn execute_claimed_pg_refstore_job(
 
     let flags = (destructive_env, fence_epoch);
     let barriers = (&lease, &pg_fence);
-    let run_res = run_safe_gc_phases(state, job, policy, flags, barriers, refcas_source).await;
+    let run_res = run_safe_gc_phases(state, job, policy, flags, barriers, refcas_source, sweep_fault).await;
     pg_fence.release().await;
     let out = run_res?;
     lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
@@ -273,6 +285,7 @@ async fn run_safe_gc_phases(
     flags: (bool, u64),
     barriers: (&crate::storage::read_leases::Lease, &fence::Fence),
     refcas_source: Option<&dyn super::pg_maintenance_dist::RefCasCutpointSource>,
+    sweep_fault: DeleteFaultHook,
 ) -> Result<Value> {
     let (destructive_env, fence_epoch) = flags;
     let (lease, pg_fence) = barriers;
@@ -384,6 +397,8 @@ async fn run_safe_gc_phases(
     let mut deleted_keys = Vec::new();
     let mut already_absent_keys = Vec::new();
     let snap_rec = authority.snapshot();
+    let prior_deleted: BTreeSet<String> =
+        snap_rec.pending_delete.as_ref().map(|b| b.deleted_keys.iter().cloned().collect()).unwrap_or_default();
     if let Some(rep) = reconcile_pending_delete_after_restart_fenced(
         &authority,
         &provider,
@@ -396,7 +411,9 @@ async fn run_safe_gc_phases(
     .await
     .map_err(|e| anyhow::anyhow!("reconcile_pending_delete_after_restart_fenced: {e}"))?
     {
-        deleted_keys.extend(rep.deleted_keys);
+        // Report only keys completed by this invocation; the checkpoint's earlier deletions
+        // belong to the interrupted pass that is being resumed.
+        deleted_keys.extend(rep.deleted_keys.into_iter().filter(|k| !prior_deleted.contains(k)));
         already_absent_keys.extend(rep.already_absent_keys);
     }
 
@@ -415,7 +432,7 @@ async fn run_safe_gc_phases(
                 deleter_lease_epoch: snap_after.authority.lease_epoch,
                 proof,
                 deadline,
-                fault: DeleteFaultHook::None,
+                fault: sweep_fault,
             },
             Some(&ext_guard),
         )

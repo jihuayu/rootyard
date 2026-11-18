@@ -148,7 +148,12 @@ impl DurableSafeGcAuthority {
             };
             seed
         };
-        if !existed {
+        if existed {
+            // A newly opened process handle does NOT hold the previous process's live
+            // PostgreSQL `gc_epoch` fence, so the historical barrier epoch is cleared
+            // in memory until a caller acquires a fresh live fence and rebinds.
+            snap.reader_leases.set_pg_exclusive_barrier_epoch(None);
+        } else {
             snap.register_initial_keys()?;
             persist_snapshot(&path, &snap)?;
         }

@@ -12,8 +12,8 @@ use crate::ref_store::{
     core::{
         contract::CommitMode,
         state_machine::{
-            AppliedLogId, BeginOperationCommand, CommitRefsCommand, InitializeGateCommand, RefCasCommand,
-            RefCasStateMachine, RepositoryLane, SmPackMode, WireCommitRefsRequest, WireGateInit,
+            AppliedLogId, ApplyResponse, BeginOperationCommand, CommitRefsCommand, InitializeGateCommand,
+            RefCasCommand, RefCasStateMachine, RepositoryLane, SmPackMode, WireCommitRefsRequest, WireGateInit,
         },
         types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget, RefUpdate},
     },
@@ -22,14 +22,18 @@ use crate::ref_store::{
 use super::{
     SafeGcError,
     anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState},
-    domain::{ActiveDeleteFence, CasCompactionPublish, UploadedCompactionPair},
+    domain::{ActiveDeleteFence, AuthorityRecord, CasCompactionPublish, UploadedCompactionPair},
     executor::{quarantine_abandoned_staging_without_delete, reclaim_abandoned_compaction_staging},
     model::{
         AuthorityLane, DecisionKind, DecisionState, GcMode, GlobalHoldEntry, GlobalHoldState, InFlightDecisionRecord,
         RetentionProducer, SafeGcArmReceipt, SafeGcObjectFormat,
     },
-    pg_maintenance_dist::{FsSealedRefCasCutpointSource, RefCasCutpointSource, persist_refcas_cutpoint_snapshot},
+    pg_maintenance_dist::{
+        FsSealedRefCasCutpointSource, RefCasCommitCutpointPublisher, RefCasCutpointSource,
+        persist_refcas_cutpoint_snapshot,
+    },
     refcas_cut::RefCasReconciledCut,
+    safe_gc_refcas_cutpoint_path,
     store::DurableSafeGcAuthority,
     store_reconcile::PgReconciledBundle,
     tests::{RecordingDeleteBackend, oid, seed_fixture, sha},
@@ -372,4 +376,117 @@ fn persisted_refcas_cutpoint_round_trips_and_corruption_fails_closed() {
 
     std::fs::write(&path, b"{\"group_id\":0,\"snapshot\":{\"body\":{}}").unwrap();
     assert!(matches!(source.capture_state_machine(repo_id), Err(SafeGcError::IncompleteProof(_))));
+}
+
+#[test]
+fn production_commit_publisher_seals_and_reloads_refcas_cutpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(RefCasCommitCutpointPublisher::new(dir.path(), 0).unwrap().group_id(), 0);
+    let (tenant_id, repo_id, history_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let main_oid = oid(SafeGcObjectFormat::Sha1, 7);
+    let next_oid = oid(SafeGcObjectFormat::Sha1, 8);
+    let sm = one_commit_state_machine(repo_id, tenant_id, history_id, &main_oid);
+    let backend = crate::pulls::remote_merge_finalizer::InProcessRefCasBackend::new(sm)
+        .with_safe_gc_cutpoint_publisher(dir.path(), 0)
+        .unwrap();
+    let rev = backend.state_machine().read_gate_version(repo_id).unwrap().unwrap().revision();
+    let request = CommitRefsRequest::new(
+        repo_id,
+        tenant_id,
+        Uuid::new_v4(),
+        IssuerLane::new("push").unwrap(),
+        2,
+        Uuid::new_v4(),
+        GitObjectFormat::Sha1,
+        history_id,
+        1,
+        1,
+        rev,
+        HeadUpdate::Keep,
+        CommitMode::Atomic,
+        vec![RefUpdate::new(
+            RefName::new("refs/heads/main").unwrap(),
+            RefPrecondition::Present(GitOid::parse(GitObjectFormat::Sha1, &main_oid).unwrap()),
+            RefTarget::Oid(GitOid::parse(GitObjectFormat::Sha1, &next_oid).unwrap()),
+        )],
+    )
+    .unwrap();
+    let resp = backend
+        .apply_repo_command(
+            repo_id,
+            RefCasCommand::CommitRefs(CommitRefsCommand {
+                request: WireCommitRefsRequest::from(&request),
+                decision_id: None,
+                required_holds: Vec::new(),
+                policy_rejects: BTreeMap::new(),
+                logical_tick: 2,
+            }),
+        )
+        .unwrap();
+    assert!(matches!(resp, ApplyResponse::RefsCommitted(_)));
+    assert!(safe_gc_refcas_cutpoint_path(dir.path(), repo_id).is_file());
+
+    let source = FsSealedRefCasCutpointSource::new(dir.path());
+    let (group_id, restored) = source.capture_state_machine(repo_id).unwrap().expect("published production cutpoint");
+    assert_eq!(group_id, 0);
+    assert_eq!(restored.last_applied().unwrap().index, 4);
+    assert_eq!(restored.read_refs(repo_id).get("refs/heads/main"), Some(&next_oid));
+}
+
+#[test]
+fn cold_reopen_clears_unheld_pg_barrier_and_requires_live_rebind() {
+    let (snap, _, _) = seed_fixture(SafeGcObjectFormat::Sha1, true);
+    let auth = snap.authority.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.json");
+    let authority = DurableSafeGcAuthority::open_with_journal(&path, Some(snap)).unwrap();
+    let arm = distributed_arm(&auth);
+    authority.set_gc_mode(GcMode::ArmedDestructive(arm.clone())).unwrap();
+    authority.rebind_pending_delete_live_pg_fence(7, arm.clone()).unwrap();
+    let proof = authority.build_authoritative_deletion_proof(arm.clone(), &[]).unwrap();
+    let batch_id = Uuid::new_v4();
+    let batch = authority
+        .begin_delete_batch(batch_id, auth.incarnation_id, auth.incarnation_epoch, auth.lease_epoch, proof)
+        .unwrap();
+    assert_eq!(batch.proof.reader_quiescence.pg_exclusive_reader_barrier_epoch, Some(7));
+    let key = batch.pending_keys[0].clone();
+    drop(authority);
+
+    let reopened = DurableSafeGcAuthority::open_with_journal(&path, None).unwrap();
+    assert!(reopened.snapshot().reader_leases.pg_exclusive_barrier_epoch.is_none());
+    assert!(matches!(
+        reopened.mint_fenced_step_ticket(batch_id, auth.incarnation_id, auth.incarnation_epoch, auth.lease_epoch, &key),
+        Err(SafeGcError::StaleDeleterFenced(_))
+    ));
+    reopened.rebind_pending_delete_live_pg_fence(8, distributed_arm(&auth)).unwrap();
+    assert_eq!(reopened.snapshot().reader_leases.pg_exclusive_barrier_epoch, Some(8));
+    assert!(
+        reopened
+            .mint_fenced_step_ticket(batch_id, auth.incarnation_id, auth.incarnation_epoch, auth.lease_epoch, &key)
+            .unwrap()
+            .is_some()
+    );
+}
+
+fn distributed_arm(auth: &AuthorityRecord) -> SafeGcArmReceipt {
+    SafeGcArmReceipt::seal(
+        auth.tenant_id,
+        auth.repo_id,
+        auth.history_id,
+        auth.incarnation_id,
+        auth.incarnation_epoch,
+        true,
+        AuthorityLane::DistributedRefCas {
+            ref_cas_authority_id: auth.repo_id,
+            quorum_epoch: 1,
+            raft_commit_index: 10,
+            quorum_verified: true,
+            global_hold_bridge_verified: true,
+            global_hold_bridge_seq: 10,
+            remote_backup_root_verified: true,
+            remote_backup_root_epoch: 1,
+            async_projection_only: false,
+        },
+    )
+    .unwrap()
 }

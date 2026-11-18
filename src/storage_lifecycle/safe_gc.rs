@@ -79,8 +79,9 @@ pub use model::{
 };
 pub use pg_maintenance::{ENV_BLOB_SAFE_GC_DESTRUCTIVE, safe_gc_destructive_env_enabled, safe_gc_journal_path};
 pub use pg_maintenance_dist::{
-    FsSealedRefCasCutpointSource, InMemoryRefCasCutpointSource, PersistedRefCasCutpointEnvelope, RefCasCutpointSource,
-    persist_refcas_cutpoint_snapshot, safe_gc_refcas_cutpoint_path,
+    FsSealedRefCasCutpointSource, InMemoryRefCasCutpointSource, PersistedRefCasCutpointEnvelope,
+    RefCasCommitCutpointPublisher, RefCasCutpointSource, persist_refcas_cutpoint_snapshot,
+    safe_gc_refcas_cutpoint_path,
 };
 pub use pg_reconcile::{reconcile_pg_refstore_authority, reconcile_refcas_quorum_into_authority};
 pub use proof::{DeletionProof, DeletionProofInputs, build_and_verify_deletion_proof, verify_deletion_proof};

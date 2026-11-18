@@ -2,6 +2,10 @@
 
 #[path = "storage_safe_gc_support/pg_refcas_cases.rs"]
 mod pg_refcas_cases;
+#[path = "storage_safe_gc_support/pg_refcas_merge_fixture.rs"]
+mod pg_refcas_merge_fixture;
+#[path = "storage_safe_gc_support/pg_refcas_restart_cases.rs"]
+mod pg_refcas_restart_cases;
 #[path = "storage_safe_gc_support/s3_harness.rs"]
 pub mod s3_harness;
 

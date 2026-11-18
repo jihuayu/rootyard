@@ -44,6 +44,8 @@ RUST_FILES = [
     ROOT / "tests" / "storage_safe_gc.rs",
     ROOT / "tests" / "storage_safe_gc_maintenance.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_cases.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_merge_fixture.rs",
+    ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_restart_cases.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "s3_harness.rs",
 ]
 WORKFLOW = ROOT / ".github" / "workflows" / "storage-safe-gc.yml"
@@ -98,6 +100,28 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("reconcile_refcas_cut_with_pg", dist)
+
+        coordinator = (
+            ROOT / "src" / "pulls" / "remote_merge_finalizer" / "coordinator.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("with_safe_gc_cutpoint_publisher", coordinator)
+        self.assertIn("publish_committed_state", coordinator)
+        cases = (ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_cases.rs").read_text(
+            encoding="utf-8"
+        )
+        merge_fixture = (
+            ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_merge_fixture.rs"
+        ).read_text(encoding="utf-8")
+        restart = (
+            ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_restart_cases.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("with_safe_gc_cutpoint_publisher", merge_fixture)
+        self.assertIn("production_refcas_pr_merge", cases)
+        self.assertIn("production_refcas_pr_merge", restart)
+        self.assertIn("run_claimed_safe_gc_once_with_fault", restart)
+        self.assertIn("reconcile_pending_delete_after_restart_fenced", restart)
+        for support in (merge_fixture, cases, restart):
+            self.assertNotIn("persist_refcas_cutpoint_snapshot", support)
 
     def test_workflow_and_doc_contracts(self) -> None:
         wf_raw = WORKFLOW.read_bytes()

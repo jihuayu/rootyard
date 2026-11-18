@@ -16,6 +16,7 @@ use crate::ref_store::core::state_machine::{
 };
 use crate::ref_store::core::terminal::{CommitRejectCode, CommitTerminal, RefCommitResult};
 use crate::ref_store::projector::DecisionGrantKeyring;
+use crate::storage_lifecycle::safe_gc::{RefCasCommitCutpointPublisher, SafeGcError};
 
 use super::projector::{MergeReceiptStore, PullMergeReceiptProjector};
 use super::types::{
@@ -44,14 +45,8 @@ pub enum AuthorityCommitOutcome {
         terminal_digest: Option<String>,
         reason: String,
     },
-    Cancelled {
-        log_index: Option<u64>,
-        log_term: Option<u64>,
-        reason: String,
-    },
-    UnknownPending {
-        reason: String,
-    },
+    Cancelled { log_index: Option<u64>, log_term: Option<u64>, reason: String },
+    UnknownPending { reason: String },
 }
 
 pub trait MergeAuthorityBackend: Send + Sync {
@@ -70,11 +65,7 @@ pub trait MergeAuthorityBackend: Send + Sync {
         base_ref: &'a str,
     ) -> BackendFuture<'a, Option<AuthorityCommitOutcome>>;
 
-    fn read_ref_oid<'a>(
-        &'a self,
-        repository_id: Uuid,
-        ref_name: &'a str,
-    ) -> BackendFuture<'a, Option<String>>;
+    fn read_ref_oid<'a>(&'a self, repository_id: Uuid, ref_name: &'a str) -> BackendFuture<'a, Option<String>>;
 }
 
 pub fn original_operation_log_id(
@@ -98,6 +89,7 @@ pub struct InProcessRefCasBackend {
     sm: Arc<Mutex<RefCasStateMachine>>,
     next_index: Arc<Mutex<u64>>,
     op_log_ids: Arc<Mutex<BTreeMap<(Uuid, Uuid), AppliedLogId>>>,
+    cutpoint_publisher: Option<RefCasCommitCutpointPublisher>,
 }
 
 impl InProcessRefCasBackend {
@@ -107,6 +99,7 @@ impl InProcessRefCasBackend {
             sm: Arc::new(Mutex::new(sm)),
             next_index: Arc::new(Mutex::new(next)),
             op_log_ids: Arc::new(Mutex::new(BTreeMap::new())),
+            cutpoint_publisher: None,
         }
     }
 
@@ -123,6 +116,30 @@ impl InProcessRefCasBackend {
         let idx = *guard;
         *guard = idx.saturating_add(1);
         AppliedLogId { term: 1, index: idx }
+    }
+
+    pub fn with_safe_gc_cutpoint_publisher(
+        mut self,
+        storage_root: impl Into<std::path::PathBuf>,
+        group_id: i64,
+    ) -> Result<Self, SafeGcError> {
+        self.cutpoint_publisher = Some(RefCasCommitCutpointPublisher::new(storage_root, group_id)?);
+        Ok(self)
+    }
+
+    pub fn apply_repo_command(
+        &self,
+        repository_id: Uuid,
+        cmd: RefCasCommand,
+    ) -> Result<ApplyResponse, RemoteMergeError> {
+        let log_id = self.next_log_id();
+        let mut sm = self.sm.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pub_sink) = &self.cutpoint_publisher {
+            return pub_sink
+                .apply_and_publish(&mut sm, repository_id, log_id, cmd)
+                .map_err(|e| RemoteMergeError::Io(format!("Ref-CAS apply/publish cutpoint failed: {e}")));
+        }
+        sm.apply(log_id, cmd).map_err(|e| RemoteMergeError::RemoteAuthzDenied(e.to_string()))
     }
 }
 
@@ -172,6 +189,11 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
                         }
                     };
                     let diag_base = sm.read_refs(repository_id).get(base_ref).cloned();
+                    if let Some(pub_sink) = &self.cutpoint_publisher {
+                        pub_sink
+                            .publish_committed_state(repository_id, &sm, &[])
+                            .map_err(|e| RemoteMergeError::Io(format!("publish Ref-CAS cutpoint snapshot failed: {e}")))?;
+                    }
                     map_commit_receipt_to_outcome(stored_idx, base_ref, &receipt.terminal, receipt.replayed, diag_base)
                 }
                 Ok(other) => Err(RemoteMergeError::Equivocation(format!("unexpected RefCas response: {other:?}"))),
@@ -238,11 +260,7 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
         })
     }
 
-    fn read_ref_oid<'a>(
-        &'a self,
-        repository_id: Uuid,
-        ref_name: &'a str,
-    ) -> BackendFuture<'a, Option<String>> {
+    fn read_ref_oid<'a>(&'a self, repository_id: Uuid, ref_name: &'a str) -> BackendFuture<'a, Option<String>> {
         Box::pin(async move {
             let sm = self.sm.lock().unwrap_or_else(|e| e.into_inner());
             Ok(sm.read_refs(repository_id).get(ref_name).cloned())
@@ -283,10 +301,7 @@ pub fn map_commit_receipt_to_outcome(
             replayed,
         });
     }
-    let reject_code = terminal
-        .rejection
-        .as_ref()
-        .map_or(CommitRejectCode::PolicyDenied, |r| r.code);
+    let reject_code = terminal.rejection.as_ref().map_or(CommitRejectCode::PolicyDenied, |r| r.code);
     let reason = format!("ref-cas rejected `{base_ref}` with {}", reject_code.as_str());
     Ok(AuthorityCommitOutcome::Rejected {
         log_index: Some(log_id.index),
@@ -308,11 +323,9 @@ pub fn map_sm_error_to_outcome(
     match err {
         StateMachineError::AuthzFloorViolation { .. }
         | StateMachineError::ScopeClosingOrClosed { .. }
-        | StateMachineError::DecisionExpired { .. } => AuthorityCommitOutcome::Cancelled {
-            log_index: idx,
-            log_term: term,
-            reason: err.to_string(),
-        },
+        | StateMachineError::DecisionExpired { .. } => {
+            AuthorityCommitOutcome::Cancelled { log_index: idx, log_term: term, reason: err.to_string() }
+        }
         StateMachineError::DecisionDigestMismatch { reason, .. } => AuthorityCommitOutcome::Rejected {
             log_index: idx,
             log_term: term,
@@ -322,11 +335,7 @@ pub fn map_sm_error_to_outcome(
             reason: reason.to_owned(),
         },
         StateMachineError::Store(crate::ref_store::contract::RefStoreError::Cancelled { .. }) => {
-            AuthorityCommitOutcome::Cancelled {
-                log_index: idx,
-                log_term: term,
-                reason: err.to_string(),
-            }
+            AuthorityCommitOutcome::Cancelled { log_index: idx, log_term: term, reason: err.to_string() }
         }
         other => AuthorityCommitOutcome::Rejected {
             log_index: idx,
@@ -368,9 +377,7 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> PullRemoteMergeProducer
         let validated = verify_pull_remote_authz_grant(spec, pull, self.keyring)?;
 
         if matches!(fault, MergeFaultInjection::DisconnectBeforePendingInsert) {
-            return Err(RemoteMergeError::PgDatabase(
-                "injected PG disconnect before pending merge insert".into(),
-            ));
+            return Err(RemoteMergeError::PgDatabase("injected PG disconnect before pending merge insert".into()));
         }
 
         let pending = PendingMergeRecord {
@@ -446,12 +453,7 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> PullRemoteMergeProducer
                     )));
                 }
                 let receipt = pending.into_committed_receipt(
-                    merged_oid,
-                    log_index,
-                    log_term,
-                    gate_revision,
-                    terminal_digest,
-                    replayed,
+                    merged_oid, log_index, log_term, gate_revision, terminal_digest, replayed,
                 );
                 self.projector
                     .project_committed(&receipt, pending.expected_storage_generation, pending.expected_version, update_forge_pulls)

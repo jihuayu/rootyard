@@ -1,7 +1,6 @@
 //! Real PG17 + `RefCasStateMachine` + migration-149 `ref_cas_projection_cursors` cut acceptance (#122).
 
 use std::{
-    collections::BTreeMap,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
@@ -9,20 +8,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use rootyard::{
     AppState, dispatch, metrics,
-    ref_store::{
-        CommitRefsRequest, IssuerLane,
-        core::{
-            contract::CommitMode,
-            state_machine::{
-                AppliedLogId, BeginOperationCommand, CommitRefsCommand, InitializeGateCommand, RefCasCommand,
-                RefCasStateMachine, RepositoryLane, SmPackMode, WireCommitRefsRequest, WireGateInit,
-            },
-            types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget, RefUpdate},
-        },
-        projector::{
-            ProjectionRealm, RefCasEventEnvelope,
-            pg::{load_or_init_cursor_for_update, project_event_in_tx},
-        },
+    ref_store::projector::{
+        ProjectionRealm, RefCasEventEnvelope,
+        pg::{load_or_init_cursor_for_update, project_event_in_tx},
     },
     storage,
     storage_lifecycle::{
@@ -33,9 +21,10 @@ use rootyard::{
             domain::AuthorityRecord,
             model::{AuthorityLane, GcMode, SafeGcObjectFormat, SourceFreshness},
             pg_maintenance::safe_gc_journal_path,
-            pg_maintenance_dist::{InMemoryRefCasCutpointSource, persist_refcas_cutpoint_snapshot},
+            pg_maintenance_dist::InMemoryRefCasCutpointSource,
             pg_reconcile::reconcile_pg_refstore_authority,
             refcas_cut::reconcile_refcas_cut_with_pg,
+            safe_gc_refcas_cutpoint_path,
             store::DurableSafeGcAuthority,
         },
         scheduler, worker,
@@ -46,22 +35,24 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use super::{
-    PG_SAFE_GC_TEST_LOCK, app_config, isolated_pg_pool, provision_pg_refstore_repo,
+    PG_SAFE_GC_TEST_LOCK, app_config, isolated_pg_pool,
+    pg_refcas_merge_fixture::{force_scan_and_schedule, production_refcas_pr_merge},
+    provision_pg_refstore_repo,
     s3_harness::{LoopbackS3, build_pack_via_opendal, build_snapshot, git_cmd, make_serving_record},
     test_policy,
 };
 
-async fn force_scan_and_schedule(
+async fn gate_fails_closed(
     state: &Arc<AppState>,
     pool: &deadpool_postgres::Pool,
     policy: &Policy,
+    owner: Uuid,
     repo_id: Uuid,
+    label: &str,
 ) -> Result<()> {
-    pool.get()
-        .await?
-        .execute("UPDATE storage_maintenance_repo_state SET last_scan_at = NULL WHERE repository_id = $1", &[&repo_id])
-        .await?;
-    assert_eq!(scheduler::schedule_once(state, policy).await?, 1);
+    force_scan_and_schedule(state, pool, policy, repo_id).await?;
+    let out = worker::run_once(state, policy, owner).await?.with_context(|| format!("{label} worker"))?;
+    ensure!(out.state == "failed", "{label} must fail closed");
     Ok(())
 }
 
@@ -95,15 +86,21 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
     let journal = safe_gc_journal_path(&state.storage.root, repo_id);
     let dl = Instant::now() + Duration::from_secs(60);
 
+    // `base_oid` on `main`, then a fast-forward feature commit `main_oid`; `HEAD` therefore
+    // packs both commits into `p_main`.
     let git_repo = dir.path().join("src.git");
     std::fs::create_dir_all(&git_repo)?;
     git_cmd(&git_repo, &["init", "--object-format=sha1", "--initial-branch=main"], None)?;
-    std::fs::write(git_repo.join("main.txt"), b"refcas-main")?;
+    std::fs::write(git_repo.join("main.txt"), b"refcas-base")?;
     git_cmd(&git_repo, &["add", "."], None)?;
-    git_cmd(&git_repo, &["commit", "-m", "main"], None)?;
+    git_cmd(&git_repo, &["commit", "-m", "base"], None)?;
+    let base_oid = git_cmd(&git_repo, &["rev-parse", "refs/heads/main"], None)?;
+    std::fs::write(git_repo.join("main.txt"), b"refcas-main")?;
+    git_cmd(&git_repo, &["commit", "-am", "main"], None)?;
     let (p_main, p_main_rec, i_main, i_main_rec, main_oid, oids_main) =
         build_pack_via_opendal(&provider, &git_repo, &dir.path().join("sm"), "HEAD", (tenant_id, repo_id, 1), dl)
             .await?;
+    ensure!(main_oid != base_oid, "fast-forward feature commit must advance main");
 
     git_cmd(&git_repo, &["checkout", "--orphan", "orphan"], None)?;
     git_cmd(&git_repo, &["read-tree", "--empty"], None)?;
@@ -132,7 +129,7 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         auth_rec.clone(),
         SafeGcObjectFormat::Sha1,
         main_oid.clone(),
-        vec![srv_main, srv_orph.clone()],
+        vec![srv_main, srv_orph],
         reg,
         None,
     );
@@ -173,8 +170,6 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
     let rep_pack_loc = snap_off.active_packs[0].pack_locator.to_locator()?;
     let rep_idx_loc = snap_off.active_packs[0].idx_locator.to_locator()?;
     drop(reloaded);
-
-    // The LoopbackS3 versioned helpers must stay live in this binary.
     let saved_orph = s3.get_stored(&p_orph).expect("p_orph stored");
     let replaced_orph = s3.overwrite_same_length(&p_orph, 0x6b);
     assert_eq!(replaced_orph.bytes.len(), saved_orph.bytes.len());
@@ -196,10 +191,10 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         AuthorityLane::DistributedRefCas {
             ref_cas_authority_id: repo_id,
             quorum_epoch: 1,
-            raft_commit_index: 3,
+            raft_commit_index: 4,
             quorum_verified: true,
             global_hold_bridge_verified: true,
-            global_hold_bridge_seq: 3,
+            global_hold_bridge_seq: 4,
             remote_backup_root_verified: true,
             remote_backup_root_epoch: 1,
             async_projection_only: false,
@@ -211,74 +206,22 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
     }
 
     // Gate A: armed DistributedRefCas with no authoritative RefCasCutpointSource fails closed.
-    force_scan_and_schedule(&state, &pool, &policy, repo_id).await?;
-    let gate_a = worker::run_once(&state, &policy, worker_owner).await?.context("gate A worker")?;
-    assert_eq!(gate_a.state, "failed");
+    gate_fails_closed(&state, &pool, &policy, worker_owner, repo_id, "gate A").await?;
+    assert!(!safe_gc_refcas_cutpoint_path(&state.storage.root, repo_id).is_file());
     assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph));
 
-    // Authoritative Ref-CAS quorum state: InitializeGate idx=1, BeginOperation idx=2, CommitRefs idx=3 (event_seq=1).
-    let mut sm = RefCasStateMachine::new();
-    sm.apply(
-        AppliedLogId { term: 1, index: 1 },
-        RefCasCommand::InitializeGate(InitializeGateCommand {
-            gate: WireGateInit {
-                repository_id: repo_id,
-                tenant_id,
-                object_format: GitObjectFormat::Sha1,
-                history_incarnation: history_id,
-                authority_epoch: 1,
-                group_epoch: 1,
-                head_ref: "refs/heads/main".into(),
-            },
-            lane: RepositoryLane::LegacyUnservedGitfs,
-            pack_mode: SmPackMode::MetadataOnly,
-            authz_floor: 0,
-        }),
-    )?;
-    let request = CommitRefsRequest::new(
-        repo_id,
-        tenant_id,
-        Uuid::new_v4(),
-        IssuerLane::new("push")?,
-        1,
-        Uuid::new_v4(),
-        GitObjectFormat::Sha1,
-        history_id,
-        1,
-        1,
-        1,
-        HeadUpdate::Keep,
-        CommitMode::Atomic,
-        vec![RefUpdate::new(
-            RefName::new("refs/heads/main")?,
-            RefPrecondition::Absent,
-            RefTarget::Oid(GitOid::parse(GitObjectFormat::Sha1, &main_oid)?),
-        )],
-    )?;
-    let fixed_wire = WireCommitRefsRequest::from(&request);
-    sm.apply(
-        AppliedLogId { term: 1, index: 2 },
-        RefCasCommand::BeginOperation(BeginOperationCommand { identity: fixed_wire.identity.clone(), logical_tick: 1 }),
-    )?;
-    sm.apply(
-        AppliedLogId { term: 1, index: 3 },
-        RefCasCommand::CommitRefs(CommitRefsCommand {
-            request: fixed_wire,
-            decision_id: None,
-            required_holds: Vec::new(),
-            policy_rejects: BTreeMap::new(),
-            logical_tick: 2,
-        }),
-    )?;
-    persist_refcas_cutpoint_snapshot(&state.storage.root, repo_id, 0, &sm, &[])?;
+    // The production PR-merge Ref-CAS commit path publishes the sealed cutpoint snapshot.
+    let sm = production_refcas_pr_merge(&state, tenant_id, repo_id, history_id, &base_oid, &main_oid).await?;
+    assert!(safe_gc_refcas_cutpoint_path(&state.storage.root, repo_id).is_file());
+    assert_eq!(sm.last_applied().context("Ref-CAS last_applied")?.index, 4);
+    let events: Vec<(u64, u64)> = sm.snapshot()?.body.events.iter().map(|ev| (ev.event_seq, ev.log_index)).collect();
+    assert_eq!(events, vec![(1, 2), (2, 4)]);
 
     // Gate B: sealed cutpoint exists but PG `ref_cas_projection_cursors` row is missing.
-    force_scan_and_schedule(&state, &pool, &policy, repo_id).await?;
-    let gate_b = worker::run_once(&state, &policy, worker_owner).await?.context("gate B worker")?;
-    assert_eq!(gate_b.state, "failed");
+    gate_fails_closed(&state, &pool, &policy, worker_owner, repo_id, "gate B").await?;
     assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph));
 
-    // Gate C: genesis cursor event_seq=0 vs Ref-CAS event_seq=1 must fail closed.
+    // Gate C: genesis cursor event_seq=0 vs Ref-CAS event_seq=2 must fail closed.
     let realm = ProjectionRealm::new(history_id, 0, 1)?;
     let mut tx_conn = pool.get().await?;
     let tx = tx_conn.transaction().await?;
@@ -292,22 +235,29 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
         Err(SafeGcError::IncompleteProof(_))
     ));
     drop(pgc);
-    force_scan_and_schedule(&state, &pool, &policy, repo_id).await?;
-    let gate_c = worker::run_once(&state, &policy, worker_owner).await?.context("gate C worker")?;
-    assert_eq!(gate_c.state, "failed");
+    gate_fails_closed(&state, &pool, &policy, worker_owner, repo_id, "gate C").await?;
     assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph));
 
-    // Gate D: projected event_seq=1 but a queued `ref_cas_projection_jobs` row remains unresolved.
-    let sm_ev = sm.snapshot()?.body.events.into_iter().next().expect("committed event");
-    let env = RefCasEventEnvelope::from_state_machine_event(realm, Some(tenant_id), None, None, &sm_ev)?;
+    // Gate C2: project only event_seq=1; the unprojected PR merge commit still fails closed.
+    let seed_ev = sm.snapshot()?.body.events.first().context("seed event")?.clone();
+    let seed_env = RefCasEventEnvelope::from_state_machine_event(realm, Some(tenant_id), None, None, &seed_ev)?;
+    let mut tx_conn = pool.get().await?;
+    let tx = tx_conn.transaction().await?;
+    let _ = project_event_in_tx(&tx, &seed_env, None).await?;
+    tx.commit().await?;
+    drop(tx_conn);
+    gate_fails_closed(&state, &pool, &policy, worker_owner, repo_id, "gate C2").await?;
+    assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph));
+
+    // Gate D: project event_seq=2 but leave the queued `ref_cas_projection_jobs` row unresolved.
+    let merge_ev = sm.snapshot()?.body.events.last().context("merge event")?.clone();
+    let merge_env = RefCasEventEnvelope::from_state_machine_event(realm, Some(tenant_id), None, None, &merge_ev)?;
     let mut tx_conn2 = pool.get().await?;
     let tx2 = tx_conn2.transaction().await?;
-    let _ = project_event_in_tx(&tx2, &env, None).await?;
+    let _ = project_event_in_tx(&tx2, &merge_env, None).await?;
     tx2.commit().await?;
     drop(tx_conn2);
-    force_scan_and_schedule(&state, &pool, &policy, repo_id).await?;
-    let gate_d = worker::run_once(&state, &policy, worker_owner).await?.context("gate D worker")?;
-    assert_eq!(gate_d.state, "failed");
+    gate_fails_closed(&state, &pool, &policy, worker_owner, repo_id, "gate D").await?;
     assert!(s3.has_key(&p_orph) && s3.has_key(&i_orph));
 
     let mem_src = InMemoryRefCasCutpointSource::new();
@@ -334,8 +284,8 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
     let res_json: serde_json::Value =
         pgc.query_one("SELECT result FROM storage_maintenance_jobs WHERE id = $1", &[&sweep_out.job_id]).await?.get(0);
     assert_eq!(res_json["authority_lane"], "distributed_refcas");
-    assert_eq!(res_json["refcas_cut_event_seq"], 1);
-    assert_eq!(res_json["refcas_cut_log_index"], 3);
+    assert_eq!(res_json["refcas_cut_event_seq"], 2);
+    assert_eq!(res_json["refcas_cut_log_index"], 4);
     drop(pgc);
 
     let _ = worker::run_once_with_refcas_source(&state, &policy, worker_owner, Some(&mem_src)).await?;
@@ -347,7 +297,7 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
     assert!(!s3.has_key(&p_orph) && !s3.has_key(&i_orph));
     let reloaded = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
     let cut = reloaded.snapshot().paired_cursors.refcas_cut.expect("persisted RefCasReconciledCut");
-    assert_eq!(cut.sm_applied_event_seq, 1);
+    assert_eq!(cut.sm_applied_event_seq, 2);
 
     // A later pass with projected cursors must never carry this cut forward as Reconciled.
     let pgc_reset = pool.get().await?;

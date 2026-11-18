@@ -187,6 +187,16 @@ impl SafeGcRepoSnapshot {
                 "SingleNodePg live fence epoch does not exactly equal armed barrier epoch",
             ));
         }
+        if (proof.reader_quiescence.pg_exclusive_reader_barrier_epoch.is_some()
+            || self.reader_leases.pg_exclusive_barrier_epoch.is_some())
+            && (proof.reader_quiescence.pg_exclusive_reader_barrier_epoch.is_none()
+                || proof.reader_quiescence.pg_exclusive_reader_barrier_epoch
+                    != self.reader_leases.pg_exclusive_barrier_epoch)
+        {
+            return Err(SafeGcError::StaleDeleterFenced(
+                "live PG gc_epoch fence missing or does not exactly equal deletion proof barrier epoch",
+            ));
+        }
         if proof.membership_generation != self.authority.membership_generation
             || proof.membership_digest != self.compute_membership_digest()
         {
@@ -340,6 +350,9 @@ impl SafeGcRepoSnapshot {
             tombstoned_pack_ids: &tombstoned_none,
         });
         for c in &proof.candidates {
+            if self.key_registry.deleted_tombstones.contains(&c.physical_key) {
+                continue;
+            }
             let unreplaced: Vec<String> =
                 c.contained_oids.iter().filter(|o| !active_oids.contains(o.as_str())).cloned().collect();
             let _ = require_pack_cover_gc_eligible(&live_index, c.pack_id, &unreplaced)?;
