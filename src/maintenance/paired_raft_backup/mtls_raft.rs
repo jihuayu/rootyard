@@ -1,5 +1,4 @@
-//! Production 3-voter mTLS live Raft backend (`raft-node`) with X.509 SAN-authenticated
-//! peers, `EnsureReadIndex` linearizable barriers, and separated quorum vs local apply (#153).
+//! Production 3-voter mTLS live Raft backend with X.509-authenticated peers, linearizable barriers, split apply (#153).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -26,6 +25,7 @@ use super::raft_barrier::{
 use super::types::{NewIncarnationAuthority, PairedBackupError, sha256_json_tagged};
 
 const FREEZE_KV_KEY: &str = "refcas/paired_freeze";
+const FREEZE_RECORD_MISSING: &str = "3-voter mTLS Raft freeze record missing";
 pub(super) const INCARNATION_KV_KEY: &str = "refcas/cluster_incarnation";
 pub(super) const GROUP_EPOCH_KV_KEY: &str = "refcas/group_epoch";
 
@@ -63,17 +63,13 @@ pub struct MtlsLiveRaftBackend {
 impl MtlsLiveRaftBackend {
     pub fn connect(cfg: MtlsRaftClusterConfig) -> Result<Self, PairedBackupError> {
         if cfg.group_id < 0 || cfg.voter_endpoints.len() < MIN_QUORUM_VOTERS {
-            return Err(PairedBackupError::InvalidArgument(
-                "live mTLS Raft cluster requires non-negative group_id and >= 3 voter endpoints",
-            ));
+            return Err(PairedBackupError::InvalidArgument("live mTLS Raft needs group_id >= 0 and >= 3 voters"));
         }
         if !cfg.voter_endpoints.contains_key(&cfg.local_node_id) {
             return Err(PairedBackupError::InvalidArgument("local_node_id must belong to voter_endpoints"));
         }
         if cfg.attestor_endpoints.keys().ne(cfg.voter_endpoints.keys()) {
-            return Err(PairedBackupError::InvalidArgument(
-                "attestor_endpoints must cover exactly the configured Raft voter node_ids",
-            ));
+            return Err(PairedBackupError::InvalidArgument("attestor_endpoints must cover the Raft voter node_ids"));
         }
         let tls_cfg = build_mtls_client_config(&cfg)?;
         let mut voter_bindings = BTreeMap::new();
@@ -159,9 +155,9 @@ impl MtlsLiveRaftBackend {
         let Some(raw) = self.linearizable_kv_get(INCARNATION_KV_KEY)? else {
             return Ok(None);
         };
-        serde_json::from_str(&raw)
-            .map(Some)
-            .map_err(|_| PairedBackupError::StateMachine("corrupt Raft incarnation record".into()))
+        let inc = serde_json::from_str(&raw)
+            .map_err(|_| PairedBackupError::StateMachine("corrupt Raft incarnation record".into()))?;
+        Ok(Some(inc))
     }
 
     fn probe_live_voters(&self) -> Result<(BTreeMap<u64, AuthenticatedVoterInfo>, u64), PairedBackupError> {
@@ -221,12 +217,9 @@ impl MtlsLiveRaftBackend {
         let deadline = Instant::now() + Duration::from_secs(12);
         let mut target: Option<u64> = None;
         while Instant::now() < deadline {
-            let (infos, lid) = match self.probe_live_voters() {
-                Ok(v) => v,
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(60));
-                    continue;
-                }
+            let Ok((infos, lid)) = self.probe_live_voters() else {
+                std::thread::sleep(Duration::from_millis(60));
+                continue;
             };
             let candidate = target.take().filter(|id| self.cfg.voter_endpoints.contains_key(id)).unwrap_or(lid);
             let addr = &self.cfg.voter_endpoints[&candidate];
@@ -480,6 +473,14 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
     fn committed_quorum_index(&self) -> Result<u64, PairedBackupError> {
         let (_, seq) = self.replay_linearizable_sm()?;
         Ok(seq)
+    }
+
+    fn verify_freeze_barrier_active(&self, expected_barrier_id: Uuid) -> Result<(), PairedBackupError> {
+        let rec = self.read_freeze_record()?.ok_or(PairedBackupError::FreezeNotHeld(FREEZE_RECORD_MISSING))?;
+        if !rec.frozen || rec.barrier_id != expected_barrier_id {
+            return Err(PairedBackupError::FreezeNotHeld("3-voter mTLS Raft freeze barrier released early"));
+        }
+        Ok(())
     }
 
     fn durable_state_machine(&self) -> &RefCasStateMachine {

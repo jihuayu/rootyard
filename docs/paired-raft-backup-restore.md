@@ -63,7 +63,23 @@ Classification tags used below:
 
 ---
 
-## 5. Verification Commands
+## 5. Fence-Hold Continuity, X.509 Caller Authorization & Restored Realm Re-Homing (`EnforcedRestoreProtocol`)
+
+1. **Fence held through archive *and* receipt publication**:
+   - [`pg_write_fence.rs`](../src/maintenance/paired_raft_backup/pg_write_fence.rs) `verify_held` is one round-trip probe that requires the same `pg_backend_pid()`, one granted `SHARE` lock per `public` base table, an unchanged public base-table count, and `backend_xid IS NULL`; any drift is `FreezeNotHeld`.
+   - [`durable_guarded_ops.rs`](../src/maintenance/paired_raft_backup/durable_guarded_ops.rs) adds `verify_fence_intact_for_publication`, which re-proves the SHARE fence, zero concurrent PG writers except the fence backend, `pando_storage_authorities.remote_delete_fenced`, `verify_still_frozen_on`, every peer `committed_quorum_index >= barrier_log_id.index`, and `verify_freeze_barrier_active` before any archive or receipt is published.
+   - [`format30_paired.rs`](../src/maintenance/paired_raft_backup/format30_paired.rs) re-runs that proof at four boundaries (before the PG cutpoint, after `crate::backup::create`, before `COMPLETE`+rename, and after archive verification before `SealedArchiveReceipt::mint`); a failed proof removes the partial/published directory and returns `FreezeNotHeld`.
+   - `DurableFreezeHandle` exposes the `#[doc(hidden)]` `fault_drop_fence_stage` injection seam used only by the ignored gate-7 test.
+2. **Durable WAL digest and quorum-reached cutpoint bound into attestations**:
+   - `PeerDurableAttestationClaims` now carries `durable_sqlite_sha256`; [`peer_attestation.rs`](../src/maintenance/paired_raft_backup/peer_attestation.rs) rejects a missing/short/all-zero digest, and [`wal_voters.rs`](../src/maintenance/paired_raft_backup/wal_voters.rs) fills it with the real SHA-256 of each voter slot's fsynced WAL (or a tagged empty-slot digest).
+   - `AttestCutpointRequest` gains `min_committed_index`; the voter refuses (`FreezeNotHeld`) unless `expected_seq > 0`, `min_committed_index >= expected_seq`, `committed_applied_index >= expected_seq`, `committed_applied_index >= min_committed_index`, and `last_log_index >= committed_applied_index`.
+   - [`raft_barrier.rs`](../src/maintenance/paired_raft_backup/raft_barrier.rs) `verify_cutpoint_attestations` repeats the committed-index reach, the hex/all-zero `durable_sqlite_sha256` check, and every quorum attestation must come from a distinct archived voter.
+3. **Peer attestor callers authorized by X.509 identity**: [`peer_caller_auth.rs`](../src/maintenance/paired_raft_backup/peer_caller_auth.rs) extracts the leaf `subjectAltName` DNS entries, requires the pinned `raft-client.refcas.internal` identity, and intersects the presented chain with either the explicit `--allow-caller-sha256` allowlist or the configured `raft-client` leaf digest before any request is dispatched; refusals return a framed `{"Error": ...}` response. The allowlist is threaded through `ROOTYARD_PAIRED_RAFT_ATTESTOR_JSON` and [`src/bin/rootyard-peer-attestor.rs`](../src/bin/rootyard-peer-attestor.rs).
+4. **Restored A3/A4/decision realm re-homing**: [`format30_realm_rehome.rs`](../src/maintenance/paired_raft_backup/format30_realm_rehome.rs) rewrites `history_incarnation`/`authority_epoch`/`group_epoch` on the restored gates, protocol-repo state, snapshots, retained roots, publication decisions, A3 hold requests, A4 pack publications, and serving repositories, then decodes and re-encodes each bounded A3 `AcquireAck`/`ConsumeAck` and A4 `PackRegistrationAck` body (recomputing `consume_digest` and the duplicated `registered` history body) so row and body can never disagree after the boot re-home. [`format30_boot.rs`](../src/maintenance/paired_raft_backup/format30_boot.rs) calls it inside the `session_replication_role = replica` transaction.
+
+---
+
+## 6. Verification Commands
 
 ```bash
 cargo fmt --all -- --check

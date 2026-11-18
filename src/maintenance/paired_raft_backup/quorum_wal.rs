@@ -40,6 +40,9 @@ pub trait DurableRaftBackend {
     fn durable_snapshot(&self) -> Result<RefCasSnapshot, PairedBackupError> {
         Ok(self.durable_state()?.0)
     }
+    fn verify_freeze_barrier_active(&self, _expected_barrier_id: Uuid) -> Result<(), PairedBackupError> {
+        Ok(())
+    }
     fn durable_state_machine(&self) -> &RefCasStateMachine;
 }
 
@@ -183,7 +186,12 @@ impl WalSyncedRaftBackend {
         wal_record_digest: &str,
     ) -> Result<VoterWalAck, PairedBackupError> {
         super::wal_voters::sign_commit_ack(
-            &WalVoterRing { voter_ids: &self.voter_ids, bindings: &self.voter_bindings, keys: &self.voter_keys },
+            &WalVoterRing {
+                voter_ids: &self.voter_ids,
+                bindings: &self.voter_bindings,
+                keys: &self.voter_keys,
+                wal_base: &self.wal_path,
+            },
             self.group_id,
             slot,
             group_epoch,
@@ -360,7 +368,12 @@ impl DurableRaftBackend for WalSyncedRaftBackend {
         state_digest: &str,
     ) -> Result<Vec<PeerDurableAttestation>, PairedBackupError> {
         let attestations = super::wal_voters::sign_cutpoint_attestations(
-            &WalVoterRing { voter_ids: &self.voter_ids, bindings: &self.voter_bindings, keys: &self.voter_keys },
+            &WalVoterRing {
+                voter_ids: &self.voter_ids,
+                bindings: &self.voter_bindings,
+                keys: &self.voter_keys,
+                wal_base: &self.wal_path,
+            },
             self.group_id,
             group_epoch,
             &self.voter_online,

@@ -7,12 +7,14 @@ use std::path::{Path, PathBuf};
 
 use ring::signature::Ed25519KeyPair;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::ref_store::core::state_machine::{AppliedLogId, RefCasSnapshot};
 
 use super::peer_attestation::{
     PeerDurableAttestation, PeerDurableAttestationClaims, derive_voter_uuid_bound, load_or_create_ed25519_keypair,
+    sync_file_if_exists,
 };
 use super::raft_barrier::{MIN_QUORUM_VOTERS, VoterWalAck};
 use super::types::{PairedBackupError, sha256_json_tagged};
@@ -45,6 +47,25 @@ pub(super) struct WalVoterRing<'a> {
     pub(super) voter_ids: &'a [Uuid],
     pub(super) bindings: &'a [WalVoterBinding],
     pub(super) keys: &'a [Ed25519KeyPair],
+    pub(super) wal_base: &'a Path,
+}
+
+/// Real SHA-256 of the voter slot's fsynced WAL bytes, with a distinct empty-slot fallback.
+fn voter_durable_sqlite_sha256(
+    ring: &WalVoterRing<'_>,
+    group_id: i64,
+    slot: usize,
+    index: u64,
+) -> Result<String, PairedBackupError> {
+    let mut path = ring.wal_base.to_path_buf();
+    if slot != 0 {
+        path = sidecar(ring.wal_base, &format!("voter{slot}.wal"));
+    }
+    if !fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() > 0) {
+        return sha256_json_tagged(b"wal-voter-empty", &(group_id, slot as u64, index));
+    }
+    sync_file_if_exists(&path)?;
+    Ok(hex::encode(Sha256::digest(fs::read(&path)?)))
 }
 
 pub(super) fn sidecar(base: &Path, suffix: &str) -> PathBuf {
@@ -154,6 +175,7 @@ pub(super) fn sign_commit_ack(
             refcas_seq: log_id.index,
             subject_digest: command_sha256.to_owned(),
             secondary_digest: wal_record_digest.to_owned(),
+            durable_sqlite_sha256: voter_durable_sqlite_sha256(ring, group_id, slot, log_id.index)?,
         },
         keypair,
     )?;
@@ -200,6 +222,7 @@ pub(super) fn sign_cutpoint_attestations(
                 refcas_seq: applied.index,
                 subject_digest: state_digest.to_owned(),
                 secondary_digest: snapshot.checksum.clone(),
+                durable_sqlite_sha256: voter_durable_sqlite_sha256(ring, group_id, slot, applied.index)?,
             },
             &ring.keys[slot],
         )?);

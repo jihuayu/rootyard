@@ -112,12 +112,14 @@ pub async fn create_format30_paired_raft_backup(
     let (peer_cuts, peer_proofs) = extract_peer_expected_cuts(req.raft.group_id(), &req.peer_groups)?;
 
     let parsed_dsn: tokio_postgres::Config = req.src_config.database_url.parse().map_err(pg_err)?;
+    let mut pg_client =
+        crate::db::connect_config(parsed_dsn).await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
+    let freeze = req.freeze_handle;
     let pg_proof = {
-        let mut pg_client =
-            crate::db::connect_config(parsed_dsn).await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
-        req.freeze_handle.verify_still_frozen_on(&pg_client, req.raft).await?;
-        let fence_pid = req.freeze_handle.write_fence_pid().await;
+        freeze.verify_still_frozen_on(&pg_client, req.raft).await?;
+        let fence_pid = freeze.write_fence_pid().await;
         verify_no_active_pg_writers_except_fence(&pg_client, fence_pid).await?;
+        freeze.verify_fence_intact_for_publication(&pg_client, req.raft, &req.peer_groups).await?;
         let tx = pg_client
             .build_transaction()
             .isolation_level(IsolationLevel::RepeatableRead)
@@ -152,6 +154,12 @@ pub async fn create_format30_paired_raft_backup(
     let cleanup_res = drop_ephemeral_backup_role(req.src_config, &role_name, &db_name).await;
     create_res.map_err(|e| PairedBackupError::Postgres(format!("format 30 backup::create failed: {e:#}")))?;
     cleanup_res?;
+    freeze.maybe_inject_fence_fault(1).await?;
+    let fence_res = freeze.verify_fence_intact_for_publication(&pg_client, req.raft, &req.peer_groups).await;
+    if let Err(err) = fence_res {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(err);
+    }
     crate::backup::check(&fmt30_dir).map_err(|_| PairedBackupError::IncompleteCut("inner format 30 check failed"))?;
 
     let (fmt30_binding, blob_closure) =
@@ -209,10 +217,22 @@ pub async fn create_format30_paired_raft_backup(
     let m_path = work_dir.join(MANIFEST_FILE);
     write_synced(&m_path, &m_bytes)?;
     let (_, m_hex) = stream_sha256_file(&m_path)?;
+    freeze.maybe_inject_fence_fault(2).await?;
+    let fence_res = freeze.verify_fence_intact_for_publication(&pg_client, req.raft, &req.peer_groups).await;
+    if let Err(err) = fence_res {
+        let _ = fs::remove_dir_all(&work_dir);
+        return Err(err);
+    }
     write_synced(&work_dir.join(COMPLETE_MARKER), m_hex.as_bytes())?;
     fs::rename(&work_dir, req.destination)?;
 
     let verified = verify_format30_paired_archive(req.destination, Some(req.store.backend_identity().as_hex()))?;
+    freeze.maybe_inject_fence_fault(3).await?;
+    let fence_res = freeze.verify_fence_intact_for_publication(&pg_client, req.raft, &req.peer_groups).await;
+    if let Err(err) = fence_res {
+        let _ = fs::remove_dir_all(req.destination);
+        return Err(err);
+    }
     let (_, complete_marker_sha256) = stream_sha256_file(&req.destination.join(COMPLETE_MARKER))?;
     let root_ids = req.freeze_handle.active_barrier.backup_holds.iter().map(|h| h.root_id).collect();
     let hold_ids =

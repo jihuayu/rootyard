@@ -50,6 +50,8 @@ struct NodeAttestorStartupJson {
     node_key_pem: PathBuf,
     raft_client_cert_pem: PathBuf,
     raft_client_key_pem: PathBuf,
+    #[serde(default)]
+    allowed_caller_cert_sha256s: Vec<String>,
     #[serde(default = "default_rpc_timeout_ms")]
     rpc_timeout_ms: u64,
 }
@@ -178,6 +180,7 @@ pub async fn install_production_serving_guard_with_attestor(
             node_key_pem: parsed.node_key_pem,
             raft_client_cert_pem: parsed.raft_client_cert_pem,
             raft_client_key_pem: parsed.raft_client_key_pem,
+            allowed_caller_cert_sha256s: parsed.allowed_caller_cert_sha256s,
             rpc_timeout: Duration::from_millis(parsed.rpc_timeout_ms.max(1)),
         })?;
         *peer_attestation_slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(daemon);

@@ -41,6 +41,7 @@ fn main() -> Result<()> {
         node_key_pem: PathBuf::from(required(&args, "--tls-key")?),
         raft_client_cert_pem: PathBuf::from(required(&args, "--raft-client-cert")?),
         raft_client_key_pem: PathBuf::from(required(&args, "--raft-client-key")?),
+        allowed_caller_cert_sha256s: flag(&args, "--allow-caller-sha256").into_iter().collect(),
         rpc_timeout: Duration::from_millis(rpc_timeout_ms.max(1)),
     })?;
     println!(

@@ -20,7 +20,7 @@ use super::pg_cutpoint::{pg_err, sync_restored_pg_projection_cursors};
 pub use super::pg_freeze_settings::{
     PAIRED_FREEZE_JOURNAL_LOCK_KEY, PG_FREEZE_SETTING, enforce_maintenance_pg_write_guard,
     read_pg_database_freeze_marker, read_pg_database_read_only, terminate_and_await_other_pg_sessions,
-    verify_no_active_pg_writers,
+    verify_no_active_pg_writers, verify_no_active_pg_writers_except_fence,
 };
 use super::pg_freeze_settings::{set_pg_database_freeze_marker, set_pg_database_read_only};
 use super::pg_write_fence::{PgTableShareFence, acquire_pg_table_share_fence};
@@ -42,6 +42,8 @@ pub struct DurableFreezeHandle {
     pub peer_barriers: BTreeMap<i64, DurableFreezeBarrierProof>,
     pub freeze_record: DurableRaftFreezeRecord,
     pub write_fence: tokio::sync::Mutex<Option<PgTableShareFence>>,
+    #[doc(hidden)]
+    pub fault_drop_fence_stage: std::sync::atomic::AtomicU8,
 }
 
 impl DurableFreezeHandle {
@@ -75,13 +77,14 @@ impl DurableFreezeHandle {
                 "PostgreSQL database default_transaction_read_only fence missing during backup capture",
             ));
         }
+        self.verify_write_fence_held().await?;
+        verify_no_active_pg_writers_except_fence(pg_client, self.write_fence_pid().await).await?;
         let rec = raft
             .read_freeze_record()?
             .ok_or(PairedBackupError::FreezeNotHeld("3-voter mTLS Raft freeze record missing"))?;
         if !rec.frozen || rec.barrier_id != self.active_barrier.barrier_id {
             return Err(PairedBackupError::FreezeNotHeld("3-voter mTLS Raft freeze barrier released early"));
         }
-        self.verify_write_fence_held().await?;
         Ok(())
     }
 }
@@ -103,9 +106,8 @@ pub async fn enter_durable_pg_raft_freeze(
     let barrier_id = Uuid::new_v4();
     // A recycled pooled backend can still be inside an abandoned transaction block.
     let _ = pg_client.batch_execute("ROLLBACK").await;
-    // A pooled `RecyclingMethod::Fast` session may already carry a latched `READ ONLY`
-    // characteristic from an earlier freeze attempt; remember it so a failure *before*
-    // `set_pg_database_read_only(true)` does not poison this unfrozen connection.
+    // A pooled `RecyclingMethod::Fast` session may already carry a latched `READ ONLY` characteristic; remember it
+    // so a failure *before* `set_pg_database_read_only(true)` does not poison this unfrozen connection.
     let prior_ro: String = pg_client.query_one("SHOW default_transaction_read_only", &[]).await.map_err(pg_err)?.get(0);
     pg_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await.map_err(pg_err)?;
 
@@ -272,6 +274,7 @@ pub async fn enter_durable_pg_raft_freeze(
             peer_barriers,
             freeze_record,
             write_fence: tokio::sync::Mutex::new(Some(write_fence)),
+            fault_drop_fence_stage: std::sync::atomic::AtomicU8::new(0),
         })
     }
     .await;

@@ -238,18 +238,14 @@ async fn install_new_incarnation_on_restored_schema151(
             .await
             .map_err(pg_err)?;
         }
-        for table in ["ref_store_core_gates", "ref_store_core_protocol_repos", "ref_store_serving_repositories"] {
-            tx.execute(
-                &format!(
-                    "UPDATE public.{table} SET history_incarnation = $1, authority_epoch = $2, \
-                     group_epoch = $3 WHERE repository_id = $4"
-                ),
-                &[&new_history_inc, &actual_auth_e, &new_grp_epoch, &repo.repository_id],
-            )
-            .await
-            .map_err(pg_err)?;
-        }
     }
+    super::format30_realm_rehome::rehome_restored_repositories_realm(
+        &tx,
+        new_history_inc,
+        actual_auth_e,
+        new_grp_epoch,
+    )
+    .await?;
     tx.batch_execute(
         "SET LOCAL session_replication_role = DEFAULT; \
          DELETE FROM public.ref_store_core_serving_reads; \

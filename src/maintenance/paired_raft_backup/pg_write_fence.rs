@@ -85,25 +85,31 @@ impl PgTableShareFence {
     }
 
     pub async fn verify_held(&self) -> Result<(), PairedBackupError> {
-        let granted_count: i64 = self
+        let row = self
             .client
             .query_one(
-                "SELECT count(*)::bigint FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
-                 JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE l.pid = pg_backend_pid() AND l.mode = 'ShareLock' AND l.granted \
-                   AND n.nspname = 'public' AND c.relkind = 'r'",
+                "SELECT \
+                   (SELECT count(*)::bigint FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+                      JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE l.pid = pg_backend_pid() AND l.mode = 'ShareLock' AND l.granted \
+                       AND n.nspname = 'public' AND c.relkind = 'r'), \
+                   (SELECT count(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = 'public' AND c.relkind = 'r'), \
+                   pg_backend_pid(), \
+                   (SELECT backend_xid IS NULL FROM pg_stat_activity WHERE pid = pg_backend_pid())",
                 &[],
             )
             .await
-            .map_err(pg_err)?
-            .get(0);
-        let no_xid: Option<bool> = self
-            .client
-            .query_one("SELECT backend_xid IS NULL FROM pg_stat_activity WHERE pid = pg_backend_pid()", &[])
-            .await
-            .map_err(pg_err)?
-            .get(0);
-        if granted_count as usize != self.locked_tables || no_xid != Some(true) {
+            .map_err(pg_err)?;
+        let granted_count: i64 = row.get(0);
+        let total_public_tables: i64 = row.get(1);
+        let current_pid: i32 = row.get(2);
+        let no_xid: Option<bool> = row.get(3);
+        if current_pid != self.backend_pid
+            || granted_count as usize != self.locked_tables
+            || total_public_tables as usize != self.locked_tables
+            || no_xid != Some(true)
+        {
             return Err(PairedBackupError::FreezeNotHeld("PostgreSQL SHARE table write fence lost or dirty"));
         }
         Ok(())

@@ -2,6 +2,7 @@
 //! Ref-CAS writes, deleter leases) and `schema 151` spec extraction (#153).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 
 use deadpool_postgres::Pool;
 use tokio_postgres::GenericClient;
@@ -10,9 +11,13 @@ use uuid::Uuid;
 use crate::ref_store::GitObjectFormat;
 use crate::ref_store::core::state_machine::{AcquireHoldBatchCommand, ApplyResponse, RefCasCommand};
 
-use super::durable_freeze_gate::{read_pg_database_freeze_marker, read_pg_database_read_only};
+use super::durable_freeze_gate::{
+    DurableFreezeHandle, read_pg_database_freeze_marker, read_pg_database_read_only,
+    verify_no_active_pg_writers_except_fence,
+};
 use super::freeze_drain::RepoBackupRegistrationSpec;
 use super::mtls_raft::MtlsLiveRaftBackend;
+use super::peer_groups::PeerGroupBackupInput;
 use super::pg_cutpoint::pg_err;
 use super::quorum_wal::DurableRaftBackend;
 use super::types::{DeleterLeaseTicket, ExpectedPackPairSpec, PairedBackupError};
@@ -270,4 +275,60 @@ pub async fn load_pg_repo_backup_specs(
         });
     }
     Ok(specs)
+}
+
+impl DurableFreezeHandle {
+    /// Drop the held SHARE table fence: the only test-only fail-closed injection point.
+    pub async fn drop_write_fence_for_test(&self) -> Result<(), PairedBackupError> {
+        let held = self.write_fence.lock().await.take();
+        if let Some(fence) = held {
+            fence.release().await?;
+        }
+        Ok(())
+    }
+
+    pub fn set_fault_drop_fence_stage_for_test(&self, stage: u8) {
+        self.fault_drop_fence_stage.store(stage, Ordering::SeqCst);
+    }
+
+    pub(super) async fn maybe_inject_fence_fault(&self, stage: u8) -> Result<(), PairedBackupError> {
+        if self.fault_drop_fence_stage.load(Ordering::SeqCst) == stage {
+            self.drop_write_fence_for_test().await?;
+        }
+        Ok(())
+    }
+
+    /// Continuous fail-closed proof that the PG SHARE fence and every Raft freeze barrier survive
+    /// archive capture and receipt publication, re-verified at each publication boundary.
+    pub async fn verify_fence_intact_for_publication(
+        &self,
+        pg_client: &(impl GenericClient + Sync),
+        raft: &MtlsLiveRaftBackend,
+        peer_groups: &[PeerGroupBackupInput<'_>],
+    ) -> Result<(), PairedBackupError> {
+        let fence_pid = self
+            .write_fence_pid()
+            .await
+            .ok_or(PairedBackupError::FreezeNotHeld("PostgreSQL SHARE table write fence missing"))?;
+        self.verify_write_fence_held().await?;
+        verify_no_active_pg_writers_except_fence(pg_client, Some(fence_pid)).await?;
+        let fenced: bool = pg_client
+            .query_one("SELECT remote_delete_fenced FROM public.pando_storage_authorities WHERE singleton = true", &[])
+            .await
+            .map_err(pg_err)?
+            .get(0);
+        if !fenced {
+            return Err(PairedBackupError::DeleterNotFenced(
+                "PostgreSQL storage authority delete fence lost during archive publication",
+            ));
+        }
+        self.verify_still_frozen_on(pg_client, raft).await?;
+        for pg in peer_groups {
+            if pg.raft.committed_quorum_index()? < pg.freeze_barrier.barrier_log_id.index {
+                return Err(PairedBackupError::FreezeNotHeld("peer Raft quorum_commit_index behind barrier"));
+            }
+            pg.raft.verify_freeze_barrier_active(self.active_barrier.barrier_id)?;
+        }
+        Ok(())
+    }
 }

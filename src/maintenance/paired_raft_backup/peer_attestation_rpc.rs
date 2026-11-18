@@ -16,6 +16,7 @@ use crate::ref_store::core::state_machine::{
 use super::mtls_raft::{GROUP_EPOCH_KV_KEY, INCARNATION_KV_KEY, MtlsLiveRaftBackend};
 use super::mtls_wire::mtls_rpc_call;
 use super::peer_attestation::{PeerAttestorState, PeerDurableAttestation, PeerDurableAttestationClaims};
+use super::quorum_wal::DurableRaftBackend;
 use super::types::{NewIncarnationAuthority, PairedBackupError, sha256_json_tagged, validate_hex64};
 use super::wal_file_digest::{extract_committed_applied_index, fsync_and_hash_voter_durable_wal};
 
@@ -42,6 +43,7 @@ struct AttestCutpointRequest {
     group_id: i64,
     group_epoch: i64,
     expected_seq: u64,
+    min_committed_index: u64,
     expected_state_digest: String,
     expected_snapshot_checksum: String,
 }
@@ -202,6 +204,7 @@ pub(super) fn attest_commit(
             refcas_seq: req.seq,
             subject_digest: req.command_sha256,
             secondary_digest: wal_digest,
+            durable_sqlite_sha256: sqlite_wal_sha256,
         },
         &state.keypair,
     )
@@ -224,8 +227,16 @@ pub(super) fn attest_cutpoint(
     let metrics = state.metrics()?;
     let last_log_index = state.verify_running_identity(&metrics)?;
     let committed_applied_index = extract_committed_applied_index(&metrics).unwrap_or(0);
-    if committed_applied_index == 0 || last_log_index < committed_applied_index {
-        return Err(PairedBackupError::FreezeNotHeld("voter Raft committed/applied index missing at cutpoint"));
+    if req.expected_seq == 0
+        || req.min_committed_index < req.expected_seq
+        || committed_applied_index == 0
+        || last_log_index < committed_applied_index
+        || committed_applied_index < req.expected_seq
+        || committed_applied_index < req.min_committed_index
+    {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "voter Raft committed_index has not reached the attested cutpoint",
+        ));
     }
     if state.read_replica_u64("refcas/head_seq")? != req.expected_seq {
         return Err(PairedBackupError::FreezeNotHeld(
@@ -256,7 +267,7 @@ pub(super) fn attest_cutpoint(
     if state_digest != req.expected_state_digest {
         return Err(PairedBackupError::FreezeNotHeld("local replica state_digest diverges from the attested cutpoint"));
     }
-    let _sqlite_wal_sha256 = fsync_and_hash_voter_durable_wal(&state.data_dir)?;
+    let sqlite_wal_sha256 = fsync_and_hash_voter_durable_wal(&state.data_dir)?;
     PeerDurableAttestation::sign(
         PeerDurableAttestationClaims {
             kind: "cutpoint".to_owned(),
@@ -271,6 +282,7 @@ pub(super) fn attest_cutpoint(
             refcas_seq: req.expected_seq,
             subject_digest: req.expected_state_digest,
             secondary_digest: req.expected_snapshot_checksum,
+            durable_sqlite_sha256: sqlite_wal_sha256,
         },
         &state.keypair,
     )
@@ -337,6 +349,8 @@ pub(super) fn attest_group_cutpoint(
     let applied = snapshot.body.last_applied.ok_or(PairedBackupError::IncompleteCut(
         "durable Raft snapshot has no applied entry for a cutpoint attestation",
     ))?;
+    let min_committed_index =
+        DurableRaftBackend::committed_quorum_index(raft).unwrap_or(applied.index).max(applied.index);
     raft.trigger_leader_snapshot()?;
     let mut attestations = Vec::new();
     let mut seen = BTreeSet::new();
@@ -357,6 +371,7 @@ pub(super) fn attest_group_cutpoint(
                     "group_id": raft.cfg.group_id,
                     "group_epoch": group_epoch,
                     "expected_seq": applied.index,
+                    "min_committed_index": min_committed_index,
                     "expected_state_digest": state_digest,
                     "expected_snapshot_checksum": snapshot.checksum.as_str(),
                 }}),
@@ -380,8 +395,12 @@ pub(super) fn attest_group_cutpoint(
             || claims.group_id != raft.cfg.group_id
             || claims.group_epoch != group_epoch
             || claims.refcas_seq != applied.index
+            || claims.raft_committed_index < min_committed_index
+            || claims.raft_committed_index < applied.index
             || claims.subject_digest != state_digest
             || claims.secondary_digest != snapshot.checksum
+            || !validate_hex64(&claims.durable_sqlite_sha256)
+            || claims.durable_sqlite_sha256.bytes().all(|b| b == b'0')
             || !seen.insert(claims.voter_id)
         {
             continue;

@@ -62,9 +62,13 @@ pub fn verify_cutpoint_attestations(
             || claims.group_id != group_id
             || claims.group_epoch != group_epoch
             || claims.raft_committed_index == 0
+            || claims.raft_committed_index < applied_log_id.index
+            || claims.raft_committed_index < claims.refcas_seq
             || claims.refcas_seq != applied_log_id.index
             || claims.subject_digest != state_digest
             || claims.secondary_digest != snapshot_checksum
+            || !validate_hex64(&claims.durable_sqlite_sha256)
+            || claims.durable_sqlite_sha256.bytes().all(|b| b == b'0')
             || !allowed.contains(&claims.voter_id)
             || !seen.insert(claims.voter_id)
         {
@@ -121,9 +125,7 @@ impl VoterWalAck {
             || claims.subject_digest != expected_cmd_sha256
             || claims.secondary_digest != self.wal_record_digest
         {
-            return Err(PairedBackupError::FreezeNotHeld(
-                "VoterWalAck is not backed by a server-side peer Ed25519 durable attestation",
-            ));
+            return Err(PairedBackupError::FreezeNotHeld("VoterWalAck lacks a server-side peer Ed25519 attestation"));
         }
         let mut clean = self.clone();
         clean.ack_digest.clear();
@@ -172,9 +174,7 @@ impl QuorumCommitReceipt {
             ack.verify(self.group_id, self.group_epoch, self.log_id, &self.command_sha256)?;
         }
         if self.voter_acks.len() <= self.voter_ids.len() / 2 {
-            return Err(PairedBackupError::FreezeNotHeld(
-                "consensus majority quorum not reached; refusing uncommitted WAL entry",
-            ));
+            return Err(PairedBackupError::FreezeNotHeld("consensus majority quorum not reached; uncommitted WAL"));
         }
         let mut clean = self.clone();
         clean.quorum_digest.clear();

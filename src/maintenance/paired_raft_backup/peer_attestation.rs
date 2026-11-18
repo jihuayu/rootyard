@@ -1,9 +1,9 @@
 //! Server-side Ed25519 per-peer durable attestations bound to the voter's X.509
 //! certificate AND Ed25519 public key, plus the per-voter mTLS attestation daemon (#153).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,9 +13,8 @@ use std::time::Duration;
 
 use ring::rand::SystemRandom;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
-use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+use rustls::{ClientConfig, ServerConfig, ServerConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -23,6 +22,9 @@ use uuid::Uuid;
 
 use super::mtls_raft::MtlsLiveRaftBackend;
 use super::mtls_wire::{MtlsRaftClusterConfig, build_mtls_client_config, mtls_rpc_call};
+use super::peer_caller_auth::{
+    authorize_caller_peer_certs, build_allowed_caller_digests, load_ca_roots, load_cert_chain, load_private_key,
+};
 use super::types::{PairedBackupError, validate_hex64};
 
 pub const PEER_ATTESTOR_KEY_FILE: &str = "peer_attestor.pk8";
@@ -61,6 +63,7 @@ pub struct PeerDurableAttestationClaims {
     pub refcas_seq: u64,
     pub subject_digest: String,
     pub secondary_digest: String,
+    pub durable_sqlite_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,10 +97,14 @@ impl PeerDurableAttestation {
             || !validate_hex64(&c.ed25519_pubkey_hex)
             || !validate_hex64(&c.subject_digest)
             || !validate_hex64(&c.secondary_digest)
+            || !validate_hex64(&c.durable_sqlite_sha256)
             || self.signature_hex.len() != 128
             || !self.signature_hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
             return Err(PairedBackupError::FreezeNotHeld("malformed peer Ed25519 durable attestation"));
+        }
+        if c.durable_sqlite_sha256.bytes().all(|b| b == b'0') {
+            return Err(PairedBackupError::FreezeNotHeld("peer attestation missing valid durable_sqlite_sha256"));
         }
         if c.kind != "commit" && c.kind != "cutpoint" {
             return Err(PairedBackupError::FreezeNotHeld("unsupported peer durable attestation kind"));
@@ -179,6 +186,8 @@ pub struct PeerAttestationConfig {
     /// (`Metrics`, `InspectReplicaKv`), which require `DNS:raft-client.refcas.internal`.
     pub raft_client_cert_pem: PathBuf,
     pub raft_client_key_pem: PathBuf,
+    /// Explicit caller leaf SHA-256 allowlist; empty pins the configured `raft-client` leaf.
+    pub allowed_caller_cert_sha256s: Vec<String>,
     pub rpc_timeout: Duration,
 }
 
@@ -191,6 +200,7 @@ pub(super) struct PeerAttestorState {
     pub(super) pubkey_hex: String,
     pub(super) voter_id: Uuid,
     pub(super) keypair: Arc<Ed25519KeyPair>,
+    pub(super) allowed_caller_cert_sha256s: BTreeSet<String>,
     pub(super) tls_cfg: Arc<ClientConfig>,
     pub(super) server_cfg: Arc<ServerConfig>,
     pub(super) rpc_timeout: Duration,
@@ -216,6 +226,8 @@ impl PeerAttestationDaemon {
         let leaf =
             certs.first().ok_or(PairedBackupError::FreezeNotHeld("peer attestor has no X.509 leaf certificate"))?;
         let cert_sha256 = hex::encode(Sha256::digest(leaf.as_ref()));
+        let allowed_caller_cert_sha256s =
+            build_allowed_caller_digests(&cfg.raft_client_cert_pem, &cfg.allowed_caller_cert_sha256s, &cert_sha256)?;
         let key = load_private_key(&cfg.node_key_pem)?;
         let verifier = WebPkiClientVerifier::builder_with_provider(roots, provider.clone())
             .build()
@@ -246,6 +258,7 @@ impl PeerAttestationDaemon {
             pubkey_hex,
             voter_id,
             keypair: Arc::new(keypair),
+            allowed_caller_cert_sha256s,
             tls_cfg,
             server_cfg: Arc::new(server_cfg),
             rpc_timeout: cfg.rpc_timeout,
@@ -313,9 +326,16 @@ fn handle_connection(state: &PeerAttestorState, tcp: TcpStream) -> Result<(), Pa
     }
     let mut body = vec![0u8; len];
     tls.read_exact(&mut body)?;
-    tls.conn
-        .peer_certificates()
-        .ok_or(PairedBackupError::FreezeNotHeld("peer attestation client presented no X.509 certificate"))?;
+    let caller_certs = tls.conn.peer_certificates();
+    if let Err(err) = authorize_caller_peer_certs(caller_certs, &state.allowed_caller_cert_sha256s) {
+        let payload = serde_json::to_vec(&json!({ "Error": err.to_string() }))
+            .map_err(|_| PairedBackupError::IncompleteCut("peer attestation response encode failed"))?;
+        tls.write_all(&(payload.len() as u32).to_be_bytes())?;
+        tls.write_all(&payload)?;
+        tls.flush()?;
+        tls.conn.send_close_notify();
+        return Err(err);
+    }
 
     let request: Value = serde_json::from_slice(&body)
         .map_err(|_| PairedBackupError::InvalidArgument("malformed peer attestation JSON request"))?;
@@ -421,31 +441,6 @@ pub(super) fn probe_attestor_identity(
         ));
     }
     Ok((reported_cert.to_owned(), pubkey_hex.to_owned()))
-}
-
-fn load_ca_roots(path: &Path) -> Result<Arc<RootCertStore>, PairedBackupError> {
-    let mut roots = RootCertStore::empty();
-    for item in rustls_pemfile::certs(&mut BufReader::new(File::open(path)?)) {
-        let der = item.map_err(|_| PairedBackupError::FreezeNotHeld("failed to parse peer attestor CA PEM"))?;
-        roots.add(der).map_err(|_| PairedBackupError::FreezeNotHeld("invalid peer attestor CA certificate"))?;
-    }
-    Ok(Arc::new(roots))
-}
-
-fn load_cert_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, PairedBackupError> {
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(File::open(path)?))
-        .collect::<Result<_, _>>()
-        .map_err(|_| PairedBackupError::FreezeNotHeld("invalid peer attestor certificate PEM"))?;
-    if certs.is_empty() {
-        return Err(PairedBackupError::FreezeNotHeld("empty peer attestor certificate chain"));
-    }
-    Ok(certs)
-}
-
-fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, PairedBackupError> {
-    rustls_pemfile::private_key(&mut BufReader::new(File::open(path)?))
-        .map_err(|_| PairedBackupError::FreezeNotHeld("invalid peer attestor private key PEM"))?
-        .ok_or(PairedBackupError::FreezeNotHeld("missing peer attestor private key"))
 }
 
 #[cfg(test)]

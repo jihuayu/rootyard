@@ -1,7 +1,9 @@
 //! Gate 5: production serving startup guard installation, freeze fail-closed drain, and
 //! exclusive freeze-barrier vs shared journal-retirement lock serialization (#153).
-//! Gate 6: co-located peer attestor startup + signed local `group_epoch` agreement (#153).
+//! Gate 6: co-located peer attestor startup, signed local `group_epoch` agreement, cutpoint
+//! commit-index reach, and X.509 caller authorization (#153).
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -10,9 +12,10 @@ use uuid::Uuid;
 
 use rootyard::db;
 use rootyard::maintenance::paired_raft_backup::{
-    DurableRaftBackend, PAIRED_FREEZE_JOURNAL_LOCK_KEY, PairedBackupError, PeerDurableAttestation,
-    ensure_serving_database_unfrozen, install_production_serving_guard, install_production_serving_guard_with_attestor,
-    installed_peer_attestation_daemon_addr, installed_production_runtime_guard, mtls_wire::mtls_rpc_call,
+    DurableRaftBackend, MtlsRaftClusterConfig, PAIRED_FREEZE_JOURNAL_LOCK_KEY, PairedBackupError,
+    PeerDurableAttestation, ensure_serving_database_unfrozen, install_production_serving_guard,
+    install_production_serving_guard_with_attestor, installed_peer_attestation_daemon_addr,
+    installed_production_runtime_guard, mtls_wire::build_mtls_client_config, mtls_wire::mtls_rpc_call,
     set_installed_production_runtime_guard, shutdown_installed_peer_attestation_daemon,
 };
 
@@ -132,7 +135,7 @@ async fn gate6_peer_attestor_rejects_mismatched_local_group_epoch() -> Result<()
     let local_epoch = snapshot.body.gates[0].group_epoch;
     let endpoint = grp.attestor_endpoints()[&1].clone();
     let tls = grp.tls_config();
-    let call = |epoch: i64| {
+    let call = |epoch: i64, min_committed_index: u64| {
         mtls_rpc_call(
             &tls,
             &endpoint,
@@ -141,6 +144,7 @@ async fn gate6_peer_attestor_rejects_mismatched_local_group_epoch() -> Result<()
                 "group_id": grp.group_id,
                 "group_epoch": epoch,
                 "expected_seq": applied.index,
+                "min_committed_index": min_committed_index,
                 "expected_state_digest": state_digest.as_str(),
                 "expected_snapshot_checksum": snapshot.checksum.as_str(),
             }}),
@@ -149,7 +153,7 @@ async fn gate6_peer_attestor_rejects_mismatched_local_group_epoch() -> Result<()
     };
     let mut accepted = None;
     for _ in 0..20 {
-        if let Ok((response, _)) = call(local_epoch)
+        if let Ok((response, _)) = call(local_epoch, applied.index)
             && response.get("Attestation").is_some()
         {
             accepted = Some(response);
@@ -162,8 +166,65 @@ async fn gate6_peer_attestor_rejects_mismatched_local_group_epoch() -> Result<()
         serde_json::from_value(response["Attestation"].clone()).context("attestation json")?;
     attestation.verify()?;
     ensure!(attestation.claims.group_epoch == local_epoch, "peer signs only its own local group_epoch");
-    let (rejected, _) = call(local_epoch + 1)?;
+    ensure!(
+        attestation.claims.raft_committed_index >= applied.index,
+        "attested raft_committed_index must reach the attested cutpoint"
+    );
+    ensure!(
+        attestation.claims.durable_sqlite_sha256.len() == 64
+            && !attestation.claims.durable_sqlite_sha256.bytes().all(|b| b == b'0'),
+        "attested cutpoint must bind a real durable WAL digest"
+    );
+    let (rejected, _) = call(local_epoch + 1, applied.index)?;
     ensure!(rejected.get("Attestation").is_none(), "mismatched group_epoch must not be signed");
     ensure!(rejected.get("Error").is_some(), "mismatched group_epoch must surface an Error");
+    let (lagged, _) = call(local_epoch, applied.index + 10_000)?;
+    ensure!(
+        lagged.get("Attestation").is_none() && lagged.get("Error").is_some(),
+        "a min_committed_index beyond the applied index must be refused"
+    );
+
+    // Requirement 4: only a leaf whose pinned digest *and* `raft-client` SAN both match may
+    // drive the daemon; a wrong-SAN leaf or an extra-CA-signed leaf is refused.
+    let probe = json!({ "AttestCutpoint": {
+        "group_id": grp.group_id,
+        "group_epoch": local_epoch,
+        "expected_seq": applied.index,
+        "min_committed_index": applied.index,
+        "expected_state_digest": state_digest.as_str(),
+        "expected_snapshot_checksum": snapshot.checksum.as_str(),
+    }});
+    let caller_base = |cert: std::path::PathBuf, key: std::path::PathBuf| MtlsRaftClusterConfig {
+        group_id: grp.group_id,
+        local_node_id: 1,
+        voter_endpoints: BTreeMap::new(),
+        attestor_endpoints: BTreeMap::new(),
+        ca_cert_pem: grp.pki.ca_cert.clone(),
+        client_cert_pem: cert,
+        client_key_pem: key,
+        rpc_timeout: Duration::from_secs(4),
+    };
+    let wrong_san = caller_base(grp.pki.wrong_san_cert.clone(), grp.pki.wrong_san_key.clone());
+    let wrong_san = build_mtls_client_config(&wrong_san)?;
+    let attest_commit = json!({ "AttestCommit": {
+        "group_id": grp.group_id,
+        "group_epoch": local_epoch,
+        "seq": 1u64,
+        "min_raft_index": 1u64,
+        "command_sha256": "a".repeat(64),
+    }});
+    for request in [json!({ "Identity": {} }), attest_commit, probe.clone()] {
+        let (refused, _) = mtls_rpc_call(&wrong_san, &endpoint, 1, &request, Duration::from_secs(6))?;
+        ensure!(
+            refused.get("Identity").is_none() && refused.get("Attestation").is_none() && refused.get("Error").is_some(),
+            "a wrong caller SAN must be refused for every RPC verb"
+        );
+    }
+    let rogue_ca = caller_base(grp.pki.rogue_client_cert.clone(), grp.pki.rogue_client_key.clone());
+    let rogue_ca = build_mtls_client_config(&rogue_ca)?;
+    ensure!(
+        mtls_rpc_call(&rogue_ca, &endpoint, 1, &probe, Duration::from_secs(6)).is_err(),
+        "an extra-CA-signed raft-client leaf must be rejected during the mTLS handshake"
+    );
     Ok(())
 }

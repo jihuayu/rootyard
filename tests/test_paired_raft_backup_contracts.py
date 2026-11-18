@@ -316,6 +316,89 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             240,
         )
 
+    def test_fence_hold_caller_auth_cutpoint_reach_and_realm_rehome_contracts(self) -> None:
+        def read(name: str) -> str:
+            return (MOD_DIR / name).read_text(encoding="utf-8")
+
+        def require(source: str, tokens: tuple[str, ...], detail: str) -> None:
+            for token in tokens:
+                self.assertIn(token, source, f"missing {detail}: {token}")
+
+        require(
+            read("pg_write_fence.rs"),
+            ("granted_count", "total_public_tables", "current_pid", "backend_pid", "no_xid", "granted"),
+            "single round-trip SHARE-fence proof",
+        )
+        require(
+            read("durable_guarded_ops.rs"),
+            ("verify_fence_intact_for_publication", "verify_write_fence_held", "remote_delete_fenced",
+             "verify_freeze_barrier_active", "fault_drop_fence_stage", "maybe_inject_fence_fault"),
+            "publication fence continuity contract",
+        )
+        fmt30 = read("format30_paired.rs")
+        self.assertGreaterEqual(
+            fmt30.count("verify_fence_intact_for_publication"), 4, "every publication boundary must re-prove the fence"
+        )
+        self.assertEqual(fmt30.count("maybe_inject_fence_fault"), 3, "gate-7 needs three publication-boundary seams")
+        for name in ("quorum_wal.rs", "mtls_raft.rs"):
+            self.assertIn("verify_freeze_barrier_active", read(name), f"{name} must prove the Raft freeze barrier")
+        require(
+            read("peer_attestation.rs"),
+            ("durable_sqlite_sha256", "allowed_caller_cert_sha256s", "authorize_caller_peer_certs",
+             "build_allowed_caller_digests"),
+            "attestation/caller-auth contract",
+        )
+        require(
+            read("peer_caller_auth.rs"),
+            ("AUTHORIZED_ATTESTOR_CLIENT_DNS", "authorize_caller_peer_certs", "OID_SUBJECT_ALT_NAME"),
+            "X.509 caller authorization contract",
+        )
+        require(
+            read("peer_attestation_rpc.rs"),
+            ("min_committed_index", "durable_sqlite_sha256", "reached the attested cutpoint"),
+            "quorum-reached cutpoint contract",
+        )
+        require(
+            read("raft_barrier.rs"),
+            ("durable_sqlite_sha256", "claims.raft_committed_index < applied_log_id.index"),
+            "cutpoint reach verification",
+        )
+        rehome = MOD_DIR / "format30_realm_rehome.rs"
+        self.assertTrue(rehome.exists(), "restored A3/A4 realm re-home module is missing")
+        rehome_src = rehome.read_text(encoding="utf-8")
+        self.assertLess(len(rehome_src.splitlines()), 280)
+        require(
+            rehome_src,
+            ("rehome_restored_repositories_realm", "artifact_hold_requests", "ref_store_core_pack_history",
+             "AcquireAck", "ConsumeAck", "PackRegistrationAck", "consume_digest"),
+            "restored realm re-home contract",
+        )
+        self.assertIn("rehome_restored_repositories_realm", read("format30_boot.rs"), "boot must re-home the realm")
+        luna = (ROOT / "tests" / "paired_raft_backup_support" / "format30_luna_startup_gates.rs")
+        require(luna.read_text(encoding="utf-8"),
+                ("min_committed_index", "durable_sqlite_sha256", "wrong_san_cert", "rogue_client_cert"), "gate-6")
+        hold = ROOT / "tests" / "paired_raft_backup_support" / "format30_luna_fence_hold_gates.rs"
+        self.assertTrue(hold.exists(), "gate-7 fence-hold test module is missing")
+        hold_src = hold.read_text(encoding="utf-8")
+        self.assertLess(len(hold_src.splitlines()), 260)
+        require(
+            hold_src,
+            ("gate7_fence_drop_at_each_publication_boundary_fails_closed", "set_fault_drop_fence_stage_for_test",
+             "durable_attestation_without_wal_digest_is_refused"),
+            "gate-7 fence-drop boundary coverage",
+        )
+        self.assertIn(
+            "format30_luna_fence_hold_gates",
+            (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8"),
+            "gate-7 module must be wired into the integration test target",
+        )
+        require(
+            (ROOT / "src" / "bin" / "rootyard-peer-attestor.rs").read_text(encoding="utf-8"),
+            ("--allow-caller-sha256",),
+            "attestor caller allowlist flag",
+        )
+        require(read("startup_wiring.rs"), ("allowed_caller_cert_sha256s",), "attestor startup allowlist wiring")
+
     def test_workflow_contract_and_doc_links(self) -> None:
         raw_wf = WORKFLOW.read_bytes()
         self.assertNotIn(b"\r\n", raw_wf)
