@@ -187,8 +187,12 @@ pub async fn verify_schema(pool: &Pool) -> Result<()> {
     let client = pool.get().await?;
     let rows = client.query("SELECT version FROM schema_migrations ORDER BY version", &[]).await?;
     let installed: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
+    verify_schema_versions(&installed)
+}
+
+fn verify_schema_versions(installed: &[i32]) -> Result<()> {
     ensure!(
-        installed.as_slice() == SCHEMA_VERSIONS,
+        installed == SCHEMA_VERSIONS,
         "database schema differs from this binary; run the migrator before runtime startup"
     );
     Ok(())
@@ -360,6 +364,22 @@ mod tests {
             assert!(SCHEMA_VERSIONS[i] < version);
             assert!(!sql.trim().is_empty());
         }
+    }
+    #[test]
+    fn schema_verification_requires_the_exact_migration_ledger() {
+        assert!(verify_schema_versions(SCHEMA_VERSIONS).is_ok());
+
+        let last_index = SCHEMA_VERSIONS.len() - 1;
+        assert!(verify_schema_versions(&SCHEMA_VERSIONS[..last_index]).is_err());
+
+        let mut future = SCHEMA_VERSIONS.to_vec();
+        future.push(SCHEMA_VERSIONS[last_index] + 1);
+        assert!(verify_schema_versions(&future).is_err());
+
+        let mut gap = SCHEMA_VERSIONS.to_vec();
+        gap.remove(last_index - 1);
+        assert_eq!(gap.last(), SCHEMA_VERSIONS.last());
+        assert!(verify_schema_versions(&gap).is_err());
     }
     #[test]
     fn identity_scope_token_prefers_parent() {

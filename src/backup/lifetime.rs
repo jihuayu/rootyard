@@ -228,19 +228,17 @@ pub(super) async fn restore_marker(client: &Client, backup: Option<uuid::Uuid>) 
 /// Prepare startup under the same database lock used by offline maintenance.
 /// Auto migrations need an exclusive lock on this exact session. Acquire the
 /// shared lifetime lock before releasing it, so no restore can enter the gap.
+/// Both modes verify the runtime pool's exact schema while holding the shared lock.
 pub(crate) async fn prepare_serving_database(
     pool: &deadpool_postgres::Pool,
     client: &mut Client,
     deadline: Instant,
 ) -> Result<ServingBarrier> {
-    match std::env::var("ROOTYARD_SCHEMA_MODE").as_deref() {
+    let shared = match std::env::var("ROOTYARD_SCHEMA_MODE").as_deref() {
         Ok("external") => {
             let shared = ServingBarrier::acquire(client, deadline).await?;
             ensure_database_available(client).await?;
-            tokio::time::timeout_at(deadline, crate::db::verify_schema(pool))
-                .await
-                .context("serving schema verification exceeded its bound")??;
-            Ok(shared)
+            shared
         }
         Ok("auto") | Err(_) => {
             let exclusive = BackupMutex::acquire(client).await?;
@@ -250,10 +248,14 @@ pub(crate) async fn prepare_serving_database(
                 .context("serving schema migration exceeded its bound")??;
             let shared = ServingBarrier::acquire(client, deadline).await?;
             exclusive.release(client).await?;
-            Ok(shared)
+            shared
         }
         _ => anyhow::bail!("ROOTYARD_SCHEMA_MODE must be external or auto"),
-    }
+    };
+    tokio::time::timeout_at(deadline, crate::db::verify_schema(pool))
+        .await
+        .context("serving schema verification exceeded its bound")??;
+    Ok(shared)
 }
 
 #[cfg(test)]
