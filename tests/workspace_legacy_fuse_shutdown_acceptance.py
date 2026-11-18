@@ -10,13 +10,17 @@ service exits.
 This file is written source, not native proof. A real result requires the
 qualified Linux FUSE/PG/namespace host profile used by C3/C5. There is no SQL
 ready/ACK fixture, mock Git, fake mount, public fault endpoint or environment
-backdoor. ``test_early_server_error`` is deliberately absent: that branch is
-proved only by the private injected-future source unit in
+backdoor. The bind case preloads the fixture-owned single-use
+``tests/fixtures/api_bind_gate.c`` only into its own service child, so the real
+``EADDRINUSE`` result is held until the live mount and exact cleanup deadline
+have been observed. ``test_early_server_error`` is deliberately absent: that
+branch is proved only by the private injected-future source unit in
 ``src/service_shutdown.rs``; no native early-server-error claim is made here.
 """
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 from pathlib import Path
 import shlex
@@ -60,6 +64,7 @@ SOURCE_PATHS = (
     "tests/workspace_legacy_fuse_shutdown_ownership.py",
     "tests/workspace_legacy_fuse_shutdown_fifo.py",
     "tests/workspace_legacy_fuse_shutdown_report.py",
+    "tests/fixtures/api_bind_gate.c",
 )
 CASE_DETAILS: dict[str, dict] = {}
 CONTAINMENT_OWNER = legacy_ownership.ContainmentOwner()
@@ -486,7 +491,18 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         self.owned_records.clear()
 
         self.conflict = legacy_fixtures.bind_owned_conflict(self.h.port)
-        service_proc = self._start_oracle_service()
+        prior_gate_env = legacy_fixtures.snapshot_api_bind_gate_env(self.h)
+        gate = legacy_fixtures.install_api_bind_gate(self.h)
+        try:
+            service_proc = self._start_oracle_service()
+        finally:
+            # Popen copied the environment. No later psql/Git/CLI child may
+            # inherit this test-only preload.
+            legacy_fixtures.restore_api_bind_gate_env(self.h, prior_gate_env)
+        # The real API bind is held after reconcile mounted the workspace but
+        # before its unmodified EADDRINUSE result can trigger cleanup. The
+        # conflict listener above remains open throughout this observation.
+        legacy_fixtures.wait_api_bind_gate(gate)
         holder, holder_proof = self._attach_holder(service_proc)
         visible = legacy_support.wait_owned_mount(
             holder.pid,
@@ -496,14 +512,23 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         mount_id = int(visible["mount_id"])
         self._remember_record(paths["mountpoint"], mount_id)
         namespace = int(holder_proof["service_namespace"])
+        # Arm the existing one absolute 5 s cleanup deadline immediately
+        # before releasing the real bind.
         deadline = self._arm_cleanup_deadline()
+        legacy_fixtures.release_api_bind_gate(gate)
         code = support.wait_process_exit(
             self.h.proc, timeout=max(0.0, deadline - time.monotonic())
         )
         self._finish_service_exit()
+        bind_gate = legacy_fixtures.read_api_bind_gate_outcome(gate)
         legacy_fixtures.close_conflict(self.conflict)
         self.conflict = None
         self.assertGreater(code, 0, "post-reconcile bind failure did not return a positive application exit status")
+        self.assertEqual(
+            bind_gate["bind_errno"],
+            errno.EADDRINUSE,
+            "the held bind did not return the real EADDRINUSE result",
+        )
 
         legacy_support.wait_exact_mount_gone(holder.pid, paths["mountpoint"], mount_id, deadline)
         self.assertEqual(
@@ -519,6 +544,17 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         )
         self.assertEqual(evidence["joined_mounts"], 1)
         self._record_detail(evidence, code, holder_proof)
+        CASE_DETAILS[self.id()]["bind_gate"] = {
+            "schema": bind_gate["schema"],
+            "events": bind_gate["events"],
+            "held": bind_gate["held"],
+            "timed_out": bind_gate["timed_out"],
+            "duplicate": bind_gate["duplicate"],
+            "abi_verified": bind_gate["abi_verified"],
+            "bind_result": bind_gate["bind_result"],
+            "bind_errno": bind_gate["bind_errno"],
+            "real_eaddrinuse": True,
+        }
 
 
     def test_sigterm_during_blocked_startup_joins_mounted_owner(self):

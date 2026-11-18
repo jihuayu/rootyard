@@ -42,6 +42,7 @@ LEGACY_ROOTS = (
     "tests/test_workspace_legacy_fuse_shutdown_primary.py",
     "tests/test_workspace_legacy_fuse_shutdown_fifo.py",
     "tests/test_workspace_legacy_fuse_containment_owner.py",
+    "tests/test_workspace_legacy_fuse_bind_gate.py",
     "scripts/native_report_manifest.py",
 )
 EVIDENCE = (
@@ -504,7 +505,10 @@ class FailureIsolatedFeatureLaneTest(unittest.TestCase):
         self.assertEqual(fuse_cases["workspace_remote_delete"], list(REMOTE_REQUIRED))
         self.assertEqual(legacy_cases["workspace_legacy_service"], list(LEGACY_REQUIRED))
         fuse_closure = _closure(FUSE_ROOTS, ("tests/fixtures/capture_read_gate.c", ".github/workflows/ci.yml"))
-        legacy_closure = _closure(LEGACY_ROOTS, (".github/workflows/ci.yml",))
+        legacy_closure = _closure(LEGACY_ROOTS, (
+            ".github/workflows/ci.yml",
+            "tests/fixtures/api_bind_gate.c",
+        ))
         self.assertEqual(set(_flags(fuse, "--harness")), fuse_closure)
         self.assertEqual(len(_flags(fuse, "--harness")), len(fuse_closure))
         self.assertEqual(set(_flags(legacy, "--harness")), legacy_closure)

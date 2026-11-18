@@ -173,7 +173,7 @@ class _FakeResult:
 
 
 class FailureProjectionTest(unittest.TestCase):
-    def test_source_whitelist_is_exactly_the_bound_ten_files(self):
+    def test_source_whitelist_is_exactly_the_bound_eleven_files(self):
         expected = tuple(acceptance.SOURCE_PATHS) + (
             "tests/e2e.py",
             "tests/runtime_binary.py",
@@ -181,7 +181,7 @@ class FailureProjectionTest(unittest.TestCase):
             "tests/fuse_helper_native_support.py",
         )
         self.assertEqual(report.DIAGNOSTIC_SOURCE_PATHS, expected)
-        self.assertEqual(len(set(expected)), 10)
+        self.assertEqual(len(set(expected)), 11)
         for relative in report.DIAGNOSTIC_SOURCE_PATHS:
             self.assertTrue((ROOT / relative).is_file(), relative)
         self.assertNotIn(
