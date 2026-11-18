@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
+import issue107_native11_runner as bounded_runner  # noqa: E402
 import native_build_receipt as receipts  # noqa: E402
 
 CASES = (
@@ -50,7 +51,14 @@ SUMMARY = re.compile(
     r"(\d+) measured; (\d+) filtered out; finished in ([0-9.]+)s$",
     re.MULTILINE,
 )
-CASE_TIMEOUT_SECONDS = 600
+CASE_TIMEOUT_SECONDS = 300
+SCOPE = "session174-cache-4-cases"
+FAILURE_CODES = {
+    "native_timeout": "timeout",
+    "native_process_failed": "process_failed",
+    "native_output_too_large": "output_too_large",
+    "cleanup_unresolved": "cleanup_unresolved",
+}
 SUCCESS_SUMMARY = (
     "session174 cache proof: 4/4 passed; 0 failed; 0 skipped"
 )
@@ -98,32 +106,33 @@ def readonly_regular(path, label):
 
 def run_exact_case(lib, name):
     try:
-        process = subprocess.run(
+        output = bounded_runner.run_bounded(
             [lib, "--ignored", "--exact", name, "--test-threads=1"],
-            capture_output=True,
-            text=True,
             timeout=CASE_TIMEOUT_SECONDS,
+            env=os.environ.copy(),
         )
-    except subprocess.TimeoutExpired:
-        return {"name": name, "status": "failed", "failure": "timeout"}
+    except bounded_runner.RunnerError as error:
+        return {
+            "name": name,
+            "status": "failed",
+            "failure": FAILURE_CODES.get(getattr(error, "code", None), "runner_failed"),
+        }
     except OSError:
         return {"name": name, "status": "failed", "failure": "exec"}
-    combined = process.stdout + process.stderr
-    rows = SUMMARY.findall(combined)
+    text = output.decode("utf-8", "replace")
+    rows = SUMMARY.findall(text)
     ran = [
         line[5:-len(" ... ok")]
-        for line in process.stdout.splitlines()
+        for line in text.splitlines()
         if line.startswith("test ") and line.endswith(" ... ok")
     ]
-    if process.returncode != 0:
-        return {"name": name, "status": "failed", "failure": "exit"}
     if len(rows) != 1:
-        return {"name": name, "status": "failed", "failure": "summary-count"}
+        return {"name": name, "status": "failed", "failure": "summary_count"}
     state, passed, failed, ignored, measured, filtered, elapsed = rows[0]
     if (state, passed, failed, ignored, measured) != ("ok", "1", "0", "0", "0"):
-        return {"name": name, "status": "failed", "failure": "summary"}
+        return {"name": name, "status": "failed", "failure": "summary_not_exact_one"}
     if ran != [name]:
-        return {"name": name, "status": "failed", "failure": "case-line"}
+        return {"name": name, "status": "failed", "failure": "case_outcome_missing"}
     return {
         "name": name,
         "status": "passed",
@@ -141,6 +150,8 @@ def exact_run_identity():
 
 
 def validate(args, report):
+    if args.scope != SCOPE:
+        fail("scope marker differs from the fixed four-case scope")
     for marker in (OWNED_POSTGRES_OPT_IN, OWNED_BLOB_OPT_IN):
         if os.environ.get(marker) != "1":
             fail(marker + " is not 1")
@@ -154,6 +165,14 @@ def validate(args, report):
         fail("Blob root is not this exact run/attempt cache prefix")
     if not os.environ.get("DATABASE_URL") or not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
         fail("owned database URLs are absent")
+    source = receipts.git_state(ROOT)
+    if source.get("clean") is not True:
+        fail("source tree is not clean")
+    if source.get("commit") != args.expected_commit:
+        fail("source commit differs from the expected commit")
+    source_tree = source.get("tree")
+    if not isinstance(source_tree, str) or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_tree) is None:
+        fail("source tree is not a lowercase full Git tree id")
     preflight_path = Path(args.preflight)
     preflight = load_json(preflight_path, "preflight evidence")
     lib = readonly_regular(args.lib, "lib alias")
@@ -185,9 +204,13 @@ def validate(args, report):
         {
             "schema": "rootyard/refstore-issue111-cache-proof/v1",
             "issue": 111,
-            "source_head": args.expected_commit,
+            "scope": args.scope,
+            "source_head": source["commit"],
+            "source_commit": source["commit"],
+            "source_tree": source_tree,
             "source_inputs_sha256": source_sha,
             "binary_sha256": binary_sha,
+            "build_receipt_sha256": validated.receipt_sha256,
             "receipt_sha256": validated.receipt_sha256,
             "preflight_sha256": sha256(preflight_path),
             "cases": [],
@@ -204,6 +227,7 @@ def main(argv=None):
     parser.add_argument("--preflight", required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--database", required=True)
+    parser.add_argument("--scope", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--summary-log", required=True)
     args = parser.parse_args(argv)
@@ -211,6 +235,7 @@ def main(argv=None):
     report = {
         "schema": "rootyard/refstore-issue111-cache-proof/v1",
         "issue": 111,
+        "scope": args.scope,
         "source_head": args.expected_commit,
         "cases": [],
         "passed": False,
@@ -235,8 +260,25 @@ def main(argv=None):
             + str(len(CASES) - passed)
             + " failed; 0 skipped"
         )
-    except (ProofError, receipts.ReceiptError, OSError, ValueError, TypeError, KeyError) as error:
-        report["error"] = type(error).__name__
+    except ProofError:
+        report["error"] = "proof_refused"
+        summary = "session174 cache proof: failed before completion; 0 skipped"
+    except receipts.ReceiptError:
+        report["error"] = "receipt_refused"
+        summary = "session174 cache proof: failed before completion; 0 skipped"
+    except subprocess.SubprocessError:
+        report["error"] = "source_git_failed"
+        summary = "session174 cache proof: failed before completion; 0 skipped"
+    except OSError:
+        report["error"] = "io_error"
+        summary = "session174 cache proof: failed before completion; 0 skipped"
+    except (ValueError, TypeError, KeyError):
+        report["error"] = "validation_failed"
+        summary = "session174 cache proof: failed before completion; 0 skipped"
+    except Exception:
+        # Never let an unclassified binder failure print a traceback or raw
+        # child text; the artifact still records one fixed failure code.
+        report["error"] = "internal_error"
         summary = "session174 cache proof: failed before completion; 0 skipped"
     finally:
         report_path = Path(args.report)

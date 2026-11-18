@@ -62,6 +62,7 @@ class Issue111CacheCiTest(unittest.TestCase):
             'ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1',
             'ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1',
             'ROOTYARD_CACHE_ENVIRONMENT="session174-cache"',
+            'ROOTYARD_ISSUE111_CACHE_SCOPE="session174-cache-4-cases"',
             'ROOTYARD_BLOB_ROOT="session174-cache-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
             'expected_db="${SESSION174_DATABASE_PREFIX}_r${GITHUB_RUN_ID}_a${GITHUB_RUN_ATTEMPT}"',
             'if [ "${SESSION174_DATABASE:-}" != "$expected_db" ]',
@@ -76,6 +77,7 @@ class Issue111CacheCiTest(unittest.TestCase):
         self.assertIn('--preflight "$preflight"', self.cache_step)
         self.assertIn('--expected-commit "$GITHUB_SHA"', self.cache_step)
         self.assertIn('--database "$SESSION174_DATABASE"', self.cache_step)
+        self.assertIn('--scope "$ROOTYARD_ISSUE111_CACHE_SCOPE"', self.cache_step)
         self.assertIn('--report "$evidence/cache-report.json"', self.cache_step)
         self.assertIn('--summary-log "$evidence/cache-summary.log"', self.cache_step)
         for case in CASES:
@@ -111,14 +113,51 @@ class Issue111CacheCiTest(unittest.TestCase):
         self.assertIn('if: always()', upload)
         self.assertIn('test-results/refstore/', upload)
 
-    def test_runner_writes_only_bounded_report_and_summary_and_fits_limits(self):
+    def test_runner_uses_existing_bounded_group_runner_and_writes_no_raw_output(self):
         self.assertLess(len(SCRIPT.read_text(encoding='utf-8').splitlines()), 500)
         self.assertEqual(self.script.count('.write_text('), 2)
+        self.assertIn('import issue107_native11_runner as bounded_runner', self.script)
+        self.assertIn('bounded_runner.run_bounded(', self.script)
+        self.assertIn('timeout=CASE_TIMEOUT_SECONDS', self.script)
+        self.assertIn('env=os.environ.copy()', self.script)
+        self.assertIn('[lib, "--ignored", "--exact", name, "--test-threads=1"]', self.script)
+        self.assertNotIn('subprocess.run(', self.script)
+        self.assertNotIn('subprocess.Popen(', self.script)
+        self.assertNotIn('capture_output', self.script)
+        for code in ('native_timeout', 'native_process_failed', 'native_output_too_large', 'cleanup_unresolved'):
+            self.assertIn(code, self.script)
+        for code in (
+            '"runner_failed"',
+            '"internal_error"',
+            '"proof_refused"',
+            '"receipt_refused"',
+            '"source_git_failed"',
+            '"io_error"',
+            '"validation_failed"',
+        ):
+            self.assertIn(code, self.script)
+        self.assertIn('FAILURE_CODES.get', self.script)
+        self.assertIn('"summary_count"', self.script)
+        self.assertIn('"summary_not_exact_one"', self.script)
+        self.assertIn('"case_outcome_missing"', self.script)
         for forbidden in ('process.stdout)', 'process.stderr)', 'print(combined)', 'ACCESS_KEY', 'SECRET_KEY'):
             self.assertNotIn(forbidden, self.script)
-        self.assertIn('capture_output=True', self.script)
         self.assertIn('report_path.write_text(json.dumps(report', self.script)
         self.assertIn('summary_path.write_text(summary', self.script)
+
+    def test_report_carries_checked_tree_and_source_build_anchors(self):
+        for marker in (
+            'receipts.git_state(ROOT)',
+            'source.get("commit") != args.expected_commit',
+            'source.get("tree")',
+            '"source_commit": source["commit"]',
+            '"source_tree": source_tree',
+            '"build_receipt_sha256": validated.receipt_sha256',
+            '"preflight_sha256": sha256(preflight_path)',
+            'SCOPE = "session174-cache-4-cases"',
+        ):
+            self.assertIn(marker, self.script)
+        self.assertIn('"scope": args.scope', self.script)
 
     def test_manual_step_has_no_remote_or_push_action(self):
         for forbidden in ('git push', 'git remote', 'gh pr'):

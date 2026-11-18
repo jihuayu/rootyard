@@ -2472,6 +2472,7 @@ jobs:
           export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
           export ROOTYARD_BLOB_ROOT="session174-cache-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           export ROOTYARD_CACHE_ENVIRONMENT="session174-cache"
+          export ROOTYARD_ISSUE111_CACHE_SCOPE="session174-cache-4-cases"
           export ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1
           export ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1
           export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$SESSION174_DATABASE"
@@ -2490,6 +2491,7 @@ jobs:
             --preflight "$preflight" \
             --expected-commit "$GITHUB_SHA" \
             --database "$SESSION174_DATABASE" \
+            --scope "$ROOTYARD_ISSUE111_CACHE_SCOPE" \
             --report "$evidence/cache-report.json" \
             --summary-log "$evidence/cache-summary.log" || status=$?
           if ! python3 scripts/collect_evidence_receipts.py \
