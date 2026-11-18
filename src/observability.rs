@@ -5,6 +5,7 @@
 //! headers, query strings, user content and source strings are never formatted.
 use crate::storage::remote_objects::RemoteStoreError;
 
+pub(crate) mod root_prepare;
 pub(crate) mod worker;
 use axum::{
     extract::{MatchedPath, Request},
@@ -329,6 +330,87 @@ pub(crate) fn observe_internal(error: &dyn Any) {
     enqueue_event(event_json(error));
 }
 
+/// Finite failure stages owned by the serving retention-root create checkpoint.
+/// The diagnostic event never accepts a free-form stage string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RootCreateFailureStage {
+    PreflightOrReplay,
+    SourceSnapshotLookup,
+    PrepareNativeCandidate,
+    TransactionSetup,
+    RegisterInTransaction,
+    FinalAuthorityCheck,
+    SourcePinRecheck,
+    Commit,
+    RollbackCleanup,
+}
+
+impl RootCreateFailureStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PreflightOrReplay => "preflight_or_replay",
+            Self::SourceSnapshotLookup => "source_snapshot_lookup",
+            Self::PrepareNativeCandidate => "prepare_native_candidate",
+            Self::TransactionSetup => "transaction_setup",
+            Self::RegisterInTransaction => "register_in_transaction",
+            Self::FinalAuthorityCheck => "final_authority_check",
+            Self::SourcePinRecheck => "source_pin_recheck",
+            Self::Commit => "commit",
+            Self::RollbackCleanup => "rollback_cleanup",
+        }
+    }
+}
+
+/// Finite failure classes for the retention-root create diagnostic. The
+/// existing `Error::internal` event remains the authoritative generic internal
+/// error event; this class only labels the create checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RootCreateErrorClass {
+    CommitUnknown,
+    Deadline,
+    Cleanup,
+    MappedError,
+}
+
+impl RootCreateErrorClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CommitUnknown => "commit_unknown",
+            Self::Deadline => "deadline",
+            Self::Cleanup => "cleanup",
+            Self::MappedError => "mapped_error",
+        }
+    }
+}
+
+fn root_create_failure_json(
+    stage: RootCreateFailureStage,
+    error_class: RootCreateErrorClass,
+    http_status: u16,
+) -> String {
+    let mut event = serde_json::Map::new();
+    event.insert("event".to_owned(), json!("root_create_failure"));
+    event.insert("stage".to_owned(), json!(stage.as_str()));
+    event.insert("error_class".to_owned(), json!(error_class.as_str()));
+    event.insert("http_status".to_owned(), json!(http_status));
+    serde_json::to_string(&Value::Object(event)).unwrap_or_else(|_| {
+        r#"{"event":"root_create_failure","stage":"preflight_or_replay","error_class":"mapped_error","http_status":503}"#
+            .to_owned()
+    })
+}
+
+/// One fixed-schema, best-effort diagnostic event on the existing bounded
+/// stderr queue. Only finite stage/error-class labels and the numeric HTTP
+/// status enter this record; no error value, source text, identifier, SQL,
+/// provider value, request value or path is accepted by this API.
+pub(crate) fn observe_root_create_failure(
+    stage: RootCreateFailureStage,
+    error_class: RootCreateErrorClass,
+    http_status: u16,
+) {
+    enqueue_event(root_create_failure_json(stage, error_class, http_status));
+}
+
 /// Test-only view of the exact record `Error::internal` would enqueue, so scope
 /// attribution can be asserted without reading the process stderr writer.
 #[cfg(test)]
@@ -535,5 +617,39 @@ mod tests {
         assert_eq!(value["kind"].as_str(), Some("http"));
         assert!(value.get("remote_op").is_none());
         assert!(value.get("remote_status").is_none());
+    }
+
+    #[test]
+    fn root_create_failure_event_has_fixed_schema_and_no_payload() {
+        let stages = [
+            RootCreateFailureStage::PreflightOrReplay,
+            RootCreateFailureStage::SourceSnapshotLookup,
+            RootCreateFailureStage::PrepareNativeCandidate,
+            RootCreateFailureStage::TransactionSetup,
+            RootCreateFailureStage::RegisterInTransaction,
+            RootCreateFailureStage::FinalAuthorityCheck,
+            RootCreateFailureStage::SourcePinRecheck,
+            RootCreateFailureStage::Commit,
+            RootCreateFailureStage::RollbackCleanup,
+        ];
+        let classes = [
+            RootCreateErrorClass::CommitUnknown,
+            RootCreateErrorClass::Deadline,
+            RootCreateErrorClass::Cleanup,
+            RootCreateErrorClass::MappedError,
+        ];
+        for stage in stages {
+            for error_class in classes {
+                let text = root_create_failure_json(stage, error_class, 503);
+                let value: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(value.as_object().unwrap().len(), 4);
+                assert_eq!(value["event"].as_str(), Some("root_create_failure"));
+                assert_eq!(value["stage"].as_str(), Some(stage.as_str()));
+                assert_eq!(value["error_class"].as_str(), Some(error_class.as_str()));
+                assert_eq!(value["http_status"].as_u64(), Some(503));
+                assert!(!text.contains("SECRET"));
+                assert!(!text.contains("://"));
+            }
+        }
     }
 }

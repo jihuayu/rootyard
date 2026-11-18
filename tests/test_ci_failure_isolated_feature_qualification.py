@@ -49,6 +49,12 @@ EVIDENCE = (
     "Bind workspace FUSE and remote-delete evidence to the built binary",
     "workspace_legacy_service", "Bind legacy FUSE evidence independently to the built binary",
 )
+# Current main's verify/lifecycle budget: 95 existing minutes, +20 for the
+# owned-Redis CLI build and isolated browse restore proof, +3 for the Redis
+# partition drill and +1 for cleanup and report binding. This branch adds no
+# main-side step, so the merged job cap must be exactly this baseline plus the
+# independent workspace FUSE phases.
+MAIN_VERIFY_BUDGET = 119
 @dataclass
 class Step:
     name: str = ""
@@ -469,11 +475,25 @@ class FailureIsolatedFeatureLaneTest(unittest.TestCase):
         self.assertNotIn("target/", _normalized(
             self.by_name["Bind legacy FUSE evidence independently to the built binary"].run))
         verify = self.text.split("  container:", 1)[0]
-        self.assertIn("    timeout-minutes: 90", verify)
-        self.assertNotIn("    timeout-minutes: 120", verify)
-        self.assertEqual((self.by_id["native_batch"].timeout, self.by_id["workspace_garage"].timeout,
-                          self.by_id["workspace_fuse_remote"].timeout, self.by_id["workspace_legacy_service"].timeout),
-                         (10, 12, 30, 10))
+        fuse_phases = (self.by_id["workspace_garage"].timeout,
+                       self.by_id["workspace_fuse_remote"].timeout,
+                       self.by_id["workspace_legacy_service"].timeout)
+        self.assertEqual((self.by_id["native_batch"].timeout, *fuse_phases), (10, 12, 30, 10))
+        # The fixture start, the helper/remote-delete step and the legacy
+        # four-case step are the only phases this branch adds to main, and each
+        # keeps its own cap. C5 runs inside the 30-minute helper step, so it
+        # shares that cap instead of reserving separate job minutes.
+        self.assertEqual(fuse_phases, (12, 30, 10))
+        merged_cap = MAIN_VERIFY_BUDGET + sum(fuse_phases)
+        self.assertEqual(merged_cap, 171)
+        self.assertIn(f"    timeout-minutes: {merged_cap}", verify)
+        self.assertIn(
+            f"{MAIN_VERIFY_BUDGET} + {' + '.join(str(phase) for phase in fuse_phases)} = {merged_cap}",
+            verify,
+            "the job comment must derive the cap from main's budget and the added phases",
+        )
+        # Keeping main's 119 alone would silently under-budget the new phases.
+        self.assertNotIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET}", verify)
         self.assertIsNone(self.by_id["cargo_all_targets"].timeout)
         fuse = self.by_name["Bind workspace FUSE and remote-delete evidence to the built binary"]
         legacy = self.by_name["Bind legacy FUSE evidence independently to the built binary"]

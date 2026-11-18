@@ -11,6 +11,7 @@ mod commit_set;
 mod contract;
 mod digest;
 mod limits;
+pub mod pack_cover;
 mod pack_set;
 mod read_mode;
 mod reasons;

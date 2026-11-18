@@ -94,6 +94,164 @@ pub(super) async fn stored_receipt(
     }))
 }
 
+/// Which authority lane a metadata snapshot mutation/read must use.
+///
+/// The legacy A5a entry points stay on [`Self::Unserved`], while the serving
+/// coordinator opts into [`Self::Serving`] with the digest of the Blob backend
+/// it actually opened. There is no caller-facing `allow_serving` boolean.
+#[derive(Clone, Copy)]
+pub(super) enum ScopeLane<'a> {
+    /// Historical A5a lane. `require_unserved=true` also rejects the ready
+    /// `pg_refstore` serving lane; `false` keeps release's transition-tolerant
+    /// behaviour.
+    Unserved { require_unserved: bool },
+    /// The pre-existing shared lock predicate used by internal retained-snapshot
+    /// materialization/retention reads. It accepts both strict lanes with the
+    /// stored realm checks and is never a caller-facing serving activation.
+    LegacyFresh,
+    /// Narrow serving lane: ready binding, actual backend identity and current
+    /// gate realm, in addition to the stored scope realm.
+    Serving { backend_identity: &'a str },
+}
+
+/// Dispatch one already-validated scope to its explicit lane.
+pub(super) async fn lock_scope_lane(
+    tx: &Transaction<'_>,
+    scope: &MetadataSnapshotScope,
+    lane: ScopeLane<'_>,
+    gate_for_update: bool,
+) -> Result<CoreGate, RefStoreError> {
+    match lane {
+        ScopeLane::Unserved { require_unserved: true } => lock_scope_unserved(tx, scope, gate_for_update).await,
+        ScopeLane::Unserved { require_unserved: false } => lock_scope(tx, scope, false, gate_for_update).await,
+        ScopeLane::LegacyFresh => lock_scope(tx, scope, true, gate_for_update).await,
+        ScopeLane::Serving { backend_identity } => {
+            lock_scope_serving(tx, scope, backend_identity, gate_for_update).await
+        }
+    }
+}
+
+async fn current_gate(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    gate_for_update: bool,
+) -> Result<CoreGate, RefStoreError> {
+    let query = format!(
+        "SELECT tenant_id,object_format,history_incarnation,authority_epoch,group_epoch,head_ref,revision
+         FROM ref_store_core_gates WHERE repository_id=$1{}",
+        if gate_for_update { " FOR UPDATE" } else { " FOR SHARE" }
+    );
+    let gate = tx
+        .query_opt(&query, &[&repository_id])
+        .await
+        .map_err(pg::db_error)?
+        .ok_or(RefStoreError::Unsupported("repository has no initialized core gate"))?;
+    super::sql::gate_from_row(repository_id, &gate)
+}
+
+fn map_snapshot_scope_refusal(refusal: super::serving_scope::ScopeRefusal) -> RefStoreError {
+    use super::serving_scope::{RealmField, ScopeRefusal};
+    match refusal {
+        ScopeRefusal::Tenant => RefStoreError::RepositoryNotFound,
+        ScopeRefusal::Realm(field) => RefStoreError::MetadataScopeMismatch(match field {
+            RealmField::ObjectFormat => "repository object format",
+            RealmField::HistoryIncarnation => "repository history incarnation",
+            RealmField::AuthorityEpoch => "repository authority epoch",
+            RealmField::GroupEpoch => "repository group epoch",
+        }),
+        other => RefStoreError::Unsupported(other.reason()),
+    }
+}
+
+fn map_serving_scope_refusal(refusal: super::serving_scope::ScopeRefusal) -> RefStoreError {
+    use super::serving_scope::ScopeRefusal;
+    match refusal {
+        ScopeRefusal::Tenant => RefStoreError::RepositoryNotFound,
+        ScopeRefusal::Inconsistent(reason) => RefStoreError::Database(reason.into()),
+        other => RefStoreError::Unsupported(other.reason()),
+    }
+}
+
+/// Historical strict A5a lane. It accepts only the legacy unserved gitfs lane;
+/// a ready `pg_refstore` repository must use [`lock_scope_serving`] instead.
+pub(super) async fn lock_scope_unserved(
+    tx: &Transaction<'_>,
+    scope: &MetadataSnapshotScope,
+    gate_for_update: bool,
+) -> Result<CoreGate, RefStoreError> {
+    use super::serving_scope::{CoreLane, CoreRealm, LockedScope};
+    let locked = LockedScope::lock(tx, scope.repository_id(), false).await?.ok_or(RefStoreError::RepositoryNotFound)?;
+    if locked.owner_id() != scope.tenant_id() {
+        return Err(RefStoreError::RepositoryNotFound);
+    }
+    let realm = CoreRealm::new(
+        scope.tenant_id(),
+        scope.object_format(),
+        scope.history_incarnation(),
+        scope.authority_epoch(),
+        scope.group_epoch(),
+    );
+    match locked.require_fresh_core(&realm) {
+        Ok(CoreLane::LegacyUnservedGitfs) => {}
+        Ok(CoreLane::PgRefStore) => {
+            return Err(RefStoreError::Unsupported("A5a pack snapshot metadata requires an unserved core repository"));
+        }
+        Err(refusal) => return Err(map_snapshot_scope_refusal(refusal)),
+    }
+    let gate = current_gate(tx, scope.repository_id(), gate_for_update).await?;
+    if gate.tenant_id() != scope.tenant_id() {
+        return Err(RefStoreError::RepositoryNotFound);
+    }
+    if gate.object_format() != scope.object_format() {
+        return Err(RefStoreError::MetadataScopeMismatch("gate object format"));
+    }
+    if gate.history_incarnation() != scope.history_incarnation() {
+        return Err(RefStoreError::MetadataScopeMismatch("gate history incarnation"));
+    }
+    if gate.authority_epoch() != scope.authority_epoch() {
+        return Err(RefStoreError::MetadataScopeMismatch("gate authority epoch"));
+    }
+    if gate.group_epoch() != scope.group_epoch() {
+        return Err(RefStoreError::MetadataScopeMismatch("gate group epoch"));
+    }
+    Ok(gate)
+}
+
+/// Serving A5a lane. The ready durable binding, the digest of the actually
+/// opened Blob backend and the locked gate realm must all agree with the stored
+/// request scope; no bare `ready` row or stored hex string is authority.
+pub(super) async fn lock_scope_serving(
+    tx: &Transaction<'_>,
+    scope: &MetadataSnapshotScope,
+    backend_identity_hex: &str,
+    gate_for_update: bool,
+) -> Result<CoreGate, RefStoreError> {
+    use super::serving_scope::LockedScope;
+    let locked = LockedScope::lock(tx, scope.repository_id(), false).await?.ok_or(RefStoreError::RepositoryNotFound)?;
+    if locked.owner_id() != scope.tenant_id() {
+        return Err(RefStoreError::RepositoryNotFound);
+    }
+    locked.require_serving(scope.tenant_id(), backend_identity_hex).map_err(map_serving_scope_refusal)?;
+    let gate = current_gate(tx, scope.repository_id(), gate_for_update).await?;
+    if gate.tenant_id() != scope.tenant_id() {
+        return Err(RefStoreError::RepositoryNotFound);
+    }
+    if gate.object_format() != scope.object_format() {
+        return Err(RefStoreError::MetadataScopeMismatch("gate object format"));
+    }
+    if gate.history_incarnation() != scope.history_incarnation() {
+        return Err(RefStoreError::MetadataScopeMismatch("gate history incarnation"));
+    }
+    if gate.authority_epoch() != scope.authority_epoch() {
+        return Err(RefStoreError::MetadataScopeMismatch("gate authority epoch"));
+    }
+    if gate.group_epoch() != scope.group_epoch() {
+        return Err(RefStoreError::MetadataScopeMismatch("gate group epoch"));
+    }
+    locked.require_binding_matches_gate(&gate).map_err(map_serving_scope_refusal)?;
+    Ok(gate)
+}
+
 /// Repository row `FOR SHARE` plus the current gate row.
 ///
 /// `require_unserved` rechecks the A1 unserved predicate: provisioning/gitfs/
@@ -468,6 +626,34 @@ pub(super) async fn pin_identity(
             "SELECT pin_id,repository_id,tenant_id,snapshot_id,owner_id,purpose
              FROM ref_store_core_pins WHERE pin_id=$1 AND repository_id=$2",
             &[&pin_id, &repository_id],
+        )
+        .await
+        .map_err(pg::db_error)?;
+    let Some(row) = row else { return Ok(None) };
+    let purpose: String = row.get(5);
+    Ok(Some(PinIdentity {
+        pin_id: row.get(0),
+        repository_id: row.get(1),
+        tenant_id: row.get(2),
+        snapshot_id: row.get(3),
+        owner_id: row.get(4),
+        purpose: MetadataPinPurpose::parse(&purpose)?,
+    }))
+}
+
+/// Stable pin identity by snapshot without reading or locking generation/expiry.
+/// The serving coordinator uses this only to reconstruct the stored scope and
+/// resource selector before entering the existing request-advisory/quota path.
+pub(super) async fn pin_identity_by_snapshot(
+    tx: &Transaction<'_>,
+    snapshot_id: Uuid,
+    repository_id: Uuid,
+) -> Result<Option<PinIdentity>, RefStoreError> {
+    let row = tx
+        .query_opt(
+            "SELECT pin_id,repository_id,tenant_id,snapshot_id,owner_id,purpose
+             FROM ref_store_core_pins WHERE snapshot_id=$1 AND repository_id=$2",
+            &[&snapshot_id, &repository_id],
         )
         .await
         .map_err(pg::db_error)?;

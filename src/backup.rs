@@ -91,7 +91,7 @@ struct BlobClosure {
     bytes: u64,
     digest: String,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     format: u32,

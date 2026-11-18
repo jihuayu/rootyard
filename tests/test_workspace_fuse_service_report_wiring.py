@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import re
 import unittest
 
 import workspace_fuse_service_acceptance as acceptance
@@ -17,6 +18,11 @@ import workspace_fuse_service_acceptance as acceptance
 ROOT = Path(__file__).resolve().parents[1]
 CI_YML = ROOT / ".github/workflows/ci.yml"
 GENERIC_RUNNER = ROOT / "scripts/run_python_ci_tests.py"
+
+# Current main's verify/lifecycle budget (95 existing + 20 owned-Redis build and
+# isolated browse restore proof + 3 Redis partition drill + 1 cleanup/report).
+# The merged job keeps it and adds only this branch's independent FUSE phases.
+MAIN_VERIFY_BUDGET = 119
 
 C5 = "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_api_sigkill_with_pending_kernel_writer"
 EXISTING_REQUIRED = (
@@ -112,17 +118,35 @@ class WorkspaceFuseServiceReportWiringTest(unittest.TestCase):
         )
         self.assertIn("timeout-minutes: 30", step)
 
-    def test_job_reserves_five_minutes_without_inflating_existing_steps(self):
+    def test_job_keeps_main_budget_and_adds_only_independent_fuse_phases(self):
         verify = self.ci.split("  container:", 1)[0]
-        self.assertIn("    timeout-minutes: 90", verify)
-        self.assertNotIn("    timeout-minutes: 85", verify)
-
+        fixture = _step(
+            self.ci, "Start the job-owned workspace FUSE/remote S3 fixture")
         helper = _step(
             self.ci, "Exercise original FUSE helper and remote-delete acceptance")
         legacy = _step(
             self.ci, "Exercise four legacy in-process FUSE service-shutdown cases")
-        self.assertIn("timeout-minutes: 30", helper)
-        self.assertIn("timeout-minutes: 10", legacy)
+        redis = _step(
+            self.ci, "Verify browse cache incarnation across restore with owned Redis")
+
+        def _cap(step):
+            match = re.search(r"^        timeout-minutes: (\d+)$", step, re.MULTILINE)
+            return int(match.group(1)) if match else None
+
+        phases = (_cap(fixture), _cap(helper), _cap(legacy))
+        self.assertEqual(phases, (12, 30, 10), "independent FUSE phases keep their caps")
+        # C5 is required from the very report the 30-minute helper step produces,
+        # so it runs inside that step and shares its cap instead of reserving
+        # extra job minutes.
+        self.assertIn("--report test-results/workspace-fuse-service.json", " ".join(helper.split()))
+        self.assertIn(f"--require-case workspace_fuse_service={C5}", self.manifest)
+        self.assertEqual(_cap(helper), 30)
+        # The merged verify job keeps main's 119-minute budget and adds only
+        # those three phases; keeping 119 alone would under-budget the lane.
+        self.assertIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET + sum(phases)}", verify)
+        self.assertNotIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET}", verify)
+        # No pre-existing main step cap is inflated by this branch.
+        self.assertEqual(_cap(redis), 24)
 
     def test_existing_upload_path_keeps_reports_on_always(self):
         step = _step(self.ci, "Upload workspace FUSE/remote acceptance reports")

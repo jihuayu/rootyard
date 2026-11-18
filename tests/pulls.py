@@ -1245,6 +1245,17 @@ class PullsHarness(ForgeHarness):
                 replay = (
                     "DELETE FROM schema_migrations WHERE version IN (9,72,107,150)"
                 )
+                if 151 in SCHEMA_VERSIONS:
+                    drops += (
+                        "; DROP TABLE IF EXISTS repository_lifecycle_idempotency, "
+                        "repository_transfers, repository_aliases; "
+                        "ALTER TABLE repositories "
+                        "DROP CONSTRAINT IF EXISTS repositories_deleted_purge_window_chk, "
+                        "DROP CONSTRAINT IF EXISTS repositories_version_check"
+                    )
+                    replay = (
+                        "DELETE FROM schema_migrations WHERE version IN (9,72,107,150,151)"
+                    )
         self.sql(drops + "; " + replay + "; CREATE TABLE forge_pull_reviews(dummy integer)")
         if 9 in SCHEMA_VERSIONS:
             failed = self.run([self.args.binary, "migrate"], check=False)

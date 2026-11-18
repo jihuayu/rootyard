@@ -80,6 +80,27 @@ pub(crate) fn normalize_excluded(raw: Option<Vec<String>>, extra: Option<&str>) 
     Ok(set.into_iter().collect())
 }
 
+/// Lock the exact live repository row before any lease or checkout grant is
+/// minted. Soft delete takes the same row exclusively, so a claim either
+/// commits its grant first or observes `deleted_at` and returns 404.
+async fn lock_claim_repository_tx(
+    tx: &Transaction<'_>,
+    repo: Uuid,
+    owner: &str,
+    name: &str,
+) -> Result<(), Error> {
+    tx.query_opt(
+        "SELECT r.id FROM repositories r JOIN namespaces n ON n.id=r.owner_id \
+         WHERE r.id=$1 AND n.slug=$2 AND r.name=$3 AND r.state='ready' AND r.deleted_at IS NULL \
+         FOR SHARE OF r",
+        &[&repo, &owner, &name],
+    )
+    .await
+    .map_err(Error::internal)?
+    .ok_or_else(Error::not_found)?;
+    Ok(())
+}
+
 pub(crate) async fn verify_hook_tx(tx: &Transaction<'_>, hook_id: Uuid, repo: Uuid, headers: &HeaderMap) -> Result<(), Error> {
     let current_hook = tx
         .query_opt(
@@ -179,7 +200,7 @@ pub(crate) async fn integration(state: &AppState, owner: &str, name: &str, hook_
     let row = client.query_opt(
         "SELECT r.id,r.owner_id,w.secret,w.active FROM repositories r \
          JOIN namespaces u ON u.id=r.owner_id JOIN forge_webhooks w ON w.repository_id=r.id \
-         WHERE u.slug=$1 AND r.name=$2 AND w.id=$3 AND r.state='ready'",
+         WHERE u.slug=$1 AND r.name=$2 AND w.id=$3 AND r.state='ready' AND r.deleted_at IS NULL",
         &[&owner,&name,&hook_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let secret: String = row.get(2);
@@ -278,6 +299,11 @@ pub async fn claim(
     // issuer authority under the same policy fence used by revocation before
     // minting the lease and its checkout capability.
     crate::webhooks::trust::lock_policy_tx(&tx, repo).await?;
+    // The early integration lookup is not a fence. Re-lock the exact
+    // repository row here, before the run row and before lease/grant mint, so
+    // soft delete either wins the row first (this returns 404) or waits until
+    // this claim's checkout grant is committed.
+    lock_claim_repository_tx(&tx, repo, &owner, &name).await?;
     if let Err(err) = verify_hook_tx(&tx, hook_id, repo, &headers).await {
         return Ok(error_with_classification(err));
     }

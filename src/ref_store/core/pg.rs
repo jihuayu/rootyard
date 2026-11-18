@@ -188,7 +188,7 @@ impl PgRefStoreCore {
         result
     }
 
-    async fn check_version_in_tx(
+    pub(crate) async fn check_version_in_tx(
         &self,
         tx: &Transaction<'_>,
         repository_id: Uuid,

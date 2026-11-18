@@ -32,7 +32,7 @@ async fn source_lease(
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client.query_opt(
         "SELECT r.id FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id \
-         WHERE ns.slug=$1 AND r.name=$2", &[&owner, &name],
+         WHERE ns.slug=$1 AND r.name=$2 AND r.deleted_at IS NULL", &[&owner, &name],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let repo: Uuid = row.get(0);
     drop(client);
