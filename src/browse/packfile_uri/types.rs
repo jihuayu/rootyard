@@ -177,27 +177,21 @@ impl PackfileClosureMember {
         Ok(())
     }
 
-    /// Converts from a cataloged [`PackSetEntry`] plus trailer hash emitted on wire.
+    /// Converts from a cataloged [`PackSetEntry`] plus verified pack checksum, byte length, and wire hash.
     pub fn from_pack_set_entry(
         entry: &PackSetEntry,
         pack_hash_hex: String,
+        sha256_hex: String,
+        byte_len: u64,
         covered_objects: u64,
         cache_warm: bool,
     ) -> Result<Self, PackfileUriError> {
-        let pack_oid = hex::encode(entry.pack_id);
-        let member = Self {
-            pack_oid,
-            pack_hash_hex,
-            sha256_hex: entry.pack_sha256.clone(),
-            byte_len: entry.byte_len,
-            covered_objects,
-            cache_warm,
-        };
-        if !is_lower_hex_exact(&member.pack_oid, 64) {
-            return Err(PackfileUriError::InvalidPolicy("invalid PackSetEntry pack_id".to_owned()));
+        let pack_oid = hex::encode(entry.artifact_set_digest());
+        if byte_len == 0 || byte_len > MAX_OFFLOAD_BYTES_HARD_CAP {
+            return Err(PackfileUriError::InvalidPolicy(format!("invalid pack byte length: {byte_len}")));
         }
-        validate_hex_sha256(&member.sha256_hex)?;
-        Ok(member)
+        validate_hex_sha256(&sha256_hex)?;
+        Ok(Self { pack_oid, pack_hash_hex, sha256_hex, byte_len, covered_objects, cache_warm })
     }
 }
 
