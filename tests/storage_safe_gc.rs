@@ -1,7 +1,7 @@
 //! Real OpenDAL S3 + BlobStore + stock Git (SHA-1 & SHA-256) Safe GC integration tests (#122).
 
 #[path = "storage_safe_gc_support/s3_harness.rs"]
-mod s3_harness;
+pub mod s3_harness;
 
 use std::{
     collections::BTreeSet,

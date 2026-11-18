@@ -175,14 +175,6 @@ impl LoopbackS3 {
         guard.insert(Self::key(loc), next.clone());
         next
     }
-
-    pub fn request_totals(&self) -> (usize, usize, usize) {
-        (
-            self.state.put_requests.load(Ordering::SeqCst),
-            self.state.head_requests.load(Ordering::SeqCst),
-            self.state.delete_requests.load(Ordering::SeqCst),
-        )
-    }
 }
 
 fn parse_query_version_id(u: &Uri) -> Option<String> {

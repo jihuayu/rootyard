@@ -266,6 +266,11 @@ async fn pg17_authoritative_refcas_reconciled_cut_blocks_unprojected_commits() -
 
     authority.set_gc_mode(GcMode::ArmedDestructive(dist_arm.clone()))?;
     let proof = authority.build_authoritative_deletion_proof(dist_arm, &[srv_orph.pack_id])?;
+    let saved_orph = s3.get_stored(&p_orph).expect("p_orph stored");
+    let replaced_orph = s3.overwrite_same_length(&p_orph, 0x6b);
+    assert_eq!(replaced_orph.bytes.len(), saved_orph.bytes.len());
+    s3.restore_stored(&p_orph, saved_orph);
+
     let cur = authority.snapshot().authority;
     let rep = execute_safe_gc_sweep(
         &authority,

@@ -39,6 +39,7 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "store_verify.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_concurrency.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_reconcile.rs",
     ROOT / "tests" / "storage_safe_gc.rs",
     ROOT / "tests" / "storage_safe_gc_maintenance.rs",
     ROOT / "tests" / "storage_safe_gc_support" / "pg_refcas_cases.rs",
