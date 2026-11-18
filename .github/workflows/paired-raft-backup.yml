@@ -1,0 +1,123 @@
+name: Paired PG Raft Blob Backup & Restore
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/paired-raft-backup.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'migrations/**'
+      - 'src/maintenance.rs'
+      - 'src/maintenance/paired_raft_backup.rs'
+      - 'src/maintenance/paired_raft_backup/**'
+      - 'tests/paired_raft_backup_restore.rs'
+      - 'scripts/eval_paired_raft_backup.py'
+      - 'tests/test_paired_raft_backup_contracts.py'
+      - 'docs/paired-raft-backup-restore.md'
+  workflow_dispatch:
+
+concurrency:
+  group: paired-raft-backup-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  paired-raft-backup:
+    name: Paired PG + Raft + Blob Backup & Restore (#153)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: rootyard_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rootyard_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://postgres:password@localhost:5432/rootyard_test
+      ROOTYARD_TEST_DATABASE_URL: postgres://postgres:password@localhost:5432/rootyard_test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && rustfmt -V && cargo clippy -V
+      - name: Restore the pinned CargoFork executable
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/rootyard-cargo-fork
+          key: rootyard-cargo-fork-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b-1.99.1-v1
+      - name: Install pinned CargoFork 1.101.0 (full 64a6ee6a)
+        run: |
+          scripts/install_ci_cargo_fork.sh install \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --record test-results/paired-raft-backup/cargo-fork.json
+      - name: Verify CargoFork 64a6ee6a before Cargo
+        run: |
+          scripts/install_ci_cargo_fork.sh verify \
+            --cache-dir "$RUNNER_TEMP/rootyard-cargo-fork" \
+            --require-os linux \
+            --require-path
+          cargo -vV
+          cargo -vV | grep -Fx 'release: 1.101.0'
+          cargo -vV | grep -Fx 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b'
+          rustc -V | grep -Eq '^rustc 1\.99\.1 '
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+      - name: Format, design-doc and offline contract checks
+        run: |
+          git --version
+          cargo fmt --all -- --check
+          python3 scripts/check_design_docs.py
+          python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_paired_raft_backup_contracts.py tests.test_workspace_remote_namespace.WorkspaceRemoteNamespaceContractTests
+      - name: Run Clippy, library unit tests, OpenDAL S3 + Git tests, and live PG 17 restore tests
+        run: |
+          cargo clippy --locked --no-default-features --lib --test paired_raft_backup_restore -- -D warnings
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib maintenance::paired_raft_backup
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test paired_raft_backup_restore
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test paired_raft_backup_restore -- --ignored --test-threads=1
+      - name: Build receipted test binary and run paired backup benchmark evaluator
+        run: |
+          mkdir -p test-results/paired-raft-backup
+          env -u CARGO_PROFILE_DEV_DEBUG -u CARGO_PROFILE_TEST_DEBUG \
+            python3 scripts/build_native_test.py \
+            --test paired_raft_backup_restore \
+            --no-default-features \
+            --package-debug 0 \
+            --output "$RUNNER_TEMP/paired-raft-backup-bin/paired_raft_backup_restore"
+          cp -- "$RUNNER_TEMP/paired-raft-backup-bin/paired_raft_backup_restore.build.json" test-results/paired-raft-backup/paired_raft_backup_restore.build.json
+          python3 scripts/eval_paired_raft_backup.py \
+            --pack-counts 4,8 \
+            --formats sha1,sha256 \
+            --binary "$RUNNER_TEMP/paired-raft-backup-bin/paired_raft_backup_restore" \
+            --build-receipt "$RUNNER_TEMP/paired-raft-backup-bin/paired_raft_backup_restore.build.json" \
+            --json-out test-results/paired-raft-backup/benchmark.json
+      - name: Upload Paired Backup CI Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-raft-backup-evidence
+          path: test-results/paired-raft-backup/
+          if-no-files-found: warn

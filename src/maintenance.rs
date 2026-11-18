@@ -1,5 +1,7 @@
 //! Offline, explicit acknowledgment of a GitFS audit gap. Never assigns a
 //! successful outcome to an unknown push and never replays that push.
+pub mod paired_raft_backup;
+
 use crate::{config::Config, git_http, journal, storage::Storage};
 use anyhow::{Context, Result, ensure};
 use deadpool_postgres::Pool;
