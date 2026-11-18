@@ -13,21 +13,30 @@ use crate::ref_store::core::state_machine::{
     AppliedLogId, ApplyResponse, RefCasCommand, RefCasLogEntry, RefCasSnapshot, RefCasStateMachine, encode_command,
 };
 
+use super::peer_attestation::PeerDurableAttestation;
 use super::raft_barrier::{
     DurableRaftApplyReceipt, LocalWalApplyReceipt, QuorumCommitReceipt, VoterWalAck, compute_group_membership_digest,
 };
 use super::types::{PairedBackupError, sha256_json_tagged, validate_hex64};
+use super::wal_voters::{WalVoterBinding, WalVoterRing};
 
 /// Durable Raft execution gate separating quorum commit witnesses from local WAL apply.
 pub trait DurableRaftBackend {
     fn group_id(&self) -> i64;
     fn group_membership_digest(&self) -> String;
+    fn voter_ids(&self) -> Vec<Uuid>;
     fn commit_and_apply(
         &mut self,
         cmd: RefCasCommand,
     ) -> Result<(DurableRaftApplyReceipt, ApplyResponse), PairedBackupError>;
     fn durable_state(&self) -> Result<(RefCasSnapshot, String), PairedBackupError>;
     fn committed_quorum_index(&self) -> Result<u64, PairedBackupError>;
+    fn attest_group_cutpoint(
+        &self,
+        group_epoch: i64,
+        snapshot: &RefCasSnapshot,
+        state_digest: &str,
+    ) -> Result<Vec<PeerDurableAttestation>, PairedBackupError>;
     fn durable_snapshot(&self) -> Result<RefCasSnapshot, PairedBackupError> {
         Ok(self.durable_state()?.0)
     }
@@ -52,14 +61,6 @@ struct QuorumCommitMarker {
     marker_seal: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedVoters {
-    group_id: i64,
-    voter_ids: Vec<Uuid>,
-    seal: String,
-}
-
 /// Multi-voter fsynced Raft WAL backend maintaining per-voter WAL files + durable quorum commit index.
 /// Reopening NEVER applies uncommitted local WAL tail entries (`log_id.index > committed_index`).
 pub struct WalSyncedRaftBackend {
@@ -67,6 +68,8 @@ pub struct WalSyncedRaftBackend {
     group_id: i64,
     term: u64,
     voter_ids: Vec<Uuid>,
+    voter_bindings: Vec<WalVoterBinding>,
+    voter_keys: Vec<ring::signature::Ed25519KeyPair>,
     voter_online: Vec<bool>,
     group_membership_digest: String,
     committed_index: u64,
@@ -88,24 +91,10 @@ impl WalSyncedRaftBackend {
         if let Some(parent) = wal_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let voters_path = Self::sidecar(&wal_path, "voters");
-        let voter_ids = if voters_path.exists() {
-            let pv: PersistedVoters = serde_json::from_slice(&fs::read(&voters_path)?)
-                .map_err(|_| PairedBackupError::StateMachine("corrupt voters file".into()))?;
-            let mut clean = pv.clone();
-            clean.seal.clear();
-            if pv.group_id != group_id || sha256_json_tagged(b"rootyard-wal-voters-file-v1", &clean)? != pv.seal {
-                return Err(PairedBackupError::StateMachine("voters file group_id or seal mismatch".into()));
-            }
-            pv.voter_ids
-        } else {
-            let mut v = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
-            v.sort();
-            let mut pv = PersistedVoters { group_id, voter_ids: v.clone(), seal: String::new() };
-            pv.seal = sha256_json_tagged(b"rootyard-wal-voters-file-v1", &pv)?;
-            Self::write_atomic(&voters_path, &serde_json::to_vec(&pv).unwrap_or_default())?;
-            v
-        };
+        let voters = super::wal_voters::open_or_create_voters(&wal_path, group_id)?;
+        let voter_ids = voters.voter_ids;
+        let voter_bindings = voters.bindings;
+        let voter_keys = voters.keys;
         let group_membership_digest = compute_group_membership_digest(&voter_ids)?;
 
         let commit_path = Self::sidecar(&wal_path, "commit");
@@ -149,6 +138,8 @@ impl WalSyncedRaftBackend {
             group_id,
             term,
             voter_ids,
+            voter_bindings,
+            voter_keys,
             voter_online,
             group_membership_digest,
             committed_index,
@@ -183,6 +174,25 @@ impl WalSyncedRaftBackend {
         Ok(recs.iter().filter(|r| r.log_id.index > self.committed_index).count())
     }
 
+    fn sign_voter_ack(
+        &self,
+        slot: usize,
+        group_epoch: i64,
+        log_id: AppliedLogId,
+        command_sha256: &str,
+        wal_record_digest: &str,
+    ) -> Result<VoterWalAck, PairedBackupError> {
+        super::wal_voters::sign_commit_ack(
+            &WalVoterRing { voter_ids: &self.voter_ids, bindings: &self.voter_bindings, keys: &self.voter_keys },
+            self.group_id,
+            slot,
+            group_epoch,
+            log_id,
+            command_sha256,
+            wal_record_digest,
+        )
+    }
+
     /// Replicate & fsync to remote quorum peers (`1..N`) WITHOUT local voter `0` WAL/apply,
     /// returning a genuine `2/3` `QuorumCommitReceipt` while local WAL/apply lags behind.
     pub fn commit_quorum_only(&mut self, cmd: &RefCasCommand) -> Result<QuorumCommitReceipt, PairedBackupError> {
@@ -191,16 +201,7 @@ impl WalSyncedRaftBackend {
         for slot in 1..self.voter_ids.len() {
             if self.voter_online[slot] {
                 Self::append_wal_record(&Self::voter_wal_path(&self.wal_path, slot), &rec)?;
-                acks.push(
-                    VoterWalAck {
-                        voter_id: self.voter_ids[slot],
-                        log_id,
-                        command_sha256: rec.command_sha256.clone(),
-                        wal_record_digest: rec.record_digest.clone(),
-                        ack_digest: String::new(),
-                    }
-                    .seal()?,
-                );
+                acks.push(self.sign_voter_ack(slot, group_epoch, log_id, &rec.command_sha256, &rec.record_digest)?);
             }
         }
         let qr = QuorumCommitReceipt {
@@ -348,6 +349,32 @@ impl DurableRaftBackend for WalSyncedRaftBackend {
         self.group_membership_digest.clone()
     }
 
+    fn voter_ids(&self) -> Vec<Uuid> {
+        self.voter_ids.clone()
+    }
+
+    fn attest_group_cutpoint(
+        &self,
+        group_epoch: i64,
+        snapshot: &RefCasSnapshot,
+        state_digest: &str,
+    ) -> Result<Vec<PeerDurableAttestation>, PairedBackupError> {
+        let attestations = super::wal_voters::sign_cutpoint_attestations(
+            &WalVoterRing { voter_ids: &self.voter_ids, bindings: &self.voter_bindings, keys: &self.voter_keys },
+            self.group_id,
+            group_epoch,
+            &self.voter_online,
+            snapshot,
+            state_digest,
+        )?;
+        if attestations.len() <= self.voter_ids.len() / 2 {
+            return Err(PairedBackupError::FreezeNotHeld(
+                "fewer than a majority of voters are online for cutpoint attestations",
+            ));
+        }
+        Ok(attestations)
+    }
+
     fn commit_and_apply(
         &mut self,
         cmd: RefCasCommand,
@@ -368,16 +395,7 @@ impl DurableRaftBackend for WalSyncedRaftBackend {
                 if slot == 0 {
                     local_acked = true;
                 }
-                acks.push(
-                    VoterWalAck {
-                        voter_id: self.voter_ids[slot],
-                        log_id,
-                        command_sha256: rec.command_sha256.clone(),
-                        wal_record_digest: rec.record_digest.clone(),
-                        ack_digest: String::new(),
-                    }
-                    .seal()?,
-                );
+                acks.push(self.sign_voter_ack(slot, group_epoch, log_id, &rec.command_sha256, &rec.record_digest)?);
             }
         }
         let quorum_receipt = QuorumCommitReceipt {

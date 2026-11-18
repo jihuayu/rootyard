@@ -25,6 +25,7 @@ pub struct MtlsRaftClusterConfig {
     pub group_id: i64,
     pub local_node_id: u64,
     pub voter_endpoints: BTreeMap<u64, String>,
+    pub attestor_endpoints: BTreeMap<u64, String>,
     pub ca_cert_pem: PathBuf,
     pub client_cert_pem: PathBuf,
     pub client_key_pem: PathBuf,
@@ -64,20 +65,6 @@ impl DurableRaftFreezeRecord {
         }
         Ok(())
     }
-}
-
-pub(super) fn derive_voter_uuid(group_id: i64, node_id: u64, cert_sha256: &str) -> Uuid {
-    let mut h = Sha256::new();
-    h.update(b"rootyard-mtls-voter-uuid-v1\0");
-    h.update(group_id.to_be_bytes());
-    h.update(node_id.to_be_bytes());
-    h.update(cert_sha256.as_bytes());
-    let digest = h.finalize();
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes)
 }
 
 pub fn build_mtls_client_config(cfg: &MtlsRaftClusterConfig) -> Result<Arc<ClientConfig>, PairedBackupError> {

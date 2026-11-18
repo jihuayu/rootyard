@@ -12,14 +12,18 @@ pub mod freeze_drain;
 pub mod git_verify;
 pub mod mtls_raft;
 pub mod mtls_wire;
+pub mod peer_attestation;
+pub mod peer_attestation_rpc;
 pub mod peer_groups;
 pub mod pg_cutpoint;
 pub mod pg_freeze_settings;
 pub mod pg_restore_admission;
+pub mod production_runtime;
 pub mod quorum_wal;
 pub mod raft_barrier;
 pub mod restore;
 pub mod types;
+pub mod wal_voters;
 
 #[cfg(test)]
 mod unit_tests;
@@ -43,18 +47,27 @@ pub use format30_paired::{
 };
 pub use freeze_drain::{InFlightOperation, RepoBackupRegistrationSpec, TriPartyBackupCoordinator};
 pub use mtls_raft::{DurableRaftFreezeRecord, MtlsLiveRaftBackend, MtlsRaftClusterConfig};
+pub use peer_attestation::{
+    PeerAttestationConfig, PeerAttestationDaemon, PeerDurableAttestation, PeerDurableAttestationClaims,
+    derive_voter_uuid_bound, load_or_create_ed25519_keypair,
+};
 pub use peer_groups::{
     ExpectedGroupCursorCut, PeerGroupBackupInput, PeerRaftCutpointProof, extract_peer_expected_cuts,
     restore_peer_groups_state, verify_all_group_cursors, verify_archived_peer_groups,
 };
 pub use pg_cutpoint::{ExpectedRaftCut, capture_pg_cutpoint_in_tx, freeze_pg_deleter};
+pub use pg_freeze_settings::{
+    enforce_maintenance_pg_write_guard, read_pg_database_read_only, terminate_and_await_other_pg_sessions,
+    verify_no_active_pg_writers,
+};
 pub use pg_restore_admission::{
     install_restored_pg_incarnation, verify_pg_live_incarnation, verify_pg_restored_cursors,
 };
+pub use production_runtime::{PairedProductionRuntimeGuard, WorkerProjectionTicket};
 pub use quorum_wal::{DurableRaftBackend, WalSyncedRaftBackend};
 pub use raft_barrier::{
     DurableFreezeBarrierProof, DurableRaftApplyReceipt, LocalWalApplyReceipt, QuorumCommitReceipt,
-    SealedArchiveReceipt, VoterWalAck, compute_group_membership_digest,
+    SealedArchiveReceipt, VoterWalAck, compute_group_membership_digest, verify_cutpoint_attestations,
 };
 pub use restore::{
     IncarnationAdmissionGuard, RestoreTargetScope, restore_new_incarnation, restore_new_incarnation_with_pg,

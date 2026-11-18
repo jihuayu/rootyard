@@ -1,6 +1,8 @@
 //! PostgreSQL 17 database-level durable read-only & freeze markers (`pg_db_role_setting`)
 //! plus ephemeral dedicated backup role provisioning outside `public` schema (#153).
 
+use std::time::{Duration, Instant};
+
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
@@ -8,6 +10,9 @@ use crate::config::Config;
 
 use super::pg_cutpoint::pg_err;
 use super::types::PairedBackupError;
+
+const CLIENT_BACKEND_STATES: &str =
+    "'active','idle in transaction','idle in transaction (aborted)','fastpath function call'";
 
 /// Database-wide durable freeze setting stored in PostgreSQL `pg_db_role_setting`
 /// (outside the `public` schema catalog so `schema 151` / `format 30` stays unmodified).
@@ -64,6 +69,122 @@ pub async fn read_pg_database_read_only(client: &(impl GenericClient + Sync)) ->
             "default_transaction_read_only=on" | "default_transaction_read_only=true"
         )
     }))
+}
+
+/// Fail-closed termination & exit barrier: every `pg_terminate_backend(pid)` boolean return
+/// value is inspected, then `pg_stat_activity` is polled until no other client backend on
+/// `current_database()` still holds a transaction/xid or an active/in-transaction state.
+pub async fn terminate_and_await_other_pg_sessions(
+    client: &(impl GenericClient + Sync),
+    timeout: Duration,
+) -> Result<usize, PairedBackupError> {
+    let rows = client
+        .query(
+            "SELECT pid, pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+               AND backend_type = 'client backend'",
+            &[],
+        )
+        .await
+        .map_err(|_| PairedBackupError::FreezeNotHeld("failed to terminate pre-existing PostgreSQL client backends"))?;
+    let mut terminated: Vec<i32> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let pid: i32 = row.get(0);
+        let terminated_ok: Option<bool> = row.get(1);
+        if terminated_ok != Some(true) {
+            return Err(PairedBackupError::FreezeNotHeld(
+                "pg_terminate_backend returned false/NULL for a pre-existing client backend",
+            ));
+        }
+        terminated.push(pid);
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = remaining_other_client_backends(client, &terminated).await?;
+        if remaining == 0 {
+            return Ok(terminated.len());
+        }
+        if Instant::now() >= deadline {
+            return Err(PairedBackupError::FreezeNotHeld(
+                "pre-existing PostgreSQL write sessions failed to exit before the freeze deadline",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn remaining_other_client_backends(
+    client: &(impl GenericClient + Sync),
+    terminated_pids: &[i32],
+) -> Result<i64, PairedBackupError> {
+    let pids: Vec<i32> = terminated_pids.to_vec();
+    let sql = format!(
+        "SELECT count(*)::bigint FROM pg_stat_activity \
+         WHERE datname = current_database() AND pid <> pg_backend_pid() \
+           AND backend_type = 'client backend' \
+           AND (pid = ANY($1) OR backend_xid IS NOT NULL OR state IN ({CLIENT_BACKEND_STATES}))"
+    );
+    let count: i64 = client.query_one(&sql, &[&pids]).await.map_err(pg_err)?.get(0);
+    Ok(count)
+}
+
+/// Verify that no concurrent PostgreSQL write session or open transaction exists.
+pub async fn verify_no_active_pg_writers(client: &(impl GenericClient + Sync)) -> Result<(), PairedBackupError> {
+    let sql = format!(
+        "SELECT count(*)::bigint FROM pg_stat_activity \
+         WHERE datname = current_database() AND pid <> pg_backend_pid() \
+           AND backend_type = 'client backend' \
+           AND (backend_xid IS NOT NULL \
+                OR state IN ('active','idle in transaction','idle in transaction (aborted)'))"
+    );
+    let count: i64 = client.query_one(&sql, &[]).await.map_err(pg_err)?.get(0);
+    if count != 0 {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "concurrent PostgreSQL write session/transaction active; refusing cutpoint capture",
+        ));
+    }
+    Ok(())
+}
+
+/// Fail-closed maintenance write guard: refuse writes and journal deletion whenever the
+/// durable PostgreSQL freeze marker, database-wide `default_transaction_read_only`, or the
+/// storage-authority remote-delete fence is active.
+pub async fn enforce_maintenance_pg_write_guard(
+    client: &(impl GenericClient + Sync),
+    check_delete_fence: bool,
+) -> Result<(), PairedBackupError> {
+    if read_pg_database_freeze_marker(client).await?.is_some() {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "PostgreSQL durable paired_backup_freeze marker is active; maintenance path refuses to write",
+        ));
+    }
+    if read_pg_database_read_only(client).await? {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "PostgreSQL database default_transaction_read_only is on; maintenance path refuses to write",
+        ));
+    }
+    if check_delete_fence {
+        let present: bool = client
+            .query_one("SELECT to_regclass('public.pando_storage_authorities') IS NOT NULL", &[])
+            .await
+            .map_err(pg_err)?
+            .get(0);
+        if present {
+            let row = client
+                .query_one(
+                    "SELECT remote_delete_fenced FROM public.pando_storage_authorities WHERE singleton = true",
+                    &[],
+                )
+                .await
+                .map_err(pg_err)?;
+            if row.get::<_, bool>(0) {
+                return Err(PairedBackupError::DeleterNotFenced(
+                    "pando_storage_authorities.remote_delete_fenced is active; journal deletion refused",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn set_pg_database_read_only(

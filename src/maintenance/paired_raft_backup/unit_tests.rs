@@ -304,6 +304,9 @@ fn manifest_digest_tamper_and_incarnation_guard_checks() {
     .seal()
     .expect("closure");
 
+    let active_voter_ids = raft.voter_ids();
+    let active_cutpoint_attestations =
+        raft.attest_group_cutpoint(3, &snap, &state_digest).expect("cutpoint attestations");
     let manifest = PairedBackupManifest {
         format_version: PAIRED_BACKUP_FORMAT_V1.into(),
         backup_id: Uuid::new_v4(),
@@ -318,6 +321,8 @@ fn manifest_digest_tamper_and_incarnation_guard_checks() {
             logical_clock_floor: snap.body.logical_clock_floor,
             state_digest,
             group_membership_digest: raft.group_membership_digest(),
+            voter_ids: active_voter_ids,
+            cutpoint_attestations: active_cutpoint_attestations,
             snapshot_checksum: snap.checksum.clone(),
             snapshot: snap,
             close_receipts: barrier.close_receipts,

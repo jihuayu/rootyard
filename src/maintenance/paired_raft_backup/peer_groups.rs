@@ -18,6 +18,7 @@ use crate::ref_store::{
 };
 
 use super::closure_bind::extract_raft_group_realm;
+use super::peer_attestation::PeerDurableAttestation;
 use super::quorum_wal::{DurableRaftBackend, WalSyncedRaftBackend};
 use super::raft_barrier::DurableFreezeBarrierProof;
 use super::types::{NewIncarnationAuthority, PairedBackupError, PgCutpointProof};
@@ -39,6 +40,8 @@ pub struct PeerRaftCutpointProof {
     pub logical_clock_floor: u64,
     pub state_digest: String,
     pub group_membership_digest: String,
+    pub voter_ids: Vec<Uuid>,
+    pub cutpoint_attestations: Vec<PeerDurableAttestation>,
     pub snapshot_checksum: String,
     pub snapshot: RefCasSnapshot,
     pub freeze_barrier: DurableFreezeBarrierProof,
@@ -100,6 +103,8 @@ pub fn extract_peer_expected_cuts(
         }
         let cut = ExpectedGroupCursorCut::from_verified_snapshot(peer.group_id, &snap)?;
         let applied_log_id = AppliedLogId { term: cut.applied_term, index: cut.applied_index };
+        let voter_ids = peer.raft.voter_ids();
+        let cutpoint_attestations = peer.raft.attest_group_cutpoint(cut.group_epoch, &snap, &state_digest)?;
         proofs.push(PeerRaftCutpointProof {
             group_id: peer.group_id,
             history_incarnation: cut.history_incarnation,
@@ -109,6 +114,8 @@ pub fn extract_peer_expected_cuts(
             logical_clock_floor: snap.body.logical_clock_floor,
             state_digest,
             group_membership_digest: mem_digest,
+            voter_ids,
+            cutpoint_attestations,
             snapshot_checksum: snap.checksum.clone(),
             snapshot: snap,
             freeze_barrier: peer.freeze_barrier.clone(),
@@ -156,6 +163,16 @@ pub fn verify_archived_peer_groups(
             &peer.snapshot,
             &peer.state_digest,
             false,
+        )?;
+        super::raft_barrier::verify_cutpoint_attestations(
+            peer.group_id,
+            peer.group_epoch,
+            &peer.voter_ids,
+            &peer.group_membership_digest,
+            peer.applied_log_id,
+            &peer.state_digest,
+            &peer.snapshot_checksum,
+            &peer.cutpoint_attestations,
         )?;
         let cut = ExpectedGroupCursorCut::from_verified_snapshot(peer.group_id, &peer.snapshot)?;
         if peer.history_incarnation != cut.history_incarnation

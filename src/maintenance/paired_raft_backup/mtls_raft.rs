@@ -15,8 +15,9 @@ use crate::ref_store::core::state_machine::{
     AppliedLogId, ApplyResponse, RefCasCommand, RefCasSnapshot, RefCasStateMachine, encode_command,
 };
 
-use super::mtls_wire::derive_voter_uuid;
-pub use super::mtls_wire::{DurableRaftFreezeRecord, MtlsRaftClusterConfig, build_mtls_client_config, mtls_rpc_call};
+pub use super::mtls_wire::{DurableRaftFreezeRecord, MtlsRaftClusterConfig};
+use super::mtls_wire::{build_mtls_client_config, mtls_rpc_call};
+use super::peer_attestation::{PeerDurableAttestation, derive_voter_uuid_bound};
 use super::quorum_wal::DurableRaftBackend;
 use super::raft_barrier::{
     DurableRaftApplyReceipt, LocalWalApplyReceipt, MIN_QUORUM_VOTERS, QuorumCommitReceipt, VoterWalAck,
@@ -42,13 +43,20 @@ struct AuthenticatedVoterInfo {
     current_term: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct MtlsVoterBinding {
+    pub(super) voter_uuid: Uuid,
+    pub(super) cert_sha256: String,
+    pub(super) ed25519_pubkey_hex: String,
+}
+
 /// Production `DurableRaftBackend` backed by a live `>= 3`-voter mTLS `raft-node` cluster.
 pub struct MtlsLiveRaftBackend {
-    cfg: MtlsRaftClusterConfig,
-    tls_cfg: Arc<ClientConfig>,
-    voter_uuids: Vec<Uuid>,
-    peer_map: BTreeMap<u64, Uuid>,
-    group_membership_digest: String,
+    pub(super) cfg: MtlsRaftClusterConfig,
+    pub(super) tls_cfg: Arc<ClientConfig>,
+    pub(super) voter_uuids: Vec<Uuid>,
+    pub(super) voter_bindings: BTreeMap<u64, MtlsVoterBinding>,
+    pub(super) group_membership_digest: String,
     cached_sm: RefCasStateMachine,
 }
 
@@ -62,8 +70,13 @@ impl MtlsLiveRaftBackend {
         if !cfg.voter_endpoints.contains_key(&cfg.local_node_id) {
             return Err(PairedBackupError::InvalidArgument("local_node_id must belong to voter_endpoints"));
         }
+        if cfg.attestor_endpoints.keys().ne(cfg.voter_endpoints.keys()) {
+            return Err(PairedBackupError::InvalidArgument(
+                "attestor_endpoints must cover exactly the configured Raft voter node_ids",
+            ));
+        }
         let tls_cfg = build_mtls_client_config(&cfg)?;
-        let mut peer_map = BTreeMap::new();
+        let mut voter_bindings = BTreeMap::new();
         let mut cert_hashes = BTreeSet::new();
         for (&node_id, addr) in &cfg.voter_endpoints {
             let (resp, cert_sha) = mtls_rpc_call(&tls_cfg, addr, node_id, &json!("Metrics"), cfg.rpc_timeout)?;
@@ -76,23 +89,47 @@ impl MtlsLiveRaftBackend {
             if !cert_hashes.insert(cert_sha.clone()) {
                 return Err(PairedBackupError::FreezeNotHeld("duplicate leaf X.509 certificate across Raft voters"));
             }
-            peer_map.insert(node_id, derive_voter_uuid(cfg.group_id, node_id, &cert_sha));
+            let (reported_cert, pubkey_hex) = super::peer_attestation_rpc::probe_attestor_identity(
+                &tls_cfg,
+                &cfg.attestor_endpoints[&node_id],
+                node_id,
+                &cert_sha,
+                cfg.rpc_timeout,
+            )?;
+            let voter_uuid = derive_voter_uuid_bound(cfg.group_id, node_id, &reported_cert, &pubkey_hex);
+            voter_bindings.insert(
+                node_id,
+                MtlsVoterBinding { voter_uuid, cert_sha256: reported_cert, ed25519_pubkey_hex: pubkey_hex },
+            );
         }
-        let mut voter_uuids: Vec<Uuid> = peer_map.values().copied().collect();
+        let mut voter_uuids: Vec<Uuid> = voter_bindings.values().map(|b| b.voter_uuid).collect();
         voter_uuids.sort();
         let group_membership_digest = compute_group_membership_digest(&voter_uuids)?;
-        let mut backend =
-            Self { cfg, tls_cfg, voter_uuids, peer_map, group_membership_digest, cached_sm: RefCasStateMachine::new() };
+        let mut backend = Self {
+            cfg,
+            tls_cfg,
+            voter_uuids,
+            voter_bindings,
+            group_membership_digest,
+            cached_sm: RefCasStateMachine::new(),
+        };
         let (sm, _) = backend.replay_linearizable_sm()?;
         backend.cached_sm = sm;
         Ok(backend)
     }
 
-    pub fn update_endpoints(&mut self, endpoints: BTreeMap<u64, String>) -> Result<(), PairedBackupError> {
-        if endpoints.keys().collect::<Vec<_>>() != self.cfg.voter_endpoints.keys().collect::<Vec<_>>() {
-            return Err(PairedBackupError::InvalidArgument("updated voter_endpoints changed voter node_id set"));
+    pub fn update_endpoints(
+        &mut self,
+        endpoints: BTreeMap<u64, String>,
+        attestor_endpoints: BTreeMap<u64, String>,
+    ) -> Result<(), PairedBackupError> {
+        if endpoints.keys().collect::<Vec<_>>() != self.cfg.voter_endpoints.keys().collect::<Vec<_>>()
+            || attestor_endpoints.keys().collect::<Vec<_>>() != endpoints.keys().collect::<Vec<_>>()
+        {
+            return Err(PairedBackupError::InvalidArgument("updated endpoints changed voter node_id set"));
         }
         self.cfg.voter_endpoints = endpoints;
+        self.cfg.attestor_endpoints = attestor_endpoints;
         Ok(())
     }
 
@@ -144,14 +181,14 @@ impl MtlsLiveRaftBackend {
             if m["running_ok"].as_bool() != Some(true) || m["node_id"].as_u64() != Some(node_id) {
                 continue;
             }
-            let expected_uuid = self
-                .peer_map
+            let binding = self
+                .voter_bindings
                 .get(&node_id)
-                .copied()
                 .ok_or(PairedBackupError::FreezeNotHeld("unknown voter node_id in Metrics"))?;
-            if derive_voter_uuid(self.cfg.group_id, node_id, &cert_sha) != expected_uuid {
+            if binding.cert_sha256 != cert_sha {
                 return Err(PairedBackupError::FreezeNotHeld("live peer X.509 certificate changed unexpectedly"));
             }
+            let expected_uuid = binding.voter_uuid;
             let mv: BTreeSet<u64> = m["membership_voters"]
                 .as_array()
                 .map(|a| a.iter().filter_map(Value::as_u64).collect())
@@ -245,35 +282,11 @@ impl MtlsLiveRaftBackend {
         Err(PairedBackupError::FreezeNotHeld("mTLS linearizable ReadIndex KvGet failed"))
     }
 
-    fn trigger_leader_snapshot(&self) -> Result<(), PairedBackupError> {
+    pub(super) fn trigger_leader_snapshot(&self) -> Result<(), PairedBackupError> {
         let (_, lid) = self.probe_live_voters()?;
         let addr = &self.cfg.voter_endpoints[&lid];
         let _ = mtls_rpc_call(&self.tls_cfg, addr, lid, &json!("TriggerSnapshot"), self.cfg.rpc_timeout)?;
         Ok(())
-    }
-
-    fn verify_local_replica_caught_up(&self, required_seq: u64) -> Result<String, PairedBackupError> {
-        let local_addr = &self.cfg.voter_endpoints[&self.cfg.local_node_id];
-        let deadline = Instant::now() + Duration::from_millis(900);
-        while Instant::now() < deadline {
-            if let Ok((resp, cert_sha)) = mtls_rpc_call(
-                &self.tls_cfg,
-                local_addr,
-                self.cfg.local_node_id,
-                &json!({ "InspectReplicaKv": { "key": "refcas/head_seq" } }),
-                self.cfg.rpc_timeout,
-            ) {
-                let seq: u64 =
-                    resp.pointer("/KvValue/value").and_then(Value::as_str).unwrap_or("0").parse().unwrap_or(0);
-                if seq >= required_seq {
-                    return Ok(cert_sha);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(40));
-        }
-        Err(PairedBackupError::FreezeNotHeld(
-            "consensus quorum committed on remote mTLS peers, but local Raft replica WAL/apply lagged",
-        ))
     }
 
     fn replay_linearizable_sm(&self) -> Result<(RefCasStateMachine, u64), PairedBackupError> {
@@ -283,7 +296,7 @@ impl MtlsLiveRaftBackend {
             .unwrap_or("0")
             .parse()
             .map_err(|_| PairedBackupError::StateMachine("invalid refcas/head_seq".into()))?;
-        let _ = self.verify_local_replica_caught_up(head_seq)?;
+        let _ = super::peer_attestation_rpc::verify_local_replica_caught_up(self, head_seq)?;
         Ok((self.replay_up_to(head_seq)?, head_seq))
     }
 
@@ -303,6 +316,7 @@ impl MtlsLiveRaftBackend {
 
     fn collect_voter_acks(
         &self,
+        group_epoch: i64,
         log_id: AppliedLogId,
         seq: u64,
         commit_raft_idx: u64,
@@ -328,16 +342,23 @@ impl MtlsLiveRaftBackend {
                 let peer_seq: u64 =
                     kv.pointer("/KvValue/value").and_then(Value::as_str).unwrap_or("0").parse().unwrap_or(0);
                 if peer_seq >= seq && (attempt > 0 || info.last_log_index >= commit_raft_idx) {
-                    let wal_digest = sha256_json_tagged(
-                        b"rootyard-mtls-peer-wal-v1",
-                        &(node_id, &info.cert_sha256, info.current_term, commit_raft_idx, seq, command_sha256),
-                    )?;
+                    let Ok(attestation) = super::peer_attestation_rpc::request_commit_attestation(
+                        self,
+                        node_id,
+                        group_epoch,
+                        seq,
+                        commit_raft_idx,
+                        command_sha256,
+                    ) else {
+                        continue;
+                    };
                     acks.push(
                         VoterWalAck {
                             voter_id: info.voter_uuid,
                             log_id,
                             command_sha256: command_sha256.to_owned(),
-                            wal_record_digest: wal_digest,
+                            wal_record_digest: attestation.claims.secondary_digest.clone(),
+                            peer_attestation: attestation,
                             ack_digest: String::new(),
                         }
                         .seal()?,
@@ -357,6 +378,15 @@ impl MtlsLiveRaftBackend {
         }
         self.cached_sm.snapshot().ok().and_then(|s| s.body.gates.first().map(|g| g.group_epoch)).unwrap_or(1).max(1)
     }
+
+    /// Refuse restore unless every configured target voter is a brand-new, empty incarnation.
+    pub fn verify_pristine_new_incarnation_target(
+        &self,
+        source_membership_digest: &str,
+        forbidden_incarnations: &BTreeSet<Uuid>,
+    ) -> Result<(), PairedBackupError> {
+        super::peer_attestation_rpc::verify_pristine_target(self, source_membership_digest, forbidden_incarnations)
+    }
 }
 
 impl DurableRaftBackend for MtlsLiveRaftBackend {
@@ -366,6 +396,10 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
 
     fn group_membership_digest(&self) -> String {
         self.group_membership_digest.clone()
+    }
+
+    fn voter_ids(&self) -> Vec<Uuid> {
+        self.voter_uuids.clone()
     }
 
     fn commit_and_apply(
@@ -394,7 +428,7 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
         let log_id = AppliedLogId { term: final_term, index: seq };
         let _ = self.trigger_leader_snapshot();
 
-        let acks = self.collect_voter_acks(log_id, seq, commit_raft_idx, &command_sha256)?;
+        let acks = self.collect_voter_acks(group_epoch, log_id, seq, commit_raft_idx, &command_sha256)?;
         let quorum_receipt = QuorumCommitReceipt {
             group_id: self.cfg.group_id,
             group_epoch,
@@ -408,7 +442,7 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
         .seal()?;
         quorum_receipt.verify()?;
 
-        let local_cert_sha = self.verify_local_replica_caught_up(seq)?;
+        let local_cert_sha = super::peer_attestation_rpc::verify_local_replica_caught_up(self, seq)?;
         let mut step_sm = self.replay_up_to(head_before)?;
         let resp = step_sm.apply(log_id, cmd).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
         let state_digest_after = step_sm.state_digest().map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
@@ -419,7 +453,7 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
             &(self.cfg.local_node_id, &local_cert_sha, commit_raft_idx, seq, &command_sha256),
         )?;
         let local_apply_receipt = LocalWalApplyReceipt {
-            local_node_id: self.peer_map[&self.cfg.local_node_id],
+            local_node_id: self.voter_bindings[&self.cfg.local_node_id].voter_uuid,
             group_id: self.cfg.group_id,
             log_id,
             command_sha256,
@@ -451,5 +485,14 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
 
     fn durable_state_machine(&self) -> &RefCasStateMachine {
         &self.cached_sm
+    }
+
+    fn attest_group_cutpoint(
+        &self,
+        group_epoch: i64,
+        snapshot: &RefCasSnapshot,
+        state_digest: &str,
+    ) -> Result<Vec<PeerDurableAttestation>, PairedBackupError> {
+        super::peer_attestation_rpc::attest_group_cutpoint(self, group_epoch, snapshot, state_digest)
     }
 }

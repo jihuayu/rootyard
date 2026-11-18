@@ -212,6 +212,8 @@ pub async fn create_paired_backup(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| PairedBackupError::Io(std::io::Error::other(e)))?
         .as_secs();
+    let voter_ids = req.raft.voter_ids();
+    let cutpoint_attestations = req.raft.attest_group_cutpoint(active_cut.group_epoch, &snapshot, &state_digest)?;
     let raft_cutpoint = RaftCutpointProof {
         group_id: req.group_id,
         group_epochs,
@@ -220,6 +222,8 @@ pub async fn create_paired_backup(
         logical_clock_floor: snapshot.body.logical_clock_floor,
         state_digest,
         group_membership_digest,
+        voter_ids,
+        cutpoint_attestations,
         snapshot_checksum: snapshot.checksum.clone(),
         snapshot,
         close_receipts: req.freeze_barrier.close_receipts.clone(),

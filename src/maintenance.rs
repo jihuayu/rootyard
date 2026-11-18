@@ -2,9 +2,12 @@
 //! successful outcome to an unknown push and never replays that push.
 pub mod paired_raft_backup;
 
+pub use paired_raft_backup::{PairedProductionRuntimeGuard, WorkerProjectionTicket};
+
 use crate::{config::Config, git_http, journal, storage::Storage};
 use anyhow::{Context, Result, ensure};
 use deadpool_postgres::Pool;
+use paired_raft_backup::enforce_maintenance_pg_write_guard;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -226,6 +229,9 @@ pub async fn resolve(
     );
     let storage = Storage::open(config)?;
     let mut client = pool.get().await?;
+    // Refuse to write while a durable paired backup freeze, database-wide read-only
+    // fence, or storage-authority remote-delete fence is active (#153).
+    enforce_maintenance_pg_write_guard(&**client, true).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     // A lost commit acknowledgment can be retried without reclassifying history.
     if let Some(row)=client.query_opt("SELECT to_jsonb(r) FROM recovery_resolutions r WHERE repository_id=$1 AND old_generation=$2 AND inspected_fingerprint=$3",&[&repo,&expected_generation,&expected_fingerprint]).await? {
         let resolution:Value=row.get(0);
@@ -280,6 +286,9 @@ pub async fn resolve(
 /// Idempotent post-commit cleanup. Changed evidence creates a new incident;
 /// resolution never authorizes discarding a different or later journal.
 pub async fn retire_resolved_journals(pool: &Pool, storage: &Storage, repo: Uuid) -> Result<()> {
+    let guard_client = pool.get().await?;
+    enforce_maintenance_pg_write_guard(&**guard_client, true).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(guard_client);
     for op in journal::pending(&storage.root, repo)? {
         let _ = retire_if_resolved(pool, storage, &op).await?;
     }
@@ -287,6 +296,7 @@ pub async fn retire_resolved_journals(pool: &Pool, storage: &Storage, repo: Uuid
 }
 pub async fn retire_if_resolved(pool: &Pool, storage: &Storage, op: &journal::Operation) -> Result<bool> {
     let client = pool.get().await?;
+    enforce_maintenance_pg_write_guard(&**client, true).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let row=client.query_opt("SELECT r.journal_digest,r.operation_digest,to_jsonb(o),resolution.volume_id FROM operation_resolutions r JOIN git_operations o ON o.id=r.operation_id JOIN recovery_resolutions resolution ON resolution.id=r.resolution_id WHERE r.operation_id=$1 AND r.repository_id=$2",&[&op.id,&op.repository_id]).await?;
     let Some(row) = row else {
         return Ok(false);

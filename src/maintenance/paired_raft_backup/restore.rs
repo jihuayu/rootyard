@@ -108,6 +108,16 @@ pub fn verify_backup_archive(
     }
 
     let active_cut = ExpectedGroupCursorCut::from_verified_snapshot(raft.group_id, &raft.snapshot)?;
+    super::raft_barrier::verify_cutpoint_attestations(
+        raft.group_id,
+        active_cut.group_epoch,
+        &raft.voter_ids,
+        &raft.group_membership_digest,
+        raft.applied_log_id,
+        &raft.state_digest,
+        &raft.snapshot_checksum,
+        &raft.cutpoint_attestations,
+    )?;
     let peer_cuts =
         verify_archived_peer_groups(raft.group_id, active_cut.group_epoch, &raft.group_epochs, &raft.peer_groups)?;
     verify_all_group_cursors(&manifest.pg_cutpoint, &active_cut, &peer_cuts)?;

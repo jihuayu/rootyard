@@ -169,6 +169,96 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         self.assertIn("durable_wal_barrier_and_sealing_receipt_freeze_thaw_regressions", it_src)
         self.assertIn("production_mtls_quorum_durable_freeze_format30_and_new_incarnation_boot", it_src)
 
+    def test_freeze_reset_attestation_pristine_and_production_guards(self) -> None:
+        pg_src = (MOD_DIR / "pg_freeze_settings.rs").read_text(encoding="utf-8")
+        for token in (
+            "terminate_and_await_other_pg_sessions",
+            "pg_terminate_backend",
+            "verify_no_active_pg_writers",
+            "enforce_maintenance_pg_write_guard",
+            "pg_stat_activity",
+            "read_pg_database_read_only",
+        ):
+            self.assertIn(token, pg_src, f"missing PG freeze/writer-exit contract: {token}")
+
+        gate_src = (MOD_DIR / "durable_freeze_gate.rs").read_text(encoding="utf-8")
+        self.assertIn("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY", gate_src)
+        self.assertIn("terminate_and_await_other_pg_sessions", gate_src)
+        self.assertIn("verify_no_active_pg_writers", gate_src)
+
+        fmt30_src = (MOD_DIR / "format30_paired.rs").read_text(encoding="utf-8")
+        self.assertIn("verify_no_active_pg_writers", fmt30_src)
+        self.assertIn("cutpoint_attestations", fmt30_src)
+
+        attest_src = (
+            (MOD_DIR / "peer_attestation.rs").read_text(encoding="utf-8")
+            + (MOD_DIR / "peer_attestation_rpc.rs").read_text(encoding="utf-8")
+            + (MOD_DIR / "wal_voters.rs").read_text(encoding="utf-8")
+        )
+        for token in (
+            "PeerDurableAttestationClaims",
+            "PeerDurableAttestation",
+            "derive_voter_uuid_bound",
+            "load_or_create_ed25519_keypair",
+            "PeerAttestationDaemon",
+            "AttestCommit",
+            "AttestCutpoint",
+            "rootyard-peer-durable-attestation-v1",
+            "voter{slot}.pk8",
+            "0o600",
+        ):
+            self.assertIn(token, attest_src, f"missing Ed25519 attestation contract: {token}")
+
+        barrier_src = (MOD_DIR / "raft_barrier.rs").read_text(encoding="utf-8")
+        self.assertIn("peer_attestation", barrier_src)
+        self.assertIn("verify_cutpoint_attestations", barrier_src)
+
+        for name in ("backup.rs", "format30_paired.rs", "peer_groups.rs", "restore.rs"):
+            self.assertIn(
+                "cutpoint_attestations",
+                (MOD_DIR / name).read_text(encoding="utf-8"),
+                f"{name} must populate/verify cutpoint attestations",
+            )
+
+        mtls_src = (MOD_DIR / "mtls_raft.rs").read_text(encoding="utf-8")
+        self.assertIn("verify_pristine_new_incarnation_target", mtls_src)
+        self.assertIn("voter_bindings", mtls_src)
+        boot_src = (MOD_DIR / "format30_boot.rs").read_text(encoding="utf-8")
+        for token in ("verify_pristine_new_incarnation_target", "forbidden_incarnations"):
+            self.assertIn(token, boot_src, f"missing pristine-incarnation contract: {token}")
+
+        runtime_src = (MOD_DIR / "production_runtime.rs").read_text(encoding="utf-8")
+        for token in (
+            "PairedProductionRuntimeGuard",
+            "WorkerProjectionTicket",
+            "commit_ref_write",
+            "run_projection_worker_step",
+            "execute_fenced_pack_delete",
+        ):
+            self.assertIn(token, runtime_src, f"missing production guard contract: {token}")
+
+        facade_src = (ROOT / "src" / "maintenance.rs").read_text(encoding="utf-8")
+        self.assertIn("enforce_maintenance_pg_write_guard", facade_src)
+        self.assertIn("pub use paired_raft_backup::{PairedProductionRuntimeGuard, WorkerProjectionTicket};", facade_src)
+
+        admission_src = (MOD_DIR / "admission_guard.rs").read_text(encoding="utf-8")
+        for token in ("admit_writer_grant", "admit_decision_execution", "admit_deleter_lease"):
+            self.assertIn(token, admission_src)
+
+        cluster_src = (ROOT / "tests" / "paired_raft_backup_support" / "mtls_cluster.rs").read_text(encoding="utf-8")
+        for token in ("attestor_endpoints", "PeerAttestationDaemon", "PeerAttestationConfig"):
+            self.assertIn(token, cluster_src, f"mTLS harness must run real per-voter attestors: {token}")
+        gates_src = (ROOT / "tests" / "paired_raft_backup_support" / "format30_luna_gates.rs").read_text(
+            encoding="utf-8"
+        )
+        for token in (
+            "gate1_pooled_pg_session_read_only_reset_and_verified_writer_exit",
+            "gate2_forged_voter_acks_and_minority_cutpoint_attestations_are_rejected",
+            "gate3_pristine_target_rejects_reused_source_incarnation",
+            "gate4_production_guards_refuse_frozen_stale_and_superseded_paths",
+        ):
+            self.assertIn(token, gates_src)
+
     def test_workflow_contract_and_doc_links(self) -> None:
         raw_wf = WORKFLOW.read_bytes()
         self.assertNotIn(b"\r\n", raw_wf)

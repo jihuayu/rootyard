@@ -47,6 +47,24 @@ pub async fn restore_and_boot_format30_new_incarnation(
     let manifest = verify_format30_paired_archive(archive_dir, Some(&backend_hex))?;
     let fmt30_dir = archive_dir.join(FORMAT30_SUBDIR);
 
+    // Refuse to restore into a dirty/previous incarnation: every configured target voter must be a
+    // brand-new empty `raft-node` replica that never hosted this backup's cluster or authority.
+    let forbidden_incarnations = BTreeSet::from([
+        manifest.pg_cutpoint.source_cluster_incarnation,
+        manifest.pg_cutpoint.source_storage_authority_id,
+    ]);
+    booted_active_raft.verify_pristine_new_incarnation_target(
+        &manifest.raft_cutpoint.group_membership_digest,
+        &forbidden_incarnations,
+    )?;
+    for (&gid, peer) in booted_peer_rafts.iter() {
+        let proof =
+            manifest.raft_cutpoint.peer_groups.iter().find(|p| p.group_id == gid).ok_or_else(|| {
+                PairedBackupError::CutpointSkew(format!("booted peer Raft group {gid} has no cutpoint"))
+            })?;
+        peer.verify_pristine_new_incarnation_target(&proof.group_membership_digest, &forbidden_incarnations)?;
+    }
+
     crate::backup::restore(
         dst_config, &fmt30_dir, false, false, false, false, false, false, false, false, false, false, false, false,
         false, false, false,

@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::ref_store::core::state_machine::{AppliedLogId, RefCasSnapshot, ScopeLifecycle, SmHoldState, SmRootState};
 
+use super::peer_attestation::PeerDurableAttestation;
 use super::quorum_wal::DurableRaftBackend;
 use super::types::{
     BackupRetentionHoldRecord, CloseScopeBarrierReceipt, FreezePartyStatus, PairedBackupError, sha256_json_tagged,
@@ -32,6 +33,48 @@ pub fn compute_group_membership_digest(voter_ids: &[Uuid]) -> Result<String, Pai
     sha256_json_tagged(b"rootyard-raft-voters-v1", &sorted)
 }
 
+/// Require a strict majority of distinct, verified server-signed `"cutpoint"` attestations
+/// bound to the archived voter set and cutpoint digests.
+pub fn verify_cutpoint_attestations(
+    group_id: i64,
+    group_epoch: i64,
+    voter_ids: &[Uuid],
+    expected_membership_digest: &str,
+    applied_log_id: AppliedLogId,
+    state_digest: &str,
+    snapshot_checksum: &str,
+    attestations: &[PeerDurableAttestation],
+) -> Result<(), PairedBackupError> {
+    if compute_group_membership_digest(voter_ids)? != expected_membership_digest {
+        return Err(PairedBackupError::FreezeNotHeld("cutpoint proof group_membership_digest mismatch"));
+    }
+    if attestations.len() <= voter_ids.len() / 2 {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "fewer than a majority of server-signed peer cutpoint attestations",
+        ));
+    }
+    let allowed: BTreeSet<Uuid> = voter_ids.iter().copied().collect();
+    let mut seen = BTreeSet::new();
+    for attestation in attestations {
+        attestation.verify()?;
+        let claims = &attestation.claims;
+        if claims.kind != "cutpoint"
+            || claims.group_id != group_id
+            || claims.group_epoch != group_epoch
+            || claims.refcas_seq != applied_log_id.index
+            || claims.subject_digest != state_digest
+            || claims.secondary_digest != snapshot_checksum
+            || !allowed.contains(&claims.voter_id)
+            || !seen.insert(claims.voter_id)
+        {
+            return Err(PairedBackupError::FreezeNotHeld(
+                "peer cutpoint attestation is not bound to the archived cutpoint/voter set",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VoterWalAck {
@@ -39,6 +82,7 @@ pub struct VoterWalAck {
     pub log_id: AppliedLogId,
     pub command_sha256: String,
     pub wal_record_digest: String,
+    pub peer_attestation: PeerDurableAttestation,
     pub ack_digest: String,
 }
 
@@ -49,7 +93,13 @@ impl VoterWalAck {
         Ok(self)
     }
 
-    pub fn verify(&self, expected_log_id: AppliedLogId, expected_cmd_sha256: &str) -> Result<(), PairedBackupError> {
+    pub fn verify(
+        &self,
+        expected_group_id: i64,
+        expected_group_epoch: i64,
+        expected_log_id: AppliedLogId,
+        expected_cmd_sha256: &str,
+    ) -> Result<(), PairedBackupError> {
         if self.voter_id.is_nil()
             || self.log_id != expected_log_id
             || self.command_sha256 != expected_cmd_sha256
@@ -57,6 +107,21 @@ impl VoterWalAck {
             || !validate_hex64(&self.wal_record_digest)
         {
             return Err(PairedBackupError::FreezeNotHeld("invalid VoterWalAck fields or log/command mismatch"));
+        }
+        self.peer_attestation.verify()?;
+        let claims = &self.peer_attestation.claims;
+        if claims.kind != "commit"
+            || claims.voter_id != self.voter_id
+            || claims.group_id != expected_group_id
+            || claims.group_epoch != expected_group_epoch
+            || claims.raft_term != expected_log_id.term
+            || claims.refcas_seq != expected_log_id.index
+            || claims.subject_digest != expected_cmd_sha256
+            || claims.secondary_digest != self.wal_record_digest
+        {
+            return Err(PairedBackupError::FreezeNotHeld(
+                "VoterWalAck is not backed by a server-side peer Ed25519 durable attestation",
+            ));
         }
         let mut clean = self.clone();
         clean.ack_digest.clear();
@@ -102,7 +167,7 @@ impl QuorumCommitReceipt {
                     "QuorumCommitReceipt contains unauthorized or duplicate voter ack",
                 ));
             }
-            ack.verify(self.log_id, &self.command_sha256)?;
+            ack.verify(self.group_id, self.group_epoch, self.log_id, &self.command_sha256)?;
         }
         if self.voter_acks.len() <= self.voter_ids.len() / 2 {
             return Err(PairedBackupError::FreezeNotHeld(

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use tokio_postgres::{Client, GenericClient};
 use uuid::Uuid;
@@ -16,7 +17,10 @@ pub use super::durable_guarded_ops::{
 use super::freeze_drain::{RepoBackupRegistrationSpec, TriPartyBackupCoordinator};
 use super::mtls_raft::{DurableRaftFreezeRecord, MtlsLiveRaftBackend};
 use super::pg_cutpoint::{pg_err, sync_restored_pg_projection_cursors};
-pub use super::pg_freeze_settings::{PG_FREEZE_SETTING, read_pg_database_freeze_marker, read_pg_database_read_only};
+pub use super::pg_freeze_settings::{
+    PG_FREEZE_SETTING, enforce_maintenance_pg_write_guard, read_pg_database_freeze_marker, read_pg_database_read_only,
+    terminate_and_await_other_pg_sessions, verify_no_active_pg_writers,
+};
 use super::pg_freeze_settings::{set_pg_database_freeze_marker, set_pg_database_read_only};
 use super::quorum_wal::DurableRaftBackend;
 use super::raft_barrier::{DurableFreezeBarrierProof, SealedArchiveReceipt};
@@ -80,46 +84,41 @@ pub async fn enter_durable_pg_raft_freeze(
     let barrier_id = Uuid::new_v4();
     pg_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await.map_err(pg_err)?;
 
-    // 1. Persist durable PostgreSQL + active/peer 3-voter mTLS Raft freeze barriers FIRST
-    //    before registering backup holds/roots so all external writers are fenced immediately!
-    let initial_floors: BTreeMap<Uuid, i64> =
-        req.repos.iter().map(|s| (s.repository_id, req.scope_authz_floor)).collect();
-    let pre_freeze_rec = DurableRaftFreezeRecord {
-        frozen: true,
-        barrier_id,
-        fenced_deleter_epoch: req.fenced_deleter_epoch,
-        app_fence_seq: req.app_fence_seq,
-        repo_access_floors: initial_floors,
-        seal_receipt_digest: None,
-        record_seal: String::new(),
-    }
-    .seal()?;
-    set_pg_database_freeze_marker(pg_client, Some(&format!("{barrier_id}:{}", req.fenced_deleter_epoch))).await?;
-    set_pg_database_read_only(pg_client, true).await?;
-    let _ = pg_client
-        .execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-             WHERE datname = current_database() AND pid <> pg_backend_pid()",
-            &[],
-        )
-        .await;
-    raft.write_freeze_record(&pre_freeze_rec)?;
-    for peer_raft in peer_rafts.values() {
-        peer_raft.write_freeze_record(&pre_freeze_rec)?;
-    }
+    let outcome: Result<DurableFreezeHandle, PairedBackupError> = async {
+        // 1. Persist durable PostgreSQL + active/peer 3-voter mTLS Raft freeze barriers FIRST
+        //    before registering backup holds/roots so all external writers are fenced immediately!
+        let initial_floors: BTreeMap<Uuid, i64> =
+            req.repos.iter().map(|s| (s.repository_id, req.scope_authz_floor)).collect();
+        let pre_freeze_rec = DurableRaftFreezeRecord {
+            frozen: true,
+            barrier_id,
+            fenced_deleter_epoch: req.fenced_deleter_epoch,
+            app_fence_seq: req.app_fence_seq,
+            repo_access_floors: initial_floors,
+            seal_receipt_digest: None,
+            record_seal: String::new(),
+        }
+        .seal()?;
+        set_pg_database_freeze_marker(pg_client, Some(&format!("{barrier_id}:{}", req.fenced_deleter_epoch))).await?;
+        set_pg_database_read_only(pg_client, true).await?;
+        terminate_and_await_other_pg_sessions(pg_client, Duration::from_secs(5)).await?;
+        raft.write_freeze_record(&pre_freeze_rec)?;
+        for peer_raft in peer_rafts.values() {
+            peer_raft.write_freeze_record(&pre_freeze_rec)?;
+        }
 
-    verify_pg_quiescent_before_freeze(pg_client).await?;
+        verify_pg_quiescent_before_freeze(pg_client).await?;
 
-    let mut repo_access_floors = BTreeMap::new();
-    {
-        let tx = pg_client.transaction().await.map_err(pg_err)?;
-        for spec in req.repos {
-            for (kind, sid) in [
-                ("repo_access", spec.repository_id),
-                ("repo_lifecycle", spec.repository_id),
-                ("authority", spec.authority_id),
-            ] {
-                let row = tx
+        let mut repo_access_floors = BTreeMap::new();
+        {
+            let tx = pg_client.transaction().await.map_err(pg_err)?;
+            for spec in req.repos {
+                for (kind, sid) in [
+                    ("repo_access", spec.repository_id),
+                    ("repo_lifecycle", spec.repository_id),
+                    ("authority", spec.authority_id),
+                ] {
+                    let row = tx
                     .query_one(
                         "INSERT INTO public.ref_store_decision_scopes(scope_kind, scope_id, version, state, change_id) \
                          VALUES($1, $2, $3, 'OPEN', NULL) \
@@ -130,111 +129,123 @@ pub async fn enter_durable_pg_raft_freeze(
                     )
                     .await
                     .map_err(pg_err)?;
-                let (ver, state): (i64, String) = (row.get(0), row.get(1));
-                if state != "OPEN" && kind == "repo_access" {
-                    return Err(PairedBackupError::ScopeNotClosed("repo_access scope unexpectedly CLOSING".into()));
-                }
-                if kind == "repo_access" {
-                    repo_access_floors.insert(spec.repository_id, ver);
+                    let (ver, state): (i64, String) = (row.get(0), row.get(1));
+                    if state != "OPEN" && kind == "repo_access" {
+                        return Err(PairedBackupError::ScopeNotClosed("repo_access scope unexpectedly CLOSING".into()));
+                    }
+                    if kind == "repo_access" {
+                        repo_access_floors.insert(spec.repository_id, ver);
+                    }
                 }
             }
-        }
-        let reason = format!("paired-backup-freeze:{barrier_id}:{}", req.fenced_deleter_epoch);
-        let updated = tx
-            .execute(
-                "UPDATE public.pando_storage_authorities \
+            let reason = format!("paired-backup-freeze:{barrier_id}:{}", req.fenced_deleter_epoch);
+            let updated = tx
+                .execute(
+                    "UPDATE public.pando_storage_authorities \
                  SET remote_delete_fenced = true, remote_delete_fence_reason = $1 \
                  WHERE singleton = true",
-                &[&reason],
-            )
-            .await
-            .map_err(pg_err)?;
-        if updated != 1 {
-            return Err(PairedBackupError::DeleterNotFenced("singleton pando_storage_authorities missing"));
+                    &[&reason],
+                )
+                .await
+                .map_err(pg_err)?;
+            if updated != 1 {
+                return Err(PairedBackupError::DeleterNotFenced("singleton pando_storage_authorities missing"));
+            }
+            tx.commit().await.map_err(pg_err)?;
         }
-        tx.commit().await.map_err(pg_err)?;
-    }
 
-    // 2. Register durable backup holds/roots and commit CloseAuthScope("repo_access") on 3-voter mTLS Raft!
-    let coord =
-        TriPartyBackupCoordinator::new(req.fenced_deleter_epoch.saturating_sub(1), req.app_fence_seq.saturating_sub(1));
-    let mut apply_receipts = Vec::new();
-    let mut backup_holds = Vec::with_capacity(req.repos.len());
-    for spec in req.repos {
-        backup_holds.push(coord.register_backup_closure_hold(raft, spec, &mut apply_receipts)?);
-    }
-    let targets: Vec<_> = req.repos.iter().map(|s| (s.repository_id, s.tenant_id, s.authority_id)).collect();
-    let close_receipts =
-        close_repo_access_and_verify_quiescent(raft, &targets, &repo_access_floors, &mut apply_receipts)?;
-    let (durable_snap, durable_digest) = raft.durable_state()?;
-    let active_log_id = durable_snap
-        .body
-        .last_applied
-        .ok_or(PairedBackupError::FreezeNotHeld("active mTLS Raft cluster has no applied log entries"))?;
-
-    let status = FreezePartyStatus {
-        app_paused: true,
-        worker_paused: true,
-        deleter_fenced: true,
-        consensus_replication_active: true,
-        leader_election_active: true,
-        fenced_deleter_epoch: req.fenced_deleter_epoch,
-        app_fence_seq: req.app_fence_seq,
-        worker_drain_settled: 0,
-        unknown_ops_resolved: 0,
-    };
-    let freeze_record = DurableRaftFreezeRecord {
-        frozen: true,
-        barrier_id,
-        fenced_deleter_epoch: req.fenced_deleter_epoch,
-        app_fence_seq: req.app_fence_seq,
-        repo_access_floors,
-        seal_receipt_digest: None,
-        record_seal: String::new(),
-    }
-    .seal()?;
-    let active_barrier = DurableFreezeBarrierProof {
-        barrier_id,
-        group_id: raft.group_id(),
-        group_membership_digest: raft.group_membership_digest(),
-        status,
-        barrier_log_id: active_log_id,
-        barrier_state_digest: durable_digest.clone(),
-        apply_receipts,
-        close_receipts,
-        backup_holds,
-        proof_digest: String::new(),
-    }
-    .seal()?;
-    active_barrier.verify_against_raft_group(
-        raft.group_id(),
-        &raft.group_membership_digest(),
-        &durable_snap,
-        &durable_digest,
-        true,
-    )?;
-
-    let mut peer_barriers = BTreeMap::new();
-    let mut peer_snaps = BTreeMap::new();
-    for (&gid, peer_raft) in peer_rafts.iter_mut() {
-        let ptargets = req.peer_repos_by_group.get(&gid).cloned().unwrap_or_default();
-        if ptargets.is_empty() {
-            return Err(PairedBackupError::InvalidArgument("peer Raft group missing repository targets"));
-        }
-        let mut peer_coord = TriPartyBackupCoordinator::new(
+        // 2. Register durable backup holds/roots and commit CloseAuthScope("repo_access") on 3-voter mTLS Raft!
+        let coord = TriPartyBackupCoordinator::new(
             req.fenced_deleter_epoch.saturating_sub(1),
             req.app_fence_seq.saturating_sub(1),
         );
-        let pb = peer_coord.freeze_peer_group_and_close(peer_raft, &ptargets, req.scope_authz_floor)?;
-        peer_snaps.insert(gid, peer_raft.durable_state()?.0);
-        peer_raft.write_freeze_record(&freeze_record)?;
-        peer_barriers.insert(gid, pb);
+        let mut apply_receipts = Vec::new();
+        let mut backup_holds = Vec::with_capacity(req.repos.len());
+        for spec in req.repos {
+            backup_holds.push(coord.register_backup_closure_hold(raft, spec, &mut apply_receipts)?);
+        }
+        let targets: Vec<_> = req.repos.iter().map(|s| (s.repository_id, s.tenant_id, s.authority_id)).collect();
+        let close_receipts =
+            close_repo_access_and_verify_quiescent(raft, &targets, &repo_access_floors, &mut apply_receipts)?;
+        let (durable_snap, durable_digest) = raft.durable_state()?;
+        let active_log_id = durable_snap
+            .body
+            .last_applied
+            .ok_or(PairedBackupError::FreezeNotHeld("active mTLS Raft cluster has no applied log entries"))?;
+
+        let status = FreezePartyStatus {
+            app_paused: true,
+            worker_paused: true,
+            deleter_fenced: true,
+            consensus_replication_active: true,
+            leader_election_active: true,
+            fenced_deleter_epoch: req.fenced_deleter_epoch,
+            app_fence_seq: req.app_fence_seq,
+            worker_drain_settled: 0,
+            unknown_ops_resolved: 0,
+        };
+        let freeze_record = DurableRaftFreezeRecord {
+            frozen: true,
+            barrier_id,
+            fenced_deleter_epoch: req.fenced_deleter_epoch,
+            app_fence_seq: req.app_fence_seq,
+            repo_access_floors,
+            seal_receipt_digest: None,
+            record_seal: String::new(),
+        }
+        .seal()?;
+        let active_barrier = DurableFreezeBarrierProof {
+            barrier_id,
+            group_id: raft.group_id(),
+            group_membership_digest: raft.group_membership_digest(),
+            status,
+            barrier_log_id: active_log_id,
+            barrier_state_digest: durable_digest.clone(),
+            apply_receipts,
+            close_receipts,
+            backup_holds,
+            proof_digest: String::new(),
+        }
+        .seal()?;
+        active_barrier.verify_against_raft_group(
+            raft.group_id(),
+            &raft.group_membership_digest(),
+            &durable_snap,
+            &durable_digest,
+            true,
+        )?;
+
+        let mut peer_barriers = BTreeMap::new();
+        let mut peer_snaps = BTreeMap::new();
+        for (&gid, peer_raft) in peer_rafts.iter_mut() {
+            let ptargets = req.peer_repos_by_group.get(&gid).cloned().unwrap_or_default();
+            if ptargets.is_empty() {
+                return Err(PairedBackupError::InvalidArgument("peer Raft group missing repository targets"));
+            }
+            let mut peer_coord = TriPartyBackupCoordinator::new(
+                req.fenced_deleter_epoch.saturating_sub(1),
+                req.app_fence_seq.saturating_sub(1),
+            );
+            let pb = peer_coord.freeze_peer_group_and_close(peer_raft, &ptargets, req.scope_authz_floor)?;
+            peer_snaps.insert(gid, peer_raft.durable_state()?.0);
+            peer_raft.write_freeze_record(&freeze_record)?;
+            peer_barriers.insert(gid, pb);
+        }
+
+        raft.write_freeze_record(&freeze_record)?;
+        sync_restored_pg_projection_cursors(pg_client, raft.group_id(), &durable_snap, &peer_snaps).await?;
+
+        Ok(DurableFreezeHandle { active_barrier, peer_barriers, freeze_record })
     }
+    .await;
 
-    raft.write_freeze_record(&freeze_record)?;
-    sync_restored_pg_projection_cursors(pg_client, raft.group_id(), &durable_snap, &peer_snaps).await?;
-
-    Ok(DurableFreezeHandle { active_barrier, peer_barriers, freeze_record })
+    // Always hand the pooled session back as `READ ONLY`, on both `Ok` and `Err`, so
+    // `deadpool_postgres::RecyclingMethod::Fast` can never leak a `READ WRITE` connection
+    // into another request (`POST /api/repos` -> `BlobGitState`).
+    let lock_ro = pg_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").await.map_err(pg_err);
+    let handle = outcome?;
+    lock_ro?;
+    Ok(handle)
 }
 
 /// Thaw durable PostgreSQL + 3-voter mTLS Raft admission ONLY after verifying `SealedArchiveReceipt`,

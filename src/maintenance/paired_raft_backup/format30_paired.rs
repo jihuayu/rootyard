@@ -26,7 +26,9 @@ use super::peer_groups::{
     verify_archived_peer_groups,
 };
 use super::pg_cutpoint::{ExpectedRaftCut, capture_pg_cutpoint_in_tx, pg_err};
-use super::pg_freeze_settings::{drop_ephemeral_backup_role, provision_ephemeral_backup_role};
+use super::pg_freeze_settings::{
+    drop_ephemeral_backup_role, provision_ephemeral_backup_role, verify_no_active_pg_writers,
+};
 use super::quorum_wal::DurableRaftBackend;
 use super::raft_barrier::SealedArchiveReceipt;
 use super::types::{
@@ -114,6 +116,7 @@ pub async fn create_format30_paired_raft_backup(
         let mut pg_client =
             crate::db::connect_config(parsed_dsn).await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
         req.freeze_handle.verify_still_frozen_on(&pg_client, req.raft).await?;
+        verify_no_active_pg_writers(&pg_client).await?;
         let tx = pg_client
             .build_transaction()
             .isolation_level(IsolationLevel::RepeatableRead)
@@ -163,6 +166,8 @@ pub async fn create_format30_paired_raft_backup(
     for pc in &peer_cuts {
         group_epochs.insert(pc.group_id, pc.group_epoch);
     }
+    let voter_ids = req.raft.voter_ids();
+    let cutpoint_attestations = req.raft.attest_group_cutpoint(active_cut.group_epoch, &snapshot, &state_digest)?;
     let raft_cutpoint = RaftCutpointProof {
         group_id: req.raft.group_id(),
         group_epochs,
@@ -171,6 +176,8 @@ pub async fn create_format30_paired_raft_backup(
         logical_clock_floor: snapshot.body.logical_clock_floor,
         state_digest,
         group_membership_digest: mem_digest,
+        voter_ids,
+        cutpoint_attestations,
         snapshot_checksum: snapshot.checksum.clone(),
         snapshot,
         close_receipts: req.freeze_handle.active_barrier.close_receipts.clone(),
@@ -283,6 +290,16 @@ pub fn verify_format30_paired_archive(
         return Err(PairedBackupError::CutpointSkew("active Raft state_digest mismatches snapshot".into()));
     }
     let active_cut = ExpectedGroupCursorCut::from_verified_snapshot(raft.group_id, &raft.snapshot)?;
+    super::raft_barrier::verify_cutpoint_attestations(
+        raft.group_id,
+        active_cut.group_epoch,
+        &raft.voter_ids,
+        &raft.group_membership_digest,
+        raft.applied_log_id,
+        &raft.state_digest,
+        &raft.snapshot_checksum,
+        &raft.cutpoint_attestations,
+    )?;
     let peer_cuts =
         verify_archived_peer_groups(raft.group_id, active_cut.group_epoch, &raft.group_epochs, &raft.peer_groups)?;
     verify_all_group_cursors(&manifest.pg_cutpoint, &active_cut, &peer_cuts)?;

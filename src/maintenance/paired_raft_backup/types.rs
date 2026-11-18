@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::ref_store::GitObjectFormat;
 use crate::ref_store::core::state_machine::{AppliedLogId, RefCasSnapshot, ScopeLifecycle};
 
+use super::peer_attestation::PeerDurableAttestation;
 use super::peer_groups::PeerRaftCutpointProof;
 
 pub const PAIRED_BACKUP_FORMAT_V1: &str = "rootyard-paired-pg-raft-blob-v1";
@@ -299,6 +300,8 @@ pub struct RaftCutpointProof {
     pub logical_clock_floor: u64,
     pub state_digest: String,
     pub group_membership_digest: String,
+    pub voter_ids: Vec<Uuid>,
+    pub cutpoint_attestations: Vec<PeerDurableAttestation>,
     pub snapshot_checksum: String,
     pub snapshot: RefCasSnapshot,
     pub close_receipts: Vec<CloseScopeBarrierReceipt>,

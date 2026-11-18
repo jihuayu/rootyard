@@ -69,4 +69,19 @@ impl IncarnationAdmissionGuard {
         }
         Ok(())
     }
+
+    /// Admission alias: refuse a pre-backup writer grant.
+    pub fn admit_writer_grant(&self, ticket: &WriterGrantTicket) -> Result<(), PairedBackupError> {
+        self.verify_writer_grant(ticket)
+    }
+
+    /// Admission alias: refuse a pre-backup scoped decision execution.
+    pub fn admit_decision_execution(&self, ticket: &DecisionExecutionTicket) -> Result<(), PairedBackupError> {
+        self.verify_decision_execution(ticket)
+    }
+
+    /// Admission alias: refuse a superseded deleter lease.
+    pub fn admit_deleter_lease(&self, ticket: &DeleterLeaseTicket) -> Result<(), PairedBackupError> {
+        self.verify_deleter_lease(ticket)
+    }
 }

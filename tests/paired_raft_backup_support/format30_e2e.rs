@@ -11,10 +11,12 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use rootyard::db;
+use rootyard::maintenance::paired_raft_backup::WriterGrantTicket;
 use rootyard::maintenance::paired_raft_backup::{
-    DurableFreezeRequest, DurableRaftBackend, Format30PairedBackupRequest, PairedBackupError, PeerGroupBackupInput,
-    STANDARD_PAIRED_PG_FORMAT, STANDARD_SCHEMA_HEAD, create_format30_paired_raft_backup, enter_durable_pg_raft_freeze,
-    execute_deleter_guarded, load_pg_repo_backup_specs, propose_raft_hold_guarded, propose_raft_ref_write_guarded,
+    DurableFreezeRequest, DurableRaftBackend, Format30PairedBackupRequest, PairedBackupError,
+    PairedProductionRuntimeGuard, PeerGroupBackupInput, STANDARD_PAIRED_PG_FORMAT, STANDARD_SCHEMA_HEAD,
+    WorkerProjectionTicket, create_format30_paired_raft_backup, enter_durable_pg_raft_freeze, execute_deleter_guarded,
+    load_pg_repo_backup_specs, propose_raft_hold_guarded, propose_raft_ref_write_guarded,
     restore_and_boot_format30_new_incarnation, thaw_durable_pg_raft_freeze, upsert_repo_access_collaborator_guarded,
     verify_pg_live_incarnation,
 };
@@ -180,7 +182,7 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         let _ = gw_jh.await;
 
         g1.kill_and_restart_node(2)?;
-        raft1.update_endpoints(g1.endpoints())?;
+        raft1.update_endpoints(g1.endpoints(), g1.attestor_endpoints())?;
         let fresh_src_pool = db::pool(&src_url)?;
         // Direct unguarded SQL write to `public.repository_collaborators` (`repo_access`) MUST fail in PG 17!
         ensure!(
@@ -306,7 +308,6 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
             upsert_repo_access_collaborator_guarded(&thawed_pool, &raft1, repo_id, collab.id, "admin").await?;
         ensure!(ver_after_thaw >= 27);
         drop(thawed_pool);
-
         // 4. Wipe S3 bytes & boot fresh incarnation on empty PG17 `dst_db` + fresh 3-voter mTLS Raft clusters!
         s3.state.objects.lock().unwrap().clear();
         ensure!(s3.state.objects.lock().unwrap().is_empty());
@@ -315,9 +316,8 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         let mut booted_raft1 = dst_g1.connect_backend(1)?;
         let booted_raft2 = dst_g2.connect_backend(1)?;
         let mut booted_peers = BTreeMap::from([(2i64, booted_raft2)]);
-
         let dst_cfg = make_backup_config(dst_url.clone(), dir.path().join("dst-vol"), git.clone());
-        let (restore_out, _guard) = {
+        let (restore_out, guard) = {
             let _s3_env = s3.apply_env("paired-fmt30-s3");
             restore_and_boot_format30_new_incarnation(
                 &archive_dir,
@@ -329,22 +329,22 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
             )
             .await?
         };
+        let prod_guard = PairedProductionRuntimeGuard::from_live_authority(guard, false);
         let inc = &restore_out.incarnation;
+        let g_ok = wticket(
+            inc.new_cluster_incarnation,
+            inc.new_history_incarnation,
+            inc.new_authority_epoch,
+            inc.new_group_epoch,
+            inc.new_authz_floor,
+        );
         ensure!(inc.new_cluster_incarnation != manifest.pg_cutpoint.source_cluster_incarnation);
         ensure!(s3.state.objects.lock().unwrap().len() == 4, "all 4 Blob objects rebuilt from format 30 archive");
         ensure!(booted_raft1.read_incarnation_record()?.as_ref() == Some(inc));
-
         // 5. Boot live Smart-HTTP `BlobGitState` on restored `schema 151` DB & verify post-restore behavior!
         let dst_pool = db::pool(&dst_url)?;
         {
             let dc = dst_pool.get().await?;
-            let g_ok = wticket(
-                inc.new_cluster_incarnation,
-                inc.new_history_incarnation,
-                inc.new_authority_epoch,
-                inc.new_group_epoch,
-                inc.new_authz_floor,
-            );
             let d_ok = dticket(
                 inc.new_cluster_incarnation,
                 inc.new_storage_authority_id,
@@ -365,7 +365,6 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
                 PairedBackupError::StaleDeleterRefused(_)
             ));
         }
-
         let (dst_gw_addr, dst_gw_jh) =
             start_gateway(dst_pool.clone(), store.clone(), git.clone(), dir.path().join("dst-gw-scratch")).await?;
         let old_collab_url = format!(
@@ -445,21 +444,33 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
             logical_tick: (inc.new_authz_floor + 5) as u64,
         });
         assert!(matches!(
-            propose_raft_ref_write_guarded(
-                &dst_pool,
-                &mut booted_raft1,
-                repo_id,
-                inc.new_authz_floor - 1,
-                raft_cmd.clone(),
-            )
-            .await
-            .unwrap_err(),
+            prod_guard
+                .execute_live_ref_write(
+                    &dst_pool,
+                    &mut booted_raft1,
+                    repo_id,
+                    &WriterGrantTicket { authz_epoch: inc.new_authz_floor - 1, ..g_ok.clone() },
+                    None,
+                    raft_cmd.clone(),
+                )
+                .await
+                .unwrap_err(),
             PairedBackupError::StaleGrantRefused(_)
         ));
         let dst_lid = dst_g1.wait_leader()?;
         dst_g1.kill_and_restart_node(dst_lid)?;
-        booted_raft1.update_endpoints(dst_g1.endpoints())?;
-        propose_raft_ref_write_guarded(&dst_pool, &mut booted_raft1, repo_id, inc.new_authz_floor, raft_cmd).await?;
+        booted_raft1.update_endpoints(dst_g1.endpoints(), dst_g1.attestor_endpoints())?;
+        prod_guard.execute_live_ref_write(&dst_pool, &mut booted_raft1, repo_id, &g_ok, None, raft_cmd).await?;
+        let proj_ticket = WorkerProjectionTicket {
+            job_key: "post-restore-proj".into(),
+            cluster_incarnation: inc.new_cluster_incarnation,
+            history_incarnation: inc.new_history_incarnation,
+            group_id: 1,
+            group_epoch: inc.new_group_epoch,
+            authz_epoch: inc.new_authz_floor,
+            applied_event_seq: 2,
+        };
+        prod_guard.execute_live_projection_worker_step(&dst_pool, &booted_raft1, repo_id, &proj_ticket).await?;
         let post_snap = booted_raft1.durable_state()?.0;
         ensure!(post_snap.body.last_applied.unwrap().term >= 2, "leader failover must advance durable consensus term");
         ensure!(
@@ -470,7 +481,6 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         Ok(())
     }
     .await;
-
     if let Ok(c) = admin.get().await {
         let _ = c.batch_execute(&format!("DROP DATABASE IF EXISTS {src_db} WITH (FORCE)")).await;
         let _ = c.batch_execute(&format!("DROP DATABASE IF EXISTS {dst_db} WITH (FORCE)")).await;

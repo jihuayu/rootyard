@@ -232,6 +232,7 @@ pub fn verify_mtls_auth_and_quorum_faults() -> Result<()> {
                 group_id: 9,
                 local_node_id: 1,
                 voter_endpoints: gf.endpoints(),
+                attestor_endpoints: gf.attestor_endpoints(),
                 ca_cert_pem: ca.clone(),
                 client_cert_pem: crt.clone(),
                 client_key_pem: key.clone(),

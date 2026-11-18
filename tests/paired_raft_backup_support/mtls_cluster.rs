@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use rootyard::maintenance::paired_raft_backup::{
-    MtlsLiveRaftBackend, MtlsRaftClusterConfig, mtls_wire::build_mtls_client_config, mtls_wire::mtls_rpc_call,
+    MtlsLiveRaftBackend, MtlsRaftClusterConfig, PeerAttestationConfig, PeerAttestationDaemon,
+    mtls_wire::build_mtls_client_config, mtls_wire::mtls_rpc_call,
 };
 
 struct OwnedChild(Option<Child>);
@@ -164,6 +165,11 @@ impl MtlsGroupPki {
             _dir: dir,
         })
     }
+
+    /// `(node_cert_pem, node_key_pem)` for one voter, reused by its attestor daemon.
+    pub fn node_cert_key(&self, id: u64) -> Option<(PathBuf, PathBuf)> {
+        self.node_paths.get(&id).cloned()
+    }
 }
 
 pub struct NodeProc {
@@ -246,6 +252,7 @@ pub struct LiveMtlsRaftGroup {
     pub group_id: i64,
     pub pki: MtlsGroupPki,
     pub nodes: BTreeMap<u64, NodeProc>,
+    attestors: BTreeMap<u64, PeerAttestationDaemon>,
     tls_cfg: Arc<ClientConfig>,
 }
 
@@ -258,6 +265,7 @@ impl LiveMtlsRaftGroup {
             group_id,
             local_node_id: 1,
             voter_endpoints: BTreeMap::from([(1, "127.0.0.1:1".into())]),
+            attestor_endpoints: BTreeMap::new(),
             ca_cert_pem: pki.ca_cert.clone(),
             client_cert_pem: pki.client_cert.clone(),
             client_key_pem: pki.client_key.clone(),
@@ -277,7 +285,24 @@ impl LiveMtlsRaftGroup {
             assert_eq!(n.rpc(&json!({ "UpdatePeers": { "peers": members } }))?, json!("Ok"));
         }
         assert_eq!(nodes[&1].rpc(&json!({ "Bootstrap": { "members": members } }))?, json!("Ok"));
-        let grp = Self { _root: root, bin, group_id, pki, nodes, tls_cfg };
+        let mut attestors = BTreeMap::new();
+        for id in [1u64, 2, 3] {
+            let (cert, key) = pki.node_cert_key(id).context("missing node PKI")?;
+            let data_dir = nodes[&id].data_dir.clone();
+            let daemon = PeerAttestationDaemon::spawn(PeerAttestationConfig {
+                node_id: id,
+                group_id,
+                data_dir,
+                raft_node_addr: nodes[&id].addr.clone(),
+                ca_cert_pem: pki.ca_cert.clone(),
+                node_cert_pem: cert,
+                node_key_pem: key,
+                rpc_timeout: Duration::from_secs(4),
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            attestors.insert(id, daemon);
+        }
+        let grp = Self { _root: root, bin, group_id, pki, nodes, attestors, tls_cfg };
         grp.wait_leader()?;
         Ok(grp)
     }
@@ -286,11 +311,17 @@ impl LiveMtlsRaftGroup {
         self.nodes.iter().map(|(&id, n)| (id, n.addr.clone())).collect()
     }
 
+    /// One server-side Ed25519 attestor daemon per voter (bound to that voter's X.509 cert).
+    pub fn attestor_endpoints(&self) -> BTreeMap<u64, String> {
+        self.attestors.iter().map(|(&id, a)| (id, a.addr().to_owned())).collect()
+    }
+
     pub fn connect_backend(&self, local_node_id: u64) -> Result<MtlsLiveRaftBackend> {
         MtlsLiveRaftBackend::connect(MtlsRaftClusterConfig {
             group_id: self.group_id,
             local_node_id,
             voter_endpoints: self.endpoints(),
+            attestor_endpoints: self.attestor_endpoints(),
             ca_cert_pem: self.pki.ca_cert.clone(),
             client_cert_pem: self.pki.client_cert.clone(),
             client_key_pem: self.pki.client_key.clone(),
@@ -343,6 +374,9 @@ impl LiveMtlsRaftGroup {
     }
 
     pub fn kill_and_restart_node(&mut self, node_id: u64) -> Result<()> {
+        if let Some(old_att) = self.attestors.remove(&node_id) {
+            old_att.shutdown();
+        }
         let dir = {
             let n = self.nodes.remove(&node_id).context("missing node")?;
             let d = n.data_dir.clone();
@@ -350,7 +384,25 @@ impl LiveMtlsRaftGroup {
             d
         };
         let respawned = NodeProc::spawn(&self.bin, &self.pki, node_id, dir, self.tls_cfg.clone())?;
+        let new_addr = respawned.addr.clone();
         self.nodes.insert(node_id, respawned);
+        // Rebind the voter's attestor daemon to the restarted node address; the persisted
+        // `peer_attestor.pk8` keeps the same Ed25519 identity across restarts.
+        if let Some((cert, key)) = self.pki.node_cert_key(node_id) {
+            let data_dir = self.nodes[&node_id].data_dir.clone();
+            let daemon = PeerAttestationDaemon::spawn(PeerAttestationConfig {
+                node_id,
+                group_id: self.group_id,
+                data_dir,
+                raft_node_addr: new_addr,
+                ca_cert_pem: self.pki.ca_cert.clone(),
+                node_cert_pem: cert,
+                node_key_pem: key,
+                rpc_timeout: Duration::from_secs(4),
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            self.attestors.insert(node_id, daemon);
+        }
         self.heal_all()
     }
 }
