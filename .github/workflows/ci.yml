@@ -580,6 +580,18 @@ jobs:
             --harness tests/token_management.py \
             --harness tests/ci_dependencies.py \
             --harness tests/ci_job_checkouts.py \
+            --harness tests/transfer_revocation_timing.py \
+            --harness tests/transfer_revocation_observer.py \
+            --harness tests/transfer_revocation_backpressure.py \
+            --harness tests/transfer_revocation_source.py \
+            --harness tests/transfer_revocation_git_source.py \
+            --harness tests/transfer_revocation_probe.py \
+            --harness tests/transfer_revocation_transport.py \
+            --harness tests/transfer_revocation_failure.py \
+            --harness tests/transfer_revocation_failure_projection.py \
+            --harness tests/transfer_revocation_failure_reader.py \
+            --harness tests/test_transfer_revocation_failure.py \
+            --harness tests/test_transfer_revocation_failure_transport.py \
             --harness tests/ci_source_pins.py \
             --harness tests/ci_mirror.py \
             --harness tests/metrics.py \
