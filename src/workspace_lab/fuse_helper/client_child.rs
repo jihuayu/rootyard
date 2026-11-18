@@ -8,12 +8,11 @@ use std::process::{Child, ExitStatus};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ExitView {
     pub success: bool,
-    pub description: String,
 }
 
 impl From<ExitStatus> for ExitView {
     fn from(status: ExitStatus) -> Self {
-        Self { success: status.success(), description: status.to_string() }
+        Self { success: status.success() }
     }
 }
 
@@ -116,7 +115,7 @@ mod tests {
     #[test]
     fn a_recorded_exit_blocks_a_second_reap_and_stays_observable() {
         let mut slot = ChildSlot::default();
-        let success = ExitView { success: true, description: "exit status: 0".into() };
+        let success = ExitView { success: true };
         slot.record_exit(Ok(success.clone()));
         assert!(slot.take_for_reap().is_none(), "an observed exit must not be reaped twice");
         assert_eq!(slot.observe(), ExitObservation::Exited(Ok(success)));
@@ -130,14 +129,14 @@ mod tests {
         assert!(!waiting.reaped(), "a wait error is not reap proof");
 
         let mut reaped = ChildSlot::default();
-        reaped.record_exit(Ok(ExitView { success: false, description: "exit status: 9".into() }));
+        reaped.record_exit(Ok(ExitView { success: false }));
         assert!(reaped.reaped(), "an observed nonzero exit was still reaped");
     }
 
     #[test]
     fn a_recorded_nonzero_exit_is_preserved_for_the_waiter() {
         let mut slot = ChildSlot::default();
-        let failure = ExitView { success: false, description: "exit status: 7".into() };
+        let failure = ExitView { success: false };
         slot.record_exit(Ok(failure.clone()));
         assert_eq!(slot.observe(), ExitObservation::Exited(Ok(failure)));
     }

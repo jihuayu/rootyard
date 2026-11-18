@@ -57,17 +57,68 @@ const CONTROL_SEND_FLAGS: i32 = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const CONTROL_SEND_FLAGS: i32 = libc::MSG_DONTWAIT;
 
+/// Closed parent-side helper failure classes. A normal-shutdown diagnostic may
+/// map one of these to a fixed clause; the class never carries raw status text,
+/// a path, a PID, a child-provided message or a protocol payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperErrorKind {
+    /// No more specific class is available.
+    Other,
+    /// `Child::try_wait` observed a real, unsuccessful child exit.
+    ChildExited,
+    /// The child handle disappeared without an observed exit.
+    ChildMissing,
+    /// The exit wait or reap itself failed; no child exit was observed.
+    ChildReap,
+    /// The control protocol was malformed or violated.
+    Protocol,
+    /// A bounded helper operation or exit wait expired.
+    Timeout,
+}
+
 /// Failure while talking to the helper. The code is an errno value when one is
 /// meaningful, so callers can distinguish `EBUSY`/`ESTALE`/timeouts.
 #[derive(Debug, Clone)]
 pub struct HelperError {
     pub code: i32,
     pub message: String,
+    /// Closed class for bounded teardown diagnostics; it never contains the
+    /// raw child status, a path or an identifier.
+    pub kind: HelperErrorKind,
 }
 
 impl HelperError {
     pub fn new(code: i32, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        let kind = match code {
+            libc::ETIMEDOUT => HelperErrorKind::Timeout,
+            libc::EPROTO => HelperErrorKind::Protocol,
+            _ => HelperErrorKind::Other,
+        };
+        Self::classified(code, message, kind)
+    }
+
+    fn classified(code: i32, message: impl Into<String>, kind: HelperErrorKind) -> Self {
+        Self { code, message: message.into(), kind }
+    }
+
+    fn child_exited() -> Self {
+        Self::classified(libc::ECHILD, "workspace FUSE helper exited unsuccessfully", HelperErrorKind::ChildExited)
+    }
+
+    fn child_missing() -> Self {
+        Self::classified(
+            libc::ECHILD,
+            "workspace FUSE helper child handle disappeared before an exit was observed",
+            HelperErrorKind::ChildMissing,
+        )
+    }
+
+    fn child_reap() -> Self {
+        Self::classified(
+            libc::ECHILD,
+            "workspace FUSE helper child reaping failed before an exit was observed",
+            HelperErrorKind::ChildReap,
+        )
     }
 
     pub fn disconnected() -> Self {
@@ -75,7 +126,7 @@ impl HelperError {
     }
 
     pub fn protocol(message: impl Into<String>) -> Self {
-        Self::new(libc::EPROTO, message.into())
+        Self::classified(libc::EPROTO, message, HelperErrorKind::Protocol)
     }
 
     pub fn is_disconnected(&self) -> bool {
@@ -557,19 +608,9 @@ impl Inner {
             };
             match observation {
                 ExitObservation::Exited(Ok(status)) if status.success => return Ok(()),
-                ExitObservation::Exited(Ok(status)) => {
-                    return Err(HelperError::new(
-                        libc::ECHILD,
-                        format!("workspace FUSE helper exited with {}", status.description),
-                    ));
-                }
-                ExitObservation::Exited(Err(error)) => return Err(HelperError::new(libc::ECHILD, error)),
-                ExitObservation::Missing => {
-                    return Err(HelperError::new(
-                        libc::ECHILD,
-                        "workspace FUSE helper child handle disappeared before an exit was observed",
-                    ));
-                }
+                ExitObservation::Exited(Ok(_)) => return Err(HelperError::child_exited()),
+                ExitObservation::Exited(Err(_)) => return Err(HelperError::child_reap()),
+                ExitObservation::Missing => return Err(HelperError::child_missing()),
                 ExitObservation::Running | ExitObservation::Reaping => {
                     let now = Instant::now();
                     if now >= deadline {
@@ -1313,5 +1354,15 @@ mod tests {
         assert_eq!(error.code, libc::ETIMEDOUT);
         assert!(started.elapsed() >= Duration::from_millis(15), "teardown publication was not exercised");
         assert!(started.elapsed() < Duration::from_secs(2), "write ignored the published teardown cap");
+    }
+
+    #[test]
+    fn helper_error_kinds_are_closed_and_classify_teardown_observations() {
+        assert_eq!(HelperError::new(libc::ETIMEDOUT, "timeout").kind, HelperErrorKind::Timeout);
+        assert_eq!(HelperError::protocol("protocol").kind, HelperErrorKind::Protocol);
+        assert_eq!(HelperError::new(libc::EBUSY, "busy").kind, HelperErrorKind::Other);
+        assert_eq!(HelperError::child_exited().kind, HelperErrorKind::ChildExited);
+        assert_eq!(HelperError::child_missing().kind, HelperErrorKind::ChildMissing);
+        assert_eq!(HelperError::child_reap().kind, HelperErrorKind::ChildReap);
     }
 }

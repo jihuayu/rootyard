@@ -60,6 +60,11 @@ SHUTDOWN_OUTCOME_UNKNOWN = "unknown"
 SHUTDOWN_OUTCOME_MULTIPLE = "multiple"
 SHUTDOWN_OUTCOMES = frozenset((
     "helper_internal_503",
+    "helper_child_exit",
+    "helper_child_absent",
+    "helper_child_reap",
+    "helper_protocol",
+    "helper_timeout",
     "helper_deadline",
     "capture_scan",
     "git_drain",
@@ -82,6 +87,11 @@ _SHUTDOWN_HELPER_CONTAINER = "workspace FUSE helper shutdown failed: "
 
 _SHUTDOWN_HELPER_CLAUSES = {
     "HTTP 503: service temporarily unavailable": "helper_internal_503",
+    "HTTP 503: workspace FUSE helper child exited unsuccessfully": "helper_child_exit",
+    "HTTP 503: workspace FUSE helper child exit was not observed": "helper_child_absent",
+    "HTTP 503: workspace FUSE helper child reaping failed": "helper_child_reap",
+    "HTTP 503: workspace FUSE helper control protocol failed": "helper_protocol",
+    "HTTP 503: workspace FUSE helper teardown timed out": "helper_timeout",
     "HTTP 504: workspace FUSE helper shutdown exceeded the shared "
     "normal-shutdown deadline": "helper_deadline",
     "HTTP 504: workspace FUSE legacy mount teardown exceeded the shared "

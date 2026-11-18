@@ -253,6 +253,21 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             (capture + helper + "HTTP 503: service temporarily unavailable",
              "helper_internal_503"),
             (capture + helper + (
+                "HTTP 503: workspace FUSE helper child exited unsuccessfully"),
+             "helper_child_exit"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper child exit was not observed"),
+             "helper_child_absent"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper child reaping failed"),
+             "helper_child_reap"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper control protocol failed"),
+             "helper_protocol"),
+            (capture + helper + (
+                "HTTP 503: workspace FUSE helper teardown timed out"),
+             "helper_timeout"),
+            (capture + helper + (
                 "HTTP 504: workspace FUSE helper shutdown exceeded the shared "
                 "normal-shutdown deadline"), "helper_deadline"),
             (capture + (
@@ -277,6 +292,14 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             project_shutdown_outcome(
                 _terminal(mixed, "Error: service cleanup incomplete: ")),
             SHUTDOWN_OUTCOME_MULTIPLE)
+        mixed_child_exit = (
+            capture + helper
+            + "HTTP 503: workspace FUSE helper child exited unsuccessfully"
+            + "; owned workspace Git jobs/process cleanup did not complete cleanly")
+        self.assertEqual(
+            project_shutdown_outcome(
+                _terminal(mixed_child_exit, "Error: service cleanup incomplete: ")),
+            SHUTDOWN_OUTCOME_MULTIPLE)
 
     def test_shutdown_outcome_rejects_incomplete_ambiguous_or_unrecognized(self):
         known = _terminal("native Git process cleanup did not prove quiescence")
@@ -286,6 +309,8 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             _terminal(
                 "workspace capture/helper shutdown did not complete cleanly: "),
             _terminal("HTTP 503: service temporarily unavailable"),
+            _terminal(
+                "HTTP 503: workspace FUSE helper child exited unsuccessfully"),
             known[:-1], known[:-1] + b"; not-a-source-clause\n",
             known.replace(b"native Git", b"not-native Git"),
             known + other, other + known, known + b"trailing non-Error output\n",
