@@ -56,6 +56,177 @@ FAILURE_PHASES = frozenset((
 ))
 MAX_DIAGNOSTIC_LINE = 100_000
 
+SHUTDOWN_OUTCOME_UNKNOWN = "unknown"
+SHUTDOWN_OUTCOME_MULTIPLE = "multiple"
+SHUTDOWN_OUTCOMES = frozenset((
+    "helper_internal_503",
+    "helper_deadline",
+    "capture_scan",
+    "git_drain",
+    "http_join",
+    "background_join",
+    "native_quiescence",
+    SHUTDOWN_OUTCOME_MULTIPLE,
+    SHUTDOWN_OUTCOME_UNKNOWN,
+))
+MAX_SHUTDOWN_TAIL_BYTES = 64 * 1024
+MAX_SHUTDOWN_RECORD_BYTES = 8 * 1024
+
+_SHUTDOWN_TERMINAL_PREFIXES = (
+    "Error: normal shutdown incomplete: ",
+    "Error: service cleanup incomplete: ",
+)
+_SHUTDOWN_CAPTURE_CONTAINER = (
+    "workspace capture/helper shutdown did not complete cleanly: ")
+_SHUTDOWN_HELPER_CONTAINER = "workspace FUSE helper shutdown failed: "
+
+_SHUTDOWN_HELPER_CLAUSES = {
+    "HTTP 503: service temporarily unavailable": "helper_internal_503",
+    "HTTP 504: workspace FUSE helper shutdown exceeded the shared "
+    "normal-shutdown deadline": "helper_deadline",
+    "HTTP 504: workspace FUSE legacy mount teardown exceeded the shared "
+    "normal-shutdown deadline": "helper_deadline",
+}
+_SHUTDOWN_CLAUSES = {
+    "workspace capture worker did not stop before the abort-confirmation window":
+        "capture_scan",
+    "owned workspace Git jobs/process cleanup did not complete cleanly":
+        "git_drain",
+    "late owned workspace Git jobs/process cleanup did not complete cleanly":
+        "git_drain",
+    "HTTP server did not stop cleanly": "http_join",
+    "HTTP server did not join within the shutdown deadline": "http_join",
+    "background worker did not stop cleanly": "background_join",
+    "native Git process cleanup did not prove quiescence": "native_quiescence",
+}
+
+
+def _classify_shutdown_payload(payload):
+    """Classify only complete, source-defined cleanup clauses."""
+    categories = []
+    for part in payload.split("; "):
+        helper_scope = False
+        changed = True
+        while changed:
+            changed = False
+            if part.startswith(_SHUTDOWN_CAPTURE_CONTAINER):
+                part = part[len(_SHUTDOWN_CAPTURE_CONTAINER):]
+                changed = True
+            elif part.startswith(_SHUTDOWN_HELPER_CONTAINER):
+                part = part[len(_SHUTDOWN_HELPER_CONTAINER):]
+                helper_scope = True
+                changed = True
+        if not part:
+            return SHUTDOWN_OUTCOME_UNKNOWN
+        category = (
+            _SHUTDOWN_HELPER_CLAUSES if helper_scope else _SHUTDOWN_CLAUSES
+        ).get(part)
+        if category is None:
+            return SHUTDOWN_OUTCOME_UNKNOWN
+        categories.append(category)
+    if not categories:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    if len(set(categories)) == 1:
+        return categories[0]
+    return SHUTDOWN_OUTCOME_MULTIPLE
+
+
+def project_shutdown_outcome(data):
+    """Project one complete, unique terminal record to a closed outcome.
+
+    The final non-blank line must be the only ``Error:`` line in the bounded
+    snapshot and a source-known complete record.  The parser returns a fixed
+    category or ``unknown``; it never returns or stores log text, paths, ids,
+    dynamic payloads, request ids, stacks or output.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    if len(data) > MAX_SHUTDOWN_TAIL_BYTES or not data.endswith(b"\n"):
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    try:
+        text = bytes(data).decode("utf-8")
+    except UnicodeDecodeError:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    nonempty = [line for line in text.splitlines() if line.strip()]
+    if not nonempty:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    terminal = nonempty[-1]
+    error_lines = [line for line in nonempty if line.startswith("Error:")]
+    if len(error_lines) != 1 or error_lines[0] != terminal:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    if len(terminal.encode("utf-8")) > MAX_SHUTDOWN_RECORD_BYTES:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    for prefix in _SHUTDOWN_TERMINAL_PREFIXES:
+        if terminal.startswith(prefix):
+            return _classify_shutdown_payload(terminal[len(prefix):])
+    return SHUTDOWN_OUTCOME_UNKNOWN
+
+
+def _shutdown_log_path(source):
+    if isinstance(source, (str, os.PathLike)):
+        return Path(source)
+    name = getattr(source, "name", None)
+    if isinstance(name, (str, os.PathLike)):
+        return Path(name)
+    return None
+
+
+def _bound_source(source):
+    """Return the harness-owned descriptor identity, never just its path."""
+    path = _shutdown_log_path(source)
+    if isinstance(source, (str, os.PathLike)) or not hasattr(source, "fileno"):
+        return None, path
+    fd = source.fileno()
+    if type(fd) is not int or fd < 0:
+        raise OSError("source descriptor is unavailable")
+    return (fd, os.fstat(fd)), path
+
+
+def _open_bound_snapshot(fd, path, proc_fd_root):
+    """Open the exact bound inode; only a confirmed path/proc ENOENT falls back."""
+    try:
+        return os.open(Path(proc_fd_root) / str(fd), os.O_RDONLY)
+    except (FileNotFoundError, ProcessLookupError):
+        if path is None:
+            raise
+        return os.open(path, os.O_RDONLY)
+
+
+def read_shutdown_outcome(source, proc_fd_root=Path("/proc/self/fd")):
+    """Read a bounded tail tied to the exact source descriptor identity."""
+    try:
+        bound, path = _bound_source(source)
+        if bound is None:
+            if path is None:
+                return SHUTDOWN_OUTCOME_UNKNOWN
+            read_fd = os.open(path, os.O_RDONLY)
+            target = None
+        else:
+            fd, target = bound
+            read_fd = _open_bound_snapshot(fd, path, proc_fd_root)
+        with os.fdopen(read_fd, "rb") as stream:
+            current = os.fstat(stream.fileno())
+            if target is not None and (
+                    (current.st_dev, current.st_ino)
+                    != (target.st_dev, target.st_ino)):
+                return SHUTDOWN_OUTCOME_UNKNOWN
+            size = target.st_size if target is not None else current.st_size
+            start = max(0, size - MAX_SHUTDOWN_TAIL_BYTES)
+            previous = b""
+            if start:
+                stream.seek(start - 1)
+                previous = stream.read(1)
+            stream.seek(start)
+            data = stream.read(size - start)
+    except (OSError, TypeError, ValueError):
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    if start and previous != b"\n":
+        newline = data.find(b"\n")
+        if newline < 0:
+            return SHUTDOWN_OUTCOME_UNKNOWN
+        data = data[newline + 1:]
+    return project_shutdown_outcome(data)
+
 
 def _flatten(suite):
     for test in suite:
@@ -159,6 +330,17 @@ def _failure_phase(test):
     return None
 
 
+def _shutdown_outcome(test):
+    """Read only the test's already projected fixed outcome, never raw output."""
+    try:
+        value = getattr(test, "_rootyard_diagnostic_shutdown_outcome", None)
+        if isinstance(value, str) and value in SHUTDOWN_OUTCOMES:
+            return value
+    except BaseException:
+        pass
+    return SHUTDOWN_OUTCOME_UNKNOWN
+
+
 def _unknown_diagnostic():
     return {
         "phase": None,
@@ -167,6 +349,7 @@ def _unknown_diagnostic():
         "http_status": None,
         "errno": None,
         "child_exit": None,
+        "shutdown_outcome": SHUTDOWN_OUTCOME_UNKNOWN,
     }
 
 
@@ -178,6 +361,7 @@ def _diagnostic_record(test, error, tb):
         "http_status": _http_status(error),
         "errno": _errno(error),
         "child_exit": _diagnostic_child_exit(test, error),
+        "shutdown_outcome": _shutdown_outcome(test),
     }
 
 
