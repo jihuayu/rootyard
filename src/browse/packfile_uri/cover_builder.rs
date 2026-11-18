@@ -280,7 +280,7 @@ pub fn build_verified_cover_proof_from_repo(
         let w_oid = GitOid::parse(params.object_format, wc).map_err(internal_err)?;
         let Some(&owner_vid) = commit_ver_map.get(wc) else { return Ok(None) };
         seq += 1;
-        let w_ref = RefName::new(&format!("refs/heads/__packfile_uri_want_{idx}")).map_err(internal_err)?;
+        let w_ref = RefName::new(format!("refs/heads/__packfile_uri_want_{idx}")).map_err(internal_err)?;
         let w_ver = seal_synth_version(&realm, &w_ref, seq, None, vec![owner_vid], w_oid, &[])?;
         graph.insert_active(CausalVersionNode { record: w_ver.clone(), own_packs: Vec::new() });
         heads.insert(w_ref.clone(), RefHead::from_committed(&w_ver).map_err(internal_err)?);

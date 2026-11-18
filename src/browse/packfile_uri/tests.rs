@@ -158,7 +158,7 @@ pub(super) fn build_verified_fixture(
         let pse = PackSetEntry::new(Uuid::new_v4(), Uuid::new_v4(), RequestDigest::of("art", &[&seq.to_be_bytes()])).unwrap();
         let pack_loc = BlobLocator::new(tenant, repo, 1, Uuid::new_v4(), "packs", sha256, byte_len).unwrap();
         let idx_loc = BlobLocator::new(tenant, repo, 1, Uuid::new_v4(), "packs", sha256, 64).unwrap();
-        let vcp = VerifiedClosurePack::new(pse, tenant, repo, "s3", &"a".repeat(64), byte_len + 64, 2).unwrap();
+        let vcp = VerifiedClosurePack::new(pse, tenant, repo, "s3", "a".repeat(64), byte_len + 64, 2).unwrap();
         let deps = base_ver.as_ref().map(VersionRecord::version_id).into_iter().collect();
         let ver = seal_synth_version(&realm, &ref_name, seq, base_ver.as_ref(), deps, coid, &[pse]).unwrap();
         let vid = ver.version_id();
