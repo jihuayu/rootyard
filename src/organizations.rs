@@ -20,7 +20,10 @@ pub fn routes() -> Router<Arc<crate::AppState>> {
     Router::new()
         .route("/api/orgs", get(audit::list_organizations).post(handlers::create_organization))
         .route("/api/orgs/{slug}", get(handlers::get_organization))
-        .route("/api/repos/{owner}/{name}/transfer", post(handlers::transfer_ownership))
+        .route(
+            "/api/repos/{owner}/{name}/transfer",
+            post(handlers::transfer_ownership).get(crate::repositories::lifecycle_handlers::get_transfer),
+        )
         .route("/api/orgs/{slug}/audit", get(audit::list_audit_log))
         .route("/api/orgs/{slug}/members", get(handlers::list_members))
         .route("/api/orgs/{slug}/members/{username}", put(handlers::put_member).delete(handlers::delete_member))
