@@ -684,7 +684,9 @@ jobs:
             --harness tests/test_workspace_legacy_fuse_shutdown_fifo.py \
             --harness tests/test_workspace_legacy_fuse_containment_owner.py \
             --harness tests/test_workspace_legacy_fuse_bind_gate.py \
+            --harness tests/test_workspace_legacy_fuse_stat_gate.py \
             --harness tests/fixtures/api_bind_gate.c \
+            --harness tests/fixtures/legacy_stat_gate.c \
             --harness scripts/native_report_manifest.py \
             --harness scripts/native_build_receipt.py \
             --harness .github/workflows/ci.yml \
@@ -927,7 +929,9 @@ jobs:
             --harness tests/test_workspace_legacy_fuse_shutdown_fifo.py \
             --harness tests/test_workspace_legacy_fuse_containment_owner.py \
             --harness tests/test_workspace_legacy_fuse_bind_gate.py \
+            --harness tests/test_workspace_legacy_fuse_stat_gate.py \
             --harness tests/fixtures/api_bind_gate.c \
+            --harness tests/fixtures/legacy_stat_gate.c \
             --harness tests/fixtures/capture_read_gate.c \
             --harness tests/repository_pagination.py \
             --harness tests/organization_pagination.py \

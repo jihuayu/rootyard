@@ -5,7 +5,9 @@ This private module is owned by ``tests/workspace_legacy_fuse_shutdown_acceptanc
 It creates and reads workspaces through the real HTTP API and owns only the
 conflict listener it binds. The optional bind gate is compiled from
 ``tests/fixtures/api_bind_gate.c`` and preloaded only into the fixture-owned
-service child; it is inert without that child's private environment. This
+service child; the optional metadata gate is compiled from
+``tests/fixtures/legacy_stat_gate.c`` and preloaded only into its failure-run
+service child. Both are inert without that child's private environment. This
 module contains no SQL-ready fixture, mock Git, fake mount, public fault
 endpoint, or production environment backdoor.
 """
@@ -15,9 +17,11 @@ import base64
 import errno
 import ipaddress
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
+import stat
 import sys
 import time
 
@@ -37,6 +41,26 @@ _API_BIND_GATE_OUTCOME_FIELDS = frozenset((
     "abi_verified", "bind_result", "bind_errno",
 ))
 _API_BIND_GATE_FAILURES = ("duplicate", "abi", "timeout")
+
+STAT_GATE_SCHEMA = "rootyard/issues91-95/legacy-stat-gate/v1"
+STAT_GATE_VERSION = 1
+STAT_GATE_ENV_NAMES = (
+    "LD_PRELOAD",
+    "ROOTYARD_TEST_STAT_GATE",
+    "ROOTYARD_TEST_STAT_GATE_TARGET",
+    "ROOTYARD_TEST_STAT_GATE_EXE",
+)
+STAT_GATE_HOLD_SECONDS = 30.0
+STAT_GATE_OUTCOME_SECONDS = 10.0
+_STAT_GATE_OUTCOME_FIELDS = frozenset((
+    "schema", "version", "events", "held", "timed_out", "duplicate",
+    "abi_verified", "scope_verified", "lookup", "struct_size", "result",
+    "errno", "mode", "is_regular", "is_directory",
+))
+_STAT_GATE_FAILURES = ("duplicate", "abi", "scope", "timeout")
+_STAT_GATE_LOOKUPS = frozenset((
+    "statx", "stat", "lstat", "fstatat", "stat64", "lstat64", "fstatat64",
+))
 _TESTS_DIR = Path(__file__).resolve().parent
 
 
@@ -145,6 +169,45 @@ def parse_api_bind_gate_address(value) -> str:
     return f"{address}:{port}"
 
 
+def _build_preload_gate(harness, source_name: str, build_name: str, library_name: str,
+                        label: str, compiler=None) -> Path:
+    """Compile one fixture-owned preload library into this harness's temp root."""
+    if not sys.platform.startswith("linux") or not Path("/proc/self").is_dir():
+        raise LegacyAcceptanceError(f"{label} requires Linux process and procfs support")
+    compiler = compiler or shutil.which("gcc")
+    if compiler is None:
+        raise LegacyAcceptanceError(f"{label} requires gcc on PATH")
+    source = _TESTS_DIR / "fixtures" / source_name
+    if not source.is_file():
+        raise LegacyAcceptanceError(f"{label} fixture is missing: {source}")
+    build = harness.root / build_name
+    build.mkdir(parents=True, exist_ok=True)
+    library = build / library_name
+    build_env = dict(harness.env)
+    for name in set(API_BIND_GATE_ENV_NAMES) | set(STAT_GATE_ENV_NAMES):
+        build_env.pop(name, None)
+    harness.run(
+        [compiler, "-shared", "-fPIC", "-O2", "-pthread", "-o", str(library), str(source), "-ldl"],
+        env=build_env,
+    )
+    if not library.is_file():
+        raise LegacyAcceptanceError(f"{label} did not produce {library}")
+    return library
+
+
+def _snapshot_gate_env(harness, names) -> dict:
+    return {name: harness.env.get(name) for name in names}
+
+
+def _restore_gate_env(harness, prior, names) -> None:
+    for name in names:
+        value = prior.get(name)
+        if value is None:
+            harness.env.pop(name, None)
+        else:
+            harness.env[name] = value
+
+
 def install_api_bind_gate(harness, compiler=None):
     """Compile the single-use bind gate and configure only this child.
 
@@ -153,27 +216,12 @@ def install_api_bind_gate(harness, compiler=None):
     must snapshot and restore the three environment names after ``Popen`` has
     copied them, so no later fixture child inherits the preload.
     """
-    if not sys.platform.startswith("linux") or not Path("/proc/self").is_dir():
-        raise LegacyAcceptanceError("API bind gate requires Linux process and procfs support")
-    compiler = compiler or shutil.which("gcc")
-    if compiler is None:
-        raise LegacyAcceptanceError("API bind gate requires gcc on PATH")
-    source = _TESTS_DIR / "fixtures" / "api_bind_gate.c"
-    if not source.is_file():
-        raise LegacyAcceptanceError(f"API bind gate fixture is missing: {source}")
     address = parse_api_bind_gate_address(harness.env.get("ROOTYARD_BIND"))
-    build = harness.root / "legacy-api-bind-gate"
-    build.mkdir(parents=True, exist_ok=True)
-    library = build / "api_bind_gate.so"
-    build_env = dict(harness.env)
-    for name in API_BIND_GATE_ENV_NAMES:
-        build_env.pop(name, None)
-    harness.run(
-        [compiler, "-shared", "-fPIC", "-O2", "-pthread", "-o", str(library), str(source), "-ldl"],
-        env=build_env,
+    library = _build_preload_gate(
+        harness, "api_bind_gate.c", "legacy-api-bind-gate", "api_bind_gate.so",
+        "API bind gate", compiler,
     )
-    if not library.is_file():
-        raise LegacyAcceptanceError(f"API bind gate did not produce {library}")
+    build = library.parent
     prefix = build / "gate"
     harness.env.update(
         LD_PRELOAD=str(library),
@@ -185,17 +233,50 @@ def install_api_bind_gate(harness, compiler=None):
 
 def snapshot_api_bind_gate_env(harness) -> dict:
     """Remember only the three private names so they can be removed after Popen."""
-    return {name: harness.env.get(name) for name in API_BIND_GATE_ENV_NAMES}
+    return _snapshot_gate_env(harness, API_BIND_GATE_ENV_NAMES)
 
 
 def restore_api_bind_gate_env(harness, prior) -> None:
     """Restore the exact pre-gate environment after the owned child was spawned."""
-    for name in API_BIND_GATE_ENV_NAMES:
-        value = prior.get(name)
-        if value is None:
-            harness.env.pop(name, None)
-        else:
-            harness.env[name] = value
+    _restore_gate_env(harness, prior, API_BIND_GATE_ENV_NAMES)
+
+
+def install_stat_gate(harness, target, executable, compiler=None):
+    """Compile the one-use metadata gate for the exact service child.
+
+    ``target`` becomes the canonical regular-file path the real lower ``.git``
+    lookup must match. ``executable`` is the canonical service binary; the
+    child verifies it through ``/proc/self/exe`` and its own process-group
+    scope before it can hold a matching lookup.
+    """
+    target = Path(target).resolve(strict=True)
+    executable = Path(executable).resolve(strict=True)
+    if not target.is_file() or target.is_symlink():
+        raise LegacyAcceptanceError("metadata gate target is not a regular file")
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise LegacyAcceptanceError("metadata gate executable is not executable")
+    library = _build_preload_gate(
+        harness, "legacy_stat_gate.c", "legacy-stat-gate", "legacy_stat_gate.so",
+        "legacy metadata gate", compiler,
+    )
+    prefix = library.parent / "gate"
+    harness.env.update(
+        LD_PRELOAD=str(library),
+        ROOTYARD_TEST_STAT_GATE=str(prefix),
+        ROOTYARD_TEST_STAT_GATE_TARGET=str(target),
+        ROOTYARD_TEST_STAT_GATE_EXE=str(executable),
+    )
+    return prefix
+
+
+def snapshot_stat_gate_env(harness) -> dict:
+    """Remember only the four private names so they can be removed after Popen."""
+    return _snapshot_gate_env(harness, STAT_GATE_ENV_NAMES)
+
+
+def restore_stat_gate_env(harness, prior) -> None:
+    """Restore the exact pre-gate environment after the owned child was spawned."""
+    _restore_gate_env(harness, prior, STAT_GATE_ENV_NAMES)
 
 
 def _assert_no_gate_failure(gate) -> None:
@@ -287,3 +368,105 @@ def read_api_bind_gate_outcome(
     if last_error is not None:
         raise LegacyAcceptanceError("API bind gate outcome is unreadable") from last_error
     raise LegacyAcceptanceError("API bind gate outcome was not observed within the bound")
+
+
+def _assert_no_stat_gate_failure(gate) -> None:
+    for suffix in _STAT_GATE_FAILURES:
+        marker = _gate_marker(gate, suffix)
+        if marker.exists():
+            raise LegacyAcceptanceError(f"legacy metadata gate reported {suffix}")
+
+
+def wait_stat_gate(gate, timeout: float = STAT_GATE_HOLD_SECONDS) -> Path:
+    """Wait for the one exact metadata lookup to be held before its result."""
+    gate = Path(gate)
+    hit = _gate_marker(gate, "hit")
+    deadline = time.monotonic() + float(timeout)
+    while time.monotonic() < deadline:
+        _assert_no_stat_gate_failure(gate)
+        if hit.exists():
+            _assert_no_stat_gate_failure(gate)
+            return hit
+        time.sleep(0.05)
+    _assert_no_stat_gate_failure(gate)
+    raise LegacyAcceptanceError("legacy metadata gate was not reached within the bounded setup")
+
+
+def release_stat_gate(gate) -> Path:
+    """Release the single held metadata lookup exactly once."""
+    release = _gate_marker(gate, "release")
+    try:
+        with open(release, "xb") as stream:
+            stream.write(b"release\n")
+    except FileExistsError:
+        raise LegacyAcceptanceError("legacy metadata gate release already existed") from None
+    except OSError as error:
+        raise LegacyAcceptanceError("legacy metadata gate release could not be written") from error
+    return release
+
+
+def validate_stat_gate_outcome(payload) -> dict:
+    """Accept only the real, successful, non-directory regular-file lookup."""
+    if not isinstance(payload, dict):
+        raise LegacyAcceptanceError("legacy metadata gate outcome is not an object")
+    if set(payload) != _STAT_GATE_OUTCOME_FIELDS:
+        raise LegacyAcceptanceError("legacy metadata gate outcome has an unexpected field set")
+    exact = {
+        "schema": STAT_GATE_SCHEMA,
+        "version": STAT_GATE_VERSION,
+        "events": 1,
+        "held": 1,
+        "timed_out": 0,
+        "duplicate": 0,
+        "abi_verified": 1,
+        "scope_verified": 1,
+        "is_regular": 1,
+        "is_directory": 0,
+    }
+    for name, expected in exact.items():
+        if type(payload.get(name)) is not type(expected) or payload.get(name) != expected:
+            raise LegacyAcceptanceError(f"legacy metadata gate outcome {name} is not exact")
+    lookup = payload.get("lookup")
+    if not isinstance(lookup, str) or lookup not in _STAT_GATE_LOOKUPS:
+        raise LegacyAcceptanceError("legacy metadata gate lookup ABI is not verified")
+    for name in ("struct_size", "result", "errno", "mode"):
+        if type(payload.get(name)) is not int:
+            raise LegacyAcceptanceError(f"legacy metadata gate outcome {name} is not an integer")
+    if payload["struct_size"] < 1:
+        raise LegacyAcceptanceError("legacy metadata gate struct size is not positive")
+    if payload["result"] != 0:
+        raise LegacyAcceptanceError("legacy metadata gate did not retain a successful real result")
+    if payload["errno"] < 0:
+        raise LegacyAcceptanceError("legacy metadata gate errno is not a real errno")
+    mode = payload["mode"]
+    if mode < 0 or not stat.S_ISREG(mode) or stat.S_ISDIR(mode):
+        raise LegacyAcceptanceError("legacy metadata gate did not observe regular-file metadata")
+    return payload
+
+
+def read_stat_gate_outcome(
+    gate, timeout: float = STAT_GATE_OUTCOME_SECONDS
+) -> dict:
+    """Read the bounded outcome written only after the real metadata returned."""
+    gate = Path(gate)
+    outcome = _gate_marker(gate, "outcome")
+    deadline = time.monotonic() + float(timeout)
+    last_error = None
+    while time.monotonic() < deadline:
+        if outcome.is_file():
+            try:
+                if outcome.stat().st_size > 4096:
+                    raise LegacyAcceptanceError("legacy metadata gate outcome exceeds the bounded size")
+                payload = json.loads(outcome.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, ValueError) as error:
+                last_error = error
+            else:
+                validated = validate_stat_gate_outcome(payload)
+                _assert_no_stat_gate_failure(gate)
+                return validated
+        _assert_no_stat_gate_failure(gate)
+        time.sleep(0.05)
+    _assert_no_stat_gate_failure(gate)
+    if last_error is not None:
+        raise LegacyAcceptanceError("legacy metadata gate outcome is unreadable") from last_error
+    raise LegacyAcceptanceError("legacy metadata gate outcome was not observed within the bound")

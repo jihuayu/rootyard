@@ -13,8 +13,11 @@ ready/ACK fixture, mock Git, fake mount, public fault endpoint or environment
 backdoor. The bind case preloads the fixture-owned single-use
 ``tests/fixtures/api_bind_gate.c`` only into its own service child, so the real
 ``EADDRINUSE`` result is held until the live mount and exact cleanup deadline
-have been observed. ``test_early_server_error`` is deliberately absent: that
-branch is proved only by the private injected-future source unit in
+have been observed. The partial-reconcile case similarly preloads
+``tests/fixtures/legacy_stat_gate.c`` only into its failure-run service child,
+holding the exact corrupted lower ``.git`` metadata lookup before its real
+non-directory result is returned. ``test_early_server_error`` is deliberately
+absent: that branch is proved only by the private injected-future source unit in
 ``src/service_shutdown.rs``; no native early-server-error claim is made here.
 """
 from __future__ import annotations
@@ -26,6 +29,7 @@ from pathlib import Path
 import shlex
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -65,6 +69,7 @@ SOURCE_PATHS = (
     "tests/workspace_legacy_fuse_shutdown_fifo.py",
     "tests/workspace_legacy_fuse_shutdown_report.py",
     "tests/fixtures/api_bind_gate.c",
+    "tests/fixtures/legacy_stat_gate.c",
 )
 CASE_DETAILS: dict[str, dict] = {}
 CONTAINMENT_OWNER = legacy_ownership.ContainmentOwner()
@@ -387,6 +392,11 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             raise legacy_support.LegacyAcceptanceError("corruption fixture already exists")
         git_dir.rename(corrupt_name)
         (broken_lower / ".git").write_text("corrupted legacy lower state\n", encoding="utf-8")
+        corrupt_git = broken_lower / ".git"
+        if corrupt_git.is_symlink() or not corrupt_git.is_file() or corrupt_git.is_dir():
+            raise legacy_support.LegacyAcceptanceError(
+                "the corrupted lower .git is not an actual non-directory regular file"
+            )
 
         # This 180 s preparation-stop bound is setup containment, explicitly
         # outside the single 5 s case oracle armed below at the failure trigger.
@@ -396,7 +406,23 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         self.assertEqual(code, 0, "preparation service did not stop cleanly before the failure run")
         self.owned_records.clear()
 
-        service_proc = self._start_oracle_service()
+        # The one-use preload gate is copied into this service child only. It
+        # holds the product's exact statx/stat-family lookup of the corrupted
+        # lower .git (the real `is_dir` check at src/workspaces/mounts.rs:251)
+        # before that lookup returns, so the two earlier owned mounts can be
+        # observed independently before the real failure is released. The gate
+        # verifies /proc/self/exe and process-group scope.
+        prior_gate_env = legacy_fixtures.snapshot_stat_gate_env(self.h)
+        gate = legacy_fixtures.install_stat_gate(
+            self.h, broken_lower / ".git", self.binary
+        )
+        try:
+            service_proc = self._start_oracle_service()
+        finally:
+            # Popen copied the environment. No later psql/Git/CLI child may
+            # inherit this test-only preload.
+            legacy_fixtures.restore_stat_gate_env(self.h, prior_gate_env)
+        legacy_fixtures.wait_stat_gate(gate)
         holder, holder_proof = self._attach_holder(service_proc)
         observed = {}
         for workspace, paths in healthy:
@@ -420,12 +446,19 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         )
 
         namespace = int(holder_proof["service_namespace"])
+        # Arm the existing one absolute 5 s cleanup deadline immediately
+        # before releasing the observed real lookup.
         deadline = self._arm_cleanup_deadline()
+        legacy_fixtures.release_stat_gate(gate)
         code = support.wait_process_exit(
             self.h.proc, timeout=max(0.0, deadline - time.monotonic())
         )
         self._finish_service_exit()
+        stat_gate = legacy_fixtures.read_stat_gate_outcome(gate)
         self.assertGreater(code, 0, "partial reconcile failure did not return a positive application exit status")
+        self.assertEqual(stat_gate["result"], 0, "the held lookup did not return its real success result")
+        self.assertTrue(stat.S_ISREG(stat_gate["mode"]), "the held lookup did not observe a regular file")
+        self.assertFalse(stat.S_ISDIR(stat_gate["mode"]), "the held lookup observed a directory")
 
         for workspace, paths in healthy:
             legacy_support.wait_exact_mount_gone(
@@ -472,6 +505,23 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             "the corrupted later workspace was reported as a joined mount",
         )
         self._record_detail(evidence, code, holder_proof)
+        CASE_DETAILS[self.id()]["stat_gate"] = {
+            "schema": stat_gate["schema"],
+            "events": stat_gate["events"],
+            "held": stat_gate["held"],
+            "timed_out": stat_gate["timed_out"],
+            "duplicate": stat_gate["duplicate"],
+            "abi_verified": stat_gate["abi_verified"],
+            "scope_verified": stat_gate["scope_verified"],
+            "lookup": stat_gate["lookup"],
+            "struct_size": stat_gate["struct_size"],
+            "result": stat_gate["result"],
+            "errno": stat_gate["errno"],
+            "mode": stat_gate["mode"],
+            "is_regular": stat_gate["is_regular"],
+            "is_directory": stat_gate["is_directory"],
+            "real_regular_file": True,
+        }
 
     def test_post_reconcile_api_bind_failure_cleans_owned_mount(self):
         workspace, paths = self._create_workspace("legacy-bind", "legacy-bind-create")
