@@ -1,19 +1,36 @@
-//! PostgreSQL 17 consistent cutpoint capture, cursor reconciliation, and clean-room
-//! new-incarnation authority persistence (#153).
+//! PostgreSQL 17 consistent cutpoint capture and cursor `group_epoch` reconciliation (#153).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use tokio_postgres::{Client, GenericClient, Transaction};
+use tokio_postgres::{GenericClient, Transaction};
 use uuid::Uuid;
 
 use crate::ref_store::GitObjectFormat;
 
 use super::types::{
-    DeleterLeaseTicket, NewIncarnationAuthority, PairedBackupError, PairedBackupManifest, PgCutpointProof,
-    PgProjectionCursorCut, PgRepositoryRowProof, WriterGrantTicket, sha256_json_tagged,
+    PairedBackupError, PgCutpointProof, PgProjectionCursorCut, PgRepositoryRowProof, sha256_json_tagged,
 };
 
-fn pg_err(err: tokio_postgres::Error) -> PairedBackupError {
+#[derive(Clone, Debug)]
+pub struct ExpectedRaftCut {
+    pub group_id: i64,
+    pub history_incarnation: Uuid,
+    pub group_epoch: i64,
+    pub peer_group_epochs: BTreeMap<i64, i64>,
+    pub applied_index: u64,
+    pub applied_term: u64,
+    pub applied_event_seq: u64,
+}
+
+impl ExpectedRaftCut {
+    pub fn all_group_epochs(&self) -> BTreeMap<i64, i64> {
+        let mut all = self.peer_group_epochs.clone();
+        all.insert(self.group_id, self.group_epoch);
+        all
+    }
+}
+
+pub(super) fn pg_err(err: tokio_postgres::Error) -> PairedBackupError {
     let detail = err
         .as_db_error()
         .map_or_else(|| err.to_string(), |db| format!("{}: {} ({:?})", db.severity(), db.message(), db.detail()));
@@ -46,14 +63,10 @@ pub async fn freeze_pg_deleter(client: &impl GenericClient, reason: &str) -> Res
 }
 
 /// Capture an immutable PG 17 repeatable-read cutpoint and reconcile projection cursors
-/// & pending decisions/outbox entries to the exact Raft `(group_id, term, index)` cut.
+/// (`group_epoch` across all Raft groups + log index/term/seq) and pending decisions/outbox.
 pub async fn capture_pg_cutpoint_in_tx(
     tx: &Transaction<'_>,
-    expected_group_id: i64,
-    expected_incarnation: Uuid,
-    expected_raft_index: u64,
-    expected_raft_term: u64,
-    expected_event_seq: u64,
+    expected: &ExpectedRaftCut,
 ) -> Result<PgCutpointProof, PairedBackupError> {
     let pg_ver: String = tx.query_one("SHOW server_version", &[]).await.map_err(pg_err)?.get(0);
     if !pg_ver.starts_with("17.") {
@@ -88,13 +101,18 @@ pub async fn capture_pg_cutpoint_in_tx(
             "PG pando_storage_authorities.remote_delete_fenced must be true",
         ));
     }
+    let max_decision_scope_version: i64 = tx
+        .query_one("SELECT COALESCE(max(version), 0)::bigint FROM ref_store_decision_scopes", &[])
+        .await
+        .map_err(pg_err)?
+        .get(0);
 
     let pending_decisions_count: i64 = tx
         .query_one("SELECT count(*)::bigint FROM ref_store_publication_decisions WHERE state = 'OPEN'", &[])
         .await
         .map_err(pg_err)?
         .get(0);
-    let pending_outbox_count: i64 = tx
+    let pending_outbox_val: i64 = tx
         .query_one(
             "SELECT (SELECT count(*)::bigint FROM git_operations WHERE outcome = 'unknown') \
              + (SELECT count(*)::bigint FROM event_deliveries WHERE state <> 'delivered') \
@@ -104,9 +122,9 @@ pub async fn capture_pg_cutpoint_in_tx(
         .await
         .map_err(pg_err)?
         .get(0);
-    if pending_decisions_count != 0 || pending_outbox_count != 0 {
+    if pending_decisions_count != 0 || pending_outbox_val != 0 {
         return Err(PairedBackupError::UnknownInFlightOperations(
-            (pending_decisions_count + pending_outbox_count) as usize,
+            (pending_decisions_count + pending_outbox_val) as usize,
         ));
     }
 
@@ -132,22 +150,61 @@ pub async fn capture_pg_cutpoint_in_tx(
             stream_state: row.get(7),
         });
     }
+
+    let expected_epochs = expected.all_group_epochs();
+    if projection_cursors.len() != expected_epochs.len() {
+        return Err(PairedBackupError::CutpointSkew(format!(
+            "PG projection_cursors count ({}) != expected Raft group count ({})",
+            projection_cursors.len(),
+            expected_epochs.len()
+        )));
+    }
+    let mut seen_groups = BTreeSet::new();
+    for cur in &projection_cursors {
+        if !seen_groups.insert(cur.group_id)
+            || cur.group_epoch <= 0
+            || cur.history_incarnation.is_nil()
+            || cur.stream_state != "active"
+        {
+            return Err(PairedBackupError::CutpointSkew(format!(
+                "PG cursor group {} duplicate, invalid group_epoch {}, or stream_state {}",
+                cur.group_id, cur.group_epoch, cur.stream_state
+            )));
+        }
+        let Some(&exp_epoch) = expected_epochs.get(&cur.group_id) else {
+            return Err(PairedBackupError::CutpointSkew(format!("unbound PG cursor for group {}", cur.group_id)));
+        };
+        if cur.group_epoch != exp_epoch {
+            return Err(PairedBackupError::CutpointSkew(format!(
+                "PG cursor group {} group_epoch {} != Raft group_epoch {}",
+                cur.group_id, cur.group_epoch, exp_epoch
+            )));
+        }
+    }
+
     let matched_cursor = projection_cursors
         .iter()
-        .find(|c| c.group_id == expected_group_id && c.history_incarnation == expected_incarnation)
+        .find(|c| c.group_id == expected.group_id && c.history_incarnation == expected.history_incarnation)
         .ok_or_else(|| {
             PairedBackupError::CutpointSkew(
                 "missing PG ref_cas_projection_cursors row for active Raft group/incarnation".into(),
             )
         })?;
-    if matched_cursor.stream_state != "active"
-        || matched_cursor.applied_log_index as u64 != expected_raft_index
-        || matched_cursor.applied_log_term as u64 != expected_raft_term
-        || matched_cursor.applied_event_seq as u64 != expected_event_seq
+    if matched_cursor.group_epoch != expected.group_epoch
+        || matched_cursor.applied_log_index as u64 != expected.applied_index
+        || matched_cursor.applied_log_term as u64 != expected.applied_term
+        || matched_cursor.applied_event_seq as u64 != expected.applied_event_seq
     {
         return Err(PairedBackupError::CutpointSkew(format!(
-            "PG projection cursor ({},{},{}) != Raft cut ({expected_raft_term},{expected_raft_index},{expected_event_seq})",
-            matched_cursor.applied_log_term, matched_cursor.applied_log_index, matched_cursor.applied_event_seq
+            "PG projection cursor (grp_epoch={},{},{},{}) != Raft cut (grp_epoch={},{},{},{})",
+            matched_cursor.group_epoch,
+            matched_cursor.applied_log_term,
+            matched_cursor.applied_log_index,
+            matched_cursor.applied_event_seq,
+            expected.group_epoch,
+            expected.applied_term,
+            expected.applied_index,
+            expected.applied_event_seq,
         )));
     }
 
@@ -165,6 +222,13 @@ pub async fn capture_pg_cutpoint_in_tx(
     let mut repositories = Vec::with_capacity(repo_rows.len());
     for row in repo_rows {
         let repository_id: Uuid = row.get(0);
+        let history_incarnation: Uuid = row.get(5);
+        let group_epoch: i64 = row.get(7);
+        if history_incarnation != expected.history_incarnation || group_epoch != expected.group_epoch {
+            return Err(PairedBackupError::CutpointSkew(format!(
+                "PG repository {repository_id} (inc={history_incarnation}, group_epoch={group_epoch}) != Raft cut",
+            )));
+        }
         let ref_rows = tx
             .query(
                 "SELECT ref_name, oid FROM ref_store_core_refs WHERE repository_id = $1 ORDER BY ref_name",
@@ -183,9 +247,9 @@ pub async fn capture_pg_cutpoint_in_tx(
             name: row.get(2),
             object_format: parse_obj_format(row.get::<_, String>(3).as_str())?,
             storage_backend: row.get(4),
-            history_incarnation: row.get(5),
+            history_incarnation,
             authority_epoch: row.get(6),
-            group_epoch: row.get(7),
+            group_epoch,
             gate_revision: row.get(8),
             refs_digest,
             refs,
@@ -201,225 +265,12 @@ pub async fn capture_pg_cutpoint_in_tx(
         source_storage_authority_id,
         source_storage_generation,
         remote_delete_fenced,
+        max_decision_scope_version,
         pending_decisions_count,
-        pending_outbox_count,
+        pending_outbox_count: pending_outbox_val,
         projection_cursors,
         repositories,
         cutpoint_digest: String::new(),
     }
     .seal()
-}
-
-/// Restore clean-room PG 17 tables under a strictly new incarnation, rotate authority,
-/// fence prior cluster leases/credentials/tokens, and register backup retention roots.
-pub async fn install_restored_pg_incarnation(
-    client: &mut Client,
-    manifest: &PairedBackupManifest,
-    inc: &NewIncarnationAuthority,
-) -> Result<(), PairedBackupError> {
-    let tx = client.transaction().await.map_err(pg_err)?;
-    tx.batch_execute(
-        "DELETE FROM cluster_transport_nonces;
-         UPDATE ci_runs SET state='cancelled', lease_generation=lease_generation+1, lease_expires_unix=0, runner_id=NULL WHERE state IN ('queued','leased');
-         UPDATE ci_mirror_nodes SET active=false, ready_oids='[]'::jsonb, heartbeat_unix=0;
-         UPDATE forge_webhook_deliveries SET state='pending', lease_generation=lease_generation+1, next_attempt_unix=0 WHERE state='leased';
-         UPDATE ref_cas_projection_jobs SET state='queued', claim_generation=claim_generation+1, lease_owner=NULL, lease_until=NULL WHERE state='running';
-         UPDATE workspaces SET lease_epoch=lease_epoch+1, lease_until=clock_timestamp()-interval '1 second' WHERE state='ready';
-         UPDATE sandbox_jobs SET state='cancelled', pid=NULL, finished_at=clock_timestamp() WHERE state IN ('queued','preparing','running');
-         UPDATE tokens SET revoked=true WHERE kind='browser';
-         UPDATE web_sessions SET revoked=true;",
-    )
-    .await
-    .map_err(pg_err)?;
-
-    tx.execute(
-        "UPDATE cluster_authority SET incarnation = $1, rotated_at = clock_timestamp() WHERE singleton = true",
-        &[&inc.new_cluster_incarnation],
-    )
-    .await
-    .map_err(pg_err)?;
-    let storage_row = tx
-        .query_one(
-            "UPDATE pando_storage_authorities \
-             SET authority_id = $1, generation = $2, restore_generation = restore_generation + 1, \
-                 authority_epoch = $3, remote_delete_fenced = false, remote_delete_fence_reason = NULL, \
-                 rotated_at = clock_timestamp() \
-             WHERE singleton = true \
-             RETURNING restore_generation",
-            &[&inc.new_storage_authority_id, &inc.new_storage_generation, &inc.new_authority_epoch],
-        )
-        .await
-        .map_err(pg_err)?;
-    let restore_gen: i64 = storage_row.get(0);
-
-    for repo in &manifest.pg_cutpoint.repositories {
-        let uname = format!("r{}", &repo.tenant_id.simple().to_string()[..12]);
-        tx.execute(
-            "INSERT INTO users(id, username) VALUES($1, $2) ON CONFLICT (id) DO NOTHING",
-            &[&repo.tenant_id, &uname],
-        )
-        .await
-        .map_err(pg_err)?;
-        let fmt_str = repo.object_format.as_str();
-        tx.execute(
-            "INSERT INTO repositories(id, owner_id, name, state, storage_backend, object_format, transition_state) \
-             VALUES($1, $2, $3, 'provisioning', $4, $5, 'stable')",
-            &[&repo.repository_id, &repo.tenant_id, &repo.name, &repo.storage_backend, &fmt_str],
-        )
-        .await
-        .map_err(pg_err)?;
-        let head_ref = repo
-            .refs
-            .keys()
-            .find(|k| k.as_str() == "refs/heads/main")
-            .or_else(|| repo.refs.keys().find(|k| k.starts_with("refs/heads/")))
-            .map(String::as_str)
-            .unwrap_or("refs/heads/main");
-        tx.execute(
-            "INSERT INTO ref_store_core_gates(repository_id, tenant_id, object_format, history_incarnation, authority_epoch, group_epoch, head_ref, revision, pack_mode) \
-             VALUES($1, $2, $3, $4, $5, $6, $7, $8, 'metadata_only')",
-            &[
-                &repo.repository_id,
-                &repo.tenant_id,
-                &fmt_str,
-                &inc.new_history_incarnation,
-                &inc.new_authority_epoch,
-                &inc.new_group_epoch,
-                &head_ref,
-                &repo.gate_revision,
-            ],
-        )
-        .await
-        .map_err(pg_err)?;
-        tx.execute(
-            "INSERT INTO ref_store_core_protocol_repos(repository_id, tenant_id, object_format, history_incarnation, authority_epoch, group_epoch, decision_required, roots_revision) \
-             VALUES($1, $2, $3, $4, $5, $6, TRUE, 1)",
-            &[&repo.repository_id, &repo.tenant_id, &fmt_str, &inc.new_history_incarnation, &inc.new_authority_epoch, &inc.new_group_epoch],
-        )
-        .await
-        .map_err(pg_err)?;
-        for (ref_name, oid) in &repo.refs {
-            tx.execute(
-                "INSERT INTO ref_store_core_refs(repository_id, ref_name, oid, revision) VALUES($1, $2, $3, $4)",
-                &[&repo.repository_id, ref_name, oid, &repo.gate_revision],
-            )
-            .await
-            .map_err(pg_err)?;
-        }
-        if repo.storage_backend == "pg_refstore" {
-            tx.execute(
-                "INSERT INTO ref_store_serving_repositories(repository_id, owner_id, name, object_format, history_incarnation, authority_epoch, group_epoch, backend_identity, state) \
-                 VALUES($1, $2, $3, $4, $5, $6, $7, $8, 'pending')",
-                &[
-                    &repo.repository_id,
-                    &repo.tenant_id,
-                    &repo.name,
-                    &fmt_str,
-                    &inc.new_history_incarnation,
-                    &inc.new_authority_epoch,
-                    &inc.new_group_epoch,
-                    &manifest.blob_closure.backend_identity,
-                ],
-            )
-            .await
-            .map_err(pg_err)?;
-            tx.execute(
-                "UPDATE ref_store_serving_repositories SET state = 'ready' WHERE repository_id = $1",
-                &[&repo.repository_id],
-            )
-            .await
-            .map_err(pg_err)?;
-        }
-        tx.execute("UPDATE repositories SET state = 'ready' WHERE id = $1", &[&repo.repository_id])
-            .await
-            .map_err(pg_err)?;
-        tx.execute(
-            "INSERT INTO pando_retention_roots(id, authority_id, tenant_id, repository_id, root_kind, state, restore_generation, external_lsn, note) \
-             VALUES($1, $2, $3, $4, 'backup_snapshot', 'active', $5, $6, $7)",
-            &[
-                &Uuid::new_v4(),
-                &inc.new_storage_authority_id,
-                &repo.tenant_id,
-                &repo.repository_id,
-                &restore_gen,
-                &manifest.pg_cutpoint.wal_lsn,
-                &format!("restored-from-backup-{}", manifest.backup_id),
-            ],
-        )
-        .await
-        .map_err(pg_err)?;
-    }
-
-    for cur in &manifest.pg_cutpoint.projection_cursors {
-        tx.execute(
-            "INSERT INTO ref_cas_projection_cursors(group_id, history_incarnation, group_epoch, applied_event_seq, applied_log_index, applied_log_term, last_event_id, stream_state) \
-             VALUES($1, $2, $3, $4, $5, $6, $7, 'active')",
-            &[
-                &cur.group_id,
-                &inc.new_history_incarnation,
-                &inc.new_group_epoch,
-                &cur.applied_event_seq,
-                &cur.applied_log_index,
-                &cur.applied_log_term,
-                &cur.last_event_id,
-            ],
-        )
-        .await
-        .map_err(pg_err)?;
-    }
-
-    tx.commit().await.map_err(pg_err)?;
-    Ok(())
-}
-
-/// Fail-closed SQL check rejecting pre-backup incarnation credentials or stale deleter leases against PG 17.
-pub async fn verify_pg_live_incarnation(
-    client: &Client,
-    repository_id: Uuid,
-    grant: &WriterGrantTicket,
-    deleter: Option<&DeleterLeaseTicket>,
-) -> Result<(), PairedBackupError> {
-    let cluster_inc: Uuid = client
-        .query_one("SELECT incarnation FROM cluster_authority WHERE singleton = true", &[])
-        .await
-        .map_err(pg_err)?
-        .get(0);
-    if grant.cluster_incarnation != cluster_inc {
-        return Err(PairedBackupError::StaleIncarnation {
-            field: "cluster_incarnation",
-            expected: cluster_inc.to_string(),
-            got: grant.cluster_incarnation.to_string(),
-        });
-    }
-    let gate_row = client
-        .query_one(
-            "SELECT history_incarnation, authority_epoch, group_epoch FROM ref_store_core_gates WHERE repository_id = $1",
-            &[&repository_id],
-        )
-        .await
-        .map_err(pg_err)?;
-    let (live_hist, live_auth_e, live_grp_e): (Uuid, i64, i64) = (gate_row.get(0), gate_row.get(1), gate_row.get(2));
-    if grant.history_incarnation != live_hist || grant.authority_epoch < live_auth_e || grant.group_epoch < live_grp_e {
-        return Err(PairedBackupError::StaleGrantRefused("grant incarnation/epoch behind live PG gate"));
-    }
-    if let Some(del) = deleter {
-        let auth_row = client
-            .query_one(
-                "SELECT authority_id, generation, remote_delete_fenced FROM pando_storage_authorities WHERE singleton = true",
-                &[],
-            )
-            .await
-            .map_err(pg_err)?;
-        let (aid, auth_gen, fenced): (Uuid, i64, bool) = (auth_row.get(0), auth_row.get(1), auth_row.get(2));
-        if fenced
-            || del.storage_authority_id != aid
-            || del.storage_generation < auth_gen
-            || del.cluster_incarnation != cluster_inc
-        {
-            return Err(PairedBackupError::StaleDeleterRefused(
-                "deleter authority/generation/cluster_incarnation rejected by PG",
-            ));
-        }
-    }
-    Ok(())
 }

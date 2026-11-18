@@ -175,6 +175,16 @@ impl CloseScopeBarrierReceipt {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedPackPairSpec {
+    pub pack_id: Uuid,
+    pub pack_sha256: String,
+    pub pack_bytes: u64,
+    pub idx_sha256: String,
+    pub idx_bytes: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupRetentionHoldRecord {
@@ -185,6 +195,7 @@ pub struct BackupRetentionHoldRecord {
     pub pin_generation: i64,
     pub root_id: Uuid,
     pub hold_ids: Vec<Uuid>,
+    pub pack_set_digest: String,
     pub raft_log_index: u64,
 }
 
@@ -228,6 +239,7 @@ pub struct PgCutpointProof {
     pub source_storage_authority_id: Uuid,
     pub source_storage_generation: i64,
     pub remote_delete_fenced: bool,
+    pub max_decision_scope_version: i64,
     pub pending_decisions_count: i64,
     pub pending_outbox_count: i64,
     pub projection_cursors: Vec<PgProjectionCursorCut>,
@@ -243,8 +255,22 @@ impl PgCutpointProof {
     }
 
     pub fn verify(&self) -> Result<(), PairedBackupError> {
-        if self.wal_lsn.is_empty() || self.snapshot_tx.is_empty() || !self.remote_delete_fenced {
-            return Err(PairedBackupError::IncompleteCut("PG cutpoint missing LSN/snapshot or unfenced deleter"));
+        if self.wal_lsn.is_empty()
+            || self.snapshot_tx.is_empty()
+            || !self.remote_delete_fenced
+            || self.max_decision_scope_version < 0
+            || self.projection_cursors.is_empty()
+        {
+            return Err(PairedBackupError::IncompleteCut(
+                "PG cutpoint missing LSN/snapshot/cursors, negative scope version, or unfenced deleter",
+            ));
+        }
+        for c in &self.projection_cursors {
+            if c.group_epoch <= 0 || c.history_incarnation.is_nil() || c.stream_state != "active" {
+                return Err(PairedBackupError::CutpointSkew(
+                    "PG projection cursor has invalid group_epoch, nil incarnation, or non-active stream".into(),
+                ));
+            }
         }
         if self.pending_decisions_count != 0 || self.pending_outbox_count != 0 {
             return Err(PairedBackupError::UnknownInFlightOperations(
@@ -265,6 +291,7 @@ impl PgCutpointProof {
 #[serde(deny_unknown_fields)]
 pub struct RaftCutpointProof {
     pub group_id: i64,
+    pub group_epochs: BTreeMap<i64, i64>,
     pub applied_log_id: AppliedLogId,
     pub logical_clock_floor: u64,
     pub state_digest: String,

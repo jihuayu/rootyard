@@ -11,6 +11,7 @@ on:
       - 'src/maintenance/paired_raft_backup.rs'
       - 'src/maintenance/paired_raft_backup/**'
       - 'tests/paired_raft_backup_restore.rs'
+      - 'tests/paired_raft_backup_support/**'
       - 'scripts/eval_paired_raft_backup.py'
       - 'tests/test_paired_raft_backup_contracts.py'
       - 'docs/paired-raft-backup-restore.md'

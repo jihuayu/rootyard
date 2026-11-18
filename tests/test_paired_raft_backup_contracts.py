@@ -18,6 +18,7 @@ RUST_FILES = [
     ROOT / "src" / "maintenance" / "paired_raft_backup.rs",
     *sorted(MOD_DIR.glob("*.rs")),
     ROOT / "tests" / "paired_raft_backup_restore.rs",
+    *sorted((ROOT / "tests" / "paired_raft_backup_support").glob("*.rs")),
 ]
 WORKFLOW = ROOT / ".github" / "workflows" / "paired-raft-backup.yml"
 DOC = ROOT / "docs" / "paired-raft-backup-restore.md"
@@ -34,6 +35,10 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         self.assertIn("pub mod paired_raft_backup;", facade_text)
         self.assertNotIn('#[path = "maintenance/paired_raft_backup.rs"]', facade_text)
         self.assertFalse(list((ROOT / "src" / "maintenance").rglob("mod.rs")))
+        self.assertFalse(list((ROOT / "tests" / "paired_raft_backup_support").rglob("mod.rs")))
+
+        mod_facade_lines = (ROOT / "src" / "maintenance" / "paired_raft_backup.rs").read_text(encoding="utf-8").splitlines()
+        self.assertLess(len(mod_facade_lines), 100)
 
         for path in RUST_FILES:
             with self.subTest(file=path.relative_to(ROOT).as_posix()):
@@ -44,12 +49,12 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
                 self.assertLess(len(lines), 500, f"{path.name} has {len(lines)} lines (must stay < 500)")
                 self.assertNotIn("#[allow(", text, f"lint suppression forbidden in {path.name}")
                 for match in re.finditer(
-                    r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*pub struct (\w+)",
+                    r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*(?:pub\s+)?struct (\w+)",
                     text,
                 ):
                     self.assertIn("deny_unknown_fields", match.group(0), f"{match.group(1)} missing deny_unknown_fields")
 
-    def test_paired_protocol_enforces_freeze_close_incarnation_and_s3_connection_close(self) -> None:
+    def test_paired_protocol_enforces_freeze_close_closure_bind_incarnation_and_s3_close(self) -> None:
         types_src = (MOD_DIR / "types.rs").read_text(encoding="utf-8")
         for token in (
             "IncompleteCut",
@@ -66,8 +71,29 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             "StaleGrantRefused",
             "StaleDecisionRefused",
             "StaleDeleterRefused",
+            "ExpectedPackPairSpec",
+            "max_decision_scope_version",
         ):
             self.assertIn(token, types_src)
+
+        barrier_src = (MOD_DIR / "raft_barrier.rs").read_text(encoding="utf-8")
+        for token in (
+            "DurableRaftBackend",
+            "WalSyncedRaftBackend",
+            "DurableFreezeBarrierProof",
+            "SealedArchiveReceipt",
+            "sync_data",
+        ):
+            self.assertIn(token, barrier_src)
+
+        bind_src = (MOD_DIR / "closure_bind.rs").read_text(encoding="utf-8")
+        for token in (
+            "compute_canonical_pack_set_digest",
+            "verify_cursor_group_epochs",
+            "verify_blob_closure_against_durable_raft",
+            "verify_registration_spec_completeness",
+        ):
+            self.assertIn(token, bind_src)
 
         freeze_src = (MOD_DIR / "freeze_drain.rs").read_text(encoding="utf-8")
         for token in (
@@ -76,26 +102,38 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             "AcquireHoldBatch",
             "RegisterRoot",
             "unfreeze_after_backup",
+            "SealedArchiveReceipt",
+            "verify_backup_archive",
         ):
             self.assertIn(token, freeze_src)
 
         backup_src = (MOD_DIR / "backup.rs").read_text(encoding="utf-8")
         self.assertIn("IsolationLevel::RepeatableRead", backup_src)
+        self.assertIn("verify_blob_closure_against_durable_raft", backup_src)
+        self.assertIn("verify_cursor_group_epochs", backup_src)
 
-        pg_src = (MOD_DIR / "pg_cutpoint.rs").read_text(encoding="utf-8")
+        pg_src = (MOD_DIR / "pg_cutpoint.rs").read_text(encoding="utf-8") + (
+            MOD_DIR / "pg_restore_admission.rs"
+        ).read_text(encoding="utf-8")
         for token in (
             "capture_pg_cutpoint_in_tx",
             "pando_storage_authorities",
             "pando_retention_roots",
             "ref_cas_projection_cursors",
             "ref_store_serving_repositories",
+            "ref_store_decision_scopes",
+            "verify_pg_restored_cursors",
         ):
             self.assertIn(token, pg_src)
 
-        it_src = (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8")
+        it_src = (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8") + (
+            ROOT / "tests" / "paired_raft_backup_support" / "fixture.rs"
+        ).read_text(encoding="utf-8")
         self.assertIn("RETRY_MAX_TIMES=3", it_src)
         self.assertIn("header::CONNECTION", it_src)
         self.assertIn('"close"', it_src)
+        self.assertIn("missing_whole_pack_pair_and_single_side_closure_regressions", it_src)
+        self.assertIn("durable_wal_barrier_and_sealing_receipt_freeze_thaw_regressions", it_src)
 
     def test_workflow_contract_and_doc_links(self) -> None:
         raw_wf = WORKFLOW.read_bytes()
@@ -116,6 +154,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
                 "src/maintenance/paired_raft_backup.rs",
                 "src/maintenance/paired_raft_backup/**",
                 "tests/paired_raft_backup_restore.rs",
+                "tests/paired_raft_backup_support/**",
                 "scripts/eval_paired_raft_backup.py",
                 "docs/paired-raft-backup-restore.md",
             ):

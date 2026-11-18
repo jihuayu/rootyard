@@ -13,21 +13,23 @@ use uuid::Uuid;
 use crate::blob_store::capacity_contract::git_ops::{UploadScope, upload_pack_pair};
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::core::state_machine::{
-    AppliedLogId, CommitRefsCommand, InitializeGateCommand, RefCasCommand, RefCasStateMachine, RepositoryLane,
-    SmPackMode, WireCommitRefsRequest, WireGateInit,
+    CommitRefsCommand, InitializeGateCommand, RefCasCommand, RefCasStateMachine, RepositoryLane, SmPackMode,
+    WireCommitRefsRequest, WireGateInit,
 };
 use crate::ref_store::{
     CommitMode, CommitRefsRequest, CoreGateInit, HeadUpdate, IssuerLane, RefName, RefPrecondition, RefTarget, RefUpdate,
 };
 
-use super::backup::stream_sha256_file;
+use super::backup::{reconcile_pg_raft_repositories, stream_sha256_file};
+use super::closure_bind::{verify_blob_closure_against_durable_raft, verify_cursor_group_epochs};
 use super::freeze_drain::{RepoBackupRegistrationSpec, TriPartyBackupCoordinator};
 use super::git_verify::verify_bare_repo_from_blobs;
-use super::pg_cutpoint::install_restored_pg_incarnation;
+use super::pg_restore_admission::{install_restored_pg_incarnation, verify_pg_restored_cursors};
+use super::raft_barrier::{DurableRaftBackend, WalSyncedRaftBackend};
 use super::types::{
-    COMPLETE_MARKER, DecisionExecutionTicket, DeleterLeaseTicket, MANIFEST_FILE, MAX_MANIFEST_BYTES,
-    NewIncarnationAuthority, PAIRED_BACKUP_FORMAT_V1, PairedBackupError, PairedBackupManifest, RestoreOutcome,
-    WriterGrantTicket,
+    COMPLETE_MARKER, DecisionExecutionTicket, DeleterLeaseTicket, ExpectedPackPairSpec, MANIFEST_FILE,
+    MAX_MANIFEST_BYTES, NewIncarnationAuthority, PAIRED_BACKUP_FORMAT_V1, PairedBackupError, PairedBackupManifest,
+    RestoreOutcome, WriterGrantTicket,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -103,8 +105,8 @@ impl IncarnationAdmissionGuard {
     }
 }
 
-/// Strictly verify `COMPLETE` seal, manifest integrity, PG <-> Raft cutpoint reconciliation,
-/// scope close receipts, backup holds, and every archived Blob member SHA-256 + byte length.
+/// Strictly verify `COMPLETE` seal, manifest integrity, PG <-> Raft `group_epoch` + index cutpoint,
+/// scope close receipts, complete durable hold/root/pin Blob closure, and archived Blob SHA-256s.
 pub fn verify_backup_archive(
     source: &Path,
     expected_backend_identity: Option<&str>,
@@ -162,28 +164,21 @@ pub fn verify_backup_archive(
     if raft.close_receipts.is_empty() || raft.backup_holds.is_empty() {
         return Err(PairedBackupError::IncompleteCut("manifest missing close barrier receipts or backup holds"));
     }
-    for r in &raft.close_receipts {
-        r.verify()?;
-        if r.raft_log_index > raft.applied_log_id.index || r.raft_log_term != raft.applied_log_id.term {
-            return Err(PairedBackupError::CutpointSkew(
-                "close receipt Raft index/term disagrees with snapshot".into(),
-            ));
-        }
-    }
 
-    let expected_seq = raft.snapshot.body.next_event_seq.saturating_sub(1) as i64;
-    let cursor = manifest
-        .pg_cutpoint
-        .projection_cursors
-        .iter()
-        .find(|c| c.group_id == raft.group_id)
-        .ok_or_else(|| PairedBackupError::CutpointSkew("missing PG cursor for backed-up Raft group".into()))?;
-    if cursor.applied_log_index != raft.applied_log_id.index as i64
-        || cursor.applied_log_term != raft.applied_log_id.term as i64
-        || cursor.applied_event_seq != expected_seq
-    {
-        return Err(PairedBackupError::CutpointSkew("PG projection cursor skewed from Raft snapshot index".into()));
-    }
+    verify_cursor_group_epochs(
+        &manifest.pg_cutpoint,
+        &raft.snapshot,
+        raft.group_id,
+        &raft.group_epochs,
+        raft.applied_log_id,
+    )?;
+    reconcile_pg_raft_repositories(&manifest.pg_cutpoint, &raft.snapshot, raft.applied_log_id, &raft.close_receipts)?;
+    verify_blob_closure_against_durable_raft(
+        &raft.snapshot,
+        &raft.backup_holds,
+        &manifest.blob_closure.entries,
+        &manifest.pg_cutpoint.repositories,
+    )?;
 
     for entry in &manifest.blob_closure.entries {
         if entry.backend_identity != manifest.blob_closure.backend_identity {
@@ -207,8 +202,8 @@ pub fn verify_backup_archive(
 }
 
 /// Clean-room restore creating a strictly fresh incarnation (`history_incarnation`,
-/// `cluster_incarnation`, bumped epochs & authz_floor), uploading verified blobs into `target_store`,
-/// checking real `git clone` + `git fsck --full --strict`, and returning fresh `RefCasStateMachine`.
+/// `cluster_incarnation`, bumped epochs & `authz_floor`), uploading verified blobs into `target_store`,
+/// checking real `git clone` + `git fsck --full --strict`, and committing via fsynced WAL.
 pub async fn restore_new_incarnation(
     source: &Path,
     work_dir: &Path,
@@ -244,8 +239,22 @@ pub async fn restore_new_incarnation(
     }
 
     let max_auth_e = manifest.pg_cutpoint.repositories.iter().map(|r| r.authority_epoch).max().unwrap_or(1);
-    let max_grp_e = manifest.pg_cutpoint.repositories.iter().map(|r| r.group_epoch).max().unwrap_or(1);
-    let max_floor = manifest.raft_cutpoint.close_receipts.iter().map(|r| r.authz_floor).max().unwrap_or(1);
+    let max_grp_e = manifest
+        .pg_cutpoint
+        .repositories
+        .iter()
+        .map(|r| r.group_epoch)
+        .chain(manifest.raft_cutpoint.group_epochs.values().copied())
+        .max()
+        .unwrap_or(1);
+    let max_floor = manifest
+        .raft_cutpoint
+        .close_receipts
+        .iter()
+        .map(|r| r.authz_floor)
+        .max()
+        .unwrap_or(1)
+        .max(manifest.pg_cutpoint.max_decision_scope_version);
     let mut fenced_inc = BTreeSet::from([
         manifest.pg_cutpoint.source_cluster_incarnation,
         manifest.pg_cutpoint.source_storage_authority_id,
@@ -288,8 +297,11 @@ pub async fn restore_new_incarnation(
         }
     }
 
-    let mut new_sm = RefCasStateMachine::new();
-    let mut log_idx = 0u64;
+    let wal_path = work_dir.join("restored-raft.wal");
+    if wal_path.exists() {
+        fs::remove_file(&wal_path)?;
+    }
+    let mut wal_raft = WalSyncedRaftBackend::open(&wal_path, 1)?;
     let mut specs = Vec::with_capacity(manifest.pg_cutpoint.repositories.len());
 
     for repo in &manifest.pg_cutpoint.repositories {
@@ -297,9 +309,8 @@ pub async fn restore_new_incarnation(
             PairedBackupError::BlobClosureIncomplete(format!("missing packs for repo {}", repo.repository_id))
         })?;
         let mut pairs = Vec::with_capacity(pack_map.len());
-        let mut pack_digests = Vec::new();
-        let mut hold_specs = Vec::new();
-        for (p, i) in pack_map.values() {
+        let mut expected_packs = Vec::with_capacity(pack_map.len());
+        for (&pack_id, (p, i)) in pack_map {
             let (pe, pp) =
                 p.as_ref().ok_or_else(|| PairedBackupError::BlobClosureIncomplete("missing .pack in repo".into()))?;
             let (ie, ip) =
@@ -336,9 +347,13 @@ pub async fn restore_new_incarnation(
             }
             restored_blobs += 2;
             pairs.push((pp.clone(), ip.clone()));
-            pack_digests.push(pe.sha256.clone());
-            let decl = i64::try_from(pe.length.max(1)).unwrap_or(i64::MAX);
-            hold_specs.push((pe.sha256.clone(), decl, 512));
+            expected_packs.push(ExpectedPackPairSpec {
+                pack_id,
+                pack_sha256: pe.sha256.clone(),
+                pack_bytes: pe.length,
+                idx_sha256: ie.sha256.clone(),
+                idx_bytes: ie.length,
+            });
         }
 
         let repo_work = work_dir.join(repo.repository_id.to_string());
@@ -363,18 +378,12 @@ pub async fn restore_new_incarnation(
             RefName::branch(&head_branch).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?,
         )
         .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-        log_idx += 1;
-        new_sm
-            .apply(
-                AppliedLogId { term: 1, index: log_idx },
-                RefCasCommand::InitializeGate(InitializeGateCommand {
-                    gate: WireGateInit::from(&init),
-                    pack_mode: SmPackMode::MetadataOnly,
-                    lane: RepositoryLane::ServingRefStore,
-                    authz_floor: inc.new_authz_floor,
-                }),
-            )
-            .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+        wal_raft.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
+            gate: WireGateInit::from(&init),
+            pack_mode: SmPackMode::MetadataOnly,
+            lane: RepositoryLane::ServingRefStore,
+            authz_floor: inc.new_authz_floor,
+        }))?;
 
         let mut updates = Vec::with_capacity(repo.refs.len());
         for (k, v) in &repo.refs {
@@ -400,19 +409,13 @@ pub async fn restore_new_incarnation(
             updates,
         )
         .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-        log_idx += 1;
-        new_sm
-            .apply(
-                AppliedLogId { term: 1, index: log_idx },
-                RefCasCommand::CommitRefs(CommitRefsCommand {
-                    request: WireCommitRefsRequest::from(&req),
-                    decision_id: None,
-                    required_holds: Vec::new(),
-                    policy_rejects: BTreeMap::new(),
-                    logical_tick: inc.new_authz_floor as u64,
-                }),
-            )
-            .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+        wal_raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
+            request: WireCommitRefsRequest::from(&req),
+            decision_id: None,
+            required_holds: Vec::new(),
+            policy_rejects: BTreeMap::new(),
+            logical_tick: inc.new_authz_floor as u64,
+        }))?;
 
         specs.push(RepoBackupRegistrationSpec {
             repository_id: repo.repository_id,
@@ -425,15 +428,17 @@ pub async fn restore_new_incarnation(
             authority_id: inc.new_storage_authority_id,
             authority_generation: inc.new_storage_generation,
             backend_identity: target_backend.to_owned(),
-            pack_digests,
-            hold_specs,
+            expected_packs,
         });
     }
 
     let coord = TriPartyBackupCoordinator::new(inc.new_deleter_epoch.saturating_sub(1), 0);
+    let mut restore_receipts = Vec::new();
     for spec in &specs {
-        coord.register_backup_closure_hold(&mut new_sm, 1, &mut log_idx, spec)?;
+        coord.register_backup_closure_hold(&mut wal_raft, spec, &mut restore_receipts)?;
     }
+    let (durable_snap, _) = wal_raft.durable_state()?;
+    durable_snap.verify_integrity().map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
 
     let guard = IncarnationAdmissionGuard { live: inc.clone() };
     let outcome = RestoreOutcome {
@@ -442,12 +447,13 @@ pub async fn restore_new_incarnation(
         restored_blobs,
         reused_blobs: 0,
         git_verified_refs,
-        incarnation: inc.clone(),
+        incarnation: inc,
     };
-    Ok((outcome, new_sm, guard))
+    Ok((outcome, wal_raft.into_state_machine(), guard))
 }
 
-/// Clean-room restore also persisting new-incarnation state into PostgreSQL 17.
+/// Clean-room restore also persisting new-incarnation state, `authz_floor` scopes,
+/// and verified `group_epoch` cursors into PostgreSQL 17.
 pub async fn restore_new_incarnation_with_pg(
     source: &Path,
     work_dir: &Path,
@@ -458,6 +464,16 @@ pub async fn restore_new_incarnation_with_pg(
 ) -> Result<(RestoreOutcome, RefCasStateMachine, IncarnationAdmissionGuard), PairedBackupError> {
     let manifest = verify_backup_archive(source, scope.expected_backend_identity.as_deref())?;
     let (outcome, sm, guard) = restore_new_incarnation(source, work_dir, target_store, scope, deadline).await?;
-    install_restored_pg_incarnation(pg_client, &manifest, &outcome.incarnation).await?;
+    let restored_snap = sm.snapshot().map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+    install_restored_pg_incarnation(
+        pg_client,
+        &manifest,
+        &outcome.incarnation,
+        manifest.raft_cutpoint.group_id,
+        &restored_snap,
+    )
+    .await?;
+    let expected_group_ids: Vec<i64> = manifest.pg_cutpoint.projection_cursors.iter().map(|c| c.group_id).collect();
+    verify_pg_restored_cursors(pg_client, &expected_group_ids, manifest.raft_cutpoint.group_id, &restored_snap).await?;
     Ok((outcome, sm, guard))
 }

@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use uuid::Uuid;
 
-use crate::ref_store::contract::RequestDigest;
+use crate::ref_store::contract::{MetadataPinPurpose, RequestDigest};
 use crate::ref_store::core::state_machine::{
-    AppliedLogId, BeginOperationCommand, CommitRefsCommand, InitializeGateCommand, RefCasCommand, RefCasStateMachine,
+    BeginOperationCommand, CommitRefsCommand, CreateSnapshotPinCommand, InitializeGateCommand, RefCasCommand,
     RepositoryLane, ScopeLifecycle, SmPackMode, WireCommitRefsRequest, WireGateInit, WireOperationIdentity,
 };
 use crate::ref_store::{
@@ -12,29 +12,34 @@ use crate::ref_store::{
     RefPrecondition, RefTarget, RefUpdate,
 };
 
+use super::closure_bind::verify_cursor_group_epochs;
 use super::freeze_drain::{InFlightOperation, RepoBackupRegistrationSpec, TriPartyBackupCoordinator};
 use super::git_verify::{seed_commit_pack, verify_bare_repo_from_blobs};
+use super::raft_barrier::{DurableRaftBackend, WalSyncedRaftBackend};
 use super::restore::IncarnationAdmissionGuard;
 use super::types::{
     BlobArtifactEntry, BlobClosureManifest, CloseScopeBarrierReceipt, DecisionExecutionTicket, DeleterLeaseTicket,
-    FreezePartyStatus, NewIncarnationAuthority, PAIRED_BACKUP_FORMAT_V1, PairedBackupError, PairedBackupManifest,
+    ExpectedPackPairSpec, NewIncarnationAuthority, PAIRED_BACKUP_FORMAT_V1, PairedBackupError, PairedBackupManifest,
     PgCutpointProof, PgProjectionCursorCut, PgRepositoryRowProof, RaftCutpointProof, WriterGrantTicket,
     sha256_json_tagged,
 };
 
-fn seed_open_sm(repo: Uuid, tenant: Uuid, issuer: Uuid, history: Uuid) -> (RefCasStateMachine, u64, String, String) {
-    let mut sm = RefCasStateMachine::new();
+fn seed_wal_raft(
+    wal_path: &std::path::Path,
+    repo: Uuid,
+    tenant: Uuid,
+    issuer: Uuid,
+    history: Uuid,
+) -> (WalSyncedRaftBackend, String, ExpectedPackPairSpec) {
+    let mut raft = WalSyncedRaftBackend::open(wal_path, 1).expect("open wal");
     let head = RefName::branch("refs/heads/main").expect("branch");
     let init = CoreGateInit::new(repo, tenant, GitObjectFormat::Sha256, history, 2, 3, head).expect("gate");
-    sm.apply(
-        AppliedLogId { term: 1, index: 1 },
-        RefCasCommand::InitializeGate(InitializeGateCommand {
-            gate: WireGateInit::from(&init),
-            pack_mode: SmPackMode::MetadataOnly,
-            lane: RepositoryLane::ServingRefStore,
-            authz_floor: 5,
-        }),
-    )
+    raft.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
+        gate: WireGateInit::from(&init),
+        pack_mode: SmPackMode::MetadataOnly,
+        lane: RepositoryLane::ServingRefStore,
+        authz_floor: 5,
+    }))
     .expect("init gate");
 
     let commit_hex = "a".repeat(64);
@@ -46,7 +51,7 @@ fn seed_open_sm(repo: Uuid, tenant: Uuid, issuer: Uuid, history: Uuid) -> (RefCa
         repo,
         tenant,
         issuer,
-        lane.clone(),
+        lane,
         1,
         Uuid::new_v4(),
         GitObjectFormat::Sha256,
@@ -59,51 +64,76 @@ fn seed_open_sm(repo: Uuid, tenant: Uuid, issuer: Uuid, history: Uuid) -> (RefCa
         vec![upd],
     )
     .expect("req");
-    sm.apply(
-        AppliedLogId { term: 1, index: 2 },
-        RefCasCommand::CommitRefs(CommitRefsCommand {
-            request: WireCommitRefsRequest::from(&req),
-            decision_id: None,
-            required_holds: Vec::new(),
-            policy_rejects: BTreeMap::new(),
-            logical_tick: 10,
-        }),
-    )
+    raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
+        request: WireCommitRefsRequest::from(&req),
+        decision_id: None,
+        required_holds: Vec::new(),
+        policy_rejects: BTreeMap::new(),
+        logical_tick: 10,
+    }))
     .expect("commit");
-    let _ = lane;
-    (sm, 2, commit_hex, RequestDigest::of("pack-digest", &[repo.as_bytes()]).as_hex())
+    let pair = ExpectedPackPairSpec {
+        pack_id: Uuid::new_v4(),
+        pack_sha256: RequestDigest::of("pack-sha", &[repo.as_bytes()]).as_hex(),
+        pack_bytes: 2048,
+        idx_sha256: RequestDigest::of("idx-sha", &[repo.as_bytes()]).as_hex(),
+        idx_bytes: 512,
+    };
+    (raft, commit_hex, pair)
 }
 
 #[test]
-fn tri_party_freeze_enforces_unknown_drain_and_holds_before_unfreeze() {
+fn tri_party_freeze_requires_durable_wal_quorum_and_complete_pin_closure() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let (repo, tenant, issuer, history, auth_id) =
         (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    let (mut sm, mut log_idx, _commit_hex, pack_digest) = seed_open_sm(repo, tenant, issuer, history);
+    let (mut raft, _commit_hex, pair1) = seed_wal_raft(&dir.path().join("raft.wal"), repo, tenant, issuer, history);
+
+    let extra_pack_sha = RequestDigest::of("extra-pinned-pack", &[tenant.as_bytes()]).as_hex();
+    let gate_digest = raft
+        .durable_state_machine()
+        .read_gate_version(repo)
+        .expect("read gate")
+        .expect("gate exists")
+        .digest()
+        .as_hex();
+    raft.commit_and_apply(RefCasCommand::CreateSnapshotPin(CreateSnapshotPinCommand {
+        request_id: Uuid::new_v4(),
+        repository_id: repo,
+        tenant_id: tenant,
+        owner_id: tenant,
+        purpose: MetadataPinPurpose::ReadView,
+        snapshot_id: Uuid::new_v4(),
+        pin_id: Uuid::new_v4(),
+        object_format: GitObjectFormat::Sha256,
+        history_incarnation: history,
+        authority_epoch: 2,
+        group_epoch: 3,
+        expected_gate_digest: gate_digest,
+        lease_ticks: 600,
+        logical_tick: 11,
+        pack_digests: vec![pair1.pack_sha256.clone(), extra_pack_sha.clone()],
+        request_digest: RequestDigest::of("live-read-pin", &[repo.as_bytes()]).as_hex(),
+    }))
+    .expect("live read pin");
 
     let pending_op = Uuid::new_v4();
     let op_digest = RequestDigest::of("pending-op", &[pending_op.as_bytes()]).as_hex();
     let lane = IssuerLane::new("pack").expect("lane");
-    log_idx += 1;
-    sm.apply(
-        AppliedLogId { term: 1, index: log_idx },
-        RefCasCommand::BeginOperation(BeginOperationCommand {
-            identity: WireOperationIdentity {
-                repository_id: repo,
-                issuer_id: issuer,
-                lane: lane.as_str().to_owned(),
-                sequence: 2,
-                operation_id: pending_op,
-                digest: op_digest.clone(),
-            },
-            logical_tick: 11,
-        }),
-    )
+    raft.commit_and_apply(RefCasCommand::BeginOperation(BeginOperationCommand {
+        identity: WireOperationIdentity {
+            repository_id: repo,
+            issuer_id: issuer,
+            lane: lane.as_str().to_owned(),
+            sequence: 2,
+            operation_id: pending_op,
+            digest: op_digest.clone(),
+        },
+        logical_tick: 12,
+    }))
     .expect("begin op");
 
     let mut coord = TriPartyBackupCoordinator::new(10, 4);
-    assert!(coord.admit_app_write().is_ok());
-    assert!(coord.admit_worker_lease().is_ok());
-    assert!(coord.admit_deleter(10).is_ok());
     coord.track_in_flight(InFlightOperation {
         repository_id: repo,
         issuer_id: issuer,
@@ -115,9 +145,15 @@ fn tri_party_freeze_enforces_unknown_drain_and_holds_before_unfreeze() {
         settled_committed: false,
     });
 
-    assert!(matches!(coord.unfreeze_after_backup(), Err(PairedBackupError::IncompleteCut(_))));
-
-    let specs = vec![RepoBackupRegistrationSpec {
+    let pair2 = ExpectedPackPairSpec {
+        pack_id: Uuid::new_v4(),
+        pack_sha256: extra_pack_sha,
+        pack_bytes: 1024,
+        idx_sha256: RequestDigest::of("extra-pinned-idx", &[tenant.as_bytes()]).as_hex(),
+        idx_bytes: 256,
+    };
+    let backend = RequestDigest::of("backend", &[auth_id.as_bytes()]).as_hex();
+    let incomplete_specs = vec![RepoBackupRegistrationSpec {
         repository_id: repo,
         tenant_id: tenant,
         owner_id: tenant,
@@ -127,39 +163,60 @@ fn tri_party_freeze_enforces_unknown_drain_and_holds_before_unfreeze() {
         group_epoch: 3,
         authority_id: auth_id,
         authority_generation: 1,
-        backend_identity: RequestDigest::of("backend", &[auth_id.as_bytes()]).as_hex(),
-        pack_digests: vec![pack_digest.clone()],
-        hold_specs: vec![(pack_digest, 2048, 512)],
+        backend_identity: backend.clone(),
+        expected_packs: vec![pair1.clone()],
     }];
+    let full_specs =
+        vec![RepoBackupRegistrationSpec { expected_packs: vec![pair1, pair2], ..incomplete_specs[0].clone() }];
 
-    let err = coord.freeze_drain_and_register(&mut sm, 1, &mut log_idx, &specs, 12, false).unwrap_err();
-    assert!(matches!(err, PairedBackupError::UnknownInFlightOperations(1)));
+    assert!(matches!(
+        coord.freeze_drain_and_register(&mut raft, &full_specs, 12, false).unwrap_err(),
+        PairedBackupError::UnknownInFlightOperations(1)
+    ));
+    assert!(!coord.status().app_paused && coord.active_barrier().is_none());
 
-    let receipts = coord.freeze_drain_and_register(&mut sm, 1, &mut log_idx, &specs, 12, true).expect("drain ok");
-    assert_eq!(receipts.len(), 2);
-    for r in &receipts {
-        r.verify().expect("valid receipt");
-        assert_eq!(r.lifecycle, ScopeLifecycle::Closed);
-        assert!(r.open_decision_ids.is_empty());
-        assert!(r.pending_operation_ids.is_empty());
+    raft.set_wal_sync_enabled(false);
+    assert!(matches!(
+        coord.freeze_drain_and_register(&mut raft, &full_specs, 12, true).unwrap_err(),
+        PairedBackupError::FreezeNotHeld(_)
+    ));
+    assert!(!coord.status().app_paused && coord.active_barrier().is_none());
+    raft.set_wal_sync_enabled(true);
+
+    raft.set_quorum_healthy(false);
+    assert!(matches!(
+        coord.freeze_drain_and_register(&mut raft, &full_specs, 12, true).unwrap_err(),
+        PairedBackupError::FreezeNotHeld(_)
+    ));
+    assert!(!coord.status().app_paused && coord.active_barrier().is_none());
+    raft.set_quorum_healthy(true);
+
+    assert!(matches!(
+        coord.freeze_drain_and_register(&mut raft, &incomplete_specs, 12, true).unwrap_err(),
+        PairedBackupError::BlobClosureIncomplete(_)
+    ));
+    assert!(!coord.status().app_paused && coord.active_barrier().is_none());
+
+    let mut fresh_coord = TriPartyBackupCoordinator::new(10, 4);
+    let barrier = fresh_coord.freeze_drain_and_register(&mut raft, &full_specs, 12, true).expect("durable freeze");
+    barrier.verify().expect("barrier valid");
+    assert_eq!(barrier.close_receipts.len(), 2);
+    assert_eq!(barrier.backup_holds[0].hold_ids.len(), 4);
+    for cr in &barrier.close_receipts {
+        assert_eq!(cr.lifecycle, ScopeLifecycle::Closed);
     }
-    assert!(sm.has_cancel_tombstone(repo, pending_op));
-    coord.status().require_frozen().expect("frozen while Raft active");
-    assert!(coord.admit_app_write().is_err());
-    assert!(coord.admit_worker_lease().is_err());
-    assert!(coord.admit_deleter(11).is_err());
-
-    coord.unfreeze_after_backup().expect("unfreeze after holds");
-    assert!(coord.admit_app_write().is_ok());
-    assert!(coord.admit_deleter(10).is_err());
-    assert!(coord.admit_deleter(coord.status().fenced_deleter_epoch).is_ok());
+    assert!(raft.durable_state_machine().has_cancel_tombstone(repo, pending_op));
+    assert!(fresh_coord.admit_app_write().is_err());
+    assert!(fresh_coord.admit_worker_lease().is_err());
+    assert!(fresh_coord.admit_deleter(11).is_err());
 }
 
 #[test]
-fn manifest_digest_tamper_and_incarnation_guard_refuse_stale_credentials() {
+fn manifest_digest_tamper_cursor_group_epoch_and_incarnation_guard_checks() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let (repo, tenant, issuer, history, auth_id) =
         (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    let (mut sm, mut log_idx, commit_hex, pack_digest) = seed_open_sm(repo, tenant, issuer, history);
+    let (mut raft, commit_hex, pair) = seed_wal_raft(&dir.path().join("raft2.wal"), repo, tenant, issuer, history);
     let backend = RequestDigest::of("backend", &[auth_id.as_bytes()]).as_hex();
     let specs = vec![RepoBackupRegistrationSpec {
         repository_id: repo,
@@ -172,12 +229,12 @@ fn manifest_digest_tamper_and_incarnation_guard_refuse_stale_credentials() {
         authority_id: auth_id,
         authority_generation: 1,
         backend_identity: backend.clone(),
-        pack_digests: vec![pack_digest.clone()],
-        hold_specs: vec![(pack_digest.clone(), 4096, 512)],
+        expected_packs: vec![pair.clone()],
     }];
     let mut coord = TriPartyBackupCoordinator::new(3, 1);
-    let receipts = coord.freeze_drain_and_register(&mut sm, 1, &mut log_idx, &specs, 15, true).expect("freeze");
-    let snap = sm.snapshot().expect("snap");
+    let barrier = coord.freeze_drain_and_register(&mut raft, &specs, 15, true).expect("freeze");
+    let (snap, state_digest) = raft.durable_state().expect("durable state");
+    let applied = snap.body.last_applied.expect("applied");
     let refs = BTreeMap::from([("refs/heads/main".to_owned(), commit_hex)]);
 
     let pg = PgCutpointProof {
@@ -189,18 +246,31 @@ fn manifest_digest_tamper_and_incarnation_guard_refuse_stale_credentials() {
         source_storage_authority_id: auth_id,
         source_storage_generation: 1,
         remote_delete_fenced: true,
+        max_decision_scope_version: 18,
         pending_decisions_count: 0,
         pending_outbox_count: 0,
-        projection_cursors: vec![PgProjectionCursorCut {
-            group_id: 1,
-            history_incarnation: history,
-            group_epoch: 3,
-            applied_event_seq: snap.body.next_event_seq.saturating_sub(1) as i64,
-            applied_log_index: log_idx as i64,
-            applied_log_term: 1,
-            last_event_id: None,
-            stream_state: "active".into(),
-        }],
+        projection_cursors: vec![
+            PgProjectionCursorCut {
+                group_id: 1,
+                history_incarnation: history,
+                group_epoch: 3,
+                applied_event_seq: snap.body.next_event_seq.saturating_sub(1) as i64,
+                applied_log_index: applied.index as i64,
+                applied_log_term: applied.term as i64,
+                last_event_id: None,
+                stream_state: "active".into(),
+            },
+            PgProjectionCursorCut {
+                group_id: 2,
+                history_incarnation: Uuid::new_v4(),
+                group_epoch: 7,
+                applied_event_seq: 4,
+                applied_log_index: 4,
+                applied_log_term: 1,
+                last_event_id: None,
+                stream_state: "active".into(),
+            },
+        ],
         repositories: vec![PgRepositoryRowProof {
             repository_id: repo,
             tenant_id: tenant,
@@ -219,25 +289,49 @@ fn manifest_digest_tamper_and_incarnation_guard_refuse_stale_credentials() {
     .seal()
     .expect("seal pg");
 
+    let expected_epochs = BTreeMap::from([(1, 3), (2, 7)]);
+    verify_cursor_group_epochs(&pg, &snap, 1, &expected_epochs, applied).expect("both group_epochs match");
+    let skewed_peer = BTreeMap::from([(1, 3), (2, 8)]);
+    assert!(matches!(
+        verify_cursor_group_epochs(&pg, &snap, 1, &skewed_peer, applied).unwrap_err(),
+        PairedBackupError::CutpointSkew(_)
+    ));
+
     let closure = BlobClosureManifest {
         backend_identity: backend.clone(),
         provider: "s3".into(),
-        total_artifacts: 1,
-        total_bytes: 4096,
-        entries: vec![BlobArtifactEntry {
-            repository_id: repo,
-            tenant_id: tenant,
-            pack_id: Uuid::new_v4(),
-            object_format: GitObjectFormat::Sha256,
-            role: "pack".into(),
-            locator_path: "blobs/pack".into(),
-            archive_rel_path: "blobs/pack".into(),
-            attempt_id: Uuid::new_v4(),
-            generation: 1,
-            length: 4096,
-            sha256: pack_digest,
-            backend_identity: backend,
-        }],
+        total_artifacts: 2,
+        total_bytes: pair.pack_bytes + pair.idx_bytes,
+        entries: vec![
+            BlobArtifactEntry {
+                repository_id: repo,
+                tenant_id: tenant,
+                pack_id: pair.pack_id,
+                object_format: GitObjectFormat::Sha256,
+                role: "pack".into(),
+                locator_path: "blobs/pack".into(),
+                archive_rel_path: "blobs/pack".into(),
+                attempt_id: Uuid::new_v4(),
+                generation: 1,
+                length: pair.pack_bytes,
+                sha256: pair.pack_sha256,
+                backend_identity: backend.clone(),
+            },
+            BlobArtifactEntry {
+                repository_id: repo,
+                tenant_id: tenant,
+                pack_id: pair.pack_id,
+                object_format: GitObjectFormat::Sha256,
+                role: "idx".into(),
+                locator_path: "blobs/idx".into(),
+                archive_rel_path: "blobs/idx".into(),
+                attempt_id: Uuid::new_v4(),
+                generation: 1,
+                length: pair.idx_bytes,
+                sha256: pair.idx_sha256,
+                backend_identity: backend,
+            },
+        ],
         closure_digest: String::new(),
     }
     .seal()
@@ -247,28 +341,19 @@ fn manifest_digest_tamper_and_incarnation_guard_refuse_stale_credentials() {
         format_version: PAIRED_BACKUP_FORMAT_V1.into(),
         backup_id: Uuid::new_v4(),
         created_unix_seconds: 1_760_000_000,
-        freeze: FreezePartyStatus {
-            app_paused: true,
-            worker_paused: true,
-            deleter_fenced: true,
-            consensus_replication_active: true,
-            leader_election_active: true,
-            fenced_deleter_epoch: 4,
-            app_fence_seq: 2,
-            worker_drain_settled: 0,
-            unknown_ops_resolved: 0,
-        },
+        freeze: barrier.status,
         pg_cutpoint: pg.clone(),
         raft_cutpoint: RaftCutpointProof {
             group_id: 1,
-            applied_log_id: AppliedLogId { term: 1, index: log_idx },
-            logical_clock_floor: sm.logical_clock_floor(),
-            state_digest: sm.state_digest().expect("sd"),
+            group_epochs: expected_epochs,
+            applied_log_id: applied,
+            logical_clock_floor: snap.body.logical_clock_floor,
+            state_digest,
             group_membership_digest: "b".repeat(64),
             snapshot_checksum: snap.checksum.clone(),
             snapshot: snap,
-            close_receipts: receipts,
-            backup_holds: coord.registered_holds().to_vec(),
+            close_receipts: barrier.close_receipts,
+            backup_holds: barrier.backup_holds,
         },
         blob_closure: closure,
         paired_cut_digest: String::new(),
@@ -287,10 +372,8 @@ fn manifest_digest_tamper_and_incarnation_guard_refuse_stale_credentials() {
     bad_receipt.authz_floor += 1;
     assert!(bad_receipt.verify().is_err());
 
-    let new_cluster = Uuid::new_v4();
-    let new_auth = Uuid::new_v4();
-    let new_hist = Uuid::new_v4();
-    let fenced_dec = Uuid::new_v4();
+    let (new_cluster, new_auth, new_hist, fenced_dec) =
+        (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let guard = IncarnationAdmissionGuard {
         live: NewIncarnationAuthority {
             new_cluster_incarnation: new_cluster,
@@ -299,13 +382,12 @@ fn manifest_digest_tamper_and_incarnation_guard_refuse_stale_credentials() {
             new_history_incarnation: new_hist,
             new_authority_epoch: 3,
             new_group_epoch: 4,
-            new_authz_floor: 25,
+            new_authz_floor: 28,
             new_deleter_epoch: 5,
             fenced_prior_incarnations: BTreeSet::from([pg.source_cluster_incarnation, history, auth_id]),
             fenced_pre_backup_decision_ids: BTreeSet::from([fenced_dec]),
         },
     };
-
     assert!(
         guard
             .verify_writer_grant(&WriterGrantTicket {
@@ -313,19 +395,19 @@ fn manifest_digest_tamper_and_incarnation_guard_refuse_stale_credentials() {
                 history_incarnation: new_hist,
                 authority_epoch: 3,
                 group_epoch: 4,
-                authz_epoch: 25,
+                authz_epoch: 28,
             })
             .is_ok()
     );
     assert!(matches!(
         guard.verify_writer_grant(&WriterGrantTicket {
-            cluster_incarnation: pg.source_cluster_incarnation,
+            cluster_incarnation: new_cluster,
             history_incarnation: new_hist,
             authority_epoch: 3,
             group_epoch: 4,
-            authz_epoch: 25,
+            authz_epoch: 27,
         }),
-        Err(PairedBackupError::StaleIncarnation { .. })
+        Err(PairedBackupError::StaleGrantRefused(_))
     ));
     assert!(matches!(
         guard.verify_decision_execution(&DecisionExecutionTicket {
@@ -333,7 +415,7 @@ fn manifest_digest_tamper_and_incarnation_guard_refuse_stale_credentials() {
             history_incarnation: new_hist,
             authority_epoch: 3,
             group_epoch: 4,
-            authz_epoch: 25,
+            authz_epoch: 28,
         }),
         Err(PairedBackupError::StaleDecisionRefused(_))
     ));
