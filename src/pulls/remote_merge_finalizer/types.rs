@@ -4,15 +4,15 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::ref_store::core::state_machine::ScopeLifecycle;
 use crate::ref_store::core::types::GitObjectFormat;
 use crate::ref_store::projector::{GrantExpectedRealm, SignedDecisionGrant};
 
-const MERGE_BINDING_DOMAIN: &[u8] = b"rootyard/pulls/remote-merge-binding/v1";
-const REQUIRED_CHECKS_DOMAIN: &[u8] = b"rootyard/pulls/required-checks/v1";
+pub use super::validation::{
+    MergeBindingInputs, compute_merge_binding_digest, compute_observed_checks_digest, compute_required_checks_digest,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RemoteMergeError {
@@ -223,6 +223,7 @@ pub struct PendingMergeRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommittedMergeReceipt {
+    pub attempt_id: Uuid,
     pub operation_id: Uuid,
     pub decision_id: Uuid,
     pub tenant_id: Uuid,
@@ -230,7 +231,10 @@ pub struct CommittedMergeReceipt {
     pub pull_number: i64,
     pub base_ref: String,
     pub previous_base_oid: String,
+    pub expected_head_oid: String,
     pub merged_oid: String,
+    pub pack_sha256: String,
+    pub binding_digest: String,
     pub commit_log_index: u64,
     pub commit_log_term: u64,
     pub gate_revision: i64,
@@ -241,14 +245,83 @@ pub struct CommittedMergeReceipt {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RejectedMergeReceipt {
+    pub attempt_id: Uuid,
     pub operation_id: Uuid,
+    pub decision_id: Uuid,
+    pub tenant_id: Uuid,
     pub repository_id: Uuid,
     pub pull_number: i64,
+    pub base_ref: String,
+    pub expected_base_oid: String,
+    pub expected_head_oid: String,
+    pub candidate_target_oid: String,
+    pub pack_sha256: String,
+    pub binding_digest: String,
     pub commit_log_index: Option<u64>,
     pub commit_log_term: Option<u64>,
     pub state: PullMergeState,
     pub reason: String,
     pub terminal_digest: Option<String>,
+}
+
+impl PendingMergeRecord {
+    pub fn into_committed_receipt(
+        &self,
+        merged_oid: String,
+        commit_log_index: u64,
+        commit_log_term: u64,
+        gate_revision: i64,
+        terminal_digest: String,
+        replayed: bool,
+    ) -> CommittedMergeReceipt {
+        CommittedMergeReceipt {
+            attempt_id: self.attempt_id,
+            operation_id: self.operation_id,
+            decision_id: self.decision_id,
+            tenant_id: self.tenant_id,
+            repository_id: self.repository_id,
+            pull_number: self.pull_number,
+            base_ref: self.base_ref.clone(),
+            previous_base_oid: self.expected_base_oid.clone(),
+            expected_head_oid: self.expected_head_oid.clone(),
+            merged_oid,
+            pack_sha256: self.pack_sha256.clone(),
+            binding_digest: self.facts_digest.clone(),
+            commit_log_index,
+            commit_log_term,
+            gate_revision,
+            terminal_digest,
+            replayed,
+        }
+    }
+
+    pub fn into_rejected_receipt(
+        &self,
+        commit_log_index: Option<u64>,
+        commit_log_term: Option<u64>,
+        reason: String,
+        terminal_digest: Option<String>,
+    ) -> RejectedMergeReceipt {
+        RejectedMergeReceipt {
+            attempt_id: self.attempt_id,
+            operation_id: self.operation_id,
+            decision_id: self.decision_id,
+            tenant_id: self.tenant_id,
+            repository_id: self.repository_id,
+            pull_number: self.pull_number,
+            base_ref: self.base_ref.clone(),
+            expected_base_oid: self.expected_base_oid.clone(),
+            expected_head_oid: self.expected_head_oid.clone(),
+            candidate_target_oid: self.candidate_target_oid.clone(),
+            pack_sha256: self.pack_sha256.clone(),
+            binding_digest: self.facts_digest.clone(),
+            commit_log_index,
+            commit_log_term,
+            state: PullMergeState::RejectedMerge,
+            reason,
+            terminal_digest,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -286,75 +359,6 @@ pub enum MergeFaultInjection {
     DisconnectAfterPendingBeforeCas,
     CoordinatorTimeoutAfterCasBeforeProjection,
     DisconnectDuringProjectionCommit,
-}
-
-pub fn compute_required_checks_digest(required_checks: &[String], min_sequence: i64) -> String {
-    let mut unique: Vec<&str> = required_checks.iter().map(String::as_str).collect();
-    unique.sort_unstable();
-    unique.dedup();
-    let mut h = Sha256::new();
-    h.update(REQUIRED_CHECKS_DOMAIN);
-    h.update([0]);
-    h.update(min_sequence.to_be_bytes());
-    h.update((unique.len() as u64).to_be_bytes());
-    for ctx in unique {
-        h.update((ctx.len() as u64).to_be_bytes());
-        h.update(ctx.as_bytes());
-    }
-    hex::encode(h.finalize())
-}
-
-#[derive(Clone, Debug)]
-pub struct MergeBindingInputs<'a> {
-    pub tenant_id: Uuid,
-    pub repository_id: Uuid,
-    pub pull_number: i64,
-    pub actor_id: Uuid,
-    pub operation_id: Uuid,
-    pub decision_id: Uuid,
-    pub base_ref: &'a str,
-    pub expected_head_oid: &'a str,
-    pub expected_base_oid: &'a str,
-    pub candidate_target_oid: &'a str,
-    pub strategy: MergeStrategy,
-    pub expected_version: i64,
-    pub expected_storage_generation: i64,
-    pub required_checks: &'a [String],
-    pub min_check_sequence: i64,
-    pub authz_epoch: i64,
-    pub pack_sha256: &'a str,
-}
-
-pub fn compute_merge_binding_digest(inputs: &MergeBindingInputs<'_>) -> String {
-    let checks_digest = compute_required_checks_digest(inputs.required_checks, inputs.min_check_sequence);
-    let mut h = Sha256::new();
-    h.update(MERGE_BINDING_DOMAIN);
-    h.update([0]);
-    for id in [inputs.tenant_id, inputs.repository_id, inputs.actor_id, inputs.operation_id, inputs.decision_id] {
-        h.update(id.as_bytes());
-    }
-    for n in [
-        inputs.pull_number,
-        inputs.expected_version,
-        inputs.expected_storage_generation,
-        inputs.min_check_sequence,
-        inputs.authz_epoch,
-    ] {
-        h.update(n.to_be_bytes());
-    }
-    for s in [
-        inputs.base_ref,
-        inputs.expected_head_oid,
-        inputs.expected_base_oid,
-        inputs.candidate_target_oid,
-        inputs.strategy.as_str(),
-        inputs.pack_sha256,
-        &checks_digest,
-    ] {
-        h.update((s.len() as u64).to_be_bytes());
-        h.update(s.as_bytes());
-    }
-    hex::encode(h.finalize())
 }
 
 pub(super) fn sha256_hex_valid(s: &str) -> bool {

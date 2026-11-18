@@ -237,6 +237,7 @@ pub(super) fn build_spec_with_target(
         expected_version: 1,
         expected_storage_generation: 1,
         required_checks: &required_checks,
+        observed_checks: &pull.observed_checks,
         min_check_sequence: 1,
         authz_epoch,
         pack_sha256: &psha,
@@ -369,5 +370,19 @@ async fn fail_closed_checks_head_base_and_revoked_grants_return_named_errors() {
     let mut bad_pack = spec.clone();
     bad_pack.pack_sha256 = hex_digest(0xaa);
     assert!(matches!(prod.execute_merge(&bad_pack, &pull, true, MergeFaultInjection::None).await, Err(RemoteMergeError::RemoteAuthzDenied(_))));
+
+    // Mutated observed_checks (even with passing/trusted check) mismatches signed grant facts_digest.
+    let mut extra_obs = pull.clone();
+    extra_obs.observed_checks.push(CheckRunSnapshot {
+        context: "ci/extra".into(),
+        commit_oid: spec.expected_head_oid.clone(),
+        base_oid: Some(spec.expected_base_oid.clone()),
+        status: "completed".into(),
+        conclusion: Some("success".into()),
+        sequence: 3,
+        attempt: 1,
+        trusted: true,
+    });
+    assert!(matches!(prod.execute_merge(&spec, &extra_obs, true, MergeFaultInjection::None).await, Err(RemoteMergeError::RemoteAuthzDenied(_))));
     assert_eq!(f.backend.read_ref_oid(f.repo_id, "refs/heads/main").await.unwrap(), Some(f.base_oid));
 }

@@ -19,8 +19,8 @@ use crate::ref_store::projector::DecisionGrantKeyring;
 
 use super::projector::{MergeReceiptStore, PullMergeReceiptProjector};
 use super::types::{
-    CommittedMergeReceipt, MergeAttemptOutcome, MergeAttemptSpec, MergeFaultInjection, MergePullSnapshot,
-    PendingMergeRecord, PullMergeState, RejectedMergeReceipt, RemoteMergeError,
+    MergeAttemptOutcome, MergeAttemptSpec, MergeFaultInjection, MergePullSnapshot, PendingMergeRecord,
+    PullMergeState, RemoteMergeError,
 };
 use super::validation::{validate_merge_inputs_and_preconditions, verify_pull_remote_authz_grant};
 
@@ -75,6 +75,21 @@ pub trait MergeAuthorityBackend: Send + Sync {
         repository_id: Uuid,
         ref_name: &'a str,
     ) -> BackendFuture<'a, Option<String>>;
+}
+
+pub fn original_operation_log_id(
+    sm: &RefCasStateMachine,
+    repository_id: Uuid,
+    operation_id: Uuid,
+) -> Option<AppliedLogId> {
+    sm.read_events_since(0, usize::MAX)
+        .into_iter()
+        .find(|ev| {
+            ev.repository_id == repository_id
+                && ev.operation_id == operation_id
+                && (ev.outcome == "committed" || ev.outcome == "rejected")
+        })
+        .map(|ev| AppliedLogId { term: ev.log_term, index: ev.log_index })
 }
 
 /// Deterministic in-process authority backend backed directly by [`RefCasStateMachine`].
@@ -141,12 +156,18 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
             let mut sm = self.sm.lock().unwrap_or_else(|e| e.into_inner());
             match sm.apply(commit_idx, RefCasCommand::CommitScopedRefs(commit)) {
                 Ok(ApplyResponse::RefsCommitted(receipt)) => {
-                    let stored_idx = {
-                        let mut map = self.op_log_ids.lock().unwrap_or_else(|e| e.into_inner());
-                        if receipt.replayed {
-                            *map.get(&(repository_id, op_id)).unwrap_or(&commit_idx)
-                        } else {
-                            map.insert((repository_id, op_id), commit_idx);
+                    let stored_idx = match original_operation_log_id(&sm, repository_id, op_id) {
+                        Some(orig) => {
+                            self.op_log_ids.lock().unwrap_or_else(|e| e.into_inner()).entry((repository_id, op_id)).or_insert(orig);
+                            orig
+                        }
+                        None if receipt.replayed => {
+                            return Err(RemoteMergeError::Equivocation(
+                                "replayed Ref-CAS commit missing original state-machine AppliedLogId".into(),
+                            ));
+                        }
+                        None => {
+                            self.op_log_ids.lock().unwrap_or_else(|e| e.into_inner()).insert((repository_id, op_id), commit_idx);
                             commit_idx
                         }
                     };
@@ -173,13 +194,14 @@ impl MergeAuthorityBackend for InProcessRefCasBackend {
             let lookup = sm
                 .query_operation(repository_id, operation_id)
                 .map_err(|e| RemoteMergeError::RemoteAuthzDenied(e.to_string()))?;
-            let log_id = self
-                .op_log_ids
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&(repository_id, operation_id))
-                .copied()
-                .unwrap_or_else(|| sm.last_applied().unwrap_or(AppliedLogId { term: 1, index: 1 }));
+            let log_id = original_operation_log_id(&sm, repository_id, operation_id).unwrap_or_else(|| {
+                self.op_log_ids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&(repository_id, operation_id))
+                    .copied()
+                    .unwrap_or_else(|| sm.last_applied().unwrap_or(AppliedLogId { term: 1, index: 1 }))
+            });
             match lookup {
                 OperationLookup::Unknown => {
                     if sm.has_cancel_tombstone(repository_id, operation_id) {
@@ -423,37 +445,21 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> PullRemoteMergeProducer
                         spec.candidate_target_oid
                     )));
                 }
-                let receipt = CommittedMergeReceipt {
-                    operation_id: spec.operation_id,
-                    decision_id: spec.decision_id,
-                    tenant_id: spec.tenant_id,
-                    repository_id: spec.repository_id,
-                    pull_number: spec.pull_number,
-                    base_ref: spec.base_ref.clone(),
-                    previous_base_oid: spec.expected_base_oid.clone(),
+                let receipt = pending.into_committed_receipt(
                     merged_oid,
-                    commit_log_index: log_index,
-                    commit_log_term: log_term,
+                    log_index,
+                    log_term,
                     gate_revision,
                     terminal_digest,
                     replayed,
-                };
+                );
                 self.projector
                     .project_committed(&receipt, pending.expected_storage_generation, pending.expected_version, update_forge_pulls)
                     .await?;
                 Ok(MergeAttemptOutcome::Committed(receipt))
             }
             AuthorityCommitOutcome::Cancelled { log_index, log_term, reason } => {
-                let rej = RejectedMergeReceipt {
-                    operation_id: spec.operation_id,
-                    repository_id: spec.repository_id,
-                    pull_number: spec.pull_number,
-                    commit_log_index: log_index,
-                    commit_log_term: log_term,
-                    state: PullMergeState::RejectedMerge,
-                    reason: reason.clone(),
-                    terminal_digest: None,
-                };
+                let rej = pending.into_rejected_receipt(log_index, log_term, reason.clone(), None);
                 self.projector.project_rejected(&rej).await?;
                 Err(RemoteMergeError::RevokedAuthorization(reason))
             }
@@ -465,16 +471,7 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> PullRemoteMergeProducer
                 terminal_digest,
                 reason,
             } => {
-                let rej = RejectedMergeReceipt {
-                    operation_id: spec.operation_id,
-                    repository_id: spec.repository_id,
-                    pull_number: spec.pull_number,
-                    commit_log_index: log_index,
-                    commit_log_term: log_term,
-                    state: PullMergeState::RejectedMerge,
-                    reason: reason.clone(),
-                    terminal_digest,
-                };
+                let rej = pending.into_rejected_receipt(log_index, log_term, reason.clone(), terminal_digest);
                 self.projector.project_rejected(&rej).await?;
                 if matches!(reject_code, CommitRejectCode::OldOidMismatch | CommitRejectCode::RevisionMismatch) {
                     return Err(RemoteMergeError::TargetRefMoved {

@@ -17,23 +17,30 @@ split-brain truth source.
 ## State Machine & Monotonic Lifecycle
 
 Every merge attempt writes a pre-CAS `PendingMerge` durable intent row bound to:
-`(tenant_id, repository_id, pull_number, operation_id, decision_id, expected_base_ref,
+`(attempt_id, tenant_id, repository_id, pull_number, operation_id, decision_id, expected_base_ref,
 expected_head_oid, expected_base_oid, candidate_target_oid, strategy, expected_version,
 expected_storage_generation, authz_epoch, pack_sha256, facts_digest)`.
+Signed grant `facts_digest` binds `compute_merge_binding_digest` including canonical
+`compute_observed_checks_digest` over `observed_checks`, expected head/base OIDs, required
+checks, and `min_check_sequence`.
 
 From `PendingMerge`, attempts transition strictly forward into terminal states:
 
 1. `CommittedMerge`: Ref-CAS applied the scoped ref update at `(log_term, log_index)`.
-   Replaying or re-projecting the same `CommittedMergeReceipt` is idempotent (`replayed: true`)
-   and can never revert to `open`, `rejected`, or `aborted`, nor overwrite `merged_oid`.
+   Replaying or re-projecting the same `CommittedMergeReceipt` is idempotent (`replayed: true`),
+   preserves the original commit `(log_term, log_index)` via `original_operation_log_id`, verifies
+   the full receipt identity tuple (`verify_committed_receipt_tuple`), and can never revert to
+   `open`, `rejected`, or `aborted`, nor overwrite `merged_oid`.
 2. `RejectedMerge`: Ref-CAS terminally rejected the operation or precondition failed before CAS.
-   Leaves `forge_pulls` in `open` without clearing prior committed receipts.
+   Verifies the full rejected tuple (`verify_rejected_receipt_tuple`) and leaves `forge_pulls` in
+   `open` without clearing prior committed receipts.
 3. `AbortedBeforeCas`: Coordinator disconnected, timed out, or recovered when Ref-CAS confirms
    `OperationLookup::Unknown` for `operation_id` after crash.
 
-In PostgreSQL (`PgMergeStore`), `pull_remote_merge_attempts` enforces these transitions via
-`pull_remote_merge_monotonic_trig` under `SET LOCAL synchronous_commit = 'on'`, and only a
-fresh transition to `CommittedMerge` updates `forge_pulls` (`state = 'merged'`).
+In PostgreSQL (`PgMergeStore`), `pull_remote_merge_attempts` enforces full-tuple SQL `WHERE`
+predicates (`ATTEMPT_TUPLE_WHERE`) and `pull_remote_merge_monotonic_trig` under
+`SET LOCAL synchronous_commit = 'on'`, and only a fresh transition to `CommittedMerge` updates
+`forge_pulls` (`state = 'merged'`) after confirming `base_ref`, `head_oid`, and `base_oid`.
 
 ## Fail-Closed Preconditions & Error Contract
 

@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::ref_store::contract::IssuerLane;
@@ -14,9 +15,143 @@ use crate::ref_store::projector::{
 };
 
 use super::types::{
-    MergeAttemptSpec, MergeBindingInputs, MergePullSnapshot, MergeStrategy, RemoteMergeError,
-    compute_merge_binding_digest, oid_valid_for_format, sha256_hex_valid, unique_sorted_checks,
+    CheckRunSnapshot, MergeAttemptSpec, MergePullSnapshot, MergeStrategy, RemoteMergeError, oid_valid_for_format,
+    sha256_hex_valid, unique_sorted_checks,
 };
+
+const MERGE_BINDING_DOMAIN: &[u8] = b"rootyard/pulls/remote-merge-binding/v1";
+const REQUIRED_CHECKS_DOMAIN: &[u8] = b"rootyard/pulls/required-checks/v1";
+const OBSERVED_CHECKS_DOMAIN: &[u8] = b"rootyard/pulls/observed-checks/v1";
+
+fn feed_len_str(h: &mut Sha256, s: &str) {
+    h.update((s.len() as u64).to_be_bytes());
+    h.update(s.as_bytes());
+}
+
+pub fn compute_required_checks_digest(required_checks: &[String], min_sequence: i64) -> String {
+    let mut unique: Vec<&str> = required_checks.iter().map(String::as_str).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    let mut h = Sha256::new();
+    h.update(REQUIRED_CHECKS_DOMAIN);
+    h.update([0]);
+    h.update(min_sequence.to_be_bytes());
+    h.update((unique.len() as u64).to_be_bytes());
+    for ctx in unique {
+        feed_len_str(&mut h, ctx);
+    }
+    hex::encode(h.finalize())
+}
+
+pub fn compute_observed_checks_digest(
+    expected_head_oid: &str,
+    expected_base_oid: &str,
+    required_checks: &[String],
+    min_sequence: i64,
+    observed_checks: &[CheckRunSnapshot],
+) -> String {
+    let mut unique: Vec<&str> = required_checks.iter().map(String::as_str).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    let mut sorted: Vec<&CheckRunSnapshot> = observed_checks.iter().collect();
+    sorted.sort_unstable_by_key(|c| {
+        (
+            c.context.as_str(),
+            c.sequence,
+            c.attempt,
+            c.status.as_str(),
+            c.commit_oid.as_str(),
+            c.conclusion.as_deref().unwrap_or(""),
+            c.base_oid.as_deref().unwrap_or(""),
+            c.trusted,
+        )
+    });
+    let mut h = Sha256::new();
+    h.update(OBSERVED_CHECKS_DOMAIN);
+    h.update([0]);
+    feed_len_str(&mut h, expected_head_oid);
+    feed_len_str(&mut h, expected_base_oid);
+    h.update(min_sequence.to_be_bytes());
+    h.update((unique.len() as u64).to_be_bytes());
+    for ctx in unique {
+        feed_len_str(&mut h, ctx);
+    }
+    h.update((sorted.len() as u64).to_be_bytes());
+    for obs in sorted {
+        for s in [&obs.context, &obs.commit_oid, &obs.status] {
+            feed_len_str(&mut h, s);
+        }
+        for opt in [obs.base_oid.as_deref(), obs.conclusion.as_deref()] {
+            h.update([u8::from(opt.is_some())]);
+            feed_len_str(&mut h, opt.unwrap_or(""));
+        }
+        h.update(obs.sequence.to_be_bytes());
+        h.update(obs.attempt.to_be_bytes());
+        h.update([u8::from(obs.trusted)]);
+    }
+    hex::encode(h.finalize())
+}
+
+#[derive(Clone, Debug)]
+pub struct MergeBindingInputs<'a> {
+    pub tenant_id: Uuid,
+    pub repository_id: Uuid,
+    pub pull_number: i64,
+    pub actor_id: Uuid,
+    pub operation_id: Uuid,
+    pub decision_id: Uuid,
+    pub base_ref: &'a str,
+    pub expected_head_oid: &'a str,
+    pub expected_base_oid: &'a str,
+    pub candidate_target_oid: &'a str,
+    pub strategy: MergeStrategy,
+    pub expected_version: i64,
+    pub expected_storage_generation: i64,
+    pub required_checks: &'a [String],
+    pub min_check_sequence: i64,
+    pub observed_checks: &'a [CheckRunSnapshot],
+    pub authz_epoch: i64,
+    pub pack_sha256: &'a str,
+}
+
+pub fn compute_merge_binding_digest(inputs: &MergeBindingInputs<'_>) -> String {
+    let checks_digest = compute_required_checks_digest(inputs.required_checks, inputs.min_check_sequence);
+    let observed_digest = compute_observed_checks_digest(
+        inputs.expected_head_oid,
+        inputs.expected_base_oid,
+        inputs.required_checks,
+        inputs.min_check_sequence,
+        inputs.observed_checks,
+    );
+    let mut h = Sha256::new();
+    h.update(MERGE_BINDING_DOMAIN);
+    h.update([0]);
+    for id in [inputs.tenant_id, inputs.repository_id, inputs.actor_id, inputs.operation_id, inputs.decision_id] {
+        h.update(id.as_bytes());
+    }
+    for n in [
+        inputs.pull_number,
+        inputs.expected_version,
+        inputs.expected_storage_generation,
+        inputs.min_check_sequence,
+        inputs.authz_epoch,
+    ] {
+        h.update(n.to_be_bytes());
+    }
+    for s in [
+        inputs.base_ref,
+        inputs.expected_head_oid,
+        inputs.expected_base_oid,
+        inputs.candidate_target_oid,
+        inputs.strategy.as_str(),
+        inputs.pack_sha256,
+        &checks_digest,
+        &observed_digest,
+    ] {
+        feed_len_str(&mut h, s);
+    }
+    hex::encode(h.finalize())
+}
 
 #[derive(Clone, Debug)]
 pub struct ValidatedMergeGrant {
@@ -276,6 +411,7 @@ pub fn verify_pull_remote_authz_grant(
         expected_storage_generation: spec.expected_storage_generation,
         required_checks: &pull.required_checks,
         min_check_sequence: pull.min_check_sequence,
+        observed_checks: &pull.observed_checks,
         authz_epoch: p.authz_epoch,
         pack_sha256: &spec.pack_sha256,
     });

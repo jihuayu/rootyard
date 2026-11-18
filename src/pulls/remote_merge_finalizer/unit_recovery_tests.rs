@@ -8,8 +8,7 @@ use crate::ref_store::core::types::GitObjectFormat;
 use super::coordinator::{InProcessRefCasBackend, MergeAuthorityBackend, PullRemoteMergeProducer};
 use super::projector::{MergeReceiptStore, PullMergeReceiptProjector, RecoverablePullMergeFinalizer};
 use super::types::{
-    CommittedMergeReceipt, MergeAttemptOutcome, MergeFaultInjection, ProjectedPullRecord, ProjectionOutcome,
-    PullMergeState, RejectedMergeReceipt, RemoteMergeError,
+    MergeAttemptOutcome, MergeFaultInjection, ProjectedPullRecord, ProjectionOutcome, PullMergeState, RemoteMergeError,
 };
 use super::unit_tests::{build_spec_and_pull, build_spec_with_target, hex_oid, setup_fixture};
 
@@ -46,37 +45,20 @@ async fn crash_recovery_replay_idempotence_and_regression_guards() {
 
     let attempt = f.store.load_attempt(f.repo_id, spec_ok.operation_id).await.unwrap().unwrap();
     let proj = PullMergeReceiptProjector::new(&f.store);
-    let receipt = CommittedMergeReceipt {
-        operation_id: spec_ok.operation_id,
-        decision_id: spec_ok.decision_id,
-        tenant_id: f.tenant_id,
-        repository_id: f.repo_id,
-        pull_number: 1,
-        base_ref: "refs/heads/main".into(),
-        previous_base_oid: f.base_oid.clone(),
-        merged_oid: f.head_oid.clone(),
-        commit_log_index: attempt.commit_log_index.unwrap(),
-        commit_log_term: attempt.commit_log_term.unwrap(),
-        gate_revision: f.base_revision + 1,
-        terminal_digest: attempt.terminal_digest.clone().unwrap(),
-        replayed: true,
-    };
+    let receipt = attempt.into_committed_receipt(
+        f.head_oid.clone(),
+        attempt.commit_log_index.unwrap(),
+        attempt.commit_log_term.unwrap(),
+        f.base_revision + 1,
+        attempt.terminal_digest.clone().unwrap(),
+        true,
+    );
     assert_eq!(
         proj.project_committed(&receipt, 1, 1, true).await.unwrap(),
         ProjectionOutcome::ProjectedCommitted { replayed: true }
     );
     assert!(matches!(
-        proj.project_rejected(&RejectedMergeReceipt {
-            operation_id: spec_ok.operation_id,
-            repository_id: f.repo_id,
-            pull_number: 1,
-            commit_log_index: None,
-            commit_log_term: None,
-            state: PullMergeState::RejectedMerge,
-            reason: "late reject".into(),
-            terminal_digest: None,
-        })
-        .await,
+        proj.project_rejected(&attempt.into_rejected_receipt(None, None, "late reject".into(), None)).await,
         Err(RemoteMergeError::ReceiptRegression(_))
     ));
     let mut equiv_receipt = receipt;
@@ -195,10 +177,12 @@ async fn reconcile_and_replay_survive_subsequent_pr_advancing_base_ref() {
     // Recovery of PR #1 must read oid_1 immutably from CommitTerminal (never oid_2).
     let rep = finalizer.reconcile_pending(f.repo_id, true).await.unwrap();
     assert_eq!((rep.committed, rep.rejected), (1, 0));
+    let orig_idx = f.store.load_attempt(f.repo_id, s1.operation_id).await.unwrap().unwrap().commit_log_index.unwrap();
+    assert!(orig_idx < rec2.commit_log_index);
     let pr1 = f.store.get_pull(f.repo_id, 1).unwrap();
     assert_eq!((pr1.state.as_str(), pr1.merge_commit_oid.as_deref()), ("merged", Some(f.head_oid.as_str())));
 
-    // Replaying op_1 directly against Ref-CAS must also return oid_1 (`replayed=true`).
+    // Replaying op_1 directly against Ref-CAS must preserve both oid_1 (`replayed=true`) and original commit_log_index.
     let v1 = super::validation::verify_pull_remote_authz_grant(&s1, &p1, &f.keyring).unwrap();
     let replay_out = f
         .backend
@@ -207,7 +191,49 @@ async fn reconcile_and_replay_survive_subsequent_pr_advancing_base_ref() {
         .unwrap();
     assert!(matches!(
         replay_out,
-        super::coordinator::AuthorityCommitOutcome::Committed { ref merged_oid, replayed: true, .. }
-            if merged_oid == &f.head_oid
+        super::coordinator::AuthorityCommitOutcome::Committed { ref merged_oid, log_index, replayed: true, .. }
+            if merged_oid == &f.head_oid && log_index == orig_idx
     ));
+    let query_out = f.backend.query_operation_outcome(f.repo_id, s1.operation_id, "refs/heads/main").await.unwrap();
+    assert!(matches!(
+        query_out,
+        Some(super::coordinator::AuthorityCommitOutcome::Committed { ref merged_oid, log_index, replayed: true, .. })
+            if merged_oid == &f.head_oid && log_index == orig_idx
+    ));
+}
+
+#[tokio::test]
+async fn projector_rejects_mismatched_receipt_identity_tuple_with_equivocation() {
+    let f = setup_fixture(GitObjectFormat::Sha256);
+    let prod = PullRemoteMergeProducer::new(&f.backend, &f.store, &f.keyring);
+    let proj = PullMergeReceiptProjector::new(&f.store);
+    let (spec, pull) = build_spec_and_pull(&f, 1, 1, 5);
+    assert!(matches!(
+        prod.execute_merge(&spec, &pull, true, MergeFaultInjection::DisconnectAfterPendingBeforeCas).await,
+        Err(RemoteMergeError::UnknownOutcome(_))
+    ));
+    let pending = f.store.load_attempt(f.repo_id, spec.operation_id).await.unwrap().unwrap();
+    let valid_rej = pending.into_rejected_receipt(Some(99), Some(1), "rejected".into(), Some("ab".repeat(32)));
+    let mut bad_rej = valid_rej.clone();
+    bad_rej.binding_digest = "cd".repeat(32);
+    assert!(matches!(proj.project_rejected(&bad_rej).await, Err(RemoteMergeError::Equivocation(_))));
+
+    let valid_comm = pending.into_committed_receipt(f.head_oid.clone(), 99, 1, f.base_revision + 1, "ab".repeat(32), false);
+    let mut bad_attempt = valid_comm.clone();
+    bad_attempt.attempt_id = Uuid::new_v4();
+    let mut bad_tenant = valid_comm.clone();
+    bad_tenant.tenant_id = Uuid::new_v4();
+    let mut bad_head = valid_comm.clone();
+    bad_head.expected_head_oid = hex_oid(GitObjectFormat::Sha256, 0xcc);
+    let mut bad_pack = valid_comm.clone();
+    bad_pack.pack_sha256 = "ef".repeat(32);
+    let mut bad_dec = valid_comm.clone();
+    bad_dec.decision_id = Uuid::new_v4();
+    let mut bad_digest = valid_comm.clone();
+    bad_digest.binding_digest = "01".repeat(32);
+    for bad in [&bad_attempt, &bad_tenant, &bad_head, &bad_pack, &bad_dec, &bad_digest] {
+        assert!(matches!(proj.project_committed(bad, 1, 1, true).await, Err(RemoteMergeError::Equivocation(_))));
+    }
+
+    assert_eq!(proj.project_rejected(&valid_rej).await.unwrap(), ProjectionOutcome::ProjectedRejected { replayed: false });
 }

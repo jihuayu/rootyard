@@ -10,8 +10,84 @@ use uuid::Uuid;
 use super::coordinator::{AuthorityCommitOutcome, MergeAuthorityBackend};
 use super::types::{
     CommittedMergeReceipt, PendingMergeRecord, ProjectedPullRecord, ProjectionOutcome, PullMergeState,
-    RejectedMergeReceipt, RemoteMergeError,
+    RejectedMergeReceipt, RemoteMergeError, sha256_hex_valid,
 };
+
+fn check_attempt_tuple(
+    a: &PendingMergeRecord,
+    ids: (Uuid, Uuid, Uuid, Uuid, Uuid, i64),
+    refs: (&str, &str, &str, &str, &str, &str),
+    kind: &str,
+) -> Result<(), RemoteMergeError> {
+    let a_ids = (a.attempt_id, a.operation_id, a.decision_id, a.tenant_id, a.repository_id, a.pull_number);
+    let a_refs = (
+        a.base_ref.as_str(),
+        a.expected_base_oid.as_str(),
+        a.expected_head_oid.as_str(),
+        a.candidate_target_oid.as_str(),
+        a.pack_sha256.as_str(),
+        a.facts_digest.as_str(),
+    );
+    if a_ids != ids || a_refs != refs {
+        return Err(RemoteMergeError::Equivocation(format!("{kind} receipt identity tuple disagrees with stored attempt")));
+    }
+    Ok(())
+}
+
+pub(super) fn verify_committed_receipt_tuple(
+    existing: &PendingMergeRecord,
+    receipt: &CommittedMergeReceipt,
+) -> Result<(), RemoteMergeError> {
+    check_attempt_tuple(
+        existing,
+        (receipt.attempt_id, receipt.operation_id, receipt.decision_id, receipt.tenant_id, receipt.repository_id, receipt.pull_number),
+        (
+            &receipt.base_ref,
+            &receipt.previous_base_oid,
+            &receipt.expected_head_oid,
+            &receipt.merged_oid,
+            &receipt.pack_sha256,
+            &receipt.binding_digest,
+        ),
+        "committed",
+    )?;
+    if existing.state == PullMergeState::CommittedMerge
+        && (existing.commit_log_index != Some(receipt.commit_log_index)
+            || existing.commit_log_term != Some(receipt.commit_log_term)
+            || existing.merged_oid.as_deref() != Some(receipt.merged_oid.as_str())
+            || existing.terminal_digest.as_deref() != Some(receipt.terminal_digest.as_str()))
+    {
+        return Err(RemoteMergeError::Equivocation("CommittedMerge replay payload differs".into()));
+    }
+    Ok(())
+}
+
+pub(super) fn verify_rejected_receipt_tuple(
+    existing: &PendingMergeRecord,
+    receipt: &RejectedMergeReceipt,
+) -> Result<(), RemoteMergeError> {
+    check_attempt_tuple(
+        existing,
+        (receipt.attempt_id, receipt.operation_id, receipt.decision_id, receipt.tenant_id, receipt.repository_id, receipt.pull_number),
+        (
+            &receipt.base_ref,
+            &receipt.expected_base_oid,
+            &receipt.expected_head_oid,
+            &receipt.candidate_target_oid,
+            &receipt.pack_sha256,
+            &receipt.binding_digest,
+        ),
+        "rejected",
+    )?;
+    if existing.state == PullMergeState::RejectedMerge
+        && (existing.commit_log_index != receipt.commit_log_index
+            || existing.commit_log_term != receipt.commit_log_term
+            || existing.terminal_digest != receipt.terminal_digest)
+    {
+        return Err(RemoteMergeError::Equivocation("RejectedMerge replay payload differs".into()));
+    }
+    Ok(())
+}
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -84,8 +160,26 @@ impl<'a, S: MergeReceiptStore> PullMergeReceiptProjector<'a, S> {
         expected_version: i64,
         update_forge_pulls: bool,
     ) -> Result<ProjectionOutcome, RemoteMergeError> {
-        if receipt.merged_oid.is_empty() || receipt.commit_log_index == 0 || receipt.terminal_digest.is_empty() {
-            return Err(RemoteMergeError::InvalidInput("committed receipt requires merged_oid/log_index/digest".into()));
+        if [
+            receipt.attempt_id,
+            receipt.operation_id,
+            receipt.decision_id,
+            receipt.tenant_id,
+            receipt.repository_id,
+        ]
+        .iter()
+        .any(Uuid::is_nil)
+            || receipt.pull_number <= 0
+            || receipt.merged_oid.is_empty()
+            || receipt.commit_log_index == 0
+            || !sha256_hex_valid(&receipt.pack_sha256)
+            || !sha256_hex_valid(&receipt.binding_digest)
+            || receipt.terminal_digest.is_empty()
+        {
+            return Err(RemoteMergeError::InvalidInput("committed receipt missing required identity fields".into()));
+        }
+        if let Some(existing) = self.store.load_attempt(receipt.repository_id, receipt.operation_id).await? {
+            verify_committed_receipt_tuple(&existing, receipt)?;
         }
         self.store.project_committed(receipt, storage_generation, expected_version, update_forge_pulls).await
     }
@@ -94,6 +188,9 @@ impl<'a, S: MergeReceiptStore> PullMergeReceiptProjector<'a, S> {
         &self,
         receipt: &RejectedMergeReceipt,
     ) -> Result<ProjectionOutcome, RemoteMergeError> {
+        if let Some(existing) = self.store.load_attempt(receipt.repository_id, receipt.operation_id).await? {
+            verify_rejected_receipt_tuple(&existing, receipt)?;
+        }
         self.store.project_rejected(receipt).await
     }
 
@@ -144,59 +241,20 @@ impl<'a, A: MergeAuthorityBackend, S: MergeReceiptStore> RecoverablePullMergeFin
                             rec.candidate_target_oid
                         )));
                     }
-                    let receipt = CommittedMergeReceipt {
-                        operation_id: rec.operation_id,
-                        decision_id: rec.decision_id,
-                        tenant_id: rec.tenant_id,
-                        repository_id: rec.repository_id,
-                        pull_number: rec.pull_number,
-                        base_ref: rec.base_ref,
-                        previous_base_oid: rec.expected_base_oid,
-                        merged_oid,
-                        commit_log_index: log_index,
-                        commit_log_term: log_term,
-                        gate_revision,
-                        terminal_digest,
-                        replayed,
-                    };
-                    self.projector
-                        .project_committed(
-                            &receipt,
-                            rec.expected_storage_generation,
-                            rec.expected_version,
-                            update_forge_pulls,
-                        )
-                        .await?;
+                    let (stg, ver) = (rec.expected_storage_generation, rec.expected_version);
+                    let receipt =
+                        rec.into_committed_receipt(merged_oid, log_index, log_term, gate_revision, terminal_digest, replayed);
+                    self.projector.project_committed(&receipt, stg, ver, update_forge_pulls).await?;
                     report.committed += 1;
                 }
                 Some(AuthorityCommitOutcome::Rejected { log_index, log_term, terminal_digest, reason, .. }) => {
-                    self.projector
-                        .project_rejected(&RejectedMergeReceipt {
-                            operation_id: rec.operation_id,
-                            repository_id: rec.repository_id,
-                            pull_number: rec.pull_number,
-                            commit_log_index: log_index,
-                            commit_log_term: log_term,
-                            state: PullMergeState::RejectedMerge,
-                            reason,
-                            terminal_digest,
-                        })
-                        .await?;
+                    let rej = rec.into_rejected_receipt(log_index, log_term, reason, terminal_digest);
+                    self.projector.project_rejected(&rej).await?;
                     report.rejected += 1;
                 }
                 Some(AuthorityCommitOutcome::Cancelled { log_index, log_term, reason }) => {
-                    self.projector
-                        .project_rejected(&RejectedMergeReceipt {
-                            operation_id: rec.operation_id,
-                            repository_id: rec.repository_id,
-                            pull_number: rec.pull_number,
-                            commit_log_index: log_index,
-                            commit_log_term: log_term,
-                            state: PullMergeState::RejectedMerge,
-                            reason,
-                            terminal_digest: None,
-                        })
-                        .await?;
+                    let rej = rec.into_rejected_receipt(log_index, log_term, reason, None);
+                    self.projector.project_rejected(&rej).await?;
                     report.rejected += 1;
                 }
                 Some(AuthorityCommitOutcome::UnknownPending { .. }) => {
@@ -236,43 +294,41 @@ impl InMemoryMergeStore {
         Self::default()
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, MemState> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn seed_pull(&self, pull: ProjectedPullRecord) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.pulls.insert((pull.repository_id, pull.pull_number), pull);
+        self.lock().pulls.insert((pull.repository_id, pull.pull_number), pull);
     }
 
     pub fn get_pull(&self, repository_id: Uuid, pull_number: i64) -> Option<ProjectedPullRecord> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).pulls.get(&(repository_id, pull_number)).cloned()
+        self.lock().pulls.get(&(repository_id, pull_number)).cloned()
     }
 
     pub fn all_attempts(&self, repository_id: Uuid) -> Vec<PendingMergeRecord> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .attempts
-            .iter()
-            .filter(|((r, _), _)| *r == repository_id)
-            .map(|(_, v)| v.clone())
-            .collect()
+        self.lock().attempts.iter().filter(|((r, _), _)| *r == repository_id).map(|(_, v)| v.clone()).collect()
     }
+}
+
+fn ensure_no_other_committed_mem(g: &MemState, repo: Uuid, pull: i64, op: Uuid) -> Result<(), RemoteMergeError> {
+    if let Some(c) = g.attempts.values().find(|a| {
+        a.repository_id == repo && a.pull_number == pull && a.state == PullMergeState::CommittedMerge && a.operation_id != op
+    }) {
+        return Err(RemoteMergeError::AlreadyMerged {
+            pull_number: c.pull_number,
+            committed_oid: c.merged_oid.clone().unwrap_or_default(),
+            commit_log_index: c.commit_log_index.unwrap_or(0),
+        });
+    }
+    Ok(())
 }
 
 impl MergeReceiptStore for InMemoryMergeStore {
     fn insert_pending<'a>(&'a self, record: &'a PendingMergeRecord) -> BoxFuture<'a, Result<(), RemoteMergeError>> {
         Box::pin(async move {
-            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(committed) = g.attempts.values().find(|a| {
-                a.repository_id == record.repository_id
-                    && a.pull_number == record.pull_number
-                    && a.state == PullMergeState::CommittedMerge
-                    && a.operation_id != record.operation_id
-            }) {
-                return Err(RemoteMergeError::AlreadyMerged {
-                    pull_number: committed.pull_number,
-                    committed_oid: committed.merged_oid.clone().unwrap_or_default(),
-                    commit_log_index: committed.commit_log_index.unwrap_or(0),
-                });
-            }
+            let mut g = self.lock();
+            ensure_no_other_committed_mem(&g, record.repository_id, record.pull_number, record.operation_id)?;
             if let Some(existing) = g.attempts.get(&(record.repository_id, record.operation_id)) {
                 if existing.state == PullMergeState::CommittedMerge {
                     return Err(RemoteMergeError::ReceiptRegression(
@@ -299,33 +355,13 @@ impl MergeReceiptStore for InMemoryMergeStore {
         update_forge_pulls: bool,
     ) -> BoxFuture<'a, Result<ProjectionOutcome, RemoteMergeError>> {
         Box::pin(async move {
-            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(other) = g.attempts.values().find(|a| {
-                a.repository_id == receipt.repository_id
-                    && a.pull_number == receipt.pull_number
-                    && a.state == PullMergeState::CommittedMerge
-                    && a.operation_id != receipt.operation_id
-            }) {
-                return Err(RemoteMergeError::AlreadyMerged {
-                    pull_number: other.pull_number,
-                    committed_oid: other.merged_oid.clone().unwrap_or_default(),
-                    commit_log_index: other.commit_log_index.unwrap_or(0),
-                });
-            }
+            let mut g = self.lock();
+            ensure_no_other_committed_mem(&g, receipt.repository_id, receipt.pull_number, receipt.operation_id)?;
 
             let replayed = if let Some(existing) = g.attempts.get_mut(&(receipt.repository_id, receipt.operation_id)) {
+                verify_committed_receipt_tuple(existing, receipt)?;
                 match existing.state {
-                    PullMergeState::CommittedMerge => {
-                        if existing.merged_oid.as_deref() != Some(receipt.merged_oid.as_str())
-                            || existing.commit_log_index != Some(receipt.commit_log_index)
-                            || existing.terminal_digest.as_deref() != Some(receipt.terminal_digest.as_str())
-                        {
-                            return Err(RemoteMergeError::Equivocation(
-                                "conflicting CommittedMerge replay payload".into(),
-                            ));
-                        }
-                        true
-                    }
+                    PullMergeState::CommittedMerge => true,
                     PullMergeState::RejectedMerge | PullMergeState::AbortedBeforeCas => {
                         return Err(RemoteMergeError::ReceiptRegression(
                             "cannot overwrite Rejected/Aborted attempt with CommittedMerge".into(),
@@ -349,6 +385,9 @@ impl MergeReceiptStore for InMemoryMergeStore {
                     .pulls
                     .get_mut(&(receipt.repository_id, receipt.pull_number))
                     .ok_or_else(|| RemoteMergeError::InvalidInput("pull missing in InMemoryMergeStore".into()))?;
+                if pull.head_oid != receipt.expected_head_oid || pull.base_oid != receipt.previous_base_oid {
+                    return Err(RemoteMergeError::Equivocation("pull head/base OID disagrees with receipt".into()));
+                }
                 if pull.state == "merged" {
                     if pull.merge_commit_oid.as_deref() != Some(receipt.merged_oid.as_str()) {
                         return Err(RemoteMergeError::Equivocation(
@@ -375,11 +414,12 @@ impl MergeReceiptStore for InMemoryMergeStore {
         receipt: &'a RejectedMergeReceipt,
     ) -> BoxFuture<'a, Result<ProjectionOutcome, RemoteMergeError>> {
         Box::pin(async move {
-            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.lock();
             let existing = g
                 .attempts
                 .get_mut(&(receipt.repository_id, receipt.operation_id))
                 .ok_or_else(|| RemoteMergeError::InvalidInput("attempt missing before RejectedMerge".into()))?;
+            verify_rejected_receipt_tuple(existing, receipt)?;
             match existing.state {
                 PullMergeState::CommittedMerge => Err(RemoteMergeError::ReceiptRegression(
                     "cannot downgrade CommittedMerge to RejectedMerge".into(),
@@ -407,7 +447,7 @@ impl MergeReceiptStore for InMemoryMergeStore {
         reason: &'a str,
     ) -> BoxFuture<'a, Result<ProjectionOutcome, RemoteMergeError>> {
         Box::pin(async move {
-            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = self.lock();
             let existing = g
                 .attempts
                 .get_mut(&(repository_id, operation_id))
@@ -435,9 +475,7 @@ impl MergeReceiptStore for InMemoryMergeStore {
     ) -> BoxFuture<'a, Result<Vec<PendingMergeRecord>, RemoteMergeError>> {
         Box::pin(async move {
             Ok(self
-                .inner
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
                 .attempts
                 .iter()
                 .filter(|((r, _), v)| *r == repository_id && v.state == PullMergeState::PendingMerge)
@@ -451,8 +489,6 @@ impl MergeReceiptStore for InMemoryMergeStore {
         repository_id: Uuid,
         operation_id: Uuid,
     ) -> BoxFuture<'a, Result<Option<PendingMergeRecord>, RemoteMergeError>> {
-        Box::pin(async move {
-            Ok(self.inner.lock().unwrap_or_else(|e| e.into_inner()).attempts.get(&(repository_id, operation_id)).cloned())
-        })
+        Box::pin(async move { Ok(self.lock().attempts.get(&(repository_id, operation_id)).cloned()) })
     }
 }

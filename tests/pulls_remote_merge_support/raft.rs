@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use rootyard::pulls::remote_merge_finalizer::coordinator::{
-    BackendFuture, map_commit_receipt_to_outcome, map_sm_error_to_outcome,
+    BackendFuture, map_commit_receipt_to_outcome, map_sm_error_to_outcome, original_operation_log_id,
 };
 use rootyard::pulls::remote_merge_finalizer::{AuthorityCommitOutcome, MergeAuthorityBackend, RemoteMergeError};
 use rootyard::ref_store::contract::{OperationLookup, OperationState};
@@ -122,8 +122,8 @@ pub struct LiveRaft3 {
     seq: u64,
 }
 
-fn run_ssl(dir: &Path, args: &[&str]) -> Result<()> {
-    let o = Command::new("openssl").args(args).current_dir(dir).output()?;
+fn run_ssl(dir: &Path, args: &str) -> Result<()> {
+    let o = Command::new("openssl").args(args.split_whitespace()).current_dir(dir).output()?;
     ensure!(o.status.success(), "openssl: {}", String::from_utf8_lossy(&o.stderr));
     Ok(())
 }
@@ -140,72 +140,30 @@ impl LiveRaft3 {
         let r = pki.path().to_path_buf();
         run_ssl(
             &r,
-            &[
-                "req",
-                "-x509",
-                "-newkey",
-                "ec",
-                "-pkeyopt",
-                "ec_paramgen_curve:prime256v1",
-                "-nodes",
-                "-days",
-                "2",
-                "-keyout",
-                "ca.key",
-                "-out",
-                "ca.crt",
-                "-subj",
-                "/CN=p156-ca",
-            ],
+            "req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -keyout ca.key -out ca.crt -subj /CN=p156-ca",
         )?;
         let sign = |st: &str, dns: &str| -> Result<(PathBuf, PathBuf)> {
+            let (ext, key, csr, crt) =
+                (format!("{st}.ext"), format!("{st}.key"), format!("{st}.csr"), format!("{st}.crt"));
             fs::write(
-                r.join(format!("{st}.ext")),
+                r.join(&ext),
                 format!(
                     "[v3]\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:{dns}\n"
                 ),
             )?;
             run_ssl(
                 &r,
-                &[
-                    "req",
-                    "-new",
-                    "-newkey",
-                    "ec",
-                    "-pkeyopt",
-                    "ec_paramgen_curve:prime256v1",
-                    "-nodes",
-                    "-keyout",
-                    &format!("{st}.key"),
-                    "-out",
-                    &format!("{st}.csr"),
-                    "-subj",
-                    &format!("/CN={dns}"),
-                ],
+                &format!(
+                    "req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout {key} -out {csr} -subj /CN={dns}"
+                ),
             )?;
             run_ssl(
                 &r,
-                &[
-                    "x509",
-                    "-req",
-                    "-in",
-                    &format!("{st}.csr"),
-                    "-CA",
-                    "ca.crt",
-                    "-CAkey",
-                    "ca.key",
-                    "-CAcreateserial",
-                    "-out",
-                    &format!("{st}.crt"),
-                    "-days",
-                    "2",
-                    "-extfile",
-                    &format!("{st}.ext"),
-                    "-extensions",
-                    "v3",
-                ],
+                &format!(
+                    "x509 -req -in {csr} -CA ca.crt -CAkey ca.key -CAcreateserial -out {crt} -days 2 -extfile {ext} -extensions v3"
+                ),
             )?;
-            Ok((r.join(format!("{st}.crt")), r.join(format!("{st}.key"))))
+            Ok((r.join(crt), r.join(key)))
         };
         let (cc, ck) = sign("cli", "raft-client.refcas.internal")?;
         let mut roots = RootCertStore::empty();
@@ -330,7 +288,8 @@ impl LiveRaft3 {
             last_id = applied;
             if let RefCasCommand::CommitScopedRefs(c) = &cmd {
                 op_logs
-                    .insert((c.commit.request.identity.repository_id, c.commit.request.identity.operation_id), applied);
+                    .entry((c.commit.request.identity.repository_id, c.commit.request.identity.operation_id))
+                    .or_insert(applied);
             }
             last = Some(sm.apply(applied, cmd));
         }
@@ -375,7 +334,7 @@ impl MergeAuthorityBackend for LiveRaft3Backend {
         commit: CommitScopedRefsCommand,
     ) -> BackendFuture<'a, AuthorityCommitOutcome> {
         Box::pin(async move {
-            let dec_id = commit.commit.decision_id;
+            let (dec_id, op_id) = (commit.commit.decision_id, commit.commit.request.identity.operation_id);
             let mut r = self.0.lock().await;
             let (i1, sm1, r1) = r
                 .append(&RefCasCommand::InstallScopedDecision(install))
@@ -400,13 +359,24 @@ impl MergeAuthorityBackend for LiveRaft3Backend {
                 .await
                 .map_err(|e| RemoteMergeError::UnknownOutcome(e.to_string()))?;
             match r2.context("res").map_err(|e| RemoteMergeError::UnknownOutcome(e.to_string()))? {
-                Ok(ApplyResponse::RefsCommitted(rec)) => map_commit_receipt_to_outcome(
-                    AppliedLogId { term: 1, index: i2 },
-                    base_ref,
-                    &rec.terminal,
-                    rec.replayed,
-                    sm2.read_refs(repo).get(base_ref).cloned(),
-                ),
+                Ok(ApplyResponse::RefsCommitted(rec)) => {
+                    let lid = match original_operation_log_id(&sm2, repo, op_id) {
+                        Some(orig) => orig,
+                        None if rec.replayed => {
+                            return Err(RemoteMergeError::Equivocation(
+                                "replayed Raft commit missing original AppliedLogId".into(),
+                            ));
+                        }
+                        None => AppliedLogId { term: 1, index: i2 },
+                    };
+                    map_commit_receipt_to_outcome(
+                        lid,
+                        base_ref,
+                        &rec.terminal,
+                        rec.replayed,
+                        sm2.read_refs(repo).get(base_ref).cloned(),
+                    )
+                }
                 Ok(o) => Err(RemoteMergeError::Equivocation(format!("unexpected {o:?}"))),
                 Err(e) => Ok(map_sm_error_to_outcome(
                     Some(AppliedLogId { term: 1, index: i2 }),
@@ -460,8 +430,13 @@ impl MergeAuthorityBackend for LiveRaft3Backend {
                                 .clone(),
                         )
                         .map_err(|e| RemoteMergeError::Equivocation(e.to_string()))?;
+                        let settled_lid = original_operation_log_id(&out.sm, repo, op).ok_or_else(|| {
+                            RemoteMergeError::Equivocation(
+                                "settled Raft operation missing original AppliedLogId".into(),
+                            )
+                        })?;
                         Ok(Some(map_commit_receipt_to_outcome(
-                            lid,
+                            settled_lid,
                             base_ref,
                             &t,
                             true,

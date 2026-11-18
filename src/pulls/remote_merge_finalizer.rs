@@ -28,6 +28,6 @@ pub use types::{
     CheckRunSnapshot, CommittedMergeReceipt, LiveAuthzScopeState, MergeAttemptOutcome, MergeAttemptSpec,
     MergeBindingInputs, MergeFaultInjection, MergePullSnapshot, MergeStrategy, PendingMergeRecord,
     ProjectedPullRecord, ProjectionOutcome, PullMergeState, RejectedMergeReceipt, RemoteMergeError,
-    compute_merge_binding_digest, compute_required_checks_digest,
+    compute_merge_binding_digest, compute_observed_checks_digest, compute_required_checks_digest,
 };
 pub use validation::{ValidatedMergeGrant, validate_merge_inputs_and_preconditions, verify_pull_remote_authz_grant};

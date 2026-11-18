@@ -10,10 +10,11 @@ use anyhow::{Context, Result, bail};
 use deadpool_postgres::{Manager, Pool};
 use rootyard::db;
 use rootyard::pulls::remote_merge_finalizer::{
-    InMemoryMergeStore, InProcessRefCasBackend, MergeAttemptOutcome, MergeAuthorityBackend, MergeFaultInjection,
-    MergeStrategy, PgMergeStore, PrepareMergeInput, ProjectedPullRecord, ProjectionOutcome, PullMergeReceiptProjector,
-    PullRemoteMergeProducer, RecoverablePullMergeFinalizer, RemoteMergeError, init_remote_merge_tables,
-    prepare_merge_candidate,
+    AuthorityCommitOutcome, InMemoryMergeStore, InProcessRefCasBackend, MergeAttemptOutcome, MergeAuthorityBackend,
+    MergeFaultInjection, MergeReceiptStore, MergeStrategy, PgMergeStore, PrepareMergeInput, ProjectedPullRecord,
+    ProjectionOutcome, PullMergeReceiptProjector, PullMergeState, PullRemoteMergeProducer,
+    RecoverablePullMergeFinalizer, RemoteMergeError, init_remote_merge_tables, prepare_merge_candidate,
+    verify_pull_remote_authz_grant,
 };
 use rootyard::ref_store::core::state_machine::{
     AppliedLogId, CloseAuthScopeCommand, RefCasCommand, RefCasStateMachine, ScopeLifecycle,
@@ -298,6 +299,8 @@ async fn e2e_pg17_mtls_raft3_stock_git_merge_crash_recovery_and_concurrent_race(
     shared.lock().await.restart_leader().await?;
     let rep = RecoverablePullMergeFinalizer::new(&backend, &pg_store).reconcile_pending(ctx.repo, true).await?;
     assert_eq!(rep.committed, 1);
+    let a1 = pg_store.load_attempt(ctx.repo, s1.operation_id).await?.context("a1")?;
+    let orig_idx1 = a1.commit_log_index.context("orig_idx1")?;
     let r1 = pgc
         .query_one("SELECT state, merge_commit_oid FROM forge_pulls WHERE repository_id=$1 AND number=1", &[&ctx.repo])
         .await?;
@@ -339,6 +342,57 @@ async fn e2e_pg17_mtls_raft3_stock_git_merge_crash_recovery_and_concurrent_race(
     });
     let (_, sm_closed, _) = shared.lock().await.append(&close_cmd).await?;
     assert_eq!(sm_closed.read_scope_floor("token", ctx.scope_id).unwrap().authz_floor, 99);
+
+    let v1 = verify_pull_remote_authz_grant(&s1, &p1, &ctx.keyring)?;
+    assert!(matches!(
+        backend.install_and_commit_scoped(ctx.repo, &s1.base_ref, v1.install_cmd, v1.commit_cmd).await?,
+        AuthorityCommitOutcome::Committed { ref merged_oid, log_index, replayed: true, .. }
+            if merged_oid == &c1.target_oid && log_index == orig_idx1
+    ));
+    assert!(matches!(
+        backend.query_operation_outcome(ctx.repo, s1.operation_id, "refs/heads/main").await?,
+        Some(AuthorityCommitOutcome::Committed { ref merged_oid, log_index, replayed: true, .. })
+            if merged_oid == &c1.target_oid && log_index == orig_idx1
+    ));
+
+    let mut bad_committed = a1.into_committed_receipt(
+        c1.target_oid.clone(),
+        orig_idx1,
+        a1.commit_log_term.context("orig_term1")?,
+        gv.revision() + 1,
+        a1.terminal_digest.clone().context("td1")?,
+        true,
+    );
+    bad_committed.binding_digest = "ff".repeat(32);
+    assert!(matches!(
+        pg_store.project_committed(&bad_committed, 1, 1, true).await,
+        Err(RemoteMergeError::Equivocation(_))
+    ));
+
+    let mut pending_rec = a1.clone();
+    pending_rec.operation_id = Uuid::new_v4();
+    pending_rec.attempt_id = Uuid::new_v4();
+    pending_rec.pull_number = 2;
+    pending_rec.state = PullMergeState::PendingMerge;
+    pending_rec.commit_log_index = None;
+    pending_rec.commit_log_term = None;
+    pending_rec.merged_oid = None;
+    pending_rec.terminal_digest = None;
+    pending_rec.reject_reason = None;
+    pg_store.insert_pending(&pending_rec).await?;
+    let mut bad_pending_comm = pending_rec.into_committed_receipt(
+        pending_rec.candidate_target_oid.clone(),
+        orig_idx1,
+        1,
+        gv.revision() + 1,
+        "aa".repeat(32),
+        false,
+    );
+    bad_pending_comm.attempt_id = Uuid::new_v4();
+    assert!(matches!(
+        pg_store.project_committed(&bad_pending_comm, 1, 1, true).await,
+        Err(RemoteMergeError::Equivocation(_))
+    ));
     drop(pgc);
     let _ = admin.get().await?.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await;
     Ok(())

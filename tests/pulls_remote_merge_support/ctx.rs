@@ -230,6 +230,7 @@ impl TestCtx {
             expected_storage_generation: 1,
             required_checks: &chks,
             min_check_sequence: 1,
+            observed_checks: &pull.observed_checks,
             authz_epoch: 3,
             pack_sha256: psha,
         });
