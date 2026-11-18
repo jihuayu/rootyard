@@ -69,7 +69,7 @@ async fn gate1_pooled_pg_session_read_only_reset_and_verified_writer_exit() -> R
         }
         let url = super::format30_helpers::replace_db_in_url(&base_url, &gate1_db)?;
         let pool = db::pool(&url)?;
-        let mut survivor = pool.get().await?;
+        let survivor = pool.get().await?;
         // The exact statements `enter_durable_pg_raft_freeze` uses around the freeze transaction.
         survivor.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await?;
         let read_write: String = survivor.query_one("SHOW transaction_read_only", &[]).await?.get(0);
@@ -79,17 +79,18 @@ async fn gate1_pooled_pg_session_read_only_reset_and_verified_writer_exit() -> R
         ensure!(read_only == "on", "pooled session must be reset to READ ONLY on both Ok and Err paths");
 
         // A genuinely concurrent writer must be terminated AND observed to be gone.
-        let mut doomed = pool.get().await?;
+        let doomed = pool.get().await?;
         doomed.batch_execute("BEGIN; SELECT 1").await?;
-        let terminated = terminate_and_await_other_pg_sessions(&*survivor, Duration::from_secs(5)).await.map_err(pg)?;
+        let terminated =
+            terminate_and_await_other_pg_sessions(&**survivor, Duration::from_secs(5)).await.map_err(pg)?;
         ensure!(terminated >= 1, "at least the concurrent in-transaction session must be terminated");
-        verify_no_active_pg_writers(&*survivor).await.map_err(pg)?;
+        verify_no_active_pg_writers(&**survivor).await.map_err(pg)?;
         ensure!(doomed.batch_execute("SELECT 1").await.is_err(), "terminated backend must no longer serve queries");
         drop(doomed);
 
         // The database-wide fence itself is untouched by a session-level reset.
         ensure!(
-            !read_pg_database_read_only(&*survivor).await.map_err(pg)?,
+            !read_pg_database_read_only(&**survivor).await.map_err(pg)?,
             "no database-wide READ ONLY fence expected"
         );
 
