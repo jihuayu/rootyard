@@ -2,28 +2,25 @@
  * Single-use test gate for one exact workspace lower-Git metadata lookup.
  *
  * The acceptance runner compiles this into a throwaway shared library and puts
- * it on LD_PRELOAD only for its own service child. It is inert unless all of
+ * it on LD_PRELOAD only for its own service child. It is inert unless
  * ROOTYARD_TEST_STAT_GATE, ROOTYARD_TEST_STAT_GATE_TARGET and
  * ROOTYARD_TEST_STAT_GATE_EXE are non-empty.
  *
- * Rust 1.99.1 std prefers statx(2) on Linux/gnu through its weak-symbol
- * helper, so an LD_PRELOAD statx is interposable. The same source also has the
- * stat64/lstat64/fstatat64 fallback (and musl's stat/lstat/fstatat path), so
- * those symbols are gated too. No raw syscall or synthesized metadata is used:
- * each wrapper resolves the real libc function exactly once and returns that
- * function's unmodified result and errno.
+ * Rust 1.99.1 std on Linux/gnu prefers statx(2) through its weak-symbol helper,
+ * which resolves "statx" with dlsym(RTLD_DEFAULT, ...) and therefore permits an
+ * LD_PRELOAD interposer. This gate instruments only that proven statx path. If
+ * the real statx symbol is unavailable, the case fails closed instead of
+ * inventing a fallback or silently claiming another ABI.
  *
- * The first call for the exact canonical target creates "<gate>.hit" and
- * waits for "<gate>.release". The process scope must be the fixture-owned
- * service child: its /proc/self/exe must resolve to the configured executable
- * and it must still be its own process-group leader. A matching path outside
- * that scope, a second matching call, a missing real ABI, or the hold timeout
- * creates a fail-closed marker and never turns the case into a pass.
- *
- * The outcome is written only after the real call returned. It carries the
- * real return value/errno and the real metadata mode, so the acceptance test
- * requires an observed non-directory regular-file result rather than inferring
- * it from a marker.
+ * The first statx for the exact canonical target creates "<gate>.hit" with
+ * this process's PID/starttime and waits for "<gate>.release" to carry the
+ * same identity. The process must be the owned service child: exact
+ * /proc/self/exe, process-group leader, and exact absolute target path. No
+ * realpath fallback is used, so non-following semantics cannot be changed by
+ * the gate. The outcome is written only after the real statx returned and
+ * records bounded audited status: exact libc struct size, returned STATX_TYPE,
+ * real success, and regular/directory booleans. No raw mode/errno/identity is
+ * published.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -33,7 +30,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,139 +38,33 @@
 #include <time.h>
 #include <unistd.h>
 
+#if !defined(__GLIBC__)
+#error "the audited legacy statx gate requires the pinned glibc statx ABI"
+#endif
+
 #define GATE_HOLD_MILLISECONDS 30000L
+#define GATE_IDENTITY_MAX 128
 #define GATE_SCHEMA "rootyard/issues91-95/legacy-stat-gate/v1"
 
-/* Linux UAPI statx layout. The fixed size/offset assertions make an
- * incompatible build fail at compile time instead of guessing at metadata. */
-struct gate_statx_timestamp {
-    int64_t tv_sec;
-    uint32_t tv_nsec;
-    int32_t __reserved;
-};
-
-struct gate_statx {
-    uint32_t stx_mask;
-    uint32_t stx_blksize;
-    uint64_t stx_attributes;
-    uint32_t stx_nlink;
-    uint32_t stx_uid;
-    uint32_t stx_gid;
-    uint16_t stx_mode;
-    uint16_t __spare0;
-    uint64_t stx_ino;
-    uint64_t stx_size;
-    uint64_t stx_blocks;
-    uint64_t stx_attributes_mask;
-    struct gate_statx_timestamp stx_atime;
-    struct gate_statx_timestamp stx_btime;
-    struct gate_statx_timestamp stx_ctime;
-    struct gate_statx_timestamp stx_mtime;
-    uint32_t stx_rdev_major;
-    uint32_t stx_rdev_minor;
-    uint32_t stx_dev_major;
-    uint32_t stx_dev_minor;
-    uint64_t stx_mnt_id;
-    uint32_t stx_dio_mem_align;
-    uint32_t stx_dio_offset_align;
-    uint64_t __spare3[12];
-};
-
-_Static_assert(sizeof(struct gate_statx) == 256, "unverified statx buffer size");
-_Static_assert(offsetof(struct gate_statx, stx_mode) == 28, "unverified statx mode offset");
-_Static_assert(sizeof(((struct stat *)0)->st_mode) >= 2, "unverified stat mode width");
-
-typedef int (*statx_call)(int, const char *, int, unsigned int, struct gate_statx *);
-typedef int (*stat_call)(const char *, struct stat *);
-typedef int (*lstat_call)(const char *, struct stat *);
-typedef int (*fstatat_call)(int, const char *, struct stat *, int);
+_Static_assert(sizeof(struct statx) == 256, "unverified libc statx buffer size");
+_Static_assert(offsetof(struct statx, stx_mode) == 28, "unverified libc statx mode offset");
+typedef int (*statx_call)(int, const char *, int, unsigned int, struct statx *);
 
 static pthread_once_t resolve_once = PTHREAD_ONCE_INIT;
 static statx_call real_statx = NULL;
-static stat_call real_stat = NULL;
-static lstat_call real_lstat = NULL;
-static fstatat_call real_fstatat = NULL;
-
-#ifdef __GLIBC__
-typedef int (*stat64_call)(const char *, struct stat64 *);
-typedef int (*lstat64_call)(const char *, struct stat64 *);
-typedef int (*fstatat64_call)(int, const char *, struct stat64 *, int);
-static stat64_call real_stat64 = NULL;
-static lstat64_call real_lstat64 = NULL;
-static fstatat64_call real_fstatat64 = NULL;
-#endif
-
+static int real_statx_available = 0;
 static _Atomic int state = 0;
-static _Thread_local int resolving = 0;
 static _Thread_local int in_real = 0;
 static _Thread_local int held_timed_out = 0;
-
-#define RESOLVE_SYMBOL(name, target) \
-    do { *(void **)(&(target)) = dlsym(RTLD_NEXT, (name)); } while (0)
+static _Thread_local int held_identity_ok = 0;
 
 static void resolve_real(void) {
-    RESOLVE_SYMBOL("statx", real_statx);
-    RESOLVE_SYMBOL("stat", real_stat);
-    RESOLVE_SYMBOL("lstat", real_lstat);
-    RESOLVE_SYMBOL("fstatat", real_fstatat);
-#ifdef __GLIBC__
-    RESOLVE_SYMBOL("stat64", real_stat64);
-    RESOLVE_SYMBOL("lstat64", real_lstat64);
-    RESOLVE_SYMBOL("fstatat64", real_fstatat64);
-#endif
+    void *symbol = dlsym(RTLD_NEXT, "statx");
+    if (symbol == NULL || sizeof(symbol) != sizeof(real_statx))
+        return;
+    memcpy(&real_statx, &symbol, sizeof(real_statx));
+    real_statx_available = real_statx != NULL;
 }
-
-static int call_real_statx(int dirfd, const char *path, int flags, unsigned int mask,
-                           struct gate_statx *buf) {
-    if (real_statx != NULL)
-        return real_statx(dirfd, path, flags, mask, buf);
-    errno = ENOSYS;
-    return -1;
-}
-
-static int call_real_stat(const char *path, struct stat *buf) {
-    if (real_stat != NULL)
-        return real_stat(path, buf);
-    errno = ENOSYS;
-    return -1;
-}
-
-static int call_real_lstat(const char *path, struct stat *buf) {
-    if (real_lstat != NULL)
-        return real_lstat(path, buf);
-    errno = ENOSYS;
-    return -1;
-}
-
-static int call_real_fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
-    if (real_fstatat != NULL)
-        return real_fstatat(dirfd, path, buf, flags);
-    errno = ENOSYS;
-    return -1;
-}
-
-#ifdef __GLIBC__
-static int call_real_stat64(const char *path, struct stat64 *buf) {
-    if (real_stat64 != NULL)
-        return real_stat64(path, buf);
-    errno = ENOSYS;
-    return -1;
-}
-
-static int call_real_lstat64(const char *path, struct stat64 *buf) {
-    if (real_lstat64 != NULL)
-        return real_lstat64(path, buf);
-    errno = ENOSYS;
-    return -1;
-}
-
-static int call_real_fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
-    if (real_fstatat64 != NULL)
-        return real_fstatat64(dirfd, path, buf, flags);
-    errno = ENOSYS;
-    return -1;
-}
-#endif
 
 static void touch_marker(const char *gate, const char *suffix) {
     char path[PATH_MAX];
@@ -188,72 +78,108 @@ static void touch_marker(const char *gate, const char *suffix) {
         close(fd);
 }
 
-static const char *last_component(const char *path) {
-    const char *slash = strrchr(path, '/');
-    return slash == NULL ? path : slash + 1;
+static int read_self_identity(long *pid_out, unsigned long long *starttime_out) {
+    char buffer[4096];
+    int fd = open("/proc/self/stat", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    ssize_t length = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (length <= 0)
+        return 0;
+    buffer[length] = '\0';
+
+    char *close_paren = strrchr(buffer, ')');
+    if (close_paren == NULL)
+        return 0;
+    char *cursor = close_paren + 1;
+    while (*cursor == ' ')
+        cursor++;
+    while (*cursor != '\0' && *cursor != ' ')
+        cursor++;
+    for (int field = 0; field < 18; field++) {
+        while (*cursor == ' ')
+            cursor++;
+        if (*cursor == '\0')
+            return 0;
+        while (*cursor != '\0' && *cursor != ' ')
+            cursor++;
+    }
+    while (*cursor == ' ')
+        cursor++;
+    if (*cursor == '\0')
+        return 0;
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long long starttime = strtoull(cursor, &end, 10);
+    if (errno != 0 || end == cursor || starttime == 0 ||
+        (*end != '\0' && *end != ' '))
+        return 0;
+    *pid_out = (long)getpid();
+    *starttime_out = starttime;
+    return *pid_out > 0;
 }
 
-static int target_path_matches(int dirfd, const char *path, const char *target) {
-    if (path == NULL || *path == '\0' || target == NULL || target[0] != '/')
+static int write_hit(const char *gate, long pid, unsigned long long starttime) {
+    char path[PATH_MAX];
+    int length = snprintf(path, sizeof(path), "%s.hit", gate);
+    if (length < 0 || length >= (int)sizeof(path))
         return 0;
-    if (path[0] == '/' && strcmp(path, target) == 0)
-        return 1;
-    if (strcmp(last_component(path), last_component(target)) != 0)
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
         return 0;
-
-    char candidate[PATH_MAX];
-    if (path[0] == '/') {
-        if (strlen(path) >= sizeof(candidate))
-            return 0;
-        strcpy(candidate, path);
-    } else if (dirfd == AT_FDCWD) {
-        if (strlen(path) >= sizeof(candidate))
-            return 0;
-        strcpy(candidate, path);
-    } else {
-        int length = snprintf(candidate, sizeof(candidate), "/proc/self/fd/%d/%s", dirfd, path);
-        if (length < 0 || length >= (int)sizeof(candidate))
-            return 0;
+    char line[GATE_IDENTITY_MAX];
+    int line_length = snprintf(line, sizeof(line), "%ld %llu\n", pid, starttime);
+    if (line_length <= 0 || line_length >= (int)sizeof(line)) {
+        close(fd);
+        return 0;
     }
-
-    char resolved[PATH_MAX];
-    resolving = 1;
-    int match = realpath(candidate, resolved) != NULL && strcmp(resolved, target) == 0;
-    resolving = 0;
-    return match;
+    ssize_t written = write(fd, line, (size_t)line_length);
+    close(fd);
+    return written == line_length;
 }
 
-static int scope_matches(const char *gate, const char *expected_exe) {
-    if (expected_exe == NULL || expected_exe[0] != '/') {
-        touch_marker(gate, "scope");
+static int parse_identity(const char *text, long *pid_out, unsigned long long *starttime_out) {
+    errno = 0;
+    char *end = NULL;
+    long pid = strtol(text, &end, 10);
+    if (errno != 0 || end == text || pid <= 0)
         return 0;
-    }
-    if (getpgrp() != getpid()) {
-        touch_marker(gate, "scope");
+    while (*end == ' ' || *end == '\t')
+        end++;
+    errno = 0;
+    char *start_end = NULL;
+    unsigned long long starttime = strtoull(end, &start_end, 10);
+    if (errno != 0 || start_end == end || starttime == 0)
         return 0;
-    }
-
-    char actual[PATH_MAX];
-    ssize_t length = readlink("/proc/self/exe", actual, sizeof(actual) - 1);
-    if (length <= 0) {
-        touch_marker(gate, "scope");
+    while (*start_end == ' ' || *start_end == '\t' ||
+           *start_end == '\n' || *start_end == '\r')
+        start_end++;
+    if (*start_end != '\0')
         return 0;
-    }
-    actual[length] = '\0';
-
-    char resolved_actual[PATH_MAX];
-    char resolved_expected[PATH_MAX];
-    resolving = 1;
-    int ok = realpath(actual, resolved_actual) != NULL &&
-             realpath(expected_exe, resolved_expected) != NULL &&
-             strcmp(resolved_actual, resolved_expected) == 0;
-    resolving = 0;
-    if (!ok)
-        touch_marker(gate, "scope");
-    return ok;
+    *pid_out = pid;
+    *starttime_out = starttime;
+    return 1;
 }
 
-static int wait_for_release(const char *gate) {
+static int read_release_identity(const char *release, long *pid_out,
+                                 unsigned long long *starttime_out) {
+    char buffer[GATE_IDENTITY_MAX];
+    int fd = open(release, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    ssize_t length = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (length <= 0)
+        return 0;
+    buffer[length] = '\0';
+    return parse_identity(buffer, pid_out, starttime_out);
+}
+
+/* 0 = exact release identity, 1 = timeout, 2 = identity mismatch. */
+static int wait_for_release(const char *gate, long self_pid,
+                            unsigned long long self_starttime) {
     char release[PATH_MAX];
     int length = snprintf(release, sizeof(release), "%s.release", gate);
     if (length < 0 || length >= (int)sizeof(release))
@@ -262,8 +188,16 @@ static int wait_for_release(const char *gate) {
     if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
         return 1;
     for (;;) {
-        if (access(release, F_OK) == 0)
-            return 0;
+        if (access(release, F_OK) == 0) {
+            long release_pid = 0;
+            unsigned long long release_starttime = 0;
+            if (read_release_identity(release, &release_pid, &release_starttime)) {
+                if (release_pid == self_pid && release_starttime == self_starttime)
+                    return 0;
+                touch_marker(gate, "identity");
+                return 2;
+            }
+        }
         struct timespec now;
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
             return 1;
@@ -276,27 +210,55 @@ static int wait_for_release(const char *gate) {
     }
 }
 
-static int begin_hold(const char *lookup, int real_available, int dirfd, const char *path,
-                      char gate[PATH_MAX]) {
+static int owned_scope(const char *expected_exe) {
+    if (expected_exe == NULL || expected_exe[0] != '/')
+        return 0;
+    if (getpgrp() != getpid())
+        return 0;
+
+    char actual[PATH_MAX];
+    ssize_t length = readlink("/proc/self/exe", actual, sizeof(actual) - 1);
+    if (length <= 0)
+        return 0;
+    actual[length] = '\0';
+    return strcmp(actual, expected_exe) == 0;
+}
+
+static int scope_matches(const char *gate, const char *expected_exe) {
+    if (!owned_scope(expected_exe)) {
+        touch_marker(gate, "scope");
+        return 0;
+    }
+    return 1;
+}
+
+static int begin_hold(const char *path, char gate[PATH_MAX]) {
     gate[0] = '\0';
-    if (resolving || in_real || atomic_load(&state) == 2)
+    if (in_real || atomic_load(&state) == 2)
         return 0;
 
     const char *configured_gate = getenv("ROOTYARD_TEST_STAT_GATE");
     const char *target = getenv("ROOTYARD_TEST_STAT_GATE_TARGET");
     const char *expected_exe = getenv("ROOTYARD_TEST_STAT_GATE_EXE");
     if (configured_gate == NULL || *configured_gate == '\0' ||
-        target == NULL || *target != '/' ||
+        target == NULL || target[0] != '/' ||
         expected_exe == NULL || expected_exe[0] != '/')
         return 0;
     if (strlen(configured_gate) >= PATH_MAX)
         return 0;
-    if (!target_path_matches(dirfd, path, target))
+    if (path == NULL || path[0] != '/' || strcmp(path, target) != 0)
         return 0;
     if (!scope_matches(configured_gate, expected_exe))
         return 0;
-    if (!real_available) {
+    if (!real_statx_available) {
         touch_marker(configured_gate, "abi");
+        return 0;
+    }
+
+    long self_pid = 0;
+    unsigned long long self_starttime = 0;
+    if (!read_self_identity(&self_pid, &self_starttime)) {
+        touch_marker(configured_gate, "identity");
         return 0;
     }
 
@@ -307,15 +269,22 @@ static int begin_hold(const char *lookup, int real_available, int dirfd, const c
     }
 
     snprintf(gate, PATH_MAX, "%s", configured_gate);
-    touch_marker(gate, "hit");
-    held_timed_out = wait_for_release(gate);
+    if (!write_hit(gate, self_pid, self_starttime)) {
+        touch_marker(gate, "identity");
+        atomic_store(&state, 2);
+        return 0;
+    }
+    int release_status = wait_for_release(gate, self_pid, self_starttime);
+    held_timed_out = release_status == 1;
+    held_identity_ok = release_status == 0;
     if (held_timed_out)
         touch_marker(gate, "timeout");
     return 1;
 }
 
-static void write_outcome(const char *gate, const char *lookup, size_t struct_size,
-                          int result, int result_errno, mode_t mode, int timed_out) {
+static void write_outcome(const char *gate, size_t struct_size, int statx_type,
+                          int real_success, int is_regular, int is_directory,
+                          int abi_verified, int identity_verified, int timed_out) {
     char path[PATH_MAX];
     int length = snprintf(path, sizeof(path), "%s.outcome", gate);
     if (length < 0 || length >= (int)sizeof(path))
@@ -323,173 +292,52 @@ static void write_outcome(const char *gate, const char *lookup, size_t struct_si
     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
     if (fd < 0)
         return;
-    int is_regular = result == 0 && S_ISREG(mode) ? 1 : 0;
-    int is_directory = result == 0 && S_ISDIR(mode) ? 1 : 0;
     dprintf(fd,
             "{\"schema\":\"%s\",\"version\":1,\"events\":1,\"held\":1,"
-            "\"timed_out\":%d,\"duplicate\":0,\"abi_verified\":1,\"scope_verified\":1,"
-            "\"lookup\":\"%s\",\"struct_size\":%zu,\"result\":%d,\"errno\":%d,"
-            "\"mode\":%u,\"is_regular\":%d,\"is_directory\":%d}\n",
-            GATE_SCHEMA, timed_out, lookup, struct_size, result, result_errno,
-            (unsigned int)mode, is_regular, is_directory);
+            "\"timed_out\":%d,\"duplicate\":0,\"abi_verified\":%d,"
+            "\"scope_verified\":1,\"identity_verified\":%d,"
+            "\"lookup\":\"statx\",\"struct_size\":%zu,\"statx_type\":%d,"
+            "\"real_success\":%d,\"is_regular\":%d,\"is_directory\":%d}\n",
+            GATE_SCHEMA, timed_out, abi_verified, identity_verified, struct_size,
+            statx_type, real_success, is_regular, is_directory);
     close(fd);
 }
 
-static void finish_hold(const char *gate, const char *lookup, size_t struct_size,
-                        int result, int result_errno, mode_t mode) {
-    write_outcome(gate, lookup, struct_size, result, result_errno, mode, held_timed_out);
-    atomic_store(&state, 2);
-}
-
-int gate_statx(int dirfd, const char *pathname, int flags, unsigned int mask,
-               struct gate_statx *statxbuf) __asm__("statx");
-
-int gate_statx(int dirfd, const char *pathname, int flags, unsigned int mask,
-               struct gate_statx *statxbuf) {
+int statx(int dirfd, const char *pathname, int flags, unsigned int mask,
+          struct statx *statxbuf) {
     int entry_errno = errno;
     pthread_once(&resolve_once, resolve_real);
 
+    const char *configured_gate = getenv("ROOTYARD_TEST_STAT_GATE");
+    const char *expected_exe = getenv("ROOTYARD_TEST_STAT_GATE_EXE");
+    if (!real_statx_available && configured_gate != NULL && *configured_gate != '\0' &&
+        expected_exe != NULL && owned_scope(expected_exe))
+        touch_marker(configured_gate, "abi");
+
     char gate[PATH_MAX];
-    if (begin_hold("statx", real_statx != NULL, dirfd, pathname, gate)) {
+    if (begin_hold(pathname, gate)) {
         errno = entry_errno;
         in_real = 1;
-        int result = call_real_statx(dirfd, pathname, flags, mask, statxbuf);
+        int result = real_statx(dirfd, pathname, flags, mask, statxbuf);
         int result_errno = errno;
         in_real = 0;
-        finish_hold(gate, "statx", sizeof(struct gate_statx), result, result_errno,
-                    result == 0 && statxbuf != NULL ? (mode_t)statxbuf->stx_mode : (mode_t)0);
+
+        int type_present = result == 0 && statxbuf != NULL &&
+                           (statxbuf->stx_mask & STATX_TYPE) != 0;
+        int is_regular = type_present && S_ISREG(statxbuf->stx_mode);
+        int is_directory = type_present && S_ISDIR(statxbuf->stx_mode);
+        write_outcome(gate, sizeof(struct statx), type_present ? 1 : 0,
+                      result == 0 ? 1 : 0, is_regular ? 1 : 0,
+                      is_directory ? 1 : 0, type_present ? 1 : 0,
+                      held_identity_ok ? 1 : 0, held_timed_out ? 1 : 0);
+        atomic_store(&state, 2);
         errno = result_errno;
         return result;
     }
 
     errno = entry_errno;
-    return call_real_statx(dirfd, pathname, flags, mask, statxbuf);
+    if (real_statx_available)
+        return real_statx(dirfd, pathname, flags, mask, statxbuf);
+    errno = ENOSYS;
+    return -1;
 }
-
-int stat(const char *path, struct stat *buf) {
-    int entry_errno = errno;
-    pthread_once(&resolve_once, resolve_real);
-
-    char gate[PATH_MAX];
-    if (begin_hold("stat", real_stat != NULL, AT_FDCWD, path, gate)) {
-        errno = entry_errno;
-        in_real = 1;
-        int result = call_real_stat(path, buf);
-        int result_errno = errno;
-        in_real = 0;
-        finish_hold(gate, "stat", sizeof(struct stat), result, result_errno,
-                    result == 0 && buf != NULL ? buf->st_mode : (mode_t)0);
-        errno = result_errno;
-        return result;
-    }
-
-    errno = entry_errno;
-    return call_real_stat(path, buf);
-}
-
-int lstat(const char *path, struct stat *buf) {
-    int entry_errno = errno;
-    pthread_once(&resolve_once, resolve_real);
-
-    char gate[PATH_MAX];
-    if (begin_hold("lstat", real_lstat != NULL, AT_FDCWD, path, gate)) {
-        errno = entry_errno;
-        in_real = 1;
-        int result = call_real_lstat(path, buf);
-        int result_errno = errno;
-        in_real = 0;
-        finish_hold(gate, "lstat", sizeof(struct stat), result, result_errno,
-                    result == 0 && buf != NULL ? buf->st_mode : (mode_t)0);
-        errno = result_errno;
-        return result;
-    }
-
-    errno = entry_errno;
-    return call_real_lstat(path, buf);
-}
-
-int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
-    int entry_errno = errno;
-    pthread_once(&resolve_once, resolve_real);
-
-    char gate[PATH_MAX];
-    if (begin_hold("fstatat", real_fstatat != NULL, dirfd, path, gate)) {
-        errno = entry_errno;
-        in_real = 1;
-        int result = call_real_fstatat(dirfd, path, buf, flags);
-        int result_errno = errno;
-        in_real = 0;
-        finish_hold(gate, "fstatat", sizeof(struct stat), result, result_errno,
-                    result == 0 && buf != NULL ? buf->st_mode : (mode_t)0);
-        errno = result_errno;
-        return result;
-    }
-
-    errno = entry_errno;
-    return call_real_fstatat(dirfd, path, buf, flags);
-}
-
-#ifdef __GLIBC__
-int stat64(const char *path, struct stat64 *buf) {
-    int entry_errno = errno;
-    pthread_once(&resolve_once, resolve_real);
-
-    char gate[PATH_MAX];
-    if (begin_hold("stat64", real_stat64 != NULL, AT_FDCWD, path, gate)) {
-        errno = entry_errno;
-        in_real = 1;
-        int result = call_real_stat64(path, buf);
-        int result_errno = errno;
-        in_real = 0;
-        finish_hold(gate, "stat64", sizeof(struct stat64), result, result_errno,
-                    result == 0 && buf != NULL ? buf->st_mode : (mode_t)0);
-        errno = result_errno;
-        return result;
-    }
-
-    errno = entry_errno;
-    return call_real_stat64(path, buf);
-}
-
-int lstat64(const char *path, struct stat64 *buf) {
-    int entry_errno = errno;
-    pthread_once(&resolve_once, resolve_real);
-
-    char gate[PATH_MAX];
-    if (begin_hold("lstat64", real_lstat64 != NULL, AT_FDCWD, path, gate)) {
-        errno = entry_errno;
-        in_real = 1;
-        int result = call_real_lstat64(path, buf);
-        int result_errno = errno;
-        in_real = 0;
-        finish_hold(gate, "lstat64", sizeof(struct stat64), result, result_errno,
-                    result == 0 && buf != NULL ? buf->st_mode : (mode_t)0);
-        errno = result_errno;
-        return result;
-    }
-
-    errno = entry_errno;
-    return call_real_lstat64(path, buf);
-}
-
-int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
-    int entry_errno = errno;
-    pthread_once(&resolve_once, resolve_real);
-
-    char gate[PATH_MAX];
-    if (begin_hold("fstatat64", real_fstatat64 != NULL, dirfd, path, gate)) {
-        errno = entry_errno;
-        in_real = 1;
-        int result = call_real_fstatat64(dirfd, path, buf, flags);
-        int result_errno = errno;
-        in_real = 0;
-        finish_hold(gate, "fstatat64", sizeof(struct stat64), result, result_errno,
-                    result == 0 && buf != NULL ? buf->st_mode : (mode_t)0);
-        errno = result_errno;
-        return result;
-    }
-
-    errno = entry_errno;
-    return call_real_fstatat64(dirfd, path, buf, flags);
-}
-#endif

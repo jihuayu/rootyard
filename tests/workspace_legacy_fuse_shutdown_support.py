@@ -464,6 +464,40 @@ def wait_owned_mount(pid: int, mountpoint: Path, deadline: float) -> dict:
     raise LegacyAcceptanceError("owned FUSE mount was not observed within the startup observation bound")
 
 
+def assert_owned_mounts_snapshot(holder_pid: int, expected) -> int:
+    """Require one final mountinfo read to contain every exact owned mount ID.
+
+    ``expected`` is a sequence of ``(mountpoint, mount_id)`` pairs already
+    observed from this run. The helper reads mountinfo once, so two healthy
+    mounts cannot be accepted from separate snapshots with a teardown gap
+    between them. It never substitutes a replacement mount at either path.
+    """
+    wanted = {}
+    for mountpoint, mount_id in expected:
+        path = str(mountpoint)
+        value = int(mount_id)
+        if value <= 0:
+            raise LegacyAcceptanceError("expected owned mount id is not positive")
+        if path in wanted or value in wanted.values():
+            raise LegacyAcceptanceError("expected owned mount identities are not unique")
+        wanted[path] = value
+    if not wanted:
+        raise LegacyAcceptanceError("expected owned mount set is empty")
+    rows = support.read_process_mountinfo(holder_pid)
+    for path, mount_id in wanted.items():
+        at_path = [
+            row for row in rows
+            if row["mountpoint"] == path
+            and row["source"] == FUSE_SOURCE
+            and (row["fstype"] == "fuse" or row["fstype"].startswith("fuse."))
+        ]
+        if len(at_path) != 1 or int(at_path[0]["mount_id"]) != mount_id:
+            raise LegacyAcceptanceError(
+                "one final mountinfo snapshot did not contain both original owned mounts"
+            )
+    return len(wanted)
+
+
 def wait_exact_mount_gone(holder_pid: int, mountpoint: Path, mount_id: int, deadline: float) -> None:
     """Require the exact old mount ID absent and no replacement at that path."""
     expected = str(mountpoint)

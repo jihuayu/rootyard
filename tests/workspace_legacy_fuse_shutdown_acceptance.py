@@ -29,7 +29,6 @@ from pathlib import Path
 import shlex
 import shutil
 import signal
-import stat
 import sys
 import tempfile
 import time
@@ -407,11 +406,10 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         self.owned_records.clear()
 
         # The one-use preload gate is copied into this service child only. It
-        # holds the product's exact statx/stat-family lookup of the corrupted
-        # lower .git (the real `is_dir` check at src/workspaces/mounts.rs:251)
-        # before that lookup returns, so the two earlier owned mounts can be
-        # observed independently before the real failure is released. The gate
-        # verifies /proc/self/exe and process-group scope.
+        # holds the product's exact proven statx lookup of the corrupted lower
+        # .git (the real `is_dir` check at src/workspaces/mounts.rs:251) before
+        # that lookup returns, so both earlier owned mounts can be accepted
+        # from one final mountinfo snapshot before the real failure is released.
         prior_gate_env = legacy_fixtures.snapshot_stat_gate_env(self.h)
         gate = legacy_fixtures.install_stat_gate(
             self.h, broken_lower / ".git", self.binary
@@ -422,7 +420,20 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             # Popen copied the environment. No later psql/Git/CLI child may
             # inherit this test-only preload.
             legacy_fixtures.restore_stat_gate_env(self.h, prior_gate_env)
-        legacy_fixtures.wait_stat_gate(gate)
+        hit_identity = legacy_fixtures.wait_stat_gate(gate)
+        # Capture the owned Popen identity only after the gate proved the
+        # service child is already its own process-group leader.
+        service_identity = legacy_ownership.capture_service_identity(service_proc)
+        self.assertEqual(
+            hit_identity["pid"],
+            service_identity["service_pid"],
+            "the held metadata lookup did not name the exact owned service PID",
+        )
+        self.assertEqual(
+            hit_identity["starttime"],
+            service_identity["service_starttime"],
+            "the held metadata lookup did not name the exact service starttime",
+        )
         holder, holder_proof = self._attach_holder(service_proc)
         observed = {}
         for workspace, paths in healthy:
@@ -445,20 +456,54 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             "the observed mounts are not the exact two healthy workspaces",
         )
 
+        # One final snapshot is the authoritative proof that both original
+        # mount IDs are simultaneously present. It is taken before the shared
+        # 5 s cleanup deadline is armed.
+        final_mount_count = legacy_support.assert_owned_mounts_snapshot(
+            holder.pid,
+            tuple(
+                (paths["mountpoint"], observed[workspace["id"]])
+                for workspace, paths in healthy
+            ),
+        )
+        self.assertEqual(
+            final_mount_count,
+            2,
+            "final mountinfo snapshot did not contain both healthy mounts",
+        )
         namespace = int(holder_proof["service_namespace"])
-        # Arm the existing one absolute 5 s cleanup deadline immediately
+        # Recheck the exact launch identity immediately before release, then
+        # arm the existing one absolute 5 s cleanup deadline immediately
         # before releasing the observed real lookup.
+        rechecked_identity = legacy_ownership.recheck_service_identity(
+            service_proc, service_identity
+        )
         deadline = self._arm_cleanup_deadline()
-        legacy_fixtures.release_stat_gate(gate)
+        legacy_fixtures.release_stat_gate(
+            gate,
+            rechecked_identity["service_pid"],
+            rechecked_identity["service_starttime"],
+        )
         code = support.wait_process_exit(
             self.h.proc, timeout=max(0.0, deadline - time.monotonic())
         )
         self._finish_service_exit()
+        # The child is reaped, so the completed receipt is read exactly once.
         stat_gate = legacy_fixtures.read_stat_gate_outcome(gate)
         self.assertGreater(code, 0, "partial reconcile failure did not return a positive application exit status")
-        self.assertEqual(stat_gate["result"], 0, "the held lookup did not return its real success result")
-        self.assertTrue(stat.S_ISREG(stat_gate["mode"]), "the held lookup did not observe a regular file")
-        self.assertFalse(stat.S_ISDIR(stat_gate["mode"]), "the held lookup observed a directory")
+        self.assertEqual(
+            stat_gate["real_success"], 1, "the held lookup did not return its real success result"
+        )
+        self.assertEqual(
+            stat_gate["statx_type"], 1, "the returned statx mask did not attest STATX_TYPE"
+        )
+        self.assertEqual(
+            stat_gate["identity_verified"],
+            1,
+            "the release identity was not the exact owned service identity",
+        )
+        self.assertTrue(stat_gate["is_regular"], "the held lookup did not observe a regular file")
+        self.assertFalse(stat_gate["is_directory"], "the held lookup observed a directory")
 
         for workspace, paths in healthy:
             legacy_support.wait_exact_mount_gone(
@@ -513,14 +558,17 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
             "duplicate": stat_gate["duplicate"],
             "abi_verified": stat_gate["abi_verified"],
             "scope_verified": stat_gate["scope_verified"],
+            "identity_verified": stat_gate["identity_verified"],
             "lookup": stat_gate["lookup"],
             "struct_size": stat_gate["struct_size"],
-            "result": stat_gate["result"],
-            "errno": stat_gate["errno"],
-            "mode": stat_gate["mode"],
+            "statx_type": stat_gate["statx_type"],
+            "real_success": stat_gate["real_success"],
             "is_regular": stat_gate["is_regular"],
             "is_directory": stat_gate["is_directory"],
             "real_regular_file": True,
+            "hit_identity_matches": True,
+            "release_identity_verified": bool(stat_gate["identity_verified"]),
+            "final_mount_snapshot_matches": final_mount_count,
         }
 
     def test_post_reconcile_api_bind_failure_cleans_owned_mount(self):

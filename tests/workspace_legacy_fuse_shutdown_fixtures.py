@@ -21,7 +21,6 @@ import os
 from pathlib import Path
 import shutil
 import socket
-import stat
 import sys
 import time
 
@@ -51,16 +50,14 @@ STAT_GATE_ENV_NAMES = (
     "ROOTYARD_TEST_STAT_GATE_EXE",
 )
 STAT_GATE_HOLD_SECONDS = 30.0
-STAT_GATE_OUTCOME_SECONDS = 10.0
+STAT_GATE_STATX_SIZE = 256
 _STAT_GATE_OUTCOME_FIELDS = frozenset((
     "schema", "version", "events", "held", "timed_out", "duplicate",
-    "abi_verified", "scope_verified", "lookup", "struct_size", "result",
-    "errno", "mode", "is_regular", "is_directory",
+    "abi_verified", "scope_verified", "identity_verified", "lookup",
+    "struct_size", "statx_type", "real_success", "is_regular", "is_directory",
 ))
-_STAT_GATE_FAILURES = ("duplicate", "abi", "scope", "timeout")
-_STAT_GATE_LOOKUPS = frozenset((
-    "statx", "stat", "lstat", "fstatat", "stat64", "lstat64", "fstatat64",
-))
+_STAT_GATE_FAILURES = ("duplicate", "abi", "scope", "identity", "timeout")
+_STAT_GATE_LOOKUP = "statx"
 _TESTS_DIR = Path(__file__).resolve().parent
 
 
@@ -377,27 +374,55 @@ def _assert_no_stat_gate_failure(gate) -> None:
             raise LegacyAcceptanceError(f"legacy metadata gate reported {suffix}")
 
 
-def wait_stat_gate(gate, timeout: float = STAT_GATE_HOLD_SECONDS) -> Path:
-    """Wait for the one exact metadata lookup to be held before its result."""
+def _parse_stat_gate_identity(payload: str) -> dict:
+    fields = payload.split()
+    if len(fields) != 2:
+        raise ValueError("identity must contain exactly two fields")
+    pid, starttime = (int(value, 10) for value in fields)
+    if pid < 1 or starttime < 1:
+        raise ValueError("identity fields must be positive")
+    return {"pid": pid, "starttime": starttime}
+
+
+def wait_stat_gate(gate, timeout: float = STAT_GATE_HOLD_SECONDS) -> dict:
+    """Wait for the one exact lookup and return its private PID/starttime binding."""
     gate = Path(gate)
     hit = _gate_marker(gate, "hit")
     deadline = time.monotonic() + float(timeout)
     while time.monotonic() < deadline:
         _assert_no_stat_gate_failure(gate)
         if hit.exists():
-            _assert_no_stat_gate_failure(gate)
-            return hit
+            try:
+                if hit.stat().st_size > 128:
+                    raise LegacyAcceptanceError("legacy metadata gate hit exceeds the bounded size")
+                identity = _parse_stat_gate_identity(hit.read_text(encoding="utf-8"))
+            except LegacyAcceptanceError:
+                raise
+            except (OSError, UnicodeError, ValueError):
+                identity = None
+            if identity is not None:
+                _assert_no_stat_gate_failure(gate)
+                return identity
         time.sleep(0.05)
     _assert_no_stat_gate_failure(gate)
     raise LegacyAcceptanceError("legacy metadata gate was not reached within the bounded setup")
 
 
-def release_stat_gate(gate) -> Path:
-    """Release the single held metadata lookup exactly once."""
+def release_stat_gate(gate, pid, starttime) -> Path:
+    """Release the single held lookup bound to the exact owned PID/starttime."""
+    if isinstance(pid, bool) or isinstance(starttime, bool):
+        raise LegacyAcceptanceError("legacy metadata gate release identity is not positive")
+    try:
+        pid = int(pid)
+        starttime = int(starttime)
+    except (TypeError, ValueError):
+        raise LegacyAcceptanceError("legacy metadata gate release identity is not positive") from None
+    if pid < 1 or starttime < 1:
+        raise LegacyAcceptanceError("legacy metadata gate release identity is not positive")
     release = _gate_marker(gate, "release")
     try:
         with open(release, "xb") as stream:
-            stream.write(b"release\n")
+            stream.write(f"{pid} {starttime}\n".encode("ascii"))
     except FileExistsError:
         raise LegacyAcceptanceError("legacy metadata gate release already existed") from None
     except OSError as error:
@@ -406,7 +431,7 @@ def release_stat_gate(gate) -> Path:
 
 
 def validate_stat_gate_outcome(payload) -> dict:
-    """Accept only the real, successful, non-directory regular-file lookup."""
+    """Accept only exact audited statx success with returned regular-file type."""
     if not isinstance(payload, dict):
         raise LegacyAcceptanceError("legacy metadata gate outcome is not an object")
     if set(payload) != _STAT_GATE_OUTCOME_FIELDS:
@@ -420,53 +445,35 @@ def validate_stat_gate_outcome(payload) -> dict:
         "duplicate": 0,
         "abi_verified": 1,
         "scope_verified": 1,
+        "identity_verified": 1,
+        "lookup": _STAT_GATE_LOOKUP,
+        "struct_size": STAT_GATE_STATX_SIZE,
+        "statx_type": 1,
+        "real_success": 1,
         "is_regular": 1,
         "is_directory": 0,
     }
     for name, expected in exact.items():
         if type(payload.get(name)) is not type(expected) or payload.get(name) != expected:
             raise LegacyAcceptanceError(f"legacy metadata gate outcome {name} is not exact")
-    lookup = payload.get("lookup")
-    if not isinstance(lookup, str) or lookup not in _STAT_GATE_LOOKUPS:
-        raise LegacyAcceptanceError("legacy metadata gate lookup ABI is not verified")
-    for name in ("struct_size", "result", "errno", "mode"):
-        if type(payload.get(name)) is not int:
-            raise LegacyAcceptanceError(f"legacy metadata gate outcome {name} is not an integer")
-    if payload["struct_size"] < 1:
-        raise LegacyAcceptanceError("legacy metadata gate struct size is not positive")
-    if payload["result"] != 0:
-        raise LegacyAcceptanceError("legacy metadata gate did not retain a successful real result")
-    if payload["errno"] < 0:
-        raise LegacyAcceptanceError("legacy metadata gate errno is not a real errno")
-    mode = payload["mode"]
-    if mode < 0 or not stat.S_ISREG(mode) or stat.S_ISDIR(mode):
-        raise LegacyAcceptanceError("legacy metadata gate did not observe regular-file metadata")
     return payload
 
 
-def read_stat_gate_outcome(
-    gate, timeout: float = STAT_GATE_OUTCOME_SECONDS
-) -> dict:
-    """Read the bounded outcome written only after the real metadata returned."""
+def read_stat_gate_outcome(gate) -> dict:
+    """Read the completed bounded receipt exactly once, after the child was reaped."""
     gate = Path(gate)
-    outcome = _gate_marker(gate, "outcome")
-    deadline = time.monotonic() + float(timeout)
-    last_error = None
-    while time.monotonic() < deadline:
-        if outcome.is_file():
-            try:
-                if outcome.stat().st_size > 4096:
-                    raise LegacyAcceptanceError("legacy metadata gate outcome exceeds the bounded size")
-                payload = json.loads(outcome.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, ValueError) as error:
-                last_error = error
-            else:
-                validated = validate_stat_gate_outcome(payload)
-                _assert_no_stat_gate_failure(gate)
-                return validated
-        _assert_no_stat_gate_failure(gate)
-        time.sleep(0.05)
     _assert_no_stat_gate_failure(gate)
-    if last_error is not None:
-        raise LegacyAcceptanceError("legacy metadata gate outcome is unreadable") from last_error
-    raise LegacyAcceptanceError("legacy metadata gate outcome was not observed within the bound")
+    outcome = _gate_marker(gate, "outcome")
+    try:
+        if not outcome.is_file():
+            raise LegacyAcceptanceError("legacy metadata gate outcome is missing")
+        if outcome.stat().st_size > 4096:
+            raise LegacyAcceptanceError("legacy metadata gate outcome exceeds the bounded size")
+        payload = json.loads(outcome.read_text(encoding="utf-8"))
+    except LegacyAcceptanceError:
+        raise
+    except (OSError, UnicodeError, ValueError) as error:
+        raise LegacyAcceptanceError("legacy metadata gate outcome is unreadable") from error
+    validated = validate_stat_gate_outcome(payload)
+    _assert_no_stat_gate_failure(gate)
+    return validated
