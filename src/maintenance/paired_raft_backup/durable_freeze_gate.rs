@@ -419,5 +419,5 @@ fn close_repo_access_and_verify_quiescent(
             .seal()?,
         );
     }
-    Ok(())
+    Ok(receipts)
 }
