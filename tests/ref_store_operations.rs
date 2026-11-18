@@ -286,6 +286,19 @@ async fn reserved_sequences_are_transactional_and_monotonic() -> Result<()> {
         let tx = client.transaction().await?;
         assert_eq!(store.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &lane, deadline()).await?.sequence(), 2);
         tx.rollback().await?;
+
+        let tx = client.transaction().await?;
+        let nearing_end = identity_with_lane(repo, actor, lane.as_str(), i64::MAX - 1, Uuid::new_v4(), 2);
+        store.begin(&tx, &nearing_end, deadline()).await?;
+        let last = store.reserve_sequence(&tx, repo, actor, nearing_end.operation_id(), &lane, deadline()).await?;
+        assert_eq!(last.sequence(), i64::MAX);
+        assert_eq!(last.operation_id(), nearing_end.operation_id());
+        tx.commit().await?;
+
+        let tx = client.transaction().await?;
+        let exhausted = store.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &lane, deadline()).await;
+        assert!(matches!(exhausted, Err(RefStoreError::Database(_))));
+        tx.rollback().await?;
         Ok::<(), anyhow::Error>(())
     })
     .await
