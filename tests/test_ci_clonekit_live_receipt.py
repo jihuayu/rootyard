@@ -370,6 +370,10 @@ class LiveReceiptTest(unittest.TestCase):
         self.assertLess(source.index(body_error), source.index(body_record))
         self.assertLess(source.index(body_record), source.index(teardown))
         self.assertLess(source.index(teardown), source.index(cleanup))
+        self.assertNotIn("is_assert_phase", source)
+        self.assertIn("unwrap_or(Class::Other)", source)
+        self.assertIn("pub(crate)fnfail_assert", source)
+        self.assertIn("self.record(self.phase,Class::Assert,file,line);", source)
         self.assertIn("matchcleanup{Ok(())=>body,Err(err)=>Err(err),}", source)
         self.assertIn("Ok(())=>diag.complete()", source)
 

@@ -6,14 +6,16 @@
 //! marker with a closed phase/class and a source location, never an error body,
 //! environment value or command output. Successful body plus cleanup writes one fixed
 //! completion marker to `ROOTYARD_LIVE_COMPLETION_FILE`; the collector requires exactly
-//! one marker line for a green live step.
+//! one marker line for a green live step. ASSERT is reserved for explicitly observed
+//! predicate failures; external or unknown errors are OTHER unless they carry an
+//! existing typed CloneKit class.
 
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use deadpool_postgres::{Manager, Pool};
 use rootyard::blob_store::{config::BlobProfile, opendal::BlobStore};
 use rootyard::ci_checkouts::clonekit::{
@@ -74,22 +76,10 @@ impl LivePhase {
             Self::Teardown => "TEARDOWN",
         }
     }
-
-    const fn is_assert_phase(self) -> bool {
-        matches!(
-            self,
-            Self::OperationRegister
-                | Self::Publish
-                | Self::Readiness
-                | Self::Checkout
-                | Self::ActiveHolds
-                | Self::DeniedReplay
-        )
-    }
 }
 
 #[derive(Clone, Copy)]
-struct Frame {
+pub(crate) struct Frame {
     phase: LivePhase,
     class: Class,
     file: &'static str,
@@ -122,13 +112,28 @@ impl LiveRecorder {
         }
     }
 
-    /// Preserve a returned error's exact typed class at the last marked operation.
+    /// Preserve the first returned error's typed class at the last marked operation.
+    ///
+    /// Only an existing typed `CloneKitError` maps to a non-OTHER class here. Explicit
+    /// fixture predicates call [`Self::fail_assert`] at their own source instead.
     pub(crate) fn observe_final(&mut self, err: &anyhow::Error) {
-        let class = err
-            .downcast_ref::<CloneKitError>()
-            .map(Class::from_ck)
-            .unwrap_or_else(|| if self.phase.is_assert_phase() { Class::Assert } else { Class::Other });
+        let class = err.downcast_ref::<CloneKitError>().map(Class::from_ck).unwrap_or(Class::Other);
         self.record(self.phase, class, self.file, self.line);
+    }
+
+    /// Record an explicit predicate failure at the failing predicate site.
+    pub(crate) fn fail_assert(&mut self, file: &'static str, line: u32) {
+        self.record(self.phase, Class::Assert, file, line);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorded_frame(&self) -> Option<Frame> {
+        self.first
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disarm_for_test(&mut self) {
+        self.armed = false;
     }
 
     /// Write exactly one successful exact-case completion after body and cleanup finish.
@@ -264,7 +269,13 @@ async fn run_body(diag: &mut LiveRecorder, pool: &Pool) -> Result<()> {
         RequestDigest::from_bytes([1u8; 32]),
     )?;
     let tx = c.transaction().await?;
-    ensure!(PgRefStore.begin(&tx, &op, pg_dl).await?.record.state() == OperationState::Pending);
+    let begun = PgRefStore.begin(&tx, &op, pg_dl).await?;
+    if begun.record.state() != OperationState::Pending {
+        diag.fail_assert(file!(), line!());
+        return Err(anyhow::Error::msg(
+            "Condition failed: `PgRefStore.begin(&tx, &op, pg_dl).await?.record.state() == OperationState::Pending`",
+        ));
+    }
     tx.commit().await?;
     drop(c);
     diag.mark(LivePhase::BuildKit, file!(), line!());
@@ -295,11 +306,19 @@ async fn run_body(diag: &mut LiveRecorder, pool: &Pool) -> Result<()> {
         None,
     )
     .await?;
-    ensure!(receipts.len() == 2 && built.manifest.pack.as_ref().and_then(|p| p.blob_locator.as_ref()).is_some());
+    if receipts.len() != 2 || built.manifest.pack.as_ref().and_then(|p| p.blob_locator.as_ref()).is_none() {
+        diag.fail_assert(file!(), line!());
+        return Err(anyhow::Error::msg(
+            "Condition failed: `receipts.len() == 2 && built.manifest.pack.as_ref().and_then(|p| p.blob_locator.as_ref()).is_some()`",
+        ));
+    }
     diag.mark(LivePhase::Readiness, file!(), line!());
     // Publish from the unserved core lane, then become ready for the checkout oracle.
     let updated = pool.get().await?.execute("UPDATE repositories SET state='ready' WHERE id=$1", &[&ids.1]).await?;
-    ensure!(updated == 1, "fixture readiness transition updated {updated} rows");
+    if updated != 1 {
+        diag.fail_assert(file!(), line!());
+        return Err(anyhow::Error::msg(format!("fixture readiness transition updated {updated} rows")));
+    }
     diag.mark(LivePhase::JobInsert, file!(), line!());
     let c2 = add_commit(&repo, "next.txt", b"delta2\n", "c2")?;
     let (signed, ctx) = make_grant(ids, Sha1, &c2, None, now)?;
@@ -309,18 +328,26 @@ async fn run_body(diag: &mut LiveRecorder, pool: &Pool) -> Result<()> {
     let pg_auth: Arc<dyn CloneKitAuthorityOracle> = Arc::new(PgCheckoutAuthorityOracle::new(Pool::clone(pool)));
     let co = Co { manifest: Some(&built.manifest), blob: Some(&blob), ..Co::new(&vr) };
     let outcome = co.run(&signed, &ctx, &pg_auth, pol(true, true), repo.to_str().expect("utf8"), None).await?;
-    ensure!(
-        outcome.telemetry.strategy == CheckoutStrategy::CloneKitIncremental { kit_generation: 1, base_commit_oid: c1 }
-    );
+    if outcome.telemetry.strategy != (CheckoutStrategy::CloneKitIncremental { kit_generation: 1, base_commit_oid: c1 })
+    {
+        diag.fail_assert(file!(), line!());
+        return Err(anyhow::Error::msg(
+            "Condition failed: `outcome.telemetry.strategy == CheckoutStrategy::CloneKitIncremental { kit_generation: 1, base_commit_oid: c1 }`",
+        ));
+    }
     diag.mark(LivePhase::ActiveHolds, file!(), line!());
-    ensure!(
-        pool.get()
-            .await?
-            .query_one("SELECT count(*) FROM artifact_holds WHERE state = 'active'", &[])
-            .await?
-            .get::<_, i64>(0)
-            == 2
-    );
+    let active_holds = pool
+        .get()
+        .await?
+        .query_one("SELECT count(*) FROM artifact_holds WHERE state = 'active'", &[])
+        .await?
+        .get::<_, i64>(0);
+    if active_holds != 2 {
+        diag.fail_assert(file!(), line!());
+        return Err(anyhow::Error::msg(
+            "Condition failed: `pool.get().await?.query_one(\"SELECT count(*) FROM artifact_holds WHERE state = 'active'\", &[]).await?.get::<_, i64>(0) == 2`",
+        ));
+    }
     diag.mark(LivePhase::Revocation, file!(), line!());
     pool.get()
         .await?
@@ -330,9 +357,73 @@ async fn run_body(diag: &mut LiveRecorder, pool: &Pool) -> Result<()> {
         )
         .await?;
     diag.mark(LivePhase::DeniedReplay, file!(), line!());
-    ensure!(matches!(
-        co.run(&signed, &ctx, &pg_auth, pol(false, true), repo.to_str().expect("utf8"), None).await,
-        Err(CloneKitError::GrantRevoked(_))
-    ));
+    let denied = co.run(&signed, &ctx, &pg_auth, pol(false, true), repo.to_str().expect("utf8"), None).await;
+    if !matches!(denied, Err(CloneKitError::GrantRevoked(_))) {
+        diag.fail_assert(file!(), line!());
+        return Err(anyhow::Error::msg(
+            "Condition failed: `matches!(co.run(&signed, &ctx, &pg_auth, pol(false, true), repo.to_str().expect(\"utf8\"), None).await, Err(CloneKitError::GrantRevoked(_)))`",
+        ));
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame_for(phase: LivePhase, err: &anyhow::Error) -> Frame {
+        let mut recorder = LiveRecorder::new(file!(), line!());
+        recorder.mark(phase, file!(), line!());
+        recorder.observe_final(err);
+        let frame = recorder.recorded_frame().expect("recorded frame");
+        recorder.disarm_for_test();
+        frame
+    }
+
+    #[test]
+    fn unknown_errors_are_other_without_phase_inference() {
+        // Checkout and Readiness were previously classified by the phase heuristic.
+        let checkout = frame_for(LivePhase::Checkout, &anyhow::anyhow!("postgres unavailable"));
+        assert_eq!(checkout.class, Class::Other);
+        let readiness = frame_for(LivePhase::Readiness, &anyhow::anyhow!("refstore unavailable"));
+        assert_eq!(readiness.class, Class::Other);
+    }
+
+    #[test]
+    fn typed_clonekit_classes_remain_exact() {
+        let database =
+            frame_for(LivePhase::Publish, &anyhow::Error::new(CloneKitError::DatabaseFailed("synthetic".to_owned())));
+        assert_eq!(database.class, Class::DatabaseFailed);
+        let revoked = frame_for(LivePhase::DeniedReplay, &anyhow::Error::new(CloneKitError::GrantRevoked("synthetic")));
+        assert_eq!(revoked.class, Class::GrantRevoked);
+        let git = frame_for(LivePhase::Checkout, &anyhow::Error::new(CloneKitError::GitFailed("synthetic".to_owned())));
+        assert_eq!(git.class, Class::GitFailed);
+    }
+
+    #[test]
+    fn explicit_predicate_failure_is_assert_and_keeps_first_error() {
+        let mut recorder = LiveRecorder::new(file!(), line!());
+        recorder.mark(LivePhase::Checkout, file!(), line!());
+        let predicate_line = line!();
+        recorder.fail_assert(file!(), predicate_line);
+        recorder.observe_final(&anyhow::anyhow!("later body error"));
+        let frame = recorder.recorded_frame().expect("recorded frame");
+        assert_eq!(frame.phase, LivePhase::Checkout);
+        assert_eq!(frame.class, Class::Assert);
+        assert_eq!(frame.line, predicate_line);
+        recorder.disarm_for_test();
+    }
+
+    #[test]
+    fn first_body_error_survives_later_teardown_error() {
+        let mut recorder = LiveRecorder::new(file!(), line!());
+        recorder.mark(LivePhase::Checkout, file!(), line!());
+        recorder.observe_final(&anyhow::anyhow!("body failure"));
+        recorder.mark(LivePhase::Teardown, file!(), line!());
+        recorder.observe_final(&anyhow::anyhow!("cleanup failure"));
+        let frame = recorder.recorded_frame().expect("recorded frame");
+        assert_eq!(frame.phase, LivePhase::Checkout);
+        assert_eq!(frame.class, Class::Other);
+        recorder.disarm_for_test();
+    }
 }
