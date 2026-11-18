@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::fs::{self, File, OpenOptions};
+use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -46,8 +46,7 @@ pub enum HoldLifecycleState {
 }
 
 /// Non-premature hold guard that refuses release during `Pending` / `CommitUnknown` outcomes.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationHoldGuard {
     pub operation_id: Uuid,
     pub hold_ids: Vec<Uuid>,
@@ -120,7 +119,7 @@ impl QuarantineSlot {
     }
 
     pub fn record_unpromoted_blob(&mut self, locator: &BlobLocator) {
-        self.unpromoted_blobs.push(locator.path().to_owned());
+        self.unpromoted_blobs.push(locator.path());
     }
 
     pub fn sweep(mut self) -> QuarantineSweepRecord {
@@ -394,12 +393,14 @@ impl PushBlobCarrier for CapacityContractBlobCarrier {
 fn compute_blob_closure_digest(store: &BlobStore, pack: &BlobReceipt, idx: &BlobReceipt) -> String {
     let mut h = Sha256::new();
     h.update(b"push-blob-closure-v1\n");
+    let pack_path = pack.locator().path();
+    let idx_path = idx.locator().path();
     for s in [
-        store.backend_identity().as_hex().as_str(),
-        pack.locator().path(),
-        pack.sha256(),
-        idx.locator().path(),
-        idx.sha256(),
+        store.backend_identity().as_hex(),
+        pack_path.as_str(),
+        pack.verified_sha256(),
+        idx_path.as_str(),
+        idx.verified_sha256(),
     ] {
         h.update((s.len() as u64).to_be_bytes());
         h.update(s.as_bytes());

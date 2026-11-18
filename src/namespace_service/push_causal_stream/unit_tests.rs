@@ -336,7 +336,7 @@ fn version_graph_dependency_closure_blocks_foreign_or_retired_base_pack() {
         vec![],
     );
     let op_dig = operation_digest(&op_in).unwrap();
-    let vid = derive_candidate_version_id(&op_in, &op_dig, &ref_name, None).unwrap();
+    let vid = derive_candidate_version_id(&op_in, op_dig, &ref_name, None).unwrap();
     let cset = compute_commit_set_id(&CommitSetInput::new(
         other_realm,
         1,
@@ -387,8 +387,8 @@ fn version_graph_dependency_closure_blocks_foreign_or_retired_base_pack() {
             pack_length: 512,
             idx_sha256: "c".repeat(64),
             idx_length: 512,
-            pack_locator: BlobLocator::new(tenant, repo, 1, "packs", &"b".repeat(64), 512).unwrap(),
-            idx_locator: BlobLocator::new(tenant, repo, 1, "pack-idx", &"c".repeat(64), 512).unwrap(),
+            pack_locator: BlobLocator::new(tenant, repo, 1, Uuid::new_v4(), "packs", &"b".repeat(64), 512).unwrap(),
+            idx_locator: BlobLocator::new(tenant, repo, 1, Uuid::new_v4(), "pack-idx", &"c".repeat(64), 512).unwrap(),
             authorized_for_principal: true,
         }],
     };

@@ -77,11 +77,11 @@ pub fn verify_base_packs_and_dependencies<'a>(
         })?;
         let closure = verify_dependency_closure(graph, &snapshot.realm, &root_id)
             .map_err(|e| PushCausalError::UnauthorizedBaseDependency(format!("dependency closure failed: {e:?}")))?;
-        base_version_ids.insert(closure.root.version_id().as_hex());
-        for dep in &closure.dependencies {
+        base_version_ids.insert(closure.root().version_id().as_hex());
+        for dep in closure.dependencies() {
             base_version_ids.insert(dep.version_id().as_hex());
         }
-        for pack in &closure.packs {
+        for pack in closure.packs() {
             if pack.storage_tenant_id() != snapshot.tenant_id || pack.authority_id() != snapshot.repository_id {
                 return Err(PushCausalError::UnauthorizedBaseDependency(
                     "closure base pack belongs to another tenant or authority".into(),
@@ -89,7 +89,7 @@ pub fn verify_base_packs_and_dependencies<'a>(
             }
             allowed_pack_entries.insert(pack.entry());
         }
-        closure.closure_digest.as_hex()
+        closure.closure_digest().as_hex()
     } else {
         let mut h = Sha256::new();
         h.update(b"empty-base-closure-v1\n");
@@ -148,7 +148,7 @@ where
     } = params;
 
     auth.check_active()?;
-    if ingest_limits.max_pack_objects as usize > VERIFIER_MAX_OBJECTS {
+    if u64::from(ingest_limits.max_pack_objects) > VERIFIER_MAX_OBJECTS {
         return Err(PushCausalError::LimitExceeded("configured max_pack_objects exceeds VERIFIER_MAX_OBJECTS"));
     }
 
@@ -260,8 +260,7 @@ async fn prove_inside_quarantine(
     )
     .await?;
 
-    if let Some(ref resolved_pack) = ingested.incoming_pack_path {
-        let _ = resolved_pack;
+    if ingested.has_pack {
         slot.register_file(stage.resolved_pack_path.clone());
         slot.register_file(stage.resolved_idx_path.clone());
     }
@@ -352,7 +351,7 @@ async fn prove_inside_quarantine(
         idx_bytes,
         pack_locator,
         idx_locator,
-        blob_backend_identity: store.backend_identity().as_hex(),
+        blob_backend_identity: store.backend_identity().as_hex().to_owned(),
         object_count: stage.resolved_object_count,
         delta_object_count: stage.delta_object_count,
         max_delta_chain_depth: stage.max_delta_chain_depth,

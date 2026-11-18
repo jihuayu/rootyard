@@ -54,7 +54,7 @@ async fn e2e_sha1_and_sha256_thin_packs_multi_deps_duplicates_and_fail_closed() 
             pack_id: p1_id,
             reg_id: r1_id,
             pack_len: b1.2 + b1.5,
-            backend_hex: &backend_hex,
+            backend_hex,
             provider: prov,
         });
         let v2 = build_base_version(BaseVersionSpec {
@@ -68,7 +68,7 @@ async fn e2e_sha1_and_sha256_thin_packs_multi_deps_duplicates_and_fail_closed() 
             pack_id: p2_id,
             reg_id: r2_id,
             pack_len: b2.2 + b2.5,
-            backend_hex: &backend_hex,
+            backend_hex,
             provider: prov,
         });
         let mut graph = VersionGraph::new();
@@ -159,7 +159,7 @@ async fn e2e_sha1_and_sha256_thin_packs_multi_deps_duplicates_and_fail_closed() 
             })
             .await?;
 
-        out.proof.verify_scope(&snapshot, &backend_hex)?;
+        out.proof.verify_scope(&snapshot, backend_hex)?;
         assert!(!out.proof.resolved_thin_base_oids.is_empty());
         assert_eq!(out.hold_guard.state, HoldLifecycleState::ConsumedCommitted);
         assert_eq!(exec.sm().read_refs(repo).get("refs/heads/main"), Some(&c3));
@@ -167,7 +167,7 @@ async fn e2e_sha1_and_sha256_thin_packs_multi_deps_duplicates_and_fail_closed() 
         assert!(s3.objects.lock().unwrap().contains_key(&LoopbackS3::key(out.proof.pack_locator.as_ref().unwrap())));
 
         let pg_caps = ReceiveCapabilities { atomic: true, report_status: true, ..ReceiveCapabilities::default() };
-        let pg_req = build_pg_commit_request(&out.proof, &snapshot, &ticket, &pg_caps, &backend_hex)?;
+        let pg_req = build_pg_commit_request(&out.proof, &snapshot, &ticket, &pg_caps, backend_hex)?;
         pg_req.validate()?;
 
         let mut empty_base_snap = snapshot.clone();

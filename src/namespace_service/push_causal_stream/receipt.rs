@@ -32,8 +32,7 @@ pub struct RejectedRefProof {
 }
 
 /// Cryptographically bound causal proof minted ONLY after verified Blob read-back + Git closure.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CausalPushProofReceipt {
     pub receipt_version: u32,
     pub tenant_id: Uuid,
@@ -73,6 +72,8 @@ impl CausalPushProofReceipt {
     pub fn recompute_digest(&self) -> String {
         let mut h = Sha256::new();
         h.update(b"causal-push-proof-receipt-v1\n");
+        let pack_path = self.pack_locator.as_ref().map(|l| l.path()).unwrap_or_default();
+        let idx_path = self.idx_locator.as_ref().map(|l| l.path()).unwrap_or_default();
         for bytes in [
             self.receipt_version.to_be_bytes().as_slice(),
             self.tenant_id.as_bytes(),
@@ -91,8 +92,8 @@ impl CausalPushProofReceipt {
             self.pack_bytes.to_be_bytes().as_slice(),
             self.idx_sha256.as_deref().unwrap_or("").as_bytes(),
             self.idx_bytes.to_be_bytes().as_slice(),
-            self.pack_locator.as_ref().map(|l| l.path()).unwrap_or("").as_bytes(),
-            self.idx_locator.as_ref().map(|l| l.path()).unwrap_or("").as_bytes(),
+            pack_path.as_bytes(),
+            idx_path.as_bytes(),
             self.blob_backend_identity.as_bytes(),
             self.object_count.to_be_bytes().as_slice(),
             self.delta_object_count.to_be_bytes().as_slice(),

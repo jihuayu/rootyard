@@ -185,8 +185,7 @@ pub struct BranchPolicy {
 }
 
 /// Verified remote Blob reference for a base pack already anchored in an authorized snapshot.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BasePackRef {
     pub version_id: String,
     pub pack_id: Uuid,
@@ -210,8 +209,7 @@ impl BasePackRef {
 }
 
 /// Expected verified Blob backing a referenced Git LFS pointer (`sha256 -> locator`).
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LfsExpectedBlob {
     pub sha256: String,
     pub size: u64,
@@ -219,8 +217,7 @@ pub struct LfsExpectedBlob {
 }
 
 /// Git LFS pointer and remote byte verification policy.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum LfsPolicy {
     #[default]
     AllowPlainOnly,
@@ -262,7 +259,7 @@ impl OperationTicket {
         repository_id: Uuid,
         digest: RequestDigest,
     ) -> Result<OperationIdentity, RefStoreError> {
-        let lane = crate::ref_store::contract::IssuerLane::new(&self.lane)?;
+        let lane = crate::ref_store::contract::IssuerLane::new(self.lane.as_str())?;
         OperationIdentity::new(repository_id, self.issuer_id, lane, self.sequence, self.operation_id, digest)
     }
 }

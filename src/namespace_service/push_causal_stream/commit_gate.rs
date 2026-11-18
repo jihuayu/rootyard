@@ -82,7 +82,7 @@ pub fn build_pg_commit_request(
         };
         updates.push(RefUpdate::new(name, precondition, target));
     }
-    let lane = crate::ref_store::contract::IssuerLane::new(&ticket.lane)?;
+    let lane = crate::ref_store::contract::IssuerLane::new(ticket.lane.as_str())?;
     let mode = commit_mode_from_capabilities(capabilities);
     let req = CommitRefsRequest::new(
         snapshot.repository_id,
@@ -117,7 +117,7 @@ pub async fn commit_push_on_pg(
     deadline: tokio::time::Instant,
 ) -> Result<(CommitRefsReceipt, Vec<u8>), PushCausalError> {
     evaluate_push_auth_precheck(auth, snapshot.repository_id, None, FaultInjectionHook::None)?;
-    let req = build_pg_commit_request(receipt, snapshot, ticket, capabilities, &store.backend_identity().as_hex())?;
+    let req = build_pg_commit_request(receipt, snapshot, ticket, capabilities, store.backend_identity().as_hex())?;
     match pg.commit_refs(client, &req, deadline).await {
         Ok(commit_receipt) => {
             if commit_receipt.is_committed()
@@ -133,7 +133,7 @@ pub async fn commit_push_on_pg(
         Err(RefStoreError::CommitUnknown { operation_id, .. }) => {
             hold_guard.mark_unknown_outcome();
             Err(PushCausalError::CommitUnknown {
-                operation_id,
+                operation_id: operation_id.unwrap_or(ticket.operation_id),
                 detail: "PG CommitUnknown; holds retained for idempotent operation recovery".into(),
             })
         }

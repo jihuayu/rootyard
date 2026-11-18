@@ -41,7 +41,7 @@ pub(super) fn build_bootstrap_commands(
         snapshot.repository_id,
         snapshot.tenant_id,
         ticket.issuer_id,
-        IssuerLane::new(&ticket.lane)?,
+        IssuerLane::new(ticket.lane.as_str())?,
         ticket.sequence,
         ticket.operation_id,
         snapshot.object_format,

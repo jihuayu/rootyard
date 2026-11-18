@@ -129,7 +129,7 @@ impl StateMachinePushExecutor {
         let snapshot = input.snapshot;
         let ticket = input.ticket;
         let fault_hook = input.fault_hook;
-        let backend_hex = input.store.backend_identity().as_hex();
+        let backend_hex = input.store.backend_identity().as_hex().to_owned();
 
         let bundle = prove_streaming_push(StreamingProofParams {
             reader: input.reader,
