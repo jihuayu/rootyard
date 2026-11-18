@@ -10,10 +10,10 @@ use anyhow::{Result, anyhow, ensure};
 use axum::http::{StatusCode, header};
 use deadpool_postgres::Pool;
 use rootyard::blob_store::opendal::BlobStore;
+use rootyard::blob_store::protected::{ProtectedUploader, UploadSource};
 use rootyard::namespace_service::push_causal_stream::*;
 use rootyard::ref_store::core::artifact_hold::{
     AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldPurpose, ArtifactSpec, HoldScope, PgArtifactHoldStore,
-    ProtectedUploader, UploadSource,
 };
 use rootyard::ref_store::serving::lookup;
 use rootyard::ref_store::{IssuerLane, OperationIdentity, PgRefStore, RequestDigest};
@@ -230,7 +230,10 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
         let key = format!("push-causal-bucket/push-causal-it/{p}");
         ensure!(env.s3.objects.lock().unwrap().contains_key(&key), "default-off must NOT delete S3 key: {key}");
     }
-    ensure!(gw2_ledger.load(op_multi)?.unwrap().needs_recovery(), "default-off must retain recoverable ledger record");
+    ensure!(
+        gw2_ledger.load(op_multi)?.unwrap().state.needs_recovery(),
+        "default-off must retain recoverable ledger record"
+    );
 
     // Re-arm explicit S3 reclaim operator and verify next receive-pack sweeps all 6/6 S3 objects!
     configure_gateway_remote_reclaim_s3(
