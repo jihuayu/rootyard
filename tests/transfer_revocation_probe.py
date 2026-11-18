@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Strict owned transport probe for Issue #37 backpressure evidence."""
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import socket
@@ -8,7 +9,128 @@ import struct
 import time
 
 from transfer_revocation_backpressure import SustainedStallWindow
-from transfer_revocation_source import SOURCE_FAILURE_NO_MATCH
+from transfer_revocation_git_source import GitSourceWitness
+from transfer_revocation_source import (
+    LfsSourceWitness,
+    SOURCE_FAILURE_IDENTITY,
+    SOURCE_FAILURE_NO_MATCH,
+)
+
+
+MAX_TIMELINE_ENTRIES = 16
+
+
+@dataclass(frozen=True)
+class Cert:
+    start_ns: int
+    completed_ns: int
+    epoch: int
+    window_start_ns: int
+    server_inode: int
+    client_inode: int
+    source_anchor: tuple | None
+    source_qualified: bool
+    server_fd_owned: bool
+    client_inode_owned: bool
+    same_netns: bool
+
+
+@dataclass(frozen=True)
+class EpochEvent:
+    """An observation bracket for an invalidation or identity change."""
+
+    start_ns: int
+    end_ns: int
+    new_epoch: int
+    new_source_anchor: tuple | None
+    kind: str
+
+
+@dataclass(frozen=True)
+class TimelineBaseline:
+    coverage_watermark_ns: int = 0
+    epoch: int = 0
+    source_anchor: tuple | None = None
+
+
+class PreTriggerTimeline:
+    """Retain bounded snapshots of observations and their observed epochs."""
+
+    def __init__(self):
+        self._entries = deque(maxlen=MAX_TIMELINE_ENTRIES)
+        self._baseline = TimelineBaseline()
+        self._epoch = 0
+        self._source_anchor = None
+        self._transport_identity = None
+
+    @property
+    def entries(self):
+        return tuple(self._entries)
+
+    @property
+    def baseline(self):
+        return self._baseline
+
+    def covers(self, lower_ns):
+        """Check eviction and invalidation overlap before considering any cert."""
+        return lower_ns >= self._baseline.coverage_watermark_ns and not any(
+            isinstance(entry, EpochEvent) and entry.start_ns <= lower_ns < entry.end_ns
+            for entry in self._entries
+        )
+
+    def _append(self, entry):
+        if len(self._entries) == MAX_TIMELINE_ENTRIES:
+            evicted = self._entries[0]
+            baseline = self._baseline
+            if isinstance(evicted, EpochEvent):
+                self._baseline = TimelineBaseline(
+                    max(baseline.coverage_watermark_ns, evicted.end_ns),
+                    evicted.new_epoch,
+                    evicted.new_source_anchor,
+                )
+            else:
+                self._baseline = replace(baseline, coverage_watermark_ns=max(
+                    baseline.coverage_watermark_ns, evicted.completed_ns,
+                ))
+        self._entries.append(entry)
+
+    def record(self, sample, window, source_anchor: tuple | None):
+        start_ns = sample["sample_start_ns"]
+        end_ns = sample["observed_ns"]
+        server_inode = sample["server_socket_inode"]
+        client_inode = sample["client_socket_inode"]
+        same_netns = bool(sample["same_netns"])
+        source_qualified = bool(sample["source_qualified"])
+        source_failure = (sample.get("source_report") or {}).get("failure_code")
+        transport_identity = (server_inode, client_inode, same_netns)
+
+        kind = None
+        if source_failure == SOURCE_FAILURE_IDENTITY or (
+            source_qualified and self._source_anchor is not None
+            and source_anchor != self._source_anchor
+        ):
+            kind = "source_identity"
+        elif not source_qualified:
+            kind = "source_unqualified"
+        elif not same_netns or (
+            self._transport_identity is not None
+            and transport_identity != self._transport_identity
+        ):
+            kind = "inode/netns"
+        elif not window.samples:
+            kind = "reset"
+
+        if kind is not None:
+            self._epoch += 1
+            self._append(EpochEvent(start_ns, end_ns, self._epoch, source_anchor, kind))
+        self._source_anchor = source_anchor
+        self._transport_identity = transport_identity
+        if window.qualified:
+            self._append(Cert(
+                start_ns, end_ns, self._epoch, window.started_ns, server_inode, client_inode,
+                source_anchor, source_qualified, bool(sample["server_fd_owned"]),
+                bool(sample["client_inode_owned"]), same_netns,
+            ))
 
 
 @dataclass(frozen=True)
@@ -119,6 +241,7 @@ class BackpressureProbe:
         )
         self.persistent = False
         self.last_sample = None
+        self.timeline = PreTriggerTimeline()
 
     def _same_netns(self):
         if self.same_netns_override is not None:
@@ -191,6 +314,22 @@ class BackpressureProbe:
             "source_report": source_report,
         }
 
+    def _source_anchor(self, sample):
+        """Copy the identity already observed by the source witness."""
+        if not sample["source_qualified"]:
+            return None
+        witness = self.source_witness
+        if isinstance(witness, LfsSourceWitness) and witness.identity is not None:
+            return (witness.witness_kind_code, witness.identity.pid, witness.identity.starttime,
+                    witness.fd, witness.st_dev, witness.st_ino, witness.mnt_id)
+        if isinstance(witness, GitSourceWitness):
+            service, writer = witness.service_identity, witness.writer
+            if service is not None and writer is not None:
+                return (witness.witness_kind_code, service.pid, service.starttime,
+                        writer.tgid, writer.tid, writer.starttime, writer.pipe_inode,
+                        writer.service_fd)
+        return None
+
     def _observe(self):
         sample_start_ns = time.monotonic_ns()
         sample = self.sample()
@@ -200,6 +339,7 @@ class BackpressureProbe:
         sample["observed_ns"] = observed_ns
         self.last_sample = sample
         qualified = self.window.observe(sample, observed_ns)
+        self.timeline.record(sample, self.window, self._source_anchor(sample))
         return qualified, observed_ns
 
     def wait_persistent(self, *, timeout_s=5.0):

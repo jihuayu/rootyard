@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Contract and structural tests for Issue #37 bounded active transfer revocation."""
 import ast
+from dataclasses import FrozenInstanceError, replace
 import http.client
 import json
 import os
@@ -685,6 +686,202 @@ class TestTransferRevocationContract(unittest.TestCase):
                          "a stale sample beyond the maximum gap must not qualify")
         probe.last_sample = {"observed_ns": 150_000_000}
         self.assertTrue(probe.pre_trigger_valid(200_000_000))
+
+    @staticmethod
+    def _timeline_probe(min_duration_ns=0):
+        probe = object.__new__(revocation_probe.BackpressureProbe)
+        probe.window = revocation_backpressure.SustainedStallWindow(min_duration_ns)
+        probe.timeline = revocation_probe.PreTriggerTimeline()
+        probe.persistent = False
+        witness = object.__new__(revocation_probe.GitSourceWitness)
+        witness.service_identity = types.SimpleNamespace(pid=100, starttime=5)
+        witness.writer = types.SimpleNamespace(
+            tgid=200, tid=201, starttime=7, pipe_inode=19, service_fd=4,
+        )
+        probe.source_witness = witness
+        return probe
+
+    def _observe_timeline(self, probe, start_ns, end_ns, *, finalize=False, **fields):
+        sample = self._stall_sample(end_ns)
+        sample["client_socket_inode"] = 18
+        sample.update(fields)
+        clock = mock.Mock(side_effect=[start_ns, end_ns])
+        with mock.patch.object(revocation_probe, "time", types.SimpleNamespace(monotonic_ns=clock)):
+            with mock.patch.object(probe, "sample", return_value=sample):
+                if finalize:
+                    probe.finalize()
+                else:
+                    probe._observe()
+        return sample
+
+    def test_pre_trigger_timeline_captures_finalize_and_later_source_loss(self):
+        probe = self._timeline_probe(min_duration_ns=5)
+        timeline = probe.timeline
+        self._observe_timeline(probe, 10, 11)
+        self.assertEqual(timeline.entries, ())
+        self._observe_timeline(probe, 16, 17)
+        earlier, = timeline.entries
+        self._observe_timeline(probe, 20, 30, finalize=True)
+        self.assertEqual(timeline.entries, (
+            earlier, replace(earlier, start_ns=20, completed_ns=30),
+        ))
+        self.assertTrue(timeline.covers(25))
+        self.assertLessEqual(earlier.completed_ns, 25)
+        self.assertFalse(probe.pre_trigger_valid(25))
+        self.assertTrue(probe.pre_trigger_valid(30))
+
+        self._observe_timeline(probe, 40, 50, finalize=True, source_qualified=False)
+        self.assertEqual(timeline.entries[-1], revocation_probe.EpochEvent(
+            40, 50, 1, None, "source_unqualified",
+        ))
+        self.assertIs(timeline.entries[0], earlier)
+        for lower_ns, covered in ((25, True), (39, True), (40, False), (49, False),
+                                  (50, True), (51, True)):
+            with self.subTest(lower_ns=lower_ns):
+                self.assertEqual(timeline.covers(lower_ns), covered)
+        self.assertFalse(probe.pre_trigger_valid(50))
+
+    def test_pre_trigger_timeline_freezes_source_identity_and_same_time_entries(self):
+        probe = self._timeline_probe()
+        sample = self._observe_timeline(probe, 12, 12)
+        snapshot = probe.timeline.entries
+        cert, = snapshot
+        self.assertEqual(cert, revocation_probe.Cert(
+            12, 12, 0, 12, 17, 18, (2, 100, 5, 200, 201, 7, 19, 4),
+            True, True, True, True,
+        ))
+        sample["client_socket_inode"] = 99
+        sample["server_fd_owned"] = False
+        probe.source_witness.writer.pipe_inode = 29
+        self._observe_timeline(probe, 20, 20)
+        stored, event, same_time_cert = probe.timeline.entries
+        anchor = (2, 100, 5, 200, 201, 7, 29, 4)
+        self.assertEqual(event, revocation_probe.EpochEvent(20, 20, 1, anchor, "source_identity"))
+        self.assertEqual(same_time_cert, replace(
+            cert, start_ns=20, completed_ns=20, epoch=1, source_anchor=anchor,
+        ))
+        self.assertTrue(probe.timeline.covers(20))
+        probe.source_witness.writer.pipe_inode = 39
+        self._observe_timeline(probe, 22, 23)
+        self.assertEqual(snapshot, (cert,))
+        self.assertIs(stored, cert)
+        self.assertEqual((cert.client_inode, cert.server_fd_owned, cert.source_anchor[-2]),
+                         (18, True, 19))
+        self.assertEqual(event.new_source_anchor, anchor)
+        for entry, field in ((cert, "epoch"), (event, "new_epoch"), (probe.timeline.baseline, "epoch")):
+            with self.subTest(entry=type(entry).__name__):
+                with self.assertRaises(FrozenInstanceError):
+                    setattr(entry, field, 99)
+
+    def test_pre_trigger_timeline_captures_lfs_anchor_without_a_source_resample(self):
+        probe = self._timeline_probe()
+        witness = object.__new__(revocation_probe.LfsSourceWitness)
+        witness.identity = types.SimpleNamespace(pid=100, starttime=5)
+        witness.fd, witness.st_dev, witness.st_ino, witness.mnt_id = 4, 9, 19, 3
+        probe.source_witness = witness
+        with mock.patch.object(witness, "sample") as resample:
+            self._observe_timeline(probe, 12, 12)
+            witness.st_ino = 29
+            self._observe_timeline(probe, 20, 22)
+        resample.assert_not_called()
+        cert, event, next_cert = probe.timeline.entries
+        self.assertEqual(cert.source_anchor, (1, 100, 5, 4, 9, 19, 3))
+        self.assertEqual(event.kind, "source_identity")
+        self.assertEqual(event.new_source_anchor, (1, 100, 5, 4, 9, 29, 3))
+        self.assertEqual(next_cert.source_anchor, event.new_source_anchor)
+
+    def test_pre_trigger_timeline_captures_reset_and_transport_invalidation(self):
+        for fields, kind, source_qualified in (
+            ({"probe0_pending": False}, "reset", True),
+            ({"server_socket_inode": 27}, "inode/netns", True),
+            ({"same_netns": False}, "inode/netns", True),
+            ({"client_inode_owned": False}, "reset", True),
+            ({"source_report": {"failure_code": revocation_probe.SOURCE_FAILURE_IDENTITY}},
+             "source_identity", False),
+        ):
+            with self.subTest(fields=fields):
+                probe = self._timeline_probe()
+                self._observe_timeline(probe, 12, 12)
+                self._observe_timeline(probe, 20, 22, source_qualified=source_qualified, **fields)
+                cert, event = probe.timeline.entries
+                self.assertEqual(event, revocation_probe.EpochEvent(
+                    20, 22, 1, cert.source_anchor if source_qualified else None, kind,
+                ))
+                self.assertFalse(probe.timeline.covers(20))
+                self.assertTrue(probe.timeline.covers(22))
+                self.assertFalse(probe.window.qualified)
+
+    def test_pre_trigger_timeline_evicted_event_covers_only_from_end(self):
+        probe = self._timeline_probe()
+        timeline = probe.timeline
+        self._observe_timeline(probe, 12, 12)
+        old_baseline = timeline.baseline
+        probe.source_witness.writer.pipe_inode = 29
+        self._observe_timeline(probe, 20, 30)
+        _, event, same_time_cert = timeline.entries
+        for now_ns in range(32, 47):
+            self._observe_timeline(probe, now_ns, now_ns)
+
+        self.assertEqual(len(timeline.entries), 16)
+        self.assertNotIn(event, timeline.entries)
+        self.assertEqual(old_baseline, revocation_probe.TimelineBaseline())
+        self.assertEqual(timeline.baseline, revocation_probe.TimelineBaseline(
+            30, event.new_epoch, event.new_source_anchor,
+        ))
+        for lower_ns in (19, 20, 25, 29):
+            with self.subTest(lower_ns=lower_ns):
+                self.assertFalse(timeline.covers(lower_ns))
+        self.assertIs(timeline.entries[0], same_time_cert)
+        self.assertEqual(same_time_cert.completed_ns, 30)
+        self.assertEqual(same_time_cert.epoch, timeline.baseline.epoch)
+        self.assertEqual(same_time_cert.source_anchor, timeline.baseline.source_anchor)
+        self.assertTrue(timeline.covers(30))
+        self.assertTrue(timeline.covers(31))
+
+        self._observe_timeline(probe, 47, 47)
+        self.assertNotIn(same_time_cert, timeline.entries)
+        self.assertEqual(timeline.baseline.coverage_watermark_ns, 30)
+        for lower_ns in (30, 31):
+            with self.subTest(lower_ns=lower_ns):
+                self.assertTrue(timeline.covers(lower_ns))
+                self.assertTrue(all(entry.completed_ns > lower_ns for entry in timeline.entries))
+        self._observe_timeline(probe, 48, 48)
+        self.assertEqual(timeline.baseline.coverage_watermark_ns, 32)
+        self.assertFalse(timeline.covers(31))
+        self.assertTrue(timeline.covers(32))
+        self.assertTrue(all(entry.completed_ns > 32 for entry in timeline.entries))
+
+    def test_pre_trigger_timeline_watermark_is_max_across_mixed_evictions(self):
+        probe = self._timeline_probe()
+        self._observe_timeline(probe, 12, 12)
+        cert, = probe.timeline.entries
+        timeline = revocation_probe.PreTriggerTimeline()
+        event = revocation_probe.EpochEvent(20, 50, 1, cert.source_anchor, "source_identity")
+        earlier_end = revocation_probe.EpochEvent(41, 45, 2, None, "source_unqualified")
+        next_event = revocation_probe.EpochEvent(60, 80, 3, cert.source_anchor, "inode/netns")
+        # Exercise both eviction paths with synthetic timestamps below a prior end.
+        for entry in (
+            event, replace(cert, start_ns=30, completed_ns=40, epoch=1),
+            earlier_end, next_event,
+        ):
+            timeline._append(entry)
+        for now_ns in range(81, 93):
+            timeline._append(replace(cert, start_ns=now_ns, completed_ns=now_ns, epoch=3))
+        for now_ns, watermark, epoch, anchor in (
+            (93, 50, 1, event.new_source_anchor),
+            (94, 50, 1, event.new_source_anchor),
+            (95, 50, 2, None),
+            (96, 80, 3, next_event.new_source_anchor),
+            (97, 81, 3, next_event.new_source_anchor),
+        ):
+            with self.subTest(now_ns=now_ns):
+                timeline._append(replace(cert, start_ns=now_ns, completed_ns=now_ns, epoch=3))
+                self.assertEqual(len(timeline.entries), 16)
+                self.assertEqual(timeline.baseline, revocation_probe.TimelineBaseline(
+                    watermark, epoch, anchor,
+                ))
+                self.assertFalse(timeline.covers(watermark - 1))
+                self.assertTrue(timeline.covers(watermark))
 
     def test_natural_expiry_requalification_uses_reconciled_earliest_deadline(self):
         clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
