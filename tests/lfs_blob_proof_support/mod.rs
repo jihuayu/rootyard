@@ -331,7 +331,16 @@ impl RunningProdLfsServer {
         let body: Value = res.json().await?;
         ensure!(status.is_success(), "POST /api/repos failed ({status}): {body}");
         ensure!(body["state"] == "ready", "repo must be ready: {body}");
-        Ok((serde_json::from_value(body["id"].clone())?, serde_json::from_value(body["owner_id"].clone())?))
+        let repo_id: Uuid = serde_json::from_value(body["id"].clone())?;
+        let owner_id: Uuid = self
+            .state
+            .pool
+            .get()
+            .await?
+            .query_one("SELECT owner_id FROM repositories WHERE id = $1", &[&repo_id])
+            .await?
+            .get(0);
+        Ok((repo_id, owner_id))
     }
 
     pub async fn create_org(&self, actor: &TestActor, slug: &str) -> Result<Uuid> {

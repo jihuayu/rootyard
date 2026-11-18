@@ -226,7 +226,7 @@ pub fn verify_shared_hold_grant(
 /// Deterministically maps an `X-Rootyard-Operation-Id` or `Idempotency-Key` header into a non-nil
 /// operation [`Uuid`], rejecting conflicting duplicate headers.
 pub fn extract_stable_operation_id(headers: &HeaderMap) -> Result<Option<Uuid>, LfsBlobError> {
-    let mut chosen: Option<String> = None;
+    let mut chosen: Option<Uuid> = None;
     for hdr_name in ["x-rootyard-operation-id", "idempotency-key"] {
         for val in headers.get_all(hdr_name) {
             let text = val
@@ -236,22 +236,20 @@ pub fn extract_stable_operation_id(headers: &HeaderMap) -> Result<Option<Uuid>, 
             if text.is_empty() || text.len() > 128 {
                 return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "invalid operation header length"));
             }
-            if let Some(prev) = &chosen {
-                if prev != text {
+            let parsed = operation_token_to_uuid(text)?;
+            if let Some(prev) = chosen {
+                if prev != parsed {
                     return Err(LfsBlobError::new(
                         LfsProofRejectCode::AttestationEquivocation,
                         "conflicting operation identity headers on same request",
                     ));
                 }
             } else {
-                chosen = Some(text.to_owned());
+                chosen = Some(parsed);
             }
         }
     }
-    let Some(token) = chosen else {
-        return Ok(None);
-    };
-    Ok(Some(operation_token_to_uuid(&token)?))
+    Ok(chosen)
 }
 
 pub fn operation_token_to_uuid(token: &str) -> Result<Uuid, LfsBlobError> {
