@@ -49,12 +49,12 @@ EVIDENCE = (
     "Bind workspace FUSE and remote-delete evidence to the built binary",
     "workspace_legacy_service", "Bind legacy FUSE evidence independently to the built binary",
 )
-# Current main's verify/lifecycle budget: 95 existing minutes, +20 for the
-# owned-Redis CLI build and isolated browse restore proof, +3 for the Redis
-# partition drill and +1 for cleanup and report binding. This branch adds no
-# main-side step, so the merged job cap must be exactly this baseline plus the
+# Current main's verify/lifecycle budget: 95 existing minutes, +12 for the
+# #304 cold tenant LFS gate on owned Garage and +24 for the #306 combined
+# Redis restore, FLUSHALL and partition gate. This branch adds no main-side
+# step, so the merged job cap must be exactly this baseline plus the
 # independent workspace FUSE phases.
-MAIN_VERIFY_BUDGET = 119
+MAIN_VERIFY_BUDGET = 131
 @dataclass
 class Step:
     name: str = ""
@@ -485,14 +485,14 @@ class FailureIsolatedFeatureLaneTest(unittest.TestCase):
         # shares that cap instead of reserving separate job minutes.
         self.assertEqual(fuse_phases, (12, 30, 10))
         merged_cap = MAIN_VERIFY_BUDGET + sum(fuse_phases)
-        self.assertEqual(merged_cap, 171)
+        self.assertEqual(merged_cap, 183)
         self.assertIn(f"    timeout-minutes: {merged_cap}", verify)
         self.assertIn(
             f"{MAIN_VERIFY_BUDGET} + {' + '.join(str(phase) for phase in fuse_phases)} = {merged_cap}",
             verify,
             "the job comment must derive the cap from main's budget and the added phases",
         )
-        # Keeping main's 119 alone would silently under-budget the new phases.
+        # Keeping main's 131 alone would silently under-budget the new phases.
         self.assertNotIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET}", verify)
         self.assertIsNone(self.by_id["cargo_all_targets"].timeout)
         fuse = self.by_name["Bind workspace FUSE and remote-delete evidence to the built binary"]
