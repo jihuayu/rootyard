@@ -170,13 +170,19 @@ pub async fn serve_signed_packfile(
         }
     };
 
-    let _hold = state.leases.begin_download_hold(
+    let _hold = match state.leases.begin_download_hold(
         verified.claims.pin_id,
         tenant_id,
         repository_id,
         pack_oid,
         now_unix,
-    )?;
+    ) {
+        Ok(h) => h,
+        Err(err) => {
+            state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+            return Err(err);
+        }
+    };
     let meta = {
         let guard = state.packs.read().unwrap_or_else(|p| p.into_inner());
         guard
