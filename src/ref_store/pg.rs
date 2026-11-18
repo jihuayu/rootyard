@@ -21,6 +21,10 @@ use tokio::time::{Instant, timeout_at};
 use tokio_postgres::{Row, Transaction, error::SqlState, types::ToSql};
 use uuid::Uuid;
 
+/// Typed migration-152 slot-zero admission foundation. It is crate-private and
+/// deliberately has no gateway caller while the legacy path stays authoritative.
+pub(crate) mod slot_zero;
+
 const MAX_QUERY_WINDOW: Duration = Duration::from_secs(30);
 pub const OPERATION_LOCK_DOMAIN: &str = "rootyard-ref-store-operation-v1";
 pub const OPERATION_LOCK_SQL: &str =
@@ -187,28 +191,36 @@ impl<'tx, 'client> LockedSequence<'tx, 'client> {
     }
 
     async fn advance(self) -> Result<SequenceReservation, RefStoreError> {
-        // The row lock excludes other transactions. The predicate also rejects
-        // a stale preview if this transaction moved the lane in the meantime.
-        let changed = self
-            .tx
-            .execute(
-                "UPDATE ref_store_issuer_lanes SET last_reserved_sequence=$4, updated_at=clock_timestamp()
-                 WHERE (repository_id,issuer_id,lane)=($1,$2,$3) AND last_reserved_sequence=$4::bigint - 1",
-                &[&self.repository_id, &self.issuer_id, &self.lane.as_str(), &self.sequence],
-            )
-            .await
-            .map_err(db_error)?;
-        if changed != 1 {
-            return Err(RefStoreError::IdentityConflict);
-        }
-        Ok(SequenceReservation::new(
-            self.repository_id,
-            self.issuer_id,
-            self.lane.clone(),
-            self.sequence,
-            self.operation_id,
-        ))
+        advance_sequence(self.tx, self.repository_id, self.issuer_id, self.lane, self.operation_id, self.sequence).await
     }
+}
+
+/// Advance one already locked lane preview to its candidate sequence.
+///
+/// The row lock taken by [`LockedSequence::preview`] is transaction-scoped and
+/// survives dropping that value, so a caller that must build a plan between the
+/// preview and the advance can still call this conditionally. The predicate
+/// rejects a stale candidate if this transaction moved the lane in the meantime.
+async fn advance_sequence(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    issuer_id: Uuid,
+    lane: &IssuerLane,
+    operation_id: Uuid,
+    sequence: i64,
+) -> Result<SequenceReservation, RefStoreError> {
+    let changed = tx
+        .execute(
+            "UPDATE ref_store_issuer_lanes SET last_reserved_sequence=$4, updated_at=clock_timestamp()
+             WHERE (repository_id,issuer_id,lane)=($1,$2,$3) AND last_reserved_sequence=$4::bigint - 1",
+            &[&repository_id, &issuer_id, &lane.as_str(), &sequence],
+        )
+        .await
+        .map_err(db_error)?;
+    if changed != 1 {
+        return Err(RefStoreError::IdentityConflict);
+    }
+    Ok(SequenceReservation::new(repository_id, issuer_id, lane.clone(), sequence, operation_id))
 }
 
 struct Cancellation {
