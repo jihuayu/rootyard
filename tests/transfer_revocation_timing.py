@@ -13,10 +13,48 @@ import http.client
 import socket
 import time
 
+from transfer_revocation_probe import Cert, EpochEvent
+
 
 NS_PER_MS = 1_000_000
 MAX_CLOCK_MAPPING_SKEW_NS = 100 * NS_PER_MS
 CONFIRMED_STOP_KINDS = frozenset({"incomplete_read", "short_eof", "reset"})
+
+
+class NaturalExpiryResult(dict):
+    """Carry the timeline to final reconciliation outside the report fields."""
+
+    __slots__ = ("_pre_trigger_timeline",)
+
+    def __init__(self, report, timeline):
+        super().__init__(report)
+        self._pre_trigger_timeline = timeline
+
+
+def select_pre_trigger_cert(timeline, lower_ns):
+    """Select a fresh certificate from observations known by the lower bound."""
+    if timeline is None or not timeline.covers(lower_ns):
+        return None
+
+    baseline = timeline.baseline
+    epoch, anchor = baseline.epoch, baseline.source_anchor
+    entries = timeline.entries
+    # Capture is ordered by observation completion, with events before their certs.
+    for entry in reversed(entries):
+        if isinstance(entry, EpochEvent) and entry.end_ns <= lower_ns:
+            epoch, anchor = entry.new_epoch, entry.new_source_anchor
+            break
+
+    earliest_ns = max(baseline.coverage_watermark_ns, lower_ns - 100 * NS_PER_MS)
+    for entry in reversed(entries):
+        if (isinstance(entry, Cert)
+                and earliest_ns <= entry.completed_ns <= lower_ns
+                and entry.epoch == epoch
+                and (anchor is None or entry.source_anchor == anchor)
+                and entry.source_qualified and entry.server_fd_owned
+                and entry.client_inode_owned and entry.same_netns):
+            return entry
+    return None
 
 
 class InconsistentClockMapping(RuntimeError):
@@ -240,14 +278,12 @@ def apply_natural_expiry_clock(result, clock, bound_ms):
         round((post_sample_ns - final_lower_ns) / NS_PER_MS, 3)
         if isinstance(post_sample_ns, int) else None
     )
+    # Keep the finalize observation in the existing diagnostic fields.
     pre_sample = result.get("pre_trigger_backpressure_sample") or {}
     pre_sample_ns = pre_sample.get("observed_ns")
     result["pre_trigger_backpressure_sample_after_lower_ms"] = (
         round((pre_sample_ns - final_lower_ns) / NS_PER_MS, 3)
         if isinstance(pre_sample_ns, int) else None
-    )
-    max_gap_ns = int(
-        (result.get("backpressure", {}).get("max_gap_ms") or 100.0) * NS_PER_MS
     )
 
     group = result.get("git_group") or {}
@@ -271,15 +307,17 @@ def apply_natural_expiry_clock(result, clock, bound_ms):
             (group["stop_upper_ns"] - final_lower_ns) / NS_PER_MS, 3
         )
 
-    max_gap_ms = (result.get("backpressure") or {}).get("max_gap_ms")
-    pre_order_ok = bool(
-        isinstance(first_byte_ns, int)
-        and isinstance(pre_sample_ns, int)
-        and isinstance(max_gap_ms, (int, float))
-        and final_lower_ns > first_byte_ns
-        and pre_sample_ns <= final_lower_ns
-        and final_lower_ns - pre_sample_ns <= int(max_gap_ms * NS_PER_MS)
+    final_cert = select_pre_trigger_cert(
+        getattr(result, "_pre_trigger_timeline", None), final_lower_ns,
     )
+    cert_ok = final_cert is not None
+    final_pre_trigger = {
+        "backpressure_qualified": cert_ok,
+        "source_witness": cert_ok and result.get("source_precheck_ok") is True,
+        "pre_trigger_window": (
+            cert_ok and isinstance(first_byte_ns, int) and final_lower_ns > first_byte_ns
+        ),
+    }
 
     components = dict(result.get("proof_components") or {})
     required_components = (
@@ -293,11 +331,10 @@ def apply_natural_expiry_clock(result, clock, bound_ms):
     for key in required_components:
         if type(components.get(key)) is not bool:
             components[key] = False
+        elif key in final_pre_trigger:
+            components[key] = final_pre_trigger[key]
     components["client_stop_within_deadline"] = client_ok
     components["actual_reader_resume_within_deadline"] = actual_resume_ok
-    components["pre_trigger_window"] = bool(
-        components["pre_trigger_window"] and pre_order_ok
-    )
     if group_required:
         components["git_group_within_deadline"] = group_ok
     else:

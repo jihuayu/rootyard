@@ -600,7 +600,10 @@ class TestTransferRevocationContract(unittest.TestCase):
             window.observe(self._stall_sample(now), now)
         self.assertTrue(window.qualified)
 
-    def _natural_result_fixture(self, *, client_observed_ns):
+    def _natural_result_fixture(self, *, client_observed_ns, probe=None):
+        if probe is None:
+            probe = self._timeline_probe()
+            self._observe_timeline(probe, 980_000_000, 980_000_000)
         all_true = {
             "client_stop_within_deadline": True,
             "git_group_within_deadline": True,
@@ -612,7 +615,7 @@ class TestTransferRevocationContract(unittest.TestCase):
             "actual_reader_resume_within_deadline": True,
             "pre_trigger_window": True,
         }
-        return {
+        report = {
             "initial_lower_bound_ns": 1_100_000_000,
             "lower_bound_ns": 1_100_000_000,
             "deadline_ns": 2_300_000_000,
@@ -630,6 +633,7 @@ class TestTransferRevocationContract(unittest.TestCase):
             "pre_trigger_backpressure_sample": {"observed_ns": 980_000_000},
             "backpressure": {"persistent": True, "max_gap_ms": 100.0},
             "source_witness": {"qualified": True},
+            "source_precheck_ok": True,
             "group_required": True,
             "transfer_kind": "git",
             "post_transfer_group_stopped": True,
@@ -646,6 +650,7 @@ class TestTransferRevocationContract(unittest.TestCase):
             "proof_components": all_true,
             "configured_bound_proven": True,
         }
+        return revocation_timing.NaturalExpiryResult(report, probe.timeline)
 
     def test_tcp_pair_requires_unique_established_reversed_four_tuples(self):
         rows = (
@@ -727,6 +732,9 @@ class TestTransferRevocationContract(unittest.TestCase):
         ))
         self.assertTrue(timeline.covers(25))
         self.assertLessEqual(earlier.completed_ns, 25)
+        self.assertIs(probe.select_pre_trigger_cert(25), earlier)
+        finalize_cert = timeline.entries[-1]
+        self.assertIs(probe.select_pre_trigger_cert(30), finalize_cert)
         self.assertFalse(probe.pre_trigger_valid(25))
         self.assertTrue(probe.pre_trigger_valid(30))
 
@@ -740,6 +748,10 @@ class TestTransferRevocationContract(unittest.TestCase):
             with self.subTest(lower_ns=lower_ns):
                 self.assertEqual(timeline.covers(lower_ns), covered)
         self.assertFalse(probe.pre_trigger_valid(50))
+        for lower_ns, expected in ((25, earlier), (39, finalize_cert),
+                                   (40, None), (49, None), (50, None), (51, None)):
+            with self.subTest(lower_ns=lower_ns):
+                self.assertIs(probe.select_pre_trigger_cert(lower_ns), expected)
 
     def test_pre_trigger_timeline_freezes_source_identity_and_same_time_entries(self):
         probe = self._timeline_probe()
@@ -761,6 +773,7 @@ class TestTransferRevocationContract(unittest.TestCase):
             cert, start_ns=20, completed_ns=20, epoch=1, source_anchor=anchor,
         ))
         self.assertTrue(probe.timeline.covers(20))
+        self.assertIs(probe.select_pre_trigger_cert(20), same_time_cert)
         probe.source_witness.writer.pipe_inode = 39
         self._observe_timeline(probe, 22, 23)
         self.assertEqual(snapshot, (cert,))
@@ -810,6 +823,9 @@ class TestTransferRevocationContract(unittest.TestCase):
                 self.assertFalse(probe.timeline.covers(20))
                 self.assertTrue(probe.timeline.covers(22))
                 self.assertFalse(probe.window.qualified)
+                self.assertIs(probe.select_pre_trigger_cert(19), cert)
+                self.assertIsNone(probe.select_pre_trigger_cert(20))
+                self.assertIsNone(probe.select_pre_trigger_cert(22))
 
     def test_pre_trigger_timeline_evicted_event_covers_only_from_end(self):
         probe = self._timeline_probe()
@@ -818,7 +834,10 @@ class TestTransferRevocationContract(unittest.TestCase):
         old_baseline = timeline.baseline
         probe.source_witness.writer.pipe_inode = 29
         self._observe_timeline(probe, 20, 30)
-        _, event, same_time_cert = timeline.entries
+        old_cert, event, same_time_cert = timeline.entries
+        self.assertIs(probe.select_pre_trigger_cert(19), old_cert)
+        self.assertIsNone(probe.select_pre_trigger_cert(29))
+        self.assertIs(probe.select_pre_trigger_cert(30), same_time_cert)
         for now_ns in range(32, 47):
             self._observe_timeline(probe, now_ns, now_ns)
 
@@ -831,12 +850,15 @@ class TestTransferRevocationContract(unittest.TestCase):
         for lower_ns in (19, 20, 25, 29):
             with self.subTest(lower_ns=lower_ns):
                 self.assertFalse(timeline.covers(lower_ns))
+                self.assertIsNone(probe.select_pre_trigger_cert(lower_ns))
         self.assertIs(timeline.entries[0], same_time_cert)
         self.assertEqual(same_time_cert.completed_ns, 30)
         self.assertEqual(same_time_cert.epoch, timeline.baseline.epoch)
         self.assertEqual(same_time_cert.source_anchor, timeline.baseline.source_anchor)
         self.assertTrue(timeline.covers(30))
         self.assertTrue(timeline.covers(31))
+        self.assertIs(probe.select_pre_trigger_cert(30), same_time_cert)
+        self.assertIs(probe.select_pre_trigger_cert(31), same_time_cert)
 
         self._observe_timeline(probe, 47, 47)
         self.assertNotIn(same_time_cert, timeline.entries)
@@ -845,11 +867,51 @@ class TestTransferRevocationContract(unittest.TestCase):
             with self.subTest(lower_ns=lower_ns):
                 self.assertTrue(timeline.covers(lower_ns))
                 self.assertTrue(all(entry.completed_ns > lower_ns for entry in timeline.entries))
+                self.assertIsNone(probe.select_pre_trigger_cert(lower_ns))
         self._observe_timeline(probe, 48, 48)
         self.assertEqual(timeline.baseline.coverage_watermark_ns, 32)
         self.assertFalse(timeline.covers(31))
         self.assertTrue(timeline.covers(32))
         self.assertTrue(all(entry.completed_ns > 32 for entry in timeline.entries))
+        self.assertIsNone(probe.select_pre_trigger_cert(32))
+
+    def test_pre_trigger_selector_rejects_missing_stale_and_post_bound_certificates(self):
+        probe = self._timeline_probe()
+        self.assertIsNone(probe.select_pre_trigger_cert(1_000_000_000))
+        self._observe_timeline(probe, 1_000_000_000, 1_000_000_000)
+        cert, = probe.timeline.entries
+        for lower_ns, expected in (
+            (999_999_999, None),
+            (1_000_000_000, cert),
+            (1_100_000_000, cert),
+            (1_100_000_001, None),
+        ):
+            with self.subTest(lower_ns=lower_ns):
+                self.assertIs(probe.select_pre_trigger_cert(lower_ns), expected)
+
+    def test_pre_trigger_selector_requires_observed_epoch_anchor_and_flags(self):
+        probe = self._timeline_probe()
+        self._observe_timeline(probe, 1_000_000_000, 1_000_000_000)
+        original, = probe.timeline.entries
+        event_end = 1_021_000_000
+        event = revocation_probe.EpochEvent(
+            1_020_000_000, event_end, 1, original.source_anchor, "reset",
+        )
+        cert = replace(original, start_ns=event_end, completed_ns=1_022_000_000, epoch=1)
+        for fields in (
+            {}, {"epoch": 0}, {"source_anchor": (1,)}, {"source_qualified": False},
+            {"server_fd_owned": False}, {"client_inode_owned": False}, {"same_netns": False},
+        ):
+            with self.subTest(fields=fields):
+                timeline = revocation_probe.PreTriggerTimeline()
+                candidate = replace(cert, **fields)
+                for entry in (original, event, candidate):
+                    timeline._append(entry)
+                self.assertIsNone(revocation_timing.select_pre_trigger_cert(timeline, event_end))
+                expected = None if fields else candidate
+                self.assertIs(revocation_timing.select_pre_trigger_cert(
+                    timeline, candidate.completed_ns,
+                ), expected)
 
     def test_pre_trigger_timeline_watermark_is_max_across_mixed_evictions(self):
         probe = self._timeline_probe()
@@ -946,13 +1008,98 @@ class TestTransferRevocationContract(unittest.TestCase):
         self.assertIsNone(result["git_group_within_deadline"])
         self.assertTrue(result["configured_bound_proven"])
 
-    def test_post_trigger_or_stale_final_sample_invalidates_final_expiry(self):
+    def test_pre_trigger_final_expiry_reselects_at_earlier_lower_bound(self):
+        ms = revocation_timing.NS_PER_MS
+        probe = self._timeline_probe(min_duration_ns=500 * ms)
+        for now_ms in range(400, 1041, 20):
+            self._observe_timeline(probe, now_ms * ms, (now_ms + 1) * ms)
+        finalize = self._observe_timeline(
+            probe, 1060 * ms, 1065 * ms, finalize=True, source_qualified=False,
+            source_report={"qualified": False},
+        )
+        clock = revocation_timing.ExpiryClock(1000 * ms, 1100 * ms, 100 * ms, 2)
+        self.assertEqual(probe.select_pre_trigger_cert(clock.earliest_ns).completed_ns, 981 * ms)
+
+        def fake_reader(*, target, daemon, **_kwargs):
+            thread = mock.Mock(daemon=daemon)
+            thread.join.side_effect = (step() for step in (target, lambda: None))
+            thread.is_alive.return_value = False
+            return thread
+
+        for initial_ms, initial_completion in ((1050, 1041 * ms), (1100, None)):
+            with self.subTest(initial_ms=initial_ms):
+                initial_clock = revocation_timing.ExpiryClock(
+                    initial_ms * ms, 1100 * ms, (1100 - initial_ms) * ms, 1,
+                )
+                initial_cert = probe.select_pre_trigger_cert(initial_clock.earliest_ns)
+                self.assertEqual(getattr(initial_cert, "completed_ns", None), initial_completion)
+                connection = mock.Mock()
+                connection.getresponse.return_value = mock.Mock(status=200)
+                connection.getresponse.return_value.read.return_value = b"x"
+                timestamps_ms = (400, initial_ms + 780, initial_ms + 780,
+                                 initial_ms + 800, initial_ms + 800, 2000)
+                fake_time = types.SimpleNamespace(
+                    monotonic_ns=mock.Mock(side_effect=[stamp * ms for stamp in timestamps_ms]),
+                )
+                stop = revocation_timing.StopObservation(
+                    revocation_timing.StopKind.RESET, 2000 * ms, 1,
+                )
+                with mock.patch.multiple(
+                    revocation_transport,
+                    BackpressureProbe=mock.Mock(return_value=probe),
+                    SmallBufferHTTPConnection=mock.Mock(return_value=connection),
+                    threading=types.SimpleNamespace(Event=mock.Mock, Thread=fake_reader),
+                    time=fake_time,
+                    _sleep_until=mock.Mock(),
+                    read_until_transport_stop=mock.Mock(return_value=stop),
+                ), mock.patch.multiple(
+                    probe, wait_persistent=mock.Mock(), hold_until=mock.Mock(),
+                    finalize=mock.Mock(), sample=mock.Mock(return_value={"source_qualified": False}),
+                    report=mock.Mock(return_value={"persistent": False, "max_gap_ms": 100.0}),
+                ):
+                    fixture = revocation_transport.run_timed_transfer(
+                        base="http://127.0.0.1:1", path="/", method="GET", headers={}, body=None,
+                        expected_size=4, initial_bytes=1, framing="chunked", service_pid=None,
+                        require_group=False, bound_ms=1200, natural_expiry=initial_clock,
+                        evidence=mock.Mock(),
+                    )
+                proof_keys = ("pre_trigger_window", "backpressure_qualified", "source_witness")
+                for key in proof_keys:
+                    self.assertEqual(fixture["proof_components"][key], initial_cert is not None)
+                self.assertEqual(fixture["source_witness"], {"qualified": False})
+                self.assertEqual(json.loads(json.dumps(fixture)), dict(fixture))
+                result = revocation_timing.apply_natural_expiry_clock(fixture, clock, 1200)
+                self.assertTrue(result["configured_bound_proven"])
+                for key in proof_keys:
+                    self.assertTrue(result["proof_components"][key])
+                self.assertIs(result["pre_trigger_backpressure_sample"], finalize)
+                self.assertEqual(result["pre_trigger_backpressure_sample_after_lower_ms"], 65.0)
+                self.assertEqual(json.loads(json.dumps(result)), dict(result))
+
+    def test_pre_trigger_final_expiry_rejects_post_bound_or_stale_certificates(self):
         clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
-        for observed_ns in (1_000_000_001, 0):
-            fixture = self._natural_result_fixture(client_observed_ns=2_000_000_000)
-            fixture["pre_trigger_backpressure_sample"] = {"observed_ns": observed_ns}
-            result = revocation_timing.apply_natural_expiry_clock(fixture, clock, 1200)
-            self.assertFalse(result["configured_bound_proven"])
+        for observed_ns in (1_000_000_001, 899_999_999):
+            with self.subTest(observed_ns=observed_ns):
+                probe = self._timeline_probe()
+                self._observe_timeline(probe, observed_ns, observed_ns)
+                fixture = self._natural_result_fixture(client_observed_ns=2_000_000_000, probe=probe)
+                result = revocation_timing.apply_natural_expiry_clock(fixture, clock, 1200)
+                self.assertFalse(result["configured_bound_proven"])
+                for key in ("pre_trigger_window", "backpressure_qualified", "source_witness"):
+                    self.assertFalse(result["proof_components"][key])
+
+    def test_pre_trigger_final_expiry_requires_timeline_and_source_precheck(self):
+        clock = revocation_timing.ExpiryClock(1_000_000_000, 1_000_100_000, 100_000, 2)
+        fixture = self._natural_result_fixture(client_observed_ns=2_000_000_000)
+        result = revocation_timing.apply_natural_expiry_clock(dict(fixture), clock, 1200)
+        self.assertFalse(result["proof_components"]["pre_trigger_window"])
+        self.assertFalse(result["configured_bound_proven"])
+
+        fixture["source_precheck_ok"] = False
+        result = revocation_timing.apply_natural_expiry_clock(fixture, clock, 1200)
+        self.assertTrue(result["proof_components"]["pre_trigger_window"])
+        self.assertFalse(result["proof_components"]["source_witness"])
+        self.assertFalse(result["configured_bound_proven"])
 
     def test_read_timeout_is_never_a_confirmed_transport_stop(self):
         class FakeSocket:

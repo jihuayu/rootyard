@@ -18,6 +18,7 @@ from transfer_revocation_observer import (
 )
 from transfer_revocation_timing import (
     NS_PER_MS,
+    NaturalExpiryResult,
     TriggerInterval,
     read_until_transport_stop,
 )
@@ -338,24 +339,24 @@ def _run_timed_transfer_impl(
         else:
             evidence.set_group(None)
 
-        if probe is not None:
-            pre_trigger_ok = probe.pre_trigger_valid(lower_ns)
+        source_report = (pre_trigger_sample or {}).get("source_report") or {}
+        if interval is None:
+            cert = probe.select_pre_trigger_cert(lower_ns) if probe is not None else None
+            pre_trigger_ok = backpressure_ok = cert is not None
+            source_ok = source_precheck_ok and pre_trigger_ok
         else:
-            pre_trigger_ok = lower_ns > first_ns
-        source_report = (
-            (pre_trigger_sample or {}).get("source_report") or {}
-            if pre_trigger_sample is not None else {}
-        )
-        source_ok = bool(
-            source_precheck_ok
-            and source_report.get("qualified")
-            and (pre_trigger_sample or {}).get("source_qualified")
-        )
+            pre_trigger_ok = (
+                probe.pre_trigger_valid(lower_ns) if probe is not None else lower_ns > first_ns
+            )
+            source_ok = bool(
+                source_precheck_ok and source_report.get("qualified")
+                and (pre_trigger_sample or {}).get("source_qualified")
+            )
+            backpressure_ok = (not require_backpressure) or bool(
+                probe and probe.persistent and probe.window.qualified
+            )
         client_ok = stop.confirmed and stop.observed_ns <= deadline_ns
         trigger_ok = interval is None or interval.t_after_ns <= deadline_ns
-        backpressure_ok = (not require_backpressure) or bool(
-            probe and probe.persistent and probe.window.qualified
-        )
         post_pause_ok = post_pause_ns <= bound_ns
         actual_resume_ok = bool(
             reader_resume_ns is not None and reader_resume_ns < deadline_ns
@@ -430,6 +431,8 @@ def _run_timed_transfer_impl(
             "proof_components": proof_components,
             "configured_bound_proven": proof,
         }
+        if interval is None:
+            return NaturalExpiryResult(result, probe.timeline if probe is not None else None)
         return result
     except revocation_failure.SafeFailure:
         raise

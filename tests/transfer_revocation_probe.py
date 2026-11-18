@@ -368,6 +368,11 @@ class BackpressureProbe:
         self.persistent = bool(self.window.qualified)
         return self.persistent
 
+    def select_pre_trigger_cert(self, lower_bound_ns):
+        from transfer_revocation_timing import select_pre_trigger_cert
+
+        return select_pre_trigger_cert(self.timeline, lower_bound_ns)
+
     def pre_trigger_valid(self, lower_bound_ns):
         if not self.persistent or self.last_sample is None:
             return False
