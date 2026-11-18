@@ -81,11 +81,10 @@ struct Binding {
 
 async fn load_binding(state: &AppState, view: &View) -> Result<Binding, Error> {
     crate::ci_pins::s4_schema::ensure_s4_schema(&state.pool).await?;
-    let row = state
-        .pool
-        .get()
-        .await
-        .map_err(Error::internal)?
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let cluster_inc = crate::ci_pins::s4_authority::require_cluster_incarnation_nowait(&tx).await?;
+    let row = tx
         .query_opt(
             "SELECT b.retention_root_id, b.source_oid, b.projected_oid, b.subdir, b.owner_tenant_id, \
                     r.owner_id, r.storage_generation, r.state \
@@ -93,12 +92,15 @@ async fn load_binding(state: &AppState, view: &View) -> Result<Binding, Error> {
              JOIN ref_store_core_gates cg ON cg.repository_id=b.repository_id \
              WHERE b.view_id=$1 AND b.state='active' AND b.repository_id=$2 \
                AND cg.authority_epoch=b.authority_epoch \
-               AND cg.history_incarnation=b.history_incarnation AND cg.group_epoch=b.group_epoch",
-            &[&view.id, &view.repository_id],
+               AND cg.history_incarnation=b.history_incarnation AND cg.group_epoch=b.group_epoch \
+               AND b.cluster_incarnation=$3",
+            &[&view.id, &view.repository_id, &cluster_inc],
         )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
+    let _ = tx.rollback().await;
+    drop(client);
     if row.get::<_, String>(7) != "ready" || Some(row.get::<_, Uuid>(5)) != Some(row.get(4)) {
         return Err(Error::not_found());
     }
@@ -292,9 +294,8 @@ async fn publish(
         .capture_baseline(&mut client, view.repository_id, binding.owner_tenant_id, deadline)
         .await
         .map_err(Error::internal)?;
-    // Idempotent: a repository provisioned by its creator already owns this
-    // exact realm, and one that was never initialized gets it before the first
-    // decision is written, so the A4 path is never refused for a missing realm.
+    // Idempotent: a creator-provisioned repository already owns this realm, and a
+    // fresh one gets it before the first decision, so A4 never refuses a realm.
     let gate = baseline.gate();
     let realm = RealmExpectation::new(
         gate.repository_id(),
@@ -309,9 +310,8 @@ async fn publish(
         .provision(&mut client, &realm, deadline)
         .await
         .map_err(|_| Error(StatusCode::CONFLICT, "decision realm provisioning refused"))?;
-    // The retained source root only ever records `refs/heads/main`, so the live
-    // gate refs are the only truthful answer to "is this source ref still where
-    // the recorded view says it is?".
+    // The retained root only records `refs/heads/main`; live gate refs answer
+    // "is this source ref still where the recorded view says it is?".
     let live_tip = baseline
         .refs()
         .iter()

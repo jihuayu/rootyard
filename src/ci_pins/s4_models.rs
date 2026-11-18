@@ -35,6 +35,7 @@ pub struct S4ClosureGrant {
     pub authority_epoch: i64,
     pub history_incarnation: Uuid,
     pub group_epoch: i64,
+    pub cluster_incarnation: Uuid,
     pub object_format: String,
     pub target_oid: String,
     pub retention_root_id: Uuid,
@@ -79,6 +80,7 @@ pub struct GrantExpectation<'a> {
     pub authority_epoch: i64,
     pub history_incarnation: Uuid,
     pub group_epoch: i64,
+    pub cluster_incarnation: Uuid,
     pub mirror_audience: Uuid,
     pub target_oid: &'a str,
     pub now_unix: i64,
@@ -182,6 +184,7 @@ pub(crate) struct NewGrant<'a> {
     pub authority_epoch: i64,
     pub history_incarnation: Uuid,
     pub group_epoch: i64,
+    pub cluster_incarnation: Uuid,
     pub object_format: &'a str,
     pub target_oid: &'a str,
     pub retention_root_id: Uuid,
@@ -203,6 +206,7 @@ impl S4ClosureGrant {
             authority_epoch: input.authority_epoch,
             history_incarnation: input.history_incarnation,
             group_epoch: input.group_epoch,
+            cluster_incarnation: input.cluster_incarnation,
             object_format: input.object_format.to_owned(),
             target_oid: input.target_oid.to_owned(),
             retention_root_id: input.retention_root_id,
@@ -227,6 +231,7 @@ impl S4ClosureGrant {
             || self.authority_epoch <= 0
             || self.history_incarnation.is_nil()
             || self.group_epoch <= 0
+            || self.cluster_incarnation.is_nil()
             || self.expires_unix <= 0
             || oid_width(&self.object_format).is_none()
             || !is_digest_hex(&self.pack_set_digest)
@@ -248,6 +253,7 @@ impl S4ClosureGrant {
             || self.authority_epoch != expected.authority_epoch
             || self.history_incarnation != expected.history_incarnation
             || self.group_epoch != expected.group_epoch
+            || self.cluster_incarnation != expected.cluster_incarnation
             || self.mirror_audience != expected.mirror_audience
             || self.target_oid != expected.target_oid
             || self.expires_unix <= expected.now_unix
@@ -273,6 +279,7 @@ mod tests {
             authority_epoch: 3,
             history_incarnation: Uuid::new_v4(),
             group_epoch: 2,
+            cluster_incarnation: Uuid::new_v4(),
             object_format: "sha1",
             target_oid: &target,
             retention_root_id: Uuid::new_v4(),
@@ -291,6 +298,7 @@ mod tests {
             authority_epoch: grant.authority_epoch,
             history_incarnation: grant.history_incarnation,
             group_epoch: grant.group_epoch,
+            cluster_incarnation: grant.cluster_incarnation,
             mirror_audience: grant.mirror_audience,
             target_oid: &grant.target_oid,
             now_unix: 1_700_000_000,
@@ -356,6 +364,10 @@ mod tests {
 
         let mut expected = expectation(&grant);
         expected.group_epoch = grant.group_epoch + 1;
+        assert!(grant.authorize(&expected).is_err());
+
+        let mut expected = expectation(&grant);
+        expected.cluster_incarnation = Uuid::new_v4();
         assert!(grant.authorize(&expected).is_err());
     }
 

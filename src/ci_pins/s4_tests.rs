@@ -28,6 +28,7 @@ fn sample_grant(target: &str) -> S4ClosureGrant {
         authority_epoch: 4,
         history_incarnation: Uuid::new_v4(),
         group_epoch: 2,
+        cluster_incarnation: Uuid::new_v4(),
         object_format: "sha1",
         target_oid: target,
         retention_root_id: Uuid::new_v4(),
@@ -46,6 +47,7 @@ fn expectation<'a>(grant: &S4ClosureGrant, target: &'a str) -> GrantExpectation<
         authority_epoch: grant.authority_epoch,
         history_incarnation: grant.history_incarnation,
         group_epoch: grant.group_epoch,
+        cluster_incarnation: grant.cluster_incarnation,
         mirror_audience: grant.mirror_audience,
         target_oid: target,
         now_unix: 1_700_000_000,
@@ -109,6 +111,10 @@ fn closure_grant_rejects_every_tampered_field() {
 
     let mut wrong = expectation(&grant, target);
     wrong.group_epoch += 1;
+    assert!(grant.authorize(&wrong).is_err());
+
+    let mut wrong = expectation(&grant, target);
+    wrong.cluster_incarnation = Uuid::new_v4();
     assert!(grant.authorize(&wrong).is_err());
 }
 

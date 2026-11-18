@@ -102,6 +102,13 @@ impl Cluster {
         let lock = ENV_LOCK.lock().await;
         let s3 = LoopbackS3::start().await?;
         let scratch = std::env::temp_dir().join(format!("rootyard-s4-{}", Uuid::new_v4().simple()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&scratch)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&scratch)?;
         std::fs::create_dir_all(scratch.join("blob"))?;
         std::fs::create_dir_all(scratch.join("data"))?;
         let run = Uuid::new_v4().simple().to_string();
@@ -123,6 +130,7 @@ impl Cluster {
             std::env::var("ROOTYARD_TEST_DATABASE_URL").context("ROOTYARD_TEST_DATABASE_URL must be set")?;
         let schema = format!("s4_view_{}", Uuid::new_v4().simple());
         let admin = rootyard::db::pool(&base_url)?;
+        db::migrate(&admin).await?;
         admin
             .get()
             .await?
@@ -139,7 +147,7 @@ impl Cluster {
         let blob_state = Arc::new(
             BlobGitState::new(BlobGitConfig {
                 pool: pool.clone(),
-                store: store.clone(),
+                store,
                 git_binary: binary.clone(),
                 scratch_root: scratch.join("blob"),
                 max_concurrent_requests: 4,
@@ -152,7 +160,7 @@ impl Cluster {
             .map_err(|_| anyhow!("Blob gateway configuration rejected"))?,
         );
         let config = Config {
-            database_url: base_url.clone(),
+            database_url: base_url,
             data_dir: scratch.join("data"),
             bind: "127.0.0.1:0".parse()?,
             git: binary,

@@ -194,8 +194,8 @@ pub(crate) async fn issue(
                          (repository_id, job_id, owner_tenant_id, issuer_actor_id, issuer_token_id, \
                           storage_generation, authority_epoch, history_incarnation, group_epoch, \
                           object_format, target_oid, retention_root_id, register_digest_hex, \
-                          pack_set_digest_hex, state) \
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pinned')",
+                          pack_set_digest_hex, cluster_incarnation, state) \
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pinned')",
                         &[
                             &serving.repository.id,
                             &input.job_id,
@@ -211,6 +211,7 @@ pub(crate) async fn issue(
                             &prepared.request.candidate().root_id(),
                             &prepared.request.candidate().register_digest().as_hex(),
                             &prepared.pack_set_digest,
+                            &serving.cluster_incarnation,
                         ],
                     )
                     .await
@@ -233,6 +234,7 @@ pub(crate) async fn issue(
             authority_epoch: serving.gate.authority_epoch(),
             history_incarnation: serving.gate.history_incarnation(),
             group_epoch: serving.gate.group_epoch(),
+            cluster_incarnation: serving.cluster_incarnation,
             object_format: &format,
             target_oid,
             retention_root_id: root_id,
@@ -248,7 +250,7 @@ pub(crate) async fn issue(
             storage_generation: input.storage_generation,
             object_format: format.clone(),
             target_oid: target_oid.to_owned(),
-            source_receipt_sha256: register_digest.clone(),
+            source_receipt_sha256: register_digest,
             mirror_audience: audience,
             expires_unix: input.expires_unix,
             dependencies: empty_manifest("full"),
@@ -275,8 +277,9 @@ pub(crate) async fn issue(
             "INSERT INTO s4_ci_retention.closure_grants \
              (repository_id,job_id,owner_tenant_id,storage_generation,authority_epoch, \
               history_incarnation,group_epoch,object_format,target_oid,retention_root_id, \
-              pack_set_digest_hex,mirror_audience,expires_unix,credential_digest,grant_json) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+              pack_set_digest_hex,mirror_audience,expires_unix,credential_digest,grant_json, \
+              cluster_incarnation) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
             &[
                 &serving.repository.id,
                 &input.job_id,
@@ -293,6 +296,7 @@ pub(crate) async fn issue(
                 &input.expires_unix,
                 &digest,
                 &grant_json,
+                &serving.cluster_incarnation,
             ],
         )
         .await
@@ -334,7 +338,8 @@ async fn verify_reused_pin_in_tx(
         && row.get::<_, Uuid>(8) == gate.tenant_id()
         && row.get::<_, i64>(11) == gate.authority_epoch()
         && row.get::<_, Uuid>(12) == gate.history_incarnation()
-        && row.get::<_, i64>(13) == gate.group_epoch();
+        && row.get::<_, i64>(13) == gate.group_epoch()
+        && row.get::<_, Uuid>(14) == serving.cluster_incarnation;
     if !same {
         return Err(issue_error("pin is released or authority changed"));
     }
@@ -373,7 +378,8 @@ async fn pin_for_checkout(
         .map_err(Error::internal)?
         .query_opt(
             "SELECT retention_root_id, register_digest_hex, pack_set_digest_hex, state, target_oid, \
-                    storage_generation, owner_tenant_id, authority_epoch, history_incarnation, group_epoch \
+                    storage_generation, owner_tenant_id, authority_epoch, history_incarnation, group_epoch, \
+                    cluster_incarnation \
              FROM s4_ci_retention.ci_pins WHERE repository_id=$1 AND job_id=$2",
             &[&repository_id, &input.job_id],
         )
@@ -386,7 +392,8 @@ async fn pin_for_checkout(
             && row.get::<_, Uuid>(6) == tenant_id
             && row.get::<_, i64>(7) == serving.gate.authority_epoch()
             && row.get::<_, Uuid>(8) == serving.gate.history_incarnation()
-            && row.get::<_, i64>(9) == serving.gate.group_epoch();
+            && row.get::<_, i64>(9) == serving.gate.group_epoch()
+            && row.get::<_, Uuid>(10) == serving.cluster_incarnation;
         if !valid {
             return Err(issue_error("pin is released or belongs to a different target or authority"));
         }

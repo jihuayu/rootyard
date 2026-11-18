@@ -239,7 +239,8 @@ pub(crate) async fn refstore_repository(
 
 pub(crate) const PIN_COLUMNS: &str = "job_id, repository_id, object_format, target_oid, \
      storage_generation, retention_root_id, register_digest_hex, pack_set_digest_hex, \
-     owner_tenant_id, state, issuer_actor_id, authority_epoch, history_incarnation, group_epoch";
+     owner_tenant_id, state, issuer_actor_id, authority_epoch, history_incarnation, \
+     group_epoch, cluster_incarnation";
 
 pub(crate) fn pin_view(row: &tokio_postgres::Row) -> S4PinView {
     S4PinView {
@@ -332,7 +333,11 @@ pub(crate) async fn pin(
             && row.get::<_, Uuid>(8) == tenant_id
             && row.get::<_, i64>(11) == serving.gate.authority_epoch()
             && row.get::<_, Uuid>(12) == serving.gate.history_incarnation()
-            && row.get::<_, i64>(13) == serving.gate.group_epoch();
+            && row.get::<_, i64>(13) == serving.gate.group_epoch()
+            && row.get::<_, Uuid>(14) == serving.cluster_incarnation;
+        if !super::s4_schema::gate_live(&tx, &serving).await? {
+            return Err(Error(StatusCode::CONFLICT, "repository authority changed"));
+        }
         if row.get::<_, String>(9) == "pinned" && same {
             super::s4_authority::ensure_root_active(&tx, repository_id, row.get(5)).await?;
             let body = pin_view(&row);
@@ -364,11 +369,9 @@ pub(crate) async fn pin(
             deadline,
         )
         .await?;
-    let root_id = prepared.request.candidate().root_id();
-    let register_digest = prepared.request.candidate().register_digest().as_hex();
-    let pack_set_digest = prepared.pack_set_digest.clone();
-    let snapshot_scope = prepared.snapshot_scope;
-    let source_snapshot = prepared.snapshot;
+    let Prepared { request, snapshot: source_snapshot, snapshot_scope, pack_set_digest } = prepared;
+    let root_id = request.candidate().root_id();
+    let register_digest = request.candidate().register_digest().as_hex();
 
     let outcome: Result<Response, Error> = async {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
@@ -395,7 +398,11 @@ pub(crate) async fn pin(
                 && row.get::<_, Uuid>(8) == tenant_id
                 && row.get::<_, i64>(11) == serving.gate.authority_epoch()
                 && row.get::<_, Uuid>(12) == serving.gate.history_incarnation()
-                && row.get::<_, i64>(13) == serving.gate.group_epoch();
+                && row.get::<_, i64>(13) == serving.gate.group_epoch()
+                && row.get::<_, Uuid>(14) == serving.cluster_incarnation;
+            if !super::s4_schema::gate_live(&tx, &serving).await? {
+                return Err(Error(StatusCode::CONFLICT, "repository authority changed"));
+            }
             if row.get::<_, String>(9) == "pinned" && same {
                 super::s4_authority::ensure_root_active(&tx, repository_id, row.get(5)).await?;
                 let body = pin_view(&row);
@@ -409,24 +416,25 @@ pub(crate) async fn pin(
             .roots
             .register_serving_in_tx(
                 &tx,
-                prepared.request.candidate(),
-                prepared.request.request_id(),
-                prepared.request.digest(),
+                request.candidate(),
+                request.request_id(),
+                request.digest(),
                 deadline,
             )
             .await
             .map_err(root_error)?;
         producer
             .roots
-            .recheck_serving_source_pin_live_in_tx(&tx, &prepared.snapshot, deadline)
+            .recheck_serving_source_pin_live_in_tx(&tx, &source_snapshot, deadline)
             .await
             .map_err(root_error)?;
         tx.execute(
             "INSERT INTO s4_ci_retention.ci_pins \
              (repository_id, job_id, owner_tenant_id, issuer_actor_id, issuer_token_id, \
               storage_generation, authority_epoch, history_incarnation, group_epoch, object_format, \
-              target_oid, retention_root_id, register_digest_hex, pack_set_digest_hex, state) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pinned')",
+              target_oid, retention_root_id, register_digest_hex, pack_set_digest_hex, \
+              cluster_incarnation, state) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pinned')",
             &[
                 &repository_id,
                 &input.job_id,
@@ -442,6 +450,7 @@ pub(crate) async fn pin(
                 &root_id,
                 &register_digest,
                 &pack_set_digest,
+                &serving.cluster_incarnation,
             ],
         )
         .await
@@ -453,12 +462,12 @@ pub(crate) async fn pin(
             Json(S4PinView {
                 job_id: input.job_id,
                 repository_id,
-                object_format: format.clone(),
+                object_format: format,
                 target_oid: target_oid.to_owned(),
                 storage_generation: input.storage_generation,
                 retention_root_id: root_id,
-                register_digest: register_digest.clone(),
-                pack_set_digest: pack_set_digest.clone(),
+                register_digest,
+                pack_set_digest,
                 state: "pinned",
             }),
         )

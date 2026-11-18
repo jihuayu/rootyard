@@ -54,6 +54,11 @@ enum Auth<'a> {
     Bearer(&'a str),
 }
 
+async fn job_status(cluster: &Cluster, repo: &Repository, target: &str, token: &str) -> Result<StatusCode> {
+    let auth = Auth::Basic { user: cluster.owner.username.as_str(), password: token };
+    info_refs_status(cluster, repo, target, auth).await
+}
+
 async fn revoke(cluster: &Cluster, repo: &Repository, job: Uuid) -> Result<()> {
     let url = format!("{}/api/repos/{}/{}/ci-checkouts/{job}/revoke", cluster.main, cluster.owner.username, repo.name);
     let response = reqwest::Client::new().post(url).bearer_auth(&cluster.owner.token).send().await?;
@@ -203,19 +208,11 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
 
         let wide = info_refs_status(&cluster, &repo, &first, Auth::Bearer("ryu_wide_credential")).await?;
         ensure!(wide == StatusCode::FORBIDDEN, "a wide user credential reached the CI transport: {wide}");
-        let cross = info_refs_status(&cluster, &repo, &second, Auth::Basic {
-            user: cluster.owner.username.as_str(),
-            password: token.as_str(),
-        })
-        .await?;
+        let cross = job_status(&cluster, &repo, &second, &token).await?;
         ensure!(cross == StatusCode::UNAUTHORIZED, "a job credential escaped its target closure: {cross}");
 
         revoke(&cluster, &repo, job).await?;
-        let after = info_refs_status(&cluster, &repo, &first, Auth::Basic {
-            user: cluster.owner.username.as_str(),
-            password: token.as_str(),
-        })
-        .await?;
+        let after = job_status(&cluster, &repo, &first, &token).await?;
         ensure!(after == StatusCode::UNAUTHORIZED, "a revoked job credential still authorized a transfer");
 
         // A retained pack must stream in many bounded chunks. Releasing the pin
@@ -244,11 +241,7 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
             stream_errored || received < 550_000,
             "the revoked stream delivered the complete retained pack ({received} bytes)"
         );
-        let dead = info_refs_status(&cluster, &repo, &big_oid, Auth::Basic {
-            user: cluster.owner.username.as_str(),
-            password: stream_token.as_str(),
-        })
-        .await?;
+        let dead = job_status(&cluster, &repo, &big_oid, &stream_token).await?;
         ensure!(dead == StatusCode::UNAUTHORIZED, "a released stream credential still authorized info/refs");
 
         // A refused issuance must not leave a durable pin or job row behind: the
@@ -329,13 +322,34 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
             epoch_errored || epoch_received < 550_000,
             "an epoch-bumped stream delivered the complete retained pack ({epoch_received} bytes)"
         );
-        let epoch_dead = info_refs_status(&cluster, &repo, &big_oid, Auth::Basic {
-            user: cluster.owner.username.as_str(),
-            password: epoch_token.as_str(),
-        })
-        .await?;
+        let epoch_dead = job_status(&cluster, &repo, &big_oid, &epoch_token).await?;
         ensure!(epoch_dead == StatusCode::UNAUTHORIZED, "an epoch-bumped credential still authorized");
         set_gate_epoch(&cluster.pool, repo.id, old_epoch, old_incarnation).await?;
+
+        // Rotating the cluster anchor must end the stream and the credential.
+        let cluster_job = Uuid::new_v4();
+        cluster.pin(&repo, cluster_job, &big_oid).await?;
+        let cluster_token = cluster.checkout(&repo, cluster_job, &big_oid).await?;
+        let mut cluster_stream = open_pack_stream(&cluster, &repo, &big_oid, &cluster_token).await?;
+        let Some(chunk) = cluster_stream.chunk().await?.filter(|chunk| !chunk.is_empty()) else {
+            return Err(anyhow::anyhow!("the cluster pack stream produced no first chunk"));
+        };
+        let mut cluster_received = chunk.len();
+        let anchor = cluster.pool.get().await?;
+        let read = "SELECT incarnation FROM public.cluster_authority WHERE singleton=true";
+        let old_cluster_inc: Uuid = anchor.query_one(read, &[]).await?.get(0);
+        let rotate =
+            "UPDATE public.cluster_authority SET incarnation=$1, rotated_at=clock_timestamp() WHERE singleton=true";
+        anchor.execute(rotate, &[&Uuid::new_v4()]).await?;
+        let cluster_errored = drain_pack(&mut cluster_stream, &mut cluster_received).await;
+        ensure!(
+            cluster_errored || cluster_received < 550_000,
+            "a rotated cluster anchor delivered the complete pack ({cluster_received} bytes)"
+        );
+        let cluster_dead = job_status(&cluster, &repo, &big_oid, &cluster_token).await?;
+        ensure!(cluster_dead == StatusCode::UNAUTHORIZED, "a cluster-rotated credential still authorized");
+        let restore = "UPDATE public.cluster_authority SET incarnation=$1 WHERE singleton=true";
+        anchor.execute(restore, &[&old_cluster_inc]).await?;
 
         // pg_refstore identity is guarded, so no product API can move a
         // repository between tenants. Re-seat the same repository under a new
@@ -344,11 +358,7 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
         let transfer_job = Uuid::new_v4();
         cluster.pin(&repo, transfer_job, &big_oid).await?;
         let transfer_token = cluster.checkout(&repo, transfer_job, &big_oid).await?;
-        let live = info_refs_status(&cluster, &repo, &big_oid, Auth::Basic {
-            user: cluster.owner.username.as_str(),
-            password: transfer_token.as_str(),
-        })
-        .await?;
+        let live = job_status(&cluster, &repo, &big_oid, &transfer_token).await?;
         ensure!(live == StatusCode::OK, "a live credential was refused before the transfer: {live}");
         let new_username = format!("s4move{}", &Uuid::new_v4().simple().to_string()[..12]);
         let issued = rootyard::db::issue_token(&cluster.pool, &new_username, true, false).await;
@@ -371,11 +381,7 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
         tx.execute("SET LOCAL session_replication_role = origin", &[]).await?;
         tx.commit().await?;
         ensure!(moved == 1, "the ownership transfer moved {moved} repositories");
-        let gone = info_refs_status(&cluster, &repo, &big_oid, Auth::Basic {
-            user: cluster.owner.username.as_str(),
-            password: transfer_token.as_str(),
-        })
-        .await?;
+        let gone = job_status(&cluster, &repo, &big_oid, &transfer_token).await?;
         ensure!(
             gone == StatusCode::UNAUTHORIZED,
             "an old-tenant credential survived the ownership transfer: {gone}"

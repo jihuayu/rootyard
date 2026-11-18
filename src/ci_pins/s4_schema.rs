@@ -21,6 +21,7 @@ const CI_PINS: &str = "CREATE TABLE IF NOT EXISTS s4_ci_retention.ci_pins (
     authority_epoch BIGINT NOT NULL,
     history_incarnation UUID NOT NULL,
     group_epoch BIGINT NOT NULL,
+    cluster_incarnation UUID NOT NULL,
     object_format TEXT NOT NULL,
     target_oid TEXT NOT NULL,
     retention_root_id UUID NOT NULL,
@@ -40,6 +41,7 @@ const CLOSURE_GRANTS: &str = "CREATE TABLE IF NOT EXISTS s4_ci_retention.closure
     authority_epoch BIGINT NOT NULL,
     history_incarnation UUID NOT NULL,
     group_epoch BIGINT NOT NULL,
+    cluster_incarnation UUID NOT NULL,
     object_format TEXT NOT NULL,
     target_oid TEXT NOT NULL,
     retention_root_id UUID NOT NULL,
@@ -67,6 +69,7 @@ const GIT_VIEW_BINDINGS: &str = "CREATE TABLE IF NOT EXISTS s4_ci_retention.git_
     authority_epoch BIGINT NOT NULL,
     history_incarnation UUID NOT NULL,
     group_epoch BIGINT NOT NULL,
+    cluster_incarnation UUID NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('active', 'released')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 )";
@@ -134,5 +137,7 @@ pub(crate) async fn gate_live(
         )
         .await
         .map_err(Error::internal)?;
-    Ok(row.is_some())
+    let live = row.is_some()
+        && super::s4_authority::read_cluster_incarnation_nowait(tx).await? == Some(serving.cluster_incarnation);
+    Ok(live)
 }

@@ -1,13 +1,7 @@
-//! S4 CI Smart HTTP data plane for `pg_refstore` repositories.
-//!
-//! This is a read-only transport. `git-receive-pack` is refused unconditionally,
-//! only a narrow `ryj_` job credential is accepted, and every request re-proves
-//! the grant, the pin, the retained root, the token and live RBAC in PostgreSQL
-//! before a single byte is materialized.
-//!
-//! The transfer is served from a disposable bare repository rebuilt from the
-//! retained root's verified `.pack`/`.idx` bytes, so a deleted branch, a rewritten
-//! history or a wiped local cache cannot change what a pinned job sees.
+//! S4 CI Smart HTTP data plane for `pg_refstore` repositories: read-only, one
+//! narrow `ryj_` job credential, and every request re-proves the grant, the pin,
+//! the retained root, the token and live RBAC before a byte is materialized from
+//! a disposable bare repository rebuilt from the verified `.pack`/`.idx` bytes.
 use super::s4_models::{GrantExpectation, S4ClosureGrant, fixed_oid};
 use super::s4_authority::{StreamSlot, wide_credential};
 pub(crate) use super::s4_models::refused_want;
@@ -117,8 +111,7 @@ fn init_bare(dir: &FsPath, format: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Rebuild one exact retained commit as a throwaway bare repository with a
-/// single `refs/heads/main` and no other reachable object.
+/// Rebuild one exact retained commit as a throwaway bare repository with one ref.
 pub(crate) async fn materialize(
     state: &AppState,
     store: &crate::blob_store::opendal::BlobStore,
@@ -180,6 +173,7 @@ async fn authorize(
     crate::ref_store::pg::bound(&tx, deadline)
         .await
         .map_err(|_| Error::timeout())?;
+    let cluster_inc = super::s4_authority::require_cluster_incarnation_nowait(&tx).await?;
     let row = tx
         .query_opt(
             "SELECT g.grant_json, g.expires_unix, g.revoked, g.cancelled, j.cancelled, j.revoked, \
@@ -194,10 +188,10 @@ async fn authorize(
                AND sr.history_incarnation=cg.history_incarnation AND sr.group_epoch=cg.group_epoch \
              JOIN tokens t ON t.id=j.issuer_token_id \
              WHERE g.repository_id=$1 AND g.credential_digest=$2 \
-               AND g.target_oid=$3 AND r.name=$4 \
+               AND g.target_oid=$3 AND r.name=$4 AND g.cluster_incarnation=$5 \
                AND g.authority_epoch=cg.authority_epoch AND g.history_incarnation=cg.history_incarnation \
                AND g.group_epoch=cg.group_epoch",
-            &[&repository.id, &digest, &target, &name],
+            &[&repository.id, &digest, &target, &name, &cluster_inc],
         )
         .await
         .map_err(Error::internal)?
@@ -247,6 +241,7 @@ async fn authorize(
         authority_epoch: row.get(12),
         history_incarnation: row.get(13),
         group_epoch: row.get(14),
+        cluster_incarnation: cluster_inc,
         mirror_audience: crate::ci_checkouts::audience()?,
         target_oid: &target,
         now_unix: now,
@@ -255,13 +250,15 @@ async fn authorize(
         .query_opt(
             "SELECT 1 FROM s4_ci_retention.ci_pins \
              WHERE repository_id=$1 AND job_id=$2 AND state='pinned' \
-               AND authority_epoch=$3 AND history_incarnation=$4 AND group_epoch=$5",
+               AND authority_epoch=$3 AND history_incarnation=$4 AND group_epoch=$5 \
+               AND cluster_incarnation=$6",
             &[
                 &repository.id,
                 &grant.job_id,
                 &row.get::<_, i64>(12),
                 &row.get::<_, Uuid>(13),
                 &row.get::<_, i64>(14),
+                &cluster_inc,
             ],
         )
         .await
@@ -285,9 +282,8 @@ async fn authorize(
     Ok(Authorized { grant, digest })
 }
 
-/// Re-check authorization before every chunk is handed to the HTTP body. The
-/// check is deliberately inside the stream: a `last` timestamp reset after every
-/// read would let a fast local loopback stream finish before the next interval.
+/// Re-check authorization before every chunk; the check lives inside the stream,
+/// so a fast local loopback read cannot outrun the next interval.
 pub(crate) fn guarded_chunks<S, F>(
     source: S,
     mut authorized: F,
@@ -431,7 +427,7 @@ pub(crate) async fn upload_pack(
             .unwrap_or(false)
         })
     };
-    let stream_auth = authorized.clone();
+    let stream_auth = authorized;
     let source = async_stream::try_stream! {
         let _holder = holder;
         let mut ticker = tokio::time::interval(RECHECK);
@@ -446,7 +442,7 @@ pub(crate) async fn upload_pack(
                 },
                 _ = ticker.tick() => {
                     let live = super::s4_authority::still_authorized(
-                        &stream_state, stream_auth.grant.job_id, &stream_auth.digest,
+                        &state, stream_auth.grant.job_id, &stream_auth.digest,
                         stream_auth.grant.repository_id, stream_auth.grant.storage_generation,
                     ).await.unwrap_or(false);
                     if live {

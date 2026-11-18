@@ -137,6 +137,7 @@ pub(super) struct Captured {
     authority_epoch: i64,
     history_incarnation: Uuid,
     group_epoch: i64,
+    cluster_incarnation: Uuid,
     object_format: String,
 }
 
@@ -183,6 +184,7 @@ async fn capture(
         authority_epoch: serving.gate.authority_epoch(),
         history_incarnation: serving.gate.history_incarnation(),
         group_epoch: serving.gate.group_epoch(),
+        cluster_incarnation: serving.cluster_incarnation,
         object_format: serving.repository.object_format.clone(),
     })
 }
@@ -287,6 +289,11 @@ pub(super) async fn create(
         let register_digest = captured.prepared.request.candidate().register_digest().as_hex();
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
+        if crate::ci_pins::s4_authority::require_cluster_incarnation_nowait(&tx).await?
+            != captured.cluster_incarnation
+        {
+            return Err(Error(StatusCode::CONFLICT, "cluster authority rotated"));
+        }
         captured
             .producer
             .roots
@@ -334,8 +341,8 @@ pub(super) async fn create(
             "INSERT INTO s4_ci_retention.git_view_bindings \
              (view_id, namespace_id, repository_id, owner_tenant_id, mount_path, subdir, \
               source_oid, projected_oid, retention_root_id, register_digest_hex, \
-              authority_epoch, history_incarnation, group_epoch, state) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'active')",
+              authority_epoch, history_incarnation, group_epoch, cluster_incarnation, state) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'active')",
             &[
                 &vid,
                 &namespace_id,
@@ -350,6 +357,7 @@ pub(super) async fn create(
                 &captured.authority_epoch,
                 &captured.history_incarnation,
                 &captured.group_epoch,
+                &captured.cluster_incarnation,
             ],
         )
         .await
@@ -382,10 +390,12 @@ pub(super) async fn bundle(
     id: Uuid,
 ) -> Result<([(axum::http::HeaderName, &'static str); 2], Vec<u8>), Error> {
     crate::ci_pins::s4_schema::ensure_s4_schema(&state.pool).await?;
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let binding = client
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let cluster_inc = crate::ci_pins::s4_authority::require_cluster_incarnation_nowait(&tx).await?;
+    let binding = tx
         .query_opt(
-            "SELECT b.retention_root_id, b.state, b.owner_tenant_id \
+            "SELECT b.retention_root_id, b.state, b.owner_tenant_id, b.cluster_incarnation \
              FROM s4_ci_retention.git_view_bindings b \
              JOIN ref_store_core_gates cg ON cg.repository_id=b.repository_id \
              WHERE b.view_id=$1 AND cg.authority_epoch=b.authority_epoch \
@@ -395,10 +405,13 @@ pub(super) async fn bundle(
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
+    if binding.get::<_, Uuid>(3) != cluster_inc {
+        return Err(Error(StatusCode::CONFLICT, "cluster authority rotated"));
+    }
     if binding.get::<_, String>(1) != "active" {
         return Err(Error(StatusCode::CONFLICT, "view binding is released"));
     }
-    let owner_id: Uuid = client
+    let owner_id: Uuid = tx
         .query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&view.repository_id])
         .await
         .map_err(Error::internal)?
@@ -406,6 +419,7 @@ pub(super) async fn bundle(
     if Some(owner_id) != binding.get::<_, Option<Uuid>>(2) {
         return Err(Error::not_found());
     }
+    let _ = tx.rollback().await;
     drop(client);
     let deadline = tokio::time::Instant::now() + state.config.git_timeout;
     let producer = crate::ci_pins::s4_pin::Producer::open(state)?;

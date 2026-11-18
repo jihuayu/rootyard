@@ -15,6 +15,34 @@ use crate::token_scopes::RepoAction;
 /// Hard wall-clock bound on one active-transfer revocation recheck.
 const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Lock and read `public.cluster_authority.incarnation` (`FOR SHARE NOWAIT`),
+/// matching `src/ref_store/serving/authority.rs` deadlock-free lock order.
+pub(crate) async fn read_cluster_incarnation_nowait(
+    tx: &deadpool_postgres::Transaction<'_>,
+) -> Result<Option<uuid::Uuid>, Error> {
+    match tx
+        .query_opt("SELECT incarnation FROM public.cluster_authority WHERE singleton=true FOR SHARE NOWAIT", &[])
+        .await
+    {
+        Ok(Some(row)) => {
+            let inc: uuid::Uuid = row.get(0);
+            Ok((!inc.is_nil()).then_some(inc))
+        }
+        Ok(None) => Ok(None),
+        Err(err) if err.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE) => Ok(None),
+        Err(err) => Err(Error::internal(err)),
+    }
+}
+
+pub(crate) async fn require_cluster_incarnation_nowait(
+    tx: &deadpool_postgres::Transaction<'_>,
+) -> Result<uuid::Uuid, Error> {
+    read_cluster_incarnation_nowait(tx).await?.ok_or(Error(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "ref-store authority is busy; retry the same request",
+    ))
+}
+
 /// Re-prove the repository authority and exact generation inside a write tx.
 pub(crate) async fn guard_repository(
     tx: &deadpool_postgres::Transaction<'_>,
@@ -132,7 +160,7 @@ const GRANT_SELECT: &str = "SELECT g.grant_json, g.expires_unix, g.cancelled, g.
        AND sr.history_incarnation=cg.history_incarnation AND sr.group_epoch=cg.group_epoch \
      JOIN tokens t ON t.id=j.issuer_token_id \
      JOIN users ua ON ua.id=t.user_id \
-     WHERE g.repository_id=$1 AND g.credential_digest=$2 AND r.name=$3 \
+     WHERE g.repository_id=$1 AND g.credential_digest=$2 AND r.name=$3 AND g.cluster_incarnation=$4 \
        AND g.authority_epoch=cg.authority_epoch \
        AND g.history_incarnation=cg.history_incarnation \
        AND g.group_epoch=cg.group_epoch \
@@ -161,8 +189,9 @@ pub(crate) async fn authenticate(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let deadline = tokio::time::Instant::now() + state.config.git_timeout;
     crate::ref_store::pg::bound(&tx, deadline).await.map_err(|_| Error::timeout())?;
+    let cluster_inc = require_cluster_incarnation_nowait(&tx).await?;
     let row = tx
-        .query_opt(GRANT_SELECT, &[&repo.id, &digest, &name])
+        .query_opt(GRANT_SELECT, &[&repo.id, &digest, &name, &cluster_inc])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::unauthorized)?;
@@ -196,6 +225,7 @@ pub(crate) async fn authenticate(
         authority_epoch: row.get(16),
         history_incarnation: row.get(17),
         group_epoch: row.get(18),
+        cluster_incarnation: cluster_inc,
         mirror_audience: audience()?,
         target_oid: oid,
         now_unix: now,
@@ -228,13 +258,15 @@ pub(crate) async fn authenticate(
         .query_opt(
             "SELECT 1 FROM s4_ci_retention.ci_pins \
              WHERE repository_id=$1 AND job_id=$2 AND state='pinned' \
-               AND authority_epoch=$3 AND history_incarnation=$4 AND group_epoch=$5",
+               AND authority_epoch=$3 AND history_incarnation=$4 AND group_epoch=$5 \
+               AND cluster_incarnation=$6",
             &[
                 &repo.id,
                 &plan.job_id,
                 &row.get::<_, i64>(16),
                 &row.get::<_, Uuid>(17),
                 &row.get::<_, i64>(18),
+                &cluster_inc,
             ],
         )
         .await
@@ -268,6 +300,9 @@ pub(crate) async fn still_authorized(
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
         crate::ref_store::pg::bound(&tx, deadline).await.map_err(|_| Error::timeout())?;
+        let Some(cluster_inc) = read_cluster_incarnation_nowait(&tx).await? else {
+            return Ok::<bool, Error>(false);
+        };
         let row = tx
             .query_opt(
                 "SELECT g.retention_root_id, r.owner_id, t.user_id, \
@@ -288,11 +323,12 @@ pub(crate) async fn still_authorized(
                    AND g.authority_epoch=cg.authority_epoch AND p.authority_epoch=cg.authority_epoch \
                    AND g.history_incarnation=cg.history_incarnation AND p.history_incarnation=cg.history_incarnation \
                    AND g.group_epoch=cg.group_epoch AND p.group_epoch=cg.group_epoch \
+                   AND g.cluster_incarnation=$5 AND p.cluster_incarnation=$5 \
                    AND NOT t.revoked AND NOT t.read_only \
                    AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
                    AND g.expires_unix>extract(epoch FROM clock_timestamp()) \
                    AND j.expires_unix>extract(epoch FROM clock_timestamp())",
-                &[&repository_id, &job_id, &credential_digest, &storage_generation],
+                &[&repository_id, &job_id, &credential_digest, &storage_generation, &cluster_inc],
             )
             .await
             .map_err(Error::internal)?;

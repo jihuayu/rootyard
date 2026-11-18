@@ -105,9 +105,11 @@ pub(super) async fn verify_active_binding(
     crate::ci_pins::s4_schema::ensure_s4_schema(&state.pool).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let cluster_inc = crate::ci_pins::s4_authority::require_cluster_incarnation_nowait(&tx).await?;
     let row = tx
         .query_opt(
-            "SELECT b.retention_root_id, b.state, b.owner_tenant_id, r.owner_id, r.state \
+            "SELECT b.retention_root_id, b.state, b.owner_tenant_id, r.owner_id, r.state, \
+                    b.cluster_incarnation \
              FROM s4_ci_retention.git_view_bindings b JOIN repositories r ON r.id=b.repository_id \
              JOIN ref_store_core_gates cg ON cg.repository_id=b.repository_id \
              WHERE b.view_id=$1 AND b.repository_id=$2 \
@@ -119,6 +121,9 @@ pub(super) async fn verify_active_binding(
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     let root_id: Uuid = row.get(0);
+    if row.get::<_, Uuid>(5) != cluster_inc {
+        return Err(Error(StatusCode::CONFLICT, "cluster authority rotated"));
+    }
     if row.get::<_, String>(1) != "active" {
         return Err(Error(StatusCode::CONFLICT, "view binding is released"));
     }

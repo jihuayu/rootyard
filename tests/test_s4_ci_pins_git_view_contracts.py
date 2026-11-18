@@ -200,6 +200,10 @@ class SourceContracts(unittest.TestCase):
         )
         self.assertIn("group_epoch", text(CI_PINS / "s4_transport.rs"))
         self.assertIn("history_incarnation", text(CI_PINS / "s4_schema.rs"))
+        self.assertIn("cluster_authority", authority)
+        self.assertIn("read_cluster_incarnation_nowait", authority)
+        self.assertIn("cluster_incarnation", text(CI_PINS / "s4_schema.rs"))
+        self.assertIn("cluster_incarnation", text(CI_PINS / "s4_models.rs"))
 
     def test_line_endings_are_pure_lf(self) -> None:
         for path in TOUCHED + [WORKFLOW, DOC]:
