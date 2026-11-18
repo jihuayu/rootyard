@@ -61,34 +61,37 @@ pub fn run_real_validate_hook(inp: RealHookInput<'_>) -> Result<()> {
     let op = inp.op.clone();
     let changes = inp.changes.to_vec();
 
-    std::thread::spawn(move || {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: serialized across this test binary by `ENV_LOCK`.
-        unsafe {
-            std::env::set_var("ROOTYARD_DATABASE_URL", &db_url);
-            std::env::set_var("ROOTYARD_GIT_PATH", &git_bin);
-            std::env::set_var("ROOTYARD_GIT_DIR", &git_dir);
-            std::env::set_var("ROOTYARD_DATA_ROOT", &data_root);
-            std::env::set_var("ROOTYARD_GIT_TIMEOUT_SECONDS", "20");
-            match &git_obj_dir {
-                Some(v) => std::env::set_var("GIT_OBJECT_DIRECTORY", v),
-                None => std::env::remove_var("GIT_OBJECT_DIRECTORY"),
+    std::thread::Builder::new()
+        .name("s4-validate-hook".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: serialized across this test binary by `ENV_LOCK`.
+            unsafe {
+                std::env::set_var("ROOTYARD_DATABASE_URL", &db_url);
+                std::env::set_var("ROOTYARD_GIT_PATH", &git_bin);
+                std::env::set_var("ROOTYARD_GIT_DIR", &git_dir);
+                std::env::set_var("ROOTYARD_DATA_ROOT", &data_root);
+                std::env::set_var("ROOTYARD_GIT_TIMEOUT_SECONDS", "20");
+                match &git_obj_dir {
+                    Some(v) => std::env::set_var("GIT_OBJECT_DIRECTORY", v),
+                    None => std::env::remove_var("GIT_OBJECT_DIRECTORY"),
+                }
+                match &git_alt_dirs {
+                    Some(v) => std::env::set_var("GIT_ALTERNATE_OBJECT_DIRECTORIES", v),
+                    None => std::env::remove_var("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
+                }
             }
-            match &git_alt_dirs {
-                Some(v) => std::env::set_var("GIT_ALTERNATE_OBJECT_DIRECTORIES", v),
-                None => std::env::remove_var("GIT_ALTERNATE_OBJECT_DIRECTORIES"),
+            let res = rootyard::browse::policy::validate_hook(&op, &changes);
+            // SAFETY: serialized across this test binary by `ENV_LOCK`.
+            unsafe {
+                std::env::remove_var("GIT_OBJECT_DIRECTORY");
+                std::env::remove_var("GIT_ALTERNATE_OBJECT_DIRECTORIES");
             }
-        }
-        let res = rootyard::browse::policy::validate_hook(&op, &changes);
-        // SAFETY: serialized across this test binary by `ENV_LOCK`.
-        unsafe {
-            std::env::remove_var("GIT_OBJECT_DIRECTORY");
-            std::env::remove_var("GIT_ALTERNATE_OBJECT_DIRECTORIES");
-        }
-        res
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("validate_hook thread panicked"))?
+            res
+        })?
+        .join()
+        .map_err(|_| anyhow::anyhow!("validate_hook thread panicked"))?
 }
 
 impl LoopbackS3 {

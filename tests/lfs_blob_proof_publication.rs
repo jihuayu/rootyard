@@ -79,9 +79,25 @@ async fn unconfigured_blob_gate_fails_closed_on_startup_and_every_lfs_or_git_end
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[test]
 #[ignore = "requires PostgreSQL 17 (ROOTYARD_TEST_DATABASE_URL) and official git-lfs client"]
-async fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_shared_holds() -> Result<()> {
+fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_shared_holds() -> Result<()> {
+    std::thread::Builder::new()
+        .name("s4-lfs-e2e-main".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| -> Result<()> {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(16 * 1024 * 1024)
+                .enable_all()
+                .build()?;
+            rt.block_on(Box::pin(run_pg17_loopback_s3_e2e()))
+        })?
+        .join()
+        .map_err(|_| anyhow::anyhow!("s4-lfs-e2e-main thread panicked"))?
+}
+
+async fn run_pg17_loopback_s3_e2e() -> Result<()> {
     run_with_migrated_pg_schema(|pool, schema_url| async move {
         let home_dir = TempDir::new()?;
         init_git_lfs_home(home_dir.path())?;
@@ -269,7 +285,7 @@ async fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_share
             run_git_ok(bob_wt.path(), home_dir.path(), &["push", "origin", "main"])?;
             run_git_ok(bob_wt.path(), home_dir.path(), &["push", "origin", "--delete", "temp-lfs-branch"])?;
 
-            exercise_unmodified_client_default_operation_replay_and_canonical_repair(DefaultOpClientInput {
+            Box::pin(exercise_unmodified_client_default_operation_replay_and_canonical_repair(DefaultOpClientInput {
                 srv: &srv,
                 s3,
                 root_prefix: &root_prefix,
@@ -277,11 +293,11 @@ async fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_share
                 realm: &realm,
                 alice: &alice,
                 home: home_dir.path(),
-            })
+            }))
             .await?;
 
             if idx == 1 {
-                let _ = exercise_same_operation_upload_retries_locator_repair_and_corruption_guard(
+                let _ = Box::pin(exercise_same_operation_upload_retries_locator_repair_and_corruption_guard(
                     UploadRetryRepairInput {
                         srv: &srv,
                         s3,
@@ -291,9 +307,9 @@ async fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_share
                         realm: &realm,
                         alice: &alice,
                     },
-                )
+                ))
                 .await?;
-                exercise_named_pointer_rejections_and_prod_attestation_replay(PointerRejectionInput {
+                Box::pin(exercise_named_pointer_rejections_and_prod_attestation_replay(PointerRejectionInput {
                     srv: &srv,
                     pg: &pg,
                     realm: &realm,
@@ -301,27 +317,29 @@ async fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_share
                     home: home_dir.path(),
                     committed_oid: &weights_v1_oid,
                     committed_size: weights_v1.len() as i64,
-                })
+                }))
                 .await?;
 
                 let saved_repos = TempDir::new()?;
                 copy_dir_recursive(&srv.state.storage.root.join("repos"), saved_repos.path())?;
                 drop(srv);
-                exercise_org_authority_restart_recovery_hydration_and_shared_holds(OrgRestartSharedHoldInput {
-                    s3,
-                    root_prefix: &root_prefix,
-                    pool: &pool,
-                    db_url: &schema_url,
-                    pg: &pg,
-                    realm: &realm,
-                    alice: &alice,
-                    bob: &bob,
-                    prev_repos_dir: saved_repos.path(),
-                    home: home_dir.path(),
-                    historical_commit: &first_commit,
-                    shared_oid: &weights_v1_oid,
-                    shared_bytes: &weights_v1,
-                })
+                Box::pin(exercise_org_authority_restart_recovery_hydration_and_shared_holds(
+                    OrgRestartSharedHoldInput {
+                        s3,
+                        root_prefix: &root_prefix,
+                        pool: &pool,
+                        db_url: &schema_url,
+                        pg: &pg,
+                        realm: &realm,
+                        alice: &alice,
+                        bob: &bob,
+                        prev_repos_dir: saved_repos.path(),
+                        home: home_dir.path(),
+                        historical_commit: &first_commit,
+                        shared_oid: &weights_v1_oid,
+                        shared_bytes: &weights_v1,
+                    },
+                ))
                 .await?;
             }
         }
