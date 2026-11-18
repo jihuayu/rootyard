@@ -706,6 +706,9 @@ jobs:
             --require-case repository_lifecycle=rename_aliases_and_authz_before_redirect \
             --require-case repository_lifecycle=soft_delete_restore_and_purge_holds \
             --require-case repository_lifecycle=ownership_transfer_and_crash_recovery \
+            --require-case repository_lifecycle=remediation_lifecycle_and_alias_scope_boundaries \
+            --require-case repository_lifecycle=remediation_fault_injection_and_concurrency \
+            --require-case repository_lifecycle=remediation_alias_parity_and_uncertain_claim_fail_closed \
             --require-case repository_lifecycle_deleted_claim=source_claim_fence_contract \
             --require-case repository_lifecycle_deleted_claim=live_control_secret_claim_and_expired_reclaim \
             --require-case repository_lifecycle_deleted_claim=live_main_run_expired_lease_fixture \
