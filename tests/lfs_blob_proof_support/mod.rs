@@ -227,7 +227,7 @@ impl RunningLfsServer {
         let scratch_dir = TempDir::new()?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
-        let base_url = format!("http://127.0.0.1:{port}");
+        let base_url = format!("http://127.0.0.1:{port}/s4-blob");
         let svc = Arc::new(LfsBlobProofService::new(
             gate,
             pg,
