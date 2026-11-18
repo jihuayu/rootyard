@@ -223,6 +223,8 @@ async fn commit_authorized(
         Ok(CommitDetail { summary, changed_paths })
     })
     .await?;
+    #[cfg(test)]
+    session.state.pause_before_commit_finalize(&oid).await;
     let response = CommitDetailWire {
         detail,
         format: session.format_name(),

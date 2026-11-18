@@ -84,6 +84,25 @@ class BlobGatewayCommitCacheShapeTests(unittest.TestCase):
         self.assertNotIn("OriginError", load_body)
         self.assertNotIn("CircuitOpen", load_body)
 
+    def test_native_http_hit_proof_seam_is_cfg_test_only(self):
+        state = source("src/blob_git_gateway/state.rs")
+        history = source("src/blob_git_gateway/history.rs")
+        native = source("src/blob_git_gateway/session_http_acceptance/cache_tests.rs")
+        self.assertIn(
+            "#[cfg(test)]\n    pub(crate) async fn pause_before_commit_finalize",
+            state,
+        )
+        self.assertIn(
+            "#[cfg(test)]\n    session.state.pause_before_commit_finalize(&oid).await;",
+            history,
+        )
+        self.assertIn("Gateway::start_with_cache", native)
+        self.assertIn("cache_stats", native)
+        self.assertIn("ReadPause", native)
+        self.assertIn("tokio::spawn", native)
+        self.assertIn("NATIVE_ACCEPTANCE_SERIAL", native)
+        self.assertIn("db.finish(outcome).await", native)
+
     def test_final_live_authorization_and_session_fence_is_unchanged(self):
         text = source("src/blob_git_gateway/browse/session.rs")
         finalize = body(text, "pub(crate) async fn finalize", "/// The session decision")

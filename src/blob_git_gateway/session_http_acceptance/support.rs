@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use super::super::state::ReadPause;
 use super::fixtures::{
     actor::Actor,
     db::{Db, deadline},
@@ -35,6 +36,7 @@ use crate::{
         opendal::BlobStore,
         test_support::{corrupt_exact, delete_exact},
     },
+    cache_wake::{ServingCache, ServingStats},
     ref_store::{
         MetadataPinPurpose,
         core::{
@@ -78,6 +80,7 @@ pub(super) struct Gateway {
     pub git: Git,
     pub scratch: tempfile::TempDir,
     push: Arc<Mutex<PushSession>>,
+    cache: Option<Arc<ServingCache>>,
     _server: ServerGuard,
 }
 
@@ -85,30 +88,57 @@ impl Gateway {
     /// Build the production router over a real listener, with the production
     /// session key set attached exactly as `standalone` attaches it.
     pub(super) async fn start(db: &Db, store: BlobStore, tokens: SessionTokens) -> Result<Self> {
+        Self::start_with_harness(db, store, tokens, None, None).await
+    }
+
+    /// Build the same production router with the advisory cache and the
+    /// test-only pre-finalize rendezvous explicitly attached.
+    pub(super) async fn start_with_cache(
+        db: &Db,
+        store: BlobStore,
+        tokens: SessionTokens,
+        cache: Arc<ServingCache>,
+        read_pause: Option<Arc<ReadPause>>,
+    ) -> Result<Self> {
+        Self::start_with_harness(db, store, tokens, Some(cache), read_pause).await
+    }
+
+    async fn start_with_harness(
+        db: &Db,
+        store: BlobStore,
+        tokens: SessionTokens,
+        cache: Option<Arc<ServingCache>>,
+        read_pause: Option<Arc<ReadPause>>,
+    ) -> Result<Self> {
         let git = Git::new()?;
         let scratch = tempfile::tempdir().context("temporary gateway scratch root")?;
-        let state = Arc::new(
-            BlobGitState::new(BlobGitConfig {
-                pool: db.pool.clone(),
-                store: store.clone(),
-                git_binary: git.binary().to_path_buf(),
-                scratch_root: scratch.path().to_path_buf(),
-                max_concurrent_requests: 4,
-                max_request_bytes: 16 * 1024 * 1024,
-                max_response_bytes: 64 * 1024 * 1024,
-                max_inflight_bytes: 64 * 1024 * 1024,
-                operation_deadline: Duration::from_secs(120),
-                native_limits: Default::default(),
-            })
-            .map_err(|error| anyhow!("gateway configuration was refused: {error}"))?
-            .with_sessions(tokens.clone()),
-        );
+        let mut state = BlobGitState::new(BlobGitConfig {
+            pool: db.pool.clone(),
+            store: store.clone(),
+            git_binary: git.binary().to_path_buf(),
+            scratch_root: scratch.path().to_path_buf(),
+            max_concurrent_requests: 4,
+            max_request_bytes: 16 * 1024 * 1024,
+            max_response_bytes: 64 * 1024 * 1024,
+            max_inflight_bytes: 64 * 1024 * 1024,
+            operation_deadline: Duration::from_secs(120),
+            native_limits: Default::default(),
+        })
+        .map_err(|error| anyhow!("gateway configuration was refused: {error}"))?
+        .with_sessions(tokens.clone());
+        if let Some(cache) = cache.as_ref() {
+            state = state.with_cache(cache.clone());
+        }
+        if let Some(read_pause) = read_pause.as_ref() {
+            state = state.with_read_pause(read_pause.clone());
+        }
+        let state = Arc::new(state);
         let push = Arc::new(Mutex::new(PushSession::default()));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let app = observe_push_session(crate::blob_git_gateway::router(state.clone()), push.clone());
         let server = ServerGuard::start(listener, app);
-        Ok(Self { address, store, tokens, git, scratch, push, _server: server })
+        Ok(Self { address, store, tokens, git, scratch, push, cache, _server: server })
     }
 
     pub(super) fn base(&self, owner: &str, name: &str) -> String {
@@ -197,6 +227,11 @@ impl Gateway {
     pub(super) fn push_session(&self) -> RawSession {
         let push = self.push.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         push.snapshot()
+    }
+
+    /// Advisory cache counters for the explicit cache-hit/fallback proof.
+    pub(super) fn cache_stats(&self) -> Option<ServingStats> {
+        self.cache.as_ref().map(|cache| cache.stats())
     }
 }
 
