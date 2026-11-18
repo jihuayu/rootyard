@@ -263,7 +263,7 @@ pub(crate) async fn load_notifications_page(
          FROM forge_notifications n \
          JOIN repositories r ON r.id=n.repository_id AND r.owner_id=n.tenant_id \
          JOIN namespaces ns ON ns.id=r.owner_id \
-         WHERE n.recipient_id=$1 AND NOT n.archived AND n.expires_at > clock_timestamp() \
+         WHERE r.deleted_at IS NULL AND n.recipient_id=$1 AND NOT n.archived AND n.expires_at > clock_timestamp() \
          AND (NOT $3::bool OR n.unread) \
          AND ($4::text IS NULL OR ns.slug=$4) \
          AND ($5::text IS NULL OR r.name=$5) \
@@ -314,7 +314,7 @@ pub(crate) async fn mark_notification_read_tx(
         "SELECT n.unread FROM forge_notifications n \
          JOIN repositories r ON r.id=n.repository_id AND r.owner_id=n.tenant_id \
          JOIN namespaces ns ON ns.id=r.owner_id \
-         WHERE n.id=$3 AND n.recipient_id=$1 AND NOT n.archived AND n.expires_at > clock_timestamp() AND ({gate}) \
+         WHERE r.deleted_at IS NULL AND n.id=$3 AND n.recipient_id=$1 AND NOT n.archived AND n.expires_at > clock_timestamp() AND ({gate}) \
          FOR UPDATE OF n"
     );
     let was_unread: bool = tx
@@ -349,7 +349,7 @@ pub(crate) async fn mark_all_notifications_read_tx(
     let sql = format!(
         "UPDATE forge_notifications n SET unread=false,read_at=clock_timestamp(),updated_at=clock_timestamp() \
          FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id \
-         WHERE n.repository_id=r.id AND n.tenant_id=r.owner_id \
+         WHERE n.repository_id=r.id AND n.tenant_id=r.owner_id AND r.deleted_at IS NULL \
          AND n.recipient_id=$1 AND n.unread AND NOT n.archived AND n.expires_at > clock_timestamp() \
          AND ($3::text IS NULL OR ns.slug=$3) AND ($4::text IS NULL OR r.name=$4) \
          AND ({gate})"

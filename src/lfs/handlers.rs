@@ -212,6 +212,16 @@ pub async fn verify_object(
         return Ok(lfs_error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object size mismatch"));
     }
 
+    let remote_store = super::hydration::remote_store(&state.storage.root).map_err(Error::internal)?;
+    crate::storage::remote_key_claims::wait_or_clear_delete_claim(
+        &state.pool,
+        remote_store.as_ref(),
+        tenant_id,
+        "lfs",
+        &spec.oid,
+        deadline,
+    )
+    .await?;
     let verified = storage::ensure_readable(
         &state.storage.root,
         repo_id,
