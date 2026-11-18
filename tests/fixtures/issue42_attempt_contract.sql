@@ -12,6 +12,8 @@ CREATE TABLE public_operations (
     public_id uuid NOT NULL,
     issuer_id uuid NOT NULL,
     wire_digest text NOT NULL CHECK (wire_digest ~ '^[0-9a-f]{64}$'),
+    request_mode text NOT NULL CHECK (request_mode IN ('atomic', 'accepted_subset')),
+    backend_identity text NOT NULL CHECK (backend_identity ~ '^[0-9a-f]{64}$'),
     realm_id uuid NOT NULL,
     restore_incarnation uuid NOT NULL,
     current_slot smallint NOT NULL DEFAULT 0,
@@ -28,6 +30,7 @@ CREATE TABLE private_attempts (
     private_id uuid NOT NULL,
     plan_digest text NOT NULL CHECK (plan_digest ~ '^[0-9a-f]{64}$'),
     proof_digest text NOT NULL CHECK (proof_digest ~ '^[0-9a-f]{64}$'),
+    base_revision bigint NOT NULL CHECK (base_revision > 0),
     PRIMARY KEY (repository_id, public_id, slot),
     UNIQUE (repository_id, private_id),
     -- Slot 0 uses a private UUID too, so neither slot can alias a public or legacy lookup.
@@ -101,9 +104,11 @@ BEGIN
            OR EXISTS (SELECT FROM private_attempts WHERE (repository_id, private_id) = (NEW.repository_id, NEW.public_id)) THEN
             RAISE EXCEPTION 'public operation identifier occupied' USING ERRCODE = '23505';
         END IF;
-    ELSIF (OLD.repository_id, OLD.public_id, OLD.issuer_id, OLD.wire_digest, OLD.realm_id, OLD.restore_incarnation)
+    ELSIF (OLD.repository_id, OLD.public_id, OLD.issuer_id, OLD.wire_digest, OLD.request_mode, OLD.backend_identity,
+           OLD.realm_id, OLD.restore_incarnation)
           IS DISTINCT FROM
-          (NEW.repository_id, NEW.public_id, NEW.issuer_id, NEW.wire_digest, NEW.realm_id, NEW.restore_incarnation)
+          (NEW.repository_id, NEW.public_id, NEW.issuer_id, NEW.wire_digest, NEW.request_mode, NEW.backend_identity,
+           NEW.realm_id, NEW.restore_incarnation)
           OR OLD.state <> 'pending'
           OR NOT ((OLD.current_slot = 0 AND NEW.current_slot = 1 AND NEW.state = 'pending')
                   OR (OLD.current_slot = NEW.current_slot AND NEW.state <> 'pending')) THEN
@@ -223,7 +228,7 @@ BEGIN
     END IF;
     SELECT * INTO STRICT wrapper FROM public_operations WHERE (repository_id, public_id) = (repo, public_op);
     FOR attempt IN
-        SELECT a.slot, o.state AS core_state, o.terminal_result, e.event_id, e.outcome, e.payload, e.revision,
+        SELECT a.slot, a.base_revision, o.state AS core_state, o.terminal_result, e.event_id, e.outcome, e.payload, e.revision,
                c.operation_id IS NOT NULL AS cancelled
         FROM private_attempts a
         LEFT JOIN ref_store_operations o ON (o.repository_id, o.operation_id) = (a.repository_id, a.private_id)
@@ -233,16 +238,20 @@ BEGIN
     LOOP
         IF (attempt.cancelled AND attempt.terminal_result IS DISTINCT FROM '{"state":"cancelled","reason":"cancel_requested"}'::jsonb)
            OR attempt.slot > wrapper.current_slot
+           OR (attempt.event_id IS NOT NULL AND
+               (attempt.outcome IS DISTINCT FROM attempt.core_state
+                OR attempt.payload IS DISTINCT FROM attempt.terminal_result
+                OR attempt.payload->'revision' IS DISTINCT FROM to_jsonb(attempt.revision)))
            OR (attempt.slot < wrapper.current_slot AND
-               (attempt.core_state IS DISTINCT FROM 'cancelled' OR NOT attempt.cancelled OR attempt.event_id IS NOT NULL))
+               (attempt.core_state IS DISTINCT FROM 'rejected' OR attempt.cancelled OR attempt.event_id IS NULL
+                OR attempt.revision <= attempt.base_revision
+                OR attempt.payload->>'kind' IS DISTINCT FROM 'rejected'
+                OR attempt.payload#>>'{rejection,code}' IS DISTINCT FROM 'revision_mismatch'
+                OR attempt.payload->'registrations' IS DISTINCT FROM '[]'::jsonb))
            OR (attempt.slot = wrapper.current_slot AND
                (attempt.core_state IS DISTINCT FROM wrapper.state
                 OR attempt.cancelled <> (wrapper.state = 'cancelled')
-                OR attempt.event_id IS DISTINCT FROM wrapper.event_id
-                OR (attempt.event_id IS NOT NULL AND
-                    (attempt.outcome IS DISTINCT FROM wrapper.state
-                     OR attempt.payload IS DISTINCT FROM attempt.terminal_result
-                     OR attempt.payload->'revision' IS DISTINCT FROM to_jsonb(attempt.revision))))) THEN
+                OR attempt.event_id IS DISTINCT FROM wrapper.event_id)) THEN
             RAISE EXCEPTION 'wrapper and core terminal disagree' USING ERRCODE = '23514';
         END IF;
     END LOOP;
@@ -262,22 +271,24 @@ CREATE CONSTRAINT TRIGGER verify_wrapper AFTER INSERT ON ref_store_core_events
 
 -- Internal routing result only. A legacy result delegates to the existing
 -- binding/receipt path. A tombstone alone is a cancel fence, never a replay.
-CREATE FUNCTION lookup_public(repo uuid, op uuid, issuer uuid, wire text)
+CREATE FUNCTION lookup_public(repo uuid, op uuid, issuer uuid, wire text, mode text, backend text)
 RETURNS TABLE (route text, operation_id uuid, state text, event_id uuid) LANGUAGE sql STABLE AS $$
     SELECT CASE
                WHEN a.private_id IS NOT NULL THEN 'private'
-               WHEN w.public_id IS NOT NULL AND (w.issuer_id, w.wire_digest) IS DISTINCT FROM (issuer, wire) THEN 'conflict'
+               WHEN w.public_id IS NOT NULL AND binding.matches IS NOT TRUE THEN 'conflict'
                WHEN w.public_id IS NOT NULL THEN 'wrapper'
                WHEN o.operation_id IS NOT NULL THEN 'legacy_operation'
                WHEN c.operation_id IS NOT NULL THEN 'legacy_tombstone'
                ELSE 'unknown'
            END,
-           CASE WHEN (w.issuer_id, w.wire_digest) = (issuer, wire) THEN w.public_id END,
-           CASE WHEN (w.issuer_id, w.wire_digest) = (issuer, wire) THEN w.state END,
-           CASE WHEN (w.issuer_id, w.wire_digest) = (issuer, wire) THEN w.event_id END
+           CASE WHEN binding.matches THEN w.public_id END,
+           CASE WHEN binding.matches THEN w.state END,
+           CASE WHEN binding.matches THEN w.event_id END
     FROM (VALUES (repo, op)) AS lookup_key(repository_id, operation_id)
     LEFT JOIN private_attempts a ON (a.repository_id, a.private_id) = (lookup_key.repository_id, lookup_key.operation_id)
     LEFT JOIN public_operations w ON (w.repository_id, w.public_id) = (lookup_key.repository_id, lookup_key.operation_id)
     LEFT JOIN ref_store_operations o ON (o.repository_id, o.operation_id) = (lookup_key.repository_id, lookup_key.operation_id)
     LEFT JOIN ref_store_cancellations c ON (c.repository_id, c.operation_id) = (lookup_key.repository_id, lookup_key.operation_id)
+    CROSS JOIN LATERAL (SELECT (w.issuer_id, w.wire_digest, w.request_mode, w.backend_identity) =
+                               (issuer, wire, mode, backend) AS matches) binding
 $$;
