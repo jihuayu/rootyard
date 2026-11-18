@@ -2,6 +2,7 @@
 //! and production `rootyard::lfs::routes()` (`AppState`) test harness (`Refs #145`).
 
 pub mod adversarial;
+pub mod adversarial_default_ops;
 pub mod adversarial_org_restart;
 pub mod git_smart_http;
 
@@ -247,7 +248,7 @@ fn find_git_binary() -> PathBuf {
 pub struct RunningProdLfsServer {
     pub base_url: String,
     pub state: Arc<AppState>,
-    pub data_dir: TempDir,
+    _data_dir: TempDir,
     handle: JoinHandle<()>,
 }
 
@@ -298,7 +299,7 @@ impl RunningProdLfsServer {
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        Ok(Self { base_url, state, data_dir, handle })
+        Ok(Self { base_url, state, _data_dir: data_dir, handle })
     }
 
     pub fn git_url_for(&self, actor: &TestActor, owner: &str, repo: &str) -> String {

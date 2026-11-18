@@ -6,8 +6,8 @@ use uuid::Uuid;
 use crate::blob_store::BlobLocator;
 
 use super::authz::{
-    LfsBlobRuntimeGate, SubjectTenantAuthority, evaluate_subject_tenant_access, extract_stable_operation_id,
-    operation_token_to_uuid, verify_shared_hold_grant,
+    LfsBlobRuntimeGate, SubjectTenantAuthority, derive_default_push_operation_id, derive_default_upload_operation_id,
+    evaluate_subject_tenant_access, extract_stable_operation_id, operation_token_to_uuid, verify_shared_hold_grant,
 };
 use super::locks_store::valid_lfs_lock_path;
 use super::types::{
@@ -280,4 +280,17 @@ fn stable_operation_id_headers_and_attestation_digest_are_deterministic() {
     assert!(valid_lfs_lock_path("assets/model.bin"));
     assert!(!valid_lfs_lock_path("/abs/model.bin"));
     assert!(!valid_lfs_lock_path("assets/../escape.bin"));
+
+    let def_u0 = derive_default_upload_operation_id(repo, actor, &"a7".repeat(32), 2048, 0);
+    assert_eq!(def_u0, derive_default_upload_operation_id(repo, actor, &"a7".repeat(32), 2048, 0));
+    assert_ne!(def_u0, derive_default_upload_operation_id(repo, actor, &"a7".repeat(32), 2048, 1));
+    let ref_upd = LfsRefUpdateSpec {
+        ref_name: "refs/heads/main".into(),
+        old_oid: "0".repeat(40),
+        new_oid: "3".repeat(40),
+    };
+    assert_eq!(
+        derive_default_push_operation_id(repo, actor, std::slice::from_ref(&ref_upd)),
+        derive_default_push_operation_id(repo, actor, std::slice::from_ref(&ref_upd))
+    );
 }

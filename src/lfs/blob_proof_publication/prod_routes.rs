@@ -349,12 +349,30 @@ pub(crate) async fn prod_verify(
         return Ok(lfs_blob_err_response(e));
     }
     models::check_lfs_json_headers(&headers)?;
+    let op_id = match extract_stable_operation_id(&headers) {
+        Ok(v) => v,
+        Err(e) => return Ok(lfs_blob_err_response(e)),
+    };
     let spec: BatchObjectSpec = serde_json::from_slice(&body).map_err(|_| Error::bad_request())?;
     let (actor, name, pg, realm, access) =
         match auth_and_prepare_prod(&state, &gate, &headers, &owner, &repo_raw, true).await {
             Ok(t) => t,
             Err(early) => return Ok(*early),
         };
+    if let Some(id) = op_id {
+        match pg.load_upload_operation(realm.repository_id, id).await {
+            Ok(Some(saved))
+                if saved.actor_id != actor.id || saved.oid_sha256 != spec.oid || saved.size_bytes != spec.size =>
+            {
+                return Ok(lfs_blob_err_response(LfsBlobError::new(
+                    LfsProofRejectCode::AttestationEquivocation,
+                    "verify operation_id conflicts with upload operation record",
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => return Ok(lfs_blob_err_response(e)),
+        }
+    }
     let scratch = ephemeral_scratch_root();
     let ctx = LfsTransferContext {
         gate: &gate,

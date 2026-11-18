@@ -240,7 +240,7 @@ pub async fn exercise_named_pointer_rejections_and_prod_attestation_replay(
         pool: srv.state.pool.clone(),
         actor_id: alice.user_id,
         actor_username: alice.username.clone(),
-        operation_id: op_id,
+        operation_id: Some(op_id),
         git_object_dir: None,
         git_alternate_object_dirs: None,
     };

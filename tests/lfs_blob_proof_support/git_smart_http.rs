@@ -208,8 +208,7 @@ async fn smart_git_fallback(
     }
 
     let op_id = match extract_stable_operation_id(&clean_headers) {
-        Ok(Some(id)) => id,
-        Ok(None) => Uuid::new_v4(),
+        Ok(opt) => opt,
         Err(e) => return Ok(json_err(e)),
     };
 

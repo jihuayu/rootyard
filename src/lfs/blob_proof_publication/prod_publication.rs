@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::journal::RefChange;
 
 use super::attestation::{LfsPushAttestationRequest, attest_and_authorize_push};
-use super::authz::{LfsBlobRuntimeGate, operation_token_to_uuid};
+use super::authz::{LfsBlobRuntimeGate, derive_default_push_operation_id, operation_token_to_uuid};
 use super::pg_store::PgLfsBlobStore;
 use super::transfer::LfsTransferContext;
 use super::types::{AttestationOutcome, LfsBlobError, LfsProofRejectCode, LfsRefUpdateSpec};
@@ -20,7 +20,7 @@ pub struct PushAttestationSession {
     pub pool: Pool,
     pub actor_id: Uuid,
     pub actor_username: String,
-    pub operation_id: Uuid,
+    pub operation_id: Option<Uuid>,
     pub git_object_dir: Option<String>,
     pub git_alternate_object_dirs: Option<String>,
 }
@@ -50,7 +50,7 @@ pub async fn prod_validate_and_attest_push(
     changes: &[RefChange],
 ) -> Result<AttestationOutcome, LfsBlobError> {
     let _ = gate.require_store()?;
-    let (pool, actor_id, actor_username, op_id, git_obj_dir, git_alt_dirs) =
+    let (pool, actor_id, actor_username, opt_op_id, git_obj_dir, git_alt_dirs) =
         if let Ok(s) = ACTIVE_PUSH_SESSION.try_with(Clone::clone) {
             (s.pool, s.actor_id, s.actor_username, s.operation_id, s.git_object_dir, s.git_alternate_object_dirs)
         } else {
@@ -64,7 +64,7 @@ pub async fn prod_validate_and_attest_push(
     let access = pg.resolve_authoritative_repo_access(&realm, actor_id, &actor_username, true, false).await?;
     let scratch = ephemeral_scratch_root();
     let ctx = LfsTransferContext { gate, pg: &pg, realm: &realm, access: &access, scratch_dir: &scratch, timeout };
-    let updates = changes
+    let updates: Vec<LfsRefUpdateSpec> = changes
         .iter()
         .map(|c| LfsRefUpdateSpec {
             ref_name: c.ref_name.clone(),
@@ -72,6 +72,7 @@ pub async fn prod_validate_and_attest_push(
             new_oid: c.new_oid.clone(),
         })
         .collect();
+    let op_id = opt_op_id.unwrap_or_else(|| derive_default_push_operation_id(repo_id, actor_id, &updates));
     let req = LfsPushAttestationRequest {
         operation_id: op_id,
         updates,
@@ -81,7 +82,8 @@ pub async fn prod_validate_and_attest_push(
     attest_and_authorize_push(&ctx, &req).await
 }
 
-fn resolve_hook_env_session() -> Result<(Pool, Uuid, String, Uuid, Option<String>, Option<String>), LfsBlobError> {
+fn resolve_hook_env_session() -> Result<(Pool, Uuid, String, Option<Uuid>, Option<String>, Option<String>), LfsBlobError>
+{
     let db_url = std::env::var("ROOTYARD_DATABASE_URL")
         .or_else(|_| std::env::var("ROOTYARD_TEST_DATABASE_URL"))
         .map_err(|_| LfsBlobError::new(LfsProofRejectCode::PgDatabase, "missing database URL for push attestation"))?;
@@ -90,24 +92,22 @@ fn resolve_hook_env_session() -> Result<(Pool, Uuid, String, Uuid, Option<String
         && let Ok(bytes) = std::fs::read(FsPath::new(&op_dir).join("operation.json"))
         && let Ok(op) = serde_json::from_slice::<crate::journal::Operation>(&bytes)
     {
-        let op_id = op
+        let explicit_op_id = op
             .idempotency
             .as_ref()
-            .and_then(|i| operation_token_to_uuid(&i.key_sha256).ok())
-            .unwrap_or(op.id);
+            .and_then(|i| operation_token_to_uuid(&i.key_sha256).ok());
         return Ok((
             pool,
             op.actor_id,
             op.actor_name,
-            op_id,
+            explicit_op_id,
             std::env::var("GIT_OBJECT_DIRECTORY").ok(),
             std::env::var("GIT_ALTERNATE_OBJECT_DIRECTORIES").ok(),
         ));
     }
-    let op_id = std::env::var("ROOTYARD_OPERATION_ID")
+    let explicit_op_id = std::env::var("ROOTYARD_OPERATION_ID")
         .ok()
-        .and_then(|s| operation_token_to_uuid(&s).ok())
-        .unwrap_or_else(Uuid::new_v4);
+        .and_then(|s| operation_token_to_uuid(&s).ok());
     let actor_id = std::env::var("ROOTYARD_ACTOR_ID")
         .ok()
         .and_then(|s| Uuid::parse_str(&s).ok())
@@ -117,7 +117,7 @@ fn resolve_hook_env_session() -> Result<(Pool, Uuid, String, Uuid, Option<String
         pool,
         actor_id,
         actor_username,
-        op_id,
+        explicit_op_id,
         std::env::var("GIT_OBJECT_DIRECTORY").ok(),
         std::env::var("GIT_ALTERNATE_OBJECT_DIRECTORIES").ok(),
     ))

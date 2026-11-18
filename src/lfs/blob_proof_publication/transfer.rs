@@ -20,7 +20,7 @@ use crate::lfs::models::{
     LFS_MEDIA_TYPE, MAX_BATCH_OBJECTS, valid_lfs_oid,
 };
 
-use super::authz::{AuthorizedRepoAccess, LfsBlobRuntimeGate};
+use super::authz::{AuthorizedRepoAccess, LfsBlobRuntimeGate, operation_token_to_uuid};
 use super::hydration_view::EphemeralScratchGuard;
 pub use super::hydration_view::{
     ComputeViewHydrationReport, delete_or_retire_lfs_object, hydrate_clean_compute_view,
@@ -99,6 +99,7 @@ pub async fn process_batch_request(
         }
         let dl = StdInstant::now() + ctx.timeout;
         if is_upload {
+            let mut stale_missing = false;
             match ctx.pg.load_committed_blob(ctx.realm.owner_tenant_id, ctx.realm.repository_id, &spec.oid).await? {
                 Some(existing) if !existing.retired => {
                     if existing.size_bytes != spec.size {
@@ -134,12 +135,47 @@ pub async fn process_batch_request(
                             });
                             continue;
                         }
-                        Err(e) if e.code == LfsProofRejectCode::MissingRemoteBlob => {}
+                        Err(e) if e.code == LfsProofRejectCode::MissingRemoteBlob => {
+                            stale_missing = true;
+                        }
                         Err(other) => return Err(other),
                     }
                 }
-                _ => {}
+                Some(_) => stale_missing = true,
+                None => {}
             }
+            let op_id = if let Some(tok) =
+                action_headers.get("X-Rootyard-Operation-Id").or_else(|| action_headers.get("Idempotency-Key"))
+            {
+                let id = operation_token_to_uuid(tok)?;
+                let _ = ctx
+                    .pg
+                    .begin_or_load_upload_operation(
+                        ctx.realm.repository_id,
+                        id,
+                        ctx.realm.owner_tenant_id,
+                        ctx.access.actor_id,
+                        &spec.oid,
+                        spec.size,
+                    )
+                    .await?;
+                id
+            } else {
+                ctx.pg
+                    .ensure_default_upload_operation(
+                        ctx.realm.repository_id,
+                        ctx.realm.owner_tenant_id,
+                        ctx.access.actor_id,
+                        &spec.oid,
+                        spec.size,
+                        stale_missing,
+                    )
+                    .await?
+            };
+            let mut obj_upload_hdr = upload_hdr.clone();
+            obj_upload_hdr.insert("X-Rootyard-Operation-Id".to_owned(), op_id.to_string());
+            let mut obj_verify_hdr = verify_hdr.clone();
+            obj_verify_hdr.insert("X-Rootyard-Operation-Id".to_owned(), op_id.to_string());
             results.push(BatchObjectResult {
                 oid: spec.oid.clone(),
                 size: spec.size,
@@ -147,13 +183,13 @@ pub async fn process_batch_request(
                 actions: Some(BatchActions {
                     upload: Some(BatchActionLink {
                         href: format!("{prefix}/info/lfs/objects/{}/{}", spec.oid, spec.size),
-                        header: upload_hdr.clone(),
+                        header: obj_upload_hdr,
                         expires_in: Some(3600),
                     }),
                     download: None,
                     verify: Some(BatchActionLink {
                         href: format!("{prefix}/info/lfs/verify"),
-                        header: verify_hdr.clone(),
+                        header: obj_verify_hdr,
                         expires_in: Some(3600),
                     }),
                 }),
@@ -209,20 +245,6 @@ pub async fn upload_lfs_object_to_remote(
     if !valid_lfs_oid(oid_sha256) || expected_size < 0 {
         return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "invalid LFS oid or negative size"));
     }
-    if let Some(op_id) = operation_id {
-        let _ = ctx
-            .pg
-            .begin_or_load_upload_operation(
-                ctx.realm.repository_id,
-                op_id,
-                ctx.realm.owner_tenant_id,
-                ctx.access.actor_id,
-                oid_sha256,
-                expected_size,
-            )
-            .await?;
-    }
-
     let attempt_id = Uuid::new_v4();
     ctx.pg
         .record_upload_attempt_start(
@@ -249,6 +271,7 @@ pub async fn upload_lfs_object_to_remote(
 
     let mut stale_missing_locator: Option<StoredBlobLocatorRef> = None;
     let std_dl = StdInstant::now() + ctx.timeout;
+    let mut verified_fast_existing: Option<CommittedLfsBlobRecord> = None;
     if let Some(existing) =
         ctx.pg.load_committed_blob(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256).await?
     {
@@ -265,19 +288,7 @@ pub async fn upload_lfs_object_to_remote(
             match verify_committed_locator_bytes(store, ctx.scratch_dir, &existing, oid_sha256, expected_size, std_dl)
                 .await
             {
-                Ok(_) => {
-                    let committed = ctx.pg.record_committed_blob(attempt_id, operation_id, &existing, None).await?;
-                    verify_committed_locator_bytes(
-                        store,
-                        ctx.scratch_dir,
-                        &committed,
-                        oid_sha256,
-                        expected_size,
-                        StdInstant::now() + ctx.timeout,
-                    )
-                    .await?;
-                    return Ok(committed);
-                }
+                Ok(_) => verified_fast_existing = Some(existing),
                 Err(e) if e.code == LfsProofRejectCode::MissingRemoteBlob => {
                     stale_missing_locator = Some(existing.locator.clone());
                 }
@@ -287,6 +298,49 @@ pub async fn upload_lfs_object_to_remote(
                 }
             }
         }
+    }
+
+    let resolved_op_id = match operation_id {
+        Some(op_id) => {
+            let _ = ctx
+                .pg
+                .begin_or_load_upload_operation(
+                    ctx.realm.repository_id,
+                    op_id,
+                    ctx.realm.owner_tenant_id,
+                    ctx.access.actor_id,
+                    oid_sha256,
+                    expected_size,
+                )
+                .await?;
+            op_id
+        }
+        None => {
+            ctx.pg
+                .ensure_default_upload_operation(
+                    ctx.realm.repository_id,
+                    ctx.realm.owner_tenant_id,
+                    ctx.access.actor_id,
+                    oid_sha256,
+                    expected_size,
+                    stale_missing_locator.is_some(),
+                )
+                .await?
+        }
+    };
+
+    if let Some(existing) = verified_fast_existing {
+        let committed = ctx.pg.record_committed_blob(attempt_id, Some(resolved_op_id), &existing, None).await?;
+        verify_committed_locator_bytes(
+            store,
+            ctx.scratch_dir,
+            &committed,
+            oid_sha256,
+            expected_size,
+            StdInstant::now() + ctx.timeout,
+        )
+        .await?;
+        return Ok(committed);
     }
 
     fs::create_dir_all(ctx.scratch_dir)
@@ -351,8 +405,10 @@ pub async fn upload_lfs_object_to_remote(
         uploader_actor_id: ctx.access.actor_id,
         retired: false,
     };
-    let committed =
-        ctx.pg.record_committed_blob(attempt_id, operation_id, &candidate, stale_missing_locator.as_ref()).await?;
+    let committed = ctx
+        .pg
+        .record_committed_blob(attempt_id, Some(resolved_op_id), &candidate, stale_missing_locator.as_ref())
+        .await?;
     // Mandatory post-commit verification on the FINAL ACTUAL persisted `committed.locator` before ACK!
     verify_committed_locator_bytes(
         store,

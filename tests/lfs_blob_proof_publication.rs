@@ -18,6 +18,9 @@ use support::adversarial::{
     exercise_org_authority_restart_recovery_hydration_and_shared_holds,
     exercise_same_operation_upload_retries_locator_repair_and_corruption_guard,
 };
+use support::adversarial_default_ops::{
+    DefaultOpClientInput, exercise_unmodified_client_default_operation_replay_and_canonical_repair,
+};
 use support::{
     LoopbackS3, RunningProdLfsServer, copy_dir_recursive, init_git_lfs_home, issue_actor, run_git_ok, run_git_raw,
     run_with_migrated_pg_schema,
@@ -265,6 +268,17 @@ async fn pg17_loopback_s3_official_git_lfs_batch_locks_delete_recovery_and_share
             run_git_ok(bob_wt.path(), home_dir.path(), &["commit", "-m", "delete weights.bin after unlock"])?;
             run_git_ok(bob_wt.path(), home_dir.path(), &["push", "origin", "main"])?;
             run_git_ok(bob_wt.path(), home_dir.path(), &["push", "origin", "--delete", "temp-lfs-branch"])?;
+
+            exercise_unmodified_client_default_operation_replay_and_canonical_repair(DefaultOpClientInput {
+                srv: &srv,
+                s3,
+                root_prefix: &root_prefix,
+                pg: &pg,
+                realm: &realm,
+                alice: &alice,
+                home: home_dir.path(),
+            })
+            .await?;
 
             if idx == 1 {
                 let _ = exercise_same_operation_upload_retries_locator_repair_and_corruption_guard(

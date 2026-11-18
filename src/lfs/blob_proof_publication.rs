@@ -27,8 +27,9 @@ mod unit_tests;
 
 pub use attestation::{LfsPushAttestationRequest, attest_and_authorize_push};
 pub use authz::{
-    AuthorizedRepoAccess, LfsBlobRuntimeGate, SubjectTenantAuthority, evaluate_subject_tenant_access,
-    extract_credentials_header, extract_stable_operation_id, operation_token_to_uuid, verify_shared_hold_grant,
+    AuthorizedRepoAccess, LfsBlobRuntimeGate, SubjectTenantAuthority, derive_default_push_operation_id,
+    derive_default_upload_operation_id, evaluate_subject_tenant_access, extract_credentials_header,
+    extract_stable_operation_id, operation_token_to_uuid, verify_shared_hold_grant,
 };
 pub use locks_store::valid_lfs_lock_path;
 pub use pg_store::{LfsRepoRealm, PgLfsBlobStore, ReconcileUploadsReport, UploadOperationRow, init_lfs_blob_proof_tables};

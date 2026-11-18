@@ -10,10 +10,13 @@ use uuid::Uuid;
 use crate::blob_store::{config::BlobProfile, opendal::BlobStore};
 
 use super::types::{
-    CommittedLfsBlobRecord, LfsAccessMode, LfsBlobError, LfsCollaboratorRole, LfsProofRejectCode, SharedLfsHoldGrant,
+    CommittedLfsBlobRecord, LfsAccessMode, LfsBlobError, LfsCollaboratorRole, LfsProofRejectCode, LfsRefUpdateSpec,
+    SharedLfsHoldGrant, compute_ref_updates_digest,
 };
 
 const IDEMPOTENCY_OP_DOMAIN: &[u8] = b"rootyard/lfs/idempotency-op/v1:";
+const DEFAULT_UPLOAD_OP_DOMAIN: &[u8] = b"rootyard/lfs/default-upload-op/v1:";
+const DEFAULT_PUSH_OP_DOMAIN: &[u8] = b"rootyard/lfs/default-push-op/v1:";
 
 /// Startup & request gate guaranteeing LFS never operates without an explicit remote OpenDAL `BlobStore`.
 #[derive(Clone)]
@@ -265,11 +268,46 @@ pub fn operation_token_to_uuid(token: &str) -> Result<Uuid, LfsBlobError> {
     h.update(IDEMPOTENCY_OP_DOMAIN);
     h.update(token.as_bytes());
     let digest = h.finalize();
+    Ok(uuid_from_sha256_prefix(&digest))
+}
+
+fn uuid_from_sha256_prefix(digest: &[u8]) -> Uuid {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Ok(Uuid::from_bytes(bytes))
+    Uuid::from_bytes(bytes)
+}
+
+/// Deterministically derives the default upload `operation_id` when an unmodified `git-lfs` client
+/// omits `X-Rootyard-Operation-Id` / `Idempotency-Key`. `repair_epoch` increments strictly when a
+/// previously committed canonical remote `BlobLocator` is verified missing and requires repair.
+pub fn derive_default_upload_operation_id(
+    repository_id: Uuid,
+    actor_id: Uuid,
+    oid_sha256: &str,
+    size_bytes: i64,
+    repair_epoch: u64,
+) -> Uuid {
+    let mut h = Sha256::new();
+    h.update(DEFAULT_UPLOAD_OP_DOMAIN);
+    h.update(repository_id.as_bytes());
+    h.update(actor_id.as_bytes());
+    h.update(oid_sha256.as_bytes());
+    h.update(size_bytes.to_be_bytes());
+    h.update(repair_epoch.to_be_bytes());
+    uuid_from_sha256_prefix(&h.finalize())
+}
+
+/// Deterministically derives the default ref-publication attestation `operation_id` when an
+/// unmodified `git push` client omits `X-Rootyard-Operation-Id` / `Idempotency-Key`.
+pub fn derive_default_push_operation_id(repository_id: Uuid, actor_id: Uuid, updates: &[LfsRefUpdateSpec]) -> Uuid {
+    let mut h = Sha256::new();
+    h.update(DEFAULT_PUSH_OP_DOMAIN);
+    h.update(repository_id.as_bytes());
+    h.update(actor_id.as_bytes());
+    h.update(compute_ref_updates_digest(updates).as_bytes());
+    uuid_from_sha256_prefix(&h.finalize())
 }
 
 /// Parses HTTP `Authorization` header (`Basic base64(user:secret)` or `Bearer secret`).

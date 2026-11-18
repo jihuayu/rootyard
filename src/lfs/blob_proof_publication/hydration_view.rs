@@ -10,9 +10,9 @@ use uuid::Uuid;
 use crate::blob_store::{BlobReceipt, opendal::BlobStore};
 use crate::lfs::models::valid_lfs_oid;
 
-use super::authz::verify_shared_hold_grant;
+use super::authz::{derive_default_upload_operation_id, verify_shared_hold_grant};
 use super::locks_store::run_git_quarantined;
-use super::pg_store::pg_err;
+use super::pg_store::{PgLfsBlobStore, pg_err};
 use super::transfer::LfsTransferContext;
 use super::types::{
     CommittedLfsBlobRecord, LfsBlobError, LfsProofRejectCode, PointerInspection, PointerResolutionSource,
@@ -261,4 +261,48 @@ pub async fn hydrate_clean_compute_view(
         }
     }
     Ok(ComputeViewHydrationReport { commit_oid: commit_oid.to_owned(), hydrated_files, total_hydrated_bytes })
+}
+
+impl PgLfsBlobStore {
+    /// Resolves or creates a durable default upload `operation_id` in `lfs_blob_upload_operations`
+    /// for unmodified `git-lfs` clients that send no custom idempotency header.
+    pub async fn ensure_default_upload_operation(
+        &self,
+        repository_id: Uuid,
+        tenant_id: Uuid,
+        actor_id: Uuid,
+        oid_sha256: &str,
+        size_bytes: i64,
+        force_new_repair_epoch: bool,
+    ) -> Result<Uuid, LfsBlobError> {
+        let rows = self
+            .pool()
+            .get()
+            .await
+            .map_err(pg_err)?
+            .query(
+                "SELECT operation_id, state FROM lfs_blob_upload_operations
+                 WHERE repository_id=$1 AND actor_id=$2 AND oid_sha256=$3 AND size_bytes=$4
+                 ORDER BY created_at ASC",
+                &[&repository_id, &actor_id, &oid_sha256, &size_bytes],
+            )
+            .await
+            .map_err(pg_err)?;
+        for r in &rows {
+            let st: &str = r.get(1);
+            if st == "pending" || st == "aborted_failed" {
+                return Ok(r.get(0));
+            }
+        }
+        if !force_new_repair_epoch
+            && let Some(last_committed) = rows.iter().rev().find(|r| r.get::<_, &str>(1) == "committed")
+        {
+            return Ok(last_committed.get(0));
+        }
+        let op_id = derive_default_upload_operation_id(repository_id, actor_id, oid_sha256, size_bytes, rows.len() as u64);
+        let _ = self
+            .begin_or_load_upload_operation(repository_id, op_id, tenant_id, actor_id, oid_sha256, size_bytes)
+            .await?;
+        Ok(op_id)
+    }
 }
