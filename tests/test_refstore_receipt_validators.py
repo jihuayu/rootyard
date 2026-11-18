@@ -21,6 +21,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/refstore-protocol-acceptance.yml"
 SCRIPTS = ROOT / "scripts"
+CASE18_PRE_ADMISSION = (
+    "blob_git_gateway::admission_race_acceptance::"
+    "pre_admission_revision_mismatch_rebases_to_old_oid_mismatch")
+CASE19_ADMITTED_REFUSAL = (
+    "blob_git_gateway::admission_race_acceptance::"
+    "admitted_same_ref_attempt_is_refused_after_winner_commits")
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import native_build_receipt as receipts  # noqa: E402
@@ -399,7 +405,7 @@ def make_preflight_fixture(root, block, schema="v2", jobs=None,
     lib.write_text(
         "#!/usr/bin/env python3\n"
         "import sys\n"
-        f"names = {names!r}\n"
+        f"names = {names + [CASE19_ADMITTED_REFUSAL]!r}\n"
         "if sys.argv[1:] == ['--list', '--ignored']:\n"
         "    for name in names:\n"
         "        print(name + ': test')\n"
@@ -650,6 +656,10 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
             block for block in blocks
             if "session174 receipt copy check failed" in block
         )
+        cls.case_runner = next(
+            block for block in blocks
+            if "session174 cases:" in block and "phase_marker_env" in block
+        )
         cls.batch_constants = validator_constants(cls.batch_validator)
 
     def run_batch_validator(self, fixture, block=None):
@@ -675,6 +685,7 @@ class RefstoreReceiptValidatorsTest(unittest.TestCase):
 
     def run_preflight_validator(self, fixture, environment=None, block=None):
         environment = dict(os.environ if environment is None else environment)
+        environment.setdefault("ROOTYARD_282_ADMITTED_REFUSAL_WITNESS", "")
         environment.update({
             "GITHUB_WORKSPACE": str(fixture["root"]),
             "DATABASE_URL": "postgresql://fixture.invalid/rootyard",
@@ -873,21 +884,66 @@ for _guard_name in ('rename', 'replace', 'link', 'unlink', 'remove'):
 """
         return guard + self.preflight_validator
 
-    def assert_preflight_passes(self, fixture):
-        process = self.run_preflight_validator(fixture)
+    def assert_preflight_passes(self, fixture, environment=None):
+        process = self.run_preflight_validator(fixture, environment=environment)
         self.assertEqual(
             process.returncode, 0,
             f"preflight failed:\n{process.stdout[-2000:]}\n{process.stderr[-2000:]}",
         )
         return json.loads((fixture["evidence"] / "preflight.json").read_text())
 
-    def assert_preflight_fails(self, fixture, marker):
-        process = self.run_preflight_validator(fixture)
+    def assert_preflight_fails(self, fixture, marker, environment=None):
+        process = self.run_preflight_validator(fixture, environment=environment)
         self.assertNotEqual(process.returncode, 0,
                             f"preflight unexpectedly passed:\n{process.stdout[-2000:]}")
         self.assertIn(marker, process.stderr,
                       f"preflight failed without {marker!r}:\n{process.stderr[-2000:]}")
         return process
+
+    def static_preflight_names(self):
+        for node in ast.parse(self.preflight_validator).body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                    and isinstance(node.targets[0], ast.Name) \
+                    and node.targets[0].id == "names":
+                return ast.literal_eval(node.value)
+        self.fail("preflight validator has no literal names inventory")
+
+    def run_case_runner(self, root, required_names, witness, fail_case19=False):
+        root = Path(root)
+        evidence = root / "session174-foundation"
+        evidence.mkdir()
+        (evidence / "preflight.json").write_text(
+            json.dumps({"required_names": required_names}))
+        secret = "raw-case19-output-not-for-evidence"
+        lib = root / "fixture-lib"
+        lib.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys\n"
+            "name = sys.argv[sys.argv.index('--exact') + 1]\n"
+            f"if name == {CASE19_ADMITTED_REFUSAL!r}:\n"
+            f"    print({secret!r})\n"
+            f"    sys.stderr.write({secret + '-stderr'!r} + '\\n')\n"
+            f"    if {fail_case19!r}:\n"
+            "        marker = os.environ.get('ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKER')\n"
+            "        if marker:\n"
+            "            pathlib.Path(marker).write_text('durable_refusal_assertions')\n"
+            "        print('test ' + name + ' ... FAILED')\n"
+            "        sys.exit(1)\n"
+            "print('test ' + name + ' ... ok')\n"
+            "print('test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+            "0 filtered out; finished in 0.00s')\n"
+        )
+        lib.chmod(0o755)
+        environment = {
+            **os.environ,
+            "RUNNER_TEMP": str(root),
+            "ROOTYARD_282_ADMITTED_REFUSAL_WITNESS": witness,
+        }
+        process = subprocess.run(
+            [sys.executable, "-", str(lib), str(evidence)],
+            cwd=root, env=environment, input=self.case_runner,
+            text=True, capture_output=True)
+        return process, evidence, secret
 
     def assert_batch_passes(self, fixture):
         process = self.run_batch_validator(fixture)
@@ -1143,6 +1199,63 @@ pathlib.Path.replace = fail_replace
                          self.batch_validator)
         self.assertNotIn('json.loads(pathlib.Path(serving_receipt_path)',
                          self.batch_validator)
+
+    def test_282_witness_selector_is_a_fixed_pr_platform_boolean(self):
+        self.assertIn(
+            "      ROOTYARD_282_ADMITTED_REFUSAL_WITNESS: "
+            "${{ github.event.pull_request.number == 282 && '1' || '' }}\n",
+            self.source)
+        self.assertEqual(self.source.count("github.event.pull_request.number == 282"), 1)
+        self.assertEqual(
+            self.source.count("os.environ.get('ROOTYARD_282_ADMITTED_REFUSAL_WITNESS', '')"), 2)
+        self.assertNotIn("github.event.inputs", self.source[self.source.index(
+            "ROOTYARD_282_ADMITTED_REFUSAL_WITNESS"):self.source.index(
+            "CARGO_INCREMENTAL: '0'")])
+
+    def test_282_preflight_inventory_adds_only_the_admitted_witness(self):
+        names = self.static_preflight_names()
+        self.assertEqual(len(names), 18)
+        self.assertEqual(names[-1], CASE18_PRE_ADMISSION)
+        self.assertNotIn(CASE19_ADMITTED_REFUSAL, names)
+        self.assertIn(
+            "witness = os.environ.get('ROOTYARD_282_ADMITTED_REFUSAL_WITNESS', '')",
+            self.preflight_validator)
+        self.assertIn("if witness not in ('', '1'):", self.preflight_validator)
+        self.assertIn("if witness == '1':", self.preflight_validator)
+        self.assertIn("names.append(CASE19_ADMITTED_REFUSAL)", self.preflight_validator)
+        self.assertIn("'required_names': names", self.preflight_validator)
+        self.assertIn("ROOTYARD_282_ADMITTED_REFUSAL_WITNESS must be empty or 1",
+                      self.preflight_validator)
+
+    def test_282_runner_binds_preflight_set_and_keeps_case18_phase_diagnostics(self):
+        runner = self.case_runner
+        self.assertIn("required_names = preflight.get('required_names')", runner)
+        self.assertIn("if required_names != names:", runner)
+        self.assertIn("names = required_names", runner)
+        self.assertIn("if witness == '1':", runner)
+        self.assertIn("names.append(CASE19_ADMITTED_REFUSAL)", runner)
+        self.assertEqual(runner.count(CASE19_ADMITTED_REFUSAL), 1)
+        self.assertIn("witness_case = index == 19 and name == witness_case_name", runner)
+        self.assertIn("if not witness_case:", runner)
+        self.assertIn("save(evidence / 'case-19.json'", runner)
+        self.assertNotIn("case-19.log", self.source)
+        for key in ("schema", "pr", "required_case", "ran", "passed", "failed",
+                    "ignored", "exit_code", "result"):
+            self.assertIn("'" + key + "':", runner)
+        self.assertIn("case_evidence['failure_phase'] = phase", runner)
+        self.assertIn("if not witness_case:", runner)
+        self.assertLess(runner.index("if not witness_case:"), runner.index("save(log"))
+        self.assertLess(runner.index("if witness_case:"),
+                        runner.index("save(evidence / 'case-19.json'"))
+        self.assertIn("diagnose_phase = index == 18 and name == phase_case_name", runner)
+        self.assertIn("'pre_admission_barrier', 'winner_publish'", runner)
+        self.assertIn("'loser_rebase_await', 'loser_rebase_exit_status', "
+                      "'loser_rebase_forbidden_text'", runner)
+        self.assertIn("run_case18(command)", runner)
+        self.assertIn("'session174-case18-'", runner)
+        self.assertIn("'post_admission_barrier', 'pre_release_assertions'", runner)
+        self.assertIn("'superseded_refusal_await'", runner)
+        self.assertIn("run_case19(command)", runner)
 
     def test_validators_parse_and_use_the_shared_reader(self):
         self.assertEqual(len(self.validators), 2)
@@ -1594,6 +1707,94 @@ pathlib.Path.replace = fail_replace
             cli_copy = fixture["evidence"] / "rootyard-cli.build.json"
             self.assertEqual(cli_copy.read_bytes(), cli_receipt.read_bytes())
             self.assertEqual(digest(cli_copy), digest(cli_receipt))
+
+    def test_282_preflight_selects_exactly_one_witness_only_when_enabled(self):
+        base_names = self.static_preflight_names()
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(temporary, self.preflight_validator)
+            preflight = self.assert_preflight_passes(
+                fixture,
+                environment={**os.environ, "ROOTYARD_282_ADMITTED_REFUSAL_WITNESS": ""})
+            self.assertEqual(preflight["required_names"], base_names)
+            self.assertEqual(len(preflight["required_names"]), 18)
+            self.assertEqual(preflight["required_names"][-1], CASE18_PRE_ADMISSION)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(temporary, self.preflight_validator)
+            preflight = self.assert_preflight_passes(
+                fixture,
+                environment={**os.environ, "ROOTYARD_282_ADMITTED_REFUSAL_WITNESS": "1"})
+            self.assertEqual(preflight["required_names"], base_names + [CASE19_ADMITTED_REFUSAL])
+            self.assertEqual(len(preflight["required_names"]), 19)
+            self.assertEqual(preflight["required_names"][-1], CASE19_ADMITTED_REFUSAL)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = make_preflight_fixture(temporary, self.preflight_validator)
+            self.assert_preflight_fails(
+                fixture, "ROOTYARD_282_ADMITTED_REFUSAL_WITNESS must be empty or 1",
+                environment={**os.environ, "ROOTYARD_282_ADMITTED_REFUSAL_WITNESS": "true"})
+
+    def test_282_runner_executes_only_the_stored_witness_set_without_raw_output(self):
+        base_names = self.static_preflight_names()
+        with tempfile.TemporaryDirectory() as temporary:
+            process, evidence, secret = self.run_case_runner(
+                temporary, base_names, "")
+            self.assertEqual(
+                process.returncode, 0,
+                f"runner failed:\n{process.stdout[-2000:]}\n{process.stderr[-2000:]}")
+            aggregate = json.loads((evidence / "session174-foundation.json").read_text())
+            self.assertEqual(aggregate["required_cases"], base_names)
+            self.assertEqual(aggregate["cases_required"], 18)
+            self.assertTrue(aggregate["ok"])
+            self.assertEqual(aggregate["summary"], "18 passed, 0 failed, 0 ignored")
+            self.assertFalse((evidence / "case-19.json").exists())
+            self.assertFalse((evidence / "case-19.log").exists())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            process, evidence, secret = self.run_case_runner(
+                temporary, base_names + [CASE19_ADMITTED_REFUSAL], "1")
+            self.assertEqual(
+                process.returncode, 0,
+                f"runner failed:\n{process.stdout[-2000:]}\n{process.stderr[-2000:]}")
+            aggregate = json.loads((evidence / "session174-foundation.json").read_text())
+            self.assertEqual(aggregate["required_cases"],
+                             base_names + [CASE19_ADMITTED_REFUSAL])
+            self.assertEqual(aggregate["cases_required"], 19)
+            self.assertTrue(aggregate["ok"])
+            self.assertEqual(aggregate["summary"], "19 passed, 0 failed, 0 ignored")
+            witness = aggregate["cases"][-1]
+            self.assertEqual(witness["name"], CASE19_ADMITTED_REFUSAL)
+            self.assertEqual(witness["evidence"], "case-19.json")
+            self.assertNotIn("log", witness)
+            self.assertEqual(
+                json.loads((evidence / "case-19.json").read_text()),
+                {
+                    "schema": "rootyard/refstore-admitted-refusal-witness/v1",
+                    "pr": 282,
+                    "required_case": CASE19_ADMITTED_REFUSAL,
+                    "ran": 1,
+                    "passed": 1,
+                    "failed": 0,
+                    "ignored": 0,
+                    "exit_code": 0,
+                    "result": "passed",
+                })
+            self.assertFalse((evidence / "case-19.log").exists())
+            self.assertNotIn(secret, process.stdout + process.stderr)
+            for path in evidence.iterdir():
+                self.assertNotIn(secret, path.read_text(errors="ignore"), path.name)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            process, evidence, secret = self.run_case_runner(
+                temporary, base_names + [CASE19_ADMITTED_REFUSAL], "1", fail_case19=True)
+            self.assertNotEqual(process.returncode, 0, process.stdout[-2000:])
+            witness = json.loads((evidence / "case-19.json").read_text())
+            self.assertEqual(witness["result"], "failed")
+            self.assertEqual(witness["failure_phase"], "durable_refusal_assertions")
+            self.assertEqual(witness["ran"], 0)
+            self.assertFalse((evidence / "case-19.log").exists())
+            for path in evidence.iterdir():
+                self.assertNotIn(secret, path.read_text(errors="ignore"), path.name)
 
     def test_preflight_reuses_readonly_cli_receipt_alias_without_writes(self):
         with tempfile.TemporaryDirectory() as temporary:

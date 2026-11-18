@@ -81,6 +81,8 @@ jobs:
       SESSION174_DATABASE_ADMIN_URL: postgresql://rootyard@127.0.0.1:55432/postgres
       SESSION174_DATABASE_PREFIX: session174_foundation
       FORMAT22_DATABASE_PREFIX: format22_ledger
+      # Fixed-PR platform selector: only PR #282 admits the nineteenth witness.
+      ROOTYARD_282_ADMITTED_REFUSAL_WITNESS: ${{ github.event.pull_request.number == 282 && '1' || '' }}
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -1668,6 +1670,9 @@ jobs:
           workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
           evidence = pathlib.Path(lib).parent
           hex64 = re.compile(r'^[0-9a-f]{64}$')
+          CASE19_ADMITTED_REFUSAL = (
+              'blob_git_gateway::admission_race_acceptance::admitted_same_ref_attempt_is_refused_after_winner_commits')
+          witness = os.environ.get('ROOTYARD_282_ADMITTED_REFUSAL_WITNESS', '')
           names = [
               'blob_git_gateway::session_http_acceptance::push_token_bounds_repeated_http_reads',
               'blob_git_gateway::session_http_acceptance::negative_tests::cross_repository_session_replay_is_refused',
@@ -1717,6 +1722,10 @@ jobs:
               raise SystemExit('session174 preflight: ' + message)
 
 
+          if witness not in ('', '1'):
+              fail('ROOTYARD_282_ADMITTED_REFUSAL_WITNESS must be empty or 1')
+          if witness == '1':
+              names.append(CASE19_ADMITTED_REFUSAL)
           lib = readonly_alias(lib, 'lib alias')
           cli = readonly_alias(cli, 'CLI alias')
 
@@ -2227,6 +2236,20 @@ jobs:
           if python3 - "$lib" "$evidence" <<'PY' 2>&1 | tee "$evidence/cases.log"
           import contextlib, json, os, pathlib, re, subprocess, sys, tempfile
           lib, evidence = sys.argv[1], pathlib.Path(sys.argv[2])
+          CASE19_ADMITTED_REFUSAL = (
+              'blob_git_gateway::admission_race_acceptance::admitted_same_ref_attempt_is_refused_after_winner_commits')
+          witness = os.environ.get('ROOTYARD_282_ADMITTED_REFUSAL_WITNESS', '')
+          if witness not in ('', '1'):
+              raise SystemExit('session174 cases: ROOTYARD_282_ADMITTED_REFUSAL_WITNESS must be empty or 1')
+          try:
+              preflight = json.loads((evidence / 'preflight.json').read_text())
+          except (OSError, ValueError) as error:
+              raise SystemExit('session174 cases: unreadable preflight required names: '
+                               + type(error).__name__)
+          required_names = preflight.get('required_names')
+          if (not isinstance(required_names, list) or not required_names
+                  or any(not isinstance(name, str) or not name for name in required_names)):
+              raise SystemExit('session174 cases: preflight required_names is not a non-empty string list')
           phase_marker_env = 'ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKER'
           os.environ.pop(phase_marker_env, None)
           phase_case_name = (
@@ -2237,6 +2260,14 @@ jobs:
               'loser_rebase_stale_info', 'http_report_assertions', 'durable_state_assertions', 'fixture_cleanup',
           )}
           phase_read_limit = max(map(len, failure_phases)) + 1
+          witness_case_name = CASE19_ADMITTED_REFUSAL
+          witness_failure_phases = {phase.encode('ascii'): phase for phase in (
+              'fixture_setup', 'repository_seed', 'post_admission_barrier', 'pre_release_assertions',
+              'winner_publish', 'post_winner_assertions', 'superseded_refusal_await', 'report_assertions',
+              'durable_refusal_assertions', 'authenticated_operation_read', 'panic_assertion',
+              'cleanup_drain', 'fixture_cleanup',
+          )}
+          witness_phase_read_limit = max(map(len, witness_failure_phases)) + 1
           secret_env = ('ROOTYARD_OBJECT_STORE_ACCESS_KEY', 'ROOTYARD_OBJECT_STORE_SECRET_KEY',
                         'ROOTYARD_BLOB_ACCESS_KEY_ID', 'ROOTYARD_BLOB_SECRET_ACCESS_KEY')
           secrets = sorted({os.environ.get(key) or '' for key in secret_env}, key=len, reverse=True)
@@ -2261,6 +2292,11 @@ jobs:
               'ref_store::core::pack_snapshot::materialize::serving_tests::contract::sealed_materialization_returns_none_for_a_checked_empty_capture',
               'blob_git_gateway::admission_race_acceptance::pre_admission_revision_mismatch_rebases_to_old_oid_mismatch',
           ]
+          if witness == '1':
+              names.append(CASE19_ADMITTED_REFUSAL)
+          if required_names != names:
+              raise SystemExit('session174 cases: preflight required_names differs from the selected inventory')
+          names = required_names
           summary = re.compile(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; '
                                r'(\d+) measured; (\d+) filtered out; finished in ([0-9.]+)s$', re.M)
 
@@ -2279,14 +2315,14 @@ jobs:
           def save(path, text):
               path.write_text(sanitize(text))
 
-          def run_case18(command):
+          def run_case_with_phase(command, phases, read_limit, prefix):
               phase = 'unknown'
               env = os.environ.copy()
               marker = None
               with contextlib.ExitStack() as stack:
                   try:
                       directory = stack.enter_context(tempfile.TemporaryDirectory(
-                          prefix='session174-case18-', dir=os.environ.get('RUNNER_TEMP'),
+                          prefix=prefix, dir=os.environ.get('RUNNER_TEMP'),
                           ignore_cleanup_errors=True))
                       marker = pathlib.Path(directory) / 'phase'
                       env[phase_marker_env] = str(marker)
@@ -2297,15 +2333,27 @@ jobs:
                       try:
                           if not marker.is_symlink() and marker.is_file():
                               with marker.open('rb') as stream:
-                                  phase = failure_phases.get(stream.read(phase_read_limit), 'unknown')
+                                  phase = phases.get(stream.read(read_limit), 'unknown')
                       except OSError:
                           pass
               return process, phase
 
+          def run_case18(command):
+              return run_case_with_phase(command, failure_phases, phase_read_limit, 'session174-case18-')
+
+          def run_case19(command):
+              return run_case_with_phase(command, witness_failure_phases, witness_phase_read_limit,
+                                         'session174-case19-')
+
           results = []
           for index, name in enumerate(names, 1):
-              log = evidence / ('case-' + str(index) + '.log')
-              record = {'index': index, 'name': name, 'log': log.name, 'exit_code': None, 'errors': []}
+              witness_case = index == 19 and name == witness_case_name
+              record = {'index': index, 'name': name, 'exit_code': None, 'errors': []}
+              if witness_case:
+                  record['evidence'] = 'case-19.json'
+              else:
+                  log = evidence / ('case-' + str(index) + '.log')
+                  record['log'] = log.name
               passed_count = failed_count = ignored_count = 0
               diagnose_phase = index == 18 and name == phase_case_name
               failure_phase = 'unknown'
@@ -2313,13 +2361,16 @@ jobs:
                   command = [lib, '--ignored', '--exact', name, '--test-threads=1']
                   if diagnose_phase:
                       process, failure_phase = run_case18(command)
+                  elif witness_case:
+                      process, failure_phase = run_case19(command)
                   else:
                       process = subprocess.run(command, text=True, capture_output=True)
                   combined = process.stdout + process.stderr
                   record['exit_code'] = process.returncode
-                  save(log, '$ libtest --ignored --exact ' + name + ' --test-threads=1\n'
-                       + '$ exit ' + str(process.returncode) + '\n--- stdout ---\n'
-                       + process.stdout + '--- stderr ---\n' + process.stderr)
+                  if not witness_case:
+                      save(log, '$ libtest --ignored --exact ' + name + ' --test-threads=1\n'
+                           + '$ exit ' + str(process.returncode) + '\n--- stdout ---\n'
+                           + process.stdout + '--- stderr ---\n' + process.stderr)
                   # Only this unsanitized in-memory output is parsed for the libtest summary.
                   rows = summary.findall(combined)
                   record['summaries'] = len(rows)
@@ -2342,8 +2393,9 @@ jobs:
               except (OSError, subprocess.SubprocessError) as error:
                   record['exit_code'] = None
                   record['errors'].append('runner error ' + type(error).__name__)
-                  save(log, '$ libtest --ignored --exact ' + name + ' --test-threads=1\n'
-                       + '$ runner error ' + type(error).__name__ + '\n')
+                  if not witness_case:
+                      save(log, '$ libtest --ignored --exact ' + name + ' --test-threads=1\n'
+                           + '$ runner error ' + type(error).__name__ + '\n')
               # Missing/multiple summaries, ignored or zero-run cases and exit failures are failures.
               record['passed'] = 0 if record['errors'] else passed_count
               record['failed'] = 1 if record['errors'] else max(failed_count, 1 if passed_count == 0 else 0)
@@ -2351,6 +2403,23 @@ jobs:
               record['result'] = 'passed' if not record['errors'] else 'failed'
               if diagnose_phase and record['result'] == 'failed':
                   record['failure_phase'] = failure_phase
+              if witness_case:
+                  case_evidence = {
+                      'schema': 'rootyard/refstore-admitted-refusal-witness/v1',
+                      'pr': 282,
+                      'required_case': name,
+                      'ran': 1 if record.get('case_lines') == [name] else 0,
+                      'passed': record['passed'],
+                      'failed': record['failed'],
+                      'ignored': record['ignored'],
+                      'exit_code': record['exit_code'],
+                      'result': record['result'],
+                  }
+                  if record['result'] == 'failed':
+                      phase = failure_phase if failure_phase in witness_failure_phases.values() else 'unknown'
+                      if phase != 'unknown':
+                          case_evidence['failure_phase'] = phase
+                  save(evidence / 'case-19.json', json.dumps(case_evidence, indent=2) + '\n')
               results.append(record)
               print('case ' + str(index) + ': ' + record['result'] + ' ' + name)
               for error in record['errors']:
@@ -2394,10 +2463,14 @@ jobs:
           # idempotently so an existing same-byte copy is never rewritten.
           python3 scripts/collect_evidence_receipts.py \
             "$evidence/preflight.json" "$evidence" test-results/refstore/session174-foundation
-          # Every required case writes its own case-N.log; copy all of them.
+          # Each legacy case writes its own case-N.log; copy all of them.  The
+          # #282 witness writes only the bounded case-19.json projection.
           for log in "$evidence"/case-*.log; do
             if [ -f "$log" ]; then cp "$log" test-results/refstore/session174-foundation/; fi
           done
+          if [ -f "$evidence/case-19.json" ]; then
+            cp "$evidence/case-19.json" test-results/refstore/session174-foundation/
+          fi
           # Re-hash the raw consumed receipt copies; never rewrite their JSON.
           python3 - "$evidence" test-results/refstore/session174-foundation <<'PY'
           import hashlib, json, pathlib, sys
@@ -2533,7 +2606,7 @@ jobs:
           status=0
           for name in preflight.json preflight.log session174-lib-tests.stdout.log \
                       standalone-build.json cases.log session174-foundation.json \
-                      database-cleanup.log receipt-copy-check.json; do
+                      database-cleanup.log receipt-copy-check.json case-19.json; do
             if [ -f "$evidence/$name" ]; then
               cp "$evidence/$name" "$upload/" || status=1
             fi
