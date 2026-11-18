@@ -358,7 +358,8 @@ pub(super) async fn verify_staged_attempt_lease(
     Ok(())
 }
 
-/// Aborts an attempt and orphans its still-pending operation when no other live attempt references it.
+/// Aborts a failed attempt and transitions its orphaned `pending` operation to `aborted_failed`
+/// when no other live `pending` attempt references it.
 pub(super) async fn abort_attempt_and_orphan_op(
     pg: &PgLfsBlobStore,
     repository_id: Uuid,
@@ -366,28 +367,41 @@ pub(super) async fn abort_attempt_and_orphan_op(
     operation_id: Uuid,
     reason: &str,
 ) {
-    let _ = pg.mark_upload_attempt_aborted(attempt_id, reason).await;
-    if let Ok(client) = pg.pool().get().await {
-        let _ = client
-            .execute(
-                "UPDATE lfs_blob_upload_operations o
-                 SET state = 'aborted_cancelled', updated_at = clock_timestamp()
-                 WHERE o.repository_id = $1
-                   AND o.operation_id = $2
-                   AND o.state = 'pending'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM lfs_blob_upload_attempts a
-                       WHERE a.repository_id = o.repository_id
-                         AND a.state = 'pending'
-                         AND a.lease_until > clock_timestamp()
-                         AND (
-                             a.operation_id = o.operation_id
-                             OR (a.operation_id IS NULL AND a.actor_id = o.actor_id
-                                 AND a.oid_sha256 = o.oid_sha256 AND a.size_bytes = o.size_bytes)
-                         )
-                   )",
-                &[&repository_id, &operation_id],
-            )
-            .await;
-    }
+    let Ok(mut client) = pg.pool().get().await else {
+        return;
+    };
+    let Ok(tx) = client.transaction().await else {
+        return;
+    };
+    let _ = tx.batch_execute("SET LOCAL synchronous_commit = 'on'").await;
+    let _ = tx
+        .execute(
+            "UPDATE lfs_blob_upload_attempts
+             SET state = 'aborted_failed', failure_reason = $2, updated_at = clock_timestamp()
+             WHERE attempt_id = $1 AND state = 'pending'",
+            &[&attempt_id, &reason],
+        )
+        .await;
+    let _ = tx
+        .execute(
+            "UPDATE lfs_blob_upload_operations o
+             SET state = 'aborted_failed', updated_at = clock_timestamp()
+             WHERE o.repository_id = $1
+               AND o.operation_id = $2
+               AND o.state = 'pending'
+               AND NOT EXISTS (
+                   SELECT 1 FROM lfs_blob_upload_attempts a
+                   WHERE a.repository_id = o.repository_id
+                     AND a.state = 'pending'
+                     AND a.lease_until > clock_timestamp()
+                     AND (
+                         a.operation_id = o.operation_id
+                         OR (a.operation_id IS NULL AND a.actor_id = o.actor_id
+                             AND a.oid_sha256 = o.oid_sha256 AND a.size_bytes = o.size_bytes)
+                     )
+               )",
+            &[&repository_id, &operation_id],
+        )
+        .await;
+    let _ = tx.commit().await;
 }

@@ -46,7 +46,7 @@ pub async fn exercise_post_auth_pending_multi_instance_active_lease_and_atomic_c
         scenario_mid_upload_revocation(scn).await?;
     }
     super::lease_state_regressions::exercise_lease_loss_late_commit_and_unprecreated_mid_upload_revocation(
-        super::lease_state_regressions::LeaseStateRegressionInput { srv: &srv2, gate: &gate, pool, realm, alice },
+        super::lease_state_regressions::LeaseStateRegressionInput { s3, srv: &srv2, gate: &gate, pool, realm, alice },
     )
     .await?;
     Ok(())

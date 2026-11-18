@@ -325,8 +325,7 @@ pub async fn upload_streamed_lfs_object_to_remote_with_auth(
     let resolved_op_id = match operation_id {
         Some(op_id) => {
             if let Err(e) = ctx.pg.begin_or_load_upload_operation_with_auth(op_id, op_spec, commit_auth).await {
-                let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
-                return Err(e);
+                return Err(orphan_fail(ctx, attempt_id, op_id, e).await);
             }
             op_id
         }

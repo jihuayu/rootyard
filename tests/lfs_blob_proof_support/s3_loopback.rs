@@ -22,10 +22,17 @@ use rootyard::{
 };
 use sha2::{Digest, Sha256};
 
+pub struct PostPutPause {
+    pub key_suffix: String,
+    pub staged_tx: tokio::sync::oneshot::Sender<String>,
+    pub resume_rx: tokio::sync::oneshot::Receiver<()>,
+}
+
 #[derive(Default)]
 pub struct S3MemState {
     pub objects: Mutex<BTreeMap<String, Vec<u8>>>,
     pub fail_503: AtomicBool,
+    pub post_put_pause: Mutex<Option<PostPutPause>>,
 }
 
 pub struct LoopbackS3 {
@@ -141,6 +148,21 @@ impl LoopbackS3 {
     pub fn restore_raw(&self, root_prefix: &str, loc: &BlobLocator, bytes: Vec<u8>) {
         self.state.objects.lock().unwrap().insert(Self::object_key(root_prefix, loc), bytes);
     }
+
+    pub fn arm_post_put_pause(
+        &self,
+        oid: &str,
+    ) -> (tokio::sync::oneshot::Receiver<String>, tokio::sync::oneshot::Sender<()>) {
+        let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        *self.state.post_put_pause.lock().unwrap() =
+            Some(PostPutPause { key_suffix: format!("/{oid}"), staged_tx, resume_rx });
+        (staged_rx, resume_tx)
+    }
+
+    pub fn raw_object_len(&self, key: &str) -> Option<usize> {
+        self.state.objects.lock().unwrap().get(key).map(Vec::len)
+    }
 }
 
 pub fn set_blob_env(endpoint: &str, root_prefix: &str) {
@@ -198,7 +220,15 @@ async fn handle_s3(
     match method {
         Method::PUT => {
             let etag = format!("\"{}\"", &hex::encode(Sha256::digest(&body))[..32]);
-            st.objects.lock().unwrap().insert(key, body.to_vec());
+            let maybe_pause = {
+                st.objects.lock().unwrap().insert(key.clone(), body.to_vec());
+                let mut slot = st.post_put_pause.lock().unwrap();
+                if slot.as_ref().is_some_and(|p| key.ends_with(&p.key_suffix)) { slot.take() } else { None }
+            };
+            if let Some(pause) = maybe_pause {
+                let _ = pause.staged_tx.send(key);
+                let _ = pause.resume_rx.await;
+            }
             (
                 StatusCode::OK,
                 [(header::ETAG, etag), (header::CONTENT_LENGTH, "0".into()), (header::CONNECTION, "close".into())],

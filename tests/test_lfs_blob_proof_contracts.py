@@ -164,6 +164,7 @@ class LfsBlobProofContractTests(unittest.TestCase):
         )
 
         self.assertTrue((TEST_SUPPORT / "lease_state_regressions.rs").is_file())
+        self.assertTrue((TEST_SUPPORT / "lease_state_regressions" / "post_remote_stage_auth.rs").is_file())
         multi_src = (TEST_SUPPORT / "multi_instance_auth_boundary.rs").read_text(encoding="utf-8")
         self.assertIn("lease_state_regressions", multi_src)
         self.assertIn("exercise_post_auth_pending_multi_instance_active_lease_and_atomic_commit_auth", multi_src)
@@ -191,6 +192,7 @@ class LfsBlobProofContractTests(unittest.TestCase):
 
         loopback_src = (TEST_SUPPORT / "s3_loopback.rs").read_text(encoding="utf-8")
         self.assertIn("rootyard::browse::policy::validate_hook", loopback_src)
+        self.assertIn("arm_post_put_pause", loopback_src)
 
     def test_workflow_and_doc_contracts(self) -> None:
         wf = WORKFLOW.read_text(encoding="utf-8")

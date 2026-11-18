@@ -4,13 +4,15 @@ use deadpool_postgres::Pool;
 
 use rootyard::lfs::blob_proof_publication::{LfsBlobRuntimeGate, LfsRepoRealm, PgLfsBlobStore};
 
-use super::{RunningProdLfsServer, TestActor};
+use super::{LoopbackS3, RunningProdLfsServer, TestActor};
 
 mod harness;
 mod late_commit;
+mod post_remote_stage_auth;
 mod revocation_cases;
 
 pub struct LeaseStateRegressionInput<'a> {
+    pub s3: &'a LoopbackS3,
     pub srv: &'a RunningProdLfsServer,
     pub gate: &'a LfsBlobRuntimeGate,
     pub pool: &'a Pool,
@@ -21,12 +23,13 @@ pub struct LeaseStateRegressionInput<'a> {
 pub async fn exercise_lease_loss_late_commit_and_unprecreated_mid_upload_revocation(
     inp: LeaseStateRegressionInput<'_>,
 ) -> anyhow::Result<()> {
-    let LeaseStateRegressionInput { srv, gate, pool, realm, alice } = inp;
+    let LeaseStateRegressionInput { s3, srv, gate, pool, realm, alice } = inp;
     let pg = PgLfsBlobStore::new(pool.clone());
     late_commit::scenario_late_commit(&pg, pool, gate, realm, alice).await?;
     late_commit::scenario_http_late_completion(srv, &pg, pool, realm, alice).await?;
     for token_revocation in [false, true] {
         revocation_cases::scenario_unprecreated_revocation(srv, pool, realm, alice, token_revocation).await?;
     }
-    revocation_cases::scenario_chunked_reopen(srv, pool, realm, alice).await
+    revocation_cases::scenario_chunked_reopen(srv, pool, realm, alice).await?;
+    post_remote_stage_auth::scenario_post_remote_stage_final_auth_revocation(s3, srv, pool, realm, alice).await
 }
