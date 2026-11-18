@@ -337,7 +337,7 @@ fn reconcile_pg_raft_cutpoint(
         let hold = backup_holds
             .iter()
             .find(|h| h.repository_id == repo.repository_id && h.tenant_id == repo.tenant_id)
-            .ok_or_else(|| PairedBackupError::IncompleteCut("missing backup retention hold before unfreeze"))?;
+            .ok_or(PairedBackupError::IncompleteCut("missing backup retention hold before unfreeze"))?;
         if sm.read_root(hold.root_id).is_none() || sm.read_pin(hold.pin_id).is_none() {
             return Err(PairedBackupError::IncompleteCut("backup pin/root missing from Raft snapshot"));
         }
