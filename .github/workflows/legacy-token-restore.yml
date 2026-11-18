@@ -80,7 +80,8 @@ jobs:
         run: |
           scripts/install_ci_native_tools.sh install \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance test-results/legacy135/native-tools.json
+            --provenance test-results/legacy135/native-tools.json \
+            --phase-record test-results/legacy135/native-tools-phase.json
           echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
       - name: Verify the native tool profile
         timeout-minutes: 5
@@ -88,7 +89,8 @@ jobs:
           echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
           scripts/install_ci_native_tools.sh preflight \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance test-results/legacy135/native-tools.json
+            --provenance test-results/legacy135/native-tools.json \
+            --phase-record test-results/legacy135/native-tools-phase.json
       - name: Install pinned Rust 1.99.1
         run: |
           rustup toolchain install 1.99.1 --profile minimal
@@ -240,4 +242,5 @@ jobs:
             test-results/legacy135-candidate-build.json
             test-results/legacy135-candidate.build.json
             test-results/legacy135-hosted-manifest.json
+            test-results/legacy135/native-tools-phase.json
           if-no-files-found: ignore
