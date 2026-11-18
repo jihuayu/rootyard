@@ -275,8 +275,8 @@ async fn run_safe_gc_phases(
 
     let mut compacted = false;
     if authority.snapshot().active_packs.len() >= policy.pack_threshold as usize {
-        let views_dir = state.storage.root.join("safe-gc-views").join(job.id.to_string());
-        let views = DisposableViewRoot::open(&views_dir, 4, 64 * 1024 * 1024, Duration::from_secs(120))
+        let views_dir = state.storage.root.join("safe-gc-views");
+        let views = DisposableViewRoot::open(&views_dir, 8, 64 * 1024 * 1024, Duration::from_secs(120))
             .map_err(|e| anyhow::anyhow!("DisposableViewRoot: {e}"))?;
         execute_two_phase_compaction(
             &authority,
