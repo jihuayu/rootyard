@@ -13,9 +13,6 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Dedicated coordination schema. S4 never adds a table to `public`, because the
-/// migration-151 backup catalog pins the exact `public` table set.
-pub(crate) const SCHEMA: &str = "s4_ci_retention";
 /// Narrow, one-job checkout credential prefix.
 pub(crate) const JOB_PREFIX: &str = "ryj_";
 /// Maximum closure-grant lifetime accepted by the producer, in seconds.
@@ -36,21 +33,14 @@ pub struct S4ClosureGrant {
     pub owner_tenant_id: Uuid,
     pub storage_generation: i64,
     pub authority_epoch: i64,
+    pub history_incarnation: Uuid,
+    pub group_epoch: i64,
     pub object_format: String,
     pub target_oid: String,
     pub retention_root_id: Uuid,
     pub pack_set_digest: String,
     pub mirror_audience: Uuid,
     pub expires_unix: i64,
-}
-
-/// Producer request body for `POST /api/repos/{owner}/{name}/ci-pins`.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct S4PinBody {
-    pub job_id: Uuid,
-    pub target_oid: String,
-    pub storage_generation: i64,
 }
 
 /// Empty-or-exact release body. Every field is optional so `DELETE` with no body
@@ -87,6 +77,8 @@ pub struct GrantExpectation<'a> {
     pub owner_tenant_id: Uuid,
     pub storage_generation: i64,
     pub authority_epoch: i64,
+    pub history_incarnation: Uuid,
+    pub group_epoch: i64,
     pub mirror_audience: Uuid,
     pub target_oid: &'a str,
     pub now_unix: i64,
@@ -128,6 +120,58 @@ pub(crate) fn is_digest_hex(value: &str) -> bool {
     is_lower_hex(value, 64)
 }
 
+/// Fail-closed pkt-line check: requires >= 1 valid `want <exact-lower-target>`
+/// line, rejects `want-ref`, uppercase hex, extra wants, and malformed framing.
+pub(crate) fn refused_want(body: &[u8], target: &str) -> bool {
+    if body.is_empty() || target.is_empty() {
+        return true;
+    }
+    let mut pos = 0usize;
+    let mut wants = 0usize;
+    while pos < body.len() {
+        let Some(hdr) = body.get(pos..pos + 4).and_then(|b| std::str::from_utf8(b).ok()) else {
+            return true;
+        };
+        let Ok(len) = u16::from_str_radix(hdr, 16) else {
+            return true;
+        };
+        match len {
+            0..=2 => {
+                pos += 4;
+                continue;
+            }
+            3 => return true,
+            _ => {}
+        }
+        let end = pos + usize::from(len);
+        let Some(payload) = body.get(pos + 4..end) else {
+            return true;
+        };
+        pos = end;
+        if payload.starts_with(b"want-ref") || payload.windows(8).any(|w| w == b"want-ref") {
+            return true;
+        }
+        if payload.starts_with(b"want") {
+            let Some(rest) = payload.strip_prefix(b"want ") else {
+                return true;
+            };
+            if rest.len() < target.len() || &rest[..target.len()] != target.as_bytes() {
+                return true;
+            }
+            if rest.len() > target.len() && !matches!(rest[target.len()], b'\n' | b'\r' | b' ' | 0) {
+                return true;
+            }
+            if rest[target.len()..].windows(5).any(|w| w == b"want ") {
+                return true;
+            }
+            wants += 1;
+        } else if payload.windows(5).any(|w| w == b"want ") {
+            return true;
+        }
+    }
+    wants == 0
+}
+
 /// Trusted, caller-fixed identities of one grant that is about to be issued.
 /// Grouping them keeps the constructor within the seven-argument bound.
 pub(crate) struct NewGrant<'a> {
@@ -136,6 +180,8 @@ pub(crate) struct NewGrant<'a> {
     pub owner_tenant_id: Uuid,
     pub storage_generation: i64,
     pub authority_epoch: i64,
+    pub history_incarnation: Uuid,
+    pub group_epoch: i64,
     pub object_format: &'a str,
     pub target_oid: &'a str,
     pub retention_root_id: Uuid,
@@ -155,6 +201,8 @@ impl S4ClosureGrant {
             owner_tenant_id: input.owner_tenant_id,
             storage_generation: input.storage_generation,
             authority_epoch: input.authority_epoch,
+            history_incarnation: input.history_incarnation,
+            group_epoch: input.group_epoch,
             object_format: input.object_format.to_owned(),
             target_oid: input.target_oid.to_owned(),
             retention_root_id: input.retention_root_id,
@@ -177,6 +225,8 @@ impl S4ClosureGrant {
             || self.mirror_audience.is_nil()
             || self.storage_generation <= 0
             || self.authority_epoch <= 0
+            || self.history_incarnation.is_nil()
+            || self.group_epoch <= 0
             || self.expires_unix <= 0
             || oid_width(&self.object_format).is_none()
             || !is_digest_hex(&self.pack_set_digest)
@@ -196,6 +246,8 @@ impl S4ClosureGrant {
             || self.owner_tenant_id != expected.owner_tenant_id
             || self.storage_generation != expected.storage_generation
             || self.authority_epoch != expected.authority_epoch
+            || self.history_incarnation != expected.history_incarnation
+            || self.group_epoch != expected.group_epoch
             || self.mirror_audience != expected.mirror_audience
             || self.target_oid != expected.target_oid
             || self.expires_unix <= expected.now_unix
@@ -219,6 +271,8 @@ mod tests {
             owner_tenant_id: Uuid::new_v4(),
             storage_generation: 7,
             authority_epoch: 3,
+            history_incarnation: Uuid::new_v4(),
+            group_epoch: 2,
             object_format: "sha1",
             target_oid: &target,
             retention_root_id: Uuid::new_v4(),
@@ -235,6 +289,8 @@ mod tests {
             owner_tenant_id: grant.owner_tenant_id,
             storage_generation: grant.storage_generation,
             authority_epoch: grant.authority_epoch,
+            history_incarnation: grant.history_incarnation,
+            group_epoch: grant.group_epoch,
             mirror_audience: grant.mirror_audience,
             target_oid: &grant.target_oid,
             now_unix: 1_700_000_000,
@@ -292,6 +348,14 @@ mod tests {
 
         let mut expected = expectation(&grant);
         expected.authority_epoch = grant.authority_epoch + 1;
+        assert!(grant.authorize(&expected).is_err());
+
+        let mut expected = expectation(&grant);
+        expected.history_incarnation = Uuid::new_v4();
+        assert!(grant.authorize(&expected).is_err());
+
+        let mut expected = expectation(&grant);
+        expected.group_epoch = grant.group_epoch + 1;
         assert!(grant.authorize(&expected).is_err());
     }
 

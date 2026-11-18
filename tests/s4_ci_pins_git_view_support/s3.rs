@@ -57,7 +57,7 @@ impl Drop for LoopbackS3 {
 }
 
 fn reply(status: StatusCode, body: Body, content_type: Option<&str>, length: Option<usize>) -> Response {
-    let mut builder = Response::builder().status(status);
+    let mut builder = Response::builder().status(status).header(header::CONNECTION, "close");
     if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
     }
@@ -116,6 +116,7 @@ async fn handle(
                 let length = slice.len();
                 return Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONNECTION, "close")
                     .header(header::CONTENT_TYPE, "application/octet-stream")
                     .header(header::CONTENT_LENGTH, length.to_string())
                     .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{}", stored.len()))

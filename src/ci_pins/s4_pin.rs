@@ -9,7 +9,6 @@ use super::s4_models::{S4PinView, fixed_oid};
 use super::s4_schema::ensure_s4_schema;
 use super::*;
 use crate::blob_store::{config::BlobProfile, opendal::BlobStore};
-use crate::members::models::Role;
 use crate::ref_store::{
     MetadataPinPurpose, PinReleaseReason, ReleaseMetadataPinRequest, RootPurpose, RootSelector,
     contract::RequestDigest,
@@ -20,8 +19,15 @@ use crate::ref_store::{
     },
     serving::{ServingRepository, lookup},
 };
-use crate::token_scopes::RepoAction;
 use tokio::time::Instant;
+
+/// Caller-fixed identity and intent of one capture. Grouping the fields keeps
+/// the producer within the seven-argument bound.
+pub(crate) struct CaptureSpec<'a> {
+    pub(crate) purpose: RootPurpose,
+    pub(crate) business_intent: &'a str,
+    pub(crate) target_oid: &'a str,
+}
 
 /// Outcome of one verified capture, before its durable registration.
 pub(crate) struct Prepared {
@@ -52,13 +58,11 @@ impl Producer {
         &self,
         pool: &deadpool_postgres::Pool,
         serving: &ServingRepository,
-        owner_id: Uuid,
-        purpose: RootPurpose,
-        business_intent: &str,
-        target_oid: &str,
+        spec: CaptureSpec<'_>,
         deadline: Instant,
     ) -> Result<Prepared, Error> {
         let gate = &serving.gate;
+        let owner_id = serving.gate.tenant_id();
         let repository_id = serving.repository.id;
         let scope = MetadataSnapshotScope::new(
             repository_id,
@@ -109,8 +113,8 @@ impl Producer {
             repository_id,
             gate.tenant_id(),
             owner_id,
-            purpose,
-            business_intent,
+            spec.purpose,
+            spec.business_intent,
             gate.object_format(),
             gate.history_incarnation(),
             gate.authority_epoch(),
@@ -131,7 +135,7 @@ impl Producer {
             snapshot,
             Uuid::new_v4(),
             Uuid::new_v4(),
-            RootSelector::ObjectIds(vec![target_oid.to_owned()]),
+            RootSelector::ObjectIds(vec![spec.target_oid.to_owned()]),
             register_request,
         )
         .map_err(root_error)?;
@@ -235,7 +239,7 @@ pub(crate) async fn refstore_repository(
 
 pub(crate) const PIN_COLUMNS: &str = "job_id, repository_id, object_format, target_oid, \
      storage_generation, retention_root_id, register_digest_hex, pack_set_digest_hex, \
-     owner_tenant_id, state, issuer_actor_id, authority_epoch";
+     owner_tenant_id, state, issuer_actor_id, authority_epoch, history_incarnation, group_epoch";
 
 pub(crate) fn pin_view(row: &tokio_postgres::Row) -> S4PinView {
     S4PinView {
@@ -266,6 +270,10 @@ pub(crate) async fn existing_pin(
     .await
     .map_err(Error::internal)
 }
+
+/// Serialize `issue` against `cancel`/`revoke` for one exact job inside the
+/// caller's transaction, so a concurrent terminal write is never lost.
+pub(crate) use super::s4_schema::lock_job;
 
 /// One `ci-pins` create. Exact `(target, generation, tenant)` replay is
 /// idempotent; any other reuse of the same job id is a conflict.
@@ -300,6 +308,43 @@ pub(crate) async fn pin(
     let tenant_id = serving.gate.tenant_id();
     let repository_id = serving.repository.id;
 
+    // Replay is decided before any capture: a duplicate request must never
+    // register (and later leak) a second `RetentionRoot` for the same job.
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    crate::ref_store::pg::bound(&tx, deadline)
+        .await
+        .map_err(|_| Error::timeout())?;
+    lock_job(&tx, repository_id, input.job_id).await?;
+    if let Some(row) = existing_pin(&tx, repository_id, input.job_id).await? {
+        super::s4_authority::guard_repository(
+            &tx,
+            actor,
+            owner,
+            name,
+            repository_id,
+            tenant_id,
+            input.storage_generation,
+        )
+        .await?;
+        let same = row.get::<_, String>(3) == target_oid
+            && row.get::<_, i64>(4) == input.storage_generation
+            && row.get::<_, Uuid>(8) == tenant_id
+            && row.get::<_, i64>(11) == serving.gate.authority_epoch()
+            && row.get::<_, Uuid>(12) == serving.gate.history_incarnation()
+            && row.get::<_, i64>(13) == serving.gate.group_epoch();
+        if row.get::<_, String>(9) == "pinned" && same {
+            super::s4_authority::ensure_root_active(&tx, repository_id, row.get(5)).await?;
+            let body = pin_view(&row);
+            commit_owned(tx, deadline).await?;
+            drop(client);
+            return Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response());
+        }
+        return Err(Error(StatusCode::CONFLICT, "job already has a different target or state"));
+    }
+    let _ = tx.rollback().await;
+    drop(client);
+
     let intent = RequestDigest::of(
         "s4-ci-pin-intent-v1",
         &[
@@ -312,7 +357,12 @@ pub(crate) async fn pin(
     )
     .as_hex();
     let prepared = producer
-        .capture(&state.pool, &serving, tenant_id, RootPurpose::Ci, &intent, target_oid, deadline)
+        .capture(
+            &state.pool,
+            &serving,
+            CaptureSpec { purpose: RootPurpose::Ci, business_intent: &intent, target_oid },
+            deadline,
+        )
         .await?;
     let root_id = prepared.request.candidate().root_id();
     let register_digest = prepared.request.candidate().register_digest().as_hex();
@@ -320,97 +370,103 @@ pub(crate) async fn pin(
     let snapshot_scope = prepared.snapshot_scope;
     let source_snapshot = prepared.snapshot;
 
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    crate::ref_store::pg::bound(&tx, deadline)
-        .await
-        .map_err(|_| Error::timeout())?;
-    let receipt = producer
-        .roots
-        .register_serving_in_tx(
+    let outcome: Result<Response, Error> = async {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        crate::ref_store::pg::bound(&tx, deadline)
+            .await
+            .map_err(|_| Error::timeout())?;
+        lock_job(&tx, repository_id, input.job_id).await?;
+        super::s4_authority::guard_repository(
             &tx,
-            prepared.request.candidate(),
-            prepared.request.request_id(),
-            prepared.request.digest(),
-            deadline,
-        )
-        .await
-        .map_err(root_error)?;
-    let _ = receipt;
-    producer
-        .roots
-        .recheck_serving_source_pin_live_in_tx(&tx, &prepared.snapshot, deadline)
-        .await
-        .map_err(root_error)?;
-    let access = auth::authorize_repo_with_role(&tx, actor, owner, name, Role::Write, RepoAction::ContentsWrite)
-        .await?;
-    let locked = tx
-        .query_opt(
-            "SELECT owner_id, state, storage_generation FROM repositories WHERE id=$1 FOR SHARE",
-            &[&repository_id],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    if access.repo_id != repository_id
-        || locked.get::<_, Uuid>(0) != tenant_id
-        || locked.get::<_, String>(1) != "ready"
-        || locked.get::<_, i64>(2) != input.storage_generation
-    {
-        return Err(Error(StatusCode::CONFLICT, "repository authority changed"));
-    }
-    if let Some(row) = existing_pin(&tx, repository_id, input.job_id).await? {
-        let same = row.get::<_, String>(3) == target_oid
-            && row.get::<_, i64>(4) == input.storage_generation
-            && row.get::<_, Uuid>(8) == tenant_id;
-        if row.get::<_, String>(9) == "pinned" && same {
-            let body = pin_view(&row);
-            commit_owned(tx, deadline).await?;
-            drop(client);
-            producer.release_source_snapshot(&state.pool, snapshot_scope, &source_snapshot, deadline).await;
-            return Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response());
-        }
-        return Err(Error(StatusCode::CONFLICT, "job already has a different target or state"));
-    }
-    tx.execute(
-        "INSERT INTO s4_ci_retention.ci_pins \
-         (repository_id, job_id, owner_tenant_id, issuer_actor_id, issuer_token_id, \
-          storage_generation, authority_epoch, object_format, target_oid, retention_root_id, \
-          register_digest_hex, pack_set_digest_hex, state) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pinned')",
-        &[
-            &repository_id,
-            &input.job_id,
-            &tenant_id,
-            &actor.id,
-            &actor.token_id,
-            &input.storage_generation,
-            &serving.gate.authority_epoch(),
-            &format,
-            &target_oid,
-            &root_id,
-            &register_digest,
-            &pack_set_digest,
-        ],
-    )
-    .await
-    .map_err(Error::internal)?;
-    commit_owned(tx, deadline).await?;
-    drop(client);
-    producer.release_source_snapshot(&state.pool, snapshot_scope, &source_snapshot, deadline).await;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(S4PinView {
-            job_id: input.job_id,
+            actor,
+            owner,
+            name,
             repository_id,
-            object_format: format,
-            target_oid: target_oid.to_owned(),
-            storage_generation: input.storage_generation,
-            retention_root_id: root_id,
-            register_digest,
-            pack_set_digest,
-            state: "pinned",
-        }),
-    )
-        .into_response())
+            tenant_id,
+            input.storage_generation,
+        )
+        .await?;
+        // The existence check precedes root registration, so a concurrent
+        // duplicate commits its business row but never an unreferenced root.
+        if let Some(row) = existing_pin(&tx, repository_id, input.job_id).await? {
+            let same = row.get::<_, String>(3) == target_oid
+                && row.get::<_, i64>(4) == input.storage_generation
+                && row.get::<_, Uuid>(8) == tenant_id
+                && row.get::<_, i64>(11) == serving.gate.authority_epoch()
+                && row.get::<_, Uuid>(12) == serving.gate.history_incarnation()
+                && row.get::<_, i64>(13) == serving.gate.group_epoch();
+            if row.get::<_, String>(9) == "pinned" && same {
+                super::s4_authority::ensure_root_active(&tx, repository_id, row.get(5)).await?;
+                let body = pin_view(&row);
+                commit_owned(tx, deadline).await?;
+                drop(client);
+                return Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response());
+            }
+            return Err(Error(StatusCode::CONFLICT, "job already has a different target or state"));
+        }
+        producer
+            .roots
+            .register_serving_in_tx(
+                &tx,
+                prepared.request.candidate(),
+                prepared.request.request_id(),
+                prepared.request.digest(),
+                deadline,
+            )
+            .await
+            .map_err(root_error)?;
+        producer
+            .roots
+            .recheck_serving_source_pin_live_in_tx(&tx, &prepared.snapshot, deadline)
+            .await
+            .map_err(root_error)?;
+        tx.execute(
+            "INSERT INTO s4_ci_retention.ci_pins \
+             (repository_id, job_id, owner_tenant_id, issuer_actor_id, issuer_token_id, \
+              storage_generation, authority_epoch, history_incarnation, group_epoch, object_format, \
+              target_oid, retention_root_id, register_digest_hex, pack_set_digest_hex, state) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pinned')",
+            &[
+                &repository_id,
+                &input.job_id,
+                &tenant_id,
+                &actor.id,
+                &actor.token_id,
+                &input.storage_generation,
+                &serving.gate.authority_epoch(),
+                &serving.gate.history_incarnation(),
+                &serving.gate.group_epoch(),
+                &format,
+                &target_oid,
+                &root_id,
+                &register_digest,
+                &pack_set_digest,
+            ],
+        )
+        .await
+        .map_err(Error::internal)?;
+        commit_owned(tx, deadline).await?;
+        drop(client);
+        Ok((
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(S4PinView {
+                job_id: input.job_id,
+                repository_id,
+                object_format: format.clone(),
+                target_oid: target_oid.to_owned(),
+                storage_generation: input.storage_generation,
+                retention_root_id: root_id,
+                register_digest: register_digest.clone(),
+                pack_set_digest: pack_set_digest.clone(),
+                state: "pinned",
+            }),
+        )
+            .into_response())
+    }
+    .await;
+    // The transient verification pin is released on success *and* on every
+    // refusal, so a refused registration cannot consume the 64-pin A5a quota.
+    producer.release_source_snapshot(&state.pool, snapshot_scope, &source_snapshot, deadline).await;
+    outcome
 }

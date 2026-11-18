@@ -10,6 +10,55 @@ use super::*;
 use crate::ci_checkouts::{Plan, audience};
 use crate::members::{models::Role, rbac};
 use crate::ref_store::core::retention_root::{PgRetentionRoots, RootRef};
+use crate::token_scopes::RepoAction;
+
+/// Hard wall-clock bound on one active-transfer revocation recheck.
+const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Re-prove the repository authority and exact generation inside a write tx.
+pub(crate) async fn guard_repository(
+    tx: &deadpool_postgres::Transaction<'_>,
+    actor: &db::Identity,
+    owner: &str,
+    name: &str,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    generation: i64,
+) -> Result<(), Error> {
+    let access =
+        auth::authorize_repo_with_role(tx, actor, owner, name, Role::Write, RepoAction::ContentsWrite).await?;
+    let row = tx
+        .query_one(
+            "SELECT owner_id, state, storage_generation FROM repositories WHERE id=$1 FOR SHARE",
+            &[&repository_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    if access.repo_id == repository_id
+        && row.get::<_, Uuid>(0) == tenant_id
+        && row.get::<_, String>(1) == "ready"
+        && row.get::<_, i64>(2) == generation
+    {
+        return Ok(());
+    }
+    Err(Error(StatusCode::CONFLICT, "repository authority changed"))
+}
+
+/// Refuse a reused pin whose retained root is no longer active.
+pub(crate) async fn ensure_root_active(
+    tx: &deadpool_postgres::Transaction<'_>,
+    repository_id: Uuid,
+    root_id: Uuid,
+) -> Result<(), Error> {
+    let root = RootRef::new(repository_id, root_id, 1).map_err(|_| Error::internal("bad root"))?;
+    let record = PgRetentionRoots::root_record_in_tx(tx, root)
+        .await
+        .map_err(|_| Error::internal("root read failed"))?;
+    if record.is_some_and(|record| record.is_active()) {
+        return Ok(());
+    }
+    Err(Error(StatusCode::CONFLICT, "retained root unavailable or released"))
+}
 
 /// One shared Git slot that returns to the semaphore when the stream ends or is
 /// dropped by a client disconnect. The permit is never leaked on an early error.
@@ -38,25 +87,55 @@ impl Drop for StreamSlot {
     }
 }
 
-/// True when the caller presented a wide `ryu_` user credential, which is never
-/// accepted by the CI data plane.
+fn is_wide_prefix(value: &str) -> bool {
+    value.get(..4).is_some_and(|p| matches!(p.to_ascii_lowercase().as_str(), "ryt_" | "ryu_" | "rys_" | "ryb_"))
+}
+
+/// True when the caller presented any wide user/session credential (`ryt_`,
+/// `ryu_`, `rys_`, `ryb_`) via `Bearer` or `Basic`, which CI transport forbids.
 pub(crate) fn wide_credential(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().contains("ryu_"))
+    use base64::{Engine as _, engine::general_purpose::{STANDARD, STANDARD_NO_PAD}};
+    for raw in headers.get_all(header::AUTHORIZATION) {
+        let Ok(text) = raw.to_str() else { continue };
+        let Some((scheme, rest)) = text.trim().split_once(' ') else { continue };
+        let rest = rest.trim();
+        if scheme.eq_ignore_ascii_case("bearer") && is_wide_prefix(rest) {
+            return true;
+        }
+        if scheme.eq_ignore_ascii_case("basic") {
+            let decoded = STANDARD.decode(rest).or_else(|_| STANDARD_NO_PAD.decode(rest));
+            let Ok(bytes) = decoded else { continue };
+            let Ok(pair) = String::from_utf8(bytes) else { continue };
+            let wide = match pair.split_once(':') {
+                Some((user, pass)) => is_wide_prefix(user) || is_wide_prefix(pass),
+                None => is_wide_prefix(&pair),
+            };
+            if wide {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Column list shared by the two live grant reads.
 const GRANT_SELECT: &str = "SELECT g.grant_json, g.expires_unix, g.cancelled, g.revoked, \
      j.plan, j.cancelled, j.revoked, j.expires_unix, r.owner_id, r.state, \
-     r.storage_generation, r.object_format, t.user_id, ua.username, j.job_id, j.issuer_token_id \
+     r.storage_generation, r.object_format, t.user_id, ua.username, j.job_id, j.issuer_token_id, \
+     cg.authority_epoch, cg.history_incarnation, cg.group_epoch \
      FROM s4_ci_retention.closure_grants g \
      JOIN ci_checkout_jobs j ON j.repository_id=g.repository_id AND j.job_id=g.job_id \
      JOIN repositories r ON r.id=g.repository_id \
+     JOIN ref_store_core_gates cg ON cg.repository_id=g.repository_id AND cg.tenant_id=r.owner_id \
+     JOIN ref_store_serving_repositories sr ON sr.repository_id=g.repository_id AND sr.state='ready' \
+       AND sr.owner_id=cg.tenant_id AND sr.authority_epoch=cg.authority_epoch \
+       AND sr.history_incarnation=cg.history_incarnation AND sr.group_epoch=cg.group_epoch \
      JOIN tokens t ON t.id=j.issuer_token_id \
      JOIN users ua ON ua.id=t.user_id \
      WHERE g.repository_id=$1 AND g.credential_digest=$2 AND r.name=$3 \
+       AND g.authority_epoch=cg.authority_epoch \
+       AND g.history_incarnation=cg.history_incarnation \
+       AND g.group_epoch=cg.group_epoch \
        AND NOT t.revoked AND NOT t.read_only \
        AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())";
 
@@ -76,9 +155,12 @@ pub(crate) async fn authenticate(
     let repo = refstore_repository(state, owner, name)
         .await?
         .ok_or_else(Error::unauthorized)?;
+    super::s4_schema::ensure_s4_schema(&state.pool).await?;
     let digest = db::digest(&token);
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let deadline = tokio::time::Instant::now() + state.config.git_timeout;
+    crate::ref_store::pg::bound(&tx, deadline).await.map_err(|_| Error::timeout())?;
     let row = tx
         .query_opt(GRANT_SELECT, &[&repo.id, &digest, &name])
         .await
@@ -111,7 +193,9 @@ pub(crate) async fn authenticate(
         repository_id: repo.id,
         owner_tenant_id: owner_id,
         storage_generation: repo.storage_generation,
-        authority_epoch: grant.authority_epoch,
+        authority_epoch: row.get(16),
+        history_incarnation: row.get(17),
+        group_epoch: row.get(18),
         mirror_audience: audience()?,
         target_oid: oid,
         now_unix: now,
@@ -132,14 +216,26 @@ pub(crate) async fn authenticate(
     let record = PgRetentionRoots::root_record_in_tx(&tx, root)
         .await
         .map_err(|_| Error::unauthorized())?;
-    if !record.is_some_and(|record| record.is_active()) {
+    if !record.is_some_and(|record| {
+        record.is_active()
+            && record.authority_epoch() == row.get::<_, i64>(16)
+            && record.history_incarnation() == row.get::<_, Uuid>(17)
+            && record.group_epoch() == row.get::<_, i64>(18)
+    }) {
         return Err(Error::unauthorized());
     }
     let pin = tx
         .query_opt(
             "SELECT 1 FROM s4_ci_retention.ci_pins \
-             WHERE repository_id=$1 AND job_id=$2 AND state='pinned'",
-            &[&repo.id, &plan.job_id],
+             WHERE repository_id=$1 AND job_id=$2 AND state='pinned' \
+               AND authority_epoch=$3 AND history_incarnation=$4 AND group_epoch=$5",
+            &[
+                &repo.id,
+                &plan.job_id,
+                &row.get::<_, i64>(16),
+                &row.get::<_, Uuid>(17),
+                &row.get::<_, i64>(18),
+            ],
         )
         .await
         .map_err(Error::internal)?;
@@ -158,8 +254,8 @@ pub(crate) async fn authenticate(
     Ok((identity, repo, plan))
 }
 
-/// Interval recheck for one active transfer. A database error must end the
-/// stream, so every error path returns `false`.
+/// Interval recheck for one active transfer. A database error or timeout must
+/// end the stream, so every error path returns `false`.
 pub(crate) async fn still_authorized(
     state: &AppState,
     job_id: Uuid,
@@ -167,43 +263,65 @@ pub(crate) async fn still_authorized(
     repository_id: Uuid,
     storage_generation: i64,
 ) -> Result<bool, Error> {
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let row = tx
-        .query_opt(
-            "SELECT g.retention_root_id, r.owner_id, t.user_id FROM s4_ci_retention.closure_grants g \
-             JOIN s4_ci_retention.ci_pins p ON p.repository_id=g.repository_id AND p.job_id=g.job_id \
-             JOIN ci_checkout_jobs j ON j.repository_id=g.repository_id AND j.job_id=g.job_id \
-             JOIN repositories r ON r.id=g.repository_id \
-             JOIN tokens t ON t.id=j.issuer_token_id \
-             WHERE g.repository_id=$1 AND g.job_id=$2 AND g.credential_digest=$3 \
-               AND p.state='pinned' AND NOT g.cancelled AND NOT g.revoked \
-               AND NOT j.cancelled AND NOT j.revoked AND r.state='ready' \
-               AND r.owner_id=g.owner_tenant_id AND r.storage_generation=$4 \
-               AND NOT t.revoked AND NOT t.read_only \
-               AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
-               AND g.expires_unix>extract(epoch FROM clock_timestamp()) \
-               AND j.expires_unix>extract(epoch FROM clock_timestamp())",
-            &[&repository_id, &job_id, &credential_digest, &storage_generation],
-        )
-        .await
-        .map_err(Error::internal)?;
-    let Some(row) = row else {
-        return Ok(false);
-    };
-    let owner_id: Uuid = row.get(1);
-    let actor_id: Uuid = row.get(2);
-    // Ownership transfer re-reads through RBAC: a role resolved for the old
-    // tenant never authorizes a byte after the repository moved.
-    let role = rbac::resolve_effective_role_by_id(&tx, repository_id, owner_id, actor_id).await?;
-    let authorized = role.is_some_and(|role| role >= Role::Read);
-    let root = RootRef::new(repository_id, row.get(0), 1).map_err(|_| Error::internal("bad root"))?;
-    let record = PgRetentionRoots::root_record_in_tx(&tx, root)
-        .await
-        .map_err(|_| Error::internal("root read failed"))?;
-    let live = authorized && record.is_some_and(|record| record.is_active());
-    let _ = tx.rollback().await;
-    Ok(live)
+    let deadline = tokio::time::Instant::now() + RECHECK_TIMEOUT;
+    let check = tokio::time::timeout(RECHECK_TIMEOUT, async {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        crate::ref_store::pg::bound(&tx, deadline).await.map_err(|_| Error::timeout())?;
+        let row = tx
+            .query_opt(
+                "SELECT g.retention_root_id, r.owner_id, t.user_id, \
+                        cg.authority_epoch, cg.history_incarnation, cg.group_epoch \
+                 FROM s4_ci_retention.closure_grants g \
+                 JOIN s4_ci_retention.ci_pins p ON p.repository_id=g.repository_id AND p.job_id=g.job_id \
+                 JOIN ci_checkout_jobs j ON j.repository_id=g.repository_id AND j.job_id=g.job_id \
+                 JOIN repositories r ON r.id=g.repository_id \
+                 JOIN ref_store_core_gates cg ON cg.repository_id=g.repository_id AND cg.tenant_id=r.owner_id \
+                 JOIN ref_store_serving_repositories sr ON sr.repository_id=g.repository_id AND sr.state='ready' \
+                   AND sr.owner_id=cg.tenant_id AND sr.authority_epoch=cg.authority_epoch \
+                   AND sr.history_incarnation=cg.history_incarnation AND sr.group_epoch=cg.group_epoch \
+                 JOIN tokens t ON t.id=j.issuer_token_id \
+                 WHERE g.repository_id=$1 AND g.job_id=$2 AND g.credential_digest=$3 \
+                   AND p.state='pinned' AND NOT g.cancelled AND NOT g.revoked \
+                   AND NOT j.cancelled AND NOT j.revoked AND r.state='ready' \
+                   AND r.owner_id=g.owner_tenant_id AND r.storage_generation=$4 \
+                   AND g.authority_epoch=cg.authority_epoch AND p.authority_epoch=cg.authority_epoch \
+                   AND g.history_incarnation=cg.history_incarnation AND p.history_incarnation=cg.history_incarnation \
+                   AND g.group_epoch=cg.group_epoch AND p.group_epoch=cg.group_epoch \
+                   AND NOT t.revoked AND NOT t.read_only \
+                   AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
+                   AND g.expires_unix>extract(epoch FROM clock_timestamp()) \
+                   AND j.expires_unix>extract(epoch FROM clock_timestamp())",
+                &[&repository_id, &job_id, &credential_digest, &storage_generation],
+            )
+            .await
+            .map_err(Error::internal)?;
+        let Some(row) = row else {
+            return Ok::<bool, Error>(false);
+        };
+        let owner_id: Uuid = row.get(1);
+        let actor_id: Uuid = row.get(2);
+        let epoch: i64 = row.get(3);
+        let incarnation: Uuid = row.get(4);
+        let group_epoch: i64 = row.get(5);
+        let role = rbac::resolve_effective_role_by_id(&tx, repository_id, owner_id, actor_id).await?;
+        let authorized = role.is_some_and(|role| role >= Role::Read);
+        let root = RootRef::new(repository_id, row.get(0), 1).map_err(|_| Error::internal("bad root"))?;
+        let record = PgRetentionRoots::root_record_in_tx(&tx, root)
+            .await
+            .map_err(|_| Error::internal("root read failed"))?;
+        let live = authorized
+            && record.is_some_and(|record| {
+                record.is_active()
+                    && record.authority_epoch() == epoch
+                    && record.history_incarnation() == incarnation
+                    && record.group_epoch() == group_epoch
+            });
+        let _ = tx.rollback().await;
+        Ok(live)
+    })
+    .await;
+    Ok(matches!(check, Ok(Ok(true))))
 }
 
 async fn now_unix(tx: &deadpool_postgres::Transaction<'_>) -> Result<i64, Error> {

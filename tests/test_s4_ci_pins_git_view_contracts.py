@@ -37,6 +37,8 @@ TOUCHED = [
     SRC / "namespace_service" / "reverse_git.rs",
     SRC / "namespace_service" / "s4_git_view.rs",
     SRC / "namespace_service" / "s4_git_view_reverse.rs",
+    SRC / "namespace_service" / "view_git_http.rs",
+    SRC / "namespace_service" / "s4_git_view_http.rs",
     TESTS / "s4_ci_pins_git_view.rs",
     TESTS / "s4_ci_pins_git_view_support" / "harness.rs",
 ]
@@ -92,8 +94,19 @@ class SourceContracts(unittest.TestCase):
 
     def test_no_tempfile_in_production_sources(self) -> None:
         for path in TOUCHED:
-            self.assertNotIn("tempfile::", text(path), path)
-            self.assertNotIn("use tempfile", text(path), path)
+            prod = text(path).split("#[cfg(test)]", 1)[0]
+            self.assertNotIn("tempfile::", prod, path)
+            self.assertNotIn("use tempfile", prod, path)
+
+    def test_every_s4_entrypoint_ensures_the_dedicated_schema(self) -> None:
+        for rel in (
+            SRC / "namespace_service" / "s4_git_view.rs",
+            SRC / "namespace_service" / "s4_git_view_reverse.rs",
+            SRC / "namespace_service" / "s4_git_view_http.rs",
+            CI_PINS / "s4_authority.rs",
+            CI_PINS / "s4_transport.rs",
+        ):
+            self.assertIn("ensure_s4_schema", text(rel), rel)
 
     def test_deserialize_requests_deny_unknown_fields(self) -> None:
         pattern = re.compile(
@@ -176,6 +189,18 @@ class SourceContracts(unittest.TestCase):
         self.assertNotIn("501", body)
         self.assertNotIn("NOT_IMPLEMENTED", body)
 
+    def test_bounded_recheck_and_live_gate_binding(self) -> None:
+        authority = text(CI_PINS / "s4_authority.rs")
+        checkout = text(CI_PINS / "s4_checkout.rs")
+        for needle in ("RECHECK_TIMEOUT", "history_incarnation", "ref_store_core_gates"):
+            self.assertIn(needle, authority)
+        self.assertTrue(
+            "verify_reused_pin_in_tx" in checkout or "root_record_in_tx" in checkout,
+            "checkout must re-verify a reused pin and its retained root in transaction",
+        )
+        self.assertIn("group_epoch", text(CI_PINS / "s4_transport.rs"))
+        self.assertIn("history_incarnation", text(CI_PINS / "s4_schema.rs"))
+
     def test_line_endings_are_pure_lf(self) -> None:
         for path in TOUCHED + [WORKFLOW, DOC]:
             data = path.read_bytes()
@@ -211,6 +236,11 @@ class WorkflowContracts(unittest.TestCase):
 
     def test_workflow_requires_a_database_url(self) -> None:
         self.assertIn("ROOTYARD_TEST_DATABASE_URL", text(WORKFLOW))
+
+    def test_workflow_uploads_the_acceptance_evidence(self) -> None:
+        body = text(WORKFLOW)
+        self.assertIn("s4-ci-pins-git-view-evidence", body)
+        self.assertIn("actions/upload-artifact@v4", body)
 
 
 class DocumentationContracts(unittest.TestCase):

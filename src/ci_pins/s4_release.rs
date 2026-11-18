@@ -8,14 +8,16 @@
 //! observes revocation at its next chunk instead of being allowed to finish from
 //! retained bytes.
 use super::s4_models::{S4PinView, S4ReleaseBody};
-use super::s4_pin::{PIN_COLUMNS, Producer, commit_owned, pin_view, root_error};
+use super::s4_pin::{PIN_COLUMNS, Producer, commit_owned, pin_view, refstore_repository, root_error};
 use super::s4_schema::ensure_s4_schema;
 use super::*;
+use crate::members::models::Role;
 use crate::ref_store::{
     contract::RequestDigest,
     core::retention_root::{PgRetentionRoots, ReleaseRootRequest, RootRef, RootsScope},
     serving::lookup,
 };
+use crate::token_scopes::RepoAction;
 use tokio::time::Instant;
 
 /// Exact-vector read for `GET /ci-pins` and `GET /ci-pins/{job}`.
@@ -96,6 +98,7 @@ pub(crate) async fn release(
     crate::ref_store::pg::bound(&tx, deadline)
         .await
         .map_err(|_| Error::timeout())?;
+    super::s4_schema::lock_job(&tx, repository_id, job).await?;
     let row = tx
         .query_opt(
             &format!(
@@ -197,4 +200,70 @@ async fn revoke(
             .map_err(Error::internal)?;
     }
     Ok(())
+}
+
+/// Cancel or revoke one pg_refstore checkout job without touching its root.
+pub(crate) async fn terminal(
+    state: &Arc<AppState>,
+    actor: &db::Identity,
+    owner: &str,
+    name: &str,
+    job: Uuid,
+    cancel: bool,
+    deadline: Instant,
+) -> Result<Response, Error> {
+    auth::writable(actor)?;
+    ensure_s4_schema(&state.pool).await?;
+    let repo = refstore_repository(state, owner, name).await?.ok_or_else(Error::not_found)?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    crate::ref_store::pg::bound(&tx, deadline)
+        .await
+        .map_err(|_| Error::timeout())?;
+    let access =
+        auth::authorize_repo_with_role(&tx, actor, owner, name, Role::Write, RepoAction::ContentsWrite).await?;
+    if access.repo_id != repo.id {
+        return Err(Error::not_found());
+    }
+    super::s4_schema::lock_job(&tx, repo.id, job).await?;
+    if cancel {
+        tx.execute(
+            "INSERT INTO ci_checkout_jobs(repository_id,job_id,owner_id,cancelled) \
+             VALUES($1,$2,$3,true) ON CONFLICT(repository_id,job_id) DO UPDATE SET cancelled=true",
+            &[&repo.id, &job, &access.owner_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    } else if tx
+        .execute(
+            "UPDATE ci_checkout_jobs SET revoked=true \
+             WHERE repository_id=$1 AND job_id=$2 AND plan IS NOT NULL",
+            &[&repo.id, &job],
+        )
+        .await
+        .map_err(Error::internal)?
+        == 0
+    {
+        return Err(Error::not_found());
+    }
+    let column = if cancel { "cancelled=true" } else { "revoked=true" };
+    tx.execute(
+        &format!(
+            "UPDATE s4_ci_retention.closure_grants SET {column} \
+             WHERE repository_id=$1 AND job_id=$2"
+        ),
+        &[&repo.id, &job],
+    )
+    .await
+    .map_err(Error::internal)?;
+    commit_owned(tx, deadline).await?;
+    drop(client);
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "job_id": job,
+            "state": if cancel { "cancelled" } else { "revoked" },
+        })),
+    )
+        .into_response())
 }

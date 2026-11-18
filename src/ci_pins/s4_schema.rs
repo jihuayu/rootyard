@@ -19,6 +19,8 @@ const CI_PINS: &str = "CREATE TABLE IF NOT EXISTS s4_ci_retention.ci_pins (
     issuer_token_id UUID NOT NULL,
     storage_generation BIGINT NOT NULL,
     authority_epoch BIGINT NOT NULL,
+    history_incarnation UUID NOT NULL,
+    group_epoch BIGINT NOT NULL,
     object_format TEXT NOT NULL,
     target_oid TEXT NOT NULL,
     retention_root_id UUID NOT NULL,
@@ -36,6 +38,8 @@ const CLOSURE_GRANTS: &str = "CREATE TABLE IF NOT EXISTS s4_ci_retention.closure
     owner_tenant_id UUID NOT NULL,
     storage_generation BIGINT NOT NULL,
     authority_epoch BIGINT NOT NULL,
+    history_incarnation UUID NOT NULL,
+    group_epoch BIGINT NOT NULL,
     object_format TEXT NOT NULL,
     target_oid TEXT NOT NULL,
     retention_root_id UUID NOT NULL,
@@ -61,6 +65,8 @@ const GIT_VIEW_BINDINGS: &str = "CREATE TABLE IF NOT EXISTS s4_ci_retention.git_
     retention_root_id UUID NOT NULL,
     register_digest_hex TEXT NOT NULL,
     authority_epoch BIGINT NOT NULL,
+    history_incarnation UUID NOT NULL,
+    group_epoch BIGINT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('active', 'released')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 )";
@@ -85,4 +91,48 @@ pub(crate) async fn ensure_s4_schema(pool: &Pool) -> Result<(), Error> {
         client.batch_execute(statement).await.map_err(Error::internal)?;
     }
     Ok(())
+}
+
+/// Serialize `issue` against `release`/`terminal` for one exact job inside the
+/// caller's transaction, so a concurrent terminal write is never lost.
+pub(crate) async fn lock_job(
+    tx: &deadpool_postgres::Transaction<'_>,
+    repository_id: uuid::Uuid,
+    job_id: uuid::Uuid,
+) -> Result<(), Error> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        &[&format!("s4-job:{repository_id}:{job_id}")],
+    )
+    .await
+    .map_err(Error::internal)?;
+    Ok(())
+}
+
+/// Prove that the live gate and serving row still match every authority fact
+/// this issuance is about to record.
+pub(crate) async fn gate_live(
+    tx: &deadpool_postgres::Transaction<'_>,
+    serving: &crate::ref_store::serving::ServingRepository,
+) -> Result<bool, Error> {
+    let gate = &serving.gate;
+    let row = tx
+        .query_opt(
+            "SELECT 1 FROM ref_store_core_gates cg \
+             JOIN ref_store_serving_repositories sr ON sr.repository_id=cg.repository_id \
+             WHERE cg.repository_id=$1 AND cg.tenant_id=$2 AND cg.authority_epoch=$3 \
+               AND cg.history_incarnation=$4 AND cg.group_epoch=$5 AND sr.state='ready' \
+               AND sr.owner_id=cg.tenant_id AND sr.authority_epoch=cg.authority_epoch \
+               AND sr.history_incarnation=cg.history_incarnation AND sr.group_epoch=cg.group_epoch",
+            &[
+                &serving.repository.id,
+                &gate.tenant_id(),
+                &gate.authority_epoch(),
+                &gate.history_incarnation(),
+                &gate.group_epoch(),
+            ],
+        )
+        .await
+        .map_err(Error::internal)?;
+    Ok(row.is_some())
 }

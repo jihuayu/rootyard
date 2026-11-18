@@ -6,12 +6,12 @@
 //! under `subdir`, and the resulting commit becomes one new verified pack pair.
 //! The ref update, artifact holds, registration, decision and changeset are all
 //! the ordinary A4 core path; nothing here is a placeholder.
-use super::{
+use super::reverse_git::{git, git_input, git_input_bytes, git_oid, verify_candidate_budget};
+use crate::namespace_service::{
     changesets::{ChangeSet, Step},
     handlers::Mount,
-    reverse::ReverseInput,
-    reverse_git::{git, git_input, git_input_bytes, git_oid, verify_candidate_budget},
-    views::View,
+    reverse::{ReverseInput, replace_tree},
+    views::{self, View},
 };
 use crate::{
     AppState, Error,
@@ -53,6 +53,12 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn create() -> Result<Self, Error> {
         let path = std::env::temp_dir().join(format!("rootyard-s4-reverse-{}", Uuid::new_v4()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().recursive(true).mode(0o700).create(&path).map_err(Error::internal)?;
+        }
+        #[cfg(not(unix))]
         fs::create_dir_all(&path).map_err(Error::internal)?;
         Ok(Self(path))
     }
@@ -74,6 +80,7 @@ struct Binding {
 }
 
 async fn load_binding(state: &AppState, view: &View) -> Result<Binding, Error> {
+    crate::ci_pins::s4_schema::ensure_s4_schema(&state.pool).await?;
     let row = state
         .pool
         .get()
@@ -83,7 +90,10 @@ async fn load_binding(state: &AppState, view: &View) -> Result<Binding, Error> {
             "SELECT b.retention_root_id, b.source_oid, b.projected_oid, b.subdir, b.owner_tenant_id, \
                     r.owner_id, r.storage_generation, r.state \
              FROM s4_ci_retention.git_view_bindings b JOIN repositories r ON r.id=b.repository_id \
-             WHERE b.view_id=$1 AND b.state='active' AND b.repository_id=$2",
+             JOIN ref_store_core_gates cg ON cg.repository_id=b.repository_id \
+             WHERE b.view_id=$1 AND b.state='active' AND b.repository_id=$2 \
+               AND cg.authority_epoch=b.authority_epoch \
+               AND cg.history_incarnation=b.history_incarnation AND cg.group_epoch=b.group_epoch",
             &[&view.id, &view.repository_id],
         )
         .await
@@ -103,11 +113,14 @@ async fn load_binding(state: &AppState, view: &View) -> Result<Binding, Error> {
 }
 
 fn write_bundle(path: &FsPath, bytes: &[u8]) -> Result<(), Error> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(Error::internal)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(Error::internal)?;
     file.write_all(bytes).map_err(Error::internal)?;
     file.sync_all().map_err(Error::internal)
 }
@@ -178,7 +191,7 @@ pub(super) async fn create(
         &scratch.0,
         &["clone", "--no-local", "--no-hardlinks", "--no-tags", source_text, work_text],
     )?;
-    let projected = super::views::s4_git_view::project(&work, &binding.source_oid, &binding.subdir)?;
+    let projected = views::s4_git_view::project(&work, &binding.source_oid, &binding.subdir)?;
     if projected != binding.projected_oid {
         return Err(Error(StatusCode::CONFLICT, "view projection no longer matches its recorded head"));
     }
@@ -211,7 +224,7 @@ pub(super) async fn create(
         projected_tree
     } else {
         let parts: Vec<&str> = binding.subdir.split('/').collect();
-        super::replace_tree(source, &old_tree, &parts, &projected_tree)?
+        replace_tree(source, &old_tree, &parts, &projected_tree)?
     };
     let body = format!("{}\n", input.message);
     let new_oid = git_input(

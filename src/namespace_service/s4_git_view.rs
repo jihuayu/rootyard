@@ -11,7 +11,7 @@
 //! *before* PostgreSQL is touched, so the projected object id is known when the
 //! one and only transaction opens. Root registration, RBAC, the view row, its
 //! history and the binding then commit together or not at all.
-use super::{handlers, views::View};
+use crate::namespace_service::{handlers, views::{CreateView, View}};
 use crate::ref_store::core::pack_commit::PackArtifactRole;
 use crate::{AppState, Error, db::Identity, members::models::Role, token_scopes::RepoAction};
 use axum::http::StatusCode;
@@ -135,6 +135,8 @@ pub(super) struct Captured {
     repository_id: Uuid,
     tenant_id: Uuid,
     authority_epoch: i64,
+    history_incarnation: Uuid,
+    group_epoch: i64,
     object_format: String,
 }
 
@@ -165,10 +167,11 @@ async fn capture(
         .capture(
             &state.pool,
             &serving,
-            serving.gate.tenant_id(),
-            crate::ref_store::RootPurpose::Namespace,
-            &intent,
-            &mount.base_oid,
+            crate::ci_pins::s4_pin::CaptureSpec {
+                purpose: crate::ref_store::RootPurpose::Namespace,
+                business_intent: &intent,
+                target_oid: &mount.base_oid,
+            },
             deadline,
         )
         .await?;
@@ -178,6 +181,8 @@ async fn capture(
         repository_id: serving.repository.id,
         tenant_id: serving.gate.tenant_id(),
         authority_epoch: serving.gate.authority_epoch(),
+        history_incarnation: serving.gate.history_incarnation(),
+        group_epoch: serving.gate.group_epoch(),
         object_format: serving.repository.object_format.clone(),
     })
 }
@@ -260,107 +265,114 @@ pub(super) async fn create(
     state: &AppState,
     actor: &Identity,
     namespace_id: Uuid,
-    input: &super::views::CreateView,
+    input: &CreateView,
     mount: &handlers::Mount,
     repository_id: Uuid,
 ) -> Result<(StatusCode, axum::Json<View>), Error> {
+    crate::ci_pins::s4_schema::ensure_s4_schema(&state.pool).await?;
     let deadline = tokio::time::Instant::now() + state.config.git_timeout;
     let captured = capture(state, actor, mount, deadline).await?;
-    if captured.repository_id != repository_id {
-        return Err(Error::not_found());
-    }
-    let tree = TempTree::create()?;
-    materialize_packs(state, &captured, &mount.base_oid, &tree).await?;
-    git_clone(&tree.bare(), &tree.work())?;
-    let projected = project(&tree.work(), &mount.base_oid, &input.subdir)?;
-    let vid = Uuid::new_v4();
-    let root_id = captured.prepared.request.candidate().root_id();
-    let register_digest = captured.prepared.request.candidate().register_digest().as_hex();
     let snapshot_scope = captured.prepared.snapshot_scope;
     let snapshot = captured.prepared.snapshot;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    captured
-        .producer
-        .roots
-        .register_serving_in_tx(
+    let outcome: Result<(StatusCode, axum::Json<View>), Error> = async {
+        if captured.repository_id != repository_id {
+            return Err(Error::not_found());
+        }
+        let tree = TempTree::create()?;
+        materialize_packs(state, &captured, &mount.base_oid, &tree).await?;
+        git_clone(&tree.bare(), &tree.work())?;
+        let projected = project(&tree.work(), &mount.base_oid, &input.subdir)?;
+        let vid = Uuid::new_v4();
+        let root_id = captured.prepared.request.candidate().root_id();
+        let register_digest = captured.prepared.request.candidate().register_digest().as_hex();
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        captured
+            .producer
+            .roots
+            .register_serving_in_tx(
+                &tx,
+                captured.prepared.request.candidate(),
+                captured.prepared.request.request_id(),
+                captured.prepared.request.digest(),
+                deadline,
+            )
+            .await
+            .map_err(crate::ci_pins::s4_pin::root_error)?;
+        captured
+            .producer
+            .roots
+            .recheck_serving_source_pin_live_in_tx(&tx, &snapshot, deadline)
+            .await
+            .map_err(crate::ci_pins::s4_pin::root_error)?;
+        let access = crate::auth::authorize_repo_with_role(
             &tx,
-            captured.prepared.request.candidate(),
-            captured.prepared.request.request_id(),
-            captured.prepared.request.digest(),
-            deadline,
+            actor,
+            &mount.owner,
+            &mount.repository,
+            Role::Read,
+            RepoAction::ContentsRead,
+        )
+        .await?;
+        if access.repo_id != repository_id {
+            return Err(Error::not_found());
+        }
+        tx.execute(
+            "INSERT INTO workspace_views(id,namespace_id,repository_id,mount_path,subdir,source_oid,projected_oid,creator_id) \
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+            &[&vid, &namespace_id, &repository_id, &input.mount_path, &input.subdir, &mount.base_oid, &projected, &actor.id],
         )
         .await
-        .map_err(crate::ci_pins::s4_pin::root_error)?;
-    captured
-        .producer
-        .roots
-        .recheck_serving_source_pin_live_in_tx(&tx, &snapshot, deadline)
+        .map_err(Error::internal)?;
+        tx.execute(
+            "INSERT INTO workspace_view_history(view_id,source_oid,projected_oid,epoch) VALUES($1,$2,$3,1)",
+            &[&vid, &mount.base_oid, &projected],
+        )
         .await
-        .map_err(crate::ci_pins::s4_pin::root_error)?;
-    let access = crate::auth::authorize_repo_with_role(
-        &tx,
-        actor,
-        &mount.owner,
-        &mount.repository,
-        Role::Read,
-        RepoAction::ContentsRead,
-    )
-    .await?;
-    if access.repo_id != repository_id {
-        return Err(Error::not_found());
+        .map_err(Error::internal)?;
+        tx.execute(
+            "INSERT INTO s4_ci_retention.git_view_bindings \
+             (view_id, namespace_id, repository_id, owner_tenant_id, mount_path, subdir, \
+              source_oid, projected_oid, retention_root_id, register_digest_hex, \
+              authority_epoch, history_incarnation, group_epoch, state) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'active')",
+            &[
+                &vid,
+                &namespace_id,
+                &repository_id,
+                &captured.tenant_id,
+                &input.mount_path,
+                &input.subdir,
+                &mount.base_oid,
+                &projected,
+                &root_id,
+                &register_digest,
+                &captured.authority_epoch,
+                &captured.history_incarnation,
+                &captured.group_epoch,
+            ],
+        )
+        .await
+        .map_err(Error::internal)?;
+        crate::auth::finish_tx(tx, actor, false).await?;
+        drop(client);
+        Ok((
+            StatusCode::CREATED,
+            axum::Json(View {
+                id: vid,
+                namespace_id,
+                repository_id,
+                mount_path: input.mount_path.clone(),
+                subdir: input.subdir.clone(),
+                source_oid: mount.base_oid.clone(),
+                projected_oid: projected,
+                epoch: 1,
+            }),
+        ))
     }
-    tx.execute(
-        "INSERT INTO workspace_views(id,namespace_id,repository_id,mount_path,subdir,source_oid,projected_oid,creator_id) \
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
-        &[&vid, &namespace_id, &repository_id, &input.mount_path, &input.subdir, &mount.base_oid, &projected, &actor.id],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.execute(
-        "INSERT INTO workspace_view_history(view_id,source_oid,projected_oid,epoch) VALUES($1,$2,$3,1)",
-        &[&vid, &mount.base_oid, &projected],
-    )
-    .await
-    .map_err(Error::internal)?;
-    tx.execute(
-        "INSERT INTO s4_ci_retention.git_view_bindings \
-         (view_id, namespace_id, repository_id, owner_tenant_id, mount_path, subdir, \
-          source_oid, projected_oid, retention_root_id, register_digest_hex, \
-          authority_epoch, state) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active')",
-        &[
-            &vid,
-            &namespace_id,
-            &repository_id,
-            &captured.tenant_id,
-            &input.mount_path,
-            &input.subdir,
-            &mount.base_oid,
-            &projected,
-            &root_id,
-            &register_digest,
-            &captured.authority_epoch,
-        ],
-    )
-    .await
-    .map_err(Error::internal)?;
-    crate::auth::finish_tx(tx, actor, false).await?;
-    drop(client);
+    .await;
     captured.producer.release_source_snapshot(&state.pool, snapshot_scope, &snapshot, deadline).await;
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(View {
-            id: vid,
-            namespace_id,
-            repository_id,
-            mount_path: input.mount_path.clone(),
-            subdir: input.subdir.clone(),
-            source_oid: mount.base_oid.clone(),
-            projected_oid: projected,
-            epoch: 1,
-        }),
-    ))
+    outcome
 }
 
 /// Build one bundle from the retained root, never from `workspace-service/views`.
@@ -369,11 +381,15 @@ pub(super) async fn bundle(
     view: &View,
     id: Uuid,
 ) -> Result<([(axum::http::HeaderName, &'static str); 2], Vec<u8>), Error> {
+    crate::ci_pins::s4_schema::ensure_s4_schema(&state.pool).await?;
     let client = state.pool.get().await.map_err(Error::internal)?;
     let binding = client
         .query_opt(
-            "SELECT retention_root_id, state, owner_tenant_id \
-             FROM s4_ci_retention.git_view_bindings WHERE view_id=$1",
+            "SELECT b.retention_root_id, b.state, b.owner_tenant_id \
+             FROM s4_ci_retention.git_view_bindings b \
+             JOIN ref_store_core_gates cg ON cg.repository_id=b.repository_id \
+             WHERE b.view_id=$1 AND cg.authority_epoch=b.authority_epoch \
+               AND cg.history_incarnation=b.history_incarnation AND cg.group_epoch=b.group_epoch",
             &[&id],
         )
         .await

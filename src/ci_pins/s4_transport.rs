@@ -8,8 +8,9 @@
 //! The transfer is served from a disposable bare repository rebuilt from the
 //! retained root's verified `.pack`/`.idx` bytes, so a deleted branch, a rewritten
 //! history or a wiped local cache cannot change what a pinned job sees.
-use super::s4_models::{GrantExpectation, S4ClosureGrant, fixed_oid, is_lower_hex};
+use super::s4_models::{GrantExpectation, S4ClosureGrant, fixed_oid};
 use super::s4_authority::{StreamSlot, wide_credential};
+pub(crate) use super::s4_models::refused_want;
 use super::s4_pin::refstore_repository;
 use super::*;
 use crate::members::{models::Role, rbac};
@@ -83,6 +84,7 @@ fn git(dir: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_PROTOCOL")
         .output()
         .map_err(Error::internal)?;
     if !output.status.success() {
@@ -158,7 +160,6 @@ pub(crate) async fn materialize(
 /// One exact still-live authorization decision for the requested object id.
 async fn authorize(
     state: &AppState,
-    store: &crate::blob_store::opendal::BlobStore,
     headers: &HeaderMap,
     owner: &str,
     name: &str,
@@ -170,6 +171,7 @@ async fn authorize(
     }
     let (_, token) = auth::credentials_for(headers, super::s4_models::JOB_PREFIX)?;
     let repository = refstore_repository(state, owner, name).await?.ok_or_else(Error::not_found)?;
+    super::s4_schema::ensure_s4_schema(&state.pool).await?;
     let format = repository.object_format.clone();
     let target = fixed_oid(target, &format)?.to_owned();
     let digest = db::digest(&token);
@@ -181,13 +183,20 @@ async fn authorize(
     let row = tx
         .query_opt(
             "SELECT g.grant_json, g.expires_unix, g.revoked, g.cancelled, j.cancelled, j.revoked, \
-                    j.expires_unix, r.owner_id, r.state, r.storage_generation, t.user_id, j.job_id \
+                    j.expires_unix, r.owner_id, r.state, r.storage_generation, t.user_id, j.job_id, \
+                    cg.authority_epoch, cg.history_incarnation, cg.group_epoch \
              FROM s4_ci_retention.closure_grants g \
              JOIN ci_checkout_jobs j ON j.repository_id=g.repository_id AND j.job_id=g.job_id \
              JOIN repositories r ON r.id=g.repository_id \
+             JOIN ref_store_core_gates cg ON cg.repository_id=g.repository_id AND cg.tenant_id=r.owner_id \
+             JOIN ref_store_serving_repositories sr ON sr.repository_id=g.repository_id AND sr.state='ready' \
+               AND sr.owner_id=cg.tenant_id AND sr.authority_epoch=cg.authority_epoch \
+               AND sr.history_incarnation=cg.history_incarnation AND sr.group_epoch=cg.group_epoch \
              JOIN tokens t ON t.id=j.issuer_token_id \
              WHERE g.repository_id=$1 AND g.credential_digest=$2 \
-               AND g.target_oid=$3 AND r.name=$4",
+               AND g.target_oid=$3 AND r.name=$4 \
+               AND g.authority_epoch=cg.authority_epoch AND g.history_incarnation=cg.history_incarnation \
+               AND g.group_epoch=cg.group_epoch",
             &[&repository.id, &digest, &target, &name],
         )
         .await
@@ -235,7 +244,9 @@ async fn authorize(
         repository_id: repository.id,
         owner_tenant_id: owner_tenant,
         storage_generation: repository.storage_generation,
-        authority_epoch: grant.authority_epoch,
+        authority_epoch: row.get(12),
+        history_incarnation: row.get(13),
+        group_epoch: row.get(14),
         mirror_audience: crate::ci_checkouts::audience()?,
         target_oid: &target,
         now_unix: now,
@@ -243,8 +254,15 @@ async fn authorize(
     let pin = tx
         .query_opt(
             "SELECT 1 FROM s4_ci_retention.ci_pins \
-             WHERE repository_id=$1 AND job_id=$2 AND state='pinned'",
-            &[&repository.id, &grant.job_id],
+             WHERE repository_id=$1 AND job_id=$2 AND state='pinned' \
+               AND authority_epoch=$3 AND history_incarnation=$4 AND group_epoch=$5",
+            &[
+                &repository.id,
+                &grant.job_id,
+                &row.get::<_, i64>(12),
+                &row.get::<_, Uuid>(13),
+                &row.get::<_, i64>(14),
+            ],
         )
         .await
         .map_err(Error::internal)?;
@@ -255,25 +273,16 @@ async fn authorize(
     let record = PgRetentionRoots::root_record_in_tx(&tx, root)
         .await
         .map_err(|_| Error::unauthorized())?;
-    if !record.is_some_and(|record| record.is_active()) {
+    if !record.is_some_and(|record| {
+        record.is_active()
+            && record.authority_epoch() == row.get::<_, i64>(12)
+            && record.history_incarnation() == row.get::<_, Uuid>(13)
+            && record.group_epoch() == row.get::<_, i64>(14)
+    }) {
         return Err(Error::unauthorized());
     }
     let _ = tx.rollback().await;
-    let _ = store;
     Ok(Authorized { grant, digest })
-}
-
-/// Cheap periodic re-proof used by the streaming body.
-async fn still_authorized(state: &AppState, authorized: &Authorized) -> bool {
-    super::s4_authority::still_authorized(
-        state,
-        authorized.grant.job_id,
-        &authorized.digest,
-        authorized.grant.repository_id,
-        authorized.grant.storage_generation,
-    )
-    .await
-    .unwrap_or(false)
 }
 
 /// Re-check authorization before every chunk is handed to the HTTP body. The
@@ -301,25 +310,6 @@ where
     }
 }
 
-/// Any `want` line must name exactly the granted commit.
-pub(crate) fn refused_want(body: &[u8], target: &str) -> bool {
-    let mut index = 0;
-    while let Some(found) = body[index..].windows(5).position(|window| window == b"want ") {
-        let start = index + found + 5;
-        let candidate = body
-            .get(start..start + target.len())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok());
-        if let Some(value) = candidate
-            && is_lower_hex(value, target.len())
-            && value != target
-        {
-            return true;
-        }
-        index = start;
-    }
-    false
-}
-
 fn advertisement(service: &str, refs: &[u8]) -> Vec<u8> {
     let line = format!("# service=git-{service}\n");
     let mut body = format!("{:04x}", line.len() + 4).into_bytes();
@@ -341,16 +331,20 @@ pub(crate) async fn info_refs(
     request: Request<Body>,
 ) -> Result<Response, Error> {
     let (owner, name) = split_name(owner, name);
-    if request.uri().query().is_some_and(|query| query.contains("service=git-receive-pack")) {
-        return Err(Error(StatusCode::FORBIDDEN, "CI transport is read-only"));
-    }
     if refstore_repository(&state, &owner, &name).await?.is_none() {
         return crate::git_http::handle(state, request).await;
+    }
+    match request.uri().query() {
+        Some("service=git-upload-pack") => {}
+        Some(query) if query.contains("service=git-receive-pack") => {
+            return Err(Error(StatusCode::FORBIDDEN, "CI transport is read-only"));
+        }
+        _ => return Err(Error::bad_request()),
     }
     let headers = request.headers().clone();
     let deadline = Instant::now() + state.config.git_timeout;
     let store = store()?;
-    let authorized = authorize(&state, &store, &headers, &owner, &name, &target, deadline).await?;
+    let authorized = authorize(&state, &headers, &owner, &name, &target, deadline).await?;
     let holder = materialize(
         &state,
         &store,
@@ -385,7 +379,7 @@ pub(crate) async fn upload_pack(
         .await
         .map_err(|_| Error::bad_request())?;
     let store = store()?;
-    let authorized = authorize(&state, &store, &headers, &owner, &name, &target, deadline).await?;
+    let authorized = authorize(&state, &headers, &owner, &name, &target, deadline).await?;
     if refused_want(&body, &authorized.grant.target_oid) {
         return Err(Error(StatusCode::FORBIDDEN, "requested object is outside the granted closure"));
     }
@@ -405,6 +399,7 @@ pub(crate) async fn upload_pack(
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_PROTOCOL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -443,22 +438,27 @@ pub(crate) async fn upload_pack(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut buffer = vec![0u8; CHUNK];
         loop {
-            tokio::select! {
-                read = stdout.read(&mut buffer) => {
-                    let read = read?;
-                    if read == 0 {
-                        break;
-                    }
-                    yield bytes::Bytes::copy_from_slice(&buffer[..read]);
-                }
+            let step: std::io::Result<Option<bytes::Bytes>> = tokio::select! {
+                read = stdout.read(&mut buffer) => match read {
+                    Ok(0) => Ok(None),
+                    Ok(n) => Ok(Some(bytes::Bytes::copy_from_slice(&buffer[..n]))),
+                    Err(err) => Err(err),
+                },
                 _ = ticker.tick() => {
-                    if !still_authorized(&stream_state, &stream_auth).await {
-                        let _ = child.kill().await;
-                        Err(std::io::Error::other(
-                            "checkout authorization revoked during transfer",
-                        ))?;
+                    let live = super::s4_authority::still_authorized(
+                        &stream_state, stream_auth.grant.job_id, &stream_auth.digest,
+                        stream_auth.grant.repository_id, stream_auth.grant.storage_generation,
+                    ).await.unwrap_or(false);
+                    if live {
+                        continue;
                     }
+                    let _ = child.kill().await;
+                    Err(std::io::Error::other("checkout authorization revoked during transfer"))
                 }
+            };
+            match step? {
+                Some(chunk) => yield chunk,
+                None => break,
             }
         }
         let status = child.wait().await?;
@@ -476,7 +476,15 @@ pub(crate) async fn upload_pack(
 }
 
 /// `POST /ci/{target}/git/{owner}/{name}/git-receive-pack` is always refused.
-pub(crate) async fn receive_pack() -> Result<Response, Error> {
+pub(crate) async fn receive_pack(
+    State(state): State<Arc<AppState>>,
+    Path((_target, owner, name)): Path<(String, String, String)>,
+    request: Request<Body>,
+) -> Result<Response, Error> {
+    let (owner, name) = split_name(owner, name);
+    if refstore_repository(&state, &owner, &name).await?.is_none() {
+        return crate::git_http::handle(state, request).await;
+    }
     Err(Error(StatusCode::FORBIDDEN, "CI transport is read-only"))
 }
 

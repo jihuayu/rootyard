@@ -61,6 +61,75 @@ async fn revoke(cluster: &Cluster, repo: &Repository, job: Uuid) -> Result<()> {
     Ok(())
 }
 
+async fn open_pack_stream(
+    cluster: &Cluster,
+    repo: &Repository,
+    target: &str,
+    token: &str,
+) -> Result<reqwest::Response> {
+    let want = format!("want {target}\n");
+    let body = format!("{:04x}{want}00000009done\n", 4 + want.len());
+    let url = format!("{}/ci/{}/git/{}/{}/git-upload-pack", cluster.main, target, cluster.owner.username, repo.name);
+    let stream = reqwest::Client::new()
+        .post(url)
+        .basic_auth(&cluster.owner.username, Some(token))
+        .header("Content-Type", "application/x-git-upload-pack-request")
+        .body(body)
+        .send()
+        .await?;
+    ensure!(stream.status().is_success(), "upload-pack returned {}", stream.status());
+    Ok(stream)
+}
+
+/// Drain a pack response; `true` means the server aborted the stream.
+async fn drain_pack(stream: &mut reqwest::Response, received: &mut usize) -> bool {
+    loop {
+        match stream.chunk().await {
+            Ok(Some(chunk)) => *received += chunk.len(),
+            Ok(None) => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
+async fn post_checkout(cluster: &Cluster, repo: &Repository, job: Uuid, target: &str, now: i64) -> Result<StatusCode> {
+    let body = serde_json::json!({
+        "job_id": job,
+        "target_oid": target,
+        "storage_generation": repo.generation,
+        "mirror_audience": harness::AUDIENCE,
+        "expires_unix": now + 600,
+    });
+    let url = format!("{}/api/repos/{}/{}/ci-checkouts", cluster.main, cluster.owner.username, repo.name);
+    harness::post_status(&url, &cluster.owner.token, body).await
+}
+
+async fn job_and_grant_counts(cluster: &Cluster, job: Uuid) -> Result<(i64, i64)> {
+    let row = cluster
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT (SELECT count(*) FROM ci_checkout_jobs WHERE job_id=$1), \
+                    (SELECT count(*) FROM s4_ci_retention.closure_grants WHERE job_id=$1)",
+            &[&job],
+        )
+        .await?;
+    Ok((row.get(0), row.get(1)))
+}
+
+async fn set_gate_epoch(pool: &deadpool_postgres::Pool, repo_id: Uuid, epoch: i64, incarnation: Uuid) -> Result<()> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    tx.execute("SET LOCAL session_replication_role = replica", &[]).await?;
+    for table in ["ref_store_core_gates", "ref_store_core_protocol_repos", "ref_store_serving_repositories"] {
+        let sql = format!("UPDATE {table} SET authority_epoch=$1, history_incarnation=$2 WHERE repository_id=$3");
+        tx.execute(&sql, &[&epoch, &incarnation, &repo_id]).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires real PG17, an S3 endpoint and native Git"]
 async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()> {
@@ -72,9 +141,58 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
         let pinned = cluster.pin(&repo, job, &first).await?;
         ensure!(pinned["state"].as_str() == Some("pinned"), "pin response was not pinned: {pinned}");
         ensure!(pinned["target_oid"].as_str() == Some(first.as_str()), "pin stored another commit");
+        let replay = cluster.pin(&repo, job, &first).await?;
+        ensure!(replay["state"].as_str() == Some("pinned"), "pin replay was not idempotent: {replay}");
+        let root_sql = "SELECT count(*) FROM ref_store_core_root_heads h \
+             JOIN repositories r ON r.id=h.repository_id WHERE r.name=$1 AND h.state='active'";
+        let roots: i64 = cluster.pool.get().await?.query_one(root_sql, &[&repo.name]).await?.get(0);
+        ensure!(roots == 1, "an idempotent pin replay leaked {roots} active retention roots");
         let token = cluster.checkout(&repo, job, &first).await?;
         ensure!(token.starts_with("ryj_"), "checkout did not return a narrow job credential");
         ensure!(cluster.ci_clone(&repo, &first, &token).await? == first, "cold CI clone lost its pin");
+
+        for auth in [
+            Auth::Bearer(&cluster.owner.token),
+            Auth::Basic { user: &cluster.owner.username, password: &cluster.owner.token },
+        ] {
+            let wide_user = info_refs_status(&cluster, &repo, &first, auth).await?;
+            ensure!(wide_user == StatusCode::FORBIDDEN, "a wide user token reached CI transport: {wide_user}");
+        }
+
+        let upper = format!("want {}\n", first.to_ascii_uppercase());
+        let pkt = format!("{:04x}{upper}00000009done\n", 4 + upper.len());
+        let upper_url = format!(
+            "{}/ci/{}/git/{}/{}/git-upload-pack",
+            cluster.main, first, cluster.owner.username, repo.name
+        );
+        let upper_status = reqwest::Client::new()
+            .post(upper_url)
+            .basic_auth(&cluster.owner.username, Some(&token))
+            .header("Content-Type", "application/x-git-upload-pack-request")
+            .body(pkt)
+            .send()
+            .await?
+            .status();
+        ensure!(upper_status == StatusCode::FORBIDDEN, "an uppercase hex want was accepted: {upper_status}");
+
+        let cancelled_job = Uuid::new_v4();
+        let cancel_url = format!(
+            "{}/api/repos/{}/{}/ci-checkouts/{cancelled_job}/cancel",
+            cluster.main, cluster.owner.username, repo.name
+        );
+        let cancel = reqwest::Client::new().post(cancel_url).bearer_auth(&cluster.owner.token).send().await?;
+        ensure!(cancel.status().is_success(), "pre-cancel returned {}", cancel.status());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+        let cancelled_body = serde_json::json!({
+            "job_id": cancelled_job,
+            "target_oid": first,
+            "storage_generation": repo.generation,
+            "mirror_audience": harness::AUDIENCE,
+            "expires_unix": now + 600,
+        });
+        let checkout_url = format!("{}/api/repos/{}/{}/ci-checkouts", cluster.main, cluster.owner.username, repo.name);
+        let after_cancel = harness::post_status(&checkout_url, &cluster.owner.token, cancelled_body).await?;
+        ensure!(after_cancel == StatusCode::CONFLICT, "a pre-cancelled plan was reissued: {after_cancel}");
 
         let second = cluster.force_push(&repo, "a.txt", "rewritten\n").await?;
         ensure!(second != first, "force push did not create a new commit");
@@ -107,25 +225,11 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
         let stream_job = Uuid::new_v4();
         cluster.pin(&repo, stream_job, &big_oid).await?;
         let stream_token = cluster.checkout(&repo, stream_job, &big_oid).await?;
-        let want = format!("want {big_oid}\n");
-        let body = format!("{:04x}{want}00000009done\n", 4 + want.len());
-        let url = format!(
-            "{}/ci/{}/git/{}/{}/git-upload-pack",
-            cluster.main, big_oid, cluster.owner.username, repo.name
-        );
-        let mut stream = reqwest::Client::new()
-            .post(url)
-            .basic_auth(&cluster.owner.username, Some(&stream_token))
-            .header("Content-Type", "application/x-git-upload-pack-request")
-            .body(body)
-            .send()
-            .await?;
-        ensure!(stream.status().is_success(), "upload-pack returned {}", stream.status());
-        let mut received = 0_usize;
+        let mut stream = open_pack_stream(&cluster, &repo, &big_oid, &stream_token).await?;
         let Some(chunk) = stream.chunk().await?.filter(|chunk| !chunk.is_empty()) else {
             return Err(anyhow::anyhow!("the pack stream produced no first chunk"));
         };
-        received += chunk.len();
+        let mut received = chunk.len();
         let released = reqwest::Client::new()
             .delete(format!(
                 "{}/api/repos/{}/{}/ci-pins/{stream_job}",
@@ -135,17 +239,7 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
             .send()
             .await?;
         ensure!(released.status().is_success(), "mid-stream release returned {}", released.status());
-        let mut stream_errored = false;
-        loop {
-            match stream.chunk().await {
-                Ok(Some(chunk)) => received += chunk.len(),
-                Ok(None) => break,
-                Err(_) => {
-                    stream_errored = true;
-                    break;
-                }
-            }
-        }
+        let stream_errored = drain_pack(&mut stream, &mut received).await;
         ensure!(
             stream_errored || received < 550_000,
             "the revoked stream delivered the complete retained pack ({received} bytes)"
@@ -176,6 +270,72 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
         let pin_sql = "SELECT count(*) FROM s4_ci_retention.ci_pins WHERE job_id=$1";
         let pins: i64 = client.query_one(pin_sql, &[&bad_job]).await?.get(0);
         ensure!(jobs == 0 && pins == 0, "a refused checkout left job={jobs} pin={pins} rows");
+
+        // A pin released before checkout must never be turned into a job/grant.
+        let released_first_job = Uuid::new_v4();
+        cluster.pin(&repo, released_first_job, &first).await?;
+        let released = reqwest::Client::new()
+            .delete(format!(
+                "{}/api/repos/{}/{}/ci-pins/{released_first_job}",
+                cluster.main, cluster.owner.username, repo.name
+            ))
+            .bearer_auth(&cluster.owner.token)
+            .send()
+            .await?;
+        ensure!(released.status().is_success(), "release-before-checkout returned {}", released.status());
+        let after_release = post_checkout(&cluster, &repo, released_first_job, &first, now).await?;
+        ensure!(after_release == StatusCode::CONFLICT, "a released pin was reissued: {after_release}");
+        let (jobs, grants) = job_and_grant_counts(&cluster, released_first_job).await?;
+        ensure!(jobs == 0 && grants == 0, "a released pin left job={jobs} grant={grants}");
+
+        // A reused pin whose retained root was released must fail inside the
+        // issuance transaction, before any job or closure grant is inserted.
+        let root_released_job = Uuid::new_v4();
+        cluster.pin(&repo, root_released_job, &first).await?;
+        let mut releaser = cluster.pool.get().await?;
+        let tx = releaser.transaction().await?;
+        tx.execute(
+            "UPDATE ref_store_core_root_heads h SET state='released', last_generation=2 \
+             FROM s4_ci_retention.ci_pins p \
+             WHERE h.repository_id=p.repository_id AND h.root_id=p.retention_root_id AND p.job_id=$1",
+            &[&root_released_job],
+        )
+        .await?;
+        tx.commit().await?;
+        let after_root_release = post_checkout(&cluster, &repo, root_released_job, &first, now).await?;
+        ensure!(
+            after_root_release == StatusCode::CONFLICT,
+            "a released root was reissued: {after_root_release}"
+        );
+        let (jobs, grants) = job_and_grant_counts(&cluster, root_released_job).await?;
+        ensure!(jobs == 0 && grants == 0, "a released root left job={jobs} grant={grants}");
+
+        // Bumping authority/history while a transfer streams must terminate it
+        // and invalidate the same narrow credential for later requests.
+        let epoch_job = Uuid::new_v4();
+        cluster.pin(&repo, epoch_job, &big_oid).await?;
+        let epoch_token = cluster.checkout(&repo, epoch_job, &big_oid).await?;
+        let mut epoch_stream = open_pack_stream(&cluster, &repo, &big_oid, &epoch_token).await?;
+        let Some(chunk) = epoch_stream.chunk().await?.filter(|chunk| !chunk.is_empty()) else {
+            return Err(anyhow::anyhow!("the epoch pack stream produced no first chunk"));
+        };
+        let mut epoch_received = chunk.len();
+        let gate_sql = "SELECT authority_epoch, history_incarnation FROM ref_store_core_gates WHERE repository_id=$1";
+        let row = cluster.pool.get().await?.query_one(gate_sql, &[&repo.id]).await?;
+        let (old_epoch, old_incarnation): (i64, Uuid) = (row.get(0), row.get(1));
+        set_gate_epoch(&cluster.pool, repo.id, old_epoch + 1, Uuid::new_v4()).await?;
+        let epoch_errored = drain_pack(&mut epoch_stream, &mut epoch_received).await;
+        ensure!(
+            epoch_errored || epoch_received < 550_000,
+            "an epoch-bumped stream delivered the complete retained pack ({epoch_received} bytes)"
+        );
+        let epoch_dead = info_refs_status(&cluster, &repo, &big_oid, Auth::Basic {
+            user: cluster.owner.username.as_str(),
+            password: epoch_token.as_str(),
+        })
+        .await?;
+        ensure!(epoch_dead == StatusCode::UNAUTHORIZED, "an epoch-bumped credential still authorized");
+        set_gate_epoch(&cluster.pool, repo.id, old_epoch, old_incarnation).await?;
 
         // pg_refstore identity is guarded, so no product API can move a
         // repository between tenants. Re-seat the same repository under a new
@@ -233,10 +393,6 @@ async fn s4_git_view_bundle_is_projected_only_and_reverse_merges_the_subtree() -
     let outcome = async {
         let repo = cluster.create_repository("view-repo", "sha1").await?;
         let base = cluster.push_initial(&repo, &[("root.txt", "root\n"), ("dir/b.txt", "before\n")]).await?;
-        let job = Uuid::new_v4();
-        cluster.pin(&repo, job, &base).await?;
-        let token = cluster.checkout(&repo, job, &base).await?;
-        cluster.ci_clone(&repo, &base, &token).await?;
 
         let namespace = cluster.namespace(&repo, &base, "/src").await?;
         let view = cluster.view(&namespace, "/src", "dir").await?;
@@ -246,6 +402,11 @@ async fn s4_git_view_bundle_is_projected_only_and_reverse_merges_the_subtree() -
         ensure!(!tree.join("root.txt").exists(), "the projected bundle leaked a path outside the mount");
         let branch = cluster.git.text(&tree, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
         ensure!(branch == "projected", "the bundle checked out {branch}, not the projected ref");
+        let http_tree = cluster.clone_view(&view, "sha1").await?;
+        ensure!(http_tree.join("b.txt").is_file(), "the Smart HTTP view lost the selected subtree");
+        ensure!(!http_tree.join("root.txt").exists(), "the Smart HTTP view leaked a path outside the mount");
+        let http_branch = cluster.git.text(&http_tree, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
+        ensure!(http_branch == "projected", "the Smart HTTP view checked out {http_branch}, not projected");
         ensure!(
             !cluster.scratch.join("data/workspace-service/views").exists(),
             "the git view leaked a durable workspace-service copy"
@@ -293,6 +454,8 @@ async fn s4_sha256_pin_clone_and_reverse_round_trip() -> Result<()> {
         let bundle = cluster.get_bundle(&view).await?;
         let tree = clone_bundle(&cluster, &bundle, "sha256").await?;
         ensure!(tree.join("note.txt").is_file(), "the SHA-256 projected bundle is empty");
+        let http_tree = cluster.clone_view(&view, "sha256").await?;
+        ensure!(http_tree.join("note.txt").is_file(), "the SHA-256 Smart HTTP view is empty");
         let oid = cluster.git.text(&tree, &["rev-parse", "HEAD"]).await?;
         ensure!(oid.len() == 64, "the projected bundle is not SHA-256");
 

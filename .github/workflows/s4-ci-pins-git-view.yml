@@ -113,3 +113,11 @@ jobs:
       - name: Run PG17 S4 checkout, revocation and GitView acceptance
         run: |
           cargo test --locked --test s4_ci_pins_git_view -- --ignored --test-threads=1
+
+      - name: Upload S4 acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s4-ci-pins-git-view-evidence
+          path: test-results/s4-ci-pins-git-view
+          if-no-files-found: error

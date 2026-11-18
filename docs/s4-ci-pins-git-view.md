@@ -103,6 +103,16 @@ recorded head and the current repository owner, then creates a bundle containing
 only `refs/heads/projected` and `HEAD` — never `--all`, remote-tracking refs or
 `refs/original/*`.
 
+Smart HTTP is served for `pg_refstore` views at
+`/git/views/{id}.git/info/refs` and `/git/views/{id}.git/git-upload-pack`. Each
+request verifies the live `git_view_bindings` row and retained root, rebuilds the
+recorded projection into a disposable `0o700` tree, and clones only
+`refs/heads/projected` into a throwaway bare repository before running
+`upload-pack --stateless-rpc` under the shared Git-capacity semaphore and the
+request deadline. No durable copy and no unprojected sibling path is written
+under `workspace-service/views`; the disposable tree is removed before the
+response is returned. `git-receive-pack` stays refused with `403`.
+
 ## Reverse merge into `pg_refstore`
 
 `POST /api/views/{id}/changesets` is implemented for `pg_refstore`. The retained

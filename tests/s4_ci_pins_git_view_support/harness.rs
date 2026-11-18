@@ -91,6 +91,7 @@ pub struct Cluster {
 }
 
 pub struct Repository {
+    pub id: Uuid,
     pub name: String,
     pub generation: i64,
     pub object_format: String,
@@ -235,7 +236,7 @@ impl Cluster {
         drop(client);
         let generation: i64 =
             self.pool.get().await?.query_one("SELECT storage_generation FROM repositories WHERE id=$1", &[&id]).await?.get(0);
-        Ok(Repository { name: name.to_owned(), generation, object_format: format.to_owned() })
+        Ok(Repository { id, name: name.to_owned(), generation, object_format: format.to_owned() })
     }
 
     fn source_url(&self, repo: &Repository) -> String {
@@ -297,6 +298,19 @@ impl Cluster {
         );
         self.git.clone_any(&work, &url, "ci", &repo.object_format).await?;
         self.git.text(&work.join("ci"), &["rev-parse", "HEAD"]).await
+    }
+
+    pub async fn clone_view(&self, view: &str, format: &str) -> Result<PathBuf> {
+        let work = self.scratch.join(format!("view-http-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&work)?;
+        let url = format!(
+            "http://{}:{}@{}/git/views/{view}.git",
+            self.owner.username,
+            self.owner.token,
+            self.main.trim_start_matches("http://"),
+        );
+        self.git.clone_any(&work, &url, "proj", format).await?;
+        Ok(work.join("proj"))
     }
 
     pub async fn pin(&self, repo: &Repository, job_id: Uuid, target: &str) -> Result<Value> {

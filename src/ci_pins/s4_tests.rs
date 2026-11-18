@@ -26,6 +26,8 @@ fn sample_grant(target: &str) -> S4ClosureGrant {
         owner_tenant_id: Uuid::new_v4(),
         storage_generation: 11,
         authority_epoch: 4,
+        history_incarnation: Uuid::new_v4(),
+        group_epoch: 2,
         object_format: "sha1",
         target_oid: target,
         retention_root_id: Uuid::new_v4(),
@@ -36,12 +38,14 @@ fn sample_grant(target: &str) -> S4ClosureGrant {
     .expect("valid grant")
 }
 
-fn expectation(grant: &S4ClosureGrant, target: &str) -> GrantExpectation<'_> {
+fn expectation<'a>(grant: &S4ClosureGrant, target: &'a str) -> GrantExpectation<'a> {
     GrantExpectation {
         repository_id: grant.repository_id,
         owner_tenant_id: grant.owner_tenant_id,
         storage_generation: grant.storage_generation,
         authority_epoch: grant.authority_epoch,
+        history_incarnation: grant.history_incarnation,
+        group_epoch: grant.group_epoch,
         mirror_audience: grant.mirror_audience,
         target_oid: target,
         now_unix: 1_700_000_000,
@@ -98,15 +102,35 @@ fn closure_grant_rejects_every_tampered_field() {
     let mut wrong = expectation(&grant, target);
     wrong.authority_epoch += 1;
     assert!(grant.authorize(&wrong).is_err());
+
+    let mut wrong = expectation(&grant, target);
+    wrong.history_incarnation = Uuid::new_v4();
+    assert!(grant.authorize(&wrong).is_err());
+
+    let mut wrong = expectation(&grant, target);
+    wrong.group_epoch += 1;
+    assert!(grant.authorize(&wrong).is_err());
 }
 
 #[test]
 fn only_narrow_job_credentials_reach_the_data_plane() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     let wide = format!("Bearer ryu_{}", "a".repeat(64));
     let narrow = format!("Bearer ryj_{}", "b".repeat(64));
     assert!(wide_credential(&bearer(&wide)));
     assert!(!wide_credential(&bearer(&narrow)));
     assert!(!wide_credential(&HeaderMap::new()));
+
+    for prefix in ["ryt_", "ryu_", "rys_", "ryb_"] {
+        let value = format!("Bearer {prefix}{}", "a".repeat(64));
+        assert!(wide_credential(&bearer(&value)), "accepted Bearer {prefix}");
+        let basic = STANDARD.encode(format!("alice:{prefix}{}", "a".repeat(64)));
+        assert!(wide_credential(&bearer(&format!("Basic {basic}"))), "accepted Basic {prefix}");
+    }
+
+    let narrow_basic = STANDARD.encode(format!("alice:ryj_{}", "b".repeat(64)));
+    assert!(!wide_credential(&bearer(&format!("Basic {narrow_basic}"))));
+    assert!(!wide_credential(&bearer(&format!("Bearer ryj_{}", "b".repeat(64)))));
 
     // The narrow prefix is the only one `credentials_for` accepts.
     assert!(crate::auth::credentials_for(&bearer(&wide), "ryj_").is_err());
@@ -122,14 +146,23 @@ fn upload_pack_wants_must_equal_the_granted_commit() {
     assert!(!refused_want(granted_line.as_bytes(), granted));
     assert!(refused_want(other_line.as_bytes(), granted));
 
+    let cap = format!("want {granted} multi_ack_detailed side-band-64k\n");
+    let pkt = format!("{:04x}{cap}00000009done\n", 4 + cap.len());
+    assert!(!refused_want(pkt.as_bytes(), granted));
+
     let mut mixed = Vec::new();
     mixed.extend_from_slice(granted_line.as_bytes());
     mixed.extend_from_slice(b"0000");
     mixed.extend_from_slice(other_line.as_bytes());
     assert!(refused_want(&mixed, granted));
 
-    // A capability/shallow line is not a want and must not trip the check.
-    assert!(!refused_want(b"0000", granted));
+    let uppercase = format!("0032want {}\n", granted.to_ascii_uppercase());
+    assert!(refused_want(uppercase.as_bytes(), granted));
+    assert!(refused_want(b"001dwant-ref refs/heads/main\n", granted));
+
+    for refused in [b"".as_slice(), b"0000".as_slice(), b"zzzz".as_slice(), b"0032want ".as_slice()] {
+        assert!(refused_want(refused, granted), "accepted {refused:?}");
+    }
 }
 
 #[test]
