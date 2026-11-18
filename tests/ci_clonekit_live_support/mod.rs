@@ -276,7 +276,7 @@ async fn run_body(diag: &mut LiveRecorder, pool: &Pool) -> Result<()> {
     diag.mark(LivePhase::JobInsert, file!(), line!());
     let c2 = add_commit(&repo, "next.txt", b"delta2\n", "c2")?;
     let (signed, ctx) = make_grant(ids, Sha1, &c2, None, now)?;
-    let plan = serde_json::json!({"version":1,"job_id":ctx.job_id,"owner_id":ids.0,"repository_id":ids.1,"storage_generation":1,"object_format":"sha1","target_oid":c2,"source_receipt_sha256":"a".repeat(64),"mirror_audience":ctx.audience,"expires_unix":signed.claims.not_after_unix});
+    let plan = serde_json::json!({"version":1,"job_id":ctx.job_id,"owner_id":ids.0,"repository_id":ids.1,"storage_generation":1,"object_format":"sha1","target_oid":c2,"source_receipt_sha256":"a".repeat(64),"mirror_audience":ctx.audience,"expires_unix":signed.claims.not_after_unix,"dependencies":{"version":1,"history":"full","tags":[],"lfs":[],"submodules":[]}});
     pool.get().await?.execute("INSERT INTO ci_checkout_jobs(repository_id,job_id,owner_id,plan,issuer_token_id,credential_digest,expires_unix) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&ids.1, &ctx.job_id, &ids.0, &plan, &token_id, &credential_digest, &signed.claims.not_after_unix]).await?;
     diag.mark(LivePhase::Checkout, file!(), line!());
     let pg_auth: Arc<dyn CloneKitAuthorityOracle> = Arc::new(PgCheckoutAuthorityOracle::new(Pool::clone(pool)));

@@ -276,6 +276,12 @@ class LiveReceiptTest(unittest.TestCase):
             self.assertTrue(blocked.is_dir())
             self.assertFalse(any(path.name.startswith(".live-receipt.") for path in root.iterdir()))
 
+    def test_live_checkout_plan_keeps_canonical_dependency_object(self) -> None:
+        source = "".join(LIVE_MODULE.read_text(encoding="utf-8").split())
+        dependencies = '"dependencies":{"version":1,"history":"full","tags":[],"lfs":[],"submodules":[]}'
+        self.assertIn(dependencies, source)
+        self.assertLess(source.index(dependencies), source.index("INSERTINTOci_checkout_jobs"))
+
     def test_workflow_trap_preserves_status_and_fails_closed_on_green_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
