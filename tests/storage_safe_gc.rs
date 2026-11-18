@@ -226,6 +226,9 @@ async fn real_opendal_s3_git_compaction_staging_cleanup_post_ticket_fence_and_du
         // Sweep ONLY srv2 (disjoint orphan pack; both .pack and .idx must be in proof.candidates!).
         let overlap_set: BTreeSet<_> = p3_oids.iter().cloned().collect();
         assert!(p2_oids.iter().all(|o| !overlap_set.contains(o)));
+        if !distributed {
+            authority.set_pg_reader_barrier_epoch(Some(1))?;
+        }
         let proof = authority.build_authoritative_deletion_proof(arm.clone(), &[srv2.pack_id])?;
         assert_eq!(proof.candidates.len(), 2);
 

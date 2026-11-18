@@ -118,20 +118,20 @@ pub fn reconcile_refcas_quorum_into_authority(
     raft_commit_index: u64,
     authority: &DurableSafeGcAuthority,
 ) -> Result<(), SafeGcError> {
-    let refs_map = sm.read_refs(repo_id).map_err(|e| {
-        SafeGcError::IncompleteProof(if e.to_string().is_empty() {
-            "refcas read failed"
-        } else {
-            "refcas repository state unavailable"
-        })
-    })?;
+    let gate_ver = sm
+        .read_gate_version(repo_id)
+        .map_err(|_| SafeGcError::IncompleteProof("refcas repository gate version unreadable"))?;
+    if gate_ver.is_none() {
+        return Err(SafeGcError::IncompleteProof("refcas repository gate not initialized"));
+    }
+    let applied_idx = sm.last_applied().map(|id| id.index).unwrap_or(0);
+    if applied_idx < raft_commit_index {
+        return Err(SafeGcError::IncompleteProof("refcas state machine lags required raft_commit_index"));
+    }
+    let refs_map = sm.read_refs(repo_id);
     let mut live_refs = Vec::with_capacity(refs_map.len());
-    for (name, target) in refs_map {
-        live_refs.push(LiveRefRoot {
-            ref_name: name.as_str().to_owned(),
-            target_oid: target.oid().as_hex().to_owned(),
-            version_seq: raft_commit_index.max(1),
-        });
+    for (ref_name, target_oid) in refs_map {
+        live_refs.push(LiveRefRoot { ref_name, target_oid, version_seq: raft_commit_index.max(1) });
     }
     authority.apply_refcas_quorum_refs(live_refs, raft_commit_index.max(1))
 }
@@ -304,13 +304,13 @@ async fn load_pg_open_decisions<C: GenericClient + Sync>(
     let rows = client
         .query(
             "SELECT d.decision_id, d.action, d.merge_head_oid, d.merge_base_oid, r.new_oid \
-             FROM ref_store_decisions d \
+             FROM ref_store_publication_decisions d \
              LEFT JOIN ref_store_decision_refs r ON r.decision_id = d.decision_id AND r.verdict = 'accept' \
              WHERE d.repository_id = $1 AND d.state = 'OPEN'",
             &[&repo_id],
         )
         .await
-        .map_err(|e| SafeGcError::Io(format!("read ref_store_decisions failed: {e}")))?;
+        .map_err(|e| SafeGcError::Io(format!("read ref_store_publication_decisions failed: {e}")))?;
     let mut map: BTreeMap<Uuid, (DecisionKind, BTreeSet<String>)> = BTreeMap::new();
     for r in rows {
         let id: Uuid = r.get(0);

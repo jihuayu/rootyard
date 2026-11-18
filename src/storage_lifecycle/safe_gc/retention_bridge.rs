@@ -11,10 +11,20 @@ use std::collections::BTreeSet;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::ref_store::core::{ref_version::VersionId, types::RefName};
-use crate::ref_store::ref_version::pack_cover::{
-    CoverRetentionHold, NonAuthoritativeHint, PackRetentionClassification, PackRetentionState, PhysicalBlobStatus,
-    RetentionClassificationIndex,
+use crate::ref_store::{
+    contract::{IssuerLane, RequestDigest},
+    core::{
+        contract::CommitMode,
+        ref_version::{
+            AuthorityKind, BaseRequestSelector, OperationDigestInput, RefVersionIntent, RefVersionKind,
+            RefVersionRealm, VersionId, derive_candidate_version_id, operation_digest,
+        },
+        types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget},
+    },
+    ref_version::pack_cover::{
+        CoverRetentionHold, NonAuthoritativeHint, PackRetentionClassification, PackRetentionState, PhysicalBlobStatus,
+        RetentionClassificationIndex,
+    },
 };
 
 use super::{
@@ -41,11 +51,40 @@ pub struct PackCoverBridgeInputs<'a> {
 }
 
 fn oid_version_id(oid: &str) -> VersionId {
-    let digest = Sha256::digest(oid.as_bytes());
-    let mut raw = [0_u8; 8];
-    raw.copy_from_slice(&digest[..8]);
-    let seq = i64::from_be_bytes(raw).unsigned_abs().max(1) as i64;
-    VersionId::new(seq.min(i64::MAX - 1).max(1)).expect("positive VersionId")
+    let mut raw = [0_u8; 32];
+    raw.copy_from_slice(&Sha256::digest(oid.as_bytes()));
+    if raw.iter().all(|&b| b == 0) {
+        raw[0] = 1;
+    }
+    let git_oid = GitOid::parse(GitObjectFormat::Sha256, &hex::encode(raw)).expect("valid non-zero sha256 oid");
+    let ns = Uuid::from_u128(0x0122_0184_0000_0000_0000_0000_0000_0001);
+    let realm = RefVersionRealm::new(ns, ns, ns, AuthorityKind::Pg, 1, 0, 1, GitObjectFormat::Sha256);
+    let ref_name = RefName::new("refs/heads/safe-gc-oid-bridge").expect("valid bridge ref name");
+    let intent = RefVersionIntent::new(
+        ref_name.clone(),
+        RefVersionKind::Publish,
+        RefPrecondition::Absent,
+        BaseRequestSelector::ExplicitAbsent,
+        RefTarget::Oid(git_oid),
+    );
+    let digest_seed = RequestDigest::of("safe-gc-oid-bridge", &[oid.as_bytes()]);
+    let op = OperationDigestInput::new(
+        realm,
+        ns,
+        ns,
+        IssuerLane::new("safe-gc").expect("valid issuer lane"),
+        1,
+        ns,
+        1,
+        digest_seed,
+        CommitMode::Atomic,
+        HeadUpdate::Keep,
+        vec![intent],
+        digest_seed,
+        Vec::new(),
+    );
+    let od = operation_digest(&op).expect("valid bridge operation digest");
+    derive_candidate_version_id(&op, od, &ref_name, None).expect("valid bridge VersionId")
 }
 
 pub fn build_pack_cover_retention_index(inputs: &PackCoverBridgeInputs<'_>) -> RetentionClassificationIndex {

@@ -154,11 +154,9 @@ async fn handle_s3(State(st): State<Arc<S3State>>, m: Method, u: Uri, b: Bytes) 
         Method::PUT => {
             st.put_requests.fetch_add(1, Ordering::SeqCst);
             let mut data = b.to_vec();
-            if key.ends_with(".pack") || !data.is_empty() {
-                if st.corrupt_next_put.swap(false, Ordering::SeqCst) && !data.is_empty() {
-                    let mid = data.len() / 2;
-                    data[mid] ^= 0xff;
-                }
+            if st.corrupt_next_put.swap(false, Ordering::SeqCst) && !data.is_empty() {
+                let mid = data.len() / 2;
+                data[mid] ^= 0xff;
             }
             let tag = etag(&data);
             st.objects.lock().unwrap().insert(key, data);

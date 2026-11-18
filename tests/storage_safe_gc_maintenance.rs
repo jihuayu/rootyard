@@ -19,9 +19,10 @@ use rootyard::{
     ref_store::{
         core::{
             state_machine::{
-                InitializeGateCommand, RefCasCommand, RefCasStateMachine, RepositoryLane, SmPackMode, WireGateInit,
+                AppliedLogId, InitializeGateCommand, RefCasCommand, RefCasStateMachine, RepositoryLane, SmPackMode,
+                WireGateInit,
             },
-            types::{GitObjectFormat, RefName},
+            types::GitObjectFormat,
         },
         serving::{ProvisionRequest, provision},
     },
@@ -62,11 +63,18 @@ fn test_policy() -> Policy {
 }
 
 fn app_config(root: &Path, db_url: String) -> Config {
+    let git_bin = std::env::var("ROOTYARD_GIT")
+        .or_else(|_| std::env::var("ROOTYARD_GIT_PATH"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let usr = PathBuf::from("/usr/bin/git");
+            if usr.exists() { usr } else { PathBuf::from("git") }
+        });
     Config {
         database_url: db_url,
         data_dir: root.join("server-data"),
         bind: "127.0.0.1:0".parse().unwrap(),
-        git: PathBuf::from(std::env::var("ROOTYARD_GIT_PATH").unwrap_or_else(|_| "/usr/bin/git".into())),
+        git: git_bin,
         max_request_bytes: 64 * 1024 * 1024,
         max_output_bytes: 64 * 1024 * 1024,
         max_concurrent_git: 2,
@@ -164,8 +172,8 @@ async fn insert_transient_serving_read_pin(
     client
         .execute(
             "INSERT INTO ref_store_core_serving_read_packs( \
-               pin_id,ordinal,pack_id,registration_id,artifact_set_digest,joined_revision) \
-             VALUES($1,0,$2,$3,$4,1)",
+               pin_id,pack_id,registration_id,artifact_set_digest,joined_revision) \
+             VALUES($1,$2,$3,$4,1)",
             &[&pin_id, &pack_id, &Uuid::new_v4(), &d('e')],
         )
         .await?;
@@ -370,6 +378,10 @@ async fn real_pg17_scheduler_worker_sql_pins_serving_reads_and_opendal_s3_safe_g
     let shared_pg_read =
         read_leases::shared(&pool, repo_id, tokio::time::Instant::now() + Duration::from_secs(5)).await.unwrap();
     shared_pg_read.ensure_active().unwrap();
+    assert!(
+        read_leases::exclusive(&pool, repo_id, tokio::time::Instant::now() + Duration::from_millis(200)).await.is_err(),
+        "shared PG reader lease must fence concurrent exclusive GC acquisition"
+    );
     drop(shared_pg_read);
 
     // 3. Clean armed destructive sweep through scheduler::schedule_once + worker::run_once!
@@ -407,25 +419,25 @@ async fn real_pg17_scheduler_worker_sql_pins_serving_reads_and_opendal_s3_safe_g
 
     // 4. Also exercise DistributedRefCas quorum state-machine reconciliation (`RefCasStateMachine`)!
     let mut sm = RefCasStateMachine::new();
-    let _ = sm.apply(
-        1,
-        1,
-        &RefCasCommand::InitializeGate(InitializeGateCommand {
-            lane: RepositoryLane::Serving,
-            pack_mode: SmPackMode::PackVerified,
-            decision_required: true,
-            init: WireGateInit {
+    sm.apply(
+        AppliedLogId { term: 1, index: 7 },
+        RefCasCommand::InitializeGate(InitializeGateCommand {
+            gate: WireGateInit {
                 repository_id: repo_id,
                 tenant_id,
                 object_format: GitObjectFormat::Sha1,
                 history_incarnation: history_id,
                 authority_epoch: 1,
                 group_epoch: 1,
-                head_ref: RefName::new("refs/heads/main")?,
+                head_ref: "refs/heads/main".into(),
             },
+            lane: RepositoryLane::ServingRefStore,
+            pack_mode: SmPackMode::PackVerified,
+            authz_floor: 0,
         }),
-    );
+    )?;
     let after_journal = DurableSafeGcAuthority::open_with_journal(&journal, None)?;
+    assert!(reconcile_refcas_quorum_into_authority(&sm, repo_id, 9, &after_journal).is_err());
     reconcile_refcas_quorum_into_authority(&sm, repo_id, 7, &after_journal)?;
     assert!(after_journal.snapshot().paired_cursors.refcas_applied_index >= 7);
     let _ = authority;
