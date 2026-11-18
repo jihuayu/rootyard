@@ -346,6 +346,29 @@ class RepositoryLifecycleHarness(BrowserHarness):
         repo_b = self.create_repository({"owner": "alice", "name": "shared-b"}, token=self.alice)
         shared_oid = self.batch_upload("alice", "shared-a", shared_payload, self.alice)
         self.batch_upload("alice", "shared-b", shared_payload, self.alice)
+
+        peer_repo = self.create_repository({"owner": "charlie", "name": "purge-peer"}, token=self.charlie)
+        alice_tenant, peer_tenant = self.alice["user_id"], self.charlie["user_id"]
+        assert alice_tenant != peer_tenant
+        peer_payload = b"cross-tenant-purge-lfs-" * 64
+        alice_oid = self.batch_upload("alice", "shared-a", peer_payload, self.alice)
+        peer_oid = self.batch_upload("charlie", "purge-peer", peer_payload, self.charlie)
+        assert alice_oid == peer_oid == hashlib.sha256(peer_payload).hexdigest()
+        assert peer_oid != shared_oid
+        bindings = self.sql(
+            "SELECT repository_id::text || ':' || tenant_id::text || ':' || size::text || ':' || state "
+            f"FROM lfs_objects WHERE oid = {quote(peer_oid)}"
+        ).splitlines()
+        assert set(bindings) == {
+            f"{repo_a['id']}:{alice_tenant}:{len(peer_payload)}:ready",
+            f"{peer_repo['id']}:{peer_tenant}:{len(peer_payload)}:ready",
+        }
+        object_path = f"/info/lfs/objects/{peer_oid}/{len(peer_payload)}"
+        peer_download = f"/git/charlie/purge-peer.git{object_path}"
+        assert self.expect(f"/git/alice/shared-a.git{object_path}", 200, token=self.alice) == peer_payload
+        self.expect(peer_download, 404, token=self.alice)
+        assert self.expect(peer_download, 200, token=self.charlie) == peer_payload
+
         work_a = self.root / "shared-a-work"
         base_a = self.push_file("alice", "shared-a", work_a, "data.txt", "keep me\n", "main", "seed a", self.alice)
 
@@ -360,6 +383,14 @@ class RepositoryLifecycleHarness(BrowserHarness):
             extra_headers={"Idempotency-Key": "rename-shared-a"},
         )
 
+        repo_path = "/api/repos/alice/shared-a2"
+        issue_path = f"{repo_path}/issues"
+        issue_body = {"title": "Read-only collaborator must not create issues"}
+        self.expect(repo_path, 404, token=self.bob)
+        self.expect(f"{repo_path}/collaborators/bob", 201, token=self.alice, method="PUT", body={"role": "read"})
+        assert self.doc(repo_path, 200, token=self.bob)["id"] == repo_a["id"]
+        self.expect(issue_path, 403, token=self.bob, method="POST", body=issue_body)
+
         # Soft-delete with 7-day grace window hides repo & aliases across every surface.
         deleted_a = self.doc(
             "/api/repos/alice/shared-a2",
@@ -371,6 +402,8 @@ class RepositoryLifecycleHarness(BrowserHarness):
         )
         assert deleted_a["deleted"], deleted_a
         self.expect("/api/repos/alice/shared-a2", 404, token=self.alice)
+        self.expect(repo_path, 404, token=self.bob)
+        self.expect(issue_path, 404, token=self.bob, method="POST", body=issue_body)
         st_al, _, hdr_al = self.raw_http("/api/repos/alice/shared-a", token=self.alice)
         assert st_al == 404 and "location" not in hdr_al, (st_al, hdr_al)
         assert self.git("ls-remote", self.base + "/git/alice/shared-a2.git", token=self.alice, check=False).returncode != 0
@@ -399,6 +432,8 @@ class RepositoryLifecycleHarness(BrowserHarness):
         assert not restored["deleted"] and restored["version"] == deleted_a["version"] + 1, restored
         assert self.git("ls-remote", self.base + "/git/alice/shared-a2.git", "refs/heads/main", token=self.alice).stdout.decode().split()[0] == base_a
         assert self.expect(f"/git/alice/shared-a2.git/info/lfs/objects/{shared_oid}/{len(shared_payload)}", 200, token=self.alice) == shared_payload
+        assert self.doc(repo_path, 200, token=self.bob)["id"] == repo_a["id"]
+        self.expect(issue_path, 403, token=self.bob, method="POST", body=issue_body)
 
         # Re-delete with 0s grace period to test operational holds + fail-closed final purge.
         del_now = self.doc(
@@ -458,7 +493,13 @@ class RepositoryLifecycleHarness(BrowserHarness):
             200,
             token=self.alice,
         ) == shared_payload
-        return {"blocked_hold_kinds": sorted(hold_kinds), "purged_repo": repo_a["id"]}
+        assert self.expect(peer_download, 200, token=self.charlie) == peer_payload
+        return {
+            "blocked_hold_kinds": sorted(hold_kinds),
+            "purged_repo": repo_a["id"],
+            "restored_collaborator_role": "read",
+            "different_tenant_lfs_retained": True,
+        }
 
     def ownership_transfer_and_crash_recovery(self):
         org = self.doc("/api/orgs", 201, token=self.alice, method="POST", body={"slug": "dest-org"}, extra_headers={"Idempotency-Key": "org-dest"})
