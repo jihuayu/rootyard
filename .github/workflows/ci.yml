@@ -53,7 +53,8 @@ jobs:
         run: |
           scripts/install_ci_native_tools.sh install \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance test-results/ci-native-tools/provenance.json
+            --provenance test-results/ci-native-tools/provenance.json \
+            --phase-record test-results/ci-native-tools/phase.json
       - name: Verify native CI tool profile
         timeout-minutes: 5
         run: |
@@ -61,7 +62,8 @@ jobs:
           echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
           scripts/install_ci_native_tools.sh preflight \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance test-results/ci-native-tools/provenance.json
+            --provenance test-results/ci-native-tools/provenance.json \
+            --phase-record test-results/ci-native-tools/phase.json
       - name: Install pinned Rust 1.99.1 gate tools
         run: |
           rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
@@ -848,6 +850,7 @@ jobs:
             test-results/evidence/*.jsonl
             test-results/*-evidence/*.jsonl
             test-results/ci-native-tools/provenance.json
+            test-results/ci-native-tools/phase.json
           if-no-files-found: ignore
 
   container:
