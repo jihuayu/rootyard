@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Pure filesystem/mock tests for owned source witnesses."""
 from dataclasses import replace
+import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -79,6 +82,213 @@ class TestSourceParsers(unittest.TestCase):
         for text in ("anon_pipe_write\n", "pipe\n", ""):
             with self.assertRaises(source.SourceParseError):
                 source.parse_wchan(text)
+
+
+class TestOwnedStdoutPipeFullObservation(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.proc = Path(self.temp.name) / "proc"
+        self.path = self.proc / "100" / "fd" / "5"
+        self.path.parent.mkdir(parents=True)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _observe(self, *, unread=4096, capacity=4096, info=None,
+                 supported=True, open_error=None, stat_error=None,
+                 fcntl_error=None, close_error=None,
+                 expected_dev=42, expected_ino=700):
+        info = info or mock.Mock(
+            st_mode=stat.S_IFIFO | 0o600, st_dev=42, st_ino=700)
+
+        def ioctl(fd, request, buffer, mutate):
+            buffer[0] = unread
+            return buffer
+
+        def number(fd, request):
+            if fcntl_error is not None:
+                raise fcntl_error
+            return capacity
+
+        patches = [
+            mock.patch.object(source, "pipe_full_observation_supported",
+                              return_value=supported),
+            mock.patch.object(source.fcntl, "F_GETPIPE_SZ", 1032, create=True),
+            mock.patch.object(source.os, "open",
+                              side_effect=open_error, return_value=7),
+            mock.patch.object(source.os, "fstat",
+                              side_effect=stat_error, return_value=info),
+            mock.patch.object(source.fcntl, "fcntl", side_effect=number),
+            mock.patch.object(source.fcntl, "ioctl", side_effect=ioctl),
+        ]
+        with patches[0], patches[1], patches[2] as opened, patches[3], \
+                patches[4], patches[5], \
+                mock.patch.object(
+                    source.os, "close", side_effect=close_error) as closed:
+            result = source.observe_owned_stdout_pipe_full(
+                self.proc, 100, 5,
+                expected_dev=expected_dev, expected_ino=expected_ino)
+        return result, opened, closed
+
+    def test_full_observation_opens_nonblocking_cloexec_and_closes(self):
+        result, opened, closed = self._observe()
+        self.assertEqual(result, source.PIPE_FULL_PROVEN)
+        opened.assert_called_once_with(
+            self.path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        closed.assert_called_once_with(7)
+
+    def test_drain_one_byte_is_not_full_and_still_closes(self):
+        for unread in (0, 1, 4095):
+            with self.subTest(unread=unread):
+                result, _, closed = self._observe(unread=unread)
+                self.assertEqual(result, source.PIPE_FULL_NOT_FULL)
+                closed.assert_called_once_with(7)
+
+    def test_capacity_and_unread_must_be_positive_and_equal(self):
+        for unread, capacity in ((0, 4096), (4096, 0), (4096, -1)):
+            with self.subTest(unread=unread, capacity=capacity):
+                result, _, closed = self._observe(
+                    unread=unread, capacity=capacity)
+                self.assertIn(result, (source.PIPE_FULL_NOT_FULL,
+                                       source.PIPE_FULL_UNAVAILABLE))
+                closed.assert_called_once_with(7)
+
+    def test_endpoint_mismatch_and_non_fifo_are_not_proof(self):
+        for info in (
+            mock.Mock(st_mode=stat.S_IFIFO | 0o600, st_dev=42, st_ino=701),
+            mock.Mock(st_mode=stat.S_IFIFO | 0o600, st_dev=43, st_ino=700),
+            mock.Mock(st_mode=stat.S_IFREG | 0o600, st_dev=42, st_ino=700),
+        ):
+            with self.subTest(info=info):
+                result, _, closed = self._observe(info=info)
+                self.assertEqual(result, source.PIPE_FULL_MISMATCH)
+                closed.assert_called_once_with(7)
+
+    def test_unavailable_observations_never_retain_a_reader(self):
+        for kwargs, open_attempted in (
+            ({"expected_dev": None}, False),
+            ({"expected_ino": 0}, False),
+            ({"supported": False}, False),
+            ({"open_error": OSError(13, "denied")}, True),
+        ):
+            with self.subTest(kwargs=kwargs):
+                result, opened, closed = self._observe(**kwargs)
+                self.assertEqual(result, source.PIPE_FULL_UNAVAILABLE)
+                if open_attempted:
+                    opened.assert_called_once()
+                else:
+                    opened.assert_not_called()
+                closed.assert_not_called()
+
+    def test_close_failure_never_reports_full_pipe(self):
+        result, _, closed = self._observe(
+            close_error=OSError(9, "descriptor already gone"))
+        self.assertEqual(result, source.PIPE_FULL_UNAVAILABLE)
+        closed.assert_called_once_with(7)
+
+    def test_zero_pipe_device_is_still_a_bound_identity(self):
+        info = mock.Mock(st_mode=stat.S_IFIFO | 0o600, st_dev=0, st_ino=700)
+        result, opened, closed = self._observe(info=info, expected_dev=0)
+        self.assertEqual(result, source.PIPE_FULL_PROVEN)
+        opened.assert_called_once()
+        closed.assert_called_once_with(7)
+
+    def test_errors_after_open_close_the_observation_fd(self):
+        for kwargs in (
+            {"stat_error": OSError(5, "io")},
+            {"fcntl_error": OSError(22, "bad ioctl")},
+        ):
+            with self.subTest(kwargs=kwargs):
+                result, _, closed = self._observe(**kwargs)
+                self.assertEqual(result, source.PIPE_FULL_UNAVAILABLE)
+                closed.assert_called_once_with(7)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and source.pipe_full_observation_supported(),
+        "observed full-pipe proof is Linux-only; mocks cover non-Linux hosts")
+    def test_linux_controlled_pipe_observation_does_not_consume_bytes(self):
+        import termios
+        from array import array
+
+        read_fd, write_fd = os.pipe()
+        try:
+            capacity = fcntl.fcntl(read_fd, fcntl.F_GETPIPE_SZ)
+            self.assertGreater(capacity, 0)
+            os.set_blocking(write_fd, False)
+            written = 0
+            while written < capacity:
+                try:
+                    chunk = os.write(write_fd, b"x" * (capacity - written))
+                except BlockingIOError:
+                    break
+                self.assertGreater(chunk, 0)
+                written += chunk
+            self.assertEqual(written, capacity)
+            unread_before = array("i", [0])
+            fcntl.ioctl(read_fd, termios.FIONREAD, unread_before, True)
+            self.assertEqual(unread_before[0], capacity)
+            info = os.fstat(read_fd)
+            pid_dir = self.proc / str(os.getpid()) / "fd"
+            pid_dir.mkdir(parents=True)
+            (pid_dir / "9").symlink_to(f"/proc/self/fd/{read_fd}")
+            result = source.observe_owned_stdout_pipe_full(
+                self.proc, os.getpid(), 9,
+                expected_dev=info.st_dev, expected_ino=info.st_ino)
+            self.assertEqual(result, source.PIPE_FULL_PROVEN)
+            unread_after = array("i", [0])
+            fcntl.ioctl(read_fd, termios.FIONREAD, unread_after, True)
+            self.assertEqual(unread_after[0], unread_before[0])
+            drained = 0
+            while drained < capacity:
+                chunk = os.read(read_fd, capacity - drained)
+                self.assertGreater(len(chunk), 0)
+                drained += len(chunk)
+            self.assertEqual(drained, capacity)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and source.pipe_full_observation_supported(),
+        "observed full-pipe proof is Linux-only; mocks cover non-Linux hosts")
+    def test_linux_draining_one_byte_rejects_the_second_proof(self):
+        import termios
+        from array import array
+
+        read_fd, write_fd = os.pipe()
+        try:
+            capacity = fcntl.fcntl(read_fd, fcntl.F_GETPIPE_SZ)
+            os.set_blocking(write_fd, False)
+            written = 0
+            while written < capacity:
+                try:
+                    chunk = os.write(write_fd, b"x" * (capacity - written))
+                except BlockingIOError:
+                    break
+                self.assertGreater(chunk, 0)
+                written += chunk
+            self.assertEqual(written, capacity)
+            self.assertEqual(os.read(read_fd, 1), b"x")
+            info = os.fstat(read_fd)
+            pid_dir = self.proc / str(os.getpid()) / "fd"
+            pid_dir.mkdir(parents=True)
+            (pid_dir / "9").symlink_to(f"/proc/self/fd/{read_fd}")
+            result = source.observe_owned_stdout_pipe_full(
+                self.proc, os.getpid(), 9,
+                expected_dev=info.st_dev, expected_ino=info.st_ino)
+            self.assertEqual(result, source.PIPE_FULL_NOT_FULL)
+            unread = array("i", [0])
+            fcntl.ioctl(read_fd, termios.FIONREAD, unread, True)
+            self.assertEqual(unread[0], capacity - 1)
+            drained = 0
+            while drained < capacity - 1:
+                chunk = os.read(read_fd, capacity - 1 - drained)
+                self.assertGreater(len(chunk), 0)
+                drained += len(chunk)
+            self.assertEqual(drained, capacity - 1)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
 
 
 class TestLfsSourceWitness(unittest.TestCase):
@@ -339,6 +549,14 @@ class TestGitSourceWitness(unittest.TestCase):
         link.symlink_to(f"pipe:[{pipe_inode}]")
         _fdinfo(self.proc / "200" / "fdinfo" / "1", pos=0,
                 flags=1 if fd == 1 else 2, ino=0)
+        task_fd_dir = task / "fd"
+        task_fd_dir.mkdir(parents=True, exist_ok=True)
+        task_link = task_fd_dir / "1"
+        if task_link.exists() or task_link.is_symlink():
+            task_link.unlink()
+        task_link.symlink_to(f"pipe:[{pipe_inode}]")
+        _fdinfo(task / "fdinfo" / "1", pos=0,
+                flags=1 if fd == 1 else 2, ino=0)
 
     def test_sleeping_write_to_owned_stdout_pipe_qualifies(self):
         self.assertTrue(self.witness.bind())
@@ -388,6 +606,324 @@ class TestGitSourceWitness(unittest.TestCase):
         report = self.witness.sample()
         self.assertTrue(report["qualified"])
         self.assertEqual(report["source_syscall_kind_code"], 2)
+        self.assertEqual(report["source_proof_kind_code"],
+                         source.SOURCE_PROOF_KIND_PIPE_WRITE_SLEEP)
+        self.assertFalse(report["source_pipe_full"])
+
+    def test_pipe_write_proof_does_not_open_a_second_reader(self):
+        self.assertTrue(self.witness.bind())
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full") as observed:
+            report = self.witness.sample()
+        self.assertTrue(report["qualified"])
+        self.assertEqual(report["source_proof_kind_code"],
+                         source.SOURCE_PROOF_KIND_PIPE_WRITE_SLEEP)
+        observed.assert_not_called()
+
+    def _second_writer(self, *, tid=202, starttime=63, wchan="0\n",
+                       syscall="1 0x1 0x2 0x10 0x0 0x0 0x0"):
+        task = self.proc / "200" / "task" / str(tid)
+        _write(task / "stat", _stat_text(tid, "git", ppid=200, pgid=200,
+                                         starttime=starttime))
+        _write(task / "syscall", syscall)
+        _write(task / "wchan", wchan)
+
+    def test_initial_bind_requires_pipe_write_not_zero_wchan(self):
+        self._task_files(wchan="0\n")
+        witness = git_source.GitSourceWitness(
+            self.service_pid, [self.identity], proc_root=self.proc)
+        self.assertFalse(witness.bind())
+        self.assertEqual(witness.fatal_failure_code, source.SOURCE_FAILURE_NONE)
+        self.assertEqual(witness.failure_code, source.SOURCE_FAILURE_NO_CANDIDATE)
+        self._task_files(wchan="pipe_write\n")
+        self.assertTrue(witness.bind())
+
+    def test_zero_wchan_full_owned_stdout_pipe_is_positive_proof(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        self.witness.writer.service_dev = 42
+        with mock.patch.object(
+                git_source, "_read_pipe_stat",
+                return_value=git_source._PipeInfo(dev=42, ino=self.pipe_inode)), \
+                mock.patch.object(
+                    git_source, "observe_owned_stdout_pipe_full",
+                    return_value=source.PIPE_FULL_PROVEN) as observed:
+            report = self.witness.sample()
+        self.assertTrue(report["qualified"])
+        self.assertEqual(report["source_proof_kind_code"],
+                         source.SOURCE_PROOF_KIND_OWNED_STDOUT_PIPE_FULL)
+        self.assertTrue(report["source_pipe_full"])
+        self.assertEqual(report["failure_code"], source.SOURCE_FAILURE_NONE)
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_NONE)
+        self.assertNotIn("wchan_shape", report)
+        self.assertNotIn("wchan_writer_recheck", report)
+        observed.assert_called_once_with(
+            self.proc, self.service_pid, 5,
+            expected_dev=42, expected_ino=self.pipe_inode)
+        serialized = json.dumps(report)
+        for raw in (str(self.proc), "pipe:[", "[700]", "0x", "wchan"):
+            self.assertNotIn(raw, serialized)
+
+    def test_writev_zero_wchan_never_uses_full_pipe_fallback(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(
+            wchan="0\n", syscall="20 0x1 0x2 0x3 0x0 0x0 0x0")
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                return_value=source.PIPE_FULL_PROVEN) as observed:
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_NONE)
+        self.assertEqual(report["failure_code"], source.SOURCE_FAILURE_SYSCALL)
+        self.assertEqual(report["source_proof_kind_code"],
+                         source.SOURCE_PROOF_KIND_NONE)
+        observed.assert_not_called()
+
+    def test_write_to_writev_swap_after_probe_is_not_a_sample(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        self.witness.writer.service_dev = 42
+
+        def swap_then_prove(*args, **kwargs):
+            self._task_files(
+                wchan="0\n", syscall="20 0x1 0x2 0x3 0x0 0x0 0x0")
+            return source.PIPE_FULL_PROVEN
+
+        with mock.patch.object(
+                git_source, "_read_pipe_stat",
+                return_value=git_source._PipeInfo(dev=42, ino=self.pipe_inode)), \
+                mock.patch.object(
+                    git_source, "observe_owned_stdout_pipe_full",
+                    side_effect=swap_then_prove) as observed:
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_NONE)
+        self.assertEqual(report["failure_code"], source.SOURCE_FAILURE_SYSCALL)
+        self.assertEqual(report["source_proof_kind_code"],
+                         source.SOURCE_PROOF_KIND_NONE)
+        observed.assert_called_once()
+
+    def test_task_specific_stdout_fd_replacement_blocks_fallback(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        link = self.proc / "200" / "task" / "201" / "fd" / "1"
+        link.unlink()
+        link.symlink_to("pipe:[701]")
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                return_value=source.PIPE_FULL_PROVEN) as observed:
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_PIPE)
+        observed.assert_not_called()
+
+    def test_bound_service_dev_change_blocks_fallback(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        self.witness.writer.service_dev = 42
+        with mock.patch.object(
+                git_source, "_read_pipe_stat",
+                return_value=git_source._PipeInfo(dev=43, ino=self.pipe_inode)), \
+                mock.patch.object(
+                    git_source, "observe_owned_stdout_pipe_full",
+                    return_value=source.PIPE_FULL_PROVEN) as observed:
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_PIPE)
+        observed.assert_not_called()
+
+    def test_bound_service_dev_change_after_probe_blocks_proof(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        self.witness.writer.service_dev = 42
+        changed = [False]
+
+        def service_pipe(*args, **kwargs):
+            return git_source._PipeInfo(
+                dev=43 if changed[0] else 42, ino=self.pipe_inode)
+
+        def change_then_prove(*args, **kwargs):
+            changed[0] = True
+            return source.PIPE_FULL_PROVEN
+
+        with mock.patch.object(
+                git_source, "_read_pipe_stat", side_effect=service_pipe), \
+                mock.patch.object(
+                    git_source, "observe_owned_stdout_pipe_full",
+                    side_effect=change_then_prove):
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_PIPE)
+        self.assertEqual(report["source_proof_kind_code"],
+                         source.SOURCE_PROOF_KIND_NONE)
+
+    def test_unreadable_census_fd_link_fails_closed(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        path = self.proc / "200" / "fd" / "1"
+        path.unlink()
+        path.mkdir()
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                return_value=source.PIPE_FULL_PROVEN) as observed:
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"],
+                         source.SOURCE_FAILURE_UNOBSERVABLE)
+        observed.assert_not_called()
+
+    def test_unreadable_census_fdinfo_fails_closed(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        path = self.proc / "200" / "fdinfo" / "1"
+        path.unlink()
+        path.mkdir()
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                return_value=source.PIPE_FULL_PROVEN) as observed:
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"],
+                         source.SOURCE_FAILURE_UNOBSERVABLE)
+        observed.assert_not_called()
+
+    def test_second_zero_wchan_writer_makes_census_ambiguous_and_sticky(self):
+        self.assertTrue(self.witness.bind())
+        self._second_writer(wchan="0\n")
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                return_value=source.PIPE_FULL_PROVEN) as observed:
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_TASK)
+        observed.assert_not_called()
+        shutil.rmtree(self.proc / "200" / "task" / "202")
+        self.assertFalse(self.witness.sample()["qualified"],
+                         "an ambiguous writer census must remain fatal")
+
+    def test_second_zero_wchan_writer_blocks_initial_bind(self):
+        self._second_writer(wchan="0\n")
+        witness = git_source.GitSourceWitness(
+            self.service_pid, [self.identity], proc_root=self.proc)
+        self.assertFalse(witness.bind())
+        self.assertEqual(witness.fatal_failure_code, source.SOURCE_FAILURE_TASK)
+
+    def test_full_pipe_not_full_is_transient_and_recovers_from_new_window(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                return_value=source.PIPE_FULL_NOT_FULL):
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_NONE)
+        self.assertEqual(report["failure_code"],
+                         source.SOURCE_FAILURE_PIPE_NOT_FULL)
+        self.assertEqual(report["source_proof_kind_code"],
+                         source.SOURCE_PROOF_KIND_NONE)
+        self.assertFalse(report["source_pipe_full"])
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                return_value=source.PIPE_FULL_PROVEN):
+            report = self.witness.sample()
+        self.assertTrue(report["qualified"])
+        self.assertEqual(report["source_proof_kind_code"],
+                         source.SOURCE_PROOF_KIND_OWNED_STDOUT_PIPE_FULL)
+
+    def test_full_pipe_unavailable_keeps_fatal_wchan_diagnostics(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                return_value=source.PIPE_FULL_UNAVAILABLE):
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"],
+                         source.SOURCE_FAILURE_WCHAN)
+        self.assertEqual(report["wchan_shape"], "zero")
+        self.assertEqual(report["wchan_writer_recheck"],
+                         "same_writer_sleeping_in_stdout_write")
+
+    def test_full_pipe_probe_detects_stdout_endpoint_replacement(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+
+        def replace_then_prove(*args, **kwargs):
+            self._task_files(pipe_inode=701, wchan="0\n")
+            return source.PIPE_FULL_PROVEN
+
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                side_effect=replace_then_prove):
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_PIPE)
+        self._task_files(wchan="pipe_write\n")
+        self.assertFalse(self.witness.sample()["qualified"],
+                         "a replaced stdout endpoint must not be adopted back")
+
+    def test_service_read_endpoint_replacement_blocks_the_probe(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        link = self.proc / "100" / "fd" / "5"
+        link.unlink()
+        link.symlink_to("pipe:[701]")
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                return_value=source.PIPE_FULL_PROVEN) as observed:
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_PIPE)
+        observed.assert_not_called()
+
+    def test_two_owned_service_read_endpoints_block_the_probe(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        fd_dir = self.proc / "100" / "fd"
+        (fd_dir / "6").symlink_to(f"pipe:[{self.pipe_inode}]")
+        _fdinfo(self.proc / "100" / "fdinfo" / "6", pos=0, flags=0, ino=0)
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                return_value=source.PIPE_FULL_PROVEN) as observed:
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_PIPE)
+        observed.assert_not_called()
+
+    def test_full_pipe_probe_after_wake_is_not_positive_proof(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+
+        def wake_then_prove(*args, **kwargs):
+            self._task_files(wchan="0\n", syscall="running")
+            return source.PIPE_FULL_PROVEN
+
+        with mock.patch.object(
+                git_source, "observe_owned_stdout_pipe_full",
+                side_effect=wake_then_prove):
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_NONE)
+        self.assertEqual(report["failure_code"],
+                         source.SOURCE_FAILURE_NO_BLOCKED_WRITER)
+        self.assertEqual(report["source_proof_kind_code"],
+                         source.SOURCE_PROOF_KIND_NONE)
+
+    def test_single_full_pipe_sample_does_not_relax_sustained_window(self):
+        window = revocation_backpressure.SustainedStallWindow(
+            500_000_000, max_gap_ns=100_000_000
+        )
+        for now in range(0, 300_000_000, 20_000_000):
+            window.observe(_window_sample(now, True), now)
+        self.assertFalse(window.qualified)
+        window.observe(_window_sample(300_000_000, False), 300_000_000)
+        self.assertFalse(window.qualified)
+        for offset in range(0, 501_000_000, 20_000_000):
+            now = 320_000_000 + offset
+            window.observe(_window_sample(now, True), now)
+            if offset < 500_000_000:
+                self.assertFalse(window.qualified)
+        self.assertTrue(window.qualified)
 
     def test_no_candidate_then_blocked_writer_recovers_and_window_qualifies(self):
         self._task_files(syscall="running")
