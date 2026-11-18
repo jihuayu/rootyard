@@ -125,20 +125,26 @@ class GitSourceWitness:
                 if entry.name.isdigit():
                     yield tgid, int(entry.name)
 
-    def _task_stat(self, tgid, tid):
-        path = self.proc_root / str(tgid) / "task" / str(tid) / "stat"
+    def _read_stat(self, path, expected_pid):
         try:
-            return parse_proc_stat(path.read_text(encoding="utf-8"), pid=tid)
+            task = parse_proc_stat(path.read_text(encoding="utf-8"))
+            if task.pid != expected_pid:
+                raise ValueError("proc stat PID mismatch")
+            return task
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as error:
             raise SourceParseError("task metadata unavailable") from error
 
+    def _task_stat(self, tgid, tid):
+        path = self.proc_root / str(tgid) / "task" / str(tid) / "stat"
+        return self._read_stat(path, tid)
+
     def _task_text(self, tgid, tid, name):
         path = self.proc_root / str(tgid) / "task" / str(tid) / name
         try:
             return path.read_text(encoding="utf-8")
-        except OSError as error:
+        except (OSError, UnicodeDecodeError) as error:
             raise SourceParseError(f"task {name} unavailable") from error
 
     def _syscall_state(self, text):
@@ -245,6 +251,23 @@ class GitSourceWitness:
             if task.starttime != writer.starttime or task.pgid != group.pgid:
                 return "identity_changed"
             if task.state == "R":
+                service = self._read_stat(
+                    self.proc_root / str(self.service_pid) / "stat", self.service_pid
+                )
+                leader = self._read_stat(
+                    self.proc_root / str(group.leader_pid) / "stat", group.leader_pid
+                )
+                if service is None or leader is None:
+                    return "unavailable"
+                if (service.starttime != self.service_identity.starttime or not service.live
+                        or leader.starttime != group.leader_starttime
+                        or leader.pgid != group.pgid or not leader.live):
+                    return "identity_changed"
+                pipe_failure = self._pipe_failure(writer, verify_fdinfo_inode=True)
+                if pipe_failure == SOURCE_FAILURE_PIPE:
+                    return "identity_changed"
+                if pipe_failure:
+                    return "unavailable"
                 return "same_writer_running"
             if task.state in ("S", "D"):
                 state = self._syscall_state(self._task_text(writer.tgid, writer.tid, "syscall"))
@@ -254,17 +277,7 @@ class GitSourceWitness:
             return "unavailable"
         return "same_writer_other"
 
-    def _sample_writer(self, group):
-        writer = self.writer
-        if writer is None:
-            return False
-        task = self._task_stat(writer.tgid, writer.tid)
-        if task is None:
-            self._fatal(SOURCE_FAILURE_TASK)
-            return False
-        if task.starttime != writer.starttime or task.pgid != group.pgid:
-            self._fatal(SOURCE_FAILURE_TASK)
-            return False
+    def _pipe_failure(self, writer, *, verify_fdinfo_inode=False):
         try:
             pipe_inode = read_pipe_inode(self.proc_root, writer.tgid, 1)
             fd_info = read_fdinfo(self.proc_root, writer.tgid, 1)
@@ -275,13 +288,27 @@ class GitSourceWitness:
                 self.proc_root, self.service_pid, writer.service_fd
             )
         except (OSError, SourceParseError):
-            self._fatal(SOURCE_FAILURE_UNOBSERVABLE)
-            return False
+            return SOURCE_FAILURE_UNOBSERVABLE
         if (pipe_inode != writer.pipe_inode
                 or service_inode != writer.pipe_inode
                 or (fd_info.flags & os.O_ACCMODE) != os.O_WRONLY
                 or (service_info.flags & os.O_ACCMODE) != os.O_RDONLY):
-            self._fatal(SOURCE_FAILURE_PIPE)
+            return SOURCE_FAILURE_PIPE
+        if verify_fdinfo_inode and (fd_info.ino != pipe_inode or service_info.ino != service_inode):
+            return SOURCE_FAILURE_PIPE
+        return SOURCE_FAILURE_NONE
+
+    def _sample_writer(self, group):
+        writer = self.writer
+        if writer is None:
+            return False
+        task = self._task_stat(writer.tgid, writer.tid)
+        if task is None or task.starttime != writer.starttime or task.pgid != group.pgid:
+            self._fatal(SOURCE_FAILURE_TASK)
+            return False
+        pipe_failure = self._pipe_failure(writer)
+        if pipe_failure:
+            self._fatal(pipe_failure)
             return False
         if task.state not in ("S", "D"):
             self._transient(SOURCE_FAILURE_WRITER_RUNNING)
@@ -296,10 +323,16 @@ class GitSourceWitness:
                 return False
             wchan_text = self._task_text(writer.tgid, writer.tid, "wchan").strip()
             if not wchan_text or wchan_text == "0":
+                recheck = self._recheck_wchan_writer(writer, group)
+                if recheck == "same_writer_running":
+                    # The separate proc reads straddled a state change. Drop
+                    # this sample; only later positive samples can qualify.
+                    self._transient(SOURCE_FAILURE_WRITER_RUNNING)
+                    return False
                 self._fatal(SOURCE_FAILURE_WCHAN)
                 self._wchan_diagnostic = {
                     "wchan_shape": "zero" if wchan_text else "empty",
-                    "wchan_writer_recheck": self._recheck_wchan_writer(writer, group),
+                    "wchan_writer_recheck": recheck,
                 }
                 return False
             try:
