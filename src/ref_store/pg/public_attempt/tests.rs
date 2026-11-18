@@ -1,5 +1,6 @@
 use super::{
-    PublicAttemptLookup, PublicAttemptRequest, RawAttempt, RawSnapshot, RawWrapper, SELECT_SNAPSHOT, evaluate,
+    PublicAttemptLookup, PublicAttemptRequest, PublicOperationReadAuthorization, PublicOperationStatusLookup,
+    PublicOperationStatusRequest, RawAttempt, RawSnapshot, RawWrapper, SELECT_SNAPSHOT, evaluate, evaluate_status,
 };
 use crate::ref_store::{
     CommitMode, GitObjectFormat, OperationState, RefStoreError, RequestDigest,
@@ -93,6 +94,22 @@ fn request() -> PublicAttemptRequest {
         authority_epoch: 1,
         group_epoch: 2,
         restore_incarnation: restore(),
+    }
+}
+
+fn status_request() -> PublicOperationStatusRequest {
+    PublicOperationStatusRequest {
+        repository_id: repo(),
+        public_id: public(),
+        authorization: PublicOperationReadAuthorization::LiveIssuer { issuer_id: issuer() },
+    }
+}
+
+fn admin_status_request() -> PublicOperationStatusRequest {
+    PublicOperationStatusRequest {
+        repository_id: repo(),
+        public_id: public(),
+        authorization: PublicOperationReadAuthorization::RepositoryAdmin,
     }
 }
 
@@ -234,6 +251,15 @@ fn assert_identity_conflict(result: Result<PublicAttemptLookup, PackCommitError>
 
 fn assert_digest_conflict(result: Result<PublicAttemptLookup, PackCommitError>) {
     assert!(matches!(result, Err(PackCommitError::RefStore(RefStoreError::DigestConflict))));
+}
+
+fn assert_status_ledger(result: Result<PublicOperationStatusLookup, PackCommitError>) {
+    match result {
+        Err(PackCommitError::Rejected(rejection)) => {
+            assert_eq!(rejection.code, PackCommitRejectCode::LedgerIntegrity);
+        }
+        other => panic!("expected status ledger integrity, got {other:?}"),
+    }
 }
 
 #[test]
@@ -584,6 +610,183 @@ fn stored_wrapper_and_attempt_evidence_is_fail_closed() {
     let mut bad_operation_state = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
     bad_operation_state.operation_state = Some("unknown".into());
     assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![bad_operation_state]), &request()));
+}
+
+#[test]
+fn status_returns_only_the_current_public_state() {
+    let pending = evaluate_status(
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &status_request(),
+    )
+    .expect("valid pending status");
+    match pending {
+        PublicOperationStatusLookup::Found(status) => {
+            assert_eq!(status.public_id, public());
+            assert_eq!(status.state, OperationState::Pending);
+        }
+        other => panic!("expected pending status, got {other:?}"),
+    }
+
+    let committed = evaluate_status(snapshot(wrapper(0, "committed"), vec![committed_attempt()]), &status_request())
+        .expect("valid committed status");
+    match committed {
+        PublicOperationStatusLookup::Found(status) => {
+            assert_eq!(status.public_id, public());
+            assert_eq!(status.state, OperationState::Committed);
+        }
+        other => panic!("expected committed status, got {other:?}"),
+    }
+
+    let cancelled = evaluate_status(snapshot(wrapper(0, "cancelled"), vec![cancelled_attempt()]), &status_request())
+        .expect("valid cancelled status");
+    assert!(matches!(
+        cancelled,
+        PublicOperationStatusLookup::Found(status) if status.state == OperationState::Cancelled
+    ));
+}
+
+#[test]
+fn status_requires_the_exact_live_issuer_or_a_caller_resolved_admin_policy() {
+    let mut other_issuer = status_request();
+    other_issuer.authorization = PublicOperationReadAuthorization::LiveIssuer { issuer_id: private1() };
+    assert!(matches!(
+        evaluate_status(
+            snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+            &other_issuer,
+        )
+        .expect("data-free forbidden marker"),
+        PublicOperationStatusLookup::Forbidden
+    ));
+
+    let admin = evaluate_status(
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &admin_status_request(),
+    )
+    .expect("caller-resolved admin policy");
+    assert!(matches!(
+        admin,
+        PublicOperationStatusLookup::Found(status)
+            if status.public_id == public() && status.state == OperationState::Pending
+    ));
+}
+
+#[test]
+fn status_markers_preserve_unknown_legacy_and_private_routes() {
+    let mut private = empty_snapshot();
+    private.private_occupied = true;
+    private.legacy_operation = true;
+    private.legacy_cancellation = true;
+    assert!(matches!(
+        evaluate_status(private, &status_request()).expect("private marker"),
+        PublicOperationStatusLookup::PrivateIdentifier
+    ));
+
+    let mut legacy = empty_snapshot();
+    legacy.legacy_operation = true;
+    assert!(matches!(
+        evaluate_status(legacy, &status_request()).expect("legacy marker"),
+        PublicOperationStatusLookup::LegacyPath
+    ));
+
+    assert!(matches!(
+        evaluate_status(empty_snapshot(), &status_request()).expect("unknown marker"),
+        PublicOperationStatusLookup::Unknown
+    ));
+
+    let mut private_alias =
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
+    private_alias.private_occupied = true;
+    assert_status_ledger(evaluate_status(private_alias, &status_request()));
+}
+
+#[test]
+fn status_reuses_terminal_event_attempt_and_realm_integrity() {
+    let mut wrong_body = committed_attempt();
+    wrong_body.event_body_matches = false;
+    assert_status_ledger(evaluate_status(snapshot(wrapper(0, "committed"), vec![wrong_body]), &status_request()));
+
+    let mut pending_with_terminal = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    pending_with_terminal.operation_state = Some("committed".into());
+    pending_with_terminal.terminal_present = true;
+    pending_with_terminal.event_id = Some(event1());
+    pending_with_terminal.event_revision = Some(2);
+    pending_with_terminal.event_outcome_matches = true;
+    pending_with_terminal.event_body_matches = true;
+    assert_status_ledger(evaluate_status(
+        snapshot(wrapper(0, "pending"), vec![pending_with_terminal]),
+        &status_request(),
+    ));
+
+    let mut stale = snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
+    stale.realm_matches = false;
+    assert_status_ledger(evaluate_status(stale, &status_request()));
+
+    let mut unbound = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    unbound.serving_bound = false;
+    assert_status_ledger(evaluate_status(snapshot(wrapper(0, "pending"), vec![unbound]), &status_request()));
+}
+
+#[test]
+fn status_checks_stored_immutable_digest_and_mode_without_a_push_request() {
+    let attempt = || vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)];
+
+    let mut bad_wire = wrapper(0, "pending");
+    bad_wire.wire_digest = "not-a-wire-digest".into();
+    assert_status_ledger(evaluate_status(snapshot(bad_wire, attempt()), &status_request()));
+
+    let mut bad_mode = wrapper(0, "pending");
+    bad_mode.request_mode = "unknown".into();
+    assert_status_ledger(evaluate_status(snapshot(bad_mode, attempt()), &status_request()));
+
+    let mut bad_backend = wrapper(0, "pending");
+    bad_backend.backend_identity = "not-a-backend".into();
+    assert_status_ledger(evaluate_status(snapshot(bad_backend, attempt()), &status_request()));
+
+    let mut bad_state = wrapper(0, "pending");
+    bad_state.state = "unknown".into();
+    assert_status_ledger(evaluate_status(snapshot(bad_state, attempt()), &status_request()));
+}
+
+#[test]
+fn status_request_shape_and_debug_are_bounded_and_redacted() {
+    let mut nil_repo = status_request();
+    nil_repo.repository_id = Uuid::nil();
+    assert!(matches!(nil_repo.validate(), Err(PackCommitError::Invalid(_))));
+
+    let mut nil_public = status_request();
+    nil_public.public_id = Uuid::nil();
+    assert!(matches!(nil_public.validate(), Err(PackCommitError::Invalid(_))));
+
+    let mut nil_issuer = status_request();
+    nil_issuer.authorization = PublicOperationReadAuthorization::LiveIssuer { issuer_id: Uuid::nil() };
+    assert!(matches!(nil_issuer.validate(), Err(PackCommitError::Invalid(_))));
+    assert!(admin_status_request().validate().is_ok());
+
+    let found = evaluate_status(
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &status_request(),
+    )
+    .expect("valid pending status");
+    let debug = format!("{found:?}");
+    for secret in [
+        public().to_string(),
+        private0().to_string(),
+        plan0().as_hex(),
+        proof0().as_hex(),
+        wire().as_hex(),
+        event0().to_string(),
+    ] {
+        assert!(!debug.contains(secret.as_str()), "status Debug leaked {secret}");
+    }
+    assert!(debug.contains("Found"));
+    assert!(debug.contains("Pending"));
+
+    let request_debug = format!("{:?}", status_request());
+    for secret in [repo().to_string(), public().to_string(), issuer().to_string()] {
+        assert!(!request_debug.contains(secret.as_str()), "status request Debug leaked {secret}");
+    }
+    assert!(request_debug.contains("LiveIssuer"));
+    assert_eq!(format!("{:?}", PublicOperationReadAuthorization::RepositoryAdmin), "RepositoryAdmin");
 }
 
 #[test]
