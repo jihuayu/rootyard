@@ -7934,25 +7934,31 @@ class Phase1ClosureAndDocsFixture:
     def ci_build_native_batch_tokens(commands: list[list[str]]) -> list[str]:
         """Return the single native batch build command from CI run commands."""
         prefix = list(Phase1ClosureAndDocsFixture.NATIVE_BATCH_COMMAND)
-        references = [
-            tokens
-            for tokens in commands
-            if any("build_native_batch.py" in token for token in tokens)
-        ]
-        matches = [tokens for tokens in references if tokens[:2] == prefix]
+        builder_modules = {"build_native_batch", "scripts.build_native_batch"}
+        compact_module_options = {f"-m{module}" for module in builder_modules}
+        references = []
+        for tokens in commands:
+            positions = [
+                index for index, token in enumerate(tokens)
+                if "build_native_batch.py" in token
+                or token in compact_module_options
+                or (index > 0 and tokens[index - 1] == "-m" and token in builder_modules)
+            ]
+            if positions:
+                references.append((tokens, positions))
+        matches = [tokens for tokens, _ in references if tokens[:2] == prefix]
         # A `--harness scripts/build_native_batch.py` binding in the native
         # manifest is not a command invocation; only the python3 command counts.
         unexpected = [
             tokens
-            for tokens in references
+            for tokens, positions in references
             if tokens[:2] != prefix
             and not (
                 tokens[:2] == ["python3", "scripts/native_report_manifest.py"]
                 and not any(re.fullmatch(r"[;&|]+", token) for token in tokens)
                 and all(
-                    token == prefix[1] and tokens[index - 1] == "--harness"
-                    for index, token in enumerate(tokens[2:], start=2)
-                    if "build_native_batch.py" in token
+                    index > 2 and tokens[index] == prefix[1] and tokens[index - 1] == "--harness"
+                    for index in positions
                 )
             )
         ]

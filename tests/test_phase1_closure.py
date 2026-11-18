@@ -185,6 +185,9 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         bad_commands = (
             f"python3 {builder} --all-bins",
             f"python {builder} --all-bins",
+            "python3 -m build_native_batch",
+            "python3 -m scripts.build_native_batch",
+            "python3 -mbuild_native_batch",
             f"python3 scripts/native_report_manifest.py --harness {builder} && python3 {builder}",
             f"python3 scripts/native_report_manifest.py --binary {builder}",
         )
