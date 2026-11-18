@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Pure filesystem/mock tests for owned source witnesses."""
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -350,6 +351,36 @@ class TestGitSourceWitness(unittest.TestCase):
         self.assertNotIn(str(self.proc), serialized)
         self.assertNotIn("0x", serialized)
         self.assertNotIn("pipe_write", serialized)
+        self.assertNotIn("wchan_shape", report)
+        self.assertNotIn("wchan_writer_recheck", report)
+
+    def test_missing_wchan_diagnoses_once_and_stays_fatal(self):
+        for wchan, state, starttime, expected in (
+            (" \n", "R", 61, "same_writer_running"),
+            ("0\n", "S", 61, "same_writer_sleeping_in_stdout_write"),
+            ("0\n", "T", 61, "same_writer_other"),
+            ("0\n", "R", 62, "identity_changed"),
+            ("0\n", None, 61, "unavailable"),
+        ):
+            with self.subTest(expected=expected):
+                self._task_files()
+                witness = git_source.GitSourceWitness(
+                    self.service_pid, [self.identity], proc_root=self.proc)
+                self.assertTrue(witness.bind())
+                task = witness._task_stat(self.tgid, self.tid)
+                recheck = None if state is None else replace(
+                    task, state=state, starttime=starttime)
+                self._task_files(wchan=wchan)
+                with mock.patch.object(witness, "_task_stat", side_effect=[task, recheck]) as read:
+                    report = witness.sample()
+                    self._task_files()
+                    self.assertEqual(witness.sample(), report)
+                self.assertEqual(read.call_args_list, [mock.call(self.tgid, self.tid)] * 2)
+                self.assertFalse(report["qualified"])
+                self.assertEqual(report["failure_code"], source.SOURCE_FAILURE_WCHAN)
+                self.assertEqual(report["fatal_failure_code"], source.SOURCE_FAILURE_WCHAN)
+                self.assertEqual(report["wchan_shape"], "zero" if wchan.strip() else "empty")
+                self.assertEqual(report["wchan_writer_recheck"], expected)
 
     def test_writev_on_owned_stdout_pipe_qualifies(self):
         self._task_files(syscall="20 0x1 0x2 0x3 0x0 0x0 0x0")

@@ -60,6 +60,7 @@ class GitSourceWitness:
         self.qualified = False
         self.failure_code = SOURCE_FAILURE_NONE
         self.fatal_failure_code = SOURCE_FAILURE_NONE
+        self._wchan_diagnostic = {}
 
     def _base_report(self, *, qualified=False, failure_code=SOURCE_FAILURE_NONE):
         report = {
@@ -82,6 +83,7 @@ class GitSourceWitness:
                 1 if self.writer is not None and self.writer.syscall_kind == "write"
                 else 2 if self.writer is not None else 0
             ),
+            **self._wchan_diagnostic,
         }
         return report
 
@@ -235,6 +237,23 @@ class GitSourceWitness:
         self.qualified = bool(qualified)
         return self.qualified
 
+    def _recheck_wchan_writer(self, writer, group):
+        try:
+            task = self._task_stat(writer.tgid, writer.tid)
+            if task is None:
+                return "unavailable"
+            if task.starttime != writer.starttime or task.pgid != group.pgid:
+                return "identity_changed"
+            if task.state == "R":
+                return "same_writer_running"
+            if task.state in ("S", "D"):
+                state = self._syscall_state(self._task_text(writer.tgid, writer.tid, "syscall"))
+                if state not in ("running", "other") and state.fd == 1 and state.count > 0:
+                    return "same_writer_sleeping_in_stdout_write"
+        except (SourceParseError, UnicodeDecodeError):
+            return "unavailable"
+        return "same_writer_other"
+
     def _sample_writer(self, group):
         writer = self.writer
         if writer is None:
@@ -278,6 +297,10 @@ class GitSourceWitness:
             wchan_text = self._task_text(writer.tgid, writer.tid, "wchan").strip()
             if not wchan_text or wchan_text == "0":
                 self._fatal(SOURCE_FAILURE_WCHAN)
+                self._wchan_diagnostic = {
+                    "wchan_shape": "zero" if wchan_text else "empty",
+                    "wchan_writer_recheck": self._recheck_wchan_writer(writer, group),
+                }
                 return False
             try:
                 parse_wchan(wchan_text)
