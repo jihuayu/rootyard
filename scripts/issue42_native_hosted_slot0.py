@@ -51,11 +51,31 @@ EXEC_REAP = "reap"
 JOB_TIMEOUT_MINUTES = 110
 BUILD_FAILURE_MARKER = "failure-class"
 BUILD_FAILURE_LIMIT = 64
+LIB_PRODUCER_FALLBACK = "build-lib-producer"
+LIB_PRODUCER_CARGO_EXIT = "build-lib-cargo-exit"
+LIB_PRODUCER_ARTIFACT_SELECTION = "build-lib-artifact-selection"
+LIB_PRODUCER_INPUT_CHANGED = "build-lib-input-changed"
+LIB_PRODUCER_RECEIPT_PUBLICATION = "build-lib-receipt-publication"
+LIB_PRODUCER_RUST_TYPE = "build-lib-rust-type"
+LIB_PRODUCER_RUST_PRIVACY = "build-lib-rust-privacy"
+LIB_PRODUCER_RUST_TRAIT = "build-lib-rust-trait"
+LIB_PRODUCER_RUST_OTHER = "build-lib-rust-compiler-other"
+LIB_PRODUCER_RUST_CLASSES = frozenset({
+    LIB_PRODUCER_RUST_TYPE,
+    LIB_PRODUCER_RUST_PRIVACY,
+    LIB_PRODUCER_RUST_TRAIT,
+    LIB_PRODUCER_RUST_OTHER,
+})
 BUILD_FAILURE_CLASSES = frozenset({
     "build-integration-producer",
     "build-integration-executable",
     "build-integration-receipt",
-    "build-lib-producer",
+    LIB_PRODUCER_FALLBACK,
+    LIB_PRODUCER_CARGO_EXIT,
+    LIB_PRODUCER_ARTIFACT_SELECTION,
+    LIB_PRODUCER_INPUT_CHANGED,
+    LIB_PRODUCER_RECEIPT_PUBLICATION,
+    *LIB_PRODUCER_RUST_CLASSES,
     "build-lib-executable",
     "build-lib-receipt",
 })
@@ -163,6 +183,234 @@ def build_failure_is_closed(value):
     if not isinstance(value, str) or not value.startswith("build-"):
         return True
     return value in BUILD_FAILURE_CLASSES
+
+
+# The lib producer's stderr is a pipe, never a file.  Only a bounded line prefix
+# is inspected; the rest is drained so a long diagnostic cannot block the
+# producer or grow this process.  Everything below projects a fixed class and
+# never returns, prints or stores the input text.
+LIB_PRODUCER_PREFIX = b"build_native_test: "
+LIB_PRODUCER_CHUNK = 65536
+LIB_PRODUCER_TOTAL_LIMIT = 4 * 1024 * 1024
+LIB_PRODUCER_LINE_LIMIT = 4096
+LIB_PRODUCER_COMPILER_HEADER = re.compile(rb"^error\[(E[0-9]{4})\]: ")
+LIB_PRODUCER_CARGO_EXIT_PATTERN = re.compile(
+    rb"cargo test failed with status -?[0-9]{1,12}")
+
+# Exact message bodies emitted by scripts/build_native_test.py after its
+# ``build_native_test: `` final-line prefix.  Messages with a path suffix are
+# anchored on their fixed text and deliberately discard the suffix.
+LIB_PRODUCER_ARTIFACT_PATTERN = re.compile(
+    rb"(?:"
+    rb"Cargo reported [0-9]{1,12} rootyard lib test artifacts; expected exactly one"
+    rb"|rootyard lib test artifact source is outside src/: .+"
+    rb"|rootyard lib test artifact has absent or non-boolean freshness; Cargo's reported "
+    rb"freshness must be the literal JSON boolean true or false"
+    rb"|cargo artifact: .+"
+    rb")"
+)
+LIB_PRODUCER_INPUT_PATTERN = re.compile(
+    rb"(?:"
+    rb"Source inputs changed during build; rebuild before recording acceptance\."
+    rb"|Cargo\.lock changed during build; refusing the receipt"
+    rb"|config, build-script or toolchain inputs changed during build; refusing the receipt"
+    rb"|bound build inputs changed during build; refusing the receipt"
+    rb"|Toolchain identity changed during build; refusing the receipt"
+    rb"|HEAD or working-tree state changed during build; refusing the receipt"
+    rb"|lib test-support inputs changed during build: .+; rebuild before recording acceptance\."
+    rb"|lib test-support inputs changed during build; refusing the receipt"
+    rb"|toolchain: .+"
+    rb"|bound input .+"
+    rb"|refusing inherited profile/target environment: .+"
+    rb"|Cargo configuration outside the workspace at .+ could change this build; "
+    rb"only in-repository configuration is bound"
+    rb"|source tree is not clean: .+"
+    rb"|CARGO_BUILD_JOBS must be a positive decimal integer; remove it from the "
+    rb"inherited environment and pass an explicit --jobs value instead"
+    rb")"
+)
+LIB_PRODUCER_RECEIPT_PATTERN = re.compile(
+    rb"(?:"
+    rb"sealed CAS snapshot does not match the selected test artifact"
+    rb"|relocated executable does not match the selected artifact"
+    rb"|relocated executable changed during publication"
+    rb"|built test executable is missing: .+"
+    rb"|built test executable changed while its receipt was being recorded"
+    rb"|build receipt: .+"
+    rb"|receipt: .+"
+    rb"|snapshot: .+"
+    rb"|object: .+"
+    rb"|store marker: .+"
+    rb"|store_root: .+"
+    rb"|source: .+"
+    rb"|copy: .+"
+    rb"|temporary file: .+"
+    rb"|sealed: .+"
+    rb"|configuration_key: .+"
+    rb"|path: .+"
+    rb"|--output: .+"
+    rb"|--output receipt: .+"
+    rb"|canonical compatibility receipt .+"
+    rb"|--artifact-store .+"
+    rb"|--output .+"
+    rb")"
+)
+# Fixed code families only.  The numeric code is looked up here and is never
+# copied into a class or a report; an unknown E-code collapses to one class.
+LIB_PRODUCER_RUST_CODES = {
+    "E0061": LIB_PRODUCER_RUST_TYPE,
+    "E0063": LIB_PRODUCER_RUST_TYPE,
+    "E0308": LIB_PRODUCER_RUST_TYPE,
+    "E0412": LIB_PRODUCER_RUST_TYPE,
+    "E0425": LIB_PRODUCER_RUST_TYPE,
+    "E0432": LIB_PRODUCER_RUST_TYPE,
+    "E0433": LIB_PRODUCER_RUST_TYPE,
+    "E0560": LIB_PRODUCER_RUST_TYPE,
+    "E0599": LIB_PRODUCER_RUST_TYPE,
+    "E0609": LIB_PRODUCER_RUST_TYPE,
+    "E0614": LIB_PRODUCER_RUST_TYPE,
+    "E0603": LIB_PRODUCER_RUST_PRIVACY,
+    "E0616": LIB_PRODUCER_RUST_PRIVACY,
+    "E0624": LIB_PRODUCER_RUST_PRIVACY,
+    "E0046": LIB_PRODUCER_RUST_TRAIT,
+    "E0050": LIB_PRODUCER_RUST_TRAIT,
+    "E0277": LIB_PRODUCER_RUST_TRAIT,
+    "E0283": LIB_PRODUCER_RUST_TRAIT,
+    "E0284": LIB_PRODUCER_RUST_TRAIT,
+    "E0477": LIB_PRODUCER_RUST_TRAIT,
+}
+
+
+def classify_lib_producer_line(line):
+    """Project one complete ``build_native_test:`` line, or return None."""
+    if not isinstance(line, (bytes, bytearray)) or not line.startswith(LIB_PRODUCER_PREFIX):
+        return None
+    message = bytes(line)[len(LIB_PRODUCER_PREFIX):]
+    if LIB_PRODUCER_CARGO_EXIT_PATTERN.fullmatch(message):
+        return LIB_PRODUCER_CARGO_EXIT
+    if LIB_PRODUCER_ARTIFACT_PATTERN.fullmatch(message):
+        return LIB_PRODUCER_ARTIFACT_SELECTION
+    if LIB_PRODUCER_INPUT_PATTERN.fullmatch(message):
+        return LIB_PRODUCER_INPUT_CHANGED
+    if LIB_PRODUCER_RECEIPT_PATTERN.fullmatch(message):
+        return LIB_PRODUCER_RECEIPT_PUBLICATION
+    return None
+
+
+def classify_lib_producer_stream(stream, *, chunk_size=LIB_PRODUCER_CHUNK,
+                                 total_limit=LIB_PRODUCER_TOTAL_LIMIT,
+                                 line_limit=LIB_PRODUCER_LINE_LIMIT):
+    """Classify one lib-producer stderr stream without retaining its text.
+
+    The last anchored producer line is authoritative over incidental compiler
+    text and earlier unrecognized producer-prefixed noise.  If that final line
+    is unrecognized, or two different recognized producer classes appear, the
+    coarse fallback is used instead of a compiler-code guess.  Oversized
+    totals, overlong or unterminated lines, invalid bytes, read errors and
+    unrecognized input also fall back.  The loop always drains to EOF on
+    overflow so the producer cannot block on a full pipe.
+    """
+    producer_classes = set()
+    producer_seen = False
+    producer_last = None
+    rust_classes = set()
+    invalid = False
+    total = 0
+    current = bytearray()
+    discarding = False
+
+    def consume(line):
+        nonlocal producer_seen, producer_last, invalid
+        if not line:
+            return
+        if b"\r" in line or b"\x00" in line or b"\x1b" in line:
+            invalid = True
+            return
+        if line.startswith(LIB_PRODUCER_PREFIX):
+            producer_seen = True
+            value = classify_lib_producer_line(line)
+            producer_last = value
+            if value is not None:
+                producer_classes.add(value)
+            return
+        header = LIB_PRODUCER_COMPILER_HEADER.match(line)
+        if header is not None:
+            code = header.group(1).decode("ascii")
+            rust_classes.add(LIB_PRODUCER_RUST_CODES.get(code, LIB_PRODUCER_RUST_OTHER))
+
+    try:
+        while True:
+            chunk = stream.read(chunk_size)
+            if chunk is None:
+                return LIB_PRODUCER_FALLBACK
+            if not chunk:
+                break
+            if not isinstance(chunk, (bytes, bytearray)):
+                return LIB_PRODUCER_FALLBACK
+            if len(chunk) > chunk_size:
+                invalid = True
+                current.clear()
+                discarding = True
+                continue
+            total += len(chunk)
+            if total > total_limit:
+                total = total_limit + 1
+                current.clear()
+                discarding = True
+                continue
+            data = bytes(chunk)
+            start = 0
+            while start < len(data):
+                newline = data.find(b"\n", start)
+                if newline < 0:
+                    piece = data[start:]
+                    if not discarding:
+                        if len(current) + len(piece) > line_limit:
+                            invalid = True
+                            current.clear()
+                            discarding = True
+                        else:
+                            current.extend(piece)
+                    break
+                piece = data[start:newline]
+                if discarding:
+                    discarding = False
+                    current.clear()
+                else:
+                    if len(current) + len(piece) > line_limit:
+                        invalid = True
+                        current.clear()
+                    else:
+                        current.extend(piece)
+                        consume(bytes(current))
+                    current.clear()
+                start = newline + 1
+    except (OSError, ValueError, TypeError, MemoryError):
+        return LIB_PRODUCER_FALLBACK
+    if total > total_limit or invalid or discarding or current:
+        return LIB_PRODUCER_FALLBACK
+    if producer_seen:
+        if producer_last is None or len(producer_classes) != 1:
+            return LIB_PRODUCER_FALLBACK
+        return producer_last
+    if len(rust_classes) == 1:
+        return next(iter(rust_classes))
+    return LIB_PRODUCER_FALLBACK
+
+
+def cmd_classify_lib_producer(args):
+    """Write exactly one fixed class for the stream on stdin."""
+    value = LIB_PRODUCER_FALLBACK
+    try:
+        value = classify_lib_producer_stream(sys.stdin.buffer)
+    except Exception:
+        value = LIB_PRODUCER_FALLBACK
+    try:
+        sys.stdout.write(value + "\n")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        return 1
+    return 0
 
 
 def sha256_bytes(data):
@@ -1398,8 +1646,12 @@ def main(argv=None):
     finalize.add_argument("--workflow-source", required=True)
     finalize.set_defaults(func=cmd_finalize)
 
+    classify = subparsers.add_parser("classify-lib-producer")
+    classify.set_defaults(func=cmd_classify_lib_producer)
+
     arguments = parser.parse_args(argv)
-    stages = {"pg-baseline": "postgres", "bind": "bind", "run": "test", "finalize": "finalize"}
+    stages = {"pg-baseline": "postgres", "bind": "bind", "run": "test",
+              "finalize": "finalize", "classify-lib-producer": "build"}
     stage = stages[arguments.mode]
     try:
         return arguments.func(arguments)

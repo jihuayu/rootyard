@@ -215,11 +215,36 @@ jobs:
             build_failed build-integration-producer
           fi
           require_built ref-store-operations integration
-          if ! python3 -B scripts/build_native_test.py --lib \
+          lib_class=build-lib-producer
+          lib_class_file="$work/lib-producer-class"
+          rm -f "$lib_class_file" 2>/dev/null || true
+          # Classify only the lib producer stderr.  The producer's stdout stays
+          # discarded, its stderr is never written to a file, and the pipeline
+          # preserves the producer's own status under pipefail.  The classifier
+          # emits one fixed class; any classifier failure falls back closed.
+          set +e
+          python3 -B scripts/build_native_test.py --lib \
               --features pando-lab --no-default-features --package-debug 0 --strip-debuginfo \
               --artifact-store "$work/store" --output "$work/slot-zero-lib" \
-              >/dev/null 2>&1; then
-            build_failed build-lib-producer
+              2>&1 >/dev/null | \
+            python3 -I "$workflow_source/scripts/issue42_native_hosted_slot0.py" \
+              classify-lib-producer > "$lib_class_file" 2>/dev/null
+          pipeline_status=("${PIPESTATUS[@]}")
+          producer_status=${pipeline_status[0]:-1}
+          classifier_status=${pipeline_status[1]:-1}
+          set -e
+          if [ "$classifier_status" -eq 0 ] && [ -f "$lib_class_file" ] && \
+              [ ! -L "$lib_class_file" ]; then
+            IFS= read -r candidate_class < "$lib_class_file" || candidate_class=
+            case "${candidate_class:-}" in
+              build-lib-producer|build-lib-cargo-exit|build-lib-artifact-selection|build-lib-input-changed|build-lib-receipt-publication|build-lib-rust-type|build-lib-rust-privacy|build-lib-rust-trait|build-lib-rust-compiler-other)
+                lib_class=$candidate_class
+                ;;
+            esac
+          fi
+          rm -f "$lib_class_file" 2>/dev/null || true
+          if [ "$producer_status" -ne 0 ]; then
+            build_failed "$lib_class"
           fi
           require_built slot-zero-lib lib
           if ! python3 -I "$workflow_source/scripts/issue42_native_hosted_slot0.py" bind \
