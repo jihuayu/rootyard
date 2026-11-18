@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 mod scope_drain_support;
@@ -210,6 +211,9 @@ struct TestNode {
     node: RootRaftNode,
     peer_dir: PeerDirectory,
     stop: watch::Sender<bool>,
+    /// Outer mTLS listener task. It owns the exact connection-task set, so joining it proves every
+    /// fixture-owned `RootRaftNode` clone held by an RPC handler has ended.
+    listener: JoinHandle<()>,
 }
 
 struct TestCluster {
@@ -218,6 +222,8 @@ struct TestCluster {
     nodes: Vec<TestNode>,
 }
 
+/// Returned only after all fixture RPC listener tasks have been joined and all `TestNode`
+/// handles have been dropped.
 struct TestClusterShutdown {
     dirs: Vec<(u64, tempfile::TempDir)>,
     first_error: Option<RaftBackendError>,
@@ -263,7 +269,7 @@ impl TestCluster {
             let raft_addr = listener.local_addr()?.to_string();
             raft_map.insert(id, raft_addr.clone());
             let (stop, stop_rx) = watch::channel(false);
-            spawn_rpc_listener(
+            let listener = spawn_rpc_listener(
                 u8::try_from(id).expect("fixture slot"),
                 mtls_server,
                 listener,
@@ -272,7 +278,7 @@ impl TestCluster {
                 stop_rx,
             );
 
-            nodes.push(TestNode { id, dir, node, peer_dir, stop });
+            nodes.push(TestNode { id, dir, node, peer_dir, stop, listener });
         }
 
         for node in &nodes {
@@ -341,12 +347,19 @@ impl TestCluster {
         let mut dirs = Vec::new();
         let mut first_error = None;
         for node in self.nodes {
-            let TestNode { id, dir, node, stop, .. } = node;
+            let TestNode { id, dir, node, stop, listener, .. } = node;
             let _ = stop.send(true);
             if let Err(error) = node.shutdown().await {
                 first_error.get_or_insert(error);
             }
             drop(node);
+            // Each listener owns its exact connection-task set and every handler holds a
+            // `RootRaftNode` clone. Joining the outer task releases the last background clone
+            // before this fixture returns the store directory for reopen.
+            if listener.await.is_err() {
+                first_error.get_or_insert(RaftBackendError::NodeShutdown("join owned RPC listener"));
+            }
+            drop(stop);
             dirs.push((id, dir));
         }
         TestClusterShutdown { dirs, first_error }
@@ -360,9 +373,10 @@ fn spawn_rpc_listener(
     node: RootRaftNode,
     peers: PeerDirectory,
     stop: watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut stop_accept = stop.clone();
+        let mut connections = JoinSet::new();
         loop {
             tokio::select! {
                 result = stop_accept.changed() => {
@@ -376,7 +390,7 @@ fn spawn_rpc_listener(
                     let node = node.clone();
                     let peers = peers.clone();
                     let mut conn_stop = stop.clone();
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let Ok((mut tls, PeerIdentity::Node(sender))) = server.accept(tcp).await else {
                             return;
                         };
@@ -448,7 +462,10 @@ fn spawn_rpc_listener(
                 }
             }
         }
-    });
+        // The outer task is the sole owner of its connection-task set. Abort and drain exactly
+        // those tasks so no mTLS handler can retain the node/store clone after this join point.
+        connections.shutdown().await;
+    })
 }
 
 async fn backend_on(
@@ -1365,6 +1382,28 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
     phase.set(Phase::FinalReopen);
     // Restart actual cluster SQLite state: shut down all nodes, reopen the leader's application
     // state machine from its own directory, and verify the committed Root refs/coordinate.
+    //
+    // Every fixture backend below owns a `RootRaftNode` clone, and each node clone owns the
+    // `PersistentStateMachine` `Arc` that holds the directory's exclusive `.raftsm.lock`. End all
+    // of those handles before `shutdown` so the reopen targets the same selected directory and
+    // node identity without any live fixture owner. Keep this list complete with every
+    // `backend_on` binding above; the listener tasks are joined inside `cluster.shutdown`.
+    drop((
+        backend,
+        follower,
+        backend_b,
+        sha1_backend,
+        tenant_b_backend,
+        repo_c_backend,
+        isolated,
+        backend_h2a2,
+        stale_h1,
+        backend_h2a3,
+        backend_h3a4_sha1,
+        backend_h3a3,
+        backend_h4a5,
+        backend_h5a6,
+    ));
     let shutdown = cluster.shutdown().await;
     let (reopen_id, reopen_dir) = shutdown
         .dirs
