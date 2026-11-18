@@ -258,8 +258,9 @@ pub(super) fn seed_fixture(
 
 #[tokio::test]
 async fn default_off_gate_and_ttl_or_tampered_arming_fail_closed() {
-    assert!(!SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT);
+    assert!(!std::hint::black_box(SAFE_GC_DESTRUCTIVE_ENABLED_BY_DEFAULT));
     let (snap, mut arm, proof) = seed_fixture(SafeGcObjectFormat::Sha1, false);
+    assert!(matches!(snap.gc_mode, GcMode::DisabledByDefault));
     let authority = DurableSafeGcAuthority::in_memory(snap).unwrap();
     let backend = Arc::new(RecordingDeleteBackend::default());
     let res = execute_safe_gc_sweep(

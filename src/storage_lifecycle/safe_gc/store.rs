@@ -114,15 +114,14 @@ impl DurableSafeGcAuthority {
             receipt.validate()?;
         }
         self.update_persisted(|s| {
-            if let GcMode::ArmedDestructive(ref receipt) = mode {
-                if receipt.tenant_id != s.authority.tenant_id
+            if let GcMode::ArmedDestructive(ref receipt) = mode
+                && (receipt.tenant_id != s.authority.tenant_id
                     || receipt.repo_id != s.authority.repo_id
                     || receipt.history_id != s.authority.history_id
                     || receipt.incarnation_id != s.authority.incarnation_id
-                    || receipt.incarnation_epoch != s.authority.incarnation_epoch
-                {
-                    return Err(SafeGcError::ArmingRejected("arm receipt disagrees with live authority"));
-                }
+                    || receipt.incarnation_epoch != s.authority.incarnation_epoch)
+            {
+                return Err(SafeGcError::ArmingRejected("arm receipt disagrees with live authority"));
             }
             s.gc_mode = mode;
             s.push_audit("set_gc_mode", "updated");
