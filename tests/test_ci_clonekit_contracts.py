@@ -100,6 +100,7 @@ class CloneKitContractsTest(unittest.TestCase):
         self.assertIn("pull_request:", wf)
         self.assertIn("workflow_dispatch:", wf)
         self.assertNotIn("\npush:", wf)
+        self.assertIn("      - 'scripts/ci_clonekit_focused_receipt.sh'", wf)
         for cmd in (
             "scripts/install_ci_cargo_fork.sh install",
             "scripts/install_ci_cargo_fork.sh verify",

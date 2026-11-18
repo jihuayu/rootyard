@@ -10,6 +10,7 @@ on:
       - 'tests/ci_clonekit.rs'
       - 'tests/test_ci_clonekit_contracts.py'
       - 'scripts/eval_ci_clonekit.py'
+      - 'scripts/ci_clonekit_focused_receipt.sh'
       - 'docs/ci-clonekit.md'
       - 'Cargo.toml'
       - 'Cargo.lock'
