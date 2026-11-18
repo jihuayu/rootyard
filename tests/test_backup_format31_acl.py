@@ -175,6 +175,67 @@ class Format31QualificationTest(unittest.TestCase):
             call(ADMIN, f'DROP DATABASE IF EXISTS "{first}" WITH (FORCE)'),
         ])
 
+    def test_unproven_target_creation_reports_unverified_cleanup_and_never_drops_target(self):
+        binary = self.temp / "rootyard"
+        binary.touch()
+        args = Namespace(binary=str(binary), expected_commit=IDENTITY["source_head"], job_owned_postgres=True)
+        source = "rootyard_b31_" + "1" * 32
+        target = "rootyard_b31_" + "2" * 32
+        for outcome in ("racing_collision", "lost_acknowledgment", "preexisting_collision"):
+            with self.subTest(outcome=outcome):
+                databases = {target: "foreign"} if outcome == "preexisting_collision" else {}
+                events = []
+
+                def run(argv, **kwargs):
+                    if argv[1:] == ["--version"]:
+                        return CompletedProcess(argv, 0, f"{argv[0]} (PostgreSQL) 17.0\n".encode())
+                    self.assertEqual(argv[0], "psql")
+                    self.assertEqual(kwargs["env"]["PGDATABASE"], "rootyard_test")
+                    sql = argv[-1]
+                    if sql == "SHOW server_version_num":
+                        output = b"170000"
+                    elif sql.startswith("SELECT current_database()"):
+                        output = b"t"
+                    elif sql.startswith("SELECT EXISTS"):
+                        name = sql.split("'")[1]
+                        events.append(("exists", name))
+                        output = b"t" if name in databases else b"f"
+                    elif sql.startswith("CREATE DATABASE"):
+                        name = sql.split('"')[1]
+                        events.append(("create", name))
+                        if name == target:
+                            if outcome == "lost_acknowledgment":
+                                databases[name] = "unconfirmed"
+                                raise TimeoutError("private create diagnostic")
+                            databases[name] = "foreign"
+                            return CompletedProcess(argv, 1, b"")
+                        databases[name] = "owned"
+                        output = b"CREATE DATABASE"
+                    else:
+                        self.assertTrue(sql.startswith("DROP DATABASE IF EXISTS"))
+                        name = sql.split('"')[1]
+                        events.append(("drop", name))
+                        databases.pop(name)
+                        output = b"DROP DATABASE"
+                    return CompletedProcess(argv, 0, output)
+
+                names = [Namespace(hex="1" * 32), Namespace(hex="2" * 32)]
+                with (patch.object(probe.uuid, "uuid4", side_effect=names),
+                      patch.object(probe, "run_bounded", side_effect=run),
+                      patch.object(probe, "capture_binding", return_value=IDENTITY)):
+                    report = probe.qualify(args, job_environment(self.temp))
+                expected = [("exists", source), ("create", source), ("exists", target)]
+                if outcome != "preexisting_collision":
+                    expected.append(("create", target))
+                self.assertEqual(events, [*expected, ("drop", source), ("exists", source)])
+                self.assertEqual(databases, {target: "unconfirmed" if outcome == "lost_acknowledgment" else "foreign"})
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["failure_phase"], "setup")
+                self.assertFalse(report["owned_cleanup_verified"])
+                self.assertNotIn(target, json.dumps(report))
+                self.assertNotIn("private create diagnostic", json.dumps(report))
+                self.assertEqual(list(self.temp.iterdir()), [binary])
+
     def test_output_overflow_kills_and_reaps_the_owned_child_without_raw_output(self):
         child = Mock(pid=42)
         ready = Mock()
