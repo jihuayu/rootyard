@@ -908,7 +908,8 @@ for _guard_name in ('rename', 'replace', 'link', 'unlink', 'remove'):
                 return ast.literal_eval(node.value)
         self.fail("preflight validator has no literal names inventory")
 
-    def run_case_runner(self, root, required_names, witness, fail_case19=False):
+    def run_case_runner(self, root, required_names, witness, fail_case19=False,
+                        extra_test_line=None):
         root = Path(root)
         evidence = root / "session174-foundation"
         evidence.mkdir()
@@ -916,6 +917,8 @@ for _guard_name in ('rename', 'replace', 'link', 'unlink', 'remove'):
             json.dumps({"required_names": required_names}))
         secret = "raw-case19-output-not-for-evidence"
         lib = root / "fixture-lib"
+        extra = (f"    print({extra_test_line!r})\n"
+                 if extra_test_line is not None else "")
         lib.write_text(
             "#!/usr/bin/env python3\n"
             "import os, pathlib, sys\n"
@@ -923,6 +926,7 @@ for _guard_name in ('rename', 'replace', 'link', 'unlink', 'remove'):
             f"if name == {CASE19_ADMITTED_REFUSAL!r}:\n"
             f"    print({secret!r})\n"
             f"    sys.stderr.write({secret + '-stderr'!r} + '\\n')\n"
+            + extra +
             f"    if {fail_case19!r}:\n"
             "        marker = os.environ.get('ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKER')\n"
             "        if marker:\n"
@@ -1236,17 +1240,31 @@ pathlib.Path.replace = fail_replace
         self.assertIn("names.append(CASE19_ADMITTED_REFUSAL)", runner)
         self.assertEqual(runner.count(CASE19_ADMITTED_REFUSAL), 1)
         self.assertIn("witness_case = index == 19 and name == witness_case_name", runner)
-        self.assertIn("if not witness_case:", runner)
         self.assertIn("save(evidence / 'case-19.json'", runner)
         self.assertNotIn("case-19.log", self.source)
-        for key in ("schema", "pr", "required_case", "ran", "passed", "failed",
-                    "ignored", "exit_code", "result"):
+        for key in ("schema", "pr", "required_case", "complete", "ran", "passed",
+                    "failed", "ignored", "exit_code", "process_outcome", "result"):
             self.assertIn("'" + key + "':", runner)
-        self.assertIn("case_evidence['failure_phase'] = phase", runner)
-        self.assertIn("if not witness_case:", runner)
-        self.assertLess(runner.index("if not witness_case:"), runner.index("save(log"))
+        self.assertIn("case_evidence['failure_phase'] = record['failure_phase']", runner)
         self.assertLess(runner.index("if witness_case:"),
                         runner.index("save(evidence / 'case-19.json'"))
+        self.assertIn("WITNESS_STDOUT_LIMIT = 16 * 1024", runner)
+        self.assertIn("WITNESS_DEADLINE_SECONDS = 600", runner)
+        self.assertIn("WITNESS_EXPECTED_SUMMARY = ('ok', '1', '0', '0', '0')", runner)
+        self.assertIn("subprocess.Popen(", runner)
+        self.assertIn("stderr=subprocess.DEVNULL", runner)
+        self.assertIn("start_new_session=True", runner)
+        self.assertIn("time.monotonic()", runner)
+        self.assertIn("selector.select(min(remaining, 0.5))", runner)
+        self.assertIn("os.killpg(process.pid, sig)", runner)
+        self.assertIn("signal_witness_group(process, signal.SIGTERM)", runner)
+        self.assertIn("signal_witness_group(process, signal.SIGKILL)", runner)
+        self.assertIn("result['stdout'].decode('utf-8')", runner)
+        self.assertIn("line.startswith('test ')", runner)
+        bounded = runner[runner.index("def run_witness_bounded"):
+                         runner.index("def classify_witness")]
+        self.assertNotIn("capture_output=True", bounded)
+        self.assertNotIn("process.stderr", bounded)
         self.assertIn("diagnose_phase = index == 18 and name == phase_case_name", runner)
         self.assertIn("'pre_admission_barrier', 'winner_publish'", runner)
         self.assertIn("'loser_rebase_await', 'loser_rebase_exit_status', "
@@ -1763,20 +1781,34 @@ pathlib.Path.replace = fail_replace
             self.assertTrue(aggregate["ok"])
             self.assertEqual(aggregate["summary"], "19 passed, 0 failed, 0 ignored")
             witness = aggregate["cases"][-1]
-            self.assertEqual(witness["name"], CASE19_ADMITTED_REFUSAL)
-            self.assertEqual(witness["evidence"], "case-19.json")
-            self.assertNotIn("log", witness)
+            self.assertEqual(
+                witness,
+                {
+                    "index": 19,
+                    "name": CASE19_ADMITTED_REFUSAL,
+                    "evidence": "case-19.json",
+                    "exit_code": 0,
+                    "process_outcome": "exited",
+                    "ran": 1,
+                    "complete": True,
+                    "passed": 1,
+                    "failed": 0,
+                    "ignored": 0,
+                    "result": "passed",
+                })
             self.assertEqual(
                 json.loads((evidence / "case-19.json").read_text()),
                 {
                     "schema": "rootyard/refstore-admitted-refusal-witness/v1",
                     "pr": 282,
                     "required_case": CASE19_ADMITTED_REFUSAL,
+                    "complete": True,
                     "ran": 1,
                     "passed": 1,
                     "failed": 0,
                     "ignored": 0,
                     "exit_code": 0,
+                    "process_outcome": "exited",
                     "result": "passed",
                 })
             self.assertFalse((evidence / "case-19.log").exists())
@@ -1790,11 +1822,45 @@ pathlib.Path.replace = fail_replace
             self.assertNotEqual(process.returncode, 0, process.stdout[-2000:])
             witness = json.loads((evidence / "case-19.json").read_text())
             self.assertEqual(witness["result"], "failed")
+            self.assertFalse(witness["complete"])
+            self.assertEqual(witness["process_outcome"], "exited")
+            self.assertEqual(witness["error_class"], "stdout_line")
             self.assertEqual(witness["failure_phase"], "durable_refusal_assertions")
             self.assertEqual(witness["ran"], 0)
             self.assertFalse((evidence / "case-19.log").exists())
             for path in evidence.iterdir():
                 self.assertNotIn(secret, path.read_text(errors="ignore"), path.name)
+
+    def test_282_runner_rejects_leaked_test_line_without_exporting_it(self):
+        leaked = "test leaked-token-like-non-url-value ... ok"
+        base_names = self.static_preflight_names()
+        with tempfile.TemporaryDirectory() as temporary:
+            process, evidence, secret = self.run_case_runner(
+                temporary, base_names + [CASE19_ADMITTED_REFUSAL], "1",
+                extra_test_line=leaked)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertNotIn(leaked, process.stdout + process.stderr)
+            aggregate_text = (evidence / "session174-foundation.json").read_text()
+            sidecar_text = (evidence / "case-19.json").read_text()
+            self.assertNotIn(leaked, aggregate_text)
+            self.assertNotIn(leaked, sidecar_text)
+            aggregate = json.loads(aggregate_text)
+            self.assertFalse(aggregate["ok"])
+            witness = aggregate["cases"][-1]
+            self.assertEqual(witness["result"], "failed")
+            self.assertEqual(witness["error_class"], "stdout_line")
+            self.assertEqual(witness["ran"], 0)
+            self.assertFalse(witness["complete"])
+            self.assertNotIn("case_lines", witness)
+            self.assertNotIn("summary", witness)
+            self.assertNotIn("errors", witness)
+            sidecar = json.loads(sidecar_text)
+            self.assertEqual(sidecar["error_class"], "stdout_line")
+            self.assertFalse(sidecar["complete"])
+            self.assertFalse((evidence / "case-19.log").exists())
+            for path in evidence.iterdir():
+                self.assertNotIn(leaked, path.read_text(errors="ignore"), path.name)
+            self.assertNotIn(secret, process.stdout + process.stderr)
 
     def test_preflight_reuses_readonly_cli_receipt_alias_without_writes(self):
         with tempfile.TemporaryDirectory() as temporary:
