@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import urllib.request
@@ -233,7 +234,9 @@ class RubiconS3ProxyTests(unittest.TestCase):
             with urllib.request.urlopen(req_get, timeout=5) as resp:
                 self.assertEqual(resp.read(), payload)
 
-            snap = proxy.snapshot()
+            # Separate 5s boundary budget; same numeric value as urlopen(timeout=5),
+            # not a shared absolute timeout.
+            snap = proxy.snapshot_after_quiescence(time.monotonic() + 5.0)
             self.assertEqual(snap["put_requests"], 1)
             self.assertEqual(snap["put_bytes"], len(payload))
             self.assertEqual(snap["head_requests"], 1)

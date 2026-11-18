@@ -40,7 +40,13 @@ from .corpus import (
     write_askpass_script,
 )
 from .report import compute_overlap_metrics, percentile_stats, redact_text, validate_report
-from .workloads import ResourceSampler, S3MeterProxy, http_json, query_pg_snapshot_json
+from .workloads import (
+    METER_BOUNDARY_WAIT_SECONDS,
+    ResourceSampler,
+    S3MeterProxy,
+    http_json,
+    query_pg_snapshot_json,
+)
 
 BLOB_REQUIRED_VARS = (
     "ROOTYARD_BLOB_SERVICE",
@@ -412,6 +418,31 @@ def _stop_fleet_preserving_active_error(
             else ["fleet: cleanup_interrupted"]
         )
         _attach_fleet_cleanup_note(active_error, issues)
+
+
+def _finalize_tier_cleanup(
+    fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]],
+    sampler: ResourceSampler,
+    active_error: BaseException | None,
+) -> None:
+    """Always attempt sampler/fleet cleanup; keep the first workload error."""
+    sampler_error: BaseException | None = None
+    try:
+        sampler.stop()
+    except BaseException as exc:
+        sampler_error = exc
+
+    if sampler_error is not None:
+        if active_error is not None:
+            try:
+                active_error.add_note("sampler cleanup incomplete: stop_error")
+            except (AttributeError, TypeError):
+                pass
+        else:
+            _stop_fleet_preserving_active_error(fleet, sampler_error)
+            raise sampler_error
+
+    _stop_fleet_preserving_active_error(fleet, active_error)
 
 
 def _stop_fleet(fleet: list[tuple[subprocess.Popen[bytes], str, Path, Any]]) -> None:
@@ -973,7 +1004,11 @@ def _phase_cold_warm_and_ci(
 ) -> tuple[list[tuple[subprocess.Popen[bytes], str, Path, Any]], dict[str, Any], dict[str, Any]]:
     bases = [item[1] for item in fleet]
     ci_targets = ("text_history", "compressed_media")
-    s3_b_ci = s3_proxy.snapshot() if s3_proxy else None
+    s3_b_ci = (
+        s3_proxy.snapshot_after_quiescence(time.monotonic() + METER_BOUNDARY_WAIT_SECONDS)
+        if s3_proxy
+        else None
+    )
     ci_ms: list[float] = []
     with ThreadPoolExecutor(max_workers=4) as pool:
         futs = [pool.submit(clone_and_fsck, pre["git"], bases[k % n_procs] + repos[ci_targets[k % 2]]["info"]["clone_path"], tier_dir / f"ci-{k}", base_env, askpass, repos[ci_targets[k % 2]]["ro"]) for k in range(4)]
@@ -981,16 +1016,30 @@ def _phase_cold_warm_and_ci(
             ok, ms, _ = f.result()
             _record_op(records, "ci_fetch", repos[ci_targets[k % 2]]["ds_class"], "committed_success" if ok else "unknown_outcome", ms, "measured")
             ci_ms.append(ms)
-    ci_info = {"burst_latencies": percentile_stats(ci_ms), "s3_wire": S3MeterProxy.delta(s3_proxy.snapshot(), s3_b_ci) if s3_proxy and s3_b_ci else {"observed": False}}
+    ci_info = {
+        "burst_latencies": percentile_stats(ci_ms),
+        "s3_wire": (
+            S3MeterProxy.delta(
+                s3_proxy.snapshot_after_quiescence(time.monotonic() + METER_BOUNDARY_WAIT_SECONDS),
+                s3_b_ci,
+            )
+            if s3_proxy and s3_b_ci
+            else {"observed": False}
+        ),
+    }
 
     sampler.sample_once()
     _stop_fleet(fleet)
-    fleet = _start_fleet(n_procs, pre["binary"], base_env, pre["git"], pg_url, s3_endpoint, tier_scratch)
+    fleet[:] = _start_fleet(n_procs, pre["binary"], base_env, pre["git"], pg_url, s3_endpoint, tier_scratch)
     bases = [item[1] for item in fleet]
     sampler.set_targets([item[0].pid for item in fleet], [item[2] for item in fleet], new_epoch=True, worktree_dirs=[tier_dir])
 
     def _run_pass(label: str) -> tuple[list[float], list[float], dict[str, Any]]:
-        s3_b = s3_proxy.snapshot() if s3_proxy else None
+        s3_b = (
+            s3_proxy.snapshot_after_quiescence(time.monotonic() + METER_BOUNDARY_WAIT_SECONDS)
+            if s3_proxy
+            else None
+        )
         clone_ms, browse_ms = [], []
         for idx, ck in enumerate(ci_targets):
             entry = repos[ck]
@@ -1002,7 +1051,15 @@ def _phase_cold_warm_and_ci(
                 st, _, _, b_ms = http_json(bases[(idx + 1) % n_procs], f"/api/repos/{owner}/{name}/{ep}", token=entry["ro"])
                 _record_op(records, f"{label}_browse", entry["ds_class"], classify_http_status(st), b_ms, "measured")
                 browse_ms.append(b_ms)
-        return clone_ms, browse_ms, (S3MeterProxy.delta(s3_proxy.snapshot(), s3_b) if s3_proxy and s3_b else {"observed": False})
+        s3_wire = (
+            S3MeterProxy.delta(
+                s3_proxy.snapshot_after_quiescence(time.monotonic() + METER_BOUNDARY_WAIT_SECONDS),
+                s3_b,
+            )
+            if s3_proxy and s3_b
+            else {"observed": False}
+        )
+        return clone_ms, browse_ms, s3_wire
 
     cold_c, cold_b, s3_cold = _run_pass("cold")
     warm_c, warm_b, s3_warm = _run_pass("warm")
@@ -1114,8 +1171,12 @@ def _run_tier(
     tier_start = time.monotonic()
     records: list[dict[str, Any]] = []
     acked: list[dict[str, Any]] = []
-    s3_before_tier = s3_proxy.snapshot() if s3_proxy is not None else None
     try:
+        s3_before_tier = (
+            s3_proxy.snapshot_after_quiescence(time.monotonic() + METER_BOUNDARY_WAIT_SECONDS)
+            if s3_proxy is not None
+            else None
+        )
         bases = [item[1] for item in fleet]
         repos = _phase_seed(n_procs, config, pre, base_env, users, bases, tier_dir, askpass, records, acked)
         overlap = _phase_concurrent_overlap(n_procs, config, pre, base_env, pg_url, bases, tier_dir, askpass, repos, records, acked)
@@ -1128,14 +1189,19 @@ def _run_tier(
         bases = [item[1] for item in fleet]
         fault_counts, audit = _phase_fault_and_audit(pre, base_env, cli_env, bases, tier_dir, askpass, repos, records, acked, rev_tok)
         pg_final = query_pg_snapshot_json(pg_url, base_env)
-        sampler.stop()
     finally:
         active_error = sys.exc_info()[1]
-        sampler.stop()
-        _stop_fleet_preserving_active_error(fleet, active_error)
+        _finalize_tier_cleanup(fleet, sampler, active_error)
 
     tier_wall = time.monotonic() - tier_start
-    s3_tier = S3MeterProxy.delta(s3_proxy.snapshot(), s3_before_tier) if s3_proxy and s3_before_tier else {"observed": False}
+    s3_tier = (
+        S3MeterProxy.delta(
+            s3_proxy.snapshot_after_quiescence(time.monotonic() + METER_BOUNDARY_WAIT_SECONDS),
+            s3_before_tier,
+        )
+        if s3_proxy and s3_before_tier
+        else {"observed": False}
+    )
     outcomes = {
         "total_ops": len(records),
         "committed_success": sum(1 for r in records if r["outcome"] == "committed_success"),

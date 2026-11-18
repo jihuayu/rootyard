@@ -102,7 +102,21 @@ class BlobProvisioningCiWiringTest(unittest.TestCase):
         # the command deliberately runs the whole checkpoint inventory.
         self.assertIn("--report test-results/refstore/standalone-provisioning.json", provisioning)
         self.assertNotIn("--case", provisioning)
-        self.assertIn("path: test-results/refstore/", self.workflow)
+        artifact_name = "          name: refstore-protocol-native-${{ github.run_id }}-${{ github.run_attempt }}"
+        uploads = [step for step in re.split(r"(?m)(?=^      - )", self.workflow)
+                   if artifact_name in step.splitlines()]
+        self.assertEqual(len(uploads), 1)
+        upload = uploads[0]
+        upload_lines = upload.splitlines()
+        self.assertTrue(upload.startswith("      - uses: actions/upload-artifact@v4\n"))
+        self.assertIn("        if: always()", upload_lines)
+        self.assertIn("          if-no-files-found: error", upload_lines)
+        paths = re.search(r"(?ms)^ {10}path: \|\n(.*?)(?=^ {0,10}\S|\Z)", upload)
+        self.assertIsNotNone(paths)
+        self.assertEqual([line.strip() for line in paths[1].splitlines() if line.strip()], [
+            "test-results/refstore/",
+            "!test-results/refstore/blob_git_gateway/native.log",
+        ])
 
     def test_first_checkpoint_stays_first(self) -> None:
         # A reordering that silently turns the independent kill checkpoint into
