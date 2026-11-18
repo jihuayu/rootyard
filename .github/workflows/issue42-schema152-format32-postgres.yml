@@ -25,8 +25,8 @@ jobs:
           --health-cmd "pg_isready -U rootyard -d rootyard_protocol"
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
-      PRODUCT_SHA: 1570316ae1954fdc553d67fc652e8b6a8e03bf60
-      PRODUCT_TREE: 1d1d8434e941b7ea4e91e0728369e0be7beef2d3
+      PRODUCT_SHA: c60de2e598b0c83116642b7c25955cbfaa60c17e
+      PRODUCT_TREE: 3e3ab8ed272436bede55077d163f3c65d0009f1b
       WORKFLOW_PATH: .github/workflows/issue42-schema152-format32-postgres.yml
       PYTHONDONTWRITEBYTECODE: '1'
       PYTHONOPTIMIZE: ''
