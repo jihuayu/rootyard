@@ -797,14 +797,15 @@ class DeletedClaimAcceptanceHarness(RepositoryLifecycleHarness):
 
     def expire_lease_metadata(self, run_id):
         """Expire only this test's owned run lease; never fake a grant or pin."""
+        # PostgreSQL rounds the numeric epoch when casting; floor it first.
         updated = self.sql(
             "UPDATE ci_runs SET lease_expires_unix="
-            "(extract(epoch FROM clock_timestamp()))::bigint-1,"
+            "floor(extract(epoch FROM clock_timestamp()))::bigint-1,"
             "updated_at=clock_timestamp() "
             f"WHERE id={quote(run_id)} AND state='leased' RETURNING id::text"
         )
         row = self.run_row(run_id)
-        assert row["lease_expires_unix"] < int(time.time()), run_id
+        assert row["lease_expires_unix"] < time.time_ns() // 1_000_000_000, run_id
         # A background reconciler may have moved the expired row to queued
         # before the update; either way this owned run's lease is now expired.
         assert updated or row["state"] == "queued", (updated, row)
