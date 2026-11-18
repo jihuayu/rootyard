@@ -13,7 +13,7 @@ use super::contract::{
 };
 use std::{future::Future, time::Duration};
 use tokio::time::{Instant, timeout_at};
-use tokio_postgres::{Row, Transaction, error::SqlState};
+use tokio_postgres::{Row, Transaction, error::SqlState, types::ToSql};
 use uuid::Uuid;
 
 const MAX_QUERY_WINDOW: Duration = Duration::from_secs(30);
@@ -79,19 +79,7 @@ impl PgRefStore {
         bound(tx, deadline).await?;
         lock_operation_key(tx, repository_id, operation_id).await?;
         ensure_repository(tx, repository_id).await?;
-        let row = tx
-            .query_one(
-                "INSERT INTO ref_store_issuer_lanes(repository_id,issuer_id,lane,last_reserved_sequence)
-                 VALUES($1,$2,$3,1) ON CONFLICT(repository_id,issuer_id,lane) DO UPDATE
-                 SET last_reserved_sequence=ref_store_issuer_lanes.last_reserved_sequence+1,
-                     updated_at=clock_timestamp()
-                 RETURNING last_reserved_sequence",
-                &[&repository_id, &issuer_id, &lane.as_str()],
-            )
-            .await
-            .map_err(db_error)?;
-        let sequence: i64 = row.get(0);
-        Ok(SequenceReservation::new(repository_id, issuer_id, lane.clone(), sequence, operation_id))
+        LockedSequence::preview(tx, repository_id, issuer_id, operation_id, lane).await?.advance().await
     }
 
     /// Register a pending operation, or replay its existing durable state.
@@ -139,6 +127,80 @@ impl PgRefStore {
         insert_operation(tx, identity, OperationState::Pending, None).await?;
         let record = OperationRecord::new(identity.clone(), OperationState::Pending, None)?;
         Ok(BeginReceipt { created: true, record })
+    }
+}
+
+/// A candidate sequence protected by the issuer-lane row lock in this transaction.
+/// Only advancement can turn it into a reservation.
+struct LockedSequence<'tx, 'client> {
+    tx: &'tx Transaction<'client>,
+    repository_id: Uuid,
+    issuer_id: Uuid,
+    operation_id: Uuid,
+    lane: &'tx IssuerLane,
+    sequence: i64,
+}
+
+impl<'tx, 'client> LockedSequence<'tx, 'client> {
+    /// The caller holds the operation key and has checked the UUID namespace.
+    ///
+    /// An existing lane costs one locked preview plus the conditional advance.
+    /// A lane first created here reads its initial candidate straight from the
+    /// insert, so it also spends one preview statement rather than a second
+    /// locked read. Only a concurrent creator that wins the `ON CONFLICT` race
+    /// yields no inserted row; that loser re-reads under `FOR NO KEY UPDATE`.
+    async fn preview(
+        tx: &'tx Transaction<'client>,
+        repository_id: Uuid,
+        issuer_id: Uuid,
+        operation_id: Uuid,
+        lane: &'tx IssuerLane,
+    ) -> Result<Self, RefStoreError> {
+        const PREVIEW: &str = "SELECT last_reserved_sequence + 1 FROM ref_store_issuer_lanes
+             WHERE (repository_id,issuer_id,lane)=($1,$2,$3) FOR NO KEY UPDATE";
+        const CREATE_LANE: &str = "INSERT INTO ref_store_issuer_lanes(
+                 repository_id,issuer_id,lane,last_reserved_sequence)
+             VALUES($1,$2,$3,0) ON CONFLICT(repository_id,issuer_id,lane) DO NOTHING
+             RETURNING last_reserved_sequence + 1";
+        let lane_name = lane.as_str();
+        let params: &[&(dyn ToSql + Sync)] = &[&repository_id, &issuer_id, &lane_name];
+        let sequence: i64 = match tx.query_opt(PREVIEW, params).await.map_err(db_error)? {
+            Some(row) => row.get(0),
+            // No lane row is visible. The insert both creates the row and takes
+            // the initial candidate; the row lock is held for the advance.
+            None => match tx.query_opt(CREATE_LANE, params).await.map_err(db_error)? {
+                Some(row) => row.get(0),
+                // A concurrent creator committed the same lane between the
+                // preview and this insert. Re-read it under the row lock; the
+                // conditional advance below proves the re-read is still current.
+                None => tx.query_one(PREVIEW, params).await.map_err(db_error)?.get(0),
+            },
+        };
+        Ok(Self { tx, repository_id, issuer_id, operation_id, lane, sequence })
+    }
+
+    async fn advance(self) -> Result<SequenceReservation, RefStoreError> {
+        // The row lock excludes other transactions. The predicate also rejects
+        // a stale preview if this transaction moved the lane in the meantime.
+        let changed = self
+            .tx
+            .execute(
+                "UPDATE ref_store_issuer_lanes SET last_reserved_sequence=$4, updated_at=clock_timestamp()
+                 WHERE (repository_id,issuer_id,lane)=($1,$2,$3) AND last_reserved_sequence=$4::bigint - 1",
+                &[&self.repository_id, &self.issuer_id, &self.lane.as_str(), &self.sequence],
+            )
+            .await
+            .map_err(db_error)?;
+        if changed != 1 {
+            return Err(RefStoreError::IdentityConflict);
+        }
+        Ok(SequenceReservation::new(
+            self.repository_id,
+            self.issuer_id,
+            self.lane.clone(),
+            self.sequence,
+            self.operation_id,
+        ))
     }
 }
 

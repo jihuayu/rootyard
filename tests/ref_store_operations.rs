@@ -16,6 +16,26 @@ fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(15)
 }
 
+/// One boolean of positive wait evidence: the observed backend is active inside
+/// the fresh-lane INSERT and PostgreSQL names the fixture creator as its
+/// blocker. Nothing else (elapsed time, an unfinished task, a generic lock wait)
+/// is accepted as evidence.
+const FRESH_LANE_WAIT_PROBE: &str = "SELECT EXISTS (
+        SELECT 1 FROM pg_stat_activity a
+        WHERE a.pid=$1 AND a.state='active' AND a.wait_event_type='Lock'
+          AND a.query LIKE 'INSERT INTO ref_store_issuer_lanes%'
+    ) AND $2 = ANY(pg_blocking_pids($1))";
+
+#[test]
+fn fresh_lane_wait_probe_requires_the_insert_and_the_creator_as_blocker() {
+    assert!(FRESH_LANE_WAIT_PROBE.contains("a.state='active'"));
+    assert!(FRESH_LANE_WAIT_PROBE.contains("a.wait_event_type='Lock'"));
+    assert!(FRESH_LANE_WAIT_PROBE.contains("a.query LIKE 'INSERT INTO ref_store_issuer_lanes%'"));
+    assert!(FRESH_LANE_WAIT_PROBE.contains("$2 = ANY(pg_blocking_pids($1))"));
+    assert!(!FRESH_LANE_WAIT_PROBE.contains("is_finished"));
+    assert!(!FRESH_LANE_WAIT_PROBE.contains("elapsed"));
+}
+
 fn identity(repo: Uuid, issuer: Uuid, sequence: i64, operation: Uuid, digest: u8) -> OperationIdentity {
     OperationIdentity::new(
         repo,
@@ -286,11 +306,179 @@ async fn reserved_sequences_are_transactional_and_monotonic() -> Result<()> {
         let tx = client.transaction().await?;
         assert_eq!(store.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &lane, deadline()).await?.sequence(), 2);
         tx.rollback().await?;
+
+        let tx = client.transaction().await?;
+        let nearing_end = identity_with_lane(repo, actor, lane.as_str(), i64::MAX - 1, Uuid::new_v4(), 2);
+        store.begin(&tx, &nearing_end, deadline()).await?;
+        let last = store.reserve_sequence(&tx, repo, actor, nearing_end.operation_id(), &lane, deadline()).await?;
+        assert_eq!(last.sequence(), i64::MAX);
+        assert_eq!(last.operation_id(), nearing_end.operation_id());
+        tx.commit().await?;
+
+        let tx = client.transaction().await?;
+        let exhausted = store.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &lane, deadline()).await;
+        assert!(matches!(exhausted, Err(RefStoreError::Database(_))));
+        tx.rollback().await?;
         Ok::<(), anyhow::Error>(())
     })
     .await
     .context("reservation test panicked");
     teardown(&admin, &schema).await?;
+    result??;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn fresh_lane_creation_waits_for_an_uncommitted_creator() -> Result<()> {
+    const WAIT: Duration = Duration::from_secs(10);
+    let url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
+    let (admin, pool, schema, actor, repo) = setup(&url).await?;
+    let result = tokio::spawn(async move {
+        let lane = IssuerLane::new("fresh-lane-race").unwrap();
+
+        // Creator: hold one uncommitted lane row and report its exact backend.
+        let (creator_pid_tx, creator_pid_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let creator_pool = pool.clone();
+        let creator_lane = lane.clone();
+        let mut creator = tokio::spawn(async move {
+            let mut client = creator_pool.get().await?;
+            let tx = client.transaction().await?;
+            let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            tx.execute(
+                "INSERT INTO ref_store_issuer_lanes(repository_id,issuer_id,lane,last_reserved_sequence)
+                 VALUES($1,$2,$3,0)",
+                &[&repo, &actor, &creator_lane.as_str()],
+            )
+            .await?;
+            creator_pid_tx.send(pid).map_err(|_| anyhow!("creator pid receiver dropped"))?;
+            release_rx.await?;
+            tx.commit().await?;
+            Ok::<(), anyhow::Error>(())
+        });
+        let creator_pid = match tokio::time::timeout(WAIT, creator_pid_rx).await {
+            Ok(Ok(pid)) => pid,
+            Ok(Err(_)) => {
+                creator.abort();
+                let _ = tokio::time::timeout(WAIT, &mut creator).await;
+                return Err(anyhow!("creator pid receiver dropped"));
+            }
+            Err(_) => {
+                creator.abort();
+                let _ = tokio::time::timeout(WAIT, &mut creator).await;
+                return Err(anyhow!("creator never reported its backend pid"));
+            }
+        };
+
+        // Waiter: report its exact backend before entering the real reservation.
+        let (waiter_pid_tx, waiter_pid_rx) = oneshot::channel();
+        let waiter_pool = pool.clone();
+        let waiter_lane = lane.clone();
+        let mut waiter = tokio::spawn(async move {
+            let mut client = waiter_pool.get().await?;
+            let tx = client.transaction().await?;
+            let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            waiter_pid_tx.send(pid).map_err(|_| anyhow!("waiter pid receiver dropped"))?;
+            let reservation =
+                PgRefStore.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &waiter_lane, deadline()).await?;
+            tx.commit().await?;
+            Ok::<_, anyhow::Error>(reservation.sequence())
+        });
+
+        let mut release_tx = Some(release_tx);
+        let mut creator_joined = false;
+        let mut waiter_joined = false;
+        let outcome: Result<()> = async {
+            let waiter_pid =
+                tokio::time::timeout(WAIT, waiter_pid_rx).await.context("waiter never reported its backend pid")??;
+            let observer =
+                tokio::time::timeout(WAIT, pool.get()).await.context("observer pool checkout timed out")??;
+
+            // Positive evidence only: the exact backend must be active inside
+            // the lane INSERT and must name the creator as its blocker. The
+            // sleep merely spaces probes; it is never the evidence itself.
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    let observed: bool =
+                        observer.query_one(FRESH_LANE_WAIT_PROBE, &[&waiter_pid, &creator_pid]).await?.get(0);
+                    if observed {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("waiter never entered the fresh-lane INSERT blocked by the creator")??;
+
+            let release = release_tx.take().ok_or_else(|| anyhow!("creator was already released"))?;
+            release.send(()).map_err(|_| anyhow!("creator release receiver dropped"))?;
+
+            match tokio::time::timeout(WAIT, &mut creator).await {
+                Ok(joined) => {
+                    creator_joined = true;
+                    joined.context("creator task panicked")??;
+                }
+                Err(_) => return Err(anyhow!("creator did not commit after release")),
+            }
+
+            let sequence = match tokio::time::timeout(WAIT, &mut waiter).await {
+                Ok(joined) => {
+                    waiter_joined = true;
+                    joined.context("waiter task panicked")??
+                }
+                Err(_) => return Err(anyhow!("waiter did not settle after the creator committed")),
+            };
+            // The loser re-reads the winner's row under the lane lock and
+            // reserves the first sequence; it neither mints a second lane nor
+            // skips a slot.
+            assert_eq!(sequence, 1);
+
+            let mut client =
+                tokio::time::timeout(WAIT, pool.get()).await.context("next reservation checkout timed out")??;
+            let tx = tokio::time::timeout(WAIT, client.transaction())
+                .await
+                .context("next reservation BEGIN timed out")??;
+            let next = tokio::time::timeout(
+                WAIT,
+                PgRefStore.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &lane, deadline()),
+            )
+            .await
+            .context("next reservation timed out")??;
+            assert_eq!(next.sequence(), 2);
+            tokio::time::timeout(WAIT, tx.rollback()).await.context("next reservation rollback timed out")??;
+            Ok(())
+        }
+        .await;
+
+        if outcome.is_err() {
+            // Release or roll back the creator, abort/join a still-blocked
+            // waiter, and leave no backend parked on a lane lock before teardown.
+            if let Some(release) = release_tx.take() {
+                let _ = release.send(());
+            }
+            if !creator_joined {
+                match tokio::time::timeout(WAIT, &mut creator).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        creator.abort();
+                        let _ = tokio::time::timeout(WAIT, &mut creator).await;
+                    }
+                }
+            }
+            if !waiter_joined {
+                waiter.abort();
+                let _ = tokio::time::timeout(WAIT, &mut waiter).await;
+            }
+        }
+        outcome?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("fresh-lane race test panicked");
+    tokio::time::timeout(Duration::from_secs(10), teardown(&admin, &schema))
+        .await
+        .context("fresh-lane teardown timed out")??;
     result??;
     Ok(())
 }
