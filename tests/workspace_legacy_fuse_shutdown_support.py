@@ -69,13 +69,6 @@ def namespace_inodes(pid: int) -> dict:
     return pair
 
 
-def mount_namespace_inode(pid: int) -> int:
-    try:
-        return int(os.stat(f"/proc/{int(pid)}/ns/mnt").st_ino)
-    except OSError:
-        raise LegacyAcceptanceError("mount namespace identity is unavailable") from None
-
-
 def start_service(harness, log_path=None):
     """Start one owned service process; never use a readiness timeout here."""
     log = open(log_path or (harness.root / "server.log"), "ab")

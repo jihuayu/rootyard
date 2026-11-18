@@ -178,13 +178,13 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
                     legacy_ownership.retain_unresolved_fixtures(
                         self.containment_owner, self.holders, harness
                     )
+                    self.containment_owner.defer_release(
+                        lambda: self._release_deferred_fixture(harness)
+                    )
                     detail = CASE_DETAILS.setdefault(self.id(), {})
                     detail["fixture_cleanup_deferred"] = True
                 else:
-                    for holder in self.holders:
-                        legacy_support.close_holder(holder)
-                    self.holders = []
-                    self.holder_proofs = []
+                    self._release_holders()
                 if harness.proc is not None:
                     try:
                         support.terminate_process(harness.proc)
@@ -221,12 +221,30 @@ class WorkspaceLegacyFuseShutdownTest(unittest.TestCase):
         except legacy_support.LegacyAcceptanceError as error:
             pending = getattr(error, "holder", None)
             if pending is not None:
-                self.containment_owner.retain_fixture(pending)
+                self.containment_owner.adopt_pending_child(
+                    pending,
+                    kill_requested=True,
+                    deadline_crossed=True,
+                )
             raise
         self.holders.append(holder)
         proof = legacy_ownership.capture_holder_identity(holder, service_proc)
         self.holder_proofs.append((holder, proof))
         return holder, proof
+
+    def _release_holders(self):
+        for holder in self.holders:
+            legacy_support.close_holder(holder)
+        self.holders = []
+        self.holder_proofs = []
+
+    def _release_deferred_fixture(self, harness):
+        """Run only after the late reaper confirmed every owned child is gone."""
+        self._release_holders()
+        if harness.log is not None:
+            harness.log.close()
+            harness.log = None
+        harness.cleanup()
 
     def _remember_record(self, mountpoint, mount_id):
         if int(mount_id) <= 0:

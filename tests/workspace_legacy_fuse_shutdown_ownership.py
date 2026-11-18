@@ -28,6 +28,7 @@ SAFE_CONTAINMENT_ERRORS = frozenset((
 ))
 LATE_POLL_SECONDS = 0.01
 LATE_DIAG_LIMIT = 3
+LATE_DRAIN_SECONDS = 5.0
 
 
 def safe_error_name(error) -> str:
@@ -204,7 +205,7 @@ class ContainmentRecord:
 
     proc: object
     pid: int
-    mount_id: int
+    mount_id: int | None
     starttime: int | None = None
     state: str = "started"
     returncode: int | None = None
@@ -212,9 +213,11 @@ class ContainmentRecord:
     deadline_crossed: bool = False
     signal_error: str | None = None
     reap_error: str | None = None
+    kind: str = "mount"
 
     def safe(self) -> dict:
         return {
+            "kind": self.kind,
             "pid": self.pid,
             "starttime": self.starttime,
             "mount_id": self.mount_id,
@@ -247,6 +250,7 @@ class ContainmentOwner:
         self._late_wait_errors = 0
         self._late_wait_error_classes: set[str] = set()
         self._retained: list[object] = []
+        self._release_callbacks: list[object] = []
 
     def reset(self) -> None:
         if self.pending_records():
@@ -261,6 +265,7 @@ class ContainmentOwner:
         self._late_wait_errors = 0
         self._late_wait_error_classes.clear()
         self._retained.clear()
+        self._release_callbacks.clear()
 
     def register(self, proc, mount_id, starttime=None) -> ContainmentRecord:
         """Register the exact child immediately after Popen returns."""
@@ -272,6 +277,32 @@ class ContainmentOwner:
             starttime=starttime,
         )
         self._records.append(record)
+        return record
+
+    def adopt_pending_child(
+        self, proc, *, starttime=None, kill_requested=True, deadline_crossed=True
+    ) -> ContainmentRecord:
+        """Adopt one exact Popen that bounded cleanup returned still pending.
+
+        This is the explicit handoff from a fixture helper's failed readiness
+        attempt. The same live ``Popen`` object is recorded for the existing
+        late drain; it is never re-identified through a PID, process table or
+        namespace lookup and never enters normal holder records.
+        """
+        pid = _positive_int(proc.pid, "pending child pid")
+        record = ContainmentRecord(
+            proc=proc,
+            pid=pid,
+            mount_id=None,
+            starttime=starttime,
+            state="pending",
+            kill_requested=bool(kill_requested),
+            deadline_crossed=bool(deadline_crossed),
+            kind="holder",
+        )
+        self._records.append(record)
+        if deadline_crossed:
+            self.note_deadline_exhausted()
         return record
 
     def note_contained(self) -> None:
@@ -361,19 +392,59 @@ class ContainmentOwner:
         record.state = "pending"
         return None
 
-    def late_physical_drain(self, *, sleep=time.sleep, poll_interval=LATE_POLL_SECONDS) -> int:
-        """Explicit failed-run drain that never returns while a child is pending.
+    def needs_late_cleanup(self) -> bool:
+        """Return whether pending children or deferred releases remain."""
+        return bool(self.pending_records() or self._release_callbacks)
+
+    def defer_release(self, release) -> None:
+        """Keep a fixture release callback until every pending child is reaped."""
+        if not callable(release):
+            raise LegacyAcceptanceError("deferred fixture release is not callable")
+        self._release_callbacks.append(release)
+
+    def _release_late_fixtures(self) -> bool:
+        """Run deferred releases only after every exact owned child is reaped."""
+        if self.pending_records():
+            return False
+        released = False
+        while self._release_callbacks:
+            release = self._release_callbacks[0]
+            try:
+                release()
+            except Exception as error:
+                self.note_error(error)
+                return False
+            self._release_callbacks.pop(0)
+            released = True
+        if released:
+            self._retained.clear()
+        return True
+
+    def late_physical_drain(
+        self,
+        *,
+        deadline=None,
+        clock=time.monotonic,
+        sleep=time.sleep,
+        poll_interval=LATE_POLL_SECONDS,
+    ) -> int:
+        """Explicit failed-run drain of the exact owned children only.
 
         This is not an acceptance grace and cannot revive the oracle. A wait
         exception or a ``None`` result is retried on the same exact owned
-        ``Popen`` at a quiet poll cadence. There is no timeout and no success
-        state until ``poll`` or ``wait`` yields a real return code. If the
-        child is permanently unobservable, this call keeps the runner, owner,
-        holders and failed pending report alive until an external resolution
-        or the outer job terminates the process.
+        ``Popen`` at a quiet poll cadence. With no ``deadline`` the call keeps
+        the runner, owner, holders and failed pending report alive until a real
+        reap is observed. With a ``deadline`` it stops without releasing any
+        fixture when a child is still alive; release callbacks run only after
+        every child has yielded a real return code through poll/wait.
         """
         if not self.pending_records():
-            self._late_state = "reaped_late" if self._late_reaped > 0 else "not_needed"
+            had_release = bool(self._release_callbacks)
+            self._late_state = (
+                "reaped_late" if (self._late_reaped > 0 or had_release) else "not_needed"
+            )
+            if not self._release_late_fixtures():
+                self._late_state = "release_failed"
             return 0
         self._late_state = "draining"
         while self.pending_records():
@@ -383,21 +454,46 @@ class ContainmentOwner:
                     self.mark_reaped(record, code)
                     self._late_reaped += 1
                     continue
-                try:
-                    code = record.proc.wait()
-                except Exception as error:
-                    self._note_late_wait_issue(record, safe_error_name(error))
-                    code = self._poll_late(record)
-                else:
-                    if code is None:
-                        self._note_late_wait_issue(record, "wait_none")
+                if deadline is not None:
+                    remaining = deadline - clock()
+                    if remaining <= 0.0:
+                        self._late_state = "deadline_exhausted"
+                        return self._late_reaped
+                    try:
+                        code = record.proc.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
                         code = self._poll_late(record)
+                        if code is None:
+                            self._late_state = "deadline_exhausted"
+                            return self._late_reaped
+                    except Exception as error:
+                        self._note_late_wait_issue(record, safe_error_name(error))
+                        code = self._poll_late(record)
+                    else:
+                        if code is None:
+                            self._note_late_wait_issue(record, "wait_none")
+                            code = self._poll_late(record)
+                else:
+                    try:
+                        code = record.proc.wait()
+                    except Exception as error:
+                        self._note_late_wait_issue(record, safe_error_name(error))
+                        code = self._poll_late(record)
+                    else:
+                        if code is None:
+                            self._note_late_wait_issue(record, "wait_none")
+                            code = self._poll_late(record)
                 if code is not None:
                     self.mark_reaped(record, code)
                     self._late_reaped += 1
             if self.pending_records():
+                if deadline is not None and clock() >= deadline:
+                    self._late_state = "deadline_exhausted"
+                    return self._late_reaped
                 sleep(poll_interval)
         self._late_state = "reaped_late"
+        if not self._release_late_fixtures():
+            self._late_state = "release_failed"
         return self._late_reaped
 
     def snapshot(self) -> dict:
@@ -426,6 +522,7 @@ class ContainmentOwner:
                 "wait_diagnostics_capped": self._late_wait_errors >= LATE_DIAG_LIMIT,
             },
             "retained_fixtures": len(self._retained),
+            "deferred_releases": len(self._release_callbacks),
         }
 
     def retain_fixture(self, fixture) -> None:

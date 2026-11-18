@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,7 @@ for path in (TESTS, ROOT):
 
 from tests import fuse_helper_native_support as support  # noqa: E402
 from tests import workspace_legacy_fuse_shutdown_acceptance as acceptance  # noqa: E402
+from tests import workspace_legacy_fuse_shutdown_ownership as ownership  # noqa: E402
 from tests.runtime_binary import select_runtime_binary  # noqa: E402
 
 SAFE_FAILURE_TYPES = frozenset((
@@ -377,6 +379,8 @@ def _report_payload(binary_sha256=None, receipt_sha256=None, source_inputs_sha25
         and int(containment_state["pending"]) == 0
         and int(containment_state["deadline_exhausted"]) == 0
         and int(containment_state["errors"]) == 0
+        and int(containment_state["deferred_releases"]) == 0
+        and int(containment_state["retained_fixtures"]) == 0
     )
     return {
         "schema": acceptance.REPORT_SCHEMA,
@@ -488,10 +492,14 @@ def main(argv=None):
     )
     report = _report_payload(**payload_kwargs)
     _write_report(args.report, report)
-    if int(report["containment"]["pending"]) > 0:
+    owner = acceptance.CONTAINMENT_OWNER
+    if owner.needs_late_cleanup():
         # The failed pending report is durable before the explicit late drain.
-        # The drain has no positive acceptance grace and cannot revive a pass.
-        acceptance.CONTAINMENT_OWNER.late_physical_drain()
+        # The drain cannot revive a pass; it releases retained fixtures only
+        # after the same owned Popen yields a real reap within its late bound.
+        owner.late_physical_drain(
+            deadline=time.monotonic() + ownership.LATE_DRAIN_SECONDS
+        )
         report = _report_payload(**payload_kwargs)
         _write_report(args.report, report)
     print(json.dumps(report, indent=2, sort_keys=True))

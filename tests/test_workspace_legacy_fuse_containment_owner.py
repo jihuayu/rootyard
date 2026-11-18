@@ -203,6 +203,70 @@ class FakeAttachSpawn:
         return child
 
 
+class FakePendingHolder:
+    def __init__(self, pid=7300, exit_on_wait=False):
+        self.pid = pid
+        self.returncode = None
+        self.exit_on_wait = exit_on_wait
+        self.kills = 0
+        self.waits = []
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.kills += 1
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if self.returncode is not None:
+            return self.returncode
+        if self.exit_on_wait:
+            self.returncode = 0
+            return 0
+        if timeout is None:
+            return None
+        raise subprocess.TimeoutExpired("pending-holder", timeout)
+
+    def release(self):
+        self.returncode = 0
+
+
+class FakeDeferredHarness:
+    def __init__(self):
+        self.proc = None
+        self.log = None
+        self.cleanup_calls = 0
+
+    def cleanup(self):
+        self.cleanup_calls += 1
+
+
+class FakeAttachCase:
+    def __init__(self, owner, case_id=None):
+        self.h = FakeDeferredHarness()
+        self.holders = []
+        self.holder_proofs = []
+        self.created_mountpoints = []
+        self.owned_records = []
+        self.conflict = None
+        self.fifo = None
+        self._cleanup_deadline = None
+        self.containment_owner = owner
+        self._case_id = case_id or acceptance.REQUIRED_CASES[0]
+
+    def id(self):
+        return self._case_id
+
+    def _release_holders(self):
+        acceptance.WorkspaceLegacyFuseShutdownTest._release_holders(self)
+
+    def _release_deferred_fixture(self, harness):
+        acceptance.WorkspaceLegacyFuseShutdownTest._release_deferred_fixture(
+            self, harness
+        )
+
+
 def _attach_identity(service_pid, holder_pid, service_starttime=1000, holder_starttime=2000):
     return FakeAttachIdentity({
         service_pid: {"pid": service_pid, "state": "S", "starttime": service_starttime},
@@ -722,6 +786,115 @@ class NamespaceAttachReadinessTest(unittest.TestCase):
         service = FakeChild(pid=self.SERVICE_PID, returncode=1)
         with self.assertRaises(ownership.LegacyAcceptanceError):
             ownership.capture_holder_identity(holder, service)
+
+
+class AttachHandoffIntegrationTest(unittest.TestCase):
+    """Pure attach-failure handoff through teardown defer and late reaping."""
+
+    def _restore_case_details(self, saved):
+        acceptance.CASE_DETAILS.clear()
+        acceptance.CASE_DETAILS.update(saved)
+
+    def _attach_failure(self, owner, pending):
+        case = FakeAttachCase(owner)
+        error = support.LegacyAcceptanceError("attach failed")
+        error.holder = pending
+        with mock.patch.object(
+            acceptance.legacy_support,
+            "attach_namespace_holder",
+            side_effect=error,
+        ):
+            with self.assertRaises(support.LegacyAcceptanceError):
+                acceptance.WorkspaceLegacyFuseShutdownTest._attach_holder(
+                    case, FakeChild(pid=7100)
+                )
+        return case
+
+    def _successful_payload(self, owner):
+        for name in acceptance.REQUIRED_CASES:
+            acceptance.CASE_DETAILS[name] = {"owned_mounts_remaining": 0}
+        result = FakeResult()
+        return report._report_payload(
+            scheduled=acceptance.REQUIRED_CASES,
+            result=result,
+            imported=True,
+            containment_owner=owner,
+        )
+
+    def test_attach_failure_defers_then_releases_after_late_reap(self):
+        saved = dict(acceptance.CASE_DETAILS)
+        self.addCleanup(self._restore_case_details, saved)
+        owner = ownership.ContainmentOwner()
+        pending = FakePendingHolder(pid=7300, exit_on_wait=True)
+        case = self._attach_failure(owner, pending)
+
+        snapshot = owner.snapshot()
+        self.assertEqual(snapshot["pending"], 1)
+        self.assertEqual(snapshot["deadline_exhausted"], 1)
+        self.assertEqual(snapshot["pending_children"][0]["kind"], "holder")
+        self.assertIsNone(snapshot["pending_children"][0]["mount_id"])
+        self.assertEqual(snapshot["pending_children"][0]["pid"], pending.pid)
+        self.assertIs(owner.pending_records()[0].proc, pending)
+        self.assertEqual(case.holders, [])
+        self.assertEqual(case.holder_proofs, [])
+
+        acceptance.WorkspaceLegacyFuseShutdownTest.tearDown(case)
+        self.assertEqual(case.h.cleanup_calls, 0)
+        self.assertTrue(owner.needs_late_cleanup())
+        self.assertEqual(owner.snapshot()["deferred_releases"], 1)
+        self.assertTrue(
+            acceptance.CASE_DETAILS[case.id()]["fixture_cleanup_deferred"]
+        )
+
+        clock = FakeAttachClock()
+        with mock.patch("os.kill", side_effect=AssertionError("foreign kill")), \
+                mock.patch("os.killpg", side_effect=AssertionError("group kill")):
+            owner.late_physical_drain(deadline=1.0, clock=clock, sleep=clock.sleep)
+        snapshot = owner.snapshot()
+        self.assertEqual(snapshot["pending"], 0)
+        self.assertEqual(snapshot["deferred_releases"], 0)
+        self.assertEqual(snapshot["retained_fixtures"], 0)
+        self.assertEqual(case.h.cleanup_calls, 1)
+        self.assertFalse(owner.needs_late_cleanup())
+
+        payload = self._successful_payload(owner)
+        self.assertFalse(payload["passed"])
+        self.assertEqual(payload["counts"]["success"], len(acceptance.REQUIRED_CASES))
+        self.assertEqual(payload["containment"]["started"], 1)
+        self.assertEqual(payload["containment"]["pending"], 0)
+
+    def test_late_deadline_with_live_holder_does_not_release(self):
+        saved = dict(acceptance.CASE_DETAILS)
+        self.addCleanup(self._restore_case_details, saved)
+        owner = ownership.ContainmentOwner()
+        pending = FakePendingHolder(pid=7301, exit_on_wait=False)
+        case = self._attach_failure(owner, pending)
+
+        acceptance.WorkspaceLegacyFuseShutdownTest.tearDown(case)
+        clock = FakeAttachClock()
+        reaped = owner.late_physical_drain(
+            deadline=0.05, clock=clock, sleep=clock.sleep
+        )
+        self.assertEqual(reaped, 0)
+        snapshot = owner.snapshot()
+        self.assertEqual(snapshot["pending"], 1)
+        self.assertEqual(snapshot["late_cleanup"]["state"], "deadline_exhausted")
+        self.assertEqual(snapshot["deferred_releases"], 1)
+        self.assertEqual(snapshot["retained_fixtures"], 1)
+        self.assertEqual(case.h.cleanup_calls, 0)
+        self.assertTrue(owner.needs_late_cleanup())
+        self.assertTrue(
+            acceptance.CASE_DETAILS[case.id()]["fixture_cleanup_deferred"]
+        )
+
+        pending.release()
+        owner.late_physical_drain(
+            deadline=clock() + 1.0, clock=clock, sleep=clock.sleep
+        )
+        snapshot = owner.snapshot()
+        self.assertEqual(snapshot["pending"], 0)
+        self.assertEqual(snapshot["deferred_releases"], 0)
+        self.assertEqual(case.h.cleanup_calls, 1)
 
 
 if __name__ == "__main__":
