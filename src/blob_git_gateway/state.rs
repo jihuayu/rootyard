@@ -141,10 +141,11 @@ impl BlobGitState {
     /// before the first protected upload instead of continuing into a write.
     #[cfg(test)]
     pub(crate) async fn pause_after_admission(&self, operation_id: Uuid) -> Result<(), GatewayError> {
-        if let Some(pause) = &self.publication_pause {
-            if pause.pause(operation_id).await && pause.was_abandoned() {
-                return Err(GatewayError::Conflict("acceptance publication was abandoned before upload"));
-            }
+        if let Some(pause) = &self.publication_pause
+            && pause.pause(operation_id).await
+            && pause.was_abandoned()
+        {
+            return Err(GatewayError::Conflict("acceptance publication was abandoned before upload"));
         }
         Ok(())
     }

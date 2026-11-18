@@ -1138,7 +1138,7 @@ async fn wait_push(task: PushTask, label: &str) -> Result<git::Output> {
     let joined = tokio::time::timeout(PUSH_BOUND, task)
         .await
         .map_err(|_| anyhow!("the {label} stock push exceeded its bound"))?;
-    Ok(joined.with_context(|| format!("the {label} stock push task failed"))??)
+    joined.with_context(|| format!("the {label} stock push task failed"))?
 }
 
 /// Record a `JoinHandle` result that a `select!` arm already consumed. The
