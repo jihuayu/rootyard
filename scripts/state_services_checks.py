@@ -450,7 +450,19 @@ def _dependency_ok(spec, expected):
     if spec.get("default-features", spec.get("default_features", True)) is not expected.get("default_features", True):
         return False
     if expected.get("path"):
-        return "version" not in spec and "package" not in spec
+        # Exact reviewed in-repo path dependency. Only the recorded literal
+        # path is accepted; it may not be renamed, relocated through a
+        # version/package/registry/git alternative, or carry any key beyond
+        # path/features/optionality. Feature and optional/default restrictions
+        # are enforced exactly as for a registry dependency, so a path entry
+        # cannot silently gain a provider or change its role.
+        if set(spec) - {"path", "features", "optional", "default-features", "default_features"}:
+            return False
+        if spec.get("path") != expected["path"]:
+            return False
+        if set(spec.get("features") or []) != set(expected.get("features") or []):
+            return False
+        return True
     if spec.get("path") is not None or spec.get("package") is not None:
         return False
     if "features" in expected and set(spec.get("features") or []) != set(expected["features"]):
@@ -592,6 +604,15 @@ def check_integrated_manifest(integrated, manifest_text, lock_text):
     reviewed = set(integrated.get("dependencies") or {})
     for key in actual:
         require(not key.startswith("target."), f"unreviewed target-specific integrated dependency {key.split('.', 1)[1]}")
+    # A vendored source is bound to its exact in-repo path, not just its name.
+    # This runs before the generic dependency check so a repointed alias reports
+    # its specific path error; keys absent from the review are left to the
+    # unreviewed-dependency guard below.
+    for key in actual:
+        if key.startswith("path.") and key in reviewed:
+            path = (actual[key] or {}).get("path")
+            require(path == integrated["dependencies"][key].get("path"),
+                    f"vendored source {key} must stay at {integrated['dependencies'][key].get('path')!r}")
     for key, expected in (integrated.get("dependencies") or {}).items():
         table = key.partition(".")[0]
         require(table in REVIEWED_TABLES, f"integrated dependency {key} uses an unreviewed table")
@@ -601,12 +622,6 @@ def check_integrated_manifest(integrated, manifest_text, lock_text):
     for key in actual:
         if key not in reviewed:
             raise ValueError(f"unreviewed integrated dependency {key}")
-    # A vendored source is bound to its exact in-repo path, not just its name.
-    for key in actual:
-        if key.startswith("path."):
-            path = (actual[key] or {}).get("path")
-            require(path == integrated["dependencies"][key].get("path"),
-                    f"vendored source {key} must stay at {integrated['dependencies'][key].get('path')!r}")
     # Package identities corroborate the exact bytes: frozen packages keep
     # (name, version, source, checksum) and additions are explicit pairs.
     parent_lock = (ROOT / integrated["baseline_lock"]).read_text(encoding="utf-8")

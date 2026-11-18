@@ -331,6 +331,48 @@ class IntegratedManifestTest(unittest.TestCase):
         # The reviewed request itself still passes unchanged.
         self.check()
 
+    def test_reviewed_in_repo_path_dependency_is_exactly_pinned(self):
+        reviewed = 'rootyard-refcas-log = { path = "crates/refcas-log" }'
+        cases = (
+            ('rootyard-refcas-log = { path = "crates/refcas-log-evil" }', "path"),
+            ('rootyard-refcas-log = { path = "crates/refcas-log", features = ["extra"] }',
+             "extra feature"),
+            ('rootyard-refcas-log = { path = "crates/refcas-log", default-features = false }',
+             "default-features"),
+            ('rootyard-refcas-log = { path = "crates/refcas-log", optional = true }',
+             "optional"),
+        )
+        for replacement, label in cases:
+            with self.subTest(label=label):
+                mutated = self.mutated(reviewed, replacement)
+                with self.assertRaisesRegex(ValueError, "differs from the reviewed integrated manifest"):
+                    self.check(mutated)
+                with self.assertRaisesRegex(
+                        ValueError,
+                        r"(integrated dependency dependencies\.rootyard-refcas-log changed|"
+                        r"optional dependency rootyard-refcas-log)"):
+                    self.check(mutated, integrated=self.rehashed(mutated))
+        # Moving the reviewed path dependency to another role is not a silent
+        # equivalent: the reviewed key disappears and the new key is unreviewed.
+        role_drift = self.manifest_text.replace(reviewed + "\n", "", 1)
+        self.assertNotEqual(role_drift, self.manifest_text)
+        role_drift = role_drift.replace("[dev-dependencies]\n",
+                                        "[dev-dependencies]\n" + reviewed + "\n", 1)
+        with self.assertRaisesRegex(ValueError, "differs from the reviewed integrated manifest"):
+            self.check(role_drift)
+        with self.assertRaisesRegex(ValueError, "dependencies.rootyard-refcas-log is missing"):
+            self.check(role_drift, integrated=self.rehashed(role_drift))
+
+    def test_other_dependency_paths_are_not_automatically_accepted(self):
+        # A reviewed registry dependency cannot be repointed at an in-repo path.
+        repointed = self.mutated('anyhow = "1"', 'anyhow = { path = "vendor/anyhow" }')
+        with self.assertRaisesRegex(ValueError, "integrated dependency dependencies.anyhow changed"):
+            self.check(repointed, integrated=self.rehashed(repointed))
+        # A new path dependency without a reviewed record stays unreviewed.
+        extra = self.mutated('anyhow = "1"', 'anyhow = "1"\nevil = { path = "vendor/evil" }')
+        with self.assertRaisesRegex(ValueError, "unreviewed integrated dependency dependencies.evil"):
+            self.check(extra, integrated=self.rehashed(extra))
+
     def test_dependency_line_changes_fail_the_exact_pin_and_the_record(self):
         for old, new in (('axum = "0.8"', 'axum = "0.7"'),
                          ('reqwest = { version = "0.12",', 'reqwest = { version = "0.11",')):
