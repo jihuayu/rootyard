@@ -18,24 +18,26 @@
 //!
 //! One statement reads the wrapper, both attempt candidates, the migration-138
 //! operation, the migration-139 event, the migration-147 producer binding, the
-//! cancellation tombstone and the current realm from one snapshot. The durable
-//! terminal/event payload JSON never crosses into Rust: the SELECT projects the
-//! same finite predicates migration 152's verifier evaluates (terminal present,
-//! exact cancelled terminal, event outcome/body binding, revision-mismatch
-//! retirement and tombstone key/exactness) as non-NULL booleans. A missing
-//! migration 152 is reported separately as unsupported before any relation is
-//! referenced. A wrapper from a stale realm, a false/unknown predicate, a
-//! partially written attempt or a second current candidate is a fixed
-//! ledger-integrity refusal, never a weaker replay.
+//! cancellation tombstone and the current realm from one snapshot. The
+//! request-aware SELECT projects the same finite predicates migration 152's
+//! verifier evaluates (terminal present, exact cancelled terminal, event
+//! outcome/body binding, revision-mismatch retirement and tombstone
+//! key/exactness) as non-NULL booleans and transfers no terminal body. The
+//! GET-only status SELECT adds only the current attempt's terminal body from
+//! that same snapshot. A missing migration 152 is reported separately as
+//! unsupported before any relation is referenced. A wrapper from a stale realm,
+//! a false/unknown predicate, a partially written attempt or a second current
+//! candidate is a fixed ledger-integrity refusal, never a weaker replay.
 //!
 //! The result never returns a legacy operation or cancellation row: an
 //! identifier that is privately claimed is a [`PublicAttemptLookup::PrivateIdentifier`]
 //! marker, and a legacy-only identifier is a [`PublicAttemptLookup::LegacyPath`]
-//! marker for the separately authorized legacy path. Terminal JSON is verified
-//! against its event but is not re-exposed here; an authorized caller can read
-//! the returned current private operation through the normal core reader.
-//! Error values and the lookup types' `Debug` output are fixed/redacted rather
-//! than carrying PostgreSQL text, IDs, digests or payload bodies.
+//! marker for the separately authorized legacy path. The request-aware lookup
+//! does not re-expose terminal JSON; the status lookup projects only a bounded,
+//! typed, canonical current terminal and never a private id, input binding,
+//! retired terminal or arbitrary field. Error values and the lookup types'
+//! `Debug` output are fixed/redacted rather than carrying PostgreSQL text, IDs,
+//! digests or payload bodies.
 //!
 //! A current attempt must agree with its wrapper state. In particular, a slot
 //! zero private rejection whose wrapper is still pending is refused closed
@@ -66,6 +68,9 @@ use std::fmt;
 use tokio::time::{Instant, timeout_at};
 use tokio_postgres::{Transaction, error::SqlState};
 use uuid::Uuid;
+
+mod status_terminal;
+use status_terminal::{SELECT_STATUS_SNAPSHOT, project_terminal};
 
 /// Migration 152 is the compatibility probe, not a second authority. The
 /// catalog/table/function checks keep an older or partial catalog an explicit
@@ -328,17 +333,27 @@ impl fmt::Debug for PublicOperationStatusRequest {
     }
 }
 
-/// The data a future GET may return. This intentionally omits every private
-/// attempt field and any terminal payload: the snapshot only attests the
-/// terminal/event agreement, so a raw terminal cannot be decoupled from that
-/// proof yet.
+/// The data a future GET may return. This omits every private attempt field and
+/// keeps the terminal body private so it can only leave through a redacted
+/// accessor. `Pending` has no terminal; a terminal value is the exact bounded
+/// typed projection already checked against the current event and wrapper.
 #[allow(dead_code)] // Crate-private foundation: the future gateway GET consumes it.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct PublicOperationStatus {
     pub public_id: Uuid,
     /// Current wrapper state. `Pending` means the outcome is still unknown;
     /// terminal variants have already passed the event-body checks.
     pub state: OperationState,
+    terminal: Option<Value>,
+}
+
+impl PublicOperationStatus {
+    /// The bounded, verified terminal body for a future GET view. Pending is
+    /// `None`; a terminal state is already canonical and contains no private
+    /// attempt, input binding, raw digest or arbitrary extra field.
+    pub(crate) fn terminal(&self) -> Option<&Value> {
+        self.terminal.as_ref()
+    }
 }
 
 impl fmt::Debug for PublicOperationStatus {
@@ -347,6 +362,7 @@ impl fmt::Debug for PublicOperationStatus {
             .debug_struct("PublicOperationStatus")
             .field("public_id", &Redacted)
             .field("state", &self.state)
+            .field("terminal", &self.terminal.as_ref().map(|_| Redacted))
             .finish()
     }
 }
@@ -354,7 +370,7 @@ impl fmt::Debug for PublicOperationStatus {
 /// Read-only GET-side routing answer. The marker variants carry no row, digest,
 /// terminal, event, issuer or private identity.
 #[allow(dead_code)] // Crate-private foundation: the future gateway GET consumes it.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) enum PublicOperationStatusLookup {
     /// No public wrapper, private claim or legacy operation/cancellation is
     /// visible for this repository-scoped identifier.
@@ -486,9 +502,11 @@ impl PgRefStore {
     /// without state data. Unknown, legacy and private markers are preserved so
     /// a GET never routes a private id to the legacy path.
     ///
-    /// No terminal payload crosses this boundary. A terminal state is returned
-    /// only after the one snapshot proves the same current/retired
-    /// terminal/event/tombstone agreement required by the request-aware lookup.
+    /// The terminal body crosses only through the GET-only typed projection in
+    /// the same snapshot. Pending is `None`; a terminal state is returned only
+    /// after the shared current/retired event/tombstone proof and the typed
+    /// repository/revision/kind/field checks have passed. The request-aware
+    /// push lookup remains payload-free.
     #[allow(dead_code)] // No production caller until the GET route is deliberately opened.
     pub(crate) async fn lookup_public_operation_status(
         &self,
@@ -509,16 +527,39 @@ impl PgRefStore {
         request: &PublicOperationStatusRequest,
         deadline: Instant,
     ) -> Result<PublicOperationStatusLookup, PackCommitError> {
-        let snapshot = read_public_snapshot(tx, request.repository_id, request.public_id, deadline).await?;
+        let snapshot = read_public_status_snapshot(tx, request.repository_id, request.public_id, deadline).await?;
         evaluate_status(snapshot, request)
     }
 }
 
-/// Read the one bounded schema probe and snapshot shared by the request-aware
-/// lookup and the GET-side status contract. It never begins, ends, retries or
-/// writes the caller's transaction.
+/// Read the ordinary request-aware snapshot, without transferring any terminal
+/// body. Its one-statement/schema/deadline behavior is unchanged.
 async fn read_public_snapshot(
     tx: &Transaction<'_>,
+    repository_id: Uuid,
+    public_id: Uuid,
+    deadline: Instant,
+) -> Result<RawSnapshot, PackCommitError> {
+    read_public_snapshot_sql(tx, SELECT_SNAPSHOT, repository_id, public_id, deadline).await
+}
+
+/// Read the GET-only snapshot. It is the same single bounded statement and
+/// schema probe, with the current attempt's terminal body added; there is no
+/// second read after authorization.
+async fn read_public_status_snapshot(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    public_id: Uuid,
+    deadline: Instant,
+) -> Result<RawSnapshot, PackCommitError> {
+    read_public_snapshot_sql(tx, SELECT_STATUS_SNAPSHOT, repository_id, public_id, deadline).await
+}
+
+/// Shared schema probe, statement/lock budget and deserialization for both
+/// snapshots. It never begins, ends, retries or writes the caller's transaction.
+async fn read_public_snapshot_sql(
+    tx: &Transaction<'_>,
+    sql: &str,
     repository_id: Uuid,
     public_id: Uuid,
     deadline: Instant,
@@ -548,7 +589,7 @@ async fn read_public_snapshot(
     })?;
 
     let row = tx
-        .query_one(SELECT_SNAPSHOT, &[&repository_id, &public_id])
+        .query_one(sql, &[&repository_id, &public_id])
         .await
         .map_err(lookup_db_error)
         .map_err(PackCommitError::from)?;
@@ -592,13 +633,14 @@ fn validate_status_request(request: &PublicOperationStatusRequest) -> Result<(),
 /// [`PublicAttemptRequest`] from the stored row: that would turn durable
 /// evidence into a guessed request and would bypass the request-aware lookup's
 /// contract. Instead the same wrapper shape, realm and attempt proofs run
-/// against the stored immutable identity, and only the current state leaves.
+/// against the stored immutable identity, and only the current state plus its
+/// bounded typed terminal leave.
 fn evaluate_status(
     snapshot: RawSnapshot,
     request: &PublicOperationStatusRequest,
 ) -> Result<PublicOperationStatusLookup, PackCommitError> {
     validate_status_request(request)?;
-    let Some(wrapper) = snapshot.wrapper else {
+    let Some(wrapper) = snapshot.wrapper.as_ref() else {
         if snapshot.private_occupied {
             return Ok(PublicOperationStatusLookup::PrivateIdentifier);
         }
@@ -632,19 +674,26 @@ fn evaluate_status(
     // identity, slot, event and cancellation shape. No request digest or mode
     // is guessed; the SQL serving-binding predicate already uses these stored
     // immutable values.
-    let stored = parse_wrapper_identity(&wrapper)?;
-    let state = validate_wrapper_shape(&wrapper, &stored)?;
+    let stored = parse_wrapper_identity(wrapper)?;
+    let state = validate_wrapper_shape(wrapper, &stored)?;
     if !snapshot.realm_matches {
         return Err(stale_realm());
     }
 
-    let evidence = validate_current_attempts(&snapshot, &wrapper, state)?;
-    Ok(PublicOperationStatusLookup::Found(PublicOperationStatus { public_id: evidence.public_id, state }))
+    let evidence = validate_current_attempts(&snapshot, wrapper, state)?;
+    let terminal = project_terminal(
+        state,
+        wrapper.repository_id,
+        stored.object_format,
+        evidence.current.event_revision,
+        snapshot.status_terminal.as_ref(),
+    )?;
+    Ok(PublicOperationStatusLookup::Found(PublicOperationStatus { public_id: evidence.public_id, state, terminal }))
 }
 
 fn evaluate(snapshot: RawSnapshot, request: &PublicAttemptRequest) -> Result<PublicAttemptLookup, PackCommitError> {
     validate_request(request)?;
-    let Some(wrapper) = snapshot.wrapper else {
+    let Some(wrapper) = snapshot.wrapper.as_ref() else {
         if snapshot.private_occupied {
             return Ok(PublicAttemptLookup::PrivateIdentifier);
         }
@@ -661,12 +710,12 @@ fn evaluate(snapshot: RawSnapshot, request: &PublicAttemptRequest) -> Result<Pub
         return Err(ledger("public operation identifier is also claimed by the legacy operation registry"));
     }
 
-    let state = validate_wrapper(&wrapper, request)?;
+    let state = validate_wrapper(wrapper, request)?;
     if !snapshot.realm_matches {
         return Err(stale_realm());
     }
 
-    let evidence = validate_current_attempts(&snapshot, &wrapper, state)?;
+    let evidence = validate_current_attempts(&snapshot, wrapper, state)?;
     match state {
         OperationState::Pending => Ok(PublicAttemptLookup::Pending(evidence)),
         OperationState::Committed => Ok(PublicAttemptLookup::Committed(evidence)),
@@ -1089,6 +1138,10 @@ struct RawSnapshot {
     legacy_operation: bool,
     legacy_cancellation: bool,
     realm_matches: bool,
+    /// Present only in the GET-only snapshot query; the request-aware query
+    /// leaves it absent and therefore payload-free.
+    #[serde(default)]
+    status_terminal: Option<Value>,
 }
 
 impl RawWrapper {

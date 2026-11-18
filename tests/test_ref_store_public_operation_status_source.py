@@ -2,14 +2,16 @@
 
 This pins the GET-side boundary only: repository plus public id, no guessed push
 wire/mode/private identity, one shared bounded snapshot/schema/deadline, the
-same current/retired/realm/terminal proof as the request-aware lookup, no raw
-terminal JSON, and no new write path. No database, Cargo, rustc or service runs.
+same current/retired/realm/terminal proof as the request-aware lookup, a
+GET-only bounded typed terminal projection, and no new write path. No database,
+Cargo, rustc or service runs.
 """
 from pathlib import Path
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'src/ref_store/pg/public_attempt.rs'
+STATUS_TERMINAL = ROOT / 'src/ref_store/pg/public_attempt/status_terminal.rs'
 
 
 def slice_between(source, start, end):
@@ -20,6 +22,7 @@ class PublicOperationStatusSourceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = SOURCE.read_text()
+        cls.status_terminal = STATUS_TERMINAL.read_text()
 
     def test_status_request_carries_only_repository_public_id_and_auth(self):
         request = slice_between(
@@ -38,8 +41,10 @@ class PublicOperationStatusSourceTest(unittest.TestCase):
                                'impl fmt::Debug for PublicOperationStatus {')
         self.assertIn('pub public_id: Uuid', status)
         self.assertIn('pub state: OperationState', status)
+        self.assertIn('terminal: Option<Value>', status)
+        self.assertIn('pub(crate) fn terminal(&self) -> Option<&Value>', status)
         for forbidden in ('private_id', 'plan_digest', 'proof_digest', 'lane', 'sequence',
-                          'terminal_result', 'terminal:'):
+                          'terminal_result', 'pub terminal'):
             self.assertNotIn(forbidden, status)
         lookup = slice_between(self.source, 'pub(crate) enum PublicOperationStatusLookup {',
                                'impl fmt::Debug for PublicOperationStatusLookup {')
@@ -47,12 +52,11 @@ class PublicOperationStatusSourceTest(unittest.TestCase):
             self.assertIn(marker, lookup)
 
     def test_status_and_request_lookup_share_one_bounded_snapshot(self):
-        reader = slice_between(self.source, 'async fn read_public_snapshot(',
+        reader = slice_between(self.source, 'async fn read_public_snapshot_sql(',
                                'fn validate_request(')
         self.assertEqual(reader.count('SCHEMA_PROBE'), 1)
-        self.assertEqual(reader.count('SELECT_SNAPSHOT'), 1)
         self.assertGreaterEqual(reader.count('bound(tx, deadline)'), 2)
-        self.assertIn('.query_one(SELECT_SNAPSHOT', reader)
+        self.assertIn('.query_one(sql,', reader)
         for forbidden in ('tx.execute', 'INSERT ', 'UPDATE ', 'DELETE ', 'COMMIT', 'BEGIN'):
             self.assertNotIn(forbidden, reader)
 
@@ -61,9 +65,11 @@ class PublicOperationStatusSourceTest(unittest.TestCase):
         self.assertIn('read_public_snapshot(tx, request.repository_id, request.public_id, deadline)', attempt)
         self.assertIn('evaluate(snapshot, request)', attempt)
         status = slice_between(self.source, 'async fn lookup_public_operation_status_checked(',
-                               '/// Read the one bounded schema probe')
-        self.assertIn('read_public_snapshot(tx, request.repository_id, request.public_id, deadline)', status)
+                               '/// Read the ordinary request-aware snapshot')
+        self.assertIn('read_public_status_snapshot(tx, request.repository_id, request.public_id, deadline)', status)
         self.assertIn('evaluate_status(snapshot, request)', status)
+        self.assertIn('read_public_snapshot_sql(tx, SELECT_SNAPSHOT', self.source)
+        self.assertIn('read_public_snapshot_sql(tx, SELECT_STATUS_SNAPSHOT', self.source)
 
     def test_request_aware_lookup_keeps_its_digest_and_mode_comparisons(self):
         wrapper = slice_between(self.source, 'pub(super) fn validate_wrapper(',
@@ -78,22 +84,56 @@ class PublicOperationStatusSourceTest(unittest.TestCase):
     def test_status_reuses_shape_realm_and_current_retired_proofs(self):
         status = slice_between(self.source, 'fn evaluate_status(',
                                'fn evaluate(snapshot: RawSnapshot')
-        self.assertIn('parse_wrapper_identity(&wrapper)', status)
-        self.assertIn('validate_wrapper_shape(&wrapper, &stored)', status)
+        self.assertIn('parse_wrapper_identity(wrapper)', status)
+        self.assertIn('validate_wrapper_shape(wrapper, &stored)', status)
         self.assertIn('snapshot.realm_matches', status)
         self.assertIn('stale_realm()', status)
-        self.assertIn('validate_current_attempts(&snapshot, &wrapper, state)', status)
+        self.assertIn('validate_current_attempts(&snapshot, wrapper, state)', status)
+        self.assertIn('project_terminal(', status)
+        self.assertIn('snapshot.status_terminal.as_ref()', status)
+        self.assertIn('state, terminal', status)
         self.assertIn('PublicOperationStatusLookup::PrivateIdentifier', status)
         self.assertIn('PublicOperationStatusLookup::LegacyPath', status)
         self.assertIn('PublicOperationStatusLookup::Forbidden', status)
         self.assertIn('issuer_id != wrapper.issuer_id', status)
-        self.assertIn('PublicOperationStatus { public_id: evidence.public_id, state }', status)
 
         proof = slice_between(self.source, 'fn validate_current_attempts(',
                               '/// The stored immutable identity')
         for shared in ('validate_attempt(', 'validate_current(', 'validate_retired(',
                        'retired_raw', 'private identifier'):
             self.assertIn(shared, proof)
+
+    def test_get_only_terminal_projection_is_typed_bounded_and_payload_free_on_push(self):
+        request_sql = slice_between(self.source, 'const SELECT_SNAPSHOT: &str = r#"', '"#;')
+        status_sql = slice_between(self.status_terminal,
+                                   'pub(super) const SELECT_STATUS_SNAPSHOT: &str = r#"', '"#;')
+        self.assertNotIn('status_terminal', request_sql)
+        self.assertNotIn('to_jsonb(o.terminal_result)', request_sql)
+        self.assertIn("'status_terminal'", status_sql)
+        self.assertIn('a.slot=w.current_slot', status_sql)
+        self.assertIn('o.terminal_result', status_sql)
+        for forbidden in ('octet_length', 'pg_column_size', 'length(', 'char_length'):
+            self.assertNotIn(forbidden, status_sql)
+        for forbidden in (';', ' insert ', ' update ', ' delete ', ' for update', ' for share', 'pg_advisory'):
+            self.assertNotIn(forbidden, status_sql.lower())
+
+        projection = slice_between(self.status_terminal, 'pub(super) fn project_terminal(', 'fn cancelled_terminal')
+        self.assertIn('TerminalResult::json(value.clone())', projection)
+        self.assertIn('PackCommitTerminal', projection)
+        self.assertIn('canonical != result.value()', projection)
+        self.assertIn('validate_typed(', projection)
+        self.assertNotIn('private_id', projection)
+        self.assertNotIn('plan_digest', projection)
+        self.assertNotIn('wire_digest', projection)
+        validation = slice_between(self.status_terminal, 'fn validate_typed(', 'fn validate_ref_result')
+        for check in ('typed.repository_id != repository_id', 'event_revision != Some(typed.revision)',
+                      'PackMode::parse', 'RefName::branch', 'MAX_PLAN_REFS',
+                      'MAX_BATCH_NEW_PACKS', 'is_canonical_hex_64', 'validate_rejection'):
+            self.assertIn(check, validation)
+        rejection = slice_between(self.status_terminal, 'fn validate_rejection(', '#[cfg(test)]' if '#[cfg(test)]' in self.status_terminal else self.status_terminal[-200:])
+        self.assertIn('DenialCode::ALL', rejection)
+        self.assertIn('admitted base was superseded', rejection)
+        self.assertIn('no ref accepted', rejection)
 
     def test_status_has_no_handler_or_write_path(self):
         status = slice_between(self.source, 'pub(crate) async fn lookup_public_operation_status(',
