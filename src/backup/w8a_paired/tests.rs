@@ -138,9 +138,11 @@ fn destructive_gc_switches_all_refuse() {
         max_attempts: 5,
     };
     assert!(ensure_destructive_gc_disabled_with(&policy(false), false, None).is_ok());
+    assert!(ensure_destructive_gc_disabled_with(&policy(false), false, Some("disabled")).is_ok());
     assert!(ensure_destructive_gc_disabled_with(&policy(true), false, None).is_err());
     assert!(ensure_destructive_gc_disabled_with(&policy(false), true, None).is_err());
     assert!(ensure_destructive_gc_disabled_with(&policy(false), false, Some("true")).is_err());
+    assert!(ensure_destructive_gc_disabled_with(&policy(false), false, Some("false")).is_err());
 }
 
 fn sample_sidecar() -> W8aPairedSidecarManifest {

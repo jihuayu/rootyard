@@ -163,6 +163,7 @@ async fn expect_failure(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL and PostgreSQL 17 pg_dump/pg_restore"]
 async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Result<()> {
     let server = LoopbackS3::shared();
     let temp = tempfile::tempdir()?;
@@ -188,7 +189,7 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
         (KEYRING, Some(keyring.as_str())),
         ("ROOTYARD_BLOB_KMS_KEY_REF", None),
         ("ROOTYARD_PAIRED_RAFT_CLUSTER_JSON", None),
-        (BLOB_DELETE, Some("false")),
+        (BLOB_DELETE, Some("disabled")),
         (MAINTENANCE, Some("false")),
         (WORKSPACE_DELETE, Some("false")),
         (TEST_URL, Some(source_url.as_str())),

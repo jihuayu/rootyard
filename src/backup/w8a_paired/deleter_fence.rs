@@ -83,8 +83,8 @@ pub(super) fn ensure_destructive_gc_disabled_with(
     if workspace_remote_delete {
         return Err(W8aError::DestructiveGcForbidden(format!("{ENV_WORKSPACE_REMOTE_DELETE}=true")));
     }
-    if matches!(blob_delete, Some("true" | "enabled")) {
-        return Err(W8aError::DestructiveGcForbidden(format!("{ENV_BLOB_DELETE} enables remote deletes")));
+    if !matches!(blob_delete, None | Some("" | "disabled")) {
+        return Err(W8aError::DestructiveGcForbidden(format!("{ENV_BLOB_DELETE} must be unset or disabled")));
     }
     Ok(())
 }

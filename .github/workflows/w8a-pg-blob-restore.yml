@@ -120,7 +120,7 @@ jobs:
             echo "== W8-A unit tests =="
             cargo test --locked --no-default-features --lib backup::w8a_paired -- --test-threads=1
             echo "== W8-A live paired restore =="
-            cargo test --locked --no-default-features --test w8a_pg_blob_paired_restore -- --test-threads=1
+            cargo test --locked --no-default-features --test w8a_pg_blob_paired_restore -- --ignored --test-threads=1
             echo "== offline contracts =="
             python3 tests/test_w8a_pg_blob_paired_contracts.py
             python3 tests/test_ci_cargo_fork_workflows.py

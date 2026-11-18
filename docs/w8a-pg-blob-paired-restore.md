@@ -65,7 +65,7 @@ exact domains and validation rules.
 2. Keep destructive GC disabled:
    `ROOTYARD_STORAGE_MAINTENANCE=false`,
    `ROOTYARD_WORKSPACE_UNSAFE_REMOTE_DELETE=false` and
-   `ROOTYARD_BLOB_DELETE=false`.
+   `ROOTYARD_BLOB_DELETE=disabled`.
 3. Run the backup binary against an **absent** destination directory:
 
    ```
