@@ -573,7 +573,7 @@ class MarkerSeamTest(unittest.TestCase):
         self.markers.append(payload)
         return len(payload)
 
-    def run_suite(self, suite: unittest.TestSuite, *, write=None) -> int:
+    def run_suite(self, suite: unittest.TestSuite, *, write=None, **options) -> int:
         with mock.patch.object(runner, "discover", return_value=suite):
             return runner.run(
                 ROOT / "tests",
@@ -584,6 +584,7 @@ class MarkerSeamTest(unittest.TestCase):
                 disable_fatal_handler=self.disable_fatal,
                 is_fatal_handler_enabled=self.is_fatal_enabled,
                 marker_write=self.write_marker if write is None else write,
+                **options,
             )
 
     def parsed_markers(self) -> list[tuple[str, int, str]]:
@@ -811,6 +812,189 @@ class MarkerSeamTest(unittest.TestCase):
         self.assertEqual(code, 5)
         self.assertEqual(calls, [])
         self.assertIn("Ran 0 tests", self.output.getvalue())
+
+    def test_report_projects_checkout_counts_and_failed_test_hashes(self) -> None:
+        class Cases(unittest.TestCase):
+            def test_pass(self):
+                pass
+
+            def test_subtest(self):
+                with self.subTest(value="private parameter"):
+                    self.fail("private assertion")
+
+            def test_error(self):
+                raise RuntimeError("private exception")
+
+            def test_skip(self):
+                self.skipTest("private reason")
+
+            @unittest.expectedFailure
+            def test_expected_failure(self):
+                self.fail("private expected failure")
+
+            @unittest.expectedFailure
+            def test_unexpected_success(self):
+                pass
+
+        commit, tree = "a" * 40, "b" * 40
+        git = self.enterContext(mock.patch.object(
+            runner.subprocess, "run", return_value=mock.Mock(stdout=f"{commit}\n{tree}\n".encode("ascii")),
+        ))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = root / "results" / "report.json"
+        cases = [Cases(name) for name in unittest.defaultTestLoader.getTestCaseNames(Cases)]
+        code = self.run_suite(unittest.TestSuite(cases), report_out=path, expected_commit=commit)
+        self.assertEqual(code, 1)
+        self.assertEqual(git.call_args_list, [mock.call(
+            ["git", "--no-replace-objects", "rev-parse", "HEAD^{commit}", "HEAD^{tree}"],
+            cwd=runner.ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=5,
+        )] * 2)
+        data = path.read_bytes()
+        self.assertLessEqual(len(data), runner.REPORT_MAX_BYTES)
+        report = json.loads(data)
+        elapsed_ms = report.pop("elapsed_ms")
+        self.assertIs(type(elapsed_ms), int)
+        self.assertTrue(0 <= elapsed_ms <= runner.REPORT_MAX_ELAPSED_MS)
+        self.assertEqual(report, {
+            "version": 1, "source_commit": commit, "source_tree": tree,
+            "stage": "suite", "outcome": "failed", "exit_code": 1,
+            "counts": {
+                "tests_run": 6, "failures": 1, "errors": 1, "skipped": 1,
+                "expected_failures": 1, "unexpected_successes": 1,
+            },
+            "cases": [
+                {
+                    "outcome": outcome,
+                    "test_sha256": hashlib.sha256(Cases(name).id().encode()).hexdigest(),
+                }
+                for name, outcome in (
+                    ("test_subtest", "failure"), ("test_error", "error"),
+                    ("test_unexpected_success", "unexpected_success"),
+                )
+            ],
+            "cases_truncated": False,
+        })
+        for case in cases:
+            self.assertNotIn(case.id().encode(), data)
+        self.assertNotIn(b"private", data)
+        self.assertNotIn(str(root).encode(), data)
+
+    def test_report_bounds_counts_elapsed_time_and_case_rows(self) -> None:
+        class Fails(unittest.TestCase):
+            def runTest(self):
+                self.fail("private failure")
+
+        commit, tree = "a" * 40, "b" * 40
+        self.enterContext(mock.patch.object(runner, "_checkout_binding", return_value=(commit, tree)))
+        self.enterContext(mock.patch.object(runner, "REPORT_MAX_COUNT", 16))
+        end_ns = (runner.REPORT_MAX_ELAPSED_MS + 1) * 1_000_000
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = root / "report.json"
+        suite = unittest.TestSuite(Fails() for _ in range(runner.REPORT_MAX_CASES + 1))
+        with mock.patch.object(runner.time, "monotonic_ns", side_effect=(0, end_ns)):
+            self.assertEqual(self.run_suite(suite, report_out=path, expected_commit=commit), 1)
+        data = path.read_bytes()
+        self.assertLessEqual(len(data), runner.REPORT_MAX_BYTES)
+        report = json.loads(data)
+        self.assertEqual(report["elapsed_ms"], runner.REPORT_MAX_ELAPSED_MS)
+        self.assertEqual(report["counts"]["tests_run"], 16)
+        self.assertEqual(report["counts"]["failures"], 16)
+        self.assertEqual(len(report["cases"]), runner.REPORT_MAX_CASES)
+        self.assertTrue(report["cases_truncated"])
+
+    def test_requested_report_failure_keeps_suite_exit_semantics(self) -> None:
+        class Case(unittest.TestCase):
+            def test_pass(self):
+                pass
+
+            def test_fail(self):
+                self.fail("private failure")
+
+        commit, tree = "a" * 40, "b" * 40
+        self.enterContext(mock.patch.object(runner, "_checkout_binding", return_value=(commit, tree)))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = root / "report.json"
+        path.mkdir()
+        for cases, expected in (([Case("test_pass")], 1), ([Case("test_fail")], 1), ([], 5)):
+            with self.subTest(expected=expected, cases=len(cases)):
+                notice = io.StringIO()
+                with mock.patch.object(runner.sys, "stderr", notice):
+                    code = self.run_suite(unittest.TestSuite(cases), report_out=path, expected_commit=commit)
+                self.assertEqual(code, expected)
+                self.assertEqual(notice.getvalue(), "Python CI report unavailable\n")
+                self.assertEqual(list(root.iterdir()), [path])
+
+    def test_report_rejects_changed_checkout_without_skipping_the_suite(self) -> None:
+        body = mock.Mock()
+
+        class Pass(unittest.TestCase):
+            def runTest(self):
+                body()
+
+        commit, tree = "a" * 40, "b" * 40
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = root / "report.json"
+        notice = io.StringIO()
+        with (
+            mock.patch.object(runner, "_checkout_binding", side_effect=((commit, tree), None)),
+            mock.patch.object(runner.sys, "stderr", notice),
+        ):
+            code = self.run_suite(unittest.TestSuite([Pass()]), report_out=path, expected_commit=commit)
+        self.assertEqual(code, 1)
+        body.assert_called_once_with()
+        self.assertFalse(path.exists())
+        self.assertEqual(notice.getvalue(), "Python CI report unavailable\n")
+
+    def test_requested_report_records_empty_and_discovery_exit_without_changing_them(self) -> None:
+        commit, tree = "a" * 40, "b" * 40
+        self.enterContext(mock.patch.object(runner, "_checkout_binding", return_value=(commit, tree)))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = root / "report.json"
+        self.assertEqual(self.run_suite(unittest.TestSuite(), report_out=path, expected_commit=commit), 5)
+        empty = json.loads(path.read_bytes())
+        self.assertEqual((empty["stage"], empty["outcome"], empty["exit_code"]), ("suite", "empty", 5))
+
+        error = RuntimeError("private discovery exception")
+        with mock.patch.object(runner, "discover", side_effect=error), self.assertRaises(RuntimeError) as caught:
+            runner.run(
+                stream=self.output,
+                start_timer=self.start_timer,
+                stop_timer=self.stop_timer,
+                is_fatal_handler_enabled=self.is_fatal_enabled,
+                marker_write=self.write_marker,
+                report_out=path,
+                expected_commit=commit,
+            )
+        self.assertIs(caught.exception, error)
+        data = path.read_bytes()
+        report = json.loads(data)
+        self.assertEqual((report["stage"], report["outcome"], report["exit_code"]), ("discovery", "incomplete", None))
+        self.assertEqual(report["cases"], [])
+        self.assertNotIn(b"private", data)
+
+    def test_interrupted_suite_reports_outcomes_already_recorded(self) -> None:
+        class Fail(unittest.TestCase):
+            def runTest(self):
+                self.fail("private failure")
+
+        class InterruptedSuite(unittest.TestSuite):
+            def run(self, result, debug=False):
+                super().run(result, debug)
+                raise KeyboardInterrupt
+
+        commit, tree = "a" * 40, "b" * 40
+        self.enterContext(mock.patch.object(runner, "_checkout_binding", return_value=(commit, tree)))
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        path = root / "report.json"
+        case = Fail()
+        expected_hash = hashlib.sha256(case.id().encode()).hexdigest()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_suite(InterruptedSuite([case]), report_out=path, expected_commit=commit)
+        report = json.loads(path.read_bytes())
+        self.assertEqual((report["stage"], report["outcome"], report["exit_code"]), ("suite", "incomplete", None))
+        self.assertEqual(report["counts"]["tests_run"], 1)
+        self.assertEqual(report["cases"], [{"test_sha256": expected_hash, "outcome": "failure"}])
+        self.stop_timer.assert_called_once_with()
 
 
 if __name__ == "__main__":

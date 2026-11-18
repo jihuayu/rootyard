@@ -159,6 +159,93 @@ def check_blob_profile(env):
     root = env.get("ROOTYARD_BLOB_ROOT", "")
     if root: need(not root.startswith("/") and not root.endswith("/") and all(part not in ("", ".", "..") for part in root.split("/")), "invalid ROOTYARD_BLOB_ROOT")
     return {"driver": "opendal", "service": "s3", "endpoint_scheme": url.scheme, "endpoint_loopback": loopback, "root_configured": bool(root), "delete_policy": "disabled"}
+STARTUP_STAGES = frozenset((
+    "spawn", "child_exit", "readiness_probe", "readiness_timeout",
+    "post_ready", "stop_reclaim", "other",
+))
+EXIT_STATUSES = frozenset((
+    "not_applicable", "exited_0", "exited_1", "exited_101", "signaled", "other_exit",
+))
+_PRIMARY_FAILURE_STAGES = frozenset(("child_exit", "readiness_timeout", "post_ready"))
+
+
+def _closed_startup_stage(value):
+    """Return a closed startup-stage label, never an arbitrary value."""
+    return value if type(value) is str and value in STARTUP_STAGES else "other"
+
+
+def _closed_exit_status(value):
+    """Return a closed exit-status label, never an arbitrary value."""
+    return value if type(value) is str and value in EXIT_STATUSES else "not_applicable"
+
+
+def _exit_status_from_returncode(returncode):
+    """Derive the closed exit status from an already-observed return code."""
+    if type(returncode) is not int:
+        return "other_exit"
+    if returncode < 0:
+        return "signaled"
+    if returncode == 0:
+        return "exited_0"
+    if returncode == 1:
+        return "exited_1"
+    if returncode == 101:
+        return "exited_101"
+    return "other_exit"
+
+
+class StartupProjection:
+    """Closed, test-only observation of the existing ``start`` control flow.
+
+    The object stores only finite labels and booleans.  It never stores the
+    process, argv, environment, path, log, exception, message, traceback or
+    return-code object itself.  ``safe_fields`` revalidates both labels.
+    """
+
+    __slots__ = ("_stage", "_exit_status", "failed", "touched", "in_stop")
+
+    def __init__(self):
+        self._stage = "other"
+        self._exit_status = "not_applicable"
+        self.failed = False
+        self.touched = False
+        self.in_stop = False
+
+    def enter(self, stage):
+        self._stage = _closed_startup_stage(stage)
+        self._exit_status = "not_applicable"
+        self.touched = True
+
+    def child_exited(self, returncode):
+        self._stage = "child_exit"
+        self._exit_status = _exit_status_from_returncode(returncode)
+        self.touched = True
+
+    def enter_stop(self):
+        self.in_stop = True
+
+    def leave_stop(self):
+        self.in_stop = False
+
+    def mark_stop_reclaim(self):
+        # A cleanup failure must not overwrite a known primary startup
+        # failure; it is the fallback only when no such stage was observed.
+        if self._stage not in _PRIMARY_FAILURE_STAGES:
+            self._stage = "stop_reclaim"
+            self._exit_status = "not_applicable"
+        self.in_stop = False
+        self.touched = True
+
+    def safe_fields(self):
+        stage = _closed_startup_stage(self._stage)
+        status = _closed_exit_status(self._exit_status)
+        if stage != "child_exit":
+            status = "not_applicable"
+        elif status == "not_applicable":
+            status = "other_exit"
+        return stage, status
+
+
 class BlobOnlyHarness(Harness):
     def __init__(self, args, profile, blob_profile):
         super().__init__(args)
@@ -185,31 +272,56 @@ esac
 
     def prepare(self):
         if not self.schema_created: self.setup()
-    def start(self, overrides=None, label="server"):
+    def start(self, overrides=None, label="server", startup_projection=None):
         if self.proc is not None:
             raise AssertionError("serve-blob is already running")
-        env = self.env.copy()
-        env.update(overrides or {})
-        self.server_count += 1
-        self.log = open(self.root / (label + "-" + str(self.server_count) + ".log"), "ab")
-        self.proc = subprocess.Popen([str(self.profile.binary), "serve-blob"], env=env,
-                                     stdout=self.log, stderr=self.log, start_new_session=True)
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
-                status = self.proc.returncode
-                self.stop()
-                raise RuntimeError("serve-blob exited during startup with status " + str(status))
-            try:
-                if self.http("/health/ready")[0] == 200:
-                    assert sha256_file(self.profile.binary) == self.profile.build["binary_sha256"], "binary changed after attestation"
-                    native_evidence.started(self)
-                    return
-            except (OSError, urllib.error.URLError):
-                pass
-            time.sleep(0.1)
-        self.stop(hard=True)
-        raise RuntimeError("serve-blob readiness timeout")
+        observation = startup_projection if type(startup_projection) is StartupProjection else None
+        if observation is not None:
+            observation.enter("spawn")
+        completed = False
+        try:
+            env = self.env.copy()
+            env.update(overrides or {})
+            self.server_count += 1
+            self.log = open(self.root / (label + "-" + str(self.server_count) + ".log"), "ab")
+            self.proc = subprocess.Popen([str(self.profile.binary), "serve-blob"], env=env,
+                                         stdout=self.log, stderr=self.log, start_new_session=True)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if observation is not None:
+                    observation.enter("readiness_probe")
+                if self.proc.poll() is not None:
+                    status = self.proc.returncode
+                    if observation is not None:
+                        observation.child_exited(status)
+                        observation.enter_stop()
+                    self.stop()
+                    if observation is not None:
+                        observation.leave_stop()
+                    raise RuntimeError("serve-blob exited during startup with status " + str(status))
+                try:
+                    if self.http("/health/ready")[0] == 200:
+                        if observation is not None:
+                            observation.enter("post_ready")
+                        assert sha256_file(self.profile.binary) == self.profile.build["binary_sha256"], "binary changed after attestation"
+                        native_evidence.started(self)
+                        completed = True
+                        return
+                except (OSError, urllib.error.URLError):
+                    pass
+                time.sleep(0.1)
+            if observation is not None:
+                observation.enter("readiness_timeout")
+                observation.enter_stop()
+            self.stop(hard=True)
+            if observation is not None:
+                observation.leave_stop()
+            raise RuntimeError("serve-blob readiness timeout")
+        finally:
+            if observation is not None and not completed:
+                observation.failed = True
+                if observation.in_stop:
+                    observation.mark_stop_reclaim()
     def git(self, *args, cwd=None, token=None, check=True, env=None):
         prefix = [str(self.profile.git), "--no-pager", "-c", "credential.helper=",
                   "-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=30"]
