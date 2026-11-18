@@ -27,6 +27,11 @@ pub(crate) mod public_attempt;
 #[allow(dead_code)]
 pub(crate) mod public_terminal;
 
+/// Crate-private migration-152 slot-one rotation over a selected exact
+/// slot-zero revision-mismatch retirement. Not a gateway cutover.
+#[allow(dead_code)]
+pub(crate) mod slot_one;
+
 const MAX_QUERY_WINDOW: Duration = Duration::from_secs(30);
 pub const OPERATION_LOCK_DOMAIN: &str = "rootyard-ref-store-operation-v1";
 pub const OPERATION_LOCK_SQL: &str =
