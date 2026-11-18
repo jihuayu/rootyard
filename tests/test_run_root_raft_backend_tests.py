@@ -13,6 +13,7 @@ import copy
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 from unittest import mock
@@ -429,6 +430,16 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertIn(caught.exception.phase, runner.PHASES)
         self.assertNotIn(SECRET, str(caught.exception))
         return caught.exception
+
+    def _cli_anchor_environment(self):
+        """Neutralize only an ambient CI SHA for cases using --expected-commit.
+
+        The production resolver keeps its deliberate conflict check; these
+        mocked CLI cases supply their own anchor and must not be preempted by
+        an unrelated full GITHUB_SHA from the invoking host. Other environment
+        variables stay visible because the patch does not clear the mapping.
+        """
+        return mock.patch.dict(os.environ, {"GITHUB_SHA": ""}, clear=False)
 
     # -- receipt binding ---------------------------------------------------
     def test_load_and_validate_accepts_fixed_v2_receipt(self) -> None:
@@ -1768,7 +1779,8 @@ class RootRaftRunnerTest(unittest.TestCase):
         def fake_execute(*_args, **_kwargs):
             return runner.ExecutionResult(output, stderr, 101, None, "exited")
 
-        with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+        with self._cli_anchor_environment(), \
+             mock.patch.object(runner, "require_source_state", return_value=self.head), \
              mock.patch.object(runner, "_safe_head", return_value=self.head), \
              mock.patch.object(
                  runner,
@@ -1825,7 +1837,8 @@ class RootRaftRunnerTest(unittest.TestCase):
         def fake_execute(*_args, **_kwargs):
             return runner.ExecutionResult(output, stderr, 101, None, "exited")
 
-        with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+        with self._cli_anchor_environment(), \
+             mock.patch.object(runner, "require_source_state", return_value=self.head), \
              mock.patch.object(runner, "_safe_head", return_value=self.head), \
              mock.patch.object(
                  runner,
@@ -1874,7 +1887,8 @@ class RootRaftRunnerTest(unittest.TestCase):
         def fake_execute(*_args, **_kwargs):
             return runner.ExecutionResult(GOOD_OUTPUT, "", 101, None, "exited")
 
-        with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+        with self._cli_anchor_environment(), \
+             mock.patch.object(runner, "require_source_state", return_value=self.head), \
              mock.patch.object(runner, "_safe_head", return_value=self.head), \
              mock.patch.object(
                  runner,
@@ -1912,7 +1926,8 @@ class RootRaftRunnerTest(unittest.TestCase):
         def changed(*_args, **_kwargs):
             raise runner.RunnerError("execute", "evidence_changed")
 
-        with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+        with self._cli_anchor_environment(), \
+             mock.patch.object(runner, "require_source_state", return_value=self.head), \
              mock.patch.object(runner, "_safe_head", return_value=self.head), \
              mock.patch.object(
                  runner,
@@ -1960,7 +1975,8 @@ class RootRaftRunnerTest(unittest.TestCase):
                 def fake_execute(*_args, **_kwargs):
                     return runner.ExecutionResult(partial, SECRET, None, signal, termination)
 
-                with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+                with self._cli_anchor_environment(), \
+                     mock.patch.object(runner, "require_source_state", return_value=self.head), \
                      mock.patch.object(runner, "_safe_head", return_value=self.head), \
                      mock.patch.object(
                          runner,
@@ -2005,7 +2021,8 @@ class RootRaftRunnerTest(unittest.TestCase):
         def changed(*_args, **_kwargs):
             raise runner.RunnerError("execute", "evidence_changed")
 
-        with mock.patch.object(runner, "require_source_state", return_value=self.head), \
+        with self._cli_anchor_environment(), \
+             mock.patch.object(runner, "require_source_state", return_value=self.head), \
              mock.patch.object(runner, "_safe_head", return_value=self.head), \
              mock.patch.object(
                  runner,
