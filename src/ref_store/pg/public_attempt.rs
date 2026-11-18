@@ -66,11 +66,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
 use tokio::time::{Instant, timeout_at};
-use tokio_postgres::{Transaction, error::SqlState};
+use tokio_postgres::{Transaction, error::SqlState, types::ToSql};
 use uuid::Uuid;
 
 mod status_terminal;
-use status_terminal::{SELECT_STATUS_SNAPSHOT, project_terminal};
+use status_terminal::{SELECT_STATUS_SNAPSHOT, STATUS_TERMINAL_TRANSPORT_BOUND_BYTES, project_terminal};
 
 /// Migration 152 is the compatibility probe, not a second authority. The
 /// catalog/table/function checks keep an older or partial catalog an explicit
@@ -540,7 +540,8 @@ async fn read_public_snapshot(
     public_id: Uuid,
     deadline: Instant,
 ) -> Result<RawSnapshot, PackCommitError> {
-    read_public_snapshot_sql(tx, SELECT_SNAPSHOT, repository_id, public_id, deadline).await
+    let params: &[&(dyn ToSql + Sync)] = &[&repository_id, &public_id];
+    read_public_snapshot_sql(tx, SELECT_SNAPSHOT, params, deadline).await
 }
 
 /// Read the GET-only snapshot. It is the same single bounded statement and
@@ -552,7 +553,9 @@ async fn read_public_status_snapshot(
     public_id: Uuid,
     deadline: Instant,
 ) -> Result<RawSnapshot, PackCommitError> {
-    read_public_snapshot_sql(tx, SELECT_STATUS_SNAPSHOT, repository_id, public_id, deadline).await
+    let transport_bound = STATUS_TERMINAL_TRANSPORT_BOUND_BYTES;
+    let params: &[&(dyn ToSql + Sync)] = &[&repository_id, &public_id, &transport_bound];
+    read_public_snapshot_sql(tx, SELECT_STATUS_SNAPSHOT, params, deadline).await
 }
 
 /// Shared schema probe, statement/lock budget and deserialization for both
@@ -560,8 +563,7 @@ async fn read_public_status_snapshot(
 async fn read_public_snapshot_sql(
     tx: &Transaction<'_>,
     sql: &str,
-    repository_id: Uuid,
-    public_id: Uuid,
+    params: &[&(dyn ToSql + Sync)],
     deadline: Instant,
 ) -> Result<RawSnapshot, PackCommitError> {
     // The schema probe has its own statement/lock budget.
@@ -588,11 +590,7 @@ async fn read_public_snapshot_sql(
         })
     })?;
 
-    let row = tx
-        .query_one(sql, &[&repository_id, &public_id])
-        .await
-        .map_err(lookup_db_error)
-        .map_err(PackCommitError::from)?;
+    let row = tx.query_one(sql, params).await.map_err(lookup_db_error).map_err(PackCommitError::from)?;
     let snapshot: Value = row.get(0);
     serde_json::from_value::<RawSnapshot>(snapshot)
         .map_err(|_| ledger("public attempt lookup snapshot shape is not recognized"))
@@ -681,6 +679,9 @@ fn evaluate_status(
     }
 
     let evidence = validate_current_attempts(&snapshot, wrapper, state)?;
+    if snapshot.status_terminal_over_bound {
+        return Err(ledger("public terminal exceeds the bounded transport projection"));
+    }
     let terminal = project_terminal(
         state,
         wrapper.repository_id,
@@ -1142,6 +1143,10 @@ struct RawSnapshot {
     /// leaves it absent and therefore payload-free.
     #[serde(default)]
     status_terminal: Option<Value>,
+    /// The GET-only SQL cap withheld an oversized terminal body. This is an
+    /// explicit fail-closed marker, never a fallback to a direct payload read.
+    #[serde(default)]
+    status_terminal_over_bound: bool,
 }
 
 impl RawWrapper {

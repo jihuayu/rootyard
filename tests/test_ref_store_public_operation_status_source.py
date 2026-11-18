@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'src/ref_store/pg/public_attempt.rs'
 STATUS_TERMINAL = ROOT / 'src/ref_store/pg/public_attempt/status_terminal.rs'
+STATUS_TESTS = ROOT / 'src/ref_store/pg/public_attempt/tests.rs'
 
 
 def slice_between(source, start, end):
@@ -23,6 +24,7 @@ class PublicOperationStatusSourceTest(unittest.TestCase):
     def setUpClass(cls):
         cls.source = SOURCE.read_text()
         cls.status_terminal = STATUS_TERMINAL.read_text()
+        cls.status_tests = STATUS_TESTS.read_text()
 
     def test_status_request_carries_only_repository_public_id_and_auth(self):
         request = slice_between(
@@ -69,7 +71,8 @@ class PublicOperationStatusSourceTest(unittest.TestCase):
         self.assertIn('read_public_status_snapshot(tx, request.repository_id, request.public_id, deadline)', status)
         self.assertIn('evaluate_status(snapshot, request)', status)
         self.assertIn('read_public_snapshot_sql(tx, SELECT_SNAPSHOT', self.source)
-        self.assertIn('read_public_snapshot_sql(tx, SELECT_STATUS_SNAPSHOT', self.source)
+        self.assertIn('SELECT_STATUS_SNAPSHOT', self.source)
+        self.assertIn('&transport_bound', self.source)
 
     def test_request_aware_lookup_keeps_its_digest_and_mode_comparisons(self):
         wrapper = slice_between(self.source, 'pub(super) fn validate_wrapper(',
@@ -112,7 +115,7 @@ class PublicOperationStatusSourceTest(unittest.TestCase):
         self.assertIn("'status_terminal'", status_sql)
         self.assertIn('a.slot=w.current_slot', status_sql)
         self.assertIn('o.terminal_result', status_sql)
-        for forbidden in ('octet_length', 'pg_column_size', 'length(', 'char_length'):
+        for forbidden in ('pg_column_size', 'char_length', 'jsonb_pretty'):
             self.assertNotIn(forbidden, status_sql)
         for forbidden in (';', ' insert ', ' update ', ' delete ', ' for update', ' for share', 'pg_advisory'):
             self.assertNotIn(forbidden, status_sql.lower())
@@ -134,6 +137,29 @@ class PublicOperationStatusSourceTest(unittest.TestCase):
         self.assertIn('DenialCode::ALL', rejection)
         self.assertIn('admitted base was superseded', rejection)
         self.assertIn('no ref accepted', rejection)
+
+    def test_status_sql_transport_bound_is_distinct_generous_and_fail_closed(self):
+        status_sql = slice_between(self.status_terminal,
+                                   'pub(super) const SELECT_STATUS_SNAPSHOT: &str = r#"', '"#;')
+        self.assertIn('octet_length(o.terminal_result::text) <= $3::integer', status_sql)
+        self.assertIn('octet_length(o.terminal_result::text) > $3::integer', status_sql)
+        self.assertIn('ELSE NULL', status_sql)
+        self.assertIn("'status_terminal_over_bound'", status_sql)
+        self.assertIn('a.slot=w.current_slot', status_sql)
+        self.assertNotIn('pg_column_size', status_sql)
+
+        self.assertIn('pub(super) const STATUS_TERMINAL_TRANSPORT_BOUND_BYTES: i32 = 256 * 1024;',
+                      self.status_terminal)
+        self.assertGreater(256 * 1024, 64 * 1024)
+        self.assertIn('&[&repository_id, &public_id, &transport_bound]', self.source)
+        self.assertIn('snapshot.status_terminal_over_bound', self.source)
+        self.assertIn('public terminal exceeds the bounded transport projection', self.source)
+        self.assertNotIn('$3', slice_between(self.source, 'const SELECT_SNAPSHOT: &str = r#"', '"#;'))
+
+        self.assertIn('fn status_terminal_projection_uses_the_compact_64k_bound', self.status_tests)
+        self.assertIn('let dense = terminal_value(&dense);', self.status_tests)
+        self.assertIn('len() < 64 * 1024', self.status_tests)
+        self.assertIn('status_terminal_over_the_sql_transport_bound_fails_closed', self.status_tests)
 
     def test_status_has_no_handler_or_write_path(self):
         status = slice_between(self.source, 'pub(crate) async fn lookup_public_operation_status(',

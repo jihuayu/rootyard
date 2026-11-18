@@ -6,8 +6,11 @@
 //! proof. A returned terminal is decoded from `PackCommitTerminal`, re-encoded
 //! to compare the entire JSON shape (so unknown, missing or coerced fields fail
 //! closed), validated against the wrapper repository, current event revision,
-//! object format and state, and only then serialized. Pending is `None`;
-//! cancelled is the exact two-field tombstone body.
+//! object format and state, and only then serialized. The SQL layer withholds a
+//! canonical `jsonb::text` body above a generous 256 KiB transport cap and
+//! reports that fail-closed marker; Rust then applies the exact compact 64 KiB
+//! semantic bound. Pending is `None`; cancelled is the exact two-field tombstone
+//! body.
 use super::{is_canonical_hex_64, ledger};
 use crate::ref_store::{
     GitObjectFormat, GitOid, OperationState, RefCommitResult, RefName, TerminalKind, TerminalResult,
@@ -18,6 +21,21 @@ use crate::ref_store::{
 };
 use serde_json::Value;
 use uuid::Uuid;
+
+/// Conservative transport cap for the canonical PostgreSQL `jsonb::text`
+/// representation of the current terminal. It is deliberately distinct from
+/// the semantic compact `TerminalResult` bound: 256 KiB leaves 4x headroom for
+/// JSONB structural spaces and UTF-8/escape expansion of a legal dense typed
+/// value. The query projects `NULL` above this cap and reports the over-bound
+/// marker, so an oversized body is never transferred or decoded.
+///
+/// The headroom argument assumes the accepted typed shape: at most
+/// `MAX_PLAN_REFS` per-ref facts, at most `MAX_BATCH_NEW_PACKS` registrations,
+/// validated ref/HEAD names and known rejection literals. JSONB adds only
+/// structural spaces outside strings plus UTF-8/escape expansion, which stays
+/// far below 4x. The SQL predicate is fail-closed even if this assumption were
+/// wrong: anything above the cap is withheld rather than decoded.
+pub(super) const STATUS_TERMINAL_TRANSPORT_BOUND_BYTES: i32 = 256 * 1024;
 
 /// The ordinary public snapshot with exactly one GET-only addition: the current
 /// attempt's terminal body. It stays in the same single statement and snapshot;
@@ -100,7 +118,11 @@ SELECT jsonb_build_object(
          WHERE c.repository_id=$1 AND c.operation_id=$2
     ),
     'status_terminal', (
-        SELECT o.terminal_result
+        SELECT CASE
+                   WHEN o.terminal_result IS NULL THEN NULL
+                   WHEN octet_length(o.terminal_result::text) <= $3::integer THEN o.terminal_result
+                   ELSE NULL
+               END
           FROM ref_store_public_operations w
           JOIN ref_store_private_attempts a
             ON a.repository_id=w.repository_id AND a.public_id=w.public_id AND a.slot=w.current_slot
@@ -108,6 +130,16 @@ SELECT jsonb_build_object(
             ON o.repository_id=a.repository_id AND o.operation_id=a.private_id
          WHERE w.repository_id=$1 AND w.public_id=$2
     ),
+    'status_terminal_over_bound', COALESCE((
+        SELECT (o.terminal_result IS NOT NULL
+                AND octet_length(o.terminal_result::text) > $3::integer)
+          FROM ref_store_public_operations w
+          JOIN ref_store_private_attempts a
+            ON a.repository_id=w.repository_id AND a.public_id=w.public_id AND a.slot=w.current_slot
+          LEFT JOIN ref_store_operations o
+            ON o.repository_id=a.repository_id AND o.operation_id=a.private_id
+         WHERE w.repository_id=$1 AND w.public_id=$2
+    ), false),
     'realm_matches', COALESCE((
         SELECT (
             r.archived_at IS NULL AND r.deleted_at IS NULL

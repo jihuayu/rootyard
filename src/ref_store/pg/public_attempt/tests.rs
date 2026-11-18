@@ -234,6 +234,7 @@ fn snapshot(wrapper: RawWrapper, attempts: Vec<RawAttempt>) -> RawSnapshot {
         legacy_cancellation: false,
         realm_matches: true,
         status_terminal: None,
+        status_terminal_over_bound: false,
     }
 }
 
@@ -246,6 +247,7 @@ fn empty_snapshot() -> RawSnapshot {
         legacy_cancellation: false,
         realm_matches: true,
         status_terminal: None,
+        status_terminal_over_bound: false,
     }
 }
 
@@ -826,6 +828,16 @@ fn status_reuses_terminal_event_attempt_and_realm_integrity() {
     let mut unbound = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
     unbound.serving_bound = false;
     assert_status_ledger(evaluate_status(snapshot(wrapper(0, "pending"), vec![unbound]), &status_request()));
+}
+
+#[test]
+fn status_terminal_over_the_sql_transport_bound_fails_closed() {
+    let mut over_bound = with_terminal(
+        snapshot(wrapper(0, "committed"), vec![committed_attempt()]),
+        terminal_value(&pack_committed_terminal()),
+    );
+    over_bound.status_terminal_over_bound = true;
+    assert_status_ledger(evaluate_status(over_bound, &status_request()));
 }
 
 #[test]
