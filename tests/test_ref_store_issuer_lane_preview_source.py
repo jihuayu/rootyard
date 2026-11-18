@@ -19,7 +19,8 @@ class IssuerLanePreviewSourceTest(unittest.TestCase):
     def setUpClass(cls):
         cls.source = PG.read_text()
         cls.preview = cls.source.split('async fn preview(', 1)[1].split('async fn advance(', 1)[0]
-        cls.advance = cls.source.split('async fn advance(', 1)[1].split('\nstruct Cancellation', 1)[0]
+        cls.advance = cls.source.split('async fn advance(', 1)[1].split('async fn advance_sequence(', 1)[0]
+        cls.advance_sequence = cls.source.split('async fn advance_sequence(', 1)[1].split('\nstruct Cancellation', 1)[0]
         cls.reserve = cls.source.split('async fn reserve_sequence_inner(', 1)[1].split('/// Register a pending operation', 1)[0]
 
     def test_existing_lane_uses_one_locked_preview(self):
@@ -65,14 +66,19 @@ class IssuerLanePreviewSourceTest(unittest.TestCase):
         self.assertLess(fallback.index('Some(row) => row.get(0)'), fallback.index('None => tx.query_one(PREVIEW'))
 
     def test_advance_stays_conditional_and_bound_to_the_previewed_row(self):
-        self.assertIn('last_reserved_sequence=$4::bigint - 1', self.advance)
-        self.assertIn('if changed != 1', self.advance)
-        self.assertIn('RefStoreError::IdentityConflict', self.advance)
-        self.assertIn('SequenceReservation::new(', self.advance)
-        self.assertEqual(self.advance.count('UPDATE ref_store_issuer_lanes'), 1)
+        # The preview value is handed to one conditional advance; the slot-zero
+        # caller builds its plan between the two without re-reading the lane.
+        self.assertIn('advance_sequence(', self.advance)
+        self.assertIn('self.operation_id', self.advance)
+        self.assertIn('self.sequence', self.advance)
+        self.assertIn('last_reserved_sequence=$4::bigint - 1', self.advance_sequence)
+        self.assertIn('if changed != 1', self.advance_sequence)
+        self.assertIn('RefStoreError::IdentityConflict', self.advance_sequence)
+        self.assertIn('SequenceReservation::new(', self.advance_sequence)
+        self.assertEqual(self.advance_sequence.count('UPDATE ref_store_issuer_lanes'), 1)
         # The advance is the only write after the preview and still carries the
         # operation UUID chosen by the caller.
-        self.assertIn('self.operation_id,', self.advance)
+        self.assertIn('sequence, operation_id)', self.advance_sequence)
 
     def test_reservation_keeps_the_operation_then_lane_prefix(self):
         flow = ' '.join(self.reserve.split())
