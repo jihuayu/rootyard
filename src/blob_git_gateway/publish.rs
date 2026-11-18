@@ -24,6 +24,16 @@
 //! sealed core plan keeps its own canonical parent digest over the actual
 //! pack-pair metadata, and `identity.digest() == parent_digest` still holds for
 //! every A3 receipt and stored registration.
+//!
+//! [`begin_slot_zero`] is the crate-private migration-152 private-mode adapter.
+//! It is deliberately not selected by the live route: the legacy transaction
+//! above remains authoritative until GET/cancel/replay/terminal read paths and
+//! real PostgreSQL qualification are ready. When selected, it keeps the public
+//! UUID and producer digest stable, mints one independent private UUID, and
+//! admits it through [`crate::ref_store::pg::slot_zero`] before any A3/Blob IO.
+//! It never falls back to the legacy fresh transaction after the private mode
+//! has accepted the public identity or when the migration-152 foundation is
+//! absent.
 use std::{path::PathBuf, time::Instant as StdInstant};
 
 use tokio::time::{Instant, timeout_at};
@@ -33,7 +43,8 @@ use crate::{
     blob_store::protected::{ProtectedUploadError, ProtectedUploader, UploadSource},
     db::Identity,
     ref_store::{
-        GitOid, HeadUpdate, IssuerLane, OperationIdentity, PgRefStore, RefName, RefUpdate, RequestDigest,
+        GitOid, HeadUpdate, IssuerLane, OperationIdentity, OperationState, PgRefStore, RefName, RefUpdate,
+        RequestDigest,
         artifact_hold::{
             AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldError, ArtifactHoldPurpose, ArtifactSpec,
             HoldScope, PgArtifactHoldStore,
@@ -42,12 +53,13 @@ use crate::{
             CommitMode,
             pack_commit::{
                 AuthorizedCommitError, AuthorizedCommitMode, ContentDigest, GATE_REVISION_MISMATCH_DETAIL,
-                PackArtifactRole, PackCommitBaseline, PackCommitError, PackCommitExpectation, PackCommitPlan,
-                PackCommitRejectCode, PackCommitScope, PackCommitTerminal, PackMembershipEntry, PackPendingToken,
-                PackRegistrationRequest, PgAuthorizedCommit, PgPackCommit, PlannedArtifact, PlannedPack,
-                PrepareOutcome, ensure_pack_terminal_budget,
+                MAX_ACK_BODY_BYTES, PackArtifactRole, PackCommitBaseline, PackCommitError, PackCommitExpectation,
+                PackCommitPlan, PackCommitRejectCode, PackCommitRejection, PackCommitScope, PackCommitTerminal,
+                PackMembershipEntry, PackPendingToken, PackRegistrationRequest, PgAuthorizedCommit, PgPackCommit,
+                PlannedArtifact, PlannedPack, PrepareOutcome, ensure_pack_terminal_budget,
             },
         },
+        pg::slot_zero::{SlotZeroAdmissionRequest, SlotZeroReceipt},
         tx::{begin_bounded, commit_bounded},
     },
 };
@@ -104,7 +116,7 @@ pub(super) enum PushOutcome {
     Cancelled(&'static str),
 }
 
-enum Start {
+pub(super) enum Start {
     Terminal(PackCommitTerminal),
     Cancelled(&'static str),
     Fresh {
@@ -315,6 +327,307 @@ async fn begin(
     }
 }
 
+/// Crate-private entry for the migration-152 private-slot admission mode.
+///
+/// The public UUID and producer digest remain the caller-visible operation
+/// identity. The pre-admission lookup still resolves an already durable legacy
+/// terminal for that public UUID; only an unknown public identity reaches the
+/// migration-152 path, where one independent private UUID is minted. A private
+/// admission refusal, an unsupported Foundation or an unknown private `COMMIT`
+/// is returned as-is: this entry never calls [`begin_fresh`] afterwards.
+///
+/// The caller must already have captured `baseline` after native ingestion and
+/// hold the staged raw pack pairs. This function performs only the short
+/// PostgreSQL admission; it holds no transaction while reading or uploading a
+/// pair.
+#[allow(dead_code)] // No route selects private mode until the GET/replay/cancel paths are ready.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn begin_slot_zero(
+    state: &BlobGitState,
+    serving: &ServingRepository,
+    actor: &Identity,
+    public_id: Uuid,
+    request_digest: RequestDigest,
+    request: &PushRequest,
+    pairs: &[Pair],
+    mode: CommitMode,
+    baseline: &PackCommitBaseline,
+    deadline: Instant,
+) -> Result<Start, GatewayError> {
+    let repository_id = baseline.gate().repository_id();
+    match operation::lookup(state, serving, actor, public_id, deadline).await? {
+        operation::Lookup::Known(resolved) => start_from_claim(operation::classify(
+            resolved,
+            repository_id,
+            actor.id,
+            public_id,
+            request,
+            request_digest,
+        )?),
+        // No legacy operation exists under the public UUID. The private wrapper
+        // preflight resolves an exact public replay without a sequence/build;
+        // otherwise it creates the private slot-zero admission atomically.
+        operation::Lookup::Unknown => {
+            begin_slot_zero_fresh(
+                state,
+                serving,
+                actor,
+                public_id,
+                request_digest,
+                request,
+                pairs,
+                mode,
+                baseline,
+                deadline,
+            )
+            .await
+        }
+    }
+}
+
+/// One fresh slot-zero admission transaction against the reviewed migration-152
+/// coordinator.
+///
+/// The candidate private UUID is unrelated to the public UUID. The request
+/// binds the exact issuer/lane, full captured base realm, live restore
+/// incarnation and opened Blob backend. The plan builder receives the locked
+/// preview and reuses the same canonical [`build_plan_core`] as the legacy
+/// transaction, so HEAD/ref and same-ref atomic/subset rules are not
+/// reimplemented here.
+///
+/// A preview whose revision differs from the captured baseline is a typed
+/// revision refusal. `admit_slot_zero_in_tx` rolls the savepoint back and
+/// releases it; this adapter then requires an acknowledged outer rollback
+/// before returning [`Start::Rebaseline`]. No raw pair is read, no private UUID
+/// is written to an operation header, and an unknown `COMMIT` is mapped to the
+/// existing generic gateway outcome.
+#[allow(clippy::too_many_arguments)]
+async fn begin_slot_zero_fresh(
+    state: &BlobGitState,
+    serving: &ServingRepository,
+    actor: &Identity,
+    public_id: Uuid,
+    request_digest: RequestDigest,
+    request: &PushRequest,
+    pairs: &[Pair],
+    mode: CommitMode,
+    baseline: &PackCommitBaseline,
+    deadline: Instant,
+) -> Result<Start, GatewayError> {
+    let repository_id = baseline.gate().repository_id();
+    // The private UUID is minted independently and is never derived from the
+    // public operation id or from any staged pack byte.
+    let private_id = Uuid::new_v4();
+    let admission = slot_zero_admission_request(
+        serving,
+        actor,
+        public_id,
+        private_id,
+        request_digest,
+        mode,
+        baseline,
+        state.store().backend_identity().as_hex(),
+    )?;
+
+    let mut client = state.pooled(deadline).await?;
+    let tx = begin_bounded(&mut client, deadline).await.map_err(ref_error)?;
+    let mut built = None;
+    let outcome = timeout_at(
+        deadline,
+        PgRefStore.admit_slot_zero_in_tx(
+            tx,
+            &admission,
+            |preview| {
+                let plan = build_slot_zero_plan(
+                    request,
+                    pairs,
+                    mode,
+                    admission.admission_owner_id,
+                    actor.id,
+                    baseline,
+                    private_id,
+                    request_digest,
+                    preview.sequence(),
+                    preview.base_revision(),
+                )?;
+                built = Some(plan.clone());
+                Ok(plan)
+            },
+            deadline,
+        ),
+    )
+    .await;
+    let (tx, admission_result) = match outcome {
+        Ok(admission) => admission.into_parts(),
+        // `admit_slot_zero_in_tx` owns and drops the outer transaction on every
+        // fatal/uncertain path, so this future cannot leave a commit-able handle.
+        Err(_) => return Err(GatewayError::Timeout),
+    };
+
+    match admission_result {
+        Ok(receipt) if receipt.replayed => {
+            // Exact public replay: no plan was built and no sequence, wrapper or
+            // operation write occurred. Resolve the stored private operation in
+            // the same transaction, then roll the read/lock transaction back.
+            let claim =
+                replay_slot_zero_claim(&tx, repository_id, actor, &receipt, request, request_digest, deadline).await;
+            let cleanup = rollback_bounded(tx, deadline).await;
+            let claim = claim?;
+            cleanup?;
+            start_from_claim(claim)
+        }
+        Ok(receipt) => {
+            let Some(plan) = built else {
+                let _ = rollback_bounded(tx, deadline).await;
+                return Err(GatewayError::Internal("slot zero admission did not build its plan"));
+            };
+            if receipt.state != OperationState::Pending
+                || receipt.public_id != public_id
+                || receipt.private_id != private_id
+                || receipt.private_id != plan.identity().operation_id()
+                || receipt.sequence != plan.identity().sequence()
+                || receipt.base_revision != plan.expected().revision()
+                || receipt.plan_digest != *plan.parent_digest()
+            {
+                let _ = rollback_bounded(tx, deadline).await;
+                return Err(GatewayError::Internal("slot zero admission receipt differs from its plan"));
+            }
+            // The token is only the opaque plan identity the existing prepare
+            // path consumes; it carries no additional authority. Mint it before
+            // COMMIT so a successful admission cannot fail on a local shaping
+            // error after the durability point.
+            let token =
+                PackPendingToken::established(repository_id, plan.tenant_id(), receipt.private_id, receipt.plan_digest)
+                    .map_err(GatewayError::from)?;
+            // The public UUID is the stable operation header. Passing it to the
+            // bounded commit keeps the private UUID out of any COMMIT-unknown
+            // error identity; `From<RefStoreError>` renders the generic unknown
+            // outcome, never the private id.
+            commit_bounded(tx, deadline, repository_id, Some(public_id)).await.map_err(ref_error)?;
+            Ok(Start::Fresh { _token: token, plan: Box::new(plan) })
+        }
+        Err(error) if is_rolled_back_revision_mismatch(&error) => {
+            // A rebase is safe only after the whole admission transaction (not
+            // merely the savepoint) is acknowledged as rolled back.
+            rollback_bounded(tx, deadline).await?;
+            Ok(Start::Rebaseline)
+        }
+        Err(error) => {
+            // The slot-zero coordinator has already rolled back and released
+            // its savepoint. The outer transaction is a definite non-success;
+            // keep the typed answer if this best-effort cleanup is unconfirmed,
+            // exactly like `begin_fresh`.
+            let _ = rollback_bounded(tx, deadline).await;
+            Err(GatewayError::from(error))
+        }
+    }
+}
+
+/// Construct the exact private admission request from the authorized serving
+/// realm and the captured base baseline.
+///
+/// `admission_owner_id` is the owner/tenant UUID proven by the authorized
+/// serving lookup, never the actor or a caller-supplied tenant. `owner` in the
+/// plan is deliberately the same value: migration 152 validates both plan
+/// fields against this one request field. The restore incarnation comes from
+/// the same authorized lookup; the coordinator re-locks the live singleton
+/// before any fresh write.
+#[allow(clippy::too_many_arguments)]
+fn slot_zero_admission_request(
+    serving: &ServingRepository,
+    actor: &Identity,
+    public_id: Uuid,
+    private_id: Uuid,
+    wire_digest: RequestDigest,
+    request_mode: CommitMode,
+    baseline: &PackCommitBaseline,
+    backend_identity: String,
+) -> Result<SlotZeroAdmissionRequest, GatewayError> {
+    if !admission_realm_matches_serving(baseline, serving) {
+        return Err(GatewayError::Conflict("repository authority changed; retry"));
+    }
+    let gate = baseline.gate();
+    let lane = IssuerLane::new(ISSUER_LANE).map_err(ref_error)?;
+    Ok(SlotZeroAdmissionRequest {
+        repository_id: gate.repository_id(),
+        admission_owner_id: gate.tenant_id(),
+        issuer_id: actor.id,
+        lane,
+        public_id,
+        private_id,
+        wire_digest,
+        request_mode,
+        backend_identity,
+        object_format: gate.object_format(),
+        history_incarnation: gate.history_incarnation(),
+        authority_epoch: gate.authority_epoch(),
+        group_epoch: gate.group_epoch(),
+        restore_incarnation: serving.cluster_incarnation,
+    })
+}
+
+/// Build the canonical plan from the locked slot-zero preview.
+///
+/// This is the exact adapter between the coordinator preview and the existing
+/// plan builder. It refuses before plan construction when the preview revision
+/// is not the captured baseline revision, so a stale candidate can only become
+/// the typed rollback-then-recapture answer. It otherwise constructs the
+/// private `OperationIdentity` with the locked sequence/private UUID and calls
+/// [`build_plan_core`] unchanged.
+#[allow(clippy::too_many_arguments)]
+fn build_slot_zero_plan(
+    request: &PushRequest,
+    pairs: &[Pair],
+    mode: CommitMode,
+    owner: Uuid,
+    issuer_id: Uuid,
+    baseline: &PackCommitBaseline,
+    private_id: Uuid,
+    wire_digest: RequestDigest,
+    sequence: i64,
+    preview_base_revision: i64,
+) -> Result<PackCommitPlan, PackCommitError> {
+    if preview_base_revision != baseline.gate().revision() {
+        return Err(PackCommitError::Rejected(PackCommitRejection::new(
+            PackCommitRejectCode::RevisionMismatch,
+            GATE_REVISION_MISMATCH_DETAIL,
+        )));
+    }
+    let identity = OperationIdentity::new(
+        baseline.gate().repository_id(),
+        issuer_id,
+        IssuerLane::new(ISSUER_LANE).map_err(PackCommitError::from)?,
+        sequence,
+        private_id,
+        wire_digest,
+    )
+    .map_err(PackCommitError::from)?;
+    build_plan_core(request, pairs, mode, owner, baseline, identity)
+}
+
+/// Resolve one exact slot-zero replay through the shared operation classifier.
+/// The private UUID is used only inside this read-only transaction; the caller
+/// exposes the resulting terminal or unknown claim, not the UUID.
+async fn replay_slot_zero_claim(
+    tx: &tokio_postgres::Transaction<'_>,
+    repository_id: Uuid,
+    actor: &Identity,
+    receipt: &SlotZeroReceipt,
+    request: &PushRequest,
+    request_digest: RequestDigest,
+    deadline: Instant,
+) -> Result<Claim, GatewayError> {
+    let private = receipt.private_id;
+    match operation::lookup_in_tx(tx, repository_id, private, deadline).await? {
+        operation::Lookup::Known(resolved) => {
+            operation::classify(resolved, repository_id, actor.id, private, request, request_digest)
+        }
+        operation::Lookup::Unknown => {
+            Err(GatewayError::Internal("slot zero replay has no durable private operation record"))
+        }
+    }
+}
+
 /// What one fresh-write transaction decided about this operation identity.
 enum Reserved {
     /// The operation already existed when this transaction re-checked it; the
@@ -474,13 +787,28 @@ fn build_plan(
     baseline: &PackCommitBaseline,
     identity: OperationIdentity,
 ) -> Result<PackCommitPlan, GatewayError> {
+    build_plan_core(request, pairs, mode, owner, baseline, identity).map_err(GatewayError::from)
+}
+
+/// Single canonical plan builder shared by the legacy fresh transaction and the
+/// crate-private slot-zero adapter. Keeping this typed lets the private
+/// admission callback return `PackCommitError` without re-wrapping or
+/// reimplementing any HEAD, ref, membership, pack or same-ref rule.
+fn build_plan_core(
+    request: &PushRequest,
+    pairs: &[Pair],
+    mode: CommitMode,
+    owner: Uuid,
+    baseline: &PackCommitBaseline,
+    identity: OperationIdentity,
+) -> Result<PackCommitPlan, PackCommitError> {
     let gate = baseline.gate();
     let format = gate.object_format();
     let mut refs = Vec::with_capacity(request.commands.len());
     for command in &request.commands {
-        let name = RefName::new(command.name.clone()).map_err(ref_error)?;
-        let precondition = GitOid::precondition_value(format, &command.old).map_err(ref_error)?;
-        let target = GitOid::target_value(format, &command.new).map_err(ref_error)?;
+        let name = RefName::new(command.name.clone()).map_err(PackCommitError::from)?;
+        let precondition = GitOid::precondition_value(format, &command.old).map_err(PackCommitError::from)?;
+        let target = GitOid::target_value(format, &command.new).map_err(PackCommitError::from)?;
         refs.push(RefUpdate::new(name, precondition, target));
     }
     let current_head = gate.head_ref().as_str();
@@ -490,7 +818,7 @@ fn build_plan(
     } else if let Some(branch) =
         request.commands.iter().find(|command| command.name.starts_with("refs/heads/") && !command.is_delete())
     {
-        HeadUpdate::retarget(branch.name.clone()).map_err(ref_error)?
+        HeadUpdate::retarget(branch.name.clone()).map_err(PackCommitError::from)?
     } else {
         HeadUpdate::Keep
     };
@@ -527,7 +855,11 @@ fn build_plan(
         planned,
         mode,
     )?;
-    ensure_pack_terminal_budget(&plan).map_err(|_| GatewayError::TooLarge)?;
+    ensure_pack_terminal_budget(&plan).map_err(|_| PackCommitError::Capacity {
+        limit: "terminal_budget",
+        bound: MAX_ACK_BODY_BYTES as i64,
+        actual: plan.refs().len() as i64,
+    })?;
     Ok(plan)
 }
 
@@ -827,6 +1159,220 @@ mod tests {
             })),
             GatewayError::Internal("protected Blob upload was refused")
         ));
+    }
+
+    fn test_serving_repository() -> ServingRepository {
+        use crate::{
+            db::Repository,
+            ref_store::{GitObjectFormat, core::contract::CoreGate},
+        };
+
+        let repository_id = Uuid::new_v4();
+        let tenant_id = Uuid::new_v4();
+        let gate = CoreGate::new(
+            repository_id,
+            tenant_id,
+            GitObjectFormat::Sha1,
+            Uuid::new_v4(),
+            1,
+            1,
+            RefName::new("refs/heads/main").unwrap(),
+            7,
+        )
+        .unwrap();
+        ServingRepository {
+            repository: Repository {
+                id: repository_id,
+                name: "private-slot-zero".to_owned(),
+                owner: "owner".to_owned(),
+                state: "ready".to_owned(),
+                clone_path: "/git/owner/private-slot-zero.git".to_owned(),
+                storage_backend: "pg_refstore".to_owned(),
+                storage_generation: 1,
+                object_format: "sha1".to_owned(),
+            },
+            gate,
+            cluster_incarnation: Uuid::new_v4(),
+        }
+    }
+
+    fn test_actor() -> Identity {
+        Identity {
+            id: Uuid::new_v4(),
+            token_id: Uuid::new_v4(),
+            parent_token_id: None,
+            username: "actor".to_owned(),
+            read_only: false,
+            token_digest: vec![0; 32],
+        }
+    }
+
+    fn test_baseline(serving: &ServingRepository) -> PackCommitBaseline {
+        use crate::ref_store::core::pack_commit::PackMode;
+        PackCommitBaseline::new(serving.gate.version(), PackMode::MetadataOnly, Vec::new(), Vec::new()).unwrap()
+    }
+
+    fn test_pair() -> Pair {
+        Pair {
+            pack: PathBuf::from("private.pack"),
+            idx: PathBuf::from("private.idx"),
+            pack_id: Uuid::new_v4(),
+            pack_sha: "1".repeat(64),
+            pack_len: 128,
+            idx_sha: "2".repeat(64),
+            idx_len: 64,
+        }
+    }
+
+    fn test_push_request() -> PushRequest {
+        use super::super::protocol::PushCommand;
+        PushRequest {
+            commands: vec![PushCommand {
+                old: "0".repeat(40),
+                new: "a".repeat(40),
+                name: "refs/heads/main".to_owned(),
+            }],
+            capabilities: vec!["report-status".to_owned()],
+        }
+    }
+
+    #[test]
+    fn slot_zero_request_keeps_public_identity_and_copies_the_full_authorized_realm() {
+        let serving = test_serving_repository();
+        let baseline = test_baseline(&serving);
+        let actor = test_actor();
+        let public_id = Uuid::new_v4();
+        let private_id = Uuid::new_v4();
+        let digest = RequestDigest::of("test-slot-zero-request", &[b"wire"]);
+        let backend = "b".repeat(64);
+
+        let request = slot_zero_admission_request(
+            &serving,
+            &actor,
+            public_id,
+            private_id,
+            digest,
+            CommitMode::AcceptedSubset,
+            &baseline,
+            backend.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(request.repository_id, serving.gate.repository_id());
+        assert_eq!(request.admission_owner_id, serving.gate.tenant_id());
+        assert_eq!(request.issuer_id, actor.id);
+        assert_eq!(request.lane.as_str(), ISSUER_LANE);
+        assert_eq!(request.public_id, public_id);
+        assert_eq!(request.private_id, private_id);
+        assert_ne!(request.public_id, request.private_id);
+        assert_eq!(request.wire_digest, digest);
+        assert_eq!(request.request_mode, CommitMode::AcceptedSubset);
+        assert_eq!(request.backend_identity, backend);
+        assert_eq!(request.object_format, serving.gate.object_format());
+        assert_eq!(request.history_incarnation, serving.gate.history_incarnation());
+        assert_eq!(request.authority_epoch, serving.gate.authority_epoch());
+        assert_eq!(request.group_epoch, serving.gate.group_epoch());
+        assert_eq!(request.restore_incarnation, serving.cluster_incarnation);
+    }
+
+    #[test]
+    fn slot_zero_request_refuses_a_baseline_outside_the_authorized_realm() {
+        use crate::ref_store::{GitObjectFormat, core::contract::CoreGate};
+
+        let serving = test_serving_repository();
+        let moved_gate = CoreGate::new(
+            serving.gate.repository_id(),
+            Uuid::new_v4(),
+            GitObjectFormat::Sha1,
+            serving.gate.history_incarnation(),
+            1,
+            1,
+            serving.gate.head_ref().clone(),
+            serving.gate.revision(),
+        )
+        .unwrap();
+        let moved = PackCommitBaseline::new(
+            moved_gate.version(),
+            crate::ref_store::core::pack_commit::PackMode::MetadataOnly,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let error = slot_zero_admission_request(
+            &serving,
+            &test_actor(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            RequestDigest::of("test-slot-zero-moved-realm", &[b"wire"]),
+            CommitMode::Atomic,
+            &moved,
+            "c".repeat(64),
+        )
+        .unwrap_err();
+        assert!(matches!(error, GatewayError::Conflict("repository authority changed; retry")));
+    }
+
+    #[test]
+    fn slot_zero_plan_binds_only_the_locked_preview_and_private_identity() {
+        let serving = test_serving_repository();
+        let baseline = test_baseline(&serving);
+        let actor = test_actor();
+        let public_id = Uuid::new_v4();
+        let private_id = Uuid::new_v4();
+        let digest = RequestDigest::of("test-slot-zero-plan", &[b"wire"]);
+        let request = test_push_request();
+        let pair = test_pair();
+        let sequence = 3;
+
+        let plan = build_slot_zero_plan(
+            &request,
+            std::slice::from_ref(&pair),
+            CommitMode::AcceptedSubset,
+            serving.gate.tenant_id(),
+            actor.id,
+            &baseline,
+            private_id,
+            digest,
+            sequence,
+            baseline.gate().revision(),
+        )
+        .unwrap();
+        assert_eq!(plan.identity().operation_id(), private_id);
+        assert_eq!(plan.identity().issuer_id(), actor.id);
+        assert_eq!(plan.identity().sequence(), sequence);
+        assert_eq!(plan.identity().digest(), plan.parent_digest());
+        assert_eq!(plan.commit_mode(), CommitMode::AcceptedSubset);
+        assert_eq!(plan.tenant_id(), serving.gate.tenant_id());
+        assert_eq!(plan.owner_id(), serving.gate.tenant_id());
+        assert_ne!(plan.identity().operation_id(), public_id);
+
+        let stale = build_slot_zero_plan(
+            &request,
+            std::slice::from_ref(&pair),
+            CommitMode::AcceptedSubset,
+            serving.gate.tenant_id(),
+            actor.id,
+            &baseline,
+            private_id,
+            digest,
+            sequence,
+            baseline.gate().revision() + 1,
+        )
+        .unwrap_err();
+        assert!(is_rolled_back_revision_mismatch(&stale), "{stale:?}");
+    }
+
+    #[test]
+    fn private_slot_zero_commit_unknown_never_renders_the_private_uuid() {
+        let private_id = Uuid::new_v4();
+        let error = GatewayError::from(PackCommitError::CommitUnknown {
+            repository_id: Uuid::new_v4(),
+            operation_id: private_id,
+        });
+        assert_eq!(error, GatewayError::OutcomeUnknown);
+        assert!(!error.message().contains(&private_id.to_string()));
+        assert!(!format!("{error:?}").contains(&private_id.to_string()));
     }
 
     #[test]
