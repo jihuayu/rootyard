@@ -410,3 +410,5 @@ fn source_keeps_the_reviewed_lock_and_write_order() {
     assert!(!source.contains("tx.rollback("));
     assert!(!source.contains("pool.get()"));
 }
+
+mod native;
