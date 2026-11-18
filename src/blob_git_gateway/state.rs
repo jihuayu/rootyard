@@ -29,7 +29,7 @@ use super::{
     error::GatewayError,
     repo_session::SessionTokens,
 };
-use crate::blob_store::opendal::BlobStore;
+use crate::{blob_store::opendal::BlobStore, cache_wake::ServingCache};
 
 tokio::task_local! {
     pub(super) static REQUEST_DEADLINE: Instant;
@@ -49,6 +49,9 @@ pub struct BlobGitState {
     inflight: Arc<AtomicU64>,
     workspace: Arc<AtomicU64>,
     sessions: Option<SessionTokens>,
+    /// Advisory, non-authoritative payload cache. It is absent by default and
+    /// carries no refs, auth, sessions, holds, roots or durable bytes.
+    cache: Option<Arc<ServingCache>>,
     packfile_offload: Option<Arc<crate::browse::packfile_uri::GatewayPackfileOffload>>,
     /// Acceptance-only rendezvous. It is absent in every non-test build and
     /// cannot be selected by any request, header or runtime configuration.
@@ -76,6 +79,7 @@ impl BlobGitState {
             inflight: Arc::new(AtomicU64::new(0)),
             workspace: Arc::new(AtomicU64::new(0)),
             sessions: None,
+            cache: None,
             packfile_offload: None,
             #[cfg(test)]
             admission_pause: None,
@@ -88,6 +92,20 @@ impl BlobGitState {
     pub fn with_sessions(mut self, sessions: SessionTokens) -> Self {
         self.sessions = Some(sessions);
         self
+    }
+
+    /// Attach the bounded advisory ServingCache. It is used only for immutable
+    /// payload computation after every live authority and reachable-closure
+    /// check has already run; a miss, corruption or backend error always falls
+    /// back to the existing origin read.
+    pub fn with_cache(mut self, cache: Arc<ServingCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// The configured advisory cache, if any.
+    pub(super) fn cache(&self) -> Option<&Arc<ServingCache>> {
+        self.cache.as_ref()
     }
 
     /// Attach optional Smart-HTTP v2 `packfile-uris` offload runtime (#185).

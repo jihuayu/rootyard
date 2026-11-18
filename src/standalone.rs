@@ -42,6 +42,12 @@ pub async fn run_from_env() -> Result<()> {
     let (bind, gateway, sessions) = config::gateway_config(pool.clone(), store)?;
     let mut state = crate::blob_git_gateway::BlobGitState::new(gateway)
         .map_err(|_| anyhow!("invalid Blob Git gateway configuration"))?;
+    // The standalone target uses the existing bounded in-process Memory profile
+    // only. No Redis client/runtime is constructed and no environment-selected
+    // backend is added here.
+    let cache =
+        crate::cache_wake::ServingCache::standalone_memory().map_err(|_| anyhow!("invalid cache configuration"))?;
+    state = state.with_cache(Arc::new(cache));
     if let Some(sessions) = sessions {
         state = state.with_sessions(sessions);
     }
