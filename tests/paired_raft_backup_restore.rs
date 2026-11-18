@@ -355,7 +355,7 @@ async fn pg17_live_paired_backup_and_clean_room_new_incarnation_restore() -> Res
         ensure!(
             peer_cur.get::<_, Uuid>(0) == inc.new_history_incarnation
                 && peer_cur.get::<_, i64>(1) == inc.new_group_epoch
-                && peer_cur.get::<_, i64>(2) >= 2
+                && peer_cur.get::<_, i64>(2) == 1
                 && peer_cur.get::<_, i64>(3) == 2
                 && peer_cur.get::<_, i64>(4) == 1
         );
