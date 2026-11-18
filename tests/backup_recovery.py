@@ -6,15 +6,23 @@ ROOTYARD_RESTORE_TEST_DATABASE_URL provides a second PostgreSQL server. Never us
 production. Synthetic prepared journals do not claim successful pushes.
 """
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import sys
 import time
+from urllib.parse import urlsplit
 import uuid
 from backup import BackupHarness
+from backup_recovery_cache import (
+    CASE, ENVIRONMENT, HIT, MISS, TTL_SECONDS, OwnedRestoreRedis, build_binding,
+    preview_key_scope, preview_request, prove_restored_preview,
+)
+from cross_process import CrossProcessHarness
 from schema_baseline import SCHEMA_VERSION_CSV
 
 ZERO = '0' * 40
@@ -22,6 +30,7 @@ ZERO = '0' * 40
 
 class BackupRecoveryHarness(BackupHarness):
     reason = 'Synthetic drill: native refs inspected; missing push audit evidence explicitly acknowledged.'
+    retain_row_snapshots = True
 
     def __init__(self, args):
         super().__init__(args)
@@ -154,7 +163,7 @@ class BackupRecoveryHarness(BackupHarness):
         assert not journal.exists()
         return fixture
 
-    def recovery_source(self):
+    def recovery_source(self, before_backup=None):
         super().setup()
         self.resolved = self.make_resolved('resolved')
         self.missing = self.make_resolved('missing-evidence', missing=True)
@@ -176,9 +185,12 @@ class BackupRecoveryHarness(BackupHarness):
         assert mapping['journal_digest'] and mapping['operation_digest'] and mapping['journal_evidence']
         absent = next(r for r in self.source_rows['operation_resolutions'] if r['operation_id'] == self.missing['op_id'])
         assert absent['journal_digest'] is None and absent['journal_evidence'] is None
+        if before_backup is not None:
+            before_backup()
         self.backup_result = json.loads(self.backup_command().stdout)
         self.cli('backup-verify', str(self.backup))
-        (self.root / 'source-sql-rows.json').write_text(json.dumps(self.source_rows, indent=2) + '\n')
+        if self.retain_row_snapshots:
+            (self.root / 'source-sql-rows.json').write_text(json.dumps(self.source_rows, indent=2) + '\n')
         return dict(resolved_unknowns=2, unresolved_unknowns=1, full_table_rows_captured=len(self.source_rows), synthetic_prepared_only=True)
 
     def schema_rejection(self):
@@ -219,7 +231,8 @@ class BackupRecoveryHarness(BackupHarness):
         self.db = self.target_db
         self.env.update(DATABASE_URL=self.db, ROOTYARD_DATA_DIR=str(self.target))
         restored = self.assert_restored_rows()
-        (self.root / 'restored-sql-rows.json').write_text(json.dumps(restored, indent=2) + '\n')
+        if self.retain_row_snapshots:
+            (self.root / 'restored-sql-rows.json').write_text(json.dumps(restored, indent=2) + '\n')
         assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == SCHEMA_VERSION_CSV
         for fixture in (self.resolved, self.missing):
             assert self.sql("SELECT storage_generation FROM repositories WHERE id='" + fixture['repo']['id'] + "'") == '2'
@@ -305,13 +318,145 @@ class BackupRecoveryHarness(BackupHarness):
         return dict(matching_journal_retired_idempotently=True, changed_journal_preserved_blocks_push=True, previously_missing_reappearing_journal_protected=True)
 
 
+class BrowseRestoreCacheHarness(BackupRecoveryHarness):
+    retain_row_snapshots = False
+
+    def __init__(self, args, redis_binary):
+        self.redis = OwnedRestoreRedis(redis_binary)
+        super().__init__(args)
+        self.env = {key: value for key, value in self.env.items() if not key.startswith('ROOTYARD_CACHE_')}
+
+    def scope(self):
+        repo_id = str(uuid.UUID(self.resolved['repo']['id']))
+        row, = self.rows(
+            "SELECT r.id, r.owner_id, r.storage_backend, r.object_format, r.storage_generation, "
+            "r.backend_transition_epoch, a.incarnation FROM repositories r "
+            "CROSS JOIN cluster_authority a WHERE a.singleton AND r.id='" + repo_id + "'"
+        )
+        incarnation = uuid.UUID(row.pop('incarnation'))
+        assert incarnation.int and row['storage_generation'] == 2 and row['storage_backend'] == 'gitfs'
+        row['volume'] = (Path(self.env['ROOTYARD_DATA_DIR']) / '.volume-id').read_bytes()
+        assert row['volume'] == self.marker
+        return row, incarnation
+
+    def preview(self):
+        status, raw, _ = self.http('/api/repos/alice/resolved/commits/' + self.second, token=self.reader)
+        assert status == 200, 'Authorized commit preview failed'
+        response = json.loads(raw)
+        assert response['oid'] == self.second and response['parents'] == [self.first]
+        assert response['subject'] == 'second' and response['changed_paths'] == ['hello.txt']
+        return response
+
+    def start_preview(self):
+        self.start()
+        assert Path(f'/proc/{self.proc.pid}/exe').samefile(self.args.binary)
+
+    def warm_preview(self):
+        self.old_scope, self.old_incarnation = self.scope()
+        self.redis.start(self.root)
+        self.env.update(
+            ROOTYARD_CACHE_BACKEND='redis',
+            ROOTYARD_CACHE_REDIS_URL=f'redis://127.0.0.1:{self.redis.redis_port}/0',
+            ROOTYARD_CACHE_ENVIRONMENT=ENVIRONMENT,
+            ROOTYARD_CACHE_TTL_SECONDS=str(TTL_SECONDS),
+        )
+        self.start_preview()
+        assert not self.redis.keys(), 'Owned Redis must start empty'
+        self.old_response = preview_request(self.redis, self.preview, MISS)
+        self.old_key, = self.redis.keys()
+        assert preview_key_scope(self.old_key)[6:8] == [self.old_scope['owner_id'], self.old_scope['id']]
+        assert preview_request(self.redis, self.preview, HIT) == self.old_response
+        self.old_entry = self.redis.entry(self.old_key)
+        self.stop()
+
+    def restored_preview(self):
+        scope, incarnation = self.scope()
+        assert scope == self.old_scope and incarnation != self.old_incarnation
+        self.start_preview()
+        return prove_restored_preview(
+            self.redis, self.preview, self.old_key, self.old_entry, self.old_response,
+        )
+
+    def cleanup(self):
+        with ExitStack() as cleanup:
+            cleanup.callback(shutil.rmtree, self.root)
+            for admin, name in self.created:
+                cleanup.callback(self.query, admin, 'DROP DATABASE "' + name + '" WITH (FORCE)')
+            cleanup.callback(self.redis.stop)
+            self.stop()
+
+
+def browse_restore_cache_report(args):
+    binding = {}
+    h = None
+    stage = 'preflight'
+    detail = {}
+    try:
+        if not __debug__ or args.keep or os.environ.get('ROOTYARD_TEST_EVIDENCE_DIR'):
+            raise RuntimeError('Browse restore proof requires assertions and disposable evidence')
+        admin = os.environ['ROOTYARD_TEST_DATABASE_URL']
+        for url in (admin, os.environ.get('ROOTYARD_RESTORE_TEST_DATABASE_URL', admin)):
+            parts = urlsplit(url)
+            assert parts.scheme in ('postgresql', 'postgres') and parts.hostname in ('127.0.0.1', '::1')
+            assert not parts.query
+        binding = build_binding(args.binary, args.expect_commit)
+        redis_binary = CrossProcessHarness.resolve_redis()
+        assert redis_binary
+        stage = 'source_warm_backup'
+        h = BrowseRestoreCacheHarness(args, redis_binary)
+        h.recovery_source(before_backup=h.warm_preview)
+        stage = 'restore'
+        h.restore_exact()
+        stage = 'restored_preview'
+        detail = h.restored_preview()
+        stage = 'receipt_changed'
+        assert build_binding(args.binary, args.expect_commit) == binding
+        stage = None
+    except (Exception, KeyboardInterrupt):
+        pass
+    finally:
+        if h is not None:
+            try:
+                h.cleanup()
+            except (Exception, KeyboardInterrupt):
+                stage = 'cleanup'
+    case = dict(name=CASE, status='passed', detail=dict(detail, owned_cleanup_completed=True))
+    if stage is not None:
+        case = dict(name=CASE, status='failed', error=stage)
+    return dict(passed=stage is None, cases=[case], **binding)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', default='target/debug/rootyard')
     parser.add_argument('--report', type=Path)
     parser.add_argument('--keep', action='store_true')
+    parser.add_argument('--browse-restore-cache', action='store_true',
+                        help='run only the browse cache restore proof with owned loopback Redis')
+    parser.add_argument('--expect-commit', help='exact checkout commit for the opt-in native receipt')
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
+    if args.browse_restore_cache:
+        def interrupted(_signum, _frame):
+            raise KeyboardInterrupt
+
+        previous = signal.signal(signal.SIGTERM, interrupted)
+        try:
+            report = browse_restore_cache_report(args)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        if args.report:
+            try:
+                args.report.parent.mkdir(parents=True, exist_ok=True)
+                with args.report.open('x') as output:
+                    json.dump(report, output, indent=2)
+                    output.write('\n')
+            except OSError:
+                report = dict(passed=False, cases=[dict(name=CASE, status='failed', error='report_write')])
+        print(json.dumps(report, indent=2))
+        return 0 if report['passed'] else 1
+    if args.expect_commit is not None:
+        parser.error('--expect-commit requires --browse-restore-cache')
     if not os.environ.get('ROOTYARD_TEST_DATABASE_URL'):
         parser.error('dedicated synthetic ROOTYARD_TEST_DATABASE_URL required')
     h = BackupRecoveryHarness(args)
