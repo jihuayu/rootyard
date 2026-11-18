@@ -22,8 +22,9 @@ jobs:
     runs-on: ubuntu-22.04
     # 95 minutes baseline, 12 for the #304 cold tenant LFS gate on owned Garage,
     # and 28 for the full Redis qualification (13 build, 5 restore/flush,
-    # 3 partition, 4 failover, 3 cleanup and manifest binding).
-    timeout-minutes: 135
+    # 3 partition, 4 failover, 3 cleanup and manifest binding), plus 40 for the
+    # Pando package gates: 95 + 12 + 28 + 40 = 175 minutes.
+    timeout-minutes: 175
     services:
       postgres:
         image: postgres:17
@@ -181,8 +182,18 @@ jobs:
             --bin rootyard-pando-lab=ROOTYARD_PANDO_LAB_BIN \
             --bin rootyard-vfs-mount=ROOTYARD_VFS_MOUNT_BIN \
             --bin-receipt rootyard=ROOTYARD_BUILD_RECEIPT \
+            --bin-receipt rootyard-pando-lab=ROOTYARD_PANDO_BUILD_RECEIPT \
             --test ref_store_snapshot_backup_fixture=ROOTYARD_SNAPSHOT_FIXTURE \
             --test ref_store_holds_backup_fixture=ROOTYARD_HOLDS_FIXTURE
+      - name: Run the 17 ignored Pando Local PostgreSQL producer cases
+        timeout-minutes: 10
+        run: |
+          python3 scripts/run_pando_producer_pg.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --expected-commit "$GITHUB_SHA" \
+            --product-receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
+            --report test-results/pando-producer-pg.json \
+            --timeout-seconds 540
       - name: Exercise trusted CI HTTP authority boundaries
         timeout-minutes: 10
         run: python3 tests/ci_trust_boundaries.py --binary "$ROOTYARD_BIN" --report test-results/ci-trust-boundaries.json --expected-commit "$GITHUB_SHA"
@@ -262,7 +273,14 @@ jobs:
       - name: Run all Python unit and Tier-5 adversarial contract suites
         # Full discovery stays unfiltered; the runner adds per-test progress and
         # periodic stderr thread stacks without changing exit semantics.
-        run: python3 scripts/run_python_ci_tests.py
+        env:
+          ROOTYARD_PYTHON_CI_REPORT: ${{ github.event.pull_request.number == 283 && 'test-results/python-ci-result.json' || '' }}
+        run: |
+          report_args=()
+          if [[ -n "$ROOTYARD_PYTHON_CI_REPORT" ]]; then
+            report_args=(--report-out "$ROOTYARD_PYTHON_CI_REPORT" --expected-commit="${GITHUB_SHA:-}")
+          fi
+          python3 scripts/run_python_ci_tests.py "${report_args[@]}"
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary "$ROOTYARD_BIN" --report test-results/e2e.json
       - name: Exercise exact-commit CI read mirror
@@ -580,6 +598,81 @@ jobs:
           test -n "$latest_pando"
           test -f "$latest_pando/results.json"
           cp "$latest_pando/results.json" test-results/pando-lab.json
+      - name: Qualify pinned real Vault rotation and bind the Pando native gate
+        timeout-minutes: 20
+        run: |
+          python3 tests/pando_vault_rotation.py \
+            --binary "$ROOTYARD_PANDO_LAB_BIN" \
+            --receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
+            --source-root "$GITHUB_WORKSPACE" \
+            --expected-commit "$GITHUB_SHA" \
+            --timeout-seconds 1080 \
+            --cleanup-reserve-seconds 90 \
+            --report test-results/pando-vault-rotation.json
+          python3 tests/pando_vault_rotation_ci_report.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --binary "$ROOTYARD_PANDO_LAB_BIN" \
+            --receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
+            --expected-commit "$GITHUB_SHA" \
+            --raw-report test-results/pando-vault-rotation.json \
+            --output test-results/pando-vault-native-report.json
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/pando-vault-gate.json \
+            --build-receipt "$ROOTYARD_PANDO_BUILD_RECEIPT" \
+            --binary "$ROOTYARD_PANDO_LAB_BIN" \
+            --expect-commit "$GITHUB_SHA" \
+            --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST" \
+            --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
+            --fixture-rust-from-receipt \
+            --fixture postgres=postgres:17 \
+            --fixture vault=hashicorp/vault@sha256:dfa48c2fa2b0099ccb47681ec5c4804bf5aec9d6879ecfee07ad4b92a5427ad6 \
+            --fixture vault_version=2.2.2 \
+            --report pando_vault=test-results/pando-vault-native-report.json \
+            --require-case pando_vault=vault_fixture_and_app_capability_boundary \
+            --require-case pando_vault=authentic_envelope_digest_and_cold_read \
+            --require-case pando_vault=admin_rotated_target_interrupted_resume_and_new_write \
+            --require-case pando_vault=wrong_key_ciphertext_envelope_and_provider_revocation_fail_closed \
+            --require-case pando_vault=owned_resource_cleanup \
+            --harness tests/pando_vault_rotation.py \
+            --harness tests/pando_vault_rotation_budget.py \
+            --harness tests/pando_vault_rotation_cases.py \
+            --harness tests/pando_vault_rotation_ci_report.py \
+            --harness tests/pando_vault_rotation_command.py \
+            --harness tests/pando_vault_rotation_context.py \
+            --harness tests/pando_vault_rotation_fixture.py \
+            --harness tests/pando_vault_rotation_fixture_resources.py \
+            --harness tests/pando_vault_rotation_fixture_vault.py \
+            --harness tests/pando_vault_rotation_http.py \
+            --harness tests/pando_vault_rotation_http_child.py \
+            --harness tests/pando_vault_rotation_mirror.py \
+            --harness tests/pando_vault_rotation_negative.py \
+            --harness tests/pando_vault_rotation_service.py \
+            --harness tests/pando_vault_rotation_source.py \
+            --harness tests/pando_vault_rotation_source_child.py \
+            --harness tests/pando_vault_rotation_support.py \
+            --harness tests/test_pando_vault_rotation_binding_failure.py \
+            --harness tests/test_pando_vault_rotation_budget.py \
+            --harness tests/test_pando_vault_rotation_ci_report.py \
+            --harness tests/test_pando_vault_rotation_ci_report_duplicates.py \
+            --harness tests/test_pando_vault_rotation_db_tamper_oracle.py \
+            --harness tests/test_pando_vault_rotation_deadline.py \
+            --harness tests/test_pando_vault_rotation_fixture.py \
+            --harness tests/test_pando_vault_rotation_http.py \
+            --harness tests/test_pando_vault_rotation_http_fixture.py \
+            --harness tests/test_pando_vault_rotation_implementation.py \
+            --harness tests/test_pando_vault_rotation_interrupt_oracle.py \
+            --harness tests/test_pando_vault_rotation_receipt_v2.py \
+            --harness tests/test_pando_vault_rotation_resource_ownership.py \
+            --harness tests/test_pando_vault_rotation_source.py \
+            --harness scripts/native_build_receipt.py \
+            --harness scripts/native_report_manifest.py \
+            --harness scripts/native_artifact_store.py \
+            --harness scripts/build_native_batch.py \
+            --harness scripts/export_native_artifacts.py \
+            --harness scripts/pando_producer_pg/__init__.py \
+            --harness scripts/pando_producer_pg/errors.py \
+            --harness scripts/pando_producer_pg/process.py \
+            --harness .github/workflows/ci.yml
       - name: Exercise live Pando PITR fencing, retention roots, and pg_dump clone safety
         timeout-minutes: 10
         run: |
@@ -870,6 +963,9 @@ jobs:
             --require-case repository_lifecycle=rename_aliases_and_authz_before_redirect \
             --require-case repository_lifecycle=soft_delete_restore_and_purge_holds \
             --require-case repository_lifecycle=ownership_transfer_and_crash_recovery \
+            --require-case repository_lifecycle=remediation_lifecycle_and_alias_scope_boundaries \
+            --require-case repository_lifecycle=remediation_fault_injection_and_concurrency \
+            --require-case repository_lifecycle=remediation_alias_parity_and_uncertain_claim_fail_closed \
             --require-case repository_lifecycle_remote_tenant_lfs=remote_tenant_lfs_cold_retention \
             --require-case repository_lifecycle_deleted_claim=source_claim_fence_contract \
             --require-case repository_lifecycle_deleted_claim=live_control_secret_claim_and_expired_reclaim \
@@ -894,7 +990,12 @@ jobs:
           path: |
             test-results/*.json
             ${{ env.ROOTYARD_BUILD_RECEIPT }}
+            ${{ env.ROOTYARD_PANDO_BUILD_RECEIPT }}
             ${{ env.ROOTYARD_BATCH_MANIFEST }}
+            test-results/pando-producer-pg.json
+            test-results/pando-vault-rotation.json
+            test-results/pando-vault-native-report.json
+            test-results/pando-vault-gate.json
             test-results/ci-webhook-regressions.log
             test-results/evidence/*.jsonl
             test-results/*-evidence/*.jsonl
