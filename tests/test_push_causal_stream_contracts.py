@@ -38,6 +38,7 @@ RUST_FILES = [
     ROOT / "tests" / "push_causal_stream.rs",
     ROOT / "tests" / "push_causal_stream" / "support.rs",
     ROOT / "tests" / "push_causal_stream" / "pg_http_gateway.rs",
+    ROOT / "tests" / "push_causal_stream" / "pg_scoped_producer.rs",
 ]
 WORKFLOW = ROOT / ".github" / "workflows" / "push-causal-stream.yml"
 DOC = ROOT / "docs" / "push-causal-stream.md"

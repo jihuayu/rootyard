@@ -47,15 +47,14 @@ pub fn recent_gateway_push_receipt(operation_id: Uuid) -> Option<CausalPushProof
     guard.iter().rev().find(|(op, _)| *op == operation_id).map(|(_, r)| r.clone())
 }
 
-/// Deterministic sibling `0700` reclaim ledger directory for a gateway `scratch_root`
-/// (kept outside `scratch_root` so transient compute-view emptiness checks remain unaffected).
+/// Deterministic private `0700` reclaim ledger directory for a gateway `scratch_root`
+/// (kept under system temp dir so `scratch_root` and parent worktrees stay clean).
 pub fn gateway_reclaim_ledger_dir_for_scratch(scratch_root: &Path) -> PathBuf {
     let mut h = Sha256::new();
-    h.update(b"gateway-reclaim-ledger-dir-v1\n");
+    h.update(b"gateway-reclaim-ledger-dir-v2\n");
     h.update(scratch_root.to_string_lossy().as_bytes());
     let suffix = &hex::encode(h.finalize())[..16];
-    let parent = scratch_root.parent().unwrap_or_else(|| Path::new("/tmp"));
-    parent.join(format!(".rootyard-gw-reclaim-{suffix}"))
+    std::env::temp_dir().join(format!("rootyard-gw-reclaim-{suffix}"))
 }
 
 pub fn open_gateway_reclaim_ledger(scratch_root: &Path) -> Result<QuarantineReclaimLedger, GatewayError> {
@@ -88,14 +87,16 @@ pub fn verify_gateway_authority_closure(
     refs: &[(String, String)],
     backend_hex: &str,
 ) -> Result<GatewayClosureContext, GatewayError> {
+    let authority_epoch = gate.authority_epoch().max(1);
+    let group_epoch = gate.group_epoch().max(1);
     let realm = RefVersionRealm::new(
         gate.tenant_id(),
         gate.repository_id(),
         gate.history_incarnation(),
         AuthorityKind::Pg,
-        gate.authority_epoch(),
+        authority_epoch,
         0,
-        gate.group_epoch(),
+        group_epoch,
         gate.object_format(),
     );
 
@@ -108,8 +109,8 @@ pub fn verify_gateway_authority_closure(
         lease_id: None,
         lease_expires_at_ms: None,
         now_ms: 0,
-        principal_authz_epoch: gate.authority_epoch().max(1),
-        min_required_authz_epoch: gate.authority_epoch().max(1),
+        principal_authz_epoch: authority_epoch,
+        min_required_authz_epoch: authority_epoch,
         write_authorized: !actor.read_only,
         allow_force_push: true,
         allow_branch_delete: true,
@@ -118,16 +119,17 @@ pub fn verify_gateway_authority_closure(
     };
 
     if !requires_closure {
+        let rev = capture.map_or_else(|| gate.revision(), ServingReadCapture::gate_revision);
         let snapshot = AuthorizedSnapshotState {
             realm,
             tenant_id: gate.tenant_id(),
             repository_id: gate.repository_id(),
             history_incarnation: gate.history_incarnation(),
-            authority_epoch: gate.authority_epoch(),
-            group_epoch: gate.group_epoch(),
-            expected_gate_revision: gate.revision(),
+            authority_epoch,
+            group_epoch,
+            expected_gate_revision: rev,
             object_format: gate.object_format(),
-            snapshot_seq: gate.revision(),
+            snapshot_seq: rev,
             root_version_id: None,
             current_refs,
             authorized_base_packs: Vec::new(),
@@ -143,21 +145,36 @@ pub fn verify_gateway_authority_closure(
     if reg_snap.packs().is_empty() {
         return Err(GatewayError::Internal("authority snapshot closure pack set is empty"));
     }
+    if reg_snap.scope().tenant_id() != gate.tenant_id()
+        || reg_snap.scope().repository_id() != gate.repository_id()
+        || reg_snap.scope().history_incarnation() != gate.history_incarnation()
+        || reg_snap.scope().object_format() != gate.object_format()
+    {
+        return Err(GatewayError::Internal("authority snapshot scope disagrees with repository gate"));
+    }
 
     let (first_ref_name, first_oid_hex) = current_refs
         .iter()
         .find(|(_, oid)| !oid.bytes().all(|b| b == b'0'))
         .ok_or(GatewayError::Internal("missing anchor ref in non-empty snapshot"))?;
-    let (graph, root_vid, base_packs) =
-        build_closure_graph_from_registered(realm, gate, reg_snap.packs(), first_ref_name, first_oid_hex, backend_hex)?;
+    let snap_rev = reg_snap.gate_revision().max(1);
+    let (graph, root_vid, base_packs) = build_closure_graph_from_registered(
+        realm,
+        gate,
+        snap_rev,
+        reg_snap.packs(),
+        first_ref_name,
+        first_oid_hex,
+        backend_hex,
+    )?;
 
     let snapshot = AuthorizedSnapshotState {
         realm,
         tenant_id: gate.tenant_id(),
         repository_id: gate.repository_id(),
         history_incarnation: gate.history_incarnation(),
-        authority_epoch: gate.authority_epoch(),
-        group_epoch: gate.group_epoch(),
+        authority_epoch,
+        group_epoch,
         expected_gate_revision: reg_snap.gate_revision(),
         object_format: gate.object_format(),
         snapshot_seq: reg_snap.gate_revision(),
@@ -173,6 +190,7 @@ pub fn verify_gateway_authority_closure(
 fn build_closure_graph_from_registered(
     realm: RefVersionRealm,
     gate: &CoreGate,
+    snap_revision: i64,
     packs: &[RegisteredPack],
     anchor_ref: &str,
     anchor_oid_hex: &str,
@@ -181,7 +199,7 @@ fn build_closure_graph_from_registered(
     let ref_name = RefName::new(anchor_ref).map_err(|_| GatewayError::Internal("invalid snapshot ref name"))?;
     let oid = GitOid::parse(gate.object_format(), anchor_oid_hex)
         .map_err(|_| GatewayError::Internal("invalid snapshot ref oid"))?;
-    let seq = gate.revision().max(1);
+    let seq = snap_revision.max(1);
     let op_id = reg_op_uuid(gate.repository_id(), seq);
 
     let mut entries = Vec::with_capacity(packs.len());
@@ -191,23 +209,36 @@ fn build_closure_graph_from_registered(
     for rp in packs {
         let p_art = rp.artifact(PackArtifactRole::Pack);
         let i_art = rp.artifact(PackArtifactRole::Idx);
-        if p_art.backend_identity() != backend_hex || i_art.backend_identity() != backend_hex {
+        if p_art.backend_identity() != backend_hex
+            || i_art.backend_identity() != backend_hex
+            || p_art.provider() != i_art.provider()
+        {
             return Err(GatewayError::Internal("registered base pack backend identity mismatch"));
         }
         let p_loc = p_art.locator().blob_locator().map_err(|_| GatewayError::Internal("invalid base pack locator"))?;
         let i_loc = i_art.locator().blob_locator().map_err(|_| GatewayError::Internal("invalid base idx locator"))?;
+        if p_loc.tenant_id() != gate.tenant_id()
+            || i_loc.tenant_id() != gate.tenant_id()
+            || p_loc.authority_id() != i_loc.authority_id()
+            || p_loc.authority_id().is_nil()
+        {
+            return Err(GatewayError::Internal("registered base pack tenant or hold authority mismatch"));
+        }
         let entry = PackSetEntry::new(rp.pack_id(), rp.registration_id(), *rp.artifact_set_digest().digest())
             .map_err(|_| GatewayError::Internal("invalid base PackSetEntry"))?;
+        let verified_bytes = p_art.verified_length().saturating_add(i_art.verified_length()).max(2);
+        // `publish.rs` binds Blob hold locators to a per-operation `hold-authority` UUID while
+        // `PackReadSnapshot` authoritatively proves membership in `gate.repository_id()`.
         let vp = VerifiedClosurePack::new(
             entry,
-            p_loc.tenant_id(),
-            p_loc.authority_id(),
+            gate.tenant_id(),
+            gate.repository_id(),
             p_art.provider(),
             p_art.backend_identity(),
-            p_art.verified_length().max(2),
+            verified_bytes,
             2,
         )
-        .map_err(|_| GatewayError::Internal("invalid VerifiedClosurePack"))?;
+        .map_err(|_| GatewayError::TooLarge)?;
         entries.push(entry);
         verified_packs.push(vp);
         base_refs_raw.push((rp, p_art, i_art, p_loc, i_loc));
@@ -352,6 +383,7 @@ pub fn finalize_gateway_receipt(args: GatewayReceiptArgs<'_>) -> Result<CausalPu
     let ticket = OperationTicket { issuer_id, lane: GATEWAY_LANE.to_owned(), sequence: 1, operation_id };
     let (accepted_init, rejected_init) = split_terminal_subset(&terminal.refs);
     let init_subset_digest = compute_accepted_subset_digest(&accepted_init, &rejected_init);
+    let committed_rev = terminal.is_committed().then_some(terminal.revision);
     let first = pairs.first();
     let mut receipt = CausalPushProofReceipt {
         receipt_version: 2,
@@ -367,7 +399,7 @@ pub fn finalize_gateway_receipt(args: GatewayReceiptArgs<'_>) -> Result<CausalPu
         sequence: ticket.sequence,
         base_snapshot_seq: closure.snapshot.snapshot_seq,
         expected_gate_revision: closure.snapshot.expected_gate_revision,
-        committed_gate_revision: Some(terminal.revision),
+        committed_gate_revision: committed_rev,
         base_version_ids: closure.base_version_ids.clone(),
         required_ancestor_oids: Vec::new(),
         resolved_thin_base_oids: Vec::new(),
@@ -392,7 +424,7 @@ pub fn finalize_gateway_receipt(args: GatewayReceiptArgs<'_>) -> Result<CausalPu
     };
     receipt.proof_digest = receipt.recompute_digest();
     receipt
-        .rebind_final_cas_terminal(&closure.snapshot, &ticket, backend_hex, Some(terminal.revision), &terminal.refs)
+        .rebind_final_cas_terminal(&closure.snapshot, &ticket, backend_hex, committed_rev, &terminal.refs)
         .map_err(|_| GatewayError::Internal("gateway commit receipt failed CAS subset binding"))?;
 
     let mut ring = receipt_ring().lock().unwrap_or_else(std::sync::PoisonError::into_inner);

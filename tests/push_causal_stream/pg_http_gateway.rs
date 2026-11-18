@@ -1,33 +1,38 @@
 //! Full authoritative PostgreSQL 17 + `LoopbackS3` + `blob_git_gateway::router` + stock `git`
-//! Smart HTTP `receive-pack` acceptance suite (#183 Merge Gates 1–4).
+//! Smart HTTP `receive-pack` acceptance suite (#183 Merge Gates 1–4 + concurrent CAS 200 `ng`).
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use deadpool_postgres::{Manager, Pool};
 use rootyard::blob_git_gateway::{BlobGitConfig, BlobGitState};
 use rootyard::blob_store::opendal::BlobStore;
 use rootyard::db;
-use rootyard::namespace_service::push_causal_stream::quarantine::HoldLifecycleState;
 use rootyard::namespace_service::push_causal_stream::*;
+use rootyard::ref_store::CommitRejectCode;
 use rootyard::ref_store::core::decision_commit::{PgDecisionProtocol, RealmExpectation};
-use rootyard::ref_store::core::pack_commit::PgPackCommit;
-use rootyard::ref_store::core::ref_version::{AuthorityKind, RefVersionRealm};
 use rootyard::ref_store::core::types::GitObjectFormat;
 use rootyard::ref_store::serving::lookup;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Barrier;
 use tokio::time::Instant as TokioInstant;
 use uuid::Uuid;
 
-use super::support::{LoopbackS3, active_auth, mk_commit, run_git};
+use super::pg_scoped_producer::{PgScopedTestEnv, exercise_pg_scoped_producer};
+use super::support::{LoopbackS3, build_receive_wire, mk_commit, run_git};
+
+#[cfg(unix)]
+const NULL_GIT_CONFIG: &str = "/dev/null";
+#[cfg(not(unix))]
+const NULL_GIT_CONFIG: &str = "NUL";
 
 struct PgSchemaGuard {
     admin: Pool,
@@ -52,8 +57,8 @@ impl PgSchemaGuard {
             .max_size(16)
             .build()?;
         db::migrate(&pool).await?;
-        let client = pool.get().await?;
-        client
+        pool.get()
+            .await?
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS public.cluster_authority (
                      singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
@@ -112,7 +117,7 @@ impl LiveGateway {
     }
 }
 
-fn resolve_git_binary() -> Result<PathBuf> {
+pub fn resolve_git_binary() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("ROOTYARD_TEST_GIT") {
         let pb = PathBuf::from(p);
         if pb.is_file() {
@@ -128,10 +133,31 @@ fn resolve_git_binary() -> Result<PathBuf> {
     Err(anyhow!("stock git binary not found at /usr/bin/git"))
 }
 
-struct PgActor {
-    identity: db::Identity,
-    username: String,
-    token: String,
+async fn git_http(cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let dir = cwd.to_path_buf();
+    let owned_args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+    tokio::task::spawn_blocking(move || {
+        let out = Command::new("git")
+            .args(["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-C"])
+            .arg(&dir)
+            .args(&owned_args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", NULL_GIT_CONFIG)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_HTTP_LOW_SPEED_LIMIT", "1")
+            .env("GIT_HTTP_LOW_SPEED_TIME", "25")
+            .stdin(Stdio::null())
+            .output()?;
+        ensure!(out.status.success(), "git {owned_args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        Ok(out.stdout)
+    })
+    .await?
+}
+
+pub struct PgActor {
+    pub identity: db::Identity,
+    pub username: String,
+    pub token: String,
 }
 
 async fn issue_writable_actor(pool: &Pool, prefix: &str) -> Result<PgActor> {
@@ -144,7 +170,7 @@ async fn issue_writable_actor(pool: &Pool, prefix: &str) -> Result<PgActor> {
     Ok(PgActor { identity, username, token })
 }
 
-async fn create_and_provision_repo(
+pub async fn create_and_provision_repo(
     addr: SocketAddr,
     pool: &Pool,
     store: &BlobStore,
@@ -179,11 +205,14 @@ async fn create_and_provision_repo(
     Ok(repo_id)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires PG17, LoopbackS3, and stock Git"]
 async fn production_gateway_http_stock_git_push_sha1_sha256_pg_producer_and_slowloris_deadline() -> Result<()> {
     let pg = PgSchemaGuard::setup().await?;
-    let run_res = run_gateway_and_pg_producer_suite(&pg).await;
+    let run_res = tokio::time::timeout(Duration::from_secs(120), run_gateway_and_pg_producer_suite(&pg))
+        .await
+        .map_err(|_| anyhow!("PG17 gateway acceptance timed out after 120s"))
+        .and_then(|r| r);
     let td_res = pg.teardown().await;
     run_res?;
     td_res
@@ -195,8 +224,9 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
     let gw = LiveGateway::start(pg.pool.clone(), store.clone(), Duration::from_secs(60)).await?;
     let actor = issue_writable_actor(&pg.pool, "push183").await?;
     let backend_hex = store.backend_identity().as_hex().to_owned();
+    let git_bin = resolve_git_binary()?;
 
-    // 1. Exercise real production `POST /git/{owner}/{name}.git/git-receive-pack` with stock `git` (`sha1` & `sha256`).
+    // 1. Real production `POST /git/{owner}/{name}.git/git-receive-pack` with stock `git` (`sha1` & `sha256`).
     for (fmt_str, git_fmt) in [("sha1", GitObjectFormat::Sha1), ("sha256", GitObjectFormat::Sha256)] {
         let repo_name = format!("gw-{fmt_str}-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let repo_id = create_and_provision_repo(gw.addr, &pg.pool, &store, &actor, &repo_name, fmt_str).await?;
@@ -205,23 +235,23 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
 
         let tmp = TempDir::new()?;
         let clone1 = tmp.path().join("clone1");
-        run_git(tmp.path(), &["clone", "--no-hardlinks", &remote_url, clone1.to_str().unwrap()], None)?;
+        git_http(tmp.path(), &["clone", "--no-hardlinks", &remote_url, clone1.to_str().unwrap()]).await?;
         let base_text = "shared-line-for-thin-delta-\n".repeat(150);
         let c1 = mk_commit(&clone1, "app.txt", &base_text, "initial commit")?;
-        run_git(&clone1, &["push", "origin", "HEAD:refs/heads/main"], None)?;
+        git_http(&clone1, &["push", "origin", "HEAD:refs/heads/main"]).await?;
 
-        // Incremental push over non-empty repository (triggers #183 Merge Gate 2 base snapshot closure verification!).
+        // Incremental push over non-empty repository (triggers #183 Merge Gate 2 base snapshot closure!).
         let c2 = mk_commit(&clone1, "app.txt", &format!("{base_text}incremental-v2\n"), "incremental delta commit")?;
         let op_hdr = Uuid::new_v4();
         let extra_hdr = format!("http.extraHeader=X-Rootyard-Operation: {op_hdr}");
-        run_git(&clone1, &["-c", &extra_hdr, "push", "origin", "HEAD:refs/heads/main"], None)?;
+        git_http(&clone1, &["-c", &extra_hdr, "push", "origin", "HEAD:refs/heads/main"]).await?;
 
         let receipt = recent_gateway_push_receipt(op_hdr)
             .ok_or_else(|| anyhow!("missing CausalPushProofReceipt for production HTTP push {op_hdr}"))?;
         ensure!(receipt.object_format == git_fmt && receipt.repository_id == repo_id, "receipt scope mismatch");
         ensure!(
             receipt.committed_gate_revision == Some(3),
-            "expected revision 3, got {:?}",
+            "expected rev 3, got {:?}",
             receipt.committed_gate_revision
         );
         ensure!(
@@ -231,32 +261,24 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
         );
         receipt.verify_digest()?;
 
-        // Verify PG17 durable scoped decisions + durable A3 artifact holds + pack memberships.
         let db_client = pg.pool.get().await?;
-        let (decisions, holds, memberships): (i64, i64, i64) = {
-            let d: i64 = db_client
-                .query_one(
-                    "SELECT COUNT(*) FROM ref_store_core_decisions WHERE repository_id=$1 AND state='committed'",
-                    &[&repo_id],
-                )
-                .await?
-                .get(0);
-            let h: i64 = db_client
-                .query_one("SELECT COUNT(*) FROM ref_store_artifact_holds WHERE repository_id=$1", &[&repo_id])
-                .await?
-                .get(0);
-            let m: i64 = db_client
-                .query_one("SELECT COUNT(*) FROM ref_store_core_pack_memberships WHERE repository_id=$1", &[&repo_id])
-                .await?
-                .get(0);
-            (d, h, m)
-        };
-        ensure!(
-            decisions >= 2 && holds >= 4 && memberships >= 2,
-            "PG17 ledger counts unexpected: d={decisions} h={holds} m={memberships}"
-        );
+        let d: i64 = db_client
+            .query_one(
+                "SELECT COUNT(*) FROM ref_store_core_decisions WHERE repository_id=$1 AND state='committed'",
+                &[&repo_id],
+            )
+            .await?
+            .get(0);
+        let h: i64 = db_client
+            .query_one("SELECT COUNT(*) FROM ref_store_artifact_holds WHERE repository_id=$1", &[&repo_id])
+            .await?
+            .get(0);
+        let m: i64 = db_client
+            .query_one("SELECT COUNT(*) FROM ref_store_core_pack_memberships WHERE repository_id=$1", &[&repo_id])
+            .await?
+            .get(0);
+        ensure!(d >= 2 && h >= 4 && m >= 2, "PG17 ledger counts unexpected: d={d} h={h} m={m}");
 
-        // Scratch dir must have zero lingering compute views; fresh clone + fsck proves remote Blob durability.
         for _ in 0..30 {
             if std::fs::read_dir(gw.scratch.path())?.next().is_none() {
                 break;
@@ -266,23 +288,32 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
         ensure!(std::fs::read_dir(gw.scratch.path())?.next().is_none(), "scratch_root must stay empty after push");
 
         let clone2 = tmp.path().join("clone2");
-        run_git(tmp.path(), &["clone", "--no-hardlinks", &remote_url, clone2.to_str().unwrap()], None)?;
+        git_http(tmp.path(), &["clone", "--no-hardlinks", &remote_url, clone2.to_str().unwrap()]).await?;
         let head2 = String::from_utf8(run_git(&clone2, &["rev-parse", "HEAD"], None)?)?.trim().to_owned();
         ensure!(head2 == c2, "fresh clone HEAD mismatch: {head2} != {c2}");
         run_git(&clone2, &["fsck", "--full", "--strict"], None)?;
     }
 
-    // 2. Direct `commit_push_on_pg` acceptance: proves PG producer gates on scoped decision + durable holds
-    //    and rebinds `CausalPushProofReceipt` to the actual `AcceptedSubset` CAS outcome (#183 Merge Gate 3).
-    exercise_pg_scoped_producer(pg, &store, gw.addr, &actor, &backend_hex).await?;
+    // 2. Concurrent same-ref race on non-empty repo: loser MUST return HTTP 200 OK `ng` (never HTTP 500!).
+    exercise_concurrent_same_ref_http_race(gw.addr, &pg.pool, &store, &actor).await?;
 
-    // 3. Real TCP HTTP slowloris command-phase stall against production `git-receive-pack` (#183 Merge Gate 1).
-    let tight_gw = LiveGateway::start(pg.pool.clone(), store.clone(), Duration::from_millis(250)).await?;
+    // 3. Direct `commit_push_on_pg` scoped decision + durable A3 hold + `AcceptedSubset` receipt rebinding.
+    exercise_pg_scoped_producer(PgScopedTestEnv {
+        pool: &pg.pool,
+        store: &store,
+        gw_addr: gw.addr,
+        actor: &actor,
+        git_binary: &git_bin,
+        backend_hex: &backend_hex,
+    })
+    .await?;
+
+    // 4. Real TCP HTTP slowloris command-phase stall against production `git-receive-pack` (#183 Merge Gate 1).
     let stall_repo = format!("stall-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    let stall_repo_id = create_and_provision_repo(tight_gw.addr, &pg.pool, &store, &actor, &stall_repo, "sha1").await?;
+    let stall_repo_id = create_and_provision_repo(gw.addr, &pg.pool, &store, &actor, &stall_repo, "sha1").await?;
+    let tight_gw = LiveGateway::start(pg.pool.clone(), store.clone(), Duration::from_millis(250)).await?;
     let auth_b64 = base64_basic(&actor.username, &actor.token);
     let mut stream = TcpStream::connect(tight_gw.addr).await?;
-    let partial_pkt = b"0067000000000000"; // incomplete pkt-line command (stalls before `0000` flush!)
     let req_head = format!(
         "POST /git/{}/{stall_repo}.git/git-receive-pack HTTP/1.1\r\n\
          Host: {}\r\n\
@@ -293,7 +324,7 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
         actor.username, tight_gw.addr
     );
     stream.write_all(req_head.as_bytes()).await?;
-    stream.write_all(partial_pkt).await?;
+    stream.write_all(b"0067000000000000").await?;
     stream.flush().await?;
     tokio::time::sleep(Duration::from_millis(420)).await;
     let mut resp_buf = Vec::new();
@@ -317,156 +348,92 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
     Ok(())
 }
 
-async fn exercise_pg_scoped_producer(
-    pg: &PgSchemaGuard,
-    store: &BlobStore,
+async fn exercise_concurrent_same_ref_http_race(
     addr: SocketAddr,
+    pool: &Pool,
+    store: &BlobStore,
     actor: &PgActor,
-    backend_hex: &str,
 ) -> Result<()> {
-    let repo_name = format!("pgprod-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    let repo_id = create_and_provision_repo(addr, &pg.pool, store, actor, &repo_name, "sha1").await?;
-    let dl = TokioInstant::now() + Duration::from_secs(30);
-    let mut db_client = pg.pool.get().await?;
-    let repo_owner_id: Uuid =
-        db_client.query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&repo_id]).await?.get(0);
-    let serving =
-        lookup(&pg.pool, &actor.identity, &actor.username, &repo_name, true, store.backend_identity(), dl).await?;
-    let gate = serving.gate;
-    let baseline = PgPackCommit.capture_baseline(&mut db_client, repo_id, gate.tenant_id(), dl).await?;
-    drop(db_client);
+    let repo_name = format!("race-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    create_and_provision_repo(addr, pool, store, actor, &repo_name, "sha1").await?;
+    let remote_url = format!("http://{}:{}@{addr}/git/{}/{repo_name}.git", actor.username, actor.token, actor.username);
 
     let tmp = TempDir::new()?;
-    let (work, bare) = (tmp.path().join("w"), tmp.path().join("b"));
-    run_git(tmp.path(), &["init", "-b", "main", work.to_str().unwrap()], None)?;
-    run_git(tmp.path(), &["init", "--bare", bare.to_str().unwrap()], None)?;
-    let c1 = mk_commit(&work, "p.txt", "pg-scoped-v1\n", "c1")?;
-    let raw_pack = run_git(&work, &["pack-objects", "--revs", "--stdout"], Some(format!("{c1}\n").as_bytes()))?;
-    let p_path = bare.join("objects/pack/p1.pack");
-    let idx_path = bare.join("objects/pack/p1.idx");
-    run_git(&bare, &["index-pack", "--stdin", "--strict", p_path.to_str().unwrap()], Some(&raw_pack))?;
+    let seed = tmp.path().join("seed");
+    git_http(tmp.path(), &["clone", "--no-hardlinks", &remote_url, seed.to_str().unwrap()]).await?;
+    let base_oid = mk_commit(&seed, "seed.txt", "race-seed\n", "seed")?;
+    git_http(&seed, &["push", "origin", "HEAD:refs/heads/race"]).await?;
 
-    let realm = RefVersionRealm::new(
-        gate.tenant_id(),
-        repo_id,
-        gate.history_incarnation(),
-        AuthorityKind::Pg,
-        gate.authority_epoch(),
-        0,
-        gate.group_epoch(),
-        GitObjectFormat::Sha1,
-    );
-    let snapshot = AuthorizedSnapshotState {
-        realm,
-        tenant_id: gate.tenant_id(),
-        repository_id: repo_id,
-        history_incarnation: gate.history_incarnation(),
-        authority_epoch: gate.authority_epoch(),
-        group_epoch: gate.group_epoch(),
-        expected_gate_revision: baseline.gate().revision(),
-        object_format: GitObjectFormat::Sha1,
-        snapshot_seq: baseline.gate().revision(),
-        root_version_id: None,
-        current_refs: BTreeMap::new(),
-        authorized_base_packs: Vec::new(),
-    };
-    let op_id = Uuid::new_v4();
-    let ticket =
-        OperationTicket { issuer_id: actor.identity.id, lane: "pg-push".into(), sequence: 1, operation_id: op_id };
-    let auth = active_auth(actor.identity.id, true);
-    let caps = ReceiveCapabilities { report_status: true, atomic: false, ..ReceiveCapabilities::default() };
+    let mut wires = Vec::new();
+    for tag in ["a", "b"] {
+        let dir = tmp.path().join(format!("c-{tag}"));
+        git_http(tmp.path(), &["clone", "--branch", "race", "--no-hardlinks", &remote_url, dir.to_str().unwrap()])
+            .await?;
+        let new_oid = mk_commit(&dir, &format!("{tag}.txt"), &format!("racer-{tag}\n"), &format!("race {tag}"))?;
+        let pack = run_git(&dir, &["--no-pager", "pack-objects", "--stdout", "--all"], Some(b""))?;
+        let cmd = format!("{base_oid} {new_oid} refs/heads/race");
+        wires.push((Uuid::new_v4(), build_receive_wire(&[cmd.as_str()], "report-status", &pack)));
+    }
 
-    // Two updates in `AcceptedSubset`: `refs/heads/main` (Absent -> c1, succeeds) + `refs/heads/stale` (Present(fake) -> c1, rejected).
-    let accepted = vec![
-        AcceptedRefProof {
-            ref_name: "refs/heads/main".into(),
-            old_oid: None,
-            new_oid: Some(c1.clone()),
-            target_kind: "commit".into(),
-        },
-        AcceptedRefProof {
-            ref_name: "refs/heads/stale".into(),
-            old_oid: Some("1".repeat(40)),
-            new_oid: Some(c1.clone()),
-            target_kind: "commit".into(),
-        },
-    ];
-    let sub_dig =
-        rootyard::namespace_service::push_causal_stream::receipt::compute_accepted_subset_digest(&accepted, &[]);
-    let mut receipt = CausalPushProofReceipt {
-        receipt_version: 2,
-        tenant_id: snapshot.tenant_id,
-        repository_id: repo_id,
-        history_incarnation: snapshot.history_incarnation,
-        authority_epoch: snapshot.authority_epoch,
-        group_epoch: snapshot.group_epoch,
-        object_format: GitObjectFormat::Sha1,
-        operation_id: op_id,
-        issuer_id: actor.identity.id,
-        lane: ticket.lane.clone(),
-        sequence: 1,
-        base_snapshot_seq: snapshot.snapshot_seq,
-        expected_gate_revision: snapshot.expected_gate_revision,
-        committed_gate_revision: None,
-        base_version_ids: vec![],
-        required_ancestor_oids: vec![],
-        resolved_thin_base_oids: vec![],
-        base_closure_digest: "0".repeat(64),
-        pack_sha256: None,
-        pack_bytes: 0,
-        idx_sha256: None,
-        idx_bytes: 0,
-        pack_locator: None,
-        idx_locator: None,
-        blob_backend_identity: backend_hex.to_owned(),
-        object_count: 3,
-        delta_object_count: 0,
-        max_delta_chain_depth: 0,
-        duplicate_object_count: 0,
-        blob_closure_digest: "0".repeat(64),
-        accepted_updates: accepted,
-        rejected_updates: vec![],
-        accepted_subset_digest: sub_dig,
-        proof_digest: String::new(),
-    };
-    receipt.proof_digest = receipt.recompute_digest();
+    let url = format!("http://{addr}/git/{}/{repo_name}.git/git-receive-pack", actor.username);
+    let auth_hdr = format!("Basic {}", base64_basic(&actor.username, &actor.token));
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for (op_id, body) in wires {
+        let (u, a, bar) = (url.clone(), auth_hdr.clone(), Arc::clone(&barrier));
+        handles.push(tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            bar.wait().await;
+            for attempt in 0..2 {
+                let resp = client
+                    .post(&u)
+                    .header(header::AUTHORIZATION, &a)
+                    .header(header::CONTENT_TYPE, "application/x-git-receive-pack-request")
+                    .header("X-Rootyard-Operation", op_id.to_string())
+                    .body(body.clone())
+                    .send()
+                    .await?;
+                let st = resp.status();
+                let bytes = resp.bytes().await?.to_vec();
+                if st == StatusCode::CONFLICT && attempt == 0 {
+                    continue;
+                }
+                return Ok::<(Uuid, StatusCode, Vec<u8>), anyhow::Error>((op_id, st, bytes));
+            }
+            Err(anyhow!("unexpected repeated 409 on race operation {op_id}"))
+        }));
+    }
 
-    let reclaim = QuarantineReclaimLedger::open(tmp.path().join("reclaim"))?;
-    let mut hold_guard = OperationHoldGuard::acquire(op_id, vec![], vec![]);
-    let git_bin = resolve_git_binary()?;
-    let outcome = commit_push_on_pg(PgScopedPushParams {
-        pool: &pg.pool,
-        store,
-        git_binary: &git_bin,
-        actor: &actor.identity,
-        owner_id: repo_owner_id,
-        snapshot: &snapshot,
-        ticket: &ticket,
-        auth: &auth,
-        capabilities: &caps,
-        staged_pack_pair: Some((&p_path, &idx_path)),
-        reclaim_ledger: Some(&reclaim),
-        receipt: &mut receipt,
-        hold_guard: &mut hold_guard,
-        deadline: dl,
-    })
-    .await?;
-
-    ensure!(hold_guard.state == HoldLifecycleState::ConsumedCommitted && hold_guard.hold_ids.len() == 2);
-    ensure!(reclaim.load(op_id)?.unwrap().state == UploadReclaimState::VerifiedPromoted);
-    receipt.verify_commit_binding(&snapshot, &ticket, backend_hex, &outcome.terminal_refs)?;
-    ensure!(receipt.accepted_updates.len() == 1 && receipt.rejected_updates.len() == 1);
-    let wire_txt = String::from_utf8_lossy(&outcome.report_status_wire);
-    ensure!(wire_txt.contains("ok refs/heads/main\n") && wire_txt.contains("ng refs/heads/stale"));
+    let (mut ok_cnt, mut ng_cnt) = (0usize, 0usize);
+    for h in handles {
+        let (op_id, st, bytes) = h.await??;
+        ensure!(st == StatusCode::OK, "expected HTTP 200 OK on concurrent push {op_id}, got {st}");
+        let txt = String::from_utf8_lossy(&bytes);
+        let receipt = recent_gateway_push_receipt(op_id).ok_or_else(|| anyhow!("missing race receipt {op_id}"))?;
+        receipt.verify_digest()?;
+        if txt.contains("ok refs/heads/race\n") {
+            ensure!(receipt.committed_gate_revision.is_some() && receipt.accepted_updates.len() == 1);
+            ok_cnt += 1;
+        } else {
+            ensure!(txt.contains("ng refs/heads/race stale info\n"), "unexpected loser report: {txt}");
+            ensure!(
+                receipt.committed_gate_revision.is_none()
+                    && receipt.accepted_updates.is_empty()
+                    && receipt.rejected_updates.len() == 1
+                    && receipt.rejected_updates[0].code == CommitRejectCode::OldOidMismatch
+            );
+            ng_cnt += 1;
+        }
+    }
+    ensure!(ok_cnt == 1 && ng_cnt == 1, "expected 1 winner and 1 CAS loser, got ok={ok_cnt} ng={ng_cnt}");
     Ok(())
 }
 
 fn base64_basic(user: &str, token: &str) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let raw = format!("{user}:{token}");
-    let bytes = raw.as_bytes();
     let mut out = String::new();
-    for chunk in bytes.chunks(3) {
+    for chunk in raw.as_bytes().chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
         let b2 = *chunk.get(2).unwrap_or(&0) as u32;

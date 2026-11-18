@@ -12,7 +12,7 @@ use axum::{
     Router,
     body::Body,
     extract::State,
-    http::{Method, StatusCode, Uri, header},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     response::Response,
 };
 use bytes::Bytes;
@@ -96,7 +96,13 @@ impl LoopbackS3 {
     }
 }
 
-async fn handle_s3(State(objects): State<S3Objects>, method: Method, uri: Uri, body: Bytes) -> Response {
+async fn handle_s3(
+    State(objects): State<S3Objects>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let key = uri.path().trim_start_matches('/').to_owned();
     if !key.contains('/') {
         return close_resp(StatusCode::OK, b"<ListBucketResult/>".to_vec());
@@ -107,19 +113,52 @@ async fn handle_s3(State(objects): State<S3Objects>, method: Method, uri: Uri, b
             close_resp(StatusCode::OK, Vec::new())
         }
         Method::GET | Method::HEAD => {
-            if let Some(bytes) = objects.lock().unwrap().get(&key).cloned() {
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_LENGTH, bytes.len())
+            let Some(bytes) = objects.lock().unwrap().get(&key).cloned() else {
+                return close_resp(StatusCode::NOT_FOUND, Vec::new());
+            };
+            if method == Method::GET
+                && let Some(raw_range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok())
+            {
+                let Some((start, end)) = parse_s3_range(raw_range, bytes.len()) else {
+                    return close_resp(StatusCode::RANGE_NOT_SATISFIABLE, Vec::new());
+                };
+                let slice = bytes[start..=end].to_vec();
+                let cr = format!("bytes {start}-{end}/{}", bytes.len());
+                return Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_LENGTH, slice.len())
+                    .header(header::CONTENT_RANGE, cr)
                     .header(header::CONNECTION, "close")
-                    .body(Body::from(if method == Method::HEAD { Vec::new() } else { bytes }))
-                    .unwrap()
-            } else {
-                close_resp(StatusCode::NOT_FOUND, Vec::new())
+                    .body(Body::from(slice))
+                    .unwrap();
             }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, bytes.len())
+                .header(header::CONNECTION, "close")
+                .body(Body::from(if method == Method::HEAD { Vec::new() } else { bytes }))
+                .unwrap()
+        }
+        Method::DELETE => {
+            objects.lock().unwrap().remove(&key);
+            close_resp(StatusCode::NO_CONTENT, Vec::new())
         }
         _ => close_resp(StatusCode::METHOD_NOT_ALLOWED, Vec::new()),
     }
+}
+
+fn parse_s3_range(raw: &str, total: usize) -> Option<(usize, usize)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = raw.strip_prefix("bytes=")?;
+    let (s, e) = spec.split_once('-')?;
+    let start: usize = s.parse().ok()?;
+    if start >= total {
+        return None;
+    }
+    let end = if e.is_empty() { total - 1 } else { e.parse::<usize>().ok()?.min(total - 1) };
+    (start <= end).then_some((start, end))
 }
 
 fn close_resp(status: StatusCode, body: Vec<u8>) -> Response {
