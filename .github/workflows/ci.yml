@@ -222,73 +222,6 @@ jobs:
         run: python3 tests/ci_mirror.py --binary "$ROOTYARD_BIN" --report test-results/ci-mirror.json
       - name: Exercise exact-target source retention and mirror preparation
         run: python3 tests/ci_source_pins.py --binary "$ROOTYARD_BIN" --report test-results/ci-source-pins.json
-      - name: Exercise isolated job checkout authorization and object closure
-        run: python3 tests/ci_job_checkouts.py --binary "$ROOTYARD_BIN" --report test-results/ci-job-checkouts.json
-      - name: Exercise exact pinned dependency checkout and origin fallback boundaries
-        timeout-minutes: 20
-        run: python3 tests/ci_dependencies.py --binary "$ROOTYARD_BIN" --report test-results/ci-dependencies.json
-      - name: Build frozen schema007 binary for genuine legacy restore
-        run: |
-          legacy=08b10e9976c012343c48e4fd6a5981e0266b8c53
-          workspace="$PWD"
-          umask 077
-          mkdir -p "$workspace/target"
-          legacy_root=$(mktemp -d "$workspace/target/legacy-source.XXXXXX")
-          trap 'rm -rf "$legacy_root"' EXIT
-          mkdir "$legacy_root/home" "$legacy_root/repo"
-          # Never invoke Git against the inherited checkout or inherit its config.
-          git_owned() {
-            env -i PATH="$PATH" HOME="$legacy_root/home" \
-              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-              GIT_TERMINAL_PROMPT=0 timeout 180 git -C "$legacy_root/repo" "$@"
-          }
-          git_owned init --template=
-          git_owned fetch --no-tags --depth=1 https://github.com/jihuayu/rootyard.git "$legacy"
-          test "$(git_owned rev-parse --verify 'FETCH_HEAD^{commit}')" = "$legacy"
-          git_owned checkout --detach "$legacy"
-          test "$(git_owned rev-parse --verify HEAD)" = "$legacy"
-          (
-            cd "$legacy_root/repo"
-            # Output uplift only: CargoFork keeps the shared compiler cache in
-            # ~/.cargo/targets and writes this frozen legacy binary here. Do not
-            # copy a target tree per commit.
-            CARGO_TARGET_DIR="$workspace/target/legacy-build" cargo build --locked --manifest-path Cargo.toml --bin rootyard
-          )
-          cp "$workspace/target/legacy-build/debug/rootyard" "$workspace/target/rootyard-schema007"
-      - name: Exercise checkout backup revocation and genuine schema007 restore
-        run: python3 tests/backup_ci_checkouts.py --binary "$ROOTYARD_BIN" --legacy-binary target/rootyard-schema007 --report test-results/backup-ci-checkouts.json
-      - name: Exercise source-pin paired backup and restore
-        run: python3 tests/backup_ci_pins.py --binary "$ROOTYARD_BIN" --report test-results/backup-ci-pins.json
-      - name: Exercise durable push recovery
-        run: python3 tests/reliability.py --binary "$ROOTYARD_BIN" --report test-results/reliability.json
-      - name: Exercise direct collaborator Git transport and write-endpoint authorization (#4)
-        timeout-minutes: 15
-        run: python3 tests/collaborator_transport.py --binary "$ROOTYARD_BIN" --report test-results/collaborator-transport.json
-      - name: Recover native Git receipts after collaborator and organization withdrawal
-        run: python3 tests/recorded_membership_recovery.py --binary "$ROOTYARD_BIN" --report test-results/recorded-membership-recovery.json
-      - name: Recover native Git receipts after token revocation
-        run: python3 tests/recorded_recovery.py --binary "$ROOTYARD_BIN" --report test-results/recorded-recovery.json
-      - name: Exercise offline backup and fresh database restore
-        run: python3 tests/backup.py --binary "$ROOTYARD_BIN" --report test-results/backup.json
-      # Kept beside (not in place of) tests/backup.py: this drill covers the
-      # audit-ID sequence across a format21 metadata-only backup and a fresh
-      # database restore. It reuses the job's PostgreSQL 17 service URL, the
-      # source-bound binary and the job fixture env, and fails (never skips)
-      # when a dependency is missing; the report feeds the native manifest.
-      - name: Restore the audit ID sequence through an offline backup and fresh database
-        timeout-minutes: 10
-        run: python3 tests/backup_audit_sequence_legacy.py --binary "$ROOTYARD_BIN" --report test-results/audit-sequence-backup.json
-      - name: Restore populated PostgreSQL RefStore core metadata from the current backup format
-        timeout-minutes: 10
-        run: python3 tests/backup_refstore_core139.py --binary "$ROOTYARD_BIN" --report test-results/backup-refstore-core.json
-      - name: Restore populated PostgreSQL RefStore snapshot metadata from the current backup format
-        timeout-minutes: 10
-        run: python3 tests/backup_refstore_snapshot140.py --binary "$ROOTYARD_BIN" --snapshot-fixture-binary "$ROOTYARD_SNAPSHOT_FIXTURE" --report test-results/backup-refstore-snapshot.json
-      - name: Restore populated permanent artifact-hold metadata from the current backup format
-        timeout-minutes: 10
-        run: python3 tests/backup_refstore_holds141.py --binary "$ROOTYARD_BIN" --holds-fixture-binary "$ROOTYARD_HOLDS_FIXTURE" --report test-results/backup-refstore-holds.json
-      - name: Exercise restored schema-003 recovery protections
-        run: python3 tests/backup_recovery.py --binary "$ROOTYARD_BIN" --report test-results/backup-recovery.json
       - name: Verify browse cache incarnation across restore with owned Redis
         timeout-minutes: 24
         shell: bash
@@ -451,6 +384,73 @@ jobs:
           rm -rf -- "$scratch"
           test ! -e "$scratch"
           trap - EXIT INT TERM
+      - name: Exercise isolated job checkout authorization and object closure
+        run: python3 tests/ci_job_checkouts.py --binary "$ROOTYARD_BIN" --report test-results/ci-job-checkouts.json
+      - name: Exercise exact pinned dependency checkout and origin fallback boundaries
+        timeout-minutes: 20
+        run: python3 tests/ci_dependencies.py --binary "$ROOTYARD_BIN" --report test-results/ci-dependencies.json
+      - name: Build frozen schema007 binary for genuine legacy restore
+        run: |
+          legacy=08b10e9976c012343c48e4fd6a5981e0266b8c53
+          workspace="$PWD"
+          umask 077
+          mkdir -p "$workspace/target"
+          legacy_root=$(mktemp -d "$workspace/target/legacy-source.XXXXXX")
+          trap 'rm -rf "$legacy_root"' EXIT
+          mkdir "$legacy_root/home" "$legacy_root/repo"
+          # Never invoke Git against the inherited checkout or inherit its config.
+          git_owned() {
+            env -i PATH="$PATH" HOME="$legacy_root/home" \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_TERMINAL_PROMPT=0 timeout 180 git -C "$legacy_root/repo" "$@"
+          }
+          git_owned init --template=
+          git_owned fetch --no-tags --depth=1 https://github.com/jihuayu/rootyard.git "$legacy"
+          test "$(git_owned rev-parse --verify 'FETCH_HEAD^{commit}')" = "$legacy"
+          git_owned checkout --detach "$legacy"
+          test "$(git_owned rev-parse --verify HEAD)" = "$legacy"
+          (
+            cd "$legacy_root/repo"
+            # Output uplift only: CargoFork keeps the shared compiler cache in
+            # ~/.cargo/targets and writes this frozen legacy binary here. Do not
+            # copy a target tree per commit.
+            CARGO_TARGET_DIR="$workspace/target/legacy-build" cargo build --locked --manifest-path Cargo.toml --bin rootyard
+          )
+          cp "$workspace/target/legacy-build/debug/rootyard" "$workspace/target/rootyard-schema007"
+      - name: Exercise checkout backup revocation and genuine schema007 restore
+        run: python3 tests/backup_ci_checkouts.py --binary "$ROOTYARD_BIN" --legacy-binary target/rootyard-schema007 --report test-results/backup-ci-checkouts.json
+      - name: Exercise source-pin paired backup and restore
+        run: python3 tests/backup_ci_pins.py --binary "$ROOTYARD_BIN" --report test-results/backup-ci-pins.json
+      - name: Exercise durable push recovery
+        run: python3 tests/reliability.py --binary "$ROOTYARD_BIN" --report test-results/reliability.json
+      - name: Exercise direct collaborator Git transport and write-endpoint authorization (#4)
+        timeout-minutes: 15
+        run: python3 tests/collaborator_transport.py --binary "$ROOTYARD_BIN" --report test-results/collaborator-transport.json
+      - name: Recover native Git receipts after collaborator and organization withdrawal
+        run: python3 tests/recorded_membership_recovery.py --binary "$ROOTYARD_BIN" --report test-results/recorded-membership-recovery.json
+      - name: Recover native Git receipts after token revocation
+        run: python3 tests/recorded_recovery.py --binary "$ROOTYARD_BIN" --report test-results/recorded-recovery.json
+      - name: Exercise offline backup and fresh database restore
+        run: python3 tests/backup.py --binary "$ROOTYARD_BIN" --report test-results/backup.json
+      # Kept beside (not in place of) tests/backup.py: this drill covers the
+      # audit-ID sequence across a format21 metadata-only backup and a fresh
+      # database restore. It reuses the job's PostgreSQL 17 service URL, the
+      # source-bound binary and the job fixture env, and fails (never skips)
+      # when a dependency is missing; the report feeds the native manifest.
+      - name: Restore the audit ID sequence through an offline backup and fresh database
+        timeout-minutes: 10
+        run: python3 tests/backup_audit_sequence_legacy.py --binary "$ROOTYARD_BIN" --report test-results/audit-sequence-backup.json
+      - name: Restore populated PostgreSQL RefStore core metadata from the current backup format
+        timeout-minutes: 10
+        run: python3 tests/backup_refstore_core139.py --binary "$ROOTYARD_BIN" --report test-results/backup-refstore-core.json
+      - name: Restore populated PostgreSQL RefStore snapshot metadata from the current backup format
+        timeout-minutes: 10
+        run: python3 tests/backup_refstore_snapshot140.py --binary "$ROOTYARD_BIN" --snapshot-fixture-binary "$ROOTYARD_SNAPSHOT_FIXTURE" --report test-results/backup-refstore-snapshot.json
+      - name: Restore populated permanent artifact-hold metadata from the current backup format
+        timeout-minutes: 10
+        run: python3 tests/backup_refstore_holds141.py --binary "$ROOTYARD_BIN" --holds-fixture-binary "$ROOTYARD_HOLDS_FIXTURE" --report test-results/backup-refstore-holds.json
+      - name: Exercise restored schema-003 recovery protections
+        run: python3 tests/backup_recovery.py --binary "$ROOTYARD_BIN" --report test-results/backup-recovery.json
       - name: Exercise independent workers after fresh restore
         run: python3 tests/restored_workers.py --binary "$ROOTYARD_BIN" --report test-results/restored-workers.json
       - name: Exercise explicit recovery and metrics
