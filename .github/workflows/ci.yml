@@ -20,12 +20,11 @@ jobs:
     # reaps orphaned Git grandchildren. Do not introduce a global child
     # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
     runs-on: ubuntu-22.04
-    # Job cap for this branch's 159-minute verify/lifecycle budget (119 from
-    # common main plus 40 for the package gates), plus #304's independent
-    # 12-minute cold tenant LFS gate on owned Garage: 159 + 12 = 171 minutes.
-    # The common 24-minute Redis allowance is already inside the 119 and is
-    # not added again.
-    timeout-minutes: 171
+    # 95 minutes baseline, 12 for the #304 cold tenant LFS gate on owned Garage,
+    # and 28 for the full Redis qualification (13 build, 5 restore/flush,
+    # 3 partition, 4 failover, 3 cleanup and manifest binding), plus 40 for the
+    # Pando package gates: 95 + 12 + 28 + 40 = 175 minutes.
+    timeout-minutes: 175
     services:
       postgres:
         image: postgres:17
@@ -55,7 +54,8 @@ jobs:
         run: |
           scripts/install_ci_native_tools.sh install \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance test-results/ci-native-tools/provenance.json
+            --provenance test-results/ci-native-tools/provenance.json \
+            --phase-record test-results/ci-native-tools/phase.json
       - name: Verify native CI tool profile
         timeout-minutes: 5
         run: |
@@ -63,7 +63,8 @@ jobs:
           echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
           scripts/install_ci_native_tools.sh preflight \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance test-results/ci-native-tools/provenance.json
+            --provenance test-results/ci-native-tools/provenance.json \
+            --phase-record test-results/ci-native-tools/phase.json
       - name: Install pinned Rust 1.99.1 gate tools
         run: |
           rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
@@ -287,7 +288,7 @@ jobs:
       - name: Exercise exact-target source retention and mirror preparation
         run: python3 tests/ci_source_pins.py --binary "$ROOTYARD_BIN" --report test-results/ci-source-pins.json
       - name: Verify browse cache incarnation across restore with owned Redis
-        timeout-minutes: 24
+        timeout-minutes: 28
         shell: bash
         run: |
           set -euo pipefail
@@ -302,9 +303,12 @@ jobs:
           manifest="$scratch/native-browse-restore-cache.json"
           partition_report="$scratch/redis-wake-partition.json"
           partition_manifest="$scratch/native-redis-wake-partition.json"
+          failover_report="$scratch/redis-wake-failover.json"
+          failover_manifest="$scratch/native-redis-wake-failover.json"
           restore_case=browse_restore_incarnation_cache
           flush_case=browse_flushall_preserves_git_authority
           partition_case=real_redis_partition_pg_fallback_and_wake
+          failover_case=real_redis_advisory_replica_promotion_and_duplicate_wakes
           tree=$(git rev-parse 'HEAD^{tree}')
 
           publish_failure() {
@@ -320,6 +324,8 @@ jobs:
                           {"source_warm_backup", "restore", "restored_preview", "flush_authority"}),
               "partition": ("redis-wake-partition-failure.json", "real_redis_partition_pg_fallback_and_wake",
                             {"fixture", "partition"}),
+              "failover": ("redis-wake-failover-failure.json",
+                           "real_redis_advisory_replica_promotion_and_duplicate_wakes", {"fixture", "promotion"}),
           }[mode]
           with Path(source_path).open("rb") as source:
               raw = source.read(4097)
@@ -445,6 +451,29 @@ jobs:
             exit 1
           fi
           mv -- "$partition_report" "$partition_manifest" test-results/
+
+          if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
+            timeout --kill-after=30s 4m python3 tests/cross_process_failover.py \
+              --binary "$binary" --expect-commit "$GITHUB_SHA" --report "$failover_report" >/dev/null 2>&1; then
+            publish_failure "$failover_report" failover
+            echo 'Redis wake failover proof failed'
+            exit 1
+          fi
+          if ! write_manifest "$failover_report" \
+            --manifest-out "$failover_manifest" --build-receipt "$published_receipt" \
+            --report "redis_wake_failover=$failover_report" \
+            --require-case "redis_wake_failover=$failover_case" \
+            --harness tests/cross_process_failover.py \
+            --harness tests/cross_process_partition.py \
+            --harness tests/redis_partition_relay.py; then
+            echo 'Redis wake failover native manifest failed'
+            exit 1
+          fi
+          if ! verify_proof_binding "$failover_manifest" "$failover_report" redis_wake_failover "$failover_case"; then
+            echo 'Redis wake failover cleanup or receipt binding failed'
+            exit 1
+          fi
+          mv -- "$failover_report" "$failover_manifest" test-results/
           rm -rf -- "$scratch"
           test ! -e "$scratch"
           trap - EXIT INT TERM
@@ -971,6 +1000,7 @@ jobs:
             test-results/evidence/*.jsonl
             test-results/*-evidence/*.jsonl
             test-results/ci-native-tools/provenance.json
+            test-results/ci-native-tools/phase.json
           if-no-files-found: ignore
 
   container:
