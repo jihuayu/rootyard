@@ -12,7 +12,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
 use anyhow::{Result, ensure};
@@ -96,9 +95,10 @@ async fn run_production_gateway_matrix(db: &IsolatedPgDb) -> Result<()> {
 
         let offload =
             Arc::new(GatewayPackfileOffload::new(shared_keyring(), policy.clone(), "cdn.localhost", resolver.clone()));
-        let _cdn =
+        let cdn =
             spawn_tls_axum_cdn_server(tls_listener, Arc::clone(&tls.server_cfg), Arc::clone(offload.pack_server()))
                 .await?;
+        ensure!(cdn.port == tls_port && cdn.tls_requests.load(Ordering::SeqCst) == 0);
 
         let (def_addr, def_state, def_task) = spawn_gateway(
             db.pool.clone(),
