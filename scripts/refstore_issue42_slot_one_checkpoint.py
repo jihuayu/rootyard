@@ -237,7 +237,9 @@ def validate_report(report):
                                   or isinstance(exit_code, bool)):
         raise CheckpointError("report_exit_code")
     for key in ("ran", "passed", "failed", "ignored"):
-        if report.get(key) not in (0, 1) or isinstance(report.get(key), bool):
+        value = report.get(key)
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value not in (0, 1)):
             raise CheckpointError("report_" + key)
     if not isinstance(report.get("complete"), bool):
         raise CheckpointError("report_complete")

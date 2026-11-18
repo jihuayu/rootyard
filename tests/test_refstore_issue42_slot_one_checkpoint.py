@@ -224,6 +224,7 @@ class ReportTests(unittest.TestCase):
              {"process_outcome": "unknown"}),
             ("exit", "report_exit_code", {"exit_code": True}),
             ("ran", "report_ran", {"ran": 2}),
+            ("ran_float", "report_ran", {"ran": 1.0}),
             ("complete", "report_complete", {"complete": 1}),
             ("result", "report_result", {"result": "maybe"}),
             ("error", "report_error_class", {"error_class": "unknown"}),
