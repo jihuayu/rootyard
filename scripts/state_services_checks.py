@@ -437,6 +437,11 @@ def _dependency_ok(spec, expected):
     exactly; a reviewed extension must be recorded in `integrated_manifest`
     first, so a crate cannot quietly gain providers/features here.
     """
+    if expected.get("path") and not isinstance(spec, dict):
+        # A reviewed path dependency must be declared as a table carrying the
+        # literal path. A string (including "") cannot stand in for that table;
+        # check it before the non-path string shorthand below.
+        return False
     if isinstance(spec, str):
         return (expected.get("features", []) == []
                 and expected.get("default_features", True) is True
