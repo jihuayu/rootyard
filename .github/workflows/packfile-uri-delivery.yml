@@ -50,6 +50,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_packfile_uri185
+      ROOTYARD_REQUIRE_PG_PACKFILE_URI: '1'
     steps:
       - uses: actions/checkout@v4
         with:

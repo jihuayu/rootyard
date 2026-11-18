@@ -169,11 +169,28 @@ pub struct IsolatedPgDb {
 }
 
 impl IsolatedPgDb {
-    pub async fn setup() -> Result<Self> {
-        let url = std::env::var("ROOTYARD_TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/rootyard_test".to_owned());
+    pub async fn try_setup() -> Result<Option<Self>> {
+        let Some(url) = std::env::var("ROOTYARD_TEST_DATABASE_URL").ok() else {
+            ensure!(
+                std::env::var("ROOTYARD_REQUIRE_PG_PACKFILE_URI").as_deref() != Ok("1"),
+                "ROOTYARD_TEST_DATABASE_URL is required when ROOTYARD_REQUIRE_PG_PACKFILE_URI=1"
+            );
+            return Ok(None);
+        };
         let schema = format!("packfile_uri_{}", Uuid::new_v4().simple());
         let admin = db::pool(&url)?;
+        admin
+            .get()
+            .await?
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS public.cluster_authority (
+                    singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+                    incarnation UUID NOT NULL DEFAULT gen_random_uuid(),
+                    rotated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+                );
+                INSERT INTO public.cluster_authority(singleton) VALUES(true) ON CONFLICT DO NOTHING;",
+            )
+            .await?;
         admin.get().await?.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}")).await?;
         let mut cfg: tokio_postgres::Config = url.parse()?;
         cfg.options(format!(
@@ -185,7 +202,7 @@ impl IsolatedPgDb {
             .max_size(12)
             .build()?;
         db::migrate(&pool).await?;
-        Ok(Self { admin, pool, schema })
+        Ok(Some(Self { admin, pool, schema }))
     }
 
     pub async fn finish(self, outcome: Result<()>) -> Result<()> {

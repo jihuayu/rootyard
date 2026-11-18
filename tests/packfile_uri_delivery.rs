@@ -68,7 +68,9 @@ impl LivePackReadAuthorizer for BoolAuth {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_blob_git_gateway_stock_git_dual_hash_offload_incremental_fallback_and_revocation() -> Result<()> {
-    let db = IsolatedPgDb::setup().await?;
+    let Some(db) = IsolatedPgDb::try_setup().await? else {
+        return Ok(());
+    };
     let outcome = run_production_gateway_matrix(&db).await;
     db.finish(outcome).await
 }
