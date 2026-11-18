@@ -154,19 +154,19 @@ fn build_kit(
     store: Option<&CloneKitPublicationStore>,
     fail: Option<BuildFailurePoint>,
 ) -> Result<BuiltCloneKitArtifacts> {
-    build_kit_with_clock(ids, fmt, kit_gen, repo, td, store, fail, None)
+    build_kit_with_clock(ids, fmt, kit_gen, (repo, td), store, fail, None)
 }
 
 fn build_kit_with_clock(
     ids: (Uuid, Uuid, Uuid),
     fmt: CloneKitObjectFormat,
     kit_gen: u64,
-    repo: &Path,
-    td: &TempDir,
+    fixtures: (&Path, &TempDir),
     store: Option<&CloneKitPublicationStore>,
     fail: Option<BuildFailurePoint>,
     now: Option<i64>,
 ) -> Result<BuiltCloneKitArtifacts> {
+    let (repo, td) = fixtures;
     let (created_unix, expires_unix) =
         now.map_or((KIT_CREATED_UNIX, KIT_EXPIRES_UNIX), |now| (now, now + KIT_TTL_SECS));
     let built = build_clonekit_from_git(
@@ -472,7 +472,7 @@ async fn pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation(
         drop(c);
 
         let now: i64 = pool.get().await?.query_one("SELECT extract(epoch FROM clock_timestamp())::bigint", &[]).await?.get(0);
-        let mut built = build_kit_with_clock(ids, Sha1, 1, &repo, &td, None, None, Some(now))?;
+        let mut built = build_kit_with_clock(ids, Sha1, 1, (&repo, &td), None, None, Some(now))?;
         let receipts = publish_clonekit_to_blob_store(&pool, &blob, &BlobHoldPublishContext { scope: HoldScope::new(ids.1, ids.0, ids.0, ArtifactHoldPurpose::RefPublication, GitObjectFormat::Sha1, ids.2, 1, 1)?, operation: op, expected_gate_digest: gate, authority_id: ids.1, authority_generation: 1 }, &mut built, None).await?;
         ensure!(receipts.len() == 2 && built.manifest.pack.as_ref().and_then(|p| p.blob_locator.as_ref()).is_some());
 
