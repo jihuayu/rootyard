@@ -15,7 +15,7 @@ import uuid
 
 from .capacity import derive_capacity_envelope
 from .cleanup_diagnostics import remove_tree_checked, run_cleanup_steps
-from .concurrent_outcomes import collect_concurrent_outcomes
+from .concurrent_outcomes import annotate_stale_operations, collect_concurrent_outcomes
 from .corpus import (
     DATASET_ARCHETYPES,
     CommitSpec,
@@ -350,6 +350,7 @@ def run_live_serve_blob_eval(
         conc_rw_env = build_git_http_env(run_env, askpass, conc_target["rw"]["username"], conc_target["rw"]["token"])
         conc_ro_user, conc_ro_tok = conc_target["ro"]["username"], conc_target["ro"]["token"]
         conc_branches = 3
+        conc_operations = {bi: (str(uuid.uuid4()), f"refs/heads/conc_{bi}") for bi in range(conc_branches)}
         barrier = threading.Barrier(conc_branches + 1)
         conc_results: list[tuple[float, str]] = []
         conc_lock = threading.Lock()
@@ -372,6 +373,7 @@ def run_live_serve_blob_eval(
                     progress, "concurrent_push", archetype=conc_target["archetype"],
                     object_format=conc_target["object_format"], config="baseline", repo_ordinal=0, branch_ordinal=bi,
                 ),
+                fixture_operation=conc_operations[bi][0],
             )
             with conc_lock:
                 conc_results.append((ms, oid_b))
@@ -384,8 +386,7 @@ def run_live_serve_blob_eval(
             barrier.wait(timeout=30)
             browse_samples = exercise_browse(
                 base_url, conc_target["repo"]["owner"], conc_target["repo"]["name"], conc_ro_tok,
-                conc_target["seed_oid"], conc_target["head_oid"], conc_target["browse_path"],
-            )
+                conc_target["seed_oid"], conc_target["head_oid"], conc_target["browse_path"])
             with conc_lock:
                 progress["completed"]["browse_requests_completed"] += len(browse_samples)
             query_pg_refstore_stats(pg_url, run_env)
@@ -395,6 +396,8 @@ def run_live_serve_blob_eval(
             bfut = pool.submit(_conc_browse_and_pg)
             first_error = collect_concurrent_outcomes(futs, bfut, branch_count=conc_branches, progress=progress)
         if first_error is not None:
+            # Joined; one bounded read-only query per stale worker before re-raise.
+            annotate_stale_operations(progress, base_url, conc_target["repo"], conc_target["rw"]["token"], conc_operations)
             raise first_error
 
         verified_acked = 0
@@ -481,10 +484,7 @@ def run_live_serve_blob_eval(
             drop_schema=(
                 lambda: subprocess.run(
                     ["psql", "--dbname", live.pg_base, "-X", "-c", f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'],
-                    env=run_env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=15,
+                    env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15,
                 )
             ) if schema_created else None,
             remove_scratch=(lambda: remove_tree_checked(scratch_dir)) if not keep and scratch_dir.exists() else None,

@@ -14,9 +14,12 @@ Unknown or malformed context fails closed to the fixed ``unknown`` ids.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import itertools
 import math
 import re
 from typing import Any
+
+from .operation_verdict import OPERATION_VERDICTS, read_operation_verdict
 
 PHASES = (
     "baseline_seed_push",
@@ -56,11 +59,15 @@ CONCURRENT_OUTCOME_FIELDS = (
     "http_status",
     "http_subphase",
     "push_ref_verdict",
+    "operation_verdict",
     "git_returncode",
     "signal",
     "elapsed_ms",
 )
 OUTCOMES = ("passed", "failed", "unknown")
+# Fields added after the original outcome schema.  A record without any subset
+# of them is still readable: every missing field projects its fixed unknown id.
+_LATE_OUTCOME_FIELDS = ("elapsed_ms", "push_ref_verdict", "operation_verdict")
 
 
 def _choice(value: Any, allowed: tuple[str, ...] | frozenset[str], default: str = "unknown") -> str:
@@ -215,6 +222,7 @@ def _fixed_outcome(branch_ordinal: int | None, outcome: str, record: Mapping[str
             "http_status": _http_status(source.get("http_status")),
             "http_subphase": _choice(source.get("http_subphase"), HTTP_SUBPHASES),
             "push_ref_verdict": _choice(source.get("push_ref_verdict"), PUSH_REF_VERDICTS),
+            "operation_verdict": _choice(source.get("operation_verdict"), OPERATION_VERDICTS),
             "git_returncode": _optional_int(source.get("git_returncode")),
             "signal": _signal(source.get("signal")),
             "elapsed_ms": finite_elapsed_ms(source.get("elapsed_ms")),
@@ -227,6 +235,7 @@ def _fixed_outcome(branch_ordinal: int | None, outcome: str, record: Mapping[str
         "http_status": None,
         "http_subphase": "unknown",
         "push_ref_verdict": "unknown",
+        "operation_verdict": "unknown",
         "git_returncode": None,
         "signal": None,
         "elapsed_ms": finite_elapsed_ms(source.get("elapsed_ms")) if outcome == "passed" else None,
@@ -251,22 +260,18 @@ def sanitize_concurrent_outcomes(value: Any) -> list[dict[str, Any]]:
 
     The list is capped at the three known branch ids.  Entries with unlisted or
     missing keys, duplicate branch ids, wrong types, or unrecognized outcome ids
-    are rejected.  Records predating ``elapsed_ms`` receive a null duration and
-    records predating ``push_ref_verdict`` receive the fixed ``unknown`` id so
-    older receipts stay readable.  Unrecognized phase/class/subphase/verdict
+    are rejected.  Older receipts predating any of the late fields stay readable:
+    a missing ``elapsed_ms`` becomes null and a missing per-ref or operation
+    verdict becomes ``unknown``.  Unrecognized phase/class/subphase/verdict
     strings are normalized to ``unknown`` so no caller text can surface.
     """
     if not isinstance(value, (list, tuple)) or len(value) > CONCURRENT_OUTCOME_LIMIT:
         return []
     fields = frozenset(CONCURRENT_OUTCOME_FIELDS)
     accepted_fields = tuple(
-        fields - removed
-        for removed in (
-            frozenset(),
-            frozenset({"elapsed_ms"}),
-            frozenset({"push_ref_verdict"}),
-            frozenset({"elapsed_ms", "push_ref_verdict"}),
-        )
+        fields - frozenset(removed)
+        for size in range(len(_LATE_OUTCOME_FIELDS) + 1)
+        for removed in itertools.combinations(_LATE_OUTCOME_FIELDS, size)
     )
     seen: set[int] = set()
     projected: list[dict[str, Any]] = []
@@ -316,3 +321,62 @@ def collect_concurrent_outcomes(
     if progress is not None:
         progress["concurrent_worker_outcomes"] = sanitize_concurrent_outcomes(outcomes)
     return first_error
+
+
+def _operation_verdict_for(
+    branch: Any,
+    base_url: Any,
+    repo: Any,
+    token: Any,
+    operations: Any,
+) -> str:
+    """One bounded read-only query; every failure mode is a fixed ``unknown``."""
+    pair = operations.get(branch) if isinstance(operations, Mapping) else None
+    if not isinstance(pair, tuple) or len(pair) != 2 or not all(isinstance(value, str) for value in pair):
+        return "unknown"
+    if not isinstance(repo, Mapping):
+        return "unknown"
+    try:
+        answer = read_operation_verdict(
+            base_url,
+            repo.get("owner"),
+            repo.get("name"),
+            pair[0],
+            token,
+            repository_id=repo.get("id"),
+            expected_ref=pair[1],
+        )
+    except Exception:  # noqa: BLE001 - a query failure is a bounded unknown
+        return "unknown"
+    return _choice(answer, OPERATION_VERDICTS)
+
+
+def annotate_stale_operations(
+    progress: dict[str, Any],
+    base_url: str,
+    repo: Mapping[str, Any],
+    token: str,
+    operations: Mapping[int, tuple[str, str]],
+) -> None:
+    """Attach one durable-operation verdict to each ``stale_info`` worker.
+
+    Must be called only after every concurrent future has joined and before the
+    caller re-raises its original first error.  Exactly one read-only query runs
+    per stale worker; a transport failure, unlisted answer, missing operation or
+    malformed response leaves ``unknown``.  This function never raises and never
+    touches the caller's first-exception object, so it cannot replace the
+    original error or turn the phase into a pass.  Only the fixed enum reaches
+    the progress map, which is re-projected through the ordinary sanitizer.
+    """
+    outcomes = progress.get("concurrent_worker_outcomes") if isinstance(progress, dict) else None
+    if not isinstance(outcomes, (list, tuple)):
+        return
+    rows: list[dict[str, Any]] = []
+    for item in outcomes:
+        row = dict(item) if isinstance(item, Mapping) else {}
+        if row.get("push_ref_verdict") == "stale_info":
+            row["operation_verdict"] = _operation_verdict_for(
+                row.get("branch_ordinal"), base_url, repo, token, operations
+            )
+        rows.append(row)
+    progress["concurrent_worker_outcomes"] = sanitize_concurrent_outcomes(rows)

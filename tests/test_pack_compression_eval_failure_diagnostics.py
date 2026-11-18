@@ -351,6 +351,46 @@ class PushBoundaryFailureTest(unittest.TestCase):
             )
         self.assertEqual(elapsed, 7.5)
 
+    def test_fixture_operation_pin_is_invocation_local(self) -> None:
+        operation = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        fake = subprocess.CompletedProcess(args=["git", "push"], returncode=0, stdout=b"", stderr=b"")
+        with mock.patch.object(live_server, "run_git", return_value=(fake, 1.0)) as run:
+            live_server.push_with_pack_config(
+                "git", Path("/tmp"), "http://example.invalid/repo", None, "HEAD:refs/heads/main", {},
+                context=self.context(), fixture_operation=operation,
+            )
+        self.assertEqual(
+            run.call_args.args[1],
+            [
+                "-c", "credential.helper=",
+                "-c", f"http.extraHeader=X-Rootyard-Operation: {operation}",
+                "push", "--quiet", "--porcelain", "http://example.invalid/repo", "HEAD:refs/heads/main",
+            ],
+        )
+        with mock.patch.object(live_server, "run_git", return_value=(fake, 1.0)) as default_run:
+            live_server.push_with_pack_config("git", Path("/tmp"), "remote", None, "HEAD:main", {})
+        self.assertEqual(
+            default_run.call_args.args[1],
+            ["-c", "credential.helper=", "push", "--quiet", "--porcelain", "remote", "HEAD:main"],
+        )
+
+    def test_fixture_operation_must_be_a_uuid_and_never_reaches_git(self) -> None:
+        for bad in ("x\nInjected: y", "", "not-a-uuid", None):
+            with self.subTest(bad=bad):
+                with mock.patch.object(live_server, "run_git") as run:
+                    if bad is None:
+                        fake = subprocess.CompletedProcess(args=["git", "push"], returncode=0, stdout=b"", stderr=b"")
+                        with mock.patch.object(live_server, "run_git", return_value=(fake, 1.0)):
+                            live_server.push_with_pack_config(
+                                "git", Path("/tmp"), "remote", None, "HEAD:main", {}, fixture_operation=None
+                            )
+                    else:
+                        with self.assertRaises(ValueError):
+                            live_server.push_with_pack_config(
+                                "git", Path("/tmp"), "remote", None, "HEAD:main", {}, fixture_operation=bad
+                            )
+                run.assert_not_called()
+
 
 class PushRefVerdictTest(unittest.TestCase):
     """Bounded per-ref verdict from this worker's own porcelain stdout line."""

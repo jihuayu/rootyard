@@ -8,18 +8,22 @@ runtime.
 
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+from pack_compression_eval import concurrent_outcomes  # noqa: E402
 from pack_compression_eval.concurrent_outcomes import (  # noqa: E402
     CONCURRENT_OUTCOME_FIELDS,
+    annotate_stale_operations,
     collect_concurrent_outcomes,
     finite_http_subphase,
     finite_worker_outcome,
@@ -75,6 +79,7 @@ class ConcurrentOutcomeTest(unittest.TestCase):
                 "http_status": None,
                 "http_subphase": "unknown",
                 "push_ref_verdict": "unknown",
+                "operation_verdict": "unknown",
                 "git_returncode": None,
                 "signal": None,
                 "elapsed_ms": None,
@@ -103,6 +108,7 @@ class ConcurrentOutcomeTest(unittest.TestCase):
                 "http_status": 503,
                 "http_subphase": "receive_pack",
                 "push_ref_verdict": "stale_info",
+                "operation_verdict": "unknown",
                 "git_returncode": 1,
                 "signal": 9,
                 "elapsed_ms": 1023.457,
@@ -302,6 +308,27 @@ class ConcurrentOutcomeTest(unittest.TestCase):
         self.assertNotIn(SENTINEL, json.dumps(record, sort_keys=True))
         self.assertEqual(build_failure_record(push_ref_verdict=SENTINEL)["push_ref_verdict"], "unknown")
 
+    def test_receipt_carries_annotated_operation_verdict(self) -> None:
+        rows = [
+            {**finite_worker_outcome(0, self._stale_first_error()), "operation_verdict": "admitted_base_superseded"},
+            finite_worker_outcome(1, elapsed_ms=3.0),
+            {**finite_worker_outcome(2, self._stale_first_error()), "operation_verdict": "per_ref_cas_rejected"},
+        ]
+        record = build_failure_record(concurrent_worker_outcomes=rows)
+        self.assertEqual(
+            [row["operation_verdict"] for row in record["concurrent_worker_outcomes"]],
+            ["admitted_base_superseded", "unknown", "per_ref_cas_rejected"],
+        )
+        self.assertEqual(
+            [row["push_ref_verdict"] for row in record["concurrent_worker_outcomes"]],
+            ["stale_info", "unknown", "stale_info"],
+        )
+        enriched = enrich_failure_record(record)
+        self.assertEqual(
+            [row["operation_verdict"] for row in enriched["concurrent_worker_outcomes"]],
+            ["admitted_base_superseded", "unknown", "per_ref_cas_rejected"],
+        )
+
     def test_failure_record_projects_outcomes_defensively(self) -> None:
         valid = [finite_worker_outcome(0, elapsed_ms=27.125), _valid(1), _valid(2)]
         record = build_failure_record(concurrent_worker_outcomes=valid)
@@ -311,6 +338,101 @@ class ConcurrentOutcomeTest(unittest.TestCase):
         self.assertEqual(bad["concurrent_worker_outcomes"], [])
         self.assertNotIn(SENTINEL, json.dumps(bad, sort_keys=True))
         self.assertEqual(build_failure_record()["concurrent_worker_outcomes"], [])
+
+    def test_every_late_field_is_individually_legacy_compatible(self) -> None:
+        full = _valid(0)
+        late = ("elapsed_ms", "push_ref_verdict", "operation_verdict")
+        for size in range(len(late) + 1):
+            for removed in itertools.combinations(late, size):
+                legacy = {key: value for key, value in full.items() if key not in removed}
+                with self.subTest(removed=removed):
+                    [row] = sanitize_concurrent_outcomes([legacy])
+                    self.assertEqual(set(row), set(CONCURRENT_OUTCOME_FIELDS))
+                    self.assertEqual(row["push_ref_verdict"], "unknown")
+                    self.assertEqual(row["operation_verdict"], "unknown")
+                    self.assertIsNone(row["elapsed_ms"])
+
+    def _stale_first_error(self, verdict: str = "stale_info") -> LiveEvalFailure:
+        return LiveEvalFailure(
+            build_failure_record(
+                phase="concurrent_push", failure_class="git_push", git_returncode=1, push_ref_verdict=verdict
+            )
+        )
+
+    def test_annotation_queries_only_stale_workers_once_each(self) -> None:
+        first = self._stale_first_error()
+        other = self._stale_first_error("other_ref_rejection")
+        second = self._stale_first_error()
+        progress: dict = {}
+        returned = collect_concurrent_outcomes(
+            [_FakeFuture(first), _FakeFuture(other), _FakeFuture(second)],
+            _FakeFuture(value=None),
+            branch_count=3,
+            progress=progress,
+        )
+        operations = {
+            0: ("11111111-1111-4111-8111-111111111111", "refs/heads/conc_0"),
+            2: ("33333333-3333-4333-8333-333333333333", "refs/heads/conc_2"),
+        }
+        answers = {
+            operations[0][0]: "admitted_base_superseded",
+            operations[2][0]: "per_ref_cas_rejected",
+        }
+        calls = []
+
+        def fake_query(base_url, owner, name, operation_id, token, *, repository_id, expected_ref):
+            calls.append((operation_id, expected_ref, repository_id, token))
+            return answers[operation_id]
+
+        with mock.patch.object(concurrent_outcomes, "read_operation_verdict", side_effect=fake_query):
+            annotate_stale_operations(
+                progress, "http://127.0.0.1:1", {"owner": "o", "name": "r", "id": "x"}, "tok", operations
+            )
+        self.assertIs(returned, first)
+        self.assertEqual([call[0] for call in calls], [operations[0][0], operations[2][0]])
+        self.assertEqual([call[1] for call in calls], ["refs/heads/conc_0", "refs/heads/conc_2"])
+        self.assertEqual([call[2] for call in calls], ["x", "x"])
+        self.assertEqual([call[3] for call in calls], ["tok", "tok"])
+        outcomes = progress["concurrent_worker_outcomes"]
+        self.assertEqual(
+            [row["operation_verdict"] for row in outcomes],
+            ["admitted_base_superseded", "unknown", "per_ref_cas_rejected"],
+        )
+        self.assertEqual(outcomes[0]["push_ref_verdict"], "stale_info")
+        self.assertEqual(outcomes[1]["push_ref_verdict"], "other_ref_rejection")
+
+    def test_annotation_failures_stay_unknown_and_never_replace_first_error(self) -> None:
+        first = self._stale_first_error()
+        progress: dict = {}
+        returned = collect_concurrent_outcomes(
+            [_FakeFuture(first)], _FakeFuture(value=None), branch_count=3, progress=progress
+        )
+        operations = {0: ("22222222-2222-4222-8222-222222222222", "refs/heads/conc_0")}
+        for side_effect in (RuntimeError(SENTINEL), ValueError(SENTINEL), OSError(SENTINEL)):
+            with self.subTest(side_effect=type(side_effect).__name__):
+                with mock.patch.object(concurrent_outcomes, "read_operation_verdict", side_effect=side_effect):
+                    annotate_stale_operations(progress, "http://127.0.0.1:1", {"owner": "o"}, "tok", operations)
+                self.assertIs(returned, first)
+                self.assertEqual(progress["concurrent_worker_outcomes"][0]["operation_verdict"], "unknown")
+                self.assertNotIn(SENTINEL, json.dumps(progress["concurrent_worker_outcomes"], sort_keys=True))
+
+    def test_annotation_normalizes_unlisted_answers_and_malformed_input(self) -> None:
+        first = self._stale_first_error()
+        progress: dict = {}
+        collect_concurrent_outcomes([_FakeFuture(first)], _FakeFuture(value=None), branch_count=3, progress=progress)
+        operations = {0: ("44444444-4444-4444-8444-444444444444", "refs/heads/conc_0")}
+        with mock.patch.object(concurrent_outcomes, "read_operation_verdict", return_value=SENTINEL):
+            annotate_stale_operations(progress, "http://127.0.0.1:1", {"owner": "o", "id": "x"}, "tok", operations)
+        self.assertEqual(progress["concurrent_worker_outcomes"][0]["operation_verdict"], "unknown")
+        self.assertNotIn(SENTINEL, json.dumps(progress["concurrent_worker_outcomes"], sort_keys=True))
+        # Missing ordinal→operation, non-mapping repo and empty outcomes are inert.
+        for empty in ({}, {"branch_ordinal": 0}, {"branch_ordinal": 0, "outcome": "unknown"}):
+            fresh: dict = {"concurrent_worker_outcomes": [dict(empty)]}
+            annotate_stale_operations(fresh, "http://127.0.0.1:1", "not-a-mapping", "tok", {})
+            self.assertIsInstance(fresh["concurrent_worker_outcomes"], list)
+        blank: dict = {}
+        annotate_stale_operations(blank, "http://127.0.0.1:1", {}, "tok", {})
+        self.assertNotIn("concurrent_worker_outcomes", blank)
 
 
 if __name__ == "__main__":

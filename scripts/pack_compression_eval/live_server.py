@@ -13,6 +13,7 @@ import subprocess
 import time
 from typing import Any
 import urllib.parse
+import uuid
 
 from .capacity import build_server_env, derive_capacity_envelope
 from .cleanup_diagnostics import StopPostcondition
@@ -328,8 +329,13 @@ def push_with_pack_config(
     env: dict[str, str],
     *,
     context: dict[str, Any] | None = None,
+    fixture_operation: str | None = None,
 ) -> float:
     args: list[str] = ["-c", "credential.helper="]
+    if fixture_operation is not None:
+        # Invocation-local durable operation pin, exactly as stock clients send
+        # it (tests/blob_git_gateway.rs).  Global ``-c`` must precede ``push``.
+        args.extend(["-c", f"http.extraHeader=X-Rootyard-Operation: {uuid.UUID(str(fixture_operation))}"])
     if spec is not None:
         args.extend(spec.git_config_args())
     args.extend(["push", "--quiet", "--porcelain", remote_url, ref_target])
