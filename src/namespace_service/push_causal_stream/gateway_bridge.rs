@@ -234,7 +234,7 @@ fn build_closure_graph_from_registered(
         HeadUpdate::Keep,
         vec![intent],
         RequestDigest::of("gw-mem", &[&seq.to_be_bytes()]),
-        entries.clone(),
+        Vec::new(),
     );
     let op_dig = operation_digest(&op_in).map_err(|_| GatewayError::Internal("operation_digest failed"))?;
     let vid = derive_candidate_version_id(&op_in, op_dig, &ref_name, None)

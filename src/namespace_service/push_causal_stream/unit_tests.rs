@@ -27,9 +27,8 @@ use crate::ref_store::contract::{IssuerLane, RequestDigest};
 use crate::ref_store::core::contract::CommitMode;
 use crate::ref_store::core::ref_version::{
     AuthorityKind, BaseRequestSelector, CausalVersionNode, CommitSetHead, CommitSetInput, CommitSetVersionEntry,
-    OperationDigestInput, PackSetEntry, RefVersionIntent, RefVersionKind, RefVersionRealm, VerifiedClosurePack,
-    VersionGraph, VersionRecord, VersionRecordInput, compute_commit_set_id, compute_pack_set_digest,
-    derive_candidate_version_id, operation_digest,
+    OperationDigestInput, PackSetEntry, RefVersionIntent, RefVersionKind, RefVersionRealm, VersionGraph, VersionRecord,
+    VersionRecordInput, compute_commit_set_id, compute_pack_set_digest, derive_candidate_version_id, operation_digest,
 };
 use crate::ref_store::core::terminal::{CommitRejectCode, RefCommitResult};
 use crate::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget};

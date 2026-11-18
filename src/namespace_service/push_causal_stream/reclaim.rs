@@ -445,17 +445,21 @@ impl PushBlobCarrier for CapacityContractBlobCarrier {
 
 fn classify_git_ops_reclaim(err: &GitOpsError) -> UploadReclaimState {
     match err {
-        GitOpsError::DeadlineExceeded | GitOpsError::Blob(BlobError::Timeout) => UploadReclaimState::OutcomeUnknown,
+        GitOpsError::DeadlineExceeded | GitOpsError::Blob(BlobError::DeadlineExceeded) => {
+            UploadReclaimState::OutcomeUnknown
+        }
         _ => UploadReclaimState::PartialFailed,
     }
 }
 
 fn map_git_ops_error(err: GitOpsError, operation_id: Uuid) -> PushCausalError {
     match err {
-        GitOpsError::DeadlineExceeded | GitOpsError::Blob(BlobError::Timeout) => PushCausalError::CommitUnknown {
-            operation_id,
-            detail: "Blob upload timed out with unknown remote persistence".into(),
-        },
+        GitOpsError::DeadlineExceeded | GitOpsError::Blob(BlobError::DeadlineExceeded) => {
+            PushCausalError::CommitUnknown {
+                operation_id,
+                detail: "Blob upload timed out with unknown remote persistence".into(),
+            }
+        }
         GitOpsError::Blob(b) => PushCausalError::Blob(b),
         other => PushCausalError::Io(other.to_string()),
     }

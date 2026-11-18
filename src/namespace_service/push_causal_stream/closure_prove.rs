@@ -173,7 +173,6 @@ where
 
     let mut slot = QuarantineSlot::create(None)?;
     let ctx = QuarantineProveCtx {
-        remainder: decoded.remainder,
         command_bytes_read: decoded.command_bytes_read,
         commands: &decoded.commands,
         store,
@@ -193,7 +192,7 @@ where
         fault_hook,
         deadline,
     };
-    let result = prove_inside_quarantine(&mut slot, ctx).await;
+    let result = prove_inside_quarantine(&mut slot, decoded.remainder, ctx).await;
 
     let sweep_record = slot.sweep();
     match result {
@@ -213,7 +212,6 @@ where
 }
 
 struct QuarantineProveCtx<'a> {
-    remainder: Box<dyn AsyncRead + Unpin + Send>,
     command_bytes_read: usize,
     commands: &'a [PushedRefCommand],
     store: &'a BlobStore,
@@ -236,10 +234,11 @@ struct QuarantineProveCtx<'a> {
 
 async fn prove_inside_quarantine(
     slot: &mut QuarantineSlot,
+    remainder: Box<dyn AsyncRead + Unpin + Send>,
     ctx: QuarantineProveCtx<'_>,
 ) -> Result<(CausalPushProofReceipt, PushStageTelemetry), PushCausalError> {
     let ingested = ingest_pack_to_quarantine(
-        ctx.remainder,
+        remainder,
         slot,
         ctx.snapshot.object_format,
         ctx.command_bytes_read,
