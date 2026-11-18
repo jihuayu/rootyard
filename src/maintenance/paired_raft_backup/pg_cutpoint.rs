@@ -14,7 +14,10 @@ use super::types::{
 };
 
 fn pg_err(err: tokio_postgres::Error) -> PairedBackupError {
-    PairedBackupError::Postgres(err.to_string())
+    let detail = err
+        .as_db_error()
+        .map_or_else(|| err.to_string(), |db| format!("{}: {} ({:?})", db.severity(), db.message(), db.detail()));
+    PairedBackupError::Postgres(detail)
 }
 
 fn parse_obj_format(raw: &str) -> Result<GitObjectFormat, PairedBackupError> {
@@ -27,15 +30,18 @@ fn parse_obj_format(raw: &str) -> Result<GitObjectFormat, PairedBackupError> {
 
 /// Fence physical deletions in PostgreSQL before capturing a paired backup cutpoint.
 pub async fn freeze_pg_deleter(client: &impl GenericClient, reason: &str) -> Result<(), PairedBackupError> {
-    client
+    let updated = client
         .execute(
-            "UPDATE public.pando_storage_authorities \
+            "UPDATE pando_storage_authorities \
              SET remote_delete_fenced = true, remote_delete_fence_reason = $1 \
              WHERE singleton = true",
             &[&reason],
         )
         .await
         .map_err(pg_err)?;
+    if updated != 1 {
+        return Err(PairedBackupError::DeleterNotFenced("singleton pando_storage_authorities row missing"));
+    }
     Ok(())
 }
 
