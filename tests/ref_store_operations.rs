@@ -308,6 +308,57 @@ async fn reserved_sequences_are_transactional_and_monotonic() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn fresh_lane_creation_waits_for_an_uncommitted_creator() -> Result<()> {
+    let url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
+    let (admin, pool, schema, actor, repo) = setup(&url).await?;
+    let result = tokio::spawn(async move {
+        let lane = IssuerLane::new("fresh-lane-race").unwrap();
+        // Hold an uncommitted lane row so the waiter's initial locked preview
+        // cannot see it: only the fresh-lane INSERT can observe the creator.
+        let mut creator = pool.get().await?;
+        let creator_tx = creator.transaction().await?;
+        creator_tx
+            .execute(
+                "INSERT INTO ref_store_issuer_lanes(repository_id,issuer_id,lane,last_reserved_sequence)
+                 VALUES($1,$2,$3,0)",
+                &[&repo, &actor, &lane.as_str()],
+            )
+            .await?;
+
+        let waiter_pool = pool.clone();
+        let waiter_lane = lane.clone();
+        let mut waiter = tokio::spawn(async move {
+            let mut client = waiter_pool.get().await?;
+            let tx = client.transaction().await?;
+            let reservation =
+                PgRefStore.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &waiter_lane, deadline()).await?;
+            tx.commit().await?;
+            Ok::<_, anyhow::Error>(reservation.sequence())
+        });
+        let blocked = tokio::time::timeout(Duration::from_secs(2), &mut waiter).await;
+        assert!(blocked.is_err(), "fresh-lane creation did not wait for the uncommitted creator");
+        creator_tx.commit().await?;
+        let sequence = waiter.await.context("fresh-lane waiter panicked")??;
+        // The loser re-reads the winner's row under the lane lock and reserves
+        // the first sequence; it neither mints a second lane nor skips a slot.
+        assert_eq!(sequence, 1);
+
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        let next = PgRefStore.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &lane, deadline()).await?;
+        assert_eq!(next.sequence(), 2);
+        tx.rollback().await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("fresh-lane race test panicked");
+    teardown(&admin, &schema).await?;
+    result??;
+    Ok(())
+}
+
 fn identity_with_lane(
     repo: Uuid,
     issuer: Uuid,

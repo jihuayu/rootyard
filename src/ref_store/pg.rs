@@ -150,6 +150,12 @@ struct LockedSequence<'tx, 'client> {
 
 impl<'tx, 'client> LockedSequence<'tx, 'client> {
     /// The caller holds the operation key and has checked the UUID namespace.
+    ///
+    /// An existing lane costs one locked preview plus the conditional advance.
+    /// A lane first created here reads its initial candidate straight from the
+    /// insert, so it also spends one preview statement rather than a second
+    /// locked read. Only a concurrent creator that wins the `ON CONFLICT` race
+    /// yields no inserted row; that loser re-reads under `FOR NO KEY UPDATE`.
     async fn preview(
         tx: &'tx Transaction<'client>,
         repository_id: Uuid,
@@ -159,22 +165,25 @@ impl<'tx, 'client> LockedSequence<'tx, 'client> {
     ) -> Result<Self, RefStoreError> {
         const PREVIEW: &str = "SELECT last_reserved_sequence + 1 FROM ref_store_issuer_lanes
              WHERE (repository_id,issuer_id,lane)=($1,$2,$3) FOR NO KEY UPDATE";
+        const CREATE_LANE: &str = "INSERT INTO ref_store_issuer_lanes(
+                 repository_id,issuer_id,lane,last_reserved_sequence)
+             VALUES($1,$2,$3,0) ON CONFLICT(repository_id,issuer_id,lane) DO NOTHING
+             RETURNING last_reserved_sequence + 1";
         let lane_name = lane.as_str();
         let params: &[&(dyn ToSql + Sync)] = &[&repository_id, &issuer_id, &lane_name];
-        let row = match tx.query_opt(PREVIEW, params).await.map_err(db_error)? {
-            Some(row) => row,
-            None => {
-                tx.execute(
-                    "INSERT INTO ref_store_issuer_lanes(repository_id,issuer_id,lane,last_reserved_sequence)
-                     VALUES($1,$2,$3,0) ON CONFLICT(repository_id,issuer_id,lane) DO NOTHING",
-                    params,
-                )
-                .await
-                .map_err(db_error)?;
-                tx.query_one(PREVIEW, params).await.map_err(db_error)?
-            }
+        let sequence: i64 = match tx.query_opt(PREVIEW, params).await.map_err(db_error)? {
+            Some(row) => row.get(0),
+            // No lane row is visible. The insert both creates the row and takes
+            // the initial candidate; the row lock is held for the advance.
+            None => match tx.query_opt(CREATE_LANE, params).await.map_err(db_error)? {
+                Some(row) => row.get(0),
+                // A concurrent creator committed the same lane between the
+                // preview and this insert. Re-read it under the row lock; the
+                // conditional advance below proves the re-read is still current.
+                None => tx.query_one(PREVIEW, params).await.map_err(db_error)?.get(0),
+            },
         };
-        Ok(Self { tx, repository_id, issuer_id, operation_id, lane, sequence: row.get(0) })
+        Ok(Self { tx, repository_id, issuer_id, operation_id, lane, sequence })
     }
 
     async fn advance(self) -> Result<SequenceReservation, RefStoreError> {
