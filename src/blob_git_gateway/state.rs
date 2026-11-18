@@ -49,6 +49,7 @@ pub struct BlobGitState {
     inflight: Arc<AtomicU64>,
     workspace: Arc<AtomicU64>,
     sessions: Option<SessionTokens>,
+    packfile_offload: Option<Arc<crate::browse::packfile_uri::GatewayPackfileOffload>>,
     /// Acceptance-only rendezvous. It is absent in every non-test build and
     /// cannot be selected by any request, header or runtime configuration.
     #[cfg(test)]
@@ -75,6 +76,7 @@ impl BlobGitState {
             inflight: Arc::new(AtomicU64::new(0)),
             workspace: Arc::new(AtomicU64::new(0)),
             sessions: None,
+            packfile_offload: None,
             #[cfg(test)]
             admission_pause: None,
         })
@@ -85,6 +87,13 @@ impl BlobGitState {
     /// explicit `501`; nothing falls back to a generated or shared default key.
     pub fn with_sessions(mut self, sessions: SessionTokens) -> Self {
         self.sessions = Some(sessions);
+        self
+    }
+
+    /// Attach optional Smart-HTTP v2 `packfile-uris` offload runtime (#185).
+    /// Absent (`None`) by default so gateway behavior stays strictly inline unless enabled.
+    pub fn with_packfile_offload(mut self, offload: Arc<crate::browse::packfile_uri::GatewayPackfileOffload>) -> Self {
+        self.packfile_offload = Some(offload);
         self
     }
 
@@ -123,6 +132,11 @@ impl BlobGitState {
     /// presented session header is an explicit `501`, never a guessed key.
     pub(super) fn sessions(&self) -> Option<&SessionTokens> {
         self.sessions.as_ref()
+    }
+
+    /// Optional Smart-HTTP v2 `packfile-uris` offload runtime (#185).
+    pub(super) fn packfile_offload(&self) -> Option<&Arc<crate::browse::packfile_uri::GatewayPackfileOffload>> {
+        self.packfile_offload.as_ref()
     }
 
     pub fn store(&self) -> &BlobStore {

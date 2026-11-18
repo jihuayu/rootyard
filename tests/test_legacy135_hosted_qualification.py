@@ -309,11 +309,41 @@ class WorkflowContractTest(unittest.TestCase):
             "test-results/legacy135-provider.json",
             "test-results/legacy135-producer-prep.json",
             "test-results/legacy135-hosted-manifest.json",
+            "test-results/legacy135/native-tools-phase.json",
         ):
             self.assertIn(safe, upload)
         for forbidden in (".env", "server.log", "archive", "target/",
                           "legacy135-producer/source", "data/", "*.log"):
             self.assertNotIn(forbidden, upload)
+
+    def test_native_tool_steps_record_the_exact_phase_sidecar(self):
+        record = "--phase-record test-results/legacy135/native-tools-phase.json"
+        self.assertEqual(self.text.count(record), 2)
+        install = self._step_block(self.text, "Install the reviewed native tool profile")
+        verify = self._step_block(self.text, "Verify the native tool profile")
+        for block in (install, verify):
+            self.assertIn(record, block)
+            self.assertIn(
+                "--provenance test-results/legacy135/native-tools.json", block)
+            self.assertNotIn("continue-on-error", block)
+            self.assertNotIn("retry", block.lower())
+        self.assertIn("timeout-minutes: 20", install)
+        self.assertIn("timeout-minutes: 5", verify)
+        upload = self._step_block(
+            self.text, "Upload safe legacy135 qualification metadata")
+        self.assertIn("if: always()", upload)
+        paths = upload.split("path: |", 1)[1]
+        self.assertEqual(
+            paths.count("test-results/legacy135/native-tools-phase.json"), 1)
+        self.assertNotIn("test-results/legacy135/native-tools-phase*", paths)
+
+    @staticmethod
+    def _step_block(text, name):
+        marker = f"      - name: {name}"
+        start = text.index(marker) + len(marker)
+        rest = text[start:]
+        end = rest.find("\n      - name: ")
+        return rest if end == -1 else rest[:end]
 
     def test_trigger_paths_cover_source_auth_backup_schema_and_helpers(self):
         for path in (

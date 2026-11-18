@@ -8,8 +8,8 @@ pub mod lifecycle;
 pub mod migration;
 pub mod object_format;
 pub mod object_store;
-pub mod repack;
 mod remote;
+pub mod repack;
 pub mod rollback;
 mod store;
 
@@ -47,24 +47,14 @@ impl Config {
         let db: tokio_postgres::Config = database.parse()?;
         validate_database_address(&db)?;
         let root = PathBuf::from(std::env::var("PANDO_ROOT")?);
-        ensure!(
-            root.is_absolute(),
-            "PANDO_ROOT must be absolute and disposable"
-        );
+        ensure!(root.is_absolute(), "PANDO_ROOT must be absolute and disposable");
         let git = PathBuf::from(std::env::var("PANDO_GIT")?);
         ensure!(git.is_absolute(), "PANDO_GIT must be absolute");
-        ensure!(
-            root.is_dir(),
-            "create an existing disposable PANDO_ROOT directory first"
-        );
+        ensure!(root.is_dir(), "create an existing disposable PANDO_ROOT directory first");
         std::fs::create_dir_all(root.join("sessions"))?;
         std::fs::create_dir_all(root.join("objects"))?;
         std::fs::File::open(&root)?.sync_all()?;
-        Ok(Self {
-            database,
-            root,
-            git,
-        })
+        Ok(Self { database, root, git })
     }
     async fn db(&self) -> Result<Client> {
         let (c, conn) = tokio_postgres::connect(&self.database, NoTls).await?;
@@ -73,10 +63,7 @@ impl Config {
                 eprintln!("pando lab database connection ended");
             }
         });
-        c.batch_execute(
-            "SET statement_timeout='20s'; SET lock_timeout='10s'; SET synchronous_commit=on",
-        )
-        .await?;
+        c.batch_execute("SET statement_timeout='20s'; SET lock_timeout='10s'; SET synchronous_commit=on").await?;
         Ok(c)
     }
     fn git_command(&self, repo: &Path) -> Command {
@@ -84,11 +71,9 @@ impl Config {
         // The native receive hook needs its Git-created quarantine environment.
         // Entry points outside that hook never inherit object routing or config
         // from the shell that launched the experiment.
-        let hook = std::env::args().next().is_some_and(|s| {
-            Path::new(&s)
-                .file_name()
-                .is_some_and(|n| n == "proc-receive" || n == "pre-receive")
-        });
+        let hook = std::env::args()
+            .next()
+            .is_some_and(|s| Path::new(&s).file_name().is_some_and(|n| n == "proc-receive" || n == "pre-receive"));
         if !hook {
             for (key, _) in std::env::vars_os() {
                 if key.to_string_lossy().starts_with("GIT_") && key != "GIT_EXEC_PATH" {
@@ -108,19 +93,13 @@ impl Config {
         let mut c = self.git_command(repo);
         c.args(args);
         let o = execute(c, input.to_vec()).await?;
-        ensure!(
-            o.status.success(),
-            "Git command failed: {}",
-            String::from_utf8_lossy(&o.stderr)
-        );
+        ensure!(o.status.success(), "Git command failed: {}", String::from_utf8_lossy(&o.stderr));
         Ok(o.stdout)
     }
 }
 
 async fn execute(mut c: Command, input: Vec<u8>) -> Result<std::process::Output> {
-    c.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut p = c.spawn()?;
     let mut stdin = p.stdin.take().context("missing subprocess stdin")?;
     let stdout = p.stdout.take().context("missing subprocess stdout")?;
@@ -139,11 +118,7 @@ async fn execute(mut c: Command, input: Vec<u8>) -> Result<std::process::Output>
         if status.success() {
             write?;
         }
-        Ok::<_, anyhow::Error>(std::process::Output {
-            status,
-            stdout,
-            stderr,
-        })
+        Ok::<_, anyhow::Error>(std::process::Output { status, stdout, stderr })
     };
     match tokio::time::timeout(std::time::Duration::from_secs(45), run).await {
         Ok(Ok(result)) => Ok(result),
@@ -160,10 +135,7 @@ async fn execute(mut c: Command, input: Vec<u8>) -> Result<std::process::Output>
 
 async fn bounded_read(reader: impl AsyncRead + Unpin, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader
-        .take((limit + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await?;
+    reader.take((limit + 1) as u64).read_to_end(&mut bytes).await?;
     ensure!(bytes.len() <= limit, "lab subprocess output limit");
     Ok(bytes)
 }
@@ -171,10 +143,7 @@ async fn bounded_read(reader: impl AsyncRead + Unpin, limit: usize) -> Result<Ve
 struct Session(PathBuf);
 impl Session {
     fn new(config: &Config) -> Result<Self> {
-        let p = config
-            .root
-            .join("sessions")
-            .join(Uuid::new_v4().to_string());
+        let p = config.root.join("sessions").join(Uuid::new_v4().to_string());
         std::fs::create_dir(&p)?;
         Ok(Self(p))
     }
@@ -214,54 +183,31 @@ fn control(config: &Config) -> Result<Control> {
 }
 
 async fn permitted(c: &Client, repo: Uuid, principal: &str, write: bool) -> Result<bool> {
-    Ok(c.query_opt(
-        "SELECT write_allowed FROM pando_lab.acl WHERE repo=$1 AND principal=$2",
-        &[&repo, &principal],
-    )
-    .await?
-    .is_some_and(|r| !write || r.get::<_, bool>(0)))
+    Ok(c.query_opt("SELECT write_allowed FROM pando_lab.acl WHERE repo=$1 AND principal=$2", &[&repo, &principal])
+        .await?
+        .is_some_and(|r| !write || r.get::<_, bool>(0)))
 }
 
 pub async fn run() -> Result<()> {
     let config = Config::load()?;
-    if std::env::args().next().is_some_and(|s| {
-        Path::new(&s)
-            .file_name()
-            .is_some_and(|n| n == "pre-receive")
-    }) {
+    if std::env::args().next().is_some_and(|s| Path::new(&s).file_name().is_some_and(|n| n == "pre-receive")) {
         return hook::pre_receive(&config).await;
     }
-    if std::env::args().next().is_some_and(|s| {
-        Path::new(&s)
-            .file_name()
-            .is_some_and(|n| n == "proc-receive")
-    }) {
+    if std::env::args().next().is_some_and(|s| Path::new(&s).file_name().is_some_and(|n| n == "proc-receive")) {
         return hook::run(&config).await;
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("init") if args.len() == 1 => {
-            config
-                .db()
-                .await?
-                .batch_execute(include_str!("../../experimental/pando/schema.sql"))
-                .await?;
+            config.db().await?.batch_execute(include_str!("../../experimental/pando/schema.sql")).await?;
         }
         Some("create-repo") if args.len() == 3 => {
             let id: Uuid = args[1].parse()?;
-            ensure!(
-                !args[2].is_empty() && args[2].len() <= 64,
-                "invalid synthetic principal"
-            );
+            ensure!(!args[2].is_empty() && args[2].len() <= 64, "invalid synthetic principal");
             let mut c = config.db().await?;
             let t = c.transaction().await?;
-            t.execute("INSERT INTO pando_lab.repositories(id) VALUES($1)", &[&id])
-                .await?;
-            t.execute(
-                "INSERT INTO pando_lab.acl VALUES($1,$2,true)",
-                &[&id, &args[2]],
-            )
-            .await?;
+            t.execute("INSERT INTO pando_lab.repositories(id) VALUES($1)", &[&id]).await?;
+            t.execute("INSERT INTO pando_lab.acl VALUES($1,$2,true)", &[&id, &args[2]]).await?;
             t.commit().await?;
         }
         Some("serve") if args.len() == 1 => http::serve(Arc::new(config)).await?,
@@ -292,11 +238,7 @@ pub async fn run() -> Result<()> {
             let mut obj_store = graph::ObjectStore::default();
             for pack in &snap.packs {
                 object_store::ensure_local_pack_cached(&config, repo, pack).await?;
-                let prefix = config
-                    .root
-                    .join("objects")
-                    .join(repo.to_string())
-                    .join(pack.id.to_string());
+                let prefix = config.root.join("objects").join(repo.to_string()).join(pack.id.to_string());
                 let pack_bytes = std::fs::read(prefix.with_extension("pack"))?;
                 let report = delta::verify_pack(&pack_bytes, &delta::Limits::default())?;
                 obj_store.insert_pack(&report);
@@ -336,8 +278,7 @@ pub async fn run() -> Result<()> {
         }
         Some("migrate-step") if args.len() == 4 => {
             let repo: Uuid = args[1].parse()?;
-            let report =
-                migration::migrate_step(&config, repo, Path::new(&args[2]), &args[3]).await?;
+            let report = migration::migrate_step(&config, repo, Path::new(&args[2]), &args[3]).await?;
             println!("{}", serde_json::to_string(&report)?);
         }
         Some("rollback") if args.len() == 3 => {
@@ -393,41 +334,25 @@ pub async fn run() -> Result<()> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--chunk-size" => {
-                        opts.chunk_size = args
-                            .get(i + 1)
-                            .context("missing value for --chunk-size")?
-                            .parse()?;
+                        opts.chunk_size = args.get(i + 1).context("missing value for --chunk-size")?.parse()?;
                         i += 2;
                     }
                     "--fail-after-chunks" => {
-                        opts.fail_after_chunks = Some(
-                            args.get(i + 1)
-                                .context("missing value for --fail-after-chunks")?
-                                .parse()?,
-                        );
+                        opts.fail_after_chunks =
+                            Some(args.get(i + 1).context("missing value for --fail-after-chunks")?.parse()?);
                         i += 2;
                     }
                     "--corrupt-chunk" => {
-                        opts.corrupt_chunk_part = Some(
-                            args.get(i + 1)
-                                .context("missing value for --corrupt-chunk")?
-                                .parse()?,
-                        );
+                        opts.corrupt_chunk_part =
+                            Some(args.get(i + 1).context("missing value for --corrupt-chunk")?.parse()?);
                         i += 2;
                     }
                     "--bucket" => {
-                        opts.bucket = args
-                            .get(i + 1)
-                            .context("missing value for --bucket")?
-                            .clone();
+                        opts.bucket = args.get(i + 1).context("missing value for --bucket")?.clone();
                         i += 2;
                     }
                     "--cipher-suite" => {
-                        opts.cipher_suite = Some(
-                            args.get(i + 1)
-                                .context("missing value for --cipher-suite")?
-                                .clone(),
-                        );
+                        opts.cipher_suite = Some(args.get(i + 1).context("missing value for --cipher-suite")?.clone());
                         i += 2;
                     }
                     other => bail!("unknown object-store-put flag '{other}'"),
@@ -459,19 +384,13 @@ pub async fn run() -> Result<()> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--max-packs" => {
-                        opts.max_active_packs = Some(
-                            args.get(i + 1)
-                                .context("missing value for --max-packs")?
-                                .parse()?,
-                        );
+                        opts.max_active_packs =
+                            Some(args.get(i + 1).context("missing value for --max-packs")?.parse()?);
                         i += 2;
                     }
                     "--cold-age-secs" => {
-                        opts.cold_transition_age_secs = Some(
-                            args.get(i + 1)
-                                .context("missing value for --cold-age-secs")?
-                                .parse()?,
-                        );
+                        opts.cold_transition_age_secs =
+                            Some(args.get(i + 1).context("missing value for --cold-age-secs")?.parse()?);
                         i += 2;
                     }
                     "--cold-evict-local" => {
@@ -487,27 +406,16 @@ pub async fn run() -> Result<()> {
                         i += 1;
                     }
                     "--kms-key-id" => {
-                        opts.kms_key_id = Some(
-                            args.get(i + 1)
-                                .context("missing value for --kms-key-id")?
-                                .clone(),
-                        );
+                        opts.kms_key_id = Some(args.get(i + 1).context("missing value for --kms-key-id")?.clone());
                         i += 2;
                     }
                     "--cipher-suite" => {
-                        opts.cipher_suite = Some(
-                            args.get(i + 1)
-                                .context("missing value for --cipher-suite")?
-                                .clone(),
-                        );
+                        opts.cipher_suite = Some(args.get(i + 1).context("missing value for --cipher-suite")?.clone());
                         i += 2;
                     }
                     "--encryption-mode" => {
-                        opts.encryption_mode = Some(
-                            args.get(i + 1)
-                                .context("missing value for --encryption-mode")?
-                                .clone(),
-                        );
+                        opts.encryption_mode =
+                            Some(args.get(i + 1).context("missing value for --encryption-mode")?.clone());
                         i += 2;
                     }
                     other => bail!("unknown lifecycle-evaluate flag '{other}'"),
@@ -529,7 +437,7 @@ pub async fn run() -> Result<()> {
             object_format::run_cli_command(&config, &args).await?;
         }
         _ => bail!(
-            "usage: rootyard-pando-lab init | create-repo <uuid> <principal> | serve | verify-delta <pack> | walk-graph <repo> [wants... ^haves...] | diff-export <repo> [^haves...] | gc [repo] | migrate <repo> <gitfs_path> | migrate-step <repo> <gitfs_path> <copy|verify|drain|fence|switchover> | rollback <repo> <gitfs_path> | migration-status <repo> | repack <repo> [--prune-superseded] [--no-object-store] [--pin-oid <oid>...] | pin-root <repo> <name> <oid> | unpin-root <repo> <name> | object-store-put <repo> <pack_id> [--chunk-size <bytes>] [--fail-after-chunks <n>] [--corrupt-chunk <part>] [--cipher-suite <suite>] | object-store-get <repo> <pack_id> | object-store-verify <repo> | object-store-status <repo> | lifecycle-evaluate <repo> [--max-packs <n>] [--cold-evict-local] [--auto-repack] [--encryption-mode <mode>] | kms-rotate <repo> (<new_key_id> | --resume) [--fail-after-packs <n>] [--revoke-previous] | kms-status <repo> | kms-verify <repo> | kms-revoke-key <repo> <key_id> | kms-revoke-provider <repo> | kms-grant-provider <repo> | kms-policy <repo> [--retain-previous <bool>] [--min-readable-version <n>] | object-format-detect <repo_or_path> | verify-object-format <repo> [--format <sha1|sha256>] | compat-matrix [<repo>] [--client-format <sha1|sha256>] [--protocol-v2]"
+            "usage: rootyard-pando-lab init | create-repo <uuid> <principal> | serve | verify-delta <pack> | walk-graph <repo> [wants... ^haves...] | diff-export <repo> [^haves...] | gc [repo] | migrate <repo> <gitfs_path> | migrate-step <repo> <gitfs_path> <copy|verify|drain|fence|switchover> | rollback <repo> <gitfs_path> | migration-status <repo> | repack <repo> [--prune-superseded] [--no-object-store] [--pin-oid <oid>...] | pin-root <repo> <name> <oid> | unpin-root <repo> <name> | object-store-put <repo> <pack_id> [--chunk-size <bytes>] [--fail-after-chunks <n>] [--corrupt-chunk <part>] [--cipher-suite <suite>] | object-store-get <repo> <pack_id> | object-store-verify <repo> | object-store-status <repo> | lifecycle-evaluate <repo> [--max-packs <n>] [--cold-evict-local] [--auto-repack] [--encryption-mode <mode>] | kms-rotate <repo> (<new_key_id> | --target-version <version> | --resume) [--fail-after-packs <n>] [--revoke-previous (Local only)] | kms-status <repo> | kms-verify <repo> | kms-revoke-key <repo> <key_id> | kms-revoke-provider <repo> | kms-grant-provider <repo> | kms-policy <repo> [--retain-previous <bool>] [--min-readable-version <n>] | object-format-detect <repo_or_path> | verify-object-format <repo> [--format <sha1|sha256>] | compat-matrix [<repo>] [--client-format <sha1|sha256>] [--protocol-v2]"
         ),
     }
     Ok(())
@@ -538,16 +446,14 @@ pub async fn run() -> Result<()> {
 fn validate_database_address(db: &tokio_postgres::Config) -> Result<()> {
     ensure!(
         !db.get_hosts().is_empty()
-            && db.get_hosts().iter().all(
-                |h| matches!(h,tokio_postgres::config::Host::Tcp(s) if s=="127.0.0.1" || s=="::1")
-            ),
+            && db
+                .get_hosts()
+                .iter()
+                .all(|h| matches!(h,tokio_postgres::config::Host::Tcp(s) if s=="127.0.0.1" || s=="::1")),
         "lab database must use literal loopback TCP"
     );
     // hostaddr overrides the network target while host can remain loopback.
-    ensure!(
-        db.get_hostaddrs().iter().all(std::net::IpAddr::is_loopback),
-        "lab database hostaddr must be loopback"
-    );
+    ensure!(db.get_hostaddrs().iter().all(std::net::IpAddr::is_loopback), "lab database hostaddr must be loopback");
     Ok(())
 }
 
@@ -563,21 +469,10 @@ mod tests {
             "host=remote.invalid hostaddr=127.0.0.1",
             "hostaddr=127.0.0.1",
         ] {
-            assert!(
-                validate_database_address(&dsn.parse().unwrap()).is_err(),
-                "{dsn}"
-            );
+            assert!(validate_database_address(&dsn.parse().unwrap()).is_err(), "{dsn}");
         }
-        for dsn in [
-            "host=127.0.0.1",
-            "host=::1",
-            "host=127.0.0.1 hostaddr=127.0.0.1",
-            "host=::1 hostaddr=::1",
-        ] {
-            assert!(
-                validate_database_address(&dsn.parse().unwrap()).is_ok(),
-                "{dsn}"
-            );
+        for dsn in ["host=127.0.0.1", "host=::1", "host=127.0.0.1 hostaddr=127.0.0.1", "host=::1 hostaddr=::1"] {
+            assert!(validate_database_address(&dsn.parse().unwrap()).is_ok(), "{dsn}");
         }
     }
 }

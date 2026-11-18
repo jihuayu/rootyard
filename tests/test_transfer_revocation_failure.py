@@ -12,6 +12,10 @@ if str(ROOT / "tests") not in sys.path:
 
 import ci_job_checkouts as checkouts  # noqa: E402
 import transfer_revocation_failure as failure  # noqa: E402
+from transfer_revocation_source import (  # noqa: E402
+    SOURCE_FAILURE_WCHAN,
+    SOURCE_PROOF_KIND_OWNED_STDOUT_PIPE_FULL,
+)
 import transfer_revocation_timing as timing  # noqa: E402
 import transfer_revocation_transport as transport  # noqa: E402
 
@@ -150,6 +154,46 @@ class FailureEvidenceTests(unittest.TestCase):
         self.assertNotIn("fixture_four_tuple", snapshot["backpressure"])
         self.assertEqual(snapshot["group"]["group_count"], 1)
         self.assertNotIn("pgid", snapshot["group"]["groups"][0])
+
+    def test_pre_trigger_projection_retains_only_fixed_fatal_wchan_diagnostics(self):
+        evidence = failure.FailureEvidence(subcase="db_outage_fail_closed")
+        source = {
+            "fatal_failure_code": SOURCE_FAILURE_WCHAN,
+            "qualified": False,
+            "wchan_shape": "zero",
+            "wchan_writer_recheck": "same_writer_running",
+        }
+        evidence.set_pre_trigger_evidence(source_witness=dict(
+            source, raw_wchan="secret", source_writer_starttime=123))
+        self.assertEqual(evidence.snapshot()["pre_trigger"]["source_witness"], source)
+        for name in ("wchan_shape", "wchan_writer_recheck"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                evidence.set_pre_trigger_evidence(source_witness=dict(
+                    source, **{name: "secret"}))
+        evidence.set_pre_trigger_evidence(source_witness=dict(
+            source, fatal_failure_code=0, qualified=True))
+        self.assertEqual(evidence.snapshot()["pre_trigger"]["source_witness"], {
+            "fatal_failure_code": 0, "qualified": True,
+        })
+
+    def test_pre_trigger_projection_retains_only_fixed_pipe_proof_kind(self):
+        evidence = failure.FailureEvidence(subcase="generation_changed")
+        source = {
+            "qualified": True,
+            "source_proof_kind_code": SOURCE_PROOF_KIND_OWNED_STDOUT_PIPE_FULL,
+            "source_pipe_full": True,
+        }
+        evidence.set_pre_trigger_evidence(source_witness=dict(
+            source, raw_pipe_payload="secret", source_pipe_capacity=65536,
+            source_writer_starttime=123))
+        self.assertEqual(evidence.snapshot()["pre_trigger"]["source_witness"], source)
+        for name, value in (
+            ("source_pipe_full", "yes"),
+            ("source_proof_kind_code", -1),
+        ):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                evidence.set_pre_trigger_evidence(source_witness=dict(
+                    source, **{name: value}))
 
     def test_safe_failure_has_no_raw_exception_text(self):
         evidence = failure.FailureEvidence(subcase="generation_changed")

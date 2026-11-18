@@ -6,6 +6,7 @@ pub mod handlers;
 pub mod idempotency;
 pub mod models;
 pub mod object_format;
+pub mod packfile_uri;
 pub mod policy;
 pub mod ref_transaction;
 pub mod transactions;
