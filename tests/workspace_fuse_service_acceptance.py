@@ -16,7 +16,6 @@ import io
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import traceback
@@ -77,113 +76,54 @@ _SHUTDOWN_TERMINAL_PREFIXES = (
     "Error: normal shutdown incomplete: ",
     "Error: service cleanup incomplete: ",
 )
-_SHUTDOWN_CONTAINER_PREFIXES = (
-    "workspace capture/helper shutdown did not complete cleanly: ",
-)
+_SHUTDOWN_CAPTURE_CONTAINER = (
+    "workspace capture/helper shutdown did not complete cleanly: ")
 _SHUTDOWN_HELPER_CONTAINER = "workspace FUSE helper shutdown failed: "
 
-
-def _shutdown_pattern(text):
-    return re.compile(re.escape(text))
-
-
-_SHUTDOWN_HELPER_PATTERNS = (
-    (_shutdown_pattern("HTTP 503: service temporarily unavailable"),
-     "helper_internal_503"),
-    (_shutdown_pattern(
-        "HTTP 504: workspace FUSE helper shutdown exceeded the shared "
-        "normal-shutdown deadline"), "helper_deadline"),
-    (_shutdown_pattern(
-        "HTTP 504: workspace FUSE legacy mount teardown exceeded the shared "
-        "normal-shutdown deadline"), "helper_deadline"),
-)
-_SHUTDOWN_TOP_LEVEL_PATTERNS = (
-    (_shutdown_pattern(
-        "owned workspace Git jobs/process cleanup did not complete cleanly"),
-     "git_drain"),
-    (_shutdown_pattern(
-        "late owned workspace Git jobs/process cleanup did not complete cleanly"),
-     "git_drain"),
-    (_shutdown_pattern("HTTP server did not stop cleanly"), "http_join"),
-    (_shutdown_pattern(
-        "HTTP server did not join within the shutdown deadline"), "http_join"),
-    (_shutdown_pattern("background worker did not stop cleanly"),
-     "background_join"),
-    (_shutdown_pattern("session GC task did not join cleanly"),
-     "background_join"),
-    (_shutdown_pattern("sharding controller did not stop cleanly"),
-     "background_join"),
-    (_shutdown_pattern("workspace maintenance task did not stop cleanly"),
-     "background_join"),
-    (_shutdown_pattern("dispatch publisher did not stop cleanly"),
-     "background_join"),
-    (_shutdown_pattern("dispatch delivery worker did not stop cleanly"),
-     "background_join"),
-    (_shutdown_pattern("webhook worker did not stop cleanly"),
-     "background_join"),
-    (_shutdown_pattern("metrics worker did not stop cleanly"),
-     "background_join"),
-    (_shutdown_pattern("native Git process cleanup did not prove quiescence"),
-     "native_quiescence"),
-    (_shutdown_pattern(
-        "workspace capture worker did not stop before the abort-confirmation "
-        "window"), "capture_scan"),
-    (re.compile(
-        r"workspace capture worker abort was requested but its JoinHandle did "
-        r"not complete within the final \d+ms grace; producer-before-helper "
-        r"ordering is not claimed"), "capture_scan"),
-    (re.compile(r"workspace scan workers did not drain within \d+ms"),
-     "capture_scan"),
-    (re.compile(
-        r"workspace capture worker did not finish cleanly during shutdown "
-        r"\([^;\r\n]*\)"), "capture_scan"),
-    (re.compile(
-        r"workspace capture worker did not release cleanly after abort "
-        r"\([^;\r\n]*\)"), "capture_scan"),
-)
-
-
-def _match_shutdown_clause(text, patterns):
-    """Match one exact source-defined clause and return its tail/category."""
-    for pattern, category in patterns:
-        match = pattern.match(text)
-        if match is None:
-            continue
-        tail = text[match.end():]
-        if tail and not tail.startswith("; "):
-            continue
-        return category, tail[2:] if tail else ""
-    return None, text
+_SHUTDOWN_HELPER_CLAUSES = {
+    "HTTP 503: service temporarily unavailable": "helper_internal_503",
+    "HTTP 504: workspace FUSE helper shutdown exceeded the shared "
+    "normal-shutdown deadline": "helper_deadline",
+    "HTTP 504: workspace FUSE legacy mount teardown exceeded the shared "
+    "normal-shutdown deadline": "helper_deadline",
+}
+_SHUTDOWN_CLAUSES = {
+    "workspace capture worker did not stop before the abort-confirmation window":
+        "capture_scan",
+    "owned workspace Git jobs/process cleanup did not complete cleanly":
+        "git_drain",
+    "late owned workspace Git jobs/process cleanup did not complete cleanly":
+        "git_drain",
+    "HTTP server did not stop cleanly": "http_join",
+    "HTTP server did not join within the shutdown deadline": "http_join",
+    "background worker did not stop cleanly": "background_join",
+    "native Git process cleanup did not prove quiescence": "native_quiescence",
+}
 
 
 def _classify_shutdown_payload(payload):
     """Classify only complete, source-defined cleanup clauses."""
     categories = []
-    rest = payload
-    while rest:
-        if rest.startswith(_SHUTDOWN_HELPER_CONTAINER):
-            rest = rest[len(_SHUTDOWN_HELPER_CONTAINER):]
-            if not rest:
-                return SHUTDOWN_OUTCOME_UNKNOWN
-            category, rest = _match_shutdown_clause(
-                rest, _SHUTDOWN_HELPER_PATTERNS)
-            if category is None:
-                return SHUTDOWN_OUTCOME_UNKNOWN
-            categories.append(category)
-            continue
-        for prefix in _SHUTDOWN_CONTAINER_PREFIXES:
-            if rest.startswith(prefix):
-                rest = rest[len(prefix):]
-                break
-        else:
-            category, rest = _match_shutdown_clause(
-                rest, _SHUTDOWN_TOP_LEVEL_PATTERNS)
-            if category is None:
-                return SHUTDOWN_OUTCOME_UNKNOWN
-            categories.append(category)
-            continue
-        if not rest:
+    for part in payload.split("; "):
+        helper_scope = False
+        changed = True
+        while changed:
+            changed = False
+            if part.startswith(_SHUTDOWN_CAPTURE_CONTAINER):
+                part = part[len(_SHUTDOWN_CAPTURE_CONTAINER):]
+                changed = True
+            elif part.startswith(_SHUTDOWN_HELPER_CONTAINER):
+                part = part[len(_SHUTDOWN_HELPER_CONTAINER):]
+                helper_scope = True
+                changed = True
+        if not part:
             return SHUTDOWN_OUTCOME_UNKNOWN
+        category = (
+            _SHUTDOWN_HELPER_CLAUSES if helper_scope else _SHUTDOWN_CLAUSES
+        ).get(part)
+        if category is None:
+            return SHUTDOWN_OUTCOME_UNKNOWN
+        categories.append(category)
     if not categories:
         return SHUTDOWN_OUTCOME_UNKNOWN
     if len(set(categories)) == 1:
@@ -192,25 +132,27 @@ def _classify_shutdown_payload(payload):
 
 
 def project_shutdown_outcome(data):
-    """Project one bounded harness-owned output tail to a closed outcome.
+    """Project one complete, unique terminal record to a closed outcome.
 
-    Only the final complete ``Error:`` terminal record is considered.  The
-    parser returns a fixed category or ``unknown``; it never returns or stores
-    log text, paths, ids, dynamic payloads, request ids, stacks or output.
+    The final non-blank line must be the only ``Error:`` line in the bounded
+    snapshot and a source-known complete record.  The parser returns a fixed
+    category or ``unknown``; it never returns or stores log text, paths, ids,
+    dynamic payloads, request ids, stacks or output.
     """
     if not isinstance(data, (bytes, bytearray)):
         return SHUTDOWN_OUTCOME_UNKNOWN
-    if len(data) > MAX_SHUTDOWN_TAIL_BYTES:
+    if len(data) > MAX_SHUTDOWN_TAIL_BYTES or not data.endswith(b"\n"):
         return SHUTDOWN_OUTCOME_UNKNOWN
     try:
         text = bytes(data).decode("utf-8")
     except UnicodeDecodeError:
         return SHUTDOWN_OUTCOME_UNKNOWN
-    terminal = None
-    for line in text.splitlines():
-        if any(line.startswith(prefix) for prefix in _SHUTDOWN_TERMINAL_PREFIXES):
-            terminal = line
-    if terminal is None:
+    nonempty = [line for line in text.splitlines() if line.strip()]
+    if not nonempty:
+        return SHUTDOWN_OUTCOME_UNKNOWN
+    terminal = nonempty[-1]
+    error_lines = [line for line in nonempty if line.startswith("Error:")]
+    if len(error_lines) != 1 or error_lines[0] != terminal:
         return SHUTDOWN_OUTCOME_UNKNOWN
     if len(terminal.encode("utf-8")) > MAX_SHUTDOWN_RECORD_BYTES:
         return SHUTDOWN_OUTCOME_UNKNOWN
@@ -229,21 +171,82 @@ def _shutdown_log_path(source):
     return None
 
 
-def read_shutdown_outcome(source):
-    """Read only a bounded tail of harness-owned output and classify it."""
+def _process_uid(status_path):
+    try:
+        text = status_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    for line in text.splitlines():
+        if line.startswith("Uid:"):
+            fields = line.split()
+            if len(fields) >= 2 and fields[1].isdigit():
+                return int(fields[1])
+    return None
+
+
+def shutdown_output_stable(target, proc_root=Path("/proc"),
+                           own_pid=None, own_uid=None):
+    """True only when no other same-uid process holds this exact file open."""
+    own_pid = os.getpid() if own_pid is None else own_pid
+    own_uid = os.geteuid() if own_uid is None else own_uid
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return False
+    for name in entries:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == own_pid:
+            continue
+        process = proc_root / name
+        try:
+            os.stat(process)
+        except OSError:
+            continue
+        uid = _process_uid(process / "status")
+        if uid is None:
+            return False
+        if uid != own_uid:
+            continue
+        fd_dir = process / "fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        for fd in fds:
+            try:
+                info = os.stat(fd_dir / fd)
+            except OSError:
+                continue
+            if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
+                return False
+    return True
+
+
+def read_shutdown_outcome(source, proc_root=Path("/proc")):
+    """Snapshot only a bounded tail with no other same-uid open writer."""
     try:
         path = _shutdown_log_path(source)
         if path is None:
             return SHUTDOWN_OUTCOME_UNKNOWN
         with open(path, "rb") as stream:
-            stream.seek(0, os.SEEK_END)
-            size = stream.tell()
+            target = os.fstat(stream.fileno())
+            size = target.st_size
+            if not shutdown_output_stable(target, proc_root=proc_root):
+                return SHUTDOWN_OUTCOME_UNKNOWN
             start = max(0, size - MAX_SHUTDOWN_TAIL_BYTES)
+            previous = b""
+            if start:
+                stream.seek(start - 1)
+                previous = stream.read(1)
             stream.seek(start)
-            data = stream.read(MAX_SHUTDOWN_TAIL_BYTES)
+            data = stream.read(size - start)
     except BaseException:
         return SHUTDOWN_OUTCOME_UNKNOWN
-    if start:
+    if start and previous != b"\n":
         newline = data.find(b"\n")
         if newline < 0:
             return SHUTDOWN_OUTCOME_UNKNOWN

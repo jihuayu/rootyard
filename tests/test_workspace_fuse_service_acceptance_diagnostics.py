@@ -5,6 +5,7 @@ service, a FUSE mount, a child process, PostgreSQL, Git, or the network.
 """
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -37,6 +38,7 @@ from workspace_fuse_service_acceptance import (
     _unknown_diagnostic,
     project_shutdown_outcome,
     read_shutdown_outcome,
+    shutdown_output_stable,
 )
 
 SECRET = "SECRET-must-never-appear"
@@ -68,6 +70,10 @@ def _traceback_at(filename, source):
 
 def _case(test_id):
     return types.SimpleNamespace(id=lambda: test_id)
+
+
+def _terminal(payload, prefix="Error: normal shutdown incomplete: "):
+    return (prefix + payload + "\n").encode()
 
 
 class _ResultShape:
@@ -240,7 +246,7 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
         self.assertEqual(report["counts"]["success"], 3)
         self.assertNotIn(SECRET, json.dumps(report))
 
-    def test_shutdown_outcome_maps_only_complete_source_defined_clauses(self):
+    def test_shutdown_outcome_is_a_closed_complete_clause_projection(self):
         capture = (
             "workspace capture/helper shutdown did not complete cleanly: ")
         helper = "workspace FUSE helper shutdown failed: "
@@ -251,70 +257,39 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
                 "HTTP 504: workspace FUSE helper shutdown exceeded the shared "
                 "normal-shutdown deadline"), "helper_deadline"),
             (capture + (
-                "workspace scan workers did not drain within 10000ms"),
-             "capture_scan"),
-            (capture + (
-                "workspace capture worker abort was requested but its JoinHandle "
-                "did not complete within the final 5000ms grace; "
-                "producer-before-helper ordering is not claimed"),
-             "capture_scan"),
-            (capture + (
                 "workspace capture worker did not stop before the "
                 "abort-confirmation window"), "capture_scan"),
             ("owned workspace Git jobs/process cleanup did not complete cleanly",
              "git_drain"),
-            ("late owned workspace Git jobs/process cleanup did not complete cleanly",
-             "git_drain"),
-            ("HTTP server did not stop cleanly", "http_join"),
             ("HTTP server did not join within the shutdown deadline", "http_join"),
             ("background worker did not stop cleanly", "background_join"),
-            ("session GC task did not join cleanly", "background_join"),
             ("native Git process cleanup did not prove quiescence",
              "native_quiescence"),
         )
         for payload, expected in cases:
             with self.subTest(payload=payload):
-                outcome = project_shutdown_outcome(
-                    ("Error: normal shutdown incomplete: " + payload + "\n"
-                     ).encode())
+                outcome = project_shutdown_outcome(_terminal(payload))
                 self.assertEqual(outcome, expected)
                 self.assertIn(outcome, SHUTDOWN_OUTCOMES)
+        mixed = (
+            capture + helper + "HTTP 503: service temporarily unavailable"
+            + "; owned workspace Git jobs/process cleanup did not complete cleanly")
+        self.assertEqual(
+            project_shutdown_outcome(
+                _terminal(mixed, "Error: service cleanup incomplete: ")),
+            SHUTDOWN_OUTCOME_MULTIPLE)
 
-    def test_shutdown_outcome_uses_multiple_only_for_mixed_known_causes(self):
-        capture = (
-            "workspace capture/helper shutdown did not complete cleanly: ")
-        helper = "workspace FUSE helper shutdown failed: "
-        line = (
-            "Error: service cleanup incomplete: "
-            + capture + helper + "HTTP 503: service temporarily unavailable"
-            + "; owned workspace Git jobs/process cleanup did not complete cleanly"
-            + "\n")
-        self.assertEqual(project_shutdown_outcome(line.encode()),
-                          SHUTDOWN_OUTCOME_MULTIPLE)
-
-        same_cause = (
-            "Error: normal shutdown incomplete: "
-            "owned workspace Git jobs/process cleanup did not complete cleanly"
-            "; late owned workspace Git jobs/process cleanup did not complete "
-            "cleanly\n")
-        self.assertEqual(project_shutdown_outcome(same_cause.encode()),
-                         "git_drain")
-
-    def test_shutdown_outcome_rejects_absent_truncated_or_unrecognized_tails(self):
-        known = (
-            "Error: normal shutdown incomplete: "
-            "native Git process cleanup did not prove quiescence\n").encode()
+    def test_shutdown_outcome_rejects_incomplete_ambiguous_or_unrecognized(self):
+        known = _terminal("native Git process cleanup did not prove quiescence")
+        other = b"Error: a different primary failure\n"
         bodies = (
-            b"",
-            b"rootyard listening\n",
-            b"Error: a different primary failure\n",
-            b"Error: normal shutdown incomplete: \n",
-            b"Error: normal shutdown incomplete: "
-            b"workspace capture/helper shutdown did not complete cleanly: \n",
-            b"Error: normal shutdown incomplete: "
-            b"HTTP 503: service temporarily unavailable\n",
-            known[:-1] + b"; not-a-source-clause\n",
+            b"", b"rootyard listening\n", other, _terminal(""),
+            _terminal(
+                "workspace capture/helper shutdown did not complete cleanly: "),
+            _terminal("HTTP 503: service temporarily unavailable"),
+            known[:-1], known[:-1] + b"; not-a-source-clause\n",
             known.replace(b"native Git", b"not-native Git"),
+            known + other, other + known, known + b"trailing non-Error output\n",
             b"\xff\xfe\x00",
             known.rstrip(b"\n") + b"x" * MAX_SHUTDOWN_RECORD_BYTES + b"\n",
             known + b"x" * MAX_SHUTDOWN_TAIL_BYTES,
@@ -323,36 +298,50 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             with self.subTest(body_length=len(body)):
                 self.assertEqual(project_shutdown_outcome(body),
                                  SHUTDOWN_OUTCOME_UNKNOWN)
-        self.assertEqual(project_shutdown_outcome(known),
+        self.assertEqual(project_shutdown_outcome(known), "native_quiescence")
+        self.assertEqual(project_shutdown_outcome(known + b"\n"),
                          "native_quiescence")
         self.assertEqual(project_shutdown_outcome(None),
                          SHUTDOWN_OUTCOME_UNKNOWN)
         self.assertEqual(project_shutdown_outcome("not bytes"),
                          SHUTDOWN_OUTCOME_UNKNOWN)
 
-    def test_read_shutdown_outcome_reads_only_a_bounded_tail(self):
+    def test_read_shutdown_outcome_reads_only_an_owned_bounded_tail(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "server.log"
-            prefix = b"rootyard: unrelated line\n" * (
-                MAX_SHUTDOWN_TAIL_BYTES // 22 + 2)
-            terminal = (
-                b"Error: normal shutdown incomplete: "
-                b"background worker did not stop cleanly\n")
-            path.write_bytes(prefix + terminal)
-
-            self.assertEqual(read_shutdown_outcome(path), "background_join")
-            self.assertEqual(read_shutdown_outcome(str(path)), "background_join")
+            root = Path(directory)
+            path, proc = root / "server.log", root / "proc"
+            proc.mkdir()
+            path.write_bytes(b"rootyard: unrelated line\n" * (
+                MAX_SHUTDOWN_TAIL_BYTES // 22 + 2) + _terminal(
+                    "background worker did not stop cleanly"))
+            self.assertEqual(read_shutdown_outcome(path, proc_root=proc),
+                             "background_join")
+            self.assertEqual(read_shutdown_outcome(str(path), proc_root=proc),
+                             "background_join")
             with path.open("rb") as stream:
-                self.assertEqual(read_shutdown_outcome(stream),
+                self.assertEqual(read_shutdown_outcome(stream, proc_root=proc),
                                  "background_join")
             self.assertEqual(
-                read_shutdown_outcome(Path(directory) / "missing.log"),
+                read_shutdown_outcome(root / "missing.log", proc_root=proc),
                 SHUTDOWN_OUTCOME_UNKNOWN)
-            self.assertEqual(read_shutdown_outcome(None),
+            self.assertEqual(read_shutdown_outcome(None, proc_root=proc),
                              SHUTDOWN_OUTCOME_UNKNOWN)
 
-            path.write_bytes(b"x" * (MAX_SHUTDOWN_TAIL_BYTES + 1))
-            self.assertEqual(read_shutdown_outcome(path),
+            holder = proc / "4242"
+            holder.mkdir()
+            (holder / "status").write_text(
+                f"Name:\tfixture\nUid:\t{os.geteuid()}\t0\t0\t0\n",
+                encoding="utf-8")
+            (holder / "fd").mkdir()
+            (holder / "fd" / "2").symlink_to(path)
+            self.assertEqual(read_shutdown_outcome(path, proc_root=proc),
+                             SHUTDOWN_OUTCOME_UNKNOWN)
+            self.assertFalse(shutdown_output_stable(
+                os.stat(path), proc_root=proc))
+            self.assertFalse(shutdown_output_stable(
+                os.stat(path), proc_root=root / "missing-proc"))
+            (holder / "status").unlink()
+            self.assertEqual(read_shutdown_outcome(path, proc_root=proc),
                              SHUTDOWN_OUTCOME_UNKNOWN)
 
     def test_shutdown_outcome_field_is_closed_and_never_formats_test_data(self):
