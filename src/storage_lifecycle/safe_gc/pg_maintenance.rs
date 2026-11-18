@@ -235,11 +235,12 @@ async fn execute_claimed_pg_refstore_job(state: &Arc<AppState>, job: &Job, polic
     let _write = state.storage.write_lock(job.repository_id).await;
 
     let pg_fence = fence::acquire_blob_safe_gc(state, job, &lease, policy).await?;
-    if pg_fence.epoch() <= 0 {
+    let raw_epoch = pg_fence.epoch();
+    if raw_epoch <= 0 {
         pg_fence.release().await;
-        anyhow::bail!("PG gc_epoch fence returned non-positive epoch {}", pg_fence.epoch());
+        anyhow::bail!("PG gc_epoch fence returned non-positive epoch {raw_epoch}");
     }
-    let fence_epoch = pg_fence.epoch() as u64;
+    let fence_epoch = raw_epoch as u64;
 
     let run_res = run_safe_gc_phases(state, job, policy, (destructive_env, fence_epoch), (&lease, &pg_fence)).await;
     pg_fence.release().await;
