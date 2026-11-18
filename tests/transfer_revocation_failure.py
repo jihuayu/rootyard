@@ -27,6 +27,7 @@ from transfer_revocation_failure_projection import (
     safe_errno,
 )
 from transfer_revocation_failure_reader import reader_stop_or_fail
+from transfer_revocation_source import SOURCE_FAILURE_WCHAN
 
 SCHEMA = "rootyard.transfer_partial_evidence.v1"
 
@@ -76,6 +77,15 @@ RESET_REASONS = frozenset({
     "sample_timing_missing", "sample_duration", "nonmonotonic_sample",
     "sample_gap", "inode_changed", "receiver_queue_changed",
 })
+WCHAN_DIAGNOSTIC_ENUMS = {
+    "wchan_shape": ("empty", "zero"),
+    "wchan_writer_recheck": (
+        "same_writer_running", "same_writer_sleeping_in_stdout_write",
+        "same_writer_other", "identity_changed", "unavailable",
+    ),
+}
+
+
 class SafeFailure(AssertionError):
     def __init__(self, code="unexpected", partial=None):
         self.code = _enum(code, EXCEPTION_CLASSES, "exception_class", default="unexpected")
@@ -276,6 +286,10 @@ class FailureEvidence:
     def set_pre_trigger_evidence(self, *, source_witness=None, backpressure=None):
         self._pre_source = None if source_witness is None else _project(
             source_witness, bools=SOURCE_BOOLS, ints=SOURCE_INTS)
+        if self._pre_source and self._pre_source.get("fatal_failure_code") == SOURCE_FAILURE_WCHAN:
+            for name, allowed in WCHAN_DIAGNOSTIC_ENUMS.items():
+                if name in source_witness:
+                    self._pre_source[name] = _enum(source_witness[name], allowed, name)
         self._pre_backpressure = _backpressure_value(backpressure)
         return self
 
