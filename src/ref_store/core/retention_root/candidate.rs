@@ -9,7 +9,7 @@
 //! source snapshot under PostgreSQL locks and requires byte-for-byte agreement with the sealed values here.
 use super::error::RootError;
 use super::scope::RootsScope;
-use super::selector::{RootSelectorKind, native_refs};
+use super::selector::{RootSelector, RootSelectorKind, native_refs, resolve_oids};
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
 use crate::ref_store::core::pack_commit::{CapturedRef, RegisteredPack, packs_digest, refs_digest};
 use crate::ref_store::core::pack_snapshot::{PackReadSnapshot, PackSnapshotRef};
@@ -43,6 +43,10 @@ pub struct RootCandidate {
     pub(super) head_oid: Option<String>,
     pub(super) binding_digest: RequestDigest,
     pub(super) register_digest: RequestDigest,
+    /// Ephemeral serving-lane anchor read in the same T1 transaction after the
+    /// source snapshot/pin/refs are locked. Never serialized, persisted, a
+    /// caller input or part of a receipt. Legacy candidates carry `None`.
+    pub(super) serving_cluster_incarnation: Option<Uuid>,
 }
 
 /// Canonical digest over the complete sealed source read (scope, gate, snapshot/pin, refs, packs, counts).
@@ -91,6 +95,39 @@ pub(super) fn source_read_digest(
     )
 }
 
+/// Recompute the canonical register digest of an original create intent from
+/// already-authorized stored A5 metadata, without native Blob/Git work and
+/// without accepting a caller digest. This reuses the same `RootCandidate::seal`
+/// binding algorithm used by prepare/register; it is only for the narrow
+/// release-before-register path and never constructs a byte-read view.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expected_register_digest_from_snapshot(
+    scope: RootsScope,
+    reference: PackSnapshotRef,
+    root_id: Uuid,
+    operation_id: Uuid,
+    operation_digest: RequestDigest,
+    selector: &RootSelector,
+    snapshot: &PackReadSnapshot,
+) -> Result<RequestDigest, RootError> {
+    let oids = resolve_oids(selector, snapshot.scope().object_format(), snapshot.refs(), snapshot.head_oid_hex())?;
+    let candidate = RootCandidate::seal(
+        SealRequest {
+            scope,
+            reference,
+            root_id,
+            operation_id,
+            operation_digest,
+            selector_kind: selector.kind(),
+            oids,
+            packs: snapshot.packs().to_vec(),
+            serving_cluster_incarnation: None,
+        },
+        snapshot,
+    )?;
+    Ok(candidate.register_digest())
+}
+
 /// Every caller-supplied identity of one sealed root candidate.
 ///
 /// Grouping the request keeps `seal` a two-argument boundary: the adapter
@@ -106,13 +143,26 @@ pub(super) struct SealRequest {
     pub selector_kind: RootSelectorKind,
     pub oids: Vec<String>,
     pub packs: Vec<RegisteredPack>,
+    pub serving_cluster_incarnation: Option<Uuid>,
 }
 
 impl RootCandidate {
     /// Seal one candidate. Only the adapter may call this, and only after the native closure succeeded.
     pub(super) fn seal(request: SealRequest, snapshot: &PackReadSnapshot) -> Result<Self, RootError> {
-        let SealRequest { scope, reference, root_id, operation_id, operation_digest, selector_kind, oids, packs } =
-            request;
+        let SealRequest {
+            scope,
+            reference,
+            root_id,
+            operation_id,
+            operation_digest,
+            selector_kind,
+            oids,
+            packs,
+            serving_cluster_incarnation,
+        } = request;
+        if serving_cluster_incarnation.is_some_and(|incarnation| incarnation.is_nil()) {
+            return Err(RootError::RootRealmMismatch("serving candidate cluster incarnation is nil"));
+        }
         if root_id.is_nil() || operation_id.is_nil() || root_id == operation_id {
             return Err(RootError::Store(RefStoreError::InvalidIdentity(
                 "root candidate ids must be non-nil and distinct".into(),
@@ -217,6 +267,7 @@ impl RootCandidate {
             head_oid: snapshot.head_oid_hex().map(str::to_owned),
             binding_digest: binding,
             register_digest,
+            serving_cluster_incarnation,
         })
     }
 }
@@ -279,6 +330,34 @@ impl RootCandidate {
     }
     pub fn ref_count(&self) -> i64 {
         i64::try_from(self.captured_refs.len()).unwrap_or(i64::MAX)
+    }
+
+    /// The serving prepare lane only. `None` is the unchanged LegacyFresh lane.
+    pub(crate) fn serving_cluster_incarnation(&self) -> Option<Uuid> {
+        self.serving_cluster_incarnation
+    }
+
+    pub(super) fn is_serving(&self) -> bool {
+        self.serving_cluster_incarnation.is_some()
+    }
+
+    /// Require every captured artifact to carry the actual opened Blob backend
+    /// identity before a serving register can write durable rows.
+    pub(super) fn verify_serving_backend(&self, backend_identity: &str) -> Result<(), RootError> {
+        if !self.is_serving() {
+            return Err(RootError::RootRealmMismatch("register candidate is not serving-lane"));
+        }
+        for pack in &self.packs {
+            for role in [
+                crate::ref_store::core::pack_commit::PackArtifactRole::Pack,
+                crate::ref_store::core::pack_commit::PackArtifactRole::Idx,
+            ] {
+                if pack.artifact(role).backend_identity() != backend_identity {
+                    return Err(RootError::RootRealmMismatch("serving source Blob backend identity"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Revalidate this candidate against a fresh, locked read of its source snapshot.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 import os
 from pathlib import Path
 import socket
@@ -13,9 +14,35 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 READ_CHUNK = 65536
+
+CONNECT_TIMEOUT_SECONDS = 15.0
+SOCKET_IO_TIMEOUT_SECONDS = 30.0
+# Caller-contract budget selected to match the existing socket I/O timeout
+# value. The socket timeout is per-operation inactivity, not an absolute
+# exchange bound; an active exchange may outlive this budget while still
+# making progress.
+METER_BOUNDARY_WAIT_SECONDS = 30.0
+
+
+class MeterQuiescenceTimeout(RuntimeError):
+    """Raised when an exact meter boundary cannot reach pending == 0 by deadline."""
+
+    def __init__(self, pending: int, deadline: float) -> None:
+        self.pending = pending
+        self.deadline = deadline
+        super().__init__(f"meter quiescence timeout: pending={pending} deadline={deadline}")
+
+
+class _ExchangeToken:
+    """Per-parsed-request registration token; terminalized exactly once."""
+
+    __slots__ = ("finished",)
+
+    def __init__(self) -> None:
+        self.finished = False
 
 
 class BufferedConn:
@@ -147,6 +174,9 @@ class S3MeterProxy:
         self.endpoint = f"http://127.0.0.1:{self.port}"
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._pending = 0
+        self._clock: Callable[[], float] = time.monotonic
         self._req_counts: dict[str, int] = {}
         self._req_bytes: dict[str, int] = {}
         self._resp_bytes: dict[str, int] = {}
@@ -184,22 +214,57 @@ class S3MeterProxy:
                 self._threads = [item for item in self._threads if item.is_alive()]
                 self._threads.append(t)
 
+    def _record_locked(self, method: str, req_bytes: int, resp_bytes: int, status: int) -> None:
+        self._req_counts[method] = self._req_counts.get(method, 0) + 1
+        self._req_bytes[method] = self._req_bytes.get(method, 0) + req_bytes
+        self._resp_bytes[method] = self._resp_bytes.get(method, 0) + resp_bytes
+        s_key = str(status)
+        self._status_counts[s_key] = self._status_counts.get(s_key, 0) + 1
+        if status >= 400:
+            self._error_responses += 1
+
     def _record(self, method: str, req_bytes: int, resp_bytes: int, status: int) -> None:
-        with self._lock:
-            self._req_counts[method] = self._req_counts.get(method, 0) + 1
-            self._req_bytes[method] = self._req_bytes.get(method, 0) + req_bytes
-            self._resp_bytes[method] = self._resp_bytes.get(method, 0) + resp_bytes
-            s_key = str(status)
-            self._status_counts[s_key] = self._status_counts.get(s_key, 0) + 1
-            if status >= 400:
-                self._error_responses += 1
+        """Compatibility wrapper: record a completed exchange under the meter lock."""
+        with self._cond:
+            self._record_locked(method, req_bytes, resp_bytes, status)
+
+    def _begin_exchange(self) -> _ExchangeToken:
+        """Register one parsed request before forwarding; NEW/parse failures never call this."""
+        with self._cond:
+            self._pending += 1
+            return _ExchangeToken()
+
+    def _terminal_exchange(
+        self,
+        token: _ExchangeToken,
+        record: bool,
+        method: str,
+        req_bytes: int,
+        resp_bytes: int,
+        status: int,
+    ) -> None:
+        """Terminalize a registered exchange exactly once, recording only on success."""
+        with self._cond:
+            if token.finished:
+                raise RuntimeError("exchange token finalized twice")
+            if self._pending <= 0:
+                raise RuntimeError("meter pending underflow")
+            token.finished = True
+            try:
+                if record:
+                    self._record_locked(method, req_bytes, resp_bytes, status)
+            finally:
+                self._pending -= 1
+                self._cond.notify_all()
 
     def _handle_conn(self, client_sock: socket.socket) -> None:
         upstream_sock: socket.socket | None = None
         try:
-            client_sock.settimeout(30.0)
-            upstream_sock = socket.create_connection((self.upstream_host, self.upstream_port), timeout=15.0)
-            upstream_sock.settimeout(30.0)
+            client_sock.settimeout(SOCKET_IO_TIMEOUT_SECONDS)
+            upstream_sock = socket.create_connection(
+                (self.upstream_host, self.upstream_port), timeout=CONNECT_TIMEOUT_SECONDS
+            )
+            upstream_sock.settimeout(SOCKET_IO_TIMEOUT_SECONDS)
             client_stream = BufferedConn(client_sock)
             upstream_stream = BufferedConn(upstream_sock)
 
@@ -209,67 +274,77 @@ class S3MeterProxy:
                     break
                 method, _, req_version, req_headers = _parse_http_head(raw_req_head)
                 method = method.upper()
-                upstream_sock.sendall(raw_req_head)
-
-                expect_100 = "100-continue" in req_headers.get("expect", "").lower()
-                early_final = False
+                token = self._begin_exchange()
                 req_body_bytes = 0
-                raw_resp_head = b""
+                resp_body_bytes = 0
+                status_code = 500
+                try:
+                    upstream_sock.sendall(raw_req_head)
 
-                if expect_100:
-                    raw_resp_head = upstream_stream.read_until(b"\r\n\r\n")
-                    if not raw_resp_head:
-                        break
-                    _, status_str, _, resp_headers = _parse_http_head(raw_resp_head)
-                    status_code = int(status_str) if status_str.isdigit() else 500
-                    client_sock.sendall(raw_resp_head)
-                    if status_code >= 200:
-                        early_final = True
+                    expect_100 = "100-continue" in req_headers.get("expect", "").lower()
+                    early_final = False
+                    raw_resp_head = b""
 
-                if not early_final:
-                    te_req = req_headers.get("transfer-encoding", "").lower()
-                    if "chunked" in te_req:
-                        req_body_bytes = client_stream.forward_chunked(upstream_sock)
-                    elif "content-length" in req_headers:
-                        cl = int(req_headers["content-length"])
-                        if cl > 0:
-                            req_body_bytes = client_stream.forward_exact(upstream_sock, cl)
-
-                    while True:
+                    if expect_100:
                         raw_resp_head = upstream_stream.read_until(b"\r\n\r\n")
                         if not raw_resp_head:
                             break
                         _, status_str, _, resp_headers = _parse_http_head(raw_resp_head)
                         status_code = int(status_str) if status_str.isdigit() else 500
                         client_sock.sendall(raw_resp_head)
-                        if not (100 <= status_code < 200):
+                        if status_code >= 200:
+                            early_final = True
+
+                    if not early_final:
+                        te_req = req_headers.get("transfer-encoding", "").lower()
+                        if "chunked" in te_req:
+                            req_body_bytes = client_stream.forward_chunked(upstream_sock)
+                        elif "content-length" in req_headers:
+                            cl = int(req_headers["content-length"])
+                            if cl > 0:
+                                req_body_bytes = client_stream.forward_exact(upstream_sock, cl)
+
+                        while True:
+                            raw_resp_head = upstream_stream.read_until(b"\r\n\r\n")
+                            if not raw_resp_head:
+                                break
+                            _, status_str, _, resp_headers = _parse_http_head(raw_resp_head)
+                            status_code = int(status_str) if status_str.isdigit() else 500
+                            client_sock.sendall(raw_resp_head)
+                            if not (100 <= status_code < 200):
+                                break
+                        if not raw_resp_head:
                             break
-                    if not raw_resp_head:
+                    else:
+                        _, status_str, _, resp_headers = _parse_http_head(raw_resp_head)
+                        status_code = int(status_str) if status_str.isdigit() else 500
+
+                    te_resp = resp_headers.get("transfer-encoding", "").lower()
+                    conn_resp = resp_headers.get("connection", "").lower()
+                    conn_req = req_headers.get("connection", "").lower()
+                    close_after = "close" in conn_resp or "close" in conn_req or req_version == "HTTP/1.0"
+
+                    if method != "HEAD" and status_code not in (204, 304):
+                        if "chunked" in te_resp:
+                            resp_body_bytes = upstream_stream.forward_chunked(client_sock)
+                        elif "content-length" in resp_headers:
+                            cl_resp = int(resp_headers["content-length"])
+                            if cl_resp > 0:
+                                resp_body_bytes = upstream_stream.forward_exact(client_sock, cl_resp)
+                        elif "close" in conn_resp:
+                            resp_body_bytes = upstream_stream.forward_until_eof(client_sock)
+                            close_after = True
+
+                    self._terminal_exchange(
+                        token, True, method, req_body_bytes, resp_body_bytes, status_code
+                    )
+                    if close_after:
                         break
-                else:
-                    _, status_str, _, resp_headers = _parse_http_head(raw_resp_head)
-                    status_code = int(status_str) if status_str.isdigit() else 500
-
-                resp_body_bytes = 0
-                te_resp = resp_headers.get("transfer-encoding", "").lower()
-                conn_resp = resp_headers.get("connection", "").lower()
-                conn_req = req_headers.get("connection", "").lower()
-                close_after = "close" in conn_resp or "close" in conn_req or req_version == "HTTP/1.0"
-
-                if method != "HEAD" and status_code not in (204, 304):
-                    if "chunked" in te_resp:
-                        resp_body_bytes = upstream_stream.forward_chunked(client_sock)
-                    elif "content-length" in resp_headers:
-                        cl_resp = int(resp_headers["content-length"])
-                        if cl_resp > 0:
-                            resp_body_bytes = upstream_stream.forward_exact(client_sock, cl_resp)
-                    elif "close" in conn_resp:
-                        resp_body_bytes = upstream_stream.forward_until_eof(client_sock)
-                        close_after = True
-
-                self._record(method, req_body_bytes, resp_body_bytes, status_code)
-                if close_after:
-                    break
+                finally:
+                    if not token.finished:
+                        self._terminal_exchange(
+                            token, False, method, req_body_bytes, resp_body_bytes, status_code
+                        )
         except (OSError, ValueError, EOFError):
             pass
         finally:
@@ -283,22 +358,50 @@ class S3MeterProxy:
                 except OSError:
                     pass
 
+    def _snapshot_locked(self) -> dict[str, Any]:
+        return {
+            "observed": True,
+            "get_requests": self._req_counts.get("GET", 0),
+            "get_bytes": self._resp_bytes.get("GET", 0),
+            "put_requests": self._req_counts.get("PUT", 0),
+            "put_bytes": self._req_bytes.get("PUT", 0),
+            "head_requests": self._req_counts.get("HEAD", 0),
+            "other_requests": sum(
+                v for k, v in self._req_counts.items() if k not in ("GET", "PUT", "HEAD")
+            ),
+            "total_requests": sum(self._req_counts.values()),
+            "error_responses": self._error_responses,
+            "status_counts": dict(self._status_counts),
+        }
+
+    def live_snapshot(self) -> dict[str, Any]:
+        """Nonblocking point-in-time committed counters; not phase-exact."""
+        with self._cond:
+            return self._snapshot_locked()
+
     def snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "observed": True,
-                "get_requests": self._req_counts.get("GET", 0),
-                "get_bytes": self._resp_bytes.get("GET", 0),
-                "put_requests": self._req_counts.get("PUT", 0),
-                "put_bytes": self._req_bytes.get("PUT", 0),
-                "head_requests": self._req_counts.get("HEAD", 0),
-                "other_requests": sum(
-                    v for k, v in self._req_counts.items() if k not in ("GET", "PUT", "HEAD")
-                ),
-                "total_requests": sum(self._req_counts.values()),
-                "error_responses": self._error_responses,
-                "status_counts": dict(self._status_counts),
-            }
+        """Deprecated nonblocking live-snapshot alias retained for compatibility."""
+        return self.live_snapshot()
+
+    def snapshot_after_quiescence(self, deadline: float) -> dict[str, Any]:
+        """Atomically wait for registered exchanges to terminalize, then copy counters.
+
+        ``deadline`` is an absolute ``time.monotonic()`` value. Timeout raises
+        ``MeterQuiescenceTimeout`` and never returns a partial exact snapshot.
+        """
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(deadline)
+        ):
+            raise ValueError("deadline must be a finite absolute monotonic value")
+        with self._cond:
+            while self._pending:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise MeterQuiescenceTimeout(self._pending, deadline)
+                self._cond.wait(remaining)
+            return self._snapshot_locked()
 
     @staticmethod
     def delta(after: dict[str, Any], before: dict[str, Any]) -> dict[str, Any]:

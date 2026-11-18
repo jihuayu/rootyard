@@ -1,109 +1,48 @@
-//! Retention-root requests with an explicit producer owner.
+//! Actor-owned retention-root facade requests for the format22 source.
 //!
-//! `retention_roots_support` fixes `owner_id == tenant_id` for every root. Issue
-//! #169 requires the positive format22 source to carry roots whose producer is
-//! not the repository tenant, so this module rebuilds the same `RootsScope`
-//! with `owner_id` = producer and `tenant_id` = repository tenant and reuses the
-//! unchanged real `PgRetentionRoots` API for prepare/register/release.
+//! The public `PgServingRetentionRoots::*_actor_owned` methods derive the
+//! durable root owner from the authenticated producer. The fixture supplies
+//! only repository owner/name selectors, the real source snapshot id, purpose,
+//! selector, root release target and bounded idempotency keys. No owner-id
+//! field or direct SQL/root scope is constructed here.
 
-use anyhow::{Result, anyhow};
-use deadpool_postgres::Pool;
-use rootyard::ref_store::core::pack_snapshot::PackSnapshotRef;
-use rootyard::ref_store::core::retention_root::{
-    PgRetentionRoots, PrepareRootRequest, RegisterRootRequest, ReleaseRootRequest, RootCandidate, RootError,
-    RootPurpose, RootReceipt, RootSelector, RootsScope,
+use anyhow::{Result, ensure};
+use rootyard::ref_store::core::retention_root::{RootPurpose, RootSelector};
+use rootyard::ref_store::serving::{
+    ServingRootCreate, ServingRootIntent, ServingRootRead, ServingRootRelease, ServingRootReleaseTarget,
 };
-use rootyard::ref_store::{CoreGateVersion, RequestDigest};
-use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::pack::SourceSnapshot;
-
-pub fn producer_scope(repo: Uuid, tenant: Uuid, producer: Uuid, gate: &CoreGateVersion) -> Result<RootsScope> {
-    let intent = RequestDigest::from_bytes([0x96; 32]);
-    RootsScope::new(
-        repo,
-        tenant,
-        producer,
-        RootPurpose::Backup,
-        &intent.as_hex(),
-        gate.object_format(),
-        gate.history_incarnation(),
-        gate.authority_epoch(),
-        gate.group_epoch(),
-    )
-    .map_err(|error| anyhow!("producer root scope rejected: {error:?}"))
+pub fn create_input(owner: &str, name: &str, snapshot_id: Uuid, key: &str) -> ServingRootCreate {
+    ServingRootCreate {
+        owner: owner.to_owned(),
+        name: name.to_owned(),
+        intent: ServingRootIntent {
+            source_snapshot_id: snapshot_id,
+            selector: RootSelector::Snapshot,
+            purpose: RootPurpose::Backup,
+            idempotency_key: key.to_owned(),
+        },
+    }
 }
 
-pub fn reference(source: &SourceSnapshot) -> Result<PackSnapshotRef> {
-    Ok(PackSnapshotRef::new(
-        source.scope.repository_id(),
-        source.scope.tenant_id(),
-        source.snapshot_id,
-        source.pin_id,
-        1,
-    )?)
+pub fn read_input(owner: &str, name: &str, root_id: Uuid) -> ServingRootRead {
+    ServingRootRead { owner: owner.to_owned(), name: name.to_owned(), root_id }
 }
 
-pub struct RootRequestIds {
-    pub root_id: Uuid,
-    pub operation_id: Uuid,
-    pub request_id: Uuid,
+pub fn release_input(owner: &str, name: &str, root_id: Uuid, key: &str, reason: &str) -> ServingRootRelease {
+    ServingRootRelease {
+        owner: owner.to_owned(),
+        name: name.to_owned(),
+        target: ServingRootReleaseTarget::Existing { root_id },
+        idempotency_key: key.to_owned(),
+        reason: reason.to_owned(),
+    }
 }
 
-pub async fn prepare(
-    adapter: &PgRetentionRoots,
-    pool: &Pool,
-    scope: RootsScope,
-    source: &SourceSnapshot,
-    ids: RootRequestIds,
-    deadline: Instant,
-) -> Result<RootCandidate, RootError> {
-    let reference =
-        reference(source).map_err(|_| RootError::RootSourceChanged("fixture snapshot reference invalid"))?;
-    let request = PrepareRootRequest::new(
-        scope,
-        reference,
-        ids.root_id,
-        ids.operation_id,
-        RootSelector::Snapshot,
-        ids.request_id,
-    )?;
-    adapter.prepare(pool, request, deadline).await
-}
-
-pub async fn register(
-    adapter: &PgRetentionRoots,
-    pool: &Pool,
-    candidate: RootCandidate,
-    request_id: Uuid,
-    deadline: Instant,
-) -> Result<RootReceipt, RootError> {
-    adapter.register(pool, RegisterRootRequest::new(candidate, request_id)?, deadline).await
-}
-
-pub struct ReleaseRequest<'a> {
-    pub scope: RootsScope,
-    pub root_id: Uuid,
-    pub request_id: Uuid,
-    pub expected_register_digest: &'a str,
-    pub release_digest: &'a str,
-}
-
-pub async fn release(
-    adapter: &PgRetentionRoots,
-    pool: &Pool,
-    request: ReleaseRequest<'_>,
-    deadline: Instant,
-) -> Result<RootReceipt, RootError> {
-    let request = ReleaseRootRequest::new(
-        request.scope,
-        request.root_id,
-        1,
-        request.request_id,
-        request.expected_register_digest,
-        request.release_digest,
-        "operator released retained root",
-    )?;
-    adapter.release(pool, request, deadline).await
+/// The facade derives the root id; this local helper exists only to keep the
+/// seed's marker assertions explicit without duplicating root-id logic.
+pub fn ensure_root_id(receipt_root_id: Uuid, record_root_id: Uuid) -> Result<()> {
+    ensure!(receipt_root_id == record_root_id, "root receipt and retained record disagree on root id");
+    Ok(())
 }

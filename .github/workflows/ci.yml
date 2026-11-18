@@ -20,11 +20,10 @@ jobs:
     # reaps orphaned Git grandchildren. Do not introduce a global child
     # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
     runs-on: ubuntu-22.04
-    # Job cap with bounded headroom for the three populated RefStore/artifact-hold
-    # backup drills below: their step caps grow from 5 to 10 minutes each, so the
-    # worst case added here is 3 x 5 = 15 minutes. Keep this bounded; raising it
-    # further must not be used to hide a regression inside one individual step.
-    timeout-minutes: 75
+    # 95 minutes baseline, 12 for the #304 cold tenant LFS gate on owned Garage,
+    # and 28 for the full Redis qualification (13 build, 5 restore/flush,
+    # 3 partition, 4 failover, 3 cleanup and manifest binding).
+    timeout-minutes: 135
     services:
       postgres:
         image: postgres:17
@@ -54,7 +53,8 @@ jobs:
         run: |
           scripts/install_ci_native_tools.sh install \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance test-results/ci-native-tools/provenance.json
+            --provenance test-results/ci-native-tools/provenance.json \
+            --phase-record test-results/ci-native-tools/phase.json
       - name: Verify native CI tool profile
         timeout-minutes: 5
         run: |
@@ -62,7 +62,8 @@ jobs:
           echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
           scripts/install_ci_native_tools.sh preflight \
             --prefix "$RUNNER_TEMP/rootyard-ci-native" \
-            --provenance test-results/ci-native-tools/provenance.json
+            --provenance test-results/ci-native-tools/provenance.json \
+            --phase-record test-results/ci-native-tools/phase.json
       - name: Install pinned Rust 1.99.1 gate tools
         run: |
           rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
@@ -203,6 +204,61 @@ jobs:
           ROOTYARD_JGIT_CLASSPATH="$PWD/test-results/ci-tools/clients/jgit-libs/*" ROOTYARD_PYGIT2_PYTHON="$PWD/test-results/ci-tools/client-venv/bin/python" python3 tests/client_compatibility.py --binary "$ROOTYARD_BIN" --report test-results/client-compatibility.json
       - name: Verify parallel track and schema baseline boundaries
         run: python3 -m unittest discover -s tests -p 'test_parallel_boundaries.py'
+      - name: Install Python CI test requirements
+        run: python3 -m pip install -r tests/requirements-python-ci.txt
+      - name: Exercise repository archive, rename aliases, soft-delete purge, and ownership transfer (#85)
+        timeout-minutes: 10
+        run: python3 tests/repository_lifecycle.py --binary "$ROOTYARD_BIN" --report test-results/repository-lifecycle.json
+      - name: "Qualify #85 cold tenant LFS retention on owned Garage"
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          umask 077
+          final_report="test-results/repository-lifecycle-remote-tenant-lfs.json"
+          [[ ! -e "$final_report" && ! -L "$final_report" ]]
+          scratch="$(mktemp -d "$RUNNER_TEMP/issue85-tenant-lfs.XXXXXX")"
+          garage_dir="$scratch/garage"
+          object_store_env="$scratch/object-store.env"
+          staged_report="$scratch/report.json"
+          fixture_started=0
+          finalize() {
+            local status=$?
+            trap - EXIT
+            if [[ "$fixture_started" == 1 && ! -d "$garage_dir" ]] ||
+               ! scripts/owned_garage_fixture.sh stop --directory "$garage_dir" >/dev/null 2>&1 ||
+               [[ -e "$garage_dir" || -L "$garage_dir" || -e "$object_store_env" || -L "$object_store_env" ]]; then
+              echo "Owned Garage cleanup failed." >&2
+              exit 1
+            fi
+            rm -f -- "$staged_report"
+            rmdir -- "$scratch"
+            if [[ "$status" == 0 ]]; then
+              printf '%s\n' "$report_json" >"$final_report"
+            fi
+            exit "$status"
+          }
+          trap finalize EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          ROOTYARD_FIXTURE_PULL_TIMEOUT=120 scripts/owned_garage_fixture.sh start \
+            --directory "$garage_dir" --output-env "$object_store_env" \
+            --bucket-prefix rootyard-issue85-lfs >/dev/null 2>&1
+          fixture_started=1
+          (
+            set -a
+            source "$object_store_env"
+            set +a
+            timeout --signal=INT --kill-after=15 240 python3 tests/repository_lifecycle.py \
+              --remote-tenant-lfs --binary "$ROOTYARD_BIN" --report "$staged_report"
+          ) >/dev/null 2>&1
+          [[ -f "$staged_report" && ! -L "$staged_report" && -s "$staged_report" ]]
+          report_json="$(<"$staged_report")"
+      - name: Exercise deleted webhook-claim fence (#85)
+        timeout-minutes: 10
+        run: ROOTYARD_EXPECTED_SOURCE_COMMIT="$GITHUB_SHA" python3 tests/repository_lifecycle_deleted_claim_acceptance.py --binary "$ROOTYARD_BIN" --report test-results/repository-lifecycle-deleted-claim.json
+      - name: Exercise literal Issue 85 purge-hold and alias acceptance
+        timeout-minutes: 10
+        run: python3 tests/repository_lifecycle_acceptance.py --binary "$ROOTYARD_BIN" --build-receipt "$ROOTYARD_BUILD_RECEIPT" --expected-source-commit "$GITHUB_SHA" --report test-results/repository-lifecycle-issue85-literal.json
       - name: Run all Python unit and Tier-5 adversarial contract suites
         # Full discovery stays unfiltered; the runner adds per-test progress and
         # periodic stderr thread stacks without changing exit semantics.
@@ -213,6 +269,196 @@ jobs:
         run: python3 tests/ci_mirror.py --binary "$ROOTYARD_BIN" --report test-results/ci-mirror.json
       - name: Exercise exact-target source retention and mirror preparation
         run: python3 tests/ci_source_pins.py --binary "$ROOTYARD_BIN" --report test-results/ci-source-pins.json
+      - name: Verify browse cache incarnation across restore with owned Redis
+        timeout-minutes: 28
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d "${RUNNER_TEMP:?}/rootyard-browse-restore.XXXXXX")
+          trap 'rm -rf -- "$scratch"' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          binary="$scratch/browse-restore-rootyard"
+          receipt="$binary.build.json"
+          published_receipt="test-results/${receipt##*/}"
+          report="$scratch/browse-restore-cache.json"
+          manifest="$scratch/native-browse-restore-cache.json"
+          partition_report="$scratch/redis-wake-partition.json"
+          partition_manifest="$scratch/native-redis-wake-partition.json"
+          failover_report="$scratch/redis-wake-failover.json"
+          failover_manifest="$scratch/native-redis-wake-failover.json"
+          restore_case=browse_restore_incarnation_cache
+          flush_case=browse_flushall_preserves_git_authority
+          partition_case=real_redis_partition_pg_fallback_and_wake
+          failover_case=real_redis_advisory_replica_promotion_and_duplicate_wakes
+          tree=$(git rev-parse 'HEAD^{tree}')
+
+          publish_failure() {
+            python3 -I - "$1" "$2" "$GITHUB_SHA" >/dev/null 2>&1 <<'PY' || :
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          source_path, mode, head = sys.argv[1:]
+          filename, name, stages = {
+              "restore": ("browse-restore-cache-failure.json", "browse_flushall_preserves_git_authority",
+                          {"source_warm_backup", "restore", "restored_preview", "flush_authority"}),
+              "partition": ("redis-wake-partition-failure.json", "real_redis_partition_pg_fallback_and_wake",
+                            {"fixture", "partition"}),
+              "failover": ("redis-wake-failover-failure.json",
+                           "real_redis_advisory_replica_promotion_and_duplicate_wakes", {"fixture", "promotion"}),
+          }[mode]
+          with Path(source_path).open("rb") as source:
+              raw = source.read(4097)
+          assert 0 < len(raw) <= 4096
+          report = json.loads(raw)
+          basic = {"passed", "cases"}
+          hashes = {"source_tree": 40, "source_inputs_sha256": 64,
+                    "binary_sha256": 64, "build_receipt_sha256": 64}
+          assert set(report) in (basic, basic | {"source_head", *hashes})
+          if "source_head" in report:
+              assert report["source_head"] == head
+              assert all(re.fullmatch(rf"[0-9a-f]{{{size}}}", report[key]) for key, size in hashes.items())
+          assert report["passed"] is False
+          case, = report["cases"]
+          assert set(case) == {"name", "status", "error"}
+          assert case["name"] == name and case["status"] == "failed"
+          assert case["error"] in stages | {"preflight", "receipt_changed", "cleanup", "report_write"}
+          with (Path("test-results") / filename).open("x") as output:
+              json.dump({"passed": False, "cases": [case]}, output)
+          PY
+          }
+
+          write_manifest() {
+            local proof=$1
+            shift
+            test -s "$proof" && test "$(wc -c < "$proof")" -le 4096 &&
+              python3 scripts/native_report_manifest.py --mode job \
+                --binary "$binary" --expect-commit "$GITHUB_SHA" --fixture postgres=postgres:17 \
+                --harness tests/backup_recovery_cache.py \
+                --harness tests/cross_process.py \
+                --harness tests/e2e.py \
+                --harness tests/native_evidence.py \
+                --harness tests/owned_fuse_cleanup.py \
+                --harness scripts/build_native.py \
+                --harness scripts/native_artifact_store.py \
+                --harness scripts/native_build_receipt.py \
+                --harness scripts/native_report_manifest.py \
+                --harness .github/workflows/ci.yml "$@" >/dev/null 2>&1
+          }
+
+          verify_proof_binding() {
+            python3 -I - "$tree" "$@" >/dev/null 2>&1 <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          tree, manifest_path, report_path, label, *expected = sys.argv[1:]
+          manifest = json.loads(Path(manifest_path).read_bytes())
+          payload = Path(report_path).read_bytes()
+          report = json.loads(payload)
+          cases = report["cases"]
+          assert [case["name"] for case in cases] == expected
+          assert all(case["detail"]["owned_cleanup_completed"] is True for case in cases)
+          assert set(manifest["reports"]) == {label}
+          entry = manifest["reports"][label]
+          assert entry["case_names"] == expected and entry["sha256"] == hashlib.sha256(payload).hexdigest()
+          assert report["source_head"] == manifest["source_commit"] and report["source_tree"] == tree
+          assert report["source_inputs_sha256"] == manifest["source_inputs_sha256"]
+          assert report["binary_sha256"] == manifest["binary_sha256"]
+          assert report["build_receipt_sha256"] == manifest["build_receipt"]["sha256"]
+          PY
+          }
+
+          if ! timeout --kill-after=30s 13m env -u CARGO_BUILD_JOBS python3 scripts/build_native.py \
+            --features state-redis \
+            --strip-debuginfo \
+            --artifact-store "$HOME/.cache/rootyard/native-artifacts" \
+            --output "$binary" >/dev/null 2>&1; then
+            echo 'Browse restore CLI build failed'
+            exit 1
+          fi
+          if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
+            timeout --kill-after=30s 5m python3 tests/backup_recovery.py \
+              --browse-flush-authority --binary "$binary" --expect-commit "$GITHUB_SHA" \
+              --report "$report" >/dev/null 2>&1; then
+            publish_failure "$report" restore
+            echo 'Browse restore or flush cache proof failed'
+            exit 1
+          fi
+          if ! write_manifest "$report" \
+            --manifest-out "$manifest" --build-receipt "$receipt" \
+            --report "browse_restore_cache=$report" \
+            --require-case "browse_restore_cache=$restore_case" \
+            --require-case "browse_restore_cache=$flush_case" \
+            --harness tests/backup_recovery.py \
+            --harness tests/backup.py \
+            --harness tests/schema_baseline.py \
+            --harness schema/142_catalog.json \
+            --harness schema/143_catalog.json \
+            --harness schema/151_catalog.json; then
+            echo 'Browse restore native manifest failed'
+            exit 1
+          fi
+          if ! verify_proof_binding "$manifest" "$report" browse_restore_cache "$restore_case" "$flush_case"; then
+            echo 'Browse restore cleanup or receipt binding failed'
+            exit 1
+          fi
+
+          # Keep the adjacent receipt for the shared CLI and publish the verified
+          # restore evidence before the partition drill can fail.
+          cp -- "$receipt" "$published_receipt"
+          mv -- "$report" "$manifest" test-results/
+
+          if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
+            timeout --kill-after=30s 3m python3 tests/cross_process_partition.py \
+              --binary "$binary" --expect-commit "$GITHUB_SHA" --report "$partition_report" >/dev/null 2>&1; then
+            publish_failure "$partition_report" partition
+            echo 'Redis wake partition proof failed'
+            exit 1
+          fi
+          if ! write_manifest "$partition_report" \
+            --manifest-out "$partition_manifest" --build-receipt "$published_receipt" \
+            --report "redis_wake_partition=$partition_report" \
+            --require-case "redis_wake_partition=$partition_case" \
+            --harness tests/cross_process_partition.py \
+            --harness tests/redis_partition_relay.py; then
+            echo 'Redis wake partition native manifest failed'
+            exit 1
+          fi
+          if ! verify_proof_binding "$partition_manifest" "$partition_report" redis_wake_partition "$partition_case"; then
+            echo 'Redis wake partition cleanup or receipt binding failed'
+            exit 1
+          fi
+          mv -- "$partition_report" "$partition_manifest" test-results/
+
+          if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
+            timeout --kill-after=30s 4m python3 tests/cross_process_failover.py \
+              --binary "$binary" --expect-commit "$GITHUB_SHA" --report "$failover_report" >/dev/null 2>&1; then
+            publish_failure "$failover_report" failover
+            echo 'Redis wake failover proof failed'
+            exit 1
+          fi
+          if ! write_manifest "$failover_report" \
+            --manifest-out "$failover_manifest" --build-receipt "$published_receipt" \
+            --report "redis_wake_failover=$failover_report" \
+            --require-case "redis_wake_failover=$failover_case" \
+            --harness tests/cross_process_failover.py \
+            --harness tests/cross_process_partition.py \
+            --harness tests/redis_partition_relay.py; then
+            echo 'Redis wake failover native manifest failed'
+            exit 1
+          fi
+          if ! verify_proof_binding "$failover_manifest" "$failover_report" redis_wake_failover "$failover_case"; then
+            echo 'Redis wake failover cleanup or receipt binding failed'
+            exit 1
+          fi
+          mv -- "$failover_report" "$failover_manifest" test-results/
+          rm -rf -- "$scratch"
+          test ! -e "$scratch"
+          trap - EXIT INT TERM
       - name: Exercise isolated job checkout authorization and object closure
         run: python3 tests/ci_job_checkouts.py --binary "$ROOTYARD_BIN" --report test-results/ci-job-checkouts.json
       - name: Exercise exact pinned dependency checkout and origin fallback boundaries
@@ -427,6 +673,7 @@ jobs:
             --manifest-out test-results/native-pr-gate.json \
             --build-receipt "$ROOTYARD_BUILD_RECEIPT" \
             --binary "$ROOTYARD_BIN" \
+            --expect-commit "$GITHUB_SHA" \
             --expect-batch-manifest-path "$ROOTYARD_BATCH_MANIFEST" \
             --expect-batch-manifest-sha "$ROOTYARD_BATCH_MANIFEST_SHA256" \
             --report web_sessions=test-results/web-sessions.json \
@@ -446,6 +693,10 @@ jobs:
             --report backup_capabilities=test-results/backup-capabilities.json \
             --report organizations_lifecycle=test-results/organizations-lifecycle.json \
             --report forge_collaboration=test-results/forge-collaboration.json \
+            --report repository_lifecycle=test-results/repository-lifecycle.json \
+            --report repository_lifecycle_remote_tenant_lfs=test-results/repository-lifecycle-remote-tenant-lfs.json \
+            --report repository_lifecycle_deleted_claim=test-results/repository-lifecycle-deleted-claim.json \
+            --report issue85_literal_lifecycle=test-results/repository-lifecycle-issue85-literal.json \
             --report web_detail_pagination=test-results/web-detail-pagination.json \
             --report web_repository_pagination=test-results/web-repository-pagination.json \
             --report worker_diagnostics=test-results/worker-diagnostics.json \
@@ -481,6 +732,7 @@ jobs:
             --require-case pando_pitr=post_isolate_stock_git_clone_fetch \
             --require-case pando_pitr=post_isolate_deleted_artifact_refused \
             --require-case pando_pitr=pitr_epoch_rollback_fenced \
+            --require-case organizations_lifecycle=direct_read_view_bundle_revocation \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
             --log-marker "webhook_regressions=concurrent claim fence: passed" \
@@ -491,6 +743,18 @@ jobs:
             --harness tests/token_management.py \
             --harness tests/ci_dependencies.py \
             --harness tests/ci_job_checkouts.py \
+            --harness tests/transfer_revocation_timing.py \
+            --harness tests/transfer_revocation_observer.py \
+            --harness tests/transfer_revocation_backpressure.py \
+            --harness tests/transfer_revocation_source.py \
+            --harness tests/transfer_revocation_git_source.py \
+            --harness tests/transfer_revocation_probe.py \
+            --harness tests/transfer_revocation_transport.py \
+            --harness tests/transfer_revocation_failure.py \
+            --harness tests/transfer_revocation_failure_projection.py \
+            --harness tests/transfer_revocation_failure_reader.py \
+            --harness tests/test_transfer_revocation_failure.py \
+            --harness tests/test_transfer_revocation_failure_transport.py \
             --harness tests/ci_source_pins.py \
             --harness tests/ci_mirror.py \
             --harness tests/metrics.py \
@@ -512,7 +776,18 @@ jobs:
             --harness tests/organizations_web.py \
             --harness tests/backup_capabilities.py \
             --harness tests/organizations_lifecycle.py \
+            --harness tests/organizations_direct_view_acceptance.py \
             --harness tests/forge_collaboration.py \
+            --harness tests/repository_lifecycle.py \
+            --harness scripts/owned_garage_fixture.sh \
+            --harness scripts/owned_object_store_env.py \
+            --harness tests/repository_lifecycle_deleted_claim_acceptance.py \
+            --harness tests/repository_lifecycle_acceptance.py \
+            --harness tests/repository_lifecycle_acceptance_support.py \
+            --harness tests/repository_lifecycle_acceptance_holds.py \
+            --harness tests/repository_lifecycle_acceptance_alias.py \
+            --harness tests/test_repository_lifecycle_acceptance_contract.py \
+            --harness tests/test_repository_lifecycle_acceptance_provenance.py \
             --harness tests/backup.py \
             --harness tests/web_detail_pagination.py \
             --harness tests/web_repository_pagination.py \
@@ -591,6 +866,20 @@ jobs:
             --require-case forge_collaboration=search_and_rbac \
             --require-case forge_collaboration=web_ui_and_csrf \
             --require-case forge_collaboration=backup_and_restore \
+            --require-case repository_lifecycle=archive_read_write_boundary \
+            --require-case repository_lifecycle=rename_aliases_and_authz_before_redirect \
+            --require-case repository_lifecycle=soft_delete_restore_and_purge_holds \
+            --require-case repository_lifecycle=ownership_transfer_and_crash_recovery \
+            --require-case repository_lifecycle_remote_tenant_lfs=remote_tenant_lfs_cold_retention \
+            --require-case repository_lifecycle_deleted_claim=source_claim_fence_contract \
+            --require-case repository_lifecycle_deleted_claim=live_control_secret_claim_and_expired_reclaim \
+            --require-case repository_lifecycle_deleted_claim=live_main_run_expired_lease_fixture \
+            --require-case repository_lifecycle_deleted_claim=deleted_claim_after_early_lookup_rejected_by_final_row_lock \
+            --require-case repository_lifecycle_deleted_claim=deleted_expired_lease_reclaim_denied_without_new_grant \
+            --require-case issue85_literal_lifecycle=backup_root_blocks_purge \
+            --require-case issue85_literal_lifecycle=serving_read_header_blocks_purge \
+            --require-case issue85_literal_lifecycle=ci_pin_blocks_purge \
+            --require-case issue85_literal_lifecycle=rename_alias_accepts_real_git_and_lfs_writes \
             --fixture-rust-from-receipt \
             --fixture git="$(git --version)" \
             --fixture git_lfs="$(git lfs version)" \
@@ -610,6 +899,7 @@ jobs:
             test-results/evidence/*.jsonl
             test-results/*-evidence/*.jsonl
             test-results/ci-native-tools/provenance.json
+            test-results/ci-native-tools/phase.json
           if-no-files-found: ignore
 
   container:

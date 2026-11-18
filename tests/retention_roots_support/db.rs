@@ -4,9 +4,13 @@
 //! frozen 139/142/143 row shapes) and real pools only. Missing configuration is
 //! a hard failure; no test may skip itself when PG is absent.
 use anyhow::{Result, anyhow, ensure};
+use axum::http::{HeaderMap, HeaderValue, header};
+use base64::Engine as _;
 use deadpool_postgres::{Manager, Pool};
+use rootyard::blob_store::opendal::BlobStore;
 use rootyard::db;
 use rootyard::ref_store::core::PgRefStoreCore;
+use rootyard::ref_store::serving::{ProvisionRequest, provision};
 use rootyard::ref_store::{CoreGateInit, CoreGateVersion, GitObjectFormat, RefName, VersionCheck};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -39,6 +43,142 @@ pub fn pool_for(url: &str, schema: &str, max: usize, extra: Option<&str>) -> Res
         .runtime(deadpool_postgres::Runtime::Tokio1)
         .max_size(max)
         .build()?)
+}
+
+/// One real writable API identity created through the production token path.
+/// The secret is used only to authenticate the returned Identity and is never
+/// printed or retained by the fixture.
+pub async fn serving_actor(pool: &Pool, label: &str) -> Result<db::Identity> {
+    let username = format!("{label}{}", Uuid::new_v4().simple());
+    let issued = db::issue_token(pool, &username, true, false).await?;
+    let username = issued["username"].as_str().ok_or_else(|| anyhow!("issued token has no username"))?;
+    let secret = issued["token"].as_str().ok_or_else(|| anyhow!("issued token has no secret"))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Basic {encoded}")).map_err(|_| anyhow!("token header refused"))?,
+    );
+    let identity = rootyard::auth::authenticate(pool, &headers)
+        .await
+        .map_err(|error| anyhow!("real token authentication failed: {}", error.1))?;
+    ensure!(!identity.read_only && identity.username == username, "issued serving identity differs");
+    Ok(identity)
+}
+
+/// A real writable identity with an initial restricted repository grant set.
+/// The token is issued through `db::issue_token`; only the missing public grant
+/// issuance path is represented by labeled initial scope metadata.
+pub async fn serving_actor_with_scopes(
+    pool: &Pool,
+    repo_id: Uuid,
+    actions: &[&str],
+    label: &str,
+) -> Result<db::Identity> {
+    let username = format!("{label}{}", Uuid::new_v4().simple());
+    let issued = db::issue_token(pool, &username, true, false).await?;
+    let token_id: Uuid = issued["token_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("issued token has no id"))?
+        .parse()
+        .map_err(|_| anyhow!("issued token id is invalid"))?;
+    let username = issued["username"].as_str().ok_or_else(|| anyhow!("issued token has no username"))?;
+    let secret = issued["token"].as_str().ok_or_else(|| anyhow!("issued token has no secret"))?;
+    let client = pool.get().await?;
+    client.execute("UPDATE tokens SET is_restricted=true WHERE id=$1", &[&token_id]).await?;
+    for action in actions {
+        client
+            .execute(
+                "INSERT INTO token_repository_scopes(token_id,repository_id,action) VALUES($1,$2,$3)",
+                &[&token_id, &repo_id, action],
+            )
+            .await?;
+    }
+    drop(client);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Basic {encoded}")).map_err(|_| anyhow!("token header refused"))?,
+    );
+    rootyard::auth::authenticate(pool, &headers)
+        .await
+        .map_err(|error| anyhow!("real restricted token authentication failed: {}", error.1))
+}
+
+/// A real collaborator identity with an initial role metadata row. Role rows are
+/// fixture inputs because the public collaborator transport is outside this
+/// core-lane checkpoint.
+pub async fn grant_collaborator(pool: &Pool, repo_id: Uuid, tenant_id: Uuid, user_id: Uuid, role: &str) -> Result<()> {
+    pool.get()
+        .await?
+        .execute(
+            "INSERT INTO repository_collaborators(repository_id,tenant_id,user_id,role)
+             VALUES($1,$2,$3,$4)",
+            &[&repo_id, &tenant_id, &user_id, &role],
+        )
+        .await?;
+    Ok(())
+}
+
+pub async fn serving_collaborator(
+    pool: &Pool,
+    repo_id: Uuid,
+    tenant_id: Uuid,
+    role: &str,
+    label: &str,
+) -> Result<db::Identity> {
+    let identity = serving_actor(pool, label).await?;
+    grant_collaborator(pool, repo_id, tenant_id, identity.id, role).await?;
+    Ok(identity)
+}
+
+pub async fn set_collaborator_role(pool: &Pool, repo_id: Uuid, user_id: Uuid, role: &str) -> Result<()> {
+    let changed = pool
+        .get()
+        .await?
+        .execute(
+            "UPDATE repository_collaborators SET role=$3,version=version+1,updated_at=clock_timestamp()
+             WHERE repository_id=$1 AND user_id=$2",
+            &[&repo_id, &user_id, &role],
+        )
+        .await?;
+    ensure!(changed == 1, "collaborator role update changed {changed} rows");
+    Ok(())
+}
+
+pub async fn revoke_scope(pool: &Pool, identity: &db::Identity, repo_id: Uuid) -> Result<()> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    let removed = rootyard::token_scopes::revoke_repository_scope(&tx, identity.token_id, identity.id, repo_id).await?;
+    ensure!(removed, "restricted token scope was not present");
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Provision one actual ready `pg_refstore` repository through the production
+/// serving path. No GitFS directory or forged ready row is created.
+pub async fn provision_serving(
+    pool: &Pool,
+    actor: &db::Identity,
+    store: &BlobStore,
+    name: &str,
+) -> Result<db::Repository> {
+    let receipt = provision(
+        pool,
+        actor,
+        ProvisionRequest { owner: None, name: name.to_owned(), object_format: GitObjectFormat::Sha1 },
+        store.backend_identity(),
+        deadline(),
+    )
+    .await
+    .map_err(|error| anyhow!("serving provision failed: {error}"))?;
+    ensure!(receipt.created, "serving provision unexpectedly replayed");
+    ensure!(
+        receipt.repository.storage_backend == "pg_refstore" && receipt.repository.state == "ready",
+        "provisioned repository is not ready pg_refstore"
+    );
+    Ok(receipt.repository)
 }
 
 pub struct Db {
@@ -74,6 +214,19 @@ impl Db {
         let pool = pool_for(&url, &schema, 16, None)?;
         db::migrate(&pool).await?;
         let client = pool.get().await?;
+        // The serving lane reads the production `public.cluster_authority` row.
+        // The random fixture schema owns all other tables, so ensure this one
+        // production-shaped singleton exists without replacing any existing row.
+        client
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS public.cluster_authority (
+                     singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+                     incarnation UUID NOT NULL DEFAULT gen_random_uuid(),
+                     rotated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+                 );
+                 INSERT INTO public.cluster_authority(singleton) VALUES(true) ON CONFLICT DO NOTHING;",
+            )
+            .await?;
         let installed: bool = client
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=144)
@@ -207,6 +360,46 @@ impl Db {
         let mut client = self.pool.get().await?;
         Ok(PgRefStoreCore.initialize(&mut client, &init, deadline()).await?.version())
     }
+}
+
+pub async fn cluster_incarnation(pool: &Pool) -> Result<Uuid> {
+    Ok(pool
+        .get()
+        .await?
+        .query_one("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[])
+        .await?
+        .get(0))
+}
+
+pub async fn set_cluster_incarnation(pool: &Pool, incarnation: Uuid) -> Result<()> {
+    let changed = pool
+        .get()
+        .await?
+        .execute(
+            "UPDATE public.cluster_authority SET incarnation=$1, rotated_at=clock_timestamp()
+             WHERE singleton=true",
+            &[&incarnation],
+        )
+        .await?;
+    ensure!(changed == 1, "cluster authority restore changed {changed} rows");
+    Ok(())
+}
+
+/// Rotate the real cluster authority row inside this fixture schema. This is a
+/// test-only SQL mutation of the dedicated cluster fixture, not a product path.
+pub async fn rotate_cluster(pool: &Pool) -> Result<Uuid> {
+    let row = pool
+        .get()
+        .await?
+        .query_one(
+            "UPDATE public.cluster_authority SET incarnation=gen_random_uuid(), rotated_at=clock_timestamp()
+             WHERE singleton=true RETURNING incarnation",
+            &[],
+        )
+        .await?;
+    let incarnation: Uuid = row.get(0);
+    ensure!(!incarnation.is_nil(), "rotated cluster incarnation is nil");
+    Ok(incarnation)
 }
 
 pub async fn gate_version(pool: &Pool, repo: Uuid, tenant: Uuid) -> Result<CoreGateVersion> {
