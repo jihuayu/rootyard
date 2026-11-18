@@ -39,8 +39,7 @@ CREATE TABLE IF NOT EXISTS lfs_blob_repo_realms (
     history_incarnation UUID NOT NULL,
     gate_digest_hex TEXT NOT NULL CHECK (octet_length(gate_digest_hex) = 64),
     bare_git_dir TEXT NOT NULL,
-    next_op_seq BIGINT NOT NULL DEFAULT 0,
-    UNIQUE (owner_username, repo_name)
+    next_op_seq BIGINT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS lfs_blob_upload_attempts (
@@ -232,8 +231,12 @@ impl PgLfsBlobStore {
         let anchor_name = format!("s4_hold_{}", hold_anchor_id.simple());
         client
             .execute(
-                "INSERT INTO repositories(id, owner_id, name, object_format, state, storage_backend, transition_state, deleted_at)
-                 VALUES($1, $2, $3, $4, 'provisioning', 'gitfs', 'stable', clock_timestamp())",
+                "INSERT INTO repositories(
+                    id, owner_id, name, object_format, state, storage_backend, transition_state, deleted_at, purge_after
+                 ) VALUES(
+                    $1, $2, $3, $4, 'provisioning', 'gitfs', 'stable',
+                    clock_timestamp(), clock_timestamp() + make_interval(years => 100)
+                 )",
                 &[&hold_anchor_id, &owner_tenant_id, &anchor_name, &fmt_str],
             )
             .await

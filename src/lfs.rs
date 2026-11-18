@@ -22,5 +22,4 @@ pub fn routes() -> Router<Arc<AppState>> {
     routes::routes()
 }
 
-#[path = "lfs/blob_proof_publication.rs"]
 pub mod blob_proof_publication;

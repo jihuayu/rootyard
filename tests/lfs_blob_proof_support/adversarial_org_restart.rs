@@ -92,6 +92,29 @@ pub async fn exercise_org_authority_restart_recovery_hydration_and_shared_holds(
     let rec_report = pg.reconcile_in_flight_uploads(realm.repository_id).await?;
     ensure!(rec_report.aborted_orphaned_attempts >= 1 && rec_report.committed_objects_preserved >= 2);
 
+    // Uncommitted (`pending` / `aborted_failed`) upload `operation_id` must NOT pass `POST .../verify`
+    // even when `(shared_oid, shared_bytes.len())` was already committed by an earlier upload!
+    let pending_verify_tok = "op-pending-verify-piggyback-01";
+    pg.begin_or_load_upload_operation(
+        realm.repository_id,
+        operation_token_to_uuid(pending_verify_tok)?,
+        realm.owner_tenant_id,
+        alice.user_id,
+        shared_oid,
+        shared_bytes.len() as i64,
+    )
+    .await?;
+    let piggyback_verify = cli
+        .post(format!("{}/{}/{}/info/lfs/verify", restarted.base_url, realm.owner_username, realm.repo_name))
+        .basic_auth(&alice.username, Some(&alice.token))
+        .header("Accept", "application/vnd.git-lfs+json")
+        .header("Content-Type", "application/vnd.git-lfs+json")
+        .header("X-Rootyard-Operation-Id", pending_verify_tok)
+        .json(&json!({ "oid": shared_oid, "size": shared_bytes.len() }))
+        .send()
+        .await?;
+    ensure!(piggyback_verify.status() == StatusCode::CONFLICT);
+
     let retry_res = cli
         .put(format!(
             "{}/{}/{}/info/lfs/objects/{crash_oid}/{}",
@@ -203,6 +226,13 @@ pub async fn exercise_org_authority_restart_recovery_hydration_and_shared_holds(
         )
         .await?
         .get(0);
+    // Creating a new `alice/xfer-repo` BEFORE `xfer_repo_id`'s cached realm row is refreshed must
+    // succeed without colliding on `(owner_username, repo_name)` in `lfs_blob_repo_realms`!
+    let (new_alice_xfer_id, new_alice_owner_id) = restarted.create_repo(alice, None, "xfer-repo", "sha1").await?;
+    ensure!(new_alice_xfer_id != xfer_repo_id && new_alice_owner_id == pre_owner_id);
+    let new_alice_realm = pg.ensure_realm_for_repository(new_alice_xfer_id, &restarted.state.storage.root).await?;
+    ensure!(new_alice_realm.owner_tenant_id == pre_owner_id && new_alice_realm.owner_username == alice.username);
+
     let post_realm = pg.ensure_realm_for_repository(xfer_repo_id, &restarted.state.storage.root).await?;
     ensure!(post_realm.owner_tenant_id == org_id && post_realm.owner_username == "acme");
 

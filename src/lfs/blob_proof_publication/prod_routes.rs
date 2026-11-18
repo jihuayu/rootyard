@@ -336,14 +336,15 @@ pub(crate) async fn prod_verify(
     if let Some(id) = op_id {
         match pg.load_upload_operation(realm.repository_id, id).await {
             Ok(Some(saved))
-                if saved.tenant_id != realm.owner_tenant_id
+                if saved.state != "committed"
+                    || saved.tenant_id != realm.owner_tenant_id
                     || saved.actor_id != actor.id
                     || saved.oid_sha256 != spec.oid
                     || saved.size_bytes != spec.size =>
             {
                 return Ok(lfs_blob_err_response(LfsBlobError::new(
                     LfsProofRejectCode::AttestationEquivocation,
-                    "verify operation_id conflicts with current tenant or upload operation record",
+                    "verify operation_id is uncommitted or conflicts with current tenant or upload operation record",
                 )));
             }
             Ok(_) => {}
