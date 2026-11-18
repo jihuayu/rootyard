@@ -127,7 +127,7 @@ class GitSourceWitness:
             task_dir = self.proc_root / str(tgid) / "task"
             try:
                 entries = list(task_dir.iterdir())
-            except OSError:
+            except FileNotFoundError:  # task vanished concurrently
                 continue
             for entry in entries:
                 if entry.name.isdigit():

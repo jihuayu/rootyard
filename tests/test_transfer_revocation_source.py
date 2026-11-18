@@ -868,6 +868,47 @@ class TestGitSourceWitness(unittest.TestCase):
         self.assertEqual(report["source_proof_kind_code"],
                          source.SOURCE_PROOF_KIND_NONE)
 
+    def _task_dir_error(self, error):
+        real_iterdir = Path.iterdir
+
+        def fail(path):
+            if path == self.proc / "200" / "task":
+                raise error
+            return real_iterdir(path)
+
+        return mock.patch.object(
+            Path, "iterdir", autospec=True, side_effect=fail)
+
+    def test_unreadable_task_directory_blocks_initial_bind(self):
+        witness = git_source.GitSourceWitness(
+            self.service_pid, [self.identity], proc_root=self.proc)
+        with self._task_dir_error(PermissionError(13, "denied")):
+            self.assertFalse(witness.bind())
+        self.assertEqual(witness.fatal_failure_code,
+                         source.SOURCE_FAILURE_UNOBSERVABLE)
+
+    def test_unreadable_task_directory_blocks_full_pipe_sample(self):
+        self.assertTrue(self.witness.bind())
+        self._task_files(wchan="0\n")
+        with self._task_dir_error(PermissionError(13, "denied")), \
+                mock.patch.object(
+                    git_source, "observe_owned_stdout_pipe_full",
+                    return_value=source.PIPE_FULL_PROVEN) as observed:
+            report = self.witness.sample()
+        self.assertFalse(report["qualified"])
+        self.assertEqual(report["fatal_failure_code"],
+                         source.SOURCE_FAILURE_UNOBSERVABLE)
+        observed.assert_not_called()
+
+    def test_vanished_task_directory_is_a_legal_empty_census(self):
+        witness = git_source.GitSourceWitness(
+            self.service_pid, [self.identity], proc_root=self.proc)
+        with self._task_dir_error(FileNotFoundError(2, "gone")):
+            self.assertFalse(witness.bind())
+        self.assertEqual(witness.fatal_failure_code, source.SOURCE_FAILURE_NONE)
+        self.assertEqual(witness.failure_code, source.SOURCE_FAILURE_NO_CANDIDATE)
+        self.assertTrue(witness.bind())
+
     def test_unreadable_census_fd_link_fails_closed(self):
         self.assertTrue(self.witness.bind())
         self._task_files(wchan="0\n")
