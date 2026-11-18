@@ -350,6 +350,7 @@ struct AppendCell {
     last_index: AtomicU64,
     entry_count: AtomicU64,
     handler: AtomicU8,
+    /// Sticky across observed events: a later in-range event does not clear it.
     overflow: AtomicBool,
 }
 
@@ -404,6 +405,8 @@ struct AppendObservation {
     first_index: u64,
     last_index: u64,
     entry_count: u64,
+    /// Sticky historical saturation flag. A later in-range event can replace every gauge above
+    /// while this remains true, so it does not imply that a current gauge equals its cap.
     overflow: bool,
 }
 

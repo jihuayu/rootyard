@@ -783,8 +783,10 @@ def _parse_append_witness(line) -> tuple[str, dict]:
 
     The frame is a companion to the historical case-level failure receipt. It can only name the
     real Root Raft case, and every observation is rebuilt from fixed slot labels, closed handler
-    names and bounded integers. No request, identity, path, address, payload or log text is
-    accepted or reflected.
+    names and bounded integers. ``overflow`` is preserved as a sticky historical flag: it can be
+    true after an earlier capped event even when the currently retained gauges are in range, so it
+    is not cross-checked against the current gauges. Every gauge still has its own hard cap. No
+    request, identity, path, address, payload or log text is accepted or reflected.
     """
     if not isinstance(line, str) or len(line.encode("utf-8")) > _MAX_APPEND_FRAME_BYTES:
         raise ValueError
@@ -857,20 +859,9 @@ def _parse_append_witness(line) -> tuple[str, dict]:
             raise ValueError
         if not _diagnostic_int(entry_count, 1, _MAX_APPEND_ENTRIES):
             raise ValueError
-        if overflow and not any(
-            (
-                term == _MAX_DIAGNOSTIC_TERM,
-                prev_index == _MAX_DIAGNOSTIC_LOG_INDEX,
-                first_index == _MAX_DIAGNOSTIC_LOG_INDEX,
-                last_index == _MAX_DIAGNOSTIC_LOG_INDEX,
-                entry_count == _MAX_APPEND_ENTRIES,
-                decoded == _MAX_APPEND_COUNT,
-                handled == _MAX_APPEND_COUNT,
-                write_ok == _MAX_APPEND_COUNT,
-                write_error == _MAX_APPEND_COUNT,
-            )
-        ):
-            raise ValueError
+        # ``overflow`` is a sticky historical flag. An earlier capped event can leave it set
+        # after a later in-range event replaces these gauges, so it intentionally does not imply
+        # that any current field equals its cap. Each field above still has its own hard cap.
         rebuilt.append(
             {
                 "target_slot": target_slot,

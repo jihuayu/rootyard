@@ -1231,7 +1231,13 @@ class RootRaftRunnerTest(unittest.TestCase):
         payload["observations"][0]["entry_count"] = 0
         cases.append(payload)
         payload = _append_witness_payload()
-        payload["observations"][0]["overflow"] = True
+        payload["observations"][0]["overflow"] = 1
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["term"] = runner._MAX_DIAGNOSTIC_TERM + 1
+        cases.append(payload)
+        payload = _append_witness_payload()
+        payload["observations"][0]["decoded"] = runner._MAX_APPEND_COUNT + 1
         cases.append(payload)
         payload = _append_witness_payload()
         payload["observations"][0]["prev_index"] = -1
@@ -1275,6 +1281,67 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertIsNone(observation["prev_index"])
         self.assertTrue(observation["overflow"])
         self.assertEqual(observation["decoded"], runner._MAX_APPEND_COUNT)
+
+    def test_append_witness_sticky_overflow_survives_later_in_range_event(self) -> None:
+        scalar = (
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} phase=heal class=quorum_unavailable\n"
+        )
+        before = _append_witness_payload(
+            [
+                _append_observation(
+                    decoded=1,
+                    handled=1,
+                    write_ok=1,
+                    term=6,
+                    prev_index=18,
+                    first_index=19,
+                    last_index=19,
+                    entry_count=1,
+                )
+            ]
+        )
+        capped = _append_witness_payload(
+            [
+                _append_observation(
+                    decoded=runner._MAX_APPEND_COUNT,
+                    handled=runner._MAX_APPEND_COUNT,
+                    write_ok=runner._MAX_APPEND_COUNT,
+                    term=runner._MAX_DIAGNOSTIC_TERM,
+                    prev_index=runner._MAX_DIAGNOSTIC_LOG_INDEX,
+                    first_index=runner._MAX_DIAGNOSTIC_LOG_INDEX,
+                    last_index=runner._MAX_DIAGNOSTIC_LOG_INDEX,
+                    entry_count=runner._MAX_APPEND_ENTRIES,
+                    overflow=True,
+                )
+            ]
+        )
+        after = _append_witness_payload(
+            [
+                _append_observation(
+                    decoded=2,
+                    handled=2,
+                    write_ok=2,
+                    term=7,
+                    prev_index=19,
+                    first_index=20,
+                    last_index=20,
+                    entry_count=1,
+                    overflow=True,
+                )
+            ]
+        )
+        for label, payload in (("before", before), ("capped", capped), ("after", after)):
+            with self.subTest(label=label):
+                evidence = runner.collect_failure_evidence(
+                    NONZERO_FAILED_OUTPUT, scalar + _append_witness_frame(payload)
+                )
+                self.assertTrue(evidence.diagnostics_valid)
+                self.assertEqual(len(evidence.append_witness), 1)
+                self.assertEqual(
+                    evidence.append_witness[0]["observations"],
+                    payload["observations"],
+                )
+                self.assertNotIn(SECRET, json.dumps(evidence.append_witness))
 
     def test_quorum_diagnostic_accepts_bounded_overflow(self) -> None:
         payload = _diagnostic_payload()
