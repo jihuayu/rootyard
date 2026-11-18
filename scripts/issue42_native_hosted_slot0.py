@@ -172,6 +172,7 @@ ALL_CASES = (
     (LIB, "ref_store::pg::slot_zero::tests::slot_zero_fixture_setup_error_drops_only_its_owned_database", True),
     (LIB, "ref_store::pg::slot_zero::tests::slot_zero_request_rejects_equal_ids_and_noncanonical_backend", False),
     (LIB, "ref_store::pg::slot_zero::tests::slot_zero_proof_binds_sequence_plan_and_wire", False),
+    (LIB, "ref_store::pg::slot_zero::tests::slot_zero_public_attempt_lookup_is_exact_and_read_only", True),
 )
 TOOLCHAIN_EXPECTATION = {
     "cargo": {"release": CARGO_RELEASE, "commit_hash": CARGO_FORK},
@@ -235,7 +236,7 @@ def build_failure_is_closed(value):
 
 
 # Narrow anchors for the exact fixed strings emitted by
-# scripts/build_native_test.py at PRODUCT_SHA 88e9c7007d03a296cdbead372ade2a4b35f64a00.
+# scripts/build_native_test.py at PRODUCT_SHA ebc1f9f3f2b2b4eefa2ed0b097731eb351876c54.
 # Only path-bearing suffixes are wildcarded; suffixes are never projected.
 LIB_PRODUCER_PREFIX = b"build_native_test: "
 LIB_PRODUCER_CHUNK = 65536
