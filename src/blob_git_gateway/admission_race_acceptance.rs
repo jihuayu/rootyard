@@ -356,8 +356,11 @@ async fn pre_admission_revision_mismatch_rebases_to_old_oid_mismatch() -> Result
         require_owned_disposable_blob_fixture()?;
         let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
         let db = Db::setup().await?;
-        require_per_run_blob_prefix()?;
-        let outcome = case(&db, &mut phase).await;
+        let outcome = async {
+            require_per_run_blob_prefix()?;
+            case(&db, &mut phase).await
+        }
+        .await;
         if outcome.is_ok() {
             phase = "fixture_cleanup";
         }
@@ -631,6 +634,12 @@ async fn admitted_same_ref_attempt_is_refused_after_winner_commits() -> Result<(
             admitted_refusal_case(&db, &mut phase).await
         }
         .await;
+        if phase == "cleanup_drain" {
+            // A join/drain was not proved within its bound, so the schema and
+            // its fixture-owned directories are retained rather than dropped
+            // underneath a possibly live handler.
+            return Err(anyhow!("admitted refusal fixture retained after unresolved cleanup"));
+        }
         if outcome.is_ok() {
             phase = "fixture_cleanup";
         }
@@ -1006,18 +1015,24 @@ async fn admitted_refusal_case(db: &Db, phase: &mut &'static str) -> Result<()> 
         if let Err(error) = server.drain(PUSH_BOUND).await {
             first_error.get_or_insert(error);
         }
-        // Remove the client work tree only after the real Git tasks and server
-        // drain attempt, never while a child could still be using it.
-        drop(race_work.take());
         match first_error {
             Some(error) => Err(error),
-            None => Ok(()),
+            None => {
+                // Remove the client work tree only after the real Git tasks and
+                // the server drain both succeeded.
+                drop(race_work.take());
+                Ok(())
+            }
         }
     }
     .await;
 
     if let Err(error) = cleanup {
         *phase = "cleanup_drain";
+        // The join/drain is unresolved: retain fixture-owned directories for
+        // the possibly live handler instead of deleting them under it.
+        std::mem::forget(race_work.take());
+        std::mem::forget(scratch);
         return Err(error);
     }
     outcome
