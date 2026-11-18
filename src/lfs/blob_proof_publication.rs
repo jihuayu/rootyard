@@ -1,19 +1,9 @@
-//! Unified OpenDAL Blob LFS Batch, Locks, Transfer, and Replayable Pointer Attestation (`Refs #145`).
-//!
-//! Eliminates node-local durable ACK assumptions for Git LFS: every Batch (`upload`,
-//! `download`, `verify`), object transfer, lock check, clean compute-view hydration, and
-//! pre-receive LFS pointer publication decision runs strictly through the standalone
-//! OpenDAL [`crate::blob_store::opendal::BlobStore`], permanent [`crate::ref_store::core::artifact_hold::PgArtifactHoldStore`]
-//! holds, and [`crate::blob_store::protected::ProtectedUploader`] provider read-back receipts.
+//! Remote-Blob-only LFS Batch, verified streaming transfer, and pointer publication proof (`Refs #145`).
 
 #[path = "blob_proof_publication/attestation.rs"]
 pub mod attestation;
 #[path = "blob_proof_publication/authz.rs"]
 pub mod authz;
-#[path = "blob_proof_publication/git_smart_http.rs"]
-pub mod git_smart_http;
-#[path = "blob_proof_publication/http_router.rs"]
-pub mod http_router;
 #[path = "blob_proof_publication/hydration_view.rs"]
 pub mod hydration_view;
 #[path = "blob_proof_publication/locks_store.rs"]
@@ -22,6 +12,10 @@ pub mod locks_store;
 pub mod pg_schema;
 #[path = "blob_proof_publication/pg_store.rs"]
 pub mod pg_store;
+#[path = "blob_proof_publication/prod_publication.rs"]
+pub mod prod_publication;
+#[path = "blob_proof_publication/prod_routes.rs"]
+pub mod prod_routes;
 #[path = "blob_proof_publication/transfer.rs"]
 pub mod transfer;
 #[path = "blob_proof_publication/types.rs"]
@@ -32,16 +26,24 @@ pub mod types;
 mod unit_tests;
 
 pub use attestation::{LfsPushAttestationRequest, attest_and_authorize_push};
-pub use authz::{AuthorizedRepoAccess, LfsBlobRuntimeGate, LfsPrincipal};
-pub use http_router::{LfsBlobProofService, lfs_blob_proof_router};
-pub use locks_store::{LfsLockRecord, LfsVerifyLocksReport};
-pub use pg_store::{LfsRepoRealm, PgLfsBlobStore, ReconcileUploadsReport, init_lfs_blob_proof_tables};
+pub use authz::{
+    AuthorizedRepoAccess, LfsBlobRuntimeGate, SubjectTenantAuthority, evaluate_subject_tenant_access,
+    extract_credentials_header, extract_stable_operation_id, operation_token_to_uuid, verify_shared_hold_grant,
+};
+pub use locks_store::valid_lfs_lock_path;
+pub use pg_store::{LfsRepoRealm, PgLfsBlobStore, ReconcileUploadsReport, UploadOperationRow, init_lfs_blob_proof_tables};
+pub use prod_routes::{
+    PushAttestationSession, active_blob_gate, prod_validate_and_attest_push, set_runtime_gate_override,
+    with_push_attestation_session,
+};
 pub use transfer::{
     ComputeViewHydrationReport, LfsTransferContext, delete_or_retire_lfs_object, download_lfs_object_from_remote,
-    hydrate_clean_compute_view, process_batch_request, upload_lfs_object_to_remote, verify_lfs_object_remote,
+    hydrate_clean_compute_view, process_batch_request, resolve_and_verify_remote_blob, upload_lfs_object_to_remote,
+    verify_committed_locator_bytes, verify_lfs_object_remote,
 };
 pub use types::{
     AttestationOutcome, AttestedLfsPointer, CommittedLfsBlobRecord, LfsAccessMode, LfsBlobError, LfsCollaboratorRole,
     LfsPointerAttestation, LfsProofRejectCode, LfsRefUpdateSpec, PointerInspection, PointerResolutionSource,
-    SharedLfsHoldGrant, StoredBlobLocatorRef, compute_attestation_digest, inspect_candidate_lfs_pointer,
+    SharedLfsHoldGrant, StoredBlobLocatorRef, compute_attestation_digest, compute_pointer_receipt_digest,
+    compute_ref_updates_digest, inspect_candidate_lfs_pointer,
 };

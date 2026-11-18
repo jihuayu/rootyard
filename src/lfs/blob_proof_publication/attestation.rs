@@ -123,17 +123,17 @@ fn valid_git_oid_for_format(oid: &str, fmt: GitObjectFormat) -> bool {
 }
 
 /// Evaluates a Git push during the decision / pre-receive phase:
-/// 1. Enforces fail-closed remote OpenDAL `BlobStore` presence & caller `Write` role (without `caller == tenant`).
-/// 2. Replays deterministically if `(repository_id, operation_id)` was already attested, re-proving live remote bytes.
+/// 1. Enforces fail-closed remote OpenDAL `BlobStore` presence & authoritative write role.
+/// 2. Replays deterministically if `(repository_id, operation_id)` was already attested, re-proving
+///    live remote bytes on every attested `BlobLocator` + active `SharedLfsHoldGrant`.
 /// 3. Enforces repository path locks (`LockedPathConflict`) across new commits and tree diffs/deletes.
-/// 4. Inspects all newly reachable Git blobs (`<= 1024`B), rejecting malformed pointers (`MalformedLfsPointer`),
-///    missing/wrong-size objects (`MissingRemoteBlob` / `SizeOrDigestMismatch`), or unauthorized cross-owner holds
-///    (`UnauthorizedSharedHold`), and issues a durable `LfsPointerAttestation`.
+/// 4. Inspects newly reachable Git blobs (`<= 1024`B), rejecting malformed pointers, missing/wrong-size
+///    objects, or unauthorized cross-owner holds, and issues a durable `LfsPointerAttestation`.
 pub async fn attest_and_authorize_push(
     ctx: &LfsTransferContext<'_>,
     req: &LfsPushAttestationRequest,
 ) -> Result<AttestationOutcome, LfsBlobError> {
-    let store = ctx.gate.require_store()?;
+    let _ = ctx.gate.require_store()?;
     if !ctx.access.role.allows_write() {
         return Err(LfsBlobError::new(
             LfsProofRejectCode::UnauthorizedCollaborator,
@@ -162,16 +162,7 @@ pub async fn attest_and_authorize_push(
         }
         let dl = StdInstant::now() + ctx.timeout;
         for ptr in &existing.pointers {
-            let (rec, _, _) = resolve_and_verify_remote_blob(
-                store,
-                ctx.pg,
-                ctx.realm,
-                ctx.access.actor_id,
-                &ptr.oid_sha256,
-                ptr.size_bytes,
-                dl,
-            )
-            .await?;
+            let (rec, _, _) = resolve_and_verify_remote_blob(ctx, &ptr.oid_sha256, ptr.size_bytes, dl).await?;
             if rec.locator != ptr.locator || rec.hold_id != ptr.hold_id {
                 return Err(LfsBlobError::new(
                     LfsProofRejectCode::AttestationEquivocation,
@@ -265,16 +256,8 @@ pub async fn attest_and_authorize_push(
                 }
                 PointerInspection::Valid(spec) => {
                     let dl = StdInstant::now() + ctx.timeout;
-                    let (rec, resolution, _) = resolve_and_verify_remote_blob(
-                        store,
-                        ctx.pg,
-                        ctx.realm,
-                        ctx.access.actor_id,
-                        &spec.oid,
-                        spec.size,
-                        dl,
-                    )
-                    .await?;
+                    let (rec, resolution, _) =
+                        resolve_and_verify_remote_blob(ctx, &spec.oid, spec.size, dl).await?;
                     let receipt_digest = compute_pointer_receipt_digest(
                         &spec.oid,
                         spec.size,

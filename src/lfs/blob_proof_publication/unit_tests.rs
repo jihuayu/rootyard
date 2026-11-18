@@ -1,13 +1,13 @@
 //! Deterministic unit tests for Issue #145 (`Refs #145`).
 
-use axum::http::{HeaderMap, header};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use axum::http::HeaderMap;
 use uuid::Uuid;
 
 use crate::blob_store::BlobLocator;
 
 use super::authz::{
-    LfsBlobRuntimeGate, evaluate_repo_role_access, extract_credentials_header, verify_shared_hold_grant,
+    LfsBlobRuntimeGate, SubjectTenantAuthority, evaluate_subject_tenant_access, extract_stable_operation_id,
+    operation_token_to_uuid, verify_shared_hold_grant,
 };
 use super::locks_store::valid_lfs_lock_path;
 use super::types::{
@@ -59,65 +59,116 @@ fn pointer_inspector_classifies_canonical_legacy_ordinary_and_malformed_blobs() 
 }
 
 #[test]
-fn cross_owner_collaborator_and_shared_hold_authorization_never_assume_caller_is_tenant() {
+fn authoritative_subject_tenant_access_never_uses_uuid_equality() {
     let repo_id = Uuid::new_v4();
-    let owner_tenant = Uuid::new_v4();
+    let owner_ns = Uuid::new_v4();
+    let org_id = Uuid::new_v4();
+    let alice_user = Uuid::new_v4();
     let collab_writer = Uuid::new_v4();
     let collab_reader = Uuid::new_v4();
     let outsider = Uuid::new_v4();
 
-    let owner_access =
-        evaluate_repo_role_access(repo_id, owner_tenant, owner_tenant, "alice", None, true, true).unwrap();
-    assert!(!owner_access.is_cross_owner());
-    assert_eq!(owner_access.role, LfsCollaboratorRole::Admin);
-
-    let writer_access = evaluate_repo_role_access(
+    // Even if `actor_id` numerically equals `owner_ns`, `Unrelated` MUST fail closed!
+    let accidental_uuid_collision = evaluate_subject_tenant_access(
         repo_id,
-        owner_tenant,
+        owner_ns,
+        owner_ns,
+        "spoofed",
+        SubjectTenantAuthority::Unrelated,
+        false,
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(accidental_uuid_collision.code, LfsProofRejectCode::UnauthorizedCollaborator);
+
+    let personal_owner = evaluate_subject_tenant_access(
+        repo_id,
+        owner_ns,
+        alice_user,
+        "alice",
+        SubjectTenantAuthority::PersonalNamespaceOwner {
+            namespace_id: owner_ns,
+            namespace_slug: "alice".into(),
+        },
+        true,
+        true,
+    )
+    .unwrap();
+    assert!(!personal_owner.is_cross_owner());
+    assert_eq!(personal_owner.role, LfsCollaboratorRole::Admin);
+
+    let org_maintainer = evaluate_subject_tenant_access(
+        repo_id,
+        owner_ns,
+        alice_user,
+        "alice",
+        SubjectTenantAuthority::OrganizationMember {
+            organization_id: org_id,
+            namespace_slug: "acme".into(),
+            role: LfsCollaboratorRole::Maintain,
+        },
+        true,
+        false,
+    )
+    .unwrap();
+    assert!(org_maintainer.is_cross_owner());
+    assert_eq!(
+        org_maintainer.mode,
+        LfsAccessMode::OrganizationMember { organization_id: org_id, role: LfsCollaboratorRole::Maintain }
+    );
+
+    let writer_access = evaluate_subject_tenant_access(
+        repo_id,
+        owner_ns,
         collab_writer,
         "bob",
-        Some(LfsCollaboratorRole::Write),
+        SubjectTenantAuthority::RepositoryCollaborator {
+            namespace_slug: "acme".into(),
+            role: LfsCollaboratorRole::Write,
+        },
         true,
         false,
     )
     .unwrap();
     assert!(writer_access.is_cross_owner());
-    assert_eq!(writer_access.owner_tenant_id, owner_tenant);
+    assert_eq!(writer_access.owner_tenant_id, owner_ns);
     assert_eq!(writer_access.actor_id, collab_writer);
 
-    let admin_denied = evaluate_repo_role_access(
+    let admin_denied = evaluate_subject_tenant_access(
         repo_id,
-        owner_tenant,
+        owner_ns,
         collab_writer,
         "bob",
-        Some(LfsCollaboratorRole::Write),
+        SubjectTenantAuthority::RepositoryCollaborator {
+            namespace_slug: "acme".into(),
+            role: LfsCollaboratorRole::Write,
+        },
         true,
         true,
     )
     .unwrap_err();
     assert_eq!(admin_denied.code, LfsProofRejectCode::UnauthorizedCollaborator);
 
-    let read_write_denied = evaluate_repo_role_access(
+    let read_write_denied = evaluate_subject_tenant_access(
         repo_id,
-        owner_tenant,
+        owner_ns,
         collab_reader,
         "carol",
-        Some(LfsCollaboratorRole::Read),
+        SubjectTenantAuthority::RepositoryCollaborator {
+            namespace_slug: "acme".into(),
+            role: LfsCollaboratorRole::Read,
+        },
         true,
         false,
     )
     .unwrap_err();
     assert_eq!(read_write_denied.code, LfsProofRejectCode::UnauthorizedCollaborator);
 
-    let outsider_denied =
-        evaluate_repo_role_access(repo_id, owner_tenant, outsider, "mallory", None, false, false).unwrap_err();
-    assert_eq!(outsider_denied.code, LfsProofRejectCode::UnauthorizedCollaborator);
-
     let oid = "b2".repeat(32);
     let hold_id = Uuid::new_v4();
-    let loc = BlobLocator::new(owner_tenant, repo_id, 1, Uuid::new_v4(), "lfs-objects", &oid, 512).unwrap();
+    let loc = BlobLocator::new(owner_ns, repo_id, 1, Uuid::new_v4(), "lfs-objects", &oid, 512).unwrap();
     let src_rec = CommittedLfsBlobRecord {
-        tenant_id: owner_tenant,
+        tenant_id: owner_ns,
         repository_id: repo_id,
         oid_sha256: oid.clone(),
         size_bytes: 512,
@@ -133,7 +184,7 @@ fn cross_owner_collaborator_and_shared_hold_authorization_never_assume_caller_is
     let target_repo = Uuid::new_v4();
     let mut grant = SharedLfsHoldGrant {
         grant_id: Uuid::new_v4(),
-        source_tenant_id: owner_tenant,
+        source_tenant_id: owner_ns,
         source_repository_id: repo_id,
         target_tenant_id: target_tenant,
         target_repository_id: target_repo,
@@ -156,11 +207,21 @@ fn cross_owner_collaborator_and_shared_hold_authorization_never_assume_caller_is
 }
 
 #[test]
-fn attestation_digest_locator_roundtrip_and_auth_headers_are_deterministic() {
+fn stable_operation_id_headers_and_attestation_digest_are_deterministic() {
+    let mut hdrs = HeaderMap::new();
+    hdrs.insert("X-Rootyard-Operation-Id", "op-retry-token-42".parse().unwrap());
+    let op1 = extract_stable_operation_id(&hdrs).unwrap().unwrap();
+    assert_eq!(op1, operation_token_to_uuid("op-retry-token-42").unwrap());
+
+    hdrs.insert("Idempotency-Key", "op-retry-token-42".parse().unwrap());
+    assert_eq!(extract_stable_operation_id(&hdrs).unwrap(), Some(op1));
+
+    hdrs.insert("Idempotency-Key", "conflicting-token-99".parse().unwrap());
+    assert_eq!(extract_stable_operation_id(&hdrs).unwrap_err().code, LfsProofRejectCode::AttestationEquivocation);
+
     let tenant = Uuid::new_v4();
     let repo = Uuid::new_v4();
     let actor = Uuid::new_v4();
-    let op_id = Uuid::new_v4();
     let oid = "d4".repeat(32);
     let loc = BlobLocator::new(tenant, repo, 1, Uuid::new_v4(), "lfs-objects", &oid, 2048).unwrap();
     let stored = StoredBlobLocatorRef::from_locator(&loc);
@@ -192,7 +253,7 @@ fn attestation_digest_locator_roundtrip_and_auth_headers_are_deterministic() {
         receipt_digest: rcpt_digest,
     };
     let proof_digest = compute_attestation_digest(
-        op_id,
+        op1,
         tenant,
         repo,
         actor,
@@ -202,7 +263,7 @@ fn attestation_digest_locator_roundtrip_and_auth_headers_are_deterministic() {
     );
     let mut att = LfsPointerAttestation {
         attestation_id: Uuid::new_v4(),
-        operation_id: op_id,
+        operation_id: op1,
         tenant_id: tenant,
         repository_id: repo,
         actor_id: actor,
@@ -215,14 +276,6 @@ fn attestation_digest_locator_roundtrip_and_auth_headers_are_deterministic() {
     att.verify_integrity().unwrap();
     att.pointers[0].size_bytes = 9999;
     assert_eq!(att.verify_integrity().unwrap_err().code, LfsProofRejectCode::AttestationEquivocation);
-
-    let missing_auth = extract_credentials_header(&HeaderMap::new()).unwrap_err();
-    assert_eq!(missing_auth.code, LfsProofRejectCode::Unauthenticated);
-    assert_eq!(missing_auth.code.http_status().as_u16(), 401);
-    let mut hdrs = HeaderMap::new();
-    let encoded = BASE64.encode("bob:secret-token-123");
-    hdrs.insert(header::AUTHORIZATION, format!("Basic {encoded}").parse().unwrap());
-    assert_eq!(extract_credentials_header(&hdrs).unwrap(), ("bob".into(), "secret-token-123".into()));
 
     assert!(valid_lfs_lock_path("assets/model.bin"));
     assert!(!valid_lfs_lock_path("/abs/model.bin"));

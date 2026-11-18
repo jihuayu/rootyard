@@ -6,8 +6,7 @@ on:
     paths:
       - '.github/workflows/lfs-blob-proof.yml'
       - 'src/lfs.rs'
-      - 'src/lfs/blob_proof_publication.rs'
-      - 'src/lfs/blob_proof_publication/**'
+      - 'src/lfs/**'
       - 'tests/lfs_blob_proof_publication.rs'
       - 'tests/lfs_blob_proof_support/**'
       - 'scripts/eval_lfs_blob_proof.py'

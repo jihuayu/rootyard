@@ -21,6 +21,11 @@ class LfsBlobProofContractTests(unittest.TestCase):
         return sorted(
             [
                 ROOT / "src" / "lfs.rs",
+                ROOT / "src" / "lfs" / "routes.rs",
+                ROOT / "src" / "lfs" / "handlers.rs",
+                ROOT / "src" / "lfs" / "upload.rs",
+                ROOT / "src" / "lfs" / "locks.rs",
+                ROOT / "src" / "lfs" / "publication.rs",
                 FACADE,
                 *MOD_DIR.glob("*.rs"),
                 TEST_MAIN,
@@ -34,7 +39,9 @@ class LfsBlobProofContractTests(unittest.TestCase):
 
     def test_line_budgets_pure_lf_zero_mod_rs_and_zero_allow(self) -> None:
         owned = self._owned_files()
-        self.assertGreaterEqual(len(owned), 16)
+        self.assertGreaterEqual(len(owned), 20)
+        self.assertFalse((MOD_DIR / "http_router.rs").exists(), "parallel standalone router must not exist")
+        self.assertFalse((MOD_DIR / "git_smart_http.rs").exists(), "standalone git_smart_http in src must not exist")
         for path in owned:
             self.assertTrue(path.is_file(), f"missing owned file: {path}")
             raw = path.read_bytes()
@@ -64,6 +71,7 @@ class LfsBlobProofContractTests(unittest.TestCase):
 
     def test_domain_symbols_and_durability_contracts(self) -> None:
         combined = "\n".join(p.read_text(encoding="utf-8") for p in [FACADE, *sorted(MOD_DIR.glob("*.rs"))])
+        self.assertNotIn("actor_id == owner_tenant_id", combined)
         required = (
             "LfsBlobRuntimeGate",
             "LfsProofRejectCode",
@@ -80,6 +88,14 @@ class LfsBlobProofContractTests(unittest.TestCase):
             "DeleteDisabledByPolicy",
             "LfsPointerAttestation",
             "SharedLfsHoldGrant",
+            "SubjectTenantAuthority",
+            "evaluate_subject_tenant_access",
+            "resolve_authoritative_repo_access",
+            "verify_committed_locator_bytes",
+            "extract_stable_operation_id",
+            "lfs_blob_upload_operations",
+            "prod_validate_and_attest_push",
+            "with_push_attestation_session",
             "ProtectedUploader",
             "PgArtifactHoldStore",
             "lfs_blob_objects_immutable_trig",
@@ -90,6 +106,10 @@ class LfsBlobProofContractTests(unittest.TestCase):
         for token in required:
             with self.subTest(token=token):
                 self.assertIn(token, combined)
+
+        test_router_src = (TEST_SUPPORT / "git_smart_http.rs").read_text(encoding="utf-8")
+        self.assertIn("rootyard::lfs::routes()", test_router_src)
+        self.assertIn("rootyard::lfs::publication::validate_new_refs_with_client", test_router_src)
 
     def test_workflow_and_doc_contracts(self) -> None:
         wf = WORKFLOW.read_text(encoding="utf-8")

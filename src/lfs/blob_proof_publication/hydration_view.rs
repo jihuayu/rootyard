@@ -1,8 +1,9 @@
-//! Remote-Blob resolution, policy-gated retirement, and clean compute-view hydration (`Refs #145`).
+//! Remote-Blob locator readback verification, policy-gated retirement, and compute hydration (`Refs #145`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant as StdInstant;
 
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use uuid::Uuid;
 
@@ -18,6 +19,14 @@ use super::types::{
     inspect_candidate_lfs_pointer,
 };
 
+pub(super) struct EphemeralScratchGuard(pub PathBuf);
+
+impl Drop for EphemeralScratchGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComputeViewHydrationReport {
     pub commit_oid: String,
@@ -25,86 +34,26 @@ pub struct ComputeViewHydrationReport {
     pub total_hydrated_bytes: u64,
 }
 
-/// Resolves an LFS object record and proves live byte presence on the remote OpenDAL `BlobStore`
-/// (either directly owned by `realm` or authorized via an active cross-owner `SharedLfsHoldGrant`).
-pub async fn resolve_and_verify_remote_blob(
+/// Verifies the **final persisted remote `BlobLocator`** via both `BlobStore::verify_receipt`
+/// and full streamed provider byte read-back (`get_to_file` + SHA-256 + byte length).
+/// Guarantees no upload, retry, Batch skip, or push attestation ever ACKs a missing or corrupt locator.
+pub async fn verify_committed_locator_bytes(
     store: &BlobStore,
-    pg: &PgLfsBlobStore,
-    realm: &LfsRepoRealm,
-    actor_id: Uuid,
-    oid_sha256: &str,
+    scratch_dir: &Path,
+    rec: &CommittedLfsBlobRecord,
+    expected_oid: &str,
     expected_size: i64,
     deadline: StdInstant,
-) -> Result<(CommittedLfsBlobRecord, PointerResolutionSource, BlobReceipt), LfsBlobError> {
-    if !valid_lfs_oid(oid_sha256) || expected_size < 0 {
-        return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "invalid LFS OID or negative size"));
+) -> Result<BlobReceipt, LfsBlobError> {
+    if rec.retired {
+        return Err(LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "LFS object has been retired"));
     }
-    let (rec, source) =
-        if let Some(own) = pg.load_committed_blob(realm.owner_tenant_id, realm.repository_id, oid_sha256).await? {
-            if own.retired {
-                return Err(LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "LFS object has been retired"));
-            }
-            if own.size_bytes != expected_size {
-                return Err(LfsBlobError::new(
-                    LfsProofRejectCode::SizeOrDigestMismatch,
-                    format!("LFS size mismatch: pointer expects {expected_size}, committed is {}", own.size_bytes),
-                ));
-            }
-            (own, PointerResolutionSource::RepositoryBlob)
-        } else {
-            let candidates =
-                pg.find_shared_holds_for_target(realm.owner_tenant_id, realm.repository_id, oid_sha256).await?;
-            if candidates.is_empty() {
-                return Err(LfsBlobError::new(
-                    LfsProofRejectCode::MissingRemoteBlob,
-                    format!("LFS object {oid_sha256} is absent from remote repository inventory"),
-                ));
-            }
-            let mut matched = None;
-            let mut last_err = None;
-            for grant in candidates {
-                let Some(src_rec) =
-                    pg.load_committed_blob(grant.source_tenant_id, grant.source_repository_id, oid_sha256).await?
-                else {
-                    last_err = Some(LfsBlobError::new(
-                        LfsProofRejectCode::UnauthorizedSharedHold,
-                        "shared hold source object missing",
-                    ));
-                    continue;
-                };
-                match verify_shared_hold_grant(
-                    &grant,
-                    &src_rec,
-                    realm.owner_tenant_id,
-                    realm.repository_id,
-                    actor_id,
-                    oid_sha256,
-                    expected_size,
-                ) {
-                    Ok(()) => {
-                        matched = Some((
-                            src_rec,
-                            PointerResolutionSource::SharedHold {
-                                grant_id: grant.grant_id,
-                                source_tenant_id: grant.source_tenant_id,
-                                source_repository_id: grant.source_repository_id,
-                            },
-                        ));
-                        break;
-                    }
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            match matched {
-                Some(pair) => pair,
-                None => {
-                    return Err(last_err.unwrap_or_else(|| {
-                        LfsBlobError::new(LfsProofRejectCode::UnauthorizedSharedHold, "no valid shared hold grant")
-                    }));
-                }
-            }
-        };
-
+    if rec.oid_sha256 != expected_oid || rec.size_bytes != expected_size {
+        return Err(LfsBlobError::new(
+            LfsProofRejectCode::SizeOrDigestMismatch,
+            format!("LFS metadata mismatch: expected ({expected_oid}, {expected_size}), got ({}, {})", rec.oid_sha256, rec.size_bytes),
+        ));
+    }
     if rec.backend_identity_hex != store.backend_identity().as_hex() {
         return Err(LfsBlobError::new(
             LfsProofRejectCode::ForeignBackendMismatch,
@@ -113,7 +62,7 @@ pub async fn resolve_and_verify_remote_blob(
     }
     let locator = rec.locator.to_locator()?;
     let receipt = store
-        .verify_receipt(&locator, oid_sha256, expected_size as u64, deadline)
+        .verify_receipt(&locator, expected_oid, expected_size as u64, deadline)
         .await
         .map_err(LfsBlobError::from_blob_error)?;
     if receipt.backend_identity().as_hex() != store.backend_identity().as_hex() {
@@ -122,6 +71,105 @@ pub async fn resolve_and_verify_remote_blob(
             "verified receipt backend identity mismatch",
         ));
     }
+    fs::create_dir_all(scratch_dir)
+        .await
+        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    let verify_tmp = scratch_dir.join(format!(".lfs-readback-{}.tmp", Uuid::new_v4()));
+    let _guard = EphemeralScratchGuard(verify_tmp.clone());
+    store.get_to_file(&locator, &verify_tmp, deadline).await.map_err(LfsBlobError::from_blob_error)?;
+    let bytes = fs::read(&verify_tmp)
+        .await
+        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    if bytes.len() as i64 != expected_size || hex::encode(Sha256::digest(&bytes)) != expected_oid {
+        return Err(LfsBlobError::new(
+            LfsProofRejectCode::SizeOrDigestMismatch,
+            "remote BlobLocator read-back SHA-256 or byte length mismatch",
+        ));
+    }
+    Ok(receipt)
+}
+
+/// Resolves an LFS object record and proves live byte integrity on its final `BlobLocator`
+/// (either owned by `realm` or authorized via an active cross-owner `SharedLfsHoldGrant`).
+pub async fn resolve_and_verify_remote_blob(
+    ctx: &LfsTransferContext<'_>,
+    oid_sha256: &str,
+    expected_size: i64,
+    deadline: StdInstant,
+) -> Result<(CommittedLfsBlobRecord, PointerResolutionSource, BlobReceipt), LfsBlobError> {
+    let store = ctx.gate.require_store()?;
+    if !valid_lfs_oid(oid_sha256) || expected_size < 0 {
+        return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "invalid LFS OID or negative size"));
+    }
+    let (rec, source) = if let Some(own) =
+        ctx.pg.load_committed_blob(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256).await?
+    {
+        if own.retired {
+            return Err(LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "LFS object has been retired"));
+        }
+        if own.size_bytes != expected_size {
+            return Err(LfsBlobError::new(
+                LfsProofRejectCode::SizeOrDigestMismatch,
+                format!("LFS size mismatch: pointer expects {expected_size}, committed is {}", own.size_bytes),
+            ));
+        }
+        (own, PointerResolutionSource::RepositoryBlob)
+    } else {
+        let candidates =
+            ctx.pg.find_shared_holds_for_target(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256).await?;
+        if candidates.is_empty() {
+            return Err(LfsBlobError::new(
+                LfsProofRejectCode::MissingRemoteBlob,
+                format!("LFS object {oid_sha256} is absent from remote repository inventory"),
+            ));
+        }
+        let mut matched = None;
+        let mut last_err = None;
+        for grant in candidates {
+            let Some(src_rec) =
+                ctx.pg.load_committed_blob(grant.source_tenant_id, grant.source_repository_id, oid_sha256).await?
+            else {
+                last_err = Some(LfsBlobError::new(
+                    LfsProofRejectCode::UnauthorizedSharedHold,
+                    "shared hold source object missing",
+                ));
+                continue;
+            };
+            match verify_shared_hold_grant(
+                &grant,
+                &src_rec,
+                ctx.realm.owner_tenant_id,
+                ctx.realm.repository_id,
+                ctx.access.actor_id,
+                oid_sha256,
+                expected_size,
+            ) {
+                Ok(()) => {
+                    matched = Some((
+                        src_rec,
+                        PointerResolutionSource::SharedHold {
+                            grant_id: grant.grant_id,
+                            source_tenant_id: grant.source_tenant_id,
+                            source_repository_id: grant.source_repository_id,
+                        },
+                    ));
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        match matched {
+            Some(pair) => pair,
+            None => {
+                return Err(last_err.unwrap_or_else(|| {
+                    LfsBlobError::new(LfsProofRejectCode::UnauthorizedSharedHold, "no valid shared hold grant")
+                }));
+            }
+        }
+    };
+
+    let receipt =
+        verify_committed_locator_bytes(store, ctx.scratch_dir, &rec, oid_sha256, expected_size, deadline).await?;
     Ok((rec, source, receipt))
 }
 
@@ -204,16 +252,7 @@ pub async fn hydrate_clean_compute_view(
             }
             PointerInspection::Valid(spec) => {
                 let dl = StdInstant::now() + ctx.timeout;
-                let (rec, _, _) = resolve_and_verify_remote_blob(
-                    store,
-                    ctx.pg,
-                    ctx.realm,
-                    ctx.access.actor_id,
-                    &spec.oid,
-                    spec.size,
-                    dl,
-                )
-                .await?;
+                let (rec, _, _) = resolve_and_verify_remote_blob(ctx, &spec.oid, spec.size, dl).await?;
                 let loc = rec.locator.to_locator()?;
                 store.get_to_file(&loc, &dest, dl).await.map_err(LfsBlobError::from_blob_error)?;
                 hydrated_files += 1;

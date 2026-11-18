@@ -131,7 +131,9 @@ impl std::error::Error for LfsBlobError {}
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LfsCollaboratorRole {
     Read,
+    Triage,
     Write,
+    Maintain,
     Admin,
 }
 
@@ -139,7 +141,9 @@ impl LfsCollaboratorRole {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Read => "read",
+            Self::Triage => "triage",
             Self::Write => "write",
+            Self::Maintain => "maintain",
             Self::Admin => "admin",
         }
     }
@@ -147,14 +151,16 @@ impl LfsCollaboratorRole {
     pub fn parse(raw: &str) -> Result<Self, LfsBlobError> {
         match raw {
             "read" => Ok(Self::Read),
+            "triage" => Ok(Self::Triage),
             "write" => Ok(Self::Write),
+            "maintain" => Ok(Self::Maintain),
             "admin" => Ok(Self::Admin),
             other => Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, format!("unknown LFS role `{other}`"))),
         }
     }
 
     pub const fn allows_write(self) -> bool {
-        matches!(self, Self::Write | Self::Admin)
+        matches!(self, Self::Write | Self::Maintain | Self::Admin)
     }
 
     pub const fn allows_admin(self) -> bool {
@@ -166,6 +172,7 @@ impl LfsCollaboratorRole {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LfsAccessMode {
     Owner,
+    OrganizationMember { organization_id: Uuid, role: LfsCollaboratorRole },
     Collaborator { role: LfsCollaboratorRole },
     SharedHoldGrant { grant_id: Uuid, source_tenant_id: Uuid, source_repository_id: Uuid },
 }

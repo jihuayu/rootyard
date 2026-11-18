@@ -1,4 +1,4 @@
-//! Fail-closed OpenDAL Blob startup/request gate and cross-owner / shared-hold authz (`Refs #145`).
+//! Fail-closed OpenDAL Blob gate and authoritative subject/tenant/shared-hold authz (`Refs #145`).
 
 use std::sync::Arc;
 
@@ -12,6 +12,8 @@ use crate::blob_store::{config::BlobProfile, opendal::BlobStore};
 use super::types::{
     CommittedLfsBlobRecord, LfsAccessMode, LfsBlobError, LfsCollaboratorRole, LfsProofRejectCode, SharedLfsHoldGrant,
 };
+
+const IDEMPOTENCY_OP_DOMAIN: &[u8] = b"rootyard/lfs/idempotency-op/v1:";
 
 /// Startup & request gate guaranteeing LFS never operates without an explicit remote OpenDAL `BlobStore`.
 #[derive(Clone)]
@@ -40,8 +42,23 @@ impl LfsBlobRuntimeGate {
         Self::Configured(Arc::new(store))
     }
 
-    /// Strict startup constructor reading `ROOTYARD_BLOB_*` environment settings.
-    /// Refuses missing, local-fs, memory, or invalid configurations fail-closed.
+    /// Returns `true` when S4 remote-Blob-only LFS mode is enabled on the server process.
+    pub fn blob_mode_requested() -> bool {
+        std::env::var("ROOTYARD_LFS_BLOB_ONLY")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "required" | "opendal"))
+            || std::env::var_os("ROOTYARD_BLOB_DRIVER").is_some()
+    }
+
+    /// Opens the remote OpenDAL `BlobStore` from environment variables, converting missing or
+    /// local/memory configurations into a fail-closed `Unconfigured` gate rather than panicking.
+    pub fn from_env_gate() -> Self {
+        match Self::open_from_env() {
+            Ok(gate) => gate,
+            Err(err) => Self::Unconfigured { reason: err.message },
+        }
+    }
+
     pub fn open_from_env() -> Result<Self, LfsBlobError> {
         let profile = BlobProfile::from_env().map_err(LfsBlobError::from_blob_error)?;
         Self::open_profile(profile)
@@ -65,17 +82,16 @@ impl LfsBlobRuntimeGate {
     }
 }
 
+/// Authoritative subject-to-tenant/repository relationship resolved from PostgreSQL
+/// (`namespaces`, `users`, `organizations`, `organization_memberships`, `organization_teams`,
+/// `repository_collaborators`, and `repository_teams` under `FOR SHARE`).
+/// Never inferred by comparing two raw caller and tenant UUIDs directly.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LfsPrincipal {
-    pub actor_id: Uuid,
-    pub username: String,
-    pub secret_sha256: String,
-}
-
-impl LfsPrincipal {
-    pub fn hash_secret(secret: &str) -> String {
-        hex::encode(Sha256::digest(secret.as_bytes()))
-    }
+pub enum SubjectTenantAuthority {
+    PersonalNamespaceOwner { namespace_id: Uuid, namespace_slug: String },
+    OrganizationMember { organization_id: Uuid, namespace_slug: String, role: LfsCollaboratorRole },
+    RepositoryCollaborator { namespace_slug: String, role: LfsCollaboratorRole },
+    Unrelated,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,28 +110,42 @@ impl AuthorizedRepoAccess {
     }
 }
 
-/// Evaluates repository access without assuming `actor_id == owner_tenant_id`.
-pub fn evaluate_repo_role_access(
+/// Evaluates repository access strictly from the authoritative PostgreSQL [`SubjectTenantAuthority`]
+/// relationship — never comparing raw caller and tenant UUIDs directly.
+pub fn evaluate_subject_tenant_access(
     repository_id: Uuid,
     owner_tenant_id: Uuid,
     actor_id: Uuid,
     actor_username: &str,
-    collaborator_role: Option<LfsCollaboratorRole>,
+    authority: SubjectTenantAuthority,
     require_write: bool,
     require_admin: bool,
 ) -> Result<AuthorizedRepoAccess, LfsBlobError> {
     if repository_id.is_nil() || owner_tenant_id.is_nil() || actor_id.is_nil() {
         return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "nil repository, tenant, or actor UUID"));
     }
-    let (role, mode) = if actor_id == owner_tenant_id {
-        (LfsCollaboratorRole::Admin, LfsAccessMode::Owner)
-    } else if let Some(granted) = collaborator_role {
-        (granted, LfsAccessMode::Collaborator { role: granted })
-    } else {
-        return Err(LfsBlobError::new(
-            LfsProofRejectCode::UnauthorizedCollaborator,
-            format!("actor `{actor_username}` ({actor_id}) is neither owner nor collaborator on repo {repository_id}"),
-        ));
+    let (role, mode) = match authority {
+        SubjectTenantAuthority::PersonalNamespaceOwner { namespace_id, .. } => {
+            if namespace_id != owner_tenant_id {
+                return Err(LfsBlobError::new(
+                    LfsProofRejectCode::UnauthorizedCollaborator,
+                    "personal namespace authority row does not match repository owner namespace",
+                ));
+            }
+            (LfsCollaboratorRole::Admin, LfsAccessMode::Owner)
+        }
+        SubjectTenantAuthority::OrganizationMember { organization_id, role, .. } => {
+            (role, LfsAccessMode::OrganizationMember { organization_id, role })
+        }
+        SubjectTenantAuthority::RepositoryCollaborator { role, .. } => {
+            (role, LfsAccessMode::Collaborator { role })
+        }
+        SubjectTenantAuthority::Unrelated => {
+            return Err(LfsBlobError::new(
+                LfsProofRejectCode::UnauthorizedCollaborator,
+                format!("actor `{actor_username}` has no authoritative namespace/org/repo grant on {repository_id}"),
+            ));
+        }
     };
 
     if require_admin && !role.allows_admin() {
@@ -127,7 +157,7 @@ pub fn evaluate_repo_role_access(
     if require_write && !role.allows_write() {
         return Err(LfsBlobError::new(
             LfsProofRejectCode::UnauthorizedCollaborator,
-            format!("actor `{actor_username}` has read-only role and cannot write/lock/push repository {repository_id}"),
+            format!("actor `{actor_username}` lacks write permission on repository {repository_id}"),
         ));
     }
 
@@ -190,7 +220,59 @@ pub fn verify_shared_hold_grant(
     Ok(())
 }
 
-/// Parses HTTP `Authorization` header (`Basic base64(user:secret)` or `Bearer user:secret`).
+/// Deterministically maps an `X-Rootyard-Operation-Id` or `Idempotency-Key` header into a non-nil
+/// operation [`Uuid`], rejecting conflicting duplicate headers.
+pub fn extract_stable_operation_id(headers: &HeaderMap) -> Result<Option<Uuid>, LfsBlobError> {
+    let mut chosen: Option<String> = None;
+    for hdr_name in ["x-rootyard-operation-id", "idempotency-key"] {
+        for val in headers.get_all(hdr_name) {
+            let text = val
+                .to_str()
+                .map_err(|_| LfsBlobError::new(LfsProofRejectCode::InvalidInput, "non-ASCII operation header"))?
+                .trim();
+            if text.is_empty() || text.len() > 128 {
+                return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "invalid operation header length"));
+            }
+            if let Some(prev) = &chosen {
+                if prev != text {
+                    return Err(LfsBlobError::new(
+                        LfsProofRejectCode::AttestationEquivocation,
+                        "conflicting operation identity headers on same request",
+                    ));
+                }
+            } else {
+                chosen = Some(text.to_owned());
+            }
+        }
+    }
+    let Some(token) = chosen else {
+        return Ok(None);
+    };
+    Ok(Some(operation_token_to_uuid(&token)?))
+}
+
+pub fn operation_token_to_uuid(token: &str) -> Result<Uuid, LfsBlobError> {
+    if let Ok(parsed) = Uuid::parse_str(token) {
+        if parsed.is_nil() {
+            return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "nil operation UUID forbidden"));
+        }
+        return Ok(parsed);
+    }
+    if !token.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-')) {
+        return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "unsafe characters in operation key"));
+    }
+    let mut h = Sha256::new();
+    h.update(IDEMPOTENCY_OP_DOMAIN);
+    h.update(token.as_bytes());
+    let digest = h.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(Uuid::from_bytes(bytes))
+}
+
+/// Parses HTTP `Authorization` header (`Basic base64(user:secret)` or `Bearer secret`).
 pub fn extract_credentials_header(headers: &HeaderMap) -> Result<(String, String), LfsBlobError> {
     let raw = headers
         .get(header::AUTHORIZATION)
@@ -211,14 +293,16 @@ pub fn extract_credentials_header(headers: &HeaderMap) -> Result<(String, String
         return Ok((user.to_owned(), secret.to_owned()));
     }
     if let Some(tok) = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer ")) {
-        let (user, secret) = tok
-            .trim()
-            .split_once(':')
-            .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "Bearer token must be user:secret"))?;
-        if user.is_empty() || secret.is_empty() {
-            return Err(LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "empty Bearer user or token"));
+        let trimmed = tok.trim();
+        if let Some((user, secret)) = trimmed.split_once(':') {
+            if user.is_empty() || secret.is_empty() {
+                return Err(LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "empty Bearer user or token"));
+            }
+            return Ok((user.to_owned(), secret.to_owned()));
         }
-        return Ok((user.to_owned(), secret.to_owned()));
+        if !trimmed.is_empty() {
+            return Ok((String::new(), trimmed.to_owned()));
+        }
     }
     Err(LfsBlobError::new(LfsProofRejectCode::Unauthenticated, "unsupported Authorization scheme"))
 }
