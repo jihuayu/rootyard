@@ -2104,8 +2104,17 @@ jobs:
           fi
           # Run every case; capture the pipeline status so evidence is saved before failing.
           if python3 - "$lib" "$evidence" <<'PY' 2>&1 | tee "$evidence/cases.log"
-          import json, os, pathlib, re, subprocess, sys
+          import contextlib, json, os, pathlib, re, subprocess, sys, tempfile
           lib, evidence = sys.argv[1], pathlib.Path(sys.argv[2])
+          phase_marker_env = 'ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKER'
+          os.environ.pop(phase_marker_env, None)
+          phase_case_name = (
+              'blob_git_gateway::admission_race_acceptance::pre_admission_revision_mismatch_rebases_to_old_oid_mismatch')
+          failure_phases = {phase.encode('ascii'): phase for phase in (
+              'fixture_setup', 'repository_seed', 'pre_admission_barrier', 'winner_publish',
+              'loser_rebase', 'http_report_assertions', 'durable_state_assertions', 'fixture_cleanup',
+          )}
+          phase_read_limit = max(map(len, failure_phases)) + 1
           secret_env = ('ROOTYARD_OBJECT_STORE_ACCESS_KEY', 'ROOTYARD_OBJECT_STORE_SECRET_KEY',
                         'ROOTYARD_BLOB_ACCESS_KEY_ID', 'ROOTYARD_BLOB_SECRET_ACCESS_KEY')
           secrets = sorted({os.environ.get(key) or '' for key in secret_env}, key=len, reverse=True)
@@ -2148,14 +2157,42 @@ jobs:
           def save(path, text):
               path.write_text(sanitize(text))
 
+          def run_case18(command):
+              phase = 'unknown'
+              env = os.environ.copy()
+              marker = None
+              with contextlib.ExitStack() as stack:
+                  try:
+                      directory = stack.enter_context(tempfile.TemporaryDirectory(
+                          prefix='session174-case18-', dir=os.environ.get('RUNNER_TEMP'),
+                          ignore_cleanup_errors=True))
+                      marker = pathlib.Path(directory) / 'phase'
+                      env[phase_marker_env] = str(marker)
+                  except OSError:
+                      pass
+                  process = subprocess.run(command, text=True, capture_output=True, env=env)
+                  if process.returncode > 0 and marker is not None:
+                      try:
+                          if not marker.is_symlink() and marker.is_file():
+                              with marker.open('rb') as stream:
+                                  phase = failure_phases.get(stream.read(phase_read_limit), 'unknown')
+                      except OSError:
+                          pass
+              return process, phase
+
           results = []
           for index, name in enumerate(names, 1):
               log = evidence / ('case-' + str(index) + '.log')
               record = {'index': index, 'name': name, 'log': log.name, 'exit_code': None, 'errors': []}
               passed_count = failed_count = ignored_count = 0
+              diagnose_phase = index == 18 and name == phase_case_name
+              failure_phase = 'unknown'
               try:
                   command = [lib, '--ignored', '--exact', name, '--test-threads=1']
-                  process = subprocess.run(command, text=True, capture_output=True)
+                  if diagnose_phase:
+                      process, failure_phase = run_case18(command)
+                  else:
+                      process = subprocess.run(command, text=True, capture_output=True)
                   combined = process.stdout + process.stderr
                   record['exit_code'] = process.returncode
                   save(log, '$ libtest --ignored --exact ' + name + ' --test-threads=1\n'
@@ -2190,6 +2227,8 @@ jobs:
               record['failed'] = 1 if record['errors'] else max(failed_count, 1 if passed_count == 0 else 0)
               record['ignored'] = ignored_count
               record['result'] = 'passed' if not record['errors'] else 'failed'
+              if diagnose_phase and record['result'] == 'failed':
+                  record['failure_phase'] = failure_phase
               results.append(record)
               print('case ' + str(index) + ': ' + record['result'] + ' ' + name)
               for error in record['errors']:
