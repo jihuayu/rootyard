@@ -18,9 +18,10 @@
 //!
 //! A missing marker is a hard ownership refusal, not a skip. The restore case's
 //! rotation is safe only because that dedicated database is discarded whole.
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use tokio::{task::JoinHandle, time::Instant};
 
 use super::super::{read_session::AUTHORITY_CHANGED, state::ReadPause};
 use super::{
@@ -38,6 +39,88 @@ use crate::cache_wake::ServingCache;
 
 const OWNED_POSTGRES_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES";
 const OWNED_BLOB_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB";
+
+/// One finite deadline for the pause rendezvous and for reaping the selected
+/// request; no cleanup path sleeps or starts a second bounded wait.
+const PAUSED_REQUEST_LIMIT: Duration = Duration::from_secs(30);
+
+/// Owns one selected loopback request and the pause it may be waiting on.
+/// Normal success and every `?` path join or reap the task; dropping the guard
+/// is only a last-resort abort.
+struct PausedRequest<T> {
+    pause: Arc<ReadPause>,
+    task: Option<JoinHandle<Result<T>>>,
+}
+
+impl<T> PausedRequest<T> {
+    fn new(pause: Arc<ReadPause>, task: JoinHandle<Result<T>>) -> Self {
+        Self { pause, task: Some(task) }
+    }
+
+    async fn join(mut self, deadline: Instant) -> Result<T> {
+        self.pause.release();
+        let task = self.task.take().ok_or_else(|| anyhow!("selected paused request was already reaped"))?;
+        join_bounded(task, deadline).await
+    }
+
+    async fn reap(mut self, deadline: Instant) {
+        self.pause.release();
+        if let Some(task) = self.task.take() {
+            let _ = join_bounded(task, deadline).await;
+        }
+    }
+}
+
+impl<T> Drop for PausedRequest<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            // A panic or an unexpectedly missed branch must not leave the pause
+            // held. The normal branches above already released it.
+            self.pause.release();
+            task.abort();
+        }
+    }
+}
+
+async fn join_bounded<T>(mut task: JoinHandle<Result<T>>, deadline: Instant) -> Result<T> {
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(joined) => joined.context("paused cache-hit request task")?,
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Err(anyhow!("paused cache-hit request did not complete before its deadline"))
+        }
+    }
+}
+
+/// Run one exact-OID request that must reach the real cache-hit pause. The
+/// selected request is released and joined on success; every earlier error or
+/// timeout releases it and reaps it under the same deadline before returning
+/// the original error.
+async fn run_paused_request<T, F>(
+    pause: Arc<ReadPause>,
+    oid: String,
+    deadline: Instant,
+    request: F,
+    while_paused: impl Future<Output = Result<()>>,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    pause.target(oid);
+    let mut request = Some(PausedRequest::new(pause.clone(), tokio::spawn(request)));
+    let outcome = async {
+        pause.wait_reached(deadline).await?;
+        while_paused.await?;
+        request.take().ok_or_else(|| anyhow!("selected paused request was already reaped"))?.join(deadline).await
+    }
+    .await;
+    if let Some(request) = request.take() {
+        request.reap(deadline).await;
+    }
+    outcome
+}
 
 /// Attest that the caller owns one whole disposable database and Blob prefix.
 ///
@@ -131,23 +214,24 @@ async fn exact_commit_http_hit_still_enforces_final_live_authorization() -> Resu
         ensure!(warm.status == 200, "warm collaborator GET returned {}", warm.status);
         let before = gateway.cache_stats().ok_or_else(|| anyhow!("cache stats are absent"))?;
 
-        pause.target(oid.clone());
-        let task = {
-            let client = client.clone();
-            let url = url.clone();
-            let token = collaborator.token.clone();
-            tokio::spawn(async move { raw_get(&client, &url, &token, None).await })
-        };
-        pause.wait_reached().await;
-
-        // The request already passed open-time authorization and cache lookup.
-        // Revoke the live grant only now, before finalize's encoded-response
-        // revalidation, so this is a last-mile authorization fence, not a
-        // pre-lookup refusal.
-        remove_collaborator(&db, repo.gate.repository_id(), collaborator.identity.id).await?;
-        pause.release();
-
-        let denied = task.await.context("paused cache-hit request task")??;
+        let deadline = Instant::now() + PAUSED_REQUEST_LIMIT;
+        let denied = run_paused_request(
+            pause.clone(),
+            oid.clone(),
+            deadline,
+            {
+                let client = client.clone();
+                let url = url.clone();
+                let token = collaborator.token.clone();
+                async move { raw_get(&client, &url, &token, None).await }
+            },
+            // The request already passed open-time authorization and cache
+            // lookup. Revoke the live grant only now, before finalize's
+            // encoded-response revalidation, so this is a last-mile
+            // authorization fence, not a pre-lookup refusal.
+            remove_collaborator(&db, repo.gate.repository_id(), collaborator.identity.id),
+        )
+        .await?;
         ensure!(!status_succeeds(denied.status), "a revoked cache-hit grant still returned a success status");
         ensure!(is_denial(denied.status), "cache-hit final authorization refusal status was {}", denied.status);
         ensure_no_disclosure(&denied.body, &[oid.as_str(), PUSHED_REF], "cache-hit final authorization refusal")?;
@@ -181,33 +265,38 @@ async fn exact_commit_http_hit_still_enforces_restore_incarnation_fence() -> Res
         ensure!(warm.status == 200, "warm owner GET returned {}", warm.status);
         let before = gateway.cache_stats().ok_or_else(|| anyhow!("cache stats are absent"))?;
 
-        pause.target(oid.clone());
-        let task = {
-            let client = client.clone();
-            let url = url.clone();
-            let token = owner.token.clone();
-            tokio::spawn(async move { raw_get(&client, &url, &token, None).await })
-        };
-        pause.wait_reached().await;
-
-        // Rotate the cluster restore incarnation only after the request passed
-        // open-time capture and hit the immutable payload. Finalize's live
-        // lookup reads the rotated non-nil anchor and must refuse unconditionally.
-        let rotated: uuid::Uuid = db
-            .pool
-            .get()
-            .await?
-            .query_one(
-                "UPDATE public.cluster_authority SET incarnation = gen_random_uuid(), rotated_at = clock_timestamp() \
-                 WHERE singleton = true RETURNING incarnation",
-                &[],
-            )
-            .await?
-            .get(0);
-        ensure!(!rotated.is_nil(), "rotated public.cluster_authority incarnation must not be nil");
-        pause.release();
-
-        let denied = task.await.context("paused cache-hit restore request task")??;
+        let deadline = Instant::now() + PAUSED_REQUEST_LIMIT;
+        let denied = run_paused_request(
+            pause.clone(),
+            oid.clone(),
+            deadline,
+            {
+                let client = client.clone();
+                let url = url.clone();
+                let token = owner.token.clone();
+                async move { raw_get(&client, &url, &token, None).await }
+            },
+            async {
+                // Rotate the cluster restore incarnation only after the request
+                // passed open-time capture and hit the immutable payload.
+                // Finalize's live lookup reads the rotated non-nil anchor and
+                // must refuse unconditionally.
+                let rotated: uuid::Uuid = db
+                    .pool
+                    .get()
+                    .await?
+                    .query_one(
+                        "UPDATE public.cluster_authority SET incarnation = gen_random_uuid(), rotated_at = clock_timestamp() \
+                         WHERE singleton = true RETURNING incarnation",
+                        &[],
+                    )
+                    .await?
+                    .get(0);
+                ensure!(!rotated.is_nil(), "rotated public.cluster_authority incarnation must not be nil");
+                Ok(())
+            },
+        )
+        .await?;
         ensure!(denied.status == 503, "cache-hit restore fence expected 503, got {}", denied.status);
         ensure!(contains(&denied.body, AUTHORITY_CHANGED), "cache-hit restore refusal did not name the anchor change");
         ensure_no_disclosure(&denied.body, &[oid.as_str(), PUSHED_REF], "cache-hit restore refusal")?;

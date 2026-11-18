@@ -112,6 +112,23 @@ class BlobGatewayCommitCacheShapeTests(unittest.TestCase):
         ):
             self.assertIn(marker, native)
 
+    def test_paused_cache_request_is_released_reaped_and_never_panics(self):
+        state = source("src/blob_git_gateway/state.rs")
+        native = source("src/blob_git_gateway/session_http_acceptance/cache_tests.rs")
+        wait = body(
+            state,
+            "pub(crate) async fn wait_reached(&self, deadline: Instant)",
+            "/// Let the paused request",
+        )
+        self.assertIn("anyhow::Result<()>", wait)
+        self.assertIn("timeout_at", wait)
+        self.assertNotIn("panic!", wait)
+        self.assertIn("struct PausedRequest", native)
+        self.assertIn("async fn reap", native)
+        self.assertIn("task.abort()", native)
+        self.assertIn("let _ = task.await", native)
+        self.assertIn("PAUSED_REQUEST_LIMIT", native)
+
     def test_final_live_authorization_and_session_fence_is_unchanged(self):
         text = source("src/blob_git_gateway/browse/session.rs")
         finalize = body(text, "pub(crate) async fn finalize", "/// The session decision")

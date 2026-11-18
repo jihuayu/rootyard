@@ -347,11 +347,13 @@ impl ReadPause {
     }
 
     /// Wait until the selected exact-OID request reached the pre-finalize pause.
-    pub(crate) async fn wait_reached(&self) {
-        match tokio::time::timeout(Duration::from_secs(30), self.reached.notified()).await {
-            Ok(()) => {}
-            Err(_) => panic!("deterministic commit-finalize pause was not reached"),
-        }
+    /// The caller's one deadline bounds the wait; expiration is a normal error so
+    /// the fixture can still release, reap and finish the database.
+    pub(crate) async fn wait_reached(&self, deadline: Instant) -> anyhow::Result<()> {
+        tokio::time::timeout_at(deadline, self.reached.notified())
+            .await
+            .map(|_| ())
+            .map_err(|_| anyhow::anyhow!("deterministic commit-finalize pause was not reached"))
     }
 
     /// Let the paused request continue into response encoding and final fences.
