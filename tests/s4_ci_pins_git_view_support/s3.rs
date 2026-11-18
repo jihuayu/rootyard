@@ -28,7 +28,7 @@ fn parse_range(value: &str) -> Option<(usize, usize)> {
 }
 
 #[derive(Default)]
-struct State {
+struct S3State {
     objects: BTreeMap<String, Vec<u8>>,
 }
 
@@ -39,7 +39,7 @@ pub struct LoopbackS3 {
 
 impl LoopbackS3 {
     pub async fn start() -> Result<Self> {
-        let state = Arc::new(StdMutex::new(State::default()));
+        let state = Arc::new(StdMutex::new(S3State::default()));
         let app = Router::new().fallback(handle).with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
@@ -68,7 +68,7 @@ fn reply(status: StatusCode, body: Body, content_type: Option<&str>, length: Opt
 }
 
 async fn handle(
-    State(state): State<Arc<StdMutex<State>>>,
+    State(state): State<Arc<StdMutex<S3State>>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
