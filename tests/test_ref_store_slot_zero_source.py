@@ -362,8 +362,9 @@ class SlotZeroSourceTest(unittest.TestCase):
         # callsite must instead start the direct tokio-postgres transaction that
         # the admission and rollback APIs accept.
         self.assertNotIn('.transaction().await', self.tests)
-        self.assertEqual(self.tests.count('tokio_postgres::Client::transaction'), 19)
-        self.assertEqual(self.tests.count('tokio_postgres::Client::transaction(&mut client)'), 16)
+        self.assertNotIn('deadpool_postgres::Transaction', self.tests)
+        self.assertEqual(self.tests.count('tokio_postgres::Client::transaction'), 21)
+        self.assertEqual(self.tests.count('tokio_postgres::Client::transaction(&mut client)'), 18)
         self.assertIn('tokio_postgres::Client::transaction(&mut holder_client)', self.tests)
         self.assertIn('tokio_postgres::Client::transaction(&mut admission)', self.tests)
         self.assertIn('tokio_postgres::Client::transaction(&mut legacy_client)', self.tests)
@@ -379,6 +380,26 @@ class SlotZeroSourceTest(unittest.TestCase):
         self.assertIn('timeout(WAIT, admin.get())', setup)
         self.assertIn('admin_client.query_one("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)"', setup)
         self.assertIn('setup database absence query did not finish', setup)
+
+    def test_public_attempt_lookup_smoke_owns_exactly_two_direct_transactions(self):
+        smoke = self.tests.split(
+            'async fn slot_zero_public_attempt_lookup_is_exact_and_read_only()', 1
+        )[1].split('#[tokio::test]', 1)[0]
+        exact_call = 'let tx = tokio_postgres::Client::transaction(&mut client).await?;'
+        calls = [line.strip() for line in smoke.splitlines() if 'tokio_postgres::Client::transaction' in line]
+        self.assertEqual(calls, [exact_call, exact_call])
+        self.assertNotIn('.transaction().await', smoke)
+        self.assertNotIn('deadpool_postgres::Transaction', smoke)
+
+        admission, read_only = smoke.split(exact_call, 2)[1:]
+        self.assertIn('admit_slot_zero_in_tx(', admission)
+        self.assertIn('tx.commit().await?;', admission)
+        self.assertIn('SET TRANSACTION READ ONLY', read_only)
+        self.assertIn('SHOW transaction_read_only', read_only)
+        self.assertIn('PgRefStore.lookup_public_attempt(&tx', read_only)
+        self.assertIn('tx.rollback().await?;', read_only)
+        self.assertLess(read_only.index('SET TRANSACTION READ ONLY'), read_only.index('lookup_public_attempt(&tx'))
+        self.assertLess(read_only.index('SHOW transaction_read_only'), read_only.index('lookup_public_attempt(&tx'))
 
 
 if __name__ == '__main__':
