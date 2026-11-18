@@ -202,8 +202,11 @@ def case_wrong_key_ciphertext_envelope_and_provider_revocation(ctx):
         _require_db_unchanged(ctx, before_db)
         ciphertext_tamper_denied = True
     finally:
-        cipher_path.write_bytes(original)
-        cipher_path.chmod(mode)
+        cipher_path.chmod(0o600)
+        try:
+            cipher_path.write_bytes(original)
+        finally:
+            cipher_path.chmod(mode)
         ciphertext_restored = (sha256_bytes(cipher_path.read_bytes())
                                == manifest["ciphertext_sha256"])
     require(ciphertext_restored, "ciphertext_restore_failed", "ciphertext_tamper")

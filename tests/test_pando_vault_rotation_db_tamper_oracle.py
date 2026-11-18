@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 TESTS = Path(__file__).resolve().parent
 if str(TESTS) not in sys.path:
@@ -173,6 +175,60 @@ class DbEnvelopeFieldTamperTest(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_ciphertext_probe_restores_read_only_cas_before_db_tamper(self):
+        original = self.ctx.cipher(PACK)
+        cipher = (self.root / "ciphertext.pack").resolve()
+        cipher.write_bytes(original)
+        cipher.chmod(0o444)
+        digest = support.sha256_bytes(original)
+        self.ctx.record["ciphertext_sha256"] = digest
+        self.mirror.write_text(json.dumps(dict(full_mirror(), ciphertext_sha256=digest)))
+        self.ctx.manifest = mock.Mock(return_value=dict(
+            manifest_record(), pack_key=cipher.name, ciphertext_sha256=digest))
+        self.ctx.fixture = mock.Mock(wrong_key_name="wrong-key")
+        self.ctx.fixture.key_metadata.return_value = {"latest_version": 3}
+        self.ctx.fixture.create_wrong_key.return_value = {
+            "derived": True, "type": "aes256-gcm96"}
+        self.ctx.fixture.probe_scoped_key.return_value = {"encrypt_decrypt_rewrap": True}
+        self.ctx.fixture.environment.return_value = {"PANDO_KMS_VAULT_KEY": "wrong-key"}
+        self.ctx.cold_verify = mock.Mock()
+        self.ctx.cold_get = mock.Mock()
+        run_status = self.ctx.run_status
+        observations = []
+
+        def observe(args, env=None, stage="cli"):
+            if stage.startswith("ciphertext_tamper_"):
+                observations.append((stage, cipher.read_bytes(),
+                                     stat.S_IMODE(cipher.stat().st_mode)))
+            return run_status(args, env=env, stage=stage)
+
+        self.ctx.run_status = observe
+        original_write = Path.write_bytes
+        write_modes = []
+
+        def record_write(path, data):
+            if path == cipher:
+                write_modes.append(stat.S_IMODE(path.stat().st_mode))
+            return original_write(path, data)
+
+        stop = support.QualificationError("db_probe_reached", "test")
+        with (
+            mock.patch.object(Path, "write_bytes", autospec=True, side_effect=record_write),
+            mock.patch.object(negative, "probe_db_envelope_field_tamper", side_effect=stop),
+            self.assertRaises(support.QualificationError) as caught,
+        ):
+            negative.case_wrong_key_ciphertext_envelope_and_provider_revocation(self.ctx)
+
+        self.assertIs(caught.exception, stop)
+        tampered = original[:-1] + bytes([original[-1] ^ 0x55])
+        self.assertEqual(observations, [
+            ("ciphertext_tamper_verify", tampered, 0o444),
+            ("ciphertext_tamper_get", tampered, 0o444),
+        ])
+        self.assertEqual(write_modes, [0o600, 0o600])
+        self.assertEqual(cipher.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(cipher.stat().st_mode), 0o444)
 
     def test_mac_only_mutation_keeps_digest_and_runs_both_cold_cli_probes(self):
         self.assertTrue(negative.probe_db_envelope_field_tamper(
