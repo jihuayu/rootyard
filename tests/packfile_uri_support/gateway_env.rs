@@ -327,11 +327,14 @@ pub struct SecurityGateCheckCtx<'a> {
     pub offload: &'a GatewayPackfileOffload,
 }
 
+/// Synchronous stock `git` runner signature passed into security gate checks.
+pub type GitRunnerFn = fn(&[&str], Option<&Path>, Option<&[u8]>) -> Result<Vec<u8>>;
+
 /// Exercises unadvertised `want` rejection, unsupported/unknown v2 arg native fallback,
 /// and whole-pack closure isolation on multi-ref shared packs over production `blob_git_gateway`.
 pub async fn verify_production_gateway_security_gates(
     ctx: &SecurityGateCheckCtx<'_>,
-    git_fn: fn(&[&str], Option<&Path>, Option<&[u8]>) -> Result<Vec<u8>>,
+    git_fn: GitRunnerFn,
 ) -> Result<String> {
     let http = reqwest::Client::new();
     let up_url = format!("http://{}/git/{}/{}.git/git-upload-pack", ctx.off_addr, ctx.owner_user, ctx.repo_name);

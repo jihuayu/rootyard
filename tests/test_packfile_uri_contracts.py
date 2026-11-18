@@ -91,6 +91,12 @@ class PackfileUriContractsTest(unittest.TestCase):
         pf_txt = (MOD_DIR / "preflight_guard.rs").read_text("utf-8")
         self.assertIn("impl Drop for PreflightSessionGuard", pf_txt)
         self.assertIn("impl Drop for StagedPinBatchGuard", pf_txt)
+        bij_txt = (MOD_DIR / "pack_bijection.rs").read_text("utf-8")
+        self.assertIn("verify_raw_pack_stream_bijection", bij_txt)
+        self.assertIn("index-pack", bij_txt)
+        bridge_txt = (MOD_DIR / "gateway_bridge.rs").read_text("utf-8")
+        self.assertIn("try_serve_upload_pack_v2_with_guard", bridge_txt)
+        self.assertIn("is_v2_fetch_command_request", bridge_txt)
         delivery_txt = (MOD_DIR / "delivery.rs").read_text("utf-8")
         self.assertIn("Body::from_stream", delivery_txt)
 

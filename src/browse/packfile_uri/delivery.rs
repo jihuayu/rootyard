@@ -75,7 +75,7 @@ pub struct PackHttpServerState {
     pub authorizer: Arc<dyn LivePackReadAuthorizer>,
     packs: RwLock<BoundedPackStore>,
     pub max_cached_packs: usize,
-    pub max_cached_bytes: u64,
+    pub max_cached_bytes: AtomicU64,
     pub inflight_limiter: Arc<Semaphore>,
     pub inflight_bytes: Arc<InflightBytesLimiter>,
     pub clock_unix: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -102,7 +102,7 @@ impl PackHttpServerState {
             authorizer,
             packs: RwLock::new(BoundedPackStore::default()),
             max_cached_packs: DEFAULT_MAX_CACHED_PACKS,
-            max_cached_bytes: max_bytes,
+            max_cached_bytes: AtomicU64::new(max_bytes),
             inflight_limiter: Arc::new(Semaphore::new(inflight_downloads)),
             inflight_bytes: Arc::new(InflightBytesLimiter::new(max_bytes)),
             clock_unix,
@@ -116,33 +116,58 @@ impl PackHttpServerState {
     }
 
     pub fn set_policy(&self, updated: OffloadPolicyConfig) {
+        let cap = updated.max_inflight_bytes.max(1);
+        self.max_cached_bytes.store(cap, Ordering::Release);
+        self.inflight_bytes.set_max_bytes(cap);
         *self.policy.write().unwrap_or_else(|p| p.into_inner()) = updated;
     }
 
     pub fn insert_pack(&self, meta: PackStreamMeta) -> Result<(), PackfileUriError> {
-        meta.validate_bytes()?;
-        let new_len = meta.payload.len() as u64;
-        let key = scoped_pack_key(meta.tenant_id, meta.repository_id, &meta.pack_oid);
+        self.insert_packs_atomic(vec![meta])
+    }
+
+    pub fn insert_packs_atomic(&self, batch: Vec<PackStreamMeta>) -> Result<(), PackfileUriError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut dedup: HashMap<String, PackStreamMeta> = HashMap::with_capacity(batch.len());
+        for meta in batch {
+            meta.validate_bytes()?;
+            let key = scoped_pack_key(meta.tenant_id, meta.repository_id, &meta.pack_oid);
+            dedup.insert(key, meta);
+        }
+        let max_bytes = self.max_cached_bytes.load(Ordering::Acquire);
         let mut guard = self.packs.write().unwrap_or_else(|p| p.into_inner());
-        let replaced_len = guard.entries.get(&key).map_or(0, |old| old.payload.len() as u64);
-        let is_new = !guard.entries.contains_key(&key);
-        let projected = guard.total_bytes.saturating_sub(replaced_len).saturating_add(new_len);
-        if (is_new && guard.entries.len() >= self.max_cached_packs) || projected > self.max_cached_bytes {
+        let calc_projection = |store: &BoundedPackStore| -> (usize, u64) {
+            let mut count = store.entries.len();
+            let mut bytes = store.total_bytes;
+            for (k, m) in &dedup {
+                let new_len = m.payload.len() as u64;
+                if let Some(old) = store.entries.get(k) {
+                    bytes = bytes.saturating_sub(old.payload.len() as u64).saturating_add(new_len);
+                } else {
+                    count += 1;
+                    bytes = bytes.saturating_add(new_len);
+                }
+            }
+            (count, bytes)
+        };
+        let (proj_cnt, proj_bytes) = calc_projection(&guard);
+        if proj_cnt > self.max_cached_packs || proj_bytes > max_bytes {
             let now = (self.clock_unix)();
             guard.entries.retain(|_, existing| {
                 !self.leases.can_sweep_pack(existing.tenant_id, existing.repository_id, &existing.pack_oid, now)
             });
             guard.total_bytes = guard.entries.values().map(|e| e.payload.len() as u64).sum();
         }
-        let replaced_after = guard.entries.get(&key).map_or(0, |old| old.payload.len() as u64);
-        let projected_after = guard.total_bytes.saturating_sub(replaced_after).saturating_add(new_len);
-        if (!guard.entries.contains_key(&key) && guard.entries.len() >= self.max_cached_packs)
-            || projected_after > self.max_cached_bytes
-        {
+        let (after_cnt, after_bytes) = calc_projection(&guard);
+        if after_cnt > self.max_cached_packs || after_bytes > max_bytes {
             return Err(PackfileUriError::CapacityExceeded("pack store capacity exceeded".to_owned()));
         }
-        guard.total_bytes = projected_after;
-        guard.entries.insert(key, meta);
+        for (k, m) in dedup {
+            guard.entries.insert(k, m);
+        }
+        guard.total_bytes = after_bytes;
         Ok(())
     }
 
@@ -439,21 +464,13 @@ fn extract_inbound_authority(
 }
 
 fn extract_optional_subject_headers(headers: &HeaderMap) -> Result<Option<DownloadSubjectContext>, PackfileUriError> {
-    let a = headers.get("x-rootyard-actor");
-    let t = headers.get("x-rootyard-token-id");
-    let e = headers.get("x-rootyard-auth-epoch");
-    match (a, t, e) {
+    let hdr_str = |k| headers.get(k).map(|v| v.to_str().map_err(|_| PackfileUriError::Unauthorized)).transpose();
+    match (hdr_str("x-rootyard-actor")?, hdr_str("x-rootyard-token-id")?, hdr_str("x-rootyard-auth-epoch")?) {
         (None, None, None) => Ok(None),
         (Some(av), Some(tv), Some(ev)) => {
-            let actor = Uuid::parse_str(av.to_str().map_err(|_| PackfileUriError::Unauthorized)?)
-                .map_err(|_| PackfileUriError::Unauthorized)?;
-            let tok = Uuid::parse_str(tv.to_str().map_err(|_| PackfileUriError::Unauthorized)?)
-                .map_err(|_| PackfileUriError::Unauthorized)?;
-            let ep = ev
-                .to_str()
-                .map_err(|_| PackfileUriError::Unauthorized)?
-                .parse::<u64>()
-                .map_err(|_| PackfileUriError::Unauthorized)?;
+            let actor = Uuid::parse_str(av).map_err(|_| PackfileUriError::Unauthorized)?;
+            let tok = Uuid::parse_str(tv).map_err(|_| PackfileUriError::Unauthorized)?;
+            let ep = ev.parse::<u64>().map_err(|_| PackfileUriError::Unauthorized)?;
             Ok(Some(DownloadSubjectContext::new(actor, tok, ep)?))
         }
         _ => Err(PackfileUriError::Unauthorized),

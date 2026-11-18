@@ -31,11 +31,11 @@ pub fn format_fetch_capability_line(offload_advertised: bool) -> String {
 
 /// Ordered feature tokens advertised on the `fetch=` capability line.
 pub fn fetch_capability_tokens(offload_advertised: bool) -> Vec<&'static str> {
-    let mut tokens = vec!["shallow", "filter", "wait-for-done"];
     if offload_advertised {
-        tokens.push("packfile-uris");
+        vec!["shallow", "filter", "wait-for-done", "packfile-uris"]
+    } else {
+        vec!["shallow", "filter", "wait-for-done"]
     }
-    tokens
 }
 
 /// Rewrites a native `git upload-pack --advertise-refs` v2 stream to append `packfile-uris`
@@ -131,6 +131,14 @@ pub struct FetchV2Request {
 }
 
 impl FetchV2Request {
+    fn empty(object_format: PackObjectFormat) -> Self {
+        let (wants, haves, unsupported_args) = (Vec::new(), Vec::new(), Vec::new());
+        Self {
+            object_format, wants, haves, done: false, wait_for_done: false, thin_pack: false,
+            no_progress: false, ofs_delta: false, include_tag: false, uri_protocols: None, unsupported_args,
+        }
+    }
+
     pub fn client_supports_https_offload(&self) -> bool {
         self.uri_protocols.as_ref().is_some_and(|p| p.supports_https)
     }
@@ -158,24 +166,27 @@ enum RawPkt<'a> {
     Flush,
 }
 
+fn parse_pkt_header_len(rest: &[u8]) -> Result<usize, PackfileUriError> {
+    if rest.len() < 4 {
+        return Err(PackfileUriError::ProtocolSyntax("truncated pkt-line header".to_owned()));
+    }
+    let hdr = std::str::from_utf8(&rest[..4])
+        .ok()
+        .filter(|s| s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| PackfileUriError::ProtocolSyntax("invalid pkt-line hex length".to_owned()))?;
+    usize::from_str_radix(hdr, 16).map_err(|_| PackfileUriError::ProtocolSyntax("invalid pkt-line length".to_owned()))
+}
+
 fn split_v2_pkt_lines(stream: &[u8]) -> Result<Vec<RawPkt<'_>>, PackfileUriError> {
     if stream.len() > MAX_FETCH_V2_WIRE_BYTES {
         return Err(PackfileUriError::CapacityExceeded("protocol v2 stream exceeds 1 MiB".to_owned()));
     }
-    let mut out = Vec::new();
-    let mut rest = stream;
-    let mut saw_flush = false;
+    let (mut out, mut rest, mut saw_flush) = (Vec::new(), stream, false);
     while !rest.is_empty() {
-        if out.len() >= MAX_FETCH_V2_PKTS || rest.len() < 4 {
-            return Err(PackfileUriError::ProtocolSyntax("truncated or oversized pkt-line stream".to_owned()));
+        if out.len() >= MAX_FETCH_V2_PKTS {
+            return Err(PackfileUriError::ProtocolSyntax("oversized pkt-line stream".to_owned()));
         }
-        let hdr = std::str::from_utf8(&rest[..4])
-            .map_err(|_| PackfileUriError::ProtocolSyntax("non-utf8 pkt-line length".to_owned()))?;
-        if !hdr.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(PackfileUriError::ProtocolSyntax("invalid pkt-line hex length".to_owned()));
-        }
-        let length = usize::from_str_radix(hdr, 16)
-            .map_err(|_| PackfileUriError::ProtocolSyntax("invalid pkt-line length".to_owned()))?;
+        let length = parse_pkt_header_len(rest)?;
         rest = &rest[4..];
         match length {
             0 => {
@@ -191,18 +202,30 @@ fn split_v2_pkt_lines(stream: &[u8]) -> Result<Vec<RawPkt<'_>>, PackfileUriError
                 return Err(PackfileUriError::ProtocolSyntax("pkt-line payload truncated or oversized".to_owned()));
             }
             n => {
-                let payload_len = n - 4;
-                out.push(RawPkt::Data(&rest[..payload_len]));
-                rest = &rest[payload_len..];
+                out.push(RawPkt::Data(&rest[..n - 4]));
+                rest = &rest[n - 4..];
                 saw_flush = false;
             }
         }
     }
-    if saw_flush {
-        Ok(out)
-    } else {
-        Err(PackfileUriError::ProtocolSyntax("missing terminating flush-pkt".to_owned()))
+    saw_flush.then_some(out).ok_or_else(|| PackfileUriError::ProtocolSyntax("missing terminating flush-pkt".to_owned()))
+}
+
+/// Returns `true` strictly when a pre-`0001` Protocol v2 capability header pkt-line is `command=fetch`.
+pub fn is_v2_fetch_command_request(stream: &[u8]) -> bool {
+    let mut rest = stream;
+    for _ in 0..MAX_FETCH_V2_PKTS {
+        let Ok(len) = parse_pkt_header_len(rest) else { return false };
+        if len <= 3 || len > MAX_PKT_LINE_BYTES || len > rest.len() {
+            return false;
+        }
+        let payload = &rest[4..len];
+        rest = &rest[len..];
+        if payload.strip_suffix(b"\n").unwrap_or(payload) == b"command=fetch" {
+            return true;
+        }
     }
+    false
 }
 
 /// Parses a Git Protocol v2 `command=fetch` request stream with strict format & count bounds.
@@ -216,19 +239,7 @@ pub fn parse_fetch_v2_request(
     }
     let mut saw_command_fetch = false;
     let mut in_args = false;
-    let mut req = FetchV2Request {
-        object_format: expected_format,
-        wants: Vec::new(),
-        haves: Vec::new(),
-        done: false,
-        wait_for_done: false,
-        thin_pack: false,
-        no_progress: bool::default(),
-        ofs_delta: false,
-        include_tag: false,
-        uri_protocols: None,
-        unsupported_args: Vec::new(),
-    };
+    let mut req = FetchV2Request::empty(expected_format);
     let oid_len = expected_format.oid_hex_len();
     for pkt in pkts {
         match pkt {
@@ -291,42 +302,37 @@ fn apply_capability_header(
     Ok(())
 }
 
+fn push_hex_oid(dst: &mut Vec<String>, oid: &str, oid_len: usize, cap: usize, label: &str) -> Result<(), PackfileUriError> {
+    if dst.len() >= cap {
+        return Err(PackfileUriError::CapacityExceeded(format!("fetch {label} count exceeds bound")));
+    }
+    if !is_lower_hex_exact(oid, oid_len) {
+        return Err(PackfileUriError::ProtocolSyntax(format!("invalid {label} oid")));
+    }
+    dst.push(oid.to_owned());
+    Ok(())
+}
+
 fn apply_fetch_arg(req: &mut FetchV2Request, line: &str, oid_len: usize) -> Result<(), PackfileUriError> {
     if let Some(oid) = line.strip_prefix("want ") {
-        if req.wants.len() >= MAX_FETCH_WANTS {
-            return Err(PackfileUriError::CapacityExceeded("fetch want count exceeds bound".to_owned()));
-        }
-        if !is_lower_hex_exact(oid, oid_len) {
-            return Err(PackfileUriError::ProtocolSyntax("invalid want oid".to_owned()));
-        }
-        req.wants.push(oid.to_owned());
+        push_hex_oid(&mut req.wants, oid, oid_len, MAX_FETCH_WANTS, "want")?;
     } else if let Some(oid) = line.strip_prefix("have ") {
-        if req.haves.len() >= MAX_FETCH_HAVES {
-            return Err(PackfileUriError::CapacityExceeded("fetch have count exceeds bound".to_owned()));
-        }
-        if !is_lower_hex_exact(oid, oid_len) {
-            return Err(PackfileUriError::ProtocolSyntax("invalid have oid".to_owned()));
-        }
-        req.haves.push(oid.to_owned());
+        push_hex_oid(&mut req.haves, oid, oid_len, MAX_FETCH_HAVES, "have")?;
     } else if let Some(protos) = line.strip_prefix("packfile-uris ") {
         if req.uri_protocols.is_some() {
             return Err(PackfileUriError::ProtocolSyntax("duplicate packfile-uris line".to_owned()));
         }
         req.uri_protocols = Some(parse_uri_protocol_list(protos)?);
-    } else if line == "done" {
-        req.done = true;
-    } else if line == "wait-for-done" {
-        req.wait_for_done = true;
-    } else if line == "thin-pack" {
-        req.thin_pack = true;
-    } else if line == "no-progress" {
-        req.no_progress = true;
-    } else if line == "ofs-delta" {
-        req.ofs_delta = true;
-    } else if line == "include-tag" {
-        req.include_tag = true;
     } else {
-        push_unsupported_arg(req, line)?;
+        match line {
+            "done" => req.done = true,
+            "wait-for-done" => req.wait_for_done = true,
+            "thin-pack" => req.thin_pack = true,
+            "no-progress" => req.no_progress = true,
+            "ofs-delta" => req.ofs_delta = true,
+            "include-tag" => req.include_tag = true,
+            _ => push_unsupported_arg(req, line)?,
+        }
     }
     Ok(())
 }
@@ -373,14 +379,16 @@ pub fn encode_fetch_v2_response_with_acks(
     inline_pack_bytes: &[u8],
     client_supports_https: bool,
 ) -> Result<Vec<u8>, PackfileUriError> {
-    encode_fetch_v2_response_bounded(
-        policy,
-        delivery,
-        acked_haves,
-        inline_pack_bytes,
-        client_supports_https,
-        policy.max_v2_response_bytes,
-    )
+    let max_b = policy.max_v2_response_bytes;
+    encode_fetch_v2_response_bounded(policy, delivery, acked_haves, inline_pack_bytes, client_supports_https, max_b)
+}
+
+fn ensure_within_cap(len: usize, cap: u64) -> Result<(), PackfileUriError> {
+    if len as u64 > cap {
+        Err(PackfileUriError::CapacityExceeded("v2 fetch response exceeds byte bound".to_owned()))
+    } else {
+        Ok(())
+    }
 }
 
 /// Encodes a Protocol v2 `fetch` response enforcing a hard byte ceiling on total output size.
@@ -400,11 +408,8 @@ pub fn encode_fetch_v2_response_bounded(
     if !acked_haves.is_empty() {
         push_pkt_line(&mut out, b"acknowledgments\n")?;
         for h in acked_haves {
-            let ack_line = format!("ACK {h}\n");
-            push_pkt_line(&mut out, ack_line.as_bytes())?;
-            if out.len() as u64 > cap {
-                return Err(PackfileUriError::CapacityExceeded("v2 fetch response exceeds byte bound".to_owned()));
-            }
+            push_pkt_line(&mut out, format!("ACK {h}\n").as_bytes())?;
+            ensure_within_cap(out.len(), cap)?;
         }
         push_pkt_line(&mut out, b"ready\n")?;
         out.extend_from_slice(b"0001");
@@ -421,11 +426,8 @@ pub fn encode_fetch_v2_response_bounded(
                 if !desc.uri.starts_with("https://") {
                     return Err(PackfileUriError::UnsupportedProtocol("refusing non-https offload uri".to_owned()));
                 }
-                let line = format!("{} {}\n", desc.pack_hash_hex, desc.uri);
-                push_pkt_line(&mut out, line.as_bytes())?;
-                if out.len() as u64 > cap {
-                    return Err(PackfileUriError::CapacityExceeded("v2 fetch response exceeds byte bound".to_owned()));
-                }
+                push_pkt_line(&mut out, format!("{} {}\n", desc.pack_hash_hex, desc.uri).as_bytes())?;
+                ensure_within_cap(out.len(), cap)?;
             }
             out.extend_from_slice(b"0001");
         }
@@ -436,14 +438,10 @@ pub fn encode_fetch_v2_response_bounded(
         frame.push(1);
         frame.extend_from_slice(chunk);
         push_pkt_line(&mut out, &frame)?;
-        if out.len() as u64 > cap {
-            return Err(PackfileUriError::CapacityExceeded("v2 fetch response exceeds byte bound".to_owned()));
-        }
+        ensure_within_cap(out.len(), cap)?;
     }
     out.extend_from_slice(b"0000");
-    if out.len() as u64 > cap {
-        return Err(PackfileUriError::CapacityExceeded("v2 fetch response exceeds byte bound".to_owned()));
-    }
+    ensure_within_cap(out.len(), cap)?;
     Ok(out)
 }
 

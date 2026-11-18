@@ -6,6 +6,7 @@ pub mod cover_git;
 pub mod delivery;
 pub mod downloader;
 pub mod gateway_bridge;
+pub mod pack_bijection;
 pub mod planner;
 pub mod preflight_guard;
 pub mod protocol_v2;
@@ -18,6 +19,8 @@ pub mod types;
 mod tests;
 #[cfg(test)]
 mod tests_audit;
+#[cfg(test)]
+mod tests_bijection;
 #[cfg(test)]
 mod tests_luna_gates;
 
@@ -39,8 +42,9 @@ pub use protocol_v2::{
     FetchV2Request, MAX_FETCH_HAVES, MAX_FETCH_WANTS, MAX_UNSUPPORTED_FETCH_ARGS, ParsedUriProtocolSet,
     decode_packfile_uris_section, encode_fetch_v2_response, encode_fetch_v2_response_bounded,
     encode_fetch_v2_response_with_acks, fetch_capability_tokens, format_fetch_capability_line,
-    format_fetch_capability_line_for_policy, inject_packfile_uris_into_v2_advertisement, parse_fetch_v2_request,
-    parse_uri_protocol_list, should_advertise_packfile_uris, strip_packfile_uris_from_v2_request,
+    format_fetch_capability_line_for_policy, inject_packfile_uris_into_v2_advertisement,
+    is_v2_fetch_command_request, parse_fetch_v2_request, parse_uri_protocol_list, should_advertise_packfile_uris,
+    strip_packfile_uris_from_v2_request,
 };
 pub use retention::{
     AcquireLeaseParams, InflightDownloadGuard, OffloadPackPinGuard, PackDeliveryLeaseRegistry, RetentionLeaseState,

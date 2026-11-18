@@ -1,5 +1,5 @@
-//! Bounded Git `.pack`/`.idx` scanner, `.idx` v2 OID-table bijection verifier,
-//! timeout/byte-capped helper subprocess runner, and `#184` `VersionRecord` sealer.
+//! Bounded Git `.pack`/`.idx` scanner, timeout/byte-capped helper subprocess
+//! runner, and `#184` `VersionRecord` sealer.
 
 use std::{
     collections::HashSet,
@@ -15,22 +15,29 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::ref_store::{
-    GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget,
-    contract::{IssuerLane, RequestDigest},
-    core::CommitMode,
-    ref_version::{
-        BaseRequestSelector, CommitSetHead, CommitSetInput, CommitSetVersionEntry, OperationDigestInput, PackSetEntry,
-        RefVersionIntent, RefVersionKind, RefVersionRealm, VersionId, VersionRecord, VersionRecordInput,
-        compute_commit_set_id, compute_pack_set_digest, derive_candidate_version_id, operation_digest,
+use crate::{
+    cache_wake::replica_cache::error::is_lower_hex_exact,
+    ref_store::{
+        GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget,
+        contract::{IssuerLane, RequestDigest},
+        core::CommitMode,
+        ref_version::{
+            BaseRequestSelector, CommitSetHead, CommitSetInput, CommitSetVersionEntry, OperationDigestInput,
+            PackSetEntry, RefVersionIntent, RefVersionKind, RefVersionRealm, VersionId, VersionRecord,
+            VersionRecordInput, compute_commit_set_id, compute_pack_set_digest, derive_candidate_version_id,
+            operation_digest,
+        },
     },
 };
 
-use super::types::{
-    DEFAULT_HELPER_TIMEOUT_MS, MAX_CLOSURE_COMMITS, MAX_CLOSURE_OBJECTS, MAX_HELPER_STDERR_BYTES,
-    MAX_HELPER_STDIN_BYTES, MAX_HELPER_STDOUT_BYTES, MAX_PACK_OBJECTS_PER_PACK, MAX_SCANNED_PACK_FILES,
-    MAX_SINGLE_IDX_BYTES, MAX_SINGLE_PACK_SCAN_BYTES, MAX_TOTAL_SCANNED_PACK_BYTES, OffloadPolicyConfig,
-    PackObjectFormat, PackfileUriError,
+use super::{
+    pack_bijection::{parse_and_verify_idx_v2_oids, verify_raw_pack_stream_bijection},
+    types::{
+        DEFAULT_HELPER_TIMEOUT_MS, MAX_CLOSURE_COMMITS, MAX_CLOSURE_OBJECTS, MAX_HELPER_STDERR_BYTES,
+        MAX_HELPER_STDIN_BYTES, MAX_HELPER_STDOUT_BYTES, MAX_PACK_OBJECTS_PER_PACK, MAX_SCANNED_PACK_FILES,
+        MAX_SINGLE_IDX_BYTES, MAX_SINGLE_PACK_SCAN_BYTES, MAX_TOTAL_SCANNED_PACK_BYTES, OffloadPolicyConfig,
+        PackObjectFormat, PackfileUriError,
+    },
 };
 
 /// Hard resource budgets governing helper `git` subprocesses, `.pack`/`.idx` scans, and residual packs.
@@ -69,7 +76,8 @@ impl HelperResourceLimits {
     pub fn for_gateway(policy: &OffloadPolicyConfig, request_timeout: Duration, max_response_bytes: u64) -> Self {
         let policy_dl = Duration::from_millis(policy.request_deadline_ms);
         let timeout = request_timeout.min(policy_dl).min(Duration::from_millis(DEFAULT_HELPER_TIMEOUT_MS));
-        let single_pack = policy.max_inflight_bytes.min(policy.max_pack_bytes_per_request).min(MAX_SINGLE_PACK_SCAN_BYTES);
+        let single_pack =
+            policy.max_inflight_bytes.min(policy.max_pack_bytes_per_request).min(MAX_SINGLE_PACK_SCAN_BYTES);
         let res_cap = max_response_bytes.min(policy.max_v2_response_bytes).min(MAX_SINGLE_PACK_SCAN_BYTES);
         Self {
             timeout,
@@ -115,6 +123,8 @@ pub async fn run_git_bounded(
     if stdin_bytes.is_some_and(|b| b.len() > MAX_HELPER_STDIN_BYTES) {
         return Err(PackfileUriError::CapacityExceeded("helper git stdin exceeds bound".to_owned()));
     }
+    let dev_null = if cfg!(unix) { "/dev/null" } else { "NUL" };
+    let hooks_cfg = format!("core.hooksPath={dev_null}");
     let mut cmd = Command::new(git_bin);
     cmd.env_clear();
     #[cfg(unix)]
@@ -130,12 +140,12 @@ pub async fn run_git_bounded(
     }
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", dev_null)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("LC_ALL", "C")
         .arg("-c")
-        .arg("core.hooksPath=/dev/null")
+        .arg(&hooks_cfg)
         .arg("-c")
         .arg("gc.auto=0")
         .arg("-c")
@@ -258,68 +268,14 @@ pub async fn build_residual_pack_bytes(
     .await
 }
 
-fn parse_and_verify_idx_v2_oids(
-    pack_bytes: &[u8],
-    idx_bytes: &[u8],
-    fmt: PackObjectFormat,
-    max_objects: usize,
-) -> Result<(usize, HashSet<String>), PackfileUriError> {
-    let hash_bytes = fmt.oid_hex_len() / 2;
-    if pack_bytes.len() < 12 + hash_bytes || &pack_bytes[..4] != b"PACK" {
-        return Err(PackfileUriError::IntegrityMismatch("invalid PACK header".to_owned()));
-    }
-    let pack_ver = u32::from_be_bytes([pack_bytes[4], pack_bytes[5], pack_bytes[6], pack_bytes[7]]);
-    if pack_ver != 2 {
-        return Err(PackfileUriError::IntegrityMismatch("unsupported PACK version".to_owned()));
-    }
-    let pack_nr = u32::from_be_bytes([pack_bytes[8], pack_bytes[9], pack_bytes[10], pack_bytes[11]]) as usize;
-    if pack_nr == 0 {
-        return Err(PackfileUriError::IntegrityMismatch("empty pack candidate".to_owned()));
-    }
-    if pack_nr > max_objects {
-        return Err(PackfileUriError::CapacityExceeded("pack object count exceeds bound".to_owned()));
-    }
-    let min_idx_len = 1032usize
-        .checked_add(pack_nr.checked_mul(hash_bytes + 8).ok_or_else(|| PackfileUriError::CapacityExceeded("idx overflow".to_owned()))?)
-        .and_then(|v| v.checked_add(2 * hash_bytes))
-        .ok_or_else(|| PackfileUriError::CapacityExceeded("idx overflow".to_owned()))?;
-    if idx_bytes.len() < min_idx_len || &idx_bytes[..8] != b"\xfftOc\x00\x00\x00\x02" {
-        return Err(PackfileUriError::IntegrityMismatch("invalid v2 idx header or size".to_owned()));
-    }
-    let mut prev = 0u32;
-    for i in 0..256 {
-        let off = 8 + i * 4;
-        let cur = u32::from_be_bytes([idx_bytes[off], idx_bytes[off + 1], idx_bytes[off + 2], idx_bytes[off + 3]]);
-        if cur < prev {
-            return Err(PackfileUriError::IntegrityMismatch("non-monotonic idx fanout".to_owned()));
-        }
-        prev = cur;
-    }
-    if prev as usize != pack_nr {
-        return Err(PackfileUriError::IntegrityMismatch("idx fanout total mismatches pack header".to_owned()));
-    }
-    let pack_trailer = &pack_bytes[pack_bytes.len() - hash_bytes..];
-    let idx_pack_cksum = &idx_bytes[idx_bytes.len() - 2 * hash_bytes..idx_bytes.len() - hash_bytes];
-    if pack_trailer != idx_pack_cksum {
-        return Err(PackfileUriError::IntegrityMismatch("idx embedded pack checksum mismatch".to_owned()));
-    }
-    let mut oids = HashSet::with_capacity(pack_nr);
-    let table_start = 1032;
-    for i in 0..pack_nr {
-        let s = table_start + i * hash_bytes;
-        oids.insert(hex::encode(&idx_bytes[s..s + hash_bytes]));
-    }
-    Ok((pack_nr, oids))
-}
-
 pub(super) async fn discover_repo_packs(
     git_bin: &Path,
     repo_dir: &Path,
     fmt: PackObjectFormat,
     limits: &HelperResourceLimits,
-) -> Result<Vec<DiscoveredPack>, PackfileUriError> {
+) -> Result<(Vec<DiscoveredPack>, bool), PackfileUriError> {
     let Ok(rd) = std::fs::read_dir(repo_dir.join("objects").join("pack")) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
     let mut paths: Vec<PathBuf> = rd
         .filter_map(Result::ok)
@@ -330,8 +286,10 @@ pub(super) async fn discover_repo_packs(
         return Err(PackfileUriError::CapacityExceeded("repository pack count exceeds scan bound".to_owned()));
     }
     paths.sort();
-    let trailer_len = fmt.oid_hex_len() / 2;
+    let hex_len = fmt.oid_hex_len();
+    let trailer_len = hex_len / 2;
     let mut total_scanned: u64 = 0;
+    let mut rejected_corrupt_pack = false;
     let mut out = Vec::new();
 
     for pack_path in paths {
@@ -350,11 +308,23 @@ pub(super) async fn discover_repo_packs(
         let (Ok(pack_bytes), Ok(idx_bytes)) = (std::fs::read(&pack_path), std::fs::read(&idx_path)) else {
             continue;
         };
-        let (object_count, idx_oids) = match parse_and_verify_idx_v2_oids(&pack_bytes, &idx_bytes, fmt, limits.max_pack_objects) {
-            Ok(pair) => pair,
-            Err(PackfileUriError::CapacityExceeded(msg)) => return Err(PackfileUriError::CapacityExceeded(msg)),
-            Err(_) => continue,
-        };
+        let (object_count, idx_oids) =
+            match parse_and_verify_idx_v2_oids(&pack_bytes, &idx_bytes, fmt, limits.max_pack_objects) {
+                Ok(pair) => pair,
+                Err(e @ PackfileUriError::CapacityExceeded(_)) => return Err(e),
+                Err(_) => {
+                    rejected_corrupt_pack = true;
+                    continue;
+                }
+            };
+        match verify_raw_pack_stream_bijection(git_bin, repo_dir, &pack_path, &idx_bytes, limits).await {
+            Ok(()) => {}
+            Err(e @ (PackfileUriError::CapacityExceeded(_) | PackfileUriError::Timeout(_))) => return Err(e),
+            Err(_) => {
+                rejected_corrupt_pack = true;
+                continue;
+            }
+        }
         let vp_out = match run_git_bounded(
             git_bin,
             repo_dir,
@@ -367,24 +337,34 @@ pub(super) async fn discover_repo_packs(
         {
             Ok(v) => v,
             Err(e @ (PackfileUriError::CapacityExceeded(_) | PackfileUriError::Timeout(_))) => return Err(e),
-            Err(_) => continue,
+            Err(_) => {
+                rejected_corrupt_pack = true;
+                continue;
+            }
         };
         let mut defined_oids = HashSet::with_capacity(object_count);
         let mut delta_bases = Vec::new();
         let mut commits = Vec::new();
         for line in String::from_utf8_lossy(&vp_out).lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 5 && matches!(parts[1], "commit" | "tree" | "blob" | "tag") {
+            if parts.len() >= 5
+                && matches!(parts[1], "commit" | "tree" | "blob" | "tag")
+                && is_lower_hex_exact(parts[0], hex_len)
+            {
                 defined_oids.insert(parts[0].to_owned());
                 if parts[1] == "commit" {
                     commits.push(parts[0].to_owned());
                 }
-                if parts.len() >= 7 {
+                if parts.len() >= 7 && is_lower_hex_exact(parts[6], hex_len) {
                     delta_bases.push(parts[6].to_owned());
                 }
             }
         }
-        if commits.is_empty() || defined_oids.len() != object_count || defined_oids != idx_oids {
+        if defined_oids.len() != object_count || defined_oids != idx_oids {
+            rejected_corrupt_pack = true;
+            continue;
+        }
+        if commits.is_empty() {
             continue;
         }
         let is_standalone = delta_bases.iter().all(|base| defined_oids.contains(base));
@@ -403,7 +383,7 @@ pub(super) async fn discover_repo_packs(
             is_standalone,
         });
     }
-    Ok(out)
+    Ok((out, rejected_corrupt_pack))
 }
 
 pub(super) fn seal_synth_version(
@@ -445,8 +425,9 @@ pub(super) fn seal_synth_version(
     let version_id = derive_candidate_version_id(&op, op_digest, ref_name, base.map(VersionRecord::ref_generation))
         .map_err(internal_err)?;
     let ce = CommitSetVersionEntry::new(ref_name.clone(), version_id, RefVersionKind::Publish, target.clone());
-    let cs_id = compute_commit_set_id(&CommitSetInput::new(*realm, seq, op_id, op_digest, vec![ce], CommitSetHead::Absent))
-        .map_err(internal_err)?;
+    let cs_id =
+        compute_commit_set_id(&CommitSetInput::new(*realm, seq, op_id, op_digest, vec![ce], CommitSetHead::Absent))
+            .map_err(internal_err)?;
     let ps_digest = compute_pack_set_digest(pack_entries).map_err(internal_err)?;
     VersionRecord::seal(VersionRecordInput {
         version_id,

@@ -164,7 +164,7 @@ async fn upload_pack_authorized(
     authorization.revalidate(deadline).await?;
     if git_protocol(&headers) == Some("version=2")
         && let Some(offload) = state.packfile_offload()
-        && let Some(v2_body) = try_offload_upload_pack_v2(OffloadUploadCtx {
+        && let Some((v2_body, response_lease)) = try_offload_upload_pack_v2(OffloadUploadCtx {
             state: &state,
             offload,
             identity: &identity,
@@ -178,9 +178,18 @@ async fn upload_pack_authorized(
         })
         .await?
     {
-        drop(lease);
-        let _response_lease = state.reserve_bytes(v2_body.len() as u64)?;
-        return Ok(bytes_response("application/x-git-upload-pack-result", v2_body));
+        drop((view, work, workspace, lease));
+        let payload = axum::body::Bytes::from(v2_body);
+        let stream = async_stream::stream! {
+            let _guards = (response_lease, _slot);
+            let mut offset = 0usize;
+            while offset < payload.len() {
+                let end = (offset + 32 * 1024).min(payload.len());
+                yield Ok::<_, std::io::Error>(payload.slice(offset..end));
+                offset = end;
+            }
+        };
+        return Ok(stream_response("application/x-git-upload-pack-result", Body::from_stream(stream)));
     }
     let mut command = view.command_with_protocol(state.git_binary(), git_protocol(&headers));
     command.arg("upload-pack").arg("--stateless-rpc").arg(view.repo());
@@ -215,7 +224,9 @@ struct OffloadUploadCtx<'a> {
     deadline: tokio::time::Instant,
 }
 
-async fn try_offload_upload_pack_v2(ctx: OffloadUploadCtx<'_>) -> Result<Option<Vec<u8>>, GatewayError> {
+async fn try_offload_upload_pack_v2(
+    ctx: OffloadUploadCtx<'_>,
+) -> Result<Option<(Vec<u8>, super::state::ByteLease)>, GatewayError> {
     use crate::browse::packfile_uri::{DownloadSubjectContext, GatewayFetchBridgeInput, PackfileUriError};
     let request_bytes = tokio::fs::read(ctx.request_path)
         .await
@@ -236,34 +247,48 @@ async fn try_offload_upload_pack_v2(ctx: OffloadUploadCtx<'_>) -> Result<Option<
             auth_guard.revalidate(check_deadline).await.map_err(|_| PackfileUriError::Unauthorized)
         })
     });
+    let mut reserve_err: Option<GatewayError> = None;
     let outcome = ctx
         .offload
-        .try_serve_upload_pack_v2(GatewayFetchBridgeInput {
-            git_binary: ctx.state.git_binary(),
-            repo_dir: ctx.repo_dir,
-            advertised_refs: ctx.advertised_refs,
-            object_format: ctx.object_format,
-            request_bytes: &request_bytes,
-            tenant_id: ctx.serving.gate.tenant_id(),
-            repository_id: ctx.serving.gate.repository_id(),
-            history_incarnation: ctx.serving.gate.history_incarnation(),
-            authority_epoch: ctx.serving.gate.authority_epoch(),
-            group_epoch: ctx.serving.gate.group_epoch(),
-            subject,
-            provider: ctx.state.store().provider().as_str(),
-            backend_identity_hex: ctx.state.store().backend_identity().as_hex(),
-            request_timeout,
-            max_response_bytes: max_resp,
-            live_revalidator,
-        })
+        .try_serve_upload_pack_v2_with_guard(
+            GatewayFetchBridgeInput {
+                git_binary: ctx.state.git_binary(),
+                repo_dir: ctx.repo_dir,
+                advertised_refs: ctx.advertised_refs,
+                object_format: ctx.object_format,
+                request_bytes: &request_bytes,
+                tenant_id: ctx.serving.gate.tenant_id(),
+                repository_id: ctx.serving.gate.repository_id(),
+                history_incarnation: ctx.serving.gate.history_incarnation(),
+                authority_epoch: ctx.serving.gate.authority_epoch(),
+                group_epoch: ctx.serving.gate.group_epoch(),
+                subject,
+                provider: ctx.state.store().provider().as_str(),
+                backend_identity_hex: ctx.state.store().backend_identity().as_hex(),
+                request_timeout,
+                max_response_bytes: max_resp,
+                live_revalidator,
+            },
+            |len| {
+                if len > max_resp {
+                    reserve_err = Some(GatewayError::TooLarge);
+                    return Err(PackfileUriError::CapacityExceeded("response exceeds max_response_bytes".to_owned()));
+                }
+                match ctx.state.reserve_bytes(len) {
+                    Ok(guard) => Ok(guard),
+                    Err(err) => {
+                        reserve_err = Some(err);
+                        Err(PackfileUriError::CapacityExceeded("gateway response byte budget busy".to_owned()))
+                    }
+                }
+            },
+        )
         .await;
+    if let Some(err) = reserve_err {
+        return Err(err);
+    }
     match outcome {
-        Ok(Some(v2_body)) => {
-            if v2_body.len() as u64 > max_resp {
-                return Err(GatewayError::TooLarge);
-            }
-            return Ok(Some(v2_body));
-        }
+        Ok(Some((v2_body, response_lease))) => return Ok(Some((v2_body, response_lease))),
         Err(PackfileUriError::Unauthorized) => {
             return Err(GatewayError::Forbidden("repository authorization is no longer valid"));
         }
@@ -297,7 +322,11 @@ fn require_upload_content_type(headers: &HeaderMap) -> Result<(), GatewayError> 
 }
 
 fn bytes_response(content_type: &'static str, body: Vec<u8>) -> Response {
-    let mut response = Response::new(Body::from(body));
+    stream_response(content_type, Body::from(body))
+}
+
+fn stream_response(content_type: &'static str, body: Body) -> Response {
+    let mut response = Response::new(body);
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static(content_type));
     response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));

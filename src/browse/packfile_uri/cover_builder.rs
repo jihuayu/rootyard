@@ -196,7 +196,11 @@ pub async fn build_verified_cover_proof_from_repo(
         commit_parents.insert(c.to_owned(), parts.map(str::to_owned).collect());
     }
 
-    let mut packs = discover_repo_packs(params.git_binary, params.repo_dir, pack_fmt, &params.limits).await?;
+    let (mut packs, rejected_corrupt_pack) =
+        discover_repo_packs(params.git_binary, params.repo_dir, pack_fmt, &params.limits).await?;
+    if rejected_corrupt_pack {
+        return Ok(CoverBuildOutcome::Fallback(FallbackReason::PackContainsUnauthorizedObjects));
+    }
     if ordered_commits.is_empty() || packs.is_empty() {
         return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
     }

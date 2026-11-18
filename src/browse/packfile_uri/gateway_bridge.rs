@@ -27,7 +27,10 @@ use super::{
     delivery::{PackHttpServerState, PackStreamMeta},
     planner::{CdnCircuitBreaker, CdnHealthState, DeliveryPlanRequest, DeliveryPlanner, VerifiedPackCoverInput},
     preflight_guard::{GatewayLiveAuthorizer, RegisteredPinAuth, StagedPinBatchGuard},
-    protocol_v2::{encode_fetch_v2_response_bounded, parse_fetch_v2_request, should_advertise_packfile_uris},
+    protocol_v2::{
+        encode_fetch_v2_response_bounded, is_v2_fetch_command_request, parse_fetch_v2_request,
+        should_advertise_packfile_uris,
+    },
     retention::PackDeliveryLeaseRegistry,
     signing::{LivePackReadAuthorizer, PackUriKeyring},
     ssrf_guard::PackUriDnsResolver,
@@ -157,11 +160,22 @@ impl GatewayPackfileOffload {
         &self,
         input: GatewayFetchBridgeInput<'_>,
     ) -> Result<Option<Vec<u8>>, PackfileUriError> {
+        Ok(self.try_serve_upload_pack_v2_with_guard(input, |_| Ok(())).await?.map(|(body, ())| body))
+    }
+
+    /// Evaluates a Protocol v2 upload-pack request while reserving the caller's response byte guard
+    /// *before* inserting packs into `PackHttpServerState` or committing pin leases, and holding
+    /// `PreflightSessionGuard` across residual pack creation, encoding, live revalidation, and commit.
+    pub async fn try_serve_upload_pack_v2_with_guard<G, F>(
+        &self,
+        input: GatewayFetchBridgeInput<'_>,
+        reserve_response: F,
+    ) -> Result<Option<(Vec<u8>, G)>, PackfileUriError>
+    where
+        F: FnOnce(u64) -> Result<G, PackfileUriError>,
+    {
         input.subject.validate()?;
-        if !std::str::from_utf8(input.request_bytes)
-            .unwrap_or_default()
-            .contains("command=fetch")
-        {
+        if !is_v2_fetch_command_request(input.request_bytes) {
             return Ok(None);
         }
         let pack_fmt = match input.object_format {
@@ -265,6 +279,11 @@ impl GatewayPackfileOffload {
             full_fallback_inline_bytes: bundle.plan.total_selected_bytes,
             rejected_unauthorized_pack: bundle.rejected_unauthorized_pack,
         };
+        let effective_host = if !self.allowed_host.is_empty() {
+            self.allowed_host.as_str()
+        } else {
+            policy.allowed_hosts.first().map_or("", String::as_str)
+        };
         let cdn_health = *self.cdn_health.read().unwrap_or_else(|p| p.into_inner());
         let planned = self
             .planner
@@ -278,7 +297,7 @@ impl GatewayPackfileOffload {
                     fetch_req: &fetch_req,
                     cover: &cover_in,
                     cdn_health,
-                    allowed_host: &self.allowed_host,
+                    allowed_host: effective_host,
                     now_unix,
                     resolver: self.pack_server.resolver.as_ref(),
                     policy: &policy,
@@ -286,7 +305,6 @@ impl GatewayPackfileOffload {
                 },
             )
             .await?;
-        drop(preflight_guard);
 
         let DeliveryMode::OffloadPlusResidual { offloaded, residual_inline_bytes, residual_objects, lease_pins } =
             planned.mode
@@ -304,6 +322,7 @@ impl GatewayPackfileOffload {
             now_unix,
         );
         let mut offloaded_oids: HashSet<String> = HashSet::new();
+        let mut pending_packs: Vec<PackStreamMeta> = Vec::with_capacity(offloaded.len());
         for desc in &offloaded {
             let (Some(raw), Some(oids)) =
                 (bundle.raw_pack_bytes.get(&desc.pack_oid), bundle.pack_defined_oids.get(&desc.pack_oid))
@@ -315,8 +334,7 @@ impl GatewayPackfileOffload {
                 self.record_fallback(FallbackReason::PackContainsUnauthorizedObjects);
                 return Ok(None);
             }
-            offloaded_oids.extend(oids.iter().cloned());
-            self.pack_server.insert_pack(PackStreamMeta {
+            let meta = PackStreamMeta {
                 tenant_id: input.tenant_id,
                 repository_id: input.repository_id,
                 pack_oid: desc.pack_oid.clone(),
@@ -324,7 +342,10 @@ impl GatewayPackfileOffload {
                 object_format: pack_fmt,
                 sha256_hex: desc.sha256_hex.clone(),
                 payload: Bytes::from(raw.clone()),
-            })?;
+            };
+            meta.validate_bytes()?;
+            offloaded_oids.extend(oids.iter().cloned());
+            pending_packs.push(meta);
         }
 
         let residual_pack = match build_residual_pack_bytes(
@@ -368,17 +389,35 @@ impl GatewayPackfileOffload {
             residual_objects,
             lease_pins: cloned_pins,
         };
-        let body = encode_fetch_v2_response_bounded(
+        let body = match encode_fetch_v2_response_bounded(
             &policy,
             &mode_ref,
             &acked_haves,
             &residual_pack,
             true,
             input.max_response_bytes,
-        )?;
+        ) {
+            Ok(encoded) => encoded,
+            Err(PackfileUriError::CapacityExceeded(_)) => {
+                self.record_fallback(FallbackReason::ResourceBoundsExceeded);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
         (input.live_revalidator)().await?;
+        let response_guard = reserve_response(body.len() as u64)?;
+        match self.pack_server.insert_packs_atomic(pending_packs) {
+            Ok(()) => {}
+            Err(PackfileUriError::CapacityExceeded(_)) => {
+                drop(response_guard);
+                self.record_fallback(FallbackReason::OverloadedOrQueueSaturated);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
         staged.commit();
+        drop(preflight_guard);
         self.offload_responses.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(body))
+        Ok(Some((body, response_guard)))
     }
 }

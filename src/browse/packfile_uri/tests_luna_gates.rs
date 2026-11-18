@@ -36,10 +36,12 @@ fn find_git_bin() -> PathBuf {
 }
 
 fn git_sync(git_bin: &Path, cwd: &Path, args: &[&str]) -> String {
+    let dev_null = if cfg!(unix) { "/dev/null" } else { "NUL" };
+    let hooks_cfg = format!("core.hooksPath={dev_null}");
     let out = Command::new(git_bin)
         .current_dir(cwd)
         .arg("-c")
-        .arg("core.hooksPath=/dev/null")
+        .arg(&hooks_cfg)
         .arg("-c")
         .arg("gc.auto=0")
         .arg("-c")
@@ -49,6 +51,7 @@ fn git_sync(git_bin: &Path, cwd: &Path, args: &[&str]) -> String {
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", dev_null)
         .output()
         .expect("spawn git");
     assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));

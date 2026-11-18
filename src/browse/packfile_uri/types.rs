@@ -255,21 +255,30 @@ impl OffloadPolicyConfig {
 /// Shared global byte limiter bounding concurrent inflight pack transfers.
 #[derive(Debug)]
 pub struct InflightBytesLimiter {
-    max_bytes: u64,
+    max_bytes: AtomicU64,
     used_bytes: AtomicU64,
 }
 
 impl InflightBytesLimiter {
     pub fn new(max_bytes: u64) -> Self {
-        Self { max_bytes: max_bytes.max(1), used_bytes: AtomicU64::new(0) }
+        Self { max_bytes: AtomicU64::new(max_bytes.max(1)), used_bytes: AtomicU64::new(0) }
+    }
+
+    pub fn set_max_bytes(&self, max_bytes: u64) {
+        self.max_bytes.store(max_bytes.max(1), Ordering::Release);
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes.load(Ordering::Acquire)
     }
 
     pub fn try_reserve(self: &Arc<Self>, bytes: u64) -> Result<InflightBytesGuard, PackfileUriError> {
+        let cap = self.max_bytes();
         let mut cur = self.used_bytes.load(Ordering::Acquire);
         loop {
             let next = cur
                 .checked_add(bytes)
-                .filter(|&sum| sum <= self.max_bytes)
+                .filter(|&sum| sum <= cap)
                 .ok_or_else(|| PackfileUriError::CapacityExceeded("global inflight byte limit exceeded".to_owned()))?;
             match self.used_bytes.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return Ok(InflightBytesGuard { limiter: Arc::clone(self), bytes, released: false }),
