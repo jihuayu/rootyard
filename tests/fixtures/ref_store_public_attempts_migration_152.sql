@@ -267,30 +267,34 @@ CREATE TRIGGER ref_store_private_attempt_no_truncate BEFORE TRUNCATE ON ref_stor
 -- Check the committed shape after the 138 terminal, 139 event and public link
 -- have been staged. The adapter must fence private core DML and update the
 -- wrapper in the same transaction as terminal, cancellation or rotation DML.
-CREATE FUNCTION rootyard_ref_store_verify_public_operation() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION rootyard_ref_store_verify_public_operation(repo uuid, public_op uuid) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-    repo uuid := NEW.repository_id;
     wrapper ref_store_public_operations;
     attempt record;
 BEGIN
-    SELECT * INTO wrapper FROM ref_store_public_operations WHERE (repository_id, public_id) = (repo, NEW.public_id);
-    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT * INTO wrapper FROM ref_store_public_operations WHERE (repository_id, public_id) = (repo, public_op);
+    IF NOT FOUND THEN RETURN; END IF;
     FOR attempt IN
         SELECT a.slot, a.private_id, a.base_revision, o.state AS core_state, o.terminal_result,
                e.event_id, e.outcome, e.payload, e.revision,
                rootyard_ref_store_attempt_has_binding(wrapper, a) AS serving_bound,
                c.operation_id IS NOT NULL AS has_tombstone,
+               c.operation_id IS DISTINCT FROM k.operation_id AS tombstone_key_differs,
                (c.issuer_id, c.lane, c.sequence, c.request_digest) = (o.issuer_id, o.lane, o.sequence, o.request_digest) AS exact_tombstone
         FROM ref_store_private_attempts a
         LEFT JOIN ref_store_operations o ON (o.repository_id, o.operation_id) = (a.repository_id, a.private_id)
         LEFT JOIN ref_store_core_events e ON (e.repository_id, e.operation_id) = (a.repository_id, a.private_id)
         LEFT JOIN ref_store_cancellations c ON (c.repository_id, c.operation_id) = (a.repository_id, a.private_id)
-        WHERE (a.repository_id, a.public_id) = (repo, NEW.public_id)
+        LEFT JOIN ref_store_cancellations k ON (k.repository_id, k.issuer_id, k.lane, k.sequence)
+            = (o.repository_id, o.issuer_id, o.lane, o.sequence)
+        WHERE (a.repository_id, a.public_id) = (repo, public_op)
     LOOP
         IF NOT attempt.serving_bound
            OR attempt.slot > wrapper.current_slot
-           OR (attempt.has_tombstone AND
-               (attempt.exact_tombstone IS NOT TRUE
+           OR attempt.tombstone_key_differs
+           OR (attempt.has_tombstone AND (attempt.exact_tombstone IS NOT TRUE OR attempt.core_state = 'pending'))
+           OR (attempt.core_state = 'cancelled' AND
+               (NOT attempt.has_tombstone
                 OR attempt.terminal_result IS DISTINCT FROM '{"state":"cancelled","reason":"cancel_requested"}'::jsonb))
            OR (attempt.event_id IS NOT NULL AND
                (attempt.outcome IS DISTINCT FROM attempt.core_state
@@ -300,25 +304,53 @@ BEGIN
                 OR attempt.payload->'revision' IS DISTINCT FROM to_jsonb(attempt.revision)))
            OR (attempt.slot < wrapper.current_slot AND
                (attempt.core_state IS DISTINCT FROM 'rejected' OR attempt.event_id IS DISTINCT FROM wrapper.retired_event_id
-                OR attempt.has_tombstone
                 OR attempt.revision <= attempt.base_revision
                 OR attempt.payload#>>'{rejection,code}' IS DISTINCT FROM 'revision_mismatch'
                 OR attempt.payload->'registrations' IS DISTINCT FROM '[]'::jsonb))
            OR (attempt.slot = wrapper.current_slot AND
                (attempt.core_state IS DISTINCT FROM wrapper.state
-                OR attempt.has_tombstone <> (wrapper.state = 'cancelled')
                 OR (wrapper.state = 'cancelled' AND attempt.private_id IS DISTINCT FROM wrapper.cancelled_private_id)
                 OR attempt.event_id IS DISTINCT FROM wrapper.event_id)) THEN
             RAISE EXCEPTION 'public operation and private attempt evidence disagree'
                 USING ERRCODE = '23514', CONSTRAINT = 'ref_store_public_attempt_evidence';
         END IF;
     END LOOP;
+END $$;
+
+CREATE FUNCTION rootyard_ref_store_public_operation_evidence() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM rootyard_ref_store_verify_public_operation(NEW.repository_id, NEW.public_id);
     RETURN NULL;
 END $$;
 
 CREATE CONSTRAINT TRIGGER ref_store_public_operation_evidence AFTER INSERT OR UPDATE ON ref_store_public_operations
-    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rootyard_ref_store_verify_public_operation();
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rootyard_ref_store_public_operation_evidence();
 CREATE CONSTRAINT TRIGGER ref_store_private_attempt_evidence AFTER INSERT ON ref_store_private_attempts
-    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rootyard_ref_store_verify_public_operation();
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rootyard_ref_store_public_operation_evidence();
+
+-- Legacy cancellation callers need no privileges on the new tables. Only the
+-- installed trigger may run this read-only verifier in its owning schema.
+CREATE FUNCTION rootyard_ref_store_private_cancellation_evidence() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    public_op uuid;
+BEGIN
+    PERFORM set_config('search_path', format('pg_catalog, %I, pg_temp', TG_TABLE_SCHEMA), true);
+    FOR public_op IN
+        SELECT a.public_id FROM ref_store_private_attempts a
+        WHERE (a.repository_id, a.private_id) = (NEW.repository_id, NEW.operation_id)
+        UNION
+        SELECT a.public_id FROM ref_store_operations o JOIN ref_store_private_attempts a
+            ON (a.repository_id, a.private_id) = (o.repository_id, o.operation_id)
+        WHERE (o.repository_id, o.issuer_id, o.lane, o.sequence) = (NEW.repository_id, NEW.issuer_id, NEW.lane, NEW.sequence)
+    LOOP
+        PERFORM rootyard_ref_store_verify_public_operation(NEW.repository_id, public_op);
+    END LOOP;
+    RETURN NULL;
+END $$;
+
+REVOKE EXECUTE ON FUNCTION rootyard_ref_store_private_cancellation_evidence() FROM PUBLIC;
+CREATE CONSTRAINT TRIGGER ref_store_private_cancellation_evidence AFTER INSERT OR UPDATE ON ref_store_cancellations
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION rootyard_ref_store_private_cancellation_evidence();
 
 INSERT INTO schema_migrations (version) VALUES (152) ON CONFLICT DO NOTHING;
