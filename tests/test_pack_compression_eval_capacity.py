@@ -32,15 +32,24 @@ class CapacityEnvelopeTest(unittest.TestCase):
             {
                 "concurrent_branches": 3,
                 "request_ceiling_bytes": 128 * 1024 * 1024,
-                "inflight_bytes": 384 * 1024 * 1024,
+                "inflight_bytes": 436207616,
             },
         )
-        self.assertEqual(envelope["inflight_bytes"], envelope["concurrent_branches"] * envelope["request_ceiling_bytes"])
+        self.assertEqual(
+            envelope["inflight_bytes"],
+            envelope["concurrent_branches"] * envelope["request_ceiling_bytes"] + 32 * 1024 * 1024,
+        )
         self.assertLessEqual(envelope["inflight_bytes"], capacity.MAX_INFLIGHT_BYTES)
         self.assertEqual(
             capacity.derive_capacity_envelope(concurrent_branches=3, request_ceiling_bytes=128 * 1024 * 1024),
             envelope,
         )
+
+    def test_minimum_push_budget_still_covers_one_browse_lease(self) -> None:
+        envelope = capacity.derive_capacity_envelope(concurrent_branches=1, request_ceiling_bytes=1)
+        self.assertEqual(envelope["inflight_bytes"], 32 * 1024 * 1024 + 1)
+        self.assertEqual(capacity.sanitize_capacity(envelope), envelope)
+        self.assertEqual(capacity.build_server_env({}, envelope)[capacity.INFLIGHT_ENV], str(32 * 1024 * 1024 + 1))
 
     def test_derive_rejects_invalid_and_overflow_inputs(self) -> None:
         for bad in (0, -1, 4, True, "3", None, 3.0):
@@ -59,21 +68,10 @@ class CapacityEnvelopeTest(unittest.TestCase):
         self.assertEqual(base, before)
         self.assertEqual(env["KEEP"], "yes")
         self.assertEqual(env[capacity.REQUEST_ENV], str(128 * 1024 * 1024))
-        self.assertEqual(env[capacity.INFLIGHT_ENV], str(384 * 1024 * 1024))
+        self.assertEqual(env[capacity.INFLIGHT_ENV], "436207616")
         supplied = capacity.build_server_env({"A": "b"}, capacity.derive_capacity_envelope())
         self.assertEqual(supplied[capacity.REQUEST_ENV], env[capacity.REQUEST_ENV])
         self.assertEqual(supplied[capacity.INFLIGHT_ENV], env[capacity.INFLIGHT_ENV])
-
-    def test_build_server_env_rejects_bad_envelopes(self) -> None:
-        good = capacity.derive_capacity_envelope()
-        with self.assertRaises(ValueError):
-            capacity.build_server_env({}, {**good, "extra": 1})
-        with self.assertRaises(ValueError):
-            capacity.build_server_env({}, {**good, "inflight_bytes": good["inflight_bytes"] - 1})
-        with self.assertRaises(ValueError):
-            capacity.build_server_env({}, {"concurrent_branches": 4, **{k: v for k, v in good.items() if k != "concurrent_branches"}})
-        with self.assertRaises(ValueError):
-            capacity.build_server_env({}, "not-a-mapping")  # type: ignore[arg-type]
 
     def test_build_server_env_never_mutates_os_environ(self) -> None:
         before = dict(os.environ)
@@ -82,20 +80,30 @@ class CapacityEnvelopeTest(unittest.TestCase):
         self.assertIn(capacity.REQUEST_ENV, env)
         self.assertIn(capacity.INFLIGHT_ENV, env)
 
-    def test_sanitize_capacity_fails_closed(self) -> None:
+    def test_env_and_projection_reject_the_same_invalid_envelopes(self) -> None:
         canonical = capacity.derive_capacity_envelope()
         self.assertEqual(capacity.sanitize_capacity(canonical), canonical)
+        self.assertEqual(capacity.sanitize_capacity(None), dict.fromkeys(capacity.CAPACITY_FIELDS))
         sentinel = "SENTINEL_SECRET_capacity"
         for bad in (
-            None,
+            "not-a-mapping",
             {},
             {**canonical, "concurrent_branches": 4},
+            {**canonical, "concurrent_branches": True},
+            {**canonical, "concurrent_branches": 3.0},
+            {**canonical, "request_ceiling_bytes": True},
             {**canonical, "request_ceiling_bytes": "128"},
-            {**canonical, "inflight_bytes": 1},
-            {**canonical, "inflight_bytes": 16 * 1024 * 1024 * 1024},
+            {**canonical, "inflight_bytes": 402653184},
+            {**canonical, "inflight_bytes": canonical["inflight_bytes"] - 1},
+            {**canonical, "inflight_bytes": canonical["inflight_bytes"] + 1},
+            {**canonical, "inflight_bytes": capacity.MAX_INFLIGHT_BYTES},
+            {**canonical, "inflight_bytes": True},
+            {**canonical, "inflight_bytes": float(canonical["inflight_bytes"])},
             {**canonical, "injected": sentinel},
         ):
             with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    capacity.build_server_env({}, bad)  # type: ignore[arg-type]
                 projected = capacity.sanitize_capacity(bad)
                 self.assertEqual(
                     projected,

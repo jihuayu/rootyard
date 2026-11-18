@@ -148,16 +148,18 @@ class FiniteFailureDiagnosticsTest(unittest.TestCase):
             {
                 "concurrent_branches": 3,
                 "request_ceiling_bytes": 134217728,
-                "inflight_bytes": 402653184,
+                "inflight_bytes": 436207616,
             },
         )
         self.assertEqual(enrich_failure_record(record)["fixture_capacity"], envelope)
 
         for bad in (
             {"concurrent_branches": 4, "request_ceiling_bytes": 134217728, "inflight_bytes": 536870912},
-            {"concurrent_branches": 3, "request_ceiling_bytes": "134217728", "inflight_bytes": 402653184},
-            {"concurrent_branches": 3, "request_ceiling_bytes": 134217728, "inflight_bytes": 1},
-            {"concurrent_branches": 3, "request_ceiling_bytes": 134217728, "inflight_bytes": 402653184, "x": SENTINEL},
+            {**envelope, "request_ceiling_bytes": "134217728"},
+            {**envelope, "inflight_bytes": 402653184},
+            {**envelope, "inflight_bytes": 436207617},
+            {**envelope, "inflight_bytes": 436207616.0},
+            {**envelope, "x": SENTINEL},
             {SENTINEL: 3},
         ):
             with self.subTest(bad=bad):

@@ -342,7 +342,7 @@ class ServerOwnerTest(unittest.TestCase):
             self.assertEqual(builder.call_args.args[1], capacity.derive_capacity_envelope())
             env = popen.call_args.kwargs["env"]
             self.assertEqual(env[capacity.REQUEST_ENV], "134217728")
-            self.assertEqual(env[capacity.INFLIGHT_ENV], "402653184")
+            self.assertEqual(env[capacity.INFLIGHT_ENV], "436207616")
             self.assertEqual(dict(os.environ), before)
 
     def test_start_refuses_to_overwrite_existing_owner(self) -> None:

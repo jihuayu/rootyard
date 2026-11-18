@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import http.server
 import json
 import os
@@ -19,6 +20,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+from pack_compression_eval.capacity import derive_capacity_envelope  # noqa: E402
 from pack_compression_eval.corpus import (  # noqa: E402
     DATASET_ARCHETYPES,
     build_archetype_commits,
@@ -183,6 +185,49 @@ class PackCompressionEvalTests(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             validate_report(fake_report)
+
+    def test_live_phase_three_capacity_matches_gateway_reservations(self) -> None:
+        workflow = (ROOT / ".github/workflows/pando-pack-compression-eval.yml").read_text()
+        live_step = workflow.split("- name: Run full #178", 1)[1].split("- name:", 1)[0]
+        self.assertIn("python3 scripts/pando_pack_compression_eval.py", live_step)
+        self.assertIn("--mode full", live_step)
+        self.assertNotIn("ROOTYARD_MAX_INFLIGHT_BYTES", workflow)
+
+        harness = ast.parse((SCRIPTS / "pack_compression_eval/e2e_serve_blob.py").read_text())
+        live, = (node for node in harness.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "run_live_serve_blob_eval")
+        branch_count, = (
+            ast.literal_eval(node.value) for node in ast.walk(live)
+            if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "conc_branches"
+        )
+        self.assertEqual(branch_count, 3)
+        executor, = (
+            node for node in ast.walk(live) if isinstance(node, ast.With)
+            and ast.unparse(node.items[0].context_expr).startswith("ThreadPoolExecutor(")
+        )
+        self.assertEqual(ast.unparse(executor.items[0].context_expr), "ThreadPoolExecutor(max_workers=conc_branches + 1)")
+        launches = [
+            ast.unparse(node.value) for node in executor.body if isinstance(node, ast.Assign)
+            and "pool.submit(" in ast.unparse(node.value)
+        ]
+        self.assertCountEqual(launches, [
+            "[pool.submit(_conc_push, bi) for bi in range(conc_branches)]",
+            "pool.submit(_conc_browse_and_pg)",
+        ])
+
+        gateway = ROOT / "src/blob_git_gateway"
+        config = (ROOT / "src/standalone/config.rs").read_text()
+        self.assertIn('number("ROOTYARD_MAX_REQUEST_BYTES", 128 << 20,', config)
+        self.assertIn("state.reserve_bytes(state.limits().max_request_bytes)?", (gateway / "receive.rs").read_text())
+        browse = (gateway / "browse.rs").read_text()
+        self.assertIn("MAX_MEMORY_BYTES: u64 = 32 * 1024 * 1024;", browse)
+        self.assertIn("MAX_MEMORY_BYTES.min(state.limits().max_inflight_bytes)", browse)
+        self.assertIn("state.reserve_bytes(memory)?", (gateway / "browse/session.rs").read_text())
+
+        envelope = derive_capacity_envelope()
+        self.assertEqual(envelope["concurrent_branches"], branch_count)
+        self.assertEqual(envelope["request_ceiling_bytes"], 128 << 20)
+        self.assertEqual(envelope["inflight_bytes"], (branch_count * 128 + 32) << 20)
 
     def test_module_sizes_pure_lf_and_workflow_contracts(self) -> None:
         files = [
