@@ -104,6 +104,18 @@ class PackfileUriContractsTest(unittest.TestCase):
             "index-pack",
         ):
             self.assertIn(token, bij_txt)
+        for token in ("Infallible", "open_confined_with_capability", "is_handle_confinement_available"):
+            self.assertIn(token, bij_txt)
+        # `fn read_dir(&self)` is a declaration, not a filesystem call: every actual call must be fd-relative.
+        read_dir_calls = [m for m in re.findall(r"read_dir\(([^)]+)\)", bij_txt) if m != "&self"]
+        self.assertTrue(read_dir_calls, "expected at least one fd-relative read_dir call")
+        for target in read_dir_calls:
+            self.assertRegex(target, r"/proc/self/fd/|/dev/fd/", f"unconfined read_dir target: {target}")
+        for forbidden in ("dir_path", "File::open(", ".join(file_name)"):
+            self.assertNotIn(forbidden, bij_txt, f"path-based confinement remnant: {forbidden}")
+        self.assertNotIn("read_dir(&", bij_txt.replace("fn read_dir(&self)", "fn read_dir"))
+        for name in ("types.rs", "cover_builder.rs", "gateway_bridge.rs"):
+            self.assertIn("HandleConfinementUnavailable", (MOD_DIR / name).read_text("utf-8"))
         for sibling in sorted(MOD_DIR.glob("*.rs")):
             if sibling.name == "pack_bijection.rs":
                 continue

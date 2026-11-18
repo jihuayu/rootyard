@@ -303,7 +303,19 @@ pub(super) async fn discover_repo_packs(
     fmt: PackObjectFormat,
     limits: &HelperResourceLimits,
 ) -> Result<(Vec<DiscoveredPack>, bool), PackfileUriError> {
-    let Some(pinned_pack_dir) = PinnedPackDir::open_confined(repo_dir)? else {
+    discover_repo_packs_with_capability(git_bin, repo_dir, fmt, limits, true).await
+}
+
+/// Discovers verified residual packs while honoring the host's directory/file handle-confinement capability.
+pub(super) async fn discover_repo_packs_with_capability(
+    git_bin: &Path,
+    repo_dir: &Path,
+    fmt: PackObjectFormat,
+    limits: &HelperResourceLimits,
+    allow_handle_confinement: bool,
+) -> Result<(Vec<DiscoveredPack>, bool), PackfileUriError> {
+    let pinned_pack_dir = PinnedPackDir::open_confined_with_capability(repo_dir, allow_handle_confinement)?;
+    let Some(pinned_pack_dir) = pinned_pack_dir else {
         return Ok((Vec::new(), false));
     };
     let rd = pinned_pack_dir.read_dir()?;

@@ -202,6 +202,10 @@ impl GatewayPackfileOffload {
             self.record_fallback(FallbackReason::ClientUnsupportedProtocols);
             return Ok(None);
         }
+        if !super::pack_bijection::is_handle_confinement_available() {
+            self.record_fallback(FallbackReason::HandleConfinementUnavailable);
+            return Ok(None);
+        }
 
         let now_unix = (self.pack_server.clock_unix)();
         let preflight_exp = now_unix.saturating_add(policy.ttl_secs.max(30));

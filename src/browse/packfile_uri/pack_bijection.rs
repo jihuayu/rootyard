@@ -1,10 +1,7 @@
 //! Byte-exact `.pack` header, `.idx` v2 OID table, and raw `.pack` stream
 //! `git index-pack --strict -o` bijection verifier (preventing unindexed gap/trailing bytes).
 
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, path::Path};
 #[cfg(unix)]
 use std::{
     ffi::CString,
@@ -13,16 +10,22 @@ use std::{
         fs::{MetadataExt, OpenOptionsExt},
         io::{AsRawFd, FromRawFd},
     },
+    path::PathBuf,
 };
-
+#[cfg(unix)]
 use uuid::Uuid;
 
 use crate::cache_wake::replica_cache::error::is_lower_hex_exact;
 
+#[cfg(unix)]
+use super::cover_git::run_git_bounded;
+
 use super::{
-    cover_git::{HelperResourceLimits, run_git_bounded},
+    cover_git::HelperResourceLimits,
     types::{PackObjectFormat, PackfileUriError},
 };
+
+const HANDLE_CONFINEMENT_REQUIRED: &str = "directory-handle confinement requires unix openat";
 
 /// Parses and validates `.pack` v2 header + `.idx` v2 fanout/OID table/embedded checksums.
 pub(super) fn parse_and_verify_idx_v2_oids(
@@ -83,36 +86,61 @@ pub(super) fn parse_and_verify_idx_v2_oids(
     Ok((pack_nr, oids))
 }
 
+#[cfg(unix)]
 struct ScratchDir(PathBuf);
 
+#[cfg(unix)]
 impl ScratchDir {
     fn create() -> Result<Self, PackfileUriError> {
+        use std::os::unix::fs::DirBuilderExt;
         let path = std::env::temp_dir().join(format!("rootyard-pack-bij-{}", Uuid::new_v4().simple()));
         let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = &mut builder;
-        }
+        builder.mode(0o700);
         builder.create(&path).map_err(|e| PackfileUriError::Internal(format!("scratch dir: {e}")))?;
         Ok(Self(path))
     }
 }
 
+#[cfg(unix)]
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+#[cfg(test)]
+thread_local! {
+    static FORCE_DISABLE_HANDLE_CONFINEMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Test-only RAII guard simulating a platform without directory/file handle confinement on the current thread.
+#[cfg(test)]
+pub(super) struct ScopedDisableHandleConfinement {
+    prev: bool,
+}
 
-/// Retained verified directory handle for `objects/pack` (or a private `ScratchDir`).
-/// On Unix, holds the live `O_DIRECTORY | O_NOFOLLOW` file descriptor and its `(dev, ino)` identity;
-/// all directory enumeration and `.pack`/`.idx` opens execute strictly relative to this descriptor
-/// (`openat` + `/proc/self/fd/<fd>`) without re-resolving parent pathname components.
+#[cfg(test)]
+impl ScopedDisableHandleConfinement {
+    pub(super) fn new() -> Self {
+        let prev = FORCE_DISABLE_HANDLE_CONFINEMENT.with(|c| c.replace(true));
+        Self { prev }
+    }
+}
+#[cfg(test)]
+impl Drop for ScopedDisableHandleConfinement {
+    fn drop(&mut self) {
+        FORCE_DISABLE_HANDLE_CONFINEMENT.with(|c| c.set(self.prev));
+    }
+}
+/// Returns `true` strictly when the host OS provides `unix` `openat` handle confinement (test-overridable).
+pub(super) fn is_handle_confinement_available() -> bool {
+    #[cfg(test)]
+    if FORCE_DISABLE_HANDLE_CONFINEMENT.with(std::cell::Cell::get) {
+        return false;
+    }
+    cfg!(unix)
+}
+
+/// Retained verified directory handle for `objects/pack` (or a private `ScratchDir`): Unix holds the
+/// live `O_DIRECTORY | O_NOFOLLOW` descriptor + `(dev, ino)`; other platforms are uninhabited (`Infallible`).
 pub(super) struct PinnedPackDir {
     #[cfg(unix)]
     dir_file: std::fs::File,
@@ -121,7 +149,7 @@ pub(super) struct PinnedPackDir {
     #[cfg(unix)]
     ino: u64,
     #[cfg(not(unix))]
-    dir_path: PathBuf,
+    _never: std::convert::Infallible,
 }
 
 impl PinnedPackDir {
@@ -158,7 +186,12 @@ impl PinnedPackDir {
     }
 
     /// Opens a single directory `dir` directly as a `PinnedPackDir`, verifying `lstat`/`fstat` inode identity.
+    #[cfg(any(unix, test))]
     pub(super) fn open_dir_direct(dir: &Path) -> Result<Self, PackfileUriError> {
+        if !is_handle_confinement_available() {
+            let _ = dir;
+            return Err(PackfileUriError::IntegrityMismatch(HANDLE_CONFINEMENT_REQUIRED.to_owned()));
+        }
         #[cfg(unix)]
         {
             let lmeta = std::fs::symlink_metadata(dir)
@@ -171,8 +204,7 @@ impl PinnedPackDir {
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(dir)
                 .map_err(|e| PackfileUriError::IntegrityMismatch(format!("open dir failed: {e}")))?;
-            let fmeta =
-                dir_file.metadata().map_err(|e| PackfileUriError::Internal(format!("fstat dir failed: {e}")))?;
+            let fmeta = dir_file.metadata().map_err(|e| PackfileUriError::Internal(format!("fstat dir failed: {e}")))?;
             if !fmeta.is_dir() || (fmeta.dev(), fmeta.ino()) != (lmeta.dev(), lmeta.ino()) {
                 return Err(PackfileUriError::IntegrityMismatch("directory inode swapped during open".to_owned()));
             }
@@ -180,18 +212,22 @@ impl PinnedPackDir {
         }
         #[cfg(not(unix))]
         {
-            let lmeta = std::fs::symlink_metadata(dir)
-                .map_err(|e| PackfileUriError::IntegrityMismatch(format!("lstat dir failed: {e}")))?;
-            if lmeta.file_type().is_symlink() || !lmeta.file_type().is_dir() {
-                return Err(PackfileUriError::IntegrityMismatch("target is not a real directory".to_owned()));
-            }
-            Ok(Self { dir_path: dir.to_path_buf() })
+            let _ = dir;
+            Err(PackfileUriError::IntegrityMismatch(HANDLE_CONFINEMENT_REQUIRED.to_owned()))
         }
     }
 
     /// Steps `repo_dir -> objects -> pack` with `openat(O_NOFOLLOW)` hops and retains only the final
-    /// verified `objects/pack` descriptor; `Ok(None)` when `objects`/`objects/pack` is absent (`ENOENT`).
-    pub(super) fn open_confined(repo_dir: &Path) -> Result<Option<Self>, PackfileUriError> {
+    /// verified `objects/pack` descriptor; `Ok(None)` when handle confinement is unavailable or
+    /// `objects`/`objects/pack` is absent (`ENOENT`).
+    pub(super) fn open_confined_with_capability(
+        repo_dir: &Path,
+        allow_handle_confinement: bool,
+    ) -> Result<Option<Self>, PackfileUriError> {
+        if !allow_handle_confinement || !is_handle_confinement_available() {
+            let _ = repo_dir;
+            return Ok(None);
+        }
         #[cfg(unix)]
         {
             let repo_pinned = Self::open_dir_direct(repo_dir)?;
@@ -211,29 +247,15 @@ impl PinnedPackDir {
         }
         #[cfg(not(unix))]
         {
-            let repo_meta = std::fs::symlink_metadata(repo_dir)
-                .map_err(|e| PackfileUriError::Internal(format!("stat repo_dir failed: {e}")))?;
-            if repo_meta.file_type().is_symlink() || !repo_meta.file_type().is_dir() {
-                return Err(PackfileUriError::IntegrityMismatch("repo_dir is not a real directory".to_owned()));
-            }
-            let objects_dir = repo_dir.join("objects");
-            match std::fs::symlink_metadata(&objects_dir) {
-                Ok(m) if !m.file_type().is_symlink() && m.file_type().is_dir() => {}
-                Ok(_) => return Err(PackfileUriError::IntegrityMismatch("objects is not a real directory".to_owned())),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(PackfileUriError::Internal(format!("stat objects dir failed: {e}"))),
-            }
-            let pack_dir = objects_dir.join("pack");
-            match std::fs::symlink_metadata(&pack_dir) {
-                Ok(m) if !m.file_type().is_symlink() && m.file_type().is_dir() => {}
-                Ok(_) => {
-                    return Err(PackfileUriError::IntegrityMismatch("objects/pack is not a real directory".to_owned()));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(PackfileUriError::Internal(format!("stat objects/pack dir failed: {e}"))),
-            }
-            Ok(Some(Self { dir_path: pack_dir }))
+            let _ = repo_dir;
+            Ok(None)
         }
+    }
+
+    /// Opens the pinned `objects/pack` directory with handle confinement required.
+    #[cfg(test)]
+    pub(super) fn open_confined(repo_dir: &Path) -> Result<Option<Self>, PackfileUriError> {
+        Self::open_confined_with_capability(repo_dir, true)
     }
 
     /// Re-`fstat`s the retained handle so a swapped/replaced directory can never be re-resolved by path.
@@ -253,34 +275,29 @@ impl PinnedPackDir {
         }
         #[cfg(not(unix))]
         {
-            let meta = std::fs::symlink_metadata(&self.dir_path)
-                .map_err(|e| PackfileUriError::Internal(format!("stat pinned pack dir: {e}")))?;
-            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-                return Err(PackfileUriError::IntegrityMismatch(
-                    "pinned pack directory handle identity mismatch".to_owned(),
-                ));
-            }
-            Ok(())
+            match self._never {}
         }
     }
 
     /// Enumerates the pinned directory through its descriptor (`/proc/self/fd/<fd>`), never the parent path.
     pub(super) fn read_dir(&self) -> Result<std::fs::ReadDir, PackfileUriError> {
-        self.verify_handle_intact()?;
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
-            std::fs::read_dir(format!("/proc/self/fd/{}", self.dir_file.as_raw_fd()))
-                .map_err(|e| PackfileUriError::Internal(format!("read_dir pinned fd failed: {e}")))
-        }
-        #[cfg(all(unix, not(target_os = "linux")))]
-        {
-            std::fs::read_dir(format!("/dev/fd/{}", self.dir_file.as_raw_fd()))
-                .map_err(|e| PackfileUriError::Internal(format!("read_dir pinned fd failed: {e}")))
+            self.verify_handle_intact()?;
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_dir(format!("/proc/self/fd/{}", self.dir_file.as_raw_fd()))
+                    .map_err(|e| PackfileUriError::Internal(format!("read_dir pinned fd failed: {e}")))
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                std::fs::read_dir(format!("/dev/fd/{}", self.dir_file.as_raw_fd()))
+                    .map_err(|e| PackfileUriError::Internal(format!("read_dir pinned fd failed: {e}")))
+            }
         }
         #[cfg(not(unix))]
         {
-            std::fs::read_dir(&self.dir_path)
-                .map_err(|e| PackfileUriError::Internal(format!("read_dir pack dir failed: {e}")))
+            match self._never {}
         }
     }
 
@@ -303,50 +320,45 @@ impl PinnedPackDir {
         }
         self.verify_handle_intact()?;
         #[cfg(unix)]
-        let file = {
-            let c_name = CString::new(file_name.as_bytes())
-                .map_err(|_| PackfileUriError::IntegrityMismatch("nul byte in pack artifact filename".to_owned()))?;
-            // SAFETY: `self.dir_file` is a live verified directory descriptor, `c_name` is a
-            // single-component NUL-terminated string, and `O_NOFOLLOW | O_NONBLOCK` never follows
-            // symlinks or blocks on FIFOs.
-            let fd = unsafe {
-                libc::openat(
-                    self.dir_file.as_raw_fd(),
-                    c_name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::ENOENT) {
-                    return Ok(None);
-                }
-                return Err(PackfileUriError::IntegrityMismatch(format!(
-                    "refused opening pack artifact via dirfd: {err}"
-                )));
-            }
-            // SAFETY: `fd` is a fresh non-negative descriptor owned exclusively by `file`.
-            unsafe { std::fs::File::from_raw_fd(fd) }
-        };
+        {
+            self.read_regular_artifact_unix(file_name, max_file_bytes, total_scanned, max_total_bytes)
+        }
         #[cfg(not(unix))]
-        let file = {
-            let path = self.dir_path.join(file_name);
-            let lmeta = match std::fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(PackfileUriError::Internal(format!("lstat pack artifact failed: {e}"))),
-            };
-            if lmeta.file_type().is_symlink() || !lmeta.file_type().is_file() {
-                return Err(PackfileUriError::IntegrityMismatch("non-regular entry in objects/pack".to_owned()));
-            }
-            match std::fs::OpenOptions::new().read(true).open(&path) {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => {
-                    return Err(PackfileUriError::IntegrityMismatch(format!("refused opening pack artifact: {e}")));
-                }
-            }
+        {
+            let _ = (file_name, max_file_bytes, total_scanned, max_total_bytes);
+            match self._never {}
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_regular_artifact_unix(
+        &self,
+        file_name: &std::ffi::OsStr,
+        max_file_bytes: u64,
+        total_scanned: &mut u64,
+        max_total_bytes: u64,
+    ) -> Result<Option<bytes::Bytes>, PackfileUriError> {
+        let c_name = CString::new(file_name.as_bytes())
+            .map_err(|_| PackfileUriError::IntegrityMismatch("nul byte in pack artifact filename".to_owned()))?;
+        // SAFETY: `self.dir_file` is a live verified directory descriptor, `c_name` is a
+        // single-component NUL-terminated string, and `O_NOFOLLOW | O_NONBLOCK` never follows
+        // symlinks or blocks on FIFOs.
+        let fd = unsafe {
+            libc::openat(
+                self.dir_file.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
         };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(PackfileUriError::IntegrityMismatch(format!("refused opening pack artifact via dirfd: {err}")));
+        }
+        // SAFETY: `fd` is a fresh non-negative descriptor owned exclusively by `file`.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
         let fmeta = file
             .metadata()
             .map_err(|e| PackfileUriError::Internal(format!("fstat pack artifact failed: {e}")))?;
@@ -431,44 +443,51 @@ pub(super) async fn verify_raw_pack_stream_bijection(
     expected_idx_bytes: &[u8],
     limits: &HelperResourceLimits,
 ) -> Result<Vec<u8>, PackfileUriError> {
-    let scratch = ScratchDir::create()?;
-    let scratch_pack = scratch.0.join("candidate.pack");
-    let scratch_idx = scratch.0.join("candidate.idx");
+    if !is_handle_confinement_available() {
+        let _ = (git_bin, repo_dir, pack_bytes, expected_idx_bytes, limits);
+        return Err(PackfileUriError::IntegrityMismatch(HANDLE_CONFINEMENT_REQUIRED.to_owned()));
+    }
+    #[cfg(unix)]
     {
-        let mut p_opts = std::fs::OpenOptions::new();
-        p_opts.write(true).create_new(true);
-        #[cfg(unix)]
+        let scratch = ScratchDir::create()?;
+        let scratch_pack = scratch.0.join("candidate.pack");
+        let scratch_idx = scratch.0.join("candidate.idx");
         {
             use std::os::unix::fs::OpenOptionsExt;
+            let mut p_opts = std::fs::OpenOptions::new();
+            p_opts.write(true).create_new(true);
             p_opts.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let mut pf = p_opts
+                .open(&scratch_pack)
+                .map_err(|e| PackfileUriError::Internal(format!("create scratch pack: {e}")))?;
+            std::io::Write::write_all(&mut pf, pack_bytes)
+                .map_err(|e| PackfileUriError::Internal(format!("write scratch pack: {e}")))?;
         }
-        let mut pf = p_opts
-            .open(&scratch_pack)
-            .map_err(|e| PackfileUriError::Internal(format!("create scratch pack: {e}")))?;
-        std::io::Write::write_all(&mut pf, pack_bytes)
-            .map_err(|e| PackfileUriError::Internal(format!("write scratch pack: {e}")))?;
+        let (Some(out_str), Some(pack_str)) = (scratch_idx.to_str(), scratch_pack.to_str()) else {
+            return Err(PackfileUriError::IntegrityMismatch("non-utf8 scratch path".to_owned()));
+        };
+        let ip_args = ["index-pack", "--strict", "-o", out_str, pack_str];
+        run_git_bounded(git_bin, repo_dir, &ip_args, None, 4096, limits.timeout).await?;
+        let scratch_pinned = PinnedPackDir::open_dir_direct(&scratch.0)?;
+        let mut fresh_total = 0u64;
+        let Some(fresh_idx) = scratch_pinned.read_regular_artifact(
+            std::ffi::OsStr::new("candidate.idx"),
+            limits.max_single_idx_bytes,
+            &mut fresh_total,
+            limits.max_single_idx_bytes,
+        )?
+        else {
+            return Err(PackfileUriError::IntegrityMismatch("missing scratch idx".to_owned()));
+        };
+        if &fresh_idx[..] != expected_idx_bytes {
+            return Err(PackfileUriError::IntegrityMismatch("raw pack stream re-index mismatches idx bytes".to_owned()));
+        }
+        let vp_args = ["verify-pack", "-v", out_str];
+        run_git_bounded(git_bin, repo_dir, &vp_args, None, limits.max_stdout_bytes, limits.timeout).await
     }
-    let (Some(out_str), Some(pack_str)) = (scratch_idx.to_str(), scratch_pack.to_str()) else {
-        return Err(PackfileUriError::IntegrityMismatch("non-utf8 scratch path".to_owned()));
-    };
-    run_git_bounded(git_bin, repo_dir, &["index-pack", "--strict", "-o", out_str, pack_str], None, 4096, limits.timeout)
-        .await?;
-    let scratch_pinned = PinnedPackDir::open_dir_direct(&scratch.0)?;
-    let mut fresh_total = 0u64;
-    let Some(fresh_idx) = scratch_pinned.read_regular_artifact(
-        std::ffi::OsStr::new("candidate.idx"),
-        limits.max_single_idx_bytes,
-        &mut fresh_total,
-        limits.max_single_idx_bytes,
-    )?
-    else {
-        return Err(PackfileUriError::IntegrityMismatch("missing scratch idx".to_owned()));
-    };
-    if &fresh_idx[..] != expected_idx_bytes {
-        return Err(PackfileUriError::IntegrityMismatch(
-            "raw pack stream re-index mismatches idx bytes".to_owned(),
-        ));
+    #[cfg(not(unix))]
+    {
+        let _ = (git_bin, repo_dir, pack_bytes, expected_idx_bytes, limits);
+        Err(PackfileUriError::IntegrityMismatch(HANDLE_CONFINEMENT_REQUIRED.to_owned()))
     }
-    run_git_bounded(git_bin, repo_dir, &["verify-pack", "-v", out_str], None, limits.max_stdout_bytes, limits.timeout)
-        .await
 }

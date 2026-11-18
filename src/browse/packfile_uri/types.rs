@@ -408,6 +408,7 @@ impl fmt::Debug for SignedPackfileDescriptor {
 #[serde(rename_all = "snake_case")]
 pub enum FallbackReason {
     FeatureDisabled,
+    HandleConfinementUnavailable,
     ClientOmittedPackfileUris,
     ClientUnsupportedProtocols,
     UnsupportedFetchArgs,

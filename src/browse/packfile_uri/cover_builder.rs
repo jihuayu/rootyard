@@ -112,6 +112,9 @@ pub async fn build_verified_cover_proof_from_repo(
     params: &RepoCoverBuildParams<'_>,
 ) -> Result<CoverBuildOutcome, PackfileUriError> {
     params.subject.validate()?;
+    if !super::pack_bijection::is_handle_confinement_available() {
+        return Ok(CoverBuildOutcome::Fallback(FallbackReason::HandleConfinementUnavailable));
+    }
     if params.advertised_refs.is_empty() || params.wants.is_empty() {
         return Ok(CoverBuildOutcome::Fallback(FallbackReason::IncompleteClosure));
     }

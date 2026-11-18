@@ -5,7 +5,10 @@
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -15,7 +18,8 @@ use uuid::Uuid;
 use crate::ref_store::GitObjectFormat;
 
 use super::{
-    pack_bijection::PinnedPackDir,
+    cover_git::{discover_repo_packs, discover_repo_packs_with_capability},
+    pack_bijection::{PinnedPackDir, ScopedDisableHandleConfinement, is_handle_confinement_available},
     tests::{build_v2_fetch_wire, sample_keyring, sample_policy, sample_resolver, sample_subject},
     *,
 };
@@ -88,11 +92,10 @@ async fn pinned_pack_dir_reads_verified_fd_after_parent_path_swapped_to_attacker
     let pack_file_name = real_pack_path.file_name().expect("pack file name").to_os_string();
     let real_pack_bytes = std::fs::read(&real_pack_path).unwrap();
 
-    let pinned = PinnedPackDir::open_confined(&bare).unwrap().expect("pinned pack dir");
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
+        let pinned = PinnedPackDir::open_confined(&bare).unwrap().expect("pinned pack dir");
         let pack_dir = bare.join("objects").join("pack");
         let moved_real = bare.join("objects").join("pack.moved_real");
         std::fs::rename(&pack_dir, &moved_real).unwrap();
@@ -117,12 +120,9 @@ async fn pinned_pack_dir_reads_verified_fd_after_parent_path_swapped_to_attacker
 
     #[cfg(not(unix))]
     {
-        let mut total = 0u64;
-        let got = pinned
-            .read_regular_artifact(pack_file_name.as_os_str(), 1 << 20, &mut total, 1 << 20)
-            .unwrap()
-            .expect("pack bytes");
-        assert_eq!(&got[..], real_pack_bytes.as_slice());
+        assert!(PinnedPackDir::open_confined(&bare).unwrap().is_none());
+        assert!(PinnedPackDir::open_dir_direct(&bare).is_err());
+        let _ = (&pack_file_name, &real_pack_bytes);
     }
 }
 
@@ -199,5 +199,151 @@ async fn parent_objects_or_pack_dir_symlink_and_openat_failures_fallback_to_inli
     {
         // Hosts without `openat` still exercise the shared setup (no dead-code/unused warnings).
         let _ = (&offload, &wire, &adv, &bare, sample_subject(), Duration::from_secs(10), Uuid::new_v4());
+    }
+}
+
+#[tokio::test]
+async fn platforms_without_handle_confinement_fallback_cleanly_to_standard_inline_git_response() {
+    let git_bin = find_git_bin();
+    let tmp = TempDir::new().unwrap();
+    let (bare, tip) = create_repacked_bare_repo(tmp.path(), &git_bin);
+    let wire = build_v2_fetch_wire(&["packfile-uris https", &format!("want {tip}\n"), "done\n"]);
+    let adv = vec![("refs/heads/main".to_owned(), tip.clone())];
+
+    #[cfg(unix)]
+    {
+        let mut policy = sample_policy();
+        policy.min_pack_bytes_for_offload = 64;
+        let armed =
+            GatewayPackfileOffload::new(Arc::new(sample_keyring()), policy, "cdn.rootyard.test", sample_resolver());
+        let resp = armed
+            .try_serve_upload_pack_v2(GatewayFetchBridgeInput {
+                git_binary: &git_bin,
+                repo_dir: &bare,
+                advertised_refs: &adv,
+                object_format: GitObjectFormat::Sha1,
+                request_bytes: &wire,
+                tenant_id: Uuid::new_v4(),
+                repository_id: Uuid::new_v4(),
+                history_incarnation: Uuid::new_v4(),
+                authority_epoch: 1,
+                group_epoch: 1,
+                subject: sample_subject(),
+                provider: "s3",
+                backend_identity_hex: &"ab".repeat(32),
+                request_timeout: Duration::from_secs(10),
+                max_response_bytes: 4 * 1024 * 1024,
+                live_revalidator: Arc::new(|| Box::pin(async { Ok(()) })),
+            })
+            .await
+            .unwrap()
+            .expect("handle-confined host must emit an offload response");
+        let uris = decode_packfile_uris_section(&resp, PackObjectFormat::Sha1).unwrap();
+        assert_eq!(uris.len(), 1);
+        assert!(uris[0].1.starts_with("https://cdn.rootyard.test/"));
+    }
+
+    let guard = ScopedDisableHandleConfinement::new();
+    assert!(!is_handle_confinement_available());
+    assert!(PinnedPackDir::open_confined_with_capability(&bare, false).unwrap().is_none());
+    assert!(PinnedPackDir::open_confined(&bare).unwrap().is_none());
+    assert!(matches!(PinnedPackDir::open_dir_direct(&bare), Err(PackfileUriError::IntegrityMismatch(_))));
+
+    let limits = HelperResourceLimits::default();
+    let (packs_cap, rej_cap) =
+        discover_repo_packs_with_capability(&git_bin, &bare, PackObjectFormat::Sha1, &limits, false).await.unwrap();
+    assert!(packs_cap.is_empty() && !rej_cap);
+    let (packs_def, rej_def) = discover_repo_packs(&git_bin, &bare, PackObjectFormat::Sha1, &limits).await.unwrap();
+    assert!(packs_def.is_empty() && !rej_def);
+
+    let outcome = build_verified_cover_proof_from_repo(&RepoCoverBuildParams {
+        git_binary: &git_bin,
+        repo_dir: &bare,
+        advertised_refs: &adv,
+        wants: std::slice::from_ref(&tip),
+        haves: &[],
+        include_tag: false,
+        tenant_id: Uuid::new_v4(),
+        repository_id: Uuid::new_v4(),
+        history_incarnation: Uuid::new_v4(),
+        authority_epoch: 1,
+        group_epoch: 1,
+        object_format: GitObjectFormat::Sha1,
+        subject: sample_subject(),
+        provider: "s3",
+        backend_identity_hex: &"ab".repeat(32),
+        limits: HelperResourceLimits::default(),
+    })
+    .await
+    .unwrap();
+    assert!(matches!(outcome, CoverBuildOutcome::Fallback(FallbackReason::HandleConfinementUnavailable)));
+
+    let mut policy = sample_policy();
+    policy.min_pack_bytes_for_offload = 64;
+    let offload =
+        GatewayPackfileOffload::new(Arc::new(sample_keyring()), policy, "cdn.rootyard.test", sample_resolver());
+    let reval_calls = Arc::new(AtomicUsize::new(0));
+    let reval_counter = Arc::clone(&reval_calls);
+    let live_revalidator: LiveRevalidatorFn = Arc::new(move || {
+        let counter = Arc::clone(&reval_counter);
+        Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    });
+    let res = offload
+        .try_serve_upload_pack_v2(GatewayFetchBridgeInput {
+            git_binary: &git_bin,
+            repo_dir: &bare,
+            advertised_refs: &adv,
+            object_format: GitObjectFormat::Sha1,
+            request_bytes: &wire,
+            tenant_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            history_incarnation: Uuid::new_v4(),
+            authority_epoch: 1,
+            group_epoch: 1,
+            subject: sample_subject(),
+            provider: "s3",
+            backend_identity_hex: &"ab".repeat(32),
+            request_timeout: Duration::from_secs(10),
+            max_response_bytes: 4 * 1024 * 1024,
+            live_revalidator,
+        })
+        .await
+        .unwrap();
+    assert!(res.is_none());
+    assert_eq!(offload.last_fallback_reason(), Some(FallbackReason::HandleConfinementUnavailable));
+    assert_eq!(offload.offload_responses.load(Ordering::SeqCst), 0);
+    assert_eq!(offload.inline_fallback_responses.load(Ordering::SeqCst), 1);
+    assert_eq!(reval_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(offload.active_preflight_count(), 0);
+    assert_eq!(offload.pack_server().pack_count(), 0);
+    assert_eq!(offload.planner().leases().active_pin_count(), 0);
+
+    let stripped = strip_packfile_uris_from_v2_request(&wire).expect("strip packfile-uris");
+    let inline_resp = run_git_bounded(
+        &git_bin,
+        &bare,
+        &["-c", "protocol.version=2", "upload-pack", "--stateless-rpc", "."],
+        Some(&stripped),
+        4 * 1024 * 1024,
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert!(decode_packfile_uris_section(&inline_resp, PackObjectFormat::Sha1).unwrap().is_empty());
+    assert!(inline_resp.windows(9).any(|w| w == b"packfile\n"));
+    assert!(inline_resp.windows(4).any(|w| w == b"PACK"));
+
+    drop(guard);
+    #[cfg(unix)]
+    {
+        assert!(is_handle_confinement_available());
+        assert!(PinnedPackDir::open_confined(&bare).unwrap().is_some());
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(!is_handle_confinement_available());
     }
 }

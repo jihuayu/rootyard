@@ -1,25 +1,22 @@
 //! Regressions for confined `objects/pack` traversal/symlink rejection, bounded artifact
 //! reads, and zero-TOCTOU `Bytes` verification/serving after on-disk pack tampering.
 
-use std::{
-    collections::HashMap,
-    ffi::OsStr,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::{Path, PathBuf}, process::Command};
+
+#[cfg(unix)]
+use std::{collections::HashMap, ffi::OsStr, sync::Arc, time::Duration};
 
 use tempfile::TempDir;
 use uuid::Uuid;
 
+#[cfg(unix)]
 use crate::ref_store::GitObjectFormat;
 
+use super::{pack_bijection::PinnedPackDir, tests::sample_subject, *};
+#[cfg(unix)]
 use super::{
     cover_git::discover_repo_packs,
-    pack_bijection::PinnedPackDir,
-    tests::{build_v2_fetch_wire, sample_keyring, sample_policy, sample_resolver, sample_subject},
-    *,
+    tests::{build_v2_fetch_wire, sample_keyring, sample_policy, sample_resolver},
 };
 
 fn find_git_bin() -> PathBuf {
@@ -76,6 +73,7 @@ fn pack_dir_of(bare: &Path) -> PathBuf {
     bare.join("objects").join("pack")
 }
 
+#[cfg(unix)]
 fn only_pack_path(bare: &Path) -> PathBuf {
     std::fs::read_dir(pack_dir_of(bare))
         .unwrap()
@@ -85,18 +83,12 @@ fn only_pack_path(bare: &Path) -> PathBuf {
         .expect("repacked .pack file")
 }
 
+#[cfg(unix)]
 fn remove_pack_file(path: &Path) {
-    #[cfg(not(unix))]
-    {
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mut perms = meta.permissions();
-            perms.set_readonly(false);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-    }
     std::fs::remove_file(path).unwrap();
 }
 
+#[cfg(unix)]
 fn index_pack_strict_succeeds(git_bin: &Path, scratch: &Path, pack_bytes: &[u8]) -> bool {
     let pack = scratch.join("served.pack");
     let idx = scratch.join("served.idx");
@@ -123,18 +115,26 @@ async fn confined_pack_open_rejects_symlinks_traversal_and_nonregular_entries_wi
     let git_bin = find_git_bin();
     let tmp = TempDir::new().unwrap();
     let (bare, tip) = create_repacked_bare_repo(tmp.path(), &git_bin);
-    let pinned = PinnedPackDir::open_confined(&bare).unwrap().expect("pinned pack dir");
 
-    for bad in ["../outside.pack", "sub/evil.pack", "."] {
-        let mut total = 0u64;
-        let res = pinned.read_regular_artifact(OsStr::new(bad), 1 << 20, &mut total, 1 << 20);
-        assert!(matches!(res, Err(PackfileUriError::IntegrityMismatch(_))), "accepted traversal name {bad}");
-        assert_eq!(total, 0);
+    #[cfg(not(unix))]
+    {
+        assert!(PinnedPackDir::open_confined(&bare).unwrap().is_none());
+        assert!(PinnedPackDir::open_dir_direct(&pack_dir_of(&bare)).is_err());
+        let _ = (&git_bin, &tip);
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
+        let pinned = PinnedPackDir::open_confined(&bare).unwrap().expect("pinned pack dir");
+
+        for bad in ["../outside.pack", "sub/evil.pack", "."] {
+            let mut total = 0u64;
+            let res = pinned.read_regular_artifact(OsStr::new(bad), 1 << 20, &mut total, 1 << 20);
+            assert!(matches!(res, Err(PackfileUriError::IntegrityMismatch(_))), "accepted traversal name {bad}");
+            assert_eq!(total, 0);
+        }
+
         let pack_dir = pack_dir_of(&bare);
         let outside = tmp.path().join("outside.pack");
         let outside_bytes = b"PACK-OUTSIDE-SECRET-MUST-NEVER-BE-READ";
@@ -213,11 +213,6 @@ async fn confined_pack_open_rejects_symlinks_traversal_and_nonregular_entries_wi
         assert!(res.is_none());
         assert_eq!(offload.pack_server().pack_count(), 0);
     }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (&bare, &tip);
-    }
 }
 
 #[tokio::test]
@@ -226,23 +221,34 @@ async fn bounded_artifact_reader_enforces_single_file_and_cumulative_byte_caps()
     let pack_dir = tmp.path().join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir).unwrap();
     std::fs::write(pack_dir.join("big.pack"), vec![0x5au8; 4096]).unwrap();
-    let pinned = PinnedPackDir::open_dir_direct(&pack_dir).unwrap();
-    let name = OsStr::new("big.pack");
 
-    let mut total = 0u64;
-    let res = pinned.read_regular_artifact(name, 2048, &mut total, 1 << 20);
-    assert!(matches!(res, Err(PackfileUriError::CapacityExceeded(_))));
-    assert_eq!(total, 0);
+    #[cfg(not(unix))]
+    {
+        assert!(PinnedPackDir::open_confined(tmp.path()).unwrap().is_none());
+        assert!(PinnedPackDir::open_dir_direct(&pack_dir).is_err());
+    }
 
-    let mut total = 3000u64;
-    let res = pinned.read_regular_artifact(name, 8192, &mut total, 5000);
-    assert!(matches!(res, Err(PackfileUriError::CapacityExceeded(_))));
-    assert_eq!(total, 3000);
+    #[cfg(unix)]
+    {
+        let pinned = PinnedPackDir::open_dir_direct(&pack_dir).unwrap();
+        let name = OsStr::new("big.pack");
 
-    let mut total = 1000u64;
-    let bytes = pinned.read_regular_artifact(name, 4096, &mut total, 10_000).unwrap().expect("within-cap artifact");
-    assert_eq!(bytes.len(), 4096);
-    assert_eq!(total, 5096);
+        let mut total = 0u64;
+        let res = pinned.read_regular_artifact(name, 2048, &mut total, 1 << 20);
+        assert!(matches!(res, Err(PackfileUriError::CapacityExceeded(_))));
+        assert_eq!(total, 0);
+
+        let mut total = 3000u64;
+        let res = pinned.read_regular_artifact(name, 8192, &mut total, 5000);
+        assert!(matches!(res, Err(PackfileUriError::CapacityExceeded(_))));
+        assert_eq!(total, 3000);
+
+        let mut total = 1000u64;
+        let read = pinned.read_regular_artifact(name, 4096, &mut total, 10_000);
+        let bytes = read.unwrap().expect("within-cap artifact");
+        assert_eq!(bytes.len(), 4096);
+        assert_eq!(total, 5096);
+    }
 }
 
 #[tokio::test]
@@ -254,131 +260,141 @@ async fn verified_pack_bytes_pointer_equals_served_payload_and_survives_post_sca
     let repository = Uuid::new_v4();
     let subject = sample_subject();
 
-    let (mut packs, rejected) =
-        discover_repo_packs(&git_bin, &bare, PackObjectFormat::Sha1, &HelperResourceLimits::default())
-            .await
-            .unwrap();
-    assert!(!rejected);
-    assert_eq!(packs.len(), 1);
-    let pack_oid = packs[0].pack_oid.clone();
-    let pack_hash_hex = packs[0].pack_hash_hex.clone();
-    let len = packs[0].pack_bytes.len();
-    let expected = packs[0].pack_bytes.to_vec();
-    let ptr = packs[0].pack_bytes.as_ptr();
-    let dp = packs.pop().unwrap();
-    let mut materialized: HashMap<String, bytes::Bytes> = HashMap::new();
-    materialized.insert(dp.pack_oid.clone(), dp.pack_bytes);
-    assert_eq!(materialized[&pack_oid].as_ptr(), ptr, "Bytes must move without reallocation");
-    assert_eq!(materialized[&pack_oid].len(), len);
-    drop(materialized);
+    #[cfg(not(unix))]
+    {
+        assert!(PinnedPackDir::open_confined(&bare).unwrap().is_none());
+        assert!(PinnedPackDir::open_dir_direct(&pack_dir_of(&bare)).is_err());
+        let _ = (&git_bin, &tip, &tenant, &repository, &subject);
+    }
 
-    let outcome = build_verified_cover_proof_from_repo(&RepoCoverBuildParams {
-        git_binary: &git_bin,
-        repo_dir: &bare,
-        advertised_refs: &[("refs/heads/main".to_owned(), tip.clone())],
-        wants: std::slice::from_ref(&tip),
-        haves: &[],
-        include_tag: false,
-        tenant_id: tenant,
-        repository_id: repository,
-        history_incarnation: Uuid::new_v4(),
-        authority_epoch: 1,
-        group_epoch: 1,
-        object_format: GitObjectFormat::Sha1,
-        subject,
-        provider: "s3",
-        backend_identity_hex: &"cd".repeat(32),
-        limits: HelperResourceLimits::default(),
-    })
-    .await
-    .unwrap();
-    let bundle = match outcome {
-        CoverBuildOutcome::Planned(b) => b,
-        CoverBuildOutcome::Fallback(reason) => panic!("expected planned bundle, got fallback {reason:?}"),
-    };
-    let bundled = bundle.raw_pack_bytes.get(&pack_oid).expect("verified raw pack bytes");
-    assert_eq!(&bundled[..], expected.as_slice());
-    let shared: bytes::Bytes = (*bundled).clone();
-    assert_eq!(shared.as_ptr(), bundled.as_ptr(), "clone must share the verified allocation");
-    assert_eq!(shared.len(), len);
+    #[cfg(unix)]
+    {
+        let (mut packs, rejected) =
+            discover_repo_packs(&git_bin, &bare, PackObjectFormat::Sha1, &HelperResourceLimits::default())
+                .await
+                .unwrap();
+        assert!(!rejected);
+        assert_eq!(packs.len(), 1);
+        let pack_oid = packs[0].pack_oid.clone();
+        let pack_hash_hex = packs[0].pack_hash_hex.clone();
+        let len = packs[0].pack_bytes.len();
+        let expected = packs[0].pack_bytes.to_vec();
+        let ptr = packs[0].pack_bytes.as_ptr();
+        let dp = packs.pop().unwrap();
+        let mut materialized: HashMap<String, bytes::Bytes> = HashMap::new();
+        materialized.insert(dp.pack_oid.clone(), dp.pack_bytes);
+        assert_eq!(materialized[&pack_oid].as_ptr(), ptr, "Bytes must move without reallocation");
+        assert_eq!(materialized[&pack_oid].len(), len);
+        drop(materialized);
 
-    let mut policy = sample_policy();
-    policy.min_pack_bytes_for_offload = 64;
-    let offload =
-        GatewayPackfileOffload::new(Arc::new(sample_keyring()), policy, "cdn.rootyard.test", sample_resolver());
-    let wire = build_v2_fetch_wire(&["packfile-uris https", &format!("want {tip}\n"), "done\n"]);
-    let adv = vec![("refs/heads/main".to_owned(), tip.clone())];
-    let resp = offload
-        .try_serve_upload_pack_v2(GatewayFetchBridgeInput {
+        let outcome = build_verified_cover_proof_from_repo(&RepoCoverBuildParams {
             git_binary: &git_bin,
             repo_dir: &bare,
-            advertised_refs: &adv,
-            object_format: GitObjectFormat::Sha1,
-            request_bytes: &wire,
+            advertised_refs: &[("refs/heads/main".to_owned(), tip.clone())],
+            wants: std::slice::from_ref(&tip),
+            haves: &[],
+            include_tag: false,
             tenant_id: tenant,
             repository_id: repository,
             history_incarnation: Uuid::new_v4(),
             authority_epoch: 1,
             group_epoch: 1,
-            subject,
-            provider: "s3",
-            backend_identity_hex: &"cd".repeat(32),
-            request_timeout: Duration::from_secs(10),
-            max_response_bytes: 4 * 1024 * 1024,
-            live_revalidator: Arc::new(|| Box::pin(async { Ok(()) })),
-        })
-        .await
-        .unwrap()
-        .expect("offload path should emit a v2 response");
-    let uris = decode_packfile_uris_section(&resp, PackObjectFormat::Sha1).unwrap();
-    assert_eq!(uris.len(), 1);
-    let (signed_hash, signed_uri) = &uris[0];
-    assert_eq!(signed_hash, &pack_hash_hex);
-
-    // Corrupt/remove the on-disk pack AFTER verification: serving must use the already-read Bytes.
-    let disk_pack = only_pack_path(&bare);
-    remove_pack_file(&disk_pack);
-    assert!(!disk_pack.exists());
-    let served = serve_signed_packfile(
-        Arc::clone(offload.pack_server()),
-        &ServePackRequest {
-            raw_uri: signed_uri.as_str(),
-            inbound_host: "cdn.rootyard.test",
-            tenant_id: tenant,
-            repository_id: repository,
-            pack_oid: pack_oid.as_str(),
-            object_format: PackObjectFormat::Sha1,
-            presented_subject: None,
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(served, expected);
-    validate_pack_bytes_integrity(&served, len as u64, &pack_oid, &pack_hash_hex, PackObjectFormat::Sha1).unwrap();
-    let scratch = TempDir::new().unwrap();
-    assert!(index_pack_strict_succeeds(&git_bin, scratch.path(), &served));
-
-    let bad_helper = offload
-        .try_serve_upload_pack_v2(GatewayFetchBridgeInput {
-            git_binary: Path::new("/nonexistent-git-helper-bin"),
-            repo_dir: &bare,
-            advertised_refs: &adv,
             object_format: GitObjectFormat::Sha1,
-            request_bytes: &wire,
-            tenant_id: tenant,
-            repository_id: repository,
-            history_incarnation: Uuid::new_v4(),
-            authority_epoch: 1,
-            group_epoch: 1,
             subject,
             provider: "s3",
             backend_identity_hex: &"cd".repeat(32),
-            request_timeout: Duration::from_secs(10),
-            max_response_bytes: 4 * 1024 * 1024,
-            live_revalidator: Arc::new(|| Box::pin(async { Ok(()) })),
+            limits: HelperResourceLimits::default(),
         })
         .await
         .unwrap();
-    assert!(bad_helper.is_none());
-    assert_eq!(offload.last_fallback_reason(), Some(FallbackReason::IncompleteClosure));
+        let bundle = match outcome {
+            CoverBuildOutcome::Planned(b) => b,
+            CoverBuildOutcome::Fallback(reason) => panic!("expected planned bundle, got fallback {reason:?}"),
+        };
+        let bundled = bundle.raw_pack_bytes.get(&pack_oid).expect("verified raw pack bytes");
+        assert_eq!(&bundled[..], expected.as_slice());
+        let shared: bytes::Bytes = (*bundled).clone();
+        assert_eq!(shared.as_ptr(), bundled.as_ptr(), "clone must share the verified allocation");
+        assert_eq!(shared.len(), len);
+
+        let mut policy = sample_policy();
+        policy.min_pack_bytes_for_offload = 64;
+        let offload =
+            GatewayPackfileOffload::new(Arc::new(sample_keyring()), policy, "cdn.rootyard.test", sample_resolver());
+        let wire = build_v2_fetch_wire(&["packfile-uris https", &format!("want {tip}\n"), "done\n"]);
+        let adv = vec![("refs/heads/main".to_owned(), tip.clone())];
+        let resp = offload
+            .try_serve_upload_pack_v2(GatewayFetchBridgeInput {
+                git_binary: &git_bin,
+                repo_dir: &bare,
+                advertised_refs: &adv,
+                object_format: GitObjectFormat::Sha1,
+                request_bytes: &wire,
+                tenant_id: tenant,
+                repository_id: repository,
+                history_incarnation: Uuid::new_v4(),
+                authority_epoch: 1,
+                group_epoch: 1,
+                subject,
+                provider: "s3",
+                backend_identity_hex: &"cd".repeat(32),
+                request_timeout: Duration::from_secs(10),
+                max_response_bytes: 4 * 1024 * 1024,
+                live_revalidator: Arc::new(|| Box::pin(async { Ok(()) })),
+            })
+            .await
+            .unwrap()
+            .expect("offload path should emit a v2 response");
+        let uris = decode_packfile_uris_section(&resp, PackObjectFormat::Sha1).unwrap();
+        assert_eq!(uris.len(), 1);
+        let (signed_hash, signed_uri) = &uris[0];
+        assert_eq!(signed_hash, &pack_hash_hex);
+
+        // Corrupt/remove the on-disk pack AFTER verification: serving must use the already-read Bytes.
+        let disk_pack = only_pack_path(&bare);
+        remove_pack_file(&disk_pack);
+        assert!(!disk_pack.exists());
+        let served = serve_signed_packfile(
+            Arc::clone(offload.pack_server()),
+            &ServePackRequest {
+                raw_uri: signed_uri.as_str(),
+                inbound_host: "cdn.rootyard.test",
+                tenant_id: tenant,
+                repository_id: repository,
+                pack_oid: pack_oid.as_str(),
+                object_format: PackObjectFormat::Sha1,
+                presented_subject: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(served, expected);
+        validate_pack_bytes_integrity(&served, len as u64, &pack_oid, &pack_hash_hex, PackObjectFormat::Sha1).unwrap();
+        let scratch = TempDir::new().unwrap();
+        assert!(index_pack_strict_succeeds(&git_bin, scratch.path(), &served));
+
+        let bad_helper = offload
+            .try_serve_upload_pack_v2(GatewayFetchBridgeInput {
+                git_binary: Path::new("/nonexistent-git-helper-bin"),
+                repo_dir: &bare,
+                advertised_refs: &adv,
+                object_format: GitObjectFormat::Sha1,
+                request_bytes: &wire,
+                tenant_id: tenant,
+                repository_id: repository,
+                history_incarnation: Uuid::new_v4(),
+                authority_epoch: 1,
+                group_epoch: 1,
+                subject,
+                provider: "s3",
+                backend_identity_hex: &"cd".repeat(32),
+                request_timeout: Duration::from_secs(10),
+                max_response_bytes: 4 * 1024 * 1024,
+                live_revalidator: Arc::new(|| Box::pin(async { Ok(()) })),
+            })
+            .await
+            .unwrap();
+        assert!(bad_helper.is_none());
+        assert_eq!(offload.last_fallback_reason(), Some(FallbackReason::IncompleteClosure));
+    }
 }
