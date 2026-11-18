@@ -12,9 +12,13 @@
 //! Every case is `#[ignore]`, hard-fails when PostgreSQL, the Blob profile, the
 //! trusted Git binary or the disposable-bucket attestation is absent, and never
 //! skips once explicitly invoked. The test writes no gate, authority, decision,
-//! terminal, approval or event row directly: P0 is admitted and the P1 gate
-//! advance, P0 superseded refusal, terminal mirror and rotation all run through
-//! production methods over real A3/A4/native artifacts.
+//! terminal, approval or event row directly: P0 is admitted and staged, an
+//! unrelated ref B advances the gate through a real authorized P1 commit, P0 is
+//! durably refused and mirrored as retirement-required without wrapper mutation,
+//! and P2 re-executes the identical P0 wire ref command with a fresh private
+//! identity/sequence/plan/proof/registration before a real authorized commit and
+//! A5 snapshot. Collaboration uses separate ref A for P0/P2 and ref B for P1 so
+//! the retried wire command remains exactly the original one.
 //!
 //! Run explicitly (with an owned disposable Blob bucket/prefix):
 //!
@@ -26,9 +30,12 @@
 //! ROOTYARD_BLOB_ACCESS_KEY_ID=... ROOTYARD_BLOB_SECRET_ACCESS_KEY=... \
 //! ROOTYARD_BLOB_ROOT=slot-one-proof-<unique> ROOTYARD_TEST_GIT=/absolute/git \
 //! cargo test --locked --no-default-features --lib \
-//!   ref_store::pg::slot_one::tests::native::slot_zero_rejection_selects_retirement_on_real_a3_a4 \
+//!   ref_store::pg::slot_one::tests::native::slot_one_rotation_replays_identical_wire_command_on_real_a3_a4_a5 \
 //!   -- --ignored --exact --test-threads=1
 //! ```
+//!
+//! The smaller `slot_zero_rejection_selects_retirement_on_real_a3_a4` case covers
+//! the same P0/P1/refusal/mirror prefix and can be selected by its exact name.
 
 #![allow(clippy::too_many_arguments)]
 #![allow(dead_code)]
@@ -52,15 +59,16 @@ use rootyard::ref_store::{
     OperationLookup, OperationRecord, OperationState, RefCommitResult, RefName, RefPrecondition, RefTarget, RefUpdate,
     RequestDigest, TerminalKind,
     core::pack_commit::{
-        AuthorizedCommitMode, AuthorizedCommitReceipt, ContentDigest, PackArtifactRole, PackCommitBaseline,
-        PackCommitError, PackCommitExpectation, PackCommitPlan, PackCommitScope, PackCommitTerminal,
-        PackMembershipEntry, PackPendingToken, PgAuthorizedCommit, PgPackCommit, PlannedArtifact, PlannedPack,
-        PrepareOutcome,
+        AuthorizedCommitMode, AuthorizedCommitReceipt, CapturedRef, ContentDigest, PackArtifactRole,
+        PackCommitBaseline, PackCommitError, PackCommitExpectation, PackCommitPlan, PackCommitRejectCode,
+        PackCommitScope, PackCommitTerminal, PackMembershipEntry, PackPendingToken, PgAuthorizedCommit, PgPackCommit,
+        PlannedArtifact, PlannedPack, PrepareOutcome,
     },
     pg::{
         PgRefStore,
-        public_attempt::PublicAttemptRequest,
+        public_attempt::{PublicAttemptLookup, PublicAttemptRequest},
         public_terminal::{PublicAttemptRetirement, PublicAttemptTerminalOutcome},
+        slot_one::{SlotOneRotationReceipt, SlotOneRotationRequest},
         slot_zero::{SlotZeroAdmissionRequest, SlotZeroReceipt},
     },
 };
@@ -131,6 +139,29 @@ async fn slot_zero_rejection_selects_retirement_on_real_a3_a4() -> Result<()> {
     db.finish(outcome).await
 }
 
+#[tokio::test]
+#[ignore = "requires real PostgreSQL 17, S3/Garage Blob and native Git"]
+async fn slot_one_rotation_replays_identical_wire_command_on_real_a3_a4_a5() -> Result<()> {
+    require_owned_disposable_blob_fixture()?;
+    let db = db::Db::setup().await?;
+    let outcome: Result<()> = async {
+        require_postgres_17(&db).await?;
+        let store = common::open_store()?;
+        let git = git::git_binary()?;
+        let retired = retire_p0(&db, &store, &git).await?;
+        let p0_publication = publication_for(&db, retired.repository.id, retired.admission.private_id).await?;
+
+        let (plan, rotation, gate) = rotate_and_commit(&db, &store, &git, &retired).await?;
+        assert_a5_after_rotation(&db, &store, &retired, &plan).await?;
+        assert_no_registry_promotion(&db, &retired, &plan, &rotation, &p0_publication).await?;
+        assert_current_pending_wrapper_gap(&db, &retired).await?;
+        ensure!(gate.revision() == retired.gate.revision() + 1, "P2 did not advance the gate exactly one revision");
+        Ok(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
 /// Admit P0 for the exact ref A wire command, stage its real A3/A4 artifacts,
 /// advance the gate through a separate authorized P1 ref B command, refuse P0
 /// through the production superseded writer, and select the retirement through
@@ -176,6 +207,14 @@ async fn retire_p0(db: &db::Db, store: &BlobStore, git: &Path) -> Result<Retired
     // Real A3 protected upload + real A4 registration. These artifacts remain
     // durable but are never promoted: P0 does not commit.
     stage(db, store, &plan, &p0_files).await?;
+    ensure!(plan.packs().len() == 1, "P0 fixture plan must have one pack");
+    let p0_publication = publication_for(db, repository.id, private0).await?;
+    ensure!(
+        p0_publication.parent_digest == plan.parent_digest().as_hex(),
+        "P0 A4 registration parent digest differs from the admitted plan"
+    );
+    ensure!(p0_publication.pack_id == plan.packs()[0].pack_id(), "P0 A4 registration pack id differs");
+    ensure!(p0_publication.registration_id == plan.packs()[0].registration_id(), "P0 A4 registration id differs");
 
     let gate_before_p1 = db::gate_version(&db.pool, repository.id, actor.id).await?;
     ensure!(
@@ -546,6 +585,363 @@ fn wire_digest(format: GitObjectFormat, name: &str, old: Option<&str>, new: &str
         WIRE_BODY,
     ];
     RequestDigest::of(WIRE_DOMAIN, &parts)
+}
+
+async fn rotate_and_commit(
+    db: &db::Db,
+    store: &BlobStore,
+    git: &Path,
+    retired: &Retired,
+) -> Result<(PackCommitPlan, SlotOneRotationReceipt, CoreGateVersion)> {
+    let format = retired.verified.gate.object_format();
+    let refs = vec![ref_update(format, REF_RETRY, None, &retired.retry_oid)?];
+    ensure!(refs.as_slice() == retired.plan.refs(), "P2 changed the exact wire ref command");
+    let wire = wire_digest(format, REF_RETRY, None, &retired.retry_oid, CommitMode::Atomic);
+    ensure!(wire == retired.public.wire_digest, "P2 wire digest differs from the P0 logical incoming body");
+
+    let baseline = capture_baseline(db, retired.repository.id, retired.verified.tenant).await?;
+    ensure!(
+        baseline.gate().revision() == retired.gate.revision() && baseline.gate().digest() == retired.gate.digest(),
+        "rotation baseline is not the advanced P1 gate"
+    );
+    let rotation = SlotOneRotationRequest { public: retired.public.clone(), retirement: retired.retirement.clone() };
+    let lane = IssuerLane::new(SLOT_ZERO_LANE)?;
+
+    let mut client = db.pool.get().await?;
+    let tx = client.transaction().await?;
+    let mut built = None;
+    let outcome = PgRefStore
+        .rotate_slot_one_in_tx(
+            tx,
+            &rotation,
+            |preview| {
+                if preview.base_revision() != baseline.gate().revision() {
+                    return Err(PackCommitError::Invalid(
+                        "slot one preview gate revision drifted from the captured baseline",
+                    ));
+                }
+                let plan = plan_from_baseline(
+                    &baseline,
+                    retired.verified.tenant,
+                    preview.sequence(),
+                    preview.private_id(),
+                    &lane,
+                    refs.clone(),
+                    std::slice::from_ref(&retired.p0_files),
+                )?;
+                built = Some(plan.clone());
+                Ok(plan)
+            },
+            deadline(),
+        )
+        .await
+        .map_err(|error| anyhow!("slot one rotation aborted: {error:?}"))?;
+    let (tx, result) = outcome.into_parts();
+    let receipt = result.map_err(|error| anyhow!("slot one rotation refused: {error:?}"))?;
+    let plan = built.ok_or_else(|| anyhow!("slot one rotation did not build a plan"))?;
+
+    ensure!(!receipt.replayed, "fresh slot one rotation replayed");
+    ensure!(receipt.state == OperationState::Pending, "slot one receipt is not pending");
+    ensure!(receipt.public_id == retired.public.public_id, "slot one receipt public id differs");
+    ensure!(receipt.private_id != retired.admission.private_id, "slot one reused the retired private id");
+    ensure!(receipt.retired_private_id == retired.admission.private_id, "slot one receipt retired private id differs");
+    ensure!(receipt.retired_event_id == retired.retirement.event_id, "slot one receipt retired event id differs");
+    ensure!(
+        receipt.retired_event_revision == retired.retirement.event_revision,
+        "slot one receipt retired event revision differs"
+    );
+    ensure!(receipt.sequence > retired.admission.sequence, "slot one sequence did not advance the retired lane");
+    ensure!(receipt.base_revision == retired.gate.revision(), "slot one base revision is not the current gate");
+    ensure!(receipt.plan_digest != retired.admission.plan_digest, "slot one reused the retired plan digest");
+    ensure!(receipt.proof_digest != retired.admission.proof_digest, "slot one reused the retired proof digest");
+    ensure!(receipt.wire_digest == retired.public.wire_digest, "slot one rewrote the logical incoming wire body");
+    ensure!(plan.identity().lane().as_str() == SLOT_ZERO_LANE, "slot one changed issuer lane");
+    ensure!(plan.identity().sequence() == receipt.sequence, "slot one plan sequence differs from the receipt");
+    ensure!(plan.identity().operation_id() == receipt.private_id, "slot one plan private id differs from the receipt");
+    ensure!(plan.parent_digest() == &receipt.plan_digest, "slot one plan digest differs from the receipt");
+    ensure!(plan.refs() == retired.plan.refs(), "slot one plan changed the exact wire ref command");
+    ensure!(plan.packs().len() == 1 && retired.plan.packs().len() == 1, "fixture plans must each have one pack");
+    ensure!(plan.packs()[0].pack_id() != retired.plan.packs()[0].pack_id(), "slot one reused the retired pack id");
+    ensure!(
+        plan.packs()[0].registration_id() != retired.plan.packs()[0].registration_id(),
+        "slot one reused the retired registration id"
+    );
+    tx.commit().await?;
+
+    match lookup_public(db, &retired.public).await? {
+        PublicAttemptLookup::Pending(evidence) => {
+            ensure!(evidence.current.slot == 1, "rotated current attempt is not slot one");
+            ensure!(evidence.current.private_id == receipt.private_id, "rotated current private id differs");
+            ensure!(evidence.current.state == OperationState::Pending, "rotated current attempt is not pending");
+            let retired_attempt = evidence
+                .retired
+                .as_ref()
+                .ok_or_else(|| anyhow!("rotated wrapper has no retired slot-zero evidence"))?;
+            ensure!(retired_attempt.slot == 0, "rotated retired attempt is not slot zero");
+            ensure!(
+                retired_attempt.private_id == retired.admission.private_id,
+                "rotated retired private id differs from P0"
+            );
+            ensure!(retired_attempt.state == OperationState::Rejected, "rotated retired attempt is not rejected");
+        }
+        other => bail!("rotated wrapper is not pending slot one: {other:?}"),
+    }
+
+    let replayed = replay_rotation(db, &rotation).await?;
+    ensure!(replayed.replayed, "exact pending rotation was not a replay");
+    ensure!(replayed.private_id == receipt.private_id, "rotation replay private id differs");
+    ensure!(replayed.plan_digest == receipt.plan_digest, "rotation replay plan digest differs");
+    ensure!(replayed.proof_digest == receipt.proof_digest, "rotation replay proof digest differs");
+    ensure!(replayed.sequence == receipt.sequence, "rotation replay sequence differs");
+    ensure!(replayed.base_revision == receipt.base_revision, "rotation replay base revision differs");
+
+    stage(db, store, &plan, &retired.p0_files).await?;
+    let committed = authorized_commit(db, store, git, &retired.actor, plan.clone()).await?;
+    let gate = db::gate_version(&db.pool, retired.repository.id, retired.actor.id).await?;
+    ensure!(
+        gate.revision() == committed.terminal.revision && gate.revision() == retired.gate.revision() + 1,
+        "P2 authorized commit did not advance the gate exactly once"
+    );
+    ensure!(
+        stored_ref(db, retired.repository.id, "refs/heads/main").await?.as_deref()
+            == Some(retired.verified.commit_oid.as_str()),
+        "P2 changed the unrelated main ref"
+    );
+    ensure!(
+        stored_ref(db, retired.repository.id, REF_SIDE).await?.as_deref() == Some(retired.side_oid.as_str()),
+        "P2 changed the unrelated P1 ref B"
+    );
+    ensure!(
+        stored_ref(db, retired.repository.id, REF_RETRY).await?.as_deref() == Some(retired.retry_oid.as_str()),
+        "P2 did not apply the original P0 wire command to ref A"
+    );
+    ensure!(committed.terminal.registrations.len() == 1, "P2 terminal does not name exactly one registration");
+    let registration = &committed.terminal.registrations[0];
+    ensure!(
+        registration.pack_id == plan.packs()[0].pack_id()
+            && registration.registration_id == plan.packs()[0].registration_id(),
+        "P2 terminal registration differs from the fresh plan"
+    );
+    ensure!(registration.pack_id != retired.plan.packs()[0].pack_id(), "P2 terminal promoted the retired P0 pack");
+    Ok((plan, receipt, gate))
+}
+
+async fn replay_rotation(db: &db::Db, rotation: &SlotOneRotationRequest) -> Result<SlotOneRotationReceipt> {
+    let mut client = db.pool.get().await?;
+    let tx = client.transaction().await?;
+    let outcome = PgRefStore
+        .rotate_slot_one_in_tx(
+            tx,
+            rotation,
+            |_| panic!("exact pending rotation replay must not build a plan"),
+            deadline(),
+        )
+        .await
+        .map_err(|error| anyhow!("slot one replay aborted: {error:?}"))?;
+    let (tx, result) = outcome.into_parts();
+    let receipt = result.map_err(|error| anyhow!("slot one replay refused: {error:?}"))?;
+    ensure!(receipt.replayed, "exact pending rotation was not a replay");
+    tx.rollback().await?;
+    Ok(receipt)
+}
+
+async fn lookup_public_raw(
+    db: &db::Db,
+    request: &PublicAttemptRequest,
+) -> Result<std::result::Result<PublicAttemptLookup, PackCommitError>> {
+    let mut client = db.pool.get().await?;
+    let tx = client.transaction().await?;
+    let result = PgRefStore.lookup_public_attempt(&tx, request, deadline()).await;
+    tx.rollback().await?;
+    Ok(result)
+}
+
+async fn lookup_public(db: &db::Db, request: &PublicAttemptRequest) -> Result<PublicAttemptLookup> {
+    lookup_public_raw(db, request).await?.map_err(|error| anyhow!("public attempt lookup failed: {error:?}"))
+}
+
+async fn assert_a5_after_rotation(
+    db: &db::Db,
+    store: &BlobStore,
+    retired: &Retired,
+    plan: &PackCommitPlan,
+) -> Result<()> {
+    let source = pack::create_serving_snapshot(db, store, &retired.actor, &retired.repository, 300).await?;
+    ensure!(source.read.head_ref() == "refs/heads/main", "A5 head ref is not main");
+    ensure!(
+        source.read.head_oid_hex() == Some(retired.verified.commit_oid.as_str()),
+        "A5 head oid changed after rotation"
+    );
+    assert_snapshot_ref(source.read.refs(), "refs/heads/main", &retired.verified.commit_oid)?;
+    assert_snapshot_ref(source.read.refs(), REF_RETRY, &retired.retry_oid)?;
+    assert_snapshot_ref(source.read.refs(), REF_SIDE, &retired.side_oid)?;
+    ensure!(source.read.pack_count() > 0, "A5 snapshot has no registered pack membership");
+    ensure!(
+        source.read.packs().iter().any(|pack| pack.pack_id() == plan.packs()[0].pack_id()),
+        "A5 snapshot omits the rotated P2 pack"
+    );
+    ensure!(
+        !source.read.packs().iter().any(|pack| pack.pack_id() == retired.plan.packs()[0].pack_id()),
+        "A5 snapshot promoted the retired P0 pack"
+    );
+    Ok(())
+}
+
+fn assert_snapshot_ref(refs: &[CapturedRef], name: &str, oid: &str) -> Result<()> {
+    let reference =
+        refs.iter().find(|reference| reference.name() == name).ok_or_else(|| anyhow!("A5 snapshot omits {name}"))?;
+    ensure!(reference.oid_hex() == oid, "A5 snapshot {name} differs from the durable ref");
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PublicationRow {
+    plan_operation_id: Uuid,
+    parent_digest: String,
+    pack_id: Uuid,
+    registration_id: Uuid,
+    gate_revision: i64,
+}
+
+async fn publication_rows(db: &db::Db, repository_id: Uuid) -> Result<Vec<PublicationRow>> {
+    let rows = db
+        .pool
+        .get()
+        .await?
+        .query(
+            "SELECT plan_operation_id,parent_digest,pack_id,registration_id,gate_revision
+               FROM ref_store_core_pack_publications
+              WHERE repository_id=$1
+              ORDER BY created_at, registration_id",
+            &[&repository_id],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| PublicationRow {
+            plan_operation_id: row.get(0),
+            parent_digest: row.get(1),
+            pack_id: row.get(2),
+            registration_id: row.get(3),
+            gate_revision: row.get(4),
+        })
+        .collect())
+}
+
+async fn publication_for(db: &db::Db, repository_id: Uuid, operation_id: Uuid) -> Result<PublicationRow> {
+    let mut matching =
+        publication_rows(db, repository_id).await?.into_iter().filter(|row| row.plan_operation_id == operation_id);
+    let row = matching.next().ok_or_else(|| anyhow!("publication row is missing for the operation"))?;
+    ensure!(matching.next().is_none(), "operation has more than one publication row");
+    Ok(row)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AttemptRow {
+    slot: i16,
+    private_id: Uuid,
+    plan_digest: String,
+    proof_digest: String,
+    base_revision: i64,
+}
+
+async fn attempt_rows(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> Result<Vec<AttemptRow>> {
+    let rows = db
+        .pool
+        .get()
+        .await?
+        .query(
+            "SELECT slot,private_id,plan_digest,proof_digest,base_revision
+               FROM ref_store_private_attempts
+              WHERE repository_id=$1 AND public_id=$2
+              ORDER BY slot",
+            &[&repository_id, &public_id],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AttemptRow {
+            slot: row.get(0),
+            private_id: row.get(1),
+            plan_digest: row.get(2),
+            proof_digest: row.get(3),
+            base_revision: row.get(4),
+        })
+        .collect())
+}
+
+async fn assert_no_registry_promotion(
+    db: &db::Db,
+    retired: &Retired,
+    plan: &PackCommitPlan,
+    rotation: &SlotOneRotationReceipt,
+    p0_before: &PublicationRow,
+) -> Result<()> {
+    let p0_after = publication_for(db, retired.repository.id, retired.admission.private_id).await?;
+    ensure!(p0_before == &p0_after, "P2 rewrote the durable P0 publication registration");
+    let p2 = publication_for(db, retired.repository.id, rotation.private_id).await?;
+
+    ensure!(p0_before.parent_digest == retired.plan.parent_digest().as_hex(), "P0 publication parent digest differs");
+    ensure!(p0_before.pack_id == retired.plan.packs()[0].pack_id(), "P0 publication pack id differs");
+    ensure!(
+        p0_before.registration_id == retired.plan.packs()[0].registration_id(),
+        "P0 publication registration id differs"
+    );
+    ensure!(p0_before.gate_revision == retired.plan.expected().revision(), "P0 publication gate revision differs");
+    ensure!(p2.parent_digest == plan.parent_digest().as_hex(), "P2 publication parent digest differs");
+    ensure!(p2.pack_id == plan.packs()[0].pack_id(), "P2 publication pack id differs");
+    ensure!(p2.registration_id == plan.packs()[0].registration_id(), "P2 publication registration id differs");
+    ensure!(p2.gate_revision == plan.expected().revision(), "P2 publication gate revision differs");
+    ensure!(p0_before.pack_id != p2.pack_id, "P2 reused the retired pack id");
+    ensure!(p0_before.registration_id != p2.registration_id, "P2 reused the retired registration id");
+    ensure!(p0_before.parent_digest != p2.parent_digest, "P2 reused the retired parent digest");
+
+    let attempts = attempt_rows(db, retired.repository.id, retired.public.public_id).await?;
+    ensure!(attempts.len() == 2, "rotated wrapper does not have exactly two private attempts");
+    let slot_zero = &attempts[0];
+    ensure!(slot_zero.slot == 0, "retired attempt is not slot zero");
+    ensure!(slot_zero.private_id == retired.admission.private_id, "retired attempt private id changed");
+    ensure!(slot_zero.plan_digest == retired.admission.plan_digest.as_hex(), "retired attempt plan digest changed");
+    ensure!(slot_zero.proof_digest == retired.admission.proof_digest.as_hex(), "retired attempt proof digest changed");
+    ensure!(slot_zero.base_revision == retired.admission.base_revision, "retired attempt base revision changed");
+    let slot_one = &attempts[1];
+    ensure!(slot_one.slot == 1, "rotated attempt is not slot one");
+    ensure!(slot_one.private_id == rotation.private_id, "rotated attempt private id differs");
+    ensure!(slot_one.plan_digest == rotation.plan_digest.as_hex(), "rotated attempt plan digest differs");
+    ensure!(slot_one.proof_digest == rotation.proof_digest.as_hex(), "rotated attempt proof digest differs");
+    ensure!(slot_one.base_revision == rotation.base_revision, "rotated attempt base revision differs");
+
+    let record = operation_record(db, retired.repository.id, retired.admission.private_id).await?;
+    ensure!(record.state() == OperationState::Rejected, "P0 durable rejection was rewritten by rotation");
+    let terminal = PackCommitTerminal::from_terminal_result(
+        record.terminal_result().ok_or_else(|| anyhow!("P0 rejected operation has no terminal result"))?,
+    )
+    .map_err(|error| anyhow!("P0 durable terminal is not a pack commit terminal: {error:?}"))?;
+    ensure!(terminal.registrations.is_empty(), "P0 durable rejection gained a registration");
+    Ok(())
+}
+
+async fn assert_current_pending_wrapper_gap(db: &db::Db, retired: &Retired) -> Result<()> {
+    // The terminal writer that closes a slot-one wrapper is deliberately a
+    // separate product checkpoint. At 9cf the real P2 commit is durable in the
+    // migration-138 registry while the migration-152 wrapper remains pending;
+    // the resolver must fail closed on that exact mismatch. Integration later
+    // replaces this assertion with the committed wrapper read.
+    match lookup_public_raw(db, &retired.public).await? {
+        Err(PackCommitError::Rejected(rejection)) => {
+            ensure!(
+                rejection.code == PackCommitRejectCode::LedgerIntegrity,
+                "pending-wrapper gap raised the wrong rejection code"
+            );
+            ensure!(
+                rejection.detail == "current private attempt state differs from its public operation",
+                "pending-wrapper gap raised an unexpected detail"
+            );
+        }
+        Err(other) => bail!("pending-wrapper gap raised an unexpected error: {other:?}"),
+        Ok(other) => bail!("expected the current pending-wrapper gap, got {other:?}"),
+    }
+    Ok(())
 }
 
 fn require_owned_disposable_blob_fixture() -> Result<()> {
