@@ -345,6 +345,97 @@ class ReportProjectionTest(unittest.TestCase):
             driver.assert_allowlisted({"note": "postgresql://rootyard@127.0.0.1/db"})
 
 
+class PostgresBooleanContractTest(unittest.TestCase):
+    """PG17 prints raw bool as t/f and bool::text as true/false."""
+
+    BASELINE = {
+        "server_version_num": 170005,
+        "databases": ["postgres", "template0", "template1"],
+        "client_major": 17,
+    }
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.work = Path(self.directory.name) / "work"
+        self.work.mkdir()
+        self.queries = []
+        self.privilege = "t"
+        self.privilege_error = False
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def psql(self, sql, *, database="postgres", limit=20):
+        self.queries.append(sql)
+        if sql == "SHOW server_version_num;":
+            return "170005"
+        if sql.startswith("SELECT datname FROM pg_database"):
+            return "\n".join(self.BASELINE["databases"])
+        if "rolcreatedb OR rolsuper" in sql:
+            if self.privilege_error:
+                raise driver.EvidenceError("postgres")
+            # Reproduce PostgreSQL 17 exactly: a cast emits true/false while
+            # the raw boolean predicate emits t/f.
+            if "::text" in sql:
+                return {"t": "true", "f": "false", "": ""}[self.privilege]
+            return self.privilege
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+    def invoke(self, operation):
+        with mock.patch.object(driver, "psql", side_effect=self.psql):
+            with mock.patch.object(driver, "client_major", return_value=17):
+                return operation()
+
+    def run_baseline(self):
+        return self.invoke(lambda: driver.cmd_pg_baseline(
+            SimpleNamespace(work=str(self.work))))
+
+    def recheck(self):
+        return self.invoke(lambda: driver.check_postgres(self.BASELINE))
+
+    def privilege_queries(self):
+        return [query for query in self.queries if "rolcreatedb OR rolsuper" in query]
+
+    def assert_privilege_rejected(self):
+        with self.assertRaises(driver.EvidenceError) as caught:
+            self.run_baseline()
+        self.assertEqual(caught.exception.kind, "postgres")
+        self.assertFalse((self.work / "pg-baseline.json").exists())
+
+    def test_baseline_accepts_pg17_raw_boolean(self):
+        self.assertEqual(self.run_baseline(), 0)
+        self.assertEqual(json.loads((self.work / "pg-baseline.json").read_text()), self.BASELINE)
+        self.assertEqual(self.privilege_queries(), [driver.POSTGRES_ROLE_PRIVILEGE_SQL])
+        self.assertIn("(rolcreatedb OR rolsuper)", driver.POSTGRES_ROLE_PRIVILEGE_SQL)
+        self.assertNotIn("::text", driver.POSTGRES_ROLE_PRIVILEGE_SQL)
+        self.assertEqual(driver.POSTGRES_ROLE_PRIVILEGE_OK, "t")
+
+    def test_baseline_rejects_false_null_and_psql_error(self):
+        for privilege, error in (("f", False), ("", False), ("t", True)):
+            with self.subTest(privilege=privilege, error=error):
+                self.privilege = privilege
+                self.privilege_error = error
+                self.assert_privilege_rejected()
+
+    def test_recheck_accepts_pg17_raw_boolean(self):
+        result = self.recheck()
+        self.assertEqual(result["server_version_num"], 170005)
+        self.assertEqual(result["major"], 17)
+        self.assertEqual(result["client_major"], 17)
+        self.assertEqual(result["baseline_database_count"], 3)
+        self.assertFalse(result["owned_database_created"])
+        self.assertEqual(self.privilege_queries(), [driver.POSTGRES_ROLE_PRIVILEGE_SQL])
+
+    def test_recheck_rejects_false_null_and_psql_error(self):
+        for privilege, error in (("f", False), ("", False), ("t", True)):
+            with self.subTest(privilege=privilege, error=error):
+                self.privilege = privilege
+                self.privilege_error = error
+                with self.assertRaises(driver.EvidenceError) as caught:
+                    self.recheck()
+                self.assertEqual(caught.exception.kind, "postgres")
+
+
 class HostedFlowMockTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

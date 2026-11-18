@@ -157,7 +157,7 @@ jobs:
           fi
           printf '[slot0-native] stage=toolchain status=ok\n'
 
-      - name: Record the owned PostgreSQL 17 baseline
+      - name: Record the owned PostgreSQL 17 baseline and raw boolean privilege
         timeout-minutes: 3
         run: |
           set -euo pipefail

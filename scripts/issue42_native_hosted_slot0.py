@@ -52,6 +52,11 @@ JOB_TIMEOUT_MINUTES = 110
 DATABASE_PREFIX = "slot0_native_"
 SLOT_ZERO_DATABASE = re.compile(r"slot_zero_[0-9a-f]{32}")
 DATABASE_FULL = re.compile(rf"{DATABASE_PREFIX}[0-9]{{1,12}}_[0-9]{{1,3}}_[0-9a-f]{{32}}")
+# PostgreSQL 17 renders a bare boolean as "t"/"f"; only bool::text renders true/false.
+POSTGRES_ROLE_PRIVILEGE_SQL = (
+    "SELECT (rolcreatedb OR rolsuper) FROM pg_roles WHERE rolname = current_user;"
+)
+POSTGRES_ROLE_PRIVILEGE_OK = "t"
 OWNERSHIP_MARKER = "database-ownership.json"
 OWNERSHIP_SCHEMA = "rootyard/issue42-hosted-database-ownership/v1"
 OWNERSHIP_LIMIT = 4096
@@ -774,8 +779,7 @@ def check_postgres(baseline):
     require(version == baseline["server_version_num"], "postgres")
     require(client_major() == 17, "postgres")
     require(roster() == baseline["databases"], "preexisting-database")
-    require(psql("SELECT (rolcreatedb OR rolsuper)::text FROM pg_roles WHERE rolname = current_user;")
-            == "t", "postgres")
+    require(psql(POSTGRES_ROLE_PRIVILEGE_SQL) == POSTGRES_ROLE_PRIVILEGE_OK, "postgres")
     return {
         "server_version_num": version,
         "major": version // 10000,
@@ -974,8 +978,7 @@ def cmd_pg_baseline(args):
     require(baseline["databases"] == sorted(["postgres", "template0", "template1"]),
             "preexisting-database")
     require(baseline["server_version_num"] // 10000 == 17, "postgres")
-    require(psql("SELECT (rolcreatedb OR rolsuper)::text FROM pg_roles WHERE rolname = current_user;")
-            == "t", "postgres")
+    require(psql(POSTGRES_ROLE_PRIVILEGE_SQL) == POSTGRES_ROLE_PRIVILEGE_OK, "postgres")
     write_json(Path(args.work) / "pg-baseline.json", baseline)
     print("[slot0-native] stage=postgres status=ok")
     return 0
