@@ -7,6 +7,7 @@ pub mod closure_bind;
 pub mod durable_freeze_gate;
 pub mod durable_guarded_ops;
 pub mod format30_boot;
+mod format30_boot_raft;
 pub mod format30_paired;
 pub mod freeze_drain;
 pub mod git_verify;
@@ -18,11 +19,14 @@ pub mod peer_groups;
 pub mod pg_cutpoint;
 pub mod pg_freeze_settings;
 pub mod pg_restore_admission;
+pub mod pg_write_fence;
 pub mod production_runtime;
 pub mod quorum_wal;
 pub mod raft_barrier;
 pub mod restore;
+pub mod startup_wiring;
 pub mod types;
+mod wal_file_digest;
 pub mod wal_voters;
 
 #[cfg(test)]
@@ -35,10 +39,10 @@ pub use closure_bind::{
     compute_canonical_pack_set_digest, extract_raft_group_realm, verify_blob_closure_against_durable_raft,
 };
 pub use durable_freeze_gate::{
-    DurableFreezeHandle, DurableFreezeRequest, PG_FREEZE_SETTING, enter_durable_pg_raft_freeze,
-    execute_deleter_guarded, load_pg_repo_backup_specs, propose_raft_hold_guarded, propose_raft_ref_write_guarded,
-    read_pg_database_freeze_marker, require_unfrozen_pg_and_raft, thaw_durable_pg_raft_freeze,
-    upsert_repo_access_collaborator_guarded,
+    DurableFreezeHandle, DurableFreezeRequest, PAIRED_FREEZE_JOURNAL_LOCK_KEY, PG_FREEZE_SETTING,
+    enter_durable_pg_raft_freeze, execute_deleter_guarded, load_pg_repo_backup_specs, propose_raft_hold_guarded,
+    propose_raft_ref_write_guarded, read_pg_database_freeze_marker, require_unfrozen_pg_and_raft,
+    thaw_durable_pg_raft_freeze, upsert_repo_access_collaborator_guarded,
 };
 pub use format30_paired::{
     FORMAT30_SUBDIR, Format30PairedBackupRequest, Format30PairedManifest, Format30PgArchiveBinding,
@@ -63,6 +67,7 @@ pub use pg_freeze_settings::{
 pub use pg_restore_admission::{
     install_restored_pg_incarnation, verify_pg_live_incarnation, verify_pg_restored_cursors,
 };
+pub use pg_write_fence::{PgTableShareFence, acquire_pg_table_share_fence};
 pub use production_runtime::{PairedProductionRuntimeGuard, WorkerProjectionTicket};
 pub use quorum_wal::{DurableRaftBackend, WalSyncedRaftBackend};
 pub use raft_barrier::{
@@ -72,6 +77,11 @@ pub use raft_barrier::{
 pub use restore::{
     IncarnationAdmissionGuard, RestoreTargetScope, restore_new_incarnation, restore_new_incarnation_with_pg,
     verify_backup_archive,
+};
+pub use startup_wiring::{
+    ensure_serving_database_unfrozen, install_production_serving_guard, install_production_serving_guard_with_attestor,
+    installed_peer_attestation_daemon_addr, installed_production_runtime_guard, set_installed_production_runtime_guard,
+    shutdown_installed_peer_attestation_daemon,
 };
 pub use types::{
     BackupRetentionHoldRecord, BlobArtifactEntry, BlobClosureManifest, CloseScopeBarrierReceipt,

@@ -27,7 +27,7 @@ use super::peer_groups::{
 };
 use super::pg_cutpoint::{ExpectedRaftCut, capture_pg_cutpoint_in_tx, pg_err};
 use super::pg_freeze_settings::{
-    drop_ephemeral_backup_role, provision_ephemeral_backup_role, verify_no_active_pg_writers,
+    drop_ephemeral_backup_role, provision_ephemeral_backup_role, verify_no_active_pg_writers_except_fence,
 };
 use super::quorum_wal::DurableRaftBackend;
 use super::raft_barrier::SealedArchiveReceipt;
@@ -116,7 +116,8 @@ pub async fn create_format30_paired_raft_backup(
         let mut pg_client =
             crate::db::connect_config(parsed_dsn).await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
         req.freeze_handle.verify_still_frozen_on(&pg_client, req.raft).await?;
-        verify_no_active_pg_writers(&pg_client).await?;
+        let fence_pid = req.freeze_handle.write_fence_pid().await;
+        verify_no_active_pg_writers_except_fence(&pg_client, fence_pid).await?;
         let tx = pg_client
             .build_transaction()
             .isolation_level(IsolationLevel::RepeatableRead)

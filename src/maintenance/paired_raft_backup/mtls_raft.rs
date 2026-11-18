@@ -26,7 +26,8 @@ use super::raft_barrier::{
 use super::types::{NewIncarnationAuthority, PairedBackupError, sha256_json_tagged};
 
 const FREEZE_KV_KEY: &str = "refcas/paired_freeze";
-const INCARNATION_KV_KEY: &str = "refcas/cluster_incarnation";
+pub(super) const INCARNATION_KV_KEY: &str = "refcas/cluster_incarnation";
+pub(super) const GROUP_EPOCH_KV_KEY: &str = "refcas/group_epoch";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -88,7 +89,7 @@ impl MtlsLiveRaftBackend {
             if !cert_hashes.insert(cert_sha.clone()) {
                 return Err(PairedBackupError::FreezeNotHeld("duplicate leaf X.509 certificate across Raft voters"));
             }
-            let (reported_cert, pubkey_hex) = super::peer_attestation_rpc::probe_attestor_identity(
+            let (reported_cert, pubkey_hex) = super::peer_attestation::probe_attestor_identity(
                 &tls_cfg,
                 &cfg.attestor_endpoints[&node_id],
                 node_id,
@@ -116,7 +117,6 @@ impl MtlsLiveRaftBackend {
         backend.cached_sm = sm;
         Ok(backend)
     }
-
     pub fn update_endpoints(
         &mut self,
         endpoints: BTreeMap<u64, String>,
@@ -131,7 +131,6 @@ impl MtlsLiveRaftBackend {
         self.cfg.attestor_endpoints = attestor_endpoints;
         Ok(())
     }
-
     pub fn write_freeze_record(&self, rec: &DurableRaftFreezeRecord) -> Result<u64, PairedBackupError> {
         rec.verify()?;
         let raw = serde_json::to_string(rec).map_err(|_| PairedBackupError::IncompleteCut("freeze serialize"))?;
@@ -149,14 +148,13 @@ impl MtlsLiveRaftBackend {
         rec.verify()?;
         Ok(Some(rec))
     }
-
     pub fn write_incarnation_record(&self, inc: &NewIncarnationAuthority) -> Result<u64, PairedBackupError> {
         let raw = serde_json::to_string(inc).map_err(|_| PairedBackupError::IncompleteCut("incarnation serialize"))?;
+        let _ = self.quorum_kv_put(GROUP_EPOCH_KV_KEY, &inc.new_group_epoch.to_string())?;
         let (idx, _) = self.quorum_kv_put(INCARNATION_KV_KEY, &raw)?;
         self.trigger_leader_snapshot()?;
         Ok(idx)
     }
-
     pub fn read_incarnation_record(&self) -> Result<Option<NewIncarnationAuthority>, PairedBackupError> {
         let Some(raw) = self.linearizable_kv_get(INCARNATION_KV_KEY)? else {
             return Ok(None);
@@ -294,7 +292,7 @@ impl MtlsLiveRaftBackend {
             .unwrap_or("0")
             .parse()
             .map_err(|_| PairedBackupError::StateMachine("invalid refcas/head_seq".into()))?;
-        let _ = super::peer_attestation_rpc::verify_local_replica_caught_up(self, head_seq)?;
+        let _ = super::peer_attestation::verify_local_replica_caught_up(self, head_seq)?;
         Ok((self.replay_up_to(head_seq)?, head_seq))
     }
 
@@ -422,6 +420,9 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
             let raw = serde_json::to_string(&updated).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
             let _ = self.quorum_kv_put(&format!("refcas/cmd/{seq:08}"), &raw)?;
         }
+        if matches!(&cmd, RefCasCommand::InitializeGate(_)) || seq == 1 {
+            let _ = self.quorum_kv_put(GROUP_EPOCH_KV_KEY, &group_epoch.to_string())?;
+        }
         let (commit_raft_idx, _) = self.quorum_kv_put("refcas/head_seq", &seq.to_string())?;
         let log_id = AppliedLogId { term: final_term, index: seq };
         let _ = self.trigger_leader_snapshot();
@@ -440,7 +441,7 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
         .seal()?;
         quorum_receipt.verify()?;
 
-        let local_cert_sha = super::peer_attestation_rpc::verify_local_replica_caught_up(self, seq)?;
+        let local_cert_sha = super::peer_attestation::verify_local_replica_caught_up(self, seq)?;
         let mut step_sm = self.replay_up_to(head_before)?;
         let resp = step_sm.apply(log_id, cmd).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
         let state_digest_after = step_sm.state_digest().map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;

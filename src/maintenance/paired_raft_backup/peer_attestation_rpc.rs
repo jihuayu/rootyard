@@ -2,10 +2,8 @@
 //! and client-side helpers used by `MtlsLiveRaftBackend` (#153).
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::ClientConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -15,12 +13,11 @@ use crate::ref_store::core::state_machine::{
     AppliedLogId, RefCasCommand, RefCasSnapshot, RefCasStateMachine, encode_command,
 };
 
-use super::mtls_raft::MtlsLiveRaftBackend;
+use super::mtls_raft::{GROUP_EPOCH_KV_KEY, INCARNATION_KV_KEY, MtlsLiveRaftBackend};
 use super::mtls_wire::mtls_rpc_call;
-use super::peer_attestation::{
-    PeerAttestorState, PeerDurableAttestation, PeerDurableAttestationClaims, sync_file_if_exists,
-};
-use super::types::{PairedBackupError, sha256_json_tagged, validate_hex64};
+use super::peer_attestation::{PeerAttestorState, PeerDurableAttestation, PeerDurableAttestationClaims};
+use super::types::{NewIncarnationAuthority, PairedBackupError, sha256_json_tagged, validate_hex64};
+use super::wal_file_digest::{extract_committed_applied_index, fsync_and_hash_voter_durable_wal};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -62,8 +59,7 @@ impl PeerAttestorState {
     }
 
     fn metrics(&self) -> Result<Value, PairedBackupError> {
-        let response = self.call_raft(&json!("Metrics"))?;
-        response
+        self.call_raft(&json!("Metrics"))?
             .get("Metrics")
             .cloned()
             .ok_or(PairedBackupError::FreezeNotHeld("local raft-node rejected Metrics probe"))
@@ -78,11 +74,65 @@ impl PeerAttestorState {
         Ok(self.read_replica_kv(key)?.as_deref().unwrap_or("0").parse().unwrap_or(0))
     }
 
+    fn read_replica_i64(&self, key: &str) -> Result<Option<i64>, PairedBackupError> {
+        self.read_replica_kv(key)?
+            .map(|raw| {
+                raw.parse::<i64>().map_err(|_| PairedBackupError::StateMachine("corrupt local group_epoch".into()))
+            })
+            .transpose()
+    }
+
     fn verify_running_identity(&self, metrics: &Value) -> Result<u64, PairedBackupError> {
-        if metrics["running_ok"].as_bool() != Some(true) || metrics["node_id"].as_u64() != Some(self.node_id) {
-            return Err(PairedBackupError::FreezeNotHeld("local raft-node not running or node_id mismatch"));
+        (metrics["running_ok"].as_bool() == Some(true) && metrics["node_id"].as_u64() == Some(self.node_id))
+            .then(|| metrics["last_log_index"].as_u64().unwrap_or(0))
+            .ok_or(PairedBackupError::FreezeNotHeld("local raft-node not running or node_id mismatch"))
+    }
+
+    fn verify_local_group_epoch(&self, requested_epoch: i64, up_to_seq: u64) -> Result<i64, PairedBackupError> {
+        if requested_epoch < 1 {
+            return Err(PairedBackupError::InvalidArgument("group_epoch must be >= 1"));
         }
-        Ok(metrics["last_log_index"].as_u64().unwrap_or(0))
+        let inc_epoch = match self.read_replica_kv(INCARNATION_KV_KEY)? {
+            Some(raw) => Some(
+                serde_json::from_str::<NewIncarnationAuthority>(&raw)
+                    .map_err(|_| PairedBackupError::StateMachine("corrupt Raft incarnation record".into()))?
+                    .new_group_epoch,
+            ),
+            None => None,
+        };
+        let kv_epoch = self.read_replica_i64(GROUP_EPOCH_KV_KEY)?;
+        let gate_epoch = if up_to_seq >= 1 {
+            self.read_replica_kv("refcas/cmd/00000001")?.and_then(|raw| {
+                match serde_json::from_str::<PersistedRaftCmd>(&raw) {
+                    Ok(PersistedRaftCmd { cmd: RefCasCommand::InitializeGate(init), .. }) => {
+                        Some(init.gate.group_epoch)
+                    }
+                    _ => None,
+                }
+            })
+        } else {
+            None
+        };
+        let mut local_epoch = None;
+        for source in [inc_epoch, kv_epoch, gate_epoch].into_iter().flatten() {
+            if source < 1 {
+                return Err(PairedBackupError::StateMachine("local replica group_epoch must be >= 1".into()));
+            }
+            if local_epoch.is_some_and(|previous| previous != source) {
+                return Err(PairedBackupError::CutpointSkew("local replica group_epoch sources diverge".into()));
+            }
+            local_epoch = Some(source);
+        }
+        let local_epoch = local_epoch
+            .ok_or(PairedBackupError::FreezeNotHeld("local raft-node replica has no durable group_epoch"))?;
+        if requested_epoch != local_epoch {
+            return Err(PairedBackupError::StaleIncarnation {
+                field: "group_epoch",
+                expected: local_epoch.to_string(),
+                got: requested_epoch.to_string(),
+            });
+        }
+        Ok(local_epoch)
     }
 }
 
@@ -99,8 +149,12 @@ pub(super) fn attest_commit(
     }
     let metrics = state.metrics()?;
     let last_log_index = state.verify_running_identity(&metrics)?;
-    if last_log_index < req.min_raft_index {
-        return Err(PairedBackupError::FreezeNotHeld("local raft-node log index behind attested commit"));
+    let committed_applied_index = extract_committed_applied_index(&metrics).unwrap_or(0);
+    if last_log_index < req.min_raft_index
+        || committed_applied_index < req.min_raft_index
+        || committed_applied_index == 0
+    {
+        return Err(PairedBackupError::FreezeNotHeld("voter Raft committed/applied index behind attested commit"));
     }
     if state.read_replica_u64("refcas/head_seq")? < req.seq {
         return Err(PairedBackupError::FreezeNotHeld("local raft-node applied seq behind attested commit"));
@@ -119,30 +173,32 @@ pub(super) fn attest_commit(
             "persisted command digest does not match the attested command_sha256",
         ));
     }
-    sync_file_if_exists(&state.data_dir.join("sm.sqlite3"))?;
-    sync_file_if_exists(&state.data_dir.join("log.sqlite3"))?;
+    let local_group_epoch = state.verify_local_group_epoch(req.group_epoch, req.seq)?;
+    let sqlite_wal_sha256 = fsync_and_hash_voter_durable_wal(&state.data_dir)?;
     let wal_digest = sha256_json_tagged(
-        b"rootyard-mtls-peer-wal-v2",
+        b"rootyard-mtls-peer-wal-v3",
         &(
             state.node_id,
             state.cert_sha256.as_str(),
             persisted.term,
-            last_log_index,
+            committed_applied_index,
             req.seq,
+            local_group_epoch,
             req.command_sha256.as_str(),
+            sqlite_wal_sha256.as_str(),
         ),
     )?;
     PeerDurableAttestation::sign(
         PeerDurableAttestationClaims {
             kind: "commit".to_owned(),
             group_id: req.group_id,
-            group_epoch: req.group_epoch,
+            group_epoch: local_group_epoch,
             node_id: state.node_id,
             voter_id: state.voter_id,
             peer_cert_sha256: state.cert_sha256.clone(),
             ed25519_pubkey_hex: state.pubkey_hex.clone(),
             raft_term: persisted.term,
-            raft_committed_index: last_log_index,
+            raft_committed_index: committed_applied_index,
             refcas_seq: req.seq,
             subject_digest: req.command_sha256,
             secondary_digest: wal_digest,
@@ -167,11 +223,16 @@ pub(super) fn attest_cutpoint(
     }
     let metrics = state.metrics()?;
     let last_log_index = state.verify_running_identity(&metrics)?;
+    let committed_applied_index = extract_committed_applied_index(&metrics).unwrap_or(0);
+    if committed_applied_index == 0 || last_log_index < committed_applied_index {
+        return Err(PairedBackupError::FreezeNotHeld("voter Raft committed/applied index missing at cutpoint"));
+    }
     if state.read_replica_u64("refcas/head_seq")? != req.expected_seq {
         return Err(PairedBackupError::FreezeNotHeld(
             "local raft-node applied seq diverges from the attested cutpoint",
         ));
     }
+    let local_group_epoch = state.verify_local_group_epoch(req.group_epoch, req.expected_seq)?;
     let mut sm = RefCasStateMachine::new();
     for seq in 1..=req.expected_seq {
         let raw = state.read_replica_kv(&format!("refcas/cmd/{seq:08}"))?.ok_or(PairedBackupError::IncompleteCut(
@@ -183,6 +244,9 @@ pub(super) fn attest_cutpoint(
             .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
     }
     let snapshot = sm.snapshot().map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+    if !snapshot.body.gates.iter().all(|gate| gate.group_epoch == local_group_epoch) {
+        return Err(PairedBackupError::CutpointSkew("local replica gates diverge from group_epoch".into()));
+    }
     if snapshot.checksum != req.expected_snapshot_checksum {
         return Err(PairedBackupError::FreezeNotHeld(
             "local replica snapshot checksum diverges from the attested cutpoint",
@@ -192,19 +256,18 @@ pub(super) fn attest_cutpoint(
     if state_digest != req.expected_state_digest {
         return Err(PairedBackupError::FreezeNotHeld("local replica state_digest diverges from the attested cutpoint"));
     }
-    sync_file_if_exists(&state.data_dir.join("sm.sqlite3"))?;
-    sync_file_if_exists(&state.data_dir.join("log.sqlite3"))?;
+    let _sqlite_wal_sha256 = fsync_and_hash_voter_durable_wal(&state.data_dir)?;
     PeerDurableAttestation::sign(
         PeerDurableAttestationClaims {
             kind: "cutpoint".to_owned(),
             group_id: req.group_id,
-            group_epoch: req.group_epoch,
+            group_epoch: local_group_epoch,
             node_id: state.node_id,
             voter_id: state.voter_id,
             peer_cert_sha256: state.cert_sha256.clone(),
             ed25519_pubkey_hex: state.pubkey_hex.clone(),
             raft_term: metrics["current_term"].as_u64().unwrap_or(1).max(1),
-            raft_committed_index: last_log_index,
+            raft_committed_index: committed_applied_index,
             refcas_seq: req.expected_seq,
             subject_digest: req.expected_state_digest,
             secondary_digest: req.expected_snapshot_checksum,
@@ -213,75 +276,8 @@ pub(super) fn attest_cutpoint(
     )
 }
 
-/// Wait until the local `raft-node` replica has applied `required_seq`, returning its leaf digest.
-pub(super) fn verify_local_replica_caught_up(
-    raft: &MtlsLiveRaftBackend,
-    required_seq: u64,
-) -> Result<String, PairedBackupError> {
-    let local_addr = &raft.cfg.voter_endpoints[&raft.cfg.local_node_id];
-    let deadline = std::time::Instant::now() + Duration::from_millis(900);
-    while std::time::Instant::now() < deadline {
-        if let Ok((response, cert_sha)) = mtls_rpc_call(
-            &raft.tls_cfg,
-            local_addr,
-            raft.cfg.local_node_id,
-            &json!({ "InspectReplicaKv": { "key": "refcas/head_seq" } }),
-            raft.cfg.rpc_timeout,
-        ) {
-            let seq: u64 =
-                response.pointer("/KvValue/value").and_then(Value::as_str).unwrap_or("0").parse().unwrap_or(0);
-            if seq >= required_seq {
-                return Ok(cert_sha);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(40));
-    }
-    Err(PairedBackupError::FreezeNotHeld(
-        "consensus quorum committed on remote mTLS peers, but local Raft replica WAL/apply lagged",
-    ))
-}
-
-/// Probe one voter's `PeerAttestationDaemon` and prove its `Identity` is bound to the
-/// same X.509 leaf certificate the `raft-node` presented.
-pub(super) fn probe_attestor_identity(
-    tls_cfg: &Arc<ClientConfig>,
-    endpoint: &str,
-    node_id: u64,
-    observed_cert_sha: &str,
-    timeout: Duration,
-) -> Result<(String, String), PairedBackupError> {
-    let (response, handshake_cert_sha) =
-        mtls_rpc_call(tls_cfg, endpoint, node_id, &json!({ "Identity": {} }), timeout)?;
-    if handshake_cert_sha != observed_cert_sha {
-        return Err(PairedBackupError::FreezeNotHeld(
-            "peer attestor certificate differs from the voter's raft-node certificate",
-        ));
-    }
-    let identity = response
-        .get("Identity")
-        .ok_or(PairedBackupError::FreezeNotHeld("peer attestation daemon rejected Identity probe"))?;
-    let reported_cert = identity["peer_cert_sha256"]
-        .as_str()
-        .ok_or(PairedBackupError::FreezeNotHeld("peer attestation daemon returned no certificate digest"))?;
-    let pubkey_hex = identity["ed25519_pubkey_hex"]
-        .as_str()
-        .ok_or(PairedBackupError::FreezeNotHeld("peer attestation daemon returned no Ed25519 public key"))?;
-    if reported_cert != observed_cert_sha
-        || identity["node_id"].as_u64() != Some(node_id)
-        || !validate_hex64(pubkey_hex)
-    {
-        return Err(PairedBackupError::FreezeNotHeld(
-            "peer attestation identity is not bound to the live voter certificate/key",
-        ));
-    }
-    Ok((reported_cert.to_owned(), pubkey_hex.to_owned()))
-}
-
-fn decode_attestation(response: &Value, operation: &'static str) -> Result<PeerDurableAttestation, PairedBackupError> {
-    let raw = response.get("Attestation").ok_or(PairedBackupError::FreezeNotHeld(match operation {
-        "commit" => "peer attestor refused AttestCommit",
-        _ => "peer attestor refused AttestCutpoint",
-    }))?;
+fn decode_attestation(response: &Value, refused: &'static str) -> Result<PeerDurableAttestation, PairedBackupError> {
+    let raw = response.get("Attestation").ok_or(PairedBackupError::FreezeNotHeld(refused))?;
     let attestation: PeerDurableAttestation = serde_json::from_value(raw.clone())
         .map_err(|_| PairedBackupError::FreezeNotHeld("malformed peer durable attestation response"))?;
     attestation.verify()?;
@@ -319,7 +315,7 @@ pub(super) fn request_commit_attestation(
         }}),
         raft.cfg.rpc_timeout,
     )?;
-    let attestation = decode_attestation(&response, "commit")?;
+    let attestation = decode_attestation(&response, "peer attestor refused AttestCommit")?;
     if attestation.claims.voter_id != binding.voter_uuid
         || attestation.claims.ed25519_pubkey_hex != binding.ed25519_pubkey_hex
         || attestation.claims.peer_cert_sha256 != binding.cert_sha256
@@ -368,7 +364,7 @@ pub(super) fn attest_group_cutpoint(
             ) else {
                 continue;
             };
-            if let Ok(attestation) = decode_attestation(&response, "cutpoint") {
+            if let Ok(attestation) = decode_attestation(&response, "peer attestor refused AttestCutpoint") {
                 attested = Some(attestation);
                 break;
             }
@@ -400,6 +396,10 @@ pub(super) fn attest_group_cutpoint(
     Ok(attestations)
 }
 
+fn stale(field: &'static str, expected: String, got: String) -> PairedBackupError {
+    PairedBackupError::StaleIncarnation { field, expected, got }
+}
+
 /// Fail-closed brand-new incarnation probe over 100% of the configured target voters.
 pub(super) fn verify_pristine_target(
     raft: &MtlsLiveRaftBackend,
@@ -407,11 +407,11 @@ pub(super) fn verify_pristine_target(
     forbidden_incarnations: &BTreeSet<Uuid>,
 ) -> Result<(), PairedBackupError> {
     if raft.group_membership_digest == source_membership_digest {
-        return Err(PairedBackupError::StaleIncarnation {
-            field: "group_membership_digest",
-            expected: "brand-new target Raft cluster".into(),
-            got: source_membership_digest.to_owned(),
-        });
+        return Err(stale(
+            "group_membership_digest",
+            "brand-new target Raft cluster".into(),
+            source_membership_digest.to_owned(),
+        ));
     }
     if raft.cfg.voter_endpoints.len() < 3 {
         return Err(PairedBackupError::InvalidArgument("pristine target check requires >= 3 configured target voters"));
@@ -419,40 +419,32 @@ pub(super) fn verify_pristine_target(
     for (&node_id, endpoint) in &raft.cfg.voter_endpoints {
         let (metrics_response, _cert_sha) =
             mtls_rpc_call(&raft.tls_cfg, endpoint, node_id, &json!("Metrics"), raft.cfg.rpc_timeout).map_err(|_| {
-                PairedBackupError::StaleIncarnation {
-                    field: "target_voter_unreachable",
-                    expected: format!("reachable target voter {node_id}"),
-                    got: "unreachable".to_owned(),
-                }
+                stale("target_voter_unreachable", format!("reachable target voter {node_id}"), "unreachable".into())
             })?;
-        let metrics = metrics_response.get("Metrics").ok_or(PairedBackupError::StaleIncarnation {
-            field: "target_voter_metrics",
-            expected: format!("Metrics from target voter {node_id}"),
-            got: "missing".to_owned(),
+        let metrics = metrics_response.get("Metrics").ok_or_else(|| {
+            stale("target_voter_metrics", format!("Metrics from target voter {node_id}"), "missing".into())
         })?;
         if metrics["running_ok"].as_bool() != Some(true) || metrics["node_id"].as_u64() != Some(node_id) {
-            return Err(PairedBackupError::StaleIncarnation {
-                field: "target_voter_running_ok",
-                expected: format!("running voter {node_id}"),
-                got: "not running or node_id mismatch".to_owned(),
-            });
+            return Err(stale(
+                "target_voter_running_ok",
+                format!("running voter {node_id}"),
+                "not running or node_id mismatch".into(),
+            ));
         }
-        let summary = metrics.get("sm_summary").ok_or(PairedBackupError::StaleIncarnation {
-            field: "target_sm_summary",
-            expected: "empty state machine".to_owned(),
-            got: "missing".to_owned(),
-        })?;
+        let summary = metrics
+            .get("sm_summary")
+            .ok_or_else(|| stale("target_sm_summary", "empty state machine".to_owned(), "missing".into()))?;
         if summary["kv_count"].as_u64() != Some(0)
             || !summary["active_snapshot_id"].is_null()
             || !summary["active_snapshot_file"].is_null()
         {
-            return Err(PairedBackupError::StaleIncarnation {
-                field: "target_sm_summary",
-                expected: "empty state machine (kv_count=0, no active snapshot)".to_owned(),
-                got: summary.to_string(),
-            });
+            return Err(stale(
+                "target_sm_summary",
+                "empty state machine (kv_count=0, no active snapshot)".to_owned(),
+                summary.to_string(),
+            ));
         }
-        for key in ["refcas/head_seq", "refcas/cluster_incarnation", "refcas/paired_freeze"] {
+        for key in ["refcas/head_seq", "refcas/cluster_incarnation", "refcas/paired_freeze", GROUP_EPOCH_KV_KEY] {
             let (kv_response, _cert_sha) = mtls_rpc_call(
                 &raft.tls_cfg,
                 endpoint,
@@ -460,15 +452,14 @@ pub(super) fn verify_pristine_target(
                 &json!({ "InspectReplicaKv": { "key": key } }),
                 raft.cfg.rpc_timeout,
             )?;
-            let value = kv_response.pointer("/KvValue/value").filter(|v| !v.is_null());
-            if let Some(value) = value {
+            if let Some(value) = kv_response.pointer("/KvValue/value").filter(|value| !value.is_null()) {
                 let text = value.as_str().unwrap_or_default();
-                let forbidden = text.parse::<Uuid>().ok().is_some_and(|id| forbidden_incarnations.contains(&id));
-                return Err(PairedBackupError::StaleIncarnation {
-                    field: if forbidden { "forbidden_incarnation" } else { "dirty_target_raft" },
-                    expected: format!("empty {key} on target voter {node_id}"),
-                    got: text.to_owned(),
-                });
+                let field = if text.parse::<Uuid>().ok().is_some_and(|id| forbidden_incarnations.contains(&id)) {
+                    "forbidden_incarnation"
+                } else {
+                    "dirty_target_raft"
+                };
+                return Err(stale(field, format!("empty {key} on target voter {node_id}"), text.to_owned()));
             }
         }
     }

@@ -18,10 +18,12 @@ use super::freeze_drain::{RepoBackupRegistrationSpec, TriPartyBackupCoordinator}
 use super::mtls_raft::{DurableRaftFreezeRecord, MtlsLiveRaftBackend};
 use super::pg_cutpoint::{pg_err, sync_restored_pg_projection_cursors};
 pub use super::pg_freeze_settings::{
-    PG_FREEZE_SETTING, enforce_maintenance_pg_write_guard, read_pg_database_freeze_marker, read_pg_database_read_only,
-    terminate_and_await_other_pg_sessions, verify_no_active_pg_writers,
+    PAIRED_FREEZE_JOURNAL_LOCK_KEY, PG_FREEZE_SETTING, enforce_maintenance_pg_write_guard,
+    read_pg_database_freeze_marker, read_pg_database_read_only, terminate_and_await_other_pg_sessions,
+    verify_no_active_pg_writers,
 };
 use super::pg_freeze_settings::{set_pg_database_freeze_marker, set_pg_database_read_only};
+use super::pg_write_fence::{PgTableShareFence, acquire_pg_table_share_fence};
 use super::quorum_wal::DurableRaftBackend;
 use super::raft_barrier::{DurableFreezeBarrierProof, SealedArchiveReceipt};
 use super::types::{CloseScopeBarrierReceipt, FreezePartyStatus, PairedBackupError};
@@ -32,15 +34,31 @@ pub struct DurableFreezeRequest<'a> {
     pub scope_authz_floor: i64,
     pub repos: &'a [RepoBackupRegistrationSpec],
     pub peer_repos_by_group: BTreeMap<i64, Vec<(Uuid, Uuid, Uuid)>>,
+    pub fence_database_url: &'a str,
 }
 
 pub struct DurableFreezeHandle {
     pub active_barrier: DurableFreezeBarrierProof,
     pub peer_barriers: BTreeMap<i64, DurableFreezeBarrierProof>,
     pub freeze_record: DurableRaftFreezeRecord,
+    pub write_fence: tokio::sync::Mutex<Option<PgTableShareFence>>,
 }
 
 impl DurableFreezeHandle {
+    pub async fn write_fence_pid(&self) -> Option<i32> {
+        self.write_fence.lock().await.as_ref().map(PgTableShareFence::backend_pid)
+    }
+
+    pub async fn verify_write_fence_held(&self) -> Result<(), PairedBackupError> {
+        self.write_fence
+            .lock()
+            .await
+            .as_ref()
+            .ok_or(PairedBackupError::FreezeNotHeld("PostgreSQL SHARE table write fence missing"))?
+            .verify_held()
+            .await
+    }
+
     pub async fn verify_still_frozen_on(
         &self,
         pg_client: &(impl GenericClient + Sync),
@@ -63,6 +81,7 @@ impl DurableFreezeHandle {
         if !rec.frozen || rec.barrier_id != self.active_barrier.barrier_id {
             return Err(PairedBackupError::FreezeNotHeld("3-voter mTLS Raft freeze barrier released early"));
         }
+        self.verify_write_fence_held().await?;
         Ok(())
     }
 }
@@ -82,6 +101,8 @@ pub async fn enter_durable_pg_raft_freeze(
         ));
     }
     let barrier_id = Uuid::new_v4();
+    // A recycled pooled backend can still be inside an abandoned transaction block.
+    let _ = pg_client.batch_execute("ROLLBACK").await;
     // A pooled `RecyclingMethod::Fast` session may already carry a latched `READ ONLY`
     // characteristic from an earlier freeze attempt; remember it so a failure *before*
     // `set_pg_database_read_only(true)` does not poison this unfrozen connection.
@@ -106,6 +127,11 @@ pub async fn enter_durable_pg_raft_freeze(
         set_pg_database_freeze_marker(pg_client, Some(&format!("{barrier_id}:{}", req.fenced_deleter_epoch))).await?;
         set_pg_database_read_only(pg_client, true).await?;
         terminate_and_await_other_pg_sessions(pg_client, Duration::from_secs(5)).await?;
+        pg_client
+            .query_one("SELECT pg_advisory_lock($1)", &[&PAIRED_FREEZE_JOURNAL_LOCK_KEY])
+            .await
+            .map_err(|_| PairedBackupError::FreezeNotHeld("failed to serialize journal retirement barrier"))?;
+        let _ = pg_client.query_one("SELECT pg_advisory_unlock($1)", &[&PAIRED_FREEZE_JOURNAL_LOCK_KEY]).await;
         raft.write_freeze_record(&pre_freeze_rec)?;
         for peer_raft in peer_rafts.values() {
             peer_raft.write_freeze_record(&pre_freeze_rec)?;
@@ -238,11 +264,20 @@ pub async fn enter_durable_pg_raft_freeze(
 
         raft.write_freeze_record(&freeze_record)?;
         sync_restored_pg_projection_cursors(pg_client, raft.group_id(), &durable_snap, &peer_snaps).await?;
+        let _ = pg_client.batch_execute("ROLLBACK").await;
+        let write_fence = acquire_pg_table_share_fence(req.fence_database_url, Duration::from_secs(5)).await?;
 
-        Ok(DurableFreezeHandle { active_barrier, peer_barriers, freeze_record })
+        Ok(DurableFreezeHandle {
+            active_barrier,
+            peer_barriers,
+            freeze_record,
+            write_fence: tokio::sync::Mutex::new(Some(write_fence)),
+        })
     }
     .await;
 
+    // Never hand a recycled backend back while it still holds the freeze transaction block.
+    let _ = pg_client.batch_execute("ROLLBACK").await;
     // Hand the pooled session back as `READ ONLY` whenever `deadpool_postgres::RecyclingMethod::Fast`
     // could otherwise leak a `READ WRITE` connection into another request (`POST /api/repos` ->
     // `BlobGitState`). A failure *before* the database-wide fence only restores the characteristic
@@ -284,6 +319,10 @@ pub async fn thaw_durable_pg_raft_freeze(
         return Err(PairedBackupError::IncompleteCut(
             "format 30 paired archive or COMPLETE marker mismatches SealedArchiveReceipt",
         ));
+    }
+    let fence = handle.write_fence.lock().await.take();
+    if let Some(fence) = fence {
+        fence.release().await?;
     }
     pg_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await.map_err(pg_err)?;
 
@@ -334,6 +373,14 @@ pub async fn thaw_durable_pg_raft_freeze(
     }
     set_pg_database_read_only(pg_client, false).await?;
     set_pg_database_freeze_marker(pg_client, None).await?;
+    terminate_and_await_other_pg_sessions(pg_client, Duration::from_secs(5)).await?;
+    pg_client
+        .batch_execute(
+            "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE; \
+             RESET default_transaction_read_only; RESET lock_timeout",
+        )
+        .await
+        .map_err(pg_err)?;
     Ok(max_post_floor)
 }
 

@@ -21,7 +21,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::mtls_wire::{MtlsRaftClusterConfig, build_mtls_client_config};
+use super::mtls_raft::MtlsLiveRaftBackend;
+use super::mtls_wire::{MtlsRaftClusterConfig, build_mtls_client_config, mtls_rpc_call};
 use super::types::{PairedBackupError, validate_hex64};
 
 pub const PEER_ATTESTOR_KEY_FILE: &str = "peer_attestor.pk8";
@@ -167,6 +168,8 @@ pub struct PeerAttestationConfig {
     pub group_id: i64,
     pub data_dir: PathBuf,
     pub raft_node_addr: String,
+    /// Listener address; `None` binds an ephemeral loopback port (`127.0.0.1:0`).
+    pub bind_addr: Option<String>,
     pub ca_cert_pem: PathBuf,
     /// TLS server leaf for this daemon (`DNS:raft-node-{id}.refcas.internal`), whose
     /// SHA-256 is also the pinned voter identity.
@@ -196,6 +199,8 @@ pub(super) struct PeerAttestorState {
 /// Server-side mTLS Ed25519 durable-attestation daemon for one Raft voter.
 pub struct PeerAttestationDaemon {
     addr: String,
+    voter_id: Uuid,
+    pubkey_hex: String,
     stop: Arc<AtomicBool>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -245,8 +250,9 @@ impl PeerAttestationDaemon {
             server_cfg: Arc::new(server_cfg),
             rpc_timeout: cfg.rpc_timeout,
         });
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listener = TcpListener::bind(cfg.bind_addr.as_deref().unwrap_or("127.0.0.1:0"))?;
         let addr = listener.local_addr()?.to_string();
+        let (voter_id, pubkey_hex) = (state.voter_id, state.pubkey_hex.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let join = thread::Builder::new()
@@ -261,11 +267,19 @@ impl PeerAttestationDaemon {
                 }
             })
             .map_err(PairedBackupError::Io)?;
-        Ok(Self { addr, stop, join: Mutex::new(Some(join)) })
+        Ok(Self { addr, voter_id, pubkey_hex, stop, join: Mutex::new(Some(join)) })
     }
 
     pub fn addr(&self) -> &str {
         &self.addr
+    }
+
+    pub fn voter_id(&self) -> Uuid {
+        self.voter_id
+    }
+
+    pub fn pubkey_hex(&self) -> &str {
+        &self.pubkey_hex
     }
 
     pub fn shutdown(&self) {
@@ -334,6 +348,69 @@ fn dispatch(state: &PeerAttestorState, request: &Value) -> Value {
         Ok(attestation) => json!({ "Attestation": attestation }),
         Err(error) => json!({ "Error": error.to_string() }),
     }
+}
+
+/// Wait until the local `raft-node` replica has applied `required_seq`, returning its leaf digest.
+pub(super) fn verify_local_replica_caught_up(
+    raft: &MtlsLiveRaftBackend,
+    required_seq: u64,
+) -> Result<String, PairedBackupError> {
+    let local_addr = &raft.cfg.voter_endpoints[&raft.cfg.local_node_id];
+    let deadline = std::time::Instant::now() + Duration::from_millis(900);
+    while std::time::Instant::now() < deadline {
+        if let Ok((response, cert_sha)) = mtls_rpc_call(
+            &raft.tls_cfg,
+            local_addr,
+            raft.cfg.local_node_id,
+            &json!({ "InspectReplicaKv": { "key": "refcas/head_seq" } }),
+            raft.cfg.rpc_timeout,
+        ) {
+            let seq = response.pointer("/KvValue/value").and_then(Value::as_str).and_then(|raw| raw.parse().ok());
+            if seq.is_some_and(|seq| seq >= required_seq) {
+                return Ok(cert_sha);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    Err(PairedBackupError::FreezeNotHeld(
+        "consensus quorum committed on remote mTLS peers, but local Raft replica WAL/apply lagged",
+    ))
+}
+
+/// Probe one voter's `PeerAttestationDaemon` and prove its `Identity` is bound to the
+/// same X.509 leaf certificate the `raft-node` presented.
+pub(super) fn probe_attestor_identity(
+    tls_cfg: &Arc<ClientConfig>,
+    endpoint: &str,
+    node_id: u64,
+    observed_cert_sha: &str,
+    timeout: Duration,
+) -> Result<(String, String), PairedBackupError> {
+    let (response, handshake_cert_sha) =
+        mtls_rpc_call(tls_cfg, endpoint, node_id, &json!({ "Identity": {} }), timeout)?;
+    if handshake_cert_sha != observed_cert_sha {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "peer attestor certificate differs from the voter's raft-node certificate",
+        ));
+    }
+    let identity = response
+        .get("Identity")
+        .ok_or(PairedBackupError::FreezeNotHeld("peer attestation daemon rejected Identity probe"))?;
+    let reported_cert = identity["peer_cert_sha256"]
+        .as_str()
+        .ok_or(PairedBackupError::FreezeNotHeld("peer attestation daemon returned no certificate digest"))?;
+    let pubkey_hex = identity["ed25519_pubkey_hex"]
+        .as_str()
+        .ok_or(PairedBackupError::FreezeNotHeld("peer attestation daemon returned no Ed25519 public key"))?;
+    if reported_cert != observed_cert_sha
+        || identity["node_id"].as_u64() != Some(node_id)
+        || !validate_hex64(pubkey_hex)
+    {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "peer attestation identity is not bound to the live voter certificate/key",
+        ));
+    }
+    Ok((reported_cert.to_owned(), pubkey_hex.to_owned()))
 }
 
 fn load_ca_roots(path: &Path) -> Result<Arc<RootCertStore>, PairedBackupError> {

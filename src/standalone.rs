@@ -35,6 +35,9 @@ pub async fn run_from_env() -> Result<()> {
     )
     .await
     .map_err(startup_barrier_error)?;
+    let _guard = crate::maintenance::paired_raft_backup::install_production_serving_guard(&barrier_client)
+        .await
+        .map_err(|e| startup_barrier_error(anyhow!("{e}")))?;
     let store = crate::blob_store::opendal::BlobStore::open(
         crate::blob_store::config::BlobProfile::from_env().map_err(|_| anyhow!("invalid Blob profile"))?,
     )
@@ -51,10 +54,17 @@ pub async fn run_from_env() -> Result<()> {
             if let Err(error) = barrier.ensure_held(&barrier_client).await {
                 break error;
             }
+            if let Err(error) =
+                crate::maintenance::paired_raft_backup::ensure_serving_database_unfrozen(&barrier_client).await
+            {
+                break error;
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     };
-    serve(router, pool, bind, check).await
+    let res = serve(router, pool, bind, check).await;
+    crate::maintenance::paired_raft_backup::shutdown_installed_peer_attestation_daemon();
+    res
 }
 
 /// Only the typed lifecycle-barrier refusal keeps its fixed cause; a busy

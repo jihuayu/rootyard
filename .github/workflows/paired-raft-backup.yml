@@ -12,6 +12,8 @@ on:
       - 'src/backup.rs'
       - 'src/backup/**'
       - 'src/maintenance.rs'
+      - 'src/standalone.rs'
+      - 'src/bin/rootyard-peer-attestor.rs'
       - 'src/maintenance/paired_raft_backup.rs'
       - 'src/maintenance/paired_raft_backup/**'
       - 'tests/paired_raft_backup_restore.rs'
@@ -112,13 +114,15 @@ jobs:
           cargo fmt --all -- --check
           python3 scripts/check_design_docs.py
           python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_paired_raft_backup_contracts.py tests.test_workspace_remote_namespace.WorkspaceRemoteNamespaceContractTests
-      - name: Build multi-process refcas-log raft-node binary
+      - name: Build multi-process refcas-log raft-node and peer-attestor sidecars
         run: |
           cargo build --locked --manifest-path crates/refcas-log/Cargo.toml --bin raft-node
+          cargo build --locked --no-default-features --bin rootyard-peer-attestor
           echo "ROOTYARD_REFCAS_NODE_BIN=$GITHUB_WORKSPACE/crates/refcas-log/target/debug/raft-node" >> "$GITHUB_ENV"
+          echo "ROOTYARD_PEER_ATTESTOR_BIN=$GITHUB_WORKSPACE/target/debug/rootyard-peer-attestor" >> "$GITHUB_ENV"
       - name: Run Clippy, library unit tests, OpenDAL S3 + Git tests, and live PG 17 + 3-voter mTLS Raft format 30 restore tests
         run: |
-          cargo clippy --locked --no-default-features --lib --test paired_raft_backup_restore -- -D warnings
+          cargo clippy --locked --no-default-features --lib --bin rootyard-peer-attestor --test paired_raft_backup_restore -- -D warnings
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib maintenance::paired_raft_backup
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test paired_raft_backup_restore
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test paired_raft_backup_restore -- --ignored --test-threads=1

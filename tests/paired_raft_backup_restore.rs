@@ -8,6 +8,8 @@ pub mod format30_e2e;
 pub mod format30_helpers;
 #[path = "paired_raft_backup_support/format30_luna_gates.rs"]
 pub mod format30_luna_gates;
+#[path = "paired_raft_backup_support/format30_luna_startup_gates.rs"]
+pub mod format30_luna_startup_gates;
 #[path = "paired_raft_backup_support/mtls_cluster.rs"]
 pub mod mtls_cluster;
 

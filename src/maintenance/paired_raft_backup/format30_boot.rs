@@ -3,33 +3,25 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::Duration;
 
 use tokio_postgres::Client;
 use uuid::Uuid;
 
 use crate::blob_store::opendal::BlobStore;
 use crate::config::Config;
-use crate::ref_store::core::state_machine::{
-    CommitRefsCommand, InitializeGateCommand, RefCasCommand, RepositoryLane, SmPackMode, WireCommitRefsRequest,
-    WireGateInit,
-};
-use crate::ref_store::{
-    CommitMode, CommitRefsRequest, CoreGateInit, GitOid, HeadUpdate, IssuerLane, RefName, RefPrecondition, RefTarget,
-    RefUpdate,
-};
 
 use super::admission_guard::IncarnationAdmissionGuard;
+use super::format30_boot_raft::{boot_active_and_peer_mtls_raft_incarnation, boot_record};
 use super::format30_paired::{FORMAT30_SUBDIR, Format30PairedManifest, verify_format30_paired_archive};
-use super::freeze_drain::{RepoBackupRegistrationSpec, TriPartyBackupCoordinator};
-use super::git_verify::verify_bare_repo_from_blobs;
-use super::mtls_raft::{DurableRaftFreezeRecord, MtlsLiveRaftBackend};
-use super::peer_groups::PeerRaftCutpointProof;
+use super::mtls_raft::MtlsLiveRaftBackend;
 use super::pg_cutpoint::{pg_err, sync_restored_pg_projection_cursors};
-use super::pg_restore_admission::verify_pg_restored_cursors;
-use super::quorum_wal::DurableRaftBackend;
-use super::types::{
-    BlobArtifactEntry, ExpectedPackPairSpec, NewIncarnationAuthority, PairedBackupError, RestoreOutcome,
+use super::pg_freeze_settings::{
+    set_pg_database_freeze_marker, set_pg_database_read_only, terminate_and_await_other_pg_sessions,
 };
+use super::pg_restore_admission::verify_pg_restored_cursors;
+use super::production_runtime::PairedProductionRuntimeGuard;
+use super::types::{NewIncarnationAuthority, PairedBackupError, RestoreOutcome};
 
 /// Restore the complete `schema 151` / `format 30` archive (`pg_restore` + `BlobStore` rebuild) into
 /// a brand-new PG 17 database + target `BlobStore`, and **install + boot** the new incarnation
@@ -46,6 +38,14 @@ pub async fn restore_and_boot_format30_new_incarnation(
     let backend_hex = target_store.backend_identity().as_hex().to_owned();
     let manifest = verify_format30_paired_archive(archive_dir, Some(&backend_hex))?;
     let fmt30_dir = archive_dir.join(FORMAT30_SUBDIR);
+
+    let expected_peer_ids: BTreeSet<i64> = manifest.raft_cutpoint.peer_groups.iter().map(|p| p.group_id).collect();
+    let provided_peer_ids: BTreeSet<i64> = booted_peer_rafts.keys().copied().collect();
+    if expected_peer_ids != provided_peer_ids {
+        return Err(PairedBackupError::IncompleteCut(
+            "restore target peer Raft group set does not match archived peer_groups",
+        ));
+    }
 
     // Refuse to restore into a dirty/previous incarnation: every configured target voter must be a
     // brand-new empty `raft-node` replica that never hosted this backup's cluster or authority.
@@ -75,13 +75,19 @@ pub async fn restore_and_boot_format30_new_incarnation(
     let parsed: tokio_postgres::Config = dst_config.database_url.parse().map_err(pg_err)?;
     let mut dst_client =
         crate::db::connect_config(parsed).await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
+    dst_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await.map_err(pg_err)?;
+    set_pg_database_freeze_marker(&dst_client, Some(&format!("restore-boot:{}", manifest.backup_id))).await?;
+    set_pg_database_read_only(&dst_client, true).await?;
+    terminate_and_await_other_pg_sessions(&dst_client, Duration::from_secs(5)).await?;
 
     let inc = install_new_incarnation_on_restored_schema151(&mut dst_client, &manifest).await?;
+    let boot_freeze = boot_record(&manifest, &inc, true, Uuid::new_v4(), None)?;
     let git_verified_refs = boot_active_and_peer_mtls_raft_incarnation(
         &fmt30_dir,
         work_dir,
         &manifest,
         &inc,
+        &boot_freeze,
         booted_active_raft,
         booted_peer_rafts,
     )?;
@@ -95,7 +101,32 @@ pub async fn restore_and_boot_format30_new_incarnation(
         .await?;
     verify_pg_restored_cursors(&dst_client, manifest.raft_cutpoint.group_id, &active_snap, &peer_snaps).await?;
 
+    let boot_thaw =
+        boot_record(&manifest, &inc, false, boot_freeze.barrier_id, Some(manifest.paired_cut_digest.clone()))?;
+    for pr in booted_peer_rafts.values() {
+        pr.write_freeze_record(&boot_thaw)?;
+    }
+    booted_active_raft.write_freeze_record(&boot_thaw)?;
+    dst_client
+        .execute(
+            "UPDATE public.pando_storage_authorities \
+             SET remote_delete_fenced = false, remote_delete_fence_reason = NULL WHERE singleton = true",
+            &[],
+        )
+        .await
+        .map_err(pg_err)?;
+    set_pg_database_read_only(&dst_client, false).await?;
+    set_pg_database_freeze_marker(&dst_client, None).await?;
+    terminate_and_await_other_pg_sessions(&dst_client, Duration::from_secs(5)).await?;
+    dst_client
+        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE; RESET default_transaction_read_only")
+        .await
+        .map_err(pg_err)?;
+
     let guard = IncarnationAdmissionGuard { live: inc.clone() };
+    super::startup_wiring::set_installed_production_runtime_guard(Some(
+        PairedProductionRuntimeGuard::from_live_authority(guard.clone(), false),
+    ));
     let outcome = RestoreOutcome {
         backup_id: manifest.backup_id,
         restored_repos: manifest.pg_cutpoint.repositories.len(),
@@ -112,14 +143,7 @@ async fn install_new_incarnation_on_restored_schema151(
     manifest: &Format30PairedManifest,
 ) -> Result<NewIncarnationAuthority, PairedBackupError> {
     let gate_auth_e = manifest.pg_cutpoint.repositories.iter().map(|r| r.authority_epoch).max().unwrap_or(1).max(1);
-    let active_grp_e = manifest
-        .raft_cutpoint
-        .group_epochs
-        .get(&manifest.raft_cutpoint.group_id)
-        .copied()
-        .or_else(|| manifest.pg_cutpoint.repositories.first().map(|r| r.group_epoch))
-        .unwrap_or(1)
-        .max(1);
+    let active_grp_e = manifest.pg_cutpoint.repositories.iter().map(|r| r.group_epoch).max().unwrap_or(1).max(1);
     let max_floor = manifest
         .raft_cutpoint
         .close_receipts
@@ -129,16 +153,19 @@ async fn install_new_incarnation_on_restored_schema151(
         .unwrap_or(1)
         .max(manifest.pg_cutpoint.max_decision_scope_version);
     let new_authz_floor = max_floor.saturating_add(10);
-    let new_deleter_epoch = manifest.freeze.fenced_deleter_epoch.saturating_add(1);
-    let deleter_floor_i64 = i64::try_from(new_deleter_epoch).unwrap_or(i64::MAX);
+    let requested_deleter_epoch = manifest.freeze.fenced_deleter_epoch.saturating_add(1);
+    let deleter_floor_i64 = i64::try_from(requested_deleter_epoch).unwrap_or(i64::MAX);
 
     let new_cluster_inc = Uuid::new_v4();
     let new_storage_auth = Uuid::new_v4();
     let new_storage_gen = manifest.pg_cutpoint.source_storage_generation.saturating_add(2);
-    let primary_hist =
-        manifest.pg_cutpoint.repositories.first().map(|r| r.history_incarnation).unwrap_or_else(Uuid::new_v4);
+    let new_history_inc = Uuid::new_v4();
+    let new_auth_epoch = gate_auth_e.saturating_add(1);
+    let max_peer_grp_e = manifest.raft_cutpoint.group_epochs.values().copied().max().unwrap_or(1);
+    let new_grp_epoch = active_grp_e.max(max_peer_grp_e).saturating_add(1);
 
     let tx = client.transaction().await.map_err(pg_err)?;
+    tx.batch_execute("SET LOCAL session_replication_role = replica").await.map_err(pg_err)?;
     tx.execute(
         "UPDATE public.cluster_authority SET incarnation = $1, rotated_at = clock_timestamp() WHERE singleton = true",
         &[&new_cluster_inc],
@@ -150,15 +177,16 @@ async fn install_new_incarnation_on_restored_schema151(
             "UPDATE public.pando_storage_authorities \
              SET authority_id = $1, generation = GREATEST(generation + 1, $2), \
                  restore_generation = GREATEST(restore_generation + 1, $3), \
-                 authority_epoch = $4, \
-                 remote_delete_fenced = false, remote_delete_fence_reason = NULL, rotated_at = clock_timestamp() \
+                 authority_epoch = $4, remote_delete_fenced = true, \
+                 remote_delete_fence_reason = 'restore-boot-in-progress', rotated_at = clock_timestamp() \
              WHERE singleton = true \
-             RETURNING generation, authority_epoch",
-            &[&new_storage_auth, &new_storage_gen, &deleter_floor_i64, &gate_auth_e],
+             RETURNING generation, authority_epoch, restore_generation",
+            &[&new_storage_auth, &new_storage_gen, &deleter_floor_i64, &new_auth_epoch],
         )
         .await
         .map_err(pg_err)?;
     let (actual_storage_gen, actual_auth_e): (i64, i64) = (srow.get(0), srow.get(1));
+    let new_deleter_epoch = u64::try_from(srow.get::<_, i64>(2)).unwrap_or(requested_deleter_epoch);
 
     tx.execute("UPDATE public.tokens SET revoked = true WHERE NOT revoked", &[]).await.map_err(pg_err)?;
     tx.execute(
@@ -209,275 +237,54 @@ async fn install_new_incarnation_on_restored_schema151(
             .await
             .map_err(pg_err)?;
         }
+        for table in ["ref_store_core_gates", "ref_store_core_protocol_repos", "ref_store_serving_repositories"] {
+            tx.execute(
+                &format!(
+                    "UPDATE public.{table} SET history_incarnation = $1, authority_epoch = $2, \
+                     group_epoch = $3 WHERE repository_id = $4"
+                ),
+                &[&new_history_inc, &actual_auth_e, &new_grp_epoch, &repo.repository_id],
+            )
+            .await
+            .map_err(pg_err)?;
+        }
     }
+    tx.batch_execute(
+        "SET LOCAL session_replication_role = DEFAULT; \
+         DELETE FROM public.ref_store_core_serving_reads; \
+         DELETE FROM public.ref_cas_projection_jobs; \
+         DELETE FROM public.ref_cas_projected_refs; \
+         DELETE FROM public.ref_cas_projected_events; \
+         DELETE FROM public.ref_cas_projected_operations;",
+    )
+    .await
+    .map_err(pg_err)?;
     tx.commit().await.map_err(pg_err)?;
 
-    let fenced_inc = BTreeSet::from([
+    let mut fenced_inc = BTreeSet::from([
         manifest.pg_cutpoint.source_cluster_incarnation,
         manifest.pg_cutpoint.source_storage_authority_id,
     ]);
+    for repo in &manifest.pg_cutpoint.repositories {
+        fenced_inc.insert(repo.history_incarnation);
+    }
+    for peer in &manifest.raft_cutpoint.peer_groups {
+        for gate in &peer.snapshot.body.gates {
+            fenced_inc.insert(gate.history_incarnation);
+        }
+    }
     let fenced_decisions: BTreeSet<Uuid> =
         manifest.raft_cutpoint.snapshot.body.decisions.iter().map(|d| d.decision_id).collect();
     Ok(NewIncarnationAuthority {
         new_cluster_incarnation: new_cluster_inc,
         new_storage_authority_id: new_storage_auth,
         new_storage_generation: actual_storage_gen,
-        new_history_incarnation: primary_hist,
+        new_history_incarnation: new_history_inc,
         new_authority_epoch: actual_auth_e,
-        new_group_epoch: active_grp_e,
+        new_group_epoch: new_grp_epoch,
         new_authz_floor,
         new_deleter_epoch,
         fenced_prior_incarnations: fenced_inc,
         fenced_pre_backup_decision_ids: fenced_decisions,
     })
-}
-
-#[derive(Default)]
-struct EntrySlot<'a> {
-    pack: Option<&'a BlobArtifactEntry>,
-    idx: Option<&'a BlobArtifactEntry>,
-}
-
-fn boot_active_and_peer_mtls_raft_incarnation(
-    fmt30_dir: &Path,
-    work_dir: &Path,
-    manifest: &Format30PairedManifest,
-    inc: &NewIncarnationAuthority,
-    active_raft: &mut MtlsLiveRaftBackend,
-    peer_rafts: &mut BTreeMap<i64, MtlsLiveRaftBackend>,
-) -> Result<usize, PairedBackupError> {
-    let mut git_verified_refs = 0usize;
-    let coord = TriPartyBackupCoordinator::new(inc.new_deleter_epoch.saturating_sub(1), 0);
-    let mut repo_access_floors = BTreeMap::new();
-
-    for repo in &manifest.pg_cutpoint.repositories {
-        repo_access_floors.insert(repo.repository_id, inc.new_authz_floor);
-        let mut by_pack: BTreeMap<Uuid, EntrySlot<'_>> = BTreeMap::new();
-        for e in manifest.blob_closure.entries.iter().filter(|e| e.repository_id == repo.repository_id) {
-            let slot = by_pack.entry(e.pack_id).or_default();
-            if e.role == "pack" {
-                slot.pack = Some(e);
-            } else {
-                slot.idx = Some(e);
-            }
-        }
-        let mut pairs = Vec::with_capacity(by_pack.len());
-        let mut expected_packs = Vec::with_capacity(by_pack.len());
-        for (&pack_id, slot) in &by_pack {
-            let (pe, ie) = (
-                slot.pack.ok_or_else(|| PairedBackupError::BlobClosureIncomplete("missing .pack".into()))?,
-                slot.idx.ok_or_else(|| PairedBackupError::BlobClosureIncomplete("missing .idx".into()))?,
-            );
-            pairs.push((fmt30_dir.join(&pe.archive_rel_path), fmt30_dir.join(&ie.archive_rel_path)));
-            expected_packs.push(ExpectedPackPairSpec {
-                pack_id,
-                pack_sha256: pe.sha256.clone(),
-                pack_bytes: pe.length,
-                idx_sha256: ie.sha256.clone(),
-                idx_bytes: ie.length,
-            });
-        }
-        let rw = work_dir.join(repo.repository_id.to_string());
-        git_verified_refs += verify_bare_repo_from_blobs(&rw, repo.object_format, &repo.refs, &pairs, &rw.join("cl"))?;
-        replay_repo_onto_booted_raft(active_raft, repo, inc.new_authz_floor)?;
-
-        let spec = RepoBackupRegistrationSpec {
-            repository_id: repo.repository_id,
-            tenant_id: repo.tenant_id,
-            owner_id: repo.tenant_id,
-            object_format: repo.object_format,
-            history_incarnation: repo.history_incarnation,
-            authority_epoch: repo.authority_epoch,
-            group_epoch: repo.group_epoch,
-            authority_id: inc.new_storage_authority_id,
-            authority_generation: inc.new_storage_generation,
-            backend_identity: manifest.blob_closure.backend_identity.clone(),
-            expected_packs,
-        };
-        let mut reg_recs = Vec::new();
-        coord.register_backup_closure_hold(active_raft, &spec, &mut reg_recs)?;
-    }
-
-    let boot_thaw = DurableRaftFreezeRecord {
-        frozen: false,
-        barrier_id: Uuid::new_v4(),
-        fenced_deleter_epoch: inc.new_deleter_epoch,
-        app_fence_seq: 1,
-        repo_access_floors,
-        seal_receipt_digest: Some(manifest.paired_cut_digest.clone()),
-        record_seal: String::new(),
-    }
-    .seal()?;
-    active_raft.write_incarnation_record(inc)?;
-    active_raft.write_freeze_record(&boot_thaw)?;
-
-    for peer in &manifest.raft_cutpoint.peer_groups {
-        let pr = peer_rafts
-            .get_mut(&peer.group_id)
-            .ok_or(PairedBackupError::IncompleteCut("missing booted 3-voter mTLS Raft cluster for peer group"))?;
-        boot_single_peer_mtls_raft(pr, peer, inc, &boot_thaw)?;
-    }
-    Ok(git_verified_refs)
-}
-
-fn replay_repo_onto_booted_raft(
-    raft: &mut MtlsLiveRaftBackend,
-    repo: &super::types::PgRepositoryRowProof,
-    authz_floor: i64,
-) -> Result<(), PairedBackupError> {
-    let head_branch = repo
-        .refs
-        .keys()
-        .find(|r| r.as_str() == "refs/heads/main")
-        .or_else(|| repo.refs.keys().find(|r| r.starts_with("refs/heads/")))
-        .cloned()
-        .unwrap_or_else(|| "refs/heads/main".into());
-    let init = CoreGateInit::new(
-        repo.repository_id,
-        repo.tenant_id,
-        repo.object_format,
-        repo.history_incarnation,
-        repo.authority_epoch,
-        repo.group_epoch,
-        RefName::branch(&head_branch).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?,
-    )
-    .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-    raft.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
-        gate: WireGateInit::from(&init),
-        pack_mode: SmPackMode::MetadataOnly,
-        lane: RepositoryLane::ServingRefStore,
-        authz_floor,
-    }))?;
-    if repo.refs.is_empty() {
-        return Ok(());
-    }
-    let mut updates = Vec::with_capacity(repo.refs.len());
-    for (k, v) in &repo.refs {
-        let rn = RefName::new(k).map_err(|e| PairedBackupError::GitVerificationFailed(e.to_string()))?;
-        let oid = GitOid::parse(repo.object_format, v)
-            .map_err(|e| PairedBackupError::GitVerificationFailed(e.to_string()))?;
-        updates.push(RefUpdate::new(rn, RefPrecondition::Absent, RefTarget::Oid(oid)));
-    }
-    let issuer = Uuid::new_v4();
-    let lane = IssuerLane::new("fmt30-restore").map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-    let req = CommitRefsRequest::new(
-        repo.repository_id,
-        repo.tenant_id,
-        issuer,
-        lane.clone(),
-        1,
-        Uuid::new_v4(),
-        repo.object_format,
-        repo.history_incarnation,
-        repo.authority_epoch,
-        repo.group_epoch,
-        1,
-        HeadUpdate::Keep,
-        CommitMode::Atomic,
-        updates,
-    )
-    .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-    raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
-        request: WireCommitRefsRequest::from(&req),
-        decision_id: None,
-        required_holds: Vec::new(),
-        policy_rejects: BTreeMap::new(),
-        logical_tick: authz_floor as u64,
-    }))?;
-    if let Some((rk, rv)) = repo.refs.iter().next() {
-        let rn = RefName::new(rk).map_err(|e| PairedBackupError::GitVerificationFailed(e.to_string()))?;
-        let oid = GitOid::parse(repo.object_format, rv)
-            .map_err(|e| PairedBackupError::GitVerificationFailed(e.to_string()))?;
-        for (seq_off, rev) in (2..repo.gate_revision).enumerate() {
-            let step = CommitRefsRequest::new(
-                repo.repository_id,
-                repo.tenant_id,
-                issuer,
-                lane.clone(),
-                (seq_off + 2) as i64,
-                Uuid::new_v4(),
-                repo.object_format,
-                repo.history_incarnation,
-                repo.authority_epoch,
-                repo.group_epoch,
-                rev,
-                HeadUpdate::Keep,
-                CommitMode::Atomic,
-                vec![RefUpdate::new(rn.clone(), RefPrecondition::Present(oid), RefTarget::Oid(oid))],
-            )
-            .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-            raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
-                request: WireCommitRefsRequest::from(&step),
-                decision_id: None,
-                required_holds: Vec::new(),
-                policy_rejects: BTreeMap::new(),
-                logical_tick: authz_floor as u64,
-            }))?;
-        }
-    }
-    Ok(())
-}
-
-fn boot_single_peer_mtls_raft(
-    pr: &mut MtlsLiveRaftBackend,
-    peer: &PeerRaftCutpointProof,
-    inc: &NewIncarnationAuthority,
-    boot_thaw: &DurableRaftFreezeRecord,
-) -> Result<(), PairedBackupError> {
-    for gate in &peer.snapshot.body.gates {
-        let init = CoreGateInit::new(
-            gate.repository_id,
-            gate.tenant_id,
-            gate.object_format,
-            gate.history_incarnation,
-            gate.authority_epoch,
-            peer.group_epoch,
-            RefName::branch(&gate.head_ref).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?,
-        )
-        .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-        pr.commit_and_apply(RefCasCommand::InitializeGate(InitializeGateCommand {
-            gate: WireGateInit::from(&init),
-            pack_mode: gate.pack_mode,
-            lane: gate.lane,
-            authz_floor: inc.new_authz_floor,
-        }))?;
-        if let Some(rr) = peer.snapshot.body.refs.iter().find(|r| r.repository_id == gate.repository_id)
-            && !rr.refs.is_empty()
-        {
-            let mut updates = Vec::with_capacity(rr.refs.len());
-            for (k, v) in &rr.refs {
-                let rn = RefName::new(k).map_err(|e| PairedBackupError::GitVerificationFailed(e.to_string()))?;
-                let oid = GitOid::parse(gate.object_format, v)
-                    .map_err(|e| PairedBackupError::GitVerificationFailed(e.to_string()))?;
-                updates.push(RefUpdate::new(rn, RefPrecondition::Absent, RefTarget::Oid(oid)));
-            }
-            let req = CommitRefsRequest::new(
-                gate.repository_id,
-                gate.tenant_id,
-                Uuid::new_v4(),
-                IssuerLane::new("fmt30-peer").map_err(|e| PairedBackupError::StateMachine(e.to_string()))?,
-                1,
-                Uuid::new_v4(),
-                gate.object_format,
-                gate.history_incarnation,
-                gate.authority_epoch,
-                peer.group_epoch,
-                1,
-                HeadUpdate::Keep,
-                CommitMode::Atomic,
-                updates,
-            )
-            .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-            pr.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
-                request: WireCommitRefsRequest::from(&req),
-                decision_id: None,
-                required_holds: Vec::new(),
-                policy_rejects: BTreeMap::new(),
-                logical_tick: inc.new_authz_floor as u64,
-            }))?;
-        }
-    }
-    pr.write_incarnation_record(inc)?;
-    pr.write_freeze_record(boot_thaw)?;
-    Ok(())
 }

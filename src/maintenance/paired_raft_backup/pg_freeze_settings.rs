@@ -15,6 +15,10 @@ use super::types::PairedBackupError;
 /// (outside the `public` schema catalog so `schema 151` / `format 30` stays unmodified).
 pub const PG_FREEZE_SETTING: &str = "rootyard.paired_backup_freeze";
 
+/// Advisory lock serializing exclusive freeze entry against `journal::retire` shared-lock
+/// transactions, so an in-flight resolution cannot race the durable read-only latch.
+pub const PAIRED_FREEZE_JOURNAL_LOCK_KEY: i64 = 738_390_153;
+
 pub async fn read_pg_database_freeze_marker(
     client: &(impl GenericClient + Sync),
 ) -> Result<Option<String>, PairedBackupError> {
@@ -127,13 +131,23 @@ async fn remaining_other_client_backends(
 
 /// Verify that no concurrent PostgreSQL write session or open transaction exists.
 pub async fn verify_no_active_pg_writers(client: &(impl GenericClient + Sync)) -> Result<(), PairedBackupError> {
+    verify_no_active_pg_writers_except_fence(client, None).await
+}
+
+/// Verify no concurrent PostgreSQL writer exists while allowing exactly the dedicated
+/// `PgTableShareFence` backend (its `backend_xid` is NULL) to stay in its lock transaction.
+pub async fn verify_no_active_pg_writers_except_fence(
+    client: &(impl GenericClient + Sync),
+    allowed_fence_pid: Option<i32>,
+) -> Result<(), PairedBackupError> {
     let sql = "SELECT count(*)::bigint FROM pg_stat_activity \
          WHERE datname = current_database() AND pid <> pg_backend_pid() \
+           AND NOT ($1::int IS NOT NULL AND pid = $1 AND backend_xid IS NULL) \
            AND (backend_type = 'client backend' OR backend_type IS NULL) \
            AND (backend_xid IS NOT NULL \
                 OR state IS NULL \
                 OR state IN ('active','idle in transaction','idle in transaction (aborted)'))";
-    let count: i64 = client.query_one(sql, &[]).await.map_err(pg_err)?.get(0);
+    let count: i64 = client.query_one(sql, &[&allowed_fence_pid]).await.map_err(pg_err)?.get(0);
     if count != 0 {
         return Err(PairedBackupError::FreezeNotHeld(
             "concurrent PostgreSQL write session/transaction active; refusing cutpoint capture",
@@ -190,9 +204,15 @@ pub(super) async fn set_pg_database_read_only(
     let db_name: String = client.query_one("SELECT current_database()", &[]).await.map_err(pg_err)?.get(0);
     let quoted_db = db_name.replace('"', "\"\"");
     let sql = if read_only {
-        format!("ALTER DATABASE \"{quoted_db}\" SET default_transaction_read_only = on")
+        format!(
+            "ALTER DATABASE \"{quoted_db}\" SET default_transaction_read_only = on; \
+             ALTER DATABASE \"{quoted_db}\" SET lock_timeout = '250ms'"
+        )
     } else {
-        format!("ALTER DATABASE \"{quoted_db}\" RESET default_transaction_read_only")
+        format!(
+            "ALTER DATABASE \"{quoted_db}\" RESET default_transaction_read_only; \
+             ALTER DATABASE \"{quoted_db}\" RESET lock_timeout"
+        )
     };
     client.batch_execute(&sql).await.map_err(pg_err)?;
     Ok(())

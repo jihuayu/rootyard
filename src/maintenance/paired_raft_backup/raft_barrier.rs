@@ -61,6 +61,7 @@ pub fn verify_cutpoint_attestations(
         if claims.kind != "cutpoint"
             || claims.group_id != group_id
             || claims.group_epoch != group_epoch
+            || claims.raft_committed_index == 0
             || claims.refcas_seq != applied_log_id.index
             || claims.subject_digest != state_digest
             || claims.secondary_digest != snapshot_checksum
@@ -115,6 +116,7 @@ impl VoterWalAck {
             || claims.group_id != expected_group_id
             || claims.group_epoch != expected_group_epoch
             || claims.raft_term != expected_log_id.term
+            || claims.raft_committed_index == 0
             || claims.refcas_seq != expected_log_id.index
             || claims.subject_digest != expected_cmd_sha256
             || claims.secondary_digest != self.wal_record_digest

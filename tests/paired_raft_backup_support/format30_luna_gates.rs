@@ -107,6 +107,7 @@ async fn gate1_pooled_pg_session_read_only_reset_and_verified_writer_exit() -> R
             matches!(refused, Err(PairedBackupError::FreezeNotHeld(_))),
             "non-superuser termination against a superuser writer must fail closed"
         );
+        let _ = holder.batch_execute("ROLLBACK").await;
         drop(holder);
 
         // Early `Err` before `set_pg_database_read_only(true)`: `ALTER DATABASE` is refused for a
@@ -132,6 +133,7 @@ async fn gate1_pooled_pg_session_read_only_reset_and_verified_writer_exit() -> R
             scope_authz_floor: 7,
             repos: &repos,
             peer_repos_by_group: BTreeMap::new(),
+            fence_database_url: url.as_str(),
         };
         let early =
             enter_durable_pg_raft_freeze(&mut unpriv_client, &mut raft, &mut BTreeMap::new(), &freeze_req).await;
@@ -161,6 +163,21 @@ async fn gate1_pooled_pg_session_read_only_reset_and_verified_writer_exit() -> R
         let recycled_ro: String = recycled.query_one("SHOW transaction_read_only", &[]).await?.get(0);
         ensure!(recycled_ro == "on", "a failed freeze must return its pooled session READ ONLY");
         drop(recycled);
+        let thaw_conn = db::connect_url(&url).await?;
+        thaw_conn.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await?;
+        thaw_conn
+            .batch_execute(&format!(
+                "ALTER DATABASE \"{gate1_db}\" RESET default_transaction_read_only; \
+                 ALTER DATABASE \"{gate1_db}\" RESET rootyard.paired_backup_freeze"
+            ))
+            .await?;
+        terminate_and_await_other_pg_sessions(&thaw_conn, Duration::from_secs(5)).await.map_err(pg)?;
+        let writer = pool.get().await?;
+        writer.batch_execute("CREATE TEMP TABLE thaw_probe(v int); INSERT INTO thaw_probe VALUES (1);").await?;
+        let writer_ro: String = writer.query_one("SHOW transaction_read_only", &[]).await?.get(0);
+        ensure!(writer_ro == "off", "cross-connection thaw must restore READ WRITE on the original pool");
+        drop(writer);
+        drop(thaw_conn);
         drop(pool);
         Ok(())
     }

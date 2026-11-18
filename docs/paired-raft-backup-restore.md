@@ -17,6 +17,7 @@ Classification tags used below:
 2. **Durable PostgreSQL + Raft `freeze`/`thaw` Covering `repo_access`, Holds, Ref-CAS Writes & Deleters**:
    - [`enter_durable_pg_raft_freeze`](../src/maintenance/paired_raft_backup/durable_freeze_gate.rs) persists `ALTER DATABASE ... SET rootyard.paired_backup_freeze`, `pando_storage_authorities.remote_delete_fenced = true`, bumped `ref_store_decision_scopes` versions across `repo_access`, `repo_lifecycle`, and `authority`, and `DurableRaftFreezeRecord::Frozen` across active + peer 3-voter mTLS Raft clusters (surviving connection drops and `raft-node` restarts).
    - Guarded mutators ([`upsert_repo_access_collaborator_guarded`](../src/maintenance/paired_raft_backup/durable_guarded_ops.rs), [`propose_raft_hold_guarded`](../src/maintenance/paired_raft_backup/durable_guarded_ops.rs), [`propose_raft_ref_write_guarded`](../src/maintenance/paired_raft_backup/durable_guarded_ops.rs), [`execute_deleter_guarded`](../src/maintenance/paired_raft_backup/durable_guarded_ops.rs)) deterministically reject concurrent writes while frozen and resume only after [`thaw_durable_pg_raft_freeze`](../src/maintenance/paired_raft_backup/durable_freeze_gate.rs) verifies [`SealedArchiveReceipt`](../src/maintenance/paired_raft_backup/raft_barrier.rs) and the `format 30` archive.
+   - Kernel enforcement: [`pg_write_fence.rs`](../src/maintenance/paired_raft_backup/pg_write_fence.rs) opens a dedicated `REPEATABLE READ` backend that holds `LOCK TABLE public.<every base table> IN SHARE MODE` for the whole frozen window. PostgreSQL itself rejects any concurrent `INSERT`/`UPDATE`/`DELETE`/DDL (including a superuser session that overrides the session read-only GUC) with `lock_timeout`, and thaw releases the fence only after the archive/quorum seals verify.
 3. **Standard `schema 151` / `format 30` Full PG + Blob + Multi-Group Raft Archive**:
    - [`create_format30_paired_raft_backup`](../src/maintenance/paired_raft_backup/format30_paired.rs) delegates the PostgreSQL (`pg_dump --format=custom --schema=public --snapshot`) and OpenDAL Blob closure archive to [`crate::backup::create`](../src/backup/snapshot.rs) (`format == 30`, `schema_versions == 1..=151`), binding `metadata.dump`, `blob/...`, `PgCutpointProof`, and active + peer [`PeerRaftCutpointProof`](../src/maintenance/paired_raft_backup/peer_groups.rs)s into [`Format30PairedManifest`](../src/maintenance/paired_raft_backup/format30_paired.rs).
 
@@ -36,14 +37,15 @@ Classification tags used below:
 1. **PG pooled-session `READ ONLY` reset & verified write-session exit**:
    - [`enter_durable_pg_raft_freeze`](../src/maintenance/paired_raft_backup/durable_freeze_gate.rs) now unconditionally re-issues `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` on **both** the `Ok` and `Err` paths, so a pooled connection never leaks a read-write session back to the pool.
    - The former fire-and-forget `pg_terminate_backend` is replaced by [`terminate_and_await_other_pg_sessions`](../src/maintenance/paired_raft_backup/pg_freeze_settings.rs): every `pg_terminate_backend(pid)` boolean is inspected (fail-closed on `false`/`NULL`), then `pg_stat_activity` is polled until no other client backend of `current_database()` survives, bounded by a 5 s deadline.
-   - [`verify_no_active_pg_writers`](../src/maintenance/paired_raft_backup/pg_freeze_settings.rs) runs immediately before the `RepeatableRead` cutpoint transaction, refusing capture while any other backend still holds a transaction/xid.
+   - [`verify_no_active_pg_writers`](../src/maintenance/paired_raft_backup/pg_freeze_settings.rs) runs immediately before the `RepeatableRead` cutpoint transaction, refusing capture while any other backend still holds a transaction/xid. [`verify_no_active_pg_writers_except_fence`](../src/maintenance/paired_raft_backup/pg_freeze_settings.rs) applies the same rule while excluding only the SHARE-mode fence backend (identified by `pg_backend_pid()` and `backend_xid IS NULL`).
 2. **Server-side Ed25519 per-peer durable attestations**:
    - [`peer_attestation.rs`](../src/maintenance/paired_raft_backup/peer_attestation.rs) defines `PeerDurableAttestationClaims`/`PeerDurableAttestation`, canonical `rootyard-peer-durable-attestation-v1` signing, `derive_voter_uuid_bound` (`rootyard-mtls-voter-uuid-v2`, binding the X.509 leaf SHA-256 **and** the Ed25519 public key), and the per-voter mTLS `PeerAttestationDaemon`.
    - [`peer_attestation_rpc.rs`](../src/maintenance/paired_raft_backup/peer_attestation_rpc.rs) verifies the voter's own `raft-node` replica (`Metrics`, `InspectReplicaKv`, replayed `state_digest`/`snapshot.checksum`, fsynced `sm.sqlite3`/`log.sqlite3`) before signing `"commit"`/`"cutpoint"` claims.
+   - `PeerAttestorState::verify_local_group_epoch` cross-checks the requested `group_epoch` against **three** durable local-replica sources (`refcas/cluster_incarnation`, `refcas/group_epoch`, and the replayed `refcas/cmd/00000001` `InitializeGate`), requiring agreement and equality before any signature; stale requests return `StaleIncarnation { field: "group_epoch" }`, divergent sources return `CutpointSkew`, and cutpoint replay additionally requires every replayed gate epoch to equal the signed value.
    - Every [`VoterWalAck`](../src/maintenance/paired_raft_backup/raft_barrier.rs) must now carry a verified `"commit"` attestation bound to `(group_id, group_epoch, log_id, command_sha256, wal_record_digest)`, and every `RaftCutpointProof`/`PeerRaftCutpointProof` must carry `> N/2` distinct `"cutpoint"` attestations bound to the archived voter set and cutpoint digests (`verify_cutpoint_attestations`).
    - `WalSyncedRaftBackend` persists per-voter `0o600` `.voter{slot}.pk8` Ed25519 keys and `.voters` bindings ([`wal_voters.rs`](../src/maintenance/paired_raft_backup/wal_voters.rs)) and signs each local `VoterWalAck` itself.
 3. **Pristine target Raft incarnation check on restore**:
-   - [`verify_pristine_new_incarnation_target`](../src/maintenance/paired_raft_backup/mtls_raft.rs) probes **100%** of the configured target voters: a target `group_membership_digest` must differ from the source, `sm_summary.kv_count == 0` with no active snapshot, and `refcas/head_seq`, `refcas/cluster_incarnation`, and `refcas/paired_freeze` must be absent.
+   - [`verify_pristine_new_incarnation_target`](../src/maintenance/paired_raft_backup/mtls_raft.rs) probes **100%** of the configured target voters: a target `group_membership_digest` must differ from the source, `sm_summary.kv_count == 0` with no active snapshot, and `refcas/head_seq`, `refcas/cluster_incarnation`, `refcas/group_epoch`, and `refcas/paired_freeze` must be absent.
    - [`restore_and_boot_format30_new_incarnation`](../src/maintenance/paired_raft_backup/format30_boot.rs) runs it for the active and every peer target Raft cluster **before** `crate::backup::restore`, with `forbidden_incarnations = {source_cluster_incarnation, source_storage_authority_id}`.
 4. **Freeze / restored-incarnation / deleter-epoch guards wired into production paths**:
    - [`enforce_maintenance_pg_write_guard`](../src/maintenance/paired_raft_backup/pg_freeze_settings.rs) is enforced in [`src/maintenance.rs`](../src/maintenance.rs) `resolve`, `retire_resolved_journals`, and `retire_if_resolved` so audit-gap resolution and journal retirement fail closed during a freeze, database-wide read-only fence, or `remote_delete_fenced`.
@@ -52,14 +54,24 @@ Classification tags used below:
 
 ---
 
-## 4. Verification Commands
+## 4. Four Production Guarantees (`EnforcedRestoreProtocol`)
+
+1. **Durable WAL/SM bytes bound to Raft commits**: [`wal_file_digest.rs`](../src/maintenance/paired_raft_backup/wal_file_digest.rs) fsyncs and hashes each voter's `log.sqlite3`/`sm.sqlite3`, rejects missing or empty files, and binds the committed `last_applied.index` into the `rootyard-mtls-peer-wal-v3` signature.
+2. **Freeze/writer serialization**: `PAIRED_FREEZE_JOURNAL_LOCK_KEY` ([`pg_freeze_settings.rs`](../src/maintenance/paired_raft_backup/pg_freeze_settings.rs)) is exclusive for freeze entry and shared by [`journal::retire`](../src/maintenance.rs), while cross-connection thaw terminates stale sessions and restores `READ WRITE` on the original pool.
+3. **Production startup wiring**: [`src/standalone.rs`](../src/standalone.rs) calls `install_production_serving_guard` and `ensure_serving_database_unfrozen` ([`startup_wiring.rs`](../src/maintenance/paired_raft_backup/startup_wiring.rs)), so serving refuses startup or drains when a freeze is latched. The same wiring optionally spawns the voter's co-located mTLS Ed25519 attestor from `ROOTYARD_PAIRED_RAFT_ATTESTOR_JSON` before connecting the live Raft backend, and `src/bin/rootyard-peer-attestor.rs` provides the identical standalone sidecar process used by the multi-process tests.
+4. **Frozen-until-ready multi-peer restore**: [`format30_boot.rs`](../src/maintenance/paired_raft_backup/format30_boot.rs) rejects an incomplete peer set up front, rotates `history_incarnation`/`authority_epoch`/`group_epoch` across PG and every restored Raft group, and unfreezes only after PG cursors and 100% of active + peer cutpoint attestations verify.
+
+---
+
+## 5. Verification Commands
 
 ```bash
 cargo fmt --all -- --check
 python3 scripts/check_design_docs.py
 python3 -m unittest tests/test_ci_workflow_triggers.py tests/test_ci_cargo_fork_workflows.py tests/test_paired_raft_backup_contracts.py tests.test_workspace_remote_namespace.WorkspaceRemoteNamespaceContractTests
 cargo build --locked --manifest-path crates/refcas-log/Cargo.toml --bin raft-node
-cargo clippy --locked --no-default-features --lib --test paired_raft_backup_restore -- -D warnings
+cargo build --locked --no-default-features --bin rootyard-peer-attestor
+cargo clippy --locked --no-default-features --lib --bin rootyard-peer-attestor --test paired_raft_backup_restore -- -D warnings
 RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib maintenance::paired_raft_backup
 RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test paired_raft_backup_restore
 ROOTYARD_TEST_DATABASE_URL="postgres://postgres:password@127.0.0.1:5432/rootyard_test" RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test paired_raft_backup_restore -- --ignored --test-threads=1

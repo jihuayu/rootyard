@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parents[1]
 MOD_DIR = ROOT / "src" / "maintenance" / "paired_raft_backup"
 RUST_FILES = [
+    ROOT / "src" / "standalone.rs",
     ROOT / "src" / "maintenance" / "paired_raft_backup.rs",
     *sorted(MOD_DIR.glob("*.rs")),
     ROOT / "tests" / "paired_raft_backup_restore.rs",
@@ -187,7 +188,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         self.assertIn("verify_no_active_pg_writers", gate_src)
 
         fmt30_src = (MOD_DIR / "format30_paired.rs").read_text(encoding="utf-8")
-        self.assertIn("verify_no_active_pg_writers", fmt30_src)
+        self.assertIn("verify_no_active_pg_writers_except_fence", fmt30_src)
         self.assertIn("cutpoint_attestations", fmt30_src)
 
         attest_src = (
@@ -241,12 +242,21 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         self.assertIn("enforce_maintenance_pg_write_guard", facade_src)
         self.assertIn("pub use paired_raft_backup::{PairedProductionRuntimeGuard, WorkerProjectionTicket};", facade_src)
 
+        for token, rel in (
+            ("fsync_and_hash_voter_durable_wal", "src/maintenance/paired_raft_backup/wal_file_digest.rs"),
+            ("PAIRED_FREEZE_JOURNAL_LOCK_KEY", "src/maintenance/paired_raft_backup/pg_freeze_settings.rs"),
+            ("install_production_serving_guard", "src/maintenance/paired_raft_backup/startup_wiring.rs"),
+            ("ensure_serving_database_unfrozen", "src/maintenance/paired_raft_backup/startup_wiring.rs"),
+            ("expected_peer_ids", "src/maintenance/paired_raft_backup/format30_boot.rs"),
+        ):
+            self.assertIn(token, (ROOT / rel).read_text(encoding="utf-8"), token)
+
         admission_src = (MOD_DIR / "admission_guard.rs").read_text(encoding="utf-8")
         for token in ("admit_writer_grant", "admit_decision_execution", "admit_deleter_lease"):
             self.assertIn(token, admission_src)
 
         cluster_src = (ROOT / "tests" / "paired_raft_backup_support" / "mtls_cluster.rs").read_text(encoding="utf-8")
-        for token in ("attestor_endpoints", "PeerAttestationDaemon", "PeerAttestationConfig"):
+        for token in ("attestor_endpoints", "peer_attestor_bin", "AttestorProc", "ROOTYARD_PEER_ATTESTOR_BIN"):
             self.assertIn(token, cluster_src, f"mTLS harness must run real per-voter attestors: {token}")
         gates_src = (ROOT / "tests" / "paired_raft_backup_support" / "format30_luna_gates.rs").read_text(
             encoding="utf-8"
@@ -258,6 +268,53 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             "gate4_production_guards_refuse_frozen_stale_and_superseded_paths",
         ):
             self.assertIn(token, gates_src)
+
+    def test_kernel_write_fence_peer_attestor_sidecar_and_group_epoch_contracts(self) -> None:
+        fence_path = MOD_DIR / "pg_write_fence.rs"
+        fence_raw = fence_path.read_bytes()
+        self.assertNotIn(b"\r\n", fence_raw)
+        fence_text = fence_raw.decode("utf-8")
+        self.assertLess(len(fence_text.splitlines()), 175)
+        self.assertNotIn("#[allow(", fence_text)
+        for token in ("PgTableShareFence", "LOCK TABLE", "IN SHARE MODE", "pg_backend_pid", "backend_xid"):
+            self.assertIn(token, fence_text, f"missing kernel PostgreSQL write-fence contract: {token}")
+
+        sidecar = ROOT / "src" / "bin" / "rootyard-peer-attestor.rs"
+        sidecar_raw = sidecar.read_bytes()
+        self.assertNotIn(b"\r\n", sidecar_raw)
+        sidecar_text = sidecar_raw.decode("utf-8")
+        self.assertLess(len(sidecar_text.splitlines()), 95)
+        self.assertNotIn("#[allow(", sidecar_text)
+        for token in ("READY", "ed25519_pubkey_hex", "--raft-node-addr", "--rpc-timeout-ms", "ctrl_c"):
+            self.assertIn(token, sidecar_text, f"missing peer-attestor sidecar contract: {token}")
+
+        wiring = (MOD_DIR / "startup_wiring.rs").read_text(encoding="utf-8")
+        for token in (
+            "ROOTYARD_PAIRED_RAFT_ATTESTOR_JSON",
+            "installed_peer_attestation_daemon_addr",
+            "shutdown_installed_peer_attestation_daemon",
+        ):
+            self.assertIn(token, wiring, f"missing co-located attestor startup contract: {token}")
+        self.assertIn(
+            "shutdown_installed_peer_attestation_daemon",
+            (ROOT / "src" / "standalone.rs").read_text(encoding="utf-8"),
+            "standalone serving must shut down the co-located attestor",
+        )
+
+        rpc = (MOD_DIR / "peer_attestation_rpc.rs").read_text(encoding="utf-8")
+        for token in ("verify_local_group_epoch", "GROUP_EPOCH_KV_KEY", "StaleIncarnation", "CutpointSkew"):
+            self.assertIn(token, rpc, f"missing signed local group_epoch verification: {token}")
+        self.assertIn(
+            "refcas/group_epoch",
+            (MOD_DIR / "mtls_raft.rs").read_text(encoding="utf-8"),
+            "missing group epoch key literal in mtls_raft",
+        )
+        self.assertLess(len(rpc.splitlines()), 495)
+        self.assertLess(len((ROOT / "tests" / "paired_raft_backup_support" / "format30_e2e.rs").read_text(encoding="utf-8").splitlines()), 475)
+        self.assertLess(
+            len((ROOT / "tests" / "paired_raft_backup_support" / "format30_luna_startup_gates.rs").read_text(encoding="utf-8").splitlines()),
+            240,
+        )
 
     def test_workflow_contract_and_doc_links(self) -> None:
         raw_wf = WORKFLOW.read_bytes()
@@ -277,6 +334,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
                 "src/maintenance.rs",
                 "src/maintenance/paired_raft_backup.rs",
                 "src/maintenance/paired_raft_backup/**",
+                "src/bin/rootyard-peer-attestor.rs",
                 "tests/paired_raft_backup_restore.rs",
                 "tests/paired_raft_backup_support/**",
                 "scripts/eval_paired_raft_backup.py",
@@ -289,6 +347,9 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             "scripts/install_ci_cargo_fork.sh install",
             "scripts/install_ci_cargo_fork.sh verify",
             "postgres:17",
+            "cargo build --locked --no-default-features --bin rootyard-peer-attestor",
+            "ROOTYARD_PEER_ATTESTOR_BIN=",
+            "--bin rootyard-peer-attestor",
             "cargo test --locked --no-default-features --lib maintenance::paired_raft_backup",
             "cargo test --locked --no-default-features --test paired_raft_backup_restore",
             "--ignored",
@@ -299,8 +360,16 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         raw_doc = DOC.read_bytes()
         self.assertNotIn(b"\r\n", raw_doc)
         doc_text = raw_doc.decode("utf-8")
-        self.assertLess(len(doc_text.splitlines()), 500)
-        for token in ("#153", "CurrentCodeFact", "EnforcedRestoreProtocol", "MeasuredEvalBaseline"):
+        self.assertLess(len(doc_text.splitlines()), 130)
+        for token in (
+            "#153",
+            "CurrentCodeFact",
+            "EnforcedRestoreProtocol",
+            "MeasuredEvalBaseline",
+            "pg_write_fence.rs",
+            "verify_local_group_epoch",
+            "rootyard-peer-attestor.rs",
+        ):
             self.assertIn(token, doc_text)
         for target in re.findall(r"\[[^\]]*\]\(([^)]+)\)", doc_text):
             clean = target.split("#", 1)[0]
