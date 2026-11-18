@@ -14,6 +14,8 @@ pub mod fuse_mount;
 pub mod ignore;
 #[path = "workspace_lab/manifest.rs"]
 pub mod manifest;
+#[path = "workspace_lab/merkle_sync.rs"]
+pub mod merkle_sync;
 #[path = "workspace_lab/mutation_gate.rs"]
 pub mod mutation_gate;
 #[path = "workspace_lab/namespace.rs"]

@@ -55,6 +55,8 @@ use super::session_http_acceptance::fixtures::{
 
 use std::{
     collections::HashMap,
+    fs::OpenOptions,
+    io::Write,
     path::Path,
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
@@ -91,6 +93,7 @@ const SEED_CONTENT: &str = "seed\n";
 const SEED_REF: &str = "refs/heads/main";
 const MAX_CAPTURED_RESPONSE: usize = 64 * 1024 * 1024;
 const OWNED_BLOB_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB";
+const FAILURE_PHASE_MARKER: &str = "ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKER";
 
 /// A parsed `report-status`: the `unpack` status and `(ref, ng reason)` rows.
 type GitReport = (String, Vec<(String, Option<String>)>);
@@ -191,15 +194,35 @@ fn require_per_run_blob_prefix() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and Git"]
 async fn pre_admission_revision_mismatch_rebases_to_old_oid_mismatch() -> Result<()> {
-    require_owned_disposable_blob_fixture()?;
-    let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
-    let db = Db::setup().await?;
-    require_per_run_blob_prefix()?;
-    let outcome = case(&db).await;
-    db.finish(outcome).await
+    let mut phase = "fixture_setup";
+    let result = async {
+        require_owned_disposable_blob_fixture()?;
+        let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
+        let db = Db::setup().await?;
+        require_per_run_blob_prefix()?;
+        let outcome = case(&db, &mut phase).await;
+        if outcome.is_ok() {
+            phase = "fixture_cleanup";
+        }
+        db.finish(outcome).await
+    }
+    .await;
+
+    // The fixture preserves a case error over a cleanup error. Record its
+    // phase only after that decision, never while the race is in flight.
+    if result.is_err()
+        && let Some(path) = std::env::var_os(FAILURE_PHASE_MARKER)
+    {
+        let _ = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(phase.as_bytes()));
+    }
+    result
 }
 
-async fn case(db: &Db) -> Result<()> {
+async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
     let store = open_store()?;
     let git: &'static Git = Box::leak(Box::new(Git::new()?));
     let owner = actor::owner(&db.pool).await?;
@@ -234,6 +257,7 @@ async fn case(db: &Db) -> Result<()> {
     let app = capture_receive_responses(router(state.clone()), captures.clone());
     let _server = ServerGuard { task: tokio::spawn(async move { axum::serve(listener, app).await }) };
 
+    *phase = "repository_seed";
     let created = create_repository(address, &owner, &name).await?;
     let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
     provision_decision_realm(db, &owner, &name, &store).await?;
@@ -263,6 +287,7 @@ async fn case(db: &Db) -> Result<()> {
     // Start the loser and wait until its native receive-pack, pair staging and
     // publish baseline capture have completed. It is then held before its
     // admission transaction while the winner commits.
+    *phase = "pre_admission_barrier";
     let mut loser_push = spawn_push(git, second_dir, direct_url.clone(), loser_operation);
     tokio::select! {
         _ = pause.wait_reached() => {}
@@ -280,21 +305,26 @@ async fn case(db: &Db) -> Result<()> {
     );
     ensure!(gate_revision(db, repository_id).await? == revision_before, "the gate moved before the winner started");
 
+    *phase = "winner_publish";
     let winner_output = spawn_push(git, first_dir, direct_url, winner_operation).await?;
     let winner_output = winner_output.context("the winning stock push task failed")?;
     ensure!(winner_output.success, "the winning stock push failed: {}", redacted(&winner_output));
 
+    *phase = "loser_rebase_await";
     pause.release();
     let loser_output = loser_push.await.context("the losing stock push task failed")??;
+    *phase = "loser_rebase_exit_status";
     ensure!(!loser_output.success, "the paused loser unexpectedly succeeded");
+    *phase = "loser_rebase_forbidden_text";
     let loser_text = output_text(&loser_output);
     for forbidden in ["409", "503", "non-fast-forward", "fetch first", "unexpected disconnect", "remote end hung up"] {
-        ensure!(
-            !loser_text.contains(forbidden),
-            "loser saw `{forbidden}`, not a report-status: {}",
-            redacted(&loser_output)
-        );
+        let found = match forbidden {
+            "409" | "503" => has_stock_http_error(&loser_text, forbidden),
+            _ => loser_text.contains(forbidden),
+        };
+        ensure!(!found, "loser saw `{forbidden}`, not a report-status: {}", redacted(&loser_output));
     }
+    *phase = "loser_rebase_stale_info";
     ensure!(
         loser_text.contains("[rejected]") && loser_text.contains("stale info"),
         "the loser did not print the stock stale-info rejection: {}",
@@ -304,6 +334,7 @@ async fn case(db: &Db) -> Result<()> {
     // Exact raw service report-statuses, keyed by pinned operation. Both must
     // be HTTP 200 and parse as real Git pkt-lines; the loser must carry exactly
     // one `ng refs/heads/main stale info` and the winner exactly one `ok`.
+    *phase = "http_report_assertions";
     let winner_capture = captures.take(winner_operation).ok_or_else(|| anyhow!("the winner has no raw reply"))?;
     let loser_capture = captures.take(loser_operation).ok_or_else(|| anyhow!("the loser has no raw reply"))?;
     ensure!(captures.is_empty(), "the service answered unexpected extra receive-pack operations");
@@ -327,6 +358,7 @@ async fn case(db: &Db) -> Result<()> {
     // Durable state: exactly the winner committed; the loser has one durable
     // rejected terminal whose per-ref reason is OldOidMismatch. The gate moved
     // once and main is the winner.
+    *phase = "durable_state_assertions";
     let (winner_state, winner_terminal) = operation_row(db, repository_id, winner_operation)
         .await?
         .ok_or_else(|| anyhow!("the winning operation has no durable row"))?;
@@ -521,6 +553,32 @@ fn report_status(response: &[u8]) -> Result<GitReport> {
         }
     }
     Ok((unpack.ok_or_else(|| anyhow!("report-status has no unpack line"))?, results))
+}
+
+// Git's destination lines include the fixture's ephemeral port and random hex repo name.
+fn has_stock_http_error(text: &str, status: &str) -> bool {
+    let rpc_error = format!("RPC failed; HTTP {status} curl ");
+    let url_error = format!("The requested URL returned error: {status}");
+    text.lines().any(|line| {
+        line.strip_prefix("error: ").unwrap_or(line).starts_with(rpc_error.as_str())
+            || line.ends_with(url_error.as_str())
+    })
+}
+
+#[test]
+fn stock_http_errors_distinguish_status_from_destination_digits() {
+    let destination = "To http://127.0.0.1:54090/git/owner/race-admission-a503b0000000.git\n\
+         ! [rejected] HEAD -> main (stale info)\n\
+        error: failed to push some refs to 'http://127.0.0.1:54090/git/owner/race-admission-a503b0000000.git'";
+    for status in ["409", "503"] {
+        assert!(destination.contains(status));
+        assert!(!has_stock_http_error(destination, status));
+        assert!(has_stock_http_error(&format!("error: RPC failed; HTTP {status} curl 22"), status));
+        assert!(has_stock_http_error(
+            &format!("fatal: unable to access 'http://example.invalid/': The requested URL returned error: {status}"),
+            status
+        ));
+    }
 }
 
 fn output_text(output: &git::Output) -> String {
