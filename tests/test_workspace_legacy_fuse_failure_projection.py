@@ -131,6 +131,120 @@ class FailureProjectionTest(unittest.TestCase):
         }])
         self.assertNotIn("payload-secret", json.dumps(diagnostic, sort_keys=True))
 
+    def test_nested_finally_reports_the_raise_line_not_the_cleanup_line(self):
+        path, _line_count, functions = report._static_function_index()[REPORT_SOURCE]
+        ranges = {qualified: (start, end) for _name, qualified, start, end in functions}
+        inner_start, inner_end = ranges["_frame_record"]
+        outer_start, outer_end = ranges["_project_failure"]
+        self.assertLess(inner_end, outer_start)
+        # The synthetic module needs room for nested try/finally bodies inside
+        # the static ranges it claims to belong to.
+        self.assertGreaterEqual(inner_end - inner_start, 7)
+        self.assertGreaterEqual(outer_end - outer_start, 4)
+
+        raise_line = inner_start + 3
+        inner_finally_line = inner_start + 5
+        inner_cleanup_line = inner_start + 7
+        outer_call_line = outer_start + 2
+        outer_cleanup_line = outer_start + 4
+        self.assertLessEqual(outer_cleanup_line, outer_end)
+        self.assertLess(raise_line, inner_finally_line)
+        self.assertLess(inner_finally_line, inner_cleanup_line)
+
+        lines = [""] * outer_cleanup_line
+
+        def put(number, text):
+            lines[number - 1] = text
+
+        put(inner_start, "def _frame_record(tb):")
+        put(inner_start + 1, "    try:")
+        put(inner_start + 2, "        try:")
+        put(raise_line, "            raise RuntimeError('synthetic-secret-body')")
+        put(inner_start + 4, "        finally:")
+        put(inner_finally_line, "            parked = 'inner-finally'")
+        put(inner_start + 6, "    finally:")
+        put(inner_start + 7, "        parked = 'outer-finally'")
+        put(outer_start, "def _project_failure(err, case_id=None):")
+        put(outer_start + 1, "    try:")
+        put(outer_call_line, "        return _frame_record(None)")
+        put(outer_start + 3, "    finally:")
+        put(outer_cleanup_line, "        parked = 'outer-finally'")
+
+        error = _captured_error(
+            str(path), "\n".join(lines) + "\n", "_project_failure", None
+        )
+        nodes = {}
+        tb = error[2]
+        while tb is not None:
+            nodes.setdefault(tb.tb_frame.f_code.co_name, tb)
+            tb = tb.tb_next
+        raised = nodes["_frame_record"]
+        self.assertEqual(raised.tb_lineno, raise_line)
+        # Both raising frames ran their ``finally`` bodies after the failure, so
+        # the live frame line has moved on while the traceback node has not.
+        self.assertEqual(raised.tb_frame.f_lineno, inner_cleanup_line)
+        self.assertNotEqual(raised.tb_lineno, raised.tb_frame.f_lineno)
+        self.assertGreater(raised.tb_frame.f_lineno, raise_line)
+        self.assertEqual(
+            nodes["_project_failure"].tb_frame.f_lineno, outer_cleanup_line
+        )
+
+        diagnostic = report._project_failure(
+            error, case_id="tests.fake.Case.test_finally", started=True
+        )
+        self.assertEqual(diagnostic["schema"], report.DIAGNOSTIC_SCHEMA)
+        self.assertEqual(set(diagnostic), {
+            "schema", "kind", "case_id", "started", "stage", "exception_class",
+            "locus", "frames", "frames_truncated",
+        })
+        self.assertEqual(diagnostic["exception_class"], "RuntimeError")
+        self.assertEqual(diagnostic["kind"], "error")
+        self.assertEqual(diagnostic["locus"], "verified_source")
+        self.assertFalse(diagnostic["frames_truncated"])
+        self.assertEqual(diagnostic["frames"], [
+            {
+                "path": REPORT_SOURCE,
+                "line": outer_call_line,
+                "function": "_project_failure",
+            },
+            {
+                "path": REPORT_SOURCE,
+                "line": raise_line,
+                "function": "_frame_record",
+            },
+        ])
+        for frame in diagnostic["frames"]:
+            self.assertEqual(set(frame), {"path", "line", "function"})
+
+        encoded = json.dumps(diagnostic, sort_keys=True)
+        for secret in (
+            "synthetic-secret-body", "inner-finally", "outer-finally",
+            "raise RuntimeError", str(path),
+        ):
+            self.assertNotIn(secret, encoded)
+
+        case_id = "tests.fake.Case.test_finally"
+        result = _FakeResult((case_id,), {case_id: diagnostic})
+        result.errors = [(_FakeTest(case_id), "formatted-in-memory")]
+        with mock.patch.object(acceptance, "REQUIRED_CASES", (case_id,)), \
+                mock.patch.object(acceptance, "CASE_DETAILS", {}):
+            payload = report._report_payload(
+                scheduled=(case_id,),
+                result=result,
+                imported=True,
+                containment_owner=ownership.ContainmentOwner(),
+            )
+        self.assertEqual(
+            payload["failure_diagnostics"]["frame_cap"], report.DIAGNOSTIC_FRAME_CAP
+        )
+        self.assertEqual(payload["cases"][0]["diagnostic"], diagnostic)
+        self.assertEqual(
+            payload["cases"][0]["diagnostic"]["frames"][1]["line"], raise_line
+        )
+        report_encoded = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("synthetic-secret-body", report_encoded)
+        self.assertNotIn(str(path), report_encoded)
+
     def test_external_malicious_and_malformed_frames_never_emit_raw_paths(self):
         for filename in ("/etc/passwd", "<external>", "tests/../outside.py"):
             error = _captured_error(

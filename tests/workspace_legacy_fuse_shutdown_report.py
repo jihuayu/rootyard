@@ -103,12 +103,19 @@ def _static_function_index():
     return facts
 
 
-def _frame_record(frame):
-    """Project one traceback frame only when it exactly matches static source."""
+def _frame_record(tb):
+    """Project one traceback node only when it exactly matches static source.
+
+    The projected line is ``tb_lineno`` (the instruction that raised or
+    propagated), never ``tb_frame.f_lineno``: when the raising frame runs a
+    ``finally`` block before unwinding, ``f_lineno`` advances to the cleanup
+    line and would report that instead of the original failure line.
+    """
+    frame = getattr(tb, "tb_frame", None)
     code = getattr(frame, "f_code", None)
     filename = getattr(code, "co_filename", None)
     name = getattr(code, "co_name", None)
-    line = getattr(frame, "f_lineno", None)
+    line = getattr(tb, "tb_lineno", None)
     if not isinstance(filename, str) or not isinstance(name, str) or not isinstance(line, int):
         return None
     try:
@@ -175,7 +182,7 @@ def _project_failure(err, case_id=None, started=False, kind="error"):
     frames = []
     truncated = False
     while tb is not None:
-        record = _frame_record(getattr(tb, "tb_frame", None))
+        record = _frame_record(tb)
         if record is not None:
             if len(frames) < DIAGNOSTIC_FRAME_CAP:
                 frames.append(record)
