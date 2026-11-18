@@ -241,6 +241,68 @@ class StatGateTest(unittest.TestCase):
                     with self.assertRaises(LegacyAcceptanceError):
                         legacy_support.assert_owned_mounts_snapshot(123, expected)
 
+    def test_mount_deadline_helpers_check_again_after_observation(self):
+        mountpoint = Path("/fixture/mount")
+        row = {
+            "mountpoint": str(mountpoint),
+            "mount_id": 7,
+            "source": legacy_support.FUSE_SOURCE,
+            "fstype": "fuse.rootyard",
+        }
+        now = [4.9]
+
+        def clock():
+            return now[0]
+
+        def crossed_empty(_pid):
+            now[0] = 5.1
+            return []
+
+        with self.assertRaises(LegacyAcceptanceError):
+            legacy_support.wait_exact_mount_gone(
+                123, mountpoint, 7, 5.0,
+                clock=clock, read_mountinfo=crossed_empty, sleep=lambda _seconds: None,
+            )
+
+        now[0] = 4.0
+
+        def before_empty(_pid):
+            now[0] = 4.5
+            return []
+
+        self.assertIsNone(
+            legacy_support.wait_exact_mount_gone(
+                123, mountpoint, 7, 5.0,
+                clock=clock, read_mountinfo=before_empty, sleep=lambda _seconds: None,
+            )
+        )
+
+        now[0] = 4.9
+
+        def crossed_present(_pid):
+            now[0] = 5.1
+            return [row]
+
+        with self.assertRaises(LegacyAcceptanceError):
+            legacy_support.wait_owned_mount(
+                123, mountpoint, 5.0,
+                clock=clock, read_mountinfo=crossed_present, sleep=lambda _seconds: None,
+            )
+
+        now[0] = 4.0
+
+        def before_present(_pid):
+            now[0] = 4.5
+            return [row]
+
+        self.assertEqual(
+            legacy_support.wait_owned_mount(
+                123, mountpoint, 5.0,
+                clock=clock, read_mountinfo=before_present, sleep=lambda _seconds: None,
+            ),
+            row,
+        )
+
     def test_gate_environment_is_restored_to_its_exact_prior_state(self):
         class Harness:
             env = {"LD_PRELOAD": "/old", "ROOTYARD_TEST_STAT_GATE": "/old",

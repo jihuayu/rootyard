@@ -441,9 +441,11 @@ def attach_namespace_holder(
     raise _attach_error("independent namespace holder could not attach before service exit")
 
 
-def _owned_rows(pid: int, mountpoint: Path):
+def _owned_rows(pid: int, mountpoint: Path, *, read_mountinfo=None):
+    if read_mountinfo is None:
+        read_mountinfo = support.read_process_mountinfo
     expected = str(mountpoint)
-    rows = support.read_process_mountinfo(pid)
+    rows = read_mountinfo(pid)
     return [
         row for row in rows
         if row["mountpoint"] == expected
@@ -452,15 +454,25 @@ def _owned_rows(pid: int, mountpoint: Path):
     ]
 
 
-def wait_owned_mount(pid: int, mountpoint: Path, deadline: float) -> dict:
+def wait_owned_mount(
+    pid: int,
+    mountpoint: Path,
+    deadline: float,
+    *,
+    clock=time.monotonic,
+    read_mountinfo=None,
+    sleep=time.sleep,
+) -> dict:
     """Wait for exactly one owned FUSE mount at the exact API-created path."""
-    while time.monotonic() < deadline:
-        rows = _owned_rows(pid, mountpoint)
+    while clock() < deadline:
+        rows = _owned_rows(pid, mountpoint, read_mountinfo=read_mountinfo)
         if len(rows) == 1:
-            return rows[0]
+            if clock() < deadline:
+                return rows[0]
+            break
         if len(rows) > 1:
             raise LegacyAcceptanceError("multiple owned FUSE mounts appeared at one workspace path")
-        time.sleep(0.02)
+        sleep(0.02)
     raise LegacyAcceptanceError("owned FUSE mount was not observed within the startup observation bound")
 
 
@@ -498,14 +510,32 @@ def assert_owned_mounts_snapshot(holder_pid: int, expected) -> int:
     return len(wanted)
 
 
-def wait_exact_mount_gone(holder_pid: int, mountpoint: Path, mount_id: int, deadline: float) -> None:
-    """Require the exact old mount ID absent and no replacement at that path."""
+def wait_exact_mount_gone(
+    holder_pid: int,
+    mountpoint: Path,
+    mount_id: int,
+    deadline: float,
+    *,
+    clock=time.monotonic,
+    read_mountinfo=None,
+    sleep=time.sleep,
+) -> None:
+    """Require the exact old mount ID absent and no replacement at that path.
+
+    The same absolute deadline is checked again after every observation, so a
+    mountinfo read that started before D and completed after D cannot turn
+    disappearance into a successful return.
+    """
+    if read_mountinfo is None:
+        read_mountinfo = support.read_process_mountinfo
     expected = str(mountpoint)
-    while time.monotonic() < deadline:
-        rows = support.read_process_mountinfo(holder_pid)
+    while clock() < deadline:
+        rows = read_mountinfo(holder_pid)
         at_path = [row for row in rows if row["mountpoint"] == expected]
         if not at_path:
-            return
+            if clock() < deadline:
+                return
+            break
         if not any(
             row["mount_id"] == int(mount_id)
             and row["source"] == FUSE_SOURCE
@@ -513,7 +543,7 @@ def wait_exact_mount_gone(holder_pid: int, mountpoint: Path, mount_id: int, dead
             for row in at_path
         ):
             raise LegacyAcceptanceError("owned workspace path carried a replacement mount after cleanup")
-        time.sleep(0.02)
+        sleep(0.02)
     raise LegacyAcceptanceError("exact owned mount did not disappear within the shared deadline")
 
 
