@@ -313,9 +313,35 @@ jobs:
           fi
           if ! ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server TMPDIR="$scratch" \
             timeout --kill-after=30s 5m python3 tests/backup_recovery.py \
-              --browse-restore-cache --binary "$binary" --expect-commit "$GITHUB_SHA" \
+              --browse-flush-authority --binary "$binary" --expect-commit "$GITHUB_SHA" \
               --report "$report" >/dev/null 2>&1; then
-            echo 'Browse restore cache proof failed'
+            python3 -I - "$report" "$GITHUB_SHA" >/dev/null 2>&1 <<'PY' || :
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          with Path(sys.argv[1]).open("rb") as source:
+              raw = source.read(4097)
+          assert 0 < len(raw) <= 4096
+          report = json.loads(raw)
+          basic = {"passed", "cases"}
+          hashes = {"source_tree": 40, "source_inputs_sha256": 64,
+                    "binary_sha256": 64, "build_receipt_sha256": 64}
+          assert set(report) in (basic, basic | {"source_head", *hashes})
+          if "source_head" in report:
+              assert report["source_head"] == sys.argv[2]
+              assert all(re.fullmatch(rf"[0-9a-f]{{{size}}}", report[key]) for key, size in hashes.items())
+          assert report["passed"] is False
+          case, = report["cases"]
+          assert set(case) == {"name", "status", "error"}
+          assert case["name"] == "browse_flushall_preserves_git_authority" and case["status"] == "failed"
+          assert case["error"] in {"preflight", "source_warm_backup", "restore", "restored_preview",
+                                   "flush_authority", "receipt_changed", "cleanup", "report_write"}
+          with Path("test-results/browse-restore-cache-failure.json").open("x") as output:
+              json.dump({"passed": False, "cases": [case]}, output)
+          PY
+            echo 'Browse restore or flush cache proof failed'
             exit 1
           fi
           test -s "$report"
@@ -325,6 +351,7 @@ jobs:
             --manifest-out "$manifest" --build-receipt "$receipt" --binary "$binary" \
             --expect-commit "$GITHUB_SHA" --report "browse_restore_cache=$report" \
             --require-case browse_restore_cache=browse_restore_incarnation_cache \
+            --require-case browse_restore_cache=browse_flushall_preserves_git_authority \
             --fixture postgres=postgres:17 \
             --harness tests/backup_recovery.py \
             --harness tests/backup_recovery_cache.py \
@@ -346,15 +373,23 @@ jobs:
             exit 1
           fi
           if ! python3 -I - "$report" "$manifest" >/dev/null 2>&1 <<'PY'
+          import hashlib
           import json
           from pathlib import Path
           import sys
 
-          report, manifest = (json.loads(Path(path).read_text()) for path in sys.argv[1:])
-          case, = report["cases"]
-          assert case["detail"]["owned_cleanup_completed"] is True
+          payload = Path(sys.argv[1]).read_bytes()
+          report = json.loads(payload)
+          manifest = json.loads(Path(sys.argv[2]).read_bytes())
+          expected = ["browse_restore_incarnation_cache", "browse_flushall_preserves_git_authority"]
+          cases = report["cases"]
+          assert [case["name"] for case in cases] == expected
+          assert all(case["detail"]["owned_cleanup_completed"] is True for case in cases)
+          entry = manifest["reports"]["browse_restore_cache"]
+          assert entry["case_names"] == expected and entry["sha256"] == hashlib.sha256(payload).hexdigest()
           assert report["source_head"] == manifest["source_commit"]
           assert report["source_inputs_sha256"] == manifest["source_inputs_sha256"]
+          assert report["binary_sha256"] == manifest["binary_sha256"]
           assert report["build_receipt_sha256"] == manifest["build_receipt"]["sha256"]
           PY
           then
