@@ -16,19 +16,19 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 static SHARED: OnceLock<LoopbackS3> = OnceLock::new();
 
 #[derive(Default)]
-struct State {
+struct S3State {
     objects: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 pub struct LoopbackS3 {
     endpoint: String,
-    state: Arc<State>,
+    state: Arc<S3State>,
 }
 
 impl LoopbackS3 {
     pub fn shared() -> &'static Self {
         SHARED.get_or_init(|| {
-            let state = Arc::new(State::default());
+            let state = Arc::new(S3State::default());
             let server = Arc::clone(&state);
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -150,7 +150,7 @@ fn range(raw: &str, total: usize) -> Option<(usize, usize)> {
 }
 
 async fn handle(
-    State(state): State<Arc<State>>,
+    State(state): State<Arc<S3State>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,

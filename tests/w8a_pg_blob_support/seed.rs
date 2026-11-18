@@ -278,14 +278,12 @@ async fn seed_runtime_rows(
     let config_digest = "0".repeat(64);
     let head_oid = repo.head_oid.as_str();
     let owner_id = owner.identity.id;
-    let owner_name = repo.owner.as_str();
-    let repo_name = repo.name.as_str();
     client
         .execute(
             "INSERT INTO ci_runs(id,tenant_id,repository_id,pull_number,pull_version,context,job_id,head_oid,base_oid,
                                  storage_generation,config_sha256,state,lease_generation,lease_expires_unix,runner_id)
              VALUES($1,$2,$3,$4,1,'w8a',$5,$6,$6,1,$7,'leased',1,$8,'w8a-runner')",
-            &[&Uuid::new_v4(), &owner_id, &repo.id, &pull, &job_id, head_oid, config_digest.as_str(), &expires],
+            &[&Uuid::new_v4(), &owner_id, &repo.id, &pull, &job_id, &head_oid, &config_digest, &expires],
         )
         .await?;
     let plan = json!({
@@ -321,7 +319,7 @@ async fn seed_runtime_rows(
             "INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,state,host_id,
                                     lease_epoch,lease_until,revision,git_generation)
              VALUES($1,$2,$3,$4,'w8a-agent',$5,'ready',$6,1,clock_timestamp()+interval '1 hour',0,0)",
-            &[&Uuid::new_v4(), &repo.id, owner_name, repo_name, &owner_id, &Uuid::new_v4()],
+            &[&Uuid::new_v4(), &repo.id, &repo.owner, &repo.name, &owner_id, &Uuid::new_v4()],
         )
         .await?;
     let operation = OperationRecord {
