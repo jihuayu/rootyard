@@ -161,6 +161,22 @@ pub async fn exercise_pg_scoped_producer(env: PgScopedTestEnv<'_>) -> Result<()>
 
     ensure!(hold_guard.state == HoldLifecycleState::ConsumedCommitted && hold_guard.hold_ids.len() == 2);
     ensure!(reclaim.load(op_id)?.unwrap().state == UploadReclaimState::VerifiedPromoted);
+    let v_client = env.pool.get().await?;
+    let dec_cnt: i64 = v_client
+        .query_one(
+            "SELECT COUNT(*) FROM ref_store_publication_decisions WHERE repository_id=$1 AND operation_id=$2 AND state='CONSUMED'",
+            &[&repo_id, &op_id],
+        )
+        .await?
+        .get(0);
+    let hold_cnt: i64 = v_client
+        .query_one(
+            "SELECT COUNT(*) FROM artifact_holds WHERE repository_id=$1 AND operation_id=$2",
+            &[&repo_id, &op_id],
+        )
+        .await?
+        .get(0);
+    ensure!(dec_cnt == 1 && hold_cnt == 2, "expected 1 consumed decision and 2 holds, got d={dec_cnt} h={hold_cnt}");
     receipt.verify_commit_binding(&snapshot, &ticket, env.backend_hex, &outcome.terminal_refs)?;
     ensure!(receipt.accepted_updates.len() == 1 && receipt.rejected_updates.len() == 1);
     let wire_txt = String::from_utf8_lossy(&outcome.report_status_wire);

@@ -264,13 +264,13 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
         let db_client = pg.pool.get().await?;
         let d: i64 = db_client
             .query_one(
-                "SELECT COUNT(*) FROM ref_store_core_decisions WHERE repository_id=$1 AND state='committed'",
+                "SELECT COUNT(*) FROM ref_store_publication_decisions WHERE repository_id=$1 AND state='CONSUMED'",
                 &[&repo_id],
             )
             .await?
             .get(0);
         let h: i64 = db_client
-            .query_one("SELECT COUNT(*) FROM ref_store_artifact_holds WHERE repository_id=$1", &[&repo_id])
+            .query_one("SELECT COUNT(*) FROM artifact_holds WHERE repository_id=$1", &[&repo_id])
             .await?
             .get(0);
         let m: i64 = db_client
