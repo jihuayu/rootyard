@@ -41,6 +41,9 @@ use uuid::Uuid;
 mod ck_diag;
 
 const SECRET: [u8; 32] = [0x42u8; 32];
+const KIT_CREATED_UNIX: i64 = 1_750_000_000;
+const KIT_EXPIRES_UNIX: i64 = 1_750_003_600;
+const KIT_TTL_SECS: i64 = KIT_EXPIRES_UNIX - KIT_CREATED_UNIX;
 const fn pol(ck: bool, fb: bool) -> CheckoutPolicy {
     CheckoutPolicy { use_clonekit: ck, fallback_to_git_on_unusable_kit: fb, require_full_fsck: true }
 }
@@ -151,6 +154,21 @@ fn build_kit(
     store: Option<&CloneKitPublicationStore>,
     fail: Option<BuildFailurePoint>,
 ) -> Result<BuiltCloneKitArtifacts> {
+    build_kit_with_clock(ids, fmt, kit_gen, repo, td, store, fail, None)
+}
+
+fn build_kit_with_clock(
+    ids: (Uuid, Uuid, Uuid),
+    fmt: CloneKitObjectFormat,
+    kit_gen: u64,
+    repo: &Path,
+    td: &TempDir,
+    store: Option<&CloneKitPublicationStore>,
+    fail: Option<BuildFailurePoint>,
+    now: Option<i64>,
+) -> Result<BuiltCloneKitArtifacts> {
+    let (created_unix, expires_unix) =
+        now.map_or((KIT_CREATED_UNIX, KIT_EXPIRES_UNIX), |now| (now, now + KIT_TTL_SECS));
     let built = build_clonekit_from_git(
         &BuildCloneKitRequest {
             tenant_id: ids.0,
@@ -161,8 +179,8 @@ fn build_kit(
             object_format: fmt,
             kit_generation: kit_gen,
             branch_ref: "refs/heads/main".into(),
-            created_unix: 1_750_000_000,
-            expires_unix: 1_750_003_600,
+            created_unix,
+            expires_unix,
             git_binary: git_binary(),
             source_repo_dir: repo.to_path_buf(),
             staging_root: td.path().join("st"),
@@ -453,12 +471,12 @@ async fn pg_and_garage_s3_clonekit_durable_hold_protected_upload_and_revocation(
         tx.commit().await?;
         drop(c);
 
-        let mut built = build_kit(ids, Sha1, 1, &repo, &td, None, None)?;
+        let now: i64 = pool.get().await?.query_one("SELECT extract(epoch FROM clock_timestamp())::bigint", &[]).await?.get(0);
+        let mut built = build_kit_with_clock(ids, Sha1, 1, &repo, &td, None, None, Some(now))?;
         let receipts = publish_clonekit_to_blob_store(&pool, &blob, &BlobHoldPublishContext { scope: HoldScope::new(ids.1, ids.0, ids.0, ArtifactHoldPurpose::RefPublication, GitObjectFormat::Sha1, ids.2, 1, 1)?, operation: op, expected_gate_digest: gate, authority_id: ids.1, authority_generation: 1 }, &mut built, None).await?;
         ensure!(receipts.len() == 2 && built.manifest.pack.as_ref().and_then(|p| p.blob_locator.as_ref()).is_some());
 
         let c2 = add_commit(&repo, "next.txt", b"delta2\n", "c2")?;
-        let now: i64 = pool.get().await?.query_one("SELECT extract(epoch FROM clock_timestamp())::bigint", &[]).await?.get(0);
         let (signed, ctx) = make_grant(ids, Sha1, &c2, None, now)?;
         let plan = serde_json::json!({"version":1,"job_id":ctx.job_id,"owner_id":ids.0,"repository_id":ids.1,"storage_generation":1,"object_format":"sha1","target_oid":c2,"source_receipt_sha256":"a".repeat(64),"mirror_audience":ctx.audience,"expires_unix":signed.claims.not_after_unix});
         pool.get().await?.execute("INSERT INTO ci_checkout_jobs(repository_id,job_id,owner_id,plan,issuer_token_id,credential_digest,expires_unix) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&ids.1, &ctx.job_id, &ids.0, &plan, &token_id, &credential_digest, &signed.claims.not_after_unix]).await?;
