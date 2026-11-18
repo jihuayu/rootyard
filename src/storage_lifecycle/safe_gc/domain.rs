@@ -124,18 +124,29 @@ pub struct DeleteAuthorizationTicket {
     ticket_digest: String,
 }
 
+/// Input payload for atomic Phase 2 compaction CAS publication.
+#[derive(Clone, Debug)]
+pub struct CasCompactionPublish {
+    pub op_id: Uuid,
+    pub group_id: String,
+    pub expected_incarnation_id: Uuid,
+    pub expected_incarnation_epoch: u64,
+    pub expected_generation: u64,
+    pub retired_pack_ids: Vec<Uuid>,
+    pub uploaded: UploadedCompactionPair,
+    pub replacement_oids: Vec<String>,
+    pub equivalence_digest: String,
+}
+
 impl DeleteAuthorizationTicket {
     pub(super) fn mint(
-        batch_id: Uuid,
-        incarnation_id: Uuid,
-        incarnation_epoch: u64,
-        lease_epoch: u64,
+        batch: (Uuid, Uuid, u64, u64),
         proof_digest: String,
         pack_id: Uuid,
-        physical_key: String,
-        object_sha256: String,
-        locator: Option<BlobLocatorRecord>,
+        target: (String, String, Option<BlobLocatorRecord>),
     ) -> Self {
+        let (batch_id, incarnation_id, incarnation_epoch, lease_epoch) = batch;
+        let (physical_key, object_sha256, locator) = target;
         let mut h = Sha256::new();
         h.update(b"safe-gc-delete-ticket-v1|");
         h.update(batch_id.as_bytes());
@@ -207,13 +218,9 @@ pub trait SafeGcCompactionUploader: Send + Sync {
     fn upload_compacted_pair<'a>(
         &'a self,
         store: &'a BlobStore,
-        tenant_id: Uuid,
-        repo_id: Uuid,
-        blob_generation: i64,
-        pack_key: PhysicalBlobKey,
-        idx_key: PhysicalBlobKey,
-        pack_path: &'a Path,
-        idx_path: &'a Path,
+        scope: (Uuid, Uuid, i64),
+        keys: (PhysicalBlobKey, PhysicalBlobKey),
+        paths: (&'a Path, &'a Path),
         deadline: Instant,
     ) -> SafeGcFuture<'a, UploadedCompactionPair>;
 }

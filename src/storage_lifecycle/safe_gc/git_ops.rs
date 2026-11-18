@@ -135,8 +135,8 @@ pub async fn download_and_verify_pair(
 ) -> Result<(PathBuf, PathBuf), SafeGcError> {
     let pack_out = dest_dir.join("pack-readback.pack");
     let idx_out = dest_dir.join("pack-readback.idx");
-    store.get_to_file_verified(pack_loc, &pack_out, deadline).await?;
-    store.get_to_file_verified(idx_loc, &idx_out, deadline).await?;
+    store.get_to_file(pack_loc, &pack_out, deadline).await?;
+    store.get_to_file(idx_loc, &idx_out, deadline).await?;
     Ok((pack_out, idx_out))
 }
 
@@ -162,12 +162,12 @@ async fn write_refs_to_repo(
 pub async fn build_self_contained_pack_from_sources(
     work_repo: &Path,
     source_pairs: &[(PathBuf, PathBuf)],
-    refs: &[(String, String)],
-    extra_roots: &[String],
+    closure_roots: (&[(String, String)], &[String]),
     out_stage_prefix: &Path,
     object_format: SafeGcObjectFormat,
     deadline: Instant,
 ) -> Result<(PathBuf, PathBuf, Vec<String>), SafeGcError> {
+    let (refs, extra_roots) = closure_roots;
     let _ = run_git_isolated(
         None,
         &["init", "--bare", "--object-format", format_arg(object_format), work_repo.to_str().unwrap_or("")],
@@ -210,14 +210,14 @@ pub async fn build_self_contained_pack_from_sources(
 
 pub async fn verify_readback_pack_closure(
     verify_repo: &Path,
-    pack_path: &Path,
-    idx_path: &Path,
-    refs: &[(String, String)],
-    extra_roots: &[String],
+    pair: (&Path, &Path),
+    closure_roots: (&[(String, String)], &[String]),
     expected_oids: &[String],
     object_format: SafeGcObjectFormat,
     deadline: Instant,
 ) -> Result<(), SafeGcError> {
+    let (pack_path, idx_path) = pair;
+    let (refs, extra_roots) = closure_roots;
     let _ = run_git_isolated(
         None,
         &["init", "--bare", "--object-format", format_arg(object_format), verify_repo.to_str().unwrap_or("")],

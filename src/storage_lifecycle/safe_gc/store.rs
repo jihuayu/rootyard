@@ -13,8 +13,8 @@ use super::{
     SafeGcError,
     anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState, PhysicalBlobKey},
     domain::{
-        AuthorityRecord, BlobLocatorRecord, CompactionPublishResult, DeleteExecutionReport, GcAuditEvent,
-        UploadedCompactionPair,
+        AuthorityRecord, BlobLocatorRecord, CasCompactionPublish, CompactionPublishResult, DeleteExecutionReport,
+        GcAuditEvent,
     },
     model::{
         GcMode, GlobalHoldEntry, GroupClosureReceipt, InFlightDecisionRecord, LiveRefRoot, PairedCursorReconciliation,
@@ -199,26 +199,12 @@ impl DurableSafeGcAuthority {
             if s.authority.incarnation_epoch != expected_incarnation_epoch {
                 return Err(SafeGcError::StaleIncarnation("compaction epoch stale"));
             }
-            let (t, r, h, inc) =
+            let scope =
                 (s.authority.tenant_id, s.authority.repo_id, s.authority.history_id, s.authority.incarnation_epoch);
-            let pk = s.key_registry.mint_immutable_key(
-                t,
-                r,
-                h,
-                inc,
-                "pack",
-                pack_sha256,
-                KeyLifecycleState::CompactionStaging,
-            )?;
-            let ik = s.key_registry.mint_immutable_key(
-                t,
-                r,
-                h,
-                inc,
-                "idx",
-                idx_sha256,
-                KeyLifecycleState::CompactionStaging,
-            )?;
+            let pk =
+                s.key_registry.mint_immutable_key(scope, "pack", pack_sha256, KeyLifecycleState::CompactionStaging)?;
+            let ik =
+                s.key_registry.mint_immutable_key(scope, "idx", idx_sha256, KeyLifecycleState::CompactionStaging)?;
             Ok((pk, ik))
         })
     }
@@ -228,42 +214,31 @@ impl DurableSafeGcAuthority {
         guard.key_registry.assert_late_put_allowed(key_path, writer_epoch)
     }
 
-    pub fn cas_publish_compaction(
-        &self,
-        op_id: Uuid,
-        group_id: &str,
-        expected_incarnation_id: Uuid,
-        expected_incarnation_epoch: u64,
-        expected_generation: u64,
-        retired_pack_ids: &[Uuid],
-        uploaded: UploadedCompactionPair,
-        replacement_oids: Vec<String>,
-        equivalence_digest: String,
-    ) -> Result<CompactionPublishResult, SafeGcError> {
+    pub fn cas_publish_compaction(&self, req: CasCompactionPublish) -> Result<CompactionPublishResult, SafeGcError> {
         self.update_persisted(|s| {
-            if s.authority.incarnation_id != expected_incarnation_id
-                || s.authority.incarnation_epoch != expected_incarnation_epoch
+            if s.authority.incarnation_id != req.expected_incarnation_id
+                || s.authority.incarnation_epoch != req.expected_incarnation_epoch
             {
                 return Err(SafeGcError::StaleIncarnation("compaction publish incarnation mismatch"));
             }
-            if s.authority.membership_generation != expected_generation {
+            if s.authority.membership_generation != req.expected_generation {
                 return Err(SafeGcError::MembershipOrRootDrift(
                     "membership generation advanced during compaction".into(),
                 ));
             }
-            let retire_set: BTreeSet<Uuid> = retired_pack_ids.iter().copied().collect();
+            let retire_set: BTreeSet<Uuid> = req.retired_pack_ids.iter().copied().collect();
             if retire_set.is_empty() || !retire_set.iter().all(|id| s.active_packs.iter().any(|p| &p.pack_id == id)) {
                 return Err(SafeGcError::MembershipOrRootDrift(
                     "retired input pack missing from active closure".into(),
                 ));
             }
             s.key_registry.transition_state(
-                &uploaded.pack_key.object_path,
+                &req.uploaded.pack_key.object_path,
                 KeyLifecycleState::CompactionStaging,
                 KeyLifecycleState::ActiveServing,
             )?;
             s.key_registry.transition_state(
-                &uploaded.idx_key.object_path,
+                &req.uploaded.idx_key.object_path,
                 KeyLifecycleState::CompactionStaging,
                 KeyLifecycleState::ActiveServing,
             )?;
@@ -293,20 +268,20 @@ impl DurableSafeGcAuthority {
             let new_pack_id = Uuid::new_v4();
             let replacement_record = ServingPackRecord {
                 pack_id: new_pack_id,
-                group_id: group_id.to_owned(),
-                pack_key: uploaded.pack_key.clone(),
-                idx_key: uploaded.idx_key.clone(),
-                pack_locator: uploaded.pack_locator.clone(),
-                idx_locator: uploaded.idx_locator.clone(),
-                contained_oids: replacement_oids,
+                group_id: req.group_id.clone(),
+                pack_key: req.uploaded.pack_key.clone(),
+                idx_key: req.uploaded.idx_key.clone(),
+                pack_locator: req.uploaded.pack_locator.clone(),
+                idx_locator: req.uploaded.idx_locator.clone(),
+                contained_oids: req.replacement_oids,
             };
             s.active_packs.push(replacement_record);
             s.authority.membership_generation += 1;
 
             let receipt = seal_group_receipt(GroupClosureReceipt {
-                group_id: group_id.to_owned(),
+                group_id: req.group_id,
                 epoch: s.authority.incarnation_epoch,
-                retired_pack_ids: retired_pack_ids.to_vec(),
+                retired_pack_ids: req.retired_pack_ids.clone(),
                 replacement_pack_ids: vec![new_pack_id],
                 replacement_closure_verified: true,
                 quiesced: true,
@@ -316,22 +291,22 @@ impl DurableSafeGcAuthority {
             s.push_audit("cas_publish_compaction", &new_pack_id.to_string());
 
             Ok(CompactionPublishResult {
-                op_id,
+                op_id: req.op_id,
                 new_pack_id,
                 new_membership_generation: s.authority.membership_generation,
-                retired_pack_ids: retired_pack_ids.to_vec(),
-                replacement_pack: uploaded.pack_locator,
-                replacement_idx: uploaded.idx_locator,
-                pack_key_path: uploaded.pack_key.object_path,
-                equivalence_digest,
+                retired_pack_ids: req.retired_pack_ids,
+                replacement_pack: req.uploaded.pack_locator,
+                replacement_idx: req.uploaded.idx_locator,
+                pack_key_path: req.uploaded.pack_key.object_path,
+                equivalence_digest: req.equivalence_digest,
                 prior_closure_retained: true,
             })
         })
     }
 
-    pub(super) fn update_persisted<F, T>(&self, mut f: F) -> Result<T, SafeGcError>
+    pub(super) fn update_persisted<F, T>(&self, f: F) -> Result<T, SafeGcError>
     where
-        F: FnMut(&mut SafeGcRepoSnapshot) -> Result<T, SafeGcError>,
+        F: FnOnce(&mut SafeGcRepoSnapshot) -> Result<T, SafeGcError>,
     {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut candidate = guard.clone();

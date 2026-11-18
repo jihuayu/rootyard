@@ -39,15 +39,13 @@ pub struct PhysicalBlobKey {
 
 impl PhysicalBlobKey {
     pub fn canonical_path(
-        tenant_id: Uuid,
-        repo_id: Uuid,
-        history_id: Uuid,
-        incarnation_epoch: u64,
+        scope: (Uuid, Uuid, Uuid, u64),
         allocation_seq: u64,
         nonce: Uuid,
         role: &str,
         object_sha256: &str,
     ) -> String {
+        let (tenant_id, repo_id, history_id, incarnation_epoch) = scope;
         format!(
             "tenants/{tenant_id}/repos/{repo_id}/hist/{history_id}/inc-{incarnation_epoch:016x}/seq-{allocation_seq:016x}-{nonce}-{role}-{object_sha256}"
         )
@@ -85,14 +83,12 @@ impl AntiAbaKeyRegistry {
 
     pub fn mint_immutable_key(
         &mut self,
-        tenant_id: Uuid,
-        repo_id: Uuid,
-        history_id: Uuid,
-        incarnation_epoch: u64,
+        scope: (Uuid, Uuid, Uuid, u64),
         role: &str,
         object_sha256: &str,
         initial_state: KeyLifecycleState,
     ) -> Result<PhysicalBlobKey, SafeGcError> {
+        let (tenant_id, repo_id, history_id, incarnation_epoch) = scope;
         if tenant_id.is_nil() || repo_id.is_nil() || history_id.is_nil() || incarnation_epoch == 0 {
             return Err(SafeGcError::InvalidInput("physical key requires valid scopes and epoch".into()));
         }
@@ -106,16 +102,7 @@ impl AntiAbaKeyRegistry {
         self.next_allocation_seq =
             seq.checked_add(1).ok_or_else(|| SafeGcError::InvalidInput("allocation seq overflow".into()))?;
         let nonce = Uuid::new_v4();
-        let object_path = PhysicalBlobKey::canonical_path(
-            tenant_id,
-            repo_id,
-            history_id,
-            incarnation_epoch,
-            seq,
-            nonce,
-            role,
-            object_sha256,
-        );
+        let object_path = PhysicalBlobKey::canonical_path(scope, seq, nonce, role, object_sha256);
         if self.keys_by_path.contains_key(&object_path) || self.deleted_tombstones.contains(&object_path) {
             return Err(SafeGcError::AbaKeyReuseDetected(format!("duplicate physical key {object_path}")));
         }

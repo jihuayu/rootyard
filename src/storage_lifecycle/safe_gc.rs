@@ -44,8 +44,9 @@ use crate::blob_store::{BlobError, disposable_view::DisposableViewError};
 pub use anti_aba::{AntiAbaKeyRegistry, KeyLifecycleState, PhysicalBlobKey};
 pub use compaction::{SafeGcCompactionRequest, SafeGcCompactionResult, execute_two_phase_compaction};
 pub use domain::{
-    AuthorityRecord, BlobStoreReadbackBackend, CompactionPublishResult, DeleteAuthorizationTicket,
-    DeleteExecutionReport, GcAuditEvent, SafeGcCompactionUploader, SafeGcDeleteBackend, UploadedCompactionPair,
+    AuthorityRecord, BlobStoreReadbackBackend, CasCompactionPublish, CompactionPublishResult,
+    DeleteAuthorizationTicket, DeleteExecutionReport, GcAuditEvent, SafeGcCompactionUploader, SafeGcDeleteBackend,
+    UploadedCompactionPair,
 };
 pub use executor::{
     DeleteFaultHook, SafeGcSweepRequest, execute_safe_gc_sweep, reconcile_pending_delete_after_restart,

@@ -1,6 +1,10 @@
 //! Two-phase read-back verified Blob compaction with no-delete retirement (#122).
 
-use std::{collections::BTreeSet, path::PathBuf, time::Instant};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -9,7 +13,7 @@ use crate::blob_store::{disposable_view::DisposableViewRoot, opendal::BlobStore}
 
 use super::{
     SafeGcError,
-    domain::{CompactionPublishResult, SafeGcCompactionUploader},
+    domain::{CasCompactionPublish, CompactionPublishResult, SafeGcCompactionUploader},
     git_ops::{
         build_self_contained_pack_from_sources, download_and_verify_pair, sha256_file_and_len,
         verify_readback_pack_closure,
@@ -77,8 +81,7 @@ pub async fn execute_two_phase_compaction(
     let (new_pack_path, new_idx_path, closure_oids) = build_self_contained_pack_from_sources(
         &work_repo,
         &source_pairs,
-        &refs,
-        &extra_roots,
+        (&refs, &extra_roots),
         &stage_prefix,
         snap.object_format,
         req.deadline,
@@ -93,13 +96,9 @@ pub async fn execute_two_phase_compaction(
     let uploaded = uploader
         .upload_compacted_pair(
             store,
-            snap.authority.tenant_id,
-            snap.authority.repo_id,
-            req.blob_generation,
-            pack_key,
-            idx_key,
-            &new_pack_path,
-            &new_idx_path,
+            (snap.authority.tenant_id, snap.authority.repo_id, req.blob_generation),
+            (pack_key, idx_key),
+            (&new_pack_path, &new_idx_path),
             req.deadline,
         )
         .await?;
@@ -119,10 +118,8 @@ pub async fn execute_two_phase_compaction(
     let (rb_pack, rb_idx) = download_and_verify_pair(store, &pk_loc, &ix_loc, &readback_dir, req.deadline).await?;
     verify_readback_pack_closure(
         &verify_repo,
-        &rb_pack,
-        &rb_idx,
-        &refs,
-        &extra_roots,
+        (&rb_pack, &rb_idx),
+        (&refs, &extra_roots),
         &closure_oids,
         snap.object_format,
         req.deadline,
@@ -145,17 +142,17 @@ pub async fn execute_two_phase_compaction(
 
     let eq_digest = compute_equivalence_digest(&closure_oids, &pack_sha256, &idx_sha256);
     let retired_ids: Vec<Uuid> = inputs.iter().map(|p| p.pack_id).collect();
-    let publish = authority.cas_publish_compaction(
-        req.op_id,
-        req.group_id,
-        snap.authority.incarnation_id,
-        snap.authority.incarnation_epoch,
-        snap.authority.membership_generation,
-        &retired_ids,
+    let publish = authority.cas_publish_compaction(CasCompactionPublish {
+        op_id: req.op_id,
+        group_id: req.group_id.to_owned(),
+        expected_incarnation_id: snap.authority.incarnation_id,
+        expected_incarnation_epoch: snap.authority.incarnation_epoch,
+        expected_generation: snap.authority.membership_generation,
+        retired_pack_ids: retired_ids,
         uploaded,
-        closure_oids.clone(),
-        eq_digest,
-    )?;
+        replacement_oids: closure_oids.clone(),
+        equivalence_digest: eq_digest,
+    })?;
 
     Ok(SafeGcCompactionResult { publish, compacted_object_count: closure_oids.len(), old_pack_bytes, new_pack_bytes })
 }
@@ -193,7 +190,7 @@ fn collect_retained_roots(snap: &SafeGcRepoSnapshot) -> Vec<String> {
 async fn download_input_packs(
     store: &BlobStore,
     inputs: &[ServingPackRecord],
-    in_dir: &PathBuf,
+    in_dir: &Path,
     deadline: Instant,
 ) -> Result<(Vec<(PathBuf, PathBuf)>, u64), SafeGcError> {
     let mut pairs = Vec::with_capacity(inputs.len());

@@ -158,23 +158,19 @@ impl SafeGcCompactionUploader for TestS3Uploader {
     fn upload_compacted_pair<'a>(
         &'a self,
         _store: &'a BlobStore,
-        tenant_id: Uuid,
-        repo_id: Uuid,
-        blob_gen: i64,
-        pack_key: PhysicalBlobKey,
-        idx_key: PhysicalBlobKey,
-        pack_path: &'a Path,
-        idx_path: &'a Path,
+        scope: (Uuid, Uuid, i64),
+        keys: (PhysicalBlobKey, PhysicalBlobKey),
+        paths: (&'a Path, &'a Path),
         _deadline: Instant,
     ) -> SafeGcFuture<'a, UploadedCompactionPair> {
         Box::pin(async move {
-            let pk = put_path_to_s3(tenant_id, repo_id, blob_gen, pack_path, self.corrupt_pack)?;
-            let ix = put_path_to_s3(tenant_id, repo_id, blob_gen, idx_path, false)?;
+            let pk = put_path_to_s3(scope.0, scope.1, scope.2, paths.0, self.corrupt_pack)?;
+            let ix = put_path_to_s3(scope.0, scope.1, scope.2, paths.1, false)?;
             Ok(UploadedCompactionPair {
                 pack_locator: BlobLocatorRecord::from_locator(&pk),
                 idx_locator: BlobLocatorRecord::from_locator(&ix),
-                pack_key,
-                idx_key,
+                pack_key: keys.0,
+                idx_key: keys.1,
             })
         })
     }
@@ -247,17 +243,9 @@ fn make_serving_record(
     il: &BlobLocator,
     oids: Vec<String>,
 ) -> ServingPackRecord {
+    let scope = (auth.tenant_id, auth.repo_id, auth.history_id, 1);
     let mut mint = |role, l: &BlobLocator| {
-        reg.mint_immutable_key(
-            auth.tenant_id,
-            auth.repo_id,
-            auth.history_id,
-            1,
-            role,
-            l.sha256(),
-            KeyLifecycleState::ActiveServing,
-        )
-        .unwrap()
+        reg.mint_immutable_key(scope, role, l.sha256(), KeyLifecycleState::ActiveServing).unwrap()
     };
     ServingPackRecord {
         pack_id: Uuid::new_v4(),
@@ -484,8 +472,8 @@ async fn real_s3_and_git_two_phase_compaction_retention_and_safe_gc_both_formats
         let (pk_dst, ix_dst) = (verify_dir.join("objects/pack/surv.pack"), verify_dir.join("objects/pack/surv.idx"));
         std::fs::create_dir_all(pk_dst.parent().unwrap())?;
         git_cmd(&verify_dir, &["init", "--bare", "--object-format", fmt.as_str()], None)?;
-        store.get_to_file_verified(&new_pk_loc, &pk_dst, dl).await?;
-        store.get_to_file_verified(&new_ix_loc, &ix_dst, dl).await?;
+        store.get_to_file(&new_pk_loc, &pk_dst, dl).await?;
+        store.get_to_file(&new_ix_loc, &ix_dst, dl).await?;
         git_cmd(&verify_dir, &["update-ref", "refs/heads/main", &main_oid], None)?;
         git_cmd(&verify_dir, &["fsck", "--full", "--strict"], None)?;
 

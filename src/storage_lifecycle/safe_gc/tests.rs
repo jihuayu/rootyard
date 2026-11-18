@@ -70,26 +70,9 @@ pub(super) fn make_pack_record(
     let isha = sha(&format!("idx-{tag}"));
     let p_nonce = Uuid::new_v4();
     let i_nonce = Uuid::new_v4();
-    let p_path = PhysicalBlobKey::canonical_path(
-        auth.tenant_id,
-        auth.repo_id,
-        auth.history_id,
-        auth.incarnation_epoch,
-        seq,
-        p_nonce,
-        "pack",
-        &psha,
-    );
-    let i_path = PhysicalBlobKey::canonical_path(
-        auth.tenant_id,
-        auth.repo_id,
-        auth.history_id,
-        auth.incarnation_epoch,
-        seq + 1,
-        i_nonce,
-        "idx",
-        &isha,
-    );
+    let scope = (auth.tenant_id, auth.repo_id, auth.history_id, auth.incarnation_epoch);
+    let p_path = PhysicalBlobKey::canonical_path(scope, seq, p_nonce, "pack", &psha);
+    let i_path = PhysicalBlobKey::canonical_path(scope, seq + 1, i_nonce, "idx", &isha);
     let pack_key = PhysicalBlobKey {
         schema_version: 1,
         tenant_id: auth.tenant_id,
@@ -362,7 +345,7 @@ fn anti_aba_registry_forbids_reuse_even_after_deletion_and_same_sha_reupload() {
     let (t, r, h) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let same_sha = sha("identical-pack");
     let mut reg = AntiAbaKeyRegistry::new();
-    let k1 = reg.mint_immutable_key(t, r, h, 1, "pack", &same_sha, KeyLifecycleState::ActiveServing).unwrap();
+    let k1 = reg.mint_immutable_key((t, r, h, 1), "pack", &same_sha, KeyLifecycleState::ActiveServing).unwrap();
     reg.transition_state(&k1.object_path, KeyLifecycleState::ActiveServing, KeyLifecycleState::RetiredPendingProof)
         .unwrap();
     reg.transition_state(
@@ -379,7 +362,7 @@ fn anti_aba_registry_forbids_reuse_even_after_deletion_and_same_sha_reupload() {
     .unwrap();
 
     // Classic A -> delete -> A re-upload must produce a strictly distinct physical key!
-    let k2 = reg.mint_immutable_key(t, r, h, 1, "pack", &same_sha, KeyLifecycleState::ActiveServing).unwrap();
+    let k2 = reg.mint_immutable_key((t, r, h, 1), "pack", &same_sha, KeyLifecycleState::ActiveServing).unwrap();
     assert_ne!(k1.object_path, k2.object_path);
     assert!(k2.allocation_seq > k1.allocation_seq);
     assert!(matches!(reg.register_verified_key(k1.clone()), Err(SafeGcError::AbaKeyReuseDetected(_))));

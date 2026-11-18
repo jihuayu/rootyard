@@ -1,6 +1,6 @@
 //! Pre-delete barrier re-verification & atomic snapshot persistence (#122).
 
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{collections::BTreeSet, path::Path};
 
 use uuid::Uuid;
 
@@ -8,7 +8,7 @@ use super::{
     SafeGcError,
     anti_aba::KeyLifecycleState,
     domain::{DeleteAuthorizationTicket, DeleteExecutionReport, GcAuditEvent},
-    model::{AuthorityLane, DecisionState, GcMode, GlobalHoldState, SourceFreshness},
+    model::{AuthorityLane, DecisionState, GlobalHoldState, SourceFreshness},
     proof::{DeletionProof, verify_deletion_proof},
     store::{DurableSafeGcAuthority, PendingDeleteBatch, SafeGcRepoSnapshot},
 };
@@ -93,15 +93,10 @@ impl DurableSafeGcAuthority {
             }
         });
         Ok(Some(DeleteAuthorizationTicket::mint(
-            batch_id,
-            deleter_incarnation_id,
-            deleter_incarnation_epoch,
-            deleter_lease_epoch,
+            (batch_id, deleter_incarnation_id, deleter_incarnation_epoch, deleter_lease_epoch),
             batch.proof.proof_digest.clone(),
             cand.pack_id,
-            cand.physical_key.clone(),
-            cand.object_sha256.clone(),
-            locator,
+            (cand.physical_key.clone(), cand.object_sha256.clone(), locator),
         )))
     }
 
@@ -219,7 +214,7 @@ impl SafeGcRepoSnapshot {
             proof.candidates.iter().flat_map(|c| c.contained_oids.iter().map(String::as_str)).collect();
 
         if self.active_packs.iter().any(|p| cand_ids.contains(&p.pack_id)) {
-            return Err(SafeGcError::ProtectionOverlap("candidate is still in active serving set"));
+            return Err(SafeGcError::ProtectionOverlap("candidate is still in active serving set".into()));
         }
         for r in &self.live_refs {
             if cand_oids.contains(r.target_oid.as_str()) {
@@ -281,7 +276,7 @@ impl SafeGcRepoSnapshot {
     }
 }
 
-pub(super) fn persist_snapshot(path: &PathBuf, snap: &SafeGcRepoSnapshot) -> Result<(), SafeGcError> {
+pub(super) fn persist_snapshot(path: &Path, snap: &SafeGcRepoSnapshot) -> Result<(), SafeGcError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| SafeGcError::Io(e.to_string()))?;
     }

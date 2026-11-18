@@ -11,7 +11,7 @@ use uuid::Uuid;
 use super::{
     SafeGcError,
     anti_aba::KeyLifecycleState,
-    domain::UploadedCompactionPair,
+    domain::{CasCompactionPublish, UploadedCompactionPair},
     executor::{DeleteFaultHook, SafeGcSweepRequest, execute_safe_gc_sweep, reconcile_pending_delete_after_restart},
     model::{GcMode, GlobalHoldEntry, GlobalHoldState, LiveRefRoot, SafeGcArmReceipt, SafeGcObjectFormat},
     proof::{DeletionProofInputs, build_and_verify_deletion_proof},
@@ -264,17 +264,17 @@ fn compaction_cas_drift_keeps_prior_closure_intact() {
         pack_key: pk,
         idx_key: ik,
     };
-    let drift = authority.cas_publish_compaction(
-        Uuid::new_v4(),
-        "g1",
-        auth.incarnation_id,
-        1,
-        auth.membership_generation + 99,
-        &[old_id],
-        pair,
-        vec![],
-        sha("eq"),
-    );
+    let drift = authority.cas_publish_compaction(CasCompactionPublish {
+        op_id: Uuid::new_v4(),
+        group_id: "g1".into(),
+        expected_incarnation_id: auth.incarnation_id,
+        expected_incarnation_epoch: 1,
+        expected_generation: auth.membership_generation + 99,
+        retired_pack_ids: vec![old_id],
+        uploaded: pair,
+        replacement_oids: vec![],
+        equivalence_digest: sha("eq"),
+    });
     assert!(matches!(drift, Err(SafeGcError::MembershipOrRootDrift(_))));
     assert_eq!(authority.snapshot().active_packs.len(), 1);
     assert_eq!(authority.snapshot().active_packs[0].pack_id, old_id);
