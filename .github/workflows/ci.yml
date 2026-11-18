@@ -230,7 +230,14 @@ jobs:
       - name: Run all Python unit and Tier-5 adversarial contract suites
         # Full discovery stays unfiltered; the runner adds per-test progress and
         # periodic stderr thread stacks without changing exit semantics.
-        run: python3 scripts/run_python_ci_tests.py
+        env:
+          ROOTYARD_PYTHON_CI_REPORT: ${{ github.event.pull_request.number == 283 && 'test-results/python-ci-result.json' || '' }}
+        run: |
+          report_args=()
+          if [[ -n "$ROOTYARD_PYTHON_CI_REPORT" ]]; then
+            report_args=(--report-out "$ROOTYARD_PYTHON_CI_REPORT" --expected-commit="${GITHUB_SHA:-}")
+          fi
+          python3 scripts/run_python_ci_tests.py "${report_args[@]}"
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary "$ROOTYARD_BIN" --report test-results/e2e.json
       - name: Exercise exact-commit CI read mirror
