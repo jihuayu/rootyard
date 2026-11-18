@@ -308,22 +308,32 @@ async fn prove_inside_quarantine(
         .collect();
     let accepted_subset_digest = compute_accepted_subset_digest(&accepted_updates, &[]);
 
-    let (pack_sha256, pack_bytes, idx_sha256, idx_bytes, pack_locator, idx_locator, blob_closure_digest, put_bytes) =
-        match uploaded_opt {
-            Some(up) => {
-                let put = up.pack_bytes.saturating_add(up.idx_bytes);
-                (
-                    Some(up.pack_sha256),
-                    up.pack_bytes,
-                    Some(up.idx_sha256),
-                    up.idx_bytes,
-                    Some(up.pack_receipt.locator().clone()),
-                    Some(up.idx_receipt.locator().clone()),
-                    up.blob_closure_digest,
-                    put,
-                )
-            }
-            None => (None, 0, None, 0, None, None, "no-new-pack-verified".to_owned(), 0),
+    use super::receipt::CommittedPackPairProof;
+    let (pack_sha256, pack_bytes, idx_sha256, idx_bytes, pack_locator, idx_locator, pack_pairs, blob_dig, put_bytes) =
+        if let Some(up) = uploaded_opt {
+            let (p_loc, i_loc) = (up.pack_receipt.locator().clone(), up.idx_receipt.locator().clone());
+            let pair = CommittedPackPairProof {
+                pack_sha256: up.pack_sha256.clone(),
+                pack_bytes: up.pack_bytes,
+                idx_sha256: up.idx_sha256.clone(),
+                idx_bytes: up.idx_bytes,
+                pack_locator: Some(p_loc.clone()),
+                idx_locator: Some(i_loc.clone()),
+            };
+            let put = up.pack_bytes.saturating_add(up.idx_bytes);
+            (
+                Some(up.pack_sha256),
+                up.pack_bytes,
+                Some(up.idx_sha256),
+                up.idx_bytes,
+                Some(p_loc),
+                Some(i_loc),
+                vec![pair],
+                up.blob_closure_digest,
+                put,
+            )
+        } else {
+            (None, 0, None, 0, None, None, Vec::new(), "no-new-pack-verified".to_owned(), 0)
         };
 
     let receipt = CausalPushProofReceipt {
@@ -351,12 +361,13 @@ async fn prove_inside_quarantine(
         idx_bytes,
         pack_locator,
         idx_locator,
+        pack_pairs,
         blob_backend_identity: ctx.store.backend_identity().as_hex().to_owned(),
         object_count: stage.resolved_object_count,
         delta_object_count: stage.delta_object_count,
         max_delta_chain_depth: stage.max_delta_chain_depth,
         duplicate_object_count: stage.duplicate_object_count,
-        blob_closure_digest,
+        blob_closure_digest: blob_dig,
         accepted_updates,
         rejected_updates: Vec::new(),
         accepted_subset_digest,

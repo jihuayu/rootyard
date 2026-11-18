@@ -10,10 +10,9 @@
    - Every base pack and non-empty repository snapshot MUST carry a verified `#180` authority snapshot dependency closure (`verify_dependency_closure` / `ServingReadCapture::registered_snapshot()`).
    - Missing (`None`) or empty (`packs.is_empty()`) closures fail closed unconditionally (`UnauthorizedBaseDependency`), preventing unverified thin/delta base resolution.
 
-3. **Full Commit Receipt Binding & Scoped-Decision + Durable-Hold PG/Raft Gate (`receipt.rs`, `pg_producer.rs`, `sm_executor.rs`)**:
-   - `CausalPushProofReceipt` binds `(operation_id, snapshot, ticket, final_accepted_cas_subset)` (`rebind_final_cas_terminal` + `verify_commit_binding`), including partial `AcceptedSubset` outcomes (`Applied` + `NotApplied`).
-   - PostgreSQL publication (`commit_push_on_pg` & `blob_git_gateway::receive`) gates every mutation on a live migration-144 scoped decision (`PgAuthorizedCommit` / `PgAuthorizedMetadata`) and migration-141 durable artifact holds (`PgArtifactHoldStore` + `ProtectedUploader`).
+3. **Authoritative PG Sequence, Post-CAS Snapshot & Durable Restart Replay (`receipt.rs`, `gateway_prover.rs`, `gateway_durable_replay.rs`, `pg_producer.rs`)**:
+   - Production HTTP `receive-pack` executes object-level causal closure proving (`prove_gateway_incoming_pack_closure`) before CAS admission, refusing unresolved thin-pack delta bases or missing ancestor objects before any database or hold mutation.
+   - `CausalPushProofReceipt` (`materialize_durable_gateway_receipt`) binds the actual PostgreSQL `ref_store_operations.sequence`, post-CAS `ref_store_publication_decisions.base_revision` snapshot, all `0..=8` `pack_pairs`, and final CAS subset (`PgAuthorizedCommit` + `PgArtifactHoldStore`), replaying byte-for-byte identically across full process restarts.
 
-4. **Recoverable Reclaim Ledger & Stock-Git HTTP Acceptance (`reclaim.rs`, `tests/push_causal_stream/pg_http_gateway.rs`, `scripts/eval_push_causal_stream.py`)**:
-   - Partial or `OutcomeUnknown` Blob uploads persist `0600` fsync-durable `BlobUploadReclaimRecord` entries (`QuarantineReclaimLedger`), refusing premature reclamation until operation abort is proven.
-   - Verified end-to-end with stock `git` (`SHA-1` & `SHA-256`) over `crate::blob_git_gateway::router` + PG17 + `LoopbackS3` (`OverlappedPipeline` vs `#164` naive full-repo repack).
+4. **Multi-Pair Recoverable Reclaim Ledger & Remote Sweeper (`reclaim.rs`, `reclaim_sweeper.rs`, `tests/push_causal_stream/pg_restart_and_reclaim.rs`)**:
+   - `QuarantineReclaimLedger` records all `0..=8` staged `.pack`/`.idx` pairs; `sweep_gateway_reclaim_ledger` and `settle_aborted_gateway_reclaim` sweep 100% of unpromoted/partial/rejected remote staging packs once PostgreSQL proves terminal abort with zero active memberships or pins (`OverlappedPipeline` vs `#164` naive full-repo repack, `SHA-1` & `SHA-256`).

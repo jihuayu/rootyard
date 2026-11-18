@@ -37,9 +37,20 @@ pub(super) async fn init_isolated_bare_repo(
     proc_limits: &GitSubprocessLimits,
     deadline: Instant,
 ) -> Result<(), PushCausalError> {
+    init_isolated_bare_repo_bin(Path::new("git"), view_dir, format, proc_limits, deadline).await
+}
+
+pub(super) async fn init_isolated_bare_repo_bin(
+    git_bin: &Path,
+    view_dir: &Path,
+    format: GitObjectFormat,
+    proc_limits: &GitSubprocessLimits,
+    deadline: Instant,
+) -> Result<(), PushCausalError> {
     let fmt_flag = format!("--object-format={}", format.as_str());
     let dir_str = view_dir.to_str().ok_or_else(|| PushCausalError::Io("non-utf8 view dir".into()))?;
-    run_git(view_dir, &["init", "--bare", &fmt_flag, dir_str], GitStdin::Null, proc_limits, deadline).await?;
+    run_git_bin(git_bin, view_dir, &["init", "--bare", &fmt_flag, dir_str], GitStdin::Null, proc_limits, deadline)
+        .await?;
     Ok(())
 }
 
@@ -49,8 +60,19 @@ pub(super) async fn list_idx_oids(
     proc_limits: &GitSubprocessLimits,
     deadline: Instant,
 ) -> Result<Vec<String>, PushCausalError> {
+    list_idx_oids_bin(Path::new("git"), view_dir, idx_path, proc_limits, deadline).await
+}
+
+pub(super) async fn list_idx_oids_bin(
+    git_bin: &Path,
+    view_dir: &Path,
+    idx_path: &Path,
+    proc_limits: &GitSubprocessLimits,
+    deadline: Instant,
+) -> Result<Vec<String>, PushCausalError> {
     let idx_bytes = fs::read(idx_path).map_err(|e| PushCausalError::Io(e.to_string()))?;
-    let out = run_git(view_dir, &["show-index"], GitStdin::Bytes(&idx_bytes), proc_limits, deadline).await?;
+    let out =
+        run_git_bin(git_bin, view_dir, &["show-index"], GitStdin::Bytes(&idx_bytes), proc_limits, deadline).await?;
     let text = String::from_utf8(out).map_err(|e| PushCausalError::CorruptPack(e.to_string()))?;
     let mut oids = Vec::new();
     for line in text.lines() {
@@ -145,8 +167,19 @@ pub(super) async fn run_git(
     limits: &GitSubprocessLimits,
     deadline: Instant,
 ) -> Result<Vec<u8>, PushCausalError> {
+    run_git_bin(Path::new("git"), repo_dir, args, stdin_mode, limits, deadline).await
+}
+
+pub(super) async fn run_git_bin(
+    git_bin: &Path,
+    repo_dir: &Path,
+    args: &[&str],
+    stdin_mode: GitStdin<'_>,
+    limits: &GitSubprocessLimits,
+    deadline: Instant,
+) -> Result<Vec<u8>, PushCausalError> {
     let timeout = deadline.checked_duration_since(Instant::now()).ok_or(PushCausalError::DeadlineExceeded)?;
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(git_bin);
     let stdin_stdio = match stdin_mode {
         GitStdin::Null => Stdio::null(),
         GitStdin::Bytes(_) => Stdio::piped(),

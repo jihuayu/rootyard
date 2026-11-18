@@ -34,6 +34,17 @@ pub struct RejectedRefProof {
     pub reason: String,
 }
 
+/// Verified `.pack` + `.idx` pair descriptor embedded in [`CausalPushProofReceipt`] (`0..=8` pairs).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedPackPairProof {
+    pub pack_sha256: String,
+    pub pack_bytes: u64,
+    pub idx_sha256: String,
+    pub idx_bytes: u64,
+    pub pack_locator: Option<BlobLocator>,
+    pub idx_locator: Option<BlobLocator>,
+}
+
 /// Cryptographically bound causal proof minted after verified Blob read-back + Git closure
 /// and rebound to the exact authoritative CAS terminal subset on commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +73,7 @@ pub struct CausalPushProofReceipt {
     pub idx_bytes: u64,
     pub pack_locator: Option<BlobLocator>,
     pub idx_locator: Option<BlobLocator>,
+    pub pack_pairs: Vec<CommittedPackPairProof>,
     pub blob_backend_identity: String,
     pub object_count: u64,
     pub delta_object_count: u64,
@@ -136,6 +148,17 @@ impl CausalPushProofReceipt {
         h.update((self.rejected_updates.len() as u64).to_be_bytes());
         for r in &self.rejected_updates {
             let line = format!("{}|{}|{}", r.ref_name, r.code.as_str(), r.reason);
+            h.update((line.len() as u64).to_be_bytes());
+            h.update(line.as_bytes());
+        }
+        h.update((self.pack_pairs.len() as u64).to_be_bytes());
+        for pair in &self.pack_pairs {
+            let pp = pair.pack_locator.as_ref().map(|l| l.path()).unwrap_or_default();
+            let ip = pair.idx_locator.as_ref().map(|l| l.path()).unwrap_or_default();
+            let line = format!(
+                "{}|{}|{}|{}|{}|{}",
+                pair.pack_sha256, pair.pack_bytes, pair.idx_sha256, pair.idx_bytes, pp, ip
+            );
             h.update((line.len() as u64).to_be_bytes());
             h.update(line.as_bytes());
         }
@@ -263,6 +286,21 @@ pub fn compute_accepted_subset_digest(accepted: &[AcceptedRefProof], rejected: &
     }
     for r in rejected {
         let s = format!("ng:{}:{}", r.ref_name, r.code.as_str());
+        h.update((s.len() as u64).to_be_bytes());
+        h.update(s.as_bytes());
+    }
+    hex::encode(h.finalize())
+}
+
+pub fn compute_multi_pair_closure_digest(pairs: &[CommittedPackPairProof]) -> String {
+    if pairs.is_empty() {
+        return "no-new-pack".to_owned();
+    }
+    let mut h = Sha256::new();
+    h.update(b"gateway-pack-pairs-closure-v1\n");
+    h.update((pairs.len() as u64).to_be_bytes());
+    for p in pairs {
+        let s = format!("{}:{}:{}:{}", p.pack_sha256, p.pack_bytes, p.idx_sha256, p.idx_bytes);
         h.update((s.len() as u64).to_be_bytes());
         h.update(s.as_bytes());
     }

@@ -126,6 +126,7 @@ pub async fn exercise_pg_scoped_producer(env: PgScopedTestEnv<'_>) -> Result<()>
         idx_bytes: 0,
         pack_locator: None,
         idx_locator: None,
+        pack_pairs: Vec::new(),
         blob_backend_identity: env.backend_hex.to_owned(),
         object_count: 3,
         delta_object_count: 0,

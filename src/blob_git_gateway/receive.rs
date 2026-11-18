@@ -39,8 +39,10 @@ use super::{
 };
 use crate::{
     namespace_service::push_causal_stream::{
-        GatewayPairSummary, GatewayReceiptArgs, finalize_gateway_receipt, record_gateway_reclaim_failure,
-        record_gateway_staging_inflight, spool_receive_stream_shared_deadline, verify_gateway_authority_closure,
+        DurableGatewayReceiptArgs, GatewayIncomingProofArgs, GatewayPairSummary, UploadReclaimState,
+        classify_gateway_reclaim_error, materialize_durable_gateway_receipt, prove_gateway_incoming_pack_closure,
+        record_gateway_staging_inflight, settle_aborted_gateway_reclaim, spool_receive_stream_shared_deadline,
+        sweep_gateway_reclaim_ledger, verify_gateway_authority_closure,
     },
     ref_store::{CommitMode, CommitRejectCode, RefCommitResult},
 };
@@ -110,15 +112,25 @@ async fn receive_pack_authorized(
     let digest =
         operation::request_digest(repository_id, operation, format, &request, mode, &request_path, deadline).await?;
 
-    // Immutable operation identity before native fresh writes. A terminal is
-    // replayed from the durable receipt; a pending operation stays unknown.
+    let backend_hex = state.store().backend_identity().as_hex();
+    let _ = sweep_gateway_reclaim_ledger(state.pool(), state.scratch_root(), backend_hex, deadline).await;
+    let receipt_args = || DurableGatewayReceiptArgs {
+        pool: state.pool(),
+        store: state.store(),
+        git_binary: state.git_binary(),
+        scratch_root: Some(state.scratch_root()),
+        repository_id,
+        operation_id: operation,
+        deadline,
+    };
+
     match operation::probe(&state, &serving, &identity, operation, &request, digest, deadline).await? {
         Claim::Pending => return Err(GatewayError::OutcomeUnknown),
         Claim::Cancelled(reason) => {
-            let results = cancelled_results(&request, reason);
-            return terminal_response(&request, &results, operation);
+            return terminal_response(&request, &cancelled_results(&request, reason), operation);
         }
         Claim::Replay(terminal) => {
+            materialize_durable_gateway_receipt(receipt_args()).await?;
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
             return committed_response(CommittedResponse {
@@ -139,7 +151,6 @@ async fn receive_pack_authorized(
 
     // Real sealed read view; verify authority snapshot closure before building
     // the native Git view so base packs never skip closure verification.
-    let backend_hex = state.store().backend_identity().as_hex();
     let refs = snapshot::load_ref_view(&state, &serving, deadline).await?;
     let closure_ctx =
         match verify_gateway_authority_closure(&serving.gate, &identity, refs.handle.as_ref(), &refs.refs, backend_hex)
@@ -152,6 +163,18 @@ async fn receive_pack_authorized(
         };
     let view = snapshot::build_view(&state, &refs, deadline).await?;
     let before = pack_stems(view.repo())?;
+    let target_oids: Vec<String> = request.commands.iter().filter(|c| !c.is_delete()).map(|c| c.new.clone()).collect();
+    prove_gateway_incoming_pack_closure(GatewayIncomingProofArgs {
+        operation_id: operation,
+        git_binary: state.git_binary(),
+        view_repo: view.repo(),
+        request_path: &request_path,
+        pack_offset: streamed_prefix.len(),
+        closure: &closure_ctx,
+        target_oids: &target_oids,
+        deadline,
+    })
+    .await?;
 
     let mut command = view.command(state.git_binary());
     command.arg("receive-pack").arg("--stateless-rpc").arg(view.repo());
@@ -201,15 +224,7 @@ async fn receive_pack_authorized(
         // Git report-status. Mixed/accepted-subset terminals are replayed
         // exactly as recorded.
         Ok(PushOutcome::Terminal(terminal)) => {
-            finalize_gateway_receipt(GatewayReceiptArgs {
-                scratch_root: state.scratch_root(),
-                operation_id: operation,
-                issuer_id: identity.id,
-                closure: &closure_ctx,
-                pairs: &pair_summaries,
-                backend_hex,
-                terminal: &terminal,
-            })?;
+            materialize_durable_gateway_receipt(receipt_args()).await?;
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
             committed_response(CommittedResponse {
@@ -226,14 +241,32 @@ async fn receive_pack_authorized(
             .await
         }
         Ok(PushOutcome::Cancelled(reason)) => {
-            record_gateway_reclaim_failure(state.scratch_root(), operation, &GatewayError::Conflict(reason));
-            let results = cancelled_results(&request, reason);
-            terminal_response(&request, &results, operation)
+            let s = state.scratch_root();
+            let _ = settle_aborted_gateway_reclaim(
+                state.pool(),
+                s,
+                repository_id,
+                operation,
+                backend_hex,
+                UploadReclaimState::AbortUnpromoted,
+                reason,
+            )
+            .await;
+            terminal_response(&request, &cancelled_results(&request, reason), operation)
         }
-        // Contention, an unverified adapter and an unknown COMMIT stay HTTP
-        // errors with the operation header; they never become `ng`/`ok`.
         Err(error) => {
-            record_gateway_reclaim_failure(state.scratch_root(), operation, &error);
+            let st = classify_gateway_reclaim_error(&error);
+            let s = state.scratch_root();
+            let _ = settle_aborted_gateway_reclaim(
+                state.pool(),
+                s,
+                repository_id,
+                operation,
+                backend_hex,
+                st,
+                error.message(),
+            )
+            .await;
             Err(error)
         }
     }

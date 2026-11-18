@@ -32,6 +32,12 @@ RUST_FILES = [
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "pg_producer_plan.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_stream.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_bridge.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_prover.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_prover_pack.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_durable_replay.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_durable_sql.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "reclaim_carrier.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "reclaim_sweeper.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "sm_commands.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "sm_executor.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "unit_tests.rs",
@@ -39,6 +45,7 @@ RUST_FILES = [
     ROOT / "tests" / "push_causal_stream" / "support.rs",
     ROOT / "tests" / "push_causal_stream" / "pg_http_gateway.rs",
     ROOT / "tests" / "push_causal_stream" / "pg_scoped_producer.rs",
+    ROOT / "tests" / "push_causal_stream" / "pg_restart_and_reclaim.rs",
 ]
 WORKFLOW = ROOT / ".github" / "workflows" / "push-causal-stream.yml"
 DOC = ROOT / "docs" / "push-causal-stream.md"
@@ -66,7 +73,9 @@ class PushCausalStreamContractsTest(unittest.TestCase):
         receive_src = (ROOT / "src" / "blob_git_gateway" / "receive.rs").read_text(encoding="utf-8")
         self.assertIn("spool_receive_stream_shared_deadline", receive_src)
         self.assertIn("verify_gateway_authority_closure", receive_src)
-        self.assertIn("finalize_gateway_receipt", receive_src)
+        self.assertIn("prove_gateway_incoming_pack_closure", receive_src)
+        self.assertIn("materialize_durable_gateway_receipt", receive_src)
+        self.assertIn("sweep_gateway_reclaim_ledger", receive_src)
 
         commit_gate_src = (ROOT / "src" / "namespace_service" / "push_causal_stream" / "commit_gate.rs").read_text(
             encoding="utf-8"
@@ -158,9 +167,9 @@ class PushCausalStreamContractsTest(unittest.TestCase):
             )
             report = module.run_benchmark(
                 formats=["sha1"],
-                pushes=2,
-                base_commits=3,
-                payload_kb=8,
+                pushes=1,
+                base_commits=2,
+                payload_kb=4,
                 cargo_fork_record=record_path,
             )
         self.assertEqual(

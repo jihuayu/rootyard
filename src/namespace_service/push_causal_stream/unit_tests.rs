@@ -274,6 +274,7 @@ fn receipt_binds_operation_snapshot_ticket_and_final_cas_subset_and_reclaim_pers
         idx_bytes: 0,
         pack_locator: None,
         idx_locator: None,
+        pack_pairs: Vec::new(),
         blob_backend_identity: backend_hex.clone(),
         object_count: 2,
         delta_object_count: 0,

@@ -26,6 +26,9 @@ use tokio::sync::Barrier;
 use tokio::time::Instant as TokioInstant;
 use uuid::Uuid;
 
+use super::pg_restart_and_reclaim::{
+    RestartReclaimSuiteEnv, exercise_restart_replay_causal_negatives_and_multipack_sweep,
+};
 use super::pg_scoped_producer::{PgScopedTestEnv, exercise_pg_scoped_producer};
 use super::support::{LoopbackS3, build_receive_wire, mk_commit, run_git};
 
@@ -77,14 +80,14 @@ impl PgSchemaGuard {
     }
 }
 
-struct LiveGateway {
-    addr: SocketAddr,
-    scratch: TempDir,
-    stop: tokio::sync::oneshot::Sender<()>,
+pub struct LiveGateway {
+    pub addr: SocketAddr,
+    pub scratch: TempDir,
+    pub stop: tokio::sync::oneshot::Sender<()>,
 }
 
 impl LiveGateway {
-    async fn start(pool: Pool, store: BlobStore, op_deadline: Duration) -> Result<Self> {
+    pub async fn start(pool: Pool, store: BlobStore, op_deadline: Duration) -> Result<Self> {
         let scratch = tempfile::tempdir()?;
         let git_bin = resolve_git_binary()?;
         let state = Arc::new(
@@ -133,7 +136,7 @@ pub fn resolve_git_binary() -> Result<PathBuf> {
     Err(anyhow!("stock git binary not found at /usr/bin/git"))
 }
 
-async fn git_http(cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
+pub async fn git_http(cwd: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let dir = cwd.to_path_buf();
     let owned_args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
     tokio::task::spawn_blocking(move || {
@@ -209,9 +212,9 @@ pub async fn create_and_provision_repo(
 #[ignore = "requires PG17, LoopbackS3, and stock Git"]
 async fn production_gateway_http_stock_git_push_sha1_sha256_pg_producer_and_slowloris_deadline() -> Result<()> {
     let pg = PgSchemaGuard::setup().await?;
-    let run_res = tokio::time::timeout(Duration::from_secs(120), run_gateway_and_pg_producer_suite(&pg))
+    let run_res = tokio::time::timeout(Duration::from_secs(180), run_gateway_and_pg_producer_suite(&pg))
         .await
-        .map_err(|_| anyhow!("PG17 gateway acceptance timed out after 120s"))
+        .map_err(|_| anyhow!("PG17 gateway acceptance timed out after 180s"))
         .and_then(|r| r);
     let td_res = pg.teardown().await;
     run_res?;
@@ -250,14 +253,18 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
             .ok_or_else(|| anyhow!("missing CausalPushProofReceipt for production HTTP push {op_hdr}"))?;
         ensure!(receipt.object_format == git_fmt && receipt.repository_id == repo_id, "receipt scope mismatch");
         ensure!(
-            receipt.committed_gate_revision == Some(3),
-            "expected rev 3, got {:?}",
-            receipt.committed_gate_revision
+            receipt.sequence == 2 && receipt.committed_gate_revision == Some(3) && receipt.object_count >= 3,
+            "unexpected PG sequence / rev / obj_count: seq={}, rev={:?}, objs={}",
+            receipt.sequence,
+            receipt.committed_gate_revision,
+            receipt.object_count
         );
         ensure!(
             receipt.accepted_updates.len() == 1
                 && receipt.accepted_updates[0].old_oid.as_deref() == Some(c1.as_str())
                 && receipt.accepted_updates[0].new_oid.as_deref() == Some(c2.as_str())
+                && receipt.required_ancestor_oids == vec![c1.clone()]
+                && receipt.pack_pairs.len() == 1
         );
         receipt.verify_digest()?;
 
@@ -302,6 +309,17 @@ async fn run_gateway_and_pg_producer_suite(pg: &PgSchemaGuard) -> Result<()> {
         pool: &pg.pool,
         store: &store,
         gw_addr: gw.addr,
+        actor: &actor,
+        git_binary: &git_bin,
+        backend_hex: &backend_hex,
+    })
+    .await?;
+
+    // 3b. Restart durable PG-sequence receipt replay + causal prover negative + multi-pack remote sweep.
+    exercise_restart_replay_causal_negatives_and_multipack_sweep(RestartReclaimSuiteEnv {
+        pool: &pg.pool,
+        store: &store,
+        s3,
         actor: &actor,
         git_binary: &git_bin,
         backend_hex: &backend_hex,
@@ -431,7 +449,7 @@ async fn exercise_concurrent_same_ref_http_race(
     Ok(())
 }
 
-fn base64_basic(user: &str, token: &str) -> String {
+pub fn base64_basic(user: &str, token: &str) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let raw = format!("{user}:{token}");
     let mut out = String::new();
