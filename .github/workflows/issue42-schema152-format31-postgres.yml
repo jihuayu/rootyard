@@ -1,0 +1,266 @@
+name: Issue 42 schema 152 format 31 qualification
+
+on:
+  push:
+    branches: [codex/goal-issue42-original-ac-source-audit-20261117]
+    paths: [.github/workflows/issue42-schema152-format31-postgres.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  format31:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_PASSWORD: rootyard-ci-only
+          POSTGRES_DB: rootyard_test
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PRODUCT_SHA: 1570316ae1954fdc553d67fc652e8b6a8e03bf60
+      PRODUCT_TREE: 1d1d8434e941b7ea4e91e0728369e0be7beef2d3
+      WORKFLOW_PATH: .github/workflows/issue42-schema152-format31-postgres.yml
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONOPTIMIZE: ''
+    defaults:
+      run:
+        shell: bash
+        working-directory: product
+    steps:
+      - name: Check out the exact workflow source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        timeout-minutes: 3
+        with:
+          ref: ${{ github.sha }}
+          path: workflow-source
+          persist-credentials: false
+      - name: Check out the pinned product source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        timeout-minutes: 3
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          persist-credentials: false
+      - name: Verify both exact source roles
+        timeout-minutes: 2
+        run: |
+          workflow_source="$GITHUB_WORKSPACE/workflow-source"
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/codex/goal-issue42-original-ac-source-audit-20261117
+          test "$GITHUB_WORKFLOW_REF" = "$GITHUB_REPOSITORY/$WORKFLOW_PATH@$GITHUB_REF"
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test "$(git -C "$workflow_source" rev-parse HEAD)" = "$GITHUB_SHA"
+          workflow_status=$(git -C "$workflow_source" status --porcelain=v1 --untracked-files=all)
+          test -z "$workflow_status"
+          git -C "$workflow_source" cat-file -e "HEAD:$WORKFLOW_PATH"
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          product_status=$(git status --porcelain=v1 --untracked-files=all)
+          test -z "$product_status"
+          umask 077
+          mkdir -- "$RUNNER_TEMP/issue42-format31" "$RUNNER_TEMP/issue42-format31-evidence"
+      - name: Set up the project Python version
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        timeout-minutes: 3
+        with:
+          python-version: '3.12'
+      - name: Install the existing native tools and pinned Rust and CargoFork
+        timeout-minutes: 24
+        run: |
+          work="$RUNNER_TEMP/issue42-format31"
+          if ! bash -euo pipefail -c '
+            work=$1
+            scripts/install_ci_native_tools.sh install --prefix "$work/native-tools"
+            echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
+            rustup toolchain install 1.99.1 --profile minimal
+            rustup default 1.99.1
+            scripts/install_ci_cargo_fork.sh install --cache-dir "$work/cargo-fork" --require-os linux
+          ' _ "$work" >/dev/null 2>&1; then
+            echo 'Format 31 tool installation failed' >&2
+            exit 1
+          fi
+      - name: Build one immutable product CLI and adjacent receipt
+        timeout-minutes: 35
+        run: |
+          work="$RUNNER_TEMP/issue42-format31"
+          test "$(git rev-parse HEAD)" = "$PRODUCT_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$PRODUCT_TREE"
+          product_status=$(git status --porcelain=v1 --untracked-files=all)
+          test -z "$product_status"
+          scripts/install_ci_cargo_fork.sh verify --cache-dir "$work/cargo-fork" --require-os linux --require-path >/dev/null 2>&1
+          cargo_version=$(cargo -vV 2>/dev/null)
+          grep -Fxq 'release: 1.101.0' <<< "$cargo_version"
+          grep -Fxq 'commit-hash: 64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b' <<< "$cargo_version"
+          rustc_version=$(rustc -V 2>/dev/null)
+          [[ "$rustc_version" == 'rustc 1.99.1 '* ]]
+          unset CARGO_BUILD_JOBS CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          if ! python3 -B scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo \
+            --artifact-store "$work/store" --output "$work/rootyard" >/dev/null 2>&1; then
+            echo 'Format 31 product CLI build failed' >&2
+            exit 1
+          fi
+          [[ -x "$work/rootyard" && ! -w "$work/rootyard" && ! -L "$work/rootyard" ]]
+          [[ -f "$work/rootyard.build.json" && ! -w "$work/rootyard.build.json" && ! -L "$work/rootyard.build.json" ]]
+          product_status=$(git status --porcelain=v1 --untracked-files=all)
+          test -z "$product_status"
+      - name: Qualify format 31 metadata archives and the cancellation ACL
+        timeout-minutes: 8
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -o pipefail
+          umask 077
+          work="$RUNNER_TEMP/issue42-format31"
+          binary="$work/rootyard"
+          evidence="$RUNNER_TEMP/issue42-format31-evidence/qualification.json"
+          workflow_source="$GITHUB_WORKSPACE/workflow-source"
+          [[ "$PG_CONTAINER" =~ ^[0-9a-f]{64}$ ]]
+          test "$(docker port "$PG_CONTAINER" 5432/tcp 2>/dev/null)" = 127.0.0.1:55432
+          mkdir -- "$work/fixtures"
+          EVENT_TREE=$(git -C "$workflow_source" rev-parse "$GITHUB_SHA^{tree}")
+          WORKFLOW_DIGEST=$(git -C "$workflow_source" show "$GITHUB_WORKFLOW_SHA:$WORKFLOW_PATH" | sha256sum | cut -d ' ' -f 1)
+          BEFORE_BINARY=$(sha256sum "$binary" | cut -d ' ' -f 1)
+          BEFORE_RECEIPT=$(sha256sum "$binary.build.json" | cut -d ' ' -f 1)
+          export EVENT_TREE WORKFLOW_DIGEST BEFORE_BINARY BEFORE_RECEIPT
+          set +e
+          (
+            RUNNER_TEMP="$work/fixtures" \
+              ROOTYARD_TEST_DATABASE_URL=postgresql://rootyard:rootyard-ci-only@127.0.0.1:55432/rootyard_test \
+              timeout --signal=TERM --kill-after=25s 360s python3 -B tests/backup_format31_acl.py \
+              --job-owned-postgres --binary "$binary" --expected-commit "$PRODUCT_SHA" 2>/dev/null
+            code=$?
+            printf '%s\n' "$code"
+            exit "$code"
+          ) | python3 -B -I - "$binary" "$evidence" 3<&0 2>/dev/null <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          sys.path.insert(0, str(Path.cwd() / "scripts"))
+          from native_build_receipt import load_receipt, sha256_file
+
+          def require(condition):
+              if not condition:
+                  raise ValueError("invalid format 31 qualification evidence")
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL, timeout=10, text=True).strip()
+
+          def unique_keys(pairs):
+              value = dict(pairs)
+              require(len(value) == len(pairs))
+              return value
+
+          with os.fdopen(3, "rb") as pipe:
+              raw = pipe.read(4097)
+          require(len(raw) <= 4096)
+          line, code = raw.splitlines()
+          require(code in (b"0", b"1"))
+          report = json.loads(line, object_pairs_hook=unique_keys)
+
+          product = os.environ["PRODUCT_SHA"]
+          tree = os.environ["PRODUCT_TREE"]
+          event = os.environ["GITHUB_SHA"]
+          event_tree = os.environ["EVENT_TREE"]
+          workflow_sha = os.environ["GITHUB_WORKFLOW_SHA"]
+          workflow_digest = os.environ["WORKFLOW_DIGEST"]
+          require(all(re.fullmatch(r"[0-9a-f]{40}", value) for value in (product, tree, event, event_tree, workflow_sha)))
+          require(event == workflow_sha and event != product and re.fullmatch(r"[0-9a-f]{64}", workflow_digest))
+          require(git("rev-parse", "HEAD") == product and git("rev-parse", "HEAD^{tree}") == tree)
+          require(not git("status", "--porcelain=v1", "--untracked-files=all"))
+
+          binary = Path(sys.argv[1])
+          receipt = load_receipt(binary.with_suffix(".build.json"), binary_path=binary,
+                                 expected_commit=product, source_root=Path.cwd(), verify_source_files=True)
+          payload = receipt.payload
+          require(receipt.schema == "v2" and payload["git_head"] == product
+                  and payload["working_tree"] == {"tree": tree, "status": ""})
+          require(payload["kind"] == "native-binary" and payload["relocated_artifact"] is True
+                  and payload["features"] == {"enabled": [], "no_default_features": True})
+          require(payload["command"] == [
+              "cargo", "build", "--locked", "--no-default-features",
+              "--config", "profile.dev.package.rootyard.debug=0", "--bin", "rootyard",
+              "--config", 'profile.dev.package.rootyard.strip="debuginfo"', "--message-format=json-render-diagnostics",
+          ])
+          require(receipt.toolchain["rustc"]["release"] == "1.99.1"
+                  and receipt.toolchain["cargo"]["release"] == "1.101.0"
+                  and receipt.toolchain["cargo"]["commit_hash"] == "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b")
+          require(receipt.binary_sha256 == os.environ["BEFORE_BINARY"]
+                  and receipt.receipt_sha256 == os.environ["BEFORE_RECEIPT"]
+                  and payload["cargo_lock_sha256"] == sha256_file(Path("Cargo.lock")))
+
+          identity = {"source_head": product, "source_tree": tree, "binary_sha256": receipt.binary_sha256,
+                      "receipt_sha256": receipt.receipt_sha256, "source_inputs_sha256": receipt.source_inputs_sha256}
+          fields = {"schema", "passed", "failure_phase", "binding_rechecked", "owned_cleanup_verified", "cases"}
+          require(isinstance(report, dict) and (report.keys() == fields or report.keys() == fields | identity.keys()))
+          require(report["schema"] == "rootyard/issue42-format31-acl/v1")
+          passed = code == b"0"
+          require(report["passed"] is passed)
+          flags = ("binding_rechecked", "owned_cleanup_verified")
+          require(all(type(report[name]) is bool for name in flags))
+          phase = report["failure_phase"]
+          cases = ("format31_metadata_roundtrip", "public_execute_refused_before_publication", "restored_cancellation_acl")
+          rows = report["cases"]
+          require(isinstance(rows, list) and len(rows) == len(cases))
+          for row, name in zip(rows, cases):
+              require(isinstance(row, dict) and row.keys() == {"name", "status"}
+                      and row["name"] == name and row["status"] in ("passed", "failed"))
+          if report.keys() != fields:
+              require(all(report[key] == value for key, value in identity.items()))
+          else:
+              require(not passed and phase == "preflight" and not any(report[name] for name in flags))
+          if passed:
+              require(phase is None and all(report[name] for name in flags)
+                      and all(row["status"] == "passed" for row in rows))
+          else:
+              require(phase in ("preflight", "setup", "acl_refusal", "archive_roundtrip", "restored_acl",
+                                "owned_cleanup", "post_binding"))
+
+          result = {"schema": "rootyard/issue42-format31-hosted/v1", "passed": passed,
+                    "event_head": event, "event_tree": event_tree, "workflow_head": workflow_sha,
+                    "workflow_sha256": workflow_digest, "producer_exit": int(code),
+                    "cargo_lock_sha256": payload["cargo_lock_sha256"],
+                    **identity, **{key: report[key] for key in fields - {"schema", "passed"}}}
+          draft = binary.with_name("qualification.tmp")
+          with draft.open("x", encoding="utf-8") as output:
+              json.dump(result, output, sort_keys=True, separators=(",", ":"))
+              output.write("\n")
+          os.replace(draft, sys.argv[2])
+          PY
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          if (( statuses[0] != 0 || statuses[1] != 0 )); then
+            echo 'Format 31 qualification or evidence validation failed' >&2
+            if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+            exit "${statuses[1]}"
+          fi
+      - name: Discard owned build and fixture files
+        if: always()
+        timeout-minutes: 3
+        working-directory: ${{ runner.temp }}
+        run: |
+          work="$RUNNER_TEMP/issue42-format31"
+          if ! rm -rf -- "$work" >/dev/null 2>&1 || [[ -e "$work" || -L "$work" ]]; then
+            echo 'Format 31 owned file cleanup failed' >&2
+            exit 1
+          fi
+      - name: Upload the finite qualification report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        timeout-minutes: 2
+        with:
+          name: issue42-format31-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue42-format31-evidence/qualification.json
+          if-no-files-found: error
+          retention-days: 7
