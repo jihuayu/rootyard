@@ -421,7 +421,7 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
 
     // Seed one real main tip, then clone twice so both stock clients advertise
     // exactly the same old OID.
-    let SameTipRace { work: _work, direct_url, seed, first_dir, second_dir, first_new, second_new, revision_before } =
+    let SameTipRace { work: _work, direct_url, seed, first_dir, second_dir, first_new, revision_before } =
         seed_same_tip_race(db, git, address, &owner, &name, repository_id).await?;
 
     // Start the loser and wait until its native receive-pack, pair staging and
@@ -585,7 +585,6 @@ struct SameTipRace {
     first_dir: PathBuf,
     second_dir: PathBuf,
     first_new: String,
-    second_new: String,
     revision_before: i64,
 }
 
@@ -616,7 +615,7 @@ async fn seed_same_tip_race(
     let second_new = git.commit(&second_dir, "b.txt", "from b\n", "commit from b").await?;
     ensure!(first_new != second_new, "the two racers made the same commit");
     let revision_before = gate_revision(db, repository_id).await?;
-    Ok(SameTipRace { work, direct_url, seed, first_dir, second_dir, first_new, second_new, revision_before })
+    Ok(SameTipRace { work, direct_url, seed, first_dir, second_dir, first_new, revision_before })
 }
 
 #[tokio::test]
@@ -704,7 +703,7 @@ async fn admitted_refusal_case(db: &Db, phase: &mut &'static str) -> Result<()> 
         let created = create_repository(address, &owner, &name).await?;
         let repository_id = Uuid::parse_str(created["id"].as_str().ok_or_else(|| anyhow!("create API has no id"))?)?;
         provision_decision_realm(db, &owner, &name, &store).await?;
-        let SameTipRace { work, direct_url, seed, first_dir, second_dir, first_new, second_new, revision_before } =
+        let SameTipRace { work, direct_url, seed, first_dir, second_dir, first_new, revision_before } =
             seed_same_tip_race(db, git, address, &owner, &name, repository_id).await?;
         race_work = Some(work);
 
