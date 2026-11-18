@@ -20,7 +20,7 @@ use super::super::{
     serving::lookup,
     session::{ReadAuthorization, authenticate, authority_error, read_authorization},
     snapshot::{self, ComputedView},
-    state::{BlobGitState, ByteLease},
+    state::{BlobGitState, ByteLease, WorkspaceLease},
 };
 use super::memory_budget;
 use crate::ref_store::{GitObjectFormat, core::pack_snapshot::MaterializedServingRead};
@@ -217,19 +217,43 @@ fn issue(
         .map_err(|_| GatewayError::Internal("repository session could not be issued"))
 }
 
-fn body_response(
+pub(super) fn body_response(
     bytes: Vec<u8>,
     slot: tokio::sync::OwnedSemaphorePermit,
     lease: ByteLease,
     issued: Option<&IssuedSession>,
 ) -> Response {
+    body_response_parts(bytes, slot, lease, None, issued)
+}
+
+/// Root-browse variant that keeps the computed Git workspace charge alive
+/// alongside the response byte lease until the body is consumed or discarded.
+pub(super) fn body_response_with_workspace(
+    bytes: Vec<u8>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+    lease: ByteLease,
+    workspace: WorkspaceLease,
+    issued: Option<&IssuedSession>,
+) -> Response {
+    body_response_parts(bytes, slot, lease, Some(workspace), issued)
+}
+
+fn body_response_parts(
+    bytes: Vec<u8>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+    lease: ByteLease,
+    workspace: Option<WorkspaceLease>,
+    issued: Option<&IssuedSession>,
+) -> Response {
     // Keep the bounded response's capacity charged until its body is consumed
     // or discarded, even after the request future has returned: the moved
     // leases live in the stream state.
-    let stream =
-        futures_util::stream::unfold((Some(Bytes::from(bytes)), slot, lease), |(bytes, slot, lease)| async move {
-            bytes.map(|bytes| (Ok::<_, std::convert::Infallible>(bytes), (None, slot, lease)))
-        });
+    let stream = futures_util::stream::unfold(
+        (Some(Bytes::from(bytes)), slot, lease, workspace),
+        |(bytes, slot, lease, workspace)| async move {
+            bytes.map(|bytes| (Ok::<_, std::convert::Infallible>(bytes), (None, slot, lease, workspace)))
+        },
+    );
     let mut response = Response::new(Body::from_stream(stream));
     response.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
     response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));

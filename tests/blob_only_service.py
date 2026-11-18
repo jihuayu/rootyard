@@ -27,6 +27,8 @@ import urllib.error
 import urllib.parse
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import http_report_contract as _http_contract
 import native_evidence
 import ops_provenance
 from e2e import Harness
@@ -40,6 +42,40 @@ BLOB_REQUIRED = ("ROOTYARD_BLOB_SERVICE", "ROOTYARD_BLOB_ENDPOINT", "ROOTYARD_BL
 SENSITIVE_ENV = ("ROOTYARD_BLOB_SECRET_ACCESS_KEY", "ROOTYARD_BLOB_SESSION_TOKEN", "ROOTYARD_BLOB_ACCESS_KEY_ID", "ROOTYARD_BLOB_ENDPOINT", "ROOTYARD_TEST_DATABASE_URL")
 LIMITATIONS = ["serve-blob is an increment, not the default server; full equivalence is not claimed.", "LFS, web UI and pull/merge endpoints are outside this harness and remain unqualified.", "SHA-256 requires the Root-supplied trusted Git; missing support fails the case.", "The crash case is SIGKILL of this harness's process group after an ACK, not kernel/power-loss behavior.", "Blob corruption is not injected into the shared S3 fixture; unavailability uses a harmless wrong loopback endpoint and missing bytes use an isolated root prefix without stopping or mutating the shared provider.", "Blob deletion is disabled; failed-upload orphan objects under the fixture root are not reclaimed by this harness.", "Loopback HTTP and stock Git only; no SSH, HA, multi-host or provider failover is claimed.", "No SQL row creates a ready repository or an ACK; SQL only verifies the actual repository binding."]
 class ProfileError(RuntimeError): pass
+
+
+def http_input_hashes():
+    try:
+        return _http_contract.hash_inputs(Path(__file__).resolve().parents[1])
+    except _http_contract.ContractError as error:
+        raise ProfileError(str(error)) from None
+
+
+def bind_http_report(report, direct_script, hashes_before, profile):
+    """Attach the complete fixed Python HTTP input identity before publication.
+
+    Only fixed, credential-free source hashes and the standalone CLI receipt
+    identity are added. Existing case statuses are never rewritten.
+    """
+    hashes_now = http_input_hashes()
+    direct_key = direct_script if direct_script in hashes_now else "tests/" + str(direct_script)
+    report["checkpoint_sha256"] = hashes_now.get(direct_key)
+    report["harness_inputs_sha256"] = hashes_now
+    report["harness_inputs"] = {"before_sha256": dict(hashes_before), "input_hashes": hashes_now}
+    errors = []
+    if hashes_now != hashes_before:
+        errors.append("harness/helper source changed during HTTP acceptance")
+    if sha256_file(profile.binary) != profile.build["binary_sha256"]:
+        errors.append("executed CLI changed during HTTP acceptance")
+    receipt = profile.binary.with_suffix(".build.json")
+    if not receipt.is_file() or sha256_file(receipt) != profile.receipt_sha256:
+        errors.append("CLI build receipt changed during HTTP acceptance")
+    if errors:
+        report["inputs_unchanged"] = False
+        report["passed"] = False
+        prior = report.get("binding_error")
+        report["binding_error"] = "; ".join(errors + ([prior] if prior else []))
+    return report
 def need(condition, message):
     if not condition:
         raise ProfileError(message)

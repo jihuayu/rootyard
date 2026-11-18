@@ -32,6 +32,35 @@ impl PgRetentionRoots {
         request: RegisterRootRequest,
         deadline: Instant,
     ) -> Result<RootReceipt, RootError> {
+        if request.candidate().is_serving() {
+            return Err(RootError::RootRealmMismatch("legacy register accepts only a legacy candidate"));
+        }
+        self.register_with_lane(pool, request, deadline, false).await
+    }
+
+    /// Serving-lane Phase 2: commit a serving candidate with the actual opened
+    /// Blob backend, ready binding/current realm and the candidate's ephemeral
+    /// cluster anchor. The public LegacyFresh wrapper and exact replay/no-charge
+    /// behavior are unchanged.
+    pub async fn register_serving(
+        &self,
+        pool: &Pool,
+        request: RegisterRootRequest,
+        deadline: Instant,
+    ) -> Result<RootReceipt, RootError> {
+        if !request.candidate().is_serving() {
+            return Err(RootError::RootRealmMismatch("serving register requires a serving candidate"));
+        }
+        self.register_with_lane(pool, request, deadline, true).await
+    }
+
+    async fn register_with_lane(
+        &self,
+        pool: &Pool,
+        request: RegisterRootRequest,
+        deadline: Instant,
+        serving: bool,
+    ) -> Result<RootReceipt, RootError> {
         let deadline = effective_deadline(deadline)?;
         let request_digest = request.digest();
         let (candidate, request_id) = request.into_parts();
@@ -46,8 +75,11 @@ impl PgRetentionRoots {
             drop(client);
             return Err(error);
         }
-        let outcome =
-            before_deadline(deadline, self.register_in_tx(&tx, &candidate, request_id, request_digest, deadline)).await;
+        let outcome = before_deadline(
+            deadline,
+            self.register_in_tx(&tx, &candidate, request_id, request_digest, deadline, serving),
+        )
+        .await;
         match outcome {
             Ok(receipt) => {
                 commit_bounded(tx, deadline, repository_id, Some(operation_id)).await?;
@@ -62,7 +94,41 @@ impl PgRetentionRoots {
         }
     }
 
-    async fn register_in_tx(
+    /// Last fresh DB-clock source-pin liveness check for a serving create. This
+    /// runs after the late token/auth check while the pin row is already held by
+    /// the serving register transaction; it never uses client time.
+    pub(crate) async fn recheck_serving_source_pin_live_in_tx(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        reference: &crate::ref_store::core::pack_snapshot::PackSnapshotRef,
+        deadline: Instant,
+    ) -> Result<(), RootError> {
+        before_deadline(deadline, async {
+            let pin = super::super::snapshot_sql::pin_for_share(tx, reference.pin_id(), reference.repository_id())
+                .await?
+                .ok_or(RootError::Store(crate::ref_store::contract::RefStoreError::MetadataPinNotFound {
+                    pin_id: reference.pin_id(),
+                }))?;
+            if pin.repository_id != reference.repository_id()
+                || pin.pin_id != reference.pin_id()
+                || pin.snapshot_id != reference.snapshot_id()
+                || pin.tenant_id != reference.tenant_id()
+            {
+                return Err(RootError::RootSourceChanged("source pin identity changed"));
+            }
+            pin.ensure_live(reference.expected_generation()).map_err(RootError::from)?;
+            Ok::<_, RootError>(())
+        })
+        .await
+    }
+
+    /// Crate-private seam for the future serving coordinator. The caller owns
+    /// the already-bounded transaction and can perform its current
+    /// Owner/Admin+ContentsWrite/token check after these root rows are staged
+    /// but before its COMMIT. This method performs the complete serving
+    /// register, including source revalidation and cluster-anchor comparison.
+    #[allow(dead_code)] // Future serving coordinator seam; not an HTTP/public API.
+    pub(crate) async fn register_serving_in_tx(
         &self,
         tx: &tokio_postgres::Transaction<'_>,
         candidate: &super::candidate::RootCandidate,
@@ -70,10 +136,29 @@ impl PgRetentionRoots {
         request_digest: crate::ref_store::contract::RequestDigest,
         deadline: Instant,
     ) -> Result<RootReceipt, RootError> {
+        if !candidate.is_serving() {
+            return Err(RootError::RootRealmMismatch("serving in-tx register requires a serving candidate"));
+        }
+        self.register_in_tx(tx, candidate, request_id, request_digest, deadline, true).await
+    }
+
+    async fn register_in_tx(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+        candidate: &super::candidate::RootCandidate,
+        request_id: Uuid,
+        request_digest: crate::ref_store::contract::RequestDigest,
+        deadline: Instant,
+        serving: bool,
+    ) -> Result<RootReceipt, RootError> {
         let scope = *candidate.scope();
         let repository_id = scope.repository_id();
         let root_id = candidate.root_id();
         let register_digest = candidate.register_digest();
+        if serving != candidate.is_serving() {
+            return Err(RootError::RootRealmMismatch("register candidate/lane mismatch"));
+        }
+        let backend_identity = self.engine().backend_identity().as_hex();
 
         // (1) Exact replay first: an already stored receipt returns without any liveness check or extra charge.
         if let Some(row) = super::sql::lookup_receipt(tx, repository_id, request_id).await? {
@@ -124,8 +209,16 @@ impl PgRetentionRoots {
         // (4) Fresh revalidation of the ORIGINAL active pin + realm + complete immutable pack identity under the
         // gate lock. This re-reads the source snapshot rows (and locks the pin FOR SHARE) and re-checks liveness,
         // generation, expiry and release; the sealed candidate must agree byte for byte.
-        let fresh = PgPackSnapshot.read_checked(tx, candidate.reference(), deadline).await?;
+        let lane = if serving {
+            super::super::snapshot_sql::ScopeLane::Serving { backend_identity }
+        } else {
+            super::super::snapshot_sql::ScopeLane::LegacyFresh
+        };
+        let fresh = PgPackSnapshot.read_checked(tx, candidate.reference(), deadline, lane).await?;
         candidate.verify_source(&fresh)?;
+        if serving {
+            candidate.verify_serving_backend(backend_identity)?;
+        }
 
         // (5) Monotone separate protocol revision (never a gate row shape change). It becomes durable only with
         // the capture rows below, so any later refusal rolls the bump back with the whole transaction.
@@ -161,7 +254,19 @@ impl PgRetentionRoots {
             return Err(RootError::RootAlreadyActive { repository_id, root_id });
         }
 
-        // (8) Bounded canonical receipt body, then the exact charge computed from the actual canonical column
+        // (8) Serving-only cluster anchor check after the existing repository/gate/pin/protocol/root locks.
+        // This preserves pin/root -> cluster NOWAIT order; the anchor was captured by T1 and is never persisted.
+        if serving {
+            let expected = candidate
+                .serving_cluster_incarnation()
+                .ok_or(RootError::RootRealmMismatch("serving candidate has no cluster anchor"))?;
+            let current = super::sql::cluster_incarnation_nowait(tx).await?;
+            if current != expected {
+                return Err(RootError::RootRealmMismatch("cluster authority incarnation changed during register"));
+            }
+        }
+
+        // (9) Bounded canonical receipt body, then the exact charge computed from the actual canonical column
         // bytes of every row this transaction is about to write, applied atomically under both already-locked
         // usage rows and before the first retained row.
         let body = register_body(
@@ -195,7 +300,7 @@ impl PgRetentionRoots {
         let charge = RootCharge::register(candidate, body_bytes);
         super::sql::apply_charge(tx, &scope, charge).await?;
 
-        // (9) All retained rows in this same transaction.
+        // (10) All retained rows in this same transaction.
         super::sql::insert_head(tx, &scope, root_id, &register_digest, false).await?;
         super::sql_insert::insert_capture(tx, candidate, request_id, roots_revision).await?;
         super::sql_insert::insert_refs(tx, repository_id, root_id, candidate.captured_refs()).await?;

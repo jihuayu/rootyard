@@ -157,9 +157,17 @@ pub async fn acquire(
         .map_err(Error::internal)?;
     let row = tx
         .query_opt(
-            "SELECT storage_generation,state,gc_epoch, \
-             (gc_owner IS NOT NULL AND gc_lease_until > clock_timestamp() - interval '5 seconds') \
-             FROM repositories WHERE id=$1 FOR SHARE NOWAIT",
+            "SELECT r.storage_generation,r.state,r.gc_epoch, \
+             (r.gc_owner IS NOT NULL AND r.gc_lease_until > clock_timestamp() - interval '5 seconds'), \
+             (r.deleted_at IS NOT NULL), \
+             (r.archived_at IS NOT NULL), \
+             r.transition_state, \
+             EXISTS ( \
+               SELECT 1 FROM repository_transfers t \
+               WHERE t.repository_id = r.id \
+                 AND t.state NOT IN ('completed', 'rolled_back', 'failed') \
+             ) \
+             FROM repositories r WHERE r.id=$1 FOR SHARE NOWAIT",
             &[&repository_id],
         )
         .await
@@ -169,7 +177,17 @@ pub async fn acquire(
     let state: String = row.get(1);
     let epoch: i64 = row.get(2);
     let gc_blocked: bool = row.get(3);
-    if current_generation != generation || state != "ready" {
+    let deleted: bool = row.get(4);
+    let archived: bool = row.get(5);
+    let transition_state: String = row.get(6);
+    let active_transfer: bool = row.get(7);
+    if deleted {
+        return Err(Error::not_found());
+    }
+    if archived {
+        return Err(Error(StatusCode::FORBIDDEN, "repository is archived and read-only"));
+    }
+    if current_generation != generation || state != "ready" || transition_state != "stable" || active_transfer {
         return Err(conflict());
     }
     if gc_blocked {
@@ -204,8 +222,14 @@ pub async fn acquire(
                            WHERE id=$1 AND owner=$2 AND state='active' \
                            RETURNING repository_id,gc_epoch \
                          ) SELECT r.storage_generation=$3 AND r.state='ready' \
+                           AND r.deleted_at IS NULL \
                            AND r.gc_epoch=heartbeat.gc_epoch \
                            AND (r.gc_owner IS NULL OR r.gc_lease_until <= clock_timestamp()) \
+                           AND NOT EXISTS ( \
+                             SELECT 1 FROM repository_transfers t \
+                             WHERE t.repository_id = r.id \
+                               AND t.state IN ('copying_remote', 'rekeying_db', 'revoking_legacy') \
+                           ) \
                          FROM repositories r JOIN heartbeat ON heartbeat.repository_id=r.id",
                         &[&id, &owner, &generation, &lease_seconds],
                     )
@@ -267,7 +291,10 @@ mod tests {
                    id uuid PRIMARY KEY, storage_generation bigint NOT NULL, state text NOT NULL, \
                    gc_epoch bigint NOT NULL DEFAULT 0, gc_owner uuid, gc_job_id uuid, \
                    gc_lease_until timestamptz, gc_fence_started_at timestamptz, \
-                   gc_quiesced_at timestamptz); \
+                   gc_quiesced_at timestamptz, deleted_at timestamptz, archived_at timestamptz, \
+                   transition_state text NOT NULL DEFAULT 'stable'); \
+                 CREATE TABLE repository_transfers( \
+                   id uuid PRIMARY KEY, repository_id uuid NOT NULL, state text NOT NULL); \
                  CREATE TABLE storage_write_admissions( \
                    id uuid PRIMARY KEY, repository_id uuid NOT NULL REFERENCES repositories(id), \
                    gc_epoch bigint NOT NULL, owner uuid NOT NULL, kind text NOT NULL, \
@@ -345,6 +372,79 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(admission.ensure_active().is_err(), "admission stayed active after the GC epoch advanced");
+        admission.finish().await;
+    }
+
+    #[tokio::test]
+    async fn acquire_rejects_deleted_archived_and_active_transfer() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let c = pool.get().await.unwrap();
+        let r_del = Uuid::new_v4();
+        let r_arch = Uuid::new_v4();
+        let r_xfer = Uuid::new_v4();
+        c.execute(
+            "INSERT INTO repositories(id,storage_generation,state,deleted_at) VALUES($1,1,'ready',clock_timestamp())",
+            &[&r_del],
+        )
+        .await
+        .unwrap();
+        c.execute(
+            "INSERT INTO repositories(id,storage_generation,state,archived_at) VALUES($1,1,'ready',clock_timestamp())",
+            &[&r_arch],
+        )
+        .await
+        .unwrap();
+        c.execute("INSERT INTO repositories(id,storage_generation,state) VALUES($1,1,'ready')", &[&r_xfer])
+            .await
+            .unwrap();
+        c.execute(
+            "INSERT INTO repository_transfers(id,repository_id,state) VALUES($1,$2,'draining')",
+            &[&Uuid::new_v4(), &r_xfer],
+        )
+        .await
+        .unwrap();
+
+        let err_del =
+            acquire(&pool, r_del, 1, "git-push", Instant::now() + Duration::from_secs(10)).await.err().unwrap();
+        assert_eq!(err_del.0, StatusCode::NOT_FOUND);
+        let err_arch =
+            acquire(&pool, r_arch, 1, "git-push", Instant::now() + Duration::from_secs(10)).await.err().unwrap();
+        assert_eq!(err_arch.0, StatusCode::FORBIDDEN);
+        let err_xfer =
+            acquire(&pool, r_xfer, 1, "git-push", Instant::now() + Duration::from_secs(10)).await.err().unwrap();
+        assert_eq!(err_xfer.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_survives_draining_and_fences_copying_remote() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let c = pool.get().await.unwrap();
+        let repo = Uuid::new_v4();
+        let xfer = Uuid::new_v4();
+        c.execute("INSERT INTO repositories(id,storage_generation,state) VALUES($1,1,'ready')", &[&repo])
+            .await
+            .unwrap();
+        let admission =
+            acquire(&pool, repo, 1, "workspace_publish", Instant::now() + Duration::from_secs(10)).await.unwrap();
+
+        c.execute("INSERT INTO repository_transfers(id,repository_id,state) VALUES($1,$2,'draining')", &[&xfer, &repo])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(admission.ensure_active().is_ok(), "draining must let already-admitted writer finish");
+
+        c.execute("UPDATE repository_transfers SET state='copying_remote' WHERE id=$1", &[&xfer]).await.unwrap();
+        for _ in 0..30 {
+            if admission.ensure_active().is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(admission.ensure_active().is_err(), "copying_remote must fence admitted writer");
         admission.finish().await;
     }
 }

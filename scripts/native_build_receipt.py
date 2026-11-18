@@ -74,6 +74,10 @@ TEST_SUPPORT_DIRS = (
     "tests/serving_support",
     "tests/fixtures",
 )
+#: Generated Python caches are not source inputs.  Ignoring them keeps a v2
+#: receipt stable across unittest import order without omitting real files.
+PYTHON_CACHE_DIRECTORY = "__pycache__"
+PYTHON_BYTECODE_SUFFIXES = (".pyc", ".pyo")
 #: Literal in-repository files embedded at compile time by ``include_str!``,
 #: ``include_bytes!`` or ``include!`` from a bound Rust source file.  This is
 #: the explicit closed set of assets used by the current production closure;
@@ -602,11 +606,18 @@ def normalize_build_environment(environ=None):
 
 
 # -- bound input inventory ----------------------------------------------------
+def _is_generated_python_cache(relative):
+    return PYTHON_CACHE_DIRECTORY in relative.parts or relative.suffix in PYTHON_BYTECODE_SUFFIXES
+
+
 def _files_under(root, base):
     root = Path(root).resolve()
     for path in sorted(Path(base).rglob("*")):
         if path.is_file():
             _require(_is_within(path, root), "bound input", f"{path} resolves outside {root}")
+            relative = path.relative_to(root)
+            if _is_generated_python_cache(relative):
+                continue
             yield path
 
 
@@ -660,7 +671,9 @@ def bound_input_inventory(root):
     the test closure binds ``tests/**/*.rs`` plus the known support directories.
     Files embedded by literal ``include_*!`` macros are bound as
     ``compiled_asset`` even when they live outside those directories; the
-    explicit :data:`COMPILED_ASSETS` set is required to be present.
+    explicit :data:`COMPILED_ASSETS` set is required to be present.  Generated
+    Python cache directories and ``.pyc``/``.pyo`` files are runner state, not
+    content inputs, and are excluded.
     """
     root = Path(root).resolve()
     _require(root.is_dir(), "bound input", f"source root {root} is not a directory")
