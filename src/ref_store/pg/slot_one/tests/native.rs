@@ -10,9 +10,10 @@
 //! imports resolve inside the crate's own test build.
 //!
 //! Every case is `#[ignore]`, hard-fails when PostgreSQL, the Blob profile, the
-//! trusted Git binary or the disposable-bucket attestation is absent, and never
-//! skips once explicitly invoked. The test writes no gate, authority, decision,
-//! terminal, approval or event row directly: P0 is admitted and staged, an
+//! trusted Git binary, the disposable-database attestation or the
+//! disposable-bucket attestation is absent, and never skips once explicitly
+//! invoked. The test writes no gate, authority, decision, terminal, approval or
+//! event row directly: P0 is admitted and staged, an
 //! unrelated ref B advances the gate through a real authorized P1 commit, P0 is
 //! durably refused and mirrored as retirement-required without wrapper mutation,
 //! and P2 re-executes the identical P0 wire ref command with a fresh private
@@ -20,9 +21,16 @@
 //! A5 snapshot. Collaboration uses separate ref A for P0/P2 and ref B for P1 so
 //! the retried wire command remains exactly the original one.
 //!
-//! Run explicitly (with an owned disposable Blob bucket/prefix):
+//! The PostgreSQL marker attests one dedicated database disposed whole, never a
+//! shared schema, even when the configured URL is valid; the included fixture
+//! seeds `public.cluster_authority` outside its random schema and does not claim
+//! shared-schema cleanup.
+//!
+//! Run explicitly (with an owned disposable PostgreSQL database and Blob
+//! bucket/prefix):
 //!
 //! ```text
+//! ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES=1 \
 //! ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB=1 \
 //! ROOTYARD_TEST_DATABASE_URL=postgresql://... \
 //! ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3 \
@@ -68,14 +76,13 @@ use rootyard::ref_store::{
 use readback::{assert_a5_after_rotation, assert_no_registry_promotion, publication_for, stored_ref};
 use retirement::retire_p0;
 use rotation::{assert_current_pending_wrapper_gap, mirror_p2_terminal_and_prove_replay, rotate_and_commit};
-use setup::{require_owned_disposable_blob_fixture, require_postgres_17};
+use setup::{require_owned_disposable_fixture, require_postgres_17};
 
 const REF_RETRY: &str = "refs/heads/retry";
 const REF_SIDE: &str = "refs/heads/side";
 const SLOT_ZERO_LANE: &str = "slot-zero-rotation";
 const WIRE_DOMAIN: &str = "rootyard-test-wire-ref-command-v1";
 const WIRE_BODY: &[u8] = b"identical logical receive-pack ref update";
-const OWNED_BLOB_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB";
 
 /// The durable state through P0 admission, P0 artifact staging, the real P1
 /// authorized advance, the production superseded refusal and the read-only
@@ -97,7 +104,7 @@ struct Retired {
 #[tokio::test]
 #[ignore = "requires real PostgreSQL 17, S3/Garage Blob and native Git"]
 async fn slot_zero_rejection_selects_retirement_on_real_a3_a4() -> Result<()> {
-    require_owned_disposable_blob_fixture()?;
+    require_owned_disposable_fixture()?;
     let db = db::Db::setup().await?;
     let outcome: Result<()> = async {
         require_postgres_17(&db).await?;
@@ -135,7 +142,7 @@ async fn slot_zero_rejection_selects_retirement_on_real_a3_a4() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires real PostgreSQL 17, S3/Garage Blob and native Git"]
 async fn slot_one_rotation_replays_identical_wire_command_on_real_a3_a4_a5() -> Result<()> {
-    require_owned_disposable_blob_fixture()?;
+    require_owned_disposable_fixture()?;
     let db = db::Db::setup().await?;
     let outcome: Result<()> = async {
         require_postgres_17(&db).await?;
