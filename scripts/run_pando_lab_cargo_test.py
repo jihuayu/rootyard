@@ -1,11 +1,16 @@
-"""Run the isolated Pando Cargo test gate and print a bounded CI receipt."""
+"""Run the isolated Pando Cargo test gate and write a bounded CI receipt."""
 
+import argparse
 import json
+from pathlib import Path
 import re
 import subprocess
+import tempfile
 
 
 CARGO_COMMAND = ("cargo", "test", "--locked", "--all-targets", "--features", "pando-lab")
+RECEIPT = Path("test-results/pando-lab-cargo-test.json")
+GIT_OID = re.compile(r"[0-9a-f]{40}")
 MAX_LINE_BYTES = 4096
 MAX_FAILED_TESTS = 8
 SGR = re.compile(rb"\x1b\[[0-9;]*m")
@@ -36,23 +41,31 @@ def bounded_lines(stream):
                 line = stream.readline(MAX_LINE_BYTES + 1)
 
 
-def source_commit():
+def git_oid(revision):
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD"], check=False,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            ["git", "--no-replace-objects", "rev-parse", "--verify", revision],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode == 0 and re.fullmatch(rb"[0-9a-f]{40}\n", result.stdout):
-        return result.stdout.strip().decode("ascii")
+        return result.stdout[:-1].decode("ascii")
     return None
+
+
+def source_binding(expected_commit):
+    if not GIT_OID.fullmatch(expected_commit):
+        return None, None
+    commit = git_oid("HEAD^{commit}")
+    if commit != expected_commit:
+        return None, None
+    tree = git_oid(f"{commit}^{{tree}}")
+    return (commit, tree) if tree is not None else (None, None)
 
 
 def source_test_names(commit):
     """Allow ordinary Rust and Tokio test names from committed source blobs."""
-    if commit is None:
-        return set()
     command = [
         "git", "--no-replace-objects", "grep", "--no-color", "--no-line-number",
         "--break", "-h", "-I", "-E",
@@ -120,11 +133,39 @@ def run_cargo(commit):
     return status, phase, failed_tests, truncated
 
 
+def write_receipt(receipt):
+    RECEIPT.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=RECEIPT.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(json.dumps(receipt) + "\n")
+        temporary.replace(RECEIPT)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main():
-    commit = source_commit()
-    status, phase, names, truncated = run_cargo(commit)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--expect-commit", nargs="?", const="", default="", help="full commit SHA required before running Cargo",
+    )
+    expected_commit = parser.parse_args().expect_commit
+
+    commit = tree = None
+    try:
+        commit, tree = source_binding(expected_commit)
+        if commit is None:
+            status, phase, names, truncated = 1, "source_binding", (), False
+        else:
+            status, phase, names, truncated = run_cargo(commit)
+    except KeyboardInterrupt:
+        status, phase, names, truncated = 130, "infrastructure", (), False
+
     receipt = {
         "source_commit": commit,
+        "source_tree": tree,
         "stage": "cargo_test",
         "outcome": "failed" if status else "passed",
         "exit_code": status,
@@ -134,12 +175,14 @@ def main():
         if phase == "test":
             receipt["failed_tests"] = [name.decode("ascii") for name in sorted(names)]
             receipt["failed_tests_truncated"] = truncated
-    print(json.dumps(receipt))
+    try:
+        write_receipt(receipt)
+    except OSError:
+        print("Pando lab Cargo test receipt could not be written")
+        return status or 1
+    print(f"Pando lab Cargo test {receipt['outcome']}")
     return status
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        raise SystemExit(130) from None
+    raise SystemExit(main())

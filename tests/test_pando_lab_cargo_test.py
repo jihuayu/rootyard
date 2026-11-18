@@ -27,33 +27,71 @@ KNOWN_TESTS = (
 
 
 class PandoLabCargoTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
-        ).strip()
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve() / "workspace"
+        self.root.mkdir()
+        self.receipt = self.root / "test-results/pando-lab-cargo-test.json"
+        self.git = shutil.which("git")
+        self.assertIsNotNone(self.git)
+        git_env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 
-    def run_gate(self, code, status, phase=None, *, names=(), truncated=False, with_git=True):
+        def git(*args):
+            return subprocess.check_output(
+                [self.git, *args], cwd=self.root, env=git_env, text=True,
+            ).strip()
+
+        git("init", "--quiet", "--template=")
+        source = self.root / "src"
+        source.mkdir()
+        (source / "lib.rs").write_text("".join(f"#[test]\nfn {name}() {{}}\n" for name in KNOWN_TESTS))
+        git("add", "src/lib.rs")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "--quiet", "-m", "Fixture tests")
+        self.commit = git("rev-parse", "HEAD")
+        self.tree = git("rev-parse", "HEAD^{tree}")
+
+    def invoke_gate(self, code, *, args=None, with_git=True, git_code=None):
         with tempfile.TemporaryDirectory() as directory:
             bin_dir = Path(directory)
-            if with_git:
-                (bin_dir / "git").symlink_to(shutil.which("git"))
+            if git_code is not None:
+                fake_git = bin_dir / "git"
+                fake_git.write_text(f"#!{sys.executable}\n" + textwrap.dedent(git_code))
+                fake_git.chmod(0o700)
+            elif with_git:
+                (bin_dir / "git").symlink_to(self.git)
+            invoked = bin_dir / "cargo-invoked"
             if code is not None:
                 fake = bin_dir / "cargo"
-                fake.write_text(f"#!{sys.executable}\n" + textwrap.dedent(code))
+                fake.write_text(
+                    f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(invoked)!r}).touch()\n"
+                    + textwrap.dedent(code)
+                )
                 fake.chmod(0o700)
+            if args is None:
+                args = (f"--expect-commit={self.commit}",)
             result = subprocess.run(
-                [sys.executable, str(WRAPPER)], cwd=ROOT, capture_output=True, text=True,
-                env={**os.environ, "PATH": directory, "PANDO_FAKE_SENTINEL": "private-value"},
-                timeout=10,
+                [sys.executable, str(WRAPPER), *args], cwd=self.root, capture_output=True, text=True,
+                env={
+                    **os.environ, "PATH": directory, "PANDO_FAKE_SENTINEL": "private-value",
+                    "GITHUB_SHA": self.commit,
+                },
+                timeout=15,
             )
+            return result, invoked.exists()
+
+    def run_gate(self, code, status, phase=None, *, names=(), truncated=False, bound=True, **invocation):
+        self.receipt.unlink(missing_ok=True)
+        result, invoked = self.invoke_gate(code, **invocation)
+        self.assertEqual(invoked, bound and code is not None)
         self.assertEqual(result.returncode, status)
         self.assertEqual(result.stderr, "")
-        self.assertEqual(len(result.stdout.splitlines()), 1)
+        outcome = "failed" if status else "passed"
+        self.assertEqual(result.stdout, f"Pando lab Cargo test {outcome}\n")
         expected = {
-            "source_commit": self.commit if with_git else None,
+            "source_commit": self.commit if bound else None,
+            "source_tree": self.tree if bound else None,
             "stage": "cargo_test",
-            "outcome": "failed" if status else "passed",
+            "outcome": outcome,
             "exit_code": status,
         }
         if phase is not None:
@@ -61,13 +99,13 @@ class PandoLabCargoTest(unittest.TestCase):
         if phase == "test":
             expected["failed_tests"] = sorted(names)
             expected["failed_tests_truncated"] = truncated
-        self.assertEqual(json.loads(result.stdout), expected)
+        self.assertEqual(json.loads(self.receipt.read_text()), expected)
 
     def test_success_preserves_argv_environment_and_working_directory(self):
         self.run_gate(f"""
             import os, sys
             assert sys.argv[1:] == ["test", "--locked", "--all-targets", "--features", "pando-lab"]
-            assert os.getcwd() == {str(ROOT)!r}
+            assert os.getcwd() == {str(self.root)!r}
             print(os.environ["PANDO_FAKE_SENTINEL"])
             print("/private/path", file=sys.stderr)
             print("error: test failed")
@@ -141,14 +179,34 @@ class PandoLabCargoTest(unittest.TestCase):
             os.kill(os.getpid(), signal.SIGTERM)
         """, 143, "infrastructure")
 
-    def test_names_are_omitted_when_the_git_source_is_unavailable(self):
-        self.run_gate(f"""
-            import sys
-            print("running 1 test")
-            print("test {KNOWN_TESTS[0]} ... FAILED")
-            print("error: test failed")
-            sys.exit(101)
-        """, 101, "test", with_git=False)
+    def test_invalid_source_binding_never_invokes_successful_cargo(self):
+        contexts = {
+            "omitted expected commit": {"args": ()},
+            "missing expected commit value": {"args": ("--expect-commit",)},
+            "empty expected commit": {"args": ("--expect-commit=",)},
+            "symbolic expected commit": {"args": ("--expect-commit", "HEAD")},
+            "mismatched expected commit": {"args": ("--expect-commit", "0" * 40)},
+            "missing Git": {"with_git": False},
+            "invalid Git HEAD": {"git_code": "print('private invalid HEAD')"},
+            "invalid Git tree": {"git_code": f"""
+                import sys
+                print({self.commit!r} if sys.argv[-1] == "HEAD^{{commit}}" else "private invalid tree")
+            """},
+        }
+        for context, invocation in contexts.items():
+            with self.subTest(context=context):
+                self.run_gate("raise SystemExit(0)", 1, "source_binding", bound=False, **invocation)
+
+    def test_receipt_destination_failure_preserves_cargo_failure_and_rejects_success(self):
+        self.receipt.mkdir(parents=True)
+        for cargo_status, expected_status in ((0, 1), (37, 37)):
+            with self.subTest(cargo_status=cargo_status):
+                result, invoked = self.invoke_gate(f"raise SystemExit({cargo_status})")
+                self.assertTrue(invoked)
+                self.assertEqual(result.returncode, expected_status)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stdout, "Pando lab Cargo test receipt could not be written\n")
+                self.assertEqual(list(self.receipt.parent.iterdir()), [self.receipt])
 
 
 if __name__ == "__main__":
