@@ -363,8 +363,8 @@ class SlotZeroSourceTest(unittest.TestCase):
         # the admission and rollback APIs accept.
         self.assertNotIn('.transaction().await', self.tests)
         self.assertNotIn('deadpool_postgres::Transaction', self.tests)
-        self.assertEqual(self.tests.count('tokio_postgres::Client::transaction'), 21)
-        self.assertEqual(self.tests.count('tokio_postgres::Client::transaction(&mut client)'), 18)
+        self.assertEqual(self.tests.count('tokio_postgres::Client::transaction'), 27)
+        self.assertEqual(self.tests.count('tokio_postgres::Client::transaction(&mut client)'), 24)
         self.assertIn('tokio_postgres::Client::transaction(&mut holder_client)', self.tests)
         self.assertIn('tokio_postgres::Client::transaction(&mut admission)', self.tests)
         self.assertIn('tokio_postgres::Client::transaction(&mut legacy_client)', self.tests)

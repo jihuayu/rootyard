@@ -5,8 +5,8 @@ use super::{
 use crate::{
     db,
     ref_store::{
-        CommitMode, GitObjectFormat, IssuerLane, OperationIdentity, OperationState, PgRefStore, RefStoreError,
-        RequestDigest,
+        CommitMode, CommitRejectCode, CommitRejection, CommitTerminal, GitObjectFormat, IssuerLane, OperationIdentity,
+        OperationState, PgRefStore, RefCommitResult, RefStoreError, RequestDigest, TerminalOutcome,
         core::{
             CoreGate, GitOid, HeadUpdate, RefName, RefPrecondition, RefUpdate,
             pack_commit::{
@@ -14,7 +14,10 @@ use crate::{
                 PackCommitScope, PackMode,
             },
         },
-        pg::public_attempt::{PublicAttemptLookup, PublicAttemptRequest},
+        pg::{
+            public_attempt::{PublicAttemptLookup, PublicAttemptRequest},
+            public_terminal::PublicAttemptTerminalOutcome,
+        },
     },
 };
 use anyhow::Context;
@@ -1277,6 +1280,58 @@ async fn attempt_ledger_facts(
     })
 }
 
+fn public_attempt_request(fixture: &Fixture, admission: &SlotZeroAdmissionRequest) -> PublicAttemptRequest {
+    PublicAttemptRequest {
+        repository_id: fixture.repo,
+        admission_owner_id: fixture.actor,
+        issuer_id: fixture.actor,
+        public_id: admission.public_id,
+        wire_digest: admission.wire_digest,
+        request_mode: admission.request_mode,
+        backend_identity: fixture.backend.clone(),
+        object_format: admission.object_format,
+        history_incarnation: fixture.history,
+        authority_epoch: admission.authority_epoch,
+        group_epoch: admission.group_epoch,
+        restore_incarnation: fixture.restore,
+    }
+}
+
+/// Exact wrapper/attempt/operation/event rows for one public operation. This
+/// compares the durable ledger after the mirror and after its read-only replay.
+async fn public_terminal_ledger(
+    client: &tokio_postgres::Client,
+    repository_id: Uuid,
+    public_id: Uuid,
+) -> anyhow::Result<serde_json::Value> {
+    let row = client
+        .query_one(
+            "SELECT jsonb_build_object(
+               'wrapper', (SELECT to_jsonb(w)
+                             FROM ref_store_public_operations w
+                            WHERE w.repository_id=$1 AND w.public_id=$2),
+               'attempts', (SELECT jsonb_agg(to_jsonb(a) ORDER BY a.slot)
+                              FROM ref_store_private_attempts a
+                             WHERE a.repository_id=$1 AND a.public_id=$2),
+               'operation', (SELECT to_jsonb(o)
+                               FROM ref_store_operations o
+                               JOIN ref_store_private_attempts a
+                                 ON a.repository_id=o.repository_id AND a.private_id=o.operation_id
+                              WHERE a.repository_id=$1 AND a.public_id=$2),
+               'event', (SELECT to_jsonb(e)
+                           FROM ref_store_core_events e
+                           JOIN ref_store_private_attempts a
+                             ON a.repository_id=e.repository_id AND a.private_id=e.operation_id
+                          WHERE a.repository_id=$1 AND a.public_id=$2),
+               'gate_revision', (SELECT revision FROM ref_store_core_gates WHERE repository_id=$1),
+               'event_count', (SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1)
+             )",
+            &[&repository_id, &public_id],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
 #[tokio::test]
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
 async fn slot_zero_public_attempt_lookup_is_exact_and_read_only() -> anyhow::Result<()> {
@@ -1393,6 +1448,205 @@ async fn slot_zero_public_attempt_lookup_is_exact_and_read_only() -> anyhow::Res
         tx.rollback().await?;
         let after = attempt_ledger_facts(&client, &fixture).await?;
         assert_eq!(before, after, "read-only public attempt lookup changed the attempt ledger");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn slot_zero_public_terminal_mirror_commits_then_exactly_replays() -> anyhow::Result<()> {
+    with_fixture(|fixture| async move {
+        let public = Uuid::new_v4();
+        let private = Uuid::new_v4();
+        let admission_request = slot_zero_request(&fixture, public, private);
+        let mut client = fixture.pool.get().await?;
+
+        // Real slot-zero admission: wrapper + slot-zero attempt + pending
+        // migration-138 operation + migration-147 producer binding.
+        let tx = tokio_postgres::Client::transaction(&mut client).await?;
+        let (tx, receipt) = PgRefStore
+            .admit_slot_zero_in_tx(
+                tx,
+                &admission_request,
+                |preview| plan_for(&fixture, &admission_request, preview),
+                deadline(),
+            )
+            .await?
+            .into_parts();
+        let receipt = receipt?;
+        assert!(!receipt.replayed);
+        assert_eq!(receipt.state, OperationState::Pending);
+        tx.commit().await?;
+
+        let public_request = public_attempt_request(&fixture, &admission_request);
+        let identity = OperationIdentity::new(
+            fixture.repo,
+            fixture.actor,
+            admission_request.lane.clone(),
+            receipt.sequence,
+            private,
+            receipt.plan_digest,
+        )?;
+
+        // A still-pending private operation is refused before any SQL lock or
+        // write. The outer transaction remains usable for its rollback.
+        let pending_ledger = public_terminal_ledger(&client, fixture.repo, public).await?;
+        let pending_tx = tokio_postgres::Client::transaction(&mut client).await?;
+        let pending_record = match PgRefStore.get(&pending_tx, fixture.repo, private, deadline()).await? {
+            OperationLookup::Known(record) => record,
+            OperationLookup::Unknown => return Err(anyhow::anyhow!("admitted private operation is not registered")),
+        };
+        assert_eq!(pending_record.state(), OperationState::Pending);
+        match PgRefStore
+            .mirror_public_attempt_terminal_in_tx(&pending_tx, &public_request, &pending_record, deadline())
+            .await
+        {
+            Err(PackCommitError::RefStore(RefStoreError::OperationPending { operation_id }))
+                if operation_id == private => {}
+            other => {
+                return Err(anyhow::anyhow!(
+                    "pending terminal mirror did not fail closed with OperationPending: {other:?}"
+                ));
+            }
+        }
+        pending_tx.rollback().await?;
+        assert_eq!(
+            public_terminal_ledger(&client, fixture.repo, public).await?,
+            pending_ledger,
+            "pending terminal mirror changed the public ledger"
+        );
+
+        // The existing core adapter writes both immutable pieces: the exact
+        // migration-138 terminal and the migration-139 event body. A full
+        // commit_refs/authorized commit is the wrong seam here because this ready
+        // fixture realm is decision-required and the authorized path additionally
+        // requires a native closure proof.
+        let terminal = CommitTerminal::rejected(
+            fixture.repo,
+            receipt.base_revision,
+            Some("refs/heads/main".into()),
+            vec![RefCommitResult::NotApplied {
+                name: "refs/heads/main".into(),
+                reason: CommitRejectCode::OldOidMismatch,
+            }],
+            CommitRejection {
+                code: CommitRejectCode::OldOidMismatch,
+                ref_name: Some("refs/heads/main".into()),
+                expected: None,
+                actual: None,
+            },
+        );
+        let result = terminal.to_terminal_result()?;
+        let terminal_tx = tokio_postgres::Client::transaction(&mut client).await?;
+        let terminal_receipt =
+            PgRefStore.record_terminal(&terminal_tx, &identity, TerminalOutcome::Rejected, &result, deadline()).await?;
+        assert!(!terminal_receipt.replayed);
+        assert_eq!(terminal_receipt.record.state(), OperationState::Rejected);
+        crate::ref_store::core::sql::insert_event(
+            &terminal_tx,
+            fixture.repo,
+            receipt.base_revision,
+            private,
+            "rejected",
+            &result,
+        )
+        .await?;
+        let event_id: Uuid = terminal_tx
+            .query_one(
+                "SELECT event_id FROM ref_store_core_events WHERE repository_id=$1 AND operation_id=$2",
+                &[&fixture.repo, &private],
+            )
+            .await?
+            .get(0);
+        terminal_tx.commit().await?;
+
+        // Wrong wire identity fails before the guarded UPDATE and leaves the
+        // exact pending wrapper/terminal/event ledger unchanged.
+        let mut wrong_wire = public_request.clone();
+        wrong_wire.wire_digest = RequestDigest::from_bytes([2; 32]);
+        let before_wrong_wire = public_terminal_ledger(&client, fixture.repo, public).await?;
+        let wrong_tx = tokio_postgres::Client::transaction(&mut client).await?;
+        match PgRefStore
+            .mirror_public_attempt_terminal_in_tx(&wrong_tx, &wrong_wire, &terminal_receipt.record, deadline())
+            .await
+        {
+            Err(PackCommitError::RefStore(RefStoreError::DigestConflict)) => {}
+            other => {
+                return Err(anyhow::anyhow!(
+                    "wrong-wire terminal mirror did not fail closed with DigestConflict: {other:?}"
+                ));
+            }
+        }
+        wrong_tx.rollback().await?;
+        assert_eq!(
+            public_terminal_ledger(&client, fixture.repo, public).await?,
+            before_wrong_wire,
+            "wrong-wire terminal mirror changed the public ledger"
+        );
+
+        // Fresh short owned transaction: the mirror publishes the exact
+        // already-durable state/event id and the caller's COMMIT is the point.
+        let commit_tx = tokio_postgres::Client::transaction(&mut client).await?;
+        let mirrored = match PgRefStore
+            .mirror_public_attempt_terminal_in_tx(&commit_tx, &public_request, &terminal_receipt.record, deadline())
+            .await?
+        {
+            PublicAttemptTerminalOutcome::Mirrored(receipt) => receipt,
+            other => return Err(anyhow::anyhow!("terminal mirror unexpectedly required retirement: {other:?}")),
+        };
+        assert!(!mirrored.replayed);
+        assert_eq!(mirrored.state, OperationState::Rejected);
+        assert_eq!(mirrored.event_id, event_id);
+        commit_tx.commit().await?;
+
+        let wrapper = client
+            .query_one(
+                "SELECT state,event_id,current_slot,retired_event_id,cancelled_private_id
+                   FROM ref_store_public_operations
+                  WHERE repository_id=$1 AND public_id=$2",
+                &[&fixture.repo, &public],
+            )
+            .await?;
+        assert_eq!(wrapper.get::<_, String>(0), "rejected");
+        assert_eq!(wrapper.get::<_, Option<Uuid>>(1), Some(event_id));
+        assert_eq!(wrapper.get::<_, i16>(2), 0);
+        assert_eq!(wrapper.get::<_, Option<Uuid>>(3), None);
+        assert_eq!(wrapper.get::<_, Option<Uuid>>(4), None);
+
+        let event = client
+            .query_one(
+                "SELECT event_id,revision,outcome,payload
+                   FROM ref_store_core_events
+                  WHERE repository_id=$1 AND operation_id=$2",
+                &[&fixture.repo, &private],
+            )
+            .await?;
+        assert_eq!(event.get::<_, Uuid>(0), event_id);
+        assert_eq!(event.get::<_, i64>(1), receipt.base_revision);
+        assert_eq!(event.get::<_, String>(2), "rejected");
+        assert_eq!(&event.get::<_, serde_json::Value>(3), result.value());
+
+        // Exact replay in another fresh short owned transaction returns the same
+        // durable event and changes no wrapper/attempt/operation/event row.
+        let before_replay = public_terminal_ledger(&client, fixture.repo, public).await?;
+        let replay_tx = tokio_postgres::Client::transaction(&mut client).await?;
+        let replayed = match PgRefStore
+            .mirror_public_attempt_terminal_in_tx(&replay_tx, &public_request, &terminal_receipt.record, deadline())
+            .await?
+        {
+            PublicAttemptTerminalOutcome::Mirrored(receipt) => receipt,
+            other => return Err(anyhow::anyhow!("exact terminal replay unexpectedly required retirement: {other:?}")),
+        };
+        assert!(replayed.replayed);
+        assert_eq!(replayed.state, OperationState::Rejected);
+        assert_eq!(replayed.event_id, event_id);
+        replay_tx.commit().await?;
+        assert_eq!(
+            public_terminal_ledger(&client, fixture.repo, public).await?,
+            before_replay,
+            "exact terminal mirror replay changed the public ledger"
+        );
         Ok(())
     })
     .await
