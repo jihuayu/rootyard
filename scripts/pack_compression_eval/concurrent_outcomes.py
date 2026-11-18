@@ -14,6 +14,7 @@ Unknown or malformed context fails closed to the fixed ``unknown`` ids.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
 from typing import Any
 
 PHASES = (
@@ -48,6 +49,7 @@ CONCURRENT_OUTCOME_FIELDS = (
     "http_subphase",
     "git_returncode",
     "signal",
+    "elapsed_ms",
 )
 OUTCOMES = ("passed", "failed", "unknown")
 
@@ -70,6 +72,16 @@ def _signal(value: Any) -> int | None:
 def _http_status(value: Any) -> int | None:
     code = _optional_int(value)
     return code if code is not None and 100 <= code <= 599 else None
+
+
+def finite_elapsed_ms(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return round(number, 3) if math.isfinite(number) and number >= 0 else None
 
 
 def finite_http_subphase(stderr: bytes | bytearray | None, status: int | None) -> str:
@@ -103,6 +115,7 @@ def _fixed_outcome(branch_ordinal: int | None, outcome: str, record: Mapping[str
             "http_subphase": _choice(source.get("http_subphase"), HTTP_SUBPHASES),
             "git_returncode": _optional_int(source.get("git_returncode")),
             "signal": _signal(source.get("signal")),
+            "elapsed_ms": finite_elapsed_ms(source.get("elapsed_ms")),
         }
     return {
         "branch_ordinal": branch_ordinal,
@@ -113,14 +126,17 @@ def _fixed_outcome(branch_ordinal: int | None, outcome: str, record: Mapping[str
         "http_subphase": "unknown",
         "git_returncode": None,
         "signal": None,
+        "elapsed_ms": finite_elapsed_ms(source.get("elapsed_ms")) if outcome == "passed" else None,
     }
 
 
-def finite_worker_outcome(branch_ordinal: int, exc: BaseException | None = None) -> dict[str, Any]:
+def finite_worker_outcome(
+    branch_ordinal: int, exc: BaseException | None = None, *, elapsed_ms: Any = None
+) -> dict[str, Any]:
     """Build one fixed outcome without inspecting raw exception text."""
     branch = branch_ordinal if 0 <= branch_ordinal < CONCURRENT_OUTCOME_LIMIT else None
     if exc is None:
-        return _fixed_outcome(branch, "passed", None)
+        return _fixed_outcome(branch, "passed", {"elapsed_ms": elapsed_ms})
     record = getattr(exc, "record", None)
     if not isinstance(record, Mapping):
         return _fixed_outcome(branch, "unknown", None)
@@ -132,16 +148,18 @@ def sanitize_concurrent_outcomes(value: Any) -> list[dict[str, Any]]:
 
     The list is capped at the three known branch ids.  Entries with unlisted or
     missing keys, duplicate branch ids, wrong types, or unrecognized outcome ids
-    are rejected.  Unrecognized phase/class/subphase strings are normalized to
-    the fixed ``unknown`` ids so no caller text can surface.
+    are rejected.  Records predating ``elapsed_ms`` receive a null duration.
+    Unrecognized phase/class/subphase strings are normalized to the fixed
+    ``unknown`` ids so no caller text can surface.
     """
     if not isinstance(value, (list, tuple)) or len(value) > CONCURRENT_OUTCOME_LIMIT:
         return []
     fields = set(CONCURRENT_OUTCOME_FIELDS)
+    legacy_fields = fields - {"elapsed_ms"}
     seen: set[int] = set()
     projected: list[dict[str, Any]] = []
     for item in value:
-        if not isinstance(item, Mapping) or set(item.keys()) != fields:
+        if not isinstance(item, Mapping) or set(item.keys()) not in (fields, legacy_fields):
             continue
         branch = item.get("branch_ordinal")
         if isinstance(branch, bool) or not isinstance(branch, int) or not 0 <= branch < CONCURRENT_OUTCOME_LIMIT:
@@ -174,7 +192,7 @@ def collect_concurrent_outcomes(
     first_error: BaseException | None = None
     for index, future in enumerate(list(futures) + [browse_future]):
         try:
-            future.result()
+            elapsed_ms = future.result()
         except BaseException as exc:  # noqa: BLE001 - preserve the original object
             if first_error is None:
                 first_error = exc
@@ -182,7 +200,7 @@ def collect_concurrent_outcomes(
                 outcomes.append(finite_worker_outcome(index, exc))
         else:
             if index < branch_count:
-                outcomes.append(finite_worker_outcome(index, None))
+                outcomes.append(finite_worker_outcome(index, elapsed_ms=elapsed_ms))
     if progress is not None:
         progress["concurrent_worker_outcomes"] = sanitize_concurrent_outcomes(outcomes)
     return first_error

@@ -35,15 +35,16 @@ SENTINEL = "SENTINEL_SECRET_concurrent_fd3a"
 
 
 class _FakeFuture:
-    def __init__(self, error: BaseException | None = None) -> None:
+    def __init__(self, error: BaseException | None = None, *, value: object = None) -> None:
         self.error = error
+        self.value = value
         self.called = False
 
     def result(self) -> object:
         self.called = True
         if self.error is not None:
             raise self.error
-        return "ok"
+        return self.value
 
 
 class _FakeExecutor:
@@ -75,6 +76,7 @@ class ConcurrentOutcomeTest(unittest.TestCase):
                 "http_subphase": "unknown",
                 "git_returncode": None,
                 "signal": None,
+                "elapsed_ms": None,
             },
         )
 
@@ -86,6 +88,7 @@ class ConcurrentOutcomeTest(unittest.TestCase):
             http_subphase="receive_pack",
             git_returncode=1,
             signal=9,
+            elapsed_ms=1023.4567,
         )
         outcome = finite_worker_outcome(0, LiveEvalFailure(record))
         self.assertEqual(
@@ -99,6 +102,7 @@ class ConcurrentOutcomeTest(unittest.TestCase):
                 "http_subphase": "receive_pack",
                 "git_returncode": 1,
                 "signal": 9,
+                "elapsed_ms": 1023.457,
             },
         )
 
@@ -107,6 +111,7 @@ class ConcurrentOutcomeTest(unittest.TestCase):
         self.assertEqual(outcome["outcome"], "unknown")
         self.assertEqual(outcome["phase"], "unknown")
         self.assertEqual(outcome["failure_class"], "unclassified")
+        self.assertIsNone(outcome["elapsed_ms"])
         self.assertNotIn(SENTINEL, json.dumps(outcome, sort_keys=True))
 
     def test_http_subphase_is_only_unambiguous(self) -> None:
@@ -136,14 +141,17 @@ class ConcurrentOutcomeTest(unittest.TestCase):
     def test_collect_preserves_original_first_error_and_all_outcomes(self) -> None:
         first = LiveEvalFailure(
             build_failure_record(
-                phase="concurrent_push", failure_class="git_push", http_status=503, http_subphase="receive_pack"
+                phase="concurrent_push", failure_class="git_push", git_returncode=1, elapsed_ms=12.3456
             )
         )
         second = LiveEvalFailure(
-            build_failure_record(phase="concurrent_push", failure_class="git_push", http_status=503)
+            build_failure_record(
+                phase="concurrent_push", failure_class="git_push", git_returncode=1,
+                http_status=503, http_subphase="receive_pack", elapsed_ms=42,
+            )
         )
         browse = RuntimeError("browse")
-        futs = [_FakeFuture(first), _FakeFuture(), _FakeFuture(second)]
+        futs = [_FakeFuture(first), _FakeFuture(value=24.1234), _FakeFuture(second)]
         bfut = _FakeFuture(browse)
         progress: dict = {}
         executor = _FakeExecutor()
@@ -156,6 +164,9 @@ class ConcurrentOutcomeTest(unittest.TestCase):
         outcomes = progress["concurrent_worker_outcomes"]
         self.assertEqual([o["branch_ordinal"] for o in outcomes], [0, 1, 2])
         self.assertEqual([o["outcome"] for o in outcomes], ["failed", "passed", "failed"])
+        self.assertEqual([o["elapsed_ms"] for o in outcomes], [12.346, 24.123, 42.0])
+        self.assertEqual([o["http_status"] for o in outcomes], [None, None, 503])
+        self.assertEqual([o["http_subphase"] for o in outcomes], ["unknown", "unknown", "receive_pack"])
         with self.assertRaises(RuntimeError) as caught:
             if returned is not None:
                 raise returned
@@ -168,6 +179,24 @@ class ConcurrentOutcomeTest(unittest.TestCase):
         returned = collect_concurrent_outcomes(futs, _FakeFuture(browse), branch_count=3, progress=progress)
         self.assertIs(returned, browse)
         self.assertEqual([o["outcome"] for o in progress["concurrent_worker_outcomes"]], ["passed"] * 3)
+
+    def test_unmeasured_failures_leave_elapsed_null(self) -> None:
+        for failure_class in ("git_timeout", "git_spawn"):
+            with self.subTest(failure_class=failure_class):
+                exc = LiveEvalFailure(build_failure_record(phase="concurrent_push", failure_class=failure_class))
+                self.assertIsNone(finite_worker_outcome(0, exc)["elapsed_ms"])
+        [unknown] = sanitize_concurrent_outcomes([{**_valid(0), "outcome": "unknown", "elapsed_ms": 12.0}])
+        self.assertIsNone(unknown["elapsed_ms"])
+
+    def test_elapsed_uses_same_finite_scalar_contract_at_each_boundary(self) -> None:
+        self.assertEqual(finite_worker_outcome(0, elapsed_ms=0)["elapsed_ms"], 0.0)
+        for value in (None, True, SENTINEL, -1, float("nan"), float("inf"), 10**400):
+            with self.subTest(value=value):
+                self.assertIsNone(finite_worker_outcome(0, elapsed_ms=value)["elapsed_ms"])
+                self.assertIsNone(build_failure_record(elapsed_ms=value)["elapsed_ms"])
+                [row] = sanitize_concurrent_outcomes([{**_valid(0), "elapsed_ms": value}])
+                self.assertIsNone(row["elapsed_ms"])
+                self.assertNotIn(SENTINEL, json.dumps(row, allow_nan=False))
 
     def test_sanitize_rejects_duplicates_unlisted_keys_and_injection(self) -> None:
         valid = [_valid(0), _valid(1), _valid(2)]
@@ -193,8 +222,15 @@ class ConcurrentOutcomeTest(unittest.TestCase):
         self.assertEqual(sanitize_concurrent_outcomes({"branch_ordinal": 0}), [])
         self.assertEqual(set(CONCURRENT_OUTCOME_FIELDS), set(_valid(0)))
 
+    def test_legacy_outcome_gains_null_elapsed_without_relaxing_its_other_fields(self) -> None:
+        legacy = _valid(0)
+        del legacy["elapsed_ms"]
+        self.assertEqual(sanitize_concurrent_outcomes([legacy]), [_valid(0)])
+        del legacy["http_subphase"]
+        self.assertEqual(sanitize_concurrent_outcomes([legacy]), [])
+
     def test_failure_record_projects_outcomes_defensively(self) -> None:
-        valid = [_valid(0), _valid(1), _valid(2)]
+        valid = [finite_worker_outcome(0, elapsed_ms=27.125), _valid(1), _valid(2)]
         record = build_failure_record(concurrent_worker_outcomes=valid)
         self.assertEqual(record["concurrent_worker_outcomes"], valid)
         self.assertEqual(enrich_failure_record(record)["concurrent_worker_outcomes"], valid)

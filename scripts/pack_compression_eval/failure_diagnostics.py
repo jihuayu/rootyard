@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -22,6 +21,7 @@ from .concurrent_outcomes import (
     FAILURE_CLASSES,
     HTTP_SUBPHASES,
     PHASES,
+    finite_elapsed_ms,
     finite_http_subphase,
     sanitize_concurrent_outcomes,
 )
@@ -137,13 +137,6 @@ def _http_status(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if 100 <= value <= 599 else None
-
-
-def _elapsed(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    number = float(value)
-    return round(number, 3) if math.isfinite(number) and number >= 0 else None
 
 
 def _sha(value: Any) -> str | None:
@@ -313,7 +306,7 @@ def build_failure_record(
         "signal": _signal(signal),
         "http_status": _http_status(http_status),
         "http_subphase": _choice(http_subphase, HTTP_SUBPHASES),
-        "elapsed_ms": _elapsed(elapsed_ms),
+        "elapsed_ms": finite_elapsed_ms(elapsed_ms),
         "last_completed_phase": _choice(last_completed_phase, PROGRESS_PHASES),
         "completed": completed_counts(completed),
         "s3": sanitize_s3_snapshot(s3),

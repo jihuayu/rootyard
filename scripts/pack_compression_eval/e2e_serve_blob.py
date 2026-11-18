@@ -348,8 +348,7 @@ def run_live_serve_blob_eval(
         # Phase 3: Concurrent pushes across distinct branches + Browse + PG inspection.
         conc_target = repos[0]
         conc_rw_env = build_git_http_env(run_env, askpass, conc_target["rw"]["username"], conc_target["rw"]["token"])
-        conc_ro_user = conc_target["ro"]["username"]
-        conc_ro_tok = conc_target["ro"]["token"]
+        conc_ro_user, conc_ro_tok = conc_target["ro"]["username"], conc_target["ro"]["token"]
         conc_branches = 3
         barrier = threading.Barrier(conc_branches + 1)
         conc_results: list[tuple[float, str]] = []
@@ -363,7 +362,7 @@ def run_live_serve_blob_eval(
             oid_b = apply_commit_spec(git_bin, cdir, CommitSpec(f"conc {bi}", {f"conc_{bi}.txt": f"branch={bi}\n".encode()}), conc_rw_env, 100 + bi)
             conc_clones.append((cdir, oid_b))
 
-        def _conc_push(bi: int) -> None:
+        def _conc_push(bi: int) -> float:
             cdir, oid_b = conc_clones[bi]
             branch_ref = f"refs/heads/conc_{bi}"
             barrier.wait(timeout=30)
@@ -379,6 +378,7 @@ def run_live_serve_blob_eval(
                 progress["completed"]["concurrent_pushes_completed"] += 1
                 progress["last_completed_phase"] = "concurrent_push"
                 acked.append((conc_target["repo"]["clone_path"], branch_ref, oid_b, "concurrent", conc_ro_user, conc_ro_tok))
+            return ms
 
         def _conc_browse_and_pg() -> None:
             barrier.wait(timeout=30)
