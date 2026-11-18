@@ -1,0 +1,258 @@
+name: Draft issue 42 schema contract PostgreSQL qualification
+
+on:
+  push:
+    branches: [codex/goal-issue42-original-ac-source-audit-20261117]
+    paths: [.github/workflows/issue42-schema-contract-postgres.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  schema-contract:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      TRIGGER_SHA: ${{ github.sha }}
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Prepare the redacted verifier
+        timeout-minutes: 1
+        run: |
+          work="$RUNNER_TEMP/issue42-schema-contract"
+          umask 077
+          mkdir -- "$work"
+          cat >"$work/verify.py" <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import secrets
+          import subprocess
+          import sys
+          import tarfile
+          import time
+          from pathlib import Path
+
+          WORK = Path(__file__).parent
+          STATE = WORK / "state.json"
+          WORKFLOW = ".github/workflows/issue42-schema-contract-postgres.yml"
+          PARENT_SHA = "7e66935afc1bbb9a289d6be94680b346462052d9"
+          PARENT_TREE = "391d50d1a24e805d9bf92b0e79cadaff31906cf5"
+          FIXTURE = "tests/fixtures/ref_store_public_attempts_schema.sql"
+          INPUTS = {
+              FIXTURE: "1a1feec273b40144f1425b4e106f569a4dc2ac90d583da8039b6fa0db91d0956",
+              "migrations/138_ref_store_operation_identity.sql": "509bb1afad56a599c7deb8c888a732b10258b5dc8fb46ecf6c463e3e2726fc56",
+          }
+
+          def require(condition):
+              if not condition:
+                  raise ValueError("schema contract qualification check failed")
+
+          def digest(value, length):
+              return value if isinstance(value, str) and re.fullmatch(f"[0-9a-f]{{{length}}}", value) else None
+
+          def initial():
+              return {"phase": "source_failed", "source": None, "tree": None, "pg_version_num": None,
+                      "db": None, "created": False, "invocations": 0, "session_ended": False}
+
+          def save(state):
+              pending = STATE.with_suffix(".tmp")
+              pending.write_text(json.dumps(state), encoding="ascii")
+              pending.replace(STATE)
+
+          def git(*args):
+              return subprocess.run(["git", *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=10).stdout.decode("ascii").strip()
+
+          def source_archive(state):
+              source = digest(git("rev-parse", "HEAD"), 40)
+              tree = digest(git("rev-parse", "HEAD^{tree}"), 40)
+              require(source and tree and source == os.environ["TRIGGER_SHA"] == os.environ["WORKFLOW_SHA"])
+              require(git("rev-parse", "HEAD^", "HEAD^^{tree}").splitlines() == [PARENT_SHA, PARENT_TREE])
+              require(git("diff-tree", "--no-commit-id", "--name-status", "--no-renames", "-r", "HEAD") == f"A\t{WORKFLOW}")
+              require(not git("status", "--porcelain", "--untracked-files=normal"))
+              archive = io.BytesIO()
+              with tarfile.open(fileobj=archive, mode="w") as tar:
+                  for name, expected in INPUTS.items():
+                      data = Path(name).read_bytes()
+                      require(hashlib.sha256(data).hexdigest() == expected)
+                      member = tarfile.TarInfo(name)
+                      member.size = len(data)
+                      tar.addfile(member, io.BytesIO(data))
+              state.update(source=source, tree=tree, phase="setup_failed")
+              save(state)
+              return archive.getvalue()
+
+          def database_prefix():
+              run, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+              require(re.fullmatch(r"[1-9][0-9]{0,19}", run) and re.fullmatch(r"[1-9][0-9]{0,4}", attempt))
+              return f"issue42_schema_r{run}_a{attempt}_"
+
+          def docker(*args, data=None, capture=False, limit=15):
+              container = digest(os.getenv("PG_CONTAINER"), 64)
+              require(container)
+              return subprocess.run(
+                  ["docker", "exec", "-i", "-e", "PGCONNECT_TIMEOUT=5", "-e",
+                   "PGOPTIONS=-c statement_timeout=5000 -c lock_timeout=2000", container, *args],
+                  input=data, stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL, timeout=limit,
+              )
+
+          def admin(db, sql, kind=None):
+              result = docker("timeout", "-k", "2s", "10s", "psql", "-XqAtw", "-h", "127.0.0.1", "-U", "rootyard",
+                              "-d", db, "-v", "ON_ERROR_STOP=1", "-c", sql, capture=kind is not None)
+              require(result.returncode == 0)
+              if kind == "boolean":
+                  require(result.stdout in (b"t\n", b"f\n"))
+                  return result.stdout == b"t\n"
+              if kind == "version":
+                  require(re.fullmatch(rb"17[0-9]{4}\n", result.stdout))
+                  return int(result.stdout)
+
+          def exists(db):
+              return admin("postgres", f"SELECT EXISTS (SELECT FROM pg_database WHERE datname = '{db}');", "boolean")
+
+          def run():
+              state = initial()
+              save(state)
+              archive = source_archive(state)
+              state["pg_version_num"] = admin("postgres", "SELECT current_setting('server_version_num');", "version")
+              db = database_prefix() + secrets.token_hex(6)
+              require(not exists(db))
+              state["db"] = db
+              save(state)
+              admin("postgres", f'CREATE DATABASE "{db}" TEMPLATE template0;')
+              state.update(created=True, invocations=None, phase="interrupted")
+              save(state)
+              fixture = r'''
+          set -eu
+          dir=$(mktemp -d)
+          trap 'rm -rf -- "$dir"' EXIT
+          tar -xf - -C "$dir"
+          command -v timeout >/dev/null
+          command -v psql >/dev/null
+          status=0
+          timeout -k 3s 45s psql -Xqw -h 127.0.0.1 -U rootyard -d "$1" -v ON_ERROR_STOP=1 \
+            -f "$dir/$2" >/dev/null 2>&1 || status=$?
+          printf 'fixture\n'
+          exit "$status"
+          '''
+              try:
+                  result = docker("sh", "-c", fixture, "sh", db, FIXTURE, data=archive, capture=True, limit=65)
+              except subprocess.TimeoutExpired:
+                  state["phase"] = "fixture_timeout"
+              else:
+                  counted = result.stdout == b"fixture\n"
+                  state["invocations"] = 1 if counted else None
+                  state["session_ended"] = counted and result.returncode in (0, 1, 2, 3)
+                  if counted and result.returncode == 0:
+                      state["phase"] = "fixture_passed"
+                  elif result.returncode in (124, 137):
+                      state["phase"] = "fixture_timeout"
+                  else:
+                      state["phase"] = "fixture_failed"
+              save(state)
+              return state["phase"] == "fixture_passed"
+
+          def sessions_drained(db):
+              stop_at = time.monotonic() + 3
+              while admin("postgres", f"SELECT EXISTS (SELECT FROM pg_stat_activity WHERE datname = '{db}');", "boolean"):
+                  if time.monotonic() >= stop_at:
+                      return False
+                  time.sleep(0.05)
+              return True
+
+          def cleanup(state):
+              db = state["db"]
+              if db is None:
+                  return "not_checked", "not_created"
+              require(re.fullmatch(re.escape(database_prefix()) + r"[0-9a-f]{12}", db))
+              schema = "unproven"
+              try:
+                  if (state["invocations"] == 0 or state["session_ended"]) and exists(db) and sessions_drained(db):
+                      present = admin(db, "SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'issue42_schema_contract');",
+                                      "boolean")
+                      schema = "present" if present else "absent"
+              except Exception:
+                  pass
+              database = "unproven"
+              try:
+                  admin("postgres", f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE);')
+                  if not exists(db):
+                      database = "dropped" if state["created"] else "absent"
+              except Exception:
+                  pass
+              return schema, database
+
+          def finalize():
+              state = json.loads(STATE.read_text(encoding="ascii")) if STATE.exists() else initial()
+              schema, database = cleanup(state)
+              verdict = state["phase"]
+              require(verdict in ("source_failed", "setup_failed", "interrupted", "fixture_timeout", "fixture_failed", "fixture_passed"))
+              count, version = state["invocations"], state["pg_version_num"]
+              require(count is None or type(count) is int and count in (0, 1))
+              require(version is None or type(version) is int and 170000 <= version < 180000)
+              if verdict == "fixture_passed":
+                  verdict = "passed" if (count, schema, database) == (1, "absent", "dropped") else "cleanup_failed"
+              elif database == "unproven" or schema == "present" or (state["session_ended"] and schema != "absent"):
+                  verdict = "cleanup_failed"
+              source = digest(state["source"], 40)
+              report = {
+                  "version": 1, "scope": "schema_contract", "verdict": verdict,
+                  "trigger_sha": digest(os.getenv("TRIGGER_SHA"), 40), "workflow_sha": digest(os.getenv("WORKFLOW_SHA"), 40),
+                  "source_sha": source, "source_tree": digest(state["tree"], 40),
+                  "parent_sha": PARENT_SHA, "parent_tree": PARENT_TREE, "inputs_sha256": INPUTS if source else {},
+                  "pg_version_num": version, "fixture_invocations": count, "schema": schema, "database": database,
+              }
+              (WORK / "outcome.json").write_text(json.dumps(report, sort_keys=True) + "\n", encoding="ascii")
+              return verdict == "passed"
+
+          if __name__ == "__main__":
+              try:
+                  ok = {"run": run, "finalize": finalize}[sys.argv[1]]()
+              except Exception:
+                  ok = False
+              sys.exit(0 if ok else 1)
+          PY
+      - uses: actions/checkout@v4
+        timeout-minutes: 3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Run the schema contract once
+        timeout-minutes: 3
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: python3 "$RUNNER_TEMP/issue42-schema-contract/verify.py" run
+      - name: Verify rollback and dispose of the owned database
+        if: always()
+        timeout-minutes: 2
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: python3 "$RUNNER_TEMP/issue42-schema-contract/verify.py" finalize
+      - uses: actions/upload-artifact@v4
+        if: always()
+        timeout-minutes: 2
+        with:
+          name: issue42-schema-contract-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue42-schema-contract/outcome.json
+          if-no-files-found: error
+          retention-days: 7
