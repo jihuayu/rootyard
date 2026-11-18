@@ -37,7 +37,13 @@ use super::{
     snapshot,
     state::BlobGitState,
 };
-use crate::ref_store::{CommitMode, CommitRejectCode, RefCommitResult};
+use crate::{
+    namespace_service::push_causal_stream::{
+        GatewayPairSummary, GatewayReceiptArgs, finalize_gateway_receipt, record_gateway_reclaim_failure,
+        record_gateway_staging_inflight, spool_receive_stream_shared_deadline, verify_gateway_authority_closure,
+    },
+    ref_store::{CommitMode, CommitRejectCode, RefCommitResult},
+};
 
 const MAX_NEW_PACKS: usize = 8;
 
@@ -83,7 +89,7 @@ async fn receive_pack_authorized(
     let work = state.temp_dir("receive")?;
     let request_path = work.path().join("request.bin");
     let encoding = content_encoding(&headers)?;
-    let received = native::spool_body_with_encoding(
+    let (received, streamed_prefix) = spool_receive_stream_shared_deadline(
         body,
         &request_path,
         state.limits().max_request_bytes,
@@ -96,7 +102,10 @@ async fn receive_pack_authorized(
         return Err(GatewayError::BadRequest("push request is truncated"));
     }
     let prefix = native::read_prefix(&request_path, protocol::MAX_COMMAND_BYTES).await?;
-    let request = protocol::parse_push(&prefix, format)?;
+    if !prefix.starts_with(&streamed_prefix) {
+        return Err(GatewayError::Internal("spooled push command prefix disagrees with streamed pkt-lines"));
+    }
+    let request = protocol::parse_push(&streamed_prefix, format)?;
     let mode = if request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset };
     let digest =
         operation::request_digest(repository_id, operation, format, &request, mode, &request_path, deadline).await?;
@@ -128,9 +137,19 @@ async fn receive_pack_authorized(
         Claim::Fresh => {}
     }
 
-    // Real sealed read view; the native process sees the exact refs/bytes of the
-    // pack-aware snapshot, never a legacy working copy.
+    // Real sealed read view; verify authority snapshot closure before building
+    // the native Git view so base packs never skip closure verification.
+    let backend_hex = state.store().backend_identity().as_hex();
     let refs = snapshot::load_ref_view(&state, &serving, deadline).await?;
+    let closure_ctx =
+        match verify_gateway_authority_closure(&serving.gate, &identity, refs.handle.as_ref(), &refs.refs, backend_hex)
+        {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                snapshot::release_view(&state, &refs, deadline).await;
+                return Err(error);
+            }
+        };
     let view = snapshot::build_view(&state, &refs, deadline).await?;
     let before = pack_stems(view.repo())?;
 
@@ -156,9 +175,24 @@ async fn receive_pack_authorized(
         return Err(GatewayError::TooLarge);
     }
     let mut pairs = Vec::with_capacity(new_pairs.len());
+    let mut pair_summaries = Vec::with_capacity(new_pairs.len());
     for (pack, idx) in new_pairs {
-        pairs.push(Pair::stage(pack, idx, operation).await?);
+        let staged = Pair::stage(pack, idx, operation).await?;
+        pair_summaries.push(GatewayPairSummary {
+            pack_sha256: staged.pack_sha.clone(),
+            pack_len: staged.pack_len,
+            idx_sha256: staged.idx_sha.clone(),
+            idx_len: staged.idx_len,
+        });
+        pairs.push(staged);
     }
+    record_gateway_staging_inflight(
+        state.scratch_root(),
+        operation,
+        &closure_ctx.snapshot,
+        backend_hex,
+        &pair_summaries,
+    )?;
 
     let published =
         publish::push(&state, &serving, &identity, operation, digest, &request, &pairs, mode, deadline).await;
@@ -167,6 +201,15 @@ async fn receive_pack_authorized(
         // Git report-status. Mixed/accepted-subset terminals are replayed
         // exactly as recorded.
         Ok(PushOutcome::Terminal(terminal)) => {
+            finalize_gateway_receipt(GatewayReceiptArgs {
+                scratch_root: state.scratch_root(),
+                operation_id: operation,
+                issuer_id: identity.id,
+                closure: &closure_ctx,
+                pairs: &pair_summaries,
+                backend_hex,
+                terminal: &terminal,
+            })?;
             let results = report_results(&request, &terminal)?;
             let body = protocol::report_status(request.wants_report(), &results);
             committed_response(CommittedResponse {
@@ -183,12 +226,16 @@ async fn receive_pack_authorized(
             .await
         }
         Ok(PushOutcome::Cancelled(reason)) => {
+            record_gateway_reclaim_failure(state.scratch_root(), operation, &GatewayError::Conflict(reason));
             let results = cancelled_results(&request, reason);
             terminal_response(&request, &results, operation)
         }
         // Contention, an unverified adapter and an unknown COMMIT stay HTTP
         // errors with the operation header; they never become `ng`/`ok`.
-        Err(error) => Err(error),
+        Err(error) => {
+            record_gateway_reclaim_failure(state.scratch_root(), operation, &error);
+            Err(error)
+        }
     }
 }
 

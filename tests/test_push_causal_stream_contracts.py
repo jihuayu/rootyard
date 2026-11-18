@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import re
+import tempfile
 import unittest
 
 try:
@@ -14,9 +16,11 @@ except ImportError:  # pragma: no cover
 
 ROOT = Path(__file__).resolve().parents[1]
 RUST_FILES = [
+    ROOT / "src" / "blob_git_gateway" / "receive.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "types.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "receipt.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "reclaim.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "protocol.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "quarantine.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "git_proc.rs",
@@ -24,11 +28,16 @@ RUST_FILES = [
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "git_verify.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "closure_prove.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "commit_gate.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "pg_producer.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "pg_producer_plan.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_stream.rs",
+    ROOT / "src" / "namespace_service" / "push_causal_stream" / "gateway_bridge.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "sm_commands.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "sm_executor.rs",
     ROOT / "src" / "namespace_service" / "push_causal_stream" / "unit_tests.rs",
     ROOT / "tests" / "push_causal_stream.rs",
     ROOT / "tests" / "push_causal_stream" / "support.rs",
+    ROOT / "tests" / "push_causal_stream" / "pg_http_gateway.rs",
 ]
 WORKFLOW = ROOT / ".github" / "workflows" / "push-causal-stream.yml"
 DOC = ROOT / "docs" / "push-causal-stream.md"
@@ -40,6 +49,8 @@ class PushCausalStreamContractsTest(unittest.TestCase):
         facade = (ROOT / "src" / "namespace_service.rs").read_text(encoding="utf-8")
         self.assertIn("pub mod push_causal_stream;", facade)
         self.assertLess(len(facade.splitlines()), 100)
+        stream_facade = (ROOT / "src" / "namespace_service" / "push_causal_stream.rs").read_text(encoding="utf-8")
+        self.assertLess(len(stream_facade.splitlines()), 100)
         self.assertFalse(list((ROOT / "src" / "namespace_service").rglob("mod.rs")))
 
         for path in RUST_FILES:
@@ -51,7 +62,17 @@ class PushCausalStreamContractsTest(unittest.TestCase):
                 self.assertLess(len(lines), 500, f"{path.name} reached {len(lines)} lines (must stay < 500)")
                 self.assertNotIn("#[allow(", text, f"lint suppression forbidden in {path.name}")
 
-        for src_name in ("types.rs", "receipt.rs", "protocol.rs", "quarantine.rs"):
+        receive_src = (ROOT / "src" / "blob_git_gateway" / "receive.rs").read_text(encoding="utf-8")
+        self.assertIn("spool_receive_stream_shared_deadline", receive_src)
+        self.assertIn("verify_gateway_authority_closure", receive_src)
+        self.assertIn("finalize_gateway_receipt", receive_src)
+
+        commit_gate_src = (ROOT / "src" / "namespace_service" / "push_causal_stream" / "commit_gate.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("pg.commit_refs(", commit_gate_src)
+
+        for src_name in ("types.rs", "receipt.rs", "reclaim.rs", "protocol.rs", "quarantine.rs"):
             src = (ROOT / "src" / "namespace_service" / "push_causal_stream" / src_name).read_text(encoding="utf-8")
             structs = list(
                 re.finditer(
@@ -82,6 +103,7 @@ class PushCausalStreamContractsTest(unittest.TestCase):
             self.assertNotIn("push", on_cfg)
             paths = on_cfg["pull_request"]["paths"]
             for required in (
+                "src/blob_git_gateway/receive.rs",
                 "src/namespace_service.rs",
                 "src/namespace_service/push_causal_stream.rs",
                 "src/namespace_service/push_causal_stream/**",
@@ -93,23 +115,28 @@ class PushCausalStreamContractsTest(unittest.TestCase):
 
         for token in (
             "64a6ee6a47acfa82b1ed930d7cd55e56dc30c30b",
+            "postgres:17",
             "scripts/install_ci_cargo_fork.sh install",
             "scripts/install_ci_cargo_fork.sh verify",
             "cargo test --locked --no-default-features --lib namespace_service::push_causal_stream",
-            "cargo test --locked --no-default-features --test push_causal_stream",
+            "cargo test --locked --no-default-features --test push_causal_stream -- --ignored",
             "scripts/eval_push_causal_stream.py",
         ):
             self.assertIn(token, wf_text)
 
         doc_text = DOC.read_text(encoding="utf-8")
-        for expected in ("Refs #183", "CausalPushProofReceipt", "OverlappedPipeline", "#164", "SHA-256"):
+        for expected in (
+            "Refs #183",
+            "CausalPushProofReceipt",
+            "QuarantineReclaimLedger",
+            "PgAuthorizedCommit",
+            "#164",
+            "SHA-256",
+        ):
             self.assertIn(expected, doc_text)
         self.assertLess(len(doc_text.splitlines()), 500)
 
     def test_eval_script_runs_and_reports_overlap_vs_naive_repack(self) -> None:
-        import json
-        import tempfile
-
         spec = importlib.util.spec_from_file_location("eval_push_causal_stream", EVAL_SCRIPT)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)

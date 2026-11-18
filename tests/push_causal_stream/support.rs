@@ -267,6 +267,20 @@ pub fn dl() -> Instant {
     Instant::now() + Duration::from_secs(30)
 }
 
+pub fn chunked_stream(wire: Vec<u8>) -> tokio::io::DuplexStream {
+    let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        for chunk in wire.chunks(4096) {
+            if writer.write_all(chunk).await.is_err() {
+                break;
+            }
+        }
+        let _ = writer.shutdown().await;
+    });
+    reader
+}
+
 pub type UploadedPair = (BlobLocator, String, u64, BlobLocator, String, u64);
 
 pub async fn upload_git_pack(

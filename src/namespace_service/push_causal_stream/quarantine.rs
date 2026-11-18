@@ -12,15 +12,14 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::blob_store::capacity_contract::git_ops::{UploadScope, upload_pack_pair};
-use crate::blob_store::closure::{
-    BlobClosureEncryption, BlobClosureProof, BlobClosureSpec, ClosureArtifactRole, ClosureEntrySpec,
-};
+use crate::blob_store::closure::BlobClosureProof;
 use crate::blob_store::opendal::BlobStore;
-use crate::blob_store::{BlobError, BlobLocator, BlobReceipt};
+use crate::blob_store::{BlobLocator, BlobReceipt};
 use crate::ref_store::core::types::GitObjectFormat;
 
-use super::types::{PushCausalError, STREAM_CHUNK_BYTES, StreamIngestLimits};
+pub use super::reclaim::CapacityContractBlobCarrier;
+use super::reclaim::QuarantineReclaimLedger;
+use super::types::{FaultInjectionHook, PushCausalError, STREAM_CHUNK_BYTES, StreamIngestLimits};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -320,11 +319,14 @@ pub struct UploadedQuarantinePack {
 
 /// Artifact bundle queued for quarantined OpenDAL Blob publication.
 pub struct QuarantineArtifactSet<'a> {
+    pub operation_id: Uuid,
     pub tenant_id: Uuid,
     pub repository_id: Uuid,
     pub generation: i64,
     pub pack_path: &'a Path,
     pub idx_path: &'a Path,
+    pub reclaim_ledger: Option<&'a QuarantineReclaimLedger>,
+    pub fault_hook: FaultInjectionHook,
 }
 
 /// Pluggable carrier preserving `#113` `ProtectedUploader`/`ArtifactHold` boundaries outside `blob_store`.
@@ -337,77 +339,6 @@ pub trait PushBlobCarrier: Send + Sync {
     ) -> BoxFuture<'a, Result<UploadedQuarantinePack, PushCausalError>>;
 }
 
-/// Default OpenDAL S3/provider carrier delegating PUT + full read-back closure proof to `blob_store`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CapacityContractBlobCarrier;
-
-impl PushBlobCarrier for CapacityContractBlobCarrier {
-    fn upload_and_verify_closure<'a>(
-        &'a self,
-        store: &'a BlobStore,
-        artifacts: QuarantineArtifactSet<'a>,
-        deadline: Instant,
-    ) -> BoxFuture<'a, Result<UploadedQuarantinePack, PushCausalError>> {
-        Box::pin(async move {
-            let started = Instant::now();
-            let generation = artifacts.generation.max(1);
-            let scope =
-                UploadScope { tenant_id: artifacts.tenant_id, authority_id: artifacts.repository_id, generation };
-            let pair = upload_pack_pair(store, scope, artifacts.pack_path, artifacts.idx_path, deadline)
-                .await
-                .map_err(|e| PushCausalError::Io(e.to_string()))?;
-
-            let entries = vec![
-                ClosureEntrySpec::provider_managed(ClosureArtifactRole::Pack, pair.pack_receipt.locator().clone())
-                    .with_expected_plaintext(&pair.pack_sha256, pair.pack_length)?,
-                ClosureEntrySpec::provider_managed(ClosureArtifactRole::PackIndex, pair.idx_receipt.locator().clone())
-                    .with_expected_plaintext(&pair.idx_sha256, pair.idx_length)?,
-            ];
-            let spec = BlobClosureSpec::new(
-                artifacts.tenant_id,
-                artifacts.repository_id,
-                generation,
-                BlobClosureEncryption::ProviderManaged,
-                entries,
-            )?;
-            let closure_proof = store.verify_closure(&spec, None, None, deadline).await?;
-            if !closure_proof.has_git_pack_pair() {
-                return Err(PushCausalError::Blob(BlobError::ForeignBackend));
-            }
-            let digest = compute_blob_closure_digest(store, &pair.pack_receipt, &pair.idx_receipt);
-            Ok(UploadedQuarantinePack {
-                pack_receipt: pair.pack_receipt,
-                idx_receipt: pair.idx_receipt,
-                pack_sha256: pair.pack_sha256,
-                pack_bytes: pair.pack_length,
-                idx_sha256: pair.idx_sha256,
-                idx_bytes: pair.idx_length,
-                closure_proof,
-                blob_closure_digest: digest,
-                upload_ms: elapsed_ms(started),
-            })
-        })
-    }
-}
-
-fn compute_blob_closure_digest(store: &BlobStore, pack: &BlobReceipt, idx: &BlobReceipt) -> String {
-    let mut h = Sha256::new();
-    h.update(b"push-blob-closure-v1\n");
-    let pack_path = pack.locator().path();
-    let idx_path = idx.locator().path();
-    for s in [
-        store.backend_identity().as_hex(),
-        pack_path.as_str(),
-        pack.verified_sha256(),
-        idx_path.as_str(),
-        idx.verified_sha256(),
-    ] {
-        h.update((s.len() as u64).to_be_bytes());
-        h.update(s.as_bytes());
-    }
-    hex::encode(h.finalize())
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
+pub(super) fn elapsed_ms(started: Instant) -> u64 {
     Duration::from_nanos(started.elapsed().as_nanos().min(u64::MAX as u128) as u64).as_millis() as u64
 }

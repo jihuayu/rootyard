@@ -2,6 +2,7 @@
 //! advertisement policy, and `report-status` / `report-status-v2` wire encoder.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use async_compression::tokio::bufread::GzipDecoder;
 use serde::{Deserialize, Serialize};
@@ -80,13 +81,29 @@ pub struct AdvertisementDecision {
     pub fallback_reason: Option<String>,
 }
 
+async fn read_exact_until<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    buf: &mut [u8],
+    deadline: Instant,
+    eof_context: &'static str,
+) -> Result<(), PushCausalError> {
+    let remaining = deadline.checked_duration_since(Instant::now()).ok_or(PushCausalError::DeadlineExceeded)?;
+    tokio::time::timeout(remaining, reader.read_exact(buf))
+        .await
+        .map_err(|_| PushCausalError::DeadlineExceeded)?
+        .map(|_| ())
+        .map_err(|e| PushCausalError::MalformedProtocol(format!("{eof_context}: {e}")))
+}
+
 /// Stream only the Smart HTTP `receive-pack` pkt-line command block without buffering
-/// the trailing pack bytes into RAM. Returns the remaining reader positioned at `PACK`.
+/// the trailing pack bytes into RAM, enforcing the shared end-to-end `deadline` across
+/// every header and payload read. Returns the remaining reader positioned at `PACK`.
 pub async fn decode_receive_pack_stream<R>(
     reader: R,
     gzipped: bool,
     object_format: GitObjectFormat,
     limits: &StreamIngestLimits,
+    deadline: Instant,
 ) -> Result<DecodedReceiveStream, PushCausalError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -107,10 +124,7 @@ where
 
     loop {
         let mut len_buf = [0u8; 4];
-        decoder
-            .read_exact(&mut len_buf)
-            .await
-            .map_err(|e| PushCausalError::MalformedProtocol(format!("incomplete pkt-line header: {e}")))?;
+        read_exact_until(decoder.as_mut(), &mut len_buf, deadline, "incomplete pkt-line header").await?;
         command_bytes_read = command_bytes_read.saturating_add(4);
         if command_bytes_read > limits.max_command_bytes || (command_bytes_read as u64) > limits.max_stream_bytes {
             return Err(PushCausalError::LimitExceeded("receive-pack command block exceeded stream/command budget"));
@@ -134,10 +148,7 @@ where
             return Err(PushCausalError::LimitExceeded("receive-pack command block exceeded stream/command budget"));
         }
         let mut payload = vec![0u8; payload_len];
-        decoder
-            .read_exact(&mut payload)
-            .await
-            .map_err(|e| PushCausalError::MalformedProtocol(format!("truncated pkt-line payload: {e}")))?;
+        read_exact_until(decoder.as_mut(), &mut payload, deadline, "truncated pkt-line payload").await?;
         let text = payload.strip_suffix(b"\n").unwrap_or(&payload);
         if text.starts_with(b"shallow ") {
             if !limits.allow_shallow {

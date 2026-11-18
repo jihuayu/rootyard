@@ -1,14 +1,15 @@
-//! Pre-commit authorization checks and PostgreSQL Ref-CAS bridge over verified receipts (#183).
+//! Pre-commit authorization checks, Ref-CAS request builder, and wire report encoder (#183).
+//!
+//! PostgreSQL commits MUST flow through [`super::pg_producer::commit_push_on_pg`], which
+//! enforces a live migration-144 scoped decision (`PgAuthorizedCommit` / `PgAuthorizedMetadata`)
+//! and durable A3 artifact holds (`PgArtifactHoldStore`), never raw `PgRefStoreCore::commit_refs`.
 
 use std::time::Instant;
 
-use tokio_postgres::Client;
 use uuid::Uuid;
 
 use crate::blob_store::opendal::BlobStore;
-use crate::ref_store::contract::RefStoreError;
 use crate::ref_store::core::command::CommitRefsRequest;
-use crate::ref_store::core::pg::PgRefStoreCore;
 use crate::ref_store::core::ref_version::VersionGraph;
 use crate::ref_store::core::state_machine::{RefCasStateMachine, ScopeLifecycle};
 use crate::ref_store::core::terminal::{CommitRefsReceipt, CommitRejectCode, RefCommitResult};
@@ -17,10 +18,13 @@ use crate::ref_store::core::types::{GitOid, HeadUpdate, RefName, RefPrecondition
 use super::protocol::encode_receive_pack_report;
 use super::quarantine::{OperationHoldGuard, PushBlobCarrier};
 use super::receipt::{CausalPushProofReceipt, commit_mode_from_capabilities};
+use super::reclaim::QuarantineReclaimLedger;
 use super::types::{
     AuthorizedSnapshotState, BranchPolicy, FaultInjectionHook, GitSubprocessLimits, LfsPolicy, OperationTicket,
     PackPipelineMode, PushAuthContext, PushCausalError, PushStageTelemetry, ReceiveCapabilities, StreamIngestLimits,
 };
+
+pub use super::pg_producer::{PgScopedPushOutcome, PgScopedPushParams, commit_push_on_pg};
 
 pub(super) const REF_CHANGED_REASON: &str = "ref changed; retry from current refs";
 
@@ -56,7 +60,8 @@ pub fn evaluate_push_auth_precheck(
     Ok(())
 }
 
-/// Convert a verified [`CausalPushProofReceipt`] into a PG/Raft [`CommitRefsRequest`].
+/// Convert a verified [`CausalPushProofReceipt`] into a PG/Raft [`CommitRefsRequest`],
+/// checking exact `(operation_id, snapshot, ticket, backend)` scope binding first.
 pub fn build_pg_commit_request(
     receipt: &CausalPushProofReceipt,
     snapshot: &AuthorizedSnapshotState,
@@ -64,7 +69,7 @@ pub fn build_pg_commit_request(
     capabilities: &ReceiveCapabilities,
     store_backend_identity_hex: &str,
 ) -> Result<CommitRefsRequest, PushCausalError> {
-    receipt.verify_scope(snapshot, store_backend_identity_hex)?;
+    receipt.verify_scope(snapshot, ticket, store_backend_identity_hex)?;
     if receipt.accepted_updates.is_empty() {
         return Err(PushCausalError::MalformedProtocol("cannot build CommitRefsRequest for zero updates".into()));
     }
@@ -103,54 +108,13 @@ pub fn build_pg_commit_request(
     Ok(req)
 }
 
-/// Execute proven Ref-CAS against PostgreSQL (`PgRefStoreCore`) keeping holds intact on `CommitUnknown`.
-pub async fn commit_push_on_pg(
-    pg: &PgRefStoreCore,
-    client: &mut Client,
-    store: &BlobStore,
-    snapshot: &AuthorizedSnapshotState,
-    ticket: &OperationTicket,
-    auth: &PushAuthContext,
-    capabilities: &ReceiveCapabilities,
-    receipt: &CausalPushProofReceipt,
-    hold_guard: &mut OperationHoldGuard,
-    deadline: tokio::time::Instant,
-) -> Result<(CommitRefsReceipt, Vec<u8>), PushCausalError> {
-    evaluate_push_auth_precheck(auth, snapshot.repository_id, None, FaultInjectionHook::None)?;
-    let req = build_pg_commit_request(receipt, snapshot, ticket, capabilities, store.backend_identity().as_hex())?;
-    match pg.commit_refs(client, &req, deadline).await {
-        Ok(commit_receipt) => {
-            if commit_receipt.is_committed()
-                || commit_receipt.terminal.refs.iter().any(|r| matches!(r, RefCommitResult::Applied { .. }))
-            {
-                hold_guard.mark_committed()?;
-            } else {
-                hold_guard.release_on_proven_abort()?;
-            }
-            let wire = report_status_from_pg_receipt(capabilities, &commit_receipt)?;
-            Ok((commit_receipt, wire))
-        }
-        Err(RefStoreError::CommitUnknown { operation_id, .. }) => {
-            hold_guard.mark_unknown_outcome();
-            Err(PushCausalError::CommitUnknown {
-                operation_id: operation_id.unwrap_or(ticket.operation_id),
-                detail: "PG CommitUnknown; holds retained for idempotent operation recovery".into(),
-            })
-        }
-        Err(other) => {
-            hold_guard.release_on_proven_abort()?;
-            Err(PushCausalError::RefStore(other))
-        }
-    }
-}
-
 /// Render Git `report-status` / `report-status-v2` wire output strictly matching CAS commit outcome.
-pub fn report_status_from_pg_receipt(
+pub fn report_status_from_terminal_refs(
     capabilities: &ReceiveCapabilities,
-    receipt: &CommitRefsReceipt,
+    terminal_refs: &[RefCommitResult],
 ) -> Result<Vec<u8>, PushCausalError> {
-    let mut statuses: Vec<(&str, Result<(), &str>)> = Vec::with_capacity(receipt.terminal.refs.len());
-    for entry in &receipt.terminal.refs {
+    let mut statuses: Vec<(&str, Result<(), &str>)> = Vec::with_capacity(terminal_refs.len());
+    for entry in terminal_refs {
         match entry {
             RefCommitResult::Applied { name, .. } => statuses.push((name.as_str(), Ok(()))),
             RefCommitResult::NotApplied { name, reason } => {
@@ -163,6 +127,14 @@ pub fn report_status_from_pg_receipt(
         }
     }
     encode_receive_pack_report(capabilities, Ok(()), &statuses)
+}
+
+/// Render Git `report-status` / `report-status-v2` wire output from a [`CommitRefsReceipt`].
+pub fn report_status_from_pg_receipt(
+    capabilities: &ReceiveCapabilities,
+    receipt: &CommitRefsReceipt,
+) -> Result<Vec<u8>, PushCausalError> {
+    report_status_from_terminal_refs(capabilities, &receipt.terminal.refs)
 }
 
 /// Complete push execution input against `StateMachinePushExecutor`.
@@ -180,6 +152,7 @@ pub struct PushExecutionInput<'a, R> {
     pub pipeline_mode: PackPipelineMode,
     pub ingest_limits: &'a StreamIngestLimits,
     pub proc_limits: &'a GitSubprocessLimits,
+    pub reclaim_ledger: Option<&'a QuarantineReclaimLedger>,
     pub fault_hook: FaultInjectionHook,
     pub deadline: Instant,
 }

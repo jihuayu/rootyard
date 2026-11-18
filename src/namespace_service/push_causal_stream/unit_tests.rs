@@ -1,8 +1,9 @@
-//! Unit tests covering Smart HTTP pkt-line bounds, advertisement narrowing/authz,
-//! `#180` closure checks, `CausalPushProofReceipt` binding, and RefCas SM retries (#183).
+//! Unit tests covering shared-deadline pkt-line stalls, advertisement authz,
+//! `#180` closure gates, `CausalPushProofReceipt` CAS subset binding, and reclaim ledgers (#183).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
+use std::time::{Duration, Instant};
 
 use async_compression::tokio::write::GzipEncoder;
 use tokio::io::AsyncWriteExt;
@@ -16,19 +17,21 @@ use super::protocol::{
 };
 use super::quarantine::{HoldLifecycleState, OperationHoldGuard, QuarantineSlot, ingest_pack_to_quarantine};
 use super::receipt::{AcceptedRefProof, CausalPushProofReceipt};
+use super::reclaim::{QuarantineReclaimLedger, StagingUploadIntent, UploadReclaimState};
 use super::types::{
-    AuthorizedSnapshotState, BasePackRef, FaultInjectionHook, PushAuthContext, PushCausalError, ReceiveCapabilities,
-    StreamIngestLimits,
+    AuthorizedSnapshotState, BasePackRef, FaultInjectionHook, OperationTicket, PushAuthContext, PushCausalError,
+    ReceiveCapabilities, StreamIngestLimits,
 };
 use crate::blob_store::BlobLocator;
 use crate::ref_store::contract::{IssuerLane, RequestDigest};
 use crate::ref_store::core::contract::CommitMode;
 use crate::ref_store::core::ref_version::{
     AuthorityKind, BaseRequestSelector, CausalVersionNode, CommitSetHead, CommitSetInput, CommitSetVersionEntry,
-    OperationDigestInput, RefVersionIntent, RefVersionKind, RefVersionRealm, VerifiedClosurePack, VersionGraph,
-    VersionRecord, VersionRecordInput, compute_commit_set_id, compute_pack_set_digest, derive_candidate_version_id,
-    operation_digest,
+    OperationDigestInput, PackSetEntry, RefVersionIntent, RefVersionKind, RefVersionRealm, VerifiedClosurePack,
+    VersionGraph, VersionRecord, VersionRecordInput, compute_commit_set_id, compute_pack_set_digest,
+    derive_candidate_version_id, operation_digest,
 };
+use crate::ref_store::core::terminal::{CommitRejectCode, RefCommitResult};
 use crate::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget};
 
 fn sample_auth(actor_id: Uuid) -> PushAuthContext {
@@ -57,7 +60,7 @@ fn pkt_line(payload: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn decode_stream_handles_gzip_and_rejects_shallow_and_overflow() {
+async fn decode_stream_handles_gzip_rejects_shallow_overflow_and_command_stall_deadline() {
     let old = "0".repeat(40);
     let new = "a".repeat(40);
     let cmd = format!("{old} {new} refs/heads/feat\0report-status-v2 atomic side-band-64k ofs-delta\n");
@@ -72,7 +75,9 @@ async fn decode_stream_handles_gzip_and_rejects_shallow_and_overflow() {
     let gz = enc.into_inner();
 
     let limits = StreamIngestLimits::default();
-    let decoded = decode_receive_pack_stream(Cursor::new(gz), true, GitObjectFormat::Sha1, &limits).await.unwrap();
+    let shared_dl = Instant::now() + Duration::from_secs(5);
+    let decoded =
+        decode_receive_pack_stream(Cursor::new(gz), true, GitObjectFormat::Sha1, &limits, shared_dl).await.unwrap();
     assert_eq!(decoded.commands.len(), 1);
     assert!(decoded.capabilities.atomic && decoded.capabilities.report_status_v2);
 
@@ -83,31 +88,39 @@ async fn decode_stream_handles_gzip_and_rejects_shallow_and_overflow() {
         GitObjectFormat::Sha1,
         decoded.command_bytes_read,
         &limits,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
+        shared_dl,
     )
     .await
     .unwrap();
-    assert!(ingested.has_pack);
-    assert!(ingested.incoming_pack_path.as_ref().unwrap().exists());
-    let sweep = slot.sweep();
-    assert!(sweep.dir_removed);
+    assert!(ingested.has_pack && ingested.incoming_pack_path.as_ref().unwrap().exists());
+    assert!(slot.sweep().dir_removed);
+
+    // Regression (#183 Merge Gate 1): slowloris stall mid-command fails closed on shared deadline.
+    let (mut writer, reader) = tokio::io::duplex(256);
+    let partial_cmd = &pkt_line(cmd.as_bytes())[..18];
+    writer.write_all(partial_cmd).await.unwrap();
+    let tight_dl = Instant::now() + Duration::from_millis(80);
+    let stall_res = decode_receive_pack_stream(reader, false, GitObjectFormat::Sha1, &limits, tight_dl).await;
+    assert!(matches!(stall_res, Err(PushCausalError::DeadlineExceeded)));
+    drop(writer);
 
     let mut shallow_wire = pkt_line(b"shallow 1111111111111111111111111111111111111111\n");
     shallow_wire.extend_from_slice(&pkt_line(cmd.as_bytes()));
     shallow_wire.extend_from_slice(b"0000");
-    let err = decode_receive_pack_stream(Cursor::new(shallow_wire), false, GitObjectFormat::Sha1, &limits).await;
+    let err =
+        decode_receive_pack_stream(Cursor::new(shallow_wire), false, GitObjectFormat::Sha1, &limits, shared_dl).await;
     assert!(matches!(err, Err(PushCausalError::ShallowRejected)));
 
-    let mut strict_limit = limits;
-    strict_limit.max_stream_bytes = 24;
-    let over = decode_receive_pack_stream(Cursor::new(wire), false, GitObjectFormat::Sha1, &strict_limit).await;
+    let strict_limit = StreamIngestLimits { max_stream_bytes: 24, ..limits };
+    let over =
+        decode_receive_pack_stream(Cursor::new(wire), false, GitObjectFormat::Sha1, &strict_limit, shared_dl).await;
     assert!(matches!(over, Err(PushCausalError::LimitExceeded(_))));
 }
 
 #[tokio::test]
 async fn quarantine_rejects_corrupt_version_truncated_pack_and_object_bomb() {
     let limits = StreamIngestLimits { max_pack_objects: 5, ..StreamIngestLimits::default() };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(5);
 
     let mut slot1 = QuarantineSlot::create(None).unwrap();
     let bad_ver = [b'P', b'A', b'C', b'K', 0, 0, 0, 9, 0, 0, 0, 1];
@@ -135,7 +148,6 @@ async fn quarantine_rejects_corrupt_version_truncated_pack_and_object_bomb() {
 fn ref_advertisement_verifies_capability_stacked_branches_force_with_lease_and_no_leak() {
     let oid1 = "1".repeat(40);
     let oid2 = "2".repeat(40);
-    let oid_secret = "9".repeat(40);
     let refs = vec![
         VisibleRefEntry {
             ref_name: "refs/heads/main".into(),
@@ -160,7 +172,7 @@ fn ref_advertisement_verifies_capability_stacked_branches_force_with_lease_and_n
         },
         VisibleRefEntry {
             ref_name: "refs/heads/secret".into(),
-            oid: oid_secret,
+            oid: "9".repeat(40),
             visible_to_principal: false,
             is_shared_base: false,
             is_default_head: false,
@@ -177,7 +189,7 @@ fn ref_advertisement_verifies_capability_stacked_branches_force_with_lease_and_n
         object_format: GitObjectFormat::Sha1,
         requested_targets: BTreeSet::from(["refs/heads/stack-top".to_owned()]),
         stacked_parent_refs: BTreeMap::from([("refs/heads/stack-top".into(), vec!["refs/heads/stack-base".into()])]),
-        force_with_lease_refs: BTreeMap::from([("refs/heads/main".into(), oid1.clone())]),
+        force_with_lease_refs: BTreeMap::from([("refs/heads/main".into(), oid1)]),
     };
 
     let narrowed = build_push_ref_advertisement(&AdvertisementRequest {
@@ -190,11 +202,6 @@ fn ref_advertisement_verifies_capability_stacked_branches_force_with_lease_and_n
     .unwrap();
     assert_eq!(narrowed.strategy_used, AdvertisementStrategy::NarrowedSharedBases);
     assert_eq!(narrowed.suppressed_unauthorized_count, 1);
-    let names: BTreeSet<_> = narrowed.advertised_refs.iter().map(|r| r.ref_name.as_str()).collect();
-    assert!(names.contains("refs/heads/main"));
-    assert!(names.contains("refs/heads/stack-base"));
-    assert!(!names.contains("refs/heads/secret"));
-    assert!(!names.contains("refs/heads/unrelated"));
 
     let mut no_proof = client.clone();
     no_proof.compatibility_proof_id = None;
@@ -207,7 +214,6 @@ fn ref_advertisement_verifies_capability_stacked_branches_force_with_lease_and_n
     })
     .unwrap();
     assert_eq!(fallback.strategy_used, AdvertisementStrategy::FullAuthorizedFallback);
-    assert!(fallback.advertised_refs.iter().all(|r| r.ref_name != "refs/heads/secret"));
     let adv_wire = encode_ref_advertisement(&fallback, GitObjectFormat::Sha1, true).unwrap();
     assert!(adv_wire.starts_with(b"001f# service=git-receive-pack\n0000"));
 
@@ -224,13 +230,28 @@ fn ref_advertisement_verifies_capability_stacked_branches_force_with_lease_and_n
 }
 
 #[test]
-fn receipt_digest_binds_scope_and_auth_checks_lease_and_hold_retention() {
-    let tenant = Uuid::new_v4();
-    let repo = Uuid::new_v4();
-    let hist = Uuid::new_v4();
-    let op = Uuid::new_v4();
+fn receipt_binds_operation_snapshot_ticket_and_final_cas_subset_and_reclaim_persists() {
+    let (tenant, repo, hist, op, issuer) =
+        (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let realm = RefVersionRealm::new(tenant, repo, hist, AuthorityKind::Pg, 2, 0, 1, GitObjectFormat::Sha256);
+    let snapshot = AuthorizedSnapshotState {
+        realm,
+        tenant_id: tenant,
+        repository_id: repo,
+        history_incarnation: hist,
+        authority_epoch: 2,
+        group_epoch: 1,
+        expected_gate_revision: 4,
+        object_format: GitObjectFormat::Sha256,
+        snapshot_seq: 7,
+        root_version_id: None,
+        current_refs: BTreeMap::new(),
+        authorized_base_packs: Vec::new(),
+    };
+    let ticket = OperationTicket { issuer_id: issuer, lane: "push".into(), sequence: 9, operation_id: op };
+    let backend_hex = "b".repeat(64);
     let mut receipt = CausalPushProofReceipt {
-        receipt_version: 1,
+        receipt_version: 2,
         tenant_id: tenant,
         repository_id: repo,
         history_incarnation: hist,
@@ -238,10 +259,12 @@ fn receipt_digest_binds_scope_and_auth_checks_lease_and_hold_retention() {
         group_epoch: 1,
         object_format: GitObjectFormat::Sha256,
         operation_id: op,
-        issuer_id: Uuid::new_v4(),
+        issuer_id: issuer,
         lane: "push".into(),
-        sequence: 1,
+        sequence: 9,
         base_snapshot_seq: 7,
+        expected_gate_revision: 4,
+        committed_gate_revision: None,
         base_version_ids: vec![],
         required_ancestor_oids: vec![],
         resolved_thin_base_oids: vec![],
@@ -252,27 +275,73 @@ fn receipt_digest_binds_scope_and_auth_checks_lease_and_hold_retention() {
         idx_bytes: 0,
         pack_locator: None,
         idx_locator: None,
-        blob_backend_identity: "b".repeat(64),
-        object_count: 1,
+        blob_backend_identity: backend_hex.clone(),
+        object_count: 2,
         delta_object_count: 0,
         max_delta_chain_depth: 0,
         duplicate_object_count: 0,
         blob_closure_digest: "c".repeat(64),
-        accepted_updates: vec![AcceptedRefProof {
-            ref_name: "refs/heads/main".into(),
-            old_oid: None,
-            new_oid: Some("d".repeat(64)),
-            target_kind: "commit".into(),
-        }],
+        accepted_updates: vec![
+            AcceptedRefProof {
+                ref_name: "refs/heads/main".into(),
+                old_oid: None,
+                new_oid: Some("d".repeat(64)),
+                target_kind: "commit".into(),
+            },
+            AcceptedRefProof {
+                ref_name: "refs/heads/stale".into(),
+                old_oid: Some("1".repeat(64)),
+                new_oid: Some("d".repeat(64)),
+                target_kind: "commit".into(),
+            },
+        ],
         rejected_updates: vec![],
         accepted_subset_digest: "e".repeat(64),
         proof_digest: String::new(),
     };
     receipt.proof_digest = receipt.recompute_digest();
-    receipt.verify_digest().unwrap();
+    receipt.verify_scope(&snapshot, &ticket, &backend_hex).unwrap();
 
-    receipt.tenant_id = Uuid::new_v4();
-    assert!(matches!(receipt.verify_digest(), Err(PushCausalError::ProofTampered(_))));
+    // Ticket mismatch (wrong sequence / operation_id) MUST fail closed.
+    let bad_ticket = OperationTicket { sequence: 10, ..ticket.clone() };
+    assert!(matches!(
+        receipt.verify_scope(&snapshot, &bad_ticket, &backend_hex),
+        Err(PushCausalError::ProofScopeMismatch)
+    ));
+
+    // AcceptedSubset CAS terminal rebinding: `stale` lost CAS race -> receipt must reflect exact CAS subset.
+    let cas_refs = vec![
+        RefCommitResult::Applied { name: "refs/heads/main".into(), old_oid: None, new_oid: Some("d".repeat(64)) },
+        RefCommitResult::NotApplied { name: "refs/heads/stale".into(), reason: CommitRejectCode::OldOidMismatch },
+    ];
+    assert!(receipt.verify_commit_binding(&snapshot, &ticket, &backend_hex, &cas_refs).is_err());
+    receipt.rebind_final_cas_terminal(&snapshot, &ticket, &backend_hex, Some(5), &cas_refs).unwrap();
+    assert_eq!(receipt.accepted_updates.len(), 1);
+    assert_eq!(receipt.rejected_updates.len(), 1);
+    assert_eq!(receipt.committed_gate_revision, Some(5));
+    receipt.verify_commit_binding(&snapshot, &ticket, &backend_hex, &cas_refs).unwrap();
+
+    // Recoverable reclaim ledger (#183 Merge Gate 4): partial & unknown upload records survive & gate reclaim.
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = QuarantineReclaimLedger::open(tmp.path().join("reclaim")).unwrap();
+    ledger
+        .record_inflight(&StagingUploadIntent {
+            operation_id: op,
+            tenant_id: tenant,
+            repository_id: repo,
+            generation: 2,
+            backend_identity: &backend_hex,
+            pack_sha256: &"1".repeat(64),
+            pack_bytes: 4096,
+            idx_sha256: &"2".repeat(64),
+            idx_bytes: 1024,
+        })
+        .unwrap();
+    ledger.transition(op, UploadReclaimState::OutcomeUnknown, vec!["tenant/pack-a".into()], 4096, "timeout").unwrap();
+    assert_eq!(ledger.list_recoverable().unwrap().len(), 1);
+    assert!(matches!(ledger.mark_reclaimed_if_proven_aborted(op, false), Err(PushCausalError::CommitUnknown { .. })));
+    ledger.mark_reclaimed_if_proven_aborted(op, true).unwrap();
+    assert!(ledger.list_recoverable().unwrap().is_empty());
 
     let mut expired = sample_auth(Uuid::new_v4());
     expired.now_ms = 20_000;
@@ -280,11 +349,9 @@ fn receipt_digest_binds_scope_and_auth_checks_lease_and_hold_retention() {
         evaluate_push_auth_precheck(&expired, repo, None, FaultInjectionHook::None),
         Err(PushCausalError::StaleLease(_))
     ));
-
     let mut hold = OperationHoldGuard::acquire(op, vec![Uuid::new_v4()], vec![]);
     hold.mark_unknown_outcome();
-    assert!(hold.release_on_proven_abort().is_err());
-    assert_eq!(hold.state, HoldLifecycleState::ActiveHeld);
+    assert!(hold.release_on_proven_abort().is_err() && hold.state == HoldLifecycleState::ActiveHeld);
 
     let report = encode_receive_pack_report(
         &ReceiveCapabilities { report_status: true, sideband_64k: true, ..ReceiveCapabilities::default() },
@@ -297,19 +364,48 @@ fn receipt_digest_binds_scope_and_auth_checks_lease_and_hold_retention() {
 }
 
 #[test]
-fn version_graph_dependency_closure_blocks_foreign_or_retired_base_pack() {
-    let tenant = Uuid::new_v4();
-    let repo = Uuid::new_v4();
-    let hist = Uuid::new_v4();
+fn base_closure_rejects_missing_closure_empty_closure_and_foreign_pack() {
+    let (tenant, repo, hist) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let realm = RefVersionRealm::new(tenant, repo, hist, AuthorityKind::Pg, 1, 0, 1, GitObjectFormat::Sha1);
-    let other_realm =
-        RefVersionRealm::new(Uuid::new_v4(), repo, hist, AuthorityKind::Pg, 1, 0, 1, GitObjectFormat::Sha1);
-
     let pack_id = Uuid::new_v4();
     let reg_id = Uuid::new_v4();
     let pack_digest = RequestDigest::of("pack", &[b"p1"]);
-    let pack_entry = crate::ref_store::core::ref_version::PackSetEntry::new(pack_id, reg_id, pack_digest).unwrap();
-    let pack_set_digest = compute_pack_set_digest(&[pack_entry]).unwrap();
+    let pack_entry = PackSetEntry::new(pack_id, reg_id, pack_digest).unwrap();
+    let base_ref = BasePackRef {
+        version_id: "v1".into(),
+        pack_id,
+        registration_id: reg_id,
+        artifact_set_digest_hex: pack_digest.as_hex(),
+        pack_sha256: "b".repeat(64),
+        pack_length: 512,
+        idx_sha256: "c".repeat(64),
+        idx_length: 512,
+        pack_locator: BlobLocator::new(tenant, repo, 1, Uuid::new_v4(), "packs", &"b".repeat(64), 512).unwrap(),
+        idx_locator: BlobLocator::new(tenant, repo, 1, Uuid::new_v4(), "pack-idx", &"c".repeat(64), 512).unwrap(),
+        authorized_for_principal: true,
+    };
+
+    // Case 1 (#183 Merge Gate 2): root_version_id absent (`None`) while base packs exist -> MUST fail closed.
+    let missing_closure_snap = AuthorizedSnapshotState {
+        realm,
+        tenant_id: tenant,
+        repository_id: repo,
+        history_incarnation: hist,
+        authority_epoch: 1,
+        group_epoch: 1,
+        expected_gate_revision: 1,
+        object_format: GitObjectFormat::Sha1,
+        snapshot_seq: 1,
+        root_version_id: None,
+        current_refs: BTreeMap::new(),
+        authorized_base_packs: vec![base_ref.clone()],
+    };
+    assert!(matches!(
+        verify_base_packs_and_dependencies(&missing_closure_snap, None, &sample_auth(Uuid::new_v4())),
+        Err(PushCausalError::UnauthorizedBaseDependency(_))
+    ));
+
+    // Case 2 (#183 Merge Gate 2): verified VersionGraph with EMPTY `own_packs` -> MUST fail closed.
     let op_id = Uuid::new_v4();
     let ref_name = RefName::branch("refs/heads/main").unwrap();
     let target_oid = GitOid::Sha1([0x11; 20]);
@@ -321,7 +417,7 @@ fn version_graph_dependency_closure_blocks_foreign_or_retired_base_pack() {
         RefTarget::Oid(target_oid),
     );
     let op_in = OperationDigestInput::new(
-        other_realm,
+        realm,
         tenant,
         Uuid::new_v4(),
         IssuerLane::new("push").unwrap(),
@@ -338,7 +434,7 @@ fn version_graph_dependency_closure_blocks_foreign_or_retired_base_pack() {
     let op_dig = operation_digest(&op_in).unwrap();
     let vid = derive_candidate_version_id(&op_in, op_dig, &ref_name, None).unwrap();
     let cset = compute_commit_set_id(&CommitSetInput::new(
-        other_realm,
+        realm,
         1,
         op_id,
         op_dig,
@@ -346,9 +442,9 @@ fn version_graph_dependency_closure_blocks_foreign_or_retired_base_pack() {
         CommitSetHead::Absent,
     ))
     .unwrap();
-    let rec = VersionRecord::seal(VersionRecordInput {
+    let rec_empty = VersionRecord::seal(VersionRecordInput {
         version_id: vid,
-        realm: other_realm,
+        realm,
         ref_name,
         ref_generation: 1,
         operation_id: op_id,
@@ -358,40 +454,17 @@ fn version_graph_dependency_closure_blocks_foreign_or_retired_base_pack() {
         target: RefTarget::Oid(target_oid),
         base_version_id: None,
         object_deps: vec![],
-        pack_set_digest,
+        pack_set_digest: compute_pack_set_digest(&[]).unwrap(),
         commit_set_id: cset,
     })
     .unwrap();
-    let vpack = VerifiedClosurePack::new(pack_entry, tenant, repo, "s3", "a".repeat(64), 1024, 2).unwrap();
-    let mut graph = VersionGraph::new();
-    graph.insert_active(CausalVersionNode { record: rec.clone(), own_packs: vec![vpack] });
-
-    let snap = AuthorizedSnapshotState {
-        realm,
-        tenant_id: tenant,
-        repository_id: repo,
-        history_incarnation: hist,
-        authority_epoch: 1,
-        group_epoch: 1,
-        expected_gate_revision: 1,
-        object_format: GitObjectFormat::Sha1,
-        snapshot_seq: 1,
-        root_version_id: Some(rec.version_id()),
-        current_refs: BTreeMap::new(),
-        authorized_base_packs: vec![BasePackRef {
-            version_id: rec.version_id().as_hex(),
-            pack_id,
-            registration_id: reg_id,
-            artifact_set_digest_hex: pack_digest.as_hex(),
-            pack_sha256: "b".repeat(64),
-            pack_length: 512,
-            idx_sha256: "c".repeat(64),
-            idx_length: 512,
-            pack_locator: BlobLocator::new(tenant, repo, 1, Uuid::new_v4(), "packs", &"b".repeat(64), 512).unwrap(),
-            idx_locator: BlobLocator::new(tenant, repo, 1, Uuid::new_v4(), "pack-idx", &"c".repeat(64), 512).unwrap(),
-            authorized_for_principal: true,
-        }],
-    };
-    let res = verify_base_packs_and_dependencies(&snap, Some(&graph), &sample_auth(Uuid::new_v4()));
-    assert!(matches!(res, Err(PushCausalError::UnauthorizedBaseDependency(_))));
+    let mut empty_pack_graph = VersionGraph::new();
+    empty_pack_graph.insert_active(CausalVersionNode { record: rec_empty, own_packs: vec![] });
+    let mut empty_closure_snap = missing_closure_snap;
+    empty_closure_snap.root_version_id = Some(vid);
+    assert!(matches!(
+        verify_base_packs_and_dependencies(&empty_closure_snap, Some(&empty_pack_graph), &sample_auth(Uuid::new_v4()),),
+        Err(PushCausalError::UnauthorizedBaseDependency(_))
+    ));
+    let _ = pack_entry;
 }

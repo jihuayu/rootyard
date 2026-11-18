@@ -5,6 +5,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/push-causal-stream.yml'
+      - 'src/blob_git_gateway/receive.rs'
       - 'src/namespace_service.rs'
       - 'src/namespace_service/push_causal_stream.rs'
       - 'src/namespace_service/push_causal_stream/**'
@@ -27,12 +28,27 @@ concurrency:
 jobs:
   push-causal-stream:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: rootyard_push183
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd="pg_isready -U rootyard -d rootyard_push183"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_push183
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,6 +100,9 @@ jobs:
           cargo clippy --locked --no-default-features --lib --test push_causal_stream -- -D warnings
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --lib namespace_service::push_causal_stream
           RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test push_causal_stream
+      - name: Run PG17 + LoopbackS3 + production blob_git_gateway HTTP stock-Git push acceptance
+        run: |
+          RUSTFLAGS="-D warnings" cargo test --locked --no-default-features --test push_causal_stream -- --ignored --nocapture --test-threads=1
       - name: Run reproducible #183 streaming push vs naive repack benchmark evaluator
         run: |
           mkdir -p test-results/push-causal-stream

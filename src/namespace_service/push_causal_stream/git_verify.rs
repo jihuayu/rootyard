@@ -114,6 +114,11 @@ pub async fn stage_and_index_quarantine_pack(
 
     let parsed = inspect_verify_pack(view_dir, &resolved_idx_path, ingest_limits, proc_limits, deadline).await?;
     let resolved_thin_base_oids = extract_resolved_thin_bases(&parsed, &base_oids, incoming_object_count);
+    if !resolved_thin_base_oids.is_empty() && (authorized_bases.is_empty() || snapshot.root_version_id.is_none()) {
+        return Err(PushCausalError::UnauthorizedBaseDependency(
+            "thin pack delta bases require verified non-empty authority snapshot closure".into(),
+        ));
+    }
     let duplicate_object_count = parsed.entries.iter().filter(|e| base_oids.contains(&e.oid)).count() as u64;
 
     Ok(VerifiedPackStage {

@@ -288,6 +288,8 @@ pub struct PushStageTelemetry {
 pub enum FaultInjectionHook {
     #[default]
     None,
+    SimulatePartialBlobUpload,
+    SimulateUnknownBlobUpload,
     AbortAfterBlobQuarantineUpload,
     RevokeAuthBeforeCommit,
     SimulateUnknownAckAfterCommit,

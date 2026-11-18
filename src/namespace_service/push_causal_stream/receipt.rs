@@ -1,4 +1,7 @@
 //! Immutable `CausalPushProofReceipt` and deterministic wire/state-machine proof helpers (#183).
+//!
+//! Binds the exact `(operation_id, snapshot, ticket, final_accepted_cas_subset)` tuple both
+//! before Ref-CAS admission and after actual CAS terminal resolution (`Atomic` & `AcceptedSubset`).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7,10 +10,10 @@ use uuid::Uuid;
 use crate::blob_store::BlobLocator;
 use crate::ref_store::core::contract::CommitMode;
 use crate::ref_store::core::state_machine::ApplyResponse;
-use crate::ref_store::core::terminal::CommitRejectCode;
+use crate::ref_store::core::terminal::{CommitRejectCode, RefCommitResult};
 use crate::ref_store::core::types::GitObjectFormat;
 
-use super::types::{AuthorizedSnapshotState, PushCausalError, ReceiveCapabilities};
+use super::types::{AuthorizedSnapshotState, OperationTicket, PushCausalError, ReceiveCapabilities};
 
 /// Accepted per-ref proof line embedded in [`CausalPushProofReceipt`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -31,7 +34,8 @@ pub struct RejectedRefProof {
     pub reason: String,
 }
 
-/// Cryptographically bound causal proof minted ONLY after verified Blob read-back + Git closure.
+/// Cryptographically bound causal proof minted after verified Blob read-back + Git closure
+/// and rebound to the exact authoritative CAS terminal subset on commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CausalPushProofReceipt {
     pub receipt_version: u32,
@@ -46,6 +50,8 @@ pub struct CausalPushProofReceipt {
     pub lane: String,
     pub sequence: i64,
     pub base_snapshot_seq: i64,
+    pub expected_gate_revision: i64,
+    pub committed_gate_revision: Option<i64>,
     pub base_version_ids: Vec<String>,
     pub required_ancestor_oids: Vec<String>,
     pub resolved_thin_base_oids: Vec<String>,
@@ -71,9 +77,10 @@ pub struct CausalPushProofReceipt {
 impl CausalPushProofReceipt {
     pub fn recompute_digest(&self) -> String {
         let mut h = Sha256::new();
-        h.update(b"causal-push-proof-receipt-v1\n");
+        h.update(b"causal-push-proof-receipt-v2\n");
         let pack_path = self.pack_locator.as_ref().map(|l| l.path()).unwrap_or_default();
         let idx_path = self.idx_locator.as_ref().map(|l| l.path()).unwrap_or_default();
+        let committed_rev = self.committed_gate_revision.unwrap_or(-1);
         for bytes in [
             self.receipt_version.to_be_bytes().as_slice(),
             self.tenant_id.as_bytes(),
@@ -87,6 +94,8 @@ impl CausalPushProofReceipt {
             self.lane.as_bytes(),
             self.sequence.to_be_bytes().as_slice(),
             self.base_snapshot_seq.to_be_bytes().as_slice(),
+            self.expected_gate_revision.to_be_bytes().as_slice(),
+            committed_rev.to_be_bytes().as_slice(),
             self.base_closure_digest.as_bytes(),
             self.pack_sha256.as_deref().unwrap_or("").as_bytes(),
             self.pack_bytes.to_be_bytes().as_slice(),
@@ -140,7 +149,13 @@ impl CausalPushProofReceipt {
         Ok(())
     }
 
-    pub fn verify_scope(&self, snapshot: &AuthorizedSnapshotState, backend_hex: &str) -> Result<(), PushCausalError> {
+    /// Verify exact `(operation_id, snapshot, ticket, backend)` identity binding.
+    pub fn verify_scope(
+        &self,
+        snapshot: &AuthorizedSnapshotState,
+        ticket: &OperationTicket,
+        backend_hex: &str,
+    ) -> Result<(), PushCausalError> {
         self.verify_digest()?;
         if self.tenant_id != snapshot.tenant_id
             || self.repository_id != snapshot.repository_id
@@ -148,12 +163,93 @@ impl CausalPushProofReceipt {
             || self.authority_epoch != snapshot.authority_epoch
             || self.group_epoch != snapshot.group_epoch
             || self.object_format != snapshot.object_format
+            || self.base_snapshot_seq != snapshot.snapshot_seq
+            || self.expected_gate_revision != snapshot.expected_gate_revision
+            || self.operation_id != ticket.operation_id
+            || self.issuer_id != ticket.issuer_id
+            || self.lane != ticket.lane
+            || self.sequence != ticket.sequence
             || self.blob_backend_identity != backend_hex
         {
             return Err(PushCausalError::ProofScopeMismatch);
         }
         Ok(())
     }
+
+    /// Rebind this receipt to the exact CAS applied/rejected subset produced by Ref-CAS commit
+    /// (`Atomic` or `AcceptedSubset`), recompute `accepted_subset_digest` and `proof_digest`, and
+    /// verify the full `(operation, snapshot, ticket, final_cas_subset)` binding.
+    pub fn rebind_final_cas_terminal(
+        &mut self,
+        snapshot: &AuthorizedSnapshotState,
+        ticket: &OperationTicket,
+        backend_hex: &str,
+        committed_revision: Option<i64>,
+        terminal_refs: &[RefCommitResult],
+    ) -> Result<(), PushCausalError> {
+        self.verify_scope(snapshot, ticket, backend_hex)?;
+        let (accepted, rejected) = split_terminal_subset(terminal_refs);
+        self.committed_gate_revision = committed_revision;
+        self.accepted_updates = accepted;
+        self.rejected_updates = rejected;
+        self.accepted_subset_digest = compute_accepted_subset_digest(&self.accepted_updates, &self.rejected_updates);
+        self.proof_digest = self.recompute_digest();
+        self.verify_commit_binding(snapshot, ticket, backend_hex, terminal_refs)
+    }
+
+    /// Verify that a committed receipt matches `(operation, snapshot, ticket, final_cas_subset)`.
+    pub fn verify_commit_binding(
+        &self,
+        snapshot: &AuthorizedSnapshotState,
+        ticket: &OperationTicket,
+        backend_hex: &str,
+        terminal_refs: &[RefCommitResult],
+    ) -> Result<(), PushCausalError> {
+        self.verify_scope(snapshot, ticket, backend_hex)?;
+        let (expected_accepted, expected_rejected) = split_terminal_subset(terminal_refs);
+        let expected_digest = compute_accepted_subset_digest(&expected_accepted, &expected_rejected);
+        if self.accepted_updates != expected_accepted
+            || self.rejected_updates != expected_rejected
+            || self.accepted_subset_digest != expected_digest
+        {
+            return Err(PushCausalError::ProofTampered(
+                "commit receipt accepted/rejected subset disagrees with authoritative CAS terminal",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn split_terminal_subset(terminal_refs: &[RefCommitResult]) -> (Vec<AcceptedRefProof>, Vec<RejectedRefProof>) {
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for entry in terminal_refs {
+        match entry {
+            RefCommitResult::Applied { name, old_oid, new_oid } => {
+                let target_kind = if new_oid.is_none() {
+                    "delete"
+                } else if name.starts_with("refs/heads/") {
+                    "commit"
+                } else {
+                    "object"
+                };
+                accepted.push(AcceptedRefProof {
+                    ref_name: name.clone(),
+                    old_oid: old_oid.clone(),
+                    new_oid: new_oid.clone(),
+                    target_kind: target_kind.to_owned(),
+                });
+            }
+            RefCommitResult::NotApplied { name, reason } => {
+                rejected.push(RejectedRefProof {
+                    ref_name: name.clone(),
+                    code: *reason,
+                    reason: reason.as_str().to_owned(),
+                });
+            }
+        }
+    }
+    (accepted, rejected)
 }
 
 pub fn compute_accepted_subset_digest(accepted: &[AcceptedRefProof], rejected: &[RejectedRefProof]) -> String {

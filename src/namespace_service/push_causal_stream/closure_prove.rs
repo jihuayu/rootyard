@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncRead;
+use uuid::Uuid;
 
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::core::pack_commit::contract::VERIFIER_MAX_OBJECTS;
@@ -18,6 +19,7 @@ use super::quarantine::{
     ingest_pack_to_quarantine,
 };
 use super::receipt::{AcceptedRefProof, CausalPushProofReceipt, compute_accepted_subset_digest};
+use super::reclaim::{QuarantineReclaimLedger, UploadReclaimState};
 use super::types::{
     AuthorizedSnapshotState, BasePackRef, BranchPolicy, FaultInjectionHook, GitSubprocessLimits, LfsPolicy,
     OperationTicket, PackPipelineMode, PushAuthContext, PushCausalError, PushStageTelemetry, PushedRefCommand,
@@ -49,12 +51,13 @@ pub struct StreamingProofParams<'a, R> {
     pub pipeline_mode: PackPipelineMode,
     pub ingest_limits: &'a StreamIngestLimits,
     pub proc_limits: &'a GitSubprocessLimits,
+    pub reclaim_ledger: Option<&'a QuarantineReclaimLedger>,
     pub fault_hook: FaultInjectionHook,
     pub deadline: Instant,
 }
 
-/// Verify `#180` dependency closure & principal authorization for base packs referenced
-/// by `snapshot`. Discards untrusted client base claims and checks exact realm homogeneity.
+/// Verify `#180` authority snapshot dependency closure & principal authorization for base packs.
+/// Fails closed whenever base packs or non-empty refs lack a verified non-empty closure.
 pub fn verify_base_packs_and_dependencies<'a>(
     snapshot: &'a AuthorizedSnapshotState,
     version_graph: Option<&VersionGraph>,
@@ -67,36 +70,49 @@ pub fn verify_base_packs_and_dependencies<'a>(
         ));
     }
 
+    let requires_closure = !snapshot.authorized_base_packs.is_empty()
+        || snapshot.current_refs.values().any(|oid| !oid.bytes().all(|b| b == b'0'));
     let mut allowed_pack_entries = BTreeSet::new();
     let mut base_version_ids = BTreeSet::new();
-    let base_closure_digest = if let Some(root_id) = snapshot.root_version_id {
-        let graph = version_graph.ok_or_else(|| {
-            PushCausalError::UnauthorizedBaseDependency(
-                "snapshot specifies root_version_id without VersionGraph".into(),
-            )
-        })?;
-        let closure = verify_dependency_closure(graph, &snapshot.realm, &root_id)
-            .map_err(|e| PushCausalError::UnauthorizedBaseDependency(format!("dependency closure failed: {e:?}")))?;
-        base_version_ids.insert(closure.root().version_id().as_hex());
-        for dep in closure.dependencies() {
-            base_version_ids.insert(dep.version_id().as_hex());
-        }
-        for pack in closure.packs() {
-            if pack.storage_tenant_id() != snapshot.tenant_id || pack.authority_id() != snapshot.repository_id {
+    let base_closure_digest = match snapshot.root_version_id {
+        Some(root_id) => {
+            let graph = version_graph.ok_or_else(|| {
+                PushCausalError::UnauthorizedBaseDependency(
+                    "snapshot specifies root_version_id without VersionGraph".into(),
+                )
+            })?;
+            let closure = verify_dependency_closure(graph, &snapshot.realm, &root_id).map_err(|e| {
+                PushCausalError::UnauthorizedBaseDependency(format!("dependency closure failed: {e:?}"))
+            })?;
+            if closure.packs().is_empty() && requires_closure {
                 return Err(PushCausalError::UnauthorizedBaseDependency(
-                    "closure base pack belongs to another tenant or authority".into(),
+                    "authority snapshot closure pack set is empty for non-empty repository/base set".into(),
                 ));
             }
-            allowed_pack_entries.insert(*pack.entry());
+            base_version_ids.insert(closure.root().version_id().as_hex());
+            for dep in closure.dependencies() {
+                base_version_ids.insert(dep.version_id().as_hex());
+            }
+            for pack in closure.packs() {
+                if pack.storage_tenant_id() != snapshot.tenant_id || pack.authority_id() != snapshot.repository_id {
+                    return Err(PushCausalError::UnauthorizedBaseDependency(
+                        "closure base pack belongs to another tenant or authority".into(),
+                    ));
+                }
+                allowed_pack_entries.insert(*pack.entry());
+            }
+            closure.closure_digest().as_hex()
         }
-        closure.closure_digest().as_hex()
-    } else {
-        let mut h = Sha256::new();
-        h.update(b"empty-base-closure-v1\n");
-        for b in &snapshot.authorized_base_packs {
-            h.update(b.version_id.as_bytes());
+        None => {
+            if requires_closure {
+                return Err(PushCausalError::UnauthorizedBaseDependency(
+                    "base packs and non-empty snapshots require verified authority snapshot closure".into(),
+                ));
+            }
+            let mut h = Sha256::new();
+            h.update(b"empty-base-closure-v1\n");
+            hex::encode(h.finalize())
         }
-        hex::encode(h.finalize())
     };
 
     let mut selected = Vec::new();
@@ -107,14 +123,12 @@ pub fn verify_base_packs_and_dependencies<'a>(
                 base.version_id
             )));
         }
-        if !allowed_pack_entries.is_empty() {
-            let entry = base.pack_set_entry()?;
-            if !allowed_pack_entries.contains(&entry) {
-                return Err(PushCausalError::UnauthorizedBaseDependency(format!(
-                    "base pack `{}` is outside verified #180 dependency closure",
-                    base.pack_id
-                )));
-            }
+        let entry = base.pack_set_entry()?;
+        if !allowed_pack_entries.contains(&entry) {
+            return Err(PushCausalError::UnauthorizedBaseDependency(format!(
+                "base pack `{}` is outside verified #180 dependency closure",
+                base.pack_id
+            )));
         }
         base_version_ids.insert(base.version_id.clone());
         selected.push(base);
@@ -124,7 +138,7 @@ pub fn verify_base_packs_and_dependencies<'a>(
 }
 
 /// Stream, quarantine, upload + read-back verify, inspect thin/causal/LFS closure, and mint
-/// an immutable `CausalPushProofReceipt`. Always sweeps quarantine workspace before returning.
+/// an immutable `CausalPushProofReceipt` under a single shared end-to-end `deadline`.
 pub async fn prove_streaming_push<R>(params: StreamingProofParams<'_, R>) -> Result<ProvedPushBundle, PushCausalError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -143,6 +157,7 @@ where
         pipeline_mode,
         ingest_limits,
         proc_limits,
+        reclaim_ledger,
         fault_hook,
         deadline,
     } = params;
@@ -152,7 +167,7 @@ where
         return Err(PushCausalError::LimitExceeded("configured max_pack_objects exceeds VERIFIER_MAX_OBJECTS"));
     }
 
-    let decoded = decode_receive_pack_stream(reader, gzipped, snapshot.object_format, ingest_limits).await?;
+    let decoded = decode_receive_pack_stream(reader, gzipped, snapshot.object_format, ingest_limits, deadline).await?;
     let (authorized_bases, base_version_ids, base_closure_digest) =
         verify_base_packs_and_dependencies(snapshot, version_graph, auth)?;
 
@@ -174,6 +189,7 @@ where
         pipeline_mode,
         ingest_limits,
         proc_limits,
+        reclaim_ledger,
         fault_hook,
         deadline,
     };
@@ -213,6 +229,7 @@ struct QuarantineProveCtx<'a> {
     pipeline_mode: PackPipelineMode,
     ingest_limits: &'a StreamIngestLimits,
     proc_limits: &'a GitSubprocessLimits,
+    reclaim_ledger: Option<&'a QuarantineReclaimLedger>,
     fault_hook: FaultInjectionHook,
     deadline: Instant,
 }
@@ -221,42 +238,28 @@ async fn prove_inside_quarantine(
     slot: &mut QuarantineSlot,
     ctx: QuarantineProveCtx<'_>,
 ) -> Result<(CausalPushProofReceipt, PushStageTelemetry), PushCausalError> {
-    let QuarantineProveCtx {
-        remainder,
-        command_bytes_read,
-        commands,
-        store,
-        carrier,
-        snapshot,
-        authorized_bases,
-        base_version_ids,
-        base_closure_digest,
-        auth,
-        branch_policy,
-        lfs_policy,
-        ticket,
-        pipeline_mode,
-        ingest_limits,
-        proc_limits,
-        fault_hook,
-        deadline,
-    } = ctx;
-    let ingested =
-        ingest_pack_to_quarantine(remainder, slot, snapshot.object_format, command_bytes_read, ingest_limits, deadline)
-            .await?;
+    let ingested = ingest_pack_to_quarantine(
+        ctx.remainder,
+        slot,
+        ctx.snapshot.object_format,
+        ctx.command_bytes_read,
+        ctx.ingest_limits,
+        ctx.deadline,
+    )
+    .await?;
 
     let view_dir = slot.dir().join("verify-view");
     std::fs::create_dir_all(&view_dir).map_err(|e| PushCausalError::Io(e.to_string()))?;
     let stage = stage_and_index_quarantine_pack(
         &view_dir,
-        store,
-        snapshot,
-        authorized_bases,
+        ctx.store,
+        ctx.snapshot,
+        ctx.authorized_bases,
         ingested.incoming_pack_path.as_deref(),
         ingested.incoming_object_count,
-        ingest_limits,
-        proc_limits,
-        deadline,
+        ctx.ingest_limits,
+        ctx.proc_limits,
+        ctx.deadline,
     )
     .await?;
 
@@ -266,36 +269,32 @@ async fn prove_inside_quarantine(
     }
 
     let (required_ancestor_oids, uploaded_opt, verify_ms, blob_upload_ms, overlap_wall_saved_ms) =
-        run_verify_and_upload(
-            &stage,
-            store,
-            carrier,
-            snapshot,
-            commands,
-            auth,
-            branch_policy,
-            lfs_policy,
-            pipeline_mode,
-            ingest_limits,
-            proc_limits,
-            ingested.has_pack,
-            deadline,
-        )
-        .await?;
+        run_verify_and_upload(&stage, &ctx, ingested.has_pack).await?;
 
     if let Some(ref uploaded) = uploaded_opt
-        && fault_hook == FaultInjectionHook::AbortAfterBlobQuarantineUpload
+        && ctx.fault_hook == FaultInjectionHook::AbortAfterBlobQuarantineUpload
     {
         slot.record_unpromoted_blob(uploaded.pack_receipt.locator());
         slot.record_unpromoted_blob(uploaded.idx_receipt.locator());
+        if let Some(ledger) = ctx.reclaim_ledger {
+            let paths = vec![uploaded.pack_receipt.locator().path(), uploaded.idx_receipt.locator().path()];
+            let _ = ledger.transition(
+                ctx.ticket.operation_id,
+                UploadReclaimState::AbortUnpromoted,
+                paths,
+                uploaded.pack_bytes.saturating_add(uploaded.idx_bytes),
+                "injected fault abort after quarantine Blob upload",
+            );
+        }
         return Err(PushCausalError::StateMachine(
             "injected fault abort after quarantine Blob upload; refs untouched".into(),
         ));
     }
 
-    let mut accepted_updates = Vec::with_capacity(commands.len());
-    for cmd in commands {
-        accepted_updates.push(AcceptedRefProof {
+    let accepted_updates: Vec<AcceptedRefProof> = ctx
+        .commands
+        .iter()
+        .map(|cmd| AcceptedRefProof {
             ref_name: cmd.ref_name.clone(),
             old_oid: (!cmd.is_create()).then(|| cmd.old_oid.clone()),
             new_oid: (!cmd.is_delete()).then(|| cmd.new_oid.clone()),
@@ -306,8 +305,8 @@ async fn prove_inside_quarantine(
             } else {
                 "object".into()
             },
-        });
-    }
+        })
+        .collect();
     let accepted_subset_digest = compute_accepted_subset_digest(&accepted_updates, &[]);
 
     let (pack_sha256, pack_bytes, idx_sha256, idx_bytes, pack_locator, idx_locator, blob_closure_digest, put_bytes) =
@@ -329,29 +328,31 @@ async fn prove_inside_quarantine(
         };
 
     let receipt = CausalPushProofReceipt {
-        receipt_version: 1,
-        tenant_id: snapshot.tenant_id,
-        repository_id: snapshot.repository_id,
-        history_incarnation: snapshot.history_incarnation,
-        authority_epoch: snapshot.authority_epoch,
-        group_epoch: snapshot.group_epoch,
-        object_format: snapshot.object_format,
-        operation_id: ticket.operation_id,
-        issuer_id: ticket.issuer_id,
-        lane: ticket.lane.clone(),
-        sequence: ticket.sequence,
-        base_snapshot_seq: snapshot.snapshot_seq,
-        base_version_ids: base_version_ids.to_vec(),
+        receipt_version: 2,
+        tenant_id: ctx.snapshot.tenant_id,
+        repository_id: ctx.snapshot.repository_id,
+        history_incarnation: ctx.snapshot.history_incarnation,
+        authority_epoch: ctx.snapshot.authority_epoch,
+        group_epoch: ctx.snapshot.group_epoch,
+        object_format: ctx.snapshot.object_format,
+        operation_id: ctx.ticket.operation_id,
+        issuer_id: ctx.ticket.issuer_id,
+        lane: ctx.ticket.lane.clone(),
+        sequence: ctx.ticket.sequence,
+        base_snapshot_seq: ctx.snapshot.snapshot_seq,
+        expected_gate_revision: ctx.snapshot.expected_gate_revision,
+        committed_gate_revision: None,
+        base_version_ids: ctx.base_version_ids.to_vec(),
         required_ancestor_oids,
         resolved_thin_base_oids: stage.resolved_thin_base_oids.clone(),
-        base_closure_digest: base_closure_digest.to_owned(),
+        base_closure_digest: ctx.base_closure_digest.to_owned(),
         pack_sha256,
         pack_bytes,
         idx_sha256,
         idx_bytes,
         pack_locator,
         idx_locator,
-        blob_backend_identity: store.backend_identity().as_hex().to_owned(),
+        blob_backend_identity: ctx.store.backend_identity().as_hex().to_owned(),
         object_count: stage.resolved_object_count,
         delta_object_count: stage.delta_object_count,
         max_delta_chain_depth: stage.max_delta_chain_depth,
@@ -364,7 +365,7 @@ async fn prove_inside_quarantine(
     };
 
     let telemetry = PushStageTelemetry {
-        pipeline_mode,
+        pipeline_mode: ctx.pipeline_mode,
         stream_wire_bytes: ingested.stream_wire_bytes,
         pack_bytes,
         idx_bytes,
@@ -380,98 +381,96 @@ async fn prove_inside_quarantine(
     Ok((receipt, telemetry))
 }
 
+async fn verify_stage(
+    stage: &VerifiedPackStage,
+    ctx: &QuarantineProveCtx<'_>,
+) -> Result<(Vec<String>, u64), PushCausalError> {
+    let t0 = Instant::now();
+    let ancestors = verify_causal_closure_and_lfs(
+        stage,
+        ctx.store,
+        ctx.snapshot,
+        ctx.commands,
+        ctx.auth,
+        ctx.branch_policy,
+        ctx.lfs_policy,
+        ctx.ingest_limits,
+        ctx.proc_limits,
+        ctx.deadline,
+    )
+    .await?;
+    Ok((ancestors, elapsed_ms(t0)))
+}
+
 async fn run_verify_and_upload(
     stage: &VerifiedPackStage,
-    store: &BlobStore,
-    carrier: &dyn PushBlobCarrier,
-    snapshot: &AuthorizedSnapshotState,
-    commands: &[PushedRefCommand],
-    auth: &PushAuthContext,
-    branch_policy: &BranchPolicy,
-    lfs_policy: &LfsPolicy,
-    pipeline_mode: PackPipelineMode,
-    ingest_limits: &StreamIngestLimits,
-    proc_limits: &GitSubprocessLimits,
+    ctx: &QuarantineProveCtx<'_>,
     has_pack: bool,
-    deadline: Instant,
 ) -> Result<(Vec<String>, Option<UploadedQuarantinePack>, u64, u64, u64), PushCausalError> {
     if !has_pack {
-        let t0 = Instant::now();
-        let ancestors = verify_causal_closure_and_lfs(
-            stage,
-            store,
-            snapshot,
-            commands,
-            auth,
-            branch_policy,
-            lfs_policy,
-            ingest_limits,
-            proc_limits,
-            deadline,
-        )
-        .await?;
-        return Ok((ancestors, None, elapsed_ms(t0), 0, 0));
+        let (ancestors, verify_ms) = verify_stage(stage, ctx).await?;
+        return Ok((ancestors, None, verify_ms, 0, 0));
     }
 
     let artifacts = QuarantineArtifactSet {
-        tenant_id: snapshot.tenant_id,
-        repository_id: snapshot.repository_id,
-        generation: snapshot.authority_epoch.max(1),
+        operation_id: ctx.ticket.operation_id,
+        tenant_id: ctx.snapshot.tenant_id,
+        repository_id: ctx.snapshot.repository_id,
+        generation: ctx.snapshot.authority_epoch.max(1),
         pack_path: &stage.resolved_pack_path,
         idx_path: &stage.resolved_idx_path,
+        reclaim_ledger: ctx.reclaim_ledger,
+        fault_hook: ctx.fault_hook,
     };
 
-    match pipeline_mode {
+    match ctx.pipeline_mode {
         PackPipelineMode::Sequential => {
-            let t_v = Instant::now();
-            let ancestors = verify_causal_closure_and_lfs(
-                stage,
-                store,
-                snapshot,
-                commands,
-                auth,
-                branch_policy,
-                lfs_policy,
-                ingest_limits,
-                proc_limits,
-                deadline,
-            )
-            .await?;
-            let verify_ms = elapsed_ms(t_v);
+            let (ancestors, verify_ms) = verify_stage(stage, ctx).await?;
             let t_u = Instant::now();
-            let uploaded = carrier.upload_and_verify_closure(store, artifacts, deadline).await?;
+            let uploaded = ctx.carrier.upload_and_verify_closure(ctx.store, artifacts, ctx.deadline).await?;
             let upload_ms = uploaded.upload_ms.max(elapsed_ms(t_u));
             Ok((ancestors, Some(uploaded), verify_ms, upload_ms, 0))
         }
         PackPipelineMode::OverlappedPipeline => {
             let parallel_started = Instant::now();
-            let verify_fut = async {
-                let s = Instant::now();
-                let res = verify_causal_closure_and_lfs(
-                    stage,
-                    store,
-                    snapshot,
-                    commands,
-                    auth,
-                    branch_policy,
-                    lfs_policy,
-                    ingest_limits,
-                    proc_limits,
-                    deadline,
-                )
-                .await?;
-                Ok::<_, PushCausalError>((res, elapsed_ms(s)))
-            };
+            let verify_fut = verify_stage(stage, ctx);
             let upload_fut = async {
                 let s = Instant::now();
-                let up = carrier.upload_and_verify_closure(store, artifacts, deadline).await?;
+                let up = ctx.carrier.upload_and_verify_closure(ctx.store, artifacts, ctx.deadline).await?;
                 Ok::<_, PushCausalError>((up, elapsed_ms(s)))
             };
-            let ((ancestors, verify_ms), (uploaded, upload_ms)) = tokio::try_join!(verify_fut, upload_fut)?;
-            let wall_ms = elapsed_ms(parallel_started);
-            let saved = verify_ms.saturating_add(upload_ms).saturating_sub(wall_ms);
-            Ok((ancestors, Some(uploaded), verify_ms, upload_ms, saved))
+            let (v_res, u_res) = tokio::join!(verify_fut, upload_fut);
+            match (v_res, u_res) {
+                (Ok((ancestors, verify_ms)), Ok((uploaded, upload_ms))) => {
+                    let wall_ms = elapsed_ms(parallel_started);
+                    let saved = verify_ms.saturating_add(upload_ms).saturating_sub(wall_ms);
+                    Ok((ancestors, Some(uploaded), verify_ms, upload_ms, saved))
+                }
+                (Err(v_err), Ok((uploaded, _))) => {
+                    mark_unpromoted_on_abort(ctx.reclaim_ledger, ctx.ticket.operation_id, &uploaded, &v_err);
+                    Err(v_err)
+                }
+                (_, Err(u_err)) => Err(u_err),
+            }
         }
+    }
+}
+
+fn mark_unpromoted_on_abort(
+    ledger: Option<&QuarantineReclaimLedger>,
+    operation_id: Uuid,
+    uploaded: &UploadedQuarantinePack,
+    err: &PushCausalError,
+) {
+    if let Some(ledger) = ledger {
+        let paths = vec![uploaded.pack_receipt.locator().path(), uploaded.idx_receipt.locator().path()];
+        let _ = ledger.transition(
+            operation_id,
+            UploadReclaimState::AbortUnpromoted,
+            paths,
+            uploaded.pack_bytes.saturating_add(uploaded.idx_bytes),
+            format!("overlapped verification rejected uploaded staging pack: {err}"),
+        );
     }
 }
 

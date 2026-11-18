@@ -23,6 +23,7 @@ use super::commit_gate::{
 };
 use super::quarantine::OperationHoldGuard;
 use super::receipt::commit_mode_from_capabilities;
+use super::reclaim::{QuarantineReclaimLedger, UploadReclaimState};
 use super::sm_commands::{
     ScopedDecisionCtx, build_acquire_holds_cmd, build_bootstrap_commands, build_mark_consumed_cmd,
     build_scoped_decision_cmd,
@@ -128,6 +129,7 @@ impl StateMachinePushExecutor {
         let auth = input.auth;
         let snapshot = input.snapshot;
         let ticket = input.ticket;
+        let reclaim_ledger = input.reclaim_ledger;
         let fault_hook = input.fault_hook;
         let backend_hex = input.store.backend_identity().as_hex().to_owned();
 
@@ -145,59 +147,76 @@ impl StateMachinePushExecutor {
             pipeline_mode: input.pipeline_mode,
             ingest_limits: input.ingest_limits,
             proc_limits: input.proc_limits,
+            reclaim_ledger,
             fault_hook,
             deadline: input.deadline,
         })
         .await?;
 
-        self.commit_proved_bundle(bundle, snapshot, ticket, auth, &backend_hex, fault_hook)
+        self.commit_proved_bundle(CommitBundleCtx {
+            bundle,
+            snapshot,
+            ticket,
+            auth,
+            backend_hex: &backend_hex,
+            reclaim_ledger,
+            fault_hook,
+        })
     }
 
     pub fn commit_proved_bundle(
         &mut self,
-        mut bundle: ProvedPushBundle,
-        snapshot: &AuthorizedSnapshotState,
-        ticket: &OperationTicket,
-        auth: &PushAuthContext,
-        backend_hex: &str,
-        fault_hook: FaultInjectionHook,
+        mut ctx: CommitBundleCtx<'_>,
     ) -> Result<PushExecutionOutput, PushCausalError> {
         let t_commit = Instant::now();
-        let req = build_pg_commit_request(&bundle.receipt, snapshot, ticket, &bundle.capabilities, backend_hex)?;
+        let req = build_pg_commit_request(
+            &ctx.bundle.receipt,
+            ctx.snapshot,
+            ctx.ticket,
+            &ctx.bundle.capabilities,
+            ctx.backend_hex,
+        )?;
         let gate_ver = self
             .sm
-            .read_gate_version(snapshot.repository_id)
+            .read_gate_version(ctx.snapshot.repository_id)
             .map_err(|e| PushCausalError::StateMachine(format!("{e:?}")))?
             .ok_or_else(|| PushCausalError::StateMachine("repository gate not initialized".into()))?;
 
         let (hold_ids, hold_req_pair, mut hold_guard) = match build_acquire_holds_cmd(
-            &bundle.receipt,
-            snapshot,
-            ticket,
-            auth,
-            backend_hex,
+            &ctx.bundle.receipt,
+            ctx.snapshot,
+            ctx.ticket,
+            ctx.auth,
+            ctx.backend_hex,
             &gate_ver.digest().as_hex(),
         ) {
             Some((cmd, ids, pair, guard)) => {
                 self.apply(cmd)?;
                 (ids, Some(pair), guard)
             }
-            None => (Vec::new(), None, OperationHoldGuard::acquire(ticket.operation_id, Vec::new(), Vec::new())),
+            None => (Vec::new(), None, OperationHoldGuard::acquire(ctx.ticket.operation_id, Vec::new(), Vec::new())),
         };
 
-        if let Err(err) = evaluate_push_auth_precheck(auth, snapshot.repository_id, Some(&self.sm), fault_hook) {
+        if let Err(err) =
+            evaluate_push_auth_precheck(ctx.auth, ctx.snapshot.repository_id, Some(&self.sm), ctx.fault_hook)
+        {
             let _ = hold_guard.release_on_proven_abort();
-            self.holds.insert(ticket.operation_id, hold_guard);
+            transition_reclaim_if_present(
+                ctx.reclaim_ledger,
+                ctx.ticket.operation_id,
+                UploadReclaimState::AbortUnpromoted,
+            );
+            self.holds.insert(ctx.ticket.operation_id, hold_guard);
             return Err(err);
         }
 
         let decision_id = Uuid::new_v4();
         self.logical_tick += 1;
         let (decision_cmd, commitment) = build_scoped_decision_cmd(ScopedDecisionCtx {
-            receipt: &bundle.receipt,
-            snapshot,
-            ticket,
-            auth,
+            receipt: &ctx.bundle.receipt,
+            snapshot: ctx.snapshot,
+            ticket: ctx.ticket,
+            auth: ctx.auth,
             req: &req,
             decision_id,
             gate_digest: &gate_ver.digest().as_hex(),
@@ -225,20 +244,38 @@ impl StateMachinePushExecutor {
 
         let ApplyResponse::RefsCommitted(commit_receipt) = resp.inspect_err(|_| {
             let _ = hold_guard.release_on_proven_abort();
-            self.holds.insert(ticket.operation_id, hold_guard.clone());
+            transition_reclaim_if_present(
+                ctx.reclaim_ledger,
+                ctx.ticket.operation_id,
+                UploadReclaimState::AbortUnpromoted,
+            );
+            self.holds.insert(ctx.ticket.operation_id, hold_guard.clone());
         })?
         else {
             return Err(PushCausalError::StateMachine("expected RefsCommitted response".into()));
         };
 
-        if fault_hook == FaultInjectionHook::SimulateUnknownAckAfterCommit {
+        if ctx.fault_hook == FaultInjectionHook::SimulateUnknownAckAfterCommit {
             hold_guard.mark_unknown_outcome();
-            self.holds.insert(ticket.operation_id, hold_guard);
+            transition_reclaim_if_present(
+                ctx.reclaim_ledger,
+                ctx.ticket.operation_id,
+                UploadReclaimState::OutcomeUnknown,
+            );
+            self.holds.insert(ctx.ticket.operation_id, hold_guard);
             return Err(PushCausalError::CommitUnknown {
-                operation_id: ticket.operation_id,
+                operation_id: ctx.ticket.operation_id,
                 detail: "simulated transport drop after commit; holds pinned ActiveHeld until recovery".into(),
             });
         }
+
+        ctx.bundle.receipt.rebind_final_cas_terminal(
+            ctx.snapshot,
+            ctx.ticket,
+            ctx.backend_hex,
+            Some(commit_receipt.terminal.revision),
+            &commit_receipt.terminal.refs,
+        )?;
 
         let has_applied = commit_receipt.is_committed()
             || commit_receipt.terminal.refs.iter().any(|r| matches!(r, RefCommitResult::Applied { .. }));
@@ -246,29 +283,39 @@ impl StateMachinePushExecutor {
             if let Some((batch_req_id, consume_req_id)) = hold_req_pair
                 && !hold_ids.is_empty()
             {
-                self.apply(build_mark_consumed_cmd(snapshot, batch_req_id, consume_req_id, &hold_ids))?;
+                self.apply(build_mark_consumed_cmd(ctx.snapshot, batch_req_id, consume_req_id, &hold_ids))?;
             }
             hold_guard.mark_committed()?;
+            transition_reclaim_if_present(
+                ctx.reclaim_ledger,
+                ctx.ticket.operation_id,
+                UploadReclaimState::VerifiedPromoted,
+            );
         } else {
             hold_guard.release_on_proven_abort()?;
+            transition_reclaim_if_present(
+                ctx.reclaim_ledger,
+                ctx.ticket.operation_id,
+                UploadReclaimState::AbortUnpromoted,
+            );
         }
 
         if commit_receipt.terminal.kind == TerminalKind::Rejected
-            && commit_mode_from_capabilities(&bundle.capabilities) == CommitMode::Atomic
+            && commit_mode_from_capabilities(&ctx.bundle.capabilities) == CommitMode::Atomic
         {
-            let rejected_refs: Vec<String> = bundle.commands.iter().map(|c| c.ref_name.clone()).collect();
-            self.holds.insert(ticket.operation_id, hold_guard);
+            let rejected_refs: Vec<String> = ctx.bundle.commands.iter().map(|c| c.ref_name.clone()).collect();
+            self.holds.insert(ctx.ticket.operation_id, hold_guard);
             return Err(PushCausalError::AtomicBatchRejected { rejected_refs, reason: REF_CHANGED_REASON.into() });
         }
 
-        let wire = report_status_from_pg_receipt(&bundle.capabilities, &commit_receipt)?;
-        bundle.telemetry.commit_ms = t_commit.elapsed().as_millis() as u64;
-        self.holds.insert(ticket.operation_id, hold_guard.clone());
+        let wire = report_status_from_pg_receipt(&ctx.bundle.capabilities, &commit_receipt)?;
+        ctx.bundle.telemetry.commit_ms = t_commit.elapsed().as_millis() as u64;
+        self.holds.insert(ctx.ticket.operation_id, hold_guard.clone());
         Ok(PushExecutionOutput {
-            proof: bundle.receipt,
+            proof: ctx.bundle.receipt,
             commit_receipt,
             report_status_wire: wire,
-            telemetry: bundle.telemetry,
+            telemetry: ctx.bundle.telemetry,
             hold_guard,
         })
     }
@@ -319,5 +366,24 @@ impl StateMachinePushExecutor {
         let log_id = AppliedLogId { term: 1, index: self.next_log_index };
         self.next_log_index += 1;
         self.sm.apply(log_id, command).map_err(|e| PushCausalError::StateMachine(format!("{e:?}")))
+    }
+}
+
+/// Context bundle passed into [`StateMachinePushExecutor::commit_proved_bundle`].
+pub struct CommitBundleCtx<'a> {
+    pub bundle: ProvedPushBundle,
+    pub snapshot: &'a AuthorizedSnapshotState,
+    pub ticket: &'a OperationTicket,
+    pub auth: &'a PushAuthContext,
+    pub backend_hex: &'a str,
+    pub reclaim_ledger: Option<&'a QuarantineReclaimLedger>,
+    pub fault_hook: FaultInjectionHook,
+}
+
+fn transition_reclaim_if_present(ledger: Option<&QuarantineReclaimLedger>, op_id: Uuid, state: UploadReclaimState) {
+    if let Some(ledger) = ledger
+        && matches!(ledger.load(op_id), Ok(Some(_)))
+    {
+        let _ = ledger.transition(op_id, state, Vec::new(), 0, state.as_str());
     }
 }

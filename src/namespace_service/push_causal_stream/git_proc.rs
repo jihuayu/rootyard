@@ -108,11 +108,7 @@ pub(super) async fn check_is_ancestor(
     }
 }
 
-pub(super) fn verify_file_sha256_len(
-    path: &Path,
-    expected_sha256: &str,
-    expected_len: u64,
-) -> Result<(), PushCausalError> {
+pub(super) fn sha256_and_len_sync(path: &Path) -> Result<(String, u64), PushCausalError> {
     let mut file = File::open(path).map_err(|e| PushCausalError::Io(e.to_string()))?;
     let mut hasher = Sha256::new();
     let mut total = 0u64;
@@ -125,7 +121,16 @@ pub(super) fn verify_file_sha256_len(
         hasher.update(&buf[..n]);
         total = total.saturating_add(n as u64);
     }
-    if total != expected_len || hex::encode(hasher.finalize()) != expected_sha256 {
+    Ok((hex::encode(hasher.finalize()), total))
+}
+
+pub(super) fn verify_file_sha256_len(
+    path: &Path,
+    expected_sha256: &str,
+    expected_len: u64,
+) -> Result<(), PushCausalError> {
+    let (actual_sha, actual_len) = sha256_and_len_sync(path)?;
+    if actual_len != expected_len || actual_sha != expected_sha256 {
         return Err(PushCausalError::UnauthorizedBaseDependency(
             "base artifact failed SHA-256 or length verification".into(),
         ));
