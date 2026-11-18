@@ -1714,9 +1714,16 @@ def _list_target(binary, cfg, remaining, target=None,
         timeout=min(60.0, remaining), env=os.environ.copy(),
         failure_context=failure_context)
     actual = parse_listing(output)
-    expected = list(inventory.cases(target_name, scope))
-    _require(len(actual) == len(expected) and len(set(actual)) == len(actual)
-             and set(actual) == set(expected), "static_inventory_mismatch")
+    # Libtest order is not trusted.  Compare exact sets against the explicit
+    # alternatives; this admits the canonical normal listing or the exact
+    # canonical-plus-both-known-#42 listing, never a partial pair or a
+    # generic extra name.  Execution still uses the selected scope's cases.
+    alternatives = inventory.listing_alternatives(target_name, scope)
+    _require(len(set(actual)) == len(actual)
+             and any(len(actual) == len(allowed)
+                     and set(actual) == allowed
+                     for allowed in alternatives),
+             "static_inventory_mismatch")
     return actual
 
 

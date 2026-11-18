@@ -111,29 +111,91 @@ class ScopeTests(unittest.TestCase):
                     inventory.cases(target, inventory.NORMAL_SCOPE),
                 )
 
-    def test_issue42_listing_is_strict_and_normal_rejects_the_extension(self):
+    def test_normal_listing_accepts_original_or_full_known_extension(self):
         cfg = inventory.TARGETS["ref_store_operations"]
-        extended = inventory.cases("ref_store_operations", inventory.ISSUE42_SCOPE)
-        good = b"\n".join(name.encode() + b": test" for name in extended)
-        with mock.patch.object(runner, "run_bounded", return_value=good):
-            self.assertEqual(
-                len(runner._list_target(
-                    "fake", cfg, 5.0, target="ref_store_operations",
-                    scope=inventory.ISSUE42_SCOPE)),
-                9,
-            )
-        with mock.patch.object(runner, "run_bounded", return_value=good):
-            with self.assertRaises(runner.RunnerError) as raised:
-                runner._list_target(
-                    "fake", cfg, 5.0, target="ref_store_operations",
-                    scope=inventory.NORMAL_SCOPE)
-            self.assertEqual(raised.exception.code, "static_inventory_mismatch")
-        for bad in (
-            good.splitlines()[:-1],
-            good.splitlines() + [b"extra: test"],
-            good.splitlines() + [good.splitlines()[0]],
+        canonical = inventory.cases(
+            "ref_store_operations", inventory.NORMAL_SCOPE)
+        extended = inventory.cases(
+            "ref_store_operations", inventory.ISSUE42_SCOPE)
+        self.assertEqual(inventory.target_expected_count(
+            "ref_store_operations", inventory.NORMAL_SCOPE), 7)
+        self.assertEqual(inventory.target_expected_count(
+            "ref_store_operations", inventory.ISSUE42_SCOPE), 9)
+        self.assertEqual((len(canonical), len(extended)), (7, 9))
+        for names, accepted in (
+            (canonical, 7),
+            (extended, 9),
+            (tuple(reversed(extended)), 9),
         ):
-            with mock.patch.object(runner, "run_bounded", return_value=b"\n".join(bad)):
+            payload = b"\n".join(name.encode() + b": test" for name in names)
+            with mock.patch.object(runner, "run_bounded", return_value=payload):
+                self.assertEqual(
+                    len(runner._list_target(
+                        "fake", cfg, 5.0, target="ref_store_operations",
+                        scope=inventory.NORMAL_SCOPE)),
+                    accepted,
+                )
+        for bad in (
+            canonical + (FRESH_LANE_REGULAR,),
+            canonical + (FRESH_LANE_IGNORED,),
+            canonical[:-1],
+            canonical + ("unknown_extra",),
+            extended[:-1],
+            extended + ("unknown_extra",),
+            extended + (extended[0],),
+        ):
+            payload = b"\n".join(name.encode() + b": test" for name in bad)
+            with mock.patch.object(runner, "run_bounded", return_value=payload):
+                with self.assertRaises(runner.RunnerError) as raised:
+                    runner._list_target(
+                        "fake", cfg, 5.0, target="ref_store_operations",
+                        scope=inventory.NORMAL_SCOPE)
+                self.assertEqual(raised.exception.code, "static_inventory_mismatch")
+
+    def test_only_ref_store_operations_uses_unfiltered_listing(self):
+        for scope in (inventory.NORMAL_SCOPE, inventory.ISSUE42_SCOPE):
+            cfg = inventory.TARGETS["ref_store_operations"]
+            with mock.patch.object(runner, "run_bounded", return_value=b"") as called:
+                with self.assertRaises(runner.RunnerError):
+                    runner._list_target(
+                        "fake", cfg, 5.0, target="ref_store_operations",
+                        scope=scope)
+            self.assertEqual(called.call_args[0][0],
+                             ["fake", "--list", "--format", "terse"])
+        other = inventory.TARGETS["ref_store_core"]
+        with mock.patch.object(runner, "run_bounded", return_value=b"") as called:
+            with self.assertRaises(runner.RunnerError):
+                runner._list_target(
+                    "fake", other, 5.0, target="ref_store_core",
+                    scope=inventory.NORMAL_SCOPE)
+        self.assertEqual(
+            called.call_args[0][0],
+            ["fake", "--list", "--ignored", "--format", "terse"])
+
+    def test_issue42_listing_requires_the_full_extension(self):
+        cfg = inventory.TARGETS["ref_store_operations"]
+        canonical = inventory.cases(
+            "ref_store_operations", inventory.NORMAL_SCOPE)
+        extended = inventory.cases(
+            "ref_store_operations", inventory.ISSUE42_SCOPE)
+        for names in (extended, tuple(reversed(extended))):
+            payload = b"\n".join(name.encode() + b": test" for name in names)
+            with mock.patch.object(runner, "run_bounded", return_value=payload):
+                self.assertEqual(
+                    len(runner._list_target(
+                        "fake", cfg, 5.0, target="ref_store_operations",
+                        scope=inventory.ISSUE42_SCOPE)),
+                    9,
+                )
+        for bad in (
+            canonical,
+            canonical + (FRESH_LANE_REGULAR,),
+            canonical + (FRESH_LANE_IGNORED,),
+            extended + ("unknown_extra",),
+            extended + (extended[0],),
+        ):
+            payload = b"\n".join(name.encode() + b": test" for name in bad)
+            with mock.patch.object(runner, "run_bounded", return_value=payload):
                 with self.assertRaises(runner.RunnerError) as raised:
                     runner._list_target(
                         "fake", cfg, 5.0, target="ref_store_operations",
@@ -198,7 +260,7 @@ class ScopeTests(unittest.TestCase):
             runner.validate_report(wrong, HEAD, scope=inventory.ISSUE42_SCOPE)
         self.assertEqual(raised.exception.code, "target_case_inventory_mismatch")
 
-    def test_issue42_run_acceptance_is_169_with_exact_flags(self):
+    def _observed_acceptance(self, scope):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "source"
@@ -219,14 +281,17 @@ class ScopeTests(unittest.TestCase):
                     "binary_sha256": "b" * 64,
                     "receipt_sha256": "e" * 64,
                     "source_inputs_sha256": "c" * 64,
-                    "test_count": inventory.target_expected_count(
-                        target, inventory.ISSUE42_SCOPE),
+                    "test_count": inventory.target_expected_count(target, scope),
                 }
             seen = []
 
             def fake_list(binary, cfg, remaining, target=None,
                           scope=inventory.NORMAL_SCOPE):
-                seen.append(("list", target, scope))
+                listed = inventory.cases(target, scope)
+                if scope == inventory.NORMAL_SCOPE and target == "ref_store_operations":
+                    listed = inventory.cases(
+                        target, inventory.ISSUE42_SCOPE)
+                seen.append(("list", target, scope, tuple(listed)))
 
             def fake_run(binary, name, remaining, case_seconds=0, target=None,
                          ignored=True, scope=inventory.NORMAL_SCOPE):
@@ -242,8 +307,11 @@ class ScopeTests(unittest.TestCase):
                  mock.patch.object(runner, "_list_target", side_effect=fake_list), \
                  mock.patch.object(runner, "_run_one", side_effect=fake_run):
                 report = runner.run_acceptance(
-                    HEAD, str(source), targets, receipts,
-                    scope=inventory.ISSUE42_SCOPE)
+                    HEAD, str(source), targets, receipts, scope=scope)
+        return report, seen
+
+    def test_issue42_run_acceptance_is_169_with_exact_flags(self):
+        report, seen = self._observed_acceptance(inventory.ISSUE42_SCOPE)
         self.assertTrue(report["passed"])
         self.assertEqual(report["scope"], inventory.ISSUE42_SCOPE)
         self.assertEqual(report["scope_version"],
@@ -257,6 +325,38 @@ class ScopeTests(unittest.TestCase):
         self.assertIn(
             ("run", "ref_store_operations", FRESH_LANE_IGNORED, True,
              inventory.ISSUE42_SCOPE), seen)
+
+    def test_normal_run_acceptance_is_167_even_with_extended_listing(self):
+        report, seen = self._observed_acceptance(inventory.NORMAL_SCOPE)
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["scope"], inventory.NORMAL_SCOPE)
+        self.assertEqual(report["scope_version"],
+                         inventory.scope_version(inventory.NORMAL_SCOPE))
+        self.assertEqual(report["expected_count"], 167)
+        self.assertEqual(report["case_count"], 167)
+        self.assertEqual(sum(1 for item in seen if item[0] == "run"), 167)
+        self.assertNotIn(
+            ("run", "ref_store_operations", FRESH_LANE_REGULAR, False,
+             inventory.NORMAL_SCOPE), seen)
+        self.assertNotIn(
+            ("run", "ref_store_operations", FRESH_LANE_IGNORED, True,
+             inventory.NORMAL_SCOPE), seen)
+        listed = [item for item in seen if item[0] == "list"
+                  and item[1] == "ref_store_operations"]
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(tuple(listed[0][3]),
+                         inventory.cases("ref_store_operations",
+                                         inventory.ISSUE42_SCOPE))
+
+    def test_scope_diagnostics_fall_back_to_expected_counts(self):
+        normal = runner.project_target_failure(
+            "ref_store_operations", b"", 1, phase="list",
+            scope=inventory.NORMAL_SCOPE)
+        manual = runner.project_target_failure(
+            "ref_store_operations", b"", 1, phase="list",
+            scope=inventory.ISSUE42_SCOPE)
+        self.assertEqual(normal["inventory"]["expected"], 7)
+        self.assertEqual(manual["inventory"]["expected"], 9)
 
 
 class EnvironmentTests(unittest.TestCase):

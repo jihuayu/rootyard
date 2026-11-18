@@ -421,14 +421,37 @@ def cases(target, scope=NORMAL_SCOPE):
     return tuple(name for name, _ in case_specs(target, scope))
 
 
+LISTING_EXTENSION_TARGETS = frozenset(SCOPE_EXTENSIONS[ISSUE42_SCOPE])
+
+
 def listing_ignored(target, scope=NORMAL_SCOPE):
     """True when the target's strict listing must use --ignored.
 
-    The canonical #107 inventory is entirely ignored native cases.  The #42
-    extension contains one regular selector, so only that target needs the
-    unfiltered listing under the #42 scope.
+    Only ref_store_operations carries the two known #42 selectors, one of
+    which is regular.  It is always listed unfiltered in both scopes so the
+    normal scope can distinguish the exact original listing from the exact
+    known extension.  Every other target keeps its canonical --ignored
+    listing and exact-set strictness.
     """
+    if target in LISTING_EXTENSION_TARGETS:
+        return False
     return all(ignored for _, ignored in case_specs(target, scope))
+
+
+def listing_alternatives(target, scope=NORMAL_SCOPE):
+    """Return the exact accepted name sets for one target and scope.
+
+    Normal scope accepts only the canonical set, plus for the one extension
+    target the canonical set together with exactly both known #42 names.  A
+    partial pair is never an alternative.  The manual scope requires the
+    full extension and never accepts the original-only set.
+    """
+    canonical = cases(target, NORMAL_SCOPE)
+    if scope == NORMAL_SCOPE and target in LISTING_EXTENSION_TARGETS:
+        extended = canonical + tuple(
+            name for name, _ in _extension(target, ISSUE42_SCOPE))
+        return (frozenset(canonical), frozenset(extended))
+    return (frozenset(cases(target, scope)),)
 
 
 def target_expected_count(target, scope=NORMAL_SCOPE):
