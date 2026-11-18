@@ -7669,6 +7669,8 @@ class SchemaBoundaryIntegrationFixture:
 class Phase1ClosureAndDocsFixture:
     """Verifier for Phase 1 CI Pipeline Wiring (F20) and Implementation Status & Docs Synchronization (F21)."""
 
+    NATIVE_BATCH_COMMAND = ("python3", "scripts/build_native_batch.py")
+
     REQUIRED_CI_SUITES: tuple[str, ...] = (
         "tests/pulls.py",
         "tests/backup_pulls.py",
@@ -7803,7 +7805,18 @@ class Phase1ClosureAndDocsFixture:
                 if pending:
                     joined.append(pending)
                 script = "\n".join(joined)
-            return tokenize(script), next_index
+            whole_run = tokenize(script)
+            command_groups = [group for line in script.splitlines() for group in tokenize(line)]
+            if (
+                not whole_run
+                or [token for group in command_groups for token in group] != whole_run[0]
+                or any(
+                    tuple(group[:2]) == Phase1ClosureAndDocsFixture.NATIVE_BATCH_COMMAND
+                    for group in command_groups
+                )
+            ):
+                return whole_run, next_index
+            return command_groups, next_index
 
         steps_indent: int | None = None
         step_indent: int | None = None
@@ -7920,7 +7933,7 @@ class Phase1ClosureAndDocsFixture:
     @staticmethod
     def ci_build_native_batch_tokens(commands: list[list[str]]) -> list[str]:
         """Return the single native batch build command from CI run commands."""
-        prefix = ["python3", "scripts/build_native_batch.py"]
+        prefix = list(Phase1ClosureAndDocsFixture.NATIVE_BATCH_COMMAND)
         references = [
             tokens
             for tokens in commands
@@ -7933,7 +7946,15 @@ class Phase1ClosureAndDocsFixture:
             tokens
             for tokens in references
             if tokens[:2] != prefix
-            and tokens[:2] != ["python3", "scripts/native_report_manifest.py"]
+            and not (
+                tokens[:2] == ["python3", "scripts/native_report_manifest.py"]
+                and not any(re.fullmatch(r"[;&|]+", token) for token in tokens)
+                and all(
+                    token == prefix[1] and tokens[index - 1] == "--harness"
+                    for index, token in enumerate(tokens[2:], start=2)
+                    if "build_native_batch.py" in token
+                )
+            )
         ]
         expected = [
             "python3", "scripts/build_native_batch.py", "--all-bins",

@@ -163,6 +163,37 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
             "ci.yml must run cargo test with --features pando-lab",
         )
 
+    def test_vault_manifest_builder_input_preserves_native_batch_guard(self) -> None:
+        ci_text = CI_YML.read_text(encoding="utf-8")
+        fixture = Phase1ClosureAndDocsFixture
+        commands = fixture.live_ci_run_commands(ci_text)
+        vault_start = next(
+            index for index, tokens in enumerate(commands)
+            if tokens[:2] == ["python3", "tests/pando_vault_rotation.py"]
+        )
+        vault, report, manifest = commands[vault_start:vault_start + 3]
+        self.assertIn("--receipt", vault)
+        self.assertEqual(report[:2], ["python3", "tests/pando_vault_rotation_ci_report.py"])
+        self.assertEqual(manifest[:2], ["python3", "scripts/native_report_manifest.py"])
+        builder = "scripts/build_native_batch.py"
+        binding = manifest.index(builder)
+        self.assertEqual(manifest[binding - 1], "--harness")
+        self.assertEqual(fixture.ci_build_native_batch_tokens(commands)[:2], ["python3", builder])
+
+        step_start = ci_text.index("      - name: Qualify pinned real Vault rotation")
+        step_end = ci_text.index("      - name:", step_start + 1)
+        bad_commands = (
+            f"python3 {builder} --all-bins",
+            f"python {builder} --all-bins",
+            f"python3 scripts/native_report_manifest.py --harness {builder} && python3 {builder}",
+            f"python3 scripts/native_report_manifest.py --binary {builder}",
+        )
+        for bad_command in bad_commands:
+            with self.subTest(command=bad_command):
+                mutated = ci_text[:step_end] + f"          {bad_command}\n" + ci_text[step_end:]
+                with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+                    fixture.ci_build_native_batch_tokens(fixture.live_ci_run_commands(mutated))
+
     def test_ci_workflow_wires_schema_030_and_all_tier1_e2e_harnesses(self) -> None:
         ci_text = CI_YML.read_text(encoding="utf-8")
 
