@@ -18,7 +18,11 @@ use crate::{
 };
 use anyhow::Context;
 use deadpool_postgres::{Manager, Pool, Runtime};
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     sync::oneshot,
     time::{Instant, sleep, timeout},
@@ -70,89 +74,182 @@ struct Fixture {
     gate: CoreGate,
 }
 
+struct FixtureSeed {
+    pool: Pool,
+    actor: Uuid,
+    repo: Uuid,
+    history: Uuid,
+    backend: String,
+    restore: Uuid,
+    gate: CoreGate,
+}
+
+/// Tear down a database whose ownership is already proven by a successful
+/// `CREATE DATABASE`. The caller must have dropped the fixture pool/clients
+/// first. Every checkout and SQL statement is bounded; failures name the exact
+/// database and leave it in place for inspection.
+async fn cleanup_owned_database(admin: &Pool, database: &str) -> anyhow::Result<()> {
+    let client = timeout(WAIT, admin.get())
+        .await
+        .with_context(|| format!("owned database {database} cleanup admin checkout did not finish"))??;
+    match timeout(
+        WAIT,
+        client.query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname=$1 AND pid<>pg_backend_pid()",
+            &[&database],
+        ),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Err(
+                anyhow::Error::new(error).context(format!("terminating backends of owned database {database} failed"))
+            );
+        }
+        Err(_) => return Err(anyhow::anyhow!("terminating backends of owned database {database} timed out")),
+    }
+    match timeout(WAIT, client.batch_execute(&format!("DROP DATABASE {database}"))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow::Error::new(error).context(format!("dropping owned database {database} failed"))),
+        Err(_) => Err(anyhow::anyhow!("dropping owned database {database} timed out")),
+    }
+}
+
 async fn fixture() -> anyhow::Result<Fixture> {
+    fixture_with_setup_check(|_| Ok(())).await
+}
+
+/// Create one random, owned PG17 database and run the complete setup. The
+/// hook runs after the full seed and is test-only: a non-empty result simulates
+/// a setup failure without changing the production or fixture success path.
+async fn fixture_with_setup_check<F>(check: F) -> anyhow::Result<Fixture>
+where
+    F: FnOnce(&str) -> anyhow::Result<()>,
+{
     let base_url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
     let admin = db::pool(&base_url)?;
     // Migration 152 resolves `public.cluster_authority` explicitly, so these
     // wrapper tests need a job-owned database whose public schema is migrated,
     // not a schema-isolated search_path. The SQL fixtures use the same shape.
-    // `ROOTYARD_TEST_DATABASE_URL` therefore needs CREATEDB; `with_fixture`
-    // terminates its backends and drops the database even when the body fails.
+    // `ROOTYARD_TEST_DATABASE_URL` therefore needs CREATEDB.
     let database = format!("slot_zero_{}", Uuid::new_v4().simple());
-    admin.get().await?.batch_execute(&format!("CREATE DATABASE {database}")).await?;
-    let mut config: tokio_postgres::Config = base_url.parse()?;
-    config.dbname(database.as_str());
-    config.options("-c search_path=public -c timezone=UTC -c statement_timeout=15000 -c lock_timeout=10000");
-    let pool =
-        Pool::builder(Manager::new(config, tokio_postgres::NoTls)).runtime(Runtime::Tokio1).max_size(8).build()?;
-    db::migrate(&pool).await?;
 
-    let actor = Uuid::new_v4();
-    let repo = Uuid::new_v4();
-    let history = Uuid::new_v4();
-    let backend = "a".repeat(64);
-    let client = pool.get().await?;
-    client
-        .execute(
-            "INSERT INTO users(id,username) VALUES($1,$2)",
-            &[&actor, &format!("slotzero{}", &actor.simple().to_string()[..12])],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO repositories(id,owner_id,name,state,storage_backend,object_format)
+    // CREATE is the ownership linearization point. Record the name only after
+    // it returns an acknowledged success, exactly like the existing Python
+    // fixtures. If CREATE returns an error the server may or may not have
+    // created the database (including a lost reply), so ownership is unproven
+    // and cleanup must not touch it.
+    let create = timeout(WAIT, admin.get()).await.context("fixture CREATE admin checkout did not finish")??;
+    timeout(WAIT, create.batch_execute(&format!("CREATE DATABASE {database}")))
+        .await
+        .context("fixture CREATE DATABASE did not finish")??;
+    drop(create);
+
+    // Everything below can fail after ownership is proven. The async block owns
+    // the pool and every client, so an early `?` drops them before the match
+    // calls the shared cleanup helper.
+    let setup: anyhow::Result<FixtureSeed> = async {
+        let mut config: tokio_postgres::Config = base_url.parse()?;
+        config.dbname(database.as_str());
+        config.options("-c search_path=public -c timezone=UTC -c statement_timeout=15000 -c lock_timeout=10000");
+        let pool =
+            Pool::builder(Manager::new(config, tokio_postgres::NoTls)).runtime(Runtime::Tokio1).max_size(8).build()?;
+        db::migrate(&pool).await?;
+
+        let actor = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        let history = Uuid::new_v4();
+        let backend = "a".repeat(64);
+        let client = pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO users(id,username) VALUES($1,$2)",
+                &[&actor, &format!("slotzero{}", &actor.simple().to_string()[..12])],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO repositories(id,owner_id,name,state,storage_backend,object_format)
                  VALUES($1,$2,'slot-zero','provisioning','pg_refstore','sha1')",
-            &[&repo, &actor],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO ref_store_core_gates(repository_id,tenant_id,object_format,history_incarnation,
+                &[&repo, &actor],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO ref_store_core_gates(repository_id,tenant_id,object_format,history_incarnation,
                      authority_epoch,group_epoch,head_ref,revision)
                  VALUES($1,$2,'sha1',$3,1,1,'refs/heads/main',1)",
-            &[&repo, &actor, &history],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO ref_store_core_protocol_repos(repository_id,tenant_id,object_format,
+                &[&repo, &actor, &history],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO ref_store_core_protocol_repos(repository_id,tenant_id,object_format,
                      history_incarnation,authority_epoch,group_epoch,decision_required)
                  VALUES($1,$2,'sha1',$3,1,1,true)",
-            &[&repo, &actor, &history],
-        )
-        .await?;
-    client
-        .execute(
-            "INSERT INTO ref_store_serving_repositories(repository_id,owner_id,name,object_format,
+                &[&repo, &actor, &history],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO ref_store_serving_repositories(repository_id,owner_id,name,object_format,
                      history_incarnation,authority_epoch,group_epoch,backend_identity,state)
                  VALUES($1,$2,'slot-zero','sha1',$3,1,1,$4,'pending')",
-            &[&repo, &actor, &history, &backend],
-        )
-        .await?;
-    client.execute("UPDATE ref_store_serving_repositories SET state='ready' WHERE repository_id=$1", &[&repo]).await?;
-    client.execute("UPDATE repositories SET state='ready' WHERE id=$1", &[&repo]).await?;
+                &[&repo, &actor, &history, &backend],
+            )
+            .await?;
+        client
+            .execute("UPDATE ref_store_serving_repositories SET state='ready' WHERE repository_id=$1", &[&repo])
+            .await?;
+        client.execute("UPDATE repositories SET state='ready' WHERE id=$1", &[&repo]).await?;
 
-    let restore: Uuid =
-        client.query_one("SELECT incarnation FROM cluster_authority WHERE singleton", &[]).await?.get(0);
-    let row = client
-        .query_one(
-            "SELECT tenant_id,object_format,history_incarnation,authority_epoch,group_epoch,head_ref,revision
+        let restore: Uuid =
+            client.query_one("SELECT incarnation FROM cluster_authority WHERE singleton", &[]).await?.get(0);
+        let row = client
+            .query_one(
+                "SELECT tenant_id,object_format,history_incarnation,authority_epoch,group_epoch,head_ref,revision
                  FROM ref_store_core_gates WHERE repository_id=$1",
-            &[&repo],
-        )
-        .await?;
-    let gate = CoreGate::new(
-        repo,
-        row.get(0),
-        GitObjectFormat::parse(&row.get::<_, String>(1))?,
-        row.get(2),
-        row.get(3),
-        row.get(4),
-        RefName::new(row.get::<_, String>(5))?,
-        row.get(6),
-    )?;
-    drop(client);
-    Ok(Fixture { admin, pool, database, actor, repo, history, backend, restore, gate })
+                &[&repo],
+            )
+            .await?;
+        let gate = CoreGate::new(
+            repo,
+            row.get(0),
+            GitObjectFormat::parse(&row.get::<_, String>(1))?,
+            row.get(2),
+            row.get(3),
+            row.get(4),
+            RefName::new(row.get::<_, String>(5))?,
+            row.get(6),
+        )?;
+        check(&database)?;
+        drop(client);
+        Ok(FixtureSeed { pool, actor, repo, history, backend, restore, gate })
+    }
+    .await;
+
+    match setup {
+        Ok(seed) => Ok(Fixture {
+            admin,
+            pool: seed.pool,
+            database,
+            actor: seed.actor,
+            repo: seed.repo,
+            history: seed.history,
+            backend: seed.backend,
+            restore: seed.restore,
+            gate: seed.gate,
+        }),
+        Err(original) => {
+            let cleanup = cleanup_owned_database(&admin, &database).await;
+            Err(match cleanup {
+                Ok(()) => original,
+                Err(cleanup_error) => append_cleanup(original, "fixture setup database cleanup", Err(cleanup_error)),
+            })
+        }
+    }
 }
 
 async fn with_fixture<F, Fut>(body: F) -> anyhow::Result<()>
@@ -164,17 +261,19 @@ where
     let admin = fixture.admin.clone();
     let database = fixture.database.clone();
     let outcome = tokio::spawn(body(fixture)).await;
-    admin
-        .get()
-        .await?
-        .batch_execute(&format!(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-             WHERE datname='{database}' AND pid<>pg_backend_pid()"
-        ))
-        .await?;
-    admin.get().await?.batch_execute(&format!("DROP DATABASE {database}")).await?;
-    outcome??;
-    Ok(())
+    // The spawned body owns the only fixture pool; awaiting its JoinHandle
+    // guarantees it was dropped (success, error or panic) before this point.
+    let cleanup = cleanup_owned_database(&admin, &database).await;
+    match (outcome, cleanup) {
+        (Ok(Ok(())), Ok(())) => Ok(()),
+        (Ok(Err(error)), Ok(())) => Err(error),
+        (Ok(Ok(())), Err(cleanup_error)) => Err(cleanup_error),
+        (Ok(Err(error)), Err(cleanup_error)) => Err(append_cleanup(error, "database cleanup", Err(cleanup_error))),
+        (Err(join_error), Ok(())) => Err(join_error.into()),
+        (Err(join_error), Err(cleanup_error)) => {
+            Err(append_cleanup(join_error.into(), "database cleanup", Err(cleanup_error)))
+        }
+    }
 }
 
 fn slot_zero_request(fixture: &Fixture, public_id: Uuid, private_id: Uuid) -> SlotZeroAdmissionRequest {
@@ -944,4 +1043,36 @@ fn slot_zero_proof_binds_sequence_plan_and_wire() {
             plan_digest: RequestDigest::from_bytes([11; 32]),
         })
     );
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn slot_zero_fixture_setup_error_drops_only_its_owned_database() -> anyhow::Result<()> {
+    let base_url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
+    let admin = db::pool(&base_url)?;
+    let observed = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&observed);
+    let error = match fixture_with_setup_check(move |database| {
+        *captured.lock().expect("fixture database capture lock poisoned") = Some(database.to_string());
+        Err(anyhow::anyhow!("injected setup failure after fixture seed"))
+    })
+    .await
+    {
+        Ok(_) => return Err(anyhow::anyhow!("injected setup failure unexpectedly produced a fixture")),
+        Err(error) => error,
+    };
+    let database = {
+        let mut captured = observed.lock().expect("fixture database capture lock poisoned");
+        captured.take().ok_or_else(|| anyhow::anyhow!("fixture did not report its owned database name"))?
+    };
+    let chain = format!("{error:#}");
+    assert!(
+        chain.contains("injected setup failure after fixture seed"),
+        "setup cleanup replaced the original error: {chain}"
+    );
+    assert!(!chain.contains("fixture setup database cleanup"), "setup cleanup failed: {chain}");
+    let exists: bool =
+        admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)", &[&database]).await?.get(0);
+    assert!(!exists, "owned setup database {database} survived cleanup");
+    Ok(())
 }

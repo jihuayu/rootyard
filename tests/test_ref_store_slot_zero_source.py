@@ -220,7 +220,57 @@ class SlotZeroSourceTest(unittest.TestCase):
         self.assertIn('ref_store_operations', atomic)
         self.assertIn('ref_store_serving_operations', atomic)
         self.assertIn('for index in 0..5', atomic)
-        self.assertGreaterEqual(self.tests.count('#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]'), 7)
+        self.assertGreaterEqual(self.tests.count('#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]'), 8)
+
+    def test_fixture_setup_cleanup_is_owned_bounded_and_observable(self):
+        self.assertIn('struct FixtureSeed', self.tests)
+        self.assertIn('async fn fixture_with_setup_check', self.tests)
+        self.assertIn('fixture_with_setup_check(|_| Ok(()))', self.tests)
+
+        setup = self.tests.split('async fn fixture_with_setup_check', 1)[1].split('async fn with_fixture', 1)[0]
+        self.assertIn('CREATE is the ownership linearization point', setup)
+        self.assertIn('cleanup must not touch it', setup)
+        self.assertIn('CREATE DATABASE {database}', setup)
+        self.assertIn('let setup: anyhow::Result<FixtureSeed> = async {', setup)
+        self.assertLess(
+            setup.index('CREATE DATABASE {database}'),
+            setup.index('let setup: anyhow::Result<FixtureSeed>'),
+        )
+        self.assertNotIn('cleanup_owned_database(', setup.split('CREATE DATABASE {database}', 1)[0])
+        self.assertIn('check(&database)?;', setup)
+        self.assertIn('Err(original) => {', setup)
+        self.assertIn('cleanup_owned_database(&admin, &database)', setup)
+        self.assertIn('append_cleanup(original, "fixture setup database cleanup"', setup)
+
+        cleanup = self.tests.split('async fn cleanup_owned_database', 1)[1].split('async fn fixture()', 1)[0]
+        self.assertIn('timeout(WAIT, admin.get())', cleanup)
+        self.assertIn('pg_terminate_backend(pid)', cleanup)
+        self.assertIn('DROP DATABASE {database}', cleanup)
+        self.assertIn('cleanup admin checkout did not finish', cleanup)
+        self.assertIn('terminating backends of owned database {database}', cleanup)
+        self.assertIn('dropping owned database {database}', cleanup)
+        self.assertIn('leave it in place for inspection', self.tests)
+
+        with_fixture = self.tests.split('async fn with_fixture', 1)[1].split('#[tokio::test]', 1)[0]
+        self.assertIn('let outcome = tokio::spawn(body(fixture)).await;', with_fixture)
+        self.assertIn('cleanup_owned_database(&admin, &database)', with_fixture)
+        self.assertIn('(Ok(Err(error)), Ok(())) => Err(error)', with_fixture)
+        self.assertIn('append_cleanup(error, "database cleanup"', with_fixture)
+        self.assertIn('(Err(join_error), Ok(())) => Err(join_error.into())', with_fixture)
+
+        self.assertIn(
+            '#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]\n'
+            'async fn slot_zero_fixture_setup_error_drops_only_its_owned_database()',
+            self.tests,
+        )
+        test = self.tests.split('async fn slot_zero_fixture_setup_error_drops_only_its_owned_database()', 1)[1]
+        self.assertIn('fixture_with_setup_check(move |database|', test)
+        self.assertIn('injected setup failure after fixture seed', test)
+        self.assertIn('setup cleanup replaced the original error', test)
+        self.assertIn('setup cleanup failed', test)
+        self.assertIn('SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname=$1)', test)
+        self.assertIn('owned setup database {database} survived cleanup', test)
+        self.assertGreaterEqual(self.tests.count('#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]'), 8)
 
     def test_ignored_tests_drive_the_real_admission_entry(self):
         self.assertGreaterEqual(self.tests.count('.admit_slot_zero_in_tx('), 4)
