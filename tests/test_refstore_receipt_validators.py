@@ -913,6 +913,96 @@ for _guard_name in ('rename', 'replace', 'link', 'unlink', 'remove'):
         shutil.copyfile(fixture["serving_receipt"], directory / "rootyard.build.json")
         return directory
 
+    def test_126_outcome_stays_unaccepted_on_false_green_malformed_and_duplicate_output(self):
+        parser = next(block for block in heredoc_blocks(self.source) if "native-outcome.json" in block)
+        targets = (
+            "atomic_push_with_rewritten_old_oid_rejects_both_refs_and_leaves_gate_unchanged",
+            "concurrent_same_tip_pushes_get_parsed_ng_stale_info",
+            "lost_receive_pack_ack_after_commit_resolves_committed_via_operation_get",
+        )
+        skipped = ["smart_http_push_then_reclone_without_compute_views_has_exact_oid"]
+        secret = "synthetic_detail_that_must_not_escape"
+        pair = {
+            "workspace_commit": "1" * 40,
+            "source_inputs_sha256": "2" * 64,
+            "test_source_closure": {"sha256": "3" * 64, "files": [secret]},
+            "test_executable": {"sha256": "4" * 64},
+            "serving_executable": {"sha256": "5" * 64},
+            "test_receipt": {"receipt_sha256": "6" * 64, "receipt_path": secret},
+            "serving_receipt": {"receipt_sha256": "7" * 64},
+        }
+        pair_bytes = json.dumps(pair).encode("utf-8")
+        binding = {
+            "workspace_commit": "1" * 40,
+            "build_pair_sha256": hashlib.sha256(pair_bytes).hexdigest(),
+            "source_inputs_sha256": "2" * 64,
+            "test_source_closure_sha256": "3" * 64,
+            "test_binary_sha256": "4" * 64,
+            "serving_binary_sha256": "5" * 64,
+            "test_receipt_sha256": "6" * 64,
+            "serving_receipt_sha256": "7" * 64,
+        }
+        ok_lines = [f"test {name} ... ok\n" for name in targets]
+        ok_summary = "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 40 filtered out; finished in 0.01s\n"
+        ok_output = "".join(ok_lines) + ok_summary
+
+        def check(output, exit_code, phase, *, accepted=False, gate_passed=False, bound=True):
+            with tempfile.TemporaryDirectory() as temporary:
+                evidence = Path(temporary)
+                fake_input = evidence / "fake-input.txt"
+                fake_input.write_bytes(output.encode("utf-8") if isinstance(output, str) else output)
+                (evidence / "build-pair.json").write_bytes(pair_bytes if bound else b'{}')
+                process = subprocess.run(
+                    [sys.executable, "-B", "-", str(fake_input), str(exit_code)],
+                    input=parser, text=True, capture_output=True,
+                )
+                self.assertEqual(process.returncode == 0, gate_passed)
+                raw = (evidence / "native-outcome.json").read_text(encoding="utf-8")
+                self.assertLess(len(raw), 4096)
+                for prohibited in (secret, temporary):
+                    self.assertNotIn(prohibited, raw + process.stdout + process.stderr)
+                outcome = json.loads(raw)
+                self.assertIs(outcome["accepted"], accepted)
+                self.assertEqual(outcome["phase"], phase)
+                self.assertEqual(outcome["exit_code"], exit_code)
+                self.assertEqual(tuple(outcome["tests"]), targets)
+                self.assertEqual(outcome["skipped"], skipped)
+                self.assertEqual(outcome["binding"], binding if bound else None)
+                acceptance = evidence / "acceptance.json"
+                self.assertEqual(acceptance.exists(), gate_passed)
+                if gate_passed:
+                    self.assertEqual(json.loads(acceptance.read_text(encoding="utf-8")), {
+                        "version": 1, "issue": 126, "suite": "blob_git_gateway", "accepted": True,
+                        "tests": dict.fromkeys(targets, "ok"), "skipped": skipped,
+                        "result": {"state": "ok", "passed": 3, "failed": 0, "ignored": 0},
+                    })
+                return outcome
+
+        check(ok_output, 0, "complete", accepted=True, gate_passed=True)
+        check(ok_output, 0, "acceptance_check", gate_passed=True, bound=False)
+        false_green = check(ok_output, 101, "native_exit")
+        self.assertEqual(false_green["summary"], {"state": "ok", "passed": 3, "failed": 0, "ignored": 0})
+        self.assertTrue(all(case == {"status": "matched", "result": "ok"}
+                            for case in false_green["tests"].values()))
+
+        failed_summary = "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 40 filtered out; finished in 0.01s\n"
+        partial = check(ok_lines[0] + f"test {targets[1]} ... FAILED\n{secret}\n" + failed_summary, 101, "native_exit")
+        self.assertEqual(partial["summary"], {"state": "FAILED", "passed": 1, "failed": 1, "ignored": 0})
+        self.assertEqual(partial["tests"][targets[1]], {"status": "matched", "result": "failed"})
+        self.assertEqual(partial["tests"][targets[2]], {"status": "unreported", "result": None})
+        unreadable = check(b"\xff", 101, "log_unreadable")
+        self.assertIsNone(unreadable["summary"])
+
+        duplicate_summary = check(ok_output + ok_summary, 0, "acceptance_check")
+        self.assertIsNone(duplicate_summary["summary"])
+        malformed_summary = check("".join(ok_lines) + ok_summary.replace("0 measured;", secret),
+                                  0, "acceptance_check", gate_passed=True)
+        self.assertIsNone(malformed_summary["summary"])
+        for row in (ok_lines[0], f"test {targets[0]} ... {secret}\n"):
+            ambiguous = check(row + ok_output, 0, "acceptance_check")
+            self.assertEqual(ambiguous["tests"][targets[0]], {"status": "ambiguous", "result": None})
+        check(ok_output + f"test {secret} ... ok\n", 0, "acceptance_check")
+
     def test_non_174_builders_use_the_shared_immutable_store(self):
         start = self.source.index("Build and exercise the minimal Blob")
         end = self.source.index('"Exercise the #174 HTTP foundation cases')
