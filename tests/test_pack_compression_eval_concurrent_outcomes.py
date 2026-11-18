@@ -74,6 +74,7 @@ class ConcurrentOutcomeTest(unittest.TestCase):
                 "failure_class": "unclassified",
                 "http_status": None,
                 "http_subphase": "unknown",
+                "push_ref_verdict": "unknown",
                 "git_returncode": None,
                 "signal": None,
                 "elapsed_ms": None,
@@ -86,6 +87,7 @@ class ConcurrentOutcomeTest(unittest.TestCase):
             failure_class="git_push",
             http_status=503,
             http_subphase="receive_pack",
+            push_ref_verdict="stale_info",
             git_returncode=1,
             signal=9,
             elapsed_ms=1023.4567,
@@ -100,6 +102,7 @@ class ConcurrentOutcomeTest(unittest.TestCase):
                 "failure_class": "git_push",
                 "http_status": 503,
                 "http_subphase": "receive_pack",
+                "push_ref_verdict": "stale_info",
                 "git_returncode": 1,
                 "signal": 9,
                 "elapsed_ms": 1023.457,
@@ -228,6 +231,76 @@ class ConcurrentOutcomeTest(unittest.TestCase):
         self.assertEqual(sanitize_concurrent_outcomes([legacy]), [_valid(0)])
         del legacy["http_subphase"]
         self.assertEqual(sanitize_concurrent_outcomes([legacy]), [])
+
+    def test_legacy_outcome_without_verdict_projects_unknown(self) -> None:
+        without_verdict = _valid(1)
+        del without_verdict["push_ref_verdict"]
+        without_elapsed = dict(without_verdict)
+        del without_elapsed["elapsed_ms"]
+        projected = sanitize_concurrent_outcomes([without_verdict, {**without_elapsed, "branch_ordinal": 2}])
+        self.assertEqual([row["branch_ordinal"] for row in projected], [1, 2])
+        self.assertEqual([row["push_ref_verdict"] for row in projected], ["unknown", "unknown"])
+        self.assertEqual([row["elapsed_ms"] for row in projected], [None, None])
+        # A pre-verdict receipt keeps its own stderr HTTP classification.
+        failed_legacy = {
+            "branch_ordinal": 1,
+            "outcome": "failed",
+            "phase": "concurrent_push",
+            "failure_class": "git_push",
+            "http_status": 503,
+            "http_subphase": "receive_pack",
+            "git_returncode": 1,
+            "signal": None,
+            "elapsed_ms": 4.5,
+        }
+        [projected_failed] = sanitize_concurrent_outcomes([failed_legacy])
+        self.assertEqual(projected_failed["push_ref_verdict"], "unknown")
+        self.assertEqual(projected_failed["http_status"], 503)
+        self.assertEqual(projected_failed["http_subphase"], "receive_pack")
+        self.assertEqual(projected_failed["elapsed_ms"], 4.5)
+
+    def test_two_failed_workers_keep_their_own_verdict(self) -> None:
+        first = LiveEvalFailure(
+            build_failure_record(
+                phase="concurrent_push", failure_class="git_push", git_returncode=1,
+                http_status=503, http_subphase="receive_pack",
+                push_ref_verdict="stale_info", elapsed_ms=11.5,
+            )
+        )
+        second = LiveEvalFailure(
+            build_failure_record(
+                phase="concurrent_push", failure_class="git_push", git_returncode=1,
+                push_ref_verdict="other_ref_rejection", elapsed_ms=22.5,
+            )
+        )
+        progress: dict = {}
+        returned = collect_concurrent_outcomes(
+            [_FakeFuture(first), _FakeFuture(value=3.0), _FakeFuture(second)],
+            _FakeFuture(value=None),
+            branch_count=3,
+            progress=progress,
+        )
+        self.assertIs(returned, first)
+        outcomes = progress["concurrent_worker_outcomes"]
+        self.assertEqual([o["branch_ordinal"] for o in outcomes], [0, 1, 2])
+        self.assertEqual([o["push_ref_verdict"] for o in outcomes], ["stale_info", "unknown", "other_ref_rejection"])
+        # The first original error and its existing stderr HTTP result stay intact.
+        self.assertEqual(returned.record["http_status"], 503)
+        self.assertEqual(returned.record["http_subphase"], "receive_pack")
+        self.assertEqual(outcomes[0]["http_status"], 503)
+        self.assertEqual(outcomes[0]["http_subphase"], "receive_pack")
+        self.assertIsNone(outcomes[2]["http_status"])
+        self.assertEqual(outcomes[2]["http_subphase"], "unknown")
+        self.assertEqual(returned.record["push_ref_verdict"], "stale_info")
+
+    def test_verdict_projection_never_leaks_raw_text(self) -> None:
+        injected = sanitize_concurrent_outcomes([{**_valid(0), "push_ref_verdict": SENTINEL}])
+        self.assertEqual(injected[0]["push_ref_verdict"], "unknown")
+        self.assertNotIn(SENTINEL, json.dumps(injected, sort_keys=True))
+        record = build_failure_record(concurrent_worker_outcomes=[{**_valid(0), "push_ref_verdict": SENTINEL}])
+        self.assertEqual(record["concurrent_worker_outcomes"][0]["push_ref_verdict"], "unknown")
+        self.assertNotIn(SENTINEL, json.dumps(record, sort_keys=True))
+        self.assertEqual(build_failure_record(push_ref_verdict=SENTINEL)["push_ref_verdict"], "unknown")
 
     def test_failure_record_projects_outcomes_defensively(self) -> None:
         valid = [finite_worker_outcome(0, elapsed_ms=27.125), _valid(1), _valid(2)]

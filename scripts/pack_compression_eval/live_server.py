@@ -17,8 +17,12 @@ import urllib.parse
 from .capacity import build_server_env, derive_capacity_envelope
 from .cleanup_diagnostics import StopPostcondition
 from .corpus import run_git, url_quote_repo
-from .failure_diagnostics import LiveEvalFailure, build_failure_record
-from .failure_diagnostics import LiveEvalFailure, git_failure_record
+from .failure_diagnostics import (
+    LiveEvalFailure,
+    build_failure_record,
+    git_failure_record,
+    push_expected_destination,
+)
 from .pack_matrix import PackConfigSpec, kill_process_group
 from .telemetry import http_json_timed, verify_binary_receipt
 
@@ -336,8 +340,18 @@ def push_with_pack_config(
     except OSError:
         raise LiveEvalFailure(git_failure_record(context, failure_class="git_spawn")) from None
     if proc.returncode != 0:
+        # ``--porcelain`` writes per-ref status to stdout; stderr keeps carrying
+        # any HTTP transport markers.  Both are parsed in memory only, and the
+        # verdict is limited to this worker's own expected destination ref.
         raise LiveEvalFailure(
-            git_failure_record(context, returncode=proc.returncode, elapsed_ms=ms, stderr=proc.stderr)
+            git_failure_record(
+                context,
+                returncode=proc.returncode,
+                elapsed_ms=ms,
+                stderr=proc.stderr,
+                stdout=proc.stdout,
+                expected_destination=push_expected_destination(ref_target),
+            )
         ) from None
     return ms
 

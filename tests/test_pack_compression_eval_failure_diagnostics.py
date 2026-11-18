@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Hermetic tests for finite live-benchmark failure diagnostics (Refs #178).
 
-These tests never spawn Git, HTTP, S3, PostgreSQL or a benchmark process.  They
-use fake CompletedProcess values, known in-memory stderr strings, temporary
-files and mocked CLI collaborators.
+These tests never contact HTTP, S3, PostgreSQL or a benchmark process.  They
+use fake CompletedProcess values, known in-memory stdout/stderr strings,
+temporary files and mocked CLI collaborators.  One class drives real stock Git
+against a temporary local bare repository only, to lock the actual
+``push --quiet --porcelain`` framing; it never touches a remote or a service.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,7 +42,9 @@ from pack_compression_eval.failure_diagnostics import (  # noqa: E402
     failure_record_from_exception,
     finite_http_status,
     finite_http_subphase,
+    finite_push_ref_verdict,
     git_failure_record,
+    push_expected_destination,
     safe_summary,
     sanitize_bindings,
     sanitize_s3_snapshot,
@@ -78,6 +84,7 @@ class FiniteFailureDiagnosticsTest(unittest.TestCase):
             signal=999,
             http_status=999,
             http_subphase=SENTINEL,
+            push_ref_verdict=SENTINEL,
             elapsed_ms=float("inf"),
             last_completed_phase=SENTINEL,
             completed={
@@ -118,6 +125,7 @@ class FiniteFailureDiagnosticsTest(unittest.TestCase):
         self.assertIsNone(record["signal"])
         self.assertIsNone(record["http_status"])
         self.assertEqual(record["http_subphase"], "unknown")
+        self.assertEqual(record["push_ref_verdict"], "unknown")
         self.assertIsNone(record["elapsed_ms"])
         self.assertEqual(record["last_completed_phase"], "unknown")
         self.assertEqual(record["completed"], completed_counts({"acked_refs_verified": 2}))
@@ -344,7 +352,349 @@ class PushBoundaryFailureTest(unittest.TestCase):
         self.assertEqual(elapsed, 7.5)
 
 
+class PushRefVerdictTest(unittest.TestCase):
+    """Bounded per-ref verdict from this worker's own porcelain stdout line."""
+
+    DESTINATION = "refs/heads/conc_1"
+
+    def context(self) -> dict:
+        return {
+            "phase": "concurrent_push",
+            "archetype": "text_history",
+            "object_format": "sha1",
+            "config": "baseline",
+            "repo_ordinal": 0,
+            "branch_ordinal": 1,
+            "completed": completed_counts({}),
+            "last_completed_phase": "live_setup",
+        }
+
+    def push_failure(
+        self,
+        stdout: bytes,
+        *,
+        stderr: bytes = b"",
+        ref_target: str | None = None,
+        returncode: int = 1,
+    ) -> dict:
+        fake = subprocess.CompletedProcess(
+            args=["git", "push", "--quiet", "--porcelain"], returncode=returncode, stdout=stdout, stderr=stderr
+        )
+        with mock.patch.object(live_server, "run_git", return_value=(fake, 9.0)):
+            with self.assertRaises(LiveEvalFailure) as caught:
+                live_server.push_with_pack_config(
+                    "git",
+                    Path("/tmp"),
+                    "http://example.invalid/repo",
+                    None,
+                    ref_target or f"HEAD:{self.DESTINATION}",
+                    {},
+                    context=self.context(),
+                )
+        return caught.exception.record
+
+    def porcelain(self, summary: str, *, flag: str = "!", destination: str | None = None) -> bytes:
+        target = destination or self.DESTINATION
+        return f"{flag}\tHEAD:{target}\t{summary}\n".encode()
+
+    def test_both_stock_stale_spellings_are_stale_info(self) -> None:
+        for summary in ("[rejected] (stale info)", "[remote rejected] (stale info)"):
+            with self.subTest(summary=summary):
+                record = self.push_failure(self.porcelain(summary))
+                self.assertEqual(record["push_ref_verdict"], "stale_info")
+                self.assertEqual(record["failure_class"], "git_push")
+                self.assertEqual(record["git_returncode"], 1)
+                self.assertEqual(record["branch_ordinal"], 1)
+
+    def test_other_rejection_of_this_destination_is_bounded(self) -> None:
+        for summary in ("[remote rejected] (pre-receive hook declined)", "[rejected] (non-fast-forward)"):
+            with self.subTest(summary=summary):
+                self.assertEqual(
+                    self.push_failure(self.porcelain(summary))["push_ref_verdict"], "other_ref_rejection"
+                )
+
+    def test_missing_stdout_is_unknown(self) -> None:
+        for stdout in (b"", b"\n"):
+            with self.subTest(stdout=stdout):
+                self.assertEqual(self.push_failure(stdout)["push_ref_verdict"], "unknown")
+
+    def test_expected_destination_comes_only_from_this_workers_refspec(self) -> None:
+        self.assertEqual(push_expected_destination("HEAD:refs/heads/conc_1"), "refs/heads/conc_1")
+        self.assertEqual(push_expected_destination("+HEAD:refs/heads/main"), "refs/heads/main")
+        self.assertEqual(push_expected_destination("refs/heads/main"), "refs/heads/main")
+        for bad in (None, "", "HEAD", "HEAD:main", "HEAD:refs/heads/a\tb", 7):
+            with self.subTest(bad=bad):
+                self.assertIsNone(push_expected_destination(bad))
+
+    def test_off_target_and_non_bang_lines_are_unknown(self) -> None:
+        off_target = self.porcelain("[rejected] (stale info)", destination="refs/heads/conc_2")
+        self.assertEqual(self.push_failure(off_target)["push_ref_verdict"], "unknown")
+        up_to_date = self.porcelain("[up to date]", flag="=")
+        self.assertEqual(self.push_failure(up_to_date)["push_ref_verdict"], "unknown")
+        forced = self.porcelain("[forced update]", flag="+")
+        self.assertEqual(self.push_failure(forced)["push_ref_verdict"], "unknown")
+        # No destination can be derived from the refspec, so nothing is classified.
+        record = self.push_failure(self.porcelain("[rejected] (stale info)"), ref_target="HEAD")
+        self.assertEqual(record["push_ref_verdict"], "unknown")
+
+    def test_duplicate_conflicting_or_extra_lines_are_unknown(self) -> None:
+        stale = self.porcelain("[rejected] (stale info)")
+        other = self.porcelain("[remote rejected] (pre-receive hook declined)")
+        duplicated = stale + stale
+        self.assertEqual(self.push_failure(duplicated)["push_ref_verdict"], "unknown")
+        conflicting = stale + other
+        self.assertEqual(self.push_failure(conflicting)["push_ref_verdict"], "unknown")
+        with_off_target = stale + self.porcelain("[rejected] (stale info)", destination="refs/heads/conc_0")
+        self.assertEqual(self.push_failure(with_off_target)["push_ref_verdict"], "unknown")
+
+    def test_malformed_or_unrelated_stdout_is_unknown(self) -> None:
+        for stdout in (
+            b"stale info\n",
+            b"!\trefs/heads/conc_1\n",
+            b"!\tno-colon\t[rejected] (stale info)\n",
+            b"!\tHEAD:refs/heads/conc_1\t(stale info)\n",
+            b"!\tHEAD:refs/heads/conc_1\t[rejected] (stale info) trailing\n",
+            b"!\tHEAD:refs/heads/conc_1\t[rejected] ()\n",
+            b"!\tHEAD:refs/heads/conc_1\t[rejected] (stale info)\textra\n",
+            b"\x00\xff\xfe binary noise",
+        ):
+            with self.subTest(stdout=stdout):
+                self.assertEqual(self.push_failure(stdout)["push_ref_verdict"], "unknown")
+
+    def envelope(self, *status_lines: bytes, remote: bytes = b"https://example.invalid/git/o/r.git") -> bytes:
+        frames = [b"To " + remote, *status_lines, b"Done"]
+        return b"\n".join(frames) + b"\n"
+
+    def test_stock_envelope_with_both_stale_spellings(self) -> None:
+        for summary in ("[rejected] (stale info)", "[remote rejected] (stale info)"):
+            with self.subTest(summary=summary):
+                record = self.push_failure(self.envelope(self.porcelain(summary).rstrip(b"\n")))
+                self.assertEqual(record["push_ref_verdict"], "stale_info")
+                encoded = json.dumps(record, sort_keys=True)
+                self.assertNotIn("To ", encoded)
+                self.assertNotIn("Done", encoded)
+                self.assertNotIn(self.DESTINATION, encoded)
+
+    def test_stock_envelope_with_real_different_rejection(self) -> None:
+        record = self.push_failure(
+            self.envelope(self.porcelain("[remote rejected] (pre-receive hook declined)").rstrip(b"\n"))
+        )
+        self.assertEqual(record["push_ref_verdict"], "other_ref_rejection")
+        self.assertEqual(record["failure_class"], "git_push")
+
+    def test_optional_framing_halves_are_independently_accepted(self) -> None:
+        stale = self.porcelain("[rejected] (stale info)").rstrip(b"\n")
+        self.assertEqual(self.push_failure(b"To https://h.invalid/r.git\n" + stale + b"\n")["push_ref_verdict"], "stale_info")
+        self.assertEqual(self.push_failure(stale + b"\nDone\n")["push_ref_verdict"], "stale_info")
+        # Bare single status line (no framing at all) still classifies.
+        self.assertEqual(self.push_failure(stale + b"\n")["push_ref_verdict"], "stale_info")
+
+    def test_envelope_duplicate_status_lines_stay_unknown(self) -> None:
+        stale = self.porcelain("[rejected] (stale info)").rstrip(b"\n")
+        other = self.porcelain("[remote rejected] (pre-receive hook declined)").rstrip(b"\n")
+        for stdout in (self.envelope(stale, stale), self.envelope(stale, other)):
+            with self.subTest(stdout=stdout):
+                self.assertEqual(self.push_failure(stdout)["push_ref_verdict"], "unknown")
+
+    def test_envelope_extra_or_forged_content_never_upgrades_to_rejection(self) -> None:
+        stale = self.porcelain("[rejected] (stale info)").rstrip(b"\n")
+        for stdout in (
+            self.envelope(stale, b"junk"),
+            b"junk\n" + self.envelope(stale),
+            self.envelope(stale) + b"junk\n",
+            b"To https://h.invalid/r.git\nDone\n" + stale + b"\n",
+            b"To https://h.invalid/r.git\n" + stale + b"\nDone\nDone\n",
+            b"To https://h.invalid/r.git\nTo https://h.invalid/r.git\n" + stale + b"\nDone\n",
+            b"To \n" + stale + b"\nDone\n",
+            b"To https://h.invalid/r.git\nstale info\nDone\n",
+        ):
+            with self.subTest(stdout=stdout):
+                self.assertEqual(self.push_failure(stdout)["push_ref_verdict"], "unknown")
+
+    def test_untrusted_to_remote_is_never_retained(self) -> None:
+        stale = self.porcelain("[rejected] (stale info)").rstrip(b"\n")
+        record = self.push_failure(self.envelope(stale, remote=f"https://{SENTINEL}@hidden.invalid/r.git".encode()))
+        self.assertEqual(record["push_ref_verdict"], "stale_info")
+        encoded = json.dumps(record, sort_keys=True)
+        self.assertNotIn(SENTINEL, encoded)
+        self.assertNotIn("hidden.invalid", encoded)
+        self.assertNotIn("https://", encoded)
+
+    def test_verdict_and_stderr_http_fields_are_independent(self) -> None:
+        record = self.push_failure(
+            self.porcelain("[rejected] (stale info)"),
+            stderr=b"fatal: unable to access 'http://example.invalid/repo/info/refs?service=git-receive-pack': "
+            b"The requested URL returned error: 503\n",
+        )
+        self.assertEqual(record["push_ref_verdict"], "stale_info")
+        self.assertEqual(record["http_status"], 503)
+        self.assertEqual(record["http_subphase"], "info_refs")
+        silent = self.push_failure(self.porcelain("[remote rejected] (stale info)"), stderr=b"")
+        self.assertIsNone(silent["http_status"])
+        self.assertEqual(silent["http_subphase"], "unknown")
+
+    def test_stdout_stays_available_to_other_consumers(self) -> None:
+        raw = self.porcelain("[rejected] (stale info)")
+        fake = subprocess.CompletedProcess(args=["git", "push"], returncode=1, stdout=raw, stderr=b"")
+        with mock.patch.object(live_server, "run_git", return_value=(fake, 3.0)):
+            with self.assertRaises(LiveEvalFailure):
+                live_server.push_with_pack_config(
+                    "git",
+                    Path("/tmp"),
+                    "http://example.invalid/repo",
+                    None,
+                    f"HEAD:{self.DESTINATION}",
+                    {},
+                    context=self.context(),
+                )
+        self.assertEqual(fake.stdout, raw)
+        self.assertEqual(fake.stderr, b"")
+        self.assertEqual(fake.returncode, 1)
+
+    def test_verdict_never_retains_stdout_stderr_ref_or_sentinel(self) -> None:
+        raw = (
+            f"!\t{SENTINEL}:{self.DESTINATION}\t[remote rejected] (stale info)\n"
+        ).encode()
+        record = self.push_failure(raw, stderr=f"fatal: {SENTINEL} HTTP 503\n".encode())
+        self.assertEqual(record["push_ref_verdict"], "stale_info")
+        encoded = json.dumps(record, sort_keys=True)
+        self.assertNotIn(SENTINEL, encoded)
+        self.assertNotIn(self.DESTINATION, encoded)
+        self.assertNotIn("stale info", encoded)
+        self.assertNotIn("example.invalid", encoded)
+
+
+class StockGitPorcelainEnvelopeTest(unittest.TestCase):
+    """Lock the actual stock-Git ``--quiet --porcelain`` framing offline.
+
+    Only a temporary local bare repository and local working trees are used;
+    there is no network, service, container or native runtime involvement.
+    """
+
+    def setUp(self) -> None:
+        git = shutil.which("git")
+        if git is None:
+            self.skipTest("stock git is not available")
+        self.git = git
+        self._tmp = tempfile.TemporaryDirectory(prefix="pack-eval-porcelain-")
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+                "HOME": str(self.root),
+            }
+        )
+        self.identity = ("-c", "user.name=pack-eval", "-c", "user.email=pack-eval@example.invalid")
+
+    def git_run(self, *args: str, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
+        proc = subprocess.run(
+            [self.git, *args],
+            cwd=str(cwd) if cwd is not None else None,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if check and proc.returncode != 0:
+            self.fail(f"stock git {args[0]} failed: {proc.stderr.decode(errors='replace')[:200]}")
+        return proc
+
+    def commit(self, work: Path, name: str, content: str) -> str:
+        (work / "f.txt").write_text(content, encoding="utf-8")
+        self.git_run("add", "f.txt", cwd=work)
+        self.git_run(*self.identity, "commit", "-qm", name, cwd=work)
+        return self.git_run("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
+
+    def test_stock_git_frames_one_ref_status_and_reports_real_rejections(self) -> None:
+        remote = self.root / "remote.git"
+        self.git_run("init", "--bare", "-q", "--initial-branch=main", str(remote))
+        first = self.root / "first"
+        self.git_run("init", "-q", str(first))
+        seed_oid = self.commit(first, "seed", "seed\n")
+        self.git_run("push", "-q", "--porcelain", str(remote), "HEAD:refs/heads/main", cwd=first)
+
+        second = self.root / "second"
+        self.git_run("clone", "-q", str(remote), str(second))
+        self.commit(second, "remote-move", "remote\n")
+        self.git_run("push", "-q", "--porcelain", str(remote), "HEAD:refs/heads/main", cwd=second)
+
+        self.commit(first, "local-move", "local\n")
+        diverted = self.git_run(
+            "push", "--quiet", "--porcelain", "--force-with-lease=refs/heads/main:" + seed_oid,
+            str(remote), "HEAD:refs/heads/main", cwd=first, check=False,
+        )
+        self.assertNotEqual(diverted.returncode, 0)
+        stale_lines = diverted.stdout.decode("utf-8", "replace").splitlines()
+        self.assertEqual(len(stale_lines), 3)
+        self.assertTrue(stale_lines[0].startswith("To "))
+        self.assertEqual(stale_lines[2], "Done")
+        self.assertIn(b"[rejected] (stale info)", diverted.stdout)
+        self.assertEqual(finite_push_ref_verdict(diverted.stdout, "refs/heads/main"), "stale_info")
+
+        rejected = self.git_run(
+            "push", "--quiet", "--porcelain", str(remote), "HEAD:refs/heads/main", cwd=first, check=False
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        rejected_lines = rejected.stdout.decode("utf-8", "replace").splitlines()
+        self.assertEqual(len(rejected_lines), 3)
+        self.assertTrue(rejected_lines[0].startswith("To "))
+        self.assertEqual(rejected_lines[2], "Done")
+        # A real different rejection reason ("fetch first"/"non-fast-forward"
+        # depending on local remote-tracking state) is bounded, not stale info.
+        self.assertIn(b"\t[rejected] (", rejected.stdout)
+        self.assertNotIn(b"stale info", rejected.stdout)
+        self.assertEqual(finite_push_ref_verdict(rejected.stdout, "refs/heads/main"), "other_ref_rejection")
+
+        record = git_failure_record(
+            {"phase": "concurrent_push", "branch_ordinal": 2},
+            returncode=rejected.returncode,
+            elapsed_ms=5.0,
+            stderr=rejected.stderr,
+            stdout=rejected.stdout,
+            expected_destination="refs/heads/main",
+        )
+        self.assertEqual(record["push_ref_verdict"], "other_ref_rejection")
+        self.assertEqual(record["git_returncode"], rejected.returncode)
+        self.assertIsNone(record["http_status"])
+        self.assertEqual(record["http_subphase"], "unknown")
+        encoded = json.dumps(record, sort_keys=True)
+        self.assertNotIn(str(self.root), encoded)
+        self.assertNotIn("refs/heads/main", encoded)
+
+
 class FailureArtifactTest(unittest.TestCase):
+    def test_legacy_receipt_without_verdict_projects_unknown(self) -> None:
+        legacy = {
+            "schema_version": FAILURE_SCHEMA,
+            "phase": "concurrent_push",
+            "failure_class": "git_push",
+            "http_status": 503,
+            "http_subphase": "receive_pack",
+            "git_returncode": 1,
+            "concurrent_worker_outcomes": [
+                {
+                    "branch_ordinal": 0,
+                    "outcome": "failed",
+                    "phase": "concurrent_push",
+                    "failure_class": "git_push",
+                    "http_status": None,
+                    "http_subphase": "unknown",
+                    "git_returncode": 1,
+                    "signal": None,
+                    "elapsed_ms": 4.0,
+                }
+            ],
+        }
+        record = enrich_failure_record(legacy)
+        self.assertEqual(record["push_ref_verdict"], "unknown")
+        self.assertEqual(record["http_status"], 503)
+        self.assertEqual(record["http_subphase"], "receive_pack")
+        self.assertEqual(record["concurrent_worker_outcomes"][0]["push_ref_verdict"], "unknown")
+        self.assertEqual(record["concurrent_worker_outcomes"][0]["elapsed_ms"], 4.0)
+
     def test_failure_record_from_exception_merges_source_meta(self) -> None:
         failure = LiveEvalFailure(
             build_failure_record(

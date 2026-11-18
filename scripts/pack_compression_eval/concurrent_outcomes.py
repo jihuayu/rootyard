@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import math
+import re
 from typing import Any
 
 PHASES = (
@@ -38,6 +39,13 @@ FAILURE_CLASSES = (
     "unclassified",
 )
 HTTP_SUBPHASES = ("unknown", "info_refs", "receive_pack")
+# Bounded per-ref verdict for this worker's own expected push destination only.
+# ``stale_info`` covers stock Git's ``[rejected] (stale info)`` plus
+# ``[remote rejected] (stale info)``; any other classified ``!`` rejection of
+# that same destination is ``other_ref_rejection``.  Everything absent,
+# malformed, duplicated, off-target or non-``!`` stays ``unknown`` so it can
+# never turn into a definite failure of the current ref.
+PUSH_REF_VERDICTS = ("unknown", "stale_info", "other_ref_rejection")
 
 CONCURRENT_OUTCOME_LIMIT = 3
 CONCURRENT_OUTCOME_FIELDS = (
@@ -47,6 +55,7 @@ CONCURRENT_OUTCOME_FIELDS = (
     "failure_class",
     "http_status",
     "http_subphase",
+    "push_ref_verdict",
     "git_returncode",
     "signal",
     "elapsed_ms",
@@ -103,6 +112,98 @@ def finite_http_subphase(stderr: bytes | bytearray | None, status: int | None) -
     return "unknown"
 
 
+# Stock ``git push --porcelain`` summary column for one rejected ref.
+_PORCELAIN_REJECTION = re.compile(rb"^(?:\[rejected\]|\[remote rejected\]) \(([^()\x00-\x1f\x7f]{1,200})\)$")
+_PORCELAIN_STALE_REASON = b"stale info"
+# Optional stock framing around the single ref status line: one leading
+# ``To <remote>`` line and one trailing ``Done`` line.  The remote is
+# untrusted and is never decoded, retained or compared.
+_PORCELAIN_TO_PREFIX = b"To "
+_PORCELAIN_DONE = b"Done"
+_PORCELAIN_TO_LIMIT = 8192
+
+
+def _is_porcelain_to_line(line: bytes) -> bool:
+    """Accept only a bounded ``To <remote>`` frame whose remote is never read."""
+    if not line.startswith(_PORCELAIN_TO_PREFIX) or len(line) > _PORCELAIN_TO_LIMIT:
+        return False
+    remote = line[len(_PORCELAIN_TO_PREFIX):]
+    return bool(remote) and b"\x00" not in remote and b"\t" not in remote
+
+
+def push_expected_destination(ref_target: Any) -> str | None:
+    """Return the bounded destination ref of this worker's own push refspec.
+
+    ``HEAD:refs/heads/conc_0`` yields ``refs/heads/conc_0``.  Anything that is
+    not a plain ``refs/`` destination (missing, relative, glob, control or
+    non-ASCII bytes, absurdly long) yields ``None`` so the verdict fails closed.
+    """
+    if not isinstance(ref_target, str) or not ref_target:
+        return None
+    refspec = ref_target[1:] if ref_target.startswith("+") else ref_target
+    destination = refspec.rsplit(":", 1)[1] if ":" in refspec else refspec
+    if not destination.startswith("refs/") or len(destination) > 1024:
+        return None
+    if any(not 0x21 <= ord(ch) <= 0x7E for ch in destination):
+        return None
+    return destination
+
+
+def finite_push_ref_verdict(stdout: bytes | bytearray | None, expected_destination: Any) -> str:
+    """Classify at most one stock-Git porcelain line for one known destination.
+
+    Only ``git push --porcelain`` stdout is inspected.  Stock Git wraps the
+    single ref status line in optional framing: at most one leading ``To
+    <remote>`` line and at most one trailing exact ``Done`` line.  That framing
+    is stripped and discarded without ever decoding, retaining or comparing the
+    untrusted remote.  After stripping, exactly one well-formed status line
+    carrying the ``!`` flag whose destination equals the caller's own expected
+    ref may be classified.  ``stale_info`` accepts both stock spellings,
+    ``[rejected] (stale info)`` and ``[remote rejected] (stale info)``; any
+    other classified rejection of that same destination is
+    ``other_ref_rejection``.  Any second status line, duplicate/forged framing,
+    extra unrelated content, malformed bytes, an off-target destination or a
+    non-``!`` flag stays ``unknown``: ignored extra input can never upgrade
+    itself into a definite failure of the current ref.  Raw bytes are not
+    retained and no ref name, remote, path or user text escapes this function.
+    """
+    if not isinstance(stdout, (bytes, bytearray)) or not isinstance(expected_destination, str):
+        return "unknown"
+    if not expected_destination or not expected_destination.startswith("refs/"):
+        return "unknown"
+    data = bytes(stdout)
+    if data.endswith(b"\n"):
+        data = data[:-1]
+    if not data:
+        return "unknown"
+    lines = [line[:-1] if line.endswith(b"\r") else line for line in data.split(b"\n")]
+    if _is_porcelain_to_line(lines[0]):
+        lines = lines[1:]
+    if lines and lines[-1] == _PORCELAIN_DONE:
+        lines = lines[:-1]
+    if len(lines) != 1:
+        return "unknown"
+    parts = lines[0].split(b"\t")
+    if len(parts) != 3:
+        return "unknown"
+    flag, refs, summary = parts
+    if flag != b"!":
+        return "unknown"
+    if b":" not in refs:
+        return "unknown"
+    _source, raw_destination = refs.rsplit(b":", 1)
+    try:
+        destination = raw_destination.decode("ascii")
+    except UnicodeDecodeError:
+        return "unknown"
+    if destination != expected_destination:
+        return "unknown"
+    match = _PORCELAIN_REJECTION.fullmatch(summary)
+    if match is None:
+        return "unknown"
+    return "stale_info" if match.group(1) == _PORCELAIN_STALE_REASON else "other_ref_rejection"
+
+
 def _fixed_outcome(branch_ordinal: int | None, outcome: str, record: Mapping[str, Any] | None) -> dict[str, Any]:
     source = record if isinstance(record, Mapping) else {}
     if outcome == "failed":
@@ -113,6 +214,7 @@ def _fixed_outcome(branch_ordinal: int | None, outcome: str, record: Mapping[str
             "failure_class": _choice(source.get("failure_class"), FAILURE_CLASSES, "unclassified"),
             "http_status": _http_status(source.get("http_status")),
             "http_subphase": _choice(source.get("http_subphase"), HTTP_SUBPHASES),
+            "push_ref_verdict": _choice(source.get("push_ref_verdict"), PUSH_REF_VERDICTS),
             "git_returncode": _optional_int(source.get("git_returncode")),
             "signal": _signal(source.get("signal")),
             "elapsed_ms": finite_elapsed_ms(source.get("elapsed_ms")),
@@ -124,6 +226,7 @@ def _fixed_outcome(branch_ordinal: int | None, outcome: str, record: Mapping[str
         "failure_class": "unclassified",
         "http_status": None,
         "http_subphase": "unknown",
+        "push_ref_verdict": "unknown",
         "git_returncode": None,
         "signal": None,
         "elapsed_ms": finite_elapsed_ms(source.get("elapsed_ms")) if outcome == "passed" else None,
@@ -148,18 +251,27 @@ def sanitize_concurrent_outcomes(value: Any) -> list[dict[str, Any]]:
 
     The list is capped at the three known branch ids.  Entries with unlisted or
     missing keys, duplicate branch ids, wrong types, or unrecognized outcome ids
-    are rejected.  Records predating ``elapsed_ms`` receive a null duration.
-    Unrecognized phase/class/subphase strings are normalized to the fixed
-    ``unknown`` ids so no caller text can surface.
+    are rejected.  Records predating ``elapsed_ms`` receive a null duration and
+    records predating ``push_ref_verdict`` receive the fixed ``unknown`` id so
+    older receipts stay readable.  Unrecognized phase/class/subphase/verdict
+    strings are normalized to ``unknown`` so no caller text can surface.
     """
     if not isinstance(value, (list, tuple)) or len(value) > CONCURRENT_OUTCOME_LIMIT:
         return []
-    fields = set(CONCURRENT_OUTCOME_FIELDS)
-    legacy_fields = fields - {"elapsed_ms"}
+    fields = frozenset(CONCURRENT_OUTCOME_FIELDS)
+    accepted_fields = tuple(
+        fields - removed
+        for removed in (
+            frozenset(),
+            frozenset({"elapsed_ms"}),
+            frozenset({"push_ref_verdict"}),
+            frozenset({"elapsed_ms", "push_ref_verdict"}),
+        )
+    )
     seen: set[int] = set()
     projected: list[dict[str, Any]] = []
     for item in value:
-        if not isinstance(item, Mapping) or set(item.keys()) not in (fields, legacy_fields):
+        if not isinstance(item, Mapping) or frozenset(item.keys()) not in accepted_fields:
             continue
         branch = item.get("branch_ordinal")
         if isinstance(branch, bool) or not isinstance(branch, int) or not 0 <= branch < CONCURRENT_OUTCOME_LIMIT:

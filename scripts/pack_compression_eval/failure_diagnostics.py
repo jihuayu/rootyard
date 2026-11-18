@@ -21,8 +21,11 @@ from .concurrent_outcomes import (
     FAILURE_CLASSES,
     HTTP_SUBPHASES,
     PHASES,
+    PUSH_REF_VERDICTS,
     finite_elapsed_ms,
     finite_http_subphase,
+    finite_push_ref_verdict,
+    push_expected_destination,
     sanitize_concurrent_outcomes,
 )
 from .corpus import DATASET_ARCHETYPES, OBJECT_FORMATS
@@ -83,6 +86,7 @@ _RECORD_FIELDS = (
     "signal",
     "http_status",
     "http_subphase",
+    "push_ref_verdict",
     "elapsed_ms",
     "last_completed_phase",
     "completed",
@@ -276,6 +280,7 @@ def build_failure_record(
     signal: Any = None,
     http_status: Any = None,
     http_subphase: Any = "unknown",
+    push_ref_verdict: Any = "unknown",
     elapsed_ms: Any = None,
     last_completed_phase: Any = "unknown",
     completed: Any = None,
@@ -306,6 +311,7 @@ def build_failure_record(
         "signal": _signal(signal),
         "http_status": _http_status(http_status),
         "http_subphase": _choice(http_subphase, HTTP_SUBPHASES),
+        "push_ref_verdict": _choice(push_ref_verdict, PUSH_REF_VERDICTS),
         "elapsed_ms": finite_elapsed_ms(elapsed_ms),
         "last_completed_phase": _choice(last_completed_phase, PROGRESS_PHASES),
         "completed": completed_counts(completed),
@@ -362,8 +368,13 @@ def git_failure_record(
     returncode: Any = None,
     elapsed_ms: Any = None,
     stderr: bytes | bytearray | None = None,
+    stdout: bytes | bytearray | None = None,
+    expected_destination: Any = None,
 ) -> dict[str, Any]:
-    """Build a push-boundary record; raw stderr is parsed and never retained."""
+    """Push-boundary record; raw stdout/stderr are parsed and never kept.
+
+    HTTP fields come only from stderr, independent of the per-ref verdict.
+    """
     values = context if isinstance(context, Mapping) else {}
     code, signal = child_outcome(returncode)
     status = finite_http_status(stderr)
@@ -381,6 +392,7 @@ def git_failure_record(
         signal=signal,
         http_status=status,
         http_subphase=finite_http_subphase(stderr, status),
+        push_ref_verdict=finite_push_ref_verdict(stdout, expected_destination),
         elapsed_ms=elapsed_ms,
         completed=values.get("completed"),
         last_completed_phase=values.get("last_completed_phase"),
@@ -474,8 +486,10 @@ __all__ = [
     "failure_record_from_exception",
     "finalize_cleanup",
     "finite_http_status",
+    "finite_push_ref_verdict",
     "git_failure_record",
     "push_context",
+    "push_expected_destination",
     "safe_summary",
     "sanitize_bindings",
     "sanitize_s3_snapshot",
