@@ -1,0 +1,283 @@
+//! P0 admission, real P1 ref B advance, production superseded refusal and the
+//! read-only retirement selection.
+
+use super::db::deadline;
+use super::{
+    REF_RETRY, REF_SIDE, Retired, SLOT_ZERO_LANE, db, git, pack,
+    publication::{
+        authorized_commit, capture_baseline, child_commit, plan_from_baseline, ref_update, stage, wire_digest,
+    },
+    readback::{operation_record, publication_for, stored_ref},
+    serving,
+};
+use anyhow::{Result, anyhow, bail, ensure};
+use rootyard::blob_store::opendal::BlobStore;
+use rootyard::ref_store::{
+    CommitMode, CommitRejectCode, GitObjectFormat, IssuerLane, OperationLookup, OperationState, RefCommitResult,
+    TerminalKind,
+    core::pack_commit::{
+        PackCommitBaseline, PackCommitError, PackCommitPlan, PackCommitTerminal, PackPendingToken, PgAuthorizedCommit,
+    },
+    pg::{
+        PgRefStore,
+        public_attempt::PublicAttemptRequest,
+        public_terminal::{PublicAttemptRetirement, PublicAttemptTerminalOutcome},
+        slot_zero::{SlotZeroAdmissionRequest, SlotZeroReceipt},
+    },
+};
+use std::path::Path;
+use uuid::Uuid;
+
+/// Admit P0 for the exact ref A wire command, stage its real A3/A4 artifacts,
+/// advance the gate through a separate authorized P1 ref B command, refuse P0
+/// through the production superseded writer, and select the retirement through
+/// the production mirror without mutating the pending wrapper.
+pub(super) async fn retire_p0(db: &db::Db, store: &BlobStore, git: &Path) -> Result<Retired> {
+    let (verified, actor, repository) = serving::verify_new_serving(db, store, git, "slot-one-native").await?;
+    let gate0 = db::gate_version(&db.pool, repository.id, actor.id).await?;
+    ensure!(gate0.revision() == verified.gate.revision(), "initial gate revision differs from the serving receipt");
+    let format = gate0.object_format();
+    ensure!(format == GitObjectFormat::Sha1, "the shared serving fixture must provision a sha1 repository");
+    let main_oid = verified.commit_oid.clone();
+
+    let retry_oid =
+        child_commit(&verified.fixture, &main_oid, "retry.txt", b"slot-zero retry\n", "slot zero retry").await?;
+    let side_oid = child_commit(&verified.fixture, &main_oid, "side.txt", b"side advance\n", "side advance").await?;
+    verified.fixture.update_ref(REF_RETRY, &retry_oid).await?;
+    let p0_files = verified.fixture.pack_all("slot-zero-p0").await?;
+    verified.fixture.update_ref(REF_SIDE, &side_oid).await?;
+    let p1_files = verified.fixture.pack_all("slot-zero-p1").await?;
+
+    let lane = IssuerLane::new(SLOT_ZERO_LANE)?;
+    let refs0 = vec![ref_update(format, REF_RETRY, None, &retry_oid)?];
+    let wire0 = wire_digest(format, REF_RETRY, None, &retry_oid, CommitMode::Atomic);
+    let public = PublicAttemptRequest {
+        repository_id: repository.id,
+        admission_owner_id: actor.id,
+        issuer_id: actor.id,
+        public_id: Uuid::new_v4(),
+        wire_digest: wire0,
+        request_mode: CommitMode::Atomic,
+        backend_identity: store.backend_identity().as_hex().to_owned(),
+        object_format: format,
+        history_incarnation: gate0.history_incarnation(),
+        authority_epoch: gate0.authority_epoch(),
+        group_epoch: gate0.group_epoch(),
+        restore_incarnation: db::cluster_incarnation(&db.pool).await?,
+    };
+    let private0 = Uuid::new_v4();
+    let baseline0 = capture_baseline(db, repository.id, actor.id).await?;
+    let (admission, plan) =
+        admit_slot_zero(db, &public, private0, &lane, &baseline0, refs0, std::slice::from_ref(&p0_files)).await?;
+
+    // Real A3 protected upload + real A4 registration. These artifacts remain
+    // durable but are never promoted: P0 does not commit.
+    stage(db, store, &plan, &p0_files).await?;
+    ensure!(plan.packs().len() == 1, "P0 fixture plan must have one pack");
+    let p0_publication = publication_for(db, repository.id, private0).await?;
+    ensure!(
+        p0_publication.parent_digest == plan.parent_digest().as_hex(),
+        "P0 A4 registration parent digest differs from the admitted plan"
+    );
+    ensure!(p0_publication.pack_id == plan.packs()[0].pack_id(), "P0 A4 registration pack id differs");
+    ensure!(p0_publication.registration_id == plan.packs()[0].registration_id(), "P0 A4 registration id differs");
+
+    let gate_before_p1 = db::gate_version(&db.pool, repository.id, actor.id).await?;
+    ensure!(
+        gate_before_p1.revision() == gate0.revision(),
+        "P0 admission advanced the gate before the unrelated P1 advance"
+    );
+    let draft1 = pack::draft(
+        db,
+        repository.id,
+        actor.id,
+        2,
+        &gate_before_p1,
+        vec![ref_update(format, REF_SIDE, None, &side_oid)?],
+        std::slice::from_ref(&p1_files),
+    )
+    .await?;
+    stage(db, store, &draft1.plan, &p1_files).await?;
+    let receipt1 = authorized_commit(db, store, git, &actor, draft1.plan.clone()).await?;
+    let gate1 = db::gate_version(&db.pool, repository.id, actor.id).await?;
+    ensure!(
+        gate1.revision() == receipt1.terminal.revision && gate1.revision() == gate0.revision() + 1,
+        "P1 authorized commit did not advance the gate exactly once"
+    );
+    ensure!(
+        stored_ref(db, repository.id, "refs/heads/main").await?.as_deref() == Some(main_oid.as_str()),
+        "P1 changed the unrelated main ref"
+    );
+    ensure!(
+        stored_ref(db, repository.id, REF_SIDE).await?.as_deref() == Some(side_oid.as_str()),
+        "P1 ref B is not visible"
+    );
+    ensure!(stored_ref(db, repository.id, REF_RETRY).await?.is_none(), "P0 became visible before any commit");
+
+    let token = PackPendingToken::established(repository.id, actor.id, private0, *plan.parent_digest())?;
+    let authorized = PgAuthorizedCommit::new(store.clone(), git.to_path_buf())
+        .map_err(|error| anyhow!("authorized adapter rejected the slot-zero fixture: {error:?}"))?;
+    let terminal = authorized
+        .reject_superseded_serving(&db.pool, &token, &plan, &actor, wire0, deadline())
+        .await
+        .map_err(|error| anyhow!("authorized superseded refusal failed ({}): {error:?}", error.code()))?
+        .ok_or_else(|| anyhow!("authorized superseded refusal observed no advanced gate"))?;
+    ensure!(terminal.kind == TerminalKind::Rejected, "P0 superseded terminal is not a rejection");
+    ensure!(terminal.revision == gate1.revision(), "P0 rejection did not observe the advanced gate");
+    ensure!(terminal.registrations.is_empty(), "P0 superseded rejection names active registrations");
+    let rejection = terminal.rejection.as_ref().ok_or_else(|| anyhow!("P0 rejection has no typed reason"))?;
+    ensure!(rejection.code == "revision_mismatch", "P0 rejection code is not revision_mismatch");
+    ensure!(
+        terminal.refs.iter().any(|result| matches!(
+            result,
+            RefCommitResult::NotApplied { name, reason: CommitRejectCode::OldOidMismatch } if name.as_str() == REF_RETRY
+        )),
+        "P0 rejection did not leave the retried ref unapplied"
+    );
+
+    let record = operation_record(db, repository.id, private0).await?;
+    ensure!(record.state() == OperationState::Rejected, "P0 operation is not durably rejected");
+    let durable = PackCommitTerminal::from_terminal_result(
+        record.terminal_result().ok_or_else(|| anyhow!("P0 rejected operation has no terminal result"))?,
+    )
+    .map_err(|error| anyhow!("P0 durable terminal is not a pack commit terminal: {error:?}"))?;
+    ensure!(durable.registrations.is_empty(), "P0 durable rejection names active registrations");
+
+    let wrapper_before = wrapper_json(db, repository.id, public.public_id).await?;
+    let retirement = retirement_required(db, &public, private0).await?;
+    let wrapper_after = wrapper_json(db, repository.id, public.public_id).await?;
+    ensure!(wrapper_before == wrapper_after, "the retirement selection mutated the pending wrapper");
+    ensure!(
+        retirement.event_revision == gate1.revision(),
+        "selected retirement does not name the current advanced gate"
+    );
+    ensure!(
+        operation_record(db, repository.id, private0).await?.state() == OperationState::Rejected,
+        "the mirror selection changed the durable P0 terminal"
+    );
+
+    Ok(Retired {
+        verified,
+        actor,
+        repository,
+        retry_oid,
+        side_oid,
+        p0_files,
+        public,
+        admission,
+        plan,
+        retirement,
+        gate: gate1,
+    })
+}
+
+async fn admit_slot_zero(
+    db: &db::Db,
+    public: &PublicAttemptRequest,
+    private_id: Uuid,
+    lane: &IssuerLane,
+    baseline: &PackCommitBaseline,
+    refs: Vec<RefUpdate>,
+    files: &[git::PairFiles],
+) -> Result<(SlotZeroReceipt, PackCommitPlan)> {
+    let request = SlotZeroAdmissionRequest {
+        repository_id: public.repository_id,
+        admission_owner_id: public.admission_owner_id,
+        issuer_id: public.issuer_id,
+        lane: lane.clone(),
+        public_id: public.public_id,
+        private_id,
+        wire_digest: public.wire_digest,
+        request_mode: public.request_mode,
+        backend_identity: public.backend_identity.clone(),
+        object_format: public.object_format,
+        history_incarnation: public.history_incarnation,
+        authority_epoch: public.authority_epoch,
+        group_epoch: public.group_epoch,
+        restore_incarnation: public.restore_incarnation,
+    };
+
+    let mut client = db.pool.get().await?;
+    let tx = client.transaction().await?;
+    let mut built = None;
+    let admission = PgRefStore
+        .admit_slot_zero_in_tx(
+            tx,
+            &request,
+            |preview| {
+                if preview.base_revision() != baseline.gate().revision() {
+                    return Err(PackCommitError::Invalid(
+                        "slot zero preview gate revision drifted from the captured baseline",
+                    ));
+                }
+                let plan = plan_from_baseline(
+                    baseline,
+                    request.admission_owner_id,
+                    preview.sequence(),
+                    request.private_id,
+                    &request.lane,
+                    refs.clone(),
+                    files,
+                )?;
+                built = Some(plan.clone());
+                Ok(plan)
+            },
+            deadline(),
+        )
+        .await
+        .map_err(|error| anyhow!("slot zero admission aborted: {error:?}"))?;
+    let (tx, result) = admission.into_parts();
+    let receipt = result.map_err(|error| anyhow!("slot zero admission refused: {error:?}"))?;
+    let plan = built.ok_or_else(|| anyhow!("slot zero admission did not build a plan"))?;
+    ensure!(!receipt.replayed, "fresh slot zero admission replayed");
+    ensure!(receipt.state == OperationState::Pending, "slot zero receipt is not pending");
+    ensure!(receipt.public_id == public.public_id, "slot zero receipt public id differs");
+    ensure!(receipt.private_id == private_id, "slot zero receipt private id differs");
+    ensure!(plan.identity().operation_id() == private_id, "slot zero plan private id differs");
+    ensure!(plan.parent_digest() == &receipt.plan_digest, "slot zero plan digest differs from the receipt");
+    tx.commit().await?;
+    Ok((receipt, plan))
+}
+
+async fn retirement_required(
+    db: &db::Db,
+    public: &PublicAttemptRequest,
+    private_id: Uuid,
+) -> Result<PublicAttemptRetirement> {
+    let mut client = db.pool.get().await?;
+    let tx = client.transaction().await?;
+    let record = match PgRefStore
+        .get(&tx, public.repository_id, private_id, deadline())
+        .await
+        .map_err(|error| anyhow!("P0 operation lookup failed: {error:?}"))?
+    {
+        OperationLookup::Known(record) => record,
+        _ => bail!("P0 operation is not visible to the terminal mirror"),
+    };
+    ensure!(record.state() == OperationState::Rejected, "P0 operation is not durably rejected");
+    let outcome = PgRefStore
+        .mirror_public_attempt_terminal_in_tx(&tx, public, &record, deadline())
+        .await
+        .map_err(|error| anyhow!("public terminal mirror failed: {error:?}"))?;
+    let retirement = match outcome {
+        PublicAttemptTerminalOutcome::RetirementRequired(retirement) => retirement,
+        PublicAttemptTerminalOutcome::Mirrored(receipt) => {
+            bail!("terminal mirror published instead of selecting retirement: {receipt:?}")
+        }
+    };
+    tx.rollback().await?;
+    Ok(retirement)
+}
+
+async fn wrapper_json(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> Result<serde_json::Value> {
+    let row = db
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT to_jsonb(w) FROM ref_store_public_operations w WHERE w.repository_id=$1 AND w.public_id=$2",
+            &[&repository_id, &public_id],
+        )
+        .await?;
+    Ok(row.get(0))
+}

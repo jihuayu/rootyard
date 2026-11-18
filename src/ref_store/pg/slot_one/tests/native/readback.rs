@@ -1,0 +1,201 @@
+//! Durable operation/ref/publication/attempt readback and A5 snapshot checks.
+
+use super::db::deadline;
+use super::{REF_RETRY, REF_SIDE, Retired, db, pack};
+use anyhow::{Result, anyhow, bail, ensure};
+use rootyard::blob_store::opendal::BlobStore;
+use rootyard::ref_store::{
+    CapturedRef, OperationLookup, OperationRecord, OperationState,
+    core::pack_commit::{PackCommitPlan, PackCommitTerminal},
+    pg::{PgRefStore, slot_one::SlotOneRotationReceipt},
+};
+use uuid::Uuid;
+
+pub(super) async fn operation_record(db: &db::Db, repository_id: Uuid, operation_id: Uuid) -> Result<OperationRecord> {
+    let mut client = db.pool.get().await?;
+    let tx = client.transaction().await?;
+    let lookup = PgRefStore
+        .get(&tx, repository_id, operation_id, deadline())
+        .await
+        .map_err(|error| anyhow!("operation lookup failed: {error:?}"))?;
+    tx.rollback().await?;
+    match lookup {
+        OperationLookup::Known(record) => Ok(record),
+        _ => bail!("operation is not visible"),
+    }
+}
+
+pub(super) async fn stored_ref(db: &db::Db, repository_id: Uuid, name: &str) -> Result<Option<String>> {
+    let name = name.to_owned();
+    let row = db
+        .pool
+        .get()
+        .await?
+        .query_opt(
+            "SELECT oid FROM ref_store_core_refs WHERE repository_id=$1 AND ref_name=$2",
+            &[&repository_id, &name],
+        )
+        .await?;
+    Ok(row.map(|row| row.get(0)))
+}
+
+pub(super) async fn assert_a5_after_rotation(
+    db: &db::Db,
+    store: &BlobStore,
+    retired: &Retired,
+    plan: &PackCommitPlan,
+) -> Result<()> {
+    let source = pack::create_serving_snapshot(db, store, &retired.actor, &retired.repository, 300).await?;
+    ensure!(source.read.head_ref() == "refs/heads/main", "A5 head ref is not main");
+    ensure!(
+        source.read.head_oid_hex() == Some(retired.verified.commit_oid.as_str()),
+        "A5 head oid changed after rotation"
+    );
+    assert_snapshot_ref(source.read.refs(), "refs/heads/main", &retired.verified.commit_oid)?;
+    assert_snapshot_ref(source.read.refs(), REF_RETRY, &retired.retry_oid)?;
+    assert_snapshot_ref(source.read.refs(), REF_SIDE, &retired.side_oid)?;
+    ensure!(source.read.pack_count() > 0, "A5 snapshot has no registered pack membership");
+    ensure!(
+        source.read.packs().iter().any(|pack| pack.pack_id() == plan.packs()[0].pack_id()),
+        "A5 snapshot omits the rotated P2 pack"
+    );
+    ensure!(
+        !source.read.packs().iter().any(|pack| pack.pack_id() == retired.plan.packs()[0].pack_id()),
+        "A5 snapshot promoted the retired P0 pack"
+    );
+    Ok(())
+}
+
+fn assert_snapshot_ref(refs: &[CapturedRef], name: &str, oid: &str) -> Result<()> {
+    let reference =
+        refs.iter().find(|reference| reference.name() == name).ok_or_else(|| anyhow!("A5 snapshot omits {name}"))?;
+    ensure!(reference.oid_hex() == oid, "A5 snapshot {name} differs from the durable ref");
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct PublicationRow {
+    pub(super) plan_operation_id: Uuid,
+    pub(super) parent_digest: String,
+    pub(super) pack_id: Uuid,
+    pub(super) registration_id: Uuid,
+    pub(super) gate_revision: i64,
+}
+
+async fn publication_rows(db: &db::Db, repository_id: Uuid) -> Result<Vec<PublicationRow>> {
+    let rows = db
+        .pool
+        .get()
+        .await?
+        .query(
+            "SELECT plan_operation_id,parent_digest,pack_id,registration_id,gate_revision
+               FROM ref_store_core_pack_publications
+              WHERE repository_id=$1
+              ORDER BY created_at, registration_id",
+            &[&repository_id],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| PublicationRow {
+            plan_operation_id: row.get(0),
+            parent_digest: row.get(1),
+            pack_id: row.get(2),
+            registration_id: row.get(3),
+            gate_revision: row.get(4),
+        })
+        .collect())
+}
+
+pub(super) async fn publication_for(db: &db::Db, repository_id: Uuid, operation_id: Uuid) -> Result<PublicationRow> {
+    let mut matching =
+        publication_rows(db, repository_id).await?.into_iter().filter(|row| row.plan_operation_id == operation_id);
+    let row = matching.next().ok_or_else(|| anyhow!("publication row is missing for the operation"))?;
+    ensure!(matching.next().is_none(), "operation has more than one publication row");
+    Ok(row)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AttemptRow {
+    slot: i16,
+    private_id: Uuid,
+    plan_digest: String,
+    proof_digest: String,
+    base_revision: i64,
+}
+
+async fn attempt_rows(db: &db::Db, repository_id: Uuid, public_id: Uuid) -> Result<Vec<AttemptRow>> {
+    let rows = db
+        .pool
+        .get()
+        .await?
+        .query(
+            "SELECT slot,private_id,plan_digest,proof_digest,base_revision
+               FROM ref_store_private_attempts
+              WHERE repository_id=$1 AND public_id=$2
+              ORDER BY slot",
+            &[&repository_id, &public_id],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AttemptRow {
+            slot: row.get(0),
+            private_id: row.get(1),
+            plan_digest: row.get(2),
+            proof_digest: row.get(3),
+            base_revision: row.get(4),
+        })
+        .collect())
+}
+
+pub(super) async fn assert_no_registry_promotion(
+    db: &db::Db,
+    retired: &Retired,
+    plan: &PackCommitPlan,
+    rotation: &SlotOneRotationReceipt,
+    p0_before: &PublicationRow,
+) -> Result<()> {
+    let p0_after = publication_for(db, retired.repository.id, retired.admission.private_id).await?;
+    ensure!(p0_before == &p0_after, "P2 rewrote the durable P0 publication registration");
+    let p2 = publication_for(db, retired.repository.id, rotation.private_id).await?;
+
+    ensure!(p0_before.parent_digest == retired.plan.parent_digest().as_hex(), "P0 publication parent digest differs");
+    ensure!(p0_before.pack_id == retired.plan.packs()[0].pack_id(), "P0 publication pack id differs");
+    ensure!(
+        p0_before.registration_id == retired.plan.packs()[0].registration_id(),
+        "P0 publication registration id differs"
+    );
+    ensure!(p0_before.gate_revision == retired.plan.expected().revision(), "P0 publication gate revision differs");
+    ensure!(p2.parent_digest == plan.parent_digest().as_hex(), "P2 publication parent digest differs");
+    ensure!(p2.pack_id == plan.packs()[0].pack_id(), "P2 publication pack id differs");
+    ensure!(p2.registration_id == plan.packs()[0].registration_id(), "P2 publication registration id differs");
+    ensure!(p2.gate_revision == plan.expected().revision(), "P2 publication gate revision differs");
+    ensure!(p0_before.pack_id != p2.pack_id, "P2 reused the retired pack id");
+    ensure!(p0_before.registration_id != p2.registration_id, "P2 reused the retired registration id");
+    ensure!(p0_before.parent_digest != p2.parent_digest, "P2 reused the retired parent digest");
+
+    let attempts = attempt_rows(db, retired.repository.id, retired.public.public_id).await?;
+    ensure!(attempts.len() == 2, "rotated wrapper does not have exactly two private attempts");
+    let slot_zero = &attempts[0];
+    ensure!(slot_zero.slot == 0, "retired attempt is not slot zero");
+    ensure!(slot_zero.private_id == retired.admission.private_id, "retired attempt private id changed");
+    ensure!(slot_zero.plan_digest == retired.admission.plan_digest.as_hex(), "retired attempt plan digest changed");
+    ensure!(slot_zero.proof_digest == retired.admission.proof_digest.as_hex(), "retired attempt proof digest changed");
+    ensure!(slot_zero.base_revision == retired.admission.base_revision, "retired attempt base revision changed");
+    let slot_one = &attempts[1];
+    ensure!(slot_one.slot == 1, "rotated attempt is not slot one");
+    ensure!(slot_one.private_id == rotation.private_id, "rotated attempt private id differs");
+    ensure!(slot_one.plan_digest == rotation.plan_digest.as_hex(), "rotated attempt plan digest differs");
+    ensure!(slot_one.proof_digest == rotation.proof_digest.as_hex(), "rotated attempt proof digest differs");
+    ensure!(slot_one.base_revision == rotation.base_revision, "rotated attempt base revision differs");
+
+    let record = operation_record(db, retired.repository.id, retired.admission.private_id).await?;
+    ensure!(record.state() == OperationState::Rejected, "P0 durable rejection was rewritten by rotation");
+    let terminal = PackCommitTerminal::from_terminal_result(
+        record.terminal_result().ok_or_else(|| anyhow!("P0 rejected operation has no terminal result"))?,
+    )
+    .map_err(|error| anyhow!("P0 durable terminal is not a pack commit terminal: {error:?}"))?;
+    ensure!(terminal.registrations.is_empty(), "P0 durable rejection gained a registration");
+    Ok(())
+}
