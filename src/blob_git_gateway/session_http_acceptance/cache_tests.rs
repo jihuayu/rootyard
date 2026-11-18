@@ -40,9 +40,11 @@ use crate::cache_wake::ServingCache;
 const OWNED_POSTGRES_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_POSTGRES";
 const OWNED_BLOB_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB";
 
-/// One finite deadline for the pause rendezvous and for reaping the selected
-/// request; no cleanup path sleeps or starts a second bounded wait.
-const PAUSED_REQUEST_LIMIT: Duration = Duration::from_secs(30);
+/// Strict absolute bound for one paused case's rendezvous, action and request.
+const CASE_LIMIT: Duration = Duration::from_secs(30);
+/// Separate short bound for aborting/reaping and for draining the server once
+/// the case deadline has expired. It starts only when cleanup begins.
+const CLEANUP_LIMIT: Duration = Duration::from_secs(5);
 
 /// Owns one selected loopback request and the pause it may be waiting on.
 /// Normal success and every `?` path join or reap the task; dropping the guard
@@ -57,17 +59,20 @@ impl<T> PausedRequest<T> {
         Self { pause, task: Some(task) }
     }
 
-    async fn join(mut self, deadline: Instant) -> Result<T> {
+    async fn join(mut self, case_deadline: Instant, cleanup_limit: Duration) -> (Result<T>, bool) {
         self.pause.release();
-        let task = self.task.take().ok_or_else(|| anyhow!("selected paused request was already reaped"))?;
-        join_bounded(task, deadline).await
+        let Some(task) = self.task.take() else {
+            return (Err(anyhow!("selected paused request was already reaped")), false);
+        };
+        join_bounded(task, case_deadline, cleanup_limit).await
     }
 
-    async fn reap(mut self, deadline: Instant) {
+    async fn reap(mut self, cleanup_limit: Duration) -> bool {
         self.pause.release();
-        if let Some(task) = self.task.take() {
-            let _ = join_bounded(task, deadline).await;
-        }
+        let Some(mut task) = self.task.take() else { return true };
+        task.abort();
+        let cleanup_deadline = Instant::now() + cleanup_limit;
+        tokio::time::timeout_at(cleanup_deadline, &mut task).await.is_ok()
     }
 }
 
@@ -82,44 +87,123 @@ impl<T> Drop for PausedRequest<T> {
     }
 }
 
-async fn join_bounded<T>(mut task: JoinHandle<Result<T>>, deadline: Instant) -> Result<T> {
-    match tokio::time::timeout_at(deadline, &mut task).await {
-        Ok(joined) => joined.context("paused cache-hit request task")?,
+async fn join_bounded<T>(
+    mut task: JoinHandle<Result<T>>,
+    case_deadline: Instant,
+    cleanup_limit: Duration,
+) -> (Result<T>, bool) {
+    match tokio::time::timeout_at(case_deadline, &mut task).await {
+        Ok(joined) => {
+            let result = joined.context("paused cache-hit request task").and_then(|result| result);
+            (result, true)
+        }
         Err(_) => {
             task.abort();
-            let _ = task.await;
-            Err(anyhow!("paused cache-hit request did not complete before its deadline"))
+            let cleanup_deadline = Instant::now() + cleanup_limit;
+            let terminated = tokio::time::timeout_at(cleanup_deadline, &mut task).await.is_ok();
+            (Err(anyhow!("paused cache-hit request did not complete before the case deadline")), terminated)
         }
     }
 }
 
 /// Run one exact-OID request that must reach the real cache-hit pause. The
-/// selected request is released and joined on success; every earlier error or
-/// timeout releases it and reaps it under the same deadline before returning
-/// the original error.
+/// action is polled only under the strict absolute case deadline. On success
+/// the request is released and joined; every earlier error or timeout releases
+/// it and aborts it under the separate cleanup deadline. The boolean proves the
+/// request task was awaited to completion, so an unproven cleanup can retain
+/// the fixture instead of dropping the database under a live user.
 async fn run_paused_request<T, F>(
     pause: Arc<ReadPause>,
     oid: String,
-    deadline: Instant,
+    case_deadline: Instant,
+    cleanup_limit: Duration,
     request: F,
     while_paused: impl Future<Output = Result<()>>,
-) -> Result<T>
+) -> (Result<T>, bool)
 where
     F: Future<Output = Result<T>> + Send + 'static,
     T: Send + 'static,
 {
     pause.target(oid);
     let mut request = Some(PausedRequest::new(pause.clone(), tokio::spawn(request)));
+    let mut terminated = false;
     let outcome = async {
-        pause.wait_reached(deadline).await?;
-        while_paused.await?;
-        request.take().ok_or_else(|| anyhow!("selected paused request was already reaped"))?.join(deadline).await
+        pause.wait_reached(case_deadline).await?;
+        tokio::time::timeout_at(case_deadline, while_paused)
+            .await
+            .map_err(|_| anyhow!("paused cache-hit action did not complete before the case deadline"))??;
+        let (joined, proven) = request
+            .take()
+            .ok_or_else(|| anyhow!("selected paused request was already reaped"))?
+            .join(case_deadline, cleanup_limit)
+            .await;
+        terminated = proven;
+        joined
     }
     .await;
     if let Some(request) = request.take() {
-        request.reap(deadline).await;
+        terminated = request.reap(cleanup_limit).await;
     }
-    outcome
+    (outcome, terminated)
+}
+
+/// Owns one cache case's database and drainable gateway. The gateway (and its
+/// scratch) is deliberately retained unless both the selected request and the
+/// axum server are proven terminated; `Db::finish` is never called on an
+/// unproven cleanup.
+struct CaseFixture {
+    db: Db,
+    gateway: Option<Gateway>,
+    retain_on_drop: bool,
+}
+
+impl CaseFixture {
+    fn new(db: Db, gateway: Gateway) -> Self {
+        Self { db, gateway: Some(gateway), retain_on_drop: true }
+    }
+
+    fn db(&self) -> &Db {
+        &self.db
+    }
+
+    fn gateway(&self) -> &Gateway {
+        self.gateway.as_ref().expect("case gateway is present until finish")
+    }
+
+    async fn finish(mut self, outcome: Result<()>, request_terminated: bool, cleanup_limit: Duration) -> Result<()> {
+        let cleanup_deadline = Instant::now() + cleanup_limit;
+        let drained = match self.gateway.as_mut() {
+            Some(gateway) => gateway.drain(cleanup_deadline).await,
+            None => Err(anyhow!("case gateway was already released")),
+        };
+        if request_terminated && drained.is_ok() {
+            drop(self.gateway.take());
+            self.retain_on_drop = false;
+            return self.db.finish(outcome).await;
+        }
+        match (outcome, drained) {
+            (Err(error), Ok(())) => {
+                Err(error.context("paused request termination was not proven; retained the owned fixture"))
+            }
+            (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+                "paused request/server termination was not proven; retained the owned fixture: {cleanup_error:#}"
+            ))),
+            (Ok(()), Ok(())) => Err(anyhow!("paused request termination was not proven; retained the owned fixture")),
+            (Ok(()), Err(cleanup_error)) => {
+                Err(cleanup_error.context("owned server termination was not proven; retained the owned fixture"))
+            }
+        }
+    }
+}
+
+impl Drop for CaseFixture {
+    fn drop(&mut self) {
+        if self.retain_on_drop {
+            if let Some(gateway) = self.gateway.take() {
+                std::mem::forget(gateway);
+            }
+        }
+    }
 }
 
 /// Attest that the caller owns one whole disposable database and Blob prefix.
@@ -165,11 +249,17 @@ async fn exact_commit_http_warm_miss_then_actual_hit_is_byte_equal() -> Result<(
     let _serial = super::super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
     require_owned_disposable_fixture()?;
     let db = Db::setup().await?;
+    let gateway = match cache_gateway(&db, None).await {
+        Ok(gateway) => gateway,
+        Err(error) => return db.finish(Err(error)).await,
+    };
+    let fixture = CaseFixture::new(db, gateway);
     let outcome = async {
-        let gateway = cache_gateway(&db, None).await?;
-        let (owner, name, oid) = pushed(&gateway, &db, "commit-cache-hit").await?;
+        let gateway = fixture.gateway();
+        let db = fixture.db();
+        let (owner, name, oid) = pushed(gateway, db, "commit-cache-hit").await?;
         let client = reqwest::Client::new();
-        let url = commit_url(&gateway, &owner, &name, &oid);
+        let url = commit_url(gateway, &owner, &name, &oid);
 
         let first = raw_get(&client, &url, &owner.token, None).await?;
         ensure!(first.status == 200, "warm exact-OID GET returned {}", first.status);
@@ -191,7 +281,7 @@ async fn exact_commit_http_warm_miss_then_actual_hit_is_byte_equal() -> Result<(
         Ok(())
     }
     .await;
-    db.finish(outcome).await
+    fixture.finish(outcome, true, CLEANUP_LIMIT).await
 }
 
 #[tokio::test]
@@ -200,25 +290,33 @@ async fn exact_commit_http_hit_still_enforces_final_live_authorization() -> Resu
     let _serial = super::super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
     require_owned_disposable_fixture()?;
     let db = Db::setup().await?;
+    let pause = Arc::new(ReadPause::new());
+    let gateway = match cache_gateway(&db, Some(pause.clone())).await {
+        Ok(gateway) => gateway,
+        Err(error) => return db.finish(Err(error)).await,
+    };
+    let fixture = CaseFixture::new(db, gateway);
+    let mut request_terminated = true;
     let outcome = async {
-        let pause = Arc::new(ReadPause::new());
-        let gateway = cache_gateway(&db, Some(pause.clone())).await?;
-        let (owner, name, oid) = pushed(&gateway, &db, "commit-cache-auth").await?;
+        let gateway = fixture.gateway();
+        let db = fixture.db();
+        let (owner, name, oid) = pushed(gateway, db, "commit-cache-auth").await?;
         let collaborator = actor::stranger(&db.pool).await?;
-        let repo = serving(&db, &gateway, &owner, &name, false).await?;
-        add_read_collaborator(&db, repo.gate.repository_id(), repo.gate.tenant_id(), collaborator.identity.id).await?;
+        let repo = serving(db, gateway, &owner, &name, false).await?;
+        add_read_collaborator(db, repo.gate.repository_id(), repo.gate.tenant_id(), collaborator.identity.id).await?;
 
         let client = reqwest::Client::new();
-        let url = commit_url(&gateway, &owner, &name, &oid);
+        let url = commit_url(gateway, &owner, &name, &oid);
         let warm = raw_get(&client, &url, &collaborator.token, None).await?;
         ensure!(warm.status == 200, "warm collaborator GET returned {}", warm.status);
         let before = gateway.cache_stats().ok_or_else(|| anyhow!("cache stats are absent"))?;
 
-        let deadline = Instant::now() + PAUSED_REQUEST_LIMIT;
-        let denied = run_paused_request(
+        let case_deadline = Instant::now() + CASE_LIMIT;
+        let (denied, terminated) = run_paused_request(
             pause.clone(),
             oid.clone(),
-            deadline,
+            case_deadline,
+            CLEANUP_LIMIT,
             {
                 let client = client.clone();
                 let url = url.clone();
@@ -229,9 +327,11 @@ async fn exact_commit_http_hit_still_enforces_final_live_authorization() -> Resu
             // lookup. Revoke the live grant only now, before finalize's
             // encoded-response revalidation, so this is a last-mile
             // authorization fence, not a pre-lookup refusal.
-            remove_collaborator(&db, repo.gate.repository_id(), collaborator.identity.id),
+            remove_collaborator(db, repo.gate.repository_id(), collaborator.identity.id),
         )
-        .await?;
+        .await;
+        request_terminated = terminated;
+        let denied = denied?;
         ensure!(!status_succeeds(denied.status), "a revoked cache-hit grant still returned a success status");
         ensure!(is_denial(denied.status), "cache-hit final authorization refusal status was {}", denied.status);
         ensure_no_disclosure(&denied.body, &[oid.as_str(), PUSHED_REF], "cache-hit final authorization refusal")?;
@@ -245,7 +345,7 @@ async fn exact_commit_http_hit_still_enforces_final_live_authorization() -> Resu
         Ok(())
     }
     .await;
-    db.finish(outcome).await
+    fixture.finish(outcome, request_terminated, CLEANUP_LIMIT).await
 }
 
 #[tokio::test]
@@ -254,22 +354,30 @@ async fn exact_commit_http_hit_still_enforces_restore_incarnation_fence() -> Res
     let _serial = super::super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
     require_owned_disposable_fixture()?;
     let db = Db::setup().await?;
+    let pause = Arc::new(ReadPause::new());
+    let gateway = match cache_gateway(&db, Some(pause.clone())).await {
+        Ok(gateway) => gateway,
+        Err(error) => return db.finish(Err(error)).await,
+    };
+    let fixture = CaseFixture::new(db, gateway);
+    let mut request_terminated = true;
     let outcome = async {
-        let pause = Arc::new(ReadPause::new());
-        let gateway = cache_gateway(&db, Some(pause.clone())).await?;
-        let (owner, name, oid) = pushed(&gateway, &db, "commit-cache-restore").await?;
+        let gateway = fixture.gateway();
+        let db = fixture.db();
+        let (owner, name, oid) = pushed(gateway, db, "commit-cache-restore").await?;
         let client = reqwest::Client::new();
-        let url = commit_url(&gateway, &owner, &name, &oid);
+        let url = commit_url(gateway, &owner, &name, &oid);
 
         let warm = raw_get(&client, &url, &owner.token, None).await?;
         ensure!(warm.status == 200, "warm owner GET returned {}", warm.status);
         let before = gateway.cache_stats().ok_or_else(|| anyhow!("cache stats are absent"))?;
 
-        let deadline = Instant::now() + PAUSED_REQUEST_LIMIT;
-        let denied = run_paused_request(
+        let case_deadline = Instant::now() + CASE_LIMIT;
+        let (denied, terminated) = run_paused_request(
             pause.clone(),
             oid.clone(),
-            deadline,
+            case_deadline,
+            CLEANUP_LIMIT,
             {
                 let client = client.clone();
                 let url = url.clone();
@@ -296,7 +404,9 @@ async fn exact_commit_http_hit_still_enforces_restore_incarnation_fence() -> Res
                 Ok(())
             },
         )
-        .await?;
+        .await;
+        request_terminated = terminated;
+        let denied = denied?;
         ensure!(denied.status == 503, "cache-hit restore fence expected 503, got {}", denied.status);
         ensure!(contains(&denied.body, AUTHORITY_CHANGED), "cache-hit restore refusal did not name the anchor change");
         ensure_no_disclosure(&denied.body, &[oid.as_str(), PUSHED_REF], "cache-hit restore refusal")?;
@@ -310,7 +420,7 @@ async fn exact_commit_http_hit_still_enforces_restore_incarnation_fence() -> Res
         Ok(())
     }
     .await;
-    db.finish(outcome).await
+    fixture.finish(outcome, request_terminated, CLEANUP_LIMIT).await
 }
 
 #[tokio::test]
@@ -319,17 +429,23 @@ async fn exact_commit_http_cached_oid_is_not_served_after_it_becomes_unreachable
     let _serial = super::super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
     require_owned_disposable_fixture()?;
     let db = Db::setup().await?;
+    let gateway = match cache_gateway(&db, None).await {
+        Ok(gateway) => gateway,
+        Err(error) => return db.finish(Err(error)).await,
+    };
+    let fixture = CaseFixture::new(db, gateway);
     let outcome = async {
-        let gateway = cache_gateway(&db, None).await?;
+        let gateway = fixture.gateway();
+        let db = fixture.db();
         let owner = actor::owner(&db.pool).await?;
         let name = unique_name("commit-cache-unreachable");
         gateway.create_repository(&owner, &name).await?;
-        gateway.provision_decision_realm(&db, &owner, &name).await?;
+        gateway.provision_decision_realm(db, &owner, &name).await?;
         let (_work, checkout) = gateway.clone_checkout(&owner, &name).await?;
         let oid = gateway.commit_and_push(&checkout, COMMIT_FILE, "cached origin body\n", "cached origin").await?;
 
         let client = reqwest::Client::new();
-        let old_url = commit_url(&gateway, &owner, &name, &oid);
+        let old_url = commit_url(gateway, &owner, &name, &oid);
         let warm = raw_get(&client, &old_url, &owner.token, None).await?;
         ensure!(warm.status == 200, "warm exact-OID GET returned {}", warm.status);
         ensure!(contains(&warm.body, &oid), "warm body did not name the exact commit");
@@ -361,11 +477,11 @@ async fn exact_commit_http_cached_oid_is_not_served_after_it_becomes_unreachable
             "unreachable old OID consulted the cache before the live reachable-closure proof"
         );
 
-        let fresh = raw_get(&client, &commit_url(&gateway, &owner, &name, &new_oid), &owner.token, None).await?;
+        let fresh = raw_get(&client, &commit_url(gateway, &owner, &name, &new_oid), &owner.token, None).await?;
         ensure!(fresh.status == 200, "new orphan tip exact-OID GET returned {}", fresh.status);
         ensure!(contains(&fresh.body, &new_oid), "new orphan tip body did not name the new exact commit");
         Ok(())
     }
     .await;
-    db.finish(outcome).await
+    fixture.finish(outcome, true, CLEANUP_LIMIT).await
 }

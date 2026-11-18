@@ -192,18 +192,59 @@ async fn capture_push_session(
 }
 
 /// Abort-on-drop guard for the real `axum::serve` task.
+///
+/// The default fixture keeps the historical abort-on-drop behavior. The
+/// test-only drainable path additionally retains a graceful-shutdown signal so
+/// an explicit owner can wait until `axum::serve` has joined every connection
+/// task before the fixture database is released.
 pub(crate) struct ServerGuard {
     task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl ServerGuard {
     pub(crate) fn start(listener: tokio::net::TcpListener, app: Router) -> Self {
-        Self { task: tokio::spawn(async move { axum::serve(listener, app).await }) }
+        Self { task: tokio::spawn(async move { axum::serve(listener, app).await }), shutdown: None }
+    }
+
+    /// Opt-in graceful path for tests that must prove every axum connection
+    /// task drained before dropping their owned database.
+    pub(crate) fn start_drainable(listener: tokio::net::TcpListener, app: Router) -> Self {
+        let (shutdown, signal) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = signal.await;
+                })
+                .await
+        });
+        Self { task, shutdown: Some(shutdown) }
+    }
+
+    /// Signal graceful shutdown and join the outer serve future, which axum
+    /// only completes after every accepted connection task has finished.
+    pub(crate) async fn shutdown(&mut self, deadline: tokio::time::Instant) -> Result<()> {
+        let Some(shutdown) = self.shutdown.take() else {
+            return Err(anyhow!("loopback server was not started with a drain signal"));
+        };
+        let _ = shutdown.send(());
+        match tokio::time::timeout_at(deadline, &mut self.task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(anyhow!("loopback server exited during drain: {error}")),
+            Ok(Err(error)) => Err(anyhow!("loopback server task failed during drain: {error}")),
+            Err(_) => {
+                self.task.abort();
+                Err(anyhow!("loopback server did not prove all connections drained before the cleanup deadline"))
+            }
+        }
     }
 }
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
         self.task.abort();
     }
 }
