@@ -60,12 +60,13 @@
 // modules in the cfg(test) library graph.
 use super::session_http_acceptance::fixtures::{
     actor::{self, Actor},
-    db::{Db, RUN_BLOB_PREFIX, deadline},
+    db::{Db, RUN_BLOB_PREFIX, deadline, prepare},
     git::{self, Git},
 };
 
 use std::{
     collections::HashMap,
+    io::{self, Write},
     panic::AssertUnwindSafe,
     path::Path,
     sync::{Arc, Mutex, PoisonError},
@@ -83,7 +84,12 @@ use axum::{
 };
 use futures_util::FutureExt;
 use serde_json::Value;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::oneshot,
+    task::JoinHandle,
+    time::{Instant, timeout_at},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -115,18 +121,84 @@ struct ServerGuard {
     task: JoinHandle<Result<(), std::io::Error>>,
 }
 
-impl ServerGuard {
-    /// Explicitly abort and join the real server task so request work is
-    /// settled before the fixture schema is torn down.
-    async fn shutdown(mut self) {
-        self.task.abort();
-        let _ = (&mut self.task).await;
-    }
-}
-
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[derive(Default)]
+struct WitnessResources {
+    pause: Option<Arc<AdmissionPause>>,
+    scratch: Option<tempfile::TempDir>,
+    work: Option<tempfile::TempDir>,
+    shutdown: Option<oneshot::Sender<()>>,
+    server: Option<JoinHandle<io::Result<()>>>,
+    second_push: Option<JoinHandle<Result<git::Output>>>,
+    first_push: Option<JoinHandle<Result<git::Output>>>,
+}
+
+impl WitnessResources {
+    async fn drain_pushes(&mut self) {
+        if let Some(pause) = &self.pause {
+            pause.release();
+        }
+        for push in [&mut self.second_push, &mut self.first_push] {
+            if let Some(task) = push.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    async fn drain_server(&mut self, cleanup_deadline: Instant) -> Result<()> {
+        if let Some(server) = self.server.as_mut() {
+            let signaled = self.shutdown.take().is_some_and(|shutdown| shutdown.send(()).is_ok());
+            let drained = timeout_at(cleanup_deadline, server).await;
+            if drained.is_ok() {
+                self.server = None;
+            }
+            ensure!(signaled && matches!(drained, Ok(Ok(Ok(())))), "gateway server drain unproven; schema retained");
+        }
+        Ok(())
+    }
+
+    async fn teardown(&mut self, db: &Db, fence: &mut Vec<deadpool_postgres::Client>) -> Result<()> {
+        let cleanup_deadline = deadline();
+        self.drain_pushes().await;
+        self.drain_server(cleanup_deadline).await?;
+
+        let capacity = db.pool.status().max_size;
+        ensure!(capacity > 0, "witness pool has no checkout capacity; schema retained");
+        for _ in 0..capacity {
+            let Ok(Ok(client)) = timeout_at(cleanup_deadline, db.pool.get()).await else {
+                return Err(anyhow!("witness pool checkout fence failed; schema retained"));
+            };
+            fence.push(client);
+        }
+        for client in fence {
+            ensure!(
+                matches!(timeout_at(cleanup_deadline, client.simple_query("SELECT 1")).await, Ok(Ok(_))),
+                "witness pool roundtrip failed; schema retained"
+            );
+        }
+
+        db.pool.close();
+        ensure!(Instant::now() < cleanup_deadline, "witness cleanup deadline elapsed; schema retained");
+        ensure!(
+            matches!(timeout_at(cleanup_deadline, db.teardown()).await, Ok(Ok(()))),
+            "witness schema teardown unconfirmed"
+        );
+        Ok(())
+    }
+
+    async fn seal_failed_cleanup(&mut self, db: &Db) {
+        db.pool.close();
+        self.drain_pushes().await;
+        if let Some(server) = self.server.take() {
+            server.abort();
+            let _ = server.await;
+        }
     }
 }
 
@@ -228,53 +300,55 @@ async fn pre_admission_revision_mismatch_rebases_to_old_oid_mismatch() -> Result
 async fn post_admission_independent_refs_both_commit() -> Result<()> {
     require_owned_disposable_blob_fixture()?;
     let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
-    let db = Db::setup().await?;
+    prepare()?;
     require_per_run_blob_prefix()?;
-    let outcome = independent_refs_case(&db).await;
-    db.finish(outcome).await
-}
-
-async fn independent_refs_case(db: &Db) -> Result<()> {
-    let store = open_store()?;
-    let git: &'static Git = Box::leak(Box::new(Git::new()?));
-
-    let first_operation = Uuid::new_v4();
-    let second_operation = Uuid::new_v4();
-    ensure!(first_operation != second_operation, "the independent race pins shared an operation id");
-
-    // The post-admission phase must not consume the existing pre-admission
-    // pause; `new_after_admission` is a distinct selector.
-    let pause = Arc::new(AdmissionPause::new_after_admission(second_operation));
-    let captures = Captures::default();
-    let scratch = tempfile::tempdir().context("temporary gateway scratch root")?;
-    let state = Arc::new(
-        BlobGitState::new(BlobGitConfig {
-            pool: db.pool.clone(),
-            store: store.clone(),
-            git_binary: git.binary().to_path_buf(),
-            scratch_root: scratch.path().to_path_buf(),
-            max_concurrent_requests: 4,
-            max_request_bytes: 16 * 1024 * 1024,
-            max_response_bytes: 64 * 1024 * 1024,
-            max_inflight_bytes: 64 * 1024 * 1024,
-            operation_deadline: Duration::from_secs(120),
-            native_limits: Default::default(),
-        })
-        .map_err(|error| anyhow!("gateway configuration was refused: {error}"))?
-        .with_admission_pause(pause.clone()),
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let app = capture_receive_responses(router(state.clone()), captures.clone());
-    let server = ServerGuard { task: tokio::spawn(async move { axum::serve(listener, app).await }) };
-
-    // Every fallible fixture operation after server startup stays inside the
-    // unwind boundary. The task owners are declared here without fallible
-    // side effects so catch cleanup can release/drain them on every exit.
-    let mut second_push: Option<JoinHandle<Result<git::Output>>> = None;
-    let mut first_push: Option<JoinHandle<Result<git::Output>>> = None;
-    let body_pause = pause.clone();
+    let db = Db::setup().await?;
+    let mut resources = WitnessResources::default();
     let outcome = AssertUnwindSafe(async {
+        let db = &db;
+        let store = open_store()?;
+        let git: &'static Git = Box::leak(Box::new(Git::new()?));
+
+        let first_operation = Uuid::new_v4();
+        let second_operation = Uuid::new_v4();
+        ensure!(first_operation != second_operation, "the independent race pins shared an operation id");
+
+        // The post-admission phase must not consume the existing pre-admission
+        // pause; `new_after_admission` is a distinct selector.
+        let body_pause =
+            resources.pause.insert(Arc::new(AdmissionPause::new_after_admission(second_operation))).clone();
+        let captures = Captures::default();
+        let scratch = resources.scratch.insert(tempfile::tempdir().context("temporary gateway scratch root")?);
+        let state = Arc::new(
+            BlobGitState::new(BlobGitConfig {
+                pool: db.pool.clone(),
+                store: store.clone(),
+                git_binary: git.binary().to_path_buf(),
+                scratch_root: scratch.path().to_path_buf(),
+                max_concurrent_requests: 4,
+                max_request_bytes: 16 * 1024 * 1024,
+                max_response_bytes: 64 * 1024 * 1024,
+                max_inflight_bytes: 64 * 1024 * 1024,
+                operation_deadline: Duration::from_secs(120),
+                native_limits: Default::default(),
+            })
+            .map_err(|error| anyhow!("gateway configuration was refused: {error}"))?
+            .with_admission_pause(body_pause.clone()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let app = capture_receive_responses(router(state.clone()), captures.clone());
+        let (shutdown, signal) = oneshot::channel();
+        resources.shutdown = Some(shutdown);
+        resources.server = Some(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = signal.await;
+                })
+                .await
+        }));
+        let (second_push, first_push) = (&mut resources.second_push, &mut resources.first_push);
+
         let owner = actor::owner(&db.pool).await?;
         let name = format!("race-independent-{}", &Uuid::new_v4().simple().to_string()[..12]);
 
@@ -283,7 +357,7 @@ async fn independent_refs_case(db: &Db) -> Result<()> {
         provision_decision_realm(db, &owner, &name, &store).await?;
 
         // Seed one real main tip, then clone two independent worktrees from it.
-        let work = tempfile::tempdir().context("temporary Git work root")?;
+        let work = resources.work.insert(tempfile::tempdir().context("temporary Git work root")?);
         let direct_url = clone_url(address, &owner, &name);
         let seeded = git.clone(work.path(), &direct_url, "seed").await?;
         ensure!(seeded.success, "real Smart HTTP clone of the empty repository failed");
@@ -308,7 +382,7 @@ async fn independent_refs_case(db: &Db) -> Result<()> {
         // fallible read/assertion and both push tasks are owned by the guarded
         // block so the pause is released and the tasks are aborted/joined before
         // the fixture returns, including on a panic.
-        second_push = Some(spawn_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B));
+        *second_push = Some(spawn_push_ref(git, second_dir, direct_url.clone(), second_operation, INDEPENDENT_B));
         {
             let selected: Option<std::result::Result<Result<git::Output>, tokio::task::JoinError>> = {
                 let second_handle =
@@ -341,13 +415,13 @@ async fn independent_refs_case(db: &Db) -> Result<()> {
         );
 
         // A commits a different ref while B is paused after admission.
-        first_push = Some(spawn_push_ref(git, first_dir, direct_url, first_operation, INDEPENDENT_A));
+        *first_push = Some(spawn_push_ref(git, first_dir, direct_url, first_operation, INDEPENDENT_A));
         let first_join = {
             let first_handle =
                 first_push.as_mut().ok_or_else(|| anyhow!("the first independent push task was not created"))?;
             first_handle.await
         };
-        first_push = None;
+        *first_push = None;
         let first_output = first_join.context("the first independent push task failed")??;
         ensure!(first_output.success, "the first independent push failed: {}", redacted(&first_output));
         let revision_after_first = gate_revision(db, repository_id).await?;
@@ -362,7 +436,7 @@ async fn independent_refs_case(db: &Db) -> Result<()> {
                 second_push.as_mut().ok_or_else(|| anyhow!("the paused independent push task was lost"))?;
             second_handle.await
         };
-        second_push = None;
+        *second_push = None;
         let second_output = second_join.context("the paused independent push task failed")??;
 
         let first_capture =
@@ -446,12 +520,24 @@ async fn independent_refs_case(db: &Db) -> Result<()> {
     .catch_unwind()
     .await;
 
-    release_and_drain_pushes(pause.as_ref(), &mut second_push, &mut first_push).await;
-    server.shutdown().await;
+    let mut fence = Vec::new();
+    let cleanup = AssertUnwindSafe(resources.teardown(&db, &mut fence))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("witness cleanup panicked")));
+    if let Err(error) = &cleanup {
+        let sealed = AssertUnwindSafe(resources.seal_failed_cleanup(&db)).catch_unwind().await;
+        if sealed.is_err() {
+            let _ = writeln!(io::stderr().lock(), "post-admission witness cleanup fallback panicked");
+        }
+        if !matches!(&outcome, Ok(Ok(()))) {
+            let _ = writeln!(io::stderr().lock(), "post-admission witness cleanup failed ({error})");
+        }
+    }
+    drop(fence);
 
     match outcome {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(error),
+        Ok(result) => result.and(cleanup),
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
@@ -711,26 +797,6 @@ fn spawn_push_ref(
         let target = format!("HEAD:{ref_name}");
         git.run(&directory, &["-c", header.as_str(), "push", url.as_str(), target.as_str()]).await
     })
-}
-
-/// Release the selected one-shot pause and abort/join any push task still
-/// owned by the case. This runs before the server task and fixture teardown on
-/// normal, error and panic paths; task join failures are intentionally ignored
-/// so the case's original error or panic remains primary.
-async fn release_and_drain_pushes(
-    pause: &AdmissionPause,
-    second_push: &mut Option<JoinHandle<Result<git::Output>>>,
-    first_push: &mut Option<JoinHandle<Result<git::Output>>>,
-) {
-    pause.release();
-    if let Some(handle) = second_push.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
-    if let Some(handle) = first_push.take() {
-        handle.abort();
-        let _ = handle.await;
-    }
 }
 
 async fn gate_revision(db: &Db, repository_id: Uuid) -> Result<i64> {
