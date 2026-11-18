@@ -27,7 +27,8 @@ pub use super::hydration_view::{
     download_lfs_object_from_remote, hydrate_clean_compute_view, resolve_and_verify_remote_blob,
     verify_committed_locator_bytes,
 };
-use super::pg_store::{LfsRepoRealm, PgLfsBlobStore};
+use super::pg_store::{LfsRepoRealm, PgLfsBlobStore, UploadOpSpec};
+use super::prod_auth_tx::ProdCommitAuthCheck;
 use super::types::{CommittedLfsBlobRecord, LfsBlobError, LfsProofRejectCode, StoredBlobLocatorRef};
 
 #[derive(Clone, Copy)]
@@ -49,6 +50,16 @@ pub struct PreStreamedScratch {
 
 pub async fn process_batch_request(
     ctx: &LfsTransferContext<'_>,
+    base_url: &str,
+    action_headers: &BTreeMap<String, String>,
+    req: &BatchRequest,
+) -> Result<BatchResponse, LfsBlobError> {
+    process_batch_request_with_auth(ctx, None, base_url, action_headers, req).await
+}
+
+pub async fn process_batch_request_with_auth(
+    ctx: &LfsTransferContext<'_>,
+    commit_auth: Option<&ProdCommitAuthCheck>,
     base_url: &str,
     action_headers: &BTreeMap<String, String>,
     req: &BatchRequest,
@@ -78,7 +89,6 @@ pub async fn process_batch_request(
         "download" => false,
         _ => return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "unsupported LFS batch operation")),
     };
-
     let prefix = format!(
         "{}/git/{}/{}.git",
         base_url.trim_end_matches('/'),
@@ -90,7 +100,6 @@ pub async fn process_batch_request(
     let mut verify_hdr = action_headers.clone();
     verify_hdr.insert("Content-Type".to_owned(), LFS_MEDIA_TYPE.to_owned());
     let mut results = Vec::with_capacity(req.objects.len());
-
     for spec in &req.objects {
         if !valid_lfs_oid(&spec.oid) || spec.size < 0 {
             results.push(BatchObjectResult {
@@ -147,33 +156,21 @@ pub async fn process_batch_request(
                 Some(_) => stale_missing = true,
                 None => {}
             }
+            let op_spec = UploadOpSpec {
+                repository_id: ctx.realm.repository_id,
+                tenant_id: ctx.realm.owner_tenant_id,
+                actor_id: ctx.access.actor_id,
+                oid_sha256: &spec.oid,
+                size_bytes: spec.size,
+            };
             let op_id = if let Some(tok) =
                 action_headers.get("X-Rootyard-Operation-Id").or_else(|| action_headers.get("Idempotency-Key"))
             {
                 let id = operation_token_to_uuid(tok)?;
-                let _ = ctx
-                    .pg
-                    .begin_or_load_upload_operation(
-                        ctx.realm.repository_id,
-                        id,
-                        ctx.realm.owner_tenant_id,
-                        ctx.access.actor_id,
-                        &spec.oid,
-                        spec.size,
-                    )
-                    .await?;
+                let _ = ctx.pg.begin_or_load_upload_operation_with_auth(id, op_spec, commit_auth).await?;
                 id
             } else {
-                ctx.pg
-                    .ensure_default_upload_operation(
-                        ctx.realm.repository_id,
-                        ctx.realm.owner_tenant_id,
-                        ctx.access.actor_id,
-                        &spec.oid,
-                        spec.size,
-                        stale_missing,
-                    )
-                    .await?
+                ctx.pg.ensure_default_upload_operation_with_auth(op_spec, stale_missing, commit_auth).await?
             };
             let mut obj_upload_hdr = upload_hdr.clone();
             obj_upload_hdr.insert("X-Rootyard-Operation-Id".to_owned(), op_id.to_string());
@@ -226,14 +223,22 @@ pub async fn process_batch_request(
             }
         }
     }
-
     Ok(BatchResponse { transfer: "basic", objects: results, hash_algo: LFS_HASH_ALGO })
 }
-
 /// Publishes a pre-streamed `0600` scratch file via `ProtectedUploader`, commits/repairs
 /// `lfs_blob_objects`, and verifies the **final persisted `committed.locator`** before ACK.
 pub async fn upload_streamed_lfs_object_to_remote(
     ctx: &LfsTransferContext<'_>,
+    operation_id: Option<Uuid>,
+    oid_sha256: &str,
+    expected_size: i64,
+    streamed: &PreStreamedScratch,
+) -> Result<CommittedLfsBlobRecord, LfsBlobError> {
+    upload_streamed_lfs_object_to_remote_with_auth(ctx, None, operation_id, oid_sha256, expected_size, streamed).await
+}
+pub async fn upload_streamed_lfs_object_to_remote_with_auth(
+    ctx: &LfsTransferContext<'_>,
+    commit_auth: Option<&ProdCommitAuthCheck>,
     operation_id: Option<Uuid>,
     oid_sha256: &str,
     expected_size: i64,
@@ -263,7 +268,6 @@ pub async fn upload_streamed_lfs_object_to_remote(
             id
         }
     };
-
     if streamed.size_bytes != expected_size {
         let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, "upload byte length mismatch").await;
         return Err(LfsBlobError::new(
@@ -275,7 +279,6 @@ pub async fn upload_streamed_lfs_object_to_remote(
         let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, "upload SHA-256 mismatch").await;
         return Err(LfsBlobError::new(LfsProofRejectCode::SizeOrDigestMismatch, "upload SHA-256 digest mismatch"));
     }
-
     let mut stale_missing_locator: Option<StoredBlobLocatorRef> = None;
     let std_dl = StdInstant::now() + ctx.timeout;
     let mut verified_fast_existing: Option<CommittedLfsBlobRecord> = None;
@@ -306,54 +309,40 @@ pub async fn upload_streamed_lfs_object_to_remote(
             }
         }
     }
-
+    let op_spec = UploadOpSpec {
+        repository_id: ctx.realm.repository_id,
+        tenant_id: ctx.realm.owner_tenant_id,
+        actor_id: ctx.access.actor_id,
+        oid_sha256,
+        size_bytes: expected_size,
+    };
     let resolved_op_id = match operation_id {
         Some(op_id) => {
-            if let Err(e) = ctx
-                .pg
-                .begin_or_load_upload_operation(
-                    ctx.realm.repository_id,
-                    op_id,
-                    ctx.realm.owner_tenant_id,
-                    ctx.access.actor_id,
-                    oid_sha256,
-                    expected_size,
-                )
-                .await
-            {
+            if let Err(e) = ctx.pg.begin_or_load_upload_operation_with_auth(op_id, op_spec, None).await {
                 let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
                 return Err(e);
             }
             op_id
         }
         None => {
-            ctx.pg
-                .ensure_default_upload_operation(
-                    ctx.realm.repository_id,
-                    ctx.realm.owner_tenant_id,
-                    ctx.access.actor_id,
-                    oid_sha256,
-                    expected_size,
-                    stale_missing_locator.is_some(),
-                )
-                .await?
+            ctx.pg.ensure_default_upload_operation_with_auth(op_spec, stale_missing_locator.is_some(), None).await?
         }
     };
-
     if let Some(existing) = verified_fast_existing {
-        let committed = ctx.pg.record_committed_blob(attempt_id, Some(resolved_op_id), &existing, None).await?;
-        verify_committed_locator_bytes(
-            store,
-            ctx.scratch_dir,
-            &committed,
-            oid_sha256,
-            expected_size,
-            StdInstant::now() + ctx.timeout,
-        )
-        .await?;
+        let committed = match ctx
+            .pg
+            .record_committed_blob_with_auth(attempt_id, Some(resolved_op_id), &existing, None, commit_auth)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
+                return Err(e);
+            }
+        };
+        verify_record_locator(ctx, &committed, oid_sha256, expected_size).await?;
         return Ok(committed);
     }
-
     let pg_dl = TokioInstant::now() + ctx.timeout;
     let grant = match ctx.pg.acquire_lfs_upload_hold(store, ctx.realm, oid_sha256, expected_size as u64, pg_dl).await {
         Ok(g) => g,
@@ -397,22 +386,45 @@ pub async fn upload_streamed_lfs_object_to_remote(
         uploader_actor_id: ctx.access.actor_id,
         retired: false,
     };
-    let committed = ctx
+    verify_record_locator(ctx, &candidate, oid_sha256, expected_size).await?;
+    let committed = match ctx
         .pg
-        .record_committed_blob(attempt_id, Some(resolved_op_id), &candidate, stale_missing_locator.as_ref())
-        .await?;
+        .record_committed_blob_with_auth(
+            attempt_id,
+            Some(resolved_op_id),
+            &candidate,
+            stale_missing_locator.as_ref(),
+            commit_auth,
+        )
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
+            return Err(e);
+        }
+    };
+    verify_record_locator(ctx, &committed, oid_sha256, expected_size).await?;
+    Ok(committed)
+}
+async fn verify_record_locator(
+    ctx: &LfsTransferContext<'_>,
+    rec: &CommittedLfsBlobRecord,
+    oid_sha256: &str,
+    expected_size: i64,
+) -> Result<(), LfsBlobError> {
+    let store = ctx.gate.require_store()?;
     verify_committed_locator_bytes(
         store,
         ctx.scratch_dir,
-        &committed,
+        rec,
         oid_sha256,
         expected_size,
         StdInstant::now() + ctx.timeout,
     )
-    .await?;
-    Ok(committed)
+    .await
+    .map(|_| ())
 }
-
 pub async fn upload_lfs_object_to_remote(
     ctx: &LfsTransferContext<'_>,
     operation_id: Option<Uuid>,
@@ -443,7 +455,6 @@ pub async fn upload_lfs_object_to_remote(
     };
     upload_streamed_lfs_object_to_remote(ctx, operation_id, oid_sha256, expected_size, &streamed).await
 }
-
 pub async fn verify_lfs_object_remote(
     ctx: &LfsTransferContext<'_>,
     oid_sha256: &str,

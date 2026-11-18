@@ -22,9 +22,10 @@ use crate::{
     lfs::models::LFS_MEDIA_TYPE,
 };
 
-use super::attestation::{LfsPushAttestationRequest, attest_and_authorize_push};
+use super::attestation::{LfsPushAttestationRequest, attest_and_authorize_push_with_auth};
 use super::authz::{LfsBlobRuntimeGate, derive_default_push_operation_id, operation_token_to_uuid};
 use super::pg_store::PgLfsBlobStore;
+use super::prod_auth_tx::PushCommitAuthCheck;
 use super::transfer::{LfsTransferContext, acquire_transfer_permit};
 use super::types::{AttestationOutcome, LfsBlobError, LfsProofRejectCode, LfsRefUpdateSpec};
 
@@ -158,6 +159,14 @@ pub async fn prod_validate_and_attest_hook(
     let _permit = acquire_transfer_permit(timeout).await?;
     let pool = crate::db::pool(db_url).map_err(|e| LfsBlobError::new(LfsProofRejectCode::PgDatabase, e.to_string()))?;
     let pg = PgLfsBlobStore::new(pool);
+    super::prod_auth_tx::preflight_write_authority(
+        &pg,
+        op.repository_id,
+        expected_tenant_id,
+        op.actor_id,
+        &op.actor_name,
+    )
+    .await?;
     let mut realm = pg.ensure_realm_for_repository(op.repository_id, data_root).await?;
     if realm.owner_tenant_id != expected_tenant_id {
         return Err(LfsBlobError::new(
@@ -190,7 +199,16 @@ pub async fn prod_validate_and_attest_hook(
         git_object_dir: git_obj_dir,
         git_alternate_object_dirs: git_alt_dirs,
     };
-    attest_and_authorize_push(&ctx, &req).await
+    attest_and_authorize_push_with_auth(
+        &ctx,
+        &req,
+        Some(PushCommitAuthCheck {
+            actor_id: op.actor_id,
+            token_id: Some(op.token_id),
+            expected_generation: Some(op.storage_generation),
+        }),
+    )
+    .await
 }
 
 pub async fn prod_validate_and_attest_push(
@@ -211,6 +229,8 @@ pub async fn prod_validate_and_attest_push(
         )
     })?;
     let pg = PgLfsBlobStore::new(s.pool);
+    super::prod_auth_tx::preflight_write_authority(&pg, repo_id, expected_tenant_id, s.actor_id, &s.actor_username)
+        .await?;
     let mut realm = pg.ensure_realm_for_repository(repo_id, data_root).await?;
     if realm.owner_tenant_id != expected_tenant_id {
         return Err(LfsBlobError::new(

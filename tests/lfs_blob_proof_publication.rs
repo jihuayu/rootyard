@@ -24,6 +24,9 @@ use support::adversarial_cancel::{
 use support::adversarial_default_ops::{
     DefaultOpClientInput, exercise_unmodified_client_default_operation_replay_and_canonical_repair,
 };
+use support::multi_instance_auth_boundary::{
+    MultiInstanceAuthInput, exercise_post_auth_pending_multi_instance_active_lease_and_atomic_commit_auth,
+};
 use support::{
     LoopbackS3, RunningProdLfsServer, copy_dir_recursive, init_git_lfs_home, issue_actor, run_git_ok, run_git_raw,
     run_with_migrated_pg_schema,
@@ -326,6 +329,17 @@ async fn run_pg17_loopback_s3_e2e() -> Result<()> {
                 let cancel_inp =
                     UploadCancelReconcileInput { srv: &srv, pool: &pool, pg: &pg, realm: &realm, alice: &alice };
                 Box::pin(exercise_production_upload_cancellation_and_stale_reconciler(cancel_inp)).await?;
+                Box::pin(exercise_post_auth_pending_multi_instance_active_lease_and_atomic_commit_auth(
+                    MultiInstanceAuthInput {
+                        s3,
+                        root_prefix: &root_prefix,
+                        pool: &pool,
+                        db_url: &schema_url,
+                        realm: &realm,
+                        alice: &alice,
+                    },
+                ))
+                .await?;
 
                 let saved_repos = TempDir::new()?;
                 copy_dir_recursive(&srv.state.storage.root.join("repos"), saved_repos.path())?;

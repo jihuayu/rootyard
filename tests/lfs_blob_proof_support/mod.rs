@@ -6,6 +6,7 @@ pub mod adversarial_cancel;
 pub mod adversarial_default_ops;
 pub mod adversarial_org_restart;
 pub mod git_smart_http;
+pub mod multi_instance_auth_boundary;
 pub mod s3_loopback;
 
 use std::path::{Path, PathBuf};
@@ -59,6 +60,8 @@ fn find_git_binary() -> PathBuf {
     PathBuf::from("git")
 }
 
+static ACTIVE_SERVERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub struct RunningProdLfsServer {
     pub base_url: String,
     pub state: Arc<AppState>,
@@ -69,7 +72,9 @@ pub struct RunningProdLfsServer {
 impl Drop for RunningProdLfsServer {
     fn drop(&mut self) {
         self.handle.abort();
-        set_runtime_gate_override(None);
+        if ACTIVE_SERVERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            set_runtime_gate_override(None);
+        }
     }
 }
 
@@ -113,6 +118,7 @@ impl RunningProdLfsServer {
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
+        ACTIVE_SERVERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Self { base_url, state, _data_dir: data_dir, handle })
     }
 
@@ -233,7 +239,7 @@ where
     cfg.options(format!("-c search_path={schema} -c timezone=UTC -c statement_timeout=30000 -c lock_timeout=15000"));
     let pool = Pool::builder(Manager::new(cfg, tokio_postgres::NoTls))
         .runtime(deadpool_postgres::Runtime::Tokio1)
-        .max_size(8)
+        .max_size(24)
         .build()?;
     let res = async {
         db::migrate(&pool).await?;

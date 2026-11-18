@@ -25,8 +25,9 @@ use crate::{
 };
 
 use super::authz::{LfsBlobRuntimeGate, extract_stable_operation_id};
-use super::locks_store::InFlightUploadGuard;
-use super::pg_store::PgLfsBlobStore;
+use super::locks_store::{ActiveUploadAttemptSpec, InFlightUploadGuard};
+use super::pg_store::{PgLfsBlobStore, UploadOpSpec};
+use super::prod_auth_tx::ProdCommitAuthCheck;
 pub(crate) use super::prod_publication::{active_push_quarantine_dirs, enforce_blob_gate_if_requested, to_app_error};
 use super::prod_publication::{
     build_base_url, collect_forwarded_action_headers, ephemeral_scratch_root, lfs_blob_err_response, lfs_blob_json,
@@ -37,10 +38,15 @@ pub use super::prod_publication::{
 };
 use super::transfer::{
     LfsTransferContext, PreStreamedScratch, acquire_transfer_permit, open_verified_remote_download_file,
-    process_batch_request, upload_streamed_lfs_object_to_remote, verify_lfs_object_remote,
+    process_batch_request_with_auth, upload_streamed_lfs_object_to_remote_with_auth, verify_lfs_object_remote,
 };
 use super::types::{LfsBlobError, LfsProofRejectCode};
-
+struct ProdAuthPrepared {
+    commit_auth: ProdCommitAuthCheck,
+    pg: PgLfsBlobStore,
+    realm: super::pg_store::LfsRepoRealm,
+    access: super::authz::AuthorizedRepoAccess,
+}
 async fn auth_and_prepare_prod(
     state: &Arc<AppState>,
     gate: &LfsBlobRuntimeGate,
@@ -48,16 +54,7 @@ async fn auth_and_prepare_prod(
     owner: &str,
     repo_raw: &str,
     write: bool,
-) -> Result<
-    (
-        crate::db::Identity,
-        String,
-        PgLfsBlobStore,
-        super::pg_store::LfsRepoRealm,
-        super::authz::AuthorizedRepoAccess,
-    ),
-    Box<Response>,
-> {
+) -> Result<ProdAuthPrepared, Box<Response>> {
     if let Err(e) = gate.require_store() {
         return Err(Box::new(lfs_blob_err_response(e)));
     }
@@ -67,39 +64,8 @@ async fn auth_and_prepare_prod(
         auth::writable(&actor).map_err(|e| Box::new(e.into_response()))?;
     }
     let name = models::normalize_repo_name(repo_raw).map_err(|e| Box::new(e.into_response()))?;
-    let repo_lookup = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| Box::new(Error::internal(e).into_response()))?
-        .query_opt(
-            "SELECT r.id, r.owner_id FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id
-             WHERE ns.slug = $1 AND r.name = $2 AND r.deleted_at IS NULL",
-            &[&owner, &name],
-        )
-        .await
-        .map_err(|e| Box::new(Error::internal(e).into_response()))?
-        .ok_or_else(|| Box::new(Error::not_found().into_response()))?;
-    let lookup_repo_id: Uuid = repo_lookup.get(0);
-    let lookup_tenant_id: Uuid = repo_lookup.get(1);
-
-    let pg = PgLfsBlobStore::new(state.pool.clone());
-    let realm = match pg.ensure_realm_for_repository(lookup_repo_id, &state.storage.root).await {
-        Ok(r) => r,
-        Err(e) => return Err(Box::new(lfs_blob_err_response(e))),
-    };
-    if write {
-        let stale_window = state.config.git_timeout.max(std::time::Duration::from_secs(5));
-        if let Err(e) = pg.reconcile_stale_pending_uploads(realm.repository_id, stale_window).await {
-            return Err(Box::new(lfs_blob_err_response(e)));
-        }
-    }
-    let auth_access = match pg.resolve_authoritative_repo_access(&realm, actor.id, &actor.username, write, false).await
-    {
-        Ok(a) => a,
-        Err(e) => return Err(Box::new(lfs_blob_err_response(e))),
-    };
-    let (repo_id, tenant_id) = {
+    // STEP 1: authorization must pass before any realm or `pending` row mutation.
+    let (access, storage_generation, auth_access) = {
         let mut client = state.pool.get().await.map_err(|e| Box::new(Error::internal(e).into_response()))?;
         let tx = client.transaction().await.map_err(|e| Box::new(Error::internal(e).into_response()))?;
         let access = auth::authorize_repo_with_role(
@@ -112,15 +78,52 @@ async fn auth_and_prepare_prod(
         )
         .await
         .map_err(|e| Box::new(e.into_response()))?;
+        let storage_generation: i64 = tx
+            .query_one("SELECT storage_generation FROM repositories WHERE id = $1", &[&access.repo_id])
+            .await
+            .map_err(|e| Box::new(Error::internal(e).into_response()))?
+            .get(0);
+        let auth_access = super::prod_auth_tx::resolve_authoritative_repo_access_in_tx(
+            &tx,
+            access.repo_id,
+            Some(access.owner_id),
+            actor.id,
+            &actor.username,
+            write,
+            false,
+        )
+        .await
+        .map_err(|e| Box::new(lfs_blob_err_response(e)))?;
         auth::finish_tx(tx, &actor, false).await.map_err(|e| Box::new(e.into_response()))?;
-        (access.repo_id, access.owner_id)
+        (access, storage_generation, auth_access)
     };
-    if repo_id != lookup_repo_id || tenant_id != lookup_tenant_id || realm.owner_tenant_id != tenant_id {
+    // STEP 2: post-auth realm ensure and active-aware stale reconciliation.
+    let pg = PgLfsBlobStore::new(state.pool.clone());
+    let realm = pg
+        .ensure_realm_for_repository(access.repo_id, &state.storage.root)
+        .await
+        .map_err(|e| Box::new(lfs_blob_err_response(e)))?;
+    if realm.owner_tenant_id != access.owner_id {
         return Err(Box::new(Error(StatusCode::CONFLICT, "repository identity changed").into_response()));
     }
-    Ok((actor, name.to_owned(), pg, realm, auth_access))
+    if write {
+        let stale_window = state.config.git_timeout.max(std::time::Duration::from_secs(5));
+        if let Err(e) = pg.reconcile_stale_pending_uploads(realm.repository_id, stale_window).await {
+            return Err(Box::new(lfs_blob_err_response(e)));
+        }
+    }
+    Ok(ProdAuthPrepared {
+        commit_auth: ProdCommitAuthCheck {
+            actor,
+            owner_slug: owner.to_owned(),
+            repo_name: name.to_owned(),
+            expected_generation: Some(storage_generation),
+        },
+        pg,
+        realm,
+        access: auth_access,
+    })
 }
-
 pub(crate) async fn prod_delete_refused(gate: LfsBlobRuntimeGate) -> Result<Response, Error> {
     if let Err(e) = gate.require_store() {
         return Ok(lfs_blob_err_response(e));
@@ -130,7 +133,6 @@ pub(crate) async fn prod_delete_refused(gate: LfsBlobRuntimeGate) -> Result<Resp
         "physical LFS object DELETE is disabled until safe GC (#122)",
     )))
 }
-
 pub(crate) async fn prod_batch(
     gate: LfsBlobRuntimeGate,
     state: Arc<AppState>,
@@ -156,7 +158,7 @@ pub(crate) async fn prod_batch(
     if let Err(e) = extract_stable_operation_id(&headers) {
         return Ok(lfs_blob_err_response(e));
     }
-    let (actor, name, pg, realm, access) =
+    let ProdAuthPrepared { commit_auth, pg, realm, access } =
         match auth_and_prepare_prod(&state, &gate, &headers, &owner, &repo_raw, write).await {
             Ok(t) => t,
             Err(early) => return Ok(*early),
@@ -172,15 +174,16 @@ pub(crate) async fn prod_batch(
     };
     let base_url = build_base_url(&headers);
     let action_headers = collect_forwarded_action_headers(&sanitize_headers(&headers));
-    let batch_resp = match process_batch_request(&ctx, &base_url, &action_headers, &req).await {
-        Ok(r) => r,
-        Err(e) => return Ok(lfs_blob_err_response(e)),
-    };
+    let batch_resp =
+        match process_batch_request_with_auth(&ctx, Some(&commit_auth), &base_url, &action_headers, &req).await {
+            Ok(r) => r,
+            Err(e) => return Ok(lfs_blob_err_response(e)),
+        };
     reauthorize_repo(
         &state,
-        &actor,
+        &commit_auth.actor,
         &owner,
-        &name,
+        &commit_auth.repo_name,
         realm.repository_id,
         realm.owner_tenant_id,
         if write { auth::Role::Write } else { auth::Role::Read },
@@ -190,7 +193,6 @@ pub(crate) async fn prod_batch(
     .await?;
     Ok(lfs_blob_json(StatusCode::OK, batch_resp))
 }
-
 pub(crate) async fn prod_upload(
     gate: LfsBlobRuntimeGate,
     state: Arc<AppState>,
@@ -212,7 +214,7 @@ pub(crate) async fn prod_upload(
         Ok(v) => v,
         Err(e) => return Ok(lfs_blob_err_response(e)),
     };
-    let (actor, name, pg, realm, access) =
+    let ProdAuthPrepared { commit_auth, pg, realm, access } =
         match auth_and_prepare_prod(&state, &gate, &headers, &owner, &repo_raw, true).await {
             Ok(t) => t,
             Err(early) => return Ok(*early),
@@ -242,28 +244,37 @@ pub(crate) async fn prod_upload(
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
     }
     let declared_size: Option<i64> = size_param.or_else(|| content_len_opt.and_then(|cl| i64::try_from(cl).ok()));
-
     let repo_id = realm.repository_id;
     let tenant_id = realm.owner_tenant_id;
-    if let (Some(explicit_op), Some(decl_sz)) = (op_id, declared_size)
-        && let Err(e) = pg
-            .begin_or_load_upload_operation(repo_id, explicit_op, tenant_id, actor.id, &oid, decl_sz)
-            .await
-    {
-        return Ok(lfs_blob_err_response(e));
+    let actor = commit_auth.actor.id;
+    if let (Some(op), Some(size_bytes)) = (op_id, declared_size) {
+        let spec = UploadOpSpec { repository_id: repo_id, tenant_id, actor_id: actor, oid_sha256: &oid, size_bytes };
+        if let Err(e) = pg.begin_or_load_upload_operation_with_auth(op, spec, Some(&commit_auth)).await {
+            return Ok(lfs_blob_err_response(e));
+        }
     }
-    let attempt_id = Uuid::new_v4();
-    let attempt_res = pg
-        .record_upload_attempt_start(attempt_id, tenant_id, repo_id, actor.id, &oid, declared_size.unwrap_or(0))
-        .await;
-    if let Err(e) = attempt_res {
-        return Ok(lfs_blob_err_response(e));
-    }
-
     let scratch = ephemeral_scratch_root();
     fs::create_dir_all(&scratch).await.map_err(Error::internal)?;
     let scratch_path = scratch.join(format!(".lfs-stream-up-{}.tmp", Uuid::new_v4()));
-    let mut upload_guard = InFlightUploadGuard::new(pg.clone(), repo_id, attempt_id, op_id, scratch_path.clone());
+    let mut upload_guard = match InFlightUploadGuard::acquire(
+        pg.clone(),
+        ActiveUploadAttemptSpec {
+            tenant_id,
+            repository_id: repo_id,
+            actor_id: commit_auth.actor.id,
+            oid_sha256: &oid,
+            size_bytes: declared_size.unwrap_or(0),
+            operation_id: op_id,
+            scratch_path: scratch_path.clone(),
+            lease_ttl: state.config.git_timeout.max(std::time::Duration::from_secs(30)),
+        },
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => return Ok(lfs_blob_err_response(e)),
+    };
+    let attempt_id = upload_guard.attempt_id();
     let mut hasher = Sha256::new();
     let mut written: u64 = 0;
     {
@@ -286,11 +297,16 @@ pub(crate) async fn prod_upload(
                 return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
             }
             hasher.update(&chunk);
-            out_file.write_all(&chunk).await.map_err(Error::internal)?;
+            if let Err(e) = out_file.write_all(&chunk).await {
+                upload_guard.abort_now("upload_stream_write_failed").await;
+                return Err(Error::internal(e));
+            }
         }
-        out_file.sync_all().await.map_err(Error::internal)?;
+        if let Err(e) = out_file.sync_all().await {
+            upload_guard.abort_now("upload_stream_sync_failed").await;
+            return Err(Error::internal(e));
+        }
     }
-
     let expected_size = size_param.unwrap_or(written as i64);
     let streamed = PreStreamedScratch {
         path: scratch_path,
@@ -306,26 +322,23 @@ pub(crate) async fn prod_upload(
         scratch_dir: &scratch,
         timeout: state.config.git_timeout,
     };
-    let committed = match upload_streamed_lfs_object_to_remote(&ctx, op_id, &oid, expected_size, &streamed).await {
+    let committed = match upload_streamed_lfs_object_to_remote_with_auth(
+        &ctx,
+        Some(&commit_auth),
+        op_id,
+        &oid,
+        expected_size,
+        &streamed,
+    )
+    .await
+    {
         Ok(c) => c,
         Err(e) => {
             upload_guard.abort_now(&e.message).await;
             return Ok(lfs_blob_err_response(e));
         }
     };
-    upload_guard.mark_committed();
-    reauthorize_repo(
-        &state,
-        &actor,
-        &owner,
-        &name,
-        realm.repository_id,
-        realm.owner_tenant_id,
-        auth::Role::Write,
-        RepoAction::ContentsWrite,
-        true,
-    )
-    .await?;
+    upload_guard.finish_and_unlock().await;
     state.transfer_metrics.record_success();
     Ok(lfs_blob_json(
         StatusCode::OK,
@@ -338,7 +351,6 @@ pub(crate) async fn prod_upload(
         }),
     ))
 }
-
 pub(crate) async fn prod_verify(
     gate: LfsBlobRuntimeGate,
     state: Arc<AppState>,
@@ -360,7 +372,7 @@ pub(crate) async fn prod_verify(
         Err(e) => return Ok(lfs_blob_err_response(e)),
     };
     let spec: BatchObjectSpec = serde_json::from_slice(&body).map_err(|_| Error::bad_request())?;
-    let (actor, name, pg, realm, access) =
+    let ProdAuthPrepared { commit_auth, pg, realm, access } =
         match auth_and_prepare_prod(&state, &gate, &headers, &owner, &repo_raw, true).await {
             Ok(t) => t,
             Err(early) => return Ok(*early),
@@ -370,7 +382,7 @@ pub(crate) async fn prod_verify(
             Ok(Some(saved))
                 if saved.state != "committed"
                     || saved.tenant_id != realm.owner_tenant_id
-                    || saved.actor_id != actor.id
+                    || saved.actor_id != commit_auth.actor.id
                     || saved.oid_sha256 != spec.oid
                     || saved.size_bytes != spec.size =>
             {
@@ -397,9 +409,9 @@ pub(crate) async fn prod_verify(
     }
     reauthorize_repo(
         &state,
-        &actor,
+        &commit_auth.actor,
         &owner,
-        &name,
+        &commit_auth.repo_name,
         realm.repository_id,
         realm.owner_tenant_id,
         auth::Role::Write,
@@ -409,7 +421,6 @@ pub(crate) async fn prod_verify(
     .await?;
     Ok(lfs_blob_json(StatusCode::OK, json!({ "oid": spec.oid, "size": spec.size, "verified": true })))
 }
-
 pub(crate) async fn prod_download(
     gate: LfsBlobRuntimeGate,
     state: Arc<AppState>,
@@ -426,7 +437,7 @@ pub(crate) async fn prod_download(
         Ok(p) => p,
         Err(e) => return Ok(lfs_blob_err_response(e)),
     };
-    let (actor, name, pg, realm, access) =
+    let ProdAuthPrepared { commit_auth, pg, realm, access } =
         match auth_and_prepare_prod(&state, &gate, &headers, &owner, &repo_raw, false).await {
             Ok(t) => t,
             Err(early) => return Ok(*early),
@@ -446,9 +457,9 @@ pub(crate) async fn prod_download(
     };
     reauthorize_repo(
         &state,
-        &actor,
+        &commit_auth.actor,
         &owner,
-        &name,
+        &commit_auth.repo_name,
         realm.repository_id,
         realm.owner_tenant_id,
         auth::Role::Read,

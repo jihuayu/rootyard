@@ -17,7 +17,8 @@ use crate::lfs::models::valid_lfs_oid;
 
 use super::authz::{derive_default_upload_operation_id, verify_shared_hold_grant};
 use super::locks_store::run_git_quarantined;
-use super::pg_store::{PgLfsBlobStore, pg_err};
+use super::pg_store::{PgLfsBlobStore, UploadOpSpec, pg_err};
+use super::prod_auth_tx::ProdCommitAuthCheck;
 use super::transfer::LfsTransferContext;
 use super::types::{
     CommittedLfsBlobRecord, LfsBlobError, LfsProofRejectCode, PointerInspection, PointerResolutionSource,
@@ -375,6 +376,21 @@ impl PgLfsBlobStore {
         size_bytes: i64,
         force_new_repair_epoch: bool,
     ) -> Result<Uuid, LfsBlobError> {
+        self.ensure_default_upload_operation_with_auth(
+            UploadOpSpec { repository_id, tenant_id, actor_id, oid_sha256, size_bytes },
+            force_new_repair_epoch,
+            None,
+        )
+        .await
+    }
+
+    pub async fn ensure_default_upload_operation_with_auth(
+        &self,
+        spec: UploadOpSpec<'_>,
+        force_new_repair_epoch: bool,
+        commit_auth: Option<&ProdCommitAuthCheck>,
+    ) -> Result<Uuid, LfsBlobError> {
+        let UploadOpSpec { repository_id, tenant_id, actor_id, oid_sha256, size_bytes } = spec;
         let rows = self
             .pool()
             .get()
@@ -393,7 +409,12 @@ impl PgLfsBlobStore {
             let cand =
                 derive_default_upload_operation_id(repository_id, tenant_id, actor_id, oid_sha256, size_bytes, ep);
             match by_id.get(&cand).map(String::as_str) {
-                Some("pending" | "aborted_failed" | "aborted_cancelled") => return Ok(cand),
+                Some(state @ ("pending" | "aborted_failed" | "aborted_cancelled")) => {
+                    if commit_auth.is_some() || state.starts_with("aborted_") {
+                        let _ = self.begin_or_load_upload_operation_with_auth(cand, spec, commit_auth).await?;
+                    }
+                    return Ok(cand);
+                }
                 Some("committed") => continue,
                 _ => {
                     if !force_new_repair_epoch && ep > 0 {
@@ -406,9 +427,7 @@ impl PgLfsBlobStore {
                             ep - 1,
                         ));
                     }
-                    let _ = self
-                        .begin_or_load_upload_operation(repository_id, cand, tenant_id, actor_id, oid_sha256, size_bytes)
-                        .await?;
+                    let _ = self.begin_or_load_upload_operation_with_auth(cand, spec, commit_auth).await?;
                     return Ok(cand);
                 }
             }

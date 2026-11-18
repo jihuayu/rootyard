@@ -13,6 +13,7 @@ use crate::ref_store::artifact_hold::{
 use crate::ref_store::{IssuerLane, OperationIdentity, OperationState, PgRefStore, RequestDigest};
 
 pub use super::pg_schema::{LfsRepoRealm, init_lfs_blob_proof_tables};
+use super::prod_auth_tx::ProdCommitAuthCheck;
 use super::types::{CommittedLfsBlobRecord, LfsBlobError, LfsProofRejectCode, StoredBlobLocatorRef};
 
 pub(super) fn pg_err(err: impl std::fmt::Display) -> LfsBlobError {
@@ -37,6 +38,15 @@ pub struct UploadOperationRow {
     pub state: String,
     pub locator: Option<StoredBlobLocatorRef>,
     pub hold_id: Option<Uuid>,
+}
+
+#[derive(Clone, Copy)]
+pub struct UploadOpSpec<'a> {
+    pub repository_id: Uuid,
+    pub tenant_id: Uuid,
+    pub actor_id: Uuid,
+    pub oid_sha256: &'a str,
+    pub size_bytes: i64,
 }
 
 #[derive(Clone)]
@@ -150,9 +160,34 @@ impl PgLfsBlobStore {
         oid_sha256: &str,
         size_bytes: i64,
     ) -> Result<UploadOperationRow, LfsBlobError> {
+        self.begin_or_load_upload_operation_with_auth(
+            operation_id,
+            UploadOpSpec { repository_id, tenant_id, actor_id, oid_sha256, size_bytes },
+            None,
+        )
+        .await
+    }
+
+    pub async fn begin_or_load_upload_operation_with_auth(
+        &self,
+        operation_id: Uuid,
+        spec: UploadOpSpec<'_>,
+        commit_auth: Option<&ProdCommitAuthCheck>,
+    ) -> Result<UploadOperationRow, LfsBlobError> {
+        let UploadOpSpec { repository_id, tenant_id, actor_id, oid_sha256, size_bytes } = spec;
         let mut client = self.pool.get().await.map_err(pg_err)?;
         let tx = client.transaction().await.map_err(pg_err)?;
         tx.batch_execute("SET LOCAL synchronous_commit = 'on'").await.map_err(pg_err)?;
+        if commit_auth.is_some() {
+            super::prod_auth_tx::verify_commit_write_authority_in_tx(
+                &tx,
+                repository_id,
+                tenant_id,
+                actor_id,
+                commit_auth,
+            )
+            .await?;
+        }
         tx.execute(
             "INSERT INTO lfs_blob_upload_operations(repository_id, operation_id, tenant_id, actor_id, oid_sha256, size_bytes, state)
              VALUES($1,$2,$3,$4,$5,$6,'pending') ON CONFLICT (repository_id, operation_id) DO NOTHING",
@@ -225,8 +260,7 @@ impl PgLfsBlobStore {
         let client = self.pool.get().await.map_err(pg_err)?;
         client
             .execute(
-                "INSERT INTO lfs_blob_upload_attempts(attempt_id, tenant_id, repository_id, actor_id, oid_sha256, size_bytes, state)
-                 VALUES($1,$2,$3,$4,$5,$6,'pending')",
+                "INSERT INTO lfs_blob_upload_attempts(attempt_id, tenant_id, repository_id, actor_id, oid_sha256, size_bytes, state) VALUES($1,$2,$3,$4,$5,$6,'pending')",
                 &[&attempt_id, &tenant_id, &repository_id, &actor_id, &oid_sha256, &size_bytes],
             )
             .await
@@ -257,11 +291,30 @@ impl PgLfsBlobStore {
         record: &CommittedLfsBlobRecord,
         stale_missing_locator: Option<&StoredBlobLocatorRef>,
     ) -> Result<CommittedLfsBlobRecord, LfsBlobError> {
+        self.record_committed_blob_with_auth(attempt_id, operation_id, record, stale_missing_locator, None).await
+    }
+
+    pub async fn record_committed_blob_with_auth(
+        &self,
+        attempt_id: Uuid,
+        operation_id: Option<Uuid>,
+        record: &CommittedLfsBlobRecord,
+        stale_missing_locator: Option<&StoredBlobLocatorRef>,
+        commit_auth: Option<&ProdCommitAuthCheck>,
+    ) -> Result<CommittedLfsBlobRecord, LfsBlobError> {
         let loc_json = serde_json::to_value(&record.locator)
             .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
         let mut client = self.pool.get().await.map_err(pg_err)?;
         let tx = client.transaction().await.map_err(pg_err)?;
         tx.batch_execute("SET LOCAL synchronous_commit = 'on'").await.map_err(pg_err)?;
+        super::prod_auth_tx::verify_commit_write_authority_in_tx(
+            &tx,
+            record.repository_id,
+            record.tenant_id,
+            record.uploader_actor_id,
+            commit_auth,
+        )
+        .await?;
         tx.execute(
             "UPDATE lfs_blob_upload_attempts SET state='committed', updated_at=clock_timestamp() WHERE attempt_id=$1",
             &[&attempt_id],
@@ -359,6 +412,9 @@ impl PgLfsBlobStore {
         .await
         .map_err(pg_err)?;
 
+        if let Some(ca) = commit_auth {
+            crate::auth::verify_token(&tx, &ca.actor, true).await.map_err(super::prod_auth_tx::map_app_auth_err)?;
+        }
         tx.commit().await.map_err(pg_err)?;
         Ok(stored)
     }

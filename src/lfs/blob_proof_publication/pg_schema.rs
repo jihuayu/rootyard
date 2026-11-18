@@ -11,9 +11,9 @@ use uuid::Uuid;
 use crate::ref_store::core::{CoreGateInit, PgRefStoreCore};
 use crate::ref_store::{GitObjectFormat, RefName, RequestDigest};
 
-use super::authz::{AuthorizedRepoAccess, SubjectTenantAuthority, evaluate_subject_tenant_access};
+use super::authz::AuthorizedRepoAccess;
 use super::pg_store::{PgLfsBlobStore, pg_err};
-use super::types::{LfsBlobError, LfsCollaboratorRole, LfsProofRejectCode};
+use super::types::{LfsBlobError, LfsProofRejectCode};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LfsRepoRealm {
@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS lfs_blob_upload_attempts (
     actor_id UUID NOT NULL,
     oid_sha256 TEXT NOT NULL CHECK (oid_sha256 ~ '^[0-9a-f]{64}$'),
     size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+    operation_id UUID,
+    lease_until TIMESTAMPTZ NOT NULL DEFAULT (clock_timestamp() + make_interval(secs => 30.0)),
     state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'aborted_failed', 'aborted_cancelled')),
     failure_reason TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
@@ -148,6 +150,14 @@ pub async fn init_lfs_blob_proof_tables(pool: &Pool) -> Result<(), LfsBlobError>
         .get(0);
     if !exists {
         client.batch_execute(LFS_BLOB_PROOF_DDL).await.map_err(pg_err)?;
+    } else {
+        client
+            .batch_execute(
+                "ALTER TABLE lfs_blob_upload_attempts ADD COLUMN IF NOT EXISTS operation_id UUID;
+                 ALTER TABLE lfs_blob_upload_attempts ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ NOT NULL DEFAULT (clock_timestamp() + make_interval(secs => 30.0));",
+            )
+            .await
+            .map_err(pg_err)?;
     }
     Ok(())
 }
@@ -224,12 +234,20 @@ impl PgLfsBlobStore {
             .await
             .map_err(pg_err)?
         {
-            let decoded = Self::decode_realm(&existing)?;
-            if decoded.owner_tenant_id == owner_tenant_id
-                && decoded.owner_username == owner_slug
-                && decoded.repo_name == repo_name
-                && decoded.bare_git_dir == bare_git_dir
-            {
+            let mut decoded = Self::decode_realm(&existing)?;
+            if decoded.owner_tenant_id == owner_tenant_id {
+                if decoded.owner_username != owner_slug || decoded.repo_name != repo_name {
+                    client
+                        .execute(
+                            "UPDATE lfs_blob_repo_realms SET owner_username=$2, repo_name=$3 WHERE repository_id=$1",
+                            &[&repository_id, &owner_slug, &repo_name],
+                        )
+                        .await
+                        .map_err(pg_err)?;
+                    decoded.owner_username = owner_slug;
+                    decoded.repo_name = repo_name;
+                }
+                decoded.bare_git_dir = bare_git_dir;
                 return Ok(decoded);
             }
         }
@@ -295,7 +313,6 @@ impl PgLfsBlobStore {
             .await
             .map_err(pg_err)?;
         drop(client);
-        let _ = self.reconcile_stale_pending_uploads(repository_id, Duration::from_secs(30)).await?;
         Self::decode_realm(&saved)
     }
 
@@ -313,156 +330,17 @@ impl PgLfsBlobStore {
     ) -> Result<AuthorizedRepoAccess, LfsBlobError> {
         let mut client = self.pool().get().await.map_err(pg_err)?;
         let tx = client.transaction().await.map_err(pg_err)?;
-        let ns_row = tx
-            .query_opt(
-                "SELECT r.owner_id, ns.slug, ns.kind, ns.user_id, ns.organization_id,
-                        r.state, r.transition_state, r.archived_at IS NOT NULL, r.deleted_at IS NOT NULL
-                 FROM repositories r
-                 JOIN namespaces ns ON ns.id = r.owner_id
-                 WHERE r.id = $1
-                 FOR SHARE OF r, ns",
-                &[&realm.repository_id],
-            )
-            .await
-            .map_err(pg_err)?
-            .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "repository missing"))?;
-
-        let owner_ns_id: Uuid = ns_row.get(0);
-        let ns_slug: String = ns_row.get(1);
-        let ns_kind: String = ns_row.get(2);
-        let ns_user_id: Option<Uuid> = ns_row.get(3);
-        let ns_org_id: Option<Uuid> = ns_row.get(4);
-        let state: String = ns_row.get(5);
-        let transition: String = ns_row.get(6);
-        let archived: bool = ns_row.get(7);
-        let deleted: bool = ns_row.get(8);
-        if deleted
-            || state != "ready"
-            || (require_write
-                && (archived
-                    || transition != "stable"
-                    || crate::auth::lifecycle::has_active_transfer(&*tx, realm.repository_id)
-                        .await
-                        .map_err(pg_err)?))
-        {
-            return Err(LfsBlobError::new(
-                LfsProofRejectCode::UnauthorizedCollaborator,
-                "repository is deleted, archived, transferring, or not ready for LFS mutation",
-            ));
-        }
-
-        // 1. Personal namespace owner verified via relational `namespaces JOIN users` (`FOR SHARE`).
-        if ns_kind == "user"
-            && let Some(bound_uid) = ns_user_id
-        {
-            let verified_owner = tx
-                .query_opt(
-                    "SELECT n.id FROM namespaces n JOIN users u ON u.id = n.user_id
-                     WHERE n.id = $1 AND n.kind = 'user' AND u.id = $2
-                     FOR SHARE OF n, u",
-                    &[&owner_ns_id, &actor_id],
-                )
-                .await
-                .map_err(pg_err)?;
-            if verified_owner.is_some() && bound_uid == actor_id {
-                tx.commit().await.map_err(pg_err)?;
-                return evaluate_subject_tenant_access(
-                    realm.repository_id,
-                    owner_ns_id,
-                    actor_id,
-                    actor_username,
-                    SubjectTenantAuthority::PersonalNamespaceOwner {
-                        namespace_id: owner_ns_id,
-                        namespace_slug: ns_slug,
-                    },
-                    require_write,
-                    require_admin,
-                );
-            }
-        }
-
-        // 2. Organization memberships + organization teams (`FOR SHARE`), plus direct/team repo collaborators.
-        let mut best_org_role: Option<(Uuid, LfsCollaboratorRole)> = None;
-        if ns_kind == "organization"
-            && let Some(org_id) = ns_org_id
-        {
-            for r in tx
-                .query(
-                    "SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 FOR SHARE",
-                    &[&org_id, &actor_id],
-                )
-                .await
-                .map_err(pg_err)?
-            {
-                let parsed = LfsCollaboratorRole::parse(r.get::<_, &str>(0))?;
-                best_org_role = Some(best_org_role.map_or((org_id, parsed), |(id, cur)| (id, cur.max(parsed))));
-            }
-            for r in tx
-                .query(
-                    "SELECT t.role FROM organization_teams t
-                     JOIN organization_team_members tm ON tm.team_id = t.id
-                     WHERE t.organization_id = $1 AND tm.user_id = $2
-                     FOR SHARE OF t, tm",
-                    &[&org_id, &actor_id],
-                )
-                .await
-                .map_err(pg_err)?
-            {
-                let parsed = LfsCollaboratorRole::parse(r.get::<_, &str>(0))?;
-                best_org_role = Some(best_org_role.map_or((org_id, parsed), |(id, cur)| (id, cur.max(parsed))));
-            }
-        }
-
-        let mut best_repo_role: Option<LfsCollaboratorRole> = None;
-        for r in tx
-            .query(
-                "SELECT role FROM repository_collaborators WHERE repository_id=$1 AND user_id=$2 FOR SHARE",
-                &[&realm.repository_id, &actor_id],
-            )
-            .await
-            .map_err(pg_err)?
-        {
-            let parsed = LfsCollaboratorRole::parse(r.get::<_, &str>(0))?;
-            best_repo_role = Some(best_repo_role.map_or(parsed, |cur| cur.max(parsed)));
-        }
-        for r in tx
-            .query(
-                "SELECT t.role FROM repository_teams t
-                 JOIN repository_team_members tm ON tm.team_id = t.id
-                 WHERE t.repository_id = $1 AND tm.user_id = $2
-                 FOR SHARE OF t, tm",
-                &[&realm.repository_id, &actor_id],
-            )
-            .await
-            .map_err(pg_err)?
-        {
-            let parsed = LfsCollaboratorRole::parse(r.get::<_, &str>(0))?;
-            best_repo_role = Some(best_repo_role.map_or(parsed, |cur| cur.max(parsed)));
-        }
-        tx.commit().await.map_err(pg_err)?;
-
-        let authority = match (best_org_role, best_repo_role) {
-            (Some((_org_id, org_r)), Some(repo_r)) if repo_r > org_r => {
-                SubjectTenantAuthority::RepositoryCollaborator { namespace_slug: ns_slug, role: repo_r }
-            }
-            (Some((org_id, org_r)), _) => SubjectTenantAuthority::OrganizationMember {
-                organization_id: org_id,
-                namespace_slug: ns_slug,
-                role: org_r,
-            },
-            (None, Some(repo_r)) => {
-                SubjectTenantAuthority::RepositoryCollaborator { namespace_slug: ns_slug, role: repo_r }
-            }
-            (None, None) => SubjectTenantAuthority::Unrelated,
-        };
-        evaluate_subject_tenant_access(
+        let access = super::prod_auth_tx::resolve_authoritative_repo_access_in_tx(
+            &tx,
             realm.repository_id,
-            owner_ns_id,
+            Some(realm.owner_tenant_id),
             actor_id,
             actor_username,
-            authority,
             require_write,
             require_admin,
         )
+        .await?;
+        tx.commit().await.map_err(pg_err)?;
+        Ok(access)
     }
 }

@@ -163,18 +163,6 @@ async fn smart_git_fallback(
     let repo_id: Uuid = row.get(0);
     let owner_id: Uuid = row.get(1);
     let storage_generation: i64 = row.get(2);
-
-    let pg = PgLfsBlobStore::new(state.pool.clone());
-    let realm = match pg.ensure_realm_for_repository(repo_id, &state.storage.root).await {
-        Ok(r) => r,
-        Err(e) => return Ok(json_err(e)),
-    };
-    if realm.owner_tenant_id != owner_id {
-        return Err(rootyard::Error(StatusCode::CONFLICT, "repository identity changed"));
-    }
-    if let Err(e) = pg.resolve_authoritative_repo_access(&realm, actor.id, &actor.username, write, false).await {
-        return Ok(json_err(e));
-    }
     {
         let mut client = state.pool.get().await.map_err(rootyard::Error::internal)?;
         let tx = client.transaction().await.map_err(rootyard::Error::internal)?;
@@ -188,6 +176,18 @@ async fn smart_git_fallback(
         )
         .await?;
         auth::finish_tx(tx, &actor, false).await?;
+    }
+
+    let pg = PgLfsBlobStore::new(state.pool.clone());
+    let realm = match pg.ensure_realm_for_repository(repo_id, &state.storage.root).await {
+        Ok(r) => r,
+        Err(e) => return Ok(json_err(e)),
+    };
+    if realm.owner_tenant_id != owner_id {
+        return Err(rootyard::Error(StatusCode::CONFLICT, "repository identity changed"));
+    }
+    if let Err(e) = pg.resolve_authoritative_repo_access(&realm, actor.id, &actor.username, write, false).await {
+        return Ok(json_err(e));
     }
 
     let bare_dir: PathBuf = state.storage.repo_path(repo_id);

@@ -12,6 +12,8 @@ pub mod locks_store;
 pub mod pg_schema;
 #[path = "blob_proof_publication/pg_store.rs"]
 pub mod pg_store;
+#[path = "blob_proof_publication/prod_auth_tx.rs"]
+pub mod prod_auth_tx;
 #[path = "blob_proof_publication/prod_publication.rs"]
 pub mod prod_publication;
 #[path = "blob_proof_publication/prod_routes.rs"]
@@ -33,6 +35,7 @@ pub use authz::{
 };
 pub use locks_store::{InFlightUploadGuard, valid_lfs_lock_path};
 pub use pg_store::{LfsRepoRealm, PgLfsBlobStore, ReconcileUploadsReport, UploadOperationRow, init_lfs_blob_proof_tables};
+pub use prod_auth_tx::{ProdCommitAuthCheck, PushCommitAuthCheck, upload_attempt_advisory_keys};
 pub use prod_routes::{
     PushAttestationSession, active_blob_gate, prod_validate_and_attest_hook, prod_validate_and_attest_push,
     set_runtime_gate_override, with_push_attestation_session,

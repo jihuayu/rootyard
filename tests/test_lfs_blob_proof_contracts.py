@@ -126,6 +126,14 @@ class LfsBlobProofContractTests(unittest.TestCase):
             "reconcile_stale_pending_uploads",
             "abort_upload_on_cancel",
             "aborted_cancelled",
+            "upload_attempt_advisory_keys",
+            "pg_try_advisory_lock",
+            "pg_try_advisory_xact_lock",
+            "pg_advisory_unlock",
+            "verify_commit_write_authority_in_tx",
+            "record_committed_blob_with_auth",
+            "lease_until",
+            "operation_id",
         )
         for token in required:
             with self.subTest(token=token):
@@ -134,6 +142,22 @@ class LfsBlobProofContractTests(unittest.TestCase):
         prod_routes_src = (MOD_DIR / "prod_routes.rs").read_text(encoding="utf-8")
         self.assertIn("reconcile_stale_pending_uploads", prod_routes_src)
         self.assertIn("InFlightUploadGuard", prod_routes_src)
+        upload_body = prod_routes_src.split("pub(crate) async fn prod_upload(", 1)[1].split(
+            "pub(crate) async fn prod_verify(", 1
+        )[0]
+        self.assertNotIn("reauthorize_repo", upload_body)
+        self.assertIn("finish_and_unlock", upload_body)
+
+        multi_src = (TEST_SUPPORT / "multi_instance_auth_boundary.rs").read_text(encoding="utf-8")
+        self.assertIn("exercise_post_auth_pending_multi_instance_active_lease_and_atomic_commit_auth", multi_src)
+        self.assertIn("multi_instance_auth_boundary", TEST_MAIN.read_text(encoding="utf-8"))
+        fallback = (TEST_SUPPORT / "git_smart_http.rs").read_text(encoding="utf-8").split(
+            "async fn smart_git_fallback(", 1
+        )[1]
+        self.assertLess(
+            fallback.index("authorize_repo_with_role"), fallback.index("ensure_realm_for_repository")
+        )
+
         schema_src = (MOD_DIR / "pg_schema.rs").read_text(encoding="utf-8")
         self.assertIn('format!("{repository_id}.git")', schema_src)
         hook_src = (TEST_SUPPORT / "git_smart_http.rs").read_text(encoding="utf-8")

@@ -57,31 +57,69 @@ impl PgLfsBlobStore {
         stale_after: Duration,
     ) -> Result<ReconcileUploadsReport, LfsBlobError> {
         let stale_secs: f64 = stale_after.as_secs_f64();
+        let is_zero = stale_after.is_zero();
         let mut client = self.pool().get().await.map_err(pg_err)?;
         let tx = client.transaction().await.map_err(pg_err)?;
         tx.batch_execute("SET LOCAL synchronous_commit = 'on'").await.map_err(pg_err)?;
-        let aborted_attempts = tx
-            .execute(
-                "UPDATE lfs_blob_upload_attempts
-                 SET state='aborted_failed',
-                     failure_reason='reconciled_stale_pending_upload',
-                     updated_at=clock_timestamp()
-                 WHERE repository_id=$1
-                   AND state='pending'
-                   AND updated_at <= clock_timestamp() - make_interval(secs => $2)",
+        let candidates = tx
+            .query(
+                "SELECT attempt_id,
+                        (updated_at <= clock_timestamp() - make_interval(secs => $2)) AS age_stale,
+                        (lease_until <= clock_timestamp()) AS lease_expired
+                 FROM lfs_blob_upload_attempts
+                 WHERE repository_id = $1 AND state = 'pending'
+                 FOR UPDATE SKIP LOCKED",
                 &[&repository_id, &stale_secs],
             )
             .await
             .map_err(pg_err)?;
+        let mut aborted_attempts: u64 = 0;
+        for r in candidates {
+            let attempt_id: Uuid = r.get(0);
+            let age_stale: bool = r.get(1);
+            let lease_expired: bool = r.get(2);
+            let (k1, k2) = super::prod_auth_tx::upload_attempt_advisory_keys(attempt_id);
+            let lock_free: bool = tx
+                .query_one("SELECT pg_try_advisory_xact_lock($1, $2)", &[&k1, &k2])
+                .await
+                .map_err(pg_err)?
+                .get(0);
+            if !lock_free && !lease_expired {
+                // Actively streaming on a live instance right now — DO NOT reclaim!
+                continue;
+            }
+            if (lock_free && (is_zero || age_stale || lease_expired)) || lease_expired {
+                aborted_attempts += tx
+                    .execute(
+                        "UPDATE lfs_blob_upload_attempts
+                         SET state = 'aborted_failed',
+                             failure_reason = 'reconciled_stale_pending_upload',
+                             updated_at = clock_timestamp()
+                         WHERE attempt_id = $1 AND state = 'pending'",
+                        &[&attempt_id],
+                    )
+                    .await
+                    .map_err(pg_err)?;
+            }
+        }
         let aborted_ops = tx
             .execute(
-                "UPDATE lfs_blob_upload_operations
-                 SET state='aborted_failed',
-                     updated_at=clock_timestamp()
-                 WHERE repository_id=$1
-                   AND state='pending'
-                   AND updated_at <= clock_timestamp() - make_interval(secs => $2)",
-                &[&repository_id, &stale_secs],
+                "UPDATE lfs_blob_upload_operations o
+                 SET state = 'aborted_failed',
+                     updated_at = clock_timestamp()
+                 WHERE o.repository_id = $1
+                   AND o.state = 'pending'
+                   AND ($3 OR o.updated_at <= clock_timestamp() - make_interval(secs => $2))
+                   AND NOT EXISTS (
+                       SELECT 1 FROM lfs_blob_upload_attempts a
+                       WHERE a.repository_id = o.repository_id
+                         AND a.state = 'pending'
+                         AND (
+                             a.operation_id = o.operation_id
+                             OR (a.operation_id IS NULL AND a.actor_id = o.actor_id AND a.oid_sha256 = o.oid_sha256 AND a.size_bytes = o.size_bytes)
+                         )
+                   )",
+                &[&repository_id, &stale_secs, &is_zero],
             )
             .await
             .map_err(pg_err)?;
@@ -100,14 +138,12 @@ impl PgLfsBlobStore {
             committed_objects_preserved: preserved.max(0) as u64,
         })
     }
-
     pub async fn reconcile_in_flight_uploads(
         &self,
         repository_id: Uuid,
     ) -> Result<ReconcileUploadsReport, LfsBlobError> {
         self.reconcile_stale_pending_uploads(repository_id, Duration::ZERO).await
     }
-
     pub async fn abort_upload_on_cancel(
         &self,
         repository_id: Uuid,
@@ -139,7 +175,6 @@ impl PgLfsBlobStore {
         tx.commit().await.map_err(pg_err)?;
         Ok(())
     }
-
     pub async fn grant_shared_hold(&self, g: &SharedLfsHoldGrant) -> Result<(), LfsBlobError> {
         let mut client = self.pool().get().await.map_err(pg_err)?;
         let tx = client.transaction().await.map_err(pg_err)?;
@@ -159,7 +194,6 @@ impl PgLfsBlobStore {
         tx.commit().await.map_err(pg_err)?;
         Ok(())
     }
-
     pub async fn set_shared_hold_active(&self, grant_id: Uuid, active: bool) -> Result<(), LfsBlobError> {
         let client = self.pool().get().await.map_err(pg_err)?;
         client
@@ -173,7 +207,6 @@ impl PgLfsBlobStore {
             .map_err(pg_err)?;
         Ok(())
     }
-
     pub async fn find_shared_holds_for_target(
         &self,
         target_tenant_id: Uuid,
@@ -209,39 +242,136 @@ impl PgLfsBlobStore {
             .collect())
     }
 }
-
+pub struct ActiveUploadAttemptSpec<'a> {
+    pub tenant_id: Uuid,
+    pub repository_id: Uuid,
+    pub actor_id: Uuid,
+    pub oid_sha256: &'a str,
+    pub size_bytes: i64,
+    pub operation_id: Option<Uuid>,
+    pub scratch_path: PathBuf,
+    pub lease_ttl: Duration,
+}
 pub struct InFlightUploadGuard {
     pg: PgLfsBlobStore,
     repository_id: Uuid,
     attempt_id: Uuid,
     operation_id: Option<Uuid>,
     scratch_path: PathBuf,
-    settled: bool,
+    settled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    keeper_handle: Option<tokio::task::JoinHandle<()>>,
 }
-
 impl InFlightUploadGuard {
-    pub fn new(
-        pg: PgLfsBlobStore,
-        repository_id: Uuid,
-        attempt_id: Uuid,
-        operation_id: Option<Uuid>,
-        scratch_path: PathBuf,
-    ) -> Self {
-        Self { pg, repository_id, attempt_id, operation_id, scratch_path, settled: false }
+    pub async fn acquire(pg: PgLfsBlobStore, spec: ActiveUploadAttemptSpec<'_>) -> Result<Self, LfsBlobError> {
+        let attempt_id = Uuid::new_v4();
+        let (k1, k2) = super::prod_auth_tx::upload_attempt_advisory_keys(attempt_id);
+        let lease_conn = pg.pool().get().await.map_err(pg_err)?;
+        let locked: bool = lease_conn
+            .query_one("SELECT pg_try_advisory_lock($1, $2)", &[&k1, &k2])
+            .await
+            .map_err(pg_err)?
+            .get(0);
+        if !locked {
+            return Err(pg_err("upload advisory lock collision"));
+        }
+        let lease_secs = spec.lease_ttl.as_secs_f64();
+        if let Err(e) = lease_conn
+            .execute(
+                "INSERT INTO lfs_blob_upload_attempts(
+                    attempt_id, tenant_id, repository_id, actor_id, oid_sha256, size_bytes, operation_id, lease_until, state
+                 ) VALUES($1, $2, $3, $4, $5, $6, $7, clock_timestamp() + make_interval(secs => $8), 'pending')",
+                &[
+                    &attempt_id,
+                    &spec.tenant_id,
+                    &spec.repository_id,
+                    &spec.actor_id,
+                    &spec.oid_sha256,
+                    &spec.size_bytes,
+                    &spec.operation_id,
+                    &lease_secs,
+                ],
+            )
+            .await
+        {
+            let _ = lease_conn.execute("SELECT pg_advisory_unlock($1, $2)", &[&k1, &k2]).await;
+            return Err(pg_err(e));
+        }
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let settled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settled_clone = settled.clone();
+        let pg_clone = pg.clone();
+        let repository_id = spec.repository_id;
+        let operation_id = spec.operation_id;
+        let keeper_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                        let _ = lease_conn
+                            .execute(
+                                "UPDATE lfs_blob_upload_attempts
+                                 SET lease_until = clock_timestamp() + make_interval(secs => $2),
+                                     updated_at = clock_timestamp()
+                                 WHERE attempt_id = $1 AND state = 'pending'",
+                                &[&attempt_id, &lease_secs],
+                            )
+                            .await;
+                        if let Some(op_id) = operation_id {
+                            let _ = lease_conn
+                                .execute(
+                                    "UPDATE lfs_blob_upload_operations SET updated_at = clock_timestamp()
+                                     WHERE repository_id = $1 AND operation_id = $2 AND state = 'pending'",
+                                    &[&repository_id, &op_id],
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+            let _ = lease_conn.execute("SELECT pg_advisory_unlock($1, $2)", &[&k1, &k2]).await;
+            drop(lease_conn);
+            if !settled_clone.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    pg_clone.abort_upload_on_cancel(
+                        repository_id,
+                        attempt_id,
+                        operation_id,
+                        "client_upload_stream_cancelled",
+                    ),
+                )
+                .await;
+            }
+        });
+        Ok(Self {
+            pg,
+            repository_id,
+            attempt_id,
+            operation_id,
+            scratch_path: spec.scratch_path,
+            settled,
+            stop_tx: Some(stop_tx),
+            keeper_handle: Some(keeper_handle),
+        })
     }
-
     pub const fn attempt_id(&self) -> Uuid {
         self.attempt_id
     }
-
-    pub fn mark_committed(&mut self) {
-        self.settled = true;
+    pub async fn finish_and_unlock(&mut self) {
+        self.settled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop_tx.take();
+        if let Some(h) = self.keeper_handle.take() {
+            let _ = h.await;
+        }
     }
-
     pub async fn abort_now(&mut self, reason: &str) {
-        if !self.settled {
-            self.settled = true;
+        if !self.settled.swap(true, std::sync::atomic::Ordering::SeqCst) {
             let _ = std::fs::remove_file(&self.scratch_path);
+            self.stop_tx.take();
+            if let Some(h) = self.keeper_handle.take() {
+                let _ = h.await;
+            }
             let _ =
                 self.pg.abort_upload_on_cancel(self.repository_id, self.attempt_id, self.operation_id, reason).await;
         }
@@ -251,22 +381,7 @@ impl InFlightUploadGuard {
 impl Drop for InFlightUploadGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.scratch_path);
-        if !self.settled {
-            self.settled = true;
-            let pg = self.pg.clone();
-            let repo_id = self.repository_id;
-            let attempt_id = self.attempt_id;
-            let op_id = self.operation_id;
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        pg.abort_upload_on_cancel(repo_id, attempt_id, op_id, "client_upload_stream_cancelled"),
-                    )
-                    .await;
-                });
-            }
-        }
+        let _ = self.stop_tx.take();
     }
 }
 

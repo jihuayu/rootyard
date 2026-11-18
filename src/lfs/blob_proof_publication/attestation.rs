@@ -11,6 +11,7 @@ use crate::ref_store::GitObjectFormat;
 
 use super::locks_store::{collect_touched_paths, run_git_quarantined};
 use super::pg_store::{PgLfsBlobStore, pg_err};
+use super::prod_auth_tx::PushCommitAuthCheck;
 use super::transfer::{LfsTransferContext, resolve_and_verify_remote_blob};
 use super::types::{
     AttestationOutcome, AttestedLfsPointer, LfsBlobError, LfsPointerAttestation, LfsProofRejectCode, LfsRefUpdateSpec,
@@ -59,12 +60,28 @@ impl PgLfsBlobStore {
         &self,
         att: &LfsPointerAttestation,
     ) -> Result<(LfsPointerAttestation, bool), LfsBlobError> {
+        self.persist_attestation_with_auth(att, None).await
+    }
+
+    pub async fn persist_attestation_with_auth(
+        &self,
+        att: &LfsPointerAttestation,
+        push_auth: Option<PushCommitAuthCheck>,
+    ) -> Result<(LfsPointerAttestation, bool), LfsBlobError> {
         att.verify_integrity()?;
         let payload_json = serde_json::to_value(att)
             .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
         let mut client = self.pool().get().await.map_err(pg_err)?;
         let tx = client.transaction().await.map_err(pg_err)?;
         tx.batch_execute("SET LOCAL synchronous_commit = 'on'").await.map_err(pg_err)?;
+        super::prod_auth_tx::verify_push_attestation_authority_in_tx(
+            &tx,
+            att.repository_id,
+            att.tenant_id,
+            att.actor_id,
+            push_auth,
+        )
+        .await?;
         let inserted = tx
             .execute(
                 "INSERT INTO lfs_pointer_attestations(
@@ -115,12 +132,28 @@ impl PgLfsBlobStore {
     }
 
     pub async fn refresh_repaired_attestation(&self, att: &LfsPointerAttestation) -> Result<(), LfsBlobError> {
+        self.refresh_repaired_attestation_with_auth(att, None).await
+    }
+
+    pub async fn refresh_repaired_attestation_with_auth(
+        &self,
+        att: &LfsPointerAttestation,
+        push_auth: Option<PushCommitAuthCheck>,
+    ) -> Result<(), LfsBlobError> {
         att.verify_integrity()?;
         let payload_json = serde_json::to_value(att)
             .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
         let mut client = self.pool().get().await.map_err(pg_err)?;
         let tx = client.transaction().await.map_err(pg_err)?;
         tx.batch_execute("SET LOCAL synchronous_commit = 'on'").await.map_err(pg_err)?;
+        super::prod_auth_tx::verify_push_attestation_authority_in_tx(
+            &tx,
+            att.repository_id,
+            att.tenant_id,
+            att.actor_id,
+            push_auth,
+        )
+        .await?;
         let updated = tx
             .execute(
                 "UPDATE lfs_pointer_attestations
@@ -167,6 +200,14 @@ fn valid_git_oid_for_format(oid: &str, fmt: GitObjectFormat) -> bool {
 pub async fn attest_and_authorize_push(
     ctx: &LfsTransferContext<'_>,
     req: &LfsPushAttestationRequest,
+) -> Result<AttestationOutcome, LfsBlobError> {
+    attest_and_authorize_push_with_auth(ctx, req, None).await
+}
+
+pub async fn attest_and_authorize_push_with_auth(
+    ctx: &LfsTransferContext<'_>,
+    req: &LfsPushAttestationRequest,
+    push_auth: Option<PushCommitAuthCheck>,
 ) -> Result<AttestationOutcome, LfsBlobError> {
     let _ = ctx.gate.require_store()?;
     if !ctx.access.role.allows_write() {
@@ -227,7 +268,7 @@ pub async fn attest_and_authorize_push(
                 &existing.ref_updates_digest,
                 &existing.pointers,
             );
-            ctx.pg.refresh_repaired_attestation(&existing).await?;
+            ctx.pg.refresh_repaired_attestation_with_auth(&existing, push_auth).await?;
         }
         return Ok(AttestationOutcome::Replayed(existing));
     }
@@ -367,6 +408,6 @@ pub async fn attest_and_authorize_push(
         pointers: attested_pointers,
         proof_digest,
     };
-    let (saved, replayed) = ctx.pg.persist_attestation(&att).await?;
+    let (saved, replayed) = ctx.pg.persist_attestation_with_auth(&att, push_auth).await?;
     Ok(if replayed { AttestationOutcome::Replayed(saved) } else { AttestationOutcome::Issued(saved) })
 }
