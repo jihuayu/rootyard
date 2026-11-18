@@ -7,11 +7,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use reqwest::StatusCode;
 use rootyard::{
-    journal::RefChange,
+    journal::{self, IdempotencyIntent, RefChange},
     lfs::blob_proof_publication::{
         LfsBlobRuntimeGate, LfsProofRejectCode, LfsRepoRealm, LfsTransferContext, PgLfsBlobStore,
-        PushAttestationSession, delete_or_retire_lfs_object, operation_token_to_uuid, upload_lfs_object_to_remote,
-        with_push_attestation_session,
+        delete_or_retire_lfs_object, operation_token_to_uuid, upload_lfs_object_to_remote,
     },
 };
 use serde_json::{Value, json};
@@ -22,7 +21,7 @@ use uuid::Uuid;
 pub use super::adversarial_org_restart::{
     OrgRestartSharedHoldInput, exercise_org_authority_restart_recovery_hydration_and_shared_holds,
 };
-use super::{LoopbackS3, RunningProdLfsServer, TestActor, run_git_ok, run_git_raw};
+use super::{LoopbackS3, RunningProdLfsServer, TestActor, run_git_ok, run_git_raw, run_real_validate_hook};
 
 pub struct UploadRetryRepairInput<'a> {
     pub srv: &'a RunningProdLfsServer,
@@ -166,6 +165,12 @@ pub async fn exercise_same_operation_upload_retries_locator_repair_and_corruptio
     ensure!(del_http.status() == StatusCode::METHOD_NOT_ALLOWED);
     let del_body: Value = del_http.json().await?;
     ensure!(del_body["code"] == "delete_disabled_by_policy", "got {del_body}");
+    let del_with_sz = cli
+        .delete(format!("{}/{}/{}/info/lfs/objects/{oid}/{sz}", srv.base_url, realm.owner_username, realm.repo_name))
+        .basic_auth(&alice.username, Some(&alice.token))
+        .send()
+        .await?;
+    ensure!(del_with_sz.status() == StatusCode::METHOD_NOT_ALLOWED);
     let del_err = delete_or_retire_lfs_object(&ctx, &oid, false).await.expect_err("physical delete must fail");
     ensure!(del_err.code == LfsProofRejectCode::DeleteDisabledByPolicy);
     Ok(oid)
@@ -227,6 +232,14 @@ pub async fn exercise_named_pointer_rejections_and_prod_attestation_replay(
     let out_mal = run_git_raw(mal_wt.path(), home, &["push", "--no-verify", "origin", "main"])?;
     ensure!(!out_mal.status.success() && String::from_utf8_lossy(&out_mal.stderr).contains("malformed_lfs_pointer"));
 
+    let storage_gen: i64 = srv
+        .state
+        .pool
+        .get()
+        .await?
+        .query_one("SELECT storage_generation FROM repositories WHERE id = $1", &[&realm.repository_id])
+        .await?
+        .get(0);
     let bare_dir = srv.state.storage.repo_path(realm.repository_id);
     let head_oid = run_git_ok(&bare_dir, home, &["rev-parse", "refs/heads/main"])?;
     let zero_oid = "0".repeat(head_oid.len());
@@ -236,65 +249,68 @@ pub async fn exercise_named_pointer_rejections_and_prod_attestation_replay(
         old_oid: zero_oid.clone(),
         new_oid: head_oid.clone(),
     }];
-    let sess = PushAttestationSession {
-        pool: srv.state.pool.clone(),
-        actor_id: alice.user_id,
-        actor_username: alice.username.clone(),
-        operation_id: Some(op_id),
-        git_object_dir: None,
-        git_alternate_object_dirs: None,
+    let mk_op = || {
+        journal::begin_ref_transaction(
+            &srv.state.storage.root,
+            realm.repository_id,
+            alice.user_id,
+            alice.username.clone(),
+            alice.token_id,
+            storage_gen,
+            Some(IdempotencyIntent { key_sha256: op_id.to_string(), request_sha256: "0".repeat(64) }),
+        )
     };
-    let client = srv.state.pool.get().await?;
-    with_push_attestation_session(sess.clone(), async {
-        rootyard::lfs::publication::validate_new_refs_with_client(
-            &**client,
+
+    let op1 = mk_op()?;
+    tokio::task::block_in_place(|| {
+        run_real_validate_hook(
+            &srv.state.config.database_url,
+            &srv.state.config.git,
             &bare_dir,
             &srv.state.storage.root,
-            &srv.state.config.git,
-            srv.state.config.git_timeout,
-            realm.repository_id,
-            realm.owner_tenant_id,
+            None,
+            None,
+            &op1,
             &changes,
         )
-        .await
-    })
-    .await?;
+    })?;
+    let _ = journal::finish(&op1);
     let att1 = pg.load_attestation(realm.repository_id, op_id).await?.context("att1")?;
 
-    with_push_attestation_session(sess.clone(), async {
-        rootyard::lfs::publication::validate_new_refs_with_client(
-            &**client,
+    let op2 = mk_op()?;
+    tokio::task::block_in_place(|| {
+        run_real_validate_hook(
+            &srv.state.config.database_url,
+            &srv.state.config.git,
             &bare_dir,
             &srv.state.storage.root,
-            &srv.state.config.git,
-            srv.state.config.git_timeout,
-            realm.repository_id,
-            realm.owner_tenant_id,
+            None,
+            None,
+            &op2,
             &changes,
         )
-        .await
-    })
-    .await?;
+    })?;
+    let _ = journal::finish(&op2);
     let att2 = pg.load_attestation(realm.repository_id, op_id).await?.context("att2")?;
     ensure!(att1.attestation_id == att2.attestation_id && att1.proof_digest == att2.proof_digest);
 
     let tampered =
         vec![RefChange { ref_name: "refs/heads/tampered-target".into(), old_oid: zero_oid, new_oid: head_oid }];
-    let equiv_err = with_push_attestation_session(sess, async {
-        rootyard::lfs::publication::validate_new_refs_with_client(
-            &**client,
+    let op3 = mk_op()?;
+    let equiv_err = tokio::task::block_in_place(|| {
+        run_real_validate_hook(
+            &srv.state.config.database_url,
+            &srv.state.config.git,
             &bare_dir,
             &srv.state.storage.root,
-            &srv.state.config.git,
-            srv.state.config.git_timeout,
-            realm.repository_id,
-            realm.owner_tenant_id,
+            None,
+            None,
+            &op3,
             &tampered,
         )
-        .await
     })
-    .await
-    .expect_err("equivocated replay must fail closed");
+    .expect_err("equivocated replay via real validate_hook must fail closed");
+    let _ = journal::finish(&op3);
     ensure!(equiv_err.to_string().contains("attestation_equivocation"), "got {equiv_err}");
     Ok(())
 }

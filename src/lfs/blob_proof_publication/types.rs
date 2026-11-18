@@ -67,9 +67,8 @@ impl LfsProofRejectCode {
             Self::InvalidInput => StatusCode::BAD_REQUEST,
             Self::MalformedLfsPointer | Self::SizeOrDigestMismatch => StatusCode::UNPROCESSABLE_ENTITY,
             Self::MissingRemoteBlob => StatusCode::NOT_FOUND,
-            Self::UnauthorizedCollaborator | Self::UnauthorizedSharedHold | Self::DeleteDisabledByPolicy => {
-                StatusCode::FORBIDDEN
-            }
+            Self::UnauthorizedCollaborator | Self::UnauthorizedSharedHold => StatusCode::FORBIDDEN,
+            Self::DeleteDisabledByPolicy => StatusCode::METHOD_NOT_ALLOWED,
             Self::ForeignBackendMismatch | Self::LockedPathConflict | Self::AttestationEquivocation => {
                 StatusCode::CONFLICT
             }

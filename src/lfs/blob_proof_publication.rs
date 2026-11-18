@@ -34,13 +34,14 @@ pub use authz::{
 pub use locks_store::valid_lfs_lock_path;
 pub use pg_store::{LfsRepoRealm, PgLfsBlobStore, ReconcileUploadsReport, UploadOperationRow, init_lfs_blob_proof_tables};
 pub use prod_routes::{
-    PushAttestationSession, active_blob_gate, prod_validate_and_attest_push, set_runtime_gate_override,
-    with_push_attestation_session,
+    PushAttestationSession, active_blob_gate, prod_validate_and_attest_hook, prod_validate_and_attest_push,
+    set_runtime_gate_override, with_push_attestation_session,
 };
 pub use transfer::{
-    ComputeViewHydrationReport, LfsTransferContext, delete_or_retire_lfs_object, download_lfs_object_from_remote,
-    hydrate_clean_compute_view, process_batch_request, resolve_and_verify_remote_blob, upload_lfs_object_to_remote,
-    verify_committed_locator_bytes, verify_lfs_object_remote,
+    ComputeViewHydrationReport, LfsTransferContext, MAX_CONCURRENT_S4_TRANSFERS, PreStreamedScratch,
+    acquire_transfer_permit, delete_or_retire_lfs_object, download_lfs_object_from_remote, hydrate_clean_compute_view,
+    process_batch_request, resolve_and_verify_remote_blob, upload_lfs_object_to_remote,
+    upload_streamed_lfs_object_to_remote, verify_committed_locator_bytes, verify_lfs_object_remote,
 };
 pub use types::{
     AttestationOutcome, AttestedLfsPointer, CommittedLfsBlobRecord, LfsAccessMode, LfsBlobError, LfsCollaboratorRole,

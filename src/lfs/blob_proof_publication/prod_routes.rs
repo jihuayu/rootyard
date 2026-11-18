@@ -1,114 +1,45 @@
-//! Production `crate::lfs::routes()` (`AppState`) S4 remote-Blob HTTP bridge (`Refs #145`).
+//! Production `crate::lfs::routes()` (`AppState`) S4 streaming HTTP bridge (`Refs #145`).
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::os::unix::fs::OpenOptionsExt;
+use std::sync::Arc;
 
 use axum::{
-    Json,
     body::{Body, Bytes},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use futures_util::StreamExt;
-use serde::Serialize;
+use futures_util::{StreamExt, stream};
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::{
     AppState, Error, auth,
     lfs::{
         handlers::{reauthorize_repo, sanitize_headers},
-        models::{self, BatchObjectSpec, BatchRequest, LFS_MEDIA_TYPE},
+        models::{self, BatchObjectSpec, BatchRequest},
     },
     token_scopes::RepoAction,
 };
 
 use super::authz::{LfsBlobRuntimeGate, extract_stable_operation_id};
 use super::pg_store::PgLfsBlobStore;
-pub(crate) use super::prod_publication::active_push_quarantine_dirs;
-use super::prod_publication::ephemeral_scratch_root;
-pub use super::prod_publication::{PushAttestationSession, prod_validate_and_attest_push, with_push_attestation_session};
+pub(crate) use super::prod_publication::{active_push_quarantine_dirs, enforce_blob_gate_if_requested, to_app_error};
+use super::prod_publication::{
+    build_base_url, collect_forwarded_action_headers, ephemeral_scratch_root, lfs_blob_err_response, lfs_blob_json,
+};
+pub use super::prod_publication::{
+    PushAttestationSession, active_blob_gate, prod_validate_and_attest_hook, prod_validate_and_attest_push,
+    set_runtime_gate_override, with_push_attestation_session,
+};
 use super::transfer::{
-    LfsTransferContext, download_lfs_object_from_remote, process_batch_request, upload_lfs_object_to_remote,
+    EphemeralScratchGuard, LfsTransferContext, PreStreamedScratch, acquire_transfer_permit,
+    open_verified_remote_download_file, process_batch_request, upload_streamed_lfs_object_to_remote,
     verify_lfs_object_remote,
 };
 use super::types::{LfsBlobError, LfsProofRejectCode};
-
-static GATE_OVERRIDE: OnceLock<RwLock<Option<LfsBlobRuntimeGate>>> = OnceLock::new();
-
-fn gate_slot() -> &'static RwLock<Option<LfsBlobRuntimeGate>> {
-    GATE_OVERRIDE.get_or_init(|| RwLock::new(None))
-}
-
-pub fn set_runtime_gate_override(gate: Option<LfsBlobRuntimeGate>) {
-    *gate_slot().write().unwrap_or_else(|e| e.into_inner()) = gate;
-}
-
-pub fn active_blob_gate() -> Option<LfsBlobRuntimeGate> {
-    if let Some(g) = gate_slot().read().unwrap_or_else(|e| e.into_inner()).clone() {
-        return Some(g);
-    }
-    LfsBlobRuntimeGate::blob_mode_requested().then(LfsBlobRuntimeGate::from_env_gate)
-}
-
-pub(crate) fn enforce_blob_gate_if_requested() -> Result<Option<LfsBlobRuntimeGate>, Error> {
-    let Some(gate) = active_blob_gate() else {
-        return Ok(None);
-    };
-    let _ = gate.require_store().map_err(to_app_error)?;
-    Ok(Some(gate))
-}
-
-pub(crate) fn to_app_error(err: LfsBlobError) -> Error {
-    Error(err.code.http_status(), err.code.as_str())
-}
-
-fn lfs_blob_json(status: StatusCode, payload: impl Serialize) -> Response {
-    let mut res = (status, Json(payload)).into_response();
-    res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(LFS_MEDIA_TYPE));
-    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    res.headers_mut().insert(HeaderName::from_static("x-content-type-options"), HeaderValue::from_static("nosniff"));
-    res.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
-    if status == StatusCode::UNAUTHORIZED {
-        res.headers_mut()
-            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"Rootyard\", charset=\"UTF-8\""));
-    }
-    res
-}
-
-fn lfs_blob_err_response(err: LfsBlobError) -> Response {
-    lfs_blob_json(
-        err.code.http_status(),
-        json!({ "code": err.code.as_str(), "error": err.code.as_str(), "message": err.message }),
-    )
-}
-
-fn build_base_url(headers: &HeaderMap) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| s.eq_ignore_ascii_case("https"))
-        .map(|_| "https")
-        .unwrap_or("http");
-    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()).map(str::trim).filter(|h| !h.is_empty())
-    else {
-        return String::new();
-    };
-    format!("{scheme}://{host}")
-}
-
-fn collect_forwarded_action_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    if let Some(auth_val) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        out.insert("Authorization".to_owned(), auth_val.to_owned());
-    }
-    for name in ["X-Rootyard-Operation-Id", "Idempotency-Key"] {
-        if let Some(val) = headers.get(name).and_then(|v| v.to_str().ok()) {
-            out.insert(name.to_owned(), val.to_owned());
-        }
-    }
-    out
-}
 
 async fn auth_and_prepare_prod(
     state: &Arc<AppState>,
@@ -205,6 +136,10 @@ pub(crate) async fn prod_batch(
     if let Err(e) = gate.require_store() {
         return Ok(lfs_blob_err_response(e));
     }
+    let _permit = match acquire_transfer_permit(state.config.git_timeout).await {
+        Ok(p) => p,
+        Err(e) => return Ok(lfs_blob_err_response(e)),
+    };
     models::check_lfs_json_headers(&headers)?;
     let req: BatchRequest = serde_json::from_slice(&body).map_err(|_| Error::bad_request())?;
     let write = match req.operation.as_str() {
@@ -263,6 +198,10 @@ pub(crate) async fn prod_upload(
     if let Err(e) = gate.require_store() {
         return Ok(lfs_blob_err_response(e));
     }
+    let _permit = match acquire_transfer_permit(state.config.git_timeout).await {
+        Ok(p) => p,
+        Err(e) => return Ok(lfs_blob_err_response(e)),
+    };
     let op_id = match extract_stable_operation_id(&headers) {
         Ok(v) => v,
         Err(e) => return Ok(lfs_blob_err_response(e)),
@@ -289,17 +228,48 @@ pub(crate) async fn prod_upload(
             return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
         }
     }
-    let mut payload = Vec::new();
-    let mut stream = body.into_data_stream();
-    while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res.map_err(|_| Error::bad_request())?;
-        if (payload.len() as u64).saturating_add(chunk.len() as u64) > state.config.max_request_bytes {
-            return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
-        }
-        payload.extend_from_slice(&chunk);
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .is_some_and(|cl| cl > state.config.max_request_bytes)
+    {
+        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
     }
-    let expected_size = size_param.unwrap_or(payload.len() as i64);
+
     let scratch = ephemeral_scratch_root();
+    fs::create_dir_all(&scratch).await.map_err(Error::internal)?;
+    let scratch_path = scratch.join(format!(".lfs-stream-up-{}.tmp", Uuid::new_v4()));
+    let _guard = EphemeralScratchGuard(scratch_path.clone());
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+    {
+        let std_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&scratch_path)
+            .map_err(Error::internal)?;
+        let mut out_file = fs::File::from_std(std_file);
+        let mut data_stream = body.into_data_stream();
+        while let Some(chunk_res) = data_stream.next().await {
+            let chunk = chunk_res.map_err(|_| Error::bad_request())?;
+            written = written.saturating_add(chunk.len() as u64);
+            if written > state.config.max_request_bytes {
+                return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
+            }
+            hasher.update(&chunk);
+            out_file.write_all(&chunk).await.map_err(Error::internal)?;
+        }
+        out_file.sync_all().await.map_err(Error::internal)?;
+    }
+
+    let expected_size = size_param.unwrap_or(written as i64);
+    let streamed = PreStreamedScratch {
+        path: scratch_path,
+        size_bytes: written as i64,
+        sha256_hex: hex::encode(hasher.finalize()),
+    };
     let ctx = LfsTransferContext {
         gate: &gate,
         pg: &pg,
@@ -308,7 +278,7 @@ pub(crate) async fn prod_upload(
         scratch_dir: &scratch,
         timeout: state.config.git_timeout,
     };
-    let committed = match upload_lfs_object_to_remote(&ctx, op_id, &oid, expected_size, &payload).await {
+    let committed = match upload_streamed_lfs_object_to_remote(&ctx, op_id, &oid, expected_size, &streamed).await {
         Ok(c) => c,
         Err(e) => return Ok(lfs_blob_err_response(e)),
     };
@@ -348,6 +318,10 @@ pub(crate) async fn prod_verify(
     if let Err(e) = gate.require_store() {
         return Ok(lfs_blob_err_response(e));
     }
+    let _permit = match acquire_transfer_permit(state.config.git_timeout).await {
+        Ok(p) => p,
+        Err(e) => return Ok(lfs_blob_err_response(e)),
+    };
     models::check_lfs_json_headers(&headers)?;
     let op_id = match extract_stable_operation_id(&headers) {
         Ok(v) => v,
@@ -362,11 +336,14 @@ pub(crate) async fn prod_verify(
     if let Some(id) = op_id {
         match pg.load_upload_operation(realm.repository_id, id).await {
             Ok(Some(saved))
-                if saved.actor_id != actor.id || saved.oid_sha256 != spec.oid || saved.size_bytes != spec.size =>
+                if saved.tenant_id != realm.owner_tenant_id
+                    || saved.actor_id != actor.id
+                    || saved.oid_sha256 != spec.oid
+                    || saved.size_bytes != spec.size =>
             {
                 return Ok(lfs_blob_err_response(LfsBlobError::new(
                     LfsProofRejectCode::AttestationEquivocation,
-                    "verify operation_id conflicts with upload operation record",
+                    "verify operation_id conflicts with current tenant or upload operation record",
                 )));
             }
             Ok(_) => {}
@@ -412,6 +389,10 @@ pub(crate) async fn prod_download(
     if let Err(e) = gate.require_store() {
         return Ok(lfs_blob_err_response(e));
     }
+    let permit = match acquire_transfer_permit(state.config.git_timeout).await {
+        Ok(p) => p,
+        Err(e) => return Ok(lfs_blob_err_response(e)),
+    };
     let (actor, name, pg, realm, access) =
         match auth_and_prepare_prod(&state, &gate, &headers, &owner, &repo_raw, false).await {
             Ok(t) => t,
@@ -426,8 +407,8 @@ pub(crate) async fn prod_download(
         scratch_dir: &scratch,
         timeout: state.config.git_timeout,
     };
-    let bytes = match download_lfs_object_from_remote(&ctx, &oid, size_param).await {
-        Ok(b) => b,
+    let (file, guard, expected_len) = match open_verified_remote_download_file(&ctx, &oid, size_param).await {
+        Ok(t) => t,
         Err(e) => return Ok(lfs_blob_err_response(e)),
     };
     reauthorize_repo(
@@ -442,14 +423,23 @@ pub(crate) async fn prod_download(
         false,
     )
     .await?;
+    let body_stream = stream::try_unfold((file, guard, permit), |(mut f, g, p)| async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            return Ok::<_, std::io::Error>(None);
+        }
+        buf.truncate(n);
+        Ok(Some((Bytes::from(buf), (f, g, p))))
+    });
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .header(header::CONTENT_LENGTH, expected_len.to_string())
         .header(header::CACHE_CONTROL, "no-store")
         .header("x-content-type-options", "nosniff")
         .header("x-lfs-oid", &oid)
         .header(header::CONNECTION, "close")
-        .body(Body::from(bytes))
+        .body(Body::from_stream(body_stream))
         .map_err(Error::internal)
 }

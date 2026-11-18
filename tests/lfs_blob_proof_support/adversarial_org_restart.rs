@@ -1,4 +1,5 @@
-//! Organization RBAC, crash/restart recovery, clean hydration, and cross-owner shared-holds (`Refs #145`).
+//! Organization RBAC, ownership-transfer tenant re-validation, crash/restart recovery,
+//! clean hydration, and cross-owner shared-holds (`Refs #145`).
 
 use std::path::Path;
 use std::time::Duration;
@@ -6,15 +7,22 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use deadpool_postgres::Pool;
 use reqwest::StatusCode;
-use rootyard::lfs::blob_proof_publication::{
-    LfsAccessMode, LfsBlobRuntimeGate, LfsRepoRealm, LfsTransferContext, PgLfsBlobStore, PointerResolutionSource,
-    SharedLfsHoldGrant, hydrate_clean_compute_view, operation_token_to_uuid,
+use rootyard::{
+    journal::{self, IdempotencyIntent, RefChange},
+    lfs::blob_proof_publication::{
+        LfsAccessMode, LfsBlobRuntimeGate, LfsProofRejectCode, LfsRepoRealm, LfsTransferContext, PgLfsBlobStore,
+        PointerResolutionSource, SharedLfsHoldGrant, hydrate_clean_compute_view, operation_token_to_uuid,
+    },
 };
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use super::{LoopbackS3, RunningProdLfsServer, TestActor, copy_dir_recursive, issue_actor, run_git_ok, run_git_raw};
+use super::{
+    LoopbackS3, RunningProdLfsServer, TestActor, copy_dir_recursive, issue_actor, run_git_ok, run_git_raw,
+    run_real_validate_hook,
+};
 
 pub struct OrgRestartSharedHoldInput<'a> {
     pub s3: &'a LoopbackS3,
@@ -79,11 +87,12 @@ pub async fn exercise_org_authority_restart_recovery_hydration_and_shared_holds(
     ensure!(!restart_dir.path().join("data").join("lfs").exists());
     let fresh_gate = LfsBlobRuntimeGate::configured(s3.open_store(root_prefix)?);
     let restarted = RunningProdLfsServer::start_in_dir(fresh_gate.clone(), pool.clone(), db_url, restart_dir).await?;
+    let cli = reqwest::Client::new();
 
     let rec_report = pg.reconcile_in_flight_uploads(realm.repository_id).await?;
     ensure!(rec_report.aborted_orphaned_attempts >= 1 && rec_report.committed_objects_preserved >= 2);
 
-    let retry_res = reqwest::Client::new()
+    let retry_res = cli
         .put(format!(
             "{}/{}/{}/info/lfs/objects/{crash_oid}/{}",
             restarted.base_url,
@@ -144,6 +153,146 @@ pub async fn exercise_org_authority_restart_recovery_hydration_and_shared_holds(
     let org_clone = TempDir::new()?;
     run_git_ok(org_clone.path(), home, &["clone", &restarted.git_url_for(alice, "acme", "org-engine"), "."])?;
     ensure!(std::fs::read(org_clone.path().join("org_asset.bin"))? == org_bytes);
+
+    // Ownership transfer (`alice/xfer-repo` -> `acme/xfer-repo`): `ensure_realm_for_repository`,
+    // upload operations, push attestations, and clean hydration must re-validate live `owner_id`
+    // and reject stale pre-transfer tenant records (`409 attestation_equivocation` / `missing_remote_blob`).
+    let (xfer_repo_id, pre_owner_id) = restarted.create_repo(alice, None, "xfer-repo", "sha1").await?;
+    ensure!(pre_owner_id != org_id);
+    let xfer_wt = TempDir::new()?;
+    run_git_ok(xfer_wt.path(), home, &["init", "--initial-branch=main"])?;
+    run_git_ok(xfer_wt.path(), home, &["lfs", "install", "--local"])?;
+    run_git_ok(
+        xfer_wt.path(),
+        home,
+        &["remote", "add", "origin", &restarted.git_url_for(alice, &alice.username, "xfer-repo")],
+    )?;
+    run_git_ok(xfer_wt.path(), home, &["lfs", "track", "*.bin"])?;
+    let pre_bytes = b"pre-ownership-transfer-lfs-payload-v1".to_vec();
+    let pre_oid = hex::encode(Sha256::digest(&pre_bytes));
+    let pre_sz = pre_bytes.len() as i64;
+    std::fs::write(xfer_wt.path().join("pre_xfer.bin"), &pre_bytes)?;
+    run_git_ok(xfer_wt.path(), home, &["add", ".gitattributes", "pre_xfer.bin"])?;
+    run_git_ok(xfer_wt.path(), home, &["commit", "-m", "pre-transfer LFS commit"])?;
+    let pre_commit_oid = run_git_ok(xfer_wt.path(), home, &["rev-parse", "HEAD"])?;
+    let pre_push_tok = "op-pre-xfer-push-01";
+    run_git_ok(
+        xfer_wt.path(),
+        home,
+        &["-c", &format!("http.extraHeader=X-Rootyard-Operation-Id: {pre_push_tok}"), "push", "-u", "origin", "main"],
+    )?;
+    let pre_up_tok = "op-pre-xfer-upload-01";
+    let pre_put = cli
+        .put(format!("{}/{}/xfer-repo/info/lfs/objects/{pre_oid}/{pre_sz}", restarted.base_url, alice.username))
+        .basic_auth(&alice.username, Some(&alice.token))
+        .header("X-Rootyard-Operation-Id", pre_up_tok)
+        .body(pre_bytes.clone())
+        .send()
+        .await?;
+    ensure!(pre_put.status() == StatusCode::OK);
+
+    let new_gen: i64 = pool
+        .get()
+        .await?
+        .query_one(
+            "UPDATE repositories
+             SET owner_id = $2, storage_generation = storage_generation + 1
+             WHERE id = $1
+             RETURNING storage_generation",
+            &[&xfer_repo_id, &org_id],
+        )
+        .await?
+        .get(0);
+    let post_realm = pg.ensure_realm_for_repository(xfer_repo_id, &restarted.state.storage.root).await?;
+    ensure!(post_realm.owner_tenant_id == org_id && post_realm.owner_username == "acme");
+
+    let stale_put = cli
+        .put(format!("{}/acme/xfer-repo/info/lfs/objects/{pre_oid}/{pre_sz}", restarted.base_url))
+        .basic_auth(&alice.username, Some(&alice.token))
+        .header("X-Rootyard-Operation-Id", pre_up_tok)
+        .body(pre_bytes)
+        .send()
+        .await?;
+    ensure!(stale_put.status() == StatusCode::CONFLICT);
+    let stale_put_json: Value = stale_put.json().await?;
+    ensure!(stale_put_json["code"] == "attestation_equivocation", "got {stale_put_json}");
+
+    let stale_verify = cli
+        .post(format!("{}/acme/xfer-repo/info/lfs/verify", restarted.base_url))
+        .basic_auth(&alice.username, Some(&alice.token))
+        .header("Accept", "application/vnd.git-lfs+json")
+        .header("Content-Type", "application/vnd.git-lfs+json")
+        .header("X-Rootyard-Operation-Id", pre_up_tok)
+        .json(&json!({ "oid": pre_oid, "size": pre_sz }))
+        .send()
+        .await?;
+    ensure!(stale_verify.status() == StatusCode::CONFLICT);
+
+    let pre_push_uuid = operation_token_to_uuid(pre_push_tok)?;
+    let xfer_bare = restarted.state.storage.repo_path(xfer_repo_id);
+    let stale_op = journal::begin_ref_transaction(
+        &restarted.state.storage.root,
+        xfer_repo_id,
+        alice.user_id,
+        alice.username.clone(),
+        alice.token_id,
+        new_gen,
+        Some(IdempotencyIntent { key_sha256: pre_push_uuid.to_string(), request_sha256: "0".repeat(64) }),
+    )?;
+    let stale_hook_err = tokio::task::block_in_place(|| {
+        run_real_validate_hook(
+            &restarted.state.config.database_url,
+            &restarted.state.config.git,
+            &xfer_bare,
+            &restarted.state.storage.root,
+            None,
+            None,
+            &stale_op,
+            &[RefChange {
+                ref_name: "refs/heads/main".into(),
+                old_oid: "0".repeat(40),
+                new_oid: pre_commit_oid.clone(),
+            }],
+        )
+    })
+    .expect_err("stale pre-transfer push attestation replay must fail closed");
+    let _ = journal::finish(&stale_op);
+    ensure!(stale_hook_err.to_string().contains("attestation_equivocation"), "got {stale_hook_err}");
+
+    let post_access =
+        pg.resolve_authoritative_repo_access(&post_realm, bob.user_id, &bob.username, true, false).await?;
+    let stale_hyd_dir = TempDir::new()?;
+    let post_ctx = LfsTransferContext {
+        gate: &fresh_gate,
+        pg,
+        realm: &post_realm,
+        access: &post_access,
+        scratch_dir: scratch.path(),
+        timeout: Duration::from_secs(20),
+    };
+    let stale_hyd_err = hydrate_clean_compute_view(&post_ctx, &pre_commit_oid, stale_hyd_dir.path())
+        .await
+        .expect_err("pre-transfer tenant blob without shared-hold must not hydrate under new owner");
+    ensure!(stale_hyd_err.code == LfsProofRejectCode::MissingRemoteBlob);
+
+    let post_wt = TempDir::new()?;
+    run_git_ok(post_wt.path(), home, &["init", "--initial-branch=post-xfer"])?;
+    run_git_ok(post_wt.path(), home, &["lfs", "install", "--local"])?;
+    run_git_ok(post_wt.path(), home, &["remote", "add", "origin", &restarted.git_url_for(bob, "acme", "xfer-repo")])?;
+    run_git_ok(post_wt.path(), home, &["lfs", "track", "*.bin"])?;
+    let post_bytes = b"post-ownership-transfer-acme-lfs-payload-v2".to_vec();
+    std::fs::write(post_wt.path().join("post_xfer.bin"), &post_bytes)?;
+    run_git_ok(post_wt.path(), home, &["add", ".gitattributes", "post_xfer.bin"])?;
+    run_git_ok(post_wt.path(), home, &["commit", "-m", "post-transfer org push"])?;
+    run_git_ok(post_wt.path(), home, &["push", "-u", "origin", "post-xfer"])?;
+
+    let post_clone = TempDir::new()?;
+    run_git_ok(
+        post_clone.path(),
+        home,
+        &["clone", "--branch", "post-xfer", &restarted.git_url_for(alice, "acme", "xfer-repo"), "."],
+    )?;
+    ensure!(std::fs::read(post_clone.path().join("post_xfer.bin"))? == post_bytes);
 
     let dave = issue_actor(pool, "dave").await?;
     let (fork_repo_id, fork_owner_id) = restarted.create_repo(&dave, None, "fork-engine", "sha1").await?;

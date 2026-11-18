@@ -18,6 +18,7 @@ use super::types::{LfsBlobError, LfsCollaboratorRole, LfsProofRejectCode};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LfsRepoRealm {
     pub repository_id: Uuid,
+    pub hold_anchor_id: Uuid,
     pub owner_tenant_id: Uuid,
     pub owner_username: String,
     pub repo_name: String,
@@ -30,6 +31,7 @@ pub struct LfsRepoRealm {
 const LFS_BLOB_PROOF_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS lfs_blob_repo_realms (
     repository_id UUID PRIMARY KEY,
+    hold_anchor_id UUID NOT NULL,
     owner_tenant_id UUID NOT NULL,
     owner_username TEXT NOT NULL,
     repo_name TEXT NOT NULL,
@@ -146,31 +148,33 @@ pub async fn init_lfs_blob_proof_tables(pool: &Pool) -> Result<(), LfsBlobError>
 
 impl PgLfsBlobStore {
     fn decode_realm(row: &Row) -> Result<LfsRepoRealm, LfsBlobError> {
-        let fmt_raw: String = row.get(4);
+        let fmt_raw: String = row.get(5);
         let object_format = match fmt_raw.as_str() {
             "sha1" => GitObjectFormat::Sha1,
             "sha256" => GitObjectFormat::Sha256,
             other => return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, format!("bad format {other}"))),
         };
-        let gate_hex: String = row.get(6);
+        let gate_hex: String = row.get(7);
         let bytes = hex::decode(&gate_hex)
             .ok()
             .and_then(|v| <[u8; 32]>::try_from(v).ok())
             .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::InvalidInput, "bad gate_digest_hex"))?;
         Ok(LfsRepoRealm {
             repository_id: row.get(0),
-            owner_tenant_id: row.get(1),
-            owner_username: row.get(2),
-            repo_name: row.get(3),
+            hold_anchor_id: row.get(1),
+            owner_tenant_id: row.get(2),
+            owner_username: row.get(3),
+            repo_name: row.get(4),
             object_format,
-            history_incarnation: row.get(5),
+            history_incarnation: row.get(6),
             gate_digest: RequestDigest::from_bytes(bytes),
-            bare_git_dir: row.get(7),
+            bare_git_dir: row.get(8),
         })
     }
 
-    /// Idempotently binds an authoritative Rootyard `repositories` + `namespaces` row to a `PgRefStoreCore`
-    /// gate so `PgArtifactHoldStore` and `ProtectedUploader` work seamlessly on production repositories.
+    /// Binds an authoritative Rootyard `repositories JOIN namespaces` row to a `PgRefStoreCore`
+    /// hold-anchor gate, and automatically re-syncs the realm whenever ownership transfer or rename
+    /// updates `repositories.owner_id` / `namespaces.slug` / `repositories.name`.
     pub async fn ensure_realm_for_repository(
         &self,
         repository_id: Uuid,
@@ -178,19 +182,6 @@ impl PgLfsBlobStore {
     ) -> Result<LfsRepoRealm, LfsBlobError> {
         init_lfs_blob_proof_tables(self.pool()).await?;
         let mut client = self.pool().get().await.map_err(pg_err)?;
-        if let Some(existing) = client
-            .query_opt(
-                "SELECT repository_id, owner_tenant_id, owner_username, repo_name, object_format,
-                        history_incarnation, gate_digest_hex, bare_git_dir
-                 FROM lfs_blob_repo_realms WHERE repository_id=$1",
-                &[&repository_id],
-            )
-            .await
-            .map_err(pg_err)?
-        {
-            return Self::decode_realm(&existing);
-        }
-
         let repo_row = client
             .query_opt(
                 "SELECT r.owner_id, ns.slug, r.name, r.object_format
@@ -217,36 +208,62 @@ impl PgLfsBlobStore {
             .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::InvalidInput, "non-UTF8 repo path"))?
             .to_owned();
 
+        if let Some(existing) = client
+            .query_opt(
+                "SELECT repository_id, hold_anchor_id, owner_tenant_id, owner_username, repo_name, object_format,
+                        history_incarnation, gate_digest_hex, bare_git_dir
+                 FROM lfs_blob_repo_realms WHERE repository_id=$1",
+                &[&repository_id],
+            )
+            .await
+            .map_err(pg_err)?
+        {
+            let decoded = Self::decode_realm(&existing)?;
+            if decoded.owner_tenant_id == owner_tenant_id
+                && decoded.owner_username == owner_slug
+                && decoded.repo_name == repo_name
+                && decoded.bare_git_dir == bare_git_dir
+            {
+                return Ok(decoded);
+            }
+        }
+
+        let hold_anchor_id = Uuid::new_v4();
+        let anchor_name = format!("s4_hold_{}", hold_anchor_id.simple());
+        client
+            .execute(
+                "INSERT INTO repositories(id, owner_id, name, object_format, state, storage_backend, transition_state, deleted_at)
+                 VALUES($1, $2, $3, $4, 'provisioning', 'gitfs', 'stable', clock_timestamp())",
+                &[&hold_anchor_id, &owner_tenant_id, &anchor_name, &fmt_str],
+            )
+            .await
+            .map_err(pg_err)?;
+
         let history = Uuid::new_v4();
         let main_ref = RefName::branch("refs/heads/main")
             .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
-        let init = CoreGateInit::new(repository_id, owner_tenant_id, object_format, history, 1, 1, main_ref)
+        let init = CoreGateInit::new(hold_anchor_id, owner_tenant_id, object_format, history, 1, 1, main_ref)
             .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
         let pg_dl = TokioInstant::now() + Duration::from_secs(20);
-        let gate_hex = match PgRefStoreCore.initialize(&mut client, &init, pg_dl).await {
-            Ok(g) => g.digest().as_hex(),
-            Err(_) => {
-                let row = client
-                    .query_one(
-                        "SELECT repository_id, owner_tenant_id, owner_username, repo_name, object_format,
-                                history_incarnation, gate_digest_hex, bare_git_dir
-                         FROM lfs_blob_repo_realms WHERE repository_id=$1",
-                        &[&repository_id],
-                    )
-                    .await
-                    .map_err(pg_err)?;
-                return Self::decode_realm(&row);
-            }
-        };
+        let gate_hex = PgRefStoreCore.initialize(&mut client, &init, pg_dl).await.map_err(pg_err)?.digest().as_hex();
         client
             .execute(
                 "INSERT INTO lfs_blob_repo_realms(
-                    repository_id, owner_tenant_id, owner_username, repo_name, object_format,
+                    repository_id, hold_anchor_id, owner_tenant_id, owner_username, repo_name, object_format,
                     history_incarnation, gate_digest_hex, bare_git_dir
-                 ) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-                 ON CONFLICT (repository_id) DO UPDATE SET bare_git_dir = EXCLUDED.bare_git_dir",
+                 ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                 ON CONFLICT (repository_id) DO UPDATE SET
+                    hold_anchor_id = EXCLUDED.hold_anchor_id,
+                    owner_tenant_id = EXCLUDED.owner_tenant_id,
+                    owner_username = EXCLUDED.owner_username,
+                    repo_name = EXCLUDED.repo_name,
+                    object_format = EXCLUDED.object_format,
+                    history_incarnation = EXCLUDED.history_incarnation,
+                    gate_digest_hex = EXCLUDED.gate_digest_hex,
+                    bare_git_dir = EXCLUDED.bare_git_dir",
                 &[
                     &repository_id,
+                    &hold_anchor_id,
                     &owner_tenant_id,
                     &owner_slug,
                     &repo_name,
@@ -260,7 +277,7 @@ impl PgLfsBlobStore {
             .map_err(pg_err)?;
         let saved = client
             .query_one(
-                "SELECT repository_id, owner_tenant_id, owner_username, repo_name, object_format,
+                "SELECT repository_id, hold_anchor_id, owner_tenant_id, owner_username, repo_name, object_format,
                         history_incarnation, gate_digest_hex, bare_git_dir
                  FROM lfs_blob_repo_realms WHERE repository_id=$1",
                 &[&repository_id],

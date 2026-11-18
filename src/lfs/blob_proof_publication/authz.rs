@@ -45,12 +45,11 @@ impl LfsBlobRuntimeGate {
         Self::Configured(Arc::new(store))
     }
 
-    /// Returns `true` when S4 remote-Blob-only LFS mode is enabled on the server process.
+    /// Returns `true` when S4 remote-Blob-only LFS mode is explicitly enabled via `ROOTYARD_LFS_BLOB_ONLY`.
     pub fn blob_mode_requested() -> bool {
         std::env::var("ROOTYARD_LFS_BLOB_ONLY")
             .ok()
             .is_some_and(|v| matches!(v.trim(), "1" | "true" | "required" | "opendal"))
-            || std::env::var_os("ROOTYARD_BLOB_DRIVER").is_some()
     }
 
     /// Opens the remote OpenDAL `BlobStore` from environment variables, converting missing or
@@ -278,10 +277,11 @@ fn uuid_from_sha256_prefix(digest: &[u8]) -> Uuid {
 }
 
 /// Deterministically derives the default upload `operation_id` when an unmodified `git-lfs` client
-/// omits `X-Rootyard-Operation-Id` / `Idempotency-Key`. `repair_epoch` increments strictly when a
-/// previously committed canonical remote `BlobLocator` is verified missing and requires repair.
+/// omits `X-Rootyard-Operation-Id` / `Idempotency-Key`. Includes `tenant_id` so ownership transfers
+/// isolate pre-transfer operations from post-transfer operations.
 pub fn derive_default_upload_operation_id(
     repository_id: Uuid,
+    tenant_id: Uuid,
     actor_id: Uuid,
     oid_sha256: &str,
     size_bytes: i64,
@@ -290,6 +290,7 @@ pub fn derive_default_upload_operation_id(
     let mut h = Sha256::new();
     h.update(DEFAULT_UPLOAD_OP_DOMAIN);
     h.update(repository_id.as_bytes());
+    h.update(tenant_id.as_bytes());
     h.update(actor_id.as_bytes());
     h.update(oid_sha256.as_bytes());
     h.update(size_bytes.to_be_bytes());
@@ -299,10 +300,16 @@ pub fn derive_default_upload_operation_id(
 
 /// Deterministically derives the default ref-publication attestation `operation_id` when an
 /// unmodified `git push` client omits `X-Rootyard-Operation-Id` / `Idempotency-Key`.
-pub fn derive_default_push_operation_id(repository_id: Uuid, actor_id: Uuid, updates: &[LfsRefUpdateSpec]) -> Uuid {
+pub fn derive_default_push_operation_id(
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    actor_id: Uuid,
+    updates: &[LfsRefUpdateSpec],
+) -> Uuid {
     let mut h = Sha256::new();
     h.update(DEFAULT_PUSH_OP_DOMAIN);
     h.update(repository_id.as_bytes());
+    h.update(tenant_id.as_bytes());
     h.update(actor_id.as_bytes());
     h.update(compute_ref_updates_digest(updates).as_bytes());
     uuid_from_sha256_prefix(&h.finalize())

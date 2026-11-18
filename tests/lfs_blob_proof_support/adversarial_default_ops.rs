@@ -1,5 +1,5 @@
 //! Unmodified official `git-lfs` + `git push` (zero custom headers) default-`operation_id`
-//! stability and canonical missing-locator repair E2E checks (`Refs #145`).
+//! stability and canonical missing-locator repair + attestation refresh E2E checks (`Refs #145`).
 
 use std::path::Path;
 
@@ -46,7 +46,8 @@ pub async fn exercise_unmodified_client_default_operation_replay_and_canonical_r
 
     // 1. Headerless Batch `upload` deterministically mints & reuses `default_upload_operation_id(..., epoch=0)`
     //    and injects `X-Rootyard-Operation-Id` into BOTH `actions.upload.header` and `actions.verify.header`.
-    let expected_uop0 = derive_default_upload_operation_id(realm.repository_id, alice.user_id, &oid, sz, 0);
+    let expected_uop0 =
+        derive_default_upload_operation_id(realm.repository_id, realm.owner_tenant_id, alice.user_id, &oid, sz, 0);
     let batch_url = format!("{}/{}/{}.git/info/lfs/objects/batch", srv.base_url, realm.owner_username, realm.repo_name);
     let b1: Value = cli
         .post(&batch_url)
@@ -80,7 +81,7 @@ pub async fn exercise_unmodified_client_default_operation_replay_and_canonical_r
     ensure!(hdr_u1 == expected_uop0.to_string() && hdr_v1 == hdr_u1 && hdr_u2 == hdr_u1);
 
     // 2. Unmodified official `git push origin main` (ZERO `http.extraHeader`!) echoes `expected_uop0`
-    //    across upload + verify AND attests refs under `derive_default_push_operation_id`.
+    //    across upload + verify AND attests refs via real `browse::policy::validate_hook`.
     run_git_ok(wt.path(), home, &["push", "origin", "main"])?;
     let uop0_row =
         pg.load_upload_operation(realm.repository_id, expected_uop0).await?.context("default upload op committed")?;
@@ -88,6 +89,7 @@ pub async fn exercise_unmodified_client_default_operation_replay_and_canonical_r
 
     let expected_pop = derive_default_push_operation_id(
         realm.repository_id,
+        realm.owner_tenant_id,
         alice.user_id,
         &[LfsRefUpdateSpec {
             ref_name: "refs/heads/main".into(),
@@ -112,7 +114,8 @@ pub async fn exercise_unmodified_client_default_operation_replay_and_canonical_r
     );
 
     // 3. Canonical remote object missing -> unmodified official `git lfs push --all origin` (ZERO headers)
-    //    repairs `lfs_blob_objects` (`orig_loc` -> `repaired_loc`), verifies readback before ACK, and commits `epoch=1`!
+    //    repairs `lfs_blob_objects` (`orig_loc` -> `repaired_loc`), commits `epoch=1`, AND re-running
+    //    unmodified `git push origin main` refreshes `lfs_pointer_attestations` to `repaired_rec.locator`!
     let orig_rec = pg
         .load_committed_blob(realm.owner_tenant_id, realm.repository_id, &oid)
         .await?
@@ -128,10 +131,22 @@ pub async fn exercise_unmodified_client_default_operation_replay_and_canonical_r
         .context("repaired committed rec")?;
     let repaired_loc = repaired_rec.locator.to_locator()?;
     ensure!(repaired_loc != orig_loc, "official git-lfs push repair must replace missing canonical BlobLocator");
-    let expected_uop1 = derive_default_upload_operation_id(realm.repository_id, alice.user_id, &oid, sz, 1);
+    let expected_uop1 =
+        derive_default_upload_operation_id(realm.repository_id, realm.owner_tenant_id, alice.user_id, &oid, sz, 1);
     let uop1_row =
         pg.load_upload_operation(realm.repository_id, expected_uop1).await?.context("repair epoch=1 upload op")?;
     ensure!(uop1_row.state == "committed" && uop1_row.locator == Some(repaired_rec.locator));
+
+    run_git_ok(&bare_dir, home, &["update-ref", "refs/heads/main", &prev_head])?;
+    run_git_ok(wt.path(), home, &["push", "origin", "main"])?;
+    let att_after_repair = pg
+        .load_attestation(realm.repository_id, expected_pop)
+        .await?
+        .context("refreshed push attestation after canonical repair")?;
+    ensure!(
+        att_after_repair.pointers.iter().any(|p| p.oid_sha256 == oid && p.locator == repaired_rec.locator),
+        "re-push after canonical missing-locator repair must refresh lfs_pointer_attestations locator"
+    );
 
     let verify_clone = TempDir::new()?;
     run_git_ok(verify_clone.path(), home, &["clone", &alice_url, "."])?;

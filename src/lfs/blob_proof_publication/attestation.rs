@@ -100,17 +100,52 @@ impl PgLfsBlobStore {
         let existing: LfsPointerAttestation = serde_json::from_value(row.get(0))
             .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
         existing.verify_integrity()?;
-        if existing.actor_id != att.actor_id
+        if existing.tenant_id != att.tenant_id
+            || existing.actor_id != att.actor_id
             || existing.ref_updates_digest != att.ref_updates_digest
             || existing.proof_digest != att.proof_digest
         {
             return Err(LfsBlobError::new(
                 LfsProofRejectCode::AttestationEquivocation,
-                "conflicting LFS pointer attestation payload for operation_id",
+                "conflicting LFS pointer attestation payload or stale tenant for operation_id",
             ));
         }
         tx.commit().await.map_err(pg_err)?;
         Ok((existing, true))
+    }
+
+    pub async fn refresh_repaired_attestation(&self, att: &LfsPointerAttestation) -> Result<(), LfsBlobError> {
+        att.verify_integrity()?;
+        let payload_json = serde_json::to_value(att)
+            .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+        let mut client = self.pool().get().await.map_err(pg_err)?;
+        let tx = client.transaction().await.map_err(pg_err)?;
+        tx.batch_execute("SET LOCAL synchronous_commit = 'on'").await.map_err(pg_err)?;
+        let updated = tx
+            .execute(
+                "UPDATE lfs_pointer_attestations
+                 SET proof_digest=$3, payload_json=$4
+                 WHERE repository_id=$1 AND operation_id=$2 AND tenant_id=$5 AND actor_id=$6 AND ref_updates_digest=$7",
+                &[
+                    &att.repository_id,
+                    &att.operation_id,
+                    &att.proof_digest,
+                    &payload_json,
+                    &att.tenant_id,
+                    &att.actor_id,
+                    &att.ref_updates_digest,
+                ],
+            )
+            .await
+            .map_err(pg_err)?;
+        if updated != 1 {
+            return Err(LfsBlobError::new(
+                LfsProofRejectCode::AttestationEquivocation,
+                "failed to refresh repaired LFS pointer attestation under current tenant",
+            ));
+        }
+        tx.commit().await.map_err(pg_err)?;
+        Ok(())
     }
 }
 
@@ -153,22 +188,46 @@ pub async fn attest_and_authorize_push(
     }
 
     let ref_updates_digest = compute_ref_updates_digest(&req.updates);
-    if let Some(existing) = ctx.pg.load_attestation(ctx.realm.repository_id, req.operation_id).await? {
-        if existing.actor_id != ctx.access.actor_id || existing.ref_updates_digest != ref_updates_digest {
+    if let Some(mut existing) = ctx.pg.load_attestation(ctx.realm.repository_id, req.operation_id).await? {
+        if existing.tenant_id != ctx.realm.owner_tenant_id
+            || existing.actor_id != ctx.access.actor_id
+            || existing.ref_updates_digest != ref_updates_digest
+        {
             return Err(LfsBlobError::new(
                 LfsProofRejectCode::AttestationEquivocation,
-                "replay request actor or ref_updates_digest disagrees with stored attestation",
+                "replay request tenant, actor, or ref_updates_digest disagrees with stored attestation",
             ));
         }
         let dl = StdInstant::now() + ctx.timeout;
-        for ptr in &existing.pointers {
-            let (rec, _, _) = resolve_and_verify_remote_blob(ctx, &ptr.oid_sha256, ptr.size_bytes, dl).await?;
+        let mut repaired = false;
+        for ptr in &mut existing.pointers {
+            let (rec, resolution, _) = resolve_and_verify_remote_blob(ctx, &ptr.oid_sha256, ptr.size_bytes, dl).await?;
             if rec.locator != ptr.locator || rec.hold_id != ptr.hold_id {
-                return Err(LfsBlobError::new(
-                    LfsProofRejectCode::AttestationEquivocation,
-                    "replayed attestation locator or hold drifted from live inventory",
-                ));
+                ptr.receipt_digest = compute_pointer_receipt_digest(
+                    &ptr.oid_sha256,
+                    ptr.size_bytes,
+                    &rec.locator,
+                    &rec.backend_identity_hex,
+                    rec.hold_id,
+                );
+                ptr.locator = rec.locator;
+                ptr.backend_identity_hex = rec.backend_identity_hex;
+                ptr.hold_id = rec.hold_id;
+                ptr.resolution = resolution;
+                repaired = true;
             }
+        }
+        if repaired {
+            existing.proof_digest = compute_attestation_digest(
+                existing.operation_id,
+                existing.tenant_id,
+                existing.repository_id,
+                existing.actor_id,
+                &existing.object_format,
+                &existing.ref_updates_digest,
+                &existing.pointers,
+            );
+            ctx.pg.refresh_repaired_attestation(&existing).await?;
         }
         return Ok(AttestationOutcome::Replayed(existing));
     }

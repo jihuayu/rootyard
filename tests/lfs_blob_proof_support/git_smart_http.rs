@@ -1,4 +1,5 @@
-//! Smart-HTTP Git harness wrapping production `rootyard::lfs::routes()` & `publication` (`Refs #145`).
+//! Smart-HTTP Git harness driving production `rootyard::lfs::routes()` and
+//! `rootyard::browse::policy::validate_hook` (`Refs #145`).
 
 use std::path::{Path as FsPath, PathBuf};
 use std::process::Stdio;
@@ -14,11 +15,8 @@ use axum::{
 };
 use rootyard::{
     AppState, auth,
-    journal::RefChange,
-    lfs::blob_proof_publication::{
-        LfsBlobError, PgLfsBlobStore, PushAttestationSession, active_blob_gate, extract_stable_operation_id,
-        with_push_attestation_session,
-    },
+    journal::{self, RefChange},
+    lfs::blob_proof_publication::{LfsBlobError, PgLfsBlobStore, active_blob_gate, extract_stable_operation_id},
     token_scopes::RepoAction,
 };
 use serde::{Deserialize, Serialize};
@@ -27,6 +25,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use uuid::Uuid;
+
+use super::run_real_validate_hook;
 
 pub fn production_s4_test_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -147,7 +147,8 @@ async fn smart_git_fallback(
         .await
         .map_err(rootyard::Error::internal)?
         .query_opt(
-            "SELECT r.id, r.owner_id FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id
+            "SELECT r.id, r.owner_id, r.storage_generation
+             FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id
              WHERE ns.slug = $1 AND r.name = $2 AND r.deleted_at IS NULL",
             &[&owner, &repo_name],
         )
@@ -156,12 +157,16 @@ async fn smart_git_fallback(
         .ok_or_else(rootyard::Error::not_found)?;
     let repo_id: Uuid = row.get(0);
     let owner_id: Uuid = row.get(1);
+    let storage_generation: i64 = row.get(2);
 
     let pg = PgLfsBlobStore::new(state.pool.clone());
     let realm = match pg.ensure_realm_for_repository(repo_id, &state.storage.root).await {
         Ok(r) => r,
         Err(e) => return Ok(json_err(e)),
     };
+    if realm.owner_tenant_id != owner_id {
+        return Err(rootyard::Error(StatusCode::CONFLICT, "repository identity changed"));
+    }
     if let Err(e) = pg.resolve_authoritative_repo_access(&realm, actor.id, &actor.username, write, false).await {
         return Ok(json_err(e));
     }
@@ -207,7 +212,7 @@ async fn smart_git_fallback(
             .into_response());
     }
 
-    let op_id = match extract_stable_operation_id(&clean_headers) {
+    let explicit_op_id = match extract_stable_operation_id(&clean_headers) {
         Ok(opt) => opt,
         Err(e) => return Ok(json_err(e)),
     };
@@ -241,49 +246,41 @@ async fn smart_git_fallback(
                     });
                 }
             }
-            let session = PushAttestationSession {
-                pool: st.pool.clone(),
-                actor_id: act.id,
-                actor_username: act.username.clone(),
-                operation_id: op_id,
-                git_object_dir: wire_in.git_object_dir,
-                git_alternate_object_dirs: wire_in.git_alternate_object_dirs,
+            let idem = explicit_op_id.map(|op_uuid| journal::IdempotencyIntent {
+                key_sha256: op_uuid.to_string(),
+                request_sha256: "0".repeat(64),
+            });
+            let op_res = journal::begin_ref_transaction(
+                &st.storage.root,
+                repo_id,
+                act.id,
+                act.username.clone(),
+                act.token_id,
+                storage_generation,
+                idem,
+            );
+            let reply = match op_res {
+                Ok(op) => {
+                    let res = tokio::task::block_in_place(|| {
+                        run_real_validate_hook(
+                            &st.config.database_url,
+                            &st.config.git,
+                            &bdir,
+                            &st.storage.root,
+                            wire_in.git_object_dir.as_deref(),
+                            wire_in.git_alternate_object_dirs.as_deref(),
+                            &op,
+                            &changes,
+                        )
+                    });
+                    let _ = journal::finish(&op);
+                    match res {
+                        Ok(()) => HookWireOut { ok: true, message: "ok".into() },
+                        Err(e) => HookWireOut { ok: false, message: format!("{e:#}") },
+                    }
+                }
+                Err(e) => HookWireOut { ok: false, message: format!("journal begin failed: {e:#}") },
             };
-            let reply = with_push_attestation_session(session, async {
-                let client = match st.pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => return HookWireOut { ok: false, message: format!("pg pool error: {e}") },
-                };
-                if let Err(e) = rootyard::lfs::publication::validate_new_refs_with_client(
-                    &**client,
-                    &bdir,
-                    &st.storage.root,
-                    &st.config.git,
-                    st.config.git_timeout,
-                    repo_id,
-                    owner_id,
-                    &changes,
-                )
-                .await
-                {
-                    return HookWireOut { ok: false, message: e.to_string() };
-                }
-                if let Err(e) = rootyard::lfs::locks::validate_new_refs_with_client(
-                    &**client,
-                    &bdir,
-                    &st.config.git,
-                    st.config.git_timeout,
-                    repo_id,
-                    act.id,
-                    &changes,
-                )
-                .await
-                {
-                    return HookWireOut { ok: false, message: e.to_string() };
-                }
-                HookWireOut { ok: true, message: "ok".into() }
-            })
-            .await;
             if let Ok(resp_bytes) = serde_json::to_vec(&reply) {
                 let _ = sock.write_all(&resp_bytes).await;
             }

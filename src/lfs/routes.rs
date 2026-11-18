@@ -125,7 +125,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/git/{owner}/{name}/info/lfs/objects/{oid}/{size}",
-            get(handlers::download_object_with_size),
+            get(handlers::download_object_with_size).delete(handlers::delete_object_refused),
         )
         .route(
             "/{owner}/{name}/info/lfs/objects/{oid}",
@@ -135,7 +135,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/{owner}/{name}/info/lfs/objects/{oid}/{size}",
-            get(handlers::download_object_with_size),
+            get(handlers::download_object_with_size).delete(handlers::delete_object_refused),
         )
         .route(
             "/api/repos/{owner}/{name}/lfs/objects/{oid}",
@@ -145,7 +145,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/api/repos/{owner}/{name}/lfs/objects/{oid}/{size}",
-            get(handlers::download_object_with_size),
+            get(handlers::download_object_with_size).delete(handlers::delete_object_refused),
         )
         .route(
             "/api/repos/{owner}/{name}/info/lfs/objects/{oid}",
@@ -155,7 +155,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/api/repos/{owner}/{name}/info/lfs/objects/{oid}/{size}",
-            get(handlers::download_object_with_size),
+            get(handlers::download_object_with_size).delete(handlers::delete_object_refused),
         )
         .merge(upload_routes)
 }

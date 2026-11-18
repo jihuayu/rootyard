@@ -20,6 +20,7 @@ class LfsBlobProofContractTests(unittest.TestCase):
     def _owned_files(self) -> list[Path]:
         return sorted(
             [
+                ROOT / "src" / "browse" / "policy.rs",
                 ROOT / "src" / "lfs.rs",
                 ROOT / "src" / "lfs" / "routes.rs",
                 ROOT / "src" / "lfs" / "handlers.rs",
@@ -39,7 +40,7 @@ class LfsBlobProofContractTests(unittest.TestCase):
 
     def test_line_budgets_pure_lf_zero_mod_rs_and_zero_allow(self) -> None:
         owned = self._owned_files()
-        self.assertGreaterEqual(len(owned), 20)
+        self.assertGreaterEqual(len(owned), 22)
         self.assertFalse((MOD_DIR / "http_router.rs").exists(), "parallel standalone router must not exist")
         self.assertFalse((MOD_DIR / "git_smart_http.rs").exists(), "standalone git_smart_http in src must not exist")
         for path in owned:
@@ -72,6 +73,9 @@ class LfsBlobProofContractTests(unittest.TestCase):
     def test_domain_symbols_and_durability_contracts(self) -> None:
         combined = "\n".join(p.read_text(encoding="utf-8") for p in [FACADE, *sorted(MOD_DIR.glob("*.rs"))])
         self.assertNotIn("actor_id == owner_tenant_id", combined)
+        self.assertNotIn("ROOTYARD_JOURNAL_OPERATION", combined)
+        self.assertNotIn("ROOTYARD_OPERATION_DIR", combined)
+        self.assertNotIn("ROOTYARD_BLOB_DRIVER", (MOD_DIR / "authz.rs").read_text(encoding="utf-8"))
         required = (
             "LfsBlobRuntimeGate",
             "LfsProofRejectCode",
@@ -86,6 +90,7 @@ class LfsBlobProofContractTests(unittest.TestCase):
             "LockedPathConflict",
             "AttestationEquivocation",
             "DeleteDisabledByPolicy",
+            "StatusCode::METHOD_NOT_ALLOWED",
             "LfsPointerAttestation",
             "SharedLfsHoldGrant",
             "SubjectTenantAuthority",
@@ -97,8 +102,13 @@ class LfsBlobProofContractTests(unittest.TestCase):
             "derive_default_push_operation_id",
             "ensure_default_upload_operation",
             "lfs_blob_upload_operations",
+            "prod_validate_and_attest_hook",
             "prod_validate_and_attest_push",
-            "with_push_attestation_session",
+            "refresh_repaired_attestation",
+            "MAX_CONCURRENT_S4_TRANSFERS",
+            "acquire_transfer_permit",
+            "Body::from_stream",
+            "into_data_stream",
             "ProtectedUploader",
             "PgArtifactHoldStore",
             "lfs_blob_objects_immutable_trig",
@@ -110,15 +120,23 @@ class LfsBlobProofContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, combined)
 
+        policy_src = (ROOT / "src" / "browse" / "policy.rs").read_text(encoding="utf-8")
+        self.assertIn("validate_new_refs_for_hook", policy_src)
+
         test_router_src = (TEST_SUPPORT / "git_smart_http.rs").read_text(encoding="utf-8")
         self.assertIn("rootyard::lfs::routes()", test_router_src)
-        self.assertIn("rootyard::lfs::publication::validate_new_refs_with_client", test_router_src)
+        self.assertIn("run_real_validate_hook", test_router_src)
+        self.assertNotIn("with_push_attestation_session", test_router_src)
+
+        loopback_src = (TEST_SUPPORT / "s3_loopback.rs").read_text(encoding="utf-8")
+        self.assertIn("rootyard::browse::policy::validate_hook", loopback_src)
 
     def test_workflow_and_doc_contracts(self) -> None:
         wf = WORKFLOW.read_text(encoding="utf-8")
         self.assertTrue(wf.startswith("name: "))
         self.assertNotIn("\t", wf)
         for token in (
+            "src/browse/policy.rs",
             "postgres:17",
             "scripts/install_git_lfs.sh",
             "3.6.1",
@@ -132,7 +150,7 @@ class LfsBlobProofContractTests(unittest.TestCase):
         ):
             self.assertIn(token, wf)
 
-        harness = (TEST_SUPPORT / "mod.rs").read_text(encoding="utf-8")
+        harness = (TEST_SUPPORT / "s3_loopback.rs").read_text(encoding="utf-8")
         self.assertIn('("RETRY_MAX_TIMES", "3")', harness)
         self.assertIn("header::CONNECTION", harness)
         self.assertIn('"close"', harness)

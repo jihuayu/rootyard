@@ -1,10 +1,15 @@
-//! Remote-Blob locator readback verification, policy-gated retirement, and compute hydration (`Refs #145`).
+//! Streaming locator readback verification, bounded transfer concurrency, policy-gated retirement,
+//! clean compute-view hydration, and tenant-isolated default upload operation tracking (`Refs #145`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant as StdInstant;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant as StdInstant};
 
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::io::AsyncReadExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::blob_store::{BlobReceipt, opendal::BlobStore};
@@ -19,7 +24,26 @@ use super::types::{
     inspect_candidate_lfs_pointer,
 };
 
-pub(super) struct EphemeralScratchGuard(pub PathBuf);
+pub const MAX_CONCURRENT_S4_TRANSFERS: usize = 16;
+
+static S4_TRANSFER_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn transfer_semaphore() -> &'static Arc<Semaphore> {
+    S4_TRANSFER_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_S4_TRANSFERS)))
+}
+
+/// Acquires a bounded S4 streaming I/O concurrency permit; released automatically via RAII on drop
+/// or mid-stream client cancellation.
+pub async fn acquire_transfer_permit(timeout: Duration) -> Result<OwnedSemaphorePermit, LfsBlobError> {
+    tokio::time::timeout(timeout, Arc::clone(transfer_semaphore()).acquire_owned())
+        .await
+        .map_err(|_| {
+            LfsBlobError::new(LfsProofRejectCode::RemoteBlobUnreachable, "S4 LFS transfer concurrency budget exhausted")
+        })?
+        .map_err(|_| LfsBlobError::new(LfsProofRejectCode::RemoteBlobUnreachable, "S4 LFS transfer semaphore closed"))
+}
+
+pub(crate) struct EphemeralScratchGuard(pub PathBuf);
 
 impl Drop for EphemeralScratchGuard {
     fn drop(&mut self) {
@@ -34,24 +58,44 @@ pub struct ComputeViewHydrationReport {
     pub total_hydrated_bytes: u64,
 }
 
-/// Verifies the **final persisted remote `BlobLocator`** via both `BlobStore::verify_receipt`
-/// and full streamed provider byte read-back (`get_to_file` + SHA-256 + byte length).
-/// Guarantees no upload, retry, Batch skip, or push attestation ever ACKs a missing or corrupt locator.
-pub async fn verify_committed_locator_bytes(
+pub(crate) async fn stream_file_sha256_and_len(path: &Path) -> Result<(String, u64), LfsBlobError> {
+    let mut file =
+        fs::File::open(path).await.map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total = total.saturating_add(n as u64);
+    }
+    Ok((hex::encode(hasher.finalize()), total))
+}
+
+async fn verify_locator_and_stage_file(
     store: &BlobStore,
     scratch_dir: &Path,
     rec: &CommittedLfsBlobRecord,
     expected_oid: &str,
     expected_size: i64,
     deadline: StdInstant,
-) -> Result<BlobReceipt, LfsBlobError> {
+) -> Result<(BlobReceipt, PathBuf, EphemeralScratchGuard), LfsBlobError> {
     if rec.retired {
         return Err(LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "LFS object has been retired"));
     }
     if rec.oid_sha256 != expected_oid || rec.size_bytes != expected_size {
         return Err(LfsBlobError::new(
             LfsProofRejectCode::SizeOrDigestMismatch,
-            format!("LFS metadata mismatch: expected ({expected_oid}, {expected_size}), got ({}, {})", rec.oid_sha256, rec.size_bytes),
+            format!(
+                "LFS metadata mismatch: expected ({expected_oid}, {expected_size}), got ({}, {})",
+                rec.oid_sha256, rec.size_bytes
+            ),
         ));
     }
     if rec.backend_identity_hex != store.backend_identity().as_hex() {
@@ -75,34 +119,42 @@ pub async fn verify_committed_locator_bytes(
         .await
         .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
     let verify_tmp = scratch_dir.join(format!(".lfs-readback-{}.tmp", Uuid::new_v4()));
-    let _guard = EphemeralScratchGuard(verify_tmp.clone());
+    let guard = EphemeralScratchGuard(verify_tmp.clone());
     store.get_to_file(&locator, &verify_tmp, deadline).await.map_err(LfsBlobError::from_blob_error)?;
-    let bytes = fs::read(&verify_tmp)
-        .await
-        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
-    if bytes.len() as i64 != expected_size || hex::encode(Sha256::digest(&bytes)) != expected_oid {
+    let (actual_hex, actual_len) = stream_file_sha256_and_len(&verify_tmp).await?;
+    if actual_len as i64 != expected_size || actual_hex != expected_oid {
         return Err(LfsBlobError::new(
             LfsProofRejectCode::SizeOrDigestMismatch,
-            "remote BlobLocator read-back SHA-256 or byte length mismatch",
+            "remote BlobLocator streamed read-back SHA-256 or byte length mismatch",
         ));
     }
+    Ok((receipt, verify_tmp, guard))
+}
+
+/// Verifies the **final persisted remote `BlobLocator`** via both `BlobStore::verify_receipt`
+/// and chunk-streamed provider byte read-back (`get_to_file` + streamed SHA-256 + byte length).
+pub async fn verify_committed_locator_bytes(
+    store: &BlobStore,
+    scratch_dir: &Path,
+    rec: &CommittedLfsBlobRecord,
+    expected_oid: &str,
+    expected_size: i64,
+    deadline: StdInstant,
+) -> Result<BlobReceipt, LfsBlobError> {
+    let (receipt, _path, _guard) =
+        verify_locator_and_stage_file(store, scratch_dir, rec, expected_oid, expected_size, deadline).await?;
     Ok(receipt)
 }
 
-/// Resolves an LFS object record and proves live byte integrity on its final `BlobLocator`
-/// (either owned by `realm` or authorized via an active cross-owner `SharedLfsHoldGrant`).
-pub async fn resolve_and_verify_remote_blob(
+async fn resolve_authorized_blob_record(
     ctx: &LfsTransferContext<'_>,
     oid_sha256: &str,
     expected_size: i64,
-    deadline: StdInstant,
-) -> Result<(CommittedLfsBlobRecord, PointerResolutionSource, BlobReceipt), LfsBlobError> {
-    let store = ctx.gate.require_store()?;
+) -> Result<(CommittedLfsBlobRecord, PointerResolutionSource), LfsBlobError> {
     if !valid_lfs_oid(oid_sha256) || expected_size < 0 {
         return Err(LfsBlobError::new(LfsProofRejectCode::InvalidInput, "invalid LFS OID or negative size"));
     }
-    let (rec, source) = if let Some(own) =
-        ctx.pg.load_committed_blob(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256).await?
+    if let Some(own) = ctx.pg.load_committed_blob(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256).await?
     {
         if own.retired {
             return Err(LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "LFS object has been retired"));
@@ -113,68 +165,114 @@ pub async fn resolve_and_verify_remote_blob(
                 format!("LFS size mismatch: pointer expects {expected_size}, committed is {}", own.size_bytes),
             ));
         }
-        (own, PointerResolutionSource::RepositoryBlob)
-    } else {
-        let candidates =
-            ctx.pg.find_shared_holds_for_target(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256).await?;
-        if candidates.is_empty() {
-            return Err(LfsBlobError::new(
-                LfsProofRejectCode::MissingRemoteBlob,
-                format!("LFS object {oid_sha256} is absent from remote repository inventory"),
+        return Ok((own, PointerResolutionSource::RepositoryBlob));
+    }
+    let candidates =
+        ctx.pg.find_shared_holds_for_target(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256).await?;
+    if candidates.is_empty() {
+        return Err(LfsBlobError::new(
+            LfsProofRejectCode::MissingRemoteBlob,
+            format!("LFS object {oid_sha256} is absent from current tenant inventory"),
+        ));
+    }
+    let mut last_err = None;
+    for grant in candidates {
+        let Some(src_rec) =
+            ctx.pg.load_committed_blob(grant.source_tenant_id, grant.source_repository_id, oid_sha256).await?
+        else {
+            last_err = Some(LfsBlobError::new(
+                LfsProofRejectCode::UnauthorizedSharedHold,
+                "shared hold source object missing",
             ));
-        }
-        let mut matched = None;
-        let mut last_err = None;
-        for grant in candidates {
-            let Some(src_rec) =
-                ctx.pg.load_committed_blob(grant.source_tenant_id, grant.source_repository_id, oid_sha256).await?
-            else {
-                last_err = Some(LfsBlobError::new(
-                    LfsProofRejectCode::UnauthorizedSharedHold,
-                    "shared hold source object missing",
+            continue;
+        };
+        match verify_shared_hold_grant(
+            &grant,
+            &src_rec,
+            ctx.realm.owner_tenant_id,
+            ctx.realm.repository_id,
+            ctx.access.actor_id,
+            oid_sha256,
+            expected_size,
+        ) {
+            Ok(()) => {
+                return Ok((
+                    src_rec,
+                    PointerResolutionSource::SharedHold {
+                        grant_id: grant.grant_id,
+                        source_tenant_id: grant.source_tenant_id,
+                        source_repository_id: grant.source_repository_id,
+                    },
                 ));
-                continue;
-            };
-            match verify_shared_hold_grant(
-                &grant,
-                &src_rec,
-                ctx.realm.owner_tenant_id,
-                ctx.realm.repository_id,
-                ctx.access.actor_id,
-                oid_sha256,
-                expected_size,
-            ) {
-                Ok(()) => {
-                    matched = Some((
-                        src_rec,
-                        PointerResolutionSource::SharedHold {
-                            grant_id: grant.grant_id,
-                            source_tenant_id: grant.source_tenant_id,
-                            source_repository_id: grant.source_repository_id,
-                        },
-                    ));
-                    break;
-                }
-                Err(e) => last_err = Some(e),
             }
+            Err(e) => last_err = Some(e),
         }
-        match matched {
-            Some(pair) => pair,
-            None => {
-                return Err(last_err.unwrap_or_else(|| {
-                    LfsBlobError::new(LfsProofRejectCode::UnauthorizedSharedHold, "no valid shared hold grant")
-                }));
-            }
-        }
-    };
+    }
+    Err(last_err.unwrap_or_else(|| {
+        LfsBlobError::new(LfsProofRejectCode::UnauthorizedSharedHold, "no valid shared hold grant")
+    }))
+}
 
+/// Resolves an LFS object record under the current relational `owner_tenant_id` (or active
+/// cross-owner `SharedLfsHoldGrant`) and proves live byte integrity on its final `BlobLocator`.
+pub async fn resolve_and_verify_remote_blob(
+    ctx: &LfsTransferContext<'_>,
+    oid_sha256: &str,
+    expected_size: i64,
+    deadline: StdInstant,
+) -> Result<(CommittedLfsBlobRecord, PointerResolutionSource, BlobReceipt), LfsBlobError> {
+    let store = ctx.gate.require_store()?;
+    let (rec, source) = resolve_authorized_blob_record(ctx, oid_sha256, expected_size).await?;
     let receipt =
         verify_committed_locator_bytes(store, ctx.scratch_dir, &rec, oid_sha256, expected_size, deadline).await?;
     Ok((rec, source, receipt))
 }
 
-/// Refuses physical remote blob deletion via `BlobStore::delete` (`DeleteDisabledByPolicy`) while
-/// allowing explicit admin logical retirement (`retired = true`) when `allow_logical_retire` is set.
+pub(crate) async fn open_verified_remote_download_file(
+    ctx: &LfsTransferContext<'_>,
+    oid_sha256: &str,
+    expected_size_param: Option<i64>,
+) -> Result<(fs::File, EphemeralScratchGuard, u64), LfsBlobError> {
+    let store = ctx.gate.require_store()?;
+    let dl = StdInstant::now() + ctx.timeout;
+    let size_hint =
+        if let Some(own) = ctx.pg.load_committed_blob(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256).await?
+        {
+            own.size_bytes
+        } else {
+            ctx.pg
+                .find_shared_holds_for_target(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256)
+                .await?
+                .first()
+                .map(|g| g.size_bytes)
+                .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "LFS object not found"))?
+        };
+    if let Some(req_sz) = expected_size_param
+        && req_sz != size_hint
+    {
+        return Err(LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "LFS object size mismatch"));
+    }
+    let (rec, _) = resolve_authorized_blob_record(ctx, oid_sha256, size_hint).await?;
+    let (_, tmp_path, guard) =
+        verify_locator_and_stage_file(store, ctx.scratch_dir, &rec, oid_sha256, size_hint, dl).await?;
+    let file = fs::File::open(&tmp_path)
+        .await
+        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    Ok((file, guard, size_hint as u64))
+}
+
+pub async fn download_lfs_object_from_remote(
+    ctx: &LfsTransferContext<'_>,
+    oid_sha256: &str,
+    expected_size_param: Option<i64>,
+) -> Result<Vec<u8>, LfsBlobError> {
+    let _permit = acquire_transfer_permit(ctx.timeout).await?;
+    let (mut file, _guard, _) = open_verified_remote_download_file(ctx, oid_sha256, expected_size_param).await?;
+    let mut out = Vec::new();
+    file.read_to_end(&mut out).await.map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    Ok(out)
+}
+
 pub async fn delete_or_retire_lfs_object(
     ctx: &LfsTransferContext<'_>,
     oid_sha256: &str,
@@ -204,14 +302,13 @@ pub async fn delete_or_retire_lfs_object(
     Ok(())
 }
 
-/// Materializes an isolated clean compute view at `commit_oid`, hydrating every LFS pointer directly
-/// from the remote OpenDAL `BlobStore` without any node-local LFS cache.
 pub async fn hydrate_clean_compute_view(
     ctx: &LfsTransferContext<'_>,
     commit_oid: &str,
     view_dir: &Path,
 ) -> Result<ComputeViewHydrationReport, LfsBlobError> {
     let store = ctx.gate.require_store()?;
+    let _permit = acquire_transfer_permit(ctx.timeout).await?;
     fs::create_dir_all(view_dir)
         .await
         .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
@@ -252,9 +349,12 @@ pub async fn hydrate_clean_compute_view(
             }
             PointerInspection::Valid(spec) => {
                 let dl = StdInstant::now() + ctx.timeout;
-                let (rec, _, _) = resolve_and_verify_remote_blob(ctx, &spec.oid, spec.size, dl).await?;
-                let loc = rec.locator.to_locator()?;
-                store.get_to_file(&loc, &dest, dl).await.map_err(LfsBlobError::from_blob_error)?;
+                let (rec, _) = resolve_authorized_blob_record(ctx, &spec.oid, spec.size).await?;
+                let (_, staged_path, _guard) =
+                    verify_locator_and_stage_file(store, view_dir, &rec, &spec.oid, spec.size, dl).await?;
+                fs::rename(&staged_path, &dest)
+                    .await
+                    .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
                 hydrated_files += 1;
                 total_hydrated_bytes += spec.size as u64;
             }
@@ -264,8 +364,8 @@ pub async fn hydrate_clean_compute_view(
 }
 
 impl PgLfsBlobStore {
-    /// Resolves or creates a durable default upload `operation_id` in `lfs_blob_upload_operations`
-    /// for unmodified `git-lfs` clients that send no custom idempotency header.
+    /// Resolves or creates a tenant-isolated default upload `operation_id` in `lfs_blob_upload_operations`
+    /// for unmodified `git-lfs` clients, ignoring custom `X-Rootyard-Operation-Id` rows and stale tenants.
     pub async fn ensure_default_upload_operation(
         &self,
         repository_id: Uuid,
@@ -282,27 +382,37 @@ impl PgLfsBlobStore {
             .map_err(pg_err)?
             .query(
                 "SELECT operation_id, state FROM lfs_blob_upload_operations
-                 WHERE repository_id=$1 AND actor_id=$2 AND oid_sha256=$3 AND size_bytes=$4
-                 ORDER BY created_at ASC",
-                &[&repository_id, &actor_id, &oid_sha256, &size_bytes],
+                 WHERE repository_id=$1 AND tenant_id=$2 AND actor_id=$3 AND oid_sha256=$4 AND size_bytes=$5",
+                &[&repository_id, &tenant_id, &actor_id, &oid_sha256, &size_bytes],
             )
             .await
             .map_err(pg_err)?;
-        for r in &rows {
-            let st: &str = r.get(1);
-            if st == "pending" || st == "aborted_failed" {
-                return Ok(r.get(0));
+        let by_id: HashMap<Uuid, String> = rows.into_iter().map(|r| (r.get(0), r.get(1))).collect();
+        let max_ep = by_id.len() as u64;
+        for ep in 0..=max_ep {
+            let cand =
+                derive_default_upload_operation_id(repository_id, tenant_id, actor_id, oid_sha256, size_bytes, ep);
+            match by_id.get(&cand).map(String::as_str) {
+                Some("pending" | "aborted_failed") => return Ok(cand),
+                Some("committed") => continue,
+                _ => {
+                    if !force_new_repair_epoch && ep > 0 {
+                        return Ok(derive_default_upload_operation_id(
+                            repository_id,
+                            tenant_id,
+                            actor_id,
+                            oid_sha256,
+                            size_bytes,
+                            ep - 1,
+                        ));
+                    }
+                    let _ = self
+                        .begin_or_load_upload_operation(repository_id, cand, tenant_id, actor_id, oid_sha256, size_bytes)
+                        .await?;
+                    return Ok(cand);
+                }
             }
         }
-        if !force_new_repair_epoch
-            && let Some(last_committed) = rows.iter().rev().find(|r| r.get::<_, &str>(1) == "committed")
-        {
-            return Ok(last_committed.get(0));
-        }
-        let op_id = derive_default_upload_operation_id(repository_id, actor_id, oid_sha256, size_bytes, rows.len() as u64);
-        let _ = self
-            .begin_or_load_upload_operation(repository_id, op_id, tenant_id, actor_id, oid_sha256, size_bytes)
-            .await?;
-        Ok(op_id)
+        Err(LfsBlobError::new(LfsProofRejectCode::PgDatabase, "default upload epoch search exhausted"))
     }
 }

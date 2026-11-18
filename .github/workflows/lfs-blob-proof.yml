@@ -5,6 +5,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/lfs-blob-proof.yml'
+      - 'src/browse/policy.rs'
       - 'src/lfs.rs'
       - 'src/lfs/**'
       - 'tests/lfs_blob_proof_publication.rs'

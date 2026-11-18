@@ -281,16 +281,23 @@ fn stable_operation_id_headers_and_attestation_digest_are_deterministic() {
     assert!(!valid_lfs_lock_path("/abs/model.bin"));
     assert!(!valid_lfs_lock_path("assets/../escape.bin"));
 
-    let def_u0 = derive_default_upload_operation_id(repo, actor, &"a7".repeat(32), 2048, 0);
-    assert_eq!(def_u0, derive_default_upload_operation_id(repo, actor, &"a7".repeat(32), 2048, 0));
-    assert_ne!(def_u0, derive_default_upload_operation_id(repo, actor, &"a7".repeat(32), 2048, 1));
+    assert_eq!(LfsProofRejectCode::DeleteDisabledByPolicy.http_status().as_u16(), 405);
+
+    let def_u0 = derive_default_upload_operation_id(repo, tenant, actor, &"a7".repeat(32), 2048, 0);
+    assert_eq!(def_u0, derive_default_upload_operation_id(repo, tenant, actor, &"a7".repeat(32), 2048, 0));
+    assert_ne!(def_u0, derive_default_upload_operation_id(repo, tenant, actor, &"a7".repeat(32), 2048, 1));
+    assert_ne!(def_u0, derive_default_upload_operation_id(repo, Uuid::new_v4(), actor, &"a7".repeat(32), 2048, 0));
     let ref_upd = LfsRefUpdateSpec {
         ref_name: "refs/heads/main".into(),
         old_oid: "0".repeat(40),
         new_oid: "3".repeat(40),
     };
     assert_eq!(
-        derive_default_push_operation_id(repo, actor, std::slice::from_ref(&ref_upd)),
-        derive_default_push_operation_id(repo, actor, std::slice::from_ref(&ref_upd))
+        derive_default_push_operation_id(repo, tenant, actor, std::slice::from_ref(&ref_upd)),
+        derive_default_push_operation_id(repo, tenant, actor, std::slice::from_ref(&ref_upd))
+    );
+    assert_ne!(
+        derive_default_push_operation_id(repo, tenant, actor, std::slice::from_ref(&ref_upd)),
+        derive_default_push_operation_id(repo, Uuid::new_v4(), actor, std::slice::from_ref(&ref_upd))
     );
 }

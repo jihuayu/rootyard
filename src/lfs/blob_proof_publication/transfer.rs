@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant as StdInstant};
 
 use sha2::{Digest, Sha256};
@@ -21,10 +21,11 @@ use crate::lfs::models::{
 };
 
 use super::authz::{AuthorizedRepoAccess, LfsBlobRuntimeGate, operation_token_to_uuid};
-use super::hydration_view::EphemeralScratchGuard;
+pub(crate) use super::hydration_view::{EphemeralScratchGuard, open_verified_remote_download_file};
 pub use super::hydration_view::{
-    ComputeViewHydrationReport, delete_or_retire_lfs_object, hydrate_clean_compute_view,
-    resolve_and_verify_remote_blob, verify_committed_locator_bytes,
+    ComputeViewHydrationReport, MAX_CONCURRENT_S4_TRANSFERS, acquire_transfer_permit, delete_or_retire_lfs_object,
+    download_lfs_object_from_remote, hydrate_clean_compute_view, resolve_and_verify_remote_blob,
+    verify_committed_locator_bytes,
 };
 use super::pg_store::{LfsRepoRealm, PgLfsBlobStore};
 use super::types::{CommittedLfsBlobRecord, LfsBlobError, LfsProofRejectCode, StoredBlobLocatorRef};
@@ -39,9 +40,12 @@ pub struct LfsTransferContext<'a> {
     pub timeout: Duration,
 }
 
-/// Executes Git LFS Batch (`upload` / `download`) purely against OpenDAL `BlobStore` + PostgreSQL.
-/// Emits skip-upload ACK (`actions: None`) ONLY after `verify_committed_locator_bytes` proves live
-/// SHA-256 readback on the final persisted `BlobLocator`.
+pub struct PreStreamedScratch {
+    pub path: PathBuf,
+    pub size_bytes: i64,
+    pub sha256_hex: String,
+}
+
 pub async fn process_batch_request(
     ctx: &LfsTransferContext<'_>,
     base_url: &str,
@@ -135,9 +139,7 @@ pub async fn process_batch_request(
                             });
                             continue;
                         }
-                        Err(e) if e.code == LfsProofRejectCode::MissingRemoteBlob => {
-                            stale_missing = true;
-                        }
+                        Err(e) if e.code == LfsProofRejectCode::MissingRemoteBlob => stale_missing = true,
                         Err(other) => return Err(other),
                     }
                 }
@@ -227,16 +229,14 @@ pub async fn process_batch_request(
     Ok(BatchResponse { transfer: "basic", objects: results, hash_algo: LFS_HASH_ALGO })
 }
 
-/// Streams an LFS object upload via an ephemeral `0600` scratch file (unlinked on drop), binds any
-/// caller-supplied `operation_id` (`X-Rootyard-Operation-Id` / `Idempotency-Key`), publishes via
-/// `ProtectedUploader`, commits/repairs `lfs_blob_objects`, AND verifies the **final persisted
-/// `committed.locator`** on OpenDAL `BlobStore` before issuing an ACK.
-pub async fn upload_lfs_object_to_remote(
+/// Publishes a pre-streamed `0600` scratch file via `ProtectedUploader`, commits/repairs
+/// `lfs_blob_objects`, and verifies the **final persisted `committed.locator`** before ACK.
+pub async fn upload_streamed_lfs_object_to_remote(
     ctx: &LfsTransferContext<'_>,
     operation_id: Option<Uuid>,
     oid_sha256: &str,
     expected_size: i64,
-    payload: &[u8],
+    streamed: &PreStreamedScratch,
 ) -> Result<CommittedLfsBlobRecord, LfsBlobError> {
     let store = ctx.gate.require_store()?;
     if !ctx.access.role.allows_write() {
@@ -257,14 +257,14 @@ pub async fn upload_lfs_object_to_remote(
         )
         .await?;
 
-    if payload.len() as i64 != expected_size {
+    if streamed.size_bytes != expected_size {
         let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, "upload byte length mismatch").await;
         return Err(LfsBlobError::new(
             LfsProofRejectCode::SizeOrDigestMismatch,
-            format!("upload size mismatch: expected {expected_size}, got {}", payload.len()),
+            format!("upload size mismatch: expected {expected_size}, got {}", streamed.size_bytes),
         ));
     }
-    if hex::encode(Sha256::digest(payload)) != oid_sha256 {
+    if streamed.sha256_hex != oid_sha256 {
         let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, "upload SHA-256 mismatch").await;
         return Err(LfsBlobError::new(LfsProofRejectCode::SizeOrDigestMismatch, "upload SHA-256 digest mismatch"));
     }
@@ -302,7 +302,7 @@ pub async fn upload_lfs_object_to_remote(
 
     let resolved_op_id = match operation_id {
         Some(op_id) => {
-            let _ = ctx
+            if let Err(e) = ctx
                 .pg
                 .begin_or_load_upload_operation(
                     ctx.realm.repository_id,
@@ -312,7 +312,11 @@ pub async fn upload_lfs_object_to_remote(
                     oid_sha256,
                     expected_size,
                 )
-                .await?;
+                .await
+            {
+                let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
+                return Err(e);
+            }
             op_id
         }
         None => {
@@ -343,25 +347,6 @@ pub async fn upload_lfs_object_to_remote(
         return Ok(committed);
     }
 
-    fs::create_dir_all(ctx.scratch_dir)
-        .await
-        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
-    let scratch_path = ctx.scratch_dir.join(format!(".lfs-upload-{attempt_id}.tmp"));
-    let _guard = EphemeralScratchGuard(scratch_path.clone());
-    {
-        let std_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&scratch_path)
-            .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
-        let mut f = fs::File::from_std(std_file);
-        f.write_all(payload)
-            .await
-            .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
-        f.sync_all().await.map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
-    }
-
     let pg_dl = TokioInstant::now() + ctx.timeout;
     let grant = match ctx.pg.acquire_lfs_upload_hold(store, ctx.realm, oid_sha256, expected_size as u64, pg_dl).await {
         Ok(g) => g,
@@ -372,7 +357,7 @@ pub async fn upload_lfs_object_to_remote(
     };
     let uploader = ProtectedUploader::new(store.clone());
     let pub_res = uploader
-        .consume_and_upload(ctx.pg.pool(), grant, &[UploadSource::new(&scratch_path)], std_dl)
+        .consume_and_upload(ctx.pg.pool(), grant, &[UploadSource::new(&streamed.path)], std_dl)
         .await
         .map_err(|err| match err {
             ProtectedUploadError::ForeignBackend => {
@@ -409,7 +394,6 @@ pub async fn upload_lfs_object_to_remote(
         .pg
         .record_committed_blob(attempt_id, Some(resolved_op_id), &candidate, stale_missing_locator.as_ref())
         .await?;
-    // Mandatory post-commit verification on the FINAL ACTUAL persisted `committed.locator` before ACK!
     verify_committed_locator_bytes(
         store,
         ctx.scratch_dir,
@@ -420,6 +404,36 @@ pub async fn upload_lfs_object_to_remote(
     )
     .await?;
     Ok(committed)
+}
+
+pub async fn upload_lfs_object_to_remote(
+    ctx: &LfsTransferContext<'_>,
+    operation_id: Option<Uuid>,
+    oid_sha256: &str,
+    expected_size: i64,
+    payload: &[u8],
+) -> Result<CommittedLfsBlobRecord, LfsBlobError> {
+    let _permit = acquire_transfer_permit(ctx.timeout).await?;
+    fs::create_dir_all(ctx.scratch_dir)
+        .await
+        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    let scratch_path = ctx.scratch_dir.join(format!(".lfs-mem-upload-{}.tmp", Uuid::new_v4()));
+    let _guard = EphemeralScratchGuard(scratch_path.clone());
+    let std_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&scratch_path)
+        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    let mut f = fs::File::from_std(std_file);
+    f.write_all(payload).await.map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    f.sync_all().await.map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    let streamed = PreStreamedScratch {
+        path: scratch_path,
+        size_bytes: payload.len() as i64,
+        sha256_hex: hex::encode(Sha256::digest(payload)),
+    };
+    upload_streamed_lfs_object_to_remote(ctx, operation_id, oid_sha256, expected_size, &streamed).await
 }
 
 pub async fn verify_lfs_object_remote(
@@ -434,39 +448,4 @@ pub async fn verify_lfs_object_remote(
     let dl = StdInstant::now() + ctx.timeout;
     let (_, _, rcpt) = resolve_and_verify_remote_blob(ctx, oid_sha256, expected_size, dl).await?;
     Ok(rcpt)
-}
-
-pub async fn download_lfs_object_from_remote(
-    ctx: &LfsTransferContext<'_>,
-    oid_sha256: &str,
-    expected_size_param: Option<i64>,
-) -> Result<Vec<u8>, LfsBlobError> {
-    let store = ctx.gate.require_store()?;
-    let dl = StdInstant::now() + ctx.timeout;
-    let size_hint =
-        if let Some(own) = ctx.pg.load_committed_blob(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256).await?
-        {
-            own.size_bytes
-        } else {
-            ctx.pg
-                .find_shared_holds_for_target(ctx.realm.owner_tenant_id, ctx.realm.repository_id, oid_sha256)
-                .await?
-                .first()
-                .map(|g| g.size_bytes)
-                .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "LFS object not found"))?
-        };
-    if let Some(req_sz) = expected_size_param
-        && req_sz != size_hint
-    {
-        return Err(LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "LFS object size mismatch"));
-    }
-    let (rec, _, _) = resolve_and_verify_remote_blob(ctx, oid_sha256, size_hint, dl).await?;
-    fs::create_dir_all(ctx.scratch_dir)
-        .await
-        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
-    let tmp = ctx.scratch_dir.join(format!(".lfs-dl-{}.tmp", Uuid::new_v4()));
-    let _guard = EphemeralScratchGuard(tmp.clone());
-    let loc = rec.locator.to_locator()?;
-    store.get_to_file(&loc, &tmp, dl).await.map_err(LfsBlobError::from_blob_error)?;
-    fs::read(&tmp).await.map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))
 }
