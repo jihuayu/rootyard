@@ -247,17 +247,25 @@ impl Drop for PushTask {
     }
 }
 
+/// What one poll cycle of an owned push task proved.
+enum JoinFailure {
+    /// The task produced a result that is not a normal `Git::run` `Output`.
+    /// The handle's result is consumed and must be removed.
+    SettledUnproven,
+    /// The timeout fired before the handle produced a result. The handle is
+    /// still owned and has not been consumed.
+    NotSettled,
+}
+
 impl PushTask {
-    /// Wait for the task's real `Git::run` future to finish and return its
-    /// `Output`. Only `Ok(Ok(Output))` proves `Command::output` completed and
-    /// the child was waited/reaped. A timeout leaves the owned handle in its
-    /// caller's slot; it never aborts or discards it here.
-    async fn join_proven(&mut self, bound: Duration) -> Result<git::Output> {
+    /// Consume at most one `JoinHandle` result. Only `Ok(Ok(Output))` proves
+    /// `Command::output` completed and the child was waited/reaped. A timeout
+    /// leaves the handle unconsumed for the caller's slot.
+    async fn join_once(&mut self, bound: Duration) -> Result<git::Output, JoinFailure> {
         match tokio::time::timeout(bound, &mut self.0).await {
             Ok(Ok(Ok(output))) => Ok(output),
-            Ok(Ok(Err(_))) => Err(anyhow!("stock push task ended without a Git output proof")),
-            Ok(Err(_)) => Err(anyhow!("stock push task did not join normally")),
-            Err(_) => Err(anyhow!("stock push task join exceeded its bound")),
+            Ok(Ok(Err(_))) | Ok(Err(_)) => Err(JoinFailure::SettledUnproven),
+            Err(_) => Err(JoinFailure::NotSettled),
         }
     }
 
@@ -267,10 +275,6 @@ impl PushTask {
     async fn stop_unproven(&mut self, bound: Duration) -> bool {
         self.0.abort();
         tokio::time::timeout(bound, &mut self.0).await.is_ok()
-    }
-
-    fn is_finished(&self) -> bool {
-        self.0.is_finished()
     }
 }
 
@@ -739,20 +743,29 @@ async fn admitted_refusal_case(db: &Db, phase: &mut &'static str) -> Result<()> 
         // first A3 hold/protected upload.
         *phase = "post_admission_barrier";
         loser_push = Some(spawn_push(git, second_dir, direct_url.clone(), loser_operation));
-        {
+        let early_exit = {
             let loser_task =
                 loser_push.as_mut().ok_or_else(|| anyhow!("the losing stock push task was not retained"))?;
             tokio::select! {
                 reached = tokio::time::timeout(PUSH_BOUND, pause.wait_reached()) => {
                     reached.map_err(|_| anyhow!("the losing stock push did not reach its post-admission rendezvous"))?;
+                    None
                 }
-                exited = loser_task => {
-                    let output = exited.context("the losing stock push task failed")??;
+                exited = loser_task => Some(exited),
+            }
+        };
+        if let Some(ready) = early_exit {
+            // The select arm already consumed the JoinHandle result. Record
+            // that exact result and remove the handle before the early
+            // return so cleanup can never poll it a second time.
+            match consume_ready_push(&mut loser_push, ready, &mut join_unproven) {
+                Ok(output) => {
                     return Err(anyhow!(
                         "the losing stock push exited before its post-admission rendezvous: {}",
                         redacted(&output)
                     ));
                 }
+                Err(error) => return Err(error),
             }
         }
 
@@ -1128,12 +1141,31 @@ async fn wait_push(task: PushTask, label: &str) -> Result<git::Output> {
     Ok(joined.with_context(|| format!("the {label} stock push task failed"))??)
 }
 
+/// Record a `JoinHandle` result that a `select!` arm already consumed. The
+/// handle is always removed, so no later cleanup can poll it again. Only a
+/// normal `Git::run` `Output` is proved; any runner error or `JoinError` is
+/// recorded as cleanup-unproven and the fixed error is returned.
+fn consume_ready_push(
+    slot: &mut Option<PushTask>,
+    ready: Result<Result<git::Output>, tokio::task::JoinError>,
+    join_unproven: &mut bool,
+) -> Result<git::Output> {
+    drop(slot.take());
+    match ready {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Ok(Err(_))) | Ok(Err(_)) => {
+            *join_unproven = true;
+            Err(anyhow!("stock push task ended without a Git output proof"))
+        }
+    }
+}
+
 /// Wait for one real push output without discarding its owned handle on a
 /// timeout. The caller keeps the slot so cleanup can either prove a normal join
 /// or perform bounded containment and retain an unresolved handle.
 async fn take_push_output(slot: &mut Option<PushTask>, label: &str, join_unproven: &mut bool) -> Result<git::Output> {
     let joined = match slot.as_mut() {
-        Some(task) => task.join_proven(PUSH_BOUND).await,
+        Some(task) => task.join_once(PUSH_BOUND).await,
         None => return Err(anyhow!("the {label} stock push task was not retained")),
     };
     match joined {
@@ -1141,44 +1173,46 @@ async fn take_push_output(slot: &mut Option<PushTask>, label: &str, join_unprove
             drop(slot.take());
             Ok(output)
         }
-        Err(error) => {
+        Err(JoinFailure::SettledUnproven) => {
+            drop(slot.take());
             *join_unproven = true;
-            Err(error)
+            Err(anyhow!("stock push task ended without a Git output proof"))
+        }
+        Err(JoinFailure::NotSettled) => {
+            *join_unproven = true;
+            Err(anyhow!("stock push task join exceeded its bound"))
         }
     }
 }
 
 /// Prove a normal join when no earlier ordinary wait timed out. Once any
 /// ordinary wait is unproven, only containment is attempted and the result is
-/// never promoted to a clean cleanup.
+/// never promoted to a clean cleanup. Any consumed result is removed here, so
+/// a slot that survives this call still owns an unconsumed handle.
 async fn confirm_or_stop(slot: &mut Option<PushTask>, join_unproven: bool, bound: Duration) -> bool {
     if slot.is_none() {
         return true;
     }
     if !join_unproven {
         let joined = match slot.as_mut() {
-            Some(task) => task.join_proven(bound).await,
+            Some(task) => task.join_once(bound).await,
             None => return true,
         };
-        if joined.is_ok() {
-            drop(slot.take());
-            return true;
+        match joined {
+            Ok(_) => {
+                drop(slot.take());
+                return true;
+            }
+            Err(JoinFailure::SettledUnproven) => {
+                drop(slot.take());
+                return false;
+            }
+            Err(JoinFailure::NotSettled) => {}
         }
     }
-    // A JoinHandle whose Ready was already consumed must not be polled again.
-    // Such a settled task is containment-complete but still not child-reap
-    // proof, so the caller's cleanup-unproven state is preserved.
-    let finished = match slot.as_ref() {
-        Some(task) => task.is_finished(),
+    let settled = match slot.as_mut() {
+        Some(task) => task.stop_unproven(CLEANUP_STOP_BOUND).await,
         None => true,
-    };
-    let settled = if finished {
-        true
-    } else {
-        match slot.as_mut() {
-            Some(task) => task.stop_unproven(CLEANUP_STOP_BOUND).await,
-            None => true,
-        }
     };
     if settled {
         drop(slot.take());
@@ -1427,6 +1461,40 @@ fn has_stock_http_error(text: &str, status: &str) -> bool {
         line.strip_prefix("error: ").unwrap_or(line).starts_with(rpc_error.as_str())
             || line.ends_with(url_error.as_str())
     })
+}
+
+fn synthetic_push_output() -> git::Output {
+    git::Output { success: false, stdout: Vec::new(), stderr: Vec::new() }
+}
+
+/// Pure Tokio regression: a timeout leaves the owned handle unconsumed, a
+/// select-consumed result is removed before cleanup, and cleanup never polls a
+/// consumed JoinHandle. No real Git, server or PostgreSQL is involved.
+#[tokio::test]
+async fn push_join_results_are_consumed_once_before_cleanup() {
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let mut task = PushTask(tokio::spawn(async move {
+        let _ = wait.await;
+        Ok::<_, anyhow::Error>(synthetic_push_output())
+    }));
+    assert!(matches!(task.join_once(Duration::from_millis(1)).await, Err(JoinFailure::NotSettled)));
+    let _ = release.send(());
+    assert!(task.join_once(Duration::from_secs(1)).await.is_ok());
+    drop(task);
+
+    let mut join_unproven = false;
+    let mut slot = Some(PushTask(tokio::spawn(async {
+        let value: Result<git::Output> = Err(anyhow!("synthetic git runner error"));
+        value
+    })));
+    let ready = match slot.as_mut() {
+        Some(task) => (&mut task.0).await,
+        None => unreachable!("synthetic push task disappeared"),
+    };
+    assert!(consume_ready_push(&mut slot, ready, &mut join_unproven).is_err());
+    assert!(join_unproven);
+    assert!(slot.is_none());
+    let _ = confirm_or_stop(&mut slot, join_unproven, Duration::from_millis(10)).await;
 }
 
 #[test]
