@@ -328,7 +328,7 @@ async fn e2e_pg17_mtls_raft3_stock_git_merge_crash_recovery_and_concurrent_race(
         .query_one("SELECT state, merge_commit_oid FROM forge_pulls WHERE repository_id=$1 AND number=2", &[&ctx.repo])
         .await?;
     assert_eq!((r2.get::<_, String>(0).as_str(), r2.get::<_, Option<String>>(1)), ("open", None));
-    assert_eq!(backend.read_ref_oid(ctx.repo, "refs/heads/main").await?, Some(c1.target_oid));
+    assert_eq!(backend.read_ref_oid(ctx.repo, "refs/heads/main").await?, Some(c1.target_oid.clone()));
 
     let close_cmd = RefCasCommand::CloseAuthScope(CloseAuthScopeCommand {
         scope_kind: "token".into(),
