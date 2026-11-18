@@ -18,8 +18,8 @@ permissions:
   contents: read
 
 env:
-  PRODUCT_SHA: e01b627d973483f4dbcb93380d4c858ef25dd0c0
-  PRODUCT_TREE: 7f35fcabae51b937d65fbdd5548998e48880d147
+  PRODUCT_SHA: 54526cc987719c629e55eef7571913958e8f9188
+  PRODUCT_TREE: 0054cee88f2491d0dbb92bb56e1677b543356bcb
   WORKFLOW_PATH: .github/workflows/issue42-native-hosted-slot0-postgres.yml
   CARGO_BUILD_JOBS: '2'
   CARGO_INCREMENTAL: '0'
