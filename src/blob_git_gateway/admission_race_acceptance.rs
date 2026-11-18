@@ -310,18 +310,21 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
     let winner_output = winner_output.context("the winning stock push task failed")?;
     ensure!(winner_output.success, "the winning stock push failed: {}", redacted(&winner_output));
 
-    *phase = "loser_rebase";
+    *phase = "loser_rebase_await";
     pause.release();
     let loser_output = loser_push.await.context("the losing stock push task failed")??;
+    *phase = "loser_rebase_exit_status";
     ensure!(!loser_output.success, "the paused loser unexpectedly succeeded");
+    *phase = "loser_rebase_forbidden_text";
     let loser_text = output_text(&loser_output);
     for forbidden in ["409", "503", "non-fast-forward", "fetch first", "unexpected disconnect", "remote end hung up"] {
-        ensure!(
-            !loser_text.contains(forbidden),
-            "loser saw `{forbidden}`, not a report-status: {}",
-            redacted(&loser_output)
-        );
+        let found = match forbidden {
+            "409" | "503" => has_stock_http_error(&loser_text, forbidden),
+            _ => loser_text.contains(forbidden),
+        };
+        ensure!(!found, "loser saw `{forbidden}`, not a report-status: {}", redacted(&loser_output));
     }
+    *phase = "loser_rebase_stale_info";
     ensure!(
         loser_text.contains("[rejected]") && loser_text.contains("stale info"),
         "the loser did not print the stock stale-info rejection: {}",
@@ -550,6 +553,32 @@ fn report_status(response: &[u8]) -> Result<GitReport> {
         }
     }
     Ok((unpack.ok_or_else(|| anyhow!("report-status has no unpack line"))?, results))
+}
+
+// Git's destination lines include the fixture's ephemeral port and random hex repo name.
+fn has_stock_http_error(text: &str, status: &str) -> bool {
+    let rpc_error = format!("RPC failed; HTTP {status} curl ");
+    let url_error = format!("The requested URL returned error: {status}");
+    text.lines().any(|line| {
+        line.strip_prefix("error: ").unwrap_or(line).starts_with(rpc_error.as_str())
+            || line.ends_with(url_error.as_str())
+    })
+}
+
+#[test]
+fn stock_http_errors_distinguish_status_from_destination_digits() {
+    let destination = "To http://127.0.0.1:54090/git/owner/race-admission-a503b0000000.git\n\
+         ! [rejected] HEAD -> main (stale info)\n\
+        error: failed to push some refs to 'http://127.0.0.1:54090/git/owner/race-admission-a503b0000000.git'";
+    for status in ["409", "503"] {
+        assert!(destination.contains(status));
+        assert!(!has_stock_http_error(destination, status));
+        assert!(has_stock_http_error(&format!("error: RPC failed; HTTP {status} curl 22"), status));
+        assert!(has_stock_http_error(
+            &format!("fatal: unable to access 'http://example.invalid/': The requested URL returned error: {status}"),
+            status
+        ));
+    }
 }
 
 fn output_text(output: &git::Output) -> String {

@@ -2233,7 +2233,8 @@ jobs:
               'blob_git_gateway::admission_race_acceptance::pre_admission_revision_mismatch_rebases_to_old_oid_mismatch')
           failure_phases = {phase.encode('ascii'): phase for phase in (
               'fixture_setup', 'repository_seed', 'pre_admission_barrier', 'winner_publish',
-              'loser_rebase', 'http_report_assertions', 'durable_state_assertions', 'fixture_cleanup',
+              'loser_rebase_await', 'loser_rebase_exit_status', 'loser_rebase_forbidden_text',
+              'loser_rebase_stale_info', 'http_report_assertions', 'durable_state_assertions', 'fixture_cleanup',
           )}
           phase_read_limit = max(map(len, failure_phases)) + 1
           secret_env = ('ROOTYARD_OBJECT_STORE_ACCESS_KEY', 'ROOTYARD_OBJECT_STORE_SECRET_KEY',
