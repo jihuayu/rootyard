@@ -301,11 +301,10 @@ async fn verified_pack_bytes_pointer_equals_served_payload_and_survives_post_sca
     assert_eq!(shared.as_ptr(), bundled.as_ptr(), "clone must share the verified allocation");
     assert_eq!(shared.len(), len);
 
-    let resolver = sample_resolver();
     let mut policy = sample_policy();
     policy.min_pack_bytes_for_offload = 64;
     let offload =
-        GatewayPackfileOffload::new(Arc::new(sample_keyring()), policy, "cdn.rootyard.test", Arc::clone(&resolver));
+        GatewayPackfileOffload::new(Arc::new(sample_keyring()), policy, "cdn.rootyard.test", sample_resolver());
     let wire = build_v2_fetch_wire(&["packfile-uris https", &format!("want {tip}\n"), "done\n"]);
     let adv = vec![("refs/heads/main".to_owned(), tip.clone())];
     let resp = offload
