@@ -778,22 +778,55 @@ class Lab:
         assert manifests, 'Expected at least one committed manifest for object store test'
         pack_id = manifests[0]['pack_id']
 
-        put_rep = json.loads(self.cli('object-store-put', self.repo, pack_id, '--chunk-size', '4096'))
-        assert put_rep['status'] == 'published' and put_rep['chunk_count'] >= 1, put_rep
-        assert put_rep['immutable_mode'] == '0444', put_rep
+        # The catalogue row in pando_lab.manifests is the source pack under test;
+        # it must remain. Only the object-store publication pair may be absent.
+        root_env = self.env.get('PANDO_OBJECT_STORE_ROOT')
+        store_root = Path(root_env) if root_env is not None and root_env.strip() else self.store
+        bucket_env = self.env.get('PANDO_OBJECT_STORE_BUCKET')
+        bucket = bucket_env if bucket_env is not None and bucket_env.strip() else 'pando-default'
+        manifest_path = store_root / 'manifests' / self.repo / f'{pack_id}.json'
+        pack_key = store_root / 'buckets' / bucket / 'repos' / self.repo / 'packs' / f'{pack_id}.pack'
+        idx_key = store_root / 'buckets' / bucket / 'repos' / self.repo / 'packs' / f'{pack_id}.idx'
+        multipart_dir = store_root / 'multipart'
+
+        def assert_unpublished_pair():
+            counts = json.loads(self.sql(
+                "SELECT json_build_object("
+                f"'source_pack',(SELECT count(*) FROM pando_lab.manifests WHERE repo='{self.repo}' AND pack_id='{pack_id}'),"
+                f"'object_store_manifest',(SELECT count(*) FROM pando_lab.object_store_manifests WHERE repo='{self.repo}' AND pack_id='{pack_id}'),"
+                f"'kms_envelope',(SELECT count(*) FROM pando_lab.kms_envelopes WHERE repo='{self.repo}' AND pack_id='{pack_id}'))"
+            ))
+            assert counts == {'source_pack': 1, 'object_store_manifest': 0, 'kms_envelope': 0}, counts
+            assert not manifest_path.exists(), 'object-store manifest exists before publication'
+            assert not pack_key.exists(), 'object-store CAS pack exists before publication'
+            assert not idx_key.exists(), 'object-store CAS idx exists before publication'
+            assert not multipart_dir.exists() or len(list(multipart_dir.iterdir())) == 0, \
+                'multipart staging not empty before publication'
+
+        assert_unpublished_pair()
 
         fail_res = self.run(
             [self.binary, 'object-store-put', self.repo, pack_id, '--chunk-size', '64', '--fail-after-chunks', '1'],
             check=False,
         )
         assert fail_res.returncode != 0, 'Fault injection --fail-after-chunks 1 must fail closed'
+        assert ('fault injection: multipart upload' in fail_res.stderr
+                and 'aborted after 1 chunks' in fail_res.stderr), \
+            'fault-injection diagnostic predicate not met'
+        assert_unpublished_pair()
+
         corrupt_res = self.run(
             [self.binary, 'object-store-put', self.repo, pack_id, '--chunk-size', '64', '--corrupt-chunk', '1'],
             check=False,
         )
         assert corrupt_res.returncode != 0, 'Corrupt chunk part must fail closed'
-        multipart_dir = self.store / 'multipart'
-        assert not multipart_dir.exists() or len(list(multipart_dir.iterdir())) == 0
+        assert 'multipart chunk 1 digest or size mismatch' in corrupt_res.stderr, \
+            'corrupt-chunk diagnostic predicate not met'
+        assert_unpublished_pair()
+
+        put_rep = json.loads(self.cli('object-store-put', self.repo, pack_id, '--chunk-size', '4096'))
+        assert put_rep['status'] == 'published' and put_rep['chunk_count'] >= 1, put_rep
+        assert put_rep['immutable_mode'] == '0444', put_rep
 
         local_pack = self.store / 'objects' / self.repo / f'{pack_id}.pack'
         if local_pack.exists():
@@ -1000,13 +1033,101 @@ class Lab:
             c1_path.chmod(0o444)
 
         env_p1_path = self.store / 'object_store' / 'envelopes' / enc_repo / f'{p1}.json'
-        env_p1_orig = env_p1_path.read_bytes()
-        bad_env = json.loads(env_p1_orig.decode())
-        bad_env['envelope_mac'] = '0' * 64
-        env_p1_path.write_text(json.dumps(bad_env))
-        assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
-        env_p1_path.write_bytes(env_p1_orig)
+        cache_dir = self.store / 'objects' / enc_repo
+
+        def evict_mirror_authority_cache():
+            for suffix in ('.pack', '.idx'):
+                path = cache_dir / f'{p1}{suffix}'
+                if path.exists():
+                    path.unlink()
+            assert not (cache_dir / f'{p1}.pack').exists()
+            assert not (cache_dir / f'{p1}.idx').exists()
+
+        # A healthy committed DB envelope rewrites its mirror, so capture the
+        # canonical mirror before introducing isolated tamper fixtures.
+        evict_mirror_authority_cache()
         assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 2
+        env_p1_orig = env_p1_path.read_bytes()
+        assert c1_path.read_bytes() == c1_bytes
+
+        # DB authority: a valid-length envelope_mac mutation must fail closed
+        # even while the mirror remains healthy. translate() is a reversible
+        # bijection, so the fixture never reads or writes the stored MAC value.
+        db_tampered = False
+        try:
+            changed = self.sql(
+                "UPDATE pando_lab.kms_envelopes "
+                "SET envelope_mac = translate(envelope_mac, '0123456789abcdef', '123456789abcdef0') "
+                f"WHERE repo='{enc_repo}' AND pack_id='{p1}' RETURNING pack_id::text"
+            )
+            db_tampered = True
+            assert changed == p1, changed
+            evict_mirror_authority_cache()
+            assert self.run([self.binary, 'kms-verify', enc_repo], check=False).returncode != 0
+            assert not (cache_dir / f'{p1}.pack').exists()
+            assert not (cache_dir / f'{p1}.idx').exists()
+            assert env_p1_path.read_bytes() == env_p1_orig
+            assert c1_path.read_bytes() == c1_bytes
+            evict_mirror_authority_cache()
+            assert self.run([self.binary, 'object-store-get', enc_repo, p1], check=False).returncode != 0
+            assert not (cache_dir / f'{p1}.pack').exists()
+            assert not (cache_dir / f'{p1}.idx').exists()
+            assert env_p1_path.read_bytes() == env_p1_orig
+            assert c1_path.read_bytes() == c1_bytes
+        finally:
+            if db_tampered:
+                restored = self.sql(
+                    "UPDATE pando_lab.kms_envelopes "
+                    "SET envelope_mac = translate(envelope_mac, '123456789abcdef0', '0123456789abcdef') "
+                    f"WHERE repo='{enc_repo}' AND pack_id='{p1}' RETURNING pack_id::text"
+                )
+                assert restored == p1, restored
+            env_p1_path.write_bytes(env_p1_orig)
+            assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 2
+            assert env_p1_path.read_bytes() == env_p1_orig
+
+        # Mirror-only tamper: DB authority must hydrate successfully and repair
+        # the mirror to the validated committed envelope.
+        try:
+            bad_env = json.loads(env_p1_orig.decode())
+            bad_env['envelope_mac'] = bad_env['envelope_mac'].translate(
+                str.maketrans('0123456789abcdef', '123456789abcdef0')
+            )
+            env_p1_path.write_text(json.dumps(bad_env))
+            evict_mirror_authority_cache()
+            repaired = json.loads(self.cli('object-store-get', enc_repo, p1))
+            assert repaired['verified'] is True, repaired
+            assert repaired['cache_hit'] is False, repaired
+            assert repaired['rehydrated_from_object_store'] is True, repaired
+            assert repaired['pack_sha256'] == p1_sha, repaired
+            assert repaired['idx_sha256'] == m1['idx_sha256'], repaired
+            assert hashlib.sha256((cache_dir / f'{p1}.pack').read_bytes()).hexdigest() == p1_sha
+            assert hashlib.sha256((cache_dir / f'{p1}.idx').read_bytes()).hexdigest() == m1['idx_sha256']
+            assert env_p1_path.read_bytes() == env_p1_orig
+            assert c1_path.read_bytes() == c1_bytes
+        finally:
+            env_p1_path.write_bytes(env_p1_orig)
+            assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 2
+
+        # Missing mirror: the same DB authority must recreate it on cold read.
+        try:
+            if env_p1_path.exists():
+                env_p1_path.unlink()
+            assert not env_p1_path.exists()
+            evict_mirror_authority_cache()
+            repaired = json.loads(self.cli('object-store-get', enc_repo, p1))
+            assert repaired['verified'] is True, repaired
+            assert repaired['cache_hit'] is False, repaired
+            assert repaired['rehydrated_from_object_store'] is True, repaired
+            assert repaired['pack_sha256'] == p1_sha, repaired
+            assert repaired['idx_sha256'] == m1['idx_sha256'], repaired
+            assert hashlib.sha256((cache_dir / f'{p1}.pack').read_bytes()).hexdigest() == p1_sha
+            assert hashlib.sha256((cache_dir / f'{p1}.idx').read_bytes()).hexdigest() == m1['idx_sha256']
+            assert env_p1_path.read_bytes() == env_p1_orig
+            assert c1_path.read_bytes() == c1_bytes
+        finally:
+            env_p1_path.write_bytes(env_p1_orig)
+            assert json.loads(self.cli('kms-verify', enc_repo))['packs_verified'] == 2
 
         c1_sha = hashlib.sha256(c1_bytes).hexdigest()
         c2_sha = hashlib.sha256(c2_bytes).hexdigest()
@@ -1034,10 +1155,88 @@ class Lab:
         assert (clone_mid / 'data.txt').read_text().strip() == 'ROOTYARD_ISSUE21_CONCURRENT_GAMMA_003'
         assert 'ROOTYARD_ISSUE21_SECRET_ALPHA_001' in self.git('show', 'HEAD~2:data.txt', cwd=clone_mid).stdout
 
+        # Independent pre-resume baseline: use the authoritative checkpoint and
+        # envelopes, not the resume response, to derive the this-run eligible set.
+        baseline = json.loads(self.sql(
+            f"""
+            SELECT json_build_object(
+              'checkpoint', (
+                SELECT json_build_object(
+                  'state', state,
+                  'target_id', to_key_id,
+                  'target_version', to_key_version,
+                  'target_provider', checkpoint_json->>'to_provider_kind',
+                  'expected_version', (checkpoint_json->>'expected_to_version')::int,
+                  'completed_pack_ids', checkpoint_json->'completed_pack_ids',
+                  'failed_pack_id', failed_pack_id
+                )
+                FROM pando_lab.kms_rotations
+                WHERE repo='{enc_repo}' AND state='IN_PROGRESS'
+              ),
+              'packs', (
+                SELECT json_agg(json_build_object(
+                  'pack_id', m.pack_id::text,
+                  'key_id', e.key_id,
+                  'key_version', e.key_version,
+                  'encryption_mode', e.encryption_mode,
+                  'provider_kind', e.provider_kind
+                ) ORDER BY m.pack_id)
+                FROM pando_lab.manifests m
+                LEFT JOIN pando_lab.kms_envelopes e
+                  ON e.repo=m.repo AND e.pack_id=m.pack_id
+                WHERE m.repo='{enc_repo}'
+              )
+            )
+            """
+        ))
+        checkpoint = baseline['checkpoint']
+        packs = baseline['packs']
+        assert checkpoint is not None and packs is not None, baseline
+        assert checkpoint['state'] == 'IN_PROGRESS', checkpoint
+        target_key_id = checkpoint['target_id']
+        target_key_version = checkpoint['target_version']
+        assert target_key_id == 'kms-rot-v2', checkpoint
+        assert target_key_version == checkpoint['expected_version'], checkpoint
+        assert checkpoint['target_provider'] == 'local-file-key-provider', checkpoint
+        assert len(packs) == 3, packs
+        assert all(p['key_id'] is not None and p['key_version'] is not None for p in packs), packs
+        assert all(p['encryption_mode'] == 'authenticated-envelope-v1' for p in packs), packs
+        assert all(p['provider_kind'] == 'local-file-key-provider' for p in packs), packs
+        scoped_pack_ids = {p['pack_id'] for p in packs}
+        assert scoped_pack_ids == {p1, p2, p3}, scoped_pack_ids
+        completed_ids = checkpoint['completed_pack_ids']
+        assert isinstance(completed_ids, list) and len(completed_ids) == 1, checkpoint
+        completed_pack_id = completed_ids[0]
+        failed_pack_id = checkpoint['failed_pack_id']
+        assert failed_pack_id is not None, checkpoint
+        assert completed_pack_id in scoped_pack_ids and p3 in scoped_pack_ids, scoped_pack_ids
+        eligible_pack_ids = {
+            p['pack_id'] for p in packs
+            if p['key_id'] != target_key_id or p['key_version'] != target_key_version
+        }
+        assert completed_pack_id not in eligible_pack_ids, eligible_pack_ids
+        assert p3 not in eligible_pack_ids, eligible_pack_ids
+        assert failed_pack_id in eligible_pack_ids, eligible_pack_ids
+        assert eligible_pack_ids == scoped_pack_ids - {completed_pack_id, p3}, eligible_pack_ids
+        expected_rewrapped = len(eligible_pack_ids)
+
         resumed = json.loads(self.cli('kms-rotate', enc_repo, '--resume'))
-        assert resumed['new_key_id'] == 'kms-rot-v2' and resumed['envelopes_rewrapped'] == 3, resumed
+        assert resumed['new_key_id'] == 'kms-rot-v2', resumed
+        assert resumed['new_key_version'] == target_key_version, resumed
+        assert resumed['envelopes_rewrapped'] == expected_rewrapped, resumed
+        assert resumed['envelopes_verified'] == 3 and len(resumed['envelopes']) == 3, resumed
+        assert {e['pack_id'] for e in resumed['envelopes']} == scoped_pack_ids, resumed
+        assert all(
+            e['key_id'] == target_key_id
+            and e['key_version'] == target_key_version
+            and e['encryption_mode'] == 'authenticated-envelope-v1'
+            and e['provider_kind'] == 'local-file-key-provider'
+            for e in resumed['envelopes']
+        ), resumed
         st_done = json.loads(self.cli('kms-status', enc_repo))
         assert st_done['active_rotation']['state'] == 'COMPLETED'
+        assert set(st_done['active_rotation']['target_pack_ids']) == scoped_pack_ids, st_done
+        assert set(st_done['active_rotation']['completed_pack_ids']) == scoped_pack_ids, st_done
         assert hashlib.sha256(c1_path.read_bytes()).hexdigest() == c1_sha
         assert hashlib.sha256(c2_path.read_bytes()).hexdigest() == c2_sha
         assert hashlib.sha256(c2_bytes).hexdigest() == c2_sha and len(p2_sha) == 64 and len(p3_sha) == 64

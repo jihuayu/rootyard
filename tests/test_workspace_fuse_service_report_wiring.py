@@ -19,11 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 CI_YML = ROOT / ".github/workflows/ci.yml"
 GENERIC_RUNNER = ROOT / "scripts/run_python_ci_tests.py"
 
-# Current main's verify/lifecycle budget (95 existing + 12 cold tenant LFS gate
-# on owned Garage + 28 full Redis qualification, including restore/FLUSHALL,
-# partition, failover, and cleanup/manifest binding).
-# The merged job keeps it and adds only this branch's independent FUSE phases.
-MAIN_VERIFY_BUDGET = 135
+# Current main's verify/lifecycle budget: 95 existing + 12 cold tenant LFS gate
+# on owned Garage + 28 full Redis qualification (including restore/FLUSHALL,
+# partition, failover, and cleanup/manifest binding) + 40 Pando package gates:
+# 175. The merged job keeps it and adds only this branch's independent FUSE
+# phases.
+MAIN_VERIFY_BUDGET = 175
 
 C5 = "tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_api_sigkill_with_pending_kernel_writer"
 EXISTING_REQUIRED = (
@@ -142,8 +143,8 @@ class WorkspaceFuseServiceReportWiringTest(unittest.TestCase):
         self.assertIn("--report test-results/workspace-fuse-service.json", " ".join(helper.split()))
         self.assertIn(f"--require-case workspace_fuse_service={C5}", self.manifest)
         self.assertEqual(_cap(helper), 30)
-        # The merged verify job keeps main's 135-minute budget and adds only
-        # those three phases; keeping 135 alone would under-budget the lane.
+        # The merged verify job keeps main's 175-minute budget and adds only
+        # those three phases; keeping 175 alone would under-budget the lane.
         self.assertIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET + sum(phases)}", verify)
         self.assertNotIn(f"    timeout-minutes: {MAIN_VERIFY_BUDGET}", verify)
         # No pre-existing main step cap is inflated by this branch; the Redis
