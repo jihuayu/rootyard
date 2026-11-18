@@ -23,6 +23,8 @@ pub mod pando_delete_gate;
 pub mod quarantine;
 #[path = "storage_lifecycle/retention.rs"]
 pub mod retention;
+#[path = "storage_lifecycle/rubicon_compaction.rs"]
+pub mod rubicon_compaction;
 #[path = "storage_lifecycle/scheduler.rs"]
 pub mod scheduler;
 #[path = "storage_lifecycle/worker.rs"]

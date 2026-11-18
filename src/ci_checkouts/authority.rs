@@ -26,7 +26,7 @@ impl IntegrationScope {
         if client.query_opt("SELECT 1 FROM ci_integration_source_grants g \
             JOIN repositories r ON r.id=g.repository_id \
             WHERE g.issuer_webhook_id=$1 AND g.repository_id=$2 AND g.active=true \
-            AND r.state='ready' AND r.storage_generation=$3",&[&self.hook_id,&repo_id,&sub.storage_generation])
+            AND r.deleted_at IS NULL AND r.state='ready' AND r.storage_generation=$3",&[&self.hook_id,&repo_id,&sub.storage_generation])
             .await.map_err(Error::internal)?.is_none(){return Err(Error::unauthorized());}
         Ok(())
     }
@@ -44,7 +44,7 @@ const INTEGRATION_GRANT: &str = "FROM ci_integration_checkout_jobs i \
    AND p.state='open' AND p.version=c.pull_version \
    AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \
  JOIN repositories r ON r.id=i.repository_id AND r.owner_id=i.owner_id \
-   AND r.state='ready' AND r.storage_backend='gitfs' \
+   AND r.deleted_at IS NULL AND r.state='ready' AND r.storage_backend='gitfs' \
  WHERE i.expires_unix>extract(epoch FROM clock_timestamp()) \
    AND (i.repository_id=c.repository_id OR EXISTS ( \
       SELECT 1 FROM ci_integration_source_grants g \
@@ -130,7 +130,7 @@ pub(crate) async fn authenticate(
           AND g.expires_unix>extract(epoch FROM clock_timestamp()) \
           AND NOT t.revoked AND NOT t.read_only \
           AND (t.expires_at IS NULL OR t.expires_at>clock_timestamp()) \
-          AND r.state='ready' AND r.storage_backend='gitfs' AND r.name=$2 AND u.slug=$3");
+          AND r.deleted_at IS NULL AND r.state='ready' AND r.storage_backend='gitfs' AND r.name=$2 AND u.slug=$3");
     let row=tx.query_opt(&sql,&[&digest,&name,&owner]).await.map_err(Error::internal)?
         .ok_or_else(Error::unauthorized)?;
     let repo_id:Uuid=row.get(2);let owner_id:Uuid=row.get(1);let actor_id:Uuid=row.get(8);
@@ -171,7 +171,7 @@ pub(crate) async fn still_authorized(
           AND g.expires_unix>extract(epoch FROM clock_timestamp()) \
           AND NOT t.revoked AND NOT t.read_only \
           AND (t.expires_at IS NULL OR t.expires_at>clock_timestamp()) \
-          AND r.state='ready' AND r.storage_generation=$4");
+          AND r.deleted_at IS NULL AND r.state='ready' AND r.storage_generation=$4");
     let row=tx.query_opt(&sql,&[&repository_id,&job_id,&credential_digest,&storage_generation])
         .await.map_err(Error::internal)?;
     let valid=if let Some(row)=row {

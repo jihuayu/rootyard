@@ -433,6 +433,46 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
         }
         self.assertEqual(route_map, expected)
 
+    def test_repository_lifecycle_and_organization_routers_have_no_collisions(self) -> None:
+        lib_src = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
+        self.assertIn(".merge(repositories::routes())", lib_src)
+        self.assertIn(".merge(organizations::routes())", lib_src)
+        seen: dict[tuple[str, str], str] = {}
+        param_by_prefix: dict[tuple[str, ...], str] = {}
+        files = (*self.ALL_PRIMARY_ROUTER_FILES, "src/repositories.rs", "src/organizations.rs")
+        for rel in files:
+            regs = (
+                [
+                    *_extract_route_registrations(ROOT / "src/web/navigation.rs"),
+                    *_expand_page_table("src/web/repository_pages.rs", ("/web", "/ui")),
+                    *_expand_page_table("src/web/org_admin.rs", ()),
+                    *_expand_web_collaboration_routes(),
+                ]
+                if rel == "src/web.rs"
+                else _extract_route_registrations(ROOT / rel)
+            )
+            for raw_path, methods in regs:
+                norm = _normalize_route_pattern(raw_path)
+                for method in methods:
+                    key = (norm, method)
+                    self.assertNotIn(key, seen, f"Lifecycle router collision on {key}: {rel} vs {seen.get(key)}")
+                    seen[key] = rel
+                segs = [s for s in raw_path.strip("/").split("/") if s]
+                prefix: list[str] = []
+                for seg in segs:
+                    if seg.startswith("{") and seg.endswith("}"):
+                        pkey = tuple(prefix)
+                        if pkey in param_by_prefix:
+                            self.assertEqual(seg, param_by_prefix[pkey], f"Param conflict in {rel}: {raw_path}")
+                        else:
+                            param_by_prefix[pkey] = seg
+                        prefix.append("{*}" if seg.startswith("{*") else "{}")
+                    else:
+                        prefix.append(seg)
+        self.assertIn(("api", "repos", "{}", "{}", "aliases"), param_by_prefix)
+        self.assertEqual(param_by_prefix[("api", "repos", "{}", "{}", "aliases")], "{alias_owner}")
+        self.assertEqual(param_by_prefix[("api", "repos", "{}", "{}", "aliases", "{}")], "{alias_name}")
+
 
 class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
     """Class 2: Schema baseline 060, FK topological DAG, backup lock ordering, and relational CHECK constraints."""
@@ -632,9 +672,20 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
                 r"REFERENCES repositories\(id, owner_id\)", definition,
             ):
                 current_composite.add(constraint["table"])
-        self.assertEqual(current_composite, (expected_composite - {"git_operations"}) | {
-            "storage_maintenance_repo_state", "storage_maintenance_jobs", "storage_maintenance_tombstones",
-        })
+        # Migration 151 similarly rebinds ci_checkout_* historical issuer rows to
+        # repositories(id) ON DELETE CASCADE (preserving immutable owner_id in signed plans
+        # while allowing personal <-> organization ownership transfers and final purge).
+        self.assertEqual(
+            current_composite,
+            (expected_composite - {
+                "git_operations",
+                "ci_checkout_jobs",
+                "ci_checkout_delegations",
+                "ci_integration_checkout_jobs",
+            }) | {
+                "storage_maintenance_repo_state", "storage_maintenance_jobs", "storage_maintenance_tombstones",
+            },
+        )
         manifest_constraints = {
             entry["name"]: entry["definition"].replace("public.", "").replace('"', "")
             for entry in live["constraints"] if entry["table"] == "pando_manifest_artifacts"
@@ -642,17 +693,18 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         self.assertEqual(
             manifest_constraints["pando_manifest_artifacts_manifest_identity_fkey"],
             "FOREIGN KEY (manifest_id, repository_id, tenant_id) "
-            "REFERENCES pando_pack_manifests(id, repository_id, tenant_id) ON DELETE CASCADE",
+            "REFERENCES pando_pack_manifests(id, repository_id, tenant_id) ON UPDATE CASCADE ON DELETE CASCADE",
         )
         self.assertNotIn("pando_manifest_artifacts_manifest_id_fkey", manifest_constraints)
         # Comments/reviews inherit tenant+repository identity through their
-        # composite issue/PR parent rather than a second direct repository FK.
+        # composite issue/PR parent rather than a second direct repository FK,
+        # cascading both ownership transfer updates and approved repository purge.
         for table, parent, number in (
             ("forge_issue_comments", "forge_issues", "issue_number"),
             ("forge_pull_reviews", "forge_pulls", "pull_number"),
         ):
             expected = (f"FOREIGN KEY (tenant_id, repository_id, {number}) "
-                        f"REFERENCES public.{parent}(tenant_id, repository_id, number)")
+                        f"REFERENCES public.{parent}(tenant_id, repository_id, number) ON UPDATE CASCADE ON DELETE CASCADE")
             self.assertTrue(any(c["table"] == table and c["definition"] == expected
                                 for c in live["constraints"]), f"{table} lost its tenant-scoped parent FK")
 

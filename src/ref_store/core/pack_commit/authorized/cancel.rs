@@ -7,13 +7,16 @@
 //! closes the decision row (`OPEN -> CANCELLED`). This module adds the pool,
 //! deadline and durability framing only; it never re-implements an authority
 //! check and never writes a ref row, a gate revision or an event.
-use super::super::error::PackCommitError;
+use super::super::error::{PackCommitError, PackCommitRejectCode};
+use super::super::producer::read_serving_operation;
 use super::{AuthorizedCommitError, PgAuthorizedCommit, effective_deadline, pooled_client};
 use crate::db::Identity;
-use crate::ref_store::contract::OperationIdentity;
+use crate::ref_store::contract::{OperationIdentity, OperationLookup, OperationRecord};
 use crate::ref_store::core::publication_decision::{self, CancelOutcome};
+use crate::ref_store::pg::PgRefStore;
 use crate::ref_store::tx::{begin_bounded, commit_bounded};
 use tokio::time::{Instant, timeout_at};
+use tokio_postgres::Transaction;
 use uuid::Uuid;
 
 /// Public cancel outcome. It carries ids only — never a token, a digest or a
@@ -90,6 +93,131 @@ impl PgAuthorizedCommit {
             }
         }
     }
+
+    /// Resolve one **already registered** operation by its repository-scoped
+    /// UUID and cancel it in one bounded, `synchronous_commit=on` transaction.
+    ///
+    /// The stored migration-138 record is the only identity source: the caller
+    /// supplies no issuer, lane, sequence, digest or reason beyond the fixed
+    /// server reason. The migration-138 operation advisory key is taken *before*
+    /// the registry read, so this resolution is linearized with a concurrent
+    /// begin/commit on the same UUID. A known record must also have its exact
+    /// migration-147 producer binding; a missing or inconsistent binding is a
+    /// ledger refusal, never a weaker cancellation.
+    ///
+    /// `Ok(None)` means no operation row exists for this repository; the
+    /// transaction is rolled back and **no cancellation tombstone is written**.
+    /// For a known operation, the existing authorized decision coordinator is
+    /// called in the same transaction. It rechecks the live writable token and
+    /// current owner/admin role under its documented lock order, then either
+    /// wins with an immutable `Cancelled` terminal or observes the exact
+    /// committed/rejected terminal that already won. The returned record is read
+    /// back inside this same transaction, so an ambiguous `COMMIT` stays a typed
+    /// unknown rather than a guessed success or failure.
+    pub async fn cancel_known(
+        &self,
+        pool: &deadpool_postgres::Pool,
+        actor: &Identity,
+        repository_id: Uuid,
+        operation_id: Uuid,
+        reason: &str,
+        deadline: Instant,
+    ) -> Result<Option<OperationRecord>, AuthorizedCommitError> {
+        if repository_id.is_nil() || operation_id.is_nil() {
+            return Err(AuthorizedCommitError::Unverifiable("operation cancellation ids must be non-nil"));
+        }
+        let deadline = effective_deadline(deadline)?;
+        let mut client = pooled_client(pool, deadline).await?;
+        let tx = begin_bounded(&mut client, deadline).await?;
+        let stage = async {
+            super::super::pg::set_ack_durability(&tx, deadline).await.map_err(AuthorizedCommitError::from)?;
+            // Same migration-138 prefix as begin/reserve/cancel. The coordinator
+            // reacquires this transaction-scoped key below; that is a no-op and
+            // preserves operation -> lane -> ... ordering.
+            crate::ref_store::pg::lock_operation(&tx, repository_id, operation_id, deadline)
+                .await
+                .map_err(AuthorizedCommitError::from)?;
+            let Some(record) = resolve_registered_operation(&tx, repository_id, operation_id, deadline).await? else {
+                return Ok(None);
+            };
+            publication_decision::coordinator_cancel(&tx, actor, record.identity(), reason, deadline)
+                .await
+                .map_err(super::decision_error)?;
+            let final_record = match PgRefStore.get(&tx, repository_id, operation_id, deadline).await? {
+                OperationLookup::Known(record) => record,
+                OperationLookup::Unknown => {
+                    return Err(AuthorizedCommitError::Ledger(
+                        "operation disappeared inside its cancellation transaction",
+                    ));
+                }
+            };
+            if final_record.identity().repository_id() != repository_id
+                || final_record.identity().operation_id() != operation_id
+            {
+                return Err(AuthorizedCommitError::Ledger("cancellation returned a foreign operation identity"));
+            }
+            if !final_record.state().is_terminal() || final_record.terminal_result().is_none() {
+                return Err(AuthorizedCommitError::Ledger("cancellation did not produce an immutable terminal result"));
+            }
+            Ok(Some(final_record))
+        };
+        let staged = match timeout_at(deadline, stage).await {
+            Ok(value) => value,
+            Err(_) => Err(AuthorizedCommitError::Timeout),
+        };
+        match staged {
+            Ok(Some(record)) => {
+                commit_bounded(tx, deadline, repository_id, Some(operation_id)).await.map_err(PackCommitError::from)?;
+                Ok(Some(record))
+            }
+            Ok(None) => {
+                // The caller resolved an unknown UUID after authorization. No
+                // operation row, cancellation tombstone or decision row exists.
+                super::rollback(tx, deadline).await?;
+                Ok(None)
+            }
+            Err(error) => {
+                let _cleanup = super::rollback(tx, deadline).await;
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Resolve the stored migration-138 record and its exact migration-147 producer
+/// binding in the caller-owned cancellation transaction without writing anything.
+///
+/// This is the same A3/Core identity check the served receive probe uses
+/// (`operation::lookup_in_tx`): the binding must exist, name this repository and
+/// operation, and its parent digest must equal the core record digest. The
+/// migration-147 adapter itself also rejects a different issuer or parent.
+async fn resolve_registered_operation(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    operation_id: Uuid,
+    deadline: Instant,
+) -> Result<Option<OperationRecord>, AuthorizedCommitError> {
+    let record = match PgRefStore.get(tx, repository_id, operation_id, deadline).await? {
+        OperationLookup::Unknown => return Ok(None),
+        OperationLookup::Known(record) => record,
+    };
+    let identity = record.identity();
+    if identity.repository_id() != repository_id || identity.operation_id() != operation_id {
+        return Err(AuthorizedCommitError::Ledger("operation lookup returned a foreign identity"));
+    }
+    let Some(binding) = read_serving_operation(tx, repository_id, operation_id, deadline).await? else {
+        return Err(super::reject(
+            PackCommitRejectCode::LedgerIntegrity,
+            "operation has no durable producer request binding; it cannot be cancelled from this endpoint",
+        ));
+    };
+    if binding.parent_digest() != identity.digest() {
+        return Err(super::reject(
+            PackCommitRejectCode::LedgerIntegrity,
+            "serving producer binding parent digest differs from its operation record",
+        ));
+    }
+    Ok(Some(record))
 }
 
 /// Public projection of the decision module's cancel outcome.

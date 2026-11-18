@@ -235,7 +235,7 @@ pub(crate) async fn execute_search(
     };
 
     let sql = format!(
-        "WITH auth_repos AS (SELECT r.id FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id WHERE ({vis}) AND $2::uuid IS NOT NULL AND ($3::uuid IS NULL OR r.id=$3)), \
+        "WITH auth_repos AS (SELECT r.id FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id WHERE ({vis}) AND r.deleted_at IS NULL AND $2::uuid IS NOT NULL AND ($3::uuid IS NULL OR r.id=$3)), \
          unioned AS ({union_sql}) \
          SELECT u.kind,u.repository_id,u.owner,u.repo,u.number,u.comment_number,u.state,u.title,u.raw_excerpt,u.updated_at,to_char(u.sort_ts AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS cursor_ts \
          FROM unioned u WHERE {cursor_pred} ORDER BY {order_by} LIMIT $11"

@@ -85,7 +85,7 @@ fn page_sql(restricted: bool) -> &'static str {
     if restricted {
         concat!(
             "SELECT ns.slug,r.name,r.id FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id ",
-            "WHERE r.state='ready' AND (ns.user_id=$6",
+            "WHERE r.state='ready' AND r.deleted_at IS NULL AND (ns.user_id=$6",
             " OR EXISTS (SELECT 1 FROM organization_memberships m WHERE m.organization_id=r.owner_id AND m.user_id=$6)",
             " OR EXISTS (SELECT 1 FROM organization_team_members tm WHERE tm.organization_id=r.owner_id AND tm.user_id=$6)",
             " OR EXISTS (SELECT 1 FROM repository_collaborators c WHERE c.repository_id=r.id AND c.user_id=$6)",
@@ -98,7 +98,7 @@ fn page_sql(restricted: bool) -> &'static str {
     } else {
         concat!(
             "SELECT ns.slug,r.name,r.id FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id ",
-            "WHERE r.state='ready' AND (ns.user_id=$1",
+            "WHERE r.state='ready' AND r.deleted_at IS NULL AND (ns.user_id=$1",
             " OR EXISTS (SELECT 1 FROM organization_memberships m WHERE m.organization_id=r.owner_id AND m.user_id=$1)",
             " OR EXISTS (SELECT 1 FROM organization_team_members tm WHERE tm.organization_id=r.owner_id AND tm.user_id=$1)",
             " OR EXISTS (SELECT 1 FROM repository_collaborators c WHERE c.repository_id=r.id AND c.user_id=$1)",

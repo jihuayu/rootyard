@@ -171,12 +171,13 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (148, include_str!("../migrations/148_pando_pitr_authority_fence.sql")),
     (149, include_str!("../migrations/149_ref_cas_event_projection.sql")),
     (150, include_str!("../migrations/150_forge_collaboration.sql")),
+    (151, include_str!("../migrations/151_repository_lifecycle.sql")),
 ];
 
 pub const SCHEMA_VERSIONS: &[i32] = &[
     1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 73, 74, 75, 80, 81, 82, 83, 84, 85, 86, 90, 91, 92, 93, 94, 95,
     96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 121, 125, 126, 127, 128, 129, 130,
-    131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150,
+    131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151,
 ];
 
 /// Runtime roles use a read-only schema check. Migration/backup ownership is
@@ -200,6 +201,9 @@ pub async fn prepare_runtime_schema(pool: &Pool) -> Result<()> {
     }
 }
 
+#[cfg(test)]
+static MIGRATION_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;
     migrate_client(&mut client).await
@@ -209,6 +213,11 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
 /// session-level backup lock. The caller still owns transaction boundaries and
 /// must verify the resulting schema before exposing the database.
 pub(crate) async fn migrate_client(client: &mut tokio_postgres::Client) -> Result<()> {
+    // Unit tests use independent schemas, but the advisory lock below is database-global.
+    // Serialize the whole migration transaction in-process so parallel fixtures do not
+    // queue on that SQL lock past lock_timeout. The guard lives until this function returns.
+    #[cfg(test)]
+    let _migration_gate = MIGRATION_GATE.lock().await;
     let tx = client.transaction().await?;
     tx.execute("SELECT pg_advisory_xact_lock(738390103)", &[]).await?;
     // A restored schema already contains migration 001's tables and ledger in

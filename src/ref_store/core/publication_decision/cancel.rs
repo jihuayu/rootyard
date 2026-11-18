@@ -175,6 +175,22 @@ async fn authorize(tx: &Transaction<'_>, actor: &Identity, repository_id: Uuid) 
     if role < Role::Admin {
         return Err(DecisionError::Denied(DenialCode::RoleDenied));
     }
+    // Final restricted-token narrowing check, on the same transaction that
+    // writes the cancellation tombstones. The preflight is only an early
+    // filter: a scope update committed after it must still deny here. This
+    // deliberately stays last in the documented lock order (operation key ->
+    // A3 -> repository/gate -> late token/grants -> commit); the helper takes
+    // the token row FOR SHARE and holds it until this transaction ends.
+    crate::token_scopes::authorize_repository_late(
+        tx,
+        actor.token_id,
+        actor.id,
+        repository_id,
+        crate::token_scopes::RepoAction::ContentsWrite,
+        false,
+    )
+    .await
+    .map_err(super::auth_deps::map_scope_denial)?;
     Ok(())
 }
 
