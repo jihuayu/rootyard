@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """Pure finite failure-projection tests for the legacy shutdown report.
 
-Every case here uses fake unittest cases, in-memory error tuples and compiled
-synthetic tracebacks. Nothing starts the legacy acceptance class, a service,
-Git, a subprocess, FUSE, PostgreSQL, the network or a thread.
+Every case here uses fake unittest cases, in-memory error tuples, compiled
+synthetic tracebacks and temporary bounded evidence files. Nothing starts the
+legacy acceptance class, a service, Git, a subprocess, FUSE, PostgreSQL, the
+network or a thread.
 """
 from __future__ import annotations
 
 import io
 import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
 from tests import workspace_legacy_fuse_shutdown_acceptance as acceptance
 from tests import workspace_legacy_fuse_shutdown_ownership as ownership
 from tests import workspace_legacy_fuse_shutdown_report as report
+from tests import workspace_legacy_fuse_shutdown_support as support
 
 ROOT = Path(__file__).resolve().parents[1]
 REPORT_SOURCE = "tests/workspace_legacy_fuse_shutdown_report.py"
@@ -37,6 +40,115 @@ def _run_inventory(case_class):
     return unittest.TextTestRunner(
         stream=stream, verbosity=0, resultclass=report.InventoryResult
     ).run(suite)
+
+
+_LEGACY_WORKSPACE_IDS = (
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222",
+)
+_LEGACY_FOREIGN_WORKSPACE_ID = "33333333-3333-4333-8333-333333333333"
+
+
+def _legacy_join_payload(workspace_hashes, *, joined_mounts=None, total=None):
+    """Copy the fixed v1 legacy-shutdown-evidence shape emitted by Rust."""
+    return {
+        "schema": support.EVIDENCE_SCHEMA,
+        "mount_namespace": 4021,
+        "joined_mounts": (
+            len(workspace_hashes) if joined_mounts is None else joined_mounts
+        ),
+        "joined_workspaces": list(workspace_hashes),
+        "joined_workspaces_total": (
+            len(workspace_hashes) if total is None else total
+        ),
+        "joined_workspaces_truncated": False,
+        "pending_admissions": 0,
+        "retained_owners": 0,
+        "cleanup_failures": 0,
+    }
+
+
+class JoinEvidenceParsingTest(unittest.TestCase):
+    """The v1 evidence parser must accept the real list shape and stay exact."""
+
+    def _read(self, payload, expected):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "service.log"
+            log_path.write_bytes(
+                (support.EVIDENCE_PREFIX + json.dumps(payload) + "\n").encode("utf-8")
+            )
+            return support.read_join_evidence(
+                log_path, payload["mount_namespace"], expected
+            )
+
+    def _assert_rejected(self, payload, expected, message):
+        with self.assertRaisesRegex(support.LegacyAcceptanceError, message):
+            self._read(payload, expected)
+
+    def test_exact_v1_joined_workspaces_list_is_accepted(self):
+        hashes = [
+            support.workspace_hash(workspace_id)
+            for workspace_id in _LEGACY_WORKSPACE_IDS
+        ]
+        payload = _legacy_join_payload(hashes)
+        self.assertIsInstance(payload["joined_workspaces"], list)
+        self.assertEqual(
+            self._read(payload, hashes),
+            {
+                "schema": support.EVIDENCE_SCHEMA,
+                "mount_namespace": 4021,
+                "joined_mounts": 2,
+                "joined_workspaces": 2,
+                "workspace_hashes": hashes,
+                "expected_workspace_hashes": hashes,
+                "pending_admissions": 0,
+                "retained_owners": 0,
+                "cleanup_failures": 0,
+            },
+        )
+
+    def test_non_list_and_existing_workspace_proof_mismatches_still_fail(self):
+        hashes = [
+            support.workspace_hash(workspace_id)
+            for workspace_id in _LEGACY_WORKSPACE_IDS
+        ]
+        foreign = support.workspace_hash(_LEGACY_FOREIGN_WORKSPACE_ID)
+
+        non_list = _legacy_join_payload(hashes)
+        non_list["joined_workspaces"] = ",".join(hashes)
+        self._assert_rejected(
+            non_list, hashes, "joined_workspaces has an invalid type"
+        )
+
+        count_mismatch = _legacy_join_payload(hashes, total=len(hashes) + 1)
+        self._assert_rejected(
+            count_mismatch, hashes, "workspace count mismatch"
+        )
+
+        set_mismatch = _legacy_join_payload([hashes[0], foreign])
+        self._assert_rejected(
+            set_mismatch, hashes, "workspace set is not the exact expected set"
+        )
+
+        missing_expected = _legacy_join_payload([hashes[0]], joined_mounts=len(hashes))
+        self._assert_rejected(
+            missing_expected, hashes, "workspace set is not the exact expected set"
+        )
+
+        for name in (
+            "mount_namespace",
+            "joined_mounts",
+            "joined_workspaces_total",
+            "pending_admissions",
+            "retained_owners",
+            "cleanup_failures",
+        ):
+            with self.subTest(field=name):
+                bool_not_int = _legacy_join_payload(hashes)
+                bool_not_int[name] = True
+                self._assert_rejected(
+                    bool_not_int, hashes, f"{name} has an invalid type"
+                )
 
 
 class _FakeTest:

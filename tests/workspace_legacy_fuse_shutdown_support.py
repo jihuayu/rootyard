@@ -671,6 +671,8 @@ def _safe_field(value, kind):
         return isinstance(value, str)
     if kind is bool:
         return isinstance(value, bool)
+    if kind is list:
+        return isinstance(value, list)
     return False
 
 
