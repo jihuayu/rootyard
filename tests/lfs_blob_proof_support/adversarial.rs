@@ -21,7 +21,9 @@ use uuid::Uuid;
 pub use super::adversarial_org_restart::{
     OrgRestartSharedHoldInput, exercise_org_authority_restart_recovery_hydration_and_shared_holds,
 };
-use super::{LoopbackS3, RunningProdLfsServer, TestActor, run_git_ok, run_git_raw, run_real_validate_hook};
+use super::{
+    LoopbackS3, RealHookInput, RunningProdLfsServer, TestActor, run_git_ok, run_git_raw, run_real_validate_hook,
+};
 
 pub struct UploadRetryRepairInput<'a> {
     pub srv: &'a RunningProdLfsServer,
@@ -263,32 +265,32 @@ pub async fn exercise_named_pointer_rejections_and_prod_attestation_replay(
 
     let op1 = mk_op()?;
     tokio::task::block_in_place(|| {
-        run_real_validate_hook(
-            &srv.state.config.database_url,
-            &srv.state.config.git,
-            &bare_dir,
-            &srv.state.storage.root,
-            None,
-            None,
-            &op1,
-            &changes,
-        )
+        run_real_validate_hook(RealHookInput {
+            db_url: &srv.state.config.database_url,
+            git_bin: &srv.state.config.git,
+            git_dir: &bare_dir,
+            data_root: &srv.state.storage.root,
+            git_obj_dir: None,
+            git_alt_dirs: None,
+            op: &op1,
+            changes: &changes,
+        })
     })?;
     let _ = journal::finish(&op1);
     let att1 = pg.load_attestation(realm.repository_id, op_id).await?.context("att1")?;
 
     let op2 = mk_op()?;
     tokio::task::block_in_place(|| {
-        run_real_validate_hook(
-            &srv.state.config.database_url,
-            &srv.state.config.git,
-            &bare_dir,
-            &srv.state.storage.root,
-            None,
-            None,
-            &op2,
-            &changes,
-        )
+        run_real_validate_hook(RealHookInput {
+            db_url: &srv.state.config.database_url,
+            git_bin: &srv.state.config.git,
+            git_dir: &bare_dir,
+            data_root: &srv.state.storage.root,
+            git_obj_dir: None,
+            git_alt_dirs: None,
+            op: &op2,
+            changes: &changes,
+        })
     })?;
     let _ = journal::finish(&op2);
     let att2 = pg.load_attestation(realm.repository_id, op_id).await?.context("att2")?;
@@ -298,16 +300,16 @@ pub async fn exercise_named_pointer_rejections_and_prod_attestation_replay(
         vec![RefChange { ref_name: "refs/heads/tampered-target".into(), old_oid: zero_oid, new_oid: head_oid }];
     let op3 = mk_op()?;
     let equiv_err = tokio::task::block_in_place(|| {
-        run_real_validate_hook(
-            &srv.state.config.database_url,
-            &srv.state.config.git,
-            &bare_dir,
-            &srv.state.storage.root,
-            None,
-            None,
-            &op3,
-            &tampered,
-        )
+        run_real_validate_hook(RealHookInput {
+            db_url: &srv.state.config.database_url,
+            git_bin: &srv.state.config.git,
+            git_dir: &bare_dir,
+            data_root: &srv.state.storage.root,
+            git_obj_dir: None,
+            git_alt_dirs: None,
+            op: &op3,
+            changes: &tampered,
+        })
     })
     .expect_err("equivocated replay via real validate_hook must fail closed");
     let _ = journal::finish(&op3);

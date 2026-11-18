@@ -56,6 +56,13 @@ class LfsBlobProofContractTests(unittest.TestCase):
         self.assertLess(len(FACADE.read_text(encoding="utf-8").splitlines()), 100)
         self.assertEqual([], list((ROOT / "src" / "lfs").rglob("mod.rs")))
 
+        fn_pat = re.compile(r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([a-zA-Z0-9_]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)", re.S)
+        for path in [TEST_MAIN, *sorted(TEST_SUPPORT.glob("*.rs"))]:
+            txt = path.read_text(encoding="utf-8")
+            for m in fn_pat.finditer(txt):
+                args = [a.strip() for a in m.group(2).split(",") if a.strip() and not a.strip().endswith("self")]
+                self.assertLessEqual(len(args), 7, f"{path.name}: fn {m.group(1)} exceeds 7 args ({len(args)})")
+
     def test_serde_deny_unknown_fields_on_all_deserialize_types(self) -> None:
         pattern = re.compile(r"#\[derive\([^\]]*Deserialize[^\]]*\)\]")
         deny_attr = re.compile(r"#\[serde\([^\]]*\bdeny_unknown_fields\b[^\]]*\)\]")

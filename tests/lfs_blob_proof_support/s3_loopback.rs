@@ -36,28 +36,30 @@ pub struct LoopbackS3 {
 static SHARED_S3: OnceLock<LoopbackS3> = OnceLock::new();
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+pub struct RealHookInput<'a> {
+    pub db_url: &'a str,
+    pub git_bin: &'a Path,
+    pub git_dir: &'a Path,
+    pub data_root: &'a Path,
+    pub git_obj_dir: Option<&'a str>,
+    pub git_alt_dirs: Option<&'a str>,
+    pub op: &'a Operation,
+    pub changes: &'a [RefChange],
+}
+
 /// Executes Rootyard's real production `browse::policy::validate_hook` pre-receive gate on a
 /// dedicated OS thread with the exact child hook environment (`ROOTYARD_DATABASE_URL`,
 /// `ROOTYARD_GIT_PATH`, `ROOTYARD_GIT_DIR`, `ROOTYARD_DATA_ROOT`, `GIT_OBJECT_DIRECTORY`,
 /// `GIT_ALTERNATE_OBJECT_DIRECTORIES`) serialized under `ENV_LOCK`.
-pub fn run_real_validate_hook(
-    db_url: &str,
-    git_bin: &Path,
-    git_dir: &Path,
-    data_root: &Path,
-    git_obj_dir: Option<&str>,
-    git_alt_dirs: Option<&str>,
-    op: &Operation,
-    changes: &[RefChange],
-) -> Result<()> {
-    let db_url = db_url.to_owned();
-    let git_bin = git_bin.to_path_buf();
-    let git_dir = git_dir.to_path_buf();
-    let data_root = data_root.to_path_buf();
-    let git_obj_dir = git_obj_dir.map(str::to_owned);
-    let git_alt_dirs = git_alt_dirs.map(str::to_owned);
-    let op = op.clone();
-    let changes = changes.to_vec();
+pub fn run_real_validate_hook(inp: RealHookInput<'_>) -> Result<()> {
+    let db_url = inp.db_url.to_owned();
+    let git_bin = inp.git_bin.to_path_buf();
+    let git_dir = inp.git_dir.to_path_buf();
+    let data_root = inp.data_root.to_path_buf();
+    let git_obj_dir = inp.git_obj_dir.map(str::to_owned);
+    let git_alt_dirs = inp.git_alt_dirs.map(str::to_owned);
+    let op = inp.op.clone();
+    let changes = inp.changes.to_vec();
 
     std::thread::spawn(move || {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

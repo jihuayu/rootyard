@@ -20,8 +20,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::{
-    LoopbackS3, RunningProdLfsServer, TestActor, copy_dir_recursive, issue_actor, run_git_ok, run_git_raw,
-    run_real_validate_hook,
+    LoopbackS3, RealHookInput, RunningProdLfsServer, TestActor, copy_dir_recursive, issue_actor, run_git_ok,
+    run_git_raw, run_real_validate_hook,
 };
 
 pub struct OrgRestartSharedHoldInput<'a> {
@@ -240,20 +240,20 @@ pub async fn exercise_org_authority_restart_recovery_hydration_and_shared_holds(
         Some(IdempotencyIntent { key_sha256: pre_push_uuid.to_string(), request_sha256: "0".repeat(64) }),
     )?;
     let stale_hook_err = tokio::task::block_in_place(|| {
-        run_real_validate_hook(
-            &restarted.state.config.database_url,
-            &restarted.state.config.git,
-            &xfer_bare,
-            &restarted.state.storage.root,
-            None,
-            None,
-            &stale_op,
-            &[RefChange {
+        run_real_validate_hook(RealHookInput {
+            db_url: &restarted.state.config.database_url,
+            git_bin: &restarted.state.config.git,
+            git_dir: &xfer_bare,
+            data_root: &restarted.state.storage.root,
+            git_obj_dir: None,
+            git_alt_dirs: None,
+            op: &stale_op,
+            changes: &[RefChange {
                 ref_name: "refs/heads/main".into(),
                 old_oid: "0".repeat(40),
                 new_oid: pre_commit_oid.clone(),
             }],
-        )
+        })
     })
     .expect_err("stale pre-transfer push attestation replay must fail closed");
     let _ = journal::finish(&stale_op);

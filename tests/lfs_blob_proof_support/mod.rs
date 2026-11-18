@@ -28,7 +28,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-pub use s3_loopback::{LoopbackS3, run_real_validate_hook};
+pub use s3_loopback::{LoopbackS3, RealHookInput, run_real_validate_hook};
 
 #[derive(Clone, Debug)]
 pub struct TestActor {

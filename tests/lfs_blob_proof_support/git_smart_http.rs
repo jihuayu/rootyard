@@ -26,7 +26,7 @@ use tokio::net::TcpListener;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use super::run_real_validate_hook;
+use super::{RealHookInput, run_real_validate_hook};
 
 pub fn production_s4_test_router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -262,16 +262,16 @@ async fn smart_git_fallback(
             let reply = match op_res {
                 Ok(op) => {
                     let res = tokio::task::block_in_place(|| {
-                        run_real_validate_hook(
-                            &st.config.database_url,
-                            &st.config.git,
-                            &bdir,
-                            &st.storage.root,
-                            wire_in.git_object_dir.as_deref(),
-                            wire_in.git_alternate_object_dirs.as_deref(),
-                            &op,
-                            &changes,
-                        )
+                        run_real_validate_hook(RealHookInput {
+                            db_url: &st.config.database_url,
+                            git_bin: &st.config.git,
+                            git_dir: &bdir,
+                            data_root: &st.storage.root,
+                            git_obj_dir: wire_in.git_object_dir.as_deref(),
+                            git_alt_dirs: wire_in.git_alternate_object_dirs.as_deref(),
+                            op: &op,
+                            changes: &changes,
+                        })
                     });
                     let _ = journal::finish(&op);
                     match res {
