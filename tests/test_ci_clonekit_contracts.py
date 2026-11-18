@@ -22,8 +22,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FOCUSED_HELPER = ROOT / "scripts" / "ci_clonekit_focused_receipt.sh"
+INTEGRATION_HELPER = ROOT / "scripts" / "ci_clonekit_integration_receipt.sh"
 FOCUSED_STEP = "Clippy and CloneKit unit plus Smart-HTTP integration tests"
 FOCUSED_RECEIPT = "test-results/ci-clonekit/focused-command.json"
+INTEGRATION_RECEIPT = "test-results/ci-clonekit/integration-failure.json"
 FOCUSED_GROUPS = ("clippy", "lib", "integration")
 FOCUSED_COMMANDS = (
     "cargo clippy --locked --lib --test ci_clonekit -- -D warnings",
@@ -43,7 +45,9 @@ ALL_OWNED_TEXT_FILES = (
     *CLONEKIT_RUST_FILES,
     ROOT / "scripts" / "eval_ci_clonekit.py",
     FOCUSED_HELPER,
+    INTEGRATION_HELPER,
     ROOT / "tests" / "test_ci_clonekit_contracts.py",
+    ROOT / "tests" / "test_ci_clonekit_projection.py",
     ROOT / "docs" / "ci-clonekit.md",
     ROOT / ".github" / "workflows" / "ci-clonekit.yml",
 )
@@ -101,6 +105,7 @@ class CloneKitContractsTest(unittest.TestCase):
         self.assertIn("workflow_dispatch:", wf)
         self.assertNotIn("\npush:", wf)
         self.assertIn("      - 'scripts/ci_clonekit_focused_receipt.sh'", wf)
+        self.assertIn("      - 'scripts/ci_clonekit_integration_receipt.sh'", wf)
         for cmd in (
             "scripts/install_ci_cargo_fork.sh install",
             "scripts/install_ci_cargo_fork.sh verify",
@@ -111,6 +116,7 @@ class CloneKitContractsTest(unittest.TestCase):
             "cargo test --locked --test ci_clonekit",
             "--ignored --test-threads=1",
             "scripts/eval_ci_clonekit.py --scale full",
+            "scripts/ci_clonekit_integration_receipt.sh \"$integration_receipt\"",
         ):
             self.assertIn(cmd, wf)
 
@@ -209,16 +215,23 @@ class FocusedCommandReceiptTest(unittest.TestCase):
         script = self.focused_script()
         self.assertTrue(script.startswith("set -euo pipefail"))
         self.assertIn("focused_receipt=" + FOCUSED_RECEIPT, script)
+        self.assertIn("integration_receipt=" + INTEGRATION_RECEIPT, script)
         self.assertEqual(1, script.count("trap '"))
         self.assertNotIn("|| true", script)
         self.assertNotIn("continue-on-error", script)
 
         lines = script.splitlines()
+        command_lines = [line for line in lines if line.startswith("cargo ")]
+        commands = [line.split(" 2>&1 |", 1)[0] for line in command_lines]
+        self.assertEqual(commands, list(FOCUSED_COMMANDS))
+        self.assertNotIn("2>&1 |", command_lines[0])
+        self.assertNotIn("2>&1 |", command_lines[1])
         self.assertEqual(
-            ["cargo " + line.split("cargo ", 1)[1] for line in lines if line.startswith("cargo ")],
-            list(FOCUSED_COMMANDS),
+            "cargo test --locked --test ci_clonekit 2>&1 | "
+            "scripts/ci_clonekit_integration_receipt.sh \"$integration_receipt\"",
+            command_lines[2],
         )
-        for group, command in zip(FOCUSED_GROUPS, FOCUSED_COMMANDS):
+        for group, command in zip(FOCUSED_GROUPS, command_lines):
             self.assertEqual(f"focused_group={group}", lines[lines.index(command) - 1])
 
         trap = self.trap_line()
@@ -234,6 +247,7 @@ class FocusedCommandReceiptTest(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, trap)
         self.assertTrue(os.access(FOCUSED_HELPER, os.X_OK))
+        self.assertTrue(os.access(INTEGRATION_HELPER, os.X_OK))
 
     def test_helper_projects_each_failure_and_success_without_raw_values(self) -> None:
         with tempfile.TemporaryDirectory() as td:

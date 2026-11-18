@@ -9,8 +9,10 @@ on:
       - 'src/ref_store/**'
       - 'tests/ci_clonekit.rs'
       - 'tests/test_ci_clonekit_contracts.py'
+      - 'tests/test_ci_clonekit_projection.py'
       - 'scripts/eval_ci_clonekit.py'
       - 'scripts/ci_clonekit_focused_receipt.sh'
+      - 'scripts/ci_clonekit_integration_receipt.sh'
       - 'docs/ci-clonekit.md'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -107,12 +109,14 @@ jobs:
           python3 -m unittest -v \
             tests.test_ci_workflow_triggers \
             tests.test_ci_cargo_fork_workflows \
-            tests.test_ci_clonekit_contracts
+            tests.test_ci_clonekit_contracts \
+            tests.test_ci_clonekit_projection
 
       - name: Clippy and CloneKit unit plus Smart-HTTP integration tests
         run: |
           set -euo pipefail
           focused_receipt=test-results/ci-clonekit/focused-command.json
+          integration_receipt=test-results/ci-clonekit/integration-failure.json
           focused_group=
           trap 'status=$?; trap - EXIT; set +e; scripts/ci_clonekit_focused_receipt.sh "${focused_group:-invalid}" "$status" "$focused_receipt"; receipt_status=$?; if [ "$status" -ne 0 ]; then exit "$status"; fi; [ "$receipt_status" -eq 0 ] || exit 1; exit 0' EXIT
           focused_group=clippy
@@ -120,7 +124,7 @@ jobs:
           focused_group=lib
           cargo test --locked --lib ci_checkouts::clonekit
           focused_group=integration
-          cargo test --locked --test ci_clonekit
+          cargo test --locked --test ci_clonekit 2>&1 | scripts/ci_clonekit_integration_receipt.sh "$integration_receipt"
 
       - name: Start job-owned Garage 2.1 S3 fixture
         timeout-minutes: 10
