@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::mtls_wire::{MtlsRaftClusterConfig, build_mtls_client_config};
-use super::types::{PairedBackupError, sha256_json_tagged, validate_hex64};
+use super::types::{PairedBackupError, validate_hex64};
 
 pub const PEER_ATTESTOR_KEY_FILE: &str = "peer_attestor.pk8";
 const MAX_ATTEST_FRAME_BYTES: usize = 16 * 1024 * 1024;

@@ -130,14 +130,12 @@ async fn remaining_other_client_backends(
 
 /// Verify that no concurrent PostgreSQL write session or open transaction exists.
 pub async fn verify_no_active_pg_writers(client: &(impl GenericClient + Sync)) -> Result<(), PairedBackupError> {
-    let sql = format!(
-        "SELECT count(*)::bigint FROM pg_stat_activity \
+    let sql = "SELECT count(*)::bigint FROM pg_stat_activity \
          WHERE datname = current_database() AND pid <> pg_backend_pid() \
            AND backend_type = 'client backend' \
            AND (backend_xid IS NOT NULL \
-                OR state IN ('active','idle in transaction','idle in transaction (aborted)'))"
-    );
-    let count: i64 = client.query_one(&sql, &[]).await.map_err(pg_err)?.get(0);
+                OR state IN ('active','idle in transaction','idle in transaction (aborted)'))";
+    let count: i64 = client.query_one(sql, &[]).await.map_err(pg_err)?.get(0);
     if count != 0 {
         return Err(PairedBackupError::FreezeNotHeld(
             "concurrent PostgreSQL write session/transaction active; refusing cutpoint capture",

@@ -38,7 +38,6 @@ struct PersistedRaftCmd {
 #[derive(Clone, Debug)]
 struct AuthenticatedVoterInfo {
     voter_uuid: Uuid,
-    cert_sha256: String,
     last_log_index: u64,
     current_term: u64,
 }
@@ -203,7 +202,6 @@ impl MtlsLiveRaftBackend {
                 node_id,
                 AuthenticatedVoterInfo {
                     voter_uuid: expected_uuid,
-                    cert_sha256: cert_sha,
                     last_log_index: m["last_log_index"].as_u64().unwrap_or(0),
                     current_term: m["current_term"].as_u64().unwrap_or(1).max(1),
                 },
