@@ -1,11 +1,10 @@
 use super::{
-    PublicAttemptLookup, PublicAttemptRequest, RawAttempt, RawRealm, RawSnapshot, RawWrapper, SELECT_SNAPSHOT, evaluate,
+    PublicAttemptLookup, PublicAttemptRequest, RawAttempt, RawSnapshot, RawWrapper, SELECT_SNAPSHOT, evaluate,
 };
 use crate::ref_store::{
     CommitMode, GitObjectFormat, OperationState, RefStoreError, RequestDigest,
     core::pack_commit::{PackCommitError, PackCommitRejectCode},
 };
-use serde_json::{Value, json};
 use uuid::Uuid;
 
 fn id(value: u128) -> Uuid {
@@ -97,41 +96,6 @@ fn request() -> PublicAttemptRequest {
     }
 }
 
-fn realm() -> RawRealm {
-    RawRealm {
-        repository_id: repo(),
-        repository_owner_id: owner(),
-        repository_name: "public-attempt".into(),
-        repository_object_format: "sha1".into(),
-        repository_state: "ready".into(),
-        repository_storage_backend: "pg_refstore".into(),
-        repository_transition_state: "stable".into(),
-        repository_archived_at: None,
-        repository_deleted_at: None,
-        gate_tenant_id: Some(owner()),
-        gate_object_format: Some("sha1".into()),
-        gate_history_incarnation: Some(history()),
-        gate_authority_epoch: Some(1),
-        gate_group_epoch: Some(2),
-        gate_revision: Some(2),
-        serving_owner_id: Some(owner()),
-        serving_name: Some("public-attempt".into()),
-        serving_object_format: Some("sha1".into()),
-        serving_history_incarnation: Some(history()),
-        serving_authority_epoch: Some(1),
-        serving_group_epoch: Some(2),
-        serving_backend_identity: Some(backend()),
-        serving_state: Some("ready".into()),
-        protocol_tenant_id: Some(owner()),
-        protocol_object_format: Some("sha1".into()),
-        protocol_history_incarnation: Some(history()),
-        protocol_authority_epoch: Some(1),
-        protocol_group_epoch: Some(2),
-        protocol_decision_required: Some(true),
-        cluster_incarnation: Some(restore()),
-    }
-}
-
 fn wrapper(current_slot: i16, state: &str) -> RawWrapper {
     RawWrapper {
         repository_id: repo(),
@@ -158,36 +122,6 @@ fn wrapper(current_slot: i16, state: &str) -> RawWrapper {
     }
 }
 
-fn committed_payload(revision: i64) -> Value {
-    json!({
-        "kind": "committed",
-        "repository_id": repo(),
-        "revision": revision,
-        "head_ref": "refs/heads/main",
-        "mode": "atomic",
-        "refs": [],
-        "registrations": [],
-        "rejection": null
-    })
-}
-
-fn rejected_payload(revision: i64) -> Value {
-    json!({
-        "kind": "rejected",
-        "repository_id": repo(),
-        "revision": revision,
-        "head_ref": null,
-        "mode": "atomic",
-        "refs": [],
-        "registrations": [],
-        "rejection": {"code": "revision_mismatch", "detail": "gate revision differs"}
-    })
-}
-
-fn cancelled_terminal() -> Value {
-    json!({"state": "cancelled", "reason": "cancel_requested"})
-}
-
 fn base_attempt(slot: i16, private_id: Uuid, plan: RequestDigest, proof: RequestDigest, sequence: i64) -> RawAttempt {
     RawAttempt {
         slot,
@@ -201,18 +135,17 @@ fn base_attempt(slot: i16, private_id: Uuid, plan: RequestDigest, proof: Request
         operation_sequence: Some(sequence),
         operation_request_digest: Some(plan.as_hex()),
         operation_state: Some("pending".into()),
-        operation_terminal_result: None,
+        terminal_present: false,
+        terminal_cancelled_exact: false,
         event_id: None,
-        event_repository_id: None,
         event_revision: None,
-        event_outcome: None,
-        event_payload: None,
-        tombstone_operation_id: None,
-        tombstone_issuer_id: None,
-        tombstone_lane: None,
-        tombstone_sequence: None,
-        tombstone_request_digest: None,
-        lane_tombstone_operation_id: None,
+        event_outcome_matches: false,
+        event_body_matches: false,
+        tombstone_present: false,
+        tombstone_absent: true,
+        tombstone_matches_lane: false,
+        tombstone_exact_operation: false,
+        revision_mismatch_rejection: false,
     }
 }
 
@@ -231,40 +164,36 @@ fn pending_attempt(
 
 fn retired_attempt() -> RawAttempt {
     let mut attempt = base_attempt(0, private0(), plan0(), proof0(), 1);
-    let payload = rejected_payload(2);
     attempt.operation_state = Some("rejected".into());
-    attempt.operation_terminal_result = Some(payload.clone());
+    attempt.terminal_present = true;
     attempt.event_id = Some(event0());
-    attempt.event_repository_id = Some(repo());
     attempt.event_revision = Some(2);
-    attempt.event_outcome = Some("rejected".into());
-    attempt.event_payload = Some(payload);
+    attempt.event_outcome_matches = true;
+    attempt.event_body_matches = true;
+    attempt.revision_mismatch_rejection = true;
     attempt
 }
 
 fn committed_attempt() -> RawAttempt {
     let mut attempt = base_attempt(0, private0(), plan0(), proof0(), 1);
-    let payload = committed_payload(2);
     attempt.operation_state = Some("committed".into());
-    attempt.operation_terminal_result = Some(payload.clone());
+    attempt.terminal_present = true;
     attempt.event_id = Some(event1());
-    attempt.event_repository_id = Some(repo());
     attempt.event_revision = Some(2);
-    attempt.event_outcome = Some("committed".into());
-    attempt.event_payload = Some(payload);
+    attempt.event_outcome_matches = true;
+    attempt.event_body_matches = true;
     attempt
 }
 
 fn cancelled_attempt() -> RawAttempt {
     let mut attempt = base_attempt(0, private0(), plan0(), proof0(), 1);
     attempt.operation_state = Some("cancelled".into());
-    attempt.operation_terminal_result = Some(cancelled_terminal());
-    attempt.tombstone_operation_id = Some(private0());
-    attempt.tombstone_issuer_id = Some(issuer());
-    attempt.tombstone_lane = Some("lane".into());
-    attempt.tombstone_sequence = Some(1);
-    attempt.tombstone_request_digest = Some(plan0().as_hex());
-    attempt.lane_tombstone_operation_id = Some(private0());
+    attempt.terminal_present = true;
+    attempt.terminal_cancelled_exact = true;
+    attempt.tombstone_present = true;
+    attempt.tombstone_absent = false;
+    attempt.tombstone_matches_lane = true;
+    attempt.tombstone_exact_operation = true;
     attempt
 }
 
@@ -275,7 +204,7 @@ fn snapshot(wrapper: RawWrapper, attempts: Vec<RawAttempt>) -> RawSnapshot {
         private_occupied: false,
         legacy_operation: false,
         legacy_cancellation: false,
-        realm: Some(realm()),
+        realm_matches: true,
     }
 }
 
@@ -286,7 +215,7 @@ fn empty_snapshot() -> RawSnapshot {
         private_occupied: false,
         legacy_operation: false,
         legacy_cancellation: false,
-        realm: Some(realm()),
+        realm_matches: true,
     }
 }
 
@@ -372,12 +301,12 @@ fn committed_requires_the_exact_event_and_terminal_body() {
         other => panic!("expected committed, got {other:?}"),
     }
 
-    let mut wrong_payload = committed_attempt();
-    wrong_payload.event_payload = Some(committed_payload(3));
-    assert_ledger(evaluate(snapshot(wrapper(0, "committed"), vec![wrong_payload]), &request()));
+    let mut wrong_body = committed_attempt();
+    wrong_body.event_body_matches = false;
+    assert_ledger(evaluate(snapshot(wrapper(0, "committed"), vec![wrong_body]), &request()));
 
     let mut wrong_outcome = committed_attempt();
-    wrong_outcome.event_outcome = Some("rejected".into());
+    wrong_outcome.event_outcome_matches = false;
     assert_ledger(evaluate(snapshot(wrapper(0, "committed"), vec![wrong_outcome]), &request()));
 
     assert_ledger(evaluate(snapshot(wrapper(0, "committed"), vec![retired_attempt()]), &request()));
@@ -401,16 +330,23 @@ fn cancelled_requires_the_current_private_id_and_exact_tombstone() {
     assert_ledger(evaluate(snapshot(wrong_current, vec![cancelled_attempt()]), &request()));
 
     let mut wrong_tombstone = cancelled_attempt();
-    wrong_tombstone.tombstone_request_digest = Some(plan1().as_hex());
+    wrong_tombstone.tombstone_exact_operation = false;
     assert_ledger(evaluate(snapshot(wrapper(0, "cancelled"), vec![wrong_tombstone]), &request()));
 
     let mut wrong_lane_tombstone = cancelled_attempt();
-    wrong_lane_tombstone.lane_tombstone_operation_id = Some(private1());
+    wrong_lane_tombstone.tombstone_matches_lane = false;
     assert_ledger(evaluate(snapshot(wrapper(0, "cancelled"), vec![wrong_lane_tombstone]), &request()));
 
     let mut wrong_terminal = cancelled_attempt();
-    wrong_terminal.operation_terminal_result = Some(json!({"state": "cancelled", "reason": "other"}));
+    wrong_terminal.terminal_cancelled_exact = false;
     assert_ledger(evaluate(snapshot(wrapper(0, "cancelled"), vec![wrong_terminal]), &request()));
+
+    let mut no_tombstone = cancelled_attempt();
+    no_tombstone.tombstone_present = false;
+    no_tombstone.tombstone_absent = true;
+    no_tombstone.tombstone_matches_lane = false;
+    no_tombstone.tombstone_exact_operation = false;
+    assert_ledger(evaluate(snapshot(wrapper(0, "cancelled"), vec![no_tombstone]), &request()));
 }
 
 #[test]
@@ -420,13 +356,12 @@ fn cancelled_slot_one_binds_only_the_current_attempt() {
     let mut cancelled = base_attempt(1, private1(), plan1(), proof1(), 2);
     cancelled.base_revision = 2;
     cancelled.operation_state = Some("cancelled".into());
-    cancelled.operation_terminal_result = Some(cancelled_terminal());
-    cancelled.tombstone_operation_id = Some(private1());
-    cancelled.tombstone_issuer_id = Some(issuer());
-    cancelled.tombstone_lane = Some("lane".into());
-    cancelled.tombstone_sequence = Some(2);
-    cancelled.tombstone_request_digest = Some(plan1().as_hex());
-    cancelled.lane_tombstone_operation_id = Some(private1());
+    cancelled.terminal_present = true;
+    cancelled.terminal_cancelled_exact = true;
+    cancelled.tombstone_present = true;
+    cancelled.tombstone_absent = false;
+    cancelled.tombstone_matches_lane = true;
+    cancelled.tombstone_exact_operation = true;
 
     let result = evaluate(snapshot(current.clone(), vec![retired_attempt(), cancelled.clone()]), &request())
         .expect("valid cancelled slot one");
@@ -445,56 +380,43 @@ fn cancelled_slot_one_binds_only_the_current_attempt() {
 
 #[test]
 fn retired_attempt_must_be_the_advanced_revision_mismatch_rejection() {
-    let mut wrong_code = retired_attempt();
-    let mut payload = rejected_payload(2);
-    payload["rejection"]["code"] = json!("old_oid_mismatch");
-    wrong_code.operation_terminal_result = Some(payload.clone());
-    wrong_code.event_payload = Some(payload);
-    assert_ledger(evaluate(
-        snapshot(wrapper(1, "pending"), vec![wrong_code, pending_attempt(1, private1(), plan1(), proof1(), 2, 2)]),
-        &request(),
-    ));
-
     let mut wrong_revision = retired_attempt();
     wrong_revision.event_revision = Some(1);
-    let mut payload = rejected_payload(1);
-    payload["revision"] = json!(1);
-    wrong_revision.operation_terminal_result = Some(payload.clone());
-    wrong_revision.event_payload = Some(payload);
     assert_ledger(evaluate(
         snapshot(wrapper(1, "pending"), vec![wrong_revision, pending_attempt(1, private1(), plan1(), proof1(), 2, 2)]),
         &request(),
     ));
 
-    let mut wrong_registrations = retired_attempt();
-    let mut payload = rejected_payload(2);
-    payload["registrations"] = json!([{"pack_id": id(30)}]);
-    wrong_registrations.operation_terminal_result = Some(payload.clone());
-    wrong_registrations.event_payload = Some(payload);
+    let mut wrong_retirement = retired_attempt();
+    wrong_retirement.revision_mismatch_rejection = false;
     assert_ledger(evaluate(
         snapshot(
             wrapper(1, "pending"),
-            vec![wrong_registrations, pending_attempt(1, private1(), plan1(), proof1(), 2, 2)],
+            vec![wrong_retirement, pending_attempt(1, private1(), plan1(), proof1(), 2, 2)],
         ),
+        &request(),
+    ));
+
+    let mut wrong_body = retired_attempt();
+    wrong_body.event_body_matches = false;
+    assert_ledger(evaluate(
+        snapshot(wrapper(1, "pending"), vec![wrong_body, pending_attempt(1, private1(), plan1(), proof1(), 2, 2)]),
+        &request(),
+    ));
+
+    let mut wrong_state = retired_attempt();
+    wrong_state.operation_state = Some("committed".into());
+    assert_ledger(evaluate(
+        snapshot(wrapper(1, "pending"), vec![wrong_state, pending_attempt(1, private1(), plan1(), proof1(), 2, 2)]),
         &request(),
     ));
 }
 
 #[test]
-fn stale_or_inconsistent_realm_is_refused() {
-    let mut stale_restore =
-        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
-    stale_restore.realm.as_mut().unwrap().cluster_incarnation = Some(id(99));
-    assert_ledger(evaluate(stale_restore, &request()));
-
-    let mut stale_backend =
-        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
-    stale_backend.realm.as_mut().unwrap().serving_backend_identity = Some("f".repeat(64));
-    assert_ledger(evaluate(stale_backend, &request()));
-
-    let mut archived = snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
-    archived.realm.as_mut().unwrap().repository_archived_at = Some("2026-11-19T00:00:00Z".into());
-    assert_ledger(evaluate(archived, &request()));
+fn stale_realm_is_refused() {
+    let mut stale = snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]);
+    stale.realm_matches = false;
+    assert_ledger(evaluate(stale, &request()));
 }
 
 #[test]
@@ -623,8 +545,13 @@ fn attempt_binding_and_event_evidence_are_fail_closed() {
     assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![pending_with_event]), &request()));
 
     let mut partial_tombstone = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
-    partial_tombstone.tombstone_operation_id = Some(private0());
+    partial_tombstone.tombstone_present = true;
+    partial_tombstone.tombstone_absent = false;
     assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![partial_tombstone]), &request()));
+
+    let mut pending_terminal = pending_attempt(0, private0(), plan0(), proof0(), 1, 1);
+    pending_terminal.terminal_present = true;
+    assert_ledger(evaluate(snapshot(wrapper(0, "pending"), vec![pending_terminal]), &request()));
 }
 
 #[test]
@@ -660,7 +587,44 @@ fn stored_wrapper_and_attempt_evidence_is_fail_closed() {
 }
 
 #[test]
-fn snapshot_sql_is_one_read_only_statement_with_the_required_evidence() {
+fn debug_output_is_redacted() {
+    let lookup = evaluate(
+        snapshot(wrapper(0, "pending"), vec![pending_attempt(0, private0(), plan0(), proof0(), 1, 1)]),
+        &request(),
+    )
+    .expect("valid pending lookup");
+    let lookup_debug = format!("{lookup:?}");
+    for secret in [
+        public().to_string(),
+        private0().to_string(),
+        plan0().as_hex(),
+        proof0().as_hex(),
+        wire().as_hex(),
+        event0().to_string(),
+    ] {
+        assert!(!lookup_debug.contains(secret.as_str()), "lookup Debug leaked {secret}");
+    }
+    assert!(lookup_debug.contains("Pending"));
+    assert!(lookup_debug.contains("slot: 0"));
+
+    let request_debug = format!("{:?}", request());
+    for secret in [
+        repo().to_string(),
+        public().to_string(),
+        owner().to_string(),
+        issuer().to_string(),
+        history().to_string(),
+        restore().to_string(),
+        wire().as_hex(),
+        backend(),
+    ] {
+        assert!(!request_debug.contains(secret.as_str()), "request Debug leaked {secret}");
+    }
+    assert!(request_debug.contains("Atomic"));
+}
+
+#[test]
+fn snapshot_sql_is_one_read_only_statement_with_finite_evidence() {
     let sql = SELECT_SNAPSHOT.to_ascii_lowercase();
     for table in [
         "ref_store_public_operations",
@@ -672,10 +636,31 @@ fn snapshot_sql_is_one_read_only_statement_with_the_required_evidence() {
         "ref_store_serving_repositories",
         "ref_store_core_protocol_repos",
         "cluster_authority",
+        "repositories",
     ] {
         assert!(sql.contains(table), "snapshot SQL is missing {table}");
     }
     assert!(sql.contains("rootyard_ref_store_attempt_has_binding"));
+    for evidence in [
+        "terminal_present",
+        "terminal_cancelled_exact",
+        "event_outcome_matches",
+        "event_body_matches",
+        "revision_mismatch_rejection",
+        "tombstone_present",
+        "tombstone_absent",
+        "tombstone_matches_lane",
+        "tombstone_exact_operation",
+        "realm_matches",
+    ] {
+        assert!(sql.contains(evidence), "snapshot SQL is missing {evidence}");
+    }
+    for realm in ["r.archived_at", "s.backend_identity", "p.decision_required", "c.incarnation"] {
+        assert!(sql.contains(realm), "snapshot SQL is missing realm evidence {realm}");
+    }
+    for payload in ["operation_terminal_result", "event_payload", "tombstone_request_digest"] {
+        assert!(!sql.contains(payload), "snapshot SQL still projects payload column {payload}");
+    }
     for forbidden in [" insert ", " update ", " delete ", " for update", " for share", "pg_advisory", ";"] {
         assert!(!sql.contains(forbidden), "snapshot SQL contains forbidden {forbidden:?}");
     }

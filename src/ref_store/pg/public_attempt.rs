@@ -18,11 +18,15 @@
 //!
 //! One statement reads the wrapper, both attempt candidates, the migration-138
 //! operation, the migration-139 event, the migration-147 producer binding, the
-//! cancellation tombstone and the current realm from one snapshot. A missing
+//! cancellation tombstone and the current realm from one snapshot. The durable
+//! terminal/event payload JSON never crosses into Rust: the SELECT projects the
+//! same finite predicates migration 152's verifier evaluates (terminal present,
+//! exact cancelled terminal, event outcome/body binding, revision-mismatch
+//! retirement and tombstone key/exactness) as non-NULL booleans. A missing
 //! migration 152 is reported separately as unsupported before any relation is
-//! referenced. A wrapper from a stale realm, a partially written attempt, an
-//! unknown state, a mismatched binding/event/tombstone or a second current
-//! candidate is a fixed ledger-integrity refusal, never a weaker replay.
+//! referenced. A wrapper from a stale realm, a false/unknown predicate, a
+//! partially written attempt or a second current candidate is a fixed
+//! ledger-integrity refusal, never a weaker replay.
 //!
 //! The result never returns a legacy operation or cancellation row: an
 //! identifier that is privately claimed is a [`PublicAttemptLookup::PrivateIdentifier`]
@@ -30,20 +34,24 @@
 //! marker for the separately authorized legacy path. Terminal JSON is verified
 //! against its event but is not re-exposed here; an authorized caller can read
 //! the returned current private operation through the normal core reader.
+//! Error values and the lookup types' `Debug` output are fixed/redacted rather
+//! than carrying PostgreSQL text, IDs, digests or payload bodies.
 //!
 //! A current attempt must agree with its wrapper state. In particular, a slot
 //! zero private rejection whose wrapper is still pending is refused closed
 //! rather than returned as a final rejection; a committed/retired slot one is
 //! returned only from the current slot after the slot-zero revision-mismatch
 //! retirement has been proved.
-use super::{bound, db_error};
+use super::bound;
 use crate::ref_store::{
     CommitMode, GitObjectFormat, IssuerLane, OperationState, PgRefStore, RefStoreError, RequestDigest,
     core::pack_commit::{PackCommitError, PackCommitRejectCode, PackCommitRejection},
 };
 use serde::Deserialize;
+use serde_json::Value;
+use std::fmt;
 use tokio::time::{Instant, timeout_at};
-use tokio_postgres::Transaction;
+use tokio_postgres::{Transaction, error::SqlState};
 use uuid::Uuid;
 
 /// Migration 152 is the compatibility probe, not a second authority. The
@@ -60,6 +68,12 @@ const SCHEMA_PROBE: &str = "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE 
 /// plain reads; the migration-152 binding predicate is a SQL `STABLE` function
 /// so this adapter reuses the reviewed durable check instead of inventing a
 /// second binding vocabulary.
+///
+/// Every projected predicate is a non-NULL boolean. The terminal/event payload
+/// JSON stays inside PostgreSQL: it is compared with `IS [NOT] DISTINCT FROM`
+/// only inside the finite booleans below. Required equalities are gated by
+/// explicit presence predicates, so a missing event/terminal cannot become a
+/// tautological NULL-equality success.
 const SELECT_SNAPSHOT: &str = r#"
 SELECT jsonb_build_object(
     'wrapper', (
@@ -81,16 +95,35 @@ SELECT jsonb_build_object(
                    o.sequence AS operation_sequence,
                    o.request_digest AS operation_request_digest,
                    o.state AS operation_state,
-                   o.terminal_result AS operation_terminal_result,
-                   e.event_id, e.repository_id AS event_repository_id,
-                   e.revision AS event_revision, e.outcome AS event_outcome,
-                   e.payload AS event_payload,
-                   c.operation_id AS tombstone_operation_id,
-                   c.issuer_id AS tombstone_issuer_id,
-                   c.lane AS tombstone_lane,
-                   c.sequence AS tombstone_sequence,
-                   c.request_digest AS tombstone_request_digest,
-                   k.operation_id AS lane_tombstone_operation_id
+                   o.terminal_result IS NOT NULL AS terminal_present,
+                   COALESCE(o.terminal_result =
+                       '{"state":"cancelled","reason":"cancel_requested"}'::jsonb, false)
+                       AS terminal_cancelled_exact,
+                   e.event_id,
+                   e.revision AS event_revision,
+                   COALESCE(e.event_id IS NOT NULL AND e.outcome = o.state, false)
+                       AS event_outcome_matches,
+                   COALESCE(e.event_id IS NOT NULL
+                            AND e.payload IS NOT DISTINCT FROM o.terminal_result
+                            AND e.payload->>'kind' = o.state
+                            AND e.payload->'repository_id' = to_jsonb(w.repository_id)
+                            AND e.payload->'revision' = to_jsonb(e.revision), false)
+                       AS event_body_matches,
+                   COALESCE(c.operation_id IS NOT NULL, false) AS tombstone_present,
+                   (c.operation_id IS NULL AND k.operation_id IS NULL) AS tombstone_absent,
+                   COALESCE(c.operation_id IS NOT NULL AND c.operation_id = k.operation_id, false)
+                       AS tombstone_matches_lane,
+                   COALESCE(c.operation_id IS NOT NULL
+                            AND c.operation_id = a.private_id
+                            AND c.issuer_id = o.issuer_id
+                            AND c.lane = o.lane
+                            AND c.sequence = o.sequence
+                            AND c.request_digest = o.request_digest, false)
+                       AS tombstone_exact_operation,
+                   COALESCE(e.event_id IS NOT NULL
+                            AND e.payload#>>'{rejection,code}' = 'revision_mismatch'
+                            AND e.payload->'registrations' = '[]'::jsonb, false)
+                       AS revision_mismatch_rejection
               FROM ref_store_private_attempts a
               JOIN ref_store_public_operations w
                 ON w.repository_id=a.repository_id AND w.public_id=a.public_id
@@ -118,42 +151,28 @@ SELECT jsonb_build_object(
         SELECT 1 FROM ref_store_cancellations c
          WHERE c.repository_id=$1 AND c.operation_id=$2
     ),
-    'realm', (
-        SELECT to_jsonb(r) FROM (
-            SELECT r.id AS repository_id, r.owner_id AS repository_owner_id,
-                   r.name AS repository_name, r.object_format AS repository_object_format,
-                   r.state AS repository_state, r.storage_backend AS repository_storage_backend,
-                   r.transition_state AS repository_transition_state,
-                   r.archived_at AS repository_archived_at,
-                   r.deleted_at AS repository_deleted_at,
-                   g.tenant_id AS gate_tenant_id,
-                   g.object_format AS gate_object_format,
-                   g.history_incarnation AS gate_history_incarnation,
-                   g.authority_epoch AS gate_authority_epoch,
-                   g.group_epoch AS gate_group_epoch,
-                   g.revision AS gate_revision,
-                   s.owner_id AS serving_owner_id, s.name AS serving_name,
-                   s.object_format AS serving_object_format,
-                   s.history_incarnation AS serving_history_incarnation,
-                   s.authority_epoch AS serving_authority_epoch,
-                   s.group_epoch AS serving_group_epoch,
-                   s.backend_identity AS serving_backend_identity,
-                   s.state AS serving_state,
-                   p.tenant_id AS protocol_tenant_id,
-                   p.object_format AS protocol_object_format,
-                   p.history_incarnation AS protocol_history_incarnation,
-                   p.authority_epoch AS protocol_authority_epoch,
-                   p.group_epoch AS protocol_group_epoch,
-                   p.decision_required AS protocol_decision_required,
-                   c.incarnation AS cluster_incarnation
-              FROM repositories r
-              LEFT JOIN ref_store_core_gates g ON g.repository_id=r.id
-              LEFT JOIN ref_store_serving_repositories s ON s.repository_id=r.id
-              LEFT JOIN ref_store_core_protocol_repos p ON p.repository_id=r.id
-              LEFT JOIN public.cluster_authority c ON c.singleton
-             WHERE r.id=$1
-        ) r
-    )
+    'realm_matches', COALESCE((
+        SELECT (
+            r.archived_at IS NULL AND r.deleted_at IS NULL
+            AND (r.owner_id, r.object_format, r.state, r.storage_backend, r.transition_state)
+                = (w.admission_owner_id, w.object_format, 'ready', 'pg_refstore', 'stable')
+            AND (g.tenant_id, g.object_format, g.history_incarnation, g.authority_epoch, g.group_epoch)
+                = (w.admission_owner_id, w.object_format, w.history_incarnation, w.authority_epoch, w.group_epoch)
+            AND (s.owner_id, s.object_format, s.history_incarnation, s.authority_epoch, s.group_epoch)
+                = (g.tenant_id, g.object_format, g.history_incarnation, g.authority_epoch, g.group_epoch)
+            AND (p.tenant_id, p.object_format, p.history_incarnation, p.authority_epoch, p.group_epoch)
+                = (g.tenant_id, g.object_format, g.history_incarnation, g.authority_epoch, g.group_epoch)
+            AND s.state = 'ready' AND s.name = r.name AND p.decision_required
+            AND s.backend_identity = w.backend_identity AND c.incarnation = w.restore_incarnation
+        )
+          FROM ref_store_public_operations w
+          JOIN repositories r ON r.id = w.repository_id
+          JOIN ref_store_core_gates g ON g.repository_id = w.repository_id
+          JOIN ref_store_serving_repositories s ON s.repository_id = w.repository_id
+          JOIN ref_store_core_protocol_repos p ON p.repository_id = w.repository_id
+          JOIN public.cluster_authority c ON c.singleton
+         WHERE w.repository_id = $1 AND w.public_id = $2
+    ), false)
 ) AS snapshot
 "#;
 
@@ -163,7 +182,7 @@ SELECT jsonb_build_object(
 /// identity, lane, sequence, event id or caller-supplied state: those are
 /// durable evidence, never request inputs.
 #[allow(dead_code)] // Crate-private foundation: the ignored tests and the future serving boundary consume it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct PublicAttemptRequest {
     pub repository_id: Uuid,
     pub admission_owner_id: Uuid,
@@ -186,10 +205,30 @@ impl PublicAttemptRequest {
     }
 }
 
+impl fmt::Debug for PublicAttemptRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicAttemptRequest")
+            .field("repository_id", &Redacted)
+            .field("admission_owner_id", &Redacted)
+            .field("issuer_id", &Redacted)
+            .field("public_id", &Redacted)
+            .field("wire_digest", &Redacted)
+            .field("request_mode", &self.request_mode)
+            .field("backend_identity", &Redacted)
+            .field("object_format", &self.object_format)
+            .field("history_incarnation", &Redacted)
+            .field("authority_epoch", &self.authority_epoch)
+            .field("group_epoch", &self.group_epoch)
+            .field("restore_incarnation", &Redacted)
+            .finish()
+    }
+}
+
 /// Read-only routing answer. The two marker variants carry no legacy row,
 /// digest, terminal, event or private identity.
 #[allow(dead_code)] // Crate-private foundation: the ignored tests and the future serving boundary consume it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) enum PublicAttemptLookup {
     /// No public wrapper, private claim or legacy operation/cancellation is
     /// visible for this repository-scoped identifier.
@@ -207,20 +246,45 @@ pub(crate) enum PublicAttemptLookup {
     Cancelled(PublicAttemptEvidence),
 }
 
+impl fmt::Debug for PublicAttemptLookup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => formatter.write_str("Unknown"),
+            Self::PrivateIdentifier => formatter.write_str("PrivateIdentifier"),
+            Self::LegacyPath => formatter.write_str("LegacyPath"),
+            Self::Pending(evidence) => formatter.debug_tuple("Pending").field(evidence).finish(),
+            Self::Committed(evidence) => formatter.debug_tuple("Committed").field(evidence).finish(),
+            Self::Rejected(evidence) => formatter.debug_tuple("Rejected").field(evidence).finish(),
+            Self::Cancelled(evidence) => formatter.debug_tuple("Cancelled").field(evidence).finish(),
+        }
+    }
+}
+
 /// The durable current attempt plus, when current slot one is in use, the
 /// already retired slot-zero evidence.
 #[allow(dead_code)] // Crate-private foundation: the ignored tests and the future serving boundary consume it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct PublicAttemptEvidence {
     pub public_id: Uuid,
     pub current: PublicAttempt,
     pub retired: Option<PublicAttempt>,
 }
 
+impl fmt::Debug for PublicAttemptEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicAttemptEvidence")
+            .field("public_id", &Redacted)
+            .field("current", &self.current)
+            .field("retired", &self.retired)
+            .finish()
+    }
+}
+
 /// One immutable private attempt candidate whose operation/binding/event and
 /// optional tombstone were proved consistent in the same snapshot.
 #[allow(dead_code)] // Crate-private foundation: the ignored tests and the future serving boundary consume it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct PublicAttempt {
     pub slot: i16,
     pub private_id: Uuid,
@@ -234,6 +298,24 @@ pub(crate) struct PublicAttempt {
     pub event_revision: Option<i64>,
 }
 
+impl fmt::Debug for PublicAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicAttempt")
+            .field("slot", &self.slot)
+            .field("private_id", &Redacted)
+            .field("plan_digest", &Redacted)
+            .field("proof_digest", &Redacted)
+            .field("base_revision", &self.base_revision)
+            .field("lane", &Redacted)
+            .field("sequence", &self.sequence)
+            .field("state", &self.state)
+            .field("event_id", &self.event_id.map(|_| Redacted))
+            .field("event_revision", &self.event_revision)
+            .finish()
+    }
+}
+
 impl PgRefStore {
     /// Resolve one exact public attempt inside the caller-owned read transaction.
     ///
@@ -241,7 +323,8 @@ impl PgRefStore {
     /// installs the existing per-statement/lock timeout. The method performs no
     /// writes, row locks, sequence allocation, retries, Blob/Git IO or nested
     /// connection checkout. It must be called with a transaction the caller
-    /// treats as read-only; it never ends that transaction.
+    /// treats as read-only; it never ends that transaction. Database/protocol
+    /// failures are collapsed to a fixed error, never raw PostgreSQL text.
     #[allow(dead_code)] // No production caller until the wrapper entry is deliberately opened.
     pub(crate) async fn lookup_public_attempt(
         &self,
@@ -262,9 +345,14 @@ impl PgRefStore {
         request: &PublicAttemptRequest,
         deadline: Instant,
     ) -> Result<PublicAttemptLookup, PackCommitError> {
-        bound(tx, deadline).await.map_err(PackCommitError::from)?;
+        bound(tx, deadline).await.map_err(|error| {
+            PackCommitError::from(match error {
+                RefStoreError::Timeout => RefStoreError::Timeout,
+                _ => RefStoreError::Database("public attempt lookup database error"),
+            })
+        })?;
 
-        let schema = tx.query_one(SCHEMA_PROBE, &[]).await.map_err(db_error).map_err(PackCommitError::from)?;
+        let schema = tx.query_one(SCHEMA_PROBE, &[]).await.map_err(lookup_db_error).map_err(PackCommitError::from)?;
         if !schema.get::<_, bool>(0)
             || !schema.get::<_, bool>(1)
             || !schema.get::<_, bool>(2)
@@ -278,9 +366,9 @@ impl PgRefStore {
         let row = tx
             .query_one(SELECT_SNAPSHOT, &[&request.repository_id, &request.public_id])
             .await
-            .map_err(db_error)
+            .map_err(lookup_db_error)
             .map_err(PackCommitError::from)?;
-        let snapshot: serde_json::Value = row.get(0);
+        let snapshot: Value = row.get(0);
         let snapshot = serde_json::from_value::<RawSnapshot>(snapshot)
             .map_err(|_| ledger("public attempt lookup snapshot shape is not recognized"))?;
         evaluate(snapshot, request)
@@ -326,9 +414,9 @@ fn evaluate(snapshot: RawSnapshot, request: &PublicAttemptRequest) -> Result<Pub
     }
 
     let state = validate_wrapper(&wrapper, request)?;
-    let realm =
-        snapshot.realm.as_ref().ok_or_else(|| ledger("public attempt wrapper has no durable repository realm"))?;
-    validate_realm(realm, &wrapper)?;
+    if !snapshot.realm_matches {
+        return Err(stale_realm());
+    }
 
     if wrapper.current_slot != 0 && wrapper.current_slot != 1 {
         return Err(ledger("public operation current slot is not zero or one"));
@@ -455,54 +543,6 @@ fn validate_wrapper(wrapper: &RawWrapper, request: &PublicAttemptRequest) -> Res
     Ok(state)
 }
 
-fn validate_realm(realm: &RawRealm, wrapper: &RawWrapper) -> Result<(), PackCommitError> {
-    if realm.repository_id != wrapper.repository_id
-        || realm.repository_owner_id != wrapper.admission_owner_id
-        || realm.repository_object_format != wrapper.object_format
-        || realm.repository_state != "ready"
-        || realm.repository_storage_backend != "pg_refstore"
-        || realm.repository_transition_state != "stable"
-        || realm.repository_archived_at.is_some()
-        || realm.repository_deleted_at.is_some()
-    {
-        return Err(stale_realm());
-    }
-
-    if realm.gate_tenant_id != Some(wrapper.admission_owner_id)
-        || realm.gate_object_format.as_deref() != Some(wrapper.object_format.as_str())
-        || realm.gate_history_incarnation != Some(wrapper.history_incarnation)
-        || realm.gate_authority_epoch != Some(wrapper.authority_epoch)
-        || realm.gate_group_epoch != Some(wrapper.group_epoch)
-        || !matches!(realm.gate_revision, Some(revision) if revision > 0)
-    {
-        return Err(stale_realm());
-    }
-
-    if realm.serving_owner_id != realm.gate_tenant_id
-        || realm.serving_object_format != realm.gate_object_format
-        || realm.serving_history_incarnation != realm.gate_history_incarnation
-        || realm.serving_authority_epoch != realm.gate_authority_epoch
-        || realm.serving_group_epoch != realm.gate_group_epoch
-        || realm.serving_state.as_deref() != Some("ready")
-        || realm.serving_name.as_deref() != Some(realm.repository_name.as_str())
-        || realm.serving_backend_identity.as_deref() != Some(wrapper.backend_identity.as_str())
-    {
-        return Err(stale_realm());
-    }
-
-    if realm.protocol_tenant_id != realm.gate_tenant_id
-        || realm.protocol_object_format != realm.gate_object_format
-        || realm.protocol_history_incarnation != realm.gate_history_incarnation
-        || realm.protocol_authority_epoch != realm.gate_authority_epoch
-        || realm.protocol_group_epoch != realm.gate_group_epoch
-        || realm.protocol_decision_required != Some(true)
-        || realm.cluster_incarnation != Some(wrapper.restore_incarnation)
-    {
-        return Err(stale_realm());
-    }
-    Ok(())
-}
-
 struct AttemptFacts {
     slot: i16,
     private_id: Uuid,
@@ -512,9 +552,9 @@ struct AttemptFacts {
     lane: IssuerLane,
     sequence: i64,
     state: OperationState,
-    terminal: Option<serde_json::Value>,
     event_id: Option<Uuid>,
     event_revision: Option<i64>,
+    revision_mismatch_rejection: bool,
 }
 
 fn validate_attempt(attempt: &RawAttempt, wrapper: &RawWrapper) -> Result<AttemptFacts, PackCommitError> {
@@ -561,27 +601,26 @@ fn validate_attempt(attempt: &RawAttempt, wrapper: &RawWrapper) -> Result<Attemp
         "stored private attempt operation state is not recognized",
     )?;
 
-    let terminal = attempt.operation_terminal_result.clone();
     match state {
         OperationState::Pending => {
-            if terminal.is_some() {
+            if attempt.terminal_present {
                 return Err(ledger("pending private attempt carries a terminal result"));
             }
         }
         OperationState::Committed | OperationState::Rejected => {
-            if terminal.is_none() {
+            if !attempt.terminal_present {
                 return Err(ledger("terminal private attempt has no terminal result"));
             }
         }
         OperationState::Cancelled => {
-            if terminal.as_ref() != Some(&cancelled_terminal()) {
+            if !attempt.terminal_present || !attempt.terminal_cancelled_exact {
                 return Err(ledger("cancelled private attempt does not carry the exact cancel terminal"));
             }
         }
     }
 
-    validate_tombstone(attempt, operation_issuer, &lane, sequence, operation_digest, state)?;
-    ensure_event(attempt, wrapper.repository_id, state, terminal.as_ref())?;
+    validate_tombstone(attempt, state)?;
+    validate_event(attempt, state)?;
 
     Ok(AttemptFacts {
         slot: attempt.slot,
@@ -592,98 +631,51 @@ fn validate_attempt(attempt: &RawAttempt, wrapper: &RawWrapper) -> Result<Attemp
         lane,
         sequence,
         state,
-        terminal,
         event_id: attempt.event_id,
         event_revision: attempt.event_revision,
+        revision_mismatch_rejection: attempt.revision_mismatch_rejection,
     })
 }
 
-fn validate_tombstone(
-    attempt: &RawAttempt,
-    operation_issuer: Uuid,
-    lane: &IssuerLane,
-    sequence: i64,
-    operation_digest: RequestDigest,
-    state: OperationState,
-) -> Result<(), PackCommitError> {
-    if attempt.tombstone_operation_id != attempt.lane_tombstone_operation_id {
-        return Err(ledger("private attempt cancellation tombstone differs from its operation lane key"));
-    }
-    let Some(tombstone_id) = attempt.tombstone_operation_id else {
-        if attempt.tombstone_issuer_id.is_some()
-            || attempt.tombstone_lane.is_some()
-            || attempt.tombstone_sequence.is_some()
-            || attempt.tombstone_request_digest.is_some()
-        {
-            return Err(ledger("private attempt cancellation evidence is partial"));
+fn validate_tombstone(attempt: &RawAttempt, state: OperationState) -> Result<(), PackCommitError> {
+    if attempt.tombstone_present {
+        if !attempt.tombstone_matches_lane || !attempt.tombstone_exact_operation {
+            return Err(ledger("private attempt cancellation tombstone differs from its operation"));
+        }
+        if state == OperationState::Pending {
+            return Err(ledger("pending private attempt has a cancellation tombstone"));
+        }
+    } else {
+        if !attempt.tombstone_absent {
+            return Err(ledger("private attempt cancellation tombstone differs from its operation lane key"));
         }
         if state == OperationState::Cancelled {
             return Err(ledger("cancelled private attempt has no cancellation tombstone"));
         }
-        return Ok(());
-    };
-
-    if tombstone_id != attempt.private_id
-        || attempt.tombstone_issuer_id != Some(operation_issuer)
-        || attempt.tombstone_lane.as_deref() != Some(lane.as_str())
-        || attempt.tombstone_sequence != Some(sequence)
-    {
-        return Err(ledger("private attempt cancellation tombstone differs from its operation"));
-    }
-    let tombstone_digest = parse_digest(
-        attempt
-            .tombstone_request_digest
-            .as_deref()
-            .ok_or_else(|| ledger("private attempt cancellation digest is missing"))?,
-        "stored private attempt cancellation digest is not canonical",
-    )?;
-    if tombstone_digest != operation_digest {
-        return Err(ledger("private attempt cancellation digest differs from its operation"));
-    }
-    if state == OperationState::Pending {
-        return Err(ledger("pending private attempt has a cancellation tombstone"));
     }
     Ok(())
 }
 
-fn ensure_event(
-    attempt: &RawAttempt,
-    repository_id: Uuid,
-    state: OperationState,
-    terminal: Option<&serde_json::Value>,
-) -> Result<(), PackCommitError> {
+fn validate_event(attempt: &RawAttempt, state: OperationState) -> Result<(), PackCommitError> {
     let Some(event_id) = attempt.event_id else {
-        if attempt.event_repository_id.is_some()
-            || attempt.event_revision.is_some()
-            || attempt.event_outcome.is_some()
-            || attempt.event_payload.is_some()
-        {
+        if attempt.event_revision.is_some() {
             return Err(ledger("private attempt event evidence is partial"));
         }
         return Ok(());
     };
 
-    if event_id.is_nil() || attempt.event_repository_id != Some(repository_id) {
-        return Err(ledger("private attempt event belongs to another repository"));
+    if event_id.is_nil() {
+        return Err(ledger("private attempt event identity is nil"));
     }
     let revision = attempt.event_revision.ok_or_else(|| ledger("private attempt event revision is missing"))?;
     if revision < 0 {
         return Err(ledger("private attempt event revision is negative"));
     }
-    let outcome = attempt.event_outcome.as_deref().ok_or_else(|| ledger("private attempt event outcome is missing"))?;
-    if outcome != state.as_str() {
-        return Err(ledger("private attempt event outcome differs from its operation state"));
+    if !matches!(state, OperationState::Committed | OperationState::Rejected) {
+        return Err(ledger("private attempt event state is not committed or rejected"));
     }
-    let payload = attempt.event_payload.as_ref().ok_or_else(|| ledger("private attempt event payload is missing"))?;
-    let terminal = terminal.ok_or_else(|| ledger("private attempt event has no matching terminal result"))?;
-    if payload != terminal {
-        return Err(ledger("private attempt event payload differs from its terminal result"));
-    }
-    if payload["kind"] != serde_json::json!(state.as_str())
-        || payload["repository_id"] != serde_json::json!(repository_id)
-        || payload["revision"] != serde_json::json!(revision)
-    {
-        return Err(ledger("private attempt event payload is not the canonical terminal body"));
+    if !attempt.event_outcome_matches || !attempt.event_body_matches {
+        return Err(ledger("private attempt event evidence differs from its operation"));
     }
     Ok(())
 }
@@ -730,10 +722,7 @@ fn validate_retired(wrapper: &RawWrapper, retired: &AttemptFacts) -> Result<(), 
     if revision <= retired.base_revision {
         return Err(ledger("retired public attempt did not observe an advanced gate"));
     }
-    let terminal = retired.terminal.as_ref().ok_or_else(|| ledger("retired public attempt terminal is missing"))?;
-    if terminal["rejection"]["code"] != serde_json::json!("revision_mismatch")
-        || terminal["registrations"] != serde_json::json!([])
-    {
+    if !retired.revision_mismatch_rejection {
         return Err(ledger("retired public attempt is not the exact revision-mismatch rejection"));
     }
     Ok(())
@@ -778,16 +767,29 @@ fn is_canonical_hex_64(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn cancelled_terminal() -> serde_json::Value {
-    serde_json::json!({"state": "cancelled", "reason": "cancel_requested"})
-}
-
 fn ledger(detail: &'static str) -> PackCommitError {
     PackCommitError::Rejected(PackCommitRejection::new(PackCommitRejectCode::LedgerIntegrity, detail))
 }
 
 fn stale_realm() -> PackCommitError {
     ledger("public operation wrapper does not belong to the current repository realm")
+}
+
+fn lookup_db_error(error: tokio_postgres::Error) -> RefStoreError {
+    match error.code() {
+        Some(code) if *code == SqlState::QUERY_CANCELED || *code == SqlState::LOCK_NOT_AVAILABLE => {
+            RefStoreError::Timeout
+        }
+        _ => RefStoreError::Database("public attempt lookup database error"),
+    }
+}
+
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -798,7 +800,7 @@ struct RawSnapshot {
     private_occupied: bool,
     legacy_operation: bool,
     legacy_cancellation: bool,
-    realm: Option<RawRealm>,
+    realm_matches: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -835,52 +837,17 @@ struct RawAttempt {
     operation_sequence: Option<i64>,
     operation_request_digest: Option<String>,
     operation_state: Option<String>,
-    operation_terminal_result: Option<serde_json::Value>,
+    terminal_present: bool,
+    terminal_cancelled_exact: bool,
     event_id: Option<Uuid>,
-    event_repository_id: Option<Uuid>,
     event_revision: Option<i64>,
-    event_outcome: Option<String>,
-    event_payload: Option<serde_json::Value>,
-    tombstone_operation_id: Option<Uuid>,
-    tombstone_issuer_id: Option<Uuid>,
-    tombstone_lane: Option<String>,
-    tombstone_sequence: Option<i64>,
-    tombstone_request_digest: Option<String>,
-    lane_tombstone_operation_id: Option<Uuid>,
-}
-
-#[derive(Clone, Deserialize)]
-struct RawRealm {
-    repository_id: Uuid,
-    repository_owner_id: Uuid,
-    repository_name: String,
-    repository_object_format: String,
-    repository_state: String,
-    repository_storage_backend: String,
-    repository_transition_state: String,
-    repository_archived_at: Option<String>,
-    repository_deleted_at: Option<String>,
-    gate_tenant_id: Option<Uuid>,
-    gate_object_format: Option<String>,
-    gate_history_incarnation: Option<Uuid>,
-    gate_authority_epoch: Option<i64>,
-    gate_group_epoch: Option<i64>,
-    gate_revision: Option<i64>,
-    serving_owner_id: Option<Uuid>,
-    serving_name: Option<String>,
-    serving_object_format: Option<String>,
-    serving_history_incarnation: Option<Uuid>,
-    serving_authority_epoch: Option<i64>,
-    serving_group_epoch: Option<i64>,
-    serving_backend_identity: Option<String>,
-    serving_state: Option<String>,
-    protocol_tenant_id: Option<Uuid>,
-    protocol_object_format: Option<String>,
-    protocol_history_incarnation: Option<Uuid>,
-    protocol_authority_epoch: Option<i64>,
-    protocol_group_epoch: Option<i64>,
-    protocol_decision_required: Option<bool>,
-    cluster_incarnation: Option<Uuid>,
+    event_outcome_matches: bool,
+    event_body_matches: bool,
+    tombstone_present: bool,
+    tombstone_absent: bool,
+    tombstone_matches_lane: bool,
+    tombstone_exact_operation: bool,
+    revision_mismatch_rejection: bool,
 }
 
 #[cfg(test)]
