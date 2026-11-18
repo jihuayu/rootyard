@@ -328,7 +328,10 @@ async fn get_operation_authorized(
         .map_err(|_| GatewayError::Timeout)?
         .map_err(|_| GatewayError::Internal("authorization transaction failed"))?;
     let loaded: Result<(OperationLookup, Option<Role>), GatewayError> = async {
-        crate::ref_store::pg::bound(&tx, deadline).await.map_err(GatewayError::from)?;
+        // Take the operation key before the authorization checks take row locks.
+        crate::ref_store::pg::lock_operation(&tx, repository_id, operation_id, deadline)
+            .await
+            .map_err(GatewayError::from)?;
         let fresh = crate::ref_store::serving::lookup_in_tx(
             &tx,
             &identity,
@@ -341,7 +344,10 @@ async fn get_operation_authorized(
         .await
         .map_err(authority_error)?;
         authorization.ensure_same_realm(&fresh)?;
-        let lookup = PgRefStore.get(&tx, repository_id, operation_id, deadline).await.map_err(GatewayError::from)?;
+        let lookup = PgRefStore
+            .get_legacy_locked(&tx, repository_id, operation_id, deadline)
+            .await
+            .map_err(GatewayError::from)?;
         // Distinguish a write intent from its reader: the durable issuer or a
         // *current* repository admin may resolve it. Read access to the
         // repository alone does not expose another actor's write facts.

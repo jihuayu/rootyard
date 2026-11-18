@@ -6,6 +6,11 @@
 //! existing `FOR UPDATE OF s` ref CAS, read leases, decisions, roots, holds or
 //! GC. Queries are bounded by the caller deadline and by a local statement
 //! timeout. There is intentionally no router or unauthenticated public query.
+//!
+//! Legacy reserve, begin and cancel refuse migration-152 wrapper and attempt
+//! UUIDs. The core-only lookup and exact-identity terminal writer are still
+//! shared ledger primitives. A wrapper producer needs its own authorized
+//! attempt lifecycle before it can use the core ledger.
 use super::contract::{
     BeginReceipt, CancelReceipt, Capabilities, CommitReceipt, IssuerLane, OperationIdentity, OperationLookup,
     OperationRecord, OperationState, RefStoreError, RequestDigest, SequenceReservation, TerminalOutcome,
@@ -78,6 +83,7 @@ impl PgRefStore {
         }
         bound(tx, deadline).await?;
         lock_operation_key(tx, repository_id, operation_id).await?;
+        refuse_legacy_collision(tx, repository_id, operation_id).await?;
         ensure_repository(tx, repository_id).await?;
         let row = tx
             .query_one(
@@ -116,6 +122,7 @@ impl PgRefStore {
     ) -> Result<BeginReceipt, RefStoreError> {
         bound(tx, deadline).await?;
         lock_operation_key(tx, identity.repository_id(), identity.operation_id()).await?;
+        refuse_legacy_collision(tx, identity.repository_id(), identity.operation_id()).await?;
         ensure_repository(tx, identity.repository_id()).await?;
         lock_lane(tx, identity).await?;
         if let Some(row) = operation_row(tx, identity.repository_id(), identity.operation_id(), true).await? {
@@ -168,6 +175,7 @@ impl PgRefStore {
     ) -> Result<CancelReceipt, RefStoreError> {
         bound(tx, deadline).await?;
         lock_operation_key(tx, identity.repository_id(), identity.operation_id()).await?;
+        refuse_legacy_collision(tx, identity.repository_id(), identity.operation_id()).await?;
         ensure_repository(tx, identity.repository_id()).await?;
         lock_lane(tx, identity).await?;
         let existing = match operation_row(tx, identity.repository_id(), identity.operation_id(), true).await? {
@@ -303,8 +311,9 @@ impl PgRefStore {
         Ok(CommitReceipt { record, replayed: false })
     }
 
-    /// Internal repository-scoped lookup. No route exposes this today. A missing
-    /// row is [`OperationLookup::Unknown`], never an aborted result.
+    /// Internal repository-scoped core lookup, including private identities.
+    /// Legacy HTTP callers use `get_legacy_locked`. A missing row is
+    /// [`OperationLookup::Unknown`], never an aborted result.
     pub async fn get(
         &self,
         tx: &Transaction<'_>,
@@ -313,6 +322,23 @@ impl PgRefStore {
         deadline: Instant,
     ) -> Result<OperationLookup, RefStoreError> {
         before_deadline(deadline, self.get_inner(tx, repository_id, operation_id, deadline)).await
+    }
+
+    /// Resolve a legacy operation for an authorized HTTP caller. The caller
+    /// must already hold the migration-138 operation lock in this transaction.
+    pub(crate) async fn get_legacy_locked(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        operation_id: Uuid,
+        deadline: Instant,
+    ) -> Result<OperationLookup, RefStoreError> {
+        before_deadline(deadline, async {
+            bound(tx, deadline).await?;
+            refuse_legacy_collision(tx, repository_id, operation_id).await?;
+            self.get_inner(tx, repository_id, operation_id, deadline).await
+        })
+        .await
     }
 
     async fn get_inner(
@@ -371,6 +397,43 @@ pub(crate) async fn lock_operation(
         lock_operation_key(tx, repository_id, operation_id).await
     })
     .await
+}
+
+/// Called only under the migration-138 key, before any issuer-lane mutation
+/// or external replay lookup. Migration 152 claims wrapper and attempt UUIDs
+/// with that same key. A read-committed statement issued after locking sees
+/// claims committed by the preceding holder of the key.
+async fn refuse_legacy_collision(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    operation_id: Uuid,
+) -> Result<(), RefStoreError> {
+    let schema = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=152),
+                    current_setting('transaction_isolation') = 'read committed'",
+            &[],
+        )
+        .await
+        .map_err(db_error)?;
+    // Older catalogs lack both relations. Keep their legacy identity contract
+    // without preparing a statement that references the absent tables.
+    if !schema.get::<_, bool>(0) {
+        return Ok(());
+    }
+    if !schema.get::<_, bool>(1) {
+        return Err(RefStoreError::Database("legacy operation UUID checks require read committed".into()));
+    }
+    let claimed: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM ref_store_public_operations WHERE repository_id=$1 AND public_id=$2)
+                 OR EXISTS(SELECT 1 FROM ref_store_private_attempts WHERE repository_id=$1 AND private_id=$2)",
+            &[&repository_id, &operation_id],
+        )
+        .await
+        .map_err(db_error)?
+        .get(0);
+    if claimed { Err(RefStoreError::IdentityConflict) } else { Ok(()) }
 }
 
 pub(crate) async fn bound(tx: &Transaction<'_>, deadline: Instant) -> Result<(), RefStoreError> {

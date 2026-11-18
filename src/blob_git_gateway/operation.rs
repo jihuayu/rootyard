@@ -147,6 +147,11 @@ pub(super) async fn lookup(
         .await
         .map_err(|_| GatewayError::Timeout)?
         .map_err(|_| GatewayError::Internal("operation lookup transaction failed"))?;
+    // Acquire the operation key before the serving lookup takes row locks.
+    // Only classify the UUID after the live authority recheck below.
+    crate::ref_store::pg::lock_operation(&tx, repository_id, operation_id, deadline)
+        .await
+        .map_err(GatewayError::from)?;
     let fresh = crate::ref_store::serving::lookup_in_tx(
         &tx,
         actor,
@@ -180,24 +185,22 @@ pub(super) async fn lookup(
 /// producer binding read inside a **caller-owned** transaction.
 ///
 /// This helper performs no authorization and no repository resolution; it is
-/// only valid when the caller's transaction is already authorized for exactly
-/// this repository. That is true both for the authorized read probe above and
-/// for the gateway's fresh write transaction, whose earlier authorized probe on
-/// this same request has completed (so the write transaction must not take a
-/// second repository read lock).
+/// only valid when the transaction holds the operation key and the request
+/// is already authorized for this repository. The read probe above takes the
+/// key directly. The fresh write transaction takes it during reservation and
+/// relies on the earlier authorized probe for this request to avoid taking
+/// a second repository read lock in the write transaction.
 ///
-/// `Unknown` means no operation row. A known record without a producer binding
-/// is a typed conflict, never a replay. The binding's stored parent digest is
-/// compared against the very record read above: the A3 invariant makes it equal
-/// to `identity.digest()`, so a binding that disagrees names a different
-/// operation than the one being classified.
+/// Wrapper and private attempt UUIDs are refused before reading the core
+/// record. A known record without a producer binding is a typed conflict. The
+/// binding must have the same parent digest as the record, as required by A3.
 pub(super) async fn lookup_in_tx(
     tx: &tokio_postgres::Transaction<'_>,
     repository_id: Uuid,
     operation_id: Uuid,
     deadline: Instant,
 ) -> Result<Lookup, GatewayError> {
-    match PgRefStore.get(tx, repository_id, operation_id, deadline).await.map_err(GatewayError::from)? {
+    match PgRefStore.get_legacy_locked(tx, repository_id, operation_id, deadline).await.map_err(GatewayError::from)? {
         OperationLookup::Unknown => Ok(Lookup::Unknown),
         OperationLookup::Known(record) => {
             let Some(binding) =
