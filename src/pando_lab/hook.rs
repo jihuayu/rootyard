@@ -34,22 +34,13 @@ fn flush(out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 fn oid(s: &str) -> bool {
-    s.len() == 40
-        && s.bytes()
-            .all(|x| x.is_ascii_digit() || (b'a'..=b'f').contains(&x))
+    s.len() == 40 && s.bytes().all(|x| x.is_ascii_digit() || (b'a'..=b'f').contains(&x))
 }
 
 fn parse_command(s: &str) -> Result<RefCommand> {
     let parts: Vec<_> = s.split(' ').collect();
-    ensure!(
-        parts.len() == 3 && oid(parts[0]) && oid(parts[1]),
-        "bad hook command"
-    );
-    Ok(RefCommand {
-        old: parts[0].to_owned(),
-        new: parts[1].to_owned(),
-        name: parts[2].to_owned(),
-    })
+    ensure!(parts.len() == 3 && oid(parts[0]) && oid(parts[1]), "bad hook command");
+    Ok(RefCommand { old: parts[0].to_owned(), new: parts[1].to_owned(), name: parts[2].to_owned() })
 }
 
 /// Native Git can remove failed commands before invoking proc-receive, even
@@ -57,41 +48,23 @@ fn parse_command(s: &str) -> Result<RefCommand> {
 /// provides the complete command group that we must publish all-or-nothing.
 pub(super) async fn pre_receive(config: &Config) -> Result<()> {
     let mut bytes = Vec::new();
-    std::io::stdin()
-        .lock()
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= 1024 * 1024 && bytes.last() == Some(&b'\n'),
-        "invalid or oversized pre-receive group"
-    );
-    let commands: Vec<RefCommand> = std::str::from_utf8(&bytes)?
-        .split_terminator('\n')
-        .map(parse_command)
-        .collect::<Result<_>>()?;
-    ensure!(
-        !commands.is_empty() && commands.len() <= 256,
-        "lab ref command limit"
-    );
+    std::io::stdin().lock().take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 1024 * 1024 && bytes.last() == Some(&b'\n'), "invalid or oversized pre-receive group");
+    let commands: Vec<RefCommand> =
+        std::str::from_utf8(&bytes)?.split_terminator('\n').map(parse_command).collect::<Result<_>>()?;
+    ensure!(!commands.is_empty() && commands.len() <= 256, "lab ref command limit");
     let op: Uuid = std::env::var("PANDO_OPERATION")?.parse()?;
     let repo: Uuid = std::env::var("PANDO_REPO")?.parse()?;
     let principal = std::env::var("PANDO_PRINCIPAL")?;
     let c = config.db().await?;
-    let repo_row = c
-        .query_one(
-            "SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1",
-            &[&repo],
-        )
-        .await?;
+    let repo_row =
+        c.query_one("SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1", &[&repo]).await?;
     ensure!(
         !repo_row.get::<_, bool>(0) && repo_row.get::<_, String>(1) == "pando",
         "repository writes paused or storage backend is not pando"
     );
     let n=c.execute("UPDATE pando_lab.operations SET state='PREPARED',commands=$4 WHERE id=$1 AND repo=$2 AND principal=$3 AND state='RECEIVING'",&[&op,&repo,&principal,&serde_json::to_value(&commands)?]).await?;
-    ensure!(
-        n == 1,
-        "operation must belong to the complete pre-receive group"
-    );
+    ensure!(n == 1, "operation must belong to the complete pre-receive group");
     Ok(())
 }
 
@@ -100,14 +73,7 @@ pub(super) async fn run(config: &Config) -> Result<()> {
     let mut out = std::io::stdout().lock();
     let hello = block(&mut input)?;
     let atomic = hello.iter().any(|s| s.windows(6).any(|v| v == b"atomic"));
-    packet(
-        &mut out,
-        if atomic {
-            "version=1\0atomic"
-        } else {
-            "version=1"
-        },
-    )?;
+    packet(&mut out, if atomic { "version=1\0atomic" } else { "version=1" })?;
     flush(&mut out)?;
     let mut commands = Vec::new();
     for raw in block(&mut input)? {
@@ -126,17 +92,26 @@ pub(super) async fn run(config: &Config) -> Result<()> {
             eprintln!("pando lab hook rejected: {error:#}");
             if let Ok(c) = config.db().await {
                 // Never overwrite COMMITTED after a lost commit acknowledgment.
-                let _=c.execute("UPDATE pando_lab.operations SET state='REJECTED',result=$2 WHERE id=$1 AND state<>'COMMITTED'",&[&op,&serde_json::json!({"error":error.to_string()})]).await;
+                let _ = c
+                    .execute(
+                        "UPDATE pando_lab.operations SET state='REJECTED',result=$2 WHERE id=$1 AND state<>'COMMITTED'",
+                        &[&op, &serde_json::json!({"error":error.to_string()})],
+                    )
+                    .await;
             }
             for c in &commands {
-                packet(
-                    &mut out,
-                    &format!("ng {} pando-validation-or-CAS-rejected", c.name),
-                )?;
+                packet(&mut out, &format!("ng {} pando-validation-or-CAS-rejected", c.name))?;
             }
         }
     }
     flush(&mut out)
+}
+
+fn needs_prepared_encryption(
+    has_checkpoint: bool,
+    selected: lifecycle::provider_selection::PandoProviderSelection,
+) -> bool {
+    has_checkpoint || selected == lifecycle::provider_selection::PandoProviderSelection::VaultTransit
 }
 
 async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<()> {
@@ -146,48 +121,29 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
     let ctl = control(config)?;
     let git_dir = std::env::current_dir()?;
     let value = serde_json::to_value(commands)?;
-    let mut c = config.db().await?;
+    let mut session = lifecycle::publication::writer_session(config, repo).await?;
+    let checkpoint = lifecycle::publication::active_rotation(session.client(), repo).await?;
+    let c = session.client();
     // Do not overwrite the complete pre-receive command group with Git's filtered
     // proc-receive subset. Matching JSON arrays checks old/new/name and ordering.
     let n=c.execute("UPDATE pando_lab.operations SET state='PREPARING' WHERE id=$1 AND repo=$2 AND principal=$3 AND state='PREPARED' AND commands=$4",&[&op,&repo,&principal,&value]).await?;
-    ensure!(
-        n == 1,
-        "proc-receive group differs from complete pre-receive group"
-    );
+    ensure!(n == 1, "proc-receive group differs from complete pre-receive group");
     let mut names = std::collections::BTreeSet::new();
     for cmd in commands {
         ensure!(names.insert(&cmd.name), "duplicate ref command");
-        ensure!(
-            cmd.name.starts_with("refs/heads/") || cmd.name.starts_with("refs/tags/"),
-            "unsupported ref namespace"
-        );
-        config
-            .git(&git_dir, &["check-ref-format", &cmd.name], b"")
-            .await?;
+        ensure!(cmd.name.starts_with("refs/heads/") || cmd.name.starts_with("refs/tags/"), "unsupported ref namespace");
+        config.git(&git_dir, &["check-ref-format", &cmd.name], b"").await?;
         if cmd.new != ZERO && cmd.name.starts_with("refs/heads/") {
             ensure!(
-                config
-                    .git(&git_dir, &["cat-file", "-t", &cmd.new], b"")
-                    .await?
-                    == b"commit\n",
+                config.git(&git_dir, &["cat-file", "-t", &cmd.new], b"").await? == b"commit\n",
                 "branch target must be commit"
             );
             if cmd.old != ZERO {
-                config
-                    .git(
-                        &git_dir,
-                        &["merge-base", "--is-ancestor", &cmd.old, &cmd.new],
-                        b"",
-                    )
-                    .await?;
+                config.git(&git_dir, &["merge-base", "--is-ancestor", &cmd.old, &cmd.new], b"").await?;
             }
         }
     }
-    let roots: Vec<_> = commands
-        .iter()
-        .filter(|c| c.new != ZERO)
-        .map(|c| c.new.clone())
-        .collect();
+    let roots: Vec<_> = commands.iter().filter(|c| c.new != ZERO).map(|c| c.new.clone()).collect();
     if !roots.is_empty() {
         let mut args = vec!["fsck", "--full", "--strict", "--no-reflogs"];
         args.extend(roots.iter().map(String::as_str));
@@ -197,11 +153,29 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
         std::process::exit(71);
     }
     let pack = store::publish_pack(config, repo, op, &git_dir, &roots).await?;
-    c.execute(
-        "UPDATE pando_lab.operations SET state='OBJECTS_DURABLE' WHERE id=$1",
-        &[&op],
-    )
-    .await?;
+    let prepared = if let Some((pack, _)) = &pack {
+        let selected = lifecycle::provider_selection::selected_kind()?;
+        let needs_encrypted = needs_prepared_encryption(checkpoint.is_some(), selected);
+        if needs_encrypted {
+            Some(
+                object_store::prepare_known_pack_publication(
+                    config,
+                    session.client(),
+                    repo,
+                    pack,
+                    checkpoint.as_ref(),
+                    "hot",
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut receipt: Option<object_store::PublicationReceipt> = None;
+    c.execute("UPDATE pando_lab.operations SET state='OBJECTS_DURABLE' WHERE id=$1", &[&op]).await?;
     if ctl.fault == "after-objects" {
         std::process::exit(72);
     }
@@ -215,7 +189,7 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
-    let t = c.transaction().await?;
+    let t = session.client_mut().transaction().await?;
     let row = t
         .query_one(
             "SELECT generation,storage_generation,write_paused,storage_backend FROM pando_lab.repositories WHERE id=$1 FOR UPDATE",
@@ -223,39 +197,24 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
         )
         .await?;
     let generation: i64 = row.get(0);
-    ensure!(
-        row.get::<_, i64>(1) == storage_generation,
-        "stale storage generation"
-    );
+    ensure!(row.get::<_, i64>(1) == storage_generation, "stale storage generation");
     ensure!(!row.get::<_, bool>(2), "repository writes paused");
-    ensure!(
-        row.get::<_, String>(3) == "pando",
-        "repository storage backend is not pando"
-    );
+    ensure!(row.get::<_, String>(3) == "pando", "repository storage backend is not pando");
     let acl = t
         .query_opt(
             "SELECT write_allowed FROM pando_lab.acl WHERE repo=$1 AND principal=$2 FOR SHARE",
             &[&repo, &principal],
         )
         .await?;
-    ensure!(
-        acl.is_some_and(|r| r.get::<_, bool>(0)),
-        "write access revoked"
-    );
+    ensure!(acl.is_some_and(|r| r.get::<_, bool>(0)), "write access revoked");
     let mut refs: BTreeMap<String, String> = t
-        .query(
-            "SELECT name,oid FROM pando_lab.refs WHERE repo=$1",
-            &[&repo],
-        )
+        .query("SELECT name,oid FROM pando_lab.refs WHERE repo=$1", &[&repo])
         .await?
         .into_iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
     for cmd in commands {
-        ensure!(
-            refs.get(&cmd.name).map(String::as_str).unwrap_or(ZERO) == cmd.old,
-            "compare-and-swap conflict"
-        );
+        ensure!(refs.get(&cmd.name).map(String::as_str).unwrap_or(ZERO) == cmd.old, "compare-and-swap conflict");
         if cmd.new == ZERO {
             refs.remove(&cmd.name);
         } else {
@@ -264,10 +223,7 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
     }
     for name in refs.keys() {
         for (i, _) in name.match_indices('/') {
-            ensure!(
-                !refs.contains_key(&name[..i]),
-                "ref directory/file conflict"
-            );
+            ensure!(!refs.contains_key(&name[..i]), "ref directory/file conflict");
         }
     }
     if let Some((pack, oids)) = &pack {
@@ -277,49 +233,56 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
         )
         .await?;
         for oid in oids {
-            t.execute(
-                "INSERT INTO pando_lab.objects VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
-                &[&repo, oid, &pack.id],
-            )
-            .await?;
+            t.execute("INSERT INTO pando_lab.objects VALUES($1,$2,$3) ON CONFLICT DO NOTHING", &[&repo, oid, &pack.id])
+                .await?;
         }
+    }
+    if let Some(prepared) = &prepared {
+        receipt = Some(prepared.publish_in(&t).await?);
     }
     for cmd in commands {
         if cmd.new == ZERO {
+            t.execute("DELETE FROM pando_lab.refs WHERE repo=$1 AND name=$2", &[&repo, &cmd.name]).await?;
+        } else {
             t.execute(
-                "DELETE FROM pando_lab.refs WHERE repo=$1 AND name=$2",
-                &[&repo, &cmd.name],
+                "INSERT INTO pando_lab.refs VALUES($1,$2,$3) ON CONFLICT(repo,name) DO UPDATE SET oid=excluded.oid",
+                &[&repo, &cmd.name, &cmd.new],
             )
             .await?;
-        } else {
-            t.execute("INSERT INTO pando_lab.refs VALUES($1,$2,$3) ON CONFLICT(repo,name) DO UPDATE SET oid=excluded.oid",&[&repo,&cmd.name,&cmd.new]).await?;
         }
     }
     let next = generation.checked_add(1).context("generation exhausted")?;
-    t.execute(
-        "UPDATE pando_lab.repositories SET generation=$2 WHERE id=$1",
-        &[&repo, &next],
-    )
-    .await?;
-    t.execute(
-        "INSERT INTO pando_lab.changes VALUES($1,$2,$3,$4)",
-        &[&repo, &next, &op, &value],
-    )
-    .await?;
+    t.execute("UPDATE pando_lab.repositories SET generation=$2 WHERE id=$1", &[&repo, &next]).await?;
+    t.execute("INSERT INTO pando_lab.changes VALUES($1,$2,$3,$4)", &[&repo, &next, &op, &value]).await?;
     t.execute(
         "UPDATE pando_lab.operations SET state='COMMITTED',result=$2 WHERE id=$1",
-        &[
-            &op,
-            &serde_json::json!({"generation":next,"status":"committed"}),
-        ],
+        &[&op, &serde_json::json!({"generation":next,"status":"committed"})],
     )
     .await?;
     if ctl.fault == "before-commit" {
         std::process::exit(73);
     }
     t.commit().await?;
+    // The receipt is provisional until this commit succeeds. Mirror only the
+    // DB-winning envelope, never the losing prepared value.
+    if let Some(receipt) = &receipt {
+        receipt.refresh_mirrors();
+    }
     if ctl.fault == "after-commit" {
         std::process::exit(74);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_encryption_activation_matrix_is_explicit() {
+        assert!(!needs_prepared_encryption(false, lifecycle::provider_selection::PandoProviderSelection::Local));
+        assert!(needs_prepared_encryption(false, lifecycle::provider_selection::PandoProviderSelection::VaultTransit));
+        assert!(needs_prepared_encryption(true, lifecycle::provider_selection::PandoProviderSelection::Local));
+        assert!(needs_prepared_encryption(true, lifecycle::provider_selection::PandoProviderSelection::VaultTransit));
+    }
 }

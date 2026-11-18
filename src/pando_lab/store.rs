@@ -7,6 +7,21 @@ use std::{
     io::Write,
 };
 
+mod snapshot_retention;
+
+pub(super) async fn snapshot_and_retain(client: &mut Client, repo: Uuid, principal: &str) -> Result<Uuid> {
+    snapshot_retention::snapshot_and_retain(client, repo, principal).await
+}
+
+#[cfg(test)]
+pub(super) mod snapshot_pg_barrier;
+#[cfg(test)]
+pub(super) mod snapshot_pg_support;
+#[cfg(test)]
+mod snapshot_pg_tests;
+#[cfg(test)]
+mod snapshot_race_pg_tests;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcReport {
     pub orphan_packs_deleted: usize,
@@ -29,17 +44,10 @@ pub(super) async fn snapshot(config: &Config, repo: Uuid) -> Result<Snapshot> {
         .read_only(true)
         .start()
         .await?;
-    let row = t
-        .query_one(
-            "SELECT generation,storage_generation FROM pando_lab.repositories WHERE id=$1",
-            &[&repo],
-        )
-        .await?;
+    let row =
+        t.query_one("SELECT generation,storage_generation FROM pando_lab.repositories WHERE id=$1", &[&repo]).await?;
     let refs = t
-        .query(
-            "SELECT name,oid FROM pando_lab.refs WHERE repo=$1 ORDER BY name",
-            &[&repo],
-        )
+        .query("SELECT name,oid FROM pando_lab.refs WHERE repo=$1 ORDER BY name", &[&repo])
         .await?
         .into_iter()
         .map(|r| (r.get(0), r.get(1)))
@@ -51,66 +59,33 @@ pub(super) async fn snapshot(config: &Config, repo: Uuid) -> Result<Snapshot> {
         )
         .await?
         .into_iter()
-        .map(|r| Pack {
-            id: r.get(0),
-            pack_sha256: r.get(1),
-            idx_sha256: r.get(2),
-        })
+        .map(|r| Pack { id: r.get(0), pack_sha256: r.get(1), idx_sha256: r.get(2) })
         .collect();
-    let snapshot = Snapshot {
-        repo,
-        generation: row.get(0),
-        storage_generation: row.get(1),
-        refs,
-        packs,
-    };
+    let snapshot = Snapshot { repo, generation: row.get(0), storage_generation: row.get(1), refs, packs };
     t.commit().await?;
     Ok(snapshot)
 }
 
 pub(super) async fn init_repo(config: &Config, path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
-    config
-        .git(
-            path,
-            &[
-                "init",
-                "--bare",
-                "--object-format=sha1",
-                "--initial-branch=main",
-                ".",
-            ],
-            b"",
-        )
-        .await?;
+    config.git(path, &["init", "--bare", "--object-format=sha1", "--initial-branch=main", "."], b"").await?;
     Ok(())
 }
 
 async fn index_pack(config: &Config, repo: &Path, data: &[u8]) -> Result<()> {
-    config
-        .git(repo, &["index-pack", "--stdin", "--strict"], data)
-        .await?;
+    config.git(repo, &["index-pack", "--stdin", "--strict"], data).await?;
     Ok(())
 }
 
 /// Cold rebuild first validates immutable pack+idx then copies only the chosen
 /// roots' reachable closure into an isolated repository. Hidden refs alone are
 /// not our access boundary; obsolete and other-repository objects are absent.
-pub(super) async fn materialize(
-    config: &Config,
-    snapshot: &Snapshot,
-    base: &Path,
-    ctl: &Control,
-) -> Result<PathBuf> {
+pub(super) async fn materialize(config: &Config, snapshot: &Snapshot, base: &Path, ctl: &Control) -> Result<PathBuf> {
     let staging = base.join("staging.git");
     init_repo(config, &staging).await?;
     for pack in &snapshot.packs {
         object_store::ensure_local_pack_cached(config, snapshot.repo, pack).await?;
-        let prefix = config
-            .root
-            .join("objects")
-            .join(snapshot.repo.to_string())
-            .join(pack.id.to_string());
+        let prefix = config.root.join("objects").join(snapshot.repo.to_string()).join(pack.id.to_string());
         let mut bytes = std::fs::read(prefix.with_extension("pack"))?;
         let idx = std::fs::read(prefix.with_extension("idx"))?;
         if ctl.fault == "corrupt-read" && !bytes.is_empty() {
@@ -121,9 +96,7 @@ pub(super) async fn materialize(
             "immutable pack checksum mismatch"
         );
         delta::verify_pack(&bytes, &delta::Limits::default())?;
-        config
-            .git(&staging, &["index-pack", "--stdin"], &bytes)
-            .await?;
+        config.git(&staging, &["index-pack", "--stdin"], &bytes).await?;
     }
     // Only roots in this immutable snapshot are given to pack-objects.
     let roots = snapshot.refs.values().cloned().collect::<Vec<_>>();
@@ -134,13 +107,7 @@ pub(super) async fn materialize(
         args.extend(roots.iter().map(String::as_str));
         config.git(&staging, &args, b"").await?;
         let input = format!("{}\n", roots.join("\n"));
-        let pack = config
-            .git(
-                &staging,
-                &["pack-objects", "--stdout", "--revs"],
-                input.as_bytes(),
-            )
-            .await?;
+        let pack = config.git(&staging, &["pack-objects", "--stdout", "--revs"], input.as_bytes()).await?;
         index_pack(config, &repo, &pack).await?;
     }
     for (name, oid) in &snapshot.refs {
@@ -181,22 +148,13 @@ pub(super) async fn publish_pack(
     }
 
     let existing_snap = snapshot(config, repo).await?;
-    let existing_refs: Vec<String> = existing_snap
-        .refs
-        .values()
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let existing_refs: Vec<String> =
+        existing_snap.refs.values().cloned().collect::<BTreeSet<_>>().into_iter().collect();
 
     let mut existing_store = graph::ObjectStore::default();
     for pack in &existing_snap.packs {
         object_store::ensure_local_pack_cached(config, repo, pack).await?;
-        let prefix = config
-            .root
-            .join("objects")
-            .join(repo.to_string())
-            .join(pack.id.to_string());
+        let prefix = config.root.join("objects").join(repo.to_string()).join(pack.id.to_string());
         let pack_bytes = std::fs::read(prefix.with_extension("pack"))?;
         let idx_bytes = std::fs::read(prefix.with_extension("idx"))?;
         ensure!(
@@ -219,13 +177,7 @@ pub(super) async fn publish_pack(
     }
 
     let incremental_oids: Vec<String> = String::from_utf8(
-        config
-            .git(
-                git_dir,
-                &["rev-list", "--objects", "--no-object-names", "--stdin"],
-                rev_input.as_bytes(),
-            )
-            .await?,
+        config.git(git_dir, &["rev-list", "--objects", "--no-object-names", "--stdin"], rev_input.as_bytes()).await?,
     )?
     .lines()
     .filter(|l| !l.is_empty())
@@ -234,20 +186,11 @@ pub(super) async fn publish_pack(
 
     if incremental_oids.is_empty() {
         let full_walk = graph::walk_reachable(&existing_store, roots, &[])?;
-        ensure!(
-            !full_walk.reachable_oids.is_empty(),
-            "reachable object closure for pushed roots is empty"
-        );
+        ensure!(!full_walk.reachable_oids.is_empty(), "reachable object closure for pushed roots is empty");
         return Ok(None);
     }
 
-    let bytes = config
-        .git(
-            git_dir,
-            &["pack-objects", "--stdout", "--revs"],
-            rev_input.as_bytes(),
-        )
-        .await?;
+    let bytes = config.git(git_dir, &["pack-objects", "--stdout", "--revs"], rev_input.as_bytes()).await?;
     ensure!(bytes.len() <= LIMIT, "lab pack size limit");
 
     let pack_report = delta::verify_pack(&bytes, &delta::Limits::default())?;
@@ -265,13 +208,7 @@ pub(super) async fn publish_pack(
     let scratch = Session::new(config)?;
     let pack_path = scratch.0.join("upload.pack");
     std::fs::write(&pack_path, &bytes)?;
-    config
-        .git(
-            git_dir,
-            &["index-pack", "--strict", &pack_path.to_string_lossy()],
-            b"",
-        )
-        .await?;
+    config.git(git_dir, &["index-pack", "--strict", &pack_path.to_string_lossy()], b"").await?;
     let idx = std::fs::read(scratch.0.join("upload.idx"))?;
     let dir = config.root.join("objects").join(repo.to_string());
     if !dir.exists() {
@@ -280,49 +217,41 @@ pub(super) async fn publish_pack(
     }
     for (ext, data) in [("pack", &bytes), ("idx", &idx)] {
         let dest = dir.join(format!("{id}.{ext}"));
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&dest)?;
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&dest)?;
         f.write_all(data)?;
         f.sync_all()?;
         ensure!(std::fs::read(&dest)? == *data, "object read-back mismatch");
     }
     File::open(&dir)?.sync_all()?;
-    Ok(Some((
-        Pack {
-            id,
-            pack_sha256: digest(&bytes),
-            idx_sha256: digest(&idx),
-        },
-        inc_walk.reachable_oids,
-    )))
+    Ok(Some((Pack { id, pack_sha256: digest(&bytes), idx_sha256: digest(&idx) }, inc_walk.reachable_oids)))
 }
 
 /// Reclaims unreferenced orphan `.pack`/`.idx` files left by failed/aborted operations,
 /// fences non-terminal operations, and purges expired read snapshots.
 pub(super) async fn gc(config: &Config, repo_filter: Option<Uuid>) -> Result<GcReport> {
     let mut c = config.db().await?;
-    let t = c.transaction().await?;
+    // The repository row locks can wait behind a retained-snapshot commit.
+    // Read committed keeps the post-wait live-snapshot scan fresh instead of
+    // reusing a repeatable-read image taken before the wait.
+    let t = c
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::ReadCommitted)
+        .read_only(false)
+        .start()
+        .await?;
 
     let repos: Vec<Uuid> = if let Some(repo) = repo_filter {
-        t.query(
-            "SELECT id FROM pando_lab.repositories WHERE id=$1 FOR UPDATE",
-            &[&repo],
-        )
-        .await?
-        .into_iter()
-        .map(|r| r.get(0))
-        .collect()
+        t.query("SELECT id FROM pando_lab.repositories WHERE id=$1 FOR UPDATE", &[&repo])
+            .await?
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect()
     } else {
-        t.query(
-            "SELECT id FROM pando_lab.repositories ORDER BY id FOR UPDATE",
-            &[],
-        )
-        .await?
-        .into_iter()
-        .map(|r| r.get(0))
-        .collect()
+        t.query("SELECT id FROM pando_lab.repositories ORDER BY id FOR UPDATE", &[])
+            .await?
+            .into_iter()
+            .map(|r| r.get(0))
+            .collect()
     };
 
     let aborted_operations_fenced = if let Some(repo) = repo_filter {
@@ -340,45 +269,22 @@ pub(super) async fn gc(config: &Config, repo_filter: Option<Uuid>) -> Result<GcR
     };
 
     let expired_snapshots_deleted = if let Some(repo) = repo_filter {
-        t.execute(
-            "DELETE FROM pando_lab.snapshots WHERE repo=$1 AND expires_at<=clock_timestamp()",
-            &[&repo],
-        )
-        .await?
+        t.execute("DELETE FROM pando_lab.snapshots WHERE repo=$1 AND expires_at<=clock_timestamp()", &[&repo]).await?
     } else {
-        t.execute(
-            "DELETE FROM pando_lab.snapshots WHERE expires_at<=clock_timestamp()",
-            &[],
-        )
-        .await?
+        t.execute("DELETE FROM pando_lab.snapshots WHERE expires_at<=clock_timestamp()", &[]).await?
     };
 
     let committed_rows = if let Some(repo) = repo_filter {
-        t.query(
-            "SELECT repo,pack_id FROM pando_lab.manifests WHERE repo=$1",
-            &[&repo],
-        )
-        .await?
+        t.query("SELECT repo,pack_id FROM pando_lab.manifests WHERE repo=$1", &[&repo]).await?
     } else {
-        t.query("SELECT repo,pack_id FROM pando_lab.manifests", &[])
-            .await?
+        t.query("SELECT repo,pack_id FROM pando_lab.manifests", &[]).await?
     };
-    let mut committed: BTreeSet<(Uuid, Uuid)> = committed_rows
-        .into_iter()
-        .map(|r| (r.get(0), r.get(1)))
-        .collect();
+    let mut committed: BTreeSet<(Uuid, Uuid)> = committed_rows.into_iter().map(|r| (r.get(0), r.get(1))).collect();
     let active_snap_rows = if let Some(repo) = repo_filter {
-        t.query(
-            "SELECT repo,packs FROM pando_lab.snapshots WHERE repo=$1 AND expires_at>clock_timestamp()",
-            &[&repo],
-        )
-        .await?
+        t.query("SELECT repo,packs FROM pando_lab.snapshots WHERE repo=$1 AND expires_at>clock_timestamp()", &[&repo])
+            .await?
     } else {
-        t.query(
-            "SELECT repo,packs FROM pando_lab.snapshots WHERE expires_at>clock_timestamp()",
-            &[],
-        )
-        .await?
+        t.query("SELECT repo,packs FROM pando_lab.snapshots WHERE expires_at>clock_timestamp()", &[]).await?
     };
     for row in active_snap_rows {
         let srepo: Uuid = row.get(0);
