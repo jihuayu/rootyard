@@ -9,6 +9,7 @@ use std::io::Write;
 
 use rootyard::ref_store::projector::RemoteAuthzBridgeError;
 use rootyard::ref_store::raft_backend::RaftBackendError;
+use rootyard_refcas_log::E;
 
 #[path = "quorum_diagnostic.rs"]
 mod quorum_diagnostic;
@@ -164,8 +165,50 @@ pub(crate) enum Class {
     BridgeDatabase,
     BridgeInvalidInput,
     BridgeAuthority,
+    FinalReopenShutdown,
+    FinalReopenDirectory,
+    FinalReopenExhausted,
+    FinalReopenSnapshotRead,
+    FinalReopenSnapshotMissing,
     BackendOther,
     Unclassified,
+}
+
+/// Test-only terminal branches for the final restart check.
+///
+/// Every variant keeps the original underlying error as its source, while its static display text
+/// never carries paths, identifiers, or provider output. `Class::from_error` maps the variant to
+/// one fixed closed class so the published frame distinguishes the failed branch without changing
+/// the original reopen deadline, backoff, or native read.
+#[derive(Debug)]
+pub(crate) enum FinalReopenFailure {
+    Shutdown(RaftBackendError),
+    Directory,
+    Exhausted(E),
+    SnapshotRead(E),
+    SnapshotMissing,
+}
+
+impl std::fmt::Display for FinalReopenFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Shutdown(_) => "final reopen shutdown failed",
+            Self::Directory => "final reopen required directory is unavailable",
+            Self::Exhausted(_) => "final reopen retry deadline exhausted",
+            Self::SnapshotRead(_) => "final reopen application snapshot read failed",
+            Self::SnapshotMissing => "final reopen application snapshot is missing",
+        })
+    }
+}
+
+impl std::error::Error for FinalReopenFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Shutdown(error) => Some(error),
+            Self::Exhausted(error) | Self::SnapshotRead(error) => Some(error),
+            Self::Directory | Self::SnapshotMissing => None,
+        }
+    }
 }
 
 impl Class {
@@ -187,12 +230,26 @@ impl Class {
             Self::BridgeDatabase => "bridge_database",
             Self::BridgeInvalidInput => "bridge_invalid_input",
             Self::BridgeAuthority => "bridge_authority",
+            Self::FinalReopenShutdown => "final_reopen_shutdown",
+            Self::FinalReopenDirectory => "final_reopen_directory",
+            Self::FinalReopenExhausted => "final_reopen_exhausted",
+            Self::FinalReopenSnapshotRead => "final_reopen_snapshot_read",
+            Self::FinalReopenSnapshotMissing => "final_reopen_snapshot_missing",
             Self::BackendOther => "backend_other",
             Self::Unclassified => "unclassified",
         }
     }
 
     pub(crate) fn from_error(error: &anyhow::Error) -> Self {
+        if let Some(error) = error.downcast_ref::<FinalReopenFailure>() {
+            return match error {
+                FinalReopenFailure::Shutdown(_) => Self::FinalReopenShutdown,
+                FinalReopenFailure::Directory => Self::FinalReopenDirectory,
+                FinalReopenFailure::Exhausted(_) => Self::FinalReopenExhausted,
+                FinalReopenFailure::SnapshotRead(_) => Self::FinalReopenSnapshotRead,
+                FinalReopenFailure::SnapshotMissing => Self::FinalReopenSnapshotMissing,
+            };
+        }
         if let Some(error) = error.downcast_ref::<RaftBackendError>() {
             return match error {
                 RaftBackendError::ProposalScopeMismatch(_) => Self::ProposalScope,

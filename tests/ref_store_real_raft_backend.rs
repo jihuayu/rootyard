@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use openraft::entry::RaftEntry as _;
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{BasicNode, CommittedLeaderId, Config, Entry, EntryPayload, LogId, ServerState, SnapshotPolicy};
@@ -47,8 +47,8 @@ use uuid::Uuid;
 mod scope_drain_support;
 
 use scope_drain_support::failure_phase::{
-    CASE_REAL, Class, Operation, Phase, PhaseGuard, note_append_decoded, note_append_handled, note_append_written,
-    observe_call, reset_append_witness,
+    CASE_REAL, Class, FinalReopenFailure, Operation, Phase, PhaseGuard, note_append_decoded, note_append_handled,
+    note_append_written, observe_call, reset_append_witness,
 };
 
 const TEST_GROUP: &str = "group-175";
@@ -218,6 +218,11 @@ struct TestCluster {
     nodes: Vec<TestNode>,
 }
 
+struct TestClusterShutdown {
+    dirs: Vec<(u64, tempfile::TempDir)>,
+    first_error: Option<RaftBackendError>,
+}
+
 impl TestCluster {
     async fn start_three(trust: NodeTrust) -> Result<Self> {
         let pki = TestPki::new()?;
@@ -332,16 +337,19 @@ impl TestCluster {
         }
     }
 
-    async fn shutdown(self) -> Vec<(u64, tempfile::TempDir)> {
+    async fn shutdown(self) -> TestClusterShutdown {
         let mut dirs = Vec::new();
+        let mut first_error = None;
         for node in self.nodes {
             let TestNode { id, dir, node, stop, .. } = node;
             let _ = stop.send(true);
-            let _ = node.shutdown().await;
+            if let Err(error) = node.shutdown().await {
+                first_error.get_or_insert(error);
+            }
             drop(node);
             dirs.push((id, dir));
         }
-        dirs
+        TestClusterShutdown { dirs, first_error }
     }
 }
 
@@ -1357,11 +1365,28 @@ async fn real_root_refcas_commands_through_quorum_mtls_sqlite_and_restart_body(
     phase.set(Phase::FinalReopen);
     // Restart actual cluster SQLite state: shut down all nodes, reopen the leader's application
     // state machine from its own directory, and verify the committed Root refs/coordinate.
-    let dirs = cluster.shutdown().await;
-    let (reopen_id, reopen_dir) =
-        dirs.iter().find(|entry| entry.0 == healed_leader).or_else(|| dirs.first()).context("cluster dirs")?;
-    let restarted = reopen_application(reopen_dir.path(), *reopen_id).await?;
-    let restarted_snapshot = restarted.application_snapshot().await?.expect("application state");
+    let shutdown = cluster.shutdown().await;
+    let (reopen_id, reopen_dir) = shutdown
+        .dirs
+        .iter()
+        .find(|entry| entry.0 == healed_leader)
+        .or_else(|| shutdown.dirs.first())
+        .ok_or_else(|| anyhow::Error::new(FinalReopenFailure::Directory))?;
+    let restarted = match reopen_application(reopen_dir.path(), *reopen_id).await {
+        Ok(restarted) => restarted,
+        Err(FinalReopenFailure::Exhausted(error)) => {
+            return Err(match shutdown.first_error {
+                Some(error) => anyhow::Error::new(FinalReopenFailure::Shutdown(error)),
+                None => anyhow::Error::new(FinalReopenFailure::Exhausted(error)),
+            });
+        }
+        Err(error) => return Err(anyhow::Error::new(error)),
+    };
+    let restarted_snapshot = match restarted.application_snapshot().await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return Err(anyhow::Error::new(FinalReopenFailure::SnapshotMissing)),
+        Err(error) => return Err(anyhow::Error::new(FinalReopenFailure::SnapshotRead(error))),
+    };
     let restarted_reducer = reducer_snapshot(&restarted_snapshot);
     assert_eq!(restarted_reducer.read_refs(repo).get("refs/heads/main"), Some(&expected_oid));
     assert_eq!(restarted_reducer.read_head_ref(repo).as_deref(), Some("refs/heads/main"));
@@ -1430,7 +1455,7 @@ async fn pruned_receipts_export_restore_and_sqlite_reopen() -> Result<()> {
     Ok(())
 }
 
-async fn reopen_application(dir: &std::path::Path, node_id: u64) -> Result<PersistentStateMachine> {
+async fn reopen_application(dir: &std::path::Path, node_id: u64) -> Result<PersistentStateMachine, FinalReopenFailure> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         match PersistentStateMachine::open_application(dir, node_id, true, Box::new(RootRefCasStateMachine::new()))
@@ -1439,7 +1464,7 @@ async fn reopen_application(dir: &std::path::Path, node_id: u64) -> Result<Persi
             Ok(sm) => return Ok(sm),
             Err(error) => {
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!("reopen restarted application state machine: {error}"));
+                    return Err(FinalReopenFailure::Exhausted(error));
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }

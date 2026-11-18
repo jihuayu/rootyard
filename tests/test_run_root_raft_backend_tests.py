@@ -951,6 +951,39 @@ class RootRaftRunnerTest(unittest.TestCase):
         self.assertFalse(secret_phase.diagnostics_valid)
         self.assertNotIn(SECRET, json.dumps(secret_phase.case_failures))
 
+    def test_final_reopen_failure_classes_are_closed(self) -> None:
+        classes = (
+            "final_reopen_shutdown",
+            "final_reopen_directory",
+            "final_reopen_exhausted",
+            "final_reopen_snapshot_read",
+            "final_reopen_snapshot_missing",
+        )
+        for class_code in classes:
+            with self.subTest(class_code=class_code):
+                frame = (
+                    f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
+                    f"phase=final_reopen class={class_code}\n"
+                )
+                evidence = runner.collect_failure_evidence("", frame)
+                self.assertTrue(evidence.diagnostics_valid)
+                self.assertEqual(
+                    evidence.case_failures,
+                    [{"case": CASE_REAL, "phase": "final_reopen", "class": class_code}],
+                )
+                self.assertEqual(evidence.failure_phase, "final_reopen")
+                self.assertEqual(evidence.failure_class, class_code)
+                self.assertNotIn(SECRET, json.dumps(evidence.case_failures))
+
+        unknown = runner.collect_failure_evidence(
+            "",
+            f"ROOTYARD_FAILURE_FRAME v1 case={CASE_REAL} "
+            "phase=final_reopen class=final_reopen_attempt\n" + SECRET,
+        )
+        self.assertFalse(unknown.diagnostics_valid)
+        self.assertEqual(unknown.case_failures, [])
+        self.assertNotIn(SECRET, json.dumps(unknown.case_failures))
+
     def test_quorum_diagnostic_is_validated_and_safely_rebuilt(self) -> None:
         for operation, cause, phase in (
             ("client_write", "write_forward", "semantic_input_write"),

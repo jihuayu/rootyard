@@ -97,7 +97,9 @@ _FAILURE_CLASSES = frozenset(
         "follower_redirect", "quorum_unavailable", "apply_barrier", "storage",
         "encode", "wrong_reducer", "recovery_not_observed", "scope_binding",
         "scope_close_recovery", "bridge_database", "bridge_invalid_input",
-        "bridge_authority", "backend_other", "unclassified",
+        "bridge_authority", "final_reopen_shutdown", "final_reopen_directory",
+        "final_reopen_exhausted", "final_reopen_snapshot_read",
+        "final_reopen_snapshot_missing", "backend_other", "unclassified",
     )
 )
 _FAILURE_CASES = {REQUIRED_CASES[0]: _REAL_PHASES, REQUIRED_CASES[2]: _SCOPE_PHASES}
