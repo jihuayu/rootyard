@@ -25,6 +25,9 @@ use uuid::Uuid;
 /// deliberately has no gateway caller while the legacy path stays authoritative.
 pub(crate) mod slot_zero;
 
+/// Read-only migration-152 public operation/current attempt resolver.
+pub(crate) mod public_attempt;
+
 const MAX_QUERY_WINDOW: Duration = Duration::from_secs(30);
 pub const OPERATION_LOCK_DOMAIN: &str = "rootyard-ref-store-operation-v1";
 pub const OPERATION_LOCK_SQL: &str =
