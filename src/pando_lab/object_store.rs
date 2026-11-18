@@ -15,8 +15,6 @@ pub(super) use publish::put_pack;
 pub(crate) use publish::put_pack_and_seal_with_suite;
 #[cfg(test)]
 use publish::put_pack_db_inner;
-#[cfg_attr(not(test), expect(unused_imports, reason = "unit tests exercise the raw file publication reexport"))]
-pub use publish::put_pack_files;
 #[cfg(test)]
 mod pg_receipt_tests;
 #[cfg(test)]
@@ -458,6 +456,25 @@ fn ensure_encrypted_hook_backend_supported(remote: bool) -> Result<()> {
         "encrypted Git-hook publication is unsupported with ROOTYARD_OBJECT_STORE_ENDPOINT; local CAS cannot be committed as a remote-backed object-store publication"
     );
     Ok(())
+}
+
+pub async fn put_pack_files(
+    store_root_dir: &Path,
+    local_objects_root: &Path,
+    repo: Uuid,
+    pack_id: Uuid,
+    opts: &ObjectStorePutOptions,
+) -> Result<(ObjectStorePutReport, CasPackManifest)> {
+    ensure!(
+        lifecycle::provider_selection::selected_kind()? == lifecycle::provider_selection::PandoProviderSelection::Local,
+        "raw Local object-store helper cannot publish unterminated Vault writes"
+    );
+    let prepared =
+        prepare_pack_files_sealed(store_root_dir, local_objects_root, repo, pack_id, opts, "hot", None, None).await?;
+    // This raw path has no DB authority, so its verified envelope file is the
+    // only metadata authority. The staged prepare itself never writes a mirror.
+    prepared.write_file_only_mirror()?;
+    Ok((prepared.report().clone(), prepared.manifest().clone()))
 }
 
 pub async fn get_pack_files(

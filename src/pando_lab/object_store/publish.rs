@@ -1,16 +1,11 @@
 //! Prepared and DB-backed Pando pack publication entry points.
-//!
-//! The raw public helper and the DB-backed put paths share the prepared CAS
-//! artifact and authoritative publication transaction. Read/verify/status
-//! helpers remain in the parent module.
 
 use super::super::{Config, Pack, delta, lifecycle};
 use super::{
-    CasPackManifest, ObjectStorePutOptions, ObjectStorePutReport, PreparedPackPublication, prepare_pack_files_sealed,
-    remote_enabled, store_root,
+    ObjectStorePutOptions, ObjectStorePutReport, PreparedPackPublication, prepare_pack_files_sealed, remote_enabled,
+    store_root,
 };
 use anyhow::{Result, ensure};
-use std::path::Path;
 use tokio_postgres::Client;
 use uuid::Uuid;
 pub(crate) async fn prepare_known_pack_publication(
@@ -70,25 +65,6 @@ pub(crate) async fn prepare_known_pack_publication(
         );
     }
     Ok(prepared)
-}
-
-pub async fn put_pack_files(
-    store_root_dir: &Path,
-    local_objects_root: &Path,
-    repo: Uuid,
-    pack_id: Uuid,
-    opts: &ObjectStorePutOptions,
-) -> Result<(ObjectStorePutReport, CasPackManifest)> {
-    ensure!(
-        lifecycle::provider_selection::selected_kind()? == lifecycle::provider_selection::PandoProviderSelection::Local,
-        "raw Local object-store helper cannot publish unterminated Vault writes"
-    );
-    let prepared =
-        prepare_pack_files_sealed(store_root_dir, local_objects_root, repo, pack_id, opts, "hot", None, None).await?;
-    // This raw path has no DB authority, so its verified envelope file is the
-    // only metadata authority. The staged prepare itself never writes a mirror.
-    prepared.write_file_only_mirror()?;
-    Ok((prepared.report().clone(), prepared.manifest().clone()))
 }
 
 pub(super) async fn put_pack_db_inner(
