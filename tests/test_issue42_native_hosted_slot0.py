@@ -2125,8 +2125,8 @@ esac
             self.assertIn(action, self.text)
         pin = self.text.split("PRODUCT_SHA:", 1)[1].splitlines()[0].strip()
         tree = self.text.split("PRODUCT_TREE:", 1)[1].splitlines()[0].strip()
-        self.assertEqual(pin, "54526cc987719c629e55eef7571913958e8f9188")
-        self.assertEqual(tree, "0054cee88f2491d0dbb92bb56e1677b543356bcb")
+        self.assertEqual(pin, "88e9c7007d03a296cdbead372ade2a4b35f64a00")
+        self.assertEqual(tree, "8b0e35c99259e90818d286b14522a8d27914f63d")
         self.assertIn("Run exactly the twelve bounded native cases", self.text)
 
     def test_owned_postgres_and_fixed_artifact(self):
