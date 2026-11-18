@@ -82,7 +82,8 @@ use crate::{
         CommitRejectCode, RefCommitResult, TerminalKind,
         core::{
             decision_commit::{PgDecisionProtocol, RealmExpectation},
-            pack_commit::PackCommitTerminal,
+            pack_commit::{PackCommitRejectCode, PackCommitTerminal},
+            publication_decision::codes::DenialCode,
         },
         serving::lookup,
     },
@@ -94,6 +95,12 @@ const SEED_REF: &str = "refs/heads/main";
 const MAX_CAPTURED_RESPONSE: usize = 64 * 1024 * 1024;
 const OWNED_BLOB_OPT_IN: &str = "ROOTYARD_TEST_OWNED_DISPOSABLE_BLOB";
 const FAILURE_PHASE_MARKER: &str = "ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKER";
+/// Exact persisted detail of the post-admission immutable-plan refusal built by
+/// `authorized/refusal.rs` (`RevisionMismatch` + this detail). No production
+/// constant names this literal, so it stays local to the assertion instead of
+/// widening that module; `PackCommitRejectCode::RevisionMismatch.as_str()` is
+/// used for the code half.
+const POST_ADMISSION_REFUSAL_DETAIL: &str = "admitted base was superseded";
 
 /// A parsed `report-status`: the `unpack` status and `(ref, ng reason)` rows.
 type GitReport = (String, Vec<(String, Option<String>)>);
@@ -397,6 +404,32 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
             return Err(anyhow!("the rejected terminal contains an applied ref: {terminal:?}"));
         }
     }
+    ensure!(terminal.repository_id == repository_id, "the rejected terminal names another repository: {terminal:?}");
+    let rejection = terminal
+        .rejection
+        .as_ref()
+        .ok_or_else(|| anyhow!("the rejected terminal has no operation-level rejection: {terminal:?}"))?;
+    let rejection_code = PackCommitRejectCode::parse(&rejection.code)
+        .map_err(|_| anyhow!("the rejected terminal carries an unknown rejection code: {terminal:?}"))?;
+    ensure!(
+        rejection_code == PackCommitRejectCode::NoRefApplied,
+        "the loser terminal rejection is {rejection_code:?}, not the per-ref CAS refusal: {terminal:?}"
+    );
+    ensure!(
+        rejection.detail == DenialCode::AllRejected.as_str(),
+        "the loser terminal rejection detail is {:?}, not the per-ref CAS reason: {terminal:?}",
+        rejection.detail
+    );
+    // `operation_verdict.py` classifies this exact persisted pair as
+    // `per_ref_cas_rejected`. The post-admission immutable-plan refusal is
+    // `RevisionMismatch` + "admitted base was superseded"
+    // (`admitted_base_superseded`). Compare typed persisted wire fields, never
+    // a std `Debug` rendering of the operation.
+    ensure!(
+        (rejection.code.as_str(), rejection.detail.as_str())
+            != (PackCommitRejectCode::RevisionMismatch.as_str(), POST_ADMISSION_REFUSAL_DETAIL),
+        "the loser terminal is the post-admission immutable-plan refusal, not the pre-admission per-ref CAS refusal: {terminal:?}"
+    );
     let revision_after = gate_revision(db, repository_id).await?;
     ensure!(
         revision_after == revision_before + 1,
