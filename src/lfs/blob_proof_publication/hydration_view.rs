@@ -418,14 +418,18 @@ impl PgLfsBlobStore {
                 Some("committed") => continue,
                 _ => {
                     if !force_new_repair_epoch && ep > 0 {
-                        return Ok(derive_default_upload_operation_id(
+                        let prev = derive_default_upload_operation_id(
                             repository_id,
                             tenant_id,
                             actor_id,
                             oid_sha256,
                             size_bytes,
                             ep - 1,
-                        ));
+                        );
+                        if commit_auth.is_some() {
+                            let _ = self.begin_or_load_upload_operation_with_auth(prev, spec, commit_auth).await?;
+                        }
+                        return Ok(prev);
                     }
                     let _ = self.begin_or_load_upload_operation_with_auth(cand, spec, commit_auth).await?;
                     return Ok(cand);

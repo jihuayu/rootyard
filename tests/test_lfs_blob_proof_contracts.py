@@ -30,7 +30,7 @@ class LfsBlobProofContractTests(unittest.TestCase):
                 FACADE,
                 *MOD_DIR.glob("*.rs"),
                 TEST_MAIN,
-                *TEST_SUPPORT.glob("*.rs"),
+                *TEST_SUPPORT.rglob("*.rs"),
                 EVAL_SCRIPT,
                 ROOT / "tests" / "test_lfs_blob_proof_contracts.py",
                 DOC,
@@ -57,7 +57,7 @@ class LfsBlobProofContractTests(unittest.TestCase):
         self.assertEqual([], list((ROOT / "src" / "lfs").rglob("mod.rs")))
 
         fn_pat = re.compile(r"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([a-zA-Z0-9_]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)", re.S)
-        for path in [TEST_MAIN, *sorted(TEST_SUPPORT.glob("*.rs"))]:
+        for path in [TEST_MAIN, *sorted(TEST_SUPPORT.rglob("*.rs"))]:
             txt = path.read_text(encoding="utf-8")
             for m in fn_pat.finditer(txt):
                 args = [a.strip() for a in m.group(2).split(",") if a.strip() and not a.strip().endswith("self")]
@@ -132,6 +132,8 @@ class LfsBlobProofContractTests(unittest.TestCase):
             "pg_advisory_unlock",
             "verify_commit_write_authority_in_tx",
             "record_committed_blob_with_auth",
+            "enforce_live_attempt_and_commit_in_tx",
+            "finalize_committed_operation_in_tx",
             "lease_until",
             "operation_id",
         )
@@ -148,7 +150,22 @@ class LfsBlobProofContractTests(unittest.TestCase):
         self.assertNotIn("reauthorize_repo", upload_body)
         self.assertIn("finish_and_unlock", upload_body)
 
+        transfer_src = (MOD_DIR / "transfer.rs").read_text(encoding="utf-8")
+        transfer_upload = transfer_src.split("pub async fn upload_streamed_lfs_object_to_remote_with_auth(", 1)[1]
+        self.assertIn("begin_or_load_upload_operation_with_auth(op_id, op_spec, commit_auth)", transfer_upload)
+        self.assertIn(
+            "ensure_default_upload_operation_with_auth(op_spec, stale_missing_locator.is_some(), commit_auth)",
+            transfer_upload,
+        )
+        self.assertNotIn("begin_or_load_upload_operation_with_auth(op_id, op_spec, None)", transfer_upload)
+        self.assertNotIn(
+            "ensure_default_upload_operation_with_auth(op_spec, stale_missing_locator.is_some(), None)",
+            transfer_upload,
+        )
+
+        self.assertTrue((TEST_SUPPORT / "lease_state_regressions.rs").is_file())
         multi_src = (TEST_SUPPORT / "multi_instance_auth_boundary.rs").read_text(encoding="utf-8")
+        self.assertIn("lease_state_regressions", multi_src)
         self.assertIn("exercise_post_auth_pending_multi_instance_active_lease_and_atomic_commit_auth", multi_src)
         self.assertIn("multi_instance_auth_boundary", TEST_MAIN.read_text(encoding="utf-8"))
         fallback = (TEST_SUPPORT / "git_smart_http.rs").read_text(encoding="utf-8").split(

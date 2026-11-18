@@ -279,6 +279,12 @@ pub async fn upload_streamed_lfs_object_to_remote_with_auth(
         let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, "upload SHA-256 mismatch").await;
         return Err(LfsBlobError::new(LfsProofRejectCode::SizeOrDigestMismatch, "upload SHA-256 digest mismatch"));
     }
+    if streamed.pre_attempt_id.is_some()
+        && let Err(e) = super::prod_auth_tx::verify_staged_attempt_lease(ctx.pg, attempt_id, expected_size, false).await
+    {
+        let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
+        return Err(e);
+    }
     let mut stale_missing_locator: Option<StoredBlobLocatorRef> = None;
     let std_dl = StdInstant::now() + ctx.timeout;
     let mut verified_fast_existing: Option<CommittedLfsBlobRecord> = None;
@@ -318,15 +324,23 @@ pub async fn upload_streamed_lfs_object_to_remote_with_auth(
     };
     let resolved_op_id = match operation_id {
         Some(op_id) => {
-            if let Err(e) = ctx.pg.begin_or_load_upload_operation_with_auth(op_id, op_spec, None).await {
+            if let Err(e) = ctx.pg.begin_or_load_upload_operation_with_auth(op_id, op_spec, commit_auth).await {
                 let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
                 return Err(e);
             }
             op_id
         }
-        None => {
-            ctx.pg.ensure_default_upload_operation_with_auth(op_spec, stale_missing_locator.is_some(), None).await?
-        }
+        None => match ctx
+            .pg
+            .ensure_default_upload_operation_with_auth(op_spec, stale_missing_locator.is_some(), commit_auth)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
+                return Err(e);
+            }
+        },
     };
     if let Some(existing) = verified_fast_existing {
         let committed = match ctx
@@ -335,10 +349,7 @@ pub async fn upload_streamed_lfs_object_to_remote_with_auth(
             .await
         {
             Ok(c) => c,
-            Err(e) => {
-                let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
-                return Err(e);
-            }
+            Err(e) => return Err(orphan_fail(ctx, attempt_id, resolved_op_id, e).await),
         };
         verify_record_locator(ctx, &committed, oid_sha256, expected_size).await?;
         return Ok(committed);
@@ -346,10 +357,7 @@ pub async fn upload_streamed_lfs_object_to_remote_with_auth(
     let pg_dl = TokioInstant::now() + ctx.timeout;
     let grant = match ctx.pg.acquire_lfs_upload_hold(store, ctx.realm, oid_sha256, expected_size as u64, pg_dl).await {
         Ok(g) => g,
-        Err(e) => {
-            let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
-            return Err(e);
-        }
+        Err(e) => return Err(orphan_fail(ctx, attempt_id, resolved_op_id, e).await),
     };
     let uploader = ProtectedUploader::new(store.clone());
     let pub_res = uploader
@@ -364,10 +372,7 @@ pub async fn upload_streamed_lfs_object_to_remote_with_auth(
         });
     let publication = match pub_res {
         Ok(p) => p,
-        Err(e) => {
-            let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
-            return Err(e);
-        }
+        Err(e) => return Err(orphan_fail(ctx, attempt_id, resolved_op_id, e).await),
     };
     let pr = publication
         .receipts()
@@ -386,7 +391,9 @@ pub async fn upload_streamed_lfs_object_to_remote_with_auth(
         uploader_actor_id: ctx.access.actor_id,
         retired: false,
     };
-    verify_record_locator(ctx, &candidate, oid_sha256, expected_size).await?;
+    if let Err(e) = verify_record_locator(ctx, &candidate, oid_sha256, expected_size).await {
+        return Err(orphan_fail(ctx, attempt_id, resolved_op_id, e).await);
+    }
     let committed = match ctx
         .pg
         .record_committed_blob_with_auth(
@@ -399,14 +406,18 @@ pub async fn upload_streamed_lfs_object_to_remote_with_auth(
         .await
     {
         Ok(c) => c,
-        Err(e) => {
-            let _ = ctx.pg.mark_upload_attempt_aborted(attempt_id, &e.message).await;
-            return Err(e);
-        }
+        Err(e) => return Err(orphan_fail(ctx, attempt_id, resolved_op_id, e).await),
     };
     verify_record_locator(ctx, &committed, oid_sha256, expected_size).await?;
     Ok(committed)
 }
+
+async fn orphan_fail(ctx: &LfsTransferContext<'_>, attempt_id: Uuid, op_id: Uuid, e: LfsBlobError) -> LfsBlobError {
+    super::prod_auth_tx::abort_attempt_and_orphan_op(ctx.pg, ctx.realm.repository_id, attempt_id, op_id, &e.message)
+        .await;
+    e
+}
+
 async fn verify_record_locator(
     ctx: &LfsTransferContext<'_>,
     rec: &CommittedLfsBlobRecord,

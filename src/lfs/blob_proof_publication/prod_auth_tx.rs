@@ -5,9 +5,9 @@ use uuid::Uuid;
 
 use crate::token_scopes::RepoAction;
 
-use super::authz::{AuthorizedRepoAccess, SubjectTenantAuthority, evaluate_subject_tenant_access};
+pub(super) use super::authz_tx::resolve_authoritative_repo_access_in_tx;
 use super::pg_store::{PgLfsBlobStore, pg_err};
-use super::types::{LfsBlobError, LfsCollaboratorRole, LfsProofRejectCode};
+use super::types::{CommittedLfsBlobRecord, LfsBlobError, LfsProofRejectCode, StoredBlobLocatorRef};
 
 #[derive(Clone)]
 pub struct ProdCommitAuthCheck {
@@ -39,173 +39,6 @@ pub(super) fn map_app_auth_err(err: crate::Error) -> LfsBlobError {
         axum::http::StatusCode::CONFLICT => LfsBlobError::new(LfsProofRejectCode::AttestationEquivocation, err.1),
         _ => LfsBlobError::new(LfsProofRejectCode::PgDatabase, err.1),
     }
-}
-
-/// Resolves authoritative relational RBAC inside the caller's transaction, without committing it.
-pub(super) async fn resolve_authoritative_repo_access_in_tx(
-    tx: &Transaction<'_>,
-    repository_id: Uuid,
-    expected_tenant_id: Option<Uuid>,
-    actor_id: Uuid,
-    actor_username: &str,
-    require_write: bool,
-    require_admin: bool,
-) -> Result<AuthorizedRepoAccess, LfsBlobError> {
-    let ns_row = tx
-        .query_opt(
-            "SELECT r.owner_id, ns.slug, ns.kind, ns.user_id, ns.organization_id,
-                    r.state, r.transition_state, r.archived_at IS NOT NULL, r.deleted_at IS NOT NULL
-             FROM repositories r
-             JOIN namespaces ns ON ns.id = r.owner_id
-             WHERE r.id = $1
-             FOR SHARE OF r, ns",
-            &[&repository_id],
-        )
-        .await
-        .map_err(pg_err)?
-        .ok_or_else(|| LfsBlobError::new(LfsProofRejectCode::MissingRemoteBlob, "repository missing"))?;
-
-    let owner_ns_id: Uuid = ns_row.get(0);
-    let ns_slug: String = ns_row.get(1);
-    let ns_kind: String = ns_row.get(2);
-    let ns_user_id: Option<Uuid> = ns_row.get(3);
-    let ns_org_id: Option<Uuid> = ns_row.get(4);
-    let state: String = ns_row.get(5);
-    let transition: String = ns_row.get(6);
-    let archived: bool = ns_row.get(7);
-    let deleted: bool = ns_row.get(8);
-    if let Some(exp_tenant) = expected_tenant_id
-        && owner_ns_id != exp_tenant
-    {
-        return Err(LfsBlobError::new(
-            LfsProofRejectCode::AttestationEquivocation,
-            "repository ownership tenant changed",
-        ));
-    }
-    if deleted
-        || state != "ready"
-        || (require_write
-            && (archived
-                || transition != "stable"
-                || crate::auth::lifecycle::has_active_transfer(&**tx, repository_id).await.map_err(pg_err)?))
-    {
-        return Err(LfsBlobError::new(
-            LfsProofRejectCode::UnauthorizedCollaborator,
-            "repository is deleted, archived, transferring, or not ready for LFS mutation",
-        ));
-    }
-
-    // 1. Personal namespace owner verified via relational `namespaces JOIN users` (`FOR SHARE`).
-    if ns_kind == "user"
-        && let Some(bound_uid) = ns_user_id
-    {
-        let verified_owner = tx
-            .query_opt(
-                "SELECT n.id FROM namespaces n JOIN users u ON u.id = n.user_id
-                 WHERE n.id = $1 AND n.kind = 'user' AND u.id = $2
-                 FOR SHARE OF n, u",
-                &[&owner_ns_id, &actor_id],
-            )
-            .await
-            .map_err(pg_err)?;
-        if verified_owner.is_some() && bound_uid == actor_id {
-            return evaluate_subject_tenant_access(
-                repository_id,
-                owner_ns_id,
-                actor_id,
-                actor_username,
-                SubjectTenantAuthority::PersonalNamespaceOwner {
-                    namespace_id: owner_ns_id,
-                    namespace_slug: ns_slug,
-                },
-                require_write,
-                require_admin,
-            );
-        }
-    }
-
-    // 2. Organization memberships + organization teams (`FOR SHARE`), plus direct/team repo collaborators.
-    let mut best_org_role: Option<(Uuid, LfsCollaboratorRole)> = None;
-    if ns_kind == "organization"
-        && let Some(org_id) = ns_org_id
-    {
-        for r in tx
-            .query(
-                "SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 FOR SHARE",
-                &[&org_id, &actor_id],
-            )
-            .await
-            .map_err(pg_err)?
-        {
-            let parsed = LfsCollaboratorRole::parse(r.get::<_, &str>(0))?;
-            best_org_role = Some(best_org_role.map_or((org_id, parsed), |(id, cur)| (id, cur.max(parsed))));
-        }
-        for r in tx
-            .query(
-                "SELECT t.role FROM organization_teams t
-                 JOIN organization_team_members tm ON tm.team_id = t.id
-                 WHERE t.organization_id = $1 AND tm.user_id = $2
-                 FOR SHARE OF t, tm",
-                &[&org_id, &actor_id],
-            )
-            .await
-            .map_err(pg_err)?
-        {
-            let parsed = LfsCollaboratorRole::parse(r.get::<_, &str>(0))?;
-            best_org_role = Some(best_org_role.map_or((org_id, parsed), |(id, cur)| (id, cur.max(parsed))));
-        }
-    }
-
-    let mut best_repo_role: Option<LfsCollaboratorRole> = None;
-    for r in tx
-        .query(
-            "SELECT role FROM repository_collaborators WHERE repository_id=$1 AND user_id=$2 FOR SHARE",
-            &[&repository_id, &actor_id],
-        )
-        .await
-        .map_err(pg_err)?
-    {
-        let parsed = LfsCollaboratorRole::parse(r.get::<_, &str>(0))?;
-        best_repo_role = Some(best_repo_role.map_or(parsed, |cur| cur.max(parsed)));
-    }
-    for r in tx
-        .query(
-            "SELECT t.role FROM repository_teams t
-             JOIN repository_team_members tm ON tm.team_id = t.id
-             WHERE t.repository_id = $1 AND tm.user_id = $2
-             FOR SHARE OF t, tm",
-            &[&repository_id, &actor_id],
-        )
-        .await
-        .map_err(pg_err)?
-    {
-        let parsed = LfsCollaboratorRole::parse(r.get::<_, &str>(0))?;
-        best_repo_role = Some(best_repo_role.map_or(parsed, |cur| cur.max(parsed)));
-    }
-
-    let authority = match (best_org_role, best_repo_role) {
-        (Some((_org_id, org_r)), Some(repo_r)) if repo_r > org_r => {
-            SubjectTenantAuthority::RepositoryCollaborator { namespace_slug: ns_slug, role: repo_r }
-        }
-        (Some((org_id, org_r)), _) => SubjectTenantAuthority::OrganizationMember {
-            organization_id: org_id,
-            namespace_slug: ns_slug,
-            role: org_r,
-        },
-        (None, Some(repo_r)) => {
-            SubjectTenantAuthority::RepositoryCollaborator { namespace_slug: ns_slug, role: repo_r }
-        }
-        (None, None) => SubjectTenantAuthority::Unrelated,
-    };
-    evaluate_subject_tenant_access(
-        repository_id,
-        owner_ns_id,
-        actor_id,
-        actor_username,
-        authority,
-        require_write,
-        require_admin,
-    )
 }
 
 /// Verifies live token liveness, repository identity/generation, and relational write RBAC inside `tx`.
@@ -334,4 +167,227 @@ pub(super) async fn preflight_write_authority(
     .await?;
     tx.commit().await.map_err(pg_err)?;
     Ok(())
+}
+
+/// Locks the live attempt row, verifies its metadata/lease/operation state, and only then
+/// transitions it to `committed` — strictly before any `lfs_blob_objects` / `lfs_objects` write.
+pub(super) async fn enforce_live_attempt_and_commit_in_tx(
+    tx: &Transaction<'_>,
+    attempt_id: Uuid,
+    operation_id: Option<Uuid>,
+    record: &CommittedLfsBlobRecord,
+) -> Result<Option<Uuid>, LfsBlobError> {
+    let att_row = tx
+        .query_opt(
+            "SELECT state, (lease_until > clock_timestamp()) AS lease_live,
+                    tenant_id, repository_id, actor_id, oid_sha256, size_bytes, operation_id
+             FROM lfs_blob_upload_attempts
+             WHERE attempt_id = $1
+             FOR UPDATE",
+            &[&attempt_id],
+        )
+        .await
+        .map_err(pg_err)?
+        .ok_or_else(|| {
+            LfsBlobError::new(LfsProofRejectCode::AttestationEquivocation, "upload attempt missing at commit")
+        })?;
+    let att_state: String = att_row.get(0);
+    let lease_live: bool = att_row.get(1);
+    let att_tenant: Uuid = att_row.get(2);
+    let att_repo: Uuid = att_row.get(3);
+    let att_actor: Uuid = att_row.get(4);
+    let att_oid: String = att_row.get(5);
+    let att_size: i64 = att_row.get(6);
+    let att_op: Option<Uuid> = att_row.get(7);
+    if att_tenant != record.tenant_id
+        || att_repo != record.repository_id
+        || att_actor != record.uploader_actor_id
+        || att_oid != record.oid_sha256
+        || att_size != record.size_bytes
+    {
+        return Err(LfsBlobError::new(
+            LfsProofRejectCode::AttestationEquivocation,
+            "upload attempt metadata mismatch at commit",
+        ));
+    }
+    let effective_op_id = match (att_op, operation_id) {
+        (Some(a), Some(b)) if a != b => {
+            return Err(LfsBlobError::new(
+                LfsProofRejectCode::AttestationEquivocation,
+                "upload attempt operation_id mismatch at commit",
+            ));
+        }
+        (a, b) => b.or(a),
+    };
+    if att_state != "pending" || !lease_live {
+        return Err(LfsBlobError::new(
+            LfsProofRejectCode::AttestationEquivocation,
+            "upload attempt lease expired or already revoked/aborted before commit",
+        ));
+    }
+    if let Some(op_id) = effective_op_id {
+        let op_row = tx
+            .query_opt(
+                "SELECT state, tenant_id, actor_id, oid_sha256, size_bytes
+                 FROM lfs_blob_upload_operations
+                 WHERE repository_id = $1 AND operation_id = $2
+                 FOR UPDATE",
+                &[&record.repository_id, &op_id],
+            )
+            .await
+            .map_err(pg_err)?
+            .ok_or_else(|| {
+                LfsBlobError::new(LfsProofRejectCode::AttestationEquivocation, "upload operation missing at commit")
+            })?;
+        let op_state: String = op_row.get(0);
+        let op_tenant: Uuid = op_row.get(1);
+        let op_actor: Uuid = op_row.get(2);
+        let op_oid: String = op_row.get(3);
+        let op_size: i64 = op_row.get(4);
+        if op_tenant != record.tenant_id
+            || op_actor != record.uploader_actor_id
+            || op_oid != record.oid_sha256
+            || op_size != record.size_bytes
+        {
+            return Err(LfsBlobError::new(
+                LfsProofRejectCode::AttestationEquivocation,
+                "upload operation metadata mismatch at commit",
+            ));
+        }
+        if !matches!(op_state.as_str(), "pending" | "committed") {
+            return Err(LfsBlobError::new(
+                LfsProofRejectCode::AttestationEquivocation,
+                "upload operation is no longer pending (aborted or cancelled) at commit",
+            ));
+        }
+    }
+    let updated_att = tx
+        .execute(
+            "UPDATE lfs_blob_upload_attempts
+             SET state = 'committed',
+                 operation_id = COALESCE(operation_id, $3),
+                 updated_at = clock_timestamp()
+             WHERE attempt_id = $1
+               AND repository_id = $2
+               AND state = 'pending'
+               AND lease_until > clock_timestamp()",
+            &[&attempt_id, &record.repository_id, &effective_op_id],
+        )
+        .await
+        .map_err(pg_err)?;
+    if updated_att != 1 {
+        return Err(LfsBlobError::new(
+            LfsProofRejectCode::AttestationEquivocation,
+            "upload attempt lost lease or pending state before commit",
+        ));
+    }
+    Ok(effective_op_id)
+}
+
+/// Finalizes a committed operation under the authoritative `pending|committed` predicate.
+pub(super) async fn finalize_committed_operation_in_tx(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    op_id: Uuid,
+    locator: &StoredBlobLocatorRef,
+    hold_id: Uuid,
+) -> Result<(), LfsBlobError> {
+    let final_loc_json = serde_json::to_value(locator)
+        .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
+    let updated_op = tx
+        .execute(
+            "UPDATE lfs_blob_upload_operations
+             SET state = 'committed', locator_json = $3, hold_id = $4, updated_at = clock_timestamp()
+             WHERE repository_id = $1
+               AND operation_id = $2
+               AND state IN ('pending', 'committed')",
+            &[&repository_id, &op_id, &final_loc_json, &hold_id],
+        )
+        .await
+        .map_err(pg_err)?;
+    if updated_op != 1 {
+        return Err(LfsBlobError::new(
+            LfsProofRejectCode::AttestationEquivocation,
+            "upload operation lost pending/committed state during commit",
+        ));
+    }
+    Ok(())
+}
+
+/// Re-checks the live attempt lease immediately before staging handoff or remote upload.
+pub(super) async fn verify_staged_attempt_lease(
+    pg: &PgLfsBlobStore,
+    attempt_id: Uuid,
+    expected_size: i64,
+    bind_unknown_size: bool,
+) -> Result<(), LfsBlobError> {
+    let client = pg.pool().get().await.map_err(pg_err)?;
+    if bind_unknown_size {
+        let n = client
+            .execute(
+                "UPDATE lfs_blob_upload_attempts
+                 SET size_bytes = $2, updated_at = clock_timestamp()
+                 WHERE attempt_id = $1 AND state = 'pending' AND lease_until > clock_timestamp()",
+                &[&attempt_id, &expected_size],
+            )
+            .await
+            .map_err(pg_err)?;
+        if n != 1 {
+            return Err(LfsBlobError::new(
+                LfsProofRejectCode::AttestationEquivocation,
+                "upload attempt lease expired or revoked while streaming",
+            ));
+        }
+        return Ok(());
+    }
+    let ok = client
+        .query_opt(
+            "SELECT (state = 'pending' AND lease_until > clock_timestamp() AND size_bytes = $2)
+             FROM lfs_blob_upload_attempts WHERE attempt_id = $1",
+            &[&attempt_id, &expected_size],
+        )
+        .await
+        .map_err(pg_err)?
+        .is_some_and(|r| r.get::<_, bool>(0));
+    if !ok {
+        return Err(LfsBlobError::new(
+            LfsProofRejectCode::AttestationEquivocation,
+            "upload attempt lease expired or already revoked before staging handoff",
+        ));
+    }
+    Ok(())
+}
+
+/// Aborts an attempt and orphans its still-pending operation when no other live attempt references it.
+pub(super) async fn abort_attempt_and_orphan_op(
+    pg: &PgLfsBlobStore,
+    repository_id: Uuid,
+    attempt_id: Uuid,
+    operation_id: Uuid,
+    reason: &str,
+) {
+    let _ = pg.mark_upload_attempt_aborted(attempt_id, reason).await;
+    if let Ok(client) = pg.pool().get().await {
+        let _ = client
+            .execute(
+                "UPDATE lfs_blob_upload_operations o
+                 SET state = 'aborted_cancelled', updated_at = clock_timestamp()
+                 WHERE o.repository_id = $1
+                   AND o.operation_id = $2
+                   AND o.state = 'pending'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM lfs_blob_upload_attempts a
+                       WHERE a.repository_id = o.repository_id
+                         AND a.state = 'pending'
+                         AND a.lease_until > clock_timestamp()
+                         AND (
+                             a.operation_id = o.operation_id
+                             OR (a.operation_id IS NULL AND a.actor_id = o.actor_id
+                                 AND a.oid_sha256 = o.oid_sha256 AND a.size_bytes = o.size_bytes)
+                         )
+                   )",
+                &[&repository_id, &operation_id],
+            )
+            .await;
+    }
 }

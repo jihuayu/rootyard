@@ -4,6 +4,8 @@
 pub mod attestation;
 #[path = "blob_proof_publication/authz.rs"]
 pub mod authz;
+#[path = "blob_proof_publication/authz_tx.rs"]
+pub mod authz_tx;
 #[path = "blob_proof_publication/hydration_view.rs"]
 pub mod hydration_view;
 #[path = "blob_proof_publication/locks_store.rs"]

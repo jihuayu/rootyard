@@ -2,18 +2,24 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use axum::{
     Json,
+    body::Body,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use deadpool_postgres::Pool;
+use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::{
@@ -24,6 +30,7 @@ use crate::{
 
 use super::attestation::{LfsPushAttestationRequest, attest_and_authorize_push_with_auth};
 use super::authz::{LfsBlobRuntimeGate, derive_default_push_operation_id, operation_token_to_uuid};
+use super::locks_store::InFlightUploadGuard;
 use super::pg_store::PgLfsBlobStore;
 use super::prod_auth_tx::PushCommitAuthCheck;
 use super::transfer::{LfsTransferContext, acquire_transfer_permit};
@@ -276,4 +283,44 @@ pub async fn prod_validate_and_attest_push(
         Some(PushCommitAuthCheck { actor_id: s.actor_id, token_id: None, expected_generation: None }),
     )
     .await
+}
+
+/// Streams request-body chunks to a `0600` scratch file while enforcing `max_request_bytes`.
+pub(super) async fn stream_body_to_scratch(
+    body: Body,
+    scratch_path: &FsPath,
+    max_request_bytes: u64,
+    upload_guard: &mut InFlightUploadGuard,
+) -> Result<(u64, String), Error> {
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+    let std_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(scratch_path)
+        .map_err(Error::internal)?;
+    let mut out_file = fs::File::from_std(std_file);
+    let mut data_stream = body.into_data_stream();
+    while let Some(chunk_res) = data_stream.next().await {
+        let Some(chunk) = chunk_res.ok() else {
+            upload_guard.abort_now("upload_stream_error_or_oversize").await;
+            return Err(Error::bad_request());
+        };
+        written = written.saturating_add(chunk.len() as u64);
+        if written > max_request_bytes {
+            upload_guard.abort_now("upload_stream_error_or_oversize").await;
+            return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
+        }
+        hasher.update(&chunk);
+        if let Err(e) = out_file.write_all(&chunk).await {
+            upload_guard.abort_now("upload_stream_write_failed").await;
+            return Err(Error::internal(e));
+        }
+    }
+    if let Err(e) = out_file.sync_all().await {
+        upload_guard.abort_now("upload_stream_sync_failed").await;
+        return Err(Error::internal(e));
+    }
+    Ok((written, hex::encode(hasher.finalize())))
 }

@@ -227,6 +227,9 @@ impl PgLfsBlobStore {
                 .map_err(pg_err)?;
             op_row = Self::decode_upload_op_row(&reopened)?;
         }
+        if let Some(ca) = commit_auth {
+            crate::auth::verify_token(&tx, &ca.actor, true).await.map_err(super::prod_auth_tx::map_app_auth_err)?;
+        }
         tx.commit().await.map_err(pg_err)?;
         Ok(op_row)
     }
@@ -260,7 +263,7 @@ impl PgLfsBlobStore {
         let client = self.pool.get().await.map_err(pg_err)?;
         client
             .execute(
-                "INSERT INTO lfs_blob_upload_attempts(attempt_id, tenant_id, repository_id, actor_id, oid_sha256, size_bytes, state) VALUES($1,$2,$3,$4,$5,$6,'pending')",
+                "INSERT INTO lfs_blob_upload_attempts(attempt_id, tenant_id, repository_id, actor_id, oid_sha256, size_bytes, lease_until, state) VALUES($1,$2,$3,$4,$5,$6, clock_timestamp() + make_interval(secs => 120.0), 'pending')",
                 &[&attempt_id, &tenant_id, &repository_id, &actor_id, &oid_sha256, &size_bytes],
             )
             .await
@@ -315,12 +318,8 @@ impl PgLfsBlobStore {
             commit_auth,
         )
         .await?;
-        tx.execute(
-            "UPDATE lfs_blob_upload_attempts SET state='committed', updated_at=clock_timestamp() WHERE attempt_id=$1",
-            &[&attempt_id],
-        )
-        .await
-        .map_err(pg_err)?;
+        let effective_op_id =
+            super::prod_auth_tx::enforce_live_attempt_and_commit_in_tx(&tx, attempt_id, operation_id, record).await?;
         let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
             &record.tenant_id,
             &record.repository_id,
@@ -388,29 +387,34 @@ impl PgLfsBlobStore {
             stored = Self::decode_blob_row(&row)?;
         }
 
-        if let Some(op_id) = operation_id {
-            let final_loc_json = serde_json::to_value(&stored.locator)
-                .map_err(|e| LfsBlobError::new(LfsProofRejectCode::InvalidInput, e.to_string()))?;
-            tx.execute(
-                "UPDATE lfs_blob_upload_operations
-                 SET state='committed', locator_json=$3, hold_id=$4, updated_at=clock_timestamp()
-                 WHERE repository_id=$1 AND operation_id=$2",
-                &[&record.repository_id, &op_id, &final_loc_json, &stored.hold_id],
+        if let Some(op_id) = effective_op_id {
+            super::prod_auth_tx::finalize_committed_operation_in_tx(
+                &tx,
+                record.repository_id,
+                op_id,
+                &stored.locator,
+                stored.hold_id,
             )
-            .await
-            .map_err(pg_err)?;
+            .await?;
         }
 
-        tx.execute(
-            "INSERT INTO lfs_objects (tenant_id, repository_id, oid, size, state)
+        let ready_rows = tx
+            .execute(
+                "INSERT INTO lfs_objects (tenant_id, repository_id, oid, size, state)
              VALUES ($1, $2, $3, $4, 'ready')
              ON CONFLICT (tenant_id, repository_id, oid)
              DO UPDATE SET state = 'ready', updated_at = clock_timestamp()
              WHERE lfs_objects.size = EXCLUDED.size",
-            &[&stored.tenant_id, &stored.repository_id, &stored.oid_sha256, &stored.size_bytes],
-        )
-        .await
-        .map_err(pg_err)?;
+                &[&stored.tenant_id, &stored.repository_id, &stored.oid_sha256, &stored.size_bytes],
+            )
+            .await
+            .map_err(pg_err)?;
+        if ready_rows != 1 {
+            return Err(LfsBlobError::new(
+                LfsProofRejectCode::SizeOrDigestMismatch,
+                "existing lfs_objects row has conflicting byte length",
+            ));
+        }
 
         if let Some(ca) = commit_auth {
             crate::auth::verify_token(&tx, &ca.actor, true).await.map_err(super::prod_auth_tx::map_app_auth_err)?;

@@ -6,6 +6,7 @@ pub mod adversarial_cancel;
 pub mod adversarial_default_ops;
 pub mod adversarial_org_restart;
 pub mod git_smart_http;
+pub mod lease_state_regressions;
 pub mod multi_instance_auth_boundary;
 pub mod s3_loopback;
 

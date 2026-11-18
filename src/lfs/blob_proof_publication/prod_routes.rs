@@ -1,6 +1,5 @@
 //! Production `crate::lfs::routes()` (`AppState`) S4 streaming HTTP bridge (`Refs #145`).
 
-use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
 use axum::{
@@ -8,11 +7,10 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use futures_util::{StreamExt, stream};
+use futures_util::stream;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::{
@@ -31,7 +29,7 @@ use super::prod_auth_tx::ProdCommitAuthCheck;
 pub(crate) use super::prod_publication::{active_push_quarantine_dirs, enforce_blob_gate_if_requested, to_app_error};
 use super::prod_publication::{
     build_base_url, collect_forwarded_action_headers, ephemeral_scratch_root, lfs_blob_err_response, lfs_blob_json,
-    map_pre_auth_err,
+    map_pre_auth_err, stream_body_to_scratch,
 };
 pub use super::prod_publication::{
     PushAttestationSession, active_blob_gate, prod_validate_and_attest_hook, prod_validate_and_attest_push,
@@ -276,43 +274,19 @@ pub(crate) async fn prod_upload(
         Err(e) => return Ok(lfs_blob_err_response(e)),
     };
     let attempt_id = upload_guard.attempt_id();
-    let mut hasher = Sha256::new();
-    let mut written: u64 = 0;
+    let (written, sha256_hex) =
+        stream_body_to_scratch(body, &scratch_path, state.config.max_request_bytes, &mut upload_guard).await?;
+    let expected_size = declared_size.unwrap_or(written as i64);
+    if declared_size.is_none()
+        && let Err(e) = super::prod_auth_tx::verify_staged_attempt_lease(&pg, attempt_id, expected_size, true).await
     {
-        let std_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&scratch_path)
-            .map_err(Error::internal)?;
-        let mut out_file = fs::File::from_std(std_file);
-        let mut data_stream = body.into_data_stream();
-        while let Some(chunk_res) = data_stream.next().await {
-            let Some(chunk) = chunk_res.ok() else {
-                upload_guard.abort_now("upload_stream_error_or_oversize").await;
-                return Err(Error::bad_request());
-            };
-            written = written.saturating_add(chunk.len() as u64);
-            if written > state.config.max_request_bytes {
-                upload_guard.abort_now("upload_stream_error_or_oversize").await;
-                return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
-            }
-            hasher.update(&chunk);
-            if let Err(e) = out_file.write_all(&chunk).await {
-                upload_guard.abort_now("upload_stream_write_failed").await;
-                return Err(Error::internal(e));
-            }
-        }
-        if let Err(e) = out_file.sync_all().await {
-            upload_guard.abort_now("upload_stream_sync_failed").await;
-            return Err(Error::internal(e));
-        }
+        upload_guard.abort_now(&e.message).await;
+        return Ok(lfs_blob_err_response(e));
     }
-    let expected_size = size_param.unwrap_or(written as i64);
     let streamed = PreStreamedScratch {
         path: scratch_path,
         size_bytes: written as i64,
-        sha256_hex: hex::encode(hasher.finalize()),
+        sha256_hex,
         pre_attempt_id: Some(attempt_id),
     };
     let ctx = LfsTransferContext {
