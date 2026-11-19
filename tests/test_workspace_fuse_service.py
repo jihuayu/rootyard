@@ -686,10 +686,21 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
         teardown owns every mount, so the held wrapper still proves that helper
         teardown precedes the Git join.  A raw partial-body PUT is already
         accepted but cannot reach PUT admission until shutdown closes it.
+
+        An optional fixture-only preload is bound before SIGTERM to the exact
+        helper, the parked writer descriptor and the three route mount IDs.  It
+        records the real helper ``umount2(path, 0)`` entry/result and the one
+        successful parked-FD close with the same CLOCK_MONOTONIC source, then
+        projects only fixed ``busy_target``/``writer_close`` values into the
+        failure diagnostic.  If it cannot be built or injected, both stay
+        ``unknown``; it adds no wait/barrier, does not open a mounted path and
+        is never a pass condition.
         """
         self._rootyard_diagnostic_phase = "setup"
         self._rootyard_diagnostic_api_exit = None
         self._rootyard_diagnostic_shutdown_outcome = "unknown"
+        self._rootyard_diagnostic_busy_target = "unknown"
+        self._rootyard_diagnostic_writer_close = "unknown"
         binary, _ = select_runtime_binary()
         self.assertTrue(binary.is_file())
         real_git = shutil.which("git")
@@ -721,6 +732,9 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
             helper_identity = None
             helper_pidfd = None
             api_pidfd = None
+            witness_dir = None
+            witness_library = None
+            witness_binding = None
             original_failure = None
             mount_cleanup_proven = True
             try:
@@ -728,6 +742,12 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 # this harness's own service child before the API starts.  Its
                 # target proxy is absent, so setup reads cannot match yet.
                 gate_prefix = install_capture_read_gate(h, proxy_target)
+                # The optional witness is a separate fixture-only preload.  Its
+                # absence leaves the original acceptance untouched and keeps
+                # the diagnostic at "unknown"; it is never a pass condition.
+                witness_dir = h.root / "normal-sigterm-witness"
+                witness_library = normal_shutdown.install_busy_witness(
+                    h, witness_dir)
                 h.setup()
                 api_pid = h.proc.pid
                 self.assertEqual(os.getpgid(api_pid), api_pid,
@@ -872,7 +892,9 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 writer_script.write_text(support.PENDING_WRITER_SCRIPT, encoding="utf-8")
                 writer_status = h.root / "normal-sigterm-writer.json"
                 writer = support.spawn_api_namespace_writer(
-                    api_pid, writer_script, writer_mount, writer_status)
+                    api_pid, writer_script, writer_mount, writer_status,
+                    env=normal_shutdown.busy_witness_writer_env(
+                        witness_library, witness_dir))
                 writer_identity = support.process_identity(writer.pid)
                 self.assertIsNotNone(writer_identity, "pending writer identity is unavailable")
                 self.assertGreater(writer_identity["starttime"], 0)
@@ -955,6 +977,49 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                                 "writer did not expose a real kernel FUSE wait")
                 self.assertFalse(gate_prefix.with_suffix(".timeout").exists(),
                                  "capture read gate emergency timeout fired while frozen")
+
+                # Bind the witness to the exact owned helper, writer and route
+                # mounts before SIGTERM.  This is an immediate local read; it
+                # adds no wait/barrier and any mismatch leaves both projected
+                # fields at "unknown" without changing an acceptance assertion.
+                if witness_library is not None:
+                    try:
+                        helper_mounts = support.read_process_mountinfo(helper_pid)
+                        expected_mounts = {}
+                        for label, mount_id in (
+                                ("writer", writer_mount_id),
+                                ("git", git_mount_id),
+                                ("put", put_mount_id)):
+                            row = next(
+                                (row for row in helper_mounts
+                                 if row["mount_id"] == mount_id), None)
+                            if row is None:
+                                raise AssertionError(
+                                    "witness route mount identity is absent")
+                            expected_mounts[label] = (
+                                mount_id,
+                                normal_shutdown.path_tag(row["mountpoint"]))
+                        owned_mounts = {
+                            (row["mount_id"],
+                             normal_shutdown.path_tag(row["mountpoint"]))
+                            for row in helper_mounts
+                            if row["source"] == "rootyard-vfs"
+                            and (row["fstype"] == "fuse"
+                                 or row["fstype"].startswith("fuse."))
+                        }
+                        if not set(expected_mounts.values()).issubset(owned_mounts):
+                            raise AssertionError(
+                                "witness route mount ownership is unproved")
+                        witness_binding = {
+                            "helper_tag": normal_shutdown.process_tag(
+                                helper_pid, helper_identity["starttime"]),
+                            "writer_tag": normal_shutdown.process_tag(
+                                writer.pid, writer_identity["starttime"]),
+                            "expected_mounts": expected_mounts,
+                            "owned_mounts": owned_mounts,
+                        }
+                    except BaseException:
+                        witness_binding = None
 
                 self.assertEqual(os.getpgid(api_pid), api_pid,
                                  "production API is not the owned process-group leader")
@@ -1178,6 +1243,22 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 raise
             finally:
                 self._rootyard_diagnostic_phase = "cleanup"
+                # Read only the bounded local receipts.  This is not a wait and
+                # is attempted before cleanup removes the fixture root; any
+                # missing/partial/mismatched record remains "unknown".
+                if witness_binding is not None and witness_dir is not None:
+                    try:
+                        target, close_state = normal_shutdown.project_busy_witness_receipts(
+                            witness_dir,
+                            helper_tag=witness_binding["helper_tag"],
+                            writer_tag=witness_binding["writer_tag"],
+                            expected_mounts=witness_binding["expected_mounts"],
+                            owned_mounts=witness_binding["owned_mounts"],
+                        )
+                        self._rootyard_diagnostic_busy_target = target
+                        self._rootyard_diagnostic_writer_close = close_state
+                    except BaseException:
+                        pass
                 cleanup_failures = []
                 retain_fixture = not mount_cleanup_proven
 

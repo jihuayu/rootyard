@@ -755,6 +755,12 @@ try:
     # leave the writer stuck in setup without a publishable wait observation.
     parked = os.open(os.path.join(mount, "parked.bin"),
                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        # Name the exact parked descriptor before the barrier so the optional
+        # witness adds no environment mutation on the close/error path.
+        os.environ["ROOTYARD_TEST_FUSE_WITNESS_CLOSE_FD"] = str(parked)
+    except OSError:
+        pass
     publish("ready")
     marker = os.open(os.path.join(mount, "gate-target.txt"),
                      os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -864,15 +870,19 @@ def api_namespace_command(api_pid, argv):
             "--", *[str(value) for value in argv]]
 
 
-def spawn_api_namespace(api_pid, argv):
+def spawn_api_namespace(api_pid, argv, env=None):
     """Start one fixture-owned observer/writer in the API's own namespaces.
 
-    The child gets only PATH/LC_ALL; it never inherits database, object-store,
-    token or LD_PRELOAD state from the test process.
+    The child gets only PATH/LC_ALL plus an explicit private fixture addition
+    (the optional witness preload); it never inherits database, object-store,
+    token or general LD_PRELOAD state from the test process.
     """
+    child_env = {"PATH": os.defpath, "LC_ALL": "C"}
+    if env:
+        child_env.update({str(name): str(value) for name, value in env.items()})
     return subprocess.Popen(
         api_namespace_command(api_pid, argv),
-        env={"PATH": os.defpath, "LC_ALL": "C"},
+        env=child_env,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1028,9 +1038,10 @@ def spawn_api_namespace_holder(api_pid):
         api_pid, [sys.executable, "-c", "import time; time.sleep(600)"])
 
 
-def spawn_api_namespace_writer(api_pid, script, mountpoint, status_path):
+def spawn_api_namespace_writer(api_pid, script, mountpoint, status_path, env=None):
     return spawn_api_namespace(
-        api_pid, [sys.executable, str(script), str(mountpoint), str(status_path)])
+        api_pid, [sys.executable, str(script), str(mountpoint), str(status_path)],
+        env=env)
 
 
 def wait_process_exit(process, timeout=EXIT_DEADLINE):

@@ -27,6 +27,7 @@ from workspace_fuse_service_acceptance import (
     SOURCE_PATHS,
     WorkspaceFuseDiagnosticResult,
     _bounded_int,
+    _busy_target,
     _child_exit,
     _diagnostic_record,
     _errno,
@@ -36,6 +37,7 @@ from workspace_fuse_service_acceptance import (
     _report_payload,
     _source_location,
     _unknown_diagnostic,
+    _writer_close,
     project_shutdown_outcome,
     read_shutdown_outcome,
 )
@@ -228,6 +230,8 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
             "errno": None,
             "child_exit": None,
             "shutdown_outcome": "unknown",
+            "busy_target": "unknown",
+            "writer_close": "unknown",
         })
         self.assertEqual(set(record), set(_unknown_diagnostic()))
 
@@ -473,6 +477,26 @@ class WorkspaceFuseDiagnosticsContractTest(unittest.TestCase):
         self.assertIsNone(unknown["errno"])
         self.assertIsNone(unknown["child_exit"])
         self.assertEqual(unknown["shutdown_outcome"], SHUTDOWN_OUTCOME_UNKNOWN)
+        self.assertEqual(unknown["busy_target"], "unknown")
+        self.assertEqual(unknown["writer_close"], "unknown")
+
+    def test_busy_witness_fields_accept_only_closed_values(self):
+        test = _case(REQUIRED_CASES[2])
+        self.assertEqual(_busy_target(test), "unknown")
+        self.assertEqual(_writer_close(test), "unknown")
+        test._rootyard_diagnostic_busy_target = "writer"
+        test._rootyard_diagnostic_writer_close = "completed_before_unmount_entry"
+        self.assertEqual(_busy_target(test), "writer")
+        self.assertEqual(_writer_close(test), "completed_before_unmount_entry")
+        for value in (SECRET, "writer ", "OTHER", 1, True, None, ["writer"]):
+            test._rootyard_diagnostic_busy_target = value
+            test._rootyard_diagnostic_writer_close = value
+            self.assertEqual(_busy_target(test), "unknown")
+            self.assertEqual(_writer_close(test), "unknown")
+        record = _diagnostic_record(test, AssertionError("synthetic"), None)
+        self.assertNotIn(SECRET, json.dumps(record))
+        self.assertEqual(record["busy_target"], "unknown")
+        self.assertEqual(record["writer_close"], "unknown")
 
     def test_result_captures_before_unittest_formats_the_exception(self):
         result = WorkspaceFuseDiagnosticResult(io.StringIO(), False, 0)

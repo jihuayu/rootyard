@@ -29,6 +29,7 @@ for path in (TESTS, ROOT):
         sys.path.insert(0, str(path))
 
 from tests.workspace_capture_acceptance import TimedTextTestResult
+from tests.workspace_normal_shutdown_support import BUSY_TARGETS, WRITER_CLOSE_STATES
 
 REPORT_SCHEMA = "rootyard/issues91-95/workspace-fuse-service-acceptance/v1"
 REQUIRED_CASES = (
@@ -355,6 +356,28 @@ def _shutdown_outcome(test):
     return SHUTDOWN_OUTCOME_UNKNOWN
 
 
+def _busy_target(test):
+    """Return only one closed projector value, never a receipt/raw identity."""
+    try:
+        value = getattr(test, "_rootyard_diagnostic_busy_target", None)
+        if isinstance(value, str) and value in BUSY_TARGETS:
+            return value
+    except BaseException:
+        pass
+    return "unknown"
+
+
+def _writer_close(test):
+    """Return only one closed ordering value, never timestamps/errno."""
+    try:
+        value = getattr(test, "_rootyard_diagnostic_writer_close", None)
+        if isinstance(value, str) and value in WRITER_CLOSE_STATES:
+            return value
+    except BaseException:
+        pass
+    return "unknown"
+
+
 def _unknown_diagnostic():
     return {
         "phase": None,
@@ -364,6 +387,8 @@ def _unknown_diagnostic():
         "errno": None,
         "child_exit": None,
         "shutdown_outcome": SHUTDOWN_OUTCOME_UNKNOWN,
+        "busy_target": "unknown",
+        "writer_close": "unknown",
     }
 
 
@@ -376,6 +401,8 @@ def _diagnostic_record(test, error, tb):
         "errno": _errno(error),
         "child_exit": _child_exit(error),
         "shutdown_outcome": _shutdown_outcome(test),
+        "busy_target": _busy_target(test),
+        "writer_close": _writer_close(test),
     }
 
 

@@ -10,7 +10,11 @@ Everything here is owned by the one test that imports it:
   a FUSE/helper fake or a special file;
 * the raw HTTP PUT client sends request headers plus only part of a valid JSON
   body, so the handler cannot reach its PUT-capacity admission before the test
-  observes shutdown.
+  observes shutdown;
+* the optional bounded busy witness is compiled only into this harness's own
+  children and records the exact helper ``umount2(..., 0)`` and parked writer
+  ``close`` ordering; if it cannot be built or injected, projection is
+  ``unknown`` and the original acceptance assertions are unchanged.
 
 There is no mock Git, fake helper, fake mount or reference implementation in
 this module.  The wrapper holds only the one ``add -- parked.bin`` invocation
@@ -18,9 +22,11 @@ created by the test; every other Git call is forwarded unchanged.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import shutil
 import socket
 import stat
 import sys
@@ -32,9 +38,76 @@ from tests import fuse_helper_native_support as support
 
 ADMISSION_CLOSED_ERROR = "workspace admission is closed for shutdown"
 MAX_ERROR_BODY_BYTES = 8192
+TESTS_DIR = Path(__file__).resolve().parent
+BUSY_WITNESS_ENV = (
+    "LD_PRELOAD",
+    "ROOTYARD_TEST_FUSE_WITNESS_ROLE",
+    "ROOTYARD_TEST_FUSE_WITNESS_DIR",
+    "ROOTYARD_TEST_FUSE_WITNESS_LIBRARY",
+    "ROOTYARD_TEST_FUSE_WITNESS_CLOSE_FD",
+)
+
 
 class NormalShutdownError(RuntimeError):
     """A bounded fixture precondition failed (never a skipped assertion)."""
+
+
+def install_busy_witness(h, witness_dir):
+    """Build and install the optional bounded passive witness.
+
+    The witness is diagnostic-only.  Every unavailability (non-Linux, no
+    compiler, fixture missing, build failure) returns ``None`` and leaves the
+    service environment untouched, so the original normal-SIGTERM acceptance
+    remains the only pass condition and the diagnostic stays ``unknown``.
+    """
+    witness_dir = Path(witness_dir)
+    if not sys.platform.startswith("linux") or not Path("/proc/self/fd").is_dir():
+        return None
+    compiler = shutil.which("gcc")
+    if compiler is None:
+        return None
+    source = TESTS_DIR / "fixtures" / "fuse_busy_witness.c"
+    if not source.is_file():
+        return None
+    build = Path(h.root) / "fuse-busy-witness"
+    try:
+        build.mkdir(parents=True, exist_ok=True)
+        library = build / "fuse_busy_witness.so"
+        build_env = dict(h.env)
+        for name in BUSY_WITNESS_ENV:
+            build_env.pop(name, None)
+        h.run(
+            [compiler, "-shared", "-fPIC", "-O2", "-pthread", "-o",
+             str(library), str(source), "-ldl"],
+            env=build_env,
+        )
+        if not library.is_file():
+            return None
+        witness_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("helper.receipt", "writer.receipt"):
+            receipt = witness_dir / name
+            if receipt.exists() or receipt.is_symlink():
+                receipt.unlink()
+    except Exception:
+        return None
+    existing = h.env.get("LD_PRELOAD")
+    h.env["LD_PRELOAD"] = (
+        f"{existing}:{library}" if existing else str(library))
+    h.env["ROOTYARD_TEST_FUSE_WITNESS_ROLE"] = "api"
+    h.env["ROOTYARD_TEST_FUSE_WITNESS_DIR"] = str(witness_dir)
+    h.env["ROOTYARD_TEST_FUSE_WITNESS_LIBRARY"] = str(library)
+    return library
+
+
+def busy_witness_writer_env(library, witness_dir):
+    """Return only the writer-child witness environment, or ``None``."""
+    if library is None:
+        return None
+    return {
+        "LD_PRELOAD": str(library),
+        "ROOTYARD_TEST_FUSE_WITNESS_ROLE": "writer",
+        "ROOTYARD_TEST_FUSE_WITNESS_DIR": str(witness_dir),
+    }
 
 
 _GIT_WRAPPER_TEMPLATE = r'''#!__PYTHON__
@@ -495,3 +568,249 @@ class PartialPut:
                 self.sock.close()
             finally:
                 self.sock = None
+
+
+# ---------------------------------------------------------------------------
+# Bounded passive busy-witness projection
+#
+# The observer is the fixture-only tests/fixtures/fuse_busy_witness.c preload.
+# It records only the helper's umount2(flags=0) entry/result with the mount
+# identity observed for that exact path, and the parked writer's successful
+# close entry/result.  Both use CLOCK_MONOTONIC.  These functions project the
+# bounded local receipts to the two fixed diagnostic values; they never return
+# a path, PID, descriptor, argv, errno body, log line or event.
+# ---------------------------------------------------------------------------
+BUSY_TARGETS = frozenset((
+    "writer",
+    "git",
+    "put",
+    "other_owned",
+    "unknown",
+))
+WRITER_CLOSE_STATES = frozenset((
+    "completed_before_unmount_entry",
+    "began_after_busy_return",
+    "overlapping",
+    "unknown",
+))
+UNKNOWN = "unknown"
+MAX_RECEIPT_BYTES = 64 * 1024
+MAX_RECEIPTS = 128
+_FNV_OFFSET = 14695981039346656037
+_FNV_PRIME = 1099511628211
+_REQUIRED_KEYS = frozenset((
+    "kind", "role", "entry_ns", "result_ns", "mount_id", "path_hash",
+    "proc_tag", "rc", "errno", "flags", "owned",
+))
+
+
+def fnv1a64(data: bytes) -> int:
+    """Return the FNV-1a 64-bit identity used by the C fixture."""
+    value = _FNV_OFFSET
+    for byte in data:
+        value ^= byte
+        value = (value * _FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return value
+
+
+def process_tag(pid: int, starttime: int) -> int:
+    """Return the opaque process tag; never return the raw pid/starttime."""
+    if (type(pid) is not int or type(starttime) is not int
+            or pid <= 0 or starttime <= 0):
+        return 0
+    return fnv1a64(f"{pid}:{starttime}".encode("ascii"))
+
+
+def path_tag(path) -> int:
+    """Return an opaque identity for one exact fixture path."""
+    try:
+        raw = os.fsencode(os.fspath(path))
+    except (TypeError, ValueError, OSError):
+        return 0
+    if not raw:
+        return 0
+    return fnv1a64(raw)
+
+
+def _parse_uint(text: str, maximum: int):
+    if not text or not text.isdigit():
+        return None
+    value = int(text, 10)
+    return value if 0 <= value <= maximum else None
+
+
+def _parse_hex(text: str, digits: int):
+    if len(text) != digits:
+        return None
+    try:
+        return int(text, 16)
+    except ValueError:
+        return None
+
+
+def _parse_int(text: str, minimum: int, maximum: int):
+    if not text:
+        return None
+    try:
+        value = int(text, 10)
+    except ValueError:
+        return None
+    return value if minimum <= value <= maximum else None
+
+
+def _parse_witness_line(line: bytes):
+    if not line.startswith(b"W1 ") or len(line) > 512:
+        return None
+    try:
+        text = line.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    fields = {}
+    for part in text[3:].split(" "):
+        if not part or "=" not in part:
+            return None
+        name, value = part.split("=", 1)
+        if name in fields or name not in _REQUIRED_KEYS:
+            return None
+        fields[name] = value
+    if set(fields) != _REQUIRED_KEYS:
+        return None
+    kind = fields["kind"]
+    role = fields["role"]
+    if kind not in ("umount", "close"):
+        return None
+    if (kind == "umount" and role != "helper") or (kind == "close" and role != "writer"):
+        return None
+    entry_ns = _parse_uint(fields["entry_ns"], 2 ** 63 - 1)
+    result_ns = _parse_uint(fields["result_ns"], 2 ** 63 - 1)
+    mount_id = _parse_uint(fields["mount_id"], 2 ** 64 - 1)
+    path_hash = _parse_hex(fields["path_hash"], 16)
+    proc_tag = _parse_hex(fields["proc_tag"], 16)
+    flags = _parse_uint(fields["flags"], 1)
+    owned = _parse_uint(fields["owned"], 1)
+    rc = _parse_int(fields["rc"], -(2 ** 31), 2 ** 31 - 1)
+    error = _parse_uint(fields["errno"], 4095)
+    if None in (entry_ns, result_ns, mount_id, path_hash, proc_tag,
+                flags, owned, rc, error):
+        return None
+    if entry_ns <= 0 or result_ns < entry_ns or flags != 0:
+        return None
+    if kind == "close":
+        if mount_id != 0 or path_hash != 0 or owned != 0:
+            return None
+    return {
+        "kind": kind,
+        "role": role,
+        "entry_ns": entry_ns,
+        "result_ns": result_ns,
+        "mount_id": mount_id,
+        "path_hash": path_hash,
+        "proc_tag": proc_tag,
+        "rc": rc,
+        "errno": error,
+        "flags": flags,
+        "owned": owned,
+    }
+
+
+def parse_witness_receipt(path) -> list[dict] | None:
+    """Parse one bounded receipt, or return ``None`` for any unsafe shape."""
+    try:
+        with open(path, "rb") as stream:
+            data = stream.read(MAX_RECEIPT_BYTES + 1)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not data or len(data) > MAX_RECEIPT_BYTES or not data.endswith(b"\n"):
+        return None
+    records = []
+    for line in data.splitlines():
+        if not line:
+            return None
+        if len(records) >= MAX_RECEIPTS:
+            return None
+        record = _parse_witness_line(line)
+        if record is None:
+            return None
+        records.append(record)
+    return records or None
+
+
+def _witness_target(record, expected_mounts, owned_mounts):
+    identity = (record["mount_id"], record["path_hash"])
+    for label in ("writer", "git", "put"):
+        if identity == expected_mounts.get(label):
+            return label if record["owned"] == 1 else UNKNOWN
+    if record["owned"] == 1 and identity in owned_mounts:
+        return "other_owned"
+    return UNKNOWN
+
+
+def project_busy_witness(records, *, helper_tag, writer_tag,
+                         expected_mounts, owned_mounts):
+    """Project receipts to ``(busy_target, writer_close)`` fixed values.
+
+    Exactly one matched-ID ``umount2(flags=0)`` EBUSY return and exactly one
+    successful parked-FD close are required.  Anything else is ``unknown``;
+    this function never guesses or promotes a failed close to success.
+    """
+    if not isinstance(records, list) or not records:
+        return UNKNOWN, UNKNOWN
+    if (type(helper_tag) is not int or type(writer_tag) is not int
+            or helper_tag <= 0 or writer_tag <= 0):
+        return UNKNOWN, UNKNOWN
+    if not isinstance(expected_mounts, dict):
+        return UNKNOWN, UNKNOWN
+    if not isinstance(owned_mounts, (set, frozenset, list, tuple)):
+        return UNKNOWN, UNKNOWN
+    owned = set(owned_mounts)
+    umounts = [
+        record for record in records
+        if record["kind"] == "umount"
+        and record["role"] == "helper"
+        and record["proc_tag"] == helper_tag
+        and record["flags"] == 0
+    ]
+    busy = [
+        record for record in umounts
+        if record["rc"] == -1 and record["errno"] == errno.EBUSY
+    ]
+    if len(busy) != 1:
+        return UNKNOWN, UNKNOWN
+    busy_record = busy[0]
+    target = _witness_target(busy_record, expected_mounts, owned)
+    closes = [
+        record for record in records
+        if record["kind"] == "close"
+        and record["role"] == "writer"
+        and record["proc_tag"] == writer_tag
+    ]
+    if len(closes) != 1 or closes[0]["rc"] != 0:
+        return target, UNKNOWN
+    close = closes[0]
+    if close["result_ns"] < busy_record["entry_ns"]:
+        state = "completed_before_unmount_entry"
+    elif close["entry_ns"] >= busy_record["result_ns"]:
+        state = "began_after_busy_return"
+    else:
+        state = "overlapping"
+    return target, state
+
+
+def project_busy_witness_receipts(witness_dir, *, helper_tag, writer_tag,
+                                  expected_mounts, owned_mounts):
+    """Read both bounded receipts and project them, defaulting to unknown."""
+    try:
+        directory = Path(witness_dir)
+        helper = parse_witness_receipt(directory / "helper.receipt")
+        writer = parse_witness_receipt(directory / "writer.receipt")
+    except (OSError, TypeError, ValueError):
+        return UNKNOWN, UNKNOWN
+    if helper is None or writer is None:
+        return UNKNOWN, UNKNOWN
+    return project_busy_witness(
+        helper + writer,
+        helper_tag=helper_tag,
+        writer_tag=writer_tag,
+        expected_mounts=expected_mounts,
+        owned_mounts=owned_mounts,
+    )
