@@ -169,10 +169,10 @@ class CiMirrorHaContractsTest(unittest.TestCase):
         self.assertTrue(issubclass(module.HttpTransportError, OSError))
 
         src = QUAL_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("read_bounded(resp)", src)
-        self.assertIn("read_bounded(err)", src)
-        self.assertIn("bounded_report_payload(payload)", src)
-        self.assertIn('raise HttpTransportError("HTTP request failed") from None', src)
+        self.assertTrue("read_bounded(resp)" in src, "success response read is not bounded")
+        self.assertTrue("read_bounded(err)" in src, "error response read is not bounded")
+        self.assertTrue("bounded_report_payload(payload)" in src, "report payload is not size guarded")
+        self.assertTrue('raise HttpTransportError("HTTP request failed") from None' in src, "transport error is not fixed")
 
     def test_checkout_token_registration_is_immediate_and_fixed(self) -> None:
         class FakeHarness:
@@ -341,15 +341,71 @@ class CiMirrorHaContractsTest(unittest.TestCase):
                     if names & token_names:
                         self.assertIsInstance(node.msg, ast.Constant)
                         self.assertIsInstance(node.msg.value, str)
-        self.assertNotIn('["checkout"]["token"]', QUAL_SCRIPT.read_text(encoding="utf-8"))
+        self.assertTrue(
+            '["checkout"]["token"]' not in QUAL_SCRIPT.read_text(encoding="utf-8"),
+            "direct checkout token extraction remains",
+        )
+
+    def test_require_int_rejects_bool_float_and_other_stand_ins(self) -> None:
+        self.assertEqual(QUAL_MODULE.require_int(1, "counter"), 1)
+        self.assertEqual(QUAL_MODULE.require_int(0, "counter"), 0)
+        for value in (True, False, 1.0, 1.5, "1", None):
+            with self.assertRaises(AssertionError) as raised:
+                QUAL_MODULE.require_int(value, "counter")
+            self.assertEqual(str(raised.exception), "counter is not an integer")
+
+    def test_untrusted_counters_use_require_int(self) -> None:
+        tree = ast.parse(QUAL_SCRIPT.read_text(encoding="utf-8"))
+        cls = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "HaQualificationHarness"
+        )
+        methods = {
+            node.name: node for node in cls.body if isinstance(node, ast.FunctionDef)
+        }
+        counter_names = {
+            "attempt",
+            "lease_generation",
+            "storage_generation",
+            "ready_available_mirrors",
+            "ready_total_mirrors",
+            "healthy_unready_mirrors",
+        }
+        for scenario in (
+            "scenario_a_pr_prewarm_and_live_mirror_checkout",
+            "scenario_b_sigkill_dual_crash_and_failover",
+            "scenario_c_coalesced_prewarm_and_origin_burst",
+            "scenario_d_controlled_readiness_claim_transition",
+        ):
+            for node in ast.walk(methods[scenario]):
+                if not isinstance(node, ast.Assert):
+                    continue
+                for child in ast.walk(node.test):
+                    if (
+                        isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Attribute)
+                        and child.func.attr == "get"
+                        and child.args
+                        and isinstance(child.args[0], ast.Constant)
+                        and child.args[0].value in counter_names
+                    ):
+                        self.fail("direct untrusted counter comparison remains")
+                    if (
+                        isinstance(child, ast.Subscript)
+                        and isinstance(child.slice, ast.Constant)
+                        and child.slice.value in counter_names
+                    ):
+                        self.fail("direct untrusted counter comparison remains")
+        src = QUAL_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("isinstance(pr_number, int)", src)
 
     def test_initialization_failure_is_bounded_and_cleans_root(self) -> None:
         src = QUAL_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('root = Path(tempfile.mkdtemp(prefix="rootyard-ci-mirror-ha-"))', src)
-        self.assertIn("harness = HaQualificationHarness(args, root)", src)
-        self.assertIn('"error": "qualification harness initialization failed"', src)
-        self.assertIn("shutil.rmtree(root, ignore_errors=True)", src)
-        self.assertIn("harness.cleanup(stop_daemons=False)", src)
+        self.assertTrue('root = Path(tempfile.mkdtemp(prefix="rootyard-ci-mirror-ha-"))' in src, "main-owned temp root creation missing")
+        self.assertTrue("harness = HaQualificationHarness(args, root)" in src, "main did not pass the owned root")
+        self.assertTrue('"error": "qualification harness initialization failed"' in src, "fixed initialization failure report missing")
+        self.assertTrue("shutil.rmtree(root, ignore_errors=True)" in src, "initialization failure root cleanup missing")
+        self.assertTrue("harness.cleanup(stop_daemons=False, remove_root=reaped)" in src, "bounded cleanup call missing")
         self.assertLess(
             src.index("    try:\n        root = Path(tempfile.mkdtemp"),
             src.index("        harness = HaQualificationHarness(args, root)"),
@@ -361,11 +417,13 @@ class CiMirrorHaContractsTest(unittest.TestCase):
 
     def test_source_token_scan_states_and_final_scan_order(self) -> None:
         src = QUAL_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("live_pgid_processes(self.tracked_pgids)", src)
-        self.assertIn('"live_writer"', src)
-        self.assertIn('"oversize"', src)
-        self.assertIn("MAX_LOG_BYTES", src)
-        self.assertIn("MAX_TOTAL_LOG_BYTES", src)
+        self.assertTrue("live_pgid_processes(self.tracked_pgids)" in src, "live-writer ownership check missing")
+        self.assertTrue('"live_writer"' in src, "live-writer failure state missing")
+        self.assertTrue('"oversize"' in src, "oversize failure state missing")
+        self.assertTrue("MAX_LOG_BYTES" in src, "per-log cap missing")
+        self.assertTrue("MAX_TOTAL_LOG_BYTES" in src, "total log cap missing")
+        self.assertTrue("source_token_zero_leak" not in src, "stale unbounded leak claim remains")
+        self.assertTrue('entry["log_path"].read_text' not in src, "unbounded C log scan remains")
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             clean = root / "clean.log"
@@ -428,6 +486,7 @@ class CiMirrorHaContractsTest(unittest.TestCase):
                 and node.func.attr == attribute
             ]
 
+        reap_lines = call_lines("reap_owned_processes")
         scan_lines = call_lines("scan_source_token_logs")
         cleanup_lines = call_lines("cleanup")
         write_lines = call_lines("write_text")
@@ -462,6 +521,7 @@ class CiMirrorHaContractsTest(unittest.TestCase):
             and node.args[0].id == "failure_trace"
         ]
         for found in (
+            reap_lines,
             scan_lines,
             cleanup_lines,
             write_lines,
@@ -471,6 +531,27 @@ class CiMirrorHaContractsTest(unittest.TestCase):
             failure_print_lines,
         ):
             self.assertTrue(found)
+        reaped_if = next(
+            node for statement in outer_try.finalbody for node in ast.walk(statement)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "reaped"
+        )
+        reaped_scan_lines = [
+            node.lineno for node in ast.walk(reaped_if)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "scan_source_token_logs"
+        ]
+        self.assertTrue(reaped_scan_lines)
+        self.assertLess(min(reap_lines), min(reaped_scan_lines))
+        cleanup_calls = [
+            node for statement in outer_try.finalbody for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "cleanup"
+        ]
+        self.assertTrue(any(any(keyword.arg == "remove_root" for keyword in call.keywords) for call in cleanup_calls))
         self.assertLess(min(scan_lines), min(cleanup_lines))
         self.assertLess(min(scan_lines), min(write_lines))
         self.assertLess(min(scan_lines), min(failure_print_lines))
