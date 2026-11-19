@@ -21,10 +21,11 @@ jobs:
     # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
     runs-on: ubuntu-22.04
     # 95 minutes baseline, 12 for the #304 cold tenant LFS gate on owned Garage,
-    # and 28 for the full Redis qualification (13 build, 5 restore/flush,
-    # 3 partition, 4 failover, 3 cleanup and manifest binding), plus 40 for the
-    # Pando package gates: 95 + 12 + 28 + 40 = 175 minutes.
-    timeout-minutes: 175
+    # 28 for the full Redis qualification (13 build, 5 restore/flush, 3
+    # partition, 4 failover, 3 cleanup and manifest binding), 40 for the Pando
+    # package gates, and 18 for the #29 bounded owned-Garage named witness:
+    # 95 + 12 + 28 + 40 + 18 = 193 minutes.
+    timeout-minutes: 193
     services:
       postgres:
         image: postgres:17
@@ -267,7 +268,14 @@ jobs:
       # Separate #29-owned Garage/bucket/scratch scope. Do not reuse the live
       # #85 fixture, keys, environment file or cleanup trap.
       - name: "Prove #29 tenant-scoped remote checkpoint restore/fork refusal on owned Garage"
-        timeout-minutes: 10
+        # Worst-case bounded components: two 120s pulls plus 10s kill-after and a
+        # 2s retry pause (262s), a shared 60s startup budget plus a 5s kill-after
+        # and a 1s pause (66s), the independent S3 readiness probe's 60s budget
+        # plus a 5s attempt overrun and 0.5s pause (66s), and the 480s named test
+        # plus 15s kill-after (495s): 889s, or 14m49s.  The 18-minute allowance
+        # leaves ~3m11s for owned-container cleanup and normal Docker/Garage
+        # setup overhead.
+        timeout-minutes: 18
         env:
           ROOTYARD_WORKSPACE_MOUNT_MODE: direct
         run: |

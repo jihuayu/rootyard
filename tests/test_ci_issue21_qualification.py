@@ -34,14 +34,17 @@ PG_STEP = "Run the 17 ignored Pando Local PostgreSQL producer cases"
 PANDO_CLI_STEP = "Exercise Pando object store delta resolution, graph traversal, and differential export"
 PANDO_PITR_STEP = "Exercise live Pando PITR fencing, retention roots, and pg_dump clone safety"
 COLD_LFS_STEP = "Qualify #85 cold tenant LFS retention on owned Garage"
+REMOTE_CAS_STEP = "Prove #29 tenant-scoped remote checkpoint restore/fork refusal on owned Garage"
 UPLOAD_STEP = "Upload end-to-end report"
 UPLOAD_ALLOWED_LOG = "test-results/ci-webhook-regressions.log"
 
 # The 163-minute verify/lifecycle budget already contains the 28-minute owned
 # Redis step, so it is not added again.  #304 contributes an independent
-# 12-minute cold tenant LFS gate on owned Garage: 163 + 12 = 175.
+# 12-minute cold tenant LFS gate on owned Garage, and #29 contributes an
+# independent 18-minute bounded owned-Garage named witness: 163 + 12 + 18 = 193.
 VERIFY_BASE_BUDGET_MINUTES = 163
 COLD_LFS_BUDGET_MINUTES = 12
+REMOTE_CAS_BUDGET_MINUTES = 18
 
 
 def _lines():
@@ -209,11 +212,16 @@ class WorkflowWiringTest(unittest.TestCase):
         lines = _verify_lines()
         self.assertEqual(
             _job_scalar(lines, "timeout-minutes"),
-            str(VERIFY_BASE_BUDGET_MINUTES + COLD_LFS_BUDGET_MINUTES),
+            str(VERIFY_BASE_BUDGET_MINUTES + COLD_LFS_BUDGET_MINUTES
+                + REMOTE_CAS_BUDGET_MINUTES),
         )
         cold_lfs = _step(COLD_LFS_STEP)
         self.assertEqual(
             cold_lfs["timeout-minutes"], str(COLD_LFS_BUDGET_MINUTES)
+        )
+        remote_cas = _step(REMOTE_CAS_STEP)
+        self.assertEqual(
+            remote_cas["timeout-minutes"], str(REMOTE_CAS_BUDGET_MINUTES)
         )
         pg = _step(PG_STEP)
         self.assertEqual(pg["timeout-minutes"], "10")
