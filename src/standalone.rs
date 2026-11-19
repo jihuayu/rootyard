@@ -1,12 +1,13 @@
 //! Minimal serving lifecycle, with independent HTTP draining and worker stop.
-//! Storage adapters construct routes; this path opens no GitFS volume or external wake.
-//! Browser sign-in is enabled on the standalone service, so the shared bounded
-//! browser-session GC loop runs here under its own cancellation token.
+//! Storage adapters construct routes; this path opens no GitFS volume. Its
+//! default wake is local Notify + PostgreSQL target-audit scanning; an explicit
+//! A4 variable may attach the advisory Redis publisher without changing the
+//! committed response. Browser sign-in is enabled on the standalone service, so
+//! the shared bounded browser-session GC loop runs here under its own token.
 use anyhow::{Result, anyhow};
 use axum::response::IntoResponse;
 use deadpool_postgres::Pool;
 use std::{future::IntoFuture, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 mod config;
 pub(crate) mod session_keyring;
@@ -48,12 +49,12 @@ pub async fn run_from_env() -> Result<()> {
     let cache =
         crate::cache_wake::ServingCache::standalone_memory().map_err(|_| anyhow!("invalid cache configuration"))?;
     state = state.with_cache(Arc::new(cache));
-    // One advisory local signal set for this process. It is shared by the
-    // gateway's fresh-commit trigger and the embedded PG worker; it carries no
-    // event payload and never affects the committed response.
+    // One advisory signal set for this process. The local permit wakes the
+    // embedded PG target-audit worker; the remote permit is consumed only by
+    // the explicit opt-in publisher. It carries no event payload and never
+    // affects the committed response.
     let dispatch = crate::dispatch::Signals::default();
     state = state.with_dispatch(dispatch.clone());
-    let wake = dispatch.local.clone();
     if let Some(sessions) = sessions {
         state = state.with_sessions(sessions);
     }
@@ -66,7 +67,7 @@ pub async fn run_from_env() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     };
-    serve(router, pool, bind, check, wake).await
+    serve(router, pool, bind, check, dispatch).await
 }
 
 /// Only the typed lifecycle-barrier refusal keeps its fixed cause; a busy
@@ -84,8 +85,15 @@ async fn serve(
     pool: Pool,
     bind: SocketAddr,
     check: impl std::future::Future<Output = anyhow::Error>,
-    wake: Arc<Notify>,
+    dispatch: crate::dispatch::Signals,
 ) -> Result<()> {
+    // The default remains local Notify + PG scan. The A4 transport is selected
+    // only by its dedicated explicit variable, never by generic wake settings.
+    let settings = crate::dispatch::Settings::standalone_from_env()
+        .map_err(|_| anyhow!("invalid A4 advisory wake configuration"))?;
+    let transport = settings.transport.clone();
+    let wake = dispatch.local.clone();
+    let remote = dispatch.remote.clone();
     let hard_stop = CancellationToken::new();
     let request_stop = hard_stop.clone();
     let router = router.layer(axum::middleware::from_fn(
@@ -105,12 +113,12 @@ async fn serve(
         tokio::net::TcpListener::bind(bind).await.map_err(|_| anyhow!("could not bind Blob service listener"))?;
     let worker_stop = CancellationToken::new();
     let server_stop = CancellationToken::new();
-    let mut worker = tokio::spawn(crate::dispatch::worker(
-        pool.clone(),
-        crate::dispatch::Settings::standalone(),
-        wake,
-        worker_stop.clone(),
-    ));
+    let mut worker = tokio::spawn(crate::dispatch::worker(pool.clone(), settings, wake, worker_stop.clone()));
+    // A publish failure or a lost hint only delays the existing PG poll. The
+    // committed response above already completed; this task never owns a
+    // terminal, outbox row or retry decision. It shares the one dispatch stop
+    // token so shutdown cancels subscription-free publishes promptly.
+    let mut publisher = tokio::spawn(crate::dispatch::publisher(transport, remote, worker_stop.clone()));
     // The one shared browser-session GC loop. It needs only PostgreSQL and is
     // stopped and awaited on every exit path below.
     let session_gc_stop = CancellationToken::new();
@@ -167,6 +175,15 @@ async fn serve(
             Err(_) => {
                 worker.abort();
                 let _ = worker.await;
+            }
+        }
+    }
+    if !publisher.is_finished() {
+        match tokio::time::timeout(Duration::from_secs(5), &mut publisher).await {
+            Ok(_) => {}
+            Err(_) => {
+                publisher.abort();
+                let _ = publisher.await;
             }
         }
     }

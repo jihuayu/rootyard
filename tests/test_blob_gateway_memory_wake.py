@@ -21,16 +21,18 @@ def body(text, start, end):
 
 
 class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
-    def test_standalone_uses_one_local_signal_set_and_no_external_transport(self):
+    def test_standalone_defaults_to_local_wake_and_only_reads_the_a4_opt_in(self):
         text = source("src/standalone.rs")
         self.assertIn("crate::dispatch::Signals::default()", text)
         self.assertIn("state.with_dispatch(dispatch.clone())", text)
         self.assertIn("let wake = dispatch.local.clone()", text)
-        self.assertIn("serve(router, pool, bind, check, wake).await", text)
-        self.assertIn("crate::dispatch::Settings::standalone()", text)
-        self.assertIn("wake,", text)
+        self.assertIn("let remote = dispatch.remote.clone()", text)
+        self.assertIn("serve(router, pool, bind, check, dispatch).await", text)
+        self.assertIn("crate::dispatch::Settings::standalone_from_env()", text)
+        self.assertIn("crate::dispatch::publisher", text)
         for forbidden in (
             "ROOTYARD_WAKE_TRANSPORT",
+            "ROOTYARD_WAKE_CHANNEL",
             "RedisWake",
             "KafkaWake",
             "Settings::from_env",

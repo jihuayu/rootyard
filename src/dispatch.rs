@@ -19,6 +19,52 @@ use crate::observability::{
 };
 
 type Task<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Explicit worker topology selectors. The generic scope preserves its existing
+/// `audit-log,ref-index` and Ref-CAS projection scans. The A4 scope restricts
+/// the scan to the dedicated target evidence kind, uses the A4 wake namespace,
+/// and never enables legacy consumers or projection jobs.
+pub const WORKER_SCOPE_ENV: &str = "ROOTYARD_WORKER_SCOPE";
+pub const A4_WORKER_SCOPE: &str = "a4-target-audit";
+/// A4 wake selection is deliberately separate from the generic outbox wake.
+/// Setting the generic variables can never enroll this producer/subscriber.
+pub const A4_WAKE_TRANSPORT_ENV: &str = "ROOTYARD_A4_WAKE_TRANSPORT";
+pub const A4_WAKE_CHANNEL_ENV: &str = "ROOTYARD_A4_WAKE_CHANNEL";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerScope {
+    Generic,
+    A4TargetAudit,
+}
+
+/// The fixed A4 advisory namespace. It contains the exact durable target-audit
+/// kind and is never derived from a repository, operation, token or payload.
+pub fn a4_wake_channel() -> String {
+    format!("rootyard:a4:{}:v1", crate::events::TARGET_AUDIT_KIND)
+}
+
+/// Resolve the installation-selected A4 channel, validating it with the same
+/// bounded rule as every other wake channel. A present invalid value fails
+/// closed; the value is not silently replaced with the default.
+pub fn a4_wake_channel_from_env() -> Result<String> {
+    let channel = std::env::var(A4_WAKE_CHANNEL_ENV).unwrap_or_else(a4_wake_channel);
+    crate::cache_wake::validate_wake_channel(&channel)?;
+    Ok(channel)
+}
+
+pub fn worker_scope_from_env() -> Result<WorkerScope> {
+    let raw = std::env::var(WORKER_SCOPE_ENV).ok();
+    worker_scope(raw.as_deref())
+}
+
+fn worker_scope(raw: Option<&str>) -> Result<WorkerScope> {
+    match raw.unwrap_or("") {
+        "" | "generic" => Ok(WorkerScope::Generic),
+        A4_WORKER_SCOPE => Ok(WorkerScope::A4TargetAudit),
+        _ => bail!("{WORKER_SCOPE_ENV} must be generic or {A4_WORKER_SCOPE}"),
+    }
+}
+
 /// Implementations carry only a hint to rescan PG. They cannot supply a Claim,
 /// mark a delivery complete, choose a repository, or execute a business effect.
 pub trait WakeTransport: Send + Sync {
@@ -66,15 +112,42 @@ impl Settings {
         }
     }
 
-    pub fn from_env() -> Result<Self> {
-        fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
-            let value = match std::env::var(name) {
-                Ok(v) => v.parse().with_context(|| format!("invalid {name}"))?,
-                Err(_) => default,
-            };
-            ensure!((min..=max).contains(&value), "{name} outside supported range");
-            Ok(value)
+    /// Standalone serving keeps its bounded Memory cache and PG target-audit
+    /// scan. The only production opt-in here is the explicitly selected A4
+    /// advisory transport; generic wake variables are never read.
+    pub fn standalone_from_env() -> Result<Self> {
+        let mut settings = Self::standalone();
+        settings.transport = a4_transport_from_env()?;
+        Ok(settings)
+    }
+
+    /// Explicit external A4 worker. It scans only the target audit evidence
+    /// kind and never enables Ref-CAS projection jobs or legacy consumers.
+    pub fn a4_target_audit() -> Self {
+        Self {
+            poll: Duration::from_secs(1),
+            batch: 64,
+            lease_seconds: 60,
+            consumers: vec![crate::events::TARGET_AUDIT_CONSUMER.to_owned()],
+            transport: None,
+            target_audit_only: true,
+            projection_jobs: false,
         }
+    }
+
+    /// Read only the shared worker bounds and the A4-specific wake transport.
+    /// `ROOTYARD_WORKER_CONSUMERS`, `ROOTYARD_WAKE_TRANSPORT` and
+    /// `ROOTYARD_WAKE_CHANNEL` are deliberately ignored in this scope.
+    pub fn a4_target_audit_from_env() -> Result<Self> {
+        let mut settings = Self::a4_target_audit();
+        settings.poll = Duration::from_millis(number("ROOTYARD_WORKER_POLL_MS", 5000, 50, 60_000)?);
+        settings.batch = number("ROOTYARD_WORKER_BATCH", 64, 1, 1000)? as i64;
+        settings.lease_seconds = number("ROOTYARD_WORKER_LEASE_SECONDS", 60, 1, 3600)? as i64;
+        settings.transport = a4_transport_from_env()?;
+        Ok(settings)
+    }
+
+    pub fn from_env() -> Result<Self> {
         let consumers =
             std::env::var("ROOTYARD_WORKER_CONSUMERS").unwrap_or_else(|_| crate::events::CONSUMERS.join(","));
         let consumers: Vec<String> = consumers.split(',').map(str::to_owned).collect();
@@ -125,6 +198,39 @@ impl Settings {
         })
     }
 }
+
+fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
+    let value = match std::env::var(name) {
+        Ok(value) => value.parse().with_context(|| format!("invalid {name}"))?,
+        Err(_) => default,
+    };
+    ensure!((min..=max).contains(&value), "{name} outside supported range");
+    Ok(value)
+}
+
+fn a4_transport_from_env() -> Result<Option<Arc<dyn WakeTransport>>> {
+    let raw = std::env::var(A4_WAKE_TRANSPORT_ENV).ok();
+    a4_transport_from_setting(raw.as_deref())
+}
+
+fn a4_transport_from_setting(raw: Option<&str>) -> Result<Option<Arc<dyn WakeTransport>>> {
+    match raw.unwrap_or("") {
+        "" | "poll" | "memory" => Ok(None),
+        "redis" => {
+            #[cfg(feature = "state-redis")]
+            {
+                let channel = a4_wake_channel_from_env()?;
+                Ok(Some(Arc::new(crate::cache_wake::RedisWake::from_env_with_channel(channel)?)))
+            }
+            #[cfg(not(feature = "state-redis"))]
+            {
+                bail!("A4 Redis wake requires building with feature 'state-redis'")
+            }
+        }
+        _ => bail!("{A4_WAKE_TRANSPORT_ENV} must be poll, memory or redis"),
+    }
+}
+
 /// Runs independently of native Git, volume locks, and journal reconciliation.
 /// A fixed interval remains active even when no transport exists or it fails.
 pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: CancellationToken) {
@@ -488,6 +594,45 @@ mod tests {
         assert!(settings.target_audit_only);
         assert!(!settings.projection_jobs);
         assert!(settings.transport.is_none());
+    }
+    #[test]
+    fn a4_scope_excludes_legacy_consumers_and_projection_jobs() {
+        let settings = Settings::a4_target_audit();
+        assert_eq!(settings.consumers, vec![crate::events::TARGET_AUDIT_CONSUMER.to_owned()]);
+        assert!(settings.target_audit_only);
+        assert!(!settings.projection_jobs);
+        assert!(settings.transport.is_none());
+    }
+    #[test]
+    fn a4_channel_is_namespaced_valid_and_contains_the_target_kind() {
+        let channel = a4_wake_channel();
+        assert!(channel.starts_with("rootyard:a4:"));
+        assert!(channel.contains(crate::events::TARGET_AUDIT_KIND));
+        crate::cache_wake::validate_wake_channel(&channel).unwrap();
+    }
+    #[test]
+    fn worker_scope_is_explicit_and_rejects_unknown_values() {
+        assert_eq!(worker_scope(None).unwrap(), WorkerScope::Generic);
+        assert_eq!(worker_scope(Some("")).unwrap(), WorkerScope::Generic);
+        assert_eq!(worker_scope(Some("generic")).unwrap(), WorkerScope::Generic);
+        assert_eq!(worker_scope(Some(A4_WORKER_SCOPE)).unwrap(), WorkerScope::A4TargetAudit);
+        assert!(worker_scope(Some("a4")).is_err());
+        assert!(worker_scope(Some("legacy")).is_err());
+    }
+    #[test]
+    fn a4_transport_defaults_to_no_remote_and_rejects_unrelated_values() {
+        assert!(a4_transport_from_setting(None).unwrap().is_none());
+        assert!(a4_transport_from_setting(Some("")).unwrap().is_none());
+        assert!(a4_transport_from_setting(Some("poll")).unwrap().is_none());
+        assert!(a4_transport_from_setting(Some("memory")).unwrap().is_none());
+        assert!(a4_transport_from_setting(Some("kafka")).is_err());
+        assert!(a4_transport_from_setting(Some("redis ")).is_err());
+    }
+    #[cfg(not(feature = "state-redis"))]
+    #[test]
+    fn a4_redis_requires_the_explicit_state_redis_feature() {
+        let error = a4_transport_from_setting(Some("redis")).err().expect("redis must be refused");
+        assert!(format!("{error}").contains("state-redis"));
     }
     #[tokio::test]
     async fn failed_adapter_is_cancellable() {
