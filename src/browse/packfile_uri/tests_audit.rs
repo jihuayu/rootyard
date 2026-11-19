@@ -28,7 +28,7 @@ use super::{
     *,
 };
 
-async fn raw_http_exchange(addr: std::net::SocketAddr, request: &str) -> (u16, Vec<u8>) {
+pub(super) async fn raw_http_exchange(addr: std::net::SocketAddr, request: &str) -> (u16, Vec<u8>) {
     let mut sock = TcpStream::connect(addr).await.unwrap();
     sock.write_all(request.as_bytes()).await.unwrap();
     let mut raw = Vec::new();
