@@ -28,7 +28,7 @@
 - HTTP/Git：`tests/blob_only_service.py` 11 项；tree/blob 浏览 `tests/blob_gateway_browse.py` 7 项（`f1889aa` 通过）；refs、提交列表/详情和 compare 历史 API 7 项（`7690758` 通过）。浏览复用捕获的 RefStore 快照、Blob 物化和真实 token/session 权限，支持 SHA-1/SHA-256、带注解标签、当前 refs 可达的历史对象、分页及二进制文件；消息、遍历、子进程输出和 JSON 编码都有明确上限。
 - 并发提交收尾只在原 pending token、请求绑定与同一 realm 持久 gate 前进均核对后写入拒绝终态；真正结果未知的提交保持 UNKNOWN。A3 两个指定竞争窗口只有错误分类单元回归，HTTP 竞争验收不保证调度恰落在这两个窗口。
 - 备份：format22/schema147 配对归档（见下节）7 项、旧 format21 备份/恢复 7 项，均在 `1d1ce62` 通过。
-- 本地结构检查（非新增执行记录）：`src/standalone.rs` 只构造 Smart HTTP 路由，不提供 SSH 入口；`state-redis` 默认不在 feature 中，`serve-blob` 默认仍是 Memory + 内嵌 PG 扫描，只有 `ROOTYARD_A4_WORKER_MODE=external` 才移除内嵌 A4 consumer，只有显式设置 `ROOTYARD_A4_WAKE_TRANSPORT=redis` 且以 `state-redis` 构建时才启用 A4 咨询式 Redis publisher；独立实验 crate 不在根依赖中。
+- 本地结构检查（非新增执行记录）：`src/standalone.rs` 只构造 Smart HTTP 路由，不提供 SSH 入口；`state-redis` 默认不在 feature 中，`serve-blob` 默认仍是 Memory + 内嵌 PG 扫描，只有 `ROOTYARD_A4_WORKER_MODE=external` 才移除内嵌 A4 consumer，只有显式设置 `ROOTYARD_A4_WAKE_TRANSPORT=redis` 且以 `state-redis` 构建时才启用 A4 咨询式 Redis publisher；A4 mode/scope/transport/channel 仅真正缺失时取默认，显式空值、非法值或非 Unicode 会拒绝启动，且 A4 channel 不得与通用 wake channel 或其默认值相同；独立实验 crate 不在根依赖中。
 
 Rust 与 Python 计数来自各候选提交当时记录的实跑：`7690758` 上 Rust 库测试 464 通过、9 项服务依赖测试显式忽略，最小依赖 all-targets Clippy 通过（候选 PR #159/#161 的 GitHub 主 CI `verify` 任务当时为失败，记录未追溯根因；独立的 CI 恢复与问题修复在其他分支进行，本页不重复）；`backup_blob_serving147.py` 记录 Python 336 项中 331 通过、5 跳过，外加 3 项 live S3 工作区用例通过。上述结果绑定各自源码提交；集成后的全量门禁（all-targets Clippy、Rust 测试与 native/remote 用例）以 PR #170 最终检查与 artifacts 为准，本页不另作汇总通过声明。
 

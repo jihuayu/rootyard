@@ -64,10 +64,10 @@ downgraded.
 | `ROOTYARD_REDIS_URL` | none | Optional feature `state-redis`: `rediss://` remote with ACL in URL, or loopback `redis://` |
 | `ROOTYARD_REDIS_ADDRESS` | none | Legacy loopback address when `state-redis` is off, or compatibility fallback when on |
 | `ROOTYARD_WAKE_CHANNEL` | `rootyard:outbox:v1` | 1–128 ASCII alphanumeric, colon, underscore or hyphen |
-| `ROOTYARD_WORKER_SCOPE` | `generic` | `generic` preserves legacy consumers/projection jobs; `a4-target-audit` selects only the A4 target-audit queue |
-| `ROOTYARD_A4_WORKER_MODE` | `embedded` | On `serve-blob`: `embedded` keeps the in-process A4 consumer; `external` removes it for a separately supervised A4 worker |
-| `ROOTYARD_A4_WAKE_TRANSPORT` | absent (`poll`) | `poll`/`memory` (no remote) or `redis` (requires `state-redis`); read only by `serve-blob` and the A4 worker scope |
-| `ROOTYARD_A4_WAKE_CHANNEL` | `rootyard:a4:pg_refstore_core_commit_audit:v1` | Explicit A4 namespace; validated by the same channel rule |
+| `ROOTYARD_WORKER_SCOPE` | `generic` when missing | `generic` preserves legacy consumers/projection jobs; `a4-target-audit` selects only the A4 target-audit queue; present empty/unknown/non-Unicode fails |
+| `ROOTYARD_A4_WORKER_MODE` | `embedded` when missing | On `serve-blob`: `embedded` keeps the in-process A4 consumer; `external` removes it for a separately supervised A4 worker; present empty/unknown/non-Unicode fails |
+| `ROOTYARD_A4_WAKE_TRANSPORT` | absent (`poll`) when missing | `poll`/`memory` (no remote) or `redis` (requires `state-redis`); present empty/unknown/non-Unicode fails |
+| `ROOTYARD_A4_WAKE_CHANNEL` | `rootyard:a4:pg_refstore_core_commit_audit:v1` when missing | A4 Redis namespace; must differ from the configured generic wake channel/default; when A4 Redis is selected, present empty/invalid/non-Unicode or alias fails |
 
 Example role split (set the database URL using your normal secret mechanism):
 
@@ -87,8 +87,13 @@ in-process A4 consumer, so the external worker is the only claimant and the
 healthy push/fallback evidence is causally attributable. The generic
 consumer/wake variables above are ignored by this topology; in particular,
 `ROOTYARD_WORKER_SCOPE=a4-target-audit` never scans `ref-index` or runs Ref-CAS
-projection jobs. Unknown modes, unsupported transports and `redis` without the
-`state-redis` feature fail startup closed.
+projection jobs. Only a truly missing variable selects each A4 default; present
+empty, unknown and non-Unicode mode/scope/transport/channel values fail startup
+closed. The resolved A4 channel must not alias the actual generic
+`ROOTYARD_WAKE_CHANNEL` (including its `rootyard:outbox:v1` default). Malformed
+configuration is distinct from a transport outage: the latter remains advisory
+and leaves PostgreSQL polling active. `redis` without the `state-redis` feature
+also fails startup closed.
 
 ```sh
 ROOTYARD_A4_WORKER_MODE=external \

@@ -19,7 +19,7 @@ class SourceBindingTest(unittest.TestCase):
         self.assertIn(f'pub const TARGET_AUDIT_KIND: &str = "{a4.TARGET_KIND}"', events)
         dispatch = (ROOT / "src" / "dispatch.rs").read_text(encoding="utf-8")
         self.assertIn('pub const A4_WORKER_MODE_ENV: &str = "ROOTYARD_A4_WORKER_MODE"', dispatch)
-        self.assertIn('"external" => Ok(A4WorkerMode::External)', dispatch)
+        self.assertIn('Some("external") => Ok(A4WorkerMode::External)', dispatch)
         self.assertIn("pub const fn runs_embedded_worker", dispatch)
         standalone = (ROOT / "src" / "standalone.rs").read_text(encoding="utf-8")
         self.assertIn("if mode.runs_embedded_worker()", standalone)

@@ -62,38 +62,70 @@ pub fn a4_wake_channel() -> String {
     format!("rootyard:a4:{}:v1", crate::events::TARGET_AUDIT_KIND)
 }
 
-/// Resolve the installation-selected A4 channel, validating it with the same
-/// bounded rule as every other wake channel. A present invalid value fails
-/// closed; the value is not silently replaced with the default.
+/// Resolve the installation-selected A4 channel. Only a truly absent variable
+/// selects the A4 default; a present empty, invalid or non-Unicode value fails
+/// closed. The A4 namespace must also differ from the actual generic wake
+/// channel, including the generic default, so one configured Generic worker can
+/// never consume A4 hints or vice versa.
 pub fn a4_wake_channel_from_env() -> Result<String> {
-    let channel = std::env::var(A4_WAKE_CHANNEL_ENV).unwrap_or_else(a4_wake_channel);
+    let explicit = env_text(A4_WAKE_CHANNEL_ENV)?;
+    let generic = crate::cache_wake::generic_wake_channel_from_env()?;
+    a4_wake_channel_for(explicit.as_deref(), &generic)
+}
+
+fn a4_wake_channel_for(explicit: Option<&str>, generic: &str) -> Result<String> {
+    let channel = match explicit {
+        Some(value) => value.to_owned(),
+        None => a4_wake_channel(),
+    };
     crate::cache_wake::validate_wake_channel(&channel)?;
+    ensure!(
+        channel.as_str() != generic,
+        "A4 wake channel must differ from the generic wake channel"
+    );
     Ok(channel)
 }
 
 pub fn worker_scope_from_env() -> Result<WorkerScope> {
-    let raw = std::env::var(WORKER_SCOPE_ENV).ok();
+    let raw = env_text(WORKER_SCOPE_ENV)?;
     worker_scope(raw.as_deref())
 }
 
 fn worker_scope(raw: Option<&str>) -> Result<WorkerScope> {
-    match raw.unwrap_or("") {
-        "" | "generic" => Ok(WorkerScope::Generic),
-        A4_WORKER_SCOPE => Ok(WorkerScope::A4TargetAudit),
-        _ => bail!("{WORKER_SCOPE_ENV} must be generic or {A4_WORKER_SCOPE}"),
+    match raw {
+        None | Some("generic") => Ok(WorkerScope::Generic),
+        Some(A4_WORKER_SCOPE) => Ok(WorkerScope::A4TargetAudit),
+        Some(_) => bail!("{WORKER_SCOPE_ENV} must be generic or {A4_WORKER_SCOPE}"),
     }
 }
 
 pub fn a4_worker_mode_from_env() -> Result<A4WorkerMode> {
-    let raw = std::env::var(A4_WORKER_MODE_ENV).ok();
+    let raw = env_text(A4_WORKER_MODE_ENV)?;
     a4_worker_mode(raw.as_deref())
 }
 
 fn a4_worker_mode(raw: Option<&str>) -> Result<A4WorkerMode> {
-    match raw.unwrap_or("") {
-        "" | "embedded" => Ok(A4WorkerMode::Embedded),
-        "external" => Ok(A4WorkerMode::External),
-        _ => bail!("{A4_WORKER_MODE_ENV} must be embedded or external"),
+    match raw {
+        None | Some("embedded") => Ok(A4WorkerMode::Embedded),
+        Some("external") => Ok(A4WorkerMode::External),
+        Some(_) => bail!("{A4_WORKER_MODE_ENV} must be embedded or external"),
+    }
+}
+
+/// Read one new A4-specific variable with strict presence semantics. Only
+/// `VarError::NotPresent` means "use the documented default"; present empty,
+/// malformed and non-Unicode values are refusals. The error names the variable
+/// but never includes its value.
+fn env_text(name: &str) -> Result<Option<String>> {
+    env_text_from(name, std::env::var(name))
+}
+
+fn env_text_from(name: &str, raw: std::result::Result<String, std::env::VarError>) -> Result<Option<String>> {
+    match raw {
+        Ok(value) if value.is_empty() => bail!("{name} must not be empty"),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => bail!("{name} must be valid Unicode"),
     }
 }
 
@@ -172,9 +204,9 @@ impl Settings {
     /// `ROOTYARD_WAKE_CHANNEL` are deliberately ignored in this scope.
     pub fn a4_target_audit_from_env() -> Result<Self> {
         let mut settings = Self::a4_target_audit();
-        settings.poll = Duration::from_millis(number("ROOTYARD_WORKER_POLL_MS", 5000, 50, 60_000)?);
-        settings.batch = number("ROOTYARD_WORKER_BATCH", 64, 1, 1000)? as i64;
-        settings.lease_seconds = number("ROOTYARD_WORKER_LEASE_SECONDS", 60, 1, 3600)? as i64;
+        settings.poll = Duration::from_millis(number_strict("ROOTYARD_WORKER_POLL_MS", 5000, 50, 60_000)?);
+        settings.batch = number_strict("ROOTYARD_WORKER_BATCH", 64, 1, 1000)? as i64;
+        settings.lease_seconds = number_strict("ROOTYARD_WORKER_LEASE_SECONDS", 60, 1, 3600)? as i64;
         settings.transport = a4_transport_from_env()?;
         Ok(settings)
     }
@@ -203,8 +235,7 @@ impl Settings {
                         .context("ROOTYARD_REDIS_ADDRESS is required")?
                         .parse()
                         .context("Redis address must be a loopback socket address")?;
-                    let channel =
-                        std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
+                    let channel = crate::cache_wake::generic_wake_channel_from_env()?;
                     Some(Arc::new(RedisWake::new(address, channel)?))
                 }
             }
@@ -231,24 +262,37 @@ impl Settings {
     }
 }
 
+/// Existing generic numeric read. It intentionally retains the legacy
+/// non-Unicode fallback for the generic worker path; the A4 path uses the
+/// strict variant below.
 fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
-    let value = match std::env::var(name) {
-        Ok(value) => value.parse().with_context(|| format!("invalid {name}"))?,
-        Err(_) => default,
+    let raw = std::env::var(name).ok();
+    number_from_setting(name, raw.as_deref(), default, min, max)
+}
+
+fn number_strict(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
+    let raw = env_text(name)?;
+    number_from_setting(name, raw.as_deref(), default, min, max)
+}
+
+fn number_from_setting(name: &str, raw: Option<&str>, default: u64, min: u64, max: u64) -> Result<u64> {
+    let value = match raw {
+        Some(value) => value.parse().with_context(|| format!("invalid {name}"))?,
+        None => default,
     };
     ensure!((min..=max).contains(&value), "{name} outside supported range");
     Ok(value)
 }
 
 fn a4_transport_from_env() -> Result<Option<Arc<dyn WakeTransport>>> {
-    let raw = std::env::var(A4_WAKE_TRANSPORT_ENV).ok();
+    let raw = env_text(A4_WAKE_TRANSPORT_ENV)?;
     a4_transport_from_setting(raw.as_deref())
 }
 
 fn a4_transport_from_setting(raw: Option<&str>) -> Result<Option<Arc<dyn WakeTransport>>> {
-    match raw.unwrap_or("") {
-        "" | "poll" | "memory" => Ok(None),
-        "redis" => {
+    match raw {
+        None | Some("poll") | Some("memory") => Ok(None),
+        Some("redis") => {
             #[cfg(feature = "state-redis")]
             {
                 let channel = a4_wake_channel_from_env()?;
@@ -259,7 +303,7 @@ fn a4_transport_from_setting(raw: Option<&str>) -> Result<Option<Arc<dyn WakeTra
                 bail!("A4 Redis wake requires building with feature 'state-redis'")
             }
         }
-        _ => bail!("{A4_WAKE_TRANSPORT_ENV} must be poll, memory or redis"),
+        Some(_) => bail!("{A4_WAKE_TRANSPORT_ENV} must be poll, memory or redis"),
     }
 }
 
@@ -643,33 +687,68 @@ mod tests {
         crate::cache_wake::validate_wake_channel(&channel).unwrap();
     }
     #[test]
-    fn worker_scope_is_explicit_and_rejects_unknown_values() {
+    fn worker_scope_defaults_only_when_missing_and_rejects_empty_or_unknown() {
         assert_eq!(worker_scope(None).unwrap(), WorkerScope::Generic);
-        assert_eq!(worker_scope(Some("")).unwrap(), WorkerScope::Generic);
         assert_eq!(worker_scope(Some("generic")).unwrap(), WorkerScope::Generic);
         assert_eq!(worker_scope(Some(A4_WORKER_SCOPE)).unwrap(), WorkerScope::A4TargetAudit);
+        assert!(worker_scope(Some("")).is_err());
         assert!(worker_scope(Some("a4")).is_err());
         assert!(worker_scope(Some("legacy")).is_err());
     }
     #[test]
-    fn a4_worker_mode_defaults_embedded_and_external_is_explicit() {
+    fn a4_worker_mode_defaults_only_when_missing_and_rejects_empty_or_unknown() {
         assert_eq!(a4_worker_mode(None).unwrap(), A4WorkerMode::Embedded);
-        assert_eq!(a4_worker_mode(Some("")).unwrap(), A4WorkerMode::Embedded);
         assert_eq!(a4_worker_mode(Some("embedded")).unwrap(), A4WorkerMode::Embedded);
         assert_eq!(a4_worker_mode(Some("external")).unwrap(), A4WorkerMode::External);
+        assert!(a4_worker_mode(Some("")).is_err());
         assert!(a4_worker_mode(Some("disabled")).is_err());
         assert!(a4_worker_mode(Some("Redis")).is_err());
         assert!(A4WorkerMode::Embedded.runs_embedded_worker());
         assert!(!A4WorkerMode::External.runs_embedded_worker());
     }
     #[test]
-    fn a4_transport_defaults_to_no_remote_and_rejects_unrelated_values() {
+    fn a4_transport_defaults_only_when_missing_and_rejects_empty_or_unrelated() {
         assert!(a4_transport_from_setting(None).unwrap().is_none());
-        assert!(a4_transport_from_setting(Some("")).unwrap().is_none());
         assert!(a4_transport_from_setting(Some("poll")).unwrap().is_none());
         assert!(a4_transport_from_setting(Some("memory")).unwrap().is_none());
+        assert!(a4_transport_from_setting(Some("")).is_err());
         assert!(a4_transport_from_setting(Some("kafka")).is_err());
         assert!(a4_transport_from_setting(Some("redis ")).is_err());
+    }
+    #[test]
+    fn a4_channel_cannot_alias_the_generic_channel_or_default() {
+        let a4 = a4_wake_channel();
+        let generic = crate::cache_wake::GENERIC_WAKE_CHANNEL_DEFAULT;
+        assert_ne!(a4.as_str(), generic);
+        assert_eq!(a4_wake_channel_for(None, generic).unwrap(), a4);
+        assert!(a4_wake_channel_for(None, &a4).is_err());
+        assert!(a4_wake_channel_for(Some(generic), generic).is_err());
+        assert!(a4_wake_channel_for(Some(a4.as_str()), generic).is_ok());
+        assert!(a4_wake_channel_for(Some(""), generic).is_err());
+        assert!(a4_wake_channel_for(Some("has space"), generic).is_err());
+    }
+    #[test]
+    fn strict_env_presence_rejects_empty_and_non_unicode_without_echoing() {
+        assert_eq!(env_text_from("ROOTYARD_TEST_STRICT", Err(std::env::VarError::NotPresent)).unwrap(), None);
+        assert!(env_text_from("ROOTYARD_TEST_STRICT", Ok(String::new())).is_err());
+        let error = env_text_from(
+            "ROOTYARD_TEST_STRICT",
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from("private-value"))),
+        )
+        .err()
+        .expect("non-Unicode must be refused");
+        let text = format!("{error}");
+        assert!(text.contains("ROOTYARD_TEST_STRICT"));
+        assert!(!text.contains("private-value"));
+    }
+    #[test]
+    fn strict_a4_numbers_default_only_when_missing_and_reject_bad_values() {
+        assert_eq!(number_from_setting("ROOTYARD_TEST_NUMBER", None, 5, 1, 10).unwrap(), 5);
+        assert_eq!(number_from_setting("ROOTYARD_TEST_NUMBER", Some("7"), 5, 1, 10).unwrap(), 7);
+        assert!(number_from_setting("ROOTYARD_TEST_NUMBER", Some(""), 5, 1, 10).is_err());
+        assert!(number_from_setting("ROOTYARD_TEST_NUMBER", Some("0"), 5, 1, 10).is_err());
+        assert!(number_from_setting("ROOTYARD_TEST_NUMBER", Some("11"), 5, 1, 10).is_err());
+        assert!(number_from_setting("ROOTYARD_TEST_NUMBER", Some("not-a-number"), 5, 1, 10).is_err());
     }
     #[cfg(not(feature = "state-redis"))]
     #[test]

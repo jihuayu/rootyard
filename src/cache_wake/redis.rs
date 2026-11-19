@@ -503,7 +503,7 @@ impl RedisWake {
     /// plaintext compatibility path. `ROOTYARD_WAKE_CHANNEL` retains its
     /// existing default and validation.
     pub fn from_env() -> Result<Self> {
-        let channel = std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
+        let channel = super::generic_wake_channel_from_env()?;
         Self::from_env_with_channel(channel)
     }
 

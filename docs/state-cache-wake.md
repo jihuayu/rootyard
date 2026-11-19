@@ -189,26 +189,34 @@ existing full `audit-log` scan.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ROOTYARD_A4_WORKER_MODE` | `embedded` | `embedded` keeps the in-process target-audit consumer; `external` removes it for a separately supervised A4 worker |
-| `ROOTYARD_A4_WAKE_TRANSPORT` | absent (`poll`) | `poll`/`memory` (no remote), or `redis` (requires `state-redis`) |
-| `ROOTYARD_A4_WAKE_CHANNEL` | `rootyard:a4:pg_refstore_core_commit_audit:v1` | Validated 1–128 ASCII alphanumeric/colon/underscore/hyphen A4 namespace; never a secret or payload |
-| `ROOTYARD_WORKER_SCOPE` | `generic` | On `rootyard worker`/`worker-once`: `generic` or the explicit `a4-target-audit` scope |
+| `ROOTYARD_A4_WORKER_MODE` | `embedded` when missing | `embedded` keeps the in-process target-audit consumer; `external` removes it; present empty/unknown/non-Unicode fails |
+| `ROOTYARD_A4_WAKE_TRANSPORT` | absent (`poll`) when missing | `poll`/`memory` (no remote), or `redis` (requires `state-redis`); present empty/unknown/non-Unicode fails |
+| `ROOTYARD_A4_WAKE_CHANNEL` | `rootyard:a4:pg_refstore_core_commit_audit:v1` when missing | A4 Redis namespace; must differ from the configured generic wake channel (default `rootyard:outbox:v1`); when A4 Redis is selected, present empty/invalid/non-Unicode or alias fails |
+| `ROOTYARD_WORKER_SCOPE` | `generic` when missing | On `rootyard worker`/`worker-once`: `generic` or `a4-target-audit`; present empty/unknown/non-Unicode fails |
 
 Producer (`serve-blob`):
 
 - `ROOTYARD_A4_WORKER_MODE=external` is the explicit external-placement mode. It
   launches no in-process A4 consumer at all, so the separately supervised
-  `ROOTYARD_WORKER_SCOPE=a4-target-audit` process is the only claimant. The
-  default `embedded` mode and every value other than the exact `external` token
-  keep the embedded consumer; unknown modes fail startup. External placement is
-  valid with no A4 transport (the external worker then uses its mandatory PG
-  ticker), with `poll`/`memory`, or with the feature-gated `redis` publisher.
+  `ROOTYARD_WORKER_SCOPE=a4-target-audit` process is the only claimant. Only a
+  truly absent variable selects the default `embedded`; the exact `embedded`
+  value is also accepted, while present empty, unknown and non-Unicode values
+  fail startup. External placement is valid with no A4 transport (the external
+  worker then uses its mandatory PG ticker), with `poll`/`memory`, or with the
+  feature-gated `redis` publisher.
 - `ROOTYARD_A4_WAKE_TRANSPORT=redis` selects the existing feature-gated
   `RedisWake` using `ROOTYARD_REDIS_URL` or the loopback
   `ROOTYARD_REDIS_ADDRESS`. Without `state-redis`, selecting `redis` fails
-  startup closed; no Redis crate is compiled into the default build. Startup
-  validates the URL/channel policy but does not require Redis reachability, and
-  an external placement never waits for Redis before serving.
+  startup closed; no Redis crate is compiled into the default build. Only a
+  truly absent transport selects polling; present empty, unknown and non-Unicode
+  values fail. The A4 channel default is used only when its variable is absent;
+  the resolved A4 channel must differ from the actual configured generic
+  `ROOTYARD_WAKE_CHANNEL` (including the generic default) or startup fails. This
+  prevents an explicit/default A4 namespace from aliasing the generic outbox
+  namespace. Startup validates the URL/channel policy but does not require Redis
+  reachability, and an external placement never waits for Redis before serving.
+  Malformed configuration is a startup refusal; a configured transport outage
+  remains advisory and leaves the mandatory PG polling path active.
 - The gateway still calls `Signals::committed()` only after a fresh authorized A4
   durable transaction, including its audit outbox projection, has committed. The
   call stores a local and a remote `Notify` permit and does not await Redis. In
@@ -225,8 +233,11 @@ Subscriber (`rootyard worker` in A4 scope):
 
 - `ROOTYARD_WORKER_SCOPE=a4-target-audit` selects a target-audit-only
   `Settings`: consumer `audit-log`, `events::TARGET_AUDIT_KIND`,
-  `projection_jobs=false`. `worker-once` uses the same scoped claim helper.
-  It never executes the generic `ref-index` effect or `ref_cas_projection_jobs`.
+  `projection_jobs=false`. Only a truly absent scope selects the existing
+  generic default; present empty, unknown and non-Unicode values fail startup
+  rather than starting generic projection work. `worker-once` uses the same
+  scoped claim helper and never executes the generic `ref-index` effect or
+  `ref_cas_projection_jobs`.
 - The fixed ticker remains active independently of Redis. A subscription
   acknowledgment triggers a catch-up scan; reconnect also triggers one. Wrong
   channel/payload frames disconnect. Duplicate or lost hints may only cause an

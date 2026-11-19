@@ -43,6 +43,12 @@ embedded wake path with the explicit A4 topology:
 | `tests/backup_recovery_cache.py` | Reused `OwnedRestoreRedis` start/stop/identity/command helpers and exact `build_binding` source/receipt checks. |
 | `src/standalone.rs`, `src/dispatch.rs`, `src/main.rs` | Production entry points: `ROOTYARD_A4_WORKER_MODE=external`, `Settings::standalone_from_env`, `Settings::a4_target_audit_from_env`, `ROOTYARD_WORKER_SCOPE=a4-target-audit`, and the shared publisher stop token. |
 
+Product configuration is strict: only a truly missing A4 mode/scope/transport/
+channel selects its default, present empty/invalid/non-Unicode values fail
+startup, and the A4 channel must not alias the configured generic wake channel or
+its default. A transport outage after valid startup remains advisory and the PG
+ticker continues.
+
 The binary must carry the existing attested `state-redis` build receipt whose
 `features.enabled` is exactly `["state-redis"]` and whose source commit/tree
 matches the clean current checkout. It is the same receipt contract used by the

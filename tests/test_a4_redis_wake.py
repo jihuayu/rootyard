@@ -47,7 +47,34 @@ class A4RedisWakeShapeTests(unittest.TestCase):
         self.assertIn('format!("rootyard:a4:{}:v1"', channel)
         self.assertIn("crate::events::TARGET_AUDIT_KIND", channel)
         resolve = body(dispatch, "pub fn a4_wake_channel_from_env()", "pub fn worker_scope_from_env")
-        self.assertIn("validate_wake_channel", resolve)
+        self.assertIn("env_text(A4_WAKE_CHANNEL_ENV)", resolve)
+        self.assertIn("generic_wake_channel_from_env", resolve)
+        self.assertIn("a4_wake_channel_for", resolve)
+        helper = body(dispatch, "fn a4_wake_channel_for", "pub fn worker_scope_from_env")
+        self.assertIn("validate_wake_channel", helper)
+        self.assertIn("channel.as_str() != generic", helper)
+
+    def test_a4_config_reads_are_strict_and_share_the_generic_namespace(self):
+        dispatch = source("src/dispatch.rs")
+        self.assertIn("fn env_text_from(", dispatch)
+        self.assertIn("Ok(value) if value.is_empty() => bail!", dispatch)
+        self.assertIn("Err(std::env::VarError::NotUnicode(_)) => bail!", dispatch)
+        for start in (
+            "pub fn worker_scope_from_env()",
+            "pub fn a4_worker_mode_from_env()",
+            "fn a4_transport_from_env()",
+        ):
+            block = body(dispatch, start, "\n}\n")
+            self.assertIn("env_text(", block)
+            self.assertNotIn(".ok()", block)
+        cache = source("src/cache_wake.rs")
+        self.assertIn('pub const GENERIC_WAKE_CHANNEL_DEFAULT: &str = "rootyard:outbox:v1"', cache)
+        self.assertIn("fn generic_wake_channel_from_result(", cache)
+        self.assertIn("generic_wake_channel_from_result(Err(std::env::VarError::NotPresent))", cache)
+        self.assertIn("generic_wake_channel_from_result(Err(std::env::VarError::NotUnicode(", cache)
+        redis = source("src/cache_wake/redis.rs")
+        self.assertIn("super::generic_wake_channel_from_env()?", redis)
+        self.assertIn("crate::cache_wake::generic_wake_channel_from_env()?", dispatch)
 
     def test_serve_blob_reads_only_the_a4_opt_in_and_owns_publisher_cancellation(self):
         standalone = source("src/standalone.rs")
@@ -70,11 +97,13 @@ class A4RedisWakeShapeTests(unittest.TestCase):
     def test_external_worker_mode_is_explicit_and_default_stays_embedded(self):
         dispatch = source("src/dispatch.rs")
         self.assertIn('pub const A4_WORKER_MODE_ENV: &str = "ROOTYARD_A4_WORKER_MODE"', dispatch)
-        self.assertIn('"" | "embedded" => Ok(A4WorkerMode::Embedded)', dispatch)
-        self.assertIn('"external" => Ok(A4WorkerMode::External)', dispatch)
+        self.assertIn('None | Some("embedded") => Ok(A4WorkerMode::Embedded)', dispatch)
+        self.assertIn('Some("external") => Ok(A4WorkerMode::External)', dispatch)
+        self.assertIn('fn strict_env_presence_rejects_empty_and_non_unicode_without_echoing', dispatch)
+        self.assertIn('fn a4_channel_cannot_alias_the_generic_channel_or_default', dispatch)
         self.assertIn("pub const fn runs_embedded_worker", dispatch)
         self.assertIn("matches!(self, Self::Embedded)", dispatch)
-        self.assertIn("fn a4_worker_mode_defaults_embedded_and_external_is_explicit", dispatch)
+        self.assertIn("fn a4_worker_mode_defaults_only_when_missing_and_rejects_empty_or_unknown", dispatch)
         standalone = source("src/standalone.rs")
         self.assertIn("a4_worker_mode_from_env()", standalone)
         self.assertIn("if mode.runs_embedded_worker()", standalone)
