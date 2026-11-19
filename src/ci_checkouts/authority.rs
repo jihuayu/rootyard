@@ -116,6 +116,11 @@ const GRANTS: &str = "WITH grants AS ( \
 pub(crate) async fn authenticate(
     state:&AppState,headers:&HeaderMap,owner:&str,name:&str,oid:&str,
 ) -> Result<(db::Identity,db::Repository,Plan),Error>{
+    // `pg_refstore` jobs are authorized by the S4 authority: a live read of the
+    // closure grant, the pin, the retained root and current RBAC.
+    if crate::ci_pins::s4_pin::refstore_repository(state,owner,name).await?.is_some(){
+        return crate::ci_pins::s4_authority::authenticate(state,headers,owner,name,oid).await;
+    }
     let (user,token)=auth::credentials_for(headers,"ryj_")?;
     if user.as_ref().is_some_and(|u|u!=owner){return Err(Error::unauthorized());}
     let digest=db::digest(&token);
@@ -161,6 +166,13 @@ pub(crate) async fn still_authorized(
     state:&AppState,job_id:Uuid,credential_digest:&[u8],repository_id:Uuid,
     storage_generation:i64,
 ) -> Result<bool,Error>{
+    let backend=state.pool.get().await.map_err(Error::internal)?
+        .query_opt("SELECT storage_backend FROM repositories WHERE id=$1",&[&repository_id])
+        .await.map_err(Error::internal)?;
+    if backend.is_some_and(|row|row.get::<_,String>(0)==crate::ref_store::core::serving_scope::PG_REFSTORE_BACKEND){
+        return crate::ci_pins::s4_authority::still_authorized(
+            state,job_id,credential_digest,repository_id,storage_generation).await;
+    }
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
     let sql=format!("{GRANTS} SELECT r.owner_id,t.user_id FROM grants g \
