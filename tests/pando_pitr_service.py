@@ -44,6 +44,19 @@ MANDATORY_CASES = (
     "post_isolate_deleted_artifact_refused",
     "pitr_epoch_rollback_fenced",
 )
+#: Closed stages an escaping live-suite assertion may report.  The optional
+#: callback is diagnostic-only; callers must not parse or project arbitrary text.
+LIVE_ASSERTION_STAGES = (
+    "setup",
+    "startup_fail_closed",
+    "authority",
+    "repo_cutover",
+    "retention_prune",
+    "dump_restore_clone",
+    "isolate",
+    "epoch_rollback",
+    "cleanup",
+)
 OWNED_HARNESS_FILES = (
     "tests/pando_pitr_service.py",
     "tests/test_pando_pitr_service.py",
@@ -525,7 +538,10 @@ def seed_synthetic_manifest(
     return manifest_id, remote_keys
 
 
-def run_suite(binary: str) -> dict:
+def run_suite(
+    binary: str,
+    on_assertion_stage: Callable[[str], None] | None = None,
+) -> dict:
     stage = "setup"
 
     def enter_stage(next_stage: str) -> str:
@@ -537,6 +553,12 @@ def run_suite(binary: str) -> dict:
     try:
         return _run_live_suite(binary, enter_stage)
     except AssertionError:
+        if callable(on_assertion_stage) and stage in LIVE_ASSERTION_STAGES:
+            try:
+                on_assertion_stage(stage)
+            except Exception:
+                # A diagnostic callback failure must preserve the original assertion.
+                pass
         try:
             print(f"pando PITR live assertion stage ({stage})", file=sys.stderr, flush=True)
         except Exception:

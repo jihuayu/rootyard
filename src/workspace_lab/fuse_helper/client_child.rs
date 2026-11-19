@@ -3,18 +3,44 @@
 //! Taking a `Child` out of the shared slot is not an exit. A taken handle means
 //! the one reaper owns the process and must keep polling it; `wait_exit` may
 //! only succeed from an `ExitStatus` observed by `Child::try_wait`/`wait`.
-use std::process::{Child, ExitStatus};
+use std::{
+    os::unix::process::ExitStatusExt,
+    process::{Child, ExitStatus},
+};
+
+/// Sealed parent-side view of the exact child status. Only the two Unix
+/// termination shapes are retained; no message, path or arbitrary payload is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExitKind {
+    Code(i32),
+    Signal(i32),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ExitView {
     pub success: bool,
+    /// Original `ExitStatus` Display retained only to reconstruct the public
+    /// shutdown error; private evidence uses the typed outcome instead.
     pub description: String,
+    pub kind: ExitKind,
 }
 
 impl From<ExitStatus> for ExitView {
     fn from(status: ExitStatus) -> Self {
-        Self { success: status.success(), description: status.to_string() }
+        let kind = match status.signal() {
+            Some(signal) => ExitKind::Signal(signal),
+            None => ExitKind::Code(status.code().unwrap_or(-1)),
+        };
+        Self { success: status.success(), description: status.to_string(), kind }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ReapFailure {
+    /// The published shutdown deadline expired after the child was killed.
+    Deadline,
+    /// `Child::try_wait` itself failed with the original private message.
+    WaitError(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,14 +50,14 @@ pub(super) enum ExitObservation {
     Reaping,
     /// The handle vanished without an observed exit. This is never success.
     Missing,
-    Exited(Result<ExitView, String>),
+    Exited(Result<ExitView, ReapFailure>),
 }
 
 #[derive(Default)]
 pub(super) struct ChildSlot {
     child: Option<Child>,
     reaping: bool,
-    status: Option<Result<ExitView, String>>,
+    status: Option<Result<ExitView, ReapFailure>>,
 }
 
 impl ChildSlot {
@@ -51,11 +77,18 @@ impl ChildSlot {
     }
 
     /// Record a status obtained from the reaper's own `Child::try_wait`.
-    pub(super) fn record_exit(&mut self, observed: Result<ExitView, String>) {
+    pub(super) fn record_exit(&mut self, observed: Result<ExitView, ReapFailure>) {
         if self.status.is_none() {
             self.status = Some(observed);
         }
         self.reaping = false;
+    }
+
+    /// True only after `Child::try_wait`/`wait` actually reaped the child.
+    /// A recorded wait error, a taken handle still being reaped, or a missing
+    /// handle is never quiescence.
+    pub(super) fn reaped(&self) -> bool {
+        matches!(&self.status, Some(Ok(_)))
     }
 
     /// One short observation. Never sleeps and never treats a missing handle as
@@ -69,7 +102,7 @@ impl ChildSlot {
             match child.try_wait() {
                 Ok(Some(status)) => observed = Some(Ok(ExitView::from(status))),
                 Ok(None) => {}
-                Err(error) => observed = Some(Err(error.to_string())),
+                Err(error) => observed = Some(Err(ReapFailure::WaitError(error.to_string()))),
             }
         }
         if let Some(result) = observed {
@@ -109,16 +142,53 @@ mod tests {
     #[test]
     fn a_recorded_exit_blocks_a_second_reap_and_stays_observable() {
         let mut slot = ChildSlot::default();
-        let success = ExitView { success: true, description: "exit status: 0".into() };
+        let success = ExitView { success: true, description: "exit status: 0".into(), kind: ExitKind::Code(0) };
         slot.record_exit(Ok(success.clone()));
         assert!(slot.take_for_reap().is_none(), "an observed exit must not be reaped twice");
         assert_eq!(slot.observe(), ExitObservation::Exited(Ok(success)));
     }
 
     #[test]
+    fn only_an_observed_exit_is_reaped() {
+        let mut waiting = ChildSlot::default();
+        assert!(!waiting.reaped(), "a missing handle is not reap proof");
+        waiting.record_exit(Err(ReapFailure::WaitError("wait failed".into())));
+        assert!(!waiting.reaped(), "a wait error is not reap proof");
+
+        let mut reaped = ChildSlot::default();
+        reaped.record_exit(Ok(ExitView {
+            success: false,
+            description: "exit status: 9".into(),
+            kind: ExitKind::Code(9),
+        }));
+        assert!(reaped.reaped(), "an observed nonzero exit was still reaped");
+    }
+
+    #[test]
+    fn reap_deadline_and_wait_error_remain_distinct() {
+        let mut deadline = ChildSlot::default();
+        deadline.record_exit(Err(ReapFailure::Deadline));
+        assert_eq!(deadline.observe(), ExitObservation::Exited(Err(ReapFailure::Deadline)));
+        assert!(!deadline.reaped(), "a reap deadline is not an exit");
+
+        let mut wait_error = ChildSlot::default();
+        wait_error.record_exit(Err(ReapFailure::WaitError("wait failed".into())));
+        assert_eq!(wait_error.observe(), ExitObservation::Exited(Err(ReapFailure::WaitError("wait failed".into()))));
+        assert!(!wait_error.reaped(), "a wait error is not an exit");
+    }
+
+    #[test]
+    fn repeated_wait_error_observation_clones_the_private_message() {
+        let mut slot = ChildSlot::default();
+        slot.record_exit(Err(ReapFailure::WaitError("wait failed".into())));
+        assert_eq!(slot.observe(), ExitObservation::Exited(Err(ReapFailure::WaitError("wait failed".into()))));
+        assert_eq!(slot.observe(), ExitObservation::Exited(Err(ReapFailure::WaitError("wait failed".into()))));
+    }
+
+    #[test]
     fn a_recorded_nonzero_exit_is_preserved_for_the_waiter() {
         let mut slot = ChildSlot::default();
-        let failure = ExitView { success: false, description: "exit status: 7".into() };
+        let failure = ExitView { success: false, description: "exit status: 7".into(), kind: ExitKind::Code(7) };
         slot.record_exit(Ok(failure.clone()));
         assert_eq!(slot.observe(), ExitObservation::Exited(Ok(failure)));
     }

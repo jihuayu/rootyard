@@ -499,7 +499,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         let mut buf = [0u8; 4096];
         while matches!(stderr.read(&mut buf).await, Ok(n) if n > 0) {}
     });
-    let mut process = Process { child, input: Some(input), stderr, pid };
+    let mut process = Process::new(child, Some(input), stderr, pid);
     let mut stdout = BufReader::with_capacity(16 * 1024, stdout);
     let pre_stream_recheck = || async {
         if let Some(guard) = &ref_guard {

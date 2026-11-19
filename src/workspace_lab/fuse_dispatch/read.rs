@@ -5,8 +5,10 @@
 //! read whose reply is still in its slot; a read already doing I/O re-checks
 //! the shutdown flag and replies `EIO` instead of a late success.
 use super::super::inner_ops::{ReadPlan, read_at};
+use super::actor::Actor;
 use super::read_pool::ReadJob;
 use super::*;
+use fuser::ReplyData;
 
 /// A lazy read whose reply and budget charge travel to the read pool together.
 pub(super) struct DeferredRead {
