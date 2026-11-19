@@ -30,6 +30,9 @@ use child_fixture::OwnedChild;
 #[path = "publication_active_fixture.rs"]
 mod fixture;
 
+#[path = "publication_read_lease_guard_tests.rs"]
+mod guard_tests;
+
 fn publish(store: &CloneKitPublicationStore, repository_id: Uuid, kit_generation: u64) {
     publish_clonekit_versioned(
         store,
