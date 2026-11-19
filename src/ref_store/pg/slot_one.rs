@@ -45,7 +45,9 @@
 //! through the read-only public-attempt resolver/terminal path.
 use super::{
     LockedSequence, PgRefStore, advance_sequence, bound, ensure_repository, insert_operation,
-    public_attempt::{PublicAttemptRequest, RawWrapper, Redacted, ledger, parse_digest, parse_state, validate_wrapper},
+    public_attempt::{
+        PublicAttempt, PublicAttemptRequest, RawWrapper, Redacted, ledger, parse_digest, parse_state, validate_wrapper,
+    },
     public_terminal::PublicAttemptRetirement,
 };
 use crate::ref_store::{
@@ -687,17 +689,76 @@ where
     })
 }
 
-fn validate_slot_one_replay_evidence(
-    retired: &AttemptFacts,
-    current: &AttemptFacts,
-    request: &PublicAttemptRequest,
-    retirement: &PublicAttemptRetirement,
-) -> Result<(), PackCommitError> {
-    if current.slot != 1 || current.state != OperationState::Pending || current.event_id.is_some() {
-        return Err(ledger("slot one replay current attempt is not pending slot one"));
+struct SlotOneProofAttempt {
+    slot: i16,
+    private_id: Uuid,
+    plan_digest: RequestDigest,
+    proof_digest: RequestDigest,
+    lane: IssuerLane,
+    sequence: i64,
+    base_revision: i64,
+    state: OperationState,
+    event_id: Option<Uuid>,
+    event_revision: Option<i64>,
+}
+
+impl SlotOneProofAttempt {
+    fn from_facts(facts: &AttemptFacts) -> Self {
+        Self {
+            slot: facts.slot,
+            private_id: facts.private_id,
+            plan_digest: facts.plan_digest,
+            proof_digest: facts.proof_digest,
+            lane: facts.lane.clone(),
+            sequence: facts.sequence,
+            base_revision: facts.base_revision,
+            state: facts.state,
+            event_id: facts.event_id,
+            event_revision: facts.event_revision,
+        }
+    }
+
+    fn from_public(attempt: &PublicAttempt) -> Self {
+        Self {
+            slot: attempt.slot,
+            private_id: attempt.private_id,
+            plan_digest: attempt.plan_digest,
+            proof_digest: attempt.proof_digest,
+            lane: attempt.lane.clone(),
+            sequence: attempt.sequence,
+            base_revision: attempt.base_revision,
+            state: attempt.state,
+            event_id: attempt.event_id,
+            event_revision: attempt.event_revision,
+        }
+    }
+}
+
+/// Shared slot-one invariant check used by both the pending rotation replay
+/// validator and writer-replay proof recomputation.
+///
+/// It mirrors the migration-152 slot-one triggers: the retired attempt must be
+/// a slot-zero rejection with a non-nil event; the current slot-one identity
+/// must be fresh, on the same lane, at least one sequence step ahead with
+/// checked overflow, and based on the retired event revision with a revision
+/// that can advance without overflow. Pending attempts carry no event, terminal
+/// attempts carry one, and cancelled attempts carry none.
+fn validate_slot_one_proof_invariants(
+    public_id: Uuid,
+    retired: &SlotOneProofAttempt,
+    current: &SlotOneProofAttempt,
+) -> Result<(Uuid, i64), PackCommitError> {
+    if retired.slot != 0 || current.slot != 1 {
+        return Err(ledger("slot one proof evidence is not a slot-zero/slot-one pair"));
+    }
+    if retired.private_id.is_nil()
+        || current.private_id.is_nil()
+        || retired.private_id == public_id
+        || current.private_id == public_id
+    {
+        return Err(ledger("slot one identity aliases the public operation"));
     }
     if current.private_id == retired.private_id
-        || current.private_id == request.public_id
         || current.plan_digest == retired.plan_digest
         || current.proof_digest == retired.proof_digest
     {
@@ -707,16 +768,64 @@ fn validate_slot_one_replay_evidence(
         return Err(ledger("slot one replay switched issuer lanes"));
     }
     checked_prospective_sequence(retired.sequence, current.sequence)?;
-    if current.base_revision != retirement.event_revision {
+
+    if retired.state != OperationState::Rejected {
+        return Err(ledger("slot one retired attempt is not a rejection"));
+    }
+    let event_id = retired.event_id.ok_or_else(|| ledger("slot one retired event is missing"))?;
+    if event_id.is_nil() {
+        return Err(ledger("slot one retired event id is nil"));
+    }
+    let event_revision = retired.event_revision.ok_or_else(|| ledger("slot one retired event revision is missing"))?;
+    if event_revision <= 0 {
+        return Err(ledger("slot one retired event revision is not positive"));
+    }
+    if current.base_revision != event_revision {
         return Err(ledger("slot one replay base revision differs from the retired event"));
     }
     checked_prospective_revision(current.base_revision)?;
+
+    match current.state {
+        OperationState::Pending => {
+            if current.event_id.is_some() {
+                return Err(ledger("slot one pending attempt carries an event"));
+            }
+        }
+        OperationState::Committed | OperationState::Rejected => {
+            if current.event_id.is_none() {
+                return Err(ledger("slot one terminal attempt has no event"));
+            }
+        }
+        OperationState::Cancelled => {
+            if current.event_id.is_some() {
+                return Err(ledger("slot one cancelled attempt carries an event"));
+            }
+        }
+    }
+    Ok((event_id, event_revision))
+}
+
+fn validate_slot_one_replay_evidence(
+    retired: &AttemptFacts,
+    current: &AttemptFacts,
+    request: &PublicAttemptRequest,
+    retirement: &PublicAttemptRetirement,
+) -> Result<(), PackCommitError> {
+    if current.slot != 1 || current.state != OperationState::Pending || current.event_id.is_some() {
+        return Err(ledger("slot one replay current attempt is not pending slot one"));
+    }
+    if retired.event_id != Some(retirement.event_id) || retired.event_revision != Some(retirement.event_revision) {
+        return Err(ledger("slot one replay retirement evidence differs from the retired attempt"));
+    }
+    let retired = SlotOneProofAttempt::from_facts(retired);
+    let current = SlotOneProofAttempt::from_facts(current);
+    let (event_id, event_revision) = validate_slot_one_proof_invariants(request.public_id, &retired, &current)?;
     let expected_proof = slot_one_proof_digest(&SlotOneProofFacts {
         public: request,
         lane: &retired.lane,
         retired_private_id: retired.private_id,
-        retired_event_id: retirement.event_id,
-        retired_event_revision: retirement.event_revision,
+        retired_event_id: event_id,
+        retired_event_revision: event_revision,
         retired_plan_digest: retired.plan_digest,
         private_id: current.private_id,
         sequence: current.sequence,
@@ -1195,15 +1304,13 @@ struct SlotOneProofFacts<'a> {
 /// evidence. Performs no SQL and accepts no stored proof bytes as input.
 pub(crate) fn recompute_slot_one_proof(
     public: &PublicAttemptRequest,
-    retired: &super::public_attempt::PublicAttempt,
-    current: &super::public_attempt::PublicAttempt,
+    retired: &PublicAttempt,
+    current: &PublicAttempt,
 ) -> Result<RequestDigest, PackCommitError> {
-    if retired.slot != 0 || current.slot != 1 {
-        return Err(ledger("slot one proof requested for a non-slot-one pair"));
-    }
-    let retired_event_id = retired.event_id.ok_or_else(|| ledger("slot one retired event is missing"))?;
-    let retired_event_revision =
-        retired.event_revision.ok_or_else(|| ledger("slot one retired event revision is missing"))?;
+    let retired = SlotOneProofAttempt::from_public(retired);
+    let current = SlotOneProofAttempt::from_public(current);
+    let (retired_event_id, retired_event_revision) =
+        validate_slot_one_proof_invariants(public.public_id, &retired, &current)?;
     Ok(slot_one_proof_digest(&SlotOneProofFacts {
         public,
         lane: &retired.lane,

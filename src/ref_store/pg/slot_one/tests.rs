@@ -1,14 +1,14 @@
 use super::{
     AttemptFacts, SLOT_ONE_PROOF_DOMAIN, SlotOneProofFacts, SlotOneRotationRequest, StoredAttempt,
-    checked_prospective_revision, checked_prospective_sequence, slot_one_proof_digest, slot_one_proof_fields,
-    split_attempts, validate_attempt, validate_replay, validate_request, validate_retired, validate_retirement_at_gate,
-    validate_slot_one_replay_evidence,
+    checked_prospective_revision, checked_prospective_sequence, recompute_slot_one_proof, slot_one_proof_digest,
+    slot_one_proof_fields, split_attempts, validate_attempt, validate_replay, validate_request, validate_retired,
+    validate_retirement_at_gate, validate_slot_one_replay_evidence,
 };
 use crate::ref_store::{
     CommitMode, GitObjectFormat, IssuerLane, OperationState, RequestDigest,
     core::pack_commit::{PackCommitError, PackCommitRejectCode},
     pg::{
-        public_attempt::{PublicAttemptRequest, RawWrapper},
+        public_attempt::{PublicAttempt, PublicAttemptRequest, RawWrapper},
         public_terminal::PublicAttemptRetirement,
     },
 };
@@ -157,6 +157,21 @@ fn pending_facts(retired: &AttemptFacts) -> AttemptFacts {
     let mut current = validate_attempt(stored_attempt(1), &request).expect("valid pending facts");
     current.proof_digest = slot_one_proof_digest(&proof_facts(&request, retired, &current));
     current
+}
+
+fn public_attempt(facts: &AttemptFacts) -> PublicAttempt {
+    PublicAttempt {
+        slot: facts.slot,
+        private_id: facts.private_id,
+        plan_digest: facts.plan_digest,
+        proof_digest: facts.proof_digest,
+        base_revision: facts.base_revision,
+        lane: facts.lane.clone(),
+        sequence: facts.sequence,
+        state: facts.state,
+        event_id: facts.event_id,
+        event_revision: facts.event_revision,
+    }
 }
 
 fn wrapper_json() -> serde_json::Value {
@@ -328,6 +343,56 @@ fn replay_requires_pending_slot_one_and_a_fresh_identity_plan_and_proof() {
     expect_ledger(
         validate_replay(&wrapper, &request, &retirement(), &retired, &terminal),
         "slot one replay current attempt is not pending slot one",
+    );
+}
+
+#[test]
+fn recomputed_slot_one_proof_enforces_lane_sequence_base_and_terminal_invariants() {
+    let retired = retired_facts();
+    let current = pending_facts(&retired);
+    let request = public_request();
+    let retired_public = public_attempt(&retired);
+    let current_public = public_attempt(&current);
+
+    let proof = recompute_slot_one_proof(&request, &retired_public, &current_public).expect("exact proof");
+    assert_eq!(proof, current.proof_digest);
+
+    // A legitimate terminal slot-one replay still has to recompute the exact
+    // rotation proof; its state/event are outside the proof fields.
+    let mut terminal = current_public.clone();
+    terminal.state = OperationState::Rejected;
+    terminal.event_id = Some(event_one());
+    terminal.event_revision = Some(4);
+    assert_eq!(recompute_slot_one_proof(&request, &retired_public, &terminal).expect("terminal proof"), proof);
+
+    let mut wrong_lane = current_public.clone();
+    wrong_lane.lane = IssuerLane::new("another-lane").expect("valid lane");
+    expect_ledger(
+        recompute_slot_one_proof(&request, &retired_public, &wrong_lane),
+        "slot one replay switched issuer lanes",
+    );
+
+    let mut stale_sequence = current_public.clone();
+    stale_sequence.sequence = retired_public.sequence;
+    expect_ledger(
+        recompute_slot_one_proof(&request, &retired_public, &stale_sequence),
+        "slot one sequence does not advance the retired attempt",
+    );
+
+    let mut overflowed_sequence_retired = retired_public.clone();
+    overflowed_sequence_retired.sequence = i64::MAX;
+    let mut overflowed_sequence_current = current_public.clone();
+    overflowed_sequence_current.sequence = i64::MAX;
+    expect_ledger(
+        recompute_slot_one_proof(&request, &overflowed_sequence_retired, &overflowed_sequence_current),
+        "slot one retired sequence cannot advance",
+    );
+
+    let mut wrong_base = current_public.clone();
+    wrong_base.base_revision = 4;
+    expect_ledger(
+        recompute_slot_one_proof(&request, &retired_public, &wrong_base),
+        "slot one replay base revision differs from the retired event",
     );
 }
 

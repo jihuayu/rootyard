@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISH = ROOT / 'src/blob_git_gateway/publish.rs'
 OPERATION = ROOT / 'src/blob_git_gateway/operation.rs'
+SLOT_ONE = ROOT / 'src/ref_store/pg/slot_one.rs'
 PG = ROOT / 'src/ref_store/pg.rs'
 
 
@@ -26,6 +27,7 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
     def setUpClass(cls):
         cls.publish = PUBLISH.read_text()
         cls.operation = OPERATION.read_text()
+        cls.slot_one = SLOT_ONE.read_text()
         cls.pg = PG.read_text()
 
     def test_timeout_result_is_matched_before_into_parts(self):
@@ -143,6 +145,29 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
         self.assertIn('recompute_slot_one_proof(', helper)
         self.assertNotIn('get_legacy_locked', helper)
         self.assertNotIn('lookup_in_tx(', helper)
+
+        recompute = slice_between(
+            self.slot_one,
+            'pub(crate) fn recompute_slot_one_proof(',
+            'fn slot_one_proof_digest(',
+        )
+        self.assertIn('validate_slot_one_proof_invariants(', recompute)
+        common = slice_between(
+            self.slot_one,
+            'fn validate_slot_one_proof_invariants(',
+            'fn validate_slot_one_replay_evidence(',
+        )
+        self.assertIn('checked_prospective_sequence(', common)
+        self.assertIn('checked_prospective_revision(', common)
+        self.assertIn('current.base_revision != event_revision', common)
+        self.assertIn('current.lane != retired.lane', common)
+        self.assertIn('current.private_id == retired.private_id', common)
+        evidence = slice_between(
+            self.slot_one,
+            'fn validate_slot_one_replay_evidence(',
+            '/// Validate an already-pending stored rotation',
+        )
+        self.assertIn('validate_slot_one_proof_invariants(', evidence)
 
     def test_legacy_guard_remains_closed_for_external_lookup(self):
         legacy = slice_between(
