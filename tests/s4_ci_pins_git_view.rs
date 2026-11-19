@@ -21,13 +21,15 @@ async fn clone_bundle(cluster: &Cluster, bytes: &[u8], format: &str) -> Result<P
     let work = root.join("work");
     std::fs::create_dir_all(&work)?;
     let path = bundle.to_str().ok_or_else(|| anyhow::anyhow!("bundle path"))?;
-    let mut args = vec!["clone", "--no-local", "--no-hardlinks", "--no-tags"];
+    let proj = work.join("proj");
     if format == "sha256" {
-        args.push("--object-format=sha256");
+        cluster.git.ok(&work, &["init", "--quiet", "--object-format=sha256", "proj"]).await?;
+        cluster.git.ok(&proj, &["fetch", "--quiet", path, "refs/heads/projected:refs/heads/projected"]).await?;
+        cluster.git.ok(&proj, &["checkout", "--quiet", "projected"]).await?;
+        return Ok(proj);
     }
-    args.extend([path, "proj"]);
-    cluster.git.ok(&work, &args).await?;
-    Ok(work.join("proj"))
+    cluster.git.ok(&work, &["clone", "--no-local", "--no-hardlinks", "--no-tags", path, "proj"]).await?;
+    Ok(proj)
 }
 
 async fn proposal_bundle(cluster: &Cluster, work: &Path) -> Result<Vec<u8>> {
