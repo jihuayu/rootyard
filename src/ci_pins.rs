@@ -60,6 +60,8 @@ pub(crate) mod s4_release;
 pub(crate) mod s4_authority;
 #[path = "ci_pins/s4_git_runner.rs"]
 pub(crate) mod s4_git_runner;
+#[path = "ci_pins/s4_git_reaper.rs"]
+pub(crate) mod s4_git_reaper;
 #[path = "ci_pins/s4_checkout.rs"]
 pub(crate) mod s4_checkout;
 #[path = "ci_pins/s4_transport.rs"]

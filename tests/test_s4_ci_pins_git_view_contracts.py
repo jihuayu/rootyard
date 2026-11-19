@@ -27,6 +27,7 @@ TOUCHED = [
     CI_PINS / "s4_release.rs",
     CI_PINS / "s4_authority.rs",
     CI_PINS / "s4_git_runner.rs",
+    CI_PINS / "s4_git_reaper.rs",
     CI_PINS / "s4_checkout.rs",
     CI_PINS / "s4_transport.rs",
     CI_PINS / "s4_tests.rs",
@@ -240,6 +241,8 @@ class SourceContracts(unittest.TestCase):
 
     def test_scratch_holds_outlive_child_process_groups(self) -> None:
         runner = text(CI_PINS / "s4_git_runner.rs")
+        reaper = text(CI_PINS / "s4_git_reaper.rs")
+        reaper_tests = reaper.split("#[cfg(test)]", 1)[1]
         tokio_block = runner.split("use tokio::{", 1)[1].split("};", 1)[0]
         self.assertIn("process::{", tokio_block)
         tokio_process = tokio_block.split("process::{", 1)[1].split("}", 1)[0]
@@ -269,14 +272,20 @@ class SourceContracts(unittest.TestCase):
             self.assertIn("spawn_reaper_with", body)
             self.assertNotIn("kill_group_child", body)
             self.assertNotIn("forget(child)", body)
-        self.assertIn("std::mem::forget(holds)", runner)
-        self.assertIn("reap_fallback_bounded", runner)
-        self.assertIn("handoff_unresolved_child", runner)
-        self.assertNotIn(".wait()).await.is_ok()", runner)
-        self.assertNotIn("libc::kill", text(CI_PINS / "s4_tests.rs"))
-        self.assertNotIn("libc::kill", text(SRC / "namespace_service" / "s4_git_proc_tests.rs"))
-        self.assertNotIn("waitpid", text(CI_PINS / "s4_tests.rs"))
-        self.assertNotIn("waitpid", text(SRC / "namespace_service" / "s4_git_proc_tests.rs"))
+        self.assertNotIn("Ok(true) | Err(_)", reaper)
+        self.assertNotIn("forget(child)", reaper)
+        self.assertNotIn(".wait()).await.is_ok()", reaper)
+        self.assertIn("retain_scratch", reaper)
+        self.assertIn("reap_fallback_bounded", reaper)
+        self.assertIn("handoff_unresolved_child", reaper)
+        self.assertIn("state.retained", reaper)
+        for test_body in (
+            text(CI_PINS / "s4_tests.rs"),
+            text(SRC / "namespace_service" / "s4_git_proc_tests.rs"),
+            reaper_tests,
+        ):
+            self.assertNotIn("libc::kill", test_body)
+            self.assertNotIn("waitpid", test_body)
         for body in (runner, transport):
             self.assertIn("finish(deadline)", body)
         hold = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")

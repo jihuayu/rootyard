@@ -159,6 +159,7 @@ impl ReapOnDropGuard {
             && (pid <= 1
                 || tokio::time::timeout(bound, async {
                     while !matches!(group_quiescent(pid), Ok(true)) {
+                        signal_group(child, pid);
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 })

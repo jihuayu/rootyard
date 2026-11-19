@@ -110,6 +110,12 @@ async fn closed_stdout_hang_times_out_at_final_wait_and_reaps_before_scratch_dro
     let (leader, grandchild) = wait_pids(&pidfile).await;
     assert!(root.exists(), "the scratch directory vanished before the final wait was confirmed");
     assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
+    for _ in 0..100 {
+        if !PathBuf::from(format!("/proc/{grandchild}")).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
     drop(scratch);
     assert!(!root.exists());
