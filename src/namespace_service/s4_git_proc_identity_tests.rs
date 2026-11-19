@@ -41,6 +41,9 @@ impl OriginalProcess {
 }
 
 pub(super) fn capture_pair(leader: i32, descendant: i32) -> (OriginalProcess, OriginalProcess) {
+    assert!(leader > 1, "leader pid marker {leader} is not a valid positive process id");
+    assert!(descendant > 1, "descendant pid marker {descendant} is not a valid positive process id");
+    assert_ne!(leader, descendant, "leader and descendant pid markers must be distinct");
     assert_procfs_live();
     let leader_entry = live_entry(leader, "leader");
     let descendant_entry = live_entry(descendant, "descendant");
@@ -139,6 +142,18 @@ mod tests {
         assert_eq!(entry.state, ProcState::Live);
         assert_eq!(entry.pgrp, 77);
         assert_eq!(entry.starttime, 9000);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be distinct")]
+    fn rejects_equal_pid_markers_before_lookup() {
+        capture_pair(4242, 4242);
+    }
+
+    #[test]
+    #[should_panic(expected = "valid positive")]
+    fn rejects_invalid_pid_markers_before_lookup() {
+        capture_pair(0, 4242);
     }
 
     #[test]

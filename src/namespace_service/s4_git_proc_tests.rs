@@ -3,7 +3,7 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[path = "s4_git_proc_identity_tests.rs"]
 mod identity;
 
@@ -95,7 +95,10 @@ async fn cancelled_future_drop_kills_process_group_and_reaps_leader() {
     ));
     let (leader, grandchild) = loop {
         if let Some((leader_pid, descendant_pid)) = try_pids(&pidfile) {
+            #[cfg(target_os = "linux")]
             break identity::capture_pair(leader_pid, descendant_pid);
+            #[cfg(not(target_os = "linux"))]
+            break (leader_pid, descendant_pid);
         }
         tokio::select! {
             _ = &mut future => panic!("cancelled process unexpectedly finished"),
@@ -111,12 +114,20 @@ async fn cancelled_future_drop_kills_process_group_and_reaps_leader() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(!root.exists(), "the scratch directory outlived the cancelled Git command");
-    assert_eq!(leader.state(), identity::ProcState::Gone, "the original direct leader was not reaped");
-    let descendant_state = grandchild.state();
-    assert!(
-        matches!(descendant_state, identity::ProcState::Gone | identity::ProcState::Exited),
-        "the original descendant is still live after cancellation: {descendant_state:?}"
-    );
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(leader.state(), identity::ProcState::Gone, "the original direct leader was not reaped");
+        let descendant_state = grandchild.state();
+        assert!(
+            matches!(descendant_state, identity::ProcState::Gone | identity::ProcState::Exited),
+            "the original descendant is still live after cancellation: {descendant_state:?}"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
+        assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
+    }
 }
 
 #[cfg(unix)]
