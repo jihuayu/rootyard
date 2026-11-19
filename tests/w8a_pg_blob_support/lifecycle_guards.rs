@@ -5,7 +5,7 @@ use anyhow::{Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use rootyard::backup::w8a_paired::{W8aCreateReceipt, W8aError, W8aPairedSidecarManifest, restore};
+use rootyard::backup::w8a_paired::{W8aCreateReceipt, W8aError, W8aPairedSidecarManifest, check, restore};
 
 use crate::s3::{EnvGuard, LoopbackS3};
 use crate::seed;
@@ -82,6 +82,7 @@ pub async fn run_lifecycle_guard_drills(
     created: &W8aCreateReceipt,
 ) -> Result<()> {
     let tampered = tampered_epoch_archive(archive, &temp.join("tampered-epoch"))?;
+    check(&tampered)?;
     let (database, url) = fresh_database(admin).await?;
     env.update(crate::TEST_URL, &url);
     let config = crate::config(url.clone(), temp, "drill-a", git);

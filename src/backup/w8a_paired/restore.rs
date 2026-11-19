@@ -326,7 +326,7 @@ fn prepare_compute(compute_dir: &Path, source: &Path, target: &Path) -> W8aResul
     Ok(ComputeDirGuard { path: compute })
 }
 
-pub(super) async fn verify_restored_source_snapshot(
+pub(in crate::backup) async fn verify_restored_source_snapshot(
     client: &tokio_postgres::Client,
     sidecar: &W8aPairedSidecarManifest,
 ) -> W8aResult<()> {
@@ -357,7 +357,7 @@ pub(super) async fn verify_restored_source_snapshot(
     Ok(())
 }
 
-pub(super) async fn finish_guarded_restore(
+pub(in crate::backup) async fn finish_guarded_restore(
     config: &Config,
     client: &mut tokio_postgres::Client,
     mutex: &super::super::BackupMutex,

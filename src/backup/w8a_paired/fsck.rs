@@ -154,10 +154,9 @@ async fn fsck_one(
     for member in members {
         let path = staged.join(format!("{}.{}", member.pack_id.simple(), member.role));
         let locator = member.locator().map_err(map_archive_error)?;
-        transfer
-            .export(read, &locator, &member.sha256, member.length, &path, deadline)
-            .await
-            .map_err(map_archive_error)?;
+        transfer.export(read, &locator, &member.sha256, member.length, &path, deadline).await.map_err(|error| {
+            W8aError::MissingOrCorruptBlobArtifact(format!("re-exporting restored Blob artifact: {error}"))
+        })?;
         order.push((member.pack_id, member.role.clone(), path));
     }
     for (pack_id, role, path) in &order {
