@@ -89,7 +89,7 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
     def test_trigger_requires_a_fresh_committed_terminal_with_audit_outbox(self):
         text = source("src/blob_git_gateway/publish.rs")
         push = body(text, "Start::Fresh { plan, _token: token }", "async fn repository_owner")
-        self.assertIn("decide(state, actor, (*plan).clone(), mode, deadline).await", push)
+        self.assertIn("decide(state, actor, (*plan).clone(), mode, serving.cluster_incarnation, deadline).await", push)
         self.assertLess(push.index("decide(state"), push.index("if notify"))
         self.assertLess(push.index("if notify"), push.index("state.dispatch().committed()"))
         predicate = body(text, "fn should_notify", "/// The authorized A4 facade")
@@ -155,6 +155,36 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         self.assertIn("VALUES($1,'audit-log')", guarded)
         # The audit-only path must never enqueue the legacy ref-index effect.
         self.assertNotIn("VALUES($1,'audit-log'),($1,'ref-index')", guarded)
+
+    def test_restore_incarnation_is_threaded_from_authorized_serving(self):
+        publish = source("src/blob_git_gateway/publish.rs")
+        push = body(publish, "Start::Fresh { plan, _token: token }", "async fn repository_owner")
+        self.assertIn("serving.cluster_incarnation", push)
+        decide = body(publish, "async fn decide(", "/// The one trigger predicate")
+        self.assertIn("expected_cluster_incarnation", decide)
+        self.assertIn("commit_with_expected_cluster_incarnation", decide)
+
+        commit = source("src/ref_store/core/pack_commit/authorized/commit.rs")
+        inner = body(commit, "async fn commit_inner(", "async fn commit_in_tx(")
+        self.assertIn("expected_cluster_incarnation", inner)
+        tx = body(commit, "async fn commit_in_tx(", "// SHARE NOWAIT is taken")
+        self.assertIn("crate::ref_store::pg::bound", tx)
+        self.assertIn("public_cluster_incarnation_nowait", tx)
+        self.assertLess(tx.index("public_cluster_incarnation_nowait"), tx.index("PgRefStore.begin"))
+        pending = body(tx, "OperationState::Pending => {", "}\n")
+        self.assertIn("RestoreIncarnationMismatch", pending)
+        replay = body(tx, "OperationState::Committed | OperationState::Rejected", "OperationState::Cancelled")
+        self.assertIn("return Ok(receipt", replay)
+        audit = body(commit, "async fn enqueue_core_audit(", "fn receipt(")
+        self.assertIn("captured_restore_incarnation", audit)
+        self.assertIn("Some(incarnation) => incarnation", audit)
+        self.assertIn("None => tx", audit)
+
+        contract = source("src/ref_store/contract.rs")
+        self.assertIn("RestoreIncarnationMismatch", contract)
+        gateway = source("src/blob_git_gateway/error.rs")
+        self.assertIn("Ref::RestoreIncarnationMismatch =>", gateway)
+        self.assertIn('Self::Unavailable("repository authority changed; retry the same operation")', gateway)
 
     def test_audit_projection_is_not_a_legacy_push_webhook_or_ref_index_event(self):
         bridge = source("src/events.rs")

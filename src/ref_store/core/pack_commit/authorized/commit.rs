@@ -18,6 +18,7 @@ use crate::ref_store::pg::PgRefStore;
 use crate::ref_store::tx::{begin_bounded, commit_bounded};
 use tokio::time::{Instant, timeout_at};
 use tokio_postgres::Transaction;
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizedCommitReceipt {
@@ -45,13 +46,44 @@ impl PgAuthorizedCommit {
         verified: &VerifiedAuthorizedPublication,
         deadline: Instant,
     ) -> Result<AuthorizedCommitReceipt, AuthorizedCommitError> {
+        self.commit_inner(pool, verified, None, deadline).await
+    }
+
+    /// Final A4 commit for the serving gateway, carrying the exact restore
+    /// incarnation captured by its initial authorized `ServingRepository`
+    /// lookup. The incarnation is locked and compared as the first lock of the
+    /// final transaction, before any operation/core/ref/event/outbox write.
+    /// A mismatch rolls the whole transaction back; a replay still returns its
+    /// persisted terminal without restamping or emitting a new wake.
+    pub async fn commit_with_expected_cluster_incarnation(
+        &self,
+        pool: &deadpool_postgres::Pool,
+        verified: &VerifiedAuthorizedPublication,
+        expected_cluster_incarnation: Uuid,
+        deadline: Instant,
+    ) -> Result<AuthorizedCommitReceipt, AuthorizedCommitError> {
+        self.commit_inner(pool, verified, Some(expected_cluster_incarnation), deadline).await
+    }
+
+    async fn commit_inner(
+        &self,
+        pool: &deadpool_postgres::Pool,
+        verified: &VerifiedAuthorizedPublication,
+        expected_cluster_incarnation: Option<Uuid>,
+        deadline: Instant,
+    ) -> Result<AuthorizedCommitReceipt, AuthorizedCommitError> {
         let deadline = effective_deadline(deadline)?;
         let plan = verified.selection().prepared().plan();
         ensure_pack_terminal_budget(plan)?;
         let mut client = pooled_client(pool, deadline).await?;
         let tx = begin_bounded(&mut client, deadline).await?;
         let backend_identity = self.store.backend_identity().as_hex();
-        let outcome = match timeout_at(deadline, commit_in_tx(&tx, verified, backend_identity, deadline)).await {
+        let outcome = match timeout_at(
+            deadline,
+            commit_in_tx(&tx, verified, backend_identity, expected_cluster_incarnation, deadline),
+        )
+        .await
+        {
             Ok(value) => value,
             Err(_) => Err(AuthorizedCommitError::Timeout),
         };
@@ -74,11 +106,24 @@ async fn commit_in_tx(
     tx: &Transaction<'_>,
     verified: &VerifiedAuthorizedPublication,
     backend_identity: &str,
+    expected_cluster_incarnation: Option<Uuid>,
     deadline: Instant,
 ) -> Result<AuthorizedCommitReceipt, AuthorizedCommitError> {
     let selection = verified.selection();
     let prepared = selection.prepared();
     let plan = prepared.plan();
+    // The cluster anchor is taken first, exactly like the serving read capture:
+    // before the operation/repository/gate/usage prefix. `NOWAIT` keeps it out
+    // of a restore-fence lock cycle; the absolute A4 deadline remains the outer
+    // bound. A mismatch is only enforced for a non-replay pending commit.
+    let captured_cluster_incarnation = match expected_cluster_incarnation {
+        Some(expected) => {
+            crate::ref_store::pg::bound(tx, deadline).await?;
+            let current = crate::ref_store::pg::public_cluster_incarnation_nowait(tx).await?;
+            Some((current, current != expected))
+        }
+        None => None,
+    };
     pg::set_ack_durability(tx, deadline).await?;
     let begun = PgRefStore.begin(tx, plan.identity(), deadline).await?;
     match begun.record.state() {
@@ -94,7 +139,13 @@ async fn commit_in_tx(
                 "publication needs an existing pending operation",
             ));
         }
-        OperationState::Pending => {}
+        OperationState::Pending => {
+            if let Some((_, true)) = captured_cluster_incarnation {
+                return Err(AuthorizedCommitError::from(
+                    crate::ref_store::contract::RefStoreError::RestoreIncarnationMismatch,
+                ));
+            }
+        }
     }
     // SHARE NOWAIT is taken before any authorization reads and retained through COMMIT.
     decisions::sql_locks::lock_source_tables(tx, selection.selected().action()).await.map_err(super::decision_error)?;
@@ -244,6 +295,7 @@ async fn commit_in_tx(
             &committed.terminal,
             gate.object_format(),
             backend_identity,
+            captured_cluster_incarnation.map(|(incarnation, _)| incarnation),
         )
         .await?;
         committed
@@ -306,6 +358,7 @@ async fn enqueue_core_audit(
     terminal: &PackCommitTerminal,
     format: crate::ref_store::core::types::GitObjectFormat,
     backend_identity: &str,
+    captured_restore_incarnation: Option<Uuid>,
 ) -> Result<bool, crate::ref_store::contract::RefStoreError> {
     let changes = audit_changes(format, &terminal.refs);
     if changes.is_empty() {
@@ -366,11 +419,17 @@ async fn enqueue_core_audit(
     if core_outcome != "committed" {
         return Err(crate::ref_store::contract::RefStoreError::GateConflict);
     }
-    let restore_incarnation: Uuid = tx
-        .query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true FOR SHARE", &[])
-        .await
-        .map_err(crate::ref_store::pg::db_error)?
-        .get(0);
+    // The serving A4 path passes the incarnation already locked and compared at
+    // the start of this transaction; it is never re-read after core mutation.
+    // Other authorized callers keep their existing late read.
+    let restore_incarnation = match captured_restore_incarnation {
+        Some(incarnation) => incarnation,
+        None => tx
+            .query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true FOR SHARE", &[])
+            .await
+            .map_err(crate::ref_store::pg::db_error)?
+            .get(0),
+    };
     if restore_incarnation.is_nil() {
         return Err(crate::ref_store::contract::RefStoreError::GateConflict);
     }

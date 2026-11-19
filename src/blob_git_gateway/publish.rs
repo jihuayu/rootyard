@@ -209,7 +209,7 @@ pub(super) async fn push(
                         plan.packs().get(index).ok_or(GatewayError::Internal("planned pack set is incomplete"))?;
                     publish_pair(state, &plan, planned.pack_id(), pair, deadline).await?;
                 }
-                decide(state, actor, (*plan).clone(), mode, deadline).await
+                decide(state, actor, (*plan).clone(), mode, serving.cluster_incarnation, deadline).await
             }
             .await;
             match result {
@@ -628,6 +628,7 @@ async fn decide(
     actor: &Identity,
     plan: PackCommitPlan,
     mode: CommitMode,
+    expected_cluster_incarnation: Uuid,
     deadline: Instant,
 ) -> Result<(PackCommitTerminal, bool), GatewayError> {
     let adapter = authorized(state)?;
@@ -643,7 +644,10 @@ async fn decide(
     };
     let selection = adapter.select(state.pool(), *prepared, actor, mode, deadline).await.map_err(map_authorized)?;
     let verified = adapter.verify(selection, deadline).await.map_err(map_authorized)?;
-    let receipt = adapter.commit(state.pool(), &verified, deadline).await.map_err(map_authorized)?;
+    let receipt = adapter
+        .commit_with_expected_cluster_incarnation(state.pool(), &verified, expected_cluster_incarnation, deadline)
+        .await
+        .map_err(map_authorized)?;
     let notify = should_notify(&receipt.terminal, receipt.replayed, receipt.audit_enqueued);
     Ok((receipt.terminal, notify))
 }
