@@ -62,6 +62,7 @@ mod browser_tests;
 pub(super) mod fixtures;
 mod matrix_tests;
 mod negative_tests;
+mod public_operation_tests;
 mod support;
 
 use anyhow::{Context, Result, anyhow, ensure};
