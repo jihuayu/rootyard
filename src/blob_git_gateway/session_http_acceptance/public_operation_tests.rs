@@ -114,7 +114,7 @@ async fn admit_pending_public(
             &[public_id.as_bytes(), private_id.as_bytes()],
         ),
         request_mode: CommitMode::Atomic,
-        backend_identity: gateway.store.backend_identity().as_hex(),
+        backend_identity: gateway.store.backend_identity().as_hex().to_owned(),
         object_format: gate.object_format(),
         history_incarnation: gate.history_incarnation(),
         authority_epoch: gate.authority_epoch(),
