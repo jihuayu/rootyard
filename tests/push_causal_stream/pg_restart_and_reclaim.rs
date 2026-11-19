@@ -158,6 +158,7 @@ async fn run_suite_inner(env: &RestartReclaimSuiteEnv<'_>) -> Result<()> {
         sandbox_root: None,
         repository_id: repo_id,
         operation_id: op2,
+        private_operation_id: None,
         deadline: dl,
     })
     .await?

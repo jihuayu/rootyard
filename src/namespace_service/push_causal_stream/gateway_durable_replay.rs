@@ -45,7 +45,14 @@ pub struct DurableGatewayReceiptArgs<'a> {
     pub scratch_root: Option<&'a Path>,
     pub sandbox_root: Option<&'a Path>,
     pub repository_id: Uuid,
+    /// Stable public operation identity. This is the receipt/ring key and the
+    /// identity rendered to callers.
     pub operation_id: Uuid,
+    /// Exact private migration-152 attempt that owns the durable migration-138
+    /// operation, decision, pack registrations and event rows. `None` is the
+    /// legacy one-identity path. This is never derived from, or written into,
+    /// the public identity.
+    pub private_operation_id: Option<Uuid>,
     pub deadline: TokioInstant,
 }
 
@@ -64,6 +71,12 @@ pub async fn materialize_durable_gateway_receipt(
 pub async fn load_durable_gateway_push_receipt(
     args: &DurableGatewayReceiptArgs<'_>,
 ) -> Result<Option<CausalPushProofReceipt>, PushCausalError> {
+    let durable_operation_id = args.private_operation_id.unwrap_or(args.operation_id);
+    if durable_operation_id.is_nil()
+        || (args.private_operation_id.is_some() && durable_operation_id == args.operation_id)
+    {
+        return Err(PushCausalError::StateMachine("durable gateway operation identity is invalid".into()));
+    }
     let client = timeout_at(args.deadline, args.pool.get())
         .await
         .map_err(|_| PushCausalError::DeadlineExceeded)?
@@ -75,7 +88,7 @@ pub async fn load_durable_gateway_push_receipt(
             "SELECT issuer_id, lane, sequence, state, terminal_result
              FROM ref_store_operations
              WHERE repository_id = $1 AND operation_id = $2",
-            &[&args.repository_id, &args.operation_id],
+            &[&args.repository_id, &durable_operation_id],
         ),
     )
     .await
@@ -99,7 +112,8 @@ pub async fn load_durable_gateway_push_receipt(
         serde_json::from_value(terminal_json).map_err(|e| PushCausalError::Io(e.to_string()))?;
 
     let meta =
-        load_decision_or_gate_meta(&client, args.repository_id, args.operation_id, &terminal, args.deadline).await?;
+        load_decision_or_gate_meta(&client, args.repository_id, durable_operation_id, &terminal, args.deadline)
+            .await?;
     let current_refs =
         load_historical_refs_at_revision(&client, args.repository_id, meta.base_revision, args.deadline).await?;
     let backend_hex = args.store.backend_identity().as_hex();
@@ -115,7 +129,7 @@ pub async fn load_durable_gateway_push_receipt(
     .await?;
 
     let (pack_pairs, all_hold_paths) =
-        load_all_operation_pack_pairs(&client, args.repository_id, args.operation_id, args.deadline).await?;
+        load_all_operation_pack_pairs(&client, args.repository_id, durable_operation_id, args.deadline).await?;
     drop(client);
 
     if let Some(sr) = args.scratch_root {

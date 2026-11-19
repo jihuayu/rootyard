@@ -43,8 +43,8 @@ use crate::{
     blob_store::protected::{ProtectedUploadError, ProtectedUploader, UploadSource},
     db::Identity,
     ref_store::{
-        GitOid, HeadUpdate, IssuerLane, OperationIdentity, OperationState, PgRefStore, RefName, RefUpdate,
-        RequestDigest,
+        GitOid, HeadUpdate, IssuerLane, OperationIdentity, OperationLookup, OperationRecord, OperationState, PgRefStore,
+        RefName, RefUpdate, RequestDigest,
         artifact_hold::{
             AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldError, ArtifactHoldPurpose, ArtifactSpec,
             HoldScope, PgArtifactHoldStore,
@@ -60,7 +60,8 @@ use crate::{
             },
         },
         pg::{
-            public_attempt::{PublicAttemptLookup, PublicAttemptRequest},
+            public_attempt::{PublicAttemptEvidence, PublicAttemptLookup, PublicAttemptRequest},
+            public_terminal::{PublicAttemptRetirement, PublicAttemptTerminalOutcome},
             slot_zero::SlotZeroAdmissionRequest,
         },
         tx::{begin_bounded, commit_bounded},
@@ -72,14 +73,16 @@ use super::{
     native::{derived_uuid, file_digest},
     operation::{self, Claim},
     protocol::PushRequest,
+    receive::VerifiedReceive,
     serving::ServingRepository,
     snapshot::{capture_baseline, ref_error},
     state::BlobGitState,
 };
 
-/// Crate-private exact slot-zero-retirement handoff. No route selects it until
-/// the separate reviewed HTTP admission switch is opened.
-#[allow(dead_code)]
+/// Crate-private exact slot-zero-retirement handoff. The activation-safe
+/// receive finish path selects it only from the mirror's typed retirement
+/// disposition; fresh admission stays on the legacy entry until every HTTP
+/// read/cancel seam is qualified.
 pub(super) mod slot_one;
 
 const HOLD_NAMESPACE: &str = "gateway-pack";
@@ -441,6 +444,182 @@ enum SlotZeroPreflight {
     Claim(Claim),
 }
 
+/// Mirror one already-durable private terminal into its public wrapper before
+/// the route may ACK it.
+///
+/// The caller passes the exact public request it just authenticated; the
+/// private record is the same durable migration-138/139 terminal produced by
+/// the A4 commit. A dedicated short read-committed transaction is used because
+/// the terminal mirror must be the first lock-taking step. `RetirementRequired`
+/// is rolled back without a write and is the only disposition that may proceed
+/// to the reviewed slot-one retirement path. Mirrored commits before this
+/// returns; an unknown COMMIT remains an unknown outcome.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn finish_public_terminal(
+    state: &BlobGitState,
+    serving: &ServingRepository,
+    actor: &Identity,
+    public_id: Uuid,
+    wire_digest: RequestDigest,
+    request_mode: CommitMode,
+    record: &OperationRecord,
+    deadline: Instant,
+) -> Result<PublicAttemptTerminalOutcome, GatewayError> {
+    let public_request = public_attempt_request_from_serving(
+        serving,
+        actor,
+        public_id,
+        wire_digest,
+        request_mode,
+        state.store().backend_identity().as_hex().to_owned(),
+    )?;
+    mirror_public_terminal_with_request(state, &public_request, record, deadline).await
+}
+
+/// Shared dedicated-transaction terminal mirror. The typed public request is
+/// already the exact authenticated wrapper identity; no private UUID is read
+/// from it or formatted into an error.
+async fn mirror_public_terminal_with_request(
+    state: &BlobGitState,
+    public_request: &PublicAttemptRequest,
+    record: &OperationRecord,
+    deadline: Instant,
+) -> Result<PublicAttemptTerminalOutcome, GatewayError> {
+    let mut client = state.pooled(deadline).await?;
+    let tx = match timeout_at(deadline, client.transaction()).await {
+        Ok(Ok(tx)) => tx,
+        Ok(Err(_)) => return Err(GatewayError::Internal("private terminal mirror transaction failed")),
+        Err(_) => return Err(GatewayError::Timeout),
+    };
+    let mirrored = timeout_at(
+        deadline,
+        PgRefStore.mirror_public_attempt_terminal_in_tx(&**tx, public_request, record, deadline),
+    )
+    .await;
+    let outcome = match mirrored {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
+            return Err(GatewayError::from(error));
+        }
+        Err(_) => {
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
+            return Err(GatewayError::Timeout);
+        }
+    };
+    match outcome {
+        PublicAttemptTerminalOutcome::Mirrored(receipt) => {
+            commit_deadpool_bounded(tx, deadline).await?;
+            Ok(PublicAttemptTerminalOutcome::Mirrored(receipt))
+        }
+        PublicAttemptTerminalOutcome::RetirementRequired(retirement) => {
+            // The mirror wrote nothing on this branch. Acknowledged cleanup is
+            // required before the caller may build the slot-one candidate.
+            rollback_deadpool_bounded(tx, deadline).await?;
+            Ok(PublicAttemptTerminalOutcome::RetirementRequired(retirement))
+        }
+    }
+}
+
+/// The one terminal produced by the reviewed slot-one retirement path. The
+/// public wrapper was mirrored before this value is returned, so the caller may
+/// render the exact durable terminal and materialize its receipt.
+pub(super) struct RetiredSlotOneOutcome {
+    pub terminal: PackCommitTerminal,
+    pub private_id: Uuid,
+}
+
+/// Complete the one definite slot-zero stale-retirement event through the
+/// reviewed rotation foundation.
+///
+/// The same [`VerifiedReceive`] provides the authenticated actor, parsed wire
+/// request, mode and ordered staged pairs. A fresh baseline is captured on the
+/// same authorized serving realm; the rotation primitive selects the exact
+/// private slot-one identity and re-proves restore/realm under its own locks.
+/// A3/A4 then run on that fresh private identity, and the exact terminal is
+/// mirrored into the public wrapper before this function returns. There is no
+/// second retirement, no retry loop and no fallback to legacy insertion.
+pub(super) async fn retire_slot_one(
+    state: &BlobGitState,
+    serving: &ServingRepository,
+    verified: &VerifiedReceive<'_>,
+    evidence: &PublicAttemptEvidence,
+    retirement: &PublicAttemptRetirement,
+    deadline: Instant,
+) -> Result<RetiredSlotOneOutcome, GatewayError> {
+    let baseline =
+        capture_baseline(state, serving.gate.repository_id(), serving.gate.tenant_id(), deadline).await?;
+    if !admission_realm_matches_serving(&baseline, serving) {
+        return Err(GatewayError::Conflict("repository authority changed; retry"));
+    }
+    let backend_identity = state.store().backend_identity().as_hex().to_owned();
+    let handoff = slot_one::SlotOneReceive::from_verified_slot_zero(
+        serving,
+        verified,
+        &baseline,
+        backend_identity,
+        evidence,
+        retirement,
+    )?;
+    let public_request = handoff.public().clone();
+    let admission = slot_one::rotate_slot_one(state, serving, &handoff, &baseline, deadline).await?;
+    match admission {
+        slot_one::SlotOneAdmission::Fresh { plan, .. } => {
+            for (index, pair) in verified.pairs().iter().enumerate() {
+                let planned =
+                    plan.packs().get(index).ok_or(GatewayError::Internal("slot one planned pack set is incomplete"))?;
+                publish_pair(state, &plan, planned.pack_id(), pair, deadline).await?;
+            }
+            let terminal = decide(state, verified.actor(), (*plan).clone(), verified.mode(), deadline).await?;
+            let private_id = plan.identity().operation_id();
+            let record =
+                load_terminal_record(state, serving.gate.repository_id(), private_id, deadline).await?;
+            match mirror_public_terminal_with_request(state, &public_request, &record, deadline).await? {
+                PublicAttemptTerminalOutcome::Mirrored(_) => {
+                    Ok(RetiredSlotOneOutcome { terminal, private_id })
+                }
+                PublicAttemptTerminalOutcome::RetirementRequired(_) => Err(GatewayError::Internal(
+                    "slot one terminal cannot require a second retirement",
+                )),
+            }
+        }
+        // An exact pending rotation replay has no new plan to publish and its
+        // wrapper outcome is still unknown. Never render a false ACK here.
+        slot_one::SlotOneAdmission::Replayed(_) => Err(GatewayError::OutcomeUnknown),
+    }
+}
+
+/// Load one immutable private terminal record in its own short read
+/// transaction. No Blob/Git IO and no admission write occurs while this
+/// connection is checked out.
+async fn load_terminal_record(
+    state: &BlobGitState,
+    repository_id: Uuid,
+    operation_id: Uuid,
+    deadline: Instant,
+) -> Result<OperationRecord, GatewayError> {
+    let mut client = state.pooled(deadline).await?;
+    let tx = begin_bounded(&mut client, deadline).await.map_err(ref_error)?;
+    let loaded = PgRefStore.get(&tx, repository_id, operation_id, deadline).await.map_err(GatewayError::from);
+    let cleanup = timeout_at(deadline, tx.rollback()).await;
+    drop(client);
+    match cleanup {
+        Err(_) => return Err(GatewayError::Timeout),
+        Ok(Err(_)) => return Err(GatewayError::Internal("private terminal record cleanup failed")),
+        Ok(Ok(())) => {}
+    }
+    let record = match loaded? {
+        OperationLookup::Known(record) => record,
+        OperationLookup::Unknown => {
+            return Err(GatewayError::Internal("private terminal record disappeared after commit"));
+        }
+    };
+    if !record.state().is_terminal() || record.terminal_result().is_none() {
+        return Err(GatewayError::Internal("private operation did not produce a durable terminal"));
+    }
+    Ok(record)
+}
+
 /// One authenticated, lock-ordered public preflight in the caller's transaction.
 ///
 /// Order is fixed and enforced under the public/attempt and migration-138
@@ -573,7 +752,8 @@ async fn slot_zero_public_preflight(
                 public_request.wire_digest,
                 deadline,
             )
-            .await?,
+            .await?
+            .claim,
         )),
     }
 }
@@ -841,7 +1021,22 @@ fn public_attempt_request(
     if !admission_realm_matches_serving(baseline, serving) {
         return Err(GatewayError::Conflict("repository authority changed; retry"));
     }
-    let gate = baseline.gate();
+    public_attempt_request_from_serving(serving, actor, public_id, wire_digest, request_mode, backend_identity)
+}
+
+/// Build the same typed public request directly from an already-authorized live
+/// serving realm. The finish path has no captured plan baseline; it uses only
+/// the serving gate that the migration-152 lookup just re-authenticated. No
+/// public/private UUID is derived here, and no private identity is accepted.
+fn public_attempt_request_from_serving(
+    serving: &ServingRepository,
+    actor: &Identity,
+    public_id: Uuid,
+    wire_digest: RequestDigest,
+    request_mode: CommitMode,
+    backend_identity: String,
+) -> Result<PublicAttemptRequest, GatewayError> {
+    let gate = &serving.gate;
     Ok(PublicAttemptRequest {
         repository_id: gate.repository_id(),
         admission_owner_id: gate.tenant_id(),
@@ -945,7 +1140,9 @@ async fn replay_slot_zero_claim(
                 return Err(GatewayError::Internal("slot zero replay evidence is not a verified public attempt"));
             }
         };
-    operation::lookup_public_private_in_tx(tx, public_request, &evidence, request, request_digest, deadline).await
+    operation::lookup_public_private_in_tx(tx, public_request, &evidence, request, request_digest, deadline)
+        .await
+        .map(|resolved| resolved.claim)
 }
 
 /// What one fresh-write transaction decided about this operation identity.

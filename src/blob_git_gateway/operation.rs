@@ -33,7 +33,7 @@ use crate::ref_store::{
     RequestDigest, TerminalKind,
     core::pack_commit::{PackCommitTerminal, read_serving_operation},
     pg::{
-        public_attempt::{PublicAttemptEvidence, PublicAttemptRequest},
+        public_attempt::{PublicAttemptEvidence, PublicAttemptFinishLookup, PublicAttemptRequest},
         slot_one, slot_zero,
     },
 };
@@ -75,6 +75,34 @@ pub(super) struct ResolvedOperation {
 pub(super) enum Lookup {
     Known(ResolvedOperation),
     Unknown,
+}
+
+/// One verified private resolution: the request-aware classification plus the
+/// exact terminal/pending record loaded under the migration-152 attempt lock.
+/// The mirror needs the record's immutable terminal body; the route must never
+/// synthesize one from `PublicAttemptEvidence`.
+pub(super) struct ResolvedPublicPrivate {
+    pub claim: Claim,
+    pub record: OperationRecord,
+}
+
+/// Early receive classification after migration 152 is consulted. A `Finish`
+/// is not a Git result: the wrapper is still pending and the exact private
+/// attempt is terminal, so the reviewed terminal mirror must first derive
+/// `Mirrored` or `RetirementRequired`. The record is owned by this value; no
+/// private UUID is formatted into a public error or response.
+pub(super) enum Probe {
+    Fresh,
+    Pending,
+    Replay { terminal: PackCommitTerminal, private_id: Option<Uuid> },
+    Cancelled { reason: &'static str },
+    Finish {
+        terminal: PackCommitTerminal,
+        private_id: Uuid,
+        evidence: PublicAttemptEvidence,
+        record: OperationRecord,
+    },
+    FinishCancelled { reason: &'static str },
 }
 
 /// Compute the operation-level request digest over the **decoded** wire body.
@@ -244,6 +272,147 @@ pub(super) async fn probe(
 
 /// Classify one already-fetched operation against this exact request.
 ///
+/// Early receive classification that consults migration 152 before any native
+/// child or A3/A4 write.
+///
+/// The public UUID and producer digest are the stable public identity. A
+/// private wrapper is resolved only through the migration-152 public/attempt
+/// lock, the exact current/retired evidence and the private operation's
+/// migration-147 binding. A pending wrapper with a terminal private attempt is
+/// returned as [`Probe::Finish`] (the mirror has not published it yet), never as
+/// a false replay. Unknown wrapper/legacy rows are `Fresh`/legacy as marked;
+/// a private identifier, mismatched proof or malformed evidence is a typed
+/// refusal. No write, sequence allocation or terminal body is performed here.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn probe_public(
+    state: &BlobGitState,
+    serving: &crate::ref_store::serving::ServingRepository,
+    actor: &crate::db::Identity,
+    public_id: Uuid,
+    request: &PushRequest,
+    digest: RequestDigest,
+    mode: CommitMode,
+    deadline: Instant,
+) -> Result<Probe, GatewayError> {
+    let repository_id = serving.gate.repository_id();
+    let gate = &serving.gate;
+    let public_request = PublicAttemptRequest {
+        repository_id,
+        admission_owner_id: gate.tenant_id(),
+        issuer_id: actor.id,
+        public_id,
+        wire_digest: digest,
+        request_mode: mode,
+        backend_identity: state.store().backend_identity().as_hex().to_owned(),
+        object_format: gate.object_format(),
+        history_incarnation: gate.history_incarnation(),
+        authority_epoch: gate.authority_epoch(),
+        group_epoch: gate.group_epoch(),
+        restore_incarnation: serving.cluster_incarnation,
+    };
+    let mut client = state.pooled(deadline).await?;
+    let tx = timeout_at(deadline, client.transaction())
+        .await
+        .map_err(|_| GatewayError::Timeout)?
+        .map_err(|_| GatewayError::Internal("private operation probe transaction failed"))?;
+    let result: Result<Probe, GatewayError> = async {
+        // Migration-152 public/attempt keys first. The proposed private id is
+        // random and exists only to make the lock set complete; it is never
+        // allocated, written or exposed.
+        crate::ref_store::PgRefStore
+            .lock_public_attempt(&tx, &public_request, Uuid::new_v4(), deadline)
+            .await
+            .map_err(GatewayError::from)?;
+        // The legacy key is taken before the guarded legacy lookup below, and
+        // is a no-op when this identifier is private or unknown.
+        crate::ref_store::pg::lock_operation(&tx, repository_id, public_id, deadline)
+            .await
+            .map_err(GatewayError::from)?;
+        let fresh = crate::ref_store::serving::lookup_in_tx(
+            &tx,
+            actor,
+            &serving.repository.owner,
+            &serving.repository.name,
+            true,
+            state.store().backend_identity(),
+            deadline,
+        )
+        .await
+        .map_err(GatewayError::from)?;
+        if fresh.gate.repository_id() != repository_id
+            || crate::ref_store::core::RealmExpectation::from_gate(&fresh.gate)
+                != crate::ref_store::core::RealmExpectation::from_gate(&serving.gate)
+            || fresh.cluster_incarnation != serving.cluster_incarnation
+        {
+            return Err(GatewayError::Conflict("repository authority changed; retry"));
+        }
+        match crate::ref_store::PgRefStore
+            .lookup_public_attempt_finish(&tx, &public_request, deadline)
+            .await
+            .map_err(GatewayError::from)?
+        {
+            PublicAttemptFinishLookup::Unknown => Ok(Probe::Fresh),
+            PublicAttemptFinishLookup::PrivateIdentifier => {
+                Err(GatewayError::Conflict("operation identifier is already a private attempt"))
+            }
+            PublicAttemptFinishLookup::LegacyPath => {
+                match lookup_in_tx(&tx, repository_id, public_id, deadline).await? {
+                    Lookup::Known(resolved) => {
+                        match classify(resolved, repository_id, actor.id, public_id, request, digest)? {
+                            Claim::Fresh => Err(GatewayError::Internal("known operation was classified as fresh")),
+                            Claim::Pending => Ok(Probe::Pending),
+                            Claim::Replay(terminal) => Ok(Probe::Replay { terminal, private_id: None }),
+                            Claim::Cancelled(reason) => Ok(Probe::Cancelled { reason }),
+                        }
+                    }
+                    Lookup::Unknown => {
+                        Err(GatewayError::Internal("legacy public marker has no durable operation record"))
+                    }
+                }
+            }
+            PublicAttemptFinishLookup::Evidence(found) => {
+                let evidence = found.evidence;
+                let wrapper_state = found.wrapper_state;
+                let private_id = evidence.current.private_id;
+                let resolved = lookup_public_private_in_tx(
+                    &tx,
+                    &public_request,
+                    &evidence,
+                    request,
+                    digest,
+                    deadline,
+                )
+                .await?;
+                let ResolvedPublicPrivate { claim, record } = resolved;
+                match (wrapper_state, claim) {
+                    (OperationState::Pending, Claim::Pending) => Ok(Probe::Pending),
+                    (OperationState::Pending, Claim::Replay(terminal)) => Ok(Probe::Finish {
+                        terminal,
+                        private_id,
+                        evidence,
+                        record,
+                    }),
+                    (OperationState::Pending, Claim::Cancelled(reason)) => {
+                        Ok(Probe::FinishCancelled { reason })
+                    }
+                    (_, Claim::Replay(terminal)) => Ok(Probe::Replay { terminal, private_id: Some(private_id) }),
+                    (_, Claim::Cancelled(reason)) => Ok(Probe::Cancelled { reason }),
+                    (_, Claim::Pending) => Ok(Probe::Pending),
+                    (_, Claim::Fresh) => Err(GatewayError::Internal("known private operation was classified as fresh")),
+                }
+            }
+        }
+    }
+    .await;
+    let cleanup = timeout_at(deadline, tx.rollback()).await;
+    drop(client);
+    match cleanup {
+        Err(_) => Err(GatewayError::Timeout),
+        Ok(Err(_)) => Err(GatewayError::Internal("private operation probe cleanup failed")),
+        Ok(Ok(())) => result,
+    }
+}
+
 /// Order matters and is part of the contract:
 ///
 /// 1. the identity must be the one that was asked for;
@@ -321,7 +490,7 @@ pub(super) async fn lookup_public_private_in_tx(
     request: &PushRequest,
     digest: RequestDigest,
     deadline: Instant,
-) -> Result<Claim, GatewayError> {
+) -> Result<ResolvedPublicPrivate, GatewayError> {
     let repository_id = public_request.repository_id;
     let public_id = public_request.public_id;
     if evidence.public_id != public_id {
@@ -380,14 +549,15 @@ pub(super) async fn lookup_public_private_in_tx(
             "verified public attempt producer binding differs from its private operation",
         ));
     }
-    classify(
-        ResolvedOperation { record, producer_digest: *binding.producer_digest() },
+    let claim = classify(
+        ResolvedOperation { record: record.clone(), producer_digest: *binding.producer_digest() },
         repository_id,
         public_request.issuer_id,
         private_id,
         request,
         digest,
-    )
+    )?;
+    Ok(ResolvedPublicPrivate { claim, record })
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

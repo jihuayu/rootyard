@@ -45,7 +45,13 @@ use crate::{
         record_gateway_staging_inflight, settle_aborted_gateway_reclaim, spool_receive_stream_shared_deadline,
         sweep_gateway_reclaim_ledger, verify_gateway_authority_closure,
     },
-    ref_store::{CommitMode, CommitRejectCode, GitObjectFormat, RefCommitResult, RequestDigest},
+    ref_store::{
+        CommitMode, CommitRejectCode, GitObjectFormat, RefCommitResult, RequestDigest,
+        pg::{
+            public_attempt::PublicAttemptEvidence,
+            public_terminal::{PublicAttemptRetirement, PublicAttemptTerminalOutcome},
+        },
+    },
 };
 
 const MAX_NEW_PACKS: usize = 8;
@@ -217,7 +223,7 @@ async fn receive_pack_authorized(
     };
 
     let backend_hex = state.store().backend_identity().as_hex();
-    let receipt_args = |settle_reclaim: bool| DurableGatewayReceiptArgs {
+    let receipt_args = |settle_reclaim: bool, private_id: Option<Uuid>| DurableGatewayReceiptArgs {
         pool: state.pool(),
         store: state.store(),
         git_binary: state.git_binary(),
@@ -225,18 +231,74 @@ async fn receive_pack_authorized(
         sandbox_root: Some(state.scratch_root()),
         repository_id,
         operation_id: operation,
+        private_operation_id: private_id,
         deadline,
     };
 
-    match operation::probe(&state, &serving, receive.actor, operation, receive.request(), receive.digest(), deadline)
-        .await?
+    // Migration-152 public/private probe before any native child or A3/A4 write.
+    // Fresh identifiers continue through the legacy early probe and entry; an
+    // existing private wrapper is resolved only through its exact durable
+    // evidence, and a pending wrapper whose private attempt is already terminal
+    // is finished by the reviewed mirror (never rendered as a false replay).
+    let mut pending_retirement: Option<(PublicAttemptEvidence, PublicAttemptRetirement)> = None;
+    match operation::probe_public(
+        &state,
+        &serving,
+        receive.actor,
+        operation,
+        receive.request(),
+        receive.digest(),
+        receive.mode(),
+        deadline,
+    )
+    .await?
     {
-        Claim::Pending => return Err(GatewayError::OutcomeUnknown),
-        Claim::Cancelled(reason) => {
+        operation::Probe::Fresh => {
+            match operation::probe(
+                &state,
+                &serving,
+                receive.actor,
+                operation,
+                receive.request(),
+                receive.digest(),
+                deadline,
+            )
+            .await?
+            {
+                Claim::Pending => return Err(GatewayError::OutcomeUnknown),
+                Claim::Cancelled(reason) => {
+                    return terminal_response(
+                        receive.request(),
+                        &cancelled_results(receive.request(), reason),
+                        operation,
+                    );
+                }
+                Claim::Replay(terminal) => {
+                    materialize_durable_gateway_receipt(receipt_args(false, None)).await?;
+                    let results = report_results(receive.request(), &terminal)?;
+                    let body = protocol::report_status(receive.request().wants_report(), &results);
+                    return committed_response(CommittedResponse {
+                        state: &state,
+                        identity: &identity,
+                        owner: &owner,
+                        name,
+                        authorized: &serving,
+                        terminal: &terminal,
+                        body,
+                        operation,
+                        deadline,
+                    })
+                    .await;
+                }
+                Claim::Fresh => {}
+            }
+        }
+        operation::Probe::Pending => return Err(GatewayError::OutcomeUnknown),
+        operation::Probe::Cancelled { reason } => {
             return terminal_response(receive.request(), &cancelled_results(receive.request(), reason), operation);
         }
-        Claim::Replay(terminal) => {
-            materialize_durable_gateway_receipt(receipt_args(false)).await?;
+        operation::Probe::Replay { terminal, private_id } => {
+            materialize_durable_gateway_receipt(receipt_args(false, private_id)).await?;
             let results = report_results(receive.request(), &terminal)?;
             let body = protocol::report_status(receive.request().wants_report(), &results);
             return committed_response(CommittedResponse {
@@ -252,7 +314,54 @@ async fn receive_pack_authorized(
             })
             .await;
         }
-        Claim::Fresh => {}
+        operation::Probe::Finish { terminal, private_id, evidence, record } => {
+            // Ask the mirror for the owned disposition before any ACK. It is
+            // read-only for a retirement candidate and commits only the exact
+            // already-durable terminal for every other rejected/committed case.
+            match publish::finish_public_terminal(
+                &state,
+                &serving,
+                receive.actor,
+                operation,
+                receive.digest(),
+                receive.mode(),
+                &record,
+                deadline,
+            )
+            .await?
+            {
+                PublicAttemptTerminalOutcome::Mirrored(_) => {
+                    materialize_durable_gateway_receipt(receipt_args(false, Some(private_id))).await?;
+                    let results = report_results(receive.request(), &terminal)?;
+                    let body = protocol::report_status(receive.request().wants_report(), &results);
+                    return committed_response(CommittedResponse {
+                        state: &state,
+                        identity: &identity,
+                        owner: &owner,
+                        name,
+                        authorized: &serving,
+                        terminal: &terminal,
+                        body,
+                        operation,
+                        deadline,
+                    })
+                    .await;
+                }
+                PublicAttemptTerminalOutcome::RetirementRequired(retirement) => {
+                    // The wrapper remains pending. Continue through native
+                    // ingestion with the same completed receive value, then
+                    // reserve/execute the reviewed slot-one A3/A4/A5 path.
+                    pending_retirement = Some((evidence, retirement));
+                }
+            }
+        }
+        operation::Probe::FinishCancelled { reason } => {
+            // No private cancellation producer is selected by this route. A
+            // blind ACK would leave the public wrapper pending, so fail closed
+            // with a fixed refusal that names neither UUID.
+            let _ = reason;
+            return Err(GatewayError::Conflict("operation cancellation requires reconciliation"));
+        }
     }
     // Reclaim sweeping is a fresh-admission side effect only: a pending, cancelled or replayed
     // claim must never mutate the local reclaim ledger or delete a remote staging object.
@@ -325,6 +434,69 @@ async fn receive_pack_authorized(
         &pair_summaries,
     )?;
 
+    if let Some((evidence, retirement)) = pending_retirement {
+        // Re-authenticate the live serving realm after native ingestion. The
+        // gate revision may legitimately have advanced (that is exactly the
+        // stale-retirement condition), but tenant/format/history/authority/
+        // group/restore/backend may not move. The rotation primitive performs
+        // its own final realm/restore proof under the slot-one locks.
+        let refreshed = lookup(
+            state.pool(),
+            &identity,
+            &owner,
+            name,
+            true,
+            state.store().backend_identity(),
+            deadline,
+        )
+        .await
+        .map_err(GatewayError::from)?;
+        if refreshed.gate.repository_id() != repository_id
+            || refreshed.gate.tenant_id() != serving.gate.tenant_id()
+            || refreshed.gate.object_format() != serving.gate.object_format()
+            || refreshed.gate.history_incarnation() != serving.gate.history_incarnation()
+            || refreshed.gate.authority_epoch() != serving.gate.authority_epoch()
+            || refreshed.gate.group_epoch() != serving.gate.group_epoch()
+            || refreshed.cluster_incarnation != serving.cluster_incarnation
+        {
+            return Err(GatewayError::Conflict("repository authority changed; retry"));
+        }
+        let retired = publish::retire_slot_one(&state, &refreshed, &receive, &evidence, &retirement, deadline).await;
+        return match retired {
+            Ok(retired) => {
+                materialize_durable_gateway_receipt(receipt_args(true, Some(retired.private_id))).await?;
+                let results = report_results(receive.request(), &retired.terminal)?;
+                let body = protocol::report_status(receive.request().wants_report(), &results);
+                committed_response(CommittedResponse {
+                    state: &state,
+                    identity: &identity,
+                    owner: &owner,
+                    name,
+                    authorized: &refreshed,
+                    terminal: &retired.terminal,
+                    body,
+                    operation,
+                    deadline,
+                })
+                .await
+            }
+            Err(error) => {
+                let st = classify_gateway_reclaim_error(&error);
+                let _ = settle_aborted_gateway_reclaim(
+                    state.pool(),
+                    state.scratch_root(),
+                    repository_id,
+                    operation,
+                    backend_hex,
+                    st,
+                    error.message(),
+                )
+                .await;
+                Err(error)
+            }
+        };
+    }
+
     let published = publish::push(
         &state,
         &serving,
@@ -342,7 +514,7 @@ async fn receive_pack_authorized(
         // Git report-status. Mixed/accepted-subset terminals are replayed
         // exactly as recorded.
         Ok(PushOutcome::Terminal(terminal)) => {
-            materialize_durable_gateway_receipt(receipt_args(true)).await?;
+            materialize_durable_gateway_receipt(receipt_args(true, None)).await?;
             let results = report_results(receive.request(), &terminal)?;
             let body = protocol::report_status(receive.request().wants_report(), &results);
             committed_response(CommittedResponse {
