@@ -3,6 +3,7 @@
 import argparse
 import json
 import subprocess
+import urllib.parse
 import uuid
 from pathlib import Path
 import sys
@@ -18,6 +19,21 @@ def _remaining_seconds(deadline, now=None):
 def _statement_timeout_ms(deadline, now=None):
     remaining = _remaining_seconds(deadline, now)
     return 0 if remaining <= 0 else max(1, int(remaining * 1000))
+
+
+def _scoped_dsn(base_db, timeout_ms):
+    if timeout_ms <= 0:
+        raise ValueError("timeout budget must be positive")
+    parts = urllib.parse.urlsplit(base_db)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    options = [value for key, value in query if key == "options"]
+    if len(options) != 1 or "search_path" not in options[0]:
+        raise ValueError("isolated DSN must retain an explicit search_path option")
+    merged = (options[0].strip() +
+        f" -c statement_timeout={timeout_ms} -c lock_timeout={timeout_ms}")
+    query = [(key, merged if key == "options" else value) for key, value in query]
+    return urllib.parse.urlunsplit(
+        parts._replace(query=urllib.parse.urlencode(query, quote_via=urllib.parse.quote)))
 
 
 def _receipt(output):
@@ -186,35 +202,35 @@ def main():
         new_oid=h.git("rev-parse","HEAD",cwd=h.work).stdout.decode().strip()
         h.git("push","origin","HEAD:refs/heads/feature",cwd=h.work,token=h.alice)
         def psql_until(sql, deadline):
-            env=h.env.copy()
-            env["PGDATABASE"]=h.db
             budget=_statement_timeout_ms(deadline)
             if budget<=0:
-                return None,"","deadline exhausted",True
-            env["PGOPTIONS"]=(env.get("PGOPTIONS","").strip()+
-                f" -c statement_timeout={budget} -c lock_timeout={budget}").strip()
+                return None,"",True
+            try:
+                scoped_db=_scoped_dsn(h.db,budget)
+            except ValueError:
+                return None,"",False
+            env=h.env.copy()
+            env["PGDATABASE"]=scoped_db
             argv=["psql","-w","--dbname",env["PGDATABASE"],"-X","-v",
                   "ON_ERROR_STOP=1","-At","-c",sql]
             remaining=_remaining_seconds(deadline)
             if remaining<=0:
-                return None,"","deadline exhausted",True
+                return None,"",True
             try:
-                p=subprocess.run(argv,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                p=subprocess.run(argv,env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
                                  text=True,timeout=remaining)
             except subprocess.TimeoutExpired:
-                return None,"","deadline exceeded",True
-            return p.returncode,p.stdout,p.stderr,False
-
-        def psql_error(stderr):
-            line=next((line.strip() for line in stderr.splitlines() if line.strip()),"")
-            return h.redact(line[:240])
+                return None,"",True
+            except OSError:
+                return None,"",False
+            return p.returncode,p.stdout,False
 
         def psql_value(sql, deadline):
-            returncode,stdout,stderr,timed_out=psql_until(sql,deadline)
+            returncode,stdout,timed_out=psql_until(sql,deadline)
             if timed_out:
                 raise AssertionError("pull-sync fixture: psql deadline exceeded")
             if returncode!=0:
-                raise AssertionError("pull-sync fixture: psql failed: "+psql_error(stderr))
+                raise AssertionError("pull-sync fixture: psql failed closed")
             return stdout.strip()
 
         # The producer writes the completion marker last. Wait on one snapshot
@@ -232,7 +248,7 @@ def main():
                 "AND r.pull_version=p.version AND r.head_oid=p.head_oid AND r.base_oid=p.base_oid "
                 "AND r.storage_generation=repo.storage_generation "
                 f"WHERE p.repository_id='{pr['repository_id']}' AND p.number={pr['number']} "
-                "GROUP BY p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation",
+                "GROUP BY p.repository_id,p.number,p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation",
                 deadline)
             parts=row.split("|")
             if len(parts)!=9:return "missing_pull",None
@@ -316,13 +332,11 @@ def main():
             while True:
                 if _remaining_seconds(deadline)<=0:
                     raise AssertionError("pull-sync fixture: injection preparation window exhausted")
-                returncode,stdout,stderr,timed_out=psql_until(injection_sql,deadline)
+                returncode,stdout,timed_out=psql_until(injection_sql,deadline)
                 outcome=_injection_outcome(returncode,stdout,timed_out)
                 if outcome=="applied":return
                 if outcome!="retry_lock":
-                    detail=psql_error(stderr)
-                    raise AssertionError("pull-sync fixture: injection failed closed"+
-                                         (": "+detail if detail else ""))
+                    raise AssertionError("pull-sync fixture: injection failed closed")
                 time.sleep(min(.05,max(0.0,deadline-time.monotonic())))
 
         inject_pull_sync(deadline)
@@ -341,7 +355,7 @@ def main():
                 "AND r.pull_version=p.version AND r.head_oid=p.head_oid AND r.base_oid=p.base_oid "
                 "AND r.storage_generation=repo.storage_generation "
                 f"WHERE p.repository_id='{pr['repository_id']}' AND p.number={pr['number']} "
-                "GROUP BY p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation",
+                "GROUP BY p.repository_id,p.number,p.state,p.version,p.head_oid,p.base_oid,repo.storage_generation",
                 deadline)
             parts=row.split("|")
             if len(parts)!=5:return "missing_pull"

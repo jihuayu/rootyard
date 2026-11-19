@@ -826,17 +826,25 @@ class WebhooksTrackAContractTest(unittest.TestCase):
         self.assertEqual(block.count("psql_until("), 3)
         self.assertEqual(block.count("subprocess.run("), 1)
         present('["psql","-w","--dbname",env["PGDATABASE"]')
-        present('env["PGDATABASE"]=h.db')
+        present("scoped_db=_scoped_dsn(h.db,budget)")
+        present("env[\"PGDATABASE\"]=scoped_db")
         absent("shell=True")
         absent("os.system")
+        absent("PGOPTIONS")
+        absent("psql_error")
         present("remaining=_remaining_seconds(deadline)")
         present("budget=_statement_timeout_ms(deadline)")
-        present("statement_timeout={budget} -c lock_timeout={budget}")
+        present("stderr=subprocess.DEVNULL")
         present("text=True,timeout=remaining")
+        present("psql failed closed")
+        present("injection failed closed")
         present("EXCEPTION WHEN lock_not_available THEN retry_lock := true")
         present("_injection_outcome(returncode,stdout,timed_out)")
         present("injection preparation window exhausted")
         self.assertEqual(block.count("FROM forge_pulls p JOIN repositories repo"), 2)
+        self.assertEqual(block.count(
+            "GROUP BY p.repository_id,p.number,p.state,p.version,p.head_oid,p.base_oid,"
+            "repo.storage_generation"), 2)
         self.assertEqual(block.count("DELETE FROM ci_runs"), 1)
         self.assertEqual(block.count("DELETE FROM ci_pull_sync_progress"), 1)
         present("BEGIN; ")
@@ -897,10 +905,30 @@ class WebhooksTrackAContractTest(unittest.TestCase):
         self.assertEqual(reg._injection_outcome(0, "pull-sync-receipt=lock_not_available\n"), "retry_lock")
         self.assertEqual(reg._injection_outcome(1, "pull-sync-receipt=lock_not_available\n"), "fail")
         self.assertEqual(reg._injection_outcome(0, "pull-sync-receipt=1,1,1,1,0,0\n", True), "fail")
+        self.assertEqual(reg._injection_outcome(None, "", False), "fail")
+        self.assertEqual(reg._injection_outcome(0, "", False), "fail")
         self.assertEqual(reg._injection_outcome(0, "ERROR: lock_not_available\n"), "fail")
         self.assertEqual(reg._injection_outcome(0, "pull-sync-receipt=lock_not_available extra\n"), "fail")
         self.assertEqual(reg._injection_outcome(
             0, "pull-sync-receipt=1,1,1,1,0,0\npull-sync-receipt=1,1,1,1,0,0\n"), "fail")
+        fake_dsn = ("postgresql://fixture@example.invalid/fixture_db"
+                    "?options=-csearch_path%3Dfixture_schema&sslmode=disable")
+        scoped = reg._scoped_dsn(fake_dsn, 1234)
+        parts = urllib.parse.urlsplit(scoped)
+        query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+        self.assertEqual(parts.hostname, "example.invalid")
+        self.assertEqual(parts.path, "/fixture_db")
+        self.assertEqual(query["sslmode"], "disable")
+        self.assertIn("-csearch_path=fixture_schema", query["options"])
+        self.assertIn("-c statement_timeout=1234", query["options"])
+        self.assertIn("-c lock_timeout=1234", query["options"])
+        with self.assertRaises(ValueError):
+            reg._scoped_dsn("postgresql://fixture@example.invalid/fixture_db", 1234)
+        with self.assertRaises(ValueError):
+            reg._scoped_dsn(
+                "postgresql://fixture@example.invalid/fixture_db?options=-cstatement_timeout=1", 1234)
+        with self.assertRaises(ValueError):
+            reg._scoped_dsn(fake_dsn, 0)
 
 
 if __name__ == "__main__":
