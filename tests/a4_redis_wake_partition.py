@@ -150,12 +150,14 @@ class LinuxChildSubreaper:
             try:
                 pid, _ = os.waitpid(-1, os.WNOHANG)
             except ChildProcessError:
+                if time.monotonic() >= deadline:
+                    raise ContainmentError("child process quiescence deadline exceeded")
                 return
             except OSError:
                 raise ContainmentError("child process quiescence proof failed") from None
+            if time.monotonic() >= deadline:
+                raise ContainmentError("child process quiescence deadline exceeded")
             if pid == 0:
-                if time.monotonic() >= deadline:
-                    raise ContainmentError("child process quiescence deadline exceeded")
                 time.sleep(0.05)
 
 

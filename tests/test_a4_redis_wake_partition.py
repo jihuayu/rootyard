@@ -269,9 +269,27 @@ class ContainmentTest(unittest.TestCase):
     def test_reaped_adopted_exit_then_echild_proves_quiescence(self):
         containment = self.make()
         with patch.object(a4.os, "waitpid", side_effect=[(123, 0), ChildProcessError()]) as wait:
-            containment.prove_no_descendants()
+            with patch.object(a4.time, "monotonic", return_value=0.0):
+                containment.prove_no_descendants()
         containment.verify.assert_called_once()
         self.assertEqual(wait.call_args_list, [call(-1, a4.os.WNOHANG), call(-1, a4.os.WNOHANG)])
+
+    def test_continuous_positive_reaps_cannot_bypass_deadline(self):
+        containment = self.make(timeout=0.5)
+        with patch.object(a4.os, "waitpid", return_value=(123, 0)) as wait:
+            with patch.object(a4.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 0.4, 0.6]):
+                with patch.object(a4.time, "sleep") as sleep:
+                    with self.assertRaisesRegex(a4.ContainmentError, "deadline"):
+                        containment.prove_no_descendants()
+        self.assertEqual(wait.call_count, 4)
+        sleep.assert_not_called()
+
+    def test_echild_after_deadline_fails_closed(self):
+        containment = self.make(timeout=0.5)
+        with patch.object(a4.os, "waitpid", side_effect=ChildProcessError()):
+            with patch.object(a4.time, "monotonic", side_effect=[0.0, 0.6]):
+                with self.assertRaisesRegex(a4.ContainmentError, "deadline"):
+                    containment.prove_no_descendants()
 
     def test_reaped_leader_with_live_descendant_times_out(self):
         containment = self.make(timeout=0.5)
