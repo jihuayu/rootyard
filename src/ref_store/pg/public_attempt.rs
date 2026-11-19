@@ -1166,7 +1166,7 @@ pub(super) fn stale_realm() -> PackCommitError {
     ledger("public operation wrapper does not belong to the current repository realm")
 }
 
-fn lookup_db_error(error: tokio_postgres::Error) -> RefStoreError {
+pub(super) fn lookup_db_error(error: tokio_postgres::Error) -> RefStoreError {
     match error.code() {
         Some(code) if *code == SqlState::QUERY_CANCELED || *code == SqlState::LOCK_NOT_AVAILABLE => {
             RefStoreError::Timeout

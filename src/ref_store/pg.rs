@@ -28,6 +28,10 @@ pub(crate) mod slot_zero;
 /// Read-only migration-152 public operation/current attempt resolver.
 pub(crate) mod public_attempt;
 
+/// Read-only per-slot/per-hold discovery over both migration-152 attempts.
+#[allow(dead_code)]
+pub(crate) mod public_reclaim;
+
 /// Crate-private migration-152 slot-zero terminal mirror.
 #[allow(dead_code)]
 pub(crate) mod public_terminal;

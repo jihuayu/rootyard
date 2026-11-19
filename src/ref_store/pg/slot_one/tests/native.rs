@@ -61,6 +61,7 @@ mod serving;
 
 mod publication;
 mod readback;
+mod reclaim;
 mod retirement;
 mod rotation;
 mod setup;
