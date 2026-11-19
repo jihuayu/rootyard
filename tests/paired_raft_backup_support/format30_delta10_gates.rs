@@ -30,6 +30,8 @@ use super::format30_helpers::{
 };
 use super::mtls_cluster::LiveMtlsRaftGroup;
 
+type PreThawOutcome = Result<(u64, ExitStatus, ExitStatus)>;
+
 const REF_COUNT: i64 = 136;
 
 fn guard_of(data_dir: &std::path::Path) -> std::path::PathBuf {
@@ -200,7 +202,7 @@ async fn gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish() -> 
         let thaw_fail_grp = LiveMtlsRaftGroup::start_three(42)?;
         let mut blocked_raft = thaw_fail_grp.connect_backend(1)?;
         let mut blocked_peers: BTreeMap<i64, MtlsLiveRaftBackend> = BTreeMap::new();
-        let pre_thaw_outcome: Arc<Mutex<Option<Result<(u64, ExitStatus, ExitStatus)>>>> = Arc::new(Mutex::new(None));
+        let pre_thaw_outcome: Arc<Mutex<Option<PreThawOutcome>>> = Arc::new(Mutex::new(None));
         let thaw_slot = pre_thaw_outcome.clone();
         let restore_env = s3.apply_env("paired-fmt30-delta10");
         let rejected = restore_and_boot_format30_with_pre_thaw_hook(
@@ -227,7 +229,8 @@ async fn gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish() -> 
         .await;
         drop(restore_env);
         let pre_thaw_hook_ran = pre_thaw_outcome.lock().unwrap().take();
-        let (pre_applied, _st2, _st3) = pre_thaw_hook_ran.ok_or_else(|| anyhow!("pre-thaw hook must have run"))??;
+        let (pre_applied, st2, st3) = pre_thaw_hook_ran.ok_or_else(|| anyhow!("pre-thaw hook must have run"))??;
+        ensure!(!st2.success() && !st3.success(), "hard-killed voters must exit non-zero (v2={st2}, v3={st3})");
         ensure!(
             matches!(&rejected, Err(PairedBackupError::BootThawRefused(_))),
             "expected BootThawRefused when quorum dies before thaw, got {rejected:?}"
