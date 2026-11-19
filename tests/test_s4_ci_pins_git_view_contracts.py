@@ -259,6 +259,18 @@ class SourceContracts(unittest.TestCase):
             TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs",
         ):
             self.assertIn("ClusterAuthorityRestoreGuard", text(rel), rel)
+        proc = text(SRC / "namespace_service" / "s4_git_proc.rs")
+        transport = text(CI_PINS / "s4_transport.rs")
+        for body in (runner, proc):
+            self.assertNotIn("Ok(true) | Err(_)", body, "cleanup must not treat a wait error as confirmed")
+            self.assertIn("TIMEOUT_CLEANUP_BOUND", body)
+            self.assertIn("spawn_reaper_thread", body)
+            self.assertNotIn("kill_group_child", body)
+        for body in (runner, transport):
+            self.assertIn("finish(deadline)", body)
+        hold = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")
+        self.assertIn("SET incarnation=$1, rotated_at=$2", hold)
+        self.assertIn("GateEpochRestoreGuard", hold)
 
     def test_hold_regressions_cover_the_two_review_items(self) -> None:
         body = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")

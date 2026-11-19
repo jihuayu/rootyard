@@ -2,6 +2,12 @@ use super::*;
 use std::path::PathBuf;
 
 const SCRIPT: &str = r#"sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > "$1"; trap "" TERM; while :; do sleep 1; done"#;
+#[cfg(unix)]
+const FINAL_SCRIPT: &str = r#"exec >/dev/null
+sh -c 'trap "" TERM; while :; do sleep 1; done' &
+echo $$ $! > "$1"
+trap "" TERM
+while :; do sleep 1; done"#;
 
 fn try_pids(path: &FsPath) -> Option<(i32, i32)> {
     let text = std::fs::read_to_string(path).ok()?;
@@ -22,6 +28,13 @@ async fn wait_pids(path: &FsPath) -> (i32, i32) {
 fn command(pidfile: &FsPath) -> Command {
     let mut cmd = base_command(FsPath::new("/bin/sh"));
     cmd.args(["-c", SCRIPT, "sh", pidfile.to_str().unwrap()]);
+    cmd
+}
+
+#[cfg(unix)]
+fn final_command(pidfile: &FsPath) -> Command {
+    let mut cmd = base_command(FsPath::new("/bin/sh"));
+    cmd.args(["-c", FINAL_SCRIPT, "sh", pidfile.to_str().unwrap()]);
     cmd
 }
 
@@ -76,6 +89,55 @@ async fn cancelled_future_drop_kills_process_group_and_reaps_leader() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(!root.exists(), "the scratch directory outlived the cancelled Git command");
+    assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
+    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn closed_stdout_hang_times_out_at_final_wait_and_reaps_before_scratch_drop() {
+    let scratch = ScratchDir::create("rootyard-s4-proc-final").unwrap();
+    let root = scratch.root().to_path_buf();
+    let pidfile = root.join("final.pid");
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let error = with_scratch(
+        vec![scratch.hold()],
+        run_git_bounded(final_command(&pidfile), GitStdin::Null, 1024, deadline, Error::internal("failed")),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
+    let (leader, grandchild) = wait_pids(&pidfile).await;
+    assert!(root.exists(), "the scratch directory vanished before the final wait was confirmed");
+    assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
+    assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
+    drop(scratch);
+    assert!(!root.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn expired_timeout_cleanup_hands_scratch_to_reaper_until_group_exits() {
+    let scratch = ScratchDir::create("rootyard-s4-proc-handoff").unwrap();
+    let root = scratch.root().to_path_buf();
+    let pidfile = root.join("handoff.pid");
+    let mut guard = with_scratch(vec![scratch.hold()], async {
+        let mut cmd = command(&pidfile);
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        ReapOnDropGuard::spawn(cmd).unwrap()
+    })
+    .await;
+    let (leader, grandchild) = wait_pids(&pidfile).await;
+    drop(scratch);
+    guard.kill_and_reap_bounded(Duration::ZERO).await;
+    drop(guard);
+    for _ in 0..200 {
+        if !root.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!root.exists(), "the scratch directory outlived the timed-out reaper handoff");
     assert!(!PathBuf::from(format!("/proc/{leader}")).exists());
     assert!(!PathBuf::from(format!("/proc/{grandchild}")).exists());
 }

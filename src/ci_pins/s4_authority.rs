@@ -115,7 +115,7 @@ impl Drop for StreamSlot {
     }
 }
 
-pub(crate) use super::s4_git_runner::{ScratchHold, UploadPackGroup, run_git_dir_bounded};
+pub(crate) use super::s4_git_runner::{DisposableCiView, UploadPackGroup, run_git_dir_bounded};
 
 fn is_wide_prefix(value: &str) -> bool {
     value.get(..4).is_some_and(|p| matches!(p.to_ascii_lowercase().as_str(), "ryt_" | "ryu_" | "rys_" | "ryb_"))

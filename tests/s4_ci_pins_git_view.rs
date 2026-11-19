@@ -8,6 +8,7 @@ pub mod harness;
 mod hold_regressions;
 use anyhow::{Result, ensure};
 use harness::{Cluster, Repository};
+use hold_regressions::GateEpochRestoreGuard;
 use reqwest::StatusCode;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -124,17 +125,6 @@ async fn job_and_grant_counts(cluster: &Cluster, job: Uuid) -> Result<(i64, i64)
     Ok((row.get(0), row.get(1)))
 }
 
-async fn set_gate_epoch(pool: &deadpool_postgres::Pool, repo_id: Uuid, epoch: i64, incarnation: Uuid) -> Result<()> {
-    let mut client = pool.get().await?;
-    let tx = client.transaction().await?;
-    tx.execute("SET LOCAL session_replication_role = replica", &[]).await?;
-    for table in ["ref_store_core_gates", "ref_store_core_protocol_repos", "ref_store_serving_repositories"] {
-        let sql = format!("UPDATE {table} SET authority_epoch=$1, history_incarnation=$2 WHERE repository_id=$3");
-        tx.execute(&sql, &[&epoch, &incarnation, &repo_id]).await?;
-    }
-    tx.commit().await?;
-    Ok(())
-}
 #[tokio::test]
 #[ignore = "requires real PG17, an S3 endpoint and native Git"]
 async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()> {
@@ -313,23 +303,18 @@ async fn s4_pin_retained_clone_survives_force_push_and_revocation() -> Result<()
             return Err(anyhow::anyhow!("the epoch pack stream produced no first chunk"));
         };
         let mut epoch_received = chunk.len();
-        let gate_sql = "SELECT authority_epoch, history_incarnation FROM ref_store_core_gates WHERE repository_id=$1";
-        let row = cluster.pool.get().await?.query_one(gate_sql, &[&repo.id]).await?;
-        let (old_epoch, old_incarnation): (i64, Uuid) = (row.get(0), row.get(1));
-        let epoch_res: Result<()> = async {
-            set_gate_epoch(&cluster.pool, repo.id, old_epoch + 1, Uuid::new_v4()).await?;
-            let epoch_errored = drain_pack(&mut epoch_stream, &mut epoch_received).await;
-            ensure!(
-                epoch_errored || epoch_received < 550_000,
-                "an epoch-bumped stream delivered the complete retained pack ({epoch_received} bytes)"
-            );
-            let epoch_dead = job_status(&cluster, &repo, &big_oid, &epoch_token).await?;
-            ensure!(epoch_dead == StatusCode::UNAUTHORIZED, "an epoch-bumped credential still authorized");
-            Ok(())
-        }
-        .await;
-        set_gate_epoch(&cluster.pool, repo.id, old_epoch, old_incarnation).await?;
-        epoch_res?;
+        let gate_sql = "SELECT authority_epoch FROM ref_store_core_gates WHERE repository_id=$1";
+        let old_epoch: i64 = cluster.pool.get().await?.query_one(gate_sql, &[&repo.id]).await?.get(0);
+        let mut gate_guard =
+            GateEpochRestoreGuard::rotate(&cluster.pool, repo.id, old_epoch + 1, Uuid::new_v4()).await?;
+        let epoch_errored = drain_pack(&mut epoch_stream, &mut epoch_received).await;
+        ensure!(
+            epoch_errored || epoch_received < 550_000,
+            "an epoch-bumped stream delivered the complete retained pack ({epoch_received} bytes)"
+        );
+        let epoch_dead = job_status(&cluster, &repo, &big_oid, &epoch_token).await?;
+        ensure!(epoch_dead == StatusCode::UNAUTHORIZED, "an epoch-bumped credential still authorized");
+        gate_guard.restore(&cluster.pool).await?;
 
         // Rotating the cluster anchor must end the stream and the credential.
         let cluster_job = Uuid::new_v4();

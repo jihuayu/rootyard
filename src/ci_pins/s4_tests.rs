@@ -8,7 +8,7 @@ use super::s4_models::{
 };
 use super::s4_authority::{StreamSlot, wide_credential};
 use super::s4_transport::{guarded_chunks, refused_want};
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use std::sync::{
@@ -212,4 +212,73 @@ fn digest_and_hex_width_helpers_are_exact() {
     assert!(!is_lower_hex(&"a".repeat(63), 64));
     assert!(is_digest_hex(&"0123456789abcdef".repeat(4)));
     assert!(!is_digest_hex(&"g".repeat(64)));
+}
+
+#[cfg(unix)]
+const FINAL_SCRIPT: &str = r#"#!/bin/sh
+exec >/dev/null; sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > "$0.pids"
+trap "" TERM; while :; do sleep 1; done
+"#;
+
+#[cfg(unix)]
+fn wait_pids(path: &std::path::Path) -> (i32, i32) {
+    for _ in 0..200 {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut values = text.split_whitespace().filter_map(|value| value.parse::<i32>().ok());
+        if let (Some(leader), Some(grandchild)) = (values.next(), values.next()) {
+            return (leader, grandchild);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the Git wrapper did not publish its process group");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_git_dir_bounded_enforces_deadline_on_final_wait_after_stdout_closes() {
+    use super::s4_authority::{DisposableCiView, run_git_dir_bounded};
+    use std::os::unix::fs::PermissionsExt;
+    let view = DisposableCiView::create().expect("disposable view");
+    let root = view.path().to_path_buf();
+    let wrapper = root.join("git");
+    std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+    let failed = super::Error::internal("failed");
+    let error = run_git_dir_bounded(&wrapper, None, &[], deadline, failed, Some(view.hold()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.0, StatusCode::GATEWAY_TIMEOUT);
+    let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
+    assert!(root.exists(), "the disposable view vanished before the final wait was confirmed");
+    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists());
+    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists());
+    drop(view);
+    assert!(!root.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn expired_timeout_cleanup_hands_scratch_to_reaper_until_group_exits() {
+    use super::s4_authority::{DisposableCiView, UploadPackGroup};
+    use std::os::unix::fs::PermissionsExt;
+    let view = DisposableCiView::create().expect("disposable view");
+    let root = view.path().to_path_buf();
+    let wrapper = root.join("git");
+    std::fs::write(&wrapper, FINAL_SCRIPT).expect("write wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
+    let mut group = UploadPackGroup::spawn(&wrapper, &root, Some(view.hold())).expect("spawn");
+    let (leader, grandchild) = wait_pids(&wrapper.with_extension("pids"));
+    drop(view);
+    group.kill_and_reap_bounded(std::time::Duration::ZERO).await;
+    drop(group);
+    for _ in 0..200 {
+        if !root.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(!root.exists(), "the disposable view outlived the timed-out reaper handoff");
+    assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists());
+    assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists());
 }

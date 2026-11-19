@@ -1,19 +1,57 @@
 //! Bounded, isolated child Git processes for S4 CI transport.
 use super::*;
-use crate::git_http::{finish_group_child, group_quiescent, kill_group_child};
-use std::{path::Path as FsPath, process::{ExitStatus, Stdio}, time::Duration};
+#[cfg(unix)]
+use crate::git_http::{finish_group_child, group_quiescent};
+use std::{path::{Path as FsPath, PathBuf}, process::{ExitStatus, Stdio}, sync::Arc, time::Duration};
 use tokio::{
     io::AsyncReadExt,
     process::{Child, ChildStdin, ChildStdout, Command},
     time::Instant,
 };
 
-const GROUP_CLEANUP: Duration = Duration::from_secs(2);
-const DROP_GROUP_BUDGET: Duration = Duration::from_millis(500);
 const GIT_DIR_CAP: usize = 64 * 1024 * 1024;
+const TIMEOUT_CLEANUP_BOUND: Duration = Duration::from_secs(2);
+const LEADER_REAP_BOUND: Duration = Duration::from_millis(100);
 
 /// One refcounted scratch owner that must outlive a child process group.
 pub(crate) type ScratchHold = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+
+struct DisposableDir(PathBuf);
+
+impl Drop for DisposableDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Disposable `0o700` bare repository removed when the last hold is dropped.
+#[derive(Clone)]
+pub(crate) struct DisposableCiView {
+    dir: Arc<DisposableDir>,
+}
+
+impl DisposableCiView {
+    pub(crate) fn create() -> Result<Self, Error> {
+        let dir = std::env::temp_dir().join(format!("rootyard-s4-{}", Uuid::new_v4()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).map_err(Error::internal)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&dir).map_err(Error::internal)?;
+        Ok(Self { dir: Arc::new(DisposableDir(dir)) })
+    }
+
+    pub(crate) fn path(&self) -> &FsPath {
+        &self.dir.0
+    }
+
+    pub(crate) fn hold(&self) -> ScratchHold {
+        self.dir.clone()
+    }
+}
+
 /// One isolated `git upload-pack` (or bounded disposable-repo command) child.
 pub(crate) struct UploadPackGroup {
     child: Option<Child>,
@@ -48,8 +86,9 @@ impl UploadPackGroup {
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
-        let mut child = cmd.spawn().map_err(Error::internal)?;
+        let child = cmd.spawn().map_err(Error::internal)?;
         let pid = child.id().and_then(|id| i32::try_from(id).ok()).unwrap_or(0);
+        let guard = Self { child: Some(child), pid, scratch_hold };
         #[cfg(unix)]
         if pid > 1 {
             let until = Instant::now() + Duration::from_millis(100);
@@ -59,14 +98,12 @@ impl UploadPackGroup {
                     break;
                 }
                 if Instant::now() >= until {
-                    let _ = child.start_kill();
-                    let _ = child.try_wait();
                     return Err(Error::internal("Git process group isolation timed out"));
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        Ok(Self { child: Some(child), pid, scratch_hold })
+        Ok(guard)
     }
 
     pub(crate) fn take_pipes(&mut self) -> Result<(ChildStdin, ChildStdout), Error> {
@@ -82,123 +119,182 @@ impl UploadPackGroup {
         self.child.as_mut().and_then(|child| child.stdout.take()).ok_or_else(|| Error::internal("missing Git stdout"))
     }
 
-    pub(crate) async fn finish(&mut self) -> Result<ExitStatus, Error> {
+    pub(crate) async fn finish(&mut self, deadline: Instant) -> Result<ExitStatus, Error> {
         let Some(child) = self.child.as_mut() else {
             return Err(Error::internal("Git child already taken"));
         };
         #[cfg(unix)]
-        let outcome = finish_group_child(child).await;
+        let outcome = tokio::time::timeout_at(deadline, finish_group_child(child)).await;
         #[cfg(not(unix))]
-        let outcome = child.wait().await;
+        let outcome = tokio::time::timeout_at(deadline, child.wait()).await;
         match outcome {
-            Ok(status) => {
+            Ok(Ok(status)) => {
                 self.child = None;
                 self.pid = 0;
                 self.scratch_hold = None;
                 Ok(status)
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 self.kill_and_reap().await;
                 Err(Error::internal(error))
+            }
+            Err(_) => {
+                self.kill_and_reap().await;
+                Err(Error::timeout())
             }
         }
     }
 
     pub(crate) async fn kill_and_reap(&mut self) {
-        let pid = self.pid;
-        let Some(child) = self.child.as_mut() else { return };
+        self.kill_and_reap_bounded(TIMEOUT_CLEANUP_BOUND).await;
+    }
+
+    pub(crate) async fn kill_and_reap_bounded(&mut self, bound: Duration) {
+        let Some(child) = self.child.as_mut() else {
+            self.pid = 0;
+            self.scratch_hold = None;
+            return;
+        };
+        let pid = if child.id().is_some() { self.pid } else { 0 };
+        signal_group(child, pid);
         #[cfg(unix)]
-        if pid > 1 {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            let _ = kill_group_child(child).await;
-        }
+        let quiescent = !bound.is_zero()
+            && (pid <= 1
+                || tokio::time::timeout(bound, async {
+                    while !matches!(group_quiescent(pid), Ok(true)) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .is_ok());
         #[cfg(not(unix))]
-        {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        let quiescent = !bound.is_zero();
+        if quiescent {
+            self.pid = 0;
+            if let Some(child) = self.child.as_mut()
+                && tokio::time::timeout(LEADER_REAP_BOUND, async {
+                    while !child_gone(child) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .is_ok()
+            {
+                self.child = None;
+                self.scratch_hold = None;
+                return;
+            }
         }
-        self.child = None;
-        self.pid = 0;
-        self.scratch_hold = None;
+        if let Some(child) = self.child.take() {
+            let reap_pid = if child.id().is_some() { std::mem::replace(&mut self.pid, 0) } else { 0 };
+            self.pid = 0;
+            spawn_reaper_thread(child, reap_pid, self.scratch_hold.take());
+        } else {
+            self.pid = 0;
+            self.scratch_hold = None;
+        }
     }
 }
 impl Drop for UploadPackGroup {
     fn drop(&mut self) {
-        if self.child.is_none() {
-            self.scratch_hold = None;
-            return;
-        }
+        const DROP_INLINE_BUDGET: Duration = Duration::from_millis(100);
         let Some(mut child) = self.child.take() else {
+            self.pid = 0;
             self.scratch_hold = None;
             return;
         };
-        let pid = std::mem::replace(&mut self.pid, 0);
+        let pid = if child.id().is_some() { std::mem::replace(&mut self.pid, 0) } else { 0 };
+        self.pid = 0;
+        signal_group(&mut child, pid);
         #[cfg(unix)]
-        if pid > 1 {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
-        let _ = child.start_kill();
-        let mut reaped = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
-        #[cfg(unix)]
-        {
-            let started = std::time::Instant::now();
-            while started.elapsed() < DROP_GROUP_BUDGET {
-                if !reaped {
-                    reaped = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
-                }
-                let quiet = pid <= 1 || matches!(group_quiescent(pid), Ok(true) | Err(_));
-                if reaped && quiet {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        }
-        let reaped = reaped || matches!(child.try_wait(), Ok(Some(_)) | Err(_));
-        #[cfg(unix)]
-        let quiet = pid <= 1 || matches!(group_quiescent(pid), Ok(true) | Err(_));
+        let quiescent = pid <= 1 || wait_until(DROP_INLINE_BUDGET, || matches!(group_quiescent(pid), Ok(true)));
         #[cfg(not(unix))]
-        let quiet = true;
-        if reaped && quiet {
+        let quiescent = true;
+        if quiescent && wait_until(Duration::from_millis(50), || child_gone(&mut child)) {
             self.scratch_hold = None;
             return;
         }
-        let hold = self.scratch_hold.take();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                #[cfg(unix)]
-                if pid > 1 {
-                    let until = Instant::now() + GROUP_CLEANUP;
-                    while Instant::now() < until && matches!(group_quiescent(pid), Ok(false)) {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                }
-                let _ = tokio::time::timeout(GROUP_CLEANUP, child.wait()).await;
-                drop(hold);
-            });
-        } else {
-            std::thread::spawn(move || {
-                let started = std::time::Instant::now();
-                while started.elapsed() < GROUP_CLEANUP {
-                    let done = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
-                    #[cfg(unix)]
-                    let quiet = pid <= 1 || matches!(group_quiescent(pid), Ok(true) | Err(_));
-                    #[cfg(not(unix))]
-                    let quiet = true;
-                    if done && quiet {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                drop(hold);
-            });
+        spawn_reaper_thread(child, if quiescent { 0 } else { pid }, self.scratch_hold.take());
+    }
+}
+
+fn signal_group(child: &mut Child, pid: i32) {
+    #[cfg(unix)]
+    if pid > 1 {
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        return;
+    }
+    let _ = child.start_kill();
+}
+
+fn spawn_reaper_thread(child: Child, pid: i32, hold: Option<ScratchHold>) {
+    let mut fallback = FallbackReap { state: Some((child, pid, hold)) };
+    let spawned = std::thread::Builder::new().name("s4-git-reap".into()).spawn(move || {
+        if let Some((child, pid, hold)) = fallback.state.take() {
+            reap_until_confirmed(child, pid, hold);
+        }
+    });
+    drop(spawned);
+}
+
+struct FallbackReap {
+    state: Option<(Child, i32, Option<ScratchHold>)>,
+}
+
+impl Drop for FallbackReap {
+    fn drop(&mut self) {
+        if let Some((child, pid, hold)) = self.state.take() {
+            reap_until_confirmed(child, pid, hold);
         }
     }
 }
+
+fn wait_until(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if done() {
+            return true;
+        }
+        if started.elapsed() >= budget {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn child_gone(child: &mut Child) -> bool {
+    match child.try_wait() {
+        Ok(Some(_)) => true,
+        #[cfg(unix)]
+        Err(err) => err.raw_os_error() == Some(libc::ECHILD),
+        #[cfg(not(unix))]
+        Err(_) => true,
+        Ok(None) => false,
+    }
+}
+
+fn reap_until_confirmed(mut child: Child, pid: i32, hold: Option<ScratchHold>) {
+    #[cfg(unix)]
+    if pid > 1 {
+        let started = std::time::Instant::now();
+        let mut reported = false;
+        while !matches!(group_quiescent(pid), Ok(true)) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            if !reported && started.elapsed() > Duration::from_secs(5) {
+                eprintln!("rootyard: cancelled Git process group cleanup blocked; retaining scratch hold");
+                reported = true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    while !child_gone(&mut child) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(hold);
+}
+
 pub(crate) async fn run_git_dir_bounded(
     git_bin: &FsPath,
     dir: Option<&FsPath>,
@@ -231,7 +327,7 @@ pub(crate) async fn run_git_dir_bounded(
         guard.kill_and_reap().await;
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "Git output exceeds limit"));
     }
-    let status = guard.finish().await?;
+    let status = guard.finish(deadline).await?;
     if !status.success() {
         return Err(fail_error);
     }

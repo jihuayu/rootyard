@@ -6,7 +6,7 @@ use reqwest::StatusCode;
 use std::{
     path::{Path as FsPath, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
@@ -309,45 +309,37 @@ pub async fn bounded_child_lifecycle() -> Result<()> {
     cluster.finish(outcome).await
 }
 
-async fn cluster_incarnation(pool: &deadpool_postgres::Pool) -> Result<Uuid> {
-    let row = pool
-        .get()
-        .await?
-        .query_one("SELECT incarnation FROM public.cluster_authority WHERE singleton=true", &[])
-        .await?;
-    Ok(row.get(0))
+async fn cluster_authority_state(pool: &deadpool_postgres::Pool) -> Result<(Uuid, SystemTime)> {
+    let sql = "SELECT incarnation, rotated_at FROM public.cluster_authority WHERE singleton=true";
+    let row = pool.get().await?.query_one(sql, &[]).await?;
+    Ok((row.get(0), row.get(1)))
 }
 
-/// Restores `public.cluster_authority.incarnation` even when a test fails early.
+const AUTHORITY_ROTATE: &str = "UPDATE public.cluster_authority \
+    SET incarnation=$1, rotated_at=GREATEST(clock_timestamp(), rotated_at + interval '1 millisecond') \
+    WHERE singleton=true";
+const AUTHORITY_RESTORE: &str =
+    "UPDATE public.cluster_authority SET incarnation=$1, rotated_at=$2 WHERE singleton=true";
+
+/// Restores `public.cluster_authority` even when a test fails early.
 pub struct ClusterAuthorityRestoreGuard {
     db_url: String,
     original_incarnation: Uuid,
+    original_rotated_at: SystemTime,
     disarmed: bool,
 }
-
 impl ClusterAuthorityRestoreGuard {
     pub async fn rotate(pool: &deadpool_postgres::Pool, next: Uuid) -> Result<Self> {
         let db_url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
-        let original_incarnation = cluster_incarnation(pool).await?;
-        let guard = Self { db_url, original_incarnation, disarmed: false };
-        let client = pool.get().await?;
-        client
-            .execute(
-                "UPDATE public.cluster_authority SET incarnation=$1, rotated_at=clock_timestamp() WHERE singleton=true",
-                &[&next],
-            )
-            .await?;
+        let (original_incarnation, original_rotated_at) = cluster_authority_state(pool).await?;
+        let guard = Self { db_url, original_incarnation, original_rotated_at, disarmed: false };
+        pool.get().await?.execute(AUTHORITY_ROTATE, &[&next]).await?;
         Ok(guard)
     }
 
     pub async fn restore(&mut self, pool: &deadpool_postgres::Pool) -> Result<()> {
         let client = pool.get().await?;
-        client
-            .execute(
-                "UPDATE public.cluster_authority SET incarnation=$1 WHERE singleton=true",
-                &[&self.original_incarnation],
-            )
-            .await?;
+        client.execute(AUTHORITY_RESTORE, &[&self.original_incarnation, &self.original_rotated_at]).await?;
         self.disarmed = true;
         Ok(())
     }
@@ -359,7 +351,8 @@ impl Drop for ClusterAuthorityRestoreGuard {
             return;
         }
         let db_url = self.db_url.clone();
-        let original = self.original_incarnation;
+        let incarnation = self.original_incarnation;
+        let rotated_at = self.original_rotated_at;
         let handle = std::thread::spawn(move || {
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
                 return;
@@ -369,9 +362,81 @@ impl Drop for ClusterAuthorityRestoreGuard {
                     return;
                 };
                 let task = tokio::spawn(connection);
-                let _ = client
-                    .execute("UPDATE public.cluster_authority SET incarnation=$1 WHERE singleton=true", &[&original])
-                    .await;
+                let _ = client.execute(AUTHORITY_RESTORE, &[&incarnation, &rotated_at]).await;
+                drop(client);
+                let _ = task.await;
+            });
+        });
+        let _ = handle.join();
+    }
+}
+
+const GATE_UPDATE: &str = "WITH g AS (UPDATE ref_store_core_gates SET authority_epoch=$1, \
+     history_incarnation=$2 WHERE repository_id=$3), p AS (UPDATE ref_store_core_protocol_repos \
+     SET authority_epoch=$1, history_incarnation=$2 WHERE repository_id=$3), s AS (UPDATE \
+     ref_store_serving_repositories SET authority_epoch=$1, history_incarnation=$2 \
+     WHERE repository_id=$3) SELECT 1";
+const GATE_STATE: &str = "SELECT current_schema(), authority_epoch, history_incarnation \
+     FROM ref_store_core_gates WHERE repository_id=$1";
+
+async fn apply_gate_epoch(pool: &deadpool_postgres::Pool, repo_id: Uuid, epoch: i64, incarnation: Uuid) -> Result<()> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    tx.execute("SET LOCAL session_replication_role = replica", &[]).await?;
+    tx.execute(GATE_UPDATE, &[&epoch, &incarnation, &repo_id]).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Restores the gate epoch/history triple even when a test fails early.
+pub struct GateEpochRestoreGuard {
+    db_url: String,
+    schema: String,
+    repo_id: Uuid,
+    old_epoch: i64,
+    old_incarnation: Uuid,
+    disarmed: bool,
+}
+impl GateEpochRestoreGuard {
+    pub async fn rotate(pool: &deadpool_postgres::Pool, repo_id: Uuid, epoch: i64, incarnation: Uuid) -> Result<Self> {
+        let db_url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
+        let row = pool.get().await?.query_one(GATE_STATE, &[&repo_id]).await?;
+        let (schema, old_epoch, old_incarnation): (String, i64, Uuid) = (row.get(0), row.get(1), row.get(2));
+        let guard = Self { db_url, schema, repo_id, old_epoch, old_incarnation, disarmed: false };
+        apply_gate_epoch(pool, repo_id, epoch, incarnation).await?;
+        Ok(guard)
+    }
+
+    pub async fn restore(&mut self, pool: &deadpool_postgres::Pool) -> Result<()> {
+        apply_gate_epoch(pool, self.repo_id, self.old_epoch, self.old_incarnation).await?;
+        self.disarmed = true;
+        Ok(())
+    }
+}
+impl Drop for GateEpochRestoreGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        let db_url = self.db_url.clone();
+        let schema = self.schema.clone();
+        let setup = format!("SET LOCAL search_path TO {schema}; SET LOCAL session_replication_role = replica");
+        let (repo_id, old_epoch, old_incarnation) = (self.repo_id, self.old_epoch, self.old_incarnation);
+        let handle = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok((mut client, conn)) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls).await else {
+                    return;
+                };
+                let task = tokio::spawn(conn);
+                let Ok(tx) = client.transaction().await else {
+                    return;
+                };
+                let _ = tx.batch_execute(&setup).await;
+                let _ = tx.execute(GATE_UPDATE, &[&old_epoch, &old_incarnation, &repo_id]).await;
+                let _ = tx.commit().await;
                 drop(client);
                 let _ = task.await;
             });
@@ -382,32 +447,35 @@ impl Drop for ClusterAuthorityRestoreGuard {
 
 pub async fn cluster_authority_restores_on_failure_and_panic() -> Result<()> {
     let cluster = Cluster::setup().await?;
-    let baseline = cluster_incarnation(&cluster.pool).await?;
-    let rotated_err = Uuid::new_v4();
+    let baseline = cluster_authority_state(&cluster.pool).await?;
+    let rotated = Uuid::new_v4();
+    let mut guard = ClusterAuthorityRestoreGuard::rotate(&cluster.pool, rotated).await?;
+    let during = cluster_authority_state(&cluster.pool).await?;
+    ensure!(during.0 == rotated && during.1 != baseline.1, "rotation did not mutate both authority columns");
+    guard.restore(&cluster.pool).await?;
+    let restored = cluster_authority_state(&cluster.pool).await?;
+    ensure!(restored.0 == baseline.0 && restored.1 == baseline.1, "explicit restore lost authority state");
     let failed: Result<()> = async {
-        let _guard = ClusterAuthorityRestoreGuard::rotate(&cluster.pool, rotated_err).await?;
-        ensure!(
-            cluster_incarnation(&cluster.pool).await? == rotated_err,
-            "the cluster authority rotation was not applied"
-        );
+        let fail_inc = Uuid::new_v4();
+        let _guard = ClusterAuthorityRestoreGuard::rotate(&cluster.pool, fail_inc).await?;
+        let mutated = cluster_authority_state(&cluster.pool).await?;
+        ensure!(mutated.0 == fail_inc && mutated.1 != baseline.1, "error path did not mutate both columns");
         Err(anyhow::anyhow!("simulated failure before explicit restore"))
     }
     .await;
     ensure!(failed.is_err(), "the simulated failure returned Ok");
-    ensure!(
-        cluster_incarnation(&cluster.pool).await? == baseline,
-        "the cluster authority was not restored after the simulated failure"
-    );
-    let rotated_panic = Uuid::new_v4();
+    let after_err = cluster_authority_state(&cluster.pool).await?;
+    ensure!(after_err.0 == baseline.0 && after_err.1 == baseline.1, "error path failed to restore both columns");
     let panicked = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
-        let _guard = ClusterAuthorityRestoreGuard::rotate(&cluster.pool, rotated_panic).await.expect("rotate");
+        let panic_inc = Uuid::new_v4();
+        let _guard = ClusterAuthorityRestoreGuard::rotate(&cluster.pool, panic_inc).await.expect("rotate");
+        let mutated = cluster_authority_state(&cluster.pool).await.expect("state");
+        assert!(mutated.0 == panic_inc && mutated.1 != baseline.1, "panic path did not mutate both columns");
         panic!("simulated panic before explicit restore");
     }))
     .await;
     ensure!(panicked.is_err(), "the simulated panic did not unwind");
-    ensure!(
-        cluster_incarnation(&cluster.pool).await? == baseline,
-        "the cluster authority was not restored after the simulated panic"
-    );
+    let after_panic = cluster_authority_state(&cluster.pool).await?;
+    ensure!(after_panic.0 == baseline.0 && after_panic.1 == baseline.1, "panic path failed to restore both columns");
     cluster.finish(Ok(())).await
 }
