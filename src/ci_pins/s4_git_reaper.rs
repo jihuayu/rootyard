@@ -261,11 +261,15 @@ async fn run_unresolved_owner_task(registry: Arc<UnresolvedRegistry>, policy: Ow
             continue;
         }
         registry.sweep_retained_once(policy.signal_on_sweep);
-        let mut state = registry.state.lock().unwrap_or_else(|e| e.into_inner());
-        let done = state.queue.is_empty() && state.retained.is_empty();
-        state.active_task &= !done;
-        drop(state);
-        guard.armed = !done;
+        let done = {
+            let mut state = registry.state.lock().unwrap_or_else(|e| e.into_inner());
+            let empty = state.queue.is_empty() && state.retained.is_empty();
+            if empty {
+                state.active_task = false;
+                guard.armed = false;
+            }
+            empty
+        };
         if done {
             return;
         }
