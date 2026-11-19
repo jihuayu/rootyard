@@ -8,6 +8,8 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'migrations/**'
+      - 'src/db.rs'
+      - 'src/events.rs'
       - 'src/backup.rs'
       - 'src/backup/**'
       - 'src/blob_store.rs'

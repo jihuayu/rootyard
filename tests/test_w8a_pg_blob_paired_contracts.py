@@ -20,10 +20,12 @@ LIMITS = {
     "src/backup/w8a_paired/deleter_fence.rs": 220,
     "src/backup/w8a_paired/tests.rs": 380,
     "src/bin/rootyard-w8a-backup.rs": 95,
+    "src/db.rs": 440,
+    "src/events.rs": 470,
     "tests/w8a_pg_blob_paired_restore.rs": 460,
     "tests/w8a_pg_blob_support/s3.rs": 330,
     "tests/w8a_pg_blob_support/seed.rs": 420,
-    "tests/w8a_pg_blob_support/lifecycle_guards.rs": 220,
+    "tests/w8a_pg_blob_support/lifecycle_guards.rs": 320,
     "tests/test_w8a_pg_blob_paired_contracts.py": 260,
     "docs/w8a-pg-blob-paired-restore.md": 300,
     ".github/workflows/w8a-pg-blob-restore.yml": 150,
@@ -122,6 +124,11 @@ class W8aPgBlobPairedContractsTest(unittest.TestCase):
             self.assertIn(token, authority, f"authority.rs missing {token}")
         self.assertIn("pull_remote_merge_attempts", authority)
 
+        runtime = files["src/db.rs"]
+        self.assertIn("prepare_runtime_schema", runtime, "db.rs lost the runtime schema entry point")
+        self.assertIn("ensure_database_available", runtime, "db.rs does not enforce the database restore marker")
+        self.assertIn("ref_store_serving_repositories", files["src/events.rs"])
+
         integration = files["tests/w8a_pg_blob_paired_restore.rs"]
         for token in [
             '"sha1"', '"sha256"', "KeyReferenceMismatch", "MixedPointInTime",
@@ -138,6 +145,8 @@ class W8aPgBlobPairedContractsTest(unittest.TestCase):
             "GitObjectFormat::Sha1", "GitObjectFormat::Sha256",
         ]:
             self.assertIn(token, seed, f"seed missing {token}")
+        self.assertIn("w8a_paired_seed", seed, "seed no longer publishes a human push-receipt event")
+        self.assertNotIn("observed_immutable_ci_root", seed, "seed still forges CI maintenance evidence")
         for token in ["LoopbackS3", "IF_NONE_MATCH", "RANGE", "Method::PUT", "Method::HEAD", "Method::GET", "Method::DELETE"]:
             self.assertIn(token, s3, f"s3 support missing {token}")
 
@@ -176,6 +185,8 @@ class W8aPgBlobPairedContractsTest(unittest.TestCase):
         self.assertIn("permissions:", workflow)
         self.assertIn("contents: read", workflow)
         for token in ["'src/backup/**'", "'src/blob_store/**'"]:
+            self.assertIn(token, workflow, f"workflow paths missing {token}")
+        for token in ["'src/db.rs'", "'src/events.rs'"]:
             self.assertIn(token, workflow, f"workflow paths missing {token}")
 
 

@@ -337,12 +337,29 @@ pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
         )
         .await?
         .get(0);
+    // A repository with a durable `pg_refstore` serving binding is the single
+    // ref authority: keep its outbox/audit trail, but never mirror it into the
+    // legacy rebuildable projection (migration 145 refuses that second write).
+    let pg_refstore_served: bool = if tx
+        .query_one("SELECT to_regclass(format('%I.ref_store_serving_repositories', current_schema())) IS NOT NULL", &[])
+        .await?
+        .get(0)
+    {
+        tx.query_one(
+            "SELECT EXISTS (SELECT 1 FROM ref_store_serving_repositories WHERE repository_id=$1)",
+            &[&repository_id],
+        )
+        .await?
+        .get(0)
+    } else {
+        false
+    };
     match claim.consumer.as_str() {
         "audit-log" => {
             tx.execute("INSERT INTO audit_events(event_id) VALUES($1) ON CONFLICT DO NOTHING", &[&claim.event_id])
                 .await?;
         }
-        "ref-index" if !superseded && !ci_maintenance => {
+        "ref-index" if !superseded && !ci_maintenance && !pg_refstore_served => {
             tx.execute("INSERT INTO repository_ref_projection(repository_id,ref_name,oid,deleted,storage_generation,operation_sequence,transaction_sequence,event_id) SELECT repository_id,ref_name,CASE WHEN new_oid ~ '^0+$' THEN NULL ELSE new_oid END,new_oid ~ '^0+$',storage_generation,operation_sequence,transaction_sequence,event_id FROM outbox_events WHERE event_id=$1 ON CONFLICT(repository_id,ref_name) DO UPDATE SET oid=EXCLUDED.oid,deleted=EXCLUDED.deleted,storage_generation=EXCLUDED.storage_generation,operation_sequence=EXCLUDED.operation_sequence,transaction_sequence=EXCLUDED.transaction_sequence,event_id=EXCLUDED.event_id,source_kind='push_receipt',resolution_id=NULL,updated_at=clock_timestamp() WHERE (repository_ref_projection.storage_generation,repository_ref_projection.operation_sequence,repository_ref_projection.transaction_sequence)<(EXCLUDED.storage_generation,EXCLUDED.operation_sequence,EXCLUDED.transaction_sequence)", &[&claim.event_id]).await?;
         }
         "ref-index" => {}

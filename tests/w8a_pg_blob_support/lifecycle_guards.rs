@@ -2,10 +2,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail, ensure};
+use deadpool_postgres::Pool;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use rootyard::backup::w8a_paired::{W8aCreateReceipt, W8aError, W8aPairedSidecarManifest, check, restore};
+use rootyard::events::{self, OperationRecord, RefEventInput};
 
 use crate::s3::{EnvGuard, LoopbackS3};
 use crate::seed;
@@ -72,6 +75,113 @@ fn tampered_epoch_archive(archive: &Path, target: &Path) -> Result<PathBuf> {
     Ok(target.to_path_buf())
 }
 
+async fn assert_runtime_startup_refused_with_other_data_dir(
+    env: &mut EnvGuard,
+    url: &str,
+    other_data_dir: &Path,
+) -> Result<()> {
+    ensure!(
+        rootyard::backup::ensure_not_restoring(other_data_dir).is_ok(),
+        "separate data_dir unexpectedly had a local guard"
+    );
+    let pool = seed::pool_for(url)?;
+    env.set_opt("ROOTYARD_SCHEMA_MODE", None);
+    ensure!(
+        rootyard::db::prepare_runtime_schema(&pool).await.is_err(),
+        "auto prepare_runtime_schema succeeded against fenced/restoring DB"
+    );
+    env.set_opt("ROOTYARD_SCHEMA_MODE", Some("external"));
+    ensure!(
+        rootyard::db::prepare_runtime_schema(&pool).await.is_err(),
+        "external prepare_runtime_schema succeeded against fenced/restoring DB"
+    );
+    env.set_opt("ROOTYARD_SCHEMA_MODE", None);
+    Ok(())
+}
+
+/// A cleanly restored database must start in both schema modes and must keep
+/// `pg_refstore` as the single ref authority while legacy `gitfs` projection
+/// stays a plain, rebuildable consumer effect.
+pub async fn verify_post_restore_startup_and_projection(
+    env: &mut EnvGuard,
+    pool: &Pool,
+    owner_id: Uuid,
+    token_id: Uuid,
+    actor_name: &str,
+    head_oid: &str,
+) -> Result<()> {
+    env.set_opt("ROOTYARD_SCHEMA_MODE", None);
+    ensure!(
+        rootyard::db::prepare_runtime_schema(pool).await.is_ok(),
+        "auto prepare_runtime_schema refused the cleanly restored database"
+    );
+    env.set_opt("ROOTYARD_SCHEMA_MODE", Some("external"));
+    ensure!(
+        rootyard::db::prepare_runtime_schema(pool).await.is_ok(),
+        "external prepare_runtime_schema refused the cleanly restored database"
+    );
+    env.set_opt("ROOTYARD_SCHEMA_MODE", None);
+    let client = pool.get().await?;
+    let audit: i64 = client.query_one("SELECT count(*) FROM audit_events", &[]).await?.get(0);
+    ensure!(audit == 1, "restored pg_refstore event was not audited exactly once: {audit}");
+    let applied: i64 = client
+        .query_one("SELECT count(*) FROM event_deliveries WHERE state='delivered' AND effect='applied'", &[])
+        .await?
+        .get(0);
+    ensure!(applied == 2, "restored pg_refstore event was not applied by both workers: {applied}");
+    let projection: i64 = client.query_one("SELECT count(*) FROM repository_ref_projection", &[]).await?.get(0);
+    ensure!(projection == 0, "pg_refstore outbox event wrote a competing ref projection: {projection}");
+    let gitfs_repo = Uuid::new_v4();
+    client
+        .execute(
+            "INSERT INTO repositories(id, owner_id, name, state) VALUES ($1, $2, 'w8a-gitfs-proj', 'ready')",
+            &[&gitfs_repo, &owner_id],
+        )
+        .await?;
+    drop(client);
+    let operation = OperationRecord {
+        id: Uuid::new_v4(),
+        repository_id: gitfs_repo,
+        actor_id: owner_id,
+        token_id,
+        service_principal_id: None,
+        actor_name: actor_name.to_owned(),
+        sequence: 1,
+        storage_generation: 1,
+        outcome: "recorded".into(),
+        evidence: json!({"kind": "w8a_paired_seed"}),
+        admission: None,
+    };
+    let change = RefEventInput {
+        transaction_sequence: 1,
+        ref_name: "refs/heads/main".into(),
+        old_oid: "0".repeat(40),
+        new_oid: head_oid.to_owned(),
+    };
+    events::publish(pool, &operation, &[change]).await?;
+    let lease_owner = Uuid::new_v4();
+    for consumer in ["audit-log", "ref-index"] {
+        while events::worker_once(pool, consumer, lease_owner, 10).await? > 0 {}
+    }
+    ensure!(events::pending_count(pool).await? == 0, "outbox did not drain after the legacy projection probe");
+    let client = pool.get().await?;
+    let audit: i64 = client.query_one("SELECT count(*) FROM audit_events", &[]).await?.get(0);
+    ensure!(audit == 2, "legacy gitfs outbox event was not audited: {audit}");
+    let ref_name = "refs/heads/main";
+    let row = client
+        .query_one(
+            "SELECT oid, source_kind FROM repository_ref_projection WHERE repository_id=$1 AND ref_name=$2",
+            &[&gitfs_repo, &ref_name],
+        )
+        .await?;
+    let projected = (row.get::<_, Option<String>>(0), row.get::<_, String>(1));
+    ensure!(
+        projected == (Some(head_oid.to_owned()), "push_receipt".to_owned()),
+        "legacy gitfs ref projection was not applied with push_receipt semantics: {projected:?}"
+    );
+    Ok(())
+}
+
 pub async fn run_lifecycle_guard_drills(
     env: &mut EnvGuard,
     admin: &str,
@@ -101,6 +211,7 @@ pub async fn run_lifecycle_guard_drills(
     ensure!(!config.data_dir.exists(), "failed restore published its target");
     ensure!(!compute.exists(), "failed restore kept the compute directory");
     ensure!(!has_partial_staging(temp)?, "failed restore kept a partial staging directory");
+    assert_runtime_startup_refused_with_other_data_dir(env, &url, &temp.join("other-serve-a")).await?;
     let _ = seed::drop_database(admin, &database).await;
 
     let (database, url) = fresh_database(admin).await?;
@@ -118,6 +229,7 @@ pub async fn run_lifecycle_guard_drills(
     ensure!(startup_guard(&config.data_dir).exists(), "corrupt restore cleared its startup guard");
     ensure!(!config.data_dir.exists() && !compute.exists(), "corrupt restore published or kept local state");
     ensure!(!has_partial_staging(temp)?, "corrupt restore kept a partial staging directory");
+    assert_runtime_startup_refused_with_other_data_dir(env, &url, &temp.join("other-serve-b")).await?;
     server.clear_intercepts();
     let _ = seed::drop_database(admin, &database).await;
 
@@ -157,6 +269,7 @@ pub async fn run_lifecycle_guard_drills(
     ensure!(fenced, "fresh-incarnation fence did not run before the guarded fsck");
     drop(probe);
     drop(pool);
+    assert_runtime_startup_refused_with_other_data_dir(env, &url, &temp.join("other-serve-c-live")).await?;
     drop(restoring);
     paused.release.notify_one();
     server.clear_intercepts();
@@ -165,6 +278,7 @@ pub async fn run_lifecycle_guard_drills(
     ensure!(startup_guard(&config.data_dir).exists(), "cancelled restore cleared its startup guard");
     ensure!(!config.data_dir.exists() && !compute.exists(), "cancelled restore published or kept local state");
     ensure!(!has_partial_staging(temp)?, "cancelled restore kept a partial staging directory");
+    assert_runtime_startup_refused_with_other_data_dir(env, &url, &temp.join("other-serve-c-cancelled")).await?;
     let _ = seed::drop_database(admin, &database).await;
     Ok(())
 }

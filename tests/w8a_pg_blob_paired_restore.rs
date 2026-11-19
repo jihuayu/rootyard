@@ -381,6 +381,15 @@ async fn paired_pg_blob_fresh_incarnation_is_blank_of_source_authority() -> Resu
         }
     }
     ensure!(rootyard::events::pending_count(&destination_pool).await? == 0, "outbox did not drain after restore");
+    lifecycle_guards::verify_post_restore_startup_and_projection(
+        &mut env,
+        &destination_pool,
+        seeded.owner.identity.id,
+        seeded.owner.identity.token_id,
+        &seeded.owner.identity.username,
+        &seeded.repos[0].head_oid,
+    )
+    .await?;
 
     let policy = Policy::from_env()?;
     let mut fence_client = rootyard::db::connect_url(&destination_url).await?;
