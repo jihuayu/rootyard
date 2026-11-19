@@ -118,17 +118,6 @@ const FAILURE_PHASE_MARKER: &str = "ROOTYARD_TEST_174_CASE18_FAILURE_PHASE_MARKE
 /// A parsed `report-status`: the `unpack` status and `(ref, ng reason)` rows.
 type GitReport = (String, Vec<(String, Option<String>)>);
 
-/// Abort the real `axum::serve` task when the case ends, including on failure.
-struct ServerGuard {
-    task: JoinHandle<Result<(), std::io::Error>>,
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 #[derive(Default)]
 struct WitnessResources {
     pause: Option<Arc<AdmissionPause>>,
@@ -290,19 +279,41 @@ fn require_per_run_blob_prefix() -> Result<()> {
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and Git"]
 async fn pre_admission_revision_mismatch_rebases_to_old_oid_mismatch() -> Result<()> {
     let mut phase = "fixture_setup";
-    let result = async {
-        require_owned_disposable_blob_fixture()?;
-        let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
-        let db = Db::setup().await?;
-        require_per_run_blob_prefix()?;
-        let outcome = case(&db, &mut phase).await;
+    require_owned_disposable_blob_fixture()?;
+    let _serial = super::NATIVE_ACCEPTANCE_SERIAL.lock().await;
+    prepare()?;
+    require_per_run_blob_prefix()?;
+    let db = Db::setup().await?;
+    let mut resources = WitnessResources::default();
+    let outcome = AssertUnwindSafe(async {
+        let outcome = case(&db, &mut resources, &mut phase).await;
         if outcome.is_ok() {
             phase = "fixture_cleanup";
         }
-        db.finish(outcome).await
-    }
+        outcome
+    })
+    .catch_unwind()
     .await;
+    let mut fence = Vec::new();
+    let cleanup = AssertUnwindSafe(resources.teardown(&db, &mut fence))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("pre-admission witness cleanup panicked")));
+    if let Err(error) = &cleanup {
+        let sealed = AssertUnwindSafe(resources.seal_failed_cleanup(&db)).catch_unwind().await;
+        if sealed.is_err() {
+            let _ = writeln!(io::stderr().lock(), "pre-admission witness cleanup fallback panicked");
+        }
+        if !matches!(&outcome, Ok(Ok(()))) {
+            let _ = writeln!(io::stderr().lock(), "pre-admission witness cleanup failed ({error})");
+        }
+    }
+    drop(fence);
 
+    let result = match outcome {
+        Ok(result) => result.and(cleanup),
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
     // The fixture preserves a case error over a cleanup error. Record its
     // phase only after that decision, never while the race is in flight.
     if result.is_err()
@@ -564,7 +575,7 @@ async fn post_admission_independent_refs_both_commit() -> Result<()> {
     }
 }
 
-async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
+async fn case(db: &Db, resources: &mut WitnessResources, phase: &mut &'static str) -> Result<()> {
     let store = open_store()?;
     let git: &'static Git = Box::leak(Box::new(Git::new()?));
     let owner = actor::owner(&db.pool).await?;
@@ -575,9 +586,9 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
     ensure!(winner_operation != loser_operation, "the race pins shared an operation id");
 
     // The rendezvous is keyed by the operation UUID and can fire only once.
-    let pause = Arc::new(AdmissionPause::new(loser_operation));
+    let pause = resources.pause.insert(Arc::new(AdmissionPause::new(loser_operation))).clone();
     let captures = Captures::default();
-    let scratch = tempfile::tempdir().context("temporary gateway scratch root")?;
+    let scratch = resources.scratch.insert(tempfile::tempdir().context("temporary gateway scratch root")?);
     let state = Arc::new(
         BlobGitState::new(BlobGitConfig {
             pool: db.pool.clone(),
@@ -597,7 +608,15 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let app = capture_receive_responses(router(state.clone()), captures.clone());
-    let _server = ServerGuard { task: tokio::spawn(async move { axum::serve(listener, app).await }) };
+    let (shutdown, signal) = oneshot::channel();
+    resources.shutdown = Some(shutdown);
+    resources.server = Some(tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = signal.await;
+            })
+            .await
+    }));
 
     *phase = "repository_seed";
     let created = create_repository(address, &owner, &name).await?;
@@ -606,7 +625,7 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
 
     // Seed one real main tip, then clone twice so both stock clients advertise
     // exactly the same old OID.
-    let work = tempfile::tempdir().context("temporary Git work root")?;
+    let work = resources.work.insert(tempfile::tempdir().context("temporary Git work root")?);
     let direct_url = clone_url(address, &owner, &name);
     let seeded = git.clone(work.path(), &direct_url, "seed").await?;
     ensure!(seeded.success, "real Smart HTTP clone of the empty repository failed");
@@ -630,10 +649,21 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
     // publish baseline capture have completed. It is then held before its
     // admission transaction while the winner commits.
     *phase = "pre_admission_barrier";
-    let mut loser_push = spawn_push(git, second_dir, direct_url.clone(), loser_operation);
-    tokio::select! {
-        _ = pause.wait_reached() => {}
-        exited = &mut loser_push => {
+    resources.second_push = Some(spawn_push(git, second_dir, direct_url.clone(), loser_operation));
+    {
+        let selected: Option<std::result::Result<Result<git::Output>, tokio::task::JoinError>> = {
+            let loser_handle =
+                resources.second_push.as_mut().ok_or_else(|| anyhow!("the losing stock push task was not created"))?;
+            tokio::select! {
+                _ = pause.wait_reached() => None,
+                exited = loser_handle => Some(exited),
+            }
+        };
+        if let Some(exited) = selected {
+            // The select consumed this JoinHandle's output. Remove the
+            // completed handle without polling it again, then preserve the
+            // original completion result.
+            let _consumed = resources.second_push.take();
             let output = exited.context("the losing stock push task failed")??;
             return Err(anyhow!(
                 "the losing stock push exited before its post-capture rendezvous: {}",
@@ -648,13 +678,25 @@ async fn case(db: &Db, phase: &mut &'static str) -> Result<()> {
     ensure!(gate_revision(db, repository_id).await? == revision_before, "the gate moved before the winner started");
 
     *phase = "winner_publish";
-    let winner_output = spawn_push(git, first_dir, direct_url, winner_operation).await?;
-    let winner_output = winner_output.context("the winning stock push task failed")?;
+    resources.first_push = Some(spawn_push(git, first_dir, direct_url, winner_operation));
+    let winner_join = {
+        let winner_handle =
+            resources.first_push.as_mut().ok_or_else(|| anyhow!("the winning stock push task was not created"))?;
+        winner_handle.await
+    };
+    resources.first_push = None;
+    let winner_output = winner_join.context("the winning stock push task failed")??;
     ensure!(winner_output.success, "the winning stock push failed: {}", redacted(&winner_output));
 
     *phase = "loser_rebase_await";
     pause.release();
-    let loser_output = loser_push.await.context("the losing stock push task failed")??;
+    let loser_join = {
+        let loser_handle =
+            resources.second_push.as_mut().ok_or_else(|| anyhow!("the paused stock push task was lost"))?;
+        loser_handle.await
+    };
+    resources.second_push = None;
+    let loser_output = loser_join.context("the losing stock push task failed")??;
     *phase = "loser_rebase_exit_status";
     ensure!(!loser_output.success, "the paused loser unexpectedly succeeded");
     *phase = "loser_rebase_forbidden_text";

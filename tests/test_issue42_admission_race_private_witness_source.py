@@ -88,5 +88,54 @@ class AdmissionRacePrivateWitnessSourceTest(unittest.TestCase):
             self.assertIn(marker, self.source)
 
 
+    def test_case18_uses_owned_cleanup_shell_before_schema_teardown(self):
+        entry = slice_between(
+            self.source,
+            "async fn pre_admission_revision_mismatch_rebases_to_old_oid_mismatch()",
+            "async fn post_admission_independent_refs_both_commit()",
+        )
+        self.assertLess(entry.index("prepare()?;"), entry.index("Db::setup().await?"))
+        self.assertLess(
+            entry.index("require_per_run_blob_prefix()?;"), entry.index("Db::setup().await?")
+        )
+        self.assertLess(entry.index("require_owned_disposable_blob_fixture()?;"), entry.index("Db::setup().await?"))
+        self.assertIn("let mut resources = WitnessResources::default();", entry)
+        self.assertLess(entry.index("Db::setup().await?"), entry.index("let mut resources = WitnessResources::default();"))
+        self.assertIn(".catch_unwind()", entry)
+        self.assertIn("resources.teardown(&db, &mut fence)", entry)
+        self.assertIn("resources.seal_failed_cleanup(&db)", entry)
+        self.assertLess(entry.index("resources.teardown(&db, &mut fence)"), entry.index("drop(fence);"))
+        self.assertIn("Err(payload) => std::panic::resume_unwind(payload)", entry)
+        self.assertNotIn("db.finish(", entry)
+
+        teardown = slice_between(
+            self.source,
+            "async fn teardown(&mut self, db: &Db, fence: &mut Vec<deadpool_postgres::Client>)",
+            "async fn seal_failed_cleanup",
+        )
+        self.assertLess(teardown.index("self.drain_pushes().await;"), teardown.index("self.drain_server("))
+        self.assertLess(teardown.index("self.drain_server("), teardown.index("db.pool.close();"))
+        self.assertLess(teardown.index("db.pool.close();"), teardown.index("db.teardown()"))
+        self.assertIn("witness pool checkout fence failed; schema retained", teardown)
+        self.assertIn("witness pool roundtrip failed; schema retained", teardown)
+        self.assertIn("witness cleanup deadline elapsed; schema retained", teardown)
+
+    def test_case18_owns_server_pause_and_push_handles(self):
+        case = slice_between(self.source, "async fn case(db: &Db, resources: &mut WitnessResources", "async fn durable_main")
+        self.assertNotIn("ServerGuard", case)
+        self.assertNotIn("let mut loser_push", case)
+        self.assertNotIn("db.finish(", case)
+        self.assertIn("resources.pause.insert(", case)
+        self.assertIn("resources.scratch.insert(", case)
+        self.assertIn("resources.work.insert(", case)
+        self.assertIn("resources.shutdown = Some(shutdown);", case)
+        self.assertIn("resources.server = Some(", case)
+        self.assertIn("resources.second_push = Some(spawn_push(", case)
+        self.assertIn("resources.first_push = Some(spawn_push(", case)
+        self.assertIn("resources.second_push.as_mut()", case)
+        self.assertIn("resources.first_push.as_mut()", case)
+        self.assertIn("pause.release();", case)
+        self.assertLess(case.index("pause.release();"), case.index("resources.second_push = None;"))
+
 if __name__ == "__main__":
     unittest.main()
