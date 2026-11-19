@@ -23,7 +23,8 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::sync::Semaphore;
+use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 use super::{
@@ -309,20 +310,29 @@ pub async fn serve_signed_packfile_stream(
                 yield Err(io::Error::other("packfile stream aborted by policy, deadline, or pin revocation"));
                 return;
             }
-            if state
-                .authorizer
-                .authorize_pack_download(
+            let authorized = timeout_at(
+                deadline,
+                state.authorizer.authorize_pack_download(
                     claims.tenant_id,
                     claims.repository_id,
                     &claims.subject,
                     &claims.pack_oid,
                     claims.pin_id,
-                )
-                .await
-                .is_err()
-            {
+                ),
+            )
+            .await;
+            if authorized.as_ref().is_ok_and(|result| result.is_err()) {
                 state.rejected_requests.fetch_add(1, Ordering::Relaxed);
                 yield Err(io::Error::new(io::ErrorKind::PermissionDenied, "live auth revoked during stream"));
+                return;
+            }
+            if authorized.is_err()
+                || !state.current_policy().enabled
+                || Instant::now() > deadline
+                || !state.leases.is_hold_still_valid(claims.pin_id)
+            {
+                state.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                yield Err(io::Error::other("packfile stream aborted by policy, deadline, or pin revocation"));
                 return;
             }
             let end = (offset + STREAM_CHUNK_BYTES).min(payload.len());
