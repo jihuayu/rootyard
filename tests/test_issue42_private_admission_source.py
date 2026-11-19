@@ -38,11 +38,36 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
         )
         self.assertIn('Ok(Ok(admission)) => admission.into_parts()', body)
         self.assertIn('Ok(Err(error)) => {', body)
-        self.assertIn('return Err(GatewayError::from(error));', body)
-        self.assertIn('Err(_) => {', body)
-        self.assertIn('return Err(GatewayError::Timeout);', body)
-        self.assertIn('rollback_deadpool_bounded(tx, deadline).await', body)
+        self.assertIn('SlotZeroFreshDisposition::Refused(GatewayError::from(error))', body)
+        self.assertIn('Err(_) => return SlotZeroFreshDisposition::Refused(GatewayError::Timeout)', body)
         self.assertNotIn('Ok(admission) => admission.into_parts()', body)
+
+        # The savepoint borrow ends inside the scope: the outer owner keeps the
+        # one finish call and moves `tx` only after all borrowed objects drop.
+        outer = slice_between(
+            self.publish,
+            'async fn begin_slot_zero_fresh(',
+            '/// One owned disposition',
+        )
+        self.assertIn('let disposition = slot_zero_fresh_scope(', outer)
+        self.assertIn('SlotZeroFreshDisposition::Refused(error)', outer)
+        self.assertIn('commit_deadpool_bounded(tx, deadline).await?;', outer)
+        self.assertIn('rollback_deadpool_bounded(tx, deadline).await?;', outer)
+        self.assertIn('let _ = rollback_deadpool_bounded(tx, deadline).await;', outer)
+        self.assertNotIn('tokio_postgres::Transaction::savepoint(', outer)
+        self.assertNotIn('admit_slot_zero_in_tx(', outer)
+
+        scope = slice_between(
+            self.publish,
+            'async fn slot_zero_fresh_scope(',
+            '/// Construct the exact typed public request',
+        )
+        self.assertIn("tx: &mut tokio_postgres::Transaction<'_>", scope)
+        self.assertIn('tokio_postgres::Transaction::savepoint(&mut *tx, GATEWAY_SLOT_ZERO_SAVEPOINT)', scope)
+        self.assertIn('PgRefStore.admit_slot_zero_in_tx(', scope)
+        self.assertIn('commit_bounded(savepoint, deadline, repository_id', scope)
+        self.assertNotIn('rollback_deadpool_bounded(', scope)
+        self.assertNotIn('commit_deadpool_bounded(', scope)
 
     def test_private_entry_does_not_use_the_legacy_public_lookup(self):
         entry = slice_between(

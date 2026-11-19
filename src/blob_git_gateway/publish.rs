@@ -604,25 +604,112 @@ async fn begin_slot_zero_fresh(
     private_id: Uuid,
     deadline: Instant,
 ) -> Result<Start, GatewayError> {
-    let repository_id = public_request.repository_id;
     let admission = slot_zero_admission_request(&public_request, private_id)?;
 
-    // Keep the authenticated deadpool transaction as the owner. The coordinator
-    // receives a tokio savepoint borrowed from that same connection, so its
-    // locks, rows and synchronous WAL setting remain inside the one outer
-    // transaction. No connection or transaction is split.
+    // Keep the authenticated deadpool transaction as the owner. The helper gets
+    // one mutable borrow of its tokio transaction and returns only owned data,
+    // so every savepoint, result and future is dropped before this function
+    // moves `tx` into the single outer COMMIT or ROLLBACK below. No connection
+    // or transaction is split.
+    let disposition = slot_zero_fresh_scope(
+        &mut tx,
+        &admission,
+        request,
+        pairs,
+        mode,
+        baseline,
+        &public_request,
+        private_id,
+        deadline,
+    )
+    .await;
+
+    match disposition {
+        SlotZeroFreshDisposition::Commit { token, plan } => {
+            // The gateway savepoint was already released inside the scope; this
+            // is the one outer durability point and the public UUID stays the
+            // stable operation header.
+            commit_deadpool_bounded(tx, deadline).await?;
+            Ok(Start::Fresh { _token: token, plan })
+        }
+        SlotZeroFreshDisposition::Replay { claim, savepoint_cleanup } => {
+            // Preserve the proven replay cleanup ordering and error precedence:
+            // resolve the claim, acknowledge the savepoint rollback, then roll
+            // back the outer owner; the claim error outranks cleanup errors.
+            let outer_cleanup = rollback_deadpool_bounded(tx, deadline).await;
+            let claim = claim?;
+            savepoint_cleanup?;
+            outer_cleanup?;
+            start_from_claim(claim)
+        }
+        SlotZeroFreshDisposition::Rebaseline => {
+            // A rebase is safe only after the whole owned transaction is
+            // acknowledged as rolled back.
+            rollback_deadpool_bounded(tx, deadline).await?;
+            Ok(Start::Rebaseline)
+        }
+        SlotZeroFreshDisposition::Refused(error) => {
+            // The savepoint (if any) was already consumed by the scope. Keep the
+            // typed answer if best-effort outer cleanup is unconfirmed, exactly
+            // like `begin_fresh`.
+            let _ = rollback_deadpool_bounded(tx, deadline).await;
+            Err(error)
+        }
+    }
+}
+
+/// One owned disposition from the savepoint-scoped half of a fresh slot-zero
+/// admission.
+///
+/// Every variant is produced only after the savepoint, its admission result and
+/// all borrowed futures have been dropped. The caller still owns the
+/// authenticated transaction and performs its one outer `COMMIT` or `ROLLBACK`.
+enum SlotZeroFreshDisposition {
+    /// The gateway savepoint was released. The outer `COMMIT` is the sole
+    /// durability point.
+    Commit { token: PackPendingToken, plan: Box<PackCommitPlan> },
+    /// An exact public replay was resolved. `claim` carries the typed lookup
+    /// result and `savepoint_cleanup` its savepoint rollback acknowledgement;
+    /// the outer owner must still roll back.
+    Replay { claim: Result<Claim, GatewayError>, savepoint_cleanup: Result<(), GatewayError> },
+    /// The captured revision was already superseded and the savepoint was
+    /// rolled back. A rebase is allowed only after the outer rollback is
+    /// acknowledged.
+    Rebaseline,
+    /// The typed answer to keep after the outer owner's best-effort rollback.
+    Refused(GatewayError),
+}
+
+/// Run the savepoint-scoped half of one fresh slot-zero admission.
+///
+/// This function borrows the authenticated transaction only through `tx`. It
+/// creates the gateway savepoint, hands it to the migration-152 coordinator,
+/// consumes every returned savepoint/rollback/future, and drops all of them
+/// before returning an owned disposition. The caller therefore remains free to
+/// move the outer owner into exactly one `COMMIT` or `ROLLBACK`.
+#[allow(clippy::too_many_arguments)]
+async fn slot_zero_fresh_scope(
+    tx: &mut tokio_postgres::Transaction<'_>,
+    admission: &SlotZeroAdmissionRequest,
+    request: &PushRequest,
+    pairs: &[Pair],
+    mode: CommitMode,
+    baseline: &PackCommitBaseline,
+    public_request: &PublicAttemptRequest,
+    private_id: Uuid,
+    deadline: Instant,
+) -> SlotZeroFreshDisposition {
+    let repository_id = public_request.repository_id;
     let savepoint =
         match timeout_at(deadline, tokio_postgres::Transaction::savepoint(&mut *tx, GATEWAY_SLOT_ZERO_SAVEPOINT)).await
         {
             Ok(Ok(savepoint)) => savepoint,
             Ok(Err(_)) => {
-                let _ = rollback_deadpool_bounded(tx, deadline).await;
-                return Err(GatewayError::Internal("slot zero admission savepoint failed"));
+                return SlotZeroFreshDisposition::Refused(GatewayError::Internal(
+                    "slot zero admission savepoint failed",
+                ));
             }
-            Err(_) => {
-                let _ = rollback_deadpool_bounded(tx, deadline).await;
-                return Err(GatewayError::Timeout);
-            }
+            Err(_) => return SlotZeroFreshDisposition::Refused(GatewayError::Timeout),
         };
 
     let mut built = None;
@@ -630,7 +717,7 @@ async fn begin_slot_zero_fresh(
         deadline,
         PgRefStore.admit_slot_zero_in_tx(
             savepoint,
-            &admission,
+            admission,
             |preview| {
                 let plan = build_slot_zero_plan(
                     request,
@@ -655,15 +742,11 @@ async fn begin_slot_zero_fresh(
         Ok(Ok(admission)) => admission.into_parts(),
         // The coordinator owns and drops the savepoint on an inner fatal or
         // uncertain error; only the outer transaction remains and is rolled
-        // back by this adapter.
+        // back by the caller.
         Ok(Err(error)) => {
-            let _ = rollback_deadpool_bounded(tx, deadline).await;
-            return Err(GatewayError::from(error));
+            return SlotZeroFreshDisposition::Refused(GatewayError::from(error));
         }
-        Err(_) => {
-            let _ = rollback_deadpool_bounded(tx, deadline).await;
-            return Err(GatewayError::Timeout);
-        }
+        Err(_) => return SlotZeroFreshDisposition::Refused(GatewayError::Timeout),
     };
 
     match admission_result {
@@ -671,22 +754,20 @@ async fn begin_slot_zero_fresh(
             // Exact public replay: no plan was built and no sequence, wrapper or
             // operation write occurred. Resolve the stored private operation
             // through the same verified public evidence, never the legacy
-            // private-id lookup, then roll back the savepoint and outer owner.
+            // private-id lookup, then roll back the savepoint. The caller rolls
+            // back the outer owner.
             let claim =
-                replay_slot_zero_claim(&savepoint, &public_request, request, public_request.wire_digest, deadline)
+                replay_slot_zero_claim(&savepoint, public_request, request, public_request.wire_digest, deadline)
                     .await;
             let savepoint_cleanup = rollback_bounded(savepoint, deadline).await;
-            let outer_cleanup = rollback_deadpool_bounded(tx, deadline).await;
-            let claim = claim?;
-            savepoint_cleanup?;
-            outer_cleanup?;
-            start_from_claim(claim)
+            SlotZeroFreshDisposition::Replay { claim, savepoint_cleanup }
         }
         Ok(receipt) => {
             let Some(plan) = built else {
                 let _ = rollback_bounded(savepoint, deadline).await;
-                let _ = rollback_deadpool_bounded(tx, deadline).await;
-                return Err(GatewayError::Internal("slot zero admission did not build its plan"));
+                return SlotZeroFreshDisposition::Refused(GatewayError::Internal(
+                    "slot zero admission did not build its plan",
+                ));
             };
             if receipt.state != OperationState::Pending
                 || receipt.public_id != public_request.public_id
@@ -697,8 +778,9 @@ async fn begin_slot_zero_fresh(
                 || receipt.plan_digest != *plan.parent_digest()
             {
                 let _ = rollback_bounded(savepoint, deadline).await;
-                let _ = rollback_deadpool_bounded(tx, deadline).await;
-                return Err(GatewayError::Internal("slot zero admission receipt differs from its plan"));
+                return SlotZeroFreshDisposition::Refused(GatewayError::Internal(
+                    "slot zero admission receipt differs from its plan",
+                ));
             }
             // The token is only the opaque plan identity the existing prepare
             // path consumes; it carries no additional authority. Mint it before
@@ -713,30 +795,20 @@ async fn begin_slot_zero_fresh(
                 Ok(token) => token,
                 Err(error) => {
                     let _ = rollback_bounded(savepoint, deadline).await;
-                    let _ = rollback_deadpool_bounded(tx, deadline).await;
-                    return Err(GatewayError::from(error));
+                    return SlotZeroFreshDisposition::Refused(GatewayError::from(error));
                 }
             };
-            // Release the gateway savepoint, then acknowledge durability on the
-            // real outer transaction. The public UUID is the stable operation
+            // Release the gateway savepoint; the caller's outer COMMIT is the
+            // only durability point. The public UUID is the stable operation
             // header; the private UUID never enters the COMMIT-unknown identity.
             match commit_bounded(savepoint, deadline, repository_id, Some(public_request.public_id)).await {
-                Ok(()) => {
-                    commit_deadpool_bounded(tx, deadline).await?;
-                    Ok(Start::Fresh { _token: token, plan: Box::new(plan) })
-                }
-                Err(error) => {
-                    let _ = rollback_deadpool_bounded(tx, deadline).await;
-                    Err(ref_error(error))
-                }
+                Ok(()) => SlotZeroFreshDisposition::Commit { token, plan: Box::new(plan) },
+                Err(error) => SlotZeroFreshDisposition::Refused(ref_error(error)),
             }
         }
         Err(error) if is_rolled_back_revision_mismatch(&error) => {
-            // A rebase is safe only after both the gateway savepoint and the
-            // whole owned transaction are acknowledged as rolled back.
             let _ = rollback_bounded(savepoint, deadline).await;
-            rollback_deadpool_bounded(tx, deadline).await?;
-            Ok(Start::Rebaseline)
+            SlotZeroFreshDisposition::Rebaseline
         }
         Err(error) => {
             // The coordinator has already rolled back and released its nested
@@ -744,8 +816,7 @@ async fn begin_slot_zero_fresh(
             // definite non-success; keep the typed answer if best-effort
             // cleanup is unconfirmed, exactly like `begin_fresh`.
             let _ = rollback_bounded(savepoint, deadline).await;
-            let _ = rollback_deadpool_bounded(tx, deadline).await;
-            Err(GatewayError::from(error))
+            SlotZeroFreshDisposition::Refused(GatewayError::from(error))
         }
     }
 }
