@@ -38,16 +38,108 @@ use super::{
     state::BlobGitState,
 };
 use crate::{
+    db::Identity,
     namespace_service::push_causal_stream::{
         DurableGatewayReceiptArgs, GatewayIncomingProofArgs, GatewayPairSummary, UploadReclaimState,
         classify_gateway_reclaim_error, materialize_durable_gateway_receipt, prove_gateway_incoming_pack_closure,
         record_gateway_staging_inflight, settle_aborted_gateway_reclaim, spool_receive_stream_shared_deadline,
         sweep_gateway_reclaim_ledger, verify_gateway_authority_closure,
     },
-    ref_store::{CommitMode, CommitRejectCode, RefCommitResult},
+    ref_store::{CommitMode, CommitRejectCode, GitObjectFormat, RefCommitResult, RequestDigest},
 };
 
 const MAX_NEW_PACKS: usize = 8;
+
+/// Producer-owned receive identity created exactly where the parsed request,
+/// commit mode and producer digest are derived from the same spooled body.
+///
+/// The type is private to this module, so only the normal receive path can
+/// create it. Its fields are moved into [`VerifiedReceive`] only after the
+/// native receive-pack stage has produced the ordered staged pair set.
+struct ReceiveInput<'a> {
+    actor: &'a Identity,
+    operation: Uuid,
+    repository_id: Uuid,
+    object_format: GitObjectFormat,
+    request: PushRequest,
+    mode: CommitMode,
+    digest: RequestDigest,
+}
+
+/// The completed receive input. Only [`ReceiveInput::complete`] can build this
+/// value, and that method is private to the producer module; sibling modules can
+/// borrow it but cannot construct an alternate request/mode/digest/pair set.
+#[allow(dead_code)] // The private slot-one handoff is not selected by this route yet.
+pub(super) struct VerifiedReceive<'a> {
+    actor: &'a Identity,
+    operation: Uuid,
+    repository_id: Uuid,
+    object_format: GitObjectFormat,
+    request: PushRequest,
+    mode: CommitMode,
+    digest: RequestDigest,
+    pairs: Vec<Pair>,
+}
+
+impl<'a> ReceiveInput<'a> {
+    /// Complete the same receive value with the pairs produced from this exact
+    /// staged native view. Consuming `self` makes a second completion or a
+    /// different pair set impossible.
+    fn complete(self, pairs: Vec<Pair>) -> VerifiedReceive<'a> {
+        VerifiedReceive {
+            actor: self.actor,
+            operation: self.operation,
+            repository_id: self.repository_id,
+            object_format: self.object_format,
+            request: self.request,
+            mode: self.mode,
+            digest: self.digest,
+            pairs,
+        }
+    }
+
+    fn request(&self) -> &PushRequest {
+        &self.request
+    }
+
+    fn digest(&self) -> RequestDigest {
+        self.digest
+    }
+}
+
+impl<'a> VerifiedReceive<'a> {
+    pub(super) fn actor(&self) -> &Identity {
+        self.actor
+    }
+
+    pub(super) fn operation_id(&self) -> Uuid {
+        self.operation
+    }
+
+    pub(super) fn repository_id(&self) -> Uuid {
+        self.repository_id
+    }
+
+    pub(super) fn object_format(&self) -> GitObjectFormat {
+        self.object_format
+    }
+
+    pub(super) fn request(&self) -> &PushRequest {
+        &self.request
+    }
+
+    pub(super) fn mode(&self) -> CommitMode {
+        self.mode
+    }
+
+    pub(super) fn digest(&self) -> RequestDigest {
+        self.digest
+    }
+
+    pub(super) fn pairs(&self) -> &[Pair] {
+        &self.pairs
+    }
+}
 
 /// Every refusal of this route is rendered with `GatewayError::git`, so the
 /// push endpoint keeps its Smart HTTP `Basic` challenge; only the success and
@@ -107,10 +199,22 @@ async fn receive_pack_authorized(
     if !prefix.starts_with(&streamed_prefix) {
         return Err(GatewayError::Internal("spooled push command prefix disagrees with streamed pkt-lines"));
     }
-    let request = protocol::parse_push(&streamed_prefix, format)?;
-    let mode = if request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset };
+    let parsed_request = protocol::parse_push(&streamed_prefix, format)?;
+    let mode = if parsed_request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset };
     let digest =
-        operation::request_digest(repository_id, operation, format, &request, mode, &request_path, deadline).await?;
+        operation::request_digest(repository_id, operation, format, &parsed_request, mode, &request_path, deadline)
+            .await?;
+    // The only production construction of the receive identity: the digest and
+    // mode were just derived from this exact parsed request and spooled body.
+    let receive = ReceiveInput {
+        actor: &identity,
+        operation,
+        repository_id,
+        object_format: format,
+        request: parsed_request,
+        mode,
+        digest,
+    };
 
     let backend_hex = state.store().backend_identity().as_hex();
     let receipt_args = |settle_reclaim: bool| DurableGatewayReceiptArgs {
@@ -124,15 +228,17 @@ async fn receive_pack_authorized(
         deadline,
     };
 
-    match operation::probe(&state, &serving, &identity, operation, &request, digest, deadline).await? {
+    match operation::probe(&state, &serving, receive.actor, operation, receive.request(), receive.digest(), deadline)
+        .await?
+    {
         Claim::Pending => return Err(GatewayError::OutcomeUnknown),
         Claim::Cancelled(reason) => {
-            return terminal_response(&request, &cancelled_results(&request, reason), operation);
+            return terminal_response(receive.request(), &cancelled_results(receive.request(), reason), operation);
         }
         Claim::Replay(terminal) => {
             materialize_durable_gateway_receipt(receipt_args(false)).await?;
-            let results = report_results(&request, &terminal)?;
-            let body = protocol::report_status(request.wants_report(), &results);
+            let results = report_results(receive.request(), &terminal)?;
+            let body = protocol::report_status(receive.request().wants_report(), &results);
             return committed_response(CommittedResponse {
                 state: &state,
                 identity: &identity,
@@ -166,7 +272,8 @@ async fn receive_pack_authorized(
         };
     let view = snapshot::build_view(&state, &refs, deadline).await?;
     let before = pack_stems(view.repo())?;
-    let target_oids: Vec<String> = request.commands.iter().filter(|c| !c.is_delete()).map(|c| c.new.clone()).collect();
+    let target_oids: Vec<String> =
+        receive.request().commands.iter().filter(|c| !c.is_delete()).map(|c| c.new.clone()).collect();
     prove_gateway_incoming_pack_closure(GatewayIncomingProofArgs {
         operation_id: operation,
         git_binary: state.git_binary(),
@@ -207,6 +314,9 @@ async fn receive_pack_authorized(
         });
         pairs.push(staged);
     }
+    // Only the normal native receive-pack stage of this same receive input can
+    // complete the producer value with these ordered staged pairs.
+    let receive = receive.complete(pairs);
     record_gateway_staging_inflight(
         state.scratch_root(),
         operation,
@@ -215,16 +325,26 @@ async fn receive_pack_authorized(
         &pair_summaries,
     )?;
 
-    let published =
-        publish::push(&state, &serving, &identity, operation, digest, &request, &pairs, mode, deadline).await;
+    let published = publish::push(
+        &state,
+        &serving,
+        receive.actor(),
+        operation,
+        receive.digest(),
+        receive.request(),
+        receive.pairs(),
+        receive.mode(),
+        deadline,
+    )
+    .await;
     match published {
         // Only the persisted (fresh or replayed) core terminal is rendered as a
         // Git report-status. Mixed/accepted-subset terminals are replayed
         // exactly as recorded.
         Ok(PushOutcome::Terminal(terminal)) => {
             materialize_durable_gateway_receipt(receipt_args(true)).await?;
-            let results = report_results(&request, &terminal)?;
-            let body = protocol::report_status(request.wants_report(), &results);
+            let results = report_results(receive.request(), &terminal)?;
+            let body = protocol::report_status(receive.request().wants_report(), &results);
             committed_response(CommittedResponse {
                 state: &state,
                 identity: &identity,
@@ -250,7 +370,7 @@ async fn receive_pack_authorized(
                 reason,
             )
             .await;
-            terminal_response(&request, &cancelled_results(&request, reason), operation)
+            terminal_response(receive.request(), &cancelled_results(receive.request(), reason), operation)
         }
         Err(error) => {
             let st = classify_gateway_reclaim_error(&error);
@@ -492,4 +612,394 @@ fn response(
             .map_err(|_| GatewayError::Internal("operation header is invalid"))?,
     );
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    use uuid::Uuid;
+
+    use crate::{
+        blob_git_gateway::{
+            protocol::{PushCommand, PushRequest},
+            publish::{Pair, slot_one::SlotOneReceive},
+        },
+        db::{Identity, Repository},
+        ref_store::{
+            CommitMode, GitObjectFormat, IssuerLane, OperationState, RequestDigest,
+            core::{
+                contract::CoreGate,
+                pack_commit::{PackCommitBaseline, PackMode},
+            },
+            pg::{
+                public_attempt::{PublicAttempt, PublicAttemptEvidence, PublicAttemptRequest},
+                public_terminal::PublicAttemptRetirement,
+                slot_zero,
+            },
+            serving::ServingRepository,
+        },
+    };
+
+    const LANE: &str = "blob-git-receive";
+
+    fn serving() -> ServingRepository {
+        let repository_id = Uuid::new_v4();
+        let tenant_id = Uuid::new_v4();
+        let gate = CoreGate::new(
+            repository_id,
+            tenant_id,
+            GitObjectFormat::Sha1,
+            Uuid::new_v4(),
+            1,
+            1,
+            crate::ref_store::RefName::new("refs/heads/main").unwrap(),
+            7,
+        )
+        .unwrap();
+        ServingRepository {
+            repository: Repository {
+                id: repository_id,
+                name: "receive-provenance".to_owned(),
+                owner: "owner".to_owned(),
+                state: "ready".to_owned(),
+                clone_path: "/git/owner/receive-provenance.git".to_owned(),
+                storage_backend: "pg_refstore".to_owned(),
+                storage_generation: 1,
+                object_format: "sha1".to_owned(),
+            },
+            gate,
+            cluster_incarnation: Uuid::new_v4(),
+        }
+    }
+
+    fn wire_request(atomic: bool) -> PushRequest {
+        let mut capabilities = vec!["report-status".to_owned()];
+        if atomic {
+            capabilities.push("atomic".to_owned());
+        }
+        PushRequest {
+            commands: vec![
+                PushCommand { old: "1".repeat(40), new: "2".repeat(40), name: "refs/heads/main".to_owned() },
+                PushCommand { old: "3".repeat(40), new: "4".repeat(40), name: "refs/heads/side".to_owned() },
+            ],
+            capabilities,
+        }
+    }
+
+    fn mode_for(request: &PushRequest) -> CommitMode {
+        if request.wants_atomic() { CommitMode::Atomic } else { CommitMode::AcceptedSubset }
+    }
+
+    fn staged_pair(name: &str, pack_digit: char, idx_digit: char) -> Pair {
+        Pair {
+            pack: PathBuf::from(format!("/staged/{name}.pack")),
+            idx: PathBuf::from(format!("/staged/{name}.idx")),
+            pack_id: Uuid::new_v4(),
+            pack_sha: pack_digit.to_string().repeat(64),
+            pack_len: 101,
+            idx_sha: idx_digit.to_string().repeat(64),
+            idx_len: 37,
+        }
+    }
+
+    fn staged_pairs() -> Vec<Pair> {
+        vec![staged_pair("first", 'a', 'b'), staged_pair("second", 'c', 'd')]
+    }
+
+    fn verified_receive<'a>(
+        actor: &'a Identity,
+        serving: &ServingRepository,
+        operation: Uuid,
+        request: PushRequest,
+        mode: CommitMode,
+        digest: RequestDigest,
+        pairs: Vec<Pair>,
+    ) -> VerifiedReceive<'a> {
+        ReceiveInput {
+            actor,
+            operation,
+            repository_id: serving.gate.repository_id(),
+            object_format: serving.gate.object_format(),
+            request,
+            mode,
+            digest,
+        }
+        .complete(pairs)
+    }
+
+    fn baseline(serving: &ServingRepository) -> PackCommitBaseline {
+        PackCommitBaseline::new(serving.gate.version(), PackMode::MetadataOnly, Vec::new(), Vec::new()).unwrap()
+    }
+
+    fn public_request(
+        serving: &ServingRepository,
+        actor: &Identity,
+        public_id: Uuid,
+        digest: RequestDigest,
+        mode: CommitMode,
+    ) -> PublicAttemptRequest {
+        PublicAttemptRequest {
+            repository_id: serving.gate.repository_id(),
+            admission_owner_id: serving.gate.tenant_id(),
+            issuer_id: actor.id,
+            public_id,
+            wire_digest: digest,
+            request_mode: mode,
+            backend_identity: "a".repeat(64),
+            object_format: serving.gate.object_format(),
+            history_incarnation: serving.gate.history_incarnation(),
+            authority_epoch: serving.gate.authority_epoch(),
+            group_epoch: serving.gate.group_epoch(),
+            restore_incarnation: serving.cluster_incarnation,
+        }
+    }
+
+    fn rejected_evidence(
+        public: &PublicAttemptRequest,
+        private_id: Uuid,
+        event_id: Uuid,
+        base_revision: i64,
+        event_revision: i64,
+    ) -> PublicAttemptEvidence {
+        let mut current = PublicAttempt {
+            slot: 0,
+            private_id,
+            plan_digest: RequestDigest::of("receive-provenance-plan", &[b"plan"]),
+            proof_digest: RequestDigest::of("receive-provenance-proof", &[b"placeholder"]),
+            base_revision,
+            lane: IssuerLane::new(LANE).unwrap(),
+            sequence: 4,
+            state: OperationState::Rejected,
+            event_id: Some(event_id),
+            event_revision: Some(event_revision),
+        };
+        current.proof_digest = slot_zero::recompute_slot_zero_proof(public, &current).unwrap();
+        PublicAttemptEvidence { public_id: public.public_id, current, retired: None }
+    }
+
+    fn retirement(event_id: Uuid, event_revision: i64) -> PublicAttemptRetirement {
+        PublicAttemptRetirement { event_id, event_revision }
+    }
+
+    #[test]
+    fn completed_receive_preserves_exact_commands_capability_mode_digest_and_pair_order() {
+        let serving = serving();
+        let actor = Identity {
+            id: Uuid::new_v4(),
+            token_id: Uuid::new_v4(),
+            parent_token_id: None,
+            username: "actor".to_owned(),
+            read_only: false,
+            token_digest: vec![0; 32],
+        };
+        let request = wire_request(true);
+        let mode = mode_for(&request);
+        let digest = RequestDigest::of("receive-provenance-wire", &[b"body"]);
+        let operation = Uuid::new_v4();
+        let pairs = staged_pairs();
+        let verified = verified_receive(&actor, &serving, operation, request.clone(), mode, digest, pairs.clone());
+
+        assert!(std::ptr::eq(verified.actor(), &actor));
+        assert_eq!(verified.operation_id(), operation);
+        assert_eq!(verified.repository_id(), serving.gate.repository_id());
+        assert_eq!(verified.object_format(), serving.gate.object_format());
+        assert_eq!(verified.request(), &request);
+        assert_eq!(verified.mode(), CommitMode::Atomic);
+        assert_eq!(verified.digest(), digest);
+        assert_eq!(verified.pairs().len(), pairs.len());
+        for (observed, expected) in verified.pairs().iter().zip(&pairs) {
+            assert_eq!(observed.pack, expected.pack);
+            assert_eq!(observed.idx, expected.idx);
+            assert_eq!(observed.pack_sha, expected.pack_sha);
+            assert_eq!(observed.pack_len, expected.pack_len);
+            assert_eq!(observed.idx_sha, expected.idx_sha);
+            assert_eq!(observed.idx_len, expected.idx_len);
+        }
+    }
+
+    #[test]
+    fn handoff_uses_only_completed_receive_and_exact_retirement() {
+        let serving = serving();
+        let actor = Identity {
+            id: Uuid::new_v4(),
+            token_id: Uuid::new_v4(),
+            parent_token_id: None,
+            username: "actor".to_owned(),
+            read_only: false,
+            token_digest: vec![0; 32],
+        };
+        let request = wire_request(false);
+        let mode = mode_for(&request);
+        let digest = RequestDigest::of("receive-provenance-handoff", &[b"body"]);
+        let operation = Uuid::new_v4();
+        let pairs = staged_pairs();
+        let verified = verified_receive(&actor, &serving, operation, request.clone(), mode, digest, pairs.clone());
+        let baseline = baseline(&serving);
+        let public = public_request(&serving, &actor, operation, digest, mode);
+        let private_id = Uuid::new_v4();
+        let event_id = Uuid::new_v4();
+        let evidence = rejected_evidence(&public, private_id, event_id, 6, 7);
+        let retirement = retirement(event_id, 7);
+
+        let handoff = SlotOneReceive::from_verified_slot_zero(
+            &serving,
+            &verified,
+            &baseline,
+            "a".repeat(64),
+            &evidence,
+            &retirement,
+        )
+        .unwrap();
+
+        assert_eq!(handoff.public().public_id, operation);
+        assert_eq!(handoff.public().wire_digest, digest);
+        assert_eq!(handoff.public().request_mode, mode);
+        assert_eq!(handoff.public().admission_owner_id, serving.gate.tenant_id());
+        assert!(std::ptr::eq(handoff.actor(), verified.actor()));
+        assert!(std::ptr::eq(handoff.request(), verified.request()));
+        assert_eq!(handoff.pairs().as_ptr(), verified.pairs().as_ptr());
+        assert_eq!(handoff.request(), &request);
+        assert_eq!(handoff.retirement(), &retirement);
+        assert!(!format!("{handoff:?}").contains(&private_id.to_string()));
+        assert!(!format!("{handoff:?}").contains(&event_id.to_string()));
+        assert!(!format!("{handoff:?}").contains(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn only_the_exact_current_slot_zero_retirement_is_accepted() {
+        let serving = serving();
+        let actor = Identity {
+            id: Uuid::new_v4(),
+            token_id: Uuid::new_v4(),
+            parent_token_id: None,
+            username: "actor".to_owned(),
+            read_only: false,
+            token_digest: vec![0; 32],
+        };
+        let request = wire_request(false);
+        let mode = mode_for(&request);
+        let digest = RequestDigest::of("receive-provenance-invalid", &[b"body"]);
+        let operation = Uuid::new_v4();
+        let pairs = staged_pairs();
+        let verified = verified_receive(&actor, &serving, operation, request, mode, digest, pairs);
+        let baseline = baseline(&serving);
+        let public = public_request(&serving, &actor, operation, digest, mode);
+        let private_id = Uuid::new_v4();
+        let event_id = Uuid::new_v4();
+        let valid = rejected_evidence(&public, private_id, event_id, 6, 7);
+        let valid_retirement = retirement(event_id, 7);
+
+        let cases = [
+            {
+                let mut evidence = valid.clone();
+                evidence.current.slot = 1;
+                ("slot one is current", evidence, valid_retirement.clone())
+            },
+            {
+                let mut evidence = valid.clone();
+                evidence.current.state = OperationState::Pending;
+                ("not rejected", evidence, valid_retirement.clone())
+            },
+            {
+                let mut evidence = valid.clone();
+                evidence.retired = Some(valid.current.clone());
+                ("already retired", evidence, valid_retirement.clone())
+            },
+            {
+                let mut evidence = valid.clone();
+                evidence.current.event_id = Some(Uuid::new_v4());
+                ("different event", evidence, valid_retirement.clone())
+            },
+            {
+                let mut evidence = valid.clone();
+                evidence.current.proof_digest = RequestDigest::of("receive-provenance-wrong-proof", &[b"body"]);
+                ("different proof", evidence, valid_retirement.clone())
+            },
+            {
+                let mut evidence = valid.clone();
+                evidence.public_id = Uuid::new_v4();
+                ("different public id", evidence, valid_retirement.clone())
+            },
+            ("different revision", valid.clone(), retirement(event_id, 8)),
+        ];
+
+        for (label, evidence, retirement) in cases {
+            let error = SlotOneReceive::from_verified_slot_zero(
+                &serving,
+                &verified,
+                &baseline,
+                "a".repeat(64),
+                &evidence,
+                &retirement,
+            )
+            .unwrap_err();
+            assert!(matches!(error, GatewayError::Internal(_)), "{label}: {error:?}");
+            assert!(!error.message().contains(&private_id.to_string()), "{label}");
+            assert!(!format!("{error:?}").contains(&private_id.to_string()), "{label}");
+            assert!(!format!("{error:?}").contains(&event_id.to_string()), "{label}");
+        }
+    }
+
+    #[test]
+    fn handoff_refuses_receive_provenance_from_another_repository() {
+        let serving = serving();
+        let other = serving();
+        let actor = Identity {
+            id: Uuid::new_v4(),
+            token_id: Uuid::new_v4(),
+            parent_token_id: None,
+            username: "actor".to_owned(),
+            read_only: false,
+            token_digest: vec![0; 32],
+        };
+        let request = wire_request(false);
+        let mode = mode_for(&request);
+        let digest = RequestDigest::of("receive-provenance-foreign", &[b"body"]);
+        let operation = Uuid::new_v4();
+        let verified = verified_receive(&actor, &serving, operation, request, mode, digest, staged_pairs());
+        let other_baseline = baseline(&other);
+        let public = public_request(&other, &actor, operation, digest, mode);
+        let event_id = Uuid::new_v4();
+        let evidence = rejected_evidence(&public, Uuid::new_v4(), event_id, 6, 7);
+        let retirement = retirement(event_id, 7);
+
+        let error = SlotOneReceive::from_verified_slot_zero(
+            &other,
+            &verified,
+            &other_baseline,
+            "a".repeat(64),
+            &evidence,
+            &retirement,
+        )
+        .unwrap_err();
+        assert!(matches!(error, GatewayError::Internal(_)), "{error:?}");
+        assert!(!format!("{error:?}").contains(&operation.to_string()));
+    }
+
+    #[test]
+    fn receive_value_is_completed_only_by_the_producer() {
+        let source = include_str!("receive.rs");
+        let production = source.split("#[cfg(test)]").next().expect("production source");
+        assert!(production.contains("struct ReceiveInput<'a> {"));
+        assert!(!production.contains("pub(super) struct ReceiveInput<'a>"));
+        assert!(production.contains("fn complete(self, pairs: Vec<Pair>) -> VerifiedReceive<'a>"));
+        assert!(!production.contains("pub(super) fn complete("));
+        assert_eq!(production.matches("ReceiveInput {").count(), 1);
+        assert_eq!(production.matches(".complete(pairs)").count(), 1);
+        let fields = production
+            .split("pub(super) struct VerifiedReceive<'a> {")
+            .nth(1)
+            .expect("verified receive")
+            .split('}')
+            .next()
+            .expect("verified receive fields");
+        for field in
+            ["actor:", "operation:", "repository_id:", "object_format:", "request:", "mode:", "digest:", "pairs:"]
+        {
+            assert!(fields.contains(field));
+            assert!(!fields.contains(&format!("pub {field}")));
+        }
+    }
 }

@@ -82,53 +82,46 @@ use super::{
     Pair, build_plan_core, commit_deadpool_bounded, public_attempt_request, rollback_bounded, rollback_deadpool_bounded,
 };
 use crate::blob_git_gateway::{
-    error::GatewayError, native::derived_uuid, protocol::PushRequest, serving::ServingRepository, state::BlobGitState,
+    error::GatewayError, native::derived_uuid, protocol::PushRequest, receive::VerifiedReceive,
+    serving::ServingRepository, state::BlobGitState,
 };
 
 /// The one gateway savepoint that owns the whole slot-one rotation call.
 const GATEWAY_SLOT_ONE_SAVEPOINT: &str = "rootyard_gateway_slot_one_handoff";
 
-/// One immutable receive input: the authenticated original actor, the parsed
-/// wire request, the ordered staged pair metadata and the exact durable public
-/// retirement tuple. The rotation cannot receive alternate copies of these
-/// values, so its plan is necessarily built from the bytes that were parsed and
-/// staged for this request.
+/// Handoff input built from one completed producer-owned receive value and the
+/// exact durable public retirement tuple. It cannot be constructed with an
+/// independently supplied request, pair set, wire digest or mode.
 #[allow(dead_code)] // No route selects exact stale retirement until the reviewed next step.
-pub(super) struct SlotOneReceive<'a> {
-    actor: &'a Identity,
-    request: &'a PushRequest,
-    pairs: &'a [Pair],
+pub(in crate::blob_git_gateway) struct SlotOneReceive<'verified, 'actor> {
+    verified: &'verified VerifiedReceive<'actor>,
     public: PublicAttemptRequest,
     retirement: PublicAttemptRetirement,
 }
 
 #[allow(dead_code)] // No route selects exact stale retirement until the reviewed next step.
-impl<'a> SlotOneReceive<'a> {
-    /// Build the exact receive context from the authenticated actor, parsed
-    /// request, ordered staged pairs, verified public attempt and selected
-    /// retirement.
+impl<'verified, 'actor> SlotOneReceive<'verified, 'actor> {
+    /// Build the exact handoff input from the completed receive value.
     ///
     /// The evidence must be the current slot-zero attempt in `Rejected` state
     /// and the retirement must name that attempt's exact migration-139 event.
     /// The public request is rebuilt from the same authorized serving realm and
     /// captured baseline as the original push; its public UUID, producer wire
-    /// digest and commit mode are unchanged. The retired private UUID is only
-    /// used to recompute the slot-zero proof and is never copied into the new
-    /// request. No PG access, hashing or plan construction happens here.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn from_verified_slot_zero(
+    /// digest and commit mode come only from `verified`. The retired private
+    /// UUID is only used to recompute the slot-zero proof and is never copied
+    /// into the new request. No PG access, hashing or plan construction happens
+    /// here.
+    pub(in crate::blob_git_gateway) fn from_verified_slot_zero(
         serving: &ServingRepository,
-        actor: &'a Identity,
-        request: &'a PushRequest,
-        pairs: &'a [Pair],
-        public_id: Uuid,
-        wire_digest: RequestDigest,
-        mode: CommitMode,
+        verified: &'verified VerifiedReceive<'actor>,
         baseline: &PackCommitBaseline,
         backend_identity: String,
         evidence: &PublicAttemptEvidence,
         retirement: &PublicAttemptRetirement,
     ) -> Result<Self, GatewayError> {
+        let public_id = verified.operation_id();
+        let wire_digest = verified.digest();
+        let mode = verified.mode();
         let current = &evidence.current;
         if evidence.public_id != public_id
             || evidence.retired.is_some()
@@ -154,41 +147,58 @@ impl<'a> SlotOneReceive<'a> {
             ));
         }
 
-        let public = public_attempt_request(serving, actor, public_id, wire_digest, mode, baseline, backend_identity)?;
+        let public = public_attempt_request(
+            serving,
+            verified.actor(),
+            public_id,
+            wire_digest,
+            mode,
+            baseline,
+            backend_identity,
+        )?;
+        if verified.repository_id() != public.repository_id || verified.object_format() != public.object_format {
+            return Err(GatewayError::Internal("slot one handoff receive provenance differs from its public realm"));
+        }
         let proof = slot_zero::recompute_slot_zero_proof(&public, current)
             .map_err(|_| GatewayError::Internal("slot one handoff slot-zero proof is not recomputable"))?;
         if proof != current.proof_digest {
             return Err(GatewayError::Internal("slot one handoff slot-zero proof differs from the durable evidence"));
         }
-        Ok(Self { actor, request, pairs, public, retirement: retirement.clone() })
+        Ok(Self { verified, public, retirement: retirement.clone() })
     }
 
     /// The unchanged public request this context will rotate.
     #[allow(dead_code)]
-    pub(super) fn public(&self) -> &PublicAttemptRequest {
+    pub(in crate::blob_git_gateway) fn public(&self) -> &PublicAttemptRequest {
         &self.public
     }
 
-    /// The authenticated original actor bound to this receive.
+    /// The authenticated original actor bound to the completed receive.
     #[allow(dead_code)]
-    pub(super) fn actor(&self) -> &Identity {
-        self.actor
+    pub(in crate::blob_git_gateway) fn actor(&self) -> &Identity {
+        self.verified.actor()
     }
 
-    /// The exact parsed wire request this receive admitted.
+    /// The exact parsed wire request completed for this receive.
     #[allow(dead_code)]
-    pub(super) fn request(&self) -> &PushRequest {
-        self.request
+    pub(in crate::blob_git_gateway) fn request(&self) -> &PushRequest {
+        self.verified.request()
     }
 
-    /// The exact ordered staged pair metadata this receive checked.
+    /// The exact ordered staged pair metadata completed for this receive.
     #[allow(dead_code)]
-    pub(super) fn pairs(&self) -> &[Pair] {
-        self.pairs
+    pub(in crate::blob_git_gateway) fn pairs(&self) -> &[Pair] {
+        self.verified.pairs()
+    }
+
+    /// The exact selected retirement bound to this receive.
+    #[allow(dead_code)]
+    pub(in crate::blob_git_gateway) fn retirement(&self) -> &PublicAttemptRetirement {
+        &self.retirement
     }
 }
 
-impl fmt::Debug for SlotOneReceive<'_> {
+impl fmt::Debug for SlotOneReceive<'_, '_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Do not render the actor, staged paths, raw backend or private attempt;
         // the public request already redacts its own identity fields.
@@ -208,7 +218,7 @@ impl fmt::Debug for SlotOneReceive<'_> {
 /// identity and no sequence.
 #[allow(dead_code)] // No route selects exact stale retirement until the reviewed next step.
 #[derive(Clone, Eq, PartialEq)]
-pub(super) enum SlotOneAdmission {
+pub(in crate::blob_git_gateway) enum SlotOneAdmission {
     Fresh { plan: Box<PackCommitPlan>, receipt: SlotOneRotationReceipt },
     Replayed(SlotOneRotationReceipt),
 }
@@ -216,7 +226,7 @@ pub(super) enum SlotOneAdmission {
 #[allow(dead_code)] // No route selects exact stale retirement until the reviewed next step.
 impl SlotOneAdmission {
     /// The durable rotation receipt, whether fresh or an exact pending replay.
-    pub(super) fn receipt(&self) -> &SlotOneRotationReceipt {
+    pub(in crate::blob_git_gateway) fn receipt(&self) -> &SlotOneRotationReceipt {
         match self {
             Self::Fresh { receipt, .. } | Self::Replayed(receipt) => receipt,
         }
@@ -247,20 +257,24 @@ impl fmt::Debug for SlotOneAdmission {
 /// it.
 #[allow(dead_code)] // No route selects exact stale retirement until the reviewed next step.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn rotate_slot_one(
+pub(in crate::blob_git_gateway) async fn rotate_slot_one(
     state: &BlobGitState,
     serving: &ServingRepository,
-    receive: &SlotOneReceive<'_>,
+    receive: &SlotOneReceive<'_, '_>,
     baseline: &PackCommitBaseline,
     deadline: Instant,
 ) -> Result<SlotOneAdmission, GatewayError> {
     let public = receive.public.clone();
-    let actor = receive.actor;
-    let request = receive.request;
-    let pairs = receive.pairs;
+    let actor = receive.actor();
+    let request = receive.request();
+    let pairs = receive.pairs();
     let repository_id = public.repository_id;
-    if !actor_matches(actor, &public) {
-        return Err(GatewayError::Internal("slot one actor differs from its public identity"));
+    if receive.verified.operation_id() != public.public_id
+        || receive.verified.digest() != public.wire_digest
+        || receive.verified.mode() != public.request_mode
+        || !actor_matches(actor, &public)
+    {
+        return Err(GatewayError::Internal("slot one receive provenance differs from its public identity"));
     }
     let mut client = state.pooled(deadline).await?;
     let mut tx = match timeout_at(deadline, client.transaction()).await {
@@ -564,18 +578,14 @@ impl fmt::Debug for Redacted {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
     use crate::{
-        blob_git_gateway::protocol::PushCommand,
         db::Repository,
         ref_store::{
-            GitObjectFormat, IssuerLane,
+            GitObjectFormat,
             core::{
                 contract::CoreGate,
                 pack_commit::{PackCommitBaseline, PackMode},
             },
-            pg::public_attempt::PublicAttempt,
         },
     };
 
@@ -635,182 +645,6 @@ mod tests {
     ) -> PublicAttemptRequest {
         public_attempt_request(serving, actor, public_id, digest, CommitMode::AcceptedSubset, baseline, "a".repeat(64))
             .unwrap()
-    }
-
-    fn rejected_evidence(
-        public: &PublicAttemptRequest,
-        private_id: Uuid,
-        event_id: Uuid,
-        base_revision: i64,
-        event_revision: i64,
-    ) -> PublicAttemptEvidence {
-        let mut current = PublicAttempt {
-            slot: 0,
-            private_id,
-            plan_digest: RequestDigest::of("slot-one-handoff-test-plan", &[b"plan"]),
-            proof_digest: RequestDigest::of("slot-one-handoff-test-proof", &[b"placeholder"]),
-            base_revision,
-            lane: IssuerLane::new(LANE).unwrap(),
-            sequence: 4,
-            state: OperationState::Rejected,
-            event_id: Some(event_id),
-            event_revision: Some(event_revision),
-        };
-        current.proof_digest = slot_zero::recompute_slot_zero_proof(public, &current).unwrap();
-        PublicAttemptEvidence { public_id: public.public_id, current, retired: None }
-    }
-
-    fn wire_request() -> PushRequest {
-        PushRequest {
-            commands: vec![
-                PushCommand { old: "1".repeat(40), new: "2".repeat(40), name: "refs/heads/main".to_owned() },
-                PushCommand { old: "3".repeat(40), new: "4".repeat(40), name: "refs/heads/side".to_owned() },
-            ],
-            capabilities: vec!["report-status".to_owned()],
-        }
-    }
-
-    fn staged_pair(name: &str, pack_digit: char, idx_digit: char) -> Pair {
-        Pair {
-            pack: PathBuf::from(format!("/staged/{name}.pack")),
-            idx: PathBuf::from(format!("/staged/{name}.idx")),
-            pack_id: Uuid::new_v4(),
-            pack_sha: pack_digit.to_string().repeat(64),
-            pack_len: 101,
-            idx_sha: idx_digit.to_string().repeat(64),
-            idx_len: 37,
-        }
-    }
-
-    fn staged_pairs() -> Vec<Pair> {
-        vec![staged_pair("first", 'a', 'b'), staged_pair("second", 'c', 'd')]
-    }
-
-    fn retirement(event_id: Uuid, event_revision: i64) -> PublicAttemptRetirement {
-        PublicAttemptRetirement { event_id, event_revision }
-    }
-
-    #[test]
-    fn trusted_slot_zero_evidence_keeps_the_public_identity_and_redacts_private_ids() {
-        let serving = serving();
-        let actor = actor();
-        let baseline = baseline(&serving);
-        let public_id = Uuid::new_v4();
-        let private_id = Uuid::new_v4();
-        let event_id = Uuid::new_v4();
-        let digest = RequestDigest::of("slot-one-handoff-request", &[b"wire"]);
-        let request = wire_request();
-        let pairs = staged_pairs();
-        let public = public_request(&serving, &actor, public_id, digest, &baseline);
-        let evidence = rejected_evidence(&public, private_id, event_id, 6, 7);
-        let retirement = retirement(event_id, 7);
-
-        let receive = SlotOneReceive::from_verified_slot_zero(
-            &serving,
-            &actor,
-            &request,
-            &pairs,
-            public_id,
-            digest,
-            CommitMode::AcceptedSubset,
-            &baseline,
-            "a".repeat(64),
-            &evidence,
-            &retirement,
-        )
-        .unwrap();
-
-        assert_eq!(receive.public().public_id, public_id);
-        assert_eq!(receive.public().wire_digest, digest);
-        assert_eq!(receive.public().request_mode, CommitMode::AcceptedSubset);
-        assert_eq!(receive.public().admission_owner_id, serving.gate.tenant_id());
-        assert!(std::ptr::eq(receive.actor(), &actor));
-        assert!(std::ptr::eq(receive.request(), &request));
-        assert_eq!(receive.pairs().as_ptr(), pairs.as_ptr());
-        assert_eq!(receive.request().commands, request.commands);
-        assert_eq!(receive.pairs().len(), pairs.len());
-        for (observed, expected) in receive.pairs().iter().zip(&pairs) {
-            assert_eq!(observed.pack, expected.pack);
-            assert_eq!(observed.idx, expected.idx);
-            assert_eq!(observed.pack_sha, expected.pack_sha);
-            assert_eq!(observed.pack_len, expected.pack_len);
-            assert_eq!(observed.idx_sha, expected.idx_sha);
-            assert_eq!(observed.idx_len, expected.idx_len);
-        }
-        assert_eq!(receive.retirement, retirement);
-        assert!(!format!("{receive:?}").contains(&private_id.to_string()));
-        assert!(!format!("{receive:?}").contains(&event_id.to_string()));
-    }
-
-    #[test]
-    fn only_the_exact_current_slot_zero_rejection_is_a_receive_input() {
-        let serving = serving();
-        let actor = actor();
-        let baseline = baseline(&serving);
-        let public_id = Uuid::new_v4();
-        let private_id = Uuid::new_v4();
-        let event_id = Uuid::new_v4();
-        let digest = RequestDigest::of("slot-one-handoff-invalid", &[b"wire"]);
-        let request = wire_request();
-        let pairs = staged_pairs();
-        let public = public_request(&serving, &actor, public_id, digest, &baseline);
-        let valid = rejected_evidence(&public, private_id, event_id, 6, 7);
-        let valid_retirement = retirement(event_id, 7);
-
-        let cases = [
-            {
-                let mut evidence = valid.clone();
-                evidence.current.slot = 1;
-                ("slot one is current", evidence, valid_retirement.clone())
-            },
-            {
-                let mut evidence = valid.clone();
-                evidence.current.state = OperationState::Pending;
-                ("not rejected", evidence, valid_retirement.clone())
-            },
-            {
-                let mut evidence = valid.clone();
-                evidence.retired = Some(valid.current.clone());
-                ("already retired", evidence, valid_retirement.clone())
-            },
-            {
-                let mut evidence = valid.clone();
-                evidence.current.event_id = Some(Uuid::new_v4());
-                ("different event", evidence, valid_retirement.clone())
-            },
-            {
-                let mut evidence = valid.clone();
-                evidence.current.proof_digest = RequestDigest::of("slot-one-handoff-wrong-proof", &[b"wire"]);
-                ("different proof", evidence, valid_retirement.clone())
-            },
-            {
-                let mut evidence = valid.clone();
-                evidence.public_id = Uuid::new_v4();
-                ("different public id", evidence, valid_retirement.clone())
-            },
-            ("different revision", valid.clone(), retirement(event_id, 8)),
-        ];
-
-        for (label, evidence, retirement) in cases {
-            let error = SlotOneReceive::from_verified_slot_zero(
-                &serving,
-                &actor,
-                &request,
-                &pairs,
-                public_id,
-                digest,
-                CommitMode::AcceptedSubset,
-                &baseline,
-                "a".repeat(64),
-                &evidence,
-                &retirement,
-            )
-            .unwrap_err();
-            assert!(matches!(error, GatewayError::Internal(_)), "{label}: {error:?}");
-            assert!(!error.message().contains(&private_id.to_string()), "{label}");
-            assert!(!format!("{error:?}").contains(&private_id.to_string()), "{label}");
-            assert!(!format!("{error:?}").contains(&event_id.to_string()), "{label}");
-        }
     }
 
     #[test]
@@ -880,19 +714,30 @@ mod tests {
     fn source_keeps_the_receive_context_as_the_only_plan_input() {
         let source = include_str!("slot_one.rs");
         let signature = source
-            .split("pub(super) async fn rotate_slot_one(")
+            .split("pub(in crate::blob_git_gateway) async fn rotate_slot_one(")
             .nth(1)
             .expect("rotation function")
             .split(") -> Result<SlotOneAdmission, GatewayError>")
             .next()
             .expect("rotation signature");
-        assert!(signature.contains("receive: &SlotOneReceive<'_>"));
+        assert!(signature.contains("receive: &SlotOneReceive<'_, '_>"));
         assert!(!signature.contains("actor: &Identity"));
         assert!(!signature.contains("request: &PushRequest"));
         assert!(!signature.contains("pairs: &[Pair]"));
-        assert!(source.contains("let actor = receive.actor;"));
-        assert!(source.contains("let request = receive.request;"));
-        assert!(source.contains("let pairs = receive.pairs;"));
+        let handoff = source
+            .split("pub(in crate::blob_git_gateway) fn from_verified_slot_zero(")
+            .nth(1)
+            .expect("handoff constructor")
+            .split(") -> Result<Self, GatewayError>")
+            .next()
+            .expect("handoff signature");
+        assert!(handoff.contains("verified: &'verified VerifiedReceive<'actor>"));
+        for independent in ["actor:", "request:", "pairs:", "wire_digest:", "mode:", "public_id:"] {
+            assert!(!handoff.contains(independent), "handoff still accepts {independent}");
+        }
+        assert!(source.contains("let actor = receive.actor();"));
+        assert!(source.contains("let request = receive.request();"));
+        assert!(source.contains("let pairs = receive.pairs();"));
         assert!(source.contains("build_slot_one_plan(request, pairs, &public, baseline, preview)?"));
         assert!(!source.contains(&["into_", "fresh"].concat()));
         let replay = source
