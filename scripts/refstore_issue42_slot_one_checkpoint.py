@@ -397,6 +397,23 @@ def build_attestation(lib, receipt, preflight_path, workspace, expected_commit,
     }
 
 
+def apply_lib_alias_label(attestation, label):
+    """Replace the verified resolved path with a fixed public report label.
+
+    Internal attestation and receipt checks have already validated the exact
+    resolved libtest path before this projection. ``None`` keeps the legacy
+    slot-one report shape/value unchanged; an explicit label must be a simple
+    anonymous token, never a path or credential-bearing value.
+    """
+    if label is None:
+        return attestation
+    if not isinstance(label, str) or re.fullmatch(
+            r"[A-Za-z0-9._#-]{1,64}", label) is None:
+        raise CheckpointError("lib_alias_label")
+    attestation["lib_alias"] = label
+    return attestation
+
+
 def _signal_group(process, sig):
     try:
         os.killpg(process.pid, sig)
@@ -492,6 +509,7 @@ def run_checkpoint(args):
     attestation = build_attestation(
         args.lib, args.receipt, args.preflight, args.workspace,
         args.expected_commit, schema=args.report_schema, case=args.case)
+    apply_lib_alias_label(attestation, args.lib_alias_label)
     listing = run_bounded(
         listing_command(args.lib), timeout=min(60.0, args.timeout),
         stdout_limit=LISTING_STDOUT_LIMIT)
@@ -522,6 +540,7 @@ def main(argv=None):
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--case", default=CASE)
     parser.add_argument("--report-schema", default=REPORT_SCHEMA)
+    parser.add_argument("--lib-alias-label", default=None)
     parser.add_argument("--report", required=True)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--stdout-limit", type=int, default=DEFAULT_STDOUT_LIMIT)

@@ -314,6 +314,32 @@ class FirstLaneSelectionTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "report_schema")
 
 
+    def test_fixed_public_label_replaces_the_verified_path_only_when_requested(self):
+        source = attestation()
+        source["schema"] = FIRST_LANE_SCHEMA
+        source["case"] = FIRST_LANE_CASE
+        verified_path = source["lib_alias"]
+        returned = checkpoint.apply_lib_alias_label(
+            source, "preflighted-#174-libtest")
+        self.assertIs(returned, source)
+        self.assertEqual(source["lib_alias"], "preflighted-#174-libtest")
+        self.assertNotIn("/", source["lib_alias"])
+        report = checkpoint.make_report(
+            source, projection(), 0, "exited",
+            schema=FIRST_LANE_SCHEMA, case=FIRST_LANE_CASE)
+        encoded = json.dumps(report)
+        self.assertNotIn(verified_path, encoded)
+        legacy = attestation()
+        checkpoint.apply_lib_alias_label(legacy, None)
+        self.assertEqual(legacy["lib_alias"], verified_path)
+        for bad in ("/tmp/libtest", "C:\\libtest", "", "has space",
+                    "a" * 65):
+            with self.subTest(label=bad):
+                with self.assertRaises(checkpoint.CheckpointError) as raised:
+                    checkpoint.apply_lib_alias_label(attestation(), bad)
+                self.assertEqual(str(raised.exception), "lib_alias_label")
+
+
 class WorkflowWiringTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -357,7 +383,8 @@ class WorkflowWiringTests(unittest.TestCase):
     def test_first_lane_gate_is_scoped_to_its_own_manual_ref(self):
         step = self.step(
             '"Replay exactly one #42 first-lane admission case')
-        self.assertEqual(self.text.count(FIRST_LANE_REF), 1)
+        # Once as the job env value and once as the Bash byte-exact literal.
+        self.assertEqual(self.text.count(FIRST_LANE_REF), 2)
         self.assertEqual(step.count("github.ref"), 1)
         self.assertIn("workflow_dispatch", step)
         self.assertIn("success()", step)
@@ -367,6 +394,20 @@ class WorkflowWiringTests(unittest.TestCase):
             self.text.count(
                 "refs/heads/codex/goal-issue42-original-ac-source-audit-20261117"),
             1)
+
+    def test_first_lane_step_requires_bash_byte_exact_manual_ref(self):
+        step = self.step(
+            '"Replay exactly one #42 first-lane admission case')
+        run = step.split("run: |", 1)[1]
+        self.assertIn(
+            '[ "${GITHUB_EVENT_NAME:-}" != \'workflow_dispatch\' ]',
+            run)
+        self.assertIn(
+            '[ "${GITHUB_REF:-}" != \'' + FIRST_LANE_REF + '\' ]', run)
+        self.assertLess(
+            run.index("set -euo pipefail"), run.index('${GITHUB_REF:-}'))
+        self.assertLess(
+            run.index('${GITHUB_REF:-}'), run.index("evidence="))
 
     def test_first_lane_step_runs_after_slot_one_and_before_cleanup(self):
         slot_one = self.text.index(
@@ -387,6 +428,8 @@ class WorkflowWiringTests(unittest.TestCase):
             '--case "' + FIRST_LANE_CASE + '"', step)
         self.assertIn(
             '--report-schema "' + FIRST_LANE_SCHEMA + '"', step)
+        self.assertIn(
+            '--lib-alias-label "preflighted-#174-libtest"', step)
         self.assertIn(
             '--report "test-results/refstore/session174-foundation/'
             'first-lane-admission.json"', step)

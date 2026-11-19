@@ -2522,6 +2522,11 @@ jobs:
           SESSION174_DATABASE: ${{ steps.session174_db.outputs.database }}
         run: |
           set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME:-}" != 'workflow_dispatch' ] ||
+             [ "${GITHUB_REF:-}" != 'refs/heads/codex/goal-issue42-first-lane-qualification-20261119' ]; then
+            echo "refusing to run outside the exact first-lane manual ref" >&2
+            exit 1
+          fi
           evidence="$RUNNER_TEMP/session174-foundation"
           lib="${ROOTYARD_174_LIB_ALIAS:-}"
           receipt="${ROOTYARD_174_LIB_ALIAS_RECEIPT:-}"
@@ -2558,6 +2563,7 @@ jobs:
             --expected-commit "$GITHUB_SHA" \
             --case "blob_git_gateway::slot_zero_admission_acceptance::first_lane_insert_waits_before_authority_locks" \
             --report-schema "rootyard/refstore-issue42-first-lane-checkpoint/v1" \
+            --lib-alias-label "preflighted-#174-libtest" \
             --report "test-results/refstore/session174-foundation/first-lane-admission.json" \
             --timeout 600 \
             --stdout-limit 16384
