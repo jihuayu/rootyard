@@ -290,6 +290,7 @@ impl fmt::Debug for PublicAttemptLookup {
 /// terminal body, so a caller must ask the mirror to derive the owned
 /// disposition before it may ACK anything.
 #[allow(dead_code)] // The private finish path is activation-safe until the serving cutover.
+#[allow(clippy::large_enum_variant)] // One exact evidence value, not a hot compact route.
 #[derive(Clone)]
 pub(crate) enum PublicAttemptFinishLookup {
     Unknown,
