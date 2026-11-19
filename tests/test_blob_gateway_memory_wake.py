@@ -38,6 +38,28 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, text)
 
+    def test_standalone_scan_is_target_audit_only_and_skips_projection_jobs(self):
+        dispatch = source("src/dispatch.rs")
+        standalone = body(dispatch, "pub fn standalone()", "pub fn from_env()")
+        self.assertIn("crate::events::TARGET_AUDIT_CONSUMER", standalone)
+        self.assertNotIn("CONSUMERS.iter()", standalone)
+        self.assertIn("target_audit_only: true", standalone)
+        self.assertIn("projection_jobs: false", standalone)
+        legacy = body(dispatch, "pub fn from_env()", "/// Runs independently")
+        self.assertIn("target_audit_only: false", legacy)
+        self.assertIn("projection_jobs: true", legacy)
+        worker = body(dispatch, "pub async fn worker(", "/// Called outside the Git/PG commit path")
+        self.assertIn("worker_once_with_lease_scoped", worker)
+        self.assertIn("target_audit_only.then_some(crate::events::TARGET_AUDIT_KIND)", worker)
+        self.assertIn("if settings.projection_jobs", worker)
+        events = source("src/events.rs")
+        self.assertIn('pub const TARGET_AUDIT_CONSUMER: &str = "audit-log"', events)
+        self.assertIn('pub const TARGET_AUDIT_KIND: &str = "pg_refstore_core_commit_audit"', events)
+        claim = body(events, "async fn claim_scoped(", "async fn lock_valid_lease")
+        self.assertIn("$3::text IS NULL OR o.evidence->>'kind'=$3", claim)
+        scoped = body(events, "pub async fn worker_once_with_lease_scoped(", "async fn run_claims")
+        self.assertIn("claim_scoped", scoped)
+
     def test_state_holds_only_a_unit_signal_not_event_data(self):
         text = source("src/blob_git_gateway/state.rs")
         self.assertIn("dispatch: dispatch::Signals", text)
@@ -139,7 +161,7 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         self.assertIn("tokio::time::interval(settings.poll)", worker)
         self.assertIn("signal.notified()", worker)
         self.assertIn("stop.cancelled()", worker)
-        self.assertIn("crate::events::worker_once_with_lease", worker)
+        self.assertIn("crate::events::worker_once_with_lease_scoped", worker)
         self.assertIn("crate::events::process_ref_cas_projection_jobs", worker)
 
 

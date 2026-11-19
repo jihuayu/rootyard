@@ -50,6 +50,10 @@ pub struct Claim {
     pub new_oid: String,
 }
 pub const CONSUMERS: &[&str] = &["audit-log", "ref-index"];
+/// The only delivery consumer the standalone worker is allowed to scan.
+pub const TARGET_AUDIT_CONSUMER: &str = "audit-log";
+/// Fixed durable evidence kind produced by the pg_refstore A4 audit bridge.
+pub const TARGET_AUDIT_KIND: &str = "pg_refstore_core_commit_audit";
 fn valid_consumer(consumer: &str) -> Result<()> {
     ensure!(CONSUMERS.contains(&consumer), "unknown consumer");
     Ok(())
@@ -359,11 +363,26 @@ fn claim_from_row(row: &Row, consumer: &str, owner: Uuid, generation: i64) -> Cl
 }
 
 pub async fn claim(pool: &Pool, consumer: &str, owner: Uuid, limit: i64, lease_seconds: i64) -> Result<Vec<Claim>> {
+    claim_scoped(pool, consumer, None, owner, limit, lease_seconds).await
+}
+
+/// Claim one exact consumer scope. `target_kind` is `None` for the shared
+/// legacy/default queue or `Some(TARGET_AUDIT_KIND)` for the dedicated
+/// standalone audit queue. The filter is part of the lease query, so a target
+/// worker can never lease a legacy `audit-log` row.
+async fn claim_scoped(
+    pool: &Pool,
+    consumer: &str,
+    target_kind: Option<&str>,
+    owner: Uuid,
+    limit: i64,
+    lease_seconds: i64,
+) -> Result<Vec<Claim>> {
     valid_consumer(consumer)?;
     ensure!((1..=1000).contains(&limit) && (1..=3600).contains(&lease_seconds), "invalid claim bounds");
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    let rows=tx.query("SELECT e.* FROM event_deliveries d JOIN outbox_events e USING(event_id) JOIN git_operations o ON o.id=e.operation_id WHERE d.consumer=$1 AND o.outcome <> 'unknown' AND d.state <> 'delivered' AND d.next_attempt_at <= clock_timestamp() AND (d.state='pending' OR d.lease_until <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM outbox_events prior JOIN event_deliveries pd USING(event_id) WHERE pd.consumer=d.consumer AND pd.state <> 'delivered' AND prior.repository_id=e.repository_id AND prior.ref_name=e.ref_name AND (prior.storage_generation,prior.operation_sequence,prior.transaction_sequence)<(e.storage_generation,e.operation_sequence,e.transaction_sequence)) AND NOT EXISTS (SELECT 1 FROM git_operations unknown_op WHERE unknown_op.repository_id=e.repository_id AND unknown_op.outcome='unknown' AND NOT EXISTS(SELECT 1 FROM operation_resolutions resolved WHERE resolved.operation_id=unknown_op.id) AND (unknown_op.storage_generation,unknown_op.sequence)<(e.storage_generation,e.operation_sequence)) ORDER BY e.storage_generation,e.operation_sequence,e.transaction_sequence,e.event_id LIMIT $2 FOR UPDATE OF d SKIP LOCKED", &[&consumer,&limit]).await?;
+    let rows=tx.query("SELECT e.* FROM event_deliveries d JOIN outbox_events e USING(event_id) JOIN git_operations o ON o.id=e.operation_id WHERE d.consumer=$1 AND o.outcome <> 'unknown' AND ($3::text IS NULL OR o.evidence->>'kind'=$3) AND d.state <> 'delivered' AND d.next_attempt_at <= clock_timestamp() AND (d.state='pending' OR d.lease_until <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM outbox_events prior JOIN event_deliveries pd USING(event_id) WHERE pd.consumer=d.consumer AND pd.state <> 'delivered' AND prior.repository_id=e.repository_id AND prior.ref_name=e.ref_name AND (prior.storage_generation,prior.operation_sequence,prior.transaction_sequence)<(e.storage_generation,e.operation_sequence,e.transaction_sequence)) AND NOT EXISTS (SELECT 1 FROM git_operations unknown_op WHERE unknown_op.repository_id=e.repository_id AND unknown_op.outcome='unknown' AND NOT EXISTS(SELECT 1 FROM operation_resolutions resolved WHERE resolved.operation_id=unknown_op.id) AND (unknown_op.storage_generation,unknown_op.sequence)<(e.storage_generation,e.operation_sequence)) ORDER BY e.storage_generation,e.operation_sequence,e.transaction_sequence,e.event_id LIMIT $2 FOR UPDATE OF d SKIP LOCKED", &[&consumer,&limit,&target_kind]).await?;
     let mut claims = Vec::new();
     for row in rows {
         let id: String = row.get("event_id");
@@ -479,7 +498,25 @@ pub async fn worker_once_with_lease(
     limit: i64,
     lease_seconds: i64,
 ) -> Result<usize> {
-    let claims = claim(pool, consumer, owner, limit, lease_seconds).await?;
+    worker_once_with_lease_scoped(pool, consumer, None, owner, limit, lease_seconds).await
+}
+
+/// One bounded scan over an optional evidence-scoped consumer queue. Standalone
+/// passes `TARGET_AUDIT_KIND` and the audit-log consumer; the legacy defaults
+/// pass `None` and keep their existing full per-consumer scan.
+pub async fn worker_once_with_lease_scoped(
+    pool: &Pool,
+    consumer: &str,
+    target_kind: Option<&str>,
+    owner: Uuid,
+    limit: i64,
+    lease_seconds: i64,
+) -> Result<usize> {
+    let claims = claim_scoped(pool, consumer, target_kind, owner, limit, lease_seconds).await?;
+    run_claims(pool, claims).await
+}
+
+async fn run_claims(pool: &Pool, claims: Vec<Claim>) -> Result<usize> {
     let mut count = 0;
     for item in claims {
         match acknowledge(pool, &item).await {
