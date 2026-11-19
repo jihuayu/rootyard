@@ -54,7 +54,7 @@ PROTOCOL_COUNTS = {
     "ref_store_packs": 8,
     "ref_store_retention_roots": 23,
     "ref_store_materialized_reads": 12,
-    "ref_store_decision_subset": 23,
+    "ref_store_decision_subset": 24,
 }
 
 _TEST_ATTRIBUTE = re.compile(
@@ -634,7 +634,7 @@ class ProtocolSuiteCountTest(unittest.TestCase):
         self.assertIsNotNone(assertion, "the step has no sorted suite-count assertion")
         asserted = ast.literal_eval(assertion.group(1))
         self.assertEqual(asserted, sorted(counts.values()))
-        self.assertEqual(asserted, [8, 12, 23, 23])
+        self.assertEqual(asserted, [8, 12, 23, 24])
 
     def test_strip_rust_comments_handles_comments_and_char_literals(self) -> None:
         sample = (

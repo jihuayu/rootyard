@@ -1,0 +1,437 @@
+//! A4 restore-capture fence and target-audit wake witness (issue #111).
+//!
+//! This uses the owned real PostgreSQL/S3/native-Git serving fixture, not the
+//! unserved decision lane: `verify_new_serving` provisions an actual ready
+//! `pg_refstore` repository through production provisioning. The case then:
+//!
+//! * captures the authorized serving incarnation, stages an A4 publication,
+//!   injects a deterministic restore rotation before the final auth and proves
+//!   the typed refusal rolls back with no terminal/ref/event/outbox/wake;
+//! * commits a captured-and-matched A4 publication and proves the core
+//!   terminal/ref/event and exact target-audit outbox committed together;
+//! * commits through the generic facade and proves the pre-wake-bridge path
+//!   still writes core state but no target audit/wake;
+//! * replays the matched terminal under another rotation and proves no
+//!   restamp, no new outbox and no new effect;
+//! * runs the standalone scoped subscriber and proves it leases only the exact
+//!   target evidence while an unrelated legacy audit row stays pending.
+use super::assert as facts;
+use super::fixture::{commit_receipt, prepare, select_as, update, verify};
+use crate::retention_roots_support::common::open_store;
+use crate::retention_roots_support::db::{Db, deadline, gate_version, rotate_cluster};
+use crate::retention_roots_support::git::git_binary;
+use crate::retention_roots_support::pack::draft;
+use crate::retention_roots_support::serving::verify_new_serving;
+use anyhow::{Result, anyhow, ensure};
+use deadpool_postgres::Pool;
+use rootyard::blob_store::opendal::BlobStore;
+use rootyard::db::{Identity, Repository};
+use rootyard::events;
+use rootyard::ref_store::core::pack_commit::{AuthorizedCommitError, PackCommitError, PgAuthorizedCommit};
+use rootyard::ref_store::{GitObjectFormat, RefStoreError};
+use uuid::Uuid;
+
+const SHA1: GitObjectFormat = GitObjectFormat::Sha1;
+
+/// Capture the incarnation through the same authorized serving lookup the
+/// gateway uses; this is a server-side durable read, never a caller value.
+async fn authorized_capture(pool: &Pool, actor: &Identity, repository: &Repository, store: &BlobStore) -> Result<Uuid> {
+    let serving = rootyard::ref_store::serving::lookup(
+        pool,
+        actor,
+        &repository.owner,
+        &repository.name,
+        true,
+        store.backend_identity(),
+        deadline(),
+    )
+    .await
+    .map_err(|error| anyhow!("authorized serving capture refused: {}", error.1))?;
+    ensure!(serving.repository.id == repository.id, "authorized capture returned another repository");
+    ensure!(!serving.cluster_incarnation.is_nil(), "authorized capture returned a nil incarnation");
+    Ok(serving.cluster_incarnation)
+}
+
+async fn count_for_operation(pool: &Pool, sql: &str, repository: Uuid, operation: Uuid) -> Result<i64> {
+    Ok(pool.get().await?.query_one(sql, &[&repository, &operation]).await?.get(0))
+}
+
+#[tokio::test]
+#[ignore = "requires real PG/S3/Git and the integrated decision/subset pipeline"]
+async fn a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit() -> Result<()> {
+    let db = Db::setup().await?;
+    let store = open_store()?;
+    let git = git_binary()?;
+    let outcome = async {
+        let (verified, actor, repository) = verify_new_serving(&db, &store, &git, "issue111-target-wake").await?;
+        let adapter = PgAuthorizedCommit::new(store.clone(), git.clone())
+            .map_err(|error| anyhow!("authorized adapter constructor refused: {error:?}"))?;
+        let repo = verified.repo;
+        let tenant = verified.tenant;
+        let oid = verified.commit_oid.clone();
+        let refs_before = facts::refs(&db.pool, repo).await?;
+        let revision_before = facts::gate_revision(&db.pool, repo).await?;
+        let audit_before: i64 = db.pool.get().await?.query_one("SELECT count(*) FROM audit_events", &[]).await?.get(0);
+        let pending_before = events::pending_count(&db.pool).await?;
+
+        // 1. Authorized capture -> staged A4 selection/verification -> restore
+        //    rotation -> final commit. The rotation lands after the trusted
+        //    capture and before the final authorization transaction.
+        let captured_mismatch = authorized_capture(&db.pool, &actor, &repository, &store).await?;
+        let mismatch_plan = draft(
+            &db,
+            repo,
+            tenant,
+            2,
+            &verified.gate,
+            vec![update(SHA1, "refs/heads/wake-mismatch", None, Some(&oid))?],
+            &[],
+        )
+        .await?
+        .plan;
+        let mismatch_op = mismatch_plan.identity().operation_id();
+        let prepared = prepare(&adapter, &db.pool, mismatch_plan).await?;
+        let selection = select_as(&adapter, &db.pool, prepared, &actor).await?;
+        ensure!(!selection.is_all_rejected(), "the mismatch publication was rejected before the fence");
+        let mismatch_verified = verify(&adapter, selection).await?;
+        let rotated = rotate_cluster(&db.pool).await?;
+        ensure!(rotated != captured_mismatch, "restore rotation did not change the incarnation");
+        let error = adapter
+            .commit_with_expected_cluster_incarnation(&db.pool, &mismatch_verified, captured_mismatch, deadline())
+            .await
+            .expect_err("a rotated restore incarnation must refuse the final A4 commit");
+        ensure!(
+            matches!(
+                error,
+                AuthorizedCommitError::Pack(PackCommitError::RefStore(RefStoreError::RestoreIncarnationMismatch))
+            ),
+            "restore mismatch returned an unrelated refusal: {error}"
+        );
+
+        // The whole final transaction rolled back before auth/terminal writes.
+        let operation = facts::operation(&db.pool, repo, mismatch_op).await?;
+        ensure!(
+            operation.state == "pending" && operation.terminal.is_none(),
+            "mismatch wrote a terminal: {operation:?}"
+        );
+        ensure!(facts::refs(&db.pool, repo).await? == refs_before, "mismatch changed refs");
+        ensure!(facts::gate_revision(&db.pool, repo).await? == revision_before, "mismatch changed the gate revision");
+        let core_events = count_for_operation(
+            &db.pool,
+            "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1 AND operation_id=$2",
+            repo,
+            mismatch_op,
+        )
+        .await?;
+        ensure!(core_events == 0, "mismatch wrote {core_events} core events");
+        let audit_rows = count_for_operation(
+            &db.pool,
+            "SELECT count(*) FROM git_operations WHERE repository_id=$1 AND id=$2",
+            repo,
+            mismatch_op,
+        )
+        .await?;
+        ensure!(audit_rows == 0, "mismatch wrote {audit_rows} target audit rows");
+        let outbox_rows = count_for_operation(
+            &db.pool,
+            "SELECT count(*) FROM outbox_events WHERE repository_id=$1 AND operation_id=$2",
+            repo,
+            mismatch_op,
+        )
+        .await?;
+        ensure!(outbox_rows == 0, "mismatch wrote {outbox_rows} outbox events");
+        let decision = facts::decision(&db.pool, repo, mismatch_op)
+            .await?
+            .ok_or_else(|| anyhow!("mismatch did not persist its authorized decision"))?;
+        ensure!(
+            decision.state != "CONSUMED" && decision.consume_receipt_id.is_none(),
+            "mismatch consumed the decision before final auth"
+        );
+        let audit_after: i64 = db.pool.get().await?.query_one("SELECT count(*) FROM audit_events", &[]).await?.get(0);
+        ensure!(audit_after == audit_before, "mismatch changed audit_events");
+        ensure!(events::pending_count(&db.pool).await? == pending_before, "mismatch left a wakeable delivery");
+
+        // 2. Matching capture: the authorized lookup observes the rotated
+        //    anchor and the final transaction stamps exactly that UUID.
+        let captured_match = authorized_capture(&db.pool, &actor, &repository, &store).await?;
+        ensure!(captured_match == rotated, "matching capture did not observe the rotated anchor");
+        let match_plan = draft(
+            &db,
+            repo,
+            tenant,
+            3,
+            &verified.gate,
+            vec![update(SHA1, "refs/heads/wake-match", None, Some(&oid))?],
+            &[],
+        )
+        .await?
+        .plan;
+        let match_op = match_plan.identity().operation_id();
+        let prepared = prepare(&adapter, &db.pool, match_plan).await?;
+        let selection = select_as(&adapter, &db.pool, prepared, &actor).await?;
+        ensure!(!selection.is_all_rejected(), "the matching publication was rejected before commit");
+        let match_verified = verify(&adapter, selection).await?;
+        let receipt = adapter
+            .commit_with_expected_cluster_incarnation(&db.pool, &match_verified, captured_match, deadline())
+            .await?;
+        ensure!(
+            receipt.is_committed() && !receipt.replayed && receipt.audit_enqueued,
+            "matching capture did not produce a fresh committed audit-enqueued terminal"
+        );
+        let gate_after_match = gate_version(&db.pool, repo, tenant).await?;
+        ensure!(
+            gate_after_match.revision() == receipt.terminal.revision,
+            "matching capture did not advance the real gate"
+        );
+        ensure!(
+            facts::refs(&db.pool, repo).await?.get("refs/heads/wake-match") == Some(&oid),
+            "matching capture did not persist the applied ref"
+        );
+        let core_events = count_for_operation(
+            &db.pool,
+            "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1 AND operation_id=$2",
+            repo,
+            match_op,
+        )
+        .await?;
+        ensure!(core_events == 1, "matching capture wrote {core_events} core events");
+        let row = db
+            .pool
+            .get()
+            .await?
+            .query_opt(
+                "SELECT outcome,evidence FROM git_operations WHERE repository_id=$1 AND id=$2",
+                &[&repo, &match_op],
+            )
+            .await?
+            .ok_or_else(|| anyhow!("matching capture wrote no target audit row"))?;
+        let outcome: String = row.get(0);
+        let evidence: serde_json::Value = row.get(1);
+        let repo_hex = repo.to_string();
+        let operation_hex = match_op.to_string();
+        ensure!(outcome == "recorded", "target audit outcome is {outcome}");
+        ensure!(evidence["kind"].as_str() == Some(events::TARGET_AUDIT_KIND), "target audit kind differs");
+        ensure!(evidence["authority"].as_str() == Some("pg_refstore"), "target audit authority differs");
+        ensure!(evidence["delivery"].as_str() == Some(events::TARGET_AUDIT_CONSUMER), "target audit delivery differs");
+        ensure!(evidence["source"].as_str() == Some("ref_store_core_events"), "target audit source differs");
+        ensure!(evidence["repository_id"].as_str() == Some(repo_hex.as_str()), "target audit repository differs");
+        ensure!(
+            evidence["core_operation_id"].as_str() == Some(operation_hex.as_str()),
+            "target audit operation differs"
+        );
+        ensure!(evidence["core_revision"].as_i64() == Some(receipt.terminal.revision), "target audit revision differs");
+        ensure!(evidence["core_outcome"].as_str() == Some("committed"), "target audit core outcome differs");
+        let stored_incarnation: String = db
+            .pool
+            .get()
+            .await?
+            .query_one("SELECT evidence->>'restore_incarnation' FROM git_operations WHERE id=$1", &[&match_op])
+            .await?
+            .get(0);
+        ensure!(
+            stored_incarnation == captured_match.to_string(),
+            "target audit did not stamp the captured-and-matched incarnation"
+        );
+        let outbox_rows = count_for_operation(
+            &db.pool,
+            "SELECT count(*) FROM outbox_events WHERE repository_id=$1 AND operation_id=$2",
+            repo,
+            match_op,
+        )
+        .await?;
+        ensure!(outbox_rows == 1, "matching capture wrote {outbox_rows} outbox events");
+        let consumers: Vec<String> = db
+            .pool
+            .get()
+            .await?
+            .query(
+                "SELECT DISTINCT d.consumer FROM event_deliveries d JOIN outbox_events e USING(event_id) \
+                 WHERE e.operation_id=$1 ORDER BY 1",
+                &[&match_op],
+            )
+            .await?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        ensure!(consumers == vec![events::TARGET_AUDIT_CONSUMER.to_owned()], "audit outbox has legacy consumers");
+        let projection: i64 = db
+            .pool
+            .get()
+            .await?
+            .query_one("SELECT count(*) FROM repository_ref_projection WHERE repository_id=$1", &[&repo])
+            .await?
+            .get(0);
+        ensure!(projection == 0, "matching capture wrote a legacy ref projection");
+        ensure!(events::pending_count(&db.pool).await? == 1, "matching capture did not enqueue exactly one wake");
+
+        // 3. Generic commit keeps the pre-wake-bridge behavior: the durable
+        //    core terminal/ref/event still commit, but no target audit row and
+        //    no wakeable delivery are created.
+        let generic_plan = draft(
+            &db,
+            repo,
+            tenant,
+            4,
+            &gate_after_match,
+            vec![update(SHA1, "refs/heads/wake-generic", None, Some(&oid))?],
+            &[],
+        )
+        .await?
+        .plan;
+        let generic_op = generic_plan.identity().operation_id();
+        let prepared = prepare(&adapter, &db.pool, generic_plan).await?;
+        let selection = select_as(&adapter, &db.pool, prepared, &actor).await?;
+        ensure!(!selection.is_all_rejected(), "the generic publication was rejected before commit");
+        let generic_verified = verify(&adapter, selection).await?;
+        let generic_receipt = commit_receipt(&adapter, &db.pool, &generic_verified).await?;
+        ensure!(
+            generic_receipt.is_committed() && !generic_receipt.audit_enqueued,
+            "generic commit unexpectedly opted into the target audit wake"
+        );
+        ensure!(
+            facts::refs(&db.pool, repo).await?.get("refs/heads/wake-generic") == Some(&oid),
+            "generic commit did not persist its core ref"
+        );
+        let generic_audit = count_for_operation(
+            &db.pool,
+            "SELECT count(*) FROM git_operations WHERE repository_id=$1 AND id=$2",
+            repo,
+            generic_op,
+        )
+        .await?;
+        ensure!(generic_audit == 0, "generic commit wrote {generic_audit} target audit rows");
+        let generic_outbox = count_for_operation(
+            &db.pool,
+            "SELECT count(*) FROM outbox_events WHERE repository_id=$1 AND operation_id=$2",
+            repo,
+            generic_op,
+        )
+        .await?;
+        ensure!(generic_outbox == 0, "generic commit wrote {generic_outbox} outbox events");
+        ensure!(events::pending_count(&db.pool).await? == 1, "generic commit changed the wake queue");
+
+        // 4. Exact replay under another rotation returns the persisted
+        //    terminal, never restamps the audit evidence and never enqueues.
+        let audit_row_before = count_for_operation(
+            &db.pool,
+            "SELECT count(*) FROM git_operations WHERE repository_id=$1 AND id=$2",
+            repo,
+            match_op,
+        )
+        .await?;
+        let outbox_before = count_for_operation(
+            &db.pool,
+            "SELECT count(*) FROM outbox_events WHERE repository_id=$1 AND operation_id=$2",
+            repo,
+            match_op,
+        )
+        .await?;
+        let audit_events_before: i64 =
+            db.pool.get().await?.query_one("SELECT count(*) FROM audit_events", &[]).await?.get(0);
+        let replay_rotation = rotate_cluster(&db.pool).await?;
+        ensure!(replay_rotation != captured_match, "replay rotation did not change the incarnation");
+        let replay = adapter
+            .commit_with_expected_cluster_incarnation(&db.pool, &match_verified, captured_match, deadline())
+            .await?;
+        ensure!(
+            replay.replayed && replay.is_committed() && !replay.audit_enqueued,
+            "replay did not return the persisted terminal without a new wake"
+        );
+        ensure!(replay.terminal == receipt.terminal, "replay returned another terminal");
+        ensure!(
+            count_for_operation(
+                &db.pool,
+                "SELECT count(*) FROM git_operations WHERE repository_id=$1 AND id=$2",
+                repo,
+                match_op,
+            )
+            .await?
+                == audit_row_before,
+            "replay wrote another target audit row"
+        );
+        ensure!(
+            count_for_operation(
+                &db.pool,
+                "SELECT count(*) FROM outbox_events WHERE repository_id=$1 AND operation_id=$2",
+                repo,
+                match_op,
+            )
+            .await?
+                == outbox_before,
+            "replay wrote another outbox event"
+        );
+        let replay_incarnation: String = db
+            .pool
+            .get()
+            .await?
+            .query_one("SELECT evidence->>'restore_incarnation' FROM git_operations WHERE id=$1", &[&match_op])
+            .await?
+            .get(0);
+        ensure!(replay_incarnation == captured_match.to_string(), "replay restamped the mutable current incarnation");
+        ensure!(
+            db.pool.get().await?.query_one("SELECT count(*) FROM audit_events", &[]).await?.get::<_, i64>(0)
+                == audit_events_before,
+            "replay emitted an audit effect"
+        );
+        ensure!(events::pending_count(&db.pool).await? == 1, "replay changed the wake queue");
+
+        // 5. The standalone scoped subscriber leases exact target evidence;
+        //    an unrelated legacy audit row remains pending.
+        let decoy = events::OperationRecord {
+            id: Uuid::new_v4(),
+            repository_id: repo,
+            actor_id: actor.id,
+            token_id: actor.token_id,
+            service_principal_id: None,
+            actor_name: actor.username.clone(),
+            sequence: 900,
+            storage_generation: repository.storage_generation,
+            outcome: "recorded".to_owned(),
+            evidence: serde_json::json!({"kind":"legacy_push"}),
+            admission: None,
+        };
+        let decoy_change = events::RefEventInput {
+            transaction_sequence: 1,
+            ref_name: "refs/heads/legacy-decoy".to_owned(),
+            old_oid: "0".repeat(40),
+            new_oid: oid.clone(),
+        };
+        let mut client = db.pool.get().await?;
+        let tx = client.transaction().await?;
+        events::publish_in_tx(&tx, &decoy, std::slice::from_ref(&decoy_change)).await?;
+        tx.commit().await?;
+        let audit_before_worker: i64 =
+            db.pool.get().await?.query_one("SELECT count(*) FROM audit_events", &[]).await?.get(0);
+        ensure!(events::pending_count(&db.pool).await? == 3, "decoy did not add exactly two deliveries");
+        let consumed = events::worker_once_with_lease_scoped(
+            &db.pool,
+            events::TARGET_AUDIT_CONSUMER,
+            Some(events::TARGET_AUDIT_KIND),
+            actor.id,
+            100,
+            60,
+        )
+        .await?;
+        ensure!(consumed == 1, "target subscriber consumed {consumed} events, expected exactly one");
+        ensure!(
+            db.pool.get().await?.query_one("SELECT count(*) FROM audit_events", &[]).await?.get::<_, i64>(0)
+                == audit_before_worker + 1,
+            "target subscriber did not deliver exactly the A4 audit event"
+        );
+        ensure!(events::pending_count(&db.pool).await? == 2, "legacy decoy deliveries were consumed");
+        let decoy_audit: i64 = db
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT count(*) FROM audit_events a JOIN outbox_events e USING(event_id) WHERE e.operation_id=$1",
+                &[&decoy.id],
+            )
+            .await?
+            .get(0);
+        ensure!(decoy_audit == 0, "scoped subscriber delivered the legacy decoy");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}

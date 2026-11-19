@@ -56,7 +56,7 @@ def target_report():
 
 
 class StaticInventoryTests(unittest.TestCase):
-    def test_exact_eleven_targets_and_167_unique_cases(self):
+    def test_exact_eleven_targets_and_168_unique_cases(self):
         self.assertEqual(len(inventory.TARGET_ORDER), 11)
         self.assertEqual(set(inventory.TARGET_ORDER), set(inventory.TARGETS))
         names = []
@@ -64,8 +64,8 @@ class StaticInventoryTests(unittest.TestCase):
             cases = inventory.TARGETS[target]["cases"]
             self.assertEqual(len(cases), len(set(cases)), target)
             names.extend((target, name) for name in cases)
-        self.assertEqual(len(names), 167)
-        self.assertEqual(len(set(names)), 167)
+        self.assertEqual(len(names), 168)
+        self.assertEqual(len(set(names)), 168)
         self.assertIn("cancellation::cancel_versus_commit_keeps_one_exact_terminal",
                       inventory.TARGETS["ref_store_core"]["cases"])
         self.assertIn(
@@ -519,7 +519,7 @@ class BoundedProcessTests(unittest.TestCase):
 class ReportValidatorTests(unittest.TestCase):
     def test_valid_synthetic_report(self):
         self.assertEqual(runner.validate_report(target_report(), HEAD),
-                         {"targets": 11, "cases": 167})
+                         {"targets": 11, "cases": 168})
         with self.assertRaises(runner.RunnerError) as raised:
             runner.validate_report(target_report(), "0" * 40)
         self.assertEqual(raised.exception.code, "wrong_source_head")

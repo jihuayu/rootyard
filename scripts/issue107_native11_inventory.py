@@ -362,6 +362,7 @@ TARGETS = {
             'decision_subset_support::cases_e::non_tenant_producer_collaborator_selects_with_producer_owner_different_from_tenant',
             'decision_subset_support::cases_e::plan_claiming_another_tenant_is_refused_by_begin_pending',
             'decision_subset_support::cases_e::unauthorized_actor_cannot_select_a_producers_plan',
+            'decision_subset_support::cases_f::a4_capture_fences_restore_and_only_matched_capture_wakes_target_audit',
         ),
     },
 }
