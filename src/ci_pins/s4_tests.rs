@@ -435,7 +435,8 @@ async fn inner_wait_error_preserves_scratch_and_hands_child_to_bounded_owner() {
     )
     .await;
     for _ in 0..300 {
-        if !std::path::PathBuf::from(format!("/proc/{leader}")).exists()
+        if !root.exists()
+            && !std::path::PathBuf::from(format!("/proc/{leader}")).exists()
             && !std::path::PathBuf::from(format!("/proc/{grandchild}")).exists()
         {
             break;
@@ -444,6 +445,8 @@ async fn inner_wait_error_preserves_scratch_and_hands_child_to_bounded_owner() {
     }
     assert!(!std::path::PathBuf::from(format!("/proc/{leader}")).exists(), "unresolved owner did not reap leader");
     assert!(!std::path::PathBuf::from(format!("/proc/{grandchild}")).exists(), "grandchild survived cleanup");
-    assert!(root.exists(), "inner wait error released scratch without reap proof");
-    std::fs::remove_dir_all(&root).expect("cleanup preserved disposable view");
+    assert!(
+        !root.exists(),
+        "continuing owner must release scratch after positively confirming reap and group quiescence"
+    );
 }

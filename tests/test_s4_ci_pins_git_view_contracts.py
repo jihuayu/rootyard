@@ -28,6 +28,7 @@ TOUCHED = [
     CI_PINS / "s4_authority.rs",
     CI_PINS / "s4_git_runner.rs",
     CI_PINS / "s4_git_reaper.rs",
+    CI_PINS / "s4_git_reaper_tests.rs",
     CI_PINS / "s4_checkout.rs",
     CI_PINS / "s4_transport.rs",
     CI_PINS / "s4_tests.rs",
@@ -242,7 +243,7 @@ class SourceContracts(unittest.TestCase):
     def test_scratch_holds_outlive_child_process_groups(self) -> None:
         runner = text(CI_PINS / "s4_git_runner.rs")
         reaper = text(CI_PINS / "s4_git_reaper.rs")
-        reaper_tests = reaper.split("#[cfg(test)]", 1)[1]
+        reaper_tests = text(CI_PINS / "s4_git_reaper_tests.rs")
         tokio_block = runner.split("use tokio::{", 1)[1].split("};", 1)[0]
         self.assertIn("process::{", tokio_block)
         tokio_process = tokio_block.split("process::{", 1)[1].split("}", 1)[0]
@@ -275,9 +276,11 @@ class SourceContracts(unittest.TestCase):
         self.assertNotIn("Ok(true) | Err(_)", reaper)
         self.assertNotIn("forget(child)", reaper)
         self.assertNotIn(".wait()).await.is_ok()", reaper)
-        self.assertIn("retain_scratch", reaper)
+        self.assertIn("InFlightEntryGuard", reaper)
+        self.assertIn("ensure_standby_sweeper", reaper)
+        self.assertIn("ConfirmedRelease", reaper)
+        self.assertIn("unverified_scratch", reaper)
         self.assertIn("reap_fallback_bounded", reaper)
-        self.assertIn("handoff_unresolved_child", reaper)
         self.assertIn("state.retained", reaper)
         for test_body in (
             text(CI_PINS / "s4_tests.rs"),

@@ -95,6 +95,7 @@ impl ReapOnDropGuard {
         cmd.kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
+        crate::ci_pins::s4_git_reaper::warm_standby_reaper();
         let child = cmd.spawn().map_err(Error::internal)?;
         let pid = child.id().and_then(|id| i32::try_from(id).ok()).unwrap_or(0);
         let scratch_holds = ACTIVE_SCRATCH.try_with(Clone::clone).unwrap_or_default();
@@ -219,7 +220,7 @@ impl Drop for ReapOnDropGuard {
 
 fn signal_group(child: &mut Child, pid: i32) {
     #[cfg(unix)]
-    if pid > 1 {
+    if pid > 1 && child.id().is_some() {
         unsafe { libc::kill(-pid, libc::SIGKILL) };
         return;
     }
