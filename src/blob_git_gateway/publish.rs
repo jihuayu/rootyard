@@ -461,14 +461,13 @@ async fn slot_zero_public_preflight(
     crate::ref_store::pg::lock_operation(&**tx, repository_id, public_request.public_id, deadline)
         .await
         .map_err(GatewayError::from)?;
-    // The lane lock must precede the repository/binding/gate locks taken by the
-    // authenticated lookup and by the slot-zero coordinator. This is only a
-    // pre-lock: no sequence advances until the same transaction builds and
-    // validates the plan. Any later auth/identity refusal rolls it back.
-    PgRefStore
-        .lock_expected_lane(&**tx, repository_id, actor.id, private_id, lane, deadline)
-        .await
-        .map_err(GatewayError::from)?;
+    // The lane pre-lock precedes the repository/binding/gate locks taken by the
+    // authenticated lookup and by the slot-zero coordinator. It locks only an
+    // existing lane row and never computes `+1`, inserts a missing lane or
+    // advances a sequence, so a verified replay cannot overflow or enter the
+    // allocation path. Fresh admission allocates later in this same
+    // transaction, before its repository/gate writes. Any refusal rolls back.
+    PgRefStore.lock_expected_lane(&**tx, repository_id, actor.id, lane, deadline).await.map_err(GatewayError::from)?;
     let fresh = crate::ref_store::serving::lookup_in_tx(
         tx,
         actor,
