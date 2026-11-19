@@ -929,7 +929,6 @@ async fn replay_slot_zero_claim(
     request_digest: RequestDigest,
     deadline: Instant,
 ) -> Result<Claim, GatewayError> {
-    let repository_id = public_request.repository_id;
     let evidence =
         match PgRefStore.lookup_public_attempt(tx, public_request, deadline).await.map_err(GatewayError::from)? {
             PublicAttemptLookup::Pending(evidence)
