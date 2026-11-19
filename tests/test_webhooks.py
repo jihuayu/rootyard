@@ -806,6 +806,130 @@ class WebhooksTrackAContractTest(unittest.TestCase):
         for tok in ("failover", "ci-mirrors", "requeue_only", "wait_for_ready_ms", "X-Rootyard-CI-State"):
             self.assertIn(tok, reg_src, f"ci_runs_regressions.py missing coverage for {tok}")
 
+    def test_ci_runs_pull_sync_repair_window_is_bounded(self):
+        src = (ROOT / "tests/ci_runs_regressions.py").read_text(encoding="utf-8")
+        ast.parse(src)
+        start = src.index('new_oid=h.git("rev-parse"')
+        end = src.index('print("push reconciles PR candidate and creates new runs: passed"', start)
+        block = src[start:end]
+
+        def present(token):
+            self.assertTrue(token in block, "fixture missing required invariant")
+
+        def absent(token):
+            self.assertFalse(token in block, "fixture retained forbidden invariant")
+
+        self.assertEqual(block.count("time.monotonic()+15"), 2)
+        self.assertEqual(block.count('assert state=="ready",state'), 2)
+        self.assertEqual(block.count("h.sql("), 0, "fixture must use its deadline-aware connector")
+        self.assertEqual(block.count("psql_value("), 3)
+        self.assertEqual(block.count("psql_until("), 3)
+        self.assertEqual(block.count("subprocess.run("), 1)
+        present('["psql","-w","--dbname",env["PGDATABASE"]')
+        present("scoped_db=_scoped_dsn(h.db,budget)")
+        present("env[\"PGDATABASE\"]=scoped_db")
+        absent("shell=True")
+        absent("os.system")
+        absent("PGOPTIONS")
+        absent("psql_error")
+        present("remaining=_remaining_seconds(deadline)")
+        present("budget=_statement_timeout_ms(deadline)")
+        present("stderr=subprocess.DEVNULL")
+        present("text=True,timeout=remaining")
+        present("psql failed closed")
+        present("injection failed closed")
+        present("EXCEPTION WHEN lock_not_available THEN retry_lock := true")
+        present("_injection_outcome(returncode,stdout,timed_out)")
+        present("injection preparation window exhausted")
+        self.assertEqual(block.count("FROM forge_pulls p JOIN repositories repo"), 2)
+        self.assertEqual(block.count(
+            "GROUP BY p.repository_id,p.number,p.state,p.version,p.head_oid,p.base_oid,"
+            "repo.storage_generation"), 2)
+        self.assertEqual(block.count("DELETE FROM ci_runs"), 1)
+        self.assertEqual(block.count("DELETE FROM ci_pull_sync_progress"), 1)
+        present("BEGIN; ")
+        present("COMMIT;")
+        present("LOCK TABLE ci_runs IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+        present("LOCK TABLE ci_pull_sync_progress IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+        present("FOR UPDATE NOWAIT")
+        present("FOR SHARE NOWAIT")
+        present("RETURNING 1 INTO lint_returned")
+        present("RETURNING 1 INTO marker_returned")
+        present("GET DIAGNOSTICS lint_deleted = ROW_COUNT")
+        present("GET DIAGNOSTICS marker_deleted = ROW_COUNT")
+        self.assertGreaterEqual(block.count("RAISE EXCEPTION 'pull-sync fixture:"), 5)
+        present("IF run_total<>2 OR test_total<>1 OR lint_total<>1 OR marker_total<>1")
+        present("IF run_total<>1 OR test_total<>1 OR lint_total<>0 OR marker_total<>0")
+        present("lint_deleted::text||','||marker_deleted::text")
+        present("current_setting('rootyard.fixture_pull_sync_receipt')")
+        present('"marker_without_lint"')
+        present('"runs_without_marker"')
+        present('"marker_missing"')
+        absent('if new_runs=="2" and marker_count=="1":break')
+        absent("new_runs=h.sql")
+        absent("marker_count=h.sql")
+        absent("WITH removed_run AS (DELETE FROM ci_runs WHERE")
+        self.assertLess(block.index("pull_sync_snapshot"), block.rindex("inject_pull_sync(deadline)"))
+        self.assertLess(block.rindex("inject_pull_sync(deadline)"), block.index("pull_sync_final"))
+        self.assertLess(block.index("BEGIN; "), block.index("DELETE FROM ci_runs"))
+        self.assertLess(block.index("DELETE FROM ci_runs"), block.index("COMMIT;"))
+        self.assertLess(
+            block.index("RETURNING 1 INTO lint_returned"),
+            block.index("GET DIAGNOSTICS lint_deleted = ROW_COUNT"),
+        )
+        self.assertLess(
+            block.index("GET DIAGNOSTICS marker_deleted = ROW_COUNT"),
+            block.index("IF run_total<>1 OR test_total<>1 OR lint_total<>0 OR marker_total<>0"),
+        )
+
+
+        delivery = (ROOT / "src/webhooks/delivery.rs").read_text(encoding="utf-8")
+        start = delivery.index("pub async fn on_pull_synchronized")
+        end = delivery.index("pub async fn orchestrate_pull_ci", start)
+        producer = delivery[start:end]
+        self.assertEqual(producer.count("INSERT INTO ci_pull_sync_progress"), 1)
+        marker = producer.index("INSERT INTO ci_pull_sync_progress")
+        self.assertGreater(marker, producer.index("INSERT INTO ci_runs"))
+        self.assertGreater(marker, producer.index("reconcile_on_pull_sync"))
+        self.assertGreater(marker, producer.index("enqueue_webhook_delivery"))
+
+    def test_pull_sync_deadline_and_receipt_classification(self):
+        import ci_runs_regressions as reg
+        self.assertEqual(reg._remaining_seconds(100.0, 70.0), 30.0)
+        self.assertEqual(reg._remaining_seconds(100.0, 100.0), 0.0)
+        self.assertEqual(reg._remaining_seconds(100.0, 101.0), 0.0)
+        self.assertEqual(reg._statement_timeout_ms(100.0, 98.0), 2000)
+        self.assertEqual(reg._statement_timeout_ms(100.0, 99.9995), 1)
+        self.assertEqual(reg._statement_timeout_ms(100.0, 100.0), 0)
+        self.assertEqual(reg._injection_outcome(0, "pull-sync-receipt=1,1,1,1,0,0\n"), "applied")
+        self.assertEqual(reg._injection_outcome(0, "pull-sync-receipt=lock_not_available\n"), "retry_lock")
+        self.assertEqual(reg._injection_outcome(1, "pull-sync-receipt=lock_not_available\n"), "fail")
+        self.assertEqual(reg._injection_outcome(0, "pull-sync-receipt=1,1,1,1,0,0\n", True), "fail")
+        self.assertEqual(reg._injection_outcome(None, "", False), "fail")
+        self.assertEqual(reg._injection_outcome(0, "", False), "fail")
+        self.assertEqual(reg._injection_outcome(0, "ERROR: lock_not_available\n"), "fail")
+        self.assertEqual(reg._injection_outcome(0, "pull-sync-receipt=lock_not_available extra\n"), "fail")
+        self.assertEqual(reg._injection_outcome(
+            0, "pull-sync-receipt=1,1,1,1,0,0\npull-sync-receipt=1,1,1,1,0,0\n"), "fail")
+        fake_dsn = ("postgresql://fixture@example.invalid/fixture_db"
+                    "?options=-csearch_path%3Dfixture_schema&sslmode=disable")
+        scoped = reg._scoped_dsn(fake_dsn, 1234)
+        parts = urllib.parse.urlsplit(scoped)
+        query = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+        self.assertEqual(parts.hostname, "example.invalid")
+        self.assertEqual(parts.path, "/fixture_db")
+        self.assertEqual(query["sslmode"], "disable")
+        self.assertIn("-csearch_path=fixture_schema", query["options"])
+        self.assertIn("-c statement_timeout=1234", query["options"])
+        self.assertIn("-c lock_timeout=1234", query["options"])
+        with self.assertRaises(ValueError):
+            reg._scoped_dsn("postgresql://fixture@example.invalid/fixture_db", 1234)
+        with self.assertRaises(ValueError):
+            reg._scoped_dsn(
+                "postgresql://fixture@example.invalid/fixture_db?options=-cstatement_timeout=1", 1234)
+        with self.assertRaises(ValueError):
+            reg._scoped_dsn(fake_dsn, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
