@@ -1,5 +1,5 @@
 use super::*;
-use crate::workspace_lab::fuse_mount::MutationGate;
+use crate::workspace_lab::fuse_mount::{MountTeardownClass, MutationGate};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -267,4 +267,16 @@ fn graceful_barrier_waits_for_owned_pending_cleanup() {
     assert!(!returned_before_owner_cleanup, "the barrier returned before its pending owner finished");
     assert!(completed, "the barrier did not finish after owned cleanup");
     assert!(lock(&state.pending).is_empty());
+}
+
+#[test]
+fn typed_teardown_classes_have_distinct_reserved_nonzero_exit_codes() {
+    let codes = [
+        teardown_failstop_exit(MountTeardownClass::IdentityOrProbe),
+        teardown_failstop_exit(MountTeardownClass::MatchedIdBusy),
+        teardown_failstop_exit(MountTeardownClass::OtherUnmount),
+        teardown_failstop_exit(MountTeardownClass::JoinOrState),
+    ];
+    assert_eq!(codes, [102, 103, 104, 105]);
+    assert!(codes.iter().all(|code| *code != 0 && *code != 1 && *code != 101));
 }
