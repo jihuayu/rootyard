@@ -1,0 +1,62 @@
+# CI/Agent Fixed-OID Reusable CloneKit & Incremental Checkout (Issue #182)
+
+This document defines the architecture, safety invariants, fail-closed guarantees, and empirical evaluation results for Rootyard's opt-in CI/Agent CloneKit subsystem (`src/ci_checkouts/clonekit.rs`).
+
+## 1. Scope, Opt-In Policy & Non-Claims
+
+- **Default disabled (`use_clonekit: false`)**: `CheckoutPolicy::default()` keeps `use_clonekit: false`, `fallback_to_git_on_unusable_kit: true`, and `require_full_fsck: true`. All existing CI checkout callers (`src/ci_checkouts/authority.rs`, `handlers.rs`, `integration.rs`, `leases.rs`) remain untouched and stock Git checkouts run unchanged unless a caller explicitly requests `use_clonekit: true`.
+- **Non-claims**:
+  - CloneKit is a read-only object-pack acceleration layer (`pack` + `idx` anchored to an exact `base_commit_oid`). It is never a substitute for server authority checks, RefCas/PostgreSQL commit leases, or `#36` LFS/submodule dependency verification.
+  - When a cold CI runner downloads both the full kit over HTTP and a small origin delta, total client bytes (`clonekit_cold_http`) roughly match a fresh origin clone (`1,577,157.8 B` vs `1,576,191.8 B` for SHA-1 at 1.5 MiB) and the evaluation's stat-only `git verify-pack -s` measurement adds client CPU (`~0.115s` vs `~0.074s`). The primary benefits are **525x–763x origin `git-upload-pack` egress offload** (`clonekit_cold_http` and `clonekit_warm_cache`) and **525x–763x total wire reduction on warm runners** (`clonekit_warm_cache`).
+
+## 2. Module Layout & Ownership
+
+- Entry module: [`src/ci_checkouts/clonekit.rs`](../src/ci_checkouts/clonekit.rs) (wired from [`src/ci_checkouts.rs`](../src/ci_checkouts.rs))
+- Submodules:
+  - [`src/ci_checkouts/clonekit/manifest.rs`](../src/ci_checkouts/clonekit/manifest.rs): `CloneKitObjectFormat` (`Sha1` / `Sha256`), `CloneKitStatus` (`Ready` / `EmptyRepository`), `StoredBlobLocator`, `CloneKitArtifactDigest`, `CloneKitManifest` (all `Deserialize` types use `#[serde(deny_unknown_fields)]`), canonical domain-separated `manifest_sha256`, `CloneKitError`, and `0o700` atomic directory/file helpers.
+  - [`src/ci_checkouts/clonekit/grants.rs`](../src/ci_checkouts/clonekit/grants.rs): HMAC-SHA256 (`ring::hmac`) signed `SignedCloneKitGrant` / `CloneKitGrantClaims`, `GrantVerificationContext`, async `CloneKitAuthorityOracle` (`InMemoryAuthorityOracle` and `PgCheckoutAuthorityOracle`), and `#36` `verify_tree_dependencies` (`git ls-tree -lrz --full-tree` validating LFS pointer OIDs + `160000` submodule gitlink entries against job-scoped delegation grants).
+  - [`src/ci_checkouts/clonekit/builder.rs`](../src/ci_checkouts/clonekit/builder.rs): `build_clonekit_from_git`, `publish_clonekit_to_blob_store` (`PgArtifactHoldStore` + `ProtectedUploader` + `BlobClosureSpec::verify_closure`), `RetentionPinLedger`, and `RetentionPinGuard`. The private child [`publication.rs`](../src/ci_checkouts/clonekit/publication.rs) owns `CloneKitPublicationStore` and `publish_clonekit_versioned`: it prepares and fsyncs a unique complete generation, fences the fresh current-generation CAS with a stable per-repository `.publication.lock`, installs whole directories, recovers only an exact unpublished generation, and publishes `current.json` by atomic rename plus parent-directory fsync.
+  - [`src/ci_checkouts/clonekit/checkout.rs`](../src/ci_checkouts/clonekit/checkout.rs): `CheckoutPolicy`, `FallbackReason`, `CheckoutStrategy`, `CheckoutTelemetry`, `CheckoutOutcome`, and `execute_ci_checkout`.
+
+## 3. Protocol & Cross-Issue Safety Invariants
+
+| Concern | Related Issues | Enforced Mechanism |
+| --- | --- | --- |
+| Exact OID & parity | #182, #147, #163, #164 | Manifest binds `tenant_id`, `repository_id`, `history_id`, `storage_generation`, `object_format` (`sha1`/`sha256`), `base_commit_oid`, and `kit_generation`. Builder detects empty repos (`EmptyRepository`) and fully verifies staged pack/idx content with non-verbose `git verify-pack -- <idx>` in the selected object-format context. |
+| Anti-stale-tip fetch | #182 | Checkout stages verified `.pack`/`.idx`, sets temporary `refs/rootyard-clonekit-base -> base_commit_oid` strictly for Git `have` negotiation during `git fetch --no-tags <origin> <target_oid>`, deletes `refs/rootyard-clonekit-base` immediately after fetch, verifies `HEAD^{commit} == target_oid`, detaches `HEAD` to `target_oid`, and runs `git fsck --full --strict`. A base commit can never be mistaken for `target_oid`. |
+| Publication durability & GC safety | #182, #114 | `publish_clonekit_to_blob_store` holds active `artifact_holds` + protected upload + closure proof before exposing the manifest. `publish_clonekit_versioned` prepares pack/idx/manifest in a unique owned `.publish-*` directory, verifies exact digests and pack/idx content with non-verbose `git verify-pack -- <idx>` against those private copies in a selected-object-format ephemeral bare repo, and fsyncs them before acquiring the stable repository `.publication.lock`. Under that lock it re-reads `current.json`, requires a strictly newer generation, installs an absent generation by whole-directory rename, and accepts a pre-existing generation only when its verified manifest and pack/idx lengths/digests match the candidate exactly. `current.json` is replaced by a fsynced same-directory temp and atomic rename, followed by a parent-directory fsync. `try_gc_generation` uses the same lock and deletes only a generation strictly older than the locked fresh current while holding the process-local ledger read guard from the pin check through removal. |
+| History / restore / generation fencing | #182, #153 | Checkout verifies exact equality of `tenant_id`, `repository_id`, `history_id`, `storage_generation`, and `object_format` between the verified grant, `GrantVerificationContext`, and kit manifest; any mismatch returns `FallbackReason::KitHistoryMismatch` / `KitFormatOrStorageMismatch` / `CrossTenantDenied`. |
+| Authority, revocation & `#36` separation | #182, #34, #36 | `PgCheckoutAuthorityOracle` checks `ci_checkout_jobs` (`revoked = false`, `expires_unix > now`), `repositories.state = 'ready'`, and scopes `ci_checkout_delegations` with `d.job_id = $1 AND d.expires_unix > now`. Authority and `CancellationToken` are checked pre-fetch, mid-transfer, and post-checkout. LFS objects and submodule gitlinks in the checked-out tree must match signed `CloneKitDependencyGrants`. |
+| Runner isolation & secret hygiene | #182 | Workspaces are created in `0o700` `DisposableViewRoot` leases (`TempViewLease` lifetime bound to `CheckoutOutcome`). Bearer tokens use `-c http.extraheader` in subprocess env/args only and are never written to `.git/config` or remote URLs. |
+
+### Publication CAS, recovery, and cancellation truth
+
+- The stable per-repository `.publication.lock` is opened without truncation and locked with `fs2::FileExt::try_lock_exclusive`. Contention returns an explicit finite `CloneKitError::GitFailed` publication-busy error; there is no unbounded wait, sleep/retry loop, or new timeout. The lock file is never renamed or unlinked and is not treated as a stale-generation signal. All cooperating publishers and local GC for a repository use the same lock inode.
+- A candidate is fully staged, digest-checked, Git-verified, and directory-synced before lock acquisition. An exact pre-existing but unpublished generation may be recovered only when its complete verified manifest equals the candidate and every pack/idx length/digest matches it; a differing, corrupt, symlinked, or unexpected directory fails closed without rewriting it. Failed attempts remove only their own `.publish-*` directory. Exact interrupted-install recovery performs local pack/idx hashing while holding the lock; this exceptional path is not given a hard time bound. The normal absent-target commit performs no artifact hashing or Git operation under the lock.
+- After the `current.json` rename succeeds, that rename is the visibility linearization point. Cancellation is not reported after it, and a later directory-fsync failure returns an explicit existing-surface `CloneKitError::GitFailed` stating that publication outcome/durability is uncertain; it does not claim the old current is unchanged. An installed generation or prepared version directory left by a failed pointer update may remain for exact retry or later strictly-older GC.
+- The `RetentionPinLedger` remains process-local: `load_latest` (lock-free) followed by pin acquisition, and GC versus a separate process that has not pinned, remain explicit limitations. This change does not claim end-to-end distributed GC, a cross-process read lease, BlobDB atomicity, or a joint database/filesystem commit.
+- Deterministic race, cancellation, staged-verification, and crash-point source tests live in the private `publication_tests.rs` and `publication_race_tests.rs` modules and compile only under `cfg(test)`; no production fault-injection hook is exposed.
+
+## 4. Empirical Evaluation (`scripts/eval_ci_clonekit.py --scale full`)
+
+Measured on real Git over loopback Smart HTTP (`git-http-backend` with Bearer auth) and Bearer-protected CloneKit HTTP cache (`history_payload_bytes = 1,572,864` per format, `8` incremental target commits per mode, Windows 11, `git version 2.45.1.windows.1`):
+
+| Format | Mode | Origin Wire TX (B/run) | Kit HTTP GET (B/run) | Total Wire TX (B/run) | Client Scratch Disk (B) | Client CPU (s) | P50 (ms) | P95 (ms) | P99 (ms) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `sha1` | Stock Git Direct | 1,576,191.8 | 0.0 | 1,576,191.8 | 1,603,226.4 | 0.0742 | 747.00 | 809.37 | 809.37 |
+| `sha1` | CloneKit Cold HTTP | 2,065.8 | 1,575,092.0 | 1,577,157.8 | 1,604,438.4 | 0.1152 | 815.58 | 901.19 | 901.19 |
+| `sha1` | CloneKit Warm Cache | 2,065.8 | 0.0 | 2,065.8 | 1,604,438.4 | 0.1094 | 744.27 | 832.00 | 832.00 |
+| `sha256` | Stock Git Direct | 1,577,143.0 | 0.0 | 1,577,143.0 | 1,603,903.1 | 0.0742 | 765.58 | 996.33 | 996.33 |
+| `sha256` | CloneKit Cold HTTP | 3,003.0 | 1,575,255.0 | 1,578,258.0 | 1,605,211.1 | 0.1152 | 806.70 | 914.59 | 914.59 |
+| `sha256` | CloneKit Warm Cache | 3,003.0 | 0.0 | 3,003.0 | 1,605,211.1 | 0.1055 | 748.42 | 841.39 | 841.39 |
+
+- **Origin wire egress reduction**: **`762.99x`** (`sha1`) and **`525.19x`** (`sha256`).
+- **One-time CloneKit build cost**: `sha1` pack=`1,573,880 B`, idx=`1,212 B` (`258.59 ms` wall, `0.0469 s` CPU); `sha256` pack=`1,573,959 B`, idx=`1,296 B` (`255.28 ms` wall, `0.0469 s` CPU).
+- **Fault injection fallbacks**: `kit_miss_fallback=true` and `kit_corrupt_fallback=true` verified on both `sha1` and `sha256`, failing over cleanly to stock Git + full `fsck`.
+- Linux runner telemetry is emitted per PR in CI workflow [`ci-clonekit.yml`](../.github/workflows/ci-clonekit.yml) (`ci-clonekit-evidence` artifact).
+
+## 5. Verification
+
+- Offline & Smart-HTTP Rust suite: [`tests/ci_clonekit.rs`](../tests/ci_clonekit.rs) (`cargo test --locked --test ci_clonekit`)
+- Live PostgreSQL 17 + Garage 2.1 S3 suite: `cargo test --locked --test ci_clonekit -- --ignored --test-threads=1`
+- Python contract & eval suite: [`tests/test_ci_clonekit_contracts.py`](../tests/test_ci_clonekit_contracts.py) and [`scripts/eval_ci_clonekit.py`](../scripts/eval_ci_clonekit.py)
