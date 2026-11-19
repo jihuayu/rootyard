@@ -2,9 +2,12 @@
 """Pure static tests for the fixed #107 hosted inventory wiring."""
 from __future__ import annotations
 
+import re
 import sys
+import textwrap
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -137,18 +140,106 @@ class HostedWiringTests(unittest.TestCase):
 
     def test_step11_requires_exact_a4_ok_row_and_bound_separate_report(self):
         step = native_step()
-        row = f"test {A4_CASE} ... ok"
-        self.assertIn(row, step)
-        self.assertIn("assert log.count(a4_row) == 1", step)
-        self.assertIn("assert log.count(a4_prefix) == 1", step)
-        self.assertIn("assert a4_prefix + ' ignored' not in log", step)
+        self.assertIn(f"a4_name = '{A4_CASE}'", step)
+        self.assertIn("a4_prefix = f'test {a4_name} ...'", step)
+        self.assertIn("a4_ok = f'{a4_prefix} ok'", step)
+        self.assertIn(
+            "a4_rows = [line for line in log.splitlines() if a4_prefix in line]",
+            step)
+        self.assertIn("assert len(a4_rows) == 1", step)
+        self.assertIn("assert a4_rows[0] == a4_ok", step)
+        self.assertNotIn("log.count(a4_row", step)
+        self.assertNotIn("log.count(a4_prefix", step)
         self.assertIn("issue107-a4-native.json", step)
         self.assertIn("'case': a4_name", step)
-        self.assertIn("'row': a4_row", step)
+        self.assertIn("'status': 'passed'", step)
+        self.assertIn("'passed': True", step)
+        self.assertIn("'row': a4_ok", step)
+        self.assertIn("'source_head': source_head", step)
+        self.assertIn("'checkout_head': checkout_head", step)
+        self.assertIn("'checkout_tree': checkout_tree", step)
         self.assertIn("'native_log_sha256': hashlib.sha256(raw_log).hexdigest()", step)
         self.assertIn("native.json", step)
         self.assertIn("'suite_counts': [int(row[1]) for row in rows]", step)
-        self.assertIn("assert sorted(int(passed) for _, passed, _, _ in rows) == [8, 12, 23, 24]", step)
+        self.assertIn("suite_counts = sorted(int(passed) for _, passed, _, _ in rows)", step)
+        self.assertIn("assert suite_counts == [8, 12, 23, 24]", step)
+        self.assertIn("source_head = os.environ.get('GITHUB_SHA', '')", step)
+        self.assertIn("assert re.fullmatch(r'[0-9a-f]{40}', source_head)", step)
+        self.assertIn("checkout_head = subprocess.check_output(", step)
+        self.assertIn("['git', 'rev-parse', 'HEAD']", step)
+        self.assertIn("assert checkout_head == source_head", step)
+        self.assertIn("checkout_tree = subprocess.check_output(", step)
+        self.assertIn("['git', 'rev-parse', 'HEAD^{tree}']", step)
+        self.assertIn("assert re.fullmatch(r'[0-9a-f]{40}', checkout_tree)", step)
+
+    def test_step11_a4_row_and_source_checks_reject_false_positive_and_wrong_source(self):
+        step = native_step()
+
+        def snippet(start_marker, end_marker):
+            start = step.index(start_marker)
+            start = step.rfind("\n", 0, start) + 1
+            end = step.index(end_marker, start)
+            end = step.index("\n", end)
+            return textwrap.dedent(step[start:end])
+
+        row_source = snippet("a4_name = ", "assert a4_rows[0] == a4_ok")
+        expected = f"test {A4_CASE} ... ok"
+        namespace = {"log": "harness noise\n" + expected + "\n"}
+        exec(row_source, namespace)
+        self.assertEqual(namespace["a4_rows"], [expected])
+
+        false_positives = (
+            expected + " trailing",
+            "prefix " + expected,
+            f"test {A4_CASE} ... ignored",
+            f"test {A4_CASE} ...",
+            expected + "\n" + expected + "\n",
+        )
+        for log in false_positives:
+            with self.assertRaises(AssertionError):
+                exec(row_source, {"log": log})
+
+        source_source = snippet(
+            "source_head = os.environ.get",
+            "assert re.fullmatch(r'[0-9a-f]{40}', checkout_tree)")
+        head = "a" * 40
+        tree = "b" * 40
+
+        def check_output(argv, **kwargs):
+            self.assertEqual(kwargs.get("cwd"), "/workspace")
+            self.assertEqual(kwargs.get("text"), True)
+            if argv == ["git", "rev-parse", "HEAD"]:
+                return head + "\n"
+            if argv == ["git", "rev-parse", "HEAD^{tree}"]:
+                return tree + "\n"
+            raise AssertionError(argv)
+
+        source_namespace = {
+            "os": SimpleNamespace(environ={
+                "GITHUB_SHA": head, "GITHUB_WORKSPACE": "/workspace"}),
+            "re": re,
+            "subprocess": SimpleNamespace(check_output=check_output),
+        }
+        exec(source_source, source_namespace)
+        self.assertEqual(source_namespace["source_head"], head)
+        self.assertEqual(source_namespace["checkout_head"], head)
+        self.assertEqual(source_namespace["checkout_tree"], tree)
+
+        wrong_source = {
+            **source_namespace,
+            "os": SimpleNamespace(environ={
+                "GITHUB_SHA": "c" * 40, "GITHUB_WORKSPACE": "/workspace"}),
+        }
+        with self.assertRaises(AssertionError):
+            exec(source_source, wrong_source)
+
+        bad_hex = {
+            **source_namespace,
+            "os": SimpleNamespace(environ={
+                "GITHUB_SHA": "A" * 40, "GITHUB_WORKSPACE": "/workspace"}),
+        }
+        with self.assertRaises(AssertionError):
+            exec(source_source, bad_hex)
 
     def test_existing_unfiltered_sequence_still_has_all_legacy_reports(self):
         text = WORKFLOW.read_text()
