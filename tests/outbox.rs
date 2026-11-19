@@ -214,3 +214,168 @@ async fn verify_contract(pool: &Pool) -> Result<()> {
     );
     Ok(())
 }
+
+/// Genuine ignored owned-PG witness for the standalone core-commit wake bridge.
+///
+/// It proves the durable half of the association: a fresh core commit's exact
+/// applied refs can be projected into the existing `audit-log` delivery queue
+/// inside the caller transaction, the legacy worker can claim and acknowledge
+/// them, no `ref-index` projection is created, and a pre-existing legacy
+/// sequence is never overwritten (the caller must then not emit a hint).
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL and PostgreSQL schema creation permission"]
+async fn core_commit_audit_bridge_is_scanned_and_acked_by_the_existing_worker() -> Result<()> {
+    let url = std::env::var("ROOTYARD_TEST_DATABASE_URL").context("set ROOTYARD_TEST_DATABASE_URL")?;
+    let admin = db::pool(&url)?;
+    let schema = format!("wake_bridge_test_{}", Uuid::new_v4().simple());
+    admin.get().await?.batch_execute(&format!("CREATE SCHEMA {schema}")).await?;
+    let result = run_wake_bridge_in_schema(&url, &schema).await;
+    admin.get().await?.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await?;
+    result
+}
+
+async fn run_wake_bridge_in_schema(url: &str, schema: &str) -> Result<()> {
+    let mut config: tokio_postgres::Config = url.parse()?;
+    config.options(format!("-c search_path={schema} -c statement_timeout=5000 -c lock_timeout=3000"));
+    let pool = Pool::builder(Manager::new(config, tokio_postgres::NoTls))
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .max_size(8)
+        .build()?;
+    tokio::spawn(async move {
+        db::migrate(&pool).await?;
+        let token = db::issue_token(&pool, "alice", true, false).await?;
+        let actor: Uuid = serde_json::from_value(token["user_id"].clone())?;
+        let token_id: Uuid = serde_json::from_value(token["token_id"].clone())?;
+        let collision_repo = Uuid::new_v4();
+        pool.get()
+            .await?
+            .execute(
+                "INSERT INTO repositories(id,owner_id,name,state) VALUES($1,$2,'wake-collision','ready')",
+                &[&collision_repo, &actor],
+            )
+            .await?;
+        let repo = Uuid::new_v4();
+        pool.get()
+            .await?
+            .execute("INSERT INTO repositories(id,owner_id,name,state) VALUES($1,$2,'wake','ready')", &[&repo, &actor])
+            .await?;
+        let a = "1".repeat(40);
+        let b = "2".repeat(40);
+        let zero = "0".repeat(40);
+
+        // A legacy operation already owns this sequence. The bridge must decline
+        // instead of overwriting it or emitting a wake for an absent job.
+        let legacy_id = Uuid::new_v4();
+        pool.get()
+            .await?
+            .execute(
+                "INSERT INTO git_operations(id,repository_id,actor_id,token_id,actor_name,sequence,storage_generation,evidence,outcome) \
+                 VALUES($1,$2,$3,$4,'alice',9,1,'{}','recorded')",
+                &[&legacy_id, &collision_repo, &actor, &token_id],
+            )
+            .await?;
+        let colliding = record(collision_repo, actor, token_id, 9);
+        let colliding_change = change(1, "refs/heads/main", &zero, &a);
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        assert!(
+            events::publish_core_commit_audit_in_tx(&tx, &colliding, std::slice::from_ref(&colliding_change))
+                .await
+                .is_err(),
+            "a legacy sequence collision must fail closed, not be acknowledged"
+        );
+        tx.rollback().await?;
+        let collision_events: i64 = pool
+            .get()
+            .await?
+            .query_one("SELECT count(*) FROM outbox_events WHERE operation_id=$1", &[&colliding.id])
+            .await?
+            .get(0);
+        assert_eq!(collision_events, 0);
+
+        // A fresh recorded projection is accepted atomically and is idempotent.
+        let projection_record = record(repo, actor, token_id, 7);
+        let changes = vec![
+            change(1, "refs/heads/main", &zero, &a),
+            change(2, "refs/heads/side", &zero, &b),
+        ];
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        events::publish_core_commit_audit_in_tx(&tx, &projection_record, &changes).await?;
+        tx.commit().await?;
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        events::publish_core_commit_audit_in_tx(&tx, &projection_record, &changes).await?;
+        tx.commit().await?;
+
+        // A same-id row with different fixed evidence is a cross-kind conflict,
+        // not a duplicate: it must fail closed without changing the durable row.
+        let mut mismatched = projection_record.clone();
+        mismatched.evidence = serde_json::json!({"kind":"legacy_push"});
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        assert!(
+            events::publish_core_commit_audit_in_tx(&tx, &mismatched, &changes).await.is_err(),
+            "a mismatched same-id audit row must fail closed"
+        );
+        tx.rollback().await?;
+        let evidence: serde_json::Value = pool
+            .get()
+            .await?
+            .query_one("SELECT evidence FROM git_operations WHERE id=$1", &[&projection_record.id])
+            .await?
+            .get(0);
+        assert_eq!(evidence["kind"], "pg_refstore_core_commit_audit");
+        assert_eq!(evidence["delivery"], "audit-log");
+        assert_eq!(evidence["storage_generation"], 1);
+        assert_eq!(evidence["core_outcome"], "committed");
+
+        // Only audit-log work exists; the legacy ref-index consumer cannot
+        // create a conflicting `repository_ref_projection` authority row.
+        assert!(events::claim(&pool, "ref-index", Uuid::new_v4(), 100, 60).await?.is_empty());
+        assert_eq!(events::pending_count(&pool).await?, 2);
+        assert_eq!(events::worker_once(&pool, "audit-log", actor, 100).await?, 2);
+        assert_eq!(events::pending_count(&pool).await?, 0);
+        let audit: i64 = pool.get().await?.query_one("SELECT count(*) FROM audit_events", &[]).await?.get(0);
+        assert_eq!(audit, 2);
+        let projection: i64 =
+            pool.get().await?.query_one("SELECT count(*) FROM repository_ref_projection", &[]).await?.get(0);
+        assert_eq!(projection, 0);
+
+        // The collision record itself remains unprojected and unacknowledged.
+        let stored: serde_json::Value =
+            pool.get().await?.query_one("SELECT evidence FROM git_operations WHERE id=$1", &[&legacy_id]).await?.get(0);
+        assert_eq!(stored, serde_json::json!({}));
+        println!(
+            "PASS core-commit audit-only outbox/replay/worker ack/no ref-index projection/legacy-sequence refusal"
+        );
+        Ok(())
+    })
+    .await
+    .context("wake bridge test panicked")?
+}
+
+fn record(repository_id: Uuid, actor_id: Uuid, token_id: Uuid, sequence: i64) -> events::OperationRecord {
+    events::OperationRecord {
+        id: Uuid::new_v4(),
+        repository_id,
+        actor_id,
+        token_id,
+        service_principal_id: None,
+        actor_name: "alice".into(),
+        sequence,
+        storage_generation: 1,
+        outcome: "recorded".into(),
+        evidence: serde_json::json!({"kind":"pg_refstore_core_commit_audit"}),
+        admission: None,
+    }
+}
+
+fn change(transaction_sequence: i64, ref_name: &str, old_oid: &str, new_oid: &str) -> events::RefEventInput {
+    events::RefEventInput {
+        transaction_sequence,
+        ref_name: ref_name.into(),
+        old_oid: old_oid.into(),
+        new_oid: new_oid.into(),
+    }
+}

@@ -29,7 +29,7 @@ use super::{
     error::GatewayError,
     repo_session::SessionTokens,
 };
-use crate::{blob_store::opendal::BlobStore, cache_wake::ServingCache};
+use crate::{blob_store::opendal::BlobStore, cache_wake::ServingCache, dispatch};
 
 tokio::task_local! {
     pub(super) static REQUEST_DEADLINE: Instant;
@@ -52,6 +52,9 @@ pub struct BlobGitState {
     /// Advisory, non-authoritative payload cache. It is absent by default and
     /// carries no refs, auth, sessions, holds, roots or durable bytes.
     cache: Option<Arc<ServingCache>>,
+    /// Local advisory wake signals. Only a fresh committed terminal whose
+    /// audit outbox rows committed with it may call `committed()`.
+    dispatch: dispatch::Signals,
     packfile_offload: Option<Arc<crate::browse::packfile_uri::GatewayPackfileOffload>>,
     /// Acceptance-only rendezvous. It is absent in every non-test build and
     /// cannot be selected by any request, header or runtime configuration.
@@ -85,6 +88,7 @@ impl BlobGitState {
             workspace: Arc::new(AtomicU64::new(0)),
             sessions: None,
             cache: None,
+            dispatch: dispatch::Signals::default(),
             packfile_offload: None,
             #[cfg(test)]
             admission_pause: None,
@@ -113,6 +117,18 @@ impl BlobGitState {
     /// The configured advisory cache, if any.
     pub(super) fn cache(&self) -> Option<&Arc<ServingCache>> {
         self.cache.as_ref()
+    }
+
+    /// Share the one local advisory signal set with the embedded worker and the
+    /// publisher (if any). It carries no event data and never participates in
+    /// authority or delivery state.
+    pub fn with_dispatch(mut self, dispatch: dispatch::Signals) -> Self {
+        self.dispatch = dispatch;
+        self
+    }
+
+    pub(super) fn dispatch(&self) -> &dispatch::Signals {
+        &self.dispatch
     }
 
     /// Attach optional Smart-HTTP v2 `packfile-uris` offload runtime (#185).

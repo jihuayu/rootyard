@@ -107,7 +107,7 @@ async fn publish_guarded(
 ) -> Result<()> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    publish_in_tx_guarded(&tx, operation, changes, no_grant, recorded).await?;
+    publish_in_tx_guarded(&tx, operation, changes, no_grant, recorded, true).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -116,7 +116,85 @@ async fn publish_guarded(
 /// transaction. Pando uses this with the authoritative ref/pack CAS so neither
 /// side can commit independently.
 pub async fn publish_in_tx(tx: &Transaction<'_>, operation: &OperationRecord, changes: &[RefEventInput]) -> Result<()> {
-    publish_in_tx_guarded(tx, operation, changes, None, None).await
+    publish_in_tx_guarded(tx, operation, changes, None, None, true).await
+}
+
+/// Project one already-committed core pack operation into the durable delivery
+/// outbox as *audit-log only*. It runs inside the core commit transaction, so
+/// the `git_operations` row, exact applied ref events and their `audit-log`
+/// deliveries become durable atomically with `ref_store_core_events`.
+///
+/// This is a delivery/audit projection, never a ref authority: the core refs,
+/// gate revision and terminal remain the only source of truth, and no
+/// `ref-index` delivery is created (that legacy consumer would otherwise write
+/// `repository_ref_projection`, which the `pg_refstore` serving predicate
+/// treats as a conflicting legacy authority).
+///
+/// A different `git_operations` row already owning the same exact
+/// `(repository, storage_generation, sequence)` tuple is a typed namespace
+/// conflict. The caller must roll back the whole core commit rather than ACK
+/// content whose audit delivery was silently dropped.
+pub async fn publish_core_commit_audit_in_tx(
+    tx: &Transaction<'_>,
+    operation: &OperationRecord,
+    changes: &[RefEventInput],
+) -> Result<(), crate::ref_store::contract::RefStoreError> {
+    if operation.outcome != "recorded" {
+        return Err(crate::ref_store::contract::RefStoreError::Unsupported(
+            "core audit projection requires a recorded operation",
+        ));
+    }
+    if changes.is_empty() {
+        return Ok(());
+    }
+    // The legacy delivery namespace must contain only this fixed audit kind.
+    // A legacy push/CI/unknown row at any sequence means the repository is not
+    // an isolated fresh `pg_refstore` audit namespace, so fail closed instead
+    // of mixing sequence spaces or letting generic idempotency hide it.
+    let foreign_kind: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM git_operations \
+             WHERE repository_id=$1 AND id<>$2 \
+               AND COALESCE(evidence->>'kind','') <> 'pg_refstore_core_commit_audit'",
+            &[&operation.repository_id, &operation.id],
+        )
+        .await
+        .map_err(crate::ref_store::pg::db_error)?
+        .get(0);
+    if foreign_kind != 0 {
+        return Err(crate::ref_store::contract::RefStoreError::IdentityConflict);
+    }
+    let existing = tx
+        .query_opt(
+            "SELECT id,repository_id,storage_generation,sequence,actor_id,token_id,service_principal_id,actor_name,outcome,evidence \
+             FROM git_operations \
+             WHERE (repository_id=$1 AND storage_generation=$2 AND sequence=$3) OR id=$4",
+            &[&operation.repository_id, &operation.storage_generation, &operation.sequence, &operation.id],
+        )
+        .await
+        .map_err(crate::ref_store::pg::db_error)?;
+    if let Some(row) = existing {
+        // Only a byte-identical local duplicate of this audit projection may be
+        // confirmed. Any other id, authority scope, sequence, principal,
+        // outcome or evidence is a cross-kind/namespace conflict: fail closed
+        // rather than letting generic `ON CONFLICT` idempotency hide it.
+        let exact = row.get::<_, Uuid>(0) == operation.id
+            && row.get::<_, Uuid>(1) == operation.repository_id
+            && row.get::<_, i64>(2) == operation.storage_generation
+            && row.get::<_, i64>(3) == operation.sequence
+            && row.get::<_, Option<Uuid>>(4) == Some(operation.actor_id)
+            && row.get::<_, Option<Uuid>>(5) == Some(operation.token_id)
+            && row.get::<_, Option<Uuid>>(6) == operation.service_principal_id
+            && row.get::<_, String>(7) == operation.actor_name
+            && row.get::<_, String>(8) == "recorded"
+            && row.get::<_, serde_json::Value>(9) == operation.evidence;
+        if !exact {
+            return Err(crate::ref_store::contract::RefStoreError::IdentityConflict);
+        }
+    }
+    publish_in_tx_guarded(tx, operation, changes, None, None, false)
+        .await
+        .map_err(|_| crate::ref_store::contract::RefStoreError::Database("core audit outbox projection failed".into()))
 }
 
 async fn publish_in_tx_guarded(
@@ -125,6 +203,7 @@ async fn publish_in_tx_guarded(
     changes: &[RefEventInput],
     no_grant: Option<&crate::storage::no_grant_proof::NoGrantAbort>,
     recorded: Option<&crate::storage::recorded_receipt_proof::RecordedReceiptProof>,
+    enqueue_ref_index: bool,
 ) -> Result<()> {
     ensure!(matches!(operation.outcome.as_str(), "unknown" | "recorded" | "no_ref_changes"), "invalid outcome");
     ensure!(operation.sequence > 0 && operation.storage_generation > 0, "invalid operation sequence");
@@ -245,7 +324,18 @@ async fn publish_in_tx_guarded(
                 && old.get::<_, String>(4) == change.new_oid,
             "event replay mismatch"
         );
-        tx.execute("INSERT INTO event_deliveries(event_id,consumer) VALUES($1,'audit-log'),($1,'ref-index') ON CONFLICT DO NOTHING", &[&id]).await?;
+        tx.execute(
+            "INSERT INTO event_deliveries(event_id,consumer) VALUES($1,'audit-log') ON CONFLICT DO NOTHING",
+            &[&id],
+        )
+        .await?;
+        if enqueue_ref_index {
+            tx.execute(
+                "INSERT INTO event_deliveries(event_id,consumer) VALUES($1,'ref-index') ON CONFLICT DO NOTHING",
+                &[&id],
+            )
+            .await?;
+        }
     }
     tx.execute("UPDATE git_operations SET outcome=$2,evidence=$3,settled_at=CASE WHEN $2='unknown' THEN NULL ELSE COALESCE(settled_at,clock_timestamp()) END WHERE id=$1", &[&operation.id,&operation.outcome,&operation.evidence]).await?;
     Ok(())

@@ -25,7 +25,7 @@ pub trait WakeTransport: Send + Sync {
     fn publish(&self) -> Task<'_, Result<()>>;
     fn subscribe(&self, signal: Arc<Notify>, stop: CancellationToken) -> Task<'_, ()>;
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Signals {
     pub local: Arc<Notify>,
     pub remote: Arc<Notify>,
