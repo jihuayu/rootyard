@@ -31,37 +31,20 @@ fn json_reply(status: StatusCode, value: &impl Serialize) -> Result<Response<Bod
 
 pub(super) async fn serve(config: Arc<Config>) -> Result<()> {
     let version = String::from_utf8(config.git(&config.root, &["--version"], b"").await?)?;
-    let numbers: Vec<u32> = version
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("")
-        .split('.')
-        .take(2)
-        .map(|n| n.parse().unwrap_or(0))
-        .collect();
+    let numbers: Vec<u32> =
+        version.split_whitespace().nth(2).unwrap_or("").split('.').take(2).map(|n| n.parse().unwrap_or(0)).collect();
     ensure!(
         numbers.len() == 2 && (numbers[0], numbers[1]) >= (2, 43),
         "lab requires native Git 2.43 or newer for proc-receive"
     );
-    let listen: std::net::SocketAddr = std::env::var("PANDO_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:0".into())
-        .parse()?;
-    ensure!(
-        listen.ip().is_loopback(),
-        "lab server may only listen on loopback"
-    );
+    let listen: std::net::SocketAddr =
+        std::env::var("PANDO_LISTEN").unwrap_or_else(|_| "127.0.0.1:0".into()).parse()?;
+    ensure!(listen.ip().is_loopback(), "lab server may only listen on loopback");
     let listener = tokio::net::TcpListener::bind(listen).await?;
     println!("LISTEN http://{}", listener.local_addr()?);
     std::io::stdout().flush()?;
-    let state = Server {
-        config,
-        slots: Arc::new(tokio::sync::Semaphore::new(8)),
-    };
-    axum::serve(
-        listener,
-        Router::new().fallback(any(handler)).with_state(state),
-    )
-    .await?;
+    let state = Server { config, slots: Arc::new(tokio::sync::Semaphore::new(8)) };
+    axum::serve(listener, Router::new().fallback(any(handler)).with_state(state)).await?;
     Ok(())
 }
 
@@ -80,24 +63,15 @@ async fn handler(State(s): State<Server>, request: Request<Body>) -> Response<Bo
 
 async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<Body>> {
     let (parts, body) = request.into_parts();
-    let principal = parts
-        .headers
-        .get("X-Pando-Principal")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let principal = parts.headers.get("X-Pando-Principal").and_then(|v| v.to_str().ok()).unwrap_or("");
     if principal.is_empty() || principal.len() > 64 {
-        return Ok(reply(
-            StatusCode::UNAUTHORIZED,
-            "synthetic principal required",
-        ));
+        return Ok(reply(StatusCode::UNAUTHORIZED, "synthetic principal required"));
     }
     let path = parts.uri.path();
     let segments: Vec<_> = path.trim_start_matches('/').split('/').collect();
     let (token, repository, tail) = match segments.as_slice() {
         ["repos", repo, tail @ ..] => (None, *repo, tail.join("/")),
-        ["snapshots", token, repo, tail @ ..] => {
-            (Some(token.parse::<Uuid>()?), *repo, tail.join("/"))
-        }
+        ["snapshots", token, repo, tail @ ..] => (Some(token.parse::<Uuid>()?), *repo, tail.join("/")),
         _ => return Ok(reply(StatusCode::NOT_FOUND, "unknown route")),
     };
     let Some(id) = repository.strip_suffix(".git") else {
@@ -184,20 +158,14 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
             if !permitted(&db, repo, principal, false).await? {
                 return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
             }
-            return json_reply(
-                StatusCode::OK,
-                &lifecycle::rotation::kms_status(config, repo).await?,
-            );
+            return json_reply(StatusCode::OK, &lifecycle::rotation::kms_status(config, repo).await?);
         }
         if tail == "object-format" {
             let db = config.db().await?;
             if !permitted(&db, repo, principal, false).await? {
                 return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
             }
-            return json_reply(
-                StatusCode::OK,
-                &object_format::detect_format(config, &repo.to_string()).await?,
-            );
+            return json_reply(StatusCode::OK, &object_format::detect_format(config, &repo.to_string()).await?);
         }
     }
     if token.is_none() && parts.method == "POST" && tail == "object-format" {
@@ -213,18 +181,10 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
             return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
         }
         let proto_v2 = req.protocol_version.unwrap_or(2) >= 2;
-        let report = object_format::run_compat_matrix_drill(
-            config,
-            Some(repo),
-            req.client_object_format.as_deref(),
-            proto_v2,
-        )
-        .await?;
-        let status = if report.negotiation_admitted {
-            StatusCode::OK
-        } else {
-            StatusCode::CONFLICT
-        };
+        let report =
+            object_format::run_compat_matrix_drill(config, Some(repo), req.client_object_format.as_deref(), proto_v2)
+                .await?;
+        let status = if report.negotiation_admitted { StatusCode::OK } else { StatusCode::CONFLICT };
         return json_reply(status, &report);
     }
     if token.is_none() && parts.method == "POST" && tail == "repack" {
@@ -233,10 +193,7 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
             return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
         }
         let state_row = db
-            .query_opt(
-                "SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1",
-                &[&repo],
-            )
+            .query_opt("SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1", &[&repo])
             .await?;
         let Some(state_row) = state_row else {
             return Ok(reply(StatusCode::NOT_FOUND, "unknown repository"));
@@ -244,21 +201,12 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
         let write_paused: bool = state_row.get(0);
         let storage_backend: String = state_row.get(1);
         if write_paused || storage_backend != "pando" {
-            return Ok(reply(
-                StatusCode::CONFLICT,
-                "repository writes paused or routed to gitfs",
-            ));
+            return Ok(reply(StatusCode::CONFLICT, "repository writes paused or routed to gitfs"));
         }
         let raw_body = to_bytes(body, 64 * 1024).await?;
-        let opts: repack::RepackOptions = if raw_body.is_empty() {
-            repack::RepackOptions::default()
-        } else {
-            serde_json::from_slice(&raw_body)?
-        };
-        return json_reply(
-            StatusCode::OK,
-            &repack::repack_repo(config, repo, &opts).await?,
-        );
+        let opts: repack::RepackOptions =
+            if raw_body.is_empty() { repack::RepackOptions::default() } else { serde_json::from_slice(&raw_body)? };
+        return json_reply(StatusCode::OK, &repack::repack_repo(config, repo, &opts).await?);
     }
     if token.is_none() && parts.method == "POST" && tail == "lifecycle" {
         let db = config.db().await?;
@@ -271,10 +219,7 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
         } else {
             serde_json::from_slice(&raw_body)?
         };
-        return json_reply(
-            StatusCode::OK,
-            &lifecycle::evaluate_lifecycle(config, repo, &opts).await?,
-        );
+        return json_reply(StatusCode::OK, &lifecycle::evaluate_lifecycle(config, repo, &opts).await?);
     }
     if token.is_none() && parts.method == "POST" && tail == "kms/rotate" {
         let db = config.db().await?;
@@ -303,7 +248,7 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
         _ => return Ok(reply(StatusCode::NOT_FOUND, "unknown route")),
     };
     let write = service == "git-receive-pack";
-    let db = config.db().await?;
+    let mut db = config.db().await?;
     if !permitted(&db, repo, principal, write).await? {
         return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
     }
@@ -312,10 +257,7 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
     }
     if write {
         let state_row = db
-            .query_opt(
-                "SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1",
-                &[&repo],
-            )
+            .query_opt("SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1", &[&repo])
             .await?;
         let Some(state_row) = state_row else {
             return Ok(reply(StatusCode::NOT_FOUND, "unknown repository"));
@@ -323,10 +265,7 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
         let write_paused: bool = state_row.get(0);
         let storage_backend: String = state_row.get(1);
         if write_paused || storage_backend != "pando" {
-            return Ok(reply(
-                StatusCode::CONFLICT,
-                "repository writes paused or routed to gitfs",
-            ));
+            return Ok(reply(StatusCode::CONFLICT, "repository writes paused or routed to gitfs"));
         }
     }
     let snapshot = if let Some(token) = token {
@@ -342,49 +281,32 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
             packs: serde_json::from_value(row.get(3))?,
         }
     } else {
-        let snapshot = store::snapshot(config, repo).await?;
         if !write {
             if parts.method != "GET" {
                 return Ok(reply(StatusCode::CONFLICT, "read snapshot required"));
             }
-            let token = Uuid::new_v4();
-            db.execute("INSERT INTO pando_lab.snapshots(id,repo,principal,generation,storage_generation,refs,packs) VALUES($1,$2,$3,$4,$5,$6,$7)",&[&token,&repo,&principal,&snapshot.generation,&snapshot.storage_generation,&serde_json::to_value(&snapshot.refs)?,&serde_json::to_value(&snapshot.packs)?]).await?;
+            let token = store::snapshot_and_retain(&mut db, repo, principal).await?;
             return Ok(Response::builder()
                 .status(StatusCode::FOUND)
-                .header(
-                    header::LOCATION,
-                    format!("/snapshots/{token}/{repo}.git/info/refs?service=git-upload-pack"),
-                )
+                .header(header::LOCATION, format!("/snapshots/{token}/{repo}.git/info/refs?service=git-upload-pack"))
                 .header(header::CACHE_CONTROL, "no-store")
                 .body(Body::empty())?);
         }
-        snapshot
+        store::snapshot(config, repo).await?
     };
     if parts.headers.contains_key(header::CONTENT_ENCODING) {
-        return Ok(reply(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "compressed requests not supported by lab",
-        ));
+        return Ok(reply(StatusCode::UNSUPPORTED_MEDIA_TYPE, "compressed requests not supported by lab"));
     }
     if parts.method == "POST"
-        && parts
-            .headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
+        && parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
             != Some(&format!("application/x-{service}-request"))
     {
-        return Ok(reply(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Git request content type required",
-        ));
+        return Ok(reply(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Git request content type required"));
     }
     let data = match to_bytes(body, LIMIT).await {
         Ok(b) => b,
         Err(_) => {
-            return Ok(reply(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "lab fixture size limit",
-            ));
+            return Ok(reply(StatusCode::PAYLOAD_TOO_LARGE, "lab fixture size limit"));
         }
     };
     let ctl = control(config)?;
@@ -392,7 +314,11 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
     store::materialize(config, &snapshot, &session.0, &ctl).await?;
     let op = if write && parts.method == "POST" {
         let id = Uuid::new_v4();
-        db.execute("INSERT INTO pando_lab.operations(id,repo,principal,state) VALUES($1,$2,$3,'RECEIVING')",&[&id,&repo,&principal]).await?;
+        db.execute(
+            "INSERT INTO pando_lab.operations(id,repo,principal,state) VALUES($1,$2,$3,'RECEIVING')",
+            &[&id, &repo, &principal],
+        )
+        .await?;
         Some(id)
     } else {
         None
@@ -405,24 +331,14 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
         .env("PATH_INFO", format!("/repo.git/{tail}"))
         .env("QUERY_STRING", parts.uri.query().unwrap_or(""))
         .env("REQUEST_METHOD", parts.method.as_str())
-        .env(
-            "CONTENT_TYPE",
-            parts
-                .headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or(""),
-        )
+        .env("CONTENT_TYPE", parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or(""))
         .env("CONTENT_LENGTH", data.len().to_string())
         .env("REMOTE_USER", principal)
         .env("REMOTE_ADDR", "127.0.0.1")
         .env("SERVER_PROTOCOL", "HTTP/1.1")
         .env("PANDO_REPO", repo.to_string())
         .env("PANDO_PRINCIPAL", principal)
-        .env(
-            "PANDO_STORAGE_GENERATION",
-            snapshot.storage_generation.to_string(),
-        );
+        .env("PANDO_STORAGE_GENERATION", snapshot.storage_generation.to_string());
     if let Some(op) = op {
         c.env("PANDO_OPERATION", op.to_string());
     }
@@ -433,24 +349,13 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
     if !output.stderr.is_empty() {
         eprintln!("pando Git: {}", String::from_utf8_lossy(&output.stderr));
     }
-    let split = output
-        .stdout
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .context("invalid Git CGI response")?;
+    let split = output.stdout.windows(4).position(|w| w == b"\r\n\r\n").context("invalid Git CGI response")?;
     let head = std::str::from_utf8(&output.stdout[..split])?;
     let mut response = Response::builder().status(StatusCode::OK);
     for line in head.split("\r\n") {
         let (key, value) = line.split_once(':').context("invalid CGI header")?;
         if key.eq_ignore_ascii_case("status") {
-            response = response.status(
-                value
-                    .trim()
-                    .split(' ')
-                    .next()
-                    .context("CGI status")?
-                    .parse::<u16>()?,
-            );
+            response = response.status(value.trim().split(' ').next().context("CGI status")?.parse::<u16>()?);
         } else if !key.eq_ignore_ascii_case("content-length") {
             response = response.header(key, value.trim());
         }
@@ -469,22 +374,15 @@ async fn check_writable_pando_repo(
     if !permitted(db, repo, principal, true).await? {
         return Ok(Some(reply(StatusCode::FORBIDDEN, "repository access denied")));
     }
-    let Some(state_row) = db
-        .query_opt(
-            "SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1",
-            &[&repo],
-        )
-        .await?
+    let Some(state_row) =
+        db.query_opt("SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1", &[&repo]).await?
     else {
         return Ok(Some(reply(StatusCode::NOT_FOUND, "unknown repository")));
     };
     let write_paused: bool = state_row.get(0);
     let storage_backend: String = state_row.get(1);
     if write_paused || storage_backend != "pando" {
-        return Ok(Some(reply(
-            StatusCode::CONFLICT,
-            "repository writes paused or routed to gitfs",
-        )));
+        return Ok(Some(reply(StatusCode::CONFLICT, "repository writes paused or routed to gitfs")));
     }
     Ok(None)
 }

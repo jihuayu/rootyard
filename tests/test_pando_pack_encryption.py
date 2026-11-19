@@ -15,7 +15,13 @@ class PandoPackEncryptionContractTests(unittest.TestCase):
         self.assertIn("synthetic metadata-only lab envelope", envelopes)
 
         obj_store = (ROOT / "src" / "pando_lab" / "object_store.rs").read_text(encoding="utf-8")
-        self.assertIn("AUTHENTICATED_ENVELOPE_MODE", obj_store)
+        self.assertIn("use read::{get_pack_files_inner, verify_repo_files_with_base};", obj_store)
+        verified_reads = (ROOT / "src" / "pando_lab" / "object_store" / "read.rs").read_text(encoding="utf-8")
+        self.assertRegex(
+            verified_reads,
+            r"ensure!\(\s*manifest\.encryption_mode\.as_deref\(\) == "
+            r"Some\(lifecycle::crypto::AUTHENTICATED_ENVELOPE_MODE\),",
+        )
 
     def test_kms_schema_tables_and_lifecycle_submodules_bounded(self):
         schema_sql = (ROOT / "experimental" / "pando" / "schema.sql").read_text(encoding="utf-8")
