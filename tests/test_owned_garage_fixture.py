@@ -80,8 +80,12 @@ case "$*" in
     [ "${{STUB_PULL_EXIT:-0}}" -eq 0 ] || exit "${{STUB_PULL_EXIT}}"
     [ -n "${{STUB_IMAGE_STATE:-}}" ] && : >"$STUB_IMAGE_STATE"
     exit 0 ;;
-  *'run --rm'*'--version'*) printf '%s\\n' 'garage v2.1.0 [features: bundled-libs]' ;;
-  *'create --rm'*) printf '%s\\n' "${{STUB_CONTAINER_ID:?}}" ;;
+  *'run --rm'*'--version'*)
+    [ "${{STUB_RUN_HANG:-0}}" -eq 0 ] || exec sleep 600
+    printf '%s\\n' 'garage v2.1.0 [features: bundled-libs]' ;;
+  *'create --rm'*)
+    [ "${{STUB_CREATE_HANG:-0}}" -eq 0 ] || exec sleep 600
+    printf '%s\\n' "${{STUB_CONTAINER_ID:?}}" ;;
   exec*)
     case "$*" in
       *'node id'*)
@@ -103,17 +107,29 @@ case "$*" in
         [ "$count" -gt "${{STUB_STATUS_HANG_AFTER:-0}}" ] || exec sleep 600
         [ "$count" -gt "${{STUB_STATUS_FAILS:-0}}" ] || {{ echo 'Error: unable to connect: Connection refused' >&2; exit 1; }}
         printf 'Healthy: 1/1 nodes connected\n' ;;
-      *'key create'*) printf 'Key ID:         %s\\nSecret key:     %s\\nCreated:        2026-11-07\\n' "${{STUB_ACCESS_KEY:-GK0123456789abcdef01234567}}" "${{STUB_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}}" ;;
+      *'layout assign'*)
+        [ "${{STUB_LAYOUT_HANG:-0}}" -eq 0 ] || exec sleep 600 ;;
+      *'layout apply'*)
+        [ "${{STUB_LAYOUT_APPLY_HANG:-0}}" -eq 0 ] || exec sleep 600 ;;
+      *'key create'*)
+        [ "${{STUB_KEY_HANG:-0}}" -eq 0 ] || exec sleep 600
+        printf 'Key ID:         %s\\nSecret key:     %s\\nCreated:        2026-11-07\\n' "${{STUB_ACCESS_KEY:-GK0123456789abcdef01234567}}" "${{STUB_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}}" ;;
       *) exit 0 ;;
     esac ;;
-  *'{{{{.Id}}}}'*) printf '%s\\n' "${{STUB_CONTAINER_ID:?}}" ;;
+  *'{{{{.Id}}}}'*)
+    [ "${{STUB_ID_INSPECT_HANG:-0}}" -eq 0 ] || exec sleep 600
+    printf '%s\\n' "${{STUB_CONTAINER_ID:?}}" ;;
   *'rootyard.fixture.kind'*) printf '%s\\n' "${{STUB_KIND:-owned-garage}}" ;;
   *'rootyard.fixture.nonce'*) printf '%s\\n' "${{STUB_NONCE:-$(sentinel_field nonce)}}" ;;
   *'rootyard.fixture.directory'*) printf '%s\\n' "${{STUB_PATH:-$(sentinel_field directory)}}" ;;
   *'rootyard.fixture.uid'*) printf '%s\\n' "${{STUB_UID:-$(sentinel_field uid)}}" ;;
   *'rootyard.fixture.name'*) printf '%s\\n' "${{STUB_NAME:-$(sentinel_field container_name)}}" ;;
-  rm*) exit "${{STUB_RM_EXIT:-0}}" ;;
-  start*) exit "${{STUB_START_EXIT:-0}}" ;;
+  rm*)
+    [ "${{STUB_RM_HANG:-0}}" -eq 0 ] || exec sleep 600
+    exit "${{STUB_RM_EXIT:-0}}" ;;
+  start*)
+    [ "${{STUB_START_HANG:-0}}" -eq 0 ] || exec sleep 600
+    exit "${{STUB_START_EXIT:-0}}" ;;
   *) exit 1 ;;
 esac
 """
@@ -597,6 +613,195 @@ class ColdCacheImageTest(FixtureGuardTest):
         )
         self.assertIn("only the pinned digest reference may be pulled", process.stderr)
         self.assertNotIn("pull", self.docker_calls())
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+
+
+class BoundedLifecycleTest(FixtureGuardTest):
+    """Opt-in #29 deadlines stay finite and never guess at unknown containers."""
+
+    def test_invalid_start_lifecycle_fails_before_docker_or_fixture_creation(self):
+        directory = self.root / "owned"
+        process = self.start(
+            directory, 1,
+            env={"ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT": "0"},
+        )
+        self.assertIn("between 1 and 1800", process.stderr)
+        self.assertEqual("", self.docker_calls())
+        self.assertFalse(directory.exists())
+
+    def test_start_lifecycle_bounds_post_readiness_layout_and_cleans_up(self):
+        directory = self.root / "owned"
+        port = self.held_dead_port()
+        started = time.monotonic()
+        process = self.start(
+            directory, 1, "--port", str(port),
+            env={
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT": "5",
+                "ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT": "2",
+                "STUB_LAYOUT_HANG": "1",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 20,
+                        "the opt-in start lifecycle was not honoured")
+        calls = self.docker_calls()
+        self.assertEqual(1, sum(" layout assign " in line
+                                for line in calls.splitlines()), calls)
+        self.assertNotIn(" layout apply ", calls)
+        self.assertNotIn("key create", calls)
+        self.assertNotIn("bucket create", calls)
+        self.assertIn("layout assign did not complete", process.stderr)
+        self.assertIn(f"rm -f -- {self.cid}", calls)
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+
+    def test_stop_lifecycle_bounds_ownership_inspection_then_retry_succeeds(self):
+        directory = self.root / "owned"
+        self.sentinel(directory)
+        started = time.monotonic()
+        process = self.run_script(
+            "stop", directory, 1,
+            env={
+                "ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT": "2",
+                "STUB_ID_INSPECT_HANG": "1",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 20,
+                        "the opt-in stop lifecycle was not honoured")
+        self.assertIn("absent or unreadable", process.stderr)
+        calls = self.docker_calls()
+        self.assertNotIn(f"rm -f -- {self.cid}", calls)
+        self.assertTrue(directory.is_dir())
+        self.assertTrue((directory / ".rootyard-owned-fixture").is_file())
+        # A bounded refusal leaves the exact sentinel in place so the workflow's
+        # repeated safe stop can retry without guessing at another container.
+        process = self.run_script(
+            "stop", directory, 0,
+            env={"ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT": "2"},
+        )
+        self.assertEqual("", process.stderr)
+        self.assertIn(f"rm -f -- {self.cid}", self.docker_calls())
+        self.assertFalse(directory.exists())
+
+    def test_stop_lifecycle_bounds_remove_then_retry_succeeds(self):
+        directory = self.root / "owned"
+        self.sentinel(directory)
+        started = time.monotonic()
+        process = self.run_script(
+            "stop", directory, 1,
+            env={
+                "ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT": "2",
+                "STUB_RM_HANG": "1",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 20,
+                        "the opt-in stop remove was not honoured")
+        self.assertIn(f"rm -f -- {self.cid}", self.docker_calls())
+        self.assertTrue(directory.is_dir())
+        self.assertTrue((directory / ".rootyard-owned-fixture").is_file())
+        process = self.run_script(
+            "stop", directory, 0,
+            env={"ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT": "2"},
+        )
+        self.assertEqual("", process.stderr)
+        self.assertFalse(directory.exists())
+
+    def test_start_timeout_bounds_docker_start_and_cleans_known_container(self):
+        directory = self.root / "owned"
+        port = self.held_dead_port()
+        started = time.monotonic()
+        process = self.start(
+            directory, 1, "--port", str(port),
+            env={
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT": "5",
+                "ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT": "2",
+                "STUB_START_HANG": "1",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 20,
+                        "the bounded start did not fail closed")
+        calls = self.docker_calls()
+        self.assertIn("create --rm", calls)
+        self.assertIn(f"start {self.cid}", calls)
+        self.assertNotIn("exec ", calls)
+        self.assertIn("docker could not start", process.stderr)
+        self.assertIn(f"rm -f -- {self.cid}", calls)
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+
+    def test_start_lifecycle_bounds_key_create_and_cleans_up(self):
+        directory = self.root / "owned"
+        port = self.held_dead_port()
+        started = time.monotonic()
+        process = self.start(
+            directory, 1, "--port", str(port),
+            env={
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT": "5",
+                "ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT": "2",
+                "STUB_KEY_HANG": "1",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 20,
+                        "the bounded key creation did not fail closed")
+        calls = self.docker_calls()
+        self.assertIn("key create", calls)
+        self.assertNotIn("bucket create", calls)
+        self.assertIn("key create did not complete", process.stderr)
+        self.assertIn(f"rm -f -- {self.cid}", calls)
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+
+    def test_create_timeout_fails_closed_without_removing_unknown_container(self):
+        directory = self.root / "owned"
+        port = self.held_dead_port()
+        started = time.monotonic()
+        process = self.start(
+            directory, 1, "--port", str(port),
+            env={
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT": "5",
+                "ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT": "2",
+                "STUB_CREATE_HANG": "1",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 20,
+                        "the bounded create did not fail closed")
+        calls = self.docker_calls()
+        self.assertEqual(1, calls.count("create --rm"), calls)
+        self.assertNotIn("rm -f --", calls)
+        self.assertNotIn("exec ", calls)
+        self.assertIn("docker create did not acknowledge", process.stderr)
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+
+    def test_version_timeout_fails_closed_without_unknown_cleanup(self):
+        directory = self.root / "owned"
+        port = self.held_dead_port()
+        started = time.monotonic()
+        process = self.start(
+            directory, 1, "--port", str(port),
+            env={
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_START_LIFECYCLE_TIMEOUT": "5",
+                "ROOTYARD_FIXTURE_STOP_LIFECYCLE_TIMEOUT": "2",
+                "STUB_RUN_HANG": "1",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 20,
+                        "the bounded version probe did not fail closed")
+        calls = self.docker_calls()
+        self.assertEqual(1, calls.count("run --rm"), calls)
+        self.assertNotIn("create --rm", calls)
+        self.assertNotIn("rm -f --", calls)
+        self.assertIn("cannot execute", process.stderr)
         self.assertFalse(directory.exists())
         self.assertFalse((self.root / "outside.env").exists())
 
