@@ -65,6 +65,7 @@ downgraded.
 | `ROOTYARD_REDIS_ADDRESS` | none | Legacy loopback address when `state-redis` is off, or compatibility fallback when on |
 | `ROOTYARD_WAKE_CHANNEL` | `rootyard:outbox:v1` | 1–128 ASCII alphanumeric, colon, underscore or hyphen |
 | `ROOTYARD_WORKER_SCOPE` | `generic` | `generic` preserves legacy consumers/projection jobs; `a4-target-audit` selects only the A4 target-audit queue |
+| `ROOTYARD_A4_WORKER_MODE` | `embedded` | On `serve-blob`: `embedded` keeps the in-process A4 consumer; `external` removes it for a separately supervised A4 worker |
 | `ROOTYARD_A4_WAKE_TRANSPORT` | absent (`poll`) | `poll`/`memory` (no remote) or `redis` (requires `state-redis`); read only by `serve-blob` and the A4 worker scope |
 | `ROOTYARD_A4_WAKE_CHANNEL` | `rootyard:a4:pg_refstore_core_commit_audit:v1` | Explicit A4 namespace; validated by the same channel rule |
 
@@ -79,12 +80,18 @@ ROOTYARD_WORKER_CONSUMERS=ref-index rootyard worker
 ### Explicit A4 target-audit split
 
 `serve-blob` uses its embedded target-audit worker by default. To split the A4
-producer and subscriber across processes and hosts, select the dedicated A4
-variables on both sides. The generic consumer/wake variables above are ignored
-by this topology; in particular, `ROOTYARD_WORKER_SCOPE=a4-target-audit` never
-scans `ref-index` or runs Ref-CAS projection jobs.
+producer and subscriber across processes and hosts, set
+`ROOTYARD_A4_WORKER_MODE=external` on `serve-blob` and run a distinct
+`ROOTYARD_WORKER_SCOPE=a4-target-audit` worker. External placement launches no
+in-process A4 consumer, so the external worker is the only claimant and the
+healthy push/fallback evidence is causally attributable. The generic
+consumer/wake variables above are ignored by this topology; in particular,
+`ROOTYARD_WORKER_SCOPE=a4-target-audit` never scans `ref-index` or runs Ref-CAS
+projection jobs. Unknown modes, unsupported transports and `redis` without the
+`state-redis` feature fail startup closed.
 
 ```sh
+ROOTYARD_A4_WORKER_MODE=external \
 ROOTYARD_A4_WAKE_TRANSPORT=redis \
 ROOTYARD_REDIS_URL='rediss://cache-user:secret@cache.internal:6380/0' \
   rootyard serve-blob
@@ -95,8 +102,12 @@ ROOTYARD_REDIS_URL='rediss://cache-user:secret@cache.internal:6380/0' \
   rootyard worker
 ```
 
-Redis carries only the fixed `v1` hint on the A4 channel, never a claim or event
-body. The producer notifies after the fresh A4 durable commit; publication is a
+External placement with no `ROOTYARD_A4_WAKE_TRANSPORT` is valid: `serve-blob`
+then has no publisher and the external A4 worker relies only on its fixed PG
+ticker. Startup validates endpoint/channel policy but never waits for Redis
+reachability, and a failed publish cannot fail the acknowledged push. Redis
+carries only the fixed `v1` hint on the A4 channel, never a claim or event body.
+The producer notifies after the fresh A4 durable commit; publication is a
 separate bounded task and never gates that commit. The subscriber's fixed PG
 ticker remains mandatory: a disconnected, duplicated or lost hint only changes
 scan timing and can never bypass the normal lease, authorization, ref, hold,

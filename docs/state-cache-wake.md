@@ -182,32 +182,44 @@ split across processes without changing PostgreSQL authority. This is an explici
 default-off topology; `serve-blob` without the A4 variables keeps the in-process
 Memory cache, local `Notify` hints and periodic target-audit scan. The generic
 `ROOTYARD_WAKE_TRANSPORT`, `ROOTYARD_WAKE_CHANNEL` and
-`ROOTYARD_WORKER_CONSUMERS` variables are **not** read by this A4 path, so a
-an A4 worker cannot be broadened to the legacy `ref-index` consumer or Ref-CAS
+`ROOTYARD_WORKER_CONSUMERS` variables are **not** read by this A4 path, so an
+A4 worker cannot be broadened to the legacy `ref-index` consumer or Ref-CAS
 projection jobs by them. The generic scope itself is unchanged and keeps its
 existing full `audit-log` scan.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `ROOTYARD_A4_WORKER_MODE` | `embedded` | `embedded` keeps the in-process target-audit consumer; `external` removes it for a separately supervised A4 worker |
 | `ROOTYARD_A4_WAKE_TRANSPORT` | absent (`poll`) | `poll`/`memory` (no remote), or `redis` (requires `state-redis`) |
 | `ROOTYARD_A4_WAKE_CHANNEL` | `rootyard:a4:pg_refstore_core_commit_audit:v1` | Validated 1–128 ASCII alphanumeric/colon/underscore/hyphen A4 namespace; never a secret or payload |
 | `ROOTYARD_WORKER_SCOPE` | `generic` | On `rootyard worker`/`worker-once`: `generic` or the explicit `a4-target-audit` scope |
 
 Producer (`serve-blob`):
 
+- `ROOTYARD_A4_WORKER_MODE=external` is the explicit external-placement mode. It
+  launches no in-process A4 consumer at all, so the separately supervised
+  `ROOTYARD_WORKER_SCOPE=a4-target-audit` process is the only claimant. The
+  default `embedded` mode and every value other than the exact `external` token
+  keep the embedded consumer; unknown modes fail startup. External placement is
+  valid with no A4 transport (the external worker then uses its mandatory PG
+  ticker), with `poll`/`memory`, or with the feature-gated `redis` publisher.
 - `ROOTYARD_A4_WAKE_TRANSPORT=redis` selects the existing feature-gated
   `RedisWake` using `ROOTYARD_REDIS_URL` or the loopback
   `ROOTYARD_REDIS_ADDRESS`. Without `state-redis`, selecting `redis` fails
-  startup closed; no Redis crate is compiled into the default build.
+  startup closed; no Redis crate is compiled into the default build. Startup
+  validates the URL/channel policy but does not require Redis reachability, and
+  an external placement never waits for Redis before serving.
 - The gateway still calls `Signals::committed()` only after a fresh authorized A4
   durable transaction, including its audit outbox projection, has committed. The
-  call stores a local and a remote `Notify` permit and does not await Redis. The
-  separate publisher task has its own one-second publish deadline and swallows
-  publish errors into a fixed diagnostic; a slow, disconnected or lost publish
-  cannot delay or alter the acknowledged commit, terminal, refs, holds, roots or
-  outbox rows.
+  call stores a local and a remote `Notify` permit and does not await Redis. In
+  external placement the local permit has no consumer; the remote permit feeds
+  the optional publisher when configured. The separate publisher task has its own
+  one-second publish deadline and swallows publish errors into a fixed diagnostic;
+  a slow, disconnected or lost publish cannot delay or alter the acknowledged
+  commit, terminal, refs, holds, roots or outbox rows.
 - The publisher shares the existing dispatch stop token, is cancelled on every
-  listener/worker/signal/barrier exit path and is bounded-awaited during drain.
+  listener/worker/signal/barrier exit path and is bounded-awaited during drain,
+  whether or not an embedded worker exists.
 
 Subscriber (`rootyard worker` in A4 scope):
 
@@ -229,17 +241,22 @@ Example role split (endpoint/credentials supplied by the normal secret
 mechanism; use a distinct channel per installation):
 
 ```sh
-# Producer and embedded local worker
+# Producer with no in-process A4 consumer; publisher remains advisory.
+ROOTYARD_A4_WORKER_MODE=external \
 ROOTYARD_A4_WAKE_TRANSPORT=redis \
 ROOTYARD_REDIS_URL='rediss://cache-user:secret@cache.internal:6380/0' \
   rootyard serve-blob
 
-# A4-only external subscriber
+# The only A4 consumer. It still scans PG on its fixed ticker if Redis is down.
 ROOTYARD_WORKER_SCOPE=a4-target-audit \
 ROOTYARD_A4_WAKE_TRANSPORT=redis \
 ROOTYARD_REDIS_URL='rediss://cache-user:secret@cache.internal:6380/0' \
   rootyard worker
 ```
+
+Omitting `ROOTYARD_A4_WORKER_MODE` keeps the embedded consumer. An external
+placement with no `ROOTYARD_A4_WAKE_TRANSPORT` is also valid: `serve-blob` simply
+has no publisher and the external worker relies on PG polling.
 
 Keep the existing `ROOTYARD_OUTBOX_WORKER=false` + generic `rootyard worker`
 roles separate. The A4 scope is a separate queue/namespace, not a replacement for

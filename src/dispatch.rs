@@ -30,11 +30,30 @@ pub const A4_WORKER_SCOPE: &str = "a4-target-audit";
 /// Setting the generic variables can never enroll this producer/subscriber.
 pub const A4_WAKE_TRANSPORT_ENV: &str = "ROOTYARD_A4_WAKE_TRANSPORT";
 pub const A4_WAKE_CHANNEL_ENV: &str = "ROOTYARD_A4_WAKE_CHANNEL";
+/// Placement of the standalone A4 consumer. `embedded` is the default; the
+/// explicit `external` value removes the in-process consumer so a separately
+/// supervised `ROOTYARD_WORKER_SCOPE=a4-target-audit` process is the only one
+/// that can claim the target audit rows.
+pub const A4_WORKER_MODE_ENV: &str = "ROOTYARD_A4_WORKER_MODE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerScope {
     Generic,
     A4TargetAudit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum A4WorkerMode {
+    Embedded,
+    External,
+}
+
+impl A4WorkerMode {
+    /// True only for the default placement. External placement must not keep a
+    /// dormant local consumer that could claim the healthy push or fallback.
+    pub const fn runs_embedded_worker(self) -> bool {
+        matches!(self, Self::Embedded)
+    }
 }
 
 /// The fixed A4 advisory namespace. It contains the exact durable target-audit
@@ -62,6 +81,19 @@ fn worker_scope(raw: Option<&str>) -> Result<WorkerScope> {
         "" | "generic" => Ok(WorkerScope::Generic),
         A4_WORKER_SCOPE => Ok(WorkerScope::A4TargetAudit),
         _ => bail!("{WORKER_SCOPE_ENV} must be generic or {A4_WORKER_SCOPE}"),
+    }
+}
+
+pub fn a4_worker_mode_from_env() -> Result<A4WorkerMode> {
+    let raw = std::env::var(A4_WORKER_MODE_ENV).ok();
+    a4_worker_mode(raw.as_deref())
+}
+
+fn a4_worker_mode(raw: Option<&str>) -> Result<A4WorkerMode> {
+    match raw.unwrap_or("") {
+        "" | "embedded" => Ok(A4WorkerMode::Embedded),
+        "external" => Ok(A4WorkerMode::External),
+        _ => bail!("{A4_WORKER_MODE_ENV} must be embedded or external"),
     }
 }
 
@@ -618,6 +650,17 @@ mod tests {
         assert_eq!(worker_scope(Some(A4_WORKER_SCOPE)).unwrap(), WorkerScope::A4TargetAudit);
         assert!(worker_scope(Some("a4")).is_err());
         assert!(worker_scope(Some("legacy")).is_err());
+    }
+    #[test]
+    fn a4_worker_mode_defaults_embedded_and_external_is_explicit() {
+        assert_eq!(a4_worker_mode(None).unwrap(), A4WorkerMode::Embedded);
+        assert_eq!(a4_worker_mode(Some("")).unwrap(), A4WorkerMode::Embedded);
+        assert_eq!(a4_worker_mode(Some("embedded")).unwrap(), A4WorkerMode::Embedded);
+        assert_eq!(a4_worker_mode(Some("external")).unwrap(), A4WorkerMode::External);
+        assert!(a4_worker_mode(Some("disabled")).is_err());
+        assert!(a4_worker_mode(Some("Redis")).is_err());
+        assert!(A4WorkerMode::Embedded.runs_embedded_worker());
+        assert!(!A4WorkerMode::External.runs_embedded_worker());
     }
     #[test]
     fn a4_transport_defaults_to_no_remote_and_rejects_unrelated_values() {

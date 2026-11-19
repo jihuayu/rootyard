@@ -17,7 +17,10 @@ worker.
 The acceptance must therefore keep the real `serve-blob` fixture but replace its
 embedded wake path with the explicit A4 topology:
 
-- producer: `rootyard serve-blob` with `ROOTYARD_A4_WAKE_TRANSPORT=redis`;
+- producer: `rootyard serve-blob` with
+  `ROOTYARD_A4_WORKER_MODE=external` and
+  `ROOTYARD_A4_WAKE_TRANSPORT=redis`; external mode removes the embedded
+  local consumer so it cannot win the healthy or fallback claim;
 - subscriber: `rootyard worker` with
   `ROOTYARD_WORKER_SCOPE=a4-target-audit` and
   `ROOTYARD_A4_WAKE_TRANSPORT=redis`;
@@ -59,10 +62,13 @@ and must refuse to run against a shared/production Redis, Blob bucket or schema.
 One repository and one external A4 worker, with the worker poll interval longer
 than the observation window:
 
-1. Start the owned Redis and the relay. Start `serve-blob` with the A4 producer
-   variables and a channel such as `rootyard:a4:test:<schema>`. Start the A4
-   worker with the same endpoint/channel and `ROOTYARD_WORKER_POLL_MS` set well
-   above the case deadline; assert both processes are the expected executable.
+1. Start the owned Redis and the relay. Start `serve-blob` with
+   `ROOTYARD_A4_WORKER_MODE=external`, the A4 producer variables and a channel
+   such as `rootyard:a4:test:<schema>`. Start the A4 worker with the same
+   endpoint/channel and `ROOTYARD_WORKER_POLL_MS` set well above the case
+   deadline; assert both processes are the expected executable. Assert the
+   producer has no embedded target-audit consumer by checking the subscriber
+   count and by proving delivery occurs under the external worker's lease owner.
 2. Wait until `PUBSUB NUMSUB` reports one subscriber and the relay has forwarded
    its connection. Confirm the initial subscription catch-up scan completed.
 3. Create a repository through the real `POST /api/repos` route, clone with stock

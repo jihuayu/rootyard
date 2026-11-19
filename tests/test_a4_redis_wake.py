@@ -57,7 +57,7 @@ class A4RedisWakeShapeTests(unittest.TestCase):
         self.assertIn("let mut publisher", standalone)
         self.assertIn("if !publisher.is_finished()", standalone)
         self.assertIn("publisher.abort()", standalone)
-        self.assertGreaterEqual(standalone.count("worker_stop.clone()"), 2)
+        self.assertGreaterEqual(standalone.count("dispatch_stop.clone()"), 2)
         for forbidden in (
             "ROOTYARD_WAKE_TRANSPORT",
             "ROOTYARD_WAKE_CHANNEL",
@@ -66,6 +66,27 @@ class A4RedisWakeShapeTests(unittest.TestCase):
             "RedisWake",
         ):
             self.assertNotIn(forbidden, standalone)
+
+    def test_external_worker_mode_is_explicit_and_default_stays_embedded(self):
+        dispatch = source("src/dispatch.rs")
+        self.assertIn('pub const A4_WORKER_MODE_ENV: &str = "ROOTYARD_A4_WORKER_MODE"', dispatch)
+        self.assertIn('"" | "embedded" => Ok(A4WorkerMode::Embedded)', dispatch)
+        self.assertIn('"external" => Ok(A4WorkerMode::External)', dispatch)
+        self.assertIn("pub const fn runs_embedded_worker", dispatch)
+        self.assertIn("matches!(self, Self::Embedded)", dispatch)
+        self.assertIn("fn a4_worker_mode_defaults_embedded_and_external_is_explicit", dispatch)
+        standalone = source("src/standalone.rs")
+        self.assertIn("a4_worker_mode_from_env()", standalone)
+        self.assertIn("if mode.runs_embedded_worker()", standalone)
+        self.assertIn("None\n    };", standalone)
+        self.assertIn("std::future::pending::<()>().await", standalone)
+        self.assertIn("if let Some(worker) = worker.as_mut()", standalone)
+        # The publisher is unconditional; external placement only removes the
+        # local consumer, never the optional advisory producer.
+        self.assertIn("let mut publisher = tokio::spawn(crate::dispatch::publisher", standalone)
+        self.assertIn("dispatch_stop.cancel()", standalone)
+        # The old unconditional worker spawn must not return.
+        self.assertNotIn("let mut worker = tokio::spawn(crate::dispatch::worker", standalone)
 
     def test_external_worker_selects_the_a4_scope_before_scanning(self):
         main = source("src/main.rs")
