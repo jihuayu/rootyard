@@ -60,29 +60,37 @@ impl PgRefStore {
         Capabilities::pg_transition_increment()
     }
 
-    /// Lock the expected issuer lane before an authorization/repository read
-    /// in a caller-owned transaction.
+    /// Lock an existing expected issuer-lane row before an
+    /// authorization/repository read in a caller-owned transaction.
     ///
-    /// This is deliberately a lock-only preflight: it creates the lane row when
-    /// absent and takes the same `FOR NO KEY UPDATE` row lock as the slot-zero
-    /// coordinator, but never advances the sequence, inserts an operation or
-    /// grants authority. The caller must already hold the operation key and must
-    /// roll back on any later authorization/identity refusal. The same
-    /// transaction later re-previews this lane under its existing lock.
-    pub(crate) async fn lock_expected_lane<'a>(
+    /// This is deliberately a lock-only preflight and never evaluates
+    /// `last_reserved_sequence + 1`, inserts a missing lane or reserves a
+    /// sequence. An absent lane is a no-op here; a fresh admission allocates it
+    /// later in the same transaction, after this preflight and before its
+    /// repository/gate writes. A replay therefore cannot overflow on an
+    /// exhausted lane or enter the allocation path. A concurrently uncommitted
+    /// lane creation is not visible to this read; the fresh coordinator's own
+    /// insert remains the first lane wait in that case. The caller must already
+    /// hold the operation key and must roll back on later refusal.
+    pub(crate) async fn lock_expected_lane(
         &self,
-        tx: &'a Transaction<'_>,
+        tx: &Transaction<'_>,
         repository_id: Uuid,
         issuer_id: Uuid,
-        operation_id: Uuid,
-        lane: &'a IssuerLane,
+        lane: &IssuerLane,
         deadline: Instant,
     ) -> Result<(), RefStoreError> {
-        if repository_id.is_nil() || issuer_id.is_nil() || operation_id.is_nil() {
+        if repository_id.is_nil() || issuer_id.is_nil() {
             return Err(RefStoreError::InvalidIdentity("expected lane ids must be non-nil".into()));
         }
         bound(tx, deadline).await?;
-        let _ = LockedSequence::preview(tx, repository_id, issuer_id, operation_id, lane).await?;
+        tx.query_opt(
+            "SELECT 1 FROM ref_store_issuer_lanes
+             WHERE (repository_id,issuer_id,lane)=($1,$2,$3) FOR NO KEY UPDATE",
+            &[&repository_id, &issuer_id, &lane.as_str()],
+        )
+        .await
+        .map_err(db_error)?;
         Ok(())
     }
 

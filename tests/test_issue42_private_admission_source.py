@@ -12,6 +12,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 PUBLISH = ROOT / 'src/blob_git_gateway/publish.rs'
 OPERATION = ROOT / 'src/blob_git_gateway/operation.rs'
+PG = ROOT / 'src/ref_store/pg.rs'
 
 
 def slice_between(source, start, end):
@@ -25,6 +26,7 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
     def setUpClass(cls):
         cls.publish = PUBLISH.read_text()
         cls.operation = OPERATION.read_text()
+        cls.pg = PG.read_text()
 
     def test_timeout_result_is_matched_before_into_parts(self):
         body = slice_between(
@@ -89,6 +91,16 @@ class PrivateAdmissionSourceTest(unittest.TestCase):
         self.assertIn('lookup_public_attempt(', preflight)
         self.assertIn('LegacyPath', preflight)
         self.assertLess(preflight.index('lock_expected_lane('), preflight.index('lookup_in_tx('))
+
+        lane_lock = slice_between(
+            self.pg,
+            'pub(crate) async fn lock_expected_lane(',
+            '    /// Reserve the next sequence',
+        )
+        self.assertIn('SELECT 1 FROM ref_store_issuer_lanes', lane_lock)
+        self.assertIn('FOR NO KEY UPDATE', lane_lock)
+        self.assertNotIn('last_reserved_sequence + 1', lane_lock)
+        self.assertNotIn('INSERT INTO ref_store_issuer_lanes', lane_lock)
 
         unknown = slice_between(
             preflight,
