@@ -608,11 +608,13 @@ class PartialPut:
 # Bounded passive busy-witness projection
 #
 # The observer is the fixture-only tests/fixtures/fuse_busy_witness.c preload.
-# It records only the helper's umount2(flags=0) entry/result with the mount
-# identity observed for that exact path, and the parked writer's successful
-# close entry/result.  Both use CLOCK_MONOTONIC.  These functions project the
-# bounded local receipts to the two fixed diagnostic values; they never return
-# a path, PID, descriptor, argv, errno body, log line or event.
+# It records only a helper umount2(flags=0) that returned -1/EBUSY, with the
+# mount identity observed for that exact path, and only the parked writer's
+# successful close entry/result.  Both use CLOCK_MONOTONIC.  Receipts are
+# fixture-created 0600 regular files opened without following links.  These
+# functions project the bounded local receipts to the two fixed diagnostic
+# values; they never return a path, PID, descriptor, argv, errno body, log
+# line or event.
 # ---------------------------------------------------------------------------
 BUSY_TARGETS = frozenset((
     "writer",

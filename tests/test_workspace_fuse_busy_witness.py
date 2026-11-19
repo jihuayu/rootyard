@@ -427,5 +427,57 @@ class BusyWitnessInstallGuardTest(unittest.TestCase):
         self.assertIsNone(normal_shutdown.busy_witness_writer_env(None, h.root))
 
 
+class BusyWitnessSourceContractTest(unittest.TestCase):
+    """Source-only checks; the Linux fixture is never compiled locally."""
+
+    SOURCE = Path(__file__).with_name("fixtures") / "fuse_busy_witness.c"
+
+    def _block(self, text, marker):
+        start = text.index(marker)
+        end = text.find("\n}\n", start)
+        self.assertNotEqual(end, -1, marker)
+        return text[start:end]
+
+    def test_forwarded_hooks_do_not_use_lazy_resolution_or_formatting(self):
+        text = self.SOURCE.read_text(encoding="utf-8")
+        self.assertNotIn("pthread_once", text)
+        self.assertNotIn("PTHREAD_ONCE_INIT", text)
+        for marker in ("int umount2(", "int close(", "int execve(",
+                       "int execv(", "int execvp(", "int execvpe(",
+                       "int posix_spawn(", "int posix_spawnp("):
+            block = self._block(text, marker)
+            self.assertNotIn("dlsym", block, marker)
+            self.assertNotIn("snprintf", block, marker)
+
+    def test_receipt_open_is_private_and_never_creates(self):
+        text = self.SOURCE.read_text(encoding="utf-8")
+        block = self._block(text, "static void open_receipt")
+        for token in ("O_NOFOLLOW", "O_NONBLOCK", "fstat", "S_ISREG",
+                      "WITNESS_RECEIPT_MODE", "WITNESS_MAX_RECEIPT_BYTES",
+                      "geteuid", "st_nlink"):
+            self.assertIn(token, block)
+        self.assertNotIn("O_CREAT", block)
+
+    def test_umount_records_only_ebusy_after_the_return_sample(self):
+        text = self.SOURCE.read_text(encoding="utf-8")
+        block = self._block(text, "int umount2(")
+        self.assertIn("result != -1 || saved_errno != EBUSY", block)
+        sample = block.index("result_ns = monotonic_ns();")
+        self.assertLess(sample, block.index("mount_identity("))
+        self.assertLess(sample, block.index("record_event("))
+        self.assertNotIn("O_CREAT", block)
+
+    def test_helper_environment_is_prepared_and_pid_guarded(self):
+        text = self.SOURCE.read_text(encoding="utf-8")
+        self.assertIn("prepare_api_environment", text)
+        self.assertIn("witness_env_ready", text)
+        self.assertIn("(long)getpid() != witness_pid", text)
+        self.assertIn("witness_self_exe", text)
+        self.assertLess(
+            text.index("static void prepare_api_environment"),
+            text.index("__attribute__((constructor))"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

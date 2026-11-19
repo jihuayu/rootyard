@@ -10,23 +10,32 @@
  *   ROOTYARD_TEST_FUSE_WITNESS_ROLE=helper
  *   ROOTYARD_TEST_FUSE_WITNESS_DIR=<fixture directory>
  *
- * In helper mode it records the real umount2(path, 0) entry/result, the mount
- * ID and a path identity observed in /proc/self/mountinfo for that exact path,
- * and the preserved return/errno.  In writer mode it records the one close(fd)
- * named by ROOTYARD_TEST_FUSE_WITNESS_CLOSE_FD, with the same CLOCK_MONOTONIC
- * source.  Records go to a bounded local "<dir>/<role>.receipt" file.
+ * In helper mode it records only a real umount2(path, 0) that returned -1 with
+ * EBUSY, the mount ID and a path identity observed in /proc/self/mountinfo for
+ * that exact path, and the preserved return/errno.  In writer mode it records
+ * only the successful close(fd) named by ROOTYARD_TEST_FUSE_WITNESS_CLOSE_FD,
+ * with the same CLOCK_MONOTONIC source.  Records go to fixture-created,
+ * private 0600 regular "<dir>/<role>.receipt" files opened with O_NOFOLLOW and
+ * O_NONBLOCK after an ownership/type/mode/size fstat check.
  *
  * The library never waits, retries, detaches, fsyncs, opens a mounted path,
  * changes a syscall argument or emits a path/pid/fd/argv/body.  Every hook
  * fails open to the real libc/syscall when its role or configuration is not
- * present.  It is inert in the API process.
+ * present.  API mode only prepares the exact helper exec environment; it does
+ * not write a receipt.  This is a normal-process-context observer, not an
+ * async-signal-safe tracer, and it makes no such claim.
+ *
+ * The Rust helper spawn uses current_exe with the fixed helper argument and a
+ * scrubbed environment; the Linux glibc path reaches posix_spawnp.  A
+ * fork-only exec fallback is deliberately not injected after the fork (the
+ * constructor PID guard), so that portability gap stays unknown rather than
+ * being misattributed.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <pthread.h>
 #include <spawn.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -41,6 +50,9 @@
 
 #define WITNESS_MAX_ENV 64
 #define WITNESS_MAX_MOUNTINFO (256 * 1024)
+#define WITNESS_MAX_RECEIPT_BYTES (64 * 1024)
+#define WITNESS_RECEIPT_MODE 0600
+#define WITNESS_HELPER_ARG "--workspace-fuse-helper"
 
 extern char **environ;
 
@@ -52,9 +64,16 @@ enum witness_role {
 };
 
 static enum witness_role role = WITNESS_NONE;
+static long witness_pid = -1;
 static char witness_dir[PATH_MAX];
 static char witness_library[PATH_MAX];
+static char witness_self_exe[PATH_MAX];
+static char witness_preload_entry[PATH_MAX + 16];
+static char witness_role_entry[64];
+static char witness_dir_entry[PATH_MAX + 64];
+static int witness_env_ready = 0;
 static int witness_fd = -1;
+static int witness_close_fd = -1;
 static uint64_t witness_proc_tag = 0;
 static _Atomic int close_recorded = 0;
 
@@ -153,16 +172,34 @@ static void open_receipt(const char *name)
     char path[PATH_MAX + 32];
     int length = 0;
     long descriptor = -1;
+    struct stat info;
 
     if (witness_fd >= 0 || witness_dir[0] == '\0' || name == NULL)
         return;
     length = snprintf(path, sizeof(path), "%s/%s.receipt", witness_dir, name);
     if (length <= 0 || length >= (int)sizeof(path))
         return;
-    descriptor = (long)syscall(SYS_openat, AT_FDCWD, path,
-                               O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-    if (descriptor >= 0 && descriptor <= INT_MAX)
-        witness_fd = (int)descriptor;
+    /*
+     * The fixture creates and owns this file.  Never create it here: a FIFO
+     * or symlink replacement must fail closed instead of blocking or
+     * redirecting the observer.
+     */
+    descriptor = (long)syscall(
+        SYS_openat, AT_FDCWD, path,
+        O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0);
+    if (descriptor < 0 || descriptor > INT_MAX)
+        return;
+    if (fstat((int)descriptor, &info) != 0
+        || !S_ISREG(info.st_mode)
+        || (info.st_mode & 0777) != WITNESS_RECEIPT_MODE
+        || info.st_uid != geteuid()
+        || info.st_nlink != 1
+        || info.st_size < 0
+        || info.st_size > WITNESS_MAX_RECEIPT_BYTES) {
+        (void)syscall(SYS_close, descriptor);
+        return;
+    }
+    witness_fd = (int)descriptor;
 }
 
 static void record_event(const char *kind, uint64_t entry_ns, uint64_t result_ns,
@@ -174,7 +211,8 @@ static void record_event(const char *kind, uint64_t entry_ns, uint64_t result_ns
     ssize_t written = 0;
     const char *role_name = NULL;
 
-    if (witness_fd < 0 || kind == NULL)
+    if (witness_fd < 0 || kind == NULL || witness_pid < 0
+        || (long)getpid() != witness_pid)
         return;
     if (role == WITNESS_HELPER)
         role_name = "helper";
@@ -192,6 +230,7 @@ static void record_event(const char *kind, uint64_t entry_ns, uint64_t result_ns
         result, error, flags, owned);
     if (length <= 0 || length >= (int)sizeof(record))
         return;
+    /* One bounded append-only write: no retry, no partial-record repair. */
     written = (ssize_t)syscall(SYS_write, witness_fd, record, (size_t)length);
     (void)written;
 }
@@ -339,13 +378,7 @@ static void mount_identity(const char *target, uint64_t *mount_id, unsigned *own
     free(buffer);
 }
 
-static pthread_once_t umount_once = PTHREAD_ONCE_INIT;
 static int (*real_umount2)(const char *, int) = NULL;
-
-static void resolve_umount2(void)
-{
-    real_umount2 = (int (*)(const char *, int))dlsym(RTLD_NEXT, "umount2");
-}
 
 static int call_real_umount2(const char *target, int flags)
 {
@@ -364,35 +397,36 @@ int umount2(const char *target, int flags)
     int result = 0;
     int saved_errno = 0;
 
-    pthread_once(&umount_once, resolve_umount2);
-    if (role != WITNESS_HELPER || witness_fd < 0 || flags != 0 || target == NULL)
+    if (role != WITNESS_HELPER || witness_pid < 0
+        || (long)getpid() != witness_pid || witness_fd < 0
+        || flags != 0 || target == NULL)
         return call_real_umount2(target, flags);
-    path_hash = fnv1a64((const unsigned char *)target, strlen(target));
     entry_ns = monotonic_ns();
     result = call_real_umount2(target, flags);
     saved_errno = errno;
-    result_ns = monotonic_ns();
     /*
-     * Only an EBUSY return can be the diagnostic target, and that mount is
-     * still present after the return.  Read its identity after the result
-     * timestamp, never before the real syscall, so the observer adds no
-     * mount-table read to the umount entry race.
+     * Only the exact 0-flag EBUSY return is recorded.  Sample that return
+     * before any receipt preparation, mount-table read or write.
      */
-    if (result != 0 && saved_errno == EBUSY)
-        mount_identity(target, &mount_id, &owned);
+    if (result != -1 || saved_errno != EBUSY) {
+        errno = saved_errno;
+        return result;
+    }
+    result_ns = monotonic_ns();
+    path_hash = fnv1a64((const unsigned char *)target, strlen(target));
+    /*
+     * The failed mount is still present after EBUSY.  Read its exact path
+     * identity after the return sample, never before the real syscall, so the
+     * observer adds no mount-table read to the umount entry race.
+     */
+    mount_identity(target, &mount_id, &owned);
     record_event("umount", entry_ns, result_ns, mount_id, path_hash,
                  (long)result, saved_errno, 0, owned);
     errno = saved_errno;
     return result;
 }
 
-static pthread_once_t close_once = PTHREAD_ONCE_INIT;
 static int (*real_close)(int) = NULL;
-
-static void resolve_close(void)
-{
-    real_close = (int (*)(int))dlsym(RTLD_NEXT, "close");
-}
 
 static int call_real_close(int descriptor)
 {
@@ -401,26 +435,37 @@ static int call_real_close(int descriptor)
     return (int)syscall(SYS_close, descriptor);
 }
 
-int close(int descriptor)
+static void resolve_close_fd(void)
 {
     const char *configured = NULL;
     char *end = NULL;
     long expected = -1;
+
+    if (witness_close_fd >= 0)
+        return;
+    configured = getenv("ROOTYARD_TEST_FUSE_WITNESS_CLOSE_FD");
+    if (configured == NULL || *configured == '\0')
+        return;
+    expected = strtol(configured, &end, 10);
+    if (end == configured || *end != '\0' || expected < 0
+        || expected > INT_MAX)
+        return;
+    witness_close_fd = (int)expected;
+}
+
+int close(int descriptor)
+{
     uint64_t entry_ns = 0;
     uint64_t result_ns = 0;
     int result = 0;
     int saved_errno = 0;
 
-    pthread_once(&close_once, resolve_close);
-    if (role != WITNESS_WRITER || witness_fd < 0
+    if (role != WITNESS_WRITER || witness_pid < 0
+        || (long)getpid() != witness_pid || witness_fd < 0
         || atomic_load(&close_recorded))
         return call_real_close(descriptor);
-    configured = getenv("ROOTYARD_TEST_FUSE_WITNESS_CLOSE_FD");
-    if (configured == NULL || *configured == '\0')
-        return call_real_close(descriptor);
-    expected = strtol(configured, &end, 10);
-    if (end == configured || *end != '\0' || expected < 0
-        || expected > INT_MAX || (int)expected != descriptor)
+    resolve_close_fd();
+    if (witness_close_fd < 0 || witness_close_fd != descriptor)
         return call_real_close(descriptor);
     if (atomic_exchange(&close_recorded, 1) != 0)
         return call_real_close(descriptor);
@@ -428,34 +473,28 @@ int close(int descriptor)
     result = call_real_close(descriptor);
     saved_errno = errno;
     result_ns = monotonic_ns();
-    record_event("close", entry_ns, result_ns, 0, 0,
-                 (long)result, saved_errno, 0, 0);
+    /* A failed close is not success evidence and is never recorded as one. */
+    if (result == 0)
+        record_event("close", entry_ns, result_ns, 0, 0, 0, 0, 0, 0);
     errno = saved_errno;
     return result;
 }
 
 struct witness_environment {
     char *entries[WITNESS_MAX_ENV + 4];
-    char library[PATH_MAX + 16];
-    char child_role[64];
-    char child_dir[PATH_MAX + 64];
 };
 
 static int is_helper_exec(const char *path, char *const arguments[])
 {
-    char self[PATH_MAX];
-    ssize_t length = 0;
-
+    if (role != WITNESS_API || !witness_env_ready || witness_pid < 0
+        || (long)getpid() != witness_pid)
+        return 0;
     if (path == NULL || arguments == NULL || arguments[0] == NULL
         || arguments[1] == NULL)
         return 0;
-    if (strcmp(arguments[1], "--workspace-fuse-helper") != 0)
+    if (strcmp(arguments[1], WITNESS_HELPER_ARG) != 0)
         return 0;
-    length = readlink("/proc/self/exe", self, sizeof(self) - 1);
-    if (length <= 0)
-        return 0;
-    self[length] = '\0';
-    return strcmp(path, self) == 0;
+    return strcmp(path, witness_self_exe) == 0;
 }
 
 static int build_helper_environment(char *const source[],
@@ -464,10 +503,8 @@ static int build_helper_environment(char *const source[],
     size_t source_index = 0;
     size_t output_index = 0;
     char *const *list = NULL;
-    int length = 0;
 
-    if (output == NULL || witness_library[0] == '\0'
-        || witness_dir[0] == '\0' || source == NULL)
+    if (output == NULL || !witness_env_ready || source == NULL)
         return 0;
     list = source;
     for (source_index = 0; list[source_index] != NULL; source_index++) {
@@ -481,26 +518,14 @@ static int build_helper_environment(char *const source[],
     }
     if (output_index + 3 > WITNESS_MAX_ENV)
         return 0;
-    length = snprintf(output->library, sizeof(output->library),
-                      "LD_PRELOAD=%s", witness_library);
-    if (length <= 0 || length >= (int)sizeof(output->library))
-        return 0;
-    length = snprintf(output->child_role, sizeof(output->child_role),
-                      "ROOTYARD_TEST_FUSE_WITNESS_ROLE=helper");
-    if (length <= 0 || length >= (int)sizeof(output->child_role))
-        return 0;
-    length = snprintf(output->child_dir, sizeof(output->child_dir),
-                      "ROOTYARD_TEST_FUSE_WITNESS_DIR=%s", witness_dir);
-    if (length <= 0 || length >= (int)sizeof(output->child_dir))
-        return 0;
-    output->entries[output_index++] = output->library;
-    output->entries[output_index++] = output->child_role;
-    output->entries[output_index++] = output->child_dir;
+    /* These strings were prepared in the constructor, not post-fork. */
+    output->entries[output_index++] = witness_preload_entry;
+    output->entries[output_index++] = witness_role_entry;
+    output->entries[output_index++] = witness_dir_entry;
     output->entries[output_index] = NULL;
     return 1;
 }
 
-static pthread_once_t exec_once = PTHREAD_ONCE_INIT;
 static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
 static int (*real_execv)(const char *, char *const[]) = NULL;
 static int (*real_execvp)(const char *, char *const[]) = NULL;
@@ -514,8 +539,10 @@ static int (*real_posix_spawnp)(pid_t *, const char *,
                                 const posix_spawnattr_t *, char *const[],
                                 char *const[]) = NULL;
 
-static void resolve_exec(void)
+static void resolve_symbols(void)
 {
+    real_umount2 = (int (*)(const char *, int))dlsym(RTLD_NEXT, "umount2");
+    real_close = (int (*)(int))dlsym(RTLD_NEXT, "close");
     real_execve = (int (*)(const char *, char *const[], char *const[]))
         dlsym(RTLD_NEXT, "execve");
     real_execv = (int (*)(const char *, char *const[]))
@@ -540,8 +567,7 @@ int execve(const char *path, char *const arguments[], char *const environment[])
 {
     struct witness_environment built;
 
-    pthread_once(&exec_once, resolve_exec);
-    if (role == WITNESS_API && is_helper_exec(path, arguments)
+    if (is_helper_exec(path, arguments)
         && build_helper_environment(environment, &built)) {
         if (real_execve != NULL)
             return real_execve(path, arguments, built.entries);
@@ -556,8 +582,7 @@ int execv(const char *path, char *const arguments[])
 {
     struct witness_environment built;
 
-    pthread_once(&exec_once, resolve_exec);
-    if (role == WITNESS_API && is_helper_exec(path, arguments)
+    if (is_helper_exec(path, arguments)
         && build_helper_environment(environ, &built)) {
         if (real_execve != NULL)
             return real_execve(path, arguments, built.entries);
@@ -574,8 +599,7 @@ int execvp(const char *file, char *const arguments[])
 {
     struct witness_environment built;
 
-    pthread_once(&exec_once, resolve_exec);
-    if (role == WITNESS_API && is_helper_exec(file, arguments)
+    if (is_helper_exec(file, arguments)
         && build_helper_environment(environ, &built)) {
         if (real_execvpe != NULL)
             return real_execvpe(file, arguments, built.entries);
@@ -601,8 +625,7 @@ int execvpe(const char *file, char *const arguments[], char *const environment[]
 {
     struct witness_environment built;
 
-    pthread_once(&exec_once, resolve_exec);
-    if (role == WITNESS_API && is_helper_exec(file, arguments)
+    if (is_helper_exec(file, arguments)
         && build_helper_environment(environment, &built)) {
         if (real_execvpe != NULL)
             return real_execvpe(file, arguments, built.entries);
@@ -620,12 +643,11 @@ int posix_spawn(pid_t *pid, const char *path,
 {
     struct witness_environment built;
 
-    pthread_once(&exec_once, resolve_exec);
     if (real_posix_spawn == NULL) {
         errno = ENOSYS;
         return -1;
     }
-    if (role == WITNESS_API && is_helper_exec(path, arguments)
+    if (is_helper_exec(path, arguments)
         && build_helper_environment(environment, &built))
         return real_posix_spawn(pid, path, file_actions, attributes,
                                 arguments, built.entries);
@@ -640,12 +662,11 @@ int posix_spawnp(pid_t *pid, const char *file,
 {
     struct witness_environment built;
 
-    pthread_once(&exec_once, resolve_exec);
     if (real_posix_spawnp == NULL) {
         errno = ENOSYS;
         return -1;
     }
-    if (role == WITNESS_API && is_helper_exec(file, arguments)
+    if (is_helper_exec(file, arguments)
         && build_helper_environment(environment, &built))
         return real_posix_spawnp(pid, file, file_actions, attributes,
                                  arguments, built.entries);
@@ -653,18 +674,51 @@ int posix_spawnp(pid_t *pid, const char *file,
                              environment);
 }
 
+static void prepare_api_environment(void)
+{
+    ssize_t length = 0;
+    int written = 0;
+
+    witness_env_ready = 0;
+    copy_environment(witness_dir, sizeof(witness_dir),
+                     "ROOTYARD_TEST_FUSE_WITNESS_DIR");
+    copy_environment(witness_library, sizeof(witness_library),
+                     "ROOTYARD_TEST_FUSE_WITNESS_LIBRARY");
+    length = readlink("/proc/self/exe", witness_self_exe,
+                      sizeof(witness_self_exe) - 1);
+    if (length <= 0 || length >= (ssize_t)sizeof(witness_self_exe))
+        return;
+    witness_self_exe[length] = '\0';
+    if (witness_library[0] == '\0' || witness_dir[0] == '\0')
+        return;
+    /* Fixed helper environment entries, prepared once in this process. */
+    written = snprintf(witness_preload_entry, sizeof(witness_preload_entry),
+                       "LD_PRELOAD=%s", witness_library);
+    if (written <= 0 || written >= (int)sizeof(witness_preload_entry))
+        return;
+    written = snprintf(witness_role_entry, sizeof(witness_role_entry),
+                       "ROOTYARD_TEST_FUSE_WITNESS_ROLE=helper");
+    if (written <= 0 || written >= (int)sizeof(witness_role_entry))
+        return;
+    written = snprintf(witness_dir_entry, sizeof(witness_dir_entry),
+                       "ROOTYARD_TEST_FUSE_WITNESS_DIR=%s", witness_dir);
+    if (written <= 0 || written >= (int)sizeof(witness_dir_entry))
+        return;
+    witness_env_ready = 1;
+}
+
 __attribute__((constructor)) static void witness_init(void)
 {
-    const char *configured = getenv("ROOTYARD_TEST_FUSE_WITNESS_ROLE");
+    const char *configured = NULL;
 
+    witness_pid = (long)syscall(SYS_getpid);
+    resolve_symbols();
+    configured = getenv("ROOTYARD_TEST_FUSE_WITNESS_ROLE");
     if (configured == NULL || *configured == '\0')
         return;
     if (strcmp(configured, "api") == 0) {
         role = WITNESS_API;
-        copy_environment(witness_dir, sizeof(witness_dir),
-                         "ROOTYARD_TEST_FUSE_WITNESS_DIR");
-        copy_environment(witness_library, sizeof(witness_library),
-                         "ROOTYARD_TEST_FUSE_WITNESS_LIBRARY");
+        prepare_api_environment();
         return;
     }
     if (strcmp(configured, "helper") == 0) {
