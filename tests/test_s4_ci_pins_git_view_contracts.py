@@ -42,7 +42,9 @@ TOUCHED = [
     SRC / "namespace_service" / "s4_git_proc.rs",
     SRC / "namespace_service" / "s4_git_proc_tests.rs",
     SRC / "namespace_service" / "s4_git_proc_reverse.rs",
+    SRC / "namespace_service" / "s4_git_reverse_diag.rs",
     SRC / "namespace_service" / "s4_git_view_reverse.rs",
+    SRC / "namespace_service" / "s4_git_view_reverse_binding.rs",
     SRC / "namespace_service" / "view_git_http.rs",
     SRC / "namespace_service" / "s4_git_view_http.rs",
     TESTS / "s4_ci_pins_git_view.rs",
@@ -109,12 +111,14 @@ class SourceContracts(unittest.TestCase):
     def test_every_s4_entrypoint_ensures_the_dedicated_schema(self) -> None:
         for rel in (
             SRC / "namespace_service" / "s4_git_view.rs",
-            SRC / "namespace_service" / "s4_git_view_reverse.rs",
+            SRC / "namespace_service" / "s4_git_view_reverse_binding.rs",
             SRC / "namespace_service" / "s4_git_view_http.rs",
             CI_PINS / "s4_authority.rs",
             CI_PINS / "s4_transport.rs",
         ):
             self.assertIn("ensure_s4_schema", text(rel), rel)
+        # The reverse entrypoint must load its active binding through that helper.
+        self.assertIn("load_binding(state, view)", text(SRC / "namespace_service" / "s4_git_view_reverse.rs"))
 
     def test_deserialize_requests_deny_unknown_fields(self) -> None:
         pattern = re.compile(
@@ -298,6 +302,118 @@ class SourceContracts(unittest.TestCase):
         hold = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")
         self.assertIn("SET incarnation=$1, rotated_at=$2", hold)
         self.assertIn("GateEpochRestoreGuard", hold)
+
+    def test_reverse_git_child_failure_diagnostic_is_closed_and_visible(self) -> None:
+        proc = text(SRC / "namespace_service" / "s4_git_proc.rs")
+        diag = text(SRC / "namespace_service" / "s4_git_reverse_diag.rs")
+        reverse = text(SRC / "namespace_service" / "s4_git_proc_reverse.rs")
+        view_reverse = text(SRC / "namespace_service" / "s4_git_view_reverse.rs")
+        tests = text(SRC / "namespace_service" / "s4_git_proc_tests.rs")
+        product = proc.split('#[path = "s4_git_proc_tests.rs"]', 1)[0]
+
+        for label in (
+            "source_projection",
+            "proposal_verify_fetch",
+            "ancestry_integrity",
+            "subtree_export_ref_update",
+            "subtree_source_fetch",
+            "subtree_source_tree_resolve",
+            "subtree_root_listing",
+            "subtree_root_rebuild",
+            "commit_synthesize",
+            "pack_write_index",
+        ):
+            self.assertIn(f'"{label}"', diag)
+        for label in ("nonzero_exit", "signaled", "unknown"):
+            self.assertIn(f'"{label}"', diag)
+        self.assertIn("enum ReverseGitStage", diag)
+        self.assertIn("enum ReverseGitChildOutcome", diag)
+        self.assertIn("pub(crate) fn write_failure_line", diag)
+        self.assertIn('b"rootyard: S4 reverse Git child failed stage="', diag)
+        self.assertIn('b" outcome="', diag)
+        self.assertIn("let _ = write_failure_line(&mut std::io::stderr().lock(), stage, outcome);", diag)
+        self.assertNotIn("eprintln!", diag)
+        self.assertNotIn("fn failure_line", diag)
+        self.assertNotIn("format!", diag)
+        self.assertNotIn("unwrap", diag)
+        self.assertNotIn("panic!", diag)
+        self.assertNotIn("{:?", diag, "no debug-formatted child value may enter the line")
+        self.assertNotIn("tracing_subscriber", diag)
+        self.assertNotIn("RUST_LOG", diag)
+        self.assertNotIn("tracing_subscriber", product)
+        self.assertNotIn("RUST_LOG", product)
+
+        failed = product.split("if !status.success()", 1)
+        self.assertEqual(len(failed), 2, "the diagnostic must sit at the child-status boundary")
+        self.assertIn("reverse_diag::emit(stage, reverse_diag::classify(status))", failed[1])
+        self.assertIn("return Err(fail_error);", failed[1])
+        capture = failed[1].split("return Err(fail_error);", 1)[0]
+        self.assertNotIn("unwrap", capture, "capture failure must not replace the public error")
+        self.assertNotIn("panic!", capture, "capture failure must not replace the public error")
+
+        for variant in (
+            "ReverseGitStage::SourceProjection",
+            "ReverseGitStage::ProposalVerifyFetch",
+            "ReverseGitStage::AncestryIntegrity",
+            "ReverseGitStage::SubtreeExportRefUpdate",
+            "ReverseGitStage::SubtreeSourceFetch",
+            "ReverseGitStage::SubtreeSourceTreeResolve",
+            "ReverseGitStage::CommitSynthesize",
+        ):
+            self.assertIn(variant, view_reverse)
+        for variant in (
+            "ReverseGitStage::SubtreeRootListing",
+            "ReverseGitStage::SubtreeRootRebuild",
+            "ReverseGitStage::PackWriteIndex",
+        ):
+            self.assertIn(variant, reverse)
+        self.assertNotIn("ReverseGitStage::SubtreeGraft", view_reverse + reverse)
+        self.assertNotIn('"subtree_graft"', diag)
+        self.assertIn("Git View reverse mapping conflict", reverse)
+        self.assertIn("Git View reverse mapping conflict", view_reverse)
+
+        self.assertIn("reverse_diag::take_for_test", tests)
+        self.assertIn("every_reverse_stage_reaches_closed_runner_diagnostic_and_keeps_public_conflict", tests)
+        self.assertIn("reverse_git_child_outcome_distinguishes_nonzero_signal_and_unknown", tests)
+        self.assertIn("reverse_git_diagnostic_labels_are_closed_and_bounded", tests)
+        self.assertIn("reverse_git_diagnostic_write_failure_is_best_effort", tests)
+
+    def test_discarded_projection_cleanup_is_not_diagnosed(self) -> None:
+        view = text(SRC / "namespace_service" / "s4_git_view.rs")
+        self.assertIn(
+            'let _ = run_git(git_bin, work, &["update-ref", "-d", reference], deadline, None).await;',
+            view,
+        )
+        self.assertIn(
+            '&["update-ref", "-d", "refs/original/refs/heads/projected"],\n            deadline,\n            None,',
+            view,
+        )
+        self.assertNotIn('&["update-ref", "-d", reference], deadline, stage)', view)
+        self.assertNotIn(
+            '&["update-ref", "-d", "refs/original/refs/heads/projected"],\n            deadline,\n            stage,',
+            view,
+        )
+
+    def test_reverse_fixture_failure_output_is_bounded(self) -> None:
+        harness = text(TESTS / "s4_ci_pins_git_view_support" / "harness.rs")
+        reverse = harness.split("pub async fn reverse", 1)[1].split("pub async fn post_json", 1)[0]
+        self.assertIn("reverse_changeset failure http_status={}", reverse)
+        self.assertIn("status.as_u16()", reverse)
+        self.assertIn('map_err(|_| anyhow!("reverse_changeset failure class=transport"))?', reverse)
+        self.assertIn('map_err(|_| anyhow!("reverse_changeset failure class=json"))', reverse)
+        self.assertNotIn("send().await?", reverse)
+        self.assertNotIn(".context(", reverse)
+        self.assertNotIn("post_json(", reverse)
+        self.assertNotIn("{url}", reverse)
+        self.assertNotIn("{value}", reverse)
+
+        fixture = text(TESTS / "s4_ci_pins_git_view.rs")
+        self.assertEqual(fixture.count('changeset["state"].as_str() == Some("complete")'), 2)
+        self.assertIn('"reverse_changeset failure class=state sha1"', fixture)
+        self.assertIn('"reverse_changeset failure class=state sha256"', fixture)
+        self.assertNotIn('"reverse merge did not complete: {changeset}"', fixture)
+        self.assertNotIn('"SHA-256 reverse merge incomplete: {changeset}"', fixture)
+        self.assertNotIn("{changeset}", fixture)
 
     def test_hold_regressions_cover_the_two_review_items(self) -> None:
         body = text(TESTS / "s4_ci_pins_git_view_support" / "hold_regressions.rs")
