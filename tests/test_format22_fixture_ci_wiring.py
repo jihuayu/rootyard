@@ -635,7 +635,8 @@ class ProtocolSuiteCountTest(unittest.TestCase):
         self.assertEqual(assertion_lines[0], binding_lines[0] + 1,
                          "binding and verifier must be adjacent top-level statements")
 
-        body = {node.lineno: node for node in ast.parse(code).body}
+        tree = ast.parse(code)
+        body = {node.lineno: node for node in tree.body}
         self.assertIsInstance(body.get(binding_lines[0] + 1), ast.Assign)
         assertion_node = body.get(assertion_lines[0] + 1)
         self.assertIsInstance(assertion_node, ast.Assert)
@@ -643,6 +644,13 @@ class ProtocolSuiteCountTest(unittest.TestCase):
         self.assertEqual(len(assertion_node.test.comparators), 1)
         asserted = ast.literal_eval(assertion_node.test.comparators[0])
         self.assertEqual(asserted, [8, 12, 23, 24])
+
+        stores = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and node.id == "suite_counts"
+            and isinstance(node.ctx, ast.Store)
+        ]
+        self.assertEqual(len(stores), 1, "expected exactly one suite_counts write")
 
         self.assertEqual(step.count("issue107-a4-native.json"), 1)
         self.assertEqual(step.count("'suite_counts': suite_counts,"), 1,
@@ -678,6 +686,11 @@ class ProtocolSuiteCountTest(unittest.TestCase):
             step.replace(assertion, "assert suite_counts == [8, 12, 23, 23], rows", 1),
             step.replace(assertion, "", 1),
             step.replace(binding, binding + "\n" + binding, 1),
+            step.replace(
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                "          suite_counts = [0, 0, 0, 0]\n"
+                "          pathlib.Path('test-results/refstore/issue107-a4-native.json')",
+                1),
         )
         for variant in variants:
             with self.assertRaises(AssertionError):
