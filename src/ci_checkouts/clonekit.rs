@@ -12,11 +12,13 @@ pub mod checkout;
 pub mod grants;
 #[path = "clonekit/manifest.rs"]
 pub mod manifest;
+#[path = "clonekit/transfer.rs"]
+mod transfer;
 
 pub use builder::{
     BlobHoldPublishContext, BuildCloneKitRequest, BuildFailurePoint, BuiltCloneKitArtifacts, CloneKitPublicationStore,
-    RetentionPinGuard, RetentionPinLedger, build_clonekit_from_git, publish_clonekit_to_blob_store,
-    publish_clonekit_versioned,
+    CloneKitReadLease, LeasedCloneKitManifest, RetentionPinGuard, RetentionPinLedger, build_clonekit_from_git,
+    publish_clonekit_to_blob_store, publish_clonekit_versioned,
 };
 pub use checkout::{
     CheckoutOutcome, CheckoutPolicy, CheckoutRequest, CheckoutStrategy, CheckoutTelemetry, FallbackReason,

@@ -17,9 +17,10 @@ use super::{
         verify_grant, verify_tree_dependencies,
     },
     manifest::{
-        CloneKitError, CloneKitManifest, CloneKitStatus, compute_file_sha256, default_git_timeout,
-        ensure_not_cancelled, ensure_private_dir, read_pack_trailer_hex, run_git_command, write_atomic_private_file,
+        CloneKitError, CloneKitManifest, CloneKitStatus, ensure_not_cancelled, ensure_private_dir,
+        read_pack_trailer_hex, run_git_command,
     },
+    transfer::download_and_verify_kit_files,
 };
 use crate::blob_store::{
     disposable_view::{DisposableViewRoot, TempViewLease},
@@ -283,55 +284,6 @@ fn evaluate_manifest_fallback(
     Ok(Ok(()))
 }
 
-async fn download_and_verify_kit_files(
-    req: &CheckoutRequest<'_>,
-    manifest: &CloneKitManifest,
-    stage_dir: &Path,
-) -> Result<(PathBuf, PathBuf, u64, u64), CloneKitError> {
-    ensure_not_cancelled(req.cancel.as_ref())?;
-    let pack_meta = manifest.pack.as_ref().ok_or(CloneKitError::MissingKit)?;
-    let idx_meta = manifest.idx.as_ref().ok_or(CloneKitError::MissingKit)?;
-    let dest_pack = stage_dir.join(format!("kit-{}.pack", pack_meta.sha256));
-    let dest_idx = stage_dir.join(format!("kit-{}.idx", idx_meta.sha256));
-    let mut gets = 0u64;
-
-    if let Some(blob_store) = req.blob_store {
-        if let Some(expected_backend) = manifest.backend_identity_hex.as_deref()
-            && expected_backend != blob_store.backend_identity().as_hex()
-        {
-            return Err(CloneKitError::ForeignBackend);
-        }
-        if let (Some(p_loc), Some(i_loc)) = (&pack_meta.blob_locator, &idx_meta.blob_locator) {
-            let deadline = std::time::Instant::now() + default_git_timeout();
-            blob_store.get_to_file(&p_loc.to_blob_locator()?, &dest_pack, deadline).await?;
-            gets += 1;
-            ensure_not_cancelled(req.cancel.as_ref())?;
-            blob_store.get_to_file(&i_loc.to_blob_locator()?, &dest_idx, deadline).await?;
-            gets += 1;
-        }
-    }
-    if gets == 0 {
-        let pub_store = req.pub_store.ok_or(CloneKitError::MissingKit)?;
-        let (src_pack, src_idx) = pub_store.artifact_paths(manifest.repository_id, manifest.kit_generation);
-        write_atomic_private_file(
-            &dest_pack,
-            &fs::read(&src_pack).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?,
-        )?;
-        ensure_not_cancelled(req.cancel.as_ref())?;
-        write_atomic_private_file(
-            &dest_idx,
-            &fs::read(&src_idx).map_err(|e| CloneKitError::CorruptArtifact(e.to_string()))?,
-        )?;
-        gets = 2;
-    }
-
-    let ((p_sha, p_len), (i_sha, i_len)) = (compute_file_sha256(&dest_pack)?, compute_file_sha256(&dest_idx)?);
-    if p_sha != pack_meta.sha256 || p_len != pack_meta.length || i_sha != idx_meta.sha256 || i_len != idx_meta.length {
-        return Err(CloneKitError::CorruptArtifact("downloaded clonekit pack/idx digest or size mismatch".into()));
-    }
-    Ok((dest_pack, dest_idx, p_len + i_len, gets))
-}
-
 fn fallback_error(reason: FallbackReason) -> CloneKitError {
     match reason {
         FallbackReason::OptOutStockGitRequested => CloneKitError::InvalidConfig("clonekit not requested"),
@@ -367,10 +319,10 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
 
     let allow_fallback = claims.allow_git_fallback && req.policy.fallback_to_git_on_unusable_kit;
     let loaded = match req.manifest_override {
-        Some(m) => Some(m.clone()),
+        Some(m) => Some((m.clone(), None)),
         None => match req.pub_store {
-            Some(store) => match store.load_latest(claims.repository_id) {
-                Ok(found) => found,
+            Some(store) => match store.load_latest_leased(claims.repository_id) {
+                Ok(found) => found.map(|leased| leased.into_parts()),
                 Err(_) if allow_fallback => {
                     return run_stock_git_checkout(
                         req,
@@ -385,7 +337,7 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
             None => None,
         },
     };
-    if let Err(reason) = evaluate_manifest_fallback(loaded.as_ref(), req)? {
+    if let Err(reason) = evaluate_manifest_fallback(loaded.as_ref().map(|(manifest, _)| manifest), req)? {
         return if allow_fallback {
             run_stock_git_checkout(req, work_repo, lease, CheckoutStrategy::StockGitFallback { reason }).await
         } else {
@@ -393,28 +345,28 @@ pub async fn execute_ci_checkout(req: &CheckoutRequest<'_>) -> Result<CheckoutOu
         };
     }
 
-    let manifest = loaded.ok_or(CloneKitError::MissingKit)?;
+    let (manifest, read_lease) = loaded.ok_or(CloneKitError::MissingKit)?;
     let _pin = match req.pin_ledger {
         Some(ledger) => Some(RetentionPinGuard::acquire(ledger, claims.repository_id, manifest.kit_generation)?),
         None => None,
     };
     let stage_dir = lease.dir_path().map_err(|e| CloneKitError::GitFailed(e.to_string()))?.join("kit-stage");
     ensure_private_dir(&stage_dir)?;
-    let (staged_pack, staged_idx, kit_bytes, gets) = match download_and_verify_kit_files(req, &manifest, &stage_dir)
-        .await
-    {
-        Ok(res) => res,
-        Err(err @ (CloneKitError::TransferCancelled | CloneKitError::ForeignBackend)) => return Err(err),
-        Err(err) if allow_fallback => {
-            let reason = if matches!(err, CloneKitError::MissingKit) {
-                FallbackReason::MissingKit
-            } else {
-                FallbackReason::CorruptKit
-            };
-            return run_stock_git_checkout(req, work_repo, lease, CheckoutStrategy::StockGitFallback { reason }).await;
-        }
-        Err(err) => return Err(err),
-    };
+    let (staged_pack, staged_idx, kit_bytes, gets) =
+        match download_and_verify_kit_files(req, &manifest, &stage_dir, read_lease).await {
+            Ok(res) => res,
+            Err(err @ (CloneKitError::TransferCancelled | CloneKitError::ForeignBackend)) => return Err(err),
+            Err(err) if allow_fallback => {
+                let reason = if matches!(err, CloneKitError::MissingKit) {
+                    FallbackReason::MissingKit
+                } else {
+                    FallbackReason::CorruptKit
+                };
+                return run_stock_git_checkout(req, work_repo, lease, CheckoutStrategy::StockGitFallback { reason })
+                    .await;
+            }
+            Err(err) => return Err(err),
+        };
 
     req.authority.check_active(claims).await?;
     ensure_not_cancelled(req.cancel.as_ref())?;
