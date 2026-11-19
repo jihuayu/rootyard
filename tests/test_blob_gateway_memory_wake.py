@@ -56,7 +56,19 @@ class BlobGatewayMemoryWakeShapeTests(unittest.TestCase):
         self.assertIn('pub const TARGET_AUDIT_CONSUMER: &str = "audit-log"', events)
         self.assertIn('pub const TARGET_AUDIT_KIND: &str = "pg_refstore_core_commit_audit"', events)
         claim = body(events, "async fn claim_scoped(", "async fn lock_valid_lease")
-        self.assertIn("$3::text IS NULL OR o.evidence->>'kind'=$3", claim)
+        for marker in (
+            "$3::text IS NULL OR",
+            "o.evidence->>'kind'=$3",
+            "o.evidence->>'authority'='pg_refstore'",
+            "o.evidence->>'delivery'='audit-log'",
+            "o.evidence->>'source'='ref_store_core_events'",
+            "o.evidence->>'repository_id'=e.repository_id::text",
+            "o.evidence->>'storage_generation'=e.storage_generation::text",
+            "o.evidence->>'core_operation_id'=e.operation_id::text",
+            "o.evidence->>'core_revision'=e.operation_sequence::text",
+            "o.evidence->>'core_outcome'='committed'",
+        ):
+            self.assertIn(marker, claim)
         scoped = body(events, "pub async fn worker_once_with_lease_scoped(", "async fn run_claims")
         self.assertIn("claim_scoped", scoped)
 

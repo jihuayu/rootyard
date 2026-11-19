@@ -347,7 +347,18 @@ async fn run_wake_bridge_in_schema(url: &str, schema: &str) -> Result<()> {
         // create a conflicting `repository_ref_projection` authority row.
         assert!(events::claim(&pool, "ref-index", Uuid::new_v4(), 100, 60).await?.is_empty());
         assert_eq!(events::pending_count(&pool).await?, 2);
-        assert_eq!(events::worker_once(&pool, "audit-log", actor, 100).await?, 2);
+        assert_eq!(
+            events::worker_once_with_lease_scoped(
+                &pool,
+                events::TARGET_AUDIT_CONSUMER,
+                Some(events::TARGET_AUDIT_KIND),
+                actor,
+                100,
+                60,
+            )
+            .await?,
+            2
+        );
         assert_eq!(events::pending_count(&pool).await?, 0);
         let audit: i64 = pool.get().await?.query_one("SELECT count(*) FROM audit_events", &[]).await?.get(0);
         assert_eq!(audit, 2);
@@ -377,8 +388,9 @@ async fn run_wake_bridge_in_schema(url: &str, schema: &str) -> Result<()> {
 }
 
 fn record(repository_id: Uuid, actor_id: Uuid, token_id: Uuid, sequence: i64) -> events::OperationRecord {
+    let id = Uuid::new_v4();
     events::OperationRecord {
-        id: Uuid::new_v4(),
+        id,
         repository_id,
         actor_id,
         token_id,
@@ -387,7 +399,17 @@ fn record(repository_id: Uuid, actor_id: Uuid, token_id: Uuid, sequence: i64) ->
         sequence,
         storage_generation: 1,
         outcome: "recorded".into(),
-        evidence: serde_json::json!({"kind":"pg_refstore_core_commit_audit"}),
+        evidence: serde_json::json!({
+            "kind": "pg_refstore_core_commit_audit",
+            "authority": "pg_refstore",
+            "delivery": "audit-log",
+            "source": "ref_store_core_events",
+            "repository_id": repository_id,
+            "storage_generation": 1,
+            "core_operation_id": id,
+            "core_revision": sequence,
+            "core_outcome": "committed",
+        }),
         admission: None,
     }
 }
