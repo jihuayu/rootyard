@@ -287,7 +287,7 @@ async fn seed_runtime_rows(
         )
         .await?;
     let plan = json!({
-        "version": "1",
+        "version": 1,
         "job_id": job_id.to_string(),
         "owner_id": owner_id.to_string(),
         "repository_id": repo.id.to_string(),
@@ -297,6 +297,7 @@ async fn seed_runtime_rows(
         "source_receipt_sha256": "1".repeat(64),
         "mirror_audience": Uuid::new_v4().to_string(),
         "expires_unix": expires,
+        "dependencies": {"version": 1},
     });
     let credential: &[u8] = &[0xA5u8; 32];
     client
