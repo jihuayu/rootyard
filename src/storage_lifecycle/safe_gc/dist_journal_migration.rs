@@ -359,7 +359,7 @@ fn extract_distributed_lane(snap: &SafeGcRepoSnapshot) -> Result<DistributedLane
         .pending_delete
         .as_ref()
         .map(|batch| &batch.proof.lane)
-        .or_else(|| match &snap.gc_mode {
+        .or(match &snap.gc_mode {
             GcMode::ArmedDestructive(arm) if matches!(&arm.lane, AuthorityLane::DistributedRefCas { .. }) => {
                 Some(&arm.lane)
             }
