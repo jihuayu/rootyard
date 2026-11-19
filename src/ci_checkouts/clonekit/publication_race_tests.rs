@@ -11,6 +11,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::publication_child_fixture::OwnedChild;
 use super::{
     CP_AFTER_INSTALL, CP_AFTER_POINTER, CP_BEFORE_INSTALL, CP_BEFORE_LOCK, CP_BEFORE_POINTER, CloneKitPublicationStore,
     publish_clonekit_versioned, test_seam,
@@ -22,10 +23,6 @@ use crate::ci_checkouts::clonekit::{
         CloneKitStatus,
     },
 };
-
-#[path = "publication_child_fixture.rs"]
-mod child_fixture;
-use child_fixture::OwnedChild;
 
 fn git() -> &'static Path {
     Path::new("/usr/bin/git")
@@ -180,7 +177,7 @@ fn cross_process_lock_excludes_and_releases_on_child_termination() {
     let mut child = OwnedChild::new(
         Command::new(std::env::current_exe().expect("current exe"))
             .arg("--nocapture")
-            .arg("publication_lock_child_helper")
+            .arg("ci_checkouts::clonekit::publication::publication_race_tests::publication_lock_child_helper")
             .env("ROOTYARD_CK_LOCK_ROOT", &root)
             .env("ROOTYARD_CK_LOCK_REPO", repository_id.to_string())
             .env("ROOTYARD_CK_LOCK_READY", &ready)
