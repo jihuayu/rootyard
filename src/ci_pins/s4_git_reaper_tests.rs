@@ -36,6 +36,14 @@ fn is_active_task(registry: &UnresolvedRegistry) -> bool {
     registry.state.lock().unwrap_or_else(|e| e.into_inner()).active_task
 }
 
+fn is_standby_started(registry: &UnresolvedRegistry) -> bool {
+    registry.state.lock().unwrap_or_else(|e| e.into_inner()).standby_started
+}
+
+fn failed_standby(_task: ReaperTask) -> std::io::Result<()> {
+    Err(std::io::Error::other("simulated thread exhaustion"))
+}
+
 fn stop_standby(registry: &UnresolvedRegistry) {
     let mut state = registry.state.lock().unwrap_or_else(|e| e.into_inner());
     state.standby_stop = true;
@@ -185,7 +193,7 @@ async fn unresolved_owner_retains_child_and_scratch_when_owner_task_cancelled() 
 #[tokio::test]
 async fn unresolved_owner_standby_sweeper_reaps_without_runtime_or_new_thread() {
     let registry = Arc::new(UnresolvedRegistry::default());
-    registry.ensure_standby_sweeper();
+    registry.ensure_standby_sweeper().expect("standby sweeper");
     let (view, root, child, pid, leader, grandchild) = spawn_test_group().await;
     let holds = vec![view.hold()];
     drop(view);
@@ -289,7 +297,7 @@ async fn unresolved_owner_cancellation_drains_pending_queue_and_clears_active_ta
         "both entries must be retained"
     );
     assert!(root1.exists() && root2.exists(), "scratch vanished during cancellation");
-    registry.ensure_standby_sweeper();
+    registry.ensure_standby_sweeper().expect("standby sweeper");
     registry.wake.notify_all();
     for _ in 0..300 {
         let cleared = !retained_contains_pid(&registry, pid1)
@@ -343,7 +351,7 @@ async fn unresolved_owner_failed_start_and_runtime_shutdown_retain_child_and_scr
     assert!(retained_contains_pid(&registry, pid2), "shutdown fallback dropped the child");
     assert!(!gone(leader2), "shutdown fallback reaped the leader");
     assert!(root2.exists(), "shutdown fallback dropped scratch");
-    registry.ensure_standby_sweeper();
+    registry.ensure_standby_sweeper().expect("standby sweeper");
     registry.wake.notify_all();
     for _ in 0..300 {
         let cleared = !retained_contains_pid(&registry, pid1)
@@ -366,4 +374,74 @@ async fn unresolved_owner_failed_start_and_runtime_shutdown_retain_child_and_scr
     assert!(gone(leader1) && gone(grandchild1) && gone(leader2) && gone(grandchild2), "standby left a live process");
     assert!(!root1.exists() && !root2.exists(), "standby did not release shutdown-retained scratch");
     stop_standby(&registry);
+}
+
+#[tokio::test]
+async fn ensure_standby_sweeper_failure_resets_flag_and_allows_recovery() {
+    let registry = Arc::new(UnresolvedRegistry::default());
+    let failed = registry.ensure_standby_sweeper_with(failed_standby);
+    assert!(failed.is_err(), "simulated spawn failure must surface");
+    assert!(!is_standby_started(&registry), "failed standby spawn left the started flag set");
+    let (view, root, child, pid, leader, grandchild) = spawn_test_group().await;
+    let holds = vec![view.hold()];
+    drop(view);
+    let worker = Arc::clone(&registry);
+    let handoff = std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let entry = UnresolvedEntry::new(child, pid, holds, default_probe());
+        assert!(worker.ensure_standby_sweeper_with(failed_standby).is_err(), "retry must fail");
+        let policy = OwnerPolicy { allow_thread_owner: false, ..QUIET };
+        let _ = worker.handoff_with(entry, None, policy);
+    });
+    handoff.join().expect("handoff thread");
+    assert!(!is_standby_started(&registry), "failed standby retry left the started flag set");
+    assert_retained(&registry, &root, pid, leader);
+    registry.ensure_standby_sweeper().expect("recovered standby");
+    registry.wake.notify_all();
+    for _ in 0..300 {
+        if !retained_contains_pid(&registry, pid) && gone(leader) && gone(grandchild) && !root.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!retained_contains_pid(&registry, pid), "recovered standby left a live entry retained");
+    assert!(gone(leader), "recovered standby left the leader as a zombie");
+    assert!(gone(grandchild), "recovered standby left the grandchild alive");
+    assert!(!root.exists(), "recovered standby did not release confirmed scratch");
+    stop_standby(&registry);
+}
+
+#[tokio::test]
+async fn fallback_exits_transfer_entry_to_registry_before_diagnostic_unwinds() {
+    let registry = Arc::new(UnresolvedRegistry::default());
+    let (view1, root1, child1, pid1, leader1, grandchild1) = spawn_test_group().await;
+    let entry1 = UnresolvedEntry::new(child1, pid1, vec![view1.hold()], default_probe());
+    drop(view1);
+    let policy = OwnerPolicy { allow_thread_owner: false, ..QUIET };
+    let worker = Arc::clone(&registry);
+    let sync = std::thread::spawn(move || {
+        drop_fallback_with_diag(worker, entry1, policy, |_| panic!("simulated stderr panic"));
+    });
+    assert!(sync.join().is_err(), "the sync fallback diagnostic must unwind after transfer");
+    assert_retained(&registry, &root1, pid1, leader1);
+    assert!(!gone(grandchild1), "the sync fallback diagnostic reaped the grandchild before transfer");
+    let (view2, root2, child2, pid2, leader2, grandchild2) = spawn_test_group().await;
+    let entry2 = UnresolvedEntry::new(child2, pid2, vec![view2.hold()], default_probe());
+    drop(view2);
+    let worker2 = Arc::clone(&registry);
+    let task = tokio::spawn(async move {
+        let guard = InFlightEntryGuard { registry: worker2, entry: Some(entry2) };
+        reap_fallback_guarded_with_diag(guard, default_wait_child, QUIET, |_| panic!("simulated stderr panic")).await;
+    });
+    assert!(task.await.expect_err("diag panic").is_panic(), "the async fallback diagnostic must unwind");
+    for _ in 0..100 {
+        if retained_contains_pid(&registry, pid2) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_retained(&registry, &root2, pid2, leader2);
+    assert!(!gone(grandchild2), "the async fallback diagnostic reaped the grandchild before transfer");
+    sweep_finish_released(&registry, &root1, pid1, leader1, grandchild1).await;
+    sweep_finish_released(&registry, &root2, pid2, leader2, grandchild2).await;
 }

@@ -3,7 +3,10 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const SCRIPT: &str = r#"sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > "$1"; trap "" TERM; while :; do sleep 1; done"#;
+const SCRIPT: &str = concat!(
+    r#"sh -c 'trap "" TERM; while :; do sleep 1; done' & echo $$ $! > "$1"; "#,
+    r#"trap "" TERM; while :; do sleep 1; done"#,
+);
 #[cfg(unix)]
 const FINAL_SCRIPT: &str = r#"exec >/dev/null
 sh -c 'trap "" TERM; while :; do sleep 1; done' &
@@ -246,4 +249,18 @@ async fn spawn_reaper_failure_with_unknown_group_preserves_scratch_and_reaps_chi
     }
     assert!(!PathBuf::from(format!("/proc/{leader}")).exists(), "leader survived after probe recovery");
     assert!(!root.exists(), "confirmed scratch was not released after probe recovery");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn git_proc_spawn_refuses_to_start_child_when_standby_sweeper_fails() {
+    let scratch = ScratchDir::create("rootyard-s4-proc-nostandby").unwrap();
+    let marker = scratch.root().join("ran");
+    let mut cmd = base_command(FsPath::new("/bin/sh"));
+    cmd.args(["-c", "echo spawned > \"$1\"", "sh", marker.to_str().unwrap()]);
+    let err = ReapOnDropGuard::spawn_with_warm(cmd, || Err(io::Error::other("simulated standby failure")))
+        .err()
+        .expect("standby failure must refuse spawn");
+    assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!marker.exists(), "GitView child ran despite standby failure");
 }

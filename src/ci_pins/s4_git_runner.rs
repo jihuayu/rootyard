@@ -12,6 +12,7 @@ use tokio::{
 const GIT_DIR_CAP: usize = 64 * 1024 * 1024;
 const TIMEOUT_CLEANUP_BOUND: Duration = Duration::from_secs(2);
 const LEADER_REAP_BOUND: Duration = Duration::from_millis(100);
+const UPLOAD_PACK_ARGS: [&str; 2] = ["upload-pack", "--stateless-rpc"];
 
 /// One refcounted scratch owner that must outlive a child process group.
 pub(crate) type ScratchHold = std::sync::Arc<dyn std::any::Any + Send + Sync>;
@@ -60,14 +61,7 @@ pub(crate) struct UploadPackGroup {
 }
 impl UploadPackGroup {
     pub(crate) fn spawn(git_bin: &FsPath, dir: &FsPath, scratch_hold: Option<ScratchHold>) -> Result<Self, Error> {
-        Self::spawn_argv(
-            git_bin,
-            Some(dir),
-            &["upload-pack", "--stateless-rpc"],
-            Some(dir),
-            Stdio::piped(),
-            scratch_hold,
-        )
+        Self::spawn_argv(git_bin, Some(dir), &UPLOAD_PACK_ARGS, Some(dir), Stdio::piped(), scratch_hold)
     }
 
     fn spawn_argv(
@@ -78,6 +72,32 @@ impl UploadPackGroup {
         stdin: Stdio,
         scratch_hold: Option<ScratchHold>,
     ) -> Result<Self, Error> {
+        let cmd = Self::build_command(git_bin, dir, args, positional, stdin);
+        Self::spawn_with_warm(cmd, scratch_hold, super::s4_git_reaper::warm_standby_reaper)
+    }
+
+    #[cfg(test)]
+    #[cfg(unix)]
+    pub(crate) fn spawn_for_test_with_warm<W>(
+        git_bin: &FsPath,
+        dir: &FsPath,
+        scratch_hold: Option<ScratchHold>,
+        warm: W,
+    ) -> Result<Self, Error>
+    where
+        W: FnOnce() -> std::io::Result<()>,
+    {
+        let cmd = Self::build_command(git_bin, Some(dir), &UPLOAD_PACK_ARGS, Some(dir), Stdio::piped());
+        Self::spawn_with_warm(cmd, scratch_hold, warm)
+    }
+
+    fn build_command(
+        git_bin: &FsPath,
+        dir: Option<&FsPath>,
+        args: &[&str],
+        positional: Option<&FsPath>,
+        stdin: Stdio,
+    ) -> Command {
         let mut cmd = Command::new(git_bin);
         cmd.args(["-c", "core.hooksPath=/dev/null"]);
         if let Some(dir) = dir {
@@ -97,7 +117,14 @@ impl UploadPackGroup {
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
-        super::s4_git_reaper::warm_standby_reaper();
+        cmd
+    }
+
+    fn spawn_with_warm<W>(mut cmd: Command, scratch_hold: Option<ScratchHold>, warm: W) -> Result<Self, Error>
+    where
+        W: FnOnce() -> std::io::Result<()>,
+    {
+        warm().map_err(Error::internal)?;
         let child = cmd.spawn().map_err(Error::internal)?;
         let pid = child.id().and_then(|id| i32::try_from(id).ok()).unwrap_or(0);
         let guard = Self { child: Some(child), pid, scratch_hold };

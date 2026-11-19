@@ -471,3 +471,21 @@ async fn inner_wait_error_preserves_scratch_and_hands_child_to_bounded_owner() {
         "continuing owner must release scratch after positively confirming reap and group quiescence"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upload_pack_spawn_refuses_to_start_child_when_standby_sweeper_fails() {
+    use super::s4_authority::{DisposableCiView, UploadPackGroup};
+    use std::os::unix::fs::PermissionsExt;
+    let view = DisposableCiView::create().expect("disposable view");
+    let wrapper = view.path().join("git");
+    std::fs::write(&wrapper, "#!/bin/sh\necho spawned > \"$0.ran\"\n").expect("write wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("chmod wrapper");
+    let err = UploadPackGroup::spawn_for_test_with_warm(&wrapper, view.path(), Some(view.hold()), || {
+        Err(std::io::Error::other("simulated standby failure"))
+    })
+    .err()
+    .expect("standby failure must refuse spawn");
+    assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!wrapper.with_extension("ran").exists(), "Git child ran despite standby failure");
+}

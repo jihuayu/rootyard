@@ -91,11 +91,18 @@ struct ReapOnDropGuard {
 }
 
 impl ReapOnDropGuard {
-    fn spawn(mut cmd: Command) -> Result<Self, Error> {
+    fn spawn(cmd: Command) -> Result<Self, Error> {
+        Self::spawn_with_warm(cmd, crate::ci_pins::s4_git_reaper::warm_standby_reaper)
+    }
+
+    fn spawn_with_warm<W>(mut cmd: Command, warm: W) -> Result<Self, Error>
+    where
+        W: FnOnce() -> io::Result<()>,
+    {
         cmd.kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
-        crate::ci_pins::s4_git_reaper::warm_standby_reaper();
+        warm().map_err(Error::internal)?;
         let child = cmd.spawn().map_err(Error::internal)?;
         let pid = child.id().and_then(|id| i32::try_from(id).ok()).unwrap_or(0);
         let scratch_holds = ACTIVE_SCRATCH.try_with(Clone::clone).unwrap_or_default();
@@ -299,8 +306,11 @@ pub(crate) async fn run_git_bounded(
         return Err(Error::internal("missing Git stdout"));
     };
     let mut output = Vec::new();
-    let read = tokio::time::timeout_at(deadline, (&mut stdout).take(max_stdout_bytes as u64 + 1).read_to_end(&mut output))
-        .await;
+    let read = tokio::time::timeout_at(
+        deadline,
+        (&mut stdout).take(max_stdout_bytes as u64 + 1).read_to_end(&mut output),
+    )
+    .await;
     drop(stdout);
     match read {
         Ok(Ok(_)) => {}
@@ -394,7 +404,12 @@ pub(crate) async fn git_oid(
         .to_owned())
 }
 
-pub(crate) async fn git_init_bare(git_bin: &FsPath, bare: &FsPath, format: &str, deadline: Instant) -> Result<(), Error> {
+pub(crate) async fn git_init_bare(
+    git_bin: &FsPath,
+    bare: &FsPath,
+    format: &str,
+    deadline: Instant,
+) -> Result<(), Error> {
     let object_format = format!("--object-format={format}");
     let mut cmd = base_command(git_bin);
     cmd.args(["-c", "core.hooksPath=/dev/null", "init", "--bare"])

@@ -14,7 +14,13 @@ const FALLBACK_ASYNC_BUDGET: Duration = Duration::from_millis(250);
 const UNRESOLVED_OWNER_CAP: usize = 256;
 const OWNER_WAIT_BUDGET: Duration = Duration::from_secs(2);
 const RETAINED_SWEEP_INTERVAL: Duration = Duration::from_millis(50);
-
+const FALLBACK_DIAGNOSTIC: &str =
+    "rootyard: Git reaper fallback timed out or group probe failed; handing off unresolved child\n";
+const BLOCKED_DIAGNOSTIC: &str =
+    "rootyard: cancelled Git process group cleanup blocked; retaining scratch hold\n";
+fn write_reaper_diagnostic(msg: &str) {
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), msg.as_bytes());
+}
 pub(crate) type ReaperTask = Box<dyn FnOnce() + Send + 'static>;
 pub(crate) type GroupProbe = fn(i32) -> std::io::Result<bool>;
 pub(super) type WaitFuture<'a> =
@@ -94,6 +100,7 @@ struct UnresolvedState {
 #[derive(Default)]
 struct UnresolvedRegistry {
     state: Mutex<UnresolvedState>,
+    standby_init: Mutex<()>,
     wake: Condvar,
 }
 static RETAINED_REGISTRY: OnceLock<Arc<UnresolvedRegistry>> = OnceLock::new();
@@ -101,8 +108,8 @@ fn global_registry() -> &'static Arc<UnresolvedRegistry> {
     RETAINED_REGISTRY.get_or_init(|| Arc::new(UnresolvedRegistry::default()))
 }
 /// Pre-warms the standby OS sweeper so a runtime-less or cancelled handoff sweeps via `Condvar`.
-pub(crate) fn warm_standby_reaper() {
-    global_registry().ensure_standby_sweeper();
+pub(crate) fn warm_standby_reaper() -> std::io::Result<()> {
+    global_registry().ensure_standby_sweeper()
 }
 struct FlagGuard {
     registry: Arc<UnresolvedRegistry>,
@@ -146,19 +153,26 @@ impl Drop for InFlightEntryGuard {
     }
 }
 impl UnresolvedRegistry {
-    fn ensure_standby_sweeper(self: &Arc<Self>) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.standby_started {
-            return;
+    fn ensure_standby_sweeper(self: &Arc<Self>) -> std::io::Result<()> {
+        let spawn = |task| std::thread::Builder::new().name("s4-git-standby".into()).spawn(task).map(|_| ());
+        self.ensure_standby_sweeper_with(spawn)
+    }
+    fn ensure_standby_sweeper_with<F>(self: &Arc<Self>, spawn_standby: F) -> std::io::Result<()>
+    where
+        F: FnOnce(ReaperTask) -> std::io::Result<()>,
+    {
+        let _init = self.standby_init.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.standby_started {
+                return Ok(());
+            }
+            state.standby_started = true;
+            state.standby_stop = false;
         }
-        state.standby_started = true;
-        state.standby_stop = false;
-        drop(state);
         let reg = Arc::clone(self);
         let guard = FlagGuard { registry: Arc::clone(self), standby: true, armed: true };
-        let _ = std::thread::Builder::new()
-            .name("s4-git-standby".into())
-            .spawn(move || run_standby_sweeper(reg, guard));
+        spawn_standby(Box::new(move || run_standby_sweeper(reg, guard)))
     }
     fn requeue_retained(&self, entry: UnresolvedEntry) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -187,29 +201,37 @@ impl UnresolvedRegistry {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.retained.retain_mut(|entry| !try_resolve_entry(entry, signal));
     }
-    fn handoff_with(
+    fn opportunistic_sweep(&self, include_queue: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.retained.retain_mut(|item| !try_resolve_entry(item, false));
+        if include_queue {
+            state.queue.retain_mut(|item| !try_resolve_entry(item, false));
+        }
+    }
+    fn handoff_guarded(
         self: &Arc<Self>,
-        mut entry: UnresolvedEntry,
+        mut guard: InFlightEntryGuard,
         runtime: Option<tokio::runtime::Handle>,
         policy: OwnerPolicy,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        if try_resolve_entry(&mut entry, policy.signal_on_handoff) {
+        if try_resolve_entry(guard.entry.as_mut().expect("guarded entry present"), policy.signal_on_handoff) {
+            let _ = guard.entry.take();
             return None;
         }
+        self.opportunistic_sweep(runtime.is_some());
+        let entry = guard.entry.take().expect("guarded entry present");
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.retained.retain_mut(|item| !try_resolve_entry(item, false));
         let Some(handle) = runtime else {
             state.retained.push(entry);
             let need_standby = policy.allow_thread_owner && !state.standby_started;
             drop(state);
             self.wake.notify_all();
             if need_standby {
-                self.ensure_standby_sweeper();
+                let _ = self.ensure_standby_sweeper();
                 self.wake.notify_all();
             }
             return None;
         };
-        state.queue.retain_mut(|item| !try_resolve_entry(item, false));
         if state.queue.len() < policy.queue_cap {
             state.queue.push_back(entry);
         } else {
@@ -223,6 +245,16 @@ impl UnresolvedRegistry {
             return Some(handle.spawn(run_unresolved_owner_task(Arc::clone(self), task_guard, policy)));
         }
         None
+    }
+    #[cfg(test)]
+    fn handoff_with(
+        self: &Arc<Self>,
+        entry: UnresolvedEntry,
+        runtime: Option<tokio::runtime::Handle>,
+        policy: OwnerPolicy,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let guard = InFlightEntryGuard { registry: Arc::clone(self), entry: Some(entry) };
+        self.handoff_guarded(guard, runtime, policy)
     }
 }
 async fn run_unresolved_owner_task(registry: Arc<UnresolvedRegistry>, mut guard: FlagGuard, policy: OwnerPolicy) {
@@ -267,20 +299,18 @@ fn run_standby_sweeper(registry: Arc<UnresolvedRegistry>, _guard: FlagGuard) {
                 return;
             }
         }
-        registry.sweep_retained_once(true);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| registry.sweep_retained_once(true)));
         if !registry.state.lock().unwrap_or_else(|e| e.into_inner()).retained.is_empty() {
             std::thread::sleep(RETAINED_SWEEP_INTERVAL);
         }
     }
 }
-
 pub(crate) fn spawn_reaper_with<F>(child: Child, pid: i32, holds: Vec<ScratchHold>, spawn_fn: F)
 where
     F: FnOnce(ReaperTask) -> std::io::Result<()>,
 {
     spawn_reaper_with_probe(child, pid, holds, spawn_fn, default_probe());
 }
-
 pub(crate) fn spawn_reaper_with_probe<F>(
     child: Child,
     pid: i32,
@@ -290,7 +320,7 @@ pub(crate) fn spawn_reaper_with_probe<F>(
 ) where
     F: FnOnce(ReaperTask) -> std::io::Result<()>,
 {
-    warm_standby_reaper();
+    let _ = warm_standby_reaper();
     let mut fallback = SpawnFallback { state: Some((child, pid, holds, probe)) };
     let _ = spawn_fn(Box::new(move || {
         if let Some((child, pid, holds, probe)) = fallback.state.take() {
@@ -304,29 +334,46 @@ struct SpawnFallback {
 }
 impl Drop for SpawnFallback {
     fn drop(&mut self) {
-        let Some((mut child, pid, holds, probe)) = self.state.take() else {
+        let Some((child, pid, holds, probe)) = self.state.take() else {
             return;
         };
-        signal_group(&mut child, pid);
-        let mut entry = UnresolvedEntry::new(child, pid, holds, probe);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            drop(spawn_fallback_on_handle(
-                Arc::clone(global_registry()),
-                entry,
-                &handle,
-                default_wait_child,
-                PROD_OWNER_POLICY,
-            ));
-            return;
-        }
-        if try_resolve_entry(&mut entry, false) {
-            return;
-        }
-        eprintln!("rootyard: Git reaper fallback timed out or group probe failed; handing off unresolved child");
-        let _ = global_registry().handoff_with(entry, None, PROD_OWNER_POLICY);
+        let entry = UnresolvedEntry::new(child, pid, holds, probe);
+        drop_fallback_with_diag(Arc::clone(global_registry()), entry, PROD_OWNER_POLICY, write_reaper_diagnostic);
     }
 }
-
+fn drop_fallback_with_diag<D>(
+    registry: Arc<UnresolvedRegistry>,
+    entry: UnresolvedEntry,
+    policy: OwnerPolicy,
+    diag: D,
+) where
+    D: FnOnce(&str),
+{
+    let mut guard = InFlightEntryGuard { registry: Arc::clone(&registry), entry: Some(entry) };
+    if policy.signal_on_handoff {
+        let current = guard.entry.as_mut().expect("guarded entry present");
+        signal_group(&mut current.child, current.pid);
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        drop(spawn_fallback_guarded_on_handle(guard, &handle, default_wait_child, policy));
+        return;
+    }
+    if try_resolve_entry(guard.entry.as_mut().expect("guarded entry present"), false) {
+        let _ = guard.entry.take();
+        return;
+    }
+    drop(registry.handoff_guarded(guard, None, policy));
+    diag(FALLBACK_DIAGNOSTIC);
+}
+fn spawn_fallback_guarded_on_handle(
+    guard: InFlightEntryGuard,
+    handle: &tokio::runtime::Handle,
+    wait_child: WaitChildFn,
+    policy: OwnerPolicy,
+) -> tokio::task::JoinHandle<()> {
+    handle.spawn(reap_fallback_guarded(guard, wait_child, policy))
+}
+#[cfg(test)]
 fn spawn_fallback_on_handle(
     registry: Arc<UnresolvedRegistry>,
     entry: UnresolvedEntry,
@@ -335,10 +382,20 @@ fn spawn_fallback_on_handle(
     policy: OwnerPolicy,
 ) -> tokio::task::JoinHandle<()> {
     let guard = InFlightEntryGuard { registry, entry: Some(entry) };
-    handle.spawn(reap_fallback_guarded(guard, wait_child, policy))
+    spawn_fallback_guarded_on_handle(guard, handle, wait_child, policy)
+}
+async fn reap_fallback_guarded(guard: InFlightEntryGuard, wait_child: WaitChildFn, policy: OwnerPolicy) {
+    reap_fallback_guarded_with_diag(guard, wait_child, policy, write_reaper_diagnostic).await;
 }
 
-async fn reap_fallback_guarded(mut guard: InFlightEntryGuard, wait_child: WaitChildFn, policy: OwnerPolicy) {
+async fn reap_fallback_guarded_with_diag<D>(
+    mut guard: InFlightEntryGuard,
+    wait_child: WaitChildFn,
+    policy: OwnerPolicy,
+    diag: D,
+) where
+    D: FnOnce(&str) + Send,
+{
     let confirmed = {
         let current = guard.entry.as_mut().expect("guarded entry present");
         if policy.signal_on_handoff {
@@ -364,15 +421,20 @@ async fn reap_fallback_guarded(mut guard: InFlightEntryGuard, wait_child: WaitCh
     } else {
         false
     };
-    let mut entry = guard.entry.take().expect("guarded entry present");
-    entry.group_confirmed |= confirmed;
-    entry.reaped |= reaped;
-    if entry.group_confirmed && entry.reaped {
-        entry.holds.clear();
-        return;
+    {
+        let current = guard.entry.as_mut().expect("guarded entry present");
+        current.group_confirmed |= confirmed;
+        current.reaped |= reaped;
+        if current.group_confirmed && current.reaped {
+            current.holds.clear();
+            let _ = guard.entry.take();
+            return;
+        }
     }
-    eprintln!("rootyard: Git reaper fallback timed out or group probe failed; handing off unresolved child");
-    let _ = guard.registry.handoff_with(entry, tokio::runtime::Handle::try_current().ok(), policy);
+    let runtime = tokio::runtime::Handle::try_current().ok();
+    let registry = Arc::clone(&guard.registry);
+    drop(registry.handoff_guarded(guard, runtime, policy));
+    diag(FALLBACK_DIAGNOSTIC);
 }
 
 #[cfg(test)]
@@ -395,7 +457,7 @@ fn reap_until_confirmed(mut child: Child, pid: i32, holds: Vec<ScratchHold>, pro
         while !matches!(probe(pid), Ok(true)) {
             signal_group(&mut child, pid);
             if !reported && started.elapsed() > Duration::from_secs(5) {
-                eprintln!("rootyard: cancelled Git process group cleanup blocked; retaining scratch hold");
+                write_reaper_diagnostic(BLOCKED_DIAGNOSTIC);
                 reported = true;
             }
             std::thread::sleep(Duration::from_millis(5));

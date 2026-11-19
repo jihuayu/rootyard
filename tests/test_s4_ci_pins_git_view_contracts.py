@@ -268,6 +268,7 @@ class SourceContracts(unittest.TestCase):
         self.assertNotIn('"closure_grant"', text(CI_PINS / "s4_checkout.rs"))
         for body in (runner, proc):
             self.assertNotIn("Ok(true) | Err(_)", body, "cleanup must not treat a wait error as confirmed")
+            self.assertIn("warm().map_err(Error::internal)?", body)
             self.assertIn("TIMEOUT_CLEANUP_BOUND", body)
             self.assertIn("spawn_reaper_thread", body)
             self.assertIn("spawn_reaper_with", body)
@@ -278,6 +279,10 @@ class SourceContracts(unittest.TestCase):
         self.assertNotIn(".wait()).await.is_ok()", reaper)
         self.assertIn("InFlightEntryGuard", reaper)
         self.assertIn("ensure_standby_sweeper", reaper)
+        self.assertIn("ensure_standby_sweeper_with", reaper)
+        self.assertIn("handoff_guarded", reaper)
+        self.assertNotIn("eprintln!", reaper)
+        self.assertIn("write_reaper_diagnostic", reaper)
         self.assertIn("spawn_fallback_on_handle", reaper)
         self.assertIn("reap_fallback_guarded", reaper)
         self.assertIn("state.retained", reaper)
