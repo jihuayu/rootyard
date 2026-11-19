@@ -34,6 +34,9 @@ class SourceBindingTest(unittest.TestCase):
         self.assertIn('"rootyard:a4:test:" + self.schema', script)
         self.assertIn("require_postgres_17", script)
         self.assertIn("SHOW server_version_num", script)
+        self.assertIn("PR_SET_CHILD_SUBREAPER", script)
+        self.assertIn("os.waitpid(-1, os.WNOHANG)", script)
+        self.assertIn("containment_factory=LinuxChildSubreaper.install", script)
 
 
 class HealthyTimingTest(unittest.TestCase):
@@ -154,6 +157,13 @@ class ReportTest(unittest.TestCase):
             detail={"healthy_wake_before_poll": True, "owned_cleanup_completed": True},
         )])
         self.assertEqual(harness.method_calls, [call.setup_partition(), call.run_case(), call.cleanup()])
+        self.factory.assert_called_once_with(
+            self.args,
+            self.prepared.profile,
+            self.prepared.blob_profile,
+            self.prepared.redis_binary,
+            containment=None,
+        )
         self.assertEqual(self.build.call_args_list, [call(self.args.binary, self.args.expect_commit)])
         self.assertEqual(self.hash.call_args_list, [call(Path(a4.__file__))])
 
@@ -167,7 +177,12 @@ class ReportTest(unittest.TestCase):
                 harness.cleanup.side_effect = RuntimeError("cleanup-specific") if stage == "cleanup" else None
                 report = a4.acceptance_report(self.args)
                 self.assertFalse(report["passed"])
-                self.assertEqual(report["cases"], [dict(name=a4.CASE, status="failed", error=stage)])
+                if stage == "cleanup":
+                    self.assertEqual(report["cases"], [dict(
+                        name=a4.CASE, status="failed", error="cleanup", cleanup_failed=True,
+                    )])
+                else:
+                    self.assertEqual(report["cases"], [dict(name=a4.CASE, status="failed", error=stage)])
                 harness.cleanup.assert_called_once()
 
     def test_primary_failure_precedes_cleanup_failure_but_records_it(self):
@@ -180,6 +195,7 @@ class ReportTest(unittest.TestCase):
             name=a4.CASE,
             status="failed",
             error="case",
+            cleanup_failed=True,
             cleanup_error="cleanup",
         )])
         harness.cleanup.assert_called_once()
@@ -187,6 +203,15 @@ class ReportTest(unittest.TestCase):
     def test_preflight_failure_allocates_no_fixture(self):
         self.prepare.side_effect = a4.ProfileError("synthetic preflight")
         report = a4.acceptance_report(self.args)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["cases"], [dict(name=a4.CASE, status="failed", error="preflight")])
+        self.factory.assert_not_called()
+
+    def test_containment_setup_failure_allocates_no_fixture(self):
+        report = a4.acceptance_report(
+            self.args,
+            containment_factory=Mock(side_effect=a4.ContainmentError("containment unavailable")),
+        )
         self.assertFalse(report["passed"])
         self.assertEqual(report["cases"], [dict(name=a4.CASE, status="failed", error="preflight")])
         self.factory.assert_not_called()
@@ -234,6 +259,47 @@ class PreflightTest(unittest.TestCase):
         build.assert_not_called()
 
 
+class ContainmentTest(unittest.TestCase):
+    def make(self, timeout=0.5):
+        containment = object.__new__(a4.LinuxChildSubreaper)
+        containment.timeout = timeout
+        containment.verify = Mock()
+        return containment
+
+    def test_reaped_adopted_exit_then_echild_proves_quiescence(self):
+        containment = self.make()
+        with patch.object(a4.os, "waitpid", side_effect=[(123, 0), ChildProcessError()]) as wait:
+            containment.prove_no_descendants()
+        containment.verify.assert_called_once()
+        self.assertEqual(wait.call_args_list, [call(-1, a4.os.WNOHANG), call(-1, a4.os.WNOHANG)])
+
+    def test_reaped_leader_with_live_descendant_times_out(self):
+        containment = self.make(timeout=0.5)
+        with patch.object(a4.os, "waitpid", return_value=(0, 0)):
+            with patch.object(a4.time, "monotonic", side_effect=[0.0, 0.0, 0.6]):
+                with patch.object(a4.time, "sleep") as sleep:
+                    with self.assertRaisesRegex(a4.ContainmentError, "deadline"):
+                        containment.prove_no_descendants()
+        sleep.assert_called_once()
+
+    def test_wait_error_fails_closed(self):
+        containment = self.make()
+        with patch.object(a4.os, "waitpid", side_effect=OSError("synthetic wait failure")):
+            with self.assertRaisesRegex(a4.ContainmentError, "quiescence proof failed"):
+                containment.prove_no_descendants()
+
+    def test_verify_failure_fails_closed(self):
+        containment = object.__new__(a4.LinuxChildSubreaper)
+        containment._get = Mock(return_value=0)
+        with self.assertRaisesRegex(a4.ContainmentError, "verification failed"):
+            containment.verify()
+
+    def test_install_rejects_non_linux(self):
+        with patch.object(a4.sys, "platform", "darwin"):
+            with self.assertRaisesRegex(a4.ContainmentError, "unavailable"):
+                a4.LinuxChildSubreaper.install()
+
+
 class StopWorkersTest(unittest.TestCase):
     def test_unconfirmed_worker_keeps_exact_owner_and_open_log(self):
         harness = object.__new__(a4.A4RedisWakeHarness)
@@ -257,23 +323,28 @@ class StopWorkersTest(unittest.TestCase):
         self.assertEqual(harness.workers, [(proc, log)])
         log.close.assert_not_called()
 
-    def test_confirmed_exit_removes_owner_and_closes_log(self):
+    def test_confirmed_exit_retains_owner_until_descendant_proof(self):
         harness = object.__new__(a4.A4RedisWakeHarness)
         proc, log = Mock(), Mock()
         proc.poll.return_value = 0
         harness.workers = [(proc, log)]
+        harness.log = None
         with patch.object(a4.CrossProcessHarness, "stop_process", return_value=None):
             harness.stop_workers()
+        self.assertEqual(harness.workers, [(proc, log)])
+        log.close.assert_not_called()
+        harness.close_owner_diagnostics()
         self.assertEqual(harness.workers, [])
         log.close.assert_called_once()
 
-    def test_mixed_failure_retains_only_the_unconfirmed_owner(self):
+    def test_mixed_failure_retains_all_until_diagnostics_close(self):
         harness = object.__new__(a4.A4RedisWakeHarness)
         confirmed, confirmed_log = Mock(), Mock()
         unconfirmed, unconfirmed_log = Mock(), Mock()
         confirmed.poll.return_value = 0
         unconfirmed.poll.return_value = None
         harness.workers = [(confirmed, confirmed_log), (unconfirmed, unconfirmed_log)]
+        harness.log = None
         with patch.object(
             a4.CrossProcessHarness,
             "stop_process",
@@ -281,50 +352,143 @@ class StopWorkersTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "still alive"):
                 harness.stop_workers()
+        self.assertEqual(harness.workers, [(confirmed, confirmed_log), (unconfirmed, unconfirmed_log)])
+        confirmed_log.close.assert_not_called()
+        unconfirmed_log.close.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "did not exit"):
+            harness.close_owner_diagnostics()
         self.assertEqual(harness.workers, [(unconfirmed, unconfirmed_log)])
         confirmed_log.close.assert_called_once()
         unconfirmed_log.close.assert_not_called()
 
+    def test_owner_close_failure_retains_worker_and_service_diagnostics(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        proc, worker_log = Mock(), Mock()
+        proc.poll.return_value = 0
+        worker_log.close.side_effect = RuntimeError("worker log close failed")
+        service_log = Mock()
+        service_log.close.side_effect = RuntimeError("service log close failed")
+        harness.workers = [(proc, worker_log)]
+        harness.log = service_log
+        with self.assertRaisesRegex(RuntimeError, "worker log close failed"):
+            harness.close_owner_diagnostics()
+        self.assertEqual(harness.workers, [(proc, worker_log)])
+        self.assertIs(harness.log, service_log)
+
+    def test_service_stop_preserves_log_until_owner_close(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.proc = Mock()
+        log = Mock()
+        harness.log = log
+        harness.workers = []
+        with patch.object(
+            a4.BlobOnlyHarness,
+            "stop",
+            side_effect=lambda: setattr(harness, "proc", None),
+        ) as inherited_stop:
+            harness.stop_service_retaining_log()
+        inherited_stop.assert_called_once()
+        self.assertIs(harness.log, log)
+        log.close.assert_not_called()
+        harness.close_owner_diagnostics()
+        log.close.assert_called_once()
+        self.assertIsNone(harness.log)
+
+    def test_owner_close_refuses_live_service_and_retains_log(self):
+        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness.proc = Mock()
+        log = Mock()
+        harness.log = log
+        harness.workers = []
+        with self.assertRaisesRegex(RuntimeError, "did not exit"):
+            harness.close_owner_diagnostics()
+        log.close.assert_not_called()
+        self.assertIs(harness.log, log)
+
 
 class CleanupTest(unittest.TestCase):
-    def test_cleanup_attempts_all_stops_but_skips_teardown_after_worker_failure(self):
+    def make_harness(self):
         harness = object.__new__(a4.A4RedisWakeHarness)
-        harness.stop_workers = Mock(side_effect=RuntimeError("synthetic worker stop"))
-        harness.stop = Mock()
+        harness.stop_workers = Mock()
+        harness.stop_service_retaining_log = Mock()
         harness.close_relay = Mock()
         harness.stop_redis = Mock()
+        harness.containment = Mock()
+        harness.close_owner_diagnostics = Mock()
+        harness.workers = []
+        harness.log = None
+        return harness
+
+    def test_cleanup_attempts_all_stops_but_skips_teardown_after_worker_failure(self):
+        harness = self.make_harness()
+        harness.stop_workers.side_effect = RuntimeError("synthetic worker stop")
         with patch.object(a4.BlobOnlyHarness, "cleanup") as parent_cleanup:
             with self.assertRaisesRegex(RuntimeError, "synthetic worker stop"):
                 harness.cleanup()
-        harness.stop.assert_called_once()
+        harness.stop_service_retaining_log.assert_called_once()
         harness.close_relay.assert_called_once()
         harness.stop_redis.assert_called_once()
+        harness.containment.prove_no_descendants.assert_not_called()
+        harness.close_owner_diagnostics.assert_not_called()
         parent_cleanup.assert_not_called()
 
     def test_cleanup_skips_teardown_after_server_failure_but_stops_other_members(self):
-        harness = object.__new__(a4.A4RedisWakeHarness)
-        harness.stop_workers = Mock()
-        harness.stop = Mock(side_effect=RuntimeError("service still alive"))
-        harness.close_relay = Mock()
-        harness.stop_redis = Mock()
+        harness = self.make_harness()
+        harness.stop_service_retaining_log.side_effect = RuntimeError("service still alive")
         with patch.object(a4.BlobOnlyHarness, "cleanup") as parent_cleanup:
             with self.assertRaisesRegex(RuntimeError, "service still alive"):
                 harness.cleanup()
         harness.stop_workers.assert_called_once()
         harness.close_relay.assert_called_once()
         harness.stop_redis.assert_called_once()
+        harness.containment.prove_no_descendants.assert_not_called()
+        harness.close_owner_diagnostics.assert_not_called()
         parent_cleanup.assert_not_called()
 
-    def test_cleanup_orders_worker_service_relay_redis_then_schema(self):
+    def test_cleanup_skips_teardown_when_containment_proof_fails(self):
+        harness = self.make_harness()
+        harness.containment.prove_no_descendants.side_effect = a4.ContainmentError("synthetic proof failure")
+        with patch.object(a4.BlobOnlyHarness, "cleanup") as parent_cleanup:
+            with self.assertRaisesRegex(a4.ContainmentError, "synthetic proof failure"):
+                harness.cleanup()
+        harness.containment.prove_no_descendants.assert_called_once()
+        harness.close_owner_diagnostics.assert_not_called()
+        parent_cleanup.assert_not_called()
+
+    def test_cleanup_requires_containment_before_schema_teardown(self):
+        harness = self.make_harness()
+        harness.containment = None
+        with patch.object(a4.BlobOnlyHarness, "cleanup") as parent_cleanup:
+            with self.assertRaisesRegex(a4.ContainmentError, "not installed"):
+                harness.cleanup()
+        harness.close_owner_diagnostics.assert_not_called()
+        parent_cleanup.assert_not_called()
+
+    def test_cleanup_skips_teardown_when_owner_diagnostics_close_fails(self):
+        harness = self.make_harness()
+        harness.close_owner_diagnostics.side_effect = RuntimeError("diagnostics close failed")
+        with patch.object(a4.BlobOnlyHarness, "cleanup") as parent_cleanup:
+            with self.assertRaisesRegex(RuntimeError, "diagnostics close failed"):
+                harness.cleanup()
+        harness.containment.prove_no_descendants.assert_called_once()
+        parent_cleanup.assert_not_called()
+
+    def test_cleanup_orders_worker_service_relay_redis_containment_owner_close_then_schema(self):
         events = []
-        harness = object.__new__(a4.A4RedisWakeHarness)
+        harness = self.make_harness()
         harness.stop_workers = Mock(side_effect=lambda: events.append("workers"))
-        harness.stop = Mock(side_effect=lambda: events.append("service"))
+        harness.stop_service_retaining_log = Mock(side_effect=lambda: events.append("service"))
         harness.close_relay = Mock(side_effect=lambda: events.append("relay"))
         harness.stop_redis = Mock(side_effect=lambda: events.append("redis"))
+        harness.containment = Mock()
+        harness.containment.prove_no_descendants = Mock(side_effect=lambda: events.append("containment"))
+        harness.close_owner_diagnostics = Mock(side_effect=lambda: events.append("diagnostics"))
         with patch.object(a4.BlobOnlyHarness, "cleanup", side_effect=lambda: events.append("schema")):
             harness.cleanup()
-        self.assertEqual(events, ["workers", "service", "relay", "redis", "schema"])
+        self.assertEqual(
+            events,
+            ["workers", "service", "relay", "redis", "containment", "diagnostics", "schema"],
+        )
 
 
 if __name__ == "__main__":

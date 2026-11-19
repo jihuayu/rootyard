@@ -356,8 +356,11 @@ point is `tests/a4_redis_wake_partition.py` with pure tests in
 `tests/test_a4_redis_wake_partition.py`. Its preflight reads the owned loopback
 fixture's `server_version_num` through the trusted existing `psql` and rejects
 any major other than 17 before effects; the report carries closed
-`postgres_major`/`postgres_server_version_num` evidence. No native PASSED report
-is claimed in this worktree. This increment keeps #111 open for that run and never makes
+`postgres_major`/`postgres_server_version_num` evidence. Its standalone `main`
+also uses a test-only Linux child-subreaper plus bounded `waitpid` drain to prove
+no adopted service/worker descendant remains before schema/scratch cleanup; this
+is fixture containment, not a production mechanism. No native PASSED report is
+claimed in this worktree. This increment keeps #111 open for that run and never makes
 Redis a hard quota or authority. The default build still needs no Redis.
 
 The full ignored real-Redis suite includes destructive FLUSHALL and CONFIG SET

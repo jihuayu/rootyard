@@ -35,7 +35,7 @@ embedded wake path with the explicit A4 topology:
 
 | File | Responsibility |
 | --- | --- |
-| `tests/a4_redis_wake_partition.py` | Implemented opt-in acceptance script. Reuses `BlobOnlyHarness`/`NativeProfile`/`check_blob_profile` from `tests/blob_only_service.py`, `OwnedRestoreRedis` from `tests/backup_recovery_cache.py`, `RedisPartitionRelay` from `tests/redis_partition_relay.py`, and `build_binding` for the source/binary receipt. |
+| `tests/a4_redis_wake_partition.py` | Implemented opt-in acceptance script. Reuses `BlobOnlyHarness`/`NativeProfile`/`check_blob_profile` from `tests/blob_only_service.py`, `OwnedRestoreRedis` from `tests/backup_recovery_cache.py`, `RedisPartitionRelay` from `tests/redis_partition_relay.py`, and `build_binding` for the source/binary receipt. Its standalone `main` also installs a private Linux child-subreaper containment proof before any fixture/service spawn; imported/shared use never changes process state. |
 | `tests/test_a4_redis_wake_partition.py` | Implemented pure tests for source constants, wake-timing rejection, report shape/stages, preflight refusal and cleanup ordering. They need no PG/Redis/S3. |
 | `tests/blob_only_service.py` | Reused fixture only. Its case list and default gate are unchanged; the new script imports its `BlobOnlyHarness`, `NativeProfile`, `check_blob_profile`, `parse_push`, `push_success` and `write_report` helpers. |
 | `tests/cross_process_partition.py` | Reused timing/partition pattern: fixed-poll deadline assertions, relay cut/refuse/heal and scan-accounting discipline. Its generic cases are unchanged. |
@@ -89,7 +89,9 @@ it at a shared production bucket.
 One repository and one external A4 worker, with the worker poll interval longer
 than the observation window:
 
-1. Start the owned Redis and the relay, then start `serve-blob` with
+1. In the standalone fixture process only, set and verify
+   `PR_SET_CHILD_SUBREAPER` before any preflight command or service spawn. Start
+   the owned Redis and the relay, then start `serve-blob` with
    `ROOTYARD_A4_WORKER_MODE=external`, the A4 producer variables and the unique
    channel. Create the repository through the real `POST /api/repos` route,
    clone with stock Git, commit and push over real Smart HTTP before any worker
@@ -197,6 +199,22 @@ fixed hint counter, subscriber count and relay forwarding.
   independently owned relay/Redis members are still stopped best-effort where
   safe. Cleanup failure is recorded without overwriting an earlier primary case
   failure.
+- After all owned Popen leaders have been individually reaped and their normal
+  stops succeeded, the fixture process performs a bounded
+  `waitpid(-1, WNOHANG)` drain until `ChildProcessError`/ECHILD. A live adopted
+  descendant keeps returning 0 and fails the deadline. The standalone `main`
+  sets and verifies `PR_SET_CHILD_SUBREAPER` before any prep/service spawn, so
+  orphaned native Git descendants from the service's separate process group are
+  reparented to this fixture and become observable. A live nested subreaper is
+  itself a live descendant and keeps a live direct-child ancestor chain, so
+  ECHILD cannot be reached while it or its subtree remains. PID-namespace or
+  privileged escapes are outside this trusted single-host fixture's proof.
+  Containment setup, verification, wait errors, or deadline expiry fail closed
+  and retain the schema/scratch and owner diagnostics. Worker owner tuples/log
+  handles and the serve-blob log handle are kept open through this proof and are
+  closed only after it succeeds, immediately before inherited schema/scratch
+  teardown. No global process killing or `/proc` process listing is used, and no
+  PID/path/command line is emitted.
 
 ## Report contract
 
@@ -209,17 +227,20 @@ fixed hint counter, subscriber count and relay forwarding.
 SHA-256, plus the fixed limitations list. It never
 contains a DSN, token, Redis URL, S3 credential or exception body. Failure stages
 are fixed labels (`preflight`, `fixture`, `case`, `receipt_changed`, `cleanup`)
-and `owned_cleanup_completed` appears only after a successful owned cleanup. If
-an earlier primary stage and cleanup both fail, the case keeps the primary error
-and adds `cleanup_error: "cleanup"`; a later cleanup failure can never make the
-report pass. If cleanup fails after an otherwise successful case, the case is
-failed with `error: "cleanup"`.
+and `owned_cleanup_completed` appears only after a successful owned cleanup. Any
+cleanup failure adds `cleanup_failed: true`. If an earlier primary stage and
+cleanup both fail, the case keeps the primary error and also adds
+`cleanup_error: "cleanup"`; a later cleanup failure can never make the report
+pass. If cleanup fails after an otherwise successful case, the case is failed
+with `error: "cleanup"` and `cleanup_failed: true`.
 
 ## Explicit non-goals
 
 This design does not add Redis HA/Sentinel/Cluster, remote TLS proxying, Kafka,
 multi-host PostgreSQL failover, storage fencing, broad Git routing or default
-`serve` changes. It does not alter the exact cache product, A4 commit/replay
+`serve` changes. The child-subreaper containment is test-only and is not a
+production kill or containment mechanism; it relies on the trusted fixture not
+using PID-namespace/privileged escapes. It does not alter the exact cache product, A4 commit/replay
 semantics or the existing `tests/cross_process_partition.py` /
 `tests/cross_process_failover.py` gates. It is an opt-in acceptance script and
 its pure helper tests only.

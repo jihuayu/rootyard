@@ -28,6 +28,7 @@ PostgreSQL/Garage/Redis fixture with an exact attested binary and matching sourc
 commit.
 """
 import argparse
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -72,6 +73,7 @@ LIMITATIONS = [
     "A cut relay proves advisory Redis loss and PostgreSQL polling repair; it is not kernel, power-loss, Redis HA or multi-host failover evidence.",
     "The fixture uses the real stock Git CLI over Smart HTTP; SSH and non-loopback HTTP are outside this case.",
     "The owned Redis process and relay are single-host test fixtures; production TLS/ACL deployment is not exercised here.",
+    "Descendant quiescence is proved only inside the standalone Linux fixture with PR_SET_CHILD_SUBREAPER and a bounded waitpid drain; it is not a production containment mechanism.",
 ]
 
 
@@ -80,10 +82,88 @@ def need(condition, message):
         raise ProfileError(message)
 
 
+class ContainmentError(RuntimeError):
+    pass
+
+
+class LinuxChildSubreaper:
+    """Test-only descendant containment for the standalone A4 fixture.
+
+    Setting PR_SET_CHILD_SUBREAPER before any service spawn makes orphaned
+    descendants in the fixture subtree reparent here. After every owned Popen
+    leader has been individually reaped through its normal method, a bounded
+    waitpid(-1, WNOHANG) drain is repeated until ECHILD. A live adopted child
+    keeps returning 0 and fails the deadline; a live nested subreaper is itself
+    a live descendant and therefore prevents ECHILD through its ancestor chain.
+    PID-namespace/privileged escapes are out of scope for this trusted fixture.
+    This is never invoked at import time or in shared runner code.
+    """
+
+    PR_SET_CHILD_SUBREAPER = 36
+    PR_GET_CHILD_SUBREAPER = 37
+
+    def __init__(self, timeout=5.0):
+        self.timeout = timeout
+        try:
+            self._libc = ctypes.CDLL(None, use_errno=True)
+            self._libc.prctl.argtypes = [
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ]
+            self._libc.prctl.restype = ctypes.c_int
+        except (OSError, AttributeError):
+            raise ContainmentError("Linux child containment is unavailable") from None
+
+    @classmethod
+    def install(cls, timeout=5.0):
+        if not sys.platform.startswith("linux"):
+            raise ContainmentError("Linux child containment is unavailable")
+        containment = cls(timeout)
+        containment._set(1)
+        if containment._get() != 1:
+            raise ContainmentError("Linux child subreaper verification failed")
+        return containment
+
+    def _set(self, value):
+        if self._libc.prctl(self.PR_SET_CHILD_SUBREAPER, ctypes.c_void_p(value), None, None, None) != 0:
+            raise ContainmentError("Linux child subreaper setup failed")
+
+    def _get(self):
+        value = ctypes.c_int(0)
+        if self._libc.prctl(
+            self.PR_GET_CHILD_SUBREAPER,
+            ctypes.cast(ctypes.byref(value), ctypes.c_void_p),
+            None,
+            None,
+            None,
+        ) != 0:
+            raise ContainmentError("Linux child subreaper verification failed")
+        return value.value
+
+    def verify(self):
+        if self._get() != 1:
+            raise ContainmentError("Linux child subreaper verification failed")
+
+    def prove_no_descendants(self):
+        self.verify()
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError:
+                raise ContainmentError("child process quiescence proof failed") from None
+            if pid == 0:
+                if time.monotonic() >= deadline:
+                    raise ContainmentError("child process quiescence deadline exceeded")
+                time.sleep(0.05)
+
+
 class A4RedisWakeHarness(BlobOnlyHarness):
-    def __init__(self, args, profile, blob_profile, redis_binary):
+    def __init__(self, args, profile, blob_profile, redis_binary, containment=None):
         super().__init__(args, profile, blob_profile)
         self.redis_binary = redis_binary
+        self.containment = containment
         self.owned_redis = OwnedRestoreRedis(redis_binary)
         self.relay = None
         self.workers = []
@@ -94,16 +174,36 @@ class A4RedisWakeHarness(BlobOnlyHarness):
     # ---- owned processes -------------------------------------------------
     def stop_workers(self):
         first = None
-        for proc, log in list(self.workers):
+        for proc, _log in list(self.workers):
             try:
                 CrossProcessHarness.stop_process(proc)
                 if proc.poll() is None:
                     raise RuntimeError("owned A4 worker did not exit after SIGKILL")
             except (Exception, KeyboardInterrupt) as error:
-                # Keep the exact owner tuple and open log for diagnosis. Parent
-                # cleanup will not touch the schema/scratch until every worker
-                # reports a positive exit.
+                # Keep the exact owner tuple and open log for diagnosis. The
+                # schema/scratch and owner diagnostics remain untouched until
+                # the descendant quiescence proof succeeds.
                 first = first or error
+        if first is not None:
+            raise first
+
+    def stop_service_retaining_log(self):
+        # Use the inherited stop/wait semantics for the serve-blob leader, but
+        # keep its diagnostic handle open until descendant quiescence is proved.
+        log = self.log
+        self.log = None
+        try:
+            super().stop()
+        finally:
+            self.log = log
+
+    def close_owner_diagnostics(self):
+        if getattr(self, "proc", None) is not None:
+            raise RuntimeError("serve-blob did not exit before diagnostics close")
+        first = None
+        for proc, log in list(self.workers):
+            if proc.poll() is None:
+                first = first or RuntimeError("owned A4 worker did not exit after SIGKILL")
                 continue
             try:
                 log.close()
@@ -111,6 +211,13 @@ class A4RedisWakeHarness(BlobOnlyHarness):
                 first = first or error
                 continue
             self.workers.remove((proc, log))
+        if self.log is not None:
+            try:
+                self.log.close()
+            except (Exception, KeyboardInterrupt) as error:
+                first = first or error
+            else:
+                self.log = None
         if first is not None:
             raise first
 
@@ -172,12 +279,30 @@ class A4RedisWakeHarness(BlobOnlyHarness):
         first = None
         # Always attempt the independently owned process/socket stops. The
         # inherited schema/scratch teardown runs only after every worker and the
-        # serve-blob process have positively exited and all stops succeeded.
-        for action in (self.stop_workers, self.stop, self.close_relay, self.stop_redis):
+        # serve-blob process have positively exited, the descendant proof has
+        # succeeded, and owner diagnostics have been closed.
+        for action in (
+            self.stop_workers,
+            self.stop_service_retaining_log,
+            self.close_relay,
+            self.stop_redis,
+        ):
             try:
                 action()
             except (Exception, KeyboardInterrupt) as error:
                 first = first or error
+        if first is None:
+            try:
+                if self.containment is None:
+                    raise ContainmentError("child containment was not installed")
+                self.containment.prove_no_descendants()
+            except (Exception, KeyboardInterrupt) as error:
+                first = error
+        if first is None:
+            try:
+                self.close_owner_diagnostics()
+            except (Exception, KeyboardInterrupt) as error:
+                first = error
         if first is None:
             try:
                 super().cleanup()
@@ -712,7 +837,7 @@ def result_report(binding, case, passed, harness_sha256=None, postgres_major=Non
     return report
 
 
-def acceptance_report(args, *, harness_type=None, preflight_fn=None):
+def acceptance_report(args, *, harness_type=None, preflight_fn=None, containment=None, containment_factory=None):
     prepare = preflight_fn or preflight
     binding = {}
     harness = None
@@ -723,6 +848,8 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None):
     cleanup_error = None
     detail = None
     try:
+        if containment is None and containment_factory is not None:
+            containment = containment_factory()
         prepared = prepare(args)
         binding = prepared.binding
         harness_sha256 = prepared.harness_sha256
@@ -730,7 +857,8 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None):
         postgres_major_value = require_postgres_17(postgres_server_version_num_value)
         primary = "fixture"
         harness = (harness_type or A4RedisWakeHarness)(
-            args, prepared.profile, prepared.blob_profile, prepared.redis_binary
+            args, prepared.profile, prepared.blob_profile, prepared.redis_binary,
+            containment=containment,
         )
         harness.setup_partition()
         primary = "case"
@@ -752,6 +880,8 @@ def acceptance_report(args, *, harness_type=None, preflight_fn=None):
         case = dict(name=CASE, status="passed", detail=dict(detail, owned_cleanup_completed=True))
     else:
         case = dict(name=CASE, status="failed", error=primary or cleanup_error)
+        if cleanup_error is not None:
+            case["cleanup_failed"] = True
         if primary is not None and cleanup_error is not None:
             case["cleanup_error"] = cleanup_error
     return result_report(
@@ -779,7 +909,7 @@ def main(argv=None):
 
     previous = signal.signal(signal.SIGTERM, interrupted)
     try:
-        report = acceptance_report(args)
+        report = acceptance_report(args, containment_factory=LinuxChildSubreaper.install)
         try:
             write_report(args.report, report)
         except OSError:
