@@ -236,6 +236,30 @@ class InstallerPhaseProjectionTest(unittest.TestCase):
         self.assertNotIn("repo_create", passed)
 
 
+    def test_workflow_prepares_public_cluster_authority_before_harness(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        prepare = "Prepare the public serving schema"
+        harness = "Run real external A4 acceptance"
+        self.assertIn(prepare, text)
+        self.assertIn(harness, text)
+        self.assertLess(text.index(prepare), text.index(harness))
+        block = text[text.index(prepare):text.index(harness)]
+        self.assertIn(
+            'env DATABASE_URL="$ROOTYARD_TEST_DATABASE_URL" "$binary" migrate',
+            block,
+        )
+        self.assertIn("public.cluster_authority", block)
+        self.assertIn("psql \"$ROOTYARD_TEST_DATABASE_URL\"", block)
+        self.assertIn('if [ "$authority" != "t" ]', block)
+        self.assertIn(
+            "ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_a4_wake",
+            text,
+        )
+        self.assertIn("image: postgres:17", text)
+        upload = text[text.index("Upload closed report and typed evidence"):]
+        self.assertNotIn("public-migrate.log", upload)
+
+
 
 if __name__ == "__main__":
     unittest.main()

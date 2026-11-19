@@ -157,6 +157,41 @@ jobs:
           test -x "$RUNNER_TEMP/a4-native/rootyard"
           test -f "$RUNNER_TEMP/a4-native/rootyard.build.json"
 
+      - name: Prepare the public serving schema
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/a4-native/rootyard"
+          log="$RUNNER_TEMP/a4/public-migrate.log"
+          test -x "$binary"
+          # The harness migrates only its random search_path schema. The
+          # standalone GET authorization reads public.cluster_authority, so the
+          # job-owned database needs the production public migration first, as
+          # in the reviewed standalone Blob gate. Keep diagnostics private.
+          set +e
+          env DATABASE_URL="$ROOTYARD_TEST_DATABASE_URL" "$binary" migrate >"$log" 2>&1
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "A4 public serving schema migration failed" >&2
+            exit "$status"
+          fi
+          set +e
+          authority="$(psql "$ROOTYARD_TEST_DATABASE_URL" -X -t -A -v ON_ERROR_STOP=1 \
+            -c "SELECT to_regclass('public.cluster_authority') IS NOT NULL" 2>>"$log")"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "A4 public serving schema check failed" >&2
+            exit "$status"
+          fi
+          if [ "$authority" != "t" ]; then
+            echo "A4 public serving schema is incomplete" >&2
+            exit 1
+          fi
+          rm -f -- "$log"
+
       - name: Start owned Garage S3 fixture
         id: garage_start
         timeout-minutes: 12
