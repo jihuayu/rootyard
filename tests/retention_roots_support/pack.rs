@@ -121,7 +121,7 @@ fn hold_scope(plan: &PackCommitPlan) -> Result<HoldScope> {
     .map_err(|error| anyhow!("hold scope rejected: {error}"))
 }
 
-pub(super) async fn publish(
+pub(crate) async fn publish(
     db: &Db,
     store: &BlobStore,
     plan: &PackCommitPlan,
@@ -159,7 +159,7 @@ pub(super) async fn publish(
     Ok(publication)
 }
 
-pub(super) async fn register(
+pub(crate) async fn register(
     db: &Db,
     plan: &PackCommitPlan,
     pack_id: Uuid,
