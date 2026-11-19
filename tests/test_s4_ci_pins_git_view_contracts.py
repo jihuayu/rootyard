@@ -168,6 +168,7 @@ class SourceContracts(unittest.TestCase):
         self.assertIn("16 * 1024", stream)
         self.assertIn("100", stream)
         self.assertIn("live_check", stream)
+        self.assertIn("body_live_check", stream)
         self.assertIn("try_reserve", stream)
         self.assertIn("kill_and_reap", stream)
         self.assertIn("revoked", authority)

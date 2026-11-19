@@ -4,7 +4,8 @@
 //! the stdin writer guard, the scratch hold and the stream slot. Revocation,
 //! the request deadline, body disconnect and process cleanup therefore make
 //! progress even when the body is never polled or its single data slot stays
-//! full.
+//! full. The outgoing body also re-proves authority immediately before every
+//! chunk; a denial closes the data receiver to wake and cancel the producer.
 use super::s4_authority::{DisposableCiView, RECHECK_TIMEOUT, StreamSlot, UploadPackGroup};
 use crate::{AppState, Error};
 use axum::{body::Body, http::StatusCode};
@@ -24,7 +25,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, ChildStdout},
     sync::{
         mpsc::{self, error::TrySendError},
-        oneshot,
+        oneshot::{self, error::TryRecvError},
     },
     time::{Instant, sleep, sleep_until, timeout_at},
 };
@@ -107,15 +108,17 @@ impl PackOwner for RunningUploadPack {
 }
 
 /// Spawn the upload-pack child and return a body owned by its producer task.
-pub(crate) fn upload_pack_body<F>(
+pub(crate) fn upload_pack_body<P, D>(
     state: &AppState,
     holder: DisposableCiView,
     request: Bytes,
     deadline: Instant,
-    check: F,
+    producer_check: P,
+    delivery_check: D,
 ) -> Result<Body, Error>
 where
-    F: FnMut() -> Check + Send + 'static,
+    P: FnMut() -> Check + Send + 'static,
+    D: FnMut() -> Check + Send + 'static,
 {
     let slot = StreamSlot::acquire(state)?;
     let hold = holder.hold();
@@ -129,36 +132,51 @@ where
         })
         .await;
     }));
-    Ok(producer_body(RunningUploadPack { child, stdout, _stdin: stdin_guard, _slot: slot }, deadline, check))
+    Ok(producer_body(
+        RunningUploadPack { child, stdout, _stdin: stdin_guard, _slot: slot },
+        deadline,
+        producer_check,
+        delivery_check,
+    ))
 }
 
 /// Detach the owned producer from the body. The body never owns process state.
-fn producer_body<O, F>(owner: O, deadline: Instant, check: F) -> Body
+fn producer_body<O, P, D>(owner: O, deadline: Instant, producer_check: P, delivery_check: D) -> Body
 where
     O: PackOwner,
-    F: FnMut() -> Check + Send + 'static,
+    P: FnMut() -> Check + Send + 'static,
+    D: FnMut() -> Check + Send + 'static,
 {
     let (data_tx, data_rx) = mpsc::channel::<Bytes>(1);
     let (failure_tx, failure_rx) = oneshot::channel::<io::Error>();
     let aborted = Arc::new(AtomicBool::new(false));
-    tokio::spawn(run_producer(owner, deadline, check, data_tx, failure_tx, aborted.clone()));
-    Body::from_stream(response_stream(data_rx, failure_rx, aborted))
+    tokio::spawn(run_producer(owner, deadline, producer_check, data_tx, failure_tx, aborted.clone()));
+    Body::from_stream(response_stream(data_rx, failure_rx, aborted, deadline, delivery_check))
 }
 
 /// Map one probe to the stream action without ever awaiting an unbounded check.
-async fn live_check<F>(check: &mut F, data: &mpsc::Sender<Bytes>, deadline: Instant) -> CheckOutcome
+async fn live_check<F, C>(check: &mut F, deadline: Instant, cancelled: C) -> CheckOutcome
 where
     F: FnMut() -> Check,
+    C: Future<Output = ()> + Send,
 {
     let probe = check();
     tokio::pin!(probe);
     tokio::select! {
         biased;
-        _ = data.closed() => CheckOutcome::Closed,
+        _ = cancelled => CheckOutcome::Closed,
         _ = sleep_until(deadline) => CheckOutcome::TimedOut,
         _ = sleep(RECHECK_TIMEOUT) => CheckOutcome::Revoked,
         live = &mut probe => if live { CheckOutcome::Live } else { CheckOutcome::Revoked },
     }
+}
+
+/// The hard per-chunk authority boundary at the actual outgoing Body poll.
+async fn body_live_check<F>(check: &mut F, deadline: Instant) -> CheckOutcome
+where
+    F: FnMut() -> Check,
+{
+    live_check(check, deadline, std::future::pending::<()>()).await
 }
 
 async fn run_producer<O, F>(
@@ -181,7 +199,7 @@ async fn run_producer<O, F>(
 
     macro_rules! recheck {
         () => {
-            match live_check(&mut check, &data, deadline).await {
+            match live_check(&mut check, deadline, data.closed()).await {
                 CheckOutcome::Live => {}
                 CheckOutcome::Revoked => {
                     failure = Some(revoked_error());
@@ -243,8 +261,6 @@ async fn run_producer<O, F>(
                 break 'producer;
             }
             Ok(n) => {
-                // Final live proof immediately before the chunk is queued.
-                recheck!();
                 permit.send(Bytes::copy_from_slice(&buffer[..n]));
             }
             Err(error) => {
@@ -263,7 +279,7 @@ async fn run_producer<O, F>(
                     biased;
                     _ = data.closed() => break FinishOutcome::Closed,
                     _ = sleep_until(deadline) => break FinishOutcome::TimedOut,
-                    _ = ticker.tick() => match live_check(&mut check, &data, deadline).await {
+                    _ = ticker.tick() => match live_check(&mut check, deadline, data.closed()).await {
                         CheckOutcome::Live => {}
                         CheckOutcome::Revoked => break FinishOutcome::Revoked,
                         CheckOutcome::TimedOut => break FinishOutcome::TimedOut,
@@ -298,18 +314,23 @@ async fn run_producer<O, F>(
 }
 
 /// Body-side view: one queued chunk maximum and an independent terminal signal.
-fn response_stream(
+fn response_stream<D>(
     mut data: mpsc::Receiver<Bytes>,
     failure: oneshot::Receiver<io::Error>,
     aborted: Arc<AtomicBool>,
-) -> impl Stream<Item = io::Result<Bytes>> + Send + 'static {
+    deadline: Instant,
+    mut delivery_check: D,
+) -> impl Stream<Item = io::Result<Bytes>> + Send + 'static
+where
+    D: FnMut() -> Check + Send + 'static,
+{
     async_stream::stream! {
-        let mut failure = Box::pin(failure);
+        let mut failure = failure;
         let mut failure_open = true;
         loop {
             if aborted.load(Ordering::Acquire) {
                 let error = if failure_open {
-                    match failure.as_mut().await {
+                    match (&mut failure).await {
                         Ok(error) => error,
                         Err(_) => transfer_terminated_error(),
                     }
@@ -321,7 +342,7 @@ fn response_stream(
             }
             tokio::select! {
                 biased;
-                result = failure.as_mut(), if failure_open => {
+                result = &mut failure, if failure_open => {
                     failure_open = false;
                     match result {
                         Ok(error) => {
@@ -336,7 +357,40 @@ fn response_stream(
                         if aborted.load(Ordering::Acquire) {
                             continue;
                         }
-                        yield Ok(bytes);
+                        // The producer's periodic recheck may lag behind an
+                        // enqueue. Re-prove authority at the actual outgoing
+                        // poll before any byte is yielded.
+                        match body_live_check(&mut delivery_check, deadline).await {
+                            CheckOutcome::Live => {
+                                if aborted.load(Ordering::Acquire) {
+                                    continue;
+                                }
+                                if let Some(error) = terminal_error(&mut failure, &mut failure_open) {
+                                    data.close();
+                                    yield Err(error);
+                                    return;
+                                }
+                                if aborted.load(Ordering::Acquire) {
+                                    continue;
+                                }
+                                yield Ok(bytes);
+                            }
+                            CheckOutcome::Revoked => {
+                                data.close();
+                                yield Err(revoked_error());
+                                return;
+                            }
+                            CheckOutcome::TimedOut => {
+                                data.close();
+                                yield Err(timeout_error());
+                                return;
+                            }
+                            CheckOutcome::Closed => {
+                                data.close();
+                                yield Err(transfer_terminated_error());
+                                return;
+                            }
+                        }
                     }
                     None => {
                         if aborted.load(Ordering::Acquire) {
@@ -346,6 +400,21 @@ fn response_stream(
                     }
                 },
             }
+        }
+    }
+}
+
+/// Consume a producer failure that was published while the body was checking.
+fn terminal_error(failure: &mut oneshot::Receiver<io::Error>, open: &mut bool) -> Option<io::Error> {
+    if !*open {
+        return None;
+    }
+    match failure.try_recv() {
+        Ok(error) => Some(error),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Closed) => {
+            *open = false;
+            None
         }
     }
 }

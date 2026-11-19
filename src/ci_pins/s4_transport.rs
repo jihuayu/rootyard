@@ -28,6 +28,23 @@ struct Authorized {
 
 pub(crate) use super::s4_authority::DisposableCiView;
 
+/// Build one independent live-grant probe. Producer and Body each get their own
+/// closure so both may run concurrently without sharing mutable state.
+fn live_grant_check(
+    state: Arc<AppState>,
+    grant: S4ClosureGrant,
+    digest: Vec<u8>,
+) -> impl FnMut() -> Check + Send + 'static {
+    move || -> Check {
+        let (state, grant, digest) = (state.clone(), grant.clone(), digest.clone());
+        Box::pin(async move {
+            still_authorized(&state, grant.job_id, &digest, grant.repository_id, grant.storage_generation)
+                .await
+                .unwrap_or(false)
+        })
+    }
+}
+
 async fn git_dir(
     state: &AppState,
     holder: &DisposableCiView,
@@ -325,18 +342,9 @@ pub(crate) async fn upload_pack(
         deadline,
     )
     .await?;
-    let stream_state = state.clone();
-    let stream_grant = authorized.grant.clone();
-    let stream_digest = authorized.digest.clone();
-    let check = move || -> Check {
-        let (state, grant, digest) = (stream_state.clone(), stream_grant.clone(), stream_digest.clone());
-        Box::pin(async move {
-            still_authorized(&state, grant.job_id, &digest, grant.repository_id, grant.storage_generation)
-                .await
-                .unwrap_or(false)
-        })
-    };
-    let body = upload_pack_body(&state, holder, body, deadline, check)?;
+    let producer_check = live_grant_check(state.clone(), authorized.grant.clone(), authorized.digest.clone());
+    let delivery_check = live_grant_check(state.clone(), authorized.grant.clone(), authorized.digest.clone());
+    let body = upload_pack_body(&state, holder, body, deadline, producer_check, delivery_check)?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-git-upload-pack-result")
