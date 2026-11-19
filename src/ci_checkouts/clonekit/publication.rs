@@ -286,7 +286,11 @@ impl Drop for PublicationGuard {
         // the flock held after this owning descriptor closes. LOCK_UN on the shared description
         // releases it; the following field close remains the fallback if the best-effort unlock fails.
         if let Err(error) = FileExt::unlock(&self.file) {
-            eprintln!("rootyard: clonekit publication lock release failed; closing owner as fallback: {error}");
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "rootyard: clonekit publication lock release failed; closing owner as fallback: {error}"
+            );
         }
     }
 }
