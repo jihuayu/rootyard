@@ -12,7 +12,7 @@ use crate::ci_checkouts::clonekit::builder::read_lease::{
 };
 
 #[test]
-fn flock_allowlist_refuses_process_scoped_targets() {
+fn flock_allowlist_refuses_unlisted_targets() {
     assert!(backend_uses_open_file_description_flock("linux"));
     assert!(backend_uses_open_file_description_flock("macos"));
     assert!(backend_uses_open_file_description_flock("freebsd"));

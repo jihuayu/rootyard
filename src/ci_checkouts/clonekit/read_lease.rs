@@ -27,8 +27,9 @@ const COPY_CAPACITY_HINT: usize = 8 * 1024 * 1024;
 
 /// `fs2` is pinned to 0.4.3 in `Cargo.lock`. On these targets its Unix backend uses
 /// `flock(2)`, whose ownership follows the open file description (so a duplicate fd keeps a
-/// lock alive). Solaris/illumos and other process-scoped `fcntl` or non-Unix backends are
-/// deliberately refused instead of being treated as equivalent.
+/// lock alive). Solaris (fs2's explicit process-scoped `fcntl` fallback) and targets outside
+/// this allowlist, including illumos and non-Unix backends, are deliberately refused instead
+/// of being treated as equivalent.
 pub(super) fn backend_uses_open_file_description_flock(target_os: &str) -> bool {
     matches!(target_os, "linux" | "android" | "macos" | "ios" | "freebsd" | "openbsd" | "netbsd" | "dragonfly")
 }
