@@ -78,6 +78,9 @@ fn try_resolve_entry(entry: &mut UnresolvedEntry, signal: bool) -> bool {
         signal_group(&mut entry.child, entry.pid);
     }
     entry.reaped |= child_gone(&mut entry.child);
+    if entry.reaped {
+        entry.holds.clear();
+    }
     entry.reaped
 }
 #[derive(Default)]
@@ -307,13 +310,13 @@ impl Drop for SpawnFallback {
         signal_group(&mut child, pid);
         let mut entry = UnresolvedEntry::new(child, pid, holds, probe);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _ = spawn_fallback_on_handle(
+            drop(spawn_fallback_on_handle(
                 Arc::clone(global_registry()),
                 entry,
                 &handle,
                 default_wait_child,
                 PROD_OWNER_POLICY,
-            );
+            ));
             return;
         }
         if try_resolve_entry(&mut entry, false) {
@@ -365,12 +368,14 @@ async fn reap_fallback_guarded(mut guard: InFlightEntryGuard, wait_child: WaitCh
     entry.group_confirmed |= confirmed;
     entry.reaped |= reaped;
     if entry.group_confirmed && entry.reaped {
+        entry.holds.clear();
         return;
     }
     eprintln!("rootyard: Git reaper fallback timed out or group probe failed; handing off unresolved child");
     let _ = guard.registry.handoff_with(entry, tokio::runtime::Handle::try_current().ok(), policy);
 }
 
+#[cfg(test)]
 pub(super) async fn reap_fallback_with_wait(
     child: Child,
     pid: i32,
