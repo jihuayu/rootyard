@@ -249,7 +249,7 @@ async fn receive_pack_authorized(
         operation,
         receive.request(),
         receive.digest(),
-        receive.mode(),
+        receive.mode,
         deadline,
     )
     .await?
@@ -286,7 +286,7 @@ async fn receive_pack_authorized(
                 receive.actor,
                 operation,
                 receive.digest(),
-                receive.mode(),
+                receive.mode,
                 &record,
                 deadline,
             )
@@ -373,7 +373,7 @@ async fn receive_pack_authorized(
             operation,
             receive.request(),
             receive.digest(),
-            receive.mode(),
+            receive.mode,
             deadline,
         )
         .await?
@@ -411,7 +411,7 @@ async fn receive_pack_authorized(
                     receive.actor,
                     operation,
                     receive.digest(),
-                    receive.mode(),
+                    receive.mode,
                     &record,
                     deadline,
                 )
