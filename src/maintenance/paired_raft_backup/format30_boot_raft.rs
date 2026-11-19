@@ -262,15 +262,14 @@ fn verify_booted_group(raft: &MtlsLiveRaftBackend, group_epoch: i64) -> Result<(
     let (snapshot, state_digest) = raft.durable_state()?;
     let applied =
         snapshot.body.last_applied.ok_or(PairedBackupError::IncompleteCut("booted Raft group has no applied entry"))?;
+    let min_idx = raft.committed_quorum_index()?;
     let attestations = raft.attest_group_cutpoint(group_epoch, &snapshot, &state_digest)?;
     verify_cutpoint_attestations(
-        raft.group_id(),
-        group_epoch,
+        (raft.group_id(), group_epoch),
         &raft.voter_ids(),
         &raft.group_membership_digest(),
-        applied,
-        &state_digest,
-        &snapshot.checksum,
+        (applied, min_idx),
+        (&state_digest, &snapshot.checksum),
         &attestations,
     )
 }

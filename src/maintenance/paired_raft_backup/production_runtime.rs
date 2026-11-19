@@ -235,15 +235,14 @@ impl PairedProductionRuntimeGuard {
             .ok_or(PairedBackupError::IncompleteCut("missing applied log entry for projection worker"))?;
         let voter_ids = raft.voter_ids();
         let mem_digest = raft.group_membership_digest();
+        let min_idx = raft.committed_quorum_index()?;
         let attestations = raft.attest_group_cutpoint(ticket.group_epoch, &snap, &state_digest)?;
         verify_cutpoint_attestations(
-            raft.group_id(),
-            ticket.group_epoch,
+            (raft.group_id(), ticket.group_epoch),
             &voter_ids,
             &mem_digest,
-            applied,
-            &state_digest,
-            &snap.checksum,
+            (applied, min_idx),
+            (&state_digest, &snap.checksum),
             &attestations,
         )?;
         let updated = client

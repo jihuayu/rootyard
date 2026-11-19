@@ -55,8 +55,13 @@ pub fn verify_bare_repo_from_blobs(
     pack_pairs: &[(PathBuf, PathBuf)],
     clone_dir: &Path,
 ) -> Result<usize, PairedBackupError> {
-    if refs.is_empty() || pack_pairs.is_empty() {
-        return Err(PairedBackupError::GitVerificationFailed("cannot verify empty repository closure".into()));
+    if pack_pairs.is_empty() {
+        if refs.is_empty() {
+            return Ok(0);
+        }
+        return Err(PairedBackupError::GitVerificationFailed(
+            "cannot verify repository refs without pack closure".into(),
+        ));
     }
     let bare = work_dir.join("restored.git");
     fs::create_dir_all(&bare)?;
@@ -88,6 +93,12 @@ pub fn verify_bare_repo_from_blobs(
         )?;
     }
     fs::remove_dir_all(&strict_scratch)?;
+    // A repository that is provisioned but holds no refs yet is a legitimate restore target:
+    // its pack closure must still be byte-verified, while refs/HEAD/clone checks are vacuous.
+    if refs.is_empty() {
+        run_git(Some(&bare), &["fsck", "--full", "--strict"], &[])?;
+        return Ok(0);
+    }
 
     let mut batch = String::new();
     for (ref_name, oid) in refs {

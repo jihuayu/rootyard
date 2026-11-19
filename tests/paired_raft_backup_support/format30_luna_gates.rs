@@ -212,17 +212,22 @@ fn gate2_forged_voter_acks_and_minority_cutpoint_attestations_are_rejected() -> 
 
     let cutpoint = raft.attest_group_cutpoint(2, &snapshot, &state_digest).map_err(pg)?;
     ensure!(cutpoint.len() > voter_ids.len() / 2, "majority of voters must attest the cutpoint");
-    verify_cutpoint_attestations(1, 2, &voter_ids, &membership, applied, &state_digest, &snapshot.checksum, &cutpoint)
-        .map_err(pg)?;
+    verify_cutpoint_attestations(
+        (1, 2),
+        &voter_ids,
+        &membership,
+        (applied, applied.index),
+        (&state_digest, &snapshot.checksum),
+        &cutpoint,
+    )
+    .map_err(pg)?;
     ensure!(
         verify_cutpoint_attestations(
-            1,
-            2,
+            (1, 2),
             &voter_ids,
             &membership,
-            applied,
-            &state_digest,
-            &snapshot.checksum,
+            (applied, applied.index),
+            (&state_digest, &snapshot.checksum),
             &cutpoint[..1],
         )
         .is_err(),
@@ -232,13 +237,11 @@ fn gate2_forged_voter_acks_and_minority_cutpoint_attestations_are_rejected() -> 
     skewed[0].claims.subject_digest = "11".repeat(32);
     ensure!(
         verify_cutpoint_attestations(
-            1,
-            2,
+            (1, 2),
             &voter_ids,
             &membership,
-            applied,
-            &state_digest,
-            &snapshot.checksum,
+            (applied, applied.index),
+            (&state_digest, &snapshot.checksum),
             &skewed,
         )
         .is_err(),

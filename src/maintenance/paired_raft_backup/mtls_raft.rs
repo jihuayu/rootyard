@@ -28,6 +28,7 @@ const FREEZE_KV_KEY: &str = "refcas/paired_freeze";
 const FREEZE_RECORD_MISSING: &str = "3-voter mTLS Raft freeze record missing";
 pub(super) const INCARNATION_KV_KEY: &str = "refcas/cluster_incarnation";
 pub(super) const GROUP_EPOCH_KV_KEY: &str = "refcas/group_epoch";
+pub(super) const HEAD_RAFT_INDEX_KV_KEY: &str = "refcas/head_raft_index";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -37,7 +38,7 @@ struct PersistedRaftCmd {
 }
 
 #[derive(Clone, Debug)]
-struct AuthenticatedVoterInfo {
+pub(super) struct AuthenticatedVoterInfo {
     voter_uuid: Uuid,
     last_log_index: u64,
     current_term: u64,
@@ -160,7 +161,7 @@ impl MtlsLiveRaftBackend {
         Ok(Some(inc))
     }
 
-    fn probe_live_voters(&self) -> Result<(BTreeMap<u64, AuthenticatedVoterInfo>, u64), PairedBackupError> {
+    pub(super) fn probe_live_voters(&self) -> Result<(BTreeMap<u64, AuthenticatedVoterInfo>, u64), PairedBackupError> {
         let expected_ids: BTreeSet<u64> = self.cfg.voter_endpoints.keys().copied().collect();
         let mut infos = BTreeMap::new();
         let mut leader_opt = None;
@@ -245,30 +246,16 @@ impl MtlsLiveRaftBackend {
         Err(PairedBackupError::FreezeNotHeld("mTLS Raft ClientWrite timed out awaiting majority quorum"))
     }
 
-    fn linearizable_kv_get(&self, key: &str) -> Result<Option<String>, PairedBackupError> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut target: Option<u64> = None;
-        while Instant::now() < deadline {
-            let candidate = match target.take() {
-                Some(id) if self.cfg.voter_endpoints.contains_key(&id) => id,
-                _ => self.probe_live_voters()?.1,
-            };
-            let addr = &self.cfg.voter_endpoints[&candidate];
-            if let Ok((resp, _)) =
-                mtls_rpc_call(&self.tls_cfg, addr, candidate, &json!({ "KvGet": { "key": key } }), self.cfg.rpc_timeout)
-            {
-                if resp.get("KvValue").is_some() {
-                    return Ok(resp.pointer("/KvValue/value").and_then(Value::as_str).map(str::to_owned));
-                }
-                if let Some(fwd) = resp.pointer("/Error/forward_to_leader_id").and_then(Value::as_u64)
-                    && fwd != candidate
-                {
-                    target = Some(fwd);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        Err(PairedBackupError::FreezeNotHeld("mTLS linearizable ReadIndex KvGet failed"))
+    pub(super) fn replica_kv_u64(&self, node_id: u64, key: &str) -> Result<u64, PairedBackupError> {
+        let addr = &self.cfg.voter_endpoints[&node_id];
+        let (kv, _) = mtls_rpc_call(
+            &self.tls_cfg,
+            addr,
+            node_id,
+            &json!({ "InspectReplicaKv": { "key": key } }),
+            self.cfg.rpc_timeout,
+        )?;
+        Ok(kv.pointer("/KvValue/value").and_then(Value::as_str).unwrap_or("0").parse().unwrap_or(0))
     }
 
     pub(super) fn trigger_leader_snapshot(&self) -> Result<(), PairedBackupError> {
@@ -308,7 +295,7 @@ impl MtlsLiveRaftBackend {
         group_epoch: i64,
         log_id: AppliedLogId,
         seq: u64,
-        commit_raft_idx: u64,
+        (commit_raft_idx, idx_put_raft_idx): (u64, u64),
         command_sha256: &str,
     ) -> Result<Vec<VoterWalAck>, PairedBackupError> {
         for attempt in 0..15 {
@@ -318,19 +305,10 @@ impl MtlsLiveRaftBackend {
             let (infos, _) = self.probe_live_voters()?;
             let mut acks = Vec::new();
             for (&node_id, info) in &infos {
-                let addr = &self.cfg.voter_endpoints[&node_id];
-                let Ok((kv, _)) = mtls_rpc_call(
-                    &self.tls_cfg,
-                    addr,
-                    node_id,
-                    &json!({ "InspectReplicaKv": { "key": "refcas/head_seq" } }),
-                    self.cfg.rpc_timeout,
-                ) else {
-                    continue;
-                };
-                let peer_seq: u64 =
-                    kv.pointer("/KvValue/value").and_then(Value::as_str).unwrap_or("0").parse().unwrap_or(0);
-                if peer_seq >= seq && (attempt > 0 || info.last_log_index >= commit_raft_idx) {
+                let Ok(peer_seq) = self.replica_kv_u64(node_id, "refcas/head_seq") else { continue };
+                let Ok(peer_raft_idx) = self.replica_kv_u64(node_id, HEAD_RAFT_INDEX_KV_KEY) else { continue };
+                let replicated = attempt > 0 || info.last_log_index >= idx_put_raft_idx;
+                if peer_seq >= seq && peer_raft_idx >= commit_raft_idx && replicated {
                     let Ok(attestation) = super::peer_attestation_rpc::request_commit_attestation(
                         self,
                         node_id,
@@ -354,7 +332,9 @@ impl MtlsLiveRaftBackend {
                     );
                 }
             }
-            if acks.len() > self.voter_uuids.len() / 2 {
+            let local_replicated =
+                self.replica_kv_u64(self.cfg.local_node_id, HEAD_RAFT_INDEX_KV_KEY).unwrap_or(0) >= commit_raft_idx;
+            if acks.len() > self.voter_uuids.len() / 2 && local_replicated {
                 return Ok(acks);
             }
         }
@@ -374,7 +354,7 @@ impl MtlsLiveRaftBackend {
         source_membership_digest: &str,
         forbidden_incarnations: &BTreeSet<Uuid>,
     ) -> Result<(), PairedBackupError> {
-        super::peer_attestation_rpc::verify_pristine_target(self, source_membership_digest, forbidden_incarnations)
+        super::mtls_consensus::verify_pristine_target(self, source_membership_digest, forbidden_incarnations)
     }
 }
 
@@ -417,10 +397,12 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
             let _ = self.quorum_kv_put(GROUP_EPOCH_KV_KEY, &group_epoch.to_string())?;
         }
         let (commit_raft_idx, _) = self.quorum_kv_put("refcas/head_seq", &seq.to_string())?;
+        let (idx_put_raft_idx, _) = self.quorum_kv_put(HEAD_RAFT_INDEX_KV_KEY, &commit_raft_idx.to_string())?;
         let log_id = AppliedLogId { term: final_term, index: seq };
         let _ = self.trigger_leader_snapshot();
 
-        let acks = self.collect_voter_acks(group_epoch, log_id, seq, commit_raft_idx, &command_sha256)?;
+        let acks =
+            self.collect_voter_acks(group_epoch, log_id, seq, (commit_raft_idx, idx_put_raft_idx), &command_sha256)?;
         let quorum_receipt = QuorumCommitReceipt {
             group_id: self.cfg.group_id,
             group_epoch,
@@ -450,7 +432,7 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
             log_id,
             command_sha256,
             local_wal_record_digest: local_wal_digest,
-            committed_index_on_disk: seq,
+            committed_index_on_disk: commit_raft_idx,
             state_digest_after_apply: state_digest_after,
             apply_digest: String::new(),
         }
@@ -471,8 +453,7 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
     }
 
     fn committed_quorum_index(&self) -> Result<u64, PairedBackupError> {
-        let (_, seq) = self.replay_linearizable_sm()?;
-        Ok(seq)
+        self.linearizable_consensus_index()
     }
 
     fn verify_freeze_barrier_active(&self, expected_barrier_id: Uuid) -> Result<(), PairedBackupError> {

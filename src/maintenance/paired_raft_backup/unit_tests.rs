@@ -318,6 +318,7 @@ fn manifest_digest_tamper_and_incarnation_guard_checks() {
             group_epochs: BTreeMap::from([(1, 3)]),
             peer_groups: Vec::new(),
             applied_log_id: applied,
+            min_consensus_index: applied.index,
             logical_clock_floor: snap.body.logical_clock_floor,
             state_digest,
             group_membership_digest: raft.group_membership_digest(),

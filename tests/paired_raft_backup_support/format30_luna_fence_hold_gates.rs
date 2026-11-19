@@ -16,7 +16,8 @@ use rootyard::maintenance::paired_raft_backup::{
     DurableFreezeRequest, Format30PairedBackupRequest, MtlsLiveRaftBackend, PairedBackupError, PeerDurableAttestation,
     PeerDurableAttestationClaims, SealedArchiveReceipt, compute_group_membership_digest,
     create_format30_paired_raft_backup, derive_voter_uuid_bound, enter_durable_pg_raft_freeze,
-    load_pg_repo_backup_specs, thaw_durable_pg_raft_freeze, verify_cutpoint_attestations,
+    load_pg_repo_backup_specs, replicate_pg_repo_to_raft_guarded, thaw_durable_pg_raft_freeze,
+    verify_cutpoint_attestations,
 };
 use rootyard::ref_store::core::decision_commit::{PgDecisionProtocol, RealmExpectation};
 use rootyard::ref_store::core::state_machine::AppliedLogId;
@@ -24,8 +25,7 @@ use rootyard::ref_store::serving::lookup;
 
 use super::fixture::LoopbackS3;
 use super::format30_helpers::{
-    find_git_bin, init_volume_dir, make_actor, make_backup_config, replace_db_in_url, run_git_cli,
-    seed_gate_and_commit, start_gateway,
+    find_git_bin, init_volume_dir, make_actor, make_backup_config, replace_db_in_url, run_git_cli, start_gateway,
 };
 use super::mtls_cluster::LiveMtlsRaftGroup;
 
@@ -40,7 +40,8 @@ fn durable_attestation_without_wal_digest_is_refused() -> Result<()> {
                 Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|e| anyhow!("parse ed25519 pkcs8: {e}"))?;
             let cert = format!("{node_id:064x}");
             let pubkey = hex::encode(KeyPair::public_key(&keypair).as_ref());
-            Ok((node_id, keypair, cert, derive_voter_uuid_bound(1, node_id, &cert, &pubkey), pubkey))
+            let voter_id = derive_voter_uuid_bound(1, node_id, &cert, &pubkey);
+            Ok((node_id, keypair, cert, voter_id, pubkey))
         })
         .collect::<Result<Vec<_>>>()?;
     let voter_ids: Vec<Uuid> = voters.iter().map(|voter| voter.3).collect();
@@ -77,17 +78,15 @@ fn durable_attestation_without_wal_digest_is_refused() -> Result<()> {
         matches!(zeroed.verify(), Err(PairedBackupError::FreezeNotHeld(_))),
         "an all-zero durable_sqlite_sha256 must fail the attestation closed"
     );
-    for (raft_committed_index, expected_ok) in [(4u64, false), (5u64, true)] {
+    for (raft_committed_index, expected_ok) in [(11u64, false), (12u64, true)] {
         let attestations = attest(raft_committed_index)?;
         ensure!(attestations.iter().all(|attestation| attestation.verify().is_ok()), "signed cutpoints must verify");
         let outcome = verify_cutpoint_attestations(
-            1,
-            1,
+            (1, 1),
             &voter_ids,
             &membership,
-            applied,
-            &"c".repeat(64),
-            &"d".repeat(64),
+            (applied, 12),
+            (&"c".repeat(64), &"d".repeat(64)),
             &attestations,
         );
         ensure!(outcome.is_ok() == expected_ok, "cutpoint reach outcome mismatch");
@@ -158,14 +157,9 @@ async fn gate7_fence_drop_at_each_publication_boundary_fails_closed() -> Result<
         fs::write(clone.join("f.txt"), "gate7\n")?;
         ensure!(run_git_cli(&git, &clone, &["add", "."]).status.success());
         ensure!(run_git_cli(&git, &clone, &["commit", "-q", "-m", "gate7"]).status.success());
-        let head = String::from_utf8(run_git_cli(&git, &clone, &["rev-parse", "HEAD"]).stdout)?.trim().to_owned();
         let pushed = run_git_cli(&git, &clone, &["push", "origin", "HEAD:refs/heads/main"]);
         ensure!(pushed.status.success(), "push failed: {}", String::from_utf8_lossy(&pushed.stderr));
-        seed_gate_and_commit(
-            &mut raft,
-            (repo_id, gate.tenant_id(), gate.history_incarnation(), gate.authority_epoch(), gate.group_epoch()),
-            &[head],
-        )?;
+        replicate_pg_repo_to_raft_guarded(&pool, &mut raft, repo_id).await?;
         let specs = load_pg_repo_backup_specs(&**pool.get().await?).await?;
         ensure!(specs.len() == 1, "the source repository must yield exactly one backup spec");
         let data_dir = dir.path().join("gate7-vol");

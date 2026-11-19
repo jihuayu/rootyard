@@ -132,6 +132,8 @@ async fn gate6_peer_attestor_rejects_mismatched_local_group_epoch() -> Result<()
     seed_gate_and_commit(&mut raft, (repo, tenant, hist, 2, 3), &["e".repeat(64)])?;
     let (snapshot, state_digest) = raft.durable_state()?;
     let applied = snapshot.body.last_applied.context("durable applied index")?;
+    let consensus_idx = raft.committed_quorum_index()?;
+    ensure!(consensus_idx > applied.index, "real Raft consensus index must exceed the RefCAS seq");
     let local_epoch = snapshot.body.gates[0].group_epoch;
     let endpoint = grp.attestor_endpoints()[&1].clone();
     let tls = grp.tls_config();
@@ -153,7 +155,7 @@ async fn gate6_peer_attestor_rejects_mismatched_local_group_epoch() -> Result<()
     };
     let mut accepted = None;
     for _ in 0..20 {
-        if let Ok((response, _)) = call(local_epoch, applied.index)
+        if let Ok((response, _)) = call(local_epoch, consensus_idx)
             && response.get("Attestation").is_some()
         {
             accepted = Some(response);
@@ -166,23 +168,19 @@ async fn gate6_peer_attestor_rejects_mismatched_local_group_epoch() -> Result<()
         serde_json::from_value(response["Attestation"].clone()).context("attestation json")?;
     attestation.verify()?;
     ensure!(attestation.claims.group_epoch == local_epoch, "peer signs only its own local group_epoch");
+    ensure!(attestation.claims.raft_committed_index >= applied.index, "raft_committed_index reaches the cutpoint");
+    let wal = &attestation.claims.durable_sqlite_sha256;
+    ensure!(wal.len() == 64 && !wal.bytes().all(|b| b == b'0'), "cutpoint must bind a real durable WAL digest");
+    let (below, _) = call(local_epoch, applied.index)?;
     ensure!(
-        attestation.claims.raft_committed_index >= applied.index,
-        "attested raft_committed_index must reach the attested cutpoint"
-    );
-    ensure!(
-        attestation.claims.durable_sqlite_sha256.len() == 64
-            && !attestation.claims.durable_sqlite_sha256.bytes().all(|b| b == b'0'),
-        "attested cutpoint must bind a real durable WAL digest"
+        below.get("Attestation").is_none() && below.get("Error").is_some(),
+        "a min_committed_index below the real Raft consensus index must be refused"
     );
     let (rejected, _) = call(local_epoch + 1, applied.index)?;
     ensure!(rejected.get("Attestation").is_none(), "mismatched group_epoch must not be signed");
     ensure!(rejected.get("Error").is_some(), "mismatched group_epoch must surface an Error");
     let (lagged, _) = call(local_epoch, applied.index + 10_000)?;
-    ensure!(
-        lagged.get("Attestation").is_none() && lagged.get("Error").is_some(),
-        "a min_committed_index beyond the applied index must be refused"
-    );
+    ensure!(lagged.get("Attestation").is_none() && lagged.get("Error").is_some(), "lagged cutpoint refused");
 
     // Requirement 4: only a leaf whose pinned digest *and* `raft-client` SAN both match may
     // drive the daemon; a wrong-SAN leaf or an extra-CA-signed leaf is refused.
@@ -190,7 +188,7 @@ async fn gate6_peer_attestor_rejects_mismatched_local_group_epoch() -> Result<()
         "group_id": grp.group_id,
         "group_epoch": local_epoch,
         "expected_seq": applied.index,
-        "min_committed_index": applied.index,
+        "min_committed_index": consensus_idx,
         "expected_state_digest": state_digest.as_str(),
         "expected_snapshot_checksum": snapshot.checksum.as_str(),
     }});

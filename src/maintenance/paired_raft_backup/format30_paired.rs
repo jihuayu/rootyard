@@ -182,6 +182,7 @@ pub async fn create_format30_paired_raft_backup(
         group_epochs,
         peer_groups: peer_proofs,
         applied_log_id,
+        min_consensus_index: committed_idx,
         logical_clock_floor: snapshot.body.logical_clock_floor,
         state_digest,
         group_membership_digest: mem_digest,
@@ -312,13 +313,11 @@ pub fn verify_format30_paired_archive(
     }
     let active_cut = ExpectedGroupCursorCut::from_verified_snapshot(raft.group_id, &raft.snapshot)?;
     super::raft_barrier::verify_cutpoint_attestations(
-        raft.group_id,
-        active_cut.group_epoch,
+        (raft.group_id, active_cut.group_epoch),
         &raft.voter_ids,
         &raft.group_membership_digest,
-        raft.applied_log_id,
-        &raft.state_digest,
-        &raft.snapshot_checksum,
+        (raft.applied_log_id, raft.min_consensus_index),
+        (&raft.state_digest, &raft.snapshot_checksum),
         &raft.cutpoint_attestations,
     )?;
     let peer_cuts =

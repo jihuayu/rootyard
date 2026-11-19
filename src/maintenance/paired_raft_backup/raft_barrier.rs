@@ -36,13 +36,11 @@ pub fn compute_group_membership_digest(voter_ids: &[Uuid]) -> Result<String, Pai
 /// Require a strict majority of distinct, verified server-signed `"cutpoint"` attestations
 /// bound to the archived voter set and cutpoint digests.
 pub fn verify_cutpoint_attestations(
-    group_id: i64,
-    group_epoch: i64,
+    (group_id, group_epoch): (i64, i64),
     voter_ids: &[Uuid],
     expected_membership_digest: &str,
-    applied_log_id: AppliedLogId,
-    state_digest: &str,
-    snapshot_checksum: &str,
+    (applied_log_id, min_consensus_index): (AppliedLogId, u64),
+    (state_digest, snapshot_checksum): (&str, &str),
     attestations: &[PeerDurableAttestation],
 ) -> Result<(), PairedBackupError> {
     if compute_group_membership_digest(voter_ids)? != expected_membership_digest {
@@ -63,6 +61,9 @@ pub fn verify_cutpoint_attestations(
             || claims.group_epoch != group_epoch
             || claims.raft_committed_index == 0
             || claims.raft_committed_index < applied_log_id.index
+            || min_consensus_index == 0
+            || min_consensus_index < applied_log_id.index
+            || claims.raft_committed_index < min_consensus_index
             || claims.raft_committed_index < claims.refcas_seq
             || claims.refcas_seq != applied_log_id.index
             || claims.subject_digest != state_digest

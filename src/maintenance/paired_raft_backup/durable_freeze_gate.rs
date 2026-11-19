@@ -12,7 +12,7 @@ use crate::ref_store::core::state_machine::{ApplyResponse, CloseAuthScopeCommand
 
 pub use super::durable_guarded_ops::{
     execute_deleter_guarded, load_pg_repo_backup_specs, propose_raft_hold_guarded, propose_raft_ref_write_guarded,
-    require_unfrozen_pg_and_raft, upsert_repo_access_collaborator_guarded,
+    replicate_pg_repo_to_raft_guarded, require_unfrozen_pg_and_raft, upsert_repo_access_collaborator_guarded,
 };
 use super::freeze_drain::{RepoBackupRegistrationSpec, TriPartyBackupCoordinator};
 use super::mtls_raft::{DurableRaftFreezeRecord, MtlsLiveRaftBackend};

@@ -219,6 +219,7 @@ pub async fn create_paired_backup(
         group_epochs,
         peer_groups: peer_proofs,
         applied_log_id,
+        min_consensus_index: committed_idx,
         logical_clock_floor: snapshot.body.logical_clock_floor,
         state_digest,
         group_membership_digest,
@@ -314,8 +315,9 @@ pub(super) fn reconcile_pg_raft_repositories(
         }
     }
     for repo in &pg.repositories {
-        let sm_refs = snap.body.refs.iter().find(|rf| rf.repository_id == repo.repository_id).map(|rf| &rf.refs);
-        if sm_refs != Some(&repo.refs) {
+        let empty = BTreeMap::new();
+        let found = snap.body.refs.iter().find(|rf| rf.repository_id == repo.repository_id);
+        if found.map_or(&empty, |rf| &rf.refs) != &repo.refs {
             return Err(PairedBackupError::CutpointSkew(format!(
                 "PG refs != Raft refs for repo {}",
                 repo.repository_id

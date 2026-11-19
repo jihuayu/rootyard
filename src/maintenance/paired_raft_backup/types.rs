@@ -297,6 +297,7 @@ pub struct RaftCutpointProof {
     pub group_epochs: BTreeMap<i64, i64>,
     pub peer_groups: Vec<PeerRaftCutpointProof>,
     pub applied_log_id: AppliedLogId,
+    pub min_consensus_index: u64,
     pub logical_clock_floor: u64,
     pub state_digest: String,
     pub group_membership_digest: String,

@@ -2,7 +2,7 @@
 //! onto fresh PostgreSQL 17, isolated `BlobStore`, and fresh 3-voter mTLS Raft clusters (#153).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio_postgres::Client;
@@ -18,7 +18,7 @@ use super::format30_realm_rehome::{
     RestoredRepoCapture, capture_restored_repositories_for_rebind, rebind_restored_repositories_in_new_realm,
     rehome_restored_repositories_realm,
 };
-use super::mtls_raft::MtlsLiveRaftBackend;
+use super::mtls_raft::{DurableRaftFreezeRecord, MtlsLiveRaftBackend};
 use super::pg_cutpoint::{pg_err, sync_restored_pg_projection_cursors};
 use super::pg_freeze_settings::{
     set_pg_database_freeze_marker, set_pg_database_read_only, terminate_and_await_other_pg_sessions,
@@ -27,6 +27,9 @@ use super::pg_restore_admission::verify_pg_restored_cursors;
 use super::production_runtime::PairedProductionRuntimeGuard;
 use super::quorum_wal::DurableRaftBackend;
 use super::types::{NewIncarnationAuthority, PairedBackupError, RestoreOutcome};
+
+/// Complete result of the staged restore + new-incarnation installation before publication.
+type RestoredIncarnation = (Client, NewIncarnationAuthority, DurableRaftFreezeRecord, usize);
 
 /// Restore the complete `schema 151` / `format 30` archive (`pg_restore` + `BlobStore` rebuild) into
 /// a brand-new PG 17 database + target `BlobStore`, and **install + boot** the new incarnation
@@ -70,45 +73,120 @@ pub async fn restore_and_boot_format30_new_incarnation(
         peer.verify_pristine_new_incarnation_target(&proof.group_membership_digest, &forbidden_incarnations)?;
     }
 
-    crate::backup::restore(
-        dst_config, &fmt30_dir, false, false, false, false, false, false, false, false, false, false, false, false,
-        false, false, false,
-    )
-    .await
-    .map_err(|e| PairedBackupError::Postgres(format!("format 30 backup::restore failed: {e:#}")))?;
-
-    let parsed: tokio_postgres::Config = dst_config.database_url.parse().map_err(pg_err)?;
-    let mut dst_client =
-        crate::db::connect_config(parsed).await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
-    dst_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await.map_err(pg_err)?;
-    set_pg_database_freeze_marker(&dst_client, Some(&format!("restore-boot:{}", manifest.backup_id))).await?;
-    set_pg_database_read_only(&dst_client, true).await?;
-    terminate_and_await_other_pg_sessions(&dst_client, Duration::from_secs(5)).await?;
-
-    let captured_repos = capture_restored_repositories_for_rebind(&dst_client, &fmt30_dir, &manifest).await?;
-    let inc = install_new_incarnation_on_restored_schema151(&mut dst_client, &manifest, &captured_repos).await?;
-    let rebound_packs =
-        rebind_restored_repositories_in_new_realm(&mut dst_client, dst_config, target_store, &inc, &captured_repos)
-            .await?;
-    let boot_freeze = boot_record(&manifest, &inc, true, Uuid::new_v4(), None)?;
-    let git_verified_refs = boot_active_and_peer_mtls_raft_incarnation(
-        (&fmt30_dir, work_dir),
-        &manifest,
-        &inc,
-        &boot_freeze,
-        &rebound_packs,
-        booted_active_raft,
-        booted_peer_rafts,
-    )?;
-
-    let (active_snap, _) = booted_active_raft.durable_state()?;
-    let mut peer_snaps = BTreeMap::new();
-    for (&gid, pr) in booted_peer_rafts.iter() {
-        peer_snaps.insert(gid, pr.durable_state()?.0);
+    // Refuse an already-published target BEFORE writing the crash-persistent guard or touching
+    // PostgreSQL: publishing a restored volume over a live one is never recoverable.
+    if std::fs::symlink_metadata(&dst_config.data_dir).is_ok() {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "restore target data_dir already exists; refusing to publish a restored volume over it",
+        ));
     }
-    sync_restored_pg_projection_cursors(&mut dst_client, manifest.raft_cutpoint.group_id, &active_snap, &peer_snaps)
+    crate::backup::ensure_not_restoring(&dst_config.data_dir)
+        .map_err(|_| PairedBackupError::FreezeNotHeld("incomplete restore guard blocks target data_dir"))?;
+
+    // PostgreSQL is fenced *before* the target volume is touched. Only the durable freeze marker is
+    // armed here: `crate::backup::restore` rejects a pre-existing `rootyard.restore_in_progress`
+    // and requires zero sibling sessions, then sets that marker itself inside its `BackupMutex`.
+    let marker = format!("restore-boot:{}", manifest.backup_id);
+    let parsed: tokio_postgres::Config = dst_config.database_url.parse().map_err(pg_err)?;
+    let pre_client =
+        crate::db::connect_config(parsed.clone()).await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
+    set_pg_database_freeze_marker(&pre_client, Some(&marker)).await?;
+    terminate_and_await_other_pg_sessions(&pre_client, Duration::from_secs(5)).await?;
+    drop(pre_client);
+    // Let the terminations settle so `restore` observes `sessions == 0` when it connects.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Never publish `dst_config.data_dir` before the paired freeze marker and every restored
+    // rebind have committed: the volume is restored into a private staging directory and
+    // published by exactly one atomic rename once all PostgreSQL + Raft work has committed.
+    let stage_root = staging_root(&dst_config.data_dir)?;
+    let staged_data = stage_root.join("data");
+    let mut staged_config = dst_config.clone();
+    staged_config.data_dir = staged_data.clone();
+    let guard_path = restore_guard_path(&dst_config.data_dir)?;
+    create_private_dir(&stage_root)?;
+    write_restore_guard(&guard_path, manifest.backup_id)?;
+    let restored: Result<RestoredIncarnation, PairedBackupError> = async {
+        crate::backup::restore(
+            &staged_config,
+            &fmt30_dir,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .await
+        .map_err(|e| PairedBackupError::Postgres(format!("format 30 backup::restore failed: {e:#}")))?;
+
+        let mut dst_client =
+            crate::db::connect_config(parsed.clone()).await.map_err(|e| PairedBackupError::Postgres(e.to_string()))?;
+        dst_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await.map_err(pg_err)?;
+        set_pg_database_freeze_marker(&dst_client, Some(&marker)).await?;
+        set_restore_in_progress(&dst_client, Some(manifest.backup_id)).await?;
+        set_pg_database_read_only(&dst_client, true).await?;
+        terminate_and_await_other_pg_sessions(&dst_client, Duration::from_secs(5)).await?;
+
+        let captured_repos = capture_restored_repositories_for_rebind(&dst_client, &fmt30_dir, &manifest).await?;
+        let inc = install_new_incarnation_on_restored_schema151(&mut dst_client, &manifest, &captured_repos).await?;
+        let rebound_packs =
+            rebind_restored_repositories_in_new_realm(&mut dst_client, dst_config, target_store, &inc, &captured_repos)
+                .await?;
+        let boot_freeze = boot_record(&manifest, &inc, true, Uuid::new_v4(), None)?;
+        let git_verified_refs = boot_active_and_peer_mtls_raft_incarnation(
+            (&fmt30_dir, work_dir),
+            &manifest,
+            &inc,
+            &boot_freeze,
+            &rebound_packs,
+            booted_active_raft,
+            booted_peer_rafts,
+        )?;
+
+        let (active_snap, _) = booted_active_raft.durable_state()?;
+        let mut peer_snaps = BTreeMap::new();
+        for (&gid, pr) in booted_peer_rafts.iter() {
+            peer_snaps.insert(gid, pr.durable_state()?.0);
+        }
+        sync_restored_pg_projection_cursors(
+            &mut dst_client,
+            manifest.raft_cutpoint.group_id,
+            &active_snap,
+            &peer_snaps,
+        )
         .await?;
-    verify_pg_restored_cursors(&dst_client, manifest.raft_cutpoint.group_id, &active_snap, &peer_snaps).await?;
+        verify_pg_restored_cursors(&dst_client, manifest.raft_cutpoint.group_id, &active_snap, &peer_snaps).await?;
+        Ok((dst_client, inc, boot_freeze, git_verified_refs))
+    }
+    .await;
+    let (dst_client, inc, boot_freeze, git_verified_refs) = match restored {
+        Ok(restored) => restored,
+        Err(err) => {
+            // Nothing was published: discard only the private staging copy. The target guard stays
+            // on disk and the PG freeze/read-only fences stay armed, so startup cannot admit it.
+            let _ = std::fs::remove_dir_all(&stage_root);
+            return Err(err);
+        }
+    };
+
+    // Everything that can still fail has committed: publish the staged volume with one rename.
+    if dst_config.data_dir.exists() {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "restore target data_dir already exists; refusing to publish a restored volume over it",
+        ));
+    }
+    std::fs::rename(&staged_data, &dst_config.data_dir)?;
+    let _ = std::fs::remove_dir_all(&stage_root);
 
     let boot_thaw =
         boot_record(&manifest, &inc, false, boot_freeze.barrier_id, Some(manifest.paired_cut_digest.clone()))?;
@@ -126,11 +204,15 @@ pub async fn restore_and_boot_format30_new_incarnation(
         .map_err(pg_err)?;
     set_pg_database_read_only(&dst_client, false).await?;
     set_pg_database_freeze_marker(&dst_client, None).await?;
+    set_restore_in_progress(&dst_client, None).await?;
     terminate_and_await_other_pg_sessions(&dst_client, Duration::from_secs(5)).await?;
     dst_client
         .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE; RESET default_transaction_read_only")
         .await
         .map_err(pg_err)?;
+    // The crash-persistent admission guard is removed last: only a fully thawed, published
+    // incarnation may become visible to service startup.
+    std::fs::remove_file(&guard_path)?;
 
     let guard = IncarnationAdmissionGuard { live: inc.clone() };
     super::startup_wiring::set_installed_production_runtime_guard(Some(
@@ -145,6 +227,60 @@ pub async fn restore_and_boot_format30_new_incarnation(
         incarnation: inc,
     };
     Ok((outcome, guard))
+}
+
+/// `.<name>.rootyard-restoring` sibling of the final volume, byte-identical to the guard path
+/// used by `crate::backup` so startup admission sees the same crash-persistent marker.
+fn restore_guard_path(target: &Path) -> Result<PathBuf, PairedBackupError> {
+    let path = if target.is_absolute() { target.to_owned() } else { std::env::current_dir()?.join(target) };
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().ok_or(PairedBackupError::FreezeNotHeld("restore target has no volume name"))?);
+    name.push(".rootyard-restoring");
+    Ok(path.parent().ok_or(PairedBackupError::FreezeNotHeld("restore target has no parent volume"))?.join(name))
+}
+
+/// Private staging root next to — never inside — the final volume.
+fn staging_root(target: &Path) -> Result<PathBuf, PairedBackupError> {
+    let guard = restore_guard_path(target)?;
+    let parent = guard.parent().ok_or(PairedBackupError::FreezeNotHeld("restore target has no parent volume"))?;
+    Ok(parent.join(format!(".paired-fmt30-stage-{}", Uuid::new_v4())))
+}
+
+fn create_private_dir(path: &Path) -> Result<(), PairedBackupError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn write_restore_guard(path: &Path, backup_id: Uuid) -> Result<(), PairedBackupError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    std::io::Write::write_all(&mut file, format!("{backup_id}\n").as_bytes())?;
+    file.sync_data()?;
+    Ok(())
+}
+
+/// PostgreSQL-visible companion marker of the volume guard: readers refuse a database whose
+/// `rootyard.restore_in_progress` setting is present, even across a `raft-node` restart.
+async fn set_restore_in_progress(client: &Client, backup_id: Option<Uuid>) -> Result<(), PairedBackupError> {
+    let database: String = client.query_one("SELECT current_database()", &[]).await.map_err(pg_err)?.get(0);
+    let quoted = format!("\"{}\"", database.replace('"', "\"\""));
+    let statement = match backup_id {
+        Some(id) => format!("ALTER DATABASE {quoted} SET rootyard.restore_in_progress = '{id}'"),
+        None => format!("ALTER DATABASE {quoted} RESET rootyard.restore_in_progress"),
+    };
+    client.batch_execute(&statement).await.map_err(pg_err)
 }
 
 async fn install_new_incarnation_on_restored_schema151(

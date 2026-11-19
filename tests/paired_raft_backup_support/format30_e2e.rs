@@ -21,8 +21,8 @@ use rootyard::maintenance::paired_raft_backup::{
     PairedProductionRuntimeGuard, PeerGroupBackupInput, STANDARD_PAIRED_PG_FORMAT, STANDARD_SCHEMA_HEAD,
     WorkerProjectionTicket, create_format30_paired_raft_backup, enter_durable_pg_raft_freeze, execute_deleter_guarded,
     load_pg_repo_backup_specs, propose_raft_hold_guarded, propose_raft_ref_write_guarded,
-    restore_and_boot_format30_new_incarnation, thaw_durable_pg_raft_freeze, upsert_repo_access_collaborator_guarded,
-    verify_pg_live_incarnation,
+    replicate_pg_repo_to_raft_guarded, restore_and_boot_format30_new_incarnation, thaw_durable_pg_raft_freeze,
+    upsert_repo_access_collaborator_guarded, verify_pg_live_incarnation,
 };
 use rootyard::ref_store::core::decision_commit::{PgDecisionProtocol, RealmExpectation};
 use rootyard::ref_store::core::state_machine::{
@@ -122,13 +122,9 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
             ensure!(push_out.status.success(), "git push failed: {}", String::from_utf8_lossy(&push_out.stderr));
             pushed_oids.push(head);
         }
-        seed_gate_and_commit(
-            &mut raft1,
-            (repo_id, gate.tenant_id(), gate.history_incarnation(), gate.authority_epoch(), gate.group_epoch()),
-            &pushed_oids,
-        )?;
+        replicate_pg_repo_to_raft_guarded(&src_pool, &mut raft1, repo_id).await?;
         let specs = load_pg_repo_backup_specs(&**src_pool.get().await?).await?;
-        ensure!(specs.len() == 1 && specs[0].expected_packs.len() == 2);
+        ensure!(specs.len() == 1 && specs[0].expected_packs.len() == 2 && pushed_oids.len() == 2);
         let pre_ledger =
             super::format30_ledger_gates::capture_pre_backup_ledger_proof(&src_pool, repo_id, &gate).await?;
         let src_authority_id = specs[0].authority_id;
@@ -261,6 +257,9 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         ensure!(manifest.format30_pg.schema_head == STANDARD_SCHEMA_HEAD);
         ensure!(manifest.blob_closure.total_artifacts == 4);
         ensure!(manifest.raft_cutpoint.peer_groups.len() == 1);
+        ensure!(manifest.raft_cutpoint.min_consensus_index > manifest.raft_cutpoint.applied_log_id.index);
+        let peer0 = &manifest.raft_cutpoint.peer_groups[0];
+        ensure!(peer0.min_consensus_index > peer0.applied_log_id.index);
         let thawed_pool = db::pool(&src_url)?;
         {
             let mut tc = thawed_pool.get().await?;

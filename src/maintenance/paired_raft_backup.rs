@@ -8,10 +8,12 @@ pub mod durable_freeze_gate;
 pub mod durable_guarded_ops;
 pub mod format30_boot;
 mod format30_boot_raft;
+mod format30_pack_consolidate;
 pub mod format30_paired;
 mod format30_realm_rehome;
 pub mod freeze_drain;
 pub mod git_verify;
+mod mtls_consensus;
 pub mod mtls_raft;
 pub mod mtls_wire;
 pub mod peer_attestation;
@@ -43,8 +45,8 @@ pub use closure_bind::{
 pub use durable_freeze_gate::{
     DurableFreezeHandle, DurableFreezeRequest, PAIRED_FREEZE_JOURNAL_LOCK_KEY, PG_FREEZE_SETTING,
     enter_durable_pg_raft_freeze, execute_deleter_guarded, load_pg_repo_backup_specs, propose_raft_hold_guarded,
-    propose_raft_ref_write_guarded, read_pg_database_freeze_marker, require_unfrozen_pg_and_raft,
-    thaw_durable_pg_raft_freeze, upsert_repo_access_collaborator_guarded,
+    propose_raft_ref_write_guarded, read_pg_database_freeze_marker, replicate_pg_repo_to_raft_guarded,
+    require_unfrozen_pg_and_raft, thaw_durable_pg_raft_freeze, upsert_repo_access_collaborator_guarded,
 };
 pub use format30_paired::{
     FORMAT30_SUBDIR, Format30PairedBackupRequest, Format30PairedManifest, Format30PgArchiveBinding,

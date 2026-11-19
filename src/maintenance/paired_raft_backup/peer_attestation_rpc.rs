@@ -7,13 +7,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::ref_store::core::state_machine::{
     AppliedLogId, RefCasCommand, RefCasSnapshot, RefCasStateMachine, encode_command,
 };
 
-use super::mtls_raft::{GROUP_EPOCH_KV_KEY, INCARNATION_KV_KEY, MtlsLiveRaftBackend};
+use super::mtls_raft::{GROUP_EPOCH_KV_KEY, HEAD_RAFT_INDEX_KV_KEY, INCARNATION_KV_KEY, MtlsLiveRaftBackend};
 use super::mtls_wire::mtls_rpc_call;
 use super::peer_attestation::{PeerAttestorState, PeerDurableAttestation, PeerDurableAttestationClaims};
 use super::quorum_wal::DurableRaftBackend;
@@ -227,12 +226,16 @@ pub(super) fn attest_cutpoint(
     let metrics = state.metrics()?;
     let last_log_index = state.verify_running_identity(&metrics)?;
     let committed_applied_index = extract_committed_applied_index(&metrics).unwrap_or(0);
+    let local_head_raft_index = state.read_replica_u64(HEAD_RAFT_INDEX_KV_KEY)?;
     if req.expected_seq == 0
         || req.min_committed_index < req.expected_seq
         || committed_applied_index == 0
         || last_log_index < committed_applied_index
         || committed_applied_index < req.expected_seq
         || committed_applied_index < req.min_committed_index
+        || local_head_raft_index < req.expected_seq
+        || req.min_committed_index < local_head_raft_index
+        || committed_applied_index < local_head_raft_index
     {
         return Err(PairedBackupError::FreezeNotHeld(
             "voter Raft committed_index has not reached the attested cutpoint",
@@ -346,12 +349,16 @@ pub(super) fn attest_group_cutpoint(
     snapshot: &RefCasSnapshot,
     state_digest: &str,
 ) -> Result<Vec<PeerDurableAttestation>, PairedBackupError> {
+    raft.trigger_leader_snapshot()?;
     let applied = snapshot.body.last_applied.ok_or(PairedBackupError::IncompleteCut(
         "durable Raft snapshot has no applied entry for a cutpoint attestation",
     ))?;
-    let min_committed_index =
-        DurableRaftBackend::committed_quorum_index(raft).unwrap_or(applied.index).max(applied.index);
-    raft.trigger_leader_snapshot()?;
+    let min_committed_index = DurableRaftBackend::committed_quorum_index(raft)?;
+    if min_committed_index < applied.index || min_committed_index == 0 {
+        return Err(PairedBackupError::FreezeNotHeld(
+            "voter Raft committed_index has not reached the attested cutpoint",
+        ));
+    }
     let mut attestations = Vec::new();
     let mut seen = BTreeSet::new();
     for (&node_id, endpoint) in &raft.cfg.attestor_endpoints {
@@ -413,74 +420,4 @@ pub(super) fn attest_group_cutpoint(
         ));
     }
     Ok(attestations)
-}
-
-fn stale(field: &'static str, expected: String, got: String) -> PairedBackupError {
-    PairedBackupError::StaleIncarnation { field, expected, got }
-}
-
-/// Fail-closed brand-new incarnation probe over 100% of the configured target voters.
-pub(super) fn verify_pristine_target(
-    raft: &MtlsLiveRaftBackend,
-    source_membership_digest: &str,
-    forbidden_incarnations: &BTreeSet<Uuid>,
-) -> Result<(), PairedBackupError> {
-    if raft.group_membership_digest == source_membership_digest {
-        return Err(stale(
-            "group_membership_digest",
-            "brand-new target Raft cluster".into(),
-            source_membership_digest.to_owned(),
-        ));
-    }
-    if raft.cfg.voter_endpoints.len() < 3 {
-        return Err(PairedBackupError::InvalidArgument("pristine target check requires >= 3 configured target voters"));
-    }
-    for (&node_id, endpoint) in &raft.cfg.voter_endpoints {
-        let (metrics_response, _cert_sha) =
-            mtls_rpc_call(&raft.tls_cfg, endpoint, node_id, &json!("Metrics"), raft.cfg.rpc_timeout).map_err(|_| {
-                stale("target_voter_unreachable", format!("reachable target voter {node_id}"), "unreachable".into())
-            })?;
-        let metrics = metrics_response.get("Metrics").ok_or_else(|| {
-            stale("target_voter_metrics", format!("Metrics from target voter {node_id}"), "missing".into())
-        })?;
-        if metrics["running_ok"].as_bool() != Some(true) || metrics["node_id"].as_u64() != Some(node_id) {
-            return Err(stale(
-                "target_voter_running_ok",
-                format!("running voter {node_id}"),
-                "not running or node_id mismatch".into(),
-            ));
-        }
-        let summary = metrics
-            .get("sm_summary")
-            .ok_or_else(|| stale("target_sm_summary", "empty state machine".to_owned(), "missing".into()))?;
-        if summary["kv_count"].as_u64() != Some(0)
-            || !summary["active_snapshot_id"].is_null()
-            || !summary["active_snapshot_file"].is_null()
-        {
-            return Err(stale(
-                "target_sm_summary",
-                "empty state machine (kv_count=0, no active snapshot)".to_owned(),
-                summary.to_string(),
-            ));
-        }
-        for key in ["refcas/head_seq", "refcas/cluster_incarnation", "refcas/paired_freeze", GROUP_EPOCH_KV_KEY] {
-            let (kv_response, _cert_sha) = mtls_rpc_call(
-                &raft.tls_cfg,
-                endpoint,
-                node_id,
-                &json!({ "InspectReplicaKv": { "key": key } }),
-                raft.cfg.rpc_timeout,
-            )?;
-            if let Some(value) = kv_response.pointer("/KvValue/value").filter(|value| !value.is_null()) {
-                let text = value.as_str().unwrap_or_default();
-                let field = if text.parse::<Uuid>().ok().is_some_and(|id| forbidden_incarnations.contains(&id)) {
-                    "forbidden_incarnation"
-                } else {
-                    "dirty_target_raft"
-                };
-                return Err(stale(field, format!("empty {key} on target voter {node_id}"), text.to_owned()));
-            }
-        }
-    }
-    Ok(())
 }

@@ -36,6 +36,7 @@ pub struct PeerRaftCutpointProof {
     pub history_incarnation: Uuid,
     pub group_epoch: i64,
     pub applied_log_id: AppliedLogId,
+    pub min_consensus_index: u64,
     pub applied_event_seq: u64,
     pub logical_clock_floor: u64,
     pub state_digest: String,
@@ -110,6 +111,7 @@ pub fn extract_peer_expected_cuts(
             history_incarnation: cut.history_incarnation,
             group_epoch: cut.group_epoch,
             applied_log_id,
+            min_consensus_index: committed_idx,
             applied_event_seq: cut.applied_event_seq,
             logical_clock_floor: snap.body.logical_clock_floor,
             state_digest,
@@ -165,13 +167,11 @@ pub fn verify_archived_peer_groups(
             false,
         )?;
         super::raft_barrier::verify_cutpoint_attestations(
-            peer.group_id,
-            peer.group_epoch,
+            (peer.group_id, peer.group_epoch),
             &peer.voter_ids,
             &peer.group_membership_digest,
-            peer.applied_log_id,
-            &peer.state_digest,
-            &peer.snapshot_checksum,
+            (peer.applied_log_id, peer.min_consensus_index),
+            (&peer.state_digest, &peer.snapshot_checksum),
             &peer.cutpoint_attestations,
         )?;
         let cut = ExpectedGroupCursorCut::from_verified_snapshot(peer.group_id, &peer.snapshot)?;
