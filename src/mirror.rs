@@ -44,6 +44,7 @@ pub async fn open(config: Config, pool: Pool) -> Result<Arc<AppState>> {
         &std::env::var("ROOTYARD_PRIMARY_URL")
             .context("ROOTYARD_PRIMARY_URL is required for a read mirror")?,
     )?;
+    crate::db::verify_mirror_database_available(&pool).await?;
     let storage = Storage::open_mirror(&config)?;
     // Read replicas never migrate, repair, provision, reconcile, or run workers.
     pool.get()
