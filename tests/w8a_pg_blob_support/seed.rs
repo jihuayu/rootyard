@@ -392,13 +392,16 @@ pub fn copy_tree(source: &Path, target: &Path) -> Result<()> {
     std::fs::create_dir_all(target)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
+        let entry_path = entry.path();
         let destination = target.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &destination)?;
+            copy_tree(&entry_path, &destination)?;
         } else {
-            std::fs::copy(entry.path(), &destination)?;
+            std::fs::copy(&entry_path, &destination)?;
+            std::fs::set_permissions(&destination, std::fs::symlink_metadata(&entry_path)?.permissions())?;
         }
     }
+    std::fs::set_permissions(target, std::fs::symlink_metadata(source)?.permissions())?;
     Ok(())
 }
 pub fn pool_for(url: &str) -> Result<Pool> {
