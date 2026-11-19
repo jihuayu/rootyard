@@ -488,6 +488,38 @@ class BusyWitnessSourceContractTest(unittest.TestCase):
         self.assertIn("One bounded append-only write", block)
         self.assertNotIn("while (", block)
 
+    def test_mountinfo_reader_requires_eof_cap_and_final_newline(self):
+        text = self.SOURCE.read_text(encoding="utf-8")
+        block = self._block(text, "static void mount_identity")
+        for token in (
+                "malloc(WITNESS_MAX_MOUNTINFO + 1)",
+                "while (used <= WITNESS_MAX_MOUNTINFO)",
+                "WITNESS_MAX_MOUNTINFO + 1 - used",
+                "eof = 1",
+                "if (!eof || used == 0 || used > WITNESS_MAX_MOUNTINFO",
+                "buffer[used - 1] != '\\n'",
+                "if (newline == NULL)",
+                "errno = saved_errno"):
+            self.assertIn(token, block)
+        self.assertNotIn("malloc(WITNESS_MAX_MOUNTINFO);", block)
+
+    def test_mountinfo_cap_model_rejects_non_eof_and_torn_snapshot(self):
+        # The C reader is not executable locally.  This model mirrors its
+        # pre-parse acceptance rule: EOF observed, non-empty, within cap, and
+        # a complete final row terminator.
+        def complete(data, cap):
+            return 0 < len(data) <= cap and data.endswith(b"\n")
+
+        cap = 16
+        self.assertTrue(complete(b"row\n", cap))
+        self.assertFalse(complete(b"row", cap))
+        self.assertFalse(complete(b"", cap))
+        exact = b"x" * (cap - 1) + b"\n"
+        self.assertEqual(len(exact), cap)
+        self.assertTrue(complete(exact, cap))
+        self.assertFalse(complete(b"x" * cap, cap))
+        self.assertFalse(complete(exact + b"y", cap))
+
     def test_helper_environment_is_prepared_and_pid_guarded(self):
         text = self.SOURCE.read_text(encoding="utf-8")
         self.assertIn("prepare_api_environment", text)

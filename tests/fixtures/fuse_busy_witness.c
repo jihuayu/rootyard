@@ -252,6 +252,8 @@ static int starts_with(const char *value, const char *prefix)
  */
 static void mount_identity(const char *target, uint64_t *mount_id, unsigned *owned)
 {
+    int saved_errno = errno;
+    int eof = 0;
     long descriptor = -1;
     char *buffer = NULL;
     size_t used = 0;
@@ -262,36 +264,50 @@ static void mount_identity(const char *target, uint64_t *mount_id, unsigned *own
     *mount_id = 0;
     *owned = 0;
     if (target == NULL || *target == '\0')
-        return;
+        goto out;
     descriptor = (long)syscall(SYS_openat, AT_FDCWD, "/proc/self/mountinfo",
                                O_RDONLY | O_CLOEXEC, 0);
     if (descriptor < 0)
-        return;
-    buffer = (char *)malloc(WITNESS_MAX_MOUNTINFO);
-    if (buffer == NULL) {
-        (void)syscall(SYS_close, descriptor);
-        return;
-    }
-    while (used < WITNESS_MAX_MOUNTINFO) {
-        ssize_t length = (ssize_t)syscall(SYS_read, descriptor, buffer + used,
-                                          WITNESS_MAX_MOUNTINFO - used);
-        if (length == 0)
+        goto out;
+    buffer = (char *)malloc(WITNESS_MAX_MOUNTINFO + 1);
+    if (buffer == NULL)
+        goto out;
+    while (used <= WITNESS_MAX_MOUNTINFO) {
+        ssize_t length = (ssize_t)syscall(
+            SYS_read, descriptor, buffer + used,
+            WITNESS_MAX_MOUNTINFO + 1 - used);
+        if (length == 0) {
+            eof = 1;
             break;
+        }
         if (length < 0) {
             if (errno == EINTR)
                 continue;
-            used = 0;
-            break;
+            goto out;
         }
         used += (size_t)length;
     }
+    /*
+     * A capped, unterminated or non-EOF snapshot is structurally incomplete.
+     * Never attribute an identity from an unproved snapshot.
+     */
+    if (!eof || used == 0 || used > WITNESS_MAX_MOUNTINFO
+        || buffer[used - 1] != '\n')
+        goto out;
     (void)syscall(SYS_close, descriptor);
+    descriptor = -1;
     target_length = strlen(target);
     line = buffer;
     end = buffer + used;
-    while (line < end && used > 0) {
+    while (line < end) {
         char *newline = (char *)memchr(line, '\n', (size_t)(end - line));
-        char *line_end = newline != NULL ? newline : end;
+        char *line_end = NULL;
+        if (newline == NULL) {
+            *mount_id = 0;
+            *owned = 0;
+            break;
+        }
+        line_end = newline;
         char *field_end = line;
         unsigned long long id = 0;
         int numeric = line < line_end;
@@ -371,11 +387,13 @@ static void mount_identity(const char *target, uint64_t *mount_id, unsigned *own
                 *owned = is_owned;
             }
         }
-        if (newline == NULL)
-            break;
         line = newline + 1;
     }
+out:
+    if (descriptor >= 0)
+        (void)syscall(SYS_close, descriptor);
     free(buffer);
+    errno = saved_errno;
 }
 
 static int (*real_umount2)(const char *, int) = NULL;
