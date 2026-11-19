@@ -237,6 +237,26 @@ impl SafeGcRepoTrustConfig {
         quorum_threshold: usize,
         trusted_consensus_voters: Vec<TrustedConsensusVoter>,
     ) -> Result<(Self, JournalMigrationReport), SafeGcError> {
+        Self::migrate_legacy_trust_and_journal_with_boundary_hook(
+            storage_root,
+            journal_path,
+            repo_id,
+            quorum_threshold,
+            trusted_consensus_voters,
+            || Ok(()),
+        )
+    }
+
+    /// Migrate legacy trust plus its journal, invoking `after_trust_before_journal` at the crash boundary.
+    #[doc(hidden)]
+    pub fn migrate_legacy_trust_and_journal_with_boundary_hook(
+        storage_root: &Path,
+        journal_path: &Path,
+        repo_id: Uuid,
+        quorum_threshold: usize,
+        trusted_consensus_voters: Vec<TrustedConsensusVoter>,
+        after_trust_before_journal: impl FnOnce() -> Result<(), SafeGcError>,
+    ) -> Result<(Self, JournalMigrationReport), SafeGcError> {
         let config =
             migration::prepare_migrated_trust(storage_root, repo_id, quorum_threshold, trusted_consensus_voters)?;
         if !journal_path.exists() {
@@ -273,6 +293,7 @@ impl SafeGcRepoTrustConfig {
         }
         snap.push_audit("migrate_legacy_distributed_journal", &repo_id.to_string());
         migration::commit_migrated_trust(storage_root, &config)?;
+        after_trust_before_journal()?;
         persist_snapshot(journal_path, &snap)?;
         Ok((config, report_from_snapshot(&snap, true)))
     }

@@ -51,8 +51,10 @@ RUST_FILES = [
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_dist_migration.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_dist_migration_fixtures.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_reconcile.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "tests_voter_tls.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_service.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_tls.rs",
+    ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_merge_backend.rs",
     ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_writer.rs",
     ROOT / "src" / "bin" / "rootyard-safe-gc-voter.rs",
     ROOT / "tests" / "storage_safe_gc.rs",
@@ -109,6 +111,7 @@ class StorageSafeGcContractsTest(unittest.TestCase):
             "dist_trust_migration.rs",
             "voter_service.rs",
             "voter_tls.rs",
+            "voter_merge_backend.rs",
             "voter_writer.rs",
         ):
             src = (ROOT / "src" / "storage_lifecycle" / "safe_gc" / name).read_text(encoding="utf-8")
@@ -270,6 +273,38 @@ class StorageSafeGcContractsTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("request_voter_https", voter_auth_cases)
         self.assertIn("foreign_voter_client_auth", voter_auth_cases)
+        self.assertIn("same_ca_voter_client_auth_with_san", voter_auth_cases)
+
+        merge_backend = (
+            ROOT / "src" / "storage_lifecycle" / "safe_gc" / "voter_merge_backend.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pub struct SafeGcRaftMergeBackend", merge_backend)
+        self.assertIn("impl MergeAuthorityBackend for SafeGcRaftMergeBackend", merge_backend)
+        raft_backend = (
+            ROOT / "tests" / "storage_safe_gc_support" / "raft_merge_backend.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("SafeGcRaftMergeBackend", raft_backend)
+        for forbidden in (
+            "map_commit_receipt_to_outcome",
+            "map_sm_error_to_outcome",
+            "OperationLookup",
+            "AtomicBool",
+        ):
+            self.assertNotIn(forbidden, raft_backend, f"raft_merge_backend.rs still duplicates {forbidden}")
+        self.assertIn("pub struct SafeGcRaftCommitWriterConfig", writer)
+        self.assertIn("pub fn from_config_file", writer)
+        self.assertIn("slot_lock", writer)
+        self.assertIn("pub allowed_client_san: String", voter_service)
+        self.assertIn("extract_x509_dns_sans", transport)
+        self.assertIn("peer_cert_matches_allowed_san", transport)
+        self.assertIn("--version", voter_bin)
+        self.assertIn(
+            "RUN test -x /usr/local/bin/rootyard-safe-gc-voter "
+            "&& /usr/local/bin/rootyard-safe-gc-voter --version",
+            dockerfile,
+        )
+        self.assertIn("migrate_legacy_trust_and_journal_with_boundary_hook", journal_migration)
+        self.assertIn("migrate_legacy_trust_and_journal_with_boundary_hook", migration_cases)
 
     def test_workflow_and_doc_contracts(self) -> None:
         wf_raw = WORKFLOW.read_bytes()

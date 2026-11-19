@@ -1,8 +1,20 @@
 //! Real 3-node mTLS `raft-node` cluster with three deployed `rootyard-safe-gc-voter` OS processes (#122).
-//!
-//! Each voter process holds exactly one replica connection, replays committed `pm/*` entries from
-//! ONLY its own replica, and signs its own Ed25519 cutpoint attestation. Tests never hold a voter.
-
+use super::dist_auth_harness::publish_live_voter_auth;
+use anyhow::{Context, Result, bail, ensure};
+use rootyard::{
+    ref_store::core::state_machine::{
+        AppliedLogId, ApplyResponse, RefCasCommand, RefCasStateMachine, StateMachineError,
+    },
+    storage_lifecycle::safe_gc::{
+        SafeGcEd25519Signer, SafeGcRaftCommitWriter, SafeGcRaftCommitWriterConfig, TrustedConsensusVoter,
+        voter_service::{
+            MtlsReplicaEndpoint, SafeGcVoterClientAuth, SafeGcVoterReadyReceipt, SafeGcVoterServiceConfig,
+            build_mtls_client_config, raft_mtls_rpc, replay_raft_replica,
+        },
+        voter_writer::SafeGcRaftReplicaConfig,
+    },
+};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
@@ -12,33 +24,16 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-
-use anyhow::{Context, Result, bail, ensure};
-use rootyard::{
-    ref_store::core::state_machine::{
-        AppliedLogId, ApplyResponse, RefCasCommand, RefCasStateMachine, StateMachineError,
-    },
-    storage_lifecycle::safe_gc::{
-        SafeGcEd25519Signer, SafeGcRaftCommitWriter, TrustedConsensusVoter,
-        voter_service::{
-            MtlsReplicaEndpoint, ReplicaReplay, SafeGcVoterClientAuth, SafeGcVoterReadyReceipt,
-            SafeGcVoterServiceConfig, build_mtls_client_config, raft_mtls_rpc, replay_raft_replica,
-        },
-    },
-};
-use serde_json::{Value, json};
 use tempfile::TempDir;
-
-use super::dist_auth_harness::publish_live_voter_auth;
 
 pub const RAFT_NODE_BIN_ENV: &str = "ROOTYARD_REFCAS_NODE_BIN";
 pub const SAFE_GC_VOTER_BIN_ENV: &str = "ROOTYARD_SAFE_GC_VOTER_BIN";
 const VOTER_KEY_ID: u8 = 1;
 const VOTER_SEEDS: [[u8; 32]; 3] = [[0x71; 32], [0x72; 32], [0x73; 32]];
 const VOTER_DNS: &str = "safe-gc-voter.refcas.internal";
+const WORKER_CLIENT_SAN: &str = "safe-gc-worker.refcas.internal";
 const VOTER_AUTH_TOKEN: &str = "9f2c4d7a1b6e8c0d3a5f7b9e1c2d4f6a8b0c1d3e5f7a9b2c4d6e8f0a1b3c5d7e";
 
-/// Resolve the multi-process `raft-node` binary, or `Ok(None)` when optional tests may skip.
 pub fn resolve_raft_node_bin() -> Result<Option<PathBuf>> {
     let required = std::env::var_os("ROOTYARD_SAFE_GC_REQUIRE_PG").is_some();
     let candidate = std::env::var_os(RAFT_NODE_BIN_ENV)
@@ -52,7 +47,6 @@ pub fn resolve_raft_node_bin() -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Resolve the deployed `rootyard-safe-gc-voter` binary, or `Ok(None)` when optional tests may skip.
 pub fn resolve_voter_bin() -> Result<Option<PathBuf>> {
     let required = std::env::var_os("ROOTYARD_SAFE_GC_REQUIRE_PG").is_some();
     let mut candidates = Vec::new();
@@ -143,10 +137,6 @@ impl MtlsNode {
     }
 }
 
-async fn replay_node(node: &MtlsNode) -> Result<ReplicaReplay> {
-    Ok(replay_raft_replica(&node.endpoint).await?)
-}
-
 struct VoterProcess {
     voter_id: u64,
     bin: PathBuf,
@@ -179,8 +169,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn write_voter_config(path: &Path, config: &SafeGcVoterServiceConfig) -> Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(config)?)?;
-    Ok(())
+    Ok(fs::write(path, serde_json::to_vec_pretty(config)?)?)
 }
 
 fn launch_voter(voter: &VoterProcess) -> Result<(Child, SafeGcVoterReadyReceipt)> {
@@ -224,6 +213,7 @@ pub struct LiveRaftVoterCluster {
     nodes: BTreeMap<u64, Arc<MtlsNode>>,
     voters: BTreeMap<u64, VoterProcess>,
     writer: SafeGcRaftCommitWriter,
+    writer_config_path: PathBuf,
 }
 
 fn run_ssl(dir: &Path, args: &str) -> Result<()> {
@@ -291,9 +281,25 @@ impl LiveRaftVoterCluster {
             ensure!(node.rpc(json!({ "UpdatePeers": { "peers": peers } })).await? == json!("Ok"));
         }
         ensure!(nodes[&1].rpc(json!({ "Bootstrap": { "members": peers } })).await? == json!("Ok"));
-        let replicas = nodes.iter().map(|(id, node)| (*id, node.endpoint.clone())).collect();
-        let writer = SafeGcRaftCommitWriter::new(replicas, Duration::from_secs(20))?;
-        let mut cluster = Self { _pki: pki, _data: data, nodes, voters: BTreeMap::new(), writer };
+        let writer_config_path = data.path().join("writer-config.json");
+        let replicas = nodes
+            .iter()
+            .map(|(id, node)| SafeGcRaftReplicaConfig {
+                replica_id: *id,
+                addr: node.endpoint.addr.clone(),
+                server_name: node.endpoint.server_name.clone(),
+            })
+            .collect();
+        let writer_config = SafeGcRaftCommitWriterConfig {
+            ca_cert_pem: pki.path().join("ca.crt"),
+            client_cert_pem: pki.path().join("cli.crt"),
+            client_key_pem: pki.path().join("cli.key"),
+            write_timeout_ms: 20_000,
+            replicas,
+        };
+        fs::write(&writer_config_path, serde_json::to_vec_pretty(&writer_config)?)?;
+        let writer = SafeGcRaftCommitWriter::from_config_file(&writer_config_path)?;
+        let mut cluster = Self { _pki: pki, _data: data, nodes, voters: BTreeMap::new(), writer, writer_config_path };
         let _ = cluster.writer.wait_active_leader().await?;
         cluster.spawn_voters(&voter_bin)?;
         Ok(cluster)
@@ -334,6 +340,7 @@ impl LiveRaftVoterCluster {
                 listener_server_cert_pem: pki.join(format!("vs{voter_id}.crt")),
                 listener_server_key_pem: pki.join(format!("vs{voter_id}.key")),
                 listener_auth_token_path: pki.join("voter-auth.token"),
+                allowed_client_san: WORKER_CLIENT_SAN.to_owned(),
                 rpc_timeout_ms: 5_000,
             };
             write_voter_config(&voter.config_path, &config)?;
@@ -351,7 +358,6 @@ impl LiveRaftVoterCluster {
         Ok(())
     }
 
-    /// Pinned mTLS + `0600` Bearer credentials the worker uses to poll these three voter listeners.
     pub fn voter_client_auth(&self) -> SafeGcVoterClientAuth {
         let pki = self._pki.path();
         SafeGcVoterClientAuth {
@@ -363,7 +369,35 @@ impl LiveRaftVoterCluster {
         }
     }
 
-    /// Mint a client certificate from an unrelated CA to prove the listener's mTLS verifier rejects it.
+    pub fn commit_writer(&self) -> SafeGcRaftCommitWriter {
+        self.writer.clone()
+    }
+
+    pub fn writer_config_path(&self) -> &Path {
+        &self.writer_config_path
+    }
+
+    pub fn same_ca_voter_client_auth_with_san(&self, stem: &str, dns_san: &str) -> Result<SafeGcVoterClientAuth> {
+        let pki = self._pki.path();
+        sign_cert(pki, stem, stem, "clientAuth", &format!("DNS:{dns_san}"))?;
+        Ok(SafeGcVoterClientAuth {
+            ca_cert_pem: pki.join("ca.crt"),
+            client_cert_pem: pki.join(format!("{stem}.crt")),
+            client_key_pem: pki.join(format!("{stem}.key")),
+            server_name: VOTER_DNS.to_owned(),
+            auth_token_path: pki.join("voter-auth.token"),
+        })
+    }
+
+    pub async fn inject_uncoordinated_slot_value(&self, slot: u64, value: &str) -> Result<()> {
+        let (leader_id, _term) = self.writer.wait_active_leader().await?;
+        let put = json!({ "Put": { "key": format!("pm/{slot:08}"), "value": value } });
+        let payload = serde_json::to_vec(&put)?;
+        let response = self.nodes[&leader_id].rpc(json!({ "ClientWrite": { "payload": payload } })).await?;
+        ensure!(response.get("Error").is_none(), "uncoordinated ClientWrite failed: {response}");
+        Ok(())
+    }
+
     pub fn foreign_voter_client_auth(&self, foreign: &Path) -> Result<SafeGcVoterClientAuth> {
         run_ssl(
             foreign,
@@ -419,7 +453,6 @@ impl LiveRaftVoterCluster {
         self.voters.iter().filter(|(_, voter)| voter.child.is_some()).map(|(id, _)| *id).collect()
     }
 
-    /// Append one command to the next `pm/*` slot through the production committed writer.
     pub async fn append(
         &mut self,
         command: &RefCasCommand,
@@ -428,7 +461,7 @@ impl LiveRaftVoterCluster {
     }
 
     pub async fn state_machine(&self) -> Result<RefCasStateMachine> {
-        Ok(replay_node(&self.nodes[&1]).await?.sm)
+        Ok(replay_raft_replica(&self.nodes[&1].endpoint).await?.sm)
     }
 }
 

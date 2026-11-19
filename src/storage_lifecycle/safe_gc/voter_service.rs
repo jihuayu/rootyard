@@ -70,6 +70,7 @@ pub struct SafeGcVoterServiceConfig {
     pub listener_server_cert_pem: PathBuf,
     pub listener_server_key_pem: PathBuf,
     pub listener_auth_token_path: PathBuf,
+    pub allowed_client_san: String,
     #[serde(default = "default_voter_rpc_timeout_ms")]
     pub rpc_timeout_ms: u64,
 }
@@ -78,6 +79,14 @@ impl SafeGcVoterServiceConfig {
     pub fn validate(&self) -> Result<(), SafeGcError> {
         if self.voter_id == 0 || self.key_id == 0 || self.group_id < 0 {
             return Err(SafeGcError::ArmingRejected("safe-gc voter identity is invalid"));
+        }
+        if self.allowed_client_san.trim().is_empty()
+            || self.allowed_client_san.contains('*')
+            || self.allowed_client_san.chars().any(char::is_whitespace)
+        {
+            return Err(SafeGcError::ArmingRejected(
+                "safe-gc voter allowed_client_san must be a non-wildcard DNS name",
+            ));
         }
         if !(100..=60_000).contains(&self.rpc_timeout_ms) {
             return Err(SafeGcError::ArmingRejected("safe-gc voter rpc_timeout_ms is out of bounds"));

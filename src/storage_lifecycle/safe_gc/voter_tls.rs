@@ -1,9 +1,4 @@
-//! Authenticated mTLS HTTPS transport and `0600` Bearer-token boundary for `rootyard-safe-gc-voter` (#122).
-//!
-//! Every connection must present a CA-signed client certificate and the pinned Bearer token.
-//! Header and body reads are bounded, `into_std()` sockets are forced back to blocking mode, and
-//! every response is written on a bounded blocking worker.
-
+//! Authenticated mTLS HTTPS transport plus bounded DER SAN extraction for `rootyard-safe-gc-voter` (#122).
 use std::{
     fs::File,
     io::{BufReader, Read, Write},
@@ -32,6 +27,8 @@ const MIN_BEARER_TOKEN_BYTES: usize = 32;
 const MAX_CONNECTIONS: usize = 32;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const HEADER_END: &[u8] = b"\r\n\r\n";
+const MAX_PEER_CERT_DER_BYTES: usize = 64 * 1024;
+const SAN_OID: &[u8] = &[0x55, 0x1d, 0x11];
 
 fn io_error(err: impl std::fmt::Display) -> SafeGcError {
     SafeGcError::Io(err.to_string())
@@ -87,7 +84,128 @@ pub fn constant_time_bearer_eq(expected: &[u8], auth_header: Option<&str>) -> bo
     diff == 0 && !expected.is_empty()
 }
 
-/// Build the listener verifier that demands a CA-signed client certificate on every connection.
+fn read_der_tlv(input: &[u8]) -> Result<(u8, &[u8], &[u8]), SafeGcError> {
+    let malformed = || SafeGcError::Serialization("X.509 DER length is malformed".into());
+    let (&tag, rest) = input.split_first().ok_or_else(malformed)?;
+    let (&first, rest) = rest.split_first().ok_or_else(malformed)?;
+    if first == 0x80 {
+        return Err(malformed());
+    }
+    let (len, rest) = if first & 0x80 == 0 {
+        (usize::from(first), rest)
+    } else {
+        let count = usize::from(first & 0x7f);
+        if count == 0 || count > 4 {
+            return Err(malformed());
+        }
+        let (bytes, tail) = rest.split_at_checked(count).ok_or_else(malformed)?;
+        if bytes[0] == 0 {
+            return Err(malformed());
+        }
+        let len = bytes.iter().fold(0_usize, |acc, byte| (acc << 8) | usize::from(*byte));
+        if len < 128 {
+            return Err(malformed());
+        }
+        (len, tail)
+    };
+    let (value, trailing) = rest.split_at_checked(len).ok_or_else(malformed)?;
+    Ok((tag, value, trailing))
+}
+
+pub fn extract_x509_dns_sans(cert_der: &[u8]) -> Result<Vec<String>, SafeGcError> {
+    if cert_der.is_empty() || cert_der.len() > MAX_PEER_CERT_DER_BYTES {
+        return Err(SafeGcError::Serialization("peer certificate DER size is invalid".into()));
+    }
+    let (tag, cert, trailing) = read_der_tlv(cert_der)?;
+    if tag != 0x30 || !trailing.is_empty() {
+        return Err(SafeGcError::Serialization("peer certificate is not a single X.509 SEQUENCE".into()));
+    }
+    let (tag, tbs, _) = read_der_tlv(cert)?;
+    if tag != 0x30 {
+        return Err(SafeGcError::Serialization("X.509 tbsCertificate is not a SEQUENCE".into()));
+    }
+    let mut rest = tbs;
+    let (version_tag, _, version_rest) = read_der_tlv(rest)?;
+    if version_tag == 0xa0 {
+        rest = version_rest;
+    }
+    for expected in [0x02_u8, 0x30, 0x30, 0x30, 0x30, 0x30] {
+        let (field_tag, _, field_rest) = read_der_tlv(rest)?;
+        if field_tag != expected {
+            return Err(SafeGcError::Serialization("X.509 tbsCertificate field order is invalid".into()));
+        }
+        rest = field_rest;
+    }
+    let mut dns_sans = Vec::new();
+    let mut saw_san_ext = false;
+    while !rest.is_empty() {
+        let (tag, value, next) = read_der_tlv(rest)?;
+        rest = next;
+        if tag != 0xa3 {
+            continue;
+        }
+        let (ext_tag, extensions, ext_trailing) = read_der_tlv(value)?;
+        if ext_tag != 0x30 || !ext_trailing.is_empty() {
+            return Err(SafeGcError::Serialization("X.509 extensions are not a SEQUENCE".into()));
+        }
+        let mut ext_rest = extensions;
+        while !ext_rest.is_empty() {
+            let (ext_seq_tag, extension, next) = read_der_tlv(ext_rest)?;
+            ext_rest = next;
+            if ext_seq_tag != 0x30 {
+                return Err(SafeGcError::Serialization("X.509 extension is not a SEQUENCE".into()));
+            }
+            let (oid_tag, oid, oid_rest) = read_der_tlv(extension)?;
+            if oid_tag != 0x06 {
+                return Err(SafeGcError::Serialization("X.509 extension OID is invalid".into()));
+            }
+            let (mut value_tag, mut ext_value, mut value_rest) = read_der_tlv(oid_rest)?;
+            if value_tag == 0x01 {
+                let (next_tag, next_value, next_rest) = read_der_tlv(value_rest)?;
+                value_tag = next_tag;
+                ext_value = next_value;
+                value_rest = next_rest;
+            }
+            if value_tag != 0x04 || !value_rest.is_empty() {
+                return Err(SafeGcError::Serialization("X.509 extension value is invalid".into()));
+            }
+            if oid != SAN_OID {
+                continue;
+            }
+            if saw_san_ext {
+                return Err(SafeGcError::Serialization("duplicate subjectAltName extension".into()));
+            }
+            saw_san_ext = true;
+            let (gn_tag, general_names, gn_trailing) = read_der_tlv(ext_value)?;
+            if gn_tag != 0x30 || !gn_trailing.is_empty() {
+                return Err(SafeGcError::Serialization("X.509 subjectAltName is not a SEQUENCE".into()));
+            }
+            let mut gn_rest = general_names;
+            while !gn_rest.is_empty() {
+                let (gn_tag, gn_value, gn_next) = read_der_tlv(gn_rest)?;
+                gn_rest = gn_next;
+                if gn_tag != 0x82 {
+                    continue;
+                }
+                if gn_value.is_empty() || !gn_value.iter().all(|byte| byte.is_ascii() && !byte.is_ascii_control()) {
+                    return Err(SafeGcError::Serialization("X.509 dNSName SAN is invalid".into()));
+                }
+                dns_sans.push(
+                    std::str::from_utf8(gn_value)
+                        .map_err(|_| SafeGcError::Serialization("X.509 dNSName SAN is not UTF-8".into()))?
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    Ok(dns_sans)
+}
+
+pub fn peer_cert_matches_allowed_san(cert_der: &[u8], allowed_client_san: &str) -> bool {
+    !allowed_client_san.is_empty()
+        && extract_x509_dns_sans(cert_der).is_ok_and(|sans| sans.iter().any(|san| san.as_str() == allowed_client_san))
+}
+
 pub fn build_mtls_server_config(
     ca_cert_pem: &Path,
     server_cert_pem: &Path,
@@ -163,7 +281,7 @@ fn parse_http_request(header: &[u8]) -> Result<(String, String, Option<String>),
 fn read_tls_request(
     stream: tokio::net::TcpStream,
     server_config: Arc<ServerConfig>,
-) -> Result<(ServerTlsStream, String, String, Option<String>), SafeGcError> {
+) -> Result<(ServerTlsStream, String, String, Option<String>, Option<Vec<u8>>), SafeGcError> {
     let std_stream = stream.into_std().map_err(io_error)?;
     std_stream.set_nonblocking(false).map_err(io_error)?;
     std_stream.set_read_timeout(Some(CONNECTION_TIMEOUT)).map_err(io_error)?;
@@ -171,8 +289,9 @@ fn read_tls_request(
     let connection = ServerConnection::new(server_config).map_err(io_error)?;
     let mut tls = StreamOwned::new(connection, std_stream);
     let (header, _body) = read_http_header(&mut tls)?;
+    let leaf_der = tls.conn.peer_certificates().and_then(|certs| certs.first()).map(|cert| cert.as_ref().to_vec());
     let (method, path, auth_header) = parse_http_request(&header)?;
-    Ok((tls, method, path, auth_header))
+    Ok((tls, method, path, auth_header, leaf_der))
 }
 
 fn write_tls_response(
@@ -196,10 +315,14 @@ fn write_tls_response(
 async fn dispatch_https_request(
     state: &VoterState,
     expected_token: &[u8],
+    leaf_cert_der: Option<&[u8]>,
     method: &str,
     path: &str,
     auth_header: Option<&str>,
 ) -> (u16, &'static str, Vec<u8>) {
+    if !leaf_cert_der.is_some_and(|der| peer_cert_matches_allowed_san(der, &state.config.allowed_client_san)) {
+        return (403, "Forbidden", br#"{"error":"client certificate SAN not authorized"}"#.to_vec());
+    }
     if !constant_time_bearer_eq(expected_token, auth_header) {
         return (401, "Unauthorized", br#"{"error":"unauthorized"}"#.to_vec());
     }
@@ -225,9 +348,10 @@ async fn handle_https_connection(
     server_config: Arc<ServerConfig>,
 ) -> Result<(), SafeGcError> {
     let request = tokio::task::spawn_blocking(move || read_tls_request(stream, server_config));
-    let (tls, method, path, auth_header) = request.await.map_err(io_error)??;
+    let (tls, method, path, auth_header, leaf_der) = request.await.map_err(io_error)??;
     let header = auth_header.as_deref();
-    let (code, reason, body) = dispatch_https_request(&state, &expected_token, &method, &path, header).await;
+    let (code, reason, body) =
+        dispatch_https_request(&state, &expected_token, leaf_der.as_deref(), &method, &path, header).await;
     tokio::task::spawn_blocking(move || write_tls_response(tls, code, reason, &body)).await.map_err(io_error)??;
     Ok(())
 }
@@ -354,3 +478,7 @@ pub async fn request_voter_https(
         .await
         .map_err(io_error)?
 }
+
+#[cfg(test)]
+#[path = "tests_voter_tls.rs"]
+mod tests;

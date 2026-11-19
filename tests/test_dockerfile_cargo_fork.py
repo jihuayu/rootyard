@@ -71,7 +71,14 @@ class DockerfileCargoForkTest(unittest.TestCase):
         ]
         self.assertEqual(
             copy_lines,
-            ["COPY --from=build /build/target/release/rootyard /usr/local/bin/rootyard"],
+            [
+                "COPY --from=build /build/target/release/rootyard /usr/local/bin/rootyard",
+                "COPY --from=build /build/target/release/rootyard-safe-gc-voter /usr/local/bin/rootyard-safe-gc-voter",
+            ],
+        )
+        self.assertIn(
+            "RUN test -x /usr/local/bin/rootyard-safe-gc-voter && /usr/local/bin/rootyard-safe-gc-voter --version",
+            self.runtime_stage,
         )
 
     def test_helper_is_in_the_build_context(self) -> None:

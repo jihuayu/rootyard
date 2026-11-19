@@ -96,4 +96,4 @@ pub use quiescence::{ActiveReaderLease, ReaderLeaseRegistry, ReaderQuiescenceObs
 pub use refcas_cut::{RefCasReconciledCut, reconcile_refcas_cut_with_pg};
 pub use store::{DurableSafeGcAuthority, SafeGcRepoSnapshot, ServingPackRecord};
 pub use voter_service::{SafeGcVoterReadyReceipt, SafeGcVoterServiceConfig, serve_safe_gc_voter};
-pub use voter_writer::SafeGcRaftCommitWriter;
+pub use voter_writer::{SafeGcRaftCommitWriter, SafeGcRaftCommitWriterConfig, SafeGcRaftMergeBackend};

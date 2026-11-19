@@ -113,6 +113,17 @@ pub(super) fn prepare_migrated_trust(
     let bytes =
         read_private_file(&SafeGcRepoTrustConfig::config_path(storage_root, repo_id), MAX_TRUST_DOCUMENT_BYTES)?;
     let pinned = pinned_trust(&bytes, repo_id)?;
+    if pinned.quorum_threshold.is_some() || !pinned.trusted_consensus_voters.is_empty() {
+        pinned.validate_identity()?;
+        if pinned.quorum_threshold != Some(quorum_threshold)
+            || pinned.trusted_consensus_voters != trusted_consensus_voters
+        {
+            return Err(SafeGcError::ArmingRejected(
+                "migrated safe-gc trust bundle pins disagree with retry voter configuration",
+            ));
+        }
+        return Ok(pinned);
+    }
     let config = SafeGcRepoTrustConfig {
         repo_id,
         tenant_id: pinned.tenant_id,

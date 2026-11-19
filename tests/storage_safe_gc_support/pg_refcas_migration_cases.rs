@@ -228,6 +228,36 @@ async fn pg17_legacy_distributed_journal_migration_and_deployed_voter_rearm_resu
     assert!(retired.iter().all(|locator| s3.has_key(locator)), "the legacy cold runtime must keep every locator");
 
     // Step 4: migrate trust + journal under the deployed voters and bind the mTLS Bearer boundary.
+    let crash_err = SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal_with_boundary_hook(
+        &storage_root,
+        &journal,
+        repo_id,
+        2,
+        trusted_voters.clone(),
+        || Err(SafeGcError::Io("simulated crash after trust commit before journal persist".into())),
+    )
+    .unwrap_err();
+    assert!(matches!(crash_err, SafeGcError::Io(_)));
+    assert_eq!(SafeGcRepoTrustConfig::load(&storage_root, repo_id)?.quorum_threshold, Some(2));
+    assert!(matches!(
+        DurableSafeGcAuthority::open_with_journal(&journal, None),
+        Err(SafeGcError::ArmingRejected(
+            "legacy DistributedRefCas journal snapshot requires explicit migration and safe re-arm"
+        ))
+    ));
+    pool.get()
+        .await?
+        .execute("UPDATE storage_maintenance_repo_state SET last_scan_at = NULL WHERE repository_id = $1", &[&repo_id])
+        .await?;
+    let half_pid = pg_child_worker::spawn_cold_runtime_no_delete_child(root, db, &schema, repo_id, &envs).await?;
+    assert_ne!(half_pid, std::process::id(), "the half-migrated probe must run in a separate OS process");
+    assert_ne!(half_pid, cold, "each cold probe must run in its own OS process");
+    assert_eq!(
+        s3.state.delete_requests.load(Ordering::SeqCst),
+        deletes_before_cold,
+        "a half-migrated trust/journal boundary must not delete"
+    );
+    assert!(retired.iter().all(|locator| s3.has_key(locator)), "the half-migrated probe must keep every locator");
     let (mut trust, report) =
         SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal(&storage_root, &journal, repo_id, 2, trusted_voters)?;
     let auth = cluster.lock().await.voter_client_auth();

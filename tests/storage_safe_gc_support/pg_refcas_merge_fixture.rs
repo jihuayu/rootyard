@@ -26,7 +26,7 @@ use rootyard::{
         },
         projector::{DecisionGrantKeyring, GrantExpectedRealm, SignedDecisionGrantPayload},
     },
-    storage_lifecycle::{models::Policy, scheduler},
+    storage_lifecycle::{models::Policy, safe_gc::SafeGcRaftMergeBackend, scheduler},
 };
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
@@ -69,7 +69,8 @@ pub(super) async fn build_refcas_merge_rig(
     let fmt = GitObjectFormat::Sha1;
     let token_scope_id = Uuid::new_v4();
     let keyring = DecisionGrantKeyring::new([(1, Zeroizing::new([0x5a; 32]))], 1, BTreeSet::new()).unwrap();
-    let backend = LiveRaft3MergeBackend::new(cluster);
+    SafeGcRaftMergeBackend::from_config_file(cluster.lock().await.writer_config_path())?;
+    let backend = LiveRaft3MergeBackend::new(cluster.lock().await.commit_writer());
     let init = RefCasCommand::InitializeGate(InitializeGateCommand {
         gate: WireGateInit {
             repository_id: repo_id,
@@ -321,7 +322,7 @@ pub(super) async fn production_refcas_pr_merge(
         version: 1,
     });
     let (spec, pull) = build_refcas_merge_attempt(rig, base_oid, main_oid, main_oid, 1, 1, rig.token_scope_id).await?;
-    let merge_out = PullRemoteMergeProducer::new(&rig.backend, &merge_store, &rig.keyring)
+    let merge_out = PullRemoteMergeProducer::new(rig.backend.as_production(), &merge_store, &rig.keyring)
         .execute_merge(&spec, &pull, true, MergeFaultInjection::None)
         .await?;
     ensure!(matches!(merge_out, MergeAttemptOutcome::Committed(_)), "production Ref-CAS PR merge was not committed");

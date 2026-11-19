@@ -216,13 +216,84 @@ fn voter_service_config_validates_bounds_and_rejects_unknown_fields() {
         listener_server_cert_pem: PathBuf::from("vs1.crt"),
         listener_server_key_pem: PathBuf::from("vs1.key"),
         listener_auth_token_path: PathBuf::from("voter-auth.token"),
+        allowed_client_san: "safe-gc-worker.refcas.internal".into(),
         rpc_timeout_ms: 5_000,
     };
     config.validate().unwrap();
     let mut doc: Value = serde_json::to_value(&config).unwrap();
     doc["unexpected_field"] = json!(true);
     assert!(serde_json::from_value::<SafeGcVoterServiceConfig>(doc).is_err());
-    let mut invalid = config;
+    let mut invalid = config.clone();
     invalid.voter_id = 0;
     assert!(matches!(invalid.validate(), Err(SafeGcError::ArmingRejected(_))));
+    let mut empty_san = config.clone();
+    empty_san.allowed_client_san = String::new();
+    assert!(matches!(empty_san.validate(), Err(SafeGcError::ArmingRejected(_))));
+    let mut wildcard_san = config;
+    wildcard_san.allowed_client_san = "*.refcas.internal".into();
+    assert!(matches!(wildcard_san.validate(), Err(SafeGcError::ArmingRejected(_))));
+}
+
+#[test]
+fn boundary_crash_after_trust_commit_before_journal_persist_fails_closed_and_retries_cleanly() {
+    let root = tempdir().unwrap();
+    let (repo_id, tenant_id, history_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let (arm, bridge, backup) = (
+        SafeGcEd25519Signer::from_seed([0x41; 32]).unwrap(),
+        SafeGcEd25519Signer::from_seed([0x42; 32]).unwrap(),
+        SafeGcEd25519Signer::from_seed([0x43; 32]).unwrap(),
+    );
+    let authority = authority(tenant_id, repo_id, history_id, &arm);
+    let holds = vec![hold(&authority)];
+    let lane = dist_lane(&authority, &holds, &bridge, &backup);
+    let batch_id = Uuid::new_v4();
+    let snapshot = snapshot_with_pending(&authority, &lane, &holds, batch_id);
+    let journal = journal_path(root.path(), repo_id);
+    write_legacy_trust(root.path(), &authority, &arm, &bridge, &backup);
+    arm.write_seed_file(&SafeGcRepoTrustConfig::seed_path(root.path(), repo_id, "arm")).unwrap();
+    let doc = legacy_document(serde_json::to_value(&snapshot).unwrap());
+    let bytes = serde_json::to_vec_pretty(&doc).unwrap();
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    std::fs::write(&journal, &bytes).unwrap();
+
+    let err = SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal_with_boundary_hook(
+        root.path(),
+        &journal,
+        repo_id,
+        2,
+        voters(),
+        || Err(SafeGcError::Io("simulated crash after trust commit before journal persist".into())),
+    )
+    .unwrap_err();
+    assert!(matches!(err, SafeGcError::Io(_)));
+    let half = SafeGcRepoTrustConfig::load(root.path(), repo_id).unwrap();
+    assert_eq!(half.quorum_threshold, Some(2));
+    assert!(!SafeGcRepoTrustConfig::seed_path(root.path(), repo_id, "quorum").exists());
+    assert_eq!(std::fs::read(&journal).unwrap(), bytes, "crash must leave the legacy journal byte-identical");
+    assert!(matches!(
+        DurableSafeGcAuthority::open_with_journal(&journal, None),
+        Err(SafeGcError::ArmingRejected(
+            "legacy DistributedRefCas journal snapshot requires explicit migration and safe re-arm"
+        ))
+    ));
+    let mismatched: Vec<_> = voters().into_iter().rev().collect();
+    assert!(
+        SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal(root.path(), &journal, repo_id, 2, mismatched).is_err()
+    );
+    assert_eq!(std::fs::read(&journal).unwrap(), bytes, "a mismatched retry must not corrupt the journal");
+
+    let (trust, report) =
+        SafeGcRepoTrustConfig::migrate_legacy_trust_and_journal(root.path(), &journal, repo_id, 2, voters()).unwrap();
+    assert_eq!(trust.quorum_threshold, Some(2));
+    assert!(report.journal_migrated && report.disarmed_for_voter_rearm);
+    assert_eq!(report.preserved_pending_batch_id, Some(batch_id));
+    assert_eq!(report.preserved_deleted_keys, vec!["deleted-key".to_owned()]);
+    assert_eq!(report.preserved_pending_keys, vec!["pending-key".to_owned()]);
+    let opened = DurableSafeGcAuthority::open_with_journal(&journal, None).unwrap();
+    let snapshot = opened.snapshot();
+    assert_eq!(snapshot.gc_mode, GcMode::DisabledByDefault);
+    let batch = snapshot.pending_delete.as_ref().unwrap();
+    assert_eq!(batch.batch_id, batch_id);
+    assert_eq!(batch.deleted_keys, vec!["deleted-key".to_owned()]);
+    assert_eq!(batch.pending_keys, vec!["pending-key".to_owned()]);
 }
