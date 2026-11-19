@@ -9,7 +9,6 @@ use std::process::Command;
 use std::time::Duration;
 
 use deadpool_postgres::Pool;
-use tempfile::TempDir;
 use tokio::time::Instant;
 use tokio_postgres::{Client, Transaction};
 use uuid::Uuid;
@@ -39,8 +38,7 @@ use super::types::{ExpectedPackPairSpec, NewIncarnationAuthority, PairedBackupEr
 const GATES: &str = "SELECT g.repository_id, g.tenant_id, r.owner_id, g.object_format, \
      COALESCE(p.decision_required, false) FROM public.ref_store_core_gates g \
      JOIN public.repositories r ON r.id = g.repository_id \
-     LEFT JOIN public.ref_store_core_protocol_repos p ON p.repository_id = g.repository_id \
-     ORDER BY g.repository_id";
+     LEFT JOIN public.ref_store_core_protocol_repos p ON p.repository_id = g.repository_id ORDER BY g.repository_id";
 const REFS: &str = "SELECT ref_name, oid FROM public.ref_store_core_refs WHERE repository_id = $1 ORDER BY ref_name";
 const PACKS: &str = "SELECT m.pack_id, pa.sha256, pa.content_length, ia.sha256, ia.content_length \
      FROM public.ref_store_core_pack_memberships m \
@@ -200,13 +198,7 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
     let verifier = PackVerifier::new(target_store.clone(), dst_config.git.clone()).map_err(pack_error)?;
     let backend = target_store.backend_identity().clone();
     let mut rebound_packs: BTreeMap<Uuid, Vec<ExpectedPackPairSpec>> = BTreeMap::new();
-    let repack_root: Option<TempDir> = if captured.iter().any(|repo| {
-        !repo.active_packs.is_empty() && !repo.refs.is_empty() && repo.active_packs.len() > MAX_BATCH_NEW_PACKS
-    }) {
-        Some(tempfile::tempdir().map_err(PairedBackupError::Io)?)
-    } else {
-        None
-    };
+    let repack_root = captured.iter().any(needs_consolidation).then(RebindTempDir::create).transpose()?;
     for repo in captured {
         if repo.active_packs.is_empty() || repo.refs.is_empty() {
             continue;
@@ -217,7 +209,7 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
             let root = repack_root.as_ref().ok_or_else(|| {
                 PairedBackupError::StateMachine("restore pack consolidation workspace is missing".into())
             })?;
-            let repo_root = root.path().join(repo.repository_id.to_string());
+            let repo_root = root.0.join(repo.repository_id.to_string());
             vec![consolidate_packs_with_git(
                 &dst_config.git,
                 repo.object_format,
@@ -264,18 +256,8 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
         let mut expected_specs = Vec::with_capacity(packs_to_publish.len());
         for pack_file in &packs_to_publish {
             let (pack_id, registration_id) = (Uuid::new_v4(), Uuid::new_v4());
-            let pack_artifact = PlannedArtifact::new(
-                PackArtifactRole::Pack,
-                ContentDigest::parse(pack_file.pack_sha256.clone()).map_err(pack_error)?,
-                pack_file.pack_len,
-            )
-            .map_err(pack_error)?;
-            let idx_artifact = PlannedArtifact::new(
-                PackArtifactRole::Idx,
-                ContentDigest::parse(pack_file.idx_sha256.clone()).map_err(pack_error)?,
-                pack_file.idx_len,
-            )
-            .map_err(pack_error)?;
+            let pack_artifact = artifact(PackArtifactRole::Pack, &pack_file.pack_sha256, pack_file.pack_len)?;
+            let idx_artifact = artifact(PackArtifactRole::Idx, &pack_file.idx_sha256, pack_file.idx_len)?;
             planned_packs
                 .push(PlannedPack::new(pack_id, registration_id, pack_artifact, idx_artifact).map_err(pack_error)?);
             expected_specs.push(ExpectedPackPairSpec {
@@ -339,20 +321,13 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
                     "restore rebind A3 acquire replayed an existing request".into(),
                 ));
             };
-            let sources =
-                [UploadSource::new(pack_file.pack_path.as_path()), UploadSource::new(pack_file.idx_path.as_path())];
+            let sources = [UploadSource::new(&pack_file.pack_path), UploadSource::new(&pack_file.idx_path)];
             let publication = ProtectedUploader::new(target_store.clone())
                 .consume_and_upload(&rw_pool, grant, &sources, deadline.into_std())
                 .await
                 .map_err(|e| PairedBackupError::StateMachine(format!("restore rebind upload failed: {e}")))?;
-            PgPackCommit
-                .register_publication(
-                    client,
-                    PackRegistrationRequest::new(&plan, planned.pack_id(), &publication).map_err(pack_error)?,
-                    deadline,
-                )
-                .await
-                .map_err(pack_error)?;
+            let request = PackRegistrationRequest::new(&plan, planned.pack_id(), &publication).map_err(pack_error)?;
+            PgPackCommit.register_publication(client, request, deadline).await.map_err(pack_error)?;
         }
         let context = PgPackCommit.capture_context(client, &plan, deadline).await.map_err(pack_error)?;
         let proof = verifier.verify(&plan, &context, deadline.into_std()).await.map_err(pack_error)?;
@@ -466,4 +441,34 @@ fn ledger_error(error: ArtifactHoldError) -> PairedBackupError {
 
 fn pack_error(error: PackCommitError) -> PairedBackupError {
     PairedBackupError::StateMachine(format!("restored A4 new-realm rebind refused: {error}"))
+}
+
+fn artifact(role: PackArtifactRole, sha256: &str, len: u64) -> Result<PlannedArtifact, PairedBackupError> {
+    PlannedArtifact::new(role, ContentDigest::parse(sha256).map_err(pack_error)?, len).map_err(pack_error)
+}
+
+fn needs_consolidation(repo: &RestoredRepoCapture) -> bool {
+    !repo.active_packs.is_empty() && !repo.refs.is_empty() && repo.active_packs.len() > MAX_BATCH_NEW_PACKS
+}
+
+struct RebindTempDir(PathBuf);
+
+impl RebindTempDir {
+    fn create() -> Result<Self, PairedBackupError> {
+        let path = std::env::temp_dir().join(format!("rootyard-rebind-{}", Uuid::new_v4()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&path)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for RebindTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

@@ -47,8 +47,7 @@ pub(super) fn boot_record(
 /// backup closure holds, boot each peer group under a rotated realm, and verify every group's
 /// server-signed cutpoint while PostgreSQL and all Raft groups are still frozen.
 pub(super) fn boot_active_and_peer_mtls_raft_incarnation(
-    fmt30_dir: &Path,
-    work_dir: &Path,
+    (fmt30_dir, work_dir): (&Path, &Path),
     manifest: &Format30PairedManifest,
     inc: &NewIncarnationAuthority,
     boot_freeze: &DurableRaftFreezeRecord,

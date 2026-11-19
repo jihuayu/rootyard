@@ -92,8 +92,7 @@ pub async fn restore_and_boot_format30_new_incarnation(
             .await?;
     let boot_freeze = boot_record(&manifest, &inc, true, Uuid::new_v4(), None)?;
     let git_verified_refs = boot_active_and_peer_mtls_raft_incarnation(
-        &fmt30_dir,
-        work_dir,
+        (&fmt30_dir, work_dir),
         &manifest,
         &inc,
         &boot_freeze,
