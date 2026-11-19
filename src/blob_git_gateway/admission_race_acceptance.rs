@@ -1153,7 +1153,7 @@ fn consume_ready_push(
     drop(slot.take());
     match ready {
         Ok(Ok(output)) => Ok(output),
-        Ok(Ok(Err(_))) | Ok(Err(_)) => {
+        Ok(Err(_)) | Err(_) => {
             *join_unproven = true;
             Err(anyhow!("stock push task ended without a Git output proof"))
         }
