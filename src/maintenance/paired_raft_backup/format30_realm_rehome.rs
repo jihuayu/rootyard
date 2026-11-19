@@ -21,22 +21,26 @@ use crate::ref_store::core::artifact_hold::{
     PgArtifactHoldStore,
 };
 use crate::ref_store::core::pack_commit::{
-    ContentDigest, MAX_BATCH_NEW_PACKS, PackArtifactRole, PackCommitError, PackCommitExpectation, PackCommitPlan,
-    PackCommitScope, PackMembershipEntry, PackRegistrationRequest, PackVerifier, PgPackCommit, PlannedArtifact,
-    PlannedPack,
+    ContentDigest, MAX_PLAN_REFS, PackArtifactRole, PackCommitError, PackCommitExpectation, PackCommitPlan,
+    PackRegistrationRequest, PackVerifier, PgPackCommit, PlannedArtifact, PlannedPack, VERIFIER_MAX_TOTAL_BYTES,
 };
 use crate::ref_store::core::terminal::TerminalKind;
 use crate::ref_store::core::types::{
     GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget, RefUpdate,
 };
 
-use super::format30_pack_consolidate::{RebindTempDir, consolidate_packs_with_git, pick_any_object_oid_from_pack};
+use super::format30_pack_consolidate::{
+    MAX_REBIND_REF_ACK_BYTES, RebindTempDir, chunk_refs_for_plans, needs_consolidation_with_limit,
+    select_packs_for_rebind_with_limit,
+};
 use super::format30_paired::Format30PairedManifest;
+use super::format30_rebind_plans::{adopt_tag_updates, commit_followup_ref_plan, ref_updates_for};
+use super::format30_rebind_plans::{rebind_scope, sm_error};
 use super::pg_cutpoint::pg_err;
 use super::types::{ExpectedPackPairSpec, NewIncarnationAuthority, PairedBackupError};
 
 const GATES: &str = "SELECT g.repository_id, g.tenant_id, r.owner_id, g.object_format, \
-     COALESCE(p.decision_required, false) FROM public.ref_store_core_gates g \
+     COALESCE(p.decision_required, false), g.head_ref FROM public.ref_store_core_gates g \
      JOIN public.repositories r ON r.id = g.repository_id \
      LEFT JOIN public.ref_store_core_protocol_repos p ON p.repository_id = g.repository_id ORDER BY g.repository_id";
 const REFS: &str = "SELECT ref_name, oid FROM public.ref_store_core_refs WHERE repository_id = $1 ORDER BY ref_name";
@@ -80,6 +84,7 @@ pub(super) struct RestoredRepoCapture {
     pub owner_id: Uuid,
     pub object_format: GitObjectFormat,
     pub decision_required: bool,
+    pub head_ref: String,
     pub refs: Vec<(String, String)>,
     pub active_packs: Vec<RestoredRepoPackFile>,
 }
@@ -99,8 +104,8 @@ pub(super) async fn capture_restored_repositories_for_rebind(
         let owner_id: Uuid = row.get(2);
         let format: String = row.get(3);
         let decision_required: bool = row.get(4);
-        let object_format =
-            GitObjectFormat::parse(&format).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+        let head_ref: String = row.get(5);
+        let object_format = GitObjectFormat::parse(&format).map_err(sm_error)?;
         let refs: Vec<(String, String)> = client
             .query(REFS, &[&repository_id])
             .await
@@ -149,6 +154,7 @@ pub(super) async fn capture_restored_repositories_for_rebind(
             owner_id,
             object_format,
             decision_required,
+            head_ref,
             refs,
             active_packs,
         });
@@ -198,38 +204,30 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
     let verifier = PackVerifier::new(target_store.clone(), dst_config.git.clone()).map_err(pack_error)?;
     let backend = target_store.backend_identity().clone();
     let mut rebound_packs: BTreeMap<Uuid, Vec<ExpectedPackPairSpec>> = BTreeMap::new();
-    let repack_root = captured.iter().any(needs_consolidation).then(RebindTempDir::create).transpose()?;
+    let repack_root = captured
+        .iter()
+        .any(|repo| needs_consolidation_with_limit(&repo.active_packs, VERIFIER_MAX_TOTAL_BYTES))
+        .then(RebindTempDir::create)
+        .transpose()?;
     for repo in captured {
         if repo.active_packs.is_empty() {
             continue;
         }
-        let packs_to_publish: Vec<RestoredRepoPackFile> = if repo.active_packs.len() <= MAX_BATCH_NEW_PACKS {
-            repo.active_packs.clone()
-        } else {
-            let root = repack_root.as_ref().ok_or_else(|| {
-                PairedBackupError::StateMachine("restore pack consolidation workspace is missing".into())
-            })?;
-            let repo_root = root.0.join(repo.repository_id.to_string());
-            vec![consolidate_packs_with_git(&dst_config.git, repo.object_format, &repo.active_packs, &repo_root)?]
-        };
+        let repo_root = repack_root.as_ref().map(|root| root.0.join(repo.repository_id.to_string()));
+        let packs_to_publish = select_packs_for_rebind_with_limit(
+            &dst_config.git,
+            repo.object_format,
+            &repo.active_packs,
+            VERIFIER_MAX_TOTAL_BYTES,
+            repo_root.as_deref(),
+        )?;
         let op_id = Uuid::new_v4();
         let deadline = Instant::now() + Duration::from_secs(30);
         let baseline = PgPackCommit
             .capture_baseline(client, repo.repository_id, repo.tenant_id, deadline)
             .await
             .map_err(pack_error)?;
-        let scope = PackCommitScope::new(
-            repo.repository_id,
-            repo.tenant_id,
-            repo.owner_id,
-            repo.object_format,
-            inc.new_history_incarnation,
-            inc.new_authority_epoch,
-            inc.new_group_epoch,
-        )
-        .map_err(pack_error)?;
-        let lane =
-            IssuerLane::new("paired-restore-rebind").map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+        let lane = IssuerLane::new("paired-restore-rebind").map_err(sm_error)?;
         let init_identity = OperationIdentity::new(
             repo.repository_id,
             inc.new_history_incarnation,
@@ -238,31 +236,19 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
             op_id,
             RequestDigest::of("restore-rebind-init", &[op_id.as_bytes()]),
         )
-        .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-        let mut ref_updates = Vec::with_capacity(repo.refs.len() + 1);
-        for (name, oid) in &repo.refs {
-            let target =
-                GitOid::parse(repo.object_format, oid).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-            let name = RefName::new(name.clone()).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-            ref_updates.push(RefUpdate::new(name, RefPrecondition::Absent, RefTarget::Oid(target)));
-        }
+        .map_err(sm_error)?;
+        // The HEAD ref always leads the ordered ref list, so Plan #1 creates it and every later
+        // chunk keeps HEAD while the A4 pipeline adopts the freshly registered packs exactly once.
+        let mut ordered_refs = repo.refs.clone();
+        ordered_refs.sort_by_key(|(name, _)| name != &repo.head_ref);
+        let chunks = chunk_refs_for_plans(&ordered_refs, MAX_PLAN_REFS, MAX_REBIND_REF_ACK_BYTES);
         // A restored repository may legitimately hold zero refs while owning real packs; the A4
         // pipeline requires a non-empty ref batch, so the packs are adopted under an ephemeral
         // tag that the delete-only follow-up plan removes again.
-        let mut ephemeral_tag: Option<(String, GitOid)> = None;
-        if repo.refs.is_empty() {
-            let name = format!("refs/tags/rootyard-rebind-{op_id}");
-            let hex =
-                pick_any_object_oid_from_pack(&dst_config.git, repo.object_format, &packs_to_publish[0].idx_path)?;
-            let target =
-                GitOid::parse(repo.object_format, &hex).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-            ref_updates.push(RefUpdate::new(
-                RefName::new(name.clone()).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?,
-                RefPrecondition::Absent,
-                RefTarget::Oid(target),
-            ));
-            ephemeral_tag = Some((name, target));
-        }
+        let (first_updates, ephemeral_tag) = match chunks.first() {
+            Some(chunk) => (ref_updates_for(repo, chunk)?, None),
+            None => adopt_tag_updates(&dst_config.git, repo, &packs_to_publish[0], op_id)?,
+        };
         let mut planned_packs = Vec::with_capacity(packs_to_publish.len());
         let mut expected_specs = Vec::with_capacity(packs_to_publish.len());
         for pack_file in &packs_to_publish {
@@ -283,11 +269,11 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
             PackCommitExpectation::new(baseline.gate().revision(), *baseline.gate().digest(), baseline.mode())
                 .map_err(pack_error)?;
         let plan = PackCommitPlan::new(
-            scope,
+            rebind_scope(repo, inc)?,
             init_identity,
             expected,
             HeadUpdate::Keep,
-            ref_updates,
+            first_updates,
             baseline.membership_digest(),
             Vec::new(),
             planned_packs,
@@ -350,6 +336,18 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
         if let Some((tag, tag_oid)) = ephemeral_tag {
             delete_ephemeral_rebind_tag(client, &verifier, repo, inc, (&tag, tag_oid), deadline).await?;
         }
+        for (idx, chunk) in chunks.iter().enumerate().skip(1) {
+            commit_followup_ref_plan(
+                client,
+                &verifier,
+                repo,
+                inc,
+                ((idx + 1) as i64, "restore-rebind-ref-chunk"),
+                ref_updates_for(repo, chunk)?,
+                deadline,
+            )
+            .await?;
+        }
         if repo.decision_required {
             client.execute(DECISION_ON, &[&repo.repository_id]).await.map_err(pg_err)?;
         }
@@ -358,9 +356,9 @@ pub(super) async fn rebind_restored_repositories_in_new_realm(
     Ok(rebound_packs)
 }
 
-/// Second, delete-only A4 plan that removes the ephemeral adopt tag again, so a restored
-/// repository that legitimately held zero refs finishes the rebind with exactly zero refs while
-/// its freshly registered packs stay active memberships of the new gate revision.
+/// Second, delete-only A4 plan that removes the ephemeral adopt tag again, so a restored repository
+/// that legitimately held zero refs finishes the rebind with exactly zero refs while its freshly
+/// registered packs stay active memberships of the new gate revision.
 async fn delete_ephemeral_rebind_tag(
     client: &mut Client,
     verifier: &PackVerifier,
@@ -369,62 +367,9 @@ async fn delete_ephemeral_rebind_tag(
     tag: (&str, GitOid),
     deadline: Instant,
 ) -> Result<(), PairedBackupError> {
-    let baseline = PgPackCommit
-        .capture_baseline(client, repo.repository_id, repo.tenant_id, deadline)
-        .await
-        .map_err(pack_error)?;
-    let scope = PackCommitScope::new(
-        repo.repository_id,
-        repo.tenant_id,
-        repo.owner_id,
-        repo.object_format,
-        inc.new_history_incarnation,
-        inc.new_authority_epoch,
-        inc.new_group_epoch,
-    )
-    .map_err(pack_error)?;
-    let lane = IssuerLane::new("paired-restore-rebind").map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-    let op_id = Uuid::new_v4();
-    let identity = OperationIdentity::new(
-        repo.repository_id,
-        inc.new_history_incarnation,
-        lane,
-        2,
-        op_id,
-        RequestDigest::of("restore-rebind-tag-drop", &[op_id.as_bytes()]),
-    )
-    .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-    let mut memberships = Vec::with_capacity(baseline.old_packs().len());
-    for pack in baseline.old_packs() {
-        memberships.push(PackMembershipEntry::from_pack(pack).map_err(pack_error)?);
-    }
-    let delete = RefUpdate::new(
-        RefName::new(tag.0).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?,
-        RefPrecondition::Present(tag.1),
-        RefTarget::Delete,
-    );
-    let expected = PackCommitExpectation::new(baseline.gate().revision(), *baseline.gate().digest(), baseline.mode())
-        .map_err(pack_error)?;
-    let plan = PackCommitPlan::new(
-        scope,
-        identity,
-        expected,
-        HeadUpdate::Keep,
-        vec![delete],
-        baseline.membership_digest(),
-        memberships,
-        Vec::new(),
-    )
-    .map_err(pack_error)?;
-    let token = PgPackCommit.begin_pending(client, &plan, deadline).await.map_err(pack_error)?;
-    let context = PgPackCommit.capture_context(client, &plan, deadline).await.map_err(pack_error)?;
-    let proof = verifier.verify(&plan, &context, deadline.into_std()).await.map_err(pack_error)?;
-    let committed =
-        PgPackCommit.commit_verified_pending(client, &plan, &token, &proof, deadline).await.map_err(pack_error)?;
-    if committed.terminal.kind != TerminalKind::Committed {
-        return Err(PairedBackupError::StateMachine("restore rebind ephemeral tag drop was rejected".into()));
-    }
-    Ok(())
+    let delete =
+        RefUpdate::new(RefName::new(tag.0).map_err(sm_error)?, RefPrecondition::Present(tag.1), RefTarget::Delete);
+    commit_followup_ref_plan(client, verifier, repo, inc, (2, "restore-rebind-tag"), vec![delete], deadline).await
 }
 
 /// Build the one write-enabled pool used only by the protected A3 consume/upload child. Client
@@ -458,8 +403,4 @@ fn pack_error(error: PackCommitError) -> PairedBackupError {
 
 fn artifact(role: PackArtifactRole, sha256: &str, len: u64) -> Result<PlannedArtifact, PairedBackupError> {
     PlannedArtifact::new(role, ContentDigest::parse(sha256).map_err(pack_error)?, len).map_err(pack_error)
-}
-
-fn needs_consolidation(repo: &RestoredRepoCapture) -> bool {
-    repo.active_packs.len() > MAX_BATCH_NEW_PACKS
 }

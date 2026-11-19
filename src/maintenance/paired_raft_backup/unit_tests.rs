@@ -441,3 +441,20 @@ fn git_verify_roundtrip_sha1_and_sha256_reverse_pack_order_and_rejects_corrupt_p
         );
     }
 }
+
+#[test]
+fn publish_staged_dir_noreplace_refuses_existing_target_without_clobbering() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (staged, dst) = (dir.path().join("staged"), dir.path().join("dst"));
+    std::fs::create_dir(&staged).expect("staged dir");
+    std::fs::create_dir(&dst).expect("dst dir");
+    std::fs::write(staged.join("marker.txt"), "new").expect("staged marker");
+    std::fs::write(dst.join("existing.txt"), "keep").expect("existing marker");
+    assert!(matches!(
+        super::format30_boot::publish_staged_dir_noreplace(&staged, &dst),
+        Err(PairedBackupError::FreezeNotHeld(_))
+    ));
+    assert_eq!(std::fs::read_to_string(dst.join("existing.txt")).expect("existing intact"), "keep");
+    assert!(!dst.join("marker.txt").exists(), "a refused publish must not move any staged entry");
+    assert_eq!(std::fs::read_to_string(staged.join("marker.txt")).expect("staged intact"), "new");
+}

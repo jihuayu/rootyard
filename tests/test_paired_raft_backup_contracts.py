@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MOD_DIR = ROOT / "src" / "maintenance" / "paired_raft_backup"
 RUST_FILES = [
     ROOT / "src" / "standalone.rs",
+    ROOT / "src" / "blob_git_gateway" / "receive.rs",
     ROOT / "src" / "maintenance" / "paired_raft_backup.rs",
     *sorted(MOD_DIR.glob("*.rs")),
     ROOT / "tests" / "paired_raft_backup_restore.rs",
@@ -49,31 +50,16 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
                 lines = text.splitlines()
                 self.assertLess(len(lines), 500, f"{path.name} has {len(lines)} lines (must stay < 500)")
                 self.assertNotIn("#[allow(", text, f"lint suppression forbidden in {path.name}")
-                for match in re.finditer(
-                    r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*(?:pub\s+)?struct (\w+)",
-                    text,
-                ):
+                for match in re.finditer(r"#\[derive\([^)]*Deserialize[^)]*\)\]\s*(?:#\[[^\]]+\]\s*)*(?:pub\s+)?struct (\w+)", text):
                     self.assertIn("deny_unknown_fields", match.group(0), f"{match.group(1)} missing deny_unknown_fields")
 
     def test_paired_protocol_enforces_freeze_close_closure_bind_incarnation_and_s3_close(self) -> None:
         types_src = (MOD_DIR / "types.rs").read_text(encoding="utf-8")
         for token in (
-            "IncompleteCut",
-            "FreezeNotHeld",
-            "ScopeNotClosed",
-            "UnknownInFlightOperations",
-            "DeleterNotFenced",
-            "CutpointSkew",
-            "TenantOrRepoMismatch",
-            "BlobClosureIncomplete",
-            "CorruptBlobOrDigest",
-            "BackendIdentityMismatch",
-            "StaleIncarnation",
-            "StaleGrantRefused",
-            "StaleDecisionRefused",
-            "StaleDeleterRefused",
-            "ExpectedPackPairSpec",
-            "max_decision_scope_version",
+            "IncompleteCut", "FreezeNotHeld", "ScopeNotClosed", "UnknownInFlightOperations", "DeleterNotFenced",
+            "CutpointSkew", "TenantOrRepoMismatch", "BlobClosureIncomplete", "CorruptBlobOrDigest",
+            "BackendIdentityMismatch", "StaleIncarnation", "StaleGrantRefused", "StaleDecisionRefused",
+            "StaleDeleterRefused", "ExpectedPackPairSpec", "max_decision_scope_version",
         ):
             self.assertIn(token, types_src)
 
@@ -81,14 +67,8 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             MOD_DIR / "quorum_wal.rs"
         ).read_text(encoding="utf-8")
         for token in (
-            "DurableRaftBackend",
-            "WalSyncedRaftBackend",
-            "QuorumCommitReceipt",
-            "LocalWalApplyReceipt",
-            "VoterWalAck",
-            "DurableFreezeBarrierProof",
-            "SealedArchiveReceipt",
-            "sync_data",
+            "DurableRaftBackend", "WalSyncedRaftBackend", "QuorumCommitReceipt", "LocalWalApplyReceipt", "VoterWalAck",
+            "DurableFreezeBarrierProof", "SealedArchiveReceipt", "sync_data",
         ):
             self.assertIn(token, barrier_src)
 
@@ -96,24 +76,15 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             MOD_DIR / "peer_groups.rs"
         ).read_text(encoding="utf-8")
         for token in (
-            "compute_canonical_pack_set_digest",
-            "PeerRaftCutpointProof",
-            "verify_archived_peer_groups",
-            "verify_all_group_cursors",
-            "verify_blob_closure_against_durable_raft",
-            "verify_registration_spec_completeness",
+            "compute_canonical_pack_set_digest", "PeerRaftCutpointProof", "verify_archived_peer_groups",
+            "verify_all_group_cursors", "verify_blob_closure_against_durable_raft", "verify_registration_spec_completeness",
         ):
             self.assertIn(token, bind_src)
 
         freeze_src = (MOD_DIR / "freeze_drain.rs").read_text(encoding="utf-8")
         for token in (
-            "CloseAuthScope",
-            "CreateSnapshotPin",
-            "AcquireHoldBatch",
-            "RegisterRoot",
-            "unfreeze_after_backup",
-            "SealedArchiveReceipt",
-            "verify_backup_archive",
+            "CloseAuthScope", "CreateSnapshotPin", "AcquireHoldBatch", "RegisterRoot", "unfreeze_after_backup",
+            "SealedArchiveReceipt", "verify_backup_archive",
         ):
             self.assertIn(token, freeze_src)
 
@@ -126,12 +97,8 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             MOD_DIR / "pg_restore_admission.rs"
         ).read_text(encoding="utf-8")
         for token in (
-            "capture_pg_cutpoint_in_tx",
-            "pando_storage_authorities",
-            "pando_retention_roots",
-            "ref_cas_projection_cursors",
-            "ref_store_serving_repositories",
-            "ref_store_decision_scopes",
+            "capture_pg_cutpoint_in_tx", "pando_storage_authorities", "pando_retention_roots",
+            "ref_cas_projection_cursors", "ref_store_serving_repositories", "ref_store_decision_scopes",
             "verify_pg_restored_cursors",
         ):
             self.assertIn(token, pg_src)
@@ -145,18 +112,10 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             + (MOD_DIR / "format30_boot.rs").read_text(encoding="utf-8")
         )
         for token in (
-            "MtlsLiveRaftBackend",
-            "raft-node-",
-            "peer_certificates",
-            "PG_FREEZE_SETTING",
-            "repo_access",
-            "upsert_repo_access_collaborator_guarded",
-            "create_format30_paired_raft_backup",
-            "restore_and_boot_format30_new_incarnation",
-            "STANDARD_PAIRED_PG_FORMAT",
-            "STANDARD_SCHEMA_HEAD",
-            "crate::backup::create",
-            "crate::backup::restore",
+            "MtlsLiveRaftBackend", "raft-node-", "peer_certificates", "PG_FREEZE_SETTING", "repo_access",
+            "upsert_repo_access_collaborator_guarded", "create_format30_paired_raft_backup",
+            "restore_and_boot_format30_new_incarnation", "STANDARD_PAIRED_PG_FORMAT", "STANDARD_SCHEMA_HEAD",
+            "crate::backup::create", "crate::backup::restore",
         ):
             self.assertIn(token, mtls_and_fmt30_src)
 
@@ -197,16 +156,9 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
             + (MOD_DIR / "wal_voters.rs").read_text(encoding="utf-8")
         )
         for token in (
-            "PeerDurableAttestationClaims",
-            "PeerDurableAttestation",
-            "derive_voter_uuid_bound",
-            "load_or_create_ed25519_keypair",
-            "PeerAttestationDaemon",
-            "AttestCommit",
-            "AttestCutpoint",
-            "rootyard-peer-durable-attestation-v1",
-            "voter{slot}.pk8",
-            "0o600",
+            "PeerDurableAttestationClaims", "PeerDurableAttestation", "derive_voter_uuid_bound",
+            "load_or_create_ed25519_keypair", "PeerAttestationDaemon", "AttestCommit", "AttestCutpoint",
+            "rootyard-peer-durable-attestation-v1", "voter{slot}.pk8", "0o600",
         ):
             self.assertIn(token, attest_src, f"missing Ed25519 attestation contract: {token}")
 
@@ -215,11 +167,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         self.assertIn("verify_cutpoint_attestations", barrier_src)
 
         for name in ("backup.rs", "format30_paired.rs", "peer_groups.rs", "restore.rs"):
-            self.assertIn(
-                "cutpoint_attestations",
-                (MOD_DIR / name).read_text(encoding="utf-8"),
-                f"{name} must populate/verify cutpoint attestations",
-            )
+            self.assertIn("cutpoint_attestations", (MOD_DIR / name).read_text(encoding="utf-8"), f"{name} must populate/verify cutpoint attestations")
 
         mtls_src = (MOD_DIR / "mtls_raft.rs").read_text(encoding="utf-8")
         self.assertIn("verify_pristine_new_incarnation_target", mtls_src)
@@ -339,21 +287,33 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         self.assertTrue(rehome.exists(), "restored A3/A4 realm re-home module is missing")
         rehome_src = rehome.read_text(encoding="utf-8")
         self.assertLess(len(rehome_src.splitlines()), 480)
+        rehome_all = rehome_src + "\n" + read("format30_rebind_plans.rs")
         require(rehome_src, ("rehome_restored_repositories_realm", "rebind_restored_repositories_in_new_realm", "PgPackCommit", "PgArtifactHoldStore", "ProtectedUploader", "PackVerifier", "PackRegistrationRequest", "commit_verified_pending"), "restored realm re-home contract")
         for statement in ("UPDATE public.artifact_hold_requests", "UPDATE public.artifact_hold_consume_receipts", "UPDATE public.ref_store_core_pack_publications", "UPDATE public.ref_store_core_pack_history"):
-            self.assertNotIn(statement, rehome_src, "historical A3/A4 ledger rows must stay immutable")
+            self.assertNotIn(statement, rehome_all, "historical A3/A4 ledger rows must stay immutable")
         self.assertIn("rehome_restored_repositories_realm", read("format30_boot.rs"), "boot must re-home the realm")
         consolidate = MOD_DIR / "format30_pack_consolidate.rs"
         self.assertTrue(consolidate.exists(), "restored ref-less pack consolidation module is missing")
         consolidate_src = consolidate.read_text(encoding="utf-8")
         require(consolidate_src, ("RebindTempDir", "consolidate_packs_with_git", "pick_any_object_oid_from_pack", "consolidate_more_than_eight_identical_filename_pairs_preserves_all_objects", "pack-{index:06}-", "--batch-all-objects"), "ref-less restore pack consolidation contract")
-        require(rehome_src, ("rootyard-rebind-", "RefTarget::Delete", "delete_ephemeral_rebind_tag", "old_packs()"), "ref-less active-pack rebind contract")
+        require(rehome_all, ("rootyard-rebind-", "RefTarget::Delete", "delete_ephemeral_rebind_tag", "old_packs()"), "ref-less active-pack rebind contract")
         require(read("mtls_consensus.rs"), ("HEAD_RAFT_INDEX_KV_KEY", "linearizable_consensus_index", "EnsureReadIndex", "forward_to_leader_id"), "real Raft consensus index contract")
         require(read("mtls_raft.rs"), ("refcas/head_raft_index", "linearizable_consensus_index", "commit_raft_idx"), "durable head_raft_index persistence contract")
         require(read("peer_attestation_rpc.rs"), ("HEAD_RAFT_INDEX_KV_KEY", "read_replica_u64"), "local head_raft_index attestation floor")
         self.assertIn("min_consensus_index", read("types.rs"), "cutpoint proofs must carry the consensus floor")
         self.assertIn("min_consensus_index", read("peer_groups.rs"))
-        require(read("format30_boot.rs"), ("staging_root", "restore_guard_path", "restore_in_progress", "std::fs::rename"), "staged restore publication contract")
+        require(read("format30_boot.rs"), ("staging_root", "restore_guard_path", "restore_in_progress"), "staged restore publication contract")
+        boot_src = read("format30_boot.rs")
+        require(
+            boot_src,
+            ("publish_staged_dir_noreplace", "RENAME_NOREPLACE", "boot_thaw"),
+            "atomic no-replace staged publication contract",
+        )
+        self.assertLess(
+            boot_src.index("boot_thaw"),
+            boot_src.index("publish_staged_dir_noreplace(&staged_data"),
+            "the Raft/PG thaw must stay inside the fallible block before the single publish rename",
+        )
         self.assertIn("replicate_pg_repo_to_raft_guarded", read("durable_guarded_ops.rs"))
         delta8 = ROOT / "tests" / "paired_raft_backup_support" / "format30_delta8_gates.rs"
         self.assertTrue(delta8.exists(), "gate-8 delta module is missing")
@@ -375,6 +335,60 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
         self.assertIn("format30_luna_fence_hold_gates", (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8"), "gate-7 module must be wired into the integration test target")
         require((ROOT / "src" / "bin" / "rootyard-peer-attestor.rs").read_text(encoding="utf-8"), ("--allow-caller-sha256",), "attestor caller allowlist flag")
         require(read("startup_wiring.rs"), ("allowed_caller_cert_sha256s",), "attestor startup allowlist wiring")
+        delta10 = ROOT / "tests" / "paired_raft_backup_support" / "format30_delta10_gates.rs"
+        self.assertTrue(delta10.exists(), "gate-10 delta module is missing")
+        delta10_src = delta10.read_text(encoding="utf-8")
+        self.assertLess(len(delta10_src.splitlines()), 450)
+        require(
+            delta10_src,
+            (
+                "gate10_multi_plan_135_refs_rebind_and_thaw_failure_blocks_publish",
+                "restore_and_boot_format30_with_pre_thaw_hook",
+                "kill_hard",
+                "paired-restore-rebind",
+            ),
+            "gate-10 multi-plan rebind and thaw-failure coverage",
+        )
+        self.assertIn(
+            "format30_delta10_gates",
+            (ROOT / "tests" / "paired_raft_backup_restore.rs").read_text(encoding="utf-8"),
+            "gate-10 module must be wired into the integration test target",
+        )
+        require(
+            read("format30_pack_consolidate.rs"),
+            ("chunk_refs_for_plans", "select_packs_for_rebind_with_limit", "MAX_REBIND_REF_ACK_BYTES"),
+            "multi-plan rebind ref/ACK and verifier byte chunking contract",
+        )
+        require(
+            read("format30_pg_raft_sync.rs"),
+            ("apply_pg_repo_state_to_raft", "RefPrecondition::Present", "RefTarget::Delete", "MAX_PLAN_REFS"),
+            "delta-exact PG -> Raft replication contract",
+        )
+        require(
+            read("mtls_raft.rs"),
+            ("sync_cached_state_machine", "resolve_group_epoch(&cmd, &before_sm)"),
+            "multi-handle Raft cache sync and per-commit group-epoch resolution contract",
+        )
+        require(
+            read("startup_wiring.rs"),
+            ("PairedWriteRaftScopeGuard", "install_paired_write_raft_binding", "mirror_gateway_push_to_paired_raft"),
+            "database-keyed paired write binding contract",
+        )
+        receive_src = (ROOT / "src" / "blob_git_gateway" / "receive.rs").read_text(encoding="utf-8")
+        require(
+            receive_src,
+            ("check_paired_write_unfrozen", "mirror_gateway_push_to_paired_raft", "GatewayError::OutcomeUnknown"),
+            "normal paired Smart-HTTP write-path mirror contract",
+        )
+        for gate in ("format30_delta8_gates.rs", "format30_delta10_gates.rs", "format30_luna_fence_hold_gates.rs"):
+            gate_src = (ROOT / "tests" / "paired_raft_backup_support" / gate).read_text(encoding="utf-8")
+            self.assertNotIn("replicate_pg_repo_to_raft_guarded", gate_src, f"{gate} must use the normal paired write path")
+            self.assertIn('flavor = "multi_thread"', gate_src, f"{gate} must drive the mirrored write path on a multi-thread runtime")
+        self.assertNotIn(
+            "replicate_pg_repo_to_raft_guarded",
+            (ROOT / "tests" / "paired_raft_backup_support" / "format30_e2e.rs").read_text(encoding="utf-8"),
+            "the live E2E must prove the normal push path owns the Raft floor",
+        )
 
     def test_workflow_contract_and_doc_links(self) -> None:
         raw_wf = WORKFLOW.read_bytes()
@@ -395,6 +409,7 @@ class PairedRaftBackupContractsTest(unittest.TestCase):
                 "src/maintenance/paired_raft_backup.rs",
                 "src/maintenance/paired_raft_backup/**",
                 "src/bin/rootyard-peer-attestor.rs",
+                "src/blob_git_gateway/receive.rs",
                 "tests/paired_raft_backup_restore.rs",
                 "tests/paired_raft_backup_support/**",
                 "scripts/eval_paired_raft_backup.py",

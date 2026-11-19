@@ -1,6 +1,4 @@
-//! Coordinated PG cutpoint + Raft index + Blob closure paired backup and
-//! clean-room new-incarnation restore engine (#153).
-
+//! Coordinated PG cutpoint + Raft index + Blob closure paired backup and clean-room restore engine (#153).
 pub mod admission_guard;
 pub mod backup;
 pub mod closure_bind;
@@ -8,9 +6,12 @@ pub mod durable_freeze_gate;
 pub mod durable_guarded_ops;
 pub mod format30_boot;
 mod format30_boot_raft;
+mod format30_incarnation;
 mod format30_pack_consolidate;
 pub mod format30_paired;
+mod format30_pg_raft_sync;
 mod format30_realm_rehome;
+mod format30_rebind_plans;
 pub mod freeze_drain;
 pub mod git_verify;
 mod mtls_consensus;
@@ -30,14 +31,12 @@ pub mod raft_barrier;
 pub mod restore;
 pub mod startup_wiring;
 pub mod types;
-mod wal_file_digest;
-pub mod wal_voters;
-
 #[cfg(test)]
 mod unit_tests;
 #[cfg(test)]
 mod unit_tests_quorum_peers;
-
+mod wal_file_digest;
+pub mod wal_voters;
 pub use backup::{PairedBackupRequest, PreparedBlobArtifact, capture_live_pg_backup, create_paired_backup};
 pub use closure_bind::{
     compute_canonical_pack_set_digest, extract_raft_group_realm, verify_blob_closure_against_durable_raft,
@@ -51,7 +50,8 @@ pub use durable_freeze_gate::{
 pub use format30_paired::{
     FORMAT30_SUBDIR, Format30PairedBackupRequest, Format30PairedManifest, Format30PgArchiveBinding,
     STANDARD_PAIRED_PG_FORMAT, STANDARD_SCHEMA_HEAD, create_format30_paired_raft_backup,
-    restore_and_boot_format30_new_incarnation, verify_format30_paired_archive,
+    restore_and_boot_format30_new_incarnation, restore_and_boot_format30_with_pre_thaw_hook,
+    verify_format30_paired_archive,
 };
 pub use freeze_drain::{InFlightOperation, RepoBackupRegistrationSpec, TriPartyBackupCoordinator};
 pub use mtls_raft::{DurableRaftFreezeRecord, MtlsLiveRaftBackend, MtlsRaftClusterConfig};
@@ -83,7 +83,8 @@ pub use restore::{
     verify_backup_archive,
 };
 pub use startup_wiring::{
-    ensure_serving_database_unfrozen, install_production_serving_guard, install_production_serving_guard_with_attestor,
+    PairedWriteRaftScopeGuard, ensure_serving_database_unfrozen, install_paired_write_raft_binding,
+    install_production_serving_guard, install_production_serving_guard_with_attestor,
     installed_peer_attestation_daemon_addr, installed_production_runtime_guard, set_installed_production_runtime_guard,
     shutdown_installed_peer_attestation_daemon,
 };

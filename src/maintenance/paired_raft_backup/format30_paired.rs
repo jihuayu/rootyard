@@ -36,7 +36,9 @@ use super::types::{
     PAIRED_BACKUP_FORMAT_V1, PairedBackupError, PgCutpointProof, RaftCutpointProof, sha256_json_tagged, validate_hex64,
 };
 
-pub use super::format30_boot::restore_and_boot_format30_new_incarnation;
+pub use super::format30_boot::{
+    restore_and_boot_format30_new_incarnation, restore_and_boot_format30_with_pre_thaw_hook,
+};
 
 pub const STANDARD_PAIRED_PG_FORMAT: u32 = 30;
 pub const STANDARD_SCHEMA_HEAD: i32 = 151;

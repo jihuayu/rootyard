@@ -106,14 +106,12 @@ pub async fn enter_durable_pg_raft_freeze(
     let barrier_id = Uuid::new_v4();
     // A recycled pooled backend can still be inside an abandoned transaction block.
     let _ = pg_client.batch_execute("ROLLBACK").await;
-    // A pooled `RecyclingMethod::Fast` session may already carry a latched `READ ONLY` characteristic; remember it
-    // so a failure *before* `set_pg_database_read_only(true)` does not poison this unfrozen connection.
+    // A recycled `Fast` session may already carry a latched `READ ONLY`; remember it for rollback.
     let prior_ro: String = pg_client.query_one("SHOW default_transaction_read_only", &[]).await.map_err(pg_err)?.get(0);
     pg_client.batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE").await.map_err(pg_err)?;
 
     let outcome: Result<DurableFreezeHandle, PairedBackupError> = async {
-        // 1. Persist durable PostgreSQL + active/peer 3-voter mTLS Raft freeze barriers FIRST
-        //    before registering backup holds/roots so all external writers are fenced immediately!
+        // 1. Persist the durable PG + active/peer Raft freeze barriers before any holds/roots.
         let initial_floors: BTreeMap<Uuid, i64> =
             req.repos.iter().map(|s| (s.repository_id, req.scope_authz_floor)).collect();
         let pre_freeze_rec = DurableRaftFreezeRecord {
@@ -193,6 +191,9 @@ pub async fn enter_durable_pg_raft_freeze(
         );
         let mut apply_receipts = Vec::new();
         let mut backup_holds = Vec::with_capacity(req.repos.len());
+        // Absorb every commit made by the `serve-blob` gateway's own `PairedWriteRaftBinding` handle
+        // before the closure holds are registered, so the freeze record covers the full log.
+        raft.sync_cached_state_machine()?;
         for spec in req.repos {
             backup_holds.push(coord.register_backup_closure_hold(raft, spec, &mut apply_receipts)?);
         }

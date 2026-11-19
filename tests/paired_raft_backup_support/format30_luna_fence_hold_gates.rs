@@ -3,6 +3,7 @@
 //! paired backup closed and must never leave a published archive or a thawable barrier (#153).
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, ensure};
@@ -12,12 +13,12 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use rootyard::db;
+use rootyard::maintenance::paired_raft_backup::install_paired_write_raft_binding as bind_paired_write;
 use rootyard::maintenance::paired_raft_backup::{
-    DurableFreezeRequest, Format30PairedBackupRequest, MtlsLiveRaftBackend, PairedBackupError, PeerDurableAttestation,
-    PeerDurableAttestationClaims, SealedArchiveReceipt, compute_group_membership_digest,
+    DurableFreezeRequest, DurableRaftBackend, Format30PairedBackupRequest, MtlsLiveRaftBackend, PairedBackupError,
+    PeerDurableAttestation, PeerDurableAttestationClaims, SealedArchiveReceipt, compute_group_membership_digest,
     create_format30_paired_raft_backup, derive_voter_uuid_bound, enter_durable_pg_raft_freeze,
-    load_pg_repo_backup_specs, replicate_pg_repo_to_raft_guarded, thaw_durable_pg_raft_freeze,
-    verify_cutpoint_attestations,
+    load_pg_repo_backup_specs, thaw_durable_pg_raft_freeze, verify_cutpoint_attestations,
 };
 use rootyard::ref_store::core::decision_commit::{PgDecisionProtocol, RealmExpectation};
 use rootyard::ref_store::core::state_machine::AppliedLogId;
@@ -97,7 +98,7 @@ fn durable_attestation_without_wal_digest_is_refused() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live PostgreSQL 17 + built raft-node and rootyard-peer-attestor binaries"]
 async fn gate7_fence_drop_at_each_publication_boundary_fails_closed() -> Result<()> {
     let base_url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
@@ -114,8 +115,9 @@ async fn gate7_fence_drop_at_each_publication_boundary_fails_closed() -> Result<
         let mut raft = group.connect_backend(1)?;
         let pool = db::pool(&url)?;
         db::migrate(&pool).await?;
+        let _write_binding = bind_paired_write(Arc::new(Mutex::new(group.connect_backend(1)?)), &url)?;
         let owner = make_actor(&pool, "gate7owner", true).await?;
-        let (gw_addr, _gw_jh) =
+        let (gw_addr, gw_jh) =
             start_gateway(pool.clone(), store.clone(), git.clone(), dir.path().join("gate7-gw")).await?;
         let created = reqwest::Client::new()
             .post(format!("http://{gw_addr}/api/repos"))
@@ -159,7 +161,14 @@ async fn gate7_fence_drop_at_each_publication_boundary_fails_closed() -> Result<
         ensure!(run_git_cli(&git, &clone, &["commit", "-q", "-m", "gate7"]).status.success());
         let pushed = run_git_cli(&git, &clone, &["push", "origin", "HEAD:refs/heads/main"]);
         ensure!(pushed.status.success(), "push failed: {}", String::from_utf8_lossy(&pushed.stderr));
-        replicate_pg_repo_to_raft_guarded(&pool, &mut raft, repo_id).await?;
+        gw_jh.abort();
+        let _ = gw_jh.await;
+        let (raft_snap, _) = raft.durable_state()?;
+        ensure!(
+            raft_snap.body.gates.iter().any(|g| g.repository_id == repo_id)
+                && raft_snap.body.refs.iter().any(|r| r.repository_id == repo_id && !r.refs.is_empty()),
+            "the normal Smart-HTTP push must mirror itself into the live 3-voter Raft cluster"
+        );
         let specs = load_pg_repo_backup_specs(&**pool.get().await?).await?;
         ensure!(specs.len() == 1, "the source repository must yield exactly one backup spec");
         let data_dir = dir.path().join("gate7-vol");

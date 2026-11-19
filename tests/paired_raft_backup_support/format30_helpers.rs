@@ -277,3 +277,21 @@ pub fn verify_mtls_auth_and_quorum_faults() -> Result<()> {
     ));
     Ok(())
 }
+
+/// Assert one already-committed PostgreSQL ref is mirrored into the live Raft state machine, and
+/// return that repository gate's current revision so a follow-up plan can be sealed against it.
+pub fn ensure_raft_ref_mirrored(
+    raft: &impl DurableRaftBackend,
+    repository_id: Uuid,
+    ref_name: &str,
+    expected_oid: &str,
+) -> Result<i64> {
+    let (snap, _) = raft.durable_state()?;
+    let refs =
+        snap.body.refs.iter().find(|r| r.repository_id == repository_id).map(|r| r.refs.clone()).unwrap_or_default();
+    ensure!(
+        refs.get(ref_name).map(String::as_str) == Some(expected_oid),
+        "the normal Smart-HTTP push must mirror {ref_name} into the live 3-voter Raft cluster"
+    );
+    Ok(snap.body.gates.iter().find(|g| g.repository_id == repository_id).map(|g| g.revision).unwrap_or(1))
+}

@@ -110,8 +110,7 @@ impl MtlsLiveRaftBackend {
             group_membership_digest,
             cached_sm: RefCasStateMachine::new(),
         };
-        let (sm, _) = backend.replay_linearizable_sm()?;
-        backend.cached_sm = sm;
+        backend.sync_cached_state_machine()?;
         Ok(backend)
     }
     pub fn update_endpoints(
@@ -341,11 +340,23 @@ impl MtlsLiveRaftBackend {
         Ok(Vec::new())
     }
 
-    fn resolve_group_epoch(&self, cmd: &RefCasCommand) -> i64 {
+    fn resolve_group_epoch(&self, cmd: &RefCasCommand, before_sm: &RefCasStateMachine) -> i64 {
         if let RefCasCommand::InitializeGate(init) = cmd {
             return init.gate.group_epoch.max(1);
         }
-        self.cached_sm.snapshot().ok().and_then(|s| s.body.gates.first().map(|g| g.group_epoch)).unwrap_or(1).max(1)
+        // Resolve from the linearizable replay of *this* commit, never from a handle-local cache: a
+        // second backend connected to the same 3-voter cluster may not have observed the peer's
+        // commits yet, and would otherwise seal the wrong group epoch into its command.
+        let current = before_sm.snapshot().ok().and_then(|s| s.body.gates.first().map(|g| g.group_epoch));
+        current.unwrap_or(1).max(1)
+    }
+
+    /// Re-read the full linearizable Raft state into this handle's cache so `durable_state_machine`
+    /// observes every commit made by any other handle connected to the same 3-voter cluster.
+    pub fn sync_cached_state_machine(&mut self) -> Result<(), PairedBackupError> {
+        let (sm, _) = self.replay_linearizable_sm()?;
+        self.cached_sm = sm;
+        Ok(())
     }
 
     /// Refuse restore unless every configured target voter is a brand-new, empty incarnation.
@@ -380,7 +391,7 @@ impl DurableRaftBackend for MtlsLiveRaftBackend {
         let (infos, lid) = self.probe_live_voters()?;
         let observed_term = infos.get(&lid).map_or(1, |i| i.current_term).max(floor_term).max(1);
         let seq = head_before.saturating_add(1);
-        let group_epoch = self.resolve_group_epoch(&cmd);
+        let group_epoch = self.resolve_group_epoch(&cmd, &before_sm);
         let wire_bytes = encode_command(&cmd).map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
         let command_sha256 = hex::encode(Sha256::digest(&wire_bytes));
         let persisted = PersistedRaftCmd { term: observed_term, cmd: cmd.clone() };

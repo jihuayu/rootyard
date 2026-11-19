@@ -16,9 +16,8 @@ use super::format30_boot_raft::{boot_active_and_peer_mtls_raft_incarnation, boot
 use super::format30_paired::{FORMAT30_SUBDIR, Format30PairedManifest, verify_format30_paired_archive};
 use super::format30_realm_rehome::{
     RestoredRepoCapture, capture_restored_repositories_for_rebind, rebind_restored_repositories_in_new_realm,
-    rehome_restored_repositories_realm,
 };
-use super::mtls_raft::{DurableRaftFreezeRecord, MtlsLiveRaftBackend};
+use super::mtls_raft::MtlsLiveRaftBackend;
 use super::pg_cutpoint::{pg_err, sync_restored_pg_projection_cursors};
 use super::pg_freeze_settings::{
     set_pg_database_freeze_marker, set_pg_database_read_only, terminate_and_await_other_pg_sessions,
@@ -29,7 +28,7 @@ use super::quorum_wal::DurableRaftBackend;
 use super::types::{NewIncarnationAuthority, PairedBackupError, RestoreOutcome};
 
 /// Complete result of the staged restore + new-incarnation installation before publication.
-type RestoredIncarnation = (Client, NewIncarnationAuthority, DurableRaftFreezeRecord, usize);
+type RestoredIncarnation = (Client, NewIncarnationAuthority, usize);
 
 /// Restore the complete `schema 151` / `format 30` archive (`pg_restore` + `BlobStore` rebuild) into
 /// a brand-new PG 17 database + target `BlobStore`, and **install + boot** the new incarnation
@@ -42,6 +41,52 @@ pub async fn restore_and_boot_format30_new_incarnation(
     target_store: &BlobStore,
     booted_active_raft: &mut MtlsLiveRaftBackend,
     booted_peer_rafts: &mut BTreeMap<i64, MtlsLiveRaftBackend>,
+) -> Result<(RestoreOutcome, IncarnationAdmissionGuard), PairedBackupError> {
+    restore_and_boot_format30_inner(
+        archive_dir,
+        work_dir,
+        dst_config,
+        target_store,
+        booted_active_raft,
+        booted_peer_rafts,
+        || {},
+    )
+    .await
+}
+
+/// Fault-injection entry point: `before_thaw` runs inside the fallible restore block after the
+/// restored PostgreSQL cursors verify and immediately before the frozen boot record is thawed across
+/// every Raft group, so a live test can partition the quorum while the volume is still unpublished.
+#[doc(hidden)]
+pub async fn restore_and_boot_format30_with_pre_thaw_hook(
+    archive_dir: &Path,
+    work_dir: &Path,
+    dst_config: &Config,
+    target_store: &BlobStore,
+    booted_active_raft: &mut MtlsLiveRaftBackend,
+    booted_peer_rafts: &mut BTreeMap<i64, MtlsLiveRaftBackend>,
+    before_thaw: impl FnOnce(),
+) -> Result<(RestoreOutcome, IncarnationAdmissionGuard), PairedBackupError> {
+    restore_and_boot_format30_inner(
+        archive_dir,
+        work_dir,
+        dst_config,
+        target_store,
+        booted_active_raft,
+        booted_peer_rafts,
+        before_thaw,
+    )
+    .await
+}
+
+async fn restore_and_boot_format30_inner(
+    archive_dir: &Path,
+    work_dir: &Path,
+    dst_config: &Config,
+    target_store: &BlobStore,
+    booted_active_raft: &mut MtlsLiveRaftBackend,
+    booted_peer_rafts: &mut BTreeMap<i64, MtlsLiveRaftBackend>,
+    before_thaw: impl FnOnce(),
 ) -> Result<(RestoreOutcome, IncarnationAdmissionGuard), PairedBackupError> {
     let backend_hex = target_store.backend_identity().as_hex().to_owned();
     let manifest = verify_format30_paired_archive(archive_dir, Some(&backend_hex))?;
@@ -166,10 +211,20 @@ pub async fn restore_and_boot_format30_new_incarnation(
         )
         .await?;
         verify_pg_restored_cursors(&dst_client, manifest.raft_cutpoint.group_id, &active_snap, &peer_snaps).await?;
-        Ok((dst_client, inc, boot_freeze, git_verified_refs))
+        before_thaw();
+        // Thaw every Raft group *inside* the fallible block: a lost quorum here leaves PostgreSQL
+        // frozen, the admission guard on disk and `dst_config.data_dir` unpublished.
+        let boot_thaw =
+            boot_record(&manifest, &inc, false, boot_freeze.barrier_id, Some(manifest.paired_cut_digest.clone()))?;
+        for pr in booted_peer_rafts.values() {
+            pr.write_freeze_record(&boot_thaw)?;
+        }
+        booted_active_raft.write_freeze_record(&boot_thaw)?;
+        clear_restored_pg_freeze(&dst_client).await?;
+        Ok((dst_client, inc, git_verified_refs))
     }
     .await;
-    let (dst_client, inc, boot_freeze, git_verified_refs) = match restored {
+    let (dst_client, inc, git_verified_refs) = match restored {
         Ok(restored) => restored,
         Err(err) => {
             // Nothing was published: discard only the private staging copy. The target guard stays
@@ -179,37 +234,16 @@ pub async fn restore_and_boot_format30_new_incarnation(
         }
     };
 
-    // Everything that can still fail has committed: publish the staged volume with one rename.
-    if dst_config.data_dir.exists() {
-        return Err(PairedBackupError::FreezeNotHeld(
-            "restore target data_dir already exists; refusing to publish a restored volume over it",
-        ));
+    // Everything that can still fail has committed: publish the staged volume with one atomic
+    // no-replace rename that can never clobber a live or previously restored incarnation.
+    if let Err(err) = publish_staged_dir_noreplace(&staged_data, &dst_config.data_dir) {
+        let _ = set_pg_database_freeze_marker(&dst_client, Some(&marker)).await;
+        let _ = set_pg_database_read_only(&dst_client, true).await;
+        let _ = std::fs::remove_dir_all(&stage_root);
+        return Err(err);
     }
-    std::fs::rename(&staged_data, &dst_config.data_dir)?;
     let _ = std::fs::remove_dir_all(&stage_root);
-
-    let boot_thaw =
-        boot_record(&manifest, &inc, false, boot_freeze.barrier_id, Some(manifest.paired_cut_digest.clone()))?;
-    for pr in booted_peer_rafts.values() {
-        pr.write_freeze_record(&boot_thaw)?;
-    }
-    booted_active_raft.write_freeze_record(&boot_thaw)?;
-    dst_client
-        .execute(
-            "UPDATE public.pando_storage_authorities \
-             SET remote_delete_fenced = false, remote_delete_fence_reason = NULL WHERE singleton = true",
-            &[],
-        )
-        .await
-        .map_err(pg_err)?;
-    set_pg_database_read_only(&dst_client, false).await?;
-    set_pg_database_freeze_marker(&dst_client, None).await?;
-    set_restore_in_progress(&dst_client, None).await?;
-    terminate_and_await_other_pg_sessions(&dst_client, Duration::from_secs(5)).await?;
-    dst_client
-        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE; RESET default_transaction_read_only")
-        .await
-        .map_err(pg_err)?;
+    sync_parent_dir(&dst_config.data_dir)?;
     // The crash-persistent admission guard is removed last: only a fully thawed, published
     // incarnation may become visible to service startup.
     std::fs::remove_file(&guard_path)?;
@@ -227,6 +261,77 @@ pub async fn restore_and_boot_format30_new_incarnation(
         incarnation: inc,
     };
     Ok((outcome, guard))
+}
+
+/// Clear every restored PostgreSQL fence after the Raft thaw has committed. The volume is still
+/// unpublished and the admission guard is still on disk, so no service can observe this window.
+async fn clear_restored_pg_freeze(client: &Client) -> Result<(), PairedBackupError> {
+    client
+        .execute(
+            "UPDATE public.pando_storage_authorities \
+             SET remote_delete_fenced = false, remote_delete_fence_reason = NULL WHERE singleton = true",
+            &[],
+        )
+        .await
+        .map_err(pg_err)?;
+    set_pg_database_read_only(client, false).await?;
+    set_pg_database_freeze_marker(client, None).await?;
+    set_restore_in_progress(client, None).await?;
+    terminate_and_await_other_pg_sessions(client, Duration::from_secs(5)).await?;
+    client
+        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE; RESET default_transaction_read_only")
+        .await
+        .map_err(pg_err)
+}
+
+/// Publish the staged volume with one atomic no-replace directory rename: an existing target is a
+/// typed refusal, so a restore can never clobber a live or previously restored incarnation.
+pub(super) fn publish_staged_dir_noreplace(staged: &Path, dst: &Path) -> Result<(), PairedBackupError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let src_c = std::ffi::CString::new(staged.as_os_str().as_bytes())
+            .map_err(|_| PairedBackupError::InvalidArgument("staged path contains interior NUL"))?;
+        let dst_c = std::ffi::CString::new(dst.as_os_str().as_bytes())
+            .map_err(|_| PairedBackupError::InvalidArgument("destination path contains interior NUL"))?;
+        let rc = unsafe {
+            libc::renameat2(libc::AT_FDCWD, src_c.as_ptr(), libc::AT_FDCWD, dst_c.as_ptr(), libc::RENAME_NOREPLACE)
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if matches!(err.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY))
+                || err.kind() == std::io::ErrorKind::AlreadyExists
+            {
+                return Err(PairedBackupError::FreezeNotHeld(
+                    "restore target data_dir already exists; no-replace publish refused",
+                ));
+            }
+            return Err(PairedBackupError::Io(err));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if std::fs::symlink_metadata(dst).is_ok() {
+            return Err(PairedBackupError::FreezeNotHeld(
+                "restore target data_dir already exists; no-replace publish refused",
+            ));
+        }
+        std::fs::rename(staged, dst)?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(target: &Path) -> Result<(), PairedBackupError> {
+    let parent = target.parent().ok_or(PairedBackupError::FreezeNotHeld("restore target has no parent volume"))?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_target: &Path) -> Result<(), PairedBackupError> {
+    Ok(())
 }
 
 /// `.<name>.rootyard-restoring` sibling of the final volume, byte-identical to the guard path
@@ -283,144 +388,14 @@ async fn set_restore_in_progress(client: &Client, backup_id: Option<Uuid>) -> Re
     client.batch_execute(&statement).await.map_err(pg_err)
 }
 
+/// Install the rotated new incarnation into the restored `schema 151` database: cluster identity,
+/// floors, revoked pre-restore authority and `rehome_restored_repositories_realm` for every restored
+/// gate/protocol/serving realm row.
 async fn install_new_incarnation_on_restored_schema151(
     client: &mut Client,
     manifest: &Format30PairedManifest,
     captured_repos: &[RestoredRepoCapture],
 ) -> Result<NewIncarnationAuthority, PairedBackupError> {
-    let gate_auth_e = manifest.pg_cutpoint.repositories.iter().map(|r| r.authority_epoch).max().unwrap_or(1).max(1);
-    let active_grp_e = manifest.pg_cutpoint.repositories.iter().map(|r| r.group_epoch).max().unwrap_or(1).max(1);
-    let max_floor = manifest
-        .raft_cutpoint
-        .close_receipts
-        .iter()
-        .map(|r| r.authz_floor)
-        .max()
-        .unwrap_or(1)
-        .max(manifest.pg_cutpoint.max_decision_scope_version);
-    let new_authz_floor = max_floor.saturating_add(10);
-    let requested_deleter_epoch = manifest.freeze.fenced_deleter_epoch.saturating_add(1);
-    let deleter_floor_i64 = i64::try_from(requested_deleter_epoch).unwrap_or(i64::MAX);
-
-    let new_cluster_inc = Uuid::new_v4();
-    let new_storage_auth = Uuid::new_v4();
-    let new_storage_gen = manifest.pg_cutpoint.source_storage_generation.saturating_add(2);
-    let new_history_inc = Uuid::new_v4();
-    let new_auth_epoch = gate_auth_e.saturating_add(1);
-    let max_peer_grp_e = manifest.raft_cutpoint.group_epochs.values().copied().max().unwrap_or(1);
-    let new_grp_epoch = active_grp_e.max(max_peer_grp_e).saturating_add(1);
-
-    let tx = client.transaction().await.map_err(pg_err)?;
-    tx.batch_execute("SET LOCAL session_replication_role = replica").await.map_err(pg_err)?;
-    tx.execute(
-        "UPDATE public.cluster_authority SET incarnation = $1, rotated_at = clock_timestamp() WHERE singleton = true",
-        &[&new_cluster_inc],
-    )
-    .await
-    .map_err(pg_err)?;
-    let srow = tx
-        .query_one(
-            "UPDATE public.pando_storage_authorities \
-             SET authority_id = $1, generation = GREATEST(generation + 1, $2), \
-                 restore_generation = GREATEST(restore_generation + 1, $3), \
-                 authority_epoch = $4, remote_delete_fenced = true, \
-                 remote_delete_fence_reason = 'restore-boot-in-progress', rotated_at = clock_timestamp() \
-             WHERE singleton = true \
-             RETURNING generation, authority_epoch, restore_generation",
-            &[&new_storage_auth, &new_storage_gen, &deleter_floor_i64, &new_auth_epoch],
-        )
-        .await
-        .map_err(pg_err)?;
-    let (actual_storage_gen, actual_auth_e): (i64, i64) = (srow.get(0), srow.get(1));
-    let new_deleter_epoch = u64::try_from(srow.get::<_, i64>(2)).unwrap_or(requested_deleter_epoch);
-
-    tx.execute("UPDATE public.tokens SET revoked = true WHERE NOT revoked", &[]).await.map_err(pg_err)?;
-    tx.execute(
-        "UPDATE public.ref_store_publication_decisions \
-         SET state = 'CANCELLED', closed_code = 'restored_new_incarnation', \
-             cancelled_at = clock_timestamp(), cancel_change_id = $1 \
-         WHERE state = 'OPEN'",
-        &[&Uuid::new_v4()],
-    )
-    .await
-    .map_err(pg_err)?;
-
-    tx.execute(
-        "INSERT INTO public.ref_store_decision_scopes(scope_kind, scope_id, version, state, change_id) \
-         VALUES('authority', $1, $2, 'CLOSING', $3) \
-         ON CONFLICT (scope_kind, scope_id) DO UPDATE \
-         SET state = 'CLOSING', \
-             version = GREATEST(public.ref_store_decision_scopes.version, EXCLUDED.version), \
-             change_id = COALESCE(public.ref_store_decision_scopes.change_id, EXCLUDED.change_id)",
-        &[&manifest.pg_cutpoint.source_storage_authority_id, &new_authz_floor, &Uuid::new_v4()],
-    )
-    .await
-    .map_err(pg_err)?;
-    tx.execute(
-        "INSERT INTO public.ref_store_decision_scopes(scope_kind, scope_id, version, state, change_id) \
-         VALUES('authority', $1, $2, 'OPEN', NULL) \
-         ON CONFLICT (scope_kind, scope_id) DO UPDATE \
-         SET version = GREATEST(public.ref_store_decision_scopes.version, EXCLUDED.version)",
-        &[&new_storage_auth, &new_authz_floor],
-    )
-    .await
-    .map_err(pg_err)?;
-    tx.execute(
-        "UPDATE public.ref_store_decision_scopes SET version = GREATEST(version, $1) WHERE state = 'OPEN'",
-        &[&new_authz_floor],
-    )
-    .await
-    .map_err(pg_err)?;
-    for repo in &manifest.pg_cutpoint.repositories {
-        for kind in ["repo_access", "repo_lifecycle"] {
-            tx.execute(
-                "INSERT INTO public.ref_store_decision_scopes(scope_kind, scope_id, version, state, change_id) \
-                 VALUES($1, $2, $3, 'OPEN', NULL) \
-                 ON CONFLICT (scope_kind, scope_id) DO UPDATE \
-                 SET version = GREATEST(public.ref_store_decision_scopes.version, EXCLUDED.version)",
-                &[&kind, &repo.repository_id, &new_authz_floor],
-            )
-            .await
-            .map_err(pg_err)?;
-        }
-    }
-    rehome_restored_repositories_realm(&tx, captured_repos, new_history_inc, actual_auth_e, new_grp_epoch).await?;
-    tx.batch_execute(
-        "SET LOCAL session_replication_role = DEFAULT; \
-         DELETE FROM public.ref_store_core_serving_reads; \
-         DELETE FROM public.ref_cas_projection_jobs; \
-         DELETE FROM public.ref_cas_projected_refs; \
-         DELETE FROM public.ref_cas_projected_events; \
-         DELETE FROM public.ref_cas_projected_operations;",
-    )
-    .await
-    .map_err(pg_err)?;
-    tx.commit().await.map_err(pg_err)?;
-
-    let mut fenced_inc = BTreeSet::from([
-        manifest.pg_cutpoint.source_cluster_incarnation,
-        manifest.pg_cutpoint.source_storage_authority_id,
-    ]);
-    for repo in &manifest.pg_cutpoint.repositories {
-        fenced_inc.insert(repo.history_incarnation);
-    }
-    for peer in &manifest.raft_cutpoint.peer_groups {
-        for gate in &peer.snapshot.body.gates {
-            fenced_inc.insert(gate.history_incarnation);
-        }
-    }
-    let fenced_decisions: BTreeSet<Uuid> =
-        manifest.raft_cutpoint.snapshot.body.decisions.iter().map(|d| d.decision_id).collect();
-    Ok(NewIncarnationAuthority {
-        new_cluster_incarnation: new_cluster_inc,
-        new_storage_authority_id: new_storage_auth,
-        new_storage_generation: actual_storage_gen,
-        new_history_incarnation: new_history_inc,
-        new_authority_epoch: actual_auth_e,
-        new_group_epoch: new_grp_epoch,
-        new_authz_floor,
-        new_deleter_epoch,
-        fenced_prior_incarnations: fenced_inc,
-        fenced_pre_backup_decision_ids: fenced_decisions,
-    })
+    let install = super::format30_incarnation::install_new_incarnation_on_restored_schema151;
+    install(client, manifest, captured_repos).await
 }

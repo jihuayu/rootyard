@@ -69,6 +69,77 @@ pub(super) fn pick_any_object_oid_from_pack(
         .ok_or_else(|| PairedBackupError::StateMachine("restored pack holds no object id".into()))
 }
 
+/// Conservative per-plan ACK budget for rebind ref chunks. It is half of the canonical
+/// `MAX_ACK_BODY_BYTES` bound (64 KiB) so pack/scope/digest fields can never overflow one ACK body.
+pub(super) const MAX_REBIND_REF_ACK_BYTES: usize = 32 * 1024;
+
+/// Split restored refs into non-empty A4 plan chunks bounded by both the per-plan ref count and a
+/// conservative ACK-body byte estimate. A ref is always admitted into empty chunks, so even a name
+/// longer than the whole budget still makes progress in a chunk of its own.
+pub(super) fn chunk_refs_for_plans(
+    refs: &[(String, String)],
+    max_refs: usize,
+    max_ack_budget_bytes: usize,
+) -> Vec<Vec<(String, String)>> {
+    let cap = max_refs.max(1);
+    let mut chunks: Vec<Vec<(String, String)>> = Vec::new();
+    let mut used_bytes = 0usize;
+    for (name, oid) in refs {
+        let cost = name.len().saturating_add(oid.len()).saturating_add(128);
+        let start_new = match chunks.last() {
+            None => true,
+            Some(chunk) => {
+                chunk.len() >= cap || (!chunk.is_empty() && used_bytes.saturating_add(cost) > max_ack_budget_bytes)
+            }
+        };
+        if start_new {
+            chunks.push(Vec::new());
+            used_bytes = 0;
+        }
+        if let Some(chunk) = chunks.last_mut() {
+            chunk.push((name.clone(), oid.clone()));
+        }
+        used_bytes = used_bytes.saturating_add(cost);
+    }
+    chunks
+}
+
+/// Checked/saturating sum of every restored pack pair's `.pack` + `.idx` bytes.
+pub(super) fn total_pack_bytes(packs: &[RestoredRepoPackFile]) -> u64 {
+    packs.iter().fold(0u64, |sum, pack| sum.saturating_add(pack.pack_len.saturating_add(pack.idx_len)))
+}
+
+/// A rebind plan must consolidate when it exceeds the pack-count *or* the total verifier byte bound.
+pub(super) fn needs_consolidation_with_limit(packs: &[RestoredRepoPackFile], max_plan_bytes: u64) -> bool {
+    !packs.is_empty()
+        && (packs.len() > crate::ref_store::core::pack_commit::MAX_BATCH_NEW_PACKS
+            || total_pack_bytes(packs) > max_plan_bytes)
+}
+
+/// Choose the pack set for the first rebind plan, consolidating into one canonical pack whenever the
+/// archived membership exceeds the pack-count or byte budget. A consolidated closure that still
+/// exceeds the verifier byte bound is a typed refusal, never an oversized plan handed to A4.
+pub(super) fn select_packs_for_rebind_with_limit(
+    git: &Path,
+    object_format: GitObjectFormat,
+    packs: &[RestoredRepoPackFile],
+    max_plan_bytes: u64,
+    repo_workspace: Option<&Path>,
+) -> Result<Vec<RestoredRepoPackFile>, PairedBackupError> {
+    if !needs_consolidation_with_limit(packs, max_plan_bytes) {
+        return Ok(packs.to_vec());
+    }
+    let root = repo_workspace
+        .ok_or_else(|| PairedBackupError::StateMachine("restore pack consolidation workspace is missing".into()))?;
+    let single = consolidate_packs_with_git(git, object_format, packs, root)?;
+    if single.pack_len.saturating_add(single.idx_len) > max_plan_bytes {
+        return Err(PairedBackupError::StateMachine(
+            "consolidated pack closure exceeds verifier total byte bound".into(),
+        ));
+    }
+    Ok(vec![single])
+}
+
 /// Consolidate every restored pair into one canonical pack built from all packed objects.
 pub(super) fn consolidate_packs_with_git(
     git: &Path,
@@ -251,6 +322,62 @@ mod tests {
         let (pack_len, pack_sha256) = stream_sha256_file(&named_pack).expect("pack digest");
         let (idx_len, idx_sha256) = stream_sha256_file(&named_idx).expect("idx digest");
         RestoredRepoPackFile { pack_path: named_pack, pack_sha256, pack_len, idx_path: named_idx, idx_sha256, idx_len }
+    }
+
+    #[test]
+    fn chunk_refs_for_plans_splits_by_count_and_ack_byte_budget() {
+        let oid = "a".repeat(64);
+        let refs: Vec<(String, String)> =
+            (0..135).map(|index| (format!("refs/tags/bulk-{index:03}"), oid.clone())).collect();
+        let chunks = chunk_refs_for_plans(&refs, 128, MAX_REBIND_REF_ACK_BYTES);
+        assert_eq!(chunks.len(), 2, "135 refs above a 128-ref plan limit must split into two plans");
+        assert_eq!((chunks[0].len(), chunks[1].len()), (128, 7));
+        let flattened: Vec<(String, String)> = chunks.iter().flatten().cloned().collect();
+        assert_eq!(flattened, refs, "chunking must preserve the exact ref set and order");
+
+        let long_name = "r".repeat(700);
+        let long_refs: Vec<(String, String)> =
+            (0..45).map(|index| (format!("refs/tags/{long_name}-{index}"), oid.clone())).collect();
+        let long_chunks = chunk_refs_for_plans(&long_refs, 128, MAX_REBIND_REF_ACK_BYTES);
+        assert!(long_chunks.len() >= 2, "45 long ref names must exceed the 32 KiB ACK budget");
+        assert_eq!((long_chunks[0].len(), long_chunks[1].len()), (36, 9));
+        for chunk in &long_chunks {
+            let footprint: usize = chunk.iter().map(|(name, oid)| name.len() + oid.len() + 128).sum();
+            assert!(
+                footprint <= MAX_REBIND_REF_ACK_BYTES,
+                "every chunk footprint {footprint} must stay within the ACK budget"
+            );
+        }
+        assert_eq!(long_chunks.iter().flatten().count(), long_refs.len());
+    }
+
+    #[test]
+    fn select_packs_for_rebind_consolidates_when_bytes_exceed_plan_limit() {
+        let git = PathBuf::from("git");
+        if Command::new(&git).arg("--version").output().is_err() {
+            return;
+        }
+        let root = RebindTempDir::create().expect("workspace");
+        let scratch = root.0.join("scratch.git");
+        Command::new(&git).args(["init", "--bare", "--object-format", "sha256"]).arg(&scratch).output().expect("init");
+        let mut pairs = Vec::new();
+        for index in 0..3u8 {
+            let target = root.0.join(format!("restored-{index}"));
+            pairs.push(seed_pack(&git, &scratch, &target, format!("object-{index}\n").as_bytes()));
+        }
+        let total = total_pack_bytes(&pairs);
+        assert!(pairs.len() <= 8 && total > 0, "three packs alone stay under the pack-count limit");
+        let out_dir = root.0.join("selected-consolidated");
+        let selected = select_packs_for_rebind_with_limit(
+            &git,
+            GitObjectFormat::Sha256,
+            &pairs,
+            total - 1,
+            Some(out_dir.as_path()),
+        )
+        .expect("consolidate on byte overflow");
+        assert_eq!(selected.len(), 1, "a byte-overflowing membership must consolidate into one pack");
+        assert_eq!(count_pack_objects(&git, &out_dir, &selected[0].idx_path).expect("count"), 3);
     }
 
     #[test]

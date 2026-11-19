@@ -1,6 +1,7 @@
 //! Live 3-voter mTLS `raft-node` + `schema 151` / `format 30` + Smart-HTTP `BlobGitState` + OpenDAL S3 E2E (#153).
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, ensure};
@@ -10,19 +11,20 @@ use uuid::Uuid;
 
 use super::fixture::{LoopbackS3, dticket, wticket};
 use super::format30_helpers::{
-    find_git_bin, init_volume_dir, make_actor, make_backup_config, replace_db_in_url, run_git_cli,
-    seed_gate_and_commit, start_gateway, verify_mtls_auth_and_quorum_faults,
+    ensure_raft_ref_mirrored, find_git_bin, init_volume_dir, make_actor, make_backup_config, replace_db_in_url,
+    run_git_cli, seed_gate_and_commit, start_gateway, verify_mtls_auth_and_quorum_faults,
 };
 use super::mtls_cluster::LiveMtlsRaftGroup;
 use rootyard::db;
 use rootyard::maintenance::paired_raft_backup::WriterGrantTicket;
+use rootyard::maintenance::paired_raft_backup::install_paired_write_raft_binding as bind_paired_write;
 use rootyard::maintenance::paired_raft_backup::{
     DurableFreezeRequest, DurableRaftBackend, Format30PairedBackupRequest, PairedBackupError,
     PairedProductionRuntimeGuard, PeerGroupBackupInput, STANDARD_PAIRED_PG_FORMAT, STANDARD_SCHEMA_HEAD,
     WorkerProjectionTicket, create_format30_paired_raft_backup, enter_durable_pg_raft_freeze, execute_deleter_guarded,
     load_pg_repo_backup_specs, propose_raft_hold_guarded, propose_raft_ref_write_guarded,
-    replicate_pg_repo_to_raft_guarded, restore_and_boot_format30_new_incarnation, thaw_durable_pg_raft_freeze,
-    upsert_repo_access_collaborator_guarded, verify_pg_live_incarnation,
+    restore_and_boot_format30_new_incarnation, thaw_durable_pg_raft_freeze, upsert_repo_access_collaborator_guarded,
+    verify_pg_live_incarnation,
 };
 use rootyard::ref_store::core::decision_commit::{PgDecisionProtocol, RealmExpectation};
 use rootyard::ref_store::core::state_machine::{
@@ -60,6 +62,8 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         seed_gate_and_commit(&mut raft2, (peer_repo, peer_tenant, peer_hist, 2, 4), &["b".repeat(64)])?;
         let src_pool = db::pool(&src_url)?;
         db::migrate(&src_pool).await?;
+        // The gateway mirrors every committed push through its own live Raft handle for this database.
+        let _src_write_binding = bind_paired_write(Arc::new(Mutex::new(g1.connect_backend(1)?)), &src_url)?;
         let owner = make_actor(&src_pool, "fmtowner", true).await?;
         let collab = make_actor(&src_pool, "fmtcollab", true).await?;
         let stranger = make_actor(&src_pool, "fmtstranger", true).await?;
@@ -122,7 +126,7 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
             ensure!(push_out.status.success(), "git push failed: {}", String::from_utf8_lossy(&push_out.stderr));
             pushed_oids.push(head);
         }
-        replicate_pg_repo_to_raft_guarded(&src_pool, &mut raft1, repo_id).await?;
+        ensure_raft_ref_mirrored(&raft1, repo_id, "refs/heads/main", &pushed_oids[1])?;
         let specs = load_pg_repo_backup_specs(&**src_pool.get().await?).await?;
         ensure!(specs.len() == 1 && specs[0].expected_packs.len() == 2 && pushed_oids.len() == 2);
         let pre_ledger =
@@ -292,6 +296,7 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         let mut booted_raft1 = dst_g1.connect_backend(1)?;
         let booted_raft2 = dst_g2.connect_backend(1)?;
         let mut booted_peers = BTreeMap::from([(2i64, booted_raft2)]);
+        let _dst_write_binding = bind_paired_write(Arc::new(Mutex::new(dst_g1.connect_backend(1)?)), &dst_url)?;
         let dst_cfg = make_backup_config(dst_url.clone(), dir.path().join("dst-vol"), git.clone());
         let mut no_peers = BTreeMap::new();
         let rejected = restore_and_boot_format30_new_incarnation(
@@ -393,15 +398,13 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
             String::from_utf8(run_git_cli(&git, &dst_clone, &["rev-parse", "HEAD"]).stdout)?.trim().to_owned();
         ensure!(run_git_cli(&git, &dst_clone, &["push", "origin", "HEAD:refs/heads/main"]).status.success());
         super::format30_ledger_gates::verify_post_push_new_realm_ledger(&dst_pool, &pre_ledger, inc).await?;
+        let cur_rev = ensure_raft_ref_mirrored(&booted_raft1, repo_id, "refs/heads/main", &post_oid)?;
         dst_gw_jh.abort();
         let _ = dst_gw_jh.await;
-        let (cur_snap, _) = booted_raft1.durable_state()?;
-        let cur_rev = cur_snap.body.gates[0].revision;
-        let old_oid = GitOid::parse(GitObjectFormat::Sha256, &pushed_oids[1])?;
         let next_oid = GitOid::parse(GitObjectFormat::Sha256, &post_oid)?;
         let raft_upd = RefUpdate::new(
-            RefName::new("refs/heads/main")?,
-            RefPrecondition::Present(old_oid),
+            RefName::new("refs/heads/after-failover")?,
+            RefPrecondition::Absent,
             RefTarget::Oid(next_oid),
         );
         let raft_req = CommitRefsRequest::new(
@@ -457,10 +460,8 @@ pub async fn run_live_mtls_quorum_freeze_format30_and_new_incarnation_boot() -> 
         prod_guard.execute_live_projection_worker_step(&dst_pool, &booted_raft1, repo_id, &proj_ticket).await?;
         let post_snap = booted_raft1.durable_state()?.0;
         ensure!(post_snap.body.last_applied.unwrap().term >= 2, "leader failover must advance durable consensus term");
-        ensure!(
-            post_snap.body.refs[0].refs.get("refs/heads/main") == Some(&post_oid),
-            "3-voter mTLS Raft cluster committed post-restore ref advance"
-        );
+        ensure_raft_ref_mirrored(&booted_raft1, repo_id, "refs/heads/main", &post_oid)?;
+        ensure_raft_ref_mirrored(&booted_raft1, repo_id, "refs/heads/after-failover", &post_oid)?;
         drop(dst_pool);
         Ok(())
     }

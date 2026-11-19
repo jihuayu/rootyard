@@ -3,6 +3,7 @@
 //! must leave the target volume unpublished behind an armed crash-persistent guard (#153).
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, ensure};
@@ -11,10 +12,11 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use rootyard::db;
+use rootyard::maintenance::paired_raft_backup::install_paired_write_raft_binding as bind_paired_write;
 use rootyard::maintenance::paired_raft_backup::{
-    DurableFreezeRequest, Format30PairedBackupRequest, MtlsLiveRaftBackend, create_format30_paired_raft_backup,
-    enter_durable_pg_raft_freeze, load_pg_repo_backup_specs, read_pg_database_freeze_marker,
-    read_pg_database_read_only, replicate_pg_repo_to_raft_guarded, restore_and_boot_format30_new_incarnation,
+    DurableFreezeRequest, DurableRaftBackend, Format30PairedBackupRequest, MtlsLiveRaftBackend,
+    create_format30_paired_raft_backup, enter_durable_pg_raft_freeze, load_pg_repo_backup_specs,
+    read_pg_database_freeze_marker, read_pg_database_read_only, restore_and_boot_format30_new_incarnation,
 };
 use rootyard::ref_store::core::decision_commit::{PgDecisionProtocol, RealmExpectation};
 use rootyard::ref_store::serving::lookup;
@@ -35,7 +37,7 @@ async fn repo_count(client: &tokio_postgres::Client, sql: &str, repo_id: Uuid) -
     Ok(client.query_one(sql, &[&repo_id]).await?.get(0))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live PostgreSQL 17 + built raft-node and rootyard-peer-attestor binaries"]
 async fn gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished() -> Result<()> {
     let base_url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
@@ -56,8 +58,9 @@ async fn gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished(
         let mut raft = group.connect_backend(1)?;
         let pool = db::pool(&url)?;
         db::migrate(&pool).await?;
+        let _write_binding = bind_paired_write(Arc::new(Mutex::new(group.connect_backend(1)?)), &url)?;
         let owner = make_actor(&pool, "gate8owner", true).await?;
-        let (gw_addr, _gw_jh) =
+        let (gw_addr, gw_jh) =
             start_gateway(pool.clone(), store.clone(), git.clone(), dir.path().join("gate8-gw")).await?;
         let created = reqwest::Client::new()
             .post(format!("http://{gw_addr}/api/repos"))
@@ -118,7 +121,15 @@ async fn gate8_refless_active_packs_rebind_and_failed_restore_stays_unpublished(
             .await?;
             ensure!(memberships == 1i64, "the pushed pack must stay an active membership");
         }
-        replicate_pg_repo_to_raft_guarded(&pool, &mut raft, repo_id).await?;
+        gw_jh.abort();
+        let _ = gw_jh.await;
+        let (raft_snap, _) = raft.durable_state()?;
+        let raft_refs =
+            raft_snap.body.refs.iter().find(|r| r.repository_id == repo_id).map(|r| r.refs.clone()).unwrap_or_default();
+        ensure!(
+            raft_snap.body.gates.iter().any(|g| g.repository_id == repo_id) && raft_refs.is_empty(),
+            "the mirrored create+delete pushes must leave the live Raft gate with exactly zero refs"
+        );
         let specs = load_pg_repo_backup_specs(&**pool.get().await?).await?;
         ensure!(
             specs.len() == 1 && !specs[0].expected_packs.is_empty(),

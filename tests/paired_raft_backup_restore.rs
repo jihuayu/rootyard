@@ -2,6 +2,8 @@
 
 #[path = "paired_raft_backup_support/fixture.rs"]
 pub mod fixture;
+#[path = "paired_raft_backup_support/format30_delta10_gates.rs"]
+pub mod format30_delta10_gates;
 #[path = "paired_raft_backup_support/format30_delta8_gates.rs"]
 pub mod format30_delta8_gates;
 #[path = "paired_raft_backup_support/format30_e2e.rs"]

@@ -196,30 +196,36 @@ fn replay_gate(
     }
     let lane =
         IssuerLane::new("paired-format30-restore").map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-    let req = CommitRefsRequest::new(
-        gate.repository_id,
-        gate.tenant_id,
-        Uuid::new_v4(),
-        lane,
-        1,
-        Uuid::new_v4(),
-        gate.object_format,
-        history,
-        authority_epoch,
-        group_epoch,
-        1,
-        HeadUpdate::Keep,
-        CommitMode::Atomic,
-        updates,
-    )
-    .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-    raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
-        request: WireCommitRefsRequest::from(&req),
-        decision_id: None,
-        required_holds: Vec::new(),
-        policy_rejects: BTreeMap::new(),
-        logical_tick: authz_floor as u64,
-    }))?;
+    // One `CommitRefs` admits at most `MAX_REFS_PER_COMMIT` refs, so a restored repository holding
+    // more archived refs is replayed as an ordered sequence of commits that each advance the gate
+    // revision by exactly one, starting from the freshly initialized revision `1`.
+    for (chunk_idx, chunk) in updates.chunks(crate::ref_store::core::pack_commit::MAX_PLAN_REFS).enumerate() {
+        let index = chunk_idx as i64 + 1;
+        let req = CommitRefsRequest::new(
+            gate.repository_id,
+            gate.tenant_id,
+            Uuid::new_v4(),
+            lane.clone(),
+            index,
+            Uuid::new_v4(),
+            gate.object_format,
+            history,
+            authority_epoch,
+            group_epoch,
+            index,
+            HeadUpdate::Keep,
+            CommitMode::Atomic,
+            chunk.to_vec(),
+        )
+        .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+        raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
+            request: WireCommitRefsRequest::from(&req),
+            decision_id: None,
+            required_holds: Vec::new(),
+            policy_rejects: BTreeMap::new(),
+            logical_tick: (authz_floor as u64).saturating_add(chunk_idx as u64),
+        }))?;
+    }
     Ok(())
 }
 

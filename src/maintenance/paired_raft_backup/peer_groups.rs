@@ -288,31 +288,36 @@ pub fn restore_peer_groups_state(
                         .map_err(|e| PairedBackupError::GitVerificationFailed(e.to_string()))?;
                     updates.push(RefUpdate::new(rn, RefPrecondition::Absent, RefTarget::Oid(oid)));
                 }
-                let req = CommitRefsRequest::new(
-                    gate.repository_id,
-                    gate.tenant_id,
-                    Uuid::new_v4(),
-                    IssuerLane::new("paired-peer-restore")
-                        .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?,
-                    1,
-                    Uuid::new_v4(),
-                    gate.object_format,
-                    inc.new_history_incarnation,
-                    inc.new_authority_epoch,
-                    inc.new_group_epoch,
-                    1,
-                    HeadUpdate::Keep,
-                    CommitMode::Atomic,
-                    updates,
-                )
-                .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
-                wal_raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
-                    request: WireCommitRefsRequest::from(&req),
-                    decision_id: None,
-                    required_holds: Vec::new(),
-                    policy_rejects: BTreeMap::new(),
-                    logical_tick: inc.new_authz_floor as u64,
-                }))?;
+                let lane = IssuerLane::new("paired-peer-restore")
+                    .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+                for (chunk_idx, chunk) in updates.chunks(crate::ref_store::core::pack_commit::MAX_PLAN_REFS).enumerate()
+                {
+                    let index = chunk_idx as i64 + 1;
+                    let req = CommitRefsRequest::new(
+                        gate.repository_id,
+                        gate.tenant_id,
+                        Uuid::new_v4(),
+                        lane.clone(),
+                        index,
+                        Uuid::new_v4(),
+                        gate.object_format,
+                        inc.new_history_incarnation,
+                        inc.new_authority_epoch,
+                        inc.new_group_epoch,
+                        index,
+                        HeadUpdate::Keep,
+                        CommitMode::Atomic,
+                        chunk.to_vec(),
+                    )
+                    .map_err(|e| PairedBackupError::StateMachine(e.to_string()))?;
+                    wal_raft.commit_and_apply(RefCasCommand::CommitRefs(CommitRefsCommand {
+                        request: WireCommitRefsRequest::from(&req),
+                        decision_id: None,
+                        required_holds: Vec::new(),
+                        policy_rejects: BTreeMap::new(),
+                        logical_tick: (inc.new_authz_floor as u64).saturating_add(chunk_idx as u64),
+                    }))?;
+                }
             }
         }
         let (snap, _) = wal_raft.durable_state()?;
