@@ -358,3 +358,86 @@ async fn every_reverse_stage_reaches_closed_runner_diagnostic_and_keeps_public_c
         );
     }
 }
+
+#[test]
+fn reverse_root_probe_selects_one_retained_sibling_without_guessing_type() {
+    use std::collections::BTreeMap;
+    let subtree = "1".repeat(40);
+    let sibling = "2".repeat(40);
+    let mut entries = BTreeMap::new();
+    entries.insert(b"dir".to_vec(), format!("040000 tree {subtree}\tdir").into_bytes());
+    entries.insert(b"vendor".to_vec(), format!("160000 commit {sibling}\tvendor").into_bytes());
+    assert_eq!(
+        retained_root_sibling(&entries, b"dir"),
+        Ok(Some((sibling.as_str(), ReverseGitObjectType::Commit)))
+    );
+    entries.insert(b"other".to_vec(), format!("100644 blob {sibling}\tother").into_bytes());
+    assert_eq!(retained_root_sibling(&entries, b"dir"), Ok(None));
+    let mut malformed = BTreeMap::new();
+    malformed.insert(b"dir".to_vec(), format!("040000 tree {subtree}\tdir").into_bytes());
+    malformed.insert(b"root.txt".to_vec(), b"100644 blob nope\troot.txt".to_vec());
+    assert_eq!(retained_root_sibling(&malformed, b"dir"), Err(()));
+}
+
+#[test]
+fn reverse_root_probe_output_is_closed_and_separate() {
+    let oid = "1".repeat(40);
+    let mut line = Vec::new();
+    reverse_diag::write_failure_line(
+        &mut line,
+        ReverseGitStage::SubtreeRootRebuild,
+        reverse_diag::ReverseGitChildOutcome::NonzeroExit,
+    )
+    .unwrap();
+    reverse_diag::write_probe_line(
+        &mut line,
+        reverse_diag::ReverseGitProbeObject::ReplacementSubtree,
+        reverse_diag::ReverseGitProbeResult::PresentAndTyped,
+        Some(reverse_diag::ReverseGitObjectType::Tree),
+    )
+    .unwrap();
+    assert_eq!(
+        line,
+        b"rootyard: S4 reverse Git child failed stage=subtree_root_rebuild outcome=nonzero_exit\n\
+rootyard: S4 reverse Git child probe object=replacement_subtree result=present_and_typed type=tree\n"
+            .to_vec()
+    );
+    for (result, label) in [
+        (ReverseGitProbeResult::PresentAndTyped, "present_and_typed"),
+        (ReverseGitProbeResult::Missing, "missing"),
+        (ReverseGitProbeResult::ProbeError, "probe_error"),
+        (ReverseGitProbeResult::Unavailable, "unavailable"),
+    ] {
+        assert_eq!(result.as_str(), label);
+    }
+    for (kind, label) in [
+        (ReverseGitObjectType::Blob, "blob"),
+        (ReverseGitObjectType::Tree, "tree"),
+        (ReverseGitObjectType::Commit, "commit"),
+        (ReverseGitObjectType::Tag, "tag"),
+    ] {
+        assert_eq!(kind.as_str(), label);
+    }
+    for (object, label) in [
+        (ReverseGitProbeObject::ReplacementSubtree, "replacement_subtree"),
+        (ReverseGitProbeObject::RetainedRootSibling, "retained_root_sibling"),
+    ] {
+        assert_eq!(object.as_str(), label);
+    }
+    assert_eq!(
+        classify_batch_check_line(&format!("{oid} tree 12"), &oid, ReverseGitObjectType::Tree),
+        (ReverseGitProbeResult::PresentAndTyped, Some(ReverseGitObjectType::Tree))
+    );
+    assert_eq!(
+        classify_batch_check_line(&format!("{oid} missing"), &oid, ReverseGitObjectType::Tree),
+        (ReverseGitProbeResult::Missing, None)
+    );
+    assert_eq!(
+        classify_batch_check_line(&format!("{oid} blob 12"), &oid, ReverseGitObjectType::Tree),
+        (ReverseGitProbeResult::ProbeError, None)
+    );
+    assert_eq!(
+        classify_batch_check_line(&format!("{oid} tree nope"), &oid, ReverseGitObjectType::Tree),
+        (ReverseGitProbeResult::ProbeError, None)
+    );
+}

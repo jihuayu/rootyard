@@ -378,6 +378,20 @@ class SourceContracts(unittest.TestCase):
         self.assertIn("reverse_git_diagnostic_labels_are_closed_and_bounded", tests)
         self.assertIn("reverse_git_diagnostic_write_failure_is_best_effort", tests)
 
+        probe = reverse.split("async fn probe_failed_root_mktree", 1)
+        self.assertEqual(len(probe), 2, "the root probe must stay one bounded helper")
+        helper = probe[1].split("async fn mktree", 1)[0]
+        self.assertIn('["cat-file", "--batch-check"]', helper)
+        self.assertIn("classify_batch_check_line", helper)
+        self.assertIn("emit_probe", helper)
+        self.assertFalse(any(needle in helper for needle in ("eprintln!", "format!")))
+        for needle in ("parts.len() == 1", "is_reverse_child_failure(&error)"):
+            self.assertIn(needle, reverse)
+        self.assertIn("stage == Some(ReverseGitStage::SubtreeRootRebuild)", reverse)
+        self.assertIn("write_probe_line", diag)
+        self.assertIn("reverse_root_probe_output_is_closed_and_separate", tests)
+        self.assertIn("fn s4_git_view_bundle_is_projected_only_and_reverse_merges_the_subtree", text(TESTS / "s4_ci_pins_git_view.rs"))
+
     def test_discarded_projection_cleanup_is_not_diagnosed(self) -> None:
         view = text(SRC / "namespace_service" / "s4_git_view.rs")
         self.assertIn(

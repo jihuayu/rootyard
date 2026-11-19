@@ -222,7 +222,8 @@ pub(super) async fn create(
                 projected_tree
             } else {
                 let parts: Vec<&str> = binding.subdir.split('/').collect();
-                replace_tree(&state.config.git, source, &old_tree, &parts, &projected_tree, deadline).await?
+                let stage = Some(ReverseGitStage::SubtreeRootRebuild);
+                replace_tree(git, source, &old_tree, &parts, &projected_tree, deadline, stage).await?
             };
             let body = format!("{}\n", input.message);
             let commit_args = ["commit-tree", new_tree.as_str(), "-p", binding.source_oid.as_str()];

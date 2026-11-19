@@ -67,12 +67,15 @@ pub(crate) async fn with_scratch<T>(holds: Vec<ScratchHold>, fut: impl std::futu
 }
 
 pub(crate) use super::s4_git_proc_reverse::{
-    GitInputSpec, git_input, new_pack, replace_tree, verify_candidate_budget,
+    GitInputSpec, git_input, new_pack, replace_tree, retained_root_sibling, verify_candidate_budget,
 };
 
 pub(crate) enum GitStdin<'a> { Null, Bytes(&'a [u8]), File(std::fs::File) }
 
-pub(crate) use reverse_diag::ReverseGitStage;
+pub(crate) use reverse_diag::{
+    ReverseGitObjectType, ReverseGitProbeObject, ReverseGitProbeResult, ReverseGitStage, classify_batch_check_line,
+    emit_probe,
+};
 
 pub(crate) fn base_command(git_bin: &FsPath) -> Command {
     let mut command = Command::new(git_bin);
